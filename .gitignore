@@ -1,0 +1,22 @@
+# локальная память (тайм-лог) и секреты
+*.local.md
+*.env
+client_secret*.json
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+# модели и тяжёлые артефакты — только манифесты
+models/
+*.onnx
+*.bin
+*.gguf
+# временное
+scratchpad/
+.build/
