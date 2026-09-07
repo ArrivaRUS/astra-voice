@@ -44,7 +44,7 @@ K_R2    = float(os.environ.get("K_R2", 1.38))    # r2 / r1
 K_R3    = float(os.environ.get("K_R3", 1.90))    # r3 / r1
 K_G1    = float(os.environ.get("K_G1", 2.55))    # промежуток 1 в радиусах r1
 K_G2    = float(os.environ.get("K_G2", 0.90))    # промежуток 2 в радиусах r1
-K_VGAP  = float(os.environ.get("K_VGAP", 0.62))  # зазор точки→строка, в толщинах строки
+K_VGAP  = float(os.environ.get("K_VGAP", 0.30))  # зазор точки→строка, в толщинах строки
 K_OFF   = 0.20     # сдвиг первой точки от левого торца строки, в r1
 # ширина ряда = 2r1 + g1 + 2*K_R2*r1 + g2 + 2*K_R3*r1 = r1 * K_ROWSPAN
 K_ROWSPAN = 2 + K_G1 + 2 * K_R2 + K_G2 + 2 * K_R3
@@ -124,8 +124,8 @@ WORDMARK_D = open(os.path.join(HERE, "icons", "_src", "wordmark.d")).read().stri
     if os.path.exists(os.path.join(HERE, "icons", "_src", "wordmark.d")) else None
 WM_W, WM_CAP, WM_OVERSHOOT = 532.1, 70.0, 0.8
 
-MARK_H_IN_LOCKUP = float(os.environ.get("MH", 104))   # высота знака в замке
-LOCKUP_GAP = float(os.environ.get("GAP", 32))         # просвет знак↔имя
+MARK_H_IN_LOCKUP = float(os.environ.get("MH", 84))   # высота знака в замке
+LOCKUP_GAP = float(os.environ.get("GAP", 34))         # просвет знак↔имя
 MARK_CY = float(os.environ.get("MCY", 34))            # центр знака в коорд. текста
 WM_RAW_X, WM_RAW_Y = 1.5, 130.0    # bbox контуров в исходной системе Inkscape
 
@@ -178,19 +178,20 @@ def svg_lockup(ink, accent, mono=False, media=False, pad=0.0, title="Astra Voice
 # (сторона, поле, толщина строки, верх строки, rx плашки) — 16/22/24/32 вычищены
 # вручную под пиксельную сетку, 64 — мастер для 64…512.
 _IT  = float(os.environ.get("IT", 0.125))   # толщина строки, доля стороны
-_IL  = float(os.environ.get("IL", 0.02))    # подъём знака над центром, доля стороны
-_IRX = float(os.environ.get("IRX", 0.115))  # левый край ряда точек, доля стороны
-_IRW = float(os.environ.get("IRW", 0.62))   # ширина ряда точек, доля стороны
+_IL  = float(os.environ.get("IL", 0.03))    # подъём знака над центром, доля стороны
+_IRX = float(os.environ.get("IRX", 0.10))  # левый край ряда точек, доля стороны
+_IRW = float(os.environ.get("IRW", 0.54))   # ширина ряда точек, доля стороны
+_IPL = float(os.environ.get("IPL", 0.08))   # левое поле строки, доля стороны
+_IPR = float(os.environ.get("IPR", 0.07))   # правое поле строки, доля стороны
 ICON_SIZES = (16, 22, 24, 32, 64)
 
 
 def icon_mark(S):
-    """Знак в плашке: строка ВЫХОДИТ за края плашки (обрезается ею) — так она
-    читается как продолжающаяся строка текста, а не как «рот» на «лице».
-    Ряд точек заметно уже и сдвинут влево — композиция намеренно асимметрична."""
+    """Знак в плашке. Ряд точек заметно уже строки и прижат влево, точки
+    подходят к строке вплотную — композиция намеренно асимметрична, иначе
+    «три круга над горизонталью» в квадрате читаются как лицо."""
     t = _IT * S
-    bleed = 0.05 * S
-    bx, bw = -bleed, S + 2 * bleed
+    bx, bw = _IPL * S, S * (1.0 - _IPL - _IPR)
     row_x, row_w = _IRX * S, _IRW * S            # ряд точек: старт и ширина
     r1 = row_w / K_ROWSPAN
     r2, r3 = r1 * K_R2, r1 * K_R3
@@ -210,22 +211,18 @@ def icon_mark(S):
 def svg_icon(S):
     rx = round(0.22 * S, 2)
     m = HAND16_ICON if S == 16 else icon_mark(S)
-    clip = ('<clipPath id="t"><rect x="0" y="0" width="%d" height="%d" rx="%s"/></clipPath>'
-            % (S, S, f(rx))) if S != 16 else ""
-    g = ('<g clip-path="url(#t)">%s</g>' % draw(m, INK_LIGHT, ACCENT_DARK)) if S != 16 \
-        else draw(m, INK_LIGHT, ACCENT_DARK)
     return (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d"'
-        ' role="img" aria-label="Astra Voice">%s'
+        ' role="img" aria-label="Astra Voice">'
         '<rect x="0" y="0" width="%d" height="%d" rx="%s" fill="%s"/>%s</svg>\n'
-        % (S, S, S, S, clip, S, S, f(rx), TILE, g))
+        % (S, S, S, S, S, S, f(rx), TILE, draw(m, INK_LIGHT, ACCENT_DARK)))
 
 
 # -------------------------------------------------------------- трей KDE ---
 # Символьные, форма одна на все состояния, цветом отличается только точка 3.
 # Соглашение KDE: <style id="current-color-scheme"> + class="ColorScheme-Text",
 # Plasma подменяет содержимое этого стиля цветом темы панели.
-TRAY_GEOM = {22: dict(bx=2.0, by=13.0, bw=18.0, bh=4.0)}   # 16 px — HAND16_TRAY
+TRAY_GEOM = {22: dict(bx=2.0, by=12.0, bw=18.0, bh=4.0)}   # 16 px — HAND16_TRAY
 
 
 def svg_tray(S, light=None, dark=None, mono=False):
