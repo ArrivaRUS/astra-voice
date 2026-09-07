@@ -1,11 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 214 80" width="214" height="80" role="img" aria-label="Вслух — концепт 1: Ёлочки — прямая речь">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" width="306" height="80" role="img" aria-label="Astra Voice — концепт 01: Ёлочки">
   <style>
-    svg { color:#0E1729; --a:#12B3A0; }
-    @media (prefers-color-scheme: dark) { svg { color:#F2F5FA; --a:#2FD9C4; } }
+    /* Без CSS-переменных: librsvg (GTK-миниатюры, конвертеры) их не поддерживает
+       и акцентные части пропадают. Только литеральные цвета и currentColor. */
+    svg   { color:#0E1729; }
     .ink  { fill:none; stroke:currentColor; stroke-linecap:round; stroke-linejoin:round; }
-    .acc  { fill:none; stroke:var(--a);     stroke-linecap:round; stroke-linejoin:round; }
-    .accf { fill:var(--a); stroke:none; }
+    .acc  { fill:none; stroke:#12B3A0; stroke-linecap:round; stroke-linejoin:round; }
+    .accf { fill:#12B3A0; stroke:none; }
+    .inkf { fill:currentColor; stroke:none; }
     .wm   { fill:currentColor; stroke:none; }
+    @media (prefers-color-scheme: dark) {
+      svg { color:#F2F5FA; } .acc { stroke:#2FD9C4; } .accf { fill:#2FD9C4; }
+    }
   </style>
   <g class="mark" transform="translate(8,8)">
     <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
@@ -15,5 +20,5 @@
     <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
     <circle class="accf" cx="32" cy="32" r="5"/>
   </g>
-  <text class="wm" x="92" y="53" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="40" font-weight="700" letter-spacing="-0.4">Вслух</text>
+  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="-0.2">Astra Voice</text>
 </svg>

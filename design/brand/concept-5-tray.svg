@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="22" height="22" role="img" aria-label="трей-иконка Astra Voice, концепт 05">
+  <style>
+    svg { color:#0E1729; }
+    @media (prefers-color-scheme: dark) { svg { color:#F2F5FA; } }
+    .s  { fill:none; stroke:currentColor; stroke-linecap:round; stroke-linejoin:round; }
+    .st { fill:currentColor; stroke:none; }        /* элемент состояния */
+  </style>
+    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/>
+</svg>

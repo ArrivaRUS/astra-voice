@@ -1,0 +1,1006 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Astra Voice — знак, раунд 2</title>
+<style>
+:root{
+  --ink:#0E1729; --n700:#243350; --n500:#5A6884; --n300:#AAB4C7; --n200:#D7DEEA;
+  --n100:#EDF1F7; --n50:#F7F9FC; --primary:#1B3A73; --a:#12B3A0; --a-ink:#0B7F71; --a-bg:#E3F7F4;
+  --d-bg:#0B1220; --d-surface:#151E30; --d-fg:#F2F5FA; --d-n500:#8C97AC; --d-a:#2FD9C4;
+  --font:'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif;
+  --mono:'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--n50);color:var(--ink);font-family:var(--font);
+     font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1120px;margin:0 auto;padding:48px 32px 96px}
+h1{font-size:28px;line-height:1.2;font-weight:700;margin:0 0 6px}
+h2{font-size:20px;line-height:1.25;font-weight:700;margin:0}
+h3{font-size:16px;line-height:1.3;font-weight:500;margin:0 0 14px}
+.lead{color:var(--n500);font-size:15px;margin:0 0 4px;max-width:74ch}
+.meta{color:var(--n300);font-size:12px;font-family:var(--mono);margin-top:14px}
+hr{border:0;border-top:1px solid var(--n200);margin:44px 0}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+         color:var(--a-ink);margin:0 0 22px}
+
+/* ── знак: общие классы (совпадают со <style> внутри .svg-файлов) ── */
+.ink{fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round}
+.acc{fill:none;stroke:var(--acc,var(--a));stroke-linecap:round;stroke-linejoin:round}
+.accf{fill:var(--acc,var(--a));stroke:none}
+.wm{fill:currentColor;stroke:none}
+.s{fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round}
+.st{fill:currentColor;stroke:none}
+.s.state{stroke:var(--state,currentColor)}
+.st.state{fill:var(--state,currentColor)}
+
+/* ── карточка концепта ── */
+.card{background:#fff;border:1px solid var(--n200);border-radius:14px;overflow:hidden;
+      margin-bottom:28px;box-shadow:0 1px 2px rgba(14,23,41,.05)}
+.card > .head{padding:22px 26px 18px;border-bottom:1px solid var(--n100)}
+.num{font-family:var(--mono);font-size:12px;color:var(--a-ink);letter-spacing:.1em}
+.sub{color:var(--n500);font-size:13px;margin-left:8px}
+.idea{margin:8px 0 0;color:var(--n700);max-width:80ch}
+.note{margin:10px 0 0;color:var(--n500);font-size:13px}
+
+.duo{display:grid;grid-template-columns:1fr 1fr}
+.pane{padding:30px 26px 20px;display:flex;flex-direction:column;align-items:center;
+      justify-content:center;gap:4px;min-height:150px}
+.pane.light{background:#fff;color:var(--ink);--acc:var(--a)}
+.pane .cap{color:inherit;opacity:.42}
+.pane.dark{background:var(--d-bg);color:var(--d-fg);--acc:var(--d-a)}
+.pane svg{height:60px;width:auto}
+.pane.mono{background:var(--n100);color:var(--ink);--acc:var(--ink)}
+.pane.inv{background:var(--primary);color:#fff;--acc:#fff}
+
+.strip{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--n100)}
+.strip > div{padding:22px 18px;border-right:1px solid var(--n100);text-align:center}
+.strip > div:last-child{border-right:0}
+.cap{display:block;font-family:var(--mono);font-size:10.5px;color:var(--n500);
+     letter-spacing:.06em;margin-top:12px}
+
+/* иконка приложения */
+.tile{border-radius:22%;display:inline-flex;align-items:center;justify-content:center;
+      vertical-align:middle;margin:0 8px}
+.tile.lt{background:#fff;border:1px solid var(--n200);color:var(--ink);--acc:var(--a)}
+.tile.dk{background:var(--ink);color:#fff;--acc:var(--d-a)}
+.tile svg{width:64%;height:64%}
+.t128{width:128px;height:128px} .t48{width:48px;height:48px}
+.t24{width:24px;height:24px;border-radius:26%} .t16{width:16px;height:16px;border-radius:28%}
+
+/* трей */
+.panel{display:inline-flex;align-items:center;gap:14px;padding:7px 14px;border-radius:8px}
+.panel.kde-dark{background:#232629;color:#eff0f1}
+.panel.kde-light{background:#eff0f1;color:#232629;border:1px solid var(--n200)}
+.panel svg{width:22px;height:22px;display:block}
+.panel .dim{opacity:.65}
+.states{display:flex;gap:16px;justify-content:center;flex-wrap:wrap}
+.states .one{text-align:center}
+.states .box{width:36px;height:36px;border-radius:8px;display:flex;align-items:center;
+             justify-content:center;margin:0 auto}
+.states.on-dark .box{background:#232629;color:#eff0f1}
+.states.on-light .box{background:#eff0f1;color:#3b4045}
+.states svg{width:22px;height:22px}
+.st-label{font-family:var(--mono);font-size:10px;color:var(--n500);margin-top:6px;display:block}
+
+/* таблицы */
+table{border-collapse:collapse;width:100%;font-size:13.5px}
+th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--n200);vertical-align:top}
+th{font-size:11px;font-family:var(--mono);letter-spacing:.08em;text-transform:uppercase;
+   color:var(--n500);border-bottom:1px solid var(--n300)}
+tr.rec td{background:var(--a-bg)}
+tr.bad td{color:var(--n500)}
+.tag{display:inline-block;font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:99px;
+     background:var(--a-ink);color:#fff;letter-spacing:.05em;vertical-align:middle}
+.tag.warn{background:#8F5E12}
+code{font-family:var(--mono);font-size:12.5px;background:var(--n100);padding:1px 5px;border-radius:4px}
+
+/* палитра */
+.sw{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:12px}
+.sw div{border-radius:10px;padding:12px;border:1px solid var(--n200);min-height:78px;
+        display:flex;flex-direction:column;justify-content:flex-end}
+.sw b{font-size:12px;font-weight:500} .sw span{font-family:var(--mono);font-size:11px;opacity:.75}
+.type-demo{background:#fff;border:1px solid var(--n200);border-radius:12px;padding:24px 26px}
+@media (max-width:820px){ .duo{grid-template-columns:1fr} .strip{grid-template-columns:1fr 1fr} }
+
+/* ── раунд 2 ── */
+.inkf{fill:currentColor;stroke:none}
+.strip{grid-template-columns:1fr 1fr}
+.strip.two{grid-template-columns:320px 1fr}
+.states{gap:10px}
+.states .one{min-width:54px}
+.card.fresh{border-color:#9FE0D6;box-shadow:0 1px 2px rgba(14,23,41,.05),0 0 0 3px var(--a-bg)}
+.card > .head h2{display:inline-block;margin-left:10px}
+.tag.new{background:var(--a-ink)}
+.tag{background:var(--n500)}
+.panel{vertical-align:middle}
+.states{margin-bottom:14px}
+.decided{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin:18px 0 0}
+.decided > div{background:#fff;border:1px solid var(--n200);border-left:3px solid var(--a);
+               border-radius:10px;padding:14px 16px}
+.decided b{display:block;font-size:13px;margin-bottom:3px}
+.decided span{color:var(--n500);font-size:13px}
+.rec-box{background:var(--a-bg);border:1px solid #9FE0D6;border-radius:12px;padding:18px 22px;margin:22px 0 0}
+.rec-box p{margin:0 0 8px} .rec-box p:last-child{margin:0}
+ol.q{padding-left:20px;max-width:80ch} ol.q li{margin-bottom:10px}
+</style></head>
+<body><div class="wrap">
+<p class="eyebrow">astra-voice · шаг G2a · раунд 2 · контактный лист</p>
+<h1>Astra Voice — четыре новых направления знака</h1>
+<p class="lead">Имя и фирменный цвет приняты, остался знак. Ниже сначала два направления из раунда 1 («более-менее») — уже с новым именем и с уточнённой вариацией каждого; затем четыре принципиально новых идеи. Выбрать нужно <b>одно направление</b>; вариацию внутри направления (01/01b, 03/03b) можно выбрать отдельно.</p>
+<div class="decided">
+<div><b>Имя — Astra Voice</b><span>Латиницей. Товарный риск по марке «Астра» принят заказчиком.</span></div>
+<div><b>«Слушаю» — бирюза #12B3A0</b><span>Фирменный сигнальный цвет. Янтарь — «распознаю», красный остаётся за ошибкой.</span></div>
+<div><b>Шрифты — PT Root UI + PT Mono</b><span>Оба уже стоят в ALSE 1.8, тянуть в пакет не нужно.</span></div>
+</div>
+<p class="meta">2026-09-07 · brand-designer · раунд 2 из 2 по лимиту правок</p>
+<hr>
+<p class="eyebrow">A · Точка отсчёта — то, что уже понравилось</p>
+<h2>01 Ёлочки и 03 Клавиша с новым именем</h2>
+<p class="lead" style="margin:8px 0 22px">Форма прежняя, текстовая часть — «Astra Voice». Рядом с каждым — уточнённая вариация (01b, 03b): то же самое, но вычищенное под маленькие размеры.</p>
+<section class="card">
+  <div class="head">
+    <span class="num">КОНЦЕПТ 01</span> <span class="tag">из раунда 1</span>
+    <h2>Ёлочки<span class="sub">прямая речь · типографика</span></h2>
+    <p class="idea">Русские кавычки-ёлочки — знак прямой речи. Открывающая тонкая (сказанное — воздух), закрывающая жирная (напечатанное — вещь), между ними акцентом лежит сама реплика.</p>
+    <p class="note">Из раунда 1, «более-менее». Здесь — только с новым именем, форма не тронута.</p>
+  </div>
+  <div class="duo">
+    <div class="pane light"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Ёлочки">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="-0.2">Astra Voice</text></svg><span class="cap">светлый фон</span></div>
+    <div class="pane dark"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Ёлочки">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="-0.2">Astra Voice</text></svg><span class="cap">тёмный фон</span></div>
+  </div>
+  <div class="duo">
+    <div class="pane mono"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Ёлочки">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="-0.2">Astra Voice</text></svg><span class="cap">один цвет — печать, ч/б</span></div>
+    <div class="pane inv"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Ёлочки">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="-0.2">Astra Voice</text></svg><span class="cap">фирменный фон, выворотка</span></div>
+  </div>
+  <div class="strip">
+    <div><span class="tile lt t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/></svg></span><span class="tile lt t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/></svg></span><span class="tile lt t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/></svg></span><span class="tile lt t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/></svg></span><span class="cap">иконка 128 / 48 / 24 / 16</span></div>
+    <div><span class="tile dk t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/></svg></span><span class="tile dk t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/></svg></span><span class="tile dk t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/></svg></span><span class="tile dk t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/></svg></span><span class="cap">тёмная иконка</span></div>
+  </div>
+  <div class="strip two">
+    <div><span class="panel kde-dark"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><br><span class="panel kde-light" style="margin-top:10px"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><span class="cap">трей KDE 22 px — тёмная и светлая панель</span></div>
+    <div>
+      <div class="states on-dark">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F2B559" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#4FBF88" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F0645F" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <div class="states on-light">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#E8A33A" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FA36B" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#D64545" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M8.2,6 L4.6,11 L8.2,16"/>
+    <path class="s" stroke-width="2.5" d="M14.6,6 L18.2,11 L14.6,16"/>
+    <circle class="st state" cx="11.4" cy="11" r="1.9"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <span class="cap">пять состояний — «слушаю» бирюзовый</span>
+    </div>
+  </div>
+</section>
+<section class="card">
+  <div class="head">
+    <span class="num">КОНЦЕПТ 01b</span> <span class="tag">из раунда 1</span>
+    <h2>Ёлочка<span class="sub">уточнение 01 · одна пара</span></h2>
+    <p class="idea">То же самое, но убрана половина элементов: одна тонкая открывающая, одна жирная закрывающая, реплика между ними. Идея не изменилась — знак стал чище.</p>
+    <p class="note">Зачем: у 01 в 16 px четыре шеврона слипаются в «решётку». Здесь три элемента вместо пяти — силуэт держится до 16 px, и точка-состояние крупнее.</p>
+  </div>
+  <div class="duo">
+    <div class="pane light"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Ёлочка">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="-0.2">Astra Voice</text></svg><span class="cap">светлый фон</span></div>
+    <div class="pane dark"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Ёлочка">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="-0.2">Astra Voice</text></svg><span class="cap">тёмный фон</span></div>
+  </div>
+  <div class="duo">
+    <div class="pane mono"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Ёлочка">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="-0.2">Astra Voice</text></svg><span class="cap">один цвет — печать, ч/б</span></div>
+    <div class="pane inv"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Ёлочка">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="-0.2">Astra Voice</text></svg><span class="cap">фирменный фон, выворотка</span></div>
+  </div>
+  <div class="strip">
+    <div><span class="tile lt t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/></svg></span><span class="tile lt t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/></svg></span><span class="tile lt t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/></svg></span><span class="tile lt t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/></svg></span><span class="cap">иконка 128 / 48 / 24 / 16</span></div>
+    <div><span class="tile dk t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/></svg></span><span class="tile dk t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/></svg></span><span class="tile dk t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/></svg></span><span class="tile dk t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- одна пара: тонкая (речь) → точка (реплика) → жирная (текст) -->
+    <path class="ink" stroke-width="5"   d="M20,14 L10,32 L20,50"/>
+    <path class="ink" stroke-width="8.5" d="M44,14 L54,32 L44,50"/>
+    <circle class="accf" cx="32" cy="32" r="5.5"/></svg></span><span class="cap">тёмная иконка</span></div>
+  </div>
+  <div class="strip two">
+    <div><span class="panel kde-dark"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><br><span class="panel kde-light" style="margin-top:10px"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><span class="cap">трей KDE 22 px — тёмная и светлая панель</span></div>
+    <div>
+      <div class="states on-dark">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F2B559" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#4FBF88" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F0645F" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <div class="states on-light">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#E8A33A" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FA36B" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#D64545" aria-hidden="true">    <path class="s" stroke-width="1.7" d="M7.4,5.2 L3.8,11 L7.4,16.8"/>
+    <path class="s" stroke-width="2.7" d="M14.6,5.2 L18.2,11 L14.6,16.8"/>
+    <circle class="st state" cx="11" cy="11" r="2.1"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <span class="cap">пять состояний — «слушаю» бирюзовый</span>
+    </div>
+  </div>
+</section>
+<section class="card">
+  <div class="head">
+    <span class="num">КОНЦЕПТ 03</span> <span class="tag">из раунда 1</span>
+    <h2>Клавиша<span class="sub">жест · зажатая клавиша</span></h2>
+    <p class="idea">Единственный жест продукта: зажал клавишу — говоришь. Форма-контейнер, внутри — индикатор состояния.</p>
+    <p class="note">Из раунда 1, «более-менее». Здесь — только с новым именем, форма не тронута.</p>
+  </div>
+  <div class="duo">
+    <div class="pane light"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Клавиша">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="0">Astra Voice</text></svg><span class="cap">светлый фон</span></div>
+    <div class="pane dark"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Клавиша">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="0">Astra Voice</text></svg><span class="cap">тёмный фон</span></div>
+  </div>
+  <div class="duo">
+    <div class="pane mono"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Клавиша">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="0">Astra Voice</text></svg><span class="cap">один цвет — печать, ч/б</span></div>
+    <div class="pane inv"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Клавиша">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="0">Astra Voice</text></svg><span class="cap">фирменный фон, выворотка</span></div>
+  </div>
+  <div class="strip">
+    <div><span class="tile lt t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/></svg></span><span class="tile lt t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/></svg></span><span class="tile lt t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/></svg></span><span class="tile lt t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/></svg></span><span class="cap">иконка 128 / 48 / 24 / 16</span></div>
+    <div><span class="tile dk t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/></svg></span><span class="tile dk t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/></svg></span><span class="tile dk t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/></svg></span><span class="tile dk t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/></svg></span><span class="cap">тёмная иконка</span></div>
+  </div>
+  <div class="strip two">
+    <div><span class="panel kde-dark"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><br><span class="panel kde-light" style="margin-top:10px"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><span class="cap">трей KDE 22 px — тёмная и светлая панель</span></div>
+    <div>
+      <div class="states on-dark">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F2B559" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#4FBF88" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F0645F" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <div class="states on-light">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#E8A33A" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FA36B" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#D64545" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <span class="cap">пять состояний — «слушаю» бирюзовый</span>
+    </div>
+  </div>
+</section>
+<section class="card">
+  <div class="head">
+    <span class="num">КОНЦЕПТ 03b</span> <span class="tag">из раунда 1</span>
+    <h2>Клавиша<span class="sub">уточнение 03 · одна форма на всех размерах</span></h2>
+    <p class="idea">Та же клавиша, но внутри — не три штриха, а та самая точка состояния, что и в трее.</p>
+    <p class="note">Зачем: у 03 логотип и трей-иконка сейчас разные (три штриха vs точка). Здесь форма одна на всех размерах — от 128 px до 16 px, и «слушаю» читается одинаково везде.</p>
+  </div>
+  <div class="duo">
+    <div class="pane light"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Клавиша">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="0">Astra Voice</text></svg><span class="cap">светлый фон</span></div>
+    <div class="pane dark"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Клавиша">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="0">Astra Voice</text></svg><span class="cap">тёмный фон</span></div>
+  </div>
+  <div class="duo">
+    <div class="pane mono"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Клавиша">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="0">Astra Voice</text></svg><span class="cap">один цвет — печать, ч/б</span></div>
+    <div class="pane inv"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Клавиша">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="0">Astra Voice</text></svg><span class="cap">фирменный фон, выворотка</span></div>
+  </div>
+  <div class="strip">
+    <div><span class="tile lt t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/></svg></span><span class="tile lt t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/></svg></span><span class="tile lt t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/></svg></span><span class="tile lt t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/></svg></span><span class="cap">иконка 128 / 48 / 24 / 16</span></div>
+    <div><span class="tile dk t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/></svg></span><span class="tile dk t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/></svg></span><span class="tile dk t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/></svg></span><span class="tile dk t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- клавиша + точка состояния: одна форма на всех размерах -->
+    <rect class="ink" stroke-width="5" x="6" y="13" width="52" height="42" rx="13"/>
+    <circle class="accf" cx="32" cy="34" r="6.5"/></svg></span><span class="cap">тёмная иконка</span></div>
+  </div>
+  <div class="strip two">
+    <div><span class="panel kde-dark"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><br><span class="panel kde-light" style="margin-top:10px"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><span class="cap">трей KDE 22 px — тёмная и светлая панель</span></div>
+    <div>
+      <div class="states on-dark">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F2B559" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#4FBF88" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F0645F" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <div class="states on-light">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#E8A33A" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FA36B" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#D64545" aria-hidden="true">    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <span class="cap">пять состояний — «слушаю» бирюзовый</span>
+    </div>
+  </div>
+</section>
+<hr>
+<p class="eyebrow">B · Четыре новых направления</p>
+<h2>Абзац · Слоги · Пилюля · Voice V</h2>
+<p class="lead" style="margin:8px 0 22px">Что учтено из отклика на раунд 1: сохранены типографская «своя» линия (05) и логика «форма-контейнер + индикатор состояния внутри» (05, 07); звуковая волна и курсор как метафоры больше не используются. Пятое предложенное направление — «эфир/сигнал в квадрате» — я не рисовал: любые дуги сигнала читаются как та же звуковая волна, которая не зашла.</p>
+<section class="card fresh">
+  <div class="head">
+    <span class="num">КОНЦЕПТ 05</span> <span class="tag new">новое</span>
+    <h2>Абзац<span class="sub">типографика · ¶ знак абзаца</span></h2>
+    <p class="idea">Пилькроу ¶ — типографский знак «здесь начинается новый абзац». Метафора прямая: сказал — и в документе появился абзац. Головка знака сплошная, как в настоящем шрифте, а внутри неё живёт голос: точка состояния.</p>
+    <p class="note">Плюс: типографский и «свой», как ёлочки, но силуэт цельный — не рассыпается на штрихи; внутри готовое место под индикатор, как в клавише. Минус: в 16 px головка становится плотным пятном с двумя ножками — узнаваемо, но менее чётко, чем клавиша; и у части людей ¶ = «показать непечатаемые символы» из Word. Стоит показать двум-трём будущим пользователям без объяснений.</p>
+  </div>
+  <div class="duo">
+    <div class="pane light"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Абзац">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="0.4">Astra Voice</text></svg><span class="cap">светлый фон</span></div>
+    <div class="pane dark"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Абзац">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="0.4">Astra Voice</text></svg><span class="cap">тёмный фон</span></div>
+  </div>
+  <div class="duo">
+    <div class="pane mono"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Абзац">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="0.4">Astra Voice</text></svg><span class="cap">один цвет — печать, ч/б</span></div>
+    <div class="pane inv"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Абзац">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="0.4">Astra Voice</text></svg><span class="cap">фирменный фон, выворотка</span></div>
+  </div>
+  <div class="strip">
+    <div><span class="tile lt t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/></svg></span><span class="tile lt t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/></svg></span><span class="tile lt t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/></svg></span><span class="tile lt t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/></svg></span><span class="cap">иконка 128 / 48 / 24 / 16</span></div>
+    <div><span class="tile dk t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/></svg></span><span class="tile dk t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/></svg></span><span class="tile dk t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/></svg></span><span class="tile dk t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/></svg></span><span class="cap">тёмная иконка</span></div>
+  </div>
+  <div class="strip two">
+    <div><span class="panel kde-dark"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><br><span class="panel kde-light" style="margin-top:10px"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><span class="cap">трей KDE 22 px — тёмная и светлая панель</span></div>
+    <div>
+      <div class="states on-dark">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F2B559" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#4FBF88" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F0645F" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <div class="states on-light">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#E8A33A" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FA36B" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#D64545" aria-hidden="true">    <path class="st" d="M15.8,4.1 L10.6,4.1 A3.95,3.95 0 0 0 10.6,11.9 L15.8,11.9 Z"/>
+    <path class="s" stroke-width="1.8" d="M14.9,11.9 L14.9,18"/>
+    <path class="s" stroke-width="1.8" d="M10.6,11.9 L10.6,18"/>
+    <circle class="st state" cx="9.9" cy="8" r="2.15"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <span class="cap">пять состояний — «слушаю» бирюзовый</span>
+    </div>
+  </div>
+</section>
+<section class="card fresh">
+  <div class="head">
+    <span class="num">КОНЦЕПТ 06</span> <span class="tag new">новое</span>
+    <h2>Слоги<span class="sub">геометрия · речь ложится строкой</span></h2>
+    <p class="idea">Речь дискретна — слоги, паузы, промежутки. Текст непрерывен — ровная строка. Три точки с сужающимися промежутками сверху, сплошная строка снизу: слоги ложатся строкой.</p>
+    <p class="note">Плюс: строгая геометрия без единой кривой — это не «звуковая волна», а ритм речи; две линии дают знаку читаемый прямоугольный силуэт. Минус: самый абстрактный из четырёх — без подписи метафора считывается не с первого взгляда.</p>
+  </div>
+  <div class="duo">
+    <div class="pane light"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Слоги">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="1.2">Astra Voice</text></svg><span class="cap">светлый фон</span></div>
+    <div class="pane dark"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Слоги">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="1.2">Astra Voice</text></svg><span class="cap">тёмный фон</span></div>
+  </div>
+  <div class="duo">
+    <div class="pane mono"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Слоги">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="1.2">Astra Voice</text></svg><span class="cap">один цвет — печать, ч/б</span></div>
+    <div class="pane inv"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Слоги">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="1.2">Astra Voice</text></svg><span class="cap">фирменный фон, выворотка</span></div>
+  </div>
+  <div class="strip">
+    <div><span class="tile lt t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/></svg></span><span class="tile lt t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/></svg></span><span class="tile lt t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/></svg></span><span class="tile lt t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/></svg></span><span class="cap">иконка 128 / 48 / 24 / 16</span></div>
+    <div><span class="tile dk t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/></svg></span><span class="tile dk t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/></svg></span><span class="tile dk t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/></svg></span><span class="tile dk t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- слоги (точки, промежутки сужаются) ложатся в строку текста -->
+    <circle class="accf" cx="10" cy="20" r="5.5"/>
+    <circle class="accf" cx="31" cy="20" r="5.5"/>
+    <circle class="accf" cx="48" cy="20" r="5.5"/>
+    <path class="ink" stroke-width="10" d="M10,44 L54,44"/></svg></span><span class="cap">тёмная иконка</span></div>
+  </div>
+  <div class="strip two">
+    <div><span class="panel kde-dark"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><br><span class="panel kde-light" style="margin-top:10px"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><span class="cap">трей KDE 22 px — тёмная и светлая панель</span></div>
+    <div>
+      <div class="states on-dark">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F2B559" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#4FBF88" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F0645F" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <div class="states on-light">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#E8A33A" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FA36B" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#D64545" aria-hidden="true">    <circle class="st state" cx="4.8" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="11" cy="7.2" r="1.8"/>
+    <circle class="st state" cx="16.4" cy="7.2" r="1.8"/>
+    <path class="s" stroke-width="3.2" d="M4.8,15.4 L17.2,15.4"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <span class="cap">пять состояний — «слушаю» бирюзовый</span>
+    </div>
+  </div>
+</section>
+<section class="card fresh">
+  <div class="head">
+    <span class="num">КОНЦЕПТ 07</span> <span class="tag new">новое</span>
+    <h2>Пилюля<span class="sub">сам продукт · оверлей записи</span></h2>
+    <p class="idea">Логотипом становится то, что человек реально видит на экране: плавающая пилюля записи — слева живая точка «слушаю», справа растущая строка распознанного.</p>
+    <p class="note">Плюс: самый честный знак — это буквально интерфейс продукта, и он уже задуман как контейнер с индикатором. Минус: горизонтальная форма слабее в квадратной иконке приложения, чем клавиша; и это второй «контейнер с точкой» в наборе после 03.</p>
+  </div>
+  <div class="duo">
+    <div class="pane light"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Пилюля">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="0.2">Astra Voice</text></svg><span class="cap">светлый фон</span></div>
+    <div class="pane dark"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Пилюля">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="0.2">Astra Voice</text></svg><span class="cap">тёмный фон</span></div>
+  </div>
+  <div class="duo">
+    <div class="pane mono"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Пилюля">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="0.2">Astra Voice</text></svg><span class="cap">один цвет — печать, ч/б</span></div>
+    <div class="pane inv"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Пилюля">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="0.2">Astra Voice</text></svg><span class="cap">фирменный фон, выворотка</span></div>
+  </div>
+  <div class="strip">
+    <div><span class="tile lt t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/></svg></span><span class="tile lt t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/></svg></span><span class="tile lt t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/></svg></span><span class="tile lt t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/></svg></span><span class="cap">иконка 128 / 48 / 24 / 16</span></div>
+    <div><span class="tile dk t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/></svg></span><span class="tile dk t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/></svg></span><span class="tile dk t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/></svg></span><span class="tile dk t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- оверлей записи как знак: живая точка + растущая строка внутри пилюли -->
+    <rect class="ink" stroke-width="5" x="3" y="18" width="58" height="28" rx="14"/>
+    <circle class="accf" cx="18.5" cy="32" r="6.5"/>
+    <path class="ink" stroke-width="5.5" d="M31.5,32 L51,32"/></svg></span><span class="cap">тёмная иконка</span></div>
+  </div>
+  <div class="strip two">
+    <div><span class="panel kde-dark"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><br><span class="panel kde-light" style="margin-top:10px"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><span class="cap">трей KDE 22 px — тёмная и светлая панель</span></div>
+    <div>
+      <div class="states on-dark">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F2B559" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#4FBF88" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F0645F" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <div class="states on-light">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#E8A33A" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FA36B" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#D64545" aria-hidden="true">    <rect class="s" stroke-width="1.8" x="1.7" y="6.2" width="18.6" height="9.6" rx="4.8"/>
+    <circle class="st state" cx="7.2" cy="11" r="2.2"/>
+    <path class="s" stroke-width="1.7" d="M12.2,11 L16.6,11"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <span class="cap">пять состояний — «слушаю» бирюзовый</span>
+    </div>
+  </div>
+</section>
+<section class="card fresh">
+  <div class="head">
+    <span class="num">КОНЦЕПТ 08</span> <span class="tag new">новое</span>
+    <h2>Voice V<span class="sub">буквенный знак · воронка голоса</span></h2>
+    <p class="idea">Буква V из имени Voice и одновременно воронка: голос (точка) входит сверху и сводится в одну точку — в текст. Знак и первая буква имени — один объект.</p>
+    <p class="note">Плюс: единственный в наборе буквенный знак — он же короткое имя продукта, отлично держит 16 px. Со знаком Astra Linux не пересекается: без звезды, без астры-цветка, без «А» и без круглой эмблемы — родство только по цвету. Минус: «шеврон + точка» — ходовая форма (похоже на «свернуть»/«скачать»), нужна проверка на конфликт с системными иконками KDE.</p>
+  </div>
+  <div class="duo">
+    <div class="pane light"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Voice V">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" letter-spacing="-0.2" xml:space="preserve"><tspan font-weight="400">Astra </tspan><tspan font-weight="700">Voice</tspan></text></svg><span class="cap">светлый фон</span></div>
+    <div class="pane dark"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Voice V">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" letter-spacing="-0.2" xml:space="preserve"><tspan font-weight="400">Astra </tspan><tspan font-weight="700">Voice</tspan></text></svg><span class="cap">тёмный фон</span></div>
+  </div>
+  <div class="duo">
+    <div class="pane mono"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Voice V">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" letter-spacing="-0.2" xml:space="preserve"><tspan font-weight="400">Astra </tspan><tspan font-weight="700">Voice</tspan></text></svg><span class="cap">один цвет — печать, ч/б</span></div>
+    <div class="pane inv"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" role="img" aria-label="Astra Voice — Voice V">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/>  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" letter-spacing="-0.2" xml:space="preserve"><tspan font-weight="400">Astra </tspan><tspan font-weight="700">Voice</tspan></text></svg><span class="cap">фирменный фон, выворотка</span></div>
+  </div>
+  <div class="strip">
+    <div><span class="tile lt t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/></svg></span><span class="tile lt t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/></svg></span><span class="tile lt t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/></svg></span><span class="tile lt t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/></svg></span><span class="cap">иконка 128 / 48 / 24 / 16</span></div>
+    <div><span class="tile dk t128"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/></svg></span><span class="tile dk t48"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/></svg></span><span class="tile dk t24"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/></svg></span><span class="tile dk t16"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true">    <!-- V (Voice) как воронка: голос сверху сходится в точку — в текст -->
+    <path class="ink" stroke-width="7.5" d="M8,14 L32,50 L56,14"/>
+    <circle class="accf" cx="32" cy="28" r="6"/></svg></span><span class="cap">тёмная иконка</span></div>
+  </div>
+  <div class="strip two">
+    <div><span class="panel kde-dark"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><br><span class="panel kde-light" style="margin-top:10px"><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M4,7 H18 M4,11 H18 M4,15 H13"/></svg></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg><span class="dim"><svg viewBox="0 0 22 22" aria-hidden="true"><path class="s" stroke-width="1.6" d="M11,4.5 A6.5,6.5 0 1 1 10.99,4.5"/><path class="s" stroke-width="1.6" d="M11,7.5 V11 L13.5,12.8"/></svg></span></span><span class="cap">трей KDE 22 px — тёмная и светлая панель</span></div>
+    <div>
+      <div class="states on-dark">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FD9C4" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F2B559" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#4FBF88" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#F0645F" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <div class="states on-light">
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg></span><span class="st-label">покой</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#12B3A0" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg></span><span class="st-label">слушаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#E8A33A" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg></span><span class="st-label">распознаю</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#2FA36B" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg></span><span class="st-label">готово</span></span>
+        <span class="one"><span class="box"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" style="--state:#D64545" aria-hidden="true">    <path class="s" stroke-width="2.5" d="M3.4,5.4 L11,17.6 L18.6,5.4"/>
+    <circle class="st state" cx="11" cy="9" r="1.8"/></svg></span><span class="st-label">ошибка</span></span>
+      </div>
+      <span class="cap">пять состояний — «слушаю» бирюзовый</span>
+    </div>
+  </div>
+</section>
+<hr>
+<p class="eyebrow">C · Рекомендация и вопросы</p>
+<h2>Что бы выбрал я</h2>
+<div class="rec-box">
+<p><b>05 «Абзац» (¶)</b> — первый выбор. Он делает ровно то, за что зацепились ёлочки (типографский, «свой», из письменных символов), но силуэт цельный, а не набор штрихов: ёлочки в 16 px рассыпаются, ¶ — нет. И внутри у него готовое место под индикатор состояния — то, за что зацепилась клавиша. Чем платим: в 16 px ¶ — плотное пятно с двумя ножками, менее чёткое, чем клавиша.</p>
+<p><b>03b «Клавиша»</b> — второй выбор и самый безопасный: честный жест продукта, лучшая читаемость в трее из всех восьми, одна и та же форма от 128 до 16 px. Если спор затянется — берите его, он точно не подведёт.</p>
+<p><b>08 «Voice V»</b> — если хочется, чтобы знак был буквой имени. Перед выбором нужна проверка на конфликт с системными иконками KDE (шеврон — ходовая форма).</p>
+</div>
+<h2 style="margin-top:34px">Вопросы, на которые нужен ответ</h2>
+<ol class="q">
+<li><b>Одно направление из восьми.</b> Если ни одно не «то» — скажите, какое ближе всего и что именно в нём мешает: лимит раундов исчерпан, дальше идёт доводка выбранного, а не новый поиск.</li>
+<li><b>01 или 01b, 03 или 03b</b> — если выбор падёт на них.</li>
+<li><b>Знак ¶ (05): не читается ли он как «непечатаемые символы» из Word?</b> Стоит показать двум-трём будущим пользователям без объяснений и спросить, что это.</li>
+<li><b>Текстовая часть.</b> Сейчас везде «Astra Voice» одним начертанием (в 08 — «Astra» тонким, «Voice» жирным). Нужен ли вариант с кириллической подписью «Астра Войс» / «голосовой ввод» второй строкой для документов и госзакупок?</li>
+</ol>
+<hr>
+<p class="eyebrow">D · База айдентики (без изменений)</p>
+<h2>Фирменные цвета</h2>
+<div class="sw" style="margin-top:16px">
+<div style="background:#0E1729;color:#fff;border-color:#0E1729"><b>brand.ink</b><span>#0E1729</span></div>
+<div style="background:#1B3A73;color:#fff;border-color:#1B3A73"><b>brand.primary</b><span>#1B3A73</span></div>
+<div style="background:#12B3A0;color:#08201C;border-color:#12B3A0"><b>brand.accent «слушаю»</b><span>#12B3A0</span></div>
+<div style="background:#0B7F71;color:#fff;border-color:#0B7F71"><b>accent.ink (текст)</b><span>#0B7F71</span></div>
+<div style="background:#E3F7F4;color:#0E1729;border-color:#E3F7F4"><b>accent.bg</b><span>#E3F7F4</span></div>
+<div style="background:#E8A33A;color:#2A1B02;border-color:#E8A33A"><b>распознаю</b><span>#E8A33A</span></div>
+<div style="background:#2FA36B;color:#fff;border-color:#2FA36B"><b>готово</b><span>#2FA36B</span></div>
+<div style="background:#D64545;color:#fff;border-color:#D64545"><b>ошибка</b><span>#D64545</span></div>
+<div style="background:#0B1220;color:#F2F5FA;border-color:#0B1220"><b>тёмная тема bg</b><span>#0B1220</span></div>
+<div style="background:#2FD9C4;color:#08201C;border-color:#2FD9C4"><b>тёмная тема accent</b><span>#2FD9C4</span></div>
+</div>
+<h2 style="margin-top:34px">PT Root UI + PT Mono</h2>
+<div class="type-demo" style="margin-top:16px">
+<div style="font-size:28px;font-weight:700;line-height:1.2">Astra Voice — голосовой ввод</div>
+<div style="font-size:20px;font-weight:700;line-height:1.25;margin-top:14px">Зажмите клавишу и говорите</div>
+<div style="font-size:14px;line-height:1.5;margin-top:10px;max-width:66ch">Текст появляется там, где стоит курсор — в письме, документе или чате. Ничего не уходит в сеть: распознавание идёт на вашем процессоре. Ёлки, ёж, всё с «ё» на месте.</div>
+<div style="font-size:12px;color:var(--n500);margin-top:12px">GigaAM v3 · ≈415 МБ ОЗУ · <span style="font-family:var(--mono)">Ctrl + Shift + Space</span></div>
+</div>
+<p class="meta">design/brand/ — concept-1, 1b, 3, 3b, 5, 6, 7, 8 (+ *-tray) · brand-basics.md</p>
+</div></body></html>

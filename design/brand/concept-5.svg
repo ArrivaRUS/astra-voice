@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" width="306" height="80" role="img" aria-label="Astra Voice — концепт 03: Клавиша">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 306 80" width="306" height="80" role="img" aria-label="Astra Voice — концепт 05: Абзац">
   <style>
     /* Без CSS-переменных: librsvg (GTK-миниатюры, конвертеры) их не поддерживает
        и акцентные части пропадают. Только литеральные цвета и currentColor. */
@@ -13,11 +13,11 @@
     }
   </style>
   <g class="mark" transform="translate(8,8)">
-    <!-- клавиша: единственный жест продукта — зажать и говорить -->
-    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
-    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
-    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
-    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/>
+    <!-- ¶ : сказал — появился абзац; внутри головки живёт голос -->
+    <path class="inkf" d="M46,11.5 L31,11.5 A11.5,11.5 0 0 0 31,34.5 L46,34.5 Z"/>
+    <path class="ink" stroke-width="5" d="M43.5,34.5 L43.5,53"/>
+    <path class="ink" stroke-width="5" d="M31,34.5 L31,53"/>
+    <circle class="accf" cx="29" cy="23" r="6.5"/>
   </g>
-  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="700" letter-spacing="0">Astra Voice</text>
+  <text class="wm" x="92" y="51.5" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="32" font-weight="500" letter-spacing="0.4">Astra Voice</text>
 </svg>
