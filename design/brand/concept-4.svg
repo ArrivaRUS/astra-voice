@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 204 80" width="204" height="80" role="img" aria-label="Вслух — концепт 4: Каретка">
+  <style>
+    svg { color:#0E1729; --a:#12B3A0; }
+    @media (prefers-color-scheme: dark) { svg { color:#F2F5FA; --a:#2FD9C4; } }
+    .ink  { fill:none; stroke:currentColor; stroke-linecap:round; stroke-linejoin:round; }
+    .acc  { fill:none; stroke:var(--a);     stroke-linecap:round; stroke-linejoin:round; }
+    .accf { fill:var(--a); stroke:none; }
+    .wm   { fill:currentColor; stroke:none; }
+  </style>
+  <g class="mark" transform="translate(3,8)">
+    <!-- каретка: речь приходит прямо в текстовый курсор -->
+    <path class="acc" stroke-width="5"   d="M27,43 A22,22 0 0 1 27,21"/>
+    <path class="acc" stroke-width="5"   d="M18.3,48 A32,32 0 0 1 18.3,16"/>
+    <path class="ink" stroke-width="7"   d="M46,13 L46,51"/>
+    <path class="ink" stroke-width="5"   d="M40,13 L52,13"/>
+    <path class="ink" stroke-width="5"   d="M40,51 L52,51"/>
+  </g>
+  <text class="wm" x="80" y="53" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="38" font-weight="400" letter-spacing="0.8">Вслух</text>
+</svg>

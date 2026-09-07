@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="22" height="22" role="img" aria-label="трей-иконка, концепт 3">
+  <style>
+    svg { color:#0E1729; }
+    @media (prefers-color-scheme: dark) { svg { color:#F2F5FA; } }
+    .s  { fill:none; stroke:currentColor; stroke-linecap:round; stroke-linejoin:round; }
+    .st { fill:currentColor; stroke:none; }        /* элемент состояния */
+    .sl { fill:none; stroke:currentColor; stroke-linecap:round; }
+  </style>
+    <rect class="s" stroke-width="1.7" x="2.6" y="4.2" width="16.8" height="13.6" rx="4.4"/>
+    <circle class="st state" cx="11" cy="11" r="2.4"/>
+</svg>

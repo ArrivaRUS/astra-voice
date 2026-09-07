@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 213 80" width="213" height="80" role="img" aria-label="Вслух — концепт 3: Клавиша">
+  <style>
+    svg { color:#0E1729; --a:#12B3A0; }
+    @media (prefers-color-scheme: dark) { svg { color:#F2F5FA; --a:#2FD9C4; } }
+    .ink  { fill:none; stroke:currentColor; stroke-linecap:round; stroke-linejoin:round; }
+    .acc  { fill:none; stroke:var(--a);     stroke-linecap:round; stroke-linejoin:round; }
+    .accf { fill:var(--a); stroke:none; }
+    .wm   { fill:currentColor; stroke:none; }
+  </style>
+  <g class="mark" transform="translate(8,8)">
+    <!-- клавиша: единственный жест продукта — зажать и говорить -->
+    <rect class="ink" stroke-width="5" x="8" y="14" width="48" height="40" rx="12"/>
+    <path class="acc" stroke-width="4.6" d="M23.5,30 L23.5,38"/>
+    <path class="acc" stroke-width="4.6" d="M32,24 L32,44"/>
+    <path class="acc" stroke-width="4.6" d="M40.5,28 L40.5,40"/>
+  </g>
+  <text class="wm" x="92" y="53" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="40" font-weight="700" letter-spacing="0">Вслух</text>
+</svg>

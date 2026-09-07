@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 214 80" width="214" height="80" role="img" aria-label="Вслух — концепт 2: Волна в строку">
+  <style>
+    svg { color:#0E1729; --a:#12B3A0; }
+    @media (prefers-color-scheme: dark) { svg { color:#F2F5FA; --a:#2FD9C4; } }
+    .ink  { fill:none; stroke:currentColor; stroke-linecap:round; stroke-linejoin:round; }
+    .acc  { fill:none; stroke:var(--a);     stroke-linecap:round; stroke-linejoin:round; }
+    .accf { fill:var(--a); stroke:none; }
+    .wm   { fill:currentColor; stroke:none; }
+  </style>
+  <g class="mark" transform="translate(8,8)">
+    <!-- волна речи, затухающая в ровную строку текста -->
+    <path class="acc" stroke-width="6" d="M7,32 C10,12 15,12 18,32 C21,50 26,50 29,32 C31,22 35,26 38,32"/>
+    <path class="ink" stroke-width="6" d="M38,32 L57,32"/>
+  </g>
+  <text class="wm" x="92" y="53" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="38" font-weight="500" letter-spacing="1.6">Вслух</text>
+</svg>

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 214 80" width="214" height="80" role="img" aria-label="Вслух — концепт 1: Ёлочки — прямая речь">
+  <style>
+    svg { color:#0E1729; --a:#12B3A0; }
+    @media (prefers-color-scheme: dark) { svg { color:#F2F5FA; --a:#2FD9C4; } }
+    .ink  { fill:none; stroke:currentColor; stroke-linecap:round; stroke-linejoin:round; }
+    .acc  { fill:none; stroke:var(--a);     stroke-linecap:round; stroke-linejoin:round; }
+    .accf { fill:var(--a); stroke:none; }
+    .wm   { fill:currentColor; stroke:none; }
+  </style>
+  <g class="mark" transform="translate(8,8)">
+    <!-- «ёлочки»: тонкая открывающая (речь) + жирная закрывающая (текст), между ними — сказанное -->
+    <path class="ink" stroke-width="4.2" d="M14,15 L6,32 L14,49"/>
+    <path class="ink" stroke-width="4.2" d="M22,15 L14,32 L22,49"/>
+    <path class="ink" stroke-width="7"   d="M42,15 L50,32 L42,49"/>
+    <path class="ink" stroke-width="7"   d="M50,15 L58,32 L50,49"/>
+    <circle class="accf" cx="32" cy="32" r="5"/>
+  </g>
+  <text class="wm" x="92" y="53" font-family="'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif" font-size="40" font-weight="700" letter-spacing="-0.4">Вслух</text>
+</svg>
