@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>A · Панель — Обновления</title>
+<style>
+:root{--font-ui:'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif;--font-mono:'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace;
+  --bg-app:#F7F9FC; --bg-surface:#FFFFFF; --bg-sunk:#EDF1F7; --bg-tbar:#E7ECF4;
+  --border:#D7DEEA; --border-soft:#EDF1F7;
+  --fg1:#0E1729; --fg2:#243350; --fg3:#5A6884; --fg4:#AAB4C7;
+  --primary:#1B3A73; --primary-hover:#12294F; --primary-fg:#FFFFFF; --primary-bg:#E8EDF7;
+  --accent:#12B3A0; --accent-ink:#0B7F71; --accent-bg:#E3F7F4;
+  --ok-ink:#1F7D50; --ok-bg:#E7F5EE;
+  --warn-ink:#8F5E12; --warn-bg:#FAF0DC;
+  --err-ink:#C0322F; --err-bg:#FBECEB;
+  --canvas:#DDE3EE; --canvas-fg:#3A4761; --shadow:rgba(14,23,41,.18);
+}
+
+*{box-sizing:border-box}
+body{margin:0;padding:26px 20px 34px;background:var(--canvas);color:var(--canvas-fg);
+  font-family:var(--font-ui);font-size:14px;line-height:1.5;
+  display:flex;flex-direction:column;align-items:center;gap:14px;-webkit-font-smoothing:antialiased}
+.cap{font-size:13px;letter-spacing:.01em}
+.cap b{color:var(--fg1);font-weight:700}
+body.dark .cap b{color:#F2F5FA}
+.legend{max-width:900px;font-size:12.5px;line-height:1.55;opacity:.95}
+.legend b{font-weight:700}
+.legend ul{margin:6px 0 0;padding-left:18px}
+.mono{font-family:var(--font-mono);letter-spacing:.02em}
+
+/* ── окно ───────────────────────────────────────────── */
+.win{background:var(--bg-app);color:var(--fg1);border-radius:8px;overflow:hidden;
+  box-shadow:0 14px 44px var(--shadow);display:flex;flex-direction:column;flex:none}
+.tbar{height:32px;flex:none;display:flex;align-items:center;gap:8px;padding:0 10px;
+  background:var(--bg-tbar);border-bottom:1px solid var(--border)}
+.tbar .t{font-size:12.5px;color:var(--fg2);font-weight:500}
+.tbar .sp{flex:1}
+.wbtn{width:14px;height:14px;border-radius:3px;background:var(--border);display:inline-block}
+.wbtn.c{background:#D96B62}
+body.dark .wbtn.c{background:#8C3B36}
+
+/* ── типографика ────────────────────────────────────── */
+.h1{font-size:28px;line-height:1.2;font-weight:700;color:var(--fg1);margin:0}
+.h2{font-size:20px;line-height:1.25;font-weight:700;color:var(--fg1);margin:0}
+.h3{font-size:16px;line-height:1.3;font-weight:500;color:var(--fg1);margin:0}
+.sm{font-size:13px;line-height:1.45;color:var(--fg3)}
+.c12{font-size:12px;line-height:1.4;color:var(--fg3)}
+.grp{font-size:11px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--fg3);margin:0 0 7px 2px}
+.muted{color:var(--fg3)}
+.strong{font-weight:700;color:var(--fg1)}
+
+/* ── карточки и строки настроек ─────────────────────── */
+.card{background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.card>.r+.r{border-top:1px solid var(--border-soft)}
+.r{display:flex;align-items:center;gap:10px;padding:11px 14px;min-height:44px}
+.r .lbl{font-size:14px;color:var(--fg1);font-weight:400}
+.r .sub{font-size:12px;color:var(--fg3);margin-top:2px}
+.r .left{flex:1;min-width:0}
+.r.dis{opacity:.5}
+.hint{width:15px;height:15px;flex:none;border-radius:50%;border:1px solid var(--fg4);color:var(--fg3);
+  font-size:10px;line-height:13px;text-align:center;display:inline-block;font-weight:500}
+.lockb{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--fg3);
+  background:var(--bg-sunk);border-radius:5px;padding:2px 6px}
+
+/* ── контролы ───────────────────────────────────────── */
+.tgl{width:38px;height:21px;border-radius:11px;background:var(--fg4);position:relative;flex:none}
+.tgl i{position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;background:#fff;display:block}
+.tgl.on{background:var(--primary)}
+.tgl.on i{left:19px}
+.tgl.lock{background:var(--border)}
+.btn{font-family:var(--font-ui);font-size:13px;font-weight:500;color:var(--fg1);background:var(--bg-surface);
+  border:1px solid var(--border);border-radius:7px;padding:6px 12px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.btn.pri{background:var(--primary);border-color:var(--primary);color:var(--primary-fg)}
+.btn.gh{background:transparent;border-color:transparent;color:var(--primary);padding:6px 8px}
+.btn.dis{opacity:.45}
+.btn.sm{font-size:12.5px;padding:4px 9px}
+.sel{font-size:13px;color:var(--fg1);background:var(--bg-surface);border:1px solid var(--border);
+  border-radius:7px;padding:6px 10px;display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:7px;overflow:hidden;background:var(--bg-surface)}
+.seg span{font-size:12.5px;padding:5px 11px;color:var(--fg2)}
+.seg span.on{background:var(--primary);color:var(--primary-fg);font-weight:500}
+.key{font-family:var(--font-mono);font-size:13px;color:var(--fg1);background:var(--bg-sunk);
+  border-radius:6px;padding:3px 8px 2px;border-bottom:2px solid var(--border);display:inline-block;letter-spacing:.02em}
+.field{font-size:13px;color:var(--fg3);background:var(--bg-surface);border:1px solid var(--border);
+  border-radius:7px;padding:7px 11px;display:flex;align-items:center;gap:8px}
+.field.cap{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-bg);color:var(--fg1)}
+.chip{font-size:12.5px;color:var(--fg2);background:var(--bg-surface);border:1px solid var(--border);
+  border-radius:14px;padding:4px 11px;display:inline-flex;align-items:center;gap:6px}
+.chip.on{background:var(--primary);border-color:var(--primary);color:var(--primary-fg);font-weight:500}
+
+/* ── бейджи и теги ──────────────────────────────────── */
+.bd{font-size:11.5px;font-weight:500;border-radius:5px;padding:2px 7px;display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.bd.act{background:var(--accent-bg);color:var(--accent-ink)}
+.bd.rec{background:var(--primary-bg);color:var(--primary)}
+.bd.upd{background:var(--warn-bg);color:var(--warn-ink)}
+.bd.new{background:var(--bg-sunk);color:var(--fg3)}
+.bd.err{background:var(--err-bg);color:var(--err-ink)}
+.tag{font-size:12px;color:var(--fg3);white-space:nowrap}
+.dot{width:4px;height:4px;border-radius:50%;background:var(--fg4);display:inline-block;vertical-align:middle}
+
+/* ── полоски метрик ─────────────────────────────────── */
+.met{display:flex;align-items:center;gap:8px}
+.met .mn{font-size:11.5px;color:var(--fg3);width:58px;text-align:right;flex:none}
+.trk{width:88px;height:6px;border-radius:3px;background:var(--bg-sunk);overflow:hidden;flex:none}
+.trk i{display:block;height:100%;border-radius:3px;background:var(--primary)}
+.trk.est i{background:var(--fg4)}
+.met .mv{font-size:11.5px;color:var(--fg3);white-space:nowrap}
+.met .mv b{color:var(--fg1);font-weight:700}
+.prog{height:6px;border-radius:3px;background:var(--bg-sunk);overflow:hidden}
+.prog i{display:block;height:100%;background:var(--primary);border-radius:3px}
+
+/* ── полосы-уведомления ─────────────────────────────── */
+.note{display:flex;gap:9px;align-items:flex-start;border-radius:9px;padding:10px 12px;font-size:12.5px;line-height:1.45}
+.note.i{background:var(--bg-sunk);color:var(--fg2)}
+.note.w{background:var(--warn-bg);color:var(--warn-ink)}
+.note.e{background:var(--err-bg);color:var(--err-ink)}
+.note.o{background:var(--ok-bg);color:var(--ok-ink)}
+.note b{display:block;font-weight:700;margin-bottom:2px}
+
+/* ── нижняя строка окна ─────────────────────────────── */
+.foot{height:36px;flex:none;display:flex;align-items:center;gap:10px;padding:0 14px;
+  background:var(--bg-app);border-top:1px solid var(--border);font-size:12.5px;color:var(--fg3)}
+.foot .sp{flex:1}
+.foot .up{color:var(--primary);font-weight:500}
+.foot .num{font-family:var(--font-mono);font-size:12px}
+
+/* ── пилюля-оверлей ─────────────────────────────────── */
+.desk{border-radius:8px;overflow:hidden;position:relative;box-shadow:0 14px 44px var(--shadow);flex:none;
+  background:linear-gradient(160deg,#16233F 0%,#0E1729 55%,#1B3A73 100%)}
+.dwin{position:absolute;background:#FFFFFF;border-radius:7px;box-shadow:0 8px 26px rgba(0,0,0,.35);overflow:hidden}
+.dwin .dt{height:26px;background:#E7ECF4;border-bottom:1px solid #D7DEEA;display:flex;align-items:center;
+  padding:0 9px;font-size:11.5px;color:#243350}
+.dwin .dc{padding:12px 14px;font-size:12.5px;line-height:1.65;color:#0E1729}
+.panel{position:absolute;left:0;right:0;bottom:0;height:40px;background:#0B1220;
+  display:flex;align-items:center;gap:8px;padding:0 10px;border-top:1px solid rgba(255,255,255,.08)}
+.panel .pb{font-size:11.5px;color:#C4CDDC;background:rgba(255,255,255,.07);border-radius:5px;padding:4px 9px}
+.panel .sp{flex:1}
+.pill{background:rgba(14,23,41,.94);border-radius:18px;height:36px;display:inline-flex;align-items:center;
+  gap:9px;padding:0 10px;color:#F2F5FA;font-size:12.5px;box-shadow:0 6px 18px rgba(0,0,0,.4)}
+.pill .lv{display:flex;align-items:flex-end;gap:3px;height:20px}
+.pill .lv i{width:6px;border-radius:3px;background:#12B3A0;display:block}
+.pill .lv.f i{background:#5A6884}
+.pill .x{width:22px;height:22px;border-radius:50%;background:rgba(255,255,255,.12);display:inline-flex;
+  align-items:center;justify-content:center;color:#C4CDDC;font-size:13px;line-height:1}
+.pill .st{white-space:nowrap}
+.pill .st b{font-weight:700}
+.gal{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center;
+  background:var(--bg-sunk);border:1px solid var(--border);border-radius:10px;padding:14px}
+.gal .cell{display:flex;flex-direction:column;align-items:center;gap:6px}
+.gal .cn{font-size:11px;color:var(--fg3)}
+
+/* ── трей-меню ──────────────────────────────────────── */
+.menu{background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:5px;
+  box-shadow:0 12px 34px var(--shadow);width:262px}
+.mi{display:flex;align-items:center;gap:9px;padding:6px 9px;border-radius:6px;font-size:13px;color:var(--fg1)}
+.mi .sp{flex:1}
+.mi .sc{font-family:var(--font-mono);font-size:11.5px;color:var(--fg3)}
+.mi.dis{color:var(--fg4)}
+.mi.hd{color:var(--fg3);font-size:12px;padding-top:3px;padding-bottom:3px}
+.mi.hl{background:var(--primary);color:var(--primary-fg)}
+.mi.hl .sc{color:rgba(255,255,255,.7)}
+.msep{height:1px;background:var(--border-soft);margin:4px 6px}
+
+/* ── прокрутка (визуальная, содержимое обрезано как в реальном окне) ── */
+.scr{position:relative;overflow:hidden}
+.sb{position:absolute;right:4px;width:5px;border-radius:3px;background:var(--fg4);opacity:.45}
+
+/* ── карточка модели ────────────────────────────────── */
+.mc{background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:10px 13px;margin-bottom:9px}
+.mc.act{border-color:var(--accent);background:var(--accent-bg)}
+.mc.rec{border-color:var(--primary)}
+.mc.dis{opacity:.62}
+.mtop{display:flex;gap:14px;align-items:flex-start}
+.mtop .ml{flex:1;min-width:0}
+.mname{font-size:15px;font-weight:500;color:var(--fg1)}
+.mven{color:var(--fg3);font-weight:400;font-size:12.5px}
+.mpurp{font-size:12.5px;color:var(--fg3);margin-top:2px}
+.mbadges{display:flex;gap:5px;flex-wrap:wrap;margin-top:4px}
+.mmets{display:flex;flex-direction:column;gap:5px;flex:none}
+.mhr{height:1px;background:var(--border-soft);margin:9px 0 8px}
+.mbot{display:flex;align-items:center;gap:9px;font-size:12px;color:var(--fg3);flex-wrap:wrap}
+.mbot .sp{flex:1}
+
+
+.side{width:184px;flex:none;background:var(--bg-sunk);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;padding:12px 10px}
+.slogo{display:flex;align-items:center;gap:8px;padding:4px 6px 12px;margin-bottom:6px;
+  border-bottom:1px solid var(--border)}
+.nav{display:flex;flex-direction:column;gap:2px;margin-top:8px}
+.nv{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:7px;font-size:13.5px;
+  font-weight:500;color:var(--fg2)}
+.nv.on{background:var(--primary);color:var(--primary-fg)}
+.nv.sub{font-weight:400;color:var(--fg3);font-size:13px}
+.cont{flex:1;min-width:0;display:flex;flex-direction:column}
+.chead{padding:13px 22px 9px}
+.r{padding:10px 14px;min-height:42px}
+.cbody{flex:1;padding:0 22px 16px}
+.wrap{display:flex;flex:1;min-height:0}
+.steps{display:flex;align-items:center;gap:7px}
+.sd{width:7px;height:7px;border-radius:50%;background:var(--border)}
+.sd.on{background:var(--primary);width:20px;border-radius:4px}
+.sd.dn{background:var(--fg4)}
+.obody{flex:1;display:flex;flex-direction:column;align-items:center;padding:26px 40px 0}
+.obar{height:60px;flex:none;border-top:1px solid var(--border);display:flex;align-items:center;
+  gap:10px;padding:0 22px;background:var(--bg-app)}
+.upan{background:var(--bg-surface);border:1px solid var(--primary);border-radius:10px;padding:14px 16px}
+.ul{margin:6px 0 0;padding-left:17px;font-size:12.5px;color:var(--fg2);line-height:1.6}
+</style></head>
+<body class="light">
+<div class="cap"><b>A · Панель</b> — обновления, трек без ЗПС + строка внизу «Доступна версия» · 900×620</div>
+<div class="win" style="width:900px;height:620px"><div class="tbar-x"></div><div class="tbar"><svg viewBox="0 0 100 51.7238" width="16" height="8.28" aria-hidden="true" style="flex:none"><circle cx="8.1233" cy="12.8619" r="6.7694" fill="var(--fg1)"/><circle cx="41.4966" cy="12.8619" r="9.3418" fill="var(--fg1)"/><circle cx="69.7928" cy="12.8619" r="12.8619" fill="var(--accent)"/><rect x="0" y="31.7238" width="100" height="20" rx="10" fill="var(--fg1)"/></svg><span class="t">Astra Voice — Настройки</span><span class="sp"></span><span class="wbtn"></span><span class="wbtn"></span><span class="wbtn c"></span></div><div class="wrap"><div class="side"><div class="slogo"><span style="display:inline-flex;align-items:center;gap:8px"><svg viewBox="0 0 100 51.7238" width="22" height="11.38" aria-hidden="true" style="flex:none"><circle cx="8.1233" cy="12.8619" r="6.7694" fill="var(--fg1)"/><circle cx="41.4966" cy="12.8619" r="9.3418" fill="var(--fg1)"/><circle cx="69.7928" cy="12.8619" r="12.8619" fill="var(--accent)"/><rect x="0" y="31.7238" width="100" height="20" rx="10" fill="var(--fg1)"/></svg><span style="font-size:15px;font-weight:500;letter-spacing:.03em;color:var(--fg1)">Astra&nbsp;Voice</span></span></div><div class="nav"><div class="nv"><svg viewBox="0 0 16 16" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 10.1a2.1 2.1 0 1 0 0-4.2 2.1 2.1 0 0 0 0 4.2zM8 1.9v1.7M8 12.4v1.7M2.7 8h1.7M11.6 8h1.7M4.2 4.2l1.2 1.2M10.6 10.6l1.2 1.2M11.8 4.2l-1.2 1.2M5.4 10.6l-1.2 1.2"/></svg><span>Общие</span></div><div class="nv"><svg viewBox="0 0 16 16" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M5.4 5.4h5.2v5.2H5.4zM6.6 2.6v2.8M9.4 2.6v2.8M6.6 10.6v2.8M9.4 10.6v2.8M2.6 6.6h2.8M2.6 9.4h2.8M10.6 6.6h2.8M10.6 9.4h2.8"/></svg><span>Модели</span></div><div class="nv"><svg viewBox="0 0 16 16" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M6.2 3.2H3.2v9.6h9.6V9.8M9.4 2.8h3.8v3.8M13.2 2.8L7.6 8.4"/></svg><span>Вывод</span></div><div class="nv on"><svg viewBox="0 0 16 16" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.7M13.4 2.6v2.9h-2.9"/></svg><span>Сеть и обновления</span></div><div class="nv"><svg viewBox="0 0 16 16" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M3 5h10M3 11h10M6.2 3.2v3.6M10.4 9.2v3.6"/></svg><span>Продвинутые</span></div><div class="nv"><svg viewBox="0 0 16 16" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12zM8 7.4v3.6M8 5.2v.1"/></svg><span>О программе</span></div></div><div style="flex:1"></div><div class="nv sub"><svg viewBox="0 0 16 16" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M3 5h10M3 11h10M6.2 3.2v3.6M10.4 9.2v3.6"/></svg><span>Отладка (Ctrl+Shift+D)</span></div></div><div class="cont"><div class="chead"><div style="display:flex;align-items:center;gap:10px"><div><div class="h2">Сеть и обновления</div><div class="sm" style="margin-top:2px">Четыре сетевых действия — и ни одного больше</div></div></div></div><div class="cbody scr"><div class="upan"><div style="display:flex;align-items:center;gap:9px"><div class="h3">Доступна версия 0.2.1</div><span class="bd rec">Новая</span><span style="flex:1"></span><span class="c12">7 сентября 2026 · 74,3 МБ</span></div><div class="sm" style="margin-top:7px;color:var(--fg2)"><b>Что нового</b></div><ul class="ul"><li>Каталог моделей: 10 моделей, память в работе замеряется на вашем компьютере</li><li>Автозапуск при входе в систему</li><li>Исправлено: пилюля перекрывалась панелью при смене раскладки</li></ul><div style="display:flex;gap:8px;margin-top:12px;align-items:center"><span class="btn pri"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 2.8v7.4m0 0l-3-3m3 3l3-3M2.8 13.2h10.4"/></svg> Скачать и установить</span><span class="btn ">Пропустить эту версию</span><span class="btn gh">Напомнить позже</span><span style="flex:1"></span><span class="c12">Подпись релиза проверяется до установки</span></div></div><div style="height:16px"></div><div style="margin-bottom:16px"><div class="grp">Сеть и обновления</div><div class="card"><div class="r"><div class="left"><div class="lbl">Проверять обновления утилиты</div><div class="sub">Не чаще раза в сутки · github.com</div></div><span class="hint">?</span><span class="tgl on"><i></i></span></div><div class="r"><div class="left"><div class="lbl">Проверять обновления моделей</div><div class="sub">Не чаще раза в сутки · huggingface.co</div></div><span class="hint">?</span><span class="tgl on"><i></i></span></div><div class="r"><div class="left"><div class="lbl">Офлайн-режим</div><div class="sub">Полностью запрещает сетевые запросы</div></div><span class="hint">?</span><span class="tgl"><i></i></span></div><div class="r"><div class="left"><div class="lbl">Адрес каталога моделей</div></div><span class="hint">?</span><span class="sel mono" style="font-size:12px">встроенный <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="var(--fg3)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M3.5 6.5L8 11l4.5-4.5"/></svg></span></div><div class="r"><div class="left"><div class="lbl">Проверка вручную</div></div><span class="btn sm"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M13.2 8a5.2 5.2 0 1 1-1.6-3.7M13.4 2.6v2.9h-2.9"/></svg> Проверить сейчас</span> <span class="btn sm"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M4 2.2h5l3 3v8.6H4zM9 2.2v3.2h3"/></svg> Обновить из файла…</span></div></div></div><div class="sb" style="top:6px;height:200px"></div></div></div></div><div class="foot"><span style="display:inline-flex;align-items:center;gap:7px"><svg viewBox="0 0 22 22" width="15" height="15" aria-hidden="true" style="flex:none;color:var(--fg3)"><circle cx="3.4622" cy="8.4849" r="1.2185" fill="currentColor"/><circle cx="9.4694" cy="8.4849" r="1.6815" fill="currentColor"/><circle cx="14.5627" cy="8.4849" r="2.3151" fill="var(--fg3)"/><rect x="2" y="12" width="18" height="4" rx="2" fill="currentColor"/></svg> GigaAM v3 RNN-T</span><span class="sp"></span><span class="up">Доступна версия 0.2.1 · Установить</span><span class="dot" style="margin:0 8px"></span><span class="num">v0.2.0</span></div></div>
+<div class="legend"><b>Показано:</b> строка внизу справа — единственное цветовое пятно («Доступна версия 0.2.1 · Установить»); панель «Что нового» раскрыта из этой строки; установка только по явному действию, далее одно окно polkit. <b>Другие состояния строки</b> (checking / uptodate / downloading 42 % / unavailable / restart) описаны в <code>design/flows.md</code> §3.2.</div>
+</body></html>
