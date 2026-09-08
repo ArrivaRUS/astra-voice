@@ -98,7 +98,8 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 .grid1{display:grid;grid-template-columns:1fr;gap:10px;width:100%;max-width:900px}
 .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;width:100%;max-width:900px}
 .stc{background:var(--bg-app);border:1px solid var(--border);border-radius:10px;padding:11px 12px;
-  min-width:0;overflow-wrap:break-word}
+  min-width:0}
+.stc .lbl,.stc .h3,.stc .stn{overflow-wrap:normal;word-break:keep-all}
 .grid>*,.grid1>*,.grid3>*{min-width:0}
 .stc div{flex-wrap:wrap}
 .stc .win div,.stc .desk div,.stc .menu div{flex-wrap:nowrap}
@@ -114,7 +115,8 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 .dlg .dh{height:30px;background:var(--bg-tbar);border-bottom:1px solid var(--border);display:flex;
   align-items:center;padding:0 10px;font-size:12.5px;color:var(--fg2);gap:7px}
 .dlg .db{padding:16px 18px 6px;display:flex;gap:13px}
-.dlg .df{display:flex;gap:8px;align-items:center;padding:12px 18px 14px}
+.dlg .df{display:flex;gap:8px;align-items:center;padding:12px 18px 14px;flex-wrap:wrap}
+.stc .dlg{max-width:100%}
 .dlg .df .sp{flex:1}
 
 /* --- уведомление KDE ------------------------------------------------------ */

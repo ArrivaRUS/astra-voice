@@ -333,12 +333,13 @@ def pill_screen(theme):
 
 
 def menu(state):
-    """Трей-меню: покой · запись · доступно обновление · ошибка микрофона."""
+    """Трей-меню: покой · запись · доступно обновление · ошибка микрофона · офлайн."""
     hdr = {
         "idle": (tray("idle", 15, "var(--fg3)"), "Готов · Ctrl + Space", ""),
         "rec": (tray("listening", 15, "var(--accent)"), "Слушаю…", "color:var(--accent-ink)"),
         "update": (tray("idle", 15, "var(--fg3)"), "Готов · Ctrl + Space", ""),
         "micerr": (tray("error", 15, "var(--err-ink)"), "Микрофон недоступен", "color:var(--err-ink)"),
+        "offline": (tray("idle", 15, "var(--fg3)"), "Готов · Ctrl + Space", ""),
     }[state]
     rec = state == "rec"
     items = f'<div class="mi hd" style="{hdr[2]}">{hdr[0]} {hdr[1]}</div><div class="msep"></div>'
@@ -355,8 +356,12 @@ def menu(state):
     if state == "update":
         items += ('<div class="mi" style="color:var(--primary);font-weight:500">'
                   + ic("down", 14, "var(--primary)") + 'Доступна версия 0.2.1 — установить</div>')
+    elif state == "offline":
+        items += ('<div class="mi dis">' + ic("lock", 14, "var(--fg-dis)")
+                  + 'Проверить обновления<span class="sp"></span>'
+                  '<span class="sc">офлайн</span></div>')
     else:
-        items += '<div class="mi dis">Проверить обновления</div>'
+        items += '<div class="mi">Проверить обновления</div>'
     items += '<div class="mi">О программе</div><div class="msep"></div>'
     items += '<div class="mi">Выход<span class="sp"></span><span class="sc">Ctrl+Q</span></div>'
     return f'<div class="menu">{items}</div>'
@@ -385,7 +390,10 @@ def tray_screen(theme):
            "меню. Значок обязателен всегда, даже когда пилюля выключена, иначе запись стала бы скрытой "
            "(§9.5). Цвет несёт <b>только третья точка знака</b>, сам значок берёт цвет панели — поэтому он "
            "читается и на светлой, и на тёмной панели. Подсказка при наведении повторяет состояние словами: "
-           "человеку с нарушением цветовосприятия цвет точки ничего не скажет.")
+           "человеку с нарушением цветовосприятия цвет точки ничего не скажет. "
+           "<b>«Проверить обновления» активен всегда</b> (решение 2026-09-08): ручная проверка — явное "
+           "действие человека, как «Проверить сейчас» в разделе «Сеть». Недоступен он только в "
+           "офлайн-режиме или когда проверки запрещены политикой администратора.")
     return page(f"A · Трей — {th(theme)}",
                 f'<b>Трей</b> — значок, подсказки и меню в четырёх состояниях · {th(theme)} тема',
                 scene + sech("Меню — состояния") + grid([
@@ -394,7 +402,10 @@ def tray_screen(theme):
                 ]) + grid([
                     stcell("доступно обновление", menu("update"), "update-available"),
                     stcell("ошибка микрофона", menu("micerr"), "error"),
-                ]) + sech("Значок и подсказки при наведении") + grid(icons, 3),
+                ]) + grid([
+                    stcell("офлайн-режим или запрет политикой — единственный случай, "
+                           "когда «Проверить обновления» недоступен", menu("offline"), "offline"),
+                ], 1) + sech("Значок и подсказки при наведении") + grid(icons, 3),
                 theme, leg, EXTRA_CSS)
 
 
