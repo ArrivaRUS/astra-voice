@@ -122,6 +122,10 @@ QML = [
     ("Трей и меню", "<span class=\"mono\">QSystemTrayIcon</span> + <span class=\"mono\">QMenu</span> — это "
      "Widgets, а не QML: приложение получается гибридным (QQmlApplicationEngine + QWidgets-трей). "
      "Значок — SVG из лого-пака, цвет несёт только третья точка.", "средне"),
+    ("Набор иконок", "<b>21 контурный глиф</b> 16×16, обводка 1.5, <span class=\"mono\">currentColor</span>, "
+     "по одному <span class=\"mono\">&lt;path&gt;</span> на иконку — свои, в комплекте приложения; Breeze "
+     "не зависимость (решение по токенам, К10/В7). Последний добавлен <span class=\"mono\">clock</span> — "
+     "он отличает состояние пилюли «Достигнут лимит записи» от «Слушаю».", "дёшево"),
     ("Подсказка «Как мы считаем»", "ToolTip в Controls 2 не принимает клики — нужен Popup с "
      "<span class=\"mono\">closePolicy</span> и ссылкой внутри.", "дёшево"),
     ("Цифры моноширинно", "<span class=\"mono\">font.features</span> (tabular-nums) появился в Qt 6.7; "

@@ -157,7 +157,6 @@ body.dark .wbtn.c{background:#8C3B36}
   gap:9px;padding:0 10px;color:#F2F5FA;font-size:12.5px;box-shadow:0 6px 18px rgba(0,0,0,.4)}
 .pill .lv{display:flex;align-items:flex-end;gap:3px;height:20px}
 .pill .lv i{width:6px;border-radius:3px;background:#12B3A0;display:block}
-.pill .lv.f i{background:#5A6884}
 .pill .x{width:22px;height:22px;border-radius:50%;background:rgba(255,255,255,.12);display:inline-flex;
   align-items:center;justify-content:center;color:#C4CDDC;font-size:13px;line-height:1}
 .pill .st{white-space:nowrap}
@@ -280,6 +279,7 @@ _IC = {
     "chip": 'M5.4 5.4h5.2v5.2H5.4zM6.6 2.6v2.8M9.4 2.6v2.8M6.6 10.6v2.8M9.4 10.6v2.8M2.6 6.6h2.8M2.6 9.4h2.8M10.6 6.6h2.8M10.6 9.4h2.8',
     "sliders": 'M3 5h10M3 11h10M6.2 3.2v3.6M10.4 9.2v3.6',
     "out": 'M6.2 3.2H3.2v9.6h9.6V9.8M9.4 2.8h3.8v3.8M13.2 2.8L7.6 8.4',
+    "clock": 'M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12zM8 4.7V8l2.4 1.5',
 }
 
 
@@ -374,7 +374,7 @@ def pill(state, w=None, cls="", scale=1.0):
     elif state == "cancel":
         inner = ic("x", 15, "#8C97AC") + '<span class="st">Отменено</span>'
     elif state == "limit":
-        inner = bars("#12B3A0") + '<span class="st">Достигнут лимит записи</span>'
+        inner = ic("clock", 16, "#C4CDDC") + '<span class="st">Достигнут лимит записи</span>'
     elif state == "error":
         inner = (ic("alert", 16, "#F0645F") + '<span class="st" style="color:#F0645F">Микрофон недоступен</span>'
                  + '<span class="x">&#8250;</span>')
