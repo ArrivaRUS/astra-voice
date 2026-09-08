@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Разделы «Общие» (01) и «Модели» (02) — полный макет A «Панель»."""
-from _shell import (page, write, shell, head, footer, sb, m, MODELS, CATALOG_ORDER,
-                    ic, tgl, key, btn, row, card, group, met, level_bars, stcell, sech, grid,
-                    W, H, th)
+from _shell import (page, write, shell, head, footer, sb, m, MODELS, CATALOG_ORDER, DOMESTIC,
+                    INSTALLED_SIZE, ic, tgl, key, btn, row, card, group, met, met2, level_bars,
+                    stcell, sech, grid, W, H, th)
 
 DD = 'var(--fg3)'
 
@@ -325,8 +325,8 @@ def mcard(mid, state=None, badges=None, note=None, acts=None, extra="", cls_extr
     bl = badges if badges is not None else mo["badges"]
     cls = "mc" + (" act" if st in ("active", "switching") else "") + cls_extra
     mets = ('<div class="mmets">'
-            + met("Качество", mo["q"], mo["qv"], not mo["measured"])
-            + met("Скорость", mo["s"], mo["sv"], not mo["measured"]) + '</div>')
+            + met2("Качество", mo["q"], mo["qv"], mo["measured"], mo["qkind"])
+            + met2("Скорость", mo["s"], mo["sv"], mo["measured"], mo["skind"]) + '</div>')
     bh = badges_html(bl)
     top = ('<div class="mtop"><div class="ml">'
            f'<div class="mname">{mo["name"]} <span class="mven">· {mo["vendor"]}</span></div>'
@@ -395,7 +395,10 @@ def mcard(mid, state=None, badges=None, note=None, acts=None, extra="", cls_extr
     return f'<div class="{cls}">{top}{body}{extra}</div>'
 
 
-def filters(theme, domestic=False, count="Установлено 3 из 12 · 687 МБ на диске"):
+def filters(theme, domestic=False, count=None):
+    if count is None:
+        count = (f"Показано 6 из 12 · установлено 3 · {INSTALLED_SIZE} на диске" if domestic
+                 else f"Установлено 3 из 12 · {INSTALLED_SIZE} на диске")
     return ('<div style="display:flex;gap:8px;align-items:center;margin:0 0 12px">'
             f'<span class="chip">{ic("globe", 13, DD)} Все языки {ic("chevd", 12, DD)}</span>'
             f'<span class="chip{" on" if domestic else ""}">Только отечественные {tgl(domestic)}</span>'
@@ -412,16 +415,37 @@ def catalog_body(theme):
     s += mcard("ml", "new", [("Новое", "new")])
     s += mcard("tone", "avail")
     s += mcard("vosk", "avail",
-               note=("i", "Происхождение уточняется — в фильтр «отечественные» пока не входит"))
+               note=("i", "Правообладатель — Alpha Cephei Inc. (США), команда из России"))
     s += mcard("vosk-s", "avail")
     s += mcard("wturbo", "lowram",
-               note=("w", "Нужно ~1,8 ГБ ОЗУ — на этом компьютере 8 ГБ, может не хватить"))
-    s += mcard("wsmall", "avail")
+               note=("w", "Нужно ~2,0 ГБ ОЗУ — на этом компьютере 8 ГБ, может не хватить"))
+    s += mcard("wsmall", "avail",
+               note=("i", "Нет цифр по нашему протоколу: FLEURS 11,4 % — другой набор; "
+                          "замерим на вашем компьютере"))
     s += mcard("wbase", "notrec",
-               note=("w", "Для русского не рекомендуется: ошибка почти в каждом четвёртом слове"))
+               note=("w", "Для русского не рекомендуется: ошибка в каждом третьем слове"))
     s += mcard("mllarge", "avail")
     s += mcard("nemo", "avail",
                note=("i", "Лицензия CC-BY-4.0 — атрибуция автора попадёт в «О программе»"))
+    return s
+
+
+def catalog_domestic():
+    """Состояние фильтра «только отечественные»: 5 GigaAM + T-one (по юрлицу правообладателя)."""
+    s = filters(None, domestic=True)
+    s += '<div class="grp">Установленные · 3</div>'
+    s += mcard("rnnt", "active", [("Активна", "act"), ("Рекомендуем", "rec")])
+    s += mcard("ctc", "installed")
+    s += mcard("rnnt-np", "downloading")
+    s += '<div class="grp" style="margin-top:14px">Доступные · 3</div>'
+    s += mcard("ml", "new", [("Новое", "new")])
+    s += mcard("tone", "avail")
+    s += mcard("mllarge", "avail")
+    s += ('<div class="note i" style="margin-top:4px">' + ic("info", 15, DD)
+          + '<div><b>Скрыто 6 моделей</b>'
+            'Whisper (OpenAI, США), NeMo FastConformer (NVIDIA, США) и обе Vosk '
+            '(Alpha Cephei Inc., Делавэр — команда из России, но юрлицо зарубежное). '
+            'Фильтр смотрит на правообладателя, а не на страну разработчиков.</div></div>')
     return s
 
 
@@ -433,23 +457,34 @@ def models_catalog(theme):
             '<div style="background:var(--bg-app);padding:14px 22px 18px">'
             + catalog_body(theme) + '</div></div>')
     leg = ("<b>Решение G2: каталог показывается целиком с прокруткой</b> — без «показать ещё». Всего 12 "
-           "карточек (10 Must + 2 Could, PRD §7.2); нужная стоит первой и помечена «Активна». Ниже — тот "
-           "же список без обрезки окном, чтобы видеть всю ленту прокрутки. "
-           "<b>Фильтры:</b> «Все языки» (выпадающий) и «Только отечественные» (тумблер) — не прячут "
-           "установленные модели, только «Доступные». <b>ОЗУ:</b> «415 МБ · замерено на этом компьютере» "
-           "жирным против «~420 МБ · оценка» серым. Полоски: серая — бенчмарк автора, синяя — замерено "
-           "на этой машине; рядом всегда текстовое значение (не только длина).")
+           "карточек (10 Must + 2 Could, PRD §7.2); нужная стоит первой и помечена «Активна». "
+           "<b>Все цифры — из <span class=\"mono\">research/catalog-numbers.md</span> (2026-09-08):</b> "
+           "размер = сумма точных байт файлов рантайма из HF API в десятичных МБ; WER — Russian "
+           "LibriSpeech, бенчмарк onnx-asr; скорость — столбец «x64 RTFx (int8)». Где int8-замера нет "
+           "(T-one, обе GigaAM Multilingual) — полоска помечена «бенчмарк fp32». У Whisper small цифр "
+           "по протоколу нет вовсе: полоски пунктиром и «нет данных», выдумывать нельзя (§7.1). "
+           "<b>ОЗУ:</b> «415 МБ · замерено на этом компьютере» жирным против «~416 МБ · оценка» серым. "
+           "<b>Фильтр «только отечественные»</b> смотрит на юрлицо правообладателя: остаются 5 GigaAM "
+           "и T-one, обе Vosk уходят (Alpha Cephei Inc., США).")
     return page(f"A · Модели: каталог — {th(theme)}",
                 f'<b>Модели</b> — каталог целиком (12 карточек) · {th(theme)} тема · 900×620',
-                b + sech("Каталог целиком — лента прокрутки, 12 карточек") + full, theme, leg)
+                b + sech("Каталог целиком — лента прокрутки, 12 карточек") + full
+                + sech("Фильтр «только отечественные» включён — 6 моделей")
+                + '<div class="win" style="width:900px;padding:0">'
+                  '<div style="background:var(--bg-app);padding:14px 22px 18px">'
+                + catalog_domestic() + '</div></div>', theme, leg)
 
 
 def tooltip_bars():
-    return ('<div class="pop" style="position:static;box-shadow:none;width:330px;min-width:0;padding:12px">'
-            '<div class="strong" style="font-size:13px;margin-bottom:5px">Качество · WER 7,6 %</div>'
+    return ('<div class="pop" style="position:static;box-shadow:none;width:340px;min-width:0;padding:12px">'
+            '<div class="strong" style="font-size:13px;margin-bottom:5px">Качество · WER 7,60 %</div>'
             '<div class="c12" style="line-height:1.55">Доля слов с ошибкой на наборе Russian LibriSpeech, '
-            'бенчмарк onnx-asr от 04.09.2026. Полоска одна и та же для всех моделей: чем длиннее — тем '
-            'меньше ошибок. Пунктуация в полоску не входит — у неё отдельный значок.<br>'
+            'бенчмарк onnx-asr. Полоска одна и та же для всех моделей: чем длиннее — тем меньше ошибок. '
+            'Пунктуация в полоску не входит — у неё отдельный значок.<br>'
+            '<b>WER бенчмарка измерен на fp32-весах</b> той же модели: для int8, которые мы скачиваем, '
+            'публичных замеров нет ни у одной модели.<br>'
+            'Скорость берётся из столбца «x64 RTFx (int8)»; где int8-замера нет, полоска помечена '
+            '«бенчмарк fp32».<br>'
             '<span style="color:var(--primary)">Как мы считаем →</span></div></div>')
 
 
@@ -475,12 +510,21 @@ def models_card_states(theme):
                "update-failed"),
         stcell("предупреждение по ОЗУ (не запрет)",
                mcard("wturbo", "lowram",
-                     note=("w", "Нужно ~1,8 ГБ ОЗУ — на этом компьютере 8 ГБ, может не хватить")),
+                     note=("w", "Нужно ~2,0 ГБ ОЗУ — на этом компьютере 8 ГБ, может не хватить")),
                "low-ram"),
         stcell("не рекомендуется для русского",
                mcard("wbase", "notrec",
-                     note=("w", "Для русского не рекомендуется: ошибка почти в каждом четвёртом слове")),
+                     note=("w", "Для русского не рекомендуется: ошибка в каждом третьем слове")),
                "not-recommended"),
+        stcell("нет цифр по нашему протоколу — полоски пунктиром",
+               mcard("wsmall", "avail",
+                     note=("i", "FLEURS 11,4 % — другой набор и другой формат весов; "
+                                "замерим на вашем компьютере")),
+               "no-benchmark"),
+        stcell("скорость измерена на fp32-весах (int8-замера нет)",
+               mcard("tone", "avail",
+                     note=("i", "Модель поставляется только в fp32 — 144,2 МБ, ОЗУ выше оценки")),
+               "fp32-benchmark"),
         stcell("нет сети",
                mcard("tone", "nonet", note=("i", "Нет доступа к huggingface.co")), "no-network"),
         stcell("офлайн-режим включён вами",
@@ -529,13 +573,13 @@ def models_file_dialogs(theme):
               '<span class="mono">tokens.txt</span>) или архив, полученный от администратора.</div>'
               '<div class="field mono" style="font-size:12px">/media/usb/models/gigaam-v3-e2e-rnnt-int8'
               f'<span style="flex:1"></span>{ic("folder", 13, DD)}</div>'
-              '<div class="c12">Найдено 4 файла · 232 МБ · encoder.int8.onnx, decoder.onnx, joiner.onnx, '
+              '<div class="c12">Найдено 4 файла · 231,9 МБ · encoder.int8.onnx, decoder.onnx, joiner.onnx, '
               'tokens.txt</div></div>'
               f'<div class="df"><span class="sp"></span>{btn("Отмена")}{btn("Проверить и установить", "pri")}'
               '</div></div>')
     ok = (f'<div class="note o">{ic("check", 15, "var(--ok-ink)")}'
           '<div><b>Модель установлена</b>'
-          'GigaAM v3 RNN-T · 232 МБ · контрольные суммы совпали с манифестом каталога. '
+          'GigaAM v3 RNN-T · 231,9 МБ · контрольные суммы совпали с манифестом каталога. '
           'Ревизия <span class="mono">a6039be</span> от 16.12.2025.'
           f'<div style="margin-top:9px">{btn("Выбрать активной", "pri")}</div></div></div>')
     bad = (f'<div class="note e">{ic("alert", 15, "var(--err-ink)")}'
@@ -558,7 +602,7 @@ def models_file_dialogs(theme):
     delete = ('<div class="dlg"><div class="dh">' + ic("trash", 14, DD) + 'Удалить модель</div>'
               f'<div class="db">{ic("trash", 22, "var(--err-ink)")}'
               '<div><div class="h3">Удалить GigaAM v3 CTC?</div>'
-              '<div class="sm" style="margin-top:6px">С диска будет удалено <b>225 МБ</b> из '
+              '<div class="sm" style="margin-top:6px">С диска будет удалено <b>224,9 МБ</b> из '
               '<span class="mono">~/.local/share/astra-voice/models/</span>. Настройки и статистика '
               'останутся. Скачать модель заново можно в любой момент.</div></div></div>'
               f'<div class="df"><span class="sp"></span>{btn("Отмена")}'

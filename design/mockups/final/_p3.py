@@ -74,7 +74,7 @@ def onb1(theme):
 def onb2_card(state):
     if state == "avail":
         return mcard("rnnt", "avail", [("Рекомендуем", "rec")],
-                     acts=btn("Скачать 232 МБ", "sm pri", "down") + " " + btn("Из файла…", "sm", "folder"))
+                     acts=btn("Скачать 231,9 МБ", "sm pri", "down") + " " + btn("Из файла…", "sm", "folder"))
     if state == "downloading":
         return mcard("rnnt", "downloading", [("Рекомендуем", "rec")])
     if state == "nonet":
@@ -83,7 +83,7 @@ def onb2_card(state):
                      acts=btn("Скачать", "sm dis") + " " + btn("Установить из файла…", "sm pri", "folder"))
     if state == "installed":
         return mcard("rnnt", "active", [("Активна", "act"), ("Рекомендуем", "rec")],
-                     acts=btn("Установлена · 232 МБ", "sm dis", "check"))
+                     acts=btn("Установлена · 231,9 МБ", "sm dis", "check"))
     raise KeyError(state)
 
 
@@ -95,7 +95,7 @@ def onb2(theme):
             'расставляет знаки препинания сама.</div>'
             + onb2_card("avail")
             + mcard("vosk-s", "avail",
-                    acts=btn("Скачать 26 МБ", "sm", "down") + " " + btn("Из файла…", "sm"))
+                    acts=btn("Скачать 26,7 МБ", "sm", "down") + " " + btn("Из файла…", "sm"))
             + f'<div style="display:flex;gap:8px;align-items:center;margin-top:4px">'
               f'{btn("Показать все 12 моделей", "gh")}<span style="flex:1"></span>'
               f'{btn("Установить из файла или папки…", "", "folder")}</div>'
@@ -117,7 +117,7 @@ def onb2(theme):
     err_space = (f'<div class="note e">{ic("alert", 15, "var(--err-ink)")}'
                  '<div><b>Недостаточно места на диске</b>'
                  'Нужно ~270 МБ, свободно 100 МБ. Освободите место или выберите модель полегче — '
-                 'Vosk small занимает 26 МБ.'
+                 'Vosk small занимает 26,7 МБ.'
                  f'<div style="display:flex;gap:8px;margin-top:9px">'
                  f'{btn("Открыть папку моделей", "pri", "folder")}{btn("Выбрать полегче")}</div></div></div>')
     leg = ("<b>Шаг 2 из 5 — единственный обязательный.</b> «Пропустить» показан, но недоступен: "

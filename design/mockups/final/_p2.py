@@ -483,7 +483,7 @@ def advanced(theme):
             f'<span style="display:flex;gap:8px;align-items:center">'
             f'<span class="c12 mono">~/.local/share/astra-voice/models</span>'
             f'{btn("Открыть", "sm", "folder")}{btn("Изменить", "sm")}</span>',
-            "Занято 687 МБ · свободно на разделе 42,1 ГБ", hint=False),
+            "Занято 686 МБ · свободно на разделе 42,1 ГБ", hint=False),
         row("Надёжный режим захвата клавиш (evdev)", tgl(False),
             "Если комбинацию перехватывает другое приложение. Нужна группа input — экспериментально"),
         row("Посимвольный ввод вместо буфера (xdotool type)", tgl(False),
@@ -502,8 +502,8 @@ def advanced(theme):
                        "Следующая диктовка после выгрузки ждёт загрузку ~2 с", hint=False) + '</div>')
     disk_low = (f'<div class="note w">{ic("alert", 15, "var(--warn-ink)")}'
                 '<div><b>Мало места на диске</b>'
-                'В папке моделей занято 687 МБ, свободно 340 МБ. Скачать Whisper large-v3-turbo '
-                '(987 МБ) не получится — освободите место или выберите модель полегче.'
+                'В папке моделей занято 686 МБ, свободно 340 МБ. Скачать Whisper large-v3-turbo '
+                '(1 089 МБ) не получится — освободите место или выберите модель полегче.'
                 f'<div style="display:flex;gap:8px;margin-top:9px">{btn("Открыть папку", "pri", "folder")}'
                 f'{btn("Показать лёгкие модели", "gh")}</div></div></div>')
     threads = ('<div class="card">'
@@ -548,8 +548,9 @@ def about(theme):
             f'{btn("Открыть LICENSE", "sm", "file")}</span>',
             "Исходный код открыт: github.com/ArrivaRUS/astra-voice", hint=False),
         row("Лицензии компонентов и моделей", btn("NOTICE", "sm", "file"),
-            "GigaAM — MIT · Сбер; Whisper — MIT и Apache-2.0 · OpenAI; sherpa-onnx — Apache-2.0; "
-            "silero-vad — MIT; NeMo FastConformer — CC-BY-4.0 · NVIDIA", hint=False),
+            "GigaAM — MIT · Сбер; Whisper large-v3-turbo — MIT, Whisper small и base — Apache-2.0 · "
+            "OpenAI; Vosk — Apache-2.0 · Alpha Cephei; NeMo FastConformer — CC-BY-4.0 · NVIDIA",
+            hint=False),
         row("Приватность и сетевые хосты", btn("PRIVACY", "sm", "shield"),
             "Аудио не покидает компьютер и не сохраняется на диск. Хостов всего два: huggingface.co, "
             "github.com — и только по вашей команде", hint=False),
@@ -559,7 +560,7 @@ def about(theme):
             f'<span class="c12 mono">~/.config/astra-voice/</span>{btn("Открыть", "sm", "folder")}</span>',
             hint=False),
         row("Модели", f'<span style="display:flex;gap:8px;align-items:center">'
-            f'<span class="c12 mono">~/.local/share/astra-voice/models/ · 687 МБ</span>'
+            f'<span class="c12 mono">~/.local/share/astra-voice/models/ · 686 МБ</span>'
             f'{btn("Открыть", "sm", "folder")}</span>', hint=False),
         row("Логи и статистика", f'<span style="display:flex;gap:8px;align-items:center">'
             f'<span class="c12 mono">~/.local/state/astra-voice/ · 2,1 МБ</span>'
@@ -591,8 +592,9 @@ def about(theme):
               '<div style="height:9px"></div><b>Модели</b><br>'
               'GigaAM v3 (RNN-T, CTC, Multilingual) — MIT · Сбер, GigaChat Team, 2024<br>'
               'T-one — Apache-2.0 · Т-Банк<br>'
-              'Vosk ru 0.52 / 0.54 — Apache-2.0 · Alpha Cephei<br>'
-              'Whisper (base, small, large-v3-turbo) — MIT и Apache-2.0 · OpenAI<br>'
+              'Vosk ru 0.52 / 0.54 — Apache-2.0 · Alpha Cephei Inc.<br>'
+              'Whisper large-v3-turbo — MIT · OpenAI<br>'
+              'Whisper small, Whisper base — Apache-2.0 · OpenAI<br>'
               'NeMo FastConformer ru pc — CC-BY-4.0 · NVIDIA (требуется атрибуция)'
               '</div></div>'
               f'<div class="df">{btn("Скопировать", "", "file")}<span class="sp"></span>'
@@ -630,7 +632,7 @@ def about(theme):
     remove = ('<div class="card">'
               + row("Удалить данные программы",
                     btn("Показать, что удалять", "sm", "trash"),
-                    "При удалении пакета остаются: настройки (12 КБ), модели (687 МБ), логи (2,1 МБ)",
+                    "При удалении пакета остаются: настройки (12 КБ), модели (686 МБ), логи (2,1 МБ)",
                     hint=False) + '</div>')
     leg = ("<b>Экран для ИБ-службы (П3):</b> версии всех компонентов, лицензия <b>GPL-3.0-or-later</b>, "
            "NOTICE с атрибуцией каждой модели, PRIVACY со списком ровно двух хостов и дисклеймер о "

@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(ROOT, "..", "directions")))
 
 from _base import (  # noqa: E402
     page as _page, mark, logo, appicon, tray, ic, tgl, key, bd, btn, row, card,
-    met, foot, foot_left, pill as _pill, MODELS as BASE_MODELS, LEVELS,
+    met, foot, foot_left, pill as _pill, LEVELS,
 )
 
 
@@ -72,6 +72,8 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 
 /* --- карточка модели: плотнее по горизонтали, чтобы не рвалась в колонке 672 px --- */
 .mven{white-space:nowrap}
+.trk.nd{background:transparent;border:1px dashed var(--fg4);height:6px;border-radius:3px}
+.mv.nd{color:var(--fg-dis);font-style:italic}
 .mc{padding:9px 13px;margin-bottom:8px}
 .met .mn{width:54px}
 .trk{width:78px}
@@ -287,33 +289,102 @@ def footer(model="GigaAM v3 RNN-T", state="disabled", icon="idle"):
     return foot(foot_left(model, icon), foot_right(state))
 
 
-# ── каталог: 12 моделей PRD §7.2 (8 из _base + 4 добавленные) ──────────────
-EXTRA_MODELS = [
+# ── каталог: 12 моделей — источник истины research/catalog-numbers.md (2026-09-08) ──
+# Размер = сумма точных байт файлов рантайма из HF API, десятичные МБ.
+# WER = Russian LibriSpeech test, бенчмарк onnx-asr (измерен на fp32-весах — оговорка в подсказке).
+# RTFx = столбец «x64 RTFx (int8)»; где int8-замера нет — помечено «бенчмарк fp32».
+# Полоска качества: 4 % WER = 100, 40 % = 0. Полоска скорости: RTFx / 85.
+MODELS = [
+    dict(id="rnnt", name="GigaAM v3 RNN-T", vendor="Сбер (GigaChat Team)",
+         purpose="Русская диктовка с пунктуацией — по умолчанию",
+         disk="231,9 МБ", ram="415 МБ", ramkind="замерено на этом компьютере", measured=True,
+         q=90, qv="WER 7,60 %", qkind="ok", s=50, sv="42,5× быстрее речи", skind="ok",
+         punct=True, lang="Только русский", lic="MIT · Сбер", origin="отечественная",
+         status="active", badges=[("Активна", "act"), ("Рекомендуем", "rec")]),
+    dict(id="ctc", name="GigaAM v3 CTC", vendor="Сбер (GigaChat Team)",
+         purpose="То же, быстрее на ~25 %, точность чуть ниже",
+         disk="224,9 МБ", ram="~416 МБ", ramkind="оценка", measured=False,
+         q=89, qv="WER 7,80 %", qkind="ok", s=61, sv="52,2× быстрее речи", skind="ok",
+         punct=True, lang="Только русский", lic="MIT · Сбер", origin="отечественная",
+         status="installed", badges=[]),
+    dict(id="rnnt-np", name="GigaAM v3 RNN-T без пунктуации", vendor="Сбер (GigaChat Team)",
+         purpose="Самая точная по словам, без знаков препинания",
+         disk="229,3 МБ", ram="~424 МБ", ramkind="оценка", measured=False,
+         q=99, qv="WER 4,39 %", qkind="ok", s=50, sv="42,8× быстрее речи", skind="ok",
+         punct=False, lang="Только русский", lic="MIT · Сбер", origin="отечественная",
+         status="downloading", badges=[("Обновление доступно", "upd")]),
+    dict(id="ml", name="GigaAM Multilingual CTC 220M", vendor="Сбер (GigaChat Team)",
+         purpose="Русский + казахский, киргизский, узбекский, английский; без пунктуации",
+         disk="224,8 МБ", ram="~416 МБ", ramkind="оценка", measured=False,
+         q=88, qv="WER 8,43 %", qkind="ok", s=69, sv="58,5× · бенчмарк fp32", skind="fp32",
+         punct=False, lang="ru, kk, ky, uz, en", lic="MIT · Сбер", origin="отечественная",
+         status="new", badges=[("Новое", "new")]),
+    dict(id="tone", name="T-one", vendor="Т-Банк",
+         purpose="Русская, лёгкая, без пунктуации; веса только fp32",
+         disk="144,2 МБ", ram="~300 МБ", ramkind="грубая оценка · веса fp32", measured=False,
+         q=93, qv="WER 6,57 %", qkind="ok", s=31, sv="26,3× · бенчмарк fp32", skind="fp32",
+         punct=False, lang="Только русский", lic="Apache-2.0 · Т-Банк", origin="отечественная",
+         status="avail", badges=[]),
     dict(id="vosk", name="Vosk ru 0.54", vendor="Alpha Cephei",
          purpose="Лёгкая полная Vosk; точность ниже GigaAM",
-         disk="70 МБ", ram="~150 МБ", ramkind="оценка", measured=False,
-         q=44, qv="WER 18,4 %", s=97, sv="≈52× быстрее речи", punct=False, lang="Только русский",
-         lic="Apache-2.0 · Alpha Cephei", origin="происхождение уточняется", status="avail", badges=[]),
+         disk="72,5 МБ", ram="~134 МБ", ramkind="оценка", measured=False,
+         q=84, qv="WER 9,89 %", qkind="ok", s=83, sv="70,5× быстрее речи", skind="ok",
+         punct=False, lang="Только русский", lic="Apache-2.0 · Alpha Cephei",
+         origin="зарубежная · команда из России", status="avail", badges=[]),
+    dict(id="vosk-s", name="Vosk small ru 0.52", vendor="Alpha Cephei",
+         purpose="Для слабых машин и малого диска",
+         disk="26,7 МБ", ram="~50 МБ", ramkind="оценка", measured=False,
+         q=71, qv="WER 14,53 %", qkind="ok", s=98, sv="83,5× быстрее речи", skind="ok",
+         punct=False, lang="Только русский", lic="Apache-2.0 · Alpha Cephei",
+         origin="зарубежная · команда из России", status="avail", badges=[]),
+    dict(id="wturbo", name="Whisper large-v3-turbo", vendor="OpenAI",
+         purpose="Многоязычная, качественно, очень медленно на процессоре",
+         disk="1 089,1 МБ", ram="~2,0 ГБ", ramkind="оценка", measured=False,
+         q=83, qv="WER 10,10 %", qkind="ok", s=5, sv="3,9× быстрее речи", skind="ok",
+         punct=True, lang="99 языков", lic="MIT · OpenAI", origin="зарубежная",
+         status="lowram", badges=[]),
     dict(id="wsmall", name="Whisper small", vendor="OpenAI",
          purpose="Многоязычная, средняя; по-русски слабее GigaAM",
-         disk="357 МБ", ram="~700 МБ", ramkind="оценка", measured=False,
-         q=52, qv="WER 16,9 %", s=32, sv="≈4,1× быстрее речи", punct=True, lang="99 языков",
-         lic="MIT / Apache-2.0 · OpenAI", origin="зарубежная", status="avail", badges=[]),
+         disk="253,5 МБ", ram="~470 МБ", ramkind="оценка", measured=False,
+         q=0, qv="нет данных", qkind="none", s=0, sv="нет данных", skind="none",
+         punct=True, lang="99 языков", lic="Apache-2.0 · OpenAI", origin="зарубежная",
+         status="avail", badges=[]),
+    dict(id="wbase", name="Whisper base", vendor="OpenAI",
+         purpose="Быстрая и лёгкая; для русского не рекомендуется",
+         disk="109,1 МБ", ram="~200 МБ", ramkind="оценка", measured=False,
+         q=5, qv="WER 38,33 %", qkind="ok", s=61, sv="51,6× быстрее речи", skind="ok",
+         punct=True, lang="99 языков", lic="Apache-2.0 · OpenAI", origin="зарубежная",
+         status="avail", badges=[]),
     dict(id="mllarge", name="GigaAM Multilingual Large CTC", vendor="Сбер (GigaChat Team)",
          purpose="«Качество любой ценой»: тяжёлая, без пунктуации",
-         disk="564 МБ", ram="~1 ГБ", ramkind="оценка", measured=False,
-         q=93, qv="WER 6,9 %", s=61, sv="≈11× быстрее речи", punct=False, lang="ru, kk, ky, uz, en",
-         lic="MIT · Сбер", origin="отечественная", status="avail", badges=[]),
+         disk="591,6 МБ", ram="~1,1 ГБ", ramkind="оценка", measured=False,
+         q=96, qv="WER 5,55 %", qkind="ok", s=36, sv="30,4× · бенчмарк fp32", skind="fp32",
+         punct=False, lang="ru, kk, ky, uz, en", lic="MIT · Сбер", origin="отечественная",
+         status="avail", badges=[]),
     dict(id="nemo", name="NeMo FastConformer ru pc", vendor="NVIDIA",
-         purpose="Самая быстрая, с пунктуацией, точность ниже",
-         disk="125 МБ", ram="~250 МБ", ramkind="оценка", measured=False,
-         q=58, qv="WER 15,2 %", s=99, sv="≈58× быстрее речи", punct=True, lang="Только русский",
-         lic="CC-BY-4.0 (атрибуция) · NVIDIA", origin="зарубежная", status="avail", badges=[]),
+         purpose="Быстрая, с пунктуацией, точность ниже GigaAM",
+         disk="131,6 МБ", ram="~245 МБ", ramkind="оценка", measured=False,
+         q=75, qv="WER 13,10 %", qkind="ok", s=83, sv="70,6× быстрее речи", skind="ok",
+         punct=True, lang="Только русский", lic="CC-BY-4.0 (атрибуция) · NVIDIA",
+         origin="зарубежная", status="avail", badges=[]),
 ]
-
-MODELS = list(BASE_MODELS) + EXTRA_MODELS
 CATALOG_ORDER = ["rnnt", "ctc", "rnnt-np", "ml", "tone", "vosk", "vosk-s",
                  "wturbo", "wsmall", "wbase", "mllarge", "nemo"]
+DOMESTIC = ["rnnt", "ctc", "rnnt-np", "ml", "mllarge", "tone"]   # по юрлицу правообладателя
+INSTALLED_SIZE = "686 МБ"                                        # 231,9 + 224,9 + 229,3
+
+
+def met2(name, pct, value, measured=False, kind="ok"):
+    """Полоска метрики. kind: ok · fp32 (замер на fp32-весах) · none (нет данных по протоколу)."""
+    if kind == "none":
+        return (f'<div class="met"><span class="mn">{name}</span>'
+                '<span class="trk nd"></span>'
+                f'<span class="mv nd">{value}</span></div>')
+    cls = "trk" if measured else "trk est"
+    val = f'<b>{value}</b>' if measured else value
+    return (f'<div class="met"><span class="mn">{name}</span>'
+            f'<span class="{cls}"><i style="width:{pct}%"></i></span>'
+            f'<span class="mv">{val}</span></div>')
 
 
 def m(mid):
