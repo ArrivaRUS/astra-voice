@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>A · Модели: файл и удаление — светлая</title>
+<style>
+:root{--font-ui:'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif;--font-mono:'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace;
+  --bg-app:#F7F9FC; --bg-surface:#FFFFFF; --bg-sunk:#EDF1F7; --bg-tbar:#E7ECF4;
+  --border:#D7DEEA; --border-soft:#EDF1F7;
+  --fg1:#0E1729; --fg2:#243350; --fg3:#5A6884; --fg4:#AAB4C7;
+  --primary:#1B3A73; --primary-hover:#12294F; --primary-fg:#FFFFFF; --primary-bg:#E8EDF7;
+  --accent:#12B3A0; --accent-ink:#0B7F71; --accent-bg:#E3F7F4;
+  --ok-ink:#1F7D50; --ok-bg:#E7F5EE;
+  --warn-ink:#8F5E12; --warn-bg:#FAF0DC;
+  --err-ink:#C0322F; --err-bg:#FBECEB;
+  --canvas:#DDE3EE; --canvas-fg:#3A4761; --shadow:rgba(14,23,41,.18);
+}
+
+*{box-sizing:border-box}
+body{margin:0;padding:26px 20px 34px;background:var(--canvas);color:var(--canvas-fg);
+  font-family:var(--font-ui);font-size:14px;line-height:1.5;
+  display:flex;flex-direction:column;align-items:center;gap:14px;-webkit-font-smoothing:antialiased}
+.cap{font-size:13px;letter-spacing:.01em}
+.cap b{color:var(--fg1);font-weight:700}
+body.dark .cap b{color:#F2F5FA}
+.legend{max-width:900px;font-size:12.5px;line-height:1.55;opacity:.95}
+.legend b{font-weight:700}
+.legend ul{margin:6px 0 0;padding-left:18px}
+.mono{font-family:var(--font-mono);letter-spacing:.02em}
+
+/* ── окно ───────────────────────────────────────────── */
+.win{background:var(--bg-app);color:var(--fg1);border-radius:8px;overflow:hidden;
+  box-shadow:0 14px 44px var(--shadow);display:flex;flex-direction:column;flex:none}
+.tbar{height:32px;flex:none;display:flex;align-items:center;gap:8px;padding:0 10px;
+  background:var(--bg-tbar);border-bottom:1px solid var(--border)}
+.tbar .t{font-size:12.5px;color:var(--fg2);font-weight:500}
+.tbar .sp{flex:1}
+.wbtn{width:14px;height:14px;border-radius:3px;background:var(--border);display:inline-block}
+.wbtn.c{background:#D96B62}
+body.dark .wbtn.c{background:#8C3B36}
+
+/* ── типографика ────────────────────────────────────── */
+.h1{font-size:28px;line-height:1.2;font-weight:700;color:var(--fg1);margin:0}
+.h2{font-size:20px;line-height:1.25;font-weight:700;color:var(--fg1);margin:0}
+.h3{font-size:16px;line-height:1.3;font-weight:500;color:var(--fg1);margin:0}
+.sm{font-size:13px;line-height:1.45;color:var(--fg3)}
+.c12{font-size:12px;line-height:1.4;color:var(--fg3)}
+.grp{font-size:11px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--fg3);margin:0 0 7px 2px}
+.muted{color:var(--fg3)}
+.strong{font-weight:700;color:var(--fg1)}
+
+/* ── карточки и строки настроек ─────────────────────── */
+.card{background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.card>.r+.r{border-top:1px solid var(--border-soft)}
+.r{display:flex;align-items:center;gap:10px;padding:11px 14px;min-height:44px}
+.r .lbl{font-size:14px;color:var(--fg1);font-weight:400}
+.r .sub{font-size:12px;color:var(--fg3);margin-top:2px}
+.r .left{flex:1;min-width:0}
+.r.dis{opacity:.5}
+.hint{width:15px;height:15px;flex:none;border-radius:50%;border:1px solid var(--fg4);color:var(--fg3);
+  font-size:10px;line-height:13px;text-align:center;display:inline-block;font-weight:500}
+.lockb{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--fg3);
+  background:var(--bg-sunk);border-radius:5px;padding:2px 6px}
+
+/* ── контролы ───────────────────────────────────────── */
+.tgl{width:38px;height:21px;border-radius:11px;background:var(--fg4);position:relative;flex:none}
+.tgl i{position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;background:#fff;display:block}
+.tgl.on{background:var(--primary)}
+.tgl.on i{left:19px}
+.tgl.lock{background:var(--border)}
+.btn{font-family:var(--font-ui);font-size:13px;font-weight:500;color:var(--fg1);background:var(--bg-surface);
+  border:1px solid var(--border);border-radius:7px;padding:6px 12px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.btn.pri{background:var(--primary);border-color:var(--primary);color:var(--primary-fg)}
+.btn.gh{background:transparent;border-color:transparent;color:var(--primary);padding:6px 8px}
+.btn.dis{opacity:.45}
+.btn.sm{font-size:12.5px;padding:4px 9px}
+.sel{font-size:13px;color:var(--fg1);background:var(--bg-surface);border:1px solid var(--border);
+  border-radius:7px;padding:6px 10px;display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:7px;overflow:hidden;background:var(--bg-surface)}
+.seg span{font-size:12.5px;padding:5px 11px;color:var(--fg2)}
+.seg span.on{background:var(--primary);color:var(--primary-fg);font-weight:500}
+.key{font-family:var(--font-mono);font-size:13px;color:var(--fg1);background:var(--bg-sunk);
+  border-radius:6px;padding:3px 8px 2px;border-bottom:2px solid var(--border);display:inline-block;letter-spacing:.02em}
+.field{font-size:13px;color:var(--fg3);background:var(--bg-surface);border:1px solid var(--border);
+  border-radius:7px;padding:7px 11px;display:flex;align-items:center;gap:8px}
+.field.cap{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-bg);color:var(--fg1)}
+.chip{font-size:12.5px;color:var(--fg2);background:var(--bg-surface);border:1px solid var(--border);
+  border-radius:14px;padding:4px 11px;display:inline-flex;align-items:center;gap:6px}
+.chip.on{background:var(--primary);border-color:var(--primary);color:var(--primary-fg);font-weight:500}
+
+/* ── бейджи и теги ──────────────────────────────────── */
+.bd{font-size:11.5px;font-weight:500;border-radius:5px;padding:2px 7px;display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.bd.act{background:var(--accent-bg);color:var(--accent-ink)}
+.bd.rec{background:var(--primary-bg);color:var(--primary)}
+.bd.upd{background:var(--warn-bg);color:var(--warn-ink)}
+.bd.new{background:var(--bg-sunk);color:var(--fg3)}
+.bd.err{background:var(--err-bg);color:var(--err-ink)}
+.tag{font-size:12px;color:var(--fg3);white-space:nowrap}
+.dot{width:4px;height:4px;border-radius:50%;background:var(--fg4);display:inline-block;vertical-align:middle}
+
+/* ── полоски метрик ─────────────────────────────────── */
+.met{display:flex;align-items:center;gap:8px}
+.met .mn{font-size:11.5px;color:var(--fg3);width:58px;text-align:right;flex:none}
+.trk{width:88px;height:6px;border-radius:3px;background:var(--bg-sunk);overflow:hidden;flex:none}
+.trk i{display:block;height:100%;border-radius:3px;background:var(--primary)}
+.trk.est i{background:var(--fg4)}
+.met .mv{font-size:11.5px;color:var(--fg3);white-space:nowrap}
+.met .mv b{color:var(--fg1);font-weight:700}
+.prog{height:6px;border-radius:3px;background:var(--bg-sunk);overflow:hidden}
+.prog i{display:block;height:100%;background:var(--primary);border-radius:3px}
+
+/* ── полосы-уведомления ─────────────────────────────── */
+.note{display:flex;gap:9px;align-items:flex-start;border-radius:9px;padding:10px 12px;font-size:12.5px;line-height:1.45}
+.note.i{background:var(--bg-sunk);color:var(--fg2)}
+.note.w{background:var(--warn-bg);color:var(--warn-ink)}
+.note.e{background:var(--err-bg);color:var(--err-ink)}
+.note.o{background:var(--ok-bg);color:var(--ok-ink)}
+.note b{display:block;font-weight:700;margin-bottom:2px}
+
+/* ── нижняя строка окна ─────────────────────────────── */
+.foot{height:36px;flex:none;display:flex;align-items:center;gap:10px;padding:0 14px;
+  background:var(--bg-app);border-top:1px solid var(--border);font-size:12.5px;color:var(--fg3)}
+.foot .sp{flex:1}
+.foot .up{color:var(--primary);font-weight:500}
+.foot .num{font-family:var(--font-mono);font-size:12px}
+
+/* ── пилюля-оверлей ─────────────────────────────────── */
+.desk{border-radius:8px;overflow:hidden;position:relative;box-shadow:0 14px 44px var(--shadow);flex:none;
+  background:linear-gradient(160deg,#16233F 0%,#0E1729 55%,#1B3A73 100%)}
+.dwin{position:absolute;background:#FFFFFF;border-radius:7px;box-shadow:0 8px 26px rgba(0,0,0,.35);overflow:hidden}
+.dwin .dt{height:26px;background:#E7ECF4;border-bottom:1px solid #D7DEEA;display:flex;align-items:center;
+  padding:0 9px;font-size:11.5px;color:#243350}
+.dwin .dc{padding:12px 14px;font-size:12.5px;line-height:1.65;color:#0E1729}
+.panel{position:absolute;left:0;right:0;bottom:0;height:40px;background:#0B1220;
+  display:flex;align-items:center;gap:8px;padding:0 10px;border-top:1px solid rgba(255,255,255,.08)}
+.panel .pb{font-size:11.5px;color:#C4CDDC;background:rgba(255,255,255,.07);border-radius:5px;padding:4px 9px}
+.panel .sp{flex:1}
+.pill{background:rgba(14,23,41,.94);border-radius:18px;height:36px;display:inline-flex;align-items:center;
+  gap:9px;padding:0 10px;color:#F2F5FA;font-size:12.5px;box-shadow:0 6px 18px rgba(0,0,0,.4)}
+.pill .lv{display:flex;align-items:flex-end;gap:3px;height:20px}
+.pill .lv i{width:6px;border-radius:3px;background:#12B3A0;display:block}
+.pill .lv.f i{background:#5A6884}
+.pill .x{width:22px;height:22px;border-radius:50%;background:rgba(255,255,255,.12);display:inline-flex;
+  align-items:center;justify-content:center;color:#C4CDDC;font-size:13px;line-height:1}
+.pill .st{white-space:nowrap}
+.pill .st b{font-weight:700}
+.gal{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center;
+  background:var(--bg-sunk);border:1px solid var(--border);border-radius:10px;padding:14px}
+.gal .cell{display:flex;flex-direction:column;align-items:center;gap:6px}
+.gal .cn{font-size:11px;color:var(--fg3)}
+
+/* ── трей-меню ──────────────────────────────────────── */
+.menu{background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:5px;
+  box-shadow:0 12px 34px var(--shadow);width:262px}
+.mi{display:flex;align-items:center;gap:9px;padding:6px 9px;border-radius:6px;font-size:13px;color:var(--fg1)}
+.mi .sp{flex:1}
+.mi .sc{font-family:var(--font-mono);font-size:11.5px;color:var(--fg3)}
+.mi.dis{color:var(--fg4)}
+.mi.hd{color:var(--fg3);font-size:12px;padding-top:3px;padding-bottom:3px}
+.mi.hl{background:var(--primary);color:var(--primary-fg)}
+.mi.hl .sc{color:rgba(255,255,255,.7)}
+.msep{height:1px;background:var(--border-soft);margin:4px 6px}
+
+/* ── прокрутка (визуальная, содержимое обрезано как в реальном окне) ── */
+.scr{position:relative;overflow:hidden}
+.sb{position:absolute;right:4px;width:5px;border-radius:3px;background:var(--fg4);opacity:.45}
+
+/* ── карточка модели ────────────────────────────────── */
+.mc{background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:10px 13px;margin-bottom:9px}
+.mc.act{border-color:var(--accent);background:var(--accent-bg)}
+.mc.rec{border-color:var(--primary)}
+.mc.dis{opacity:.62}
+.mtop{display:flex;gap:14px;align-items:flex-start}
+.mtop .ml{flex:1;min-width:0}
+.mname{font-size:15px;font-weight:500;color:var(--fg1)}
+.mven{color:var(--fg3);font-weight:400;font-size:12.5px}
+.mpurp{font-size:12.5px;color:var(--fg3);margin-top:2px}
+.mbadges{display:flex;gap:5px;flex-wrap:wrap;margin-top:4px}
+.mmets{display:flex;flex-direction:column;gap:5px;flex:none}
+.mhr{height:1px;background:var(--border-soft);margin:9px 0 8px}
+.mbot{display:flex;align-items:center;gap:9px;font-size:12px;color:var(--fg3);flex-wrap:wrap}
+.mbot .sp{flex:1}
+
+
+/* --- токены доступности: цвет «выключено» с контрастом >= 4,5:1 ---------- */
+:root{--fg-dis:#67748B}
+body.dark{--fg-dis:#8C97AC}
+.mi.dis{color:var(--fg-dis)}
+.btn.dis{opacity:1;color:var(--fg-dis);background:var(--bg-sunk);border-color:var(--border)}
+.r.dis{opacity:1}
+.r.dis .lbl,.r.dis .sub{color:var(--fg-dis)}
+.tgl.dis{background:var(--border)}
+
+/* --- сайдбар ------------------------------------------------------------- */
+.side{width:184px;flex:none;background:var(--bg-sunk);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;padding:12px 10px}
+.slogo{display:flex;align-items:center;gap:8px;padding:4px 6px 12px;margin-bottom:6px;
+  border-bottom:1px solid var(--border)}
+.nav{display:flex;flex-direction:column;gap:2px;margin-top:8px}
+.nv{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:7px;font-size:13.5px;
+  font-weight:500;color:var(--fg2)}
+.nv.on{background:var(--primary);color:var(--primary-fg)}
+.nv.sub{font-weight:400;color:var(--fg3);font-size:13px}
+.nv .sp{flex:1}
+.nv .cnt{font-size:11.5px;color:var(--fg3)}
+.nv.on .cnt{color:rgba(255,255,255,.75)}
+body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
+.cont{flex:1;min-width:0;display:flex;flex-direction:column}
+.chead{padding:12px 22px 8px}
+.cbody{flex:1;padding:0 22px 16px}
+.wrap{display:flex;flex:1;min-height:0}
+.r{padding:7px 14px;min-height:38px}
+.grp{margin:0 0 5px 2px}
+
+/* --- карточка модели: плотнее по горизонтали, чтобы не рвалась в колонке 672 px --- */
+.mven{white-space:nowrap}
+.mc{padding:9px 13px;margin-bottom:8px}
+.met .mn{width:54px}
+.trk{width:78px}
+.mhr{margin:8px 0 7px}
+
+/* --- фокус клавиатуры (§8 PRD): видимая рамка 2 px ------------------------ */
+.foc{outline:2px solid var(--primary);outline-offset:2px;border-radius:8px}
+
+/* --- выпадающий список (раскрытый) --------------------------------------- */
+.pop{position:absolute;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;
+  box-shadow:0 12px 34px var(--shadow);padding:5px;z-index:5;min-width:236px}
+.po{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:6px;font-size:13px;color:var(--fg1)}
+.po .sp{flex:1}
+.po.on{background:var(--primary-bg);color:var(--primary);font-weight:500}
+.po.dis{color:var(--fg-dis)}
+.po .d2{font-size:11.5px;color:var(--fg3);display:block;margin-top:1px;font-weight:400}
+.rel{position:relative}
+
+/* --- галереи состояний --------------------------------------------------- */
+.sec{max-width:900px;width:100%}
+.sech{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--canvas-fg);
+  margin:16px 0 8px;width:100%;max-width:900px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;width:100%;max-width:900px}
+.grid1{display:grid;grid-template-columns:1fr;gap:10px;width:100%;max-width:900px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;width:100%;max-width:900px}
+.stc{background:var(--bg-app);border:1px solid var(--border);border-radius:10px;padding:11px 12px;
+  min-width:0;overflow-wrap:break-word}
+.grid>*,.grid1>*,.grid3>*{min-width:0}
+.stc div{flex-wrap:wrap}
+.stc .win div,.stc .desk div,.stc .menu div{flex-wrap:nowrap}
+.grid .mono,.grid3 .mono{overflow-wrap:anywhere}
+.stn{font-size:11.5px;font-weight:700;color:var(--fg3);letter-spacing:.04em;text-transform:uppercase;
+  margin-bottom:7px;display:flex;align-items:center;gap:6px}
+.stn .code{font-family:var(--font-mono);text-transform:none;letter-spacing:0;font-weight:400;
+  color:var(--fg4);font-size:11px}
+
+/* --- диалог -------------------------------------------------------------- */
+.dlg{background:var(--bg-app);border:1px solid var(--border);border-radius:9px;width:420px;
+  box-shadow:0 16px 44px var(--shadow);overflow:hidden}
+.dlg .dh{height:30px;background:var(--bg-tbar);border-bottom:1px solid var(--border);display:flex;
+  align-items:center;padding:0 10px;font-size:12.5px;color:var(--fg2);gap:7px}
+.dlg .db{padding:16px 18px 6px;display:flex;gap:13px}
+.dlg .df{display:flex;gap:8px;align-items:center;padding:12px 18px 14px}
+.dlg .df .sp{flex:1}
+
+/* --- уведомление KDE ------------------------------------------------------ */
+.kn{width:340px;background:#1B2331;border:1px solid rgba(255,255,255,.12);border-radius:8px;
+  box-shadow:0 14px 36px rgba(0,0,0,.5);padding:11px 12px;color:#F2F5FA;font-size:12.5px}
+.kn .knh{display:flex;align-items:center;gap:8px;font-size:11.5px;color:#8C97AC;margin-bottom:6px}
+.kn b{display:block;font-size:13.5px;margin-bottom:3px}
+.kn .knb{display:flex;gap:7px;margin-top:10px}
+.kn .knb span{font-size:12px;background:rgba(255,255,255,.10);border-radius:6px;padding:5px 10px}
+.kn .knb span.p{background:#6C93E8;color:#0B1220;font-weight:500}
+
+/* --- панель обновления --------------------------------------------------- */
+.upan{background:var(--bg-surface);border:1px solid var(--primary);border-radius:10px;padding:14px 16px}
+.upan.n{border-color:var(--border)}
+.ul{margin:6px 0 0;padding-left:17px;font-size:12.5px;color:var(--fg2);line-height:1.6}
+
+/* --- онбординг ------------------------------------------------------------ */
+.steps{display:flex;align-items:center;gap:7px}
+.sd{width:7px;height:7px;border-radius:50%;background:var(--border)}
+.sd.on{background:var(--primary);width:20px;border-radius:4px}
+.sd.dn{background:var(--fg4)}
+.obody{flex:1;display:flex;flex-direction:column;align-items:center;padding:24px 40px 0;overflow:hidden}
+.obar{height:60px;flex:none;border-top:1px solid var(--border);display:flex;align-items:center;
+  gap:10px;padding:0 22px;background:var(--bg-app)}
+
+/* --- индикатор уровня микрофона ------------------------------------------ */
+.lvl{display:flex;align-items:flex-end;gap:3px;height:34px}
+.lvl i{width:7px;border-radius:3px;background:var(--accent);display:block}
+.lvl.flat i{background:var(--fg4)}
+.lvbox{background:var(--bg-sunk);border-radius:8px;padding:10px 12px;display:flex;align-items:center;gap:12px}
+
+/* --- таблица «экран → состояние → файл» в оглавлении --------------------- */
+table.t{border-collapse:collapse;width:100%;font-size:12.5px}
+table.t th,table.t td{border-bottom:1px solid var(--border);padding:6px 9px;text-align:left;vertical-align:top}
+table.t th{color:var(--fg3);font-weight:500;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em}
+table.t td a{color:var(--primary);text-decoration:none}
+table.t td.f{font-family:var(--font-mono);font-size:11.5px}
+</style></head>
+<body class="light">
+<div class="cap"><b>Модели</b> — установка из файла, проверка, удаление · светлая тема</div>
+<div class="sech">Установить из файла…</div><div class="grid"><div class="stc"><div class="stn">выбор папки<span class="code">picker</span></div><div class="dlg" style="width:460px"><div class="dh"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="var(--fg3)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M2.2 4.4h4.2l1.3 1.7h6.1v7.5H2.2z"/></svg>Выбор папки с моделью</div><div class="db" style="flex-direction:column;gap:10px"><div class="sm">Укажите папку с файлами модели (<span class="mono">*.onnx</span> и <span class="mono">tokens.txt</span>) или архив, полученный от администратора.</div><div class="field mono" style="font-size:12px">/media/usb/models/gigaam-v3-e2e-rnnt-int8<span style="flex:1"></span><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="var(--fg3)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M2.2 4.4h4.2l1.3 1.7h6.1v7.5H2.2z"/></svg></div><div class="c12">Найдено 4 файла · 232 МБ · encoder.int8.onnx, decoder.onnx, joiner.onnx, tokens.txt</div></div><div class="df"><span class="sp"></span><span class="btn ">Отмена</span><span class="btn pri">Проверить и установить</span></div></div></div><div class="stc"><div class="stn">проверка прошла<span class="code">ok</span></div><div class="note o"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="var(--ok-ink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M3 8.4l3.4 3.3L13 4.6"/></svg><div><b>Модель установлена</b>GigaAM v3 RNN-T · 232 МБ · контрольные суммы совпали с манифестом каталога. Ревизия <span class="mono">a6039be</span> от 16.12.2025.<div style="margin-top:9px"><span class="btn pri">Выбрать активной</span></div></div></div></div></div><div class="grid"><div class="stc"><div class="stn">контрольная сумма не совпала<span class="code">bad-sum</span></div><div class="note e"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="var(--err-ink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 2.6l6 10.8H2zM8 6.6v3.1M8 11.4v.1"/></svg><div><b>Файл не прошёл проверку</b>Контрольная сумма <span class="mono">encoder.int8.onnx</span> не совпала с манифестом: файл повреждён или получен не из нашего каталога. Мы ничего не устанавливали.<div style="display:flex;gap:8px;margin-top:9px"><span class="btn pri">Выбрать другую папку</span><span class="btn gh">Подробнее</span></div></div></div></div><div class="stc"><div class="stn">модели нет в манифесте<span class="code">unknown</span></div><div class="note w"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="var(--warn-ink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 2.6l6 10.8H2zM8 6.6v3.1M8 11.4v.1"/></svg><div><b>Модель не из каталога</b>Сверить контрольные суммы не с чем — этой модели нет в манифесте. Установим как «Своя модель»: обновлений и метрик качества у неё не будет.<div style="display:flex;gap:8px;margin-top:9px"><span class="btn pri">Установить всё равно</span><span class="btn ">Отмена</span></div></div></div></div></div><div class="grid"><div class="stc"><div class="stn">в папке не хватает файлов<span class="code">incomplete</span></div><div class="note e"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="var(--err-ink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 2.6l6 10.8H2zM8 6.6v3.1M8 11.4v.1"/></svg><div><b>В папке не хватает файлов</b>Не найден <span class="mono">tokens.txt</span>. Нужны все файлы модели — обычно они лежат рядом в одной папке.<div style="margin-top:9px"><span class="btn pri">Выбрать другую папку</span></div></div></div></div><div class="stc"><div class="stn">установленная своя модель — без метрик и обновлений<span class="code">custom</span></div><div class="mc"><div class="mtop"><div class="ml"><div class="mname">NeMo FastConformer ru pc <span class="mven">· NVIDIA</span></div><div class="mpurp">Самая быстрая, с пунктуацией, точность ниже</div></div><div class="mmets"><div class="met"><span class="mn">Качество</span><span class="trk est"><i style="width:58%"></i></span><span class="mv">WER 15,2 %</span></div><div class="met"><span class="mn">Скорость</span><span class="trk est"><i style="width:99%"></i></span><span class="mv">≈58× быстрее речи</span></div></div></div><div class="mhr"></div><div class="mbot">Только русский <span class="dot"></span> с пунктуацией <span class="dot"></span> CC-BY-4.0 (атрибуция) · NVIDIA <span class="dot"></span> зарубежная<span class="sp"></span><span style="color:var(--fg3);display:inline-flex;align-items:center;gap:5px"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="var(--fg3)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12zM8 7.4v3.6M8 5.2v.1"/></svg>Своя модель: качество и скорость не измерены, обновлений нет</span><span class="dot"></span><span>125 МБ на диске</span><span class="dot"></span><span>~250 МБ ОЗУ · оценка</span> <span class="btn sm pri">Выбрать</span> <span class="btn sm">Удалить</span></div></div></div></div><div class="sech">Удаление модели</div><div class="grid"><div class="stc"><div class="stn">подтверждение удаления<span class="code">confirm</span></div><div class="dlg"><div class="dh"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="var(--fg3)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M3.4 4.6h9.2M6.2 4.6V3.2h3.6v1.4M4.6 4.6l.6 8.4h5.6l.6-8.4"/></svg>Удалить модель</div><div class="db"><svg viewBox="0 0 16 16" width="22" height="22" fill="none" stroke="var(--err-ink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M3.4 4.6h9.2M6.2 4.6V3.2h3.6v1.4M4.6 4.6l.6 8.4h5.6l.6-8.4"/></svg><div><div class="h3">Удалить GigaAM v3 CTC?</div><div class="sm" style="margin-top:6px">С диска будет удалено <b>225 МБ</b> из <span class="mono">~/.local/share/astra-voice/models/</span>. Настройки и статистика останутся. Скачать модель заново можно в любой момент.</div></div></div><div class="df"><span class="sp"></span><span class="btn ">Отмена</span><span class="btn pri">Удалить</span></div></div></div><div class="stc"><div class="stn">удаление активной модели недоступно<span class="code">disabled</span></div><div class="dlg"><div class="dh"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="var(--fg3)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12zM8 7.4v3.6M8 5.2v.1"/></svg>Удаление недоступно</div><div class="db"><svg viewBox="0 0 16 16" width="22" height="22" fill="none" stroke="var(--fg3)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 14A6 6 0 1 0 8 2a6 6 0 0 0 0 12zM8 7.4v3.6M8 5.2v.1"/></svg><div><div class="h3">Сначала выберите другую модель</div><div class="sm" style="margin-top:6px">GigaAM v3 RNN-T сейчас активна — без модели диктовка работать не будет. Выберите другую установленную модель, после этого удаление станет доступно.</div></div></div><div class="df"><span class="sp"></span><span class="btn ">Понятно</span><span class="btn pri">Открыть список моделей</span></div></div></div></div>
+<div class="legend"><b>«Установить из файла…»</b> — единственный путь в закрытом контуре, поэтому он есть на каждом экране, где есть «Скачать». Показаны все четыре исхода проверки: сумма сошлась · сумма не сошлась · модели нет в манифесте (ставим как «Своя модель») · не хватает файлов. <b>Удаление</b> подтверждается всегда и честно называет объём; у активной модели удаление недоступно и объясняет, почему.</div>
+</body></html>

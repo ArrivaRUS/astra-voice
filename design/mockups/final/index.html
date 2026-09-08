@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>Astra Voice — полный макет A «Панель»</title>
+<style>
+:root{--font-ui:'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif;--font-mono:'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace;
+  --bg-app:#F7F9FC; --bg-surface:#FFFFFF; --bg-sunk:#EDF1F7; --bg-tbar:#E7ECF4;
+  --border:#D7DEEA; --border-soft:#EDF1F7;
+  --fg1:#0E1729; --fg2:#243350; --fg3:#5A6884; --fg4:#AAB4C7;
+  --primary:#1B3A73; --primary-hover:#12294F; --primary-fg:#FFFFFF; --primary-bg:#E8EDF7;
+  --accent:#12B3A0; --accent-ink:#0B7F71; --accent-bg:#E3F7F4;
+  --ok-ink:#1F7D50; --ok-bg:#E7F5EE;
+  --warn-ink:#8F5E12; --warn-bg:#FAF0DC;
+  --err-ink:#C0322F; --err-bg:#FBECEB;
+  --canvas:#DDE3EE; --canvas-fg:#3A4761; --shadow:rgba(14,23,41,.18);
+}
+
+*{box-sizing:border-box}
+body{margin:0;padding:26px 20px 34px;background:var(--canvas);color:var(--canvas-fg);
+  font-family:var(--font-ui);font-size:14px;line-height:1.5;
+  display:flex;flex-direction:column;align-items:center;gap:14px;-webkit-font-smoothing:antialiased}
+.cap{font-size:13px;letter-spacing:.01em}
+.cap b{color:var(--fg1);font-weight:700}
+body.dark .cap b{color:#F2F5FA}
+.legend{max-width:900px;font-size:12.5px;line-height:1.55;opacity:.95}
+.legend b{font-weight:700}
+.legend ul{margin:6px 0 0;padding-left:18px}
+.mono{font-family:var(--font-mono);letter-spacing:.02em}
+
+/* ── окно ───────────────────────────────────────────── */
+.win{background:var(--bg-app);color:var(--fg1);border-radius:8px;overflow:hidden;
+  box-shadow:0 14px 44px var(--shadow);display:flex;flex-direction:column;flex:none}
+.tbar{height:32px;flex:none;display:flex;align-items:center;gap:8px;padding:0 10px;
+  background:var(--bg-tbar);border-bottom:1px solid var(--border)}
+.tbar .t{font-size:12.5px;color:var(--fg2);font-weight:500}
+.tbar .sp{flex:1}
+.wbtn{width:14px;height:14px;border-radius:3px;background:var(--border);display:inline-block}
+.wbtn.c{background:#D96B62}
+body.dark .wbtn.c{background:#8C3B36}
+
+/* ── типографика ────────────────────────────────────── */
+.h1{font-size:28px;line-height:1.2;font-weight:700;color:var(--fg1);margin:0}
+.h2{font-size:20px;line-height:1.25;font-weight:700;color:var(--fg1);margin:0}
+.h3{font-size:16px;line-height:1.3;font-weight:500;color:var(--fg1);margin:0}
+.sm{font-size:13px;line-height:1.45;color:var(--fg3)}
+.c12{font-size:12px;line-height:1.4;color:var(--fg3)}
+.grp{font-size:11px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--fg3);margin:0 0 7px 2px}
+.muted{color:var(--fg3)}
+.strong{font-weight:700;color:var(--fg1)}
+
+/* ── карточки и строки настроек ─────────────────────── */
+.card{background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
+.card>.r+.r{border-top:1px solid var(--border-soft)}
+.r{display:flex;align-items:center;gap:10px;padding:11px 14px;min-height:44px}
+.r .lbl{font-size:14px;color:var(--fg1);font-weight:400}
+.r .sub{font-size:12px;color:var(--fg3);margin-top:2px}
+.r .left{flex:1;min-width:0}
+.r.dis{opacity:.5}
+.hint{width:15px;height:15px;flex:none;border-radius:50%;border:1px solid var(--fg4);color:var(--fg3);
+  font-size:10px;line-height:13px;text-align:center;display:inline-block;font-weight:500}
+.lockb{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--fg3);
+  background:var(--bg-sunk);border-radius:5px;padding:2px 6px}
+
+/* ── контролы ───────────────────────────────────────── */
+.tgl{width:38px;height:21px;border-radius:11px;background:var(--fg4);position:relative;flex:none}
+.tgl i{position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;background:#fff;display:block}
+.tgl.on{background:var(--primary)}
+.tgl.on i{left:19px}
+.tgl.lock{background:var(--border)}
+.btn{font-family:var(--font-ui);font-size:13px;font-weight:500;color:var(--fg1);background:var(--bg-surface);
+  border:1px solid var(--border);border-radius:7px;padding:6px 12px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.btn.pri{background:var(--primary);border-color:var(--primary);color:var(--primary-fg)}
+.btn.gh{background:transparent;border-color:transparent;color:var(--primary);padding:6px 8px}
+.btn.dis{opacity:.45}
+.btn.sm{font-size:12.5px;padding:4px 9px}
+.sel{font-size:13px;color:var(--fg1);background:var(--bg-surface);border:1px solid var(--border);
+  border-radius:7px;padding:6px 10px;display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:7px;overflow:hidden;background:var(--bg-surface)}
+.seg span{font-size:12.5px;padding:5px 11px;color:var(--fg2)}
+.seg span.on{background:var(--primary);color:var(--primary-fg);font-weight:500}
+.key{font-family:var(--font-mono);font-size:13px;color:var(--fg1);background:var(--bg-sunk);
+  border-radius:6px;padding:3px 8px 2px;border-bottom:2px solid var(--border);display:inline-block;letter-spacing:.02em}
+.field{font-size:13px;color:var(--fg3);background:var(--bg-surface);border:1px solid var(--border);
+  border-radius:7px;padding:7px 11px;display:flex;align-items:center;gap:8px}
+.field.cap{border-color:var(--primary);box-shadow:0 0 0 2px var(--primary-bg);color:var(--fg1)}
+.chip{font-size:12.5px;color:var(--fg2);background:var(--bg-surface);border:1px solid var(--border);
+  border-radius:14px;padding:4px 11px;display:inline-flex;align-items:center;gap:6px}
+.chip.on{background:var(--primary);border-color:var(--primary);color:var(--primary-fg);font-weight:500}
+
+/* ── бейджи и теги ──────────────────────────────────── */
+.bd{font-size:11.5px;font-weight:500;border-radius:5px;padding:2px 7px;display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.bd.act{background:var(--accent-bg);color:var(--accent-ink)}
+.bd.rec{background:var(--primary-bg);color:var(--primary)}
+.bd.upd{background:var(--warn-bg);color:var(--warn-ink)}
+.bd.new{background:var(--bg-sunk);color:var(--fg3)}
+.bd.err{background:var(--err-bg);color:var(--err-ink)}
+.tag{font-size:12px;color:var(--fg3);white-space:nowrap}
+.dot{width:4px;height:4px;border-radius:50%;background:var(--fg4);display:inline-block;vertical-align:middle}
+
+/* ── полоски метрик ─────────────────────────────────── */
+.met{display:flex;align-items:center;gap:8px}
+.met .mn{font-size:11.5px;color:var(--fg3);width:58px;text-align:right;flex:none}
+.trk{width:88px;height:6px;border-radius:3px;background:var(--bg-sunk);overflow:hidden;flex:none}
+.trk i{display:block;height:100%;border-radius:3px;background:var(--primary)}
+.trk.est i{background:var(--fg4)}
+.met .mv{font-size:11.5px;color:var(--fg3);white-space:nowrap}
+.met .mv b{color:var(--fg1);font-weight:700}
+.prog{height:6px;border-radius:3px;background:var(--bg-sunk);overflow:hidden}
+.prog i{display:block;height:100%;background:var(--primary);border-radius:3px}
+
+/* ── полосы-уведомления ─────────────────────────────── */
+.note{display:flex;gap:9px;align-items:flex-start;border-radius:9px;padding:10px 12px;font-size:12.5px;line-height:1.45}
+.note.i{background:var(--bg-sunk);color:var(--fg2)}
+.note.w{background:var(--warn-bg);color:var(--warn-ink)}
+.note.e{background:var(--err-bg);color:var(--err-ink)}
+.note.o{background:var(--ok-bg);color:var(--ok-ink)}
+.note b{display:block;font-weight:700;margin-bottom:2px}
+
+/* ── нижняя строка окна ─────────────────────────────── */
+.foot{height:36px;flex:none;display:flex;align-items:center;gap:10px;padding:0 14px;
+  background:var(--bg-app);border-top:1px solid var(--border);font-size:12.5px;color:var(--fg3)}
+.foot .sp{flex:1}
+.foot .up{color:var(--primary);font-weight:500}
+.foot .num{font-family:var(--font-mono);font-size:12px}
+
+/* ── пилюля-оверлей ─────────────────────────────────── */
+.desk{border-radius:8px;overflow:hidden;position:relative;box-shadow:0 14px 44px var(--shadow);flex:none;
+  background:linear-gradient(160deg,#16233F 0%,#0E1729 55%,#1B3A73 100%)}
+.dwin{position:absolute;background:#FFFFFF;border-radius:7px;box-shadow:0 8px 26px rgba(0,0,0,.35);overflow:hidden}
+.dwin .dt{height:26px;background:#E7ECF4;border-bottom:1px solid #D7DEEA;display:flex;align-items:center;
+  padding:0 9px;font-size:11.5px;color:#243350}
+.dwin .dc{padding:12px 14px;font-size:12.5px;line-height:1.65;color:#0E1729}
+.panel{position:absolute;left:0;right:0;bottom:0;height:40px;background:#0B1220;
+  display:flex;align-items:center;gap:8px;padding:0 10px;border-top:1px solid rgba(255,255,255,.08)}
+.panel .pb{font-size:11.5px;color:#C4CDDC;background:rgba(255,255,255,.07);border-radius:5px;padding:4px 9px}
+.panel .sp{flex:1}
+.pill{background:rgba(14,23,41,.94);border-radius:18px;height:36px;display:inline-flex;align-items:center;
+  gap:9px;padding:0 10px;color:#F2F5FA;font-size:12.5px;box-shadow:0 6px 18px rgba(0,0,0,.4)}
+.pill .lv{display:flex;align-items:flex-end;gap:3px;height:20px}
+.pill .lv i{width:6px;border-radius:3px;background:#12B3A0;display:block}
+.pill .lv.f i{background:#5A6884}
+.pill .x{width:22px;height:22px;border-radius:50%;background:rgba(255,255,255,.12);display:inline-flex;
+  align-items:center;justify-content:center;color:#C4CDDC;font-size:13px;line-height:1}
+.pill .st{white-space:nowrap}
+.pill .st b{font-weight:700}
+.gal{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:center;
+  background:var(--bg-sunk);border:1px solid var(--border);border-radius:10px;padding:14px}
+.gal .cell{display:flex;flex-direction:column;align-items:center;gap:6px}
+.gal .cn{font-size:11px;color:var(--fg3)}
+
+/* ── трей-меню ──────────────────────────────────────── */
+.menu{background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;padding:5px;
+  box-shadow:0 12px 34px var(--shadow);width:262px}
+.mi{display:flex;align-items:center;gap:9px;padding:6px 9px;border-radius:6px;font-size:13px;color:var(--fg1)}
+.mi .sp{flex:1}
+.mi .sc{font-family:var(--font-mono);font-size:11.5px;color:var(--fg3)}
+.mi.dis{color:var(--fg4)}
+.mi.hd{color:var(--fg3);font-size:12px;padding-top:3px;padding-bottom:3px}
+.mi.hl{background:var(--primary);color:var(--primary-fg)}
+.mi.hl .sc{color:rgba(255,255,255,.7)}
+.msep{height:1px;background:var(--border-soft);margin:4px 6px}
+
+/* ── прокрутка (визуальная, содержимое обрезано как в реальном окне) ── */
+.scr{position:relative;overflow:hidden}
+.sb{position:absolute;right:4px;width:5px;border-radius:3px;background:var(--fg4);opacity:.45}
+
+/* ── карточка модели ────────────────────────────────── */
+.mc{background:var(--bg-surface);border:1px solid var(--border);border-radius:10px;padding:10px 13px;margin-bottom:9px}
+.mc.act{border-color:var(--accent);background:var(--accent-bg)}
+.mc.rec{border-color:var(--primary)}
+.mc.dis{opacity:.62}
+.mtop{display:flex;gap:14px;align-items:flex-start}
+.mtop .ml{flex:1;min-width:0}
+.mname{font-size:15px;font-weight:500;color:var(--fg1)}
+.mven{color:var(--fg3);font-weight:400;font-size:12.5px}
+.mpurp{font-size:12.5px;color:var(--fg3);margin-top:2px}
+.mbadges{display:flex;gap:5px;flex-wrap:wrap;margin-top:4px}
+.mmets{display:flex;flex-direction:column;gap:5px;flex:none}
+.mhr{height:1px;background:var(--border-soft);margin:9px 0 8px}
+.mbot{display:flex;align-items:center;gap:9px;font-size:12px;color:var(--fg3);flex-wrap:wrap}
+.mbot .sp{flex:1}
+
+
+/* --- токены доступности: цвет «выключено» с контрастом >= 4,5:1 ---------- */
+:root{--fg-dis:#67748B}
+body.dark{--fg-dis:#8C97AC}
+.mi.dis{color:var(--fg-dis)}
+.btn.dis{opacity:1;color:var(--fg-dis);background:var(--bg-sunk);border-color:var(--border)}
+.r.dis{opacity:1}
+.r.dis .lbl,.r.dis .sub{color:var(--fg-dis)}
+.tgl.dis{background:var(--border)}
+
+/* --- сайдбар ------------------------------------------------------------- */
+.side{width:184px;flex:none;background:var(--bg-sunk);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;padding:12px 10px}
+.slogo{display:flex;align-items:center;gap:8px;padding:4px 6px 12px;margin-bottom:6px;
+  border-bottom:1px solid var(--border)}
+.nav{display:flex;flex-direction:column;gap:2px;margin-top:8px}
+.nv{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:7px;font-size:13.5px;
+  font-weight:500;color:var(--fg2)}
+.nv.on{background:var(--primary);color:var(--primary-fg)}
+.nv.sub{font-weight:400;color:var(--fg3);font-size:13px}
+.nv .sp{flex:1}
+.nv .cnt{font-size:11.5px;color:var(--fg3)}
+.nv.on .cnt{color:rgba(255,255,255,.75)}
+body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
+.cont{flex:1;min-width:0;display:flex;flex-direction:column}
+.chead{padding:12px 22px 8px}
+.cbody{flex:1;padding:0 22px 16px}
+.wrap{display:flex;flex:1;min-height:0}
+.r{padding:7px 14px;min-height:38px}
+.grp{margin:0 0 5px 2px}
+
+/* --- карточка модели: плотнее по горизонтали, чтобы не рвалась в колонке 672 px --- */
+.mven{white-space:nowrap}
+.mc{padding:9px 13px;margin-bottom:8px}
+.met .mn{width:54px}
+.trk{width:78px}
+.mhr{margin:8px 0 7px}
+
+/* --- фокус клавиатуры (§8 PRD): видимая рамка 2 px ------------------------ */
+.foc{outline:2px solid var(--primary);outline-offset:2px;border-radius:8px}
+
+/* --- выпадающий список (раскрытый) --------------------------------------- */
+.pop{position:absolute;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;
+  box-shadow:0 12px 34px var(--shadow);padding:5px;z-index:5;min-width:236px}
+.po{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:6px;font-size:13px;color:var(--fg1)}
+.po .sp{flex:1}
+.po.on{background:var(--primary-bg);color:var(--primary);font-weight:500}
+.po.dis{color:var(--fg-dis)}
+.po .d2{font-size:11.5px;color:var(--fg3);display:block;margin-top:1px;font-weight:400}
+.rel{position:relative}
+
+/* --- галереи состояний --------------------------------------------------- */
+.sec{max-width:900px;width:100%}
+.sech{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--canvas-fg);
+  margin:16px 0 8px;width:100%;max-width:900px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;width:100%;max-width:900px}
+.grid1{display:grid;grid-template-columns:1fr;gap:10px;width:100%;max-width:900px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;width:100%;max-width:900px}
+.stc{background:var(--bg-app);border:1px solid var(--border);border-radius:10px;padding:11px 12px;
+  min-width:0;overflow-wrap:break-word}
+.grid>*,.grid1>*,.grid3>*{min-width:0}
+.stc div{flex-wrap:wrap}
+.stc .win div,.stc .desk div,.stc .menu div{flex-wrap:nowrap}
+.grid .mono,.grid3 .mono{overflow-wrap:anywhere}
+.stn{font-size:11.5px;font-weight:700;color:var(--fg3);letter-spacing:.04em;text-transform:uppercase;
+  margin-bottom:7px;display:flex;align-items:center;gap:6px}
+.stn .code{font-family:var(--font-mono);text-transform:none;letter-spacing:0;font-weight:400;
+  color:var(--fg4);font-size:11px}
+
+/* --- диалог -------------------------------------------------------------- */
+.dlg{background:var(--bg-app);border:1px solid var(--border);border-radius:9px;width:420px;
+  box-shadow:0 16px 44px var(--shadow);overflow:hidden}
+.dlg .dh{height:30px;background:var(--bg-tbar);border-bottom:1px solid var(--border);display:flex;
+  align-items:center;padding:0 10px;font-size:12.5px;color:var(--fg2);gap:7px}
+.dlg .db{padding:16px 18px 6px;display:flex;gap:13px}
+.dlg .df{display:flex;gap:8px;align-items:center;padding:12px 18px 14px}
+.dlg .df .sp{flex:1}
+
+/* --- уведомление KDE ------------------------------------------------------ */
+.kn{width:340px;background:#1B2331;border:1px solid rgba(255,255,255,.12);border-radius:8px;
+  box-shadow:0 14px 36px rgba(0,0,0,.5);padding:11px 12px;color:#F2F5FA;font-size:12.5px}
+.kn .knh{display:flex;align-items:center;gap:8px;font-size:11.5px;color:#8C97AC;margin-bottom:6px}
+.kn b{display:block;font-size:13.5px;margin-bottom:3px}
+.kn .knb{display:flex;gap:7px;margin-top:10px}
+.kn .knb span{font-size:12px;background:rgba(255,255,255,.10);border-radius:6px;padding:5px 10px}
+.kn .knb span.p{background:#6C93E8;color:#0B1220;font-weight:500}
+
+/* --- панель обновления --------------------------------------------------- */
+.upan{background:var(--bg-surface);border:1px solid var(--primary);border-radius:10px;padding:14px 16px}
+.upan.n{border-color:var(--border)}
+.ul{margin:6px 0 0;padding-left:17px;font-size:12.5px;color:var(--fg2);line-height:1.6}
+
+/* --- онбординг ------------------------------------------------------------ */
+.steps{display:flex;align-items:center;gap:7px}
+.sd{width:7px;height:7px;border-radius:50%;background:var(--border)}
+.sd.on{background:var(--primary);width:20px;border-radius:4px}
+.sd.dn{background:var(--fg4)}
+.obody{flex:1;display:flex;flex-direction:column;align-items:center;padding:24px 40px 0;overflow:hidden}
+.obar{height:60px;flex:none;border-top:1px solid var(--border);display:flex;align-items:center;
+  gap:10px;padding:0 22px;background:var(--bg-app)}
+
+/* --- индикатор уровня микрофона ------------------------------------------ */
+.lvl{display:flex;align-items:flex-end;gap:3px;height:34px}
+.lvl i{width:7px;border-radius:3px;background:var(--accent);display:block}
+.lvl.flat i{background:var(--fg4)}
+.lvbox{background:var(--bg-sunk);border-radius:8px;padding:10px 12px;display:flex;align-items:center;gap:12px}
+
+/* --- таблица «экран → состояние → файл» в оглавлении --------------------- */
+table.t{border-collapse:collapse;width:100%;font-size:12.5px}
+table.t th,table.t td{border-bottom:1px solid var(--border);padding:6px 9px;text-align:left;vertical-align:top}
+table.t th{color:var(--fg3);font-weight:500;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em}
+table.t td a{color:var(--primary);text-decoration:none}
+table.t td.f{font-family:var(--font-mono);font-size:11.5px}
+
+.doc{background:var(--bg-app);color:var(--fg1);border-radius:10px;max-width:1000px;width:100%;
+  padding:26px 30px 34px;box-shadow:0 14px 44px var(--shadow)}
+.doc h2{font-size:19px;margin:26px 0 10px;font-weight:700}
+.doc h2:first-of-type{margin-top:18px}
+.doc p{font-size:13.5px;line-height:1.65;color:var(--fg2);margin:0 0 10px}
+.doc ul{font-size:13.5px;line-height:1.7;color:var(--fg2);margin:0 0 10px;padding-left:20px}
+.doc a{color:var(--primary)}
+.lead{display:flex;align-items:center;gap:12px;padding-bottom:14px;border-bottom:1px solid var(--border)}
+.sect{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--fg3);
+  margin:18px 0 7px}
+.lnk{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:8px;background:var(--bg-surface);
+  border:1px solid var(--border);margin-bottom:6px;font-size:13.5px}
+.lnk .nm{flex:1;color:var(--fg1)}
+.lnk .st{font-size:12px;color:var(--fg3);flex:2;line-height:1.4}
+.lnk a{font-size:12.5px;padding:3px 9px;border-radius:6px;background:var(--bg-sunk);text-decoration:none;
+  white-space:nowrap;margin-left:6px}
+.q{display:grid;grid-template-columns:230px 1fr 76px;gap:10px;font-size:13px;line-height:1.55;
+  padding:9px 0;border-bottom:1px solid var(--border-soft)}
+.q b{color:var(--fg1)}
+.q .cost{font-size:11.5px;color:var(--fg3);text-align:right}
+.n{padding:9px 0;border-bottom:1px solid var(--border-soft);font-size:13px;line-height:1.6;color:var(--fg2)}
+.n b{color:var(--fg1);display:block;margin-bottom:2px}
+</style></head>
+<body class="light">
+<div class="cap"><b>Astra Voice</b> — полный макет направления A «Панель» · вход в ⛔ G3</div>
+<div class="doc"><div class="lead"><span style="display:inline-flex;align-items:center;gap:8px"><svg viewBox="0 0 100 51.7238" width="34" height="17.59" aria-hidden="true" style="flex:none"><circle cx="8.1233" cy="12.8619" r="6.7694" fill="var(--fg1)"/><circle cx="41.4966" cy="12.8619" r="9.3418" fill="var(--fg1)"/><circle cx="69.7928" cy="12.8619" r="12.8619" fill="var(--accent)"/><rect x="0" y="31.7238" width="100" height="20" rx="10" fill="var(--fg1)"/></svg><span style="font-size:22px;font-weight:500;letter-spacing:.03em;color:var(--fg1)">Astra&nbsp;Voice</span></span><div><div class="h2">Полный макет — направление A «Панель»</div><div class="sm" style="margin-top:3px">24 экрана × 2 темы = 48 файлов · окно 900×620 · QtQuick Controls 2 (Qt 5.15) · ⛔ G3</div></div></div><h2>Что здесь</h2><p>Развёрнутое направление <b>A «Панель»</b>, принятое на ⛔ G2 (<span class="mono">decisions/log.md</span>, 2026-09-08). Каждый экран — самодостаточный HTML без внешних ресурсов и скриптов; светлая и тёмная тема сделаны для всех экранов, потому что тема читается из <span class="mono">kdeglobals</span> и меняется на лету.</p><p>Решения заказчика, зашитые в макет: пилюля <b>резиновая под текст</b> (172 → 320 px, без многоточия), каталог моделей показывается <b>целиком с прокруткой</b>, подтверждение «Готово» — <b>500 мс</b>. Поведение и микрокопия — из <span class="mono">design/flows.md</span>, состав и цифры — из <span class="mono">PRD.md</span> F1–F16 и §7.2.</p><h2>Экраны</h2><div class="sect">1. Общие</div><div class="lnk"><span class="nm">Базовое состояние</span><span class="st">покой · disabled (трей выключить нельзя) · строка внизу «проверки отключены»</span><a href="01-general-base.html">светлая</a><a href="01-general-base-dark.html">тёмная</a></div><div class="lnk"><span class="nm">Захват комбинации</span><span class="st">idle · захват (ждём нажатия) · клавиши зажаты · успех · конфликт с KDE · дубликат · не захвачена</span><a href="01-general-hotkey.html">светлая</a><a href="01-general-hotkey-dark.html">тёмная</a></div><div class="lnk"><span class="nm">Микрофон</span><span class="st">поиск · список устройств · нет устройств · занято · молчит (+ «Перезапустить звук») · перезапуск идёт · службы нет · уровень live/quiet/flat</span><a href="01-general-mic.html">светлая</a><a href="01-general-mic-dark.html">тёмная</a></div><div class="lnk"><span class="nm">Индикатор и запуск</span><span class="st">выпадающий список (снизу/сверху/только трей) · режим удерживать/нажать-нажать · автозапуск вкл/выкл/ошибка · предложение звука после отключения пилюли</span><a href="01-general-indicator.html">светлая</a><a href="01-general-indicator-dark.html">тёмная</a></div><div class="sect">2. Модели</div><div class="lnk"><span class="nm">Каталог целиком</span><span class="st">12 карточек, секции «Установленные»/«Доступные», фильтры «Все языки» и «Только отечественные», прокрутка без «показать ещё»</span><a href="02-models-catalog.html">светлая</a><a href="02-models-catalog-dark.html">тёмная</a></div><div class="lnk"><span class="nm">Состояния карточки</span><span class="st">active · installed · downloading 43 % · queued · verifying · switching · not-downloaded · new · update-available · updating · update-failed · low-ram · не для русского · no-network · offline-user · policy · sha256 · нет места · corrupted · снята с каталога · правило бейджей · подсказка полосок</span><a href="02-models-card-states.html">светлая</a><a href="02-models-card-states-dark.html">тёмная</a></div><div class="lnk"><span class="nm">Из файла и удаление</span><span class="st">picker · сумма сошлась · сумма не сошлась · нет в манифесте · не хватает файлов · своя модель · подтверждение удаления · удаление активной недоступно</span><a href="02-models-file-dialogs.html">светлая</a><a href="02-models-file-dialogs-dark.html">тёмная</a></div><div class="lnk"><span class="nm">Пусто и нет сети</span><span class="st">empty (моделей нет) + no-network: встроенный список, «Скачать» disabled, «Из файла» активна</span><a href="02-models-empty-offline.html">светлая</a><a href="02-models-empty-offline-dark.html">тёмная</a></div><div class="sect">3. Вывод</div><div class="lnk"><span class="nm">Вывод</span><span class="st">способ вставки (Ctrl+V / Ctrl+Shift+V / Shift+Insert / только буфер) · терминалы · задержка · восстановление буфера · история Klipper (предупреждение и опция) · последний текст есть/пусто · тестовое поле idle/success/только буфер</span><a href="03-output.html">светлая</a><a href="03-output-dark.html">тёмная</a></div><div class="sect">4. Сеть</div><div class="lnk"><span class="nm">Сеть и обновления</span><span class="st">тумблеры выкл (по умолчанию) · офлайн-режим · источник каталога · проверка адреса (checking/ok/подпись не сошлась/недоступен) · строка заблокирована политикой</span><a href="04-network.html">светлая</a><a href="04-network-dark.html">тёмная</a></div><div class="lnk"><span class="nm">Панель обновления утилиты</span><span class="st">нет обновлений · проверяю · доступна · скачивается 42 % · проверка подписи · ожидание polkit · установка · нужен перезапуск · ошибка сети · ошибка подписи · отказ polkit · нет агента polkit · источник недоступен · версия пропущена</span><a href="04-update-panel.html">светлая</a><a href="04-update-panel-dark.html">тёмная</a></div><div class="lnk"><span class="nm">Трек «устанавливает администратор»</span><span class="st">ЗПС · нет прав · policy.conf updates=admin · вопрос «включена ли ЗПС» · пакет для админа собран</span><a href="04-update-admin.html">светлая</a><a href="04-update-admin-dark.html">тёмная</a></div><div class="lnk"><span class="nm">Строка внизу окна</span><span class="st">17 состояний обновления справа + 5 состояний активной модели слева</span><a href="04-footer-states.html">светлая</a><a href="04-footer-states-dark.html">тёмная</a></div><div class="sect">5. Продвинутые</div><div class="lnk"><span class="nm">Продвинутые</span><span class="st">модель в памяти (держать/выгружать через N мин) · потоки ORT · лимит записи · порог тишины · VAD · папка моделей и место на диске · evdev · xdotool · сброс · экспорт диагностики · мало места</span><a href="05-advanced.html">светлая</a><a href="05-advanced-dark.html">тёмная</a></div><div class="sect">6. О программе</div><div class="lnk"><span class="nm">О программе</span><span class="st">версии · GPL-3.0-or-later · NOTICE · PRIVACY · атрибуции моделей · дисклеймер о знаках · пути данных · статистика есть/пусто · что останется после удаления</span><a href="06-about.html">светлая</a><a href="06-about-dark.html">тёмная</a></div><div class="sect">7. Отладка</div><div class="lnk"><span class="nm">Отладка (Ctrl+Shift+D)</span><span class="st">уровень логов · папка логов · p50/p95 и N диктовок · статистики нет · диагностика collecting/done/error · тестовая диктовка</span><a href="07-debug.html">светлая</a><a href="07-debug-dark.html">тёмная</a></div><div class="sect">8. Онбординг</div><div class="lnk"><span class="nm">1/5 — приветствие и сеть</span><span class="st">оба тумблера ПУСТЫ · язык · пояснение приватности · «Пропустить» доступен</span><a href="08-onboarding-1-network.html">светлая</a><a href="08-onboarding-1-network-dark.html">тёмная</a></div><div class="lnk"><span class="nm">2/5 — модель</span><span class="st">скачать 232 МБ · из файла · загрузка 43 % · установлена · нет сети · сеть отвалилась · sha256 · нет места · «Пропустить» недоступен</span><a href="08-onboarding-2-model.html">светлая</a><a href="08-onboarding-2-model-dark.html">тёмная</a></div><div class="lnk"><span class="nm">3/5 — горячая клавиша</span><span class="st">предзаполнен Ctrl+Space · режим · захват · конфликт с KDE</span><a href="08-onboarding-3-hotkey.html">светлая</a><a href="08-onboarding-3-hotkey-dark.html">тёмная</a></div><div class="lnk"><span class="nm">4/5 — микрофон</span><span class="st">уровень live · тестовая диктовка без вставки · «микрофон молчит» + перезапуск звука</span><a href="08-onboarding-4-mic.html">светлая</a><a href="08-onboarding-4-mic-dark.html">тёмная</a></div><div class="lnk"><span class="nm">5/5 — автозапуск и готово</span><span class="st">автозапуск ВКЛ по умолчанию · «Готово: зажмите Ctrl+Space» · уведомление · значок в трее</span><a href="08-onboarding-5-done.html">светлая</a><a href="08-onboarding-5-done-dark.html">тёмная</a></div><div class="sect">9. Пилюля и трей</div><div class="lnk"><span class="nm">Пилюля-оверлей</span><span class="st">hidden · загружаю модель · слушаю · молчит · лимит · распознаю · готово (500 мс) · пусто · только буфер · отменено · ошибка · резиновая ширина 172→320 · снизу/сверху · светлый стол</span><a href="09-pill.html">светлая</a><a href="09-pill-dark.html">тёмная</a></div><div class="lnk"><span class="nm">Трей: значок и меню</span><span class="st">меню в покое · во время записи · при доступном обновлении · при ошибке микрофона · значок idle/listening/processing/done/error/хоткей не захвачен + подсказки</span><a href="09-tray.html">светлая</a><a href="09-tray-dark.html">тёмная</a></div><div class="sect">10. Диалоги</div><div class="lnk"><span class="nm">Диалоги и уведомления KDE</span><span class="st">удаление модели · сброс настроек · нужен перезапуск · настройки повреждены · нет трея · окно polkit (системное) · уведомления: готов, микрофон молчит, доступно обновление, обновление установлено, хоткей не захвачен</span><a href="10-dialogs.html">светлая</a><a href="10-dialogs-dark.html">тёмная</a></div><h2>Таблица: экран → состояния → файл</h2><table class="t"><thead><tr><th>Раздел</th><th>Экран и истории</th><th>Состояния</th><th>Файлы</th></tr></thead><tbody><tr><td>1. Общие</td><td><b>Базовое состояние</b><br><span class="muted">US-9.1, US-2.1</span></td><td>покой · disabled (трей выключить нельзя) · строка внизу «проверки отключены»</td><td class="f">01-general-base.html<br>01-general-base-dark.html</td></tr><tr><td>1. Общие</td><td><b>Захват комбинации</b><br><span class="muted">US-2.1, US-2.2, S1-A4</span></td><td>idle · захват (ждём нажатия) · клавиши зажаты · успех · конфликт с KDE · дубликат · не захвачена</td><td class="f">01-general-hotkey.html<br>01-general-hotkey-dark.html</td></tr><tr><td>1. Общие</td><td><b>Микрофон</b><br><span class="muted">US-11.1, S5</span></td><td>поиск · список устройств · нет устройств · занято · молчит (+ «Перезапустить звук») · перезапуск идёт · службы нет · уровень live/quiet/flat</td><td class="f">01-general-mic.html<br>01-general-mic-dark.html</td></tr><tr><td>1. Общие</td><td><b>Индикатор и запуск</b><br><span class="muted">US-4.1, US-8.1, S12</span></td><td>выпадающий список (снизу/сверху/только трей) · режим удерживать/нажать-нажать · автозапуск вкл/выкл/ошибка · предложение звука после отключения пилюли</td><td class="f">01-general-indicator.html<br>01-general-indicator-dark.html</td></tr><tr><td>2. Модели</td><td><b>Каталог целиком</b><br><span class="muted">US-5.1–5.7</span></td><td>12 карточек, секции «Установленные»/«Доступные», фильтры «Все языки» и «Только отечественные», прокрутка без «показать ещё»</td><td class="f">02-models-catalog.html<br>02-models-catalog-dark.html</td></tr><tr><td>2. Модели</td><td><b>Состояния карточки</b><br><span class="muted">US-5.2–5.6, US-7.4</span></td><td>active · installed · downloading 43 % · queued · verifying · switching · not-downloaded · new · update-available · updating · update-failed · low-ram · не для русского · no-network · offline-user · policy · sha256 · нет места · corrupted · снята с каталога · правило бейджей · подсказка полосок</td><td class="f">02-models-card-states.html<br>02-models-card-states-dark.html</td></tr><tr><td>2. Модели</td><td><b>Из файла и удаление</b><br><span class="muted">US-5.7, US-10.3</span></td><td>picker · сумма сошлась · сумма не сошлась · нет в манифесте · не хватает файлов · своя модель · подтверждение удаления · удаление активной недоступно</td><td class="f">02-models-file-dialogs.html<br>02-models-file-dialogs-dark.html</td></tr><tr><td>2. Модели</td><td><b>Пусто и нет сети</b><br><span class="muted">US-5.1, S6</span></td><td>empty (моделей нет) + no-network: встроенный список, «Скачать» disabled, «Из файла» активна</td><td class="f">02-models-empty-offline.html<br>02-models-empty-offline-dark.html</td></tr><tr><td>3. Вывод</td><td><b>Вывод</b><br><span class="muted">US-3.1–3.6</span></td><td>способ вставки (Ctrl+V / Ctrl+Shift+V / Shift+Insert / только буфер) · терминалы · задержка · восстановление буфера · история Klipper (предупреждение и опция) · последний текст есть/пусто · тестовое поле idle/success/только буфер</td><td class="f">03-output.html<br>03-output-dark.html</td></tr><tr><td>4. Сеть</td><td><b>Сеть и обновления</b><br><span class="muted">US-10.1–10.4</span></td><td>тумблеры выкл (по умолчанию) · офлайн-режим · источник каталога · проверка адреса (checking/ok/подпись не сошлась/недоступен) · строка заблокирована политикой</td><td class="f">04-network.html<br>04-network-dark.html</td></tr><tr><td>4. Сеть</td><td><b>Панель обновления утилиты</b><br><span class="muted">US-7.1–7.5</span></td><td>нет обновлений · проверяю · доступна · скачивается 42 % · проверка подписи · ожидание polkit · установка · нужен перезапуск · ошибка сети · ошибка подписи · отказ polkit · нет агента polkit · источник недоступен · версия пропущена</td><td class="f">04-update-panel.html<br>04-update-panel-dark.html</td></tr><tr><td>4. Сеть</td><td><b>Трек «устанавливает администратор»</b><br><span class="muted">US-7.5, S10</span></td><td>ЗПС · нет прав · policy.conf updates=admin · вопрос «включена ли ЗПС» · пакет для админа собран</td><td class="f">04-update-admin.html<br>04-update-admin-dark.html</td></tr><tr><td>4. Сеть</td><td><b>Строка внизу окна</b><br><span class="muted">US-7.1, US-9.1</span></td><td>17 состояний обновления справа + 5 состояний активной модели слева</td><td class="f">04-footer-states.html<br>04-footer-states-dark.html</td></tr><tr><td>5. Продвинутые</td><td><b>Продвинутые</b><br><span class="muted">US-2.6–2.9</span></td><td>модель в памяти (держать/выгружать через N мин) · потоки ORT · лимит записи · порог тишины · VAD · папка моделей и место на диске · evdev · xdotool · сброс · экспорт диагностики · мало места</td><td class="f">05-advanced.html<br>05-advanced-dark.html</td></tr><tr><td>6. О программе</td><td><b>О программе</b><br><span class="muted">US-9.3, US-10.5</span></td><td>версии · GPL-3.0-or-later · NOTICE · PRIVACY · атрибуции моделей · дисклеймер о знаках · пути данных · статистика есть/пусто · что останется после удаления</td><td class="f">06-about.html<br>06-about-dark.html</td></tr><tr><td>7. Отладка</td><td><b>Отладка (Ctrl+Shift+D)</b><br><span class="muted">US-9.4, F16</span></td><td>уровень логов · папка логов · p50/p95 и N диктовок · статистики нет · диагностика collecting/done/error · тестовая диктовка</td><td class="f">07-debug.html<br>07-debug-dark.html</td></tr><tr><td>8. Онбординг</td><td><b>1/5 — приветствие и сеть</b><br><span class="muted">US-1.1, US-10.1</span></td><td>оба тумблера ПУСТЫ · язык · пояснение приватности · «Пропустить» доступен</td><td class="f">08-onboarding-1-network.html<br>08-onboarding-1-network-dark.html</td></tr><tr><td>8. Онбординг</td><td><b>2/5 — модель</b><br><span class="muted">US-1.2, US-5.1</span></td><td>скачать 232 МБ · из файла · загрузка 43 % · установлена · нет сети · сеть отвалилась · sha256 · нет места · «Пропустить» недоступен</td><td class="f">08-onboarding-2-model.html<br>08-onboarding-2-model-dark.html</td></tr><tr><td>8. Онбординг</td><td><b>3/5 — горячая клавиша</b><br><span class="muted">US-1.3, US-2.1</span></td><td>предзаполнен Ctrl+Space · режим · захват · конфликт с KDE</td><td class="f">08-onboarding-3-hotkey.html<br>08-onboarding-3-hotkey-dark.html</td></tr><tr><td>8. Онбординг</td><td><b>4/5 — микрофон</b><br><span class="muted">US-1.5, US-11.1</span></td><td>уровень live · тестовая диктовка без вставки · «микрофон молчит» + перезапуск звука</td><td class="f">08-onboarding-4-mic.html<br>08-onboarding-4-mic-dark.html</td></tr><tr><td>8. Онбординг</td><td><b>5/5 — автозапуск и готово</b><br><span class="muted">US-1.7, US-8.1</span></td><td>автозапуск ВКЛ по умолчанию · «Готово: зажмите Ctrl+Space» · уведомление · значок в трее</td><td class="f">08-onboarding-5-done.html<br>08-onboarding-5-done-dark.html</td></tr><tr><td>9. Пилюля и трей</td><td><b>Пилюля-оверлей</b><br><span class="muted">US-4.1–4.4</span></td><td>hidden · загружаю модель · слушаю · молчит · лимит · распознаю · готово (500 мс) · пусто · только буфер · отменено · ошибка · резиновая ширина 172→320 · снизу/сверху · светлый стол</td><td class="f">09-pill.html<br>09-pill-dark.html</td></tr><tr><td>9. Пилюля и трей</td><td><b>Трей: значок и меню</b><br><span class="muted">US-4.5, US-8.4</span></td><td>меню в покое · во время записи · при доступном обновлении · при ошибке микрофона · значок idle/listening/processing/done/error/хоткей не захвачен + подсказки</td><td class="f">09-tray.html<br>09-tray-dark.html</td></tr><tr><td>10. Диалоги</td><td><b>Диалоги и уведомления KDE</b><br><span class="muted">US-7.3, US-9.2, S11–S14</span></td><td>удаление модели · сброс настроек · нужен перезапуск · настройки повреждены · нет трея · окно polkit (системное) · уведомления: готов, микрофон молчит, доступно обновление, обновление установлено, хоткей не захвачен</td><td class="f">10-dialogs.html<br>10-dialogs-dark.html</td></tr></tbody></table><h2>Что потребует кастомного QML</h2><p>Для архитекторов: список мест, где QtQuick Controls 2 «из коробки» не хватает. Оценка — относительная трудоёмкость, не часы.</p><div class="q"><div><b>Пилюля-оверлей</b></div><div>Frameless-окно поверх всех: <span class="mono">Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus</span>, вне Alt+Tab, без активации. В QtQuick Controls 2 такого компонента нет — отдельный <span class="mono">QQuickWindow</span> с собственной геометрией и повторной проверкой перекрытия (урок Astra Cowork: KWin теряет StaysOnTop при смене раскладки).</div><div class="cost">дорого</div></div><div class="q"><div><b>Столбики уровня (9 полос, ~30 кадр/с)</b></div><div>Ни ProgressBar, ни Slider не годятся: нужна перерисовка по аудиофрейму. Canvas или лёгкий <span class="mono">Repeater</span> из Rectangle с биндингом на свойство уровня; выбор — по замеру CPU (пилюля не должна греть машину во время диктовки).</div><div class="cost">средне</div></div><div class="q"><div><b>Резиновая ширина пилюли</b></div><div>Ширина считается по <span class="mono">TextMetrics</span> текста, min 172 / max 320 px, <b>без elide</b>. Анимация ширины при смене состояния — <span class="mono">Behavior on implicitWidth</span>, иначе пилюля «прыгает».</div><div class="cost">средне</div></div><div class="q"><div><b>Карточка модели</b></div><div>Композит: два трека метрик с текстовым значением, до двух бейджей по приоритету, нижняя строка тегов, прогресс-полоска и переменный набор кнопок на 20 состояний. Проще всего — один QML-компонент с <span class="mono">state</span>-машиной, а не ветвление в делегате списка.</div><div class="cost">дорого</div></div><div class="q"><div><b>Поле захвата комбинации</b></div><div>Захват «сырых» нажатий мимо focus-цепочки QML: нужен нативный event-filter (X11 <span class="mono">XGrabKeyboard</span> на время захвата) плюс чтение <span class="mono">kglobalshortcutsrc</span> для имени конфликтующего действия KDE.</div><div class="cost">дорого</div></div><div class="q"><div><b>Сегментированный переключатель</b></div><div>В Controls 2 нет SegmentedControl: собирается из Row + два AbstractButton c общим фоном; важно, чтобы Tab обходил его как один элемент.</div><div class="cost">дёшево</div></div><div class="q"><div><b>Тумблер с состоянием «заблокировано администратором»</b></div><div>Switch + значок замка + подпись; визуально «выключен», но не серый-невидимый — контраст подписи ≥ 4,5:1.</div><div class="cost">дёшево</div></div><div class="q"><div><b>Трей и меню</b></div><div><span class="mono">QSystemTrayIcon</span> + <span class="mono">QMenu</span> — это Widgets, а не QML: приложение получается гибридным (QQmlApplicationEngine + QWidgets-трей). Значок — SVG из лого-пака, цвет несёт только третья точка.</div><div class="cost">средне</div></div><div class="q"><div><b>Подсказка «Как мы считаем»</b></div><div>ToolTip в Controls 2 не принимает клики — нужен Popup с <span class="mono">closePolicy</span> и ссылкой внутри.</div><div class="cost">дёшево</div></div><div class="q"><div><b>Цифры моноширинно</b></div><div><span class="mono">font.features</span> (tabular-nums) появился в Qt 6.7; в Qt 5.15 проценты, скорость и версии набираем PT Mono, иначе полоска прогресса «дёргается».</div><div class="cost">дёшево</div></div><div class="q"><div><b>Тема из kdeglobals до первой отрисовки</b></div><div>Палитра читается парсером ini на старте (до <span class="mono">engine.load</span>) и живёт синглтоном; Qt-палитра в процессе оверлея врёт про тему — проверено на Astra Cowork.</div><div class="cost">средне</div></div><div class="q"><div><b>Окно polkit</b></div><div>Не наше окно: <span class="mono">pkexec</span>/PolicyKit-агент KDE. Наша зона — ровно один вызов за установку и корректная обработка отказа.</div><div class="cost">—</div></div><div class="q"><div><b>Уведомления KDE с кнопками</b></div><div><span class="mono">org.freedesktop.Notifications</span> по D-Bus с actions; на Astra модуль Fly может убивать владельца шины — нужен запасной путь (сообщение в окне), если сервис уведомлений не отвечает.</div><div class="cost">средне</div></div><h2>Замечания к PRD и flows.md</h2><p>Расхождения, найденные при разворачивании макета. Правки в <span class="mono">flows.md</span> уже внесены; правки в PRD — за product-manager.</p><div class="n"><b>PRD F3.2 — «Готово» 500 мс</b>✅ Уже синхронизировано: PRD F3.2 поправлен (коммит 8a0bcb9), таблица состояний в <span class="mono">design/flows.md</span> §3 обновлена этой же правкой. В макете везде 500 мс.</div><div class="n"><b>flows.md §8 — вопросы на приёмку</b>Пункты 2–4 закрыты решением G2 (резиновая пилюля, каталог целиком, 500 мс). Пункт 1 (выбор направления) закрыт выбором A. Раздел можно свернуть в «решено».</div><div class="n"><b>Лицензия в decisions/log.md</b>Запись от 2026-09-07 говорит «MIT — предварительно», а PRD F13, HEARTBEAT и файл <span class="mono">LICENSE</span> в репозитории — <b>GPL-3.0-or-later</b>. В макете «О программе» стоит GPL-3.0-or-later; старую запись стоит пометить как замещённую.</div><div class="n"><b>Каталог: 12 моделей против 8 в макетах направлений</b>Полный макет показывает все 12 позиций PRD §7.2 (10 Must + 2 Could). Числа качества/скорости для добавленных четырёх — <b>правдоподобные заглушки</b>: в PRD §7.2 есть только диск/ОЗУ/язык/лицензия, WER и RTFx там нет. Перед вёрсткой цифры должен подтвердить Researcher.</div><div class="n"><b>Vosk и фильтр «Только отечественные»</b>PRD помечает происхождение Vosk как «отеч. (уточнить, A6)». В макете такая карточка получает подпись «происхождение уточняется» и <b>не попадает</b> в фильтр отечественных. Нужно решение: считать ли Alpha Cephei отечественной — от этого зависит состав каталога в профиле <span class="mono">domestic_only=true</span>.</div><div class="n"><b>Whisper base и правило двух бейджей</b>«Не рекомендуется для русского» сделано подписью с треугольником в нижней строке карточки, а не третьим бейджем: иначе ломается правило «максимум два» (flows.md §7.8). То же для «мало ОЗУ».</div><div class="n"><b>Секция «Доступные» при пустом каталоге</b>flows.md §3.3 описывает <span class="mono">empty-network</span> как «Нет доступа к каталогу». В макете показан более мягкий вариант: <b>встроенный список из пакета остаётся виден</b> (он есть в deb и сети не требует), «Скачать» недоступна. Это ближе к F15 («встроенный манифест — источник по умолчанию»), но расходится с буквой flows.md — поправлено в flows.md §3.3.</div><div class="n"><b>«Проверить обновления» в трее при выключенных тумблерах</b>PRD F12 и flows.md §3.1 требуют делать пункт <b>неактивным</b>. При этом в разделе «Сеть» кнопка «Проверить сейчас» работает всегда (явное действие). Расхождение осознанное, но пользователю оно будет странно: в макете у неактивного пункта меню есть подсказка «Проверки выключены — включить в настройках». Вопрос к приёмке.</div><div class="n"><b>Порог тишины и VAD</b>PRD F6.2 даёт настраиваемый порог −60 дБ; отдельного тумблера VAD в PRD нет, silero-vad упоминается только в NOTICE. В «Продвинутых» добавлена строка «Отсекать тишину в начале и конце (VAD)» — <b>новая настройка</b>, требует подтверждения или удаления.</div><div class="n"><b>Размер окна</b>900×620 — из канона категории, в PRD размера нет. Минимальный размер окна (<span class="mono">minimumWidth/Height</span>) нужно зафиксировать в дизайн-спеке: при 800×600 каталог ещё читается, ниже — карточка модели ломается.</div><h2>Доступность (§8 PRD)</h2><ul><li>Контраст текста ≥ 4,5 : 1 в обеих темах; для «выключенных» элементов введён отдельный токен <span class="mono">--fg-dis</span> (#67748B / #8C97AC) вместо прозрачности — прозрачность давала 2,1 : 1.</li><li>Ни одно состояние не передаётся только цветом: у ошибки треугольник и подпись, у предупреждения — треугольник и жёлтый фон, у записи — столбики уровня, у готовности — галочка. В трее состояние дублируется подсказкой при наведении.</li><li>Бирюза #12B3A0 — только «слушаю» и только как графика; для текста берётся #0B7F71 (светлая) / #2FD9C4 (тёмная).</li><li>Все действия достижимы с клавиатуры; видимая рамка фокуса 2 px в цвете <span class="mono">--primary</span>. Esc отменяет захват комбинации и закрывает панели.</li><li>Цифры (проценты, скорость, версии, задержки) — PT Mono: в Qt 5.15 нет tabular-nums.</li></ul><h2>Как собрать заново</h2><p><span class="mono">cd design/mockups/final && python3 _build.py</span> — генераторы <span class="mono">_shell.py</span> (оболочка, палитра, данные каталога), <span class="mono">_p1.py</span> (Общие, Модели), <span class="mono">_p2.py</span> (Вывод, Сеть, Продвинутые, О программе, Отладка), <span class="mono">_p3.py</span> (онбординг, пилюля, трей, диалоги). Базовые компоненты и палитра переиспользуются из <span class="mono">../directions/_base.py</span> — правки цвета и геометрии делать там.</p></div>
+
+</body></html>
