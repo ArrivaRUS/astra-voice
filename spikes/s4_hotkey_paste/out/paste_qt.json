@@ -1,0 +1,68 @@
+{
+  "display": ":1",
+  "steps": [
+    {
+      "wid": 6291462,
+      "wm_class": [
+        "recv_qt.py",
+        "recv_qt.py"
+      ],
+      "terminal": false,
+      "step": "active-window",
+      "t_ms": 0.2
+    },
+    {
+      "formats": 2,
+      "secret": false,
+      "step": "save-clipboard",
+      "t_ms": 4.1
+    },
+    {
+      "chars": 19,
+      "hint": "secret",
+      "step": "put-text",
+      "t_ms": 4.4
+    },
+    {
+      "combo": "ctrl+v",
+      "ms": 0.42,
+      "step": "xtest",
+      "t_ms": 55.7
+    },
+    {
+      "formats": 2,
+      "step": "restore",
+      "t_ms": 156.3
+    }
+  ],
+  "target": {
+    "window": 6291462,
+    "wm_class": [
+      "recv_qt.py",
+      "recv_qt.py"
+    ]
+  },
+  "clipboard_before": {
+    "formats": [
+      "TARGETS",
+      "text/plain"
+    ],
+    "text_len": 30,
+    "password_hint": false
+  },
+  "text_raw": "Проверка связи, ёж.",
+  "text_normalized": "Проверка связи, ёж.",
+  "stripped_controls": 0,
+  "mode": "ctrl+v",
+  "xtest_ms": 0.42,
+  "owns_clipboard": true,
+  "restore": "restored",
+  "total_ms": 152.2,
+  "clipboard_after": {
+    "formats": [
+      "TARGETS",
+      "text/plain"
+    ],
+    "text": "ИСХОДНЫЙ БУФЕР 42"
+  }
+}

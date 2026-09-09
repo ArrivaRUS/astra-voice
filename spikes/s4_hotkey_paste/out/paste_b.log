@@ -1,0 +1,6 @@
+  active-window      {'wid': 4194310, 'wm_class': ('recv_qt.py', 'recv_qt.py'), 'terminal': False, 't_ms': 0.2}
+  save-clipboard     {'formats': 6, 'secret': True, 't_ms': 5.3}
+  put-text           {'chars': 19, 'hint': 'secret', 't_ms': 5.6}
+  xtest              {'combo': 'ctrl+v', 'ms': 0.33, 't_ms': 57.3}
+  restore-clear      {'reason': 'исходник с passwordManagerHint=secret (У40)', 't_ms': 158.9}
+{"mode": "ctrl+v", "restore": "cleared", "total_ms": 153.6, "owns_clipboard": true}

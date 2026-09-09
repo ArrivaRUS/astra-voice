@@ -1,0 +1,6 @@
+  active-window      {'wid': 10485766, 'wm_class': ('kate', 'kate'), 'terminal': False, 't_ms': 0.2}
+  save-clipboard     {'formats': 2, 'secret': False, 't_ms': 5.4}
+  put-text           {'chars': 19, 'hint': 'secret', 't_ms': 5.7}
+  xtest              {'combo': 'ctrl+v', 'ms': 0.22, 't_ms': 56.6}
+  restore            {'formats': 2, 't_ms': 157.6}
+{"mode": "ctrl+v", "restore": "restored", "total_ms": 152.3, "owns_clipboard": true}

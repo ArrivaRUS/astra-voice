@@ -1,0 +1,47 @@
+{
+  "format": {
+    "rate": 16000,
+    "channels": 1,
+    "sample": "s16le",
+    "chunk_ms": 20,
+    "chunk_bytes": 640
+  },
+  "device_requested": "av_test_src",
+  "silence_dbfs": -60.0,
+  "silence_hold_s": 2.0,
+  "lib": "libpulse-simple.so.0",
+  "open": {
+    "ok": true,
+    "attempts": 1,
+    "ms": 14.8,
+    "latency_us": 34
+  },
+  "capture": {
+    "chunks": 150,
+    "wall_s": 3.008,
+    "pcm_bytes": 96000,
+    "pcm_seconds": 3.0,
+    "peak_dbfs_max": -5.9,
+    "peak_dbfs_median": -120.0,
+    "silent_at_s": null,
+    "limit_at_s": null,
+    "read_thread_cpu_s": 0.01,
+    "read_thread_cpu_pct": 0.33,
+    "error": null
+  },
+  "reopen": {
+    "ok": true,
+    "ms": 15.2,
+    "attempts": 1,
+    "error": null
+  },
+  "asr": {
+    "model": "gigaam-v3-e2e-rnnt",
+    "quantization": "int8",
+    "load_ms": 725.8,
+    "infer_ms": 693.1,
+    "samples": 48000,
+    "duration_s": 3.0,
+    "text": "Проверка связи."
+  }
+}

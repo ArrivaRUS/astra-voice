@@ -1,0 +1,32 @@
+{
+  "format": {
+    "rate": 16000,
+    "channels": 1,
+    "sample": "s16le",
+    "chunk_ms": 20,
+    "chunk_bytes": 640
+  },
+  "device_requested": "av_no_such_source_42",
+  "silence_dbfs": -60.0,
+  "silence_hold_s": 2.0,
+  "lib": "libpulse-simple.so.0",
+  "open": {
+    "ok": true,
+    "attempts": 1,
+    "ms": 10.8,
+    "latency_us": 28
+  },
+  "capture": {
+    "chunks": 45,
+    "wall_s": 1.009,
+    "pcm_bytes": 28800,
+    "pcm_seconds": 0.9,
+    "peak_dbfs_max": -16.2,
+    "peak_dbfs_median": -28.9,
+    "silent_at_s": null,
+    "limit_at_s": null,
+    "read_thread_cpu_s": 0.0,
+    "read_thread_cpu_pct": 0.0,
+    "error": null
+  }
+}

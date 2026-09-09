@@ -1,0 +1,50 @@
+{
+  "path": "/home/astra/.config/kglobalshortcutsrc",
+  "exists": true,
+  "queries": {
+    "Ctrl+Space": [],
+    "Alt+F2": [
+      {
+        "section": "org.kde.krunner.desktop",
+        "section_name": "Открыть строку поиска и запуска KRunner",
+        "action": "_launch",
+        "title": "Открыть строку поиска и запуска KRunner",
+        "combos": [
+          "Alt+Space",
+          "Alt+F2",
+          "Search"
+        ]
+      }
+    ],
+    "Alt+Space": [
+      {
+        "section": "org.kde.krunner.desktop",
+        "section_name": "Открыть строку поиска и запуска KRunner",
+        "action": "_launch",
+        "title": "Открыть строку поиска и запуска KRunner",
+        "combos": [
+          "Alt+Space",
+          "Alt+F2",
+          "Search"
+        ]
+      }
+    ],
+    "Meta+V": [
+      {
+        "section": "plasmashell",
+        "section_name": "Plasma",
+        "action": "show-on-mouse-pos",
+        "title": "Показать записи на позиции указателя мыши",
+        "combos": [
+          "Meta+V"
+        ]
+      }
+    ]
+  },
+  "actions_total": 244,
+  "actions_with_combo": 99,
+  "fly_keyshortcutrc": {
+    "path": "/home/astra/.fly/keyshortcutrc",
+    "exists": true
+  }
+}

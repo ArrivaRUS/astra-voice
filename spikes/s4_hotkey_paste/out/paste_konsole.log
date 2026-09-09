@@ -1,0 +1,6 @@
+  active-window      {'wid': 4194311, 'wm_class': ('konsole', 'konsole'), 'terminal': True, 't_ms': 0.2}
+  save-clipboard     {'formats': 0, 'secret': False, 't_ms': 4.2}
+  put-text           {'chars': 19, 'hint': 'secret', 't_ms': 5.4}
+  xtest              {'combo': 'ctrl+shift+v', 'ms': 0.48, 't_ms': 57.4}
+  restore-clear      {'reason': 'буфер был пуст', 't_ms': 158.5}
+{"mode": "ctrl+shift+v", "restore": "cleared-empty", "total_ms": 154.2, "owns_clipboard": true}

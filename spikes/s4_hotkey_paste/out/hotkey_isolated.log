@@ -1,0 +1,18 @@
+grab ctrl+space → keycode=65 масок=4 ok=True
+probe alt+F2: занят другим клиентом → наш grab ok=False ([['0x8', 'BadAccess'], ['0xa', 'BadAccess'], ['0x18', 'BadAccess'], ['0x1a', 'BadAccess']]); после снятия ok=True
+  [recording] press
+  Escape: grab ok=True
+  [recording] tap→toggle (0.014 с)
+  [processing] toggle-off
+  [idle] done
+  Escape: ungrab
+  [recording] press
+  Escape: grab ok=True
+  [processing] release (1.531 с)
+  [idle] done
+  Escape: ungrab
+  [recording] press
+  Escape: grab ok=True
+  [idle] escape-cancel
+  Escape: ungrab
+{"key_presses": 5, "autorepeat_dropped": 22}

@@ -1,0 +1,62 @@
+{
+  "display": ":1",
+  "steps": [
+    {
+      "wid": 4194311,
+      "wm_class": [
+        "konsole",
+        "konsole"
+      ],
+      "terminal": true,
+      "step": "active-window",
+      "t_ms": 0.2
+    },
+    {
+      "formats": 0,
+      "secret": false,
+      "step": "save-clipboard",
+      "t_ms": 4.2
+    },
+    {
+      "chars": 19,
+      "hint": "secret",
+      "step": "put-text",
+      "t_ms": 5.4
+    },
+    {
+      "combo": "ctrl+shift+v",
+      "ms": 0.48,
+      "step": "xtest",
+      "t_ms": 57.4
+    },
+    {
+      "reason": "буфер был пуст",
+      "step": "restore-clear",
+      "t_ms": 158.5
+    }
+  ],
+  "target": {
+    "window": 4194311,
+    "wm_class": [
+      "konsole",
+      "konsole"
+    ]
+  },
+  "clipboard_before": {
+    "formats": [],
+    "text_len": 0,
+    "password_hint": false
+  },
+  "text_raw": "Проверка связи, ёж.",
+  "text_normalized": "Проверка связи, ёж.",
+  "stripped_controls": 0,
+  "mode": "ctrl+shift+v",
+  "xtest_ms": 0.48,
+  "owns_clipboard": true,
+  "restore": "cleared-empty",
+  "total_ms": 154.2,
+  "clipboard_after": {
+    "formats": [],
+    "text": ""
+  }
+}

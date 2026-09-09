@@ -1,0 +1,62 @@
+{
+  "display": ":1",
+  "steps": [
+    {
+      "wid": 4194310,
+      "wm_class": [
+        "recv_qt.py",
+        "recv_qt.py"
+      ],
+      "terminal": false,
+      "step": "active-window",
+      "t_ms": 0.2
+    },
+    {
+      "formats": 0,
+      "secret": false,
+      "step": "save-clipboard",
+      "t_ms": 3.7
+    },
+    {
+      "chars": 21,
+      "hint": "secret",
+      "step": "put-text",
+      "t_ms": 4.1
+    },
+    {
+      "combo": "ctrl+v",
+      "ms": 0.42,
+      "step": "xtest",
+      "t_ms": 55.3
+    },
+    {
+      "reason": "буфер был пуст",
+      "step": "restore-clear",
+      "t_ms": 155.9
+    }
+  ],
+  "target": {
+    "window": 4194310,
+    "wm_class": [
+      "recv_qt.py",
+      "recv_qt.py"
+    ]
+  },
+  "clipboard_before": {
+    "formats": [],
+    "text_len": 0,
+    "password_hint": false
+  },
+  "text_raw": "ls\n rm -rf ~\u001b[31m\u000fхвост",
+  "text_normalized": "ls  rm -rf ~[31mхвост",
+  "stripped_controls": 2,
+  "mode": "ctrl+v",
+  "xtest_ms": 0.42,
+  "owns_clipboard": true,
+  "restore": "cleared-empty",
+  "total_ms": 152.1,
+  "clipboard_after": {
+    "formats": [],
+    "text": ""
+  }
+}

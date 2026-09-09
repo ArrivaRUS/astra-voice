@@ -1,0 +1,17 @@
+{
+  "format": {
+    "rate": 16000,
+    "channels": 1,
+    "sample": "s16le",
+    "chunk_ms": 20,
+    "chunk_bytes": 640
+  },
+  "device_requested": "av_no_such_source_42",
+  "silence_dbfs": -60.0,
+  "silence_hold_s": 2.0,
+  "lib": "libpulse-simple.so.0",
+  "device_check": {
+    "exists": false,
+    "known": 8
+  }
+}

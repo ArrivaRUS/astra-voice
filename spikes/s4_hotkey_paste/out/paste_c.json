@@ -1,0 +1,62 @@
+{
+  "display": ":1",
+  "steps": [
+    {
+      "wid": 6291462,
+      "wm_class": [
+        "recv_qt.py",
+        "recv_qt.py"
+      ],
+      "terminal": false,
+      "step": "active-window",
+      "t_ms": 0.2
+    },
+    {
+      "formats": 0,
+      "secret": false,
+      "step": "save-clipboard",
+      "t_ms": 4.0
+    },
+    {
+      "chars": 19,
+      "hint": "secret",
+      "step": "put-text",
+      "t_ms": 4.3
+    },
+    {
+      "was": 6291462,
+      "now": 4194310,
+      "action": "clipboard-only",
+      "step": "window-changed",
+      "t_ms": 806.2
+    },
+    {
+      "reason": "буфер был пуст",
+      "step": "restore-clear",
+      "t_ms": 907.3
+    }
+  ],
+  "target": {
+    "window": 6291462,
+    "wm_class": [
+      "recv_qt.py",
+      "recv_qt.py"
+    ]
+  },
+  "clipboard_before": {
+    "formats": [],
+    "text_len": 0,
+    "password_hint": false
+  },
+  "text_raw": "Проверка связи, ёж.",
+  "text_normalized": "Проверка связи, ёж.",
+  "stripped_controls": 0,
+  "mode": "clipboard-only",
+  "owns_clipboard": true,
+  "restore": "cleared-empty",
+  "total_ms": 903.2,
+  "clipboard_after": {
+    "formats": [],
+    "text": ""
+  }
+}

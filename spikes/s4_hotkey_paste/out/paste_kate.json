@@ -1,0 +1,68 @@
+{
+  "display": ":1",
+  "steps": [
+    {
+      "wid": 10485766,
+      "wm_class": [
+        "kate",
+        "kate"
+      ],
+      "terminal": false,
+      "step": "active-window",
+      "t_ms": 0.2
+    },
+    {
+      "formats": 2,
+      "secret": false,
+      "step": "save-clipboard",
+      "t_ms": 5.4
+    },
+    {
+      "chars": 19,
+      "hint": "secret",
+      "step": "put-text",
+      "t_ms": 5.7
+    },
+    {
+      "combo": "ctrl+v",
+      "ms": 0.22,
+      "step": "xtest",
+      "t_ms": 56.6
+    },
+    {
+      "formats": 2,
+      "step": "restore",
+      "t_ms": 157.6
+    }
+  ],
+  "target": {
+    "window": 10485766,
+    "wm_class": [
+      "kate",
+      "kate"
+    ]
+  },
+  "clipboard_before": {
+    "formats": [
+      "TARGETS",
+      "text/plain"
+    ],
+    "text_len": 30,
+    "password_hint": false
+  },
+  "text_raw": "Проверка связи, ёж.",
+  "text_normalized": "Проверка связи, ёж.",
+  "stripped_controls": 0,
+  "mode": "ctrl+v",
+  "xtest_ms": 0.22,
+  "owns_clipboard": true,
+  "restore": "restored",
+  "total_ms": 152.3,
+  "clipboard_after": {
+    "formats": [
+      "TARGETS",
+      "text/plain"
+    ],
+    "text": "ИСХОДНЫЙ БУФЕР 42"
+  }
+}

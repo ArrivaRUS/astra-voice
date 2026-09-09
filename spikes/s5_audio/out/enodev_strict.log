@@ -1,0 +1,2 @@
+ОТКАЗ: источника 'av_no_such_source_42' нет в `pactl list short sources`.
+       Открывать нельзя: pa_simple молча подставит источник по умолчанию (реальный микрофон). Снять проверку: --no-strict-device

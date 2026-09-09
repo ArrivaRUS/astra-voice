@@ -1,0 +1,6 @@
+  active-window      {'wid': 6291462, 'wm_class': ('recv_qt.py', 'recv_qt.py'), 'terminal': False, 't_ms': 0.2}
+  save-clipboard     {'formats': 2, 'secret': False, 't_ms': 4.1}
+  put-text           {'chars': 19, 'hint': 'secret', 't_ms': 4.4}
+  xtest              {'combo': 'ctrl+v', 'ms': 0.42, 't_ms': 55.7}
+  restore            {'formats': 2, 't_ms': 156.3}
+{"mode": "ctrl+v", "restore": "restored", "total_ms": 152.2, "owns_clipboard": true}
