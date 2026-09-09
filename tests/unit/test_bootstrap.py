@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -82,3 +83,59 @@ def test_setup_sys_path_dev_uses_parent(tmp_path: Path) -> None:
         assert str(here / "vendor") not in sys.path
     finally:
         sys.path[:] = saved
+
+
+# ── выбор рендера Qt Quick (RSS: 167 740 → 102 580 кБ, spikes/m1_live/rss.md) ──
+
+
+def _clear_render_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(bootstrap.RENDER_ENV, raising=False)
+    for name in bootstrap.SOFTWARE_RENDER_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_render_defaults_to_software(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_render_env(monkeypatch)
+    bootstrap._setup_render_env()
+    assert os.environ["QT_QUICK_BACKEND"] == "software"
+    assert os.environ["QT_XCB_GL_INTEGRATION"] == "none"
+
+
+@pytest.mark.parametrize("value", ["gl", "GL", " gl "])
+def test_render_gl_sets_nothing(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    _clear_render_env(monkeypatch)
+    monkeypatch.setenv(bootstrap.RENDER_ENV, value)
+    bootstrap._setup_render_env()
+    assert "QT_QUICK_BACKEND" not in os.environ
+    assert "QT_XCB_GL_INTEGRATION" not in os.environ
+
+
+def test_render_unknown_value_falls_back_to_software(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_render_env(monkeypatch)
+    monkeypatch.setenv(bootstrap.RENDER_ENV, "чепуха")
+    bootstrap._setup_render_env()
+    assert os.environ["QT_QUICK_BACKEND"] == "software"
+
+
+def test_render_keeps_user_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_render_env(monkeypatch)
+    monkeypatch.setenv("QT_QUICK_BACKEND", "openvg")
+    bootstrap._setup_render_env()
+    assert os.environ["QT_QUICK_BACKEND"] == "openvg"  # выбор пользователя не перебит
+    assert os.environ["QT_XCB_GL_INTEGRATION"] == "none"
+
+
+def test_app_command_sets_render_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_render_env(monkeypatch)
+    assert bootstrap.main(["app", "--version"]) == 0
+    assert os.environ["QT_QUICK_BACKEND"] == "software"
+    assert os.environ["QT_QUICK_CONTROLS_STYLE"] == "Default"
+
+
+def test_worker_command_leaves_render_env_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_render_env(monkeypatch)
+    monkeypatch.delenv("QT_QUICK_CONTROLS_STYLE", raising=False)
+    assert bootstrap.main(["worker"]) == 2
+    assert "QT_QUICK_BACKEND" not in os.environ
+    assert "QT_XCB_GL_INTEGRATION" not in os.environ
+    assert "QT_QUICK_CONTROLS_STYLE" not in os.environ

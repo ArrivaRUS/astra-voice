@@ -1,3 +1,15 @@
+astra-voice (0.1.0~m1.2) unstable; urgency=medium
+
+  * Карточки настроек считаются по border-box: последняя строка больше не режется.
+  * Знак в боковом меню выровнен по геометрии логотипа.
+  * Глифы сверены с макетом.
+  * Qt Quick по умолчанию рисует программно (QT_QUICK_BACKEND=software,
+    QT_XCB_GL_INTEGRATION=none): память в покое 168 → 103 МБ. Аппаратный путь
+    включается переменной ASTRA_VOICE_RENDER=gl.
+  * Служебные сообщения Qt об OpenGL больше не попадают в stderr.
+
+ -- ArrivaRUS <arrivarus@gmail.com>  Wed, 09 Sep 2026 18:07:11 +0300
+
 astra-voice (0.1.0~m1.1) unstable; urgency=medium
 
   * Тема сессии доходит до окна: цвета KDE/Fly подхватываются при старте и на лету.

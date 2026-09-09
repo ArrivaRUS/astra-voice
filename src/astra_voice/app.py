@@ -33,11 +33,48 @@ CONNECT_TIMEOUT_MS = 2000
 LOCK_TIMEOUT_MS = 100
 SIGNAL_POLL_MS = 200
 
+# Программный рендер (bootstrap ставит QT_QUICK_BACKEND=software и
+# QT_XCB_GL_INTEGRATION=none ради 65 МБ RSS) заставляет Qt дважды пожаловаться на
+# отсутствие GL. Это ожидаемое следствие нашего же выбора, а не проблема —
+# обе строки уходят в журнал на уровне debug и не сорят в stderr.
+QT_EXPECTED_MESSAGES = (
+    "Cannot create platform OpenGL context",
+    "fallback to QtQuick software backend",
+)
+_qt_message_handler = None  # ссылку держим сами: Qt хранит только указатель
+
 # Продуктово окно настроек — окно трей-приложения: закрытие прячет его, процесс
 # продолжает работать (хоткей и запись живут в трее). Трей появляется в M4, а до
 # него скрытое окно превратилось бы в ловушку: процесс-призрак ловит `show`, и
 # приложение перестаёт открываться. Поэтому в M1 закрытие завершает процесс.
 CLOSE_TO_TRAY = False  # M4: True
+
+
+def _install_qt_message_handler() -> None:
+    """Уводит сообщения Qt из stderr в наш журнал (фильтр `text` действует и на них)."""
+    global _qt_message_handler
+    from PyQt5.QtCore import QtMsgType, qInstallMessageHandler
+
+    qt_log = logging.getLogger("qt")
+    levels = {
+        QtMsgType.QtDebugMsg: logging.DEBUG,
+        QtMsgType.QtInfoMsg: logging.INFO,
+        QtMsgType.QtWarningMsg: logging.WARNING,
+        QtMsgType.QtCriticalMsg: logging.ERROR,
+        QtMsgType.QtFatalMsg: logging.CRITICAL,
+    }
+
+    def handler(mode: Any, context: Any, message: str) -> None:
+        text = str(message).strip()
+        if not text:
+            return
+        if any(expected in text for expected in QT_EXPECTED_MESSAGES):
+            qt_log.debug("%s (ожидаемо при программном рендере)", text)
+            return
+        qt_log.log(levels.get(mode, logging.INFO), "%s", text)
+
+    _qt_message_handler = handler
+    qInstallMessageHandler(handler)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -362,6 +399,7 @@ def main(argv: list[str] | None = None) -> int:
 
     session_kind = detect()
     setup_logging(session_kind.value, debug=args.debug)
+    _install_qt_message_handler()  # до создания QApplication: GL-жалобы идут оттуда
     policy = policy_mod.load()
     stored = settings_mod.load()
     settings = policy_mod.effective(stored, policy)
