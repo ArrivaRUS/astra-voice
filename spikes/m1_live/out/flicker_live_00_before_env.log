@@ -1,0 +1,144 @@
+# ДО: 2026-09-09T17:36:59+03:00
+процессы: none
+окна: 
+runtime: ls: невозможно получить доступ к '/run/user/1000z0_0_0x0_0x0/astra-voice': Нет такого файла или каталога;
+
+## glxinfo -B
+name of display: :0
+display: :0  screen: 0
+direct rendering: Yes
+Extended renderer info (GLX_MESA_query_renderer):
+    Vendor: Intel (0x8086)
+    Device: Mesa Intel(R) Graphics (ARL) (0x7d41)
+    Version: 24.2.8
+    Accelerated: yes
+    Video memory: 15787MB
+    Unified memory: yes
+    Preferred profile: core (0x1)
+    Max core profile version: 4.6
+    Max compat profile version: 4.6
+    Max GLES1 profile version: 1.1
+    Max GLES[23] profile version: 3.2
+OpenGL vendor string: Intel
+OpenGL renderer string: Mesa Intel(R) Graphics (ARL)
+OpenGL core profile version string: 4.6 (Core Profile) Mesa 24.2.8-1.astra1+b10
+OpenGL core profile shading language version string: 4.60
+OpenGL core profile context flags: (none)
+OpenGL core profile profile mask: core profile
+
+OpenGL version string: 4.6 (Compatibility Profile) Mesa 24.2.8-1.astra1+b10
+OpenGL shading language version string: 4.60
+OpenGL context flags: (none)
+OpenGL profile mask: compatibility profile
+
+OpenGL ES profile version string: OpenGL ES 3.2 Mesa 24.2.8-1.astra1+b10
+OpenGL ES profile shading language version string: OpenGL ES GLSL ES 3.20
+
+
+## kreadconfig5 kwinrc [Compositing]
+Backend=
+GLCore=
+LatencyPolicy=
+AllowTearing=
+Enabled=
+OpenGLIsUnsafe=
+HiddenPreviews=
+GLPreferBufferSwap=
+
+## qdbus org.kde.KWin supportInformation (фрагменты)
+какой OpenGL драйвер и эффекты запущены.
+Version
+KWin version: 5.27.8
+Qt Version: 5.15.8
+Qt compile version: 5.15.8
+XCB compile version: 1.15
+Operation Mode: X11 only
+Vendor: The X.Org Foundation
+Vendor Release: 12101007
+Protocol Version/Revision: 11/0
+SHAPE: yes; Version: 0x11
+RANDR: yes; Version: 0x14
+DAMAGE: yes; Version: 0x11
+Composite: yes; Version: 0x4
+RENDER: yes; Version: 0xb
+XFIXES: yes; Version: 0x50
+SYNC: yes; Version: 0x31
+GLX: yes; Version: 0x0
+Name: KWin::X11StandaloneBackend
+themeName: breeze_cursors
+Options
+compositingMode: 1
+useCompositing: true
+glSmoothScale: 2
+glStrictBindingFollowsDriver: true
+glPreferBufferSwap: 101
+glPlatformInterface: 1
+latencyPolicy: 
+allowTearing: true
+Screen Edges
+Screens
+Screen 0:
+Name: eDP-1
+Geometry: 0,0,1920x1200
+Scale: 1
+Compositing
+Compositing is active
+Compositing Type: OpenGL
+OpenGL vendor string: Intel
+OpenGL renderer string: Mesa Intel(R) Graphics (ARL)
+OpenGL version string: 4.6 (Compatibility Profile) Mesa 24.2.8-1.astra1+b10
+OpenGL platform interface: GLX
+OpenGL shading language version string: 4.60
+Driver: Intel
+GPU class: Unknown
+OpenGL version: 4.6
+GLSL version: 4.60
+Mesa version: 24.2.8
+X server version: 1.21.1
+Linux kernel version: 6.12.60
+OpenGL 2 Shaders are used
+Loaded Effects:
+screenshot
+screenedge
+kwin4_effect_scale
+screenshot:
+screenedge:
+kwin4_effect_scale:
+pluginId: kwin4_effect_scale
+
+## env QT/QSG сессии
+QT_ACCESSIBILITY=1
+QT_SCREEN_SCALE_FACTORS=HDMI-1=1.25;eDP-1=1;
+QT_LOGGING_RULES=org.kde.plasma.libdiscover*=true
+XDG_SESSION_TYPE=x11
+XDG_CURRENT_DESKTOP=KDE
+QT_QUICK_CONTROLS_STYLE=org.kde.desktop
+QT_SCALE_FACTOR_ROUNDING_POLICY=Round
+QT_AUTO_SCREEN_SCALE_FACTOR=0
+QT_DPI_ADJUSTMENT_POLICY=AdjustDpi
+QT_ENABLE_HIGHDPI_SCALING=1
+python3-xlib: 1
+
+## qdbus supportInformation — секция Compositing/Screens
+Compositing
+===========
+Compositing is active
+Compositing Type: OpenGL
+OpenGL vendor string: Intel
+OpenGL renderer string: Mesa Intel(R) Graphics (ARL)
+OpenGL version string: 4.6 (Compatibility Profile) Mesa 24.2.8-1.astra1+b10
+OpenGL platform interface: GLX
+OpenGL shading language version string: 4.60
+Driver: Intel
+GPU class: Unknown
+OpenGL version: 4.6
+GLSL version: 4.60
+Mesa version: 24.2.8
+X server version: 1.21.1
+Linux kernel version: 6.12.60
+Direct rendering: Requires strict binding: yes
+GLSL shaders:  yes
+Texture NPOT support:  yes
+Virtual Machine:  no
+OpenGL 2 Shaders are used
+Loaded Effects:

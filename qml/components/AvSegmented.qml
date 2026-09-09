@@ -36,6 +36,7 @@ FocusScope {
             Repeater {
                 model: root.options
 
+                // Цвет сегмента (и hover, и выбранный) меняется мгновенно — без вспышек.
                 Rectangle {
                     id: segment
 
@@ -52,14 +53,6 @@ FocusScope {
                     antialiasing: true
                     color: current ? Theme.primary
                          : (mouse.containsMouse ? Theme.stateHoverOnSurface : "transparent")
-
-                    Behavior on color {
-                        ColorAnimation {
-                            duration: Theme.durationHover
-                            easing.type: Easing.Bezier
-                            easing.bezierCurve: Theme.easingHover.concat([1, 1])
-                        }
-                    }
 
                     // Внутренний край сегмента остаётся прямым — скругляется только внешний.
                     Rectangle {

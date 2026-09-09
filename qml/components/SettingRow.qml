@@ -36,18 +36,11 @@ Item {
         sub !== "" ? Theme.cardRowHWithSub : 0))
     height: implicitHeight
 
+    // Подсветка строки при наведении — без анимации (см. SidebarItem).
     Rectangle {
         anchors.fill: parent
         color: (root.toggle && root.rowEnabled && hoverArea.containsMouse)
                ? Theme.stateHoverOnSurface : "transparent"
-
-        Behavior on color {
-            ColorAnimation {
-                duration: Theme.durationHover
-                easing.type: Easing.Bezier
-                easing.bezierCurve: Theme.easingHover.concat([1, 1])
-            }
-        }
     }
 
     Rectangle {

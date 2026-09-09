@@ -1,0 +1,1702 @@
+qt.qpa.xcb: Has MIT-SHM     : true
+qt.qpa.xcb: Has MIT-SHM FD  : true
+qt.qpa.xcb: Using XInput version 2.2
+qt.qpa.screen: adding QXcbScreen(0x5c287ce07e80, name="eDP-1", geometry=1920x1200+0+0, availableGeometry=1920x1148+0+0, devicePixelRatio=1.0, logicalDpi=QPair(96.0,96.0), physicalSize=508.0x317.0mm, screenNumber=0, virtualSize=1920x1200 (1920.0x1200.0mm), orientation=Qt::LandscapeOrientation, depth=24, refreshRate=60.0, root=4b9, windowManagerName="KWin") (Primary: true )
+qt.qpa.screen: initializeScreens: primary output is "eDP-1"
+qt.qpa.xcb: using glib dispatcher
+qt.qpa.gl: Choosing xcb gl-integration based on following priority
+ ("xcb_glx", "xcb_egl")
+qt.qpa.gl: Xcb GLX gl-integration created
+qt.qpa.gl: Xcb GLX gl-integration successfully initialized
+qt.scenegraph.general: threaded render loop
+qt.scenegraph.general: Using sg animation driver
+qt.scenegraph.general: Animation Driver: using vsync: 16.67 ms
+qt.qpa.gl: Requested format before FBConfig/Visual selection: QSurfaceFormat(version 2.0, options QFlags<QSurfaceFormat::FormatOption>(), depthBufferSize 24, redBufferSize 8, greenBufferSize 8, blueBufferSize 8, alphaBufferSize -1, stencilBufferSize 8, samples -1, swapBehavior QSurfaceFormat::DoubleBuffer, swapInterval 1, colorSpace QSurfaceFormat::DefaultColorSpace, profile  QSurfaceFormat::NoProfile)
+qt.qpa.gl: Available GLX extensions: GLX_ARB_context_flush_control GLX_ARB_create_context GLX_ARB_create_context_no_error GLX_ARB_create_context_profile GLX_ARB_create_context_robustness GLX_ARB_fbconfig_float GLX_ARB_framebuffer_sRGB GLX_ARB_get_proc_address GLX_ARB_multisample GLX_EXT_buffer_age GLX_EXT_create_context_es2_profile GLX_EXT_create_context_es_profile GLX_EXT_fbconfig_packed_float GLX_EXT_framebuffer_sRGB GLX_EXT_no_config_context GLX_EXT_swap_control GLX_EXT_swap_control_tear GLX_EXT_texture_from_pixmap GLX_EXT_visual_info GLX_EXT_visual_rating GLX_INTEL_swap_event GLX_MESA_copy_sub_buffer GLX_MESA_gl_interop GLX_MESA_query_renderer GLX_MESA_swap_control GLX_OML_sync_control GLX_SGIS_multisample GLX_SGIX_fbconfig GLX_SGIX_pbuffer GLX_SGIX_visual_select_group GLX_SGI_make_current_read GLX_SGI_swap_control GLX_SGI_video_sync 
+qt.qpa.gl: Got format: QSurfaceFormat(version 2.0, options QFlags<QSurfaceFormat::FormatOption>(), depthBufferSize 24, redBufferSize 8, greenBufferSize 8, blueBufferSize 8, alphaBufferSize 0, stencilBufferSize 8, samples -1, swapBehavior QSurfaceFormat::DoubleBuffer, swapInterval 1, colorSpace QSurfaceFormat::DefaultColorSpace, profile  QSurfaceFormat::NoProfile)
+qt.qpa.xdnd: dndEnable QPlatformSurface(0x5c287d58df80, class=QSurface::Window, type=QSurface::OpenGLSurface, window=Main_QMLTYPE_34(0x5c287d2f0ec0)) true
+qt.qpa.xdnd: setting XdndAware for 94371862
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 211
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 212
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 397
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 398
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 399
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 400
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 401
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 403
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 404
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 405
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 411
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 412
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 413
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 415
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 417
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 418
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 419
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 420
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 421
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 421
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 421
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 422
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 423
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 424
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 425
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 426
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 534
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 535
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_REPARENT_NOTIFY(21) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_MAP_NOTIFY(19) | sequence: 540
+qt.qpa.events: Event | XCB_EXPOSE(12) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_FOCUS_IN(9) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_KEY_RELEASE(3) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 540
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 543
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 544
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 548
+qt.scenegraph.general: Using sg animation driver
+qt.scenegraph.general: Animation Driver: using vsync: 16.67 ms
+qt.scenegraph.general: opengl texture atlas dimensions: 1024x1024
+qt.scenegraph.general: R/G/B/A Buffers:   8 8 8 0
+qt.scenegraph.general: Depth Buffer:      24
+qt.scenegraph.general: Stencil Buffer:    8
+qt.scenegraph.general: Samples:           -1
+qt.scenegraph.general: GL_VENDOR:         Intel
+qt.scenegraph.general: GL_RENDERER:       Mesa Intel(R) Graphics (ARL)
+qt.scenegraph.general: GL_VERSION:        4.6 (Compatibility Profile) Mesa 24.2.8-1.astra1+b10
+qt.scenegraph.general: GL_EXTENSIONS:    GL_AMD_conservative_depth GL_AMD_depth_clamp_separate GL_AMD_draw_buffers_blend GL_AMD_multi_draw_indirect GL_AMD_performance_monitor GL_AMD_query_buffer_object GL_AMD_seamless_cubemap_per_texture GL_AMD_shader_stencil_export GL_AMD_shader_trinary_minmax GL_AMD_texture_texture4 GL_AMD_vertex_shader_layer GL_AMD_vertex_shader_viewport_index GL_ANGLE_texture_compression_dxt3 GL_ANGLE_texture_compression_dxt5 GL_APPLE_packed_pixels GL_ARB_ES2_compatibility GL_ARB_ES3_1_compatibility GL_ARB_ES3_2_compatibility GL_ARB_ES3_compatibility GL_ARB_arrays_of_arrays GL_ARB_base_instance GL_ARB_blend_func_extended GL_ARB_buffer_storage GL_ARB_clear_buffer_object GL_ARB_clear_texture GL_ARB_clip_control GL_ARB_color_buffer_float GL_ARB_compatibility GL_ARB_compressed_texture_pixel_storage GL_ARB_compute_shader GL_ARB_compute_variable_group_size GL_ARB_conditional_render_inverted GL_ARB_conservative_depth GL_ARB_copy_buffer GL_ARB_copy_image GL_ARB_cull_distance GL_ARB_debug_output GL_ARB_depth_buffer_float GL_ARB_depth_clamp GL_ARB_depth_texture GL_ARB_derivative_control GL_ARB_direct_state_access GL_ARB_draw_buffers GL_ARB_draw_buffers_blend GL_ARB_draw_elements_base_vertex GL_ARB_draw_indirect GL_ARB_draw_instanced GL_ARB_enhanced_layouts GL_ARB_explicit_attrib_location GL_ARB_explicit_uniform_location GL_ARB_fragment_coord_conventions GL_ARB_fragment_layer_viewport GL_ARB_fragment_program GL_ARB_fragment_program_shadow GL_ARB_fragment_shader GL_ARB_fragment_shader_interlock GL_ARB_framebuffer_no_attachments GL_ARB_framebuffer_object GL_ARB_framebuffer_sRGB GL_ARB_get_program_binary GL_ARB_get_texture_sub_image GL_ARB_gl_spirv GL_ARB_gpu_shader5 GL_ARB_gpu_shader_fp64 GL_ARB_gpu_shader_int64 GL_ARB_half_float_pixel GL_ARB_half_float_vertex GL_ARB_indirect_parameters GL_ARB_instanced_arrays GL_ARB_internalformat_query GL_ARB_internalformat_query2 GL_ARB_invalidate_subdata GL_ARB_map_buffer_alignment GL_ARB_map_buffer_range GL_ARB_multi_bind GL_ARB_multi_draw_indirect GL_ARB_multisample GL_ARB_multitexture GL_ARB_occlusion_query GL_ARB_occlusion_query2 GL_ARB_parallel_shader_compile GL_ARB_pipeline_statistics_query GL_ARB_pixel_buffer_object GL_ARB_point_parameters GL_ARB_point_sprite GL_ARB_polygon_offset_clamp GL_ARB_post_depth_coverage GL_ARB_program_interface_query GL_ARB_provoking_vertex GL_ARB_query_buffer_object GL_ARB_robust_buffer_access_behavior GL_ARB_robustness GL_ARB_sample_shading GL_ARB_sampler_objects GL_ARB_seamless_cube_map GL_ARB_seamless_cubemap_per_texture GL_ARB_separate_shader_objects GL_ARB_shader_atomic_counter_ops GL_ARB_shader_atomic_counters GL_ARB_shader_ballot GL_ARB_shader_bit_encoding GL_ARB_shader_clock GL_ARB_shader_draw_parameters GL_ARB_shader_group_vote GL_ARB_shader_image_load_store GL_ARB_shader_image_size GL_ARB_shader_objects GL_ARB_shader_precision GL_ARB_shader_stencil_export GL_ARB_shader_storage_buffer_object GL_ARB_shader_subroutine GL_ARB_shader_texture_image_samples GL_ARB_shader_texture_lod GL_ARB_shader_viewport_layer_array GL_ARB_shading_language_100 GL_ARB_shading_language_420pack GL_ARB_shading_language_include GL_ARB_shading_language_packing GL_ARB_shadow GL_ARB_spirv_extensions GL_ARB_stencil_texturing GL_ARB_sync GL_ARB_tessellation_shader GL_ARB_texture_barrier GL_ARB_texture_border_clamp GL_ARB_texture_buffer_object GL_ARB_texture_buffer_object_rgb32 GL_ARB_texture_buffer_range GL_ARB_texture_compression GL_ARB_texture_compression_bptc GL_ARB_texture_compression_rgtc GL_ARB_texture_cube_map GL_ARB_texture_cube_map_array GL_ARB_texture_env_add GL_ARB_texture_env_combine GL_ARB_texture_env_crossbar GL_ARB_texture_env_dot3 GL_ARB_texture_filter_anisotropic GL_ARB_texture_float GL_ARB_texture_gather GL_ARB_texture_mirror_clamp_to_edge GL_ARB_texture_mirrored_repeat GL_ARB_texture_multisample GL_ARB_texture_non_power_of_two GL_ARB_texture_query_levels GL_ARB_texture_query_lod GL_ARB_texture_rectangle GL_ARB_texture_rg GL_ARB_texture_rgb10_a2ui GL_ARB_texture_stencil8 GL_ARB_texture_storage GL_ARB_texture_storage_multisample GL_ARB_texture_swizzle GL_ARB_texture_view GL_ARB_timer_query GL_ARB_transform_feedback2 GL_ARB_transform_feedback3 GL_ARB_transform_feedback_instanced GL_ARB_transform_feedback_overflow_query GL_ARB_transpose_matrix GL_ARB_uniform_buffer_object GL_ARB_vertex_array_bgra GL_ARB_vertex_array_object GL_ARB_vertex_attrib_64bit GL_ARB_vertex_attrib_binding GL_ARB_vertex_buffer_object GL_ARB_vertex_program GL_ARB_vertex_shader GL_ARB_vertex_type_10f_11f_11f_rev GL_ARB_vertex_type_2_10_10_10_rev GL_ARB_viewport_array GL_ARB_window_pos GL_ATI_blend_equation_separate GL_ATI_draw_buffers GL_ATI_fragment_shader GL_ATI_separate_stencil GL_ATI_texture_compression_3dc GL_ATI_texture_env_combine3 GL_ATI_texture_float GL_EXT_EGL_image_storage GL_EXT_EGL_image_storage_compression GL_EXT_EGL_sync GL_EXT_abgr GL_EXT_bgra GL_EXT_blend_color GL_EXT_blend_equation_separate GL_EXT_blend_func_separate GL_EXT_blend_minmax GL_EXT_blend_subtract GL_EXT_compiled_vertex_array GL_EXT_copy_texture GL_EXT_debug_label GL_EXT_demote_to_helper_invocation GL_EXT_depth_bounds_test GL_EXT_direct_state_access GL_EXT_draw_buffers2 GL_EXT_draw_instanced GL_EXT_draw_range_elements GL_EXT_fog_coord GL_EXT_framebuffer_blit GL_EXT_framebuffer_multisample GL_EXT_framebuffer_multisample_blit_scaled GL_EXT_framebuffer_object GL_EXT_framebuffer_sRGB GL_EXT_gpu_program_parameters GL_EXT_gpu_shader4 GL_EXT_memory_object GL_EXT_memory_object_fd GL_EXT_multi_draw_arrays GL_EXT_packed_depth_stencil GL_EXT_packed_float GL_EXT_packed_pixels GL_EXT_pixel_buffer_object GL_EXT_point_parameters GL_EXT_polygon_offset_clamp GL_EXT_provoking_vertex GL_EXT_rescale_normal GL_EXT_secondary_color GL_EXT_semaphore GL_EXT_semaphore_fd GL_EXT_separate_specular_color GL_EXT_shader_framebuffer_fetch GL_EXT_shader_framebuffer_fetch_non_coherent GL_EXT_shader_integer_mix GL_EXT_shader_samples_identical GL_EXT_shadow_funcs GL_EXT_stencil_two_side GL_EXT_stencil_wrap GL_EXT_subtexture GL_EXT_texture GL_EXT_texture3D GL_EXT_texture_array GL_EXT_texture_buffer_object GL_EXT_texture_compression_dxt1 GL_EXT_texture_compression_latc GL_EXT_texture_compression_rgtc GL_EXT_texture_compression_s3tc GL_EXT_texture_cube_map GL_EXT_texture_edge_clamp GL_EXT_texture_env_add GL_EXT_texture_env_combine GL_EXT_texture_env_dot3 GL_EXT_texture_filter_anisotropic GL_EXT_texture_integer GL_EXT_texture_lod_bias GL_EXT_texture_object GL_EXT_texture_rectangle GL_EXT_texture_sRGB GL_EXT_texture_sRGB_R8 GL_EXT_texture_sRGB_decode GL_EXT_texture_shadow_lod GL_EXT_texture_shared_exponent GL_EXT_texture_snorm GL_EXT_texture_storage GL_EXT_texture_swizzle GL_EXT_timer_query GL_EXT_transform_feedback GL_EXT_vertex_array GL_EXT_vertex_array_bgra GL_EXT_vertex_attrib_64bit GL_IBM_multimode_draw_arrays GL_IBM_rasterpos_clip GL_IBM_texture_mirrored_repeat GL_INGR_blend_func_separate GL_INTEL_blackhole_render GL_INTEL_performance_query GL_INTEL_shader_atomic_float_minmax GL_INTEL_shader_integer_functions2 GL_KHR_blend_equation_advanced GL_KHR_blend_equation_advanced_coherent GL_KHR_context_flush_control GL_KHR_debug GL_KHR_no_error GL_KHR_parallel_shader_compile GL_KHR_robust_buffer_access_behavior GL_KHR_robustness GL_KHR_texture_compression_astc_ldr GL_KHR_texture_compression_astc_sliced_3d GL_MESA_framebuffer_flip_y GL_MESA_pack_invert GL_MESA_shader_integer_functions GL_MESA_texture_const_bandwidth GL_MESA_texture_signed_rgba GL_MESA_window_pos GL_NV_ES1_1_compatibility GL_NV_alpha_to_coverage_dither_control GL_NV_blend_square GL_NV_compute_shader_derivatives GL_NV_conditional_render GL_NV_copy_depth_to_color GL_NV_copy_image GL_NV_depth_clamp GL_NV_fog_distance GL_NV_fragment_shader_interlock GL_NV_half_float GL_NV_light_max_exponent GL_NV_packed_depth_stencil GL_NV_primitive_restart GL_NV_texgen_reflection GL_NV_texture_barrier GL_NV_texture_env_combine4 GL_NV_texture_rectangle GL_OES_EGL_image GL_OES_read_format GL_S3_s3tc GL_SGIS_generate_mipmap GL_SGIS_texture_border_clamp GL_SGIS_texture_edge_clamp GL_SGIS_texture_lod GL_SUN_multi_draw_arrays
+qt.scenegraph.general: Max Texture Size: 16384
+qt.scenegraph.general: Debug context:    false
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 580
+qt.qpa.events: Event | XCB_KEY_PRESS(2) | sequence: 587
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 588
+qt.qpa.events: Event | XCB_KEY_RELEASE(3) | sequence: 588
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 588
+qt.qpa.events: Event | XCB_KEY_PRESS(2) | sequence: 588
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 589
+qt.qpa.events: Event | XCB_KEY_PRESS(2) | sequence: 589
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 590
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 590
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 590
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 590
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 590
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 590
+qt.qpa.events: Event | XCB_KEY_RELEASE(3) | sequence: 590
+qt.qpa.events: Event | XCB_KEY_RELEASE(3) | sequence: 590
+qt.qpa.events: Event | XCB_ENTER_NOTIFY(7) | sequence: 590
+qt.qpa.events: Event | XInput Event(XCB_INPUT_ENTER) | sequence: 590
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 590
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 597
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 597
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 613
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 614
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 616
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 617
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 619
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 619
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 620
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 620
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 625
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 625
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 625
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 625
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 626
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 626
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 627
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 629
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 630
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 632
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 632
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 633
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 633
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 634
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 634
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 635
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 635
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 636
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 636
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 637
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 637
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 638
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 638
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 639
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 639
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 640
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 640
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 642
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 643
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 644
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 644
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 645
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 645
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 646
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 646
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 647
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 647
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 648
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 648
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 649
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 649
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 650
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 652
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 653
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 661
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 662
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 662
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 668
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 669
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 670
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 670
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 671
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 671
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 672
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 672
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 677
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 679
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 680
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 681
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 681
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 682
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 683
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 684
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 684
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 686
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 687
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 688
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 689
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 690
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 690
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 691
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 692
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 693
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 693
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 694
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 694
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 695
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 696
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 696
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 698
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 699
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 700
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 701
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 701
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 702
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 702
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 703
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 703
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 704
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 704
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 705
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 706
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 706
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 707
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 707
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 707
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 707
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 707
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 707
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 707
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 708
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 709
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 710
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 711
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 713
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 713
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 714
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 714
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 715
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 715
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 716
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 716
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 717
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 717
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 718
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 719
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 720
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 723
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 724
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 725
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 726
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 727
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 728
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 729
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 730
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 731
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 732
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 732
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 733
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 733
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 734
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 734
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 734
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 734
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 734
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 734
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 734
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 734
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 734
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 734
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 734
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 734
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 734
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 734
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 734
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 734
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 735
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 736
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 736
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 737
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 737
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 738
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 738
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 740
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 741
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 742
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 742
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 743
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 750
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 750
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 750
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 750
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 750
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 751
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 752
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 752
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 753
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 754
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 756
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 757
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 758
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 758
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 759
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 759
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 759
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 760
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 760
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 760
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 760
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 760
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 761
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 762
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 763
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 764
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 765
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 766
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 767
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 767
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 769
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 770
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 771
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 771
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 772
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 773
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 774
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 774
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 775
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 776
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 777
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 777
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 778
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 778
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 779
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 780
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 781
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 782
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 784
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 785
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 786
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 786
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 788
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 789
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 790
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 790
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 791
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 791
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 792
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 792
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 793
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 793
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 795
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 796
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 797
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 798
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 799
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 799
+qt.qpa.events: Event | XCB_LEAVE_NOTIFY(8) | sequence: 800
+qt.qpa.events: Event | XInput Event(XCB_INPUT_LEAVE) | sequence: 800
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 806
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 806
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 806
+qt.qpa.events: Event | XCB_FOCUS_OUT(10) | sequence: 806
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 806
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 806
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 806
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 806
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 806
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 807
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 807
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 807
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 807
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_FOCUS_IN(9) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 807
+qt.qpa.events: Event | XCB_ENTER_NOTIFY(7) | sequence: 808
+qt.qpa.events: Event | XInput Event(XCB_INPUT_ENTER) | sequence: 808
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 808
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 815
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 815
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 816
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 816
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 818
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 820
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 822
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 823
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 823
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 824
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 824
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 825
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 826
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 827
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 828
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 828
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 829
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 830
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 831
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 831
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 832
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 833
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 834
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 835
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 836
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 836
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 836
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 837
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 837
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 837
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 837
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 838
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 838
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 839
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 840
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 841
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 842
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 843
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 843
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 844
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 844
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 845
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 845
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 846
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 846
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 847
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 847
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 848
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 849
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 853
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 854
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 855
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 856
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 856
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 857
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 857
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 858
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 858
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 859
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 861
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 862
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 862
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 863
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 863
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 864
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 864
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 865
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 865
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 866
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 866
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 867
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 867
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 868
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 868
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 869
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 869
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 870
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 870
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 871
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 871
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 872
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 872
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 873
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 874
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 875
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 876
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 877
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 877
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 878
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 879
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 880
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 881
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 882
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 884
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 886
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 887
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 888
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 890
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 891
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 892
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 893
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 893
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 894
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 895
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 896
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 896
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 897
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 897
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 898
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 898
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 899
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 899
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 900
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 901
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 901
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 901
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 901
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 901
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 901
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 901
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 901
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 901
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 901
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 902
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 902
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 903
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 904
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 906
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 907
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 908
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 909
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 909
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 910
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 911
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 911
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 912
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 913
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 916
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 916
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 917
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 918
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 919
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 920
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 921
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 922
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 924
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 925
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 926
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 926
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 927
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 928
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 929
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 929
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 929
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 929
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 929
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 930
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 930
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 931
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 933
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 934
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 934
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 935
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 936
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 937
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 937
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 938
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 939
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 940
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 941
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 942
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 944
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 945
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 946
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 946
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 947
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 947
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 948
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 948
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 948
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 949
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 949
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 949
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 949
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 949
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 949
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 949
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 949
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 950
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 951
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 952
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 954
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 954
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 955
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 956
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 956
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 957
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 958
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 961
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 963
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 964
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 965
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 966
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 966
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 967
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 967
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 968
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 969
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 969
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 970
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 970
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 973
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 974
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 975
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 976
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 977
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 977
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 978
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 979
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 980
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 981
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 982
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 983
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 984
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 985
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 987
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 987
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 988
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 988
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 989
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 989
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 990
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 991
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 991
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 992
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 992
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 992
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 992
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 992
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 992
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 992
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 993
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 993
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 996
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 998
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 999
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1001
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1002
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1003
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1003
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1004
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1004
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1005
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1005
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1006
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1007
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1008
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1009
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1010
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1012
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1013
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1014
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1014
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1015
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1016
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1016
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1017
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1017
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1017
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1017
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1017
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1018
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1018
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1020
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1021
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1023
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1024
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1024
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1025
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1025
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1027
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1027
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1028
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1028
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1029
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1030
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1030
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1032
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1033
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1034
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1035
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1035
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1036
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1036
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1037
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1037
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1038
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1039
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1040
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1041
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1043
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1043
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1044
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1044
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1045
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1046
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1047
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1048
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1049
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1050
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1050
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1051
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1051
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1052
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1052
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1052
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1052
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1053
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1054
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1055
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1056
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1057
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1058
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1058
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1059
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1059
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1060
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1060
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1061
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1061
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1062
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1062
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1062
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1063
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1063
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1063
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1063
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1063
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1063
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1063
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1064
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1065
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1066
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1067
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1069
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1069
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1070
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1071
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1071
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1072
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1072
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1074
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1074
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1074
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1074
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1074
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1075
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1076
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1077
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1078
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1080
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1081
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1081
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1082
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1082
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1084
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1084
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1086
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1086
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1087
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1087
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1088
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1088
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1089
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1089
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1090
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1091
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1092
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1093
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1094
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XCB_LEAVE_NOTIFY(8) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_LEAVE) | sequence: 1095
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 1095
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 1095
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 1095
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_CONFIGURE_NOTIFY(22) | sequence: 1095
+qt.qpa.events: Event | XCB_XKB_* event(85) | sequence: 1095
+qt.qpa.events: Event | XCB_ENTER_NOTIFY(7) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_ENTER) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1095
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1102
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1102
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1102
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1102
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1102
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1102
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1102
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1102
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1102
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1103
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1104
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1105
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1105
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1106
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1107
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1108
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1109
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1109
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1110
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1110
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1111
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1111
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1112
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1112
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1113
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1113
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1113
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1113
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1113
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1113
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1113
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1113
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1114
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1115
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1116
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1117
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1118
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1119
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1119
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1120
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1120
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1121
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1121
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1122
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1122
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1123
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1124
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1125
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1125
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1126
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1126
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1127
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1127
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1129
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1130
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1131
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1131
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1132
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1133
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1135
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1136
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1136
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1137
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1137
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1138
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1138
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1139
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1139
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1140
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1141
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1141
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1142
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1142
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1143
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1143
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1144
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1145
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1145
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1145
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1145
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1145
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1145
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1146
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1146
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1146
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1147
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_MOTION) | sequence: 1148
+qt.qpa.events: Event | XCB_LEAVE_NOTIFY(8) | sequence: 1148
+qt.qpa.events: Event | XInput Event(XCB_INPUT_LEAVE) | sequence: 1148
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 1148
+qt.qpa.events: Event | XCB_PROPERTY_NOTIFY(28) | sequence: 1148
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 1148
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 1148
+qt.qpa.events: Event | XCB_CLIENT_MESSAGE(33) | sequence: 1149
+qt.qpa.events: Event | XCB_UNMAP_NOTIFY(18) | sequence: 1150
+qt.qpa.events: Event | XCB_FOCUS_OUT(10) | sequence: 1150
+qt.qpa.events.reader: nodes on heap: 0

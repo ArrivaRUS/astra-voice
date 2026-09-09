@@ -146,3 +146,35 @@ sudo cat /sys/kernel/debug/dri/1/i915_edp_psr_status | head -8
 - Изолированный `kwin_wayland --virtual` с реальным GL (iris, ARL) — рабочий стенд для Qt Quick;
   `import -window` работает, `xev -id` на чужом окне — нет, `xprop -spy` — да.
   `XDG_RUNTIME_DIR` для kwin нужен короткий (лимит 108 байт на путь сокета) — симлинк `/tmp/av-dbg-xdg`.
+
+## 9. Итог живого шага (2026-09-09 17:37–17:39, `DISPLAY=:0`, пользовательская шина, «ок» заказчика ~18:05 по чату)
+
+**Во всех 4 вариантах одинаково → это hover-анимация `SidebarItem` (`Behavior on color`, 120 мс на вход и на выход),
+воспринятая как «мерцание», а не рендер: GL/threaded loop/PSR не при чём.** Заказчик смотрел сам (мышью водил он),
+наблюдения передал Юрке. Логи: `spikes/m1_live/out/flicker_live_{00_before_env,1..4,N_xprop,99_after}.log`,
+`flicker_live_summary.txt`.
+
+| № | Что запускалось | Env сверх сессии | Render loop / вывод (из лога) | Длит. | Закрытие | Аномалии в логах |
+|---|---|---|---|---|---|---|
+| 1 | `astra-voice` (установленный 0.1.0~m1) | `QSG_INFO=1 QT_LOGGING_RULES=qt.qpa.*;qt.qpa.input*=false;qt.scenegraph.general` | threaded, GLX gl-integration, Mesa Intel (ARL) 4.6 Compat, vsync 16.67 мс | 25 с | `close_window.py` → WM_DELETE, выход штатный | нет (1702 строк, 0 warning/error) |
+| 2 | `python3 spikes/m1_live/flicker_probe.py` (чистое QML) | то же | threaded, GLX, ARL | 25 с | заказчик закрыл «×» до таймера (лог кончается WM_DELETE → UnmapNotify), процесс вышел сам | нет (813 строк) |
+| 3 | `astra-voice` | то же + `QSG_RENDER_LOOP=basic` | basic render loop, GLX, ARL | 26 с | заказчик закрыл «×», выход штатный | нет (430 строк) |
+| 4 | `astra-voice` | то же + `QT_QUICK_BACKEND=software` | software backend, XShm-буфер 900×588 depth 24 | 26 с | заказчик закрыл «×», выход штатный | нет (347 строк) |
+
+Окно во всех вариантах: 900×588 @510,292, `_NET_WM_BYPASS_COMPOSITOR` не задан, `_KDE_NET_WM_*` только штатные
+(ACTIVITIES, DESKTOP_FILE, FRAME_STRUT, USER_CREATION_TIME), `_NET_WM_SYNC_REQUEST` есть, `_NET_WM_STATE_FOCUSED`.
+`close_window.py` для 2–4 упал с `BadWindow` — окно к тому моменту уже было закрыто заказчиком; это не дефект приложения.
+
+Окружение из логов/`supportInformation` (только чтение): KWin 5.27.8, «Operation Mode: X11 only», Compositing OpenGL,
+platform interface **GLX**, Mesa 24.2.8 «Intel(R) Graphics (ARL)», Xorg 1.21.1, ядро 6.12.60, `kwinrc [Compositing]`
+без переопределений (Backend/GLCore/LatencyPolicy/AllowTearing пусты = умолчания); экран eDP-1 1920×1200, dpr 1.0,
+XInput 2.2; `glxinfo -B`: direct rendering yes, 4.6 core/compat.
+
+Состояние машины **до = после**: процессов `bootstrap.py app`/`flicker_probe.py` — 0, окон — 0, `$XDG_RUNTIME_DIR/astra-voice`
+пуст (lock/ipc сняты), ничего не установлено и не изменено; уведомления `notify-send` — 5 (4 подсказки + «завершено»).
+
+**Фикс (Developer, по решению дизайна):** `qml/components/SidebarItem.qml:169-175` — убрать `Behavior on color`
+(или `duration` → 0–40 мс); симметрично `qml/components/SettingRow.qml:37-43`. Токен `Theme.durationHover=120`
+остаётся для других контролов, пока дизайн не решит иначе. **Регресс (Tester):** xvfb-тест — hover пункта меняет
+`bg.color` за один кадр (нет промежуточных значений) / QML-предупреждений нет. Разделы §6–§7 выше — история
+диагностики, план B/C неактуален.

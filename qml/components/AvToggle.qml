@@ -17,6 +17,7 @@ Switch {
     implicitHeight: Theme.toggleH
     enabled: !locked
 
+    // Цвет дорожки переключается мгновенно; анимируется только ход ручки.
     indicator: Rectangle {
         width: Theme.toggleW
         height: Theme.toggleH
@@ -27,14 +28,6 @@ Switch {
             if (control.locked)
                 return control.checked ? Theme.toggleLockedOnBg : Theme.toggleLockedOffBg;
             return control.checked ? Theme.toggleOnBg : Theme.toggleOffBg;
-        }
-
-        Behavior on color {
-            ColorAnimation {
-                duration: Theme.durationHover
-                easing.type: Easing.Bezier
-                easing.bezierCurve: Theme.easingHover.concat([1, 1])
-            }
         }
 
         Rectangle {

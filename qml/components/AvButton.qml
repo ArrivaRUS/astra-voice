@@ -29,6 +29,8 @@ Button {
     font.pixelSize: small ? Theme.fontButtonSmSize : Theme.fontButtonSize
     font.weight: Font.Medium
 
+    // Наведение и нажатие красятся мгновенно: анимация на каждый вход/выход курсора
+    // читается как мерцание (дефект живого прогона).
     background: Rectangle {
         radius: Theme.buttonRadius
         antialiasing: true
@@ -45,14 +47,6 @@ Button {
             if (control.hovered)
                 return Theme.stateHoverOnSurface;
             return control.ghost ? "transparent" : Theme.bgSurface;
-        }
-
-        Behavior on color {
-            ColorAnimation {
-                duration: Theme.durationHover
-                easing.type: Easing.Bezier
-                easing.bezierCurve: Theme.easingHover.concat([1, 1])
-            }
         }
 
         // Кольцо фокуса: 2 px снаружи, зазор 2, радиус 8 (сквозное правило 1).

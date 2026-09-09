@@ -27,26 +27,37 @@ FocusScope {
     Keys.onEnterPressed: root.activated()
     Keys.onSpacePressed: root.activated()
 
+    // Подсветка наведения — БЕЗ анимации: переход на каждый вход и выход курсора
+    // превращал проход мышью по меню в серию вспышек (дефект живого прогона).
     Rectangle {
         id: bg
         anchors.fill: parent
         radius: Theme.sidebarItemRadius
         antialiasing: true
         color: {
-            if (root.current)
-                return Theme.primary;
             if (mouse.pressed)
                 return Theme.statePressedOnSurface2;
             if (mouse.containsMouse)
                 return Theme.stateHoverOnSurface2;
             return "transparent";
         }
+    }
 
-        Behavior on color {
-            ColorAnimation {
+    // Заливка выбранного раздела: единственное анимированное состояние пункта —
+    // проявление primary при СМЕНЕ раздела, без промежуточных цветов.
+    Rectangle {
+        anchors.fill: parent
+        radius: Theme.sidebarItemRadius
+        antialiasing: true
+        color: Theme.primary
+        opacity: root.current ? 1 : 0
+        visible: opacity > 0
+
+        Behavior on opacity {
+            NumberAnimation {
                 duration: Theme.durationHover
                 easing.type: Easing.Bezier
-                easing.bezierCurve: Theme.easingHover.concat([1, 1])
+                easing.bezierCurve: Theme.easingExit.concat([1, 1])
             }
         }
     }
