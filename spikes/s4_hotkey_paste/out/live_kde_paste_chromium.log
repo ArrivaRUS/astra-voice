@@ -1,0 +1,17 @@
+окно chromium: 113246212 (ждали 2×0.5 с)
+заголовок ДО: AVS4 пусто – Chromium
+  active-window      {'wid': 113246212, 'wm_class': ('chromium (/tmp/av_s4_chrome)', 'chromium'), 'terminal': False, 't_ms': 0.2}
+  save-clipboard     {'formats': 9, 'secret': False, 't_ms': 4.9}
+  put-text           {'chars': 35, 'hint': 'secret', 't_ms': 5.2}
+  xtest              {'combo': 'ctrl+v', 'ms': 0.81, 't_ms': 57.5}
+  restore            {'formats': 9, 't_ms': 158.0}
+{"mode": "ctrl+v", "restore": "restored", "total_ms": 153.2, "owns_clipboard": true}
+заголовок ПОСЛЕ: AVS4 пусто – Chromium
+chromium (наш профиль) жив? 4
+окно: 
+окна нет — переоткрываю
+geometry: 10,28 945x1120
+заголовок ДО: AVS4 пусто – Chromium
+  restore            {'formats': 9, 't_ms': 158.6}
+{"mode": "ctrl+v", "restore": "restored", "total_ms": 153.4, "owns_clipboard": true}
+заголовок ПОСЛЕ: AVS4 len=35 marker=OK – Chromium

@@ -293,3 +293,227 @@ rm -f /tmp/av_s4_display /tmp/av_s4_dbus /tmp/av_s4_child.sh \
 
 Система не изменена: пакеты не ставились, `~/.config/kglobalshortcutsrc` только читался,
 `python-xlib` лежит в `~/.cache/astra-voice-spikes/s4-site` (scratch, вне репо).
+
+---
+
+# Живой прогон KDE (этап 2) — 2026-09-09
+
+Допуск на живой прогон получен от заказчика через Юрку (`decisions/log.md`, «Допуски на живые
+прогоны M0»). Сессия: KDE Plasma 5.27, X11, `DISPLAY=:0`, раскладки `us,ru` (активная — **ru**,
+группа 1), `Options=grp:ctrl_shift_toggle` + `grp:alt_shift_toggle`, Klipper запущен.
+Правила прогона: содержимое буфера заказчика в логи не выводилось — только TARGETS-типы,
+размеры и **хэши** (первые 16 символов sha256); окна Kate/Konsole/LibreOffice/браузер поднимал
+и закрывал сам; трей на панели не запускался (отдельного допуска не было).
+
+Снимок «до» — `out/live_kde_before.log`; артефакты живого этапа — `out/live_kde_*.json|log`.
+
+## 1. Хоткей: `Ctrl+Space` в живой сессии ЗАНЯТА
+
+```
+$ AV_ALLOW_DISPLAY=1 python3 hotkey.py --grab ctrl+space --probe alt+F2 --seconds 12
+grab ctrl+space → keycode=65 масок=4 ok=False
+  BadAccess: комбинация занята другим клиентом
+probe alt+F2: занят другим клиентом → наш grab ok=False; после снятия ok=False
+{"key_presses": 0, "autorepeat_dropped": 0}
+```
+
+При этом **KDE считает комбинацию свободной** — и файл, и живой демон:
+
+```
+$ qdbus --literal org.kde.kglobalaccel /kglobalaccel getGlobalShortcutsByKey 67108896   # Ctrl+Space
+[Argument: a(ssssssaiai) {}]                       # владельца нет
+$ qdbus --literal … isGlobalShortcutAvailable 67108896 ""
+true
+$ qdbus --literal … getGlobalShortcutsByKey 150994993   # Alt+F2 — контроль
+… "org.kde.krunner.desktop", "Открыть строку поиска и запуска KRunner" …
+```
+
+Скан комбинаций живьём (`out/live_kde_combo_scan.log`):
+
+| Комбинация | `XGrabKey` | `kglobalaccel` знает владельца |
+|---|---|---|
+| `Ctrl+Space` | **ok=False** | нет |
+| `Ctrl+Alt+Space` | **ok=False** | нет |
+| `Meta+Space` | **ok=False** | нет |
+| `Alt+Space` | ok=False | **да** — KRunner |
+| `Super+V` | ok=False | (не проверялось) |
+| **`Ctrl+Shift+Space`** | **ok=True** | нет |
+| **`Ctrl+Alt+D`** | **ok=True** | нет |
+
+**Владелец — `/usr/bin/handy` (pid 4011)**, старая сборка Handy на машине заказчика: её хоткей по
+умолчанию — `Ctrl+Space` (сведения от Юрки). Handy не останавливался и не трогался. Нажатие
+`Ctrl+Space` не открывает ни одного нового окна и не меняет активное
+(`out/live_kde_ctrlspace_owner.log`) — то есть по одному только поведению X-клиента владельца
+не опознать.
+
+**Находка (в `platform/hotkey.py`, US-1.5b):** детектор конфликтов по `kglobalshortcutsrc`
+**не видит захваты обычных X-клиентов** (Handy, ibus/fcitx, Electron-приложения с
+`globalShortcut`). Единственный честный признак — `BadAccess` при собственном `XGrabKey`.
+Поэтому: при `BadAccess` показывать «комбинация занята другой программой» + подсказку
+«если установлен Handy — измените или отключите его горячую клавишу» и сразу предлагать выбор
+другой комбинации; онбординг «Astra Voice поверх Handy» — отдельный пункт для PRD/M5.
+
+### Хоткей на свободной `Ctrl+Shift+Space` (`out/live_kde_hotkey_cs_space.log`)
+
+```
+grab ctrl+shift+space → keycode=65 масок=4 ok=True
+  [recording] press · Escape: grab ok=True · [recording] tap→toggle (0.023 с)
+  [processing] toggle-off · [idle] done · Escape: ungrab
+  [idle] escape-cancel
+{"key_presses": 4, "autorepeat_dropped": 17}
+группа раскладки: ДО 1 · во время 1 · ПОСЛЕ 1
+повторный grab после выхода: ok=True         # grab снят, процессов не осталось
+```
+
+**Побочный эффект `grp:ctrl_shift_toggle` не наступает:** пока комбинация захвачена нашим
+`XGrabKey`, события `Ctrl+Shift` до переключателя раскладки не доходят — группа остаётся 1.
+
+⚠ Артефакт синтетического ввода: `xdotool keydown/keyup` даёт нашему автомату «tap» (0,023 с),
+а не удержание, поэтому ветка PTT живьём подтверждена только логикой автомата (в изоляции
+она проверена честно: `release (1.531 с)`).
+
+## 2. Вставка в Kate (`out/live_kde_paste_kate.log`)
+
+```
+  active-window      {'wid': 113246220, 'wm_class': ('kate', 'kate'), 'terminal': False}
+  save-clipboard     {'formats': 7, 'secret': False, 't_ms': 8.4}
+  put-text           {'chars': 35, 'hint': 'secret', 't_ms': 9.0}
+  xtest              {'combo': 'ctrl+v', 'ms': 1.19, 't_ms': 61.2}
+  restore            {'formats': 7, 't_ms': 162.5}
+{"mode": "ctrl+v", "restore": "restored", "total_ms": 154.0, "owns_clipboard": true}
+файл Kate: Проверка связи S4 живой прогон, ёж.
+```
+
+**PASS**: текст вставлен при русской раскладке, восстановление 162,5 мс (порог ≤ 200 мс).
+
+## 3. Вставка в Konsole (`out/live_kde_paste_konsole.log`)
+
+```
+  active-window      {'wm_class': ('konsole', 'konsole'), 'terminal': True}
+  xtest              {'combo': 'ctrl+shift+v', 'ms': 1.07, 't_ms': 57.9}
+  restore            {'formats': 9, 't_ms': 158.7}
+принято терминалом: 61 байт, переводов строки 0 (команда не выполнилась)
+группа раскладки: ДО 1 → ПОСЛЕ 1
+```
+
+**PASS**, и главное — **XTest `Ctrl+Shift+V` НЕ переключает раскладку** у заказчика с
+`grp:ctrl_shift_toggle` (открытый вопрос §2.4 отчёта закрыт).
+
+## 4. Klipper: наша фраза в историю не попала
+
+```
+$ qdbus org.kde.klipper /klipper getClipboardHistoryMenu
+записей: 20 · наша фраза найдена: нет        # содержимое чужих записей не выводилось
+```
+
+**PASS (T-13/T-14, У40):** `x-kde-passwordManagerHint=secret` в живом Klipper работает —
+после двух вставок история осталась прежней (20 записей, до прогона тоже 20).
+
+## 5. Буфер обмена: содержимое сохранилось, но набор форматов пересобрался
+
+| Момент | TARGETS | sha256 `text/plain` |
+|---|---|---|
+| до прогона | `text/uri-list · text/x-moz-url · text/plain · application/x-kde4-urilist · …` | `a74bece24f6c44a0` |
+| после прогона | `text/uri-list · text/x-moz-url · text/plain · application/x-kio-metadata · application/x-kde-cutselection · application/x-kde-onlyReplaceEmpty · …` | `d56eeba4e5b8c67d` |
+
+Расхождение разобрано: текущее содержимое **совпадает с записью №0 в истории Klipper**
+(`getClipboardHistoryItem 0` без завершающего `\n` даёт тот же `d56eeba4e5b8c67d`), то есть
+последняя пользовательская копия жива и доступна. Механика: `paste.py` восстанавливает
+`QMimeData` и держит владение, но после выхода процесса CLIPBOARD подхватывает **Klipper** и
+отдаёт уже свою нормализованную версию той же записи — с другим набором MIME-типов
+(`application/x-kde4-urilist` исчез, появились `x-kio-metadata`/`x-kde-cutselection`).
+
+**Находка для M4 (S4-R8):** «буфер восстановлен» в живой KDE ≠ побайтовая копия. Для копии файла
+из Dolphin приложение, ожидающее `application/x-kde4-urilist`, после нашей вставки получит только
+`text/uri-list` + `text/plain`. Проверить в M4, воспроизводится ли это без Klipper и нельзя ли
+удержать владение до следующей копии пользователя.
+
+## 6. Окно без Handy: `Ctrl+Space` проверен честно
+
+Заказчик разрешил остановить Handy на ~2 минуты. Handy оказался **systemd-юнитом**
+`app-Handy@autostart.service` (`Restart=no`, `ExecStart=/usr/bin/handy`, cwd `/home/astra`),
+поэтому вместо `kill -TERM` использован штатный `systemctl --user stop|start` того же юнита —
+иначе юнит остался бы «активным» с мёртвым процессом.
+
+**Handy остановлен 15:43:23 → возвращён 15:43:38 (15 с), новый pid 66792,
+`Ctrl+Space` снова занят: да** (`grab … ok=False` через 3 с после старта — это и подтверждает
+владельца). После возврата Handy показал своё окно; оно свёрнуто, фокус возвращён исходному
+окну заказчика (`83886084`), приложение работает.
+
+Дословно (`out/live_kde_handy_window.log`, `out/live_kde_hotkey_ctrlspace.json`):
+
+```
+grab ctrl+space → keycode=65 масок=4 ok=True          # без Handy комбинация свободна
+probe alt+F2: занят другим клиентом → ok=False; после снятия ok=False   # KRunner держит постоянно
+  [recording] press · Escape: grab ok=True · [recording] tap→toggle (0.015 с)
+  [processing] toggle-off · [idle] done
+  [recording] press · Escape: grab ok=True · [processing] release (1.231 с)   # PTT честно
+  [сценарий] KRunner: Alt+F2
+  [recording] press · [recording] tap→toggle (0.015 с) · [idle] escape-cancel
+{"key_presses": 7, "autorepeat_dropped": 16}
+группа раскладки после: 1
+```
+
+| Критерий | Живой KDE |
+|---|---|
+| `XGrabKey` `Ctrl+Space` × 4 маски (Handy остановлен) | **PASS** — `ok=True` |
+| PTT + фильтр автоповтора | **PASS** — `release (1.231 с)`, 16 автоповторов отброшено |
+| Временный grab/ungrab `Escape`, отмена | **PASS** |
+| `BadAccess` на `Alt+F2` под живым `kglobalaccel` | **PASS** — KRunner держит комбинацию и после снятия чужого grab |
+| KRunner открыт → наш хоткей не ломается | **PASS** — события продолжали доходить до автомата |
+| Grab снят после выхода | **PASS** — повторный grab `ok=True`, процессов не осталось |
+
+⚠ `XGrabKeyboard` для поля захвата комбинации (У21/T-24) в спайке по-прежнему **не реализован** —
+проверка того, что чужой глобальный grab не «съест» ввод в этом поле, уходит в M4.
+
+## 7. LibreOffice Writer (`out/live_kde_paste_lo.log`)
+
+Прогон во **временном профиле** (`-env:UserInstallation=file:///tmp/av_s4_lo_profile`) —
+настройки и недавние документы заказчика не тронуты.
+
+```
+  active-window  {'wm_class': ('libreoffice', 'libreoffice-writer'), 'terminal': False}
+  xtest          {'combo': 'ctrl+v', 'ms': 0.85, 't_ms': 58.1}
+  restore        {'formats': 9, 't_ms': 159.2}
+документ после Ctrl+S → конвертация в txt:
+  строка-заглушкаПроверка связи S4 живой прогон, ёж.
+```
+
+**PASS**: вставка как обычный текст, диалог «Специальная вставка» не появлялся.
+
+## 8. Браузер — Chromium (`out/live_kde_paste_chromium.log`)
+
+Временный профиль `--user-data-dir=/tmp/av_s4_chrome`, локальная страница с `textarea`,
+которая отражает длину и наличие маркера в `document.title` (заголовок читается `xdotool`).
+
+```
+заголовок ДО:     AVS4 пусто – Chromium
+  xtest           {'combo': 'ctrl+v', 'ms': 0.81, 't_ms': 57.5}
+заголовок ПОСЛЕ:  AVS4 len=35 marker=OK – Chromium
+```
+
+**PASS** (35 символов, маркер найден). Грабли прогона: при первом открытии окна фокус не в поле —
+вставка ушла «в никуда» и заголовок не изменился; понадобился клик в `textarea`. Для M4 это ещё
+один довод к правилу «вставляем в то окно, которое было активно в момент старта диктовки»
+(фокус внутри окна мы не контролируем).
+
+## 9. Состояние машины после прогона (`out/live_kde_after.log`)
+
+```
+остатки процессов: chromium 0 · soffice.bin 0 · kate 0 · konsole 0 · python3 0
+активное окно:     83886084   (до прогона — то же)
+раскладка:         us,ru · grp:ctrl_shift_toggle,grp:alt_shift_toggle · группа 1 (до — 1)
+klipper:           записей 20 · наша фраза: нет   (до — 20 записей)
+Handy:             active, pid 66792, видимых окон 0
+буфер:             text/plain = d56eeba4… = запись Klipper №0 (см. §5)
+```
+
+Временные файлы удалены (`/tmp/av_s4_*`). Система не изменена: пакеты не ставились,
+`kglobalshortcutsrc` только читался, профили LibreOffice и Chromium были временные.
+
+## 10. Что живой этап НЕ закрыл
+
+* `XGrabKeyboard` в поле захвата комбинации (У21/T-24) — в M4.
+* Fly целиком (этап 3, после перелогина).
+* Поведение восстановления буфера **без** Klipper (см. §5) — в M4.
+* PTT-жест руками человека (в прогоне — синтетический `xdotool`).

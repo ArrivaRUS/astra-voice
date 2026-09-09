@@ -1,0 +1,14 @@
+=== S4 ЖИВОЙ ПРОГОН · СНИМОК ПОСЛЕ · 2026-09-09T15:47:21+03:00 ===
+остатки: chromium=0
+0 soffice.bin=0
+0 kate=0
+0 konsole=0
+0 python3=0
+0
+активное окно: 83886084 (до прогона: 83886084)
+раскладка: rules:      evdev model:      pc104 layout:     us,ru variant:    , options:    grp:ctrl_shift_toggle,grp:alt_shift_toggle 
+группа: 1 (до: 1)
+TARGETS: text/uri-list text/x-moz-url text/plain application/x-kio-metadata application/x-kde-cutselection application/x-kde-onlyReplaceEmpty TARGETS MULTIPLE TIMESTAMP SAVE_TARGETS 
+sha256 text/plain: d56eeba4e5b8c67d
+klipper: записей: 20 · наша фраза: нет
+Handy: active, pid 66792, видимых окон 0

@@ -1,0 +1,359 @@
+{
+  "display": ":0",
+  "lock_masks": {
+    "Lock": "0x2",
+    "Num_Lock": "0x10",
+    "Scroll_Lock": "0x0"
+  },
+  "events": [
+    {
+      "type": "KeyPress",
+      "keycode": 65,
+      "state": 4,
+      "time": 6098289
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 37,
+      "state": 4,
+      "time": 6098295
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 65,
+      "state": 0,
+      "time": 6098302
+    },
+    {
+      "type": "KeyPress",
+      "keycode": 65,
+      "state": 4,
+      "time": 6099119
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 37,
+      "state": 4,
+      "time": 6099126
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 65,
+      "state": 0,
+      "time": 6099132
+    },
+    {
+      "type": "KeyPress",
+      "keycode": 65,
+      "state": 4,
+      "time": 6099956
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100556
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100597
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100638
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100678
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100718
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100758
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100798
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100838
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100878
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100919
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100959
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6100999
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6101039
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6101080
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6101120
+    },
+    {
+      "type": "autorepeat-dropped",
+      "keycode": 65,
+      "time": 6101160
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 37,
+      "state": 4,
+      "time": 6101172
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 65,
+      "state": 0,
+      "time": 6101185
+    },
+    {
+      "type": "KeyPress",
+      "keycode": 65,
+      "state": 4,
+      "time": 6103340
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 37,
+      "state": 4,
+      "time": 6103347
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 65,
+      "state": 0,
+      "time": 6103353
+    },
+    {
+      "type": "KeyPress",
+      "keycode": 9,
+      "state": 0,
+      "time": 6104163
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 9,
+      "state": 0,
+      "time": 6104170
+    },
+    {
+      "type": "KeyPress",
+      "keycode": 65,
+      "state": 4,
+      "time": 6105186
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 37,
+      "state": 4,
+      "time": 6105193
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 65,
+      "state": 0,
+      "time": 6105200
+    },
+    {
+      "type": "KeyPress",
+      "keycode": 9,
+      "state": 0,
+      "time": 6105710
+    },
+    {
+      "type": "KeyRelease",
+      "keycode": 9,
+      "state": 0,
+      "time": 6105717
+    }
+  ],
+  "fsm": [
+    {
+      "t": 6098.2895,
+      "state": "recording",
+      "mode": "ptt",
+      "reason": "press"
+    },
+    {
+      "t": 6098.3046,
+      "state": "recording",
+      "mode": "toggle",
+      "reason": "tap→toggle (0.015 с)"
+    },
+    {
+      "t": 6099.1196,
+      "state": "processing",
+      "mode": "toggle",
+      "reason": "toggle-off"
+    },
+    {
+      "t": 6099.1196,
+      "state": "idle",
+      "mode": null,
+      "reason": "done"
+    },
+    {
+      "t": 6099.9571,
+      "state": "recording",
+      "mode": "ptt",
+      "reason": "press"
+    },
+    {
+      "t": 6101.1876,
+      "state": "processing",
+      "mode": "ptt",
+      "reason": "release (1.231 с)"
+    },
+    {
+      "t": 6101.1877,
+      "state": "idle",
+      "mode": null,
+      "reason": "done"
+    },
+    {
+      "t": 6103.3409,
+      "state": "recording",
+      "mode": "ptt",
+      "reason": "press"
+    },
+    {
+      "t": 6103.3561,
+      "state": "recording",
+      "mode": "toggle",
+      "reason": "tap→toggle (0.015 с)"
+    },
+    {
+      "t": 6104.1641,
+      "state": "idle",
+      "mode": null,
+      "reason": "escape-cancel"
+    },
+    {
+      "t": 6105.1874,
+      "state": "recording",
+      "mode": "ptt",
+      "reason": "press"
+    },
+    {
+      "t": 6105.2026,
+      "state": "recording",
+      "mode": "toggle",
+      "reason": "tap→toggle (0.015 с)"
+    },
+    {
+      "t": 6105.7111,
+      "state": "idle",
+      "mode": null,
+      "reason": "escape-cancel"
+    }
+  ],
+  "grab": {
+    "combo": "ctrl+space",
+    "keysym": "space",
+    "keycode": 65,
+    "base_mask": "0x4",
+    "variants": [
+      "0x4",
+      "0x6",
+      "0x14",
+      "0x16"
+    ],
+    "variant_count": 4,
+    "ok": true,
+    "errors": []
+  },
+  "probe": {
+    "combo": "alt+F2",
+    "keycode": 68,
+    "free_before": false,
+    "our_grab_ok": false,
+    "errors": [
+      [
+        "0x8",
+        "BadAccess"
+      ],
+      [
+        "0xa",
+        "BadAccess"
+      ],
+      [
+        "0x18",
+        "BadAccess"
+      ],
+      [
+        "0x1a",
+        "BadAccess"
+      ]
+    ],
+    "after_release_ok": false
+  },
+  "threads_used": false,
+  "escape": [
+    {
+      "action": "grab",
+      "ok": true
+    },
+    {
+      "action": "ungrab"
+    },
+    {
+      "action": "grab",
+      "ok": true
+    },
+    {
+      "action": "ungrab"
+    },
+    {
+      "action": "grab",
+      "ok": true
+    },
+    {
+      "action": "ungrab"
+    },
+    {
+      "action": "grab",
+      "ok": true
+    },
+    {
+      "action": "ungrab"
+    }
+  ],
+  "summary": {
+    "key_presses": 7,
+    "autorepeat_dropped": 16
+  }
+}

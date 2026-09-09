@@ -1,0 +1,45 @@
+Handy остановлен: 15:43:23
+Warning: The unit file, source configuration file or drop-ins of app-Handy@autostart.service changed on disk. Run 'systemctl --user daemon-reload' to reload units.
+handy жив? 0 (ждали 1×0.5 с)
+--- проба: свободен ли Ctrl+Space ---
+grab ctrl+space → keycode=65 масок=4 ok=True
+--- полный живой блок Ctrl+Space ---
+grab ctrl+space → keycode=65 масок=4 ok=True
+X protocol error:
+<class 'Xlib.error.BadAccess'>: code = 10, resource_id = 1209, sequence_number = 17, major_opcode = 33, minor_opcode = 0
+X protocol error:
+<class 'Xlib.error.BadAccess'>: code = 10, resource_id = 1209, sequence_number = 18, major_opcode = 33, minor_opcode = 0
+X protocol error:
+<class 'Xlib.error.BadAccess'>: code = 10, resource_id = 1209, sequence_number = 19, major_opcode = 33, minor_opcode = 0
+X protocol error:
+<class 'Xlib.error.BadAccess'>: code = 10, resource_id = 1209, sequence_number = 20, major_opcode = 33, minor_opcode = 0
+probe alt+F2: занят другим клиентом → наш grab ok=False ([['0x8', 'BadAccess'], ['0xa', 'BadAccess'], ['0x18', 'BadAccess'], ['0x1a', 'BadAccess']]); после снятия ok=False
+  [recording] press
+  Escape: grab ok=True
+  [recording] tap→toggle (0.015 с)
+  [processing] toggle-off
+  [idle] done
+  Escape: ungrab
+  [recording] press
+  Escape: grab ok=True
+  [processing] release (1.231 с)
+  [idle] done
+  Escape: ungrab
+  [сценарий] KRunner: Alt+F2
+  [recording] press
+  Escape: grab ok=True
+  [recording] tap→toggle (0.015 с)
+  [idle] escape-cancel
+  Escape: ungrab
+  [recording] press
+  Escape: grab ok=True
+  [recording] tap→toggle (0.015 с)
+  [idle] escape-cancel
+  Escape: ungrab
+{"key_presses": 7, "autorepeat_dropped": 16}
+процессы hotkey.py: 3
+группа раскладки: 1
+--- возврат Handy ---
+Warning: The unit file, source configuration file or drop-ins of app-Handy@autostart.service changed on disk. Run 'systemctl --user daemon-reload' to reload units.
+Handy возвращён: 15:43:38; 66792 /usr/bin/handy
+Ctrl+Space снова занят? grab ctrl+space → keycode=65 масок=4 ok=False

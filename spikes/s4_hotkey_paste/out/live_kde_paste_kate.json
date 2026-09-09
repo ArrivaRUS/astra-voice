@@ -1,0 +1,78 @@
+{
+  "display": ":0",
+  "steps": [
+    {
+      "wid": 113246220,
+      "wm_class": [
+        "kate",
+        "kate"
+      ],
+      "terminal": false,
+      "step": "active-window",
+      "t_ms": 0.7
+    },
+    {
+      "formats": 7,
+      "secret": false,
+      "step": "save-clipboard",
+      "t_ms": 8.4
+    },
+    {
+      "chars": 35,
+      "hint": "secret",
+      "step": "put-text",
+      "t_ms": 9.0
+    },
+    {
+      "combo": "ctrl+v",
+      "ms": 1.19,
+      "step": "xtest",
+      "t_ms": 61.2
+    },
+    {
+      "formats": 7,
+      "step": "restore",
+      "t_ms": 162.5
+    }
+  ],
+  "target": {
+    "window": 113246220,
+    "wm_class": [
+      "kate",
+      "kate"
+    ]
+  },
+  "clipboard_before": {
+    "formats": [
+      "MULTIPLE",
+      "SAVE_TARGETS",
+      "TARGETS",
+      "TIMESTAMP",
+      "application/x-kde4-urilist",
+      "text/plain",
+      "text/uri-list"
+    ],
+    "text_len": 45,
+    "password_hint": false
+  },
+  "text_raw": "Проверка связи S4 живой прогон, ёж.",
+  "text_normalized": "Проверка связи S4 живой прогон, ёж.",
+  "stripped_controls": 0,
+  "mode": "ctrl+v",
+  "xtest_ms": 1.19,
+  "owns_clipboard": true,
+  "restore": "restored",
+  "total_ms": 154.0,
+  "clipboard_after": {
+    "formats": [
+      "MULTIPLE",
+      "SAVE_TARGETS",
+      "TARGETS",
+      "TIMESTAMP",
+      "application/x-kde4-urilist",
+      "text/plain",
+      "text/uri-list"
+    ],
+    "text": "file:///home/astra/Desktop/ScrumBlackBook.pdf"
+  }
+}

@@ -1,0 +1,14 @@
+grab ctrl+space → keycode=65 масок=4 ok=False
+  BadAccess: комбинация занята другим клиентом
+X protocol error:
+<class 'Xlib.error.BadAccess'>: code = 10, resource_id = 1209, sequence_number = 17, major_opcode = 33, minor_opcode = 0
+X protocol error:
+<class 'Xlib.error.BadAccess'>: code = 10, resource_id = 1209, sequence_number = 18, major_opcode = 33, minor_opcode = 0
+X protocol error:
+<class 'Xlib.error.BadAccess'>: code = 10, resource_id = 1209, sequence_number = 19, major_opcode = 33, minor_opcode = 0
+X protocol error:
+<class 'Xlib.error.BadAccess'>: code = 10, resource_id = 1209, sequence_number = 20, major_opcode = 33, minor_opcode = 0
+probe alt+F2: занят другим клиентом → наш grab ok=False ([['0x8', 'BadAccess'], ['0xa', 'BadAccess'], ['0x18', 'BadAccess'], ['0x1a', 'BadAccess']]); после снятия ok=False
+--- KRunner: Alt+F2 ---
+{"key_presses": 0, "autorepeat_dropped": 0}
+код возврата: 0

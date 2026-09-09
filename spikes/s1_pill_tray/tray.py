@@ -34,8 +34,8 @@ TRAY_STATES = [
     ("processing", "astravoice-tray-processing", "Распознаю…"),
     ("done", "astravoice-tray-done", "Готово"),
     ("error", "astravoice-tray-error", "Микрофон недоступен — открыть"),
-    # РАСХОЖДЕНИЕ: файла astravoice-tray-nokey в наборе нет — временно берём error.
-    ("hotkey-not-grabbed", "astravoice-tray-error",
+    # шестое состояние spec §9.1: свой знак (кольцо), файл в наборе есть — 16/22 px
+    ("hotkey-not-grabbed", "astravoice-tray-nokey",
      "Горячая клавиша не захвачена — выбрать другую"),
 ]
 

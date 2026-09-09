@@ -86,6 +86,8 @@ class Probe(QWidget):
         text = data.decode("utf-8", "replace").rstrip()
         if text:
             self.log.appendPlainText("[%s] %s" % (tag, text))
+            # дубль в консоль: JSON помощника нужен как артефакт прогона
+            print("[%s] %s" % (tag, text), flush=True)
 
     def on_finished(self, code, _status):
         hint = EXIT_HINTS.get(code, "%d — код помощника (см. README «Коды выхода»)" % code)

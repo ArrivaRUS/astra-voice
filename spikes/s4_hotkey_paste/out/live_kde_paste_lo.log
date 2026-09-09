@@ -1,0 +1,14 @@
+convert /tmp/av_s4_live_lo.txt as a Writer document -> /tmp/av_s4_live_lo.odt using filter : writer8
+-rw-r--r-- 1 astra astra 8213 сен  9 15:44 /tmp/av_s4_live_lo.odt
+окно LO: 115343372 (ждали 3×0.5 с)
+активное перед вставкой: 115343372 (окно LO: 115343372)
+  active-window      {'wid': 115343372, 'wm_class': ('libreoffice', 'libreoffice-writer'), 'terminal': False, 't_ms': 0.3}
+  save-clipboard     {'formats': 9, 'secret': False, 't_ms': 6.3}
+  put-text           {'chars': 35, 'hint': 'secret', 't_ms': 6.8}
+  xtest              {'combo': 'ctrl+v', 'ms': 0.85, 't_ms': 58.1}
+  restore            {'formats': 9, 't_ms': 159.2}
+{"mode": "ctrl+v", "restore": "restored", "total_ms": 152.8, "owns_clipboard": true}
+convert /tmp/av_s4_live_lo.odt as a Writer document -> /tmp/av_s4_lo_out/av_s4_live_lo.txt using filter : Text
+--- содержимое документа LO ---
+﻿строка-заглушкаПроверка связи S4 живой прогон, ёж.
+--- фраза найдена: 1 раз ---

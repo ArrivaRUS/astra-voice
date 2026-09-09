@@ -1,0 +1,72 @@
+{
+  "display": ":0",
+  "lock_masks": {
+    "Lock": "0x2",
+    "Num_Lock": "0x10",
+    "Scroll_Lock": "0x0"
+  },
+  "events": [],
+  "fsm": [],
+  "grab": {
+    "combo": "ctrl+space",
+    "keysym": "space",
+    "keycode": 65,
+    "base_mask": "0x4",
+    "variants": [
+      "0x4",
+      "0x6",
+      "0x14",
+      "0x16"
+    ],
+    "variant_count": 4,
+    "ok": false,
+    "errors": [
+      [
+        "0x4",
+        "BadAccess"
+      ],
+      [
+        "0x6",
+        "BadAccess"
+      ],
+      [
+        "0x14",
+        "BadAccess"
+      ],
+      [
+        "0x16",
+        "BadAccess"
+      ]
+    ]
+  },
+  "probe": {
+    "combo": "alt+F2",
+    "keycode": 68,
+    "free_before": false,
+    "our_grab_ok": false,
+    "errors": [
+      [
+        "0x8",
+        "BadAccess"
+      ],
+      [
+        "0xa",
+        "BadAccess"
+      ],
+      [
+        "0x18",
+        "BadAccess"
+      ],
+      [
+        "0x1a",
+        "BadAccess"
+      ]
+    ],
+    "after_release_ok": false
+  },
+  "threads_used": false,
+  "summary": {
+    "key_presses": 0,
+    "autorepeat_dropped": 0
+  }
+}

@@ -1,0 +1,7 @@
+ctrl+space → grab ctrl+space → keycode=65 масок=4 ok=False
+ctrl+alt+space → grab ctrl+alt+space → keycode=65 масок=4 ok=False
+meta+space → grab meta+space → keycode=65 масок=4 ok=False
+ctrl+shift+space → grab ctrl+shift+space → keycode=65 масок=4 ok=True
+alt+space → grab alt+space → keycode=65 масок=4 ok=False
+super+v → grab super+v → keycode=55 масок=4 ok=False
+ctrl+alt+d → grab ctrl+alt+d → keycode=40 масок=4 ok=True

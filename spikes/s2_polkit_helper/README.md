@@ -213,3 +213,69 @@ install-spike.sh / uninstall-spike.sh            единственный sudo-�
 tests/test_helper.py                             35 тестов, без root и без D-Bus
 tests/make_fixtures.sh                           пересборка фикстур подписи
 ```
+
+---
+
+# Живой прогон (этап 2) — 2026-09-09
+
+Заказчик выполнил `install-spike.sh` (один `sudo`), Юрка передал допуск на прогон зонда на
+реальном дисплее. Пароль в диалоге polkit вводил **заказчик**; исполнитель пароль не вводил,
+не читал и не сохранял.
+
+## Состояние системы до прогона
+
+```
+/usr/libexec/astra-voice/update-helper                                  -rwxr-xr-x root root 23510
+/usr/share/polkit-1/actions/io.github.arrivarus.astra_voice.update.policy -rw-r--r-- root root 1197
+/usr/share/astra-voice/keys/test-release.gpg                            -rw-r--r-- root root   754
+/var/lib/astra-voice/staging                                            drwx------ root root
+dpkg-query -W astra-voice-spike → 0.0.1
+polkit-агент: /usr/lib/x86_64-linux-gnu/libexec/polkit-kde-authentication-agent-1 (pid 3737)
+```
+
+## Прогон
+
+```sh
+python3 gui_probe.py packages/astra-voice-spike_0.0.2_all.deb     # окно зонда, кнопка нажата 15:52:19
+```
+
+`out/live_s2_gui.log` (JSON помощника — `out/live_s2.json`):
+
+```json
+{"result": "ok", "exit": 0, "message": "установлено", "policy": "policy-absent",
+ "fingerprint": "CB951AD794407972A0B1A5BBAFA87398C4953A71",
+ "sha256": "738d6f2c1b5522a3f5edf92d39c9f7c704d287beb0a5cfe1a3d553edf89743af",
+ "package": "astra-voice-spike", "version": "0.0.2", "installed": "0.0.1"}
+exit=0  0 — помощник отработал (см. JSON в stdout)
+```
+
+Журнал помощника `/var/lib/astra-voice/updates.log` (копия — `out/live_s2_updates.log`):
+
+```
+2026-09-09T15:52:24+0300 result=ok exit=0 package=astra-voice-spike version=0.0.2
+  installed=0.0.1 sha256=738d6f2c1b55 fingerprint=CB951AD794407972A0B1A5BBAFA87398C4953A71 msg=установлено
+```
+
+**От нажатия кнопки до установки — 5 секунд**, включая ввод пароля заказчиком.
+
+## Чеклист M0.S2
+
+| Критерий `docs/plans.md` | Факт | Вердикт |
+|---|---|---|
+| Ровно **одно** окно ввода пароля | опрос окон класса `polkit` раз в секунду весь прогон: одновременно максимум **1**, уникальных за прогон **1** (`0x2400 00c`, id 37748748) | **PASS** |
+| Код **0** различим | `exit=0`, JSON `result=ok` | **PASS** |
+| Коды **126 / 127** различимы | живьём **не проверялись** — каждый потребовал бы ещё одного диалога у заказчика; разобраны в `gui_probe.py` (`EXIT_HINTS`) и в §«Коды выхода», покрыты юнит-тестами | **не проверено живьём** |
+| `dpkg-query -W` = 0.0.2 | `astra-voice-spike 0.0.2` | **PASS** |
+| GUI не блокируется | `QProcess` асинхронный, тикер «GUI жив: N» крутился в окне; кнопка снова стала активной после `finished` | **PASS**, но инструментально (скриншотом) не зафиксировано |
+| Установка локального `.deb` **без** `--allow-unauthenticated` (T1 §5) | `run_apt`: `argv = [apt-get, install, -y, --no-remove, ./<staged>]`, флага нет в коде установленного помощника; установка прошла | **PASS** |
+| `apt-locked` (удержанный `lock-frontend`) | сымитировать без root нельзя (lock держит root) | **не проверено живьём**, есть юнит-тест (`tests/test_helper.py`, код 72) |
+| `--no-download` при offline | ветка включается по `policy.conf`; файла нет → `policy-absent`, offline=false | **не проверено живьём**, есть юнит-тест (`tests/test_helper.py`) |
+
+## Побочные факты
+
+* `/var/lib/astra-voice/` после прогона: `staging` (0700 root, содержимое недоступно
+  непривилегированному пользователю — как и задумано), `update.lock` (0600), `updates.log` (0644).
+* Правка спайка в этом прогоне: `gui_probe.py` дублирует stdout помощника в консоль — иначе JSON
+  оставался только в окне и не попадал в артефакты.
+* Юнит-тесты (35 шт.) **сейчас прогнать нечем**: `pytest` не установлен ни в системе, ни в обоих
+  scratch-venv. Ставить пакеты в рамках прогона нельзя — вопрос человеку.

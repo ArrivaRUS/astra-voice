@@ -1,0 +1,17 @@
+группа раскладки ДО: 1
+grab ctrl+shift+space → keycode=65 масок=4 ok=True
+  [recording] press
+  Escape: grab ok=True
+  [recording] tap→toggle (0.023 с)
+  группа во время (после 1-го нажатия): 1
+  [processing] toggle-off
+  [idle] done
+  Escape: ungrab
+  [recording] press
+  Escape: grab ok=True
+  [recording] tap→toggle (0.023 с)
+  [idle] escape-cancel
+  Escape: ungrab
+{"key_presses": 4, "autorepeat_dropped": 17}
+группа раскладки ПОСЛЕ: 1
+grab снят? повторный grab: grab ctrl+shift+space → keycode=65 масок=4 ok=True

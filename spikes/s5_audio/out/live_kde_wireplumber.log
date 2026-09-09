@@ -1,0 +1,7 @@
+ДО: {"default_source": "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source", "default_sink": "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink", "active_profiles": [], "sources": 6, "wireplumber": "active"}
+захват ДО: {"ok": true, "attempts": 1, "open_ms": 11.0, "latency_us": null, "chunks": 45, "wall_s": 1.007, "peak_dbfs_max": -14.7, "peak_dbfs_median": -27.3, "cpu_pct": 0.0, "error": null}
+рестарт wireplumber: rc=0 за 3116 мс
+ленивое открытие: {"ok": true, "attempts": 1, "ms_from_restart": 573.2, "open_ms": 573.1, "error": null}
+захват ПОСЛЕ: {"ok": true, "attempts": 1, "open_ms": 32.9, "latency_us": null, "chunks": 48, "wall_s": 1.013, "peak_dbfs_max": -20.3, "peak_dbfs_median": -37.1, "cpu_pct": 0.0, "error": null}
+ПОСЛЕ: {"default_source": "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source", "default_sink": "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink", "active_profiles": [], "sources": 6, "wireplumber": "active"}
+состояние до=после: {"default_source": true, "default_sink": true, "active_profiles": true}

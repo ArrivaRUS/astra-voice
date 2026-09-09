@@ -1,0 +1,17 @@
+=== S4 ЖИВОЙ ПРОГОН · СНИМОК ДО · 2026-09-09T15:36:41+03:00 ===
+-- активное окно --
+wid=83886084
+WM_CLASS(STRING) = "com.anthropic.claude", "com.anthropic.Claude"
+-- раскладка --
+rules:      evdev model:      pc104 layout:     us,ru variant:    , options:    grp:ctrl_shift_toggle,grp:alt_shift_toggle 
+kxkbrc Options: Options=grp:ctrl_shift_toggle
+qdbus getLayout: 1
+xset LED mask: LED mask:  00001000
+-- буфер обмена (без содержимого) --
+TARGETS: text/uri-list text/x-moz-url text/plain application/x-kde4-urilist TARGETS MULTIPLE TIMESTAMP SAVE_TARGETS 
+sha256(text/plain): a74bece24f6c44a0
+-- klipper --
+история, записей: 20
+-- наши процессы --
+55571 /bin/bash -c source /home/astra/.claude/shell-snapshots/snapshot-bash-1788955624453-dvhfsg.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'cd /home/astra/Документы/astra-voice/spikes/s4_hotkey_paste && mkdir -p out && export DISPLAY=:0 && { echo "=== S4 ЖИВОЙ ПРОГОН · СНИМОК ДО · $(date -Is) ===" echo "-- активное окно --"; W=$(xdotool getactivewindow); echo "wid=$W"; xprop -id $W WM_CLASS echo "-- раскладка --"; setxkbmap -query | tr '"'"'\n'"'"' '"'"' '"'"'; echo echo "kxkbrc Options: $(grep -m1 '"'"'^Options'"'"' ~/.config/kxkbrc 2>/dev/null)" echo "qdbus getLayout: $(qdbus org.kde.keyboard /Layouts getLayout 2>&1)" echo "xset LED mask: $(xset -q | grep -o '"'"'LED mask:.*'"'"')" echo "-- буфер обмена (без содержимого) --" echo "TARGETS: $(xclip -selection clipboard -o -t TARGETS 2>/dev/null | tr '"'"'\n'"'"' '"'"' '"'"')" echo "sha256(text/plain): $(xclip -selection clipboard -o 2>/dev/null | sha256sum | cut -c1-16)" echo "-- klipper --" echo "история, записей: $(qdbus org.kde.klipper /klipper getClipboardHistoryMenu 2>/dev/null | wc -l)" echo "-- наши процессы --"; pgrep -af '"'"'hotkey.py|paste.py|pill.py|tray.py'"'"' || echo "нет" } 2>&1 | tee out/live_kde_before.log' < /dev/null && pwd -P >| /tmp/claude-5e2d-cwd
+55574 /bin/bash -c source /home/astra/.claude/shell-snapshots/snapshot-bash-1788955624453-dvhfsg.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \builtin unalias -- 'unsetenv'; \builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval 'cd /home/astra/Документы/astra-voice/spikes/s4_hotkey_paste && mkdir -p out && export DISPLAY=:0 && { echo "=== S4 ЖИВОЙ ПРОГОН · СНИМОК ДО · $(date -Is) ===" echo "-- активное окно --"; W=$(xdotool getactivewindow); echo "wid=$W"; xprop -id $W WM_CLASS echo "-- раскладка --"; setxkbmap -query | tr '"'"'\n'"'"' '"'"' '"'"'; echo echo "kxkbrc Options: $(grep -m1 '"'"'^Options'"'"' ~/.config/kxkbrc 2>/dev/null)" echo "qdbus getLayout: $(qdbus org.kde.keyboard /Layouts getLayout 2>&1)" echo "xset LED mask: $(xset -q | grep -o '"'"'LED mask:.*'"'"')" echo "-- буфер обмена (без содержимого) --" echo "TARGETS: $(xclip -selection clipboard -o -t TARGETS 2>/dev/null | tr '"'"'\n'"'"' '"'"' '"'"')" echo "sha256(text/plain): $(xclip -selection clipboard -o 2>/dev/null | sha256sum | cut -c1-16)" echo "-- klipper --" echo "история, записей: $(qdbus org.kde.klipper /klipper getClipboardHistoryMenu 2>/dev/null | wc -l)" echo "-- наши процессы --"; pgrep -af '"'"'hotkey.py|paste.py|pill.py|tray.py'"'"' || echo "нет" } 2>&1 | tee out/live_kde_before.log' < /dev/null && pwd -P >| /tmp/claude-5e2d-cwd

@@ -1,0 +1,12 @@
+=== S2 ЖИВОЙ ПРОГОН · 2026-09-09T15:52:17+03:00 ===
+до: astra-voice-spike	0.0.1
+окно зонда: 113246220
+geometry 600,376 720x420
+кнопка нажата: 15:52:19 — ЖДЁМ ВВОДА ПАРОЛЯ ЗАКАЗЧИКОМ (до 3 мин)
+завершилось на 1 с
+окон polkit: одновременно максимум 1, уникальных за прогон: 1 ( 37748748)
+=== лог зонда ===
+[stdout] {"result": "ok", "exit": 0, "message": "установлено", "policy": "policy-absent", "fingerprint": "CB951AD794407972A0B1A5BBAFA87398C4953A71", "sha256": "738d6f2c1b5522a3f5edf92d39c9f7c704d287beb0a5cfe1a3d553edf89743af", "package": "astra-voice-spike", "version": "0.0.2", "installed": "0.0.1"}
+exit=0  0 — помощник отработал (см. JSON в stdout)
+=== версия пакета после ===
+astra-voice-spike	0.0.2

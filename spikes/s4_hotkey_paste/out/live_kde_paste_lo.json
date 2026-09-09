@@ -1,0 +1,82 @@
+{
+  "display": ":0",
+  "steps": [
+    {
+      "wid": 115343372,
+      "wm_class": [
+        "libreoffice",
+        "libreoffice-writer"
+      ],
+      "terminal": false,
+      "step": "active-window",
+      "t_ms": 0.3
+    },
+    {
+      "formats": 9,
+      "secret": false,
+      "step": "save-clipboard",
+      "t_ms": 6.3
+    },
+    {
+      "chars": 35,
+      "hint": "secret",
+      "step": "put-text",
+      "t_ms": 6.8
+    },
+    {
+      "combo": "ctrl+v",
+      "ms": 0.85,
+      "step": "xtest",
+      "t_ms": 58.1
+    },
+    {
+      "formats": 9,
+      "step": "restore",
+      "t_ms": 159.2
+    }
+  ],
+  "target": {
+    "window": 115343372,
+    "wm_class": [
+      "libreoffice",
+      "libreoffice-writer"
+    ]
+  },
+  "clipboard_before": {
+    "formats": [
+      "MULTIPLE",
+      "SAVE_TARGETS",
+      "TARGETS",
+      "TIMESTAMP",
+      "application/x-kde-cutselection",
+      "application/x-kde-onlyReplaceEmpty",
+      "application/x-kio-metadata",
+      "text/plain",
+      "text/uri-list"
+    ],
+    "text_len": 27,
+    "password_hint": false
+  },
+  "text_raw": "Проверка связи S4 живой прогон, ёж.",
+  "text_normalized": "Проверка связи S4 живой прогон, ёж.",
+  "stripped_controls": 0,
+  "mode": "ctrl+v",
+  "xtest_ms": 0.85,
+  "owns_clipboard": true,
+  "restore": "restored",
+  "total_ms": 152.8,
+  "clipboard_after": {
+    "formats": [
+      "MULTIPLE",
+      "SAVE_TARGETS",
+      "TARGETS",
+      "TIMESTAMP",
+      "application/x-kde-cutselection",
+      "application/x-kde-onlyReplaceEmpty",
+      "application/x-kio-metadata",
+      "text/plain",
+      "text/uri-list"
+    ],
+    "text": "desktop:/ScrumBlackBook.pdf"
+  }
+}

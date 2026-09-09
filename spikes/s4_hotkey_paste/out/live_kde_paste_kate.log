@@ -1,0 +1,14 @@
+sha256 буфера ДО: a74bece24f6c44a0
+окно kate: 113246220 (ждали 2×0.5 с)
+активное перед вставкой: 113246220
+  active-window      {'wid': 113246220, 'wm_class': ('kate', 'kate'), 'terminal': False, 't_ms': 0.7}
+  save-clipboard     {'formats': 7, 'secret': False, 't_ms': 8.4}
+  put-text           {'chars': 35, 'hint': 'secret', 't_ms': 9.0}
+  xtest              {'combo': 'ctrl+v', 'ms': 1.19, 't_ms': 61.2}
+  restore            {'formats': 7, 't_ms': 162.5}
+{"mode": "ctrl+v", "restore": "restored", "total_ms": 154.0, "owns_clipboard": true}
+--- файл Kate ---
+Проверка связи S4 живой прогон, ёж.
+sha256 буфера ПОСЛЕ: d56eeba4e5b8c67d
+kate жив? 0
+0
