@@ -31,6 +31,7 @@ Button {
 
     background: Rectangle {
         radius: Theme.buttonRadius
+        antialiasing: true
         border.width: control.ghost ? 0 : Theme.buttonBorder
         border.color: control.enabled ? (control.primary ? Theme.primary : Theme.border) : Theme.border
         color: {
@@ -62,6 +63,7 @@ Button {
             color: "transparent"
             border.width: Theme.focusWidth
             border.color: Theme.stateFocusRing
+            antialiasing: true
             visible: control.visualFocus
         }
     }

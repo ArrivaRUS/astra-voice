@@ -47,8 +47,9 @@ Column {
 
         SettingRow {
             width: parent.width
+            // Пояснения нет: техническое имя карты пользователю не нужно.
+            // В M3 сюда пойдёт только человекочитаемое device.description из PulseAudio.
             label: qsTr("Микрофон")
-            sub: qsTr("Sof-hda-dsp · встроенный микрофон ноутбука")
 
             AvSelect {
                 Layout.preferredWidth: 236  // §4.4: типовая ширина списка в строке настройки
@@ -120,7 +121,6 @@ Column {
             width: parent.width
             divider: false
             label: qsTr("Автозапуск при входе в систему")
-            sub: qsTr("Создаёт ярлык ~/.config/autostart/astra-voice.desktop. Чужие ярлыки не трогаем")
             toggle: autostartToggle
 
             AvToggle {

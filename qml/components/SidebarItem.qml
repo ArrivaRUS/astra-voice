@@ -30,6 +30,7 @@ FocusScope {
         id: bg
         anchors.fill: parent
         radius: Theme.sidebarItemRadius
+        antialiasing: true
         color: {
             if (root.current)
                 return Theme.primary;
@@ -94,6 +95,7 @@ FocusScope {
         color: "transparent"
         border.width: Theme.focusWidth
         border.color: Theme.stateFocusRing
+        antialiasing: true
         visible: root.activeFocus
     }
 
@@ -101,9 +103,8 @@ FocusScope {
         id: mouse
         anchors.fill: parent
         hoverEnabled: true
-        onClicked: {
-            root.forceActiveFocus();
-            root.activated();
-        }
+        // Фокус мышью НЕ берём: активный пункт — только заливка primary со скруглением
+        // (§1.3, референс), кольцо фокуса появляется лишь при переходе клавиатурой (Tab).
+        onClicked: root.activated()
     }
 }

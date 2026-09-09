@@ -108,6 +108,7 @@ Item {
             Layout.preferredHeight: Theme.hintSize
             Layout.alignment: Qt.AlignVCenter
             radius: Theme.hintSize / 2
+            antialiasing: true
             color: "transparent"
             border.width: Theme.borderHairline
             border.color: Theme.fgFaint
@@ -130,6 +131,7 @@ Item {
             Layout.preferredHeight: Theme.badgeHeight
             Layout.alignment: Qt.AlignVCenter
             radius: Theme.lockBadgeRadius
+            antialiasing: true
             color: Theme.lockBadgeBg
             visible: root.locked
 

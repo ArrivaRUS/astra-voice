@@ -19,6 +19,7 @@ Switch {
         width: Theme.toggleW
         height: Theme.toggleH
         radius: Theme.toggleRadius
+        antialiasing: true
         color: {
             if (control.locked)
                 return Theme.toggleLockedBg;
@@ -60,6 +61,7 @@ Switch {
             color: "transparent"
             border.width: Theme.focusWidth
             border.color: Theme.stateFocusRing
+            antialiasing: true
             visible: control.visualFocus
         }
     }

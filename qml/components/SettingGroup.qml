@@ -35,6 +35,7 @@ Column {
         color: Theme.bgSurface
         border.width: Theme.cardBorder
         border.color: Theme.border
+        antialiasing: true
         clip: true
 
         Column {

@@ -1,5 +1,8 @@
-// Чип-клавиша («Ctrl + Space») — design/spec.md §4.7.
-// Нижняя граница 2 px читается как физическая клавиша; шрифт — PT Mono (сквозное правило 5).
+// Чип-клавиша («Ctrl + Space») — design/spec.md §4.7, макет `.key` (_base.py:100).
+// CSS: border-radius 6 + border-bottom 2 px — нижняя грань читается как физическая клавиша
+// и СКРУГЛЯЕТСЯ вместе с корпусом. В QML это два скруглённых слоя: нижний цвета `border`,
+// верхний — фон чипа с отступом снизу на толщину грани (рисовать полоску поверх нельзя:
+// она срезала бы нижние углы, дефект «нет скруглений» с живого прогона).
 import QtQuick 2.15
 import ".."
 
@@ -11,7 +14,16 @@ Rectangle {
     implicitHeight: Theme.hotkeyChipHeight
     implicitWidth: label.implicitWidth + Theme.hotkeyChipPaddingX * 2
     radius: Theme.hotkeyChipRadius
-    color: Theme.hotkeyChipBg
+    color: Theme.border
+    antialiasing: true
+
+    Rectangle {
+        anchors.fill: parent
+        anchors.bottomMargin: Theme.borderHotkeyKeyBottom
+        radius: root.radius
+        color: Theme.hotkeyChipBg
+        antialiasing: true
+    }
 
     Text {
         id: label
@@ -23,15 +35,5 @@ Rectangle {
         renderType: Text.NativeRendering
         anchors.horizontalCenter: parent.horizontalCenter
         y: Theme.hotkeyChipPaddingTop
-    }
-
-    // Нижняя грань клавиши: 2 px `border` (component.hotkey-chip.border-bottom).
-    Rectangle {
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.bottom: parent.bottom
-        height: Theme.borderHotkeyKeyBottom
-        radius: root.radius
-        color: Theme.border
     }
 }

@@ -35,6 +35,7 @@ ComboBox {
 
     background: Rectangle {
         radius: Theme.selectRadius
+        antialiasing: true
         color: control.enabled ? Theme.bgSurface : Theme.bgSurface2
         border.width: Theme.fieldBorder
         border.color: control.popup.visible ? Theme.selectOpenState : Theme.border
@@ -46,6 +47,7 @@ ComboBox {
             color: "transparent"
             border.width: Theme.focusWidth
             border.color: Theme.stateFocusRing
+            antialiasing: true
             visible: control.visualFocus
         }
     }
@@ -73,6 +75,7 @@ ComboBox {
 
         background: Rectangle {
             radius: Theme.popoverItemRadius
+            antialiasing: true
             color: parent.index === control.currentIndex ? Theme.selectionBg
                  : (parent.hovered ? Theme.stateHoverOnSurface : "transparent")
         }
@@ -117,6 +120,7 @@ ComboBox {
 
         background: Rectangle {
             radius: Theme.popoverRadius
+            antialiasing: true
             color: Theme.bgSurface
             border.width: Theme.fieldBorder
             border.color: Theme.border
