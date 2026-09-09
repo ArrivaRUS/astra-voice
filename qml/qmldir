@@ -1,0 +1,6 @@
+# СГЕНЕРИРОВАНО scripts/gen_theme.py — НЕ ПРАВИТЬ РУКАМИ.
+singleton Theme 1.0 Theme.qml
+singleton PillTheme 1.0 PillTheme.qml
+Main 1.0 Main.qml
+Sidebar 1.0 Sidebar.qml
+StatusBar 1.0 StatusBar.qml
