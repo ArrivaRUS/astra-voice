@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>Astra Voice</vendor>
+  <vendor_url>https://github.com/ArrivaRUS/astra-voice</vendor_url>
+
+  <action id="io.github.arrivarus.astra_voice.update">
+    <description>Install an Astra Voice update</description>
+    <description xml:lang="ru">Установка обновления Astra Voice</description>
+    <message>Authentication is required to install an Astra Voice update</message>
+    <message xml:lang="ru">Для установки обновления Astra Voice требуются права администратора</message>
+    <icon_name>system-software-update</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/astra-voice/update-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+</policyconfig>

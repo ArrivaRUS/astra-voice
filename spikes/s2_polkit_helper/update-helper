@@ -1,0 +1,540 @@
+#!/usr/bin/python3 -IS
+# -*- coding: utf-8 -*-
+"""astra-voice update-helper — спайк M0.S2 (трек A обновлятора, веха M8).
+
+Запускается ТОЛЬКО через pkexec по polkit-действию
+io.github.arrivarus.astra_voice.update (auth_admin, без _keep).
+Канонический путь: /usr/libexec/astra-voice/update-helper (root:root 0755).
+
+Условия приёма помощника — docs/threat-model.md §4.1 (1)–(10):
+ (1) root:root 0755, shebang `#!/usr/bin/python3 -IS`;
+ (2) только stdlib, sys.path не правится, никаких import astra_voice;
+ (3) os.environ.clear() + фиксированный набор;
+ (4) argv строго `install <абсолютный путь к .deb>`;
+ (5) копия через fd, staging O_DIRECTORY|O_NOFOLLOW + fstat uid 0 / 0700;
+ (6) gpgv --status-fd 1 --keyring <абс> + пин fingerprint (VALIDSIG), REVOKED — нашим кодом;
+ (7) dpkg-deb --field и dpkg --compare-versions по копии;
+ (8) apt-get с фиксированным argv, без --allow-unauthenticated;
+ (9) журнал (syslog + /var/lib/astra-voice/updates.log);
+ (10) unit-тесты с фейками gpgv/apt-get по АБСОЛЮТНЫМ путям в тестовом chroot.
+
+Коды выхода (см. README.md, таблица «Коды выхода»):
+   0  ok            установка выполнена
+  64  usage         неверный argv
+  65  bad-input     нет файла / не обычный файл / symlink (ELOOP) / слишком большой
+  66  bad-staging   staging не root:root 0700 либо symlink
+  67  bad-signature подпись не проверена / ключ не в пине / ключ отозван
+  68  bad-checksum  sha256 не совпал либо имя не найдено (или дублируется) в SHA256SUMS
+  69  bad-package   Package/Architecture не те
+  70  downgrade     версия не выше установленной
+  71  policy-denied policy.conf updates=admin либо DIGSIG_ELF_MODE≠0
+  72  apt-locked    удержан /var/lib/dpkg/lock-frontend
+  73  apt-failed    apt-get вернул ошибку
+  74  busy          другой экземпляр помощника держит блокировку
+  75  internal      внутренняя ошибка
+
+Коды 126/127 принадлежат pkexec (отказ/отмена диалога), помощник их не использует.
+
+Тестовый режим (только для unit-тестов, п. 10): включается, если помощник запущен
+НЕ по каноническому пути, а как <ROOT>/usr/libexec/astra-voice/update-helper, и в
+этом же дереве лежит флаг-файл <ROOT>/etc/astra-voice/SPIKE-TEST-MODE. Тогда все
+абсолютные пути (включая /usr/bin/gpgv и /usr/bin/apt-get) берутся с префиксом
+<ROOT>, а требуемый владелец staging — текущий uid. Через переменные окружения
+тестовый режим включить нельзя: окружение помощник стирает.
+"""
+
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+# --- пины (спайк: тестовые ключи из keys/test-release.gpg) ----------------------
+# В продукте сюда идут мастер-fpr + S1 + S2 из security/verify.py (T1 §4.2).
+PINNED_FINGERPRINTS = frozenset({
+    "CB951AD794407972A0B1A5BBAFA87398C4953A71",  # spike S1 (подписывает SUMS)
+    "53648D58F2B03C06CCE80580E137446C3835E961",  # spike S2 (плановая ротация)
+    "4BACA9A5099D20E13480D6675A1255A82104909F",  # spike revoked (был пиннут, отозван)
+})
+REVOKED_FINGERPRINTS = frozenset({
+    "4BACA9A5099D20E13480D6675A1255A82104909F",
+})
+
+PACKAGE_NAME = "astra-voice-spike"      # в продукте — "astra-voice"
+ALLOWED_ARCH = ("all", "amd64")
+
+MAX_DEB = 512 * 1024 * 1024
+MAX_SUMS = 64 * 1024
+MAX_ASC = 16 * 1024
+DEB_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._+~-]{0,127}\.deb\Z")
+
+EX_OK, EX_USAGE = 0, 64
+EX_BAD_INPUT, EX_BAD_STAGING, EX_BAD_SIGNATURE, EX_BAD_CHECKSUM = 65, 66, 67, 68
+EX_BAD_PACKAGE, EX_DOWNGRADE, EX_POLICY, EX_APT_LOCKED = 69, 70, 71, 72
+EX_APT_FAILED, EX_BUSY, EX_INTERNAL = 73, 74, 75
+
+CODE_BY_EXIT = {
+    EX_OK: "ok", EX_USAGE: "usage", EX_BAD_INPUT: "bad-input",
+    EX_BAD_STAGING: "bad-staging", EX_BAD_SIGNATURE: "bad-signature",
+    EX_BAD_CHECKSUM: "bad-checksum", EX_BAD_PACKAGE: "bad-package",
+    EX_DOWNGRADE: "downgrade", EX_POLICY: "policy-denied",
+    EX_APT_LOCKED: "apt-locked", EX_APT_FAILED: "apt-failed",
+    EX_BUSY: "busy", EX_INTERNAL: "internal",
+}
+
+FIXED_ENV = {
+    "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME": "/root",
+    "SHELL": "/bin/false",
+    "LC_ALL": "C.UTF-8",
+    "LANG": "C.UTF-8",
+    "DEBIAN_FRONTEND": "noninteractive",
+}
+
+CANONICAL_SELF = "/usr/libexec/astra-voice/update-helper"
+
+
+class Fail(Exception):
+    def __init__(self, exit_code, message, detail=None):
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.message = message
+        self.detail = detail
+
+
+class Paths:
+    """Абсолютные пути. В тестовом режиме — с префиксом chroot-каталога."""
+
+    def __init__(self, root, test_mode):
+        self.root = root
+        self.test_mode = test_mode
+        j = lambda *p: os.path.join(root, *p)  # noqa: E731
+        self.gpgv = j("usr/bin/gpgv")
+        self.apt_get = j("usr/bin/apt-get")
+        self.dpkg_deb = j("usr/bin/dpkg-deb")
+        self.dpkg = j("usr/bin/dpkg")
+        self.dpkg_query = j("usr/bin/dpkg-query")
+        self.keyring = j("usr/share/astra-voice/keys/test-release.gpg")
+        self.state_dir = j("var/lib/astra-voice")
+        self.staging = j("var/lib/astra-voice/staging")
+        self.lock = j("var/lib/astra-voice/update.lock")
+        self.log = j("var/lib/astra-voice/updates.log")
+        self.policy = j("etc/astra-voice/policy.conf")
+        self.digsig = j("etc/digsig/digsig_initramfs.conf")
+        self.required_uid = os.getuid() if test_mode else 0
+
+
+def sanitize_env():
+    """(3) фиксированное окружение: всё лишнее (PYTHONPATH, LD_*, GNUPGHOME…) стирается."""
+    os.environ.clear()
+    os.environ.update(FIXED_ENV)
+
+
+def resolve_paths(argv0):
+    """ROOT из собственного пути; тестовый режим — только по флаг-файлу в chroot."""
+    self_path = os.path.realpath(argv0)
+    if self_path == CANONICAL_SELF:
+        return Paths("/", False)
+    suffix = CANONICAL_SELF.lstrip("/")
+    if not self_path.endswith("/" + suffix):
+        raise Fail(EX_INTERNAL, "помощник запущен не по каноническому пути",
+                   {"self": self_path})
+    root = self_path[: -len(suffix)]
+    if not os.path.isfile(os.path.join(root, "etc/astra-voice/SPIKE-TEST-MODE")):
+        raise Fail(EX_INTERNAL, "помощник запущен не по каноническому пути",
+                   {"self": self_path})
+    return Paths(root, True)
+
+
+def parse_argv(argv):
+    """(4) argv строго `install <абсолютный путь>`."""
+    if len(argv) != 2 or argv[0] != "install":
+        raise Fail(EX_USAGE, "использование: update-helper install <абсолютный путь к .deb>")
+    path = argv[1]
+    if not path.startswith("/") or "\0" in path:
+        raise Fail(EX_USAGE, "путь должен быть абсолютным")
+    parts = path.split("/")
+    if ".." in parts or "." in parts or "" in parts[1:]:
+        raise Fail(EX_USAGE, "путь должен быть нормализованным, без .. и .")
+    name = parts[-1]
+    if not DEB_NAME_RE.match(name):
+        raise Fail(EX_USAGE, "имя файла должно быть простым именем *.deb")
+    return path, name
+
+
+# --- политика (И8, T-17, T-19) --------------------------------------------------
+
+def _read_root_owned(paths, path, limit):
+    """Читает файл как ДАННЫЕ: O_NOFOLLOW, обычный файл, владелец root, без w для group/other."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ELOOP, errno.ENOTDIR):
+            return None, ("отсутствует" if exc.errno == errno.ENOENT else "symlink")
+        raise Fail(EX_INTERNAL, "не удалось прочитать %s" % path, {"errno": exc.errno})
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, "не обычный файл"
+        if st.st_uid != paths.required_uid:
+            return None, "владелец не root"
+        if st.st_mode & 0o022:
+            return None, "доступен на запись группе/остальным"
+        return os.read(fd, limit).decode("utf-8", "replace"), None
+    finally:
+        os.close(fd)
+
+
+def read_policy(paths):
+    """/etc/astra-voice/policy.conf как данные. Возвращает (updates, note)."""
+    text, why = _read_root_owned(paths, paths.policy, 64 * 1024)
+    if text is None:
+        return None, ("policy-absent" if why == "отсутствует" else "policy-ignored:" + why)
+    value = None
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip() == "updates":
+            value = val.strip().strip('"').lower()
+    return value, "policy-applied"
+
+
+def read_digsig_mode(paths):
+    """/etc/digsig/digsig_initramfs.conf как данные. Возвращает строку режима или None."""
+    text, _why = _read_root_owned(paths, paths.digsig, 64 * 1024)
+    if text is None:
+        return None
+    mode = None
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line.startswith("DIGSIG_ELF_MODE"):
+            mode = line.partition("=")[2].strip().strip('"')
+    return mode
+
+
+def check_policy(paths, journal):
+    updates, note = read_policy(paths)
+    journal.append(note)
+    if updates == "admin":
+        raise Fail(EX_POLICY, "обновление запрещено политикой (updates=admin)")
+    mode = read_digsig_mode(paths)
+    if mode is not None and mode not in ("", "0"):
+        raise Fail(EX_POLICY, "включён ЗПС (DIGSIG_ELF_MODE=%s)" % mode)
+    return updates == "offline"
+
+
+# --- staging и копия через fd (5) -----------------------------------------------
+
+def open_staging(paths):
+    try:
+        os.mkdir(paths.state_dir, 0o755)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise Fail(EX_BAD_STAGING, "нет каталога состояния", {"errno": exc.errno})
+    try:
+        os.mkdir(paths.staging, 0o700)   # в продукте каталог создаёт .deb (root:root 0700)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise Fail(EX_BAD_STAGING, "не удалось создать staging", {"errno": exc.errno})
+    try:
+        fd = os.open(paths.staging,
+                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise Fail(EX_BAD_STAGING, "staging недоступен (symlink или не каталог)",
+                   {"errno": exc.errno})
+    st = os.fstat(fd)
+    if st.st_uid != paths.required_uid:
+        os.close(fd)
+        raise Fail(EX_BAD_STAGING, "владелец staging не root")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.close(fd)
+        raise Fail(EX_BAD_STAGING, "режим staging не 0700 (%o)" % stat.S_IMODE(st.st_mode))
+    return fd
+
+
+def read_source(dir_fd, name, limit):
+    """Открывает файл относительно fd каталога-источника, O_NOFOLLOW, читает байты."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise Fail(EX_BAD_INPUT, "%s — символическая ссылка" % name, {"errno": exc.errno})
+        raise Fail(EX_BAD_INPUT, "не удалось открыть %s" % name, {"errno": exc.errno})
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Fail(EX_BAD_INPUT, "%s — не обычный файл" % name)
+        if st.st_size > limit:
+            raise Fail(EX_BAD_INPUT, "%s слишком большой (%d)" % (name, st.st_size))
+        data = b""
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > limit:
+                raise Fail(EX_BAD_INPUT, "%s слишком большой" % name)
+        return data
+    finally:
+        os.close(fd)
+
+
+def write_staged(stage_fd, name, data):
+    try:
+        os.unlink(name, dir_fd=stage_fd)
+    except FileNotFoundError:
+        pass
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o644, dir_fd=stage_fd)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+# --- подпись (6) ----------------------------------------------------------------
+
+def run_fixed(argv, cwd=None):
+    return subprocess.run(argv, cwd=cwd, env=dict(os.environ), stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900)
+
+
+def verify_signature(paths, sums_path, asc_path):
+    """gpgv --status-fd 1 --keyring <абс>; успех только по VALIDSIG + пин, отзыв — нашим кодом."""
+    if not os.path.isfile(paths.keyring):
+        raise Fail(EX_BAD_SIGNATURE, "keyring не найден: %s" % paths.keyring)
+    proc = run_fixed([paths.gpgv, "--status-fd", "1", "--keyring", paths.keyring,
+                      asc_path, sums_path])
+    validsig = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        if line.startswith("[GNUPG:] VALIDSIG "):
+            fields = line.split()
+            if len(fields) >= 3:
+                validsig.append(fields[2].upper())
+                if len(fields) >= 12:
+                    validsig.append(fields[-1].upper())
+    if proc.returncode != 0 or not validsig:
+        raise Fail(EX_BAD_SIGNATURE, "подпись не проверена",
+                   {"rc": proc.returncode, "validsig": validsig})
+    revoked = [f for f in validsig if f in REVOKED_FINGERPRINTS]
+    if revoked:
+        raise Fail(EX_BAD_SIGNATURE, "ключ отозван: %s" % revoked[0], {"validsig": validsig})
+    pinned = [f for f in validsig if f in PINNED_FINGERPRINTS]
+    if not pinned:
+        raise Fail(EX_BAD_SIGNATURE, "ключ подписи не в списке доверенных",
+                   {"validsig": validsig})
+    return pinned[0]
+
+
+def sha256_from_sums(sums_bytes, name):
+    """Разбор ТЕХ ЖЕ байт, что отданы gpgv (T-30). Ровно одна строка на имя."""
+    found = []
+    for raw in sums_bytes.decode("utf-8", "replace").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        digest, fname = parts[0].lower(), parts[1].lstrip("*").strip()
+        if fname == name:
+            found.append(digest)
+    if len(found) != 1:
+        raise Fail(EX_BAD_CHECKSUM,
+                   "в SHA256SUMS нет ровно одной строки для %s (найдено %d)" % (name, len(found)))
+    if not re.fullmatch(r"[0-9a-f]{64}", found[0]):
+        raise Fail(EX_BAD_CHECKSUM, "некорректная сумма в SHA256SUMS")
+    return found[0]
+
+
+# --- пакет (7) ------------------------------------------------------------------
+
+def deb_fields(paths, deb_path):
+    proc = run_fixed([paths.dpkg_deb, "--field", deb_path, "Package", "Version", "Architecture"])
+    if proc.returncode != 0:
+        raise Fail(EX_BAD_PACKAGE, "dpkg-deb не прочитал пакет", {"rc": proc.returncode})
+    fields = {}
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        key, _, val = line.partition(":")
+        if val:
+            fields[key.strip()] = val.strip()
+    if fields.get("Package") != PACKAGE_NAME:
+        raise Fail(EX_BAD_PACKAGE, "чужой пакет: %r" % fields.get("Package"))
+    if fields.get("Architecture") not in ALLOWED_ARCH:
+        raise Fail(EX_BAD_PACKAGE, "архитектура не поддерживается: %r" % fields.get("Architecture"))
+    if not fields.get("Version"):
+        raise Fail(EX_BAD_PACKAGE, "в пакете нет версии")
+    return fields
+
+
+def installed_version(paths):
+    proc = run_fixed([paths.dpkg_query, "-W", "-f=${Version}", PACKAGE_NAME])
+    if proc.returncode != 0:
+        return None
+    value = proc.stdout.decode("utf-8", "replace").strip()
+    return value or None
+
+
+def check_upgrade(paths, new_version, facts):
+    current = installed_version(paths)
+    if current is None:
+        return None
+    facts["installed"] = current
+    proc = run_fixed([paths.dpkg, "--compare-versions", new_version, "gt", current])
+    if proc.returncode != 0:
+        raise Fail(EX_DOWNGRADE, "версия %s не выше установленной %s" % (new_version, current))
+    return current
+
+
+# --- apt (8) --------------------------------------------------------------------
+
+APT_LOCK_MARKERS = ("Could not get lock", "temporarily unavailable",
+                    "Не удалось получить блокировку", "dpkg frontend lock")
+
+
+def run_apt(paths, staged_name, offline):
+    argv = [paths.apt_get, "install", "-y", "--no-remove"]
+    if offline:
+        argv.append("--no-download")
+    argv.append("./" + staged_name)          # фиксированный argv, без --allow-unauthenticated
+    proc = run_fixed(argv, cwd=paths.staging)
+    if proc.returncode != 0:
+        blob = (proc.stdout + b"\n" + proc.stderr).decode("utf-8", "replace")
+        if any(m in blob for m in APT_LOCK_MARKERS):
+            raise Fail(EX_APT_LOCKED, "apt занят другим процессом", {"rc": proc.returncode})
+        raise Fail(EX_APT_FAILED, "apt-get завершился с ошибкой",
+                   {"rc": proc.returncode, "tail": blob.strip()[-400:]})
+    return proc
+
+
+# --- журнал (9) -----------------------------------------------------------------
+
+def journal_write(paths, line):
+    try:
+        fd = os.open(paths.log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+                     | os.O_CLOEXEC, 0o644)
+    except OSError:
+        return
+    try:
+        os.write(fd, (line + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def syslog_write(paths, line):
+    if paths.test_mode:          # изоляция спайка: в тестах системный журнал не трогаем
+        return
+    try:
+        import syslog
+        syslog.openlog("astra-voice-update-helper", syslog.LOG_PID, syslog.LOG_AUTH)
+        syslog.syslog(syslog.LOG_NOTICE, line)
+        syslog.closelog()
+    except Exception:
+        pass
+
+
+def report(paths, exit_code, message, extra):
+    code = CODE_BY_EXIT.get(exit_code, "internal")
+    payload = {"result": code, "exit": exit_code, "message": message}
+    payload.update(extra or {})
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+    parts = ["%s result=%s exit=%d" % (stamp, code, exit_code)]
+    for key in ("package", "version", "installed", "sha256", "fingerprint"):
+        if payload.get(key):
+            value = payload[key]
+            if key == "sha256":
+                value = value[:12]
+            parts.append("%s=%s" % (key, value))
+    parts.append("msg=%s" % message)
+    line = " ".join(parts)
+    if paths is not None:
+        journal_write(paths, line)
+        syslog_write(paths, line)
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    return exit_code
+
+
+def install(paths, deb_path, deb_name, facts):
+    journal = []
+    offline = check_policy(paths, journal)
+    facts["policy"] = journal[0] if journal else "policy-absent"
+
+    src_dir = os.path.dirname(deb_path)
+    try:
+        dir_fd = os.open(src_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise Fail(EX_BAD_INPUT, "каталог источника недоступен", {"errno": exc.errno})
+    try:
+        deb_bytes = read_source(dir_fd, deb_name, MAX_DEB)
+        sums_bytes = read_source(dir_fd, "SHA256SUMS", MAX_SUMS)
+        asc_bytes = read_source(dir_fd, "SHA256SUMS.asc", MAX_ASC)
+    finally:
+        os.close(dir_fd)
+
+    stage_fd = open_staging(paths)
+    try:
+        write_staged(stage_fd, deb_name, deb_bytes)
+        write_staged(stage_fd, "SHA256SUMS", sums_bytes)
+        write_staged(stage_fd, "SHA256SUMS.asc", asc_bytes)
+    finally:
+        os.close(stage_fd)
+
+    staged_deb = os.path.join(paths.staging, deb_name)
+    facts["fingerprint"] = verify_signature(paths,
+                                            os.path.join(paths.staging, "SHA256SUMS"),
+                                            os.path.join(paths.staging, "SHA256SUMS.asc"))
+    expected = sha256_from_sums(sums_bytes, deb_name)      # те же байты, что проверил gpgv
+    actual = hashlib.sha256(deb_bytes).hexdigest()
+    facts["sha256"] = actual
+    if actual != expected:
+        raise Fail(EX_BAD_CHECKSUM, "sha256 не совпал с SHA256SUMS")
+
+    fields = deb_fields(paths, staged_deb)
+    facts["package"] = fields["Package"]
+    facts["version"] = fields["Version"]
+    check_upgrade(paths, fields["Version"], facts)
+    run_apt(paths, deb_name, offline)
+    return facts
+
+
+def main(argv):
+    sanitize_env()
+    paths = None
+    facts = {}
+    lock_fd = None
+    try:
+        paths = resolve_paths(argv[0])
+        deb_path, deb_name = parse_argv(argv[1:])
+        os.makedirs(paths.state_dir, 0o755, exist_ok=True)
+        lock_fd = os.open(paths.lock, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                          0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise Fail(EX_BUSY, "другой экземпляр помощника уже работает")
+        install(paths, deb_path, deb_name, facts)
+        return report(paths, EX_OK, "установлено", facts)
+    except Fail as exc:
+        extra = dict(facts)
+        if exc.detail:
+            extra["detail"] = exc.detail
+        return report(paths, exc.exit_code, exc.message, extra)
+    except Exception as exc:  # noqa: BLE001 — наружу только код и класс ошибки
+        return report(paths, EX_INTERNAL, "внутренняя ошибка: %s" % type(exc).__name__, facts)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
