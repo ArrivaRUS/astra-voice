@@ -21,7 +21,6 @@ Column {
         font.capitalization: Font.AllUppercase
         font.letterSpacing: Theme.fontGroupCapsTracking * Theme.fontGroupCapsSize
         renderType: Text.NativeRendering
-        verticalAlignment: Text.AlignVCenter
         leftPadding: 2  // §3.1: отступ заголовка группы 0 0 5 2
         lineHeight: Math.round(Theme.fontGroupCapsSize * Theme.fontGroupCapsLineHeight)
         lineHeightMode: Text.FixedHeight
@@ -33,8 +32,11 @@ Column {
 
         property alias rowData: column.data
 
+        // Макет считает карточку по border-box (`*{box-sizing:border-box}`): рамка 1 px
+        // лежит ВНУТРИ габарита, строки живут в оставшихся 670 × N. Без этого запаса
+        // рамка съедала по пикселю у первой и последней строки.
         width: root.width
-        height: Math.round(column.implicitHeight)
+        height: Math.round(column.implicitHeight) + Theme.cardBorder * 2
         radius: Theme.cardRadius
         color: Theme.bgSurface
         antialiasing: true
@@ -42,8 +44,9 @@ Column {
 
         Column {
             id: column
-            width: parent.width
-            anchors.centerIn: parent
+            x: Theme.cardBorder
+            y: Theme.cardBorder
+            width: parent.width - Theme.cardBorder * 2
         }
 
         // Обводка рисуется ПОВЕРХ заливки карточки: в тёмной теме `border` — это

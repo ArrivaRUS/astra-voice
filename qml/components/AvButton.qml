@@ -23,7 +23,7 @@ Button {
     rightPadding: leftPadding
     topPadding: small ? Theme.buttonSmPaddingY : (ghost ? Theme.buttonGhostPaddingY : Theme.buttonPaddingY)
     bottomPadding: topPadding
-    implicitHeight: small ? Theme.buttonHeightSm : Theme.buttonHeight
+    implicitHeight: Math.round(small ? Theme.buttonHeightSm : Theme.buttonHeight)
     implicitWidth: contentRow.implicitWidth + leftPadding + rightPadding
     font.family: Theme.fontUi
     font.pixelSize: small ? Theme.fontButtonSmSize : Theme.fontButtonSize

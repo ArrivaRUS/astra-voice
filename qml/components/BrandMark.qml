@@ -1,61 +1,59 @@
-// Знак Astra Voice: три точки и строка.
-// Геометрия — мастер 22 px (design/spec.md §9.1, design/tokens.json component.tray.geometry-22):
-// точки r 1.2185 / 1.6815 / 2.3151 на cy 8.4849, строка 2,12 18×4 rx 2.
-// Правило бренда: цвет несёт ТОЛЬКО третья точка; строка и точки 1–2 — цвет текста.
+// Знак Astra Voice: три точки и строка. Правило бренда — цвет несёт ТОЛЬКО третья точка.
+//
+// Две РАЗНЫЕ геометрии, их нельзя путать (обе из design/mockups/directions/_base.py):
+//   logo — знак в интерфейсе, `mark()`: viewBox 100 × 51.7238, ширина знака = вся ширина;
+//   tray — иконка состояния, `tray()` и design/spec.md §9.1: viewBox 22 × 22 со своей
+//          мастер-геометрией (уменьшать логотип до 16–22 px нельзя, радиусы «плывут»).
 import QtQuick 2.15
 
 Item {
     id: root
 
     property real size: 22
+    property bool tray: false
     property color color: "#000000"
-    // Цвет третьей точки: состояние (слушаю/распознаю/готово/ошибка). По умолчанию — как весь знак.
+    // Третья точка: состояние (слушаю / распознаю / готово / ошибка) либо акцент бренда.
     property color accentColor: root.color
 
-    readonly property real k: size / 22
+    readonly property real vbW: tray ? 22 : 100
+    readonly property real vbH: tray ? 22 : 51.7238
+    readonly property real k: size / vbW
+    // cx, cy, r в координатах viewBox
+    readonly property var dots: tray
+        ? [[3.4622, 8.4849, 1.2185], [9.4694, 8.4849, 1.6815], [14.5627, 8.4849, 2.3151]]
+        : [[8.1233, 12.8619, 6.7694], [41.4966, 12.8619, 9.3418], [69.7928, 12.8619, 12.8619]]
+    // x, y, w, h, rx
+    readonly property var bar: tray ? [2, 12, 18, 4, 2] : [0, 31.7238, 100, 20, 10]
 
     implicitWidth: size
-    implicitHeight: size
-    width: size
-    height: size
+    implicitHeight: vbH * k
+    width: implicitWidth
+    height: implicitHeight
 
-    Rectangle {
-        x: (3.4622 - 1.2185) * root.k
-        y: (8.4849 - 1.2185) * root.k
-        width: 2 * 1.2185 * root.k
-        height: width
-        radius: width / 2
-        color: root.color
-        antialiasing: true
+    Repeater {
+        model: root.dots
+
+        Rectangle {
+            required property int index
+            required property var modelData
+
+            x: (modelData[0] - modelData[2]) * root.k
+            y: (modelData[1] - modelData[2]) * root.k
+            width: 2 * modelData[2] * root.k
+            height: width
+            radius: width / 2
+            antialiasing: true
+            color: index === 2 ? root.accentColor : root.color
+        }
     }
 
     Rectangle {
-        x: (9.4694 - 1.6815) * root.k
-        y: (8.4849 - 1.6815) * root.k
-        width: 2 * 1.6815 * root.k
-        height: width
-        radius: width / 2
+        x: root.bar[0] * root.k
+        y: root.bar[1] * root.k
+        width: root.bar[2] * root.k
+        height: root.bar[3] * root.k
+        radius: root.bar[4] * root.k
+        antialiasing: true
         color: root.color
-        antialiasing: true
-    }
-
-    Rectangle {
-        x: (14.5627 - 2.3151) * root.k
-        y: (8.4849 - 2.3151) * root.k
-        width: 2 * 2.3151 * root.k
-        height: width
-        radius: width / 2
-        color: root.accentColor
-        antialiasing: true
-    }
-
-    Rectangle {
-        x: 2 * root.k
-        y: 12 * root.k
-        width: 18 * root.k
-        height: 4 * root.k
-        radius: 2 * root.k
-        color: root.color
-        antialiasing: true
     }
 }

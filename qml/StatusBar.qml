@@ -59,6 +59,7 @@ Item {
 
             BrandMark {
                 size: Theme.statusbarTrayIcon
+                tray: true  // иконка состояния — мастер-геометрия 22 (§9.1), не логотип
                 color: Theme.statusbarFg
                 Layout.alignment: Qt.AlignVCenter
             }
