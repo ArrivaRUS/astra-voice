@@ -1,0 +1,15 @@
+[pill] python3-pyqt5.qtquick не установлен → бэкенд widget (plan-claude §12; deb поставит зависимость в M1)
+[pill] backend=widget  winId=0x600006  state=processing
+[pill] окно: 850,972 220x84  поле под тень=24
+[pill] первый кадр: 5.2 мс (spec §8.4 — показ ≤ 100 мс)
+[pill] active_window: 0x40000c
+[pill] screen_source: экран активного окна
+[pill] availableGeometry: (0, 0, 1920, 1080)
+[pill] _NET_WORKAREA: None
+[pill] Р7: _NET_WORKAREA нет (нет WM)
+[pill] позиция окна: (850, 972, 220, 84)
+[pill] видимый низ пилюли: 1032
+[pill] низ рабочей области: 1080
+[pill] _NET_WM_WINDOW_TYPE: ['_NET_WM_WINDOW_TYPE_NOTIFICATION']
+[pill] _NET_WM_STATE: ['_NET_WM_STATE_ABOVE', '_NET_WM_STATE_STAYS_ON_TOP', '_NET_WM_STATE_SKIP_TASKBAR', '_NET_WM_STATE_SKIP_PAGER']
+[pill] _NET_WM_USER_TIME: [0]

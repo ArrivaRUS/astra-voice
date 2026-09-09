@@ -1,0 +1,13 @@
+# CPU пилюли, состояние listening, 30 кадр/с; 2026-09-09T10:44:23+03:00
+# среда: Xwayland :1 под kwin_wayland --virtual (Xvfb в системе НЕТ), 1920x1080, 14 ядер
+%Cpu(s):  0,0 us,  0,0 sy,  0,0 ni,100,0 id,  0,0 wa,  0,0 hi,  0,0 si,  0,0 st 
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 292458 astra     20   0  301036  76148  52652 S   0,0   0,2   0:00.21 python3
+%Cpu(s):  4,6 us,  1,0 sy,  0,0 ni, 94,4 id,  0,0 wa,  0,0 hi,  0,0 si,  0,0 st 
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 292458 astra     20   0  301036  76148  52652 S   2,0   0,2   0:00.25 python3
+%Cpu(s):  1,2 us,  0,9 sy,  0,0 ni, 97,8 id,  0,0 wa,  0,0 hi,  0,0 si,  0,0 st 
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 292458 astra     20   0  301036  76148  52652 S   1,5   0,2   0:00.28 python3
+утилизация одного ядра за 10 с: ticks=15 HZ=100 → 1.00 %
+VmRSS: 76148 kB

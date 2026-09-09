@@ -1,0 +1,31 @@
+[tray] themeName = astra-proxima
+[tray] themeSearchPaths = ['/home/astra/.local/share/icons', '/home/astra/.local/share/icons', '/home/astra/.local/share/flatpak/exports/share/icons', '/usr/share/icons', ':/icons']
+[tray] isSystemTrayAvailable() = False
+[tray] SNI-хоста нет (ожидаемо под Xvfb без панели) — проверяем только разрешение имён иконок и сборку меню
+[tray] idle                 icon=astra-voice-tray-idle          найдена=True sizes=[(128, 128), (16, 16), (192, 192), (22, 22), (256, 256), (32, 32), (48, 48), (64, 64), (8, 8), (96, 96)]
+[tray] listening            icon=astra-voice-tray-listening     найдена=True sizes=[(128, 128), (16, 16), (192, 192), (22, 22), (256, 256), (32, 32), (48, 48), (64, 64), (8, 8), (96, 96)]
+[tray] processing           icon=astra-voice-tray-processing    найдена=True sizes=[(128, 128), (16, 16), (192, 192), (22, 22), (256, 256), (32, 32), (48, 48), (64, 64), (8, 8), (96, 96)]
+[tray] done                 icon=astra-voice-tray-done          найдена=True sizes=[(128, 128), (16, 16), (192, 192), (22, 22), (256, 256), (32, 32), (48, 48), (64, 64), (8, 8), (96, 96)]
+[tray] error                icon=astra-voice-tray-error         найдена=True sizes=[(128, 128), (16, 16), (192, 192), (22, 22), (256, 256), (32, 32), (48, 48), (64, 64), (8, 8), (96, 96)]
+[tray] hotkey-not-grabbed   icon=astra-voice-tray-error         найдена=True sizes=[(128, 128), (16, 16), (192, 192), (22, 22), (256, 256), (32, 32), (48, 48), (64, 64), (8, 8), (96, 96)]
+[tray] меню (spec §9.2):
+  Готов                            enabled=False
+  ---
+  Отмена                           enabled=False
+  Модель: GigaAM v3 RNN-T          enabled=False
+  Скопировать последний текст      enabled=False
+  ---
+  Настройки…                       enabled=True  Ctrl+,
+  Проверить обновления             enabled=False
+  О программе                      enabled=True
+  ---
+  Выход                            enabled=True  Ctrl+Q
+[tray] state=idle tooltip='Astra Voice — готов · Ctrl+Space'
+[tray] tray.isVisible() = True
+[tray] state=listening tooltip='Слушаю…'
+[tray] state=processing tooltip='Распознаю…'
+[tray] state=done tooltip='Готово'
+[tray] state=error tooltip='Микрофон недоступен — открыть'
+[tray] state=hotkey-not-grabbed tooltip='Горячая клавиша не захвачена — выбрать другую'
+[tray] state=idle tooltip='Astra Voice — готов · Ctrl+Space'
+[tray] state=listening tooltip='Слушаю…'

@@ -1,0 +1,8 @@
+[tray] системная тема иконок: astra-proxima
+[tray] themeName принудительно = hicolor (обход S1-ловушки)
+[tray] idle                 icon=astra-voice-tray-idle          найдена=True разрешилось в OK
+[tray] listening            icon=astra-voice-tray-listening     найдена=True разрешилось в OK
+[tray] processing           icon=astra-voice-tray-processing    найдена=True разрешилось в OK
+[tray] done                 icon=astra-voice-tray-done          найдена=True разрешилось в OK
+[tray] error                icon=astra-voice-tray-error         найдена=True разрешилось в OK
+[tray] hotkey-not-grabbed   icon=astra-voice-tray-error         найдена=True разрешилось в OK

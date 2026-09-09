@@ -120,7 +120,7 @@ paplay --device=av_test data/test/test-ru-6s.wav
 ### Validation
 ```sh
 # S1
-xdotool getactivewindow; python3 spikes/s1_pill.py & sleep 0.3; xdotool getactivewindow                 # id совпадают
+xdotool getactivewindow; python3 spikes/s1_pill_tray/pill.py & sleep 0.3; xdotool getactivewindow                 # id совпадают
 xprop -id "$(xdotool search --name astra-voice-pill | head -1)" _NET_WM_STATE _NET_WM_WINDOW_TYPE
 xprop -root _NET_WORKAREA; xprop -root | grep -E '_FLY_WM_PID|_NET_SUPPORTING_WM_CHECK'; echo "XDG=$XDG_CURRENT_DESKTOP DS=$DESKTOP_SESSION"
 # S2 (после sudo-шага заказчика)

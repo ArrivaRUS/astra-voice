@@ -1,0 +1,7 @@
+[tray] системная тема иконок: astra-proxima
+[tray] idle                 icon=astra-voice-tray-idle          найдена=True разрешилось в ПОДМЕНА → 'astra'
+[tray] listening            icon=astra-voice-tray-listening     найдена=True разрешилось в ПОДМЕНА → 'astra'
+[tray] processing           icon=astra-voice-tray-processing    найдена=True разрешилось в ПОДМЕНА → 'astra'
+[tray] done                 icon=astra-voice-tray-done          найдена=True разрешилось в ПОДМЕНА → 'astra'
+[tray] error                icon=astra-voice-tray-error         найдена=True разрешилось в ПОДМЕНА → 'astra'
+[tray] hotkey-not-grabbed   icon=astra-voice-tray-error         найдена=True разрешилось в ПОДМЕНА → 'astra'

@@ -1,0 +1,109 @@
+### Среда прогона  (2026-09-09T10:52:36+03:00)
+$ dpkg -l xvfb | tail -1
+un  xvfb           <нет>        <нет>        (описание недоступно)
+(Xvfb в системе НЕТ, ставить нельзя → изолированный X поднят через kwin_wayland)
+$ kwin_wayland --virtual --width 1920 --height 1080 --xwayland --no-lockscreen --no-global-shortcuts --socket=av-s1 /tmp/av_s1_child.sh &
+DISPLAY, выданный Xwayland: :1   (реальная сессия заказчика — :0, НЕ трогалась)
+
+$ xdpyinfo | head -3
+name of display:    :1
+version number:    11.0
+vendor string:    The X.Org Foundation
+
+$ xprop -root _NET_SUPPORTING_WM_CHECK _NET_WORKAREA
+_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x200002
+_NET_WORKAREA:  not found.
+
+### Фокус: тестовое окно xterm + пилюля
+$ xdotool getactivewindow   →  4194316 (0x40000c)
+[1]+  Завершён        setsid python3 -u pill.py --state listening --seconds 30 > /tmp/av_pill_run.log 2>&1 < /dev/null
+$ xdotool getactivewindow (пилюля показана)  →  4194316 (0x40000c)
+ВЕРДИКТ: активное окно НЕ изменилось — фокус не украден
+
+$ xdotool search --name astra-voice-pill  →  6291462 (0x600006)
+$ xprop -id 6291462 _NET_WM_STATE _NET_WM_WINDOW_TYPE _NET_WM_USER_TIME WM_CLASS
+_NET_WM_STATE(ATOM) = _NET_WM_STATE_ABOVE, _NET_WM_STATE_STAYS_ON_TOP, _NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER
+_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_NOTIFICATION
+_NET_WM_USER_TIME(CARDINAL) = 0
+WM_CLASS(STRING) = "pill.py", "astra-voice"
+
+$ xdotool getwindowgeometry 6291462
+Window 6291462
+  Position: 844,972 (screen: 0)
+  Geometry: 231x84
+
+$ xprop -root _NET_CLIENT_LIST_STACKING _NET_CLIENT_LIST _NET_ACTIVE_WINDOW
+(последний в STACKING — самый верхний: пилюля 0x600006 над xterm 0x40000c)
+_NET_CLIENT_LIST_STACKING(WINDOW): window id # 0x40000c, 0x600006
+_NET_CLIENT_LIST(WINDOW): window id # 0x40000c, 0x600006
+_NET_ACTIVE_WINDOW(WINDOW): window id # 0x40000c
+
+### Снимок экрана
+$ xwd -root -silent > root.xwd   →  под Xwayland root не читается:
+X Error of failed request:  BadMatch (invalid parameter attributes)
+  Major opcode of failed request:  73 (X_GetImage)
+  Serial number of failed request:  56
+  
+$ xwd -id 6291462 -silent | convert xwd:- out/pill_<state>.png   →  работает (см. out/*.png)
+
+### Собственный отчёт пилюли
+[pill] python3-pyqt5.qtquick не установлен → бэкенд widget (plan-claude §12; deb поставит зависимость в M1)
+[pill] backend=widget  winId=0x600006  state=listening
+[pill] окно: 844,972 231x84  поле под тень=24
+[pill] первый кадр: 6.8 мс (spec §8.4 — показ ≤ 100 мс)
+[pill] active_window: 0x40000c
+[pill] screen_source: экран активного окна
+[pill] availableGeometry: (0, 0, 1920, 1080)
+[pill] _NET_WORKAREA: None
+[pill] Р7: _NET_WORKAREA не опубликован WM — сверку struts переносим на живой прогон
+[pill] позиция окна: (844, 972, 231, 84)
+[pill] видимый низ пилюли: 1032
+[pill] низ рабочей области: 1080
+[pill] _NET_WM_WINDOW_TYPE: ['_NET_WM_WINDOW_TYPE_NOTIFICATION']
+[pill] _NET_WM_STATE: ['_NET_WM_STATE_ABOVE', '_NET_WM_STATE_STAYS_ON_TOP', '_NET_WM_STATE_SKIP_TASKBAR', '_NET_WM_STATE_SKIP_PAGER']
+[pill] _NET_WM_USER_TIME: [0]
+
+### Трей (изолированная шина)
+$ dbus-run-session -- python3 -u tray.py --seconds 3 --cycle-ms 400
+[tray] системная тема иконок: astra-proxima
+[tray] themeSearchPaths = ['/home/astra/.local/share/icons', '/home/astra/.local/share/icons', '/home/astra/.local/share/flatpak/exports/share/icons', '/usr/share/icons', ':/icons']
+[tray] isSystemTrayAvailable() = False
+[tray] SNI-хоста нет (ожидаемо под Xvfb без панели) — проверяем только разрешение имён иконок и сборку меню
+[tray] idle                 icon=astra-voice-tray-idle          найдена=True разрешилось в ПОДМЕНА → 'astra'
+[tray] listening            icon=astra-voice-tray-listening     найдена=True разрешилось в ПОДМЕНА → 'astra'
+[tray] processing           icon=astra-voice-tray-processing    найдена=True разрешилось в ПОДМЕНА → 'astra'
+[tray] done                 icon=astra-voice-tray-done          найдена=True разрешилось в ПОДМЕНА → 'astra'
+[tray] error                icon=astra-voice-tray-error         найдена=True разрешилось в ПОДМЕНА → 'astra'
+[tray] hotkey-not-grabbed   icon=astra-voice-tray-error         найдена=True разрешилось в ПОДМЕНА → 'astra'
+[tray] меню (spec §9.2):
+  Готов                            enabled=False
+  ---
+  Отмена                           enabled=False
+  Модель: GigaAM v3 RNN-T          enabled=False
+  Скопировать последний текст      enabled=False
+  ---
+  Настройки…                       enabled=True  Ctrl+,
+  Проверить обновления             enabled=False
+  О программе                      enabled=True
+  ---
+  Выход                            enabled=True  Ctrl+Q
+[tray] state=idle tooltip='Astra Voice — готов · Ctrl+Space'
+[tray] tray.isVisible() = True
+[tray] state=listening tooltip='Слушаю…'
+[tray] state=processing tooltip='Распознаю…'
+[tray] state=done tooltip='Готово'
+[tray] state=error tooltip='Микрофон недоступен — открыть'
+[tray] state=hotkey-not-grabbed tooltip='Горячая клавиша не захвачена — выбрать другую'
+
+### Тема и сессия
+$ python3 theme_probe.py --x
+KDE: тёмная (ColorScheme='AstraDark', BackgroundNormal='#262626', luma=38.0, по имя схемы), Fly: светлая (ColorScheme='AstraLight', BackgroundColor='#ffffff', luma=255.0, по имя схемы)
+XDG_CURRENT_DESKTOP=''  DESKTOP_SESSION=''  QT_QPA_PLATFORMTHEME=''  QT_QUICK_CONTROLS_STYLE=''
+файлы: kdeglobals=True paletterc=True current.themerc=True
+ВНИМАНИЕ: kdeglobals и paletterc расходятся — источник выбирается по SessionKind (plan-claude §13.1)
+--- root-атомы ($DISPLAY=:1) ---
+_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x200002
+_FLY_WM_PID:  no such atom on any window.
+_NET_WORKAREA:  not found.
+WM_NAME: _NET_WM_NAME(UTF8_STRING) = "KWin"
+SessionKind по атомам: KDE
