@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Замер модели распознавания (onnx-asr + onnxruntime) — холодная загрузка, p50/p95, RTFx, RSS, отмена.
+"""Замер модели распознавания (onnx-asr + onnxruntime).
+
+Холодная загрузка, p50/p95, RTFx, RSS, отмена.
 
 Написан для спайка M0.S3 и переиспользуется в M2 (`tools/benchmark`, `worker/measure.py`).
 Зависимости: только `onnxruntime`, `onnx-asr`, системный `numpy` — ничего сверх venv рантайма.
@@ -123,7 +125,11 @@ class Canceller:
                 continue
             if isinstance(attr, self._rt.InferenceSession):
                 self._wrap(attr)
-            elif hasattr(attr, "__dict__") and not callable(attr) and not isinstance(attr, (str, bytes, Path)):
+            elif (
+                hasattr(attr, "__dict__")
+                and not callable(attr)
+                and not isinstance(attr, (str, bytes, Path))
+            ):
                 self._patch(attr, depth + 1)
 
     def _wrap(self, sess: Any) -> None:
@@ -269,14 +275,25 @@ def measure_once(args: argparse.Namespace, threads: int) -> dict[str, Any]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Замер модели распознавания (onnx-asr).")
-    ap.add_argument("--model-dir", required=True, help="каталог с файлами модели (offline-режим onnx-asr)")
+    ap.add_argument(
+        "--model-dir", required=True, help="каталог с файлами модели (offline-режим onnx-asr)"
+    )
     ap.add_argument("--model", required=True, help="имя модели onnx-asr, напр. gigaam-v3-e2e-rnnt")
     ap.add_argument("--wav", required=True, help="wav 16 кГц моно")
     ap.add_argument("--runs", type=int, default=10, help="число тёплых прогонов (по умолчанию 10)")
-    ap.add_argument("--threads", default="4", help="intra-op потоки ORT, список через запятую: 1,2,4")
+    ap.add_argument(
+        "--threads", default="4", help="intra-op потоки ORT, список через запятую: 1,2,4"
+    )
     ap.add_argument("--quantization", default="int8", help="int8 | None")
-    ap.add_argument("--cancel-after-ms", type=int, default=None, help="прервать инференс через N мс из другого потока")
-    ap.add_argument("--rlimit-as-mb", type=int, default=None, help="выставить RLIMIT_AS перед загрузкой (МиБ)")
+    ap.add_argument(
+        "--cancel-after-ms",
+        type=int,
+        default=None,
+        help="прервать инференс через N мс из другого потока",
+    )
+    ap.add_argument(
+        "--rlimit-as-mb", type=int, default=None, help="выставить RLIMIT_AS перед загрузкой (МиБ)"
+    )
     ap.add_argument("--json", default=None, help="записать JSON-результат в файл")
     ap.add_argument("--print-json", action="store_true", help="печатать JSON в stdout")
     ap.add_argument("--_single", action="store_true", help=argparse.SUPPRESS)
@@ -295,7 +312,13 @@ def main() -> int:
     if len(thread_list) > 1 and not args._single:
         results = []
         for t in thread_list:
-            cmd = [sys.executable, os.path.abspath(__file__), *sys.argv[1:], "--_single", "--print-json"]
+            cmd = [
+                sys.executable,
+                os.path.abspath(__file__),
+                *sys.argv[1:],
+                "--_single",
+                "--print-json",
+            ]
             # выкинуть прежний --threads (в форме `--threads V` и `--threads=V`)
             cleaned: list[str] = []
             skip = False

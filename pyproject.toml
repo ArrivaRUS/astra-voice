@@ -1,0 +1,51 @@
+[project]
+name = "astra-voice"
+# Версия здесь — только для инструментов (PEP 440). Версия пакета Debian —
+# «0.1.0~m1» (packaging/debian/changelog), рантайм-версия — astra_voice.core.version.
+version = "0.1.0"
+description = "Astra Voice — локальная голосовая диктовка для Astra Linux"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = ["spikes", "design"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+# PyQt5 виден как Any (стабы неполные), поэтому две проверки strict сняты:
+# наследование от QObject и декораторы pyqtProperty/pyqtSlot.
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
+files = ["src", "tests"]
+exclude = "(^spikes/|^design/)"
+
+# Стабы PyQt5 из python3-pyqt5 неполные (нет pyqtProperty, части enum-ов),
+# поэтому Qt и Xlib видны как Any.
+[[tool.mypy.overrides]]
+module = ["PyQt5.*", "Xlib.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+# Генерируется сборкой, в дереве разработки отсутствует.
+[[tool.mypy.overrides]]
+module = ["astra_voice._version"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+markers = [
+    "unit: быстрые модульные тесты, без дисплея и без сети",
+    "xvfb: требуют виртуального X-дисплея (xvfb-run)",
+    "engine: требуют модели распознавания",
+    "machine: ручной прогон на целевой машине",
+]

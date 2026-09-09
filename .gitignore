@@ -12,6 +12,8 @@ venv/
 dist/
 build/
 *.egg-info/
+.mypy_cache/
+src/astra_voice/_version.py
 # модели и тяжёлые артефакты — только манифесты
 models/
 *.onnx
