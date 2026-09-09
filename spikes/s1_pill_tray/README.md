@@ -206,7 +206,9 @@ $ dbus-run-session -- python3 -u tray.py --seconds 3
    настоящий KWin, EWMH обрабатывается по-честному. Минус: **не X11-сессия заказчика**, поэтому
    Alt+Tab, панель, struts и перекраска трея всё равно требуют живого прогона.
    Для CI (`pytest -m xvfb` в плане M1) `xvfb` придётся внести в build-зависимости.
-2. **`QIcon.fromTheme` подменяет имя иконки.** При системной теме `astra-proxima`
+2. **Имя иконки трея подменяется на звезду Astra Linux — ПОДТВЕРЖДЕНО ЖИВЬЁМ, см. раздел
+   «Живой прогон KDE».** Лечение: переименовать набор в `astravoice-tray-*`.
+   Исходная запись этапа 1: при системной теме `astra-proxima`
    `astra-voice-tray-idle` не находится и Qt срезает имя по дефисам до `astra` — берётся
    звезда Astra Linux, а `icon.name()` становится `'astra'`. Через SNI Plasma получит
    `IconName=astra` и нарисует чужой знак. `QIcon.setThemeName("hicolor")` чинит (`--force-hicolor`),
@@ -240,3 +242,139 @@ $ dbus-run-session -- python3 -u tray.py --seconds 3
    Без них CI-гейт «скриншоты состояний под Xvfb» из M1/M4 не собрать.
 2. Как чиним подмену имени иконки (находка 2): своя тема иконок или иконка файлом?
 3. Кто рисует `astra-voice-tray-nokey.svg` (находка 6) и когда.
+
+---
+
+# Живой прогон KDE (этап 2) — 2026-09-09
+
+Разрешение на показ на реальном дисплее передал Юрка со слов заказчика (чат 2026-09-09).
+Сессия: KDE Plasma 5.27, X11, `DISPLAY=:0`, экран 1920×1200, панель Plasma 52 px снизу.
+Суммарное время показа — около 32 с (пилюля 14 с, трей 12 с + 6 с повтор для свойств SNI).
+Клавиатуру не трогал, микрофон не открывал, диалогов не открывал, активное окно не менял.
+Всё закрылось по таймеру, процессов не осталось.
+
+## Пилюля — вывод дословно (`out/live_kde_pill.log`)
+
+```
+$ xdpyinfo | grep dimensions
+  dimensions:    1920x1200 pixels (508x317 millimeters)
+$ xprop -root _NET_WORKAREA
+_NET_WORKAREA(CARDINAL) = 0, 0, 1920, 1148
+$ xprop -id 0x6c00036 _NET_WM_STRUT_PARTIAL          # панель Plasma
+_NET_WM_STRUT_PARTIAL(CARDINAL) = 0, 0, 0, 52, 0, 0, 0, 0, 0, 0, 0, 1919
+$ xdotool getwindowgeometry 0x6c00036
+  Position: 0,1148 (screen: 0)      Geometry: 1920x52
+
+$ xdotool getactivewindow  (ДО показа)       →  46137348 (0x2c00004)  "Claude"
+$ xdotool getactivewindow  (пилюля показана) →  46137348 (0x2c00004)
+PASS: активное окно НЕ изменилось
+
+$ xprop -id 0x7200006 _NET_WM_STATE _NET_WM_WINDOW_TYPE _NET_WM_USER_TIME WM_CLASS
+_NET_WM_STATE(ATOM) = _NET_WM_STATE_ABOVE, _NET_WM_STATE_STAYS_ON_TOP, _NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER
+_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_NOTIFICATION
+_NET_WM_USER_TIME(CARDINAL) = 0
+WM_CLASS(STRING) = "pill.py", "astra-voice"
+
+$ xdotool getwindowgeometry 0x7200006
+  Position: 844,1040 (screen: 0)    Geometry: 231x84
+
+$ xprop -root _NET_CLIENT_LIST_STACKING | tr ',' '\n' | tail -4
+ 0x2c00004        # окно заказчика
+ 0x6c00036        # панель Plasma
+ 0x6c00bd8
+ 0x7200006        # ПИЛЮЛЯ — самая верхняя, в том числе над панелью
+
+CPU пилюли (4 состояния по кругу, 30 кадр/с): ticks=13 за 8 с → 1.00 % одного ядра
+
+[pill] первый кадр: 46.0 мс (spec §8.4 — показ ≤ 100 мс)
+[pill] availableGeometry: (0, 0, 1920, 1148)
+[pill] _NET_WORKAREA:     (0, 0, 1920, 1148)
+[pill] Р7: совпадает
+[pill] видимый низ пилюли: 1100        [pill] низ рабочей области: 1148
+```
+
+**Р7 закрыт:** `QScreen.availableGeometry` = `_NET_WORKAREA` = `0,0,1920,1148`, панель 52 px
+учтена обоими источниками; расхождения нет. Низ пилюли 1100 при верхе панели 1148 —
+ровно **48 px над панелью**, как требует spec §8.4 У10.
+
+## Трей — вывод дословно (`out/live_kde_tray.log`)
+
+```
+$ qdbus org.kde.StatusNotifierWatcher /StatusNotifierWatcher RegisteredStatusNotifierItems | tail -2
+:1.2658/StatusNotifierItem
+org.kde.StatusNotifierItem-300113-2/StatusNotifierItem          # наш элемент зарегистрирован
+
+$ busctl --user get-property org.kde.StatusNotifierItem-300495-2 /StatusNotifierItem org.kde.StatusNotifierItem <p>
+  Id       = s "Astra Voice"
+  Title    = s "Astra Voice"
+  Category = s "ApplicationStatus"
+  Status   = s "Active"
+  IconName = s "astra-voice-tray-listening"      # через 2 с → s "astra-voice-tray-done"
+  Menu     = o "/MenuBar"                        # DBusMenu отдан Plasma
+
+$ xdotool getactivewindow (ДО/ПОСЛЕ) → 46137348 / 46137348    PASS
+[tray] isSystemTrayAvailable() = True
+[tray] все 6 имён разрешились в OK (с --force-hicolor)
+```
+
+## Иконка трея: причина подмены найдена и воспроизведена
+
+Своё имя мы отдаём правильное, но **имя разрешает Plasma в своём процессе**, и там срабатывает
+та же ловушка generic-fallback. Проверено штатным резолвером KDE (`kiconfinder5`, KIconLoader —
+именно он рисует SNI-иконки):
+
+```
+$ kiconfinder5 astra-voice-tray-idle
+/usr/share/icons/fly-astra-flat/32x32/emblems/astra.png        # ЗВЕЗДА Astra Linux, не наш знак
+$ kiconfinder5 astra-voice-tray-listening
+/usr/share/icons/fly-astra-flat/32x32/emblems/astra.png
+
+# тот же файл, то же место, имя без коллизии:
+$ cp …/astra-voice-tray-idle.svg …/zzavtest.svg && kiconfinder5 zzavtest
+/home/astra/.local/share/icons/hicolor/22x22/status/zzavtest.svg          # НАХОДИТСЯ
+$ cp …/astra-voice-tray-idle.svg …/astravoice-tray-idle.svg && kiconfinder5 astravoice-tray-idle
+/home/astra/.local/share/icons/hicolor/22x22/status/astravoice-tray-idle.svg   # НАХОДИТСЯ
+$ kiconfinder5 astra          → /usr/share/icons/fly-astra-flat/32x32/emblems/astra.png
+$ kiconfinder5 astravoice     → (пусто)
+```
+
+Отвергнутые гипотезы: путь и каталог (`zzavtest` в том же каталоге находится), SVG-формат
+(тот же файл), устаревший `~/.local/share/icons/hicolor/icon-theme.cache` от 21.05 и
+`~/.cache/icon-cache.kcache` (удалял — не помогло), отсутствие варианта `scalable/status`
+(добавлял — не помогло).
+
+**Причина:** имя `astra-voice-tray-idle` срезается по дефисам до `astra`, а иконка `astra`
+есть в активной теме (`fly-astra-flat`) — тема выигрывает у запасной `hicolor`.
+
+**Готовое лечение (проверено):** переименовать набор `astra-voice-tray-*` → `astravoice-tray-*`
+(любой префикс, чьи обрезки не существуют в темах Астры). Тогда обход `--force-hicolor`
+в коде не нужен вовсе, и Plasma найдёт наш знак сама.
+Затрагивает `design/brand/icons/hicolor/*/status/*.svg`, `ui/tray_icons.py`, `packaging/`.
+
+## Чеклист S1 — KDE (живой)
+
+| # | Критерий | Вердикт |
+|---|---|---|
+| 1 | `xdotool getactivewindow` не меняется | **PASS** — `0x2c00004` до и после, и для пилюли, и для трея |
+| 2 | `xprop`: `ABOVE`, `SKIP_TASKBAR`, `SKIP_PAGER` | **PASS** (+ `STAYS_ON_TOP` от Qt) |
+| 3 | Тип `_NET_WM_WINDOW_TYPE_NOTIFICATION` | **PASS** |
+| 4 | `_NET_WM_USER_TIME = 0` | **PASS** |
+| 5 | Нет в Alt+Tab | **PASS косвенно** — `SKIP_TASKBAR` стоит; клавиатуру заказчика не трогал |
+| 6 | Показ ≤ 100 мс | **PASS** — 46 мс до первого кадра |
+| 7 | Над панелью не лежит; Р7 `availableGeometry` ↔ struts | **PASS** — оба дают `0,0,1920,1148`, расхождения нет |
+| 8 | Ширина 172…320, без ellipsis | **PASS** — 183 px («Слушаю») |
+| 9 | 48 px от нижнего края рабочей области | **PASS** — низ пилюли 1100, панель с 1148 |
+| 10 | Пилюля выше панели в стеке | **PASS** — `_NET_CLIENT_LIST_STACKING` заканчивается пилюлей |
+| 11 | Трей: элемент зарегистрирован, 6 состояний, `IconName` меняется | **PASS** по шине |
+| 12 | Трей: меню §9.2 отдано оболочке | **PASS** — `Menu = /MenuBar` |
+| 13 | Трей: Plasma рисует НАШ знак и перекрашивает под панель | **FAIL** — KIconLoader отдаёт звезду Astra Linux (см. выше); лечение известно |
+| 14 | CPU пилюли ≤ 3 % | **PASS** — 1,0 % одного ядра |
+
+## Что не удалось
+
+- **Скриншоты реального экрана заказчика** (`import -window root -crop` пилюли и трея)
+  заблокированы политикой безопасности среды — снимков живого прогона нет. Визуальную сверку
+  «как это выглядит на панели и над панелью» придётся делать либо человеку глазами,
+  либо с отдельного разрешения на захват экрана.
+- Пункт 13 из-за этого закрыт не картинкой, а инструментально (`kiconfinder5`) — вердикт FAIL
+  опирается на штатный резолвер KDE, но своими глазами панель никто не видел.

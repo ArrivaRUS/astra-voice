@@ -1,0 +1,76 @@
+### Живой прогон KDE — трей  (2026-09-09T11:03:16+03:00)
+$ xdotool getactivewindow (ДО) → 46137348 (0x2c00004)
+[1]+  Завершён        AV_ALLOW_DISPLAY=1 AV_ALLOW_SESSION_BUS=1 setsid python3 -u tray.py --force-hicolor --cycle-ms 1500 --seconds 12 > /tmp/av_lt.log 2>&1 < /dev/null
+tray pid=300113
+
+$ qdbus org.kde.StatusNotifierWatcher /StatusNotifierWatcher RegisteredStatusNotifierItems | tail -2
+:1.2658/StatusNotifierItem
+org.kde.StatusNotifierItem-300113-2/StatusNotifierItem
+
+$ qdbus org.kde.StatusNotifierItem-300113-1 /StatusNotifierItem <свойства>
+  Id = Cannot find 'org.freedesktop.DBus.Properties.Get' in object /StatusNotifierItem at org.kde.StatusNotifierItem-300113-1 
+  Title = Cannot find 'org.freedesktop.DBus.Properties.Get' in object /StatusNotifierItem at org.kde.StatusNotifierItem-300113-1 
+  Category = Cannot find 'org.freedesktop.DBus.Properties.Get' in object /StatusNotifierItem at org.kde.StatusNotifierItem-300113-1 
+  Status = Cannot find 'org.freedesktop.DBus.Properties.Get' in object /StatusNotifierItem at org.kde.StatusNotifierItem-300113-1 
+  IconName = Cannot find 'org.freedesktop.DBus.Properties.Get' in object /StatusNotifierItem at org.kde.StatusNotifierItem-300113-1 
+  ToolTip = Cannot find 'org.freedesktop.DBus.Properties.Get' in object /StatusNotifierItem at org.kde.StatusNotifierItem-300113-1 
+
+$ … через 3 с (другое состояние):
+  Status = Cannot find 'org.freedesktop.DBus.Properties.Get' in object /StatusNotifierItem at org.kde.StatusNotifierItem-300113-1 
+  IconName = Cannot find 'org.freedesktop.DBus.Properties.Get' in object /StatusNotifierItem at org.kde.StatusNotifierItem-300113-1 
+  ToolTip = Cannot find 'org.freedesktop.DBus.Properties.Get' in object /StatusNotifierItem at org.kde.StatusNotifierItem-300113-1 
+
+$ xdotool getactivewindow (ПОСЛЕ) → 46137348 (0x2c00004)
+PASS: активное окно не изменилось и при показе трея
+
+### лог трея
+[tray] системная тема иконок: astra-proxima
+[tray] themeName принудительно = hicolor (обход S1-ловушки)
+[tray] themeSearchPaths = ['/home/astra/.local/share/icons', '/home/astra/.local/share/icons', '/home/astra/.local/share/flatpak/exports/share/icons', '/usr/share/icons', ':/icons']
+[tray] isSystemTrayAvailable() = True
+[tray] idle                 icon=astra-voice-tray-idle          найдена=True разрешилось в OK
+[tray] listening            icon=astra-voice-tray-listening     найдена=True разрешилось в OK
+[tray] processing           icon=astra-voice-tray-processing    найдена=True разрешилось в OK
+[tray] done                 icon=astra-voice-tray-done          найдена=True разрешилось в OK
+[tray] error                icon=astra-voice-tray-error         найдена=True разрешилось в OK
+[tray] hotkey-not-grabbed   icon=astra-voice-tray-error         найдена=True разрешилось в OK
+[tray] меню (spec §9.2):
+  Готов                            enabled=False
+  ---
+  Отмена                           enabled=False
+  Модель: GigaAM v3 RNN-T          enabled=False
+  Скопировать последний текст      enabled=False
+  ---
+  Настройки…                       enabled=True  Ctrl+,
+  Проверить обновления             enabled=False
+  О программе                      enabled=True
+  ---
+  Выход                            enabled=True  Ctrl+Q
+[tray] state=idle tooltip='Astra Voice — готов · Ctrl+Space'
+[tray] tray.isVisible() = True
+[tray] state=listening tooltip='Слушаю…'
+[tray] state=processing tooltip='Распознаю…'
+[tray] state=done tooltip='Готово'
+[tray] state=error tooltip='Микрофон недоступен — открыть'
+[tray] state=hotkey-not-grabbed tooltip='Горячая клавиша не захвачена — выбрать другую'
+[tray] state=idle tooltip='Astra Voice — готов · Ctrl+Space'
+
+### Повтор: свойства SNI-элемента  (2026-09-09T11:03:47+03:00)
+[1]+  Завершён        AV_ALLOW_DISPLAY=1 AV_ALLOW_SESSION_BUS=1 setsid python3 -u tray.py --force-hicolor --cycle-ms 1200 --seconds 6 > /tmp/av_lt2.log 2>&1 < /dev/null
+$ SVC=$(qdbus org.kde.StatusNotifierWatcher /StatusNotifierWatcher RegisteredStatusNotifierItems | grep $TPID)  →  org.kde.StatusNotifierItem-300495-2
+$ busctl --user get-property org.kde.StatusNotifierItem-300495-2 /StatusNotifierItem org.kde.StatusNotifierItem Id
+s "Astra Voice"
+$ busctl --user get-property org.kde.StatusNotifierItem-300495-2 /StatusNotifierItem org.kde.StatusNotifierItem Title
+s "Astra Voice"
+$ busctl --user get-property org.kde.StatusNotifierItem-300495-2 /StatusNotifierItem org.kde.StatusNotifierItem Category
+s "ApplicationStatus"
+$ busctl --user get-property org.kde.StatusNotifierItem-300495-2 /StatusNotifierItem org.kde.StatusNotifierItem Status
+s "Active"
+$ busctl --user get-property org.kde.StatusNotifierItem-300495-2 /StatusNotifierItem org.kde.StatusNotifierItem IconName
+s "astra-voice-tray-listening"
+$ … через 2 с:
+  Status = s "Active"
+  IconName = s "astra-voice-tray-done"
+$ busctl --user get-property org.kde.StatusNotifierItem-300495-2 /StatusNotifierItem org.kde.StatusNotifierItem Menu
+o "/MenuBar"
+процессы после завершения: 0

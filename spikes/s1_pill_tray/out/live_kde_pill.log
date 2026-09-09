@@ -1,0 +1,51 @@
+### Живой прогон KDE — пилюля  (2026-09-09T11:01:21+03:00)
+$ xdpyinfo | grep dimensions
+  dimensions:    1920x1200 pixels (508x317 millimeters)
+$ xprop -root _NET_WORKAREA
+_NET_WORKAREA(CARDINAL) = 0, 0, 1920, 1148
+$ xprop -id 0x6c00036 _NET_WM_STRUT_PARTIAL  # панель Plasma
+_NET_WM_STRUT_PARTIAL(CARDINAL) = 0, 0, 0, 52, 0, 0, 0, 0, 0, 0, 0, 1919
+$ xdotool getwindowgeometry 0x6c00036
+Window 113246262
+  Position: 0,1148 (screen: 0)
+  Geometry: 1920x52
+$ xdotool getactivewindow  (ДО показа)  →  46137348 (0x2c00004)  "Claude"
+[1]+  Завершён        AV_ALLOW_DISPLAY=1 setsid python3 -u pill.py --cycle --cycle-ms 2500 --seconds 14 > /tmp/av_live_pill.log 2>&1 < /dev/null
+$ xdotool getactivewindow  (пилюля показана)  →  46137348 (0x2c00004)
+PASS: активное окно НЕ изменилось
+$ xdotool search --name astra-voice-pill  →  119537670 (0x7200006)
+$ xprop -id 119537670 _NET_WM_STATE _NET_WM_WINDOW_TYPE _NET_WM_USER_TIME WM_CLASS
+_NET_WM_STATE(ATOM) = _NET_WM_STATE_ABOVE, _NET_WM_STATE_STAYS_ON_TOP, _NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER
+_NET_WM_WINDOW_TYPE(ATOM) = _NET_WM_WINDOW_TYPE_NOTIFICATION
+_NET_WM_USER_TIME(CARDINAL) = 0
+WM_CLASS(STRING) = "pill.py", "astra-voice"
+$ xdotool getwindowgeometry 119537670
+Window 119537670
+  Position: 844,1040 (screen: 0)
+  Geometry: 231x84
+$ xprop -root _NET_CLIENT_LIST_STACKING | tr ',' '\n' | tail -4
+ 0x2c00004
+ 0x6c00036
+ 0x6c00bd8
+ 0x7200006
+CPU пилюли (4 состояния по кругу, 30 кадр/с): ticks=13 за 8 с → 1.00 % одного ядра
+awk: cmd. line:1: /VmRSS/{print $2\" \"$3}
+awk: cmd. line:1:                 ^ backslash not last character on line
+VmRSS: 
+
+### Отчёт самой пилюли
+[pill] python3-pyqt5.qtquick не установлен → бэкенд widget (plan-claude §12; deb поставит зависимость в M1)
+[pill] backend=widget  winId=0x7200006  state=listening
+[pill] окно: 844,1040 231x84  поле под тень=24
+[pill] первый кадр: 46.0 мс (spec §8.4 — показ ≤ 100 мс)
+[pill] active_window: 0x2c00004
+[pill] screen_source: экран активного окна
+[pill] availableGeometry: (0, 0, 1920, 1148)
+[pill] _NET_WORKAREA: (0, 0, 1920, 1148)
+[pill] Р7: совпадает
+[pill] позиция окна: (844, 1040, 231, 84)
+[pill] видимый низ пилюли: 1100
+[pill] низ рабочей области: 1148
+[pill] _NET_WM_WINDOW_TYPE: ['_NET_WM_WINDOW_TYPE_NOTIFICATION']
+[pill] _NET_WM_STATE: ['_NET_WM_STATE_ABOVE', '_NET_WM_STATE_STAYS_ON_TOP', '_NET_WM_STATE_SKIP_TASKBAR', '_NET_WM_STATE_SKIP_PAGER']
+[pill] _NET_WM_USER_TIME: [0]
