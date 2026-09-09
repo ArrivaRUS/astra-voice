@@ -1,0 +1,33 @@
+OpenGL vendor string:                   Intel
+OpenGL renderer string:                 Mesa Intel(R) Graphics (ARL)
+OpenGL version string:                  4.6 (Core Profile) Mesa 24.2.8-1.astra1+b10
+OpenGL shading language version string: 4.60
+Driver:                                 Intel
+GPU class:                              Unknown
+OpenGL version:                         4.6
+GLSL version:                           4.60
+Mesa version:                           24.2.8
+Linux kernel version:                   6.12.60
+Requires strict binding:                no
+GLSL shaders:                           yes
+Texture NPOT support:                   yes
+Virtual Machine:                        no
+XPARSEC: parsec disabled in the system, no XPARSEC extension
+linux_dmabuf_feedback.main_device: Failed to fetch DRM device
+linux_dmabuf_feedback.tranche_target_device: Failed to fetch DRM device
+linux_dmabuf_feedback.tranche_target_device: Failed to fetch DRM device
+The XKEYBOARD keymap compiler (xkbcomp) reports:
+> Warning:          Unsupported maximum keycode 708, clipping.
+>                   X11 cannot support keycodes above 255.
+> Warning:          Could not resolve keysym XF86KbdInputAssistPrevgrou
+> Warning:          Could not resolve keysym XF86KbdInputAssistNextgrou
+Errors from xkbcomp are not fatal to the X server
+linux_dmabuf_feedback.main_device: Failed to fetch DRM device
+linux_dmabuf_feedback.tranche_target_device: Failed to fetch DRM device
+linux_dmabuf_feedback.tranche_target_device: Failed to fetch DRM device
+linux_dmabuf_feedback.main_device: Failed to fetch DRM device
+linux_dmabuf_feedback.tranche_target_device: Failed to fetch DRM device
+linux_dmabuf_feedback.tranche_target_device: Failed to fetch DRM device
+linux_dmabuf_feedback.main_device: Failed to fetch DRM device
+linux_dmabuf_feedback.tranche_target_device: Failed to fetch DRM device
+linux_dmabuf_feedback.tranche_target_device: Failed to fetch DRM device

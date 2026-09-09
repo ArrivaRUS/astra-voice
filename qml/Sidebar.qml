@@ -2,6 +2,7 @@
 // Шесть разделов в фиксированном порядке; «Отладка» внизу через распорку — только по флагу.
 import QtQuick 2.15
 import QtQuick.Layouts 1.15
+import "."
 import "components"
 
 FocusScope {
@@ -57,6 +58,8 @@ FocusScope {
                 BrandMark {
                     size: Theme.sidebarLogoMarkW
                     color: Theme.fg
+                    // Цвет несёт только третья точка (brand §2.4): в логотипе она акцентная.
+                    accentColor: Theme.accent
                     Layout.alignment: Qt.AlignVCenter
                 }
 

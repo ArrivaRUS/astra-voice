@@ -16,9 +16,42 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-__all__ = ["ThemeSource", "KdeThemeSource", "FlyThemeSource", "read_ini", "parse_color", "luma"]
+from astra_voice.core import paths
+
+__all__ = [
+    "ThemeSource",
+    "KdeThemeSource",
+    "FlyThemeSource",
+    "kde_config_path",
+    "fly_palette_path",
+    "read_ini",
+    "parse_color",
+    "luma",
+]
 
 _COMMENT = ("#", ";")
+
+# Имена файлов конфигурации сессии; каталоги считаются на каждый вызов, а не на импорте:
+# XDG_CONFIG_HOME и HOME могут отличаться у сервиса, из-под которого нас запустят.
+KDE_CONFIG_NAME = "kdeglobals"
+FLY_PALETTE_NAME = "paletterc"
+
+
+def kde_config_path() -> Path:
+    """`$XDG_CONFIG_HOME/kdeglobals`, по умолчанию `~/.config/kdeglobals`.
+
+    Каталог считаем тем же разбором XDG, что и `core.paths`, но берём РОДИТЕЛЯ нашего
+    `config_dir()`: `kdeglobals` — чужой файл пользователя, каталог под него создавать
+    и переставлять ему права нельзя (`config_dir()` делает и то, и другое).
+    TODO(M1-A): когда в `core.paths` появится публичная `config_home()`, перейти на неё —
+    сейчас переиспользуем приватный разбор, чтобы правило XDG было одно на проект.
+    """
+    return paths._xdg("XDG_CONFIG_HOME", Path.home() / ".config").parent / KDE_CONFIG_NAME
+
+
+def fly_palette_path() -> Path:
+    """`~/.fly/paletterc`. XDG к Fly не применяется — путь задан жёстко самой средой."""
+    return Path.home() / ".fly" / FLY_PALETTE_NAME
 
 
 def read_ini(path: Path) -> dict[str, dict[str, str]]:
@@ -216,17 +249,15 @@ class _FileThemeSource(ThemeSource):
 
 
 class KdeThemeSource(_FileThemeSource):
-    """KDE / Plasma: `~/.config/kdeglobals`.
+    """KDE / Plasma: `$XDG_CONFIG_HOME/kdeglobals` (по умолчанию `~/.config/kdeglobals`).
 
     Тёмность — сперва по имени схемы (`[General] ColorScheme`), затем по яркости фона
     окна (`[Colors:Window] BackgroundNormal`); нет данных — светлая.
     Акцент — `[General] AccentColor`, запасной — фон выделения `[Colors:Selection]`.
     """
 
-    DEFAULT_PATH = Path.home() / ".config" / "kdeglobals"
-
     def __init__(self, path: Path | str | None = None) -> None:
-        super().__init__(Path(path) if path is not None else self.DEFAULT_PATH)
+        super().__init__(Path(path) if path is not None else kde_config_path())
 
     def _read(self) -> tuple[bool, str | None, str | None, str | None]:
         ini = read_ini(self._path)
@@ -259,10 +290,8 @@ class FlyThemeSource(_FileThemeSource):
     без акцента, чтобы окно во Fly не оказалось тёмным по ошибке.
     """
 
-    DEFAULT_PATH = Path.home() / ".fly" / "paletterc"
-
     def __init__(self, path: Path | str | None = None) -> None:
-        super().__init__(Path(path) if path is not None else self.DEFAULT_PATH)
+        super().__init__(Path(path) if path is not None else fly_palette_path())
 
     def _read(self) -> tuple[bool, str | None, str | None, str | None]:
         # TODO(M9): разобрать [Variables] ColorScheme / BackgroundColor и слежение за темой Fly.

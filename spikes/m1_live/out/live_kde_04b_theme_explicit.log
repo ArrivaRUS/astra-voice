@@ -1,0 +1,5 @@
+# шаг 4б: светлая ветка через явный путь (XDG_CONFIG_HOME код игнорирует)
+  сигнатура: (self, path: 'Path | str | None' = None) -> 'None'
+  DEFAULT_PATH: /home/astra/.config/kdeglobals
+  dark : dark=True window_bg=#262626 text=#F7F7F7
+  light: dark=False window_bg=#F7F7F7 text=#1A1A1A

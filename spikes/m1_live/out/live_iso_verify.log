@@ -1,0 +1,68 @@
+# изолированная проверка M1-A
+дата: 2026-09-09T17:09:24+03:00
+DISPLAY=:1 (свой Xwayland), XDG_RUNTIME_DIR=/home/astra/Документы/astra-voice/spikes/m1_live/out/iso-home/run
+песочница: тёмная схема AstraDark, светлая AstraLight
+
+== запуск из репозитория (тёмная схема в песочнице) ==
+WID=4194326 PID=177831
+
+== дефект 8: WM_CLASS instance ==
+  WM_CLASS = "astra-voice", "astra-voice"
+  PASS  instance = astra-voice: "astra-voice", "astra-voice"
+  PASS  находится по --classname: 4194326
+
+== дефект 5: settings.json при первом старте ==
+  PASS  файл создан: да
+  PASS  права: 600
+  ключи: autostart,check_app_updates,check_model_updates,hotkey,hotkey_mode,language,model_id,pill_enabled,schema_version
+
+== дефект 1: тема сессии в окне (тёмная) ==
+  средняя яркость центра: 31 (0=чёрное, 255=белое)
+  журнал: тема сессии: dark=True accent=#2FB3FA
+  PASS  окно тёмное (яркость < 100): да
+
+== дефект 3: show разворачивает свёрнутое окно ==
+  PASS  окно свёрнуто: Iconic
+  второй экземпляр: код=0, время=.202864800 с
+  _NET_WM_USER_TIME = 11258564
+  _NET_WM_STATE = _NET_WM_STATE_FOCUSED
+  PASS  код второго экземпляра: 0
+  PASS  окно вернулось из Iconic: Normal
+  PASS  окно активно: 4194326
+  PASS  процессов ровно один: 1
+
+== дефект 2: закрытие окна завершает процесс ==
+  WM_PROTOCOLS: protocols  WM_DELETE_WINDOW, WM_TAKE_FOCUS, _NET_WM_PING, _NET_WM_SYNC_REQUEST
+  WM_PROTOCOLS: WM_DELETE_WINDOW, WM_TAKE_FOCUS, _NET_WM_PING, _NET_WM_SYNC_REQUEST
+  _NET_CLOSE_WINDOW отправлен окну 0x400016
+  окон осталось: 0
+  журнал: 2026-09-09 17:09:28,848 INFO    [KDE] astra_voice.app: окно закрыто — завершаю процесс (CLOSE_TO_TRAY=False)
+  PASS  процесс завершился: 0
+  PASS  lock убран: нет
+  PASS  ipc убран: нет
+
+== дефект 1 (обратная сторона): светлая схема → светлое окно ==
+  средняя яркость центра: 249
+  журнал: тема сессии: dark=False accent=#2FB3FA
+  PASS  окно светлое (яркость > 150): да
+
+== уборка по SIGTERM (тот же finally) ==
+  PASS  процесс завершился по SIGTERM: 0
+  PASS  lock убран после SIGTERM: нет
+  PASS  ipc убран после SIGTERM: нет
+
+== stderr приложения (должен быть пуст) ==
+  тёмный запуск: []
+  светлый запуск: []
+
+ИТОГ: PASS=17 FAIL=0
+
+== журнал приложения ==
+2026-09-09 17:09:24,468 INFO    [KDE] astra_voice.app: старт: версия=0.1.0~m1 сеанс=KDE политика=absent
+2026-09-09 17:09:24,471 INFO    [KDE] astra_voice.app: создан /home/astra/Документы/astra-voice/spikes/m1_live/out/iso-home/config/astra-voice/settings.json со значениями по умолчанию
+2026-09-09 17:09:24,585 INFO    [KDE] astra_voice.app: тема сессии: dark=True accent=#2FB3FA
+2026-09-09 17:09:27,255 INFO    [KDE] astra_voice.app: получена команда show (метка времени X: 11258558)
+2026-09-09 17:09:28,848 INFO    [KDE] astra_voice.app: окно закрыто — завершаю процесс (CLOSE_TO_TRAY=False)
+2026-09-09 17:09:29,270 INFO    [KDE] astra_voice.app: старт: версия=0.1.0~m1 сеанс=KDE политика=absent
+2026-09-09 17:09:29,411 INFO    [KDE] astra_voice.app: тема сессии: dark=False accent=#2FB3FA
+2026-09-09 17:09:30,892 INFO    [KDE] astra_voice.app: получен сигнал SIGTERM, завершаюсь

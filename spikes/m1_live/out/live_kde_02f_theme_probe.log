@@ -1,0 +1,8 @@
+модуль: /usr/lib/astra-voice/astra_voice/core/theme.py
+экспорт: ['FlyThemeSource', 'KdeThemeSource', 'ThemeSource', '_FileThemeSource']
+источник: KdeThemeSource
+dark   = True
+accent = #2FB3FA
+window_bg = #262626
+text   = #F7F7F7
+scheme_is_dark(AstraDark) = True

@@ -93,21 +93,23 @@ Column {
         SettingRow {
             width: parent.width
             label: qsTr("Значок в системном трее")
-            sub: qsTr("Запись всегда видна — это требование приватности (§9.5)")
+            sub: qsTr("Запись всегда видна — это требование приватности")
             rowEnabled: false
 
             Text {
                 text: qsTr("Выключить нельзя")
-                color: Theme.fgDisabled
+                // Подпись объясняет запрет и должна читаться: fg-muted, а не fg-disabled.
+                color: Theme.fgMuted
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSettingSubSize
                 renderType: Text.NativeRendering
                 Layout.alignment: Qt.AlignVCenter
             }
 
+            // Включён и заблокирован: положение читается цветом primary, запрет — подписью.
             AvToggle {
                 checked: true
-                enabled: false
+                locked: true
                 Layout.alignment: Qt.AlignVCenter
             }
         }

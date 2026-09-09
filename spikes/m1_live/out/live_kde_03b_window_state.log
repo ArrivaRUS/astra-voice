@@ -1,0 +1,8 @@
+# шаг 3б: состояние окна после команды show
+  WM_STATE(WM_STATE):
+  		window state: Iconic
+  		icon window: 0x0
+  _NET_WM_STATE(ATOM) = _NET_WM_STATE_HIDDEN, _NET_WM_STATE_DEMANDS_ATTENTION
+  видимость (xwininfo Map State):   Map State: IsUnMapped
+  активное окно: 83886084
+  имя активного: Claude

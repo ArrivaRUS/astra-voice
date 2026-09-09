@@ -1,0 +1,26 @@
+# шаг 2: диагностика темы
+ColorScheme в kdeglobals: AstraDark
+
+--- секции Colors:* в ~/.config/kdeglobals ---
+26:[Colors:Button]
+40:[Colors:Complementary]
+54:[Colors:Header]
+68:[Colors:Header][Inactive]
+82:[Colors:Selection]
+96:[Colors:Tooltip]
+110:[Colors:View]
+124:[Colors:Window]
+
+--- [Colors:Window] ---
+BackgroundAlternate=#404040
+BackgroundNormal=#262626
+DecorationFocus=#2FB3FA
+DecorationHover=#2FB3FA
+ForegroundActive=#2FB3FA
+ForegroundInactive=#B3B3B3
+
+--- [General] ---
+BrowserApplication=yandex-browser.desktop
+ColorScheme=AstraDark
+ColorSchemeHash=0c941dc42003ab6d965e2d412837789d183c66f2
+

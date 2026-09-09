@@ -1,0 +1,10 @@
+# шаг 5б: перезапуск поверх устаревших lock/ipc + закрытие через _NET_CLOSE_WINDOW
+устаревшие файлы до старта: [ipc lock ]
+стартовал поверх устаревших: WID=94371862 PID=153568 (восстановление PASS)
+stderr: []
+
+закрываю через _NET_CLOSE_WINDOW (xdotool windowclose)
+  окно закрыто, процесс ЖИВ (quitOnLastWindowClosed не сработал?)
+процессов: 0
+runtime после штатного закрытия: [ipc lock ]
+settings.json: НЕ СОЗДАН

@@ -1,0 +1,91 @@
+# снимок состояния ДО
+дата: 2026-09-09T16:40:28+03:00
+ColorScheme: AstraDark
+LookAndFeel: org.kde.breezedark.desktop
+процессов astra-voice: 3
+runtime-каталог:
+  ls: невозможно получить доступ к '/run/user/1000z0_0_0x0_0x0/astra-voice': Нет такого файла или каталога
+config-каталог:
+  итого 20
+  drwx------  2 astra astra  4096 сен  9 16:13 .
+  drwxr-xr-x 54 astra astra 16384 сен  9 16:36 ..
+строк в журнале: 2
+схемы в /usr/share/color-schemes:
+  additional
+  AstraDark-active.css
+  AstraDark.colors
+  AstraDark-default.css
+  AstraDark-disabled.css
+  AstraDark-last.css
+  AstraDark-selected.css
+  AstraLight-active.css
+  AstraLight.colors
+  AstraLight-default.css
+  AstraLight-disabled.css
+  AstraLight-last.css
+  AstraLight-selected.css
+  AstraProximaAdmin-active.css
+  AstraProximaAdmin.colors
+  AstraProximaAdmin-default.css
+  AstraProximaAdmin-disabled.css
+  AstraProximaAdmin-last.css
+  AstraProximaAdmin-selected.css
+  AstraProximaDark-active.css
+  AstraProximaDark-default.css
+  AstraProximaDark-disabled.css
+  AstraProximaDark-last.css
+  AstraProximaDark-selected.css
+  AstraProximaLight-active.css
+  AstraProximaLight-default.css
+  AstraProximaLight-disabled.css
+  AstraProximaLight-last.css
+  AstraProximaLight-selected.css
+  BreezeClassic.colors
+  BreezeDark.colors
+  BreezeLight.colors
+  DarkblueDeb-active.css
+  DarkblueDeb.colors
+  DarkblueDeb-default.css
+  DarkblueDeb-disabled.css
+  DarkblueDeb-last.css
+  DarkblueDeb-selected.css
+  FinalDestination-active.css
+  FinalDestination.colors
+  FinalDestination-default.css
+  FinalDestination-disabled.css
+  FinalDestination-last.css
+  FinalDestination-selected.css
+  FluffyBunnyColors-active.css
+  FluffyBunnyColors.colors
+  FluffyBunnyColors-default.css
+  FluffyBunnyColors-disabled.css
+  FluffyBunnyColors-last.css
+  FluffyBunnyColors-selected.css
+  FlyDefault-active.css
+  FlyDefault.colors
+  FlyDefault-default.css
+  FlyDefault-disabled.css
+  FlyDefault-last.css
+  FlyDefault-selected.css
+  OxygenCold.colors
+  Oxygen.colors
+  Smoothoctans-active.css
+  Smoothoctans.colors
+  Smoothoctans-default.css
+  Smoothoctans-disabled.css
+  Smoothoctans-last.css
+  Smoothoctans-selected.css
+  WontonSoup1-active.css
+  WontonSoup1.colors
+  WontonSoup1-default.css
+  WontonSoup1-disabled.css
+  WontonSoup1-last.css
+  WontonSoup1-selected.css
+  ZionReversed1-active.css
+  ZionReversed1.colors
+  ZionReversed1-default.css
+  ZionReversed1-disabled.css
+  ZionReversed1-last.css
+  ZionReversed1-selected.css
+схемы в ~/.local/share/color-schemes:
+  User.colors

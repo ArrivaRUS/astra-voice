@@ -26,7 +26,14 @@ Item {
     readonly property color labelColor: rowEnabled ? Theme.fg : Theme.fgDisabled
     readonly property color subColor: rowEnabled ? Theme.fgMuted : Theme.fgDisabled
 
-    implicitHeight: Math.max(Theme.cardRowMinH, line.implicitHeight + Theme.cardRowPaddingY * 2)
+    // Высота — по содержимому в паддингах 7/14 (§3.2): с пояснением `card.row-h-with-sub`,
+    // без пояснения не меньше `card.row-min-h`, со списком — по высоте контрола.
+    // Округляем до целого: грани 1 px не должны попадать на субпиксель.
+    implicitHeight: Math.ceil(Math.max(
+        Theme.cardRowMinH,
+        line.implicitHeight + Theme.cardRowPaddingY * 2,
+        slot.implicitHeight + Theme.cardRowPaddingY * 2,
+        sub !== "" ? Theme.cardRowHWithSub : 0))
     height: implicitHeight
 
     Rectangle {
@@ -76,13 +83,14 @@ Item {
 
             Text {
                 Layout.fillWidth: true
+                verticalAlignment: Text.AlignVCenter
                 text: root.label
                 color: root.labelColor
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSettingLabelSize
                 // Межстрочный из токенов задан относительно РАЗМЕРА шрифта (как CSS),
                 // а ProportionalHeight в QML множит высоту строки шрифта — отсюда FixedHeight.
-                lineHeight: Theme.fontSettingLabelSize * Theme.fontSettingLabelLineHeight
+                lineHeight: Math.round(Theme.fontSettingLabelSize * Theme.fontSettingLabelLineHeight)
                 lineHeightMode: Text.FixedHeight
                 renderType: Text.NativeRendering
                 wrapMode: Text.WordWrap
@@ -95,7 +103,7 @@ Item {
                 color: root.subColor
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSettingSubSize
-                lineHeight: Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight
+                lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
                 lineHeightMode: Text.FixedHeight
                 renderType: Text.NativeRendering
                 wrapMode: Text.WordWrap

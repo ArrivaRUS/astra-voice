@@ -33,7 +33,11 @@ Rectangle {
         font.pixelSize: Theme.fontHotkeyKeySize
         font.letterSpacing: Theme.fontHotkeyKeyTracking * Theme.fontHotkeyKeySize
         renderType: Text.NativeRendering
+        verticalAlignment: Text.AlignVCenter
+        // Центрируем в ВИДИМОЙ части корпуса — над нижней гранью 2 px, иначе текст
+        // уезжает вверх (дефект живого прогона: центр глифов был на 1 px выше центра плашки).
         anchors.horizontalCenter: parent.horizontalCenter
-        y: Theme.hotkeyChipPaddingTop
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.verticalCenterOffset: -Theme.borderHotkeyKeyBottom / 2
     }
 }

@@ -1,0 +1,5 @@
+# шаг 4: определение темы под подставным kdeglobals (реальная схема НЕ менялась)
+--- XDG_CONFIG_HOME=/tmp/av-theme/dark (ColorScheme=AstraDark) ---
+  dark = True  window_bg = #262626  accent = #2FB3FA
+--- XDG_CONFIG_HOME=/tmp/av-theme/light (ColorScheme=AstraLight) ---
+  dark = True  window_bg = #262626  accent = #2FB3FA

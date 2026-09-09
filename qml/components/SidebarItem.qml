@@ -18,7 +18,8 @@ FocusScope {
     signal activated()
 
     // Длинный пункт («Сеть и обновления») переносится и растит строку.
-    implicitHeight: Math.max(Theme.sidebarItemH, label.implicitHeight + Theme.sidebarItemPaddingY * 2)
+    implicitHeight: Math.round(
+        Math.max(Theme.sidebarItemH, label.implicitHeight + Theme.sidebarItemPaddingY * 2))
     height: implicitHeight
     activeFocusOnTab: true
 
@@ -73,7 +74,12 @@ FocusScope {
             font.pixelSize: root.muted ? Theme.fontNavItemSubSize : Theme.fontNavItemSize
             font.weight: root.muted ? Font.Normal : Font.Medium
             renderType: Text.NativeRendering
+            verticalAlignment: Text.AlignVCenter
             wrapMode: Text.WordWrap
+            lineHeight: Math.round(
+                root.muted ? Theme.fontNavItemSubSize * Theme.fontNavItemSubLineHeight
+                           : Theme.fontNavItemSize * Theme.fontNavItemLineHeight)
+            lineHeightMode: Text.FixedHeight
         }
 
         Text {

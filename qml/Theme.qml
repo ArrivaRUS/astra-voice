@@ -1,4 +1,4 @@
-// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.1.2 — НЕ ПРАВИТЬ РУКАМИ.
+// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.1.4 — НЕ ПРАВИТЬ РУКАМИ.
 // Перегенерация: python3 scripts/gen_theme.py · проверка: python3 scripts/gen_theme.py --check
 
 pragma Singleton
@@ -91,6 +91,7 @@ QtObject {
     readonly property int fontChipWeight: 400
     readonly property real fontFieldSize: 13
     readonly property int fontFieldWeight: 400
+    readonly property real fontGroupCapsLineHeight: 1.5
     readonly property real fontGroupCapsSize: 11
     readonly property real fontGroupCapsTracking: 0.08
     readonly property int fontGroupCapsWeight: 500
@@ -125,8 +126,10 @@ QtObject {
     readonly property real fontMonoInlineTracking: 0.02
     readonly property real fontNavCounterSize: 11.5
     readonly property int fontNavCounterWeight: 400
+    readonly property real fontNavItemLineHeight: 1.5
     readonly property real fontNavItemSize: 13.5
     readonly property int fontNavItemWeight: 500
+    readonly property real fontNavItemSubLineHeight: 1.5
     readonly property real fontNavItemSubSize: 13
     readonly property int fontNavItemSubWeight: 400
     readonly property real fontNoteBannerLineHeight: 1.45
@@ -258,6 +261,7 @@ QtObject {
     readonly property real buttonSmPaddingX: 9
     readonly property real cardBorder: 1
     readonly property real cardRadius: 10
+    readonly property real cardRowHWithSub: 55
     readonly property real cardRowMinH: 38
     readonly property real cardRowPaddingY: 7
     readonly property real cardRowPaddingX: 14
@@ -426,13 +430,14 @@ QtObject {
     readonly property real titlebarGap: 8
     readonly property real titlebarH: 32
     readonly property real titlebarMarkW: 16
-    readonly property color toggleDisabledBg: border
     readonly property real toggleH: 21
     readonly property real toggleKnob: 17
     readonly property color toggleKnobBg: "#FFFFFF"
     readonly property real toggleKnobInset: 2
     readonly property real toggleKnobOnX: 19
-    readonly property color toggleLockedBg: border
+    readonly property color toggleLockedOffBg: border
+    readonly property color toggleLockedOnBg: primary
+    readonly property int toggleLockedOpacity: 1
     readonly property color toggleOffBg: fgFaint
     readonly property color toggleOnBg: primary
     readonly property real toggleRadius: 11

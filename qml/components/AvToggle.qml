@@ -1,5 +1,7 @@
 // Тумблер — design/spec.md §4.2. Габарит 38 × 21, ручка 17 белая, ход 120 мс.
-// disabled и «задано администратором» — фон `border`, НИКАКОЙ прозрачности (сквозное правило 2).
+// «Заблокирован» сохраняет своё положение цветом: включённый — `primary`, выключенный —
+// `border`. Приглушения прозрачностью нет (сквозное правило 2, `toggle.locked-opacity` = 1):
+// недоступность несут цвет подписи строки и текст рядом («Выключить нельзя»).
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import ".."
@@ -20,11 +22,10 @@ Switch {
         height: Theme.toggleH
         radius: Theme.toggleRadius
         antialiasing: true
+        opacity: control.locked ? Theme.toggleLockedOpacity : 1
         color: {
             if (control.locked)
-                return Theme.toggleLockedBg;
-            if (!control.enabled)
-                return Theme.toggleDisabledBg;
+                return control.checked ? Theme.toggleLockedOnBg : Theme.toggleLockedOffBg;
             return control.checked ? Theme.toggleOnBg : Theme.toggleOffBg;
         }
 

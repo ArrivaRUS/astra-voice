@@ -15,6 +15,8 @@ from astra_voice.core.theme import (
     FlyThemeSource,
     KdeThemeSource,
     ThemeSource,
+    fly_palette_path,
+    kde_config_path,
     luma,
     parse_color,
     read_ini,
@@ -144,6 +146,48 @@ def test_kde_dark_by_background_luma(tmp_path: Path) -> None:
     """Имя схемы ничего не говорит — решает яркость фона окна."""
     source = KdeThemeSource(write(tmp_path, NAMELESS_DARK))
     assert source.dark is True
+
+
+def test_kde_config_path_follows_xdg_config_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Живой прогон M1: путь к kdeglobals обязан слушать XDG_CONFIG_HOME, а не только HOME."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert kde_config_path() == tmp_path / "kdeglobals"
+
+
+def test_kde_config_path_defaults_to_home_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Переменной нет или она относительная — работает ~/.config (правило XDG)."""
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    assert kde_config_path() == Path.home() / ".config" / "kdeglobals"
+    monkeypatch.setenv("XDG_CONFIG_HOME", "относительный/путь")
+    assert kde_config_path() == Path.home() / ".config" / "kdeglobals"
+
+
+def test_kde_config_path_does_not_create_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """kdeglobals — чужой файл: каталог под него не создаём и права не трогаем."""
+    base = tmp_path / "config"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(base))
+    kde_config_path()
+    assert not base.exists()
+
+
+def test_kde_source_without_path_uses_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Источник без явного пути читает файл из XDG_CONFIG_HOME."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    write(tmp_path, BREEZE_DARK)
+    source = KdeThemeSource()
+    assert source.path == tmp_path / "kdeglobals"
+    assert source.dark is True
+
+
+def test_fly_palette_path_ignores_xdg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fly держит палитру в ~/.fly вне XDG — переменная на путь влиять не должна."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/tmp/не-важно")
+    assert fly_palette_path() == Path.home() / ".fly" / "paletterc"
+    assert FlyThemeSource().path == fly_palette_path()
 
 
 def test_kde_missing_file_is_light(tmp_path: Path) -> None:

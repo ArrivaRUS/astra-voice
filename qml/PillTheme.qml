@@ -1,4 +1,4 @@
-// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.1.2 — НЕ ПРАВИТЬ РУКАМИ.
+// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.1.4 — НЕ ПРАВИТЬ РУКАМИ.
 // Перегенерация: python3 scripts/gen_theme.py · проверка: python3 scripts/gen_theme.py --check
 
 pragma Singleton

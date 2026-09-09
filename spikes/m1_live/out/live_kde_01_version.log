@@ -1,0 +1,8 @@
+# шаг 1: astra-voice --version
+дата: 2026-09-09T16:40:17+03:00
+$ astra-voice --version
+astra-voice 0.1.0~m1
+код возврата: 0
+
+$ dpkg-query -W -f='${Package} ${Version} ${Status}\n' astra-voice
+astra-voice 0.1.0~m1 install ok installed

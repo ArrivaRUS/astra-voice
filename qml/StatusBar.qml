@@ -76,7 +76,7 @@ Item {
         RowLayout {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            spacing: 0
+            spacing: Theme.statusbarGap
 
             Text {
                 text: root.updateText

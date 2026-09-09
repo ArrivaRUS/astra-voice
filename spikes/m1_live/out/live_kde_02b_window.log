@@ -1,0 +1,40 @@
+# шаг 2: окно, геометрия, свойства
+дата: 2026-09-09T16:41:32+03:00
+PID=148197 WID=113246230
+
+$ xdotool getwindowgeometry 113246230
+Window 113246230
+  Position: 510,292 (screen: 0)
+  Geometry: 900x588
+
+$ xwininfo -id 113246230 (клиентская область)
+  Absolute upper-left X:  510
+  Absolute upper-left Y:  292
+  Relative upper-left X:  0
+  Relative upper-left Y:  0
+  Width: 900
+  Height: 588
+  Corners:  +510+292  -510+292  -510-320  +510-320
+
+--- свойства окна ---
+$ xprop -id 113246230 WM_CLASS
+  WM_CLASS(STRING) = "bootstrap.py", "astra-voice"
+$ xprop -id 113246230 _NET_WM_NAME
+  _NET_WM_NAME(UTF8_STRING) = "Astra Voice"
+$ xprop -id 113246230 WM_NAME
+  WM_NAME(STRING) = "Astra Voice"
+$ xprop -id 113246230 _NET_WM_PID
+  _NET_WM_PID(CARDINAL) = 148197
+$ xprop -id 113246230 _NET_FRAME_EXTENTS
+  _NET_FRAME_EXTENTS(CARDINAL) = 4, 4, 28, 4
+$ xprop -id 113246230 _KDE_NET_WM_DESKTOP_FILE
+  _KDE_NET_WM_DESKTOP_FILE(UTF8_STRING) = "astra-voice"
+$ xprop -id 113246230 _NET_WM_ICON_NAME
+  _NET_WM_ICON_NAME:  not found.
+$ xprop -id 113246230 _GTK_APPLICATION_ID
+  _GTK_APPLICATION_ID(UTF8_STRING) = "astra-voice"
+$ xprop -id 113246230 WM_NORMAL_HINTS
+  WM_NORMAL_HINTS(WM_SIZE_HINTS):
+  		user specified size: 900 by 588
+  		program specified minimum size: 900 by 588
+  		window gravity: Static
