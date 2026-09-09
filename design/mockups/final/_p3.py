@@ -167,7 +167,7 @@ def onb4(theme):
             '<div class="sm" style="margin:4px 0 14px">Скажите любую фразу — мы покажем уровень и '
             'распознаем её прямо здесь. Никуда вставлять не будем.</div>'
             + card([row("Микрофон", sel("Системный по умолчанию", 236),
-                        "Встроенный микрофон (sof-hda-dsp)", hint=False)])
+                        "Встроенный микрофон", hint=False)])
             + f'<div class="lvbox" style="margin-top:12px">{level_bars("live")}'
               '<div style="flex:1"><div class="lbl">Слышим вас</div>'
               '<div class="sub">Пик −18 дБ · уровень в норме</div></div>'
@@ -210,7 +210,7 @@ def onb5(theme):
             'с системой.</div>'
             + card([
                 row("Запускать при входе в систему", tgl(True),
-                    "Создаст ярлык ~/.config/autostart/astra-voice.desktop. Выключить можно в «Общих»",
+                    "Программа будет запускаться сама при входе — выключить можно в «Общих»",
                     hint=False),
             ])
             + f'<div class="note o" style="margin-top:16px">{ic("check", 15, "var(--ok-ink)")}'
@@ -429,8 +429,8 @@ def dialogs(theme):
              '<div class="sm" style="margin-top:6px">Сбросятся: горячая клавиша, режим, микрофон, '
              'индикатор, способ вставки, продвинутые настройки. <b>Останутся</b>: установленные модели, '
              'статистика и выбор активной модели. Сетевые тумблеры вернутся в «выключено».</div>'
-             '<div class="c12" style="margin-top:8px">Текущий файл сохраним как '
-             '<span class="mono">settings.json.bak</span></div></div></div>'
+             '<div class="c12" style="margin-top:8px">Копию текущих настроек '
+             'сохраним</div></div></div>'
              f'<div class="df"><span class="sp"></span>{btn("Отмена")}{btn("Сбросить", "pri")}</div></div>')
     restart = ('<div class="dlg"><div class="dh">' + ic("power", 14, DD) + 'Перезапуск</div>'
                f'<div class="db">{ic("power", 22, "var(--primary)")}'
@@ -443,9 +443,9 @@ def dialogs(theme):
     corrupt = ('<div class="dlg"><div class="dh">' + ic("alert", 14, DD) + 'Настройки</div>'
                f'<div class="db">{ic("alert", 22, "var(--warn-ink)")}'
                '<div><div class="h3">Настройки не читались</div>'
-               '<div class="sm" style="margin-top:6px">Файл <span class="mono">settings.json</span> '
-               'повреждён. Мы сохранили копию как <span class="mono">settings.json.bak</span> и вернули '
-               'значения по умолчанию — проверьте горячую клавишу и микрофон.</div></div></div>'
+               '<div class="sm" style="margin-top:6px">Файл настроек повреждён. Мы сохранили '
+               'копию и вернули значения по умолчанию — проверьте горячую клавишу '
+               'и микрофон.</div></div></div>'
                f'<div class="df"><span class="sp"></span>{btn("Открыть папку", "", "folder")}'
                f'{btn("Понятно", "pri")}</div></div>')
     notray = ('<div class="dlg"><div class="dh">' + ic("info", 14, DD) + 'Системный трей</div>'
@@ -459,8 +459,8 @@ def dialogs(theme):
               '<div class="dh">' + ic("lock", 14, DD) + 'Требуется аутентификация — системное окно KDE</div>'
               f'<div class="db">{ic("shield", 22, DD)}'
               '<div><div class="h3">Установка пакета</div>'
-              '<div class="sm" style="margin-top:6px">Для установки <span class="mono">astra-voice_0.2.1_'
-              'amd64.deb</span> требуется пароль администратора.</div>'
+              '<div class="sm" style="margin-top:6px">Для установки обновления требуется пароль '
+              'администратора.</div>'
               '<div class="field" style="margin-top:10px">Пароль</div>'
               '<div class="c12" style="margin-top:8px">Рисуем схематично: это <b>окно KDE polkit</b>, '
               'не наше. Мы не оформляем его и не можем в него вмешаться — важно только, что оно '

@@ -173,9 +173,9 @@ R1 Python-декодер RNN-T — **снят S3** (~52 мс на 6 с) · R2 fl
 - [x] Документы-заготовки: `docs/PRIVACY.md` (четыре сетевых действия, хосты, apt → репозитории ОС), `NOTICE` скелет, README «установка требует прав администратора; пользовательская — в планах» (G4), `INSTALL-ADMIN.md` черновик.
 ### Definition of Done
 - `[~]` **Живой прогон на KDE заказчика 2026-09-09** (`spikes/m1_live/`, факты в `status.md`): `apt install` + `astra-voice --version` → `0.1.0~m1`, код 0 **PASS**; окно 900×588 клиентской = 908×620 внешней (рамка 4/4/28/4), `min 900×588`, заголовок «Astra Voice», QML-warnings 0 **PASS**; второй запуск код 0 за 0,15 с, «получена команда show», процессов 1 **PASS**; CI зелёный на всех jobs (run 34358041504) **PASS**.
-  - `[ ]` **окно в теме сессии — FAIL**: схема `AstraDark`, окно светлое; `themeSource` не подан в контекст QML (`app.py`), хотя `KdeThemeSource` определяет тему верно (M1-A, дефект 1).
+  - `[x]` **окно в теме сессии** — починено 2026-09-09 и проверено в изолированном KWin (`spikes/m1_live/verify_isolated.sh`, PASS=17/FAIL=0): тёмная схема → яркость центра 31, светлая → 249; `themeSource` подаётся и в контекст QML, и в глобальный объект JS (`Theme.qml` — `pragma Singleton`).
   - `[ ]` **RSS ≤ 120 МБ — FAIL**: 167 720 КБ против порога 122 880 (+44 840 КБ, 36 %) на пустой оболочке; разложить память мешает наш `PR_SET_DUMPABLE=0` (дефект 4).
-  - `[ ]` **«второй запуск показывает первое окно» — FAIL для свёрнутого окна**: остаётся `Iconic`, KWin даёт `DEMANDS_ATTENTION` (дефект 3); после закрытия окна процесс живёт и перехватывает `show` — приложение перестаёт открываться (дефект 2); `settings.json` не создаётся (дефект 5).
+  - `[x]` **«второй запуск показывает первое окно»** — починено: `showNormal()` + `_NET_WM_USER_TIME` из протокола `show <ts>` → окно возвращается из `Iconic` в `Normal` и становится активным (дефект 3); закрытие окна завершает процесс, `lock`/`ipc` убираются в `finally` и по SIGTERM, переключатель `CLOSE_TO_TRAY=False  # M4: True` (дефект 2); `settings.json` 0600 создаётся при первом старте (дефект 5); `WM_CLASS` instance = `astra-voice` (дефект 8).
   - `[ ]` Fly-сессия и `make deb` ≤ 5 мин / lintian без E на машине — не проверялись (deb собирается в CI).
 - T1 §5 M1: лаунчер `python3 -I`; `RLIMIT_CORE=0`/`PR_SET_DUMPABLE=0`; CI-гейты (SHA, permissions, секрет только в `release`, без `pull_request_target`); keyring мастер+S1+S2; `PINNED/REVOKED_FINGERPRINTS`; `docs/SECURITY.md`; `Verifier` по `VALIDSIG`+пин для релиза/deb-из-файла/манифеста/`catalog_pubkey`.
 ### Validation
@@ -185,7 +185,10 @@ time make deb && lintian dist/astra-voice_*.deb
 dpkg-deb -c dist/astra-voice_*.deb | grep -c '\.so' ; tools/elf-audit --strict dist/astra-voice_*.deb          # 3
 sudo apt install ./dist/astra-voice_*.deb && astra-voice --version
 astra-voice & sleep 2; astra-voice; sleep 1; pgrep -c -f '^/usr/bin/python3 -I /usr/lib/astra-voice/bootstrap\.py app'   # 1 (без якоря pgrep ловит и свою оболочку)
-ps -o rss= -p "$(pgrep -f 'bootstrap.py app')"                                                                # ≤ 122880
+WID=$(xdotool search --class astra-voice | head -1)      # именно --class: instance и class оба = astra-voice
+xdotool getwindowgeometry $WID; xprop -id $WID _NET_FRAME_EXTENTS   # 900x588 клиентской, рамка 4/4/28/4
+ps -o rss= -p "$(pgrep -f '^/usr/bin/python3 -I /usr/lib/astra-voice/bootstrap\.py app')"                     # ≤ 122880
+python3 spikes/m1_live/close_window.py $WID; sleep 2; pgrep -c -f 'bootstrap\.py app'   # 0 — закрытие завершает процесс (M1, CLOSE_TO_TRAY=False)
 python3 scripts/gen_theme.py --check && python3 scripts/ci_lint.py .github/workflows/*.yml
 ```
 ### Known Risks

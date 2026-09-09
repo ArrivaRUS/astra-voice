@@ -65,7 +65,8 @@ body.dark .wbtn.c{background:#8C3B36}
 .tgl i{position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;background:#fff;display:block}
 .tgl.on{background:var(--primary)}
 .tgl.on i{left:19px}
-.tgl.lock{background:var(--border)}
+/* заблокированный тумблер сохраняет цвет своего состояния (spec §4.2): фон не переопределяем,
+   о запрете говорят бейдж с замком или подпись рядом */
 .btn{font-family:var(--font-ui);font-size:13px;font-weight:500;color:var(--fg1);background:var(--bg-surface);
   border:1px solid var(--border);border-radius:7px;padding:6px 12px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
 .btn.pri{background:var(--primary);border-color:var(--primary);color:var(--primary-fg)}

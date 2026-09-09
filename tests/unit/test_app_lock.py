@@ -174,3 +174,80 @@ def test_ipc_socket_is_private(
 ) -> None:
     ipc = Path(first_instance[1]["XDG_RUNTIME_DIR"]) / "astra-voice" / "ipc"
     assert ipc.stat().st_mode & 0o077 == 0
+
+
+# ── протокол сокета (чистая функция, Qt не нужен) ──────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        (b"show", 0),
+        (b"show\n", 0),
+        (b"  show  \n", 0),
+        (b"show 12345", 12345),
+        (b"show 12345\n", 12345),
+        (b"show 0", 0),
+    ],
+)
+def test_parse_command_accepts(line: bytes, expected: int) -> None:
+    from astra_voice.app import parse_command
+
+    assert parse_command(line) == expected
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        b"",
+        b"\n",
+        b"quit",
+        b"Show",
+        b"show!",
+        b"showtime",
+        b"show abc",
+        b"show 12 34",
+        b"show -5",
+        b"show 12x",
+        b"exec rm -rf /",
+    ],
+)
+def test_parse_command_rejects(line: bytes) -> None:
+    from astra_voice.app import parse_command
+
+    assert parse_command(line) is None
+
+
+# ── источник темы по виду сеанса ───────────────────────────────────────────
+
+
+def test_theme_source_matches_session_kind() -> None:
+    from astra_voice.app import make_theme_source
+    from astra_voice.core.theme import FlyThemeSource, KdeThemeSource
+    from astra_voice.platform.session import SessionKind
+
+    assert isinstance(make_theme_source(SessionKind.FLY), FlyThemeSource)
+    assert isinstance(make_theme_source(SessionKind.KDE), KdeThemeSource)
+    assert isinstance(make_theme_source(SessionKind.OTHER), KdeThemeSource)
+
+
+def test_close_to_tray_is_off_until_m4() -> None:
+    from astra_voice import app as app_mod
+
+    assert app_mod.CLOSE_TO_TRAY is False
+
+
+# ── первый запуск создаёт settings.json ────────────────────────────────────
+
+
+def test_settings_file_created_on_first_start(
+    first_instance: tuple[subprocess.Popen[str], dict[str, str]], tmp_path: Path
+) -> None:
+    settings = tmp_path / "config" / "astra-voice" / "settings.json"
+    _wait_for(settings, first_instance[0], timeout=10.0)
+    assert settings.stat().st_mode & 0o777 == 0o600
+    import json
+
+    data = json.loads(settings.read_text(encoding="utf-8"))
+    assert data["schema_version"] == 1
+    assert data["check_app_updates"] is False

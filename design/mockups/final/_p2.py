@@ -84,7 +84,7 @@ def output(theme):
                  '<div class="po"><span style="width:13px"></span><span>Ctrl + Shift + V'
                  '<span class="d2">Терминалы Konsole и fly-term</span></span></div>'
                  '<div class="po"><span style="width:13px"></span><span>Shift + Insert'
-                 '<span class="d2">Старые приложения и X-совместимые терминалы</span></span></div>'
+                 '<span class="d2">Старые приложения и терминалы</span></span></div>'
                  '<div class="po"><span style="width:13px"></span><span>Не вставлять — только положить '
                  'в буфер<span class="d2">Вставите сами, куда нужно</span></span></div></div>')
     copy_has = ('<div class="card">'
@@ -179,8 +179,7 @@ def network(theme):
               network_body() + sb(6, 240), footer(state="disabled"))
     url_ok = (f'<div class="note o">{ic("check", 15, "var(--ok-ink)")}'
               '<div><b>Каталог доступен</b>'
-              '12 моделей · подпись манифеста проверена ключом из '
-              '<span class="mono">/etc/astra-voice/policy.conf</span> · обновлён 07.09.2026.</div></div>')
+              '12 моделей · подпись списка проверена · обновлён 07.09.2026.</div></div>')
     url_sig = (f'<div class="note w">{ic("alert", 15, "var(--warn-ink)")}'
                '<div><b>Каталог не обновлён</b>'
                'Подпись манифеста не совпала с ключом — показан предыдущий список моделей. '
@@ -201,7 +200,7 @@ def network(theme):
                '<div class="po"><span style="width:13px"></span><span>GitHub — наш каталог'
                '<span class="d2">github.com/ArrivaRUS/astra-voice · подпись нашим ключом</span></span></div>'
                '<div class="po"><span style="width:13px"></span><span>Корпоративный адрес'
-               '<span class="d2">Свой манифест и свои веса, ключ из policy.conf</span></span></div></div>')
+               '<span class="d2">Свой список моделей и свой ключ проверки</span></span></div></div>')
     offline = ('<div class="card">'
                + row("Офлайн-режим", tgl(True),
                      "Все сетевые кнопки скрыты; работает только установка из файла", hint=False)
@@ -209,7 +208,7 @@ def network(theme):
                      "Недоступно: включён офлайн-режим", hint=False, dis=True) + '</div>')
     policy = ('<div class="card">'
               + row("Проверять обновления утилиты", tgl(False, lock=True),
-                    "Задано администратором в /etc/astra-voice/policy.conf", lock=True, dis=True) + '</div>')
+                    "Задано администратором", lock=True, dis=True) + '</div>')
     leg = ("<b>Оба тумблера по умолчанию пусты во всех профилях</b> (решение заказчика 2026-09-07, PRD "
            "F14.2) — до явного включения программа не ходит в сеть. При этом кнопки «Скачать» и «Проверить "
            "сейчас» работают: это явное действие человека, а тумблеры управляют только фоновыми проверками. "
@@ -278,13 +277,13 @@ def upanel(state):
         return (f'<div class="upan">{head_}'
                 f'<div class="note i" style="margin-top:12px">{ic("shield", 15, DD)}'
                 '<div><b>Жду подтверждения администратора</b>'
-                'Открыто системное окно ввода пароля (polkit). Это единственное окно с паролем за всю '
+                'Открыто системное окно ввода пароля. Это единственное окно с паролем за всю '
                 'установку.</div></div>'
                 f'<div style="margin-top:12px">{btn("Отмена")}</div></div>')
     if state == "installing":
         return (f'<div class="upan">{head_}'
                 '<div class="prog" style="margin:12px 0 7px"><i style="width:78%"></i></div>'
-                '<div class="sm">Установка пакета <span class="mono">astra-voice_0.2.1_amd64.deb</span>… '
+                '<div class="sm">Устанавливаю обновление… '
                 'Диктовка сейчас недоступна.</div></div>')
     if state == "restart":
         return (f'<div class="upan"><div style="display:flex;align-items:center;gap:9px">'
@@ -313,18 +312,16 @@ def upanel(state):
         return (f'<div class="upan n"><div class="note w" style="margin:0">'
                 f'{ic("alert", 15, "var(--warn-ink)")}'
                 '<div><b>Установка отменена</b>'
-                'Пакет <span class="mono">astra-voice_0.2.1_amd64.deb</span> сохранён в '
-                '<span class="mono">~/.cache/astra-voice/updates/</span>. Установить можно позже.'
+                'Файл обновления сохранён — установить можно позже.'
                 f'<div style="display:flex;gap:8px;margin-top:9px">{btn("Установить сейчас", "pri")}'
                 f'{btn("Открыть папку", "", "folder")}</div></div></div></div>')
     if state == "err-agent":
         return (f'<div class="upan n"><div class="note e" style="margin:0">'
                 f'{ic("alert", 15, "var(--err-ink)")}'
-                '<div><b>Не найден агент авторизации</b>'
-                'В сеансе не запущен <span class="mono">polkit-kde-authentication-agent-1</span>. '
-                'Установите пакет вручную:<br>'
-                '<span class="mono">sudo apt install ./astra-voice_0.2.1_amd64.deb</span>'
-                f'<div style="display:flex;gap:8px;margin-top:9px">{btn("Скопировать команду", "pri")}'
+                '<div><b>Не удалось запросить пароль</b>'
+                'Система не показала окно ввода пароля, поэтому обновление не установлено. '
+                'Обратитесь к администратору.'
+                f'<div style="display:flex;gap:8px;margin-top:9px">{btn("Повторить", "pri", "refresh")}'
                 f'{btn("Открыть папку", "", "folder")}</div></div></div></div>')
     if state == "unavailable":
         return (f'<div class="upan n"><div class="note i" style="margin:0">{ic("globe", 15, DD)}'
@@ -346,9 +343,9 @@ def upanel(state):
 UPANEL_STATES = [
     ("none", "обновлений нет"), ("checking", "проверяю"), ("available", "доступна версия"),
     ("downloading", "скачивается 42 %"), ("verifying", "проверка подписи"),
-    ("polkit", "ожидание polkit"), ("installing", "установка"),
+    ("polkit", "ожидание пароля"), ("installing", "установка"),
     ("restart", "установлено, нужен перезапуск"), ("err-net", "ошибка: сеть"),
-    ("err-sig", "ошибка: подпись не сошлась"), ("err-polkit", "ошибка: отказ polkit"),
+    ("err-sig", "ошибка: подпись не сошлась"), ("err-polkit", "отказ от ввода пароля"),
     ("err-agent", "нет агента авторизации"), ("unavailable", "источник недоступен"),
     ("skipped", "версия пропущена"),
 ]
@@ -481,12 +478,11 @@ def advanced(theme):
     g3 = group("Файлы и место", [
         row("Папка моделей",
             f'<span style="display:flex;gap:8px;align-items:center">'
-            f'<span class="c12 mono">~/.local/share/astra-voice/models</span>'
             f'{btn("Открыть", "sm", "folder")}{btn("Изменить", "sm")}</span>',
-            "Занято 686 МБ · свободно на разделе 42,1 ГБ", hint=False),
-        row("Надёжный режим захвата клавиш (evdev)", tgl(False),
-            "Если комбинацию перехватывает другое приложение. Нужна группа input — экспериментально"),
-        row("Посимвольный ввод вместо буфера (xdotool type)", tgl(False),
+            "Занято 686 МБ · свободно на диске 42,1 ГБ", hint=False),
+        row("Надёжный режим захвата клавиш", tgl(False),
+            "Включайте, если комбинацию перехватывает другая программа — потребуются дополнительные права"),
+        row("Посимвольный ввод вместо буфера обмена", tgl(False),
             "Аварийный вариант: кириллица вводится ненадёжно. Только если вставка не работает совсем"),
     ])
     g4 = group("Обслуживание", [
@@ -537,10 +533,7 @@ def about(theme):
             f'<span style="display:flex;gap:9px;align-items:center">{num("0.2.0")}'
             f'{btn("Проверить обновления", "sm", "refresh")}</span>',
             "Сборка от 01.09.2026 · deb из GitHub Releases", hint=False),
-        row("Активная модель", f'<span class="c12 mono">GigaAM v3 RNN-T · a6039be</span>',
-            "onnx-asr 0.6.1 · onnxruntime 1.17.1", hint=False),
-        row("Среда выполнения", f'<span class="c12 mono">Python 3.11.2 · PyQt5 5.15.9 · Qt 5.15.8</span>',
-            "Astra Linux SE 1.8 · KDE 5.27 · X11", hint=False),
+        row("Активная модель", f'<span class="c12 mono">GigaAM v3 RNN-T</span>', hint=False),
     ])
     g2 = group("Лицензии и приватность", [
         row("Лицензия программы",
@@ -557,13 +550,12 @@ def about(theme):
     ])
     g3 = group("Данные на диске", [
         row("Настройки", f'<span style="display:flex;gap:8px;align-items:center">'
-            f'<span class="c12 mono">~/.config/astra-voice/</span>{btn("Открыть", "sm", "folder")}</span>',
-            hint=False),
+            f'{btn("Открыть", "sm", "folder")}</span>', hint=False),
         row("Модели", f'<span style="display:flex;gap:8px;align-items:center">'
-            f'<span class="c12 mono">~/.local/share/astra-voice/models/ · 686 МБ</span>'
+            f'<span class="c12 mono">686 МБ</span>'
             f'{btn("Открыть", "sm", "folder")}</span>', hint=False),
         row("Логи и статистика", f'<span style="display:flex;gap:8px;align-items:center">'
-            f'<span class="c12 mono">~/.local/state/astra-voice/ · 2,1 МБ</span>'
+            f'<span class="c12 mono">2,1 МБ</span>'
             f'{btn("Открыть", "sm", "folder")}</span>',
             "Логи без аудио и без распознанного текста — только длительности и коды ошибок", hint=False),
     ])

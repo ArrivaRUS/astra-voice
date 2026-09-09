@@ -89,3 +89,59 @@ astra-voice; grep 'получена команда show' ~/.local/share/astra-vo
 
 Схему сессии не переключать: тему проверять подставным `kdeglobals` по явному пути
 (`KdeThemeSource(Path(...))`), пока не починен пункт 6.
+
+## Починка 2026-09-09 (после прогона): дефекты 1, 2, 3, 5, 8 закрыты
+
+Проверка — **не переустановкой пакета**, а из репозитория в изолированном сеансе KWin
+(`verify_isolated.sh`); дисплей `:0` и настройки заказчика не затрагиваются:
+
+```sh
+REPO=$PWD OUT=$PWD/spikes/m1_live/out dbus-run-session -- \
+  kwin_wayland --virtual --width 1280 --height 900 --xwayland --socket=av-m1a \
+  --exit-with-session=spikes/m1_live/verify_isolated.sh
+```
+
+`kdeglobals` копируется в песочницу (`XDG_CONFIG_HOME`), тема проверяется в обе стороны.
+Результат: **PASS=17, FAIL=0** (`out/live_iso_verify.log`, `out/live_iso_verdict.log`).
+
+| Дефект | Что сделано (`src/astra_voice/app.py`, если не сказано иное) | Факт из изолированного прогона |
+|---|---|---|
+| 1 тема | Шаг «theme» в порядке старта: `make_theme_source()` по `SessionKind` → `ThemeBridge` → контекст QML **и** глобальный объект JS (`Theme.qml` — `pragma Singleton`, контекстных свойств не видит), `source.start()` после загрузки | тёмная схема → яркость центра **31**, журнал `тема сессии: dark=True accent=#2FB3FA`; светлая → **249**, `dark=False` |
+| 2 закрытие | `CLOSE_TO_TRAY = False  # M4: True` + фильтр события `QEvent.Close` (сигнал `closing` в PyQt5 недоступен: `QQuickCloseEvent*` не поддержан) + уборка `lock`/`ipc` в `finally` и по SIGTERM/SIGINT (`signal` + `QTimer`, чтобы Qt отпускал интерпретатор) | `окно закрыто — завершаю процесс`, процессов **0**, `lock`/`ipc` убраны; то же по SIGTERM |
+| 3 разворачивание | `showNormal()` → `_NET_WM_USER_TIME` → `raise_()` → `requestActivate()`; метку времени X второй экземпляр берёт у сервера и шлёт в протоколе `show <ts>`; новый модуль `platform/x11.py` | `Iconic` → **Normal**, окно активно, `_NET_WM_USER_TIME` выставлен, код второго экземпляра 0 за ~0,18 с |
+| 5 настройки | `_ensure_settings_file()` пишет дефолты при первом старте (на диск идут настройки пользователя, не результат наложения политики) | файл создан, права **600** |
+| 8 WM_CLASS | `QApplication([APP_NAME])` — instance-часть берётся из `argv[0]` | `WM_CLASS = "astra-voice", "astra-voice"`, окно находится по `--classname` |
+
+Протокол сокета остался единственной командой: `show` либо `show <ts>`; всё иное — отбой
+(таблица разбора — `tests/unit/test_app_lock.py::test_parse_command_*`).
+`stderr` приложения пуст в обоих запусках.
+
+### Уточнение к дефекту 2
+
+Исходный вывод «процесс переживает закрытие окна» был снят **неверным жестом**:
+`xdotool windowclose` по man-странице *уничтожает* окно (`XDestroyWindow`) и не шлёт
+`WM_DELETE_WINDOW`, поэтому приложение о закрытии не узнавало — отсюда же были
+`BadWindow` в `stderr` на `:0`. Пользователь кнопкой «×» вызывает
+`_NET_CLOSE_WINDOW` → `WM_DELETE_WINDOW`; для проверки это делает `close_window.py`.
+Сам фикс всё равно нужен: `quitOnLastWindowClosed` считает только окна-виджеты,
+и намерение (в M1 закрываем процесс, в M4 прячем в трей) теперь выражено явно.
+
+### Дефекты 4, 6, 7
+
+* 4 (RSS 167 720 КБ) — не трогал, отдельная задача после Debugger.
+* 6 (`XDG_CONFIG_HOME` в `KdeThemeSource`) — починил M1-C, подтверждено этим прогоном.
+* 7 — команды в `docs/plans.md` M1 Validation исправлены: якорный `pgrep`,
+  `xdotool search --class`, проверка закрытия через `close_window.py`.
+
+### Файлы починки
+
+| Файл | Назначение |
+|---|---|
+| `verify_isolated.sh` | стенд в изолированном KWin, 17 проверок |
+| `close_window.py` | закрытие окна как пользователем (`_NET_CLOSE_WINDOW`) |
+| `out/live_iso_verify.log` | полный лог прогона + журнал приложения |
+| `out/live_iso_window_dark.png`, `out/live_iso_window_light.png` | окно в обеих темах |
+| `out/live_iso_verdict.log` | `PASS=17 FAIL=0` |
+
+Каталог `out/iso-home/` (песочница с копией `kdeglobals`) создаётся стендом и удаляется
+после прогона — в git его быть не должно.

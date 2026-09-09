@@ -70,8 +70,7 @@ def general_rows(mode_first=True, autostart="on", indicator="Пилюля сни
             "Удерживайте и говорите — текст появится там, где курсор"),
         row("Режим", seg("Удерживать", "Нажать-нажать", mode_first),
             "Удерживать — самый предсказуемый вариант"),
-        row("Микрофон", sel("Системный по умолчанию", 236),
-            "Sof-hda-dsp · встроенный микрофон ноутбука"),
+        row("Микрофон", sel("Системный по умолчанию", 236)),
     ])
     g2 = group("Индикация", [
         row("Индикатор записи", sel(indicator, 236),
@@ -83,19 +82,15 @@ def general_rows(mode_first=True, autostart="on", indicator="Пилюля сни
             "Запись всегда видна — это требование приватности (§9.5)", dis=True),
     ])
     if autostart == "error":
-        ar = row("Автозапуск при входе в систему", tgl(True),
-                 "Создаёт ~/.config/autostart/astra-voice.desktop")
+        ar = row("Автозапуск при входе в систему", tgl(True))
         err = (f'<div class="r"><div class="note e" style="width:100%">{ic("alert", 15, "var(--err-ink)")}'
-               '<div><b>Не удалось создать ярлык автозапуска</b>'
-               'Папка <span class="mono">~/.config/autostart</span> недоступна для записи. '
-               'Астра Voice запустится вручную командой <span class="mono">astra-voice</span>.'
-               f'<div style="display:flex;gap:8px;margin-top:9px">{btn("Открыть папку", "", "folder")}'
-               f'{btn("Повторить")}</div></div></div></div>')
+               '<div><b>Не удалось включить автозапуск</b>'
+               'Программа не запустится сама при входе — открывайте её из меню приложений.'
+               f'<div style="margin-top:9px">{btn("Повторить")}</div></div></div></div>')
         g3 = group("Запуск", [ar, err])
     else:
         g3 = group("Запуск", [
-            row("Автозапуск при входе в систему", tgl(autostart == "on"),
-                "Создаёт ярлык ~/.config/autostart/astra-voice.desktop. Чужие ярлыки не трогаем"),
+            row("Автозапуск при входе в систему", tgl(autostart == "on")),
         ])
     return g1 + g2 + g3
 
@@ -160,17 +155,15 @@ def general_hotkey(theme):
 def mic_row_states(state):
     if state == "loading":
         return ('<div class="card">' + row("Микрофон", sel("Ищу устройства…", 236),
-                                           "Опрашиваем PipeWire и ALSA", hint=False) + '</div>')
+                                           hint=False) + '</div>')
     if state == "list":
         pop = ('<div class="pop" style="position:static;box-shadow:none;margin-top:7px">'
                f'<div class="po on">{ic("check", 13, "var(--primary)")}<span>Системный по умолчанию'
-               '<span class="d2">Сейчас: Встроенный микрофон (sof-hda-dsp)</span></span></div>'
-               '<div class="po"><span style="width:13px"></span><span>Встроенный микрофон'
-               '<span class="d2">alsa_input.pci-0000_00_1f.3 · 2 канала</span></span></div>'
-               '<div class="po"><span style="width:13px"></span><span>Гарнитура Jabra Evolve2 30'
-               '<span class="d2">alsa_input.usb-0b0e_Jabra · 1 канал</span></span></div>'
+               '<span class="d2">Сейчас: Встроенный микрофон</span></span></div>'
+               '<div class="po"><span style="width:13px"></span><span>Встроенный микрофон</span></div>'
+               '<div class="po"><span style="width:13px"></span><span>Гарнитура Jabra Evolve2 30</span></div>'
                '<div class="po"><span style="width:13px"></span><span>Микрофон монитора Dell U2723QE'
-               '<span class="d2">alsa_input.usb-Dell_U2723QE · 2 канала</span></span></div>'
+               '</span></div>'
                '<div class="msep"></div>'
                f'<div class="po">{ic("refresh", 13, DD)}<span>Обновить список</span></div></div>')
         return ('<div class="card">' + row("Микрофон", sel("Системный по умолчанию", 236, True),
@@ -187,7 +180,7 @@ def mic_row_states(state):
                                            hint=False) + '</div>'
                 + f'<div class="note e" style="margin-top:9px">{ic("alert", 15, "var(--err-ink)")}'
                   '<div><b>Микрофон недоступен</b>'
-                  'Устройство занято другим приложением (код <span class="mono">EBUSY</span>). '
+                  'Устройство занято другой программой. '
                   'Закройте приложение, которое пишет звук. Мы уже повторили попытку три раза.'
                   f'<div style="margin-top:9px">{btn("Повторить", "pri", "refresh")}</div></div></div>')
     if state == "silent":
@@ -195,22 +188,20 @@ def mic_row_states(state):
                                            hint=False) + '</div>'
                 + f'<div class="note w" style="margin-top:9px">{ic("alert", 15, "var(--warn-ink)")}'
                   '<div><b>Микрофон молчит</b>'
-                  'Устройство открыто, но звука нет. Обычно помогает перезапуск звуковой службы — '
+                  'Устройство открыто, но звука нет. Обычно помогает перезапуск звука — '
                   'это безопасно и не требует пароля.'
                   f'<div style="display:flex;gap:8px;margin-top:9px;align-items:center">'
-                  f'{btn("Перезапустить звуковую службу", "pri", "refresh")}{btn("Что это", "gh")}'
+                  f'{btn("Перезапустить звук", "pri", "refresh")}{btn("Что это", "gh")}'
                   '<span class="c12">Проверим уровень сами через 3 с</span></div></div></div>')
     if state == "restarting":
         return (f'<div class="note i">{ic("refresh", 15, DD)}'
-                '<div><b>Перезапускаю звуковую службу…</b>'
-                '<span class="mono">systemctl --user restart wireplumber</span> · проверим уровень '
-                'сразу после перезапуска</div></div>')
+                '<div><b>Перезапускаю звук…</b>'
+                'Проверим уровень сразу после перезапуска</div></div>')
     if state == "no-service":
         return (f'<div class="note w">{ic("alert", 15, "var(--warn-ink)")}'
-                '<div><b>Служба звука не отвечает</b>'
-                'В системе нет <span class="mono">wireplumber</span> — перезапустить её отсюда нельзя. '
-                'Обратитесь к администратору.'
-                f'<div style="margin-top:9px">{btn("Перезапустить звуковую службу", "dis", "refresh")}'
+                '<div><b>Звук не отвечает</b>'
+                'Перезапуск звука на этом компьютере недоступен. Обратитесь к администратору.'
+                f'<div style="margin-top:9px">{btn("Перезапустить звук", "dis", "refresh")}'
                 '</div></div></div>')
     raise KeyError(state)
 
@@ -233,7 +224,7 @@ def general_mic(theme):
         stcell("тишина: известная гонка WirePlumber", mic_row_states("silent"), "silent"),
     ]) + grid([
         stcell("идёт перезапуск службы", mic_row_states("restarting"), "restarting"),
-        stcell("wireplumber не установлен — кнопка недоступна", mic_row_states("no-service"), "disabled"),
+        stcell("перезапуск звука недоступен", mic_row_states("no-service"), "disabled"),
     ]) + grid([
         stcell("уровень: живой сигнал",
                f'<div class="lvbox">{level_bars("live")}<div class="sm">Пик −18 дБ · слышим вас</div></div>',
@@ -266,13 +257,13 @@ def general_indicator(theme):
     body = general_rows() + sb(6, 170)
     b = shell("Общие", head("Общие", "Индикация записи"), body, footer(state="disabled"), over=pop)
     auto_on = ('<div class="card">' + row("Автозапуск при входе в систему", tgl(True),
-               "Ярлык ~/.config/autostart/astra-voice.desktop создан", hint=False) + '</div>')
+               "Автозапуск включён", hint=False) + '</div>')
     auto_off = ('<div class="card">' + row("Автозапуск при входе в систему", tgl(False),
-                "Запускать вручную: команда astra-voice или меню приложений", hint=False) + '</div>')
+                "Открывать программу придётся вручную — из меню приложений", hint=False) + '</div>')
     auto_err = (f'<div class="note e">{ic("alert", 15, "var(--err-ink)")}'
-                '<div><b>Не удалось создать ярлык автозапуска</b>'
-                'Папка <span class="mono">~/.config/autostart</span> недоступна для записи.'
-                f'<div style="margin-top:9px">{btn("Открыть папку", "pri", "folder")}</div></div></div>')
+                '<div><b>Не удалось включить автозапуск</b>'
+                'Программа не запустится сама при входе — открывайте её из меню приложений.'
+                f'<div style="margin-top:9px">{btn("Повторить", "pri", "refresh")}</div></div></div>')
     off_note = (f'<div class="note i">{ic("info", 15, DD)}'
                 '<div><b>Вы отключили индикатор</b>'
                 'Включить звуковой сигнал начала и конца записи? Значок в трее продолжит показывать '
@@ -358,8 +349,8 @@ def mcard(mid, state=None, badges=None, note=None, acts=None, extra="", cls_extr
     elif st == "updating":
         body = ('<div class="mhr"></div>'
                 '<div class="prog" style="margin-bottom:7px"><i style="width:66%"></i></div>'
-                '<div class="mbot"><span>Проверяю новую ревизию: скачано → sha256 → пробное '
-                'распознавание</span>'
+                '<div class="mbot"><span>Проверяю новую ревизию: скачано → проверка целостности → '
+                'пробное распознавание</span>'
                 f'<span class="sp"></span>{btn("Отмена", "sm")}</div>')
     else:
         n = ""
@@ -533,7 +524,7 @@ def models_card_states(theme):
         stcell("запрещено администратором",
                mcard("wturbo", "policy",
                      note=("i", "Задано администратором: только отечественные модели")), "policy-offline"),
-        stcell("ошибка: sha256 не совпал",
+        stcell("ошибка: файл не прошёл проверку",
                mcard("tone", "badsha",
                      note=("e", "Файл не прошёл проверку — загруженное удалено")), "error-sha"),
         stcell("ошибка: кончилось место на диске",
@@ -569,12 +560,11 @@ def models_file_dialogs(theme):
     picker = ('<div class="dlg" style="width:460px"><div class="dh">'
               + ic("folder", 14, DD) + 'Выбор папки с моделью</div>'
               '<div class="db" style="flex-direction:column;gap:10px">'
-              '<div class="sm">Укажите папку с файлами модели (<span class="mono">*.onnx</span> и '
-              '<span class="mono">tokens.txt</span>) или архив, полученный от администратора.</div>'
+              '<div class="sm">Укажите папку с моделью или архив, полученный от '
+              'администратора.</div>'
               '<div class="field mono" style="font-size:12px">/media/usb/models/gigaam-v3-e2e-rnnt-int8'
               f'<span style="flex:1"></span>{ic("folder", 13, DD)}</div>'
-              '<div class="c12">Найдено 4 файла · 231,9 МБ · encoder.int8.onnx, decoder.onnx, joiner.onnx, '
-              'tokens.txt</div></div>'
+              '<div class="c12">Найдено 4 файла · 231,9 МБ</div></div>'
               f'<div class="df"><span class="sp"></span>{btn("Отмена")}{btn("Проверить и установить", "pri")}'
               '</div></div>')
     ok = (f'<div class="note o">{ic("check", 15, "var(--ok-ink)")}'
@@ -584,8 +574,8 @@ def models_file_dialogs(theme):
           f'<div style="margin-top:9px">{btn("Выбрать активной", "pri")}</div></div></div>')
     bad = (f'<div class="note e">{ic("alert", 15, "var(--err-ink)")}'
            '<div><b>Файл не прошёл проверку</b>'
-           'Контрольная сумма <span class="mono">encoder.int8.onnx</span> не совпала с манифестом: '
-           'файл повреждён или получен не из нашего каталога. Мы ничего не устанавливали.'
+           'Файлы модели повреждены — не совпадают с описанием в каталоге. '
+           'Мы ничего не устанавливали.'
            f'<div style="display:flex;gap:8px;margin-top:9px">{btn("Выбрать другую папку", "pri")}'
            f'{btn("Подробнее", "gh")}</div></div></div>')
     unknown = (f'<div class="note w">{ic("alert", 15, "var(--warn-ink)")}'
@@ -596,15 +586,15 @@ def models_file_dialogs(theme):
                f'{btn("Отмена")}</div></div></div>')
     incomplete = (f'<div class="note e">{ic("alert", 15, "var(--err-ink)")}'
                   '<div><b>В папке не хватает файлов</b>'
-                  'Не найден <span class="mono">tokens.txt</span>. Нужны все файлы модели — обычно они '
-                  'лежат рядом в одной папке.'
+                  'Не хватает одного из файлов модели. Нужны все файлы — обычно они лежат рядом '
+                  'в одной папке.'
                   f'<div style="margin-top:9px">{btn("Выбрать другую папку", "pri")}</div></div></div>')
     delete = ('<div class="dlg"><div class="dh">' + ic("trash", 14, DD) + 'Удалить модель</div>'
               f'<div class="db">{ic("trash", 22, "var(--err-ink)")}'
               '<div><div class="h3">Удалить GigaAM v3 CTC?</div>'
-              '<div class="sm" style="margin-top:6px">С диска будет удалено <b>224,9 МБ</b> из '
-              '<span class="mono">~/.local/share/astra-voice/models/</span>. Настройки и статистика '
-              'останутся. Скачать модель заново можно в любой момент.</div></div></div>'
+              '<div class="sm" style="margin-top:6px">С диска будет удалено <b>224,9 МБ</b> из папки '
+              'моделей. Настройки и статистика останутся. Скачать модель заново можно '
+              'в любой момент.</div></div></div>'
               f'<div class="df"><span class="sp"></span>{btn("Отмена")}'
               f'{btn("Удалить", "pri")}</div></div>')
     delete_active = ('<div class="dlg"><div class="dh">' + ic("info", 14, DD) + 'Удаление недоступно</div>'
