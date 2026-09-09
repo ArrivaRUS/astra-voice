@@ -1,0 +1,8 @@
+astra-voice (0.1.0~m1) unstable; urgency=medium
+
+  * Веха M1: скелет приложения, упаковка в .deb, гейты сборки и CI.
+  * Проверка подписей (gpgv + пин отпечатка), связка ключей в пакете.
+  * Пакет создаёт /var/lib/astra-voice/staging (root:root 0700) под будущий
+    обновлятор; помощник polkit появится в M8.
+
+ -- ArrivaRUS <arrivarus@gmail.com>  Wed, 09 Sep 2026 15:59:42 +0300

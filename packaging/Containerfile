@@ -1,0 +1,53 @@
+# Образ сборки .deb. debian:12 выбран не «похожестью», а совпадением:
+# ALSE 1.8.5 = /etc/debian_version 12.0, та же glibc 2.36, тот же Python 3.11.2
+# и PyQt5 5.15.9 (arch/plan-claude.md §7.3).
+#
+#   podman build -t astra-voice-build -f packaging/Containerfile .
+#   packaging/build-deb.sh --container
+FROM debian:12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LC_ALL=C.UTF-8 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install --no-install-recommends -y \
+        build-essential \
+        debhelper \
+        dh-python \
+        devscripts \
+        dpkg-dev \
+        fakeroot \
+        lintian \
+        file \
+        binutils \
+        gpgv \
+        gnupg \
+        git \
+        python3 \
+        python3-pip \
+        python3-venv \
+        python3-all \
+        python3-numpy \
+        python3-requests \
+        python3-jsonschema \
+        python3-xlib \
+    && rm -rf /var/lib/apt/lists/*
+
+# Проверка установки готового пакета (job `deb` в CI) требует Qt-стека.
+# Ставится отдельным слоем: он тяжёлый и меняется реже кода.
+RUN apt-get update && apt-get install --no-install-recommends -y \
+        python3-pyqt5 \
+        python3-pyqt5.qtquick \
+        qml-module-qtquick2 \
+        qml-module-qtquick-controls2 \
+        qml-module-qtquick-layouts \
+        qml-module-qtquick-window2 \
+        qml-module-qtgraphicaleffects \
+        python3-protobuf \
+        python3-flatbuffers \
+        python3-sympy \
+        xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src

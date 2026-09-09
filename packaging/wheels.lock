@@ -1,0 +1,17 @@
+# Вендорируемые колёса Astra Voice. Ставятся ТОЛЬКО в
+# /usr/lib/astra-voice/vendor и только с --no-deps: numpy, protobuf,
+# flatbuffers, sympy, packaging приходят из apt (Depends), см. arch/spikes/S3.md §1.
+#
+# Установка (сеть не нужна, кэш готовит `make wheels`):
+#   pip install --no-deps --no-index --find-links <кэш> --require-hashes \
+#       -r packaging/wheels.lock --target <…>/vendor
+#
+# Обновление хэшей: см. packaging/build-deb.sh, режим `--fetch-wheels`.
+# Колесо ORT — manylinux_2_27/2_28, max GLIBC 2.27, 0 символов __isoc23_,
+# ровно 3 ELF (гейт tools/elf-audit).
+
+onnxruntime==1.24.4 \
+    --hash=sha256:e54ad52e61d2d4618dcff8fa1480ac66b24ee2eab73331322db1049f11ccf330
+
+onnx-asr==0.12.0 \
+    --hash=sha256:5e7ceca454609819ea7833f61e2302e0c8f6ece4f8a78b66c5daba53cb51de4a

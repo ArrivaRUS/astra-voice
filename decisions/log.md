@@ -3,6 +3,21 @@
 > Что решили и **почему**. Новые записи — сверху. Пишет Юрка после явного «да» человека
 > (скилл `decision-log`).
 
+## 2026-09-09 — M1: сборка .deb в host-режиме, шрифты PT → Recommends, docker-группа не выдаётся
+- Контекст: M1-B собрал `astra-voice_0.1.0~m1_amd64.deb` (13 МБ, ELF 3/3, GLIBC ≤ 2.27, 0 isoc23) через `dpkg-deb` — docker
+  на машине заказчика без прав (нет группы docker), podman отсутствует, `debhelper`/`lintian` в системе нет.
+- Решения:
+  1. Группу `docker` заказчику не предлагаем (эквивалент root); dh, lintian и «установка в чистом debian:12» — только в CI;
+     локальный `build-deb.sh` остаётся host-режимом (`--dh` для контейнера/CI).
+  2. `fonts-pt-root-ui`, `fonts-pt-mono` — **Recommends**, не Depends (A-03 уточнено): на ALSE ставятся по умолчанию, в
+     Debian без Astra-репо не ломают установку; резерв шрифтов через `QFontDatabase` (PT Astra Sans/Fact → системный sans).
+  3. Depends по факту `deps-audit`: `python3-packaging` (нужен onnxruntime), `python3-numpy (>= 1:1.22.4)` (onnx-asr),
+     `qml-module-qtquick-layouts`, `qml-module-qtquick-window2`, `gpgv`; Recommends только `polkit-kde-agent-1` (Fly-агента в apt нет).
+  4. Ключ подписи — тестовый `CB95…3A71` с пометкой TODO до генерации мастера заказчиком (до 25.09, `docs/SECURITY.md` §4).
+- Почему: безопасность машины заказчика важнее локального lintian; CI воспроизводит сборку в чистом контейнере.
+- Гейт: — (приёмка M1 Юркой; G5 — на релизе v0.1).
+- Последствия: первый .deb для заказчика — host-сборка без lintian; до R1 обязателен зелёный CI-job `deb`.
+
 ## 2026-09-09 — M0: живые прогоны KDE приняты (S2, S4, S5); дефолтный хоткей остаётся `Ctrl+Space`
 - Контекст: `arch/spikes/S2.md` (одно окно polkit, exit 0, пакет 0.0.1 → 0.0.2 за 5 с, apt без `--allow-unauthenticated`),
   `arch/spikes/S4.md` § живой KDE (Kate/Konsole/LibreOffice/Chromium PASS, буфер восстановлен 153–162 мс, Klipper без фразы,

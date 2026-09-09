@@ -1,0 +1,69 @@
+#!/usr/bin/make -f
+# Раскладка пакета — бриф M1 и arch/plan-synth.md §7 (И7):
+#   /usr/lib/astra-voice/bootstrap.py      запускается как `python3 -I bootstrap.py app`
+#   /usr/lib/astra-voice/astra_voice/      код (bootstrap.py лежит РЯДОМ, не внутри)
+#   /usr/lib/astra-voice/vendor/           onnxruntime + onnx_asr (готовит build-deb.sh)
+#   /usr/share/astra-voice/{qml,data}      ресурсы
+#   /usr/bin/astra-voice                   лаунчер (sh + exec python3 -I)
+#   /var/lib/astra-voice/staging           root:root 0700, под обновлятор M8
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+PKG      := debian/astra-voice
+LIBDIR   := $(PKG)/usr/lib/astra-voice
+SHAREDIR := $(PKG)/usr/share/astra-voice
+DOCDIR   := $(PKG)/usr/share/doc/astra-voice
+
+# Дерево vendor готовит packaging/build-deb.sh (pip --require-hashes --target).
+# Пусто → сборка без vendor (режим --no-vendor), ELF в пакете 0.
+VENDOR ?= $(ASTRA_VOICE_VENDOR)
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	@echo "собирать нечего: Python + QML"
+
+override_dh_auto_test:
+	@echo "тесты гоняются отдельно (pytest -m unit), не внутри dpkg-buildpackage"
+
+override_dh_auto_install:
+	install -d $(LIBDIR) $(LIBDIR)/vendor $(SHAREDIR) $(DOCDIR) $(PKG)/usr/bin
+	cp -a src/astra_voice $(LIBDIR)/astra_voice
+	if [ -f $(LIBDIR)/astra_voice/bootstrap.py ]; then \
+		mv $(LIBDIR)/astra_voice/bootstrap.py $(LIBDIR)/bootstrap.py; \
+	fi
+	find $(LIBDIR)/astra_voice -name '__pycache__' -type d -prune -exec rm -rf {} +
+	find $(LIBDIR)/astra_voice -name '*.py[co]' -delete
+	if [ -n "$(VENDOR)" ] && [ -d "$(VENDOR)" ]; then \
+		cp -a "$(VENDOR)"/. $(LIBDIR)/vendor/; \
+	fi
+	if [ -d qml ]; then cp -a qml $(SHAREDIR)/qml; else install -d $(SHAREDIR)/qml; fi
+	cp -a data $(SHAREDIR)/data
+	rm -rf $(SHAREDIR)/data/icons $(SHAREDIR)/data/astra-voice.desktop \
+		$(SHAREDIR)/data/keys/README.md
+	install -m 0755 scripts/astra-voice $(PKG)/usr/bin/astra-voice
+	install -D -m 0644 data/astra-voice.desktop \
+		$(PKG)/usr/share/applications/astra-voice.desktop
+	cd data/icons/hicolor && find . -type f -exec \
+		install -D -m 0644 {} $(abspath $(PKG))/usr/share/icons/hicolor/{} \;
+	for f in NOTICE docs/PRIVACY.md packaging/INSTALL-ADMIN.md docs/SECURITY.md; do \
+		[ -f "$$f" ] && install -m 0644 "$$f" $(DOCDIR)/ || true; \
+	done
+
+# Каталог staging обязан быть 0700 (T1 M8): dh_fixperms сбрасывает каталоги в 0755,
+# поэтому право ставится после него.
+override_dh_fixperms:
+	dh_fixperms
+	chmod 0700 $(PKG)/var/lib/astra-voice/staging
+
+# Вендорные .so остаются байт-в-байт как в колесе: их sha256 указан в SBOM,
+# а ГОСТ-подпись (v1.1) считается по тем же байтам. Их нельзя ни strip, ни dwz.
+override_dh_strip:
+	dh_strip -Xusr/lib/astra-voice/vendor
+
+override_dh_dwz:
+	dh_dwz -Xusr/lib/astra-voice/vendor
+
+override_dh_shlibdeps:
+	dh_shlibdeps -Xusr/lib/astra-voice/vendor

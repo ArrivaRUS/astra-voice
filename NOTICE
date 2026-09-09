@@ -1,0 +1,90 @@
+Astra Voice
+Copyright (c) 2026 ArrivaRUS
+
+Эта программа распространяется на условиях GNU General Public License версии 3
+или любой более поздней (GPL-3.0-or-later). Полный текст — в файле LICENSE.
+Причина выбора GPL: интерфейс построен на PyQt5, доступной только под GPL v3
+либо по коммерческой лицензии Riverbank (research/legal.md §1.2).
+
+Ниже перечислены сторонние компоненты, их правообладатели и лицензии.
+Машиночитаемый состав поставки — в sbom.cdx.json (CycloneDX) рядом с пакетом.
+
+================================================================================
+1. Компоненты в составе пакета (каталог /usr/lib/astra-voice/vendor)
+================================================================================
+
+onnxruntime 1.24.4 — MIT License
+    Copyright (c) Microsoft Corporation
+    https://github.com/microsoft/onnxruntime
+    Поставляется три библиотеки: libonnxruntime.so, libonnxruntime_providers_shared.so,
+    onnxruntime_pybind11_state...so — байт-в-байт из официального колеса PyPI,
+    их sha256 указаны в SBOM.
+
+onnx-asr 0.12.0 — MIT License
+    Copyright (c) Ilya Stupakov
+    https://github.com/istupakov/onnx-asr
+
+================================================================================
+2. Компоненты из репозиториев операционной системы (зависимости пакета)
+================================================================================
+
+PyQt5 — GNU General Public License v3
+    Copyright (c) Riverbank Computing Limited
+    https://www.riverbankcomputing.com/software/pyqt/
+
+Qt 5 (QtQuick, QtQuick Controls 2, QtGraphicalEffects) — LGPL-3.0
+    Copyright (c) The Qt Company Ltd. и участники проекта
+    https://www.qt.io/
+
+python-xlib — GNU Lesser General Public License v2.1 или новее
+    Copyright (c) участники проекта python-xlib
+    https://github.com/python-xlib/python-xlib
+
+NumPy — BSD 3-Clause; Requests — Apache-2.0; jsonschema — MIT;
+protobuf — BSD 3-Clause; flatbuffers — Apache-2.0; SymPy — BSD 3-Clause;
+packaging — Apache-2.0 или BSD 2-Clause.
+Эти пакеты не входят в состав .deb: они устанавливаются из репозиториев
+операционной системы и остаются под своими лицензиями.
+
+================================================================================
+3. Модели распознавания (скачиваются отдельно, в пакет не входят)
+================================================================================
+
+GigaAM v3 — MIT License
+    Copyright (c) 2024 GigaChat Team, СберДевайсы
+    https://github.com/salute-developers/GigaAM
+    ONNX-экспорт: https://huggingface.co/istupakov/gigaam-v3-onnx (MIT)
+
+Whisper — MIT License (репозиторий OpenAI) / Apache-2.0 (метаданные карточек
+    на Hugging Face; расхождение источников указано намеренно)
+    Copyright (c) 2022 OpenAI
+    https://github.com/openai/whisper
+
+Silero VAD — MIT License
+    Copyright (c) Silero Team
+    https://github.com/snakers4/silero-vad
+    (не путать с silero-models — тот под CC BY-NC-SA и здесь не используется)
+
+Лицензия каждого репозитория, откуда скачиваются файлы, фиксируется в каталоге
+моделей и показывается на карточке модели.
+
+================================================================================
+4. Шрифты
+================================================================================
+
+PT Root UI и PT Mono — ParaType
+    Поставляются пакетами операционной системы (fonts-pt-root-ui, fonts-pt-mono),
+    в состав .deb не входят. Условия использования — у ParaType,
+    https://www.paratype.ru/
+
+================================================================================
+5. Товарные знаки
+================================================================================
+
+Astra Linux — товарный знак ПАО «Группа Астра». GigaAM — обозначение
+СберДевайсы. Whisper — обозначение OpenAI. Продукт не аффилирован с указанными
+компаниями и не одобрен ими; названия используются исключительно для указания
+совместимости и происхождения компонентов.
+
+Рабочее имя продукта — временное; вопрос согласования имени открыт
+(research/legal.md §5, гейт G5).

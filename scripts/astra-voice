@@ -1,4 +1,13 @@
 #!/bin/sh
-# Лаунчер GUI. Ставится сборкой как /usr/bin/astra-voice (см. packaging/build-deb.sh).
-# -I: изолированный режим — без PYTHONPATH и без user site-packages (модель угроз У3).
+# Лаунчер Astra Voice. Ставится сборкой как /usr/bin/astra-voice
+# (packaging/debian/rules, цель override_dh_auto_install).
+#
+# `-I` (isolated) обязателен: без него PYTHONPATH, user-site и sys.path[0]
+# позволяют подсунуть свой модуль вместо нашего (docs/threat-model.md §4.1, У3).
+# PYTHONPATH не используется вовсе: vendor подключает bootstrap.py сам (И7).
+# QT_QUICK_CONTROLS_STYLE выставляется до импорта Qt — во Fly стиль по умолчанию
+# иначе подменяется темой сессии (arch: Fly `06-fly-misc-env`).
+set -eu
+QT_QUICK_CONTROLS_STYLE="${QT_QUICK_CONTROLS_STYLE:-Default}"
+export QT_QUICK_CONTROLS_STYLE
 exec /usr/bin/python3 -I /usr/lib/astra-voice/bootstrap.py app "$@"

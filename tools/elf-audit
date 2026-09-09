@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Аудит ELF внутри `.deb`: сколько их, какая glibc нужна, нет ли `__isoc23_*`.
+
+Зачем именно это (arch/spikes/S3.md §1.3, урок сборки Handy):
+
+* **число ELF** — сколько объектов придётся подписывать по ГОСТ в контуре с ЗПС
+  (v1.1). Ожидание жёсткое: 3 с vendor, 0 без него. Любое расхождение — стоп
+  сборки, а не предупреждение: лишний `.so` = лишняя позиция в SBOM и в процедуре
+  подписи у заказчика;
+* **max GLIBC_** — колесо ORT собрано под manylinux_2_27, а целевая ALSE 1.8 несёт
+  glibc 2.36. Символ новее 2.36 = пакет не запустится на целевой машине;
+* **`__isoc23_*`** — след сборки современным GCC, из-за которого в сборке Handy
+  понадобился шим. Их быть не должно ни одного.
+
+    tools/elf-audit --strict dist/astra-voice_*.deb
+    tools/elf-audit --strict --expect 0 dist/astra-voice_*.deb   # сборка --no-vendor
+    tools/elf-audit /путь/к/каталогу                             # распакованное дерево
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+#: glibc целевой системы: ALSE 1.8.5 = Debian 12 = glibc 2.36.
+MAX_GLIBC = (2, 36)
+#: Ожидаемое число собственных ELF в пакете (3 `.so` onnxruntime).
+DEFAULT_EXPECT = 3
+
+_GLIBC_RE = re.compile(r"GLIBC_(\d+)\.(\d+)(?:\.(\d+))?")
+_ISOC23_RE = re.compile(r"__isoc23_\w+")
+
+
+@dataclass
+class Elf:
+    path: str
+    size: int
+    max_glibc: tuple[int, ...]
+    isoc23: list[str]
+
+
+def _is_elf(path: Path) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def _audit_one(path: Path, rel: str) -> Elf:
+    out = subprocess.run(
+        ["objdump", "-T", str(path)], capture_output=True, text=True, check=False
+    ).stdout
+    versions = [tuple(int(g) for g in m.groups() if g) for m in _GLIBC_RE.finditer(out)]
+    return Elf(
+        path=rel,
+        size=path.stat().st_size,
+        max_glibc=max(versions) if versions else (0,),
+        isoc23=sorted(set(_ISOC23_RE.findall(out))),
+    )
+
+
+def _collect(root: Path) -> list[Elf]:
+    found: list[Elf] = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and not path.is_symlink() and _is_elf(path):
+            found.append(_audit_one(path, "/" + str(path.relative_to(root))))
+    return found
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="аудит ELF в .deb или в дереве")
+    ap.add_argument("target", type=Path, help=".deb или распакованный каталог")
+    ap.add_argument("--expect", type=int, default=DEFAULT_EXPECT, help="ожидаемое число ELF")
+    ap.add_argument("--strict", action="store_true", help="расхождение → код возврата 1")
+    args = ap.parse_args(argv)
+
+    if not args.target.exists():
+        print(f"нет такого файла: {args.target}", file=sys.stderr)
+        return 2
+    if shutil.which("objdump") is None:
+        print("нужен objdump (пакет binutils)", file=sys.stderr)
+        return 2
+
+    tmp: tempfile.TemporaryDirectory[str] | None = None
+    if args.target.is_dir():
+        root = args.target
+    else:
+        tmp = tempfile.TemporaryDirectory(prefix="elf-audit-")
+        root = Path(tmp.name)
+        subprocess.run(["dpkg-deb", "-x", str(args.target), str(root)], check=True)
+
+    try:
+        elves = _collect(root)
+    finally:
+        if tmp is not None:
+            tmp.cleanup()
+
+    print(f"ELF найдено: {len(elves)} (ожидалось {args.expect})")
+    problems: list[str] = []
+    for elf in elves:
+        glibc = ".".join(str(p) for p in elf.max_glibc)
+        mark = "ok"
+        if elf.max_glibc > MAX_GLIBC:
+            mark = f"GLIBC {glibc} > {'.'.join(str(p) for p in MAX_GLIBC)}"
+            problems.append(f"{elf.path}: {mark}")
+        if elf.isoc23:
+            problems.append(f"{elf.path}: {len(elf.isoc23)} символов __isoc23_*")
+            mark = "isoc23"
+        print(f"  {elf.path}  {elf.size:>10} Б  max GLIBC_{glibc}  {mark}")
+
+    if len(elves) != args.expect:
+        problems.append(f"число ELF {len(elves)} ≠ ожидаемых {args.expect}")
+
+    if problems:
+        print("\nрасхождения:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        return 1 if args.strict else 0
+    print("гейт пройден")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

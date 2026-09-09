@@ -1,0 +1,50 @@
+Source: astra-voice
+Section: utils
+Priority: optional
+Maintainer: ArrivaRUS <arrivarus@gmail.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/ArrivaRUS/astra-voice
+Vcs-Git: https://github.com/ArrivaRUS/astra-voice.git
+Vcs-Browser: https://github.com/ArrivaRUS/astra-voice
+
+Package: astra-voice
+Architecture: amd64
+Depends: ${misc:Depends},
+         python3 (>= 3.11),
+         python3-pyqt5,
+         python3-pyqt5.qtquick,
+         qml-module-qtquick2,
+         qml-module-qtquick-controls2,
+         qml-module-qtquick-layouts,
+         qml-module-qtquick-window2,
+         qml-module-qtgraphicaleffects,
+         python3-numpy (>= 1:1.22.4),
+         python3-protobuf,
+         python3-flatbuffers,
+         python3-sympy,
+         python3-packaging,
+         python3-requests,
+         python3-jsonschema,
+         python3-xlib,
+         gpgv
+# Шрифты — Recommends, а не Depends: на ALSE apt ставит Recommends по умолчанию,
+# а в чистом debian:12 (CI, сборочный контейнер) пакетов PT нет, и жёсткая
+# зависимость ломала бы проверку установки. Резерв — PT Astra Sans/Fact через
+# QFontDatabase (A-03, Р8).
+Recommends: fonts-pt-root-ui,
+            fonts-pt-mono,
+            polkit-kde-agent-1,
+            pipewire-pulse | pulseaudio,
+            wireplumber
+Description: Голосовой ввод для Astra Linux (офлайн-распознавание речи)
+ Зажали горячую клавишу, сказали фразу — текст появился в активном окне.
+ Распознавание идёт полностью на месте, на процессоре: ни аудио, ни текст
+ никуда не передаются.
+ .
+ Движок по умолчанию — GigaAM v3 (русский язык, пунктуация); доступны модели
+ Whisper. Модели скачиваются отдельно по подписанному каталогу либо ставятся
+ из локального файла — в закрытом контуре сеть не нужна.
+ .
+ Интерфейс — Qt Quick, следует теме сессии (KDE и Fly).

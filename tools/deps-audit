@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Гейт Р3: `Requires-Dist` вендорных колёс ↔ версии в apt и в `Depends` пакета.
+
+Вендорим только `onnxruntime` и `onnx-asr` (`--no-deps`), а их зависимости —
+numpy, protobuf, flatbuffers, sympy, packaging — берём системные, из apt.
+Значит, каждый релиз колеса надо сверять с тем, что реально есть в ALSE:
+если ORT потребует numpy новее, чем 1.24.2 из репозитория, пакет соберётся,
+установится и упадёт при первом импорте. Этот скрипт ловит расхождение на сборке.
+
+    tools/deps-audit --vendor .build/vendor --deb dist/astra-voice_*.deb --strict
+
+Без apt (в чужом контейнере) версии не проверяются — сверяется только покрытие
+`Depends`, о чём скрипт честно говорит.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# Соответствие имён PyPI → пакеты Debian/ALSE. Правится вручную и осознанно.
+DEBIAN_NAME = {
+    "numpy": "python3-numpy",
+    "protobuf": "python3-protobuf",
+    "flatbuffers": "python3-flatbuffers",
+    "sympy": "python3-sympy",
+    "packaging": "python3-packaging",
+    "typing-extensions": "python3-typing-extensions",
+    "typing_extensions": "python3-typing-extensions",
+}
+
+_REQ_RE = re.compile(
+    r"^Requires-Dist:\s*(?P<name>[A-Za-z0-9._-]+)\s*(?P<spec>[^;]*?)\s*(?:;\s*(?P<marker>.*))?$"
+)
+_SPEC_RE = re.compile(r"(?P<op>[<>=!~]=?)\s*(?P<version>[0-9][0-9A-Za-z.*+!-]*)")
+
+
+def _requirements(vendor: Path) -> list[tuple[str, str, str]]:
+    out: list[tuple[str, str, str]] = []
+    for meta in sorted(vendor.glob("*.dist-info/METADATA")):
+        for line in meta.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = _REQ_RE.match(line)
+            if not m:
+                continue
+            marker = (m.group("marker") or "").strip()
+            # Экстры не ставятся (--no-deps + без [hub]); маркер по версии Python
+            # неактуален: целевая и сборочная — 3.11.
+            if "extra ==" in marker or "python_version <" in marker:
+                continue
+            out.append((m.group("name").lower(), (m.group("spec") or "").strip(), marker))
+    return out
+
+
+def _apt_version(pkg: str) -> str | None:
+    if shutil.which("apt-cache") is None:
+        return None
+    proc = subprocess.run(
+        ["apt-cache", "policy", pkg], capture_output=True, text=True, check=False
+    )
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].endswith(":") and parts[1] not in ("(none)", ""):
+            # Вторая строка вывода — кандидат (первая — установленная версия).
+            if "installed" not in line.lower() and "установ" not in line.lower():
+                return parts[1]
+    return None
+
+
+def _satisfies(version: str, spec: str) -> bool | None:
+    """`None` — нечего проверять; иначе — выполняется ли спецификатор."""
+    checks = list(_SPEC_RE.finditer(spec))
+    if not checks:
+        return None
+    ops = {">=": "ge", ">": "gt", "<=": "le", "<": "lt", "==": "eq", "!=": "ne"}
+    for m in checks:
+        op, want = m.group("op"), m.group("version")
+        if op not in ops or "*" in want:
+            continue
+        proc = subprocess.run(
+            ["dpkg", "--compare-versions", version, ops[op], want], check=False
+        )
+        if proc.returncode != 0:
+            return False
+    return True
+
+
+def _deb_depends(deb: Path) -> set[str]:
+    raw = subprocess.run(
+        ["dpkg-deb", "--field", str(deb), "Depends"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    names: set[str] = set()
+    for item in raw.split(","):
+        for alt in item.split("|"):
+            token = alt.strip().split()[0] if alt.strip() else ""
+            if token:
+                names.add(token)
+    return names
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--vendor", type=Path, required=True, help="каталог с *.dist-info")
+    ap.add_argument("--deb", type=Path, help="собранный пакет (проверка Depends)")
+    ap.add_argument("--strict", action="store_true")
+    args = ap.parse_args(argv)
+
+    if not args.vendor.is_dir():
+        print(f"нет каталога vendor: {args.vendor}", file=sys.stderr)
+        return 2
+
+    depends = _deb_depends(args.deb) if args.deb and args.deb.is_file() else None
+    problems: list[str] = []
+    seen: set[str] = set()
+
+    for name, spec, _marker in _requirements(args.vendor):
+        if name in seen:
+            continue
+        seen.add(name)
+        deb_name = DEBIAN_NAME.get(name)
+        if deb_name is None:
+            problems.append(f"{name}: нет соответствия пакету Debian в DEBIAN_NAME")
+            continue
+        apt = _apt_version(deb_name)
+        verdict = "apt недоступен" if apt is None else apt
+        ok = True
+        if apt is not None:
+            sat = _satisfies(apt, spec)
+            if sat is False:
+                ok = False
+                problems.append(f"{deb_name} {apt} не удовлетворяет {name}{spec}")
+        if depends is not None and deb_name not in depends:
+            ok = False
+            problems.append(f"{deb_name} требуется колесом ({name}{spec}), но его нет в Depends")
+        print(f"  {name}{spec or ' (без ограничений)'} → {deb_name} {verdict} {'ok' if ok else 'РАСХОЖДЕНИЕ'}")
+
+    if problems:
+        print("\nрасхождения:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        return 1 if args.strict else 0
+    print("гейт METADATA ↔ apt пройден")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

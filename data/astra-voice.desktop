@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Astra Voice
+Name[en]=Astra Voice
+GenericName=Голосовой ввод
+GenericName[en]=Voice input
+Comment=Офлайн-распознавание речи: сказали — текст появился в активном окне
+Comment[en]=Offline speech to text: speak, and the text lands in the active window
+Exec=astra-voice
+TryExec=astra-voice
+Icon=astravoice
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=диктовка;речь;распознавание;микрофон;voice;dictation;speech;
+StartupNotify=true
+StartupWMClass=astra-voice
+X-GNOME-UsesNotifications=true
