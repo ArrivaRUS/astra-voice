@@ -1,4 +1,5 @@
 """Генератор темы: детерминированность, идемпотентность и свежесть генерата в репозитории."""
+
 from __future__ import annotations
 
 import importlib.util

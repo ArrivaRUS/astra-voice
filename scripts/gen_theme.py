@@ -12,6 +12,7 @@
 отсортированы. Токены, значение которых — проза, ссылка вида `state.<тема>.…`
 или составная CSS-строка, пропускаются: в QML им нет применения.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -161,8 +162,7 @@ def emit(name: str, value: Any, aliases: dict[str, str]) -> list[str]:
         parts = value.split()
         if all(PX_RE.match(p) for p in parts) and len(parts) in MULTI_SUFFIX:
             return [
-                f"readonly property real {name}{suffix}: "
-                f"{num(float(PX_RE.match(part).group(1)))}"  # type: ignore[union-attr]
+                f"readonly property real {name}{suffix}: {num(float(PX_RE.match(part).group(1)))}"  # type: ignore[union-attr]
                 for suffix, part in zip(MULTI_SUFFIX[len(parts)], parts, strict=True)
             ]
         return []
@@ -266,17 +266,20 @@ def build_pill(data: dict[str, Any]) -> str:
 
 def render(data: dict[str, Any], type_name: str, body: list[str]) -> str:
     version = data["$meta"]["version"]
-    lines = [HEADER.format(version=version), "pragma Singleton",
-             "import QtQuick 2.15", "", "QtObject {"]
+    lines = [
+        HEADER.format(version=version),
+        "pragma Singleton",
+        "import QtQuick 2.15",
+        "",
+        "QtObject {",
+    ]
     lines.extend(body)
     lines.append("}")
     return "\n".join(lines) + "\n"
 
 
 def build_qmldir() -> str:
-    types = sorted(
-        p.stem for p in QML_DIR.glob("*.qml") if p.stem not in {"Theme", "PillTheme"}
-    )
+    types = sorted(p.stem for p in QML_DIR.glob("*.qml") if p.stem not in {"Theme", "PillTheme"})
     lines = [
         "# СГЕНЕРИРОВАНО scripts/gen_theme.py — НЕ ПРАВИТЬ РУКАМИ.",
         "singleton Theme 1.0 Theme.qml",
@@ -297,8 +300,9 @@ def outputs() -> dict[Path, str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true",
-                        help="сравнить с репозиторием, ничего не писать")
+    parser.add_argument(
+        "--check", action="store_true", help="сравнить с репозиторием, ничего не писать"
+    )
     args = parser.parse_args(argv)
 
     QML_DIR.mkdir(parents=True, exist_ok=True)

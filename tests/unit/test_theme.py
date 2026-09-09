@@ -3,6 +3,7 @@
 Фикстуры синтетические, но в формате KConfig (`ключ=значение`, секции `[Colors:*]`),
 как на машине заказчика: Breeze (светлая), BreezeDark, Astra Dark.
 """
+
 from __future__ import annotations
 
 import os

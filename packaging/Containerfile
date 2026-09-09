@@ -43,6 +43,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
         qml-module-qtquick-controls2 \
         qml-module-qtquick-layouts \
         qml-module-qtquick-window2 \
+        qml-module-qtquick-shapes \
         qml-module-qtgraphicaleffects \
         python3-protobuf \
         python3-flatbuffers \

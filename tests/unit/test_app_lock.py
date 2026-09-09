@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import socket
 import subprocess
@@ -16,7 +17,18 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.unit
+# Тестам нужен настоящий процесс GUI, то есть PyQt5 (дисплей не нужен —
+# `QT_QPA_PLATFORM=offscreen`). На машине разработчика без PyQt5 пропускаем,
+# а в CI требуем: молчаливый пропуск там означал бы ложную зелень.
+_QT_MISSING = importlib.util.find_spec("PyQt5.QtWidgets") is None
+
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.skipif(
+        _QT_MISSING and not os.environ.get("CI"),
+        reason="нужен python3-pyqt5",
+    ),
+]
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "src" / "astra_voice" / "bootstrap.py"
@@ -53,13 +65,28 @@ def _run(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[st
     )
 
 
-def _wait_for(path: Path, timeout: float = START_TIMEOUT_S) -> None:
+def _report(proc: subprocess.Popen[str]) -> str:
+    """Что успел сказать дочерний процесс: код возврата, stderr, stdout."""
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        out, err = proc.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+    return f"код возврата: {proc.returncode}\nstderr:\n{err}\nstdout:\n{out}"
+
+
+def _wait_for(path: Path, proc: subprocess.Popen[str], timeout: float = START_TIMEOUT_S) -> None:
+    """Ждёт файл; если процесс умер или не дождались — печатает его stderr."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
             return
+        if proc.poll() is not None:
+            raise AssertionError(f"дочерний процесс завершился до {path}\n{_report(proc)}")
         time.sleep(0.05)
-    raise AssertionError(f"не дождался появления {path}")
+    raise AssertionError(f"не дождался появления {path}\n{_report(proc)}")
 
 
 def _log_text(tmp_path: Path) -> str:
@@ -88,8 +115,8 @@ def first_instance(tmp_path: Path) -> Iterator[tuple[subprocess.Popen[str], dict
         text=True,
     )
     try:
-        _wait_for(Path(env["XDG_RUNTIME_DIR"]) / "astra-voice" / "ipc")
-        assert proc.poll() is None, proc.communicate()
+        _wait_for(Path(env["XDG_RUNTIME_DIR"]) / "astra-voice" / "ipc", proc)
+        assert proc.poll() is None, _report(proc)
         yield proc, env
     finally:
         proc.terminate()

@@ -4,6 +4,7 @@
 `qml/Theme.qml` читает из него один флаг `dark`, всё остальное — токены дизайн-системы.
 Смена темы в системе → сигнал `changed` → биндинги QML пересчитываются сами.
 """
+
 from __future__ import annotations
 
 from PyQt5.QtCore import QObject, pyqtProperty, pyqtSignal

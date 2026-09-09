@@ -65,5 +65,12 @@ override_dh_strip:
 override_dh_dwz:
 	dh_dwz -Xusr/lib/astra-voice/vendor
 
+# Вендорные .so сканируем НАМЕРЕННО: иначе в Depends не попадёт libc6, и lintian
+# честно ругается `missing-dependency-on-libc`. Приватных DT_NEEDED у них нет
+# (libonnxruntime грузится через dlopen), поэтому dpkg-shlibdeps разрешает всё.
 override_dh_shlibdeps:
-	dh_shlibdeps -Xusr/lib/astra-voice/vendor
+	dh_shlibdeps
+
+# А вот триггер ldconfig не нужен: библиотеки приватные, вне путей ld.so.
+override_dh_makeshlibs:
+	dh_makeshlibs -Xusr/lib/astra-voice/vendor

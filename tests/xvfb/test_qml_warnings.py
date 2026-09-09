@@ -7,6 +7,7 @@
 
 Запуск: `xvfb-run -a pytest -m xvfb` либо `QT_QPA_PLATFORM=offscreen pytest -m xvfb`.
 """
+
 from __future__ import annotations
 
 import os
@@ -96,16 +97,18 @@ def test_main_window_loads_without_warnings(qt: dict[str, Any]) -> None:
     assert not fresh, "предупреждения при загрузке Main.qml\n" + "\n".join(fresh)
 
     window = engine.rootObjects()[0]
+    # 900 × 620 — с декорацией KWin (спека §1.2), клиентская область по высоте — 588.
     assert window.property("minimumWidth") == 900
-    assert window.property("minimumHeight") == 620
+    assert window.property("minimumHeight") == 588
 
 
 def test_qmllint_is_clean_when_available() -> None:
     """qmllint — дополнительный гейт; на машине разработчика бинаря может не быть."""
     binary = shutil.which("qmllint")
-    if binary is None or subprocess.run(
-        [binary, "--help"], capture_output=True, text=True
-    ).returncode != 0:
+    if (
+        binary is None
+        or subprocess.run([binary, "--help"], capture_output=True, text=True).returncode != 0
+    ):
         pytest.skip("qmllint не установлен (в системе только симлинк qtchooser)")
 
     failures: list[str] = []

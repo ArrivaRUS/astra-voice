@@ -1,4 +1,4 @@
-// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.1.1 — НЕ ПРАВИТЬ РУКАМИ.
+// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.1.2 — НЕ ПРАВИТЬ РУКАМИ.
 // Перегенерация: python3 scripts/gen_theme.py · проверка: python3 scripts/gen_theme.py --check
 
 pragma Singleton
@@ -141,7 +141,7 @@ QtObject {
     readonly property real fontSettingLabelLineHeight: 1.5
     readonly property real fontSettingLabelSize: 14
     readonly property int fontSettingLabelWeight: 400
-    readonly property real fontSettingSubLineHeight: 1.4
+    readonly property real fontSettingSubLineHeight: 1.5
     readonly property real fontSettingSubSize: 12
     readonly property int fontSettingSubWeight: 400
     readonly property real fontSmallLineHeight: 1.45
@@ -176,7 +176,7 @@ QtObject {
     readonly property real sizeTitlebarH: 32
     readonly property real sizeWindowH: 620
     readonly property real sizeWindowMaxUsefulW: 988
-    readonly property real sizeWindowMinH: 560
+    readonly property real sizeWindowMinH: 588
     readonly property real sizeWindowMinW: 900
     readonly property real sizeWindowW: 900
 

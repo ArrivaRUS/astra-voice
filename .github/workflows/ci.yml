@@ -54,12 +54,17 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             make git python3 python3-venv python3-pip python3-numpy \
-            gnupg gpgv dpkg-dev binutils file
+            gnupg gpgv dpkg-dev binutils file \
+            python3-pyqt5
       - name: Окружение разработчика
         run: |
           python3 -m venv --system-site-packages "$VENV"
           "$VENV/bin/pip" install --quiet pytest pyyaml
+      # tests/unit/test_app_lock.py поднимает настоящий процесс GUI: нужен
+      # PyQt5 (выше) и платформа без дисплея.
       - run: make test VENV=$VENV
+        env:
+          QT_QPA_PLATFORM: offscreen
 
   xvfb:
     name: pytest -m xvfb
@@ -76,7 +81,7 @@ jobs:
             python3-pyqt5 python3-pyqt5.qtquick \
             qml-module-qtquick2 qml-module-qtquick-controls2 \
             qml-module-qtquick-layouts qml-module-qtquick-window2 \
-            qml-module-qtgraphicaleffects
+            qml-module-qtquick-shapes qml-module-qtgraphicaleffects
       - name: Окружение разработчика
         run: |
           python3 -m venv --system-site-packages "$VENV"

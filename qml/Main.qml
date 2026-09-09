@@ -20,11 +20,11 @@ ApplicationWindow {
     readonly property bool debugVisible: (info && info.debug === true)
 
     width: Theme.sizeWindowW
-    height: Theme.sizeWindowH
-    // Окно не уменьшается ниже 900 × 620 (решение В3, §1.1); токен size.window-min-h = 560
-    // относится к прежней ревизии макета и здесь намеренно не используется.
-    minimumWidth: Theme.sizeWindowW
-    minimumHeight: Theme.sizeWindowH
+    height: Theme.sizeWindowMinH
+    // 900 × 620 — размер С ДЕКОРАЦИЕЙ KWin (спека §1.2), поэтому минимум клиентской
+    // области по высоте — size.window-min-h = 588.
+    minimumWidth: Theme.sizeWindowMinW
+    minimumHeight: Theme.sizeWindowMinH
     visible: true
     title: qsTr("Astra Voice")
     color: Theme.bgApp

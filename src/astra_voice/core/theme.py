@@ -7,6 +7,7 @@ Fly — `~/.fly/paletterc` (заглушка, M9).
 Парсер работает без запущенного `QCoreApplication`: тему нужно знать **до**
 `engine.load()`. Слежение за файлом (`start()`) требует Qt-цикла событий.
 """
+
 from __future__ import annotations
 
 import re

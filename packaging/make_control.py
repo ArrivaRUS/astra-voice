@@ -60,6 +60,49 @@ def _clean_deps(value: str) -> str:
     return ", ".join(p for p in parts if p)
 
 
+def _shlib_depends(tree: Path) -> list[str]:
+    """Пакеты, дающие библиотеки, на которые ссылаются ELF в дереве.
+
+    Замена `${shlibs:Depends}` для режима `--host`: без неё в пакете не было бы
+    libc6, и lintian справедливо ругался бы `missing-dependency-on-libc`.
+    Приватных зависимостей у вендорных `.so` нет — только системные soname.
+    """
+    sonames: set[str] = set()
+    for path in tree.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        with open(path, "rb") as fh:
+            if fh.read(4) != b"\x7fELF":
+                continue
+        out = subprocess.run(
+            ["objdump", "-p", str(path)], capture_output=True, text=True, check=False
+        ).stdout
+        sonames.update(m.group(1) for m in re.finditer(r"NEEDED\s+(\S+)", out))
+
+    cache = subprocess.run(
+        ["/sbin/ldconfig", "-p"], capture_output=True, text=True, check=False
+    ).stdout
+    packages: set[str] = set()
+    for soname in sonames:
+        for line in cache.splitlines():
+            if line.strip().startswith(soname + " ") and "=>" in line:
+                lib = line.split("=>")[-1].strip()
+                # dpkg знает только реальный файл: `/lib/...` при usrmerge —
+                # симлинк, которого нет в списке файлов пакета.
+                found = False
+                for candidate in dict.fromkeys([lib, str(Path(lib).resolve())]):
+                    owner = subprocess.run(
+                        ["dpkg", "-S", candidate], capture_output=True, text=True, check=False
+                    ).stdout
+                    if ":" in owner:
+                        packages.add(owner.split(":")[0].strip())
+                        found = True
+                        break
+                if found:
+                    break
+    return sorted(packages)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--control", required=True, type=Path)
@@ -93,6 +136,9 @@ def main() -> int:
     for key in ("Depends", "Recommends", "Suggests", "Conflicts", "Breaks"):
         if key in binary:
             cleaned = _clean_deps(binary[key])
+            if key == "Depends":
+                extra = [d for d in _shlib_depends(args.tree) if d not in cleaned]
+                cleaned = ", ".join(filter(None, [cleaned, ", ".join(extra)]))
             if cleaned:
                 fields[key] = cleaned
 

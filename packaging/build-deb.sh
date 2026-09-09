@@ -48,8 +48,17 @@ die() {
 
 VERSION="$(sed -n '1s/.*(\(.*\)).*/\1/p' "$ROOT/packaging/debian/changelog")"
 [ -n "$VERSION" ] || die "не разобрал версию из packaging/debian/changelog"
-# Воспроизводимость: время последнего коммита, а не время сборки.
-SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 1)}"
+# Воспроизводимость. Источник времени — дата из changelog: она есть везде,
+# в отличие от git (в контейнере CI `git log` спотыкается на dubious ownership,
+# а откат на `echo 1` давал файлы 1970 года и 518 ошибок lintian
+# `package-contains-ancient-file`).
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+	CHANGELOG_DATE="$(sed -n 's/^ -- .*>  //p' "$ROOT/packaging/debian/changelog" | head -1)"
+	SOURCE_DATE_EPOCH="$(date -u -d "$CHANGELOG_DATE" +%s 2>/dev/null || true)"
+fi
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+	SOURCE_DATE_EPOCH="$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || date +%s)"
+fi
 export SOURCE_DATE_EPOCH
 DEB="astra-voice_${VERSION}_amd64.deb"
 
