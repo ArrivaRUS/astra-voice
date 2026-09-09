@@ -119,8 +119,8 @@
 | VAD / длинные записи | встроенный Silero-VAD (через ORT), сегментация > 20 с | встроенный Silero-VAD | паритет |
 | Сопровождение | один мейнтейнер, 0.x | k2-fsa, зрелый | против (митигация: вендор + пин + Engine-интерфейс) |
 
-**Решение:** `onnx-asr` + `onnxruntime` **1.29.0** (без `sympy` в зависимостях; `flatbuffers`/`protobuf`/`packaging` — из apt либо
-вендор чистого Python). Пины по sha256 в `packaging/wheels.lock`. **Условие отката** (PRD §1.4): если спайк S3 даст на
+**Решение:** `onnx-asr` + `onnxruntime` **1.29.0** (без `sympy` в зависимостях; `flatbuffers` 2.0.8 / `protobuf` 3.21.12 /
+`packaging` 23.0 — из apt Astra, проверено). Пины по sha256 в `packaging/wheels.lock`. **Условие отката** (PRD §1.4): если спайк S3 даст на
 эталоне p95 > 0,5 с при e2e_rnnt даже с 4 потоками → дефолт `e2e_ctc` (+25 %), а при провале и этого — `SherpaEngine` для
 GigaAM v3 (второй адаптер, строки манифеста с `engine: sherpa-onnx`).
 
@@ -206,14 +206,14 @@ docs/           plans.md status.md test-plan.md PRIVACY.md NOTICE  ·  arch/ dec
 ### 7.2 Содержимое `.deb` `astra-voice_X.Y.Z_amd64.deb` (оценка ≤ 30 МБ; A1 ≤ 80 МБ выполняется)
 - `/usr/bin/astra-voice` — лаунчер (добавляет `/usr/lib/astra-voice/vendor` в `sys.path`, запускает `astra_voice.app`);
   `/usr/lib/python3/dist-packages/astra_voice/` — код; `/usr/lib/astra-voice/vendor/` — `onnxruntime` 1.29.0 (3 `.so`, ~60 МБ
-  распакованных), `onnx_asr`, при необходимости `flatbuffers`; `/usr/share/astra-voice/{qml,icons,sounds,fonts,vad,test,keys,
+  распакованных), `onnx_asr` — только они; `/usr/share/astra-voice/{qml,icons,sounds,fonts,vad,test,keys,
   i18n,catalog.json,catalog.json.sig}`; `/usr/share/icons/hicolor/{16x16,22x22,scalable}/{apps,status}/`;
   `/usr/share/applications/astra-voice.desktop`; `/usr/share/polkit-1/actions/io.github.arrivarus.astra_voice.policy`;
   `/usr/libexec/astra-voice/update-helper` (root:root 0755); `/usr/share/doc/astra-voice/{NOTICE,PRIVACY.md,INSTALL-ADMIN.md,
   examples/policy.conf,sbom.cdx.json}`. `/etc/astra-voice/` пакет **не создаёт** (policy пишет админ). `postinst` — только
   триггеры dh (иконки/desktop), без сети и GUI.
 - **Depends:** `python3 (>= 3.11)`, `python3-pyqt5`, `python3-pyqt5.qtquick`, `python3-pyqt5.qtsvg`, `python3-xlib`,
-  `python3-numpy (>= 1:1.22.4)`, `python3-requests`, `python3-jsonschema`, `python3-packaging`, `python3-protobuf`,
+  `python3-numpy (>= 1:1.22.4)`, `python3-requests`, `python3-jsonschema`, `python3-packaging`, `python3-protobuf`, `python3-flatbuffers`,
   `qml-module-qtquick2`, `qml-module-qtquick-controls2`, `qml-module-qtquick-layouts`, `qml-module-qtquick-window2`,
   `qml-module-qtgraphicaleffects`, `qml-module-qtquick-shapes`, `libqt5svg5`, `libpulse0`, `gpgv`, `polkitd`, `pkexec`.
   **Recommends:** `polkit-kde-agent-1 | fly-…-agent`, `pipewire-pulse | pulseaudio`, `xdotool` (P2 fallback), `wireplumber`.
@@ -251,3 +251,102 @@ docs/           plans.md status.md test-plan.md PRIVACY.md NOTICE  ·  arch/ dec
 пилюля без фокуса/вне Alt+Tab/над панелью; SNI-иконка и её перекраска; polkit-окно и помощник; PipeWire-захват и гонка
 WirePlumber; Klipper; вставка в Kate/Konsole/LibreOffice/Firefox; `tcpdump` хостов (Ц4); автозапуск после перелогина;
 живая смена темы; замер ОЗУ/RTFx (Ц2, Ц6); уведомления KDE с кнопками.
+
+## 8. Порядок сборки: milestones по зависимостям (validation-first)
+
+Каждый milestone начинается с тестовой обвязки (фейки `FakeAudioSource`/`FakeEngine`/HTTP-сервер), заканчивается
+наблюдаемым «done» и командой проверки. Даты — рамки релизов из G1: v0.1 30.09 · v0.2 15.10 · v1.0 31.10.
+
+### M0 — спайки (до 12.09, ~3 дня; результаты → `arch/spikes.md`, решения → журнал)
+
+| Спайк | Что проверяем | Наблюдаемый критерий / команда | Если провал |
+|---|---|---|---|
+| S1 пилюля + трей | QML `Window` с флагами + EWMH на KWin **и** во Fly-сессии; композитор вкл/выкл; `QSystemTrayIcon` по имени иконки → перекраска под тему панели | `xdotool getactivewindow` не меняется после показа; `xprop -id <pill> _NET_WM_STATE` содержит `ABOVE, SKIP_TASKBAR, SKIP_PAGER`; пилюли нет в Alt+Tab; над панелью не лежит; трей-иконка меняет цвет строки под светлой/тёмной панелью | override-redirect режим; иконка-пиксмап |
+| S2 polkit-помощник | `pkexec /usr/libexec/…/update-helper install x.deb` из `QProcess` GUI-процесса на тестовом пакете 0.0.1→0.0.2 (установка `.policy` и помощника — один `sudo` руками) | ровно **одно** окно пароля KDE; коды 0/126/127 различимы; `dpkg-query -W` показывает 0.0.2; GUI не блокируется | `pkcon install-local` как запасной путь (PackageKit есть) |
+| S3 рантайм + замер | venv в scratch: `onnxruntime==1.29.0` + `onnx-asr==0.12.0` с **системным** numpy 1.24.2; загрузка `istupakov/gigaam-v3-onnx` (e2e_rnnt 226 МБ; при «да» — e2e_ctc и rnnt, ~680 МБ); `scripts/measure_model.py` | `import onnxruntime` ok; 10 прогонов тестового wav 6 с: медиана и p95 инференса при 2/4 потоках; `VmHWM`; число `.so` = 3; `objdump -T` без `__isoc23_`; **порог:** p95 ≤ 300 мс хотя бы у e2e_rnnt или e2e_ctc | дефолт e2e_ctc; при > 400 мс у обоих — `SherpaEngine` для GigaAM v3 |
+| S4 хоткей + вставка | `python3-xlib`: grab `Ctrl+Space` ×8 масок, PTT с фильтром автоповтора, временный grab `Escape`, `BadAccess` на занятой комбинации (`Alt+F2`), XTest `Ctrl+V` в Kate при русской раскладке, восстановление буфера, `x-kde-passwordManagerHint` против Klipper | текст появился в Kate; буфер вернулся ≤ 200 мс; `qdbus org.kde.klipper /klipper getClipboardHistoryMenu` не содержит фразу; `Alt+F2` → BadAccess пойман | Shift+Insert как дефолт вставки; предупреждение о Klipper вместо защиты (P1 остаётся) |
+| S5 звук | `libpulse-simple` через ctypes, 16 кГц mono s16le, виртуальный источник (`pactl load-module module-null-sink sink_name=av_test` + `module-remap-source master=av_test.monitor`), `paplay --device=av_test test.wav`; тишина; повторное открытие после `systemctl --user restart wireplumber` | уровень живой при `paplay`, `silent` через 2 с тишины; после рестарта WirePlumber устройство открывается со 2-й попытки ≤ 1 с; на диске ни одного файла | `QAudioInput` (apt `python3-pyqt5.qtmultimedia`) |
+
+### M1–M11 (порядок = зависимости; в скобках — истории беклога)
+
+| M | Цель | Done (наблюдаемо) | Валидация | Риски |
+|---|---|---|---|---|
+| **M1 Скелет и упаковка** (v0.1; 12.1, 1.1, 9.2, 10.5, 4.7-старт) | Репозиторий §7.1, `gen_theme.py` → `Theme.qml`, лаунчер, `--hidden`, single-instance, settings/policy/paths/logging/version, тема из `kdeglobals`, оболочка окна (сайдбар + «Общие» + строка-статус), `make deb`, CI зелёный | `apt install ./astra-voice_0.1.0~m1_amd64.deb` на ALSE → окно 900×620 в теме KDE; второй запуск показывает первое окно; `make deb` ≤ 5 мин | `time make deb`; `pytest -m unit`; `lintian`; `dpkg-deb -c \| grep -c '\.so$'` = 3 | QML 5.15 vs макет (тени `DropShadow`, шрифты PT); размер deb |
+| **M2 Воркер и движок** (2.5, 8.3, 2.8-часть) | Супервизор, IPC, воркер, `OnnxAsrEngine` (раскладка `onnx-asr-gigaam-v3`), `model.load` из локальной папки, `transcribe.file`, `measure`, рестарт при краше, выгрузка по простою | `astra-voice --debug-transcribe data/test/test-ru-6s.wav` печатает текст с «проверка» и `t_ms`; `kill -9 <worker>` → новый pid ≤ 1 с, модель перезагружена, трей/пилюля показали ошибку один раз | `pytest -m engine` (CI с кэшем модели); `pytest tests/unit/test_supervisor.py` | RTFx (см. S3); ORT-потоки |
+| **M3 Звук** (1.6-часть, 2.4, 11.1) | `PulseSimpleSource`, уровни, тишина, лимит 120 с, VAD > 20 с, список/выбор устройства, действие «Перезапустить звуковую службу», `WavFileSource` | e2e с виртуальным микрофоном: `record.start` → `paplay` 6 с → `result`; тишина → `silent` ≤ 2,2 с; 130 с записи → `limit` + текст | `scripts/e2e/virtual_mic.sh`; `pytest -m unit tests/worker/test_audio_fsm.py` | гонка WirePlumber; `EBUSY` при эксклюзивном захвате |
+| **M4 Цикл диктовки** (2.1, 2.2, 2.3, 3.1, 3.2, 3.5, 4.1–4.4, 11.2, 8.4, 2.8) | Хоткей PTT/toggle, пилюля 12 состояний, трей 6 состояний + меню, вставка с восстановлением, отмена, очередь 1, статистика, корректное завершение | S2, S3, S4-A1/A3/A4, S12-A3, S14 зелёные на машине; **p95 «отпустил → текст» ≤ 0,5 с по 50 диктовкам** (Ц2) из `stats.json` | `xdotool keydown ctrl+space; paplay …; xdotool keyup ctrl+space` ×50 → `astra-voice --stats`; `pytest -m xvfb` | фокус/стек пилюли; Klipper; BadAccess |
+| **M5 Онбординг и первая модель** (1.2, 1.3, 1.5, 1.6, 9.1-Общие) | Экраны O1–O4 (+O5 «Готово» без автозапуска), минимальный загрузчик (HF, Range, sha256, смоук) для модели по умолчанию, установка из папки, поле захвата + конфликты KDE, тест микрофона без вставки | S1-A1/A2/A3/A5/A7 на чистой ВМ ALSE 1.8; `tcpdump`: до включения тумблеров — 0 соединений, кроме явного «Скачать» | `pytest -m unit tests/models/test_downloader.py` (206/200/обрыв/подмена); ручной прогон S1 по секундомеру (Ц3-черновик) | HF недоступен → «Из файла» |
+| **→ v0.1 «Диктовка работает» 30.09** | тег `v0.1.0` → deb + `SHA256SUMS` + `.asc` + SBOM → GitHub Release (Ц7 требует подпись уже здесь; 12.2 частично раньше плана) | заказчик пользуется вместо Handy; чеклист v0.1 беклога | `scripts/release.sh v0.1.0` | ключ подписи (CI secret) заводится сейчас |
+| **M6 Каталог** (5.8, 5.1, 5.2, 5.3, 5.5, 5.6, 5.7, 5.4, 1.4, 11.3) | Манифест 12 записей (`build_manifest.py`), `CatalogModel`, карточка 20 состояний, источники HF→GitHub→corp, очередь/отмена/пауза «нет места», удаление, переключение, замеры и полоски по протоколу, ошибки повреждена/OOM, фильтры | S7, S15 зелёные; **≥ 3 модели замерены** (Ц6); скриншоты 20 состояний = референсы | `pytest -m unit tests/models/`; `pytest -m engine` на 3 раскладках; DesignReviewer | форматы Whisper/Vosk под onnx-asr (S3 закрывает) |
+| **M7 Сеть и проверки** (10.8, 10.1, 6.1, 6.2, 6.3, 7.1, 7.6, 7.7) | `HttpClient` (гейт/кэш/backoff/UA/прокси/CA), HF refs, GitHub latest, строка-статус 17 состояний, тумблеры/офлайн/URL, обновление ревизии со смоуком и откатом, манифест «Новое», трей «Проверить обновления» | S6, S8-A1..A4/A6/A7; `tcpdump` за сессию: только хосты `PRIVACY.md`, в офлайне — 0 (Ц4) | `pytest -m unit tests/net/` (фейковый сервер 200/304/429/407/таймаут); `sudo tcpdump -nn 'tcp[13]&2!=0' -w s.pcap` + `ss -tnp` | 429 за NAT; HF из РФ |
+| **M8 Обновлятор, трек A** (12.2, 7.2, 7.5) | Помощник + `.policy`, `app_updater`, панель 14 состояний, «Обновить из файла», проверка подписи GUI+root | S9-A1..A7 на машине: реальный апгрейд 0.2.0-rc → 0.2.0 через одно окно polkit; подменённый deb отвергнут | `pytest tests/unit/test_update_helper.py` (фейковые `gpgv/apt-get` через PATH); ручной S9 | polkit-агент во Fly; T2-ревью security-analyst |
+| **M9 Автозапуск, уведомления, звук, разделы** (8.2, 1.7, 10.4, 9.1-все, 4.5, 4.6, 3.3, 3.4, 3.6, 2.6, 2.7, 1.5b, 1.8, 4.7-живая) | XDG-ярлык + O5, D-Bus-уведомления с кнопками и запасным баннером, тоны через `pa_simple_write` (без новых зависимостей), «Вывод/Продвинутые/О программе», терминалы по `WM_CLASS`, Klipper-опция, выгрузка модели, живая тема | S11, S12, S13-A2, F13-acceptance; после перелогина — трей есть, аудио не открыто (`wpctl status`) | `pytest -m unit tests/platform/test_autostart.py`; перелогин в KDE **и** во Fly | Fly-уведомления убивают владельца шины |
+| **→ v0.2 «Каталог, обновления, автозапуск» 15.10** | требования №1–5 закрыты; Ц3 (≤ 5 мин на ВМ), Ц4, Ц6 | чеклист v0.2 беклога; G5 | `scripts/release.sh v0.2.0` | — |
+| **M10 Корпоративный контур** (10.2, 9.4, 5.9, 10.3, 7.3, 7.4, 10.6, 12.4, 10.7) | `policy.conf` + замки, «только отечественные» (6 моделей), корп. URL + `catalog_pubkey` + `latest.json`, трек B + детект ЗПС + вопрос, `INSTALL-ADMIN.md`, документ для админа ИБ, SBOM в релизе, NOTICE/PRIVACY/дисклеймер | S10-A1..A4, S16, F14/F15-acceptance; `profile=secure` → 0 соединений и 6 карточек | `pytest -m unit tests/core/test_policy.py`, `tests/updates/test_track.py`; ВМ с `policy.conf` | согласие на имя (L1) — вне кода, гейт G5 |
+| **M11 Полировка** (9.3, 9.6, 11.4, 6.4, 6.5) | Полный английский, клавиатура У13 и кольца фокуса, «Отладка» + сбор диагностики, сигнал «близкая модель», «пропустить ревизию» | DesignReviewer: 24 экрана × 2 темы; `lupdate` без непереведённых; Ц1 — Handy удалён | `pytest -m xvfb` скриншоты; чеклист G5 | — |
+| **→ v1.0 31.10** · **v1.1:** ГОСТ-подпись 3 `.so` (`bsign-integrator`), ключ организации, ВМ с ЗПС (12.3, Ц5) | | | | помощник — скрипт, подписывать нечего |
+
+## 9. Ключевые риски и альтернативы (с обратимостью)
+
+| # | Риск | Вер./влияние | Митигация | Альтернатива · обратимость |
+|---|---|---|---|---|
+| R1 | Python-декодер RNN-T в `onnx-asr` не даёт p95 ≤ 0,5 с на Core Ultra 7 | ср./выс. | S3 в первую неделю; потоки ORT; дефолт e2e_ctc | `SherpaEngine` за тем же `Engine` · дни, манифест не ломается |
+| R2 | Пилюля крадёт фокус / уходит под окна / чёрные углы без композитора; во Fly другой WM | ср./выс. | S1 на KWin и fly-wm; EWMH руками; re-assert + проверка перекрытия; непрозрачный вариант без композитора | override-redirect (тумблер) · часы |
+| R3 | `Ctrl+Space` занят (ibus/fcitx переключают раскладку этой комбинацией на части ALSE) | ср./ср. | `BadAccess` → `not-grabbed` + «Выбрать другую»; парсер `kglobalshortcutsrc`; подсказка `Scroll Lock` | — |
+| R4 | Автоповтор X11 и порядок отпускания модификаторов ломают PTT | ср./ср. | автомат следит только за основной клавишей, фильтр пар Release/Press с одним `time`; `XkbSetDetectableAutoRepeat` если доступен в python-xlib | evdev-режим P2 |
+| R5 | Klipper игнорирует `x-kde-passwordManagerHint` на 5.27 | ср./низ. | S4; при провале — постоянная подпись-предупреждение (flows §7.6), опция остаётся P1 | — |
+| R6 | HF недоступен из РФ / 429 за NAT; GitHub 60 req/ч | выс./ср. | источники по очереди, зеркало в Releases, корп. URL, «Из файла», кэш 24 ч, ETag, случайная задержка, Retry-After | — |
+| R7 | Новые колёса ORT поднимут порог glibc или вернут `__isoc23_*` | низ./выс. | пин 1.29.0 по sha256; CI-тест `objdump -T` (max ≤ GLIBC_2.36, нет `isoc23`); при нужде — шим как `patchelf --add-needed` (+1 `.so`) | ORT 1.24.4 (GLIBC_2.27) · минуты |
+| R8 | ORT 1.29 несовместим с системным numpy 1.24 в рантайме | низ./выс. | проверка `import` в S3 и CI на Debian 12 | ORT 1.24.4 (numpy ≥ 1.21.6, + `python3-sympy` из apt) · минуты |
+| R9 | Полкит-агента нет (Fly) / пользователь не в `astra-admin` | ср./ср. | детект агента; трек B; текст с `sudo apt install ./…` | `pkcon install-local` · часы |
+| R10 | T1 потребует помощник-ELF вместо скрипта | низ./ср. | контракт argv/JSON сохраняется | C-помощник · день (+1 ELF под ЗПС) |
+| R11 | Шрифтов PT Root UI / PT Mono на ALSE нет (есть PT Astra Sans/Serif/Fact) | выс./низ. | вложить в пакет при допустимой лицензии (проверка legal); резервный стек из `tokens.json` → PT Astra Sans; DesignReviewer сверяет композицию, не метрику | — |
+| R12 | Меню трея рисует Plasma (DBusMenu) — стиль спеки §9.2 недостижим | выс./низ. | зафиксировать в спеке как «системное меню»; состав/неактивность — наши | своё QML-меню-поповер · дни (хуже по UX) |
+| R13 | Смоук новой ревизии держит две модели в памяти (~830 МБ пик) | ср./низ. | если `MemAvailable` < 2× — выгрузить текущую перед смоуком | — |
+| R14 | Гонка WirePlumber на старте — микрофон молчит | выс./ср. | ленивое открытие, ретраи, кнопка перезапуска службы, авто-перепроверка | — |
+| R15 | Ключ подписи релизов (CI secret) утёк/потерян | низ./выс. | keyring с двумя ключами (ротация), отзыв через новый релиз с обновлённым keyring, ключ в README | — |
+| R16 | QML 5.15: нет `MultiEffect`/`font.features`; `DropShadow` дорог на CPU | ср./низ. | тени только на окне/поповере, PT Mono для цифр; замер CPU пилюли ≤ 3 % при записи | предрендеренные тени PNG · часы |
+
+## 10. Что тестируем на каждом уровне
+
+| Уровень | Среда | Что | Инструменты / команда |
+|---|---|---|---|
+| Unit (CI + локально) | Debian 12, без дисплея | settings/миграции, policy-таблица, автомат хоткея, парсер конфликтов, выбор комбинации вставки по `WM_CLASS`, downloader (206/200/обрыв/подмена), схема и подпись манифеста, SemVer/`tag_name`, выбор трека, помощник (фейки `gpgv`/`apt-get`), статистика p95, `kdeglobals`, IPC-кодек, автомат воркера (`FakeAudioSource`+`FakeEngine`), фильтр логов, ELF-count deb, glibc колеса | `pytest -m unit`, `mypy --strict`, `ruff`, `qmllint` |
+| Integration (CI, xvfb / offscreen) | `Xvfb` + `QT_QPA_PLATFORM=xcb`, кэш модели | все QML без warnings + скриншоты состояний (24 × 2 темы) для DesignReviewer; XGrabKey/BadAccess/XTest в тестовое Qt-окно; буфер обмена с восстановлением; single-instance; трей-ветка «недоступен»; движок на 3 раскладках GigaAM с тестовым wav; смоук-откат при подменённом байте; VAD-границы | `pytest -m xvfb`, `pytest -m engine` |
+| Integration с виртуальным микрофоном (машина) | ALSE, PipeWire | `paplay` в виртуальный источник → `result`; тишина; лимит; рестарт WirePlumber | `scripts/e2e/virtual_mic.sh` |
+| E2E (P21½, машина заказчика, KDE **и** Fly) | реальная сессия | S1–S16 из PRD §6 по чеклисту `docs/test-plan.md`; p95 по 50 диктовкам; `tcpdump`/`ss` хосты; polkit одно окно; автозапуск после перелогина; тема live; Kate/Konsole/LibreOffice/Firefox; Klipper; Alt+Tab; ВМ с `policy.conf` | `scripts/e2e/*.sh` + ручной чеклист Юрки |
+| Security (T1/T2/T3) | ревью + тесты | инварианты §6 как тест-кейсы (подмена deb/подписи/манифеста, symlink в staging, аргументы помощника, отсутствие файлов аудио, хосты) | security-analyst по `security-gate` |
+
+## 11. Вопросы к человеку
+
+1. **Спайк S3 качает модели с HF** (226 МБ минимум, 680 МБ для трёх вариантов) в scratch-venv — нужно «да» на трафик/диск.
+2. **S2 требует одного `sudo`** на машине (положить `.policy` и тестовый помощник) — допустимо ли делать это на машине
+   заказчика, или готовим ВМ ALSE 1.8 (её же используем для S1 во Fly-сессии и для чистого прогона S1/Ц3)?
+3. Шрифты **PT Root UI / PT Mono** отсутствуют на ALSE: вкладывать в пакет (проверка лицензии ParaType — задача legal)
+   или принять резерв PT Astra Sans для UI (метрики макета чуть разойдутся)?
+4. Подпись релизов **GPG (Ed25519) через `gpgv`** вместо minisign — принять как решение архитектуры (аргумент: `gpgv` есть
+   у любого админа ALSE для трека B; `minisign` в apt Astra нет)? Кто владеет закрытым ключом CI (заказчик или Юрка)?
+5. Меню трея под SNI рисует Plasma — согласовать с DesignReviewer, что §9.2 спеки сверяется по составу, не по стилю.
+6. Root-помощник как Python-скрипт (ноль своих ELF) — принять, либо T1 потребует C-ELF?
+
+## 12. Факты среды (проверено read-only 2026-09-09; вход для синтеза и спайков)
+
+- ALSE 1.8.5 = Debian 12.0 (`/etc/debian_version`), glibc 2.36, Python 3.11.2, `python3-pyqt5` 5.15.9 (модули Core/Gui/
+  Widgets/Network/DBus/…; **QtQml/QtQuick не установлены**, пакет `python3-pyqt5.qtquick` 5.15.9+dfsg-1+b9 есть в apt);
+  `qml-module-qtquick-controls2` 5.15.8 и `qml-module-qtgraphicaleffects` установлены; `libqt5svg5`, `libqt5x11extras5`,
+  `qmllint`/`qmlscene` есть; `qtdeclarative5-dev-tools`, `pyqt5-dev-tools`, `xvfb`, `python3-pytest` 7.2, `python3-mypy` 1.0.1 — в apt.
+- В apt Astra есть: `python3-xlib` 0.33, `python3-evdev` 1.6.1, `python3-requests` 2.32.5 (установлен), `python3-jsonschema`
+  4.10, `python3-nacl` 1.5, `python3-flatbuffers` 2.0.8, `python3-protobuf` 3.21.12, `python3-packaging` 23.0, `python3-psutil`,
+  `gpgv` 2.2.40 (установлен). **Нет:** `python3-sounddevice`, `python3-pyaudio`, `python3-pynput`, `minisign`, `syft`, `python3-semver`.
+- Звук: PipeWire 1.4.9 с pulse-протоколом (`pactl` работает, драйвер источников — PipeWire; `pipewire-pulse.service` inactive —
+  протокол отдаёт сам pipewire), WirePlumber 0.5.12 активен; `libpulse-simple.so.0` грузится через ctypes; есть `pw-record`,
+  `paplay`, `parecord`; источники `alsa_input…Mic1/Mic2` (s32le, 48 кГц).
+- Колёса ORT в `~/.cache/uv`: 1.24.4 (max `GLIBC_2.27`, 22 МБ lib) и 1.29.0 (max `GLIBC_2.28`, 28 МБ lib), **0 ссылок
+  `__isoc23_*`**, по 3 `.so`; шим из Handy нужен был только prebuilt-бинарю крейта `ort`. `onnx-asr` 0.12.0: `numpy>=1.22.4`,
+  `onnxruntime>=1.18.1,!=1.24.1,!=1.25.*,!=1.26.0`; системный numpy 1.24.2 подходит.
+- KWin: композитор активен; EWMH поддерживает `_NET_ACTIVE_WINDOW`, `_NET_CLIENT_LIST_STACKING`, `ABOVE`, `SKIP_TASKBAR`
+  (4 из 5 проверенных атомов — тип `NOTIFICATION` проверить в S1); `StatusNotifierWatcher` host зарегистрирован;
+  `org.freedesktop.Notifications` — Plasma; `polkit-kde-authentication-agent-1` запущен; пользователь в `astra-admin`, `input`.
+- ЗПС выключена (`DIGSIG_ELF_MODE=0`, все режимы 0); ключи изготовителя в `/etc/digsig/`.
+- `~/.config/kglobalshortcutsrc` (23 КБ): формат `key=combo\tcombo,default,описание` — пример `_launch=Alt+Space\tAlt+F2\tSearch,…,Открыть строку поиска и запуск`.
+- Шрифты: PT Astra Sans/Serif/Fact есть; **PT Root UI и PT Mono — нет** (R11).
