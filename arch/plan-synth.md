@@ -114,7 +114,7 @@ root-staging 0700 и повторная проверка, `apt-get install --no-
 - **T1 модель угроз** (в работе) — И8, Н5, О3, О4 переданы security-analyst.
 - **G4 закрыт** (`decisions/log.md` 2026-09-09): v1.0 — вариант A (`.deb`); relocatable-раскладка в M1; user-bundle C1 — v1.1.
 - **Fly-сессия** (§13 плана #1, принято в синтез): адаптеры `platform/session.py` (детект KDE/Fly по
-  `XDG_CURRENT_DESKTOP`), тема — `kdeglobals` в KDE / `~/.fly/paletterc` во Fly; трей — иконки по имени в KDE,
-  явные цвета во Fly; буфер — Klipper-hint в KDE / тип из чёрного списка клип-менеджера fly-wm во Fly;
+  `XDG_CURRENT_DESKTOP`), тема — `kdeglobals` в KDE / `~/.fly/paletterc` во Fly; трей — иконки по имени в KDE (набор `astravoice-tray-*`, префикс без дефиса — иначе
+  KIconLoader срезает до `astra`, spec §9.1), явные цвета во Fly; буфер — Klipper-hint в KDE / тип из чёрного списка клип-менеджера fly-wm во Fly;
   лаунчер задаёт `QT_QUICK_CONTROLS_STYLE` сам; уведомления и polkit — общие; спайки S1/S4/S5 и E2E — в обеих сессиях;
   R17 блокировка интерпретаторов — документ для админа.

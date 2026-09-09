@@ -137,11 +137,11 @@ def logo_at(f_, wpx):
 
 
 def tray(size, state):
-    return inline("icons/hicolor/%dx%d/status/astra-voice-tray-%s.svg" % (size, size, state))
+    return inline("icons/hicolor/%dx%d/status/astravoice-tray-%s.svg" % (size, size, state))
 
 
 def main():
-    ic_png = {s: b64png("icons/hicolor/%dx%d/apps/astra-voice.png" % (s, s))
+    ic_png = {s: b64png("icons/hicolor/%dx%d/apps/astravoice.png" % (s, s))
               for s in (16, 22, 24, 32, 48, 64, 128, 256, 512)}
     m, MW, MH = B.master()
     bx, by, bw, bh, _ = m["bar"]
@@ -283,7 +283,7 @@ def main():
 
     # ------------------------------------------------------------ состояния
     a("<h2>Состояния: форма одна, цвет несёт третья точка</h2>")
-    a('<p class="lead">Файлы <code>hicolor/{22x22,16x16}/status/astra-voice-tray-*.svg</code> — '
+    a('<p class="lead">Файлы <code>hicolor/{22x22,16x16}/status/astravoice-tray-*.svg</code> — '
       "<b>шесть состояний</b>. Строка и первые две точки — всегда <code>currentColor</code> "
       "(цвет темы панели), меняется только заливка третьей точки. У <code>idle</code> цвета нет "
       "вовсе. Исключение одно — <code>nokey</code> («горячая клавиша не захвачена»): там третья "
@@ -291,7 +291,7 @@ def main():
       "отличать и от покоя, и от ошибки, а свободного цвета для него нет. Приглушать кольцо "
       "нельзя: <code>opacity .55–.7</code> в 16 px пропадает на светлой панели (проверено "
       "рендером rsvg-convert). "
-      "Для монохромных панелей есть <code>astra-voice-tray-mono.svg</code> — "
+      "Для монохромных панелей есть <code>astravoice-tray-mono.svg</code> — "
       "форма без цвета; состояние там передают подсказка и оверлей, не иконка.</p>")
     a('<div class="card"><div class="states">')
     for name, lt, dk, ru in ST:
@@ -384,12 +384,12 @@ def main():
         ("readme-mark.svg", "замок для шапки README, светлая/тёмная через prefers-color-scheme"),
         ("favicon.svg", "фавикон-вектор (геометрия 32 px)"),
         ("favicon-32.png", "фавикон-растр"),
-        ("icons/hicolor/scalable/apps/astra-voice.svg", "иконка приложения, вектор"),
-        ("icons/hicolor/&lt;size&gt;/apps/astra-voice.png",
+        ("icons/hicolor/scalable/apps/astravoice.svg", "иконка приложения, вектор"),
+        ("icons/hicolor/&lt;size&gt;/apps/astravoice.png",
          "16 · 22 · 24 · 32 · 48 · 64 · 128 · 256 · 512"),
-        ("icons/hicolor/{16x16,22x22}/status/astra-voice-tray-&lt;state&gt;.svg",
+        ("icons/hicolor/{16x16,22x22}/status/astravoice-tray-&lt;state&gt;.svg",
          "трей: idle · listening · processing · done · error"),
-        ("icons/hicolor/{16x16,22x22}/status/astra-voice-tray-mono.svg",
+        ("icons/hicolor/{16x16,22x22}/status/astravoice-tray-mono.svg",
          "трей для монохромных панелей"),
         ("icons/_src/", "исходники вычищенных мелких размеров и кривые имени"),
         ("_build-logo-pack.py / _build-pack-sheet.py", "сборка пака и этого листа"),

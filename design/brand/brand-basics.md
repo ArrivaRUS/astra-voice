@@ -261,18 +261,21 @@ SIL OFL, уже стоит в системе и даёт семейное схо
 | `logo-mark.svg` | знак отдельно, мастер-сетка 100 × 51,72 |
 | `readme-mark.svg` | замок для шапки README, тема через `prefers-color-scheme`, со своим полем |
 | `favicon.svg`, `favicon-32.png` | фавикон (геометрия 32 px) |
-| `icons/hicolor/scalable/apps/astra-voice.svg` | иконка приложения, вектор (сетка 64) |
-| `icons/hicolor/<S>/apps/astra-voice.png` | 16 · 22 · 24 · 32 · 48 · 64 · 128 · 256 · 512 |
-| `icons/hicolor/{16x16,22x22}/status/astra-voice-tray-<state>.svg` | трей: `idle` · `listening` · `processing` · `done` · `error` · `nokey` (кольцо вместо диска, §4.3) |
-| `icons/hicolor/{16x16,22x22}/status/astra-voice-tray-mono.svg` | трей для монохромных панелей (без цвета; состояние передают подсказка и оверлей) |
+| `icons/hicolor/scalable/apps/astravoice.svg` | иконка приложения, вектор (сетка 64) |
+| `icons/hicolor/<S>/apps/astravoice.png` | 16 · 22 · 24 · 32 · 48 · 64 · 128 · 256 · 512 |
+| `icons/hicolor/{16x16,22x22}/status/astravoice-tray-<state>.svg` | трей: `idle` · `listening` · `processing` · `done` · `error` · `nokey` (кольцо вместо диска, §4.3) |
+| `icons/hicolor/{16x16,22x22}/status/astravoice-tray-mono.svg` | трей для монохромных панелей (без цвета; состояние передают подсказка и оверлей) |
 | `icons/_src/` | вычищенные исходники мелких размеров + кривые имени (`wordmark.d`) |
 | `logo-pack.html` | контактный лист финала (самодостаточный) |
 | `_build-logo-pack.py`, `_build-pack-sheet.py` | сборка пака и листа; правки геометрии — только здесь, файлы генерируются |
 
 Установка иконок в системе: содержимое `icons/hicolor/` кладётся в
 `/usr/share/icons/hicolor/` (или `~/.local/share/icons/hicolor/`), после чего
-`gtk-update-icon-cache`. Имя иконки в `.desktop` — `astra-voice`; трей запрашивает
-`astra-voice-tray-<state>`.
+`gtk-update-icon-cache`. Имя иконки в `.desktop` — `Icon=astravoice`; трей запрашивает
+`astravoice-tray-<state>`. **Имя пакета и репозитория остаётся `astra-voice`** — без дефиса
+пишутся только имена файлов иконок и ключ `Icon=`: KIconLoader при промахе срезает имя по
+дефисам (`astra-voice-tray-idle` → … → `astra`) и подставляет системную звезду Astra Linux
+(проверено живым прогоном, `arch/spikes/S1.md`).
 
 Архив концептов раундов 1–2 (`concept-*.svg`, `concepts.html`, `concepts-r2.html`,
 `_build-concepts-r2.py`) оставлен в папке как история решения; в продукте не используется.

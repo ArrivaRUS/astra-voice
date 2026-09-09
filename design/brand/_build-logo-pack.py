@@ -302,7 +302,7 @@ def main():
                         draw(m, "currentColor", "currentColor", cls_acc="acc"))))
 
     # --- иконка приложения ------------------------------------------------
-    written.append(w(os.path.join(ICONS, "scalable", "apps", "astra-voice.svg"), svg_icon(64)))
+    written.append(w(os.path.join(ICONS, "scalable", "apps", "astravoice.svg"), svg_icon(64)))
     for S in ICON_SIZES:
         written.append(w(os.path.join(SRC, "icon-%d.svg" % S), svg_icon(S)))
 
@@ -313,10 +313,10 @@ def main():
     for S in (16, 22):
         for name, lt, dk, _ in STATES:
             written.append(w(os.path.join(ICONS, "%dx%d" % (S, S), "status",
-                                          "astra-voice-tray-%s.svg" % name),
+                                          "astravoice-tray-%s.svg" % name),
                              svg_tray(S, lt, dk, ring=name in RING_STATES)))
         written.append(w(os.path.join(ICONS, "%dx%d" % (S, S), "status",
-                                      "astra-voice-tray-mono.svg"),
+                                      "astravoice-tray-mono.svg"),
                          svg_tray(S, mono=True)))
 
     # --- PNG --------------------------------------------------------------
@@ -324,7 +324,7 @@ def main():
     for S in (16, 22, 24, 32, 48, 64, 128, 256, 512):
         src = os.path.join(SRC, "icon-%d.svg" % S) if S in ICON_SIZES \
             else os.path.join(SRC, "icon-64.svg")
-        dst = os.path.join(ICONS, "%dx%d" % (S, S), "apps", "astra-voice.png")
+        dst = os.path.join(ICONS, "%dx%d" % (S, S), "apps", "astravoice.png")
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         subprocess.run(["rsvg-convert", "-w", str(S), "-h", str(S), "-o", dst, src], check=True)
         pngs.append(dst)

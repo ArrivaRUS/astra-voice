@@ -29,13 +29,13 @@ SIZES = ("16x16", "22x22")
 
 # spec §9.1 — состояние → (имя иконки, подсказка)
 TRAY_STATES = [
-    ("idle", "astra-voice-tray-idle", "Astra Voice — готов · Ctrl+Space"),
-    ("listening", "astra-voice-tray-listening", "Слушаю…"),
-    ("processing", "astra-voice-tray-processing", "Распознаю…"),
-    ("done", "astra-voice-tray-done", "Готово"),
-    ("error", "astra-voice-tray-error", "Микрофон недоступен — открыть"),
-    # РАСХОЖДЕНИЕ: файла astra-voice-tray-nokey в наборе нет — временно берём error.
-    ("hotkey-not-grabbed", "astra-voice-tray-error",
+    ("idle", "astravoice-tray-idle", "Astra Voice — готов · Ctrl+Space"),
+    ("listening", "astravoice-tray-listening", "Слушаю…"),
+    ("processing", "astravoice-tray-processing", "Распознаю…"),
+    ("done", "astravoice-tray-done", "Готово"),
+    ("error", "astravoice-tray-error", "Микрофон недоступен — открыть"),
+    # РАСХОЖДЕНИЕ: файла astravoice-tray-nokey в наборе нет — временно берём error.
+    ("hotkey-not-grabbed", "astravoice-tray-error",
      "Горячая клавиша не захвачена — выбрать другую"),
 ]
 
@@ -49,7 +49,7 @@ def install_icons(verbose: bool = True) -> list[str]:
             continue
         dst = DST_ICONS / size / "status"
         dst.mkdir(parents=True, exist_ok=True)
-        for svg in sorted(src.glob("astra-voice-tray-*.svg")):
+        for svg in sorted(src.glob("astravoice-tray-*.svg")):
             shutil.copy2(svg, dst / svg.name)
             copied.append(str(dst / svg.name))
     if verbose:
@@ -64,7 +64,7 @@ def build_menu(qt, recording: bool, has_last_text: bool, models: list[str],
     from PyQt5.QtWidgets import QAction, QMenu
 
     menu = QMenu()
-    menu.setObjectName("astra-voice-tray-menu")
+    menu.setObjectName("astravoice-tray-menu")
 
     # заголовок-статус: всегда неактивен
     status = QAction("Слушаю…" if recording else "Готов", menu)

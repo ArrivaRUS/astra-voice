@@ -668,6 +668,13 @@ CAPS-заголовок группы      ← font.role.group-caps: 11 / 500 / +
 
 Геометрия 22: точки `r 1.2185 / 1.6815 / 2.3151` на `cy 8.4849`, строка `2,12 18×4 rx 2`.
 
+**Имена набора (обязательны именно эти):**
+`hicolor/{16x16,22x22}/status/astravoice-tray-{idle,listening,processing,done,error,nokey}.svg`
+(+ `astravoice-tray-mono.svg` для монохромных панелей), иконка приложения —
+`hicolor/scalable/apps/astravoice.svg` и `hicolor/<S>/apps/astravoice.png`, ключ `.desktop` —
+`Icon=astravoice`. Префикс без дефиса — иначе KIconLoader при промахе срезает имя по дефисам
+до `astra` и подставляет системную звезду Astra Linux (проверено, `arch/spikes/S1.md`).
+
 | Состояние | Цвет **третьей точки** | Подсказка |
 |---|---|---|
 | `idle` | `currentColor` темы панели | Astra Voice — готов · Ctrl+Space |
@@ -675,7 +682,7 @@ CAPS-заголовок группы      ← font.role.group-caps: 11 / 500 / +
 | `processing` | `#E8A33A` | Распознаю… |
 | `done` (**800 мс**) | `#2FA36B` | Готово |
 | `error` | `#D64545` | Микрофон недоступен — открыть |
-| `hotkey-not-grabbed` | кольцо `currentColor` вместо третьей точки (форма, не цвет; файл `astra-voice-tray-nokey.svg`) | Горячая клавиша не захвачена — выбрать другую |
+| `hotkey-not-grabbed` | кольцо `currentColor` вместо третьей точки (форма, не цвет; файл `astravoice-tray-nokey.svg`) | Горячая клавиша не захвачена — выбрать другую |
 
 **Правила, которые нельзя нарушать:** цвет несёт **только третья точка**; строка и точки 1–2
 всегда `currentColor`; форма не меняется никогда; **трей-иконка статична** — пульсация
