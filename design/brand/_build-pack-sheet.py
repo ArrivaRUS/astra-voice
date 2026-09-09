@@ -283,9 +283,14 @@ def main():
 
     # ------------------------------------------------------------ состояния
     a("<h2>Состояния: форма одна, цвет несёт третья точка</h2>")
-    a('<p class="lead">Файлы <code>hicolor/{22x22,16x16}/status/astra-voice-tray-*.svg</code>. '
-      "Строка и первые две точки — всегда <code>currentColor</code> (цвет темы панели), "
-      "меняется только заливка третьей точки. У <code>idle</code> цвета нет вовсе. "
+    a('<p class="lead">Файлы <code>hicolor/{22x22,16x16}/status/astra-voice-tray-*.svg</code> — '
+      "<b>шесть состояний</b>. Строка и первые две точки — всегда <code>currentColor</code> "
+      "(цвет темы панели), меняется только заливка третьей точки. У <code>idle</code> цвета нет "
+      "вовсе. Исключение одно — <code>nokey</code> («горячая клавиша не захвачена»): там третья "
+      "точка становится <b>кольцом</b> того же наружного диаметра, потому что состояние нужно "
+      "отличать и от покоя, и от ошибки, а свободного цвета для него нет. Приглушать кольцо "
+      "нельзя: <code>opacity .55–.7</code> в 16 px пропадает на светлой панели (проверено "
+      "рендером rsvg-convert). "
       "Для монохромных панелей есть <code>astra-voice-tray-mono.svg</code> — "
       "форма без цвета; состояние там передают подсказка и оверлей, не иконка.</p>")
     a('<div class="card"><div class="states">')
@@ -297,12 +302,17 @@ def main():
              '<span style="zoom:2.4;display:inline-block;margin-left:10px">%s</span>' % tray(16, name),
              '<span style="zoom:2.4;display:inline-block">%s</span>' % tray(22, name),
              '<span style="zoom:2.4;display:inline-block;margin-left:10px">%s</span>' % tray(16, name),
-             ru, name, (lt or "currentColor")))
+             ru, name,
+             ("кольцо · currentColor" if name in B.RING_STATES else (lt or "currentColor"))))
     a("</div>")
     a('<div class="chips">')
     for name, lt, dk, ru in ST:
-        a('<span class="chip"><i style="background:%s"></i>%s · %s / %s</span>'
-          % (lt or "#5A6884", ru, lt or "currentColor", dk or "currentColor"))
+        # у nokey цвета нет — в легенде тоже кольцо, а не диск
+        sw = ('border:2px solid #5A6884;background:transparent'
+              if name in B.RING_STATES else "background:%s" % (lt or "#5A6884"))
+        a('<span class="chip"><i style="%s"></i>%s · %s / %s</span>'
+          % (sw, ru, "кольцо" if name in B.RING_STATES else (lt or "currentColor"),
+             "кольцо" if name in B.RING_STATES else (dk or "currentColor")))
     a("</div></div>")
 
     # ------------------------------------------------------------ фавикон

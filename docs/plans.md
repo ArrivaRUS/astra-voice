@@ -15,7 +15,7 @@
 - Last updated: 2026-09-09.
 
 ## Assumptions
-- **A-01 Рантайм.** `onnx-asr` 0.12.0 + `onnxruntime` **1.24.4** (синтез Р3/Н4: 1.29.0 требует `protobuf ≥ 4.25.8`, в apt Astra — 3.21.12; у 1.24.4 все Requires-Dist закрываются apt: `python3-protobuf` 3.21.12, `python3-flatbuffers` 2.0.8, `python3-sympy` 1.11.1, `python3-numpy` 1.24.2 ≥ 1.21.6; `onnx-asr` исключает только 1.24.1). Пины sha256 — `packaging/wheels.lock`. **Факты плана #1 §12 сняты на 1.29.0 — S3 обязан повторить их на 1.24.4.** Апгрейд до 1.29.x — только вместе с легальным protobuf 4.x.
+- **A-01 Рантайм.** `onnx-asr` 0.12.0 + `onnxruntime` **1.24.4** (синтез Р3/Н4: 1.29.0 требует `protobuf ≥ 4.25.8`, в apt Astra — 3.21.12; у 1.24.4 все Requires-Dist закрываются apt: `python3-protobuf` 3.21.12, `python3-flatbuffers` 2.0.8, `python3-sympy` 1.11.1, `python3-numpy` 1.24.2 ≥ 1.21.6; `onnx-asr` исключает только 1.24.1). Пины sha256 — `packaging/wheels.lock`. **Подтверждено S3 на 1.24.4** (`arch/spikes/S3.md` §1: 3 `.so`, max GLIBC_2.27, 0 isoc23, Requires-Dist 5/5 из apt; `sympy`/`protobuf`/`flatbuffers` у ORT ленивые — путь инференса их не импортирует, в M1 решить Depends vs Suggests). Апгрейд до 1.29.x — только вместе с легальным protobuf 4.x.
 - **A-02 ELF.** Ровно **3 `.so`** в пакете (все — onnxruntime); шим `__isoc23_*` **не нужен** (1.24.4: max `GLIBC_2.27`, 0 ссылок `isoc23`); CI-гейт: `objdump -T` (max ≤ GLIBC_2.36, 0 isoc23) + счётчик ELF = 3 останавливает сборку (Р2).
 - **A-03 Шрифты из apt.** Depends `fonts-pt-root-ui`, `fonts-pt-mono` (repository-main; на машине стоят через `fonts-pt`); в пакет не вкладывать; резерв PT Astra Sans/Fact через `QFontDatabase` (Р8). Имена пакетов перепроверить `apt-cache policy` в M1.
 - **A-04 Детект сессии.** По `XDG_CURRENT_DESKTOP` (решение 2026-09-09, синтез §8). Оговорка: план #1 §13.1 зафиксировал, что Fly-сессия может **не экспортировать** `XDG_CURRENT_DESKTOP` (только `DESKTOP_SESSION=fly`) → S1-Fly проверяет; резерв — атомы root-окна (`_FLY_WM_PID` → FLY, `_NET_WM_NAME=KWin` → KDE, иначе OTHER), env — подсказка. Одно приложение, никаких `OnlyShowIn`; различия за интерфейсами `SessionKind`/`ThemeSource`/`TrayIconProvider`/`ShortcutConflictSource`/ветки `paste.py`.
@@ -52,7 +52,9 @@ make user-bundle                                                 # цель об
 tools/validate <тема> [--session kde|fly]   # x11-pill · runtime · worker-cancel · dictation --virtual-mic · updater · catalog · downloads --faults
                                             # · model-updates · autostart · privacy --network-denied · policy --matrix · corporate --no-public-egress
                                             # · diagnostics --redaction · release --version X.Y.Z · e2e --suite v0.1|v0.2|s17|all · soak --hours N
-tools/benchmark --model gigaam-v3-e2e-rnnt-int8 --runs 50 --threads 4
+tools/benchmark --model gigaam-v3-e2e-rnnt-int8 --runs 50 --threads 2 --json results/m2-6s.json    # p95 ≈ S3 (253 мс), cpu/wall ≤ 2
+python3 scripts/measure_model.py --model-dir ~/.cache/astra-voice-spike/gigaam-v3/e2e_rnnt --model gigaam-v3-e2e-rnnt --wav data/test/test-ru-6s.wav --runs 1 --threads 4 --rlimit-as-mb 768 --load-deadline-s 10   # error load-timeout, не зависание
+astra-voice --debug-sessions                                                    # InferenceSession в воркере: 3
 # виртуальный микрофон (машина, PipeWire-pulse)
 pactl load-module module-null-sink sink_name=av_test sink_properties=device.description=av_test
 pactl load-module module-remap-source master=av_test.monitor source_name=av_test_mic source_properties=device.description=av_test_mic
@@ -62,7 +64,7 @@ paplay --device=av_test data/test/test-ru-6s.wav
 ## Milestone Order
 | ID | Title | Depends on | Release | Status |
 | --- | --- | --- | --- | --- |
-| M0 | Спайки S1–S5 (KDE **и** Fly), до 13.09 | — | — | [ ] |
+| M0 | Спайки S1–S5 (KDE **и** Fly), до 13.09 | — | — | [~] S3 `[x]` |
 | M1 | Скелет, упаковка, CI (+T1 §5 M1) | M0: S3 (пины), S1 (окно/тема/сессия) | v0.1 | [ ] |
 | M2 | Воркер и движок (+T1 §5 M2) | M1, S3 | v0.1 | [ ] |
 | M3 | Звук | M2, S5 | v0.1 | [ ] |
@@ -79,11 +81,11 @@ paplay --device=av_test data/test/test-ru-6s.wav
 | R3 | **Релиз v1.0 — 31.10** (⛔ G5) | M11 | v1.0 | [ ] |
 | v1.1 | ГОСТ-подпись 3 `.so` + ВМ с ЗПС (Ц5) · user-bundle C1 | R3 | v1.1 | [ ] |
 
-## M0. Спайки S1–S5 (KDE и Fly) `[ ]` — до 13.09
+## M0. Спайки S1–S5 (KDE и Fly) `[~]` — до 13.09 (S3 принят 2026-09-09)
 ### Goal
-Пять допущений архитектуры подтверждены или опровергнуты фактами на машине заказчика **в обеих сессиях** до первой строки продакшн-кода; S3 закрывает развилку рантайма (порог p95), S2 доказывает один polkit-диалог. Результаты — `arch/spikes.md`, решения — `decisions/log.md`.
+Пять допущений архитектуры подтверждены или опровергнуты фактами на машине заказчика **в обеих сессиях** до первой строки продакшн-кода; S3 закрывает развилку рантайма (порог p95), S2 доказывает один polkit-диалог. Результаты — `arch/spikes/<S>.md` (образец — `arch/spikes/S3.md`), решения — `decisions/log.md`.
 ### Tasks
-- [ ] Каркас: `arch/spikes.md` (шаблон: спайк · критерий · факт · сессия · вердикт · дата), scratch `~/.cache/astra-voice-spikes/` (gitignored), `data/test/test-ru-6s.wav` («Проверка связи, запятая, всё работает точка», 16 кГц mono) и `test-ru-20s.wav`.
+- [~] Каркас: отчёты `arch/spikes/<S>.md` (спайк · критерий · факт · сессия · вердикт · дата; S3 — образец), scratch `~/.cache/astra-voice-spike/` (вне репо, единое имя); `data/test/test-ru-6s.wav` («Проверка связи, запятая, всё работает точка», 16 кГц mono) и `test-ru-20s.wav` — **записать заказчику**: в S3 использованы синтетические повторы эталона из handy-gigaam (лежат в scratch, не в репо).
 - **S1 пилюля + трей** (US-4.1, US-4.3; `ui/pill.py`, `ui/tray.py`, `platform/x11.py`, `platform/session.py`; синтез Р4/Р5/Р7, §8 Fly; T1 О4)
   - [ ] KDE: QML `Window` Tool·Frameless·StaysOnTop·DoesNotAcceptFocus + EWMH руками (`_NET_WM_STATE_ABOVE/SKIP_TASKBAR/SKIP_PAGER`, `_NET_WM_USER_TIME=0`, тип NOTIFICATION) — критерий: `xdotool getactivewindow` не меняется; `xprop` содержит ABOVE, SKIP_TASKBAR, SKIP_PAGER; нет в Alt+Tab; показ ≤ 100 мс; над панелью не лежит (Р7: `availableGeometry` ↔ struts при панели > 48 px и боковой панели).
   - [ ] Fly (перелогин заказчика): то же + атомы `_FLY_WM_WINDOW_MAP_ANIMATION=0`/`_FLY_WM_FADE_SHOW=0`, `CenterWindowPos`, compton вкл/выкл (план #1 §13.2 п.1–3); детект сессии A-04 — что реально в `XDG_CURRENT_DESKTOP`, есть ли `_FLY_WM_PID`.
@@ -96,12 +98,12 @@ paplay --device=av_test data/test/test-ru-6s.wav
   - [ ] Из `QProcess` GUI-процесса `pkexec /usr/libexec/astra-voice/update-helper install <deb>` — критерий: **ровно одно** окно пароля (KDE-агент; во Fly тот же агент по `OnlyShowIn=…fly;` — S17-A5), коды 0/126/127 различимы, `dpkg-query -W` = 0.0.2, GUI не блокируется.
   - [ ] Подтвердить (T1 §5): `apt-get install -y ./x.deb` ставит локальный пакет **без** `--allow-unauthenticated`; удержанный `lock-frontend` → `apt-locked`, apt не убит (T-18); `-IS` — stdlib грузится без `site`; `--no-download` при offline.
   - [ ] Провал → `pkcon install-local` как запасной путь; нет агента → трек B + подсказка `sudo apt install ./…`.
-- **S3 рантайм + замер** (US-2.5, US-5.4; `worker/engine.py`, `worker/measure.py`, `scripts/measure_model.py`, `scripts/build_manifest.py`; синтез Р2/Р3/Р4, §7 И1/Д1)
-  - [ ] venv в scratch с `--system-site-packages`: `onnxruntime==1.24.4`, `onnx-asr==0.12.0` (`--no-deps`; numpy 1.24.2/sympy/protobuf/flatbuffers — системные); `import onnxruntime, onnx_asr` ok; `objdump -T` по 3 `.so`: max ≤ GLIBC_2.36, 0 `__isoc23_*`; счётчик ELF = 3.
-  - [ ] Скачать `istupakov/gigaam-v3-onnx` — e2e_rnnt, e2e_ctc, rnnt (~680 МБ, допуск 2026-09-09); зафиксировать точные `files[]` (имена, размеры, sha256: LFS — из HF API, не-LFS — считать) для `layout=onnx-asr-gigaam-v3`.
-  - [ ] `scripts/measure_model.py`: 10 прогонов `test-ru-6s.wav` при 2/4 потоках → медиана/p95 инференса, `VmHWM`; **порог: p95 ≤ 300 мс хотя бы у e2e_rnnt или e2e_ctc**; RSS воркера ≤ 450 МБ.
-  - [ ] Отмена: `RunOptions.terminate=True` из другого потока на 20-с фразе → возврат ≤ 1 с (И1); замерить `RLIMIT_AS`-порог (`min_ram_mb×3`, не ниже 3 ГиБ) для GigaAM (T1 §5).
-  - [ ] Провал порога → дефолт e2e_ctc (+25 %); оба > 400 мс → `SherpaEngine` для GigaAM v3 (второй адаптер, строки манифеста `engine: sherpa-onnx`) — запись в журнал.
+- [x] **S3 рантайм + замер** — **принят 2026-09-09** (`arch/spikes/S3.md`; журнал «M0.S3 принят») (US-2.5, US-5.4; `worker/engine.py`, `worker/measure.py`, `scripts/measure_model.py`, `scripts/build_manifest.py`; синтез Р2/Р3/Р4, §7 И1/Д1)
+  - [x] venv в scratch с `--system-site-packages`: `onnxruntime==1.24.4`, `onnx-asr==0.12.0` (`--no-deps`; numpy 1.24.2/sympy/protobuf/flatbuffers — системные); `import onnxruntime, onnx_asr` ok; `objdump -T` по 3 `.so`: max ≤ GLIBC_2.36, 0 `__isoc23_*`; счётчик ELF = 3.
+  - [x] Скачать `istupakov/gigaam-v3-onnx` — e2e_rnnt, e2e_ctc, rnnt (677 109 053 Б, ревизия `322c3b29…`, 16 файлов с sha256 — S3 §2; допуск 2026-09-09); зафиксировать точные `files[]` (имена, размеры, sha256: LFS — из HF API, не-LFS — считать) для `layout=onnx-asr-gigaam-v3`.
+  - [x] `scripts/measure_model.py` (в репо): p95 e2e_rnnt 228/253/247 мс, e2e_ctc 229/153/194 мс при 1/2/4 потоках; VmHWM 366–404 МиБ при ≤ 2 потоках (467 МиБ при 4 — выше порога 450 МБ) → **порог выполнен у обоих; RSS — при `intra_op ≤ 2`**.
+  - [x] Отмена: `RunOptions.terminate` на 20-с фразе → возврат **0,5–4,1 мс**, модель исправна после отмены (патч onnx-asr +28 строк, S3 §5); `RLIMIT_AS`-порог 512/768/2048 МиБ при 1/2/4 потоках, пол 3 ГиБ безопасен; при 4 потоках и лимите 768–1536 МиБ — **молчаливое зависание** (S3-R1).
+  - [x] Развилка **не активирована**: дефолт остаётся `gigaam-v3-e2e-rnnt`, `SherpaEngine` в M2 не нужен (журнал «M0.S3 принят»). Решения для M2: `intra_op_num_threads=2`, `allow_spinning=0`, `RLIMIT_AS` 3 ГиБ, дедлайн `engine.load`, каталог на вариант (S3-R6), без 7 сессий ресемплера (S3-R4). Для M6: строки 2–3 `research/catalog-numbers.md` §1 — размеры istupakov-наборов 224 896 388 / 225 780 697 Б (S3-R5).
 - **S4 хоткей + вставка** (US-2.1, US-3.1, US-1.5b, US-3.4; `platform/hotkey.py`, `platform/paste.py`, `platform/shortcuts_conflict.py`; план #1 Р3/§13.1; T1 У11/У12/У40)
   - [ ] KDE: `python3-xlib` `XGrabKey` Ctrl+Space × 8 масок Lock/Num/Scroll; PTT с фильтром автоповтора (KeyRelease+KeyPress одним `time`); временный grab `Escape`; `BadAccess` на `Alt+F2` → имя действия из `kglobalshortcutsrc`.
   - [ ] XTest `Ctrl+V` в Kate при русской раскладке → текст появился; буфер восстановлен ≤ 200 мс (копия `QMimeData`); `x-kde-passwordManagerHint=secret` → история Klipper без фразы.
@@ -112,9 +114,9 @@ paplay --device=av_test data/test/test-ru-6s.wav
   - [ ] `systemctl --user restart wireplumber` → устройство открывается со 2-й попытки ≤ 1 с (ленивое открытие; И4 `audio.close`/`audio.ready`); во Fly — после перелогина (гонка greeter).
   - [ ] Уведомление «Перезапустить звуковую службу» с кнопкой — `ActionInvoked` в Plasma и `fly-notifications`; имена `*.monitor` в `pactl list short sources` (У39).
   - [ ] Провал → `QAudioInput` (`python3-pyqt5.qtmultimedia`) за тем же `AudioSource`; схема #2 (PCM через memfd) — запасная.
-- [ ] Итог: `arch/spikes.md` заполнен; записи в `decisions/log.md` (рантайм/дефолт, режим пилюли, метод вставки, источник звука, детект сессии); расхождения → правка `arch/plan-synth.md`; commit+push.
+- [ ] Итог: `arch/spikes/S1…S5.md` заполнены; записи в `decisions/log.md` (рантайм/дефолт, режим пилюли, метод вставки, источник звука, детект сессии); расхождения → правка `arch/plan-synth.md`; commit+push.
 ### Definition of Done
-- В `arch/spikes.md` по каждому S1–S5 — факт и вердикт с датой; S1/S4/S5 — отдельно для KDE и Fly; S3 — таблица медиана/p95/VmHWM для трёх вариантов при 2/4 потоках + `files[]` с sha256; S2 — один polkit-диалог (скриншот) и коды 0/126/127.
+- В `arch/spikes/<S>.md` по каждому S1–S5 — факт и вердикт с датой; S1/S4/S5 — отдельно для KDE и Fly; S3 — таблица медиана/p95/VmHWM для трёх вариантов при 2/4 потоках + `files[]` с sha256; S2 — один polkit-диалог (скриншот) и коды 0/126/127.
 - Система не изменена, кроме трёх файлов S2 (перечислены с командой отката); scratch вне репо.
 - Открытых развилок нет либо они оформлены записью в журнале.
 ### Validation
@@ -126,12 +128,12 @@ xprop -root _NET_WORKAREA; xprop -root | grep -E '_FLY_WM_PID|_NET_SUPPORTING_WM
 # S2 (после sudo-шага заказчика)
 python3 spikes/s2_gui.py ./astra-voice-spike_0.0.2_all.deb; dpkg-query -W astra-voice-spike           # одно окно, 0.0.2
 # S3
-python3 -m venv --system-site-packages ~/.cache/astra-voice-spikes/venv && . ~/.cache/astra-voice-spikes/venv/bin/activate
+python3 -m venv --system-site-packages ~/.cache/astra-voice-spike/venv && . ~/.cache/astra-voice-spike/venv/bin/activate
 pip install --no-deps onnxruntime==1.24.4 onnx-asr==0.12.0 && python3 -c 'import onnxruntime,onnx_asr,numpy;print(onnxruntime.__version__,numpy.__version__)'
-find ~/.cache/astra-voice-spikes/venv -name '*.so*' -exec file {} + | grep -c ELF                     # 3
-for f in $(find ~/.cache/astra-voice-spikes/venv -name '*.so*'); do objdump -T "$f" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1; objdump -T "$f" | grep -c isoc23; done
-python3 scripts/measure_model.py --model-dir ~/.cache/astra-voice-spikes/gigaam-v3/e2e_rnnt --wav data/test/test-ru-6s.wav --runs 10 --threads 2,4
-python3 scripts/measure_model.py --model-dir ~/.cache/astra-voice-spikes/gigaam-v3/e2e_rnnt --wav data/test/test-ru-20s.wav --cancel-after-ms 300   # ≤ 1000 мс
+find ~/.cache/astra-voice-spike/venv -name '*.so*' -exec file {} + | grep -c ELF                     # 3
+for f in $(find ~/.cache/astra-voice-spike/venv -name '*.so*'); do objdump -T "$f" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1; objdump -T "$f" | grep -c isoc23; done
+python3 scripts/measure_model.py --model-dir ~/.cache/astra-voice-spike/gigaam-v3/e2e_rnnt --wav data/test/test-ru-6s.wav --runs 10 --threads 2,4
+python3 scripts/measure_model.py --model-dir ~/.cache/astra-voice-spike/gigaam-v3/e2e_rnnt --wav data/test/test-ru-20s.wav --cancel-after-ms 300   # ≤ 1000 мс
 # S4
 python3 spikes/s4_hotkey.py --grab ctrl+space --probe alt+F2                                          # Fly: --probe alt+space
 qdbus org.kde.klipper /klipper getClipboardHistoryMenu | grep -c 'проверка связи'                    # KDE: 0
@@ -141,12 +143,12 @@ pactl load-module module-null-sink sink_name=av_test sink_properties=device.desc
 pactl load-module module-remap-source master=av_test.monitor source_name=av_test_mic source_properties=device.description=av_test_mic
 python3 spikes/s5_audio.py --device av_test_mic & paplay --device=av_test data/test/test-ru-6s.wav
 systemctl --user restart wireplumber && python3 spikes/s5_audio.py --device av_test_mic --expect-reopen-ms 1000
-find ~ /tmp -newer arch/spikes.md \( -name '*.wav' -o -name '*.raw' -o -name '*.pcm' \) | grep -v astra-voice-spikes | wc -l   # 0
+find ~ /tmp -newer arch/spikes/S3.md \( -name '*.wav' -o -name '*.raw' -o -name '*.pcm' \) | grep -v astra-voice-spike | wc -l   # 0
 ```
 ### Known Risks
-R1 Python-декодер RNN-T (S3, на 1.24.4 не мерили) · R2 fly-wm и фокус пилюли (S1) · R3 `Ctrl+Space` занят (S4) · R9 нет polkit-агента во Fly (S2) · R14 гонка WirePlumber (S5) · A-04 `XDG_CURRENT_DESKTOP` во Fly пуст.
+R1 Python-декодер RNN-T — **снят S3** (~52 мс на 6 с) · R2 fly-wm и фокус пилюли (S1) · R3 `Ctrl+Space` занят (S4) · R9 нет polkit-агента во Fly (S2) · R14 гонка WirePlumber (S5) · A-04 `XDG_CURRENT_DESKTOP` во Fly пуст.
 ### Stop-and-Fix
-- Любой красный спайк → запись в журнал **до** M1; S3 p95 > 300 → дефолт e2e_ctc; оба > 400 → `SherpaEngine` входит в M2 (+3 дн).
+- Любой красный спайк → запись в журнал **до** M1; S3 закрыт зелёным — развилка «e2e_ctc / SherpaEngine» не активирована.
 - S1 крадёт фокус → override-redirect по умолчанию; S2 второе окно polkit или блокировка GUI → переделка вызова до M8 (v0.1 не блокирует).
 
 ## M1. Скелет, упаковка, CI `[ ]` — v0.1
@@ -193,18 +195,22 @@ QML 5.15 vs макет (`DropShadow`, R16) · размер deb (A1 ≤ 80 МБ) 
 ### Tasks (US-2.5, US-8.3, US-2.8-часть, US-2.3-движок; компоненты `worker/{ipc,supervisor,__main__,engine,measure}.py`; синтез §7 И1/И2/И3/И4/Д4/О1; T1 У7/У8/У18/У35/У36)
 - [ ] `worker/ipc.py`: len-prefixed JSON, `hello{protocol, build, runtime}`; длина кадра проверяется **до** `read`, ≤ 64 КиБ; схема сообщений, `text ≤ 32 КиБ`, `utterance_id` только из ожидаемых, лишние события отбрасываются + unit кодек (T-21).
 - [ ] `worker/supervisor.py`: `Popen([sys.executable,'-I',bootstrap,'worker'], pass_fds=[sock])`, `QSocketNotifier`, таймауты, рестарт ≤ 3/10 мин, `SIGTERM` при выходе; поколение воркера — все `utterance_id` старого поколения аннулируются (О1); результат принимается ровно один раз по `(generation, utterance_id)` + unit с эхо-воркером и `kill -9`.
-- [ ] `worker/__main__.py`: `prctl(PR_SET_PDEATHSIG, SIGTERM)` + проверка `getppid()`; EOF сокета → закрыть источник, выход ≤ 1 с (У36, T-34); `RLIMIT_CORE=0`, `PR_SET_DUMPABLE=0`, `oom_score_adj=+500`, `RLIMIT_AS` по итогам S3 (У8/У9).
+- [ ] `worker/__main__.py`: `prctl(PR_SET_PDEATHSIG, SIGTERM)` + проверка `getppid()`; EOF сокета → закрыть источник, выход ≤ 1 с (У36, T-34); `RLIMIT_CORE=0`, `PR_SET_DUMPABLE=0`, `oom_score_adj=+500`, **`RLIMIT_AS` = `max(min_ram_mb×3, 3 ГиБ)`** (S3 §6: пороги 512/768/2048 МиБ при 1/2/4 потоках; У8/У9).
 - [ ] Автомат `idle · recording · processing · recording+processing` (очередь 1); буфер PCM на каждую `utterance_id`, очищается по её завершению (И2) + unit на `FakeAudioSource`+`FakeEngine`.
-- [ ] `worker/engine.py`: протокол `Engine.load(dir, layout, variant, threads)` · `transcribe(audio, cancel_token)` · `unload`; `OnnxAsrEngine` для `onnx-asr-gigaam-v3` (таблица layout → загрузчик + обязательные файлы по S3); потоки `min(4, физ. ядер)`; только `CPUExecutionProvider`; `register_custom_ops_library` не вызывается; заглушка `SherpaEngine`.
+- [ ] `worker/engine.py`: протокол `Engine.load(dir, layout, variant, threads)` · `transcribe(audio, cancel_token)` · `unload`; `OnnxAsrEngine` для `onnx-asr-gigaam-v3` (таблица layout → загрузчик + обязательные файлы по S3); **`intra_op_num_threads=2`** (дефолт; настройка в «Продвинутых», > 2 — только явно) и **`sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")`** (S3 §4.3–4.4: спин жжёт CPU ×3–5 без выигрыша, 4 потока пробивают RSS 450 МБ); только `CPUExecutionProvider`; `register_custom_ops_library` не вызывается; второй адаптер (`SherpaEngine`) не нужен — S3 закрыл развилку, интерфейс `Engine` остаётся.
 - [ ] Скан ONNX-protobuf до `InferenceSession`: каждый `external_data.location` ⊆ `files[]` модели и внутри каталога ревизии; лишние файлы → `error{code=extra-file}`; `location` вне каталога → `error{code=external-data}` (У7, T-10) + unit-фикстуры.
+- [ ] Дедлайн на `engine.load` — **10 с** (норма 0,64–0,78 с): по истечении `error{code=load-timeout}`, супервизор `SIGKILL` + рестарт (S3-R1: при тесном `RLIMIT_AS` и ≥ 4 потоках воркер зависает молча, а не падает); лимит времени инференса по таймеру — тот же механизм.
+- [ ] Раскладка «каталог на вариант» (S3-R6): `store/<id>/<rev>/` содержит файлы **одного** варианта; в одном каталоге нельзя смешивать fp32+int8 и e2e+не-e2e (glob-паттерны onnx-asr `v?_…` → `MoreThanOneModelFileFoundError`); `OnnxAsrEngine.load` передаёт `local_dir` варианта (`Resolver` → `offline=True`, `huggingface_hub` не нужен); `files[]` трёх вариантов — из S3 §2 (16 файлов, sha256).
+- [ ] Убрать 7 лишних сессий ресемплера при `load_model` (S3-R4): вход всегда 16 кГц (Р1/И4) → `resampler_config`/ленивое создание, в процессе 3 `InferenceSession` вместо 10 → −640…780 мс холодного старта; замер до/после в `tools/benchmark`.
+- [ ] Вендорный патч отмены — `vendor/patches/onnx-asr-cancellable.patch` (+28 строк, `adapters.py`: контекст `cancellable()` с `RunOptions` на все сессии; текст — S3 §5.2), применяется при сборке vendor (`make wheels`), CI проверяет, что патч ложится на пин 0.12.0; проверка флага **перед каждым** `run` (шаги RNN-T-декодера — сотни коротких `run`).
 - [ ] Отмена (И1): `recognize{utterance_id}` держит `RunOptions`; `record.cancel{utterance_id}` → `terminate=True` + точки отмены между сегментами → `cancelled{utterance_id}`; лимит времени инференса по таймеру (T1 M2); поздний `result` с отменённым id GUI отбрасывает.
 - [ ] `model.load{id, revision, dir, layout, variant, threads}` → `model.loaded{id, revision, variant, load_ms, engine_version}` (И3); смена id/ревизии/потоков = перезапуск воркера (Д4).
 - [ ] `transcribe.file{path}` (смоук/тест); `measure` → `VmHWM`/`Pss` из `/proc/self/{status,smaps_rollup}`; `measurements.json` ключ `(id, revision, threads, runtime, build)` (Д4) + unit на фикстурах `/proc`.
 - [ ] Выгрузка по простою: таймер в GUI → `model.unload` (опция «никогда» по умолчанию); `ping`.
-- [ ] CLI: `astra-voice --debug-transcribe <wav>`; `tools/validate worker-cancel`; `tools/benchmark --model <id> --runs N --threads T` (обёртка над `measure`).
+- [ ] CLI: `astra-voice --debug-transcribe <wav>`; `tools/validate worker-cancel`; `tools/benchmark` — **на основе `scripts/measure_model.py` из S3** (уже в репо: `--runs/--threads/--json/--rlimit-as-mb/--cancel-after-ms`), плюс `--catalog`/`--minimum-models` в M6.
 - [ ] `tests/integration/test_engine_gigaam.py` (маркер `engine`, кэш модели по ревизии); `pytest -m engine` в CI.
 ### Definition of Done
-- `astra-voice --debug-transcribe data/test/test-ru-6s.wav` печатает текст с «проверка» и `t_ms`; `kill -9 <worker>` → новый pid ≤ 1 с, модель перезагружена, ошибка показана один раз; `kill -9` GUI → воркер завершился ≤ 1 с; отмена ≤ 1000 мс; `oom_score_adj` = 500; T-10, T-11, T-21, T-34 зелёные; p95 инференса из `tools/benchmark` записан в `arch/spikes.md`.
+- `astra-voice --debug-transcribe data/test/test-ru-6s.wav` печатает текст с «проверка» и `t_ms`; `kill -9 <worker>` → новый pid ≤ 1 с, модель перезагружена, ошибка показана один раз; `kill -9` GUI → воркер завершился ≤ 1 с; отмена ≤ 1000 мс (S3: 0,5–4 мс); `oom_score_adj` = 500; по умолчанию `intra_op=2`/`allow_spinning=0` (`cpu/wall` ≤ 2 при 2 потоках); `engine.load` под `RLIMIT_AS` 768 МиБ при 4 потоках завершается ошибкой по дедлайну 10 с, не зависает; в воркере 3 `InferenceSession` (не 10), холодная загрузка ≤ 0,3 с быстрее S3; T-10, T-11, T-21, T-34 зелёные; p95 инференса из `tools/benchmark` записан в `arch/spikes/S3.md` §4 (сравнение с замером спайка).
 ### Validation
 ```sh
 pytest -m unit tests/worker tests/unit/test_supervisor.py -q && pytest -m engine -q
@@ -215,9 +221,9 @@ W=$(pgrep -f 'bootstrap.py worker'); kill -9 "$W"; sleep 1; pgrep -f 'bootstrap.
 G=$(pgrep -f 'bootstrap.py app'); kill -9 "$G"; sleep 1; pgrep -c -f 'bootstrap.py worker'                  # 0
 ```
 ### Known Risks
-R1 RTFx Python-декодера · потоки ORT на 4-ядерных машинах · `RLIMIT_AS` низок для Whisper (для незамеренных — `min_ram_mb` карточки) · скан external_data на ORT 1.24.4 (Astra: ORT сам проверяет выход за каталог — оставить свой скан).
+R1 снят S3 · S3-R1 молчаливое зависание при тесном лимите (дедлайн) · S3-R3 > 2 потоков пробивают 450 МБ (`min_ram_mb` в каталоге считать при 2 потоках) · `RLIMIT_AS` для Whisper turbo (`min_ram_mb×3` ≥ 3 ГиБ) · патч отмены расходится с будущими версиями onnx-asr (пин 0.12.0) · скан external_data на ORT 1.24.4 (Astra: ORT сам проверяет выход за каталог — оставить свой скан).
 ### Stop-and-Fix
-- p95 инференса > 300 мс на эталоне → дефолт e2e_ctc до M4; T-10 не воспроизводится → проверить по вендорным байтам, скан не убирать.
+- p95 в M2 хуже S3 (253 мс при 2 потоках) более чем на 20 % → искать регрессию (ресемплеры/потоки/спин), дефолт не менять; T-10 не воспроизводится → проверить по вендорным байтам, скан не убирать.
 
 ## M3. Звук `[ ]` — v0.1
 ### Goal

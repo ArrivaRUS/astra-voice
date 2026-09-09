@@ -32,7 +32,12 @@ STATES = [
     ("processing", "#E8A33A",   "#F2B559",   "распознаю"),
     ("done",       "#2FA36B",   "#4FBF88",   "готово"),
     ("error",      "#D64545",   "#F0645F",   "ошибка"),
+    # шестое состояние отличается не цветом, а ФОРМОЙ третьей точки: кольцо вместо
+    # диска — «комбинация не назначена». Цвет остаётся currentColor: приглушение
+    # (opacity .55/.7) в 16 px разваливается на светлой панели, проверено рендером.
+    ("nokey",      None,        None,        "хоткей не захвачен"),
 ]
+RING_STATES = ("nokey",)          # третья точка — контур, stroke 1.0, fill none
 
 # ------------------------------------------------------- геометрия знака ---
 # Мастер-сетка знака: bbox ровно (0,0)-(100,66).
@@ -225,7 +230,7 @@ def svg_icon(S):
 TRAY_GEOM = {22: dict(bx=2.0, by=12.0, bw=18.0, bh=4.0)}   # 16 px — HAND16_TRAY
 
 
-def svg_tray(S, light=None, dark=None, mono=False):
+def svg_tray(S, light=None, dark=None, mono=False, ring=False):
     if S == 16:
         m = HAND16_TRAY
     else:
@@ -243,6 +248,14 @@ def svg_tray(S, light=None, dark=None, mono=False):
     body = []
     for i, (cx, cy, r) in enumerate(m["dots"]):
         is_acc = (i == 2)
+        if is_acc and ring:
+            # контур того же наружного диаметра: силуэт знака не меняется (§4.7),
+            # меняется только заливка — диск становится кольцом
+            sw = 1.0
+            body.append('<circle class="ColorScheme-Text" cx="%s" cy="%s" r="%s"'
+                        ' fill="none" stroke="currentColor" stroke-width="%s"/>'
+                        % (f(cx), f(cy), f(r - sw / 2.0), f(sw)))
+            continue
         body.append('<circle class="%s" cx="%s" cy="%s" r="%s" fill="%s"/>'
                     % (acc_cls if is_acc else "ColorScheme-Text",
                        f(cx), f(cy), f(r),
@@ -301,7 +314,7 @@ def main():
         for name, lt, dk, _ in STATES:
             written.append(w(os.path.join(ICONS, "%dx%d" % (S, S), "status",
                                           "astra-voice-tray-%s.svg" % name),
-                             svg_tray(S, lt, dk)))
+                             svg_tray(S, lt, dk, ring=name in RING_STATES)))
         written.append(w(os.path.join(ICONS, "%dx%d" % (S, S), "status",
                                       "astra-voice-tray-mono.svg"),
                          svg_tray(S, mono=True)))
