@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import struct
@@ -15,11 +16,14 @@ from itertools import repeat
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event
+from types import ModuleType
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
 from astra_voice.core.version import __version__
+from astra_voice.worker import state as state_module
 from astra_voice.worker.ipc import BAD_FIELD, FrameError, decode, encode
 from astra_voice.worker.state import (
     LIMIT_S_DEFAULT,
@@ -28,14 +32,55 @@ from astra_voice.worker.state import (
     Message,
     State,
     WorkerState,
+    join_segment_texts,
 )
 
 # tests не пакет; общий каталог фейков добавляется без нового conftest.py.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from fakes import FakeAudioSource, FakeCancelToken, FakeEngine, FakeLoadResult  # noqa: E402
+from fakes import (  # noqa: E402
+    Cancellation,
+    FakeAudioSource,
+    FakeCancelToken,
+    FakeEngine,
+    FakeLoadResult,
+    FakeTranscribeResult,
+)
 
 pytestmark = pytest.mark.unit
 Factory = Callable[..., tuple[WorkerState, FakeEngine, Queue[Message]]]
+
+
+class FakeVAD(ModuleType):
+    """Подменяет весь модуль, исключая загрузку настоящей модели в тестах автомата."""
+
+    def __init__(self) -> None:
+        super().__init__("astra_voice.worker.vad")
+        self.vad_available = Mock(return_value=False)
+        self.trim_trailing_silence = Mock(side_effect=lambda audio, *args, **kwargs: audio)
+        self.segment = Mock(return_value=[])
+
+
+class SegmentEngine(FakeEngine):
+    """Выдаёт тексты по порядку и позволяет отменить работу на границе вызовов."""
+
+    def __init__(self, parts: list[str], after_segment: Callable[[], None] = lambda: None) -> None:
+        super().__init__()
+        self.parts = parts
+        self.after_segment = after_segment
+
+    def transcribe(self, audio: Any, cancel: Cancellation) -> FakeTranscribeResult:
+        self.text = self.parts[self.transcribe_calls]
+        result = super().transcribe(audio, cancel)
+        self.after_segment()
+        return result
+
+
+@pytest.fixture(autouse=True)
+def fake_vad(monkeypatch: pytest.MonkeyPatch) -> FakeVAD:
+    module = FakeVAD()
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(state_module, "_vad_unavailable_warned", False)
+    return module
 
 
 def load_message(**changes: Any) -> Message:
@@ -67,7 +112,7 @@ def factory(tmp_path: Path) -> Iterator[Factory]:
             kwargs.setdefault("audio_factory", list)
         worker = WorkerState(
             engine_factory=lambda layout: fake,
-            cancel_factory=FakeCancelToken,
+            cancel_factory=kwargs.pop("cancel_factory", FakeCancelToken),
             data_dir_factory=lambda: tmp_path,
             on_event=events.put,
             **kwargs,
@@ -103,6 +148,244 @@ def start(worker: WorkerState, uid: str = "u1") -> None:
 def recognize(worker: WorkerState, uid: str = "u1") -> None:
     """Ставит распознавание без синхронного результата."""
     assert command(worker, "recognize", uid) == []
+
+
+def record_samples(worker: WorkerState, count: int) -> None:
+    """Проводит запись через record.stop до запроса распознавания."""
+    assert command(worker, "record.start") == []
+    worker.feed_audio("u1", repeat(0.25, count))
+    assert command(worker, "record.stop") == []
+
+
+@pytest.mark.parametrize(
+    "parts,expected",
+    [
+        ([], ""),
+        (["", "  ", "\n"], ""),
+        (["  раз  два ", "", " три\nчетыре "], "раз два три четыре"),
+        (["Привет", " , мир", "."], "Привет, мир."),
+        (["Готово.", " . Далее"], "Готово. Далее"),
+        (["Готово.", "...", " Далее"], "Готово. Далее"),
+        (["Да!", "! Конечно"], "Да! Конечно"),
+        (["Да?", "? Правда"], "Да? Правда"),
+        (["Жду…", "… Продолжение"], "Жду… Продолжение"),
+        (["Да?", "!"], "Да?!"),
+        (["Первое", "; второе", ": третье", "…"], "Первое; второе: третье…"),
+    ],
+)
+def test_join_segment_texts(parts: list[str], expected: str) -> None:
+    assert join_segment_texts(parts) == expected
+    assert "  " not in join_segment_texts(parts)
+
+
+@pytest.mark.parametrize(
+    "parts,expected",
+    [
+        (["  Привет ", " ,  мир. ", " .  Дальше! "], "Привет, мир. Дальше!"),
+        (["  Первый ", " . Второй ", " , третий. "], "Первый. Второй, третий."),
+    ],
+)
+def test_vad_segments_real_recognition_path(
+    factory: Factory, fake_vad: FakeVAD, parts: list[str], expected: str
+) -> None:
+    np = pytest.importorskip("numpy")
+    now = 10.0
+
+    def advance_clock() -> None:
+        nonlocal now
+        now += 0.25
+
+    token = FakeCancelToken()
+    worker, engine, events = factory(
+        SegmentEngine(parts, advance_clock),
+        numpy_audio=True,
+        cancel_factory=lambda: token,
+        clock=lambda: now,
+    )
+    fake_vad.vad_available.return_value = True
+    trimmed = np.arange(49 * SAMPLE_RATE, dtype=np.float32)
+    fake_vad.trim_trailing_silence.side_effect = None
+    fake_vad.trim_trailing_silence.return_value = trimmed
+    boundaries = [
+        (0, 20 * SAMPLE_RATE),
+        (20 * SAMPLE_RATE, 40 * SAMPLE_RATE),
+        (40 * SAMPLE_RATE, len(trimmed)),
+    ]
+    fake_vad.segment.return_value = boundaries
+    record_samples(worker, 50 * SAMPLE_RATE)
+    assert engine.transcribe_calls == 0
+    recognize(worker)
+    assert events.get(timeout=2) == {
+        "type": "result",
+        "utterance_id": "u1",
+        "text": expected,
+        "t_ms": 750,
+    }
+    fake_vad.trim_trailing_silence.assert_called_once()
+    trim_call = fake_vad.trim_trailing_silence.call_args
+    assert len(trim_call.args[0]) == 50 * SAMPLE_RATE
+    assert trim_call.args[1:] == (SAMPLE_RATE,)
+    assert trim_call.kwargs == {"cancel": token}
+    fake_vad.segment.assert_called_once_with(trimmed, SAMPLE_RATE, max_window_s=24.0, cancel=token)
+    assert engine.transcribe_calls == 3
+    assert engine.tokens == [token] * 3
+    for audio, (start_index, stop_index) in zip(engine.audios, boundaries, strict=True):
+        np.testing.assert_array_equal(audio, trimmed[start_index:stop_index])
+        assert np.shares_memory(audio, trimmed)
+    assert worker.buffers == {}
+
+
+@pytest.mark.parametrize("count", [0, SAMPLE_RATE, 20 * SAMPLE_RATE])
+def test_vad_short_recording_transcribed_once(
+    factory: Factory, fake_vad: FakeVAD, count: int
+) -> None:
+    pytest.importorskip("numpy")
+    fake_vad.vad_available.return_value = True
+    fake_vad.segment.return_value = [(0, 1), (1, count)]
+    worker, engine, events = factory(numpy_audio=True)
+    record_samples(worker, count)
+    recognize(worker)
+    assert events.get(timeout=2)["text"] == engine.text
+    assert engine.transcribe_calls == 1
+    assert len(engine.audios[0]) == count
+    fake_vad.trim_trailing_silence.assert_called_once()
+    fake_vad.segment.assert_not_called()
+
+
+def test_vad_duration_uses_trimmed_audio(factory: Factory, fake_vad: FakeVAD) -> None:
+    np = pytest.importorskip("numpy")
+    fake_vad.vad_available.return_value = True
+    trimmed = np.zeros(20 * SAMPLE_RATE, dtype=np.float32)
+    fake_vad.trim_trailing_silence.side_effect = None
+    fake_vad.trim_trailing_silence.return_value = trimmed
+    worker, engine, events = factory(numpy_audio=True)
+    record_samples(worker, 25 * SAMPLE_RATE)
+    recognize(worker)
+    assert events.get(timeout=2)["type"] == "result"
+    fake_vad.segment.assert_not_called()
+    assert engine.transcribe_calls == 1
+    assert engine.audios[0] is trimmed
+
+
+@pytest.mark.parametrize("boundaries", [[], [(0, 25 * SAMPLE_RATE)]])
+def test_vad_empty_or_single_segment_keeps_whole_audio(
+    factory: Factory, fake_vad: FakeVAD, boundaries: list[tuple[int, int]]
+) -> None:
+    pytest.importorskip("numpy")
+    fake_vad.vad_available.return_value = True
+    fake_vad.segment.return_value = boundaries
+    worker, engine, events = factory(FakeEngine("  как раньше  "), numpy_audio=True)
+    record_samples(worker, 25 * SAMPLE_RATE)
+    recognize(worker)
+    assert events.get(timeout=2)["text"] == "  как раньше  "
+    fake_vad.segment.assert_called_once()
+    assert engine.transcribe_calls == 1
+    assert len(engine.audios[0]) == 25 * SAMPLE_RATE
+
+
+@pytest.mark.parametrize("cancel_by_result", [False, True])
+def test_vad_cancel_between_segments(
+    factory: Factory, fake_vad: FakeVAD, cancel_by_result: bool
+) -> None:
+    pytest.importorskip("numpy")
+    token = FakeCancelToken()
+    engine = SegmentEngine(["первый", "второй", "третий"])
+    if cancel_by_result:
+        engine.cancelled_result = True
+    else:
+        engine.after_segment = token.cancel
+    fake_vad.vad_available.return_value = True
+    fake_vad.segment.return_value = [
+        (0, 10 * SAMPLE_RATE),
+        (10 * SAMPLE_RATE, 20 * SAMPLE_RATE),
+        (20 * SAMPLE_RATE, 30 * SAMPLE_RATE),
+    ]
+    worker, _, events = factory(engine, numpy_audio=True, cancel_factory=lambda: token)
+    record_samples(worker, 30 * SAMPLE_RATE)
+    recognize(worker)
+    assert events.get(timeout=1) == {"type": "cancelled", "utterance_id": "u1"}
+    assert engine.transcribe_calls == 1
+    assert len(engine.audios[0]) == 10 * SAMPLE_RATE
+    assert worker.buffers == {}
+    assert events.empty()
+
+
+@pytest.mark.parametrize("stage", ["trim_trailing_silence", "segment"])
+def test_vad_cancellation_skips_engine(factory: Factory, fake_vad: FakeVAD, stage: str) -> None:
+    pytest.importorskip("numpy")
+    token = FakeCancelToken()
+    fake_vad.vad_available.return_value = True
+
+    def cancel_during_vad(audio: Any, *args: Any, **kwargs: Any) -> Any:
+        token.cancel()
+        return audio if stage == "trim_trailing_silence" else []
+
+    getattr(fake_vad, stage).side_effect = cancel_during_vad
+    worker, engine, events = factory(numpy_audio=True, cancel_factory=lambda: token)
+    record_samples(worker, 25 * SAMPLE_RATE)
+    recognize(worker)
+    assert events.get(timeout=1) == {"type": "cancelled", "utterance_id": "u1"}
+    assert engine.transcribe_calls == 0
+    if stage == "trim_trailing_silence":
+        fake_vad.segment.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "own_warning", "import", "availability"])
+def test_vad_unavailable_warns_once_per_process(
+    factory: Factory,
+    fake_vad: FakeVAD,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    pytest.importorskip("numpy")
+    caplog.set_level(logging.WARNING)
+    if failure == "import":
+        real_import = importlib.import_module
+
+        def fail_vad_import(name: str, package: str | None = None) -> ModuleType:
+            if name == "astra_voice.worker.vad":
+                raise RuntimeError("ошибка инициализации модуля")
+            return real_import(name, package)
+
+        monkeypatch.setattr(importlib, "import_module", fail_vad_import)
+    elif failure == "own_warning":
+
+        def unavailable_with_warning() -> bool:
+            logging.getLogger(fake_vad.__name__).warning(
+                "Не удалось включить определение речи. Запись будет обработана целиком."
+            )
+            return False
+
+        fake_vad.vad_available.side_effect = unavailable_with_warning
+    elif failure == "availability":
+        fake_vad.vad_available.side_effect = RuntimeError("ошибка проверки доступности")
+
+    for _ in range(2):
+        # Новый автомат также не должен сбрасывать флаг уровня процесса.
+        worker, engine, events = factory(FakeEngine("  исходный текст  "), numpy_audio=True)
+        record_samples(worker, 25 * SAMPLE_RATE)
+        recognize(worker)
+        assert events.get(timeout=2)["text"] == "  исходный текст  "
+        assert engine.transcribe_calls == 1
+        assert len(engine.audios[0]) == 25 * SAMPLE_RATE
+        assert len(caplog.records) == 1
+        assert caplog.records[0].levelno == logging.WARNING
+        assert "Запись будет обработана целиком" in caplog.text
+    fake_vad.trim_trailing_silence.assert_not_called()
+    fake_vad.segment.assert_not_called()
+
+
+def test_vad_skips_list_audio(factory: Factory, fake_vad: FakeVAD) -> None:
+    fake_vad.vad_available.return_value = True
+    worker, engine, events = factory()
+    record_samples(worker, 25 * SAMPLE_RATE)
+    recognize(worker)
+    assert events.get(timeout=2)["text"] == engine.text
+    assert engine.transcribe_calls == 1
+    assert isinstance(engine.audios[0], list)
+    fake_vad.trim_trailing_silence.assert_not_called()
+    fake_vad.segment.assert_not_called()
 
 
 def test_all_states_and_pcm(factory: Factory) -> None:
@@ -574,6 +857,20 @@ def test_audio_close_ready(factory: Factory) -> None:
     assert worker.audio_ready() == {"type": "audio.ready"}
 
 
+@pytest.mark.parametrize("device", [None, "Микрофон"])
+@pytest.mark.parametrize("changed", [None, "Источник звука изменился: Микрофон"])
+def test_audio_ready_optional_fields(device: str | None, changed: str | None) -> None:
+    """Единый конструктор опускает отсутствующие поля и сохраняет готовый текст пилюли."""
+    expected: Message = {"type": "audio.ready"}
+    if device is not None:
+        expected["device"] = device
+    if changed is not None:
+        expected["changed"] = changed
+    event = WorkerState.audio_ready(device=device, changed=changed)
+    assert event == expected
+    assert decode(encode(event)[4:]) == expected
+
+
 @pytest.mark.parametrize("missing_smaps", [False, True])
 def test_measure_proc_fixtures(factory: Factory, tmp_path: Path, missing_smaps: bool) -> None:
     status, smaps = tmp_path / "status", tmp_path / "smaps_rollup"
@@ -751,6 +1048,7 @@ sys.path.insert(0, sys.argv[1])
 sys.modules['numpy'] = None
 sys.modules['onnxruntime'] = None
 sys.modules['astra_voice.worker.engine'] = None
+sys.modules['astra_voice.worker.vad'] = None
 from astra_voice.worker.state import WorkerState
 worker = WorkerState(runtime='none')
 assert worker.handle({'type': 'ping'}) == [{'type': 'pong'}]

@@ -378,15 +378,12 @@ class OnnxAsrEngine:
 
             self._model = model
             found = len(_find_sessions(model, rt.InferenceSession))
-            actual = active_sessions()
             expected = LAYOUTS[layout][variant].sessions
-            if found != expected or actual != expected:
+            if found != expected:
                 logging.getLogger(__name__).error(
-                    "Число сессий ORT не соответствует раскладке: ожидалось %d, "
-                    "найдено по типу %d, active_sessions()=%d",
+                    "Число сессий ORT не соответствует раскладке: ожидалось %d, найдено по типу %d",
                     expected,
                     found,
-                    actual,
                 )
             if callable(getattr(model, "cancellable", None)):
                 self._cancel_mode = "vendor-patch"
@@ -408,7 +405,7 @@ class OnnxAsrEngine:
             return LoadResult(
                 (time.perf_counter() - started) * 1000,
                 f"{version}; cancel={self._cancel_mode}",
-                actual,
+                found,
             )
 
     @staticmethod

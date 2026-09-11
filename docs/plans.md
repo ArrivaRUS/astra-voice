@@ -236,17 +236,17 @@ R1 снят S3 · S3-R1 молчаливое зависание при тесн�
 ### Goal
 Захват через `libpulse-simple` в воркере (PCM не покидает процесс), уровни, тишина, лимит 120 с, VAD > 20 с, список/выбор устройства, восстановление после рестарта WirePlumber, `WavFileSource` для тестов.
 ### Tasks (US-1.6-часть, US-2.4, US-11.1; компоненты `worker/audio.py`, `worker/vad.py`, `scripts/e2e/virtual_mic.sh`; синтез Р1, §7 И4; T1 У39)
-- [ ] `worker/audio.py`: протокол `AudioSource`; `PulseSimpleSource` (ctypes `libpulse-simple.so.0`, `pa_simple_new(PA_STREAM_RECORD, s16le/16k/1, device)`), поток чтения 20 мс, кольцевой буфер в ОЗУ, RMS/пик → `level` ≤ 30/с, «тишина» = пик < −60 дБ за 2 с → `silent`, лимит 120 с (настройка 30–300) → `limit`, ретраи открытия 3×300 мс, ошибки `ENODEV/EBUSY` + unit на `WavFileSource`.
-- [ ] Устройства: `pactl list short sources`; `*.monitor` — только с явной пометкой; сравнение `name`/`description` выбранного, молчаливой смены нет, при смене — имя источника в пилюле (У39, T-35).
-- [ ] И4: `audio.close` (ack) → GUI `systemctl --user restart wireplumber` через `QProcess` → ленивое открытие на следующем `record.start` → `audio.ready`; первая запись после автозапуска — повтор через 1 с до 3 раз (F6.3).
-- [ ] `worker/vad.py`: Silero VAD ONNX (`data/vad/silero_vad.onnx`, MIT, ~2 МБ): сегментация > 20 с по паузам без резки слов (окно ≤ 24 с), обрезка хвостовой тишины; ≤ 20 с — не применяется + unit синтетический wav с паузами.
-- [ ] Инвариант «ни одного wav/tmp на диске»: тест списком файлов до/после (S5-A4, инвариант #1-3 плана).
-- [ ] `scripts/e2e/virtual_mic.sh up|down`; `tools/validate dictation --virtual-mic [--silence N | --wav F]` (без хоткея: `record.start` → `paplay` → `result`).
+- [x] `worker/audio.py`: протокол `AudioSource`; `PulseSimpleSource` (ctypes `libpulse-simple.so.0`, `pa_simple_new(PA_STREAM_RECORD, s16le/16k/1, device)`), поток чтения 20 мс, кольцевой буфер в ОЗУ, RMS/пик → `level` ≤ 30/с, «тишина» = пик < −60 дБ за 2 с → `silent`, лимит 120 с (настройка 30–300) → `limit`, ретраи открытия 3×300 мс, ошибки `ENODEV/EBUSY` + unit на `WavFileSource`.
+- [x] Устройства: `pactl list short sources`; `*.monitor` — только с явной пометкой; сравнение `name`/`description` выбранного, молчаливой смены нет, при смене — имя источника в пилюле (У39, T-35).
+- [x] И4: `audio.close` (ack) → GUI `systemctl --user restart wireplumber` через `QProcess` → ленивое открытие на следующем `record.start` → `audio.ready`; первая запись после автозапуска — повтор через 1 с до 3 раз (F6.3).
+- [x] `worker/vad.py`: Silero VAD ONNX (`data/vad/silero_vad.onnx`, MIT, ~2 МБ): сегментация > 20 с по паузам без резки слов (окно ≤ 24 с), обрезка хвостовой тишины; ≤ 20 с — не применяется + unit синтетический wav с паузами.
+- [x] Инвариант «ни одного wav/tmp на диске»: тест списком файлов до/после (S5-A4, инвариант #1-3 плана).
+- [x] `scripts/e2e/virtual_mic.sh up|down`; `tools/validate dictation --virtual-mic [--silence N | --wav F]` (без хоткея: `record.start` → `paplay` → `result`).
 ### Definition of Done
 - Виртуальный микрофон: `record.start` → `paplay` 6 с → `result` с «проверка»; тишина → `silent` ≤ 2,2 с; 130 с записи → `limit` + текст; после `restart wireplumber` устройство открывается со 2-й попытки ≤ 1 с; 0 аудиофайлов на диске; CPU воркера в простое ≤ 1 % (нет опроса микрофона).
 ### Validation
 ```sh
-pytest -m unit tests/worker/test_audio_fsm.py tests/worker/test_vad.py -q
+pytest -m unit -q    # тесты звука и VAD — tests/unit/test_{audio,vad}*.py
 scripts/e2e/virtual_mic.sh up && tools/validate dictation --virtual-mic --wav data/test/test-ru-6s.wav
 tools/validate dictation --virtual-mic --silence 3                               # silent ≤ 2200 мс
 tools/validate dictation --virtual-mic --wav data/test/test-ru-130s.wav          # limit + result

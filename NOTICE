@@ -10,7 +10,7 @@ Copyright (c) 2026 ArrivaRUS
 Машиночитаемый состав поставки — в sbom.cdx.json (CycloneDX) рядом с пакетом.
 
 ================================================================================
-1. Компоненты в составе пакета (каталог /usr/lib/astra-voice/vendor)
+1. Компоненты в составе пакета
 ================================================================================
 
 onnxruntime 1.24.4 — MIT License
@@ -23,6 +23,17 @@ onnxruntime 1.24.4 — MIT License
 onnx-asr 0.12.0 — MIT License
     Copyright (c) Ilya Stupakov
     https://github.com/istupakov/onnx-asr
+
+Эти библиотеки поставляются в каталоге /usr/lib/astra-voice/vendor.
+
+Silero VAD — MIT License
+    Copyright (c) 2020-present Silero Team
+    https://github.com/snakers4/silero-vad
+    Файл silero_vad.onnx ревизии v6.2.1 (2026-02-24), коммит
+    7e30209a3e901f9842f81b225f3e93d8199902b1,
+    входит в состав пакета как data/vad/silero_vad.onnx.
+    sha256: 1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3
+    (не путать с silero-models — тот под CC BY-NC-SA и здесь не используется)
 
 Тестовые звуковые сэмплы data/test/test-ru-6s.wav и data/test/test-ru-20s.wav получены из transcribe-rs
     (MIT, Copyright (c) 2025 Ilya Stupakov).
@@ -62,11 +73,6 @@ Whisper — MIT License (репозиторий OpenAI) / Apache-2.0 (метад
     на Hugging Face; расхождение источников указано намеренно)
     Copyright (c) 2022 OpenAI
     https://github.com/openai/whisper
-
-Silero VAD — MIT License
-    Copyright (c) Silero Team
-    https://github.com/snakers4/silero-vad
-    (не путать с silero-models — тот под CC BY-NC-SA и здесь не используется)
 
 Лицензия каждого репозитория, откуда скачиваются файлы, фиксируется в каталоге
 моделей и показывается на карточке модели.

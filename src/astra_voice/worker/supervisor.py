@@ -30,6 +30,10 @@ _CORRELATION: dict[str, RequestKey] = {
     "audio.close": ("reply", "audio.closed"),
     "transcribe.file": ("utterance", "file"),
 }
+# Уровень и тишина — индикация во время записи; record.limit означает автоостановку,
+# но распознавание этого utterance_id ещё впереди. audio.ready подтверждает открытие
+# устройства, а не завершение команды: эти уведомления не снимают ожидание.
+_NOTIFICATIONS = {"level", "silent", "record.limit", "audio.ready"}
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +44,7 @@ class _Pending:
     deadline: float | None
     activity: int
     request_type: str
+    timeout: float | None
     request_types: set[str] = field(default_factory=set)
 
 
@@ -74,6 +79,8 @@ class WorkerSupervisor:
     таблица ``_CORRELATION``. Поэтому transcribe.file ожидает result/cancelled с
     id "file"; этот служебный id также нельзя повторять в пределах поколения.
     Команды одной диктовки разделяют одно ожидание и одно завершающее событие.
+    Промежуточные level/silent/record.limit/audio.ready передаются потребителю,
+    сохраняя ожидание и продлевая его дедлайн на заданный таймаут при совпадении ключа.
     Ошибка с utterance_id завершает точное ожидание; request_type без id допустим,
     если определяет единственное ожидание. Ошибка без корреляции завершает все
     текущие ожидания отдельными коррелированными событиями: при одном ожидании
@@ -195,10 +202,11 @@ class WorkerSupervisor:
         if expects_reply:
             pending = self._pending.get(key)
             if pending is None:
-                pending = _Pending(deadline, self._activity, kind)
+                pending = _Pending(deadline, self._activity, kind, timeout)
                 self._pending[key] = pending
             elif timeout is not None:
                 pending.deadline = deadline
+                pending.timeout = timeout
                 pending.activity = self._activity
             pending.request_type = kind
             pending.request_types.add(kind)
@@ -305,7 +313,11 @@ class WorkerSupervisor:
             for event in events:
                 self._emit(event, generation=generation)
             return
-        if key in self._pending:
+        if kind in _NOTIFICATIONS:
+            pending = self._pending.get(key)
+            if pending is not None and pending.timeout is not None:
+                pending.deadline = self._clock() + pending.timeout
+        elif key in self._pending:
             self._finish(key, message)
         elif kind in ("result", "cancelled") or key in self._finished:
             self.dropped_late += 1

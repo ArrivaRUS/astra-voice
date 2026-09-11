@@ -44,12 +44,16 @@ from importlib.metadata import PackageNotFoundError, version
 from itertools import islice
 from pathlib import Path
 from threading import RLock
-from typing import Any, Protocol, cast
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from astra_voice.core.logging import RedactTextFilter
 from astra_voice.core.paths import data_dir
 from astra_voice.core.version import __version__
 from astra_voice.worker.ipc import UNKNOWN_MESSAGE, FrameError, encode, error
+
+if TYPE_CHECKING:
+    from astra_voice.worker.audio import AudioCapture
 
 logger = logging.getLogger(__name__)
 logger.addFilter(RedactTextFilter())
@@ -57,6 +61,55 @@ Message = dict[str, Any]
 SAMPLE_RATE = 16_000
 LIMIT_S_DEFAULT = 120.0
 STOPPED_TTL_S_DEFAULT = 300.0
+_vad_unavailable_warned = False
+_vad_availability_lock = RLock()
+
+
+def join_segment_texts(parts: list[str]) -> str:
+    """Склеивает фрагменты, убирая лишние пробелы и повтор знака на стыке."""
+    text = ""
+    for part in parts:
+        part = " ".join(part.split())
+        if text and text[-1] in ".!?…":
+            while part.startswith(text[-1]):
+                part = part[1:].lstrip()
+        if not part:
+            continue
+        separator = " " if text and part[0] not in ".,!?;:…" else ""
+        text += separator + part
+    return text
+
+
+def _available_vad() -> ModuleType | None:
+    """Лениво проверяет VAD; учитывает его собственное предупреждение об отказе."""
+    global _vad_unavailable_warned
+
+    def warning_once(record: logging.LogRecord) -> bool:
+        global _vad_unavailable_warned
+        if record.levelno != logging.WARNING:
+            return True
+        with _vad_availability_lock:
+            if _vad_unavailable_warned:
+                return False
+            _vad_unavailable_warned = True
+            return True
+
+    with _vad_availability_lock:
+        vad_logger = logging.getLogger("astra_voice.worker.vad")
+        # Только проверка доступности: предупреждения сегментации не фильтруем.
+        vad_logger.addFilter(warning_once)
+        try:
+            module = importlib.import_module("astra_voice.worker.vad")
+            if module.vad_available():
+                return module
+        except Exception:
+            pass
+        finally:
+            vad_logger.removeFilter(warning_once)
+        if not _vad_unavailable_warned:
+            _vad_unavailable_warned = True
+            logger.warning("Определение речи недоступно. Запись будет обработана целиком.")
+    return None
 
 
 class Cancellation(Protocol):
@@ -165,6 +218,8 @@ class WorkerState:
     ``feed_audio`` принимает нормализованные отсчёты PCM 16 кГц, моно.
     ``audio_factory`` и ``cancel_factory`` позволяют тестировать без numpy и ORT.
     Переданный извне executor остаётся собственностью вызывающего кода.
+    Callback-и capture направляются в on_samples и on_error этого автомата;
+    события захвата передаются тому же on_event, что и события автомата.
     Идентичность модели сохраняется после unload: VmHWM относится ко всему процессу.
     """
 
@@ -173,6 +228,7 @@ class WorkerState:
         *,
         engine_factory: Callable[[str], EngineBackend] = _make_engine,
         audio_source: AudioSource | None = None,
+        capture: AudioCapture | None = None,
         executor: Executor | None = None,
         data_dir_factory: Callable[[], Path] = data_dir,
         on_event: Callable[[Message], None] = lambda msg: None,
@@ -200,6 +256,8 @@ class WorkerState:
         self.min_ram_mb = 0
         self._engine_factory = engine_factory
         self._source = audio_source
+        self._capture = capture
+        self._device: str | None = None
         self._executor = executor if executor is not None else ThreadPoolExecutor(max_workers=1)
         self._owns_executor = executor is None
         self._data_dir = data_dir_factory
@@ -222,50 +280,73 @@ class WorkerState:
         self._unloading = False
         self._closed = False
 
-    def handle(self, msg: Message) -> list[Message]:
-        """Принимает уже проверенное IPC сообщение; результат инференса идёт callback-ом."""
+    def set_capture(self, capture: AudioCapture) -> None:
+        """Подключает захват с callback-ами этого автомата до начала записи."""
         with self._lock:
-            if self._closed:
-                return [error("bad-state", "Воркер закрыт.")]
-            self._expire_stopped()
-            kind = msg["type"]
-            if kind == "ping":
-                return [{"type": "pong"}]
-            if kind == "model.load":
-                return self._load(msg)
-            if kind == "model.unload":
-                self._unload()
-                return []
-            if kind == "measure":
-                return self._measure()
-            if kind == "audio.close":
-                if self._source is not None:
-                    self._source.close()
-                return [{"type": "audio.closed"}]
-            if kind == "transcribe.file":
-                return self._recognize("file", Path(msg["path"]))
-            uid = str(msg.get("utterance_id", ""))
-            if kind == "record.start":
-                if self._recording is not None or self._has_job(uid):
-                    return [error("bad-state", "Запись уже существует.")]
-                if uid in self._stopped:
-                    self._stopped.pop(uid)
-                    logger.info("Остановленный буфер вытеснен новой записью: %s.", uid)
-                self._cancelled.discard(uid)
-                self.buffers[uid] = array("f")
-                self._recording = uid
-                self._update_state()
-                return []
-            if kind == "record.stop":
-                if self._recording != uid:
-                    return [error("bad-state", "Нет такой активной записи.")]
-                self._stop_recording()
-                return []
-            if kind == "record.cancel":
-                return self._cancel(uid)
-            if kind == "recognize":
-                return self._recognize(uid)
-            return [error(UNKNOWN_MESSAGE, "Неизвестная команда воркера.")]
+            if self._closed or self._recording is not None or self._capture is not None:
+                raise RuntimeError("Захват можно подключить только к свободному автомату.")
+            self._capture = capture
+
+    def handle(self, msg: Message) -> list[Message]:
+        """Принимает IPC сообщение и выполняет ожидания после снятия блокировки."""
+        deferred: list[Callable[[], None]] = []
+        with self._lock:
+            replies = self._handle(msg, deferred)
+        for action in deferred:
+            action()
+        return replies
+
+    def _handle(self, msg: Message, deferred: list[Callable[[], None]]) -> list[Message]:
+        """Меняет состояние под блокировкой; ожидание захвата откладывает в handle."""
+        if self._closed:
+            return [error("bad-state", "Воркер закрыт.")]
+        self._expire_stopped()
+        kind = msg["type"]
+        if kind == "ping":
+            return [{"type": "pong"}]
+        if kind == "model.load":
+            return self._load(msg)
+        if kind == "model.unload":
+            self._unload(deferred)
+            return []
+        if kind == "measure":
+            return self._measure()
+        if kind == "audio.close":
+            if self._capture is not None:
+                if self._recording is not None:
+                    self._stop_recording(deferred)
+                else:
+                    self._stop_capture(deferred)
+            if self._source is not None:
+                deferred.append(self._source.close)
+            return [{"type": "audio.closed"}]
+        if kind == "transcribe.file":
+            return self._recognize("file", Path(msg["path"]))
+        uid = str(msg.get("utterance_id", ""))
+        if kind == "record.start":
+            if self._recording is not None or self._has_job(uid):
+                return [error("bad-state", "Запись уже существует.")]
+            if uid in self._stopped:
+                self._stopped.pop(uid)
+                logger.info("Остановленный буфер вытеснен новой записью: %s.", uid)
+            self._cancelled.discard(uid)
+            self.buffers[uid] = array("f")
+            self._recording = uid
+            self._update_state()
+            if self._capture is not None:
+                self._device = msg.get("device")
+                self._capture.start(uid, self._device)
+            return []
+        if kind == "record.stop":
+            if self._recording != uid:
+                return [error("bad-state", "Нет такой активной записи.")]
+            self._stop_recording(deferred)
+            return []
+        if kind == "record.cancel":
+            return self._cancel(uid, deferred)
+        if kind == "recognize":
+            return self._recognize(uid, deferred=deferred)
+        return [error(UNKNOWN_MESSAGE, "Неизвестная команда воркера.")]
 
     def feed_audio(self, utterance_id: str, samples: Iterable[float]) -> None:
         """Дописывает кадр только в текущую запись; поздние кадры отбрасываются."""
@@ -277,8 +358,33 @@ class WorkerState:
                     self._stop_recording()
                     self._emit({"type": "record.limit", "utterance_id": utterance_id})
 
-    def _stop_recording(self) -> None:
+    def on_samples(self, utterance_id: str, samples: array[float]) -> bool:
+        """Принимает PCM захвата и останавливает чтение при завершении записи."""
+        with self._lock:
+            self.feed_audio(utterance_id, samples)
+            return not self._closed and self._recording == utterance_id
+
+    def on_error(self, utterance_id: str, code: str, message: str) -> None:
+        """Удаляет неудавшуюся запись и передаёт ошибку захвата событием."""
+        with self._lock:
+            if self._closed or self._recording != utterance_id:
+                return
+            self.buffers.pop(utterance_id, None)
+            self._stopped.pop(utterance_id, None)
+            self._recording = None
+            self._update_state()
+            self._emit({**error(code, message), "utterance_id": utterance_id})
+
+    def _stop_capture(self, deferred: list[Callable[[], None]] | None = None) -> None:
+        """Под блокировкой только просит остановку; callback-и не ждут свой поток."""
+        if self._capture is not None:
+            self._capture.request_stop()
+            if deferred is not None:
+                deferred.append(self._capture.stop)
+
+    def _stop_recording(self, deferred: list[Callable[[], None]] | None = None) -> None:
         assert self._recording is not None
+        self._stop_capture(deferred)
         self._stopped[self._recording] = self._clock()
         self._recording = None
         self._update_state()
@@ -292,9 +398,14 @@ class WorkerState:
                 logger.info("Истёк срок хранения остановленного буфера: %s.", uid)
 
     @staticmethod
-    def audio_ready() -> Message:
+    def audio_ready(device: str | None = None, changed: str | None = None) -> Message:
         """Формирует событие после успешного открытия устройства в M3."""
-        return {"type": "audio.ready"}
+        ready: Message = {"type": "audio.ready"}
+        if device is not None:
+            ready["device"] = device
+        if changed is not None:
+            ready["changed"] = changed
+        return ready
 
     def _has_job(self, uid: str) -> bool:
         return any(
@@ -341,7 +452,13 @@ class WorkerState:
         }
         return [dict(self._loaded)]
 
-    def _recognize(self, uid: str, path: Path | None = None) -> list[Message]:
+    def _recognize(
+        self,
+        uid: str,
+        path: Path | None = None,
+        *,
+        deferred: list[Callable[[], None]] | None = None,
+    ) -> list[Message]:
         if self._engine is None:
             return [error("no-model", "Модель не загружена.")]
         if self._has_job(uid):
@@ -356,6 +473,7 @@ class WorkerState:
         self._cancelled.discard(uid)
         self._stopped.pop(uid, None)
         if self._recording == uid:
+            self._stop_capture(deferred)
             self._recording = None
         if self._active is not None:
             self._pending = job
@@ -415,14 +533,14 @@ class WorkerState:
                     msg = {"type": "cancelled", "utterance_id": job.utterance_id}
                 else:
                     audio = self._audio_factory(samples)
-                    result = engine.transcribe(audio, job.cancel)
+                    text, cancelled = self._transcribe_audio(audio, job, engine)
                     msg = (
                         {"type": "cancelled", "utterance_id": job.utterance_id}
-                        if result.cancelled
+                        if cancelled
                         else {
                             "type": "result",
                             "utterance_id": job.utterance_id,
-                            "text": result.text,
+                            "text": text,
                             "t_ms": int((self._clock() - job.started) * 1000),
                         }
                     )
@@ -435,6 +553,37 @@ class WorkerState:
             logger.warning("Ошибка распознавания движка.")
             msg = error("engine-failed", "Ошибка распознавания движка.")
         self._finish(job, msg)
+
+    def _transcribe_audio(self, audio: Any, job: _Job, engine: EngineBackend) -> tuple[str, bool]:
+        """Обрезает хвост и распознаёт сегменты под замком движка из _run."""
+        boundaries: list[tuple[int, int]] = []
+        # Инъекция audio_factory может возвращать список вместо ndarray.
+        if getattr(audio, "ndim", None) == 1 and getattr(audio, "dtype", None) == "float32":
+            vad = _available_vad()
+            if job.cancel.cancelled:
+                return "", True
+            if vad is not None:
+                audio = vad.trim_trailing_silence(audio, SAMPLE_RATE, cancel=job.cancel)
+                if job.cancel.cancelled:
+                    return "", True
+                if len(audio) / SAMPLE_RATE > 20.0:
+                    boundaries = vad.segment(
+                        audio, SAMPLE_RATE, max_window_s=24.0, cancel=job.cancel
+                    )
+        if job.cancel.cancelled:
+            return "", True
+        if len(boundaries) <= 1:
+            result = engine.transcribe(audio, job.cancel)
+            return result.text, job.cancel.cancelled or result.cancelled
+        parts: list[str] = []
+        for start, stop in boundaries:
+            if job.cancel.cancelled:
+                return "", True
+            result = engine.transcribe(audio[start:stop], job.cancel)
+            if job.cancel.cancelled or result.cancelled:
+                return "", True
+            parts.append(result.text)
+        return join_segment_texts(parts), False
 
     def _finish(self, job: _Job, msg: Message) -> None:
         with self._lock:
@@ -470,7 +619,7 @@ class WorkerState:
         except Exception:
             logger.warning("Не удалось передать событие воркера.")
 
-    def _cancel(self, uid: str) -> list[Message]:
+    def _cancel(self, uid: str, deferred: list[Callable[[], None]] | None = None) -> list[Message]:
         if uid not in self.buffers and not self._has_job(uid) and uid not in self._cancelled:
             return [error("bad-state", "Нет такой utterance для отмены.")]
         for job in (self._active, self._pending):
@@ -480,6 +629,7 @@ class WorkerState:
                 if job is self._pending:
                     self._pending = None
         if self._recording == uid:
+            self._stop_capture(deferred)
             self._recording = None
         self.buffers.pop(uid, None)
         self._stopped.pop(uid, None)
@@ -495,7 +645,8 @@ class WorkerState:
             except Exception:
                 logger.warning("Ошибка выгрузки движка.")
 
-    def _unload(self) -> None:
+    def _unload(self, deferred: list[Callable[[], None]] | None = None) -> None:
+        self._stop_capture(deferred)
         running = self._active is not None
         for job in (self._active, self._pending):
             if job is not None:
@@ -565,12 +716,19 @@ class WorkerState:
 
     def close(self) -> None:
         """Отменяет задания, освобождает источник и завершает собственный executor."""
+        deferred: list[Callable[[], None]] = []
         with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._unload()
-            if self._source is not None:
-                self._source.close()
+            self._close(deferred)
+        for action in deferred:
+            action()
+
+    def _close(self, deferred: list[Callable[[], None]]) -> None:
+        """Закрывает автомат под блокировкой, откладывая ожидания потоков."""
+        if self._closed:
+            return
+        self._closed = True
+        self._unload(deferred)
+        if self._source is not None:
+            deferred.append(self._source.close)
         if self._owns_executor:
-            self._executor.shutdown(wait=True)
+            deferred.append(lambda: self._executor.shutdown(wait=True))

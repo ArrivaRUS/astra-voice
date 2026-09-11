@@ -997,7 +997,7 @@ def test_unavailable_cancel_preserves_text(
 
 
 @pytest.mark.parametrize(
-    ("asr_count", "resampler_count", "extra_count"), [(1, 0, 0), (3, 7, 0), (3, 0, 1)]
+    ("asr_count", "resampler_count", "extra_count"), [(1, 0, 0), (3, 7, 0), (2, 0, 1)]
 )
 def test_load_logs_session_count_mismatch(
     monkeypatch: pytest.MonkeyPatch,
@@ -1007,6 +1007,7 @@ def test_load_logs_session_count_mismatch(
     resampler_count: int,
     extra_count: int,
 ) -> None:
+    """Чужая сессия не скрывает нехватку собственных сессий адаптера."""
     adapter = _FakeAdapter([_FakeSession() for _ in range(asr_count)])
     vars(adapter)["resampler"] = SimpleNamespace(
         _preprocessors={i: _FakeSession() for i in range(resampler_count)}
@@ -1015,12 +1016,50 @@ def test_load_logs_session_count_mismatch(
     _, loaded = _load_fake_engine(monkeypatch, adapter, "gigaam-v3-e2e-rnnt")
     found = asr_count + resampler_count
     actual = found + len(extra)
-    assert loaded.sessions == actual
+    assert active_sessions() == actual
+    assert loaded.sessions == found
     assert any(
-        record.levelname == "ERROR"
-        and f"ожидалось 3, найдено по типу {found}, active_sessions()={actual}" in record.message
+        record.levelname == "ERROR" and f"ожидалось 3, найдено по типу {found}" in record.message
         for record in caplog.records
     )
+
+
+def test_load_ignores_foreign_session_and_unload_releases_own(
+    monkeypatch: pytest.MonkeyPatch, fake_runtime: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Чужая ORT-сессия не влияет на результат загрузки и остаётся после выгрузки."""
+    foreign = _FakeSession()
+    sessions: list[weakref.ReferenceType[_FakeSession]] = []
+
+    def load_model(
+        model_dir: Path, layout: str, variant: str, threads: int
+    ) -> tuple[_FakeAdapter, str]:
+        own = [_FakeSession() for _ in range(3)]
+        sessions.extend(weakref.ref(session) for session in own)
+        return _FakeAdapter(own), "fake"
+
+    engine = OnnxAsrEngine()
+    monkeypatch.setattr(engine, "_load_model", load_model)
+    try:
+        assert active_sessions() == 1
+        loaded = engine.load(Path("."), LAYOUT, "gigaam-v3-e2e-rnnt", threads=2)
+        assert loaded.sessions == 3
+        assert active_sessions() == 4
+        assert len(sessions) == 3 and all(session() is not None for session in sessions)
+        assert not [
+            record
+            for record in caplog.records
+            if record.levelno >= logging.ERROR and "Число сессий ORT" in record.getMessage()
+        ]
+
+        engine.unload()
+        assert all(session() is None for session in sessions)
+        assert active_sessions() == 1
+        engine.unload()
+        assert active_sessions() == 1
+        assert foreign.calls == 0
+    finally:
+        engine.unload()
 
 
 def test_cancel_after_recognition_preserves_text(

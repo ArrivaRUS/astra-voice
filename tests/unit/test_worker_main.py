@@ -217,6 +217,42 @@ def test_nonblocking_send_and_receive(monkeypatch: pytest.MonkeyPatch) -> None:
     connection.close.assert_called_once_with()
 
 
+def test_oversized_event_becomes_error_and_loop_continues(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Длинная подпись не роняет воркер и не мешает следующим событиям и ping."""
+    connection = Mock(spec=socket.socket)
+    sent = bytearray()
+
+    def send(data: bytearray) -> int:
+        sent.extend(data)
+        return len(data)
+
+    connection.send.side_effect = send
+    connection.recv.side_effect = [ipc.encode({"type": "ping"}), b""]
+    monkeypatch.setattr(
+        select,
+        "select",
+        Mock(side_effect=[([connection], [connection], []), ([connection], [], [])]),
+    )
+    loop = worker_main.WorkerLoop(connection, capture=False)
+    label = "Личная метка " + "я" * ipc.MAX_FRAME_BYTES
+    loop._events.put({"type": "audio.ready", "device": label})
+    loop._events.put({"type": "audio.ready", "device": "Микрофон"})
+    with caplog.at_level(logging.WARNING, logger="astra_voice.worker.main"):
+        assert loop.run() == 0
+    messages = ipc.FrameReader().feed(bytes(sent))
+    assert messages[0]["type"] == "hello"
+    assert messages[1:] == [
+        ipc.error(ipc.FRAME_TOO_LARGE, "Тело кадра превышает 64 КиБ."),
+        {"type": "audio.ready", "device": "Микрофон"},
+        {"type": "pong"},
+    ]
+    assert caplog.messages == ["Не удалось отправить событие воркера."]
+    assert "Личная метка" not in caplog.text
+    connection.close.assert_called_once_with()
+
+
 @pytest.mark.parametrize("error_number", [errno.EPIPE, errno.ECONNRESET])
 def test_fatal_send_error_closes_loop(monkeypatch: pytest.MonkeyPatch, error_number: int) -> None:
     """Настоящий обрыв при записи завершает цикл и освобождает ресурсы."""

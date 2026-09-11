@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Проверки вех Astra Voice: Р11, время подтверждения отмены через IPC.
+"""Проверки вех Astra Voice: отмена через IPC и диктовка без GUI и хоткея.
 
     tools/validate worker-cancel --model-dir /путь/к/модели --json
+    tools/validate dictation --virtual-mic --silence 3
 
 Коды возврата: 0 — уложились, 1 — нарушен критерий, 2 — прогон невозможен.
 Проверяется интервал record.cancel → cancelled, а не остановка всех вызовов ORT.
@@ -13,8 +14,11 @@ import argparse
 import json
 import math
 import os
+import signal
+import subprocess
 import sys
 import time
+import wave
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -28,6 +32,7 @@ from astra_voice.worker import ipc  # noqa: E402
 from astra_voice.worker.supervisor import Message, WorkerSupervisor  # noqa: E402
 
 CANCEL_LIMIT_MS = 1000.0
+SILENT_LIMIT_MS = 2200.0
 
 
 def positive_int(raw: str) -> int:
@@ -205,6 +210,262 @@ def worker_cancel(args: argparse.Namespace) -> int:
         supervisor.stop()
 
 
+class DictationFailure(Exception):
+    """Прерывает сценарий с вердиктом, сохраняя обязательную уборку."""
+
+    def __init__(self, code: int, explanation: str) -> None:
+        super().__init__(explanation)
+        self.code = code
+
+
+def dictation(args: argparse.Namespace) -> int:
+    """Проверяет захват, тишину, лимит и распознавание через публичный IPC."""
+    device = args.device if args.device is not None else "av_test_src"
+    facts: Message = {
+        "command": "dictation",
+        "mode": "wav" if args.wav is not None else "silence",
+        "device": device,
+        "virtual_mic": args.virtual_mic,
+        "utterance_id": "d1",
+        "limit_expected": args.limit,
+        "record_limit": False,
+        "level_count": 0,
+        "max_peak_dbfs": None,
+        "silent_ms": None,
+        "threshold_ms": SILENT_LIMIT_MS,
+    }
+    events: dict[str, tuple[float, Message]] = {}
+    errors: deque[Message] = deque()
+    player: subprocess.Popen[bytes] | None = None
+    virtual_attempted = False
+    steps: list[str] = []
+
+    def receive(event: Message) -> None:
+        """Сохраняет первые события и агрегирует уровни без журналирования текста."""
+        received_at = time.monotonic()
+        if event["generation"] != generation:
+            return
+        kind = event["type"]
+        if event.get("utterance_id") not in (None, "d1"):
+            return
+        if kind == "error":
+            errors.append(event)
+        elif kind == "level":
+            facts["level_count"] += 1
+            peak = event["peak_dbfs"]
+            previous = facts["max_peak_dbfs"]
+            facts["max_peak_dbfs"] = peak if previous is None else max(previous, peak)
+        else:
+            events.setdefault(kind, (received_at, event))
+            if kind == "record.limit" and event.get("utterance_id") == "d1":
+                facts["record_limit"] = True
+            if kind == "silent" and "audio.ready" in events:
+                facts["silent_ms"] = (events["silent"][0] - events["audio.ready"][0]) * 1000
+
+    supervisor = WorkerSupervisor(on_event=receive, use_qt=False)
+    generation = supervisor.generation
+
+    def check_worker() -> None:
+        """Ошибки устройства нарушают критерий; сбой воркера мешает прогону."""
+        if errors:
+            event = errors.popleft()
+            facts.update(error_code=event["code"], error_message=event["message"])
+            code = 1 if event["code"] in ("audio-no-device", "audio-busy", "audio-failed") else 2
+            raise DictationFailure(code, f"Воркер: {event['code']}: {event['message']}")
+        if supervisor.state == "stopped" or supervisor.generation != generation:
+            raise DictationFailure(2, "Воркер остановился или сменил поколение во время прогона.")
+
+    def pump(seconds: float) -> None:
+        supervisor.pump(min(max(0, seconds), 0.005))
+        check_worker()
+
+    def wait(kind: str, seconds: float, code: int = 2) -> tuple[float, Message]:
+        """Ожидает событие, не теряя silent и record.limit между этапами."""
+        deadline = time.monotonic() + seconds
+        while True:
+            check_worker()
+            if kind in events:
+                return events[kind]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DictationFailure(code, f"Не дождались события {kind} за {seconds:g} с.")
+            pump(remaining)
+
+    def record_for(seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            pump(deadline - time.monotonic())
+        pump(0)
+
+    def virtual_mic(action: str) -> None:
+        """Перехватывает stdout скрипта, чтобы JSON оставался одним объектом."""
+        result = subprocess.run(
+            [str(ROOT / "scripts/e2e/virtual_mic.sh"), action],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        facts[f"virtual_mic_{action}"] = result.returncode
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise DictationFailure(2, f"virtual_mic.sh {action}: код {result.returncode}. {detail}")
+
+    def run() -> tuple[int, str]:
+        nonlocal player, virtual_attempted
+        if not args.virtual_mic and args.device is None:
+            raise DictationFailure(2, "Без --virtual-mic требуется явный --device.")
+        if not device.strip():
+            raise DictationFailure(2, "Укажите непустое имя источника в --device.")
+        wav: Path | None = None
+        duration = 0.0
+        if args.wav is not None:
+            wav = args.wav.expanduser().resolve()
+            if not wav.is_file():
+                raise DictationFailure(2, "Звуковой файл не найден. Проверьте --wav.")
+            with wave.open(str(wav), "rb") as source:
+                duration = source.getnframes() / source.getframerate()
+            facts.update(wav=str(wav), wav_seconds=duration, sink="av_test")
+        if args.virtual_mic:
+            virtual_attempted = True
+            virtual_mic("up")
+            steps.append("Виртуальный микрофон поднят.")
+        supervisor.start()
+        _, hello = wait("hello", 10)
+        if hello["runtime"]["onnxruntime"] is None:
+            raise DictationFailure(2, "Движок onnxruntime недоступен в выбранном Python.")
+        if wav is not None:
+            request = model_request(args)
+            facts.update(variant=request["variant"], threads=request["threads"])
+            supervisor.send(request, timeout=10)
+            _, loaded = wait("model.loaded", 12)
+            facts["engine_version"] = loaded["engine_version"]
+            steps.append("Модель загружена.")
+        started = time.monotonic()
+        supervisor.send({"type": "record.start", "utterance_id": "d1", "device": device})
+        ready_at, _ = wait("audio.ready", 10, 1)
+        facts["audio_ready_ms"] = (ready_at - started) * 1000
+        steps.append(f"Источник {device} готов к записи.")
+        if wav is None:
+            facts["silence_seconds"] = args.silence
+            record_for(max(0, ready_at + args.silence - time.monotonic()))
+            # Длительность задаёт окно наблюдения; поздний silent не даёт PASS.
+            if args.limit:
+                wait("record.limit", 0, 1)
+            elapsed = facts["silent_ms"]
+            supervisor.send({"type": "record.cancel", "utterance_id": "d1"})
+            wait("cancelled", 3, 1)
+            if elapsed is None:
+                return 1, "За время записи событие silent не получено."
+            if elapsed > SILENT_LIMIT_MS:
+                return 1, "Событие silent пришло позже порога."
+            if args.expect is not None:
+                return 1, "В режиме тишины нет распознанного текста для --expect."
+            return 0, "Измерено время от callback(audio.ready) до callback(silent)."
+        steps.append(f"Воспроизведение {wav} в av_test.")
+        player = subprocess.Popen(
+            ["paplay", "--device=av_test", str(wav)], stdout=subprocess.DEVNULL
+        )
+        deadline = time.monotonic() + duration + 30
+        while player.poll() is None:
+            if time.monotonic() >= deadline:
+                raise DictationFailure(2, "paplay не завершился за длительность WAV плюс 30 с.")
+            pump(deadline - time.monotonic())
+        facts["paplay_returncode"] = player.returncode
+        if player.returncode:
+            raise DictationFailure(2, f"paplay завершился с кодом {player.returncode}.")
+        record_for(0.2)
+        if args.limit:
+            wait("record.limit", 2, 1)
+        # Лимит уже остановил запись в WorkerState: повторный stop даёт bad-state.
+        if not facts["record_limit"]:
+            supervisor.send({"type": "record.stop", "utterance_id": "d1"})
+        supervisor.send({"type": "recognize", "utterance_id": "d1"}, timeout=120)
+        _, result = wait("result", 120, 1)
+        facts.update(text=result["text"], t_ms=result["t_ms"])
+        if args.expect is not None:
+            matched = args.expect.casefold() in result["text"].casefold()
+            facts["expect_matched"] = matched
+            if not matched:
+                return 1, "Распознанный текст не содержит подстроку из --expect."
+        return 0, "Получен result для диктовки d1."
+
+    code, explanation = 2, "Прогон не завершён."
+    try:
+        code, explanation = run()
+    except DictationFailure as exc:
+        code, explanation = exc.code, str(exc)
+    except KeyboardInterrupt:
+        explanation = "Проверка прервана пользователем (Ctrl+C)."
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        ipc.FrameError,
+        wave.Error,
+        EOFError,
+        subprocess.SubprocessError,
+    ) as exc:
+        explanation = f"Не удалось выполнить проверку: {exc}"
+    finally:
+        # Повторный Ctrl+C не должен прерывать освобождение звуковых ресурсов.
+        previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        cleanup_errors: list[str] = []
+        try:
+            try:
+                if player is not None and player.poll() is None:
+                    player.terminate()
+                    try:
+                        player.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        player.kill()
+                        player.wait(timeout=2)
+            except (OSError, subprocess.SubprocessError) as exc:
+                cleanup_errors.append(f"Не удалось остановить paplay: {exc}")
+            finally:
+                try:
+                    supervisor.stop()
+                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                    cleanup_errors.append(f"Не удалось остановить воркер: {exc}")
+                finally:
+                    if virtual_attempted:
+                        try:
+                            virtual_mic("down")
+                            steps.append("Виртуальный микрофон выгружен.")
+                        except (DictationFailure, OSError, subprocess.SubprocessError) as exc:
+                            cleanup_errors.append(
+                                f"Не удалось выгрузить виртуальный микрофон: {exc}"
+                            )
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+        if cleanup_errors:
+            facts["cleanup_errors"] = cleanup_errors
+            code = 2
+            explanation += " " + " ".join(cleanup_errors)
+
+    verdict = {0: "уложились", 1: "не уложились", 2: "прогнать не удалось"}[code]
+    facts.update(exit_code=code, verdict=verdict, explanation=explanation)
+    if args.json:
+        print(json.dumps(facts, ensure_ascii=False), flush=True)
+    else:
+        print("Способ: dictation (запись через воркер, без хоткея и GUI).")
+        for step in steps:
+            print(step)
+        if "text" in facts:
+            print(f"Распознанный текст: {facts['text']}")
+            print(f"t_ms: {facts['t_ms']} мс.")
+        elapsed = facts["silent_ms"]
+        measured = "не измерено" if elapsed is None else f"{elapsed:.3f} мс"
+        print(f"До silent: {measured}; порог ≤ {SILENT_LIMIT_MS:g} мс.")
+        print(f"record.limit: {'получен' if facts['record_limit'] else 'не получен'}.")
+        print(
+            f"Событий level: {facts['level_count']}; максимум peak_dbfs: {facts['max_peak_dbfs']}."
+        )
+        print(f"Вердикт: {verdict}. {explanation}")
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     """Разбирает подкоманды; новые проверки добавляются отдельными обработчиками."""
     parser = argparse.ArgumentParser(description="Проверки Astra Voice без GUI")
@@ -216,8 +477,22 @@ def main(argv: list[str] | None = None) -> int:
     cancel.add_argument("--wav", type=Path, default=ROOT / "data/test/test-ru-20s.wav")
     cancel.add_argument("--cancel-after-ms", type=delay_ms, default=300.0)
     cancel.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    dictate = commands.add_parser("dictation", help="проверить диктовку без хоткея и GUI")
+    dictate.add_argument(
+        "--virtual-mic", action="store_true", help="поднять и выгрузить av_test_src"
+    )
+    source = dictate.add_mutually_exclusive_group(required=True)
+    source.add_argument("--wav", type=Path, help="WAV для paplay --device=av_test")
+    source.add_argument("--silence", type=delay_ms, metavar="СЕКУНДЫ", help="длительность тишины")
+    dictate.add_argument("--limit", action="store_true", help="потребовать событие record.limit")
+    dictate.add_argument("--device", help="источник записи; обязателен без --virtual-mic")
+    dictate.add_argument("--expect", help="ожидаемая подстрока текста без учёта регистра")
+    dictate.add_argument("--model-dir", type=Path, help="каталог модели, если она не настроена")
+    dictate.add_argument("--variant", help="вариант модели вместо настройки")
+    dictate.add_argument("--threads", type=positive_int, help="потоки вместо настройки (обычно 2)")
+    dictate.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
     args = parser.parse_args(argv)
-    handlers = {"worker-cancel": worker_cancel}
+    handlers = {"worker-cancel": worker_cancel, "dictation": dictation}
     return handlers[args.command](args)
 
 

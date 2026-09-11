@@ -86,11 +86,28 @@ def apply_address_space_limit(min_ram_mb: int | None) -> int:
 class WorkerLoop:
     """Обслуживает готовый сокет; события рабочего потока идут через очередь."""
 
-    def __init__(self, connection: socket.socket, *, parent_pid: int | None = None) -> None:
+    def __init__(
+        self,
+        connection: socket.socket,
+        *,
+        parent_pid: int | None = None,
+        capture: bool = True,
+    ) -> None:
         self.connection = connection
         self.parent_pid = os.getppid() if parent_pid is None else parent_pid
         self._events: SimpleQueue[Message] = SimpleQueue()
         self.worker = WorkerState(on_event=self._events.put)
+        if capture:
+            from astra_voice.worker.audio import AudioCapture, PulseSimpleSource
+
+            self.worker.set_capture(
+                AudioCapture(
+                    source=PulseSimpleSource(),
+                    on_samples=self.worker.on_samples,
+                    on_event=self._events.put,
+                    on_error=self.worker.on_error,
+                )
+            )
         self._reader = ipc.FrameReader()
         self._send_buffer = bytearray()
 
@@ -147,7 +164,11 @@ class WorkerLoop:
                         event = self._events.get_nowait()
                     except Empty:
                         break
-                    self._send(event)
+                    try:
+                        self._send(event)
+                    except ipc.FrameError as exc:
+                        logger.warning("Не удалось отправить событие воркера.")
+                        self._send(ipc.error(exc.code, exc.message))
                 readable, writable, _ = select.select(
                     [self.connection],
                     [self.connection] if self._send_buffer else [],

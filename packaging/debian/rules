@@ -40,8 +40,10 @@ override_dh_auto_install:
 	fi
 	if [ -d qml ]; then cp -a qml $(SHAREDIR)/qml; else install -d $(SHAREDIR)/qml; fi
 	cp -a data $(SHAREDIR)/data
+	# Тестовые сэмплы нужны только для тестов в дереве разработки.
 	rm -rf $(SHAREDIR)/data/icons $(SHAREDIR)/data/astra-voice.desktop \
-		$(SHAREDIR)/data/keys/README.md
+		$(SHAREDIR)/data/keys/README.md $(SHAREDIR)/data/test \
+		$(SHAREDIR)/data/vad/README.md
 	install -m 0755 scripts/astra-voice $(PKG)/usr/bin/astra-voice
 	install -D -m 0644 data/astra-voice.desktop \
 		$(PKG)/usr/share/applications/astra-voice.desktop

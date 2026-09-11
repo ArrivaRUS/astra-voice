@@ -61,7 +61,7 @@ _SCHEMAS = {
         }
     ),
     "model.unload": _Schema(),
-    "record.start": _UTTERANCE,
+    "record.start": _Schema({"utterance_id": _STR}, optional={"device": _STR}),
     "record.stop": _UTTERANCE,
     "record.limit": _UTTERANCE,
     "record.cancel": _UTTERANCE,
@@ -90,7 +90,9 @@ _SCHEMAS = {
     "measured": _Schema(
         {"vm_hwm_kb": _INT, "pss_kb": (int, type(None))}, optional={"sessions": _INT}
     ),
-    "audio.ready": _Schema(),
+    "level": _Schema({"utterance_id": _STR, "rms_dbfs": _NUMBER, "peak_dbfs": _NUMBER}),
+    "silent": _UTTERANCE,
+    "audio.ready": _Schema(optional={"device": _STR, "changed": _STR}),
     "audio.closed": _Schema(),
 }
 _RUNTIME = _Schema({"python": _STR, "onnxruntime": (str, type(None))})

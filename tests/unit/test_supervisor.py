@@ -456,6 +456,73 @@ def detached(clock: Clock) -> tuple[WorkerSupervisor, list[Message]]:
     return supervisor, events
 
 
+@pytest.mark.parametrize("timeout", [None, 1.0])
+def test_record_notifications_keep_pending_until_result(timeout: float | None) -> None:
+    """Индикация записи доходит до callback, а ожидание снимает только result."""
+    supervisor, events = detached(Clock())
+    supervisor.send({"type": "record.start", "utterance_id": "one"}, timeout=timeout)
+    key = ("utterance", "one")
+    notifications: list[Message] = [
+        {"type": "level", "utterance_id": "one", "rms_dbfs": level, "peak_dbfs": -1}
+        for level in (-30, -20, -10)
+    ]
+    notifications.extend(
+        [
+            {"type": "silent", "utterance_id": "one"},
+            {"type": "record.limit", "utterance_id": "one"},
+            {"type": "audio.ready"},
+        ]
+    )
+    for notification in notifications:
+        supervisor._receive(ipc.encode(notification), 1)
+        assert key in supervisor._pending
+        assert key not in supervisor._finished
+    result: Message = {"type": "result", "utterance_id": "one", "text": "Тест", "t_ms": 1}
+    supervisor._receive(ipc.encode(result), 1)
+    assert not supervisor._pending
+    assert key in supervisor._finished
+    assert events == [{**event, "generation": 1} for event in [*notifications, result]]
+    assert supervisor.dropped_late == 0
+
+    # Даже уведомления после завершения не считаются поздними ответами.
+    for notification in notifications:
+        supervisor._receive(ipc.encode(notification), 1)
+    assert events[-len(notifications) :] == [{**event, "generation": 1} for event in notifications]
+    assert not supervisor._pending
+    assert supervisor.dropped_late == 0
+
+
+@pytest.mark.parametrize("continuation_timeout", [None, 0.5])
+def test_level_stream_extends_record_deadline(continuation_timeout: float | None) -> None:
+    """Поток level сохраняет долгую запись; после паузы ожидание всё же истекает."""
+    clock = Clock()
+    supervisor, events = detached(clock)
+    supervisor.send({"type": "record.start", "utterance_id": "one"}, timeout=0.25)
+    supervisor.send({"type": "recognize", "utterance_id": "one"}, timeout=continuation_timeout)
+    timeout = 0.25 if continuation_timeout is None else continuation_timeout
+    for _ in range(20):
+        clock.now += 0.125
+        supervisor._expire()
+        supervisor._receive(
+            ipc.encode({"type": "level", "utterance_id": "one", "rms_dbfs": -20, "peak_dbfs": -1}),
+            1,
+        )
+        supervisor._expire()
+        assert ("utterance", "one") in supervisor._pending
+        assert supervisor.generation == 1
+    assert len(events) == 20
+    assert all(event["type"] == "level" for event in events)
+    assert supervisor.dropped_late == 0
+
+    clock.now += timeout
+    supervisor._expire()
+    assert not supervisor._pending
+    assert supervisor.generation == 1
+    assert len(events) == 21
+    assert events[-1]["code"] == "timeout"
+    assert events[-1]["utterance_id"] == "one"
+
+
 @pytest.mark.parametrize(
     "correlation",
     [{"utterance_id": "one"}, {"request_type": "recognize"}],

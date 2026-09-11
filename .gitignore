@@ -17,6 +17,8 @@ src/astra_voice/_version.py
 # модели и тяжёлые артефакты — только манифесты
 models/
 *.onnx
+# Silero VAD входит в состав пакета
+!data/vad/silero_vad.onnx
 *.bin
 *.gguf
 # временное

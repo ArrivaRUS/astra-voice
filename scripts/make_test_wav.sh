@@ -9,6 +9,9 @@
 # test-ru-6s.wav:  a6449a86e2f6c2f5b4faf5ec39abd36f99c3bd4416edbb1516e13381fef86f86
 # test-ru-20s.wav: f0ca33e1e48150473a95c4ba4d29c9e5469091ef120ab22e84232ec9f5c6cf29
 # Оба файла (6 и 20 секунд) лежат в репозитории; скрипт нужен для воспроизводимой перегенерации.
+# test-ru-130s.wav проверяет лимит фразы 120 с; в репозиторий НЕ кладём (~4 МБ).
+# Он собирается Python-скриптом без sox из data/test/test-ru-6s.wav в каталог результата,
+# по умолчанию scratch-кэш вне репозитория. Отдельно: python3 scripts/make_long_wav.py --target …
 # Запуск: scripts/make_test_wav.sh [путь к samples/russian.wav] [каталог результата]
 set -euo pipefail
 # Не наследуем внешние эффекты и настройки, влияющие на байты результата.
@@ -36,3 +39,7 @@ sox "$source_wav" "$work_dir/sil06.wav" \
 sox "$work_dir/tmp6.wav" "$output_dir/test-ru-6s.wav" pad 0 6 trim 0 6
 sox "$work_dir/tmp6.wav" "$work_dir/tmp20.wav" repeat 4
 sox "$work_dir/tmp20.wav" "$output_dir/test-ru-20s.wav" pad 0 20 trim 0 20
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+python3 "$script_dir/make_long_wav.py" \
+    --source "$script_dir/../data/test/test-ru-6s.wav" \
+    --target "$output_dir/test-ru-130s.wav" --seconds 130

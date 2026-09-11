@@ -182,6 +182,9 @@ fi
 [ -f "$DIST/$DEB" ] || die "пакет не собрался: $DIST/$DEB"
 
 # --- гейты --------------------------------------------------------------------
+say "гейт sha256: модель VAD"
+(cd "$ROOT/data/vad" && sha256sum -c SHA256SUMS)
+
 say "гейт ELF: tools/elf-audit --strict"
 EXPECT=$([ "$VENDOR" = 1 ] && echo 3 || echo 0)
 python3 "$ROOT/tools/elf-audit" --strict --expect "$EXPECT" "$DIST/$DEB"
