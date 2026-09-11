@@ -1,0 +1,4 @@
+2026-09-11 15:27:05,675 WARNING [WORKER] astra_voice.worker.engine: Отмена работает через обходной путь с поиском сессий по типу onnx-asr (fallback-wrapper); в vendor-сборке должен применяться патч cancellable().
+Модель загружена: 703.828 мс; threads=2; onnx-asr 0.12.0/onnxruntime 1.24.4; cancel=fallback-wrapper.
+cpu_ms=880.000; wall_ms=751.446; cpu/wall=1.171076; порог ≤ 2 при threads=2: уложились. Интервал включает чтение WAV и доставку результата IPC.
+код возврата=0

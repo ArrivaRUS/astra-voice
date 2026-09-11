@@ -13,6 +13,8 @@ import argparse
 import logging
 import signal
 import sys
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -78,12 +80,173 @@ def _install_qt_message_handler() -> None:
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    def threads_count(value: str) -> int:
+        """Отклоняет неверное число потоков с понятным пояснением."""
+        try:
+            count = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                "число потоков должно быть целым и не меньше 1"
+            ) from None
+        if count < 1:
+            raise argparse.ArgumentTypeError("число потоков должно быть целым и не меньше 1")
+        return count
+
     parser = argparse.ArgumentParser(prog=APP_NAME, add_help=True)
     parser.add_argument("--version", action="store_true", help="напечатать версию и выйти")
     parser.add_argument("--hidden", action="store_true", help="запуск без окна, только в трее")
     parser.add_argument("--show", action="store_true", help="показать окно работающей копии")
     parser.add_argument("--debug", action="store_true", help="подробный журнал")
+    parser.add_argument(
+        "--debug-transcribe",
+        metavar="WAV",
+        help="расшифровать файл и выйти; модель из настроек или --model-dir",
+    )
+    parser.add_argument(
+        "--model-dir",
+        metavar="PATH",
+        help="каталог ревизии модели для расшифровки, вместо настройки",
+    )
+    parser.add_argument(
+        "--variant", metavar="NAME", help="вариант модели для расшифровки, вместо настройки"
+    )
+    parser.add_argument(
+        "--threads",
+        metavar="N",
+        type=threads_count,
+        help="число потоков инференса: целое от 1, вместо настройки (по умолчанию 2)",
+    )
     return parser.parse_args(sys.argv[1:] if argv is None else argv)
+
+
+def _debug_model_request(
+    settings: dict[str, Any], args: argparse.Namespace, store_dir: Path
+) -> dict[str, Any]:
+    """Собирает запрос без ввода-вывода: аргумент → настройка → значение по умолчанию."""
+
+    def option(name: str, default: Any = None) -> Any:
+        """Учитывает старые имена настроек и пропускает отсутствующие значения."""
+        for value in (
+            getattr(args, f"model_{name}", None),
+            getattr(args, name, None),
+            settings.get(f"model_{name}"),
+            settings.get(name),
+        ):
+            if value is not None:
+                return value
+        return default
+
+    model_id = option("id")
+    revision = option("revision", "")
+    model_dir = option("dir")
+    if args.model_dir is not None:
+        directory = Path(args.model_dir)
+        model_id = directory.parent.name or "local-model"
+        revision = directory.name or "local-revision"
+    elif not model_id or not revision:
+        raise ValueError(
+            "Модель не настроена. Укажите --model-dir или модель и ревизию в настройках."
+        )
+    if not model_dir:
+        model_dir = store_dir / model_id / revision
+    return {
+        "type": "model.load",
+        "id": model_id,
+        "revision": revision,
+        "dir": str(model_dir),
+        "layout": option("layout", "onnx-asr-gigaam-v3"),
+        "variant": option("variant", "gigaam-v3-e2e-rnnt"),
+        "threads": option("threads", 2),
+        "min_ram_mb": option("min_ram_mb", 768),
+    }
+
+
+def _debug_transcribe(path: str, args: argparse.Namespace) -> int:
+    """Расшифровывает WAV без окна; текст передаёт исключительно в stdout."""
+    from PyQt5.QtCore import QCoreApplication
+
+    from astra_voice.core.paths import data_dir
+    from astra_voice.worker import ipc
+    from astra_voice.worker.supervisor import Message, WorkerSupervisor
+
+    app = QCoreApplication.instance() or QCoreApplication([APP_NAME])
+    events: deque[Message] = deque()
+    supervisor = WorkerSupervisor(on_event=events.append, use_qt=False)
+
+    def fail(code: int, message: str) -> int:
+        """Показывает безопасное пояснение без содержимого ответа воркера."""
+        sys.stderr.write(message + "\n")
+        return code
+
+    def wait_for(kind: str, timeout: float) -> Message:
+        """Ждёт нужное событие или ошибку, ограничивая также запуск воркера."""
+        deadline = time.monotonic() + timeout
+        while True:
+            while events:
+                event = events.popleft()
+                if event["type"] in (kind, "error", "cancelled"):
+                    return event
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ipc.error("timeout", "Истекло время ожидания.")
+            supervisor.pump(min(remaining, 0.05))
+            app.processEvents()
+
+    try:
+        setup_logging(debug=args.debug)
+        wav = Path(path).expanduser().resolve()
+        if not wav.is_file():
+            return fail(1, "Звуковой файл не найден или недоступен.")
+        settings = policy_mod.effective(settings_mod.load(), policy_mod.load()).to_dict()
+
+        try:
+            request = _debug_model_request(settings, args, data_dir() / "store")
+        except ValueError:
+            return fail(
+                2, "Модель не настроена. Укажите --model-dir или модель и ревизию в настройках."
+            )
+        request["dir"] = str(Path(request["dir"]).expanduser().resolve())
+        try:
+            ipc.encode(request)
+            if request["threads"] < 1 or request["min_ram_mb"] < 1:
+                raise ValueError
+        except (ipc.FrameError, ValueError):
+            return fail(2, "Параметры модели заданы неверно. Проверьте настройки модели.")
+
+        supervisor.start()
+        for kind, command, timeout in (
+            ("hello", None, 10.0),
+            ("model.loaded", request, 10.0),
+            ("result", {"type": "transcribe.file", "path": str(wav)}, 120.0),
+        ):
+            if command is not None:
+                supervisor.send(command, timeout=timeout)
+            event = wait_for(kind, timeout)
+            if event["type"] != kind:
+                # Не журналируем ответ целиком: даже ошибка может содержать диктовку.
+                log.debug("Отладочная расшифровка: ожидание %s завершилось ошибкой", kind)
+                if event.get("code") in ("timeout", "load-timeout"):
+                    return fail(1, "Время ожидания распознавания истекло. Попробуйте ещё раз.")
+                if kind == "model.loaded" and event.get("code") not in (
+                    "worker-start",
+                    "worker-crashed",
+                    "restart-limit",
+                ):
+                    return fail(2, "Не удалось загрузить модель. Проверьте её файлы и настройки.")
+                if event.get("code") in ("engine-unavailable", "no-model"):
+                    return fail(2, "Движок распознавания недоступен. Проверьте установку модели.")
+                return fail(1, "Не удалось расшифровать файл. Проверьте запись и попробуйте снова.")
+            if kind == "hello" and event["runtime"]["onnxruntime"] is None:
+                return fail(2, "Движок распознавания не установлен или недоступен.")
+            if kind == "result":
+                sys.stdout.write(f"{event['text']}\nt_ms={int(event['t_ms'])}\n")
+        return 0
+    except (TypeError, ValueError, ipc.FrameError):
+        return fail(2, "Параметры модели заданы неверно. Проверьте настройки модели.")
+    except (OSError, RuntimeError):
+        return fail(1, "Не удалось выполнить расшифровку. Проверьте доступ к файлам.")
+    finally:
+        supervisor.stop()
 
 
 def parse_command(line: bytes) -> int | None:
@@ -389,6 +552,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.version:
         sys.stdout.write(f"{APP_NAME} {__version__}\n")
         return 0
+    if args.debug_transcribe is not None:
+        return _debug_transcribe(args.debug_transcribe, args)
 
     from PyQt5.QtCore import QLockFile
 

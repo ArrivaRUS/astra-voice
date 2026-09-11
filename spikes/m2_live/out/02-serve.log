@@ -1,0 +1,51 @@
+pid воркера=151027; pid стенда=151026; поколение=1.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=False.
+2026-09-11 15:25:48,860 WARNING [WORKER] astra_voice.worker.engine: Отмена работает через обходной путь с поиском сессий по типу onnx-asr (fallback-wrapper); в vendor-сборке должен применяться патч cancellable().
+Модель загружена в pid=151027, поколение=1, load_ms=693.493.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=151027; state=running; модель загружена=True.
+error #1 поколения 2: {"type": "error", "code": "worker-crashed", "message": "Распознавание перезапущено.", "generation": 2}
+Новый pid=153020, поколение=2; после смерти прошло не более 0.003347 с; порог ≤ 1 с: уложились. Ошибок старого поколения: 0; ожидание 1: не уложились.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=False.
+2026-09-11 15:26:10,075 WARNING [WORKER] astra_voice.worker.engine: Отмена работает через обходной путь с поиском сессий по типу onnx-asr (fallback-wrapper); в vendor-сборке должен применяться патч cancellable().
+Модель загружена в pid=153020, поколение=2, load_ms=719.708.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.
+жив; pid=151026; worker_pid=153020; state=running; модель загружена=True.

@@ -1,0 +1,43 @@
+--- a/onnx_asr/adapters.py
++++ b/onnx_asr/adapters.py
+@@ -5,6 +5,7 @@
+ import sys
+ from abc import ABC, abstractmethod
+ from collections.abc import Iterator
++from contextlib import contextmanager
+ from pathlib import Path
+ from typing import Generic, Literal, TypedDict, TypeVar, overload
+ 
+@@ -66,6 +67,32 @@
+         self.asr = asr
+         self.resampler = resampler
+ 
++    @contextmanager
++    def cancellable(self) -> Iterator[object]:
++        """Yield onnxruntime RunOptions bound to every session of this model.
++
++        Set `run_options.terminate = True` from another thread to abort the current
++        recognition; `onnxruntime.capi.onnxruntime_pybind11_state.Fail` is raised.
++        The model stays usable afterwards.
++        """
++        import onnxruntime as rt
++
++        run_options = rt.RunOptions()
++        sessions = [
++            value
++            for holder in (self.asr, self.resampler)
++            for value in (*vars(holder).values(), *(vars(holder).get("_preprocessors") or {}).values())
++            if isinstance(value, rt.InferenceSession)
++        ]
++        originals = [session.run for session in sessions]
++        for session, original in zip(sessions, originals, strict=True):
++            session.run = (lambda o: lambda names, feed, ro=None: o(names, feed, ro or run_options))(original)
++        try:
++            yield run_options
++        finally:
++            for session, original in zip(sessions, originals, strict=True):
++                session.run = original
++
+     def with_vad(self, vad: Vad, **kwargs: Unpack[VadOptions]) -> SegmentResultsAsrAdapter:
+         """Create ASR adapter with VAD.
+ 

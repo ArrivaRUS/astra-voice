@@ -49,7 +49,7 @@ def _setup_sys_path(here: Path) -> None:
         sys.path.insert(0, text)
 
 
-def _harden() -> None:
+def _harden(command: str) -> None:
     """Запрещает core-dump процессу (модель угроз У9)."""
     try:
         import resource
@@ -57,6 +57,12 @@ def _harden() -> None:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     except Exception:  # noqa: BLE001 — отсутствие ограничения не повод падать
         pass
+    if command == "worker":
+        # После dumpable=0 файл принадлежит root: пишем заранее (У9/У8).
+        try:
+            Path("/proc/self/oom_score_adj").write_text("500", encoding="ascii")
+        except Exception:  # noqa: BLE001
+            pass
     try:
         import ctypes
 
@@ -88,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     _setup_sys_path(Path(__file__).resolve().parent)
 
     if command in ("app", "worker"):
-        _harden()
+        _harden(command)
     if command == "app":
         # Fly навязывает свой стиль через /etc/X11/Xsession.d/06-fly-misc-env,
         # поэтому ставим принудительно и до импорта Qt.

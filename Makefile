@@ -6,7 +6,7 @@ RUFF := $(VENV)/bin/ruff
 MYPY := $(VENV)/bin/mypy
 PYTEST := $(VENV)/bin/pytest
 
-.PHONY: lint test test-xvfb deb wheels theme user-bundle
+.PHONY: lint test test-xvfb test-engine deb wheels theme user-bundle
 
 lint:
 	$(RUFF) check .
@@ -18,6 +18,9 @@ test:
 
 test-xvfb:
 	xvfb-run -a $(PYTEST) -m xvfb
+
+test-engine:
+	$(PYTEST) -m engine
 
 deb:
 	packaging/build-deb.sh

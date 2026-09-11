@@ -123,6 +123,19 @@ if [ "$VENDOR" = 1 ]; then
 	say "vendor: pip install --require-hashes из $WHEEL_CACHE"
 	python3 -m pip install --no-deps --no-index --find-links "$WHEEL_CACHE" \
 		--require-hashes -r "$LOCK" --target "$VENDOR_DIR" --quiet
+	for vendor_patch in "$ROOT"/vendor/patches/*.patch; do
+		[ -f "$vendor_patch" ] || continue
+		if patch_output="$(cd "$VENDOR_DIR" && LC_ALL=C patch -p1 --dry-run --forward --batch < "$vendor_patch" 2>&1)"; then
+			(cd "$VENDOR_DIR" && patch -p1 --forward --no-backup-if-mismatch --batch < "$vendor_patch") ||
+				die "не удалось применить $vendor_patch к vendor"
+			say "vendor: применён патч $(basename "$vendor_patch")"
+		elif [[ "$patch_output" == *"Reversed (or previously applied)"* ]] &&
+			(cd "$VENDOR_DIR" && patch -p1 --dry-run --reverse --batch < "$vendor_patch" >/dev/null 2>&1); then
+			say "vendor: патч $(basename "$vendor_patch") уже применён, пропускаю"
+		else
+			die "патч $vendor_patch разошёлся с пином onnx-asr из wheels.lock: $patch_output"
+		fi
+	done
 	find "$VENDOR_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} +
 	rm -rf "$VENDOR_DIR"/bin
 else

@@ -40,10 +40,13 @@ def _installed_layout(tmp_path: Path) -> Path:
     return root
 
 
-def test_dev_layout_dispatches_worker_stub(tmp_path: Path) -> None:
+def test_dev_layout_dispatches_worker_without_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ASTRA_VOICE_IPC_FD", raising=False)
     proc = _run(DEV_BOOTSTRAP, ["worker"], cwd=tmp_path)
     assert proc.returncode == 2
-    assert "not implemented" in proc.stderr
+    assert "astra-voice worker: требуется числовой IPC fd" in proc.stderr
 
 
 def test_installed_layout_dispatches_helper_stub(tmp_path: Path) -> None:

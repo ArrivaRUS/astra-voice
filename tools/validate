@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Проверки вех Astra Voice: Р11, время подтверждения отмены через IPC.
+
+    tools/validate worker-cancel --model-dir /путь/к/модели --json
+
+Коды возврата: 0 — уложились, 1 — нарушен критерий, 2 — прогон невозможен.
+Проверяется интервал record.cancel → cancelled, а не остановка всех вызовов ORT.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+from collections import deque
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+from astra_voice.core import policy, settings  # noqa: E402
+from astra_voice.worker import ipc  # noqa: E402
+from astra_voice.worker.supervisor import Message, WorkerSupervisor  # noqa: E402
+
+CANCEL_LIMIT_MS = 1000.0
+
+
+def positive_int(raw: str) -> int:
+    """Принимает только положительное число потоков."""
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("Нужно целое число от 1.")
+    return value
+
+
+def delay_ms(raw: str) -> float:
+    """Отклоняет отрицательную и бесконечную задержку."""
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("Нужно конечное число от 0.")
+    return value
+
+
+def model_request(args: argparse.Namespace) -> Message:
+    """Читает настройки без записи; приоритет аргументов совпадает с отладочным CLI."""
+    config_root = os.environ.get("XDG_CONFIG_HOME", "")
+    config = Path(config_root) if config_root.startswith("/") else Path.home() / ".config"
+    path = config / "astra-voice" / "settings.json"
+    raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if not isinstance(raw, dict):
+        raise ValueError("Настройки должны быть JSON-объектом.")
+    effective = policy.effective(settings.from_dict(raw), policy.load()).to_dict()
+
+    def option(name: str, default: Any = None) -> Any:
+        """Выбирает аргумент, настройку с префиксом, старую настройку или дефолт."""
+        for value in (
+            getattr(args, name, None),
+            effective.get(f"model_{name}"),
+            effective.get(name),
+        ):
+            if value is not None:
+                return value
+        return default
+
+    directory = option("dir")
+    model_id, revision = option("id"), option("revision")
+    if args.model_dir is not None:
+        directory = args.model_dir.expanduser().resolve()
+        model_id, revision = directory.parent.name or "local-model", directory.name or "local"
+    elif not model_id or not revision:
+        raise ValueError("Модель не настроена. Укажите --model-dir.")
+    if directory is None:
+        data_root = os.environ.get("XDG_DATA_HOME", "")
+        data = Path(data_root) if data_root.startswith("/") else Path.home() / ".local/share"
+        directory = data / "astra-voice/store" / model_id / revision
+    directory = Path(directory).expanduser().resolve()
+    if not directory.is_dir():
+        raise ValueError("Каталог модели не найден. Проверьте --model-dir.")
+    request: Message = {
+        "type": "model.load",
+        "id": model_id,
+        "revision": revision,
+        "dir": str(directory),
+        "layout": option("layout", "onnx-asr-gigaam-v3"),
+        "variant": option("variant", "gigaam-v3-e2e-rnnt"),
+        "threads": option("threads", 2),
+        "min_ram_mb": option("min_ram_mb", 768),
+    }
+    ipc.encode(request)
+    if request["threads"] < 1 or request["min_ram_mb"] < 1:
+        raise ValueError("Число потоков и объём памяти должны быть положительными.")
+    return request
+
+
+def worker_cancel(args: argparse.Namespace) -> int:
+    """Запускает файл и измеряет получение подтверждения отмены без GUI и микрофона."""
+    events: deque[tuple[float, Message]] = deque()
+
+    def receive(event: Message) -> None:
+        """Фиксирует время именно в callback, до форматирования вывода."""
+        events.append((time.monotonic(), event))
+
+    supervisor = WorkerSupervisor(on_event=receive, use_qt=False)
+    facts: Message = {
+        "command": "worker-cancel",
+        "mode": "transcribe.file",
+        "threshold_ms": CANCEL_LIMIT_MS,
+        "cancel_after_ms": args.cancel_after_ms,
+        "cancel_ms": None,
+    }
+
+    def finish(code: int, explanation: str) -> int:
+        """Пишет только stdout; распознанный текст в журнал не попадает."""
+        verdict = {0: "уложились", 1: "не уложились", 2: "прогнать не удалось"}[code]
+        facts.update(exit_code=code, verdict=verdict, explanation=explanation)
+        if args.json:
+            print(json.dumps(facts, ensure_ascii=False), flush=True)
+        else:
+            print("Способ: transcribe.file (WAV из файла, без микрофона).")
+            elapsed = facts["cancel_ms"]
+            measured = "не измерено" if elapsed is None else f"{elapsed:.3f} мс"
+            print(f"Отмена: {measured}; порог ≤ {CANCEL_LIMIT_MS:g} мс; {verdict}.")
+            print(explanation)
+        return code
+
+    def wait(kind: str, seconds: float) -> Message:
+        """Ожидает событие с ограничением времени и обработкой ошибок запуска."""
+        deadline = time.monotonic() + seconds
+        while True:
+            while events:
+                _, event = events.popleft()
+                if event["type"] == "error":
+                    raise RuntimeError(f"Воркер сообщил ошибку: {event['code']}.")
+                if event["type"] == kind:
+                    return event
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or supervisor.state == "stopped":
+                raise RuntimeError(f"Не дождались события {kind}.")
+            supervisor.pump(min(remaining, 0.005))
+
+    try:
+        request = model_request(args)
+        wav: Path = args.wav.expanduser().resolve()
+        if not wav.is_file():
+            return finish(2, "Звуковой файл не найден. Проверьте --wav.")
+        facts.update(wav=str(wav), variant=request["variant"], threads=request["threads"])
+        supervisor.start()
+        hello = wait("hello", 10)
+        if hello["runtime"]["onnxruntime"] is None:
+            return finish(2, "Движок onnxruntime недоступен в выбранном Python.")
+        supervisor.send(request, timeout=10)
+        loaded = wait("model.loaded", 12)
+        facts["engine_version"] = loaded["engine_version"]
+        started = time.monotonic()
+        supervisor.send({"type": "transcribe.file", "path": str(wav)}, timeout=120)
+        cancel_at = started + args.cancel_after_ms / 1000
+        while time.monotonic() < cancel_at:
+            supervisor.pump(min(0.005, max(0, cancel_at - time.monotonic())))
+            if events:
+                break
+        # Забираем уже доступный result перед отменой, чтобы не получить ложный PASS.
+        supervisor.pump()
+        if events:
+            _, event = events.popleft()
+            facts["event"] = event["type"]
+            if event["type"] == "result":
+                return finish(2, "Распознавание уже завершилось. Уменьшите --cancel-after-ms.")
+            return finish(2, f"До отмены пришло событие {event['type']}: {event.get('code', '')}.")
+        generation = supervisor.generation
+        sent_at = time.monotonic()
+        sent = supervisor.send({"type": "record.cancel", "utterance_id": "file"})
+        facts["actual_cancel_after_ms"] = (sent_at - started) * 1000
+        if sent is None:
+            return finish(2, "Распознавание уже завершилось. Уменьшите --cancel-after-ms.")
+        deadline = sent_at + 3
+        while True:
+            while events:
+                received_at, event = events.popleft()
+                if event["type"] == "cancelled" and event.get("utterance_id") == "file":
+                    if event["generation"] != generation:
+                        continue
+                    elapsed = (received_at - sent_at) * 1000
+                    facts["cancel_ms"] = elapsed
+                    return finish(
+                        int(elapsed > CANCEL_LIMIT_MS),
+                        "Измерено время от send(record.cancel) до callback(cancelled).",
+                    )
+                if event["type"] in ("error", "result"):
+                    facts["event"] = event["type"]
+                    facts["error_code"] = event.get("code")
+                    return finish(1, "После отмены пришло другое завершающее событие.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or supervisor.state == "stopped":
+                facts["waited_ms"] = (time.monotonic() - sent_at) * 1000
+                return finish(1, "Подтверждение cancelled не получено; ожидание ограничено 3 с.")
+            supervisor.pump(min(remaining, 0.005))
+    except (OSError, TypeError, ValueError, RuntimeError, ipc.FrameError) as exc:
+        return finish(2, f"Не удалось выполнить проверку: {exc}")
+    finally:
+        supervisor.stop()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Разбирает подкоманды; новые проверки добавляются отдельными обработчиками."""
+    parser = argparse.ArgumentParser(description="Проверки Astra Voice без GUI")
+    commands = parser.add_subparsers(dest="command", required=True)
+    cancel = commands.add_parser("worker-cancel", help="измерить отмену через IPC")
+    cancel.add_argument("--model-dir", type=Path, help="каталог модели, если она не настроена")
+    cancel.add_argument("--variant", help="вариант модели вместо настройки")
+    cancel.add_argument("--threads", type=positive_int, help="потоки вместо настройки (обычно 2)")
+    cancel.add_argument("--wav", type=Path, default=ROOT / "data/test/test-ru-20s.wav")
+    cancel.add_argument("--cancel-after-ms", type=delay_ms, default=300.0)
+    cancel.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    args = parser.parse_args(argv)
+    handlers = {"worker-cancel": worker_cancel}
+    return handlers[args.command](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

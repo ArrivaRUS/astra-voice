@@ -1,0 +1,5 @@
+2026-09-11 15:25:40,822 WARNING [WORKER] astra_voice.worker.engine: Отмена работает через обходной путь с поиском сессий по типу onnx-asr (fallback-wrapper); в vendor-сборке должен применяться патч cancellable().
+Способ: transcribe.file (WAV из файла, без микрофона).
+Отмена: 0.419 мс; порог ≤ 1000 мс; уложились.
+Измерено время от send(record.cancel) до callback(cancelled).
+код возврата=0

@@ -102,18 +102,72 @@ jobs:
       - run: python3 scripts/ci_lint.py .github/workflows/*.yml
 
   engine:
-    name: pytest -m engine (с M2)
-    # Кэш модели и смоук движка включаются вехой M2; до неё гонять нечего.
-    if: false
+    name: pytest -m engine
+    # M2: реальная модель, распознавание и отмена инференса.
     runs-on: ubuntu-latest
     container: debian:12
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+      - name: Системные пакеты
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            make git curl ca-certificates python3 python3-venv python3-pip \
+            python3-numpy python3-flatbuffers python3-protobuf python3-sympy \
+            python3-packaging
+      - name: Окружение движка
+        run: |
+          python3 -m venv --system-site-packages "$VENV"
+          "$VENV/bin/pip" install --quiet --no-deps --require-hashes -r packaging/wheels.lock
+          "$VENV/bin/pip" install --quiet pytest==9.1.1
       - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.0.1
+        id: model-cache
         with:
-          path: ~/.cache/astra-voice/models
-          key: gigaam-v3-onnx-${{ hashFiles('data/catalog.json') }}
-      - run: make test-engine VENV=$VENV
+          path: ~/.cache/astra-voice-ci/gigaam-v3/e2e_rnnt
+          key: gigaam-v3-e2e-rnnt-322c3b29492673eb7d0b434bfa9dfb8653e34d02
+      # 226 МБ скачиваются только при промахе кэша; строго шесть файлов варианта.
+      - name: Скачать GigaAM v3 e2e_rnnt
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        env:
+          MODEL_REVISION: 322c3b29492673eb7d0b434bfa9dfb8653e34d02
+        run: |
+          set -eu
+          model_dir="$HOME/.cache/astra-voice-ci/gigaam-v3/e2e_rnnt"
+          mkdir -p "$model_dir"
+          cd "$model_dir"
+          for file in config.json v3_e2e_rnnt.yaml v3_e2e_rnnt_vocab.txt \
+            v3_e2e_rnnt_encoder.int8.onnx v3_e2e_rnnt_decoder.int8.onnx \
+            v3_e2e_rnnt_joint.int8.onnx; do
+            curl -sSL --fail \
+              "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/$MODEL_REVISION/$file" \
+              -o "$file"
+          done
+      - name: Сверка sha256 модели (всегда, в том числе при попадании кэша)
+        run: |
+          set -eu
+          model_dir="$HOME/.cache/astra-voice-ci/gigaam-v3/e2e_rnnt"
+          cd "$model_dir"
+          check_dir=$(mktemp -d)
+          trap 'rm -rf "$check_dir"' EXIT
+          cat > "$check_dir/SHA256SUMS" <<'SHA256SUMS'
+          0641fcf73f4af791c73f05083e38a658ff5dcbee3534a0c61396c10f4b97f0fe  config.json
+          d23270a1f327e365ebc4554b7ceee69ac12898e21092c18085151516aa58f91b  v3_e2e_rnnt.yaml
+          39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7  v3_e2e_rnnt_vocab.txt
+          4e0e076a6076cd110277e529b8ac8f32cd5297f7fbebad5341ae8ddb7d00817b  v3_e2e_rnnt_encoder.int8.onnx
+          89014e134865615b91e037157e46e389b1271e6072460efc010ea08e61e23146  v3_e2e_rnnt_decoder.int8.onnx
+          ade116563dbf66e503b0994efab6b5861412743e52bf31c39fc3fffa3783d5d1  v3_e2e_rnnt_joint.int8.onnx
+          SHA256SUMS
+          awk '{print $2}' "$check_dir/SHA256SUMS" | LC_ALL=C sort > "$check_dir/expected"
+          find . -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "$check_dir/actual"
+          if ! diff -u --label expected --label actual "$check_dir/expected" "$check_dir/actual"; then
+            echo 'Ошибка: каталог модели должен содержать ровно шесть ожидаемых файлов, без лишних записей.' >&2
+            exit 1
+          fi
+          sha256sum -c "$check_dir/SHA256SUMS"
+      - name: Проверки движка
+        run: |
+          export ASTRA_VOICE_TEST_MODEL_DIR="$HOME/.cache/astra-voice-ci/gigaam-v3/e2e_rnnt"
+          make test-engine VENV=$VENV
 
   deb:
     name: сборка .deb и гейты
@@ -130,6 +184,12 @@ jobs:
             python3 python3-venv python3-pip
       - name: Колёса по wheels.lock (единственный шаг с сетью)
         run: packaging/build-deb.sh --fetch-wheels
+      - name: Патч отмены применим к onnx-asr 0.12.0
+        run: |
+          T=$(mktemp -d)
+          python3 -m zipfile -e "${ASTRA_VOICE_WHEEL_CACHE:-$HOME/.cache/astra-voice-dev/wheels}/onnx_asr-0.12.0-py3-none-any.whl" "$T"
+          patch_file="$PWD/vendor/patches/onnx-asr-cancellable.patch"
+          (cd "$T" && patch -p1 --dry-run < "$patch_file")
       - name: Сборка (dh + lintian) и гейты ELF/METADATA/SBOM
         run: packaging/build-deb.sh --dh
       - name: Проверка установки в чистой системе
