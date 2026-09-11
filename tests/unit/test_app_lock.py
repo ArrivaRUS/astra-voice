@@ -20,7 +20,10 @@ import pytest
 # Тестам нужен настоящий процесс GUI, то есть PyQt5 (дисплей не нужен —
 # `QT_QPA_PLATFORM=offscreen`). На машине разработчика без PyQt5 пропускаем,
 # а в CI требуем: молчаливый пропуск там означал бы ложную зелень.
-_QT_MISSING = importlib.util.find_spec("PyQt5.QtWidgets") is None
+# find_spec подмодуля бросает ModuleNotFoundError, если нет родительского пакета.
+_QT_MISSING = (
+    importlib.util.find_spec("PyQt5") is None or importlib.util.find_spec("PyQt5.QtWidgets") is None
+)
 
 pytestmark = [
     pytest.mark.unit,
