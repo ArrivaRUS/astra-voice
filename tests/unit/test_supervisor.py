@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -340,9 +340,10 @@ def test_transcribe_file_correlates_with_service_id(timeout: float | None) -> No
         assert not supervisor._pending
 
 
-@pytest.mark.parametrize("mode", ["legacy", "utterance", "request"])
+@pytest.mark.parametrize("mode", ["utterance", "request"])
 def test_recognize_error_finishes_once(mode: str) -> None:
     """Ошибка снимает дедлайн; новый recognize допускается, поздний result отброшен."""
+    # У45: legacy-ошибка сохраняет ожидание; это проверяется отдельным тестом ниже.
     clock = Clock()
     with running(clock) as (supervisor, events):
         control(supervisor, f"errors:{mode}")
@@ -433,19 +434,39 @@ def test_model_load_deadline_obeys_restart_limit() -> None:
         assert sum(e.get("code") == "restart-limit" for e in events) == 1
 
 
-def test_cancel_after_result_is_ignored(caplog: pytest.LogCaptureFixture) -> None:
-    """Поздняя отмена не пишет кадр, возвращает None и оставляет запись debug."""
-    with running() as (supervisor, events):
+@pytest.mark.parametrize("terminal", ["result", "cancelled", "error", "unknown"])
+def test_cancel_is_always_sent_and_registers_pending(terminal: str) -> None:
+    """У45: отмена завершённого или неизвестного id отправляется с новым ожиданием."""
+    supervisor, events = detached(Clock())
+    key = ("utterance", "done")
+    if terminal != "unknown":
         supervisor.send({"type": "recognize", "utterance_id": "done"})
-        control(supervisor, "result:done")
-        wait_for(supervisor, lambda: any(e["type"] == "result" for e in events), "result")
-        with caplog.at_level(logging.DEBUG, logger="astra_voice.worker.supervisor"):
-            assert supervisor.send({"type": "record.cancel", "utterance_id": "done"}) is None
-        assert "Отмена завершённой диктовки пропущена" in caplog.text
-        assert not supervisor._outgoing
+        responses: dict[str, Message] = {
+            "result": {"type": "result", "utterance_id": "done", "text": "Тест", "t_ms": 1},
+            "cancelled": {"type": "cancelled", "utterance_id": "done"},
+            "error": {**ipc.error("no-model", "Тест."), "utterance_id": "done"},
+        }
+        supervisor._receive(ipc.encode(responses[terminal]), 1)
+        assert key in supervisor._finished
+        for kind in ("record.start", "record.stop", "recognize"):
+            with pytest.raises(ValueError, match="завершён"):
+                supervisor.send({"type": kind, "utterance_id": "done"})
+    supervisor._outgoing.clear()
+    events.clear()
+    cancel = {"type": "record.cancel", "utterance_id": "done"}
+    cancelled = {"type": "cancelled", "utterance_id": "done"}
+    # У45: прежнее подавление отмены могло оставлять микрофон открытым.
+    for _ in range(2):
+        assert supervisor.send(cancel) == {**cancel, "generation": 1}
+        assert ipc.FrameReader().feed(bytes(supervisor._outgoing)) == [cancel]
+        supervisor._outgoing.clear()
+        assert key in supervisor._pending
+        assert key not in supervisor._finished
+        supervisor._receive(ipc.encode(cancelled), 1)
         assert not supervisor._pending
-        with pytest.raises(ValueError, match="завершён"):
-            supervisor.send({"type": "recognize", "utterance_id": "done"})
+        assert key in supervisor._finished
+    assert events == [{**cancelled, "generation": 1}] * 2
+    assert supervisor.dropped_late == 0
 
 
 def detached(clock: Clock) -> tuple[WorkerSupervisor, list[Message]]:
@@ -454,6 +475,47 @@ def detached(clock: Clock) -> tuple[WorkerSupervisor, list[Message]]:
     supervisor = WorkerSupervisor(events.append, clock=clock, use_qt=False)
     supervisor.state = "running"
     return supervisor, events
+
+
+@pytest.mark.parametrize("stop_first", [False, True])
+def test_uncorrelated_error_keeps_recording_cancellable(stop_first: bool) -> None:
+    """У45/T-44: ошибка фейкового воркера сохраняет возможность stop и cancel."""
+    supervisor, events = detached(Clock())
+    sent: list[Message] = []
+    reader = ipc.FrameReader()
+    connection = Mock(spec=socket.socket)
+
+    def send(data: bytearray) -> int:
+        """Фиксирует команды, действительно переданные транспорту воркера."""
+        sent.extend(reader.feed(bytes(data)))
+        return len(data)
+
+    connection.send.side_effect = send
+    supervisor._socket = connection
+    supervisor.send({"type": "record.start", "utterance_id": "one"}, timeout=5)
+    supervisor.send({"type": "recognize", "utterance_id": "one"})
+    key = ("utterance", "one")
+    pending = supervisor._pending[key]
+    error = ipc.error("no-model", "Модель не загружена.")
+    supervisor._receive(ipc.encode(error), 1)
+    assert events == [{**error, "generation": 1}]
+    assert supervisor._pending[key] is pending
+    assert key not in supervisor._finished
+    assert supervisor.dropped_late == 0
+    if stop_first:
+        stop = {"type": "record.stop", "utterance_id": "one"}
+        assert supervisor.send(stop) is not None
+        assert sent[-1] == stop
+    cancel = {"type": "record.cancel", "utterance_id": "one"}
+    assert supervisor.send(cancel) is not None
+    assert sent[-1] == cancel
+    assert supervisor._pending[key] is pending
+    cancelled = {"type": "cancelled", "utterance_id": "one"}
+    supervisor._receive(ipc.encode(cancelled), 1)
+    assert events[-1] == {**cancelled, "generation": 1}
+    assert not supervisor._pending
+    assert key in supervisor._finished
+    assert supervisor.dropped_late == 0
 
 
 @pytest.mark.parametrize("timeout", [None, 1.0])
@@ -525,18 +587,26 @@ def test_level_stream_extends_record_deadline(continuation_timeout: float | None
 
 @pytest.mark.parametrize(
     "correlation",
-    [{"utterance_id": "one"}, {"request_type": "recognize"}],
+    [
+        {"utterance_id": "one"},
+        {"request_type": "recognize"},
+        {"utterance_id": "one", "request_type": "recognize"},
+    ],
 )
 def test_correlated_error_finishes_only_matching_request(correlation: dict[str, str]) -> None:
     """Необязательные поля проходят IPC и снимают только нужное ожидание."""
     clock = Clock()
     supervisor, events = detached(clock)
     supervisor.send({"type": "recognize", "utterance_id": "one"}, timeout=2)
+    supervisor.send({"type": "record.start", "utterance_id": "other"})
     supervisor.send({"type": "ping"}, timeout=2)
     error = {**ipc.error("engine-failed", "Тестовая ошибка."), **correlation}
     supervisor._receive(ipc.encode(error), supervisor.generation)
     assert len(events) == 1
     assert events[0]["utterance_id"] == "one"
+    assert events[0]["request_type"] == "recognize"
+    assert set(supervisor._pending) == {("utterance", "other"), ("reply", "pong")}
+    assert supervisor._finished == {("utterance", "one")}
     clock.now += 2
     supervisor._expire()
     assert len(events) == 2
@@ -546,6 +616,7 @@ def test_correlated_error_finishes_only_matching_request(correlation: dict[str, 
     supervisor._receive(ipc.encode(error), supervisor.generation)
     assert len(events) == 2
     assert supervisor.dropped_late == 1
+    assert ("utterance", "other") in supervisor._pending
 
 
 def test_file_error_by_request_type_uses_same_correlation() -> None:
@@ -584,17 +655,21 @@ def test_each_request_has_one_terminal_event(terminal: str) -> None:
     supervisor._expire()
     for response in responses.values():
         supervisor._receive(ipc.encode(response), 1)
-    supervisor._receive(ipc.encode(ipc.error("engine-failed", "Поздняя ошибка.")), 1)
+    uncorrelated = ipc.error("engine-failed", "Поздняя ошибка.")
+    supervisor._receive(ipc.encode(uncorrelated), 1)
     supervisor._expire()
-    assert len(events) == 1
+    # У45: ошибка без корреляции доставляется отдельно и не завершает диктовку повторно.
+    assert len(events) == 2
+    assert events[1] == {**uncorrelated, "generation": 1}
+    assert supervisor.dropped_late == 3
     assert events[0]["utterance_id"] == "one"
     assert events[0]["type"] == ("error" if terminal == "timeout" else terminal)
     if terminal == "timeout":
         assert events[0]["code"] == "timeout"
 
 
-def test_uncorrelated_error_completes_all_pending_before_callback() -> None:
-    """Общая ошибка атомарно завершает старые ожидания, сохраняя новое из callback."""
+def test_uncorrelated_error_completes_only_replies_before_callback() -> None:
+    """У45: общая ошибка завершает только reply, сохраняя диктовку и новый ping."""
     clock = Clock()
     events: list[Message] = []
 
@@ -605,15 +680,19 @@ def test_uncorrelated_error_completes_all_pending_before_callback() -> None:
 
     supervisor = WorkerSupervisor(on_event, clock=clock, use_qt=False)
     supervisor.state = "running"
-    supervisor.send({"type": "recognize", "utterance_id": "one"}, timeout=1)
+    supervisor.send({"type": "recognize", "utterance_id": "one"})
     supervisor.send({"type": "ping"}, timeout=1)
+    supervisor.send({"type": "measure"}, timeout=1)
     supervisor._receive(ipc.encode(ipc.error("engine-failed", "Общая ошибка.")), 1)
     assert len(events) == 2
-    assert {e["request_type"] for e in events} == {"recognize", "ping"}
+    assert {e["request_type"] for e in events} == {"measure", "ping"}
+    assert set(supervisor._pending) == {("utterance", "one"), ("reply", "pong")}
+    assert ("utterance", "one") not in supervisor._finished
     clock.now += 2
     supervisor._expire()
     supervisor._receive(ipc.encode({"type": "pong"}), 1)
     assert [e["type"] for e in events] == ["error", "error", "pong"]
+    assert set(supervisor._pending) == {("utterance", "one")}
 
 
 def test_unknown_correlated_error_does_not_finish_other_request() -> None:

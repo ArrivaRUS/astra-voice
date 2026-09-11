@@ -382,6 +382,11 @@ class WorkerState:
             if deferred is not None:
                 deferred.append(self._capture.stop)
 
+    def check_capture_watchdog(self) -> None:
+        """Проверяет остановку после фоновых событий, не ожидая под RLock."""
+        if self._capture is not None:
+            self._capture.check_stop_watchdog()
+
     def _stop_recording(self, deferred: list[Callable[[], None]] | None = None) -> None:
         assert self._recording is not None
         self._stop_capture(deferred)

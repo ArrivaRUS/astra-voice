@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import select
 import socket
@@ -34,7 +33,6 @@ _CORRELATION: dict[str, RequestKey] = {
 # но распознавание этого utterance_id ещё впереди. audio.ready подтверждает открытие
 # устройства, а не завершение команды: эти уведомления не снимают ожидание.
 _NOTIFICATIONS = {"level", "silent", "record.limit", "audio.ready"}
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -68,11 +66,12 @@ class WorkerSupervisor:
     регулярно вызывать ``pump()``. Поколение первого запуска равно 1. ``stopped``
     терминален: для нового сеанса создаётся новый супервизор.
 
-    ``send`` возвращает локальную копию запроса с поколением, а для отмены уже
-    завершённого id — None с записью debug. На проводе поколение
+    ``send`` возвращает локальную копию запроса с поколением. На проводе поколение
     отсутствует: источником истины служит соединение. Идентификатор диктовки можно
     продолжать командами stop/recognize/cancel до первого завершения или таймаута.
-    Повторное использование завершённого id в том же поколении запрещено.
+    Повторное использование завершённого id в том же поколении запрещено,
+    кроме record.cancel: отмена всегда отправляется и создаёт или переиспользует
+    ожидание ответа, поскольку ошибка могла оставить микрофон открытым (У45).
     Для запросов без id допускается одно ожидание каждого типа ответа.
 
     Единственный ключ корреляции задаёт ``_correlation``: явный utterance_id либо
@@ -82,11 +81,13 @@ class WorkerSupervisor:
     Промежуточные level/silent/record.limit/audio.ready передаются потребителю,
     сохраняя ожидание и продлевая его дедлайн на заданный таймаут при совпадении ключа.
     Ошибка с utterance_id завершает точное ожидание; request_type без id допустим,
-    если определяет единственное ожидание. Ошибка без корреляции завершает все
-    текущие ожидания отдельными коррелированными событиями: при одном ожидании
-    выбор точен, при нескольких консервативно считаем их неуспешными. Ошибки без
-    ожидания и повторные завершения отбрасываются. Без уникального id протокол
-    не позволяет отличить поздний ответ от ответа на повторный запрос того же типа.
+    если определяет единственное ожидание. Ошибка без корреляции завершает только
+    ожидания без диктовки (ключи reply) отдельными коррелированными событиями,
+    сохраняя ожидания utterance для остановки и отмены записи (У45). Если ожиданий
+    reply нет, такая ошибка всё равно передаётся потребителю через _emit.
+    Коррелированные ошибки без ожидания и повторные завершения отбрасываются.
+    Без уникального id протокол не позволяет отличить поздний ответ от ответа
+    на повторный запрос того же типа.
 
     Дедлайн model.load всегда означает зависание; прочий дедлайн — если после
     отправки не принято ни одного ответа (hello не считается). Тогда SIGKILL и
@@ -179,7 +180,7 @@ class WorkerSupervisor:
             {**message, "generation": self.generation if generation is None else generation}
         )
 
-    def send(self, message: Message, *, timeout: float | None = None) -> Message | None:
+    def send(self, message: Message, *, timeout: float | None = None) -> Message:
         """Ставит кадр в неблокирующую очередь и регистрирует ожидание ответа."""
         if self.state != "running":
             raise RuntimeError("Воркер не запущен.")
@@ -190,10 +191,7 @@ class WorkerSupervisor:
         uid = request.get("utterance_id")
         kind = str(request["type"])
         key = _correlation(request)
-        if key[0] == "utterance" and key in self._finished:
-            if kind == "record.cancel":
-                logger.debug("Отмена завершённой диктовки пропущена.")
-                return None
+        if key[0] == "utterance" and key in self._finished and kind != "record.cancel":
             raise ValueError("Идентификатор уже завершён в текущем поколении.")
         if uid is None and key in self._pending:
             raise ValueError("Ответ на предыдущий запрос этого типа ещё ожидается.")
@@ -304,7 +302,11 @@ class WorkerSupervisor:
                 if len(keys) != 1:
                     keys = []
             else:
-                keys = list(self._pending)
+                keys = [k for k in self._pending if k[0] == "reply"]
+                if not keys:
+                    self._activity += 1
+                    self._emit(message, generation=generation)
+                    return
             if not keys:
                 self.dropped_late += 1
                 return

@@ -10,11 +10,14 @@ import select
 import signal
 import socket
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from queue import Empty, SimpleQueue
+from typing import NoReturn
 
 from astra_voice.core.logging import setup_logging
 from astra_voice.worker import ipc
+from astra_voice.worker.audio import CaptureStopTimeout
 from astra_voice.worker.state import Message, WorkerState
 
 logger = logging.getLogger(__name__)
@@ -92,8 +95,10 @@ class WorkerLoop:
         *,
         parent_pid: int | None = None,
         capture: bool = True,
+        terminate: Callable[[int], NoReturn] = os._exit,
     ) -> None:
         self.connection = connection
+        self._terminate = terminate
         self.parent_pid = os.getppid() if parent_pid is None else parent_pid
         self._events: SimpleQueue[Message] = SimpleQueue()
         self.worker = WorkerState(on_event=self._events.put)
@@ -149,15 +154,41 @@ class WorkerLoop:
                 apply_address_space_limit(int(message["min_ram_mb"]))
             replies = self.worker.handle(message)
             for reply in replies:
+                if (
+                    reply["type"] == "error"
+                    and "utterance_id" in message
+                    and "utterance_id" not in reply
+                ):
+                    reply = {
+                        **reply,
+                        "utterance_id": message["utterance_id"],
+                        "request_type": message["type"],
+                    }
                 self._send(reply)
         return True
 
+    def _fatal_capture_timeout(self) -> NoReturn:
+        """Записывает причину и завершает процесс, чтобы ядро закрыло аудиосокет."""
+        try:
+            logger.critical("Поток захвата завис в libpulse после отмены. Воркер завершается.")
+            current: logging.Logger | None = logger
+            while current is not None:
+                for handler in current.handlers:
+                    handler.flush()
+                current = current.parent if current.propagate else None
+        finally:
+            # Обычный выход раскручивает стек и запускает cleanup/ожидание потоков.
+            # Они могут зависнуть или освободить дескриптор во время C-вызова.
+            self._terminate(1)
+
     def run(self) -> int:
         """Шлёт hello, обслуживает IPC и освобождает ресурсы при потере родителя."""
+        fatal = False
         try:
             self.connection.setblocking(False)
             self._send(ipc.make_hello())
             while os.getppid() == self.parent_pid:
+                self.worker.check_capture_watchdog()
                 # Ограничиваем порцию, чтобы события не вытеснили проверку родителя.
                 for _ in range(64):
                     try:
@@ -191,15 +222,23 @@ class WorkerLoop:
                             break
                 if writable:
                     self._flush_send()
+        except CaptureStopTimeout:
+            fatal = True
+            self._fatal_capture_timeout()
         except BufferError:
             logger.warning("Переполнен буфер отправки: родитель не читает IPC.")
         except OSError:
             logger.warning("Соединение с родителем закрыто или недоступно.")
         finally:
-            try:
-                self.worker.close()
-            finally:
-                self.connection.close()
+            if not fatal:
+                try:
+                    self.worker.close()
+                except CaptureStopTimeout:
+                    fatal = True
+                    self._fatal_capture_timeout()
+                finally:
+                    if not fatal:
+                        self.connection.close()
         return 0
 
 

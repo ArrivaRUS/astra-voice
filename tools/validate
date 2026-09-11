@@ -237,7 +237,7 @@ def dictation(args: argparse.Namespace) -> int:
     events: dict[str, tuple[float, Message]] = {}
     errors: deque[Message] = deque()
     player: subprocess.Popen[bytes] | None = None
-    virtual_attempted = False
+    virtual_started = False
     steps: list[str] = []
 
     def receive(event: Message) -> None:
@@ -312,7 +312,7 @@ def dictation(args: argparse.Namespace) -> int:
             raise DictationFailure(2, f"virtual_mic.sh {action}: код {result.returncode}. {detail}")
 
     def run() -> tuple[int, str]:
-        nonlocal player, virtual_attempted
+        nonlocal player, virtual_started
         if not args.virtual_mic and args.device is None:
             raise DictationFailure(2, "Без --virtual-mic требуется явный --device.")
         if not device.strip():
@@ -327,8 +327,8 @@ def dictation(args: argparse.Namespace) -> int:
                 duration = source.getnframes() / source.getframerate()
             facts.update(wav=str(wav), wav_seconds=duration, sink="av_test")
         if args.virtual_mic:
-            virtual_attempted = True
             virtual_mic("up")
+            virtual_started = True
             steps.append("Виртуальный микрофон поднят.")
         supervisor.start()
         _, hello = wait("hello", 10)
@@ -429,7 +429,7 @@ def dictation(args: argparse.Namespace) -> int:
                 except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
                     cleanup_errors.append(f"Не удалось остановить воркер: {exc}")
                 finally:
-                    if virtual_attempted:
+                    if virtual_started:
                         try:
                             virtual_mic("down")
                             steps.append("Виртуальный микрофон выгружен.")

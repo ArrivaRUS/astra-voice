@@ -10,9 +10,12 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import unicodedata
 import wave
 from array import array
 from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, NoReturn, cast
@@ -44,11 +47,13 @@ from astra_voice.worker.audio import (
     AudioDevice,
     AudioError,
     AudioSource,
+    CaptureStopTimeout,
     PulseSimpleSource,
     WavFileSource,
     _OpenDeadline,
     _Pulse,
     dbfs,
+    default_device,
     list_devices,
     normalize,
     resolve_device,
@@ -112,6 +117,58 @@ def pactl_run(short: str, details: str | Exception = "[]", code: int = 0) -> Run
     return run
 
 
+def default_source_run(output: str | Exception, code: int = 0) -> Run:
+    """Подставляет результат запроса умолчания, не обращаясь к звуковому серверу."""
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        """Принимает только фиксированную команду поиска источника."""
+        assert args == ["pactl", "get-default-source"]
+        if isinstance(output, Exception):
+            raise output
+        return subprocess.CompletedProcess(args, code, output, "техническая ошибка")
+
+    return run
+
+
+@pytest.mark.parametrize("elapsed", [None, 0.0, 6.75])
+def test_default_device_command_and_deadline(
+    elapsed: float | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """У44: имя ищется точно; команда без shell делит общий бюджет открытия."""
+    microphone = AudioDevice(2, "alsa_input.usb.microphone", "USB-микрофон", False)
+    devices = [AudioDevice(1, "alsa_input.other", "Другой микрофон", False), microphone]
+    run = Mock(wraps=default_source_run(f"  {microphone.name}\n"))
+    monkeypatch.setenv("LC_ALL", "ru_RU.UTF-8")
+    monkeypatch.setenv("ASTRA_VOICE_TEST_ENV", "preserved")
+    now = 0.0
+    deadline = None if elapsed is None else _OpenDeadline(lambda: now)
+    now = elapsed or 0.0
+
+    assert default_device(devices, run=run, deadline=deadline) is microphone
+    run.assert_called_once()
+    assert run.call_args.args == (["pactl", "get-default-source"],)
+    kwargs = run.call_args.kwargs
+    assert kwargs["capture_output"] is True
+    assert kwargs["text"] is True
+    assert kwargs["shell"] is False
+    assert kwargs["check"] is False
+    assert kwargs["timeout"] == min(5, OPEN_TOTAL_DEADLINE_S - now)
+    assert kwargs["env"]["LC_ALL"] == "C"
+    assert kwargs["env"]["ASTRA_VOICE_TEST_ENV"] == "preserved"
+
+
+def test_default_device_expired_deadline_never_runs_command() -> None:
+    """Исчерпанный общий бюджет запрещает даже запуск pactl."""
+    now = 0.0
+    deadline = _OpenDeadline(lambda: now)
+    now = OPEN_TOTAL_DEADLINE_S
+    run = Mock()
+    with pytest.raises(AudioError) as caught:
+        default_device([], run=run, deadline=deadline)
+    assert caught.value.code == ERROR_FAILED
+    run.assert_not_called()
+
+
 def test_list_devices_descriptions_and_monitor(
     short_sources: str, descriptions: list[dict[str, str]]
 ) -> None:
@@ -124,8 +181,8 @@ def test_list_devices_descriptions_and_monitor(
         (2, descriptions[1]["name"], True),
     ]
     for device, expected in zip(devices, descriptions, strict=True):
-        assert device.description.encode("utf-8") == expected["description"].encode("utf-8")
-    assert devices[0].label == descriptions[0]["description"]
+        assert device.description == expected["description"].strip()
+    assert devices[0].label == descriptions[0]["description"].strip()
     assert "звук системы" in devices[1].label.casefold()
     assert descriptions[1]["description"] in devices[1].label
 
@@ -151,6 +208,29 @@ def test_list_devices_description_fallback(
     assert [device.description for device in devices] == ["Микрофон", "Звук системы"]
     assert all("alsa_" not in device.description + device.label for device in devices)
     assert devices[1].monitor
+
+
+@pytest.mark.parametrize(
+    ("description", "expected"),
+    [
+        (" \n\r\tМикрофон\u00a0\u2028\u2029 USB\x00\u202e\u200b \t", "Микрофон USB"),
+        (" \n\r\t\x00\x01\x7f\u202e\u200b ", None),
+        ("\x00\u202e" * 200 + "Микрофон", "Микрофон"),
+    ],
+)
+def test_list_devices_cleans_descriptions(
+    short_sources: str, description: str, expected: str | None
+) -> None:
+    """T-41: очистка до AudioDevice сохраняет слова и включает запасные подписи."""
+    details = [
+        {"name": line.split("\t")[1], "description": description}
+        for line in short_sources.splitlines()
+    ]
+    devices = list_devices(run=pactl_run(short_sources, json.dumps(details)))
+    assert [device.description for device in devices] == (
+        [expected, expected] if expected is not None else ["Микрофон", "Звук системы"]
+    )
+    assert devices[1].label.endswith(" (звук системы)")
 
 
 def test_fallback_names_are_numbered(short_sources: str) -> None:
@@ -290,7 +370,6 @@ def test_pulse_null_maps_errors_and_retries(
     pulse_library: Mock,
     error_code: int,
     expected: str,
-    wait_capture: Callable[[], None],
 ) -> None:
     """NULL даёт публичный код, ровно OPEN_RETRIES попыток и паузы между ними."""
     timeline: list[tuple[str, float]] = []
@@ -301,12 +380,13 @@ def test_pulse_null_maps_errors_and_retries(
         timeline.append(("open", 0))
 
     pulse_library.pa_simple_new.side_effect = refuse
+    # У44: проверка NULL-дескриптора требует конкретного микрофона, dev=NULL запрещён.
+    device = AudioDevice(1, "alsa_input.chosen", "Микрофон", False)
     source = PulseSimpleSource(
-        devices=lambda: [], sleep=lambda delay: timeline.append(("sleep", delay))
+        devices=lambda: [device], sleep=lambda delay: timeline.append(("sleep", delay))
     )
     with pytest.raises(AudioError) as caught:
-        source.open(None)
-    wait_capture()
+        source.open(device.name)
     assert caught.value.code == expected
     assert pulse_library.pa_simple_new.call_count == OPEN_RETRIES
     assert timeline == [("open", 0), ("sleep", OPEN_RETRY_MS / 1000)] * (OPEN_RETRIES - 1) + [
@@ -324,40 +404,37 @@ def test_pulse_deadline_frees_late_handle(
     monkeypatch: pytest.MonkeyPatch,
     wait_capture: Callable[[], None],
 ) -> None:
-    """S5-R7: попытка истекает, а поздний дескриптор освобождает поток открытия."""
+    """T-40: поздний дескриптор освобождает тот же поток, который вошёл в C-вызов."""
     entered = threading.Event()
     release = threading.Event()
     now = 0.0
-    done = Mock(spec=threading.Event)
-    done.is_set.return_value = False
+    results: list[tuple[ctypes.c_void_p | None, int]] = []
+    owners: list[threading.Thread] = []
 
     def hung_new(*args: object) -> int:
         """Держит дескриптор до явного разрешения после истечения дедлайна."""
+        owners.append(threading.current_thread())
         entered.set()
         assert release.wait(TIMEOUT)
         return 123
 
-    def expire(timeout: float) -> bool:
-        """Имитирует истечение ожидания по виртуальным часам без реального sleep."""
-        nonlocal now
-        assert entered.wait(TIMEOUT)
-        assert timeout == OPEN_DEADLINE_S
-        now += timeout
-        return False
+    def free(handle: ctypes.c_void_p) -> None:
+        assert handle.value == 123
+        owners.append(threading.current_thread())
 
     pulse_library.pa_simple_new.side_effect = hung_new
-    done.wait.side_effect = expire
-    # Подменяем объект модуля только в audio: внутренние Event самого Thread настоящие.
-    fake_threading = Mock(wraps=threading)
-    fake_threading.Event.return_value = done
-    monkeypatch.setattr("astra_voice.worker.audio.threading", fake_threading)
+    pulse_library.pa_simple_free.side_effect = free
     monkeypatch.setattr("astra_voice.worker.audio.time", Mock(monotonic=lambda: now))
     pulse = _Pulse()
+    owner = threading.Thread(target=lambda: results.append(pulse.open("alsa_input.chosen")))
+    owner.start()
     try:
-        assert pulse.open(None) == (None, 0)
-        assert now == OPEN_DEADLINE_S
-        done.wait.assert_called_once_with(OPEN_DEADLINE_S)
-        done.set.assert_not_called()
+        assert entered.wait(TIMEOUT)
+        now = OPEN_DEADLINE_S + 1
+        # Старое ожидание бросало pulse-open в фоне. Теперь до возврата C-вызова
+        # жив сам владелец: дедлайн не даёт права передать или освободить handle.
+        assert owner.is_alive()
+        assert results == []
         pulse_library.pa_simple_new.assert_called_once()
         pulse_library.pa_simple_free.assert_not_called()
     finally:
@@ -365,12 +442,11 @@ def test_pulse_deadline_frees_late_handle(
         wait_capture()
     pulse_library.pa_simple_free.assert_called_once()
     assert pulse_library.pa_simple_free.call_args.args[0].value == 123
-    done.set.assert_not_called()
+    assert results == [(None, 0)]
+    assert owners == [owner, owner]
 
 
-def test_pulse_reopen_and_close_after_exception(
-    pulse_library: Mock, wait_capture: Callable[[], None]
-) -> None:
+def test_pulse_reopen_and_close_after_exception(pulse_library: Mock) -> None:
     """Повторное открытие и закрытие после сбоя освобождают каждый дескриптор один раз."""
     device = AudioDevice(1, "alsa_input.chosen", "Микрофон", False)
     pulse_library.pa_simple_new.side_effect = [123, 456]
@@ -387,7 +463,6 @@ def test_pulse_reopen_and_close_after_exception(
     finally:
         source.close()
         source.close()
-        wait_capture()
     assert [call.args[0].value for call in pulse_library.pa_simple_free.call_args_list] == [
         123,
         456,
@@ -397,32 +472,29 @@ def test_pulse_reopen_and_close_after_exception(
 
 
 @pytest.mark.parametrize("latency", [1200, (1 << 64) - 1])
-def test_pulse_latency_debug_after_open(
+def test_pulse_latency_only_on_explicit_diagnostic_request(
     pulse_library: Mock,
     latency: int,
     caplog: pytest.LogCaptureFixture,
-    wait_capture: Callable[[], None],
 ) -> None:
-    """Задержка запрашивается при открытии; числовое значение уходит только в debug."""
+    """T-40: открытие не запрашивает timing-info; диагностика доступна явно."""
     pulse_library.pa_simple_get_latency.return_value = latency
     device = AudioDevice(1, "alsa_input.secret", "Личный микрофон", False)
     source = PulseSimpleSource(devices=lambda: [device])
     try:
         with caplog.at_level(logging.DEBUG, logger="astra_voice.worker.audio"):
             source.open(device.name)
+        # Раньше тест требовал запрос latency из open; теперь это запрещено T-40.
+        pulse_library.pa_simple_get_latency.assert_not_called()
+        assert source.is_open
+        assert caplog.messages == []
+        assert source.latency_us() == (1200 if latency == 1200 else None)
         pulse_library.pa_simple_get_latency.assert_called_once()
         assert pulse_library.pa_simple_get_latency.call_args.args[0].value == 123
-        assert source.is_open
-        assert all(record.levelno == logging.DEBUG for record in caplog.records)
-        if latency == 1200:
-            assert caplog.messages == ["1200"]
-        else:
-            assert str(latency) not in caplog.text
         assert device.name not in caplog.text
         assert device.description not in caplog.text
     finally:
         source.close()
-        wait_capture()
 
 
 def test_pulse_declares_all_function_signatures(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -485,10 +557,12 @@ def test_pulse_flush_calls_server(monkeypatch: pytest.MonkeyPatch, failed: bool)
     pulse.lib.pa_simple_flush.return_value = -1 if failed else 0
     pulse.lib.pa_simple_get_latency.return_value = 1000
     monkeypatch.setattr("astra_voice.worker.audio._Pulse", lambda: pulse)
-    source = PulseSimpleSource(devices=lambda: [])
+    # У44: тест сброса открывает проверенный микрофон, сервер не выбирает умолчание.
+    device = AudioDevice(1, "alsa_input.chosen", "Микрофон", False)
+    source = PulseSimpleSource(devices=lambda: [device])
     source.flush()
     pulse.lib.pa_simple_flush.assert_not_called()
-    source.open(None)
+    source.open(device.name)
     try:
         if failed:
             with pytest.raises(AudioError) as caught:
@@ -1292,10 +1366,154 @@ def test_capture_bounds_label_in_event_and_log(
         wait_capture()
     expected = "М" * (MAX_DEVICE_LABEL - 1) + "…"
     assert [event for _, event in probe.drain()] == [{"type": "audio.ready", "device": expected}]
-    assert caplog.messages == [f"Источник записи готов: {expected}"]
+    prefix = "Источник записи готов: "
+    assert caplog.messages == [prefix + "М" * (MAX_DEVICE_LABEL - len(prefix) - 1) + "…"]
     assert label not in caplog.text
     assert "alsa_" not in caplog.text
     assert probe.errors.empty()
+
+
+@pytest.mark.parametrize(
+    ("output", "code", "monitor"),
+    [
+        ("alsa_output.x.monitor\n", 0, True),
+        ("system.capture\n", 0, True),
+        (OSError("pactl недоступен"), 0, False),
+        (subprocess.CalledProcessError(1, "pactl"), 0, False),
+        (subprocess.TimeoutExpired("pactl", 5), 0, False),
+        (UnicodeDecodeError("utf-8", b"\xff", 0, 1, "неверный ответ"), 0, False),
+        ("alsa_input.microphone\n", 1, False),
+        ("", 0, False),
+        ("  \n", 0, False),
+        ("@DEFAULT_SOURCE@\n", 0, False),
+        ("@NONE@\n", 0, False),
+        ("alsa_input.missing\n", 0, False),
+    ],
+    ids=[
+        "monitor",
+        "monitor-flag",
+        "os-error",
+        "command-error",
+        "timeout",
+        "decode-error",
+        "nonzero",
+        "empty",
+        "whitespace",
+        "default-alias",
+        "none-alias",
+        "missing",
+    ],
+)
+def test_record_start_rejects_unsafe_default_before_libpulse(
+    output: str | Exception,
+    code: int,
+    monitor: bool,
+    pulse_library: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    wait_capture: Callable[[], None],
+    probes: list[CaptureProbe],
+    worker_factory: Callable[..., tuple[WorkerState, FakeEngine]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T-39/У44: отказ выходит через record.start до загрузки библиотек и pa_simple_new."""
+    devices = [
+        AudioDevice(1, "alsa_input.microphone", "Микрофон", False),
+        AudioDevice(2, "alsa_output.x.monitor", "Колонки", True),
+        AudioDevice(3, "system.capture", "Захват системы", True),
+    ]
+    run = Mock(wraps=default_source_run(output, code))
+    source = PulseSimpleSource(devices=lambda: devices, default=partial(default_device, run=run))
+    cdll = Mock(wraps=ctypes.CDLL)
+    monkeypatch.setattr(ctypes, "CDLL", cdll)
+    events: Queue[Message] = Queue()
+    worker, _ = worker_factory(on_event=events.put)
+    probe = CaptureProbe(source, sink=lambda uid, samples: False, on_error=worker.on_error)
+    probes.append(probe)
+    worker.set_capture(probe.capture)
+
+    with caplog.at_level(logging.DEBUG, logger="astra_voice.worker.audio"):
+        assert worker.handle({"type": "record.start", "utterance_id": "default"}) == []
+        wait_capture()
+
+    event = events.get_nowait()
+    assert (event["type"], event["code"], event["utterance_id"]) == (
+        "error",
+        ERROR_NO_DEVICE,
+        "default",
+    )
+    assert event["message"] == (
+        "Микрофон не найден: звук по умолчанию — это звук системы. Выберите микрофон в настройках."
+        if monitor
+        else "Микрофон не найден. Выберите устройство записи в настройках."
+    )
+    assert encode(event)
+    assert "alsa_" not in str(event)
+    assert all(record.levelno == logging.DEBUG for record in caplog.records)
+    assert events.empty()
+    assert probe.errors.get_nowait()[1] == ERROR_NO_DEVICE
+    assert probe.errors.empty()
+    assert probe.drain() == []
+    assert probe.samples == []
+    assert worker.state is State.idle
+    assert worker.buffers == {}
+    assert not source.is_open
+    assert source.selected_device is None
+    assert run.call_count == OPEN_FIRST_RETRIES + 1
+    cdll.assert_not_called()
+    assert pulse_library.pa_simple_new.call_count == 0
+
+
+def test_record_start_resolves_default_and_reports_changes(
+    pulse_library: Mock,
+    wait_capture: Callable[[], None],
+    probes: list[CaptureProbe],
+    worker_factory: Callable[..., tuple[WorkerState, FakeEngine]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T-39/У44: две записи без device открывают найденные имена и сообщают о смене."""
+    first = AudioDevice(2, "alsa_input.builtin", "Встроенный микрофон", False)
+    second = AudioDevice(3, "alsa_input.usb", "USB-гарнитура", False)
+    devices = [AudioDevice(1, "alsa_output.x.monitor", "Колонки", True), first, second]
+    run = Mock()
+    source = PulseSimpleSource(devices=lambda: devices, default=partial(default_device, run=run))
+    events: Queue[Message] = Queue()
+    worker, _ = worker_factory(on_event=events.put)
+    selected: list[AudioDevice | None] = []
+    names: list[str | None] = []
+
+    def samples(uid: str, chunk: array[float]) -> bool:
+        """Сохраняет выбор до закрытия источника и ограничивает запись одной порцией."""
+        selected.append(source.selected_device)
+        names.append(source.device_name)
+        worker.on_samples(uid, chunk)
+        return False
+
+    probe = CaptureProbe(source, sink=samples, on_error=worker.on_error)
+    probes.append(probe)
+    worker.set_capture(probe.capture)
+    for index, microphone in enumerate((first, second, second)):
+        run.side_effect = default_source_run(microphone.name + "\n")
+        with caplog.at_level(logging.INFO, logger="astra_voice.worker.audio"):
+            assert worker.handle({"type": "record.start", "utterance_id": str(index)}) == []
+            wait_capture()
+        ready = [event for _, event in probe.drain() if event["type"] == "audio.ready"]
+        expected: Message = {"type": "audio.ready", "device": microphone.label}
+        if index < 2:
+            expected["changed"] = f"Источник звука изменился: {microphone.label}"
+        assert ready == [expected]
+        assert encode(expected)
+        assert "alsa_" not in str(ready)
+        assert selected[-1] is microphone
+        assert names[-1] == microphone.name
+        assert pulse_library.pa_simple_new.call_args.args[3] == microphone.name.encode("utf-8")
+        assert pulse_library.pa_simple_new.call_count == index + 1
+        assert pulse_library.pa_simple_free.call_count == index + 1
+        assert run.call_count == index + 1
+        assert probe.errors.empty()
+        assert events.empty()
+        assert not source.is_open
+        assert worker.handle({"type": "record.stop", "utterance_id": str(index)}) == []
+    assert "alsa_" not in caplog.text
 
 
 def test_capture_reports_device_changes_between_recordings(
@@ -1306,13 +1524,19 @@ def test_capture_reports_device_changes_between_recordings(
 ) -> None:
     """У39/T-35: имя, описание и тип сравниваются между открытиями, индекс не важен."""
     devices: list[AudioDevice] = []
-    source = PulseSimpleSource(devices=lambda: devices, sleep=lambda delay: None)
+    # У44: None теперь означает проверенное устройство, а не безымянное умолчание сервера.
+    fallback = AudioDevice(4, "alsa_input.default", "Встроенный микрофон", False)
+    source = PulseSimpleSource(
+        devices=lambda: devices,
+        default=partial(default_device, run=default_source_run(fallback.name)),
+        sleep=lambda delay: None,
+    )
     probe = CaptureProbe(source, sink=lambda uid, samples: False)
     probes.append(probe)
     ready = Mock(wraps=WorkerState.audio_ready)
     monkeypatch.setattr(WorkerState, "audio_ready", ready)
     choices: list[tuple[AudioDevice | None, str | None]] = [
-        (None, None),
+        (None, fallback.label),
         (AudioDevice(1, "alsa_input.one", "Микрофон", False), "Микрофон"),
         (AudioDevice(2, "alsa_input.one", "Микрофон", False), None),
         (AudioDevice(2, "alsa_input.one", "Гарнитура", False), "Гарнитура"),
@@ -1321,16 +1545,15 @@ def test_capture_reports_device_changes_between_recordings(
             AudioDevice(3, "alsa_input.two", "Гарнитура", True),
             "Гарнитура (звук системы)",
         ),
-        (None, "устройство по умолчанию"),
+        (None, fallback.label),
         (None, None),
     ]
     for index, (device, changed_label) in enumerate(choices):
-        devices[:] = [device] if device is not None else []
+        selected = device if device is not None else fallback
+        devices[:] = [selected]
         probe.capture.start(str(index), device.name if device is not None else None)
         wait_capture()
-        expected: Message = {"type": "audio.ready"}
-        if device is not None:
-            expected["device"] = device.label
+        expected: Message = {"type": "audio.ready", "device": selected.label}
         if changed_label is not None:
             expected["changed"] = f"Источник звука изменился: {changed_label}"
         assert [event for _, event in probe.drain()] == [expected]
@@ -1376,6 +1599,49 @@ def test_capture_bounds_change_notification(
         "changed": prefix + "Ё" * (MAX_DEVICE_LABEL - len(prefix) - 1) + "…",
     }
     assert len(event["changed"]) == len(event["device"]) == MAX_DEVICE_LABEL
+    assert encode(event)
+    assert probe.errors.empty()
+
+
+@pytest.mark.parametrize("monitor", [False, True])
+def test_capture_sanitizes_pactl_description(
+    monitor: bool,
+    short_sources: str,
+    pulse_library: Mock,
+    wait_capture: Callable[[], None],
+    probes: list[CaptureProbe],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """T-41: чужие 10 КиБ не подделывают строки событий и единственную запись журнала."""
+    name = short_sources.splitlines()[int(monitor)].split("\t")[1]
+    prefix = " \n\x00\u202eМикрофон\r\tUSB\u200b "
+    description = prefix + "X" * (10 * 1024 - len(prefix.encode("utf-8")))
+    assert len(description.encode("utf-8")) == 10 * 1024
+    run = pactl_run(short_sources, json.dumps([{"name": name, "description": description}]))
+    source = PulseSimpleSource(devices=partial(list_devices, run=run))
+    probe = CaptureProbe(source, sink=lambda uid, samples: False)
+    probes.append(probe)
+    with caplog.at_level(logging.INFO, logger="astra_voice.worker.audio"):
+        probe.capture.start("untrusted-description", name)
+        wait_capture()
+    events = [event for _, event in probe.drain()]
+    assert len(events) == 1
+    event = events[0]
+    assert event["type"] == "audio.ready"
+    readiness = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Источник записи готов: ")
+    ]
+    assert len(readiness) == 1
+    for text in (event["device"], event["changed"], readiness[0]):
+        assert isinstance(text, str)
+        assert text.splitlines() == [text]
+        assert len(text) <= MAX_DEVICE_LABEL
+        assert all(unicodedata.category(char) not in {"Cc", "Cf"} for char in text)
+        assert "Микрофон USB " in text
+    if monitor:
+        assert event["device"].endswith(" (звук системы)")
     assert encode(event)
     assert probe.errors.empty()
 
@@ -1536,6 +1802,50 @@ def test_total_deadline_includes_device_listing(
     assert not source.is_open
 
 
+def test_total_deadline_includes_default_lookup(
+    pulse_library: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    short_sources: str,
+    wait_capture: Callable[[], None],
+    probes: list[CaptureProbe],
+) -> None:
+    """У44: поиск умолчания получает остаток после обеих команд списка устройств."""
+    timeouts: list[float] = []
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        """Расходует шесть секунд на список и остаток бюджета на поиск умолчания."""
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, (int, float))
+        timeouts.append(timeout)
+        if args == ["pactl", "list", "short", "sources"]:
+            probe.now += 4.0
+            return subprocess.CompletedProcess(args, 0, short_sources, "")
+        if args == ["pactl", "-f", "json", "list", "sources"]:
+            probe.now += 2.0
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        assert args == ["pactl", "get-default-source"]
+        probe.now += timeout
+        raise subprocess.TimeoutExpired(args, timeout)
+
+    monkeypatch.setattr("astra_voice.worker.audio.list_devices", partial(list_devices, run=run))
+    cdll = Mock(wraps=ctypes.CDLL)
+    monkeypatch.setattr(ctypes, "CDLL", cdll)
+    source = PulseSimpleSource(default=partial(default_device, run=run))
+    probe = CaptureProbe(source)
+    probes.append(probe)
+    probe.capture.start("default-deadline", None)
+    wait_capture()
+    assert timeouts == [5.0, 4.0, 2.0]
+    assert probe.now == OPEN_TOTAL_DEADLINE_S
+    assert probe.sleeps == []
+    assert probe.errors.get_nowait()[1] == ERROR_FAILED
+    assert probe.errors.empty()
+    assert probe.drain() == []
+    assert not source.is_open
+    cdll.assert_not_called()
+    assert pulse_library.pa_simple_new.call_count == 0
+
+
 def test_total_deadline_shortens_retry_pause(
     monkeypatch: pytest.MonkeyPatch,
     wait_capture: Callable[[], None],
@@ -1589,3 +1899,257 @@ def test_pulse_uses_human_label(
             assert caplog.messages == [f"Выбран источник записи: {device.label}"]
     finally:
         source.close()
+
+
+@pytest.mark.parametrize("blocked_call", ["read", "flush", "second_new", "get_latency"])
+@pytest.mark.parametrize("cancel", ["request_stop", "audio.close", "engine-failed"])
+def test_capture_watchdog_never_frees_during_libpulse_call(
+    blocked_call: str,
+    cancel: str,
+    pulse_library: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    wait_capture: Callable[[], None],
+    worker_factory: Callable[..., tuple[WorkerState, FakeEngine]],
+) -> None:
+    """T-40: зависший C-вызов остаётся у владельца до возврата, даже после отмены."""
+    watchdog_s = 0.03
+    monkeypatch.setattr("astra_voice.worker.audio.STOP_WATCHDOG_S", watchdog_s)
+    monkeypatch.setattr("astra_voice.worker.state._available_vad", lambda: None)
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    engine_gate = threading.Event()
+    events: Queue[Message] = Queue()
+    worker, engine = worker_factory(on_event=events.put)
+    if cancel == "engine-failed":
+        engine.gate = engine_gate
+        engine.raises = True
+        worker.handle({"type": "record.start", "utterance_id": "job"})
+        worker.feed_audio("job", [0.25] * 320)
+        worker.handle({"type": "record.stop", "utterance_id": "job"})
+        worker.handle({"type": "recognize", "utterance_id": "job"})
+        assert engine.started.wait(TIMEOUT)
+
+    device = AudioDevice(1, "alsa_input.chosen", "Микрофон", False)
+    source = PulseSimpleSource(devices=lambda: [device], sleep=lambda _: None)
+    close_threads: list[threading.Thread] = []
+    free_threads: list[threading.Thread] = []
+    new_threads: list[threading.Thread] = []
+    call_threads: list[threading.Thread] = []
+    original_close = source.close
+
+    def close() -> None:
+        close_threads.append(threading.current_thread())
+        original_close()
+
+    def free(handle: ctypes.c_void_p) -> None:
+        assert returned.is_set(), "pa_simple_free вызван внутри незавершённого C-вызова"
+        assert handle.value == 123
+        free_threads.append(threading.current_thread())
+
+    def block(*args: object) -> int:
+        call_threads.append(threading.current_thread())
+        entered.set()
+        assert release.wait(TIMEOUT)
+        returned.set()
+        return 123 if blocked_call == "second_new" else 0
+
+    def new(*args: object) -> int | None:
+        new_threads.append(threading.current_thread())
+        if blocked_call == "second_new":
+            return None if len(new_threads) == 1 else block(*args)
+        return 123
+
+    def samples(uid: str, pcm: array[float]) -> bool:
+        if blocked_call == "get_latency":
+            # Диагностический запрос проверяем отдельно: в open его быть не должно.
+            source.latency_us()
+        return worker.on_samples(uid, pcm)
+
+    capture = AudioCapture(
+        source=source,
+        on_samples=samples,
+        on_event=lambda _: None,
+        on_error=worker.on_error,
+    )
+    monkeypatch.setattr(source, "close", close)
+    pulse_library.pa_simple_new.side_effect = new
+    pulse_library.pa_simple_free.side_effect = free
+    if blocked_call != "second_new":
+        getattr(pulse_library, f"pa_simple_{blocked_call}").side_effect = block
+    if blocked_call == "flush":
+        original_open = capture._open
+
+        def reuse(device: str | None, running: threading.Event) -> bool | None:
+            # Устраиваем ветку повторного использования, сохраняя открытие
+            # настоящим PulseSimpleSource в том же потоке захвата.
+            opened = original_open(device, running)
+            return None if opened is None else False
+
+        monkeypatch.setattr(capture, "_open", reuse)
+    worker.set_capture(capture)
+    try:
+        worker.handle({"type": "record.start", "utterance_id": "blocked", "device": device.name})
+        assert entered.wait(TIMEOUT)
+        owner = capture._thread
+        assert owner is not None
+        closes_before_stop = list(close_threads)
+        stopped_at = time.monotonic()
+        if cancel == "audio.close":
+            with pytest.raises(CaptureStopTimeout):
+                worker.handle({"type": "audio.close"})
+        else:
+            if cancel == "engine-failed":
+                engine_gate.set()
+                assert events.get(timeout=TIMEOUT)["code"] == "engine-failed"
+            else:
+                capture.request_stop()
+            worker.check_capture_watchdog()
+            with pytest.raises(CaptureStopTimeout):
+                capture.stop()
+        assert time.monotonic() - stopped_at >= watchdog_s
+        with pytest.raises(CaptureStopTimeout):
+            worker.check_capture_watchdog()
+        assert owner.is_alive()
+        assert not capture.active
+        assert not returned.is_set()
+        assert close_threads == closes_before_stop
+        pulse_library.pa_simple_free.assert_not_called()
+        assert call_threads == [owner]
+        assert new_threads == [owner] * (2 if blocked_call == "second_new" else 1)
+        if blocked_call != "get_latency":
+            pulse_library.pa_simple_get_latency.assert_not_called()
+    finally:
+        release.set()
+        engine_gate.set()
+        # Сначала даём владельцу закончить C-вызов, затем закрываем executor;
+        # wait_capture также наблюдает его поток, который живёт до shutdown.
+        if capture._thread is not None:
+            capture._thread.join(TIMEOUT)
+        worker.close()
+        wait_capture()
+    assert not source.is_open
+    assert free_threads == [owner]
+    assert close_threads == [owner, owner]  # open сбрасывает пустой источник, finally закрывает.
+    worker.check_capture_watchdog()
+
+
+@pytest.mark.parametrize("retry_loop", ["source", "capture"])
+def test_audio_closed_prevents_next_open_attempt(
+    retry_loop: str,
+    pulse_library: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    wait_capture: Callable[[], None],
+) -> None:
+    """T-40: отмена в паузе запрещает следующий pa_simple_new в обоих циклах."""
+    if retry_loop == "capture":
+        # Один внутренний отказ передаёт управление внешнему циклу AudioCapture._open.
+        monkeypatch.setattr("astra_voice.worker.audio.OPEN_RETRIES", 1)
+    pulse_library.pa_simple_new.return_value = None
+    paused = threading.Event()
+    release = threading.Event()
+
+    def pause(delay: float) -> None:
+        paused.set()
+        assert release.wait(TIMEOUT)
+
+    device = AudioDevice(1, "alsa_input.chosen", "Микрофон", False)
+    source = PulseSimpleSource(devices=lambda: [device], sleep=pause)
+    worker = WorkerState()
+    capture = AudioCapture(
+        source=source,
+        on_samples=worker.on_samples,
+        on_event=lambda _: None,
+        on_error=worker.on_error,
+        sleep=pause,
+    )
+    worker.set_capture(capture)
+    worker.handle({"type": "record.start", "utterance_id": "retry", "device": device.name})
+    try:
+        assert paused.wait(TIMEOUT)
+        owner = capture._thread
+        assert owner is not None
+        original_join = owner.join
+
+        def join(timeout: float | None = None) -> None:
+            assert not capture.active
+            release.set()
+            original_join(timeout)
+
+        monkeypatch.setattr(owner, "join", join)
+        assert worker.handle({"type": "audio.close"}) == [{"type": "audio.closed"}]
+        calls_at_closed = pulse_library.pa_simple_new.call_count
+        assert calls_at_closed == 1
+        wait_capture()
+        assert pulse_library.pa_simple_new.call_count == calls_at_closed
+        assert not owner.is_alive()
+        assert not source.is_open
+        pulse_library.pa_simple_free.assert_not_called()
+        pulse_library.pa_simple_get_latency.assert_not_called()
+    finally:
+        release.set()
+        wait_capture()
+        worker.close()
+
+
+def test_capture_stop_before_start_closes_unowned_source() -> None:
+    """Без запуска потока источник допустимо закрыть непосредственно владельцу."""
+    source = Mock(spec=AudioSource)
+    capture = AudioCapture(source=source, on_samples=Mock(), on_event=Mock(), on_error=Mock())
+    capture.stop()
+    source.close.assert_called_once_with()
+
+
+def test_watchdog_keeps_deadline_for_previous_capture(
+    pulse_library: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    wait_capture: Callable[[], None],
+) -> None:
+    """Новая запись и повторная отмена не скрывают поток, зависший в finally/free."""
+    from astra_voice.worker.audio import STOP_WATCHDOG_S
+
+    now = 0.0
+    monkeypatch.setattr("astra_voice.worker.audio.time", Mock(monotonic=lambda: now))
+    entered = threading.Event()
+    release = threading.Event()
+    free_threads: list[threading.Thread] = []
+
+    def free(handle: ctypes.c_void_p) -> None:
+        free_threads.append(threading.current_thread())
+        entered.set()
+        assert release.wait(TIMEOUT)
+
+    pulse_library.pa_simple_free.side_effect = free
+    device = AudioDevice(1, "alsa_input.chosen", "Микрофон", False)
+    source = PulseSimpleSource(devices=lambda: [device])
+    capture = AudioCapture(
+        source=source,
+        on_samples=lambda uid, samples: False,
+        on_event=lambda _: None,
+        on_error=Mock(),
+    )
+    capture.start("first", device.name)
+    try:
+        assert entered.wait(TIMEOUT)
+        first = capture._thread
+        assert first is not None
+        now = STOP_WATCHDOG_S - 1
+        capture.start("next", device.name)
+        assert capture.active
+        capture.check_stop_watchdog()
+        capture.request_stop()
+        now = STOP_WATCHDOG_S + 0.01
+        with pytest.raises(CaptureStopTimeout):
+            capture.check_stop_watchdog()
+        with pytest.raises(CaptureStopTimeout):
+            capture.stop()
+        assert first.is_alive()
+        pulse_library.pa_simple_new.assert_called_once()
+        assert free_threads == [first]
+    finally:
+        release.set()
+        wait_capture()
+        capture.stop()
+    pulse_library.pa_simple_new.assert_called_once()
+    pulse_library.pa_simple_free.assert_called_once()
+    capture.check_stop_watchdog()

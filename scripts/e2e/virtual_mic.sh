@@ -153,6 +153,8 @@ case "$1" in
     fi
     modules=$(LC_ALL=C pactl list short modules)
     down_status=0
+    # Как в rollback: возвращаем умолчания до выгрузки и проверяем после неё.
+    restore_defaults || down_status=1
     expected_module=module-remap-source
     expected_argument=source_name=av_test_src
     for module_id in "$REMAP_ID" "$SINK_ID"; do
@@ -175,6 +177,7 @@ case "$1" in
       expected_module=module-null-sink
       expected_argument=sink_name=av_test
     done
+    restore_defaults || down_status=1
     rm -f -- "$STATE" || down_status=1
     verify_down || down_status=1
     if [ "$down_status" -ne 0 ]; then

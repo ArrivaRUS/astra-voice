@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import wave
 from array import array
 from collections.abc import Callable
@@ -30,6 +31,7 @@ SILENCE_HOLD_S = 2.0
 LEVEL_RATE_HZ = 30
 OPEN_FIRST_RETRIES = 3
 OPEN_FIRST_PAUSE_S = 1.0
+STOP_WATCHDOG_S = 5.0
 
 PA_SAMPLE_S16LE = 3
 PA_STREAM_RECORD = 2
@@ -60,6 +62,10 @@ class AudioError(Exception):
         self.message: str = message
 
 
+class CaptureStopTimeout(RuntimeError):
+    """Поток захвата не вышел после отмены; источник нельзя закрывать извне."""
+
+
 class _OpenDeadline:
     """Общий бюджет подготовки источника по часам владельца захвата."""
 
@@ -73,6 +79,13 @@ class _OpenDeadline:
         if remaining <= 0:
             raise AudioError(ERROR_FAILED, "Не удалось вовремя подготовить запись звука.")
         return min(limit, remaining)
+
+
+def _clean_device_description(description: str) -> str:
+    """Сворачивает пробелы и удаляет управляющие и форматные символы чужого ввода."""
+    normalized = " ".join(description.split())
+    cleaned = "".join(char for char in normalized if unicodedata.category(char) not in {"Cc", "Cf"})
+    return " ".join(cleaned.split())
 
 
 def _device_label(description: str, suffix: str = "") -> str:
@@ -133,10 +146,12 @@ def _device_descriptions(
             continue
         name = item.get("name")
         description = item.get("description")
-        if isinstance(name, str) and isinstance(description, str) and description.strip():
-            descriptions[name] = description
-        else:
-            logger.debug("Пропущено некорректное описание устройства записи.")
+        if isinstance(name, str) and isinstance(description, str):
+            description = _clean_device_description(description)
+            if description:
+                descriptions[name] = description
+                continue
+        logger.debug("Пропущено некорректное описание устройства записи.")
     return descriptions
 
 
@@ -193,6 +208,49 @@ def list_devices(
             )
         )
     return devices
+
+
+def default_device(
+    devices: list[AudioDevice],
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    deadline: _OpenDeadline | None = None,
+) -> AudioDevice:
+    """Проверяет фактическое умолчание, запрещая неявную запись звука системы."""
+    message = "Микрофон не найден. Выберите устройство записи в настройках."
+    try:
+        result = run(
+            ["pactl", "get-default-source"],
+            capture_output=True,
+            text=True,
+            timeout=5 if deadline is None else deadline.remaining(5),
+            env={**os.environ, "LC_ALL": "C"},
+            shell=False,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        logger.debug("Не удалось узнать устройство записи по умолчанию.")
+        raise AudioError(ERROR_NO_DEVICE, message) from None
+    if result.returncode != 0:
+        logger.debug("Не удалось узнать устройство записи по умолчанию.")
+        raise AudioError(ERROR_NO_DEVICE, message)
+
+    name = result.stdout.strip()
+    if not name or name in ("@DEFAULT_SOURCE@", "@NONE@"):
+        logger.debug("Не задано устройство записи по умолчанию: %r", name)
+        raise AudioError(ERROR_NO_DEVICE, message)
+    for device in devices:
+        if device.name == name:
+            if device.monitor:
+                logger.debug("Устройство записи по умолчанию — монитор: %r", name)
+                raise AudioError(
+                    ERROR_NO_DEVICE,
+                    "Микрофон не найден: звук по умолчанию — это звук системы. "
+                    "Выберите микрофон в настройках.",
+                )
+            return device
+    logger.debug("Устройство записи по умолчанию отсутствует в списке: %r", name)
+    raise AudioError(ERROR_NO_DEVICE, message)
 
 
 def resolve_device(name: str | None, devices: list[AudioDevice]) -> AudioDevice | None:
@@ -301,12 +359,15 @@ class AudioCapture:
         self._sleep = sleep
         self._running = threading.Event()
         self._thread: threading.Thread | None = None
+        self._watchdog_lock = threading.Lock()
+        self._stop_deadlines: dict[threading.Thread, float] = {}
         self._first_open = True
         self._previous_device: AudioDevice | None = None
 
     def start(self, utterance_id: str, device: str | None) -> None:
         """Запускает запись, не ожидая открытия устройства в вызывающем потоке."""
-        self._running.clear()
+        self.request_stop()
+        self.check_stop_watchdog()
         previous = self._thread
         running = threading.Event()
         running.set()
@@ -334,7 +395,7 @@ class AudioCapture:
                 opened_now = False
                 if not self._source.is_open:
                     if isinstance(self._source, PulseSimpleSource):
-                        self._source.open(device, deadline=deadline)
+                        self._source.open(device, deadline=deadline, running=running)
                     else:
                         self._source.open(device)
                     opened_now = True
@@ -349,8 +410,6 @@ class AudioCapture:
                 self._sleep(deadline.remaining(OPEN_FIRST_PAUSE_S))
             else:
                 if not running.is_set():
-                    # stop мог закрыть источник, пока блокирующее open ещё выполнялось.
-                    self._source.close()
                     return None
                 deadline.remaining(OPEN_TOTAL_DEADLINE_S)
                 self._first_open = False
@@ -384,7 +443,7 @@ class AudioCapture:
                 label = getattr(self._source, "device_label", None)
                 if isinstance(label, str) and label.strip():
                     label = _device_label(label)
-                    logger.info("Источник записи готов: %s", label)
+                    logger.info("%s", _device_label(f"Источник записи готов: {label}"))
                 else:
                     label = None
                 self._on_event(WorkerState.audio_ready(device=label, changed=changed))
@@ -395,7 +454,8 @@ class AudioCapture:
             if running.is_set():
                 self._on_error(uid, err.code, err.message)
         finally:
-            running.clear()
+            # Даже pa_simple_free может зависнуть: сторож действует до выхода потока.
+            self._mark_stopping(threading.current_thread(), running)
             self._source.close()
 
     def _read(self, uid: str, running: threading.Event) -> None:
@@ -444,15 +504,40 @@ class AudioCapture:
 
     def request_stop(self) -> None:
         """Снимает флаг работы без ожидания потока и обращения к источнику."""
-        self._running.clear()
+        self._mark_stopping(self._thread, self._running)
+
+    def _mark_stopping(self, thread: threading.Thread | None, running: threading.Event) -> None:
+        """Сохраняет первый срок остановки; новая запись не скрывает старый поток."""
+        with self._watchdog_lock:
+            running.clear()
+            if thread is not None:
+                self._stop_deadlines.setdefault(thread, time.monotonic() + STOP_WATCHDOG_S)
+
+    def check_stop_watchdog(self) -> None:
+        """Сообщает владельцу о зависании, в том числе после фоновой отмены."""
+        with self._watchdog_lock:
+            for thread, deadline in list(self._stop_deadlines.items()):
+                if not thread.is_alive():
+                    del self._stop_deadlines[thread]
+                elif time.monotonic() >= deadline:
+                    raise CaptureStopTimeout("Поток захвата не завершился после отмены.")
 
     def stop(self) -> None:
-        """Снимает флаг, ждёт поток не более двух секунд и закрывает источник."""
+        """Ждёт выхода владельца до срока сторожа; живой источник не трогает."""
         self.request_stop()
         thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=2.0)
-        self._source.close()
+        if thread is None:
+            # Поток никогда не запускался: конкурирующего владельца заведомо нет.
+            self._source.close()
+            return
+        if thread is threading.current_thread():
+            raise RuntimeError("Поток захвата не может ожидать сам себя.")
+        while thread.is_alive():
+            self.check_stop_watchdog()
+            with self._watchdog_lock:
+                deadline = min(self._stop_deadlines.values(), default=time.monotonic())
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        self.check_stop_watchdog()
 
     @property
     def active(self) -> bool:
@@ -527,51 +612,33 @@ class _Pulse:
         return message.decode("utf-8", "replace") if message else f"код {code}"
 
     def open(
-        self, device: str | None, *, timeout: float = OPEN_DEADLINE_S
+        self, device: str, *, timeout: float = OPEN_DEADLINE_S
     ) -> tuple[ctypes.c_void_p | None, int]:
-        """Ограничивает одну попытку дедлайном и освобождает опоздавший дескриптор."""
-        done = threading.Event()
-        lock = threading.Lock()
-        abandoned = False
-        handle: ctypes.c_void_p | None = None
-        error = 0
+        """Открывает в потоке владельца и отбрасывает опоздавший дескриптор."""
         deadline = time.monotonic() + min(OPEN_DEADLINE_S, timeout)
-
-        def connect() -> None:
-            """Владеет дескриптором до передачи ожидающему вызывающему коду."""
-            nonlocal handle, error
-            spec = _PaSampleSpec(PA_SAMPLE_S16LE, RATE, CHANNELS)
-            attr = _PaBufferAttr(U32_MAX, U32_MAX, U32_MAX, U32_MAX, CHUNK_BYTES)
-            err = ctypes.c_int(0)
-            raw = self.lib.pa_simple_new(
-                None,
-                b"astra-voice",
-                PA_STREAM_RECORD,
-                device.encode("utf-8") if device is not None else None,
-                b"dictation",
-                ctypes.byref(spec),
-                None,
-                ctypes.byref(attr),
-                ctypes.byref(err),
-            )
-            opened = ctypes.c_void_p(raw) if raw else None
-            with lock:
-                # Решение о передаче и отказ по дедлайну не могут обогнать друг друга.
-                if not abandoned and time.monotonic() <= deadline:
-                    handle, error = opened, err.value
-                    done.set()
-                    return
+        spec = _PaSampleSpec(PA_SAMPLE_S16LE, RATE, CHANNELS)
+        attr = _PaBufferAttr(U32_MAX, U32_MAX, U32_MAX, U32_MAX, CHUNK_BYTES)
+        err = ctypes.c_int(0)
+        # C-вызов нельзя прервать дедлайном. При зависании после отмены воркер
+        # завершит процесс по сторожу; отдельный бесхозный pulse-open недопустим.
+        raw = self.lib.pa_simple_new(
+            None,
+            b"astra-voice",
+            PA_STREAM_RECORD,
+            device.encode("utf-8"),
+            b"dictation",
+            ctypes.byref(spec),
+            None,
+            ctypes.byref(attr),
+            ctypes.byref(err),
+        )
+        opened = ctypes.c_void_p(raw) if raw else None
+        if time.monotonic() > deadline:
             if opened is not None:
                 self.lib.pa_simple_free(opened)
-
-        threading.Thread(target=connect, name="pulse-open", daemon=True).start()
-        done.wait(max(0.0, deadline - time.monotonic()))
-        with lock:
-            if done.is_set():
-                return handle, error
-            abandoned = True
-        logger.debug("Истёк дедлайн открытия устройства записи.")
-        return None, 0
+            logger.debug("Истёк дедлайн открытия устройства записи.")
+            return None, 0
+        return opened, err.value
 
 
 class PulseSimpleSource:
@@ -581,9 +648,11 @@ class PulseSimpleSource:
         self,
         *,
         devices: Callable[[], list[AudioDevice]] | None = None,
+        default: Callable[..., AudioDevice] = default_device,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._devices = devices
+        self._default = default
         self._sleep = sleep
         self._pulse: _Pulse | None = None
         self._handle: ctypes.c_void_p | None = None
@@ -592,29 +661,46 @@ class PulseSimpleSource:
         self._selected_device: AudioDevice | None = None
         self.device_label: str | None = None
 
-    def open(self, device: str | None, *, deadline: _OpenDeadline | None = None) -> None:
-        """Проверяет выбор до открытия и повторяет ограниченные по времени попытки."""
+    def open(
+        self,
+        device: str | None,
+        *,
+        deadline: _OpenDeadline | None = None,
+        running: threading.Event | None = None,
+    ) -> None:
+        """Проверяет выбор и отмену перед каждой попыткой открытия."""
+        if running is not None and not running.is_set():
+            return
         self.close()
         devices = list_devices(deadline=deadline) if self._devices is None else self._devices()
         if deadline is not None:
             deadline.remaining(OPEN_TOTAL_DEADLINE_S)
-        selected = resolve_device(device, devices)
-        if selected is not None and selected.monitor:
+        # У44: проверяем умолчание до загрузки libpulse и открываем только конкретное имя.
+        selected = (
+            self._default(devices, deadline=deadline)
+            if device is None
+            else resolve_device(device, devices)
+        )
+        assert selected is not None
+        if deadline is not None:
+            deadline.remaining(OPEN_TOTAL_DEADLINE_S)
+        if selected.monitor:
             logger.info("Выбран источник записи: %s", selected.label)
         if self._pulse is None:
             self._pulse = _Pulse()
         error = 0
         for attempt in range(OPEN_RETRIES):
+            if running is not None and not running.is_set():
+                return
             timeout = OPEN_DEADLINE_S if deadline is None else deadline.remaining(OPEN_DEADLINE_S)
-            handle, error = self._pulse.open(device, timeout=timeout)
+            handle, error = self._pulse.open(selected.name, timeout=timeout)
             if handle is not None:
                 self._handle = handle
-                self._device_name = device
+                self._device_name = selected.name
                 self._selected_device = selected
-                self.device_label = selected.label if selected is not None else None
-                latency = self.latency_us()
-                if latency is not None:
-                    logger.debug("%d", latency)
+                self.device_label = selected.label
+                return
+            if running is not None and not running.is_set():
                 return
             logger.debug("Не удалось открыть запись: %s", self._pulse.strerror(error))
             if attempt + 1 < OPEN_RETRIES:
@@ -672,12 +758,12 @@ class PulseSimpleSource:
 
     @property
     def device_name(self) -> str | None:
-        """Возвращает запрошенное имя; libpulse-simple не сообщает фактическое."""
+        """Возвращает конкретное имя, переданное libpulse при открытии."""
         return self._device_name
 
     @property
     def selected_device(self) -> AudioDevice | None:
-        """Возвращает проверенное устройство текущего открытия, None — выбор по умолчанию."""
+        """Возвращает проверенное устройство текущего открытия, None — источник закрыт."""
         return self._selected_device
 
     def latency_us(self) -> int | None:

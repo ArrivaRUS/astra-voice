@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import socket
 import struct
 import subprocess
 import sys
@@ -24,7 +25,9 @@ import pytest
 
 from astra_voice.core.version import __version__
 from astra_voice.worker import state as state_module
-from astra_voice.worker.ipc import BAD_FIELD, FrameError, decode, encode
+from astra_voice.worker.audio import AudioCapture, WavFileSource
+from astra_voice.worker.ipc import BAD_FIELD, FrameError, FrameReader, decode, encode
+from astra_voice.worker.main import WorkerLoop
 from astra_voice.worker.state import (
     LIMIT_S_DEFAULT,
     SAMPLE_RATE,
@@ -34,6 +37,7 @@ from astra_voice.worker.state import (
     WorkerState,
     join_segment_texts,
 )
+from astra_voice.worker.supervisor import WorkerSupervisor
 
 # tests не пакет; общий каталог фейков добавляется без нового conftest.py.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -155,6 +159,128 @@ def record_samples(worker: WorkerState, count: int) -> None:
     assert command(worker, "record.start") == []
     worker.feed_audio("u1", repeat(0.25, count))
     assert command(worker, "record.stop") == []
+
+
+@pytest.mark.parametrize("code", ["no-model", "busy", "bad-state"])
+def test_recognize_error_is_correlated_by_transport(factory: Factory, code: str) -> None:
+    """У45/T-44: реальные отказы автомата получают id и тип исходной команды."""
+    worker, engine, _ = factory(FakeEngine(gate=Event()), loaded=code != "no-model")
+    loop = WorkerLoop(Mock(spec=socket.socket), capture=False)
+    loop.worker.close()
+    loop.worker = worker
+    if code == "busy":
+        for uid in ("active", "queued"):
+            start(worker, uid)
+            recognize(worker, uid)
+        assert engine.started.wait(2)
+    assert loop._receive(encode({"type": "record.start", "utterance_id": "u1"}))
+    assert not loop._send_buffer
+    if code == "bad-state":
+        # Повторный recognize отклоняется, пока движок удерживает первое задание.
+        assert loop._receive(encode({"type": "recognize", "utterance_id": "u1"}))
+        assert engine.started.wait(2)
+        assert not loop._send_buffer
+    assert loop._receive(encode({"type": "recognize", "utterance_id": "u1"}))
+    replies = FrameReader().feed(bytes(loop._send_buffer))
+    assert len(replies) == 1
+    assert replies[0]["type"] == "error"
+    assert replies[0]["code"] == code
+    assert replies[0]["utterance_id"] == "u1"
+    assert replies[0]["request_type"] == "recognize"
+    if code != "bad-state":
+        assert worker.state in (State.recording, State.recording_processing)
+
+
+@pytest.mark.parametrize("uncorrelated", [False, True])
+def test_cancel_after_recognize_error_closes_capture(
+    factory: Factory, tmp_path: Path, uncorrelated: bool
+) -> None:
+    """У45/T-44: отмена проходит супервизор, IPC и автомат и освобождает микрофон."""
+    path = tmp_path / "microphone.wav"
+    with wave.open(str(path), "wb") as wav:
+        wav.setparams((1, 2, SAMPLE_RATE, 0, "NONE", "not compressed"))
+        wav.writeframes(struct.pack("<h", 8192))
+    reading = Event()
+    release = Event()
+
+    class HeldSource(WavFileSource):
+        """Держит источник открытым до остановки захвата, не достигая EOF или лимита."""
+
+        def read_chunk(self) -> bytes | None:
+            reading.set()
+            while not release.wait(0.01):
+                if not capture.active:
+                    break
+            return None
+
+    source = HeldSource(path)
+    worker, _, capture_events = factory(loaded=False)
+    capture = AudioCapture(
+        source=source,
+        on_samples=worker.on_samples,
+        on_event=capture_events.put,
+        on_error=worker.on_error,
+    )
+    worker.set_capture(capture)
+    loop = WorkerLoop(Mock(spec=socket.socket), capture=False)
+    loop.worker.close()
+    loop.worker = worker
+    events: list[Message] = []
+    supervisor = WorkerSupervisor(events.append, use_qt=False)
+    supervisor.state = "running"
+
+    def exchange(kind: str) -> None:
+        """Передаёт настоящие кадры между супервизором и воркером без UNIX-сокетов."""
+        request = {"type": kind, "utterance_id": "u1"}
+        assert supervisor.send(request) is not None
+        data = bytes(supervisor._outgoing)
+        supervisor._outgoing.clear()
+        assert FrameReader().feed(data) == [request]
+        assert loop._receive(data)
+        replies = FrameReader().feed(bytes(loop._send_buffer))
+        loop._send_buffer.clear()
+        for reply in replies:
+            if uncorrelated and reply["type"] == "error":
+                # Вариант T-44: старый/фейковый воркер не передаёт корреляцию.
+                reply.pop("utterance_id")
+                reply.pop("request_type")
+            supervisor._receive(encode(reply), supervisor.generation)
+
+    try:
+        exchange("record.start")
+        assert reading.wait(2)
+        assert source.is_open
+        assert capture.active
+        assert_state(worker, State.recording)
+        exchange("recognize")
+        assert len(events) == 1
+        assert events[0]["code"] == "no-model"
+        assert source.is_open
+        assert capture.active
+        assert_state(worker, State.recording)
+        key = ("utterance", "u1")
+        assert (key in supervisor._pending) == uncorrelated
+        assert (key in supervisor._finished) != uncorrelated
+        if not uncorrelated:
+            assert events[0]["utterance_id"] == "u1"
+            assert events[0]["request_type"] == "recognize"
+        exchange("record.cancel")
+        assert events[-1] == {"type": "cancelled", "utterance_id": "u1", "generation": 1}
+        assert not source.is_open
+        assert not capture.active
+        assert_state(worker, State.idle)
+        assert not worker.buffers
+        assert not supervisor._pending
+        assert supervisor.dropped_late == 0
+        capture_thread = capture._thread
+        assert capture_thread is None or not capture_thread.is_alive()
+        # Повторная отмена проходит до идемпотентного автомата и получает ответ.
+        exchange("record.cancel")
+        assert [event["type"] for event in events] == ["error", "cancelled", "cancelled"]
+        assert not source.is_open
+    finally:
+        release.set()
+        worker.close()
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Thread
+from typing import NoReturn
 from unittest.mock import Mock, call
 
 import pytest
@@ -24,6 +25,7 @@ import pytest
 from astra_voice import bootstrap
 from astra_voice.worker import ipc
 from astra_voice.worker import main as worker_main
+from astra_voice.worker.audio import AudioCapture, CaptureStopTimeout
 from astra_voice.worker.state import Message, WorkerState
 
 pytestmark = pytest.mark.unit
@@ -126,6 +128,122 @@ def test_hello_then_ping() -> None:
         peer.sendall(frame[:2])
         peer.sendall(frame[2:])
         assert receive(peer) == [{"type": "pong"}]
+
+
+@pytest.mark.parametrize("failure", ["poll", "command", "disconnect", "parent_changed"])
+def test_capture_timeout_terminates_worker_without_cleanup(
+    failure: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T-40: сторож в цикле и при завершении ведёт к fatal, flush, затем _exit."""
+
+    class Terminated(BaseException):
+        """Заменяет выход процесса только в тесте."""
+
+    calls: list[str | int] = []
+    handler = logging.Handler()
+    monkeypatch.setattr(handler, "emit", lambda record: calls.append("fatal"))
+    monkeypatch.setattr(handler, "flush", lambda: calls.append("flush"))
+    monkeypatch.setattr(worker_main.logger, "handlers", [handler])
+
+    def terminate(code: int) -> NoReturn:
+        calls.append(code)
+        raise Terminated
+
+    connection = Mock(spec=socket.socket)
+    connection.recv.return_value = (
+        ipc.encode({"type": "audio.close"}) if failure == "command" else b""
+    )
+    monkeypatch.setattr(select, "select", lambda *args: ([connection], [], []))
+    loop = worker_main.WorkerLoop(
+        connection,
+        capture=False,
+        parent_pid=-1 if failure == "parent_changed" else os.getppid(),
+        terminate=terminate,
+    )
+    capture = Mock(spec=AudioCapture)
+    if failure == "poll":
+        capture.check_stop_watchdog.side_effect = CaptureStopTimeout
+    else:
+        capture.stop.side_effect = CaptureStopTimeout
+    loop.worker.set_capture(capture)
+    close = Mock(wraps=loop.worker.close)
+    monkeypatch.setattr(loop.worker, "close", close)
+    try:
+        with pytest.raises(Terminated):
+            loop.run()
+        assert calls == ["fatal", "flush", 1]
+        assert (
+            worker_main.__name__,
+            logging.CRITICAL,
+            "Поток захвата завис в libpulse после отмены. Воркер завершается.",
+        ) in caplog.record_tuples
+        assert close.call_count == int(failure in {"disconnect", "parent_changed"})
+        connection.close.assert_not_called()
+        # audio.closed нельзя выдать, если ожидание владельца завершилось сторожем.
+        assert [
+            message["type"] for message in ipc.FrameReader().feed(bytes(loop._send_buffer))
+        ] == ["hello"]
+    finally:
+        capture.stop.side_effect = None
+        loop.worker.close()
+        # При имитации _exit закрываем созданный executor вручную после проверок.
+        loop.worker._executor.shutdown(wait=True)
+
+
+@pytest.mark.parametrize("kind", ["record.start", "record.stop", "record.cancel", "recognize"])
+def test_command_error_inherits_correlation(kind: str) -> None:
+    """У45/T-44: общая ветка bad-state коррелируется для каждой команды с id."""
+    loop = worker_main.WorkerLoop(Mock(spec=socket.socket), capture=False)
+    loop.worker.close()
+    requests = [{"type": kind, "utterance_id": uid} for uid in ("u1", "u2")]
+    assert loop._receive(b"".join(ipc.encode(request) for request in requests))
+    replies = ipc.FrameReader().feed(bytes(loop._send_buffer))
+    assert replies == [
+        {
+            **ipc.error("bad-state", "Воркер закрыт."),
+            "utterance_id": request["utterance_id"],
+            "request_type": kind,
+        }
+        for request in requests
+    ]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {**ipc.error("bad-state", "Тест."), "utterance_id": "original"},
+        {
+            **ipc.error("bad-state", "Тест."),
+            "utterance_id": "original",
+            "request_type": "recognize",
+        },
+        {"type": "audio.ready"},
+        {"type": "cancelled", "utterance_id": "u1"},
+    ],
+)
+def test_receive_preserves_correlated_errors_and_other_replies(
+    monkeypatch: pytest.MonkeyPatch, reply: Message
+) -> None:
+    """Дополнение У45 сохраняет исходную корреляцию и ответы других типов."""
+    loop = worker_main.WorkerLoop(Mock(spec=socket.socket), capture=False)
+    original = dict(reply)
+    monkeypatch.setattr(loop.worker, "handle", Mock(return_value=[reply]))
+    try:
+        assert loop._receive(ipc.encode({"type": "record.start", "utterance_id": "u1"}))
+        assert ipc.FrameReader().feed(bytes(loop._send_buffer)) == [original]
+        assert reply == original
+    finally:
+        loop.worker.close()
+
+
+def test_error_without_request_id_stays_uncorrelated() -> None:
+    """Ошибке команды без id транспорт не приписывает корреляцию диктовки."""
+    loop = worker_main.WorkerLoop(Mock(spec=socket.socket), capture=False)
+    loop.worker.close()
+    assert loop._receive(ipc.encode({"type": "ping"}))
+    assert ipc.FrameReader().feed(bytes(loop._send_buffer)) == [
+        ipc.error("bad-state", "Воркер закрыт.")
+    ]
 
 
 def test_slow_reader_preserves_pending_frames() -> None:
