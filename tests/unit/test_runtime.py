@@ -18,6 +18,7 @@ from astra_voice.core.dictation import (
     BUSY_RETRY_MS,
     CANCEL_RESTART_MS,
     CANCEL_TIMEOUT_MS,
+    RECOGNIZE_TIMEOUT_S,
     DictationPhase,
 )
 from astra_voice.core.settings import Settings, from_dict
@@ -1050,11 +1051,17 @@ def test_settings_are_used_for_recording_and_paste(monkeypatch: pytest.MonkeyPat
     rig.hotkey.grab.assert_called_once_with(settings.hotkey, HotkeyMode.TOGGLE)
     rig.hotkey.fsm.press(rig.now)
     message = rig.supervisor.send.call_args.args[0]
-    assert {key: message[key] for key in ("device", "limit_s", "silence_db", "insert")} == {
+    assert message == {
+        "type": "record.start",
+        "utterance_id": message["utterance_id"],
+        "device": "микрофон",
+    }
+    assert rig.supervisor.send.call_args.kwargs == {
+        "timeout": RECORD_LIMIT_S + RECOGNIZE_TIMEOUT_S,
+    }
+    assert rig.runtime.record_params() == {
         "device": "микрофон",
         "limit_s": RECORD_LIMIT_S,
-        "silence_db": -50.0,
-        "insert": True,
     }
     rig.hotkey.fsm.press(rig.now + 1)
     rig.event(type="result", text=MARKER)
@@ -1063,8 +1070,6 @@ def test_settings_are_used_for_recording_and_paste(monkeypatch: pytest.MonkeyPat
     assert rig.runtime.record_params() == {
         "device": None,
         "limit_s": RECORD_LIMIT_S,
-        "silence_db": -45.0,
-        "insert": True,
     }
     assert rig.runtime.paste_mode() == PasteMode.AUTO
 

@@ -286,11 +286,10 @@ class DictationRuntime(QObject):
 
     def record_params(self) -> dict[str, Any]:
         """Параметры записи; расширения настроек читаются перед каждой фразой."""
+        # TODO(M5/M6): реализовать silence_db/insert; воркер их пока не поддерживает.
         return {
             "device": self.settings.extra.get("device"),
             "limit_s": RECORD_LIMIT_S,
-            "silence_db": self.settings.extra.get("silence_db", -45.0),
-            "insert": True,
         }
 
     def paste_mode(self) -> PasteMode:

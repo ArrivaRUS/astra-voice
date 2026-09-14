@@ -193,7 +193,10 @@ class DictationOrchestrator:
         self._retries = 0
         try:
             params = self._record_params()
-            message = {**params, "type": "record.start", "utterance_id": self._utterance_id}
+            message = {"type": "record.start", "utterance_id": self._utterance_id}
+            device = params.get("device")
+            if isinstance(device, str) and device:
+                message["device"] = device
             timeout = float(params["limit_s"]) + RECOGNIZE_TIMEOUT_S
         except Exception:
             self._log.warning("диктовка: параметры записи недоступны")
@@ -507,7 +510,9 @@ class DictationOrchestrator:
         try:
             self._send(message, **kwargs)
         except Exception:
-            self._log.warning("диктовка: отправка команды не удалась")
+            self._log.warning(
+                "диктовка: отправка команды %s не удалась", message.get("type"), exc_info=True
+            )
             self._fail_recognition()
             return False
         return True

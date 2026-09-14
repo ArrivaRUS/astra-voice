@@ -273,7 +273,9 @@ def rig() -> Rig:
 def test_full_ptt_cycle_and_timings(rig: Rig) -> None:
     rig.fsm.press(rig.now)
     uid = rig.uid
-    assert rig.sent == [({**rig.params, "type": "record.start", "utterance_id": uid}, 150.0)]
+    assert rig.sent == [
+        ({"type": "record.start", "utterance_id": uid, "device": "fake-device"}, 150.0)
+    ]
     assert rig.trace[:6] == [
         ("active_window", 42),
         ("send", "record.start"),
@@ -1078,7 +1080,9 @@ def test_start_failure_releases_hotkey_and_shows_error(
     def fail(*args: object, **kwargs: object) -> None:
         if failure == "params":
             assert rig.core.phase == DictationPhase.IDLE
-        raise RuntimeError(MARKER)
+            raise RuntimeError(MARKER)
+        # Ошибка транспорта не содержит распознанного текста.
+        raise BrokenPipeError("Канал воркера закрыт")
 
     monkeypatch.setattr(rig.core, "_record_params" if failure == "params" else "_send", fail)
     rig.start()
@@ -1089,6 +1093,12 @@ def test_start_failure_releases_hotkey_and_shows_error(
     assert rig.pill.calls == [(PillState.ERROR, ERROR_RECOGNITION_FAILED, None)]
     assert rig.tray.state == TrayState.ERROR and not rig.stats.events
     assert MARKER not in caplog.text
+    if failure == "send":
+        record = caplog.records[-1]
+        assert record.getMessage() == "диктовка: отправка команды record.start не удалась"
+        assert record.exc_info is not None
+        assert isinstance(record.exc_info[1], BrokenPipeError)
+        assert "Канал воркера закрыт" in caplog.text
     monkeypatch.undo()
     rig.start()
     assert rig.commands() == ["record.start"]
