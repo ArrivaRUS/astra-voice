@@ -37,15 +37,20 @@ class IndicatorGuard(QObject):
         self._pill = pill
         self._tray = tray
         self._recording = False
+        self._recording_episode = 0
         self._loss_reported = False
         self._grace_seconds = grace_ms / 1000
         self._grace_deadline = 0.0
+        self._pill_forced = False
+        self._force_grace_deadline = 0.0
         self._timer = QTimer(self)
         self._timer.setInterval(poll_ms)
         self._timer.timeout.connect(self.check)
 
     def set_recording(self, value: bool) -> None:
         """Обновить факт записи и сразу проверить индикацию при её начале."""
+        if value != self._recording:
+            self._recording_episode += 1
         if value and not self._recording:
             self._grace_deadline = monotonic() + self._grace_seconds
         self._recording = value
@@ -56,6 +61,8 @@ class IndicatorGuard(QObject):
         else:
             self.stop()
             self._loss_reported = False
+            self._pill_forced = False
+            self._force_grace_deadline = 0.0
             self._pill.set_forced(False)
 
     @property
@@ -64,27 +71,47 @@ class IndicatorGuard(QObject):
 
     @property
     def ok(self) -> bool:
-        """Есть ли прямо сейчас видимый индикатор, независимо от записи."""
+        """Прочитать локальные признаки индикации, без D-Bus-запросов в свойствах."""
         return indicator_visible(
             pill_visible=self._pill.visible, tray_registered=self._tray.registered
         )
 
     def check(self) -> bool:
-        """Применить О4 во время записи; вне записи только прочитать видимость."""
+        """При потере индикации сначала запросить остановку, затем уведомить.
+
+        Тик читает только локальные свойства индикаторов. Доставку уведомления
+        откладываем до выхода из тика, чтобы он не ждал ответа D-Bus.
+        """
+        episode = self._recording_episode
         if not self._recording:
             return self.ok
 
-        self._pill.set_forced(not self._tray.registered)
-        if self.ok:
+        tray_registered = self._tray.registered
+        if not self._recording or episode != self._recording_episode:
+            return self.ok
+        forced = not tray_registered
+        force_started = forced and not self._pill_forced
+        self._pill_forced = forced
+        if force_started:
+            # До внешнего вызова: вложенный check() тоже должен видеть новый грейс.
+            self._force_grace_deadline = monotonic() + self._grace_seconds
+        self._pill.set_forced(forced)
+        visible = self.ok
+        grace_expired = monotonic() >= max(self._grace_deadline, self._force_grace_deadline)
+        # Чужой код в свойствах или set_forced() мог закончить запись и даже
+        # начать следующую: старый вызов не вправе менять её эпизод потери.
+        if not self._recording or episode != self._recording_episode:
+            return visible
+        if visible:
             self._loss_reported = False
-        elif not self._loss_reported and monotonic() >= self._grace_deadline:
+        elif not force_started and not self._loss_reported and grace_expired:
             # Грейс даёт пилюле время показаться, не подавляя её принудительный показ.
             # До внешних вызовов: повторный вход не должен дублировать эпизод.
             self._loss_reported = True
-            notify.notify_indicators_lost()
             if self.on_stop_recording is not None:
                 self.on_stop_recording()
-        return self.ok
+            QTimer.singleShot(0, notify.notify_indicators_lost)
+        return visible
 
     def start(self) -> None:
         """Включить периодические проверки, только если запись уже идёт."""

@@ -6,11 +6,14 @@ import ast
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
+from threading import Event
+from time import perf_counter
+from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
 from PyQt5.QtCore import QMetaType, QVariant
-from PyQt5.QtDBus import QDBusMessage
+from PyQt5.QtDBus import QDBus, QDBusMessage
 
 from astra_voice.ui import notify as notifications
 
@@ -29,48 +32,104 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> Mock:
     reply = Mock()
     reply.type.return_value = QDBusMessage.ReplyMessage
     reply.arguments.return_value = [41]
-    interface = Mock()
-    interface.isValid.return_value = True
-    interface.call.return_value = reply
+    bus.call.return_value = reply
     connection = Mock()
     connection.sessionBus.return_value = bus
-    factory = Mock(return_value=interface)
+    forbidden_interface = Mock(side_effect=AssertionError("Синхронный Introspect запрещён"))
+    create_method_call = QDBusMessage.createMethodCall
+
+    def create_message(service: str, path: str, interface: str, method: str) -> QDBusMessage:
+        message = create_method_call(service, path, interface, method)
+        # Сохраняем типы QVariant до преобразования arguments() обратно в Python.
+        message.setArguments = Mock(wraps=message.setArguments)
+        return message
+
     monkeypatch.setattr(notifications, "QDBusConnection", connection)
-    monkeypatch.setattr(notifications, "QDBusInterface", factory)
-    return Mock(bus=bus, reply=reply, interface=interface, factory=factory)
+    monkeypatch.setattr(notifications, "QDBusInterface", forbidden_interface)
+    monkeypatch.setattr(QDBusMessage, "createMethodCall", create_message)
+    return Mock(bus=bus, reply=reply, factory=forbidden_interface)
+
+
+def _arguments(message: QDBusMessage) -> list[Any]:
+    return cast(list[Any], message.setArguments.call_args.args[0])
 
 
 @pytest.mark.parametrize(("urgency", "expected"), [("low", 0), ("normal", 1), ("critical", 2)])
 def test_notify_arguments(transport: Mock, urgency: str, expected: int) -> None:
     notifications.notify("Заголовок", "Сообщение", urgency=urgency)
-    transport.factory.assert_called_once_with(
-        "org.freedesktop.Notifications",
-        "/org/freedesktop/Notifications",
-        "org.freedesktop.Notifications",
-        transport.bus,
-    )
-    transport.interface.setTimeout.assert_called_once_with(1000)
-    args = transport.interface.call.call_args.args
-    assert len(args) == 9
-    assert args[0:2] == ("Notify", "Astra Voice")
-    assert args[2].userType() == QMetaType.UInt
-    assert args[2].value() == 0
-    assert args[3:6] == ("astravoice", "Заголовок", "Сообщение")
-    assert args[6].type() == QVariant.StringList
-    assert args[6].value() == []
-    assert set(args[7]) == {"urgency"}
-    assert args[7]["urgency"].userType() == QMetaType.UChar
-    assert args[7]["urgency"].value() == bytes([expected])
-    assert args[8] == -1
+    transport.factory.assert_not_called()
+    transport.bus.call.assert_called_once()
+    message, mode, timeout_ms = transport.bus.call.call_args.args
+    assert message.service() == "org.freedesktop.Notifications"
+    assert message.path() == "/org/freedesktop/Notifications"
+    assert message.interface() == "org.freedesktop.Notifications"
+    assert message.member() == "Notify"
+    assert mode == QDBus.Block
+    assert 0 < timeout_ms <= 450
+    args = _arguments(message)
+    assert len(args) == 8
+    assert args[0] == "Astra Voice"
+    assert args[1].userType() == QMetaType.UInt
+    assert args[1].value() == 0
+    assert args[2:5] == ["astravoice", "Заголовок", "Сообщение"]
+    assert args[5].type() == QVariant.StringList
+    assert args[5].value() == []
+    assert set(args[6]) == {"urgency"}
+    assert args[6]["urgency"].userType() == QMetaType.UChar
+    assert args[6]["urgency"].value() == bytes([expected])
+    assert args[7] == -1
 
 
 def test_notify_defaults(transport: Mock) -> None:
     notifications.notify("Заголовок")
-    args = transport.interface.call.call_args.args
-    assert args[5] == ""
-    assert args[7]["urgency"].value() == b"\x01"
+    args = _arguments(transport.bus.call.call_args.args[0])
+    assert args[4] == ""
+    assert args[6]["urgency"].value() == b"\x01"
     assert notifications.last_delivery_ok() is True
     assert notifications.pending_count() == 0
+
+
+@pytest.mark.parametrize("backlog", [0, 8])
+def test_hung_owner_keeps_whole_notify_within_500_ms(transport: Mock, backlog: int) -> None:
+    transport.bus.isConnected.return_value = False
+    for index in range(backlog):
+        notifications.notify(f"Отложенное {index}")
+    transport.bus.isConnected.return_value = True
+    owner = Event()  # Владелец существует, но никогда не отвечает; реальной шины нет.
+
+    def call_hung_owner(message: QDBusMessage, mode: object, timeout_ms: int) -> Mock:
+        # Даже регрессия таймаута не должна задержать unit-набор на 25 секунд.
+        owner.wait(min(timeout_ms, 600) / 1000)
+        return cast(Mock, transport.reply)
+
+    transport.reply.type.return_value = QDBusMessage.ErrorMessage
+    transport.bus.call.side_effect = call_hung_owner
+    started = perf_counter()
+    notifications.notify("Зависший владелец")
+    elapsed_ms = (perf_counter() - started) * 1000
+    assert elapsed_ms <= 500, f"notify() занял {elapsed_ms:.1f} мс"
+    transport.factory.assert_not_called()
+    transport.bus.call.assert_called_once()
+    message, mode, timeout_ms = transport.bus.call.call_args.args
+    assert message.member() == "Notify"
+    assert mode == QDBus.Block
+    assert 0 < timeout_ms <= 500
+    assert notifications.last_delivery_ok() is False
+    assert notifications.pending_count() == min(backlog + 1, 8)
+
+
+@pytest.mark.parametrize("preparation_seconds", [0.350, 0.500])
+def test_preparation_uses_same_transport_budget(
+    transport: Mock, monkeypatch: pytest.MonkeyPatch, preparation_seconds: float
+) -> None:
+    ticks = iter([0.0, preparation_seconds])
+    monkeypatch.setattr(notifications, "monotonic", lambda: next(ticks))
+    notifications.notify("Заголовок")
+    if preparation_seconds < 0.450:
+        assert 0 < transport.bus.call.call_args.args[2] <= 100
+    else:
+        transport.bus.call.assert_not_called()
+        assert notifications.pending_count() == 1
 
 
 def test_unknown_urgency(transport: Mock) -> None:
@@ -84,7 +143,11 @@ def test_replaces_last_successful_notification(transport: Mock) -> None:
     transport.reply.arguments.return_value = [72]
     notifications.notify("Второе")
     notifications.notify("Третье")
-    assert [call.args[2].value() for call in transport.interface.call.call_args_list] == [0, 41, 72]
+    assert [_arguments(call.args[0])[1].value() for call in transport.bus.call.call_args_list] == [
+        0,
+        41,
+        72,
+    ]
 
 
 @pytest.mark.parametrize("delivered", [False, True])
@@ -101,23 +164,21 @@ def test_reset_state(transport: Mock, delivered: bool) -> None:
     assert notifications.last_delivery_ok() is False
     transport.bus.isConnected.return_value = True
     notifications.notify("Второе")
-    assert transport.interface.call.call_args.args[2].value() == 0
+    assert _arguments(transport.bus.call.call_args.args[0])[1].value() == 0
 
 
-@pytest.mark.parametrize("failure", ["bus", "interface", "reply", "exception"])
+@pytest.mark.parametrize("failure", ["bus", "reply", "exception"])
 def test_transport_failure_resets_id(
     transport: Mock, failure: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     notifications.notify("Первое")
     if failure == "bus":
         transport.bus.isConnected.return_value = False
-    elif failure == "interface":
-        transport.interface.isValid.return_value = False
     elif failure == "reply":
         transport.reply.type.return_value = QDBusMessage.ErrorMessage
     else:
-        transport.interface.call.side_effect = RuntimeError("Секретная диктовка")
-    transport.interface.call.reset_mock()
+        transport.bus.call.side_effect = RuntimeError("Секретная диктовка")
+    transport.bus.call.reset_mock()
     with caplog.at_level("DEBUG", logger=notifications.__name__):
         notifications.notify("Запись остановлена", "Секретная диктовка")
     assert notifications.last_delivery_ok() is False
@@ -127,14 +188,13 @@ def test_transport_failure_resets_id(
         for record in caplog.records
     )
     assert "Секретная диктовка" not in caplog.text
-    if failure in {"bus", "interface"}:
-        transport.interface.call.assert_not_called()
+    if failure == "bus":
+        transport.bus.call.assert_not_called()
     transport.bus.isConnected.return_value = True
-    transport.interface.isValid.return_value = True
     transport.reply.type.return_value = QDBusMessage.ReplyMessage
-    transport.interface.call.side_effect = None
+    transport.bus.call.side_effect = None
     notifications.notify("Восстановлено")
-    assert transport.interface.call.call_args.args[2].value() == 0
+    assert _arguments(transport.bus.call.call_args.args[0])[1].value() == 0
 
 
 @pytest.mark.parametrize("arguments", [[], [0], [-1], [2**32], ["41"], [True], [41, 42]])
@@ -146,7 +206,7 @@ def test_invalid_reply_resets_id(transport: Mock, arguments: list[object]) -> No
     assert notifications.pending_count() == 1
     transport.reply.arguments.return_value = [42]
     notifications.notify("Третье")
-    assert transport.interface.call.call_args.args[2].value() == 0
+    assert _arguments(transport.bus.call.call_args.args[0])[1].value() == 0
 
 
 def test_flush_pending_after_recovery(transport: Mock) -> None:
@@ -159,19 +219,19 @@ def test_flush_pending_after_recovery(transport: Mock) -> None:
     assert notifications.flush_pending() == 2
     assert notifications.pending_count() == 0
     assert notifications.last_delivery_ok() is True
-    calls = transport.interface.call.call_args_list
-    assert [call.args[4:6] for call in calls] == [
+    calls = transport.bus.call.call_args_list
+    assert [tuple(_arguments(call.args[0])[3:5]) for call in calls] == [
         ("Запись остановлена", "Пропали все указатели записи, поэтому запись остановлена."),
         (
             "Горячая клавиша не захвачена",
             "Другая программа уже использует это сочетание. Выберите другое в настройках.",
         ),
     ]
-    assert [call.args[7]["urgency"].value() for call in calls] == [b"\x02", b"\x01"]
-    assert [call.args[2].value() for call in calls] == [0, 41]
+    assert [_arguments(call.args[0])[6]["urgency"].value() for call in calls] == [b"\x02", b"\x01"]
+    assert [_arguments(call.args[0])[1].value() for call in calls] == [0, 41]
     assert notifications.flush_pending() == 0
     assert notifications.last_delivery_ok() is True
-    assert transport.interface.call.call_count == 2
+    assert transport.bus.call.call_count == 2
 
 
 def test_failed_retries_preserve_unique_pending(transport: Mock) -> None:
@@ -193,9 +253,47 @@ def test_pending_queue_limit(transport: Mock) -> None:
     transport.bus.isConnected.return_value = True
     assert notifications.flush_pending() == 8
     assert notifications.pending_count() == 0
-    assert [call.args[4] for call in transport.interface.call.call_args_list] == [
+    assert [_arguments(call.args[0])[3] for call in transport.bus.call.call_args_list] == [
         f"Тестовый заголовок {index}" for index in range(4, 12)
     ]
+
+
+def test_drop_pending_removes_all_matching_summaries_and_keeps_order(transport: Mock) -> None:
+    transport.bus.isConnected.return_value = False
+    notifications.notify("Первое")
+    notifications.notify_tray_unavailable()
+    notifications.notify("Второе")
+    notifications.notify("Значок не появился на панели", "Другое тело", urgency="critical")
+    notifications.notify_tray_unavailable()  # Дубликат не создаёт третью запись.
+    notifications.notify("Значок не появился на панели снова")
+    assert notifications.pending_count() == 5
+    assert notifications.drop_pending("Значок не появился на панели") == 2
+    assert notifications.drop_pending("Значок не появился на панели") == 0
+    assert notifications.pending_count() == 3
+    transport.bus.call.assert_not_called()
+    assert notifications.last_delivery_ok() is False
+    transport.bus.isConnected.return_value = True
+    assert notifications.flush_pending() == 3
+    assert [_arguments(call.args[0])[3] for call in transport.bus.call.call_args_list] == [
+        "Первое",
+        "Второе",
+        "Значок не появился на панели снова",
+    ]
+    assert notifications.drop_pending("Первое") == 0
+    assert notifications.last_delivery_ok() is True
+
+
+def test_drop_pending_keeps_delivery_id_and_queue_limit(transport: Mock) -> None:
+    notifications.notify("Доставлено")
+    assert notifications.drop_pending("Доставлено") == 0
+    notifications.notify("Повтор")
+    assert _arguments(transport.bus.call.call_args.args[0])[1].value() == 41
+    transport.bus.isConnected.return_value = False
+    notifications.notify_tray_unavailable()
+    assert notifications.drop_pending("Значок не появился на панели") == 1
+    for index in range(12):
+        notifications.notify(f"Отложенное {index}")
+    assert notifications.pending_count() == 8
 
 
 def test_successful_repeat_removes_pending(transport: Mock) -> None:
@@ -206,7 +304,7 @@ def test_successful_repeat_removes_pending(transport: Mock) -> None:
     assert notifications.last_delivery_ok() is True
     assert notifications.pending_count() == 0
     assert notifications.flush_pending() == 0
-    transport.interface.call.assert_called_once()
+    transport.bus.call.assert_called_once()
 
 
 def test_flush_pending_partial_delivery(transport: Mock) -> None:
@@ -215,7 +313,7 @@ def test_flush_pending_partial_delivery(transport: Mock) -> None:
     notifications.notify_tray_unavailable()
     notifications.notify_hotkey_not_grabbed()
     transport.bus.isConnected.return_value = True
-    transport.interface.call.side_effect = [
+    transport.bus.call.side_effect = [
         RuntimeError("Сбой службы"),
         transport.reply,
         RuntimeError("Сбой службы"),
@@ -223,12 +321,12 @@ def test_flush_pending_partial_delivery(transport: Mock) -> None:
     assert notifications.flush_pending() == 1
     assert notifications.pending_count() == 2
     assert notifications.last_delivery_ok() is False
-    transport.interface.call.side_effect = None
-    transport.interface.call.reset_mock()
+    transport.bus.call.side_effect = None
+    transport.bus.call.reset_mock()
     assert notifications.flush_pending() == 2
     assert notifications.pending_count() == 0
     assert notifications.last_delivery_ok() is True
-    assert [call.args[4] for call in transport.interface.call.call_args_list] == [
+    assert [_arguments(call.args[0])[3] for call in transport.bus.call.call_args_list] == [
         "Запись остановлена",
         "Горячая клавиша не захвачена",
     ]
@@ -250,6 +348,13 @@ def test_flush_pending_partial_delivery(transport: Mock) -> None:
             b"\x01",
         ),
         (
+            notifications.notify_tray_depends_on_panel,
+            "Виден только значок на панели",
+            "Если панель перезапустится, показывать запись будет нечем. "
+            "Включите указатель записи в настройках.",
+            b"\x01",
+        ),
+        (
             notifications.notify_indicators_lost,
             "Запись остановлена",
             "Пропали все указатели записи, поэтому запись остановлена.",
@@ -261,9 +366,9 @@ def test_fixed_messages(
     transport: Mock, wrapper: Callable[[], None], summary: str, body: str, priority: bytes
 ) -> None:
     wrapper()
-    args = transport.interface.call.call_args.args
-    assert args[4:6] == (summary, body)
-    assert args[7]["urgency"].value() == priority
+    args = _arguments(transport.bus.call.call_args.args[0])
+    assert args[3:5] == [summary, body]
+    assert args[6]["urgency"].value() == priority
 
 
 def _qualified_name(node: ast.AST, aliases: dict[str, str]) -> str:
@@ -390,6 +495,7 @@ def test_project_notifications_contain_no_dictation() -> None:
         "show = notify\nshow(text)",
         "show = notify\nother = show\nother(text)",
         "n.notify_indicators_lost(text)",
+        "n.notify_tray_depends_on_panel(text)",
     ],
 )
 def test_ast_rejects_dynamic_text(source: str) -> None:
@@ -402,6 +508,7 @@ def test_ast_rejects_dynamic_text(source: str) -> None:
         'notify("Запись")',
         'from astra_voice.ui.notify import notify as show\nshow("Запись")',
         'notify_indicators_lost("Запись")',
+        'notify_tray_depends_on_panel("Запись")',
         "from astra_voice.ui.notify import notify_tray_unavailable as show\nshow(body=text)",
     ],
 )
@@ -421,9 +528,10 @@ def test_ast_accepts_fixed_text(source: str) -> None:
     assert not _notification_violations(source, implementation=True)
 
 
-def test_ast_accepts_wrapper_alias() -> None:
+@pytest.mark.parametrize("wrapper", ["notify_indicators_lost", "notify_tray_depends_on_panel"])
+def test_ast_accepts_wrapper_alias(wrapper: str) -> None:
     source = (
-        "from astra_voice.ui.notify import notify_indicators_lost as stopped\n"
+        f"from astra_voice.ui.notify import {wrapper} as stopped\n"
         "def on_failure():\n    stopped()\n"
     )
     assert not _notification_violations(source)

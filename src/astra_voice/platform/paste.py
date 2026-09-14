@@ -59,6 +59,7 @@ _CTRL_SHIFT_V_CLASSES = {
 _SHIFT_INSERT_CLASSES = {"xterm", "uxterm", "rxvt", "urxvt"}
 _running = False
 _last_clipboard_snapshot: dict[str, bytes] | None = None
+_pending: _PendingRestore | None = None
 
 
 class PasteMode(StrEnum):
@@ -310,13 +311,72 @@ def _restore(
     return PasteRestore.RESTORED
 
 
+@dataclass
+class _PendingRestore:
+    saved: dict[str, bytes]
+    saved_is_ours: bool
+    primary: dict[str, bytes] | None = None
+    primary_touched: bool = False
+    consumed: bool = False
+    restore: PasteRestore = PasteRestore.SKIPPED_NOT_OWNER
+    primary_restore: PasteRestore | None = None
+
+
+def has_pending() -> bool:
+    """Есть ли снимок AUTO, ожидающий восстановления.
+
+    Ожидание активно и до определения исхода: наш текст уже опубликован,
+    но XTest ещё не отработал. При исходе не pasted ожидание снимается.
+    CLIPBOARD_ONLY не снимает снимок и не создаёт ожидание.
+    """
+    return _pending is not None
+
+
+def restore_pending() -> bool:
+    """Однократно вернуть снимок AUTO при завершении в GUI-потоке.
+
+    До определения исхода (текст опубликован, XTest ещё не отработал)
+    восстановление тоже разрешено. Правила владения и секрета — штатные.
+    Без пауз, циклов событий и обращений к X11Display; ошибки, отсутствие
+    QApplication или чужой поток дают False без содержимого буфера в логе.
+    """
+    global _pending
+    try:
+        pending = _pending
+        if pending is None:
+            return False
+        cb = _Clipboard()
+        _pending = None
+        pending.consumed = True
+        try:
+            pending.restore = _restore(
+                cb, pending.saved, False, saved_is_ours=pending.saved_is_ours
+            )
+        finally:
+            if pending.primary_touched and pending.primary is not None:
+                pending.primary_restore = _restore(cb, pending.primary, True)
+        return any(
+            result
+            in (
+                PasteRestore.RESTORED,
+                PasteRestore.CLEARED_SECRET,
+                PasteRestore.CLEARED_EMPTY,
+            )
+            for result in (pending.restore, pending.primary_restore)
+        )
+    except Exception:
+        log.debug("не удалось аварийно восстановить буфер обмена")
+        return False
+
+
 class PasteFlow:
     """Цепочка S4 с переопределяемыми задержками для тестов.
 
     run возвращает окончательный исход через локальные циклы событий Qt.
     Повторный вход возвращает busy до завершения работы с обоими буферами.
-    CLIPBOARD возвращается только после успешного XTest; иначе фраза остаётся
-    для ручной вставки. PRIMARY всегда возвращается по правилам владения/секрета.
+    Штатно CLIPBOARD возвращается только после успешного XTest; иначе фраза
+    остаётся для ручной вставки. restore_pending позволяет вернуть его раньше
+    при завершении. PRIMARY возвращается по правилам владения/секрета.
     Перед паузой пробуем XGrabKeyboard на корне и сразу снимаем захват:
     XSetInputFocus не вызывается, XGetInputFocus по-прежнему указывает на цель;
     возможны FocusOut/FocusIn с NotifyGrab/NotifyUngrab. Принят остаточный риск
@@ -333,8 +393,9 @@ class PasteFlow:
 
     def run(self, text: str, target_window: int | None, mode: PasteMode) -> PasteOutcome:
         """Вернуть исход без исключений и закрыть собственное X11-соединение."""
-        global _running
+        global _running, _pending
         if _running:
+            # BUSY не создаёт снимок и не отменяет ожидание внешней цепочки.
             return PasteOutcome(
                 PasteOutcomeKind.BUSY, PasteMethod.NONE, PasteRestore.KEPT_OURS, None, 0, 0, 0.0
             )
@@ -359,6 +420,7 @@ class PasteFlow:
                 0.0,
             )
         finally:
+            _pending = None
             try:
                 if x is not None:
                     x.close()
@@ -375,12 +437,14 @@ class PasteFlow:
         cb: _Clipboard,
         x: X11Display | None,
     ) -> PasteOutcome:
+        global _pending
         wm_class = x.wm_class(target_window) if x is not None and target_window else None
         planned = method_for_wm_class(wm_class) if x is not None else PasteMethod.NONE
-        saved = cb.snapshot(False)
+        saved = cb.snapshot(False) if mode == PasteMode.AUTO else None
         # Владение проверяется до новой публикации: один hint не доказывает авторство.
-        saved_is_ours = saved == _last_clipboard_snapshot and cb.owns(False)
+        saved_is_ours = saved is not None and saved == _last_clipboard_snapshot and cb.owns(False)
         primary = cb.snapshot(True) if planned == PasteMethod.SHIFT_INSERT else None
+        pending = _PendingRestore(saved, saved_is_ours, primary) if saved is not None else None
         normalized = normalize(text)
         out = {"text/plain": normalized.encode("utf-8", errors="replace"), KDE_HINT: b"secret"}
         # Ручной режим не открывает X даже косвенно через определение сеанса.
@@ -394,18 +458,23 @@ class PasteFlow:
         primary_touched = False
         started = time.monotonic()
         try:
+            _pending = pending
             _publish(cb, out, False)
             kind = PasteOutcomeKind.CLIPBOARD_ONLY
             restore = PasteRestore.KEPT_OURS
             if primary is not None:
                 primary_touched = True
+                if pending is not None:
+                    pending.primary_touched = True
                 cb.put(out, True)
             keyboard_available = False
             if x is not None and x.grab_keyboard():
                 x.ungrab_keyboard()
                 keyboard_available = x.keyboard_grab_deadline is None
             _wait_ms(self.delay_before_ms)
-            if x is not None:
+            if pending is not None and pending.consumed:
+                kind = PasteOutcomeKind.WINDOW_CHANGED
+            elif x is not None:
                 if not keyboard_available or not _focus_matches(x, target_window, wm_class):
                     kind = PasteOutcomeKind.WINDOW_CHANGED
                 else:
@@ -418,21 +487,32 @@ class PasteFlow:
                         kind, method = PasteOutcomeKind.PASTED, planned
                     else:
                         kind = PasteOutcomeKind.WINDOW_CHANGED
+            if kind != PasteOutcomeKind.PASTED:
+                _pending = None
             _wait_ms(self.delay_after_ms)
         except Exception:
             # После публикации оставляем фразу для ручной вставки. Если XTest уже
             # прошёл успешно, сохраняем PASTED и штатно восстанавливаем CLIPBOARD.
             pass
         finally:
+            _pending = None
             try:
-                if kind == PasteOutcomeKind.PASTED:
+                if pending is not None and pending.consumed:
+                    restore = pending.restore
+                    primary_restore = pending.primary_restore
+                elif kind == PasteOutcomeKind.PASTED and saved is not None:
                     restore = _restore(cb, saved, False, saved_is_ours=saved_is_ours)
             except Exception:
                 kind = PasteOutcomeKind.FAILED
                 restore = PasteRestore.FAILED
             finally:
                 try:
-                    if primary_touched and primary is not None:
+                    if (
+                        primary_touched
+                        and primary is not None
+                        and pending is not None
+                        and not pending.consumed
+                    ):
                         primary_restore = _restore(cb, primary, True)
                 except Exception:
                     kind = PasteOutcomeKind.FAILED

@@ -15,6 +15,7 @@ import signal
 import sys
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -45,8 +46,8 @@ QT_EXPECTED_MESSAGES = (
 )
 _qt_message_handler = None  # ссылку держим сами: Qt хранит только указатель
 
-# Трей появился в M4: закрытие окна прячет его, процесс продолжает жить в трее
-# (хоткей и диктовка остаются доступны).
+# При доступном трее закрытие окна прячет его, процесс продолжает жить в трее
+# (хоткей и диктовка остаются доступны). Без трея закрытие завершает процесс.
 CLOSE_TO_TRAY = True
 
 
@@ -468,7 +469,9 @@ def _show(target: Any, timestamp: int = 0) -> None:
         root.activateWindow()
 
 
-def _wire_close(app: Any, shell: Any) -> Any | None:
+def _wire_close(
+    app: Any, shell: Any, is_tray_ready: Callable[[], bool] | None = None
+) -> Any | None:
     """Закрытие прячет окно в трей либо завершает процесс (см. ``CLOSE_TO_TRAY``).
 
     ``quitOnLastWindowClosed`` считает только окна-виджеты, поэтому закрытие
@@ -486,10 +489,17 @@ def _wire_close(app: Any, shell: Any) -> Any | None:
         def eventFilter(self, obj: Any, event: Any) -> bool:  # noqa: N802 — метод Qt
             if event.type() == QEvent.Close:
                 if CLOSE_TO_TRAY:
-                    event.ignore()
-                    root.hide()
-                    return True
-                log.info("окно закрыто — завершаю процесс (CLOSE_TO_TRAY=False)")
+                    try:
+                        tray_ready = is_tray_ready is not None and is_tray_ready()
+                    except Exception:  # noqa: BLE001 — ошибка проверки не должна скрыть окно
+                        tray_ready = False
+                    if tray_ready:
+                        event.ignore()
+                        root.hide()
+                        return True
+                    log.warning("Трей недоступен — закрытие окна завершает приложение")
+                else:
+                    log.info("Окно закрыто — завершаю приложение")
                 app.quit()
             return False
 
@@ -619,13 +629,16 @@ def main(argv: list[str] | None = None) -> int:
     if theme_bridge is not None:
         theme_bridge.source.start()  # слежение за темой — после загрузки QML
 
-    close_watcher = _wire_close(app, shell)  # держим ссылку на фильтр
+    runtime: DictationRuntime | None = None
+    # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
+    close_watcher = _wire_close(  # держим ссылку на фильтр
+        app, shell, is_tray_ready=lambda: runtime is not None and runtime.tray.registered
+    )
     server = ShowServer(lambda timestamp: _show(shell, timestamp))
     timer = _install_signal_handlers(app)
     if not args.hidden:
         _show(shell)
 
-    runtime: DictationRuntime | None = None
     try:
         try:
             from astra_voice.runtime import DictationRuntime

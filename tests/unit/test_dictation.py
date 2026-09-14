@@ -7,11 +7,13 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
 from astra_voice.core.dictation import (
     BUSY_RETRY_MS,
+    CANCEL_RESTART_MS,
     CANCEL_TIMEOUT_MS,
     PROCESSING_WATCHDOG_MS,
     RECOGNIZE_TIMEOUT_S,
@@ -19,13 +21,23 @@ from astra_voice.core.dictation import (
     DictationPhase,
     level_from_dbfs,
 )
-from astra_voice.platform.hotkey import HotkeyFsm, HotkeyMode, HotkeyState
+from astra_voice.platform.hotkey import (
+    GrabResult,
+    HotkeyBackend,
+    HotkeyEvent,
+    HotkeyFsm,
+    HotkeyManager,
+    HotkeyMode,
+    HotkeyState,
+    MappingEvent,
+)
 from astra_voice.platform.paste import (
     PasteMethod,
     PasteMode,
     PasteOutcome,
     PasteOutcomeKind,
     PasteRestore,
+    normalize,
 )
 from astra_voice.ui.pill import (
     ERROR_BUFFER_CLEARED,
@@ -107,7 +119,7 @@ class Timer:
 class Rig:
     """Все внешние эффекты наблюдаемы, время движется только явно."""
 
-    def __init__(self) -> None:
+    def __init__(self, hotkey_mode: HotkeyMode = HotkeyMode.PTT) -> None:
         self.trace: list[tuple[Any, ...]] = []
         self.now = 10.0
         self.worker_generation = 1
@@ -126,14 +138,22 @@ class Rig:
         self.during_send: Callable[[dict[str, Any]], None] | None = None
         self.timers: list[Timer] = []
         self.done = 0
+        self.cancels = 0
         self.recording = False
-        self.notifications: list[tuple[str, str]] = []
         self.pill = FakePill(self.trace)
         self.tray = FakeTray(self.trace)
         self.stats = FakeStats()
+        self.restart_worker = Mock()
+        self.backend = Mock(spec=HotkeyBackend)
+        self.backend.grab_combo.return_value = GrabResult("ok", keycode=65)
+        self.backend.grab_escape.return_value = GrabResult("ok", keycode=9)
+        self.hotkey = HotkeyManager(self.backend, clock=lambda: self.now)
+        assert self.hotkey.grab("Ctrl+Shift+Space", hotkey_mode).ok
+        self.fsm: HotkeyFsm = self.hotkey.fsm
         self.core = DictationOrchestrator(
             send=self.send,
             generation=lambda: self.worker_generation,
+            restart_worker=self.restart_worker,
             pill=self.pill,
             tray=self.tray,
             paste=self.paste,
@@ -141,15 +161,16 @@ class Rig:
             schedule=self.schedule,
             cancel_timer=self.cancel_timer,
             hotkey_done=self.hotkey_done,
+            hotkey_cancel=self.hotkey_cancel,
+            hotkey_idle=lambda: self.hotkey.fsm.state is HotkeyState.IDLE,
             set_recording=self.set_recording,
-            notify=lambda summary, body: self.notifications.append((summary, body)),
             paste_mode=lambda: self.mode,
             record_params=lambda: self.params,
             clock=self.clock,
             stats=self.stats,
             log=logging.getLogger("test.dictation"),
         )
-        self.fsm = HotkeyFsm(HotkeyMode.PTT, self.core.on_hotkey_state)
+        self.hotkey.on_state = self.core.on_hotkey_state
 
     def clock(self) -> float:
         self.trace.append(("clock", self.now))
@@ -188,6 +209,10 @@ class Rig:
         self.trace.append(("hotkey_done",))
         self.fsm.done(self.now)
 
+    def hotkey_cancel(self) -> None:
+        self.cancels += 1
+        self.fsm.escape(self.now)
+
     def set_recording(self, value: bool) -> None:
         self.recording = value
         self.trace.append(("recording", value))
@@ -198,11 +223,23 @@ class Rig:
         return matching[0]
 
     def start(self) -> None:
-        self.core.on_hotkey_state(HotkeyState.RECORDING, "press")
+        self.fsm.press(self.now)
+
+    def combo_key(self, *, pressed: bool) -> None:
+        self.hotkey.handle_event(
+            HotkeyEvent("KeyPress" if pressed else "KeyRelease", 65, int(self.now * 1000)),
+            self.now,
+        )
+
+    def assert_hotkey_state(self, state: HotkeyState) -> None:
+        assert self.fsm.state == state
 
     def stop(self) -> None:
         self.now += 2.0
-        self.core.on_hotkey_state(HotkeyState.PROCESSING, "release")
+        if self.fsm.mode == HotkeyMode.TOGGLE:
+            self.fsm.press(self.now)
+        else:
+            self.fsm.release(self.now)
 
     @property
     def uid(self) -> str:
@@ -282,6 +319,18 @@ def test_full_ptt_cycle_and_timings(rig: Rig) -> None:
     rig.timer(STATE_DURATION_MS[PillState.DONE]).fire()
     assert rig.core.phase.value == "idle"
     assert rig.tray.state.value == "idle"
+
+
+def test_last_text_is_normalized_but_paste_receives_worker_text(rig: Rig) -> None:
+    """T-58 (docs/test-plan.md), У59: меню получает текст без CR/LF и C0/C1."""
+    text = f"{MARKER}\r\nстрока\rещё\nконец\x00\t\x1b\x1f\x7f\x85\x9f"
+    rig.start()
+    rig.stop()
+    rig.result(text)
+    assert rig.core.last_text == normalize(text)
+    assert rig.core.last_text is not None
+    assert all(ord(ch) >= 0x20 and not 0x7F <= ord(ch) <= 0x9F for ch in rig.core.last_text)
+    assert rig.pasted == [(text, 42, PasteMode.AUTO)]
 
 
 @pytest.mark.parametrize("first_result", ["ok", "empty", "cancelled"])
@@ -396,9 +445,12 @@ def test_cancel_blocks_all_later_results_and_retries(rig: Rig, phase: str) -> No
     rig.core.cancel("pill")
     assert rig.sent[-1][0] == {"type": "record.cancel", "utterance_id": rig.uid}
     assert not rig.recording and rig.tray.state == TrayState.IDLE
+    assert rig.fsm.state == HotkeyState.IDLE and rig.cancels == 1
+    rig.backend.ungrab_escape.assert_called_once_with()
     assert all(t.cancelled for t in old_timers)
     rig.core.cancel("tray")
     assert rig.commands().count("record.cancel") == 1
+    assert rig.cancels == 1
     rig.result()
     for timer in old_timers:
         timer.callback()
@@ -427,6 +479,35 @@ def test_cancel_idle_and_finishing_is_noop(rig: Rig) -> None:
     assert rig.sent == before
 
 
+@pytest.mark.parametrize("mode", list(HotkeyMode))
+@pytest.mark.parametrize("source", ["pill", "tray", "indicators"])
+def test_mouse_cancel_releases_escape_and_allows_next_dictation(
+    mode: HotkeyMode, source: str
+) -> None:
+    rig = Rig(mode)
+    rig.start()
+    first_uid = rig.uid
+    assert rig.fsm.state.value == "recording" and rig.recording
+    rig.backend.grab_escape.assert_called_once_with()
+    if source == "indicators":
+        rig.core.on_indicators_lost()
+    else:
+        rig.core.cancel(source)
+    assert rig.fsm.state == HotkeyState.IDLE and rig.cancels == 1
+    rig.backend.ungrab_escape.assert_called_once_with()
+    assert rig.commands() == ["record.start", "record.cancel"]
+    rig.event("cancelled")
+    assert rig.pill.calls[-1] == (PillState.CANCELLED, None, None)
+    rig.fsm.release(rig.now + 1)
+    rig.now += 2
+    rig.start()
+    assert rig.commands().count("record.start") == 2
+    assert rig.uid != first_uid
+    assert rig.fsm.state.value == "recording" and rig.recording
+    assert rig.pill.calls[-1] == (PillState.LISTENING, None, None)
+    assert rig.backend.grab_escape.call_count == 2
+
+
 def test_escape_and_indicator_loss_use_cancel(rig: Rig) -> None:
     rig.fsm.press(rig.now)
     rig.fsm.escape(rig.now)
@@ -435,7 +516,7 @@ def test_escape_and_indicator_loss_use_cancel(rig: Rig) -> None:
     rig.start()
     rig.core.on_indicators_lost()
     assert rig.commands().count("record.cancel") == 2
-    assert not rig.notifications
+    assert rig.cancels == 2
 
 
 def test_cancel_timeout_and_synchronous_ack(rig: Rig) -> None:
@@ -444,6 +525,7 @@ def test_cancel_timeout_and_synchronous_ack(rig: Rig) -> None:
     rig.timer(CANCEL_TIMEOUT_MS).fire()
     assert rig.pill.calls[-1][0] == PillState.CANCELLED
     assert rig.core.phase == DictationPhase.FINISHING and rig.done == 1
+    rig.event("cancelled")
     rig.start()
 
     def ack(message: dict[str, Any]) -> None:
@@ -580,14 +662,30 @@ def test_generation_change_before_busy_retry_prevents_paste(rig: Rig) -> None:
     assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_RESTARTED, None)
 
 
-def test_processing_watchdog_releases_hotkey_without_empty_stat(rig: Rig) -> None:
+@pytest.mark.parametrize("send_result", ["ok", "error", "ack"])
+def test_processing_watchdog_releases_hotkey_without_empty_stat(
+    rig: Rig, send_result: str, caplog: pytest.LogCaptureFixture
+) -> None:
     rig.fsm.press(rig.now)
     rig.now += 1
     rig.fsm.release(rig.now)
+
+    def cancel_sent(message: dict[str, Any]) -> None:
+        assert message == {"type": "record.cancel", "utterance_id": rig.uid}
+        assert rig.pill.calls[-1][0] == PillState.PROCESSING
+        if send_result == "error":
+            raise RuntimeError(MARKER)
+        if send_result == "ack":
+            rig.event("cancelled")
+
+    rig.during_send = cancel_sent
     rig.timer(PROCESSING_WATCHDOG_MS).fire()
+    assert rig.commands() == ["record.start", "record.stop", "recognize", "record.cancel"]
     assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
     assert rig.fsm.state == HotkeyState.IDLE and rig.done == 1
+    rig.backend.ungrab_escape.assert_called_once_with()
     assert not rig.stats.events
+    assert MARKER not in caplog.text
     rig.result()
     assert not rig.pasted
 
@@ -618,29 +716,268 @@ def test_limit_stops_once_and_late_levels_do_not_replace_processing(rig: Rig) ->
     rig.now += 120
     rig.event("record.limit")
     assert [s for s, _, _ in rig.pill.calls][-2:] == [PillState.LIMIT, PillState.PROCESSING]
-    assert rig.commands() == ["record.start", "record.stop", "recognize"]
-    rig.core.on_hotkey_state(HotkeyState.PROCESSING, "limit")
+    assert rig.commands() == ["record.start", "recognize"]
+    rig.fsm.tick(rig.now)
     rig.event("record.limit")
     rig.event("level", peak_dbfs=-10)
     rig.event("silent")
-    assert len(rig.sent) == 3 and rig.pill.calls[-1][0] == PillState.PROCESSING
+    assert len(rig.sent) == 2 and rig.pill.calls[-1][0] == PillState.PROCESSING
     rig.result()
     assert rig.stats.events[-1]["audio_ms"] == 120000.0
 
 
+@pytest.mark.parametrize("mode", list(HotkeyMode))
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        "audio-no-device",
+        "audio-busy",
+        "audio-failed",
+        "worker-crashed",
+        "restart-limit",
+        "worker-start",
+        "timeout",
+        "cancelled",
+        "generation",
+        "newer-generation",
+        "record.limit",
+    ],
+)
+def test_recording_terminal_releases_escape_and_next_combo_starts(
+    mode: HotkeyMode, terminal: str
+) -> None:
+    """T-56: настоящий FSM должен освободить Escape и принять следующую комбинацию."""
+    rig = Rig(mode)
+    rig.combo_key(pressed=True)
+    first_uid = rig.uid
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    rig.backend.grab_escape.assert_called_once_with()
+
+    if terminal == "generation":
+        rig.worker_generation += 1
+        rig.event("audio.ready", generation=1)
+    elif terminal == "newer-generation":
+        rig.event("audio.ready", generation=2)
+    elif terminal == "record.limit":
+        rig.now += 120
+        rig.event("record.limit")
+        # Воркер опередил tick клавиш: FSM всё ещё RECORDING до результата.
+        rig.assert_hotkey_state(HotkeyState.RECORDING)
+        rig.result()
+        assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
+        assert rig.commands() == ["record.start", "recognize"]
+    elif terminal == "cancelled":
+        rig.event("cancelled")
+    else:
+        rig.event("error", code=terminal)
+
+    assert rig.core.phase.value == "finishing"
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    assert not rig.recording
+    rig.backend.ungrab_escape.assert_called_once_with()
+    assert "record.cancel" not in rig.commands()
+    rig.combo_key(pressed=False)
+    rig.now += 1
+    rig.combo_key(pressed=True)
+    assert rig.commands().count("record.start") == 2
+    assert rig.uid != first_uid
+    assert rig.core.phase == DictationPhase.RECORDING
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    assert rig.recording
+    assert rig.backend.grab_escape.call_count == 2
+
+
+@pytest.mark.parametrize("phase", ["recording", "processing", "pasting"])
+def test_press_while_cancel_ack_pending_resets_hotkey(rig: Rig, phase: str) -> None:
+    rig.start()
+    if phase != "recording":
+        rig.stop()
+    if phase == "pasting":
+        rig.outcomes.append(PasteOutcomeKind.BUSY)
+        rig.result()
+    assert rig.core.phase.value == phase
+    rig.core.cancel("tray")
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    rig.backend.ungrab_escape.reset_mock()
+
+    # Оркестратор ещё занят до cancelled, но FSM уже принимает новый press.
+    rig.start()
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    rig.backend.ungrab_escape.assert_called_once_with()
+    assert rig.commands().count("record.start") == 1
+    assert rig.commands().count("record.cancel") == 1
+    rig.event("cancelled")
+    rig.start()
+    assert rig.commands().count("record.start") == 2
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    assert rig.recording
+
+
+def test_short_ptt_tap_switches_to_toggle_without_cancelling(rig: Rig) -> None:
+    rig.combo_key(pressed=True)
+    rig.now += 0.1
+    rig.combo_key(pressed=False)
+    assert rig.fsm.mode == HotkeyMode.TOGGLE
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    assert rig.core.phase == DictationPhase.RECORDING and rig.recording
+    assert rig.commands() == ["record.start"]
+    assert rig.cancels == 0
+    rig.backend.ungrab_escape.assert_not_called()
+
+    rig.now += 1
+    rig.combo_key(pressed=True)
+    rig.assert_hotkey_state(HotkeyState.PROCESSING)
+    assert rig.commands() == ["record.start", "record.stop", "recognize"]
+    rig.result()
+    assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    assert rig.cancels == 0
+
+
+@pytest.mark.parametrize("mode", list(HotkeyMode))
+def test_mapping_regrab_during_recording_does_not_cancel(mode: HotkeyMode) -> None:
+    rig = Rig(mode)
+    rig.start()
+    rig.backend.poll_events.return_value = [
+        MappingEvent(
+            {"Ctrl+Shift+Space": GrabResult("ok", keycode=65)}, GrabResult("ok", keycode=9)
+        )
+    ]
+    rig.hotkey.process_pending()
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    assert rig.core.phase == DictationPhase.RECORDING and rig.recording
+    assert rig.commands() == ["record.start"]
+    assert rig.cancels == 0
+    rig.backend.ungrab_escape.assert_not_called()
+    rig.stop()
+    rig.result()
+    assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
+
+
+@pytest.mark.parametrize("terminal", ["error", "cancelled", "generation"])
+def test_queued_press_after_terminal_transition_is_discarded(
+    rig: Rig, terminal: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.start()
+    rig.stop()
+    caplog.set_level(logging.DEBUG, logger="test.dictation")
+
+    def reenter() -> None:
+        if terminal == "generation":
+            rig.event("audio.ready", generation=2)
+        else:
+            rig.event(terminal, code="worker-crashed", message=MARKER)
+        rig.fsm.escape(rig.now)
+        rig.start()
+        rig.assert_hotkey_state(HotkeyState.RECORDING)
+        assert rig.core.phase == DictationPhase.PASTING
+
+    rig.during_paste = reenter
+    rig.result()
+    assert rig.core.phase.value == "finishing"
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    assert rig.backend.ungrab_escape.call_count == 2
+    assert rig.commands().count("record.start") == 1
+    dropped = [r for r in caplog.records if "отложенные события" in r.message]
+    assert len(dropped) == 1 and dropped[0].levelno == logging.DEBUG
+    assert not dropped[0].args and MARKER not in caplog.text
+
+    rig.during_paste = None
+    rig.start()
+    assert rig.commands().count("record.start") == 2
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    assert rig.recording
+
+
+@pytest.mark.parametrize("kind", [PasteOutcomeKind.PASTED, PasteOutcomeKind.BUSY])
+def test_escape_and_press_during_paste_release_regrabbed_escape(
+    rig: Rig, kind: PasteOutcomeKind
+) -> None:
+    rig.start()
+    rig.stop()
+    rig.outcomes.append(kind)
+
+    def reenter() -> None:
+        rig.fsm.escape(rig.now)
+        rig.start()
+        rig.assert_hotkey_state(HotkeyState.RECORDING)
+
+    rig.during_paste = reenter
+    rig.result()
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    assert rig.backend.ungrab_escape.call_count == 2
+    assert rig.commands().count("record.start") == 1
+    if kind == PasteOutcomeKind.BUSY:
+        assert rig.commands().count("record.cancel") == 1
+        rig.event("cancelled")
+    else:
+        assert "record.cancel" not in rig.commands()
+        assert rig.cancels == 1
+        assert rig.pill.calls[-1] == (PillState.DONE, None, None)
+    assert rig.core.phase.value == "finishing"
+    rig.during_paste = None
+    rig.start()
+    assert rig.commands().count("record.start") == 2
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    assert rig.recording
+
+
+@pytest.mark.parametrize("response", ["result", "error"])
+def test_limit_recognizes_already_stopped_audio_and_releases_hotkey(
+    rig: Rig, response: str
+) -> None:
+    """T-59: воркер отвергает повторный stop; t_ms отсчитывается от record.limit."""
+    rig.start()
+    rig.now += 120
+
+    def worker(message: dict[str, Any]) -> None:
+        if message["type"] == "record.stop":
+            rig.event("error", code="bad-state")
+        elif message["type"] == "recognize":
+            rig.now += 0.375
+            rig.event(response, text=MARKER, code="timeout")
+
+    rig.during_send = worker
+    rig.event("record.limit")
+    assert rig.sent[1:] == [({"type": "recognize", "utterance_id": rig.uid}, RECOGNIZE_TIMEOUT_S)]
+    assert rig.core.phase.value == "finishing"
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    assert not rig.recording
+    rig.backend.ungrab_escape.assert_called_once_with()
+    if response == "result":
+        assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
+        assert rig.stats.events[-1]["t_ms"] == 375.0
+        assert rig.stats.events[-1]["audio_ms"] == 120000.0
+        assert rig.pill.calls[-1] == (PillState.DONE, None, None)
+        assert all(state != PillState.ERROR for state, _, _ in rig.pill.calls)
+    else:
+        assert not rig.pasted
+        assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
+    rig.during_send = None
+    rig.start()
+    assert rig.commands().count("record.start") == 2
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [PasteOutcomeKind.PASTED, PasteOutcomeKind.CLIPBOARD_ONLY, PasteOutcomeKind.WINDOW_CHANGED],
+)
 @pytest.mark.parametrize("nested", ["result", "error", "cancel", "escape"])
 def test_reentrant_delivery_is_deferred_and_cannot_overwrite_terminal_state(
-    rig: Rig, nested: str
+    rig: Rig, nested: str, kind: PasteOutcomeKind, caplog: pytest.LogCaptureFixture
 ) -> None:
     rig.start()
     rig.stop()
     before = list(rig.pill.calls)
+    caplog.set_level(logging.DEBUG, logger="test.dictation")
+    rig.outcomes.append(kind)
+    state = PillState.DONE if kind == PasteOutcomeKind.PASTED else PillState.CLIPBOARD_ONLY
 
     def reenter() -> None:
         if nested == "cancel":
             rig.core.cancel("tray")
         elif nested == "escape":
-            rig.core.on_hotkey_state(HotkeyState.IDLE, "escape-cancel")
+            rig.fsm.escape(rig.now)
         else:
             rig.event(nested, text=MARKER, code="worker-crashed")
         assert rig.pill.calls == before
@@ -652,16 +989,94 @@ def test_reentrant_delivery_is_deferred_and_cannot_overwrite_terminal_state(
     rig.result()
     assert len(rig.pasted) == 1
     if nested in ("cancel", "escape"):
-        assert rig.commands()[-1] == "record.cancel"
-        rig.timer(CANCEL_TIMEOUT_MS).fire()
-        assert rig.pill.calls[-1][0] == PillState.CANCELLED
+        assert rig.commands() == ["record.start", "record.stop", "recognize"]
+        assert rig.pill.calls[-1] == (state, None, None)
+        assert rig.tray.state == (
+            TrayState.DONE if kind == PasteOutcomeKind.PASTED else TrayState.IDLE
+        )
+        assert rig.core.last_text == MARKER and rig.tray.has_last_text
+        assert [e["result"] for e in rig.stats.events] == ["ok"]
+        assert rig.fsm.state == HotkeyState.IDLE and rig.cancels == 0
+        assert not any(t.delay == CANCEL_TIMEOUT_MS for t in rig.timers)
+        assert "поздняя отмена после доставки" in caplog.text
     elif nested == "error":
         assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_RESTARTED, None)
         assert rig.core.last_text is None
     else:
-        assert rig.pill.calls[-1][0] == PillState.DONE
+        assert rig.pill.calls[-1][0] == state
         assert len(rig.stats.events) == 1
     assert rig.core.phase == DictationPhase.FINISHING and rig.done == 1
+
+
+@pytest.mark.parametrize("kind", [PasteOutcomeKind.BUSY, PasteOutcomeKind.FAILED])
+def test_reentrant_cancel_without_delivery_still_cancels(rig: Rig, kind: PasteOutcomeKind) -> None:
+    rig.start()
+    rig.stop()
+    rig.outcomes.append(kind)
+    rig.during_paste = lambda: rig.core.cancel("tray")
+    rig.result()
+    assert rig.commands()[-1] == "record.cancel"
+    assert rig.fsm.state == HotkeyState.IDLE and rig.cancels == 1
+    rig.event("cancelled")
+    assert rig.pill.calls[-1] == (PillState.CANCELLED, None, None)
+    assert [e["result"] for e in rig.stats.events] == ["cancelled"]
+    assert rig.core.last_text is None and not rig.tray.has_last_text
+    assert len(rig.pasted) == 1
+
+
+@pytest.mark.parametrize("fields", [{}, {"text": 123}, {"text": [MARKER]}])
+def test_invalid_result_degrades_to_empty(
+    rig: Rig, fields: dict[str, object], caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.start()
+    rig.stop()
+    caplog.set_level(logging.DEBUG, logger="test.dictation")
+    rig.event("result", **fields)
+    assert rig.pill.calls[-1] == (PillState.EMPTY, None, None)
+    assert rig.fsm.state == HotkeyState.IDLE
+    assert not rig.pasted and rig.core.last_text is None
+    assert [e["result"] for e in rig.stats.events] == ["empty"]
+    assert "некорректное поле text" in caplog.text and MARKER not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "fields", [{}, {"peak_dbfs": MARKER}, {"peak_dbfs": "-30"}, {"peak_dbfs": True}]
+)
+def test_invalid_level_is_ignored(
+    rig: Rig, fields: dict[str, object], caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.start()
+    before = list(rig.trace)
+    caplog.set_level(logging.DEBUG, logger="test.dictation")
+    rig.event("level", **fields)
+    assert rig.trace == before
+    assert rig.fsm.state == HotkeyState.RECORDING and rig.recording
+    assert len(caplog.records) == 1 and caplog.records[0].levelno == logging.DEBUG
+    assert not caplog.records[0].args and MARKER not in caplog.text
+
+
+@pytest.mark.parametrize("failure", ["params", "send"])
+def test_start_failure_releases_hotkey_and_shows_error(
+    rig: Rig, failure: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
+        if failure == "params":
+            assert rig.core.phase == DictationPhase.IDLE
+        raise RuntimeError(MARKER)
+
+    monkeypatch.setattr(rig.core, "_record_params" if failure == "params" else "_send", fail)
+    rig.start()
+    assert rig.fsm.state == HotkeyState.IDLE
+    rig.backend.ungrab_escape.assert_called_once_with()
+    assert not rig.sent and not rig.recording
+    assert ("recording", True) not in rig.trace
+    assert rig.pill.calls == [(PillState.ERROR, ERROR_RECOGNITION_FAILED, None)]
+    assert rig.tray.state == TrayState.ERROR and not rig.stats.events
+    assert MARKER not in caplog.text
+    monkeypatch.undo()
+    rig.start()
+    assert rig.commands() == ["record.start"]
+    assert rig.fsm.state.value == HotkeyState.RECORDING.value and rig.recording
 
 
 def test_reentrant_queue_is_fifo_and_copies_event(
@@ -699,6 +1114,10 @@ def test_shutdown_cancels_all_timers_and_ignores_future_delivery(rig: Rig, phase
     pending = list(rig.timers)
     rig.core.shutdown()
     assert rig.pill.hidden and not rig.recording and rig.core.phase == DictationPhase.IDLE
+    assert rig.fsm.state == HotkeyState.IDLE
+    assert rig.cancels == int(phase in ("recording", "processing", "busy"))
+    if phase != "idle":
+        rig.backend.ungrab_escape.assert_called_once_with()
     assert all(t.cancelled for t in pending)
     if phase in ("recording", "processing", "busy"):
         assert rig.commands()[-1] == "record.cancel"
@@ -758,7 +1177,7 @@ def test_paste_exception_cannot_leak_text_or_leave_input_suspended(
 
 
 @pytest.mark.parametrize("kind", list(PasteOutcomeKind))
-def test_text_never_reaches_logs_indicators_notifications_or_stats(
+def test_text_never_reaches_logs_indicators_or_stats(
     rig: Rig, caplog: pytest.LogCaptureFixture, kind: PasteOutcomeKind
 ) -> None:
     caplog.set_level(logging.DEBUG)
@@ -775,7 +1194,6 @@ def test_text_never_reaches_logs_indicators_notifications_or_stats(
     assert MARKER not in caplog.text
     assert MARKER not in repr(rig.trace)
     assert MARKER not in repr(rig.pill.calls)
-    assert MARKER not in repr(rig.notifications)
     assert MARKER not in repr(rig.stats.events)
     assert MARKER not in repr(rig.sent)
 
@@ -795,3 +1213,94 @@ def test_text_never_reaches_logs_indicators_notifications_or_stats(
 )
 def test_level_scale(dbfs: float, expected: float) -> None:
     assert level_from_dbfs(dbfs) == expected
+
+
+def test_cancel_escalates_close_then_restart(rig: Rig) -> None:
+    rig.start()
+    rig.core.cancel("tray")
+    assert "audio.close" not in rig.commands()
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert rig.sent[-1][0] == {"type": "audio.close"}
+    assert rig.pill.calls[-1][0] == PillState.CANCELLED
+    rig.restart_worker.assert_not_called()
+    rig.timer(CANCEL_RESTART_MS).fire()
+    rig.restart_worker.assert_called_once_with()
+
+
+@pytest.mark.parametrize("late", [False, True])
+@pytest.mark.parametrize("tail_done", [False, True])
+def test_cancel_ack_cancels_escalations(rig: Rig, late: bool, tail_done: bool) -> None:
+    rig.start()
+    rig.core.cancel("tray")
+    if late:
+        rig.timer(CANCEL_TIMEOUT_MS).fire()
+        if tail_done:
+            rig.timer(STATE_DURATION_MS[PillState.CANCELLED]).fire()
+    pending = [t for t in rig.timers if not t.fired]
+    rig.event("cancelled")
+    for timer in pending:
+        assert timer.cancelled
+        timer.callback()
+    assert rig.commands().count("audio.close") == int(late)
+    rig.restart_worker.assert_not_called()
+    assert len(rig.stats.events) == 1
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_shutdown_cancels_escalations(rig: Rig, late: bool) -> None:
+    rig.start()
+    rig.core.cancel("tray")
+    if late:
+        rig.timer(CANCEL_TIMEOUT_MS).fire()
+    pending = [t for t in rig.timers if not t.fired]
+    rig.core.shutdown()
+    before = list(rig.sent)
+    for timer in pending:
+        assert timer.cancelled
+        timer.callback()
+    assert rig.sent == before
+    rig.restart_worker.assert_not_called()
+
+
+def test_unconfirmed_cancel_blocks_new_recording_without_losing_restart(rig: Rig) -> None:
+    rig.start()
+    rig.core.cancel("tray")
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    rig.start()
+    assert rig.commands().count("record.start") == 1
+    rig.timer(STATE_DURATION_MS[PillState.CANCELLED]).fire()
+    rig.start()
+    assert rig.commands().count("record.start") == 1
+    rig.timer(CANCEL_RESTART_MS).fire()
+    rig.restart_worker.assert_called_once_with()
+    rig.start()
+    assert rig.commands().count("record.start") == 2
+
+
+def test_synchronous_cancel_ack_on_audio_close_cancels_restart(rig: Rig) -> None:
+    rig.start()
+    rig.core.cancel("tray")
+
+    def ack(message: dict[str, Any]) -> None:
+        if message["type"] == "audio.close":
+            rig.event("cancelled")
+
+    rig.during_send = ack
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    restart = next(t for t in rig.timers if t.delay == CANCEL_RESTART_MS)
+    assert restart.cancelled
+    restart.callback()
+    rig.restart_worker.assert_not_called()
+
+
+def test_audio_close_failure_still_restarts_worker(rig: Rig) -> None:
+    rig.start()
+    rig.core.cancel("tray")
+
+    def fail(message: dict[str, Any]) -> None:
+        raise OSError(MARKER)
+
+    rig.during_send = fail
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    rig.timer(CANCEL_RESTART_MS).fire()
+    rig.restart_worker.assert_called_once_with()

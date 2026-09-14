@@ -8,15 +8,22 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from time import monotonic
 
 from PyQt5.QtCore import QMetaType, QVariant
-from PyQt5.QtDBus import QDBusConnection, QDBusInterface, QDBusMessage
+from PyQt5.QtDBus import QDBus, QDBusConnection, QDBusMessage
+
+# Совместимость с подменой старого транспорта в тестах соседней зоны.
+# Интерфейс не создаём: его конструктор синхронно запрашивает Introspect.
+from PyQt5.QtDBus import QDBusInterface as QDBusInterface
 
 __all__ = [
+    "drop_pending",
     "flush_pending",
     "last_delivery_ok",
     "notify",
     "notify_hotkey_not_grabbed",
+    "notify_tray_depends_on_panel",
     "notify_tray_unavailable",
     "notify_indicators_lost",
     "pending_count",
@@ -44,6 +51,14 @@ def pending_count() -> int:
     return len(_pending)
 
 
+def drop_pending(summary: str) -> int:
+    """Удалить все отложенные уведомления с этим заголовком; вернуть их число."""
+    messages = [message for message in _pending if message[0] == summary]
+    for message in messages:
+        _pending.remove(message)
+    return len(messages)
+
+
 def last_delivery_ok() -> bool:
     """Вернуть результат последней попытки доставки; до первой попытки — False."""
     return _last_delivery_ok
@@ -61,21 +76,19 @@ def flush_pending() -> int:
 
 def _send(summary: str, body: str, urgency: int, replaces_id: int) -> int:
     """Отправить сообщение через QtDBus; точка подмены транспорта в тестах."""
+    # Из общего бюджета notify() 500 мс оставляем 50 мс на обработку результата.
+    deadline = monotonic() + 0.450
     bus = QDBusConnection.sessionBus()
     if not bus.isConnected():
         _logger.debug("Шина уведомлений недоступна")
         return 0
 
-    interface = QDBusInterface(
+    message = QDBusMessage.createMethodCall(
         "org.freedesktop.Notifications",
         "/org/freedesktop/Notifications",
         "org.freedesktop.Notifications",
-        bus,
+        "Notify",
     )
-    if not interface.isValid():
-        _logger.debug("Служба уведомлений недоступна")
-        return 0
-    interface.setTimeout(1000)
 
     # Python int и пустой list сами по себе дают неверные типы D-Bus.
     replacement = QVariant(replaces_id)
@@ -84,17 +97,22 @@ def _send(summary: str, body: str, urgency: int, replaces_id: int) -> int:
     actions.convert(QVariant.StringList)
     priority = QVariant(urgency)
     priority.convert(QMetaType.UChar)
-    reply = interface.call(
-        "Notify",
-        "Astra Voice",
-        replacement,
-        "astravoice",
-        summary,
-        body,
-        actions,
-        {"urgency": priority},
-        -1,
+    message.setArguments(
+        [
+            "Astra Voice",
+            replacement,
+            "astravoice",
+            summary,
+            body,
+            actions,
+            {"urgency": priority},
+            -1,
+        ]
     )
+    timeout_ms = int((deadline - monotonic()) * 1000)
+    if timeout_ms <= 0:
+        return 0
+    reply = bus.call(message, QDBus.Block, timeout_ms)
     if reply.type() != QDBusMessage.ReplyMessage:
         _logger.debug("Служба уведомлений вернула ошибку")
         return 0
@@ -149,6 +167,15 @@ def notify_tray_unavailable() -> None:
     notify(
         "Значок не появился на панели",
         "Программа работает, но значка на панели нет. Показ можно проверить в настройках.",
+    )
+
+
+def notify_tray_depends_on_panel() -> None:
+    """Предупредить, что без пилюли запись показывает только панель рабочего стола."""
+    notify(
+        "Виден только значок на панели",
+        "Если панель перезапустится, показывать запись будет нечем. "
+        "Включите указатель записи в настройках.",
     )
 
 

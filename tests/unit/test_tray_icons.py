@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import os
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
@@ -14,6 +14,9 @@ from astra_voice.core import paths
 from astra_voice.core.theme import ThemeSource
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui.tray_icons import TrayIconProvider, TrayState, _fly_svg
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from helpers.qt_app import get_qapplication  # noqa: E402
 
 if TYPE_CHECKING:
     from PyQt5.QtWidgets import QApplication
@@ -44,12 +47,7 @@ class PanelTheme(ThemeSource):
 
 @pytest.fixture(scope="module")
 def qapp() -> QApplication:
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt5.QtWidgets import QApplication
-
-    app = QApplication.instance() or QApplication([])
-    assert isinstance(app, QApplication)
-    return app
+    return get_qapplication()
 
 
 @pytest.fixture

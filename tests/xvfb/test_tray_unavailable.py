@@ -8,13 +8,21 @@ pytest -m xvfb. Урок .patches/002: offscreen не изолирует сес�
 
 from __future__ import annotations
 
-import os
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from PyQt5.QtCore import QTimer
+from PyQt5.QtDBus import QDBusMessage, QDBusVariant
+
+from astra_voice.platform.session import SessionKind
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from helpers.qt_app import get_qapplication  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 
@@ -81,17 +89,12 @@ class Timer:
 
 @pytest.fixture(scope="module")
 def tray_app() -> Any:
-    pytest.importorskip("PyQt5.QtWidgets")
-    from PyQt5.QtWidgets import QApplication
-
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    app = QApplication.instance() or QApplication([])
-    assert isinstance(app, QApplication)
-    return app
+    return get_qapplication()
 
 
+@pytest.mark.parametrize("kind", list(SessionKind))
 def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
-    tray_app: Any, monkeypatch: pytest.MonkeyPatch
+    tray_app: Any, monkeypatch: pytest.MonkeyPatch, kind: SessionKind
 ) -> None:
     from PyQt5 import sip
     from PyQt5.QtWidgets import QMenu
@@ -103,31 +106,84 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
 
     forbidden_tray = Mock(side_effect=AssertionError("реальный QSystemTrayIcon запрещён"))
     monkeypatch.setattr(module, "QSystemTrayIcon", forbidden_tray)
+    host_registered = False
+    plasma_alive = False
+
+    def query(
+        message: QDBusMessage,
+        success: Callable[[QDBusMessage], None],
+        error: Callable[..., None],
+        timeout: int,
+    ) -> bool:
+        assert timeout == 500
+        if message.member() == "Get":
+            assert message.arguments() == [
+                "org.kde.StatusNotifierWatcher",
+                "IsStatusNotifierHostRegistered",
+            ]
+            value: object = QDBusVariant(host_registered)
+        else:
+            assert message.member() == "GetNameOwner"
+            assert message.arguments() == ["org.kde.plasmashell"]
+            value = ":1.42" if plasma_alive else ""
+        # Настоящая очередь событий Qt доставляет ответ в типизированный слот.
+        QTimer.singleShot(0, lambda: success(message.createReply([value])))
+        return True
+
     connection = Mock(name="fake_dbus_connection")
+    connection.sessionBus.return_value.callWithCallback.side_effect = query
+    connection.sessionBus.return_value.call.side_effect = AssertionError(
+        "синхронный D-Bus запрещён"
+    )
+    monkeypatch.setattr(module, "detect", lambda: kind)
     monkeypatch.setattr(module, "QDBusConnection", connection)
-    watcher = Mock(serviceRegistered=Signal(), serviceUnregistered=Signal())
+    watcher = Mock(
+        serviceRegistered=Signal(), serviceUnregistered=Signal(), serviceOwnerChanged=Signal()
+    )
     watcher_factory = Mock(return_value=watcher)
     watcher_factory.WatchForRegistration = 1
     watcher_factory.WatchForUnregistration = 2
+    watcher_factory.WatchForOwnerChange = 3
     monkeypatch.setattr(module, "QDBusServiceWatcher", watcher_factory)
     clock = Clock()
     monkeypatch.setattr(module, "QTimer", clock.timer)
     monkeypatch.setattr(module, "monotonic", lambda: clock.now / 1000)
-    notification = Mock()
+    notification = Mock(wraps=notify.notify_tray_unavailable)
     monkeypatch.setattr(notify, "notify_tray_unavailable", notification)
     notify.reset_state()
     send = Mock(return_value=0)
     monkeypatch.setattr(notify, "_send", send)
     flush = Mock(wraps=notify.flush_pending)
     monkeypatch.setattr(notify, "flush_pending", flush)
+    drop = Mock(wraps=notify.drop_pending)
+    monkeypatch.setattr(notify, "drop_pending", drop)
+    deliveries = Mock()
+    deliveries.attach_mock(drop, "drop")
+    deliveries.attach_mock(flush, "flush")
+    monkeypatch.setattr(notify, "notify_tray_depends_on_panel", Mock())
     forbidden_bus = Mock(side_effect=AssertionError("реальная шина уведомлений запрещена"))
     forbidden_bus.sessionBus.side_effect = AssertionError("реальная шина уведомлений запрещена")
     monkeypatch.setattr(notify, "QDBusConnection", forbidden_bus)
     monkeypatch.setattr(notify, "QDBusInterface", forbidden_bus)
     icon = Mock(name="unavailable_tray")
-    icon.isSystemTrayAvailable.return_value = False
+    cached_available: bool | None = None
+    register_calls = 0
+
+    def qt_available() -> bool:
+        nonlocal cached_available
+        if cached_available is None:
+            cached_available = host_registered
+        return cached_available
+
+    def qt_show() -> None:
+        nonlocal register_calls
+        if icon.isSystemTrayAvailable():
+            register_calls += 1
+            icon.isVisible.return_value = True
+
+    icon.isSystemTrayAvailable.side_effect = qt_available
     icon.isVisible.return_value = False
-    icon.show.side_effect = lambda: setattr(icon.isVisible, "return_value", True)
+    icon.show.side_effect = qt_show
     icon.hide.side_effect = lambda: setattr(icon.isVisible, "return_value", False)
     factory = Mock(return_value=icon)
     provider = Mock(spec=TrayIconProvider)
@@ -145,13 +201,13 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
             "org.kde.StatusNotifierWatcher", connection.sessionBus.return_value, 3, tray
         )
         assert not tray.registered
-        assert icon.isSystemTrayAvailable.call_count == 1
+        tray_app.processEvents()
+        for _ in range(29):
+            clock.advance(1000)
+            tray_app.processEvents()
         clock.advance(999)
-        assert icon.isSystemTrayAvailable.call_count == 1
-        clock.advance(1)
-        assert icon.isSystemTrayAvailable.call_count == 2
-        clock.advance(28_999)
-        assert icon.isSystemTrayAvailable.call_count == 30
+        assert cached_available is None
+        icon.isSystemTrayAvailable.assert_not_called()
         assert not tray.registered
         notification.assert_not_called()
         tray.start()  # Повторный start не должен сдвигать дедлайн.
@@ -159,37 +215,57 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
         assert clock.now == 30_000
         notification.assert_called_once_with()
         assert not tray.registered
-        attempts = icon.isSystemTrayAvailable.call_count
+        attempts = connection.sessionBus.return_value.callWithCallback.call_count
         clock.advance(60_000)
-        assert icon.isSystemTrayAvailable.call_count == attempts
+        assert connection.sessionBus.return_value.callWithCallback.call_count == attempts
         icon.show.assert_not_called()
         flush.assert_not_called()
         notify.notify_indicators_lost()
-        assert notify.pending_count() == 1
+        assert notify.pending_count() == 2  # Баннер отсутствия трея и остановка записи.
         send.return_value = 1
-        icon.isSystemTrayAvailable.return_value = True
+        host_registered = True
         watcher.serviceRegistered.emit("org.kde.StatusNotifierWatcher")
+        assert not tray.registered  # Сигнал ещё не является ответом Get.
+        tray_app.processEvents()
+        if kind == SessionKind.KDE:
+            assert not tray.registered  # KDED есть, plasmashell пока нет.
+            plasma_alive = True
+            watcher.serviceRegistered.emit("org.kde.plasmashell")
         assert tray.registered
         assert icon.isVisible()
         icon.show.assert_called_once_with()
         flush.assert_called_once_with()
+        drop.assert_called_once_with("Значок не появился на панели")
+        assert [c[0] for c in deliveries.mock_calls] == ["drop", "flush"]
+        assert send.call_args.args[0] == "Запись остановлена"
+        assert cached_available is True
+        assert register_calls > 0
         assert notify.pending_count() == 0
         assert notify.last_delivery_ok()
         clock.advance(60_000)
         notification.assert_called_once_with()
 
         for restart in range(2):
-            watcher.serviceUnregistered.emit("org.kde.StatusNotifierWatcher")
+            # В KDE падает только plasmashell, KDED и его host=True остаются.
+            service = (
+                "org.kde.plasmashell"
+                if kind == SessionKind.KDE
+                else "org.kde.StatusNotifierWatcher"
+            )
+            if kind != SessionKind.KDE:
+                host_registered = False
+            watcher.serviceOwnerChanged.emit(service, ":1.42", "")
             assert tray.registered is False
             assert not icon.isVisible()
-            icon.isSystemTrayAvailable.return_value = False
             clock.advance(30_000)
+            tray_app.processEvents()
             notification.assert_called_once_with()
-            icon.isSystemTrayAvailable.return_value = True
-            watcher.serviceRegistered.emit("org.kde.StatusNotifierWatcher")
+            host_registered = True
+            watcher.serviceOwnerChanged.emit(service, "", ":1.43")
+            tray_app.processEvents()
             assert tray.registered
             assert icon.isVisible()
-            assert icon.show.call_count == restart + 2
+            assert register_calls == restart + 2
             assert flush.call_count == restart + 2
             tray.set_state(TrayState.LISTENING)
             assert menu.actions()[0].text() == "Слушаю…"
@@ -201,7 +277,7 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
         # Таблица О4: страж не должен принимать невидимый трей за индикатор.
         for failure in ("no_tray", "empty_icon", "service_gone"):
             if failure == "no_tray":
-                icon.isSystemTrayAvailable.return_value = False
+                icon.isVisible.return_value = False
             elif failure == "empty_icon":
                 provider.has_icon.return_value = False
             else:
@@ -210,15 +286,16 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
             assert registered is False, failure
             assert not icon.isVisible(), failure
             assert not indicator_visible(pill_visible=False, tray_registered=registered), failure
-            icon.isSystemTrayAvailable.return_value = True
             provider.has_icon.return_value = True
             clock.advance(1000)
+            tray_app.processEvents()
             assert tray.registered, failure
 
         # Баннер остаётся однократным и после нового цикла запуска.
-        icon.isSystemTrayAvailable.return_value = False
+        host_registered = False
         tray.stop()
         tray.start()
+        tray_app.processEvents()
         clock.advance(30_000)
         notification.assert_called_once_with()
         assert not tray.registered

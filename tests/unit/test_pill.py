@@ -12,18 +12,21 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib.util import resolve_name
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import Mock, call
 
 import pytest
-from PyQt5.QtCore import QEventLoop, QObject, QPoint, QRect, Qt, QUrl
+from PyQt5.QtCore import QCoreApplication, QEvent, QObject, QPoint, QRect, Qt, QUrl
 from PyQt5.QtGui import QRegion
 from PyQt5.QtQuick import QQuickView
 
 from astra_voice.core.paths import qml_dir
 from astra_voice.platform.session import SessionKind
+from astra_voice.ui import indicators, notify
 from astra_voice.ui import pill as module
 from astra_voice.ui.pill import (
+    CLIPBOARD_REASONS,
+    CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
     ERROR_MICROPHONE_UNAVAILABLE,
     ERROR_REASONS,
@@ -33,6 +36,9 @@ from astra_voice.ui.pill import (
     Pill,
     PillState,
 )
+
+if TYPE_CHECKING:
+    from astra_voice.ui.tray import Tray
 
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]
@@ -99,6 +105,9 @@ class Timer:
     def setInterval(self, value: int) -> None:
         self.interval = value
 
+    def isActive(self) -> bool:
+        return self.active
+
     def start(self) -> None:
         self.active = True
 
@@ -136,6 +145,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     monkeypatch.setattr(module, "QQuickView", forbidden_view)
     clock = Clock()
     monkeypatch.setattr(module, "QTimer", clock)
+    monkeypatch.setattr(module, "monotonic", lambda: clock.now / 1000)
     ewmh = Mock()
     errors = Mock(BadWindow=BadWindow)
     errors.CatchError.return_value.get_error.return_value = None
@@ -145,7 +155,12 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
         Mock(
             Xatom=Mock(CARDINAL=6, ATOM=4),
             X=Mock(
-                IsUnmapped=0, IsViewable=2, SubstructureRedirectMask=1, SubstructureNotifyMask=2
+                IsUnmapped=0,
+                IsViewable=2,
+                InputOnly=2,
+                Above=0,
+                SubstructureRedirectMask=1,
+                SubstructureNotifyMask=2,
             ),
             error=errors,
         ),
@@ -156,11 +171,14 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     x11.open.return_value = True
     x11.active_window.return_value = None
     x11.client_list_stacking.return_value = []
+    x11.window_geometry.return_value = (948, 1178, 224, 78)
     x11.d.intern_atom.side_effect = lambda name, **kwargs: name
     x11.d.get_selection_owner.return_value = 1
     x11.d.create_resource_object.return_value.get_attributes.return_value.map_state = 0
+    x11.d.create_resource_object.return_value.get_attributes.return_value.win_class = 1
     x11.d.create_resource_object.return_value.get_full_property.return_value = None
     x11.root.get_full_property.return_value = None
+    x11.root.query_tree.return_value.children = [Mock(id=42)]
     monkeypatch.setattr(module, "X11Display", Mock(return_value=x11))
     # Конструктор X11Display ленивый, как настоящий.
     x11.d = x11.root = None
@@ -175,7 +193,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     app.primaryScreen.return_value.availableGeometry.return_value = QRect(100, 200, 1920, 1080)
     app.primaryScreen.return_value.geometry.return_value = QRect(100, 200, 1920, 1200)
     monkeypatch.setattr(module, "QGuiApplication", app)
-    monkeypatch.setattr(module, "QCoreApplication", app)
+    monkeypatch.setattr(QCoreApplication, "processEvents", app.processEvents)
     properties: dict[str, Any] = {"pillWidth": 187.6, "pillHeight": 36}
     root = Mock(
         cancelClicked=Signal(),
@@ -187,11 +205,13 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     root.setProperty.side_effect = properties.__setitem__
     # QObject может уничтожаться при сборке циклов: его слот не должен обращаться
     # к уже разобранным внутренностям Mock.
+    event_filters: list[Pill] = []
     view = Mock(
         widthChanged=Signal(),
         heightChanged=Signal(),
         visibleChanged=Signal(),
         deleteLater=lambda: None,
+        installEventFilter=Mock(side_effect=event_filters.append),
     )
     view.winId.return_value = 42
     view.rootObject.return_value = root
@@ -207,6 +227,8 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
         conn.create_resource_object.return_value.get_attributes.return_value.map_state = 2
         if changed:
             view.visibleChanged.emit()
+            for event_filter in event_filters:
+                event_filter.eventFilter(view, QEvent(QEvent.Expose))
 
     def hide() -> None:
         changed = view.isVisible()
@@ -250,6 +272,7 @@ def test_exact_enum_and_durations() -> None:
 
 def test_window_preloaded_once_with_flags_and_shadow_space(harness: Harness) -> None:
     harness.factory.assert_called_once_with()
+    harness.view.installEventFilter.assert_called_once_with(harness.pill)
     harness.view.setSource.assert_called_once_with(QUrl.fromLocalFile(str(qml_dir() / "Pill.qml")))
     harness.view.setFlags.assert_called_once_with(
         Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus
@@ -313,41 +336,119 @@ def test_visibility_and_qml_state(harness: Harness, state: PillState) -> None:
     assert not harness.pill.visible
 
 
-def test_visibility_requires_current_exposure(harness: Harness) -> None:
+def test_visibility_tracks_exposure_events(harness: Harness) -> None:
     harness.pill.show_state(PillState.LISTENING)
     assert harness.pill.visible
     harness.view.isExposed.return_value = False
+    assert harness.pill.visible  # Чтение свойства не опрашивает backend.
+    assert not harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
     assert not harness.pill.visible
     harness.view.isExposed.return_value = True
+    assert not harness.pill.visible
+    assert not harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
     assert harness.pill.visible
     harness.view.isVisible.return_value = False
     assert not harness.pill.visible
 
 
 @pytest.mark.parametrize("exposes", [False, True])
-def test_first_visibility_check_processes_pending_exposure(harness: Harness, exposes: bool) -> None:
-    harness.pill.show_state(PillState.LISTENING)
-    harness.view.isExposed.return_value = False
-
-    def process_events(flags: object) -> None:
+def test_visible_waits_for_expose_without_processing_events(
+    harness: Harness, exposes: bool
+) -> None:
+    def show_without_event() -> None:
+        harness.view.isVisible.return_value = True
         harness.view.isExposed.return_value = exposes
+        harness.view.visibleChanged.emit()
 
-    harness.app.processEvents.side_effect = process_events
+    harness.view.show.side_effect = show_without_event
+    # Старый getter обработал бы вложенное hide() и изменил эпизод стража.
+    harness.app.processEvents.side_effect = lambda *args: harness.pill.hide()
+    harness.pill.show_state(PillState.LISTENING)
+    assert harness.pill.visible
+    harness.clock.advance(999)
+    assert harness.pill.visible
+    assert not harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
     assert harness.pill.visible == exposes
     assert harness.pill.visible == exposes
-    harness.app.processEvents.assert_called_once_with(QEventLoop.ExcludeUserInputEvents)
     harness.pill.hide()
+    assert not harness.pill.visible
     harness.pill.show_state(PillState.LISTENING)
+    assert harness.pill.visible
+    harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
     assert harness.pill.visible == exposes
-    assert harness.app.processEvents.call_count == 2
+    assert harness.app.processEvents.call_count == 0
 
 
-def test_visibility_rechecks_state_after_processing_events(harness: Harness) -> None:
+def test_exposure_wait_expires_despite_repeated_show_requests(harness: Harness) -> None:
+    def show_without_exposure() -> None:
+        harness.view.isVisible.return_value = True
+        harness.view.visibleChanged.emit()
+
+    harness.view.show.side_effect = show_without_exposure
     harness.pill.show_state(PillState.LISTENING)
-    harness.app.processEvents.side_effect = lambda flags: harness.pill.hide()
+    assert harness.pill.visible
+    for _ in range(9):
+        harness.clock.advance(100)
+        harness.pill.show_state(PillState.LISTENING)
+        harness.pill.set_forced(True)
+        assert harness.pill.visible
+    harness.clock.advance(99)
+    assert harness.pill.visible
+    harness.clock.advance(1)
     assert not harness.pill.visible
+    harness.pill.set_forced(True)
+    harness.clock.advance(1000)
     assert not harness.pill.visible
-    harness.app.processEvents.assert_called_once()
+    harness.view.hide.assert_called_once_with()  # Только начальный HIDDEN.
+    harness.view.isExposed.return_value = True
+    harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
+    assert harness.pill.visible
+    assert harness.app.processEvents.call_count == 0
+
+
+@pytest.mark.parametrize("hide", ["hidden", "disabled", "setting"])
+def test_explicit_hide_cancels_exposure_wait(harness: Harness, hide: str) -> None:
+    harness.view.show.side_effect = lambda: setattr(harness.view.isVisible, "return_value", True)
+    harness.pill.show_state(PillState.LISTENING)
+    assert harness.pill.visible
+    if hide == "setting":
+        harness.pill.set_enabled(False)
+    else:
+        harness.pill.show_state(PillState(hide))
+    assert not harness.pill.visible
+    harness.clock.advance(1000)
+    assert not harness.pill.visible
+
+
+@pytest.mark.parametrize("hide", ["event", "signal", "method"])
+def test_hide_clears_last_exposure(harness: Harness, hide: str) -> None:
+    harness.pill.show_state(PillState.LISTENING)
+    assert harness.pill.visible
+    if hide == "event":
+        assert not harness.pill.eventFilter(harness.view, QEvent(QEvent.Hide))
+    elif hide == "signal":
+        harness.view.hide()
+    else:
+        harness.pill.hide()
+    # Окно получает ограниченное ожидание новой экспозиции при перепоказе.
+    harness.view.show.side_effect = lambda: setattr(harness.view.isVisible, "return_value", True)
+    harness.view.isVisible.return_value = True
+    harness.pill.show_state(PillState.LISTENING)
+    harness.clock.advance(1000)
+    assert not harness.pill.visible
+    harness.view.isExposed.return_value = True
+    harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
+    assert harness.pill.visible
+
+
+def test_filter_ignores_other_objects_and_unrelated_events(harness: Harness) -> None:
+    harness.pill.show_state(PillState.LISTENING)
+    assert not harness.pill.eventFilter(QObject(), QEvent(QEvent.Hide))
+    assert not harness.pill.eventFilter(harness.view, QEvent(QEvent.UpdateRequest))
+    assert harness.pill.visible
+    harness.pill.hide()
+    assert not harness.pill.eventFilter(QObject(), QEvent(QEvent.Expose))
+    assert not harness.pill.visible
 
 
 @pytest.mark.parametrize("platform", ["xcb", "offscreen"])
@@ -358,6 +459,7 @@ def test_missing_exposure_support_never_claims_visibility(
     harness.app.platformName.return_value = platform
     harness.pill.show_state(PillState.LISTENING)
     harness.view.isExposed.side_effect = failure
+    harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
     assert not harness.pill.visible
     harness.pill.hide()
     assert not harness.pill.visible
@@ -503,31 +605,86 @@ def test_callbacks_and_none(harness: Harness, signal: str, attribute: str) -> No
 
 
 @pytest.mark.parametrize("state", list(PillState))
-def test_text_only_for_error_and_never_logged(
+def test_unregistered_text_never_reaches_qml_or_logs(
     harness: Harness, state: PillState, caplog: pytest.LogCaptureFixture
 ) -> None:
-    secret = "PRIVATE_SENTINEL_никакого_распознанного_текста"
+    marker = "DICTATION_MARKER_никакого_распознанного_текста"
     harness.pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_UNAVAILABLE)
     harness.root.setProperty.reset_mock()
     with caplog.at_level(logging.DEBUG, logger=module.__name__):
-        harness.pill.show_state(state, text=secret)
+        harness.pill.show_state(state, text=marker)
         expected = ERROR_RECOGNITION_FAILED if state is PillState.ERROR else ""
         assert harness.properties["label"] == expected
-        assert secret not in repr(harness.root.setProperty.call_args_list)
-        assert secret not in vars(harness.pill).values()
+        assert marker not in repr(harness.root.setProperty.call_args_list)
+        assert marker not in vars(harness.pill).values()
         harness.pill.set_enabled(False)
         harness.pill.set_forced(True)
         harness.clock.advance(5000)
         harness.pill.hide()
-    assert secret not in caplog.text
+    assert marker not in caplog.text
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert [record.message for record in warnings] == (
-        ["Пилюля: причина вне реестра"] if state is PillState.ERROR else []
+        ["Пилюля: причина вне реестра"]
+        if state in (PillState.ERROR, PillState.CLIPBOARD_ONLY)
+        else []
     )
     state_records = [r for r in caplog.records if r.msg == "Пилюля: %s"]
     assert all(record.args in [(s.name,) for s in PillState] for record in state_records)
     assert harness.properties["label"] == ""
-    assert secret not in vars(harness.pill).values()
+    assert marker not in vars(harness.pill).values()
+
+
+def test_registered_clipboard_reason_reaches_qml(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness.pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED)
+    assert harness.properties["label"] == CLIPBOARD_WINDOW_CHANGED
+    assert not caplog.records
+    harness.pill.set_enabled(False)
+    assert harness.properties["label"] == ""
+    harness.pill.set_forced(True)
+    assert harness.properties["label"] == CLIPBOARD_WINDOW_CHANGED
+    harness.clock.advance(EXPECTED_DURATIONS[PillState.CLIPBOARD_ONLY])
+    assert harness.properties["label"] == ""
+
+
+def test_clipboard_without_text_clears_previous_reason(harness: Harness) -> None:
+    harness.pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED)
+    harness.pill.show_state(PillState.CLIPBOARD_ONLY)
+    assert harness.properties["label"] == ""
+
+
+@pytest.mark.parametrize("reason", ["", ERROR_MICROPHONE_UNAVAILABLE, "DICTATION_MARKER_текст"])
+def test_unregistered_clipboard_reason_uses_fallback_and_is_not_logged(
+    harness: Harness, reason: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    harness.pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED)
+    harness.root.setProperty.reset_mock()
+    with caplog.at_level(logging.DEBUG, logger=module.__name__):
+        harness.pill.show_state(PillState.CLIPBOARD_ONLY, text=reason)
+    assert harness.properties["label"] == ""
+    if reason:
+        assert reason not in repr(harness.root.setProperty.call_args_list)
+        assert reason not in vars(harness.pill).values()
+        assert reason not in caplog.text
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert [record.message for record in warnings] == ["Пилюля: причина вне реестра"]
+
+
+def test_clipboard_registry_is_exact() -> None:
+    assert CLIPBOARD_REASONS == frozenset(("Окно сменилось — текст в буфере",))
+    assert CLIPBOARD_REASONS == frozenset((CLIPBOARD_WINDOW_CHANGED,))
+
+
+@pytest.mark.parametrize("state", [s for s in PillState if s is not PillState.CLIPBOARD_ONLY])
+def test_clipboard_reason_does_not_apply_to_other_states(
+    harness: Harness, state: PillState
+) -> None:
+    harness.pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED)
+    harness.pill.show_state(state, text=CLIPBOARD_WINDOW_CHANGED)
+    assert harness.properties["label"] == (
+        ERROR_RECOGNITION_FAILED if state is PillState.ERROR else ""
+    )
 
 
 def test_error_without_text_clears_previous_reason(harness: Harness) -> None:
@@ -659,6 +816,7 @@ def test_ewmh_uses_one_lazy_connection_before_map_and_after_show(harness: Harnes
     window.change_property.assert_any_call(
         "_NET_WM_WINDOW_TYPE", 4, 32, ["_NET_WM_WINDOW_TYPE_NOTIFICATION"]
     )
+    window.change_property.assert_any_call("_NET_WM_DESKTOP", 6, 32, [0xFFFFFFFF])
     window.change_property.assert_called_with("_NET_WM_USER_TIME", 6, 32, [0])
     writes = window.change_property.call_args_list
     assert any(c.args[3] == ["_NET_WM_STATE_ABOVE"] for c in writes)
@@ -668,7 +826,7 @@ def test_ewmh_uses_one_lazy_connection_before_map_and_after_show(harness: Harnes
     after_show, _ = harness.clock.timers
     after_show.fire()
     assert harness.pill.visible
-    assert harness.ewmh.ClientMessage.call_count == 2
+    assert harness.ewmh.ClientMessage.call_count == 4
     harness.x11.open.assert_called_once_with()
     harness.view.winId.assert_called_once_with()
     harness.factory.assert_called_once_with()
@@ -763,14 +921,21 @@ def test_reassert_only_when_visible_window_is_above(
     harness: Harness, stack: list[int], mapped: int, raises: bool
 ) -> None:
     harness.x11.client_list_stacking.return_value = stack
+    if stack == [91]:
+        harness.x11.root.query_tree.return_value.children = [Mock(id=91)]
     harness.pill.show_state(PillState.LISTENING)
     harness.x11.d.create_resource_object.return_value.get_attributes.return_value.map_state = mapped
     harness.ewmh.reset_mock()
     harness.clock.timers[1].fire()
-    assert harness.view.raise_.called == raises
-    assert harness.ewmh.ClientMessage.called == raises
+    harness.view.raise_.assert_not_called()
+    above = call(
+        window=42,
+        client_type="_NET_WM_STATE",
+        data=(32, [1, "_NET_WM_STATE_ABOVE", 0, 1, 0]),
+    )
+    assert (above in harness.ewmh.ClientMessage.call_args_list) == raises
     if raises:
-        harness.ewmh.ClientMessage.assert_called_once_with(
+        harness.ewmh.ClientMessage.assert_any_call(
             window=42,
             client_type="_NET_WM_STATE",
             data=(32, [1, "_NET_WM_STATE_ABOVE", 0, 1, 0]),
@@ -782,13 +947,22 @@ def test_reassert_only_when_visible_window_is_above(
 def test_destroyed_client_does_not_hide_next_visible_client(harness: Harness) -> None:
     harness.x11.client_list_stacking.return_value = [42, 92, 91]
     harness.pill.show_state(PillState.LISTENING)
-    harness.x11.d.create_resource_object.side_effect = [
-        BadWindow("BadWindow"),
-        Mock(get_attributes=Mock(return_value=Mock(map_state=2))),
-        Mock(get_attributes=Mock(return_value=Mock(map_state=2))),
-    ]
+    window: Mock = harness.x11.d.create_resource_object.return_value
+
+    def resource(kind: str, wid: int) -> Mock:
+        if wid == 91:
+            raise BadWindow("BadWindow")
+        return window
+
+    harness.x11.d.create_resource_object.side_effect = resource
     harness.clock.timers[1].fire()
-    harness.view.raise_.assert_called_once_with()
+    assert not harness.pill.visible
+    harness.ewmh.ClientMessage.assert_any_call(
+        window=42,
+        client_type="_NET_WM_STATE",
+        data=(32, [1, "_NET_WM_STATE_ABOVE", 0, 1, 0]),
+    )
+    harness.view.raise_.assert_not_called()
 
 
 def test_occluded_pill_still_reasserts_without_restarting_timers(harness: Harness) -> None:
@@ -796,12 +970,329 @@ def test_occluded_pill_still_reasserts_without_restarting_timers(harness: Harnes
     harness.clock.timers[0].fire()
     harness.x11.client_list_stacking.return_value = [42, 91]
     harness.view.isExposed.return_value = False
+    harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
+    harness.ewmh.reset_mock()
     for _ in range(10):
         harness.clock.timers[1].fire()
     assert not harness.pill.visible
-    assert harness.view.raise_.call_count == 10
+    harness.view.raise_.assert_not_called()
+    above = call(
+        window=42,
+        client_type="_NET_WM_STATE",
+        data=(32, [1, "_NET_WM_STATE_ABOVE", 0, 1, 0]),
+    )
+    assert harness.ewmh.ClientMessage.call_args_list.count(above) == 10
     assert not harness.clock.timers[0].active
     harness.x11.open.assert_called_once_with()
+
+
+@pytest.mark.parametrize("forced", [False, True])
+@pytest.mark.parametrize(
+    ("stack", "rival", "visible"),
+    [
+        ([42, 91], (948, 1178, 224, 78), False),
+        ([42, 91], (1100, 1200, 500, 100), False),
+        ([42, 91], (1172, 1178, 500, 100), True),  # Касание границ, без пересечения.
+        ([42, 91], (2000, 0, 1920, 1080), True),  # Другой монитор.
+        ([91, 42], (948, 1178, 224, 78), True),
+    ],
+)
+def test_visibility_checks_stacking_and_geometry(
+    harness: Harness,
+    forced: bool,
+    stack: list[int],
+    rival: tuple[int, int, int, int],
+    visible: bool,
+) -> None:
+    harness.x11.client_list_stacking.return_value = stack
+    harness.x11.window_geometry.side_effect = lambda wid: (
+        (948, 1178, 224, 78) if wid == 42 else rival
+    )
+    harness.pill.show_state(PillState.LISTENING)
+    harness.view.hide.reset_mock()
+    harness.pill.set_forced(forced)
+    harness.clock.timers[1].fire()
+    assert harness.pill.visible == visible
+    # Пилюля только сообщает видимость; состояние записи остаётся прежним.
+    assert harness.pill.state is PillState.LISTENING
+    harness.view.hide.assert_not_called()
+
+
+def test_visible_uses_tick_cache_without_x11_or_event_processing(harness: Harness) -> None:
+    harness.pill.show_state(PillState.LISTENING)
+    for stack, visible in [([91, 42], True), ([42, 91], False), ([91, 42], True)]:
+        previous = harness.pill.visible
+        harness.x11.client_list_stacking.return_value = stack
+        assert harness.pill.visible == previous
+        harness.clock.timers[1].fire()
+        requests = list(harness.x11.mock_calls)
+        exposures = harness.view.isExposed.call_count
+        for _ in range(100):
+            assert harness.pill.visible == visible
+        assert harness.x11.mock_calls == requests
+        assert harness.view.isExposed.call_count == exposures
+    assert harness.app.processEvents.call_count == 0
+    harness.x11.open.assert_called_once_with()
+
+
+def fake_fullscreen(harness: Harness) -> Mock:
+    active = Mock()
+    active.get_full_property.return_value = Mock(format=32, value=["_NET_WM_STATE_FULLSCREEN"])
+    pill_window = harness.x11.d.create_resource_object.return_value
+    harness.x11.d.create_resource_object.side_effect = lambda kind, wid: (
+        active if wid == 91 else pill_window
+    )
+    harness.x11.active_window.return_value = 91
+    harness.app.screenAt.return_value = None
+    return active
+
+
+@pytest.mark.parametrize("trigger", ["show", "tick"])
+def test_fullscreen_switches_flags_only_on_mode_changes(harness: Harness, trigger: str) -> None:
+    harness.pill.show_state(PillState.LISTENING, level=0.8)
+    harness.clock.timers[0].fire()
+    active = fake_fullscreen(harness)
+    base_flags = harness.view.setFlags.call_args.args[0]
+    harness.view.hide.reset_mock()
+    generation = harness.pill._timer_generation
+
+    def update() -> None:
+        if trigger == "show":
+            harness.pill.show_state(PillState.LISTENING)
+        else:
+            harness.clock.timers[1].fire()
+
+    update()
+    harness.view.setFlags.assert_called_with(base_flags | Qt.BypassWindowManagerHint)
+    assert harness.view.setFlags.call_count == 2
+    assert harness.view.hide.call_count == 1
+    assert harness.pill.state is PillState.LISTENING
+    assert harness.properties["levels"][-1] == 0.8
+    for _ in range(5):
+        update()
+    assert harness.view.setFlags.call_count == 2
+    assert harness.view.hide.call_count == 1
+    active.get_full_property.return_value = Mock(format=32, value=[])
+    update()
+    harness.view.setFlags.assert_called_with(base_flags)
+    assert harness.view.setFlags.call_count == 3
+    assert harness.view.hide.call_count == 2
+    for _ in range(5):
+        update()
+    assert harness.view.setFlags.call_count == 3
+    assert harness.view.hide.call_count == 2
+    if trigger == "tick":
+        assert harness.pill._timer_generation == generation
+    harness.factory.assert_called_once_with()
+    harness.view.setSource.assert_called_once()
+    harness.view.destroy.assert_not_called()
+    harness.view.requestActivate.assert_not_called()
+    harness.view.raise_.assert_not_called()
+    harness.x11.open.assert_called_once_with()
+    assert harness.app.processEvents.call_count == 0
+
+
+@pytest.mark.parametrize("fullscreen", [False, True])
+@pytest.mark.parametrize("trigger", ["show", "tick"])
+def test_mode_switch_preserves_visibility_until_exposure_or_timeout(
+    harness: Harness, fullscreen: bool, trigger: str
+) -> None:
+    active = fake_fullscreen(harness)
+    active.get_full_property.return_value.value = [] if fullscreen else ["_NET_WM_STATE_FULLSCREEN"]
+    harness.pill.show_state(PillState.LISTENING)
+    assert harness.pill.visible
+    active.get_full_property.return_value.value = ["_NET_WM_STATE_FULLSCREEN"] if fullscreen else []
+    switching: list[bool] = []
+
+    def hide_during_switch() -> None:
+        harness.view.isVisible.return_value = False
+        harness.view.isExposed.return_value = False
+        harness.view.visibleChanged.emit()
+        harness.pill.eventFilter(harness.view, QEvent(QEvent.Hide))
+        harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
+        switching.append(harness.pill.visible)
+
+    def show_without_exposure() -> None:
+        harness.view.isVisible.return_value = True
+        harness.view.visibleChanged.emit()
+
+    harness.view.hide.side_effect = hide_during_switch
+    harness.view.show.side_effect = show_without_exposure
+    flag_calls = harness.view.setFlags.call_count
+    if trigger == "show":
+        harness.pill.show_state(PillState.LISTENING)
+    else:
+        harness.clock.timers[1].fire()
+    assert switching == [True]
+    assert harness.pill.visible
+    for _ in range(9):
+        harness.clock.advance(100)
+        harness.pill.show_state(PillState.LISTENING)
+        harness.pill.set_forced(True)
+        harness.clock.timers[1].fire()
+        assert harness.pill.visible
+    assert switching == [True]
+    assert harness.view.setFlags.call_count == flag_calls + 1
+    harness.clock.advance(99)
+    assert harness.pill.visible
+    harness.clock.advance(1)
+    assert not harness.pill.visible
+    harness.pill.set_forced(True)
+    assert not harness.pill.visible
+    harness.view.isExposed.return_value = True
+    harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
+    assert harness.pill.visible
+    assert harness.app.processEvents.call_count == 0
+
+
+def test_rival_gone_does_not_stop_recording_without_tray(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(indicators, "QTimer", harness.clock)
+    monkeypatch.setattr(indicators, "monotonic", lambda: harness.clock.now / 1000)
+    events: list[str] = []
+    monkeypatch.setattr(notify, "notify_indicators_lost", lambda: events.append("notify"))
+    tray = Mock(registered=True)
+    guard = indicators.IndicatorGuard(harness.pill, cast("Tray", tray))
+    guard.on_stop_recording = lambda: events.append("stop")
+    fake_fullscreen(harness)
+    harness.pill.show_state(PillState.LISTENING)
+    guard.set_recording(True)
+    harness.clock.advance(1500)
+    tray.registered = False
+    assert guard.check()
+    harness.clock.advance(1500)  # Оба грейса стража уже закончились.
+    assert guard.check()
+
+    def show_without_exposure() -> None:
+        harness.view.isVisible.return_value = True
+        harness.view.visibleChanged.emit()
+
+    harness.view.show.side_effect = show_without_exposure
+    harness.x11.active_window.return_value = None
+    harness.clock.timers[1].fire()
+    assert not harness.view.isExposed()
+    assert guard.check()
+    harness.clock.advance(999)
+    assert guard.check()
+    harness.view.isExposed.return_value = True
+    harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
+    harness.clock.advance(1001)
+    assert guard.check()
+    assert guard.recording
+    assert events == []
+    assert harness.app.processEvents.call_count == 0
+
+
+def test_fullscreen_before_first_show_reapplies_properties_to_new_xid(harness: Harness) -> None:
+    fake_fullscreen(harness)
+    harness.view.winId.return_value = 84
+    harness.pill.show_state(PillState.LISTENING)
+    assert harness.view.setFlags.call_args.args[0] & Qt.BypassWindowManagerHint
+    assert harness.pill._wid == 84
+    harness.x11.d.create_resource_object.assert_any_call("window", 84)
+    window = harness.x11.d.create_resource_object.return_value
+    window.change_property.assert_any_call("_NET_WM_DESKTOP", 6, 32, [0xFFFFFFFF])
+    window.change_property.assert_any_call("_NET_WM_USER_TIME", 6, 32, [0])
+    harness.view.show.assert_called_once_with()
+    harness.factory.assert_called_once_with()
+    harness.view.setSource.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("root_stack", "rival_geometry", "visible"),
+    [
+        ([800, 42], (0, 0, 1920, 1280), True),
+        ([42, 800], (0, 0, 1920, 1280), False),
+        ([42, 800], (2000, 0, 1920, 1280), True),
+        ([800], (0, 0, 1920, 1280), False),
+    ],
+)
+def test_compatibility_visibility_uses_actual_root_stacking(
+    harness: Harness,
+    root_stack: list[int],
+    rival_geometry: tuple[int, int, int, int],
+    visible: bool,
+) -> None:
+    fake_fullscreen(harness)
+    # В EWMH остался только клиент fullscreen; в root tree — его рамка и пилюля.
+    harness.x11.client_list_stacking.return_value = [91]
+    harness.x11.root.query_tree.return_value.children = [Mock(id=wid) for wid in root_stack]
+    harness.x11.window_geometry.side_effect = lambda wid: (
+        (948, 1178, 224, 78) if wid == 42 else rival_geometry
+    )
+    harness.pill.show_state(PillState.LISTENING)
+    harness.pill.set_forced(True)
+    harness.clock.timers[0].fire()
+    assert harness.pill.visible == visible
+    harness.x11.root.query_tree.assert_called()
+    assert harness.pill.state is PillState.LISTENING
+    assert harness.view.setFlags.call_args.args[0] & Qt.BypassWindowManagerHint
+
+
+def test_compatibility_restack_is_verified_before_claiming_visibility(harness: Harness) -> None:
+    fake_fullscreen(harness)
+    harness.pill.show_state(PillState.LISTENING)
+    harness.x11.client_list_stacking.return_value = [91]
+    tree = harness.x11.root.query_tree.return_value
+    tree.children = [Mock(id=42), Mock(id=800)]
+    window = harness.x11.d.create_resource_object.return_value
+
+    def restack(**kwargs: int) -> None:
+        tree.children.reverse()
+
+    window.configure.side_effect = restack
+    harness.clock.timers[1].fire()
+    window.configure.assert_called_once_with(stack_mode=0)
+    assert harness.pill.visible
+    harness.view.raise_.assert_not_called()
+
+
+def test_show_state_remaps_externally_unmapped_window(harness: Harness) -> None:
+    harness.pill.show_state(PillState.LISTENING)
+    harness.view.isExposed.return_value = False
+    harness.pill.eventFilter(harness.view, QEvent(QEvent.Expose))
+    assert not harness.pill.visible
+    assert harness.view.isVisible()
+    harness.view.reset_mock()
+    harness.pill.show_state(PillState.LISTENING)
+    operations = [c for c in harness.view.mock_calls if c in (call.hide(), call.show())]
+    assert operations == [call.hide(), call.show()]
+    assert harness.pill.visible
+    harness.view.setFlags.assert_not_called()
+    harness.factory.assert_called_once_with()
+    harness.pill.show_state(PillState.LISTENING)
+    harness.view.hide.assert_called_once_with()
+
+
+@pytest.mark.parametrize("compatibility", [False, True])
+def test_lift_removes_attention_without_activation(harness: Harness, compatibility: bool) -> None:
+    if compatibility:
+        fake_fullscreen(harness)
+    harness.pill.show_state(PillState.LISTENING)
+    harness.x11.client_list_stacking.return_value = [42, 800]
+    harness.x11.root.query_tree.return_value.children = [Mock(id=42), Mock(id=800)]
+    window = harness.x11.d.create_resource_object.return_value
+    window.get_full_property.return_value = Mock(
+        format=32, value=["_NET_WM_STATE_ABOVE", "_NET_WM_STATE_DEMANDS_ATTENTION"]
+    )
+    window.change_property.reset_mock()
+    harness.ewmh.reset_mock()
+    harness.clock.timers[1].fire()
+    harness.view.raise_.assert_not_called()
+    harness.view.requestActivate.assert_not_called()
+    if compatibility:
+        assert window.change_property.call_args.args[3] == ["_NET_WM_STATE_ABOVE"]
+    else:
+        harness.ewmh.ClientMessage.assert_any_call(
+            window=42,
+            client_type="_NET_WM_STATE",
+            data=(32, [0, "_NET_WM_STATE_DEMANDS_ATTENTION", 0, 1, 0]),
+        )
+    for message in harness.ewmh.ClientMessage.call_args_list:
+        data = message.kwargs["data"][1]
+        assert message.kwargs["client_type"] != "_NET_ACTIVE_WINDOW"
+        assert data[0] != 1 or "_NET_WM_STATE_DEMANDS_ATTENTION" not in data[1:3]
 
 
 @pytest.mark.parametrize("failure", ["stack", "sync", "attributes", "send", "async_error"])
@@ -846,9 +1337,16 @@ def test_x11_loss_closes_connection_and_retries_only_once(
     error.CatchError.return_value.get_error.return_value = None
     harness.view.raise_.reset_mock()
     for _ in range(10):
+        harness.ewmh.reset_mock()
         harness.clock.timers[1].fire()
+        above = call(
+            window=42,
+            client_type="_NET_WM_STATE",
+            data=(32, [1, "_NET_WM_STATE_ABOVE", 0, 1, 0]),
+        )
+        assert (above in harness.ewmh.ClientMessage.call_args_list) == reopens
     assert harness.x11.open.call_count == 2
-    assert harness.view.raise_.call_count == (10 if reopens else 0)
+    harness.view.raise_.assert_not_called()
     if reopens:
         conn.sync.side_effect = RuntimeError("lost again")
         for _ in range(10):
@@ -910,7 +1408,7 @@ def test_x11_errors_and_missing_xlib_after_init_are_safe(
     harness.pill._apply_ewmh()
     harness.pill._resize()
     harness.clock.timers[1].fire()
-    assert harness.pill.visible
+    assert not harness.pill.visible  # Потеря X-проверки не подтверждает видимость.
     harness.pill.hide()
 
 
@@ -946,6 +1444,7 @@ presentation = next(
 for transition in ("hidden", "disabled", "setting", "expiry"):
     pill.set_enabled(True)
     pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_UNAVAILABLE)
+    app.processEvents()
     assert pill.visible
     assert presentation.property("label") == ERROR_MICROPHONE_UNAVAILABLE
     if transition == "setting":
@@ -1045,7 +1544,7 @@ def _pill_text_violations(source: str, *, package: str = "astra_voice") -> list[
     registry_names = {
         f"astra_voice.ui.pill.{name}"
         for name, value in vars(module).items()
-        if name.isupper() and isinstance(value, str) and value in ERROR_REASONS
+        if name.isupper() and isinstance(value, str) and value in ERROR_REASONS | CLIPBOARD_REASONS
     }
     overwritten = {
         _qualified_pill_name(node, aliases)
@@ -1127,7 +1626,12 @@ def test_project_pill_text_contains_no_dictation() -> None:
         "def reasons():\n    pass\npill.show_state(state, text=reasons.ERROR_BUFFER_CLEARED)",
     ],
 )
-def test_pill_ast_rejects_dynamic_text(source: str) -> None:
+@pytest.mark.parametrize("clipboard", [False, True])
+def test_pill_ast_rejects_dynamic_text(source: str, clipboard: bool) -> None:
+    if clipboard:
+        source = source.replace("ERROR_BUFFER_CLEARED", "CLIPBOARD_WINDOW_CHANGED").replace(
+            "ERROR_REASONS", "CLIPBOARD_REASONS"
+        )
     assert _pill_text_violations(source)
 
 
@@ -1149,5 +1653,8 @@ def test_pill_ast_rejects_dynamic_text(source: str) -> None:
         "pill.show_state(state, text=astra_voice.ui.pill.ERROR_BUFFER_CLEARED)",
     ],
 )
-def test_pill_ast_accepts_literals_and_registry_constants(source: str) -> None:
+@pytest.mark.parametrize("clipboard", [False, True])
+def test_pill_ast_accepts_literals_and_registry_constants(source: str, clipboard: bool) -> None:
+    if clipboard:
+        source = source.replace("ERROR_BUFFER_CLEARED", "CLIPBOARD_WINDOW_CHANGED")
     assert not _pill_text_violations(source)

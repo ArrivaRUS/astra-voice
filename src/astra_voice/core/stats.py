@@ -8,6 +8,8 @@ import math
 import os
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TypedDict
 
 from astra_voice.core.paths import state_dir
@@ -16,6 +18,7 @@ log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 MAX_EVENTS = 1000
+SAVE_INTERVAL_S = 30.0
 Event = dict[str, str | int | float | bool]
 
 _FIELDS: dict[str, frozenset[str]] = {
@@ -102,16 +105,31 @@ def _event(event_type: str, fields: Mapping[str, object]) -> Event:
     return event
 
 
+@dataclass
+class _Buffer:
+    events: list[Event]
+    last_save: float
+    dirty: bool = False
+
+
+# Несброшенные данные доступны и новым Stats (в том числе CLI) в этом процессе.
+_pending: dict[Path, _Buffer] = {}
+
+
 class Stats:
     """Хранилище одного процесса; события упорядочены по времени добавления.
 
     append принимает поля из таблицы PRD §10; type и ts назначаются хранилищем.
     Неизвестные поля отбрасываются, неверные значения вызывают ValueError.
+    Методы вызываются из одного потока. append сбрасывает буфер не чаще раза
+    в SAVE_INTERVAL_S секунд; при завершении владелец обязан вызвать flush().
+    Владелец также вызывает flush() по периодическому таймеру SAVE_INTERVAL_S.
     """
 
     def __init__(self) -> None:
         self._path = state_dir() / "stats.json"
-        self._events = self._load()
+        pending = _pending.get(self._path)
+        self._buffer = pending if pending is not None else _Buffer(self._load(), time.monotonic())
 
     def _load(self) -> list[Event]:
         try:
@@ -152,7 +170,8 @@ class Stats:
             ensure_ascii=False,
             allow_nan=False,
         )
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 os.fchmod(handle.fileno(), 0o600)
@@ -164,25 +183,44 @@ class Stats:
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
-        self._events = events
+
+    def flush(self) -> None:
+        """Атомарно сохраняет накопленное в файл 0600; при ошибке буфер остаётся."""
+        if not self._buffer.dirty:
+            return
+        self._save(self._buffer.events)
+        self._saved()
+
+    def _saved(self) -> None:
+        self._buffer.dirty = False
+        self._buffer.last_save = time.monotonic()
+        if _pending.get(self._path) is self._buffer:
+            del _pending[self._path]
 
     def append(self, event_type: str, **fields: object) -> None:
-        """Добавляет событие с Unix-временем (float) и атомарно сохраняет файл 0600."""
+        """Добавляет событие с Unix-временем (float), откладывая запись на диск."""
         event = _event(event_type, fields)
         event["ts"] = time.time()
-        self._save([*self._events, event][-MAX_EVENTS:])
+        self._buffer.events.append(event)
+        del self._buffer.events[:-MAX_EVENTS]
+        self._buffer.dirty = True
+        _pending[self._path] = self._buffer
+        if time.monotonic() - self._buffer.last_save >= SAVE_INTERVAL_S:
+            self.flush()
 
     def events(self) -> list[Event]:
         """Возвращает копии событий от старых к новым."""
-        return [event.copy() for event in self._events]
+        return [event.copy() for event in self._buffer.events]
 
     def clear(self) -> None:
         """Атомарно заменяет статистику пустым набором событий."""
         self._save([])
+        self._buffer.events.clear()
+        self._saved()
 
     def summary(self) -> Summary:
         """Скорость учитывает только dictation с явно указанным cold=False."""
-        dictations = [event for event in self._events if event["type"] == "dictation"]
+        dictations = [event for event in self._buffer.events if event["type"] == "dictation"]
         timings = [
             float(event["t_ms"])
             for event in dictations
@@ -201,5 +239,5 @@ class Stats:
                 result: count / len(dictations) if dictations else 0.0
                 for result, count in results.items()
             },
-            "mic_errors": sum(event["type"] == "mic_error" for event in self._events),
+            "mic_errors": sum(event["type"] == "mic_error" for event in self._buffer.events),
         }

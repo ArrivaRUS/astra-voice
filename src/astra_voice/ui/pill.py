@@ -8,10 +8,10 @@ from collections.abc import Callable
 from enum import Enum
 from functools import partial
 from math import ceil
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any, Final
 
-from PyQt5.QtCore import QCoreApplication, QEventLoop, QObject, QPoint, QRect, Qt, QTimer, QUrl
+from PyQt5.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer, QUrl
 from PyQt5.QtGui import QGuiApplication, QRegion, QScreen
 from PyQt5.QtQuick import QQuickView
 
@@ -35,6 +35,10 @@ ERROR_REASONS: Final = frozenset(
         ERROR_RECOGNITION_FAILED,
     )
 )
+
+# Единственная допустимая уточняющая подпись CLIPBOARD_ONLY для оркестрации.
+CLIPBOARD_WINDOW_CHANGED: Final = "Окно сменилось — текст в буфере"
+CLIPBOARD_REASONS: Final = frozenset((CLIPBOARD_WINDOW_CHANGED,))
 
 
 class PillState(Enum):
@@ -71,6 +75,12 @@ _SHADOW_OFFSET_Y = 6
 _EDGE_OFFSET = 48
 # §8.2, PillTheme.pillRadius (корневой QML Item не экспортирует этот токен).
 _PILL_RADIUS = 18
+# Асинхронный map и смена override-redirect могут временно убрать экспозицию.
+# Через секунду без Expose О4 снова требует честный False; насос событий запрещён (У54).
+_EXPOSURE_WAIT_MS = 1000
+_WINDOW_FLAGS = (
+    Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus
+)
 
 
 class Pill(QObject):
@@ -99,10 +109,14 @@ class Pill(QObject):
         self._forced = False
         self._requested_state = PillState.HIDDEN
         self._state = PillState.HIDDEN
-        self._error_label = ""
+        self._label = ""
         self._levels: deque[float] = deque([0.0] * _HISTORY_SIZE, maxlen=_HISTORY_SIZE)
         self._timer_generation = 0
-        self._exposure_pending = False
+        self._exposed = False
+        self._exposure_deadline: float | None = None
+        self._remapping = False
+        self._occluded = False
+        self._compatibility_mode = False
         self._x11 = X11Display()
         self.destroyed.connect(self._x11.close)
         self._x11_started = False
@@ -118,11 +132,10 @@ class Pill(QObject):
 
         factory = view_factory if view_factory is not None else lambda: QQuickView()
         self._view = factory()
+        self._view.installEventFilter(self)
         # QWindow.setParent принимает QWindow; здесь нужно именно владение QObject.
         self.destroyed.connect(self._view.deleteLater)
-        self._view.setFlags(
-            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus
-        )
+        self._view.setFlags(_WINDOW_FLAGS)
         self._view.setColor(Qt.transparent)
         self._view.setResizeMode(QQuickView.SizeViewToRootObject)
         self._view.setSource(
@@ -153,11 +166,13 @@ class Pill(QObject):
         started = perf_counter()
         self._timer_generation += 1
         self._requested_state = state
-        self._error_label = ""
-        if state is PillState.ERROR:
-            self._error_label = ERROR_RECOGNITION_FAILED
-            if text is not None and text in ERROR_REASONS:
-                self._error_label = text
+        self._label = ""
+        if state in (PillState.ERROR, PillState.CLIPBOARD_ONLY):
+            reasons = ERROR_REASONS if state is PillState.ERROR else CLIPBOARD_REASONS
+            if state is PillState.ERROR:
+                self._label = ERROR_RECOGNITION_FAILED
+            if text is not None and text in reasons:
+                self._label = text
             elif text is not None:
                 # Чужая строка не должна попасть ни в QML, ни в журнал.
                 log.warning("Пилюля: причина вне реестра")
@@ -176,24 +191,29 @@ class Pill(QObject):
 
     @property
     def visible(self) -> bool:
-        if self._state in _INVISIBLE_STATES or not self._view.isVisible():
+        """Экспозиция и кэш перекрытия: без X-запросов и обработки событий."""
+        if self._state in _INVISIBLE_STATES or self._occluded:
             return False
-        if self._exposure_pending:
-            # О4 читает visible синхронно после show(). Даём Qt один проход для
-            # первого Expose, не подменяя подтверждение показа льготным True.
-            # Снимаем флаг до processEvents: обработчики могут войти сюда повторно.
-            self._exposure_pending = False
-            QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
-        try:
-            return (
-                self._state not in _INVISIBLE_STATES
-                and bool(self._view.isVisible())
-                and bool(self._view.isExposed())
-            )
-        except (AttributeError, NotImplementedError):
-            # Backend без подтверждения экспозиции (в т.ч. некоторые offscreen)
-            # не может служить доказательством наличия индикатора для О4.
-            return False
+        if self._exposure_deadline is not None and monotonic() < self._exposure_deadline:
+            return True
+        return bool(self._view.isVisible()) and self._exposed
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        """Запомнить экспозицию окна, пропуская события к самому окну."""
+        if watched is self._view:
+            if event.type() == QEvent.Expose:
+                if not self._remapping:
+                    self._exposure_deadline = None
+                try:
+                    self._exposed = bool(self._view.isVisible() and self._view.isExposed())
+                except (AttributeError, NotImplementedError):
+                    # Без подтверждения экспозиции окно не доказывает индикацию О4.
+                    self._exposed = False
+            elif event.type() == QEvent.Hide:
+                self._exposed = False
+                if not self._remapping:
+                    self._exposure_deadline = None
+        return False
 
     @property
     def state(self) -> PillState:
@@ -218,19 +238,92 @@ class Pill(QObject):
             self._clear_levels()
         log.debug("Пилюля: %s", state.name)
         # Обе подписи очищаются и при скрытии, и при пользовательском выключении.
-        self._root.setProperty("label", self._error_label if state is PillState.ERROR else "")
+        self._root.setProperty(
+            "label", self._label if state in (PillState.ERROR, PillState.CLIPBOARD_ONLY) else ""
+        )
         self._root.setProperty("levels", list(self._levels))
         self._root.setProperty("avState", state.value)
         if state in _INVISIBLE_STATES:
+            self._exposed = False
+            self._exposure_deadline = None
             self._view.hide()
         else:
             self._prepare_x11()
+            self._update_compatibility_mode()
             self._refresh_compositor()
             self._resize()
-            self._view.show()
+            self._show_window()
             if show_started is not None:
                 elapsed_ms = (perf_counter() - show_started) * 1000
                 log.debug("Пилюля: show_state → show() %.2f мс", elapsed_ms)
+
+    def _show_window(self) -> None:
+        if self._view.isVisible() and self._exposure_deadline is None:
+            try:
+                exposed = bool(self._view.isExposed())
+            except (AttributeError, NotImplementedError):
+                exposed = False
+            if not exposed:
+                # Внешний XUnmapWindow не сбрасывает Qt visible. show() без hide()
+                # в таком состоянии ничего не делает (У56).
+                self._hide_for_remap()
+        if not self._view.isVisible():
+            self._wait_for_exposure()
+            # WM удаляет свойства при withdraw; они нужны перед каждым новым map.
+            self._apply_ewmh()
+        self._view.show()
+
+    def _wait_for_exposure(self) -> None:
+        # Повторные show_state/set_forced не продлевают даже истёкшее ожидание.
+        if self._exposure_deadline is None:
+            self._exposure_deadline = monotonic() + _EXPOSURE_WAIT_MS / 1000
+
+    def _hide_for_remap(self, *, compatibility: bool | None = None) -> None:
+        self._wait_for_exposure()
+        self._remapping = True
+        try:
+            self._exposed = False
+            self._view.hide()
+            if compatibility is not None:
+                self._compatibility_mode = compatibility
+                flags = _WINDOW_FLAGS
+                if compatibility:
+                    flags |= Qt.BypassWindowManagerHint
+                self._view.setFlags(flags)
+                # Backend может заменить native window при смене флагов.
+                self._wid = int(self._view.winId())
+        finally:
+            self._remapping = False
+
+    def _update_compatibility_mode(self) -> bool:
+        """Перепоказ при смене fullscreen, сохраняя QQuickView и загруженный QML."""
+        if self._x11.d is None:
+            return False
+        try:
+            from Xlib import Xatom, error
+
+            conn = self._x11.d
+            active = self._x11.active_window()
+            fullscreen = False
+            if active and active != self._wid:
+                try:
+                    window = conn.create_resource_object("window", active)
+                    prop = window.get_full_property(conn.intern_atom("_NET_WM_STATE"), Xatom.ATOM)
+                except error.BadWindow:
+                    # Активное окно исчезло между запросами; дождёмся следующего тика.
+                    return False
+                fullscreen = (
+                    prop is not None
+                    and prop.format == 32
+                    and conn.intern_atom("_NET_WM_STATE_FULLSCREEN") in prop.value
+                )
+            if fullscreen == self._compatibility_mode:
+                return False
+            self._hide_for_remap(compatibility=fullscreen)
+            return True
+        except Exception as exc:
+            self._lose_x11(exc)
+            return False
 
     def _expire(self, generation: int) -> None:
         if generation == self._timer_generation:
@@ -324,11 +417,6 @@ class Pill(QObject):
             if not self._x11.open():
                 log.debug("Пилюля: X11 недоступен")
                 return
-            self._apply_ewmh()
-            if self._session is SessionKind.FLY:
-                # TODO: перейти на platform/x11
-                self._set_cardinal_zero("_FLY_WM_WINDOW_MAP_ANIMATION")
-                self._set_cardinal_zero("_FLY_WM_FADE_SHOW")
         except Exception as exc:
             self._lose_x11(exc)
 
@@ -367,13 +455,20 @@ class Pill(QObject):
                 32,
                 [conn.intern_atom("_NET_WM_WINDOW_TYPE_NOTIFICATION")],
             )
+            window.change_property(
+                conn.intern_atom("_NET_WM_DESKTOP"), Xatom.CARDINAL, 32, [0xFFFFFFFF]
+            )
             self._set_states("_NET_WM_STATE_ABOVE")
             self._set_states("_NET_WM_STATE_SKIP_TASKBAR", "_NET_WM_STATE_SKIP_PAGER")
+            self._set_states("_NET_WM_STATE_DEMANDS_ATTENTION", enabled=False)
             self._set_cardinal_zero("_NET_WM_USER_TIME")
+            if self._session is SessionKind.FLY:
+                self._set_cardinal_zero("_FLY_WM_WINDOW_MAP_ANIMATION")
+                self._set_cardinal_zero("_FLY_WM_FADE_SHOW")
         except Exception as exc:
             self._lose_x11(exc)
 
-    def _set_states(self, *names: str) -> None:
+    def _set_states(self, *names: str, enabled: bool = True) -> None:
         # TODO: перейти на platform/x11, когда EWMH-функции примут соединение.
         # Сейчас готовые функции открывают новое соединение на каждый вызов.
         from Xlib import X, Xatom, error
@@ -384,17 +479,20 @@ class Pill(QObject):
         atom = conn.intern_atom("_NET_WM_STATE")
         states = [conn.intern_atom(name) for name in names]
         catcher = error.CatchError()
-        if window.get_attributes().map_state == X.IsUnmapped:
+        if self._compatibility_mode or window.get_attributes().map_state == X.IsUnmapped:
             prop = window.get_full_property(atom, Xatom.ATOM)
             existing = [] if prop is None else list(prop.value)
-            window.change_property(
-                atom, Xatom.ATOM, 32, list(dict.fromkeys(existing + states)), onerror=catcher
+            updated = (
+                list(dict.fromkeys(existing + states))
+                if enabled
+                else [state for state in existing if state not in states]
             )
+            window.change_property(atom, Xatom.ATOM, 32, updated, onerror=catcher)
         else:
             message = event.ClientMessage(
                 window=self._wid,
                 client_type=atom,
-                data=(32, [1, states[0], states[1] if len(states) > 1 else 0, 1, 0]),
+                data=(32, [int(enabled), states[0], states[1] if len(states) > 1 else 0, 1, 0]),
             )
             self._x11.root.send_event(
                 message,
@@ -407,6 +505,8 @@ class Pill(QObject):
 
     def _lose_x11(self, exc: Exception) -> None:
         log.debug("Пилюля: X11 недоступен, re-assert приостановлен: %s", exc)
+        if self._x11.d is not None:
+            self._occluded = True  # После потери проверки нельзя подтверждать О4 старым кэшем.
         self._x11.close()
 
     def _update_mask(self) -> None:
@@ -428,11 +528,13 @@ class Pill(QObject):
         self._view.setMask(region)
 
     def _visibility_changed(self) -> None:
-        self._exposure_pending = bool(self._view.isVisible())
         if self._view.isVisible():
             self._show_timer.start()
             self._above_timer.start()
         else:
+            self._exposed = False
+            if not self._remapping:
+                self._exposure_deadline = None
             self._show_timer.stop()
             self._above_timer.stop()
 
@@ -454,28 +556,57 @@ class Pill(QObject):
                 if not self._x11.open():
                     log.debug("Пилюля: повторное открытие X11 не удалось")
                     return
-            from Xlib import X, error
-
-            stack = self._x11.client_list_stacking()
-            # client_list_stacking подавляет ошибки; sync обнаружит разрыв соединения.
-            self._x11.d.sync()
-            for wid in reversed(stack):
-                if wid == self._wid:
-                    return
-                try:
-                    window = self._x11.d.create_resource_object("window", wid)
-                    if window.get_attributes().map_state != X.IsViewable:
-                        continue
-                except error.BadWindow as exc:
-                    log.debug("Пилюля: окно стека недоступно: %s", exc)
-                    continue
-                try:
-                    self._set_states("_NET_WM_STATE_ABOVE")
-                finally:
-                    self._view.raise_()
+                self._apply_ewmh()
+            if self._update_compatibility_mode():
+                self._show_window()
+            if self._x11.d is None:
                 return
+            self._occluded = self._is_occluded()
+            if self._occluded:
+                self._set_states("_NET_WM_STATE_ABOVE")
+                if self._compatibility_mode:
+                    from Xlib import X
+
+                    # WM не обрабатывает EWMH для override-redirect. Прямой restack
+                    # не активирует окно и не создаёт DEMANDS_ATTENTION, в отличие от Qt.raise_().
+                    window = self._x11.d.create_resource_object("window", self._wid)
+                    window.configure(stack_mode=X.Above)
+                    self._x11.d.sync()
+                # Запрос ABOVE не доказывает видимость: проверяем фактический результат.
+                self._occluded = self._is_occluded()
+            self._set_states("_NET_WM_STATE_DEMANDS_ATTENTION", enabled=False)
         except Exception as exc:
             self._lose_x11(exc)
+
+    def _is_occluded(self) -> bool:
+        """Проверка только из re-assert; все координаты — физические пиксели X root."""
+        from Xlib import X, error
+
+        stack = self._x11.client_list_stacking()
+        # Override-redirect не входит в список клиентов WM. Его порядок относительно
+        # рамок managed-окон и других override-redirect берём из дерева X-сервера.
+        if self._compatibility_mode or self._wid not in stack:
+            stack = [int(window.id) for window in self._x11.root.query_tree().children]
+        # client_list_stacking подавляет ошибки; sync обнаружит разрыв соединения.
+        self._x11.d.sync()
+        if self._wid not in stack:
+            return True
+        geometry = self._x11.window_geometry(self._wid)
+        if geometry is None:
+            return True
+        pill_rect = QRect(*geometry)
+        for wid in reversed(stack[stack.index(self._wid) + 1 :]):
+            try:
+                window = self._x11.d.create_resource_object("window", wid)
+                attributes = window.get_attributes()
+                if attributes.map_state != X.IsViewable or attributes.win_class == X.InputOnly:
+                    continue
+                geometry = self._x11.window_geometry(wid)
+                if geometry is None or pill_rect.intersects(QRect(*geometry)):
+                    return True
+            except error.BadWindow as exc:
+                log.debug("Пилюля: окно стека недоступно: %s", exc)
+        return False
 
     def _cancel_clicked(self) -> None:
         if self.on_cancel_clicked is not None:

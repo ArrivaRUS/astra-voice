@@ -2,27 +2,38 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 from collections.abc import Callable
 from typing import Any
 from unittest.mock import Mock, call
 
 import pytest
-from PyQt5.QtCore import QEventLoop, Qt
+from PyQt5 import sip
+from PyQt5.QtCore import QEventLoop, QMimeData, QObject, Qt
 
 from astra_voice import runtime as module
-from astra_voice.core.dictation import BUSY_RETRY_MS, DictationPhase
+from astra_voice.core.dictation import (
+    BUSY_RETRY_MS,
+    CANCEL_RESTART_MS,
+    CANCEL_TIMEOUT_MS,
+    DictationPhase,
+)
 from astra_voice.core.settings import Settings
+from astra_voice.platform import paste as paste_module
 from astra_voice.platform.hotkey import (
     DEFAULT_CANDIDATES,
     RECORD_LIMIT_S,
     GrabResult,
+    HotkeyBackend,
+    HotkeyEvent,
     HotkeyFsm,
+    HotkeyManager,
     HotkeyMode,
     HotkeyState,
     ResultCode,
 )
-from astra_voice.platform.paste import PasteMode, PasteOutcomeKind
+from astra_voice.platform.paste import KDE_HINT, PasteMode, PasteOutcomeKind, normalize
 from astra_voice.platform.session import SessionKind
 from astra_voice.runtime import DictationRuntime
 from astra_voice.ui.pill import PillState
@@ -87,7 +98,13 @@ class FakeTimer:
 class Rig:
     """Общий журнал порядка действий и управляемые отказы каждого ресурса."""
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        settings: Settings | None = None,
+        *,
+        hotkey_factory: Callable[[], HotkeyManager] | None = None,
+    ) -> None:
         self.trace: list[str] = []
         self.fail_at: str | None = None
         self.timers: list[FakeTimer] = []
@@ -101,6 +118,9 @@ class Rig:
         self.x11.active_window.return_value = 4321
         self.x11.open.side_effect = lambda: self.record("x11.open")
         self.x11.close.side_effect = lambda: self.record("x11.close")
+        self.capture_watchdogs: list[Mock] = []
+        self.capture_open_ok = True
+        self.capture_watchdog_factory = Mock(side_effect=self.create_capture_watchdog)
         self.supervisor = Mock(state="new", generation=1)
         self.supervisor.start.side_effect = self.start_worker
         self.supervisor.stop.side_effect = self.stop_worker
@@ -123,6 +143,9 @@ class Rig:
         self.application.clipboard.return_value = self.clipboard
         self.notify = Mock()
         self.paste = Mock(return_value=Mock(kind=PasteOutcomeKind.PASTED))
+        self.restore_paste = Mock(side_effect=self.restore_pending)
+        self.atexit_register = Mock()
+        self.atexit_unregister = Mock(side_effect=lambda callback: self.record("atexit.unregister"))
         self.supervisor_factory = Mock(return_value=self.supervisor)
         self.pill_factory = Mock(return_value=self.pill)
         self.tray_factory = Mock(return_value=self.tray)
@@ -136,6 +159,8 @@ class Rig:
         monkeypatch.setattr(module, "monotonic", lambda: self.now)
         monkeypatch.setattr(module, "QApplication", self.application)
         monkeypatch.setattr(module, "notify", self.notify)
+        monkeypatch.setattr(atexit, "register", self.atexit_register)
+        monkeypatch.setattr(atexit, "unregister", self.atexit_unregister)
         # Любое случайное создание реального таймера/наблюдателя ломает тест.
         monkeypatch.setattr(module, "QTimer", Mock(side_effect=AssertionError("Реальный таймер")))
         monkeypatch.setattr(
@@ -147,13 +172,34 @@ class Rig:
             supervisor_factory=self.supervisor_factory,
             pill_factory=self.pill_factory,
             tray_factory=self.tray_factory,
-            hotkey_factory=Mock(return_value=self.hotkey),
+            hotkey_factory=hotkey_factory
+            if hotkey_factory is not None
+            else Mock(return_value=self.hotkey),
             stats_factory=Mock(return_value=self.stats),
             paste_func=self.paste,
+            restore_paste=self.restore_paste,
             x11_factory=Mock(return_value=self.x11),
             guard_factory=self.guard_factory,
             provider_factory=Mock(return_value=self.provider),
+            capture_watchdog_factory=self.capture_watchdog_factory,
         )
+
+    def create_capture_watchdog(self) -> Mock:
+        watchdog = Mock(active=False)
+
+        def open_capture() -> bool:
+            self.record("capture.open")
+            watchdog.active = self.capture_open_ok
+            return self.capture_open_ok
+
+        def close_capture() -> None:
+            watchdog.active = False
+            self.record("capture.close")
+
+        watchdog.open.side_effect = open_capture
+        watchdog.close.side_effect = close_capture
+        self.capture_watchdogs.append(watchdog)
+        return watchdog
 
     def record(self, action: str) -> None:
         self.trace.append(action)
@@ -161,9 +207,14 @@ class Rig:
             raise RuntimeError(MARKER)
 
     def create_timer(self) -> FakeTimer:
-        timer = FakeTimer(self.record, "tick" if not self.timers else "scheduled")
+        name = ("tick", "stats")[len(self.timers)] if len(self.timers) < 2 else "scheduled"
+        timer = FakeTimer(self.record, name)
         self.timers.append(timer)
         return timer
+
+    def restore_pending(self) -> bool:
+        self.record("restore_paste")
+        return False
 
     def start_worker(self) -> None:
         self.record("worker.start")
@@ -199,6 +250,105 @@ def rig(monkeypatch: pytest.MonkeyPatch) -> Rig:
 def assert_phase(runtime: DictationRuntime, expected: DictationPhase) -> None:
     """Читает фазу заново после событий, не сохраняя сужение типа mypy."""
     assert runtime.phase == expected
+
+
+@pytest.mark.parametrize("failure", ["pill", "provider", "tray", "guard", "stats", "supervisor"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_failed_build_releases_resources_and_cannot_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+    cleanup_fails: bool,
+) -> None:
+    """Откат сохраняет исходную ошибку, удаляет Qt и выдерживает повторный вход."""
+    trace: list[str] = []
+    children: list[QObject] = []
+    resources = {name: Mock() for name in ("x11", "hotkey", "pill", "tray", "guard", "stats")}
+    error = RuntimeError("Ошибка сборки")
+    runtime = DictationRuntime.__new__(DictationRuntime)
+
+    def record(action: str) -> None:
+        trace.append(action)
+        # Даже повторный вход из уборки не должен начать запуск или второй откат.
+        runtime.start()
+        runtime.shutdown()
+        if cleanup_fails:
+            raise RuntimeError(MARKER)
+
+    for name, method in (
+        ("x11", "close"),
+        ("hotkey", "ungrab"),
+        ("pill", "hide"),
+        ("tray", "stop"),
+        ("guard", "stop"),
+        ("stats", "flush"),
+    ):
+        getattr(resources[name], method).side_effect = lambda action=f"{name}.{method}": record(
+            action
+        )
+    resources["hotkey"].backend.ungrab_escape.side_effect = lambda: record("escape.ungrab")
+    resources["hotkey"].backend.close.side_effect = lambda: record("backend.close")
+    orchestrator = Mock()
+    orchestrator.shutdown.side_effect = lambda: record("orchestrator.shutdown")
+    monkeypatch.setattr(module, "DictationOrchestrator", Mock(return_value=orchestrator))
+
+    def factory(name: str, *args: object, parent: QObject | None = None, **kw: object) -> Mock:
+        if parent is not None:
+            # Как Pill: QObject уже привязан к runtime, но фабрика ещё может упасть.
+            child = QObject(parent)
+            child.destroyed.connect(lambda: trace.append(f"{name}.delete"))
+            children.append(child)
+        if name == failure:
+            raise error
+        return resources.get(name, Mock())
+
+    factories = {
+        name: Mock(side_effect=lambda *args, name=name, **kw: factory(name, *args, **kw))
+        for name in ("x11", "hotkey", "pill", "provider", "tray", "guard", "stats", "supervisor")
+    }
+    with pytest.raises(RuntimeError) as caught:
+        DictationRuntime.__init__(
+            runtime,
+            settings=Settings(),
+            session_kind=SessionKind.FLY,
+            x11_factory=factories["x11"],
+            hotkey_factory=factories["hotkey"],
+            pill_factory=factories["pill"],
+            provider_factory=factories["provider"],
+            tray_factory=factories["tray"],
+            guard_factory=factories["guard"],
+            stats_factory=factories["stats"],
+            supervisor_factory=factories["supervisor"],
+        )
+    assert caught.value is error
+
+    expected: list[str] = []
+    if failure == "supervisor":
+        expected.extend(("orchestrator.shutdown", "stats.flush"))
+    if failure in ("stats", "supervisor"):
+        expected.append("guard.stop")
+    if failure in ("guard", "stats", "supervisor"):
+        expected.append("tray.stop")
+    if failure != "pill":
+        expected.append("pill.hide")
+    expected.extend(("hotkey.ungrab", "escape.ungrab", "backend.close", "x11.close"))
+    if failure in ("guard", "stats", "supervisor"):
+        expected.append("guard.delete")
+    if failure not in ("pill", "provider"):
+        expected.append("tray.delete")
+    expected.append("pill.delete")
+    assert trace == expected
+    assert all(sip.isdeleted(child) for child in children)
+    assert runtime.children() == []
+    assert MARKER not in caplog.text
+    assert bool(caplog.records) == cleanup_fails
+
+    runtime.shutdown()
+    runtime.shutdown()
+    runtime.start()
+    assert trace == expected
+    resources["x11"].open.assert_not_called()
+    resources["hotkey"].grab.assert_not_called()
 
 
 def test_start_wires_resources_and_real_dictation(rig: Rig) -> None:
@@ -242,6 +392,53 @@ def test_cancel_callbacks(rig: Rig, monkeypatch: pytest.MonkeyPatch, source: str
     callback = rig.pill.on_cancel_clicked if source == "pill" else rig.tray.on_cancel
     callback()
     cancel.assert_called_once_with(source)
+
+
+@pytest.mark.parametrize("mode", list(HotkeyMode))
+def test_pill_cancel_resets_real_hotkey_and_allows_next_dictation(
+    monkeypatch: pytest.MonkeyPatch, mode: HotkeyMode
+) -> None:
+    backend = Mock(spec=HotkeyBackend)
+    backend.grab_combo.return_value = GrabResult("ok", keycode=65, mods=4)
+    backend.grab_escape.return_value = GrabResult("ok", keycode=9)
+    backend.fileno.return_value = 17
+    hotkey = HotkeyManager(backend)
+    rig = Rig(monkeypatch, Settings(hotkey_mode=mode.value), hotkey_factory=lambda: hotkey)
+    runtime = rig.runtime
+    runtime.start()
+
+    hotkey.handle_event(HotkeyEvent("KeyPress", 65, 1000, mods=4), rig.now)
+    assert hotkey.fsm.state.value == "recording"
+    assert_phase(runtime, DictationPhase.RECORDING)
+    first_uid = rig.supervisor.send.call_args.args[0]["utterance_id"]
+    backend.grab_escape.assert_called_once_with()
+
+    assert runtime.pill.on_cancel_clicked is not None
+    runtime.pill.on_cancel_clicked()
+    assert hotkey.fsm.state == HotkeyState.IDLE
+    backend.ungrab_escape.assert_called_once_with()
+    assert [item.args[0]["type"] for item in rig.supervisor.send.call_args_list] == [
+        "record.start",
+        "record.cancel",
+    ]
+    rig.event(type="cancelled", utterance_id=first_uid)
+    rig.pill.show_state.assert_called_with(PillState.CANCELLED)
+
+    rig.now += 1
+    hotkey.handle_event(HotkeyEvent("KeyRelease", 65, 2000, mods=4), rig.now)
+    rig.now += 1
+    hotkey.handle_event(HotkeyEvent("KeyPress", 65, 3000, mods=4), rig.now)
+    assert hotkey.fsm.state.value == "recording"
+    assert_phase(runtime, DictationPhase.RECORDING)
+    commands = [item.args[0] for item in rig.supervisor.send.call_args_list]
+    assert [command["type"] for command in commands] == [
+        "record.start",
+        "record.cancel",
+        "record.start",
+    ]
+    assert commands[-1]["utterance_id"] != first_uid
+    rig.pill.show_state.assert_called_with(PillState.LISTENING)
+    assert backend.grab_escape.call_count == 2
 
 
 def test_quit_callback_is_set_by_app_after_construction(rig: Rig) -> None:
@@ -350,16 +547,30 @@ def test_fired_timer_is_deleted(rig: Rig) -> None:
     assert not rig.runtime.timers
 
 
-def test_copy_last_only_touches_clipboard(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
-    """Маркерная фраза не уходит в журнал и уведомления даже при копировании."""
+@pytest.mark.parametrize("text", [MARKER, f"{MARKER}\r\nстрока\rещё\n\x00\t\x1b"])
+def test_copy_last_only_touches_clipboard(
+    rig: Rig, caplog: pytest.LogCaptureFixture, text: str
+) -> None:
+    """T-58 (docs/test-plan.md): MIME с secret, без фразы в логе/уведомлениях; Fly TODO."""
     with caplog.at_level(logging.DEBUG):
+        assert rig.runtime.last_text is None
         rig.tray.on_copy_last()
         rig.application.clipboard.assert_not_called()
+        assert rig.clipboard.mock_calls == []
         rig.runtime.start()
-        rig.recognize()
+        rig.recognize(text)
         rig.tray.on_copy_last()
     rig.application.clipboard.assert_called_once_with()
-    rig.clipboard.setText.assert_called_once_with(MARKER)
+    rig.clipboard.setMimeData.assert_called_once()
+    md = rig.clipboard.setMimeData.call_args.args[0]
+    assert isinstance(md, QMimeData)
+    assert md.hasFormat("text/plain")
+    assert bytes(md.data("text/plain")) == normalize(text).encode("utf-8")
+    assert md.text() == normalize(text)
+    assert md.hasFormat(KDE_HINT)
+    assert bytes(md.data(KDE_HINT)) == b"secret"
+    rig.clipboard.setMimeData.assert_called_once_with(md)
+    rig.clipboard.setText.assert_not_called()
     rig.notify.assert_not_called()
     assert rig.notify.mock_calls == []
     assert MARKER not in caplog.text
@@ -372,12 +583,19 @@ SHUTDOWN_ORDER = [
     "notifier.delete",
     "tick.stop",
     "tick.delete",
-    "hotkey.ungrab",
-    "escape.ungrab",
-    "backend.close",
+    "stats.stop",
+    "stats.delete",
+    "scheduled.stop",
+    "scheduled.delete",
+    "restore_paste",
+    "atexit.unregister",
     "audio.close",
     "worker.drain",
     "worker.stop",
+    "hotkey.ungrab",
+    "escape.ungrab",
+    "capture.close",
+    "backend.close",
     "tray.stop",
     "x11.close",
 ]
@@ -392,6 +610,9 @@ def test_shutdown_order_and_independent_failures(
 ) -> None:
     """Ошибка любого шага не мешает последующим; повторный вход не делает ничего."""
     rig.runtime.start()
+    assert rig.runtime.begin_hotkey_capture()
+    callback = Mock()
+    rig.runtime.schedule(100, callback)
     monkeypatch.setattr(
         rig.runtime.orchestrator, "shutdown", lambda: rig.record("orchestrator.shutdown")
     )
@@ -400,13 +621,97 @@ def test_shutdown_order_and_independent_failures(
     rig.runtime.shutdown()
     assert rig.trace == SHUTDOWN_ORDER
     rig.hotkey.ungrab.assert_called_once_with()
+    rig.capture_watchdogs[0].close.assert_called_once_with()
     rig.x11.close.assert_called_once_with()
     rig.supervisor.send.assert_called_once_with({"type": "audio.close"})
+    rig.restore_paste.assert_called_once_with()
+    rig.atexit_unregister.assert_called_once_with(rig.restore_paste)
+    assert not rig.runtime.timers
+    rig.timers[-1].fire()
+    rig.timers[-1].timeout.emit()
+    callback.assert_not_called()
     rig.runtime.shutdown()
     rig.runtime.start()
     assert rig.trace == SHUTDOWN_ORDER
     assert MARKER not in caplog.text
     assert bool(caplog.records) == (failure is not None)
+
+
+def test_shutdown_during_pasting_restores_clipboard_once(rig: Rig) -> None:
+    """Выход внутри AUTO-вставки возвращает снимок до завершения воркера."""
+    saved_text = "Прежний буфер"
+    phases: list[DictationPhase] = []
+
+    def restore() -> bool:
+        rig.record("restore_paste")
+        rig.clipboard.setText(saved_text)
+        return True
+
+    def paste(text: str, target: int | None, mode: PasteMode) -> Mock:
+        phases.append(rig.runtime.phase)
+        rig.runtime.shutdown()
+        return Mock(kind=PasteOutcomeKind.WINDOW_CHANGED)
+
+    rig.restore_paste.side_effect = restore
+    rig.paste.side_effect = paste
+    rig.runtime.start()
+    rig.recognize()
+    assert phases == [DictationPhase.PASTING]
+    rig.restore_paste.assert_called_once_with()
+    rig.runtime.shutdown()
+    rig.restore_paste.assert_called_once_with()
+    rig.clipboard.setText.assert_called_once_with(saved_text)
+    assert rig.trace.index("tick.delete") < rig.trace.index("restore_paste")
+    assert rig.trace.index("restore_paste") < rig.trace.index("audio.close")
+    assert rig.trace.index("audio.close") < rig.trace.index("worker.stop")
+    assert rig.trace.index("worker.stop") < rig.trace.index("hotkey.ungrab")
+
+
+def test_shutdown_after_clipboard_only_does_not_touch_qt_clipboard(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Без ожидания возврата намеренно оставленная фраза сохраняется."""
+    restore_results: list[bool] = []
+
+    def restore() -> bool:
+        rig.record("restore_paste")
+        restored = paste_module.restore_pending()
+        restore_results.append(restored)
+        return restored
+
+    monkeypatch.setattr("PyQt5.QtWidgets.QApplication.clipboard", rig.application.clipboard)
+    rig.restore_paste.side_effect = restore
+    rig.paste.return_value.kind = PasteOutcomeKind.CLIPBOARD_ONLY
+    rig.runtime.start()
+    rig.recognize()
+    rig.pill.show_state.assert_called_with(PillState.CLIPBOARD_ONLY)
+    assert not paste_module.has_pending()
+    rig.runtime.shutdown()
+    rig.restore_paste.assert_called_once_with()
+    assert restore_results == [False]
+    assert not paste_module.has_pending()
+    rig.application.clipboard.assert_not_called()
+    assert rig.clipboard.mock_calls == []
+
+
+def test_atexit_registers_only_restore_and_shutdown_unregisters_it(rig: Rig) -> None:
+    """Аварийная ручка вызывает лишь восстановление, штатный выход снимает её."""
+    rig.atexit_register.assert_not_called()
+    rig.runtime.start()
+    rig.runtime.start()
+    rig.atexit_register.assert_called_once_with(rig.restore_paste)
+    rig.atexit_unregister.assert_not_called()
+    callback = rig.atexit_register.call_args.args[0]
+    rig.trace.clear()
+    assert callback() is False
+    assert rig.trace == ["restore_paste"]
+    rig.application.clipboard.assert_not_called()
+    assert rig.clipboard.mock_calls == []
+    rig.restore_paste.reset_mock()
+    rig.runtime.shutdown()
+    rig.runtime.shutdown()
+    rig.restore_paste.assert_called_once_with()
+    rig.atexit_unregister.assert_called_once_with(callback)
 
 
 def test_shutdown_during_recording_cancels_before_closing_audio(rig: Rig) -> None:
@@ -516,3 +821,115 @@ def test_shutdown_reentrant_from_event_drain(rig: Rig, monkeypatch: pytest.Monke
     rig.supervisor.stop.assert_called_once_with()
     rig.hotkey.ungrab.assert_called_once_with()
     rig.x11.close.assert_called_once_with()
+
+
+def test_begin_and_end_hotkey_capture_use_dedicated_watchdog(rig: Rig) -> None:
+    runtime = rig.runtime
+    rig.capture_watchdog_factory.assert_not_called()
+    runtime.end_hotkey_capture()
+    assert runtime.begin_hotkey_capture()
+    watchdog = rig.capture_watchdogs[0]
+    rig.capture_watchdog_factory.assert_called_once_with()
+    watchdog.open.assert_called_once_with()
+    assert watchdog.active
+    assert runtime.begin_hotkey_capture()
+    watchdog.open.assert_called_once_with()
+    rig.capture_watchdog_factory.assert_called_once_with()
+    runtime.end_hotkey_capture()
+    runtime.end_hotkey_capture()
+    watchdog.close.assert_called_once_with()
+    assert not watchdog.active
+    assert runtime.begin_hotkey_capture()
+    assert len(rig.capture_watchdogs) == 2
+    assert rig.capture_watchdogs[1] is not watchdog
+    runtime.end_hotkey_capture()
+    rig.capture_watchdogs[1].close.assert_called_once_with()
+    assert rig.x11.mock_calls == [], "Захват поля затронул основное X-соединение"
+    assert rig.hotkey.mock_calls == [], "Захват поля затронул соединение хоткея"
+    assert not rig.timers, "Сторож поля использовал GUI-таймер"
+
+
+def test_begin_hotkey_capture_failure_cleans_up_and_allows_retry(rig: Rig) -> None:
+    rig.capture_open_ok = False
+    assert not rig.runtime.begin_hotkey_capture()
+    failed = rig.capture_watchdogs[0]
+    failed.close.assert_called_once_with()
+    rig.runtime.end_hotkey_capture()
+    failed.close.assert_called_once_with()
+    rig.capture_open_ok = True
+    assert rig.runtime.begin_hotkey_capture()
+    assert len(rig.capture_watchdogs) == 2
+    rig.runtime.end_hotkey_capture()
+
+
+def test_begin_hotkey_capture_after_expiry_replaces_watchdog(rig: Rig) -> None:
+    assert rig.runtime.begin_hotkey_capture()
+    expired = rig.capture_watchdogs[0]
+    expired.active = False
+    assert rig.runtime.begin_hotkey_capture()
+    expired.close.assert_called_once_with()
+    assert len(rig.capture_watchdogs) == 2
+    rig.runtime.end_hotkey_capture()
+
+
+def test_shutdown_stops_capture_even_without_runtime_start(rig: Rig) -> None:
+    assert rig.runtime.begin_hotkey_capture()
+    watchdog = rig.capture_watchdogs[0]
+    rig.runtime.shutdown()
+    rig.runtime.shutdown()
+    rig.runtime.end_hotkey_capture()
+    watchdog.close.assert_called_once_with()
+    assert not watchdog.active
+    assert not rig.runtime.begin_hotkey_capture()
+    rig.capture_watchdog_factory.assert_called_once_with()
+
+
+def test_cancel_restart_replaces_supervisor_and_routes_new_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drain = DictationRuntime._drain_worker_events
+    rig = Rig(monkeypatch)
+    runtime = rig.runtime
+    runtime.start()
+    old = rig.supervisor
+    old.generation = 7
+    rig.hotkey.fsm.press(rig.now)
+    runtime.orchestrator.cancel("tray")
+    next(t for t in rig.timers if t.interval == CANCEL_TIMEOUT_MS).fire()
+    new = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = new
+    rig.trace.clear()
+    new.start.side_effect = lambda: rig.record("new.start")
+    next(t for t in rig.timers if t.interval == CANCEL_RESTART_MS).fire()
+    assert rig.trace[:2] == ["worker.stop", "new.start"]
+    assert runtime.supervisor is new
+    old.stop.assert_called_once_with()
+    new.start.assert_called_once_with()
+    assert new.generation == 8
+    rig.supervisor_factory.assert_called_with(
+        on_event=runtime.orchestrator.on_worker_event, use_qt=True
+    )
+    old.send.reset_mock()
+    rig.hotkey.fsm.press(rig.now + 3)
+    assert new.send.call_args.args[0]["type"] == "record.start"
+    rig.hotkey.fsm.release(rig.now + 4)
+    assert [c.args[0]["type"] for c in new.send.call_args_list] == [
+        "record.start",
+        "record.stop",
+        "recognize",
+    ]
+    callback = rig.supervisor_factory.call_args.kwargs["on_event"]
+    callback({"type": "result", "generation": 7, "text": "старый результат"})
+    rig.paste.assert_not_called()
+    callback({"type": "result", "generation": 8, "text": MARKER})
+    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    monkeypatch.setattr(module, "QCoreApplication", Mock())
+    drain(runtime)
+    new.pump.assert_called_once_with(timeout=0.05)
+    old.pump.assert_not_called()
+    runtime.shutdown()
+    new.stop.assert_called_once_with()
+    old.send.assert_not_called()
+    rig.supervisor_factory.reset_mock()
+    runtime.restart_worker()
+    rig.supervisor_factory.assert_not_called()

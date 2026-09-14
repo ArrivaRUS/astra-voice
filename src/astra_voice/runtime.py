@@ -2,25 +2,36 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 from collections.abc import Callable
 from functools import partial
 from time import monotonic
 from typing import Any, cast
 
+from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEventLoop, QObject, QSocketNotifier, Qt, QTimer
 from PyQt5.QtWidgets import QApplication
 
+from astra_voice.core.capture_watchdog import CaptureFieldWatchdog
 from astra_voice.core.dictation import DictationOrchestrator, DictationPhase
 from astra_voice.core.settings import Settings
-from astra_voice.core.stats import Stats
+from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
 from astra_voice.platform.hotkey import (
     DEFAULT_CANDIDATES,
     RECORD_LIMIT_S,
     HotkeyManager,
     HotkeyMode,
+    HotkeyState,
 )
-from astra_voice.platform.paste import PasteMode, PasteOutcome, paste_text
+from astra_voice.platform.paste import (
+    KDE_HINT,
+    PasteMode,
+    PasteOutcome,
+    paste_text,
+    restore_mime,
+    restore_pending,
+)
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.x11 import X11Display
 from astra_voice.ui import notify
@@ -53,9 +64,11 @@ class DictationRuntime(QObject):
         hotkey_factory: Callable[[], HotkeyManager] = HotkeyManager,
         stats_factory: Callable[[], Stats] = Stats,
         paste_func: Callable[[str, int | None, PasteMode], PasteOutcome] = paste_text,
+        restore_paste: Callable[[], bool] = restore_pending,
         x11_factory: Callable[[], X11Display] = X11Display,
         guard_factory: Callable[..., IndicatorGuard] = IndicatorGuard,
         provider_factory: Callable[[SessionKind], TrayIconProvider] = TrayIconProvider,
+        capture_watchdog_factory: Callable[[], CaptureFieldWatchdog] = CaptureFieldWatchdog,
     ) -> None:
         super().__init__(parent)
         self.settings = settings
@@ -63,44 +76,82 @@ class DictationRuntime(QObject):
         self.on_quit_requested: Callable[[], None] | None = None
         self._started = False
         self._closed = False
+        self._supervisor_factory = supervisor_factory
+        self._capture_watchdog_factory = capture_watchdog_factory
+        self._capture_watchdog: CaptureFieldWatchdog | None = None
         self.notifier: QSocketNotifier | None = None
         self.tick_timer: QTimer | None = None
+        self.stats_timer: QTimer | None = None
         self.timers: set[QTimer] = set()
-        self.x11 = x11_factory()
-        self.hotkey = hotkey_factory()
-        self.pill = pill_factory(session=session_kind, parent=self)
-        self.provider = provider_factory(session_kind)
-        self.tray = tray_factory(self.provider, hotkey=settings.hotkey, parent=self)
-        self.guard = guard_factory(self.pill, self.tray, parent=self)
-        self.stats = stats_factory()
-        self.paste_func = paste_func
-        self.orchestrator = DictationOrchestrator(
-            send=self._send,
-            generation=lambda: self.supervisor.generation,
-            pill=self.pill,
-            tray=self.tray,
-            paste=self.paste_func,
-            active_window=self.x11.active_window,
-            schedule=self.schedule,
-            cancel_timer=self.cancel_timer,
-            hotkey_done=lambda: self.hotkey.fsm.done(monotonic()),
-            set_recording=self.guard.set_recording,
-            notify=notify.notify,
-            paste_mode=self.paste_mode,
-            record_params=self.record_params,
-            stats=self.stats,
-        )
-        self.supervisor = supervisor_factory(
-            on_event=self.orchestrator.on_worker_event, use_qt=True
-        )
-        self.hotkey.on_state = self.orchestrator.on_hotkey_state
-        self.pill.on_cancel_clicked = lambda: self.orchestrator.cancel("pill")
-        self.tray.on_cancel = lambda: self.orchestrator.cancel("tray")
-        self.tray.on_copy_last = self._copy_last
-        self.tray.on_quit = self._quit_requested
-        self.guard.on_stop_recording = self.orchestrator.on_indicators_lost
-        if not settings.pill_enabled:
-            self.pill.set_enabled(False)
+        rollback: list[tuple[str, Callable[[], object]]] = [
+            ("объекты Qt", self._delete_build_children),
+        ]
+        try:
+            self.x11 = x11_factory()
+            rollback.append(("основное соединение X11", self.x11.close))
+            self.hotkey = hotkey_factory()
+            rollback.extend(
+                (
+                    ("соединение хоткея", self._close_hotkey_backend),
+                    ("захват Escape", self._ungrab_escape),
+                    ("захват хоткея", self.hotkey.ungrab),
+                )
+            )
+            self.pill = pill_factory(session=session_kind, parent=self)
+            rollback.append(("пилюля", self.pill.hide))
+            self.provider = provider_factory(session_kind)
+            self.tray = tray_factory(self.provider, hotkey=settings.hotkey, parent=self)
+            rollback.append(("трей", self.tray.stop))
+            self.guard = guard_factory(self.pill, self.tray, parent=self)
+            rollback.append(("страж индикаторов", self.guard.stop))
+            self.stats = stats_factory()
+            rollback.append(("статистика", self.stats.flush))
+            self.paste_func = paste_func
+            self.restore_paste = restore_paste
+            self.orchestrator = DictationOrchestrator(
+                send=self._send,
+                generation=lambda: self.supervisor.generation,
+                restart_worker=self.restart_worker,
+                pill=self.pill,
+                tray=self.tray,
+                paste=self.paste_func,
+                active_window=self.x11.active_window,
+                schedule=self.schedule,
+                cancel_timer=self.cancel_timer,
+                hotkey_done=lambda: self.hotkey.fsm.done(monotonic()),
+                hotkey_cancel=lambda: self.hotkey.fsm.escape(monotonic()),
+                hotkey_idle=lambda: self.hotkey.fsm.state is HotkeyState.IDLE,
+                set_recording=self.guard.set_recording,
+                paste_mode=self.paste_mode,
+                record_params=self.record_params,
+                stats=self.stats,
+            )
+            rollback.append(("оркестратор", self.orchestrator.shutdown))
+            self.supervisor = supervisor_factory(
+                on_event=self.orchestrator.on_worker_event, use_qt=True
+            )
+            rollback.append(("воркер", self.supervisor.stop))
+            self.hotkey.on_state = self.orchestrator.on_hotkey_state
+            self.pill.on_cancel_clicked = lambda: self.orchestrator.cancel("pill")
+            self.tray.on_cancel = lambda: self.orchestrator.cancel("tray")
+            self.tray.on_copy_last = self._copy_last
+            self.tray.on_quit = self._quit_requested
+            self.guard.on_stop_recording = self.orchestrator.on_indicators_lost
+            if not settings.pill_enabled:
+                self.pill.set_enabled(False)
+        except Exception:
+            self._closed = True
+            for step, action in reversed(rollback):
+                self._cleanup(step, action)
+            raise
+
+    def _delete_build_children(self) -> None:
+        """Удаляет и те QObject, чьи конструкторы не успели вернуть результат."""
+        # Держим Python-обёртки живыми до удаления C++-объектов: GC цикла
+        # runtime/Pill/View иначе может вызвать eventFilter уже мёртвой Pill.
+        # Удаление Pill также закрывает её X11 и ставит удаление QQuickView.
+        for child in reversed(self.children()):
+            self._cleanup("дочерний объект Qt", partial(sip.delete, child))
 
     @property
     def phase(self) -> DictationPhase:
@@ -115,6 +166,18 @@ class DictationRuntime(QObject):
     def _send(self, message: dict[str, Any], *, timeout: float | None = None) -> None:
         """Адаптирует возвращаемое значение супервизора к порту команд."""
         self.supervisor.send(message, timeout=timeout)
+
+    def restart_worker(self) -> None:
+        """Заменяет супервизор, сохраняя уникальность поколений между заменами."""
+        if self._closed:
+            return
+        generation = self.supervisor.generation + 1
+        self.supervisor.stop()
+        self.supervisor = self._supervisor_factory(
+            on_event=self.orchestrator.on_worker_event, use_qt=True
+        )
+        self.supervisor.generation = generation
+        self.supervisor.start()
 
     def record_params(self) -> dict[str, Any]:
         """Параметры записи; расширения настроек читаются перед каждой фразой."""
@@ -176,6 +239,7 @@ class DictationRuntime(QObject):
         if self._started or self._closed:
             return
         self._started = True
+        atexit.register(self.restore_paste)
         self.x11.open()
         self.tray.start()
         self.supervisor.start()
@@ -195,6 +259,43 @@ class DictationRuntime(QObject):
         self.tick_timer = self._create_timer()
         self.tick_timer.timeout.connect(self._tick_hotkey)
         self.tick_timer.start(200)
+        self.stats_timer = self._create_timer()
+        self.stats_timer.timeout.connect(self._flush_stats)
+        self.stats_timer.start(int(SAVE_INTERVAL_S * 1000))
+
+    def _flush_stats(self) -> None:
+        """Сохраняет события и без новых диктовок; сбой не останавливает таймер."""
+        if not self._closed:
+            try:
+                self.stats.flush()
+            except Exception:
+                log.warning("Не удалось сохранить статистику")
+
+    def begin_hotkey_capture(self) -> bool:
+        """Единственная точка захвата клавиатуры полем комбинации (экран в M5).
+
+        Сторож сам создаёт отдельное X-соединение в своём потоке. GUI к нему
+        не обращается; будущий экран читает клавиши своим обычным путём.
+        Повторный вызов при активном захвате не продлевает его срок.
+        """
+        if self._closed:
+            return False
+        if self._capture_watchdog is not None:
+            if self._capture_watchdog.active:
+                return True
+            self.end_hotkey_capture()
+        watchdog = self._capture_watchdog_factory()
+        self._capture_watchdog = watchdog
+        if watchdog.open():
+            return True
+        self.end_hotkey_capture()
+        return False
+
+    def end_hotkey_capture(self) -> None:
+        """Завершает выбор комбинации и останавливает его сторож; идемпотентно."""
+        watchdog, self._capture_watchdog = self._capture_watchdog, None
+        if watchdog is not None:
+            watchdog.close()
 
     def _process_hotkey(self, *args: object) -> None:
         """Передаёт готовность дескриптора менеджеру клавиш."""
@@ -207,10 +308,16 @@ class DictationRuntime(QObject):
             self.hotkey.fsm.tick(monotonic())
 
     def _copy_last(self) -> None:
-        """Копирует фразу исключительно в буфер обмена Qt."""
+        """Копирует нормализованную фразу в буфер Qt с пометкой secret (У59)."""
         text = self.last_text
         if text is not None:
-            QApplication.clipboard().setText(text)
+            # TODO(зона A): нужна публичная функция публикации. Тип из чёрного
+            # списка Fly здесь не ставится: фраза всё ещё может попасть в историю.
+            # Снимок владения _last_clipboard_snapshot не обновляется: следующая
+            # диктовка сочтёт буфер чужим и при восстановлении очистит вместо
+            # возврата — безопасная деградация, но скопированное будет потеряно.
+            snapshot = {"text/plain": text.encode("utf-8"), KDE_HINT: b"secret"}
+            QApplication.clipboard().setMimeData(restore_mime(snapshot))
 
     def _quit_requested(self) -> None:
         """Передаёт запрос выхода владельцу приложения."""
@@ -244,15 +351,23 @@ class DictationRuntime(QObject):
         if self.tick_timer is not None:
             self._cleanup("остановка таймера хоткея", self.tick_timer.stop)
             self._cleanup("удаление таймера хоткея", self.tick_timer.deleteLater)
+        if self.stats_timer is not None:
+            self._cleanup("остановка таймера статистики", self.stats_timer.stop)
+            self._cleanup("удаление таймера статистики", self.stats_timer.deleteLater)
         # Страховка для таймеров, если завершение оркестратора прервалось ошибкой.
         for timer in tuple(self.timers):
             self._cleanup("отложенный таймер", partial(self.cancel_timer, timer))
-        self._cleanup("захват хоткея", self.hotkey.ungrab)
-        self._cleanup("захват Escape", self._ungrab_escape)
-        self._cleanup("соединение хоткея", self._close_hotkey_backend)
+        self._cleanup("восстановление буфера обмена", self.restore_paste)
+        if self._started:
+            self._cleanup("обработчик atexit", partial(atexit.unregister, self.restore_paste))
         self._cleanup("освобождение микрофона", self._close_audio)
         self._cleanup("доставка команд воркеру", self._drain_if_running)
         self._cleanup("воркер", self.supervisor.stop)
+        self._cleanup("статистика", self.stats.flush)
+        self._cleanup("захват хоткея", self.hotkey.ungrab)
+        self._cleanup("захват Escape", self._ungrab_escape)
+        self._cleanup("сторож поля комбинации", self.end_hotkey_capture)
+        self._cleanup("соединение хоткея", self._close_hotkey_backend)
         self._cleanup("трей", self.tray.stop)
         self._cleanup("основное соединение X11", self.x11.close)
 

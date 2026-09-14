@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import socket
 import subprocess
@@ -14,6 +15,7 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -235,8 +237,6 @@ def test_theme_source_matches_session_kind() -> None:
 
 
 def test_close_to_tray_hides_window_without_quitting(monkeypatch: pytest.MonkeyPatch) -> None:
-    from unittest.mock import Mock
-
     from PyQt5.QtCore import QEvent, QObject
 
     from astra_voice import app as app_mod
@@ -246,12 +246,82 @@ def test_close_to_tray_hides_window_without_quitting(monkeypatch: pytest.MonkeyP
     window = QObject()
     hide = Mock()
     monkeypatch.setattr(window, "hide", hide, raising=False)
-    watcher = app_mod._wire_close(app, window)
+    watcher = app_mod._wire_close(app, window, is_tray_ready=lambda: True)
     assert watcher is not None
     event = QEvent(QEvent.Close)
 
     assert watcher.eventFilter(window, event) is True
     assert not event.isAccepted()
+    hide.assert_called_once_with()
+    app.quit.assert_not_called()
+
+
+@pytest.mark.parametrize("tray_state", ["unregistered", "missing", "error"])
+def test_close_without_tray_quits_with_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tray_state: str
+) -> None:
+    from PyQt5.QtCore import QEvent, QObject
+
+    from astra_voice import app as app_mod
+
+    app = Mock()
+    window = QObject()
+    hide = Mock()
+    monkeypatch.setattr(window, "hide", hide, raising=False)
+    predicate = Mock(return_value=False)
+    if tray_state == "error":
+        predicate.side_effect = RuntimeError("Tray /private/path")
+    if tray_state == "missing":
+        watcher = app_mod._wire_close(app, window)
+    else:
+        watcher = app_mod._wire_close(app, window, is_tray_ready=predicate)
+    assert watcher is not None
+    predicate.assert_not_called()
+    event = QEvent(QEvent.Close)
+
+    with caplog.at_level(logging.WARNING, logger=app_mod.__name__):
+        assert watcher.eventFilter(window, event) is False
+
+    assert event.isAccepted()
+    hide.assert_not_called()
+    app.quit.assert_called_once_with()
+    assert caplog.record_tuples == [
+        (
+            app_mod.__name__,
+            logging.WARNING,
+            "Трей недоступен — закрытие окна завершает приложение",
+        )
+    ]
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_close_checks_tray_on_every_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    from PyQt5.QtCore import QEvent, QObject
+
+    from astra_voice import app as app_mod
+
+    app = Mock()
+    window = QObject()
+    hide = Mock()
+    monkeypatch.setattr(window, "hide", hide, raising=False)
+    predicate = Mock(return_value=False)
+    watcher = app_mod._wire_close(app, window, is_tray_ready=predicate)
+    assert watcher is not None
+    predicate.assert_not_called()
+
+    first_event = QEvent(QEvent.Close)
+    assert watcher.eventFilter(window, first_event) is False
+    assert first_event.isAccepted()
+    predicate.assert_called_once_with()
+    hide.assert_not_called()
+    app.quit.assert_called_once_with()
+
+    predicate.return_value = True
+    app.quit.reset_mock()
+    second_event = QEvent(QEvent.Close)
+    assert watcher.eventFilter(window, second_event) is True
+    assert not second_event.isAccepted()
+    assert predicate.call_count == 2
     hide.assert_called_once_with()
     app.quit.assert_not_called()
 

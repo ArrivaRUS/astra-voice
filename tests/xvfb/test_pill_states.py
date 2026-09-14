@@ -2,13 +2,16 @@
 
 xvfb в системе не установлен. Запуск без X-сервера:
 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software pytest -m xvfb.
-Снимки в design/refs/impl/pill/ включают поля тени окна; сама пилюля имеет высоту 36.
+Снимки в design/refs/impl/pill/ могут включать поля тени окна (offscreen) или
+содержать только пилюлю (композитор). Тест поддерживает оба режима; сама пилюля
+имеет высоту 36. Проверка тени отдельно пропускается, если поля не попали в кадр.
 Референс design/refs/09-pill.png проверяется на наличие, без попиксельного сравнения.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from math import ceil, floor
@@ -16,6 +19,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from helpers.qt_app import get_qapplication  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
@@ -65,17 +71,12 @@ class RenderedState:
     bars: list[tuple[int, float, float, str]]
     messages: list[str]
     snapshot: Path | None
+    shadow_present: bool | None
 
 
 @pytest.fixture(scope="session")
 def pill_app() -> Any:
-    pytest.importorskip("PyQt5.QtQuick", reason="нужен python3-pyqt5.qtquick")
-    from PyQt5.QtWidgets import QApplication
-
-    # QApplication совместим и с последующими тестами настоящего QMenu.
-    app = QApplication.instance() or QApplication([])
-    assert isinstance(app, QApplication)
-    return app
+    return get_qapplication()
 
 
 def visual_tree(root: Any) -> Iterator[Any]:
@@ -85,7 +86,9 @@ def visual_tree(root: Any) -> Iterator[Any]:
         yield from visual_tree(child)
 
 
-def capture_state(app: Any, state: str) -> RenderedState:
+def capture_state(
+    app: Any, state: str, *, text: str | None = None, snapshot_dir: Path = SNAPSHOTS
+) -> RenderedState:
     from PyQt5 import sip
     from PyQt5.QtCore import QPointF, QUrl, qInstallMessageHandler
     from PyQt5.QtQuick import QQuickView
@@ -118,34 +121,76 @@ def capture_state(app: Any, state: str) -> RenderedState:
             for level in LEVELS:
                 pill.show_state(PillState.LISTENING, level=level)
         else:
-            pill.show_state(PillState(state), text=LABELS[state] if state == "error" else None)
+            if text is None and state == "error":
+                text = LABELS[state]
+            pill.show_state(PillState(state), text=text)
         # Завершаем переход opacity (160/120 мс), Row polish и загрузку глифов.
         QTest.qWait(180)
         app.processEvents()
         assert root.property("avState") == state
+        pill_width = float(root.property("pillWidth"))
+        pill_height = float(root.property("pillHeight"))
 
         snapshot = None
+        shadow_present = None
         if state not in INVISIBLE:
             assert view.isVisible() and view.isExposed()
-            image = view.grabWindow()
-            if image.isNull():
-                # Некоторые сборки Qt5/offscreen не реализуют grabWindow даже после show.
-                grab = view.contentItem().grabToImage()
-                assert grab is not None, f"{state}: grabToImage не запустился"
-                for _ in range(20):
-                    QTest.qWait(10)
-                    image = grab.image()
-                    if not image.isNull():
-                        break
-            assert not image.isNull(), f"{state}: пустой снимок"
-            dpr = image.devicePixelRatio()
-            assert image.width() / dpr == ceil(root.width()) + 36
-            assert image.height() / dpr == 78  # 36 + два поля по 18 + смещение тени 6.
-            assert any(
-                image.pixelColor(x, image.height() // 2).alpha() > 0 for x in range(image.width())
-            ), f"{state}: полностью прозрачный снимок"
-            SNAPSHOTS.mkdir(parents=True, exist_ok=True)
-            snapshot = SNAPSHOTS / f"{state}.png"
+            # Ширина QML может быть дробной; окно округляет её вверх до целого px.
+            with_shadow = (ceil(pill_width) + 36, 78)
+            pill_only = (ceil(pill_width), 36)
+            grab = None
+            for attempt in range(1, 21):
+                if attempt > 1:
+                    QTest.qWait(25)
+                image = view.grabWindow()
+                if image.isNull():
+                    # Некоторые сборки Qt5/offscreen не реализуют grabWindow даже после show.
+                    if grab is None:
+                        grab = view.contentItem().grabToImage()
+                    if grab is not None:
+                        image = grab.image()
+                        if not image.isNull():
+                            # Готовый, но неподходящий кадр нужно снять заново.
+                            grab = None
+                dpr = image.devicePixelRatio()
+                actual_size = (image.width() / dpr, image.height() / dpr)
+                if image.isNull():
+                    failure = "пустой снимок"
+                    if grab is None:
+                        failure += "; grabToImage не запустился"
+                    continue
+                if actual_size not in (with_shadow, pill_only):
+                    failure = "недопустимый размер снимка"
+                    continue
+                # В полном окне начало берём из дерева, в обрезанном кадре оно равно (0, 0).
+                origin = (
+                    root.mapToItem(view.contentItem(), QPointF(0, 0))
+                    if actual_size == with_shadow
+                    else QPointF(0, 0)
+                )
+                left = ceil(origin.x() * dpr)
+                right = min(image.width(), ceil((origin.x() + pill_width) * dpr))
+                center_y = floor((origin.y() + pill_height / 2) * dpr)
+                if any(image.pixelColor(x, center_y).alpha() > 0 for x in range(left, right)):
+                    break
+                failure = "полностью прозрачная пилюля на снимке"
+            else:
+                pytest.fail(
+                    f"{state}: {failure}; размер снимка {actual_size} (DPR={dpr}); "
+                    f"ожидалось окно с полем тени {with_shadow} или только пилюля {pill_only}; "
+                    f"QML pillWidth={pill_width}, pillHeight={pill_height}; попыток: {attempt}"
+                )
+            if actual_size == with_shadow:
+                center_x = floor((origin.x() + pill_width / 2) * dpr)
+                bottom = ceil((origin.y() + pill_height) * dpr)
+                # Под центром пилюли должна быть полупрозрачная чёрная внешняя тень.
+                shadow_present = any(
+                    0 < (pixel := image.pixelColor(center_x, y)).alpha() < 255
+                    and pixel.red() == pixel.green() == pixel.blue() == 0
+                    for y in range(bottom, image.height())
+                )
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            snapshot = snapshot_dir / f"{state}.png"
             assert image.save(str(snapshot), "PNG"), f"не удалось сохранить {snapshot}"
 
         texts = []
@@ -181,8 +226,8 @@ def capture_state(app: Any, state: str) -> RenderedState:
                 )
         assert len(close_buttons) == 1, f"{state}: должна существовать одна кнопка «×»"
         return RenderedState(
-            width=root.width(),
-            height=root.height(),
+            width=pill_width,
+            height=pill_height,
             visible=view.isVisible(),
             item_visible=root.isVisible(),
             close_visible=close_buttons[0].isVisible(),
@@ -190,6 +235,7 @@ def capture_state(app: Any, state: str) -> RenderedState:
             bars=sorted(bars),
             messages=messages,
             snapshot=snapshot,
+            shadow_present=shadow_present,
         )
     finally:
         # Деструкторы также входят в перехват; таймеры не переживают своё окно.
@@ -209,17 +255,9 @@ def rendered_states(pill_app: Any) -> dict[str, RenderedState]:
     return {state: capture_state(pill_app, state) for state in LABELS}
 
 
-@pytest.mark.parametrize("state", LABELS)
-def test_pill_state(state: str, rendered_states: dict[str, RenderedState]) -> None:
-    rendered = rendered_states[state]
-    assert not rendered.messages, f"{state}: сообщения Qt\n" + "\n".join(rendered.messages)
+def assert_pill_geometry_and_text(state: str, rendered: RenderedState) -> None:
     assert 172 <= rendered.width <= 320
     assert rendered.height == 36
-    assert rendered.visible == (state not in INVISIBLE)
-    assert rendered.item_visible == rendered.visible
-    assert rendered.close_visible == (state in {"listening", "listening-silent"}), (
-        f"{state}: неверная видимость кнопки «×»"
-    )
     assert rendered.texts, "проверка Text не должна быть пустой"
     for text in rendered.texts:
         # QQuickText::ElideNone == 3 (QQuickText не экспортирован классом в PyQt5).
@@ -231,6 +269,18 @@ def test_pill_state(state: str, rendered_states: dict[str, RenderedState]) -> No
                 f"{text.left}…{text.right}, ширина {rendered.width}"
             )
 
+
+@pytest.mark.parametrize("state", LABELS)
+def test_pill_state(state: str, rendered_states: dict[str, RenderedState]) -> None:
+    rendered = rendered_states[state]
+    assert not rendered.messages, f"{state}: сообщения Qt\n" + "\n".join(rendered.messages)
+    assert_pill_geometry_and_text(state, rendered)
+    assert rendered.visible == (state not in INVISIBLE)
+    assert rendered.item_visible == rendered.visible
+    assert rendered.close_visible == (state in {"listening", "listening-silent"}), (
+        f"{state}: неверная видимость кнопки «×»"
+    )
+    # Цвета, столбики и «×» измеряются в QML, независимо от полей снимка.
     # «—» и «›» — символы иконок со своими цветами по §8.4; здесь проверяется подпись.
     captions = [text for text in rendered.texts if text.text not in {"—", "›"}]
     assert len(captions) == 1
@@ -267,6 +317,30 @@ def test_pill_state(state: str, rendered_states: dict[str, RenderedState]) -> No
         assert all(
             height == max(3, floor(level * 20 + 0.5)) for _, level, height, _ in rendered.bars
         )
+
+
+@pytest.mark.parametrize("state", [state for state in LABELS if state not in INVISIBLE])
+def test_pill_snapshot_shadow(state: str, rendered_states: dict[str, RenderedState]) -> None:
+    rendered = rendered_states[state]
+    if rendered.shadow_present is None:
+        pytest.skip(f"{state}: снимок содержит только пилюлю, поле тени не попало в кадр")
+    assert rendered.shadow_present, f"{state}: поле есть в снимке, но внешняя тень отсутствует"
+
+
+def test_clipboard_window_changed_label(pill_app: Any, tmp_path: Path) -> None:
+    from astra_voice.ui.pill import CLIPBOARD_WINDOW_CHANGED
+
+    state = "clipboard-only"
+    rendered = capture_state(pill_app, state, text=CLIPBOARD_WINDOW_CHANGED, snapshot_dir=tmp_path)
+    assert not rendered.messages, f"{state}: сообщения Qt\n" + "\n".join(rendered.messages)
+    assert rendered.visible and rendered.item_visible
+    assert_pill_geometry_and_text(state, rendered)
+    captions = [text for text in rendered.texts if text.visible]
+    assert len(captions) == 1
+    assert captions[0].text == CLIPBOARD_WINDOW_CHANGED
+    assert captions[0].color == "#F2F5FA"
+    assert not rendered.close_visible
+    assert rendered.snapshot is not None and rendered.snapshot.is_file()
 
 
 def test_design_reference_and_snapshots_exist(rendered_states: dict[str, RenderedState]) -> None:

@@ -119,6 +119,7 @@ class FakeClipboard:
 def isolated_session_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Сеанс и запомненный снимок независимы от предыдущего теста."""
     monkeypatch.setattr(paste, "_last_clipboard_snapshot", None)
+    monkeypatch.setattr(paste, "_pending", None)
     paste._session_kind.cache_clear()
     yield
     paste._session_kind.cache_clear()
@@ -147,6 +148,199 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeClipboard, Mock, list[
     monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
     monkeypatch.delenv("DESKTOP_SESSION", raising=False)
     return cb, x, delays
+
+
+@pytest.mark.parametrize("delay", [50, 100])
+@pytest.mark.parametrize("primary", [False, True])
+def test_restore_pending_during_auto(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    delay: int,
+    primary: bool,
+) -> None:
+    """Аварийный возврат в обеих паузах; продолжение не повторяет ввод и записи."""
+    cb, x, _ = harness
+    if primary:
+        x.wm_class.return_value = ("xterm", "xterm")
+    before = {mode: cb.snapshot(mode) for mode in (False, True)}
+    observed: list[bool] = []
+    writes_after: list[tuple[bool, dict[str, bytes]]] = []
+    forbidden = Mock(side_effect=AssertionError("паузы и X запрещены"))
+
+    def interrupt(ms: int) -> None:
+        if ms != delay:
+            return
+        observed.append(paste.has_pending())
+        with monkeypatch.context() as patch:
+            patch.setattr(paste, "_wait_ms", forbidden)
+            patch.setattr(paste, "X11Display", forbidden)
+            patch.setattr(paste, "_session_kind", forbidden)
+            for name in ("open", "close", "send_combo", "grab_keyboard", "ungrab_keyboard"):
+                patch.setattr(x, name, forbidden)
+            observed.extend([paste.restore_pending(), paste.has_pending()])
+            writes_after.extend(cb.writes)
+            observed.append(paste.restore_pending())
+
+    monkeypatch.setattr(paste, "_wait_ms", interrupt)
+    paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert observed == [True, True, False, False]
+    assert cb.data == before
+    assert cb.writes == writes_after
+    assert len(cb.writes) == (4 if primary else 2)
+    assert not paste.has_pending()
+    forbidden.assert_not_called()
+    assert x.send_combo.call_count == (0 if delay == 50 else 1)
+
+
+@pytest.mark.parametrize("scenario", ["manual", "clipboard-only", "window-changed", "failed"])
+def test_restore_pending_keeps_phrase_for_non_pasted(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    cb, x, _ = harness
+    observed: list[bool] = []
+    mode = PasteMode.CLIPBOARD_ONLY if scenario == "manual" else PasteMode.AUTO
+    if scenario == "manual":
+        monkeypatch.setattr(cb, "snapshot", Mock(side_effect=AssertionError("снимок запрещён")))
+    elif scenario == "clipboard-only":
+        x.send_combo.side_effect = RuntimeError("ввод недоступен")
+    elif scenario == "window-changed":
+        x.send_combo.return_value = False
+    else:
+        # Публикация произошла, но адаптер сообщил об ошибке.
+        put = cb.put
+
+        def failing_put(snapshot: dict[str, bytes], primary: bool) -> None:
+            put(snapshot, primary)
+            raise RuntimeError("публикация прервана")
+
+        monkeypatch.setattr(cb, "put", failing_put)
+
+    def wait(ms: int) -> None:
+        if scenario == "manual" or ms == 100:
+            observed.extend([paste.has_pending(), paste.restore_pending()])
+
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    outcome = paste.paste_text("фраза", 42, mode)
+    assert (
+        outcome.kind
+        == {
+            "manual": PasteOutcomeKind.CLIPBOARD_ONLY,
+            "clipboard-only": PasteOutcomeKind.CLIPBOARD_ONLY,
+            "window-changed": PasteOutcomeKind.WINDOW_CHANGED,
+            "failed": PasteOutcomeKind.FAILED,
+        }[scenario]
+    )
+    assert not any(observed)
+    assert not paste.has_pending()
+    assert not paste.restore_pending()
+    assert cb.data[False] == {"text/plain": "фраза".encode(), paste.KDE_HINT: b"secret"}
+    assert len(cb.writes) == 1
+
+
+@pytest.mark.parametrize("primary", [False, True])
+@pytest.mark.parametrize("state", ["secret", "own-secret", "not-owner", "empty"])
+def test_restore_pending_uses_existing_restore_rules(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    primary: bool,
+    state: str,
+) -> None:
+    cb, x, _ = harness
+    if primary:
+        x.wm_class.return_value = ("xterm", "xterm")
+    if state in {"secret", "own-secret"}:
+        cb.data[primary][paste.KDE_HINT] = b"secret"
+        if state == "own-secret":
+            monkeypatch.setattr(paste, "_last_clipboard_snapshot", cb.snapshot(False))
+            cb.owned[False] = True
+    elif state == "empty":
+        cb.data[primary] = {}
+    saved = cb.snapshot(primary)
+    observed: list[bool] = []
+    writes_before: list[tuple[bool, dict[str, bytes]]] = []
+
+    def interrupt(ms: int) -> None:
+        if ms != 50:
+            return
+        if state == "not-owner":
+            cb.owned[primary] = False
+            cb.data[primary] = {"text/plain": b"new-owner"}
+            # Проверяем независимость PRIMARY от CLIPBOARD.
+            cb.owned[not primary] = False
+        writes_before.extend(cb.writes)
+        observed.extend([paste.has_pending(), paste.restore_pending()])
+
+    monkeypatch.setattr(paste, "_wait_ms", interrupt)
+    paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert observed == [True, state != "not-owner"]
+    assert not paste.has_pending()
+    assert not paste.restore_pending()
+    if state == "not-owner":
+        assert cb.data[primary] == {"text/plain": b"new-owner"}
+        assert cb.writes == writes_before
+    elif state == "secret" or (state == "own-secret" and primary):
+        # Отличение своей публикации уже действует только для CLIPBOARD.
+        assert cb.data[primary] == {}
+        assert (primary, saved) not in cb.writes
+    else:
+        assert cb.data[primary] == saved
+
+
+@pytest.mark.parametrize("lost_primary", [False, True])
+def test_restore_pending_checks_each_owner(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    lost_primary: bool,
+) -> None:
+    cb, x, _ = harness
+    x.wm_class.return_value = ("xterm", "xterm")
+    saved = cb.snapshot(not lost_primary)
+    observed: list[bool] = []
+
+    def interrupt(ms: int) -> None:
+        if ms == 50:
+            cb.owned[lost_primary] = False
+            cb.data[lost_primary] = {"text/plain": b"new-owner"}
+            observed.append(paste.restore_pending())
+
+    monkeypatch.setattr(paste, "_wait_ms", interrupt)
+    paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert observed == [True]
+    assert cb.data[lost_primary] == {"text/plain": b"new-owner"}
+    assert cb.data[not lost_primary] == saved
+    assert len(cb.writes) == 3
+    assert cb.writes[-1] == (not lost_primary, saved)
+
+
+@pytest.mark.parametrize("operation", ["owns", "put", "clear"])
+def test_restore_pending_swallows_errors(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    operation: str,
+) -> None:
+    cb, _, _ = harness
+    if operation == "clear":
+        cb.data[False][paste.KDE_HINT] = b"secret"
+    caplog.set_level("DEBUG", logger=paste.__name__)
+    observed: list[bool] = []
+    error = Mock(side_effect=RuntimeError("ПРИВАТНАЯ-ФРАЗА"))
+
+    def interrupt(ms: int) -> None:
+        if ms == 50:
+            with monkeypatch.context() as patch:
+                patch.setattr(cb, operation, error)
+                observed.extend([paste.restore_pending(), paste.restore_pending()])
+
+    monkeypatch.setattr(paste, "_wait_ms", interrupt)
+    paste.paste_text("ПРИВАТНАЯ-ФРАЗА", 42, PasteMode.AUTO)
+    assert observed == [False, False]
+    error.assert_called_once()
+    assert not paste.has_pending()
+    assert "не удалось аварийно восстановить" in caplog.text
+    assert "ПРИВАТНАЯ-ФРАЗА" not in caplog.text
 
 
 def test_clipboard_only_without_x(
@@ -226,6 +420,8 @@ def test_chain_and_both_snapshots(
     assert outcome.restore == PasteRestore.RESTORED
     assert cb.data == before
     assert delays == [800, 300]
+    assert not paste.has_pending()
+    assert not paste.restore_pending()
     x.close.assert_called_once()
 
 
@@ -482,6 +678,7 @@ def test_reentrant_call_keeps_outer_flow(
         assert cb.data == during
         assert cb.writes == writes
         assert paste._running
+        assert paste.has_pending()
         completed.append(ms)
 
     monkeypatch.setattr(paste, "_wait_ms", interrupted)
@@ -493,6 +690,8 @@ def test_reentrant_call_keeps_outer_flow(
     if secret:
         assert all(data.get("text/plain") != b"before" for _, data in cb.writes)
     assert completed == [50, 100]
+    assert not paste.has_pending()
+    assert not paste.restore_pending()
     x.close.assert_called_once()
     assert not paste._running
 
@@ -712,17 +911,25 @@ def test_qt_process_returns_outcome_without_abort(scenario: str) -> None:
             if scenario == "no-app":
                 outcome = paste.paste_text("фраза", 42, paste.PasteMode.AUTO)
                 assert outcome.kind == paste.PasteOutcomeKind.FAILED
+                paste._pending = paste._PendingRestore({"text/plain": b"before"}, False)
+                assert paste.has_pending()
+                assert paste.restore_pending() is False
                 factory.assert_not_called()
             elif scenario == "wrong-thread":
                 app = QApplication(["paste-test", "-platform", "offscreen"])
                 outcomes = []
-                thread = threading.Thread(target=lambda: outcomes.append(
-                    paste.paste_text("фраза", 42, paste.PasteMode.AUTO)))
+                restored = []
+                def worker():
+                    outcomes.append(paste.paste_text("фраза", 42, paste.PasteMode.AUTO))
+                    paste._pending = paste._PendingRestore({"text/plain": b"before"}, False)
+                    restored.append(paste.restore_pending())
+                thread = threading.Thread(target=worker)
                 thread.start()
                 thread.join(5)
                 assert not thread.is_alive()
                 assert len(outcomes) == 1
                 assert outcomes[0].kind == paste.PasteOutcomeKind.FAILED
+                assert restored == [False]
                 factory.assert_not_called()
             else:
                 app = QCoreApplication([])

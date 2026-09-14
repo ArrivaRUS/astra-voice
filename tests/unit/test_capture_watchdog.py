@@ -1,284 +1,281 @@
-"""Сторож поля захвата: ручные часы и таймеры, без настоящего X-дисплея."""
+"""Сторож в настоящем потоке: события и управляемые часы, без X-дисплея."""
 
 from __future__ import annotations
 
-import inspect
-from collections.abc import Callable
-from dataclasses import dataclass
+import socket
+import threading
+from collections.abc import Iterator
+from types import SimpleNamespace
 
 import pytest
 
+from astra_voice.core import capture_watchdog as module
 from astra_voice.core.capture_watchdog import CaptureFieldWatchdog
 from astra_voice.platform.x11 import X11Display
 
 pytestmark = pytest.mark.unit
+WAIT_S = 1.0
+
+
+class FakeSocket:
+    """Наблюдаемый транспорт, который закрывается до вежливой очистки Xlib."""
+
+    def __init__(self, owner: FakeDisplay) -> None:
+        self.owner = owner
+        self.closed = False
+
+    def shutdown(self, how: int) -> None:
+        self.owner.record("socket.shutdown")
+        assert how == socket.SHUT_RDWR
+
+    def close(self) -> None:
+        self.owner.record("socket.close")
+        self.closed = True
 
 
 class FakeDisplay(X11Display):
-    """Имитирует отдельный сокет и сохраняет дедлайн при отказе снятия захвата."""
+    """Оставляет дедлайн при отказе ungrab; все вызовы записаны с их потоком."""
 
-    def __init__(self, clock: Callable[[], float]) -> None:
+    def __init__(self, rig: Rig) -> None:
         super().__init__()
-        self.clock = clock
-        self.calls: list[str] = []
+        self.rig = rig
+        self.calls: list[tuple[str, int]] = []
+        self.record("create")
+        self.transport = FakeSocket(self)
         self.grab_args: tuple[int | None, float] | None = None
+        self.deadline_at_close: float | None = None
+
+    def record(self, action: str) -> None:
+        self.calls.append((action, threading.get_ident()))
+
+    def open(self, display_name: str | None = None) -> bool:
+        self.record("open")
+        if self.rig.open_ok:
+            self.d = SimpleNamespace(display=SimpleNamespace(socket=self.transport))
+        return self.rig.open_ok
+
+    def grab_keyboard(self, window_id: int | None = None, timeout_s: float = 30.0) -> bool:
+        self.record("grab")
+        self.grab_args = window_id, timeout_s
+        if self.rig.grab_ok:
+            self.keyboard_grab_deadline = 100.0 + timeout_s
+        return self.rig.grab_ok
+
+    def ungrab_keyboard(self) -> None:
+        self.record("ungrab")
+        if self.rig.raise_ungrab:
+            raise RuntimeError("Ошибка снятия захвата")
+        if self.rig.ungrab_ok:
+            self.keyboard_grab_deadline = None
+
+    def close(self) -> None:
+        self.record("close")
+        try:
+            # Имитируем X11Display.close: вежливая очистка может не сработать.
+            self.ungrab_keyboard()
+        finally:
+            self.deadline_at_close = self.keyboard_grab_deadline
+            self.d = None
+            self.rig.closed.set()
+        if self.rig.raise_close:
+            raise RuntimeError("Ошибка закрытия")
+
+
+class Rig:
+    """Фабрика выполняется в стороже, Event переводит часы за дедлайн."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.elapsed = threading.Event()
+        self.polled = threading.Event()
+        self.closed = threading.Event()
+        self.expired = threading.Event()
+        self.clock_calls = 0
+        self.displays: list[FakeDisplay] = []
+        self.callback_threads: list[int] = []
+        self.callback_saw_closed = False
         self.open_ok = True
         self.grab_ok = True
         self.ungrab_ok = True
         self.raise_ungrab = False
         self.raise_close = False
-        self.socket_open = False
-
-    def open(self, display_name: str | None = None) -> bool:
-        self.calls.append("open")
-        self.socket_open = self.open_ok
-        return self.open_ok
-
-    def grab_keyboard(self, window_id: int | None = None, timeout_s: float = 30.0) -> bool:
-        self.calls.append("grab")
-        self.grab_args = (window_id, timeout_s)
-        if self.grab_ok:
-            self.keyboard_grab_deadline = self.clock() + timeout_s
-        return self.grab_ok
-
-    def keyboard_grab_expired(self) -> bool:
-        self.calls.append("expired")
-        return (
-            self.keyboard_grab_deadline is not None and self.clock() >= self.keyboard_grab_deadline
-        )
-
-    def ungrab_keyboard(self) -> None:
-        self.calls.append("ungrab")
-        if self.raise_ungrab:
-            raise RuntimeError("Ошибка снятия захвата")
-        if self.ungrab_ok:
-            self.keyboard_grab_deadline = None
-
-    def close(self) -> None:
-        self.calls.append("close")
-        self.socket_open = False
-        self.keyboard_grab_deadline = None
-        if self.raise_close:
-            raise RuntimeError("Ошибка закрытия")
-
-
-@dataclass
-class Timer:
-    """Однократный ручной таймер; допускает доставку уже отменённого вызова."""
-
-    delay: int
-    callback: Callable[[], None]
-    cancelled: bool = False
-
-
-class Rig:
-    """Создаёт соединения фабрикой, записывает таймеры и уведомления."""
-
-    def __init__(self) -> None:
-        self.now = 100.0
-        self.displays: list[FakeDisplay] = []
-        self.timers: list[Timer] = []
-        self.expirations = 0
-        self.configure: Callable[[FakeDisplay], None] = lambda display: None
+        self.raise_callback = False
+        monkeypatch.setattr(module, "monotonic", self.clock)
         self.watchdog = CaptureFieldWatchdog(
-            display_factory=self.factory,
-            schedule=self.schedule,
-            cancel_timer=self.cancel_timer,
-            on_expired=self.on_expired,
+            display_factory=self.factory, poll_ms=1, on_expired=self.on_expired
         )
+
+    def clock(self) -> float:
+        self.clock_calls += 1
+        if self.clock_calls > 1:
+            self.polled.set()
+        return 130.0 if self.elapsed.is_set() else 100.0
 
     def factory(self) -> FakeDisplay:
-        display = FakeDisplay(lambda: self.now)
-        self.configure(display)
+        display = FakeDisplay(self)
         self.displays.append(display)
         return display
 
-    def schedule(self, delay: int, callback: Callable[[], None]) -> object:
-        timer = Timer(delay, callback)
-        self.timers.append(timer)
-        return timer
-
-    def cancel_timer(self, handle: object) -> None:
-        assert isinstance(handle, Timer)
-        handle.cancelled = True
-
     def on_expired(self) -> None:
+        self.callback_threads.append(threading.get_ident())
+        self.callback_saw_closed = self.closed.is_set() and not self.watchdog.active
+        self.expired.set()
+        if self.raise_callback:
+            raise RuntimeError("Ошибка уведомления")
+
+    def assert_stopped(self) -> None:
+        thread = self.watchdog._thread
+        assert thread is not None, "Поток сторожа не был создан"
+        assert not thread.is_alive(), "Поток сторожа не остановился после close()"
         assert not self.watchdog.active
-        assert not self.displays[-1].socket_open
-        self.expirations += 1
 
 
-def test_open_and_periodic_poll() -> None:
-    rig = Rig()
-    assert not rig.watchdog.active
+@pytest.fixture
+def rig(monkeypatch: pytest.MonkeyPatch) -> Iterator[Rig]:
+    instance = Rig(monkeypatch)
+    try:
+        yield instance
+    finally:
+        instance.watchdog.close()
+
+
+def test_expiry_closes_socket_without_gui_event_loop(rig: Rig) -> None:
     assert rig.watchdog.open(42)
     assert rig.watchdog.active
-    assert rig.displays[0].grab_args == (42, 30.0)
-    assert rig.displays[0].calls == ["open", "grab"]
-    for _ in range(3):
-        timer = rig.timers[-1]
-        assert timer.delay == 500
-        rig.now += timer.delay / 1000
-        timer.callback()
-    assert len(rig.timers) == 4
-    assert rig.displays[0].calls.count("expired") == 3
-    assert rig.watchdog.active
-
-
-def test_grab_failure_closes_connection() -> None:
-    rig = Rig()
-    rig.configure = lambda display: setattr(display, "grab_ok", False)
-    assert not rig.watchdog.open()
-    assert rig.displays[0].calls[-1] == "close"
-    assert not rig.displays[0].socket_open
-    assert not rig.watchdog.active
-    assert not rig.timers
-
-
-@pytest.mark.parametrize("via_timer", [False, True])
-def test_expiry_closes_connection_and_notifies_once(via_timer: bool) -> None:
-    rig = Rig()
-    assert rig.watchdog.open()
-    timer = rig.timers[-1]
-    rig.now += 29.999
-    rig.watchdog.tick()
-    assert rig.watchdog.active
-    assert rig.expirations == 0
-    rig.now = 130.0
-    assert rig.watchdog.active  # Само истечение срока ещё не снимает захват.
-    if via_timer:
-        timer.callback()
-    else:
-        rig.watchdog.tick()
-        assert timer.cancelled
-    assert rig.displays[0].calls[-2:] == ["ungrab", "close"]
-    assert not rig.displays[0].socket_open
-    assert not rig.watchdog.active
-    assert rig.expirations == 1
-    rig.watchdog.tick()
-    timer.callback()
+    assert rig.polled.wait(WAIT_S), "Сторож не начал самостоятельный опрос"
+    assert not rig.closed.is_set(), "Соединение закрыто до дедлайна"
+    assert rig.watchdog.open(42)
+    assert len(rig.displays) == 1, "Повторный open создал лишний захват"
+    rig.elapsed.set()
+    # Вызывающий поток только ждёт: ни tick(), ни доставки Qt-таймеров.
+    assert rig.closed.wait(WAIT_S), "Сторож не закрыл соединение по дедлайну"
+    assert rig.expired.wait(WAIT_S), "Сторож не уведомил об истечении срока"
     rig.watchdog.close()
-    assert len(rig.timers) == 1
-    assert rig.expirations == 1
-    assert rig.displays[0].calls.count("close") == 1
+    rig.assert_stopped()
+    display = rig.displays[0]
+    assert display.grab_args == (42, 30.0)
+    actions = [action for action, _ in display.calls]
+    assert actions == [
+        "create",
+        "open",
+        "grab",
+        "socket.shutdown",
+        "socket.close",
+        "close",
+        "ungrab",
+    ]
+    assert display.transport.closed
+    assert rig.callback_saw_closed
+    thread = rig.watchdog._thread
+    assert thread is not None and thread.daemon
+    assert rig.callback_threads == [thread.ident]
+    assert thread.ident != threading.get_ident()
+    assert not rig.watchdog.open(), "Одноразовый сторож запустился после истечения срока"
 
 
 @pytest.mark.parametrize("expires", [False, True])
 @pytest.mark.parametrize("raises", [False, True])
-def test_failed_ungrab_still_closes_socket(expires: bool, raises: bool) -> None:
-    rig = Rig()
+def test_failed_ungrab_still_closes_socket(rig: Rig, expires: bool, raises: bool) -> None:
+    rig.ungrab_ok = False
+    rig.raise_ungrab = raises
     assert rig.watchdog.open()
-    display = rig.displays[0]
-    display.ungrab_ok = False
-    display.raise_ungrab = raises
     if expires:
-        rig.now += 30.0
-        rig.watchdog.tick()
-    else:
-        rig.watchdog.close()
-    assert display.calls[-2:] == ["ungrab", "close"]
-    assert not display.socket_open
-    assert not rig.watchdog.active
-    assert rig.timers[-1].cancelled
-    assert rig.expirations == int(expires)
-
-
-def test_close_is_idempotent() -> None:
-    rig = Rig()
+        rig.elapsed.set()
+        assert rig.expired.wait(WAIT_S), "Сбой ungrab помешал сторожу завершить захват"
     rig.watchdog.close()
+    rig.assert_stopped()
+    display = rig.displays[0]
+    assert display.deadline_at_close == 130.0, "Фейк должен сохранить дедлайн при сбое ungrab"
+    assert display.transport.closed, "Отказ ungrab оставил сокет открытым"
+    assert rig.closed.is_set()
+    assert rig.expired.is_set() is expires
+
+
+def test_close_stops_thread_and_is_idempotent(rig: Rig) -> None:
     assert rig.watchdog.open()
     rig.watchdog.close()
+    rig.assert_stopped()
     calls = rig.displays[0].calls.copy()
     rig.watchdog.close()
-    rig.timers[0].callback()
+    rig.watchdog.stop()
     assert rig.displays[0].calls == calls
-    assert calls[-2:] == ["ungrab", "close"]
-    assert rig.timers[0].cancelled
-    assert not rig.watchdog.active
-    assert rig.expirations == 0
+    assert rig.displays[0].transport.closed
+    assert not rig.expired.is_set()
+    assert not rig.watchdog.open()
 
 
-def test_close_suppresses_errors_and_cancels_timer() -> None:
-    rig = Rig()
+def test_close_before_open_is_safe_and_terminal(rig: Rig) -> None:
+    rig.watchdog.close()
+    rig.watchdog.close()
+    assert not rig.watchdog.open()
+    assert not rig.displays
+
+
+def test_grab_failure_leaves_no_thread(rig: Rig) -> None:
+    rig.grab_ok = False
+    assert not rig.watchdog.open()
+    rig.assert_stopped()
+    assert rig.closed.is_set()
+    assert rig.displays[0].transport.closed
+    assert not rig.expired.is_set()
+
+
+def test_no_x_is_safe(rig: Rig) -> None:
+    rig.open_ok = False
+    assert not rig.watchdog.open()
+    rig.watchdog.close()
+    rig.assert_stopped()
+    assert rig.closed.is_set()
+    assert "grab" not in [action for action, _ in rig.displays[0].calls]
+
+
+def test_factory_failure_leaves_no_thread(rig: Rig) -> None:
+    def fail() -> X11Display:
+        raise RuntimeError("X недоступен")
+
+    rig.watchdog = CaptureFieldWatchdog(display_factory=fail, poll_ms=1)
+    assert not rig.watchdog.open()
+    rig.watchdog.close()
+    rig.assert_stopped()
+
+
+def test_close_and_callback_errors_do_not_escape(rig: Rig) -> None:
+    rig.raise_close = True
+    rig.raise_callback = True
     assert rig.watchdog.open()
-    rig.displays[0].raise_close = True
+    rig.elapsed.set()
+    assert rig.expired.wait(WAIT_S), "Ошибка закрытия подавила уведомление"
     rig.watchdog.close()
     rig.watchdog.close()
-    assert rig.timers[0].cancelled
-    assert not rig.watchdog.active
+    rig.assert_stopped()
+    assert rig.displays[0].transport.closed
 
 
 @pytest.mark.parametrize("poll_ms", [1001, 2000, 0, -1])
 def test_invalid_poll_interval(poll_ms: int) -> None:
-    rig = Rig()
-    with pytest.raises(ValueError):
-        CaptureFieldWatchdog(schedule=rig.schedule, cancel_timer=rig.cancel_timer, poll_ms=poll_ms)
+    with pytest.raises(ValueError, match="Интервал опроса"):
+        CaptureFieldWatchdog(poll_ms=poll_ms)
 
 
-def test_custom_interval_and_timeout() -> None:
-    rig = Rig()
-    watchdog = CaptureFieldWatchdog(
-        display_factory=rig.factory,
-        schedule=rig.schedule,
-        cancel_timer=rig.cancel_timer,
-        poll_ms=1000,
-        timeout_s=2.0,
-    )
-    assert watchdog.open()
+def test_max_poll_interval_does_not_delay_stop(rig: Rig) -> None:
+    rig.watchdog = CaptureFieldWatchdog(display_factory=rig.factory, poll_ms=1000, timeout_s=2.0)
+    assert rig.watchdog.open()
     assert rig.displays[0].grab_args == (None, 2.0)
-    assert rig.timers[0].delay == 1000
-    rig.now += 2.0
-    rig.timers[0].callback()
-    assert not watchdog.active
-    assert not rig.displays[0].socket_open
-
-
-def test_no_x_is_safe() -> None:
-    rig = Rig()
-    rig.configure = lambda display: setattr(display, "open_ok", False)
-    assert not rig.watchdog.open()
-    assert "grab" not in rig.displays[0].calls
-    assert rig.displays[0].calls[-1] == "close"
-    rig.watchdog.tick()
     rig.watchdog.close()
-    assert not rig.watchdog.active
-    assert not rig.timers
+    rig.assert_stopped()
 
 
-def test_factory_creates_dedicated_connections() -> None:
-    rig = Rig()
-    main_display = FakeDisplay(lambda: rig.now)
+def test_connection_is_created_and_used_only_by_watchdog_thread(rig: Rig) -> None:
+    main_display = FakeDisplay(rig)
+    main_calls = main_display.calls.copy()
     assert not rig.displays
     assert rig.watchdog.open()
-    assert rig.displays[0] is not main_display
-    rig.watchdog.close()
-    assert rig.watchdog.open()
-    assert len(rig.displays) == 2
-    assert rig.displays[1] is not rig.displays[0]
-    rig.watchdog.close()
-    assert main_display.calls == []
-    parameters = inspect.signature(CaptureFieldWatchdog).parameters
-    assert parameters["display_factory"].default is X11Display
-    assert "display" not in parameters
-    assert "main_display" not in parameters
-
-
-def test_reopen_ignores_stale_timer_and_does_not_extend_active_grab() -> None:
-    rig = Rig()
-    assert rig.watchdog.open()
-    rig.now += 10.0
-    assert rig.watchdog.open()
-    assert len(rig.displays) == len(rig.timers) == 1
-    assert rig.displays[0].keyboard_grab_deadline == 130.0
-    stale = rig.timers[0]
-    rig.watchdog.close()
-    assert rig.watchdog.open()
-    rig.now = 130.0
-    stale.callback()
+    # active читает Event, не свойства Xlib в потоке GUI.
     assert rig.watchdog.active
-    assert rig.displays[1].calls == ["open", "grab"]
-    assert len(rig.timers) == 2
-    rig.now = 140.0
-    rig.timers[1].callback()
-    assert not rig.watchdog.active
-    assert rig.expirations == 1
+    rig.watchdog.close()
+    rig.assert_stopped()
+    display = rig.displays[0]
+    assert display is not main_display
+    thread = rig.watchdog._thread
+    assert thread is not None and thread.ident != threading.get_ident()
+    assert {ident for _, ident in display.calls} == {thread.ident}
+    assert main_display.calls == main_calls
