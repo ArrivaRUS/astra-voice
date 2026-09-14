@@ -28,13 +28,14 @@
   1.25/1.26 из-за чужого дефекта. Ветка `wip/ort-1.25.1` в worktree `~/.cache/astra-voice-dev/wt-ort125` (не влито).
   **Решение — спайками S6-a (переквантовка в u8s8) и S6-b (seccomp-запрет AMX на 1.24.4), выбор двумя архитекторами по цифрам, до R2.**
   CI `engine` красный на Intel-раннерах (≈½ прогонов) — известно, не маскируем.
-- **Проба заказчика m4.1 (17:32) — диктовка не поднялась**: `bootstrap.py` в пакете лежит рядом, а не внутри (`supervisor.py:17`, с M2); урок 008 (+ правило 5: ресурсы — трей Fly читал SVG из удалённого `data/icons`). Починка: `supervisor.launcher_path()`, `find_tray_icon_path()` (тема → dev), traceback в журнале, `packaging/smoke-installed.sh` (41 модуль + 15 ресурсов + `--version`) в `build-deb.sh` и job'ах `deb`/`release`, AST-гейт `test_deb_layout_imports`, `timeout-minutes` ×7, два флака `test_worker_main` → `wait_until` (20/20); 2234 unit. **`0.1.0~m4.2` собран, ждёт ревью Claude → коммит → `~/Desktop`.**
+- **Проба заказчика m4.1 (17:32) — диктовка не поднялась**: `bootstrap.py` в пакете лежит рядом, а не внутри (`supervisor.py:17`, с M2); урок 008 (+ правило 5: ресурсы — трей Fly читал SVG из удалённого `data/icons`). Починка: `supervisor.launcher_path()`, `find_tray_icon_path()` (тема → dev), traceback в журнале, `packaging/smoke-installed.sh` (41 модуль + 15 ресурсов + `--version`) в `build-deb.sh` и job'ах `deb`/`release`, AST-гейт `test_deb_layout_imports`, `timeout-minutes` ×7, два флака `test_worker_main` → `wait_until` (20/20); 2234 unit. **Ревью PASS, коммит `ae3e021`, `0.1.0~m4.2` на `~/Desktop` (m4.1 снят); заказчику отправлены команды install + запуск.**
 - **Живая приёмка M4 не проведена.** Пакет `0.1.0~m4.1` собран из финального дерева → `~/Desktop`; `model_dir` прописан в
   `~/.config/astra-voice/settings.json` (резервная копия `settings.json.bak-20260914`). Заказчику отправлены три команды
   (install, stop Handy, запуск) и просьба «ок» на автопрогон 50 диктовок.
 - Отложено: minor 3 ревью CI (`qml-module-qtquick-window2`/`qtgraphicaleffects` не подтверждены гейтом); `python3-sympy` в
   `Depends` избыточен с ORT 1.25; `design/refs/09-tray-dark.png` устарел (M11); `ui/pill.py` `_visibility_changed` при
   разрушенном `QQuickView`; вопрос developer: ставить ли `xvfb` на машину; повтор загрузки по хоткею читает настройки старта.
+  Nit'ы ревью №4 (пакет): `paths.icon_theme_dir()` в dev указывает над репо (пробовать тему только вне dev); AST-гейт `test_deb_layout_imports` видит только `mv` (добавить `rm`, каталоги) и регэксп рецепта прихватывает соседние цели; смоук не проверяет иконку приложения из `.desktop`.
 
 ## Следующий шаг (первое действие следующей сессии)
 1. Если заказчик установил m4.1 и дал «ок»: `scripts/e2e/virtual_mic.sh up && scripts/e2e/dictate50.sh --session kde --yes`
