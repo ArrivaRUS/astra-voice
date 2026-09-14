@@ -234,10 +234,26 @@ def test_theme_source_matches_session_kind() -> None:
     assert isinstance(make_theme_source(SessionKind.OTHER), KdeThemeSource)
 
 
-def test_close_to_tray_is_off_until_m4() -> None:
+def test_close_to_tray_hides_window_without_quitting(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import Mock
+
+    from PyQt5.QtCore import QEvent, QObject
+
     from astra_voice import app as app_mod
 
-    assert app_mod.CLOSE_TO_TRAY is False
+    assert app_mod.CLOSE_TO_TRAY is True
+    app = Mock()
+    window = QObject()
+    hide = Mock()
+    monkeypatch.setattr(window, "hide", hide, raising=False)
+    watcher = app_mod._wire_close(app, window)
+    assert watcher is not None
+    event = QEvent(QEvent.Close)
+
+    assert watcher.eventFilter(window, event) is True
+    assert not event.isAccepted()
+    hide.assert_called_once_with()
+    app.quit.assert_not_called()
 
 
 # ── первый запуск создаёт settings.json ────────────────────────────────────

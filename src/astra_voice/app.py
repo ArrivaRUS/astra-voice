@@ -45,11 +45,9 @@ QT_EXPECTED_MESSAGES = (
 )
 _qt_message_handler = None  # ссылку держим сами: Qt хранит только указатель
 
-# Продуктово окно настроек — окно трей-приложения: закрытие прячет его, процесс
-# продолжает работать (хоткей и запись живут в трее). Трей появляется в M4, а до
-# него скрытое окно превратилось бы в ловушку: процесс-призрак ловит `show`, и
-# приложение перестаёт открываться. Поэтому в M1 закрытие завершает процесс.
-CLOSE_TO_TRAY = False  # M4: True
+# Трей появился в M4: закрытие окна прячет его, процесс продолжает жить в трее
+# (хоткей и диктовка остаются доступны).
+CLOSE_TO_TRAY = True
 
 
 def _install_qt_message_handler() -> None:
@@ -94,6 +92,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(prog=APP_NAME, add_help=True)
     parser.add_argument("--version", action="store_true", help="напечатать версию и выйти")
+    parser.add_argument("--stats", action="store_true", help="напечатать статистику и выйти")
     parser.add_argument("--hidden", action="store_true", help="запуск без окна, только в трее")
     parser.add_argument("--show", action="store_true", help="показать окно работающей копии")
     parser.add_argument("--debug", action="store_true", help="подробный журнал")
@@ -470,15 +469,13 @@ def _show(target: Any, timestamp: int = 0) -> None:
 
 
 def _wire_close(app: Any, shell: Any) -> Any | None:
-    """Закрытие окна завершает процесс, пока нет трея (см. ``CLOSE_TO_TRAY``).
+    """Закрытие прячет окно в трей либо завершает процесс (см. ``CLOSE_TO_TRAY``).
 
     ``quitOnLastWindowClosed`` считает только окна-виджеты, поэтому закрытие
     окна QML само по себе процесс не завершает. Сигнал ``QQuickWindow.closing``
     в PyQt5 недоступен (тип аргумента `QQuickCloseEvent*` не поддержан), так что
     ловим событие закрытия фильтром — он одинаково работает и для заглушки.
     """
-    if CLOSE_TO_TRAY:
-        return None
     root = _root_window(shell)
     if root is None:
         return None
@@ -488,6 +485,10 @@ def _wire_close(app: Any, shell: Any) -> Any | None:
     class CloseWatcher(QObject):
         def eventFilter(self, obj: Any, event: Any) -> bool:  # noqa: N802 — метод Qt
             if event.type() == QEvent.Close:
+                if CLOSE_TO_TRAY:
+                    event.ignore()
+                    root.hide()
+                    return True
                 log.info("окно закрыто — завершаю процесс (CLOSE_TO_TRAY=False)")
                 app.quit()
             return False
@@ -552,6 +553,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.version:
         sys.stdout.write(f"{APP_NAME} {__version__}\n")
         return 0
+    if args.stats:
+        from astra_voice.core.stats import Stats
+
+        stats = Stats()
+        if not stats.events():
+            sys.stdout.write("Пока нет данных.\n")
+            return 0
+        summary = stats.summary()
+        sys.stdout.write(f"Диктовок: {summary['dictations']}\n")
+        p50, p95 = summary["p50_ms"], summary["p95_ms"]
+        if p50 is None or p95 is None:
+            sys.stdout.write("Скорость: пока нет данных.\n")
+        else:
+            sys.stdout.write(f"Скорость: обычно {p50:.0f} мс, в худших случаях {p95:.0f} мс\n")
+        results = summary["results"]
+        sys.stdout.write(
+            f"Успешно: {results['ok']}, пусто: {results['empty']}, "
+            f"отменено: {results['cancelled']}\n"
+            f"Ошибок микрофона: {summary['mic_errors']}\n"
+        )
+        return 0
     if args.debug_transcribe is not None:
         return _debug_transcribe(args.debug_transcribe, args)
 
@@ -603,9 +625,27 @@ def main(argv: list[str] | None = None) -> int:
     if not args.hidden:
         _show(shell)
 
+    runtime: DictationRuntime | None = None
     try:
+        try:
+            from astra_voice.runtime import DictationRuntime
+
+            runtime = DictationRuntime(settings=settings, session_kind=session_kind)
+            runtime.on_quit_requested = app.quit
+            runtime.tray.on_settings = lambda: _show(shell)
+            runtime.tray.on_about = lambda: _show(shell)
+            runtime.start()
+        except Exception:  # noqa: BLE001 — без диктовки окно должно продолжать работать
+            log.warning("Не удалось запустить диктовку, приложение продолжит работу без неё")
         return int(app.exec_())
     finally:
+        # US-8.4: выход из трея и SIGTERM/SIGINT вызывают app.quit() и приходят
+        # сюда. Сначала освобождаем воркер и захваты клавиш, затем lock/ipc и UI.
+        if runtime is not None:
+            try:
+                runtime.shutdown()
+            except Exception:  # noqa: BLE001 — ошибка диктовки не должна оставить lock/ipc
+                log.warning("Не удалось завершить диктовку")
         del close_watcher
         timer.stop()
         if theme_bridge is not None:

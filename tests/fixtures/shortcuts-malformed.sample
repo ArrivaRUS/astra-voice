@@ -1,0 +1,14 @@
+# Искусственные повреждения для проверки пропуска строк, не фрагмент настроек.
+[kwin]
+мусор без разделителя
+Broken=Alt+F9
+Damaged=Ctrl+F9,Ctrl+F9,�
+Window Close=Alt+F4,Alt+F4,Закрыть окно
+[ShortCutKeys]
+Alt||F1 = FLYWM_CLOSE
+Alt|F2 =
+Alt|F3 = произвольный мусор
+Alt|F4 = FLYWM_CLOSE
+"сломанная подпись FLYWM_CLOSE
+"" "" "" FLYWM_SNAP_LEFT
+"Закрыть окно" "application-exit" "Actions" FLYWM_CLOSE

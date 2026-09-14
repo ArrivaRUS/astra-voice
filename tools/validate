@@ -28,6 +28,13 @@ sys.path.insert(0, str(ROOT / "src"))
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 from astra_voice.core import policy, settings  # noqa: E402
+from astra_voice.core.stats import Stats, percentile  # noqa: E402
+from astra_voice.platform.hotkey import (  # noqa: E402
+    PTT_THRESHOLD_S,
+    HotkeyFsm,
+    HotkeyMode,
+    HotkeyState,
+)
 from astra_voice.worker import ipc  # noqa: E402
 from astra_voice.worker.supervisor import Message, WorkerSupervisor  # noqa: E402
 
@@ -49,6 +56,51 @@ def delay_ms(raw: str) -> float:
     if not math.isfinite(value) or value < 0:
         raise argparse.ArgumentTypeError("Нужно конечное число от 0.")
     return value
+
+
+def stats(args: argparse.Namespace) -> int:
+    """Оценивает Ц2 по прогретым диктовкам, при необходимости только после --since."""
+    explanation = ""
+    try:
+        events = Stats().events()
+        if args.since is not None:
+            events = [event for event in events if float(event["ts"]) > args.since]
+    except (OSError, RuntimeError) as exc:
+        events = []
+        explanation = f"Не удалось прочитать статистику: {exc}"
+    dictations = [event for event in events if event["type"] == "dictation"]
+    timings = [
+        float(event["t_ms"])
+        for event in dictations
+        if event.get("cold") is False and "t_ms" in event
+    ]
+    p95 = percentile(timings, 95)
+    code = 2 if p95 is None else int(p95 > args.target_ms)
+    verdict = {0: "уложились", 1: "не уложились", 2: "нет данных"}[code]
+    facts = {
+        "events": len(events),
+        "dictations": len(dictations),
+        "p50_ms": percentile(timings, 50),
+        "p95_ms": p95,
+        "results": {
+            result: sum(event.get("result") == result for event in dictations)
+            for result in ("ok", "empty", "cancelled")
+        },
+        "mic_errors": sum(event["type"] == "mic_error" for event in events),
+        "target_ms": args.target_ms,
+        "verdict": verdict,
+    }
+    if args.json:
+        print(json.dumps(facts, ensure_ascii=False), flush=True)
+        if explanation:
+            print(explanation, file=sys.stderr)
+    else:
+        print(f"Диктовок: {len(dictations)}; ошибок микрофона: {facts['mic_errors']}.")
+        measured = "нет данных" if p95 is None else f"{p95:g} мс"
+        print(f"p95: {measured}; цель ≤ {args.target_ms:g} мс; вердикт: {verdict}.")
+        if explanation:
+            print(explanation)
+    return code
 
 
 def model_request(args: argparse.Namespace) -> Message:
@@ -223,7 +275,8 @@ def dictation(args: argparse.Namespace) -> int:
     device = args.device if args.device is not None else "av_test_src"
     facts: Message = {
         "command": "dictation",
-        "mode": "wav" if args.wav is not None else "silence",
+        "mode": "toggle" if args.toggle else "ptt",
+        "audio_mode": "wav" if args.wav is not None else "silence",
         "device": device,
         "virtual_mic": args.virtual_mic,
         "utterance_id": "d1",
@@ -264,6 +317,25 @@ def dictation(args: argparse.Namespace) -> int:
 
     supervisor = WorkerSupervisor(on_event=receive, use_qt=False)
     generation = supervisor.generation
+
+    def on_state(state: HotkeyState, reason: str) -> None:
+        """Только переходы настоящего автомата управляют IPC в режиме toggle."""
+        if state == HotkeyState.RECORDING:
+            supervisor.send({"type": "record.start", "utterance_id": "d1", "device": device})
+        elif state == HotkeyState.PROCESSING:
+            # При record.limit воркер уже остановил запись.
+            if not facts["record_limit"]:
+                supervisor.send({"type": "record.stop", "utterance_id": "d1"})
+            supervisor.send({"type": "recognize", "utterance_id": "d1"}, timeout=120)
+
+    fsm = HotkeyFsm(HotkeyMode.TOGGLE, on_state=on_state)
+
+    def second_tap() -> None:
+        now = time.monotonic()
+        fsm.press(now)
+        if fsm.state != HotkeyState.PROCESSING:
+            raise DictationFailure(1, "Второе нажатие не завершило запись в режиме toggle.")
+        fsm.release(now + PTT_THRESHOLD_S / 2)
 
     def check_worker() -> None:
         """Ошибки устройства нарушают критерий; сбой воркера мешает прогону."""
@@ -334,7 +406,7 @@ def dictation(args: argparse.Namespace) -> int:
         _, hello = wait("hello", 10)
         if hello["runtime"]["onnxruntime"] is None:
             raise DictationFailure(2, "Движок onnxruntime недоступен в выбранном Python.")
-        if wav is not None:
+        if wav is not None or args.toggle:
             request = model_request(args)
             facts.update(variant=request["variant"], threads=request["threads"])
             supervisor.send(request, timeout=10)
@@ -342,7 +414,13 @@ def dictation(args: argparse.Namespace) -> int:
             facts["engine_version"] = loaded["engine_version"]
             steps.append("Модель загружена.")
         started = time.monotonic()
-        supervisor.send({"type": "record.start", "utterance_id": "d1", "device": device})
+        if args.toggle:
+            fsm.press(started)
+            fsm.release(started + PTT_THRESHOLD_S / 2)
+            if fsm.state != HotkeyState.RECORDING:
+                raise DictationFailure(1, "Короткий тап оборвал запись в режиме toggle.")
+        else:
+            supervisor.send({"type": "record.start", "utterance_id": "d1", "device": device})
         ready_at, _ = wait("audio.ready", 10, 1)
         facts["audio_ready_ms"] = (ready_at - started) * 1000
         steps.append(f"Источник {device} готов к записи.")
@@ -353,8 +431,13 @@ def dictation(args: argparse.Namespace) -> int:
             if args.limit:
                 wait("record.limit", 0, 1)
             elapsed = facts["silent_ms"]
-            supervisor.send({"type": "record.cancel", "utterance_id": "d1"})
-            wait("cancelled", 3, 1)
+            if args.toggle:
+                second_tap()
+                wait("result", 120, 1)
+                fsm.done(time.monotonic())
+            else:
+                supervisor.send({"type": "record.cancel", "utterance_id": "d1"})
+                wait("cancelled", 3, 1)
             if elapsed is None:
                 return 1, "За время записи событие silent не получено."
             if elapsed > SILENT_LIMIT_MS:
@@ -378,10 +461,15 @@ def dictation(args: argparse.Namespace) -> int:
         if args.limit:
             wait("record.limit", 2, 1)
         # Лимит уже остановил запись в WorkerState: повторный stop даёт bad-state.
-        if not facts["record_limit"]:
-            supervisor.send({"type": "record.stop", "utterance_id": "d1"})
-        supervisor.send({"type": "recognize", "utterance_id": "d1"}, timeout=120)
+        if args.toggle:
+            second_tap()
+        else:
+            if not facts["record_limit"]:
+                supervisor.send({"type": "record.stop", "utterance_id": "d1"})
+            supervisor.send({"type": "recognize", "utterance_id": "d1"}, timeout=120)
         _, result = wait("result", 120, 1)
+        if args.toggle:
+            fsm.done(time.monotonic())
         facts.update(text=result["text"], t_ms=result["t_ms"])
         if args.expect is not None:
             matched = args.expect.casefold() in result["text"].casefold()
@@ -470,6 +558,12 @@ def main(argv: list[str] | None = None) -> int:
     """Разбирает подкоманды; новые проверки добавляются отдельными обработчиками."""
     parser = argparse.ArgumentParser(description="Проверки Astra Voice без GUI")
     commands = parser.add_subparsers(dest="command", required=True)
+    summary = commands.add_parser("stats", help="проверить p95 локальной статистики")
+    summary.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    summary.add_argument("--target-ms", type=delay_ms, default=500.0, help="цель p95 в мс")
+    summary.add_argument(
+        "--since", type=delay_ms, help="учитывать события после Unix-времени начала прогона"
+    )
     cancel = commands.add_parser("worker-cancel", help="измерить отмену через IPC")
     cancel.add_argument("--model-dir", type=Path, help="каталог модели, если она не настроена")
     cancel.add_argument("--variant", help="вариант модели вместо настройки")
@@ -485,6 +579,9 @@ def main(argv: list[str] | None = None) -> int:
     source.add_argument("--wav", type=Path, help="WAV для paplay --device=av_test")
     source.add_argument("--silence", type=delay_ms, metavar="СЕКУНДЫ", help="длительность тишины")
     dictate.add_argument("--limit", action="store_true", help="потребовать событие record.limit")
+    dictate.add_argument(
+        "--toggle", action="store_true", help="управлять записью двумя тапами через HotkeyFsm"
+    )
     dictate.add_argument("--device", help="источник записи; обязателен без --virtual-mic")
     dictate.add_argument("--expect", help="ожидаемая подстрока текста без учёта регистра")
     dictate.add_argument("--model-dir", type=Path, help="каталог модели, если она не настроена")
@@ -492,7 +589,7 @@ def main(argv: list[str] | None = None) -> int:
     dictate.add_argument("--threads", type=positive_int, help="потоки вместо настройки (обычно 2)")
     dictate.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
     args = parser.parse_args(argv)
-    handlers = {"worker-cancel": worker_cancel, "dictation": dictation}
+    handlers = {"worker-cancel": worker_cancel, "dictation": dictation, "stats": stats}
     return handlers[args.command](args)
 
 

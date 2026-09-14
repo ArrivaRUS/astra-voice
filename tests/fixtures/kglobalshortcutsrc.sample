@@ -1,0 +1,13 @@
+# Фрагменты KDE без персональных данных.
+[org.kde.krunner.desktop]
+_launch=Alt+Space\tAlt+F2\tSearch,Alt+Space\tAlt+F2\tSearch,Открыть строку поиска и запуска KRunner
+_k_friendly_name=Открыть строку поиска и запуска KRunner
+
+[kwin]
+Window Close=Alt+F4\tMeta+Q,Alt+F4,Закрыть окно
+Window Maximize=none,Meta+PgUp,Распахнуть окно
+_k_friendly_name=KWin
+
+[plasmashell]
+show-on-mouse-pos=Meta+V,Meta+V,Показать записи на позиции указателя мыши
+_k_friendly_name=Plasma

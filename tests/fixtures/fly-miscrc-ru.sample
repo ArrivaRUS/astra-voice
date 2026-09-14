@@ -1,0 +1,3 @@
+; Фрагмент ru_RU.UTF-8.miscrc; для FLYWM_SNAP_LEFT подписи нет.
+"Закрыть окно"     "application-exit"  "Actions" FLYWM_CLOSE
+"Закрыть группу"   ""                  ""        FLYWM_CLOSE_COMBINED

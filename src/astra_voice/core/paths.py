@@ -61,6 +61,11 @@ def cache_dir() -> Path:
     return _ensure_private_dir(_xdg("XDG_CACHE_HOME", Path.home() / ".cache"))
 
 
+def state_dir() -> Path:
+    """``$XDG_STATE_HOME/astra-voice`` (по умолчанию ``~/.local/state/astra-voice``)."""
+    return _ensure_private_dir(_xdg("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+
+
 def runtime_dir() -> Path:
     """``$XDG_RUNTIME_DIR/astra-voice``; запасной вариант — ``/tmp/astra-voice-<uid>``.
 

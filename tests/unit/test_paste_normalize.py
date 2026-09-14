@@ -1,0 +1,969 @@
+"""Векторы S4 и T-14/T-15: подмены X/буфера, Qt-пробы в отдельном процессе."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from collections.abc import Callable, Iterator
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+from textwrap import dedent
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+from astra_voice.platform import paste, session
+from astra_voice.platform.paste import PasteMethod, PasteMode, PasteOutcomeKind, PasteRestore
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("ls\n rm -rf ~", "ls  rm -rf ~"),
+        ("a\r\nb", "a b"),
+        ("\x1b[31mкрасный\x1b[0m", "[31mкрасный[0m"),
+        ("оп\x0fерация", "операция"),
+        ("хвост\x9b", "хвост"),
+        ("Проверка связи, ёж.", "Проверка связи, ёж."),
+        ("a\rb", "a b"),
+        ("\x1b[31mоп\x0fерация", "[31mоперация"),
+        ("", ""),
+    ],
+)
+def test_normalize_vectors(source: str, expected: str) -> None:
+    result = paste.normalize(source)
+    assert result == expected
+    assert all(ord(ch) >= 0x20 and not 0x7F <= ord(ch) <= 0x9F for ch in result)
+
+
+def test_normalize_all_byte_codes() -> None:
+    result = paste.normalize("".join(chr(code) for code in range(0x100)))
+    assert all(ord(ch) >= 0x20 and not 0x7F <= ord(ch) <= 0x9F for ch in result)
+    assert result == "  " + "".join(chr(code) for code in (*range(32, 127), *range(160, 256)))
+
+
+@pytest.mark.parametrize(
+    ("wm_class", "expected"),
+    [
+        *[
+            (name, "ctrl+shift+v")
+            for name in (
+                "konsole",
+                "fly-term",
+                "flyterm",
+                "yakuake",
+                "alacritty",
+                "gnome-terminal-server",
+                "xfce4-terminal",
+                "KoNsOlE",
+            )
+        ],
+        *[
+            (name, "shift+insert")
+            for name in (
+                "xterm",
+                "uxterm",
+                "rxvt",
+                "urxvt",
+                "foo-terminal",
+                "XTerm",
+                "new-tty",
+                "console-x",
+            )
+        ],
+        ("kate", "ctrl+v"),
+        (None, "ctrl+v"),
+        (("custom", "Konsole"), "ctrl+shift+v"),
+        (("custom", "XTerm"), "shift+insert"),
+        (("custom", "Foo-Terminal"), "shift+insert"),
+        (("kate", "Kate"), "ctrl+v"),
+    ],
+)
+def test_method_for_wm_class(wm_class: str | tuple[str, str] | None, expected: str) -> None:
+    result = paste.method_for_wm_class(wm_class)
+    assert isinstance(result, PasteMethod)
+    assert result.value == expected
+
+
+class FakeClipboard:
+    """Байтовые копии двух буферов и независимые признаки владения."""
+
+    def __init__(self) -> None:
+        self.data = {
+            False: {"text/plain": b"before", "text/html": b"<b>before</b>", "custom": b"\x00\xff"},
+            True: {"text/plain": b"selection", "text/uri-list": b"file:///tmp/example"},
+        }
+        self.owned = {False: False, True: False}
+        self.writes: list[tuple[bool, dict[str, bytes]]] = []
+
+    def snapshot(self, primary: bool) -> dict[str, bytes]:
+        return self.data[primary].copy()
+
+    def put(self, snapshot: dict[str, bytes], primary: bool) -> None:
+        self.data[primary] = snapshot.copy()
+        self.writes.append((primary, snapshot.copy()))
+        self.owned[primary] = True
+
+    def owns(self, primary: bool) -> bool:
+        return self.owned[primary]
+
+    def clear(self, primary: bool) -> None:
+        self.put({}, primary)
+
+
+@pytest.fixture(autouse=True)
+def isolated_session_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Сеанс и запомненный снимок независимы от предыдущего теста."""
+    monkeypatch.setattr(paste, "_last_clipboard_snapshot", None)
+    paste._session_kind.cache_clear()
+    yield
+    paste._session_kind.cache_clear()
+
+
+@pytest.fixture
+def harness(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeClipboard, Mock, list[int]]:
+    """Весь ввод/вывод подменён до вызова цепочки, включая определение сеанса."""
+    cb = FakeClipboard()
+    x = Mock()
+    x.wm_class.return_value = ("kate", "kate")
+    x.active_window.return_value = 42
+    x.send_combo.return_value = True
+    x.grab_keyboard.return_value = True
+    x.keyboard_grab_deadline = None
+    x.root.id = 2
+    focus = x.d.get_input_focus.return_value.focus
+    focus.id = 42
+    focus.get_attributes.return_value.override_redirect = False
+    focus.query_tree.return_value.parent = x.root
+    delays: list[int] = []
+    monkeypatch.setattr(paste, "_Clipboard", lambda: cb)
+    monkeypatch.setattr(paste, "X11Display", lambda: x)
+    monkeypatch.setattr(paste, "_wait_ms", delays.append)
+    monkeypatch.setattr(session, "_from_x11", Mock(side_effect=AssertionError("X запрещён")))
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
+    monkeypatch.delenv("DESKTOP_SESSION", raising=False)
+    return cb, x, delays
+
+
+def test_clipboard_only_without_x(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cb, x, delays = harness
+    factory = Mock(side_effect=AssertionError("X запрещён"))
+    monkeypatch.setattr(paste, "X11Display", factory)
+    monkeypatch.delenv("XDG_CURRENT_DESKTOP")
+    # Проверяется отсутствие даже косвенного подключения через session.detect.
+    monkeypatch.setenv("DISPLAY", ":unreachable-paste-unit")
+    primary = cb.snapshot(True)
+    outcome = paste.paste_text("Проверка\nсвязи, ёж.\x0f", 42, PasteMode.CLIPBOARD_ONLY)
+    assert outcome.kind == PasteOutcomeKind.CLIPBOARD_ONLY
+    assert outcome.method == PasteMethod.NONE
+    assert outcome.wm_class is None
+    assert outcome.restore == PasteRestore.KEPT_OURS
+    assert outcome.chars == len("Проверка связи, ёж.")
+    assert outcome.stripped_controls == 1
+    assert outcome.t_ms >= 0
+    assert cb.writes[0] == (
+        False,
+        {
+            "text/plain": "Проверка связи, ёж.".encode(),
+            paste.KDE_HINT: b"secret",
+        },
+    )
+    assert cb.data[False] == cb.writes[0][1]
+    assert cb.data[True] == primary
+    assert len(cb.writes) == 1
+    assert delays == [50, 100]
+    factory.assert_not_called()
+    x.send_combo.assert_not_called()
+    with pytest.raises(FrozenInstanceError):
+        outcome.__setattr__("kind", PasteOutcomeKind.PASTED)
+
+
+@pytest.mark.parametrize(
+    ("wm_class", "mods", "key", "method"),
+    [
+        ("kate", ["Control_L"], "v", PasteMethod.CTRL_V),
+        ("konsole", ["Control_L", "Shift_L"], "v", PasteMethod.CTRL_SHIFT_V),
+        ("xterm", ["Shift_L"], "Insert", PasteMethod.SHIFT_INSERT),
+    ],
+)
+def test_chain_and_both_snapshots(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    wm_class: str,
+    mods: list[str],
+    key: str,
+    method: PasteMethod,
+) -> None:
+    cb, x, delays = harness
+    before = {primary: cb.snapshot(primary) for primary in (False, True)}
+    x.wm_class.return_value = (wm_class, wm_class)
+
+    def wait(ms: int) -> None:
+        delays.append(ms)
+        assert cb.data[False] == {"text/plain": b"a b[31m", paste.KDE_HINT: b"secret"}
+        if method == PasteMethod.SHIFT_INSERT:
+            assert cb.data[True] == cb.data[False]
+        if ms == 800:
+            x.wm_class.assert_called_once_with(42)
+            x.grab_keyboard.assert_called_once_with()
+            x.ungrab_keyboard.assert_called_once_with()
+            x.send_combo.assert_not_called()
+        else:
+            x.send_combo.assert_called_once_with(mods, key)
+
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    outcome = paste.PasteFlow(delay_before_ms=800, delay_after_ms=300).run(
+        "a\r\nb\x1b[31m\x0f", 42, PasteMode.AUTO
+    )
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    assert outcome.method == method
+    assert outcome.restore == PasteRestore.RESTORED
+    assert cb.data == before
+    assert delays == [800, 300]
+    x.close.assert_called_once()
+
+
+@pytest.mark.parametrize("target", [42, None])
+def test_focus_guard(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    target: int | None,
+) -> None:
+    cb, x, _ = harness
+
+    def switch_window(ms: int) -> None:
+        if ms == 50:
+            x.active_window.return_value = 99 if target else None
+
+    monkeypatch.setattr(paste, "_wait_ms", switch_window)
+    outcome = paste.paste_text("фраза", target, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+    assert outcome.method == PasteMethod.NONE
+    assert outcome.restore == PasteRestore.KEPT_OURS
+    assert cb.data[False] == {"text/plain": "фраза".encode(), paste.KDE_HINT: b"secret"}
+    assert len(cb.writes) == 1
+    x.send_combo.assert_not_called()
+
+
+@pytest.mark.parametrize("grabbed", [False, True])
+def test_keyboard_probe_failure_keeps_phrase(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    grabbed: bool,
+) -> None:
+    """Отказ захвата или неснятый захват запрещает XTest до проверки фокуса."""
+    cb, x, delays = harness
+    x.grab_keyboard.return_value = grabbed
+    if grabbed:
+        x.keyboard_grab_deadline = 30.0
+
+    def wait(ms: int) -> None:
+        delays.append(ms)
+        x.grab_keyboard.assert_called_once_with()
+        if grabbed:
+            x.ungrab_keyboard.assert_called_once_with()
+        else:
+            x.ungrab_keyboard.assert_not_called()
+        x.send_combo.assert_not_called()
+
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+    assert outcome.restore == PasteRestore.KEPT_OURS
+    assert cb.data[False]["text/plain"] == "фраза".encode()
+    assert delays == [50, 100]
+
+
+@pytest.mark.parametrize("first_mode", [PasteMode.AUTO, PasteMode.CLIPBOARD_ONLY])
+def test_own_secret_hint_is_restored_across_flows(
+    harness: tuple[FakeClipboard, Mock, list[int]], first_mode: PasteMode
+) -> None:
+    """Оставленная фраза с нашим hint восстанавливается и после второй, и после третьей вставки."""
+    cb, x, _ = harness
+    x.grab_keyboard.return_value = False
+    first = paste.paste_text("Первая фраза", 42, first_mode)
+    assert first.kind == (
+        PasteOutcomeKind.WINDOW_CHANGED
+        if first_mode == PasteMode.AUTO
+        else PasteOutcomeKind.CLIPBOARD_ONLY
+    )
+    assert first.restore == PasteRestore.KEPT_OURS
+    x.send_combo.assert_not_called()
+    saved = cb.snapshot(False)
+    assert saved == {"text/plain": "Первая фраза".encode(), paste.KDE_HINT: b"secret"}
+    assert cb.owns(False)
+
+    x.grab_keyboard.return_value = True
+    for text in ("Вторая фраза", "Третья фраза"):
+        cb.writes.clear()
+        outcome = paste.paste_text(text, 42, PasteMode.AUTO)
+        assert outcome.kind == PasteOutcomeKind.PASTED
+        assert outcome.restore == PasteRestore.RESTORED
+        assert cb.snapshot(False) == saved
+        assert cb.writes == [
+            (False, {"text/plain": text.encode(), paste.KDE_HINT: b"secret"}),
+            (False, saved),
+        ]
+    assert x.send_combo.call_count == 2
+
+
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("change", ["none", "text", "mime"])
+def test_secret_hint_requires_ownership_and_matching_snapshot(
+    harness: tuple[FakeClipboard, Mock, list[int]], owned: bool, change: str
+) -> None:
+    """Даже тот же текст чужого владельца или иной MIME своего процесса — чужой секрет."""
+    cb, x, _ = harness
+    first = paste.paste_text("Первая фраза", 42, PasteMode.CLIPBOARD_ONLY)
+    assert first.kind == PasteOutcomeKind.CLIPBOARD_ONLY
+    if change == "text":
+        cb.data[False]["text/plain"] = "Чужой секрет".encode()
+    elif change == "mime":
+        cb.data[False]["text/html"] = b"<b>secret</b>"
+    cb.owned[False] = owned
+    saved = cb.snapshot(False)
+    assert saved[paste.KDE_HINT] == b"secret"
+    cb.writes.clear()
+
+    outcome = paste.paste_text("Вторая фраза", 42, PasteMode.AUTO)
+    ours = owned and change == "none"
+    assert outcome.kind == (PasteOutcomeKind.PASTED if ours else PasteOutcomeKind.REFUSED_SECRET)
+    assert outcome.restore == (PasteRestore.RESTORED if ours else PasteRestore.CLEARED_SECRET)
+    assert cb.snapshot(False) == (saved if ours else {})
+    assert cb.writes == [
+        (False, {"text/plain": "Вторая фраза".encode(), paste.KDE_HINT: b"secret"}),
+        (False, saved if ours else {}),
+    ]
+    x.send_combo.assert_called_once_with(["Control_L"], "v")
+
+
+def test_secret_owned_without_previous_publication_is_cleared(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+) -> None:
+    """Одного ownsClipboard без запомненной публикации недостаточно для переиздания secret."""
+    cb, _, _ = harness
+    cb.data[False][paste.KDE_HINT] = b"secret"
+    cb.owned[False] = True
+    outcome = paste.paste_text("Наша фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.REFUSED_SECRET
+    assert outcome.restore == PasteRestore.CLEARED_SECRET
+    assert cb.snapshot(False) == {}
+    assert all(data.get("text/plain") != b"before" for _, data in cb.writes)
+
+
+@pytest.mark.parametrize("primary", [False, True])
+@pytest.mark.parametrize("state", ["secret", "empty", "lost-owner"])
+def test_restore_rules(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    primary: bool,
+    state: str,
+) -> None:
+    cb, x, _ = harness
+    x.wm_class.return_value = ("xterm", "XTerm")
+    other = cb.snapshot(not primary)
+    if state == "secret":
+        cb.data[primary][paste.KDE_HINT] = b"secret"
+    elif state == "empty":
+        cb.data[primary] = {}
+
+    def lose_owner(ms: int) -> None:
+        if state == "lost-owner" and ms == 100:
+            cb.data[primary] = {"text/plain": b"new user copy"}
+            cb.owned[primary] = False
+
+    monkeypatch.setattr(paste, "_wait_ms", lose_owner)
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert cb.data[not primary] == other
+    assert cb.data[primary] == ({"text/plain": b"new user copy"} if state == "lost-owner" else {})
+    assert outcome.kind == (
+        PasteOutcomeKind.REFUSED_SECRET if state == "secret" else PasteOutcomeKind.PASTED
+    )
+    assert outcome.restore == (
+        PasteRestore.RESTORED
+        if primary
+        else {
+            "secret": PasteRestore.CLEARED_SECRET,
+            "empty": PasteRestore.CLEARED_EMPTY,
+            "lost-owner": PasteRestore.SKIPPED_NOT_OWNER,
+        }[state]
+    )
+    if state == "secret":
+        old_text = b"selection" if primary else b"before"
+        assert all(data.get("text/plain") != old_text for _, data in cb.writes)
+
+
+def test_lost_owner_does_not_clear_new_copy_after_secret(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cb, _, _ = harness
+    cb.data[False][paste.KDE_HINT] = b"secret"
+
+    def change(ms: int) -> None:
+        cb.data[False] = {"text/plain": b"new copy"}
+        cb.owned[False] = False
+
+    monkeypatch.setattr(paste, "_wait_ms", change)
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.restore == PasteRestore.SKIPPED_NOT_OWNER
+    assert cb.data[False] == {"text/plain": b"new copy"}
+
+
+@pytest.mark.parametrize("mode", [PasteMode.AUTO, PasteMode.CLIPBOARD_ONLY])
+def test_secret_not_republished_without_xtest(
+    harness: tuple[FakeClipboard, Mock, list[int]], mode: PasteMode
+) -> None:
+    cb, x, _ = harness
+    cb.data[False][paste.KDE_HINT] = b"secret"
+    x.active_window.return_value = 99
+    outcome = paste.paste_text("фраза", 42, mode)
+    assert outcome.kind == (
+        PasteOutcomeKind.WINDOW_CHANGED
+        if mode == PasteMode.AUTO
+        else PasteOutcomeKind.CLIPBOARD_ONLY
+    )
+    assert outcome.restore == PasteRestore.KEPT_OURS
+    assert outcome.method == PasteMethod.NONE
+    assert cb.data[False] == {"text/plain": "фраза".encode(), paste.KDE_HINT: b"secret"}
+    assert len(cb.writes) == 1
+    assert all(data.get("text/plain") != b"before" for _, data in cb.writes)
+    x.send_combo.assert_not_called()
+
+
+@pytest.mark.parametrize("secret", [False, True])
+def test_failed_xtest_is_not_reported_as_pasted(
+    harness: tuple[FakeClipboard, Mock, list[int]], secret: bool
+) -> None:
+    cb, x, _ = harness
+    if secret:
+        cb.data[False][paste.KDE_HINT] = b"secret"
+    x.send_combo.return_value = False
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+    assert outcome.method == PasteMethod.NONE
+    assert outcome.restore == PasteRestore.KEPT_OURS
+    assert cb.data[False]["text/plain"] == "фраза".encode()
+    assert all(data.get("text/plain") != b"before" for _, data in cb.writes)
+
+
+@pytest.mark.parametrize("secret", [False, True])
+def test_reentrant_call_keeps_outer_flow(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    secret: bool,
+) -> None:
+    cb, x, _ = harness
+    x.wm_class.return_value = ("xterm", "xterm")
+    if secret:
+        cb.data[False][paste.KDE_HINT] = b"secret"
+    before = {primary: cb.snapshot(primary) for primary in (False, True)}
+    completed: list[int] = []
+
+    def interrupted(ms: int) -> None:
+        during = {primary: cb.snapshot(primary) for primary in (False, True)}
+        writes = cb.writes.copy()
+        with monkeypatch.context() as guard:
+            factory = Mock(side_effect=AssertionError("повторный вход не трогает Qt/X"))
+            guard.setattr(paste, "_Clipboard", factory)
+            guard.setattr(paste, "X11Display", factory)
+            outcome = paste.paste_text("вторая", 42, PasteMode.AUTO)
+            factory.assert_not_called()
+        assert outcome.kind == PasteOutcomeKind.BUSY
+        assert outcome.method == PasteMethod.NONE
+        assert outcome.restore == PasteRestore.KEPT_OURS
+        assert outcome.chars == outcome.stripped_controls == 0
+        assert "вторая" not in repr(outcome)
+        assert cb.data == during
+        assert cb.writes == writes
+        assert paste._running
+        completed.append(ms)
+
+    monkeypatch.setattr(paste, "_wait_ms", interrupted)
+    outcome = paste.paste_text("первая", 42, PasteMode.AUTO)
+    if secret:
+        before[False] = {}
+    assert outcome.kind == (PasteOutcomeKind.REFUSED_SECRET if secret else PasteOutcomeKind.PASTED)
+    assert cb.data == before
+    if secret:
+        assert all(data.get("text/plain") != b"before" for _, data in cb.writes)
+    assert completed == [50, 100]
+    x.close.assert_called_once()
+    assert not paste._running
+
+
+@pytest.mark.parametrize("failure_at", ["before", "after", "send", "close"])
+def test_exceptions_do_not_escape_and_primary_is_restored(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_at: str,
+) -> None:
+    cb, x, _ = harness
+    x.wm_class.return_value = ("xterm", "xterm")
+    before = {primary: cb.snapshot(primary) for primary in (False, True)}
+    private = "ПРИВАТНАЯ-ФРАЗА"
+
+    def wait(ms: int) -> None:
+        if (failure_at, ms) in {("before", 50), ("after", 100)}:
+            raise ValueError(private)
+
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    if failure_at in {"send", "close"}:
+        getattr(x, "send_combo" if failure_at == "send" else "close").side_effect = ValueError(
+            private
+        )
+    outcome = paste.paste_text(private, 42, PasteMode.AUTO)
+    pasted = failure_at in {"after", "close"}
+    assert outcome.kind == (PasteOutcomeKind.PASTED if pasted else PasteOutcomeKind.CLIPBOARD_ONLY)
+    assert outcome.restore == (PasteRestore.RESTORED if pasted else PasteRestore.KEPT_OURS)
+    assert cb.data[True] == before[True]
+    assert cb.data[False] == (
+        before[False] if pasted else {"text/plain": private.encode(), paste.KDE_HINT: b"secret"}
+    )
+    assert private not in repr(outcome) + caplog.text
+    assert not paste._running
+    x.close.assert_called_once()
+
+
+@pytest.mark.parametrize("operation", ["snapshot", "put", "owns", "clear"])
+def test_clipboard_errors_return_outcome(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    cb, x, _ = harness
+    x.wm_class.return_value = ("xterm", "xterm")
+    primary = cb.snapshot(True)
+    if operation == "clear":
+        cb.data[False][paste.KDE_HINT] = b"secret"
+    original = getattr(cb, operation)
+
+    def fail_clipboard(*args: object) -> object:
+        if args[-1] is False:
+            raise RuntimeError("буфер недоступен")
+        return original(*args)
+
+    monkeypatch.setattr(cb, operation, fail_clipboard)
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.FAILED
+    assert cb.data[True] == primary
+    assert not paste._running
+    x.close.assert_called_once()
+
+
+@pytest.mark.parametrize("state", ["normal", "secret", "empty", "lost-owner"])
+@pytest.mark.parametrize("changed", [False, True])
+def test_primary_restored_when_clipboard_is_kept(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    changed: bool,
+) -> None:
+    cb, x, _ = harness
+    x.wm_class.return_value = ("xterm", "xterm")
+    x.send_combo.return_value = False
+    if changed:
+        x.active_window.return_value = 99
+    if state == "secret":
+        cb.data[True][paste.KDE_HINT] = b"secret"
+    elif state == "empty":
+        cb.data[True] = {}
+    expected = cb.snapshot(True) if state == "normal" else {}
+    if state == "lost-owner":
+        expected = {"text/plain": b"new selection"}
+
+        def lose_primary(ms: int) -> None:
+            cb.data[True] = expected.copy()
+            cb.owned[True] = False
+
+        monkeypatch.setattr(paste, "_wait_ms", lose_primary)
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.restore == PasteRestore.KEPT_OURS
+    assert cb.data[False]["text/plain"] == "фраза".encode()
+    assert cb.data[True] == expected
+    if state == "secret":
+        assert outcome.kind == PasteOutcomeKind.REFUSED_SECRET
+        assert all(data.get("text/plain") != b"selection" for _, data in cb.writes)
+    else:
+        assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+
+
+@pytest.mark.parametrize(
+    "focus_state",
+    [
+        "other",
+        "child",
+        "class-changed",
+        "no-class",
+        "override",
+        "none",
+        "pointer",
+        "root",
+        "cycle",
+        "too-deep",
+        "query-error",
+        "tree-error",
+        "closed",
+    ],
+)
+def test_real_focus_guard_with_unchanged_ewmh(
+    harness: tuple[FakeClipboard, Mock, list[int]], focus_state: str
+) -> None:
+    cb, x, _ = harness
+    focus = x.d.get_input_focus.return_value.focus
+    if focus_state in {"other", "child", "cycle", "too-deep", "tree-error"}:
+        focus.id = 99
+    if focus_state == "child":
+        parent = Mock(id=42)
+        parent.get_attributes.return_value.override_redirect = False
+        focus.query_tree.return_value.parent = parent
+    elif focus_state == "class-changed":
+        x.wm_class.side_effect = [("kate", "kate"), ("kscreenlocker", "kscreenlocker")]
+    elif focus_state == "no-class":
+        x.wm_class.return_value = None
+    elif focus_state == "override":
+        focus.get_attributes.return_value.override_redirect = True
+    elif focus_state in {"none", "pointer", "root"}:
+        x.d.get_input_focus.return_value.focus = {"none": 0, "pointer": 1, "root": x.root}[
+            focus_state
+        ]
+    elif focus_state == "cycle":
+        focus.query_tree.return_value.parent = focus
+    elif focus_state == "too-deep":
+        window = focus
+        for wid in range(100, 140):
+            parent = Mock(id=wid)
+            parent.get_attributes.return_value.override_redirect = False
+            window.query_tree.return_value.parent = parent
+            window = parent
+    elif focus_state == "query-error":
+        x.d.get_input_focus.side_effect = RuntimeError("фокус недоступен")
+    elif focus_state == "tree-error":
+        focus.query_tree.side_effect = RuntimeError("окно исчезло")
+    elif focus_state == "closed":
+        x.d = None
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == (
+        PasteOutcomeKind.PASTED if focus_state == "child" else PasteOutcomeKind.WINDOW_CHANGED
+    )
+    if focus_state == "child":
+        x.send_combo.assert_called_once()
+    else:
+        x.send_combo.assert_not_called()
+        assert outcome.restore == PasteRestore.KEPT_OURS
+        assert cb.data[False]["text/plain"] == "фраза".encode()
+
+
+@pytest.mark.parametrize(
+    ("text", "removed"),
+    [("a\r\nb", 0), ("a\r\n\n\rb", 0), ("a\x00\t\x1b\x7f\x85\x9fb", 6), ("a\r\nb\x0f\x9b", 2)],
+)
+def test_stripped_controls_counts_only_deleted_controls(
+    harness: tuple[FakeClipboard, Mock, list[int]], text: str, removed: int
+) -> None:
+    outcome = paste.paste_text(text, 42, PasteMode.CLIPBOARD_ONLY)
+    assert outcome.stripped_controls == removed
+    assert outcome.chars == len(paste.normalize(text))
+
+
+@pytest.mark.parametrize("first", [PasteMode.AUTO, PasteMode.CLIPBOARD_ONLY])
+def test_session_detection_is_cached_without_manual_x(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    first: PasteMode,
+) -> None:
+    monkeypatch.delenv("XDG_CURRENT_DESKTOP")
+    monkeypatch.setenv("DISPLAY", ":unreachable-paste-unit")
+    probe = Mock(return_value=session.SessionKind.FLY)
+    detect = Mock(wraps=session.detect)
+    monkeypatch.setattr(session, "_from_x11", probe)
+    monkeypatch.setattr(session, "detect", detect)
+    monkeypatch.setattr(paste, "_fly_blacklist_type", lambda **kwargs: "Star Embed Source")
+    modes = [first, first, *[mode for mode in PasteMode if mode != first] * 2]
+    for mode in modes:
+        before = probe.call_count
+        paste.paste_text("фраза", 42, mode)
+        if mode == PasteMode.CLIPBOARD_ONLY:
+            assert probe.call_count == before
+    assert detect.call_count == 2
+    probe.assert_called_once_with(":unreachable-paste-unit")
+
+
+@pytest.mark.parametrize("scenario", ["reentrant", "no-app", "wrong-thread"])
+def test_qt_process_returns_outcome_without_abort(scenario: str) -> None:
+    """Настоящий Qt-слот не должен дать SIGABRT; дочерний процесс не подключается к X."""
+    script = dedent("""
+        import sys
+        import threading
+        from unittest.mock import Mock, patch
+        from PyQt5.QtCore import QCoreApplication, QTimer
+        from PyQt5.QtWidgets import QApplication
+        from astra_voice.platform import paste
+
+        scenario = sys.argv[1]
+        factory = Mock(side_effect=AssertionError("X запрещён"))
+        with patch.object(paste, "X11Display", factory):
+            if scenario == "no-app":
+                outcome = paste.paste_text("фраза", 42, paste.PasteMode.AUTO)
+                assert outcome.kind == paste.PasteOutcomeKind.FAILED
+                factory.assert_not_called()
+            elif scenario == "wrong-thread":
+                app = QApplication(["paste-test", "-platform", "offscreen"])
+                outcomes = []
+                thread = threading.Thread(target=lambda: outcomes.append(
+                    paste.paste_text("фраза", 42, paste.PasteMode.AUTO)))
+                thread.start()
+                thread.join(5)
+                assert not thread.is_alive()
+                assert len(outcomes) == 1
+                assert outcomes[0].kind == paste.PasteOutcomeKind.FAILED
+                factory.assert_not_called()
+            else:
+                app = QCoreApplication([])
+                cb = Mock()
+                saved = {"text/plain": b"before"}
+                cb.snapshot.return_value = saved.copy()
+                cb.owns.return_value = True
+                x = Mock()
+                x.wm_class.return_value = ("kate", "kate")
+                x.active_window.return_value = 42
+                x.send_combo.return_value = True
+                x.grab_keyboard.return_value = True
+                x.keyboard_grab_deadline = None
+                x.root.id = 2
+                focus = x.d.get_input_focus.return_value.focus
+                focus.id = 42
+                focus.get_attributes.return_value.override_redirect = False
+                factory.side_effect = None
+                factory.return_value = x
+                outcomes = []
+                writes = []
+                cb.put.side_effect = lambda data, primary: writes.append(data.copy())
+                def reenter():
+                    outcomes.append(paste.paste_text("вторая", 42, paste.PasteMode.AUTO))
+                QTimer.singleShot(0, reenter)
+                QTimer.singleShot(75, reenter)
+                with patch.object(paste, "_Clipboard", return_value=cb) as clipboard_factory:
+                    outcome = paste.paste_text("первая", 42, paste.PasteMode.AUTO)
+                assert outcome.kind == paste.PasteOutcomeKind.PASTED
+                assert outcome.restore == paste.PasteRestore.RESTORED
+                assert len(outcomes) == 2
+                for nested in outcomes:
+                    assert nested.kind == paste.PasteOutcomeKind.BUSY
+                    assert nested.method == paste.PasteMethod.NONE
+                    assert nested.restore == paste.PasteRestore.KEPT_OURS
+                assert writes == [
+                    {"text/plain": "первая".encode(), paste.KDE_HINT: b"secret"}, saved]
+                clipboard_factory.assert_called_once()
+                factory.assert_called_once()
+                x.close.assert_called_once()
+            assert not paste._running
+        print("ok")
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script, scenario],
+        env={
+            **os.environ,
+            "DISPLAY": "",
+            "QT_QPA_PLATFORM": "offscreen",
+            "PYTHONPATH": str(Path(paste.__file__).resolve().parents[2]),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
+def test_wait_excludes_user_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Флаг обязателен для каждого вложенного ожидания; таймеры остаются разрешены."""
+    qt = Mock()
+    monkeypatch.setitem(sys.modules, "PyQt5.QtCore", qt)
+    for delay in (50, 100):
+        paste._wait_ms(delay)
+        qt.QEventLoop.return_value.exec_.assert_called_with(qt.QEventLoop.ExcludeUserInputEvents)
+        qt.QTimer.return_value.start.assert_called_with(delay)
+    assert qt.QEventLoop.return_value.exec_.call_count == 2
+
+
+def test_snapshot_is_byte_copy() -> None:
+    payload = bytearray(b"before")
+    md = SimpleNamespace(formats=lambda: ["text/plain"], data=lambda fmt: payload)
+    snapshot = paste.snapshot_mime(md)
+    payload[:] = b"after"
+    assert snapshot == {"text/plain": b"before"}
+    assert paste.snapshot_mime(None) == {}
+
+
+def test_snapshot_limits_nontext_without_losing_text_or_hint(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """1 МиБ включительно; текст и hint любого размера сохраняются, содержимое не в логе."""
+    from PyQt5.QtCore import QMimeData
+
+    caplog.set_level("DEBUG", logger=paste.__name__)
+    limit = 1024 * 1024
+    large = b"PRIVATE-CLIPBOARD-" + b"x" * limit
+    preserved = dict.fromkeys(
+        ("text/plain", "text/html", "text/uri-list", "UTF8_STRING", paste.KDE_HINT), large
+    )
+    preserved["text/uri-list"] = b"file:///tmp/" + b"x" * limit + b"\r\n"
+    preserved["application/small"] = b"x" * limit
+    md = QMimeData()
+    for fmt, data in {**preserved, "application/large": large}.items():
+        md.setData(fmt, data)
+    assert paste.snapshot_mime(md) == preserved
+    assert "application/large" in caplog.text
+    assert "PRIVATE-CLIPBOARD" not in caplog.text
+
+
+def test_snapshot_does_not_request_heavy_formats(caplog: pytest.LogCaptureFixture) -> None:
+    """Не запускаем ленивую загрузку картинки или объекта LibreOffice в GUI-потоке."""
+    formats = [
+        "image/png",
+        "application/x-qt-image",
+        'application/x-openoffice-embed-source-xml;windows_formatname="Star Embed Source (XML)"',
+        "application/vnd.oasis.opendocument.text",
+        "Star Embed Source",
+        "Star Object Descriptor (XML)",
+    ]
+    caplog.set_level("DEBUG", logger=paste.__name__)
+    data = Mock(side_effect=AssertionError("загрузка тяжёлых данных запрещена"))
+    assert paste.snapshot_mime(SimpleNamespace(formats=lambda: formats, data=data)) == {}
+    data.assert_not_called()
+    assert all(fmt in caplog.text for fmt in formats)
+
+
+@pytest.mark.parametrize("mode", [PasteMode.AUTO, PasteMode.CLIPBOARD_ONLY])
+def test_lone_surrogate_is_replaced_without_losing_phrase(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    caplog: pytest.LogCaptureFixture,
+    mode: PasteMode,
+) -> None:
+    cb, _, _ = harness
+    private = "ПРИВАТНАЯ-ФРАЗА"
+    outcome = paste.paste_text(private + "\ud800\nконец", 42, mode)
+    assert outcome.kind == (
+        PasteOutcomeKind.PASTED if mode == PasteMode.AUTO else PasteOutcomeKind.CLIPBOARD_ONLY
+    )
+    assert cb.writes[0][1]["text/plain"] == (private + "? конец").encode()
+    assert private not in repr(outcome) + caplog.text
+
+
+@pytest.mark.parametrize("mode", [PasteMode.AUTO, PasteMode.CLIPBOARD_ONLY])
+def test_fly_adds_blacklisted_type(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    mode: PasteMode,
+) -> None:
+    cb, x, _ = harness
+    x.wm_class.return_value = ("xterm", "xterm")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "Fly")
+    monkeypatch.setattr(paste, "_fly_blacklist_type", lambda **kwargs: "Star Embed Source")
+    paste.paste_text("фраза", 42, mode)
+    expected = {
+        "text/plain": "фраза".encode(),
+        paste.KDE_HINT: b"secret",
+        "Star Embed Source": b"",
+    }
+    assert cb.writes[0] == (False, expected)
+    if mode == PasteMode.AUTO:
+        assert cb.writes[1] == (True, expected)
+
+
+@pytest.mark.parametrize(
+    "types",
+    [
+        "text/plain:x-kde-passwordManagerHint:x-openoffice-link",
+        "text/plain:text/html:x-kde-passwordManagerHint",
+    ],
+)
+def test_fly_blacklist_preserves_phrase_and_hint_in_qmime(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    types: str,
+) -> None:
+    """T-48/У49: опасные типы не затирают text/plain и hint; есть запасной тип."""
+    cb, _, _ = harness
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "Fly")
+    monkeypatch.setattr(paste, "FLY_SYSTEM_THEME", tmp_path / "missing.themerc")
+    theme = tmp_path / ".fly" / "theme"
+    theme.mkdir(parents=True)
+    (theme / "current.themerc").write_text(
+        f'ClipboardManagerTypesBlacklist="{types}"\n', encoding="utf-8"
+    )
+    outcome = paste.paste_text("фраза", 42, PasteMode.CLIPBOARD_ONLY)
+    assert outcome.kind == PasteOutcomeKind.CLIPBOARD_ONLY
+    md = paste.restore_mime(cb.data[False])
+    assert md.text() == "фраза"
+    assert bytes(md.data("text/plain")) == "фраза".encode()
+    assert bytes(md.data(paste.KDE_HINT)) == b"secret"
+    assert md.hasFormat("x-openoffice-link")
+
+
+def test_fly_blacklist_skips_occupied_keys(tmp_path: Path) -> None:
+    theme = tmp_path / "theme.themerc"
+    theme.write_text(
+        'ClipboardManagerTypesBlacklist="custom:text/html:x-openoffice-link"', encoding="utf-8"
+    )
+    assert paste._fly_blacklist_type((theme,), occupied={"custom": b"data"}) == "x-openoffice-link"
+
+
+@pytest.mark.parametrize(
+    ("user_text", "system_text", "expected"),
+    [
+        (
+            'ClipboardManagerTypesBlacklist=":: First Type:second:"',
+            'ClipboardManagerTypesBlacklist="system:"',
+            "First Type",
+        ),
+        (
+            ';ClipboardManagerTypesBlacklist="comment:"',
+            'ClipboardManagerTypesBlacklist="Star Embed Source:x-openoffice-link:"',
+            "Star Embed Source",
+        ),
+        ('ClipboardManagerTypesBlacklist=":::"', None, "x-openoffice-link"),
+        (None, None, "x-openoffice-link"),
+    ],
+)
+def test_fly_theme_priority_and_fallback(
+    tmp_path: Path, user_text: str | None, system_text: str | None, expected: str
+) -> None:
+    paths = (tmp_path / "user.themerc", tmp_path / "system.themerc")
+    for path, content in zip(paths, (user_text, system_text), strict=True):
+        if content is not None:
+            path.write_text(content, encoding="utf-8")
+    assert paste._fly_blacklist_type(paths) == expected
+
+
+def test_no_qt_import_for_pure_functions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Повторный импорт модуля запрещает даже попытку загрузить PyQt5."""
+    import builtins
+    import importlib.util
+    import sys
+
+    original: Callable[..., object] = builtins.__import__
+
+    def guarded(name: str, *args: object, **kwargs: object) -> object:
+        assert not name.startswith("PyQt5")
+        return original(name, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "__import__", guarded)
+        spec = importlib.util.spec_from_file_location("_paste_without_qt", paste.__file__)
+        assert spec is not None and spec.loader is not None
+        isolated = importlib.util.module_from_spec(spec)
+        patch.setitem(sys.modules, spec.name, isolated)
+        spec.loader.exec_module(isolated)
+        assert isolated.normalize("ёж\n") == "ёж "
+        assert isolated.method_for_wm_class("xterm") == "shift+insert"
