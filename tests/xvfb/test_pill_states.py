@@ -16,6 +16,7 @@ import sys
 import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
+from hashlib import sha256
 from math import ceil, floor
 from pathlib import Path
 from typing import Any
@@ -63,12 +64,24 @@ class TextMeasurement:
 
 
 @dataclass
+class DetailsButtonMeasurement:
+    visible: bool
+    background_visible: bool
+    radius: float
+    background_color: str
+    background_alpha: float
+    font_pixel_size: int
+    color: str
+
+
+@dataclass
 class RenderedState:
     width: float
     height: float
     visible: bool
     item_visible: bool
     close_visible: bool
+    details_button: DetailsButtonMeasurement
     texts: list[TextMeasurement]
     bars: list[tuple[int, float, float, str]]
     messages: list[str]
@@ -121,7 +134,12 @@ def assert_saved_snapshot(state: str, rendered: RenderedState) -> None:
 
 
 def capture_state(
-    app: Any, state: str, *, text: str | None = None, snapshot_dir: Path
+    app: Any,
+    state: str,
+    *,
+    text: str | None = None,
+    snapshot_dir: Path,
+    extra_wait_ms: int = 0,
 ) -> RenderedState:
     from PyQt5 import sip
     from PyQt5.QtCore import QPointF, QUrl, qInstallMessageHandler
@@ -146,6 +164,9 @@ def capture_state(
         assert view.status() == QQuickView.Ready, [e.toString() for e in view.errors()]
         root = view.rootObject()
         assert root is not None
+        assert root.setProperty("freezeAnimations", True), (
+            f"{state}: в QML нет свойства freezeAnimations — заморозка анимаций не сработала"
+        )
         if state in INVISIBLE:
             # Проверяем настоящее скрытие уже показанного окна через Python-мост.
             pill.show_state(PillState.LISTENING)
@@ -159,7 +180,7 @@ def capture_state(
                 text = LABELS[state]
             pill.show_state(PillState(state), text=text)
         # Даём время на Row polish и глифы; завершение появления проверяем по PNG ниже.
-        QTest.qWait(180)
+        QTest.qWait(180 + extra_wait_ms)
         app.processEvents()
         assert root.property("avState") == state
         pill_width = float(root.property("pillWidth"))
@@ -226,12 +247,30 @@ def capture_state(
         texts = []
         bars = []
         close_buttons = []
+        details_buttons = []
         for item in visual_tree(root):
             meta = item.metaObject()
             # У кнопки «×» есть круглая подложка; глиф состояния cancelled — без неё.
             if item.property("name") == "x" and item.parentItem().property("radius") is not None:
                 close_buttons.append(item.parentItem())
             if meta.indexOfProperty("elide") >= 0:
+                if item.property("text") == "›":
+                    background = item.parentItem()
+                    assert background is not None and background.property("radius") is not None, (
+                        f"{state}: у кнопки «›» отсутствует круглая подложка"
+                    )
+                    background_color = background.property("color")
+                    details_buttons.append(
+                        DetailsButtonMeasurement(
+                            visible=item.isVisible(),
+                            background_visible=background.isVisible(),
+                            radius=float(background.property("radius")),
+                            background_color=background_color.name().upper(),
+                            background_alpha=background_color.alphaF(),
+                            font_pixel_size=int(item.property("font").pixelSize()),
+                            color=item.property("color").name().upper(),
+                        )
+                    )
                 left = item.mapToItem(root, QPointF(0, 0)).x()
                 texts.append(
                     TextMeasurement(
@@ -255,12 +294,16 @@ def capture_state(
                     )
                 )
         assert len(close_buttons) == 1, f"{state}: должна существовать одна кнопка «×»"
+        assert len(details_buttons) == 1, (
+            f"{state}: должна существовать одна кнопка «›», найдено {len(details_buttons)}"
+        )
         return RenderedState(
             width=pill_width,
             height=pill_height,
             visible=view.isVisible(),
             item_visible=root.isVisible(),
             close_visible=close_buttons[0].isVisible(),
+            details_button=details_buttons[0],
             texts=texts,
             bars=sorted(bars),
             messages=messages,
@@ -329,7 +372,28 @@ def test_pill_state(state: str, rendered_states: dict[str, RenderedState]) -> No
     assert rendered.close_visible == (state in {"listening", "listening-silent"}), (
         f"{state}: неверная видимость кнопки «×»"
     )
-    # Цвета, столбики и «×» измеряются в QML, независимо от полей снимка.
+    details = rendered.details_button
+    assert details.visible == (state == "error"), f"{state}: неверная видимость знака «›»"
+    assert details.background_visible == (state == "error"), (
+        f"{state}: неверная видимость подложки кнопки «›»"
+    )
+    if state == "error":
+        assert details.radius == 11, (
+            f"{state}: радиус подложки кнопки «›» {details.radius}, ожидался 11"
+        )
+        assert details.background_color == "#FFFFFF", (
+            f"{state}: цвет подложки кнопки «›» {details.background_color}, ожидался #FFFFFF"
+        )
+        assert abs(details.background_alpha - 0.12) <= 0.005, (
+            f"{state}: альфа подложки кнопки «›» {details.background_alpha}, ожидалась 0.12 ± 0.005"
+        )
+        assert details.font_pixel_size == 13, (
+            f"{state}: размер шрифта знака «›» {details.font_pixel_size} px, ожидался 13 px"
+        )
+        assert details.color == "#C4CDDC", (
+            f"{state}: цвет знака «›» {details.color}, ожидался #C4CDDC"
+        )
+    # Цвета, столбики, «×» и «›» измеряются в QML, независимо от полей снимка.
     # «—» и «›» — символы иконок со своими цветами по §8.4; здесь проверяется подпись.
     captions = [text for text in rendered.texts if text.text not in {"—", "›"}]
     assert len(captions) == 1
@@ -363,6 +427,27 @@ def test_pill_state(state: str, rendered_states: dict[str, RenderedState]) -> No
     elif state in {"listening-silent", "limit"}:
         assert len(rendered.bars) == 9
         assert all(height == 4 for _, _, height, _ in rendered.bars)
+
+
+@pytest.mark.parametrize("state", [state for state in LABELS if state not in INVISIBLE])
+def test_pill_snapshots_are_deterministic(
+    state: str,
+    pill_app: Any,
+    rendered_states: dict[str, RenderedState],
+    tmp_path: Path,
+) -> None:
+    first = rendered_states[state]
+    # Сдвигаем фазу на четверть периода, чтобы без заморозки сравнение падало
+    # даже при одинаковой скорости двух рендеров. Повторные PNG не публикуются.
+    second = capture_state(pill_app, state, snapshot_dir=tmp_path, extra_wait_ms=250)
+    assert not second.messages, f"{state}: сообщения Qt\n" + "\n".join(second.messages)
+    assert_saved_snapshot(state, second)
+    assert first.snapshot is not None and second.snapshot is not None
+    first_hash = sha256(first.snapshot.read_bytes()).hexdigest()
+    second_hash = sha256(second.snapshot.read_bytes()).hexdigest()
+    assert first_hash == second_hash, (
+        f"{state}: PNG зависит от времени съёмки: {first_hash} != {second_hash}"
+    )
 
 
 @pytest.mark.parametrize("state", [state for state in LABELS if state not in INVISIBLE])

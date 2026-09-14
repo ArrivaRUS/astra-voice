@@ -15,6 +15,7 @@ Item {
     readonly property real iconSmall: 15 // design/spec.md §8.4: alert, clock, file, x, «—».
     readonly property real iconLarge: 16 // design/spec.md §8.4: refresh, check, alert ошибки.
     readonly property real closeSize: 22 // design/spec.md §8.2: кнопка 22 × 22.
+    readonly property real closeGlyphSize: 13 // design/mockups/directions/_base.py .pill .x: кегль знака.
     readonly property real dotWidth: 5 // design/spec.md §8.4: ширина точек processing.
     readonly property var dotHeights: [5, 9, 5] // design/spec.md §8.4: три точки, высоты 5/9/5.
     readonly property real pulseOpacity: 0.5 // design/spec.md §8.4: пульсация; минимум выбран без гашения.
@@ -33,6 +34,8 @@ Item {
     property string avState: "hidden"
     property string label: ""
     property var levels: []
+    // Только для детерминированной съёмки в тестах; в программе анимации включены.
+    property bool freezeAnimations: false
 
     signal cancelClicked()
     signal detailsClicked()
@@ -219,6 +222,7 @@ Item {
                 model: root.dotHeights
 
                 Rectangle {
+                    id: dot
                     required property int index
                     required property real modelData
 
@@ -232,7 +236,9 @@ Item {
 
                     SequentialAnimation on opacity {
                         running: root.active && root.visible && root.processing
+                            && !root.freezeAnimations
                         loops: Animation.Infinite
+                        onStopped: if (root.freezeAnimations) dot.opacity = 1
                         NumberAnimation {
                             from: 1
                             to: root.pulseOpacity
@@ -270,7 +276,7 @@ Item {
                 duration: root.spinnerDuration
                 easing.type: Easing.Linear
                 loops: Animation.Infinite
-                running: root.active && root.visible && root.loading
+                running: root.active && root.visible && root.loading && !root.freezeAnimations
                 // Общий глиф после спиннера должен снова быть повёрнут на ноль градусов.
                 onStopped: glyph.rotation = 0
             }
@@ -323,18 +329,21 @@ Item {
             }
         }
 
-        Item {
+        Rectangle {
             visible: root.error
             width: root.closeSize
             height: root.closeSize
             y: (content.height - height) / 2
+            radius: width / 2
+            color: PillTheme.pillCloseBg
+            antialiasing: true
 
             Text {
                 anchors.centerIn: parent
                 text: "›"
                 font.family: root.textFamily
-                font.pixelSize: root.iconSmall
-                color: PillTheme.pillError
+                font.pixelSize: root.closeGlyphSize
+                color: PillTheme.pillCloseFg
                 renderType: Text.NativeRendering
             }
 
