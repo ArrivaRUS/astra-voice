@@ -42,6 +42,22 @@ def _fly_svg(path: Path, *, dark: bool) -> bytes:
     return path.read_text(encoding="utf-8").replace("currentColor", color).encode("utf-8")
 
 
+def find_tray_icon_path(name: str, size: int) -> Path:
+    """Ищет SVG сначала в установленной теме, затем в данных дерева разработки.
+
+    Если файла нет, ошибка перечисляет оба проверенных пути.
+    """
+    relative = Path(f"{size}x{size}") / "status" / f"{name}.svg"
+    candidates = (
+        paths.icon_theme_dir() / relative,
+        paths.data_dir_static() / "icons" / "hicolor" / relative,
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(f"Не найден SVG трея: {candidates[0]}; {candidates[1]}")
+
+
 class TrayIconProvider:
     """Загрузка иконок требует QApplication; после смены темы нужен refresh()."""
 
@@ -64,10 +80,9 @@ class TrayIconProvider:
             fly = self._session == SessionKind.FLY
             icon = QIcon() if fly else QIcon.fromTheme(name)
             if icon.isNull():
-                root = paths.data_dir_static() / "icons" / "hicolor"
                 dark = self._theme.dark if self._theme is not None else False
                 for size in (16, 22):
-                    path = root / f"{size}x{size}" / "status" / f"{name}.svg"
+                    path = find_tray_icon_path(name, size)
                     data = _fly_svg(path, dark=dark) if fly else path.read_bytes()
                     pixmap = QPixmap()
                     if not pixmap.loadFromData(data, "SVG") or pixmap.isNull():

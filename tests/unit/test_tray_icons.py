@@ -13,7 +13,7 @@ import pytest
 from astra_voice.core import paths
 from astra_voice.core.theme import ThemeSource
 from astra_voice.platform.session import SessionKind
-from astra_voice.ui.tray_icons import TrayIconProvider, TrayState, _fly_svg
+from astra_voice.ui.tray_icons import TrayIconProvider, TrayState, _fly_svg, find_tray_icon_path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from helpers.qt_app import get_qapplication  # noqa: E402
@@ -51,9 +51,10 @@ def qapp() -> QApplication:
 
 
 @pytest.fixture
-def bundled_icons(monkeypatch: pytest.MonkeyPatch) -> None:
+def bundled_icons(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from PyQt5.QtGui import QIcon
 
+    monkeypatch.setattr(paths, "resource_root", lambda: tmp_path / "usr/share/astra-voice")
     monkeypatch.setattr(paths, "data_dir_static", lambda: DATA)
     monkeypatch.setattr(QIcon, "fromTheme", lambda name: QIcon())
 
@@ -73,6 +74,69 @@ def test_names_do_not_fall_back_to_astra() -> None:
 @pytest.mark.parametrize("size", [16, 22])
 def test_bundled_files(state: TrayState, name: str, size: int) -> None:
     assert (DATA / "icons" / "hicolor" / f"{size}x{size}" / "status" / f"{name}.svg").is_file()
+
+
+@pytest.mark.parametrize("size", [16, 22])
+@pytest.mark.parametrize(
+    ("in_theme", "in_data"), [(True, False), (False, True), (True, True), (False, False)]
+)
+def test_tray_icon_search_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    size: int,
+    in_theme: bool,
+    in_data: bool,
+) -> None:
+    """Установленная тема имеет приоритет; ошибка содержит оба пути поиска."""
+    root = tmp_path / "usr/share/astra-voice"
+    data = tmp_path / "dev/data"
+    monkeypatch.setattr(paths, "resource_root", lambda: root)
+    monkeypatch.setattr(paths, "data_dir_static", lambda: data)
+    name = TrayIconProvider(SessionKind.FLY).icon_name(TrayState.IDLE)
+    relative = Path(f"{size}x{size}") / "status" / f"{name}.svg"
+    theme_file = tmp_path / "usr/share/icons/hicolor" / relative
+    data_file = data / "icons/hicolor" / relative
+    for path, exists in ((theme_file, in_theme), (data_file, in_data)):
+        if exists:
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"SVG")
+
+    if in_theme or in_data:
+        assert find_tray_icon_path(name, size) == (theme_file if in_theme else data_file)
+    else:
+        with pytest.raises(FileNotFoundError) as error:
+            find_tray_icon_path(name, size)
+        assert str(theme_file) in str(error.value)
+        assert str(data_file) in str(error.value)
+
+
+@pytest.mark.parametrize("session", [SessionKind.FLY, SessionKind.KDE])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_icons_load_from_installed_theme_or_mixed_directories(
+    qapp: QApplication,
+    bundled_icons: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session: SessionKind,
+    mixed: bool,
+) -> None:
+    """Обе ветки загружают тему и независимо ищут каждый размер."""
+    data = tmp_path / "dev/data"
+    monkeypatch.setattr(paths, "data_dir_static", lambda: data)
+    provider = TrayIconProvider(session)
+    name = provider.icon_name(TrayState.IDLE)
+    for size in (16, 22):
+        relative = Path(f"{size}x{size}") / "status" / f"{name}.svg"
+        root = data / "icons/hicolor" if mixed and size == 22 else paths.icon_theme_dir()
+        path = root / relative
+        path.parent.mkdir(parents=True)
+        path.write_bytes((DATA / "icons/hicolor" / relative).read_bytes())
+
+    icon = provider.icon(TrayState.IDLE)
+    assert not icon.isNull()
+    assert {(size.width(), size.height()) for size in icon.availableSizes()} == {(16, 16), (22, 22)}
+    for size in (16, 22):
+        assert not icon.pixmap(size, size).isNull()
 
 
 @pytest.mark.parametrize("state", list(TrayState))
@@ -263,7 +327,8 @@ def test_has_icon_shares_reads_and_failures_with_icon_until_refresh(
             assert provider.has_icon(TrayState.IDLE) is available
         icon = provider.icon(TrayState.IDLE)
         assert icon.isNull() is not available
-        reads_per_load = 2 if available else 1
+        # Отсутствие файла теперь определяется поиском до попытки чтения.
+        reads_per_load = 2 if available else 0
         assert read.call_count == reads_per_load
 
         for _ in range(2):

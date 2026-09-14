@@ -15,13 +15,14 @@ from unittest.mock import Mock
 
 import pytest
 
-from astra_voice import bootstrap
+import astra_voice
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import (
     MAX_RESTARTS,
     RESTART_WINDOW_S,
     Message,
     WorkerSupervisor,
+    launcher_path,
     worker_command,
 )
 
@@ -89,13 +90,30 @@ def crash(supervisor: WorkerSupervisor) -> None:
     )
 
 
-def test_default_command_is_relocatable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Команда использует путь модуля бутстрапа и изолированный Python."""
-    monkeypatch.setattr(bootstrap, "__file__", "/tmp/relocated/astra_voice/bootstrap.py")
+@pytest.mark.parametrize(
+    ("external", "internal"),
+    [(True, False), (False, True), (True, True), (False, False)],
+    ids=["installed", "dev", "external-first", "missing"],
+)
+def test_default_command_is_relocatable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, external: bool, internal: bool
+) -> None:
+    """Лаунчер находится в обеих раскладках, команда сохраняет изолированный Python."""
+    pkg = tmp_path / "astra_voice"
+    pkg.mkdir()
+    package_file = pkg / "__init__.py"
+    package_file.touch()
+    monkeypatch.setattr(astra_voice, "__file__", str(package_file))
+    if external:
+        (tmp_path / "bootstrap.py").touch()
+    if internal:
+        (pkg / "bootstrap.py").touch()
+    expected = (tmp_path if external else pkg) / "bootstrap.py"
+    assert launcher_path() == expected
     assert worker_command(123) == [
         sys.executable,
         "-I",
-        "/tmp/relocated/astra_voice/bootstrap.py",
+        str(expected),
         "worker",
         "123",
     ]

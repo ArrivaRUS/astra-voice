@@ -622,7 +622,9 @@ def main(argv: list[str] | None = None) -> int:
             runtime.pill.on_details_clicked = lambda: _show(shell)
             runtime.start()
         except Exception:  # noqa: BLE001 — без диктовки окно должно продолжать работать
-            log.warning("Не удалось запустить диктовку, приложение продолжит работу без неё")
+            log.warning(
+                "Не удалось запустить диктовку, приложение продолжит работу без неё", exc_info=True
+            )
         return int(app.exec_())
     finally:
         # US-8.4: выход из трея и SIGTERM/SIGINT вызывают app.quit() и приходят

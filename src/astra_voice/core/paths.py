@@ -117,3 +117,8 @@ def qml_dir() -> Path:
 def data_dir_static() -> Path:
     """Каталог поставляемых данных (иконки, звуки, каталог моделей)."""
     return resource_root() / "data"
+
+
+def icon_theme_dir() -> Path:
+    """Каталог значков установленной темы рядом с корнем ресурсов."""
+    return resource_root().parent / "icons" / "hicolor"

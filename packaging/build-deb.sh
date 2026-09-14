@@ -197,4 +197,13 @@ fi
 say "SBOM"
 python3 "$ROOT/scripts/sbom.py" --deb "$DIST/$DEB" --out "$DIST/sbom.cdx.json"
 
+say "гейт установленного дерева: импорты и app --version"
+TMP="$(mktemp -d)" || die "не удалось создать временный каталог для распаковки пакета"
+trap 'rm -rf "$TMP"' EXIT
+trap 'exit 1' HUP INT TERM
+dpkg-deb -x "$DIST/$DEB" "$TMP" || die "не удалось распаковать $DIST/$DEB"
+"$ROOT/packaging/smoke-installed.sh" "$TMP" || die "смоук установленного пакета не прошёл"
+rm -rf "$TMP"
+trap - EXIT HUP INT TERM
+
 say "готово: $DIST/$DEB ($(du -h "$DIST/$DEB" | cut -f1), режим $MODE, vendor=$VENDOR)"

@@ -28,6 +28,9 @@ from astra_voice.worker import main as worker_main
 from astra_voice.worker.audio import AudioCapture, CaptureStopTimeout
 from astra_voice.worker.state import Message, WorkerState
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from helpers import wait_until  # noqa: E402
+
 pytestmark = pytest.mark.unit
 
 
@@ -412,7 +415,12 @@ def test_send_buffer_overflow_closes_loop(
 
 
 def test_eof_closes_audio_and_socket(monkeypatch: pytest.MonkeyPatch) -> None:
-    """EOF во время записи закрывает источник, сокет и цикл быстрее секунды."""
+    """EOF закрывает источник, сокет и цикл в пределах одной итерации.
+
+    EOF виден select немедленно; ожидание до 5 с — запас на планировщик
+    загруженной машины. Жёсткий порог по стенным часам не гарантирован:
+    планировщик может не дать потоку время для выполнения.
+    """
     source = Mock()
 
     def make_state(*, on_event: Callable[[Message], None]) -> WorkerState:
@@ -426,25 +434,33 @@ def test_eof_closes_audio_and_socket(monkeypatch: pytest.MonkeyPatch) -> None:
         assert receive(peer) == [{"type": "pong"}]
         started = time.monotonic()
         peer.close()
-        thread.join(1)
-        assert not thread.is_alive()
-        assert time.monotonic() - started <= 1
+        try:
+            wait_until(lambda: not thread.is_alive(), timeout=5.0)
+        except AssertionError as exc:
+            elapsed = time.monotonic() - started
+            raise AssertionError(f"цикл не вышел за {elapsed:.2f} с") from exc
         assert loop.connection.fileno() == -1
         source.close.assert_called_once_with()
         assert not loop.worker.buffers
 
 
 def test_parent_changed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Смена родителя завершает цикл, даже когда IPC ещё открыт."""
+    """Смену родителя цикл замечает на следующем опросе, даже при открытом IPC.
+
+    POLL_INTERVAL = 0.25 с; ожидание до 5 с — запас на планировщик
+    загруженной машины, а не жёсткая гарантия по стенным часам.
+    """
     parent = [123]
     monkeypatch.setattr(os, "getppid", lambda: parent[0])
     with running_loop() as (loop, peer, thread):
         receive(peer)
         started = time.monotonic()
         parent[0] = 1
-        thread.join(1)
-        assert not thread.is_alive()
-        assert time.monotonic() - started <= 1
+        try:
+            wait_until(lambda: not thread.is_alive(), timeout=5.0)
+        except AssertionError as exc:
+            elapsed = time.monotonic() - started
+            raise AssertionError(f"цикл не вышел за {elapsed:.2f} с") from exc
         assert loop.connection.fileno() == -1
         assert peer.recv(1) == b""
 

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from astra_voice import bootstrap
+import astra_voice
 from astra_voice.worker import ipc
 
 MAX_RESTARTS = 3
@@ -54,9 +54,19 @@ def _correlation(message: Message) -> RequestKey:
     return _CORRELATION.get(kind, ("reply", kind))
 
 
+def launcher_path() -> Path:
+    """Ищет лаунчер при вызове: сначала рядом с пакетом (И7), затем внутри него."""
+    pkg = Path(astra_voice.__file__).resolve().parent
+    dev_launcher = pkg / "bootstrap.py"
+    for candidate in (pkg.parent / "bootstrap.py", dev_launcher):
+        if candidate.is_file():
+            return candidate
+    return dev_launcher
+
+
 def worker_command(fd: int) -> list[str]:
-    """Находит единый бутстрап относительно установленного модуля (И7)."""
-    return [sys.executable, "-I", str(Path(bootstrap.__file__).resolve()), "worker", str(fd)]
+    """Составляет команду запуска воркера через лаунчер в изолированном Python."""
+    return [sys.executable, "-I", str(launcher_path()), "worker", str(fd)]
 
 
 class WorkerSupervisor:
