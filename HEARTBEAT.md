@@ -24,9 +24,7 @@
 - **Пилюля: DesignReviewer PASS, 0 расхождений** («›» в `error` как «×»; снимки детерминированы, `freezeAnimations` только на
   съёмке; два прогона Юрки — 10 PNG побайтно одинаковы). Диф `qml/Pill.qml` + `tests/xvfb/test_pill_states.py` + 3 PNG —
   **не закоммичен, ждёт ревью Claude** (коммит B).
-- **Пробел M4 — GUI не загружал модель** (`DictationRuntime` не слал `model.load`, только `--debug-transcribe`): мостик пишет
-  developer-codex — `core/model_request.py`, `model.load` при старте и после перезапуска воркера по `model_dir` из
-  `settings.extra`, пилюля `loading-model`, changelog `0.1.0~m4.1`. После ревью — коммит C, пересборка, `~/Desktop`.
+- **Пробел M4 — GUI не загружал модель**: мостик написан (`core/model_request.py`, `model.load` по `hello` воркера, пилюля `loading-model` до ответа ≤ 10 с, changelog `0.1.0~m4.1`); **ревью Claude: B1 (`settings.to_dict()` вместо `extra`) и M1 (загрузка при самоперезапуске супервизора) — в цикле правок**; затем коммит C, пересборка m4.1 → `~/Desktop` (там сейчас сборка ДО правок B1/M1 — заменить). Параллельно в worktree `~/.cache/astra-voice-dev/wt-ort125` — апгрейд `onnxruntime ≥ 1.25.0` (дефект AMX, `research/tech-amx-int8.md`) с гейтами и замерами; в m4.1 не входит (машина заказчика не затронута), пойдёт в m4.2/M5 после T2.
 - Заказчик спросил «когда попробовать» — обещано сегодня после m4.1: команды `sudo apt install`, остановить Handy
   (`app-Handy@autostart.service` держит `Ctrl+Space`), запустить; `model_dir` в `settings.json` прописывает Юрка
   (`~/.cache/astra-voice-spike/gigaam-v3/e2e_rnnt`, sha ок; установленный m1.2 хранит незнакомые ключи в `extra`).

@@ -218,7 +218,7 @@ QtObject {
     readonly property int durationExit: 120
     readonly property int durationHover: 120
     readonly property int durationListeningPulse: 1200
-    readonly property int durationLoadingModelMax: 5000
+    readonly property int durationLoadingModelMax: 10000
     readonly property int durationMicRetry: 300
     readonly property int durationPillAppear: 100
     readonly property int durationPillCancelled: 800
