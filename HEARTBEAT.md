@@ -17,24 +17,32 @@
 - 2026-09-07: рамки до PRD — оба режима обновления, PyQt5 из apt, пилюля по умолчанию с выключателем.
 - Codex CLI поднят до 0.153.4 — канал `gpt-6-astra` открыт для архитектора #2.
 
-## В работе (закрытие дня 2026-09-14, ~14:30)
-- **M0 (KDE) ✅ · M1 ✅ · M2 ✅ · M3 ✅ · M4 — код сведён и на GitHub (`732a116`)**: три зоны (хоткей/вставка/X11; пилюля/трей/
-  уведомления; оркестрация/статистика) прошли ревью Claude ×3 и ИБ T2 ×3, все блокеры и major закрыты; 2083 unit + 46 xvfb,
-  `make lint` чист. CI на `732a116` — запущен при закрытии (на `4a23129` был красный 3/6, причины закрыты: урок `.patches/005`).
-- **M4 не принят живьём**: DoD требует прогона `dictate50.sh --session kde` у заказчика (Ц2: p95 ≤ 0,5 с) и ручных T-50/T-56/T-58;
-  DesignReviewer — повторная сверка по пересняты снимкам `design/refs/impl/pill/` (палитра/геометрия совпали, FAIL был по съёмке
-  и размеру окна — исправлено). Живые проверки в KDE и во Fly — `docs/plans.md` M4 `[~]`.
-- PRD 0.7 (F17 «Команда помощнику Astra Cowork», решения заказчика: `Ctrl+Space`/`Ctrl+Alt+Space`, v1.0 с условием v0.2).
-- Машина: сняты 52 сироты `dbus-daemon`, 2 зависших pytest, стенд зоны A; `pgrep -f 'kwin_wayland.*av-'` = 0; `astra-voice 0.1.0~m1.2`
-  установлен у заказчика; спайк S2 в системе (откат `uninstall-spike.sh`); dev-venv `~/.cache/astra-voice-dev/venv-{a,b,c,e}`.
+## В работе (2026-09-14, вечер — сессия после компактификации)
+- **M0 (KDE) ✅ · M1 ✅ · M2 ✅ · M3 ✅ · M4 — код сведён, CI зелёный 6/6 на `514956a`** (пакеты Qt в job `unit`, гейт Qt-окружения
+  в `tests/conftest.py`, диагностика плавающего сбоя `engine`; урок 005 дополнен правилами 5–6; T-61…T-63 `[x]`).
+- **Сбой `engine` подтверждён диагностикой (`6f335f9`, run 34844710157)**: пустой текст при `infer_ms≈200` на **Intel Xeon 8573C (AMX + AVX-512 VNNI)**; зелёные прогоны — AMD EPYC 7763 (avx2). Это неверный результат int8-ядер onnxruntime 1.24.4, продуктовый риск для серверов/VDI. Ресёрч запущен (баги MLAS, ручка отключения AMX, чистые версии ORT) → решение архитектора: самопроверка при загрузке модели + обход. CI `engine` красный на Intel-раннерах до обхода — известно, не маскируем.
+- **Пилюля: DesignReviewer PASS, 0 расхождений** («›» в `error` как «×»; снимки детерминированы, `freezeAnimations` только на
+  съёмке; два прогона Юрки — 10 PNG побайтно одинаковы). Диф `qml/Pill.qml` + `tests/xvfb/test_pill_states.py` + 3 PNG —
+  **не закоммичен, ждёт ревью Claude** (коммит B).
+- **Пробел M4 — GUI не загружал модель** (`DictationRuntime` не слал `model.load`, только `--debug-transcribe`): мостик пишет
+  developer-codex — `core/model_request.py`, `model.load` при старте и после перезапуска воркера по `model_dir` из
+  `settings.extra`, пилюля `loading-model`, changelog `0.1.0~m4.1`. После ревью — коммит C, пересборка, `~/Desktop`.
+- Заказчик спросил «когда попробовать» — обещано сегодня после m4.1: команды `sudo apt install`, остановить Handy
+  (`app-Handy@autostart.service` держит `Ctrl+Space`), запустить; `model_dir` в `settings.json` прописывает Юрка
+  (`~/.cache/astra-voice-spike/gigaam-v3/e2e_rnnt`, sha ок; установленный m1.2 хранит незнакомые ключи в `extra`).
+- Пакет `0.1.0~m4` на `~/Desktop` — устарел (без мостика), ставить не нужно; заменить на m4.1.
 
 ## Следующий шаг (первое действие следующей сессии)
-1. Проверить CI на `732a116` (`gh run list`); если красный — разобрать по логам (три окружения, урок 005).
-2. Сборка `sh packaging/build-deb.sh` → `dist/astra-voice_0.1.0~m4_amd64.deb` → `~/Desktop` → заказчик: `sudo apt install ~/Desktop/…m4…deb`.
-3. С «ок» заказчика: `scripts/e2e/virtual_mic.sh up && scripts/e2e/dictate50.sh --session kde --yes` → `astra-voice --stats` (p95 ≤ 500 мс);
-   ручные T-50 (`kill plasmashell` при выключенной пилюле → пилюля форсируется), T-56 (микрофон отключён → Escape работает),
-   T-58 (Klipper без фразы); проверить `Ctrl+Alt+Space` пробником после остановки Handy (S18-A9). Затем повторный DesignReviewer → **M4 ✅**.
+1. Если коммиты B/C не сделаны: дочитать отчёты ревью (`code-reviewer`) и developer-codex (мостик), `make test` 2151+,
+   `pytest -m xvfb` 56, коммит B (пилюля) и C (мостик + changelog m4.1), пуш, CI.
+2. `sh packaging/build-deb.sh --host` → `dist/astra-voice_0.1.0~m4.1_amd64.deb` → `~/Desktop`; `model_dir` в
+   `~/.config/astra-voice/settings.json`; заказчику — три команды (install, stop Handy, запуск) и просьба «ок» на живой прогон.
+3. С «ок»: `scripts/e2e/virtual_mic.sh up && scripts/e2e/dictate50.sh --session kde --yes` → `astra-voice --stats` (p95 ≤ 500 мс);
+   ручные T-50/T-56/T-58; пробник `Ctrl+Alt+Space` после остановки Handy (S18-A9) → **M4 ✅**.
 4. M5 «Онбординг и первая модель» → R1 v0.1 (30.09). Мастер-ключ подписи — до 25.09. M0 Fly — при перелогине.
+   Отложено: minor 3 ревью CI (`qml-module-qtquick-window2`/`qtgraphicaleffects` не подтверждены гейтом — убрать или в пробу);
+   `design/refs/09-tray-dark.png` устарел (M11); вопрос developer: ставить ли `xvfb` на машину (сейчас `-m xvfb` в offscreen).
+   `ui/pill.py` `_visibility_changed` при разрушенном `QQuickView` (RuntimeError) — проверить порядок разборки при shutdown.
 
 ## Открытые СТОП-точки
 - нет (следующая — G5 на первый релиз v0.1).
