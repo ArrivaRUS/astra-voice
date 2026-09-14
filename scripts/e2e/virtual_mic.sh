@@ -30,12 +30,14 @@ restore_defaults() {
 }
 
 verify_defaults() {
+  expected_sink=$1
+  expected_source=$2
   actual_sink=$(LC_ALL=C pactl get-default-sink) || return 1
   actual_source=$(LC_ALL=C pactl get-default-source) || return 1
   printf 'Выход по умолчанию: %s\nИсточник по умолчанию: %s\n' \
     "$actual_sink" "$actual_source"
-  if [ "$actual_sink" != "$OLD_SINK" ] || [ "$actual_source" != "$OLD_SOURCE" ]; then
-    say_error "Устройства по умолчанию изменились. Ожидались: $OLD_SINK и $OLD_SOURCE."
+  if [ "$actual_sink" != "$expected_sink" ] || [ "$actual_source" != "$expected_source" ]; then
+    say_error "Устройства по умолчанию изменились. Ожидались: $expected_sink и $expected_source."
     return 1
   fi
 }
@@ -53,7 +55,7 @@ verify_down() {
     say_error 'Не удалось проверить список модулей.'
     verify_status=1
   fi
-  verify_defaults || verify_status=1
+  verify_defaults "$OLD_SINK" "$OLD_SOURCE" || verify_status=1
   return "$verify_status"
 }
 
@@ -116,7 +118,9 @@ case "$1" in
       master=av_test.monitor source_name=av_test_src \
       source_properties=device.description=av_test_src)
     restore_defaults
-    verify_defaults
+    # Программа читает device из settings.json только при старте: переключаем вход по умолчанию.
+    LC_ALL=C pactl set-default-source av_test_src || exit 1
+    verify_defaults "$OLD_SINK" av_test_src
     # Четыре строки: id в порядке выгрузки, затем прежние выход и источник.
     # Файл читается как данные, а не исполняется как код shell.
     printf '%s\n' "$REMAP_ID" "$SINK_ID" "$OLD_SINK" "$OLD_SOURCE" > "$STATE"

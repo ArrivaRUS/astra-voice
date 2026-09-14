@@ -19,8 +19,9 @@ usage() {
   --hotkey СОЧЕТАНИЕ Хоткей (из settings.json, запасной Ctrl+Space)
   --yes              Не спрашивать подтверждение занятия клавиатуры и буфера
   --help             Эта справка
-Перед запуском поднимите virtual_mic.sh up, выберите av_test_src в Astra Voice,
-режим удержания хоткея и загрузите модель. Подготовьте поле ввода Kate/fly-term.
+Перед запуском выполните virtual_mic.sh up — входом по умолчанию станет av_test_src.
+В Astra Voice выберите режим удержания хоткея и загрузите модель.
+Подготовьте поле ввода Kate/fly-term.
 После подтверждения даётся 5 секунд, чтобы перевести фокус в это поле.
 Цель: p95 «отпустил → текст» ≤ 500 мс по событиям текущего прогона.
 Коды возврата: 0 — уложились, 1 — не уложились, 2 — прогон невозможен.
@@ -130,7 +131,8 @@ try:
         raise ValueError("Некорректное сочетание в --hotkey/settings.json.")
     print(json.dumps({
         "count": count,
-        "minutes": max(1, math.ceil((count * (duration + 2) + 5) / 60)),
+        # Статистика сбрасывается на диск раз в 30 с: учитываем ожидание каждой диктовки.
+        "minutes": max(1, math.ceil((count * (duration + 2 + 30) + 5) / 60)),
         "hotkey": "+".join(aliases.get(part.lower(), part) for part in parts),
     }))
 except (OSError, ValueError, TypeError, AttributeError, EOFError, wave.Error) as exc:
@@ -145,9 +147,10 @@ json_field() {
 count=$(printf '%s\n' "$metadata" | json_field count)
 minutes=$(printf '%s\n' "$metadata" | json_field minutes)
 hotkey=$(printf '%s\n' "$metadata" | json_field hotkey)
-printf 'Скрипт займёт клавиатуру и буфер обмена примерно на %s минут\n' "$minutes"
+printf 'Скрипт займёт клавиатуру и буфер обмена до %s минут\n' "$minutes"
 printf 'Сессия: %s; диктовок: %s; хоткей: %s.\n' "$session" "$count" "$hotkey"
-printf '%s\n' 'В Astra Voice должны быть выбраны av_test_src и режим удержания; модель загружена.'
+printf '%s\n' 'Вход по умолчанию — av_test_src (virtual_mic.sh up).'
+printf '%s\n' 'В Astra Voice должен быть выбран режим удержания; модель загружена.'
 if [ "$yes" -ne 1 ]; then
   printf '%s' 'Продолжить? Введите да: '
   IFS= read -r answer || fail 'Подтверждение не получено. Для автоматического запуска есть --yes.'
@@ -182,7 +185,8 @@ cleanup() {
   exit_status=$?
   trap - 0 HUP INT TERM
   if [ "$key_down" -eq 1 ]; then
-    if ! xdotool keyup "$hotkey"; then
+    # Дефолтных 12 мс между модификатором и клавишей мало: программа не видит сочетание.
+    if ! xdotool keyup --delay 100 "$hotkey"; then
       say_error "Не удалось отпустить $hotkey. Отпустите клавиши вручную."
       exit_status=2
     fi
@@ -198,11 +202,11 @@ incomplete=0
 while [ "$iteration" -le "$count" ]; do
   printf 'Диктовка %s из %s\n' "$iteration" "$count"
   key_down=1
-  xdotool keydown "$hotkey" || fail 'Не удалось нажать хоткей.'
+  xdotool keydown --delay 100 "$hotkey" || fail 'Не удалось нажать хоткей.'
   # Даём GUI открыть источник; даже короткий WAV не превращает удержание в тап.
   sleep 0.5
   paplay --device=av_test "$wav" || fail 'Не удалось подать WAV в виртуальный микрофон.'
-  xdotool keyup "$hotkey" || fail 'Не удалось отпустить хоткей.'
+  xdotool keyup --delay 100 "$hotkey" || fail 'Не удалось отпустить хоткей.'
   key_down=0
   attempts=0
   while :; do
