@@ -44,6 +44,7 @@ from astra_voice.ui.pill import (
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
     ERROR_MICROPHONE_UNAVAILABLE,
+    ERROR_MODEL_NOT_LOADED,
     ERROR_REASONS,
     ERROR_RECOGNITION_FAILED,
     ERROR_RECOGNITION_RESTARTED,
@@ -710,6 +711,7 @@ def test_processing_watchdog_releases_hotkey_without_empty_stat(
         ("audio-failed", ERROR_MICROPHONE_UNAVAILABLE, "other"),
         ("timeout", ERROR_RECOGNITION_FAILED, None),
         ("load-timeout", ERROR_RECOGNITION_FAILED, None),
+        ("no-model", ERROR_MODEL_NOT_LOADED, None),
         (MARKER, ERROR_RECOGNITION_FAILED, None),
     ],
 )
@@ -717,6 +719,7 @@ def test_error_mapping(rig: Rig, code: str, reason: str, kind: str | None) -> No
     rig.start()
     rig.event("error", code=code, message=MARKER)
     assert rig.pill.calls[-1] == (PillState.ERROR, reason, None)
+    assert rig.tray.state == TrayState.ERROR
     assert rig.stats.events == (
         [] if kind is None else [{"type": "mic_error", "kind": kind, "recovered_by": "none"}]
     )

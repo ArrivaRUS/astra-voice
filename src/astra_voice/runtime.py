@@ -14,6 +14,8 @@ from PyQt5.QtCore import QCoreApplication, QEventLoop, QObject, QSocketNotifier,
 
 from astra_voice.core.capture_watchdog import CaptureFieldWatchdog
 from astra_voice.core.dictation import DictationOrchestrator, DictationPhase
+from astra_voice.core.model_request import ModelNotConfigured, build_model_load
+from astra_voice.core.paths import data_dir
 from astra_voice.core.settings import Settings
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
 from astra_voice.platform.hotkey import (
@@ -34,9 +36,10 @@ from astra_voice.platform.session import SessionKind
 from astra_voice.platform.x11 import X11Display
 from astra_voice.ui import notify
 from astra_voice.ui.indicators import IndicatorGuard
-from astra_voice.ui.pill import Pill
+from astra_voice.ui.pill import ERROR_MODEL_LOAD_FAILED, Pill, PillState
 from astra_voice.ui.tray import Tray
 from astra_voice.ui.tray_icons import TrayIconProvider, TrayState
+from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
 
 log = logging.getLogger(__name__)
@@ -74,6 +77,9 @@ class DictationRuntime(QObject):
         self.on_quit_requested: Callable[[], None] | None = None
         self._started = False
         self._closed = False
+        self._loading_model = False
+        self._model_load_generation: int | None = None
+        self._model_load_failures = 0
         self._supervisor_factory = supervisor_factory
         self._capture_watchdog_factory = capture_watchdog_factory
         self._capture_watchdog: CaptureFieldWatchdog | None = None
@@ -125,11 +131,9 @@ class DictationRuntime(QObject):
                 stats=self.stats,
             )
             rollback.append(("оркестратор", self.orchestrator.shutdown))
-            self.supervisor = supervisor_factory(
-                on_event=self.orchestrator.on_worker_event, use_qt=True
-            )
+            self.supervisor = supervisor_factory(on_event=self._on_worker_event, use_qt=True)
             rollback.append(("воркер", self.supervisor.stop))
-            self.hotkey.on_state = self.orchestrator.on_hotkey_state
+            self.hotkey.on_state = self._on_hotkey_state
             self.pill.on_cancel_clicked = lambda: self.orchestrator.cancel("pill")
             self.tray.on_cancel = lambda: self.orchestrator.cancel("tray")
             self.tray.on_copy_last = self._copy_last
@@ -171,11 +175,114 @@ class DictationRuntime(QObject):
             return
         generation = self.supervisor.generation + 1
         self.supervisor.stop()
-        self.supervisor = self._supervisor_factory(
-            on_event=self.orchestrator.on_worker_event, use_qt=True
-        )
+        self.supervisor = self._supervisor_factory(on_event=self._on_worker_event, use_qt=True)
         self.supervisor.generation = generation
+        self._loading_model = False
+        self._model_load_generation = None
+        self._model_load_failures = 0
         self.supervisor.start()
+
+    def _load_model(self) -> None:
+        """Загружает настроенную модель при каждом запуске нового воркера."""
+        if self._model_load_generation == self.supervisor.generation:
+            return
+        self._loading_model = False
+        if self._model_load_failures >= 2:
+            log.warning("Загрузка модели остановлена после двух неудачных попыток подряд")
+            self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+            self.tray.set_state(TrayState.ERROR)
+            return
+        settings = self.settings.to_dict()
+        model_dir = None
+        if not settings.get("model_id") or not settings.get("model_revision"):
+            model_dir = settings.get("model_dir")
+        try:
+            request = build_model_load(
+                settings,
+                model_dir=model_dir,
+                store_dir=data_dir() / "store",
+            )
+        except ModelNotConfigured:
+            log.info("модель в настройках не указана")
+            return
+        try:
+            ipc.encode(request)
+            if request["threads"] < 1 or request["min_ram_mb"] < 1:
+                raise ValueError
+        except (ipc.FrameError, TypeError, ValueError):
+            self._model_load_failures += 1
+            log.warning("параметры модели заданы неверно")
+            self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+            self.tray.set_state(TrayState.ERROR)
+            return
+        self._loading_model = True
+        self._model_load_generation = self.supervisor.generation
+        if self.orchestrator.phase == DictationPhase.IDLE:
+            self.pill.show_state(PillState.LOADING_MODEL)
+        try:
+            self.supervisor.send(request, timeout=10.0)
+        except Exception:
+            self._loading_model = False
+            self._model_load_failures += 1
+            log.warning("Не удалось отправить запрос загрузки модели")
+            self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+            self.tray.set_state(TrayState.ERROR)
+
+    def _on_worker_event(self, event: dict[str, Any]) -> None:
+        """Обрабатывает загрузку модели и передаёт исходное событие оркестратору."""
+        if (
+            not self._closed
+            and event.get("type") == "hello"
+            and event.get("generation") == self.supervisor.generation
+        ):
+            self._load_model()
+        if (
+            not self._closed
+            and self._loading_model
+            and event.get("generation") == self._model_load_generation
+        ):
+            if event.get("type") == "model.loaded":
+                self._loading_model = False
+                self._model_load_failures = 0
+                if self.orchestrator.phase == DictationPhase.IDLE:
+                    self.pill.hide()
+                    self.tray.set_state(TrayState.IDLE)
+                load_ms = event.get("load_ms")
+                if isinstance(load_ms, (int, float)) and not isinstance(load_ms, bool):
+                    log.info("модель загружена за %.0f мс", load_ms)
+                else:
+                    log.info("модель загружена")
+            elif event.get("type") == "error" and (
+                event.get("request_type") == "model.load"
+                or event.get("response_type") == "model.loaded"
+            ):
+                self._loading_model = False
+                self._model_load_failures += 1
+                log.warning("Не удалось загрузить модель")
+                if self.orchestrator.phase == DictationPhase.IDLE:
+                    self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+                    self.tray.set_state(TrayState.ERROR)
+        self.orchestrator.on_worker_event(event)
+
+    def _on_hotkey_state(self, state: HotkeyState, reason: str) -> None:
+        """Откладывает диктовку, пока воркер загружает модель."""
+        if (
+            not self._closed
+            and state == HotkeyState.RECORDING
+            and reason == "press"
+            and self._model_load_failures >= 2
+            and not self._loading_model
+            and self.orchestrator.phase == DictationPhase.IDLE
+        ):
+            self._model_load_failures = 0
+            self._model_load_generation = None
+            self._load_model()
+            return
+        if not self._closed and self._loading_model and state == HotkeyState.RECORDING:
+            if self.orchestrator.phase == DictationPhase.IDLE:
+                self.pill.show_state(PillState.LOADING_MODEL)
+            return
+        self.orchestrator.on_hotkey_state(state, reason)
 
     def record_params(self) -> dict[str, Any]:
         """Параметры записи; расширения настроек читаются перед каждой фразой."""

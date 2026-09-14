@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import logging
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, call
 
@@ -19,7 +20,7 @@ from astra_voice.core.dictation import (
     CANCEL_TIMEOUT_MS,
     DictationPhase,
 )
-from astra_voice.core.settings import Settings
+from astra_voice.core.settings import Settings, from_dict
 from astra_voice.platform import paste as paste_module
 from astra_voice.platform.hotkey import (
     DEFAULT_CANDIDATES,
@@ -36,8 +37,9 @@ from astra_voice.platform.hotkey import (
 from astra_voice.platform.paste import PasteMode, PasteOutcomeKind, normalize
 from astra_voice.platform.session import SessionKind
 from astra_voice.runtime import DictationRuntime
-from astra_voice.ui.pill import PillState
+from astra_voice.ui.pill import ERROR_MODEL_LOAD_FAILED, PillState
 from astra_voice.ui.tray_icons import TrayState
+from astra_voice.worker import ipc
 
 pytestmark = pytest.mark.unit
 MARKER = "ГЕЛИОТРОП-7"
@@ -159,6 +161,8 @@ class Rig:
             DictationRuntime, "_drain_worker_events", lambda runtime: self.record("worker.drain")
         )
         monkeypatch.setattr(module, "monotonic", lambda: self.now)
+        self.data_dir = Mock(return_value=Path("/tmp/astra-voice-test-data"))
+        monkeypatch.setattr(module, "data_dir", self.data_dir)
         monkeypatch.setattr("PyQt5.QtWidgets.QApplication.clipboard", self.application.clipboard)
         monkeypatch.setattr(module, "publish_clipboard", self.publish_clipboard)
         monkeypatch.setattr(module, "notify", self.notify)
@@ -367,10 +371,8 @@ def test_start_wires_resources_and_real_dictation(rig: Rig) -> None:
     rig.pill_factory.assert_called_once_with(session=SessionKind.FLY, parent=runtime)
     rig.tray_factory.assert_called_once_with(rig.provider, hotkey="Ctrl+Space", parent=runtime)
     rig.guard_factory.assert_called_once_with(rig.pill, rig.tray, parent=runtime)
-    rig.supervisor_factory.assert_called_once_with(
-        on_event=runtime.orchestrator.on_worker_event, use_qt=True
-    )
-    assert rig.hotkey.on_state == runtime.orchestrator.on_hotkey_state
+    rig.supervisor_factory.assert_called_once_with(on_event=runtime._on_worker_event, use_qt=True)
+    assert rig.hotkey.on_state == runtime._on_hotkey_state
     assert rig.guard.on_stop_recording == runtime.orchestrator.on_indicators_lost
     rig.create_notifier.assert_called_once_with(17)
     rig.notifier.activated.emit(17)
@@ -385,6 +387,549 @@ def test_start_wires_resources_and_real_dictation(rig: Rig) -> None:
     rig.stats.append.assert_called_once()
     rig.timers[-1].fire()
     assert_phase(runtime, DictationPhase.IDLE)
+
+
+@pytest.mark.parametrize("metadata", [{}, {"model_id": "gigaam", "model_revision": "v3"}])
+def test_start_loads_configured_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, metadata: dict[str, str]
+) -> None:
+    rig = Rig(
+        monkeypatch,
+        from_dict(
+            {
+                "model_dir": str(tmp_path),
+                "model_variant": "int8",
+                "model_threads": 4,
+                **metadata,
+            }
+        ),
+    )
+    rig.runtime.start()
+    rig.runtime.start()
+    rig.supervisor.send.assert_not_called()
+    rig.pill.show_state.assert_not_called()
+    rig.event(type="hello")
+    rig.supervisor.send.assert_called_once()
+    request = rig.supervisor.send.call_args.args[0]
+    assert request["type"] == "model.load"
+    assert request["dir"] == str(tmp_path)
+    if metadata:
+        assert request["id"] == "gigaam"
+        assert request["revision"] == "v3"
+    assert request["variant"] == "int8"
+    assert request["threads"] == 4
+    assert rig.supervisor.send.call_args.kwargs == {"timeout": 10.0}
+    assert rig.trace.index("worker.start") < rig.trace.index("model.load")
+    rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
+    rig.tray.set_state.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["threads", "min_ram_mb"])
+@pytest.mark.parametrize("value", [0, -1, "invalid", "4", True])
+def test_invalid_model_parameters_are_not_sent(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+    value: object,
+) -> None:
+    rig = Rig(
+        monkeypatch,
+        Settings(extra={"model_dir": f"/tmp/{MARKER}", f"model_{field}": value}),
+    )
+    rig.runtime.start()
+    with caplog.at_level(logging.WARNING, logger=module.__name__):
+        rig.event(type="hello")
+
+    rig.supervisor.send.assert_not_called()
+    rig.pill.show_state.assert_called_once_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
+    assert not rig.runtime._loading_model
+    assert rig.runtime._model_load_failures == 1
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.WARNING, "параметры модели заданы неверно")
+    ]
+    assert MARKER not in caplog.text
+    assert "/tmp/" not in caplog.text
+
+
+def test_invalid_model_parameters_stop_validation_after_two_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model", "model_threads": 0}))
+    encode = Mock(wraps=ipc.encode)
+    monkeypatch.setattr(ipc, "encode", encode)
+    rig.runtime.start()
+    for _ in range(3):
+        rig.event(type="hello")
+        rig.supervisor.generation += 1
+    assert encode.call_count == 2
+    assert rig.runtime._model_load_failures == 2
+    assert not rig.runtime._loading_model
+    rig.supervisor.send.assert_not_called()
+
+
+def test_start_loads_model_from_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, from_dict({"model_id": "gigaam", "model_revision": "v3"}))
+    rig.runtime.start()
+    rig.supervisor.send.assert_not_called()
+    rig.event(type="hello")
+    rig.supervisor.send.assert_called_once()
+    request = rig.supervisor.send.call_args.args[0]
+    assert request["type"] == "model.load"
+    assert request["id"] == "gigaam"
+    assert request["revision"] == "v3"
+    assert request["dir"] == str(rig.data_dir.return_value / "store" / "gigaam" / "v3")
+
+
+def test_start_without_model_does_not_load(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
+    rig.runtime.start()
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        rig.event(type="hello")
+    rig.supervisor.send.assert_not_called()
+    rig.pill.show_state.assert_not_called()
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.INFO, "модель в настройках не указана")
+    ]
+    rig.recognize()
+    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+
+
+@pytest.mark.parametrize("fields", [{"load_ms": 123.5}, {}, {"load_ms": MARKER}])
+def test_model_loaded_hides_pill_and_forwards_event(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fields: dict[str, object],
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": f"/tmp/{MARKER}"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    on_event = Mock()
+    monkeypatch.setattr(rig.runtime.orchestrator, "on_worker_event", on_event)
+    caplog.set_level(logging.INFO, logger=module.__name__)
+    event = {"type": "model.loaded", "generation": 1, "dir": MARKER, **fields}
+    rig.supervisor_factory.call_args.kwargs["on_event"](event)
+    on_event.assert_called_once_with(event)
+    assert on_event.call_args.args[0] is event
+    rig.pill.hide.assert_called_once_with()
+    rig.tray.set_state.assert_called_once_with(TrayState.IDLE)
+    assert "модель загружена" in caplog.text
+    if fields.get("load_ms") == 123.5:
+        assert "модель загружена за 124 мс" in caplog.text
+    assert MARKER not in caplog.text
+    rig.hotkey.fsm.press(rig.now)
+    assert rig.supervisor.send.call_args.args[0]["type"] == "record.start"
+
+
+@pytest.mark.parametrize(
+    "code", ["engine-failed", "load-timeout", "bad-state", "busy", "restart-required", MARKER]
+)
+@pytest.mark.parametrize(
+    "correlation", [{"request_type": "model.load"}, {"response_type": "model.loaded"}]
+)
+def test_model_load_error_shows_reason_and_releases_hotkey(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    code: str,
+    correlation: dict[str, str],
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": f"/tmp/{MARKER}"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.event(type="error", code=code, message=MARKER, **correlation)
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.WARNING, "Не удалось загрузить модель")
+    ]
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
+    rig.notify.assert_not_called()
+    assert not rig.notify.mock_calls
+    rig.hotkey.fsm.press(rig.now)
+    assert rig.supervisor.send.call_args.args[0]["type"] == "record.start"
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_model_load_send_failure_shows_error_and_releases_hotkey(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, restart: bool
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": f"/tmp/{MARKER}"}))
+    if restart:
+        rig.runtime.start()
+        rig.event(type="hello")
+        rig.event(type="model.loaded")
+        rig.tray.set_state.assert_called_once_with(TrayState.IDLE)
+        rig.tray.set_state.reset_mock()
+    rig.supervisor.send.side_effect = RuntimeError(f"Воркер не запущен: /tmp/{MARKER}")
+    with caplog.at_level(logging.WARNING, logger=module.__name__):
+        if restart:
+            rig.runtime.restart_worker()
+        else:
+            rig.runtime.start()
+        rig.event(type="hello")
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
+    assert any(
+        record.name == module.__name__ and record.levelno == logging.WARNING
+        for record in caplog.records
+    )
+    assert MARKER not in caplog.text
+    assert "/tmp/" not in caplog.text
+    rig.supervisor.send.side_effect = rig.send
+    rig.hotkey.fsm.press(rig.now)
+    assert rig.supervisor.send.call_args.args[0]["type"] == "record.start"
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+
+
+@pytest.mark.parametrize("code", ["load-timeout", "worker-crashed"])
+def test_supervisor_restart_loads_model_on_new_hello(
+    monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    rig = Rig(monkeypatch, from_dict({"model_id": "gigaam", "model_revision": "v3"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    request = rig.supervisor.send.call_args.args[0]
+    # Как в супервизоре: поколение меняется до доставки ошибки старой попытки.
+    rig.supervisor.generation += 1
+    rig.event(type="error", generation=1, code=code, request_type="model.load")
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    rig.supervisor.send.assert_called_once_with(request, timeout=10.0)
+    rig.event(type="hello")
+    assert rig.supervisor.send.call_args_list == [call(request, timeout=10.0)] * 2
+    rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
+    rig.supervisor_factory.assert_called_once()
+
+
+def test_model_load_timeouts_stop_after_two_failures(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = Rig(monkeypatch, from_dict({"model_dir": f"/tmp/{MARKER}"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    for generation in (1, 2):
+        assert rig.supervisor.send.call_count == generation
+        rig.supervisor.generation += 1
+        rig.event(
+            type="error", generation=generation, code="load-timeout", request_type="model.load"
+        )
+        rig.pill.show_state.reset_mock()
+        rig.tray.set_state.reset_mock()
+        rig.event(type="hello")
+    assert rig.supervisor.send.call_count == 2
+    rig.pill.show_state.assert_called_once_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
+    assert any(
+        record.name == module.__name__ and record.levelno == logging.WARNING
+        for record in caplog.records
+    )
+    assert MARKER not in caplog.text
+    assert "/tmp/" not in caplog.text
+
+    # Явный перезапуск снимает ограничение, но ждёт hello нового процесса.
+    rig.runtime.restart_worker()
+    assert rig.supervisor.send.call_count == 2
+    rig.event(type="hello")
+    assert rig.supervisor.send.call_count == 3
+    rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
+
+
+def test_model_loaded_resets_consecutive_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, from_dict({"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.event(type="error", code="load-timeout", request_type="model.load")
+    rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
+    rig.supervisor.generation += 1
+    rig.event(type="hello")
+    rig.event(type="model.loaded")
+    assert rig.tray.set_state.call_args_list == [call(TrayState.ERROR), call(TrayState.IDLE)]
+    rig.supervisor.generation += 1
+    rig.event(type="hello")
+    assert rig.supervisor.send.call_count == 3
+    rig.event(type="error", code="load-timeout", request_type="model.load")
+    rig.supervisor.generation += 1
+    rig.event(type="hello")
+    assert rig.supervisor.send.call_count == 4
+    rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
+
+
+def test_press_retries_model_load_after_two_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.supervisor.generation += 1
+    rig.event(type="error", generation=1, code="load-timeout", request_type="model.load")
+    rig.event(type="hello")
+    rig.event(type="error", code="engine-failed", request_type="model.load")
+    assert rig.runtime._model_load_failures == 2
+    assert not rig.runtime._loading_model
+    request = rig.supervisor.send.call_args.args[0]
+    rig.event(type="hello")
+    assert rig.supervisor.send.call_args_list == [call(request, timeout=10.0)] * 2
+
+    rig.hotkey.fsm.press(rig.now)
+    assert rig.supervisor.send.call_args_list == [call(request, timeout=10.0)] * 3
+    assert rig.runtime._model_load_failures == 0
+    assert rig.runtime._loading_model
+    assert rig.runtime._model_load_generation == rig.supervisor.generation
+    assert_phase(rig.runtime, DictationPhase.IDLE)
+    rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
+    rig.supervisor_factory.assert_called_once()
+    rig.supervisor.stop.assert_not_called()
+
+    rig.hotkey.on_state(HotkeyState.RECORDING, "press")
+    rig.hotkey.fsm.release(rig.now + 1)
+    rig.event(type="hello")
+    assert rig.supervisor.send.call_count == 3
+    rig.event(type="model.loaded")
+    rig.pill.hide.assert_called_once_with()
+    rig.tray.set_state.assert_called_with(TrayState.IDLE)
+    rig.hotkey.fsm.escape(rig.now + 2)
+    rig.hotkey.fsm.press(rig.now + 3)
+    assert rig.supervisor.send.call_args.args[0]["type"] == "record.start"
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+
+
+@pytest.mark.parametrize("generation", [1, 3])
+@pytest.mark.parametrize("kind", ["model.loaded", "error"])
+def test_foreign_model_response_is_only_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    generation: int,
+    kind: str,
+) -> None:
+    rig = Rig(monkeypatch, from_dict({"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.event(type="error", code="load-timeout", request_type="model.load")
+    rig.supervisor.generation += 1
+    rig.event(type="hello")
+    rig.pill.reset_mock()
+    rig.tray.reset_mock()
+    on_event = Mock()
+    monkeypatch.setattr(rig.runtime.orchestrator, "on_worker_event", on_event)
+    event = {
+        "type": kind,
+        "generation": generation,
+        "code": "load-timeout",
+        "request_type": "model.load",
+    }
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        rig.supervisor_factory.call_args.kwargs["on_event"](event)
+    on_event.assert_called_once_with(event)
+    assert on_event.call_args.args[0] is event
+    assert rig.pill.mock_calls == []
+    assert rig.tray.mock_calls == []
+    assert caplog.records == []
+    rig.hotkey.fsm.press(rig.now)
+    assert rig.supervisor.send.call_count == 2
+    rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
+    rig.event(type="error", code="load-timeout", request_type="model.load")
+    rig.supervisor.generation += 1
+    rig.event(type="hello")
+    assert rig.supervisor.send.call_count == 2
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+
+
+def test_duplicate_or_stale_hello_does_not_reload_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, from_dict({"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.event(type="hello")
+    rig.event(type="hello", generation=0)
+    rig.supervisor.send.assert_called_once()
+    rig.event(type="model.loaded")
+    rig.event(type="hello")
+    rig.supervisor.send.assert_called_once()
+
+
+def test_restart_loads_model_again(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": str(tmp_path)}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.event(type="model.loaded")
+    request = rig.supervisor.send.call_args.args[0]
+    new = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = new
+    rig.runtime.restart_worker()
+    rig.supervisor.stop.assert_called_once_with()
+    new.start.assert_called_once_with()
+    new.send.assert_not_called()
+    rig.event(type="hello", generation=new.generation)
+    new.send.assert_called_once_with(request, timeout=10.0)
+    rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
+    rig.pill.hide.reset_mock()
+    rig.supervisor_factory.call_args.kwargs["on_event"](
+        {"type": "model.loaded", "generation": new.generation}
+    )
+    rig.pill.hide.assert_called_once_with()
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_hotkey_during_model_load_only_blocks_recording(
+    monkeypatch: pytest.MonkeyPatch, restart: bool
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    if restart:
+        rig.event(type="model.loaded")
+        rig.runtime.restart_worker()
+        rig.event(type="hello")
+    on_state = Mock()
+    monkeypatch.setattr(rig.runtime.orchestrator, "on_hotkey_state", on_state)
+    rig.pill.show_state.reset_mock()
+    rig.supervisor.send.reset_mock()
+    rig.hotkey.fsm.press(rig.now)
+    rig.hotkey.fsm.release(rig.now + 1)
+    rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
+    on_state.assert_called_once_with(HotkeyState.PROCESSING, "release (1.000 с)")
+    on_state.reset_mock()
+    rig.hotkey.fsm.escape(rig.now + 2)
+    on_state.assert_called_once_with(HotkeyState.IDLE, "escape-cancel")
+    on_state.reset_mock()
+    rig.supervisor.send.assert_not_called()
+    assert_phase(rig.runtime, DictationPhase.IDLE)
+    rig.event(type="error", code="busy", request_type="audio.open")
+    rig.hotkey.on_state(HotkeyState.RECORDING, "press")
+    on_state.assert_not_called()
+    rig.event(type="model.loaded")
+    rig.hotkey.on_state(HotkeyState.RECORDING, "press")
+    on_state.assert_called_once_with(HotkeyState.RECORDING, "press")
+
+
+@pytest.mark.parametrize("loaded_before_release", [False, True])
+def test_model_load_preserves_recording_started_before_hello(
+    monkeypatch: pytest.MonkeyPatch, loaded_before_release: bool
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.hotkey.fsm.press(rig.now)
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    record_start = rig.supervisor.send.call_args.args[0]
+    assert record_start["type"] == "record.start"
+    rig.event(type="hello")
+    assert rig.runtime._loading_model
+    rig.pill.show_state.assert_called_once_with(PillState.LISTENING)
+    rig.tray.set_state.assert_called_once_with(TrayState.LISTENING)
+    rig.guard.set_recording.assert_called_once_with(True)
+
+    rig.hotkey.on_state(HotkeyState.RECORDING, "press")
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    rig.pill.show_state.assert_called_once_with(PillState.LISTENING)
+    assert [entry.args[0]["type"] for entry in rig.supervisor.send.call_args_list] == [
+        "record.start",
+        "model.load",
+    ]
+
+    if loaded_before_release:
+        rig.event(type="model.loaded")
+        assert_phase(rig.runtime, DictationPhase.RECORDING)
+        rig.pill.show_state.assert_called_once_with(PillState.LISTENING)
+        rig.tray.set_state.assert_called_once_with(TrayState.LISTENING)
+        rig.guard.set_recording.assert_called_once_with(True)
+        rig.pill.hide.assert_not_called()
+
+    rig.hotkey.fsm.release(rig.now + 1)
+    assert_phase(rig.runtime, DictationPhase.PROCESSING)
+    rig.supervisor.send.assert_any_call(
+        {"type": "record.stop", "utterance_id": record_start["utterance_id"]}, timeout=None
+    )
+    if not loaded_before_release:
+        rig.event(type="model.loaded")
+    assert not rig.runtime._loading_model
+    rig.pill.hide.assert_not_called()
+    assert rig.pill.show_state.call_args_list == [
+        call(PillState.LISTENING),
+        call(PillState.PROCESSING),
+    ]
+    assert rig.tray.set_state.call_args_list == [
+        call(TrayState.LISTENING),
+        call(TrayState.PROCESSING),
+    ]
+    assert rig.guard.set_recording.call_args_list == [call(True), call(False)]
+
+
+@pytest.mark.parametrize(
+    "correlation", [{"request_type": "model.load"}, {"response_type": "model.loaded"}]
+)
+def test_model_load_error_preserves_recording_and_hotkey_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    correlation: dict[str, str],
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": f"/tmp/{MARKER}"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.event(type="error", code="load-timeout", **correlation)
+    assert rig.runtime._model_load_failures == 1
+    rig.supervisor.generation += 1
+    rig.hotkey.fsm.press(rig.now)
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    rig.pill.show_state.assert_called_with(PillState.LISTENING)
+    rig.tray.set_state.assert_called_with(TrayState.LISTENING)
+    rig.event(type="hello")
+    request = rig.supervisor.send.call_args.args[0]
+    assert request["type"] == "model.load"
+    assert rig.runtime._loading_model
+    rig.pill.reset_mock()
+    rig.tray.reset_mock()
+    caplog.clear()
+
+    # Ошибка загрузки не относится к текущей фразе.
+    rig.event(type="error", code="engine-failed", utterance_id=None, message=MARKER, **correlation)
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    assert rig.pill.mock_calls == []
+    assert rig.tray.mock_calls == []
+    rig.guard.set_recording.assert_called_once_with(True)
+    assert rig.runtime._model_load_failures == 2
+    assert not rig.runtime._loading_model
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.WARNING, "Не удалось загрузить модель")
+    ]
+
+    rig.hotkey.fsm.release(rig.now + 1)
+    assert_phase(rig.runtime, DictationPhase.PROCESSING)
+    rig.event(type="result", text=MARKER)
+    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.timers[-1].fire()
+    assert_phase(rig.runtime, DictationPhase.IDLE)
+    assert rig.runtime._model_load_failures == 2
+    rig.supervisor.send.reset_mock()
+
+    rig.hotkey.fsm.press(rig.now + 2)
+    rig.supervisor.send.assert_called_once_with(request, timeout=10.0)
+    assert rig.runtime._model_load_failures == 0
+    assert rig.runtime._loading_model
+    assert_phase(rig.runtime, DictationPhase.IDLE)
+    rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
+
+
+def test_press_during_recording_after_two_model_load_failures_cancels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.event(type="error", code="load-timeout", request_type="model.load")
+    assert rig.runtime._model_load_failures == 1
+    rig.supervisor.generation += 1
+    rig.hotkey.fsm.press(rig.now)
+    record_start = rig.supervisor.send.call_args.args[0]
+    assert record_start["type"] == "record.start"
+    rig.event(type="hello")
+    rig.event(type="error", code="engine-failed", utterance_id=None, request_type="model.load")
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    assert rig.runtime._model_load_failures == 2
+    assert not rig.runtime._loading_model
+    rig.supervisor.send.reset_mock()
+
+    rig.hotkey.on_state(HotkeyState.RECORDING, "press")
+
+    rig.supervisor.send.assert_called_once_with(
+        {"type": "record.cancel", "utterance_id": record_start["utterance_id"]}, timeout=None
+    )
+    assert rig.runtime._model_load_failures == 2
+    assert not rig.runtime._loading_model
 
 
 @pytest.mark.parametrize("source", ["pill", "tray"])
@@ -921,9 +1466,7 @@ def test_cancel_restart_replaces_supervisor_and_routes_new_cycle(
     old.stop.assert_called_once_with()
     new.start.assert_called_once_with()
     assert new.generation == 8
-    rig.supervisor_factory.assert_called_with(
-        on_event=runtime.orchestrator.on_worker_event, use_qt=True
-    )
+    rig.supervisor_factory.assert_called_with(on_event=runtime._on_worker_event, use_qt=True)
     old.send.reset_mock()
     rig.hotkey.fsm.press(rig.now + 3)
     assert new.send.call_args.args[0]["type"] == "record.start"

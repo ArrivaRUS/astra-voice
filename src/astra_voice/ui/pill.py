@@ -27,12 +27,16 @@ ERROR_MICROPHONE_UNAVAILABLE: Final = "Микрофон недоступен"
 ERROR_RECOGNITION_RESTARTED: Final = "Распознавание перезапущено"
 ERROR_BUFFER_CLEARED: Final = "Буфер очищен"
 ERROR_RECOGNITION_FAILED: Final = "Не удалось распознать"
+ERROR_MODEL_NOT_LOADED: Final = "Модель не загружена"
+ERROR_MODEL_LOAD_FAILED: Final = "Не удалось загрузить модель"
 ERROR_REASONS: Final = frozenset(
     (
         ERROR_MICROPHONE_UNAVAILABLE,
         ERROR_RECOGNITION_RESTARTED,
         ERROR_BUFFER_CLEARED,
         ERROR_RECOGNITION_FAILED,
+        ERROR_MODEL_NOT_LOADED,
+        ERROR_MODEL_LOAD_FAILED,
     )
 )
 
@@ -63,7 +67,7 @@ STATE_DURATION_MS: dict[PillState, int] = {
     PillState.CANCELLED: 800,
     PillState.ERROR: 3000,
     PillState.LIMIT: 2000,
-    PillState.LOADING_MODEL: 5000,
+    PillState.LOADING_MODEL: 10000,
 }
 
 _LISTENING_STATES = (PillState.LISTENING, PillState.LISTENING_SILENT)

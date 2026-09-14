@@ -142,6 +142,16 @@ def test_tray_opens_main_window(rig: Rig, action: str) -> None:
     rig.show.assert_called_once_with(rig.shell)
 
 
+def test_pill_details_opens_main_window(rig: Rig) -> None:
+    def exec_loop() -> int:
+        rig.runtime.pill.on_details_clicked()
+        return 0
+
+    rig.app.exec_.side_effect = exec_loop
+    assert app_mod.main(["--hidden"]) == 0
+    rig.show.assert_called_once_with(rig.shell)
+
+
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
 def test_signal_uses_same_shutdown_path(rig: Rig, signum: signal.Signals) -> None:
     def exec_loop() -> int:

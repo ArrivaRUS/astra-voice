@@ -86,7 +86,7 @@ def test_model_dir_without_configured_model(directory: str, model_id: str, revis
 
     assert request["id"] == model_id
     assert request["revision"] == revision
-    assert request["dir"] == directory
+    assert request["dir"] == str(Path(directory).expanduser())
     assert request["variant"] == "gigaam-v3-e2e-rnnt"
     assert request["threads"] == 2
 

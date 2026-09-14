@@ -31,6 +31,8 @@ from astra_voice.ui.pill import (
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
     ERROR_MICROPHONE_UNAVAILABLE,
+    ERROR_MODEL_LOAD_FAILED,
+    ERROR_MODEL_NOT_LOADED,
     ERROR_REASONS,
     ERROR_RECOGNITION_FAILED,
     ERROR_RECOGNITION_RESTARTED,
@@ -52,7 +54,7 @@ EXPECTED_DURATIONS = {
     PillState.CANCELLED: 800,
     PillState.ERROR: 3000,
     PillState.LIMIT: 2000,
-    PillState.LOADING_MODEL: 5000,
+    PillState.LOADING_MODEL: 10000,
 }
 
 
@@ -895,12 +897,16 @@ def test_error_registry_is_exact() -> None:
         "Распознавание перезапущено",
         "Буфер очищен",
         "Не удалось распознать",
+        "Модель не загружена",
+        "Не удалось загрузить модель",
     }
     assert ERROR_REASONS == {
         ERROR_MICROPHONE_UNAVAILABLE,
         ERROR_RECOGNITION_RESTARTED,
         ERROR_BUFFER_CLEARED,
         ERROR_RECOGNITION_FAILED,
+        ERROR_MODEL_NOT_LOADED,
+        ERROR_MODEL_LOAD_FAILED,
     }
 
 

@@ -22,6 +22,7 @@ from astra_voice.ui.pill import (
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
     ERROR_MICROPHONE_UNAVAILABLE,
+    ERROR_MODEL_NOT_LOADED,
     ERROR_RECOGNITION_FAILED,
     ERROR_RECOGNITION_RESTARTED,
     STATE_DURATION_MS,
@@ -443,6 +444,8 @@ class DictationOrchestrator:
             kind = {"audio-no-device": "none", "audio-busy": "busy"}.get(str(code), "other")
             self._append_stat("mic_error", kind=kind, recovered_by="none")
             self._fail_microphone()
+        elif code == "no-model":
+            self._fail_model_not_loaded()
         else:
             self._fail_recognition()
 
@@ -465,6 +468,11 @@ class DictationOrchestrator:
         if cancel_worker:
             self._send_cancel()
         self._pill.show_state(PillState.ERROR, text=ERROR_RECOGNITION_FAILED)
+        self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
+
+    def _fail_model_not_loaded(self) -> None:
+        self._begin_finish()
+        self._pill.show_state(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _fail_secret(self) -> None:

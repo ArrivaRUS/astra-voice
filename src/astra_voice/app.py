@@ -22,6 +22,7 @@ from typing import Any
 from astra_voice.core import policy as policy_mod
 from astra_voice.core import settings as settings_mod
 from astra_voice.core.logging import setup_logging
+from astra_voice.core.model_request import build_model_load
 from astra_voice.core.paths import ipc_socket_path, lock_path, qml_dir, settings_path
 from astra_voice.core.version import __version__
 from astra_voice.platform.session import SessionKind, detect
@@ -122,43 +123,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 def _debug_model_request(
     settings: dict[str, Any], args: argparse.Namespace, store_dir: Path
 ) -> dict[str, Any]:
-    """Собирает запрос без ввода-вывода: аргумент → настройка → значение по умолчанию."""
-
-    def option(name: str, default: Any = None) -> Any:
-        """Учитывает старые имена настроек и пропускает отсутствующие значения."""
-        for value in (
-            getattr(args, f"model_{name}", None),
-            getattr(args, name, None),
-            settings.get(f"model_{name}"),
-            settings.get(name),
-        ):
-            if value is not None:
-                return value
-        return default
-
-    model_id = option("id")
-    revision = option("revision", "")
-    model_dir = option("dir")
-    if args.model_dir is not None:
-        directory = Path(args.model_dir)
-        model_id = directory.parent.name or "local-model"
-        revision = directory.name or "local-revision"
-    elif not model_id or not revision:
-        raise ValueError(
-            "Модель не настроена. Укажите --model-dir или модель и ревизию в настройках."
-        )
-    if not model_dir:
-        model_dir = store_dir / model_id / revision
-    return {
-        "type": "model.load",
-        "id": model_id,
-        "revision": revision,
-        "dir": str(model_dir),
-        "layout": option("layout", "onnx-asr-gigaam-v3"),
-        "variant": option("variant", "gigaam-v3-e2e-rnnt"),
-        "threads": option("threads", 2),
-        "min_ram_mb": option("min_ram_mb", 768),
-    }
+    """Передаёт аргументы отладочного запуска построителю запроса."""
+    return build_model_load(
+        settings,
+        model_dir=args.model_dir,
+        variant=args.variant,
+        threads=args.threads,
+        store_dir=store_dir,
+    )
 
 
 def _debug_transcribe(path: str, args: argparse.Namespace) -> int:
@@ -647,6 +619,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime.on_quit_requested = app.quit
             runtime.tray.on_settings = lambda: _show(shell)
             runtime.tray.on_about = lambda: _show(shell)
+            runtime.pill.on_details_clicked = lambda: _show(shell)
             runtime.start()
         except Exception:  # noqa: BLE001 — без диктовки окно должно продолжать работать
             log.warning("Не удалось запустить диктовку, приложение продолжит работу без неё")
