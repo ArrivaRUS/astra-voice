@@ -63,3 +63,33 @@ GitHub Docs «GitHub-hosted runners» · runs-on.com benchmarks.
 - Альтернатива без апгрейда: на 1.24.4 не давать `MlasInitAMX()` пройти — seccomp-запрет `arch_prctl(ARCH_REQ_XCOMP_PERM,
   XTILEDATA)` в воркере (мы им владеем: prctl PDEATHSIG/DUMPABLE уже есть) → AMX-диспатч не ставится, остаётся путь
   AVX2/AVX-512 как на машине заказчика. Уверенность med (по коду), проверяется только на AMX-железе = CI (Intel-раннеры ≈ ½).
+
+## Дополнение 2026-09-14 (поздний вечер) — второй ресёрч: причина исключения в onnx-asr, u8u8 в 1.27+, protobuf, seccomp
+- **Почему onnx-asr исключает 1.25.\*/1.26.0** — не скорость, а **крах загрузки u8-квантованных моделей Whisper**: сам
+  istupakov завёл microsoft/onnxruntime#28306 (01.05.2026, `qdq_actions.cc:136 TransposeDQWeightsForMatMulNBits Missing
+  required scale`; фьюз `DQ→MatMulNBits` из PR #27769 ломался на разделяемых weight+scale). Фикс PR #28326 (12.05.2026);
+  1.26.0 вышел 08.05 — до фикса, релиза 1.26.1 нет. Наша модель этот дефект не триггерит (грузится и распознаёт верно на
+  1.25.1). `!=1.24.1` — другой дефект (#27353, симлинки кэша HF). Пин onnx-asr нас формально не касается (`--no-deps`).
+- **Быстрый u8u8-путь для обычного AVX-VNNI не вернули ни в 1.27.1, ни в 1.30.0**: `MlasGemmU8U8DispatchAvx2Vnni` получают
+  только CPU с `avx_vnni_int8`; у Core Ultra 7 255U его нет (`avx2 avx_vnni` только) → u8u8 идёт в `MlasGemmU8U8DispatchAvx2`
+  (`vpmaddubsw`+`vpmaddwd`) — это и есть ×2. **Апгрейд на любую версию ≥ 1.25 скорость не вернёт.** AMX-путь в ≥ 1.25 чист.
+- **Третий путь — переквантовать модель в u8s8** (веса int8, активации uint8, каноническая схема ORT): на ≥ 1.25 идёт через
+  `GemmU8S8Dispatch` → на 255U `MlasGemmU8S8DispatchAvx2` + ядро `MlasGemmU8S8KernelAvxVnni` (тот самый быстрый путь), на Xeon —
+  починенный `MlasGemmU8S8DispatchAmx`. Маршрут по исходникам (high), выигрыш в мс не измерен (med). Нужен переэкспорт из
+  fp32-весов того же HF-репо + сверка текста/WER (инструмент — `onnx/neural-compressor`, ср. onnx-asr#126).
+- **protobuf ≥ 4.25.8 у ORT 1.27 — бумажный блокер**: `import onnxruntime` + `InferenceSession` работают при полностью
+  заблокированных `google.*`/`onnx` (проверено локально на 1.24.4; protobuf тянут только `backend`/`tools`/`quantization`);
+  есть чисто-Python колесо `protobuf-4.25.8-py3-none-any.whl` 153 KiB — можно вендорить без ELF. Мотив границы — вероятно CVE (low).
+  `coloredlogs` не зависимость; numpy/flatbuffers/packaging Debian 12 подходят.
+- **1.24.4 + seccomp-запрет AMX в воркере — реализуем**: `MlasInitAMX()` при ошибке `arch_prctl(0x1023, 18)` возвращает false,
+  и оба AMX-диспатча не ставятся; на Xeon 8573C остаётся строка 503 (AVX512-VNNI: тот же u8s8-диспатч, что на 255U, но ядро
+  Avx512Vnni) — корректность на не-AMX AVX-512-VNNI хосте прямо не подтверждена (проверяется только CI на Intel-раннерах).
+  Debian 12: `python3-seccomp 2.5.4`; фильтр `ERRNO(EPERM)` на `arch_prctl` с `arg0 == 0x1023`, ставить до импорта
+  onnxruntime; glibc `ARCH_SET_FS` (0x1002) не задевается; `load()` выставляет NO_NEW_PRIVS.
+- Чужие пины: silero-vad `>=1.16.1`, openWakeWord `>=1.10,<2`, speaches `>=1.24.4` — исключений 1.25/1.26 ни у кого;
+  onnx-asr — единственный.
+- Открыт PR #28745 «decomposable QGEMM» (не влит) — возможный будущий возврат производительности.
+
+**Рекомендация ресёрча:** не апгрейдиться «как есть». Два параллельных спайка: (а) переквантовка в u8s8 (переэкспорт,
+сверка текста/WER, p50/p95 на свободной машине на 1.24.4 и 1.27.0); (б) seccomp-фильтр в воркере как страховка на 1.24.4.
+Оба проверяются ассертом на непустой текст в CI на Intel-раннерах. Решение — с архитекторами, через `decision-log`.
