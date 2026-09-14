@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 import wave
 from collections.abc import Iterator
@@ -18,6 +19,7 @@ from astra_voice.worker.engine import (
     Engine,
     LoadResult,
     ModelMissingError,
+    TranscribeResult,
     active_sessions,
     make_engine,
 )
@@ -96,6 +98,41 @@ def loaded_engine(model_dir: Path) -> Iterator[tuple[Engine, LoadResult]]:
         engine.unload()
 
 
+def _diag(result: TranscribeResult, loaded: LoadResult) -> str:
+    # Ленивый импорт сохраняет возможность собирать тесты без рантайма.
+    import onnxruntime  # type: ignore[import-not-found]
+
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        # Диагностика не должна скрывать исходный сбой на системах без /proc.
+        model_name = f"/proc/cpuinfo недоступен ({type(exc).__name__})"
+        simd = "недоступны"
+    else:
+        model_name = ""
+        flags: set[str] = set()
+        for line in cpuinfo.splitlines():
+            key, separator, value = line.partition(":")
+            if not separator:
+                continue
+            if key.strip() == "model name" and not model_name:
+                model_name = value.strip()
+            elif key.strip() == "flags":
+                flags.update(
+                    flag
+                    for flag in value.split()
+                    if re.fullmatch(r"avx2|avx512[a-z_]*|avx_vnni|amx_[a-z0-9]*", flag)
+                )
+        model_name = model_name or "model name отсутствует в /proc/cpuinfo"
+        simd = " ".join(sorted(flags)) or "не найдены"
+    return (
+        f"text={result.text!r}, infer_ms={result.infer_ms}, cancelled={result.cancelled}, "
+        f"engine_version={loaded.engine_version!r}, onnxruntime={onnxruntime.__version__!r}, "
+        f"providers={onnxruntime.get_available_providers()!r}, "
+        f"model name={model_name!r}, SIMD={simd!r}"
+    )
+
+
 def test_load(loaded_engine: tuple[Engine, LoadResult]) -> None:
     _, loaded = loaded_engine
     # S3 §4.1: около 667 мс при двух потоках; контракт допускает 10 с.
@@ -108,9 +145,9 @@ def test_load(loaded_engine: tuple[Engine, LoadResult]) -> None:
 def test_transcribe(
     loaded_engine: tuple[Engine, LoadResult], audio_6s: npt.NDArray[np.float32]
 ) -> None:
-    engine, _ = loaded_engine
+    engine, loaded = loaded_engine
     result = engine.transcribe(audio_6s, CancelToken())
-    assert "проверка" in result.text.casefold()
+    assert "проверка" in result.text.casefold(), _diag(result, loaded)
     assert result.cancelled is False
     assert result.infer_ms > 0
 
@@ -120,7 +157,7 @@ def test_cancel_and_transcribe_again(
     audio_6s: npt.NDArray[np.float32],
     audio_20s: npt.NDArray[np.float32],
 ) -> None:
-    engine, _ = loaded_engine
+    engine, loaded = loaded_engine
     cancel = CancelToken()
     with ThreadPoolExecutor(max_workers=1) as executor:
         started = time.perf_counter()
@@ -137,7 +174,7 @@ def test_cancel_and_transcribe_again(
     assert elapsed_ms <= 1000, f"Возврат после отмены занял {elapsed_ms:.1f} мс"
 
     recovered = engine.transcribe(audio_6s, CancelToken())
-    assert "проверка" in recovered.text.casefold()
+    assert "проверка" in recovered.text.casefold(), _diag(recovered, loaded)
     assert recovered.cancelled is False
     assert recovered.infer_ms > 0
 
@@ -165,11 +202,11 @@ def test_unload_releases_sessions(model_dir: Path, audio_6s: npt.NDArray[np.floa
     baseline = active_sessions()
     engine = make_engine(LAYOUT)
     try:
-        engine.load(model_dir, LAYOUT, VARIANT, THREADS)
+        loaded = engine.load(model_dir, LAYOUT, VARIANT, THREADS)
         assert active_sessions() == baseline + 3
         # Проверяем также освобождение обёрток сессий, созданных распознаванием.
         result = engine.transcribe(audio_6s, CancelToken())
-        assert "проверка" in result.text.casefold()
+        assert "проверка" in result.text.casefold(), _diag(result, loaded)
         engine.unload()
         assert active_sessions() == baseline
         engine.unload()

@@ -45,6 +45,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
         qml-module-qtquick-window2 \
         qml-module-qtquick-shapes \
         qml-module-qtgraphicaleffects \
+        libqt5svg5 \
         python3-protobuf \
         python3-flatbuffers \
         python3-sympy \

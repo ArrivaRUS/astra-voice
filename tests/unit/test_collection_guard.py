@@ -211,6 +211,215 @@ def test_qt_available(
 
 
 @pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "expected"),
+    [
+        (0, 'ASTRA_QT_PROBE={"svg":"ok","qml":"ok"}\n', "", ()),
+        (
+            0,
+            'предупреждение\nASTRA_QT_PROBE={"svg":"ok","qml":"ok"}\n',
+            "QStandardPaths: предупреждение\nASTRA_QT_PROBE=мусор",
+            (),
+        ),
+        (0, 'ASTRA_QT_PROBE={"svg":"missing","qml":"ok"}', "", ("libqt5svg5",)),
+        (
+            0,
+            'ASTRA_QT_PROBE={"svg":"ok","qml":"error: QtObject is not a type"}',
+            "",
+            ("qml-module-qtquick-controls2", "QtObject is not a type"),
+        ),
+        (
+            0,
+            'ASTRA_QT_PROBE={"svg":"missing","qml":"error: QtObject is not a type"}',
+            "",
+            (
+                "libqt5svg5",
+                "qml-module-qtquick2",
+                "qml-module-qtquick-controls2",
+                "qml-module-qtquick-layouts",
+                "qml-module-qtquick-shapes",
+            ),
+        ),
+        (1, "", "ImportError: QtQml", ("кодом 1", "ImportError: QtQml")),
+        (-6, 'ASTRA_QT_PROBE={"svg":"ok","qml":"ok"}', "", ("кодом -6",)),
+        (0, "мусор", "", ("нет корректного результата",)),
+        (0, "", "", ("нет корректного результата",)),
+        (0, "ASTRA_QT_PROBE={", "", ("нет корректного результата",)),
+        (0, 'ASTRA_QT_PROBE={"svg":"ok"}', "", ("нет корректного результата",)),
+        (0, "ASTRA_QT_PROBE=[]", "", ("нет корректного результата",)),
+        (0, 'ASTRA_QT_PROBE={"svg":[],"qml":null}', "", ("нет корректного результата",)),
+        (
+            0,
+            'ASTRA_QT_PROBE={"svg":"ok","qml":"неизвестно"}',
+            "",
+            ("нет корректного результата",),
+        ),
+        (
+            0,
+            'ASTRA_QT_PROBE={"svg":"ok","qml":"ok"}\n' * 2,
+            "",
+            ("нет корректного результата",),
+        ),
+        (None, "", "", ("таймаут",)),
+        (None, 'ASTRA_QT_PROBE={"svg":"ok","qml":"ok"}', "", ("таймаут",)),
+        (
+            None,
+            'ASTRA_QT_PROBE={"svg":"missing","qml":"error: QtObject is not a type"}',
+            "",
+            ("таймаут", "libqt5svg5", "qml-module-qtquick-controls2", "QtObject is not a type"),
+        ),
+    ],
+)
+def test_qt_environment_error(
+    guard: ModuleType,
+    returncode: int | None,
+    stdout: str,
+    stderr: str,
+    expected: tuple[str, ...],
+) -> None:
+    error = guard.qt_environment_error(returncode, stdout, stderr)
+    if not expected:
+        assert error is None
+    else:
+        assert isinstance(error, str)
+        assert error.endswith("пропуск здесь запрещён.")
+        for fragment in expected:
+            assert fragment in error
+
+
+@pytest.mark.parametrize("required", [False, True])
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("probe_error", [None, "нет поддержки SVG — нужен libqt5svg5"])
+def test_qt_environment_probe_once_when_required(
+    guard: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    required: bool,
+    available: bool,
+    probe_error: str | None,
+) -> None:
+    monkeypatch.delenv("ASTRA_VOICE_REQUIRE_QT", raising=False)
+    monkeypatch.setattr(guard, "qt_available", lambda: available)
+    run_probe = Mock(return_value=probe_error)
+    monkeypatch.setattr(guard, "run_qt_environment_probe", run_probe)
+    config = Mock(stash=pytest.Stash(), rootpath=tmp_path)
+    config.option.markexpr = "unit" if required else "engine"
+    session = Mock(config=config)
+    guard.pytest_sessionstart(session)
+    # Повторный вызов не должен запускать Qt заново, в том числе после ошибки.
+    for _ in range(2):
+        if required and (not available or probe_error is not None):
+            with pytest.raises(
+                pytest.UsageError, match=probe_error if available else "python3-pyqt5"
+            ):
+                guard.pytest_collection(session)
+        else:
+            guard.pytest_collection(session)
+    if required and available:
+        run_probe.assert_called_once_with()
+    else:
+        run_probe.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout='ASTRA_QT_PROBE={"svg":"ok","qml":"ok"}',
+                stderr="предупреждение Qt",
+            ),
+            None,
+        ),
+        (subprocess.TimeoutExpired(cmd="probe", timeout=20, stderr=b"Qt"), "таймаут"),
+        (
+            OSError("не удалось запустить Python"),
+            "подпроцесс проверки Qt не запустился: не удалось запустить Python",
+        ),
+    ],
+)
+def test_qt_environment_probe_subprocess(
+    guard: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: subprocess.CompletedProcess[str] | Exception,
+    expected: str | None,
+) -> None:
+    run = (
+        Mock(side_effect=outcome) if isinstance(outcome, Exception) else Mock(return_value=outcome)
+    )
+    monkeypatch.setattr(guard.subprocess, "run", run)
+    monkeypatch.setenv("QT_QPA_PLATFORM", "xcb")
+    monkeypatch.setenv("QT_QUICK_BACKEND", "opengl")
+    error = guard.run_qt_environment_probe()
+    if expected is None:
+        assert error is None
+    else:
+        assert isinstance(error, str)
+        assert expected in error
+        assert error.endswith("пропуск здесь запрещён.")
+        if isinstance(outcome, OSError):
+            assert "завершился с кодом" not in error
+            assert "таймаут" not in error
+            assert "libqt5svg5" in error
+            assert "qml-module-qtquick-controls2" in error
+    run.assert_called_once()
+    assert run.call_args.args == ([sys.executable, "-c", guard._QT_PROBE],)
+    options = run.call_args.kwargs
+    assert options["env"]["QT_QPA_PLATFORM"] == "offscreen"
+    assert options["env"]["QT_QUICK_BACKEND"] == "software"
+    assert options["capture_output"] is True
+    assert options["text"] is True
+    assert 0 < options["timeout"] <= 30
+    assert os.environ["QT_QPA_PLATFORM"] == "xcb"
+    assert os.environ["QT_QUICK_BACKEND"] == "opengl"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stdout_tail"),
+    [
+        (None, None),
+        ("начало stdout\n" + "x" * 3000 + "\nхвост stdout", "хвост stdout"),
+        (b"stdout start\n" + b"x" * 3000 + b"\nstdout tail\xff", "stdout tail\ufffd"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("stderr", "stderr_tail"),
+    [
+        (None, None),
+        ("начало stderr\n" + "y" * 3000 + "\nхвост stderr", "хвост stderr"),
+        (b"stderr start\n" + b"y" * 3000 + b"\nstderr tail\xff", "stderr tail\ufffd"),
+    ],
+)
+def test_qt_environment_probe_timeout_output(
+    guard: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str | bytes | None,
+    stdout_tail: str | None,
+    stderr: str | bytes | None,
+    stderr_tail: str | None,
+) -> None:
+    run = Mock(
+        side_effect=subprocess.TimeoutExpired(cmd="probe", timeout=20, output=stdout, stderr=stderr)
+    )
+    monkeypatch.setattr(guard.subprocess, "run", run)
+    error = guard.run_qt_environment_probe()
+    assert isinstance(error, str)
+    assert "подпроцесс проверки Qt превысил таймаут" in error
+    assert error.endswith("пропуск здесь запрещён.")
+    assert "libqt5svg5" in error
+    assert "qml-module-qtquick-controls2" in error
+    for tail in (stdout_tail, stderr_tail):
+        if tail is not None:
+            assert tail in error
+    for head in ("начало stdout", "stdout start", "начало stderr", "stderr start"):
+        assert head not in error
+    assert "x" * 2001 not in error
+    assert "y" * 2001 not in error
+    run.assert_called_once()
+
+
+@pytest.mark.parametrize(
     ("expression", "require_env", "available"),
     [
         ("engine", False, False),
@@ -228,7 +437,8 @@ def test_collection_in_subprocess(
     """Настоящий сбор: Qt-модуль нельзя импортировать даже до фильтрации по -m."""
     (tmp_path / "conftest.py").write_text(
         GUARD_PATH.read_text(encoding="utf-8")
-        + f"\ndef qt_available() -> bool:\n    return {available!r}\n",
+        + f"\ndef qt_available() -> bool:\n    return {available!r}\n"
+        + "\ndef run_qt_environment_probe() -> str | None:\n    return None\n",
         encoding="utf-8",
     )
     (tmp_path / "pytest.ini").write_text(
@@ -316,7 +526,8 @@ def test_collection_fallback(
     # сбора, а не закончиться ранней UsageError из pytest_collection.
     (tmp_path / "conftest.py").write_text(
         GUARD_PATH.read_text(encoding="utf-8")
-        + f"\ndef qt_available():\n    return {available!r}\n",
+        + f"\ndef qt_available() -> bool:\n    return {available!r}\n"
+        + "\ndef run_qt_environment_probe() -> str | None:\n    return None\n",
         encoding="utf-8",
     )
     (tmp_path / "pytest.ini").write_text(

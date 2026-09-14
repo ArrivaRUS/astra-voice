@@ -11,6 +11,7 @@ Vcs-Browser: https://github.com/ArrivaRUS/astra-voice
 
 Package: astra-voice
 Architecture: amd64
+# Трею обязателен SVG-плагин Qt: libqt5svg5 задаём явно, транзитивность не гарантирована.
 Depends: ${misc:Depends},
          ${shlibs:Depends},
          python3 (>= 3.11),
@@ -22,6 +23,7 @@ Depends: ${misc:Depends},
          qml-module-qtquick-window2,
          qml-module-qtquick-shapes,
          qml-module-qtgraphicaleffects,
+         libqt5svg5,
          python3-numpy (>= 1:1.22.4),
          python3-protobuf,
          python3-flatbuffers,

@@ -50,12 +50,18 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
       - name: Системные пакеты
+        # test_real_qml_* грузит настоящий qml/Pill.qml; нужны QML-модули.
+        # Трей рендерит SVG плагином Qt из libqt5svg5.
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
             make git python3 python3-venv python3-pip python3-numpy \
             gnupg gpgv dpkg-dev binutils file \
-            python3-pyqt5 python3-pyqt5.qtquick python3-xlib python3-yaml
+            python3-pyqt5 python3-pyqt5.qtquick python3-xlib python3-yaml \
+            qml-module-qtquick2 qml-module-qtquick-controls2 \
+            qml-module-qtquick-layouts qml-module-qtquick-window2 \
+            qml-module-qtquick-shapes qml-module-qtgraphicaleffects \
+            libqt5svg5
       - name: Окружение разработчика
         run: |
           python3 -m venv --system-site-packages "$VENV"
@@ -80,6 +86,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
       - name: Системные пакеты (Qt + виртуальный дисплей)
+        # Трей рендерит SVG плагином Qt; libqt5svg5 нужен явно.
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
@@ -88,7 +95,8 @@ jobs:
             python3-pyqt5 python3-pyqt5.qtquick python3-xlib python3-yaml \
             qml-module-qtquick2 qml-module-qtquick-controls2 \
             qml-module-qtquick-layouts qml-module-qtquick-window2 \
-            qml-module-qtquick-shapes qml-module-qtgraphicaleffects
+            qml-module-qtquick-shapes qml-module-qtgraphicaleffects \
+            libqt5svg5
       - name: Окружение разработчика
         run: |
           python3 -m venv --system-site-packages "$VENV"
@@ -180,6 +188,14 @@ jobs:
             exit 1
           fi
           sha256sum -c "$check_dir/SHA256SUMS"
+      # Плавающий сбой распознавания: подозреваем набор SIMD-инструкций раннера.
+      - name: CPU раннера
+        run: |
+          # || не дают отсутствующим полям CPU уронить диагностический шаг.
+          grep -m1 'model name' /proc/cpuinfo || echo 'model name: нет поля'
+          nproc
+          { grep -o -wE 'avx2|avx512[a-z_]*|avx_vnni|amx_[a-z0-9]*' /proc/cpuinfo || true; } | sort -u | tr '\n' ' '
+          echo
       - name: Проверки движка
         run: |
           export ASTRA_VOICE_TEST_MODEL_DIR="$HOME/.cache/astra-voice-ci/gigaam-v3/e2e_rnnt"

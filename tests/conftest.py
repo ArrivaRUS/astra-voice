@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import os
 import re
+import subprocess
+import sys
 from collections.abc import Mapping, Set
 from pathlib import Path
 
@@ -14,6 +17,7 @@ from _pytest.nodes import Node
 from _pytest.terminal import TerminalReporter
 
 _QT_AVAILABLE = pytest.StashKey[bool]()
+_QT_ENV_ERROR = pytest.StashKey[str | None]()
 _IGNORED = pytest.StashKey[dict[Path, str]]()
 _QT_MODULES = pytest.StashKey[Set[str]]()
 _TEST_NEEDS_QT = pytest.StashKey[dict[Path, bool]]()
@@ -24,6 +28,124 @@ _QT_ERROR = (
     "Qt обязателен: выбран маркер unit/xvfb или задана ASTRA_VOICE_REQUIRE_QT=1; "
     "пропуск здесь запрещён."
 )
+_QML_PACKAGES = (
+    "qml-module-qtquick2 qml-module-qtquick-controls2 "
+    "qml-module-qtquick-layouts qml-module-qtquick-shapes"
+)
+# QApplication в процессе pytest нарушает изоляцию тестов настоящего QML.
+_QT_PROBE = """
+import json
+from PyQt5.QtCore import QUrl
+from PyQt5.QtGui import QGuiApplication, QImageReader
+from PyQt5.QtQml import QQmlComponent, QQmlEngine
+
+app = QGuiApplication([])
+svg = 'ok' if b'svg' in QImageReader.supportedImageFormats() else 'missing'
+engine = QQmlEngine()
+component = QQmlComponent(engine)
+component.setData(
+    b'import QtQuick 2.15; import QtQuick.Controls 2.15; '
+    b'import QtQuick.Layouts 1.15; import QtQuick.Shapes 1.15; QtObject {}',
+    QUrl(),
+)
+root = component.create()
+errors = [error.toString() for error in component.errors()]
+qml = (
+    'error: ' + ('; '.join(errors) or 'не удалось создать QtObject')
+    if errors or component.status() == QQmlComponent.Error or root is None
+    else 'ok'
+)
+print('ASTRA_QT_PROBE=' + json.dumps({'svg': svg, 'qml': qml}), flush=True)
+"""
+
+
+def qt_environment_error(
+    returncode: int | None,
+    stdout: str | bytes | None,
+    stderr: str | bytes | None,
+    *,
+    start_error: str | None = None,
+) -> str | None:
+    """Разбираем только помеченный результат; предупреждения Qt не часть протокола.
+
+    Без ошибки запуска None вместо кода означает таймаут, даже при готовом результате.
+    """
+
+    def output_text(output: str | bytes | None) -> str:
+        # При таймауте возможны bytes даже с text=True; диагностика не должна падать.
+        return output.decode(errors="replace") if isinstance(output, bytes) else output or ""
+
+    stdout = output_text(stdout)
+    stderr = output_text(stderr)
+    records = [
+        line.removeprefix("ASTRA_QT_PROBE=")
+        for line in stdout.splitlines()
+        if line.startswith("ASTRA_QT_PROBE=")
+    ]
+    result: object = None
+    if len(records) == 1:
+        try:
+            result = json.loads(records[0])
+        except ValueError:
+            pass
+    valid = (
+        isinstance(result, dict)
+        and result.get("svg") in ("ok", "missing")
+        and isinstance(result.get("qml"), str)
+        and (result["qml"] == "ok" or result["qml"].startswith("error: "))
+    )
+    problems: list[str] = []
+    if start_error is not None:
+        problems.append(f"подпроцесс проверки Qt не запустился: {start_error}")
+    elif returncode is None:
+        problems.append("подпроцесс проверки Qt превысил таймаут")
+    elif returncode != 0:
+        problems.append(f"подпроцесс проверки Qt завершился с кодом {returncode}")
+    if not valid:
+        problems.append(
+            "нет корректного результата проверки SVG/QML; проверьте пакеты Debian: "
+            f"libqt5svg5 {_QML_PACKAGES}"
+        )
+    elif isinstance(result, dict):
+        if result["svg"] == "missing":
+            problems.append("нет поддержки SVG — нужен пакет Debian libqt5svg5")
+        if result["qml"] != "ok":
+            problems.append(f"ошибка QML — нужны пакеты Debian {_QML_PACKAGES}: {result['qml']}")
+    if not problems:
+        return None
+    details = "".join(
+        f" Диагностика подпроцесса ({name}): {output.strip()[-2000:]}"
+        for name, output in (("stdout", stdout), ("stderr", stderr))
+        if output.strip()
+    )
+    return (
+        "Для выбранных тестов нужно рабочее окружение Qt: "
+        + "; ".join(problems)
+        + "."
+        + details
+        + " "
+        "Qt обязателен: выбран маркер unit/xvfb или задана ASTRA_VOICE_REQUIRE_QT=1; "
+        "пропуск здесь запрещён."
+    )
+
+
+def run_qt_environment_probe() -> str | None:
+    """Проверяем плагины отдельно, чтобы сбой Qt не уронил сам pytest."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _QT_PROBE],
+            env={**os.environ, "QT_QPA_PLATFORM": "offscreen", "QT_QUICK_BACKEND": "software"},
+            timeout=20,
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired as error:
+        # str(TimeoutExpired) содержит весь код пробы и заглушает причину сбоя.
+        return qt_environment_error(None, error.stdout, error.stderr)
+    except OSError as error:
+        return qt_environment_error(None, "", "", start_error=str(error))
+    return qt_environment_error(result.returncode, result.stdout, result.stderr)
 
 
 def import_names(text: str, package: str = "") -> set[str]:
@@ -146,9 +268,16 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 def pytest_collection(session: pytest.Session) -> None:
     config = session.config
-    if not config.stash[_QT_AVAILABLE] and qt_required(config.option.markexpr, os.environ):
-        # Проверяем до обхода файлов: даже явный путь к тесту не обойдёт запрет.
+    if not qt_required(config.option.markexpr, os.environ):
+        return
+    # Проверяем до обхода файлов: даже явный путь к тесту не обойдёт запрет.
+    if not config.stash[_QT_AVAILABLE]:
         raise pytest.UsageError(_QT_ERROR)
+    if _QT_ENV_ERROR not in config.stash:
+        config.stash[_QT_ENV_ERROR] = run_qt_environment_probe()
+    error = config.stash[_QT_ENV_ERROR]
+    if error is not None:
+        raise pytest.UsageError(error)
 
 
 def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
