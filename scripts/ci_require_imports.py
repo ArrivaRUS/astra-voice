@@ -13,6 +13,11 @@
 
     scripts/ci_require_imports.py tests/xvfb            # все зависимости каталога
     scripts/ci_require_imports.py tests/unit --also numpy
+
+Файл, где `importorskip` встречается внутри тестовой фикстуры, а не как настоящая
+зависимость (например, тест самого гейта), исключается строкой-меткой
+`ci-require-imports: skip-file` в его тексте. Метка ставится осознанно и только
+в таком случае: ею легко спрятать реальную зависимость.
 """
 
 from __future__ import annotations
@@ -37,6 +42,9 @@ APT_HINT = {
 
 _IMPORTORSKIP_RE = re.compile(r"""importorskip\(\s*["']([A-Za-z0-9_.]+)["']""")
 
+#: Метка «не сканировать этот файл»: `importorskip` здесь — тестовая фикстура.
+SKIP_FILE_MARKER = "ci-require-imports: skip-file"
+
 
 def required_modules(paths: list[Path]) -> list[str]:
     """Модули из всех `pytest.importorskip(...)` в указанных файлах/каталогах."""
@@ -44,7 +52,10 @@ def required_modules(paths: list[Path]) -> list[str]:
     for path in paths:
         files = sorted(path.rglob("*.py")) if path.is_dir() else [path]
         for file in files:
-            found.update(_IMPORTORSKIP_RE.findall(file.read_text(encoding="utf-8")))
+            text = file.read_text(encoding="utf-8")
+            if SKIP_FILE_MARKER in text:
+                continue
+            found.update(_IMPORTORSKIP_RE.findall(text))
     return sorted(found)
 
 

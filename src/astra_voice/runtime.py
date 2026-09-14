@@ -11,7 +11,6 @@ from typing import Any, cast
 
 from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEventLoop, QObject, QSocketNotifier, Qt, QTimer
-from PyQt5.QtWidgets import QApplication
 
 from astra_voice.core.capture_watchdog import CaptureFieldWatchdog
 from astra_voice.core.dictation import DictationOrchestrator, DictationPhase
@@ -25,11 +24,10 @@ from astra_voice.platform.hotkey import (
     HotkeyState,
 )
 from astra_voice.platform.paste import (
-    KDE_HINT,
     PasteMode,
     PasteOutcome,
     paste_text,
-    restore_mime,
+    publish_clipboard,
     restore_pending,
 )
 from astra_voice.platform.session import SessionKind
@@ -310,14 +308,8 @@ class DictationRuntime(QObject):
     def _copy_last(self) -> None:
         """Копирует нормализованную фразу в буфер Qt с пометкой secret (У59)."""
         text = self.last_text
-        if text is not None:
-            # TODO(зона A): нужна публичная функция публикации. Тип из чёрного
-            # списка Fly здесь не ставится: фраза всё ещё может попасть в историю.
-            # Снимок владения _last_clipboard_snapshot не обновляется: следующая
-            # диктовка сочтёт буфер чужим и при восстановлении очистит вместо
-            # возврата — безопасная деградация, но скопированное будет потеряно.
-            snapshot = {"text/plain": text.encode("utf-8"), KDE_HINT: b"secret"}
-            QApplication.clipboard().setMimeData(restore_mime(snapshot))
+        if text is not None and not publish_clipboard(text, session_kind=self.session_kind):
+            log.warning("Не удалось скопировать последний текст в буфер обмена")
 
     def _quit_requested(self) -> None:
         """Передаёт запрос выхода владельцу приложения."""

@@ -19,6 +19,7 @@ from uuid import uuid4
 from astra_voice.platform.hotkey import HotkeyState
 from astra_voice.platform.paste import PasteMode, PasteOutcome, PasteOutcomeKind, normalize
 from astra_voice.ui.pill import (
+    CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
     ERROR_MICROPHONE_UNAVAILABLE,
     ERROR_RECOGNITION_FAILED,
@@ -350,12 +351,12 @@ class DictationOrchestrator:
         if kind == PasteOutcomeKind.PASTED:
             self._dictation_stat("ok")
             self._finish(PillState.DONE, tray=TrayState.DONE)
-        elif kind in (
-            PasteOutcomeKind.CLIPBOARD_ONLY,
-            PasteOutcomeKind.WINDOW_CHANGED,
-            PasteOutcomeKind.BUSY,
-        ):
-            # TODO(зона B): вторая подпись реестра CLIPBOARD_ONLY для window-changed — имя придёт от зоны B  # noqa: E501
+        elif kind == PasteOutcomeKind.WINDOW_CHANGED:
+            self._dictation_stat("ok")
+            self._begin_finish()
+            self._pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED)
+            self._end_finish(PillState.CLIPBOARD_ONLY, tray=TrayState.IDLE)
+        elif kind in (PasteOutcomeKind.CLIPBOARD_ONLY, PasteOutcomeKind.BUSY):
             self._dictation_stat("ok")
             self._finish(PillState.CLIPBOARD_ONLY)
         elif kind == PasteOutcomeKind.REFUSED_SECRET:

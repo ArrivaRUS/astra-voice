@@ -3,6 +3,12 @@
 Гейт существует ради одного: в CI пропуск теста из-за забытого пакета не должен
 выглядеть как успех. Поэтому проверяем и то, что он находит зависимости в
 исходниках тестов, и то, что он краснеет на отсутствующем модуле.
+
+Сам файл помечен ниже как исключение из сканирования: `importorskip` здесь —
+тестовые фикстуры, а не настоящие зависимости. Без метки гейт требовал бы в CI
+несуществующий модуль и валил задачу `unit` (так и случилось на 4a23129).
+
+ci-require-imports: skip-file
 """
 
 from __future__ import annotations
@@ -70,3 +76,25 @@ def test_ci_installs_every_xvfb_dependency() -> None:
     for module in guard.required_modules([ROOT / "tests" / "xvfb"]):
         package = guard.APT_HINT[module]
         assert package in job, f"{module} требует apt-пакет {package} в задаче xvfb"
+
+
+def test_guard_ignores_its_own_fixtures() -> None:
+    """Регресс: гейт не спотыкается о фикстуры собственного теста (4a23129)."""
+    modules = guard.required_modules([ROOT / "tests" / "unit"])
+    assert "astra_voice_no_such_module" not in modules
+    # …но настоящие зависимости соседних тестов по-прежнему видны.
+    assert "numpy" in modules
+
+
+def test_marker_excludes_only_marked_file(tmp_path: Path) -> None:
+    (tmp_path / "test_fixture_holder.py").write_text(
+        f'"""{guard.SKIP_FILE_MARKER}"""\npytest.importorskip("не_должен_попасть")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "test_real.py").write_text('pytest.importorskip("json")\n', encoding="utf-8")
+    assert guard.required_modules([tmp_path]) == ["json"]
+
+
+def test_whole_test_tree_is_green() -> None:
+    """Полный прогон гейта по репозиторию — 0 (как в CI)."""
+    assert guard.main([str(ROOT / "tests" / "unit"), str(ROOT / "tests" / "xvfb")]) == 0

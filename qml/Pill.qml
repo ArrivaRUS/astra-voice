@@ -100,6 +100,12 @@ Item {
     onLabelChanged: updatePresentation()
     Component.onCompleted: updatePresentation()
 
+    // Python вызывает синхронно перед чтением pillWidth/pillHeight и показом окна.
+    function forceLayout() {
+        caption.forceLayout();
+        content.forceLayout();
+    }
+
     Behavior on opacity {
         id: visibilityTransition
         NumberAnimation {
@@ -114,8 +120,8 @@ Item {
     Canvas {
         x: -root.shadowRadius
         y: -root.shadowRadius
-        width: root.width + root.shadowRadius * 2
-        height: root.height + root.shadowRadius * 2 + root.shadowY
+        width: root.pillWidth + root.shadowRadius * 2
+        height: root.pillHeight + root.shadowRadius * 2 + root.shadowY
         renderTarget: Canvas.Image
         onWidthChanged: requestPaint()
         onHeightChanged: requestPaint()
@@ -126,8 +132,8 @@ Item {
             ctx.clearRect(0, 0, width, height);
             var left = root.shadowRadius;
             var top = root.shadowRadius;
-            var right = left + root.width;
-            var bottom = top + root.height;
+            var right = left + root.pillWidth;
+            var bottom = top + root.pillHeight;
             var radius = PillTheme.pillRadius;
             ctx.beginPath();
             ctx.moveTo(left + radius, top);
@@ -155,7 +161,9 @@ Item {
 
     Rectangle {
         id: background
-        anchors.fill: parent
+        // Корневой Item следует размеру окна с полями; рисунок — размеру контента.
+        width: root.pillWidth
+        height: root.pillHeight
         radius: PillTheme.pillRadius
         color: PillTheme.pillBg
         antialiasing: true
@@ -165,9 +173,9 @@ Item {
     // Дети Row центрируются через y: позиционер управляет только их x.
     Row {
         id: content
-        x: (root.width - width) / 2
+        x: (root.pillWidth - width) / 2
         y: root.paddingY
-        height: root.height - root.paddingY * 2
+        height: root.pillHeight - root.paddingY * 2
         spacing: PillTheme.pillGap
 
         Item {
@@ -189,7 +197,7 @@ Item {
                     y: (bars.height - height) / 2
                     width: PillTheme.pillBarW
                     // §8.3: напрямую по кадрам, без интерполяции или сглаживания истории.
-                    height: root.silent ? PillTheme.pillBarHFlat
+                    height: root.silent || presentation.name === "limit" ? PillTheme.pillBarHFlat
                         : Math.max(PillTheme.pillBarHMin, Math.round(level * PillTheme.pillBarHMax))
                     radius: PillTheme.pillBarRadius
                     color: root.silent || presentation.name === "limit"

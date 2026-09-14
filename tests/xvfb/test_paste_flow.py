@@ -215,9 +215,9 @@ def test_secret_not_republished_when_phrase_is_kept(
 def test_focus_changed_with_same_active_window_blocks_xtest(
     tmp_path: Path, clipboard: Any, xdisplay: X11Display, focus_kind: str
 ) -> None:
-    """Чужой фокус запрещает XTest независимо от переходного состояния EWMH.
+    """Чужой фокус или захват запрещает XTest независимо от переходного состояния EWMH.
 
-    KWin: фокус override-redirect снимает _NET_ACTIVE_WINDOW; None — переход, не прежнее окно.
+    KWin возвращает фокус активному окну и недетерминированно снимает _NET_ACTIVE_WINDOW.
     """
     from Xlib import X
 
@@ -230,7 +230,7 @@ def test_focus_changed_with_same_active_window_blocks_xtest(
             100,
             0,
             X.CopyFromParent,
-            # KWin не должен переоформлять окно и возвращать фокус мишени.
+            # Попап не становится отдельным управляемым клиентом WM.
             override_redirect=True,
             event_mask=X.KeyPressMask | X.KeyReleaseMask,
         )
@@ -256,7 +256,23 @@ def test_focus_changed_with_same_active_window_blocks_xtest(
             window.set_input_focus(X.RevertToParent, X.CurrentTime)
             xdisplay.d.sync()
             assert_active_window_allowed()
-            assert int(xdisplay.d.get_input_focus().focus.id) == int(window.id)
+            input_focus: int | None = None
+
+            def rival_has_focus() -> bool:
+                nonlocal input_focus
+                focus = xdisplay.d.get_input_focus().focus
+                input_focus = focus if isinstance(focus, int) else int(focus.id)
+                return input_focus == int(window.id)
+
+            try:
+                wait_until(rival_has_focus, timeout=0.2)
+            except AssertionError:
+                assert input_focus == target.window, (
+                    f"Фокус не достался сопернику и не вернулся мишени: input_focus={input_focus}, "
+                    f"мишень={target.window}, соперник={int(window.id)}"
+                )
+            # При возврате фокуса доставляем сцену захватом; в успешной ветке сохраняем
+            # его тоже: KWin может вернуть фокус уже после последнего XGetInputFocus.
             status = window.grab_keyboard(False, X.GrabModeAsync, X.GrabModeAsync, X.CurrentTime)
             assert status == X.GrabSuccess
             assert_active_window_allowed()

@@ -55,7 +55,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             make git python3 python3-venv python3-pip python3-numpy \
             gnupg gpgv dpkg-dev binutils file \
-            python3-pyqt5
+            python3-pyqt5 python3-pyqt5.qtquick python3-xlib python3-yaml
       - name: Окружение разработчика
         run: |
           python3 -m venv --system-site-packages "$VENV"
@@ -64,9 +64,12 @@ jobs:
       # PyQt5 (выше) и платформа без дисплея.
       - name: Зависимости unit-тестов обязаны быть установлены
         run: |
-          "$VENV/bin/python" scripts/ci_require_imports.py tests/unit
+          # --also yaml: test_ci_lint.py пропускает себя без PyYAML не через
+          # importorskip, а вручную — гейт об этом сам не узнает.
+          "$VENV/bin/python" scripts/ci_require_imports.py tests/unit --also yaml
       - run: make test VENV=$VENV
         env:
+          ASTRA_VOICE_REQUIRE_QT: "1"
           QT_QPA_PLATFORM: offscreen
           PYTEST_ADDOPTS: -rs
 
@@ -82,7 +85,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             make git python3 python3-venv python3-pip python3-numpy \
             xvfb xauth \
-            python3-pyqt5 python3-pyqt5.qtquick python3-xlib \
+            python3-pyqt5 python3-pyqt5.qtquick python3-xlib python3-yaml \
             qml-module-qtquick2 qml-module-qtquick-controls2 \
             qml-module-qtquick-layouts qml-module-qtquick-window2 \
             qml-module-qtquick-shapes qml-module-qtgraphicaleffects
@@ -98,6 +101,7 @@ jobs:
           "$VENV/bin/python" scripts/ci_require_imports.py tests/xvfb
       - run: make test-xvfb VENV=$VENV
         env:
+          ASTRA_VOICE_REQUIRE_QT: "1"
           QT_QPA_PLATFORM: xcb
           # -rs: причины пропусков видны в логе, а не только их число
           PYTEST_ADDOPTS: -rs

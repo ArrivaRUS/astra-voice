@@ -40,6 +40,8 @@ from astra_voice.platform.paste import (
     normalize,
 )
 from astra_voice.ui.pill import (
+    CLIPBOARD_REASONS,
+    CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
     ERROR_MICROPHONE_UNAVAILABLE,
     ERROR_REASONS,
@@ -65,7 +67,11 @@ class FakePill:
     def show_state(
         self, state: PillState, *, text: str | None = None, level: float | None = None
     ) -> None:
-        assert text is None or (state == PillState.ERROR and text in ERROR_REASONS)
+        assert (
+            text is None
+            or (state == PillState.ERROR and text in ERROR_REASONS)
+            or (state == PillState.CLIPBOARD_ONLY and text in CLIPBOARD_REASONS)
+        )
         self.calls.append((state, text, level))
         self.trace.append(("pill", state, text, level))
 
@@ -378,7 +384,12 @@ def test_single_slot_ignores_repeated_presses(rig: Rig, phase: str) -> None:
     [
         (PasteOutcomeKind.PASTED, PillState.DONE, None, "ok"),
         (PasteOutcomeKind.CLIPBOARD_ONLY, PillState.CLIPBOARD_ONLY, None, "ok"),
-        (PasteOutcomeKind.WINDOW_CHANGED, PillState.CLIPBOARD_ONLY, None, "ok"),
+        (
+            PasteOutcomeKind.WINDOW_CHANGED,
+            PillState.CLIPBOARD_ONLY,
+            CLIPBOARD_WINDOW_CHANGED,
+            "ok",
+        ),
         (PasteOutcomeKind.REFUSED_SECRET, PillState.ERROR, ERROR_BUFFER_CLEARED, "ok"),
         (PasteOutcomeKind.FAILED, PillState.ERROR, ERROR_RECOGNITION_FAILED, None),
     ],
@@ -386,6 +397,7 @@ def test_single_slot_ignores_repeated_presses(rig: Rig, phase: str) -> None:
 def test_paste_outcomes(
     rig: Rig, kind: PasteOutcomeKind, state: PillState, reason: str | None, stat_result: str | None
 ) -> None:
+    """T-58: смена окна уточняет подпись; оба исхода буфера сохраняют текст и result=ok."""
     rig.start()
     rig.stop()
     rig.outcomes.append(kind)
@@ -409,7 +421,7 @@ def test_busy_has_one_retry_per_dictation(rig: Rig, second: PasteOutcomeKind) ->
         rig.now += 0.2
         rig.timer(BUSY_RETRY_MS).fire()
         expected = PillState.DONE if second == PasteOutcomeKind.PASTED else PillState.CLIPBOARD_ONLY
-        assert rig.pill.calls[-1][0] == expected
+        assert rig.pill.calls[-1] == (expected, None, None)
         assert rig.stats.events[-1]["t_ms"] == pytest.approx(250.0)
         assert rig.stats.events[-1]["paste_ms"] == pytest.approx(250.0)
         assert not any(
@@ -990,7 +1002,8 @@ def test_reentrant_delivery_is_deferred_and_cannot_overwrite_terminal_state(
     assert len(rig.pasted) == 1
     if nested in ("cancel", "escape"):
         assert rig.commands() == ["record.start", "record.stop", "recognize"]
-        assert rig.pill.calls[-1] == (state, None, None)
+        reason = CLIPBOARD_WINDOW_CHANGED if kind == PasteOutcomeKind.WINDOW_CHANGED else None
+        assert rig.pill.calls[-1] == (state, reason, None)
         assert rig.tray.state == (
             TrayState.DONE if kind == PasteOutcomeKind.PASTED else TrayState.IDLE
         )

@@ -146,7 +146,19 @@ def test_sigkill_restarts_with_new_pid_within_one_second() -> None:
         assert supervisor.generation == 2
         assert supervisor.process is not None
         assert supervisor.process.pid != process.pid
-        assert process.poll() is not None
+        # Пожинание асинхронное по замыслу: `_restart` не блокирует поток GUI, а
+        # кладёт мёртвый процесс в `_retired`, и статус забирает ближайший `pump`
+        # (supervisor.py, комментарий у `self.process.kill()`). Кто первым заметит
+        # смерть — EOF сокета или `poll()` — зависит от планировщика, поэтому
+        # мгновенная проверка `poll()` здесь была гонкой: в четверти прогонов
+        # поколение уже сменилось, а зомби ещё не пожат (пожинается через ~10 мс).
+        # Проверяем инвариант О1 целиком — процесс именно пожат, и в тот же
+        # секундный бюджет, — а не то, успел ли он попасть в конкретный `pump`.
+        # Сам `poll()` в предикате и пожинает процесс; из `_retired` запись уберёт
+        # только следующий `pump` — это деталь реализации, инвариант О1 её не требует
+        # (за полную уборку отвечает `stop()`, он дренирует `_retired` с `wait`).
+        wait_for(supervisor, lambda: process.poll() is not None, "старый процесс пожат")
+        assert process.returncode == -signal.SIGKILL
         wait_for(
             supervisor,
             lambda: any(e["type"] == "hello" and e["generation"] == 2 for e in events),

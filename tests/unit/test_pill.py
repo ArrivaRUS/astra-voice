@@ -5,12 +5,14 @@ from __future__ import annotations
 import ast
 import logging
 import os
+import re
 import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib.util import resolve_name
+from math import ceil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import Mock, call
@@ -56,14 +58,18 @@ EXPECTED_DURATIONS = {
 
 class Signal:
     def __init__(self) -> None:
-        self.callbacks: list[Callable[[], None]] = []
+        self.callbacks: list[tuple[Callable[[], None], object]] = []
+        self.pending: list[Callable[[], None]] | None = None
 
     def connect(self, callback: Callable[[], None], connection: object = None) -> None:
-        self.callbacks.append(callback)
+        self.callbacks.append((callback, connection))
 
     def emit(self) -> None:
-        for callback in self.callbacks:
-            callback()
+        for callback, connection in self.callbacks:
+            if connection == Qt.QueuedConnection and self.pending is not None:
+                self.pending.append(callback)
+            else:
+                callback()
 
 
 @dataclass
@@ -132,6 +138,7 @@ class Harness:
     x11: Mock
     app: Mock
     ewmh: Mock
+    invoke: Mock
 
 
 class BadWindow(Exception):
@@ -142,7 +149,10 @@ class BadWindow(Exception):
 def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     forbidden_view = Mock(side_effect=AssertionError("Настоящий QQuickView запрещён"))
     forbidden_view.SizeViewToRootObject = QQuickView.SizeViewToRootObject
+    forbidden_view.SizeRootObjectToView = QQuickView.SizeRootObjectToView
     monkeypatch.setattr(module, "QQuickView", forbidden_view)
+    invoke = Mock(side_effect=lambda root, method, connection: getattr(root, method)())
+    monkeypatch.setattr(module, "QMetaObject", Mock(invokeMethod=invoke))
     clock = Clock()
     monkeypatch.setattr(module, "QTimer", clock)
     monkeypatch.setattr(module, "monotonic", lambda: clock.now / 1000)
@@ -200,6 +210,8 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
         detailsClicked=Signal(),
         widthChanged=Signal(),
         heightChanged=Signal(),
+        pillWidthChanged=Signal(),
+        pillHeightChanged=Signal(),
     )
     root.property.side_effect = properties.__getitem__
     root.setProperty.side_effect = properties.__setitem__
@@ -249,7 +261,182 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
     pill = Pill(view_factory=factory)
     # Тесты настраивают фейковый транспорт до первого open(), не создавая соединение.
     x11.d, x11.root = conn, root_window
-    return Harness(pill, view, root, properties, factory, clock, x11, app, ewmh)
+    return Harness(pill, view, root, properties, factory, clock, x11, app, ewmh, invoke)
+
+
+# Фейковые результаты Text/Row: короткие, длинные и дробные размеры, без зависимости
+# от установленного шрифта. HIDDEN/DISABLED сохраняют последнее содержимое QML.
+LAYOUT_SIZES = {
+    PillState.LOADING_MODEL: (216.0, 36.0),
+    PillState.LISTENING: (187.6, 36.0),
+    PillState.LISTENING_SILENT: (276.4, 36.0),
+    PillState.LIMIT: (294.25, 36.0),
+    PillState.PROCESSING: (216.0, 36.0),
+    PillState.DONE: (172.0, 36.0),
+    PillState.CLIPBOARD_ONLY: (231.5, 36.0),
+    PillState.EMPTY: (237.1, 36.0),
+    PillState.CANCELLED: (172.0, 36.0),
+    PillState.ERROR: (319.2, 36.0),
+}
+
+
+@pytest.fixture
+def deferred_layout(harness: Harness) -> list[Callable[[], None]]:
+    """Polish, таймер QQuickView и queued-сигналы исполняются только явно тестом."""
+    pending: list[Callable[[], None]] = []
+    next_size: tuple[float, float] | None = None
+    for signal in (
+        harness.root.widthChanged,
+        harness.root.heightChanged,
+        harness.root.pillWidthChanged,
+        harness.root.pillHeightChanged,
+        harness.view.widthChanged,
+        harness.view.heightChanged,
+    ):
+        signal.pending = pending
+
+    def follow_root() -> None:
+        # Qt 5 SizeViewToRootObject округляет вниз и нулевым таймером заменяет
+        # размер окна размером Item. Не имитируем эту гонку в обратном режиме.
+        if harness.view.setResizeMode.call_args.args[0] == QQuickView.SizeViewToRootObject:
+            harness.view.resize(
+                int(harness.properties["pillWidth"]), int(harness.properties["pillHeight"])
+            )
+
+    def force_layout() -> None:
+        nonlocal next_size
+        if next_size is None:
+            return
+        width, height = next_size
+        next_size = None
+        harness.properties.update(pillWidth=width, pillHeight=height)
+        harness.root.pillWidthChanged.emit()
+        harness.root.pillHeightChanged.emit()
+        harness.root.widthChanged.emit()
+        harness.root.heightChanged.emit()
+        pending.append(follow_root)
+
+    def set_property(name: str, value: Any) -> None:
+        nonlocal next_size
+        harness.properties[name] = value
+        if name == "avState" and PillState(value) in LAYOUT_SIZES:
+            next_size = LAYOUT_SIZES[PillState(value)]
+            pending.append(force_layout)
+
+    def resize(width: int, height: int) -> None:
+        old_width, old_height = harness.view.width(), harness.view.height()
+        harness.view.width.return_value = width
+        harness.view.height.return_value = height
+        if old_width != width:
+            harness.view.widthChanged.emit()
+        if old_height != height:
+            harness.view.heightChanged.emit()
+
+    harness.root.setProperty.side_effect = set_property
+    harness.root.forceLayout.side_effect = force_layout
+    harness.view.resize.side_effect = resize
+    return pending
+
+
+@pytest.mark.parametrize("state", list(PillState))
+def test_window_size_is_correct_at_every_show_before_queued_layout(
+    harness: Harness, deferred_layout: list[Callable[[], None]], state: PillState
+) -> None:
+    sizes_at_show: list[tuple[int, int]] = []
+    show = harness.view.show.side_effect
+
+    def record_show() -> None:
+        width, height = LAYOUT_SIZES[harness.pill.state]
+        size = (int(harness.view.width()), int(harness.view.height()))
+        # Сначала проверяем именно окно: чтение диагностического свойства не должно
+        # чинить размер. Старый код здесь показывает геометрию предыдущего состояния.
+        assert size == (ceil(width) + 36, ceil(height) + 42)
+        assert harness.pill.window_size == size
+        harness.view.setPosition.assert_called_with(
+            100 + (1920 - size[0]) // 2, 200 + 1080 - 48 - size[1] + 24
+        )
+        sizes_at_show.append(size)
+        assert callable(show)
+        show()
+
+    harness.view.show.side_effect = record_show
+    for previous in (PillState.ERROR, PillState.DONE, PillState.LISTENING):
+        harness.pill.show_state(previous)
+        harness.pill.hide()
+        # Не исполняем ни polish, ни queued-сигналы между состояниями и show().
+        sizes_at_show.clear()
+        harness.pill.show_state(state)
+        harness.pill.show_state(state)
+        if state in (PillState.HIDDEN, PillState.DISABLED):
+            assert not sizes_at_show
+            assert not harness.view.isVisible()
+            assert not harness.pill.visible
+        else:
+            assert len(sizes_at_show) == 2
+            assert sizes_at_show[0] == sizes_at_show[1]
+        # После показа тоже не допускаем даже временного срезания полей таймером Qt.
+        while deferred_layout:
+            deferred_layout.pop(0)()
+            if sizes_at_show:
+                assert harness.pill.window_size == sizes_at_show[0]
+            else:
+                assert not harness.view.isVisible()
+    harness.factory.assert_called_once_with()
+    assert harness.view.setSource.call_count == 1
+    harness.app.processEvents.assert_not_called()
+
+
+@pytest.mark.parametrize("content_size", [(172.0, 36.0), (187.6, 36.4), (319.2, 40.1)])
+def test_layout_finishes_before_reading_and_rounding_both_dimensions(
+    harness: Harness, content_size: tuple[float, float]
+) -> None:
+    def force_layout() -> None:
+        harness.properties.update(pillWidth=content_size[0], pillHeight=content_size[1])
+
+    harness.root.forceLayout.side_effect = force_layout
+    operations = Mock()
+    operations.attach_mock(harness.root.forceLayout, "layout")
+    operations.attach_mock(harness.root.property, "read")
+    operations.attach_mock(harness.view.resize, "resize")
+    operations.attach_mock(harness.view.setPosition, "place")
+    operations.attach_mock(harness.view.show, "show")
+    harness.pill.show_state(PillState.PROCESSING)
+    assert operations.mock_calls[:4] == [
+        call.layout(),
+        call.read("pillWidth"),
+        call.read("pillHeight"),
+        call.resize(ceil(content_size[0]) + 36, ceil(content_size[1]) + 42),
+    ]
+    assert [operation[0] for operation in operations.mock_calls][-2:] == ["place", "show"]
+    harness.invoke.assert_called_with(harness.root, "forceLayout", Qt.DirectConnection)
+
+
+def test_qml_layout_flushes_caption_before_row() -> None:
+    qml = (ROOT / "qml/Pill.qml").read_text(encoding="utf-8")
+    body = re.search(r"function forceLayout\(\)\s*\{([^}]+)\}", qml)
+    assert body is not None
+    assert body.group(1).split() == ["caption.forceLayout();", "content.forceLayout();"]
+    # SizeRootObjectToView меняет root.width/height: рисунок не должен растягиваться
+    # на поля тени или центрировать по ним подпись.
+    assert "root.width" not in qml
+    assert "root.height" not in qml
+    assert "width: root.pillWidth" in qml
+    assert "height: root.pillHeight" in qml
+
+
+def test_limit_and_silent_bars_share_flat_height_and_keep_live_formula() -> None:
+    qml = (ROOT / "qml/Pill.qml").read_text(encoding="utf-8")
+    theme = (ROOT / "qml/PillTheme.qml").read_text(encoding="utf-8")
+    assert 'readonly property bool silent: presentation.name === "listening-silent"' in qml
+    bars = qml.split("id: bars", 1)[1].split("id: dots", 1)[0]
+    height = re.search(r"height:\s*(root\.silent.*?)\s+radius:", bars, re.DOTALL)
+    assert height is not None
+    # Проверяем само QML-выражение, без копии расчёта высоты в Python и запуска окна.
+    assert " ".join(height.group(1).split()) == (
+        'root.silent || presentation.name === "limit" ? PillTheme.pillBarHFlat '
+        ": Math.max(PillTheme.pillBarHMin, Math.round(level * PillTheme.pillBarHMax))"
+    )
+    assert re.search(r"readonly property real pillBarHFlat:\s*4\s", theme)
 
 
 def test_exact_enum_and_durations() -> None:
@@ -278,7 +465,7 @@ def test_window_preloaded_once_with_flags_and_shadow_space(harness: Harness) -> 
         Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus
     )
     harness.view.setColor.assert_called_once_with(Qt.transparent)
-    harness.view.setResizeMode.assert_called_once_with(QQuickView.SizeViewToRootObject)
+    harness.view.setResizeMode.assert_called_once_with(QQuickView.SizeRootObjectToView)
     harness.view.resize.assert_called_with(224, 78)
     harness.view.setPosition.assert_called_with(948, 1178)
     assert harness.properties["x"] == harness.properties["y"] == 18
@@ -310,12 +497,12 @@ def test_missing_qml_root_fails_during_init(harness: Harness) -> None:
 def test_size_tracks_deferred_qml_layout(harness: Harness) -> None:
     harness.pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_UNAVAILABLE)
     harness.properties["pillWidth"] = 319.2
-    harness.root.widthChanged.emit()
+    harness.root.pillWidthChanged.emit()
     harness.view.resize.assert_called_with(356, 78)
     harness.properties["pillHeight"] = 40
-    harness.root.heightChanged.emit()
+    harness.root.pillHeightChanged.emit()
     harness.view.resize.assert_called_with(356, 82)
-    # SizeViewToRootObject может позже убрать поля тени; восстанавливаем их.
+    # Запасной путь для внешнего изменения геометрии окна.
     harness.view.resize(320, 40)
     harness.view.widthChanged.emit()
     harness.view.resize.assert_called_with(356, 82)
@@ -323,7 +510,7 @@ def test_size_tracks_deferred_qml_layout(harness: Harness) -> None:
     harness.view.heightChanged.emit()
     harness.view.resize.assert_called_with(356, 82)
     harness.app.primaryScreen.return_value = None
-    harness.root.widthChanged.emit()
+    harness.root.pillWidthChanged.emit()
 
 
 @pytest.mark.parametrize("state", list(PillState))
@@ -863,7 +1050,7 @@ def test_mask_only_without_compositor_and_tracks_resize(harness: Harness, owner:
     assert region.contains(QPoint(36, 18))
     assert region.contains(QPoint(18, 36))
     harness.properties["pillWidth"] = 300
-    harness.root.widthChanged.emit()
+    harness.root.pillWidthChanged.emit()
     assert harness.view.setMask.call_args.args[0].boundingRect() == QRect(18, 18, 300, 36)
     harness.properties["pillHeight"] = 40
     harness.view.heightChanged.emit()

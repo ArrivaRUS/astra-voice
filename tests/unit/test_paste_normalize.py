@@ -150,6 +150,172 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeClipboard, Mock, list[
     return cb, x, delays
 
 
+@pytest.mark.parametrize("pending_exists", [False, True])
+@pytest.mark.parametrize(
+    "text", ["", "строка\r\nещё\n\x1b\x0f\x7f\x85\x9fконец", "ёж\ud800\nконец"]
+)
+def test_publish_clipboard_normalizes_without_side_effects(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    pending_exists: bool,
+) -> None:
+    cb, x, delays = harness
+    primary = cb.snapshot(True)
+    pending = paste._PendingRestore({"text/plain": b"saved"}, False) if pending_exists else None
+    monkeypatch.setattr(paste, "_pending", pending)
+    forbidden = Mock(side_effect=AssertionError("чтение буфера, X и ожидания запрещены"))
+    for name in ("snapshot", "owns", "clear"):
+        monkeypatch.setattr(cb, name, forbidden)
+    for name in ("X11Display", "_wait_ms", "_session_kind", "_fly_blacklist_type"):
+        monkeypatch.setattr(paste, name, forbidden)
+
+    assert paste.publish_clipboard(text, session_kind=session.SessionKind.KDE) is True
+
+    expected = {
+        "text/plain": paste.normalize(text).encode("utf-8", errors="replace"),
+        paste.KDE_HINT: b"secret",
+    }
+    assert cb.writes == [(False, expected)]
+    published = cb.data[False]["text/plain"].decode("utf-8")
+    assert all(ord(ch) >= 0x20 and not 0x7F <= ord(ch) <= 0x9F for ch in published)
+    assert cb.data[True] == primary
+    assert paste._last_clipboard_snapshot == expected
+    assert paste._last_clipboard_snapshot is not cb.data[False]
+    assert paste._pending is pending
+    if pending is not None:
+        assert not pending.consumed
+    assert delays == []
+    assert x.mock_calls == []
+    forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("session_kind", list(session.SessionKind))
+@pytest.mark.parametrize("types", ["Fly-Type", "text/plain:x-kde-passwordManagerHint"])
+def test_publish_clipboard_mime_and_auto_restore(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    session_kind: session.SessionKind,
+    types: str,
+) -> None:
+    """У59/У49: сеанс из аргумента, безопасный Fly-тип и возврат своей публикации."""
+    cb, _, _ = harness
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    theme = tmp_path / "theme.themerc"
+    theme.write_text(f'ClipboardManagerTypesBlacklist="{types}"\n', encoding="utf-8")
+    monkeypatch.setattr(paste, "FLY_SYSTEM_THEME", theme)
+    # Кэш намеренно противоречит аргументу; публикующий путь не должен читать его.
+    cached = (
+        session.SessionKind.KDE
+        if session_kind == session.SessionKind.FLY
+        else session.SessionKind.FLY
+    )
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", cached.value)
+    assert paste._session_kind(PasteMode.AUTO) == cached
+    assert paste.publish_clipboard("Из\nтрея\x1b\x0f", session_kind=session_kind) is True
+    expected = {"text/plain": "Из трея".encode(), paste.KDE_HINT: b"secret"}
+    if session_kind == session.SessionKind.FLY:
+        expected["Fly-Type" if types == "Fly-Type" else paste.FLY_FALLBACK_TYPE] = b""
+    assert cb.writes == [(False, expected)]
+    md = paste.restore_mime(cb.data[False])
+    assert md.text() == "Из трея"
+    assert paste.snapshot_mime(md) == expected
+
+    outcome = paste.paste_text("Следующая диктовка", 42, PasteMode.AUTO)
+
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    assert outcome.restore == PasteRestore.RESTORED
+    assert cb.data[False] == expected
+    assert cb.writes[-1] == (False, expected)
+
+
+@pytest.mark.parametrize("failure", ["none", "before-put", "after-put"])
+def test_publish_clipboard_never_reissues_foreign_secret(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    cb, _, _ = harness
+    foreign = {"text/plain": b"FOREIGN-SECRET", paste.KDE_HINT: b"secret"}
+    cb.data[False] = foreign.copy()
+    put = cb.put
+
+    def failing_put(snapshot: dict[str, bytes], primary: bool) -> None:
+        if failure == "after-put":
+            put(snapshot, primary)
+        raise RuntimeError("публикация прервана")
+
+    with monkeypatch.context() as patch:
+        if failure != "none":
+            patch.setattr(cb, "put", failing_put)
+        assert paste.publish_clipboard("Из трея", session_kind=session.SessionKind.OTHER) is (
+            failure == "none"
+        )
+    outcome = paste.paste_text("Следующая диктовка", 42, PasteMode.AUTO)
+    assert all(snapshot != foreign for _, snapshot in cb.writes)
+    if failure == "none":
+        assert outcome.restore == PasteRestore.RESTORED
+        assert cb.data[False]["text/plain"] == "Из трея".encode()
+    else:
+        assert outcome.kind == PasteOutcomeKind.REFUSED_SECRET
+        assert outcome.restore == PasteRestore.CLEARED_SECRET
+        assert cb.data[False] == {}
+
+
+@pytest.mark.parametrize("operation", ["_Clipboard", "normalize", "_fly_blacklist_type", "put"])
+def test_publish_clipboard_errors_preserve_pending_and_privacy(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    operation: str,
+) -> None:
+    cb, _, _ = harness
+    before = cb.snapshot(False)
+    pending = paste._PendingRestore(before, False)
+    monkeypatch.setattr(paste, "_pending", pending)
+    monkeypatch.setattr(paste, "_last_clipboard_snapshot", before)
+    private = "ПРИВАТНАЯ-ФРАЗА"
+    error = Mock(side_effect=RuntimeError(private))
+    monkeypatch.setattr(cb if operation == "put" else paste, operation, error)
+    caplog.set_level("DEBUG", logger=paste.__name__)
+
+    assert paste.publish_clipboard(private, session_kind=session.SessionKind.FLY) is False
+
+    error.assert_called_once()
+    assert cb.writes == []
+    assert paste._last_clipboard_snapshot == before
+    assert paste._pending is pending
+    assert not pending.consumed
+    assert caplog.record_tuples == [
+        (paste.__name__, 10, "не удалось опубликовать текст в буфер обмена")
+    ]
+    assert caplog.records[0].exc_info is None
+    assert caplog.records[0].args == ()
+
+
+@pytest.mark.parametrize("scenario", ["no-app", "wrong-thread"])
+def test_publish_clipboard_requires_gui_application(
+    monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    """Проверка настоящего адаптера с подменённым Qt, без создания QApplication и дисплея."""
+    from PyQt5.QtCore import QThread
+    from PyQt5.QtWidgets import QApplication
+
+    app = Mock(spec=QApplication)
+    app.thread.return_value = object()
+    monkeypatch.setattr(QApplication, "instance", lambda: None if scenario == "no-app" else app)
+    monkeypatch.setattr(QThread, "currentThread", lambda: object())
+    clipboard = Mock(side_effect=AssertionError("обращение к буферу запрещено"))
+    monkeypatch.setattr(QApplication, "clipboard", clipboard)
+
+    assert paste.publish_clipboard("Из трея", session_kind=session.SessionKind.KDE) is False
+
+    clipboard.assert_not_called()
+    assert paste._last_clipboard_snapshot is None
+    assert not paste.has_pending()
+
+
 @pytest.mark.parametrize("delay", [50, 100])
 @pytest.mark.parametrize("primary", [False, True])
 def test_restore_pending_during_auto(
@@ -791,6 +957,30 @@ def test_primary_restored_when_clipboard_is_kept(
         assert all(data.get("text/plain") != b"selection" for _, data in cb.writes)
     else:
         assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+
+
+@pytest.mark.parametrize(
+    "override_redirect", [False, True], ids=["same-class", "override-redirect"]
+)
+def test_focus_matches_rejects_foreign_focus_with_unchanged_ewmh(
+    harness: tuple[FakeClipboard, Mock, list[int]], override_redirect: bool
+) -> None:
+    """Правило фокуса проверяется напрямую на ответах X, без дисплея и пробы захвата."""
+    _, x, _ = harness
+    wm_class = ("kate", "kate")
+    target = x.d.get_input_focus.return_value.focus
+    assert paste._focus_matches(x, 42, wm_class) is True
+
+    rival = Mock(id=99)
+    rival.get_attributes.return_value.override_redirect = override_redirect
+    # Даже потомок мишени с override-redirect запрещён: проверяется именно этот флаг.
+    rival.query_tree.return_value.parent = target if override_redirect else x.root
+    assert x.wm_class(int(rival.id)) == x.wm_class(42) == wm_class
+    x.d.get_input_focus.return_value.focus = rival
+
+    assert x.active_window() == 42
+    assert paste._focus_matches(x, 42, wm_class) is False
+    assert x.active_window() == 42
 
 
 @pytest.mark.parametrize(

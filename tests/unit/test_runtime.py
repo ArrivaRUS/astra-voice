@@ -10,7 +10,7 @@ from unittest.mock import Mock, call
 
 import pytest
 from PyQt5 import sip
-from PyQt5.QtCore import QEventLoop, QMimeData, QObject, Qt
+from PyQt5.QtCore import QEventLoop, QObject, Qt
 
 from astra_voice import runtime as module
 from astra_voice.core.dictation import (
@@ -33,7 +33,7 @@ from astra_voice.platform.hotkey import (
     HotkeyState,
     ResultCode,
 )
-from astra_voice.platform.paste import KDE_HINT, PasteMode, PasteOutcomeKind, normalize
+from astra_voice.platform.paste import PasteMode, PasteOutcomeKind, normalize
 from astra_voice.platform.session import SessionKind
 from astra_voice.runtime import DictationRuntime
 from astra_voice.ui.pill import PillState
@@ -104,6 +104,7 @@ class Rig:
         settings: Settings | None = None,
         *,
         hotkey_factory: Callable[[], HotkeyManager] | None = None,
+        session_kind: SessionKind = SessionKind.FLY,
     ) -> None:
         self.trace: list[str] = []
         self.fail_at: str | None = None
@@ -143,6 +144,7 @@ class Rig:
         self.application.clipboard.return_value = self.clipboard
         self.notify = Mock()
         self.paste = Mock(return_value=Mock(kind=PasteOutcomeKind.PASTED))
+        self.publish_clipboard = Mock(return_value=True)
         self.restore_paste = Mock(side_effect=self.restore_pending)
         self.atexit_register = Mock()
         self.atexit_unregister = Mock(side_effect=lambda callback: self.record("atexit.unregister"))
@@ -157,7 +159,8 @@ class Rig:
             DictationRuntime, "_drain_worker_events", lambda runtime: self.record("worker.drain")
         )
         monkeypatch.setattr(module, "monotonic", lambda: self.now)
-        monkeypatch.setattr(module, "QApplication", self.application)
+        monkeypatch.setattr("PyQt5.QtWidgets.QApplication.clipboard", self.application.clipboard)
+        monkeypatch.setattr(module, "publish_clipboard", self.publish_clipboard)
         monkeypatch.setattr(module, "notify", self.notify)
         monkeypatch.setattr(atexit, "register", self.atexit_register)
         monkeypatch.setattr(atexit, "unregister", self.atexit_unregister)
@@ -168,7 +171,7 @@ class Rig:
         )
         self.runtime = DictationRuntime(
             settings=settings if settings is not None else Settings(),
-            session_kind=SessionKind.FLY,
+            session_kind=session_kind,
             supervisor_factory=self.supervisor_factory,
             pill_factory=self.pill_factory,
             tray_factory=self.tray_factory,
@@ -548,29 +551,41 @@ def test_fired_timer_is_deleted(rig: Rig) -> None:
 
 
 @pytest.mark.parametrize("text", [MARKER, f"{MARKER}\r\nстрока\rещё\n\x00\t\x1b"])
+@pytest.mark.parametrize("session_kind", [SessionKind.KDE, SessionKind.FLY])
+@pytest.mark.parametrize("published", [True, False])
 def test_copy_last_only_touches_clipboard(
-    rig: Rig, caplog: pytest.LogCaptureFixture, text: str
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    text: str,
+    session_kind: SessionKind,
+    published: bool,
 ) -> None:
-    """T-58 (docs/test-plan.md): MIME с secret, без фразы в логе/уведомлениях; Fly TODO."""
+    """T-58: публикация для текущего сеанса; отказ безопасен, фраза не раскрывается."""
+    rig = Rig(monkeypatch, session_kind=session_kind)
+    rig.publish_clipboard.return_value = published
     with caplog.at_level(logging.DEBUG):
         assert rig.runtime.last_text is None
         rig.tray.on_copy_last()
+        rig.publish_clipboard.assert_not_called()
         rig.application.clipboard.assert_not_called()
         assert rig.clipboard.mock_calls == []
+        assert caplog.records == []
         rig.runtime.start()
         rig.recognize(text)
         rig.tray.on_copy_last()
-    rig.application.clipboard.assert_called_once_with()
-    rig.clipboard.setMimeData.assert_called_once()
-    md = rig.clipboard.setMimeData.call_args.args[0]
-    assert isinstance(md, QMimeData)
-    assert md.hasFormat("text/plain")
-    assert bytes(md.data("text/plain")) == normalize(text).encode("utf-8")
-    assert md.text() == normalize(text)
-    assert md.hasFormat(KDE_HINT)
-    assert bytes(md.data(KDE_HINT)) == b"secret"
-    rig.clipboard.setMimeData.assert_called_once_with(md)
+    rig.publish_clipboard.assert_called_once_with(normalize(text), session_kind=session_kind)
+    rig.application.clipboard.assert_not_called()
+    rig.clipboard.setMimeData.assert_not_called()
     rig.clipboard.setText.assert_not_called()
+    assert rig.clipboard.mock_calls == []
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    if published:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1
+        assert warnings[0].name == module.__name__
+        assert warnings[0].levelno == logging.WARNING
+        assert warnings[0].getMessage() == "Не удалось скопировать последний текст в буфер обмена"
     rig.notify.assert_not_called()
     assert rig.notify.mock_calls == []
     assert MARKER not in caplog.text

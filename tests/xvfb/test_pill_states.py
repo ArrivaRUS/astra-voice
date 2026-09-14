@@ -2,16 +2,18 @@
 
 xvfb в системе не установлен. Запуск без X-сервера:
 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software pytest -m xvfb.
-Снимки в design/refs/impl/pill/ могут включать поля тени окна (offscreen) или
-содержать только пилюлю (композитор). Тест поддерживает оба режима; сама пилюля
-имеет высоту 36. Проверка тени отдельно пропускается, если поля не попали в кадр.
+Снимки всегда включают поля тени 18/18/18/24 px и принимаются только при альфе
+фона 240 ± 1 в центре пилюли. Все 10 PNG публикуются из временного каталога
+атомарной заменой каждого файла только после успешных проверок всего модуля.
 Референс design/refs/09-pill.png проверяется на наличие, без попиксельного сравнения.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from math import ceil, floor
@@ -86,8 +88,40 @@ def visual_tree(root: Any) -> Iterator[Any]:
         yield from visual_tree(child)
 
 
+def pill_background_alpha(image: Any, pill_width: float, pill_height: float) -> int:
+    """Альфа фона в центре, без вклада наложенных букв и иконок.
+
+    Берём минимум на центральной вертикали в средней половине высоты пилюли:
+    текст повышает альфу, а свободный фон остаётся виден над/под глифами.
+    Скругления, края и внешняя тень в эту область не попадают.
+    """
+    dpr = image.devicePixelRatio()
+    center_x = floor((18 + pill_width / 2) * dpr)
+    top = floor((18 + pill_height / 4) * dpr)
+    bottom = ceil((18 + pill_height * 3 / 4) * dpr)
+    return min(int(image.pixelColor(center_x, y).alpha()) for y in range(top, bottom))
+
+
+def assert_saved_snapshot(state: str, rendered: RenderedState) -> None:
+    from PyQt5.QtGui import QImage
+
+    snapshot = rendered.snapshot
+    assert snapshot is not None and snapshot.is_file(), f"{state}: отсутствует PNG"
+    image = QImage(str(snapshot))
+    assert not image.isNull(), f"повреждён PNG: {snapshot}"
+    expected_size = (ceil(rendered.width) + 36, ceil(rendered.height) + 42)
+    actual_size = (image.width(), image.height())
+    assert actual_size == expected_size, (
+        f"{state}: размер PNG {actual_size}, ожидался {expected_size}"
+    )
+    alpha = pill_background_alpha(image, rendered.width, rendered.height)
+    assert abs(alpha - 240) <= 1, (
+        f"{state}: альфа фона PNG в центре {alpha}, ожидалась 240 ± 1; размер {actual_size}"
+    )
+
+
 def capture_state(
-    app: Any, state: str, *, text: str | None = None, snapshot_dir: Path = SNAPSHOTS
+    app: Any, state: str, *, text: str | None = None, snapshot_dir: Path
 ) -> RenderedState:
     from PyQt5 import sip
     from PyQt5.QtCore import QPointF, QUrl, qInstallMessageHandler
@@ -124,20 +158,24 @@ def capture_state(
             if text is None and state == "error":
                 text = LABELS[state]
             pill.show_state(PillState(state), text=text)
-        # Завершаем переход opacity (160/120 мс), Row polish и загрузку глифов.
+        # Даём время на Row polish и глифы; завершение появления проверяем по PNG ниже.
         QTest.qWait(180)
         app.processEvents()
         assert root.property("avState") == state
         pill_width = float(root.property("pillWidth"))
         pill_height = float(root.property("pillHeight"))
+        expected_size = (ceil(pill_width) + 36, ceil(pill_height) + 42)
+        window_size = (view.width(), view.height())
+        assert window_size == expected_size, (
+            f"{state}: размер окна {window_size}, ожидался {expected_size}"
+        )
 
         snapshot = None
         shadow_present = None
         if state not in INVISIBLE:
             assert view.isVisible() and view.isExposed()
-            # Ширина QML может быть дробной; окно округляет её вверх до целого px.
-            with_shadow = (ceil(pill_width) + 36, 78)
-            pill_only = (ceil(pill_width), 36)
+            origin = root.mapToItem(view.contentItem(), QPointF(0, 0))
+            assert (origin.x(), origin.y()) == (18, 18), f"{state}: неверные поля пилюли"
             grab = None
             for attempt in range(1, 21):
                 if attempt > 1:
@@ -153,42 +191,34 @@ def capture_state(
                             # Готовый, но неподходящий кадр нужно снять заново.
                             grab = None
                 dpr = image.devicePixelRatio()
-                actual_size = (image.width() / dpr, image.height() / dpr)
+                actual_size = (image.width(), image.height())
+                alpha = None
                 if image.isNull():
                     failure = "пустой снимок"
                     if grab is None:
                         failure += "; grabToImage не запустился"
                     continue
-                if actual_size not in (with_shadow, pill_only):
+                if actual_size != expected_size:
                     failure = "недопустимый размер снимка"
                     continue
-                # В полном окне начало берём из дерева, в обрезанном кадре оно равно (0, 0).
-                origin = (
-                    root.mapToItem(view.contentItem(), QPointF(0, 0))
-                    if actual_size == with_shadow
-                    else QPointF(0, 0)
-                )
-                left = ceil(origin.x() * dpr)
-                right = min(image.width(), ceil((origin.x() + pill_width) * dpr))
-                center_y = floor((origin.y() + pill_height / 2) * dpr)
-                if any(image.pixelColor(x, center_y).alpha() > 0 for x in range(left, right)):
+                alpha = pill_background_alpha(image, pill_width, pill_height)
+                if abs(alpha - 240) <= 1:
                     break
-                failure = "полностью прозрачная пилюля на снимке"
+                failure = "фон пилюли не достиг альфы 240 ± 1"
             else:
                 pytest.fail(
                     f"{state}: {failure}; размер снимка {actual_size} (DPR={dpr}); "
-                    f"ожидалось окно с полем тени {with_shadow} или только пилюля {pill_only}; "
+                    f"альфа фона в центре: {alpha}; ожидался размер {expected_size}; "
                     f"QML pillWidth={pill_width}, pillHeight={pill_height}; попыток: {attempt}"
                 )
-            if actual_size == with_shadow:
-                center_x = floor((origin.x() + pill_width / 2) * dpr)
-                bottom = ceil((origin.y() + pill_height) * dpr)
-                # Под центром пилюли должна быть полупрозрачная чёрная внешняя тень.
-                shadow_present = any(
-                    0 < (pixel := image.pixelColor(center_x, y)).alpha() < 255
-                    and pixel.red() == pixel.green() == pixel.blue() == 0
-                    for y in range(bottom, image.height())
-                )
+            center_x = floor((origin.x() + pill_width / 2) * dpr)
+            bottom = ceil((origin.y() + pill_height) * dpr)
+            # Под центром пилюли должна быть полупрозрачная чёрная внешняя тень.
+            shadow_present = any(
+                0 < (pixel := image.pixelColor(center_x, y)).alpha() < 255
+                and pixel.red() == pixel.green() == pixel.blue() == 0
+                for y in range(bottom, image.height())
+            )
             snapshot_dir.mkdir(parents=True, exist_ok=True)
             snapshot = snapshot_dir / f"{state}.png"
             assert image.save(str(snapshot), "PNG"), f"не удалось сохранить {snapshot}"
@@ -250,9 +280,28 @@ def capture_state(
 
 
 @pytest.fixture(scope="module")
-def rendered_states(pill_app: Any) -> dict[str, RenderedState]:
+def rendered_states(
+    pill_app: Any, request: pytest.FixtureRequest
+) -> Iterator[dict[str, RenderedState]]:
     # Общая фикстура гарантирует снимки и при отдельном запуске теста референса.
-    return {state: capture_state(pill_app, state) for state in LABELS}
+    staging = Path(tempfile.mkdtemp(prefix=".pill-", dir=SNAPSHOTS.parent))
+    failures_before = request.session.testsfailed
+    try:
+        rendered = {state: capture_state(pill_app, state, snapshot_dir=staging) for state in LABELS}
+        expected = {f"{state}.png" for state in LABELS if state not in INVISIBLE}
+        assert len(expected) == 10
+        assert {path.name for path in staging.glob("*.png")} == expected
+        assert {path.name for path in SNAPSHOTS.glob("*.png")} <= expected
+        for state in LABELS.keys() - INVISIBLE:
+            assert_saved_snapshot(state, rendered[state])
+        yield rendered
+        # При ошибке съёмки или любой проверки модуля прежние PNG остаются нетронутыми.
+        if request.session.testsfailed == failures_before:
+            SNAPSHOTS.mkdir(parents=True, exist_ok=True)
+            for name in sorted(expected):
+                os.replace(staging / name, SNAPSHOTS / name)
+    finally:
+        shutil.rmtree(staging)
 
 
 def assert_pill_geometry_and_text(state: str, rendered: RenderedState) -> None:
@@ -293,7 +342,8 @@ def test_pill_state(state: str, rendered_states: dict[str, RenderedState]) -> No
         assert rendered.snapshot is None
         assert not (SNAPSHOTS / f"{state}.png").exists()
     else:
-        assert rendered.snapshot == SNAPSHOTS / f"{state}.png"
+        assert rendered.snapshot is not None
+        assert rendered.snapshot.name == f"{state}.png"
         assert rendered.snapshot.is_file()
 
     if state in {"listening", "listening-silent", "limit"}:
@@ -310,20 +360,14 @@ def test_pill_state(state: str, rendered_states: dict[str, RenderedState]) -> No
         assert [height for _, _, height, _ in rendered.bars] == [
             max(3, floor(level * 20 + 0.5)) for level in LEVELS
         ]
-    elif state == "listening-silent":
+    elif state in {"listening-silent", "limit"}:
         assert len(rendered.bars) == 9
         assert all(height == 4 for _, _, height, _ in rendered.bars)
-    elif state == "limit":
-        assert all(
-            height == max(3, floor(level * 20 + 0.5)) for _, level, height, _ in rendered.bars
-        )
 
 
 @pytest.mark.parametrize("state", [state for state in LABELS if state not in INVISIBLE])
 def test_pill_snapshot_shadow(state: str, rendered_states: dict[str, RenderedState]) -> None:
     rendered = rendered_states[state]
-    if rendered.shadow_present is None:
-        pytest.skip(f"{state}: снимок содержит только пилюлю, поле тени не попало в кадр")
     assert rendered.shadow_present, f"{state}: поле есть в снимке, но внешняя тень отсутствует"
 
 
@@ -344,12 +388,10 @@ def test_clipboard_window_changed_label(pill_app: Any, tmp_path: Path) -> None:
 
 
 def test_design_reference_and_snapshots_exist(rendered_states: dict[str, RenderedState]) -> None:
-    from PyQt5.QtGui import QImage
-
     assert (REPO / "design/refs/09-pill.png").is_file()
     expected = {f"{state}.png" for state in LABELS if state not in INVISIBLE}
-    assert {path.name for path in SNAPSHOTS.glob("*.png")} == expected
+    snapshots = [rendered.snapshot for rendered in rendered_states.values() if rendered.snapshot]
+    assert len(snapshots) == len(expected) == 10
+    assert {path.name for path in snapshots[0].parent.glob("*.png")} == expected
     for state in LABELS.keys() - INVISIBLE:
-        snapshot = rendered_states[state].snapshot
-        assert snapshot is not None and snapshot.is_file()
-        assert not QImage(str(snapshot)).isNull(), f"повреждён PNG: {snapshot}"
+        assert_saved_snapshot(state, rendered_states[state])

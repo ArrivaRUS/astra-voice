@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from astra_voice.platform import session
+from astra_voice.platform.session import SessionKind
 from astra_voice.platform.x11 import X11Display
 
 log = logging.getLogger(__name__)
@@ -293,6 +294,27 @@ def _publish(cb: _Clipboard, snapshot: dict[str, bytes], primary: bool) -> None:
     cb.put(snapshot, primary)
     if not primary:
         _last_clipboard_snapshot = snapshot.copy()
+
+
+def publish_clipboard(text: str, *, session_kind: SessionKind) -> bool:
+    """Опубликовать текст из трея и запомнить владение для следующей AUTO-вставки.
+
+    Требует GUI-потока живого QApplication. Только CLIPBOARD, без ожиданий
+    и изменения _pending; ошибки возвращают False без приватных данных в логе.
+    """
+    try:
+        cb = _Clipboard()
+        out = {
+            "text/plain": normalize(text).encode("utf-8", errors="replace"),
+            KDE_HINT: b"secret",
+        }
+        if session_kind == SessionKind.FLY:
+            out.setdefault(_fly_blacklist_type(occupied=out), b"")
+        _publish(cb, out, False)
+        return True
+    except Exception:
+        log.debug("не удалось опубликовать текст в буфер обмена")
+        return False
 
 
 def _restore(

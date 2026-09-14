@@ -11,7 +11,7 @@ from math import ceil
 from time import monotonic, perf_counter
 from typing import Any, Final
 
-from PyQt5.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer, QUrl
+from PyQt5.QtCore import QEvent, QMetaObject, QObject, QPoint, QRect, Qt, QTimer, QUrl
 from PyQt5.QtGui import QGuiApplication, QRegion, QScreen
 from PyQt5.QtQuick import QQuickView
 
@@ -137,7 +137,9 @@ class Pill(QObject):
         self.destroyed.connect(self._view.deleteLater)
         self._view.setFlags(_WINDOW_FLAGS)
         self._view.setColor(Qt.transparent)
-        self._view.setResizeMode(QQuickView.SizeViewToRootObject)
+        # SizeViewToRootObject запускает нулевой таймер и позже срезает поля до
+        # размеров контента. Размером окна владеет Python; QML рисует по pillWidth/Height.
+        self._view.setResizeMode(QQuickView.SizeRootObjectToView)
         self._view.setSource(
             qml_url if qml_url is not None else QUrl.fromLocalFile(str(qml_dir() / "Pill.qml"))
         )
@@ -148,10 +150,10 @@ class Pill(QObject):
         self._root.detailsClicked.connect(self._details_clicked)
         self._root.setProperty("x", _SHADOW_MARGIN)
         self._root.setProperty("y", _SHADOW_MARGIN)
-        # Row пересчитывает ширину на этапе polish. Добавляем поля после встроенного
-        # изменения размера QQuickView, иначе оно снова обрежет окно до размеров Item.
-        self._root.widthChanged.connect(self._resize, Qt.QueuedConnection)
-        self._root.heightChanged.connect(self._resize, Qt.QueuedConnection)
+        # Запасной путь для изменений контента/экрана вне show_state. Каждый show()
+        # сам синхронно завершает компоновку и задаёт размер, не ожидая этих сигналов.
+        self._root.pillWidthChanged.connect(self._resize, Qt.QueuedConnection)
+        self._root.pillHeightChanged.connect(self._resize, Qt.QueuedConnection)
         self._view.widthChanged.connect(self._resize, Qt.QueuedConnection)
         self._view.heightChanged.connect(self._resize, Qt.QueuedConnection)
         self._view.visibleChanged.connect(self._visibility_changed)
@@ -219,6 +221,11 @@ class Pill(QObject):
     def state(self) -> PillState:
         return self._state
 
+    @property
+    def window_size(self) -> tuple[int, int]:
+        """Фактический размер окна, без компоновки и обработки отложенных сигналов."""
+        return int(self._view.width()), int(self._view.height())
+
     def set_enabled(self, value: bool) -> None:
         self._enabled = value
         self._render()
@@ -251,7 +258,6 @@ class Pill(QObject):
             self._prepare_x11()
             self._update_compatibility_mode()
             self._refresh_compositor()
-            self._resize()
             self._show_window()
             if show_started is not None:
                 elapsed_ms = (perf_counter() - show_started) * 1000
@@ -271,6 +277,7 @@ class Pill(QObject):
             self._wait_for_exposure()
             # WM удаляет свойства при withdraw; они нужны перед каждым новым map.
             self._apply_ewmh()
+        self._resize()
         self._view.show()
 
     def _wait_for_exposure(self) -> None:
@@ -331,6 +338,11 @@ class Pill(QObject):
             self.hide()
 
     def _resize(self) -> None:
+        # В Qt 5 Item.polish() лишь планирует работу на кадр. QML forceLayout()
+        # сначала завершает Text, затем Row: так pillWidth уже учитывает подпись,
+        # иконку и кнопки текущего состояния. DirectConnection не качает события,
+        # не ждёт первого кадра и не пересоздаёт заранее загруженную сцену.
+        QMetaObject.invokeMethod(self._root, "forceLayout", Qt.DirectConnection)
         self._view.resize(
             ceil(float(self._root.property("pillWidth"))) + _SHADOW_MARGIN * 2,
             ceil(float(self._root.property("pillHeight"))) + _SHADOW_MARGIN * 2 + _SHADOW_OFFSET_Y,

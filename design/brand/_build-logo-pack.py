@@ -241,8 +241,8 @@ def svg_tray(S, light=None, dark=None, mono=False, ring=False):
         acc_fill = "currentColor"
         acc_cls = "ColorScheme-Text"
     else:
-        acc_css = ('.st{fill:%s}@media (prefers-color-scheme:dark){.st{fill:%s}}'
-                   % (light, dark))
+        # KDE заменяет current-color-scheme: цвет состояния (§9.1) хранится отдельно.
+        acc_css = '<style type="text/css">.st{fill:%s}</style>' % light
         acc_fill = light
         acc_cls = "st"
     body = []
@@ -267,7 +267,7 @@ def svg_tray(S, light=None, dark=None, mono=False, ring=False):
     return (
         '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d">'
         '<style id="current-color-scheme" type="text/css">.ColorScheme-Text{color:#232629}'
-        '@media (prefers-color-scheme:dark){.ColorScheme-Text{color:#eff0f1}}%s</style>'
+        '@media (prefers-color-scheme:dark){.ColorScheme-Text{color:#eff0f1}}</style>%s'
         '%s</svg>\n' % (S, S, S, S, acc_css, "".join(body)))
 
 
