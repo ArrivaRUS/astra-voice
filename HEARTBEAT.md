@@ -46,7 +46,7 @@
 2. Повтор Ц2 у заказчика с «ок» (~25 мин): цель p95 ≤ 500 мс; затем ручные T-50/T-56/T-58, пробник `Ctrl+Alt+Space` после остановки Handy
    (S18-A9) → **M4 ✅**.
 3. Спайки S6-a/S6-b (движок/AMX) → `dual-architect` → решение → ИБ T2. M5 → R1 v0.1 (30.09); мастер-ключ до 25.09; M0 Fly при перелогине.
-4. Отложено: nit'ы ревью №1–5 (см. status.md); `xvfb` на машину — вопрос; `09-tray-dark.png`; `_visibility_changed`.
+4. Отложено: побочные находки отладчика — сторож отмены `engine.py:567–582` (`cancel.wait(0.05)` не будится `stopped`, до 50 мс), join потока захвата до 20 мс, SIGSEGV на SIGTERM в изолированном стенде («shared QObject was deleted directly»); nit'ы ревью №1–5 (см. status.md); `xvfb` на машину — вопрос; `09-tray-dark.png`; `_visibility_changed`.
 
 Команды заказчику (KDE): установка — `sudo apt install ~/Desktop/astra-voice_<версия>_amd64.deb`; Handy держит `Ctrl+Space`:
 `systemctl --user stop app-Handy@autostart.service` (вернуть — `start`); запуск — `astra-voice`; перед новой сборкой — «Выход» из трея.
