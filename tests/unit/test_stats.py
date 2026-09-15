@@ -513,7 +513,8 @@ def test_runtime_timer_flushes_without_new_append(
         if count == 1:
             assert not path.exists()
         else:
-            assert len(json.loads(path.read_text())["events"]) == count - 1
+            events = json.loads(path.read_text())["events"]
+            assert len([event for event in events if event["type"] == "dictation"]) == count - 1
         timer.fire()
         assert flush.call_count == count
         assert json.loads(path.read_text())["events"] == stats.events()
@@ -541,3 +542,79 @@ def test_runtime_stats_timer_retries_after_save_failure(
     timer.fire()
     assert json.loads(path.read_text())["events"] == stats.events()
     rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("result", ["ok", "fail"])
+def test_model_selfcheck_schema_roundtrips(path: Path, result: str) -> None:
+    stats = st.Stats()
+    fields = dict(
+        model_id="gigaam",
+        revision="r3",
+        result=result,
+        engine_version="1.24.4",
+        cpu_model="Intel Xeon",
+    )
+    stats.append("model_selfcheck", **fields)
+    stats.flush()
+    event = st.Stats().events()[0]
+    assert event == {"type": "model_selfcheck", "ts": event["ts"], **fields}
+
+
+@pytest.mark.parametrize("key_role", ["text", "command"])
+@pytest.mark.parametrize("result", ["ok", "busy", "regrabbed"])
+@pytest.mark.parametrize("attempts", [0, 1, 2.5])
+def test_hotkey_grab_schema(key_role: str, result: str, attempts: int | float) -> None:
+    stats = st.Stats()
+    stats.append("hotkey_grab", key_role=key_role, result=result, attempts=attempts)
+    event = stats.events()[0]
+    assert event == {
+        "type": "hotkey_grab",
+        "ts": event["ts"],
+        "key_role": key_role,
+        "result": result,
+        "attempts": attempts,
+    }
+
+
+@pytest.mark.parametrize("kind", ["device-changed", "device-lost"])
+def test_microphone_device_events(kind: str) -> None:
+    stats = st.Stats()
+    stats.append("mic_error", kind=kind, recovered_by="none")
+    event = stats.events()[0]
+    assert event == {"type": "mic_error", "ts": event["ts"], "kind": kind, "recovered_by": "none"}
+
+
+@pytest.mark.parametrize(
+    ("event_type", "fields"),
+    [
+        ("model_selfcheck", {"result": "garbage"}),
+        ("model_selfcheck", {"result": True}),
+        ("model_selfcheck", {"engine_version": 123}),
+        ("model_selfcheck", {"cpu_model": []}),
+        ("hotkey_grab", {"key_role": "garbage"}),
+        ("hotkey_grab", {"result": "garbage"}),
+        ("mic_error", {"kind": "device-garbage"}),
+        *[
+            ("hotkey_grab", {"attempts": value})
+            for value in (True, -1, "2", None, float("nan"), float("inf"))
+        ],
+    ],
+)
+def test_new_schema_rejects_invalid_values(event_type: str, fields: dict[str, object]) -> None:
+    stats = st.Stats()
+    with pytest.raises(ValueError):
+        stats.append(event_type, **fields)
+    assert stats.events() == []
+
+
+@pytest.mark.parametrize("event_type", ["model_selfcheck", "hotkey_grab"])
+def test_new_schema_discards_unknown_fields(
+    path: Path, caplog: pytest.LogCaptureFixture, event_type: str
+) -> None:
+    stats = st.Stats()
+    stats.append(event_type, text="private-content", garbage="private-content")
+    event = stats.events()[0]
+    assert event == {"type": event_type, "ts": event["ts"]}
+    stats.flush()
+    assert "private-content" not in path.read_text()
+    assert "private-content" not in caplog.text

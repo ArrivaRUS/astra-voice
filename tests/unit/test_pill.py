@@ -30,12 +30,15 @@ from astra_voice.ui.pill import (
     CLIPBOARD_REASONS,
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
+    ERROR_MICROPHONE_CHANGED,
+    ERROR_MICROPHONE_LOST,
     ERROR_MICROPHONE_UNAVAILABLE,
     ERROR_MODEL_LOAD_FAILED,
     ERROR_MODEL_NOT_LOADED,
     ERROR_REASONS,
     ERROR_RECOGNITION_FAILED,
     ERROR_RECOGNITION_RESTARTED,
+    ERROR_SELFCHECK_FAILED,
     STATE_DURATION_MS,
     Pill,
     PillState,
@@ -894,19 +897,25 @@ def test_registered_error_reasons_reach_qml(
 def test_error_registry_is_exact() -> None:
     assert ERROR_REASONS == {
         "Микрофон недоступен",
+        "Микрофон сменился",
+        "Микрофон отключился",
         "Распознавание перезапущено",
         "Буфер очищен",
         "Не удалось распознать",
         "Модель не загружена",
         "Не удалось загрузить модель",
+        "Распознавание не работает",
     }
     assert ERROR_REASONS == {
         ERROR_MICROPHONE_UNAVAILABLE,
+        ERROR_MICROPHONE_CHANGED,
+        ERROR_MICROPHONE_LOST,
         ERROR_RECOGNITION_RESTARTED,
         ERROR_BUFFER_CLEARED,
         ERROR_RECOGNITION_FAILED,
         ERROR_MODEL_NOT_LOADED,
         ERROR_MODEL_LOAD_FAILED,
+        ERROR_SELFCHECK_FAILED,
     }
 
 

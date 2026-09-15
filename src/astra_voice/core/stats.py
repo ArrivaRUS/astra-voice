@@ -24,6 +24,8 @@ Event = dict[str, str | int | float | bool]
 _FIELDS: dict[str, frozenset[str]] = {
     "dictation": frozenset({"model_id", "audio_ms", "t_ms", "paste_ms", "cold", "result"}),
     "model_measure": frozenset({"model_id", "revision", "peak_rss_mb", "threads", "cpu"}),
+    "model_selfcheck": frozenset({"model_id", "revision", "result", "engine_version", "cpu_model"}),
+    "hotkey_grab": frozenset({"key_role", "result", "attempts"}),
     "mic_error": frozenset({"kind", "recovered_by"}),
     "update_check": frozenset({"source", "result"}),
     "update_apply": frozenset({"kind", "track", "result"}),
@@ -31,14 +33,17 @@ _FIELDS: dict[str, frozenset[str]] = {
 }
 _CHOICES = {
     ("dictation", "result"): ("ok", "empty", "cancelled"),
-    ("mic_error", "kind"): ("none", "busy", "silent", "other"),
+    ("model_selfcheck", "result"): ("ok", "fail"),
+    ("hotkey_grab", "key_role"): ("text", "command"),
+    ("hotkey_grab", "result"): ("ok", "busy", "regrabbed"),
+    ("mic_error", "kind"): ("none", "busy", "silent", "other", "device-changed", "device-lost"),
     ("mic_error", "recovered_by"): ("restart_wireplumber", "retry", "none"),
     ("update_check", "source"): ("models", "app", "catalog"),
     ("update_check", "result"): ("ok", "none", "unavailable", "ratelimit"),
     ("update_apply", "kind"): ("model", "app"),
     ("update_apply", "track"): ("A", "B", "file"),
 }
-_NUMBERS = frozenset({"audio_ms", "t_ms", "paste_ms", "peak_rss_mb", "duration_s"})
+_NUMBERS = frozenset({"audio_ms", "t_ms", "paste_ms", "peak_rss_mb", "duration_s", "attempts"})
 
 
 class Summary(TypedDict):

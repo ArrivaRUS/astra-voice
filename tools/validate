@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Проверки вех Astra Voice: отмена через IPC и диктовка без GUI и хоткея.
+"""Проверки Astra Voice: IPC, диктовка, загрузки и запрет сети без GUI и хоткея.
 
     tools/validate worker-cancel --model-dir /путь/к/модели --json
     tools/validate dictation --virtual-mic --silence 3
+    tools/validate downloads --faults
+    tools/validate privacy --network-denied --json
 
 Коды возврата: 0 — уложились, 1 — нарушен критерий, 2 — прогон невозможен.
 Проверяется интервал record.cancel → cancelled, а не остановка всех вызовов ORT.
@@ -11,17 +13,25 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import wave
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -554,6 +564,408 @@ def dictation(args: argparse.Namespace) -> int:
     return code
 
 
+@contextmanager
+def isolated_network_environment() -> Iterator[None]:
+    """На время прогона убирает прокси и внешний offline, затем возвращает их."""
+    saved = {
+        name: value
+        for name, value in os.environ.items()
+        if name.lower().endswith("_proxy") or name == "HF_HUB_OFFLINE"
+    }
+    try:
+        for name in saved:
+            del os.environ[name]
+        yield
+    finally:
+        os.environ.update(saved)
+
+
+def network_report(
+    args: argparse.Namespace, checks: list[Message], notes: list[str], error: str = ""
+) -> int:
+    """Печатает ожидания, факты и общий вердикт одним текстом либо JSON-объектом."""
+    passed = sum(bool(check["passed"]) for check in checks)
+    code = 2 if error else int(passed != len(checks))
+    verdict = {0: "ожидания совпали", 1: "есть несовпадения", 2: "прогон невозможен"}[code]
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "command": args.command,
+                    "checks": checks,
+                    "notes": notes,
+                    "passed": passed,
+                    "total": len(checks),
+                    "verdict": verdict,
+                    "explanation": error,
+                    "exit_code": code,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    else:
+        for note in notes:
+            print(note)
+        for check in checks:
+            result = "совпало" if check["passed"] else "НЕ СОВПАЛО"
+            print(
+                f"{check['name']}: ожидание — {check['expected']}; "
+                f"факт — {check['actual']}; вердикт — {result}."
+            )
+        print(f"Итог: {passed}/{len(checks)}; {verdict}; код {code}.")
+        if error:
+            print(error)
+    return code
+
+
+def downloads(args: argparse.Namespace) -> int:
+    """Проверяет настоящий Downloader на локальном сервере с повреждёнными ответами."""
+    checks: list[Message] = []
+    notes = [
+        "Способ: настоящий Downloader и TCP-сервер на 127.0.0.1, случайный порт.",
+        "Байты считаются на выходе настоящего StreamResponse.iter_chunks; "
+        "внешний транспорт перехватывается до DNS и соединения.",
+    ]
+    try:
+        import requests
+
+        from astra_voice.models.catalog import CatalogEntry, FileSpec
+        from astra_voice.models.downloader import Downloader, DownloadError
+        from astra_voice.models.store import ModelStore
+        from astra_voice.net import http
+        from astra_voice.net.gate import NetworkGate, NetworkKind
+        from astra_voice.net.http import HttpClient, NetworkError, StreamResponse
+    except ImportError as exc:
+        return network_report(args, checks, notes, f"Не удалось загрузить зависимости: {exc}")
+
+    # Половина кратна блоку Downloader: обрыв оставляет уже прочитанные данные на диске.
+    body = bytes(range(256)) * 512
+    size, half = len(body), len(body) // 2
+    digest = hashlib.sha256(body).hexdigest()
+    seen: list[tuple[str, str | None, int]] = []
+    bytes_read = 0
+    foreign_attempts = 0
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            mode = self.path.removeprefix("/")
+            range_header = self.headers.get("Range")
+            first = not any(path == self.path for path, _, _ in seen)
+            interrupted = mode == "truncated" or (mode in {"resume-206", "no-range-200"} and first)
+            payload, status = body, 200
+            headers: dict[str, str] = {}
+            if mode == "redirect-evil":
+                payload, status = b"", 302
+                headers["Location"] = "https://evil.example/model.bin"
+            elif mode == "tampered":
+                payload = bytes(byte ^ 255 for byte in body)
+            elif mode == "oversize":
+                payload = body + b"!"
+            elif mode == "resume-206" and range_header is not None:
+                offset = int(range_header.removeprefix("bytes=").removesuffix("-"))
+                payload, status = body[offset:], 206
+                headers["Content-Range"] = f"bytes {offset}-{size - 1}/{size}"
+            seen.append((self.path, range_header, status))
+            try:
+                self.send_response(status)
+                self.send_header(
+                    "Content-Length", str(size if mode == "oversize" else len(payload))
+                )
+                if interrupted or mode == "oversize":
+                    self.send_header("Transfer-Encoding", "chunked")
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                if interrupted:
+                    prefix = payload[:half]
+                    self.wfile.write(f"{len(prefix):x}\r\n".encode() + prefix + b"\r\n")
+                    self.wfile.flush()
+                    # Нет завершающего chunk: urllib3 1.26 тоже видит обрыв.
+                    self.close_connection = True
+                elif mode == "oversize":
+                    self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n")
+                else:
+                    self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, format: str, *args: object) -> None:
+            """Служебный журнал сервера не попадает в отчёт."""
+
+    original_send = requests.adapters.HTTPAdapter.send
+    original_chunks = StreamResponse.iter_chunks
+
+    def local_send(
+        self: requests.adapters.HTTPAdapter, request: requests.PreparedRequest, **kwargs: Any
+    ) -> requests.Response:
+        nonlocal foreign_attempts
+        if urlsplit(request.url).netloc != local_host:
+            foreign_attempts += 1
+            raise NetworkError("transport-intercepted", "Перехвачена попытка выхода наружу.")
+        return original_send(self, request, **kwargs)
+
+    def counted_chunks(self: StreamResponse, chunk_size: int = 65536) -> Iterator[bytes]:
+        nonlocal bytes_read
+        for block in original_chunks(self, chunk_size):
+            bytes_read += len(block)
+            yield block
+
+    class LocalHttpClient(HttpClient):
+        def get_stream(
+            self,
+            url: str,
+            *,
+            range_from: int | None = None,
+            deadline_s: float,
+            cancel: threading.Event,
+            kind: NetworkKind = "download",
+        ) -> StreamResponse:
+            # Downloader собирает HTTPS; только адрес этого сервера переводим в HTTP.
+            prefix = f"https://{local_host}/"
+            if url.startswith(prefix):
+                url = "http://" + url.removeprefix("https://")
+            return super().get_stream(
+                url,
+                range_from=range_from,
+                deadline_s=min(deadline_s, 5),
+                cancel=cancel,
+                kind=kind,
+            )
+
+    server: ThreadingHTTPServer | None = None
+    thread: threading.Thread | None = None
+    local_policy = None
+    original_policy = http.ALLOWED_HOSTS, http.ALLOWED_SCHEMES, http.ALLOWED_PORTS
+    error = ""
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        local_host = f"127.0.0.1:{server.server_port}"
+        notes.append(f"Адрес сервера: http://{local_host}.")
+        # HTTPS и 443 оставляем, чтобы redirect-evil проверял именно запрет чужого хоста.
+        local_policy = patch.multiple(
+            http,
+            ALLOWED_HOSTS=("127.0.0.1",),
+            ALLOWED_SCHEMES=(*original_policy[1], "http"),
+            ALLOWED_PORTS=(*original_policy[2], server.server_port),
+        )
+        local_policy.start()
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        thread.start()
+        with (
+            isolated_network_environment(),
+            tempfile.TemporaryDirectory(prefix="astra-downloads-") as directory,
+            patch.object(requests.adapters.HTTPAdapter, "send", local_send),
+            patch.object(StreamResponse, "iter_chunks", counted_chunks),
+        ):
+            store = ModelStore(Path(directory) / "models")
+            if not store.disk_ok(size):
+                raise RuntimeError("Недостаточно свободного места для прогона.")
+            client = LocalHttpClient(
+                NetworkGate(settings.Settings(), policy.Policy()), user_agent="Astra-Voice/validate"
+            )
+            loader = Downloader(client, store)
+
+            def attempt(entry: CatalogEntry) -> str:
+                try:
+                    loader.download(entry, progress=lambda state: None, cancel=threading.Event())
+                except DownloadError as exc:
+                    return exc.code
+                return "ok"
+
+            for mode in (
+                "ok",
+                "resume-206",
+                "no-range-200",
+                "truncated",
+                "tampered",
+                "oversize",
+                "redirect-evil",
+            ):
+                entry = CatalogEntry(
+                    id=mode,
+                    revision="rev-1",
+                    name="Проверка загрузки",
+                    description="Синтетический файл локального прогона",
+                    size_bytes=size,
+                    min_ram_mb=1,
+                    layout="gigaam-rnnt",
+                    variant="int8",
+                    recommended=False,
+                    host=local_host,
+                    files=(FileSpec("model.bin", digest, size, f"/{mode}"),),
+                )
+                staging = store.staging_dir(entry.id, entry.revision)
+                target, part = staging / "model.bin", staging / "model.bin.part"
+                bytes_read, foreign_attempts = 0, 0
+
+                first_code = attempt(entry)
+                prefix_ok = part.is_file() and part.read_bytes() == body[:half]
+                code = first_code
+                resumed = mode in {"resume-206", "no-range-200"}
+                if resumed:
+                    code = attempt(entry)
+                requests_seen = [
+                    (header, status) for path, header, status in seen if path == f"/{mode}"
+                ]
+                file_ok = (
+                    target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() == digest
+                )
+                expected_code = {
+                    "truncated": "host-unreachable",
+                    "tampered": "bad-checksum",
+                    "oversize": "too-large",
+                    "redirect-evil": "not-allowed",
+                }.get(mode, "ok")
+                expected = expected_code
+                actual = f"код {code}"
+                matched = code == expected_code and foreign_attempts == 0
+                if expected_code == "ok":
+                    expected += ", верный файл и SHA-256, без .part"
+                    actual += (
+                        f", файл и SHA-256 {'верны' if file_ok else 'неверны'}, "
+                        f".part={part.exists()}"
+                    )
+                    matched &= file_ok and not part.exists()
+                if resumed:
+                    status = 206 if mode == "resume-206" else 200
+                    expected += f", сначала обрыв с половиной в .part, затем Range и {status}"
+                    actual += f", первый код {first_code}, половина сохранена={prefix_ok}"
+                    matched &= first_code == "host-unreachable" and prefix_ok
+                    matched &= requests_seen == [(None, 200), (f"bytes={half}-", status)]
+                else:
+                    matched &= requests_seen == [(None, 302 if mode == "redirect-evil" else 200)]
+                if mode == "truncated":
+                    expected += ", половина файла сохранена в .part"
+                    actual += f", половина сохранена={prefix_ok}"
+                    matched &= prefix_ok and not target.exists()
+                if mode == "oversize":
+                    expected += f", прочитано не больше {size + 1} байт"
+                    actual += f", прочитано {bytes_read} байт"
+                    matched &= 0 < bytes_read <= size + 1
+                if mode == "redirect-evil":
+                    expected += ", попыток к чужому хосту 0"
+                    actual += f", попыток к чужому хосту {foreign_attempts}"
+                actual += f", запросы (Range, статус): {requests_seen}"
+                checks.append(
+                    {"name": mode, "expected": expected, "actual": actual, "passed": matched}
+                )
+    except (OSError, RuntimeError, ValueError) as exc:
+        error = f"Не удалось выполнить прогон: {exc}"
+    finally:
+        if local_policy is not None:
+            local_policy.stop()
+        if server is not None:
+            try:
+                if thread is not None and thread.is_alive():
+                    server.shutdown()
+            finally:
+                server.server_close()
+                if thread is not None and thread.ident is not None:
+                    thread.join(timeout=3)
+                    if thread.is_alive():
+                        error = "Не удалось остановить локальный сервер."
+    return network_report(args, checks, notes, error)
+
+
+def privacy(args: argparse.Namespace) -> int:
+    """Проверяет запреты сети до первой попытки обращения к транспорту requests."""
+    checks: list[Message] = []
+    notes = [
+        "Способ: счётчик requests.adapters.HTTPAdapter.send — вход в транспорт "
+        "перехвачен раньше DNS и socket.connect; каждый вызов останавливается до сети.",
+        "Это проверка счётчиком попыток; полную проверку tcpdump выполняет человек "
+        "по docs/plans.md, раздел M5.",
+    ]
+    try:
+        import requests
+
+        from astra_voice.net.gate import NetworkGate, NetworkKind
+        from astra_voice.net.http import HttpClient, NetworkError
+    except ImportError as exc:
+        return network_report(args, checks, notes, f"Не удалось загрузить зависимости: {exc}")
+
+    attempts = 0
+
+    class TransportIntercepted(Exception):
+        """Отличает перехват транспорта от отказа настоящего HttpClient."""
+
+    def denied_send(
+        self: requests.adapters.HTTPAdapter, request: requests.PreparedRequest, **kwargs: object
+    ) -> requests.Response:
+        nonlocal attempts
+        attempts += 1
+        raise TransportIntercepted
+
+    offline = policy.Policy(values={"offline": True}, status=policy.PolicyStatus.OK)
+    online = policy.Policy(values={"offline": False}, status=policy.PolicyStatus.OK)
+    scenarios = (
+        ("по умолчанию, политика offline", settings.Settings(), offline, False),
+        (
+            "тумблеры включены, политика offline",
+            settings.Settings(check_app_updates=True, check_model_updates=True),
+            offline,
+            False,
+        ),
+        ("тумблеры выключены, политика разрешает", settings.Settings(), online, True),
+    )
+    kinds: tuple[NetworkKind, ...] = ("download", "check_app", "check_models")
+    error = ""
+    try:
+        with (
+            isolated_network_environment(),
+            patch.object(requests.adapters.HTTPAdapter, "send", denied_send),
+        ):
+            for name, config, rules, explicit_download in scenarios:
+                gate = NetworkGate(config, rules)
+                client = HttpClient(gate, user_agent="Astra-Voice/validate")
+                for kind in kinds:
+                    attempts = 0
+                    allowed, reason = gate.allowed(kind)
+                    expected_allowed = explicit_download and kind == "download"
+                    result = "ответ без ошибки"
+                    try:
+                        with client.get_stream(
+                            "https://huggingface.co/validate",
+                            deadline_s=1,
+                            cancel=threading.Event(),
+                            kind=kind,
+                        ):
+                            pass
+                    except NetworkError as exc:
+                        result = exc.code
+                    except TransportIntercepted:
+                        result = "перехват транспорта"
+                    expected_result = "перехват транспорта" if expected_allowed else "no-network"
+                    expected_attempts = int(expected_allowed)
+                    expected = (
+                        f"гейт {'открыт' if expected_allowed else 'закрыт'}, "
+                        f"{expected_result}, попыток {expected_attempts}"
+                    )
+                    actual = (
+                        f"гейт {'открыт' if allowed else 'закрыт'}, {result}, попыток {attempts}"
+                    )
+                    if reason:
+                        actual += f" ({reason})"
+                    checks.append(
+                        {
+                            "name": f"{name} / {kind}",
+                            "expected": expected,
+                            "actual": actual,
+                            "passed": allowed == expected_allowed
+                            and result == expected_result
+                            and attempts == expected_attempts,
+                        }
+                    )
+        notes.append(
+            "Разрешённый download — явное действие пользователя; "
+            "его перехват проверяет работу счётчика."
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        error = f"Не удалось выполнить прогон: {exc}"
+    return network_report(args, checks, notes, error)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Разбирает подкоманды; новые проверки добавляются отдельными обработчиками."""
     parser = argparse.ArgumentParser(description="Проверки Astra Voice без GUI")
@@ -588,8 +1000,27 @@ def main(argv: list[str] | None = None) -> int:
     dictate.add_argument("--variant", help="вариант модели вместо настройки")
     dictate.add_argument("--threads", type=positive_int, help="потоки вместо настройки (обычно 2)")
     dictate.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    download = commands.add_parser("downloads", help="проверить загрузку при сбоях сервера")
+    download.add_argument(
+        "--faults", action="store_true", required=True, help="локальный сервер-вредитель"
+    )
+    download.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    private = commands.add_parser("privacy", help="проверить запрет сетевых соединений")
+    private.add_argument(
+        "--network-denied",
+        action="store_true",
+        required=True,
+        help="проверить закрытый сетевой гейт",
+    )
+    private.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
     args = parser.parse_args(argv)
-    handlers = {"worker-cancel": worker_cancel, "dictation": dictation, "stats": stats}
+    handlers = {
+        "worker-cancel": worker_cancel,
+        "dictation": dictation,
+        "stats": stats,
+        "downloads": downloads,
+        "privacy": privacy,
+    }
     return handlers[args.command](args)
 
 

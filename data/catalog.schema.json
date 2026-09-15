@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Встроенный каталог моделей Astra Voice",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifest_version",
+    "serial",
+    "trust_epoch",
+    "generated_at",
+    "publisher",
+    "revoked",
+    "models"
+  ],
+  "properties": {
+    "manifest_version": {
+      "type": "integer",
+      "enum": [1]
+    },
+    "serial": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "trust_epoch": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 40,
+      "format": "date-time"
+    },
+    "publisher": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "revoked": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/revoked"
+      }
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/model"
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "revoked": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_id", "revision", "reason"],
+      "properties": {
+        "model_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "revision": {
+          "$ref": "#/$defs/identifier"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "revision",
+        "name",
+        "description",
+        "size_bytes",
+        "min_ram_mb",
+        "layout",
+        "variant",
+        "recommended",
+        "host",
+        "files"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "revision": {
+          "$ref": "#/$defs/identifier"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "min_ram_mb": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "layout": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "enum": ["onnx-asr-gigaam-v3"]
+        },
+        "variant": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "enum": ["gigaam-v3-e2e-rnnt", "gigaam-v3-e2e-ctc", "gigaam-v3-rnnt"]
+        },
+        "recommended": {
+          "type": "boolean"
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "enum": ["huggingface.co"]
+        },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/file"
+          }
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "size", "url_path"],
+      "properties": {
+        "path": {
+          "$comment": "Пустые пути и пределы 255/1024 байта проверяет разборщик с кодом bad-path.",
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 1048576
+        },
+        "sha256": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "url_path": {
+          "$comment": "Содержимое пути проверяет разборщик с кодом bad-path после схемы.",
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 1048576
+        }
+      }
+    }
+  }
+}

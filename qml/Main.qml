@@ -9,6 +9,7 @@ import QtQuick.Controls 2.15
 import "."
 import "." as Av
 import "sections"
+import "onboarding"
 
 ApplicationWindow {
     id: window
@@ -18,6 +19,7 @@ ApplicationWindow {
     readonly property string appVersion: (info && info.version) ? info.version : "0.1.0"
     readonly property string sessionKind: (info && info.sessionKind) ? info.sessionKind : "OTHER"
     readonly property bool debugVisible: (info && info.debug === true)
+    readonly property bool onboardingVisible: (typeof showOnboarding !== "undefined") ? showOnboarding === true : false
 
     width: Theme.sizeWindowW
     height: Theme.sizeWindowMinH
@@ -26,13 +28,20 @@ ApplicationWindow {
     minimumWidth: Theme.sizeWindowMinW
     minimumHeight: Theme.sizeWindowMinH
     visible: true
-    title: qsTr("Astra Voice")
+    title: window.onboardingVisible ? qsTr("Astra Voice — первый запуск") : qsTr("Astra Voice")
     color: Theme.bgApp
     font.family: Theme.fontUi
+
+    Loader {
+        anchors.fill: parent
+        active: window.onboardingVisible
+        sourceComponent: Component { Onboarding {} }
+    }
 
     // ── тело: сайдбар + контент ─────────────────────────────────────────────
     Av.Sidebar {
         id: sidebar
+        visible: !window.onboardingVisible
         anchors.left: parent.left
         anchors.top: parent.top
         anchors.bottom: statusBar.top
@@ -42,6 +51,7 @@ ApplicationWindow {
 
     Item {
         id: content
+        visible: !window.onboardingVisible
         anchors.left: sidebar.right
         anchors.right: parent.right
         anchors.top: parent.top
@@ -101,7 +111,7 @@ ApplicationWindow {
             ScrollBar.vertical: ScrollBar {
                 id: bodyScroll
                 policy: ScrollBar.AsNeeded
-                visible: size < 1.0
+                visible: !window.onboardingVisible && size < 1.0
                 width: Theme.scrollbarW
                 rightPadding: Theme.scrollbarRight
 
@@ -130,6 +140,7 @@ ApplicationWindow {
 
     Av.StatusBar {
         id: statusBar
+        visible: !window.onboardingVisible
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom

@@ -16,6 +16,8 @@ build/
 src/astra_voice/_version.py
 # модели и тяжёлые артефакты — только манифесты
 models/
+# Исходники каталога моделей должны попадать в git.
+!/src/astra_voice/models/
 *.onnx
 # Silero VAD входит в состав пакета
 !data/vad/silero_vad.onnx

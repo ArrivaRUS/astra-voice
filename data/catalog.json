@@ -1,0 +1,60 @@
+{
+  "manifest_version": 1,
+  "serial": 1,
+  "trust_epoch": 1,
+  "generated_at": "2026-09-15T00:00:00Z",
+  "publisher": "astra-voice",
+  "revoked": [],
+  "models": [
+    {
+      "id": "gigaam-v3-e2e-rnnt-int8",
+      "revision": "322c3b29492673eb7d0b434bfa9dfb8653e34d02",
+      "name": "GigaAM v3 RNN-T",
+      "description": "Русская диктовка с пунктуацией — модель по умолчанию",
+      "size_bytes": 226431968,
+      "min_ram_mb": 768,
+      "layout": "onnx-asr-gigaam-v3",
+      "variant": "gigaam-v3-e2e-rnnt",
+      "recommended": true,
+      "host": "huggingface.co",
+      "files": [
+        {
+          "path": "config.json",
+          "sha256": "0641fcf73f4af791c73f05083e38a658ff5dcbee3534a0c61396c10f4b97f0fe",
+          "size": 135,
+          "url_path": "/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/config.json"
+        },
+        {
+          "path": "v3_e2e_rnnt.yaml",
+          "sha256": "d23270a1f327e365ebc4554b7ceee69ac12898e21092c18085151516aa58f91b",
+          "size": 1041,
+          "url_path": "/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt.yaml"
+        },
+        {
+          "path": "v3_e2e_rnnt_vocab.txt",
+          "sha256": "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7",
+          "size": 13354,
+          "url_path": "/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_vocab.txt"
+        },
+        {
+          "path": "v3_e2e_rnnt_encoder.int8.onnx",
+          "sha256": "4e0e076a6076cd110277e529b8ac8f32cd5297f7fbebad5341ae8ddb7d00817b",
+          "size": 224570477,
+          "url_path": "/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_encoder.int8.onnx"
+        },
+        {
+          "path": "v3_e2e_rnnt_decoder.int8.onnx",
+          "sha256": "89014e134865615b91e037157e46e389b1271e6072460efc010ea08e61e23146",
+          "size": 1159170,
+          "url_path": "/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_decoder.int8.onnx"
+        },
+        {
+          "path": "v3_e2e_rnnt_joint.int8.onnx",
+          "sha256": "ade116563dbf66e503b0994efab6b5861412743e52bf31c39fc3fffa3783d5d1",
+          "size": 687791,
+          "url_path": "/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/v3_e2e_rnnt_joint.int8.onnx"
+        }
+      ]
+    }
+  ]
+}

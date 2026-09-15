@@ -212,7 +212,7 @@ def test_invalid_reply_resets_id(transport: Mock, arguments: list[object]) -> No
 def test_flush_pending_after_recovery(transport: Mock) -> None:
     transport.bus.isConnected.return_value = False
     notifications.notify_indicators_lost()
-    notifications.notify_hotkey_not_grabbed()
+    notifications.notify_hotkey_not_grabbed("Ctrl+Space")
     assert notifications.pending_count() == 2
 
     transport.bus.isConnected.return_value = True
@@ -223,8 +223,8 @@ def test_flush_pending_after_recovery(transport: Mock) -> None:
     assert [tuple(_arguments(call.args[0])[3:5]) for call in calls] == [
         ("Запись остановлена", "Пропали все указатели записи, поэтому запись остановлена."),
         (
-            "Горячая клавиша не захвачена",
-            "Другая программа уже использует это сочетание. Выберите другое в настройках.",
+            "Горячая клавиша Ctrl+Space занята другой программой",
+            "Как только она освободится, диктовка заработает сама.",
         ),
     ]
     assert [_arguments(call.args[0])[6]["urgency"].value() for call in calls] == [b"\x02", b"\x01"]
@@ -311,7 +311,7 @@ def test_flush_pending_partial_delivery(transport: Mock) -> None:
     transport.bus.isConnected.return_value = False
     notifications.notify_indicators_lost()
     notifications.notify_tray_unavailable()
-    notifications.notify_hotkey_not_grabbed()
+    notifications.notify_hotkey_not_grabbed("Ctrl+Space")
     transport.bus.isConnected.return_value = True
     transport.bus.call.side_effect = [
         RuntimeError("Сбой службы"),
@@ -328,19 +328,13 @@ def test_flush_pending_partial_delivery(transport: Mock) -> None:
     assert notifications.last_delivery_ok() is True
     assert [_arguments(call.args[0])[3] for call in transport.bus.call.call_args_list] == [
         "Запись остановлена",
-        "Горячая клавиша не захвачена",
+        "Горячая клавиша Ctrl+Space занята другой программой",
     ]
 
 
 @pytest.mark.parametrize(
     ("wrapper", "summary", "body", "priority"),
     [
-        (
-            notifications.notify_hotkey_not_grabbed,
-            "Горячая клавиша не захвачена",
-            "Другая программа уже использует это сочетание. Выберите другое в настройках.",
-            b"\x01",
-        ),
         (
             notifications.notify_tray_unavailable,
             "Значок не появился на панели",
@@ -353,6 +347,18 @@ def test_flush_pending_partial_delivery(transport: Mock) -> None:
             "Если панель перезапустится, показывать запись будет нечем. "
             "Включите указатель записи в настройках.",
             b"\x01",
+        ),
+        (
+            notifications.notify_microphone_lost,
+            "Микрофон отключился",
+            "Проверьте подключение или выберите микрофон в настройках.",
+            b"\x02",
+        ),
+        (
+            notifications.notify_selfcheck_failed,
+            "Распознавание на этом компьютере не работает",
+            "Обратитесь к администратору.",
+            b"\x02",
         ),
         (
             notifications.notify_indicators_lost,
@@ -368,7 +374,58 @@ def test_fixed_messages(
     wrapper()
     args = _arguments(transport.bus.call.call_args.args[0])
     assert args[3:5] == [summary, body]
+    assert args[5].value() == []
     assert args[6]["urgency"].value() == priority
+
+
+@pytest.mark.parametrize("combo", ["Ctrl+Space", "Ctrl+Shift+Space", "Win+Space"])
+@pytest.mark.parametrize("regrabbed", [False, True])
+def test_hotkey_messages_name_combo_without_actions(
+    transport: Mock, combo: str, regrabbed: bool
+) -> None:
+    if regrabbed:
+        notifications.notify_hotkey_regrabbed(combo)
+        expected = [f"Горячая клавиша снова работает: {combo}", ""]
+    else:
+        notifications.notify_hotkey_not_grabbed(combo)
+        expected = [
+            f"Горячая клавиша {combo} занята другой программой",
+            "Как только она освободится, диктовка заработает сама.",
+        ]
+    transport.bus.call.assert_called_once()
+    args = _arguments(transport.bus.call.call_args.args[0])
+    assert args[3:5] == expected
+    assert args[5].value() == []
+    assert args[6]["urgency"].value() == b"\x01"
+
+
+@pytest.mark.parametrize(
+    "wrapper", [notifications.notify_hotkey_not_grabbed, notifications.notify_hotkey_regrabbed]
+)
+def test_hotkey_messages_require_combo(wrapper: Callable[..., None]) -> None:
+    with pytest.raises(TypeError):
+        wrapper()
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_microphone_messages_use_system_description_without_actions(
+    transport: Mock, selected: bool
+) -> None:
+    name = "Встроенный микрофон"
+    if selected:
+        notifications.notify_microphone_selected(name)
+        expected = [f"Микрофон: {name}", ""]
+    else:
+        notifications.notify_microphone_changed(name)
+        expected = [
+            "Микрофон сменился",
+            f"Сейчас используется: {name}. Выбрать другой можно в настройках.",
+        ]
+    transport.bus.call.assert_called_once()
+    args = _arguments(transport.bus.call.call_args.args[0])
+    assert args[3:5] == expected
+    assert args[5].value() == []
+    assert args[6]["urgency"].value() == b"\x01"
 
 
 def _qualified_name(node: ast.AST, aliases: dict[str, str]) -> str:
@@ -388,9 +445,10 @@ def _is_notification(name: str) -> bool:
 def _notification_violations(source: str, *, implementation: bool = False) -> list[str]:
     """Проверить все вызовы, включая вложенные функции и псевдонимы импортов.
 
-    Прямой notify разрешён только в модуле уведомлений. Любая обёртка снаружи
-    вызывается без аргументов. Внутри допустимы литералы и строковые константы
-    уровня модуля, которые нигде не перезаписаны и не затенены параметром.
+    Прямой notify разрешён только в модуле уведомлений. Для двух обёрток
+    горячей клавиши разрешены settings.hotkey снаружи и шаблон с combo внутри.
+    Описание микрофона разрешено внутри двух фиксированных шаблонов; runtime
+    передаёт обёртки как колбэки. Остальные тексты — строковые константы.
     """
     tree = ast.parse(source)
     nodes = list(ast.walk(tree))
@@ -438,17 +496,72 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
                 constants.add(target.id)
 
     problems: list[str] = []
+    hotkey_templates = {
+        "notify_hotkey_not_grabbed": 'f"Горячая клавиша {combo} занята другой программой"',
+        "notify_hotkey_regrabbed": 'f"Горячая клавиша снова работает: {combo}"',
+    }
+    templates = {
+        **hotkey_templates,
+        "notify_onboarding_ready": 'f"Зажмите {combo} и говорите."',
+        "notify_microphone_changed": (
+            'f"Сейчас используется: {name}. Выбрать другой можно в настройках."'
+        ),
+        "notify_microphone_selected": 'f"Микрофон: {name}"',
+    }
+    allowed_templates = {
+        statement.value: ast.dump(ast.parse(templates[function.name], mode="eval").body)
+        for function in tree.body
+        if isinstance(function, ast.FunctionDef) and function.name in templates
+        for statement in function.body
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+    }
+    # У онбординга два типизированных перехода: контроллер → host → обёртка.
+    # Разрешены только точные вызовы в соответствующих методах этих классов.
+    onboarding_calls = {
+        ("OnboardingController", "finish"): "self._host.notify_ready(self.hotkey)",
+        ("_RuntimeOnboardingHost", "notify_ready"): "notify.notify_onboarding_ready(combo)",
+    }
+    allowed_onboarding = {
+        node
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef)
+        for method in cls.body
+        if isinstance(method, ast.FunctionDef)
+        if (cls.name, method.name) in onboarding_calls
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        if ast.dump(node)
+        == ast.dump(ast.parse(onboarding_calls[cls.name, method.name], mode="eval").body)
+    }
     for node in nodes:
         if not isinstance(node, ast.Call):
             continue
         name = _qualified_name(node.func, aliases)
         if not _is_notification(name):
             continue
+        if not implementation and node in allowed_onboarding:
+            continue
         leaf = name.rsplit(".", 1)[-1]
+        if (
+            not implementation
+            and leaf in hotkey_templates
+            and len(node.args) == 1
+            and not node.keywords
+            and ast.dump(node.args[0])
+            == ast.dump(ast.parse("self.settings.hotkey", mode="eval").body)
+        ):
+            continue
         if not implementation and (leaf == "notify" or node.args or node.keywords):
             problems.append(f"{node.lineno}: снаружи допустима только обёртка без аргументов")
         arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
         for argument in arguments:
+            if (
+                implementation
+                and leaf == "notify"
+                and node in allowed_templates
+                and ast.dump(argument) == allowed_templates[node]
+            ):
+                continue
             if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
                 continue
             if isinstance(argument, ast.Name) and argument.id in constants:
@@ -496,6 +609,13 @@ def test_project_notifications_contain_no_dictation() -> None:
         "show = notify\nother = show\nother(text)",
         "n.notify_indicators_lost(text)",
         "n.notify_tray_depends_on_panel(text)",
+        "n.notify_hotkey_not_grabbed(text)",
+        "n.notify_hotkey_regrabbed(text)",
+        "n.notify_microphone_changed(text)",
+        "n.notify_microphone_selected(text)",
+        'def notify_microphone_changed(name):\n    notify(f"Запись: {text}")',
+        'def notify_microphone_selected(name):\n    notify(f"Микрофон: {text}")',
+        'def notify_hotkey_regrabbed(combo):\n    notify(f"Запись: {text}")',
     ],
 )
 def test_ast_rejects_dynamic_text(source: str) -> None:
@@ -510,6 +630,9 @@ def test_ast_rejects_dynamic_text(source: str) -> None:
         'notify_indicators_lost("Запись")',
         'notify_tray_depends_on_panel("Запись")',
         "from astra_voice.ui.notify import notify_tray_unavailable as show\nshow(body=text)",
+        "notify_hotkey_not_grabbed(self.last_text)",
+        "notify_hotkey_regrabbed(self.settings.hotkey, body=text)",
+        "notify_hotkey_regrabbed(*args)",
     ],
 )
 def test_ast_requires_wrappers_outside_module(source: str) -> None:
@@ -535,3 +658,28 @@ def test_ast_accepts_wrapper_alias(wrapper: str) -> None:
         "def on_failure():\n    stopped()\n"
     )
     assert not _notification_violations(source)
+
+
+@pytest.mark.parametrize("combo", ["Ctrl+Space", "Ctrl+Alt+D"])
+def test_onboarding_ready_message(transport: Mock, combo: str) -> None:
+    notifications.notify_onboarding_ready(combo)
+    transport.bus.call.assert_called_once()
+    args = _arguments(transport.bus.call.call_args.args[0])
+    assert args[3:5] == ["Astra Voice готов", f"Зажмите {combo} и говорите."]
+    assert args[5].value() == []
+    assert args[6]["urgency"].value() == b"\x01"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "notify_onboarding_ready(text)",
+        "self._host.notify_ready(self.last_text)",
+        "class _RuntimeOnboardingHost:\n    def notify_ready(self, combo):\n"
+        "        notify.notify_onboarding_ready(text)",
+        "class OnboardingController:\n    def finish(self):\n"
+        "        self._host.notify_ready(self.last_text)",
+    ],
+)
+def test_ast_rejects_onboarding_dictation(source: str) -> None:
+    assert _notification_violations(source)

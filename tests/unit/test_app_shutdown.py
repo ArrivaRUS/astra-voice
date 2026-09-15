@@ -12,6 +12,7 @@ from PyQt5 import QtCore, QtWidgets
 
 from astra_voice import app as app_mod
 from astra_voice import runtime as runtime_mod
+from astra_voice.core import paths as paths_mod
 from astra_voice.core import policy as policy_mod
 from astra_voice.core import settings as settings_mod
 from astra_voice.core.policy import Policy
@@ -35,6 +36,7 @@ class Rig:
         self.timer = Mock()
         self.theme = Mock()
         self.shell = Mock()
+        self.shell.rootObjects.return_value = [Mock()]
         self.show = Mock()
         self.cleanup = Mock()
         self.runtime = Mock()
@@ -61,6 +63,7 @@ class Rig:
         monkeypatch.setattr(app_mod, "_install_qt_message_handler", Mock())
         monkeypatch.setattr(policy_mod, "load", lambda: Policy())
         monkeypatch.setattr(settings_mod, "load", lambda: self.settings)
+        monkeypatch.setattr(paths_mod, "settings_path", lambda: tmp_path / "settings.json")
         monkeypatch.setattr(app_mod, "_ensure_settings_file", Mock())
         monkeypatch.setattr(app_mod, "_make_app_info", Mock())
         monkeypatch.setattr(app_mod, "_make_theme_bridge", Mock(return_value=self.theme))
@@ -90,6 +93,45 @@ def test_shutdown_once_before_other_cleanup(rig: Rig) -> None:
         call.theme_stop(),
         call.cleanup(rig.server, rig.lock),
     ]
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        Policy(),
+        Policy(
+            values={"hotkey": "Ctrl+Shift+Space", "hotkey_mode": "toggle", "device": "admin mic"},
+            locked_keys=frozenset({"language"}),
+            status=policy_mod.PolicyStatus.OK,
+        ),
+    ],
+)
+def test_settings_bridge_receives_stored_runtime_mirror_and_policy_values(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, policy: Policy
+) -> None:
+    from astra_voice.ui import bridges
+
+    bridge_factory = Mock(wraps=bridges.SettingsBridge)
+    monkeypatch.setattr(bridges, "SettingsBridge", bridge_factory)
+    monkeypatch.setattr(policy_mod, "load", lambda: policy)
+
+    assert app_mod.main([]) == 7
+
+    bridge_factory.assert_called_once()
+    args, kwargs = bridge_factory.call_args
+    assert len(args) == 1
+    assert args[0] is rig.settings
+    runtime_settings = rig.factory.call_args.kwargs["settings"]
+    assert runtime_settings is not rig.settings
+    assert kwargs["mirror"] is runtime_settings
+    assert set(kwargs["locked"]) == set(policy.values)
+    assert isinstance(kwargs["apply"], app_mod._RuntimeSettingsApply)
+    context = rig.shell.rootContext()
+    properties = dict(item.args for item in context.setContextProperty.call_args_list)
+    bridge = properties["settingsBridge"]
+    assert bridge.lockedSettings == sorted(policy.values)
+    assert bridge.device == (runtime_settings.extra.get("device") or "")
+    assert bridge.hotkey == runtime_settings.hotkey
 
 
 @pytest.mark.parametrize("failure", ["constructor", "start"])
@@ -190,3 +232,96 @@ def test_shutdown_failure_does_not_skip_cleanup(rig: Rig) -> None:
     rig.timer.stop.assert_called_once_with()
     rig.theme.source.stop.assert_called_once_with()
     rig.cleanup.assert_called_once_with(rig.server, rig.lock)
+
+
+@pytest.mark.parametrize("done", [None, False, 1, True])
+@pytest.mark.parametrize("runtime_available", [False, True])
+def test_onboarding_context(rig: Rig, done: int | None, runtime_available: bool) -> None:
+    from PyQt5.QtQml import QQmlEngine
+
+    from astra_voice.ui.bridges import OnboardingController
+
+    rig.settings.extra["onboarding_done"] = done
+    rig.settings.extra["onboarding_step"] = 3
+    if not runtime_available:
+        rig.runtime.start.side_effect = RuntimeError()
+    assert app_mod.main([]) == 7
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    assert properties["showOnboarding"] is (done is not True)
+    assert "settingsBridge" in properties
+    if done is True:
+        assert "onboarding" not in properties
+    else:
+        controller = properties["onboarding"]
+        assert isinstance(controller, OnboardingController)
+        assert QQmlEngine.objectOwnership(controller) == QQmlEngine.CppOwnership
+        assert controller.step == 3
+        controller.beginCapture()
+        assert controller.captureState == ("capturing" if runtime_available else "not-grabbed")
+        controller.cancelCapture()
+
+
+def test_onboarding_host_delegates_and_hides_root(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from astra_voice.ui import notify
+
+    notification = Mock()
+    monkeypatch.setattr(notify, "notify_onboarding_ready", notification)
+    root = Mock()
+    rig.shell.rootObjects.return_value = [root]
+    host = app_mod._RuntimeOnboardingHost(rig.runtime, rig.shell)
+    rig.runtime.begin_hotkey_capture.return_value = True
+    rig.runtime.hotkey.probe.return_value.code = "busy"
+    rig.runtime.hotkey.free_candidates.return_value = ["Ctrl+Alt+D"]
+    rig.runtime.apply_hotkey.return_value = "ok"
+    assert host.begin_capture() is True
+    host.end_capture()
+    assert host.probe("Ctrl+Space") == "busy"
+    assert host.free_candidates(["Ctrl+Alt+D"]) == ["Ctrl+Alt+D"]
+    assert host.apply_hotkey("Ctrl+Alt+D", "toggle") == "ok"
+    host.notify_ready("Ctrl+Alt+D")
+    host.hide_window()
+    rig.runtime.begin_hotkey_capture.assert_called_once_with()
+    rig.runtime.end_hotkey_capture.assert_called_once_with()
+    rig.runtime.hotkey.probe.assert_called_once_with("Ctrl+Space")
+    rig.runtime.hotkey.free_candidates.assert_called_once_with(["Ctrl+Alt+D"])
+    rig.runtime.apply_hotkey.assert_called_once_with("Ctrl+Alt+D", "toggle")
+    notification.assert_called_once_with("Ctrl+Alt+D")
+    root.hide.assert_called_once_with()
+    rig.shell.rootObjects.return_value = []
+    host.hide_window()
+
+
+def test_finishing_onboarding_updates_context(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    from astra_voice.ui import bridges, notify
+
+    monkeypatch.setattr(notify, "notify_onboarding_ready", Mock())
+    model = Mock(
+        spec_set=bridges.ModelPort,
+        recommended=Mock(return_value=None),
+        installed_ok=Mock(return_value=True),
+        broken=Mock(return_value=False),
+        allowed=Mock(return_value=(False, "Сеть отключена в тесте")),
+        disk_ok=Mock(return_value=True),
+        ram_ok=Mock(return_value=True),
+        download=Mock(side_effect=AssertionError("Неожиданная загрузка модели")),
+        install_from_staging=Mock(side_effect=AssertionError("Неожиданная установка модели")),
+        install_from_path=Mock(side_effect=AssertionError("Неожиданная установка модели")),
+    )
+    monkeypatch.setattr(bridges, "ModelService", Mock(return_value=model))
+
+    def exec_loop() -> int:
+        properties = dict(
+            item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+        )
+        properties["onboarding"].finish()
+        return 0
+
+    rig.app.exec_.side_effect = exec_loop
+    assert app_mod.main([]) == 0
+    model.installed_ok.assert_called_once_with()
+    assert rig.settings.extra["onboarding_done"] is True
+    rig.shell.rootContext().setContextProperty.assert_called_with("showOnboarding", False)

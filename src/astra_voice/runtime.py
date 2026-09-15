@@ -6,6 +6,7 @@ import atexit
 import logging
 from collections.abc import Callable
 from functools import partial
+from pathlib import Path
 from time import monotonic
 from typing import Any, cast
 
@@ -14,7 +15,12 @@ from PyQt5.QtCore import QCoreApplication, QEventLoop, QObject, QSocketNotifier,
 
 from astra_voice.core.capture_watchdog import CaptureFieldWatchdog
 from astra_voice.core.dictation import DictationOrchestrator, DictationPhase
-from astra_voice.core.model_request import ModelNotConfigured, build_model_load
+from astra_voice.core.model_source import (
+    ModelStore,
+    resolve_model_request,
+    smoke_matches,
+    smoke_wav_path,
+)
 from astra_voice.core.paths import data_dir
 from astra_voice.core.settings import Settings
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
@@ -36,13 +42,36 @@ from astra_voice.platform.session import SessionKind
 from astra_voice.platform.x11 import X11Display
 from astra_voice.ui import notify
 from astra_voice.ui.indicators import IndicatorGuard
-from astra_voice.ui.pill import ERROR_MODEL_LOAD_FAILED, Pill, PillState
+from astra_voice.ui.pill import (
+    ERROR_MODEL_LOAD_FAILED,
+    ERROR_MODEL_NOT_LOADED,
+    ERROR_SELFCHECK_FAILED,
+    Pill,
+    PillState,
+)
 from astra_voice.ui.tray import Tray
 from astra_voice.ui.tray_icons import TrayIconProvider, TrayState
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
 
 log = logging.getLogger(__name__)
+
+SELFCHECK_TIMEOUT_S = 10.0
+SELFCHECK_WATCHDOG_MS = 10000
+REGRAB_INTERVAL_MS = 30000
+
+
+def _cpu_model() -> str:
+    """Читает название первого процессора; отсутствие сведений допустимо."""
+    try:
+        with Path("/proc/cpuinfo").open(encoding="utf-8") as handle:
+            for line in handle:
+                key, separator, value = line.partition(":")
+                if separator and key.strip() == "model name":
+                    return value.strip()
+    except Exception:
+        return ""
+    return ""
 
 
 class DictationRuntime(QObject):
@@ -58,6 +87,7 @@ class DictationRuntime(QObject):
         *,
         settings: Settings,
         session_kind: SessionKind,
+        model_store: ModelStore | None = None,
         parent: QObject | None = None,
         supervisor_factory: Callable[..., WorkerSupervisor] = WorkerSupervisor,
         pill_factory: Callable[..., Pill] = Pill,
@@ -73,6 +103,7 @@ class DictationRuntime(QObject):
     ) -> None:
         super().__init__(parent)
         self.settings = settings
+        self.model_store = model_store
         self.session_kind = session_kind
         self.on_quit_requested: Callable[[], None] | None = None
         self._started = False
@@ -80,12 +111,20 @@ class DictationRuntime(QObject):
         self._loading_model = False
         self._model_load_generation: int | None = None
         self._model_load_failures = 0
+        self._selfcheck: str = "idle"
+        self._selfcheck_timer: QTimer | None = None
+        self._loaded_model: dict[str, str] = {}
+        self._model_load_ms: int | float | None = None
         self._supervisor_factory = supervisor_factory
         self._capture_watchdog_factory = capture_watchdog_factory
         self._capture_watchdog: CaptureFieldWatchdog | None = None
         self.notifier: QSocketNotifier | None = None
         self.tick_timer: QTimer | None = None
         self.stats_timer: QTimer | None = None
+        self._regrab_timer: QTimer | None = None
+        self._regrab_attempts = 0
+        self._regrab_code: str | None = None
+        self._regrab_target: tuple[str, str] | None = None
         self.timers: set[QTimer] = set()
         rollback: list[tuple[str, Callable[[], object]]] = [
             ("объекты Qt", self._delete_build_children),
@@ -129,6 +168,9 @@ class DictationRuntime(QObject):
                 paste_mode=self.paste_mode,
                 record_params=self.record_params,
                 stats=self.stats,
+                on_device_changed=notify.notify_microphone_changed,
+                on_device_lost=notify.notify_microphone_lost,
+                on_device_selected=notify.notify_microphone_selected,
             )
             rollback.append(("оркестратор", self.orchestrator.shutdown))
             self.supervisor = supervisor_factory(on_event=self._on_worker_event, use_qt=True)
@@ -173,6 +215,7 @@ class DictationRuntime(QObject):
         """Заменяет супервизор, сохраняя уникальность поколений между заменами."""
         if self._closed:
             return
+        self._reset_selfcheck()
         generation = self.supervisor.generation + 1
         self.supervisor.stop()
         self.supervisor = self._supervisor_factory(on_event=self._on_worker_event, use_qt=True)
@@ -186,23 +229,17 @@ class DictationRuntime(QObject):
         """Загружает настроенную модель при каждом запуске нового воркера."""
         if self._model_load_generation == self.supervisor.generation:
             return
+        self._reset_selfcheck()
         self._loading_model = False
         if self._model_load_failures >= 2:
             log.warning("Загрузка модели остановлена после двух неудачных попыток подряд")
             self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
             self.tray.set_state(TrayState.ERROR)
             return
-        settings = self.settings.to_dict()
-        model_dir = None
-        if not settings.get("model_id") or not settings.get("model_revision"):
-            model_dir = settings.get("model_dir")
-        try:
-            request = build_model_load(
-                settings,
-                model_dir=model_dir,
-                store_dir=data_dir() / "store",
-            )
-        except ModelNotConfigured:
+        request = resolve_model_request(
+            self.settings, self.model_store, store_dir=data_dir() / "store"
+        )
+        if request is None:
             log.info("модель в настройках не указана")
             return
         try:
@@ -228,8 +265,101 @@ class DictationRuntime(QObject):
             self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
             self.tray.set_state(TrayState.ERROR)
 
+    def _reset_selfcheck(self) -> None:
+        """Снимает сторожа и сведения о предыдущей загрузке."""
+        self._cancel_selfcheck_timer()
+        self._selfcheck = "idle"
+        self._loaded_model = {}
+        self._model_load_ms = None
+
+    def _cancel_selfcheck_timer(self) -> None:
+        timer, self._selfcheck_timer = self._selfcheck_timer, None
+        if timer is not None:
+            self.cancel_timer(timer)
+
+    def _model_ready(self) -> None:
+        """Объявляет готовность после проверки или при отсутствии эталона."""
+        self._loading_model = False
+        self._model_load_failures = 0
+        if self.orchestrator.phase == DictationPhase.IDLE:
+            self.pill.hide()
+            self.tray.set_state(TrayState.NOKEY if self._regrab_timer else TrayState.IDLE)
+        if self._model_load_ms is not None:
+            log.info("модель загружена за %.0f мс", self._model_load_ms)
+        else:
+            log.info("модель загружена")
+
+    def _start_selfcheck(self, event: dict[str, Any]) -> None:
+        """Запускает эталон, сохраняя только сведения о модели и времени загрузки."""
+        self._loaded_model = {
+            target: value if isinstance(value := event.get(source), str) else ""
+            for target, source in (
+                ("model_id", "id"),
+                ("revision", "revision"),
+                ("engine_version", "engine_version"),
+            )
+        }
+        load_ms = event.get("load_ms")
+        self._model_load_ms = (
+            load_ms if isinstance(load_ms, (int, float)) and not isinstance(load_ms, bool) else None
+        )
+        wav = smoke_wav_path()
+        if not wav.is_file():
+            log.warning("эталон самопроверки не найден")
+            self._model_ready()
+            return
+        self._selfcheck = "running"
+        self._selfcheck_timer = self.schedule(SELFCHECK_WATCHDOG_MS, self._selfcheck_watchdog)
+        try:
+            self.supervisor.send(
+                {"type": "transcribe.file", "path": str(wav)}, timeout=SELFCHECK_TIMEOUT_S
+            )
+        except Exception:
+            self._finish_selfcheck(False)
+
+    def _selfcheck_watchdog(self) -> None:
+        # schedule уже удалил сработавший таймер из набора и сам освободит его.
+        self._selfcheck_timer = None
+        self._finish_selfcheck(False)
+
+    def _finish_selfcheck(self, matched: bool) -> None:
+        """Завершает проверку один раз; распознанный текст сюда не передаётся."""
+        if self._closed or self._selfcheck != "running":
+            return
+        self._cancel_selfcheck_timer()
+        self._selfcheck = "ok" if matched else "failed"
+        if matched:
+            self._model_ready()
+        else:
+            self._loading_model = False
+            self.tray.set_state(TrayState.ERROR)
+            self.pill.show_state(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
+            notify.notify_selfcheck_failed()
+        try:
+            self.stats.append(
+                "model_selfcheck",
+                **self._loaded_model,
+                result="ok" if matched else "fail",
+                cpu_model=_cpu_model(),
+            )
+        except Exception:
+            log.warning("Не удалось сохранить статистику самопроверки")
+
     def _on_worker_event(self, event: dict[str, Any]) -> None:
         """Обрабатывает загрузку модели и передаёт исходное событие оркестратору."""
+        if event.get("utterance_id") == "file" or event.get("request_type") == "transcribe.file":
+            if (
+                not self._closed
+                and self._selfcheck == "running"
+                and event.get("generation") == self._model_load_generation
+                and event.get("generation") == self.supervisor.generation
+            ):
+                if event.get("type") == "result":
+                    text = event.get("text")
+                    self._finish_selfcheck(isinstance(text, str) and smoke_matches(text))
+                elif event.get("type") in ("error", "cancelled"):
+                    self._finish_selfcheck(False)
+            return
         if (
             not self._closed
             and event.get("type") == "hello"
@@ -242,16 +372,8 @@ class DictationRuntime(QObject):
             and event.get("generation") == self._model_load_generation
         ):
             if event.get("type") == "model.loaded":
-                self._loading_model = False
-                self._model_load_failures = 0
-                if self.orchestrator.phase == DictationPhase.IDLE:
-                    self.pill.hide()
-                    self.tray.set_state(TrayState.IDLE)
-                load_ms = event.get("load_ms")
-                if isinstance(load_ms, (int, float)) and not isinstance(load_ms, bool):
-                    log.info("модель загружена за %.0f мс", load_ms)
-                else:
-                    log.info("модель загружена")
+                if self._selfcheck == "idle":
+                    self._start_selfcheck(event)
             elif event.get("type") == "error" and (
                 event.get("request_type") == "model.load"
                 or event.get("response_type") == "model.loaded"
@@ -266,6 +388,10 @@ class DictationRuntime(QObject):
 
     def _on_hotkey_state(self, state: HotkeyState, reason: str) -> None:
         """Откладывает диктовку, пока воркер загружает модель."""
+        if not self._closed and self._selfcheck == "failed" and state == HotkeyState.RECORDING:
+            if self.orchestrator.phase == DictationPhase.IDLE:
+                self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
+            return
         if (
             not self._closed
             and state == HotkeyState.RECORDING
@@ -283,6 +409,83 @@ class DictationRuntime(QObject):
                 self.pill.show_state(PillState.LOADING_MODEL)
             return
         self.orchestrator.on_hotkey_state(state, reason)
+
+    def apply_pill_enabled(self, value: bool) -> None:
+        """Меняет видимость индикатора и соответствующее состояние трея."""
+        self.pill.set_enabled(value)
+        self.tray.set_pill_enabled(value)
+
+    def apply_hotkey(self, combo: str, mode: str) -> str:
+        """Освобождает прежний хоткей и захватывает сохранённый без перезапуска."""
+        try:
+            hotkey_mode = HotkeyMode(mode)
+        except ValueError:
+            hotkey_mode = HotkeyMode.PTT
+        self.settings.hotkey = combo
+        self.settings.hotkey_mode = hotkey_mode.value
+        self.hotkey.ungrab()
+        result = self.hotkey.grab(combo, hotkey_mode)
+        if not result.ok:
+            self.tray.set_state(TrayState.NOKEY)
+            self._start_regrab(result.code)
+        else:
+            self._stop_regrab()
+            if self.orchestrator.phase == DictationPhase.IDLE and self._selfcheck != "failed":
+                self.tray.set_state(TrayState.IDLE)
+        return result.code
+
+    def _start_regrab(self, code: str) -> None:
+        """Повторяет захват; новая настройка начинает собственный отсчёт попыток."""
+        if self._closed:
+            return
+        target = (self.settings.hotkey, self.settings.hotkey_mode)
+        if self._regrab_timer is not None and target == self._regrab_target:
+            return
+        self._stop_regrab()
+        self._regrab_target = target
+        self._regrab_attempts = 0
+        self._regrab_code = code
+        timer = self._create_timer()
+        self._regrab_timer = timer
+        timer.setSingleShot(False)
+        timer.timeout.connect(self._retry_hotkey)
+        timer.start(REGRAB_INTERVAL_MS)
+
+    def _stop_regrab(self) -> None:
+        """Отменяет повтор и освобождает таймер."""
+        timer, self._regrab_timer = self._regrab_timer, None
+        self._regrab_target = None
+        if timer is not None:
+            self._cleanup("остановка таймера перезахвата", timer.stop)
+            self._cleanup("удаление таймера перезахвата", timer.deleteLater)
+
+    def _retry_hotkey(self) -> None:
+        """Неудачи молчат; журнал отмечает только смену кода результата."""
+        if self._closed or self._regrab_timer is None:
+            return
+        self._regrab_attempts += 1
+        result = self.hotkey.grab(self.settings.hotkey, HotkeyMode(self.settings.hotkey_mode))
+        if result.ok:
+            self._stop_regrab()
+            if self.orchestrator.phase == DictationPhase.IDLE and self._selfcheck != "failed":
+                self.tray.set_state(TrayState.IDLE)
+            notify.notify_hotkey_regrabbed(self.settings.hotkey)
+            log.info("Горячая клавиша снова захвачена: %s", self.settings.hotkey)
+            self._record_hotkey_grab("regrabbed", self._regrab_attempts)
+        elif result.code != self._regrab_code:
+            log.info("Повторный захват горячей клавиши: %s → %s", self._regrab_code, result.code)
+        self._regrab_code = result.code
+
+    def _record_hotkey_grab(self, result: str, attempts: int) -> None:
+        """Сбой статистики не мешает запуску и восстановлению клавиши."""
+        try:
+            self.stats.append("hotkey_grab", key_role="text", result=result, attempts=attempts)
+        except Exception:
+            log.warning("Не удалось сохранить статистику захвата горячей клавиши")
+
+    def apply_device(self, value: str | None) -> None:
+        """Устройство будет прочитано record_params перед следующей записью."""
+        log.info("Устройство записи изменено; применяется со следующей записи")
 
     def record_params(self) -> dict[str, Any]:
         """Параметры записи; расширения настроек читаются перед каждой фразой."""
@@ -348,9 +551,11 @@ class DictationRuntime(QObject):
         self.tray.start()
         self.supervisor.start()
         result = self.hotkey.grab(self.settings.hotkey, HotkeyMode(self.settings.hotkey_mode))
+        self._record_hotkey_grab("ok" if result.ok else "busy", 1)
         if not result.ok:
             self.tray.set_state(TrayState.NOKEY)
-            notify.notify_hotkey_not_grabbed()
+            self._start_regrab(result.code)
+            notify.notify_hotkey_not_grabbed(self.settings.hotkey)
             try:
                 candidates = self.hotkey.free_candidates(list(DEFAULT_CANDIDATES))
                 log.info("Хоткей не захвачен (%s); свободные варианты: %s", result.code, candidates)
@@ -452,9 +657,11 @@ class DictationRuntime(QObject):
         if self.stats_timer is not None:
             self._cleanup("остановка таймера статистики", self.stats_timer.stop)
             self._cleanup("удаление таймера статистики", self.stats_timer.deleteLater)
+        self._stop_regrab()
         # Страховка для таймеров, если завершение оркестратора прервалось ошибкой.
         for timer in tuple(self.timers):
             self._cleanup("отложенный таймер", partial(self.cancel_timer, timer))
+        self._selfcheck_timer = None
         self._cleanup("восстановление буфера обмена", self.restore_paste)
         if self._started:
             self._cleanup("обработчик atexit", partial(atexit.unregister, self.restore_paste))

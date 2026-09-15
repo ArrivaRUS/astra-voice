@@ -43,6 +43,8 @@ from astra_voice.ui.pill import (
     CLIPBOARD_REASONS,
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
+    ERROR_MICROPHONE_CHANGED,
+    ERROR_MICROPHONE_LOST,
     ERROR_MICROPHONE_UNAVAILABLE,
     ERROR_MODEL_NOT_LOADED,
     ERROR_REASONS,
@@ -151,6 +153,9 @@ class Rig:
         self.tray = FakeTray(self.trace)
         self.stats = FakeStats()
         self.restart_worker = Mock()
+        self.device_changed = Mock()
+        self.device_lost = Mock()
+        self.device_selected = Mock()
         self.backend = Mock(spec=HotkeyBackend)
         self.backend.grab_combo.return_value = GrabResult("ok", keycode=65)
         self.backend.grab_escape.return_value = GrabResult("ok", keycode=9)
@@ -175,6 +180,9 @@ class Rig:
             record_params=lambda: self.params,
             clock=self.clock,
             stats=self.stats,
+            on_device_changed=self.device_changed,
+            on_device_lost=self.device_lost,
+            on_device_selected=self.device_selected,
             log=logging.getLogger("test.dictation"),
         )
         self.hotkey.on_state = self.core.on_hotkey_state
@@ -278,11 +286,11 @@ def test_full_ptt_cycle_and_timings(rig: Rig) -> None:
     ]
     assert rig.trace[:6] == [
         ("active_window", 42),
+        ("clock", 10.0),
         ("send", "record.start"),
         ("pill", PillState.LISTENING, None, None),
         ("tray", TrayState.LISTENING, None),
         ("recording", True),
-        ("clock", 10.0),
     ]
     assert "utterance_id" not in rig.params
     rig.event("level", peak_dbfs=-30.0)
@@ -718,6 +726,7 @@ def test_processing_watchdog_releases_hotkey_without_empty_stat(
     ],
 )
 def test_error_mapping(rig: Rig, code: str, reason: str, kind: str | None) -> None:
+    rig.params["device"] = ""
     rig.start()
     rig.event("error", code=code, message=MARKER)
     assert rig.pill.calls[-1] == (PillState.ERROR, reason, None)
@@ -726,6 +735,186 @@ def test_error_mapping(rig: Rig, code: str, reason: str, kind: str | None) -> No
         [] if kind is None else [{"type": "mic_error", "kind": kind, "recovered_by": "none"}]
     )
     assert rig.done == 1 and not rig.recording
+
+
+@pytest.mark.parametrize("mode", list(HotkeyMode))
+@pytest.mark.parametrize("elapsed", [0.3, 4.2])
+def test_microphone_changed_stops_recognizes_and_releases_hotkey(
+    mode: HotkeyMode, elapsed: float
+) -> None:
+    rig = Rig(mode)
+    rig.now = 0.0
+    rig.combo_key(pressed=True)
+    uid = rig.uid
+    rig.now = elapsed
+
+    def notified(name: str) -> None:
+        assert rig.commands() == ["record.start", "record.stop", "recognize"]
+        assert not rig.recording
+
+    rig.device_changed.side_effect = notified
+    for _ in range(2):
+        rig.event("audio.ready", changed="Источник звука изменился: Встроенный микрофон")
+    assert rig.core.phase == DictationPhase.PROCESSING
+    assert rig.sent[1:] == [
+        ({"type": "record.stop", "utterance_id": uid}, None),
+        ({"type": "recognize", "utterance_id": uid}, RECOGNIZE_TIMEOUT_S),
+    ]
+    rig.device_changed.assert_called_once_with("Встроенный микрофон")
+    rig.device_selected.assert_not_called()
+    rig.device_lost.assert_not_called()
+    assert rig.stats.events == [
+        {"type": "mic_error", "kind": "device-changed", "recovered_by": "none"}
+    ]
+    assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_MICROPHONE_CHANGED, None)
+    rig.event("level", peak_dbfs=-20)
+    rig.result()
+    assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
+    assert rig.stats.events[-1]["audio_ms"] == pytest.approx(elapsed * 1000)
+    assert rig.stats.events[-1]["result"] == "ok"
+    assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_MICROPHONE_CHANGED, None)
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    assert rig.done == 1
+    rig.backend.ungrab_escape.assert_called_once_with()
+    rig.timer(3000).fire()
+    rig.combo_key(pressed=False)
+    rig.now += 1
+    rig.combo_key(pressed=True)
+    assert rig.uid != uid
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    calls = rig.pill.calls
+    rig.pill.calls = calls
+    assert rig.pill.calls[-1] == (PillState.LISTENING, None, None)
+
+
+@pytest.mark.parametrize("elapsed", [0.0, 0.299])
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"device": "USB-гарнитура", "changed": "Источник звука изменился: другое имя"},
+        {"changed": "Источник звука изменился: USB-гарнитура"},
+        {"device": "", "changed": "Источник звука изменился: USB-гарнитура"},
+        {"changed": "Источник звука изменился: старое: USB-гарнитура"},
+    ],
+)
+def test_microphone_selected_at_start_once(
+    rig: Rig, elapsed: float, fields: dict[str, str]
+) -> None:
+    rig.start()
+    rig.now += elapsed
+    rig.event("audio.ready", **fields)
+    rig.event("audio.ready", **fields)
+    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_changed.assert_not_called()
+    assert rig.commands() == ["record.start"]
+    assert rig.recording and rig.core.phase == DictationPhase.RECORDING
+    assert not rig.stats.events
+    rig.stop()
+    rig.result()
+    rig.start()
+    rig.event("audio.ready", **fields)
+    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.event("audio.ready", changed="Источник звука изменился: Встроенный микрофон")
+    assert rig.device_selected.call_count == 2
+    rig.device_selected.assert_called_with("Встроенный микрофон")
+
+
+@pytest.mark.parametrize("elapsed", [0.1, 2.0])
+def test_audio_ready_without_changed_only_logs(
+    rig: Rig, elapsed: float, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.start()
+    rig.now += elapsed
+    with caplog.at_level(logging.DEBUG, logger="test.dictation"):
+        rig.event("audio.ready", device="USB-гарнитура")
+    assert "диктовка: audio.ready" in caplog.text
+    assert rig.commands() == ["record.start"]
+    assert rig.recording
+    assert not rig.stats.events
+    rig.device_changed.assert_not_called()
+    rig.device_selected.assert_not_called()
+
+
+@pytest.mark.parametrize("elapsed", [0.1, 2.0])
+@pytest.mark.parametrize("changed", ["", "Источник звука изменился: ", "без разделителя", None])
+def test_unknown_device_never_notifies(rig: Rig, elapsed: float, changed: object) -> None:
+    rig.start()
+    rig.now += elapsed
+    rig.event("audio.ready", changed=changed)
+    rig.device_changed.assert_not_called()
+    rig.device_selected.assert_not_called()
+    assert rig.recording == (elapsed < 0.3)
+    if elapsed >= 0.3:
+        assert rig.commands() == ["record.start", "record.stop", "recognize"]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [PasteOutcomeKind.PASTED, PasteOutcomeKind.CLIPBOARD_ONLY, PasteOutcomeKind.WINDOW_CHANGED],
+)
+@pytest.mark.parametrize("text", [MARKER, ""])
+def test_microphone_change_remains_visible_after_result(
+    rig: Rig, outcome: PasteOutcomeKind, text: str
+) -> None:
+    rig.start()
+    rig.now += 1
+    rig.event("audio.ready", device="Встроенный микрофон", changed="смена")
+    rig.outcomes.append(outcome)
+    rig.result(text)
+    assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_MICROPHONE_CHANGED, None)
+    rig.timer(3000).fire()
+    assert rig.core.phase == DictationPhase.IDLE
+
+
+@pytest.mark.parametrize("command", ["record.stop", "recognize"])
+def test_microphone_change_stop_failure_releases_hotkey(rig: Rig, command: str) -> None:
+    def fail(message: dict[str, Any]) -> None:
+        if message["type"] == command:
+            raise RuntimeError("send failed")
+
+    rig.start()
+    rig.during_send = fail
+    rig.now += 1
+    rig.event("audio.ready", device="Встроенный микрофон", changed="смена")
+    assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    assert not rig.recording
+
+
+def test_changed_name_deduplicates_across_callback_types(rig: Rig) -> None:
+    rig.start()
+    rig.event("audio.ready", device="USB-гарнитура", changed="смена")
+    rig.now += 1
+    rig.event("audio.ready", device="USB-гарнитура", changed="смена")
+    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_changed.assert_not_called()
+    assert rig.commands() == ["record.start", "record.stop", "recognize"]
+
+
+@pytest.mark.parametrize("device", ["alsa_input.usb-headset", "", None])
+def test_missing_device_uses_selection_at_record_start(rig: Rig, device: str | None) -> None:
+    rig.params["device"] = device
+    rig.start()
+    rig.params["device"] = None if device else "alsa_input.usb-headset"
+    rig.event("error", code="audio-no-device")
+    assert rig.stats.events == [
+        {"type": "mic_error", "kind": "device-lost" if device else "none", "recovered_by": "none"}
+    ]
+    reason = ERROR_MICROPHONE_LOST if device else ERROR_MICROPHONE_UNAVAILABLE
+    assert rig.pill.calls[-1] == (PillState.ERROR, reason, None)
+    assert rig.device_lost.call_count == int(bool(device))
+    assert not rig.recording and rig.done == 1
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    rig.backend.ungrab_escape.assert_called_once_with()
+
+
+def test_synchronous_audio_ready_on_open_is_between_recordings(rig: Rig) -> None:
+    rig.during_send = lambda message: rig.event(
+        "audio.ready", changed="Источник звука изменился: USB-гарнитура"
+    )
+    rig.start()
+    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    assert rig.recording and rig.commands() == ["record.start"]
 
 
 def test_limit_stops_once_and_late_levels_do_not_replace_processing(rig: Rig) -> None:

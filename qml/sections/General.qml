@@ -1,6 +1,5 @@
 // Раздел «Общие» — референс design/refs/01-general-base.png (+ -dark), спека §3.
-// Семь настроек в трёх группах, помещаются без прокрутки. Значения — статические
-// дефолты M1: настоящие придут из core/settings.py в M3.
+// Семь настроек в трёх группах. Без моста настроек используются дефолты M1.
 import QtQuick 2.15
 import QtQuick.Layouts 1.15
 import ".."
@@ -8,6 +7,14 @@ import "../components"
 
 Column {
     id: root
+
+    readonly property var settings: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
+    readonly property string hotkeyStatus: settings ? settings.hotkeyStatus : "ok"
+
+    function isLocked(name) {
+        return settings && settings.lockedSettings
+            ? settings.lockedSettings.indexOf(name) >= 0 : false
+    }
 
     spacing: Theme.spaceGroupGap
 
@@ -20,15 +27,44 @@ Column {
             divider: false
             label: qsTr("Горячая клавиша")
             sub: qsTr("Удерживайте и говорите — текст появится там, где курсор")
+            locked: root.isLocked("hotkey")
+
+            Text {
+                text: root.hotkeyStatus === "busy" ? qsTr("Занята другой программой")
+                    : root.hotkeyStatus === "not-grabbed" ? qsTr("Горячая клавиша не захвачена")
+                    : root.hotkeyStatus === "bad-combo" ? qsTr("Такое сочетание не подходит — выберите другое")
+                    : ""
+                visible: text !== ""
+                color: root.hotkeyStatus === "not-grabbed" ? Theme.dangerInk : Theme.warningInk
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                renderType: Text.NativeRendering
+                wrapMode: Text.WordWrap
+                Layout.maximumWidth: root.width / 4
+                Layout.alignment: Qt.AlignVCenter
+            }
+
+            AvButton {
+                text: qsTr("Повторить")
+                small: true
+                visible: root.hotkeyStatus === "busy" || root.hotkeyStatus === "not-grabbed"
+                enabled: !root.isLocked("hotkey")
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: {
+                    if (root.settings && root.settings.retryHotkey)
+                        root.settings.retryHotkey()
+                }
+            }
 
             KeyChip {
-                text: "Ctrl + Space"
+                text: root.settings ? root.settings.hotkey : qsTr("Ctrl + Space")
                 Layout.alignment: Qt.AlignVCenter
             }
 
             AvButton {
                 text: qsTr("Изменить")
                 small: true
+                enabled: !root.isLocked("hotkey")
                 Layout.alignment: Qt.AlignVCenter
             }
         }
@@ -37,24 +73,56 @@ Column {
             width: parent.width
             label: qsTr("Режим")
             sub: qsTr("Удерживать — самый предсказуемый вариант")
+            locked: root.isLocked("hotkey_mode")
 
             AvSegmented {
+                id: modeSelector
                 options: [qsTr("Удерживать"), qsTr("Нажать-нажать")]
-                currentIndex: 0
+                enabled: !root.isLocked("hotkey_mode")
                 Layout.alignment: Qt.AlignVCenter
+
+                Binding {
+                    target: modeSelector
+                    property: "currentIndex"
+                    value: (root.settings && root.settings.hotkeyMode === "toggle") ? 1 : 0
+                }
+
+                onCurrentIndexChanged: {
+                    var mode = currentIndex === 1 ? "toggle" : "ptt"
+                    if (root.settings && root.settings.hotkeyMode !== mode)
+                        root.settings.hotkeyMode = mode
+                }
             }
         }
 
         SettingRow {
             width: parent.width
-            // Пояснения нет: техническое имя карты пользователю не нужно.
-            // В M3 сюда пойдёт только человекочитаемое device.description из PulseAudio.
             label: qsTr("Микрофон")
+            locked: root.isLocked("device")
 
             AvSelect {
+                id: deviceSelector
                 Layout.preferredWidth: 236  // §4.4: типовая ширина списка в строке настройки
                 Layout.alignment: Qt.AlignVCenter
-                model: [qsTr("Системный по умолчанию")]
+                enabled: !root.isLocked("device")
+                model: (root.settings && root.settings.device
+                    && root.settings.device !== qsTr("Системный по умолчанию"))
+                    ? [root.settings.device, qsTr("Системный по умолчанию")]
+                    : [qsTr("Системный по умолчанию")]
+
+                Binding {
+                    target: deviceSelector
+                    property: "currentIndex"
+                    value: Math.max(0, deviceSelector.model.indexOf(
+                        root.settings ? root.settings.device : ""))
+                }
+
+                onCurrentIndexChanged: {
+                    if (root.settings && !root.isLocked("device")
+                            && currentIndex >= 0 && currentIndex < model.length
+                            && root.settings.device !== model[currentIndex])
+                        root.settings.device = model[currentIndex]
+                }
             }
         }
     }
@@ -68,11 +136,28 @@ Column {
             divider: false
             label: qsTr("Индикатор записи")
             sub: qsTr("Пилюля не забирает фокус и не появляется в Alt+Tab")
+            locked: root.isLocked("pill_enabled")
 
             AvSelect {
+                id: pillSelector
                 Layout.preferredWidth: 236
                 Layout.alignment: Qt.AlignVCenter
                 model: [qsTr("Пилюля снизу экрана"), qsTr("Только значок в трее")]
+                enabled: !root.isLocked("pill_enabled")
+
+                Binding {
+                    target: pillSelector
+                    property: "currentIndex"
+                    value: !root.settings || root.settings.pillEnabled === true ? 0 : 1
+                }
+
+                onCurrentIndexChanged: {
+                    if (currentIndex < 0)
+                        return
+                    var pillEnabled = currentIndex === 0
+                    if (root.settings && root.settings.pillEnabled !== pillEnabled)
+                        root.settings.pillEnabled = pillEnabled
+                }
             }
         }
 
@@ -124,11 +209,24 @@ Column {
             divider: false
             label: qsTr("Автозапуск при входе в систему")
             toggle: autostartToggle
+            locked: root.isLocked("autostart")
+            rowEnabled: !root.isLocked("autostart")
 
             AvToggle {
                 id: autostartToggle
-                checked: true
+                locked: root.isLocked("autostart")
                 Layout.alignment: Qt.AlignVCenter
+
+                Binding {
+                    target: autostartToggle
+                    property: "checked"
+                    value: root.settings ? root.settings.autostart : true
+                }
+
+                onCheckedChanged: {
+                    if (root.settings && root.settings.autostart !== checked)
+                        root.settings.autostart = checked
+                }
             }
         }
     }

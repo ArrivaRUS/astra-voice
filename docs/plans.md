@@ -69,7 +69,7 @@ paplay --device=av_test data/test/test-ru-6s.wav
 | M2 | Воркер и движок (+T1 §5 M2) | M1, S3 | v0.1 | [x] 2026-09-11 (CI 6/6, DoD в spikes/m2_live) |
 | M3 | Звук | M2, S5 | v0.1 | [ ] |
 | M4 | Цикл диктовки: хоткей · пилюля · трей · вставка (+T1 §5 M4 ×2, Fly-ветки) | M3, S1, S4 | v0.1 | [x] 2026-09-15 (Ц2 p95 291, T-50/T-58 PASS, T-56 устойчив) |
-| M5 | Онбординг и первая модель | M4 | v0.1 | [ ] |
+| M5 | Онбординг и первая модель | M4 | v0.1 | [~] код, ревью впереди |
 | R1 | **Релиз v0.1 «Диктовка работает» — 30.09** (⛔ G5) | M5 | v0.1 | [ ] |
 | M6 | Каталог (+T1 §5 M6) | R1 | v0.2 | [ ] |
 | M7 | Сеть и проверки (+T1 §5 M7) | M6 | v0.2 | [ ] |
@@ -302,19 +302,36 @@ R2 стек/фокус пилюли на KWin и fly-wm · R3/R4 `Ctrl+Space`, �
 ### Goal
 Первый запуск проводит через 5 экранов до рабочей диктовки; минимальный загрузчик модели по умолчанию (HF, `Range`, sha256, смоук); установка из папки; поле захвата с конфликтами; тест микрофона без вставки; до включения тумблеров — ноль сети.
 ### Tasks (US-1.2, 1.3, 1.5, 1.6, 9.1-Общие, 1.4-минимум; компоненты `qml/onboarding/*`, `models/{store,downloader,installer,catalog}.py`, `net/http.py`-минимум, `ui/window.py`; синтез §7 И5/И6/О2; T1 У6/У13/У20/У23)
-- [ ] `qml/onboarding/{Step1Network,Step2Model,Step3Hotkey,Step4Mic,Step5Done}.qml` + обрамление спеки §10 (шапка «Шаг N из 5», точки, нижняя панель 60, ghost «Пропустить»; «Готово» disabled без модели — У11) — референсы `design/refs/08-onboarding-1-network.png` … `08-onboarding-5-done.png` (+`-dark`).
-- [ ] Шаг 1: язык (авто по `LANG`), два тумблера **пусты**; при policy `offline`/`secure` — заблокированы «Задано администратором»; пока не включены — 0 сетевых запросов (S1-A1).
-- [ ] `models/store.py`: `~/.local/share/astra-voice/models/<id>/<revision>/` + `current.json`, staging `<rev>.partial/`, `disk_usage ≥ size×1,2`, `MemTotal` vs `min_ram_mb`, размер на диске + unit tmpdir.
-- [ ] `net/http.py` минимум (T1 У13, И5/И6): `requests.Session(trust_env=False)`, UA `astra-voice/X.Y.Z (+repo)`, CA `policy.ca_bundle or /etc/ssl/certs/ca-certificates.crt` + `SSL_CERT_FILE`, `allow_redirects=False` + ручные редиректы по allowlist ≤ 5, `stream=True` с общим deadline по `time.monotonic()` и `cancel` Event между чанками; гейт «сеть разрешена?» (явное «Скачать» разрешено при пустых тумблерах, запрещено при `offline`/policy/`HF_HUB_OFFLINE=1`); `HF_ENDPOINT` не учитывается (T-26).
-- [ ] `models/downloader.py` минимум: один источник `hf` по `/resolve/{revision}/`, `.part`, `Range` только при 206 с корректным `Content-Range` (200 → сначала), инкрементальный sha256, обрыв на `size+1` **фактических** байт, `fsync`, `os.replace`, прогресс/скорость/ETA, отмена + unit на fault-server (206/200/обрыв/подмена/`size+1`/redirect-evil).
-- [ ] `models/installer.py`: из папки/файла — те же sha256; порядок О2: скачать → sha256 → `rename` в `<rev>/` → смоук `transcribe.file` вшитого wav (`expect_any`) → `current.json` → `model.load`; провал смоука → `broken` в `state.json`, старая остаётся; незавершённая транзакция на старте → перепроверка + интеграционный тест «подменённый байт → откат».
-- [ ] `models/catalog.py` минимум + `catalog.schema.json` (поля PRD 0.5 §7.3 с `serial`/`trust_epoch`/`revoked[]`): встроенный `data/catalog.json` с одной записью `gigaam-v3-e2e-rnnt-int8` (`files[]` из S3) + `catalog.json.sig` (S1) → `Verifier(catalog)`; валидатор путей (У6: regex `id`/`revision`, `path` относительный без `..`/NUL, `realpath` внутри staging) — T-09.
-- [ ] Шаг 2: карточка рекомендованной модели (состояния 7 · 3 · 5 · 1 · 17 · 18 спеки §5.4), «Скачать» показывает хост и объём (226 МБ), «Установить из файла/папки…» (`QFileDialog`) — референсы `08-onboarding-2-model.png`, `02-models-file-dialogs.png`; нет сети → состояние 14 «Нет доступа к huggingface.co».
-- [ ] Шаг 3 + строка «Горячая клавиша» в «Общих»: поле захвата 7 состояний спеки §7 (`idle · capturing · captured · success · conflict · duplicate · not-grabbed`), `XGrabKeyboard` только пока открыто; сегмент «удерживать / нажать-нажать» — референсы `08-onboarding-3-hotkey.png`, `01-general-hotkey.png`.
-- [ ] Шаг 4: выбор устройства, живой уровень, «Сказать тестовую фразу» → текст на экране **без вставки** (S1-A5) — референсы `08-onboarding-4-mic.png`, `01-general-mic.png`.
-- [ ] Шаг 5 «Готово»: в v0.1 без автозапуска (тумблер появится в M9), уведомление «Astra Voice готов: зажмите <хоткей> и говорите», окно → трей, флаг `onboarding_done`; закрытие окна на середине → следующий запуск с первого незавершённого шага (спека §10).
-- [ ] Диалог подтверждения §11.1 как компонент — референс `10-dialogs.png` (+`-dark`).
-- [ ] `tools/validate downloads --faults`, `tools/validate privacy --network-denied` (минимум: гейт + `tcpdump`-обёртка).
+- [x] `qml/onboarding/{Step1Network,Step2Model,Step3Hotkey,Step4Mic,Step5Done}.qml` + обрамление спеки §10 (шапка «Шаг N из 5», точки, нижняя панель 60, ghost «Пропустить»; «Готово» disabled без модели — У11) — референсы `design/refs/08-onboarding-1-network.png` … `08-onboarding-5-done.png` (+`-dark`).
+- [x] Шаг 1: язык (авто по `LANG`), два тумблера **пусты**; при policy `offline`/`secure` — заблокированы «Задано администратором»; пока не включены — 0 сетевых запросов (S1-A1).
+- [x] `models/store.py`: `~/.local/share/astra-voice/models/<id>/<revision>/` + `current.json`, staging `<rev>.partial/`, `disk_usage ≥ size×1,2`, `MemTotal` vs `min_ram_mb`, размер на диске + unit tmpdir.
+- [x] `net/http.py` минимум (T1 У13, И5/И6): `requests.Session(trust_env=False)`, UA `astra-voice/X.Y.Z (+repo)`, CA `policy.ca_bundle or /etc/ssl/certs/ca-certificates.crt` + `SSL_CERT_FILE`, `allow_redirects=False` + ручные редиректы по allowlist ≤ 5, `stream=True` с общим deadline по `time.monotonic()` и `cancel` Event между чанками; гейт «сеть разрешена?» (явное «Скачать» разрешено при пустых тумблерах, запрещено при `offline`/policy/`HF_HUB_OFFLINE=1`); `HF_ENDPOINT` не учитывается (T-26).
+- [x] `models/downloader.py` минимум: один источник `hf` по `/resolve/{revision}/`, `.part`, `Range` только при 206 с корректным `Content-Range` (200 → сначала), инкрементальный sha256, обрыв на `size+1` **фактических** байт, `fsync`, `os.replace`, прогресс/скорость/ETA, отмена + unit на fault-server (206/200/обрыв/подмена/`size+1`/redirect-evil).
+- [~] `models/installer.py`: из папки/файла — те же sha256; порядок О2: скачать → sha256 → `rename` в `<rev>/` → смоук `transcribe.file` вшитого wav (`expect_any`) → `current.json` → `model.load`; провал смоука → `broken` в `state.json`, старая остаётся; незавершённая транзакция на старте → перепроверка + интеграционный тест «подменённый байт → откат».
+- [x] `models/catalog.py` минимум + `catalog.schema.json` (поля PRD 0.5 §7.3 с `serial`/`trust_epoch`/`revoked[]`): встроенный `data/catalog.json` с одной записью `gigaam-v3-e2e-rnnt-int8` (`files[]` из S3) + `catalog.json.sig` (S1) → `Verifier(catalog)`; валидатор путей (У6: regex `id`/`revision`, `path` относительный без `..`/NUL, `realpath` внутри staging) — T-09.
+- [~] Шаг 2: карточка рекомендованной модели (состояния 7 · 3 · 5 · 1 · 17 · 18 спеки §5.4), «Скачать» показывает хост и объём (226 МБ), «Установить из файла/папки…» (`QFileDialog`) — референсы `08-onboarding-2-model.png`, `02-models-file-dialogs.png`; нет сети → состояние 14 «Нет доступа к huggingface.co».
+- [x] Шаг 3 + строка «Горячая клавиша» в «Общих»: поле захвата 7 состояний спеки §7 (`idle · capturing · captured · success · conflict · duplicate · not-grabbed`), `XGrabKeyboard` только пока открыто; сегмент «удерживать / нажать-нажать» — референсы `08-onboarding-3-hotkey.png`, `01-general-hotkey.png`.
+- [~] Шаг 4: выбор устройства, живой уровень, «Сказать тестовую фразу» → текст на экране **без вставки** (S1-A5) — референсы `08-onboarding-4-mic.png`, `01-general-mic.png`.
+- [x] Шаг 5 «Готово»: в v0.1 без автозапуска (тумблер появится в M9), уведомление «Astra Voice готов: зажмите <хоткей> и говорите», окно → трей, флаг `onboarding_done`; закрытие окна на середине → следующий запуск с первого незавершённого шага (спека §10).
+- [~] Диалог подтверждения §11.1 как компонент — референс `10-dialogs.png` (+`-dark`).
+- [x] `tools/validate downloads --faults`, `tools/validate privacy --network-denied` (минимум: гейт + `tcpdump`-обёртка).
+### Статус на 2026-09-15 (конец сессии) — код написан, ревью НЕ было
+Три зоны `developer-codex` отработали параллельно и сданы; код зафиксирован в `main` до ревью
+(см. `decisions/log.md`, запись «M5: код трёх зон написан и зафиксирован в main ДО ревью»).
+Зелено: `ruff`, `ruff format`, `mypy`, 3259 unit (+514 зоны A), 113 xvfb (+45 зоны B), `gen_theme --check`,
+`tools/validate downloads --faults` 7/7, `tools/validate privacy --network-denied` 9/9,
+`packaging/build-deb.sh --host` (18 ресурсов), `gpgv` подписи каталога.
+`[~]` означает:
+- **Установщик** — установка из папки есть, из архива (zip/tar) отложена в M6.
+- **Шаг 2** — карточка только рекомендованной модели; каталог из 12 карточек — M6.
+- **Шаг 4 «Микрофон»** — экран QML готов (зона B), мост со стороны Python **не начат** (зона C остановлена
+  до первой записи в файлы, задача стартует с нуля): нужны `devices/device/level/testPhrase/testText/testState`
+  и `dictation.start_test()` без вставки.
+- **Диалог подтверждения** — компонент `AvDialog` написан, но не подключён (нет действий удаления до M6).
+Не сделано и ждёт следующей сессии: `OnboardingBridge` как контекстное свойство (сейчас живёт только в фейке
+теста), `docs/ui-bridge.md`, слоты по просьбам зоны B (`pickInstallPath`, `conflictOwner`, «открыть папку»,
+словарь `testState`, тумблер звука), место для `saveError` и `modelSelfcheck` в интерфейсе,
+проверка `tcpdump` (нужны права администратора — делает заказчик).
 ### Definition of Done
 - S1-A1/A2/A3/A5/A7 зелёные на чистом профиле (`rm -rf ~/.{config,local/share,local/state,cache}/astra-voice`) на машине заказчика; на чистой ВМ — как только выделена; `tcpdump`: до включения тумблеров — 0 соединений, кроме явного «Скачать» на `huggingface.co`; T-09, T-16, T-23, T-26 зелёные; Ц3-черновик (секундомер от `apt install` до первой фразы) записан в `status.md`.
 ### Validation

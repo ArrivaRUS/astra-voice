@@ -38,7 +38,12 @@ from astra_voice.platform.hotkey import (
 from astra_voice.platform.paste import PasteMode, PasteOutcomeKind, normalize
 from astra_voice.platform.session import SessionKind
 from astra_voice.runtime import DictationRuntime
-from astra_voice.ui.pill import ERROR_MODEL_LOAD_FAILED, PillState
+from astra_voice.ui.pill import (
+    ERROR_MODEL_LOAD_FAILED,
+    ERROR_MODEL_NOT_LOADED,
+    ERROR_SELFCHECK_FAILED,
+    PillState,
+)
 from astra_voice.ui.tray_icons import TrayState
 from astra_voice.worker import ipc
 
@@ -250,9 +255,43 @@ class Rig:
         self.event(type="result", text=text)
 
 
+@pytest.fixture(autouse=True)
+def smoke_wav(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    wav = tmp_path / "smoke-ru-6s.wav"
+    wav.touch()
+    monkeypatch.setattr(module, "smoke_wav_path", lambda: wav)
+    return wav
+
+
 @pytest.fixture
 def rig(monkeypatch: pytest.MonkeyPatch) -> Rig:
     return Rig(monkeypatch)
+
+
+@pytest.mark.parametrize("event_kind", ["selected", "changed", "lost"])
+def test_microphone_notification_wiring(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, event_kind: str
+) -> None:
+    monkeypatch.setattr(rig.runtime.orchestrator, "_clock", lambda: rig.now)
+    rig.runtime.settings.extra["device"] = "alsa_input.usb-headset"
+    rig.runtime.start()
+    rig.hotkey.fsm.press(rig.now)
+    if event_kind == "lost":
+        rig.event(type="error", code="audio-no-device")
+        assert rig.notify.mock_calls == [call.notify_microphone_lost()]
+    else:
+        rig.now += 1.0 if event_kind == "changed" else 0.1
+        rig.event(
+            type="audio.ready",
+            device="Встроенный микрофон",
+            changed="Источник звука изменился: Встроенный микрофон",
+        )
+        expected = (
+            call.notify_microphone_changed("Встроенный микрофон")
+            if event_kind == "changed"
+            else call.notify_microphone_selected("Встроенный микрофон")
+        )
+        assert rig.notify.mock_calls == [expected]
 
 
 def assert_phase(runtime: DictationRuntime, expected: DictationPhase) -> None:
@@ -379,6 +418,11 @@ def test_start_wires_resources_and_real_dictation(rig: Rig) -> None:
     rig.notifier.activated.emit(17)
     rig.hotkey.process_pending.assert_called_once_with()
     assert rig.timers[0].interval == 200
+    assert runtime._regrab_timer is None
+    rig.stats.append.assert_called_once_with(
+        "hotkey_grab", key_role="text", result="ok", attempts=1
+    )
+    rig.stats.append.reset_mock()
     rig.recognize()
     rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
     assert runtime.last_text == MARKER
@@ -509,6 +553,7 @@ def test_model_loaded_hides_pill_and_forwards_event(
     caplog.set_level(logging.INFO, logger=module.__name__)
     event = {"type": "model.loaded", "generation": 1, "dir": MARKER, **fields}
     rig.supervisor_factory.call_args.kwargs["on_event"](event)
+    rig.event(type="result", utterance_id="file", text="Проверка связи")
     on_event.assert_called_once_with(event)
     assert on_event.call_args.args[0] is event
     rig.pill.hide.assert_called_once_with()
@@ -557,6 +602,7 @@ def test_model_load_send_failure_shows_error_and_releases_hotkey(
         rig.runtime.start()
         rig.event(type="hello")
         rig.event(type="model.loaded")
+        rig.event(type="result", utterance_id="file", text="Проверка связи")
         rig.tray.set_state.assert_called_once_with(TrayState.IDLE)
         rig.tray.set_state.reset_mock()
     rig.supervisor.send.side_effect = RuntimeError(f"Воркер не запущен: /tmp/{MARKER}")
@@ -641,14 +687,15 @@ def test_model_loaded_resets_consecutive_failures(monkeypatch: pytest.MonkeyPatc
     rig.supervisor.generation += 1
     rig.event(type="hello")
     rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="Проверка связи")
     assert rig.tray.set_state.call_args_list == [call(TrayState.ERROR), call(TrayState.IDLE)]
     rig.supervisor.generation += 1
     rig.event(type="hello")
-    assert rig.supervisor.send.call_count == 3
+    assert rig.supervisor.send.call_count == 4
     rig.event(type="error", code="load-timeout", request_type="model.load")
     rig.supervisor.generation += 1
     rig.event(type="hello")
-    assert rig.supervisor.send.call_count == 4
+    assert rig.supervisor.send.call_count == 5
     rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
 
 
@@ -681,6 +728,7 @@ def test_press_retries_model_load_after_two_failures(monkeypatch: pytest.MonkeyP
     rig.event(type="hello")
     assert rig.supervisor.send.call_count == 3
     rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="Проверка связи")
     rig.pill.hide.assert_called_once_with()
     rig.tray.set_state.assert_called_with(TrayState.IDLE)
     rig.hotkey.fsm.escape(rig.now + 2)
@@ -739,16 +787,21 @@ def test_duplicate_or_stale_hello_does_not_reload_model(monkeypatch: pytest.Monk
     rig.event(type="hello", generation=0)
     rig.supervisor.send.assert_called_once()
     rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="Проверка связи")
     rig.event(type="hello")
-    rig.supervisor.send.assert_called_once()
+    assert [c.args[0]["type"] for c in rig.supervisor.send.call_args_list] == [
+        "model.load",
+        "transcribe.file",
+    ]
 
 
 def test_restart_loads_model_again(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": str(tmp_path)}))
     rig.runtime.start()
     rig.event(type="hello")
-    rig.event(type="model.loaded")
     request = rig.supervisor.send.call_args.args[0]
+    rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="Проверка связи")
     new = Mock(state="running", generation=1)
     rig.supervisor_factory.return_value = new
     rig.runtime.restart_worker()
@@ -762,6 +815,7 @@ def test_restart_loads_model_again(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     rig.supervisor_factory.call_args.kwargs["on_event"](
         {"type": "model.loaded", "generation": new.generation}
     )
+    rig.event(type="result", generation=new.generation, utterance_id="file", text="Проверка связи")
     rig.pill.hide.assert_called_once_with()
 
 
@@ -774,6 +828,7 @@ def test_hotkey_during_model_load_only_blocks_recording(
     rig.event(type="hello")
     if restart:
         rig.event(type="model.loaded")
+        rig.event(type="result", utterance_id="file", text="Проверка связи")
         rig.runtime.restart_worker()
         rig.event(type="hello")
     on_state = Mock()
@@ -794,6 +849,7 @@ def test_hotkey_during_model_load_only_blocks_recording(
     rig.hotkey.on_state(HotkeyState.RECORDING, "press")
     on_state.assert_not_called()
     rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="Проверка связи")
     rig.hotkey.on_state(HotkeyState.RECORDING, "press")
     on_state.assert_called_once_with(HotkeyState.RECORDING, "press")
 
@@ -824,6 +880,7 @@ def test_model_load_preserves_recording_started_before_hello(
 
     if loaded_before_release:
         rig.event(type="model.loaded")
+        rig.event(type="result", utterance_id="file", text="Проверка связи")
         assert_phase(rig.runtime, DictationPhase.RECORDING)
         rig.pill.show_state.assert_called_once_with(PillState.LISTENING)
         rig.tray.set_state.assert_called_once_with(TrayState.LISTENING)
@@ -837,6 +894,7 @@ def test_model_load_preserves_recording_started_before_hello(
     )
     if not loaded_before_release:
         rig.event(type="model.loaded")
+        rig.event(type="result", utterance_id="file", text="Проверка связи")
     assert not rig.runtime._loading_model
     rig.pill.hide.assert_not_called()
     assert rig.pill.show_state.call_args_list == [
@@ -1008,12 +1066,225 @@ def test_failed_grab_keeps_app_running(
         rig.runtime.start()
         rig.runtime.start()
     rig.tray.set_state.assert_called_once_with(TrayState.NOKEY)
-    rig.notify.notify_hotkey_not_grabbed.assert_called_once_with()
+    rig.notify.notify_hotkey_not_grabbed.assert_called_once_with("Ctrl+Space")
     rig.notify.notify_tray_unavailable.assert_not_called()
     rig.hotkey.free_candidates.assert_called_once_with(list(DEFAULT_CANDIDATES))
     assert DEFAULT_CANDIDATES[0] in caplog.text
     assert rig.supervisor.state == "running"
     rig.create_notifier.assert_not_called()
+    timer = rig.timers[0]
+    assert rig.runtime._regrab_timer is timer
+    assert timer.interval == 30000 == module.REGRAB_INTERVAL_MS
+    assert not timer.single_shot
+    assert timer.active and not timer.deleted
+    rig.stats.append.assert_called_once_with(
+        "hotkey_grab", key_role="text", result="busy", attempts=1
+    )
+
+
+def test_regrab_busy_ticks_are_silent(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
+    rig.grab_code = "busy"
+    rig.runtime.start()
+    timer = rig.timers[0]
+    rig.notify.reset_mock()
+    with caplog.at_level(logging.DEBUG):
+        caplog.clear()
+        for attempt in range(1, 21):
+            timer.fire()
+            assert rig.runtime._regrab_attempts == attempt
+            assert timer.active and not timer.deleted
+    assert not caplog.records
+    assert not rig.notify.mock_calls
+    assert rig.hotkey.grab.call_count == 21
+    rig.hotkey.free_candidates.assert_called_once()
+    rig.stats.append.assert_called_once_with(
+        "hotkey_grab", key_role="text", result="busy", attempts=1
+    )
+
+
+def test_regrab_logs_only_result_changes(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
+    rig.grab_code = "busy"
+    rig.runtime.start()
+    timer = rig.timers[0]
+    rig.notify.reset_mock()
+    with caplog.at_level(logging.DEBUG):
+        caplog.clear()
+        for code in ("busy", "not-grabbed", "not-grabbed", "busy", "busy"):
+            rig.grab_code = code
+            timer.fire()
+    assert len(caplog.records) == 2
+    assert "busy → not-grabbed" in caplog.records[0].getMessage()
+    assert "not-grabbed → busy" in caplog.records[1].getMessage()
+    assert rig.runtime._regrab_attempts == 5
+    assert not rig.notify.mock_calls
+
+
+@pytest.mark.parametrize("busy_attempts", [0, 2, 20])
+def test_regrab_success_restores_dictation_once(
+    rig: Rig, caplog: pytest.LogCaptureFixture, busy_attempts: int
+) -> None:
+    rig.grab_code = "busy"
+    rig.runtime.start()
+    timer = rig.timers[0]
+    for _ in range(busy_attempts):
+        timer.fire()
+    rig.notify.reset_mock()
+    rig.tray.set_state.reset_mock()
+    rig.grab_code = "ok"
+    with caplog.at_level(logging.INFO):
+        caplog.clear()
+        timer.fire()
+        timer.timeout.emit()  # Уже доставленный сигнал после удаления безопасен.
+    assert len(caplog.records) == 1
+    rig.hotkey.grab.assert_called_with("Ctrl+Space", HotkeyMode.PTT)
+    assert rig.hotkey.grab.call_count == busy_attempts + 2
+    assert rig.runtime._regrab_timer is None
+    assert timer.deleted and not timer.active
+    rig.tray.set_state.assert_called_once_with(TrayState.IDLE)
+    assert rig.notify.mock_calls == [call.notify_hotkey_regrabbed("Ctrl+Space")]
+    assert rig.stats.append.call_args_list == [
+        call("hotkey_grab", key_role="text", result="busy", attempts=1),
+        call("hotkey_grab", key_role="text", result="regrabbed", attempts=busy_attempts + 1),
+    ]
+    rig.recognize()
+    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+
+
+@pytest.mark.parametrize("blocked", ["selfcheck", "recording"])
+@pytest.mark.parametrize("via_apply", [False, True])
+def test_regrab_success_preserves_busy_or_failed_tray(
+    rig: Rig, blocked: str, via_apply: bool
+) -> None:
+    rig.grab_code = "busy"
+    rig.runtime.start()
+    if blocked == "selfcheck":
+        rig.runtime._selfcheck = "failed"
+    else:
+        rig.runtime.orchestrator.on_hotkey_state(HotkeyState.RECORDING, "press")
+    rig.tray.set_state.reset_mock()
+    rig.grab_code = "ok"
+    if via_apply:
+        rig.runtime.apply_hotkey("Ctrl+Shift+Space", "ptt")
+    else:
+        rig.timers[0].fire()
+    rig.tray.set_state.assert_not_called()
+    assert rig.runtime._regrab_timer is None
+
+
+@pytest.mark.parametrize("code", ["ok", "busy"])
+def test_start_survives_hotkey_stats_failure(rig: Rig, code: ResultCode) -> None:
+    rig.grab_code = code
+    rig.stats.append.side_effect = OSError(MARKER)
+    rig.runtime.start()
+    assert rig.runtime.tick_timer is not None
+    assert rig.runtime.stats_timer is not None
+    assert rig.supervisor.state == "running"
+    assert (rig.runtime._regrab_timer is not None) == (code == "busy")
+
+
+def test_regrab_success_survives_stats_failure(rig: Rig) -> None:
+    rig.grab_code = "busy"
+    rig.runtime.start()
+    rig.stats.append.side_effect = OSError(MARKER)
+    rig.grab_code = "ok"
+    rig.timers[0].fire()
+    assert rig.runtime._regrab_timer is None
+    rig.notify.notify_hotkey_regrabbed.assert_called_once_with("Ctrl+Space")
+    rig.tray.set_state.assert_called_with(TrayState.IDLE)
+
+
+def test_regrab_keeps_nokey_when_model_becomes_ready(rig: Rig) -> None:
+    rig.grab_code = "busy"
+    rig.runtime.start()
+    rig.runtime._model_ready()
+    rig.tray.set_state.assert_called_with(TrayState.NOKEY)
+    assert rig.runtime._regrab_timer is not None
+
+
+@pytest.mark.parametrize("mode", list(HotkeyMode))
+def test_regrab_restores_real_hotkey_manager(
+    monkeypatch: pytest.MonkeyPatch, mode: HotkeyMode
+) -> None:
+    backend = Mock(spec=HotkeyBackend)
+    backend.grab_combo.return_value = GrabResult("busy")
+    backend.grab_escape.return_value = GrabResult("ok", keycode=9)
+    backend.fileno.return_value = 17
+    hotkey = HotkeyManager(backend)
+    rig = Rig(monkeypatch, Settings(hotkey_mode=mode.value), hotkey_factory=lambda: hotkey)
+    rig.runtime.start()
+    timer = rig.timers[0]
+    timer.fire()
+    assert hotkey.last_result.code == "busy"
+    backend.grab_combo.return_value = GrabResult("ok", keycode=65, mods=4)
+    timer.fire()
+    assert hotkey.last_result.ok
+    assert timer.deleted and not timer.active
+    hotkey.handle_event(HotkeyEvent("KeyPress", 65, 1000, mods=4), rig.now)
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    hotkey.handle_event(HotkeyEvent("KeyRelease", 65, 2000, mods=4), rig.now + 1)
+    if mode == HotkeyMode.TOGGLE:
+        hotkey.handle_event(HotkeyEvent("KeyPress", 65, 3000, mods=4), rig.now + 2)
+    assert_phase(rig.runtime, DictationPhase.PROCESSING)
+    rig.event(type="result", text=MARKER)
+    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.notify.notify_hotkey_regrabbed.assert_called_once_with("Ctrl+Space")
+    rig.stats.append.assert_any_call("hotkey_grab", key_role="text", result="regrabbed", attempts=2)
+
+
+def test_apply_hotkey_stops_regrab_on_success(rig: Rig) -> None:
+    rig.grab_code = "busy"
+    rig.runtime.start()
+    timer = rig.timers[0]
+    rig.grab_code = "ok"
+    assert rig.runtime.apply_hotkey("Ctrl+Shift+Space", "toggle") == "ok"
+    assert rig.runtime._regrab_timer is None
+    assert timer.deleted and not timer.active
+    rig.hotkey.grab.reset_mock()
+    timer.timeout.emit()
+    rig.hotkey.grab.assert_not_called()
+
+
+def test_apply_hotkey_failure_retries_new_settings(rig: Rig) -> None:
+    rig.runtime.start()
+    rig.grab_code = "busy"
+    assert rig.runtime.apply_hotkey("Ctrl+Shift+Space", "toggle") == "busy"
+    timer = rig.timers[-1]
+    assert rig.runtime._regrab_timer is timer
+    assert timer.interval == 30000 and not timer.single_shot
+    timer.fire()
+    rig.hotkey.grab.assert_called_with("Ctrl+Shift+Space", HotkeyMode.TOGGLE)
+    rig.runtime.apply_hotkey("Ctrl+Shift+Space", "toggle")
+    assert rig.runtime._regrab_timer is timer
+    assert rig.runtime._regrab_attempts == 1
+    rig.runtime.apply_hotkey("Win+Space", "ptt")
+    assert timer.deleted and not timer.active
+    assert rig.runtime._regrab_attempts == 0
+    replacement = rig.timers[-1]
+    assert rig.runtime._regrab_timer is replacement
+    assert replacement is not timer
+    rig.grab_code = "ok"
+    replacement.fire()
+    rig.hotkey.grab.assert_called_with("Win+Space", HotkeyMode.PTT)
+    rig.notify.notify_hotkey_regrabbed.assert_called_once_with("Win+Space")
+    rig.stats.append.assert_called_with(
+        "hotkey_grab", key_role="text", result="regrabbed", attempts=1
+    )
+
+
+def test_shutdown_stops_regrab_and_ignores_late_tick(rig: Rig) -> None:
+    rig.grab_code = "busy"
+    rig.runtime.start()
+    timer = rig.timers[0]
+    rig.runtime.shutdown()
+    assert rig.runtime._regrab_timer is None
+    assert timer.deleted and not timer.active
+    rig.hotkey.grab.reset_mock()
+    rig.notify.reset_mock()
+    timer.timeout.emit()
+    rig.runtime._start_regrab("busy")
+    assert rig.runtime._regrab_timer is None
+    rig.hotkey.grab.assert_not_called()
+    assert not rig.notify.mock_calls
 
 
 def test_candidate_probe_failure_does_not_abort_start(rig: Rig) -> None:
@@ -1021,7 +1292,7 @@ def test_candidate_probe_failure_does_not_abort_start(rig: Rig) -> None:
     rig.hotkey.free_candidates.side_effect = RuntimeError(MARKER)
     rig.runtime.start()
     assert rig.runtime.tick_timer is not None
-    rig.notify.notify_hotkey_not_grabbed.assert_called_once_with()
+    rig.notify.notify_hotkey_not_grabbed.assert_called_once_with("Ctrl+Space")
 
 
 def test_tick_enforces_record_limit(rig: Rig) -> None:
@@ -1496,3 +1767,377 @@ def test_cancel_restart_replaces_supervisor_and_routes_new_cycle(
     rig.supervisor_factory.reset_mock()
     runtime.restart_worker()
     rig.supervisor_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("state", ["ok", "broken"])
+def test_model_store_constructor_wiring(rig: Rig, state: str) -> None:
+    from types import SimpleNamespace
+
+    record = SimpleNamespace(
+        id="selected-model",
+        revision="r2",
+        dir="~/selected/model/r2",
+        layout="selected-layout",
+        variant="selected-variant",
+        state=state,
+    )
+    store = SimpleNamespace(current=lambda: record)
+    runtime = DictationRuntime(
+        settings=from_dict({}),
+        session_kind=SessionKind.FLY,
+        model_store=store,
+        supervisor_factory=rig.supervisor_factory,
+        pill_factory=rig.pill_factory,
+        tray_factory=rig.tray_factory,
+        hotkey_factory=Mock(return_value=rig.hotkey),
+        stats_factory=Mock(return_value=rig.stats),
+        paste_func=rig.paste,
+        restore_paste=rig.restore_paste,
+        x11_factory=Mock(return_value=rig.x11),
+        guard_factory=rig.guard_factory,
+        provider_factory=Mock(return_value=rig.provider),
+        capture_watchdog_factory=rig.capture_watchdog_factory,
+    )
+    assert runtime.model_store is store
+    runtime.start()
+    rig.supervisor.send.assert_not_called()
+
+    runtime._on_worker_event({"type": "hello", "generation": rig.supervisor.generation})
+
+    if state == "ok":
+        rig.supervisor.send.assert_called_once()
+        request = rig.supervisor.send.call_args.args[0]
+        assert request == {
+            "type": "model.load",
+            "id": record.id,
+            "revision": record.revision,
+            "dir": str(Path(record.dir).expanduser()),
+            "layout": record.layout,
+            "variant": record.variant,
+            "threads": 2,
+            "min_ram_mb": 768,
+        }
+        ipc.encode(request)
+        assert rig.supervisor.send.call_args.kwargs == {"timeout": 10.0}
+        rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
+    else:
+        rig.supervisor.send.assert_not_called()
+        rig.pill.show_state.assert_not_called()
+        assert runtime._model_load_failures == 0
+    runtime.shutdown()
+
+
+@pytest.fixture
+def checking_rig(monkeypatch: pytest.MonkeyPatch) -> Rig:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    monkeypatch.setattr(module, "_cpu_model", lambda: "Test CPU")
+    rig.runtime.start()
+    rig.stats.append.reset_mock()
+    rig.event(type="hello")
+    rig.runtime._model_load_failures = 1
+    rig.event(type="model.loaded", id="gigaam", revision="r3", engine_version="1.24.4", load_ms=123)
+    return rig
+
+
+def test_selfcheck_waits_for_match_before_ready(
+    checking_rig: Rig, smoke_wav: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = checking_rig
+    assert rig.runtime._selfcheck == "running"
+    assert rig.runtime._loading_model
+    assert rig.runtime._model_load_failures == 1
+    rig.supervisor.send.assert_called_with(
+        {"type": "transcribe.file", "path": str(smoke_wav)}, timeout=module.SELFCHECK_TIMEOUT_S
+    )
+    timer = rig.timers[-1]
+    assert timer.interval == module.SELFCHECK_WATCHDOG_MS
+    rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
+    rig.pill.hide.assert_not_called()
+    rig.tray.set_state.assert_not_called()
+    rig.stats.append.assert_not_called()
+    rig.hotkey.on_state(HotkeyState.RECORDING, "press")
+    assert "record.start" not in rig.trace
+    with caplog.at_level(logging.DEBUG):
+        rig.event(type="result", utterance_id="file", text=f"ПРОВЕРКА {MARKER}")
+    assert rig.runtime._selfcheck == "ok"
+    assert not rig.runtime._loading_model
+    assert rig.runtime._model_load_failures == 0
+    assert timer.deleted and not timer.active
+    assert not rig.runtime.timers
+    rig.pill.hide.assert_called_once_with()
+    rig.tray.set_state.assert_called_once_with(TrayState.IDLE)
+    rig.stats.append.assert_called_once_with(
+        "model_selfcheck",
+        model_id="gigaam",
+        revision="r3",
+        engine_version="1.24.4",
+        cpu_model="Test CPU",
+        result="ok",
+    )
+    assert "модель загружена за 123 мс" in caplog.text
+    assert MARKER not in caplog.text
+    assert MARKER not in repr(rig.stats.mock_calls + rig.notify.mock_calls + rig.pill.mock_calls)
+    assert rig.runtime.last_text is None
+    rig.paste.assert_not_called()
+    rig.notify.notify_selfcheck_failed.assert_not_called()
+    timer.timeout.emit()
+    rig.event(type="result", utterance_id="file", text="")
+    rig.stats.append.assert_called_once()
+    rig.hotkey.fsm.press(rig.now)
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "result", "text": MARKER},
+        {"type": "result", "text": ""},
+        {"type": "result", "text": None},
+        {"type": "error", "code": "engine-failed", "message": MARKER},
+        {"type": "error", "request_type": "transcribe.file", "message": MARKER},
+        {"type": "cancelled"},
+        None,
+    ],
+)
+def test_selfcheck_failure_blocks_dictation_once(
+    checking_rig: Rig,
+    caplog: pytest.LogCaptureFixture,
+    event: dict[str, object] | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = checking_rig
+    on_event = Mock()
+    monkeypatch.setattr(rig.runtime.orchestrator, "on_worker_event", on_event)
+    timer = rig.timers[-1]
+    with caplog.at_level(logging.DEBUG):
+        if event is None:
+            timer.fire()
+        else:
+            correlation = {} if "request_type" in event else {"utterance_id": "file"}
+            rig.event(**correlation, **event)
+    assert rig.runtime._selfcheck == "failed"
+    assert not rig.runtime._loading_model
+    assert rig.runtime._model_load_failures == 1
+    assert timer.deleted and not timer.active
+    assert not rig.runtime.timers
+    rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
+    rig.pill.hide.assert_not_called()
+    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    rig.stats.append.assert_called_once_with(
+        "model_selfcheck",
+        model_id="gigaam",
+        revision="r3",
+        engine_version="1.24.4",
+        cpu_model="Test CPU",
+        result="fail",
+    )
+    timer.timeout.emit()
+    rig.event(type="result", utterance_id="file", text="проверка")
+    rig.event(type="error", utterance_id="file", message=MARKER)
+    assert rig.runtime._selfcheck == "failed"
+    on_event.assert_not_called()
+    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    rig.stats.append.assert_called_once()
+    for offset in (0, 3):
+        rig.hotkey.fsm.press(rig.now + offset)
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
+        rig.hotkey.fsm.release(rig.now + offset + 1)
+        rig.hotkey.fsm.escape(rig.now + offset + 2)
+    assert "record.start" not in rig.trace
+    assert_phase(rig.runtime, DictationPhase.IDLE)
+    rig.paste.assert_not_called()
+    assert rig.runtime.last_text is None
+    assert MARKER not in caplog.text
+    assert "модель загружена" not in caplog.text
+    assert MARKER not in repr(rig.stats.mock_calls + rig.notify.mock_calls + rig.pill.mock_calls)
+
+
+def test_selfcheck_missing_reference_allows_ready_with_warning(
+    monkeypatch: pytest.MonkeyPatch, smoke_wav: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    smoke_wav.unlink()
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    with caplog.at_level(logging.INFO):
+        rig.event(type="model.loaded", load_ms=42)
+    assert (logging.WARNING, "эталон самопроверки не найден") in [
+        (record.levelno, record.getMessage()) for record in caplog.records
+    ]
+    assert "модель загружена за 42 мс" in caplog.text
+    assert not rig.runtime._loading_model
+    rig.pill.hide.assert_called_once_with()
+    rig.tray.set_state.assert_called_once_with(TrayState.IDLE)
+    assert "transcribe.file" not in rig.trace
+    assert not rig.runtime.timers
+    rig.stats.append.assert_called_once_with(
+        "hotkey_grab", key_role="text", result="ok", attempts=1
+    )
+    rig.hotkey.fsm.press(rig.now)
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+
+
+def test_selfcheck_send_error_is_private_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.supervisor.send.side_effect = RuntimeError(MARKER)
+    with caplog.at_level(logging.DEBUG):
+        rig.event(type="model.loaded")
+    assert rig.runtime._selfcheck == "failed"
+    assert rig.runtime._model_load_failures == 0
+    assert not rig.runtime.timers
+    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    assert rig.stats.append.call_args.kwargs["result"] == "fail"
+    assert rig.stats.append.call_args.kwargs["engine_version"] == ""
+    assert MARKER not in caplog.text
+
+
+@pytest.mark.parametrize("action", ["restart", "reload", "shutdown"])
+def test_selfcheck_reset_cancels_watchdog(checking_rig: Rig, action: str) -> None:
+    rig = checking_rig
+    timer = rig.timers[-1]
+    if action == "shutdown":
+        rig.runtime.shutdown()
+    elif action == "restart":
+        rig.runtime.restart_worker()
+    else:
+        rig.supervisor.generation += 1
+        rig.event(type="hello")
+    assert timer.deleted and not timer.active
+    assert rig.runtime._selfcheck_timer is None
+    assert not rig.runtime.timers
+    if action != "shutdown":
+        assert rig.runtime._selfcheck == "idle"
+        assert rig.runtime._loaded_model == {}
+        assert rig.runtime._model_load_ms is None
+    rig.pill.hide.reset_mock()
+    timer.timeout.emit()
+    rig.event(type="result", utterance_id="file", generation=1, text="проверка")
+    rig.stats.append.assert_not_called()
+    rig.notify.notify_selfcheck_failed.assert_not_called()
+    rig.pill.hide.assert_not_called()
+
+
+def test_selfcheck_ignores_foreign_results_and_unrelated_errors(
+    checking_rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = checking_rig
+    on_event = Mock()
+    monkeypatch.setattr(rig.runtime.orchestrator, "on_worker_event", on_event)
+    for generation in (0, 2):
+        rig.event(type="result", utterance_id="file", generation=generation, text="проверка")
+    on_event.assert_not_called()
+    rig.event(type="result", utterance_id="dictation", text=MARKER)
+    rig.event(type="error", request_type="audio.open")
+    assert on_event.call_count == 2
+    assert rig.runtime._selfcheck == "running"
+    rig.stats.append.assert_not_called()
+    rig.event(type="result", utterance_id="file", text="связи")
+    assert rig.runtime._selfcheck == "ok"
+    assert on_event.call_count == 2
+
+
+@pytest.mark.parametrize("result", ["проверка", ""])
+def test_selfcheck_runs_after_each_worker_load(checking_rig: Rig, result: str) -> None:
+    rig = checking_rig
+    rig.event(type="result", utterance_id="file", text=result)
+    rig.supervisor.generation += 1
+    rig.event(type="hello")
+    assert rig.runtime._selfcheck == "idle"
+    rig.event(type="model.loaded", id="next-model", revision="r4")
+    assert rig.runtime._selfcheck == "running"
+    rig.event(type="result", utterance_id="file", text="связи")
+    assert rig.runtime._selfcheck == "ok"
+    assert rig.stats.append.call_count == 2
+    assert rig.stats.append.call_args.kwargs == {
+        "model_id": "next-model",
+        "revision": "r4",
+        "engine_version": "",
+        "cpu_model": "Test CPU",
+        "result": "ok",
+    }
+    assert rig.trace.count("transcribe.file") == 2
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("processor : 0\nmodel name\t: First CPU\nmodel name : Second CPU\n", "First CPU"),
+        ("Hardware : unknown\n", ""),
+    ],
+)
+def test_cpu_model_reads_first_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, content: str, expected: str
+) -> None:
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text(content)
+    path_factory = Mock(return_value=cpuinfo)
+    monkeypatch.setattr(module, "Path", path_factory)
+    assert module._cpu_model() == expected
+    path_factory.assert_called_once_with("/proc/cpuinfo")
+
+
+@pytest.mark.parametrize("error", [OSError(MARKER), UnicodeError(MARKER)])
+def test_cpu_model_read_error_is_empty(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: Exception
+) -> None:
+    path = Mock()
+    path.open.side_effect = error
+    monkeypatch.setattr(module, "Path", Mock(return_value=path))
+    assert module._cpu_model() == ""
+    assert MARKER not in caplog.text
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_apply_pill_enabled_updates_pill_and_tray(rig: Rig, value: bool) -> None:
+    rig.runtime.apply_pill_enabled(value)
+    rig.pill.set_enabled.assert_called_once_with(value)
+    rig.tray.set_pill_enabled.assert_called_once_with(value)
+    rig.supervisor.send.assert_not_called()
+
+
+@pytest.mark.parametrize("code", ["ok", "busy", "bad-combo", "duplicate", "not-grabbed"])
+@pytest.mark.parametrize("phase", [DictationPhase.IDLE, DictationPhase.RECORDING])
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [("ptt", HotkeyMode.PTT), ("toggle", HotkeyMode.TOGGLE), ("unknown", HotkeyMode.PTT)],
+)
+def test_apply_hotkey_regrabs_and_updates_tray(
+    rig: Rig, code: ResultCode, phase: DictationPhase, mode: str, expected: HotkeyMode
+) -> None:
+    rig.grab_code = code
+    if phase == DictationPhase.RECORDING:
+        rig.runtime.orchestrator.on_hotkey_state(HotkeyState.RECORDING, "press")
+        rig.trace.clear()
+        rig.tray.set_state.reset_mock()
+        rig.supervisor.send.reset_mock()
+    assert rig.runtime.phase == phase
+    assert rig.runtime.apply_hotkey("Ctrl+Shift+Space", mode) == code
+    assert rig.trace == ["hotkey.ungrab", "hotkey.grab"]
+    rig.hotkey.ungrab.assert_called_once_with()
+    rig.hotkey.grab.assert_called_once_with("Ctrl+Shift+Space", expected)
+    if code != "ok":
+        rig.tray.set_state.assert_called_once_with(TrayState.NOKEY)
+    elif phase == DictationPhase.IDLE:
+        rig.tray.set_state.assert_called_once_with(TrayState.IDLE)
+    else:
+        rig.tray.set_state.assert_not_called()
+    rig.supervisor.send.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [None, "USB mic"])
+def test_apply_device_defers_until_next_record(
+    rig: Rig, value: str | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.runtime.settings.extra["device"] = value
+    with caplog.at_level(logging.INFO):
+        rig.runtime.apply_device(value)
+    rig.supervisor.send.assert_not_called()
+    assert rig.runtime.record_params()["device"] == value
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.INFO
+    assert rig.pill.mock_calls == rig.tray.mock_calls == rig.hotkey.mock_calls == []

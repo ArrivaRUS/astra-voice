@@ -21,6 +21,8 @@ from astra_voice.platform.paste import PasteMode, PasteOutcome, PasteOutcomeKind
 from astra_voice.ui.pill import (
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
+    ERROR_MICROPHONE_CHANGED,
+    ERROR_MICROPHONE_LOST,
     ERROR_MICROPHONE_UNAVAILABLE,
     ERROR_MODEL_NOT_LOADED,
     ERROR_RECOGNITION_FAILED,
@@ -107,6 +109,9 @@ class DictationOrchestrator:
         clock: Callable[[], float] = time.monotonic,
         stats: StatsPort | None = None,
         log: logging.Logger | None = None,
+        on_device_changed: Callable[[str], None] | None = None,
+        on_device_lost: Callable[[], None] | None = None,
+        on_device_selected: Callable[[str], None] | None = None,
     ) -> None:
         self._send = send
         self._generation = generation
@@ -125,6 +130,12 @@ class DictationOrchestrator:
         self._record_params = record_params
         self._clock = clock
         self._stats = stats
+        self._on_device_changed = on_device_changed
+        self._on_device_lost = on_device_lost
+        self._on_device_selected = on_device_selected
+        self._announced_device: str | None = None
+        self._device_selected = False
+        self._microphone_changed = False
         self._log = log if log is not None else logging.getLogger(__name__)
         self._phase = DictationPhase.IDLE
         self._target_window: int | None = None
@@ -192,17 +203,21 @@ class DictationOrchestrator:
         self._t_ms = self._paste_ms = 0.0
         self._retries = 0
         try:
+            self._device_selected = False
+            self._microphone_changed = False
             params = self._record_params()
             message = {"type": "record.start", "utterance_id": self._utterance_id}
             device = params.get("device")
             if isinstance(device, str) and device:
                 message["device"] = device
+                self._device_selected = True
             timeout = float(params["limit_s"]) + RECOGNIZE_TIMEOUT_S
         except Exception:
             self._log.warning("диктовка: параметры записи недоступны")
             self._fail_recognition()
             self._hotkey_cancel()
             return
+        self._t0 = self._clock()
         self._change_phase(DictationPhase.RECORDING)
         if not self._command(message, timeout=timeout):
             self._hotkey_cancel()
@@ -212,7 +227,6 @@ class DictationOrchestrator:
         self._pill.show_state(PillState.LISTENING)
         self._tray.set_state(TrayState.LISTENING)
         self._set_recording(True)
-        self._t0 = self._clock()
 
     def _stop(self, *, recording_stopped: bool = False) -> None:
         if self._phase != DictationPhase.RECORDING or self._cancel_requested:
@@ -233,7 +247,10 @@ class DictationOrchestrator:
         if self.phase != DictationPhase.PROCESSING or self._cancel_requested:
             return
         self._set_recording(False)
-        self._pill.show_state(PillState.PROCESSING)
+        if self._microphone_changed:
+            self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_CHANGED)
+        else:
+            self._pill.show_state(PillState.PROCESSING)
         self._tray.set_state(TrayState.PROCESSING)
         self._later(PROCESSING_WATCHDOG_MS, self._watchdog)
 
@@ -280,7 +297,7 @@ class DictationOrchestrator:
                 text = ""
             self._result(text)
         elif kind == "audio.ready":
-            self._log.debug("диктовка: audio.ready")
+            self._audio_ready(event)
         elif self._phase == DictationPhase.RECORDING:
             if kind == "level":
                 peak = event.get("peak_dbfs")
@@ -298,6 +315,29 @@ class DictationOrchestrator:
             elif kind == "record.limit":
                 self._pill.show_state(PillState.LIMIT)
                 self._stop(recording_stopped=True)
+
+    def _audio_ready(self, event: dict[str, Any]) -> None:
+        self._log.debug("диктовка: audio.ready")
+        if "changed" not in event or self._phase != DictationPhase.RECORDING:
+            return
+        # Воркер передаёт системное описание, а не идентификатор из record_params.
+        device = event.get("device")
+        name = device.strip() if isinstance(device, str) else ""
+        if not name:
+            changed = event.get("changed")
+            if isinstance(changed, str) and ": " in changed:
+                name = changed.rpartition(": ")[2].strip()
+        if self._clock() < self._t0 + 0.3:
+            callback = self._on_device_selected
+        else:
+            self._microphone_changed = True
+            self._append_stat("mic_error", kind="device-changed", recovered_by="none")
+            # Сначала останавливаем звук: транспорт уведомления может ждать ответа.
+            self._stop()
+            callback = self._on_device_changed
+        if name and name != self._announced_device and callback is not None:
+            self._announced_device = name
+            callback(name)
 
     def _result(self, text: str) -> None:
         received = self._clock()
@@ -443,6 +483,13 @@ class DictationOrchestrator:
     def _error(self, code: object) -> None:
         if code in ("worker-crashed", "restart-limit", "worker-start"):
             self._fail_restarted()
+        elif code == "audio-no-device" and self._device_selected:
+            self._append_stat("mic_error", kind="device-lost", recovered_by="none")
+            self._begin_finish()
+            self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_LOST)
+            self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
+            if self._on_device_lost is not None:
+                self._on_device_lost()
         elif code in ("audio-no-device", "audio-busy", "audio-failed"):
             kind = {"audio-no-device": "none", "audio-busy": "busy"}.get(str(code), "other")
             self._append_stat("mic_error", kind=kind, recovered_by="none")
@@ -495,6 +542,10 @@ class DictationOrchestrator:
         self._set_recording(False)
 
     def _end_finish(self, state: PillState, *, tray: TrayState) -> None:
+        if self._microphone_changed and state not in (PillState.ERROR, PillState.CANCELLED):
+            # Успешная вставка/пустой результат не должны скрыть причину автостопа.
+            self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_CHANGED)
+            state = PillState.ERROR
         self._tray.set_state(tray)
         self._later(STATE_DURATION_MS[state], self._tail_done)
         self._hotkey_done()

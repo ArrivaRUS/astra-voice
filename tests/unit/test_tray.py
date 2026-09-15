@@ -726,7 +726,7 @@ def test_each_registration_flushes_pending_notifications(
     for registration in range(3):
         harness.send.return_value = 0
         notify.notify_indicators_lost()
-        notify.notify_hotkey_not_grabbed()
+        notify.notify_hotkey_not_grabbed("Ctrl+Space")
         assert notify.pending_count() == 2
         assert not notify.last_delivery_ok()
         harness.send.return_value = 1
@@ -741,7 +741,7 @@ def test_each_registration_flushes_pending_notifications(
         assert notify.last_delivery_ok()
         assert [call.args[0] for call in harness.send.call_args_list[-2:]] == [
             "Запись остановлена",
-            "Горячая клавиша не захвачена",
+            "Горячая клавиша Ctrl+Space занята другой программой",
         ]
         assert (
             len(
@@ -1046,7 +1046,7 @@ def test_recovery_drops_only_obsolete_banner_before_flush(harness: Harness) -> N
     harness.send.return_value = 0
     notify.notify(UNAVAILABLE)
     notify.notify_indicators_lost()
-    notify.notify_hotkey_not_grabbed()
+    notify.notify_hotkey_not_grabbed("Ctrl+Space")
     assert notify.pending_count() == 3
     harness.send.reset_mock()
     harness.send.return_value = 1
@@ -1054,7 +1054,7 @@ def test_recovery_drops_only_obsolete_banner_before_flush(harness: Harness) -> N
     assert calls.mock_calls == [call.drop(UNAVAILABLE), call.flush()]
     assert [c.args[0] for c in harness.send.call_args_list] == [
         "Запись остановлена",
-        "Горячая клавиша не захвачена",
+        "Горячая клавиша Ctrl+Space занята другой программой",
     ]
     assert notify.pending_count() == 0
 

@@ -34,6 +34,11 @@ ignore_missing_imports = true
 follow_imports = "skip"
 follow_imports_for_stubs = true
 
+# Стабов requests и jsonschema нет ни в apt, ни в окружении CI.
+[[tool.mypy.overrides]]
+module = ["requests.*", "jsonschema.*"]
+ignore_missing_imports = true
+
 # Генерируется сборкой, в дереве разработки отсутствует.
 [[tool.mypy.overrides]]
 module = ["astra_voice._version"]

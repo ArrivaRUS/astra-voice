@@ -24,19 +24,25 @@ log = logging.getLogger(__name__)
 # Единственные допустимые причины ERROR: PRD §6/§9 A3, arch/plan-synth.md §7 О1,
 # docs/plans.md M4 (У11/У40). Оркестрация импортирует эти константы.
 ERROR_MICROPHONE_UNAVAILABLE: Final = "Микрофон недоступен"
+ERROR_MICROPHONE_CHANGED: Final = "Микрофон сменился"
+ERROR_MICROPHONE_LOST: Final = "Микрофон отключился"
 ERROR_RECOGNITION_RESTARTED: Final = "Распознавание перезапущено"
 ERROR_BUFFER_CLEARED: Final = "Буфер очищен"
 ERROR_RECOGNITION_FAILED: Final = "Не удалось распознать"
 ERROR_MODEL_NOT_LOADED: Final = "Модель не загружена"
 ERROR_MODEL_LOAD_FAILED: Final = "Не удалось загрузить модель"
+ERROR_SELFCHECK_FAILED: Final = "Распознавание не работает"
 ERROR_REASONS: Final = frozenset(
     (
         ERROR_MICROPHONE_UNAVAILABLE,
+        ERROR_MICROPHONE_CHANGED,
+        ERROR_MICROPHONE_LOST,
         ERROR_RECOGNITION_RESTARTED,
         ERROR_BUFFER_CLEARED,
         ERROR_RECOGNITION_FAILED,
         ERROR_MODEL_NOT_LOADED,
         ERROR_MODEL_LOAD_FAILED,
+        ERROR_SELFCHECK_FAILED,
     )
 )
 

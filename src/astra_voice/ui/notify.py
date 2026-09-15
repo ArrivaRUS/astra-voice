@@ -1,7 +1,7 @@
 """Штатные уведомления без кнопок и без распознанного текста.
 
-Остальной код вызывает только обёртки без аргументов: их готовые сообщения
-не зависят от диктовки. Это правило проверяет AST-тест по всему пакету.
+Остальной код вызывает готовые обёртки; переменные подписи — сочетание клавиш
+и системное описание микрофона. Запрет текста диктовки проверяет AST-тест пакета.
 """
 
 from __future__ import annotations
@@ -23,9 +23,14 @@ __all__ = [
     "last_delivery_ok",
     "notify",
     "notify_hotkey_not_grabbed",
+    "notify_hotkey_regrabbed",
+    "notify_microphone_changed",
+    "notify_microphone_lost",
+    "notify_microphone_selected",
     "notify_tray_depends_on_panel",
     "notify_tray_unavailable",
     "notify_indicators_lost",
+    "notify_selfcheck_failed",
     "pending_count",
     "reset_state",
 ]
@@ -154,12 +159,44 @@ def notify(summary: str, body: str = "", *, urgency: str = "normal") -> None:
         _pending.append(message)
 
 
-def notify_hotkey_not_grabbed() -> None:
+def notify_hotkey_not_grabbed(combo: str) -> None:
     """Сообщить, что сочетание клавиш занято другой программой."""
     notify(
-        "Горячая клавиша не захвачена",
-        "Другая программа уже использует это сочетание. Выберите другое в настройках.",
+        f"Горячая клавиша {combo} занята другой программой",
+        "Как только она освободится, диктовка заработает сама.",
     )
+
+
+def notify_hotkey_regrabbed(combo: str) -> None:
+    """Сообщить об автоматическом восстановлении горячей клавиши."""
+    notify(f"Горячая клавиша снова работает: {combo}", urgency="normal")
+
+
+def notify_onboarding_ready(combo: str) -> None:
+    """Сообщить о завершении первого запуска и напомнить комбинацию."""
+    notify("Astra Voice готов", f"Зажмите {combo} и говорите.")
+
+
+def notify_microphone_changed(name: str) -> None:
+    """Сообщить о смене микрофона, используя его человекочитаемое описание."""
+    notify(
+        "Микрофон сменился",
+        f"Сейчас используется: {name}. Выбрать другой можно в настройках.",
+    )
+
+
+def notify_microphone_lost() -> None:
+    """Сообщить о пропаже явно выбранного микрофона."""
+    notify(
+        "Микрофон отключился",
+        "Проверьте подключение или выберите микрофон в настройках.",
+        urgency="critical",
+    )
+
+
+def notify_microphone_selected(name: str) -> None:
+    """Объявить системное описание нового микрофона перед диктовкой."""
+    notify(f"Микрофон: {name}")
 
 
 def notify_tray_unavailable() -> None:
@@ -184,5 +221,14 @@ def notify_indicators_lost() -> None:
     notify(
         "Запись остановлена",
         "Пропали все указатели записи, поэтому запись остановлена.",
+        urgency="critical",
+    )
+
+
+def notify_selfcheck_failed() -> None:
+    """Сообщить, что модель не прошла пробное распознавание."""
+    notify(
+        "Распознавание на этом компьютере не работает",
+        "Обратитесь к администратору.",
         urgency="critical",
     )

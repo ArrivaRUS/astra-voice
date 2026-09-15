@@ -17,7 +17,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from astra_voice.core import policy as policy_mod
 from astra_voice.core import settings as settings_mod
@@ -26,6 +26,9 @@ from astra_voice.core.model_request import build_model_load
 from astra_voice.core.paths import ipc_socket_path, lock_path, qml_dir, settings_path
 from astra_voice.core.version import __version__
 from astra_voice.platform.session import SessionKind, detect
+
+if TYPE_CHECKING:
+    from astra_voice.runtime import DictationRuntime
 
 log = logging.getLogger(__name__)
 
@@ -368,6 +371,7 @@ def _load_qml(app_info: Any, theme_bridge: Any | None) -> Any | None:
     engine = QQmlApplicationEngine()
     context = engine.rootContext()
     context.setContextProperty("appInfo", app_info)
+    context.setContextProperty("showOnboarding", False)
     # themeSource обязан быть виден ДО load(): Theme.qml читает его в биндинге
     # `dark` при создании корневого объекта. Theme.qml — `pragma Singleton`, а
     # синглтоны не видят контекстных свойств, поэтому объект кладётся ещё и в
@@ -383,6 +387,62 @@ def _load_qml(app_info: Any, theme_bridge: Any | None) -> Any | None:
         log.error("QML не загрузился, показываю заглушку")
         return None
     return engine
+
+
+def _set_context_property(shell: Any, name: str, obj: Any) -> None:
+    """Добавляет объект в контекст QML; для виджета-заглушки ничего не делает."""
+    root_context = getattr(shell, "rootContext", None)
+    if callable(root_context):
+        root_context().setContextProperty(name, obj)
+
+
+class _RuntimeSettingsApply:
+    """Адаптирует apply_*; runtime.hotkey уже занят менеджером клавиш."""
+
+    def __init__(self, runtime: DictationRuntime) -> None:
+        self._runtime = runtime
+
+    def pill_enabled(self, value: bool) -> None:
+        self._runtime.apply_pill_enabled(value)
+
+    def hotkey(self, combo: str, mode: str) -> str:
+        return self._runtime.apply_hotkey(combo, mode)
+
+    def device(self, value: str | None) -> None:
+        self._runtime.apply_device(value)
+
+
+class _RuntimeOnboardingHost:
+    """Живой пробник и действия окна для мастера первого запуска."""
+
+    def __init__(self, runtime: DictationRuntime, shell: Any) -> None:
+        self._runtime = runtime
+        self._shell = shell
+
+    def begin_capture(self) -> bool:
+        return self._runtime.begin_hotkey_capture()
+
+    def end_capture(self) -> None:
+        self._runtime.end_hotkey_capture()
+
+    def probe(self, combo: str) -> str:
+        return self._runtime.hotkey.probe(combo).code
+
+    def free_candidates(self, prefer: list[str]) -> list[str]:
+        return self._runtime.hotkey.free_candidates(prefer)
+
+    def apply_hotkey(self, combo: str, mode: str) -> str:
+        return self._runtime.apply_hotkey(combo, mode)
+
+    def notify_ready(self, combo: str) -> None:
+        from astra_voice.ui import notify
+
+        notify.notify_onboarding_ready(combo)
+
+    def hide_window(self) -> None:
+        root = _root_window(self._shell)
+        if root is not None:
+            root.hide()
 
 
 def _fallback_widget() -> Any:
@@ -602,6 +662,8 @@ def main(argv: list[str] | None = None) -> int:
         theme_bridge.source.start()  # слежение за темой — после загрузки QML
 
     runtime: DictationRuntime | None = None
+    settings_bridge = None  # держим Python-обёртку живой до выхода из main
+    onboarding = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
     close_watcher = _wire_close(  # держим ссылку на фильтр
         app, shell, is_tray_ready=lambda: runtime is not None and runtime.tray.registered
@@ -612,6 +674,7 @@ def main(argv: list[str] | None = None) -> int:
         _show(shell)
 
     try:
+        runtime_ready = False
         try:
             from astra_voice.runtime import DictationRuntime
 
@@ -621,14 +684,58 @@ def main(argv: list[str] | None = None) -> int:
             runtime.tray.on_about = lambda: _show(shell)
             runtime.pill.on_details_clicked = lambda: _show(shell)
             runtime.start()
+            runtime_ready = True
         except Exception:  # noqa: BLE001 — без диктовки окно должно продолжать работать
             log.warning(
                 "Не удалось запустить диктовку, приложение продолжит работу без неё", exc_info=True
             )
+        from PyQt5.QtQml import QQmlEngine
+
+        from astra_voice.ui.bridges import ModelService, OnboardingController, SettingsBridge
+
+        settings_bridge = SettingsBridge(
+            stored,
+            mirror=settings,
+            apply=_RuntimeSettingsApply(runtime) if runtime_ready and runtime is not None else None,
+            locked=policy.values,
+        )
+        QQmlEngine.setObjectOwnership(settings_bridge, QQmlEngine.CppOwnership)
+        _set_context_property(shell, "settingsBridge", settings_bridge)
+        show_onboarding = stored.extra.get("onboarding_done") is not True
+        if show_onboarding:
+            model = None
+            try:
+                model = ModelService(stored, policy)
+            except Exception:  # noqa: BLE001 — каталог не должен мешать запуску окна
+                log.warning(
+                    "Не удалось подготовить каталог моделей, настройка продолжится без него"
+                )
+            onboarding = OnboardingController(
+                settings_bridge,
+                settings=stored,
+                model=model,
+                host=_RuntimeOnboardingHost(runtime, shell)
+                if runtime_ready and runtime is not None
+                else None,
+            )
+            QQmlEngine.setObjectOwnership(onboarding, QQmlEngine.CppOwnership)
+            _set_context_property(shell, "onboarding", onboarding)
+            root = _root_window(shell)
+            if root is not None:
+                root.installEventFilter(onboarding)
+            onboarding.doneChanged.connect(
+                lambda: _set_context_property(shell, "showOnboarding", not onboarding.done)
+            )
+        _set_context_property(shell, "showOnboarding", show_onboarding)
         return int(app.exec_())
     finally:
         # US-8.4: выход из трея и SIGTERM/SIGINT вызывают app.quit() и приходят
         # сюда. Сначала освобождаем воркер и захваты клавиш, затем lock/ipc и UI.
+        if onboarding is not None:
+            try:
+                onboarding.shutdown()
+            except Exception:  # noqa: BLE001 — остальные ресурсы тоже нужно освободить
+                log.warning("Не удалось завершить установку модели")
         if runtime is not None:
             try:
                 runtime.shutdown()

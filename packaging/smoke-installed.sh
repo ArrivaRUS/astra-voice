@@ -96,6 +96,9 @@ for path in (
     paths.qml_dir() / "Pill.qml",
     paths.qml_dir() / "Main.qml",
     paths.data_dir_static() / "vad" / "silero_vad.onnx",
+    paths.data_dir_static() / "catalog.json",
+    paths.data_dir_static() / "catalog.json.sig",
+    paths.data_dir_static() / "catalog.schema.json",
 ):
     checked += 1
     if not path.is_file():
