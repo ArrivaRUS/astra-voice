@@ -558,6 +558,7 @@ class OnnxAsrEngine:
                     def watch() -> None:
                         while not stopped.is_set():
                             # Отмена будит сразу; завершение проверяем раз в 50 мс.
+                            # TODO (см. docs/status.md): stopped.set() не будит эти 50 мс.
                             if cancel.wait(timeout=0.05):
                                 run_options.terminate = True
                                 terminate_requested.set()

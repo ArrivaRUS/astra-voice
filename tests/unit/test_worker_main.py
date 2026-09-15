@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from typing import NoReturn
 from unittest.mock import Mock, call
 
@@ -109,6 +109,8 @@ def test_main_inherited_fd(monkeypatch: pytest.MonkeyPatch, use_env: bool) -> No
         assert loop.connection.type == socket.SOCK_STREAM
         loop.worker.close()
         loop.connection.close()
+        loop._wake_r.close()
+        loop._wake_w.close()
         return 0
 
     monkeypatch.setattr(worker_main.WorkerLoop, "run", run)
@@ -191,6 +193,8 @@ def test_capture_timeout_terminates_worker_without_cleanup(
         loop.worker.close()
         # При имитации _exit закрываем созданный executor вручную после проверок.
         loop.worker._executor.shutdown(wait=True)
+        loop._wake_r.close()
+        loop._wake_w.close()
 
 
 @pytest.mark.parametrize("kind", ["record.start", "record.stop", "record.cancel", "recognize"])
@@ -198,6 +202,8 @@ def test_command_error_inherits_correlation(kind: str) -> None:
     """У45/T-44: общая ветка bad-state коррелируется для каждой команды с id."""
     loop = worker_main.WorkerLoop(Mock(spec=socket.socket), capture=False)
     loop.worker.close()
+    loop._wake_r.close()
+    loop._wake_w.close()
     requests = [{"type": kind, "utterance_id": uid} for uid in ("u1", "u2")]
     assert loop._receive(b"".join(ipc.encode(request) for request in requests))
     replies = ipc.FrameReader().feed(bytes(loop._send_buffer))
@@ -237,12 +243,16 @@ def test_receive_preserves_correlated_errors_and_other_replies(
         assert reply == original
     finally:
         loop.worker.close()
+        loop._wake_r.close()
+        loop._wake_w.close()
 
 
 def test_error_without_request_id_stays_uncorrelated() -> None:
     """Ошибке команды без id транспорт не приписывает корреляцию диктовки."""
     loop = worker_main.WorkerLoop(Mock(spec=socket.socket), capture=False)
     loop.worker.close()
+    loop._wake_r.close()
+    loop._wake_w.close()
     assert loop._receive(ipc.encode({"type": "ping"}))
     assert ipc.FrameReader().feed(bytes(loop._send_buffer)) == [
         ipc.error("bad-state", "Воркер закрыт.")
@@ -328,10 +338,10 @@ def test_nonblocking_send_and_receive(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (
         readiness.call_args_list
         == [
-            call([connection], [connection], [], worker_main.POLL_INTERVAL),
+            call([connection, loop._wake_r], [connection], [], worker_main.POLL_INTERVAL),
         ]
         * 3
-        + [call([connection], [], [], worker_main.POLL_INTERVAL)] * 2
+        + [call([connection, loop._wake_r], [], [], worker_main.POLL_INTERVAL)] * 2
     )
     connection.setblocking.assert_called_once_with(False)
     connection.settimeout.assert_not_called()
@@ -522,6 +532,88 @@ def test_events_from_background_thread(
         assert event in responses
         assert {"type": "pong"} in responses
     assert "секретная фраза" not in caplog.text
+
+
+def test_background_result_wakes_idle_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Фоновый result приходит за 50 мс, даже когда GUI молчит после hello."""
+    callbacks: list[Callable[[Message], None]] = []
+    idle = Event()
+    real_select = select.select
+
+    def make_state(*, on_event: Callable[[Message], None]) -> WorkerState:
+        callbacks.append(on_event)
+        return WorkerState(on_event=on_event)
+
+    def select_when_idle(
+        readers: list[socket.socket],
+        writers: list[socket.socket],
+        errors: list[socket.socket],
+        timeout: float,
+    ) -> tuple[list[socket.socket], list[socket.socket], list[socket.socket]]:
+        if not writers:
+            # Очередь уже проверена; следующий шаг — настоящий блокирующий select.
+            idle.set()
+        return real_select(readers, writers, errors, timeout)
+
+    monkeypatch.setattr(worker_main, "WorkerState", make_state)
+    monkeypatch.setattr(select, "select", select_when_idle)
+    with running_loop() as (_, peer, _):
+        assert receive(peer)[0]["type"] == "hello"
+        assert idle.wait(1), "Воркер не перешёл к ожиданию событий"
+        event = {"type": "result", "utterance_id": "u1", "text": "готово", "t_ms": 1}
+        started: list[float] = []
+
+        def emit() -> None:
+            started.append(time.perf_counter())
+            callbacks[0](event)
+
+        sender = Thread(target=emit)
+        sender.start()
+        try:
+            responses = receive(peer)
+            elapsed_ms = (time.perf_counter() - started[0]) * 1000
+        finally:
+            sender.join(1)
+        assert not sender.is_alive()
+        assert responses == [event]
+        print(f"background result latency: {elapsed_ms:.3f} ms")
+        assert elapsed_ms <= 50, f"result задержался на {elapsed_ms:.3f} мс"
+
+
+def test_event_wakeup_buffer_overflow() -> None:
+    """Полный неблокирующий будильник не мешает добавлять события в очередь."""
+    connection, peer = socket.socketpair()
+    loop = worker_main.WorkerLoop(connection, capture=False)
+    event = {"type": "result", "utterance_id": "u1", "text": "готово", "t_ms": 1}
+    try:
+        assert not loop._wake_r.getblocking()
+        assert not loop._wake_w.getblocking()
+        while True:
+            try:
+                loop._wake_w.send(b"\0")
+            except BlockingIOError:
+                break
+        for _ in range(1000):
+            loop._put_event(event)
+        for _ in range(1000):
+            assert loop._events.get_nowait() == event
+        assert loop._events.empty()
+    finally:
+        loop.worker.close()
+        connection.close()
+        peer.close()
+        loop._wake_r.close()
+        loop._wake_w.close()
+
+
+def test_normal_shutdown_closes_wakeup_sockets() -> None:
+    """Штатный выход потока освобождает оба дескриптора будильника."""
+    with running_loop() as (loop, peer, _):
+        assert receive(peer)[0]["type"] == "hello"
+        assert loop._wake_r.fileno() >= 0
+        assert loop._wake_w.fileno() >= 0
+    assert loop._wake_r.fileno() == -1
+    assert loop._wake_w.fileno() == -1
 
 
 def test_model_load_updates_limit(monkeypatch: pytest.MonkeyPatch) -> None:

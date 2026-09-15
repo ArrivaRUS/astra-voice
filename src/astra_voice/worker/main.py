@@ -101,7 +101,10 @@ class WorkerLoop:
         self._terminate = terminate
         self.parent_pid = os.getppid() if parent_pid is None else parent_pid
         self._events: SimpleQueue[Message] = SimpleQueue()
-        self.worker = WorkerState(on_event=self._events.put)
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
+        self._wake_w.setblocking(False)
+        self.worker = WorkerState(on_event=self._put_event)
         if capture:
             from astra_voice.worker.audio import AudioCapture, PulseSimpleSource
 
@@ -109,12 +112,22 @@ class WorkerLoop:
                 AudioCapture(
                     source=PulseSimpleSource(),
                     on_samples=self.worker.on_samples,
-                    on_event=self._events.put,
+                    on_event=self._put_event,
                     on_error=self.worker.on_error,
                 )
             )
         self._reader = ipc.FrameReader()
         self._send_buffer = bytearray()
+
+    def _put_event(self, message: Message) -> None:
+        """Ставит событие в очередь и будит цикл для немедленной отправки."""
+        self._events.put(message)
+        try:
+            self._wake_w.send(b"\0")
+        except (BlockingIOError, OSError):
+            # Переполнение буфера означает, что будильник уже взведён;
+            # закрытый сокет означает, что цикл завершается.
+            pass
 
     def _send(self, message: Message) -> None:
         """Ставит кадр в ограниченный буфер, не записывая его в журнал."""
@@ -152,6 +165,7 @@ class WorkerLoop:
                 return False
             if message["type"] == "model.load":
                 apply_address_space_limit(int(message["min_ram_mb"]))
+            # TODO (см. docs/status.md): join захвата перед заданием добавляет до 20 мс.
             replies = self.worker.handle(message)
             for reply in replies:
                 if (
@@ -201,14 +215,19 @@ class WorkerLoop:
                         logger.warning("Не удалось отправить событие воркера.")
                         self._send(ipc.error(exc.code, exc.message))
                 readable, writable, _ = select.select(
-                    [self.connection],
+                    [self.connection, self._wake_r],
                     [self.connection] if self._send_buffer else [],
                     [],
                     POLL_INTERVAL,
                 )
                 if os.getppid() != self.parent_pid:
                     break
-                if readable:
+                if self._wake_r in readable:
+                    try:
+                        self._wake_r.recv(4096)
+                    except (BlockingIOError, OSError):
+                        pass
+                if self.connection in readable:
                     try:
                         data = self.connection.recv(64 * 1024)
                     except BlockingIOError:
@@ -239,6 +258,8 @@ class WorkerLoop:
                 finally:
                     if not fatal:
                         self.connection.close()
+                        self._wake_r.close()
+                        self._wake_w.close()
         return 0
 
 
