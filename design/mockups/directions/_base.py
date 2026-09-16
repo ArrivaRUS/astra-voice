@@ -15,7 +15,7 @@ VARS_LIGHT = """
   --border:#D7DEEA; --border-soft:#EDF1F7;
   --fg1:#0E1729; --fg2:#243350; --fg3:#5A6884; --fg4:#AAB4C7;
   --primary:#1B3A73; --primary-hover:#12294F; --primary-fg:#FFFFFF; --primary-bg:#E8EDF7;
-  --accent:#12B3A0; --accent-ink:#0B7F71; --accent-bg:#E3F7F4;
+  --accent:#12B3A0; --accent-ink:#0A776A; --accent-bg:#E3F7F4;
   --ok-ink:#1F7D50; --ok-bg:#E7F5EE;
   --warn-ink:#8F5E12; --warn-bg:#FAF0DC;
   --err-ink:#C0322F; --err-bg:#FBECEB;
@@ -25,7 +25,7 @@ VARS_DARK = """
   --bg-app:#0B1220; --bg-surface:#151E30; --bg-sunk:#080D18; --bg-tbar:#101A2B;
   --border:rgba(255,255,255,.10); --border-soft:rgba(255,255,255,.06);
   --fg1:#F2F5FA; --fg2:#C4CDDC; --fg3:#8C97AC; --fg4:#5A6884;
-  --primary:#6C93E8; --primary-hover:#8AACF0; --primary-fg:#0B1220; --primary-bg:rgba(108,147,232,.16);
+  --primary:#6C93E8; --primary-hover:#8AACF0; --primary-fg:#0B1220; --primary-bg:rgba(108,147,232,.12);
   --accent:#2FD9C4; --accent-ink:#2FD9C4; --accent-bg:rgba(47,217,196,.13);
   --ok-ink:#4FBF88; --ok-bg:rgba(79,191,136,.13);
   --warn-ink:#F2B559; --warn-bg:rgba(242,181,89,.13);

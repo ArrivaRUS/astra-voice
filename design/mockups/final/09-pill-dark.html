@@ -6,7 +6,7 @@
   --bg-app:#0B1220; --bg-surface:#151E30; --bg-sunk:#080D18; --bg-tbar:#101A2B;
   --border:rgba(255,255,255,.10); --border-soft:rgba(255,255,255,.06);
   --fg1:#F2F5FA; --fg2:#C4CDDC; --fg3:#8C97AC; --fg4:#5A6884;
-  --primary:#6C93E8; --primary-hover:#8AACF0; --primary-fg:#0B1220; --primary-bg:rgba(108,147,232,.16);
+  --primary:#6C93E8; --primary-hover:#8AACF0; --primary-fg:#0B1220; --primary-bg:rgba(108,147,232,.12);
   --accent:#2FD9C4; --accent-ink:#2FD9C4; --accent-bg:rgba(47,217,196,.13);
   --ok-ink:#4FBF88; --ok-bg:rgba(79,191,136,.13);
   --warn-ink:#F2B559; --warn-bg:rgba(242,181,89,.13);
@@ -181,8 +181,8 @@ body.dark .wbtn.c{background:#8C3B36}
 
 
 /* --- токены доступности: цвет «выключено» с контрастом >= 4,5:1 ---------- */
-:root{--fg-dis:#67748B}
-body.dark{--fg-dis:#8C97AC}
+:root{--fg-dis:#616D83}
+body.dark{--fg-dis:#7E889B}
 .mi.dis{color:var(--fg-dis)}
 .btn.dis{opacity:1;color:var(--fg-dis);background:var(--bg-sunk);border-color:var(--border)}
 .r.dis{opacity:1}
@@ -294,6 +294,8 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 .lvl i{width:7px;border-radius:3px;background:var(--accent);display:block}
 .lvl.flat i{background:var(--fg4)}
 .lvbox{background:var(--bg-sunk);border-radius:8px;padding:10px 12px;display:flex;align-items:center;gap:12px}
+.lvbox .lbl{font-size:14px;color:var(--fg1);font-weight:400}
+.lvbox .sub{font-size:12px;color:var(--fg3);margin-top:2px}
 
 /* --- таблица «экран → состояние → файл» в оглавлении --------------------- */
 table.t{border-collapse:collapse;width:100%;font-size:12.5px}

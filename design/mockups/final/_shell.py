@@ -41,8 +41,8 @@ def th(theme):
 # ── CSS поверх _base.CSS: доступность + компоненты полного макета ──────────
 CSS_FINAL = """
 /* --- токены доступности: цвет «выключено» с контрастом >= 4,5:1 ---------- */
-:root{--fg-dis:#67748B}
-body.dark{--fg-dis:#8C97AC}
+:root{--fg-dis:#616D83}
+body.dark{--fg-dis:#7E889B}
 .mi.dis{color:var(--fg-dis)}
 .btn.dis{opacity:1;color:var(--fg-dis);background:var(--bg-sunk);border-color:var(--border)}
 .r.dis{opacity:1}
@@ -154,6 +154,8 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 .lvl i{width:7px;border-radius:3px;background:var(--accent);display:block}
 .lvl.flat i{background:var(--fg4)}
 .lvbox{background:var(--bg-sunk);border-radius:8px;padding:10px 12px;display:flex;align-items:center;gap:12px}
+.lvbox .lbl{font-size:14px;color:var(--fg1);font-weight:400}
+.lvbox .sub{font-size:12px;color:var(--fg3);margin-top:2px}
 
 /* --- таблица «экран → состояние → файл» в оглавлении --------------------- */
 table.t{border-collapse:collapse;width:100%;font-size:12.5px}
