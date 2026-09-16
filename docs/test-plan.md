@@ -153,6 +153,7 @@
 | ИБ-11 | U | то же через настоящий `/etc/astra-voice/policy.conf` и через смену только `hotkeyMode` при сохранённой голой клавише | M5 | [ ] |
 | ИБ-12 | U/X | имя устройства `<img src="http://127.0.0.1:PORT/x.png">` в `deviceResolved` и в списке `AvSelect` → ноль сетевых запросов от Qt (перехват на сокете), строка показана как текст; статически — каждый `Text` с внешней строкой имеет `textFormat: Text.PlainText` | M5 | [ ] |
 | ИБ-13 | U | мета-случаи AST-сторожа приватности расширены на `exc_info=True`, `exc_info=exc`, `log.exception(...)` — либо ловит сторож, либо явно вынесено в поведенческие тесты с комментарием | M5 | [ ] |
+| T-64 | X | столбики уровня в пилюле стоят на базовой линии: для каждого столбика `y + height == bars.height` во всех состояниях с уровнем (`listening`, `listening-silent`, `limit`); дефект центрирования жил, пока проверялись только `height`/`color` | M5 | [ ] |
 
 Руками Юрки на машине (threat-model §8, до T3/R2): T-12, T-13, T-14, T-18, T-25, T-29, T-34, T-35, T-42, T-45 (живые Kate/Konsole/Firefox/LibreOffice/fly-term после пробы захвата), хоткей и вставка при активной ru-группе и `grp:ctrl_shift_toggle` (S4 PASS; при расхождении — дамп `xkbcomp -xkb "$DISPLAY" -`). T2 security-analyst — на каждый диф `helper/`, `security/`, `updates/`, `net/`.
 
