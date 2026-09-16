@@ -8,16 +8,18 @@ from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from astra_voice.core import paths
 from astra_voice.core.model_request import ModelNotConfigured, build_model_load
 from astra_voice.core.settings import Settings
+from astra_voice.models.store import ModelRecord as ModelRecord
+from astra_voice.models.store import ModelStore as ModelStore
 from astra_voice.worker.supervisor import WorkerSupervisor
 
 log = logging.getLogger(__name__)
 
-SMOKE_WAV_NAME = "smoke-ru-6s.wav"
+SMOKE_WAV_NAME = "smoke-ru.wav"
 SMOKE_EXPECT_ANY: tuple[str, ...] = ("проверка", "связи")
 
 
@@ -37,7 +39,6 @@ class SmokeResult:
     """Итог проверки модели без распознанного текста."""
 
     ok: bool
-    text_matched: bool
     reason: str
 
 
@@ -71,7 +72,7 @@ class SmokeRunner:
         def finish(reason: str) -> SmokeResult:
             # Только фиксированная причина: ответы и исключения могут содержать речь.
             log.debug("Смоук модели завершён: %s", reason)
-            return SmokeResult(reason == "ok", reason == "ok", reason)
+            return SmokeResult(reason == "ok", reason)
 
         events: deque[dict[str, Any]] = deque()
         supervisor = None
@@ -139,23 +140,6 @@ class SmokeRunner:
     __call__ = run
 
 
-class ModelRecord(Protocol):
-    """Сведения о модели из хранилища."""
-
-    id: str
-    revision: str
-    dir: str
-    layout: str
-    variant: str
-    state: str
-
-
-class ModelStore(Protocol):
-    """Доступ к выбранной модели в хранилище."""
-
-    def current(self) -> ModelRecord | None: ...
-
-
 def resolve_model_request(
     settings: Settings, store: ModelStore | None = None, *, store_dir: Path
 ) -> dict[str, Any] | None:
@@ -178,7 +162,7 @@ def resolve_model_request(
                         **data,
                         "model_id": record.id,
                         "model_revision": record.revision,
-                        "model_dir": record.dir,
+                        "model_dir": str(record.dir),
                         "model_layout": record.layout,
                         "model_variant": record.variant,
                     },

@@ -9,6 +9,7 @@ from unittest.mock import Mock, call
 
 import pytest
 from PyQt5 import QtCore, QtWidgets
+from PyQt5.QtTest import QSignalSpy
 
 from astra_voice import app as app_mod
 from astra_voice import runtime as runtime_mod
@@ -16,7 +17,9 @@ from astra_voice.core import paths as paths_mod
 from astra_voice.core import policy as policy_mod
 from astra_voice.core import settings as settings_mod
 from astra_voice.core.policy import Policy
+from astra_voice.core.policy import load as load_policy
 from astra_voice.core.settings import Settings
+from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind
 from astra_voice.runtime import DictationRuntime
 
@@ -63,6 +66,7 @@ class Rig:
         monkeypatch.setattr(app_mod, "_install_qt_message_handler", Mock())
         monkeypatch.setattr(policy_mod, "load", lambda: Policy())
         monkeypatch.setattr(settings_mod, "load", lambda: self.settings)
+        monkeypatch.setattr(paths_mod, "data_dir", lambda: tmp_path / "data")
         monkeypatch.setattr(paths_mod, "settings_path", lambda: tmp_path / "settings.json")
         monkeypatch.setattr(app_mod, "_ensure_settings_file", Mock())
         monkeypatch.setattr(app_mod, "_make_app_info", Mock())
@@ -83,7 +87,12 @@ def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
 def test_shutdown_once_before_other_cleanup(rig: Rig) -> None:
     assert app_mod.main([]) == 7
 
-    rig.factory.assert_called_once_with(settings=rig.settings, session_kind=SessionKind.KDE)
+    store = rig.factory.call_args.kwargs["model_store"]
+    assert isinstance(store, ModelStore)
+    assert store.root == paths_mod.model_store_dir()
+    rig.factory.assert_called_once_with(
+        settings=rig.settings, session_kind=SessionKind.KDE, model_store=store
+    )
     rig.app.setQuitOnLastWindowClosed.assert_called_once_with(False)
     assert rig.calls.mock_calls == [
         call.start(),
@@ -95,18 +104,48 @@ def test_shutdown_once_before_other_cleanup(rig: Rig) -> None:
     ]
 
 
+@pytest.mark.parametrize("error", [StoreError("broken-store"), OSError("Хранилище недоступно")])
+def test_model_store_failure_keeps_runtime_and_event_loop_running(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+) -> None:
+    store_factory = Mock(side_effect=error)
+    monkeypatch.setattr(app_mod, "ModelStore", store_factory)
+
+    with caplog.at_level(logging.WARNING, logger=app_mod.__name__):
+        assert app_mod.main([]) == 7
+
+    store_factory.assert_called_once_with()
+    rig.factory.assert_called_once_with(
+        settings=rig.settings, session_kind=SessionKind.KDE, model_store=None
+    )
+    rig.runtime.start.assert_called_once_with()
+    rig.app.exec_.assert_called_once_with()
+    rig.runtime.shutdown.assert_called_once_with()
+    rig.cleanup.assert_called_once_with(rig.server, rig.lock)
+    assert any(
+        record.levelno == logging.WARNING
+        and "Не удалось открыть хранилище моделей" in record.getMessage()
+        and record.exc_info is not None
+        and record.exc_info[1] is error
+        for record in caplog.records
+    )
+
+
 @pytest.mark.parametrize(
     "policy",
     [
         Policy(),
         Policy(
             values={"hotkey": "Ctrl+Shift+Space", "hotkey_mode": "toggle", "device": "admin mic"},
-            locked_keys=frozenset({"language"}),
+            locked_keys=frozenset({"hotkey", "hotkey_mode", "device", "language"}),
             status=policy_mod.PolicyStatus.OK,
         ),
     ],
 )
-def test_settings_bridge_receives_stored_runtime_mirror_and_policy_values(
+def test_settings_bridge_receives_stored_runtime_mirror_and_policy_locks(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, policy: Policy
 ) -> None:
     from astra_voice.ui import bridges
@@ -124,14 +163,81 @@ def test_settings_bridge_receives_stored_runtime_mirror_and_policy_values(
     runtime_settings = rig.factory.call_args.kwargs["settings"]
     assert runtime_settings is not rig.settings
     assert kwargs["mirror"] is runtime_settings
-    assert set(kwargs["locked"]) == set(policy.values)
+    assert kwargs["locked"] is policy.locked_keys
     assert isinstance(kwargs["apply"], app_mod._RuntimeSettingsApply)
     context = rig.shell.rootContext()
     properties = dict(item.args for item in context.setContextProperty.call_args_list)
     bridge = properties["settingsBridge"]
-    assert bridge.lockedSettings == sorted(policy.values)
+    assert bridge.lockedSettings == sorted(policy.locked_keys)
     assert bridge.device == (runtime_settings.extra.get("device") or "")
     assert bridge.hotkey == runtime_settings.hotkey
+
+
+def test_explicit_policy_lock_rejects_hotkey_change_through_main_bridge(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "policy.conf"
+    path.write_text("[astra-voice]\nlocked = hotkey\n", encoding="utf-8")
+    policy = load_policy(path)
+    assert policy.status is policy_mod.PolicyStatus.OK
+    assert policy.values == {}
+    monkeypatch.setattr(policy_mod, "load", lambda: policy)
+    rig.settings.extra["onboarding_done"] = True
+    settings_mod.save(rig.settings)
+    saved = paths_mod.settings_path().read_bytes()
+
+    assert app_mod.main([]) == 7
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    bridge = properties["settingsBridge"]
+    spy = QSignalSpy(bridge.hotkeyChanged)
+    assert bridge.setProperty("hotkey", "Ctrl+Shift+Space")
+
+    assert bridge.lockedSettings == ["hotkey"]
+    assert bridge.hotkey == rig.settings.hotkey == "Alt+Space"
+    assert rig.factory.call_args.kwargs["settings"].hotkey == "Alt+Space"
+    assert paths_mod.settings_path().read_bytes() == saved
+    assert len(spy) == 1
+    rig.runtime.apply_hotkey.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "policy_text",
+    ["check_app_updates = no\ncheck_model_updates = no\n", "offline = yes\n"],
+)
+def test_model_service_receives_effective_settings_and_onboarding_receives_stored(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, policy_text: str
+) -> None:
+    from astra_voice.ui import bridges
+
+    path = tmp_path / "policy.conf"
+    path.write_text("[astra-voice]\n" + policy_text, encoding="utf-8")
+    policy = load_policy(path)
+    monkeypatch.setattr(policy_mod, "load", lambda: policy)
+    rig.settings.check_app_updates = rig.settings.check_model_updates = True
+    rig.settings.extra.update(offline="no", onboarding_language_set=True)
+    original = rig.settings.to_dict()
+    expected = policy_mod.effective(rig.settings, policy)
+    model_factory = Mock(return_value=None)
+    onboarding_factory = Mock(wraps=bridges.OnboardingController)
+    monkeypatch.setattr(bridges, "ModelService", model_factory)
+    monkeypatch.setattr(bridges, "OnboardingController", onboarding_factory)
+
+    assert app_mod.main([]) == 7
+
+    model_factory.assert_called_once_with(expected, policy)
+    effective = model_factory.call_args.args[0]
+    assert effective is rig.factory.call_args.kwargs["settings"]
+    assert effective is not rig.settings
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    assert properties["settingsBridge"].checkAppUpdates == effective.check_app_updates
+    assert properties["settingsBridge"].checkModelUpdates == effective.check_model_updates
+    onboarding_factory.assert_called_once()
+    assert onboarding_factory.call_args.kwargs["settings"] is rig.settings
+    assert rig.settings.to_dict() == original
 
 
 @pytest.mark.parametrize("failure", ["constructor", "start"])
@@ -191,6 +297,20 @@ def test_pill_details_opens_main_window(rig: Rig) -> None:
 
     rig.app.exec_.side_effect = exec_loop
     assert app_mod.main(["--hidden"]) == 0
+    rig.show.assert_called_once_with(rig.shell)
+
+
+@pytest.mark.parametrize("during_start", [False, True])
+def test_notification_action_opens_main_window(rig: Rig, during_start: bool) -> None:
+    def click_action() -> int:
+        rig.runtime.on_show_requested()
+        return 0
+
+    if during_start:
+        rig.runtime.start.side_effect = click_action
+    else:
+        rig.app.exec_.side_effect = click_action
+    assert app_mod.main(["--hidden"]) == (7 if during_start else 0)
     rig.show.assert_called_once_with(rig.shell)
 
 

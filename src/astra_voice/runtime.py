@@ -13,6 +13,7 @@ from typing import Any, cast
 from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEventLoop, QObject, QSocketNotifier, Qt, QTimer
 
+from astra_voice.core import paths
 from astra_voice.core.capture_watchdog import CaptureFieldWatchdog
 from astra_voice.core.dictation import DictationOrchestrator, DictationPhase
 from astra_voice.core.model_source import (
@@ -21,7 +22,6 @@ from astra_voice.core.model_source import (
     smoke_matches,
     smoke_wav_path,
 )
-from astra_voice.core.paths import data_dir
 from astra_voice.core.settings import Settings
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
 from astra_voice.platform.hotkey import (
@@ -42,6 +42,11 @@ from astra_voice.platform.session import SessionKind
 from astra_voice.platform.x11 import X11Display
 from astra_voice.ui import notify
 from astra_voice.ui.indicators import IndicatorGuard
+from astra_voice.ui.notify import (
+    ACTION_CHOOSE_HOTKEY,
+    ACTION_CHOOSE_MICROPHONE,
+    ACTION_SHOW_DETAILS,
+)
 from astra_voice.ui.pill import (
     ERROR_MODEL_LOAD_FAILED,
     ERROR_MODEL_NOT_LOADED,
@@ -56,9 +61,12 @@ from astra_voice.worker.supervisor import WorkerSupervisor
 
 log = logging.getLogger(__name__)
 
-SELFCHECK_TIMEOUT_S = 10.0
-SELFCHECK_WATCHDOG_MS = 10000
+# После model.loaded: в замерах загрузка занимает 0,7 с, распознавание 6 с —
+# 157 мс. Для эталона 1,6 с ожидаем <1 с (F4.9); 3 с — аварийный запас для CPU.
+SELFCHECK_TIMEOUT_S = 3.0
+SELFCHECK_WATCHDOG_MS = 3000
 REGRAB_INTERVAL_MS = 30000
+_NOTIFICATION_ACTIONS = (ACTION_CHOOSE_HOTKEY, ACTION_SHOW_DETAILS, ACTION_CHOOSE_MICROPHONE)
 
 
 def _cpu_model() -> str:
@@ -106,12 +114,14 @@ class DictationRuntime(QObject):
         self.model_store = model_store
         self.session_kind = session_kind
         self.on_quit_requested: Callable[[], None] | None = None
+        self.on_show_requested: Callable[[], None] | None = None
         self._started = False
         self._closed = False
         self._loading_model = False
         self._model_load_generation: int | None = None
         self._model_load_failures = 0
         self._selfcheck: str = "idle"
+        self._selfcheck_attempts = 0
         self._selfcheck_timer: QTimer | None = None
         self._loaded_model: dict[str, str] = {}
         self._model_load_ms: int | float | None = None
@@ -179,6 +189,7 @@ class DictationRuntime(QObject):
             self.pill.on_cancel_clicked = lambda: self.orchestrator.cancel("pill")
             self.tray.on_cancel = lambda: self.orchestrator.cancel("tray")
             self.tray.on_copy_last = self._copy_last
+            self.tray.on_model_recheck = self._recheck_model
             self.tray.on_quit = self._quit_requested
             self.guard.on_stop_recording = self.orchestrator.on_indicators_lost
             if not settings.pill_enabled:
@@ -211,25 +222,44 @@ class DictationRuntime(QObject):
         """Адаптирует возвращаемое значение супервизора к порту команд."""
         self.supervisor.send(message, timeout=timeout)
 
-    def restart_worker(self) -> None:
+    def _recheck_model(self) -> None:
+        """Жест пользователя начинает новую серию проверок после запрета."""
+        if self._closed or self._selfcheck != "failed":
+            return
+        self.hotkey.fsm.escape(monotonic())
+        self.pill.show_state(PillState.LOADING_MODEL)
+        self.tray.set_state(TrayState.NOKEY if self._regrab_timer else TrayState.IDLE)
+        try:
+            self.restart_worker()
+        except Exception:
+            self._selfcheck = "running"
+            self._selfcheck_attempts = 1
+            self._finish_selfcheck("worker-error")
+
+    def restart_worker(self, *, retry_selfcheck: bool = False) -> None:
         """Заменяет супервизор, сохраняя уникальность поколений между заменами."""
         if self._closed:
             return
-        self._reset_selfcheck()
+        # После пользовательского сброса хоткей закрыт уже до первого hello.
+        self._loading_model = retry_selfcheck or self._selfcheck == "failed"
+        self._reset_selfcheck(retry=retry_selfcheck)
         generation = self.supervisor.generation + 1
         self.supervisor.stop()
         self.supervisor = self._supervisor_factory(on_event=self._on_worker_event, use_qt=True)
         self.supervisor.generation = generation
-        self._loading_model = False
         self._model_load_generation = None
-        self._model_load_failures = 0
+        if not retry_selfcheck:
+            self._model_load_failures = 0
         self.supervisor.start()
 
     def _load_model(self) -> None:
         """Загружает настроенную модель при каждом запуске нового воркера."""
         if self._model_load_generation == self.supervisor.generation:
             return
-        self._reset_selfcheck()
+        if self._selfcheck == "failed" and self._selfcheck_attempts == 2:
+            # Автоматический hello после повтора не даёт третью попытку.
+            return
+        self._reset_selfcheck(retry=self._selfcheck == "retrying")
         self._loading_model = False
         if self._model_load_failures >= 2:
             log.warning("Загрузка модели остановлена после двух неудачных попыток подряд")
@@ -237,10 +267,12 @@ class DictationRuntime(QObject):
             self.tray.set_state(TrayState.ERROR)
             return
         request = resolve_model_request(
-            self.settings, self.model_store, store_dir=data_dir() / "store"
+            self.settings, self.model_store, store_dir=paths.model_store_dir()
         )
         if request is None:
             log.info("модель в настройках не указана")
+            if self._selfcheck == "retrying":
+                self._finish_selfcheck("load-failed")
             return
         try:
             ipc.encode(request)
@@ -248,6 +280,9 @@ class DictationRuntime(QObject):
                 raise ValueError
         except (ipc.FrameError, TypeError, ValueError):
             self._model_load_failures += 1
+            if self._selfcheck == "retrying":
+                self._finish_selfcheck("load-failed")
+                return
             log.warning("параметры модели заданы неверно")
             self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
             self.tray.set_state(TrayState.ERROR)
@@ -261,14 +296,21 @@ class DictationRuntime(QObject):
         except Exception:
             self._loading_model = False
             self._model_load_failures += 1
+            if self._selfcheck == "retrying":
+                self._finish_selfcheck("load-failed")
+                return
             log.warning("Не удалось отправить запрос загрузки модели")
             self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
             self.tray.set_state(TrayState.ERROR)
 
-    def _reset_selfcheck(self) -> None:
+    def _reset_selfcheck(self, *, retry: bool = False) -> None:
         """Снимает сторожа и сведения о предыдущей загрузке."""
         self._cancel_selfcheck_timer()
-        self._selfcheck = "idle"
+        self._selfcheck = "retrying" if retry else "idle"
+        self.tray.set_model_recheck_enabled(False)
+        if retry:
+            return
+        self._selfcheck_attempts = 0
         self._loaded_model = {}
         self._model_load_ms = None
 
@@ -278,10 +320,13 @@ class DictationRuntime(QObject):
             self.cancel_timer(timer)
 
     def _model_ready(self) -> None:
-        """Объявляет готовность после проверки или при отсутствии эталона."""
+        """Объявляет готовность только после успешной проверки."""
+        self.tray.set_model_recheck_enabled(False)
         self._loading_model = False
         self._model_load_failures = 0
         if self.orchestrator.phase == DictationPhase.IDLE:
+            # Нажатие во время проверки могло оставить автомат в PROCESSING.
+            self.hotkey.fsm.escape(monotonic())
             self.pill.hide()
             self.tray.set_state(TrayState.NOKEY if self._regrab_timer else TrayState.IDLE)
         if self._model_load_ms is not None:
@@ -291,6 +336,9 @@ class DictationRuntime(QObject):
 
     def _start_selfcheck(self, event: dict[str, Any]) -> None:
         """Запускает эталон, сохраняя только сведения о модели и времени загрузки."""
+        self._selfcheck = "running"
+        if self._selfcheck_attempts == 0:
+            self._selfcheck_attempts = 1
         self._loaded_model = {
             target: value if isinstance(value := event.get(source), str) else ""
             for target, source in (
@@ -306,44 +354,64 @@ class DictationRuntime(QObject):
         wav = smoke_wav_path()
         if not wav.is_file():
             log.warning("эталон самопроверки не найден")
-            self._model_ready()
+            self._finish_selfcheck("no-wav")
             return
-        self._selfcheck = "running"
         self._selfcheck_timer = self.schedule(SELFCHECK_WATCHDOG_MS, self._selfcheck_watchdog)
         try:
             self.supervisor.send(
                 {"type": "transcribe.file", "path": str(wav)}, timeout=SELFCHECK_TIMEOUT_S
             )
         except Exception:
-            self._finish_selfcheck(False)
+            self._finish_selfcheck("worker-error")
 
     def _selfcheck_watchdog(self) -> None:
         # schedule уже удалил сработавший таймер из набора и сам освободит его.
         self._selfcheck_timer = None
-        self._finish_selfcheck(False)
+        self._finish_selfcheck("timeout")
 
-    def _finish_selfcheck(self, matched: bool) -> None:
-        """Завершает проверку один раз; распознанный текст сюда не передаётся."""
-        if self._closed or self._selfcheck != "running":
+    def _finish_selfcheck(self, reason: str) -> None:
+        """Завершает попытку; таймаут и отмена допускают один повтор без текста."""
+        if self._closed or self._selfcheck not in ("running", "retrying"):
             return
         self._cancel_selfcheck_timer()
-        self._selfcheck = "ok" if matched else "failed"
-        if matched:
-            self._model_ready()
-        else:
-            self._loading_model = False
-            self.tray.set_state(TrayState.ERROR)
-            self.pill.show_state(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
-            notify.notify_selfcheck_failed()
+        retry = reason in ("timeout", "cancelled") and self._selfcheck_attempts == 1
+        self._selfcheck = "retrying" if retry else "ok" if reason == "ok" else "failed"
+        log_outcome = log.info if reason == "ok" else log.warning
+        log_outcome(
+            "самопроверка модели: причина=%s, попытка=%d, повтор=%s",
+            reason,
+            self._selfcheck_attempts,
+            retry,
+        )
         try:
             self.stats.append(
                 "model_selfcheck",
                 **self._loaded_model,
-                result="ok" if matched else "fail",
+                result="ok" if reason == "ok" else "fail",
                 cpu_model=_cpu_model(),
             )
         except Exception:
             log.warning("Не удалось сохранить статистику самопроверки")
+        if retry:
+            self._selfcheck_attempts = 2
+            self._loading_model = True
+            # IPC резервирует id "file" до конца поколения. Новый воркер также
+            # исключает поздний ответ первой попытки; счётчик сохраняется до hello.
+            if self.supervisor.generation == self._model_load_generation:
+                try:
+                    self.restart_worker(retry_selfcheck=True)
+                except Exception:
+                    self._finish_selfcheck("worker-error")
+            # При load-timeout супервизор уже заменил процесс до доставки ошибки.
+            return
+        if reason == "ok":
+            self._model_ready()
+        else:
+            self._loading_model = False
+            self.tray.set_model_recheck_enabled(True)
+            self.tray.set_state(TrayState.ERROR)
+            self.pill.show_state(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
+            notify.notify_selfcheck_failed()
 
     def _on_worker_event(self, event: dict[str, Any]) -> None:
         """Обрабатывает загрузку модели и передаёт исходное событие оркестратору."""
@@ -352,13 +420,31 @@ class DictationRuntime(QObject):
                 not self._closed
                 and self._selfcheck == "running"
                 and event.get("generation") == self._model_load_generation
-                and event.get("generation") == self.supervisor.generation
             ):
                 if event.get("type") == "result":
-                    text = event.get("text")
-                    self._finish_selfcheck(isinstance(text, str) and smoke_matches(text))
-                elif event.get("type") in ("error", "cancelled"):
-                    self._finish_selfcheck(False)
+                    if event.get("generation") == self.supervisor.generation:
+                        text = event.get("text")
+                        self._finish_selfcheck(
+                            "ok" if isinstance(text, str) and smoke_matches(text) else "no-match"
+                        )
+                elif event.get("type") == "cancelled":
+                    if event.get("generation") == self.supervisor.generation:
+                        self._finish_selfcheck("cancelled")
+                elif event.get("type") == "error":
+                    self._finish_selfcheck(
+                        "timeout"
+                        if event.get("code") in ("timeout", "load-timeout")
+                        else "worker-error"
+                    )
+            return
+        if (
+            not self._closed
+            and self._selfcheck == "retrying"
+            and event.get("type") == "error"
+            and event.get("generation") == self.supervisor.generation
+            and event.get("code") in ("worker-start", "worker-crashed", "restart-limit")
+        ):
+            self._finish_selfcheck("worker-error")
             return
         if (
             not self._closed
@@ -372,7 +458,10 @@ class DictationRuntime(QObject):
             and event.get("generation") == self._model_load_generation
         ):
             if event.get("type") == "model.loaded":
-                if self._selfcheck == "idle":
+                if (
+                    self._selfcheck in ("idle", "retrying")
+                    and event.get("generation") == self.supervisor.generation
+                ):
                     self._start_selfcheck(event)
             elif event.get("type") == "error" and (
                 event.get("request_type") == "model.load"
@@ -380,6 +469,9 @@ class DictationRuntime(QObject):
             ):
                 self._loading_model = False
                 self._model_load_failures += 1
+                if self._selfcheck == "retrying":
+                    self._finish_selfcheck("load-failed")
+                    return
                 log.warning("Не удалось загрузить модель")
                 if self.orchestrator.phase == DictationPhase.IDLE:
                     self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
@@ -404,7 +496,11 @@ class DictationRuntime(QObject):
             self._model_load_generation = None
             self._load_model()
             return
-        if not self._closed and self._loading_model and state == HotkeyState.RECORDING:
+        if (
+            not self._closed
+            and (self._loading_model or self._selfcheck == "retrying")
+            and state == HotkeyState.RECORDING
+        ):
             if self.orchestrator.phase == DictationPhase.IDLE:
                 self.pill.show_state(PillState.LOADING_MODEL)
             return
@@ -483,8 +579,13 @@ class DictationRuntime(QObject):
         except Exception:
             log.warning("Не удалось сохранить статистику захвата горячей клавиши")
 
-    def apply_device(self, value: str | None) -> None:
-        """Устройство будет прочитано record_params перед следующей записью."""
+    def apply_device(self, _value: str | None) -> None:
+        """record_params подхватит новое устройство перед следующей записью.
+
+        Текущая запись продолжается на прежнем устройстве.
+        """
+        # Значение намеренно не применяем на лету: record_params читает настройки
+        # перед следующей записью, а текущая продолжает использовать прежнее устройство.
         log.info("Устройство записи изменено; применяется со следующей записи")
 
     def record_params(self) -> dict[str, Any]:
@@ -546,6 +647,8 @@ class DictationRuntime(QObject):
         if self._started or self._closed:
             return
         self._started = True
+        for key in _NOTIFICATION_ACTIONS:
+            notify.set_action_handler(key, self._show_requested)
         atexit.register(self.restore_paste)
         self.x11.open()
         self.tray.start()
@@ -627,6 +730,11 @@ class DictationRuntime(QObject):
         if self.on_quit_requested is not None:
             self.on_quit_requested()
 
+    def _show_requested(self) -> None:
+        """Передаёт действие уведомления владельцу главного окна."""
+        if not self._closed and self.on_show_requested is not None:
+            self.on_show_requested()
+
     def _drain_worker_events(self) -> None:
         """Даёт IPC до 50 мс на освобождение микрофона и обрабатывает события Qt."""
         self.supervisor.pump(timeout=0.05)
@@ -645,6 +753,10 @@ class DictationRuntime(QObject):
         if self._closed:
             return
         self._closed = True
+        if self._started:
+            for key in _NOTIFICATION_ACTIONS:
+                notify.set_action_handler(key, None)
+        self.on_show_requested = None
         self._cleanup("оркестратор", self.orchestrator.shutdown)
         self._cleanup("страж индикаторов", self.guard.stop)
         notifier = self.notifier

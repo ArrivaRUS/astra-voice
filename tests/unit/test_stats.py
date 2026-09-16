@@ -544,6 +544,29 @@ def test_runtime_stats_timer_retries_after_save_failure(
     rig.runtime.shutdown()
 
 
+@pytest.mark.parametrize("open_ms", [None, 0, 42, 12.5])
+def test_dictation_open_ms_schema_roundtrips(path: Path, open_ms: int | float | None) -> None:
+    stats = st.Stats()
+    fields: dict[str, object] = dict(
+        model_id="gigaam-v3", audio_ms=6000, t_ms=310, paste_ms=10, cold=False, result="ok"
+    )
+    if open_ms is not None:
+        fields["open_ms"] = open_ms
+    stats.append("dictation", **fields)
+    stats.flush()
+    event = st.Stats().events()[0]
+    assert event == {"type": "dictation", "ts": event["ts"], **fields}
+    assert json.loads(path.read_text())["events"] == [event]
+
+
+@pytest.mark.parametrize("value", [True, -1, "2", None, float("nan"), float("inf")])
+def test_dictation_open_ms_rejects_invalid_values(value: object) -> None:
+    stats = st.Stats()
+    with pytest.raises(ValueError):
+        stats.append("dictation", open_ms=value)
+    assert stats.events() == []
+
+
 @pytest.mark.parametrize("result", ["ok", "fail"])
 def test_model_selfcheck_schema_roundtrips(path: Path, result: str) -> None:
     stats = st.Stats()

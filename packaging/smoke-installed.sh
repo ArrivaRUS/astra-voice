@@ -78,6 +78,7 @@ if (lib / "vendor").is_dir():
     sys.path.insert(0, str(lib / "vendor"))
 
 from astra_voice.core import paths
+from astra_voice.core.model_source import smoke_wav_path
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui.tray_icons import TrayIconProvider, TrayState, find_tray_icon_path
 
@@ -99,6 +100,7 @@ for path in (
     paths.data_dir_static() / "catalog.json",
     paths.data_dir_static() / "catalog.json.sig",
     paths.data_dir_static() / "catalog.schema.json",
+    smoke_wav_path(),
 ):
     checked += 1
     if not path.is_file():

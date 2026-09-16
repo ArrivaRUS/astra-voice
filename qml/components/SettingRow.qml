@@ -29,11 +29,12 @@ Item {
     // Высота — по содержимому в паддингах 7/14 (§3.2): с пояснением `card.row-h-with-sub`,
     // без пояснения не меньше `card.row-min-h`, со списком — по высоте контрола.
     // Округляем до целого: грани 1 px не должны попадать на субпиксель.
+    // Макет 08-onboarding-1-network.html (.card>.r+.r): верхний разделитель добавляет 1 px к строке.
     implicitHeight: Math.ceil(Math.max(
         Theme.cardRowMinH,
         line.implicitHeight + Theme.cardRowPaddingY * 2,
         slot.implicitHeight + Theme.cardRowPaddingY * 2,
-        sub !== "" ? Theme.cardRowHWithSub : 0))
+        sub !== "" ? Theme.cardRowHWithSub : 0)) + (divider ? Theme.spaceCardRowDivider : 0)
     height: implicitHeight
 
     // Подсветка строки при наведении — без анимации (см. SidebarItem).
@@ -65,7 +66,8 @@ Item {
         anchors.fill: parent
         anchors.leftMargin: Theme.cardRowPaddingX
         anchors.rightMargin: Theme.cardRowPaddingX
-        anchors.topMargin: Theme.cardRowPaddingY
+        // Макет 08-onboarding-1-network.html (.card>.r+.r): паддинг начинается после разделителя.
+        anchors.topMargin: Theme.cardRowPaddingY + (root.divider ? Theme.spaceCardRowDivider : 0)
         anchors.bottomMargin: Theme.cardRowPaddingY
         spacing: Theme.statusbarGap
 

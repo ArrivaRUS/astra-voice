@@ -12,6 +12,7 @@ import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import BinaryIO, cast
@@ -487,8 +488,10 @@ def test_reading_stops_at_first_excess_byte(
     original_chunks = StreamResponse.iter_chunks
     read_sizes: list[int] = []
 
-    def observed_chunks(self: StreamResponse, chunk_size: int = 65536) -> Iterator[bytes]:
-        for block in original_chunks(self, chunk_size):
+    def observed_chunks(
+        self: StreamResponse, chunk_size: int = 65536, *, limit: int | None = None
+    ) -> Iterator[bytes]:
+        for block in original_chunks(self, chunk_size, limit=limit):
             read_sizes.append(len(block))
             yield block
 
@@ -504,6 +507,54 @@ def test_redirect_to_foreign_host_preserves_not_allowed(
     local_server.faults[single_entry.files[0].url_path].mode = "redirect"
     _assert_error(loader, single_entry, "not-allowed")
     assert len(local_server.requests) == 1
+
+
+def test_source_policy_error_keeps_code_and_message(
+    loader: Downloader, entry: CatalogEntry
+) -> None:
+    error = _assert_error(loader, replace(entry, host="untrusted.example"), "not-allowed")
+    assert error.message == "Источник не разрешён: сервер отсутствует в списке."
+    assert DownloadError("not-allowed").message == "Источник загрузки не разрешён."
+    assert DownloadError("bad-path").message != error.message
+
+
+@pytest.mark.parametrize("size", (16, 65534, 65536, 98304))
+@pytest.mark.parametrize("resumed", (False, True))
+def test_oversize_read_limit_without_network(
+    loader: Downloader,
+    store: ModelStore,
+    entry: CatalogEntry,
+    monkeypatch: pytest.MonkeyPatch,
+    size: int,
+    resumed: bool,
+) -> None:
+    file = replace(entry.files[0], size=size)
+    entry = replace(entry, files=(file,), size_bytes=size)
+    offset = 5 if resumed else 0
+    part = _part(store, entry, b"x" * offset)
+    received = requests.Response()
+    received.status_code = 206 if resumed else 200
+    received.headers["Content-Length"] = str(size - offset)
+    if resumed:
+        received.headers["Content-Range"] = f"bytes {offset}-{size - 1}/{size}"
+    body = BytesIO(b"x" * (size - offset + 10000))
+    received.raw = body
+    original_read = body.read
+    read_sizes: list[int] = []
+
+    def read(count: int) -> bytes:
+        block = original_read(count)
+        read_sizes.append(len(block))
+        return block
+
+    monkeypatch.setattr(received.raw, "read", read)
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", Mock(return_value=received))
+    _assert_error(loader, entry, "too-large")
+    assert sum(read_sizes) == size - offset + 1
+    assert len(read_sizes) == (size - offset + 1024) // 1024
+    assert not part.exists()
+    assert not part.with_suffix("").exists()
+    assert received.raw.closed
 
 
 def test_disk_full_prevents_all_requests(
@@ -703,7 +754,8 @@ def test_paths_resolve_inside_staging_before_mkdir_or_network(
         path = "model.bin"
         (staging / "model.bin.part").symlink_to(outside / "model.bin")
     file = replace(entry.files[0], path=path)
-    _assert_error(loader, replace(entry, files=(file,), size_bytes=file.size), "not-allowed")
+    error = _assert_error(loader, replace(entry, files=(file,), size_bytes=file.size), "bad-path")
+    assert error.message == "Путь к файлу выходит за пределы каталога загрузки."
     assert list(outside.iterdir()) == []
     forbidden.assert_not_called()
 

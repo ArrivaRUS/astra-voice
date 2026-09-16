@@ -15,6 +15,9 @@ Rectangle {
         : variant === "error" ? Theme.dangerInk
         : variant === "ok" ? Theme.successInk : Theme.fgSecondary
 
+    // design/spec.md §7; макет 08-onboarding-1-network.html: у info иконка fg-muted, текст fg-secondary.
+    readonly property color iconInk: variant === "info" ? Theme.fgMuted : ink
+
     width: parent ? parent.width : implicitWidth
     implicitHeight: Theme.noteBannerPaddingY * 2 + Math.max(symbol.visible ? symbol.height : 0, content.height)
     height: implicitHeight
@@ -29,7 +32,7 @@ Rectangle {
         y: Theme.noteBannerPaddingY
         name: root.iconName
         size: Theme.noteBannerIcon
-        color: root.ink
+        color: root.iconInk
         visible: name !== ""
     }
 

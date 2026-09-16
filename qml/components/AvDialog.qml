@@ -34,11 +34,20 @@ Dialog {
 
     background: Rectangle {
         radius: Theme.dialogRadius
-        border.width: Theme.borderHairline
-        border.color: Theme.border
         color: Theme.bgApp
         antialiasing: true
         // Тень 0 16px 44px из §11.1 опущена.
+
+        // Обводка рисуется поверх заливки: в тёмной теме Theme.border — 10 % белого.
+        // Композит считаем от заливки диалога, иначе подложка делает рамку темнее макета.
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: "transparent"
+            border.width: Theme.borderHairline
+            border.color: Theme.border
+            antialiasing: true
+        }
     }
 
     header: Item {

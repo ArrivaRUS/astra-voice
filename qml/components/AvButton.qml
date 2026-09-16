@@ -34,11 +34,12 @@ Button {
     background: Rectangle {
         radius: Theme.buttonRadius
         antialiasing: true
-        border.width: control.ghost ? 0 : Theme.buttonBorder
+        // По design/spec.md §4.1 у disabled ghost фон и граница как у secondary; opacity остаётся 1.
+        border.width: control.ghost && control.enabled ? 0 : Theme.buttonBorder
         border.color: control.enabled ? (control.primary ? Theme.primary : Theme.border) : Theme.border
         color: {
             if (!control.enabled)
-                return control.ghost ? "transparent" : Theme.bgSurface2;
+                return Theme.bgSurface2;
             if (control.primary)
                 return control.pressed ? Theme.statePrimaryPressed
                      : (control.hovered ? Theme.statePrimaryHover : Theme.primary);

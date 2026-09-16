@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import posixpath
 import re
 import stat
 import unicodedata
 from dataclasses import dataclass
-from importlib import import_module
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 from urllib.parse import unquote
 
 from astra_voice.core import paths
+from astra_voice.net.hosts import host_allowed
 from astra_voice.security.verify import Verifier
 
 CATALOG_MAX_BYTES = 1 << 20
@@ -30,6 +32,10 @@ class CatalogError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class _RemoteReferenceError(Exception):
+    """Запасной тип ошибки для версий jsonschema без RefResolutionError."""
 
 
 @dataclass(frozen=True)
@@ -235,7 +241,7 @@ def _model(value: object) -> CatalogEntry:
     model_id = _identifier(data.get("id"))
     revision = _identifier(data.get("revision"))
     host = _string(data.get("host"))
-    if not import_module("astra_voice.net.http")._host_allowed(host):
+    if not host_allowed(host):
         raise CatalogError("bad-schema", "Источник модели отсутствует в списке разрешённых.")
     files = tuple(_file(item) for item in _array(data.get("files")))
     if len({file.path for file in files}) != len(files):
@@ -268,7 +274,7 @@ def _revoked(value: object) -> RevokedEntry:
 
 
 def load_builtin(verifier: Verifier, *, root: Path | None = None) -> Catalog:
-    """Читает встроенный каталог: лимит → подпись → JSON → схема → проверка полей."""
+    """Читает каталог: лимит → подпись → JSON → SHA-256 схемы → схема → поля."""
     directory = (paths.data_dir_static() if root is None else root).resolve()
     catalog_path = (directory / "catalog.json").resolve()
     sig_path = (directory / "catalog.json.sig").resolve()
@@ -282,21 +288,49 @@ def load_builtin(verifier: Verifier, *, root: Path | None = None) -> Catalog:
     if _read_limited(catalog_path, "Каталог") != raw:
         raise CatalogError("bad-signature", "Каталог изменился во время проверки подписи.")
     document = _parse_json(raw)
-    schema = _parse_json(_read_limited(directory / "catalog.schema.json", "Схема каталога"))
+    schema_raw = _read_limited(directory / "catalog.schema.json", "Схема каталога")
+    schema_sha256 = document.get("schema_sha256") if isinstance(document, dict) else None
+    if (
+        not isinstance(schema_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", schema_sha256) is None
+        or not hmac.compare_digest(hashlib.sha256(schema_raw).hexdigest(), schema_sha256)
+    ):
+        raise CatalogError("bad-schema", "Не удалось подтвердить схему каталога.")
+    schema = _parse_json(schema_raw)
     try:
         import jsonschema
     except ImportError:
         raise CatalogError(
             "bad-schema", "Не удалось проверить каталог: недоступен модуль jsonschema."
         ) from None
+    ref_resolution_error = getattr(
+        jsonschema.exceptions, "RefResolutionError", _RemoteReferenceError
+    )
+
+    class _LocalRefResolver(jsonschema.RefResolver):
+        def resolve_remote(self, uri: str) -> NoReturn:
+            # В jsonschema 4.10.3 отсутствие handler включает requests/urllib.
+            # Запрещаем загрузку для любой схемы URI, включая неизвестные.
+            raise ref_resolution_error("Удалённые ссылки в схеме каталога запрещены.")
+
     try:
-        jsonschema.validate(
-            document,
-            schema,
-            cls=jsonschema.Draft202012Validator,
-            format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER,
+        cls = jsonschema.Draft202012Validator
+        cls.check_schema(schema)
+        resolver = _LocalRefResolver.from_schema(schema)
+        resolver.handlers.update(
+            dict.fromkeys(("http", "https", "ftp", "file", "data"), resolver.resolve_remote)
         )
-    except (jsonschema.ValidationError, jsonschema.SchemaError, RecursionError):
+        cls(
+            schema,
+            resolver=resolver,
+            format_checker=cls.FORMAT_CHECKER,
+        ).validate(document)
+    except (
+        jsonschema.ValidationError,
+        jsonschema.SchemaError,
+        ref_resolution_error,
+        RecursionError,
+    ):
         raise CatalogError("bad-schema", "Каталог не соответствует схеме.") from None
     data = _object(document)
     _positive_integer(data.get("manifest_version"))

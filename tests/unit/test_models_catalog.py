@@ -5,16 +5,22 @@ pytest.importorskip("jsonschema")
 # Зависимость проверяется до импорта каталога (scripts/ci_require_imports.py).
 # ruff: noqa: E402
 import builtins
+import hashlib
 import io
 import json
 import os
 import socket
+import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
 from typing import IO, Any, cast
 from unittest.mock import Mock
 
+import requests
+
+from astra_voice.models import catalog as catalog_module
 from astra_voice.models.catalog import CatalogError, load_builtin
 from astra_voice.security.verify import Verifier, VerifyResult
 
@@ -66,6 +72,25 @@ def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def write_document(root: Path, document: dict[str, Any]) -> None:
     (root / "catalog.json").write_text(json.dumps(document), encoding="utf-8")
+
+
+def test_model_parsing_does_not_import_http(document: dict[str, Any]) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, sys\n"
+            "from astra_voice.models.catalog import _model\n"
+            "_model(json.load(sys.stdin))\n"
+            "assert 'astra_voice.net.http' not in sys.modules\n"
+            "assert 'requests' not in sys.modules\n",
+        ],
+        input=json.dumps(document["models"][0]),
+        text=True,
+        capture_output=True,
+        check=True,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+    )
 
 
 def assert_rejected(root: Path, code: str, verifier: Verifier | None = None) -> None:
@@ -175,6 +200,126 @@ def test_builtin_catalog_relative_paths(monkeypatch: pytest.MonkeyPatch) -> None
     )
     assert result.serial == 1
     assert result == load_builtin(Verifier("catalog", keyring=KEYRING), root=DATA_ROOT)
+
+
+def test_catalog_fixture_matches_schema(catalog_root: Path, document: dict[str, Any]) -> None:
+    schema_raw = (catalog_root / "catalog.schema.json").read_bytes()
+    assert document["schema_sha256"] == hashlib.sha256(schema_raw).hexdigest()
+    result = load_builtin(StubVerifier(), root=catalog_root)
+    assert result.serial == document["serial"]
+    assert result.entry(MODEL_ID) is not None
+
+
+def test_schema_tampering_rejected_with_real_signature(tmp_path: Path) -> None:
+    for name in ("catalog.json", "catalog.json.sig", "catalog.schema.json"):
+        (tmp_path / name).write_bytes((DATA_ROOT / name).read_bytes())
+    schema_path = tmp_path / "catalog.schema.json"
+    schema_path.write_bytes(schema_path.read_bytes() + b" ")
+
+    with pytest.raises(CatalogError) as error:
+        load_builtin(Verifier("catalog", keyring=KEYRING), root=tmp_path)
+
+    assert error.value.code == "bad-schema"
+    assert error.value.message == "Не удалось подтвердить схему каталога."
+
+
+@pytest.mark.parametrize("suffix", [b" ", b"!"], ids=["whitespace", "invalid-json"])
+def test_schema_tampering_checked_before_parsing(catalog_root: Path, suffix: bytes) -> None:
+    schema_path = catalog_root / "catalog.schema.json"
+    schema_path.write_bytes(schema_path.read_bytes() + suffix)
+
+    with pytest.raises(CatalogError) as error:
+        load_builtin(StubVerifier(), root=catalog_root)
+
+    assert error.value.code == "bad-schema"
+    assert error.value.message == "Не удалось подтвердить схему каталога."
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, False, 1, 1.5, "text", [], {}, {"schema_sha256": None}, {"schema_sha256": []}],
+    ids=["null", "bool", "int", "float", "str", "list", "missing", "null-sha", "list-sha"],
+)
+def test_schema_digest_handles_unvalidated_document(catalog_root: Path, value: object) -> None:
+    (catalog_root / "catalog.json").write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(CatalogError) as error:
+        load_builtin(StubVerifier(), root=catalog_root)
+
+    assert error.value.code == "bad-schema"
+    assert error.value.message == "Не удалось подтвердить схему каталога."
+
+
+@pytest.mark.parametrize(
+    "value",
+    [False, 1, 1.5, {}, "", "0" * 64, "a" * 63, "A" * 64, "я" * 64, "\ud800" * 64],
+    ids=[
+        "bool",
+        "int",
+        "float",
+        "object",
+        "empty",
+        "mismatch",
+        "short",
+        "upper",
+        "unicode",
+        "surrogate",
+    ],
+)
+def test_invalid_schema_digest(catalog_root: Path, document: dict[str, Any], value: object) -> None:
+    document["schema_sha256"] = value
+    write_document(catalog_root, document)
+
+    with pytest.raises(CatalogError) as error:
+        load_builtin(StubVerifier(), root=catalog_root)
+
+    assert error.value.code == "bad-schema"
+    assert error.value.message == "Не удалось подтвердить схему каталога."
+
+
+def test_schema_is_read_once_and_validates_authenticated_bytes(
+    catalog_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    schema_path = catalog_root / "catalog.schema.json"
+    original_read = catalog_module._read_limited
+    schema_reads = 0
+
+    def replace_after_read(path: Path, label: str) -> bytes:
+        nonlocal schema_reads
+        raw = original_read(path, label)
+        if path == schema_path:
+            schema_reads += 1
+            path.write_bytes(b"false")
+        return raw
+
+    monkeypatch.setattr(catalog_module, "_read_limited", replace_after_read)
+    result = load_builtin(StubVerifier(), root=catalog_root)
+
+    assert schema_reads == 1
+    assert result.entry(MODEL_ID) is not None
+    assert schema_path.read_bytes() == b"false"
+
+
+def test_external_schema_reference_never_uses_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("catalog.json", "catalog.json.sig"):
+        (tmp_path / name).write_bytes((DATA_ROOT / name).read_bytes())
+    (tmp_path / "catalog.schema.json").write_text(
+        json.dumps({"$ref": "https://evil.example/s.json"}), encoding="utf-8"
+    )
+    transport_send = Mock(side_effect=AssertionError("HTTP-транспорт при разборе схемы"))
+    requests_get = Mock(side_effect=AssertionError("requests.get при разборе схемы"))
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", transport_send)
+    monkeypatch.setattr(requests, "get", requests_get)
+
+    with pytest.raises(CatalogError) as error:
+        load_builtin(Verifier("catalog", keyring=KEYRING), root=tmp_path)
+
+    assert error.value.code == "bad-schema"
+    assert error.value.message == "Не удалось подтвердить схему каталога."
+    assert transport_send.call_count == 0
+    assert requests_get.call_count == 0
 
 
 @pytest.mark.parametrize("has_signature", [True, False], ids=["changed-byte", "missing-signature"])

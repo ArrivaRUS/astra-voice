@@ -11,10 +11,12 @@ from unittest.mock import Mock
 
 import pytest
 
+from astra_voice.core.model_request import build_model_load
 from astra_voice.models import installer as inst
-from astra_voice.models.catalog import CatalogEntry, FileSpec
+from astra_voice.models.catalog import Catalog, CatalogEntry, FileSpec, RevokedEntry
 from astra_voice.models.installer import Installer, SmokeResult
 from astra_voice.models.store import ModelRecord, ModelStore, StoreError
+from astra_voice.worker import ipc
 
 pytestmark = pytest.mark.unit
 
@@ -76,6 +78,7 @@ def _previous(store: ModelStore, entry: CatalogEntry, contents: dict[str, bytes]
         old_entry
     )
     assert result.state == "ok"
+    assert result.reason_code == ""
     assert result.record is not None
     return result.record
 
@@ -125,6 +128,7 @@ def test_success_obeys_o2_order(
     result = Installer(store, smoke).install_from_staging(entry)
 
     assert result.state == "ok"
+    assert result.reason_code == ""
     assert result.reason == ""
     assert result.record == ModelRecord(
         entry.id, entry.revision, installed, entry.layout, entry.variant, entry.size_bytes
@@ -150,6 +154,60 @@ def test_success_obeys_o2_order(
     ]
 
 
+def test_installed_record_builds_valid_smoke_ipc_request(
+    store: ModelStore, entry: CatalogEntry, contents: dict[str, bytes]
+) -> None:
+    staging = _stage(store, entry, contents)
+    checked_records: list[ModelRecord] = []
+    frames: list[bytes] = []
+
+    def check_smoke(directory: Path, model: CatalogEntry) -> SmokeResult:
+        (record,) = store.records()
+        assert record.dir == directory
+        assert (record.id, record.revision) == (model.id, model.revision)
+        assert directory.is_dir()
+        assert not staging.exists()
+        assert store.current() is None
+        # Передаём настоящий Path из хранилища без нормализации на стороне теста.
+        request = build_model_load(
+            {
+                "model_id": record.id,
+                "model_revision": record.revision,
+                "model_dir": record.dir,
+                "model_layout": record.layout,
+                "model_variant": record.variant,
+                "model_min_ram_mb": model.min_ram_mb,
+            },
+            store_dir=store.root,
+        )
+        frame = ipc.encode(request)
+        assert ipc.decode(frame[4:]) == request
+        checked_records.append(record)
+        frames.append(frame)
+        return SmokeResult(True, text="Контракт IPC проверен")
+
+    result = Installer(store, check_smoke).install_from_staging(entry)
+
+    assert result.state == "ok"
+    assert result.reason_code == ""
+    assert result.reason == ""
+    assert result.record is not None
+    assert checked_records == [result.record]
+    assert store.current() == result.record
+    assert store.records() == (result.record,)
+    assert len(frames) == 1
+    assert ipc.decode(frames[0][4:]) == {
+        "type": "model.load",
+        "id": entry.id,
+        "revision": entry.revision,
+        "dir": str(result.record.dir),
+        "layout": entry.layout,
+        "variant": entry.variant,
+        "threads": 2,
+        "min_ram_mb": entry.min_ram_mb,
+    }
+
+
 @pytest.mark.parametrize("file_index", [0, 1, 2])
 def test_changed_byte_keeps_staging_and_current(
     store: ModelStore,
@@ -173,6 +231,7 @@ def test_changed_byte_keeps_staging_and_current(
     result = Installer(store, smoke).install_from_staging(entry)
 
     assert result.state == "error"
+    assert result.reason_code == "checksum"
     assert "контрольная сумма" in result.reason
     assert result.record is None
     assert staging.is_dir()
@@ -213,6 +272,7 @@ def test_smoke_failure_marks_broken_and_preserves_current(
 
     installed = store.root / entry.id / entry.revision
     assert result.state == "broken"
+    assert result.reason_code == "selfcheck"
     assert result.reason
     assert result.record == ModelRecord(
         entry.id,
@@ -255,6 +315,7 @@ def test_extra_staged_file_is_rejected(
     result = Installer(store, smoke).install_from_staging(entry)
 
     assert result.state == "error"
+    assert result.reason_code == "layout"
     assert "лишние" in result.reason
     assert extra_name not in result.reason
     assert staging.exists()
@@ -272,6 +333,7 @@ def test_temporary_parts_are_removed_before_layout_check(
     result = Installer(store, smoke).install_from_staging(entry)
 
     assert result.state == "ok"
+    assert result.reason_code == ""
     assert result.record is not None
     assert {file.name for file in result.record.dir.iterdir()} == {*contents, "state.json"}
 
@@ -291,6 +353,7 @@ def test_missing_staging_or_required_file(
     result = Installer(store, smoke).install_from_staging(entry)
 
     assert result.state == "error"
+    assert result.reason_code == "layout"
     assert result.reason
     assert store.records() == ()
     if missing_staging:
@@ -323,6 +386,7 @@ def test_real_layout_check_rejects_inconsistent_catalog(
     result = Installer(store, smoke).install_from_staging(entry)
 
     assert result.state == "error"
+    assert result.reason_code == "layout"
     assert result.reason
     assert "unknown" not in result.reason
     assert "config.json" not in result.reason
@@ -343,6 +407,7 @@ def test_install_from_folder(
     result = Installer(store, smoke).install_from_path(source, entry)
 
     assert result.state == "ok"
+    assert result.reason_code == ""
     assert result.record == store.current()
     assert result.record is not None
     assert result.record.layout == entry.layout
@@ -368,6 +433,7 @@ def test_local_extra_file_is_rejected_before_copying(
     result = Installer(store, smoke).install_from_path(source, entry)
 
     assert result.state == "error"
+    assert result.reason_code == "layout"
     assert "лишние" in result.reason
     assert not (store.root / entry.id).exists()
     smoke.assert_not_called()
@@ -394,6 +460,7 @@ def test_invalid_local_source(
     )
 
     assert result.state == "error"
+    assert result.reason_code == ("" if source_kind == "unknown-model" else "layout")
     assert result.reason
     if source_kind == "file":
         assert result.reason == "Выберите папку с файлами модели."
@@ -428,6 +495,7 @@ def test_bad_local_bytes_clear_staging_and_keep_current(
     result = Installer(store, smoke).install_from_path(source, entry)
 
     assert result.state == "error"
+    assert result.reason_code == "checksum"
     assert "контрольная сумма" in result.reason
     assert not (store.root / entry.id / f"{entry.revision}.partial").exists()
     assert not (store.root / entry.id / entry.revision).exists()
@@ -456,6 +524,7 @@ def test_disk_full_does_not_copy_or_create_staging(
     result = Installer(store, smoke).install_from_path(source, entry)
 
     assert result.state == "error"
+    assert result.reason_code == "disk"
     assert "мест" in result.reason and "диск" in result.reason
     disk_ok.assert_called_once_with(entry.size_bytes)
     copy.assert_not_called()
@@ -476,6 +545,7 @@ def test_recovery_then_fresh_install_has_no_garbage(
     result = Installer(store, smoke).install_from_staging(entry)
 
     assert result.state == "ok"
+    assert result.reason_code == ""
     assert result.record is not None
     assert {file.name for file in result.record.dir.iterdir()} == {*contents, "state.json"}
     assert not staging.exists()
@@ -502,6 +572,7 @@ def test_upgrade_preserves_old_revision_and_switches_after_smoke(
     result = Installer(store, smoke).install_from_staging(entry)
 
     assert result.state == "ok"
+    assert result.reason_code == ""
     assert result.record == store.current()
     assert result.record is not None
     assert {record.revision for record in store.records()} == {previous.revision, entry.revision}
@@ -536,6 +607,7 @@ def test_unsafe_paths_never_overwrite_outside_files(
     result = Installer(store, smoke).install_from_path(source, entry)
 
     assert result.state == "error"
+    assert result.reason_code == "layout"
     assert outside.read_bytes() == b"keep"
     assert not (store.root / entry.id / entry.revision).exists()
     smoke.assert_not_called()
@@ -568,6 +640,7 @@ def test_io_errors_are_reported_without_internal_details(
     result = Installer(store, smoke).install_from_path(source, entry)
 
     assert result.state == "error"
+    assert result.reason_code == ("disk" if fault == "copy" else "")
     assert result.reason
     assert str(source) not in result.reason
     assert "state.json" not in result.reason
@@ -577,3 +650,142 @@ def test_io_errors_are_reported_without_internal_details(
     if fault != "activate":
         smoke.assert_not_called()
         assert not (store.root / entry.id / entry.revision).exists()
+
+
+@pytest.mark.parametrize("from_path", [False, True])
+def test_revoked_revision_is_rejected_before_copy_commit_and_smoke(
+    tmp_path: Path,
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    smoke: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    from_path: bool,
+) -> None:
+    previous = _previous(store, entry, contents)
+    before = _pointer(store)
+    staging = _stage(store, entry, contents)
+    source = _write_files(tmp_path / "source", contents) if from_path else staging
+    catalog = Catalog(1, 1, (RevokedEntry(entry.id, entry.revision, "Ошибка модели"),), (entry,))
+    copy = Mock(wraps=inst._copy_file)
+    commit = Mock(wraps=store.commit)
+    create_staging = Mock(wraps=store.staging_dir)
+    monkeypatch.setattr(inst, "_copy_file", copy)
+    monkeypatch.setattr(store, "commit", commit)
+    monkeypatch.setattr(store, "staging_dir", create_staging)
+    installer = Installer(store, smoke, catalog=catalog)
+
+    result = (
+        installer.install_from_path(source, entry)
+        if from_path
+        else installer.install_from_staging(entry)
+    )
+
+    assert result.state == "error"
+    assert result.reason_code == "revoked"
+    assert result.reason == "Эта версия модели отозвана. Выберите другую версию или модель."
+    assert result.record is None
+    assert {file.name: file.read_bytes() for file in staging.iterdir()} == contents
+    assert {file.name: file.read_bytes() for file in source.iterdir()} == contents
+    assert not (store.root / entry.id / entry.revision).exists()
+    assert store.current() == previous
+    assert store.records() == (previous,)
+    assert _pointer(store) == before
+    copy.assert_not_called()
+    commit.assert_not_called()
+    create_staging.assert_not_called()
+    smoke.assert_not_called()
+
+
+@pytest.mark.parametrize("from_path", [False, True])
+@pytest.mark.parametrize("revocation", ["none", "other-model", "other-revision"])
+def test_catalog_allows_revision_without_matching_revocation(
+    tmp_path: Path,
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    smoke: Mock,
+    from_path: bool,
+    revocation: str,
+) -> None:
+    source = (
+        _write_files(tmp_path / "source", contents) if from_path else _stage(store, entry, contents)
+    )
+    revoked = (
+        ()
+        if revocation == "none"
+        else (
+            RevokedEntry(
+                "other-model" if revocation == "other-model" else entry.id,
+                "other-revision" if revocation == "other-revision" else entry.revision,
+                "Ошибка модели",
+            ),
+        )
+    )
+    installer = Installer(store, smoke, Catalog(1, 1, revoked, (entry,)))
+
+    result = (
+        installer.install_from_path(source, entry)
+        if from_path
+        else installer.install_from_staging(entry)
+    )
+
+    assert result.state == "ok"
+    assert result.reason_code == ""
+    assert result.record == store.current()
+    smoke.assert_called_once_with(store.root / entry.id / entry.revision, entry)
+
+
+@pytest.mark.parametrize("size_delta", [-1, 1])
+def test_staged_size_mismatch_with_matching_hash_is_checksum(
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    smoke: Mock,
+    size_delta: int,
+) -> None:
+    spec = entry.files[0]
+    entry = replace(entry, files=(replace(spec, size=spec.size + size_delta), *entry.files[1:]))
+    staging = _stage(store, entry, contents)
+
+    result = Installer(store, smoke).install_from_staging(entry)
+
+    assert result.state == "error"
+    assert result.reason_code == "checksum"
+    assert staging.is_dir()
+    assert store.records() == ()
+    smoke.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("error", "reason_code"),
+    [
+        (OSError(errno.ENOSPC, "Нет места"), "disk"),
+        (OSError(errno.EDQUOT, "Исчерпана квота"), "disk"),
+        (StoreError("disk-full"), "disk"),
+        (StoreError("bad-id"), "layout"),
+        (OSError(errno.EACCES, "Отказ доступа"), ""),
+        (StoreError("broken-store"), ""),
+    ],
+)
+def test_commit_error_reason_codes(
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    smoke: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    reason_code: str,
+) -> None:
+    staging = _stage(store, entry, contents)
+    monkeypatch.setattr(store, "commit", Mock(side_effect=error))
+
+    result = Installer(store, smoke).install_from_staging(entry)
+
+    assert result.state == "error"
+    assert result.reason_code == reason_code
+    assert result.reason
+    assert staging.is_dir()
+    assert not (staging / "state.json").exists()
+    assert store.records() == ()
+    smoke.assert_not_called()

@@ -19,12 +19,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from astra_voice.core import paths
 from astra_voice.core import policy as policy_mod
 from astra_voice.core import settings as settings_mod
 from astra_voice.core.logging import setup_logging
 from astra_voice.core.model_request import build_model_load
 from astra_voice.core.paths import ipc_socket_path, lock_path, qml_dir, settings_path
 from astra_voice.core.version import __version__
+from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
 
 if TYPE_CHECKING:
@@ -140,7 +142,6 @@ def _debug_transcribe(path: str, args: argparse.Namespace) -> int:
     """Расшифровывает WAV без окна; текст передаёт исключительно в stdout."""
     from PyQt5.QtCore import QCoreApplication
 
-    from astra_voice.core.paths import data_dir
     from astra_voice.worker import ipc
     from astra_voice.worker.supervisor import Message, WorkerSupervisor
 
@@ -175,7 +176,7 @@ def _debug_transcribe(path: str, args: argparse.Namespace) -> int:
         settings = policy_mod.effective(settings_mod.load(), policy_mod.load()).to_dict()
 
         try:
-            request = _debug_model_request(settings, args, data_dir() / "store")
+            request = _debug_model_request(settings, args, paths.model_store_dir())
         except ValueError:
             return fail(
                 2, "Модель не настроена. Укажите --model-dir или модель и ревизию в настройках."
@@ -678,8 +679,19 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from astra_voice.runtime import DictationRuntime
 
-            runtime = DictationRuntime(settings=settings, session_kind=session_kind)
+            model_store: ModelStore | None = None
+            try:
+                model_store = ModelStore()
+            except (StoreError, OSError):
+                log.warning(
+                    "Не удалось открыть хранилище моделей, приложение продолжит работу без него",
+                    exc_info=True,
+                )
+            runtime = DictationRuntime(
+                settings=settings, session_kind=session_kind, model_store=model_store
+            )
             runtime.on_quit_requested = app.quit
+            runtime.on_show_requested = lambda: _show(shell)
             runtime.tray.on_settings = lambda: _show(shell)
             runtime.tray.on_about = lambda: _show(shell)
             runtime.pill.on_details_clicked = lambda: _show(shell)
@@ -697,7 +709,7 @@ def main(argv: list[str] | None = None) -> int:
             stored,
             mirror=settings,
             apply=_RuntimeSettingsApply(runtime) if runtime_ready and runtime is not None else None,
-            locked=policy.values,
+            locked=policy.locked_keys,
         )
         QQmlEngine.setObjectOwnership(settings_bridge, QQmlEngine.CppOwnership)
         _set_context_property(shell, "settingsBridge", settings_bridge)
@@ -705,7 +717,7 @@ def main(argv: list[str] | None = None) -> int:
         if show_onboarding:
             model = None
             try:
-                model = ModelService(stored, policy)
+                model = ModelService(settings, policy)
             except Exception:  # noqa: BLE001 — каталог не должен мешать запуску окна
                 log.warning(
                     "Не удалось подготовить каталог моделей, настройка продолжится без него"

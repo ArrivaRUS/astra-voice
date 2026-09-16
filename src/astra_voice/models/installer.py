@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
-from astra_voice.models.catalog import ID_RE, CatalogEntry, FileSpec
+from astra_voice.models.catalog import ID_RE, Catalog, CatalogEntry, FileSpec
 from astra_voice.models.store import ModelRecord, ModelStore, StoreError
 from astra_voice.security.verify import sha256_file
 from astra_voice.worker.engine import EngineError, ModelMissingError, check_layout
@@ -39,6 +39,7 @@ class SmokeResult:
 
 
 SmokeCheck = Callable[[Path, CatalogEntry], SmokeResult]
+ReasonCode = Literal["", "checksum", "layout", "selfcheck", "disk", "cancelled", "revoked"]
 
 
 @dataclass(frozen=True)
@@ -48,10 +49,15 @@ class InstallResult:
     state: Literal["ok", "broken", "error"]
     reason: str = ""
     record: ModelRecord | None = None
+    reason_code: ReasonCode = ""
 
 
 class _InstallError(Exception):
     """Отказ проверки с понятной пользователю причиной."""
+
+    def __init__(self, reason: str, reason_code: ReasonCode) -> None:
+        super().__init__(reason)
+        self.reason_code = reason_code
 
 
 def _file_path(directory: Path, name: str) -> Path:
@@ -67,7 +73,7 @@ def _file_path(directory: Path, name: str) -> Path:
         or target.is_symlink()
     ):
         log.warning("Недопустимый путь файла модели: %r в %s", name, directory)
-        raise _InstallError("Файлы в папке не подходят для выбранной модели.")
+        raise _InstallError("Файлы в папке не подходят для выбранной модели.", "layout")
     return target
 
 
@@ -78,18 +84,18 @@ def _check_contents(directory: Path, entry: CatalogEntry, *, allow_parts: bool) 
     for child in directory.iterdir():
         if child.is_symlink() or not child.is_file():
             log.warning("Вместо обычного файла модели обнаружен %s", child)
-            raise _InstallError(_EXTRA_REASON)
+            raise _InstallError(_EXTRA_REASON, "layout")
         if child.name in names:
             continue
         if allow_parts and child.name.endswith(".part"):
             parts.append(_file_path(directory, child.name))
             continue
         log.warning("Лишний файл модели: %s", child)
-        raise _InstallError(_EXTRA_REASON)
+        raise _InstallError(_EXTRA_REASON, "layout")
     for file in entry.files:
         if not _file_path(directory, file.path).is_file():
             log.warning("Отсутствует файл модели: %s / %s", directory, file.path)
-            raise _InstallError(_MISSING_REASON)
+            raise _InstallError(_MISSING_REASON, "layout")
     return tuple(parts)
 
 
@@ -103,20 +109,22 @@ def _copy_file(source: Path, target: Path, spec: FileSpec) -> None:
             copied += len(block)
             if copied > spec.size:
                 log.warning("Файл модели превышает заявленный размер: %s", source)
-                raise _InstallError(_CHECKSUM_REASON)
+                raise _InstallError(_CHECKSUM_REASON, "checksum")
             digest.update(block)
             writer.write(block)
         if not hmac.compare_digest(digest.hexdigest(), spec.sha256) or copied != spec.size:
             log.warning("Не совпали sha256 или размер при копировании %s", source)
-            raise _InstallError(_CHECKSUM_REASON)
+            raise _InstallError(_CHECKSUM_REASON, "checksum")
         writer.flush()
         os.fsync(writer.fileno())
 
 
 def _error_result(exc: Exception) -> InstallResult:
     log.exception("Не удалось установить модель: %s", exc)
+    reason_code: ReasonCode = ""
     if isinstance(exc, _InstallError):
         reason = str(exc)
+        reason_code = exc.reason_code
     elif (
         isinstance(exc, StoreError)
         and exc.code == "disk-full"
@@ -124,23 +132,35 @@ def _error_result(exc: Exception) -> InstallResult:
         and exc.errno in {errno.ENOSPC, errno.EDQUOT}
     ):
         reason = _DISK_REASON
+        reason_code = "disk"
     else:
         # Сообщения файловой системы и хранилища могут содержать внутренние пути.
         reason = _FILES_REASON
-    return InstallResult("error", reason)
+        if isinstance(exc, StoreError) and exc.code == "bad-id":
+            reason_code = "layout"
+    return InstallResult("error", reason, reason_code=reason_code)
 
 
 class Installer:
     """Меняет текущую модель только после успешного пробного распознавания."""
 
-    def __init__(self, store: ModelStore, smoke: SmokeCheck) -> None:
+    def __init__(
+        self, store: ModelStore, smoke: SmokeCheck, catalog: Catalog | None = None
+    ) -> None:
         self._store = store
         self._smoke = smoke
+        self._catalog = catalog
+
+    def _check_revoked(self, entry: CatalogEntry) -> None:
+        if self._catalog is not None and self._catalog.is_revoked(entry.id, entry.revision):
+            raise _InstallError(
+                "Эта версия модели отозвана. Выберите другую версию или модель.", "revoked"
+            )
 
     def _staging_path(self, entry: CatalogEntry) -> Path:
         # staging_dir создаёт папку; здесь отсутствие проверяется без побочных эффектов.
         if ID_RE.fullmatch(entry.id) is None or ID_RE.fullmatch(entry.revision) is None:
-            raise _InstallError("Не удалось определить модель. Выберите её в списке.")
+            raise _InstallError("Не удалось определить модель. Выберите её в списке.", "layout")
         staging = self._store.root / entry.id / f"{entry.revision}.partial"
         if (
             not staging.resolve().is_relative_to(self._store.root.resolve())
@@ -148,28 +168,33 @@ class Installer:
             or staging.parent.is_symlink()
         ):
             log.warning("Недопустимый каталог staging: %s", staging)
-            raise _InstallError(_FILES_REASON)
+            raise _InstallError(_FILES_REASON, "layout")
         return staging
 
     def install_from_staging(self, entry: CatalogEntry) -> InstallResult:
         """Проверяет весь набор до переноса, затем выполняет оставшиеся шаги О2."""
         try:
+            self._check_revoked(entry)
             staging = self._staging_path(entry)
             if not staging.is_dir():
-                return InstallResult("error", "Файлы для установки не найдены. Получите их заново.")
+                return InstallResult(
+                    "error",
+                    "Файлы для установки не найдены. Получите их заново.",
+                    reason_code="layout",
+                )
 
             # О2.1: даже проверенные загрузчиком файлы перечитываются перед переносом.
             for file in entry.files:
                 source = _file_path(staging, file.path)
                 if not source.is_file():
                     log.warning("Отсутствует файл модели: %s", source)
-                    raise _InstallError(_MISSING_REASON)
+                    raise _InstallError(_MISSING_REASON, "layout")
                 if not hmac.compare_digest(sha256_file(source), file.sha256):
                     log.warning("Не совпала sha256 файла модели: %s", source)
-                    raise _InstallError(_CHECKSUM_REASON)
+                    raise _InstallError(_CHECKSUM_REASON, "checksum")
                 if source.stat().st_size != file.size:
                     log.warning("Не совпал размер файла модели: %s", source)
-                    raise _InstallError(_CHECKSUM_REASON)
+                    raise _InstallError(_CHECKSUM_REASON, "checksum")
 
             # О2.2: остатки докачки разрешены, но в установленный набор не попадают.
             for part in _check_contents(staging, entry, allow_parts=True):
@@ -183,7 +208,7 @@ class Installer:
                     if isinstance(exc, ModelMissingError)
                     else "Файлы в папке не подходят для выбранной модели."
                 )
-                raise _InstallError(reason) from exc
+                raise _InstallError(reason, "layout") from exc
 
             # Служебные метаданные добавляем сами и только после проверки состава.
             metadata = _file_path(staging, "state.json")
@@ -220,7 +245,10 @@ class Installer:
                 reason = smoke.reason or _SMOKE_REASON
                 self._store.mark_broken(entry.id, entry.revision, reason)  # О2.5
                 return InstallResult(
-                    "broken", reason, replace(record, state="broken", reason=reason)
+                    "broken",
+                    reason,
+                    replace(record, state="broken", reason=reason),
+                    reason_code="selfcheck",
                 )
             self._store.set_current(entry.id, entry.revision)  # О2.6
             return InstallResult("ok", "", record)
@@ -235,19 +263,26 @@ class Installer:
             )
         staging: Path | None = None
         try:
+            self._check_revoked(entry)
             if not src.exists():
-                return InstallResult("error", "Выбранная папка не найдена. Выберите её заново.")
+                return InstallResult(
+                    "error",
+                    "Выбранная папка не найдена. Выберите её заново.",
+                    reason_code="layout",
+                )
             if not src.is_dir():
                 # Установка из архивов появится в следующей вехе.
-                return InstallResult("error", "Выберите папку с файлами модели.")
+                return InstallResult(
+                    "error", "Выберите папку с файлами модели.", reason_code="layout"
+                )
             _check_contents(src, entry, allow_parts=False)
             if not self._store.disk_ok(entry.size_bytes):
-                return InstallResult("error", _DISK_REASON)
+                return InstallResult("error", _DISK_REASON, reason_code="disk")
             destination = self._staging_path(entry)
             if src.resolve().is_relative_to(
                 destination.resolve()
             ) or destination.resolve().is_relative_to(src.resolve()):
-                raise _InstallError("Выберите другую папку с файлами модели.")
+                raise _InstallError("Выберите другую папку с файлами модели.", "layout")
             for file in entry.files:
                 _file_path(destination, file.path)
             if destination.exists():

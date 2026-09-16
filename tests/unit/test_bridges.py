@@ -7,6 +7,7 @@ import logging
 import re
 import stat
 import threading
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from functools import partial
@@ -15,7 +16,7 @@ from typing import Literal, Protocol, cast
 from unittest.mock import Mock, call
 
 import pytest
-from PyQt5.QtCore import QCoreApplication, QEvent
+from PyQt5.QtCore import QCoreApplication, QEvent, QThread
 from PyQt5.QtTest import QSignalSpy
 
 from astra_voice.core import paths
@@ -25,7 +26,7 @@ from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
 from astra_voice.models.catalog import CatalogEntry
 from astra_voice.models.downloader import DownloadError, Progress
-from astra_voice.models.installer import InstallResult
+from astra_voice.models.installer import InstallResult, ReasonCode
 from astra_voice.models.store import StoreError
 from astra_voice.net.http import NetworkError
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
@@ -102,7 +103,10 @@ def test_each_property_saves_and_notifies_once(name: str, with_mirror: bool) -> 
     def saving(current: Settings) -> None:
         assert current is settings
         assert stored_value(current, name) == value
-        assert apply.mock_calls == []
+        if name in ("hotkey", "hotkeyMode"):
+            assert apply.mock_calls == [call.hotkey(current.hotkey, current.hotkey_mode)]
+        else:
+            assert apply.mock_calls == []
 
     save.side_effect = saving
     assert bridge.setProperty(name, value)
@@ -112,6 +116,8 @@ def test_each_property_saves_and_notifies_once(name: str, with_mirror: bool) -> 
         assert stored_value(mirror, name) == value
     save.assert_called_once_with(settings)
     assert len(spy) == 1
+    if name in ("hotkey", "hotkeyMode"):
+        apply.hotkey.assert_called_once_with(settings.hotkey, settings.hotkey_mode)
 
     if name in ("language", "autostart", "checkAppUpdates", "checkModelUpdates"):
         assert apply.mock_calls == []
@@ -265,7 +271,7 @@ def test_s19_a5_all_writable_properties_reach_file(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("name", writable_properties())
 @pytest.mark.parametrize("with_mirror", [False, True])
-def test_save_error_rolls_back_without_apply(
+def test_save_error_rolls_back_value_and_runtime(
     name: str, with_mirror: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
     settings = Settings()
@@ -273,6 +279,7 @@ def test_save_error_rolls_back_without_apply(
     mirror = policy_mod.effective(settings, policy_mod.Policy()) if with_mirror else None
     save = Mock(side_effect=OSError("PRIVATE FILE CONTENT"))
     apply = Mock(spec=SettingsApply)
+    apply.hotkey.return_value = "ok"
     bridge = SettingsBridge(settings, mirror=mirror, save=save, apply=apply)
     old = getattr(bridge, name)
     value = changed_value(bridge, name)
@@ -290,7 +297,16 @@ def test_save_error_rolls_back_without_apply(
     assert bridge.saveError == "Не удалось сохранить настройки"
     assert len(spy) == len(error_spy) == 1
     assert seen == [old]
-    assert apply.mock_calls == []
+    if name in ("hotkey", "hotkeyMode"):
+        assert apply.mock_calls == [
+            call.hotkey(
+                value if name == "hotkey" else settings.hotkey,
+                value if name == "hotkeyMode" else settings.hotkey_mode,
+            ),
+            call.hotkey(settings.hotkey, settings.hotkey_mode),
+        ]
+    else:
+        assert apply.mock_calls == []
     assert "PRIVATE FILE CONTENT" not in caplog.text
     assert any(record.levelno == logging.WARNING for record in caplog.records)
 
@@ -359,7 +375,7 @@ def test_pill_and_device_apply_after_save() -> None:
     assert save.call_count == 3
 
 
-@pytest.mark.parametrize("code", ["ok", "busy", "bad-combo", "duplicate", "not-grabbed"])
+@pytest.mark.parametrize("code", ["", "ok", "busy", "bad-combo", "duplicate", "not-grabbed"])
 @pytest.mark.parametrize("name", ["hotkey", "hotkeyMode"])
 def test_hotkey_apply_updates_status(name: str, code: str) -> None:
     apply = Mock(spec=SettingsApply)
@@ -367,10 +383,131 @@ def test_hotkey_apply_updates_status(name: str, code: str) -> None:
     settings = Settings()
     bridge = SettingsBridge(settings, apply=apply, save=Mock())
     spy = QSignalSpy(bridge.hotkeyStatusChanged)
-    bridge.setProperty(name, changed_value(bridge, name))
-    apply.hotkey.assert_called_once_with(settings.hotkey, settings.hotkey_mode)
-    assert bridge.hotkeyStatus == code
-    assert len(spy) == (0 if code == "ok" else 1)
+    value = changed_value(bridge, name)
+    proposed = (
+        value if name == "hotkey" else settings.hotkey,
+        value if name == "hotkeyMode" else settings.hotkey_mode,
+    )
+    original = (settings.hotkey, settings.hotkey_mode)
+    bridge.setProperty(name, value)
+    expected_calls = [call.hotkey(*proposed)]
+    if code not in ("", "ok"):
+        expected_calls.append(call.hotkey(*original))
+    assert apply.mock_calls == expected_calls
+    assert bridge.hotkeyStatus == (code or "ok")
+    assert len(spy) == (0 if code in ("", "ok") else 1)
+
+
+@pytest.mark.parametrize("name", ["hotkey", "hotkeyMode"])
+@pytest.mark.parametrize("with_mirror", [False, True])
+@pytest.mark.parametrize("existing_file", [False, True])
+@pytest.mark.parametrize("failure", ["busy", "bad-combo", "duplicate", "not-grabbed", "OSError"])
+def test_hotkey_failure_preserves_disk_value_and_previous_grab(
+    tmp_path: Path, name: str, with_mirror: bool, existing_file: bool, failure: str
+) -> None:
+    path = tmp_path / "settings.json"
+    settings = Settings()
+    mirror = Settings(hotkey="Alt+Space", hotkey_mode="toggle") if with_mirror else None
+    runtime_settings = mirror if mirror is not None else settings
+    original = settings.to_dict()
+    effective = runtime_settings.to_dict()
+    old_grab = (runtime_settings.hotkey, runtime_settings.hotkey_mode)
+    if existing_file:
+        settings_mod.save(settings, path)
+    saved = path.read_bytes() if existing_file else None
+    save = Mock(wraps=partial(settings_mod.save, path=path))
+    if failure == "OSError":
+        save.side_effect = OSError("Запись запрещена")
+    apply = Mock(spec=SettingsApply)
+    calls = Mock()
+    calls.attach_mock(apply, "apply")
+    calls.attach_mock(save, "save")
+
+    def grab(combo: str, mode: str) -> str:
+        # DictationRuntime.apply_hotkey меняет Settings даже при отказе захвата.
+        runtime_settings.hotkey, runtime_settings.hotkey_mode = combo, mode
+        assert (path.read_bytes() if path.exists() else None) == saved
+        return "ok" if (combo, mode) == old_grab or failure == "OSError" else failure
+
+    apply.hotkey.side_effect = grab
+    bridge = SettingsBridge(settings, mirror=mirror, apply=apply, save=save)
+    old = getattr(bridge, name)
+    value = "Ctrl+Shift+Space" if name == "hotkey" else ("ptt" if old == "toggle" else "toggle")
+    spy = QSignalSpy(getattr(bridge, name + "Changed"))
+    seen: list[str] = []
+    getattr(bridge, name + "Changed").connect(lambda: seen.append(getattr(bridge, name)))
+    proposed = (
+        value if name == "hotkey" else old_grab[0],
+        value if name == "hotkeyMode" else old_grab[1],
+    )
+
+    assert bridge.setProperty(name, value)
+
+    assert getattr(bridge, name) == old
+    assert settings.to_dict() == original
+    assert runtime_settings.to_dict() == effective
+    assert len(spy) == 1 and seen == [old]
+    assert (path.read_bytes() if path.exists() else None) == saved
+    assert list(tmp_path.iterdir()) == ([path] if existing_file else [])
+    assert apply.hotkey.call_args_list == [call(*proposed), call(*old_grab)]
+    if failure == "OSError":
+        save.assert_called_once_with(settings)
+        assert [c[0] for c in calls.mock_calls] == ["apply.hotkey", "save", "apply.hotkey"]
+        assert bridge.saveError == "Не удалось сохранить настройки"
+        assert bridge.hotkeyStatus == "ok"
+    else:
+        save.assert_not_called()
+        assert [c[0] for c in calls.mock_calls] == ["apply.hotkey", "apply.hotkey"]
+        assert bridge.saveError == ""
+        assert bridge.hotkeyStatus == failure
+
+
+@pytest.mark.parametrize("name", ["hotkey", "hotkeyMode"])
+@pytest.mark.parametrize("code", ["", "ok"])
+@pytest.mark.parametrize("with_mirror", [False, True])
+def test_hotkey_success_grabs_before_saving_exactly_once(
+    tmp_path: Path, name: str, code: str, with_mirror: bool
+) -> None:
+    path = tmp_path / "settings.json"
+    settings = Settings()
+    mirror = Settings(hotkey="Alt+Space", hotkey_mode="toggle") if with_mirror else None
+    runtime_settings = mirror if mirror is not None else settings
+    settings_mod.save(settings, path)
+    saved = path.read_bytes()
+    save = Mock(wraps=partial(settings_mod.save, path=path))
+    apply = Mock(spec=SettingsApply)
+    calls = Mock()
+    calls.attach_mock(apply, "apply")
+    calls.attach_mock(save, "save")
+
+    def grab(combo: str, mode: str) -> str:
+        assert path.read_bytes() == saved
+        runtime_settings.hotkey, runtime_settings.hotkey_mode = combo, mode
+        return code
+
+    apply.hotkey.side_effect = grab
+    bridge = SettingsBridge(settings, mirror=mirror, apply=apply, save=save)
+    bridge.set_hotkey_status("busy")
+    value = (
+        "Ctrl+Shift+Space"
+        if name == "hotkey"
+        else ("ptt" if bridge.hotkeyMode == "toggle" else "toggle")
+    )
+    combo = value if name == "hotkey" else bridge.hotkey
+    mode = value if name == "hotkeyMode" else bridge.hotkeyMode
+    spy = QSignalSpy(getattr(bridge, name + "Changed"))
+
+    assert bridge.setProperty(name, value)
+
+    assert [c[0] for c in calls.mock_calls] == ["apply.hotkey", "save"]
+    apply.hotkey.assert_called_once_with(combo, mode)
+    save.assert_called_once_with(settings)
+    assert getattr(bridge, name) == stored_value(settings, name) == value
+    assert stored_value(runtime_settings, name) == value
+    assert settings_mod.load(path) == settings
+    assert list(tmp_path.iterdir()) == [path]
+    assert len(spy) == 1
+    assert bridge.hotkeyStatus == "ok" and bridge.saveError == ""
 
 
 def test_hotkey_apply_keeps_policy_mode_when_combo_changes() -> None:
@@ -498,7 +635,11 @@ def test_runtime_adapter_routes_bridge_changes() -> None:
     set_qt_property(bridge, "pillEnabled", False)
     runtime.apply_pill_enabled.assert_called_once_with(False)
     set_qt_property(bridge, "hotkey", "Alt+Space")
-    runtime.apply_hotkey.assert_called_once_with("Alt+Space", "ptt")
+    assert runtime.apply_hotkey.call_args_list == [
+        call("Alt+Space", "ptt"),
+        call("Ctrl+Space", "ptt"),
+    ]
+    assert bridge.hotkey == "Ctrl+Space"
     assert bridge.hotkeyStatus == "busy"
     set_qt_property(bridge, "device", "mic")
     runtime.apply_device.assert_called_once_with("mic")
@@ -1094,6 +1235,58 @@ def test_model_absent_and_settings_fallback(model_rig: ModelRig) -> None:
     assert not create(port, onboarding_model_ready=True).canFinish
 
 
+@pytest.mark.parametrize(
+    "resource, state", [("network", "no-network"), ("space", "no-space"), ("ram", "no-ram")]
+)
+def test_model_download_rechecks_recovered_resource(
+    model_rig: ModelRig, resource: str, state: str
+) -> None:
+    port, create = model_rig
+    setattr(port, resource, False)
+    controller = create()
+    assert controller.modelState == state
+    setattr(port, resource, True)
+    done = QSignalSpy(controller.canFinishChanged)
+    controller.download()
+    assert done.wait(1000)
+    assert controller.modelState == "installed"
+    assert port.download_calls == 1
+
+
+@pytest.mark.parametrize("resource, state", [("network", "no-network"), ("space", "no-space")])
+def test_model_download_refreshes_persistent_block_message(
+    model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch, resource: str, state: str
+) -> None:
+    port, create = model_rig
+    setattr(port, resource, False)
+    controller = create()
+    before = controller.modelMessage
+    if resource == "network":
+        monkeypatch.setattr(port, "allowed", lambda: (False, "Нет доступа к models.example"))
+    else:
+        monkeypatch.setattr(port, "disk_missing_bytes", lambda size: 1_000_000)
+    changed = QSignalSpy(controller.modelMessageChanged)
+    controller.download()
+    assert controller.modelState == state
+    assert controller.modelMessage != before
+    assert len(changed) == 1
+    assert controller._model_thread is None
+    assert port.download_calls == 0
+
+
+@pytest.mark.parametrize("initial", ["no-network", "no-space", "no-ram"])
+def test_model_download_rechecks_other_resource_blocks(model_rig: ModelRig, initial: str) -> None:
+    port, create = model_rig
+    controller = create()
+    controller._set_model_state(initial)
+    port.network = False
+    controller.download()
+    assert controller.modelState == "no-network"
+    assert controller.modelMessage == port.allowed()[1]
+    assert controller._model_thread is None
+    assert port.download_calls == 0
+
+
 def test_model_properties_use_entry_and_have_notify(model_rig: ModelRig) -> None:
     port, create = model_rig
     port.entry = replace(port.entry, size_bytes=123_400_000, host="other.example")
@@ -1179,6 +1372,7 @@ def test_model_cancel_stops_thread_and_allows_retry(model_rig: ModelRig) -> None
         (NetworkError("host-unreachable", "SECRET /path/service"), "no-network"),
         (DownloadError("no-network"), "no-network"),
         (DownloadError("bad-checksum"), "broken"),
+        (DownloadError("bad-path"), "broken"),
         (RuntimeError("SECRET /path/service"), "broken"),
     ],
 )
@@ -1195,6 +1389,21 @@ def test_model_download_errors_are_readable(
     assert controller.modelMessage
     assert "SECRET" not in controller.modelMessage
     assert "/path" not in controller.modelMessage
+    assert controller._model_thread is None
+
+
+def test_model_bad_download_path_shows_install_failure(model_rig: ModelRig) -> None:
+    port, create = model_rig
+    port.error = DownloadError("bad-path")
+    controller = create()
+    done = QSignalSpy(controller.canFinishChanged)
+    controller.download()
+    assert done.wait(1000)
+    assert controller.modelState == "broken"
+    assert controller.modelMessage == (
+        "Модель не прошла проверку. Попробуйте скачать или установить её заново."
+    )
+    assert not controller.canFinish
     assert controller._model_thread is None
 
 
@@ -1215,6 +1424,79 @@ def test_model_failed_install_is_broken_and_retryable(
     controller.download()
     assert done.wait(1000)
     assert controller.modelState == "installed"
+
+
+@pytest.mark.parametrize("reason_code", ["selfcheck", "checksum", "layout"])
+@pytest.mark.parametrize("local", [False, True])
+def test_model_install_failure_message_uses_reason_code(
+    model_rig: ModelRig, reason_code: ReasonCode, local: bool
+) -> None:
+    port, create = model_rig
+    port.result = InstallResult("broken", "SECRET /path/service", reason_code=reason_code)
+    controller = create()
+    done = QSignalSpy(controller.canFinishChanged)
+    if local:
+        controller.installFromPath("/fake/model")
+    else:
+        controller.download()
+    assert done.wait(1000)
+    assert controller.modelState == "broken"
+    assert controller.modelMessage == (
+        "Распознавание на этом компьютере не работает. Обратитесь к администратору"
+        if reason_code == "selfcheck"
+        else "Модель не прошла проверку. Попробуйте скачать или установить её заново."
+    )
+
+
+@pytest.mark.parametrize(
+    "reason_code, expected_state, expected_message",
+    [
+        (
+            "revoked",
+            "broken",
+            "Издатель больше не рекомендует эту версию модели. "
+            "Не устанавливайте её — скачайте свежую версию.",
+        ),
+        ("cancelled", "cancelled", "Загрузка отменена. Можно продолжить скачивание."),
+    ],
+)
+@pytest.mark.parametrize("state", ["broken", "error"])
+@pytest.mark.parametrize("local", [False, True])
+def test_model_install_revoked_or_cancelled(
+    model_rig: ModelRig,
+    reason_code: ReasonCode,
+    expected_state: str,
+    expected_message: str,
+    state: Literal["broken", "error"],
+    local: bool,
+) -> None:
+    port, create = model_rig
+    port.result = InstallResult(state, "SECRET /path/service", reason_code=reason_code)
+    controller = create()
+    done = QSignalSpy(controller.canFinishChanged)
+    if local:
+        controller.installFromPath("/fake/model")
+    else:
+        controller.download()
+    assert done.wait(1000)
+    assert controller.modelState == expected_state
+    assert controller.modelMessage == expected_message
+    assert not controller.canFinish
+    assert not controller._model_cancel.is_set()
+    assert controller._model_thread is None
+
+
+def test_model_job_unexpected_exception_logs_traceback(caplog: pytest.LogCaptureFixture) -> None:
+    port = FakeModelPort()
+    port.error = RuntimeError("Installation failed")
+    job = _ModelJob(port, port.entry, threading.Event())
+    finished = QSignalSpy(job.finished)
+    with caplog.at_level(logging.WARNING):
+        job.run()
+    assert finished[0][0] == "error"
+    assert len(caplog.records) == 1
+    assert caplog.records[0].exc_info is not None
+    assert caplog.records[0].exc_info[1] is port.error
 
 
 @pytest.mark.parametrize("source", ["/fake/model", "file:///fake/model"])
@@ -1250,6 +1532,39 @@ def test_model_shutdown_during_download_needs_no_gui_polling(model_rig: ModelRig
     controller.shutdown()
     controller.download()
     assert port.download_calls == 1
+
+
+def test_model_shutdown_times_out_and_logs_warning(
+    model_rig: ModelRig, caplog: pytest.LogCaptureFixture
+) -> None:
+    _, create = model_rig
+    controller = create()
+    release, started = threading.Event(), threading.Event()
+
+    class StuckThread(QThread):
+        def run(self) -> None:
+            started.set()
+            release.wait(10)
+
+    thread = StuckThread(controller)
+    controller._model_thread = thread
+    thread.start()
+    try:
+        assert started.wait(1)
+        before = time.monotonic()
+        with caplog.at_level(logging.WARNING):
+            controller.shutdown()
+        elapsed = time.monotonic() - before
+        assert 4.9 <= elapsed < 5.5
+        assert controller._model_cancel.is_set()
+        assert thread.isRunning()
+        assert thread.parent() is None
+        assert "не завершилась за 5 секунд" in caplog.text
+        assert "выход из приложения продолжается" in caplog.text
+    finally:
+        release.set()
+        assert thread.wait(1000)
+        controller._model_thread = None
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
@@ -1288,7 +1603,8 @@ def test_smoke_adapter_builds_model_load_without_leaking_text(ok: bool) -> None:
             "variant": entry.variant,
             "threads": 2,
             "min_ram_mb": entry.min_ram_mb,
-        }
+        },
+        cancel=None,
     )
     assert result.ok is ok
     assert result.reason == (
@@ -1406,12 +1722,82 @@ def test_model_job_unknown_progress_and_cancel_before_install(
     port.install_from_staging.assert_not_called()
 
 
-def test_smoke_adapter_exception_does_not_leak_details() -> None:
+def test_smoke_adapter_exception_does_not_leak_details(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     runner = Mock(side_effect=RuntimeError("PRIVATE SPEECH"))
     result = make_smoke_check(runner)(Path("/fake/revision"), FakeModelPort().entry)
     assert not result.ok
     assert result.reason == "Модель не прошла пробное распознавание на этом компьютере"
     assert result.text == ""
+    assert len(caplog.records) == 1
+    assert caplog.records[0].exc_info is not None
+
+
+@pytest.mark.parametrize("local", [False, True])
+def test_model_shutdown_cancels_active_smoke_check(
+    model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch, local: bool
+) -> None:
+    from astra_voice.ui import bridges
+
+    port, create = model_rig
+    started, stopped = threading.Event(), threading.Event()
+    store = Mock()
+    store.records.return_value = []
+    gate = Mock()
+    gate.allowed.return_value = (True, "")
+    catalog = Mock(entries=[port.entry])
+    catalog.is_revoked.return_value = False
+    monkeypatch.setattr(bridges, "load_builtin", Mock(return_value=catalog))
+    monkeypatch.setattr(bridges, "Verifier", Mock())
+    monkeypatch.setattr(bridges, "ModelStore", Mock(return_value=store))
+    monkeypatch.setattr(bridges, "NetworkGate", Mock(return_value=gate))
+    monkeypatch.setattr(bridges, "HttpClient", Mock())
+    monkeypatch.setattr(bridges, "Downloader", Mock())
+
+    def run_smoke(request: object, *, cancel: Callable[[], bool]) -> Mock:
+        assert not cancel(), "Отмена предыдущей попытки не должна попадать в новую"
+        started.set()
+        deadline = time.monotonic() + 2
+        while not cancel() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if cancel():
+            stopped.set()
+        return Mock(ok=False)
+
+    runner = Mock(side_effect=run_smoke)
+    monkeypatch.setattr(bridges, "SmokeRunner", Mock(return_value=runner))
+
+    def installer_factory(store: object, smoke: Callable[..., object]) -> Mock:
+        def install(*args: object) -> InstallResult:
+            smoke(Path("/fake/model"), port.entry)
+            return InstallResult("broken", reason_code="selfcheck")
+
+        return Mock(
+            install_from_path=Mock(side_effect=install),
+            install_from_staging=Mock(side_effect=install),
+        )
+
+    monkeypatch.setattr(bridges, "Installer", installer_factory)
+    service = ModelService(Settings(), policy_mod.Policy())
+    controller = create(service)
+    # Проверка создаётся до привязки Event; попытка должна видеть новый Event.
+    service.set_cancel(controller._model_cancel)
+    controller._model_cancel.set()
+    done = QSignalSpy(controller.canFinishChanged)
+    if local:
+        controller.installFromPath("/fake/model")
+    else:
+        controller.download()
+    assert started.wait(1)
+    controller.shutdown()
+    assert stopped.is_set()
+    assert controller._model_thread is not None
+    assert not controller._model_thread.isRunning()
+    if not done:
+        assert done.wait(1000)
+    assert controller.modelState == "cancelled"
+    runner.assert_called_once()
 
 
 @pytest.mark.parametrize("service_fails", [False, True])

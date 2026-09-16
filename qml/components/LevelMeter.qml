@@ -25,10 +25,9 @@ Item {
                 // §8.3: минимальная высота 3 px по заданию и плоскому состоянию макета.
                 if (root.silent || root.level <= 0)
                     return 3
-                // .lvl в макете: максимальная высота образца — 31 px.
+                // .lvl в макете (§8.3): образец задан прямо в пикселях макета.
                 return Math.min(Theme.micLevelMeterH, Math.max(3,
-                    Math.round(Theme.micLevelMeterSampleLive[index] / 31
-                               * root.level * Theme.micLevelMeterH)))
+                    Math.round(Theme.micLevelMeterSampleLive[index] * root.level)))
             }
             radius: Theme.micLevelMeterBarRadius
             color: root.silent ? Theme.micLevelMeterColorFlat : Theme.micLevelMeterColorLive

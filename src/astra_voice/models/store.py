@@ -287,7 +287,13 @@ class ModelStore:
                 continue
             self._checked(model)
             for directory in sorted(model.iterdir()):
-                if directory.is_symlink() or not directory.is_dir():
+                # Служебные суффиксы не входят в лимит длины самой ревизии.
+                revision = directory.name.removesuffix(".partial").split(".old-", 1)[0]
+                if (
+                    ID_RE.fullmatch(revision) is None
+                    or directory.is_symlink()
+                    or not directory.is_dir()
+                ):
                     continue
                 yield model.name, self._checked(directory)
 

@@ -68,6 +68,9 @@ FocusScope {
                     color: Theme.fg
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.sidebarLogoWordmarkSize
+                    lineHeight: Theme.sidebarLogoWordmarkSize * 1.5   // §1.3: базовый межстрочный макета
+                    lineHeightMode: Text.FixedHeight
+                    height: lineHeight
                     font.weight: Font.Medium
                     font.letterSpacing: 0.03 * Theme.sidebarLogoWordmarkSize  // §1.3: трекинг +0.03em
                     renderType: Text.NativeRendering

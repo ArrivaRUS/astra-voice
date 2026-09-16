@@ -1,6 +1,6 @@
 """Настройки пользователя: ``settings.json`` 0600 в каталоге конфигурации.
 
-Запись атомарна (временный файл + ``fsync`` + ``os.replace``), чтение — с
+Запись атомарна (временный файл + ``os.replace``, ``fsync`` файла и каталога), чтение — с
 миграциями вперёд по ``schema_version``. Испорченный файл не удаляется, а
 переименовывается в ``settings.json.bak-<метка времени>``.
 """
@@ -149,8 +149,12 @@ def save(settings: Settings, path: Path | None = None) -> None:
             handle.write(payload + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-    except BaseException:
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
         tmp.unlink(missing_ok=True)
-        raise
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)

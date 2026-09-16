@@ -11,13 +11,13 @@ import re
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from astra_voice.models.catalog import CatalogEntry, FileSpec
 from astra_voice.models.store import ModelStore, StoreError
-from astra_voice.net.http import HttpClient, NetworkError, StreamResponse
+from astra_voice.net.http import HttpClient, NetworkError
 
 log = logging.getLogger(__name__)
 _CHUNK_SIZE = 65536
@@ -56,7 +56,8 @@ class DownloadError(Exception):
             "disk-full": "На диске недостаточно места для загрузки модели.",
             "bad-status": "Сервер прислал неподходящий ответ. Попробуйте загрузить ещё раз.",
             "timeout": "Время ожидания загрузки истекло.",
-            "not-allowed": "Путь к файлу выходит за пределы каталога загрузки.",
+            "not-allowed": "Источник загрузки не разрешён.",
+            "bad-path": "Путь к файлу выходит за пределы каталога загрузки.",
         }.get(code, "Не удалось загрузить модель.")
         super().__init__(self.message)
 
@@ -71,9 +72,9 @@ def _checked_path(staging: Path, path: Path) -> Path:
     try:
         root, target = staging.resolve(), path.resolve()
         if target == root or not target.is_relative_to(root):
-            raise DownloadError("not-allowed")
+            raise DownloadError("bad-path")
     except (OSError, RuntimeError, ValueError) as exc:
-        raise DownloadError("not-allowed") from exc
+        raise DownloadError("bad-path") from exc
     return path
 
 
@@ -120,29 +121,6 @@ def _fsync_dir(directory: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-
-
-def _limited_chunks(response: StreamResponse, limit: int) -> Iterator[bytes]:
-    """Читает не больше size+1 байт, переходя на байты только в последнем блоке."""
-    chunks = response.iter_chunks(_CHUNK_SIZE)
-    try:
-        while limit >= _CHUNK_SIZE:
-            block = next(chunks, b"")
-            if not block:
-                return
-            limit -= len(block)
-            yield block
-        if limit:
-            # Размер iter_chunks фиксирован. Дочитываем тот же поток по одному байту;
-            # таких чтений не больше 65535 на файл. Старый итератор держим живым,
-            # иначе его finally закроет ответ до чтения хвоста.
-            for block in response.iter_chunks(1):
-                limit -= len(block)
-                yield block
-                if not limit:
-                    return
-    finally:
-        response.close()
 
 
 @dataclass
@@ -321,7 +299,7 @@ class Downloader:
                         digest = hashlib.sha256()
                     reporter.done += offset
                     written = offset
-                    for block in _limited_chunks(response, file.size - offset + 1):
+                    for block in response.iter_chunks(_CHUNK_SIZE, limit=file.size - offset + 1):
                         _check_cancel(cancel)
                         # Проверяем фактические байты до записи, независимо от Content-Length.
                         # Даже первый лишний байт не попадёт на диск; остаток ответа не читаем.

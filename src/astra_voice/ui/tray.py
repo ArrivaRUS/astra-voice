@@ -267,6 +267,7 @@ class Tray(QObject):
         self.on_settings: Callable[[], None] | None = None
         self.on_copy_last: Callable[[], None] | None = None
         self.on_check_updates: Callable[[], None] | None = None
+        self.on_model_recheck: Callable[[], None] | None = None
         self.on_about: Callable[[], None] | None = None
         self.on_quit: Callable[[], None] | None = None
         self.on_model_selected: Callable[[str], None] | None = None
@@ -295,6 +296,7 @@ class Tray(QObject):
         self._panel_warning_shown = False
         self._has_last_text = False
         self._updates_enabled = False
+        self._model_recheck_enabled = False
 
         self._done_timer = QTimer(self)
         self._done_timer.setSingleShot(True)
@@ -319,6 +321,9 @@ class Tray(QObject):
         self._model_menu = QMenu("Модель", self._menu)
         self._model_group = QActionGroup(self._model_menu)
         self._model_group.setExclusive(True)
+        self._model_recheck_action = self._add_action(
+            "Проверить модель ещё раз", lambda: self._invoke(self.on_model_recheck)
+        )
         self._copy_action = self._add_action(
             "Скопировать последний текст", lambda: self._invoke(self.on_copy_last)
         )
@@ -383,6 +388,8 @@ class Tray(QObject):
         self._cancel_action.setEnabled(self._state in (TrayState.LISTENING, TrayState.PROCESSING))
         self._copy_action.setEnabled(self._has_last_text)
         self._updates_action.setEnabled(self._updates_enabled)
+        self._model_recheck_action.setEnabled(self._model_recheck_enabled)
+        self._model_recheck_action.setVisible(self._model_recheck_enabled)
 
     def set_models(self, models: list[str], active: str | None) -> None:
         self._model_menu.clear()
@@ -414,6 +421,10 @@ class Tray(QObject):
 
     def set_updates_enabled(self, value: bool) -> None:
         self._updates_enabled = value
+        self._update_menu()
+
+    def set_model_recheck_enabled(self, value: bool) -> None:
+        self._model_recheck_enabled = value
         self._update_menu()
 
     def set_pill_enabled(self, value: bool) -> None:

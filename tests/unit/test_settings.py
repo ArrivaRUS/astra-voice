@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
 from typing import Any
+from unittest.mock import ANY, Mock, call
 
 import pytest
 
@@ -48,6 +50,66 @@ def test_save_creates_0600_and_roundtrips(path: Path) -> None:
 def test_save_leaves_no_temp_file(path: Path) -> None:
     st.save(st.Settings(), path)
     assert [p.name for p in path.parent.iterdir()] == ["settings.json"]
+
+
+def test_save_syncs_directory_after_replace(path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path.write_text("old settings", encoding="utf-8")
+    path.chmod(0o644)
+    operations = Mock()
+    for name in ("open", "fsync", "replace", "close"):
+        spy = Mock(wraps=getattr(os, name))
+        operations.attach_mock(spy, name)
+        monkeypatch.setattr(os, name, spy)
+    settings = st.Settings(hotkey="Ctrl+Alt+D", extra={"device": "Микрофон"})
+
+    st.save(settings, path)
+
+    directory_fd = operations.fsync.call_args.args[0]
+    assert operations.mock_calls == [
+        call.open(
+            path.with_name(".settings.json.tmp"),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            0o600,
+        ),
+        call.fsync(ANY),
+        call.replace(path.with_name(".settings.json.tmp"), path),
+        call.open(path.parent, os.O_RDONLY | os.O_DIRECTORY),
+        call.fsync(directory_fd),
+        call.close(directory_fd),
+    ]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert json.loads(path.read_text(encoding="utf-8")) == settings.to_dict()
+    assert list(path.parent.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("stage", ["chmod", "replace", "directory-open", "directory-fsync"])
+def test_save_failure_cleans_temp_file(
+    path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    st.save(st.Settings(hotkey="Ctrl+Q"), path)
+    error = OSError("save failed")
+    close = Mock(wraps=os.close)
+    monkeypatch.setattr(os, "close", close)
+    if stage == "directory-open":
+        temporary_fd = os.open(
+            path.with_name(".settings.json.tmp"), os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        monkeypatch.setattr(os, "open", Mock(side_effect=[temporary_fd, error]))
+    elif stage == "directory-fsync":
+        monkeypatch.setattr(os, "fsync", Mock(side_effect=[None, error]))
+    else:
+        monkeypatch.setattr(os, stage, Mock(side_effect=error))
+
+    with pytest.raises(OSError, match="save failed"):
+        st.save(st.Settings(hotkey="Ctrl+W"), path)
+
+    assert list(path.parent.iterdir()) == [path]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert st.load(path).hotkey == ("Ctrl+W" if stage.startswith("directory-") else "Ctrl+Q")
+    if stage == "directory-fsync":
+        close.assert_called_once()
+        with pytest.raises(OSError):
+            os.fstat(close.call_args.args[0])
 
 
 def test_broken_json_is_quarantined(path: Path) -> None:

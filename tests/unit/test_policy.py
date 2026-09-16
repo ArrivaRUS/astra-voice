@@ -63,6 +63,17 @@ def test_explicit_locked_list_adds_keys(tmp_path: Path) -> None:
     assert "locked" not in p.values
 
 
+def test_explicit_hotkey_lock_without_value_preserves_user_choice(tmp_path: Path) -> None:
+    policy = pol.load(_write(tmp_path, "[astra-voice]\nlocked = hotkey\n"))
+    settings = Settings(hotkey="Alt+Space")
+
+    assert policy.status is pol.PolicyStatus.OK
+    assert policy.values == {}
+    assert policy.locked_keys == frozenset({"hotkey"})
+    assert policy.is_locked("hotkey")
+    assert pol.effective(settings, policy).hotkey == settings.hotkey
+
+
 def test_effective_overrides_settings(tmp_path: Path) -> None:
     path = _write(tmp_path, "[astra-voice]\ncheck_model_updates = off\nlanguage = en\n")
     result = pol.effective(Settings(hotkey="Ctrl+Space"), pol.load(path))

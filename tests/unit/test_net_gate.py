@@ -7,18 +7,42 @@ from typing import cast
 
 import pytest
 
-from astra_voice.core.policy import Policy, PolicyStatus, load
+from astra_voice.core.policy import Policy, PolicyStatus, effective, load
 from astra_voice.core.settings import Settings
 from astra_voice.net.gate import NetworkGate, NetworkKind
 
 pytestmark = pytest.mark.unit
 
 KINDS: tuple[NetworkKind, ...] = ("download", "check_app", "check_models")
-BLOCKING_POLICIES = (
-    Policy(values={"offline": True}, status=PolicyStatus.OK),
-    Policy(values={"profile": "secure", "offline": False}, status=PolicyStatus.OK),
-    Policy(status=PolicyStatus.INVALID),
-)
+POLICY_FILES = {
+    "absent": (None, PolicyStatus.ABSENT),
+    "online": ("[astra-voice]\noffline = false\nprofile = personal\n", PolicyStatus.OK),
+    "offline": ("[astra-voice]\noffline = true\n", PolicyStatus.OK),
+    "secure": ("[astra-voice]\nprofile = secure\n", PolicyStatus.OK),
+    "secure-online": (
+        "[astra-voice]\nprofile = secure\noffline = false\n",
+        PolicyStatus.OK,
+    ),
+    "checks-disabled": (
+        "[astra-voice]\noffline = false\ncheck_app_updates = false\ncheck_model_updates = false\n",
+        PolicyStatus.OK,
+    ),
+    "app-check-disabled": ("[astra-voice]\ncheck_app_updates = false\n", PolicyStatus.OK),
+    "model-check-disabled": ("[astra-voice]\ncheck_model_updates = false\n", PolicyStatus.OK),
+    "invalid": ("[astra-voice\noffline = false\n", PolicyStatus.INVALID),
+}
+BLOCKING_POLICIES = ("offline", "secure", "secure-online", "invalid")
+
+
+@pytest.fixture
+def policy(request: pytest.FixtureRequest, tmp_path: Path) -> Policy:
+    contents, status = POLICY_FILES[getattr(request, "param", "absent")]
+    path = tmp_path / "policy.conf"
+    if contents is not None:
+        path.write_text(contents, encoding="utf-8")
+    result = load(path)
+    assert result.status is status
+    return result
 
 
 @pytest.fixture(autouse=True)
@@ -39,15 +63,34 @@ def assert_denied(result: tuple[bool, str]) -> None:
 @pytest.mark.parametrize("check_app", [False, True])
 @pytest.mark.parametrize("check_models", [False, True])
 @pytest.mark.parametrize(
-    "policy",
-    [Policy(), Policy(values={"offline": False, "profile": "personal"}, status=PolicyStatus.OK)],
+    ("policy", "permitted_kinds"),
+    [
+        ("absent", KINDS),
+        ("online", KINDS),
+        *((name, ()) for name in BLOCKING_POLICIES),
+        ("checks-disabled", ("download",)),
+        ("app-check-disabled", ("download", "check_models")),
+        ("model-check-disabled", ("download", "check_app")),
+    ],
+    indirect=["policy"],
 )
 def test_toggle_matrix(
-    kind: NetworkKind, check_app: bool, check_models: bool, policy: Policy
+    kind: NetworkKind,
+    check_app: bool,
+    check_models: bool,
+    policy: Policy,
+    permitted_kinds: tuple[NetworkKind, ...],
 ) -> None:
     settings = Settings(check_app_updates=check_app, check_model_updates=check_models)
-    expected = {"download": True, "check_app": check_app, "check_models": check_models}[kind]
-    result = NetworkGate(settings, policy).allowed(kind)
+    expected = (
+        kind in permitted_kinds
+        and {
+            "download": True,
+            "check_app": check_app,
+            "check_models": check_models,
+        }[kind]
+    )
+    result = NetworkGate(effective(settings, policy), policy).allowed(kind)
     if expected:
         assert result == (True, "")
     else:
@@ -55,7 +98,7 @@ def test_toggle_matrix(
 
 
 @pytest.mark.parametrize("kind", KINDS)
-@pytest.mark.parametrize("policy", BLOCKING_POLICIES)
+@pytest.mark.parametrize("policy", BLOCKING_POLICIES, indirect=True)
 @pytest.mark.parametrize("offline_env", [None, "0", "1"])
 def test_policy_blocks_all(
     kind: NetworkKind, policy: Policy, offline_env: str | None, monkeypatch: pytest.MonkeyPatch
@@ -65,38 +108,38 @@ def test_policy_blocks_all(
         check_model_updates=True,
         extra={"offline": False, "profile": "personal"},
     )
-    expected = NetworkGate(settings, policy).allowed(kind)
+    expected = NetworkGate(effective(settings, policy), policy).allowed(kind)
     assert_denied(expected)
     if offline_env is not None:
         monkeypatch.setenv("HF_HUB_OFFLINE", offline_env)
-    assert NetworkGate(settings, policy).allowed(kind) == expected
+    assert NetworkGate(effective(settings, policy), policy).allowed(kind) == expected
     settings.check_app_updates = False
     settings.check_model_updates = False
-    assert NetworkGate(settings, policy).allowed(kind) == expected
+    assert NetworkGate(effective(settings, policy), policy).allowed(kind) == expected
 
 
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE", "YeS", "On"])
 def test_environment_blocks_all(
-    kind: NetworkKind, value: str, monkeypatch: pytest.MonkeyPatch
+    kind: NetworkKind, value: str, monkeypatch: pytest.MonkeyPatch, policy: Policy
 ) -> None:
     monkeypatch.setenv("HF_HUB_OFFLINE", value)
     settings = Settings(check_app_updates=True, check_model_updates=True)
-    expected = NetworkGate(settings, Policy()).allowed(kind)
+    expected = NetworkGate(settings, policy).allowed(kind)
     assert_denied(expected)
-    assert NetworkGate(Settings(), Policy()).allowed(kind) == expected
+    assert NetworkGate(Settings(), policy).allowed(kind) == expected
 
 
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("value", [None, "0", "false", "no", "off", ""])
 def test_environment_does_not_grant_permission(
-    kind: NetworkKind, value: str | None, monkeypatch: pytest.MonkeyPatch
+    kind: NetworkKind, value: str | None, monkeypatch: pytest.MonkeyPatch, policy: Policy
 ) -> None:
     if value is not None:
         monkeypatch.setenv("HF_HUB_OFFLINE", value)
     settings = Settings(check_app_updates=True, check_model_updates=True)
-    assert NetworkGate(settings, Policy()).allowed(kind) == (True, "")
-    result = NetworkGate(Settings(), Policy()).allowed(kind)
+    assert NetworkGate(settings, policy).allowed(kind) == (True, "")
+    result = NetworkGate(Settings(), policy).allowed(kind)
     if kind == "download":
         assert result == (True, "")
     else:
@@ -104,29 +147,29 @@ def test_environment_does_not_grant_permission(
 
 
 @pytest.mark.parametrize("kind", KINDS)
-@pytest.mark.parametrize("policy", [Policy(), *BLOCKING_POLICIES])
+@pytest.mark.parametrize("policy", POLICY_FILES, indirect=True)
 @pytest.mark.parametrize("checks_enabled", [False, True])
 def test_endpoint_has_no_effect(
     kind: NetworkKind, policy: Policy, checks_enabled: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = Settings(check_app_updates=checks_enabled, check_model_updates=checks_enabled)
-    gate = NetworkGate(settings, policy)
+    gate = NetworkGate(effective(settings, policy), policy)
     expected = gate.allowed(kind)
     monkeypatch.setenv("HF_ENDPOINT", "https://evil.example")
     assert gate.allowed(kind) == expected
 
 
 @pytest.mark.parametrize("kind", KINDS)
-def test_user_extra_is_not_policy(kind: NetworkKind) -> None:
+def test_user_extra_is_not_policy(kind: NetworkKind, policy: Policy) -> None:
     settings = Settings(
         check_app_updates=True,
         check_model_updates=True,
         extra={"offline": True, "profile": "secure"},
     )
-    assert NetworkGate(settings, Policy()).allowed(kind) == (True, "")
+    assert NetworkGate(settings, policy).allowed(kind) == (True, "")
 
 
-@pytest.mark.parametrize("policy", [Policy(), *BLOCKING_POLICIES])
+@pytest.mark.parametrize("policy", POLICY_FILES, indirect=True)
 @pytest.mark.parametrize("offline_env", ["0", "1"])
 def test_unknown_kind_raises(
     policy: Policy, offline_env: str, monkeypatch: pytest.MonkeyPatch
@@ -141,7 +184,9 @@ def test_unknown_kind_raises(
     [
         ("[astra-voice]\noffline = true\n", False),
         ("[astra-voice]\nprofile = secure\n", False),
+        ("[astra-voice]\nprofile = secure\noffline = false\n", False),
         ("[astra-voice]\noffline = false\nprofile = personal\n", True),
+        ("[astra-voice]\ncheck_app_updates = false\ncheck_model_updates = false\n", True),
     ],
 )
 def test_loaded_policy_controls_download(

@@ -113,6 +113,8 @@ class FakeOnboarding(QObject):
         self._devices: list[str] = ["Системный по умолчанию"]
         self._device: str = "Системный по умолчанию"
         self._level: float = 0.6
+        self._peak: str = "−18 дБ"
+        self._testDuration: str = "0,31 с"
         self._testText: str = "Проверка связи, раз, два, три."
         self._testState: str = "done"
         self._canFinish: bool = True
@@ -254,6 +256,24 @@ class FakeOnboarding(QObject):
         self.changed.emit()
 
     level = pyqtProperty(float, _get_level, _set_level, notify=changed)
+
+    def _get_peak(self) -> str:
+        return self._peak
+
+    def _set_peak(self, value: str) -> None:
+        self._peak = value
+        self.changed.emit()
+
+    peak = pyqtProperty(str, _get_peak, _set_peak, notify=changed)
+
+    def _get_testDuration(self) -> str:
+        return self._testDuration
+
+    def _set_testDuration(self, value: str) -> None:
+        self._testDuration = value
+        self.changed.emit()
+
+    testDuration = pyqtProperty(str, _get_testDuration, _set_testDuration, notify=changed)
 
     def _get_testText(self) -> str:
         return self._testText

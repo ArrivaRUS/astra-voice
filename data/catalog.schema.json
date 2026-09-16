@@ -5,6 +5,7 @@
   "additionalProperties": false,
   "required": [
     "manifest_version",
+    "schema_sha256",
     "serial",
     "trust_epoch",
     "generated_at",
@@ -16,6 +17,10 @@
     "manifest_version": {
       "type": "integer",
       "enum": [1]
+    },
+    "schema_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "serial": {
       "type": "integer",

@@ -705,9 +705,11 @@ def downloads(args: argparse.Namespace) -> int:
             raise NetworkError("transport-intercepted", "Перехвачена попытка выхода наружу.")
         return original_send(self, request, **kwargs)
 
-    def counted_chunks(self: StreamResponse, chunk_size: int = 65536) -> Iterator[bytes]:
+    def counted_chunks(
+        self: StreamResponse, chunk_size: int = 65536, *, limit: int | None = None
+    ) -> Iterator[bytes]:
         nonlocal bytes_read
-        for block in original_chunks(self, chunk_size):
+        for block in original_chunks(self, chunk_size, limit=limit):
             bytes_read += len(block)
             yield block
 
@@ -897,27 +899,69 @@ def privacy(args: argparse.Namespace) -> int:
         attempts += 1
         raise TransportIntercepted
 
-    offline = policy.Policy(values={"offline": True}, status=policy.PolicyStatus.OK)
-    online = policy.Policy(values={"offline": False}, status=policy.PolicyStatus.OK)
+    offline = "[astra-voice]\noffline = true\n"
+    online = "[astra-voice]\noffline = false\n"
     scenarios = (
-        ("по умолчанию, политика offline", settings.Settings(), offline, False),
+        (
+            "по умолчанию, политика offline",
+            settings.Settings(),
+            offline,
+            policy.PolicyStatus.OK,
+            False,
+        ),
         (
             "тумблеры включены, политика offline",
             settings.Settings(check_app_updates=True, check_model_updates=True),
             offline,
+            policy.PolicyStatus.OK,
             False,
         ),
-        ("тумблеры выключены, политика разрешает", settings.Settings(), online, True),
+        (
+            "тумблеры выключены, политика разрешает",
+            settings.Settings(),
+            online,
+            policy.PolicyStatus.OK,
+            True,
+        ),
+        (
+            "тумблеры включены, профиль secure при offline=false",
+            settings.Settings(check_app_updates=True, check_model_updates=True),
+            online + "profile = secure\n",
+            policy.PolicyStatus.OK,
+            False,
+        ),
+        (
+            "тумблеры включены, политика выключает проверки обновлений",
+            settings.Settings(check_app_updates=True, check_model_updates=True),
+            online + "check_app_updates = false\ncheck_model_updates = false\n",
+            policy.PolicyStatus.OK,
+            True,
+        ),
+        (
+            "тумблеры включены, битый файл политики",
+            settings.Settings(check_app_updates=True, check_model_updates=True),
+            "[astra-voice\noffline = false\n",
+            policy.PolicyStatus.INVALID,
+            False,
+        ),
     )
     kinds: tuple[NetworkKind, ...] = ("download", "check_app", "check_models")
     error = ""
     try:
         with (
+            tempfile.TemporaryDirectory(prefix="astra-voice-privacy-") as temporary,
             isolated_network_environment(),
             patch.object(requests.adapters.HTTPAdapter, "send", denied_send),
         ):
-            for name, config, rules, explicit_download in scenarios:
-                gate = NetworkGate(config, rules)
+            for index, (name, config, contents, status, explicit_download) in enumerate(scenarios):
+                path = Path(temporary) / f"policy-{index}.conf"
+                path.write_text(contents, encoding="utf-8")
+                rules = policy.load(path)
+                if rules.status is not status:
+                    raise ValueError(
+                        f"{name}: ожидался статус политики {status}, факт {rules.status}"
+                    )
+                gate = NetworkGate(policy.effective(config, rules), rules)
                 client = HttpClient(gate, user_agent="Astra-Voice/validate")
                 for kind in kinds:
                     attempts = 0

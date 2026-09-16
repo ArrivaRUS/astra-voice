@@ -13,6 +13,10 @@ Item {
 
     readonly property string device: bridge ? bridge.device : ""
     readonly property real level: bridge ? bridge.level : 0
+    // Макет design/mockups/final/08-onboarding-4-mic.html: значения при отсутствии данных моста.
+    readonly property string peak: bridge && bridge.peak ? bridge.peak : qsTr("−18 дБ")
+    readonly property string testDuration: bridge && bridge.testDuration ? bridge.testDuration : qsTr("0,31 с")
+    readonly property string testModel: bridge && bridge.modelName ? bridge.modelName : qsTr("GigaAM v3 RNN-T")
     readonly property string testText: bridge ? bridge.testText : ""
     readonly property string testState: bridge ? bridge.testState : ""
     readonly property bool silent: level <= 0.02 // Порог «тишина» по заданию шага 4.
@@ -59,8 +63,6 @@ Item {
         height: rows.height + Theme.cardBorder * 2
         color: Theme.bgSurface
         radius: Theme.cardRadius
-        border.width: Theme.cardBorder
-        border.color: Theme.border
         antialiasing: true
         clip: true
 
@@ -75,7 +77,8 @@ Item {
                 divider: false
                 showHint: false
                 label: qsTr("Микрофон")
-                sub: root.device
+                // design/spec.md §3.2: пояснение только при явном выборе устройства.
+                sub: (root.device !== "" && root.device !== qsTr("Системный по умолчанию")) ? root.device : ""
 
                 AvSelect {
                     id: deviceSelector
@@ -97,6 +100,17 @@ Item {
                     }
                 }
             }
+        }
+
+        // Обводка рисуется поверх заливки: в тёмной теме Theme.border — 10 % белого.
+        // Композит считаем от заливки, иначе фон окна делает рамку темнее макета.
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: "transparent"
+            border.width: Theme.cardBorder
+            border.color: Theme.border
+            antialiasing: true
         }
     }
 
@@ -141,7 +155,7 @@ Item {
 
                 Text {
                     width: parent.width
-                    text: root.silent ? qsTr("Звука с этого микрофона пока нет") : qsTr("Уровень в норме")
+                    text: root.silent ? qsTr("Звука с этого микрофона пока нет") : qsTr("Пик %1 · уровень в норме").arg(root.peak)
                     color: Theme.fgMuted
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontSettingSubSize
@@ -155,7 +169,7 @@ Item {
             AvButton {
                 Layout.alignment: Qt.AlignVCenter
                 iconName: "chip"
-                text: qsTr("Сказать тестовую фразу")
+                text: qsTr("Тестовая диктовка")
                 enabled: !root.testing
                 onClicked: {
                     if (root.bridge)
@@ -170,10 +184,9 @@ Item {
         visible: root.testText !== "" || root.testing
         y: levelBox.y + levelBox.height + (visible ? 10 : 0) // Макет: margin-top .field.
         width: root.width
-        height: visible ? resultText.height + Theme.fieldPaddingY * 2 : 0
+        // design/spec.md §4.5: текст, паддинги и обе границы дают 35,5 → 36 px для одной строки.
+        height: visible ? Math.ceil(resultText.height + Theme.fieldPaddingY * 2 + Theme.fieldBorder * 2) : 0
         radius: Theme.fieldRadius
-        border.width: Theme.fieldBorder
-        border.color: Theme.border
         color: Theme.bgSurface
         antialiasing: true
 
@@ -187,9 +200,23 @@ Item {
             color: root.testing ? Theme.fgMuted : Theme.fg
             font.family: Theme.fontUi
             font.pixelSize: Theme.fontFieldSize
+            // Макет 08-onboarding-4-mic.html (.field): базовый межстрочный интервал 1,5.
+            lineHeight: Theme.fontFieldSize * 1.5
+            lineHeightMode: Text.FixedHeight
             renderType: Text.NativeRendering
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
+        }
+
+        // Обводка рисуется поверх заливки: в тёмной теме Theme.border — 10 % белого.
+        // Композит считаем от заливки, иначе фон окна делает рамку темнее макета.
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: "transparent"
+            border.width: Theme.fieldBorder
+            border.color: Theme.border
+            antialiasing: true
         }
     }
 
@@ -212,7 +239,7 @@ Item {
             Layout.fillWidth: true
             Layout.alignment: Qt.AlignVCenter
             text: root.testState === "error" ? qsTr("Не удалось распознать — попробуйте ещё раз")
-                : qsTr("Распознано — текст никуда не вставлен")
+                : qsTr("Распознано за %1 · модель %2 · текст никуда не вставлен").arg(root.testDuration).arg(root.testModel)
             color: root.testState === "error" ? Theme.dangerInk : Theme.successInk
             font.family: Theme.fontUi
             font.pixelSize: Theme.fontCaptionSize

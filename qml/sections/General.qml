@@ -22,6 +22,8 @@ Column {
         width: root.width
         title: qsTr("Диктовка")
 
+        // Кнопки «Повторить» нет по решению заказчика от 15.09.2026 (PRD 0.8 F2.11):
+        // бэкенд выполняет автоповтор раз в 30 секунд.
         SettingRow {
             width: parent.width
             divider: false
@@ -42,18 +44,6 @@ Column {
                 wrapMode: Text.WordWrap
                 Layout.maximumWidth: root.width / 4
                 Layout.alignment: Qt.AlignVCenter
-            }
-
-            AvButton {
-                text: qsTr("Повторить")
-                small: true
-                visible: root.hotkeyStatus === "busy" || root.hotkeyStatus === "not-grabbed"
-                enabled: !root.isLocked("hotkey")
-                Layout.alignment: Qt.AlignVCenter
-                onClicked: {
-                    if (root.settings && root.settings.retryHotkey)
-                        root.settings.retryHotkey()
-                }
             }
 
             KeyChip {

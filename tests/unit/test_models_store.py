@@ -292,6 +292,26 @@ def test_empty_records_and_ignored_staging(store: ModelStore) -> None:
     assert store.records() == ()
 
 
+@pytest.mark.parametrize("name", ("bad revision", ".hidden", "ревизия", "r" * 65, "bad\n"))
+def test_records_ignore_invalid_revision_directory(store: ModelStore, name: str) -> None:
+    installed = install(store)
+    expected = store.records()
+    (installed.parent / name).mkdir()
+    assert store.records() == expected
+    assert len(expected) == 1
+
+
+def test_recover_accepts_service_suffixes_on_long_revision(store: ModelStore) -> None:
+    revision = "r" * 64
+    staging = store.staging_dir("model", revision)
+    old = staging.with_name(revision + ".old-123")
+    old.mkdir()
+    assert store.records() == ()
+    assert store.recover_incomplete() == (f"model/{revision}",)
+    assert not staging.exists()
+    assert not old.exists()
+
+
 @pytest.mark.parametrize(
     "contents",
     [

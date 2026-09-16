@@ -11,7 +11,8 @@ ComboBox {
     padding: 0
     leftPadding: Theme.selectPaddingX
     rightPadding: Theme.selectPaddingX
-    implicitHeight: Theme.selectHeight
+    // design/spec.md §4.4: округляем высоту макета 33,5 вверх до целых 34 px.
+    implicitHeight: Math.ceil(Theme.selectHeight)
     font.family: Theme.fontUi
     font.pixelSize: Theme.fontSelectSize
 

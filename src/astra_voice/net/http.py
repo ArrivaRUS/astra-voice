@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import threading
 import time
 import urllib.request
@@ -12,22 +13,22 @@ from types import TracebackType
 from urllib.parse import urljoin, urlsplit
 
 import requests
-from requests.packages.urllib3.exceptions import ReadTimeoutError
+from urllib3.exceptions import ReadTimeoutError
 
 from astra_voice.net.gate import NetworkGate, NetworkKind
+from astra_voice.net.hosts import ALLOWED_HOSTS, host_allowed
 
-ALLOWED_HOSTS = (
-    "github.com",
-    "api.github.com",
-    "objects.githubusercontent.com",
-    "huggingface.co",
-    "hf.co",
-)
 ALLOWED_SCHEMES = ("https",)
 ALLOWED_PORTS = (None, 443)
-_SUBDOMAIN_HOSTS = ("huggingface.co", "hf.co")
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 _SYSTEM_CA_BUNDLE = Path("/etc/ssl/certs/ca-certificates.crt")
+# 128 байт/с с запасом на 30 с чтения: даже медленные каналы имеют большой запас.
+# Время обработки блока потребителем не расходует этот запас; быстрый блок его
+# пополняет, но не позволяет накопить неограниченный кредит на последующий простой.
+_MIN_SPEED_BYTES_PER_SECOND = 128
+_MIN_SPEED_GRACE_S = 30.0
+_READ_CHUNK_SIZE = 1024
+_WATCHDOG_INTERVAL_S = 0.05
 
 
 class NetworkError(Exception):
@@ -40,27 +41,6 @@ class NetworkError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
-
-
-def _host_allowed(host: str) -> bool:
-    """Сравнивает метки домена; поддомены разрешены только для двух источников."""
-    labels = host.lower().split(".")
-    if any(
-        not label
-        or len(label) > 63
-        or label.startswith("-")
-        or label.endswith("-")
-        or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in label)
-        for label in labels
-    ):
-        return False
-    for allowed in ALLOWED_HOSTS:
-        allowed_labels = allowed.split(".")
-        if labels == allowed_labels:
-            return True
-        if allowed in _SUBDOMAIN_HOSTS and labels[-len(allowed_labels) :] == allowed_labels:
-            return True
-    return False
 
 
 def _check_url_text(url: str) -> None:
@@ -85,7 +65,8 @@ def _validate_url(url: str) -> str:
         raise NetworkError("not-allowed", "Источник не разрешён: требуется защищённое соединение.")
     if port not in ALLOWED_PORTS:
         raise NetworkError("not-allowed", "Источник не разрешён: недопустимый порт.")
-    if not _host_allowed(host):
+    # Передаём текущий список: подмена http.ALLOWED_HOSTS действует и на редиректы.
+    if not host_allowed(host, ALLOWED_HOSTS):
         raise NetworkError("not-allowed", "Источник не разрешён: сервер отсутствует в списке.")
     return host
 
@@ -164,36 +145,131 @@ class StreamResponse:
         self._deadline_at = deadline_at
         self._cancel = cancel
         self._closed = False
+        self._resources_closed = False
+        self._lock = threading.Lock()
+        self._read_lock = threading.Lock()
+        self._stop_watchdog = threading.Event()
+        self._error: NetworkError | None = None
+        self._speed_budget = _MIN_SPEED_GRACE_S
+        self._read_deadline_at: float | None = None
+        # При Connection: close urllib3.connection.sock уже может быть None.
+        # Сохраняем сокет из файлового объекта до первого чтения и его закрытия.
+        fp = getattr(response.raw, "_fp", None)
+        raw = getattr(getattr(fp, "fp", None), "raw", None)
+        sock = getattr(raw, "_sock", None)
+        self._socket = sock if isinstance(sock, socket.socket) else None
+        self._watchdog = threading.Thread(target=self._watch, name="http-stream-watchdog")
+        self._watchdog.start()
 
-    def iter_chunks(self, chunk_size: int = 65536) -> Iterator[bytes]:
-        """Читает блоки, проверяя отмену и дедлайн до и после каждого чтения."""
+    def _check_active(self) -> bool:
+        """Проверяет состояние под self._lock, в том числе после прерванного чтения."""
+        if self._error is not None:
+            raise self._error
+        if self._closed:
+            return False
+        _remaining(self._deadline_at, self._cancel)
+        if self._read_deadline_at is not None and time.monotonic() >= self._read_deadline_at:
+            raise NetworkError("timeout", "Слишком низкая скорость загрузки.")
+        return True
+
+    def _shutdown_socket(self) -> None:
+        """Прерывает recv под self._lock, не закрывая читаемый BufferedReader."""
+        if self._socket is not None:
+            try:
+                # Базовый метод не меняет _sslobj у SSLSocket во время TLS-чтения.
+                socket.socket.shutdown(self._socket, socket.SHUT_RDWR)
+            except OSError:
+                # Сокет мог уже закрыться при EOF или ошибке транспорта.
+                pass
+
+    def _watch(self) -> None:
+        """Следит за остановкой даже внутри requests/urllib3 read(amt)."""
+        while not self._stop_watchdog.wait(_WATCHDOG_INTERVAL_S):
+            with self._lock:
+                try:
+                    if not self._check_active():
+                        return
+                except NetworkError as error:
+                    self._error = error
+                    self._shutdown_socket()
+                    return
+
+    def iter_chunks(self, chunk_size: int = 65536, *, limit: int | None = None) -> Iterator[bytes]:
+        """Отдаёт блоки до chunk_size, ограничивая суммарное чтение до limit байт."""
         try:
             if chunk_size <= 0:
                 raise ValueError("Размер блока должен быть положительным.")
-            chunks = self._response.iter_content(chunk_size=chunk_size)
-            while not self._closed:
-                _remaining(self._deadline_at, self._cancel)
-                try:
-                    chunk: bytes = next(chunks)
-                except StopIteration:
+            if limit is not None and limit < 0:
+                raise ValueError("Лимит чтения должен быть неотрицательным.")
+            # Ограничиваем задержку учёта прогресса. Само read(amt) по-прежнему
+            # блокируется до заполнения; его прерывает сторож, а не размер блока.
+            read_size = min(chunk_size, _READ_CHUNK_SIZE)
+            chunks = self._response.iter_content(chunk_size=read_size)
+            # Закрытие старого генератора urllib3 прерывает chunked-ответ.
+            # Держим итераторы живыми до завершения чтения ограниченного хвоста.
+            iterators = [chunks]
+            while True:
+                if limit is not None:
+                    if limit == 0:
+                        return
+                    if limit < read_size:
+                        # Размер хвоста задаём до чтения, не обрезаем уже прочитанное.
+                        read_size = limit
+                        chunks = self._response.iter_content(chunk_size=read_size)
+                        iterators.append(chunks)
+                with self._read_lock:
+                    with self._lock:
+                        if not self._check_active():
+                            return
+                        read_deadline = time.monotonic() + self._speed_budget
+                        self._read_deadline_at = read_deadline
+                    try:
+                        chunk: bytes = next(chunks, b"")
+                    finally:
+                        with self._lock:
+                            try:
+                                active = self._check_active()
+                            finally:
+                                self._speed_budget = read_deadline - time.monotonic()
+                                self._read_deadline_at = None
+                    if not active:
+                        return
+                    with self._lock:
+                        self._speed_budget = min(
+                            _MIN_SPEED_GRACE_S,
+                            self._speed_budget + len(chunk) / _MIN_SPEED_BYTES_PER_SECOND,
+                        )
+                if not chunk:
                     return
-                _remaining(self._deadline_at, self._cancel)
-                if chunk:
-                    yield chunk
+                if limit is not None:
+                    limit -= len(chunk)
+                yield chunk
         except requests.exceptions.RequestException as error:
+            with self._lock:
+                if not self._check_active():
+                    return
             raise _request_error(error, self._host) from None
         finally:
             self.close()
 
     def close(self) -> None:
-        """Закрывает ответ и сессию; повторное закрытие безопасно."""
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self._response.close()
-        finally:
-            self._session.close()
+        """Прерывает чтение, дожидается сторожа и закрывает ресурсы ровно один раз."""
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._stop_watchdog.set()
+                self._shutdown_socket()
+        self._watchdog.join()
+        # response.close() ждёт блокировку BufferedReader. Вызываем его только
+        # после выхода из чтения, уже разбуженного через shutdown сокета.
+        with self._read_lock:
+            if self._resources_closed:
+                return
+            self._resources_closed = True
+            try:
+                self._response.close()
+            finally:
+                self._session.close()
 
     def __enter__(self) -> StreamResponse:
         return self
@@ -243,6 +319,9 @@ class HttpClient:
             while True:
                 host = _validate_url(url)
                 proxies = urllib.request.getproxies()
+                # trust_env отключён: учитываем исключения явно для каждого адреса.
+                if requests.utils.should_bypass_proxies(url, no_proxy=proxies.get("no")):
+                    proxies = {}
                 headers = {
                     "User-Agent": self._user_agent,
                     "Accept-Encoding": "identity",
@@ -267,6 +346,13 @@ class HttpClient:
                     raise _request_error(error, host) from None
                 try:
                     _remaining(deadline_at, cancel)
+                    # iter_content распаковывает до учёта бюджета. Отказываем по
+                    # заголовкам, включая редиректы, и закрываем без чтения тела.
+                    if response.headers.get("Content-Encoding", "").strip().lower() not in (
+                        "",
+                        "identity",
+                    ):
+                        raise NetworkError("not-allowed", "Сжатие ответа сервера не разрешено.")
                     if response.status_code in _REDIRECT_STATUSES:
                         if redirects >= 5:
                             raise NetworkError("not-allowed", "Слишком много перенаправлений.")

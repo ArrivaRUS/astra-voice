@@ -33,6 +33,13 @@ log = logging.getLogger(__name__)
 
 _SMOKE_FAILURE = "Модель не прошла пробное распознавание на этом компьютере"
 _BROKEN_MESSAGE = "Модель не прошла проверку. Попробуйте скачать или установить её заново."
+_SELFCHECK_MESSAGE = "Распознавание на этом компьютере не работает. Обратитесь к администратору"
+_REVOKED_MESSAGE = (
+    "Издатель больше не рекомендует эту версию модели. "
+    "Не устанавливайте её — скачайте свежую версию."
+)
+# После таймаута поток не должен уничтожаться вместе с контроллером до выхода run().
+_finishing_model_threads: set[QThread] = set()
 
 
 class ModelPort(Protocol):
@@ -59,7 +66,9 @@ class ModelPort(Protocol):
     def install_from_path(self, source: Path, entry: Any) -> Any: ...
 
 
-def make_smoke_check(runner: SmokeRunner | None = None) -> SmokeCheck:
+def make_smoke_check(
+    runner: SmokeRunner | None = None, *, cancel: Callable[[], bool] | None = None
+) -> SmokeCheck:
     """Адаптирует каталог к model.load; речь и внутренние причины не выходят наружу."""
     smoke = runner if runner is not None else SmokeRunner()
 
@@ -75,8 +84,9 @@ def make_smoke_check(runner: SmokeRunner | None = None) -> SmokeCheck:
             "min_ram_mb": entry.min_ram_mb,
         }
         try:
-            ok = smoke(request).ok
+            ok = smoke(request, cancel=cancel).ok
         except Exception:
+            log.warning("Не удалось выполнить пробное распознавание", exc_info=True)
             ok = False
         return SmokeResult(ok=ok, reason="" if ok else _SMOKE_FAILURE)
 
@@ -98,7 +108,14 @@ class ModelService:
             user_agent=f"astra-voice/{__version__} (+https://github.com/ArrivaRUS/astra-voice)",
         )
         self._downloader = Downloader(http, self._store)
-        self._installer = Installer(self._store, make_smoke_check())
+        self._cancel = threading.Event()
+        self._installer = Installer(
+            self._store, make_smoke_check(cancel=lambda: self._cancel.is_set())
+        )
+
+    def set_cancel(self, cancel: threading.Event) -> None:
+        """Связывает пробное распознавание с отменой текущей попытки установки."""
+        self._cancel = cancel
 
     def recommended(self) -> CatalogEntry | None:
         return next(
@@ -168,6 +185,8 @@ class _ModelJob(QObject):
         self._entry = entry
         self._cancel = cancel
         self._source = source
+        if isinstance(model, ModelService):
+            model.set_cancel(cancel)
 
     def _progress(self, value: Progress) -> None:
         fraction = value.bytes_done / value.bytes_total if value.bytes_total > 0 else 0.0
@@ -207,8 +226,13 @@ class _ModelJob(QObject):
         if result.state == "ok":
             return "installed", ""
         self._check_cancel()
-        # InstallResult не имеет кода ошибки. Installer возвращает фиксированное
-        # сообщение при ENOSPC/EDQUOT; свободное место к этому моменту могло измениться.
+        if result.reason_code == "selfcheck":
+            return "broken", _SELFCHECK_MESSAGE
+        if result.reason_code == "revoked":
+            return "broken", _REVOKED_MESSAGE
+        if result.reason_code == "cancelled":
+            return "cancelled", "Загрузка отменена. Можно продолжить скачивание."
+        # Сохраняем распознавание отказа по месту; оно могло измениться после установки.
         if result.state == "error" and (
             "недостаточно места" in result.reason.casefold()
             or not self._model.disk_ok(self._entry.size_bytes)
@@ -225,6 +249,8 @@ class _ModelJob(QObject):
             code = getattr(exc, "code", "")
             if self._cancel.is_set() or code == "cancelled":
                 state, reason = "cancelled", "Загрузка отменена. Можно продолжить скачивание."
+            elif code == "bad-path":
+                state, reason = "broken", _BROKEN_MESSAGE
             elif code == "disk-full" or (
                 isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT)
             ):
@@ -240,18 +266,18 @@ class _ModelJob(QObject):
             else:
                 state, reason = "broken", _BROKEN_MESSAGE
         except Exception:
-            log.warning("Не удалось выполнить установку модели")
+            log.warning("Не удалось выполнить установку модели", exc_info=True)
         finally:
             self.finished.emit(state, reason)
 
 
 class SettingsApply(Protocol):
-    """Действия рантайма после успешной записи настроек."""
+    """Живое применение настроек; захват клавиши проверяется до записи."""
 
     def pill_enabled(self, value: bool) -> None: ...
 
     def hotkey(self, combo: str, mode: str) -> str:
-        """Возвращает ok, busy, bad-combo, duplicate или not-grabbed."""
+        """Пустая строка или ok — успех; иначе код отказа захвата."""
         ...
 
     def device(self, value: str | None) -> None: ...
@@ -357,6 +383,18 @@ class SettingsBridge(QObject):
             if name == "device"
             else getattr(self._settings, field)
         )
+        hotkey_apply = self._apply if name in ("hotkey", "hotkeyMode") else None
+        if hotkey_apply is not None:
+            combo = cast(str, value) if name == "hotkey" else self.hotkey
+            mode = cast(str, value) if name == "hotkeyMode" else self.hotkeyMode
+            code = hotkey_apply.hotkey(combo, mode)
+            if code not in ("", "ok"):
+                hotkey_apply.hotkey(self.hotkey, self.hotkeyMode)
+                # apply_hotkey может менять тот же Settings, что сохраняет мост.
+                setattr(self._settings, field, old)
+                self.set_hotkey_status(code)
+                getattr(self, name + "Changed").emit()
+                return
         if name == "device":
             self._settings.extra["device"] = value or None
         else:
@@ -364,6 +402,8 @@ class SettingsBridge(QObject):
         try:
             self._save(self._settings)
         except OSError:
+            if hotkey_apply is not None:
+                self.set_hotkey_status(hotkey_apply.hotkey(self.hotkey, self.hotkeyMode) or "ok")
             if name == "device":
                 if device_present:
                     self._settings.extra["device"] = old
@@ -376,7 +416,7 @@ class SettingsBridge(QObject):
             getattr(self, name + "Changed").emit()
             self.saveErrorChanged.emit()
             return
-        # Рантайм получает значение только после записи: при отказе его откат не нужен.
+        # Остальные настройки применяются только после успешной записи.
         if self._mirror is not None:
             if name == "device":
                 self._mirror.extra["device"] = value or None
@@ -389,8 +429,8 @@ class SettingsBridge(QObject):
         if self._apply is not None:
             if name == "pillEnabled":
                 self._apply.pill_enabled(self.pillEnabled)
-            elif name in ("hotkey", "hotkeyMode"):
-                self.retryHotkey()
+            elif hotkey_apply is not None:
+                self.set_hotkey_status("ok")
             elif name == "device":
                 self._apply.device(self.device or None)
         getattr(self, name + "Changed").emit()
@@ -710,7 +750,7 @@ class OnboardingController(QObject):
                     size = _megabytes(count, round_up=True)
                     return f"На диске не хватает {size}. Освободите место."
             except (OSError, StoreError):
-                pass
+                log.warning("Не удалось определить, сколько места не хватает", exc_info=True)
         return f"Недостаточно места на диске для модели {self.modelSize}. Освободите место."
 
     def _set_model_state(self, state: str, reason: str = "") -> None:
@@ -807,6 +847,10 @@ class OnboardingController(QObject):
 
     @pyqtSlot()
     def download(self) -> None:
+        if self._shutting_down or self._model_thread is not None:
+            return
+        if self._model_state in {"no-network", "no-space", "no-ram"}:
+            self._initial_model_state()
         if self._model_state in {"downloadable", "no-ram", "cancelled", "broken"}:
             self._start_model_job()
 
@@ -824,12 +868,21 @@ class OnboardingController(QObject):
         self._start_model_job(Path(source).expanduser())
 
     def shutdown(self) -> None:
-        """Останавливает загрузку и ждёт завершения атомарной установки, если она началась."""
+        """Отменяет загрузку и пробное распознавание; ждёт поток не дольше пяти секунд."""
         self._shutting_down = True
         self._model_cancel.set()
         if self._model_thread is not None:
             self._model_thread.quit()
-            self._model_thread.wait()
+            if not self._model_thread.wait(5000):
+                log.warning(
+                    "Установка модели не завершилась за 5 секунд после отмены; "
+                    "выход из приложения продолжается"
+                )
+                thread = self._model_thread
+                thread.setParent(None)
+                if thread not in _finishing_model_threads:
+                    _finishing_model_threads.add(thread)
+                    thread.finished.connect(lambda: _finishing_model_threads.discard(thread))
 
     @pyqtProperty(str, notify=languageChanged)
     def language(self) -> str:
@@ -920,7 +973,7 @@ class OnboardingController(QObject):
             try:
                 self._host.end_capture()
             except Exception:
-                log.warning("Не удалось завершить захват клавиатуры")
+                log.warning("Не удалось завершить захват клавиатуры", exc_info=True)
 
     @pyqtSlot()
     def beginCapture(self) -> None:  # noqa: N802
@@ -928,6 +981,7 @@ class OnboardingController(QObject):
         try:
             available = self._host is not None and self._host.begin_capture()
         except Exception:
+            log.warning("Не удалось начать захват клавиатуры", exc_info=True)
             available = False
         if not available:
             self._end_capture()
@@ -945,6 +999,7 @@ class OnboardingController(QObject):
         try:
             code = self._host.probe(combo) if self._host is not None else "not-grabbed"
         except Exception:
+            log.warning("Не удалось проверить сочетание клавиш", exc_info=True)
             code = "not-grabbed"
         if code == "ok":
             self._save_combo()
@@ -970,6 +1025,7 @@ class OnboardingController(QObject):
         try:
             code = self._host.apply_hotkey(self.hotkey, self.hotkeyMode)
         except Exception:
+            log.warning("Не удалось применить сочетание клавиш", exc_info=True)
             code = "not-grabbed"
         # «Оставить» принимает занятость: рантайм продолжает автоматический перезахват.
         if code == "ok" or (keep and code == "busy"):
@@ -993,6 +1049,7 @@ class OnboardingController(QObject):
                 else []
             )
         except Exception:
+            log.warning("Не удалось найти свободные сочетания клавиш", exc_info=True)
             candidates = []
             self._set_capture_state("not-grabbed")
         if self._host is None:

@@ -58,8 +58,6 @@ Item {
         height: rows.height + Theme.cardBorder * 2
         color: Theme.bgSurface
         radius: Theme.cardRadius
-        border.width: Theme.cardBorder
-        border.color: Theme.border
         antialiasing: true
         clip: true
 
@@ -123,6 +121,17 @@ Item {
                     }
                 }
             }
+        }
+
+        // Обводка рисуется поверх заливки: в тёмной теме Theme.border — 10 % белого.
+        // Композит считаем от заливки, иначе фон окна делает рамку темнее макета.
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: "transparent"
+            border.width: Theme.cardBorder
+            border.color: Theme.border
+            antialiasing: true
         }
     }
 

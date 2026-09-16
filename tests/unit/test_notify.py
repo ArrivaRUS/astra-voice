@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from threading import Event
 from time import perf_counter
@@ -12,7 +12,7 @@ from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
-from PyQt5.QtCore import QMetaType, QVariant
+from PyQt5.QtCore import QMetaType, QObject, QVariant
 from PyQt5.QtDBus import QDBus, QDBusMessage
 
 from astra_voice.ui import notify as notifications
@@ -24,11 +24,12 @@ NOTIFY_PATH = ROOT / "src/astra_voice/ui/notify.py"
 
 
 @pytest.fixture(autouse=True)
-def transport(monkeypatch: pytest.MonkeyPatch) -> Mock:
+def transport(monkeypatch: pytest.MonkeyPatch) -> Iterator[Mock]:
     """Подменить шину до любого вызова, сохранив настоящие типы аргументов Qt."""
     notifications.reset_state()
     bus = Mock()
     bus.isConnected.return_value = True
+    bus.connect.return_value = True
     reply = Mock()
     reply.type.return_value = QDBusMessage.ReplyMessage
     reply.arguments.return_value = [41]
@@ -47,7 +48,8 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> Mock:
     monkeypatch.setattr(notifications, "QDBusConnection", connection)
     monkeypatch.setattr(notifications, "QDBusInterface", forbidden_interface)
     monkeypatch.setattr(QDBusMessage, "createMethodCall", create_message)
-    return Mock(bus=bus, reply=reply, factory=forbidden_interface)
+    yield Mock(bus=bus, reply=reply, factory=forbidden_interface)
+    notifications.reset_state()
 
 
 def _arguments(message: QDBusMessage) -> list[Any]:
@@ -87,6 +89,188 @@ def test_notify_defaults(transport: Mock) -> None:
     assert args[6]["urgency"].value() == b"\x01"
     assert notifications.last_delivery_ok() is True
     assert notifications.pending_count() == 0
+
+
+def _invoke_action(transport: Mock, notification_id: int, key: str) -> None:
+    transport.bus.connect.call_args.args[-1](notification_id, key)
+
+
+def test_notify_actions_and_single_uint_signal_subscription(transport: Mock) -> None:
+    actions = [("first", "Первое"), ("second", "Второе")]
+    for _ in range(3):
+        notifications.notify("Заголовок", actions=actions)
+        value = _arguments(transport.bus.call.call_args.args[0])[5]
+        assert value.type() == QVariant.StringList
+        assert value.value() == ["first", "Первое", "second", "Второе"]
+    transport.bus.connect.assert_called_once()
+    service, path, interface, signal, signature, slot = transport.bus.connect.call_args.args
+    assert service == interface == "org.freedesktop.Notifications"
+    assert path == "/org/freedesktop/Notifications"
+    assert signal == "ActionInvoked"
+    assert signature == "us"
+    assert isinstance(slot.__self__, QObject)
+    receiver = notifications._action_receiver
+    assert receiver is not None
+    assert slot.__self__ is receiver
+    assert receiver.metaObject().indexOfSlot(b"on_action_invoked(uint,QString)") >= 0
+
+
+@pytest.mark.parametrize("notification_id", [41, 0xF0000001])
+def test_action_invoked_once_and_redelivery_rearms(transport: Mock, notification_id: int) -> None:
+    handler = Mock()
+    notifications.set_action_handler("details", handler)
+    transport.reply.arguments.return_value = [notification_id]
+    notifications.notify("Заголовок", actions=[("details", "Подробности")])
+    _invoke_action(transport, notification_id, "details")
+    _invoke_action(transport, notification_id, "details")
+    handler.assert_called_once_with()
+    notifications.notify("Заголовок", actions=[("details", "Подробности")])
+    _invoke_action(transport, notification_id, "details")
+    assert handler.call_count == 2
+    transport.bus.connect.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("notification_id", "key"), [(0, "details"), (42, "details"), (41, "unknown"), (41, "other")]
+)
+def test_unknown_id_or_key_ignored(
+    transport: Mock, caplog: pytest.LogCaptureFixture, notification_id: int, key: str
+) -> None:
+    handler = Mock()
+    notifications.set_action_handler("details", handler)
+    notifications.set_action_handler("other", handler)  # Не объявлен в этом уведомлении.
+    notifications.notify("Заголовок", actions=[("details", "Подробности")])
+    with caplog.at_level("DEBUG", logger=notifications.__name__):
+        _invoke_action(transport, notification_id, key)
+    handler.assert_not_called()
+    assert any(record.levelname == "DEBUG" for record in caplog.records)
+    _invoke_action(transport, 41, "details")
+    handler.assert_called_once_with()
+
+
+@pytest.mark.parametrize("reset", [False, True])
+def test_action_handlers_can_be_removed(transport: Mock, reset: bool) -> None:
+    handler = Mock()
+    notifications.set_action_handler("details", handler)
+    notifications.notify("Заголовок", actions=[("details", "Подробности")])
+    if reset:
+        notifications.reset_state()
+        transport.bus.disconnect.assert_called_once_with(*transport.bus.connect.call_args.args)
+    else:
+        notifications.set_action_handler("details", None)
+    _invoke_action(transport, 41, "details")
+    # Повторная доставка также не должна восстанавливать снятый обработчик.
+    notifications.notify("Заголовок", actions=[("details", "Подробности")])
+    _invoke_action(transport, 41, "details")
+    handler.assert_not_called()
+
+
+def test_action_handler_can_be_replaced(transport: Mock) -> None:
+    first, second = Mock(), Mock()
+    notifications.set_action_handler("details", first)
+    notifications.notify("Заголовок", actions=[("details", "Подробности")])
+    notifications.set_action_handler("details", second)
+    _invoke_action(transport, 41, "details")
+    first.assert_not_called()
+    second.assert_called_once_with()
+
+
+def test_action_handler_exception_does_not_escape_or_leak(
+    transport: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    handler = Mock(side_effect=RuntimeError("Секретная диктовка"))
+    notifications.set_action_handler("details", handler)
+    notifications.notify("Заголовок", actions=[("details", "Подробности")])
+    _invoke_action(transport, 41, "details")
+    _invoke_action(transport, 41, "details")
+    handler.assert_called_once_with()
+    assert "Секретная диктовка" not in caplog.text
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+
+
+@pytest.mark.parametrize("new_id", [41, 72])
+@pytest.mark.parametrize("with_actions", [False, True])
+def test_replacement_discards_previous_actions(
+    transport: Mock, new_id: int, with_actions: bool
+) -> None:
+    old, new = Mock(), Mock()
+    notifications.set_action_handler("old", old)
+    notifications.set_action_handler("new", new)
+    notifications.notify("Первое", actions=[("old", "Первое")])
+    transport.reply.arguments.return_value = [new_id]
+    notifications.notify("Второе", actions=[("new", "Второе")] if with_actions else [])
+    _invoke_action(transport, 41, "old")
+    _invoke_action(transport, new_id, "old")
+    old.assert_not_called()
+    if new_id != 41:
+        _invoke_action(transport, 41, "new")
+        new.assert_not_called()
+    _invoke_action(transport, new_id, "new")
+    assert new.call_count == int(with_actions)
+
+
+@pytest.mark.parametrize("repeat_wrapper", [False, True])
+def test_pending_actions_survive_failed_retry_and_recovery(
+    transport: Mock, repeat_wrapper: bool
+) -> None:
+    handler = Mock()
+    notifications.set_action_handler(notifications.ACTION_SHOW_DETAILS, handler)
+    transport.bus.isConnected.return_value = False
+    actions = [(notifications.ACTION_SHOW_DETAILS, "Подробности")]
+    notifications.notify(
+        "Распознавание на этом компьютере не работает",
+        "Обратитесь к администратору.",
+        urgency="critical",
+        actions=actions,
+    )
+    actions.clear()  # Очередь владеет своей копией списка.
+    notifications.notify_selfcheck_failed()
+    assert notifications.pending_count() == 1
+    transport.bus.connect.assert_not_called()
+    transport.bus.isConnected.return_value = True
+    transport.reply.type.return_value = QDBusMessage.ErrorMessage
+    assert notifications.flush_pending() == 0
+    _invoke_action(transport, 41, notifications.ACTION_SHOW_DETAILS)
+    handler.assert_not_called()
+    transport.reply.type.return_value = QDBusMessage.ReplyMessage
+    if repeat_wrapper:
+        notifications.notify_selfcheck_failed()
+    else:
+        assert notifications.flush_pending() == 1
+    assert notifications.pending_count() == 0
+    assert transport.bus.call.call_count == 2
+    for call in transport.bus.call.call_args_list:
+        assert _arguments(call.args[0])[5].value() == ["show-details", "Подробности"]
+    _invoke_action(transport, 41, notifications.ACTION_SHOW_DETAILS)
+    handler.assert_called_once_with()
+
+
+def test_pending_deduplication_includes_actions_and_drop_removes_them(transport: Mock) -> None:
+    transport.bus.isConnected.return_value = False
+    notifications.notify("Первое", actions=[("first", "Первое")])
+    notifications.notify("Первое", actions=[("second", "Второе")])
+    notifications.notify("Первое", actions=[("first", "Первое")])
+    notifications.notify("Следующее", actions=[("next", "Далее")])
+    assert notifications.pending_count() == 3
+    assert notifications.drop_pending("Первое") == 2
+    transport.bus.isConnected.return_value = True
+    assert notifications.flush_pending() == 1
+    assert _arguments(transport.bus.call.call_args.args[0])[5].value() == ["next", "Далее"]
+
+
+@pytest.mark.parametrize("failure", [False, RuntimeError("Сбой подписки")])
+def test_subscription_failure_keeps_delivery_and_retries(transport: Mock, failure: object) -> None:
+    if isinstance(failure, Exception):
+        transport.bus.connect.side_effect = failure
+    else:
+        transport.bus.connect.return_value = failure
+    notifications.notify_selfcheck_failed()
+    assert notifications.last_delivery_ok() is True
+    assert notifications.pending_count() == 0
+    transport.bus.connect.side_effect = None
+    transport.bus.connect.return_value = True
+    notifications.notify_selfcheck_failed()
+    assert transport.bus.connect.call_count == 2
 
 
 @pytest.mark.parametrize("backlog", [0, 8])
@@ -374,13 +558,15 @@ def test_fixed_messages(
     wrapper()
     args = _arguments(transport.bus.call.call_args.args[0])
     assert args[3:5] == [summary, body]
-    assert args[5].value() == []
+    assert args[5].value() == (
+        ["show-details", "Подробности"] if wrapper is notifications.notify_selfcheck_failed else []
+    )
     assert args[6]["urgency"].value() == priority
 
 
 @pytest.mark.parametrize("combo", ["Ctrl+Space", "Ctrl+Shift+Space", "Win+Space"])
 @pytest.mark.parametrize("regrabbed", [False, True])
-def test_hotkey_messages_name_combo_without_actions(
+def test_hotkey_messages_name_combo_and_actions(
     transport: Mock, combo: str, regrabbed: bool
 ) -> None:
     if regrabbed:
@@ -395,7 +581,7 @@ def test_hotkey_messages_name_combo_without_actions(
     transport.bus.call.assert_called_once()
     args = _arguments(transport.bus.call.call_args.args[0])
     assert args[3:5] == expected
-    assert args[5].value() == []
+    assert args[5].value() == ([] if regrabbed else ["choose-hotkey", "Выбрать другую"])
     assert args[6]["urgency"].value() == b"\x01"
 
 
@@ -408,7 +594,7 @@ def test_hotkey_messages_require_combo(wrapper: Callable[..., None]) -> None:
 
 
 @pytest.mark.parametrize("selected", [False, True])
-def test_microphone_messages_use_system_description_without_actions(
+def test_microphone_messages_use_system_description_and_actions(
     transport: Mock, selected: bool
 ) -> None:
     name = "Встроенный микрофон"
@@ -424,7 +610,7 @@ def test_microphone_messages_use_system_description_without_actions(
     transport.bus.call.assert_called_once()
     args = _arguments(transport.bus.call.call_args.args[0])
     assert args[3:5] == expected
-    assert args[5].value() == []
+    assert args[5].value() == ([] if selected else ["choose-microphone", "Выбрать микрофон"])
     assert args[6]["urgency"].value() == b"\x01"
 
 
@@ -440,6 +626,20 @@ def _qualified_name(node: ast.AST, aliases: dict[str, str]) -> str:
 def _is_notification(name: str) -> bool:
     leaf = name.rsplit(".", 1)[-1]
     return leaf == "notify" or leaf.startswith("notify_")
+
+
+def _is_static_actions(node: ast.AST, constants: set[str]) -> bool:
+    """Разрешены только явные пары постоянных ключей и подписей кнопок."""
+    return isinstance(node, (ast.List, ast.Tuple)) and all(
+        isinstance(pair, ast.Tuple)
+        and len(pair.elts) == 2
+        and all(
+            (isinstance(item, ast.Constant) and isinstance(item.value, str))
+            or (isinstance(item, ast.Name) and item.id in constants)
+            for item in pair.elts
+        )
+        for pair in node.elts
+    )
 
 
 def _notification_violations(source: str, *, implementation: bool = False) -> list[str]:
@@ -553,7 +753,19 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
             continue
         if not implementation and (leaf == "notify" or node.args or node.keywords):
             problems.append(f"{node.lineno}: снаружи допустима только обёртка без аргументов")
-        arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
+        arguments = [
+            *node.args,
+            *(
+                keyword.value
+                for keyword in node.keywords
+                if not (
+                    implementation
+                    and leaf == "notify"
+                    and keyword.arg == "actions"
+                    and _is_static_actions(keyword.value, constants)
+                )
+            ),
+        ]
         for argument in arguments:
             if (
                 implementation
@@ -616,10 +828,30 @@ def test_project_notifications_contain_no_dictation() -> None:
         'def notify_microphone_changed(name):\n    notify(f"Запись: {text}")',
         'def notify_microphone_selected(name):\n    notify(f"Микрофон: {text}")',
         'def notify_hotkey_regrabbed(combo):\n    notify(f"Запись: {text}")',
+        'notify("Запись", actions=text)',
+        'notify("Запись", actions=[("details", text)])',
+        'notify("Запись", actions=[(text, "Подробности")])',
+        'notify("Запись", actions=[("details", f"Подробности: {text}")])',
+        'notify("Запись", actions=[("details", "Подробности", text)])',
+        'notify("Запись", actions=[*text])',
+        'LABEL = text\nnotify("Запись", actions=[("details", LABEL)])',
+        'LABEL = "Подробности"\nLABEL = text\nnotify("Запись", actions=[("details", LABEL)])',
     ],
 )
 def test_ast_rejects_dynamic_text(source: str) -> None:
     assert _notification_violations(source, implementation=True)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'notify("Запись", actions=[("details", "Подробности")])',
+        'ACTION = "details"\nnotify("Запись", actions=[(ACTION, "Подробности")])',
+    ],
+)
+def test_ast_allows_static_actions_only_inside_module(source: str) -> None:
+    assert not _notification_violations(source, implementation=True)
+    assert _notification_violations(source)
 
 
 @pytest.mark.parametrize(

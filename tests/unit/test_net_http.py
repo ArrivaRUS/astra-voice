@@ -4,11 +4,12 @@ pytest.importorskip("requests")
 
 # Импорт зависимости должен предшествовать импорту проверяемого модуля.
 # ruff: noqa: E402
+import gzip
 import os
 import threading
 import time
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -18,7 +19,9 @@ from unittest.mock import Mock
 from urllib.parse import urlsplit
 
 import requests
-from requests.packages.urllib3.exceptions import ReadTimeoutError
+from requests.packages.urllib3.connection import HTTPSConnection
+from requests.packages.urllib3.response import HTTPResponse
+from urllib3.exceptions import ReadTimeoutError
 
 from astra_voice.core.policy import Policy, PolicyStatus
 from astra_voice.core.settings import Settings
@@ -42,13 +45,15 @@ class LocalServer:
 
 
 @pytest.fixture(autouse=True)
-def isolated_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def isolated_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[..., requests.Response]:
     """Убирает внешние прокси и запрещает настоящий транспорт вне локального сервера."""
     for name in tuple(os.environ):
         if name.lower().endswith("_proxy"):
             monkeypatch.delenv(name)
     monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
-    original_send = requests.adapters.HTTPAdapter.send
+    original_send: Callable[..., requests.Response] = requests.adapters.HTTPAdapter.send
 
     def local_send(
         self: requests.adapters.HTTPAdapter, request: requests.PreparedRequest, **kwargs: object
@@ -57,6 +62,7 @@ def isolated_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         return original_send(self, request, **kwargs)
 
     monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", local_send)
+    return original_send
 
 
 @pytest.fixture
@@ -105,13 +111,26 @@ def local_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[LocalServer]:
             elif self.path == "/slow-redirect":
                 status = 302
                 headers["Location"] = "/ok"
+            elif self.path == "/drip":
+                body = b"x" * (2 * 65536)
+            elif self.path.startswith("/gzip/"):
+                status = int(self.path.rsplit("/", 1)[1])
+                body = gzip.compress(b"x" * (1024 * 1024))
+                headers = {"Content-Encoding": "gzip", "Location": "/ok"}
             try:
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(body)))
                 for name, value in headers.items():
                     self.send_header(name, value)
                 self.end_headers()
-                if self.path == "/slow-body":
+                if self.path == "/drip":
+                    for byte in body:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        if release.wait(0.2):
+                            return
+                    return
+                elif self.path == "/slow-body":
                     self.wfile.write(body[:4])
                     self.wfile.flush()
                     release.wait(2)
@@ -127,6 +146,8 @@ def local_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[LocalServer]:
             """Не пишет служебный журнал сервера в вывод тестов."""
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    # server_close() должен дождаться и обработчиков запросов, включая каплю.
+    server.daemon_threads = False
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
     thread.start()
     monkeypatch.setattr(http, "ALLOWED_HOSTS", ("127.0.0.1",))
@@ -365,12 +386,157 @@ def test_slow_server_times_out(
     sessions[0].close.assert_called_once()
 
 
+@pytest.fixture
+def drip_server(local_server: LocalServer) -> Iterator[LocalServer]:
+    """Ограничивает зависание регрессии; таймер не участвует в успешном чтении."""
+    failsafe = threading.Timer(3, local_server.release.set)
+    failsafe.start()
+    try:
+        yield local_server
+    finally:
+        local_server.release.set()
+        failsafe.cancel()
+        failsafe.join()
+
+
+def test_drip_cancel_interrupts_block_read(
+    client: HttpClient, drip_server: LocalServer, sessions: list[requests.Session]
+) -> None:
+    cancel = threading.Event()
+    timer = threading.Timer(0.3, cancel.set)
+    with client.get_stream(drip_server.url + "/drip", deadline_s=30, cancel=cancel) as response:
+        assert int(response.headers["Content-Length"]) > 65536
+        started = time.monotonic()
+        timer.start()
+        try:
+            with pytest.raises(NetworkError) as caught:
+                next(response.iter_chunks(65536))
+            elapsed = time.monotonic() - started
+            assert caught.value.code == "cancelled"
+            assert 0.3 <= elapsed <= 2.0
+            assert response._response.raw.closed
+            assert not response._watchdog.is_alive()
+            sessions[0].close.assert_called_once()
+        finally:
+            timer.cancel()
+            timer.join()
+
+
+def test_drip_deadline_interrupts_block_read(
+    client: HttpClient, drip_server: LocalServer, sessions: list[requests.Session]
+) -> None:
+    deadline = 1.0
+    started = time.monotonic()
+    with pytest.raises(NetworkError) as caught:
+        with client.get_stream(
+            drip_server.url + "/drip", deadline_s=deadline, cancel=threading.Event()
+        ) as response:
+            next(response.iter_chunks(65536))
+    elapsed = time.monotonic() - started
+    assert caught.value.code == "timeout"
+    assert deadline <= elapsed <= deadline + 1.0
+    assert response._response.raw.closed
+    assert not response._watchdog.is_alive()
+    sessions[0].close.assert_called_once()
+
+
+@pytest.mark.parametrize("chunk_size", (1, 65536))
+def test_drip_minimum_speed_expires_before_deadline(
+    client: HttpClient,
+    drip_server: LocalServer,
+    monkeypatch: pytest.MonkeyPatch,
+    chunk_size: int,
+) -> None:
+    # Ускоряем только окно наблюдения, оставляя производственный порог скорости.
+    monkeypatch.setattr(http, "_MIN_SPEED_GRACE_S", 0.6)
+    started = time.monotonic()
+    with pytest.raises(NetworkError, match="Слишком низкая скорость") as caught:
+        with client.get_stream(
+            drip_server.url + "/drip", deadline_s=30, cancel=threading.Event()
+        ) as response:
+            list(response.iter_chunks(chunk_size))
+    elapsed = time.monotonic() - started
+    assert caught.value.code == "timeout"
+    assert 0.6 <= elapsed <= 2.0
+    assert response._response.raw.closed
+    assert not response._watchdog.is_alive()
+
+
+def test_close_from_other_threads_interrupts_block_read(
+    client: HttpClient, drip_server: LocalServer, sessions: list[requests.Session]
+) -> None:
+    response = client.get_stream(drip_server.url + "/drip", deadline_s=30, cancel=threading.Event())
+    errors: list[BaseException] = []
+
+    def close() -> None:
+        try:
+            response.close()
+        except BaseException as error:
+            errors.append(error)
+
+    closers = [threading.Timer(0.3, close) for _ in range(3)]
+    started = time.monotonic()
+    for closer in closers:
+        closer.start()
+    try:
+        assert list(response.iter_chunks(65536)) == []
+        for closer in closers:
+            closer.join(timeout=1)
+        assert time.monotonic() - started <= 2.0
+        assert all(not closer.is_alive() for closer in closers)
+        assert errors == []
+        assert not response._watchdog.is_alive()
+        assert response._response.raw.closed
+        sessions[0].close.assert_called_once()
+        response.close()
+    finally:
+        drip_server.release.set()
+        for closer in closers:
+            closer.cancel()
+            closer.join(timeout=3)
+        response.close()
+
+
 def test_redirect_body_is_not_read(client: HttpClient, local_server: LocalServer) -> None:
     with client.get_stream(
         local_server.url + "/slow-redirect", deadline_s=0.5, cancel=threading.Event()
     ) as response:
         assert b"".join(response.iter_chunks()) == _BODY
     assert len(local_server.requests) == 2
+
+
+@pytest.mark.parametrize("status", (200, 301, 302, 303, 307, 308))
+def test_gzip_server_rejected_before_body_read(
+    client: HttpClient,
+    local_server: LocalServer,
+    monkeypatch: pytest.MonkeyPatch,
+    sessions: list[requests.Session],
+    status: int,
+) -> None:
+    read = Mock(side_effect=AssertionError("Началось чтение сжатого тела"))
+    iterate = Mock(side_effect=AssertionError("Началась распаковка сжатого тела"))
+    monkeypatch.setattr(HTTPResponse, "read", read)
+    monkeypatch.setattr(requests.Response, "iter_content", iterate)
+    received: list[requests.Response] = []
+    original_close = requests.Response.close
+
+    def close(response: requests.Response) -> None:
+        received.append(response)
+        original_close(response)
+
+    monkeypatch.setattr(requests.Response, "close", close)
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream(
+            f"{local_server.url}/gzip/{status}", deadline_s=2, cancel=threading.Event()
+        )
+    assert caught.value.code == "not-allowed"
+    read.assert_not_called()
+    iterate.assert_not_called()
+    assert len(received) == 1
+    assert received[0].raw.closed
+    assert len(local_server.requests) == 1
+    assert local_server.requests[0][1]["Accept-Encoding"] == "identity"
+    sessions[0].close.assert_called_once()
 
 
 @pytest.mark.parametrize("reason", ("cancelled", "timeout"))
@@ -496,6 +662,96 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> Mock:
     return send
 
 
+@pytest.mark.parametrize("limit", (0, 1, 1023, 1024, 1025, 65535, 65536, 65537))
+def test_stream_limit_bounds_actual_reads_in_blocks(
+    client: HttpClient, transport: Mock, monkeypatch: pytest.MonkeyPatch, limit: int
+) -> None:
+    received = _response()
+    received.raw = BytesIO(b"x" * 131072)
+    read = Mock(wraps=received.raw.read)
+    monkeypatch.setattr(received.raw, "read", read)
+    transport.side_effect = None
+    transport.return_value = received
+    with client.get_stream(
+        "https://huggingface.co/file", deadline_s=2, cancel=threading.Event()
+    ) as response:
+        chunks = list(response.iter_chunks(limit=limit))
+    expected_sizes = [1024] * (limit // 1024)
+    if limit % 1024:
+        expected_sizes.append(limit % 1024)
+    assert [len(chunk) for chunk in chunks] == expected_sizes
+    assert [call.args[0] for call in read.call_args_list] == expected_sizes
+    assert received.raw.closed
+    assert not response._watchdog.is_alive()
+
+
+def test_allowed_hosts_override_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(http, "ALLOWED_HOSTS", ("127.0.0.1",))
+    assert http._validate_url("https://127.0.0.1/file") == "127.0.0.1"
+    with pytest.raises(NetworkError) as caught:
+        http._validate_url("https://huggingface.co/file")
+    assert caught.value.code == "not-allowed"
+
+
+@pytest.mark.parametrize("status", (200, 301, 302, 303, 307, 308))
+@pytest.mark.parametrize(
+    "encoding",
+    (
+        "gzip",
+        " GZiP \t",
+        "br",
+        "deflate",
+        "gzip, identity",
+        "identity, gzip",
+        "identity, identity",
+        ",",
+        "identity,",
+    ),
+)
+def test_content_encoding_rejected_without_reading(
+    client: HttpClient,
+    transport: Mock,
+    sessions: list[requests.Session],
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    encoding: str,
+) -> None:
+    received = _response(status, "https://hf.co/file")
+    received.headers["Content-Encoding"] = encoding
+    read = Mock(side_effect=AssertionError("Началось чтение запрещённого тела"))
+    monkeypatch.setattr(received.raw, "read", read)
+    iterate = Mock(side_effect=AssertionError("Началась распаковка запрещённого тела"))
+    monkeypatch.setattr(received, "iter_content", iterate)
+    transport.side_effect = [received]
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream("https://huggingface.co/file", deadline_s=2, cancel=threading.Event())
+    assert caught.value.code == "not-allowed"
+    read.assert_not_called()
+    iterate.assert_not_called()
+    transport.assert_called_once()
+    assert received.raw.closed
+    received.close.assert_called_once()
+    sessions[0].close.assert_called_once()
+
+
+@pytest.mark.parametrize("encoding", (None, "", " \t ", "identity", " IdEnTiTy \t"))
+def test_identity_encoding_is_read(
+    client: HttpClient, transport: Mock, encoding: str | None
+) -> None:
+    responses = [_response(302, "https://hf.co/file"), _response()]
+    for received in responses:
+        if encoding is not None:
+            received.headers["Content-Encoding"] = encoding
+    transport.side_effect = responses
+    with client.get_stream(
+        "https://huggingface.co/file", deadline_s=2, cancel=threading.Event()
+    ) as response:
+        chunks = list(response.iter_chunks(7))
+        assert all(len(chunk) <= 7 for chunk in chunks)
+        assert b"".join(chunks) == _BODY
+    assert transport.call_count == 2
+
+
 @pytest.mark.parametrize(
     ("explicit_kind", "system_exists", "environment_kind", "selected"),
     (
@@ -558,14 +814,19 @@ def test_ca_priority_and_ignored_environment(
     assert transport.call_args.args[0].url == "https://huggingface.co/file"
 
 
+@pytest.mark.parametrize("no_proxy", ("huggingface.co", "hf.co", None))
 def test_explicit_proxies_on_every_redirect(
     client: HttpClient,
     monkeypatch: pytest.MonkeyPatch,
     transport: Mock,
     sessions: list[requests.Session],
+    no_proxy: str | None,
 ) -> None:
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
-    monkeypatch.setenv("NO_PROXY", "huggingface.co,hf.co")
+    # ALL_PROXY тоже не должен вернуть прокси после совпадения с NO_PROXY.
+    monkeypatch.setenv("ALL_PROXY", "http://fallback.example:3128")
+    if no_proxy is not None:
+        monkeypatch.setenv("NO_PROXY", no_proxy)
     proxy_lookup = Mock(wraps=urllib.request.getproxies)
     monkeypatch.setattr(urllib.request, "getproxies", proxy_lookup)
     first = _response(302, "https://hf.co/file")
@@ -580,13 +841,71 @@ def test_explicit_proxies_on_every_redirect(
     assert first.raw.closed
     first.close.assert_called_once()
     second.close.assert_called_once()
-    expected_proxies = {"https": "http://proxy.example:3128", "no": "huggingface.co,hf.co"}
     for call in transport.call_args_list:
-        assert call.kwargs["proxies"]["https"] == "http://proxy.example:3128"
+        url = call.args[0].url
+        expected = None if urlsplit(url).hostname == no_proxy else "http://proxy.example:3128"
+        assert requests.utils.select_proxy(url, call.kwargs["proxies"]) == expected
+        if expected is None:
+            assert call.kwargs["proxies"] == {}
         assert call.kwargs["stream"] is True
     for call in sessions[0].get.call_args_list:
-        assert call.kwargs["proxies"] == expected_proxies
+        url = call.args[0]
+        expected = None if urlsplit(url).hostname == no_proxy else "http://proxy.example:3128"
+        assert requests.utils.select_proxy(url, call.kwargs["proxies"]) == expected
         assert call.kwargs["allow_redirects"] is False
+    assert sessions[0].trust_env is False
+
+
+@pytest.mark.parametrize("proxy_scheme", ("http", "https"))
+def test_proxy_authorization_only_in_connect(
+    client: HttpClient,
+    monkeypatch: pytest.MonkeyPatch,
+    isolated_environment: Callable[..., requests.Response],
+    proxy_scheme: str,
+) -> None:
+    monkeypatch.setenv(
+        "HTTPS_PROXY", f"{proxy_scheme}://proxy-user:proxy-password@proxy.example:3128"
+    )
+    sockets: list[Mock] = []
+    replies = iter(
+        (
+            b"HTTP/1.1 302 Found\r\nLocation: https://hf.co/file\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+        )
+    )
+
+    def connect(connection: HTTPSConnection) -> None:
+        # Подменяем сокет/TLS, сохраняя настоящий CONNECT, сериализацию GET,
+        # HTTPAdapter и выбор прокси. Сетевых соединений в этом тесте нет.
+        sock = Mock()
+        sock.makefile.side_effect = [
+            BytesIO(b"HTTP/1.1 200 Connection established\r\n\r\n"),
+            BytesIO(next(replies)),
+        ]
+        sockets.append(sock)
+        connection.sock = sock
+        connection._tunnel()
+        connection.is_verified = True
+        connection.proxy_is_verified = True
+
+    monkeypatch.setattr(HTTPSConnection, "connect", connect)
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", isolated_environment)
+    with client.get_stream(
+        "https://huggingface.co/file", deadline_s=2, cancel=threading.Event()
+    ) as response:
+        assert b"".join(response.iter_chunks()) == b"ok"
+    assert len(sockets) == 2
+    for sock, host in zip(sockets, ("huggingface.co", "hf.co"), strict=True):
+        wire = b"".join(call.args[0] for call in sock.sendall.call_args_list)
+        tunnel, origin, rest = wire.split(b"\r\n\r\n")
+        assert tunnel.startswith(f"CONNECT {host}:443 HTTP/".encode())
+        assert b"Proxy-Authorization: Basic cHJveHktdXNlcjpwcm94eS1wYXNzd29yZA==" in tunnel
+        assert origin.startswith(b"GET /file HTTP/")
+        assert f"Host: {host}".encode() in origin
+        assert b"authorization:" not in origin.lower()
+        assert b"proxy-user" not in origin
+        assert b"proxy-password" not in origin
+        assert rest == b""
 
 
 def test_cross_origin_has_no_credentials(
@@ -756,6 +1075,40 @@ def test_stream_stops_before_delivering_late_chunk(
         response.close()
     received.close.assert_called_once()
     sessions[0].close.assert_called_once()
+
+
+def test_minimum_speed_budget_recovers_and_excludes_consumer_pauses(
+    client: HttpClient, monkeypatch: pytest.MonkeyPatch, transport: Mock
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(http, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    received = _response()
+    transport.side_effect = None
+    transport.return_value = received
+    original_read = received.raw.read
+    durations = iter((29.0, 0.0, 2.5, 2.0))
+
+    def read(size: int) -> bytes:
+        now[0] += next(durations)
+        block: bytes = original_read(size)
+        return block
+
+    monkeypatch.setattr(received.raw, "read", read)
+    with client.get_stream(
+        "https://huggingface.co/file", deadline_s=200, cancel=threading.Event()
+    ) as response:
+        chunks = response.iter_chunks(128)
+        # После 29 с чтения первый блок оставляет 2 с запаса; мгновенный второй
+        # пополняет его до 3 с. Пауза потребителя не расходует запас.
+        assert next(chunks) == _BODY[:128]
+        now[0] += 31
+        assert next(chunks) == _BODY[128:256]
+        assert next(chunks) == _BODY[256:384]
+        with pytest.raises(NetworkError, match="Слишком низкая скорость") as caught:
+            next(chunks)
+        assert caught.value.code == "timeout"
+    assert received.raw.closed
+    assert not response._watchdog.is_alive()
 
 
 @pytest.mark.parametrize(

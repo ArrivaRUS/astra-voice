@@ -23,8 +23,6 @@ FocusScope {
         anchors.fill: parent
         radius: Theme.segmentedRadius
         color: Theme.bgSurface
-        border.width: Theme.segmentedBorder
-        border.color: Theme.border
         antialiasing: true
         clip: true
         implicitWidth: row.implicitWidth + Theme.segmentedBorder * 2
@@ -85,6 +83,17 @@ FocusScope {
                     }
                 }
             }
+        }
+
+        // Обводка рисуется поверх заливки: в тёмной теме Theme.border — 10 % белого.
+        // Композит считаем от заливки, иначе фон окна делает рамку темнее макета.
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: "transparent"
+            border.width: Theme.segmentedBorder
+            border.color: Theme.border
+            antialiasing: true
         }
     }
 

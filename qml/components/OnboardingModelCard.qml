@@ -11,6 +11,7 @@ Rectangle {
     property string vendor: qsTr("Сбер (GigaChat Team)")
     property string purpose: qsTr("Русская диктовка с пунктуацией — по умолчанию")
     property string modelSize: qsTr("231,9 МБ")
+    property string modelRam: qsTr("415 МБ")
     property string modelHost: qsTr("huggingface.co")
     property real progress: 0
     property string speed: ""
@@ -39,7 +40,8 @@ Rectangle {
     height: implicitHeight
     radius: Theme.modelCardRadius
     border.width: 1 // spec §5.1: граница карточки.
-    border.color: installed ? Theme.accent : Theme.primary
+    // design/spec.md §5.5: рекомендованную карточку отличает только бейдж.
+    border.color: installed ? Theme.accent : Theme.border
     color: installed ? Theme.accentBg : Theme.bgSurface
 
     // Inline components доступны в Qt 5.15 и не требуют записи в qmldir.
@@ -120,7 +122,8 @@ Rectangle {
                     Rectangle {
                         readonly property bool activeBadge: root.installed && index === 0
                         width: badgeText.implicitWidth + 2 * Theme.badgePaddingX
-                        height: Theme.badgeHeight
+                        // design/spec.md §4.8: округляем вверх до 22 px, чтобы избежать субпиксельных граней.
+                        height: Math.ceil(Theme.badgeHeight)
                         radius: Theme.badgeRadius
                         color: activeBadge ? Theme.accentBg : Theme.primaryBg
                         Text {
@@ -175,22 +178,13 @@ Rectangle {
                             color: Theme.modelCardMetricFillMeasured
                         }
                     }
-                    Row {
-                        FooterText {
-                            text: modelData.prefix
-                            font.pixelSize: Theme.modelCardMetricValueSize
-                        }
-                        FooterText {
-                            text: modelData.number
-                            color: Theme.fg
-                            font.family: Theme.fontMono
-                            font.weight: Font.Bold
-                            font.pixelSize: Theme.modelCardMetricValueSize
-                        }
-                        FooterText {
-                            text: modelData.suffix
-                            font.pixelSize: Theme.modelCardMetricValueSize
-                        }
+                    // design/spec.md, сквозное правило 5: вся строка метрики — шрифтом интерфейса.
+                    FooterText {
+                        text: modelData.prefix + modelData.number + modelData.suffix
+                        color: Theme.fg
+                        font.family: Theme.fontUi
+                        font.weight: Font.Bold
+                        font.pixelSize: Theme.modelCardMetricValueSize
                     }
                 }
             }
@@ -307,7 +301,8 @@ Rectangle {
                 id: tags
                 spacing: root.footerGap
                 Repeater {
-                    model: [qsTr("Только русский"), qsTr("с пунктуацией"), qsTr("MIT"), qsTr("Сбер"), qsTr("отечественная")]
+                    // design/spec.md §5.2: лицензия и автор — один тег, как в макете.
+                    model: [qsTr("Только русский"), qsTr("с пунктуацией"), qsTr("MIT · Сбер"), qsTr("отечественная")]
                     RowLayout {
                         spacing: root.footerGap
                         Dot { visible: index !== 0 }
@@ -319,13 +314,12 @@ Rectangle {
                 width: Math.max(0, tagsRow.width - tags.width - diskSize.width - 2 * root.footerGap)
                 height: diskSize.height
             }
-            Row {
+            RowLayout {
                 id: diskSize
+                spacing: root.footerGap
                 FooterText {
-                    text: root.modelSize
-                    font.family: Theme.fontMono
+                    text: qsTr("%1 на диске").arg(root.modelSize)
                 }
-                FooterText { text: qsTr(" на диске") }
             }
         }
 
@@ -342,16 +336,11 @@ Rectangle {
                 id: statusText
                 Layout.fillWidth: true
                 color: root.failed ? Theme.dangerInk : (root.warning ? Theme.warningInk : Theme.fgMuted)
+                // design/spec.md §5.4 и правило 5: число входит в переводимую фразу без моноширинного набора.
                 text: root.modelState === "broken" ? qsTr("Файл не прошёл проверку — скачайте заново")
-                    : root.modelState === "no-space" ? qsTr("Не хватает места на диске — нужно ещё")
-                    : root.warning ? qsTr("Памяти может не хватить — модели нужно около")
+                    : root.modelState === "no-space" ? qsTr("Не хватает места на диске — нужно ещё %1").arg(root.modelSize)
+                    : root.warning ? qsTr("Памяти может не хватить — модели нужно около %1").arg(root.modelRam)
                     : qsTr("Нет доступа к %1").arg(root.modelHost)
-            }
-            FooterText {
-                visible: root.modelState === "no-space" || root.warning
-                text: root.warning ? qsTr("415 МБ") : root.modelSize
-                font.family: Theme.fontMono
-                color: statusText.color
             }
         }
 
@@ -360,16 +349,26 @@ Rectangle {
             width: parent.width
             visible: !root.busy
             spacing: root.footerGap
-            Item {
-                Layout.fillWidth: true
-            }
-            FooterText {
+            // design/refs/08-onboarding-2-model.png: при ширине карточки 620 ряд .mbot
+            // переносится, и требование к памяти встаёт в строку с кнопками.
+            RowLayout {
                 visible: root.available || root.warning
                 Layout.fillWidth: true
                 Layout.minimumWidth: 0
-                elide: Text.ElideRight
-                wrapMode: Text.NoWrap
-                text: qsTr("Источник: %1").arg(root.modelHost)
+                spacing: 3 // Зазор между числом и пояснением при кегле 12.
+                FooterText {
+                    text: qsTr("%1 ОЗУ").arg(root.modelRam)
+                    color: Theme.fg
+                    font.weight: Font.Bold
+                    wrapMode: Text.NoWrap
+                }
+                FooterText {
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    elide: Text.ElideRight
+                    wrapMode: Text.NoWrap
+                    text: qsTr("· замерено на этом компьютере")
+                }
             }
             SmallButton {
                 visible: root.available || root.warning || root.offline

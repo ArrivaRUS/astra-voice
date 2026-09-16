@@ -21,7 +21,6 @@ from astra_voice.platform.paste import PasteMode, PasteOutcome, PasteOutcomeKind
 from astra_voice.ui.pill import (
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
-    ERROR_MICROPHONE_CHANGED,
     ERROR_MICROPHONE_LOST,
     ERROR_MICROPHONE_UNAVAILABLE,
     ERROR_MODEL_NOT_LOADED,
@@ -133,9 +132,9 @@ class DictationOrchestrator:
         self._on_device_changed = on_device_changed
         self._on_device_lost = on_device_lost
         self._on_device_selected = on_device_selected
-        self._announced_device: str | None = None
+        self._announced_selected_device: str | None = None
+        self._audio_opened = False
         self._device_selected = False
-        self._microphone_changed = False
         self._log = log if log is not None else logging.getLogger(__name__)
         self._phase = DictationPhase.IDLE
         self._target_window: int | None = None
@@ -145,6 +144,7 @@ class DictationOrchestrator:
         self._started = False
         self._cold = True
         self._t0 = 0.0
+        self._t_ready: float | None = None
         self._t_stop: float | None = None
         self._t_ms = 0.0
         self._paste_ms = 0.0
@@ -199,12 +199,12 @@ class DictationOrchestrator:
         self._cancel_requested = False
         self._delivered = False
         self._cold, self._started = not self._started, True
+        self._t_ready = None
         self._t_stop = None
         self._t_ms = self._paste_ms = 0.0
         self._retries = 0
         try:
             self._device_selected = False
-            self._microphone_changed = False
             params = self._record_params()
             message = {"type": "record.start", "utterance_id": self._utterance_id}
             device = params.get("device")
@@ -247,10 +247,7 @@ class DictationOrchestrator:
         if self.phase != DictationPhase.PROCESSING or self._cancel_requested:
             return
         self._set_recording(False)
-        if self._microphone_changed:
-            self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_CHANGED)
-        else:
-            self._pill.show_state(PillState.PROCESSING)
+        self._pill.show_state(PillState.PROCESSING)
         self._tray.set_state(TrayState.PROCESSING)
         self._later(PROCESSING_WATCHDOG_MS, self._watchdog)
 
@@ -318,6 +315,10 @@ class DictationOrchestrator:
 
     def _audio_ready(self, event: dict[str, Any]) -> None:
         self._log.debug("диктовка: audio.ready")
+        if self._t_ready is None:
+            self._t_ready = self._clock()
+        first_open = not self._audio_opened
+        self._audio_opened = True
         if "changed" not in event or self._phase != DictationPhase.RECORDING:
             return
         # Воркер передаёт системное описание, а не идентификатор из record_params.
@@ -327,17 +328,16 @@ class DictationOrchestrator:
             changed = event.get("changed")
             if isinstance(changed, str) and ": " in changed:
                 name = changed.rpartition(": ")[2].strip()
-        if self._clock() < self._t0 + 0.3:
-            callback = self._on_device_selected
-        else:
-            self._microphone_changed = True
-            self._append_stat("mic_error", kind="device-changed", recovered_by="none")
-            # Сначала останавливаем звук: транспорт уведомления может ждать ответа.
-            self._stop()
-            callback = self._on_device_changed
-        if name and name != self._announced_device and callback is not None:
-            self._announced_device = name
-            callback(name)
+        if not name:
+            return
+        # audio.ready приходит только при открытии, в том числе после долгих повторов.
+        if first_open:
+            if name != self._announced_selected_device and self._on_device_selected is not None:
+                self._announced_selected_device = name
+                self._on_device_selected(name)
+        elif self._on_device_changed is not None:
+            # changed задаёт воркер: одинаковые описания могут быть у разных устройств.
+            self._on_device_changed(name)
 
     def _result(self, text: str) -> None:
         received = self._clock()
@@ -542,10 +542,6 @@ class DictationOrchestrator:
         self._set_recording(False)
 
     def _end_finish(self, state: PillState, *, tray: TrayState) -> None:
-        if self._microphone_changed and state not in (PillState.ERROR, PillState.CANCELLED):
-            # Успешная вставка/пустой результат не должны скрыть причину автостопа.
-            self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_CHANGED)
-            state = PillState.ERROR
         self._tray.set_state(tray)
         self._later(STATE_DURATION_MS[state], self._tail_done)
         self._hotkey_done()
@@ -573,7 +569,12 @@ class DictationOrchestrator:
         self._append_stat(
             "dictation",
             result=result,
+            # Включает открытие устройства: _t0 ставится до отправки record.start.
             audio_ms=max(0.0, (stop - self._t0) * 1000),
+            # До получения первого audio.ready в GUI, включая доставку события.
+            open_ms=(
+                max(0.0, (self._t_ready - self._t0) * 1000) if self._t_ready is not None else None
+            ),
             t_ms=self._t_ms,
             paste_ms=self._paste_ms,
             cold=self._cold,

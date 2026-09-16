@@ -22,12 +22,16 @@ Item {
         spacing: 14 // spec §10: зазор верхнего ряда.
 
         BrandMark {
+            appicon: true
             size: 52 // Макет 08-onboarding-1-network.html: размер знака.
             Layout.preferredWidth: size
             Layout.preferredHeight: size
             Layout.alignment: Qt.AlignVCenter
-            color: Theme.fg
-            accentColor: Theme.accent
+            // Плитка шага 1 — знак приложения; его цвета одинаковы в обеих темах,
+            // поэтому берутся из PillTheme (color.fixed), а не из Theme.
+            tileColor: PillTheme.appiconBg
+            color: PillTheme.appiconMark
+            accentColor: PillTheme.appiconAccent
         }
 
         Column {
@@ -69,8 +73,6 @@ Item {
         height: rows.height + Theme.cardBorder * 2
         color: Theme.bgSurface
         radius: Theme.cardRadius
-        border.width: Theme.cardBorder
-        border.color: Theme.border
         antialiasing: true
         clip: true
 
@@ -137,6 +139,17 @@ Item {
                 }
             }
         }
+
+        // Обводка рисуется поверх заливки: в тёмной теме Theme.border — 10 % белого.
+        // Композит считаем от заливки, иначе фон окна делает рамку темнее макета.
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.radius
+            color: "transparent"
+            border.width: Theme.cardBorder
+            border.color: Theme.border
+            antialiasing: true
+        }
     }
 
     NoteBanner {
@@ -144,7 +157,7 @@ Item {
         y: card.y + card.height + 14 // spec §10: отступ баннера под карточкой.
         width: root.width
         variant: "info"
-        iconName: "shield"
+        iconName: "info" // design/spec.md §7; макет 08-onboarding-1-network.html: информационная иконка.
         title: qsTr("Пока оба переключателя выключены, программа не выходит в сеть")
         body: qsTr("Скачать модель на следующем шаге можно и без них — это ваше явное действие. Список хостов и способ выключить сеть совсем — в «О программе → Приватность».")
     }

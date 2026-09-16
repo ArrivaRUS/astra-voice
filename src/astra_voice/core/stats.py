@@ -22,7 +22,9 @@ SAVE_INTERVAL_S = 30.0
 Event = dict[str, str | int | float | bool]
 
 _FIELDS: dict[str, frozenset[str]] = {
-    "dictation": frozenset({"model_id", "audio_ms", "t_ms", "paste_ms", "cold", "result"}),
+    "dictation": frozenset(
+        {"model_id", "audio_ms", "open_ms", "t_ms", "paste_ms", "cold", "result"}
+    ),
     "model_measure": frozenset({"model_id", "revision", "peak_rss_mb", "threads", "cpu"}),
     "model_selfcheck": frozenset({"model_id", "revision", "result", "engine_version", "cpu_model"}),
     "hotkey_grab": frozenset({"key_role", "result", "attempts"}),
@@ -43,7 +45,9 @@ _CHOICES = {
     ("update_apply", "kind"): ("model", "app"),
     ("update_apply", "track"): ("A", "B", "file"),
 }
-_NUMBERS = frozenset({"audio_ms", "t_ms", "paste_ms", "peak_rss_mb", "duration_s", "attempts"})
+_NUMBERS = frozenset(
+    {"audio_ms", "open_ms", "t_ms", "paste_ms", "peak_rss_mb", "duration_s", "attempts"}
+)
 
 
 class Summary(TypedDict):

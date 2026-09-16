@@ -56,6 +56,11 @@ def data_dir() -> Path:
     return _ensure_private_dir(_xdg("XDG_DATA_HOME", Path.home() / ".local" / "share"))
 
 
+def model_store_dir() -> Path:
+    """Каталог моделей; этот же путь использует ModelStore по умолчанию."""
+    return data_dir() / "models"
+
+
 def cache_dir() -> Path:
     """``$XDG_CACHE_HOME/astra-voice`` (по умолчанию ``~/.cache/astra-voice``)."""
     return _ensure_private_dir(_xdg("XDG_CACHE_HOME", Path.home() / ".cache"))

@@ -296,6 +296,7 @@ def test_exact_menu_and_shortcuts(harness: Harness) -> None:
         None,
         "Отмена",
         "Модель не установлена",
+        "Проверить модель ещё раз",
         "Скопировать последний текст",
         None,
         "Настройки…",
@@ -305,6 +306,7 @@ def test_exact_menu_and_shortcuts(harness: Harness) -> None:
         "Выход",
     ]
     assert [a.shortcut().toString() for a in harness.menu.actions()] == [
+        "",
         "",
         "",
         "",
@@ -349,10 +351,22 @@ def test_flags_refresh_without_changing_menu(harness: Harness) -> None:
     for value in (False, True, False):
         harness.tray.set_has_last_text(value)
         harness.tray.set_updates_enabled(value)
-        assert harness.menu.actions()[4].isEnabled() == value
-        assert harness.menu.actions()[7].isEnabled() == value
+        assert harness.menu.actions()[5].isEnabled() == value
+        assert harness.menu.actions()[8].isEnabled() == value
         assert menu_labels(harness) == before
         assert not harness.menu.actions()[0].isEnabled()
+
+
+def test_model_recheck_visibility_and_enabled(harness: Harness) -> None:
+    action = harness.menu.actions()[4]
+    assert action.text() == "Проверить модель ещё раз"
+    assert not action.isVisible()
+    assert not action.isEnabled()
+    for enabled in (True, False, True):
+        harness.tray.set_model_recheck_enabled(enabled)
+        harness.tray.set_state(TrayState.ERROR if enabled else TrayState.IDLE)
+        assert action.isVisible() == enabled
+        assert action.isEnabled() == enabled
 
 
 def test_models_zero_one_many_and_reset(harness: Harness) -> None:
@@ -387,24 +401,26 @@ def test_models_zero_one_many_and_reset(harness: Harness) -> None:
     assert action.menu() is None
     assert not action.isEnabled()
     assert action.text() == "Модель не установлена"
-    assert len(harness.menu.actions()) == 11
+    assert len(harness.menu.actions()) == 12
 
 
 @pytest.mark.parametrize(
     ("index", "attribute"),
     [
         (2, "on_cancel"),
-        (4, "on_copy_last"),
-        (6, "on_settings"),
-        (7, "on_check_updates"),
-        (8, "on_about"),
-        (10, "on_quit"),
+        (4, "on_model_recheck"),
+        (5, "on_copy_last"),
+        (7, "on_settings"),
+        (8, "on_check_updates"),
+        (9, "on_about"),
+        (11, "on_quit"),
     ],
 )
 def test_callbacks_and_none(harness: Harness, index: int, attribute: str) -> None:
     harness.tray.set_state(TrayState.LISTENING)
     harness.tray.set_has_last_text(True)
     harness.tray.set_updates_enabled(True)
+    harness.tray.set_model_recheck_enabled(True)
     action = harness.menu.actions()[index]
     assert getattr(harness.tray, attribute) is None
     action.trigger()

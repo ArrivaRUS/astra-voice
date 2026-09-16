@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import wave
 from collections import deque
@@ -15,7 +16,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from astra_voice.core import model_source
+from astra_voice.core import model_source, paths
 from astra_voice.core.model_request import ModelNotConfigured
 from astra_voice.core.model_source import (
     ModelRecord,
@@ -25,23 +26,24 @@ from astra_voice.core.model_source import (
     smoke_wav_path,
 )
 from astra_voice.core.settings import Settings, from_dict
+from astra_voice.models.store import ModelStore
 from astra_voice.worker import ipc
 
 pytestmark = pytest.mark.unit
 
 
-@dataclass
-class FakeRecord:
+@dataclass(frozen=True)
+class FakeRecord(ModelRecord):
     id: str = "stored-model"
     revision: str = "stored-revision"
-    dir: str = "~/selected/model/r2"
+    dir: Path = Path("~/selected/model/r2")
     layout: str = "stored-layout"
     variant: str = "stored-variant"
-    state: str = "ok"
+    size_bytes: int = 0
 
 
 @dataclass
-class FakeStore:
+class FakeStore(ModelStore):
     record: ModelRecord | None = None
     error: Exception | None = None
     calls: int = 0
@@ -73,6 +75,54 @@ def assert_request(request: dict[str, Any] | None, expected: dict[str, Any]) -> 
     assert request == expected
     assert request is not None
     ipc.encode(request)
+
+
+def test_default_model_store_uses_shared_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    assert paths.model_store_dir() == tmp_path / "astra-voice" / "models"
+    assert ModelStore().root == paths.model_store_dir()
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_real_store_resolves_committed_revision(
+    settings: Settings, tmp_path: Path, configured: bool
+) -> None:
+    store = ModelStore(root=tmp_path)
+    model_id, revision = "installed-model", "r2"
+    staging = store.staging_dir(model_id, revision)
+    (staging / "model.onnx").write_bytes(b"model data")
+    (staging / "tokens.txt").write_text("token\n", encoding="utf-8")
+    (staging / "state.json").write_text(
+        json.dumps({"layout": "installed-layout", "variant": "int8", "size_bytes": 16}),
+        encoding="utf-8",
+    )
+    directory = store.commit(model_id, revision)
+    store.set_current(model_id, revision)
+    if not configured:
+        settings = Settings()
+
+    request = resolve_model_request(settings, store, store_dir=tmp_path / "unused")
+
+    assert directory == tmp_path / model_id / revision
+    assert directory.is_dir()
+    assert (directory / "model.onnx").read_bytes() == b"model data"
+    assert (directory / "tokens.txt").read_text(encoding="utf-8") == "token\n"
+    assert_request(
+        request,
+        {
+            "type": "model.load",
+            "id": model_id,
+            "revision": revision,
+            "dir": str(directory),
+            "layout": "installed-layout",
+            "variant": "int8",
+            "threads": 4 if configured else 2,
+            "min_ram_mb": 1024 if configured else 768,
+        },
+    )
 
 
 def test_explicit_directory_overrides_store_and_settings(settings: Settings) -> None:
@@ -312,7 +362,7 @@ def test_smoke_success(smoke_runner: SmokeRunner, smoke_supervisor: FakeSmokeSup
 
     result = smoke_runner(request)
 
-    assert result == SmokeResult(True, True, "ok")
+    assert result == SmokeResult(True, "ok")
     assert smoke_supervisor.created == smoke_supervisor.started == smoke_supervisor.stopped == 1
     assert smoke_supervisor.sent == [
         (dict(request), 0.2),
@@ -332,7 +382,7 @@ def test_smoke_without_match(
 ) -> None:
     smoke_supervisor.responses["transcribe.file"] = [{"type": "result", "text": text}]
 
-    assert smoke_runner.run({"type": "model.load"}) == SmokeResult(False, False, reason)
+    assert smoke_runner.run({"type": "model.load"}) == SmokeResult(False, reason)
     assert smoke_supervisor.stopped == 1
 
 
@@ -345,7 +395,7 @@ def test_smoke_casefold(tmp_path: Path, smoke_supervisor: FakeSmokeSupervisor, t
         supervisor_factory=smoke_supervisor.factory, wav_path=wav, expect_any=("нет", "Straße")
     )
 
-    assert runner({"type": "model.load"}) == SmokeResult(True, True, "ok")
+    assert runner({"type": "model.load"}) == SmokeResult(True, "ok")
     assert smoke_supervisor.stopped == 1
 
 
@@ -370,7 +420,7 @@ def test_smoke_error_events(
 ) -> None:
     smoke_supervisor.responses[stage] = [{"type": "error", "code": code}]
 
-    assert smoke_runner({"type": "model.load"}) == SmokeResult(False, False, reason)
+    assert smoke_runner({"type": "model.load"}) == SmokeResult(False, reason)
     assert smoke_supervisor.stopped == 1
 
 
@@ -380,7 +430,7 @@ def test_smoke_timeout(
 ) -> None:
     smoke_supervisor.responses[stage] = []
 
-    assert smoke_runner({"type": "model.load"}) == SmokeResult(False, False, "timeout")
+    assert smoke_runner({"type": "model.load"}) == SmokeResult(False, "timeout")
     assert smoke_supervisor.stopped == 1
     assert smoke_supervisor.now == pytest.approx(
         {"start": 0.1, "model.load": 0.25, "transcribe.file": 0.4}[stage]
@@ -395,9 +445,7 @@ def test_smoke_cancel(
         # Отмена после pump должна иметь приоритет даже перед готовым ответом.
         return smoke_supervisor.stage == stage and not smoke_supervisor.events
 
-    assert smoke_runner({"type": "model.load"}, cancel=cancel) == SmokeResult(
-        False, False, "cancelled"
-    )
+    assert smoke_runner({"type": "model.load"}, cancel=cancel) == SmokeResult(False, "cancelled")
     assert smoke_supervisor.stopped == 1
 
 
@@ -406,7 +454,7 @@ def test_smoke_cancel_event(
 ) -> None:
     smoke_supervisor.responses["transcribe.file"] = [{"type": "cancelled"}]
 
-    assert smoke_runner({"type": "model.load"}) == SmokeResult(False, False, "cancelled")
+    assert smoke_runner({"type": "model.load"}) == SmokeResult(False, "cancelled")
     assert smoke_supervisor.stopped == 1
 
 
@@ -423,7 +471,7 @@ def test_smoke_worker_failure(
     smoke_supervisor.fail_at = operation
     smoke_supervisor.error = error_type("Сбой воркера")
 
-    assert smoke_runner({"type": "model.load"}) == SmokeResult(False, False, "worker-failed")
+    assert smoke_runner({"type": "model.load"}) == SmokeResult(False, "worker-failed")
     assert smoke_supervisor.stopped == (0 if operation == "factory" else 1)
 
 
@@ -432,7 +480,7 @@ def test_smoke_missing_wav(tmp_path: Path, smoke_supervisor: FakeSmokeSupervisor
         supervisor_factory=smoke_supervisor.factory, wav_path=tmp_path / "missing.wav"
     )
 
-    assert runner({"type": "model.load"}) == SmokeResult(False, False, "no-wav")
+    assert runner({"type": "model.load"}) == SmokeResult(False, "no-wav")
     assert smoke_supervisor.created == smoke_supervisor.started == smoke_supervisor.stopped == 0
 
 
@@ -463,24 +511,29 @@ def test_smoke_keeps_text_private(
         assert word.casefold() not in repr(asdict(result)).casefold()
         assert word.casefold() not in repr(smoke_runner).casefold()
     assert all(record.exc_info is None for record in caplog.records)
-    assert set(asdict(result)) == {"ok", "text_matched", "reason"}
+    assert set(asdict(result)) == {"ok", "reason"}
     assert smoke_supervisor.stopped == 1
 
 
 def test_smoke_bundled_wav() -> None:
-    wav = Path(__file__).resolve().parents[2] / "data" / "smoke" / "smoke-ru-6s.wav"
+    wav = Path(__file__).resolve().parents[2] / "data" / "smoke" / "smoke-ru.wav"
 
     assert wav.is_file()
-    assert wav.stat().st_size == 192044
+    assert wav.stat().st_size == 51244
     assert hashlib.sha256(wav.read_bytes()).hexdigest() == (
-        "0ca1ae8739e1d779dda3a24407ca94628b44faeac55e5aaf52c01a0f9f063ca4"
+        "25b2afe1fe248a7b6e7238932e10cd7de97d431ee63415de2cbb2031617880bd"
     )
     with wave.open(str(wav), "rb") as recording:
         assert recording.getframerate() == 16000
         assert recording.getnchannels() == 1
         assert recording.getsampwidth() == 2
         assert recording.getcomptype() == "NONE"
-        assert recording.getnframes() == 96000
+        assert recording.getnframes() == 25600
+        assert recording.getnframes() / recording.getframerate() == 1.6
+        with wave.open(str(wav.parents[1] / "test" / "test-ru-6s.wav"), "rb") as source:
+            assert recording.readframes(25600) == source.readframes(25600)
+    assert model_source.SMOKE_WAV_NAME == wav.name
+    assert not wav.with_name("smoke-ru-6s.wav").exists()
 
 
 def test_smoke_resource_path(
