@@ -336,7 +336,11 @@ def _make_app_info(session_kind: SessionKind, policy_status: str, *, debug: bool
 
         def __init__(self) -> None:
             super().__init__()
-            self._debug = debug or os.environ.get("ASTRA_VOICE_DEBUG", "") not in ("", "0")
+            self._debug = debug or os.environ.get("ASTRA_VOICE_DEBUG", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
 
         @pyqtProperty(bool, notify=debugChanged)
         def debug(self) -> bool:
@@ -468,6 +472,9 @@ class _RuntimeOnboardingHost:
     def start_test(self, device: str, callback: TestCallback) -> bool:
         return self._runtime.start_test(device, callback)
 
+    def subscribe_device_resolved(self, callback: Callable[[str], None] | None) -> str:
+        return self._runtime.subscribe_device_resolved(callback)
+
     def stop_test(self) -> None:
         self._runtime.stop_test()
 
@@ -475,7 +482,7 @@ class _RuntimeOnboardingHost:
         self._runtime.cancel_test()
 
     def reload_model(self) -> None:
-        self._runtime.restart_worker(wait_for_model=True)
+        self._runtime.reload_model()
 
     def notify_ready(self, combo: str) -> None:
         from astra_voice.ui import notify

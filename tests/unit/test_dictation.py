@@ -158,6 +158,7 @@ class Rig:
         self.device_changed = Mock()
         self.device_lost = Mock()
         self.device_selected = Mock()
+        self.device_resolved = Mock()
         self.backend = Mock(spec=HotkeyBackend)
         self.backend.grab_combo.return_value = GrabResult("ok", keycode=65)
         self.backend.grab_escape.return_value = GrabResult("ok", keycode=9)
@@ -185,6 +186,7 @@ class Rig:
             on_device_changed=self.device_changed,
             on_device_lost=self.device_lost,
             on_device_selected=self.device_selected,
+            on_device_resolved=self.device_resolved,
             log=logging.getLogger("test.dictation"),
         )
         self.hotkey.on_state = self.core.on_hotkey_state
@@ -284,7 +286,15 @@ def test_full_ptt_cycle_and_timings(rig: Rig) -> None:
     rig.fsm.press(rig.now)
     uid = rig.uid
     assert rig.sent == [
-        ({"type": "record.start", "utterance_id": uid, "device": "fake-device"}, 150.0)
+        (
+            {
+                "type": "record.start",
+                "utterance_id": uid,
+                "device": "fake-device",
+                "limit_s": 120.0,
+            },
+            150.0,
+        )
     ]
     assert rig.trace[:6] == [
         ("active_window", 42),
@@ -1105,6 +1115,41 @@ def test_duplicate_audio_ready_keeps_first_open_ms(rig: Rig) -> None:
     rig.device_changed.assert_not_called()
 
 
+@pytest.mark.parametrize("microphone_test", [False, True])
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"device": " USB-гарнитура ", "changed": "Источник звука изменился: другое имя"},
+        {"changed": "Источник звука изменился: USB-гарнитура"},
+    ],
+)
+def test_audio_ready_resolves_device_and_reset_clears_it(
+    rig: Rig, microphone_test: bool, fields: dict[str, str]
+) -> None:
+    assert rig.core.resolved_device == ""
+    rig.core.reset_device_announcement()
+    rig.device_resolved.assert_not_called()
+    if microphone_test:
+        assert rig.core.start_test("", Mock())
+    else:
+        rig.start()
+    for _ in range(2):
+        rig.event("audio.ready", **fields)
+    assert rig.core.resolved_device == "USB-гарнитура"
+    rig.device_resolved.assert_called_once_with("USB-гарнитура")
+    rig.event("audio.ready")
+    assert rig.core.resolved_device == "USB-гарнитура"
+    if microphone_test:
+        rig.device_selected.assert_not_called()
+    else:
+        rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_changed.assert_not_called()
+    rig.core.reset_device_announcement()
+    rig.core.reset_device_announcement()
+    assert rig.core.resolved_device == ""
+    assert rig.device_resolved.call_args_list == [call("USB-гарнитура"), call("")]
+
+
 def test_audio_ready_after_stop_records_open_ms_without_notification(rig: Rig) -> None:
     rig.start()
     rig.stop()
@@ -1112,6 +1157,8 @@ def test_audio_ready_after_stop_records_open_ms_without_notification(rig: Rig) -
     rig.now += 0.5
     rig.event("audio.ready", device="USB-гарнитура", changed="смена")
     assert rig.core.phase == DictationPhase.PROCESSING
+    assert rig.core.resolved_device == "USB-гарнитура"
+    rig.device_resolved.assert_called_once_with("USB-гарнитура")
     assert rig.pill.calls == before
     assert rig.commands() == ["record.start", "record.stop", "recognize"]
     rig.device_selected.assert_not_called()
@@ -1804,6 +1851,7 @@ def test_microphone_test_cycle_is_private(
     assert rig.core.start_test(device, updates.append)
     assert updates == [MicrophoneTestUpdate("recording")]
     assert rig.sent[0][0].get("device") == (device or None)
+    assert rig.sent[0][0]["limit_s"] == 10.0
     assert rig.sent[0][1] == 40.0
     assert rig.recording
     assert not any(entry[0] == "active_window" for entry in rig.trace)
@@ -1839,6 +1887,34 @@ def test_microphone_test_cycle_is_private(
     assert not [timer for timer in rig.timers if not timer.cancelled and not timer.fired]
     rig.core.stop_test()
     assert str(updates[-1].state) == "done"
+
+
+@pytest.mark.parametrize("indicator", ["tray", "set_recording"])
+def test_microphone_limit_timer_survives_indicator_failure(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, indicator: str
+) -> None:
+    updates: list[MicrophoneTestUpdate] = []
+    target, name = (rig.tray, "set_state") if indicator == "tray" else (rig.core, "_set_recording")
+    original = getattr(target, name)
+
+    def fail_on_start(value: object) -> None:
+        if value is True or value is TrayState.LISTENING:
+            # Предел уже взведён до вызова неисправного индикатора.
+            rig.timer(TEST_RECORD_LIMIT_MS)
+            raise RuntimeError(MARKER)
+        original(value)
+
+    monkeypatch.setattr(target, name, fail_on_start)
+    with pytest.raises(RuntimeError, match=MARKER):
+        rig.core.start_test("", updates.append)
+    assert rig.core.phase == DictationPhase.RECORDING
+    assert rig.commands() == ["record.start"]
+    assert updates == []
+    rig.timer(TEST_RECORD_LIMIT_MS).fire()
+    assert rig.commands() == ["record.start", "record.stop", "recognize"]
+    assert rig.core.phase.value == "processing"
+    assert not rig.recording
+    assert updates == [MicrophoneTestUpdate("processing")]
 
 
 @pytest.mark.parametrize("phase", ["recording", "processing"])

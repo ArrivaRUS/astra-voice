@@ -12,9 +12,10 @@ import stat
 import threading
 import time
 import weakref
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import replace
 from functools import partial
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from unittest.mock import Mock, call
@@ -24,10 +25,16 @@ from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtTest import QSignalSpy
 
+from astra_voice.app import _make_app_info
 from astra_voice.core import paths
 from astra_voice.core import policy as policy_mod
 from astra_voice.core import settings as settings_mod
-from astra_voice.core.dictation import DictationOrchestrator, MicrophoneTestUpdate
+from astra_voice.core.dictation import (
+    TEST_PREPARING,
+    DictationOrchestrator,
+    DictationPhase,
+    MicrophoneTestUpdate,
+)
 from astra_voice.core.model_source import SMOKE_EXPECT_ANY
 from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
@@ -38,6 +45,7 @@ from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net.http import NetworkError
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
 from astra_voice.platform.paste import PasteMode
+from astra_voice.platform.session import SessionKind
 from astra_voice.ui.bridges import (
     ModelPort,
     ModelService,
@@ -48,6 +56,7 @@ from astra_voice.ui.bridges import (
     _ModelJob,
     make_smoke_check,
 )
+from astra_voice.ui.tray_icons import TrayState
 from astra_voice.worker import ipc
 from astra_voice.worker.audio import AudioDevice, AudioError
 
@@ -57,6 +66,55 @@ pytestmark = pytest.mark.unit
 @pytest.fixture(scope="module", autouse=True)
 def qcore_app() -> QCoreApplication:
     return QCoreApplication.instance() or QCoreApplication([])
+
+
+@pytest.mark.parametrize("debug", [False, True])
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("1", True),
+        ("true", True),
+        ("TRUE", True),
+        (" yes ", True),
+        ("0", False),
+        ("false", False),
+        ("FALSE", False),
+        ("no", False),
+        ("", False),
+        ("мусор", False),
+    ],
+)
+def test_app_info_debug_environment(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: bool, debug: bool
+) -> None:
+    monkeypatch.setenv("ASTRA_VOICE_DEBUG", value)
+
+    app_info = _make_app_info(SessionKind.OTHER, "absent", debug=debug)
+
+    assert app_info.debug is (debug or expected)
+
+
+def test_app_info_show_debug_section_enables_debug(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ASTRA_VOICE_DEBUG", "false")
+    app_info = _make_app_info(SessionKind.OTHER, "absent")
+    changed = QSignalSpy(app_info.debugChanged)
+    sections = QSignalSpy(app_info.showSection)
+    events: list[tuple[str, bool]] = []
+    app_info.debugChanged.connect(lambda: events.append(("debugChanged", app_info.debug)))
+    app_info.showSection.connect(lambda section: events.append((section, app_info.debug)))
+    assert app_info.debug is False
+
+    app_info.show_section("debug")
+
+    assert app_info.debug is True
+    assert len(changed) == 1
+    assert list(sections) == [["debug"]]
+    assert events == [("debugChanged", True), ("debug", True)]
+
+    app_info.show_section("debug")
+
+    assert len(changed) == 1
+    assert list(sections) == [["debug"], ["debug"]]
 
 
 def writable_properties() -> list[str]:
@@ -536,6 +594,67 @@ def test_hotkey_apply_keeps_policy_mode_when_combo_changes() -> None:
     assert mirror.hotkey_mode == "toggle"
 
 
+@pytest.mark.parametrize("combo", ["A", "Space", "Shift+A", "", "  sHiFt + A  ", "ControlKey+A"])
+@pytest.mark.parametrize("with_mirror", [False, True])
+def test_hotkey_without_modifier_is_rejected(
+    combo: str, with_mirror: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = Settings()
+    mirror = Settings(hotkey="Alt+Space") if with_mirror else None
+    save = Mock()
+    apply = Mock(spec=SettingsApply)
+    bridge = SettingsBridge(settings, mirror=mirror, save=save, apply=apply)
+    bridge.set_hotkey_status("busy")
+    original = settings.to_dict()
+    old = bridge.hotkey
+    changed = QSignalSpy(bridge.hotkeyChanged)
+    status = QSignalSpy(bridge.hotkeyStatusChanged)
+
+    with caplog.at_level(logging.WARNING):
+        assert bridge.setProperty("hotkey", combo)
+
+    apply.hotkey.assert_not_called()
+    save.assert_not_called()
+    assert settings.to_dict() == original
+    assert bridge.hotkey == old
+    if mirror is not None:
+        assert mirror.hotkey == old
+    assert len(changed) == 1
+    assert bridge.hotkeyStatus == "busy" and len(status) == 0
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.WARNING, "Недопустимое значение настройки hotkey")
+    ]
+
+
+@pytest.mark.parametrize(
+    "combo",
+    [
+        "Ctrl+Alt+D",
+        " cTrL + A ",
+        " CONTROL + A ",
+        " aLt + A ",
+        " MeTa + A ",
+        " SuPeR + A ",
+        " WIN + A ",
+    ],
+)
+def test_hotkey_with_modifier_is_applied_and_saved(tmp_path: Path, combo: str) -> None:
+    path = tmp_path / "settings.json"
+    settings = Settings()
+    save = Mock(wraps=partial(settings_mod.save, path=path))
+    apply = Mock(spec=SettingsApply)
+    apply.hotkey.return_value = "ok"
+    bridge = SettingsBridge(settings, save=save, apply=apply)
+    changed = QSignalSpy(bridge.hotkeyChanged)
+
+    assert bridge.setProperty("hotkey", combo)
+
+    apply.hotkey.assert_called_once_with(combo, settings.hotkey_mode)
+    save.assert_called_once_with(settings)
+    assert bridge.hotkey == settings.hotkey == settings_mod.load(path).hotkey == combo
+    assert len(changed) == 1
+
+
 @pytest.mark.parametrize("name", ["hotkeyMode", "language"])
 @pytest.mark.parametrize("value", ["", "invalid", "PTT", "RU"])
 def test_invalid_values_are_ignored(
@@ -868,6 +987,7 @@ def onboarding_rig() -> OnboardingRig:
     save = Mock()
     bridge = SettingsBridge(settings, save=save)
     host = Mock(spec=OnboardingHost)
+    host.subscribe_device_resolved.return_value = ""
     host.begin_capture.return_value = True
     host.probe.return_value = "ok"
     host.apply_hotkey.return_value = "ok"
@@ -875,6 +995,7 @@ def onboarding_rig() -> OnboardingRig:
     controller = OnboardingController(
         bridge, settings=settings, host=host, device_provider=lambda: []
     )
+    host.reset_mock()
     return controller, bridge, settings, host, save
 
 
@@ -1066,6 +1187,93 @@ def test_onboarding_capture_states(
     assert host.end_capture.call_count == 2
 
 
+@pytest.mark.parametrize("combo", ["Space", "A", "Shift+A"])
+@pytest.mark.parametrize("begin", [False, True])
+def test_onboarding_capture_without_modifier_is_rejected(
+    onboarding_rig: OnboardingRig, combo: str, begin: bool
+) -> None:
+    controller, bridge, settings, host, save = onboarding_rig
+    original = settings.to_dict()
+    if begin:
+        controller.beginCapture()
+    messages = QSignalSpy(controller.captureMessageChanged)
+    candidates = QSignalSpy(controller.freeCandidatesChanged)
+
+    controller.endCapture(combo)
+
+    host.probe.assert_not_called()
+    host.apply_hotkey.assert_not_called()
+    save.assert_not_called()
+    assert settings.to_dict() == original
+    assert bridge.hotkey == settings.hotkey == original["hotkey"]
+    assert controller.captureState == "capturing"
+    assert controller.captureMessage == "Добавьте к клавише Ctrl, Alt или Win"
+    assert controller.pendingCombo == combo
+    assert controller.freeCandidates == ["Ctrl+Alt+D"]
+    assert len(messages) == len(candidates) == 1
+    host.end_capture.assert_called_once_with()
+    host.free_candidates.assert_called_once_with(list(DEFAULT_CANDIDATES))
+    assert host.mock_calls[-2:] == [
+        call.end_capture(),
+        call.free_candidates(list(DEFAULT_CANDIDATES)),
+    ]
+
+    controller.endCapture(combo)
+
+    assert len(messages) == len(candidates) == 1
+    host.probe.assert_not_called()
+    host.apply_hotkey.assert_not_called()
+    save.assert_not_called()
+    assert settings.to_dict() == original
+
+
+def test_onboarding_valid_capture_clears_modifier_hint(onboarding_rig: OnboardingRig) -> None:
+    controller, bridge, settings, host, save = onboarding_rig
+    controller.beginCapture()
+    controller.endCapture("A")
+    assert controller.captureMessage
+    messages = QSignalSpy(controller.captureMessageChanged)
+    host.reset_mock()
+
+    controller.endCapture("Ctrl+Alt+D")
+
+    assert host.mock_calls == [
+        call.end_capture(),
+        call.probe("Ctrl+Alt+D"),
+        call.apply_hotkey("Ctrl+Alt+D", "ptt"),
+    ]
+    save.assert_called_once_with(settings)
+    assert settings.hotkey == bridge.hotkey == "Ctrl+Alt+D"
+    assert controller.captureState == "success"
+    assert controller.captureMessage == "" and len(messages) == 1
+
+
+@pytest.mark.parametrize("action", ["beginCapture", "cancelCapture", "endCapture"])
+def test_onboarding_modifier_hint_clears_on_restart_or_cancel(
+    onboarding_rig: OnboardingRig, action: str
+) -> None:
+    controller, _, settings, host, save = onboarding_rig
+    original = settings.to_dict()
+    controller.beginCapture()
+    controller.endCapture("Shift+A")
+    assert controller.captureMessage
+    messages = QSignalSpy(controller.captureMessageChanged)
+
+    for _ in range(2):
+        if action == "endCapture":
+            controller.endCapture("")
+        else:
+            getattr(controller, action)()
+        assert controller.captureState == ("capturing" if action == "beginCapture" else "idle")
+        assert controller.captureMessage == "" and len(messages) == 1
+        assert controller.pendingCombo == ""
+
+    host.probe.assert_not_called()
+    host.apply_hotkey.assert_not_called()
+    save.assert_not_called()
+    assert settings.to_dict() == original
+
+
 @pytest.mark.parametrize("failure", [False, True])
 def test_onboarding_end_capture_always_releases(
     onboarding_rig: OnboardingRig, failure: bool
@@ -1169,6 +1377,7 @@ def test_onboarding_finish_requires_model(
     if ready is True:
         assert settings.extra["onboarding_done"] is controller.done is True
         assert host.mock_calls == [
+            call.cancel_test(),
             call.reload_model(),
             call.notify_ready(settings.hotkey),
             call.hide_window(),
@@ -1176,7 +1385,7 @@ def test_onboarding_finish_requires_model(
         save.assert_called_once_with(settings)
         assert len(done_spy) == 1
         controller.finish()
-        assert len(host.mock_calls) == 3
+        assert len(host.mock_calls) == 4
     else:
         assert "onboarding_done" not in settings.extra
         assert host.mock_calls == [] and len(done_spy) == 0
@@ -1201,6 +1410,7 @@ def test_onboarding_finish_reloads_model_after_save(
         {"onboarding_language_set": True, "onboarding_model_ready": True}
     )
     host = Mock(spec=OnboardingHost)
+    host.subscribe_device_resolved.return_value = ""
     bridge = SettingsBridge(settings, save=partial(settings_mod.save, path=path))
     controller = OnboardingController(
         bridge, settings=settings, host=host, device_provider=lambda: []
@@ -1217,6 +1427,8 @@ def test_onboarding_finish_reloads_model_after_save(
 
     assert controller.done is True
     assert host.mock_calls == [
+        call.subscribe_device_resolved(controller._device_resolved),
+        call.cancel_test(),
         call.reload_model(),
         call.notify_ready(settings.hotkey),
         call.hide_window(),
@@ -2004,6 +2216,79 @@ def test_model_service_rejects_revoked_revision(
     assert {file.name: file.read_bytes() for file in source.iterdir()} == contents
 
 
+@pytest.mark.parametrize("from_path", [False, True])
+def test_model_service_cancel_during_checksum_preserves_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, from_path: bool
+) -> None:
+    from astra_voice.security import verify
+    from astra_voice.ui import bridges
+
+    contents = {
+        "v3_e2e_ctc.int8.onnx": b"\x08" * ((1 << 20) + 1),
+        "v3_e2e_ctc_vocab.txt": "а\nб\n".encode(),
+        "config.json": b'{"model_type":"gigaam"}',
+    }
+    entry = replace(
+        FakeModelPort().entry,
+        size_bytes=sum(len(data) for data in contents.values()),
+        layout="onnx-asr-gigaam-v3",
+        variant="gigaam-v3-e2e-ctc",
+        files=tuple(
+            FileSpec(name, hashlib.sha256(data).hexdigest(), len(data), f"/model/{name}")
+            for name, data in contents.items()
+        ),
+    )
+    monkeypatch.setattr(bridges, "load_builtin", lambda verifier: Catalog(1, 1, (), (entry,)))
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    service = ModelService(Settings(), policy_mod.Policy())
+    store = service._store
+    staging = store.staging_dir(entry.id, entry.revision)
+    source = tmp_path / "source" if from_path else staging
+    source.mkdir(exist_ok=True)
+    for name, data in contents.items():
+        (source / name).write_bytes(data)
+
+    read_sizes: list[int] = []
+
+    class CancellingReader(BytesIO):
+        def read(self, size: int | None = -1, /) -> bytes:
+            block = super().read(size)
+            read_sizes.append(len(block))
+            cancel.set()
+            return block
+
+    def open_for_hash(path: Path, mode: str) -> CancellingReader:
+        assert path == staging / entry.files[0].path
+        assert mode == "rb"
+        assert not cancel.is_set(), "Отмена должна происходить во время чтения"
+        return CancellingReader(path.read_bytes())
+
+    # Подменяем только источник байтов; Installer и sha256_file выполняются полностью.
+    monkeypatch.setattr(verify, "open", open_for_hash, raising=False)
+    service._cancel.set()
+    for _ in range(2):
+        cancel = threading.Event()
+        service.set_cancel(cancel)
+        read_sizes.clear()
+
+        result = (
+            service.install_from_path(source, entry)
+            if from_path
+            else service.install_from_staging(entry)
+        )
+
+        assert cancel.is_set()
+        assert len(read_sizes) == 1 and 0 < read_sizes[0] < entry.files[0].size
+        assert result.state == "error"
+        assert result.reason_code == "cancelled"
+        assert result.record is None
+        assert store.records() == ()
+        assert store.current() is None
+        assert not (store.root / entry.id / entry.revision).exists()
+        assert {file.name: file.read_bytes() for file in source.iterdir()} == contents
+        assert staging.exists() is (not from_path)
+
+
 def test_model_install_disk_error_survives_space_becoming_available(model_rig: ModelRig) -> None:
     port, create = model_rig
     port.result = InstallResult(
@@ -2113,7 +2398,7 @@ def test_model_shutdown_cancels_active_smoke_check(
     def installer_factory(
         store: object, smoke: Callable[..., object], catalog: Catalog | None = None
     ) -> Mock:
-        def install(*args: object) -> InstallResult:
+        def install(*args: object, cancel: Callable[[], bool]) -> InstallResult:
             smoke(Path("/fake/model"), port.entry)
             return InstallResult("broken", reason_code="selfcheck")
 
@@ -2214,9 +2499,11 @@ class MicrophoneBridgeRig:
         self.pill = Mock()
         self.tray = Mock()
         self.notify = Mock()
+        self.generation = 1
+        self.resolved_callback: Callable[[str], None] | None = None
         self.core = DictationOrchestrator(
             send=self.send,
-            generation=lambda: 1,
+            generation=lambda: self.generation,
             restart_worker=Mock(),
             pill=self.pill,
             tray=self.tray,
@@ -2234,8 +2521,10 @@ class MicrophoneBridgeRig:
             on_device_selected=self.notify,
             on_device_changed=self.notify,
             on_device_lost=self.notify,
+            on_device_resolved=self.device_resolved,
         )
         self.host = Mock(spec=OnboardingHost)
+        self.host.subscribe_device_resolved.side_effect = self.subscribe_device_resolved
         self.host.start_test.side_effect = self.core.start_test
         self.host.stop_test.side_effect = self.core.stop_test
         self.host.cancel_test.side_effect = self.core.cancel_test
@@ -2246,6 +2535,14 @@ class MicrophoneBridgeRig:
             device_provider=lambda: [],
         )
 
+    def subscribe_device_resolved(self, callback: Callable[[str], None] | None) -> str:
+        self.resolved_callback = callback
+        return self.core.resolved_device
+
+    def device_resolved(self, name: str) -> None:
+        if self.resolved_callback is not None:
+            self.resolved_callback(name)
+
     def send(self, message: dict[str, Any], *, timeout: float | None = None) -> None:
         self.commands.extend(ipc.FrameReader().feed(ipc.encode(message)))
 
@@ -2255,12 +2552,81 @@ class MicrophoneBridgeRig:
         )
         message = {"type": kind, "utterance_id": uid, **fields}
         event = ipc.FrameReader().feed(ipc.encode(message))[0]
-        self.core.on_worker_event({**event, "generation": 1})
+        self.core.on_worker_event({**event, "generation": self.generation})
 
 
 @pytest.fixture
 def microphone_bridge() -> MicrophoneBridgeRig:
     return MicrophoneBridgeRig()
+
+
+def test_microphone_resolved_device_signal_and_worker_restart(
+    microphone_bridge: MicrophoneBridgeRig,
+) -> None:
+    rig = microphone_bridge
+    controller = rig.controller
+    spy = QSignalSpy(controller.deviceResolvedChanged)
+    assert controller.deviceResolved == ""
+    meta = controller.metaObject()
+    prop = meta.property(meta.indexOfProperty("deviceResolved"))
+    assert prop.typeName() == "QString"
+    assert not prop.isWritable()
+    assert bytes(prop.notifySignal().name()) == b"deviceResolvedChanged"
+    controller.startTest()
+    rig.event("audio.ready", device="USB-микрофон")
+    assert controller.deviceResolved == "USB-микрофон" and len(spy) == 1
+    rig.event("audio.ready", device="USB-микрофон")
+    # Повтор от порта тоже не должен создавать лишний сигнал Qt.
+    rig.device_resolved("USB-микрофон")
+    assert len(spy) == 1
+    rig.generation += 1
+    rig.core.on_worker_event({"type": "hello", "generation": rig.generation})
+    assert controller.deviceResolved == "" and len(spy) == 2
+    rig.device_resolved("")
+    assert len(spy) == 2
+    controller.shutdown()
+    rig.host.subscribe_device_resolved.assert_called_with(None)
+    assert rig.resolved_callback is None
+    rig.device_resolved("Другой микрофон")
+    assert controller.deviceResolved == "" and len(spy) == 2
+
+
+def test_microphone_resolved_device_initial_value() -> None:
+    settings = Settings(extra={"onboarding_language_set": True})
+    host = Mock(spec=OnboardingHost)
+    host.subscribe_device_resolved.return_value = "Встроенный микрофон"
+    controller = OnboardingController(
+        SettingsBridge(settings, save=Mock()),
+        settings=settings,
+        host=host,
+        device_provider=lambda: [],
+    )
+    assert controller.deviceResolved == "Встроенный микрофон"
+    controller.shutdown()
+
+
+@pytest.mark.parametrize("operation", ["subscribe", "unsubscribe"])
+def test_microphone_resolved_device_host_failure(
+    caplog: pytest.LogCaptureFixture, operation: str
+) -> None:
+    settings = Settings(extra={"onboarding_language_set": True})
+    host = Mock(spec=OnboardingHost)
+    host.subscribe_device_resolved.return_value = ""
+    if operation == "subscribe":
+        host.subscribe_device_resolved.side_effect = RuntimeError("Сбой подписки")
+    controller = OnboardingController(
+        SettingsBridge(settings, save=Mock()),
+        settings=settings,
+        host=host,
+        device_provider=lambda: [],
+    )
+    assert controller.deviceResolved == ""
+    if operation == "unsubscribe":
+        host.subscribe_device_resolved.side_effect = RuntimeError("Сбой отписки")
+        controller.shutdown()
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    assert caplog.records[0].exc_info is not None
 
 
 def test_microphone_properties_and_full_cycle(
@@ -2283,7 +2649,11 @@ def test_microphone_properties_and_full_cycle(
     names = ("level", "peak", "testPhrase", "testState", "testText", "testDuration", "testMessage")
     spies = {name: QSignalSpy(getattr(controller, name + "Changed")) for name in names}
     states: list[str] = []
+    core_states: list[tuple[DictationPhase, bool]] = []
     controller.testStateChanged.connect(lambda: states.append(controller.testState))
+    controller.testStateChanged.connect(
+        lambda: core_states.append((rig.core.phase, rig.core.test_active))
+    )
     controller.startTest()
     controller.startTest()
     assert controller.testState == "recording"
@@ -2301,6 +2671,19 @@ def test_microphone_properties_and_full_cycle(
     assert controller.level == 0.0
     rig.event("result", text="Личная фраза микрофона", t_ms=310)
     assert states == ["recording", "processing", "done"]
+    assert core_states == [
+        (DictationPhase.RECORDING, True),
+        (DictationPhase.PROCESSING, True),
+        (DictationPhase.IDLE, False),
+    ]
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("диктовка: фаза ")
+    ] == [
+        f"диктовка: фаза {phase.value}"
+        for phase in (DictationPhase.RECORDING, DictationPhase.PROCESSING, DictationPhase.IDLE)
+    ]
     assert controller.testText == "Личная фраза микрофона"
     assert controller.testDuration == "0,31 с"
     assert controller.testMessage == ""
@@ -2326,6 +2709,47 @@ def test_microphone_level_uses_dictation_scale(
     rig.controller.startTest()
     rig.event("level", peak_dbfs=dbfs, rms_dbfs=-40.0)
     assert rig.controller.level == expected
+
+
+def test_microphone_preparing_blocks_repeat_start_and_allows_stop(
+    microphone_bridge: MicrophoneBridgeRig,
+) -> None:
+    rig = microphone_bridge
+
+    def prepare(device: str, callback: Callable[[MicrophoneTestUpdate], None]) -> bool:
+        callback(MicrophoneTestUpdate("preparing", message=TEST_PREPARING))
+        return True
+
+    rig.host.start_test.side_effect = prepare
+    rig.controller.startTest()
+    assert rig.controller.testState == "preparing"
+    assert rig.controller.testMessage == TEST_PREPARING
+    assert rig.controller.level == 0.0
+    rig.controller.startTest()
+    rig.host.start_test.assert_called_once()
+    rig.controller.stopTest()
+    rig.host.stop_test.assert_called_once_with()
+    callback = rig.host.start_test.call_args.args[1]
+    callback(MicrophoneTestUpdate("idle"))
+    assert rig.controller.testState == "idle"
+    assert rig.controller.testMessage == ""
+    assert rig.commands == []
+
+
+def test_microphone_preparing_resets_level_and_recording_clears_message(
+    microphone_bridge: MicrophoneBridgeRig,
+) -> None:
+    controller = microphone_bridge.controller
+    controller._test_updated(MicrophoneTestUpdate("recording", peak_dbfs=-18.0))
+    assert controller.level > 0.0
+    controller._test_updated(
+        MicrophoneTestUpdate("preparing", message=TEST_PREPARING, peak_dbfs=-10.0)
+    )
+    assert controller.level == 0.0
+    assert controller.testMessage == TEST_PREPARING
+    controller._test_updated(MicrophoneTestUpdate("recording"))
+    assert controller.testMessage == ""
+    assert controller.level == 0.0
 
 
 def test_microphone_early_stop_and_cancel(microphone_bridge: MicrophoneBridgeRig) -> None:
@@ -2424,11 +2848,98 @@ def test_microphone_host_exception_is_not_logged(
     assert "Личная речь" not in caplog.text
 
 
-def _microphone_log_violations(source: str) -> list[int]:
+@pytest.mark.parametrize("indicator", ["tray", "set_recording"])
+@pytest.mark.parametrize("leave", ["_clear_test", "back"])
+@pytest.mark.parametrize("cancel_fails", [False, True])
+def test_microphone_start_failure_cancels_even_from_error_state(
+    microphone_bridge: MicrophoneBridgeRig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    indicator: str,
+    leave: str,
+    cancel_fails: bool,
+) -> None:
+    rig = microphone_bridge
+    caplog.set_level(logging.DEBUG)
+    private = "Личная речь /path alsa_input.foo"
+
+    def fail_on_start(value: object) -> None:
+        if value is True or value is TrayState.LISTENING:
+            raise RuntimeError(private)
+
+    def cancel_test() -> None:
+        if cancel_fails and rig.host.cancel_test.call_count == 2:
+            raise RuntimeError(private)
+        rig.core.cancel_test()
+
+    target, name = (rig.tray, "set_state") if indicator == "tray" else (rig.core, "_set_recording")
+    monkeypatch.setattr(target, name, fail_on_start)
+    rig.host.cancel_test.side_effect = cancel_test
+    rig.controller.startTest()
+    assert rig.controller.testState == "error"
+    assert rig.controller.testMessage == "Не удалось распознать речь. Попробуйте ещё раз."
+    assert rig.host.cancel_test.call_args_list == [call(), call()]
+    assert [msg["type"] for msg in rig.commands] == (
+        ["record.start"] if cancel_fails else ["record.start", "record.cancel"]
+    )
+    if not cancel_fails:
+        rig.event("cancelled")
+        assert not rig.core.test_active
+        assert rig.core.phase == DictationPhase.IDLE
+        assert rig.controller.testState == "error"
+    getattr(rig.controller, leave)()
+    assert rig.host.cancel_test.call_args_list == [call(), call(), call()]
+    assert [msg["type"] for msg in rig.commands] == ["record.start", "record.cancel"]
+    if cancel_fails:
+        rig.event("cancelled")
+    assert not rig.core.test_active
+    assert rig.core.phase == DictationPhase.IDLE
+    assert rig.controller.testState == "idle"
+    assert private not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.parametrize("command", ["record.start", "record.stop", "recognize"])
+def test_microphone_command_failure_logs_warning_without_exception(
+    microphone_bridge: MicrophoneBridgeRig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    command: str,
+) -> None:
+    rig = microphone_bridge
+    caplog.set_level(logging.DEBUG)
+    private = "Личная речь /path alsa_input.foo"
+
+    def fail(message: dict[str, Any], *, timeout: float | None = None) -> None:
+        if message["type"] == command:
+            raise RuntimeError(private)
+        rig.send(message, timeout=timeout)
+
+    monkeypatch.setattr(rig.core, "_send", fail)
+    rig.controller.startTest()
+    if command != "record.start":
+        rig.controller.stopTest()
+    assert rig.controller.testState == "error"
+    assert rig.core.phase == DictationPhase.IDLE
+    assert not rig.core.test_active
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert [record.getMessage() for record in warnings] == [
+        f"диктовка: отправка команды {command} не удалась"
+    ]
+    assert all(record.exc_info is None for record in caplog.records)
+    assert private not in caplog.text
+
+
+def _microphone_log_violations(
+    source: str,
+    private_roots: Collection[str] = ("self._test_text", "self.testText"),
+    log_prefixes: Collection[str] = ("log.",),
+) -> list[int]:
     """Как гейт notify: AST, раскрытие псевдонимов и цепочек присваиваний."""
     nodes = list(ast.walk(ast.parse(source)))
     aliases: dict[str, str] = {}
-    private = {"self._test_text", "self.testText"}
+    private = set(private_roots)
+    prefixes = tuple(log_prefixes)
 
     def name(node: ast.AST) -> str:
         if isinstance(node, ast.Name):
@@ -2459,7 +2970,7 @@ def _microphone_log_violations(source: str) -> list[int]:
                 value_name = name(node.value)
                 if (
                     isinstance(target, ast.Name)
-                    and value_name.startswith("log.")
+                    and value_name.startswith(prefixes)
                     and target.id not in aliases
                 ):
                     aliases[target.id] = value_name
@@ -2469,14 +2980,26 @@ def _microphone_log_violations(source: str) -> list[int]:
     return [
         node.lineno
         for node in nodes
-        if isinstance(node, ast.Call) and name(node.func).startswith("log.")
+        if isinstance(node, ast.Call) and name(node.func).startswith(prefixes)
         if any(sensitive(arg) for arg in [*node.args, *(kw.value for kw in node.keywords)])
     ]
 
 
-def test_microphone_text_never_reaches_log_ast() -> None:
-    source = Path(__file__).resolve().parents[2] / "src/astra_voice/ui/bridges.py"
-    assert _microphone_log_violations(source.read_text(encoding="utf-8")) == []
+@pytest.mark.parametrize(
+    "path, private_roots, log_prefixes",
+    [
+        ("ui/bridges.py", {"self._test_text", "self.testText"}, {"log."}),
+        ("core/dictation.py", {"self._last_text", "self._test_text", "text"}, {"self._log."}),
+    ],
+)
+def test_microphone_text_never_reaches_log_ast(
+    path: str, private_roots: set[str], log_prefixes: set[str]
+) -> None:
+    source = Path(__file__).resolve().parents[2] / "src/astra_voice" / path
+    assert (
+        _microphone_log_violations(source.read_text(encoding="utf-8"), private_roots, log_prefixes)
+        == []
+    )
 
 
 @pytest.mark.parametrize(
@@ -2490,8 +3013,23 @@ def test_microphone_text_never_reaches_log_ast() -> None:
         'log.info("%s", update)',
     ],
 )
-def test_microphone_privacy_ast_gate_detects_leaks(body: str) -> None:
+@pytest.mark.parametrize("logger", ["log", "self._log"])
+def test_microphone_privacy_ast_gate_detects_leaks(body: str, logger: str) -> None:
+    body = body.replace("log.", f"{logger}.")
     source = "def receive(self, update: MicrophoneTestUpdate):\n" + "\n".join(
         "    " + line for line in body.splitlines()
     )
-    assert _microphone_log_violations(source)
+    assert _microphone_log_violations(source, log_prefixes={f"{logger}."})
+
+
+@pytest.mark.parametrize("root", ["text", "self._last_text", "self._test_text"])
+def test_microphone_privacy_ast_gate_tracks_dictation_roots(root: str) -> None:
+    source = (
+        "def _result(self, text: str):\n"
+        f"    phrase = {root}\n"
+        "    copy: str = phrase\n"
+        "    write = self._log.warning\n"
+        "    emit = write\n"
+        '    emit("%s", copy)\n'
+    )
+    assert _microphone_log_violations(source, {root}, {"self._log."}) == [6]

@@ -91,10 +91,30 @@ class FakeTheme(QObject):
         return self._dark
 
 
+class FakeAppInfo(QObject):
+    """Только используемый Main.qml контракт настоящего AppInfo из _make_app_info."""
+
+    debugChanged = pyqtSignal()
+    showSection = pyqtSignal(str, arguments=["section"])
+
+    @pyqtProperty(str, constant=True)
+    def version(self) -> str:
+        return "0.1.0"
+
+    @pyqtProperty(str, constant=True)
+    def sessionKind(self) -> str:  # noqa: N802 — имя свойства для QML
+        return "OTHER"
+
+    @pyqtProperty(bool, notify=debugChanged)
+    def debug(self) -> bool:
+        return True
+
+
 class FakeOnboarding(QObject):
     """Полный изменяемый контракт; слоты записывают вызовы без побочных действий."""
 
     changed = pyqtSignal()
+    deviceResolvedChanged = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -121,11 +141,12 @@ class FakeOnboarding(QObject):
             {"id": "", "name": "Системный по умолчанию"},
             {"id": "builtin", "name": "Встроенный микрофон"},
         ]
-        self._device: str = "builtin"
-        self._level: float = 0.6
+        self._device: str = ""
+        self._deviceResolved: str = "Встроенный микрофон"
+        self._level: float = 1.0
         self._peak: str = "−18 дБ"
         self._testDuration: str = "0,31 с"
-        self._testPhrase: str = "Сегодня хорошая погода"
+        self._testPhrase: str = "Сегодня хороший день для прогулки."
         self._testText: str = "Проверка связи, раз, два, три."
         self._testState: str = "done"
         self._testMessage: str = ""
@@ -317,6 +338,10 @@ class FakeOnboarding(QObject):
         self.changed.emit()
 
     device = pyqtProperty(str, _get_device, _set_device, notify=changed)
+
+    @pyqtProperty(str, notify=deviceResolvedChanged)
+    def deviceResolved(self) -> str:  # noqa: N802 — имя свойства для QML
+        return self._deviceResolved
 
     def _get_level(self) -> float:
         return self._level
@@ -782,6 +807,98 @@ def render_settings(app: Any, dark: bool, *, extra_wait_ms: int = 0) -> tuple[QI
             qInstallMessageHandler(previous)
 
 
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_show_section_only_navigates_to_available_pages(onboarding_app: Any, dark: bool) -> None:
+    messages: list[str] = []
+
+    def handler(_mode: Any, _context: Any, message: str) -> None:
+        messages.append(message)
+
+    previous = qInstallMessageHandler(handler)
+    engine = QQmlApplicationEngine()
+    app_info = FakeAppInfo()
+    theme = FakeTheme(dark)
+    try:
+        engine.rootContext().setContextProperty("appInfo", app_info)
+        engine.rootContext().setContextProperty("themeSource", theme)
+        engine.rootContext().setContextProperty("showOnboarding", False)
+        engine.load(QUrl.fromLocalFile(str(REPO / "qml/Main.qml")))
+        roots = engine.rootObjects()
+        assert len(roots) == 1, messages
+        window = roots[0]
+        assert isinstance(window, QQuickWindow)
+        sidebar = next(
+            item
+            for item in visual_tree(window.contentItem())
+            if item.metaObject().indexOfProperty("debugCurrent") >= 0
+        )
+        sections = sidebar.property("sections").toVariant()
+        assert [section["key"] for section in sections] == [
+            "general",
+            "models",
+            "output",
+            "network",
+            "advanced",
+            "about",
+        ]
+        assert window.property("sectionIndices").toVariant() == {
+            **{section["key"]: index for index, section in enumerate(sections)},
+            "debug": len(sections),
+        }
+
+        def visible_texts() -> set[str]:
+            return {
+                item.property("text")
+                for item in visual_tree(window.contentItem())
+                if item.isVisible() and isinstance(item.property("text"), str)
+            }
+
+        def show_section(section: str, expected_index: int) -> None:
+            window.hide()
+            assert not window.isVisible()
+            app_info.showSection.emit(section)
+            onboarding_app.processEvents()
+            assert window.isVisible()
+            assert sidebar.property("currentIndex") == expected_index
+
+        assert sidebar.property("currentIndex") == 0
+        unavailable = ("models", "output", "network", "advanced", "about", "unknown")
+        for section in unavailable:
+            show_section(section, 0)
+            assert "Диктовка, индикация и запуск" in visible_texts()
+
+        show_section("debug", len(sections))
+        assert sidebar.property("debugCurrent") is True
+        assert {
+            "Отладка",
+            "Скрытый раздел: Ctrl + Shift + D",
+            "Здесь будут сведения для поддержки",
+        } <= visible_texts()
+        assert "Диктовка, индикация и запуск" not in visible_texts()
+        assert "Горячая клавиша" not in visible_texts()
+        for section in unavailable:
+            show_section(section, len(sections))
+            assert "Здесь будут сведения для поддержки" in visible_texts()
+
+        show_section("general", 0)
+        assert {"Общие", "Диктовка, индикация и запуск", "Горячая клавиша"} <= visible_texts()
+        assert "Здесь будут сведения для поддержки" not in visible_texts()
+    finally:
+        try:
+            sip.delete(engine)
+            sip.delete(app_info)
+            sip.delete(theme)
+            onboarding_app.processEvents()
+        finally:
+            qInstallMessageHandler(previous)
+
+    # Qt/offscreen не реализует raise(); все остальные сообщения остаются ошибками.
+    assert_no_messages(
+        [message for message in messages if message != "This plugin does not support raise()"],
+        "showSection",
+    )
+
+
 def render_case(
     app: Any, step: int, dark: bool, *, extra_wait_ms: int = 0
 ) -> tuple[QImage, list[str]]:
@@ -1006,6 +1123,181 @@ def test_policy_locked_step1(onboarding_app: Any) -> None:
 
     _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
     assert_no_messages(messages, "policyLocked=True")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_mic_test_button_starts_and_stops_including_processing(
+    onboarding_app: Any, dark: bool
+) -> None:
+    fake = FakeOnboarding()
+    fake.step = 4
+
+    def inspect(root: Any) -> None:
+        for state in ("idle", "recording", "processing", "done", "error"):
+            fake.testState = state
+            onboarding_app.processEvents()
+            testing = state in ("recording", "processing")
+            text = "Остановить" if testing else "Тестовая диктовка"
+            buttons = [
+                item
+                for item in visual_tree(root)
+                if item.isVisible()
+                and item.property("text") == text
+                and item.metaObject().indexOfSignal(b"clicked()") >= 0
+            ]
+            assert len(buttons) == 1, state
+            assert buttons[0].isEnabled(), state
+            fake.calls.clear()
+            QMetaObject.invokeMethod(buttons[0], "clicked", Qt.DirectConnection)
+            assert fake.calls == ["stopTest" if testing else "startTest"], state
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "microphone test button")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_mic_card_with_resolved_default_device_is_57px(onboarding_app: Any, dark: bool) -> None:
+    fake = FakeOnboarding()
+    fake.step = 4
+
+    def inspect(root: Any) -> None:
+        row = next(item for item in visual_tree(root) if item.property("label") == "Микрофон")
+        assert row.property("sub") == "Встроенный микрофон"
+        assert row.height() == 55
+        assert row.parentItem().parentItem().height() == 57
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "resolved default microphone card height")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_mic_explanation_only_shows_resolved_default_device(
+    onboarding_app: Any, dark: bool
+) -> None:
+    fake = FakeOnboarding()
+    fake.step = 4
+    builtin = "Встроенный микрофон"
+    system_default = "Системный по умолчанию"
+
+    def inspect(root: Any) -> None:
+        row = next(item for item in visual_tree(root) if item.property("label") == "Микрофон")
+        selector = next(
+            item
+            for item in visual_tree(row)
+            if item.metaObject().indexOfProperty("currentText") >= 0
+        )
+        for device, resolved, selected, explanation in (
+            ("", builtin, system_default, builtin),
+            ("builtin", builtin, builtin, ""),
+            ("", "", system_default, ""),
+            ("", builtin, system_default, builtin),
+        ):
+            fake.device = device
+            fake._deviceResolved = resolved
+            fake.deviceResolvedChanged.emit()
+            onboarding_app.processEvents()
+            assert row.property("sub") == explanation
+            assert selector.property("currentText") == selected
+            texts = [
+                item.property("text")
+                for item in visual_tree(root)
+                if item.isVisible() and isinstance(item.property("text"), str)
+            ]
+            assert texts.count(system_default) == int(device == "")
+            assert texts.count(builtin) == int(bool(explanation) or device == "builtin")
+            assert any(
+                item.isVisible() and item.property("text") == selected
+                for item in visual_tree(selector)
+            )
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "resolved microphone explanation")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize("default_index", [0, 1, None], ids=["first", "second", "absent"])
+def test_mic_missing_device_displays_fallback_without_writing_bridge(
+    onboarding_app: Any, dark: bool, default_index: int | None
+) -> None:
+    fake = FakeOnboarding()
+    fake.step = 4
+    devices = [{"id": "builtin", "name": "Встроенный микрофон"}]
+    if default_index is not None:
+        devices.insert(default_index, {"id": "", "name": "Системный по умолчанию"})
+    fake.devices = devices
+    fake.device = "ghost-id"
+    explanation = "Выбранный раньше микрофон не найден — включён системный по умолчанию"
+
+    def inspect(root: Any) -> None:
+        selector = next(
+            item
+            for item in visual_tree(root)
+            if item.isVisible() and item.metaObject().indexOfProperty("currentText") >= 0
+        )
+        expected_index = default_index if default_index is not None else 0
+        assert selector.property("currentIndex") == expected_index
+        assert selector.property("currentText") == devices[expected_index]["name"]
+        assert any(
+            item.isVisible() and item.property("text") == devices[expected_index]["name"]
+            for item in visual_tree(selector)
+        )
+        assert any(
+            item.isVisible() and item.property("text") == explanation for item in visual_tree(root)
+        )
+        assert fake.device == "ghost-id"
+        assert fake.calls == []
+        row = next(item for item in visual_tree(root) if item.property("label") == "Микрофон")
+        assert row.property("sub") == ""
+
+        fake.device = "builtin"
+        onboarding_app.processEvents()
+        assert selector.property("currentText") == "Встроенный микрофон"
+        assert not any(
+            item.isVisible() and item.property("text") == explanation for item in visual_tree(root)
+        )
+        QTest.qWait(25)  # Дожидаемся кадра с обновлённой геометрией Column.
+        assert row.property("sub") == ""
+        assert row.parentItem().parentItem().height() == 50
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "missing microphone")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_mic_silence_is_only_reported_while_recording(onboarding_app: Any, dark: bool) -> None:
+    fake = FakeOnboarding()
+    fake.step = 4
+    fake.level = 0
+    fake.testText = ""
+    prompt = "Нажмите «Тестовая диктовка», чтобы проверить микрофон"
+    silence = "Звука с этого микрофона пока нет"
+    warning = "Микрофон молчит"
+
+    def inspect(root: Any) -> None:
+        for state, level in (
+            ("idle", 0),
+            ("recording", 0),
+            ("recording", 0.5),
+            ("processing", 0),
+            ("done", 0),
+            ("error", 0),
+            ("idle", 0),
+        ):
+            fake.testState = state
+            fake.level = level
+            onboarding_app.processEvents()
+            texts = {
+                item.property("text")
+                for item in visual_tree(root)
+                if item.isVisible() and isinstance(item.property("text"), str)
+            }
+            assert (prompt in texts) == (state == "idle"), (state, level)
+            silent_recording = state == "recording" and level == 0
+            assert (silence in texts) == silent_recording, (state, level)
+            assert (warning in texts) == silent_recording, (state, level)
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "microphone silence")
 
 
 def test_finish_calls_bridge(onboarding_app: Any) -> None:

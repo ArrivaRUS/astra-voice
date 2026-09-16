@@ -18,6 +18,7 @@ from astra_voice.core.capture_watchdog import CaptureFieldWatchdog
 from astra_voice.core.dictation import (
     TEST_BUSY,
     TEST_MODEL_UNAVAILABLE,
+    TEST_PREPARING,
     DictationOrchestrator,
     DictationPhase,
     MicrophoneTestUpdate,
@@ -72,6 +73,7 @@ log = logging.getLogger(__name__)
 # 157 мс. Для эталона 1,6 с ожидаем <1 с (F4.9); 3 с — аварийный запас для CPU.
 SELFCHECK_TIMEOUT_S = 3.0
 SELFCHECK_WATCHDOG_MS = 3000
+PREPARING_WATCHDOG_MS = 30_000
 REGRAB_INTERVAL_MS = 30000
 _NOTIFICATION_ACTIONS = (ACTION_CHOOSE_HOTKEY, ACTION_SHOW_DETAILS, ACTION_CHOOSE_MICROPHONE)
 
@@ -122,6 +124,8 @@ class DictationRuntime(QObject):
         self.session_kind = session_kind
         self.on_quit_requested: Callable[[], None] | None = None
         self.on_show_requested: Callable[[], None] | None = None
+        self._resolved_device = ""
+        self._on_device_resolved: Callable[[str], None] | None = None
         self._started = False
         self._closed = False
         self._loading_model = False
@@ -133,6 +137,7 @@ class DictationRuntime(QObject):
         self._selfcheck_timer: QTimer | None = None
         self._loaded_model: dict[str, str] = {}
         self._pending_test: tuple[str, TestCallback] | None = None
+        self._preparing_timer: QTimer | None = None
         self._model_load_ms: int | float | None = None
         self._supervisor_factory = supervisor_factory
         self._capture_watchdog_factory = capture_watchdog_factory
@@ -190,6 +195,7 @@ class DictationRuntime(QObject):
                 on_device_changed=notify.notify_microphone_changed,
                 on_device_lost=notify.notify_microphone_lost,
                 on_device_selected=notify.notify_microphone_selected,
+                on_device_resolved=self._device_resolved,
             )
             rollback.append(("оркестратор", self.orchestrator.shutdown))
             self.supervisor = supervisor_factory(on_event=self._on_worker_event, use_qt=True)
@@ -258,7 +264,9 @@ class DictationRuntime(QObject):
         # После установки на шаге 2 модель ещё может отсутствовать в живом воркере.
         # Сохраняем только выбранное устройство и адрес получателя, без речи.
         self._pending_test = (device, callback)
-        callback(MicrophoneTestUpdate("recording"))
+        self._cancel_preparing_timer()
+        self._preparing_timer = self.schedule(PREPARING_WATCHDOG_MS, self._preparing_watchdog)
+        callback(MicrophoneTestUpdate("preparing", message=TEST_PREPARING))
         if self._pending_test is not None and (not self._loading_model or not same_model):
             try:
                 self.restart_worker(wait_for_model=True)
@@ -268,6 +276,7 @@ class DictationRuntime(QObject):
 
     def stop_test(self) -> None:
         """Остановка не зависит от загрузки модели и блокировок начала диктовки."""
+        self._cancel_preparing_timer()
         if self._pending_test is not None:
             _, callback = self._pending_test
             self._pending_test = None
@@ -277,15 +286,45 @@ class DictationRuntime(QObject):
 
     def cancel_test(self) -> None:
         """Отменяет проверку при уходе с её экрана."""
+        self._cancel_preparing_timer()
         if self._pending_test is not None:
             self.stop_test()
         else:
             self.orchestrator.cancel_test()
 
+    def reload_model(self) -> None:
+        """Перезапускает воркер, если текущая модель ещё не загружена и проверена."""
+        try:
+            request = resolve_model_request(
+                self.settings, self.model_store, store_dir=paths.model_store_dir()
+            )
+        except Exception:
+            request = None
+        if (
+            request is not None
+            and request == self._model_load_request
+            and self._selfcheck == "ok"
+            and not self._loading_model
+        ):
+            log.info("Модель уже загружена и проверена; перезапуск воркера не требуется")
+            return
+        self.restart_worker(wait_for_model=True)
+
     def _fail_pending_test(self) -> None:
+        self._cancel_preparing_timer()
         pending, self._pending_test = self._pending_test, None
         if pending is not None:
             pending[1](MicrophoneTestUpdate("error", message=TEST_MODEL_UNAVAILABLE))
+
+    def _cancel_preparing_timer(self) -> None:
+        timer, self._preparing_timer = self._preparing_timer, None
+        if timer is not None:
+            self.cancel_timer(timer)
+
+    def _preparing_watchdog(self) -> None:
+        # schedule уже удалил сработавший таймер из набора и сам освободит его.
+        self._preparing_timer = None
+        self._fail_pending_test()
 
     def _recheck_model(self) -> None:
         """Жест пользователя начинает новую серию проверок после запрета."""
@@ -410,6 +449,7 @@ class DictationRuntime(QObject):
             log.info("модель загружена за %.0f мс", self._model_load_ms)
         else:
             log.info("модель загружена")
+        self._cancel_preparing_timer()
         pending, self._pending_test = self._pending_test, None
         if pending is not None:
             self.orchestrator.start_test(*pending)
@@ -598,6 +638,16 @@ class DictationRuntime(QObject):
                 self.pill.show_state(PillState.LOADING_MODEL)
             return
         self.orchestrator.on_hotkey_state(state, reason)
+
+    def _device_resolved(self, name: str) -> None:
+        self._resolved_device = name
+        if self._on_device_resolved is not None:
+            self._on_device_resolved(name)
+
+    def subscribe_device_resolved(self, callback: Callable[[str], None] | None) -> str:
+        """Заменяет подписчика и возвращает последнее известное имя микрофона."""
+        self._on_device_resolved = callback
+        return self._resolved_device
 
     def apply_pill_enabled(self, value: bool) -> None:
         """Меняет видимость индикатора и соответствующее состояние трея."""
@@ -844,6 +894,7 @@ class DictationRuntime(QObject):
         if self._closed:
             return
         self._closed = True
+        self._cancel_preparing_timer()
         if self._pending_test is not None:
             self.stop_test()
         if self._started:

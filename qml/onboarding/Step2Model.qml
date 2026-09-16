@@ -67,7 +67,9 @@ Item {
 
     RowLayout {
         id: fileRow
-        y: card.y + card.height + 4 // Макет 08-onboarding-2-model.html: отступ ряда под карточкой.
+        // В макете 08-onboarding-2-model.html margin-bottom карточки 8 px
+        // схлопывается с margin-top ряда 4 px: итоговый зазор — 8 px.
+        y: card.y + card.height + 8
         width: root.width
         Item { Layout.fillWidth: true }
         AvButton {

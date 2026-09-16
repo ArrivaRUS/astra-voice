@@ -648,6 +648,120 @@ def test_record_limit_stops_and_discards_extra(
     assert worker.buffers == {}
 
 
+@pytest.mark.parametrize(
+    "limit_s, count",
+    [
+        (None, int(LIMIT_S_DEFAULT * SAMPLE_RATE)),
+        (10, 10 * SAMPLE_RATE),
+        (10.0, 10 * SAMPLE_RATE),
+        (LIMIT_S_DEFAULT * 2, int(LIMIT_S_DEFAULT * SAMPLE_RATE)),
+        (1e308, int(LIMIT_S_DEFAULT * SAMPLE_RATE)),
+        (0, 1),
+        (-1e308, 1),
+        (0.5 / SAMPLE_RATE, 1),
+        (1.9 / SAMPLE_RATE, 1),
+    ],
+)
+def test_record_start_limit_stops_capture_without_gui(
+    factory: Factory, limit_s: int | float | None, count: int
+) -> None:
+    capture = Mock(spec=AudioCapture)
+    worker, engine, events = factory(capture=capture)
+    message: Message = {"type": "record.start", "utterance_id": "u1"}
+    if limit_s is not None:
+        message["limit_s"] = limit_s
+    assert worker.handle(decode(encode(message)[4:])) == []
+    capture.start.assert_called_once_with("u1", None)
+    worker.feed_audio("u1", repeat(0.25, count - 1))
+    assert_state(worker, State.recording)
+    assert events.empty()
+    capture.request_stop.assert_not_called()
+    worker.feed_audio("u1", [0.5, 1.0])
+    assert events.get_nowait() == {"type": "record.limit", "utterance_id": "u1"}
+    assert_state(worker, State.idle)
+    assert "u1" in worker._stopped
+    assert worker._recording is None
+    capture.request_stop.assert_called_once_with()
+    assert len(worker.buffers["u1"]) == count
+    assert worker.buffers["u1"][-1] == 0.5
+    worker.feed_audio("u1", [1.0])
+    assert len(worker.buffers["u1"]) == count
+    assert events.empty()
+    assert engine.transcribe_calls == 0
+    assert (
+        worker._record_limit_samples == worker._limit_samples == int(LIMIT_S_DEFAULT * SAMPLE_RATE)
+    )
+
+
+@pytest.mark.parametrize(
+    "finish",
+    ["record.stop", "record.cancel", "limit", "error", "recognize", "model.unload", "close"],
+)
+def test_record_limit_resets_when_recording_ends(factory: Factory, finish: str) -> None:
+    worker, engine, events = factory(FakeEngine(gate=Event()), limit_s=0.01)
+    assert worker.handle({"type": "record.start", "utterance_id": "u1", "limit_s": 0.005}) == []
+    worker.feed_audio("u1", [0.25, -0.5])
+    assert worker._record_limit_samples == 80
+    if finish == "limit":
+        worker.feed_audio("u1", repeat(0.25, 80))
+        assert events.get_nowait()["type"] == "record.limit"
+    elif finish == "error":
+        worker.on_error("u1", "audio-failed", "Ошибка захвата.")
+        assert events.get_nowait()["type"] == "error"
+    elif finish == "close":
+        worker.close()
+    else:
+        replies = command(worker, finish)
+        assert replies == (
+            [{"type": "cancelled", "utterance_id": "u1"}] if finish == "record.cancel" else []
+        )
+        if finish == "recognize":
+            assert engine.gate is not None
+            engine.gate.set()
+            assert events.get(timeout=2)["type"] == "result"
+    assert worker._record_limit_samples == worker._limit_samples == 160
+    if finish == "close":
+        return
+    # Старый GUI не присылает limit_s; следующая запись получает полный предел.
+    assert command(worker, "record.start", "u2") == []
+    worker.feed_audio("u2", repeat(0.5, 159))
+    assert_state(worker, State.recording)
+    assert events.empty()
+    worker.feed_audio("u2", [0.5, 1.0])
+    assert_state(worker, State.idle)
+    assert len(worker.buffers["u2"]) == 160
+    assert events.get_nowait() == {"type": "record.limit", "utterance_id": "u2"}
+
+
+def test_rejected_start_and_other_cancel_preserve_current_limit(factory: Factory) -> None:
+    worker, _, events = factory(limit_s=0.01)
+    start(worker, "old")
+    assert command(worker, "record.stop", "old") == []
+    assert worker.handle({"type": "record.start", "utterance_id": "u1", "limit_s": 0.005}) == []
+    assert command(worker, "record.start", "u2")[0]["code"] == "bad-state"
+    assert command(worker, "record.cancel", "old") == [{"type": "cancelled", "utterance_id": "old"}]
+    worker.feed_audio("u1", repeat(0.25, 160))
+    assert len(worker.buffers["u1"]) == 80
+    assert events.get_nowait() == {"type": "record.limit", "utterance_id": "u1"}
+
+
+def test_transcribe_file_keeps_default_limit_during_limited_recording(
+    factory: Factory, tmp_path: Path
+) -> None:
+    path = tmp_path / "recording.wav"
+    with wave.open(str(path), "wb") as wav:
+        wav.setparams((1, 2, SAMPLE_RATE, 0, "NONE", ""))
+        wav.writeframes(struct.pack("<h", 8192) * 160)
+    worker, engine, events = factory(limit_s=0.01)
+    assert worker.handle({"type": "record.start", "utterance_id": "u1", "limit_s": 0.005}) == []
+    assert worker.handle({"type": "transcribe.file", "path": str(path)}) == []
+    assert events.get(timeout=2)["type"] == "result"
+    assert engine.audios == [[0.25] * 160]
+    assert worker._record_limit_samples == 80
+    assert worker._limit_samples == 160
+    assert_state(worker, State.recording)
+
+
 def test_record_limit_requires_utterance_id() -> None:
     with pytest.raises(FrameError) as exc:
         encode({"type": "record.limit"})

@@ -64,7 +64,7 @@ def test_gui_dictation_commands_encode(runtime: DictationRuntime, extra: dict[st
     start = send.call_args.args[0]
     uid = start["utterance_id"]
     assert uid
-    expected = {"type": "record.start", "utterance_id": uid}
+    expected = {"type": "record.start", "utterance_id": uid, "limit_s": RECORD_LIMIT_S}
     if extra.get("device") == "av_test_src":
         expected["device"] = "av_test_src"
     assert start == expected
@@ -101,6 +101,48 @@ def test_record_start_with_explicit_none_is_rejected(runtime: DictationRuntime) 
     with pytest.raises(ipc.FrameError, match="Неверный тип поля device") as caught:
         ipc.encode(message)
     assert caught.value.code == ipc.BAD_FIELD
+
+
+@pytest.mark.parametrize("limit_s", [None, 10, 10.0, 120.0])
+def test_record_start_limit_round_trip(limit_s: int | float | None) -> None:
+    message: dict[str, Any] = {"type": "record.start", "utterance_id": "u1"}
+    if limit_s is not None:
+        message["limit_s"] = limit_s
+    frame = ipc.encode(message)
+    assert ipc.decode(frame[4:]) == message
+    assert ipc.FrameReader().feed(frame) == [message]
+
+
+@pytest.mark.parametrize("limit_s", [float("inf"), float("-inf"), float("nan"), "10", True, None])
+def test_record_start_invalid_limit_is_rejected(limit_s: object) -> None:
+    with pytest.raises(ipc.FrameError) as caught:
+        ipc.encode({"type": "record.start", "utterance_id": "u1", "limit_s": limit_s})
+    assert caught.value.code == ipc.BAD_FIELD
+
+
+@pytest.mark.parametrize("microphone_test", [False, True])
+def test_new_gui_record_start_is_accepted_by_old_worker_schema(
+    runtime: DictationRuntime, monkeypatch: pytest.MonkeyPatch, microphone_test: bool
+) -> None:
+    if microphone_test:
+        assert runtime.orchestrator.start_test("av_test_src", Mock())
+    else:
+        assert runtime.hotkey.on_state is not None
+        runtime.hotkey.on_state(HotkeyState.RECORDING, "press")
+    send = runtime.supervisor.send
+    assert isinstance(send, Mock)
+    message = send.call_args.args[0]
+    assert message["limit_s"] == (10.0 if microphone_test else 120.0)
+    frame = ipc.encode(message)
+    assert ipc.decode(frame[4:]) == message
+    # Старый воркер знает устройство, но молча отбрасывает новое поле предела.
+    monkeypatch.setitem(
+        ipc._SCHEMAS,
+        "record.start",
+        ipc._Schema({"utterance_id": (str,)}, optional={"device": (str,)}),
+    )
+    expected = {key: value for key, value in message.items() if key != "limit_s"}
+    assert ipc.FrameReader().feed(frame) == [expected]
 
 
 def test_model_load_encodes(tmp_path: Path) -> None:

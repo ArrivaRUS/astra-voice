@@ -35,8 +35,6 @@ Button {
         radius: Theme.buttonRadius
         antialiasing: true
         // По design/spec.md §4.1 у disabled ghost фон и граница как у secondary; opacity остаётся 1.
-        border.width: control.ghost && control.enabled ? 0 : Theme.buttonBorder
-        border.color: control.enabled ? (control.primary ? Theme.primary : Theme.border) : Theme.border
         color: {
             if (!control.enabled)
                 return Theme.bgSurface2;
@@ -48,6 +46,16 @@ Button {
             if (control.hovered)
                 return Theme.stateHoverOnSurface;
             return control.ghost ? "transparent" : Theme.bgSurface;
+        }
+
+        // Обводка поверх собственной заливки: иначе её альфа смешивается с фоном под кнопкой.
+        Rectangle {
+            anchors.fill: parent
+            color: "transparent"
+            radius: parent.radius
+            antialiasing: true
+            border.width: control.ghost && control.enabled ? 0 : Theme.buttonBorder
+            border.color: control.enabled ? (control.primary ? Theme.primary : Theme.border) : Theme.border
         }
 
         // Кольцо фокуса: 2 px снаружи, зазор 2, радиус 8 (сквозное правило 1).

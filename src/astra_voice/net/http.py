@@ -131,12 +131,29 @@ class _RequestWatchdog:
         self._connections: list[HTTPConnection] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._triggered = threading.Event()
         self._thread = threading.Thread(target=self._watch, name="http-request-watchdog")
         self._thread.start()
 
     def register(self, connection: HTTPConnection) -> None:
+        original_connect = connection.connect
+
+        def connect() -> None:
+            original_connect()
+            # Пул регистрирует соединение до появления сокета; сторож уже мог выйти.
+            with self._lock:
+                if self._triggered.is_set():
+                    sock = connection.sock
+                    if isinstance(sock, socket.socket):
+                        _shutdown_socket(sock)
+
+        connection.connect = connect
         with self._lock:
             self._connections.append(connection)
+            if self._triggered.is_set():
+                sock = connection.sock
+                if isinstance(sock, socket.socket):
+                    _shutdown_socket(sock)
 
     def _watch(self) -> None:
         while not self._stop.wait(_WATCHDOG_INTERVAL_S):
@@ -144,12 +161,12 @@ class _RequestWatchdog:
                 _remaining(self._deadline_at, self._cancel)
             except NetworkError:
                 with self._lock:
+                    self._triggered.set()
                     for connection in self._connections:
                         sock = connection.sock
                         if isinstance(sock, socket.socket):
                             _shutdown_socket(sock)
-                # При регистрации соединения сокета ещё нет. Продолжаем следить:
-                # он может появиться после отмены, в том числе после TLS-обёртки.
+                return
 
     def close(self) -> None:
         self._stop.set()
@@ -293,7 +310,7 @@ class StreamResponse:
             iterators = [chunks]
             while True:
                 if limit is not None:
-                    if limit == 0:
+                    if limit <= 0:
                         return
                     if limit < read_size:
                         # Размер хвоста задаём до чтения, не обрезаем уже прочитанное.

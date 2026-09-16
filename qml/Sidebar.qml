@@ -13,12 +13,12 @@ FocusScope {
     property bool debugCurrent: currentIndex === sections.length
 
     readonly property var sections: [
-        { "title": qsTr("Общие"), "icon": "cog", "counter": "" },
-        { "title": qsTr("Модели"), "icon": "chip", "counter": "3" },
-        { "title": qsTr("Вывод"), "icon": "out", "counter": "" },
-        { "title": qsTr("Сеть и обновления"), "icon": "refresh", "counter": "" },
-        { "title": qsTr("Продвинутые"), "icon": "sliders", "counter": "" },
-        { "title": qsTr("О программе"), "icon": "info", "counter": "" }
+        { "key": "general", "title": qsTr("Общие"), "icon": "cog", "counter": "" },
+        { "key": "models", "title": qsTr("Модели"), "icon": "chip", "counter": "3" },
+        { "key": "output", "title": qsTr("Вывод"), "icon": "out", "counter": "" },
+        { "key": "network", "title": qsTr("Сеть и обновления"), "icon": "refresh", "counter": "" },
+        { "key": "advanced", "title": qsTr("Продвинутые"), "icon": "sliders", "counter": "" },
+        { "key": "about", "title": qsTr("О программе"), "icon": "info", "counter": "" }
     ]
 
     implicitWidth: Theme.sidebarW

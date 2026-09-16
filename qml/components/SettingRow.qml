@@ -72,13 +72,14 @@ Item {
         anchors.bottomMargin: Theme.cardRowPaddingY
         spacing: Theme.statusbarGap
 
-        ColumnLayout {
+        // Column считает высоту текста без повторного расчёта вложенного Layout в Qt5.
+        Column {
             Layout.fillWidth: true
             Layout.alignment: Qt.AlignVCenter
             spacing: 2
 
             Text {
-                Layout.fillWidth: true
+                width: parent.width
                 verticalAlignment: Text.AlignVCenter
                 text: root.label
                 color: root.labelColor
@@ -93,7 +94,7 @@ Item {
             }
 
             Text {
-                Layout.fillWidth: true
+                width: parent.width
                 text: root.sub
                 visible: root.sub !== ""
                 color: root.subColor

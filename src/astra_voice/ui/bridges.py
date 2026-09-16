@@ -165,15 +165,24 @@ class ModelService:
         return self._downloader.download(entry, progress=progress, cancel=cancel)
 
     def install_from_staging(self, entry: Any) -> InstallResult:
-        return self._installer.install_from_staging(entry)
+        return self._installer.install_from_staging(entry, cancel=lambda: self._cancel.is_set())
 
     def install_from_path(self, source: Path, entry: Any) -> InstallResult:
-        return self._installer.install_from_path(source, entry)
+        return self._installer.install_from_path(
+            source, entry, cancel=lambda: self._cancel.is_set()
+        )
 
 
 def _megabytes(size_bytes: int, *, round_up: bool = False) -> str:
     value = size_bytes / 1_000_000
     return f"{math.ceil(value) if round_up else value:.0f} МБ"
+
+
+def _has_modifier(combo: str) -> bool:
+    return any(
+        part.strip().lower() in {"ctrl", "control", "alt", "meta", "super", "win"}
+        for part in combo.split("+")
+    )
 
 
 class _ModelJob(QObject):
@@ -382,10 +391,14 @@ class SettingsBridge(QObject):
             return
         if self._values[name] == value:
             return
-        if (name == "hotkeyMode" and value not in ("ptt", "toggle")) or (
-            name == "language" and value not in ("ru", "en")
+        if (
+            (name == "hotkeyMode" and value not in ("ptt", "toggle"))
+            or (name == "language" and value not in ("ru", "en"))
+            or (name == "hotkey" and not _has_modifier(cast(str, value)))
         ):
             log.warning("Недопустимое значение настройки %s", name)
+            if name == "hotkey":
+                self.hotkeyChanged.emit()
             return
         device_present = "device" in self._settings.extra
         old = (
@@ -573,6 +586,8 @@ class OnboardingHost(Protocol):
 
     def start_test(self, device: str, callback: TestCallback) -> bool: ...
 
+    def subscribe_device_resolved(self, callback: Callable[[str], None] | None) -> str: ...
+
     def stop_test(self) -> None: ...
 
     def cancel_test(self) -> None: ...
@@ -612,6 +627,7 @@ class OnboardingController(QObject):
     modelMessageChanged = pyqtSignal()
     devicesChanged = pyqtSignal()
     deviceChanged = pyqtSignal()
+    deviceResolvedChanged = pyqtSignal()
     levelChanged = pyqtSignal()
     peakChanged = pyqtSignal()
     testPhraseChanged = pyqtSignal()
@@ -641,6 +657,7 @@ class OnboardingController(QObject):
         self._bridge = bridge
         self._settings = settings
         self._host = host
+        self._resolved_device = ""
         self._model = model
         self._dialog_factory = dialog_factory
         self._devices = [{"id": "", "name": "Системный по умолчанию"}]
@@ -672,6 +689,7 @@ class OnboardingController(QObject):
         step = settings.extra.get("onboarding_step")
         self._step = step if type(step) is int and 1 <= step <= 5 else 1
         self._capture_state = "idle"
+        self._capture_hint: str = ""
         self._pending_combo = ""
         self._free_candidates: list[str] = []
         for name in (
@@ -685,6 +703,11 @@ class OnboardingController(QObject):
             getattr(bridge, name + "Changed").connect(getattr(self, name + "Changed").emit)
         bridge.extraChanged.connect(self._extra_changed)
         self.deviceChanged.connect(self._clear_test)
+        if host is not None:
+            try:
+                self._resolved_device = host.subscribe_device_resolved(self._device_resolved)
+            except Exception:
+                log.warning("Не удалось подписаться на имя открытого микрофона", exc_info=True)
         if "onboarding_language_set" not in settings.extra:
             self.setProperty(
                 "language", "ru" if os.environ.get("LANG", "").startswith("ru") else "en"
@@ -937,6 +960,11 @@ class OnboardingController(QObject):
     def shutdown(self) -> None:
         """Отменяет загрузку и пробное распознавание; ждёт поток не дольше пяти секунд."""
         self._shutting_down = True
+        if self._host is not None:
+            try:
+                self._host.subscribe_device_resolved(None)
+            except Exception:
+                log.warning("Не удалось снять подписку на имя открытого микрофона", exc_info=True)
         self._clear_test()
         self._model_cancel.set()
         if self._model_thread is not None:
@@ -967,6 +995,16 @@ class OnboardingController(QObject):
     @device.setter  # type: ignore[no-redef]
     def device(self, value: str) -> None:
         self._bridge.device = value
+
+    @pyqtProperty(str, notify=deviceResolvedChanged)
+    def deviceResolved(self) -> str:  # noqa: N802
+        return self._resolved_device
+
+    def _device_resolved(self, name: str) -> None:
+        if self._shutting_down or name == self._resolved_device:
+            return
+        self._resolved_device = name
+        self.deviceResolvedChanged.emit()
 
     @pyqtProperty(float, notify=levelChanged)
     def level(self) -> float:
@@ -1013,7 +1051,7 @@ class OnboardingController(QObject):
             if update.state == "done" and update.duration_s is not None
             else ""
         )
-        self._test_message = update.message if update.state == "error" else ""
+        self._test_message = update.message if update.state in ("error", "preparing") else ""
         if update.state == "recording" and update.peak_dbfs is not None:
             self._level = level_from_dbfs(update.peak_dbfs)
             if math.isfinite(update.peak_dbfs):
@@ -1057,7 +1095,7 @@ class OnboardingController(QObject):
             or self._step != 4
             or self._shutting_down
             or self.done
-            or self._test_state in ("recording", "processing")
+            or self._test_state in ("preparing", "recording", "processing")
         ):
             return
         self._clear_test()
@@ -1082,7 +1120,7 @@ class OnboardingController(QObject):
 
     @pyqtSlot()
     def stopTest(self) -> None:  # noqa: N802
-        if self._host is None or self._test_state not in ("recording", "processing"):
+        if self._host is None or self._test_state not in ("preparing", "recording", "processing"):
             return
         try:
             self._host.stop_test()
@@ -1151,7 +1189,7 @@ class OnboardingController(QObject):
 
     @pyqtProperty(str, notify=captureMessageChanged)
     def captureMessage(self) -> str:  # noqa: N802
-        return self._MESSAGES.get(self._capture_state, "")
+        return self._capture_hint or self._MESSAGES.get(self._capture_state, "")
 
     @pyqtProperty("QStringList", notify=freeCandidatesChanged)
     def freeCandidates(self) -> list[str]:  # noqa: N802
@@ -1165,9 +1203,16 @@ class OnboardingController(QObject):
         if state != self._capture_state:
             old_message = self.captureMessage
             self._capture_state = state
+            self._capture_hint = ""
             self.captureStateChanged.emit()
             if old_message != self.captureMessage:
                 self.captureMessageChanged.emit()
+
+    def _set_capture_hint(self, hint: str) -> None:
+        old_message = self.captureMessage
+        self._capture_hint = hint
+        if old_message != self.captureMessage:
+            self.captureMessageChanged.emit()
 
     def _set_pending_combo(self, combo: str) -> None:
         if combo != self._pending_combo:
@@ -1183,6 +1228,7 @@ class OnboardingController(QObject):
 
     @pyqtSlot()
     def beginCapture(self) -> None:  # noqa: N802
+        self._set_capture_hint("")
         self._set_pending_combo("")
         try:
             available = self._host is not None and self._host.begin_capture()
@@ -1201,6 +1247,11 @@ class OnboardingController(QObject):
         if not combo:
             self._set_capture_state("idle")
             return
+        if not _has_modifier(combo):
+            self._set_capture_state("capturing")
+            self._set_capture_hint("Добавьте к клавише Ctrl, Alt или Win")
+            self.refreshCandidates()
+            return
         self._set_capture_state("captured")
         try:
             code = self._host.probe(combo) if self._host is not None else "not-grabbed"
@@ -1217,6 +1268,7 @@ class OnboardingController(QObject):
     @pyqtSlot()
     def cancelCapture(self) -> None:  # noqa: N802
         self._end_capture()
+        self._set_capture_hint("")
         self._set_pending_combo("")
         self._set_capture_state("idle")
 

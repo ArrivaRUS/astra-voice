@@ -40,9 +40,6 @@ Rectangle {
     width: parent ? parent.width : implicitWidth
     height: implicitHeight
     radius: Theme.modelCardRadius
-    border.width: Theme.cardBorder
-    // design/spec.md §5.5: рекомендованную карточку отличает только бейдж.
-    border.color: installed ? Theme.accent : Theme.border
     color: installed ? Theme.accentBg : Theme.bgSurface
 
     // Inline components доступны в Qt 5.15 и не требуют записи в qmldir.
@@ -429,5 +426,17 @@ Rectangle {
                 }
             }
         }
+    }
+
+    // Как в SettingGroup: полупрозрачная обводка смешивается с заливкой карточки,
+    // а не с фоном окна. Rectangle поверх содержимого не перехватывает мышь.
+    Rectangle {
+        anchors.fill: parent
+        radius: parent.radius
+        color: "transparent"
+        border.width: Theme.cardBorder
+        // design/spec.md §5.5: рекомендованную карточку отличает только бейдж.
+        border.color: root.installed ? Theme.accent : Theme.border
+        antialiasing: true
     }
 }

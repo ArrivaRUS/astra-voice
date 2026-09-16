@@ -17,10 +17,7 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.unit
 REPO = Path(__file__).resolve().parents[2]
-QML_FILES = sorted((REPO / "qml/onboarding").glob("*.qml")) + [
-    REPO / "qml/sections/General.qml",
-    REPO / "qml/Main.qml",
-]
+QML_FILES = sorted((REPO / "qml").rglob("*.qml"))
 CONTEXTS = ("onboarding", "settingsBridge", "appInfo")
 IDENTIFIER = r"[A-Za-z_$][\w$]*"
 ALIAS = re.compile(
@@ -55,21 +52,17 @@ class QmlReference:
 
 
 def mask_string_contents(text: str) -> str:
-    """Прячем содержимое строк, сохраняя кавычки, позиции и номера строк."""
-    characters = list(text)
-    quote: str | None = None
-    escaped = False
-    for index, character in enumerate(text):
-        if quote is None:
-            if character in "\"'":
-                quote = character
-        elif not escaped and character == quote:
-            quote = None
-        else:
-            if character != "\n":
-                characters[index] = " "
-            escaped = not escaped and character == "\\"
-    return "".join(characters)
+    """Прячем строки и /* комментарии */, сохраняя позиции и номера строк.
+
+    Кавычки оставляем: пустая строка в вызове тоже считается аргументом.
+    """
+
+    def mask(match: re.Match[str]) -> str:
+        token = match.group()
+        hidden = "".join("\n" if char == "\n" else " " for char in token)
+        return token[0] + hidden[1:-1] + token[-1] if token[0] in "\"'" else hidden
+
+    return re.sub(r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|/\*.*?\*/""", mask, text, flags=re.DOTALL)
 
 
 def argument_count(text: str, opening: int) -> int:
@@ -92,15 +85,20 @@ def argument_count(text: str, opening: int) -> int:
     raise ValueError(f"нет закрывающей скобки вызова в позиции {opening}")
 
 
-def qml_references(path: Path) -> list[QmlReference]:
-    text = cast(str, qml_static.source(path))
-    code = mask_string_contents(text)
+def context_aliases(text: str, code: str) -> dict[str, str]:
     aliases = {context: context for context in CONTEXTS}
     aliases.update(
         (match["alias"], match["context"])
         for match in ALIAS.finditer(text)
         if code[match.start()] == "r"
     )
+    return aliases
+
+
+def qml_references(path: Path) -> list[QmlReference]:
+    text = cast(str, qml_static.source(path))
+    code = mask_string_contents(text)
+    aliases = context_aliases(text, code)
     names = "|".join(re.escape(name) for name in aliases)
     member = re.compile(
         rf"(?<![\w$.])(?:(?:root|window)\s*\.\s*)?"
@@ -125,6 +123,53 @@ def qml_references(path: Path) -> list[QmlReference]:
                 argument_count=count,
             )
         )
+    return references
+
+
+def direct_block_contents(code: str, opening: int) -> str:
+    """Тело Connections без вложенных блоков; сохраняем смещения и переносы."""
+    depth = 1
+    characters: list[str] = []
+    for character in code[opening + 1 :]:
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return "".join(characters)
+        characters.append(character if depth == 1 or character == "\n" else " ")
+    raise ValueError(f"нет закрывающей скобки Connections в позиции {opening}")
+
+
+def qml_signal_handlers(path: Path) -> list[QmlReference]:
+    text = cast(str, qml_static.source(path))
+    code = mask_string_contents(text)
+    aliases = context_aliases(text, code)
+    names = "|".join(re.escape(name) for name in aliases)
+    target = re.compile(
+        rf"\btarget\s*:\s*(?:(?:root|window)\s*\.\s*)?(?P<object>{names})"
+        rf"(?=\s*(?:;|\n|$))"
+    )
+    handler = re.compile(r"\bfunction\s+on(?P<signal>[A-Z][\w$]*)\s*\(")
+    references: list[QmlReference] = []
+    for connection in re.finditer(r"\bConnections\s*\{", code):
+        offset = connection.end()
+        body = direct_block_contents(code, offset - 1)
+        target_match = target.search(body)
+        if target_match is None:
+            # Connections к QML-объектам и null не относятся к мостам Python.
+            continue
+        for match in handler.finditer(body):
+            signal = match["signal"]
+            references.append(
+                QmlReference(
+                    path=path.relative_to(REPO),
+                    line=code.count("\n", 0, offset + match.start()) + 1,
+                    context=aliases[target_match["object"]],
+                    member=signal[0].lower() + signal[1:],
+                    argument_count=argument_count(body, match.end() - 1),
+                )
+            )
     return references
 
 
@@ -207,12 +252,126 @@ def test_qml_members_match_real_bridges(real_contracts: dict[str, MetaContract])
     assert not failures, "QML не соответствует метаобъектам мостов:\n" + "\n".join(failures)
 
 
+def signal_contract_error(reference: QmlReference, contract: MetaContract) -> str | None:
+    signals = [method for method in contract.methods if method.is_signal]
+    matching = [signal for signal in signals if signal.name == reference.member]
+    assert reference.argument_count is not None
+    if not matching:
+        reason = f"нет сигнала в {contract.class_name}"
+    elif not any(reference.argument_count <= signal.parameter_count for signal in matching):
+        expected = " или ".join(
+            str(count) for count in sorted({s.parameter_count for s in matching})
+        )
+        reason = (
+            f"у сигнала {contract.class_name} {expected} параметров, "
+            f"у обработчика {reference.argument_count}"
+        )
+    else:
+        return None
+    available = ", ".join(sorted(signal.signature for signal in signals)) or "нет"
+    return (
+        f"{reference.path}:{reference.line}: {reference.context}.{reference.member} — {reason}; "
+        f"доступные сигналы {contract.class_name}: {available}"
+    )
+
+
+def test_qml_signal_handlers_match_real_bridges(real_contracts: dict[str, MetaContract]) -> None:
+    failures = [
+        error
+        for path in QML_FILES
+        for reference in qml_signal_handlers(path)
+        if (error := signal_contract_error(reference, real_contracts[reference.context]))
+    ]
+    assert not failures, "Обработчики QML не соответствуют сигналам мостов:\n" + "\n".join(failures)
+
+
+@pytest.mark.parametrize(
+    ("target", "context"),
+    [
+        ("window.info", "appInfo"),
+        ("info", "appInfo"),
+        ("root.bridge", "onboarding"),
+        ("appInfo", "appInfo"),
+        ("onboarding", "onboarding"),
+        ("settingsBridge", "settingsBridge"),
+    ],
+)
+def test_signal_parser_resolves_targets_and_block_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str, context: str
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "REPO", tmp_path)
+    path = tmp_path / "Nested.qml"
+    text = """Item {
+    readonly property var info: (typeof appInfo !== "undefined") ? appInfo : null
+    readonly property var bridge: (typeof onboarding !== "undefined") ? onboarding : null
+    property string decoy: "Connections { target: appInfo; function onFake() {} }"
+    // Connections { target: appInfo; function onFake() {} }
+    /* Connections { target: appInfo; function onFake() { } */
+    Connections {
+        function onShowSection(section) {
+            if (section) { var text = "} target: onboarding {" }
+            function onNested(wrong, extra) {}
+        }
+        function onDebugChanged() {}
+        target: TARGET
+    }
+    Connections { target: localObject; function onUnrelated(a, b) {} }
+    Connections { target: null; function onUnrelated(a, b) {} }
+    Connections { target: appInfo; function onShowSection() {} }
+}""".replace("TARGET", target)
+    path.write_text(text, encoding="utf-8")
+    references = qml_signal_handlers(path)
+    assert [(ref.context, ref.member, ref.argument_count) for ref in references] == [
+        (context, "showSection", 1),
+        (context, "debugChanged", 0),
+        ("appInfo", "showSection", 0),
+    ]
+    assert all(ref.path == Path("Nested.qml") for ref in references)
+    assert [ref.line for ref in references] == [
+        number
+        for number, line in enumerate(text.splitlines(), 1)
+        if "function onShowSection" in line or "function onDebugChanged" in line
+    ]
+
+
+@pytest.mark.parametrize(
+    ("context", "signal", "count", "reason"),
+    [
+        ("appInfo", "showSection", 0, None),
+        ("appInfo", "showSection", 1, None),
+        ("appInfo", "showSection", 2, "у обработчика 2"),
+        ("appInfo", "showSectionX", 1, "нет сигнала"),
+        ("appInfo", "version", 0, "нет сигнала"),
+        ("settingsBridge", "retryHotkey", 0, "нет сигнала"),
+    ],
+)
+def test_signal_contract_checks_kind_and_parameter_count(
+    real_contracts: dict[str, MetaContract],
+    context: str,
+    signal: str,
+    count: int,
+    reason: str | None,
+) -> None:
+    reference = QmlReference(Path("qml/Example.qml"), 12, context, signal, count)
+    contract = real_contracts[context]
+    error = signal_contract_error(reference, contract)
+    if reason is None:
+        assert error is None
+    else:
+        assert error is not None
+        assert f"qml/Example.qml:12: {context}.{signal}" in error
+        assert reason in error
+        assert f"доступные сигналы {contract.class_name}:" in error
+        assert all(method.signature in error for method in contract.methods if method.is_signal)
+
+
 def test_xvfb_fakes_match_real_bridges(real_contracts: dict[str, MetaContract]) -> None:
     fakes = load_module("_qml_bridge_contract_fakes", REPO / "tests/xvfb/test_onboarding.py")
     failures: list[str] = []
     for fake, context in (
         (fakes.FakeOnboarding, "onboarding"),
         (fakes.FakeSettings, "settingsBridge"),
+        (fakes.FakeAppInfo, "appInfo"),
     ):
         declared = meta_contract(fake.staticMetaObject, own_only=True)
         real = real_contracts[context]
@@ -235,3 +394,28 @@ def test_xvfb_fakes_match_real_bridges(real_contracts: dict[str, MetaContract]) 
                 f"{declared.class_name}.{method.signature} — нет в {real.class_name}{detail}"
             )
     assert not failures, "Фейки xvfb не соответствуют метаобъектам мостов:\n" + "\n".join(failures)
+
+
+def test_app_info_fake_property_and_signal_signatures() -> None:
+    from astra_voice.app import _make_app_info
+    from astra_voice.core.policy import PolicyStatus
+    from astra_voice.platform.session import SessionKind
+
+    fakes = load_module("_qml_app_info_contract_fakes", REPO / "tests/xvfb/test_onboarding.py")
+    real = _make_app_info(SessionKind.OTHER, PolicyStatus.ABSENT.value)
+    real_meta = real.metaObject()
+    fake_meta = fakes.FakeAppInfo.staticMetaObject
+    assert meta_contract(fake_meta, own_only=True).properties == {"version", "sessionKind", "debug"}
+    for index in range(fake_meta.propertyOffset(), fake_meta.propertyCount()):
+        declared = fake_meta.property(index)
+        actual = real_meta.property(real_meta.indexOfProperty(declared.name()))
+        assert declared.typeName() == actual.typeName()
+        assert declared.isConstant() == actual.isConstant()
+        assert declared.isWritable() == actual.isWritable()
+        assert declared.notifySignal().methodSignature() == actual.notifySignal().methodSignature()
+    declared_methods = meta_contract(fake_meta, own_only=True).methods
+    assert {method.signature for method in declared_methods} == {
+        "debugChanged()",
+        "showSection(QString)",
+    }
+    assert set(declared_methods) <= set(meta_contract(real_meta, own_only=True).methods)

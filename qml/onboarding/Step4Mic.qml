@@ -23,6 +23,9 @@ Item {
     readonly property string testMessage: bridge ? bridge.testMessage : ""
     readonly property bool silent: level <= 0.02 // Порог «тишина» по заданию шага 4.
     readonly property bool testing: testState === "recording" || testState === "processing"
+    readonly property bool deviceMissing: device !== "" && deviceIndex(device) === -1
+    readonly property int selectedDeviceIndex: deviceIndex(device) >= 0 ? deviceIndex(device)
+        : deviceIndex("") >= 0 ? deviceIndex("") : 0
 
     // Без моста или устройств оставляем системный выбор с пустым идентификатором.
     function microphoneDevices() {
@@ -46,14 +49,6 @@ Item {
                 return i
         }
         return -1
-    }
-
-    // Пояснение содержит имя выбранного микрофона; для системного выбора оно пустое.
-    function deviceName(deviceId) {
-        if (deviceId === "")
-            return ""
-        var index = deviceIndex(deviceId)
-        return index >= 0 ? root.devices[index].name : ""
     }
 
     // Обратно в мост передаём идентификатор выбранного пункта, а не его имя.
@@ -112,12 +107,13 @@ Item {
             width: parent.width - Theme.cardBorder * 2
 
             SettingRow {
+                id: deviceRow
                 width: parent.width
                 divider: false
                 showHint: false
                 label: qsTr("Микрофон")
-                // design/spec.md §3.2: пояснение только при явном выборе устройства.
-                sub: root.deviceName(root.device)
+                // Для системного выбора поясняем, какой микрофон фактически используется.
+                sub: root.device === "" && root.bridge ? root.bridge.deviceResolved : ""
 
                 AvSelect {
                     id: deviceSelector
@@ -129,7 +125,7 @@ Item {
                     Binding {
                         target: deviceSelector
                         property: "currentIndex"
-                        value: root.deviceIndex(root.device)
+                        value: root.selectedDeviceIndex
                     }
 
                     onActivated: {
@@ -137,6 +133,22 @@ Item {
                             root.bridge.device = root.deviceIdAt(currentIndex)
                     }
                 }
+            }
+
+            Text {
+                x: Theme.cardRowPaddingX
+                width: parent.width - Theme.cardRowPaddingX * 2
+                visible: root.deviceMissing
+                height: visible ? implicitHeight : 0
+                bottomPadding: Theme.cardRowPaddingY
+                text: qsTr("Выбранный раньше микрофон не найден — включён системный по умолчанию")
+                color: Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+                lineHeightMode: Text.FixedHeight
+                renderType: Text.NativeRendering
+                wrapMode: Text.WordWrap
             }
         }
 
@@ -193,7 +205,8 @@ Item {
 
                 Text {
                     width: parent.width
-                    text: root.silent ? qsTr("Звука с этого микрофона пока нет")
+                    text: root.testState === "idle" ? qsTr("Нажмите «Тестовая диктовка», чтобы проверить микрофон")
+                        : root.testState === "recording" && root.silent ? qsTr("Звука с этого микрофона пока нет")
                         : root.peak !== "" ? qsTr("Пик %1 · уровень в норме").arg(root.peak) : ""
                     visible: text !== ""
                     height: visible ? implicitHeight : 0
@@ -210,11 +223,11 @@ Item {
             AvButton {
                 Layout.alignment: Qt.AlignVCenter
                 iconName: "chip"
-                text: root.testState === "recording" ? qsTr("Остановить") : qsTr("Тестовая диктовка")
-                enabled: root.testState !== "processing"
+                text: root.testing ? qsTr("Остановить") : qsTr("Тестовая диктовка")
+                enabled: true
                 onClicked: {
                     if (root.bridge) {
-                        if (root.testState === "recording")
+                        if (root.testing)
                             root.bridge.stopTest()
                         else
                             root.bridge.startTest()
@@ -238,7 +251,9 @@ Item {
         Text {
             id: resultText
             x: Theme.fieldPaddingX
-            y: Theme.fieldPaddingY
+            // FixedHeight оставляет leading снизу; CSS делит его пополам.
+            // Паддинг отсчитываем от внутренней стороны рамки, как в макете.
+            y: Theme.fieldBorder + Theme.fieldPaddingY + (lineHeight - resultFontMetrics.height) / 2
             width: parent.width - Theme.fieldPaddingX * 2
             text: root.testState === "recording"
                 ? (root.testPhrase !== "" ? qsTr("Слушаю… Скажите: «%1»").arg(root.testPhrase) : qsTr("Слушаю…"))
@@ -252,6 +267,11 @@ Item {
             renderType: Text.NativeRendering
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
+        }
+
+        FontMetrics {
+            id: resultFontMetrics
+            font: resultText.font
         }
 
         // Обводка рисуется поверх заливки: в тёмной теме Theme.border — 10 % белого.
@@ -278,12 +298,14 @@ Item {
             name: root.testState === "error" ? "alert" : "check"
             size: 12 // Макет: иконка строки итога.
             color: root.testState === "error" ? Theme.dangerInk : Theme.successInk
-            Layout.alignment: Qt.AlignVCenter
+            // Низ inline-иконки стоит на базовой линии подписи, как в CSS макета.
+            baselineOffset: height
+            Layout.alignment: Qt.AlignBaseline
         }
 
         Text {
             Layout.fillWidth: true
-            Layout.alignment: Qt.AlignVCenter
+            Layout.alignment: Qt.AlignBaseline
             text: root.testState === "error"
                 ? (root.testMessage !== "" ? root.testMessage : qsTr("Не удалось распознать — попробуйте ещё раз"))
                 : root.testDuration !== ""
@@ -301,7 +323,7 @@ Item {
 
     NoteBanner {
         id: silenceNote
-        visible: root.silent
+        visible: root.testState === "recording" && root.silent
         y: outcome.y + outcome.height + (visible ? 11 : 0) // Макет: margin-top .note.w.
         width: root.width
         height: visible ? implicitHeight : 0

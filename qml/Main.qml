@@ -22,15 +22,14 @@ ApplicationWindow {
     readonly property bool onboardingVisible: (typeof showOnboarding !== "undefined") ? showOnboarding === true : false
 
     // Ключи переходов из уведомлений соответствуют индексам сайдбара; «Отладка» — после основных разделов.
-    readonly property var sectionIndices: ({
-        "general": 0,
-        "models": 1,
-        "output": 2,
-        "network": 3,
-        "advanced": 4,
-        "about": 5,
-        "debug": sidebar.sections.length
-    })
+    readonly property var sectionIndices: {
+        var indices = {}
+        for (var i = 0; i < sidebar.sections.length; ++i)
+            indices[sidebar.sections[i].key] = i
+        indices.debug = sidebar.sections.length
+        return indices
+    }
+    readonly property var availableSections: ["general", "debug"]
 
     width: Theme.sizeWindowW
     height: Theme.sizeWindowMinH
@@ -45,10 +44,13 @@ ApplicationWindow {
 
     Connections {
         target: window.info
-        ignoreUnknownSignals: true
 
         function onShowSection(section) {
-            if (window.sectionIndices.hasOwnProperty(section))
+            window.show()
+            window.raise()
+            window.requestActivate()
+            if (window.availableSections.indexOf(section) !== -1
+                    && window.sectionIndices.hasOwnProperty(section))
                 sidebar.currentIndex = window.sectionIndices[section]
         }
     }
@@ -91,7 +93,7 @@ ApplicationWindow {
             spacing: 2
 
             Text {
-                text: qsTr("Общие")
+                text: sidebar.debugCurrent ? qsTr("Отладка") : qsTr("Общие")
                 color: Theme.fg
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontH2SectionSize
@@ -102,7 +104,8 @@ ApplicationWindow {
             }
 
             Text {
-                text: qsTr("Диктовка, индикация и запуск")
+                text: sidebar.debugCurrent ? qsTr("Скрытый раздел: Ctrl + Shift + D")
+                    : qsTr("Диктовка, индикация и запуск")
                 color: Theme.fgMuted
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSmallSize
@@ -124,7 +127,7 @@ ApplicationWindow {
             anchors.bottomMargin: Theme.spaceWindowContentBottom
             clip: true
             contentWidth: width
-            contentHeight: general.implicitHeight
+            contentHeight: sidebar.debugCurrent ? debugPlaceholder.implicitHeight : general.implicitHeight
             boundsBehavior: Flickable.StopAtBounds
 
             // Полоса поверх содержимого: ширины у колонки не отнимает, появляется только
@@ -155,6 +158,20 @@ ApplicationWindow {
             General {
                 id: general
                 width: body.width
+                visible: !sidebar.debugCurrent
+            }
+
+            Text {
+                id: debugPlaceholder
+                width: body.width
+                visible: sidebar.debugCurrent
+                text: qsTr("Здесь будут сведения для поддержки")
+                color: Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+                lineHeightMode: Text.FixedHeight
+                renderType: Text.NativeRendering
             }
         }
     }

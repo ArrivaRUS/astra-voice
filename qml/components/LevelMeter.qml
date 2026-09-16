@@ -25,8 +25,9 @@ Item {
                 // design/spec.md §8.3: тишина — 3 px, как в плоском состоянии макета.
                 if (root.silent || root.level <= 0)
                     return 3
-                // design/spec.md §8.3: высоты .lvl из макета 08-onboarding-4-mic.html — 1:1 в пикселях.
-                return Theme.micLevelMeterSampleLive[index]
+                // design/spec.md §8.3: высоты .lvl из макета 08-onboarding-4-mic.html
+                // масштабируются по уровню (1:1 при level = 1), минимум — 3 px.
+                return Math.max(3, Math.round(Theme.micLevelMeterSampleLive[index] * root.level))
             }
             radius: Theme.micLevelMeterBarRadius
             color: root.silent ? Theme.micLevelMeterColorFlat : Theme.micLevelMeterColorLive

@@ -44,7 +44,7 @@ TEST_RECORD_LIMIT_MS = 10000
 class MicrophoneTestUpdate:
     """Частный результат для экрана микрофона; text нельзя передавать другим портам."""
 
-    state: Literal["idle", "recording", "processing", "done", "error"]
+    state: Literal["idle", "preparing", "recording", "processing", "done", "error"]
     text: str = ""
     duration_s: float | None = None
     peak_dbfs: float | None = None
@@ -55,6 +55,7 @@ TestCallback = Callable[[MicrophoneTestUpdate], None]
 TEST_BUSY = "Сначала завершите текущую диктовку, затем попробуйте ещё раз."
 TEST_FAILED = "Не удалось распознать речь. Попробуйте ещё раз."
 TEST_MODEL_UNAVAILABLE = "Модель ещё не готова. Завершите её установку и попробуйте ещё раз."
+TEST_PREPARING = "Готовлю модель…"
 
 
 class DictationPhase(Enum):
@@ -130,6 +131,7 @@ class DictationOrchestrator:
         on_device_changed: Callable[[str], None] | None = None,
         on_device_lost: Callable[[], None] | None = None,
         on_device_selected: Callable[[str], None] | None = None,
+        on_device_resolved: Callable[[str], None] | None = None,
     ) -> None:
         self._send = send
         self._generation = generation
@@ -151,6 +153,8 @@ class DictationOrchestrator:
         self._on_device_changed = on_device_changed
         self._on_device_lost = on_device_lost
         self._on_device_selected = on_device_selected
+        self._on_device_resolved = on_device_resolved
+        self._resolved_device: str = ""
         self._announced_selected_device: str | None = None
         self._audio_opened = False
         self._announcement_generation: int | None = None
@@ -215,7 +219,7 @@ class DictationOrchestrator:
     def _finish_test(self, update: MicrophoneTestUpdate) -> None:
         callback, self._test_callback = self._test_callback, None
         self._cancel_timers()
-        self._phase = DictationPhase.IDLE
+        self._change_phase(DictationPhase.IDLE)
         self._set_recording(False)
         self._tray.set_state(TrayState.IDLE)
         if callback is not None:
@@ -231,11 +235,20 @@ class DictationOrchestrator:
         """Последняя непустая фраза только в памяти процесса."""
         return self._last_text
 
+    @property
+    def resolved_device(self) -> str:
+        """Имя действительно открытого микрофона; пусто, пока оно неизвестно."""
+        return self._resolved_device
+
     def reset_device_announcement(self) -> None:
         """Сбрасывает объявление при выборе в настройках или новом поколении воркера."""
         self._audio_opened = False
         self._announced_selected_device = None
         self._announcement_generation = self._generation()
+        if self._resolved_device:
+            self._resolved_device = ""
+            if self._on_device_resolved is not None:
+                self._on_device_resolved("")
 
     def _sync_device_generation(self) -> None:
         if self._announcement_generation != self._generation():
@@ -436,6 +449,17 @@ class DictationOrchestrator:
                 self._stop(recording_stopped=True)
 
     def _audio_ready(self, event: dict[str, Any]) -> None:
+        # Воркер передаёт системное описание, а не идентификатор из record_params.
+        device = event.get("device")
+        name = device.strip() if isinstance(device, str) else ""
+        if not name:
+            changed = event.get("changed")
+            if isinstance(changed, str) and ": " in changed:
+                name = changed.rpartition(": ")[2].strip()
+        if name and name != self._resolved_device:
+            self._resolved_device = name
+            if self._on_device_resolved is not None:
+                self._on_device_resolved(name)
         if self.test_active:
             return
         self._log.debug("диктовка: audio.ready")
@@ -445,13 +469,6 @@ class DictationOrchestrator:
         self._audio_opened = True
         if self._phase != DictationPhase.RECORDING:
             return
-        # Воркер передаёт системное описание, а не идентификатор из record_params.
-        device = event.get("device")
-        name = device.strip() if isinstance(device, str) else ""
-        if not name:
-            changed = event.get("changed")
-            if isinstance(changed, str) and ": " in changed:
-                name = changed.rpartition(": ")[2].strip()
         if not name:
             return
         # audio.ready приходит только при открытии, в том числе после долгих повторов.
@@ -720,10 +737,11 @@ class DictationOrchestrator:
         try:
             self._send(message, **kwargs)
         except Exception:
-            if not self.test_active:
-                self._log.warning(
-                    "диктовка: отправка команды %s не удалась", message.get("type"), exc_info=True
-                )
+            self._log.warning(
+                "диктовка: отправка команды %s не удалась",
+                message.get("type"),
+                exc_info=None if self.test_active else True,
+            )
             self._fail_recognition()
             return False
         return True

@@ -26,9 +26,12 @@ from astra_voice.core.dictation import (
     CANCEL_RESTART_MS,
     CANCEL_TIMEOUT_MS,
     RECOGNIZE_TIMEOUT_S,
+    TEST_MODEL_UNAVAILABLE,
+    TEST_PREPARING,
     DictationPhase,
     MicrophoneTestUpdate,
 )
+from astra_voice.core.model_source import resolve_model_request
 from astra_voice.core.settings import Settings, from_dict
 from astra_voice.models.catalog import CatalogEntry, FileSpec
 from astra_voice.models.installer import Installer, SmokeResult
@@ -319,6 +322,31 @@ def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_k
             ]
 
 
+def test_device_resolved_subscription_returns_current_and_replaces_subscriber(rig: Rig) -> None:
+    host = _RuntimeOnboardingHost(rig.runtime, Mock())
+    first, second = Mock(), Mock()
+    assert host.subscribe_device_resolved(first) == ""
+    first.assert_not_called()
+    rig.runtime.start()
+    rig.hotkey.fsm.press(rig.now)
+    rig.event(type="audio.ready", device="Встроенный микрофон")
+    first.assert_called_once_with("Встроенный микрофон")
+    assert host.subscribe_device_resolved(second) == "Встроенный микрофон"
+    second.assert_not_called()
+    rig.event(type="audio.ready", device="USB-гарнитура")
+    second.assert_called_once_with("USB-гарнитура")
+    first.assert_called_once_with("Встроенный микрофон")
+    rig.event(type="audio.ready", device="USB-гарнитура")
+    second.assert_called_once_with("USB-гарнитура")
+    assert host.subscribe_device_resolved(None) == "USB-гарнитура"
+    rig.event(type="audio.ready", device="Другой микрофон")
+    second.assert_called_once_with("USB-гарнитура")
+    assert host.subscribe_device_resolved(first) == "Другой микрофон"
+    rig.runtime.apply_device(None)
+    assert first.call_args_list == [call("Встроенный микрофон"), call("")]
+    assert host.subscribe_device_resolved(None) == ""
+
+
 @pytest.mark.parametrize("restart", ["explicit", "automatic"])
 @pytest.mark.parametrize("hello_before_record", [False, True])
 def test_microphone_announcement_follows_worker_generations(
@@ -332,6 +360,8 @@ def test_microphone_announcement_follows_worker_generations(
         return WorkerSupervisor(on_event=kwargs["on_event"], use_qt=False)
 
     rig = Rig(monkeypatch, from_dict({}), supervisor_factory=factory)
+    resolved = Mock()
+    assert rig.runtime.subscribe_device_resolved(resolved) == ""
 
     def event(message: dict[str, Any]) -> None:
         supervisor = rig.runtime.supervisor
@@ -366,6 +396,10 @@ def test_microphone_announcement_follows_worker_generations(
                 )
                 assert rig.notify.notify_microphone_selected.call_count == cycle + 1
                 rig.notify.notify_microphone_changed.assert_not_called()
+                assert rig.runtime.subscribe_device_resolved(resolved) == "USB-гарнитура"
+                assert resolved.call_args_list == [call("USB-гарнитура")] + [
+                    item for _ in range(cycle) for item in (call(""), call("USB-гарнитура"))
+                ]
     finally:
         rig.runtime.shutdown()
 
@@ -1525,6 +1559,7 @@ def test_settings_are_used_for_recording_and_paste(monkeypatch: pytest.MonkeyPat
         "type": "record.start",
         "utterance_id": message["utterance_id"],
         "device": "микрофон",
+        "limit_s": RECORD_LIMIT_S,
     }
     assert rig.supervisor.send.call_args.kwargs == {
         "timeout": RECORD_LIMIT_S + RECOGNIZE_TIMEOUT_S,
@@ -2040,6 +2075,93 @@ def checking_rig(monkeypatch: pytest.MonkeyPatch) -> Rig:
     rig.runtime._model_load_failures = 1
     rig.event(type="model.loaded", id="gigaam", revision="r3", engine_version="1.24.4", load_ms=123)
     return rig
+
+
+@pytest.mark.parametrize("through_host", [False, True])
+def test_reload_model_keeps_checked_model(
+    checking_rig: Rig, caplog: pytest.LogCaptureFixture, through_host: bool
+) -> None:
+    rig = checking_rig
+    rig.event(type="result", utterance_id="file", text="проверка")
+    assert rig.runtime._selfcheck == "ok"
+    assert not rig.runtime._loading_model
+    assert rig.runtime._model_load_request == resolve_model_request(
+        rig.runtime.settings, rig.runtime.model_store, store_dir=paths.model_store_dir()
+    )
+    supervisor_calls = list(rig.supervisor.mock_calls)
+    factory_calls = list(rig.supervisor_factory.mock_calls)
+    generation = rig.supervisor.generation
+    timers = list(rig.timers)
+
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        if through_host:
+            _RuntimeOnboardingHost(rig.runtime, Mock()).reload_model()
+        else:
+            rig.runtime.reload_model()
+
+    assert rig.supervisor.mock_calls == supervisor_calls
+    assert rig.supervisor_factory.mock_calls == factory_calls
+    assert rig.supervisor.generation == generation
+    assert rig.runtime._selfcheck == "ok"
+    assert not rig.runtime._loading_model
+    assert rig.timers == timers
+    assert "Модель уже загружена и проверена" in caplog.text
+    rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["changed", "not-loaded", "failed", "idle", "running", "loading", "no-model", "resolve-error"],
+)
+def test_reload_model_restarts_and_waits_for_model(
+    checking_rig: Rig, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    rig = checking_rig
+    rig.event(type="result", utterance_id="file", text="проверка")
+    if reason == "changed":
+        rig.runtime.settings = from_dict({"model_dir": "/tmp/other-model"})
+    elif reason == "not-loaded":
+        rig.runtime._model_load_request = None
+    elif reason in ("failed", "idle", "running"):
+        rig.runtime._selfcheck = reason
+    elif reason == "loading":
+        rig.runtime._loading_model = True
+    elif reason == "no-model":
+        rig.runtime.settings = Settings()
+        rig.runtime._model_load_request = None
+    elif reason == "resolve-error":
+        monkeypatch.setattr(module, "resolve_model_request", Mock(side_effect=RuntimeError))
+        rig.runtime._model_load_request = None
+    restart = Mock(wraps=rig.runtime.restart_worker)
+    monkeypatch.setattr(rig.runtime, "restart_worker", restart)
+    generation = rig.supervisor.generation
+    factory_count = rig.supervisor_factory.call_count
+    start_count = rig.supervisor.start.call_count
+    stop_count = rig.supervisor.stop.call_count
+    rig.supervisor.send.reset_mock()
+
+    rig.runtime.reload_model()
+
+    restart.assert_called_once_with(wait_for_model=True)
+    assert rig.supervisor_factory.call_count == factory_count + 1
+    assert rig.supervisor.start.call_count == start_count + 1
+    assert rig.supervisor.stop.call_count == stop_count + 1
+    assert rig.supervisor.generation == generation + 1
+    assert rig.runtime._loading_model
+    assert rig.runtime._selfcheck == "idle"
+    assert rig.runtime._model_load_generation is None
+    rig.supervisor.send.assert_not_called()
+    assert_recording_blocked(rig, loading=True)
+    if reason != "resolve-error":
+        rig.event(type="hello")
+        if reason == "no-model":
+            rig.supervisor.send.assert_not_called()
+        else:
+            request = resolve_model_request(
+                rig.runtime.settings, rig.runtime.model_store, store_dir=paths.model_store_dir()
+            )
+            rig.supervisor.send.assert_called_once_with(request, timeout=10.0)
+    rig.runtime.shutdown()
 
 
 def assert_selfcheck_log(
@@ -3388,7 +3510,10 @@ def test_microphone_waits_for_model_and_stop_is_allowed_before_hello(
     rig = microphone_runtime(monkeypatch)
     updates: list[MicrophoneTestUpdate] = []
     assert rig.runtime.start_test("chosen", updates.append)
-    assert str(updates[-1].state) == "recording"
+    assert updates == [MicrophoneTestUpdate("preparing", message=TEST_PREPARING)]
+    watchdog = rig.timers[-1]
+    assert watchdog.interval == module.PREPARING_WATCHDOG_MS == 30_000
+    assert watchdog.active
     send = Mock(wraps=rig.runtime.supervisor.send)
     monkeypatch.setattr(rig.runtime.supervisor, "send", send)
     rig.hotkey.fsm.press(rig.now)
@@ -3402,16 +3527,83 @@ def test_microphone_waits_for_model_and_stop_is_allowed_before_hello(
         rig.runtime.shutdown()
         assert str(updates[-1].state) == "idle"
         assert rig.runtime._pending_test is None
+        assert rig.runtime._preparing_timer is None
+        assert not watchdog.active
+        assert watchdog.deleted
+        previous = list(updates)
+        watchdog.fire()
+        watchdog.timeout.emit()
+        assert updates == previous
         return
+    if stop != "none":
+        assert rig.runtime._preparing_timer is None
+        assert not watchdog.active
+        assert watchdog.deleted
     microphone_model_ready(rig)
+    assert rig.runtime._preparing_timer is None
+    assert not watchdog.active
+    assert watchdog.deleted
+    previous = list(updates)
+    watchdog.fire()
+    watchdog.timeout.emit()
+    assert updates == previous
     types = [item.args[0]["type"] for item in send.call_args_list]
     assert types == ["model.load", "transcribe.file"] + (["record.start"] if stop == "none" else [])
     if stop == "none":
+        assert [update.state for update in updates] == ["preparing", "recording"]
         assert send.call_args.args[0]["device"] == "chosen"
         rig.runtime.stop_test()
         assert send.call_args.args[0]["type"] == "recognize"
     else:
         assert str(updates[-1].state) == "idle"
+    rig.runtime.shutdown()
+
+
+def test_microphone_preparing_watchdog_reports_error_and_ignores_late_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = microphone_runtime(monkeypatch)
+    updates: list[MicrophoneTestUpdate] = []
+    assert rig.runtime.start_test("chosen", updates.append)
+    watchdog = rig.timers[-1]
+    assert watchdog.interval == 30_000
+    assert watchdog.single_shot
+    watchdog.fire()
+    assert updates == [
+        MicrophoneTestUpdate("preparing", message=TEST_PREPARING),
+        MicrophoneTestUpdate("error", message=TEST_MODEL_UNAVAILABLE),
+    ]
+    assert rig.runtime._pending_test is None
+    assert rig.runtime._preparing_timer is None
+    assert watchdog.deleted
+    assert watchdog not in rig.runtime.timers
+    previous = list(updates)
+    watchdog.timeout.emit()
+    microphone_model_ready(rig)
+    assert updates == previous
+    assert not rig.runtime.orchestrator.test_active
+    rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("stop", ["stop_test", "cancel_test"])
+def test_microphone_repeated_preparation_ignores_previous_watchdog(
+    monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
+    rig = microphone_runtime(monkeypatch)
+    updates: list[MicrophoneTestUpdate] = []
+    assert rig.runtime.start_test("first", updates.append)
+    first = rig.timers[-1]
+    getattr(rig.runtime, stop)()
+    updates.clear()
+    assert rig.runtime.start_test("second", updates.append)
+    second = rig.timers[-1]
+    assert second is not first
+    assert second.active
+    first.timeout.emit()
+    assert updates == [MicrophoneTestUpdate("preparing", message=TEST_PREPARING)]
+    assert second.active
+    second.fire()
+    assert updates[-1] == MicrophoneTestUpdate("error", message=TEST_MODEL_UNAVAILABLE)
     rig.runtime.shutdown()
 
 
@@ -3422,6 +3614,7 @@ def test_microphone_model_preparation_reports_plain_error(
     rig = microphone_runtime(monkeypatch, model=failure != "no-model")
     updates: list[MicrophoneTestUpdate] = []
     rig.runtime.start_test("", updates.append)
+    watchdog = rig.timers[-1] if failure != "no-model" else None
     microphone_runtime_event(rig, ipc.make_hello())
     if failure == "load":
         microphone_runtime_event(
@@ -3450,6 +3643,13 @@ def test_microphone_model_preparation_reports_plain_error(
     assert updates[-1].message
     assert MARKER not in updates[-1].message
     assert rig.runtime._pending_test is None
+    assert rig.runtime._preparing_timer is None
+    if watchdog is not None:
+        assert not watchdog.active
+        assert watchdog.deleted
+        previous = list(updates)
+        watchdog.timeout.emit()
+        assert updates == previous
     rig.runtime.shutdown()
 
 
@@ -3500,10 +3700,11 @@ def test_microphone_loads_model_installed_in_wizard_before_finish(
     install("r2")
     updates: list[MicrophoneTestUpdate] = []
     assert rig.runtime.start_test("selected-mic", updates.append)
-    assert updates[-1] == MicrophoneTestUpdate("recording")
+    assert updates == [MicrophoneTestUpdate("preparing", message=TEST_PREPARING)]
     send = Mock(wraps=rig.runtime.supervisor.send)
     monkeypatch.setattr(rig.runtime.supervisor, "send", send)
     microphone_model_ready(rig)
+    assert updates[-1] == MicrophoneTestUpdate("recording")
     requests = [item.args[0] for item in send.call_args_list]
     assert [request["type"] for request in requests] == [
         "model.load",

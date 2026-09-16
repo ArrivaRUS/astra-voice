@@ -1472,6 +1472,13 @@ def test_stream_errors_close_connection(
 def test_proxy_manager_preserves_pool_classes_and_caches_subclasses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Подклассы пулов строятся от классов самого менеджера.
+
+    Раньше proxy_manager_for затирал pool_classes_by_scheme менеджера классами
+    адаптера. Это ломало urllib3.contrib.socks.SOCKSProxyManager: он восстанавливает
+    свои SOCKSHTTPConnectionPool/SOCKSHTTPSConnectionPool после super().__init__,
+    а наша подмена их стирала.
+    """
     from urllib3 import HTTPConnectionPool, HTTPSConnectionPool
 
     class CustomHTTPPool(HTTPConnectionPool):
@@ -1519,23 +1526,71 @@ def test_proxy_manager_preserves_pool_classes_and_caches_subclasses(
         adapter.close()
 
 
-def test_proxy_manager_preserves_socks_pool_classes() -> None:
-    pytest.importorskip("socks")
-    from urllib3.contrib.socks import (
-        SOCKSHTTPConnectionPool,
-        SOCKSHTTPSConnectionPool,
-        SOCKSProxyManager,
-    )
+@pytest.mark.parametrize("trigger", ["cancel", "deadline"])
+def test_request_watchdog_shuts_down_late_connection(trigger: str) -> None:
+    import socket
 
-    adapter = http._RequestAdapter(Mock(spec=http._RequestWatchdog))
-    try:
-        manager = adapter.proxy_manager_for("socks5://127.0.0.1:1080")
-        assert isinstance(manager, SOCKSProxyManager)
-        assert issubclass(manager.pool_classes_by_scheme["http"], SOCKSHTTPConnectionPool)
-        assert issubclass(manager.pool_classes_by_scheme["https"], SOCKSHTTPSConnectionPool)
-        registered_classes = manager.pool_classes_by_scheme.copy()
-        assert adapter.proxy_manager_for("socks5://127.0.0.1:1080") is manager
-        for scheme, pool_class in registered_classes.items():
-            assert manager.pool_classes_by_scheme[scheme] is pool_class
-    finally:
-        adapter.close()
+    from urllib3.connection import HTTPConnection
+
+    sock, peer = socket.socketpair()
+    with sock, peer:
+        sock.settimeout(1)
+        peer.settimeout(1)
+        sock.sendall(b"live")
+        assert peer.recv(4) == b"live"
+        cancel = threading.Event()
+        if trigger == "cancel":
+            cancel.set()
+        deadline_at = time.monotonic() + (60 if trigger == "cancel" else -1)
+        watchdog = http._RequestWatchdog(deadline_at, cancel)
+        try:
+            assert watchdog._triggered.wait(1)
+            watchdog._thread.join(timeout=1)
+            assert not watchdog._thread.is_alive()
+            connection = HTTPConnection("example.com")
+            connection.sock = sock
+            watchdog.register(connection)
+            assert peer.recv(1) == b""
+            assert sock.recv(1) == b""
+        finally:
+            watchdog.close()
+
+
+@pytest.mark.parametrize("trigger", ["cancel", "deadline"])
+def test_request_watchdog_shuts_down_socket_connected_after_trigger(
+    trigger: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+
+    from urllib3.connection import HTTPConnection
+
+    sock, peer = socket.socketpair()
+    with sock, peer:
+        sock.settimeout(1)
+        peer.settimeout(1)
+        connection = HTTPConnection("example.com")
+
+        def connect() -> None:
+            sock.sendall(b"live")
+            assert peer.recv(4) == b"live"
+            connection.sock = sock
+
+        monkeypatch.setattr(connection, "connect", connect)
+        cancel = threading.Event()
+        watchdog = http._RequestWatchdog(time.monotonic() + 60, cancel)
+        try:
+            assert connection.sock is None
+            watchdog.register(connection)
+            if trigger == "cancel":
+                cancel.set()
+            else:
+                with watchdog._lock:
+                    watchdog._deadline_at = time.monotonic() - 1
+            assert watchdog._triggered.wait(1)
+            watchdog._thread.join(timeout=1)
+            assert not watchdog._thread.is_alive()
+            connection.connect()
+            assert peer.recv(1) == b""
+            assert sock.recv(1) == b""
+        finally:
+            watchdog.close()

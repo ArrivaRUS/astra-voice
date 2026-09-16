@@ -560,3 +560,35 @@ def test_entry_and_revocation(catalog_root: Path, document: dict[str, Any]) -> N
     assert result.is_revoked(MODEL_ID, "another-revision") is False
     assert result.is_revoked("another-model", REVISION) is False
     assert result.is_revoked("another-model", "another-revision") is False
+
+
+def test_validate_type_error_is_catalog_schema_mismatch(
+    catalog_root: Path, document: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import jsonschema
+
+    validate = Mock(side_effect=TypeError("invalid document"))
+    monkeypatch.setattr(jsonschema.Draft202012Validator, "validate", validate)
+
+    with pytest.raises(CatalogError) as error:
+        load_builtin(StubVerifier(), root=catalog_root)
+
+    validate.assert_called_once_with(document)
+    assert error.value.code == "bad-schema"
+    assert error.value.message == "Каталог не соответствует схеме."
+
+
+def test_validate_attribute_error_is_catalog_schema_mismatch(
+    catalog_root: Path, document: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import jsonschema
+
+    validate = Mock(side_effect=AttributeError("invalid document"))
+    monkeypatch.setattr(jsonschema.Draft202012Validator, "validate", validate)
+
+    with pytest.raises(CatalogError) as error:
+        load_builtin(StubVerifier(), root=catalog_root)
+
+    validate.assert_called_once_with(document)
+    assert error.value.code == "bad-schema"
+    assert error.value.message == "Каталог не соответствует схеме."
