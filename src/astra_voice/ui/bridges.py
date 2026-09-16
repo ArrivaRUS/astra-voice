@@ -1039,12 +1039,11 @@ class OnboardingController(QObject):
 
     def _clear_test(self) -> None:
         self._test_epoch += 1
-        active = self._test_state in ("recording", "processing")
         self._test_updated(MicrophoneTestUpdate("idle"))
         if self._peak:
             self._peak = ""
             self.peakChanged.emit()
-        if active and self._host is not None:
+        if self._host is not None:
             try:
                 self._host.cancel_test()
             except Exception:
@@ -1074,6 +1073,11 @@ class OnboardingController(QObject):
         try:
             self._host.start_test(self.device, receive)
         except Exception:
+            try:
+                self._host.cancel_test()
+            except Exception:
+                # Даже текст исключения может содержать речь — не журналируем его.
+                pass
             receive(MicrophoneTestUpdate("error", message=TEST_FAILED))
 
     @pyqtSlot()

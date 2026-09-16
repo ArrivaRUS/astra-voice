@@ -15,7 +15,7 @@ from urllib.parse import urljoin, urlsplit
 
 import requests
 from urllib3 import HTTPConnectionPool, HTTPSConnectionPool, ProxyManager
-from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connection import HTTPConnection
 from urllib3.exceptions import ReadTimeoutError
 
 from astra_voice.net.gate import NetworkGate, NetworkKind
@@ -160,25 +160,38 @@ class _RequestAdapter(requests.adapters.HTTPAdapter):
     """Регистрирует соединения до connect/request/getresponse, включая прокси."""
 
     def __init__(self, watchdog: _RequestWatchdog) -> None:
-        class HTTPPool(HTTPConnectionPool):
+        self._watchdog = watchdog
+        self._registering_classes: dict[type[HTTPConnectionPool], type[HTTPConnectionPool]] = {}
+        super().__init__()
+        # Меняем словарь только этого менеджера, не глобальный словарь urllib3.
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": self._registering(HTTPConnectionPool, watchdog),
+            "https": self._registering(HTTPSConnectionPool, watchdog),
+        }
+
+    def _registering(
+        self, cls: type[HTTPConnectionPool], watchdog: _RequestWatchdog
+    ) -> type[HTTPConnectionPool]:
+        if cls in self._registering_classes:
+            return self._registering_classes[cls]
+
+        class RegisteringPool(cls):
             def _new_conn(self) -> HTTPConnection:
                 connection: HTTPConnection = super()._new_conn()
                 watchdog.register(connection)
                 return connection
 
-        class HTTPSPool(HTTPSConnectionPool):
-            def _new_conn(self) -> HTTPSConnection:
-                connection: HTTPSConnection = super()._new_conn()
-                watchdog.register(connection)
-                return connection
-
-        super().__init__()
-        # Меняем словарь только этого менеджера, не глобальный словарь urllib3.
-        self.poolmanager.pool_classes_by_scheme = {"http": HTTPPool, "https": HTTPSPool}
+        self._registering_classes[cls] = RegisteringPool
+        # Менеджер может повторно вернуть уже обёрнутый класс.
+        self._registering_classes[RegisteringPool] = RegisteringPool
+        return RegisteringPool
 
     def proxy_manager_for(self, proxy: str, **proxy_kwargs: object) -> ProxyManager:
         manager: ProxyManager = super().proxy_manager_for(proxy, **proxy_kwargs)
-        manager.pool_classes_by_scheme = self.poolmanager.pool_classes_by_scheme
+        manager.pool_classes_by_scheme = {
+            scheme: self._registering(cls, self._watchdog)
+            for scheme, cls in manager.pool_classes_by_scheme.items()
+        }
         return manager
 
 

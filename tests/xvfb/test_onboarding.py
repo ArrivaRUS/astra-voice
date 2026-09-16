@@ -912,6 +912,88 @@ def test_capture_states_render(state: str, onboarding_app: Any) -> None:
     assert_no_messages(messages, f"captureState={state}")
 
 
+@pytest.mark.parametrize(
+    ("key", "modifiers", "accepted_modifiers"),
+    [
+        (Qt.Key_Space, Qt.NoModifier, Qt.ControlModifier),
+        (Qt.Key_A, Qt.NoModifier, Qt.ControlModifier),
+        (Qt.Key_5, Qt.NoModifier, Qt.ControlModifier),
+        (Qt.Key_F5, Qt.NoModifier, Qt.ControlModifier),
+        (Qt.Key_A, Qt.ShiftModifier, Qt.ControlModifier | Qt.ShiftModifier),
+        (Qt.Key_Space, Qt.ShiftModifier, Qt.AltModifier),
+        (Qt.Key_F5, Qt.ShiftModifier, Qt.MetaModifier),
+    ],
+    ids=["space", "letter", "digit", "f5", "shift-letter", "shift-space", "shift-f5"],
+)
+def test_capture_requires_ctrl_alt_or_win(
+    key: Any, modifiers: Any, accepted_modifiers: Any, onboarding_app: Any
+) -> None:
+    fake = FakeOnboarding()
+    fake.step = 3
+    fake.captureState = "capturing"
+
+    def inspect(root: Any) -> None:
+        view = root.window()
+        assert isinstance(view, QQuickView)
+        capture = next(item for item in visual_tree(root) if item.property("captureActive"))
+        assert capture.hasActiveFocus()
+        QTest.keyClick(view, key, modifiers)
+        onboarding_app.processEvents()
+        assert "endCapture" not in fake.calls
+        assert fake.captureState == capture.property("state7") == "capturing"
+        hint = next(
+            item
+            for item in visual_tree(root)
+            if item.property("text") == "Удерживайте Ctrl, Alt или Win и нажмите клавишу"
+        )
+        assert hint.isVisible() and hint.height() > 0
+
+        QTest.keyClick(view, key, accepted_modifiers)
+        onboarding_app.processEvents()
+        assert fake.calls == ["endCapture"]
+        assert hint.property("text") == ""
+        assert not hint.isVisible() and hint.height() == 0
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, "capture requires Ctrl/Alt/Win")
+
+
+def test_capture_ignores_other_keys_and_clears_hint_on_exit(onboarding_app: Any) -> None:
+    fake = FakeOnboarding()
+    fake.step = 3
+    fake.captureState = "capturing"
+
+    def inspect(root: Any) -> None:
+        view = root.window()
+        assert isinstance(view, QQuickView)
+        capture = next(item for item in visual_tree(root) if item.property("captureActive"))
+        assert capture.hasActiveFocus()
+        for key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta, Qt.Key_Comma):
+            QTest.keyClick(view, key, Qt.NoModifier)
+            onboarding_app.processEvents()
+            assert fake.calls == []
+            assert capture.property("captureHint") == ""
+            assert capture.property("state7") == "capturing"
+
+        QTest.keyClick(view, Qt.Key_Space, Qt.NoModifier)
+        assert capture.property("captureHint") != ""
+        assert fake.calls == []
+        QTest.keyClick(view, Qt.Key_Escape, Qt.NoModifier)
+        assert fake.calls == ["cancelCapture"]
+        # Фейк только записывает вызов; переход состояния задаём как ответ моста.
+        fake.captureState = "idle"
+        onboarding_app.processEvents()
+        assert capture.property("captureActive") is False
+        assert capture.property("captureHint") == ""
+        fake.captureState = "capturing"
+        onboarding_app.processEvents()
+        assert capture.property("captureActive") is True
+        assert capture.property("captureHint") == ""
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, "capture ignored keys and exit")
+
+
 def test_policy_locked_step1(onboarding_app: Any) -> None:
     fake = FakeOnboarding()
     fake.policyLocked = True

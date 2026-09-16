@@ -1467,3 +1467,75 @@ def test_stream_errors_close_connection(
     raw.close.assert_called_once()
     received.close.assert_called_once()
     sessions[0].close.assert_called_once()
+
+
+def test_proxy_manager_preserves_pool_classes_and_caches_subclasses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from urllib3 import HTTPConnectionPool, HTTPSConnectionPool
+
+    class CustomHTTPPool(HTTPConnectionPool):
+        marker = "custom-http"
+
+    class CustomHTTPSPool(HTTPSConnectionPool):
+        marker = "custom-https"
+
+    original_classes: dict[str, type[HTTPConnectionPool]] = {
+        "http": CustomHTTPPool,
+        "https": CustomHTTPSPool,
+    }
+    manager = SimpleNamespace(pool_classes_by_scheme=original_classes)
+    monkeypatch.setattr(
+        requests.adapters.HTTPAdapter, "proxy_manager_for", Mock(return_value=manager)
+    )
+    watchdog = Mock(spec=http._RequestWatchdog)
+    adapter = http._RequestAdapter(watchdog)
+    try:
+        assert adapter.proxy_manager_for("http://proxy.example:3128") is manager
+        registered_classes = manager.pool_classes_by_scheme.copy()
+        for scheme, original_class in original_classes.items():
+            pool_class = registered_classes[scheme]
+            assert pool_class is not original_class
+            assert issubclass(pool_class, original_class)
+            assert pool_class.marker == original_class.marker
+            assert not issubclass(pool_class, adapter.poolmanager.pool_classes_by_scheme[scheme])
+
+        assert adapter.proxy_manager_for("http://proxy.example:3128") is manager
+        for scheme, pool_class in registered_classes.items():
+            assert manager.pool_classes_by_scheme[scheme] is pool_class
+
+        # Кеш работает и для исходного класса, и для уже обёрнутого.
+        manager.pool_classes_by_scheme = original_classes
+        adapter.proxy_manager_for("http://proxy.example:3128")
+        for scheme, pool_class in registered_classes.items():
+            assert manager.pool_classes_by_scheme[scheme] is pool_class
+            with pool_class("example.com") as pool:
+                connection = pool._new_conn()
+                watchdog.register.assert_called_once_with(connection)
+                watchdog.register.reset_mock()
+                connection.close()
+        assert original_classes == {"http": CustomHTTPPool, "https": CustomHTTPSPool}
+    finally:
+        adapter.close()
+
+
+def test_proxy_manager_preserves_socks_pool_classes() -> None:
+    pytest.importorskip("socks")
+    from urllib3.contrib.socks import (
+        SOCKSHTTPConnectionPool,
+        SOCKSHTTPSConnectionPool,
+        SOCKSProxyManager,
+    )
+
+    adapter = http._RequestAdapter(Mock(spec=http._RequestWatchdog))
+    try:
+        manager = adapter.proxy_manager_for("socks5://127.0.0.1:1080")
+        assert isinstance(manager, SOCKSProxyManager)
+        assert issubclass(manager.pool_classes_by_scheme["http"], SOCKSHTTPConnectionPool)
+        assert issubclass(manager.pool_classes_by_scheme["https"], SOCKSHTTPSConnectionPool)
+        registered_classes = manager.pool_classes_by_scheme.copy()
+        assert adapter.proxy_manager_for("socks5://127.0.0.1:1080") is manager
+        for scheme, pool_class in registered_classes.items():
+            assert manager.pool_classes_by_scheme[scheme] is pool_class
+    finally:
+        adapter.close()

@@ -291,7 +291,11 @@ class DictationOrchestrator:
                 if self.test_active
                 else self._record_params()
             )
-            message = {"type": "record.start", "utterance_id": self._utterance_id}
+            message = {
+                "type": "record.start",
+                "utterance_id": self._utterance_id,
+                "limit_s": params["limit_s"],
+            }
             device = params.get("device")
             if isinstance(device, str) and device:
                 message["device"] = device
@@ -309,12 +313,13 @@ class DictationOrchestrator:
             return
         if self._phase != DictationPhase.RECORDING or self._cancel_requested:
             return
+        if self._test_callback is not None:
+            self._later(TEST_RECORD_LIMIT_MS, self.stop_test)
         if not self.test_active:
             self._pill.show_state(PillState.LISTENING)
         self._tray.set_state(TrayState.LISTENING)
         self._set_recording(True)
         if self._test_callback is not None:
-            self._later(TEST_RECORD_LIMIT_MS, self.stop_test)
             self._test_callback(MicrophoneTestUpdate("recording"))
 
     def _stop(self, *, recording_stopped: bool = False) -> None:

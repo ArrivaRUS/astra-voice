@@ -10,6 +10,7 @@ Item {
     property string hotkey: qsTr("Ctrl + Space")
     property string conflictOwner: ""
     property string captureMessage: ""
+    property string captureHint: ""
     property string pendingCombo: ""
     property var freeCandidates: []
 
@@ -38,7 +39,10 @@ Item {
 
     // Формат моста задан в src/astra_voice/platform/x11.py::parse_combo:
     // модификаторы и имя keysym разделяются «+» без пробелов.
-    // Для v0.1 решено фиксировать комбинацию по нажатию (мост endCapture сам переводит в captured и сразу пробует); набор клавиш ограничен буквами, цифрами, Space и F1–F12 — имена keysym для прочих клавиш из QML безопасно не собрать.
+    // Для v0.1 решено фиксировать комбинацию по нажатию
+    // (мост endCapture сам переводит в captured и сразу пробует);
+    // набор клавиш ограничен буквами, цифрами, Space и F1–F12 —
+    // имена keysym для прочих клавиш из QML безопасно не собрать.
     function buildCombo(event) {
         var key = ""
         if (event.key === Qt.Key_Space)
@@ -52,6 +56,11 @@ Item {
         else
             return ""
 
+        if (!(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
+            root.captureHint = qsTr("Удерживайте Ctrl, Alt или Win и нажмите клавишу")
+            return ""
+        }
+
         var parts = []
         if (event.modifiers & Qt.ControlModifier)
             parts.push("Ctrl")
@@ -62,6 +71,7 @@ Item {
         if (event.modifiers & Qt.MetaModifier)
             parts.push("Super")
         parts.push(key)
+        root.captureHint = ""
         return parts.join("+")
     }
 
@@ -77,7 +87,11 @@ Item {
     focus: captureActive
 
     // Loader должен завершить создание поля до установки активного фокуса.
-    onCaptureActiveChanged: Qt.callLater(root.updateCaptureFocus)
+    onCaptureActiveChanged: {
+        if (!captureActive)
+            root.captureHint = ""
+        Qt.callLater(root.updateCaptureFocus)
+    }
     Component.onCompleted: Qt.callLater(root.updateCaptureFocus)
 
     Keys.onPressed: {
@@ -179,6 +193,17 @@ Item {
                     Layout.alignment: Qt.AlignVCenter
                 }
             }
+        }
+
+        Text {
+            text: root.captureHint
+            visible: text !== ""
+            height: visible ? implicitHeight : 0
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.fontCaptionSize
+            color: Theme.fgMuted
+            textFormat: Text.PlainText
+            renderType: Text.NativeRendering
         }
 
         NoteBanner {

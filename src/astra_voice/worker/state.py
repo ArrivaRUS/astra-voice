@@ -249,6 +249,7 @@ class WorkerState:
         self.state = State.idle
         self.buffers: dict[str, array[float]] = {}
         self._limit_samples = int(limit_s * SAMPLE_RATE)
+        self._record_limit_samples = self._limit_samples
         self._stopped_ttl_s = stopped_ttl_s
         self._clock = clock
         self._stopped: dict[str, float] = {}
@@ -326,6 +327,12 @@ class WorkerState:
         if kind == "record.start":
             if self._recording is not None or self._has_job(uid):
                 return [error("bad-state", "Запись уже существует.")]
+            limit_s = msg.get("limit_s")
+            self._record_limit_samples = (
+                self._limit_samples
+                if limit_s is None
+                else int(max(1, min(limit_s * SAMPLE_RATE, self._limit_samples)))
+            )
             if uid in self._stopped:
                 self._stopped.pop(uid)
                 logger.info("Остановленный буфер вытеснен новой записью: %s.", uid)
@@ -353,8 +360,8 @@ class WorkerState:
         with self._lock:
             if self._recording == utterance_id:
                 buffer = self.buffers[utterance_id]
-                buffer.extend(islice(samples, self._limit_samples - len(buffer)))
-                if len(buffer) == self._limit_samples:
+                buffer.extend(islice(samples, self._record_limit_samples - len(buffer)))
+                if len(buffer) == self._record_limit_samples:
                     self._stop_recording()
                     self._emit({"type": "record.limit", "utterance_id": utterance_id})
 
@@ -421,6 +428,7 @@ class WorkerState:
         if self._recording is not None:
             self.state = State.recording_processing if self._active else State.recording
         else:
+            self._record_limit_samples = self._limit_samples
             self.state = State.processing if self._active else State.idle
 
     def _load(self, msg: Message) -> list[Message]:
