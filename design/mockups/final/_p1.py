@@ -79,7 +79,7 @@ def general_rows(mode_first=True, autostart="on", indicator="Пилюля сни
         row("Значок в системном трее",
             f'<span style="display:flex;gap:9px;align-items:center">'
             f'<span class="c12">Выключить нельзя</span>{tgl(True)}</span>',
-            "Запись всегда видна — это требование приватности (§9.5)", dis=True),
+            "Запись всегда видна — это требование приватности", dis=True),
     ])
     if autostart == "error":
         ar = row("Автозапуск при входе в систему", tgl(True))
