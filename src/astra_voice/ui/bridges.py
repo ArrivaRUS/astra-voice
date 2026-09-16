@@ -179,9 +179,12 @@ def _megabytes(size_bytes: int, *, round_up: bool = False) -> str:
 
 
 def _has_modifier(combo: str) -> bool:
-    return any(
-        part.strip().lower() in {"ctrl", "control", "alt", "meta", "super", "win"}
-        for part in combo.split("+")
+    """Одна основная клавиша и обязательный модификатор; Shift — только дополнительный."""
+    modifiers = {"ctrl", "control", "alt", "meta", "super", "win"}
+    parts = [part.strip().lower() for part in combo.split("+")]
+    return (
+        any(part in modifiers for part in parts)
+        and sum(1 for part in parts if part and part not in modifiers and part != "shift") == 1
     )
 
 

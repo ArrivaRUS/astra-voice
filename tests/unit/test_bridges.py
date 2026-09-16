@@ -594,7 +594,10 @@ def test_hotkey_apply_keeps_policy_mode_when_combo_changes() -> None:
     assert mirror.hotkey_mode == "toggle"
 
 
-@pytest.mark.parametrize("combo", ["A", "Space", "Shift+A", "", "  sHiFt + A  ", "ControlKey+A"])
+@pytest.mark.parametrize(
+    "combo",
+    ["A", "Space", "Shift+A", "", "  sHiFt + A  ", "ControlKey+A", "Ctrl", "Alt+Super", "Ctrl+A+B"],
+)
 @pytest.mark.parametrize("with_mirror", [False, True])
 def test_hotkey_without_modifier_is_rejected(
     combo: str, with_mirror: bool, caplog: pytest.LogCaptureFixture

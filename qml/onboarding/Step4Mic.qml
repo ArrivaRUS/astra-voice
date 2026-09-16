@@ -22,7 +22,7 @@ Item {
     readonly property string testState: bridge ? bridge.testState : "idle"
     readonly property string testMessage: bridge ? bridge.testMessage : ""
     readonly property bool silent: level <= 0.02 // Порог «тишина» по заданию шага 4.
-    readonly property bool testing: testState === "recording" || testState === "processing"
+    readonly property bool testing: testState === "preparing" || testState === "recording" || testState === "processing"
     readonly property bool deviceMissing: device !== "" && deviceIndex(device) === -1
     readonly property int selectedDeviceIndex: deviceIndex(device) >= 0 ? deviceIndex(device)
         : deviceIndex("") >= 0 ? deviceIndex("") : 0
@@ -205,7 +205,8 @@ Item {
 
                 Text {
                     width: parent.width
-                    text: root.testState === "idle" ? qsTr("Нажмите «Тестовая диктовка», чтобы проверить микрофон")
+                    text: root.testState === "preparing" ? root.testMessage
+                        : root.testState === "idle" ? qsTr("Нажмите «Тестовая диктовка», чтобы проверить микрофон")
                         : root.testState === "recording" && root.silent ? qsTr("Звука с этого микрофона пока нет")
                         : root.peak !== "" ? qsTr("Пик %1 · уровень в норме").arg(root.peak) : ""
                     visible: text !== ""
@@ -239,7 +240,7 @@ Item {
 
     Rectangle {
         id: resultField
-        visible: root.testText !== "" || root.testing
+        visible: root.testText !== "" || root.testState === "recording" || root.testState === "processing"
         y: levelBox.y + levelBox.height + (visible ? 10 : 0) // Макет: margin-top .field.
         width: root.width
         // design/spec.md §4.5: текст, паддинги и обе границы дают 35,5 → 36 px для одной строки.
@@ -258,7 +259,7 @@ Item {
             text: root.testState === "recording"
                 ? (root.testPhrase !== "" ? qsTr("Слушаю… Скажите: «%1»").arg(root.testPhrase) : qsTr("Слушаю…"))
                 : root.testState === "processing" ? qsTr("Распознаю…") : root.testText
-            color: root.testing ? Theme.fgMuted : Theme.fg
+            color: root.testState === "recording" || root.testState === "processing" ? Theme.fgMuted : Theme.fg
             font.family: Theme.fontUi
             font.pixelSize: Theme.fontFieldSize
             // Макет 08-onboarding-4-mic.html (.field): базовый межстрочный интервал 1,5.

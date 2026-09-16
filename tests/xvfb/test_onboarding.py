@@ -1133,10 +1133,10 @@ def test_mic_test_button_starts_and_stops_including_processing(
     fake.step = 4
 
     def inspect(root: Any) -> None:
-        for state in ("idle", "recording", "processing", "done", "error"):
+        for state in ("idle", "preparing", "recording", "processing", "done", "error"):
             fake.testState = state
             onboarding_app.processEvents()
-            testing = state in ("recording", "processing")
+            testing = state in ("preparing", "recording", "processing")
             text = "Остановить" if testing else "Тестовая диктовка"
             buttons = [
                 item
@@ -1276,6 +1276,7 @@ def test_mic_silence_is_only_reported_while_recording(onboarding_app: Any, dark:
     def inspect(root: Any) -> None:
         for state, level in (
             ("idle", 0),
+            ("preparing", 0),
             ("recording", 0),
             ("recording", 0.5),
             ("processing", 0),
