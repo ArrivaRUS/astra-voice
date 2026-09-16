@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import logging
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable, Sequence
 from time import monotonic
 
@@ -57,9 +57,12 @@ _ACTION_SIGNAL = (
 _last_id = 0
 _last_delivery_ok = False
 # При переполнении сохраняем последние восемь уникальных уведомлений.
-_pending: deque[tuple[str, str, int, tuple[tuple[str, str], ...]]] = deque(maxlen=8)
+_MAX_NOTIFICATIONS = 8
+_pending: deque[tuple[str, str, int, tuple[tuple[str, str], ...]]] = deque(
+    maxlen=_MAX_NOTIFICATIONS
+)
 _action_handlers: dict[str, Callable[[], None]] = {}
-_notification_actions: dict[int, set[str]] = {}
+_notification_actions: OrderedDict[int, set[str]] = OrderedDict()
 _action_bus: QDBusConnection | None = None
 _action_receiver: _ActionReceiver | None = None
 
@@ -228,13 +231,15 @@ def _deliver(summary: str, body: str, urgency: int, actions: tuple[tuple[str, st
         # Исключение транспорта тоже может содержать переданное сообщение.
         _last_id = 0
     _last_delivery_ok = _last_id != 0
+    _notification_actions.pop(replaces_id, None)
     if not _last_delivery_ok:
         _logger.warning("Не удалось показать уведомление: %s", summary)
     else:
-        _notification_actions.pop(replaces_id, None)
         _notification_actions.pop(_last_id, None)
         if actions:
             _notification_actions[_last_id] = {key for key, _ in actions}
+            while len(_notification_actions) > _MAX_NOTIFICATIONS:
+                _notification_actions.popitem(last=False)
     return _last_delivery_ok
 
 

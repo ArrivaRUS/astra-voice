@@ -82,9 +82,24 @@ def test_save_syncs_directory_after_replace(path: Path, monkeypatch: pytest.Monk
     assert list(path.parent.iterdir()) == [path]
 
 
-@pytest.mark.parametrize("stage", ["chmod", "replace", "directory-open", "directory-fsync"])
+@pytest.mark.parametrize("stage", ["chmod", "replace", "fsync"])
 def test_save_failure_cleans_temp_file(
     path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    st.save(st.Settings(hotkey="Ctrl+Q"), path)
+    monkeypatch.setattr(os, stage, Mock(side_effect=OSError("save failed")))
+
+    with pytest.raises(OSError, match="save failed"):
+        st.save(st.Settings(hotkey="Ctrl+W"), path)
+
+    assert list(path.parent.iterdir()) == [path]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert st.load(path).hotkey == "Ctrl+Q"
+
+
+@pytest.mark.parametrize("stage", ["directory-open", "directory-fsync"])
+def test_save_directory_failure_warns_after_successful_replace(
+    path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stage: str
 ) -> None:
     st.save(st.Settings(hotkey="Ctrl+Q"), path)
     error = OSError("save failed")
@@ -95,17 +110,22 @@ def test_save_failure_cleans_temp_file(
             path.with_name(".settings.json.tmp"), os.O_WRONLY | os.O_CREAT, 0o600
         )
         monkeypatch.setattr(os, "open", Mock(side_effect=[temporary_fd, error]))
-    elif stage == "directory-fsync":
-        monkeypatch.setattr(os, "fsync", Mock(side_effect=[None, error]))
     else:
-        monkeypatch.setattr(os, stage, Mock(side_effect=error))
+        monkeypatch.setattr(os, "fsync", Mock(side_effect=[None, error]))
 
-    with pytest.raises(OSError, match="save failed"):
+    with caplog.at_level("WARNING", logger=st.__name__):
         st.save(st.Settings(hotkey="Ctrl+W"), path)
 
     assert list(path.parent.iterdir()) == [path]
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert st.load(path).hotkey == ("Ctrl+W" if stage.startswith("directory-") else "Ctrl+Q")
+    assert st.load(path).hotkey == "Ctrl+W"
+    assert any(
+        record.name == st.__name__
+        and record.levelname == "WARNING"
+        and "save failed" in record.getMessage()
+        and str(path.parent) in record.getMessage()
+        for record in caplog.records
+    )
     if stage == "directory-fsync":
         close.assert_called_once()
         with pytest.raises(OSError):

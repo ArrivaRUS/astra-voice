@@ -10,7 +10,7 @@ FocusScope {
 
     property int currentIndex: 0
     property bool debugVisible: false
-    property bool debugCurrent: false
+    property bool debugCurrent: currentIndex === sections.length
 
     readonly property var sections: [
         { "title": qsTr("Общие"), "icon": "cog", "counter": "" },

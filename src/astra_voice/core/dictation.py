@@ -12,8 +12,9 @@ import math
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from astra_voice.platform.hotkey import HotkeyState
@@ -36,6 +37,24 @@ PROCESSING_WATCHDOG_MS = 35000
 CANCEL_TIMEOUT_MS = 1500
 CANCEL_RESTART_MS = 2000
 BUSY_RETRY_MS = 200
+TEST_RECORD_LIMIT_MS = 10000
+
+
+@dataclass(frozen=True)
+class MicrophoneTestUpdate:
+    """Частный результат для экрана микрофона; text нельзя передавать другим портам."""
+
+    state: Literal["idle", "recording", "processing", "done", "error"]
+    text: str = ""
+    duration_s: float | None = None
+    peak_dbfs: float | None = None
+    message: str = ""
+
+
+TestCallback = Callable[[MicrophoneTestUpdate], None]
+TEST_BUSY = "Сначала завершите текущую диктовку, затем попробуйте ещё раз."
+TEST_FAILED = "Не удалось распознать речь. Попробуйте ещё раз."
+TEST_MODEL_UNAVAILABLE = "Модель ещё не готова. Завершите её установку и попробуйте ещё раз."
 
 
 class DictationPhase(Enum):
@@ -134,6 +153,7 @@ class DictationOrchestrator:
         self._on_device_selected = on_device_selected
         self._announced_selected_device: str | None = None
         self._audio_opened = False
+        self._announcement_generation: int | None = None
         self._device_selected = False
         self._log = log if log is not None else logging.getLogger(__name__)
         self._phase = DictationPhase.IDLE
@@ -157,6 +177,49 @@ class DictationOrchestrator:
         self._queue: deque[Callable[[], None]] = deque()
         self._timer_serial = 0
         self._timers: dict[int, tuple[object, Callable[[], None]]] = {}
+        self._test_callback: TestCallback | None = None
+
+    @property
+    def test_active(self) -> bool:
+        """Проверка владеет тем же автоматом и микрофоном, что обычная диктовка."""
+        return self._test_callback is not None
+
+    def start_test(self, device: str, callback: TestCallback) -> bool:
+        """Записывает выбранный микрофон без вставки, статистики и последнего текста."""
+        if (
+            self._closed
+            or self.test_active
+            or self._cancel_pending
+            or self._phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
+        ):
+            callback(MicrophoneTestUpdate("error", message=TEST_BUSY))
+            return False
+        self._test_callback = callback
+        self._start(test_device=device)
+        return True
+
+    def stop_test(self) -> None:
+        """Стоп всегда проходит: запись → распознавание, распознавание → отмена."""
+        if not self.test_active:
+            return
+        if self._phase == DictationPhase.RECORDING:
+            self._stop()
+        else:
+            self.cancel("microphone-test")
+
+    def cancel_test(self) -> None:
+        """Уход с экрана отменяет и запись, и распознавание без результата."""
+        if self.test_active:
+            self.cancel("microphone-test")
+
+    def _finish_test(self, update: MicrophoneTestUpdate) -> None:
+        callback, self._test_callback = self._test_callback, None
+        self._cancel_timers()
+        self._phase = DictationPhase.IDLE
+        self._set_recording(False)
+        self._tray.set_state(TrayState.IDLE)
+        if callback is not None:
+            callback(update)
 
     @property
     def phase(self) -> DictationPhase:
@@ -168,9 +231,25 @@ class DictationOrchestrator:
         """Последняя непустая фраза только в памяти процесса."""
         return self._last_text
 
+    def reset_device_announcement(self) -> None:
+        """Сбрасывает объявление при выборе в настройках или новом поколении воркера."""
+        self._audio_opened = False
+        self._announced_selected_device = None
+        self._announcement_generation = self._generation()
+
+    def _sync_device_generation(self) -> None:
+        if self._announcement_generation != self._generation():
+            self.reset_device_announcement()
+
     def on_hotkey_state(self, state: HotkeyState, reason: str) -> None:
         """Принимает состояния HotkeyFsm, включая IDLE с escape-cancel."""
         if self._closed:
+            return
+        if self.test_active:
+            # Сброс FSM вызывает вложенный IDLE/escape-cancel: его тоже игнорируем.
+            # Отмена самой проверки идёт через stop_test/cancel_test, а не хоткей.
+            if state in (HotkeyState.RECORDING, HotkeyState.PROCESSING):
+                self._hotkey_cancel()
             return
         if self._suspended:
             self._queue.append(lambda: self.on_hotkey_state(state, reason))
@@ -187,25 +266,31 @@ class DictationOrchestrator:
         elif state == HotkeyState.IDLE and reason == "escape-cancel":
             self.cancel("escape")
 
-    def _start(self) -> None:
+    def _start(self, *, test_device: str | None = None) -> None:
         if self._cancel_pending and self._generation() == self._worker_generation:
             self._hotkey_cancel()
             return
         self._cancel_pending = False
-        self._target_window = self._active_window()
+        self._target_window = None if self.test_active else self._active_window()
         self._utterance_id = uuid4().hex
+        self._sync_device_generation()
         self._worker_generation = self._generation()
         self._cancel_timers()
         self._cancel_requested = False
         self._delivered = False
-        self._cold, self._started = not self._started, True
+        if not self.test_active:
+            self._cold, self._started = not self._started, True
         self._t_ready = None
         self._t_stop = None
         self._t_ms = self._paste_ms = 0.0
         self._retries = 0
         try:
             self._device_selected = False
-            params = self._record_params()
+            params: dict[str, Any] = (
+                {"device": test_device, "limit_s": TEST_RECORD_LIMIT_MS / 1000}
+                if self.test_active
+                else self._record_params()
+            )
             message = {"type": "record.start", "utterance_id": self._utterance_id}
             device = params.get("device")
             if isinstance(device, str) and device:
@@ -224,13 +309,19 @@ class DictationOrchestrator:
             return
         if self._phase != DictationPhase.RECORDING or self._cancel_requested:
             return
-        self._pill.show_state(PillState.LISTENING)
+        if not self.test_active:
+            self._pill.show_state(PillState.LISTENING)
         self._tray.set_state(TrayState.LISTENING)
         self._set_recording(True)
+        if self._test_callback is not None:
+            self._later(TEST_RECORD_LIMIT_MS, self.stop_test)
+            self._test_callback(MicrophoneTestUpdate("recording"))
 
     def _stop(self, *, recording_stopped: bool = False) -> None:
         if self._phase != DictationPhase.RECORDING or self._cancel_requested:
             return
+        if self.test_active:
+            self._cancel_timers()
         self._t_stop = self._clock()
         self._change_phase(DictationPhase.PROCESSING)
         # По record.limit воркер уже остановил запись; повторный stop даёт bad-state.
@@ -240,6 +331,12 @@ class DictationOrchestrator:
             return
         if self.phase != DictationPhase.PROCESSING or self._cancel_requested:
             return
+        if self._test_callback is not None:
+            self._set_recording(False)
+            self._test_callback(MicrophoneTestUpdate("processing"))
+            # Обработчик состояния вправе сразу отменить распознавание.
+            if self.phase != DictationPhase.PROCESSING or self._cancel_requested:
+                return
         if not self._command(
             {"type": "recognize", "utterance_id": self._utterance_id}, timeout=RECOGNIZE_TIMEOUT_S
         ):
@@ -247,7 +344,8 @@ class DictationOrchestrator:
         if self.phase != DictationPhase.PROCESSING or self._cancel_requested:
             return
         self._set_recording(False)
-        self._pill.show_state(PillState.PROCESSING)
+        if not self.test_active:
+            self._pill.show_state(PillState.PROCESSING)
         self._tray.set_state(TrayState.PROCESSING)
         self._later(PROCESSING_WATCHDOG_MS, self._watchdog)
 
@@ -259,6 +357,8 @@ class DictationOrchestrator:
             saved = event.copy()
             self._queue.append(lambda: self.on_worker_event(saved))
             return
+        # hello до первой диктовки тоже начинает новое поколение объявлений.
+        self._sync_device_generation()
         if (
             self._phase in (DictationPhase.IDLE, DictationPhase.FINISHING)
             and not self._cancel_pending
@@ -292,7 +392,17 @@ class DictationOrchestrator:
             if not isinstance(text, str):
                 self._log.debug("диктовка: некорректное поле text")
                 text = ""
-            self._result(text)
+            duration = event.get("t_ms")
+            self._result(
+                text,
+                duration_s=(
+                    max(0.0, float(duration) / 1000)
+                    if isinstance(duration, (int, float))
+                    and not isinstance(duration, bool)
+                    and math.isfinite(duration)
+                    else None
+                ),
+            )
         elif kind == "audio.ready":
             self._audio_ready(event)
         elif self._phase == DictationPhase.RECORDING:
@@ -306,20 +416,29 @@ class DictationOrchestrator:
                 except (ValueError, OverflowError):
                     self._log.debug("диктовка: некорректное поле peak_dbfs")
                     return
-                self._pill.show_state(PillState.LISTENING, level=level)
+                if self._test_callback is not None:
+                    self._test_callback(MicrophoneTestUpdate("recording", peak_dbfs=float(peak)))
+                else:
+                    self._pill.show_state(PillState.LISTENING, level=level)
             elif kind == "silent":
-                self._pill.show_state(PillState.LISTENING_SILENT)
+                if self.test_active:
+                    self._stop()
+                else:
+                    self._pill.show_state(PillState.LISTENING_SILENT)
             elif kind == "record.limit":
-                self._pill.show_state(PillState.LIMIT)
+                if not self.test_active:
+                    self._pill.show_state(PillState.LIMIT)
                 self._stop(recording_stopped=True)
 
     def _audio_ready(self, event: dict[str, Any]) -> None:
+        if self.test_active:
+            return
         self._log.debug("диктовка: audio.ready")
         if self._t_ready is None:
             self._t_ready = self._clock()
         first_open = not self._audio_opened
         self._audio_opened = True
-        if "changed" not in event or self._phase != DictationPhase.RECORDING:
+        if self._phase != DictationPhase.RECORDING:
             return
         # Воркер передаёт системное описание, а не идентификатор из record_params.
         device = event.get("device")
@@ -331,18 +450,29 @@ class DictationOrchestrator:
         if not name:
             return
         # audio.ready приходит только при открытии, в том числе после долгих повторов.
-        if first_open:
-            if name != self._announced_selected_device and self._on_device_selected is not None:
-                self._announced_selected_device = name
+        previous_name = self._announced_selected_device
+        if name == previous_name:
+            return
+        self._announced_selected_device = name
+        if first_open or previous_name is None:
+            if self._on_device_selected is not None:
                 self._on_device_selected(name)
         elif self._on_device_changed is not None:
-            # changed задаёт воркер: одинаковые описания могут быть у разных устройств.
             self._on_device_changed(name)
 
-    def _result(self, text: str) -> None:
+    def _result(self, text: str, *, duration_s: float | None = None) -> None:
         received = self._clock()
         assert self._t_stop is not None
         self._t_ms = max(0.0, (received - self._t_stop) * 1000)
+        if self.test_active:
+            self._finish_test(
+                MicrophoneTestUpdate(
+                    "done",
+                    text=text,
+                    duration_s=duration_s if duration_s is not None else self._t_ms / 1000,
+                )
+            )
+            return
         self._cancel_timers()
         if not text.strip():
             self._dictation_stat("empty")
@@ -447,6 +577,9 @@ class DictationOrchestrator:
 
     def _cancelled(self) -> None:
         self._cancel_pending = False
+        if self.test_active:
+            self._finish_test(MicrophoneTestUpdate("idle"))
+            return
         if self._phase in (DictationPhase.IDLE, DictationPhase.FINISHING):
             self._cancel_timers()
             self._tail_done()
@@ -461,7 +594,11 @@ class DictationOrchestrator:
         if self._generation() != self._worker_generation:
             self._fail_restarted()
             return
-        self._cancelled()
+        if self.test_active:
+            # Не снимаем блокировку старта внутри callback: воркер ещё не ответил.
+            self._finish_test(MicrophoneTestUpdate("idle"))
+        else:
+            self._cancelled()
         self._cancel_pending = True
         # FINISHING не означает освобождение микрофона. Ставим второй сторож
         # до send, чтобы даже синхронное подтверждение сняло эскалацию.
@@ -481,6 +618,15 @@ class DictationOrchestrator:
             self._cancel_pending = False
 
     def _error(self, code: object) -> None:
+        if self.test_active:
+            message = {
+                "audio-no-device": "Микрофон недоступен. Подключите его или выберите другой.",
+                "audio-busy": "Микрофон занят. Закройте другую программу и попробуйте ещё раз.",
+                "audio-failed": "Не удалось записать звук. Выберите другой микрофон.",
+                "no-model": TEST_MODEL_UNAVAILABLE,
+            }.get(str(code), TEST_FAILED)
+            self._finish_test(MicrophoneTestUpdate("error", message=message))
+            return
         if code in ("worker-crashed", "restart-limit", "worker-start"):
             self._fail_restarted()
         elif code == "audio-no-device" and self._device_selected:
@@ -504,6 +650,10 @@ class DictationOrchestrator:
         self._fail_recognition(cancel_worker=True)
 
     def _fail_restarted(self) -> None:
+        if self.test_active:
+            self._cancel_pending = False
+            self._finish_test(MicrophoneTestUpdate("error", message=TEST_FAILED))
+            return
         self._begin_finish()
         self._pill.show_state(PillState.ERROR, text=ERROR_RECOGNITION_RESTARTED)
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
@@ -514,6 +664,14 @@ class DictationOrchestrator:
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _fail_recognition(self, *, cancel_worker: bool = False) -> None:
+        if self.test_active:
+            # Даже ошибка отправки stop/recognize не должна оставить запись открытой.
+            self._cancel_requested = True
+            self._cancel_pending = True
+            self._finish_test(MicrophoneTestUpdate("error", message=TEST_FAILED))
+            self._later(CANCEL_TIMEOUT_MS, self._cancel_timeout)
+            self._send_cancel()
+            return
         self._begin_finish()
         if cancel_worker:
             self._send_cancel()
@@ -557,9 +715,10 @@ class DictationOrchestrator:
         try:
             self._send(message, **kwargs)
         except Exception:
-            self._log.warning(
-                "диктовка: отправка команды %s не удалась", message.get("type"), exc_info=True
-            )
+            if not self.test_active:
+                self._log.warning(
+                    "диктовка: отправка команды %s не удалась", message.get("type"), exc_info=True
+                )
             self._fail_recognition()
             return False
         return True
@@ -624,7 +783,10 @@ class DictationOrchestrator:
         self._queue.clear()
         self._cancel_timers()
         self._phase = DictationPhase.IDLE
+        callback, self._test_callback = self._test_callback, None
         actions: list[Callable[[], None]] = []
+        if callback is not None:
+            actions.append(lambda: callback(MicrophoneTestUpdate("idle")))
         if active:
             actions.extend((self._hotkey_cancel, self._send_cancel))
         actions.extend((lambda: self._set_recording(False), self._hotkey_done, self._pill.hide))

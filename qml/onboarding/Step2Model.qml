@@ -51,13 +51,15 @@ Item {
         modelState: root.bridge ? root.bridge.modelState : "downloadable"
         modelName: root.bridge && root.bridge.modelName ? root.bridge.modelName : qsTr("GigaAM v3 RNN-T")
         modelSize: root.bridge && root.bridge.modelSize ? root.bridge.modelSize : qsTr("231,9 МБ")
+        modelRam: root.bridge && root.bridge.modelRam ? root.bridge.modelRam : ""
         modelHost: root.bridge && root.bridge.modelHost ? root.bridge.modelHost : qsTr("huggingface.co")
+        modelMessage: root.bridge ? root.bridge.modelMessage : ""
         progress: root.bridge ? root.bridge.progress : 0
         speed: root.bridge ? root.bridge.speed : ""
         eta: root.bridge ? root.bridge.eta : ""
         onDownloadRequested: { if (root.bridge && root.bridge.download) root.bridge.download(); }
         onCancelRequested: { if (root.bridge && root.bridge.cancelDownload) root.bridge.cancelDownload(); }
-        onInstallFromPathRequested: { if (root.bridge && root.bridge.pickInstallPath) root.bridge.pickInstallPath(); }
+        onInstallFromPathRequested: { if (root.bridge) root.bridge.pickInstallPath(); }
         onRetryRequested: { if (root.bridge && root.bridge.download) root.bridge.download(); }
         onRemoveDownloadRequested: { if (root.bridge && root.bridge.cancelDownload) root.bridge.cancelDownload(); }
         onOpenFolderRequested: { /* слота в контракте пока нет */ }
@@ -71,7 +73,7 @@ Item {
         AvButton {
             iconName: "folder"
             text: qsTr("Установить из файла или папки…")
-            onClicked: { if (root.bridge && root.bridge.pickInstallPath) root.bridge.pickInstallPath(); }
+            onClicked: { if (root.bridge) root.bridge.pickInstallPath(); }
         }
     }
 }

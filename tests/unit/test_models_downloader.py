@@ -551,7 +551,10 @@ def test_oversize_read_limit_without_network(
     monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", Mock(return_value=received))
     _assert_error(loader, entry, "too-large")
     assert sum(read_sizes) == size - offset + 1
-    assert len(read_sizes) == (size - offset + 1024) // 1024
+    chunk_size = downloader._CHUNK_SIZE
+    # BytesIO отдаёт полные блоки; iter_chunks уменьшает последний до остатка
+    # лимита size - offset + 1, без дополнительного чтения EOF.
+    assert len(read_sizes) == (size - offset + chunk_size) // chunk_size
     assert not part.exists()
     assert not part.with_suffix("").exists()
     assert received.raw.closed

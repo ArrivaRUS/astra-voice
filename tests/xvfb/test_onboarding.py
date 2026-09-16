@@ -39,7 +39,8 @@ from helpers.qt_app import get_qapplication  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-SNAPSHOTS = REPO / "design/refs/impl/onboarding"
+# Промежуточные прогоны разработки не трогают эталоны репозитория.
+SNAPSHOTS = REPO / Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR") or "design/refs/impl/onboarding")
 WIDTH, HEIGHT = 900, 588
 STEP_NAMES = {
     1: "01-welcome",
@@ -100,23 +101,34 @@ class FakeOnboarding(QObject):
         self.calls: list[str] = []
         self._step: int = 1
         self._policyLocked: bool = False
+        self._policyLockedText: str = "Задано администратором"
         self._modelState: str = "downloadable"
         self._modelName: str = "GigaAM v3 RNN-T"
         self._modelSize: str = "231,9 МБ"
+        self._modelRam: str = "415 МБ"
         self._modelHost: str = "huggingface.co"
+        self._modelMessage: str = ""
         self._progress: float = 0.43
         self._speed: str = "5,2 МБ/с"
         self._eta: str = "~25 с"
         self._hotkey: str = "Ctrl + Space"
         self._hotkeyMode: str = "ptt"
         self._captureState: str = "idle"
-        self._devices: list[str] = ["Системный по умолчанию"]
-        self._device: str = "Системный по умолчанию"
+        self._captureMessage: str = ""
+        self._pendingCombo: str = ""
+        self._freeCandidates: list[str] = []
+        self._devices: list[dict[str, str]] = [
+            {"id": "", "name": "Системный по умолчанию"},
+            {"id": "builtin", "name": "Встроенный микрофон"},
+        ]
+        self._device: str = "builtin"
         self._level: float = 0.6
         self._peak: str = "−18 дБ"
         self._testDuration: str = "0,31 с"
+        self._testPhrase: str = "Сегодня хорошая погода"
         self._testText: str = "Проверка связи, раз, два, три."
         self._testState: str = "done"
+        self._testMessage: str = ""
         self._canFinish: bool = True
         self._language: str = "ru"
         self._checkAppUpdates: bool = False
@@ -139,6 +151,17 @@ class FakeOnboarding(QObject):
         self.changed.emit()
 
     policyLocked = pyqtProperty(bool, _get_policyLocked, _set_policyLocked, notify=changed)
+
+    def _get_policyLockedText(self) -> str:
+        return self._policyLockedText
+
+    def _set_policyLockedText(self, value: str) -> None:
+        self._policyLockedText = value
+        self.changed.emit()
+
+    policyLockedText = pyqtProperty(
+        str, _get_policyLockedText, _set_policyLockedText, notify=changed
+    )
 
     def _get_modelState(self) -> str:
         return self._modelState
@@ -167,6 +190,15 @@ class FakeOnboarding(QObject):
 
     modelSize = pyqtProperty(str, _get_modelSize, _set_modelSize, notify=changed)
 
+    def _get_modelRam(self) -> str:
+        return self._modelRam
+
+    def _set_modelRam(self, value: str) -> None:
+        self._modelRam = value
+        self.changed.emit()
+
+    modelRam = pyqtProperty(str, _get_modelRam, _set_modelRam, notify=changed)
+
     def _get_modelHost(self) -> str:
         return self._modelHost
 
@@ -175,6 +207,15 @@ class FakeOnboarding(QObject):
         self.changed.emit()
 
     modelHost = pyqtProperty(str, _get_modelHost, _set_modelHost, notify=changed)
+
+    def _get_modelMessage(self) -> str:
+        return self._modelMessage
+
+    def _set_modelMessage(self, value: str) -> None:
+        self._modelMessage = value
+        self.changed.emit()
+
+    modelMessage = pyqtProperty(str, _get_modelMessage, _set_modelMessage, notify=changed)
 
     def _get_progress(self) -> float:
         return self._progress
@@ -230,14 +271,43 @@ class FakeOnboarding(QObject):
 
     captureState = pyqtProperty(str, _get_captureState, _set_captureState, notify=changed)
 
-    def _get_devices(self) -> list[str]:
+    def _get_captureMessage(self) -> str:
+        return self._captureMessage
+
+    def _set_captureMessage(self, value: str) -> None:
+        self._captureMessage = value
+        self.changed.emit()
+
+    captureMessage = pyqtProperty(str, _get_captureMessage, _set_captureMessage, notify=changed)
+
+    def _get_pendingCombo(self) -> str:
+        return self._pendingCombo
+
+    def _set_pendingCombo(self, value: str) -> None:
+        self._pendingCombo = value
+        self.changed.emit()
+
+    pendingCombo = pyqtProperty(str, _get_pendingCombo, _set_pendingCombo, notify=changed)
+
+    def _get_freeCandidates(self) -> list[str]:
+        return self._freeCandidates
+
+    def _set_freeCandidates(self, value: list[str]) -> None:
+        self._freeCandidates = value
+        self.changed.emit()
+
+    freeCandidates = pyqtProperty(
+        "QStringList", _get_freeCandidates, _set_freeCandidates, notify=changed
+    )
+
+    def _get_devices(self) -> list[dict[str, str]]:
         return self._devices
 
-    def _set_devices(self, value: list[str]) -> None:
+    def _set_devices(self, value: list[dict[str, str]]) -> None:
         self._devices = value
         self.changed.emit()
 
-    devices = pyqtProperty(list, _get_devices, _set_devices, notify=changed)
+    devices = pyqtProperty("QVariantList", _get_devices, _set_devices, notify=changed)
 
     def _get_device(self) -> str:
         return self._device
@@ -275,6 +345,15 @@ class FakeOnboarding(QObject):
 
     testDuration = pyqtProperty(str, _get_testDuration, _set_testDuration, notify=changed)
 
+    def _get_testPhrase(self) -> str:
+        return self._testPhrase
+
+    def _set_testPhrase(self, value: str) -> None:
+        self._testPhrase = value
+        self.changed.emit()
+
+    testPhrase = pyqtProperty(str, _get_testPhrase, _set_testPhrase, notify=changed)
+
     def _get_testText(self) -> str:
         return self._testText
 
@@ -292,6 +371,15 @@ class FakeOnboarding(QObject):
         self.changed.emit()
 
     testState = pyqtProperty(str, _get_testState, _set_testState, notify=changed)
+
+    def _get_testMessage(self) -> str:
+        return self._testMessage
+
+    def _set_testMessage(self, value: str) -> None:
+        self._testMessage = value
+        self.changed.emit()
+
+    testMessage = pyqtProperty(str, _get_testMessage, _set_testMessage, notify=changed)
 
     def _get_canFinish(self) -> bool:
         return self._canFinish
@@ -363,13 +451,29 @@ class FakeOnboarding(QObject):
     def beginCapture(self) -> None:
         self.calls.append("beginCapture")
 
-    @pyqtSlot()
-    def endCapture(self) -> None:
+    @pyqtSlot(str)
+    def endCapture(self, combo: str) -> None:
         self.calls.append("endCapture")
 
     @pyqtSlot()
-    def testPhrase(self) -> None:
-        self.calls.append("testPhrase")
+    def cancelCapture(self) -> None:
+        self.calls.append("cancelCapture")
+
+    @pyqtSlot()
+    def keepCombo(self) -> None:
+        self.calls.append("keepCombo")
+
+    @pyqtSlot()
+    def refreshCandidates(self) -> None:
+        self.calls.append("refreshCandidates")
+
+    @pyqtSlot()
+    def startTest(self) -> None:
+        self.calls.append("startTest")
+
+    @pyqtSlot()
+    def stopTest(self) -> None:
+        self.calls.append("stopTest")
 
     @pyqtSlot()
     def finish(self) -> None:
@@ -393,6 +497,8 @@ class FakeSettings(QObject):
         self._device: str = "Системный по умолчанию"
         self._hotkeyStatus: str = "ok"
         self._lockedSettings: list[str] = []
+        self._saveError: str = ""
+        self._modelSelfcheck: str = "idle"
 
     def _get_hotkey(self) -> str:
         return self._hotkey
@@ -487,6 +593,16 @@ class FakeSettings(QObject):
     lockedSettings = pyqtProperty(
         "QStringList", _get_lockedSettings, _set_lockedSettings, notify=changed
     )
+
+    def _get_saveError(self) -> str:
+        return self._saveError
+
+    saveError = pyqtProperty(str, _get_saveError, notify=changed)
+
+    def _get_modelSelfcheck(self) -> str:
+        return self._modelSelfcheck
+
+    modelSelfcheck = pyqtProperty(str, _get_modelSelfcheck, notify=changed)
 
     @pyqtSlot(str, result=bool)
     def is_locked(self, name: str) -> bool:

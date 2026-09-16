@@ -13,8 +13,15 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from PyQt5.QtCore import QEvent, QObject, Qt, QThread, QUrl, pyqtProperty, pyqtSignal, pyqtSlot
+from PyQt5.QtWidgets import QFileDialog
 
 from astra_voice.core import paths
+from astra_voice.core.dictation import (
+    TEST_FAILED,
+    MicrophoneTestUpdate,
+    TestCallback,
+    level_from_dbfs,
+)
 from astra_voice.core.model_source import SmokeRunner
 from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
@@ -28,6 +35,7 @@ from astra_voice.net.gate import NetworkGate
 from astra_voice.net.http import HttpClient, NetworkError
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
 from astra_voice.security.verify import Verifier
+from astra_voice.worker.audio import AudioDevice, AudioError, list_devices
 
 log = logging.getLogger(__name__)
 
@@ -38,8 +46,8 @@ _REVOKED_MESSAGE = (
     "Издатель больше не рекомендует эту версию модели. "
     "Не устанавливайте её — скачайте свежую версию."
 )
-# После таймаута поток не должен уничтожаться вместе с контроллером до выхода run().
-_finishing_model_threads: set[QThread] = set()
+# После таймаута поток и задание должны оставаться живы до выхода run().
+_finishing_model_threads: set[tuple[QThread, _ModelJob | None]] = set()
 
 
 class ModelPort(Protocol):
@@ -563,6 +571,14 @@ class OnboardingHost(Protocol):
 
     def apply_hotkey(self, combo: str, mode: str) -> str: ...
 
+    def start_test(self, device: str, callback: TestCallback) -> bool: ...
+
+    def stop_test(self) -> None: ...
+
+    def cancel_test(self) -> None: ...
+
+    def reload_model(self) -> None: ...
+
     def notify_ready(self, combo: str) -> None: ...
 
     def hide_window(self) -> None: ...
@@ -589,10 +605,20 @@ class OnboardingController(QObject):
     modelHostChanged = pyqtSignal()
     modelSizeBytesChanged = pyqtSignal()
     modelSizeChanged = pyqtSignal()
+    modelRamChanged = pyqtSignal()
     progressChanged = pyqtSignal()
     speedChanged = pyqtSignal()
     etaChanged = pyqtSignal()
     modelMessageChanged = pyqtSignal()
+    devicesChanged = pyqtSignal()
+    deviceChanged = pyqtSignal()
+    levelChanged = pyqtSignal()
+    peakChanged = pyqtSignal()
+    testPhraseChanged = pyqtSignal()
+    testStateChanged = pyqtSignal()
+    testTextChanged = pyqtSignal()
+    testDurationChanged = pyqtSignal()
+    testMessageChanged = pyqtSignal()
 
     _MESSAGES = {
         "conflict": "Эта комбинация занята другой программой. Можно оставить её или выбрать другую",
@@ -607,6 +633,8 @@ class OnboardingController(QObject):
         settings: Settings,
         host: OnboardingHost | None = None,
         model: ModelPort | None = None,
+        dialog_factory: Callable[[], str] = QFileDialog.getExistingDirectory,
+        device_provider: Callable[[], list[AudioDevice]] = list_devices,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -614,6 +642,14 @@ class OnboardingController(QObject):
         self._settings = settings
         self._host = host
         self._model = model
+        self._dialog_factory = dialog_factory
+        self._devices = [{"id": "", "name": "Системный по умолчанию"}]
+        try:
+            self._devices.extend(
+                {"id": device.name, "name": device.label} for device in device_provider()
+            )
+        except (AudioError, OSError):
+            log.warning("Не удалось получить список микрофонов. Доступен системный по умолчанию.")
         self._entry = model.recommended() if model is not None else None
         self._model_state = "absent"
         self._model_message = ""
@@ -625,15 +661,30 @@ class OnboardingController(QObject):
         self._model_cancel = threading.Event()
         self._model_result: tuple[str, str] | None = None
         self._shutting_down = False
+        self._level = 0.0
+        self._peak = ""
+        self._test_state = "idle"
+        self._test_text = ""
+        self._test_duration = ""
+        self._test_message = ""
+        self._test_epoch = 0
         self._initial_model_state()
         step = settings.extra.get("onboarding_step")
         self._step = step if type(step) is int and 1 <= step <= 5 else 1
         self._capture_state = "idle"
         self._pending_combo = ""
         self._free_candidates: list[str] = []
-        for name in ("language", "checkAppUpdates", "checkModelUpdates", "hotkey", "hotkeyMode"):
+        for name in (
+            "language",
+            "checkAppUpdates",
+            "checkModelUpdates",
+            "hotkey",
+            "hotkeyMode",
+            "device",
+        ):
             getattr(bridge, name + "Changed").connect(getattr(self, name + "Changed").emit)
         bridge.extraChanged.connect(self._extra_changed)
+        self.deviceChanged.connect(self._clear_test)
         if "onboarding_language_set" not in settings.extra:
             self.setProperty(
                 "language", "ru" if os.environ.get("LANG", "").startswith("ru") else "en"
@@ -646,8 +697,10 @@ class OnboardingController(QObject):
             self.doneChanged.emit()
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
-        if event.type() in (QEvent.Hide, QEvent.Close) and self._capture_state == "capturing":
-            self.cancelCapture()
+        if event.type() in (QEvent.Hide, QEvent.Close):
+            if self._capture_state == "capturing":
+                self.cancelCapture()
+            self._clear_test()
         return bool(super().eventFilter(obj, event))
 
     @pyqtProperty(int, notify=stepChanged)
@@ -665,6 +718,7 @@ class OnboardingController(QObject):
             return
         if self._capture_state == "capturing":
             self.cancelCapture()
+        self._clear_test()
         self._step = step
         self.stepChanged.emit()
 
@@ -724,6 +778,11 @@ class OnboardingController(QObject):
     @pyqtProperty(str, notify=modelSizeChanged)
     def modelSize(self) -> str:  # noqa: N802
         return _megabytes(self.modelSizeBytes) if self._entry is not None else ""
+
+    @pyqtProperty(str, notify=modelRamChanged)
+    def modelRam(self) -> str:  # noqa: N802
+        # Каталог хранит МБ, а общий форматтер принимает байты.
+        return _megabytes(self._entry.min_ram_mb * 1_000_000) if self._entry is not None else ""
 
     @pyqtProperty(float, notify=progressChanged)
     def progress(self) -> float:
@@ -861,6 +920,12 @@ class OnboardingController(QObject):
         if self._model_thread is not None and self._model_state == "downloading":
             self._model_cancel.set()
 
+    @pyqtSlot()
+    def pickInstallPath(self) -> None:  # noqa: N802
+        path = self._dialog_factory()
+        if path:
+            self.installFromPath(path)
+
     @pyqtSlot(str)
     def installFromPath(self, path: str) -> None:  # noqa: N802
         if not path.strip():
@@ -872,6 +937,7 @@ class OnboardingController(QObject):
     def shutdown(self) -> None:
         """Отменяет загрузку и пробное распознавание; ждёт поток не дольше пяти секунд."""
         self._shutting_down = True
+        self._clear_test()
         self._model_cancel.set()
         if self._model_thread is not None:
             self._model_thread.quit()
@@ -882,9 +948,143 @@ class OnboardingController(QObject):
                 )
                 thread = self._model_thread
                 thread.setParent(None)
-                if thread not in _finishing_model_threads:
-                    _finishing_model_threads.add(thread)
-                    thread.finished.connect(lambda: _finishing_model_threads.discard(thread))
+                pair = (thread, self._model_job)
+                _finishing_model_threads.add(pair)
+                # После отсоединения потока обработчик finished может не выполниться,
+                # если очередь GUI уже не крутится; тогда реестр держит пару до конца процесса.
+                thread.finished.connect(lambda: _finishing_model_threads.discard(pair))
+                self._model_job = None
+                self._model_thread = None
+
+    @pyqtProperty("QVariantList", notify=devicesChanged)
+    def devices(self) -> list[dict[str, str]]:
+        return [dict(device) for device in self._devices]
+
+    @pyqtProperty(str, notify=deviceChanged)
+    def device(self) -> str:
+        return cast(str, self._bridge.device)
+
+    @device.setter  # type: ignore[no-redef]
+    def device(self, value: str) -> None:
+        self._bridge.device = value
+
+    @pyqtProperty(float, notify=levelChanged)
+    def level(self) -> float:
+        return self._level
+
+    @pyqtProperty(str, notify=peakChanged)
+    def peak(self) -> str:
+        return self._peak
+
+    @pyqtProperty(str, notify=testPhraseChanged)
+    def testPhrase(self) -> str:  # noqa: N802
+        return "Сегодня хороший день для прогулки."
+
+    @pyqtProperty(str, notify=testStateChanged)
+    def testState(self) -> str:  # noqa: N802
+        return self._test_state
+
+    @pyqtProperty(str, notify=testTextChanged)
+    def testText(self) -> str:  # noqa: N802
+        return self._test_text if self._step == 4 and not self.done else ""
+
+    @pyqtProperty(str, notify=testDurationChanged)
+    def testDuration(self) -> str:  # noqa: N802
+        return self._test_duration
+
+    @pyqtProperty(str, notify=testMessageChanged)
+    def testMessage(self) -> str:  # noqa: N802
+        return self._test_message
+
+    def _test_updated(self, update: MicrophoneTestUpdate) -> None:
+        """Единственный получатель речи проверки: память шага 4, без журналирования."""
+        old = (
+            self._test_state,
+            self._test_text,
+            self._test_duration,
+            self._test_message,
+            self._level,
+            self._peak,
+        )
+        self._test_state = update.state
+        self._test_text = update.text if update.state == "done" and self._step == 4 else ""
+        self._test_duration = (
+            f"{update.duration_s:.2f} с".replace(".", ",")
+            if update.state == "done" and update.duration_s is not None
+            else ""
+        )
+        self._test_message = update.message if update.state == "error" else ""
+        if update.state == "recording" and update.peak_dbfs is not None:
+            self._level = level_from_dbfs(update.peak_dbfs)
+            if math.isfinite(update.peak_dbfs):
+                self._peak = f"{update.peak_dbfs:.0f} дБ".replace("-", "−")
+        elif update.state != "recording":
+            self._level = 0.0
+        new = (
+            self._test_state,
+            self._test_text,
+            self._test_duration,
+            self._test_message,
+            self._level,
+            self._peak,
+        )
+        for name, before, after in zip(
+            ("testState", "testText", "testDuration", "testMessage", "level", "peak"),
+            old,
+            new,
+            strict=True,
+        ):
+            if before != after:
+                getattr(self, name + "Changed").emit()
+
+    def _clear_test(self) -> None:
+        self._test_epoch += 1
+        active = self._test_state in ("recording", "processing")
+        self._test_updated(MicrophoneTestUpdate("idle"))
+        if self._peak:
+            self._peak = ""
+            self.peakChanged.emit()
+        if active and self._host is not None:
+            try:
+                self._host.cancel_test()
+            except Exception:
+                # Даже текст исключения может содержать речь — не журналируем его.
+                pass
+
+    @pyqtSlot()
+    def startTest(self) -> None:  # noqa: N802
+        if (
+            self._host is None
+            or self._step != 4
+            or self._shutting_down
+            or self.done
+            or self._test_state in ("recording", "processing")
+        ):
+            return
+        self._clear_test()
+        epoch = self._test_epoch
+
+        def receive(update: MicrophoneTestUpdate) -> None:
+            if epoch != self._test_epoch or self._step != 4 or self._shutting_down:
+                return
+            if update.state in ("done", "error", "idle"):
+                self._test_epoch += 1
+            self._test_updated(update)
+
+        try:
+            self._host.start_test(self.device, receive)
+        except Exception:
+            receive(MicrophoneTestUpdate("error", message=TEST_FAILED))
+
+    @pyqtSlot()
+    def stopTest(self) -> None:  # noqa: N802
+        if self._host is None or self._test_state not in ("recording", "processing"):
+            return
+        try:
+            self._host.stop_test()
+        except Exception:
+            self._clear_test()
+            self._test_updated(MicrophoneTestUpdate("error", message=TEST_FAILED))
 
     @pyqtProperty(str, notify=languageChanged)
     def language(self) -> str:
@@ -1070,9 +1270,14 @@ class OnboardingController(QObject):
             return
         if not self._bridge.set_extra("onboarding_done", True):
             return
+        self._clear_test()
         if self._capture_state == "capturing":
             self.cancelCapture()
         if self._host is not None:
+            try:
+                self._host.reload_model()
+            except Exception:
+                log.warning("Не удалось перезагрузить модель после онбординга", exc_info=True)
             try:
                 self._host.notify_ready(self.hotkey)
             finally:

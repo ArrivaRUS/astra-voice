@@ -12,6 +12,7 @@ import os
 import socket
 import subprocess
 import sys
+import urllib.request
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
@@ -210,6 +211,26 @@ def test_catalog_fixture_matches_schema(catalog_root: Path, document: dict[str, 
     assert result.entry(MODEL_ID) is not None
 
 
+@pytest.mark.parametrize("has_resolver", [False, True], ids=["missing", "unusable"])
+def test_incompatible_jsonschema_resolver(
+    catalog_root: Path, monkeypatch: pytest.MonkeyPatch, has_resolver: bool
+) -> None:
+    import jsonschema
+
+    replacement = ModuleType("jsonschema")
+    for name in ("exceptions", "Draft202012Validator", "ValidationError", "SchemaError"):
+        setattr(replacement, name, getattr(jsonschema, name))
+    if has_resolver:
+        monkeypatch.setattr(replacement, "RefResolver", None, raising=False)
+    monkeypatch.setitem(sys.modules, "jsonschema", replacement)
+
+    with pytest.raises(CatalogError) as error:
+        load_builtin(StubVerifier(), root=catalog_root)
+
+    assert error.value.code == "bad-schema"
+    assert error.value.message == "Не удалось проверить каталог: несовместимая версия jsonschema."
+
+
 def test_schema_tampering_rejected_with_real_signature(tmp_path: Path) -> None:
     for name in ("catalog.json", "catalog.json.sig", "catalog.schema.json"):
         (tmp_path / name).write_bytes((DATA_ROOT / name).read_bytes())
@@ -320,6 +341,36 @@ def test_external_schema_reference_never_uses_network(
     assert error.value.message == "Не удалось подтвердить схему каталога."
     assert transport_send.call_count == 0
     assert requests_get.call_count == 0
+
+
+def test_external_schema_reference_rejected_by_local_resolver(
+    tmp_path: Path, document: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ИБ-1в: при совпавшем SHA-256 удалённый $ref блокирует локальный резолвер."""
+    schema_raw = json.dumps({"$ref": "https://evil.example/s.json"}).encode("utf-8")
+    (tmp_path / "catalog.schema.json").write_bytes(schema_raw)
+    (tmp_path / "catalog.json.sig").write_bytes(b"stub signature")
+    document["schema_sha256"] = hashlib.sha256(schema_raw).hexdigest()
+    write_document(tmp_path, document)
+
+    getaddrinfo = Mock(side_effect=AssertionError("DNS при разборе схемы"))
+    connect = Mock(side_effect=AssertionError("socket.connect при разборе схемы"))
+    requests_get = Mock(side_effect=AssertionError("requests.get при разборе схемы"))
+    urlopen = Mock(side_effect=AssertionError("urllib.request.urlopen при разборе схемы"))
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(requests, "get", requests_get)
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+
+    with pytest.raises(CatalogError) as error:
+        load_builtin(StubVerifier(), root=tmp_path)
+
+    assert error.value.code == "bad-schema"
+    assert error.value.message == "Каталог не соответствует схеме."
+    assert getaddrinfo.call_count == 0
+    assert connect.call_count == 0
+    assert requests_get.call_count == 0
+    assert urlopen.call_count == 0
 
 
 @pytest.mark.parametrize("has_signature", [True, False], ids=["changed-byte", "missing-signature"])

@@ -20,6 +20,7 @@ Item {
     property bool rowEnabled: true
     // Бейдж «Задано администратором» (§3.2).
     property bool locked: false
+    property string lockedText: ""
 
     default property alias controlData: slot.data
 
@@ -151,7 +152,7 @@ Item {
                 }
 
                 Text {
-                    text: qsTr("Задано администратором")
+                    text: root.lockedText !== "" ? root.lockedText : qsTr("Задано администратором")
                     color: Theme.lockBadgeFg
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.badgeSize

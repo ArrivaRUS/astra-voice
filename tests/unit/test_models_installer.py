@@ -5,7 +5,9 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import shutil
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -415,6 +417,141 @@ def test_install_from_folder(
     for name, data in contents.items():
         assert (source / name).read_bytes() == data
         assert (result.record.dir / name).read_bytes() == data
+    smoke.assert_called_once_with(result.record.dir, entry)
+
+
+def test_cancel_during_copy_clears_partial_file_and_keeps_current(
+    tmp_path: Path,
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    smoke: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous = _previous(store, entry, contents)
+    before = _pointer(store)
+    source = _write_files(tmp_path / "source", contents)
+    staging = store.root / entry.id / f"{entry.revision}.partial"
+    monkeypatch.setattr(inst, "_COPY_CHUNK", 2)
+    # Начальная проверка и два блока первого файла; отмена после второго блока.
+    cancel = Mock(side_effect=[False, False, True])
+    rmtree = shutil.rmtree
+
+    def clear_partial(directory: Path) -> None:
+        assert directory == staging
+        first = entry.files[0].path
+        assert (directory / first).read_bytes() == contents[first][:4]
+        assert not (directory / entry.files[1].path).exists()
+        rmtree(directory)
+
+    cleanup = Mock(side_effect=clear_partial)
+    monkeypatch.setattr(shutil, "rmtree", cleanup)
+
+    result = Installer(store, smoke).install_from_path(source, entry, cancel=cancel)
+
+    assert result.state == "error"
+    assert result.reason_code == "cancelled"
+    assert result.reason == "Установка отменена."
+    assert result.record is None
+    assert cancel.call_count == 3
+    cleanup.assert_called_once_with(staging)
+    assert not staging.exists()
+    assert not (store.root / entry.id / entry.revision).exists()
+    assert store.current() == previous
+    assert store.records() == (previous,)
+    assert _pointer(store) == before
+    for name, data in contents.items():
+        assert (source / name).read_bytes() == data
+    smoke.assert_not_called()
+
+
+@pytest.mark.parametrize("from_path", [False, True])
+def test_cancel_during_sha256_preserves_download_staging_and_keeps_current(
+    tmp_path: Path,
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    smoke: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    from_path: bool,
+) -> None:
+    previous = _previous(store, entry, contents)
+    before = _pointer(store)
+    staging = store.root / entry.id / f"{entry.revision}.partial"
+    source = (
+        _write_files(tmp_path / "source", contents) if from_path else _stage(store, entry, contents)
+    )
+    monkeypatch.setattr(inst, "_COPY_CHUNK", 2)
+    hashing = Mock(wraps=partial(inst.sha256_file, chunk=2))
+    monkeypatch.setattr(inst, "sha256_file", hashing)
+    hash_cancel = Mock(side_effect=[False, False, True])
+
+    def cancel() -> bool:
+        # При установке из папки пропускаем копирование и отменяем перечитывание.
+        return bool(hash_cancel()) if hashing.called else False
+
+    installer = Installer(store, smoke)
+    result = (
+        installer.install_from_path(source, entry, cancel=cancel)
+        if from_path
+        else installer.install_from_staging(entry, cancel=cancel)
+    )
+
+    assert result.state == "error"
+    assert result.reason_code == "cancelled"
+    assert result.reason == "Установка отменена."
+    assert result.record is None
+    assert hash_cancel.call_count == 3
+    hashing.assert_called_once_with(staging / entry.files[0].path, cancel=cancel)
+    if from_path:
+        assert not staging.exists()
+    else:
+        assert staging.is_dir()
+        for name, data in contents.items():
+            assert (staging / name).read_bytes() == data
+    assert not (store.root / entry.id / entry.revision).exists()
+    assert store.current() == previous
+    assert store.records() == (previous,)
+    assert _pointer(store) == before
+    smoke.assert_not_called()
+
+
+@pytest.mark.parametrize("from_path", [False, True])
+@pytest.mark.parametrize("with_callback", [False, True])
+def test_install_without_cancellation(
+    tmp_path: Path,
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    smoke: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    from_path: bool,
+    with_callback: bool,
+) -> None:
+    source = (
+        _write_files(tmp_path / "source", contents) if from_path else _stage(store, entry, contents)
+    )
+    monkeypatch.setattr(inst, "_COPY_CHUNK", 2)
+    cancel = Mock(return_value=False) if with_callback else None
+    installer = Installer(store, smoke)
+
+    result = (
+        installer.install_from_path(source, entry, cancel=cancel)
+        if from_path
+        else installer.install_from_staging(entry, cancel=cancel)
+    )
+
+    assert result.state == "ok"
+    assert result.reason_code == ""
+    assert result.reason == ""
+    assert result.record is not None
+    assert store.current() == result.record
+    assert store.records() == (result.record,)
+    assert not (store.root / entry.id / f"{entry.revision}.partial").exists()
+    for name, data in contents.items():
+        assert (result.record.dir / name).read_bytes() == data
+    if cancel is not None:
+        assert cancel.call_count > len(entry.files)
     smoke.assert_called_once_with(result.record.dir, entry)
 
 

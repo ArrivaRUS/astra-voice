@@ -22,6 +22,7 @@ from astra_voice.core.settings import Settings
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind
 from astra_voice.runtime import DictationRuntime
+from astra_voice.ui import notify
 
 pytestmark = pytest.mark.unit
 
@@ -40,6 +41,7 @@ class Rig:
         self.theme = Mock()
         self.shell = Mock()
         self.shell.rootObjects.return_value = [Mock()]
+        self.load_qml = Mock(return_value=self.shell)
         self.show = Mock()
         self.cleanup = Mock()
         self.runtime = Mock()
@@ -69,9 +71,10 @@ class Rig:
         monkeypatch.setattr(paths_mod, "data_dir", lambda: tmp_path / "data")
         monkeypatch.setattr(paths_mod, "settings_path", lambda: tmp_path / "settings.json")
         monkeypatch.setattr(app_mod, "_ensure_settings_file", Mock())
-        monkeypatch.setattr(app_mod, "_make_app_info", Mock())
+        monkeypatch.delenv("ASTRA_VOICE_DEBUG", raising=False)
+        monkeypatch.setattr(notify, "_action_handlers", {})
         monkeypatch.setattr(app_mod, "_make_theme_bridge", Mock(return_value=self.theme))
-        monkeypatch.setattr(app_mod, "_load_qml", Mock(return_value=self.shell))
+        monkeypatch.setattr(app_mod, "_load_qml", self.load_qml)
         monkeypatch.setattr(app_mod, "_wire_close", Mock())
         monkeypatch.setattr(app_mod, "ShowServer", Mock(return_value=self.server))
         monkeypatch.setattr(app_mod, "_show", self.show)
@@ -82,6 +85,62 @@ class Rig:
 @pytest.fixture
 def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
     return Rig(monkeypatch, tmp_path)
+
+
+@pytest.mark.parametrize("debug", [False, True])
+@pytest.mark.parametrize("environment", [None, "", "0", "1"])
+def test_app_info_debug_initial_value(
+    monkeypatch: pytest.MonkeyPatch, debug: bool, environment: str | None
+) -> None:
+    monkeypatch.delenv("ASTRA_VOICE_DEBUG", raising=False)
+    if environment is not None:
+        monkeypatch.setenv("ASTRA_VOICE_DEBUG", environment)
+    args = app_mod._parse_args(["--debug"] if debug else [])
+    info = app_mod._make_app_info(SessionKind.KDE, "ok", debug=args.debug)
+
+    assert info.debug is (debug or environment == "1")
+    assert info.property("debug") is info.debug
+    meta = info.metaObject()
+    prop = meta.property(meta.indexOfProperty("debug"))
+    assert prop.typeName() == "bool"
+    assert not prop.isConstant()
+    assert prop.notifySignal().methodSignature() == b"debugChanged()"
+    assert meta.indexOfSignal(b"showSection(QString)") >= 0
+
+
+def test_app_info_show_debug_enables_section_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ASTRA_VOICE_DEBUG", raising=False)
+    info = app_mod._make_app_info(SessionKind.KDE, "ok")
+    events: list[tuple[str, bool]] = []
+    info.debugChanged.connect(lambda: events.append(("changed", info.debug)))
+    info.showSection.connect(lambda name: events.append((name, info.debug)))
+
+    info.show_section("debug")
+    assert info.debug is True
+    assert events == [("changed", True), ("debug", True)]
+
+    info.show_section("debug")
+    assert events == [("changed", True), ("debug", True), ("debug", True)]
+
+
+def test_app_info_show_models_keeps_debug_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ASTRA_VOICE_DEBUG", raising=False)
+    info = app_mod._make_app_info(SessionKind.KDE, "ok")
+    changed = QSignalSpy(info.debugChanged)
+    sections = QSignalSpy(info.showSection)
+
+    info.show_section("models")
+
+    assert info.debug is False
+    assert len(changed) == 0
+    assert list(sections) == [["models"]]
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_main_passes_debug_flag_to_app_info(rig: Rig, debug: bool) -> None:
+    assert app_mod.main(["--debug"] if debug else []) == 7
+    info = rig.load_qml.call_args.args[0]
+    assert info.debug is debug
 
 
 def test_shutdown_once_before_other_cleanup(rig: Rig) -> None:
@@ -290,14 +349,49 @@ def test_tray_opens_main_window(rig: Rig, action: str) -> None:
     rig.show.assert_called_once_with(rig.shell)
 
 
-def test_pill_details_opens_main_window(rig: Rig) -> None:
+@pytest.mark.parametrize("source", ["pill", "notification"])
+def test_details_opens_main_window_and_debug_section(rig: Rig, source: str) -> None:
+    events: list[tuple[str, bool]] = []
+
     def exec_loop() -> int:
-        rig.runtime.pill.on_details_clicked()
+        info = rig.load_qml.call_args.args[0]
+        assert info.debug is False
+        info.debugChanged.connect(lambda: events.append(("changed", info.debug)))
+        info.showSection.connect(lambda name: events.append((name, info.debug)))
+        rig.show.side_effect = lambda shell: events.append(("show", info.debug))
+        if source == "pill":
+            rig.runtime.pill.on_details_clicked()
+        else:
+            notify._action_handlers[notify.ACTION_SHOW_DETAILS]()
         return 0
 
     rig.app.exec_.side_effect = exec_loop
     assert app_mod.main(["--hidden"]) == 0
     rig.show.assert_called_once_with(rig.shell)
+    assert events == [("show", False), ("changed", True), ("debug", True)]
+
+
+@pytest.mark.parametrize(
+    "action, section",
+    [
+        (notify.ACTION_SHOW_DETAILS, "debug"),
+        (notify.ACTION_CHOOSE_MICROPHONE, "general"),
+        (notify.ACTION_CHOOSE_HOTKEY, "general"),
+    ],
+)
+def test_notification_action_shows_its_section(rig: Rig, action: str, section: str) -> None:
+    def exec_loop() -> int:
+        info = rig.load_qml.call_args.args[0]
+        sections = QSignalSpy(info.showSection)
+
+        notify._action_handlers[action]()
+
+        rig.show.assert_called_once_with(rig.shell)
+        assert list(sections) == [[section]]
+        return 0
+
+    rig.app.exec_.side_effect = exec_loop
+    assert app_mod.main(["--hidden"]) == 0
 
 
 @pytest.mark.parametrize("during_start", [False, True])
@@ -312,6 +406,7 @@ def test_notification_action_opens_main_window(rig: Rig, during_start: bool) -> 
         rig.app.exec_.side_effect = click_action
     assert app_mod.main(["--hidden"]) == (7 if during_start else 0)
     rig.show.assert_called_once_with(rig.shell)
+    assert rig.load_qml.call_args.args[0].debug is False
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])

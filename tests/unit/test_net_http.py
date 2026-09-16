@@ -5,7 +5,11 @@ pytest.importorskip("requests")
 # Импорт зависимости должен предшествовать импорту проверяемого модуля.
 # ruff: noqa: E402
 import gzip
+import logging
 import os
+import shutil
+import ssl
+import subprocess
 import threading
 import time
 import urllib.request
@@ -42,6 +46,12 @@ class LocalServer:
     url: str
     requests: list[tuple[str, dict[str, str]]]
     release: threading.Event
+
+
+@dataclass
+class LocalTLSServer(LocalServer):
+    ca_bundle: Path
+    dripping: threading.Event
 
 
 @pytest.fixture(autouse=True)
@@ -163,6 +173,117 @@ def local_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[LocalServer]:
         assert not thread.is_alive()
 
 
+@pytest.fixture(scope="session")
+def tls_cert_pair(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    """Генерирует временный сертификат и ключ один раз за сессию TLS-тестов."""
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("Для TLS-тестов нужен openssl")
+    directory = tmp_path_factory.mktemp("tls")
+    cert = directory / "cert.pem"
+    key = directory / "key.pem"
+    subprocess.run(
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=127.0.0.1",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return cert, key
+
+
+@pytest.fixture
+def local_tls_server(
+    monkeypatch: pytest.MonkeyPatch, tls_cert_pair: tuple[Path, Path]
+) -> Iterator[LocalTLSServer]:
+    """Настоящий TLS с доверенным тестовым сертификатом и незавершённой каплей."""
+    cert, key = tls_cert_pair
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    seen: list[tuple[str, dict[str, str]]] = []
+    workers: list[threading.Thread] = []
+    release = threading.Event()
+    dripping = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            workers.append(threading.current_thread())
+            seen.append((self.path, dict(self.headers)))
+            try:
+                if self.path.startswith("/redirect/"):
+                    remaining = int(self.path.rsplit("/", 1)[1]) - 1
+                    self.send_response(302)
+                    self.send_header(
+                        "Location", f"/redirect/{remaining}" if remaining else "/drip-headers"
+                    )
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if self.path == "/drip-headers":
+                    self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Drip: ")
+                    # Не заканчиваем ни строку заголовка, ни блок заголовков.
+                else:
+                    assert self.path == "/drip-body"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(2 * 65536))
+                    self.end_headers()
+                while not release.is_set():
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                    dripping.set()
+                    if release.wait(0.05):
+                        return
+            except OSError:
+                # shutdown клиента штатно обрывает TLS-запись сервера.
+                pass
+
+        def log_message(self, format: str, *args: object) -> None:
+            """Не пишет служебный журнал сервера в вывод тестов."""
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = False
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+    # При регрессии прекращаем каплю позже проверяемых пределов, чтобы тест не висел.
+    failsafe = threading.Timer(5, release.set)
+    monkeypatch.setattr(http, "ALLOWED_HOSTS", ("127.0.0.1",))
+    monkeypatch.setattr(http, "ALLOWED_SCHEMES", ("https",))
+    monkeypatch.setattr(http, "ALLOWED_PORTS", (server.server_port,))
+    thread.start()
+    failsafe.start()
+    try:
+        yield LocalTLSServer(
+            f"https://127.0.0.1:{server.server_port}", seen, release, cert, dripping
+        )
+    finally:
+        release.set()
+        failsafe.cancel()
+        failsafe.join(timeout=3)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+        assert not failsafe.is_alive()
+        assert not thread.is_alive()
+        assert all(not worker.is_alive() for worker in workers)
+
+
 @pytest.fixture
 def client() -> HttpClient:
     return HttpClient(NetworkGate(Settings(), Policy()), user_agent=_USER_AGENT)
@@ -240,6 +361,31 @@ def test_download_and_headers(
     assert headers["Connection"] == "close"
     assert "Authorization" not in headers
     assert "Cookie" not in headers
+
+
+def test_stream_socket_is_available(client: HttpClient, local_server: LocalServer) -> None:
+    with client.get_stream(
+        local_server.url + "/ok", deadline_s=2, cancel=threading.Event()
+    ) as response:
+        assert response._socket is not None
+
+
+def test_stream_without_socket_warns_once(
+    client: HttpClient, transport: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger=http.__name__):
+        with client.get_stream(
+            "https://huggingface.co/file", deadline_s=2, cancel=threading.Event()
+        ) as response:
+            assert response._socket is None
+            assert b"".join(response.iter_chunks()) == _BODY
+    assert caplog.record_tuples == [
+        (
+            http.__name__,
+            logging.WARNING,
+            "Не удалось получить сокет потока: отмена может срабатывать медленнее.",
+        )
+    ]
 
 
 @pytest.mark.parametrize(("path", "status"), [("/range", 206), ("/ok", 200)])
@@ -397,6 +543,115 @@ def drip_server(local_server: LocalServer) -> Iterator[LocalServer]:
         local_server.release.set()
         failsafe.cancel()
         failsafe.join()
+
+
+@pytest.mark.parametrize("reason", ("cancelled", "timeout"))
+@pytest.mark.parametrize("redirects", (0, 2))
+def test_tls_drip_headers_stop_before_response(
+    local_tls_server: LocalTLSServer,
+    sessions: list[requests.Session],
+    reason: str,
+    redirects: int,
+) -> None:
+    """ИБ-2в: отмена и общий дедлайн прерывают TLS-чтение незавершённых заголовков."""
+    client = HttpClient(
+        NetworkGate(Settings(), Policy()),
+        ca_bundle=local_tls_server.ca_bundle,
+        user_agent=_USER_AGENT,
+    )
+    cancel = threading.Event()
+    stop_canceller = threading.Event()
+    cancelled_at: list[float] = []
+    threads_before = set(threading.enumerate())
+
+    def cancel_request() -> None:
+        if local_tls_server.dripping.wait(2) and not stop_canceller.wait(0.2):
+            cancelled_at.append(time.monotonic())
+            cancel.set()
+
+    canceller = threading.Thread(target=cancel_request) if reason == "cancelled" else None
+    deadline = 30.0 if reason == "cancelled" else 1.0
+    path = f"/redirect/{redirects}" if redirects else "/drip-headers"
+    started = time.monotonic()
+    if canceller is not None:
+        canceller.start()
+    try:
+        with pytest.raises(NetworkError) as caught:
+            with client.get_stream(local_tls_server.url + path, deadline_s=deadline, cancel=cancel):
+                pytest.fail("Клиент вернул ответ с незавершёнными заголовками")
+        finished = time.monotonic()
+        assert local_tls_server.dripping.is_set()
+        assert len(local_tls_server.requests) == redirects + 1
+        assert caught.value.code == reason
+        if reason == "cancelled":
+            assert cancelled_at
+            assert 0 <= finished - cancelled_at[0] <= 2.0
+            assert str(caught.value) == "Загрузка отменена."
+        else:
+            assert deadline <= finished - started <= deadline + 2.0
+            assert str(caught.value) == "Время ожидания загрузки истекло."
+        sessions[0].close.assert_called_once()
+    finally:
+        local_tls_server.release.set()
+        stop_canceller.set()
+        if canceller is not None:
+            canceller.join(timeout=3)
+            assert not canceller.is_alive()
+        assert not [
+            thread
+            for thread in threading.enumerate()
+            if thread not in threads_before
+            and thread.name in ("http-request-watchdog", "http-stream-watchdog")
+        ]
+
+
+def test_tls_drip_body_cancel_interrupts_ssl_read(
+    local_tls_server: LocalTLSServer, sessions: list[requests.Session]
+) -> None:
+    """ИБ-2г: сторож сохраняет SSLSocket и прерывает каплю тела по HTTPS."""
+    client = HttpClient(
+        NetworkGate(Settings(), Policy()),
+        ca_bundle=local_tls_server.ca_bundle,
+        user_agent=_USER_AGENT,
+    )
+    cancel = threading.Event()
+    cancelled_at: list[float] = []
+    threads_before = set(threading.enumerate())
+
+    def cancel_request() -> None:
+        cancelled_at.append(time.monotonic())
+        cancel.set()
+
+    timer = threading.Timer(0.2, cancel_request)
+    with client.get_stream(
+        local_tls_server.url + "/drip-body", deadline_s=30, cancel=cancel
+    ) as response:
+        assert isinstance(response._socket, ssl.SSLSocket)
+        assert int(response.headers["Content-Length"]) > 65536
+        started = time.monotonic()
+        timer.start()
+        try:
+            with pytest.raises(NetworkError) as caught:
+                next(response.iter_chunks(65536))
+            finished = time.monotonic()
+            assert caught.value.code == "cancelled"
+            assert cancelled_at
+            assert 0 <= finished - cancelled_at[0] <= 2.0
+            assert 0.2 <= finished - started <= 2.5
+            assert response._response.raw.closed
+            assert not response._watchdog.is_alive()
+            sessions[0].close.assert_called_once()
+        finally:
+            local_tls_server.release.set()
+            timer.cancel()
+            timer.join(timeout=3)
+            assert not timer.is_alive()
+    assert not [
+        thread
+        for thread in threading.enumerate()
+        if thread not in threads_before
+        and thread.name in ("http-request-watchdog", "http-stream-watchdog")
+    ]
 
 
 def test_drip_cancel_interrupts_block_read(
@@ -662,7 +917,7 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> Mock:
     return send
 
 
-@pytest.mark.parametrize("limit", (0, 1, 1023, 1024, 1025, 65535, 65536, 65537))
+@pytest.mark.parametrize("limit", (0, 1, 1023, 1024, 1025, 65535, 65536, 65537, 131072))
 def test_stream_limit_bounds_actual_reads_in_blocks(
     client: HttpClient, transport: Mock, monkeypatch: pytest.MonkeyPatch, limit: int
 ) -> None:
@@ -676,11 +931,73 @@ def test_stream_limit_bounds_actual_reads_in_blocks(
         "https://huggingface.co/file", deadline_s=2, cancel=threading.Event()
     ) as response:
         chunks = list(response.iter_chunks(limit=limit))
-    expected_sizes = [1024] * (limit // 1024)
-    if limit % 1024:
-        expected_sizes.append(limit % 1024)
+    expected_sizes = [65536] * (limit // 65536)
+    if limit % 65536:
+        expected_sizes.append(limit % 65536)
     assert [len(chunk) for chunk in chunks] == expected_sizes
     assert [call.args[0] for call in read.call_args_list] == expected_sizes
+    assert received.raw.closed
+    assert not response._watchdog.is_alive()
+
+
+def test_stream_reads_requested_chunk_size(
+    client: HttpClient, transport: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    received = _response()
+    body = b"x" * (2 * 65536 + 17)
+    received.raw = BytesIO(body)
+    received.headers["Content-Length"] = str(len(body))
+    read = Mock(wraps=received.raw.read)
+    monkeypatch.setattr(received.raw, "read", read)
+    transport.side_effect = None
+    transport.return_value = received
+    with client.get_stream(
+        "https://huggingface.co/file", deadline_s=2, cancel=threading.Event()
+    ) as response:
+        chunks = list(response.iter_chunks(chunk_size=65536))
+    assert [len(chunk) for chunk in chunks] == [65536, 65536, 17]
+    assert b"".join(chunks) == body
+    # Три блока данных и одно чтение EOF, все запрошены размером 64 КиБ.
+    assert [call.args[0] for call in read.call_args_list] == [65536] * 4
+    received.close.assert_called_once()
+    assert not response._watchdog.is_alive()
+
+
+@pytest.mark.parametrize("short_size", (1, 7, 257))
+def test_stream_limit_short_reads_bound_iterators(
+    client: HttpClient,
+    transport: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    short_size: int,
+) -> None:
+    chunk_size = 65536
+    limit = 4097
+    received = _response()
+    body = bytes(range(256)) * 32
+    received.raw = BytesIO(body)
+    received.headers["Content-Length"] = str(len(body))
+    original_read = received.raw.read
+    positions: list[int] = []
+
+    def short_read(size: int) -> bytes:
+        # Даже запрос чтения не должен выходить за оставшийся лимит.
+        assert 0 < size <= limit - received.raw.tell()
+        data: bytes = original_read(min(size, short_size))
+        positions.append(received.raw.tell())
+        return data
+
+    monkeypatch.setattr(received.raw, "read", short_read)
+    iterate = Mock(wraps=received.iter_content)
+    monkeypatch.setattr(received, "iter_content", iterate)
+    transport.side_effect = None
+    transport.return_value = received
+    with client.get_stream(
+        "https://huggingface.co/file", deadline_s=2, cancel=threading.Event()
+    ) as response:
+        chunks = list(response.iter_chunks(chunk_size=chunk_size, limit=limit))
+    assert b"".join(chunks) == body[:limit]
+    assert positions[-1] == limit
+    assert iterate.call_count <= chunk_size.bit_length() + 1
     assert received.raw.closed
     assert not response._watchdog.is_alive()
 

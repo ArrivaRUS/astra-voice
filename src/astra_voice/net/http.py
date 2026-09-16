@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import threading
@@ -13,10 +14,14 @@ from types import TracebackType
 from urllib.parse import urljoin, urlsplit
 
 import requests
+from urllib3 import HTTPConnectionPool, HTTPSConnectionPool, ProxyManager
+from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.exceptions import ReadTimeoutError
 
 from astra_voice.net.gate import NetworkGate, NetworkKind
 from astra_voice.net.hosts import ALLOWED_HOSTS, host_allowed
+
+log = logging.getLogger(__name__)
 
 ALLOWED_SCHEMES = ("https",)
 ALLOWED_PORTS = (None, 443)
@@ -27,7 +32,6 @@ _SYSTEM_CA_BUNDLE = Path("/etc/ssl/certs/ca-certificates.crt")
 # пополняет, но не позволяет накопить неограниченный кредит на последующий простой.
 _MIN_SPEED_BYTES_PER_SECOND = 128
 _MIN_SPEED_GRACE_S = 30.0
-_READ_CHUNK_SIZE = 1024
 _WATCHDOG_INTERVAL_S = 0.05
 
 
@@ -108,6 +112,76 @@ def _request_error(error: requests.exceptions.RequestException, host: str) -> Ne
     return NetworkError("host-unreachable", f"Не удалось связаться с {host}.")
 
 
+def _shutdown_socket(sock: socket.socket | None) -> None:
+    if sock is not None:
+        try:
+            # Базовый метод не меняет _sslobj у SSLSocket во время TLS-чтения.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        except OSError:
+            # Сокет мог уже закрыться при EOF или ошибке транспорта.
+            pass
+
+
+class _RequestWatchdog:
+    """Прерывает отправку и чтение заголовков, пока StreamResponse ещё не создан."""
+
+    def __init__(self, deadline_at: float, cancel: threading.Event) -> None:
+        self._deadline_at = deadline_at
+        self._cancel = cancel
+        self._connections: list[HTTPConnection] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch, name="http-request-watchdog")
+        self._thread.start()
+
+    def register(self, connection: HTTPConnection) -> None:
+        with self._lock:
+            self._connections.append(connection)
+
+    def _watch(self) -> None:
+        while not self._stop.wait(_WATCHDOG_INTERVAL_S):
+            try:
+                _remaining(self._deadline_at, self._cancel)
+            except NetworkError:
+                with self._lock:
+                    for connection in self._connections:
+                        sock = connection.sock
+                        if isinstance(sock, socket.socket):
+                            _shutdown_socket(sock)
+                # При регистрации соединения сокета ещё нет. Продолжаем следить:
+                # он может появиться после отмены, в том числе после TLS-обёртки.
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join()
+
+
+class _RequestAdapter(requests.adapters.HTTPAdapter):
+    """Регистрирует соединения до connect/request/getresponse, включая прокси."""
+
+    def __init__(self, watchdog: _RequestWatchdog) -> None:
+        class HTTPPool(HTTPConnectionPool):
+            def _new_conn(self) -> HTTPConnection:
+                connection: HTTPConnection = super()._new_conn()
+                watchdog.register(connection)
+                return connection
+
+        class HTTPSPool(HTTPSConnectionPool):
+            def _new_conn(self) -> HTTPSConnection:
+                connection: HTTPSConnection = super()._new_conn()
+                watchdog.register(connection)
+                return connection
+
+        super().__init__()
+        # Меняем словарь только этого менеджера, не глобальный словарь urllib3.
+        self.poolmanager.pool_classes_by_scheme = {"http": HTTPPool, "https": HTTPSPool}
+
+    def proxy_manager_for(self, proxy: str, **proxy_kwargs: object) -> ProxyManager:
+        manager: ProxyManager = super().proxy_manager_for(proxy, **proxy_kwargs)
+        manager.pool_classes_by_scheme = self.poolmanager.pool_classes_by_scheme
+        return manager
+
+
 class _Session(requests.Session):
     """Сессия без скрытого чтения тела и подготовки следующего перенаправления."""
 
@@ -158,6 +232,8 @@ class StreamResponse:
         raw = getattr(getattr(fp, "fp", None), "raw", None)
         sock = getattr(raw, "_sock", None)
         self._socket = sock if isinstance(sock, socket.socket) else None
+        if self._socket is None:
+            log.warning("Не удалось получить сокет потока: отмена может срабатывать медленнее.")
         self._watchdog = threading.Thread(target=self._watch, name="http-stream-watchdog")
         self._watchdog.start()
 
@@ -174,13 +250,7 @@ class StreamResponse:
 
     def _shutdown_socket(self) -> None:
         """Прерывает recv под self._lock, не закрывая читаемый BufferedReader."""
-        if self._socket is not None:
-            try:
-                # Базовый метод не меняет _sslobj у SSLSocket во время TLS-чтения.
-                socket.socket.shutdown(self._socket, socket.SHUT_RDWR)
-            except OSError:
-                # Сокет мог уже закрыться при EOF или ошибке транспорта.
-                pass
+        _shutdown_socket(self._socket)
 
     def _watch(self) -> None:
         """Следит за остановкой даже внутри requests/urllib3 read(amt)."""
@@ -201,9 +271,9 @@ class StreamResponse:
                 raise ValueError("Размер блока должен быть положительным.")
             if limit is not None and limit < 0:
                 raise ValueError("Лимит чтения должен быть неотрицательным.")
-            # Ограничиваем задержку учёта прогресса. Само read(amt) по-прежнему
-            # блокируется до заполнения; его прерывает сторож, а не размер блока.
-            read_size = min(chunk_size, _READ_CHUNK_SIZE)
+            # Читаем запрошенными блоками: сторож прерывает read(amt) через сокет,
+            # поэтому отзывчивость отмены и дедлайна не зависит от размера блока.
+            read_size = chunk_size
             chunks = self._response.iter_content(chunk_size=read_size)
             # Закрытие старого генератора urllib3 прерывает chunked-ответ.
             # Держим итераторы живыми до завершения чтения ограниченного хвоста.
@@ -214,7 +284,11 @@ class StreamResponse:
                         return
                     if limit < read_size:
                         # Размер хвоста задаём до чтения, не обрезаем уже прочитанное.
-                        read_size = limit
+                        # При коротких chunked-блоках повторно уменьшаем размер
+                        # минимум вдвое: сохраняем не более bit_length + 1 итераторов.
+                        read_size = (
+                            limit if len(iterators) == 1 else min(limit, max(1, read_size // 2))
+                        )
                         chunks = self._response.iter_content(chunk_size=read_size)
                         iterators.append(chunks)
                 with self._read_lock:
@@ -315,7 +389,11 @@ class HttpClient:
         session.trust_env = False
         session.headers.clear()
         redirects = 0
+        watchdog: _RequestWatchdog | None = None
         try:
+            watchdog = _RequestWatchdog(deadline_at, cancel)
+            for scheme in ("http://", "https://"):
+                session.mount(scheme, _RequestAdapter(watchdog))
             while True:
                 host = _validate_url(url)
                 proxies = urllib.request.getproxies()
@@ -343,6 +421,11 @@ class HttpClient:
                         allow_redirects=False,
                     )
                 except requests.exceptions.RequestException as error:
+                    # shutdown прерывает транспорт, но причина — отмена/дедлайн.
+                    try:
+                        _remaining(deadline_at, cancel)
+                    except NetworkError as stopped:
+                        raise stopped from None
                     raise _request_error(error, host) from None
                 try:
                     _remaining(deadline_at, cancel)
@@ -394,3 +477,6 @@ class HttpClient:
         except BaseException:
             session.close()
             raise
+        finally:
+            if watchdog is not None:
+                watchdog.close()

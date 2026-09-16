@@ -11,16 +11,55 @@ Item {
     property string barHint: ""
     property bool skipEnabled: true
 
+    readonly property var devices: microphoneDevices()
     readonly property string device: bridge ? bridge.device : ""
     readonly property real level: bridge ? bridge.level : 0
-    // Макет design/mockups/final/08-onboarding-4-mic.html: значения при отсутствии данных моста.
-    readonly property string peak: bridge && bridge.peak ? bridge.peak : qsTr("−18 дБ")
-    readonly property string testDuration: bridge && bridge.testDuration ? bridge.testDuration : qsTr("0,31 с")
+    readonly property string peak: bridge ? bridge.peak : ""
+    readonly property string testDuration: bridge ? bridge.testDuration : ""
     readonly property string testModel: bridge && bridge.modelName ? bridge.modelName : qsTr("GigaAM v3 RNN-T")
+    readonly property string testPhrase: bridge ? bridge.testPhrase : ""
     readonly property string testText: bridge ? bridge.testText : ""
-    readonly property string testState: bridge ? bridge.testState : ""
+    readonly property string testState: bridge ? bridge.testState : "idle"
+    readonly property string testMessage: bridge ? bridge.testMessage : ""
     readonly property bool silent: level <= 0.02 // Порог «тишина» по заданию шага 4.
     readonly property bool testing: testState === "recording" || testState === "processing"
+
+    // Без моста или устройств оставляем системный выбор с пустым идентификатором.
+    function microphoneDevices() {
+        if (root.bridge && root.bridge.devices.length > 0)
+            return root.bridge.devices
+        return [{ id: "", name: qsTr("Системный по умолчанию") }]
+    }
+
+    // Список показывает имена; идентификаторы остаются в исходных объектах.
+    function deviceNames() {
+        var names = []
+        for (var i = 0; i < root.devices.length; ++i)
+            names.push(root.devices[i].name)
+        return names
+    }
+
+    // Выбор ищем по идентификатору: одинаковые имена не объединяют устройства.
+    function deviceIndex(deviceId) {
+        for (var i = 0; i < root.devices.length; ++i) {
+            if (root.devices[i].id === deviceId)
+                return i
+        }
+        return -1
+    }
+
+    // Пояснение содержит имя выбранного микрофона; для системного выбора оно пустое.
+    function deviceName(deviceId) {
+        if (deviceId === "")
+            return ""
+        var index = deviceIndex(deviceId)
+        return index >= 0 ? root.devices[index].name : ""
+    }
+
+    // Обратно в мост передаём идентификатор выбранного пункта, а не его имя.
+    function deviceIdAt(index) {
+        return index >= 0 && index < root.devices.length ? root.devices[index].id : ""
+    }
 
     implicitWidth: 580 // Макет 08-onboarding-4-mic.html: ширина содержимого.
     implicitHeight: silenceNote.y + silenceNote.height
@@ -78,25 +117,24 @@ Item {
                 showHint: false
                 label: qsTr("Микрофон")
                 // design/spec.md §3.2: пояснение только при явном выборе устройства.
-                sub: (root.device !== "" && root.device !== qsTr("Системный по умолчанию")) ? root.device : ""
+                sub: root.deviceName(root.device)
 
                 AvSelect {
                     id: deviceSelector
                     Layout.preferredWidth: 236 // Макет: ширина списка микрофонов.
                     Layout.alignment: Qt.AlignVCenter
-                    model: root.bridge && root.bridge.devices
-                           ? root.bridge.devices : [qsTr("Системный по умолчанию")]
+                    model: root.deviceNames()
 
                     // Binding сохраняет синхронизацию после ручного выбора.
                     Binding {
                         target: deviceSelector
                         property: "currentIndex"
-                        value: root.bridge ? deviceSelector.model.indexOf(root.device) : 0
+                        value: root.deviceIndex(root.device)
                     }
 
                     onActivated: {
                         if (root.bridge)
-                            root.bridge.device = currentText
+                            root.bridge.device = root.deviceIdAt(currentIndex)
                     }
                 }
             }
@@ -155,7 +193,10 @@ Item {
 
                 Text {
                     width: parent.width
-                    text: root.silent ? qsTr("Звука с этого микрофона пока нет") : qsTr("Пик %1 · уровень в норме").arg(root.peak)
+                    text: root.silent ? qsTr("Звука с этого микрофона пока нет")
+                        : root.peak !== "" ? qsTr("Пик %1 · уровень в норме").arg(root.peak) : ""
+                    visible: text !== ""
+                    height: visible ? implicitHeight : 0
                     color: Theme.fgMuted
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontSettingSubSize
@@ -169,11 +210,15 @@ Item {
             AvButton {
                 Layout.alignment: Qt.AlignVCenter
                 iconName: "chip"
-                text: qsTr("Тестовая диктовка")
-                enabled: !root.testing
+                text: root.testState === "recording" ? qsTr("Остановить") : qsTr("Тестовая диктовка")
+                enabled: root.testState !== "processing"
                 onClicked: {
-                    if (root.bridge)
-                        root.bridge.testPhrase()
+                    if (root.bridge) {
+                        if (root.testState === "recording")
+                            root.bridge.stopTest()
+                        else
+                            root.bridge.startTest()
+                    }
                 }
             }
         }
@@ -195,7 +240,8 @@ Item {
             x: Theme.fieldPaddingX
             y: Theme.fieldPaddingY
             width: parent.width - Theme.fieldPaddingX * 2
-            text: root.testState === "recording" ? qsTr("Слушаю…")
+            text: root.testState === "recording"
+                ? (root.testPhrase !== "" ? qsTr("Слушаю… Скажите: «%1»").arg(root.testPhrase) : qsTr("Слушаю…"))
                 : root.testState === "processing" ? qsTr("Распознаю…") : root.testText
             color: root.testing ? Theme.fgMuted : Theme.fg
             font.family: Theme.fontUi
@@ -238,8 +284,11 @@ Item {
         Text {
             Layout.fillWidth: true
             Layout.alignment: Qt.AlignVCenter
-            text: root.testState === "error" ? qsTr("Не удалось распознать — попробуйте ещё раз")
-                : qsTr("Распознано за %1 · модель %2 · текст никуда не вставлен").arg(root.testDuration).arg(root.testModel)
+            text: root.testState === "error"
+                ? (root.testMessage !== "" ? root.testMessage : qsTr("Не удалось распознать — попробуйте ещё раз"))
+                : root.testDuration !== ""
+                    ? qsTr("Распознано за %1 · модель %2 · текст никуда не вставлен").arg(root.testDuration).arg(root.testModel)
+                    : qsTr("Распознано · модель %1 · текст никуда не вставлен").arg(root.testModel)
             color: root.testState === "error" ? Theme.dangerInk : Theme.successInk
             font.family: Theme.fontUi
             font.pixelSize: Theme.fontCaptionSize

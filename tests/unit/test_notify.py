@@ -130,6 +130,42 @@ def test_action_invoked_once_and_redelivery_rearms(transport: Mock, notification
     transport.bus.connect.assert_called_once()
 
 
+def test_action_closed_notification_id_reused_by_daemon_is_ignored(transport: Mock) -> None:
+    handler = Mock()
+    notifications.set_action_handler("details", handler)
+    notifications.notify("Заголовок", actions=[("details", "Подробности")])
+    # Выбор действия закрывает non-resident уведомление; NotificationClosed не подписан.
+    _invoke_action(transport, 41, "details")
+    handler.assert_called_once_with()
+    assert 41 not in notifications._notification_actions
+    handler.reset_mock()
+
+    # Демон выдал тот же ID чужому уведомлению с таким же ключом действия.
+    _invoke_action(transport, 41, "details")
+    handler.assert_not_called()
+
+
+def test_notification_actions_evict_oldest_when_replacement_id_is_lost(
+    transport: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    handler = Mock()
+    notifications.set_action_handler("details", handler)
+    limit = notifications._pending.maxlen
+    assert limit is not None
+    for notification_id in range(1, limit * 3 + 1):
+        # Проверяем границу независимо от штатной очистки при замене уведомления.
+        monkeypatch.setattr(notifications, "_last_id", 0)
+        transport.reply.arguments.return_value = [notification_id]
+        notifications.notify("Заголовок", actions=[("details", "Подробности")])
+        assert len(notifications._notification_actions) <= limit
+
+    assert list(notifications._notification_actions) == list(range(limit * 2 + 1, limit * 3 + 1))
+    _invoke_action(transport, 1, "details")
+    handler.assert_not_called()
+    _invoke_action(transport, limit * 3, "details")
+    handler.assert_called_once_with()
+
+
 @pytest.mark.parametrize(
     ("notification_id", "key"), [(0, "details"), (42, "details"), (41, "unknown"), (41, "other")]
 )
@@ -355,7 +391,10 @@ def test_reset_state(transport: Mock, delivered: bool) -> None:
 def test_transport_failure_resets_id(
     transport: Mock, failure: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    notifications.notify("Первое")
+    handler = Mock()
+    notifications.set_action_handler("details", handler)
+    notifications.notify("Первое", actions=[("details", "Подробности")])
+    assert 41 in notifications._notification_actions
     if failure == "bus":
         transport.bus.isConnected.return_value = False
     elif failure == "reply":
@@ -366,6 +405,9 @@ def test_transport_failure_resets_id(
     with caplog.at_level("DEBUG", logger=notifications.__name__):
         notifications.notify("Запись остановлена", "Секретная диктовка")
     assert notifications.last_delivery_ok() is False
+    assert 41 not in notifications._notification_actions
+    _invoke_action(transport, 41, "details")
+    handler.assert_not_called()
     assert notifications.pending_count() == 1
     assert any(
         record.levelname == "WARNING" and "Запись остановлена" in record.getMessage()

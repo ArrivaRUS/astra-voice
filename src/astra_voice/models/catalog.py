@@ -307,13 +307,14 @@ def load_builtin(verifier: Verifier, *, root: Path | None = None) -> Catalog:
         jsonschema.exceptions, "RefResolutionError", _RemoteReferenceError
     )
 
-    class _LocalRefResolver(jsonschema.RefResolver):
-        def resolve_remote(self, uri: str) -> NoReturn:
-            # В jsonschema 4.10.3 отсутствие handler включает requests/urllib.
-            # Запрещаем загрузку для любой схемы URI, включая неизвестные.
-            raise ref_resolution_error("Удалённые ссылки в схеме каталога запрещены.")
-
     try:
+
+        class _LocalRefResolver(jsonschema.RefResolver):
+            def resolve_remote(self, uri: str) -> NoReturn:
+                # В jsonschema 4.10.3 отсутствие handler включает requests/urllib.
+                # Запрещаем загрузку для любой схемы URI, включая неизвестные.
+                raise ref_resolution_error("Удалённые ссылки в схеме каталога запрещены.")
+
         cls = jsonschema.Draft202012Validator
         cls.check_schema(schema)
         resolver = _LocalRefResolver.from_schema(schema)
@@ -325,6 +326,10 @@ def load_builtin(verifier: Verifier, *, root: Path | None = None) -> Catalog:
             resolver=resolver,
             format_checker=cls.FORMAT_CHECKER,
         ).validate(document)
+    except (AttributeError, TypeError):
+        raise CatalogError(
+            "bad-schema", "Не удалось проверить каталог: несовместимая версия jsonschema."
+        ) from None
     except (
         jsonschema.ValidationError,
         jsonschema.SchemaError,

@@ -16,7 +16,8 @@ from typing import Literal
 
 from astra_voice.models.catalog import ID_RE, Catalog, CatalogEntry, FileSpec
 from astra_voice.models.store import ModelRecord, ModelStore, StoreError
-from astra_voice.security.verify import sha256_file
+from astra_voice.security.verify import HashCancelledError
+from astra_voice.security.verify import sha256_file as sha256_file
 from astra_voice.worker.engine import EngineError, ModelMissingError, check_layout
 
 log = logging.getLogger(__name__)
@@ -99,8 +100,16 @@ def _check_contents(directory: Path, entry: CatalogEntry, *, allow_parts: bool) 
     return tuple(parts)
 
 
-def _copy_file(source: Path, target: Path, spec: FileSpec) -> None:
+def _check_cancel(cancel: Callable[[], bool] | None) -> None:
+    if cancel is not None and cancel():
+        raise _InstallError("Установка отменена.", "cancelled")
+
+
+def _copy_file(
+    source: Path, target: Path, spec: FileSpec, *, cancel: Callable[[], bool] | None = None
+) -> None:
     """Считает sha256 по копируемым блокам и ограничивает фактический размер."""
+    _check_cancel(cancel)
     digest = hashlib.sha256()
     copied = 0
     with source.open("rb") as reader, target.open("xb") as writer:
@@ -112,6 +121,7 @@ def _copy_file(source: Path, target: Path, spec: FileSpec) -> None:
                 raise _InstallError(_CHECKSUM_REASON, "checksum")
             digest.update(block)
             writer.write(block)
+            _check_cancel(cancel)
         if not hmac.compare_digest(digest.hexdigest(), spec.sha256) or copied != spec.size:
             log.warning("Не совпали sha256 или размер при копировании %s", source)
             raise _InstallError(_CHECKSUM_REASON, "checksum")
@@ -171,7 +181,9 @@ class Installer:
             raise _InstallError(_FILES_REASON, "layout")
         return staging
 
-    def install_from_staging(self, entry: CatalogEntry) -> InstallResult:
+    def install_from_staging(
+        self, entry: CatalogEntry, *, cancel: Callable[[], bool] | None = None
+    ) -> InstallResult:
         """Проверяет весь набор до переноса, затем выполняет оставшиеся шаги О2."""
         try:
             self._check_revoked(entry)
@@ -189,7 +201,11 @@ class Installer:
                 if not source.is_file():
                     log.warning("Отсутствует файл модели: %s", source)
                     raise _InstallError(_MISSING_REASON, "layout")
-                if not hmac.compare_digest(sha256_file(source), file.sha256):
+                try:
+                    actual = sha256_file(source, cancel=cancel)
+                except HashCancelledError as exc:
+                    raise _InstallError("Установка отменена.", "cancelled") from exc
+                if not hmac.compare_digest(actual, file.sha256):
                     log.warning("Не совпала sha256 файла модели: %s", source)
                     raise _InstallError(_CHECKSUM_REASON, "checksum")
                 if source.stat().st_size != file.size:
@@ -255,7 +271,9 @@ class Installer:
         except (_InstallError, StoreError, OSError, ValueError, RuntimeError) as exc:
             return _error_result(exc)
 
-    def install_from_path(self, src: Path, entry: CatalogEntry | None) -> InstallResult:
+    def install_from_path(
+        self, src: Path, entry: CatalogEntry | None, *, cancel: Callable[[], bool] | None = None
+    ) -> InstallResult:
         """Копирует только заявленные файлы, проверяя байты по ходу копирования."""
         if entry is None:
             return InstallResult(
@@ -291,8 +309,8 @@ class Installer:
             for file in entry.files:
                 source = _file_path(src, file.path)
                 target = _file_path(staging, file.path)
-                _copy_file(source, target, file)
-            return self.install_from_staging(entry)
+                _copy_file(source, target, file, cancel=cancel)
+            return self.install_from_staging(entry, cancel=cancel)
         except (_InstallError, StoreError, OSError, ValueError, RuntimeError) as exc:
             return _error_result(exc)
         finally:

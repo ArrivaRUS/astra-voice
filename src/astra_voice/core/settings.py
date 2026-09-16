@@ -151,10 +151,17 @@ def save(settings: Settings, path: Path | None = None) -> None:
             os.fsync(handle.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            log.warning(
+                "настройки сохранены, но не удалось синхронизировать каталог %s: %s",
+                path.parent,
+                exc,
+            )
     finally:
         tmp.unlink(missing_ok=True)

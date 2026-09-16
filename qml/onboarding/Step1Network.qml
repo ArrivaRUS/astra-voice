@@ -103,6 +103,7 @@ Item {
                 sub: qsTr("Раз в сутки, github.com")
                 toggle: appUpdates
                 locked: root.bridge ? root.bridge.policyLocked : false
+                lockedText: root.bridge ? root.bridge.policyLockedText : ""
                 rowEnabled: !locked
 
                 AvToggle {
@@ -125,6 +126,7 @@ Item {
                 sub: qsTr("Раз в сутки, huggingface.co")
                 toggle: modelUpdates
                 locked: root.bridge ? root.bridge.policyLocked : false
+                lockedText: root.bridge ? root.bridge.policyLockedText : ""
                 rowEnabled: !locked
 
                 AvToggle {

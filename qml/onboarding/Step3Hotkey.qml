@@ -162,16 +162,29 @@ Item {
         height: visible ? implicitHeight : 0
         state7: root.bridge ? root.bridge.captureState : "capturing"
         hotkey: root.hotkey
+        captureMessage: root.bridge ? root.bridge.captureMessage : ""
+        pendingCombo: root.bridge ? root.bridge.pendingCombo : ""
+        freeCandidates: root.bridge ? root.bridge.freeCandidates : []
         // Смежная зона: имя владельца конфликта пока отсутствует в контракте Python.
         conflictOwner: ""
+
+        onState7Changed: {
+            if ((state7 === "conflict" || state7 === "duplicate" || state7 === "not-grabbed")
+                    && root.bridge && root.bridge.refreshCandidates)
+                root.bridge.refreshCandidates()
+        }
 
         onChangeRequested: {
             if (root.bridge && root.bridge.beginCapture)
                 root.bridge.beginCapture()
         }
         onCancelRequested: {
+            if (root.bridge && root.bridge.cancelCapture)
+                root.bridge.cancelCapture()
+        }
+        onComboCaptured: {
             if (root.bridge && root.bridge.endCapture)
-                root.bridge.endCapture()
+                root.bridge.endCapture(combo)
         }
         onChooseAnotherRequested: {
             if (root.bridge && root.bridge.beginCapture)
@@ -182,8 +195,8 @@ Item {
                 root.bridge.beginCapture()
         }
         onKeepRequested: {
-            if (root.bridge && root.bridge.endCapture)
-                root.bridge.endCapture()
+            if (root.bridge && root.bridge.keepCombo)
+                root.bridge.keepCombo()
         }
         onToggleModeRequested: {
             if (root.bridge)

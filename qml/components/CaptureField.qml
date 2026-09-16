@@ -9,10 +9,18 @@ Item {
     property string state7: "idle"
     property string hotkey: qsTr("Ctrl + Space")
     property string conflictOwner: ""
+    property string captureMessage: ""
+    property string pendingCombo: ""
+    property var freeCandidates: []
+
+    readonly property string displayedCombo: pendingCombo !== "" ? pendingCombo : hotkey
+    readonly property string candidatesHint: freeCandidates.length > 0
+        ? "\n" + qsTr("Свободны: %1").arg(freeCandidates.join(", ")) : ""
 
     signal changeRequested()
     signal cancelRequested()
     signal keepRequested()
+    signal comboCaptured(string combo)
     signal chooseAnotherRequested()
     signal toggleModeRequested()
     signal retryRequested()
@@ -28,12 +36,73 @@ Item {
         return true
     }
 
+    // Формат моста задан в src/astra_voice/platform/x11.py::parse_combo:
+    // модификаторы и имя keysym разделяются «+» без пробелов.
+    // Для v0.1 решено фиксировать комбинацию по нажатию (мост endCapture сам переводит в captured и сразу пробует); набор клавиш ограничен буквами, цифрами, Space и F1–F12 — имена keysym для прочих клавиш из QML безопасно не собрать.
+    function buildCombo(event) {
+        var key = ""
+        if (event.key === Qt.Key_Space)
+            key = "Space"
+        else if (event.key >= Qt.Key_F1 && event.key <= Qt.Key_F12)
+            key = "F" + (event.key - Qt.Key_F1 + 1)
+        else if (event.key >= Qt.Key_A && event.key <= Qt.Key_Z)
+            key = String.fromCharCode(event.key - Qt.Key_A + 65)
+        else if (event.key >= Qt.Key_0 && event.key <= Qt.Key_9)
+            key = String(event.key - Qt.Key_0)
+        else
+            return ""
+
+        var parts = []
+        if (event.modifiers & Qt.ControlModifier)
+            parts.push("Ctrl")
+        if (event.modifiers & Qt.ShiftModifier)
+            parts.push("Shift")
+        if (event.modifiers & Qt.AltModifier)
+            parts.push("Alt")
+        if (event.modifiers & Qt.MetaModifier)
+            parts.push("Super")
+        parts.push(key)
+        return parts.join("+")
+    }
+
+    function updateCaptureFocus() {
+        if (captureActive)
+            forceActiveFocus()
+    }
+
     implicitWidth: Math.max(idleRow.implicitWidth, captureLine.implicitWidth + Theme.fieldPaddingX * 2)
     implicitHeight: content.implicitHeight
     width: parent ? parent.width : implicitWidth
     height: implicitHeight
+    focus: captureActive
 
-    Keys.onEscapePressed: event.accepted = root.escPressed()
+    // Loader должен завершить создание поля до установки активного фокуса.
+    onCaptureActiveChanged: Qt.callLater(root.updateCaptureFocus)
+    Component.onCompleted: Qt.callLater(root.updateCaptureFocus)
+
+    Keys.onPressed: {
+        if (event.isAutoRepeat) {
+            event.accepted = true
+            return
+        }
+        if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift
+                || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta
+                || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R
+                || event.key === Qt.Key_AltGr) {
+            event.accepted = true
+            return
+        }
+        if (event.key === Qt.Key_Escape) {
+            event.accepted = root.escPressed()
+            return
+        }
+        if (!root.captureActive)
+            return
+        var combo = root.buildCombo(event)
+        if (combo !== "")
+            root.comboCaptured(combo)
+        event.accepted = true
+    }
 
     Column {
         id: content
@@ -90,7 +159,7 @@ Item {
                 spacing: Theme.fieldGap
 
                 Text {
-                    text: root.state7 === "captured" ? root.hotkey : qsTr("Нажмите комбинацию…")
+                    text: root.state7 === "captured" ? root.displayedCombo : qsTr("Нажмите комбинацию…")
                     font.family: Theme.fontMono
                     font.pixelSize: Theme.fontHotkeyCaptureSize
                     color: Theme.fg
@@ -126,13 +195,15 @@ Item {
             height: visible ? implicitHeight : 0
             variant: "warn"
             iconName: "alert"
-            title: qsTr("Комбинация занята в KDE")
-            body: root.conflictOwner.trim() !== ""
-                ? qsTr("%1 уже назначена на действие «%2». Оставить её можно, но диктовка может не сработать — система заберёт нажатие себе.").arg(root.hotkey).arg(root.conflictOwner)
-                : qsTr("%1 уже занята другой программой. Оставить её можно, но диктовка может не сработать — система заберёт нажатие себе.").arg(root.hotkey)
+            title: qsTr("Комбинация %1 занята в KDE").arg(root.displayedCombo)
+            body: (root.captureMessage !== "" ? root.captureMessage
+                : root.conflictOwner.trim() !== ""
+                    ? qsTr("%1 уже назначена на действие «%2». Оставить её можно, но диктовка может не сработать — система заберёт нажатие себе.").arg(root.displayedCombo).arg(root.conflictOwner)
+                    : qsTr("%1 уже занята другой программой. Оставить её можно, но диктовка может не сработать — система заберёт нажатие себе.").arg(root.displayedCombo))
+                + root.candidatesHint
 
             AvButton {
-                text: qsTr("Оставить %1").arg(root.hotkey)
+                text: qsTr("Оставить %1").arg(root.displayedCombo)
                 variant: "secondary"
                 onClicked: root.keepRequested()
             }
@@ -149,8 +220,10 @@ Item {
             height: visible ? implicitHeight : 0
             variant: "warn"
             iconName: "alert"
-            title: qsTr("Эта комбинация уже назначена")
-            body: qsTr("Она занята другой настройкой Astra Voice. Выберите другое сочетание или измените режим.")
+            title: qsTr("Эта комбинация уже назначена: %1").arg(root.displayedCombo)
+            body: (root.captureMessage !== "" ? root.captureMessage
+                : qsTr("Она занята другой настройкой Astra Voice. Выберите другое сочетание или измените режим."))
+                + root.candidatesHint
 
             AvButton {
                 text: qsTr("Выбрать другую")
@@ -171,7 +244,9 @@ Item {
             variant: "error"
             iconName: "alert"
             title: qsTr("Горячая клавиша не захвачена")
-            body: qsTr("Другая программа держит это сочетание. Диктовка не заработает, пока не выбрано свободное.")
+            body: (root.captureMessage !== "" ? root.captureMessage
+                : qsTr("Другая программа держит это сочетание. Диктовка не заработает, пока не выбрано свободное."))
+                + root.candidatesHint
 
             AvButton {
                 text: qsTr("Выбрать другую")

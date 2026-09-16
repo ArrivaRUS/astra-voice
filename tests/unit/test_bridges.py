@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import gc
 import hashlib
 import json
 import logging
@@ -9,20 +11,24 @@ import re
 import stat
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 from unittest.mock import Mock, call
 
 import pytest
-from PyQt5.QtCore import QCoreApplication, QEvent, QThread
+from PyQt5 import sip
+from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtTest import QSignalSpy
 
 from astra_voice.core import paths
 from astra_voice.core import policy as policy_mod
 from astra_voice.core import settings as settings_mod
+from astra_voice.core.dictation import DictationOrchestrator, MicrophoneTestUpdate
+from astra_voice.core.model_source import SMOKE_EXPECT_ANY
 from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
 from astra_voice.models.catalog import Catalog, CatalogEntry, FileSpec, RevokedEntry
@@ -31,6 +37,7 @@ from astra_voice.models.installer import InstallResult, ReasonCode
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net.http import NetworkError
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
+from astra_voice.platform.paste import PasteMode
 from astra_voice.ui.bridges import (
     ModelPort,
     ModelService,
@@ -41,6 +48,8 @@ from astra_voice.ui.bridges import (
     _ModelJob,
     make_smoke_check,
 )
+from astra_voice.worker import ipc
+from astra_voice.worker.audio import AudioDevice, AudioError
 
 pytestmark = pytest.mark.unit
 
@@ -725,9 +734,137 @@ def test_set_extra_rollback_and_mirror(
 OnboardingRig = tuple[OnboardingController, SettingsBridge, Settings, Mock, Mock]
 
 
+def test_onboarding_devices_use_audio_labels() -> None:
+    devices = [
+        AudioDevice(1, "alsa_input.mic", "Микрофон гарнитуры", False),
+        AudioDevice(2, "alsa_output.monitor", "Колонки", True),
+    ]
+    provider = Mock(return_value=devices)
+    settings = Settings(extra={"onboarding_language_set": True})
+    controller = OnboardingController(
+        SettingsBridge(settings, save=Mock()), settings=settings, device_provider=provider
+    )
+
+    assert controller.devices == [
+        {"id": "", "name": "Системный по умолчанию"},
+        {"id": devices[0].name, "name": devices[0].label},
+        {"id": devices[1].name, "name": "Колонки (звук системы)"},
+    ]
+    provider.assert_called_once_with()
+    meta = controller.metaObject()
+    prop = meta.property(meta.indexOfProperty("devices"))
+    assert prop.typeName() == "QVariantList"
+    assert not prop.isWritable()
+    assert bytes(prop.notifySignal().name()) == b"devicesChanged"
+    device_prop = meta.property(meta.indexOfProperty("device"))
+    assert device_prop.typeName() == "QString"
+    assert device_prop.isWritable()
+    assert bytes(device_prop.notifySignal().name()) == b"deviceChanged"
+
+
+@pytest.mark.parametrize(
+    "error", [AudioError("audio-failed", "PRIVATE alsa_input /path"), OSError("PRIVATE /path")]
+)
+def test_onboarding_devices_enumeration_failure(
+    error: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = Settings(extra={"onboarding_language_set": True})
+    with caplog.at_level(logging.WARNING):
+        controller = OnboardingController(
+            SettingsBridge(settings, save=Mock()),
+            settings=settings,
+            device_provider=Mock(side_effect=error),
+        )
+
+    assert controller.devices == [{"id": "", "name": "Системный по умолчанию"}]
+    assert controller.device == ""
+    controller.next()
+    assert controller.step == 2
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "Не удалось получить список микрофонов" in warnings[0].getMessage()
+    assert warnings[0].exc_info is None
+    assert "PRIVATE" not in caplog.text
+
+
+@pytest.mark.parametrize("via_onboarding", [False, True])
+def test_onboarding_device_real_save_matches_settings_bridge(
+    tmp_path: Path, via_onboarding: bool
+) -> None:
+    path = tmp_path / "settings.json"
+    settings = Settings(extra={"onboarding_language_set": True, "unrelated": "preserved"})
+    mirror = policy_mod.effective(settings, policy_mod.Policy())
+    apply = Mock(spec=SettingsApply)
+    bridge = SettingsBridge(
+        settings, mirror=mirror, apply=apply, save=partial(settings_mod.save, path=path)
+    )
+    controller = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
+    spy = QSignalSpy(controller.deviceChanged)
+    target = controller if via_onboarding else bridge
+    assert controller.device == bridge.device == ""
+
+    for index, value in enumerate(("alsa_input.mic", ""), start=1):
+        assert target.setProperty("device", value)
+        assert controller.device == bridge.device == value
+        assert settings.extra["device"] == mirror.extra["device"] == (value or None)
+        assert settings_mod.load(path) == settings
+        assert json.loads(path.read_text())["device"] == (value or None)
+        assert settings.extra["unrelated"] == "preserved"
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert list(tmp_path.iterdir()) == [path]
+        assert len(spy) == index
+        apply.device.assert_called_with(value or None)
+        assert target.setProperty("device", value)
+        assert len(spy) == index
+    assert apply.mock_calls == [call.device("alsa_input.mic"), call.device(None)]
+
+
+@pytest.mark.parametrize("initial", [None, "old mic"])
+def test_onboarding_device_save_failure_rolls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, initial: str | None
+) -> None:
+    path = tmp_path / "settings.json"
+    settings = Settings(extra={"onboarding_language_set": True})
+    if initial is not None:
+        settings.extra["device"] = initial
+    settings_mod.save(settings, path=path)
+    original = path.read_bytes()
+    mirror = policy_mod.effective(settings, policy_mod.Policy())
+    apply = Mock(spec=SettingsApply)
+    bridge = SettingsBridge(
+        settings, mirror=mirror, apply=apply, save=partial(settings_mod.save, path=path)
+    )
+    controller = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
+    spy = QSignalSpy(controller.deviceChanged)
+    errors = QSignalSpy(bridge.saveErrorChanged)
+    seen: list[str] = []
+    controller.deviceChanged.connect(lambda: seen.append(controller.device))
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "astra_voice.core.settings.os.replace", Mock(side_effect=OSError("PRIVATE /path"))
+        )
+        assert controller.setProperty("device", "new mic")
+
+    assert controller.device == bridge.device == (initial or "")
+    assert len(spy) == 1 and seen == [initial or ""]
+    assert bridge.saveError == "Не удалось сохранить настройки"
+    assert len(errors) == 1
+    assert path.read_bytes() == original
+    assert settings_mod.load(path) == settings == mirror
+    assert list(tmp_path.iterdir()) == [path]
+    apply.device.assert_not_called()
+
+    assert controller.setProperty("device", "new mic")
+    assert controller.device == bridge.device == "new mic"
+    assert settings_mod.load(path).extra["device"] == "new mic"
+    assert bridge.saveError == ""
+    assert len(spy) == len(errors) == 2
+    apply.device.assert_called_once_with("new mic")
+
+
 @pytest.fixture
 def onboarding_rig() -> OnboardingRig:
-    settings = Settings(extra={"onboarding_language_set": True})
+    settings = settings_mod.from_dict({"onboarding_language_set": True})
     save = Mock()
     bridge = SettingsBridge(settings, save=save)
     host = Mock(spec=OnboardingHost)
@@ -735,7 +872,9 @@ def onboarding_rig() -> OnboardingRig:
     host.probe.return_value = "ok"
     host.apply_hotkey.return_value = "ok"
     host.free_candidates.return_value = ["Ctrl+Alt+D"]
-    controller = OnboardingController(bridge, settings=settings, host=host)
+    controller = OnboardingController(
+        bridge, settings=settings, host=host, device_provider=lambda: []
+    )
     return controller, bridge, settings, host, save
 
 
@@ -743,7 +882,7 @@ def test_onboarding_navigation_persists_every_transition(tmp_path: Path) -> None
     path = tmp_path / "settings.json"
     settings = Settings(extra={"onboarding_language_set": True})
     bridge = SettingsBridge(settings, save=partial(settings_mod.save, path=path))
-    controller = OnboardingController(bridge, settings=settings)
+    controller = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
     spy = QSignalSpy(controller.stepChanged)
     assert controller.step == 1 and controller.totalSteps == 5
     controller.back()
@@ -760,7 +899,9 @@ def test_onboarding_navigation_persists_every_transition(tmp_path: Path) -> None
         assert controller.step == expected
         loaded = settings_mod.load(path)
         assert loaded.extra["onboarding_step"] == expected
-        restored = OnboardingController(SettingsBridge(loaded, save=Mock()), settings=loaded)
+        restored = OnboardingController(
+            SettingsBridge(loaded, save=Mock()), settings=loaded, device_provider=lambda: []
+        )
         assert restored.step == expected
     controller.next()
     controller.skip()
@@ -770,7 +911,9 @@ def test_onboarding_navigation_persists_every_transition(tmp_path: Path) -> None
 @pytest.mark.parametrize("step", [None, True, False, "3", 3.0, 0, -1, 6, [], {}])
 def test_onboarding_bad_saved_step(step: object) -> None:
     settings = Settings(extra={"onboarding_step": step, "onboarding_language_set": True})
-    controller = OnboardingController(SettingsBridge(settings, save=Mock()), settings=settings)
+    controller = OnboardingController(
+        SettingsBridge(settings, save=Mock()), settings=settings, device_provider=lambda: []
+    )
     assert controller.step == 1
 
 
@@ -795,13 +938,13 @@ def test_onboarding_language_autodetection(
     monkeypatch.setenv("LANG", lang)
     settings = Settings()
     bridge = SettingsBridge(settings, save=Mock())
-    controller = OnboardingController(bridge, settings=settings)
+    controller = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
     assert controller.language == bridge.language == expected
     assert settings.extra["onboarding_language_set"] is True
     set_qt_property(controller, "language", "en" if expected == "ru" else "ru")
     chosen = controller.language
     monkeypatch.setenv("LANG", "ru" if chosen == "en" else "en")
-    restored = OnboardingController(bridge, settings=settings)
+    restored = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
     assert restored.language == chosen
 
 
@@ -812,7 +955,9 @@ def test_onboarding_preserves_language_when_marker_exists(
     monkeypatch.setenv("LANG", "en_US.UTF-8")
     settings = Settings(language="ru", extra={"onboarding_language_set": marker})
     save = Mock()
-    controller = OnboardingController(SettingsBridge(settings, save=save), settings=settings)
+    controller = OnboardingController(
+        SettingsBridge(settings, save=save), settings=settings, device_provider=lambda: []
+    )
     assert controller.language == "ru"
     save.assert_not_called()
 
@@ -821,7 +966,7 @@ def test_onboarding_language_failure_does_not_mark_choice(monkeypatch: pytest.Mo
     monkeypatch.setenv("LANG", "en")
     settings = Settings(language="ru")
     bridge = SettingsBridge(settings, save=Mock(side_effect=OSError()))
-    controller = OnboardingController(bridge, settings=settings)
+    controller = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
     assert controller.language == "ru"
     assert "onboarding_language_set" not in settings.extra
     set_qt_property(controller, "language", "xx")
@@ -857,7 +1002,7 @@ def test_onboarding_delegates_and_forwards_signals(
 def test_onboarding_network_defaults_and_policy(locked: tuple[str, ...]) -> None:
     settings = Settings(extra={"onboarding_language_set": True})
     bridge = SettingsBridge(settings, locked=locked, save=Mock())
-    controller = OnboardingController(bridge, settings=settings)
+    controller = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
     assert controller.checkAppUpdates is controller.checkModelUpdates is False
     assert controller.policyLocked is bool(locked)
     assert controller.policyLockedText == ("Задано администратором" if locked else "")
@@ -1023,11 +1168,15 @@ def test_onboarding_finish_requires_model(
     controller.finish()
     if ready is True:
         assert settings.extra["onboarding_done"] is controller.done is True
-        assert host.mock_calls == [call.notify_ready(settings.hotkey), call.hide_window()]
+        assert host.mock_calls == [
+            call.reload_model(),
+            call.notify_ready(settings.hotkey),
+            call.hide_window(),
+        ]
         save.assert_called_once_with(settings)
         assert len(done_spy) == 1
         controller.finish()
-        assert len(host.mock_calls) == 2
+        assert len(host.mock_calls) == 3
     else:
         assert "onboarding_done" not in settings.extra
         assert host.mock_calls == [] and len(done_spy) == 0
@@ -1035,17 +1184,57 @@ def test_onboarding_finish_requires_model(
 
 
 def test_onboarding_finish_save_failure(onboarding_rig: OnboardingRig) -> None:
-    controller, _, settings, host, save = onboarding_rig
-    settings.extra["onboarding_model_ready"] = True
+    controller, bridge, _, host, save = onboarding_rig
+    assert bridge.set_extra("onboarding_model_ready", True)
     save.side_effect = OSError()
     controller.finish()
     assert controller.done is False
     assert host.mock_calls == []
 
 
+@pytest.mark.parametrize("reload_fails", [False, True])
+def test_onboarding_finish_reloads_model_after_save(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, reload_fails: bool
+) -> None:
+    path = tmp_path / "settings.json"
+    settings = settings_mod.from_dict(
+        {"onboarding_language_set": True, "onboarding_model_ready": True}
+    )
+    host = Mock(spec=OnboardingHost)
+    bridge = SettingsBridge(settings, save=partial(settings_mod.save, path=path))
+    controller = OnboardingController(
+        bridge, settings=settings, host=host, device_provider=lambda: []
+    )
+
+    def reload_model() -> None:
+        assert settings_mod.load(path).extra["onboarding_done"] is True
+        if reload_fails:
+            raise RuntimeError("worker start failed")
+
+    host.reload_model.side_effect = reload_model
+    controller.finish()
+    controller.finish()
+
+    assert controller.done is True
+    assert host.mock_calls == [
+        call.reload_model(),
+        call.notify_ready(settings.hotkey),
+        call.hide_window(),
+    ]
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == int(reload_fails)
+    if reload_fails:
+        assert "Не удалось перезагрузить модель после онбординга" in warnings[0].message
+        assert warnings[0].exc_info is not None
+
+
 def test_onboarding_without_host() -> None:
-    settings = Settings(extra={"onboarding_language_set": True, "onboarding_model_ready": True})
-    controller = OnboardingController(SettingsBridge(settings, save=Mock()), settings=settings)
+    settings = settings_mod.from_dict(
+        {"onboarding_language_set": True, "onboarding_model_ready": True}
+    )
+    controller = OnboardingController(
+        SettingsBridge(settings, save=Mock()), settings=settings, device_provider=lambda: []
+    )
     controller.beginCapture()
     assert controller.captureState == "not-grabbed"
     controller.endCapture("Ctrl+Alt+D")
@@ -1164,7 +1353,11 @@ class ModelPortWithMockedInstall(FakeModelPort):
 
 class ModelFactory(Protocol):
     def __call__(
-        self, model: ModelPort | None = ..., **settings_extra: object
+        self,
+        model: ModelPort | None = ...,
+        *,
+        dialog_factory: Callable[[], str] = ...,
+        **settings_extra: object,
     ) -> OnboardingController: ...
 
 
@@ -1176,12 +1369,19 @@ def model_rig() -> Iterator[ModelRig]:
     port = FakeModelPort()
     controllers: list[OnboardingController] = []
 
-    def create(model: ModelPort | None = port, **settings_extra: object) -> OnboardingController:
+    def create(
+        model: ModelPort | None = port,
+        *,
+        dialog_factory: Callable[[], str] = lambda: "",
+        **settings_extra: object,
+    ) -> OnboardingController:
         settings = Settings(extra={"onboarding_language_set": True, **settings_extra})
         controller = OnboardingController(
             SettingsBridge(settings, save=Mock()),
             settings=settings,
             model=model,
+            dialog_factory=dialog_factory,
+            device_provider=lambda: [],
         )
         controllers.append(controller)
         return controller
@@ -1230,6 +1430,7 @@ def test_model_absent_and_settings_fallback(model_rig: ModelRig) -> None:
     assert controller.modelState == "absent"
     assert controller.canFinish
     assert (controller.modelName, controller.modelHost, controller.modelSizeBytes) == ("", "", 0)
+    assert controller.modelRam == ""
     controller.download()
     controller.installFromPath("/fake/model")
     assert controller._model_thread is None
@@ -1303,6 +1504,7 @@ def test_model_properties_use_entry_and_have_notify(model_rig: ModelRig) -> None
         "modelHost",
         "modelSizeBytes",
         "modelSize",
+        "modelRam",
         "progress",
         "speed",
         "eta",
@@ -1311,6 +1513,29 @@ def test_model_properties_use_entry_and_have_notify(model_rig: ModelRig) -> None
         prop = meta.property(meta.indexOfProperty(name))
         assert prop.hasNotifySignal()
         assert not prop.isWritable()
+
+
+@pytest.mark.parametrize("min_ram_mb", [415, 768, 1024])
+def test_model_ram_uses_catalog_megabytes(model_rig: ModelRig, min_ram_mb: int) -> None:
+    port, create = model_rig
+    port.entry = replace(port.entry, min_ram_mb=min_ram_mb, size_bytes=123_400_000)
+    controller = create()
+
+    assert controller.modelRam == f"{min_ram_mb} МБ"
+    assert controller.property("modelRam") == f"{min_ram_mb} МБ"
+    meta = controller.metaObject()
+    prop = meta.property(meta.indexOfProperty("modelRam"))
+    assert prop.typeName() == "QString"
+    assert prop.notifySignal().methodSignature() == b"modelRamChanged()"
+
+
+def test_model_ram_without_catalog_entry(
+    model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port, create = model_rig
+    monkeypatch.setattr(port, "recommended", lambda: None)
+
+    assert create().modelRam == ""
 
 
 @pytest.mark.parametrize("low_ram", [False, True])
@@ -1520,6 +1745,49 @@ def test_model_local_install_never_downloads(
     port.allowed.assert_not_called()
 
 
+@pytest.mark.parametrize("source", ["/fake/модель с пробелами", "file:///fake/model"])
+def test_pick_install_path_uses_local_install(
+    model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    port, create = model_rig
+    port.network = False
+    dialog = Mock(return_value=source)
+    controller = create(dialog_factory=dialog)
+    install = Mock(wraps=controller.installFromPath)
+    monkeypatch.setattr(controller, "installFromPath", install)
+    done = QSignalSpy(controller.canFinishChanged)
+    assert controller.metaObject().indexOfSlot(b"pickInstallPath()") >= 0
+
+    controller.pickInstallPath()
+
+    dialog.assert_called_once_with()
+    install.assert_called_once_with(source)
+    assert done.wait(1000)
+    assert controller.modelState == "installed"
+    assert port.sources == [Path("/fake/model" if source.startswith("file:") else source)]
+    assert port.download_calls == 0
+
+
+def test_pick_install_path_cancel_does_nothing(
+    model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port, create = model_rig
+    dialog = Mock(return_value="")
+    controller = create(dialog_factory=dialog)
+    install = Mock(wraps=controller.installFromPath)
+    monkeypatch.setattr(controller, "installFromPath", install)
+    changed = QSignalSpy(controller.modelStateChanged)
+
+    controller.pickInstallPath()
+
+    dialog.assert_called_once_with()
+    install.assert_not_called()
+    assert not changed
+    assert controller._model_thread is None
+    assert port.sources == []
+    assert port.download_calls == 0
+
+
 def test_model_shutdown_during_download_needs_no_gui_polling(model_rig: ModelRig) -> None:
     port, create = model_rig
     port.block = True
@@ -1536,20 +1804,25 @@ def test_model_shutdown_during_download_needs_no_gui_polling(model_rig: ModelRig
 
 
 def test_model_shutdown_times_out_and_logs_warning(
-    model_rig: ModelRig, caplog: pytest.LogCaptureFixture
+    model_rig: ModelRig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, create = model_rig
+    from astra_voice.ui import bridges
+
+    port, create = model_rig
     controller = create()
     release, started = threading.Event(), threading.Event()
 
-    class StuckThread(QThread):
-        def run(self) -> None:
-            started.set()
-            release.wait(10)
+    def install(entry: CatalogEntry) -> InstallResult:
+        started.set()
+        assert release.wait(15), "Тест не освободил установку"
+        return InstallResult("broken", reason_code="selfcheck")
 
-    thread = StuckThread(controller)
-    controller._model_thread = thread
-    thread.start()
+    monkeypatch.setattr(port, "install_from_staging", install)
+    controller.download()
+    thread = controller._model_thread
+    assert thread is not None
+    assert controller._model_job is not None
+    job_ref = weakref.ref(controller._model_job)
     try:
         assert started.wait(1)
         before = time.monotonic()
@@ -1562,10 +1835,26 @@ def test_model_shutdown_times_out_and_logs_warning(
         assert thread.parent() is None
         assert "не завершилась за 5 секунд" in caplog.text
         assert "выход из приложения продолжается" in caplog.text
+        assert (thread, job_ref()) in bridges._finishing_model_threads
+        assert controller._model_job is None
+        assert controller._model_thread is None
+        controller.shutdown()
+        sip.delete(controller)
+        gc.collect()
+        assert sip.isdeleted(controller)
+        assert not sip.isdeleted(thread)
+        assert thread.isRunning()
+        job = job_ref()
+        assert job is not None
+        assert not sip.isdeleted(job)
+        assert job.thread() is thread
     finally:
         release.set()
         assert thread.wait(1000)
         controller._model_thread = None
+        QCoreApplication.sendPostedEvents(None, QEvent.MetaCall)
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert (thread, job) not in bridges._finishing_model_threads
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
@@ -1908,3 +2197,301 @@ def test_model_app_assembly_and_shutdown(
     if service_fails:
         assert "каталог моделей" in caplog.text
         assert "SECRET" not in caplog.text
+
+
+class MicrophoneBridgeRig:
+    """Настоящие мост и автомат; внешние эффекты заменены наблюдаемыми портами."""
+
+    def __init__(self, *, with_host: bool = True) -> None:
+        self.settings = settings_mod.from_dict(
+            {"onboarding_step": 4, "onboarding_language_set": True, "device": "selected-mic"}
+        )
+        self.save = Mock()
+        self.bridge = SettingsBridge(self.settings, save=self.save)
+        self.commands: list[dict[str, Any]] = []
+        self.paste = Mock()
+        self.stats = Mock()
+        self.pill = Mock()
+        self.tray = Mock()
+        self.notify = Mock()
+        self.core = DictationOrchestrator(
+            send=self.send,
+            generation=lambda: 1,
+            restart_worker=Mock(),
+            pill=self.pill,
+            tray=self.tray,
+            paste=self.paste,
+            active_window=Mock(),
+            schedule=Mock(return_value=object()),
+            cancel_timer=Mock(),
+            hotkey_done=Mock(),
+            hotkey_cancel=Mock(),
+            hotkey_idle=lambda: True,
+            set_recording=Mock(),
+            paste_mode=lambda: PasteMode.AUTO,
+            record_params=lambda: {"device": "ordinary-mic", "limit_s": 120},
+            stats=self.stats,
+            on_device_selected=self.notify,
+            on_device_changed=self.notify,
+            on_device_lost=self.notify,
+        )
+        self.host = Mock(spec=OnboardingHost)
+        self.host.start_test.side_effect = self.core.start_test
+        self.host.stop_test.side_effect = self.core.stop_test
+        self.host.cancel_test.side_effect = self.core.cancel_test
+        self.controller = OnboardingController(
+            self.bridge,
+            settings=self.settings,
+            host=self.host if with_host else None,
+            device_provider=lambda: [],
+        )
+
+    def send(self, message: dict[str, Any], *, timeout: float | None = None) -> None:
+        self.commands.extend(ipc.FrameReader().feed(ipc.encode(message)))
+
+    def event(self, kind: str, **fields: object) -> None:
+        uid = next(
+            msg["utterance_id"] for msg in reversed(self.commands) if msg["type"] == "record.start"
+        )
+        message = {"type": kind, "utterance_id": uid, **fields}
+        event = ipc.FrameReader().feed(ipc.encode(message))[0]
+        self.core.on_worker_event({**event, "generation": 1})
+
+
+@pytest.fixture
+def microphone_bridge() -> MicrophoneBridgeRig:
+    return MicrophoneBridgeRig()
+
+
+def test_microphone_properties_and_full_cycle(
+    microphone_bridge: MicrophoneBridgeRig, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = microphone_bridge
+    controller = rig.controller
+    caplog.set_level(logging.DEBUG)
+    assert controller.testState == "idle"
+    assert controller.level == 0.0
+    assert (
+        controller.peak
+        == controller.testText
+        == controller.testDuration
+        == controller.testMessage
+        == ""
+    )
+    assert controller.testPhrase
+    assert not any(word in controller.testPhrase.lower() for word in SMOKE_EXPECT_ANY)
+    names = ("level", "peak", "testPhrase", "testState", "testText", "testDuration", "testMessage")
+    spies = {name: QSignalSpy(getattr(controller, name + "Changed")) for name in names}
+    states: list[str] = []
+    controller.testStateChanged.connect(lambda: states.append(controller.testState))
+    controller.startTest()
+    controller.startTest()
+    assert controller.testState == "recording"
+    assert len(rig.commands) == 1
+    assert rig.commands[0]["device"] == controller.device == "selected-mic"
+    rig.event("audio.ready", device="USB-микрофон")
+    rig.event("level", peak_dbfs=-18.0, rms_dbfs=-25.0)
+    assert controller.level == pytest.approx(0.7)
+    assert controller.peak == "−18 дБ"
+    assert len(spies["level"]) == len(spies["peak"]) == 1
+    rig.event("level", peak_dbfs=-18.0, rms_dbfs=-25.0)
+    assert len(spies["level"]) == len(spies["peak"]) == 1
+    rig.event("silent")
+    assert controller.testState == "processing"
+    assert controller.level == 0.0
+    rig.event("result", text="Личная фраза микрофона", t_ms=310)
+    assert states == ["recording", "processing", "done"]
+    assert controller.testText == "Личная фраза микрофона"
+    assert controller.testDuration == "0,31 с"
+    assert controller.testMessage == ""
+    assert len(spies["testText"]) == len(spies["testDuration"]) == 1
+    assert rig.core.last_text is None
+    rig.paste.assert_not_called()
+    rig.stats.append.assert_not_called()
+    rig.notify.assert_not_called()
+    assert "Личная фраза микрофона" not in caplog.text
+    assert "Личная фраза микрофона" not in str(rig.settings.to_dict())
+    assert "Личная фраза микрофона" not in str(rig.pill.mock_calls + rig.tray.mock_calls)
+    rig.save.assert_not_called()
+    controller.startTest()
+    assert controller.testState == "recording"
+    assert controller.testText == controller.testDuration == controller.peak == ""
+
+
+@pytest.mark.parametrize("dbfs, expected", [(-90.0, 0.0), (-30.0, 0.5), (6.0, 1.0)])
+def test_microphone_level_uses_dictation_scale(
+    microphone_bridge: MicrophoneBridgeRig, dbfs: float, expected: float
+) -> None:
+    rig = microphone_bridge
+    rig.controller.startTest()
+    rig.event("level", peak_dbfs=dbfs, rms_dbfs=-40.0)
+    assert rig.controller.level == expected
+
+
+def test_microphone_early_stop_and_cancel(microphone_bridge: MicrophoneBridgeRig) -> None:
+    rig = microphone_bridge
+    rig.controller.startTest()
+    rig.controller.stopTest()
+    assert rig.controller.testState == "processing"
+    rig.controller.stopTest()
+    assert [msg["type"] for msg in rig.commands] == [
+        "record.start",
+        "record.stop",
+        "recognize",
+        "record.cancel",
+    ]
+    rig.event("result", text="Отменённая речь", t_ms=12)
+    assert rig.controller.testText == ""
+    rig.event("cancelled")
+    assert rig.controller.testState == "idle"
+    assert rig.controller.testDuration == ""
+    rig.stats.append.assert_not_called()
+    rig.paste.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "code", ["audio-no-device", "audio-busy", "audio-failed", "no-model", "engine-failed"]
+)
+def test_microphone_error_does_not_expose_worker_details(
+    microphone_bridge: MicrophoneBridgeRig, code: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = microphone_bridge
+    caplog.set_level(logging.DEBUG)
+    rig.controller.startTest()
+    rig.event("error", code=code, message="ЛИЧНОЕ /home/astra/secret alsa_input.usb service.unit")
+    assert rig.controller.testState == "error"
+    assert rig.controller.testMessage
+    assert rig.controller.testText == rig.controller.testDuration == ""
+    for forbidden in ("ЛИЧНОЕ", "/home", "alsa_input", "service.unit"):
+        assert forbidden not in rig.controller.testMessage
+        assert forbidden not in caplog.text
+    rig.stats.append.assert_not_called()
+    rig.notify.assert_not_called()
+
+
+@pytest.mark.parametrize("state", ["recording", "processing", "done"])
+@pytest.mark.parametrize("leave", ["next", "back", "skip", "hide", "close", "device", "shutdown"])
+def test_microphone_text_is_erased_on_leaving_and_late_events_are_ignored(
+    microphone_bridge: MicrophoneBridgeRig, state: str, leave: str
+) -> None:
+    rig = microphone_bridge
+    controller = rig.controller
+    controller.startTest()
+    callback = rig.host.start_test.call_args.args[1]
+    if state != "recording":
+        controller.stopTest()
+    if state == "done":
+        rig.event("result", text="Личная речь", t_ms=310)
+    if leave in ("hide", "close"):
+        controller.eventFilter(controller, QEvent(QEvent.Hide if leave == "hide" else QEvent.Close))
+    elif leave == "device":
+        controller.setProperty("device", "another-mic")
+    else:
+        getattr(controller, leave)()
+    assert controller.testState == "idle"
+    assert controller.testText == controller.testDuration == controller.peak == ""
+    assert controller.level == 0.0
+    if state != "done":
+        assert rig.commands[-1]["type"] == "record.cancel"
+    rig.event("result", text="Запоздалая речь", t_ms=310)
+    # Даже сохранённый старый callback не должен вернуть текст после повторного входа.
+    controller._go(4)
+    callback(MicrophoneTestUpdate("done", text="Запоздалая речь", duration_s=0.31))
+    assert controller.testText == ""
+    assert controller._test_text == ""
+    rig.paste.assert_not_called()
+    rig.stats.append.assert_not_called()
+
+
+def test_microphone_without_host_is_idle() -> None:
+    rig = MicrophoneBridgeRig(with_host=False)
+    rig.controller.startTest()
+    rig.controller.stopTest()
+    assert rig.controller.testState == "idle"
+    assert rig.controller.testText == rig.controller.peak == rig.controller.testDuration == ""
+    assert rig.commands == []
+
+
+def test_microphone_host_exception_is_not_logged(
+    microphone_bridge: MicrophoneBridgeRig, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = microphone_bridge
+    caplog.set_level(logging.DEBUG)
+    rig.host.start_test.side_effect = RuntimeError("Личная речь /path alsa_input.foo")
+    rig.controller.startTest()
+    assert rig.controller.testState == "error"
+    assert rig.controller.testMessage == "Не удалось распознать речь. Попробуйте ещё раз."
+    assert "Личная речь" not in caplog.text
+
+
+def _microphone_log_violations(source: str) -> list[int]:
+    """Как гейт notify: AST, раскрытие псевдонимов и цепочек присваиваний."""
+    nodes = list(ast.walk(ast.parse(source)))
+    aliases: dict[str, str] = {}
+    private = {"self._test_text", "self.testText"}
+
+    def name(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            return f"{name(node.value)}.{node.attr}"
+        return ""
+
+    for node in nodes:
+        if isinstance(node, ast.arg) and isinstance(node.annotation, ast.Name):
+            if node.annotation.id == "MicrophoneTestUpdate":
+                private.add(node.arg)
+
+    def sensitive(node: ast.AST) -> bool:
+        return any(name(child) in private for child in ast.walk(node))
+
+    for _ in range(len(nodes)):
+        added = False
+        for node in nodes:
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                target_name = name(target)
+                if sensitive(node.value) and target_name and target_name not in private:
+                    private.add(target_name)
+                    added = True
+                value_name = name(node.value)
+                if (
+                    isinstance(target, ast.Name)
+                    and value_name.startswith("log.")
+                    and target.id not in aliases
+                ):
+                    aliases[target.id] = value_name
+                    added = True
+        if not added:
+            break
+    return [
+        node.lineno
+        for node in nodes
+        if isinstance(node, ast.Call) and name(node.func).startswith("log.")
+        if any(sensitive(arg) for arg in [*node.args, *(kw.value for kw in node.keywords)])
+    ]
+
+
+def test_microphone_text_never_reaches_log_ast() -> None:
+    source = Path(__file__).resolve().parents[2] / "src/astra_voice/ui/bridges.py"
+    assert _microphone_log_violations(source.read_text(encoding="utf-8")) == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'log.info("%s", update.text)',
+        'phrase = update.text\nlog.debug(f"{phrase}")',
+        'phrase = update.text\ncopy = phrase\nwrite = log.warning\nwrite("%s", copy)',
+        'log.error("failure", extra={"text": self.testText})',
+        "log.debug(self._test_text)",
+        'log.info("%s", update)',
+    ],
+)
+def test_microphone_privacy_ast_gate_detects_leaks(body: str) -> None:
+    source = "def receive(self, update: MicrophoneTestUpdate):\n" + "\n".join(
+        "    " + line for line in body.splitlines()
+    )
+    assert _microphone_log_violations(source)

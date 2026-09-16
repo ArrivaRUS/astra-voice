@@ -22,12 +22,11 @@ Item {
             y: root.height - height
             width: Theme.micLevelMeterBarW
             height: {
-                // §8.3: минимальная высота 3 px по заданию и плоскому состоянию макета.
+                // design/spec.md §8.3: тишина — 3 px, как в плоском состоянии макета.
                 if (root.silent || root.level <= 0)
                     return 3
-                // .lvl в макете (§8.3): образец задан прямо в пикселях макета.
-                return Math.min(Theme.micLevelMeterH, Math.max(3,
-                    Math.round(Theme.micLevelMeterSampleLive[index] * root.level)))
+                // design/spec.md §8.3: высоты .lvl из макета 08-onboarding-4-mic.html — 1:1 в пикселях.
+                return Theme.micLevelMeterSampleLive[index]
             }
             radius: Theme.micLevelMeterBarRadius
             color: root.silent ? Theme.micLevelMeterColorFlat : Theme.micLevelMeterColorLive

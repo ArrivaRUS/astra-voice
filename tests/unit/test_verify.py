@@ -6,14 +6,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
 from pathlib import Path
+from unittest.mock import Mock, call
 
 import pytest
 
-from astra_voice.security.verify import Verifier
+from astra_voice.security import verify
+from astra_voice.security.verify import HashCancelledError, Verifier, sha256_file
 
 pytestmark = [
     pytest.mark.unit,
@@ -199,6 +202,33 @@ def test_missing_gpgv_reported(env: dict[str, object], tmp_path: Path) -> None:
     )
     assert not res.ok
     assert "gpgv" in res.reason
+
+
+def test_sha256_file_cancel_on_second_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = tmp_path / "payload"
+    data = b"abcdefgh"
+    payload.write_bytes(data)
+    assert sha256_file(payload) == hashlib.sha256(data).hexdigest()
+
+    positions: list[int] = []
+    with payload.open("rb") as reader:
+        read = Mock(wraps=reader.read)
+        monkeypatch.setattr(reader, "read", read)
+        monkeypatch.setattr(verify, "open", Mock(return_value=reader), raising=False)
+
+        def cancel() -> bool:
+            positions.append(reader.tell())
+            return reader.tell() == 4
+
+        with pytest.raises(HashCancelledError):
+            sha256_file(payload, chunk=2, cancel=cancel)
+
+    assert positions == [0, 2, 4]
+    assert read.call_args_list == [call(2), call(2)]
+    assert positions[-1] < len(data)
+    assert reader.closed
 
 
 def test_sha256sums_ok(env: dict[str, object], tmp_path: Path) -> None:

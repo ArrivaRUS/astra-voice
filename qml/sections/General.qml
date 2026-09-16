@@ -10,6 +10,8 @@ Column {
 
     readonly property var settings: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
     readonly property string hotkeyStatus: settings ? settings.hotkeyStatus : "ok"
+    readonly property string saveError: root.settings ? root.settings.saveError : ""
+    readonly property string modelSelfcheck: root.settings ? root.settings.modelSelfcheck : ""
 
     function isLocked(name) {
         return settings && settings.lockedSettings
@@ -17,6 +19,33 @@ Column {
     }
 
     spacing: Theme.spaceGroupGap
+
+    NoteBanner {
+        width: root.width
+        variant: "error"
+        iconName: "alert"
+        title: root.saveError
+        body: qsTr("Проверьте, что файл настроек доступен для записи, и попробуйте ещё раз.")
+        visible: root.saveError !== ""
+        height: visible ? implicitHeight : 0
+    }
+
+    Text {
+        width: root.width
+        text: root.modelSelfcheck === "running" ? qsTr("Проверяю модель…")
+            : root.modelSelfcheck === "failed" ? qsTr("Распознавание на этом компьютере не работает. Обратитесь к администратору")
+            : ""
+        visible: root.modelSelfcheck === "running" || root.modelSelfcheck === "failed"
+        height: visible ? implicitHeight : 0
+        color: root.modelSelfcheck === "failed" ? Theme.dangerInk : Theme.fgMuted
+        font.family: Theme.fontUi
+        font.pixelSize: Theme.fontSettingSubSize
+        lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+        lineHeightMode: Text.FixedHeight
+        renderType: Text.NativeRendering
+        textFormat: Text.PlainText
+        wrapMode: Text.WordWrap
+    }
 
     SettingGroup {
         width: root.width

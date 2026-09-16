@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Literal
@@ -34,6 +35,7 @@ __all__ = [
     "GPGV_PATH",
     "PINNED_FINGERPRINTS",
     "REVOKED_FINGERPRINTS",
+    "HashCancelledError",
     "Purpose",
     "VerifyResult",
     "Verifier",
@@ -88,12 +90,22 @@ class VerifyResult:
         return self.ok
 
 
-def sha256_file(path: Path, *, chunk: int = _HASH_CHUNK) -> str:
-    """Шестнадцатеричный sha256 файла, потоково (файлы бывают по 2 ГБ)."""
+class HashCancelledError(Exception):
+    """Подсчёт контрольной суммы отменён вызывающим кодом."""
+
+
+def sha256_file(
+    path: Path, *, chunk: int = _HASH_CHUNK, cancel: Callable[[], bool] | None = None
+) -> str:
+    """Потоковый sha256 файла; при отмене поднимает HashCancelledError."""
+    if cancel is not None and cancel():
+        raise HashCancelledError
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
         while block := fh.read(chunk):
             digest.update(block)
+            if cancel is not None and cancel():
+                raise HashCancelledError
     return digest.hexdigest()
 
 

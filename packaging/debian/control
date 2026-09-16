@@ -30,7 +30,7 @@ Depends: ${misc:Depends},
          python3-sympy,
          python3-packaging,
          python3-requests,
-         python3-jsonschema,
+         python3-jsonschema (<< 5),
          python3-xlib,
          gpgv
 # Шрифты — Recommends, а не Depends: на ALSE apt ставит Recommends по умолчанию,

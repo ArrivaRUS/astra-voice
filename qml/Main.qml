@@ -21,6 +21,17 @@ ApplicationWindow {
     readonly property bool debugVisible: (info && info.debug === true)
     readonly property bool onboardingVisible: (typeof showOnboarding !== "undefined") ? showOnboarding === true : false
 
+    // Ключи переходов из уведомлений соответствуют индексам сайдбара; «Отладка» — после основных разделов.
+    readonly property var sectionIndices: ({
+        "general": 0,
+        "models": 1,
+        "output": 2,
+        "network": 3,
+        "advanced": 4,
+        "about": 5,
+        "debug": sidebar.sections.length
+    })
+
     width: Theme.sizeWindowW
     height: Theme.sizeWindowMinH
     // 900 × 620 — размер С ДЕКОРАЦИЕЙ KWin (спека §1.2), поэтому минимум клиентской
@@ -31,6 +42,16 @@ ApplicationWindow {
     title: window.onboardingVisible ? qsTr("Astra Voice — первый запуск") : qsTr("Astra Voice")
     color: Theme.bgApp
     font.family: Theme.fontUi
+
+    Connections {
+        target: window.info
+        ignoreUnknownSignals: true
+
+        function onShowSection(section) {
+            if (window.sectionIndices.hasOwnProperty(section))
+                sidebar.currentIndex = window.sectionIndices[section]
+        }
+    }
 
     Loader {
         anchors.fill: parent

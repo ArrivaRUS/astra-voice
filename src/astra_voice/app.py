@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import time
@@ -30,6 +31,7 @@ from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
 
 if TYPE_CHECKING:
+    from astra_voice.core.dictation import TestCallback
     from astra_voice.runtime import DictationRuntime
 
 log = logging.getLogger(__name__)
@@ -313,11 +315,39 @@ class ShowServer:
         self._server.close()
 
 
-def _make_app_info(session_kind: SessionKind, policy_status: str) -> Any:
-    from PyQt5.QtCore import QObject, pyqtProperty
+# Ключи разделов — общий контракт Python → QML для showSection(QString).
+SECTION_GENERAL = "general"
+SECTION_MODELS = "models"
+SECTION_OUTPUT = "output"
+SECTION_NETWORK = "network"
+SECTION_ADVANCED = "advanced"
+SECTION_ABOUT = "about"
+SECTION_DEBUG = "debug"
+
+
+def _make_app_info(session_kind: SessionKind, policy_status: str, *, debug: bool = False) -> Any:
+    from PyQt5.QtCore import QObject, pyqtProperty, pyqtSignal
 
     class AppInfo(QObject):
-        """Данные приложения для QML (версия, сеанс, статус политики)."""
+        """Данные приложения и запросы перехода между разделами QML."""
+
+        debugChanged = pyqtSignal()
+        showSection = pyqtSignal(str, arguments=["section"])
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._debug = debug or os.environ.get("ASTRA_VOICE_DEBUG", "") not in ("", "0")
+
+        @pyqtProperty(bool, notify=debugChanged)
+        def debug(self) -> bool:
+            return self._debug
+
+        def show_section(self, name: str) -> None:
+            """Жест пользователя открывает отладку до запроса перехода в неё."""
+            if name == SECTION_DEBUG and not self._debug:
+                self._debug = True
+                self.debugChanged.emit()
+            self.showSection.emit(name)
 
         @pyqtProperty(str, constant=True)
         def version(self) -> str:
@@ -434,6 +464,18 @@ class _RuntimeOnboardingHost:
 
     def apply_hotkey(self, combo: str, mode: str) -> str:
         return self._runtime.apply_hotkey(combo, mode)
+
+    def start_test(self, device: str, callback: TestCallback) -> bool:
+        return self._runtime.start_test(device, callback)
+
+    def stop_test(self) -> None:
+        self._runtime.stop_test()
+
+    def cancel_test(self) -> None:
+        self._runtime.cancel_test()
+
+    def reload_model(self) -> None:
+        self._runtime.restart_worker(wait_for_model=True)
 
     def notify_ready(self, combo: str) -> None:
         from astra_voice.ui import notify
@@ -656,7 +698,7 @@ def main(argv: list[str] | None = None) -> int:
     app.setDesktopFileName(DESKTOP_FILE_NAME)
     app.setQuitOnLastWindowClosed(not CLOSE_TO_TRAY)
 
-    app_info = _make_app_info(session_kind, policy.status.value)
+    app_info = _make_app_info(session_kind, policy.status.value, debug=args.debug)
     theme_bridge = _make_theme_bridge(session_kind)
     shell = _load_qml(app_info, theme_bridge) or _fallback_widget()
     if theme_bridge is not None:
@@ -678,6 +720,15 @@ def main(argv: list[str] | None = None) -> int:
         runtime_ready = False
         try:
             from astra_voice.runtime import DictationRuntime
+            from astra_voice.ui import notify
+
+            def show_details() -> None:
+                _show(shell)
+                app_info.show_section(SECTION_DEBUG)
+
+            def show_general() -> None:
+                _show(shell)
+                app_info.show_section(SECTION_GENERAL)
 
             model_store: ModelStore | None = None
             try:
@@ -694,8 +745,12 @@ def main(argv: list[str] | None = None) -> int:
             runtime.on_show_requested = lambda: _show(shell)
             runtime.tray.on_settings = lambda: _show(shell)
             runtime.tray.on_about = lambda: _show(shell)
-            runtime.pill.on_details_clicked = lambda: _show(shell)
+            runtime.pill.on_details_clicked = show_details
             runtime.start()
+            # start() регистрирует общий показ окна для всех действий уведомлений.
+            notify.set_action_handler(notify.ACTION_SHOW_DETAILS, show_details)
+            notify.set_action_handler(notify.ACTION_CHOOSE_MICROPHONE, show_general)
+            notify.set_action_handler(notify.ACTION_CHOOSE_HOTKEY, show_general)
             runtime_ready = True
         except Exception:  # noqa: BLE001 — без диктовки окно должно продолжать работать
             log.warning(

@@ -17,8 +17,10 @@ from astra_voice.core.dictation import (
     CANCEL_TIMEOUT_MS,
     PROCESSING_WATCHDOG_MS,
     RECOGNIZE_TIMEOUT_S,
+    TEST_RECORD_LIMIT_MS,
     DictationOrchestrator,
     DictationPhase,
+    MicrophoneTestUpdate,
     level_from_dbfs,
 )
 from astra_voice.platform.hotkey import (
@@ -53,6 +55,7 @@ from astra_voice.ui.pill import (
     PillState,
 )
 from astra_voice.ui.tray_icons import TrayState
+from astra_voice.worker import ipc
 
 pytestmark = pytest.mark.unit
 MARKER = "ГЕЛИОТРОП-7"
@@ -846,9 +849,10 @@ def test_microphone_selected_at_start_once(
 
 
 @pytest.mark.parametrize("elapsed", [0.1, 2.0])
-def test_audio_ready_without_changed_only_logs(
+def test_default_microphone_without_changed_is_selected_once(
     rig: Rig, elapsed: float, caplog: pytest.LogCaptureFixture
 ) -> None:
+    rig.params["device"] = None
     rig.start()
     rig.now += elapsed
     with caplog.at_level(logging.DEBUG, logger="test.dictation"):
@@ -858,15 +862,69 @@ def test_audio_ready_without_changed_only_logs(
     assert rig.recording
     assert not rig.stats.events
     rig.device_changed.assert_not_called()
-    rig.device_selected.assert_not_called()
+    rig.device_selected.assert_called_once_with("USB-гарнитура")
     rig.stop()
     rig.result()
     assert rig.stats.events[-1]["open_ms"] == pytest.approx(elapsed * 1000)
     rig.start()
+    rig.event("audio.ready", device="USB-гарнитура")
+    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_changed.assert_not_called()
+    rig.stop()
+    rig.result()
+    rig.start()
     rig.event("audio.ready", device="Встроенный микрофон", changed="смена")
-    rig.device_selected.assert_not_called()
+    rig.device_selected.assert_called_once_with("USB-гарнитура")
     rig.device_changed.assert_called_once_with("Встроенный микрофон")
     assert rig.recording
+
+
+@pytest.mark.parametrize("hello_before_start", [False, True])
+def test_new_generation_announces_same_microphone_as_selected(
+    rig: Rig, hello_before_start: bool
+) -> None:
+    for generation in (1, 2, 3):
+        rig.worker_generation = generation
+        if hello_before_start:
+            rig.core.on_worker_event({"type": "hello", "generation": generation})
+        rig.start()
+        rig.event("audio.ready", device="USB-гарнитура", changed="смена")
+        rig.stop()
+        rig.result()
+    assert rig.device_selected.call_args_list == [call("USB-гарнитура")] * 3
+    rig.device_changed.assert_not_called()
+
+
+def test_explicit_device_selection_resets_announcement(rig: Rig) -> None:
+    rig.start()
+    rig.event("audio.ready", device="Встроенный микрофон")
+    rig.stop()
+    rig.result()
+    rig.params["device"] = "alsa_input.usb-headset"
+    rig.core.reset_device_announcement()
+    rig.start()
+    rig.event("audio.ready", device="USB-гарнитура", changed="смена")
+    assert rig.device_selected.call_args_list == [
+        call("Встроенный микрофон"),
+        call("USB-гарнитура"),
+    ]
+    rig.device_changed.assert_not_called()
+
+
+def test_device_change_is_announced_once_per_name_in_generation(rig: Rig) -> None:
+    for name, changed in (
+        ("Встроенный микрофон", {}),
+        ("USB-гарнитура", {"changed": "смена"}),
+        ("USB-гарнитура", {"changed": "смена"}),
+        ("USB-гарнитура", {}),
+        ("Встроенный микрофон", {"changed": "смена"}),
+    ):
+        rig.start()
+        rig.event("audio.ready", device=name, **changed)
+        rig.stop()
+        rig.result()
+    rig.device_selected.assert_called_once_with("Встроенный микрофон")
+    assert rig.device_changed.call_args_list == [call("USB-гарнитура"), call("Встроенный микрофон")]
 
 
 @pytest.mark.parametrize("elapsed", [0.1, 2.0])
@@ -958,7 +1016,7 @@ def test_manual_stop_failure_after_audio_ready_releases_hotkey(rig: Rig, command
     assert not rig.recording
 
 
-def test_changed_notification_never_deduplicates_names(rig: Rig) -> None:
+def test_changed_notification_deduplicates_announced_names(rig: Rig) -> None:
     # Разные системные имена могут иметь одинаковое описание в audio.ready.
     names = [
         "USB-гарнитура",
@@ -967,6 +1025,7 @@ def test_changed_notification_never_deduplicates_names(rig: Rig) -> None:
         "Встроенный микрофон",
         "USB-гарнитура",
     ]
+    changes = ["Встроенный микрофон", "USB-гарнитура"]
 
     def notified(name: str) -> None:
         assert rig.commands()[-1] == "record.start"
@@ -977,12 +1036,14 @@ def test_changed_notification_never_deduplicates_names(rig: Rig) -> None:
         rig.start()
         rig.event("audio.ready", device=name, changed=f"Источник звука изменился: {name}")
         rig.device_selected.assert_called_once_with(names[0])
-        assert rig.device_changed.call_args_list == [call(value) for value in names[1 : index + 1]]
+        assert rig.device_changed.call_args_list == [
+            call(value) for value in changes[: max(0, index - 2)]
+        ]
         assert rig.recording and rig.core.phase == DictationPhase.RECORDING
         rig.stop()
         rig.result()
     rig.device_selected.assert_called_once_with("USB-гарнитура")
-    assert rig.device_changed.call_args_list == [call(name) for name in names[1:]]
+    assert rig.device_changed.call_args_list == [call(name) for name in changes]
     assert rig.commands() == ["record.start", "record.stop", "recognize"] * len(names)
     assert all(event["type"] == "dictation" for event in rig.stats.events)
     assert all(state != PillState.ERROR for state, _, _ in rig.pill.calls)
@@ -1719,3 +1780,250 @@ def test_audio_close_failure_still_restarts_worker(rig: Rig) -> None:
     rig.timer(CANCEL_TIMEOUT_MS).fire()
     rig.timer(CANCEL_RESTART_MS).fire()
     rig.restart_worker.assert_called_once_with()
+
+
+def microphone_event(rig: Rig, kind: str, **fields: object) -> None:
+    """События проходят настоящий IPC; generation добавляет супервизор."""
+    message = {"type": kind, "utterance_id": rig.uid, **fields}
+    decoded = ipc.FrameReader().feed(ipc.encode(message))[0]
+    rig.core.on_worker_event({**decoded, "generation": rig.worker_generation})
+
+
+@pytest.mark.parametrize("device", ["", "alsa_input.usb-mic"])
+@pytest.mark.parametrize("stop", ["button", "silent", "limit", "record.limit"])
+def test_microphone_test_cycle_is_private(
+    rig: Rig, device: str, stop: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    updates: list[MicrophoneTestUpdate] = []
+
+    def encode_command(message: dict[str, Any]) -> None:
+        ipc.encode(message)
+
+    rig.during_send = encode_command
+    assert rig.core.start_test(device, updates.append)
+    assert updates == [MicrophoneTestUpdate("recording")]
+    assert rig.sent[0][0].get("device") == (device or None)
+    assert rig.sent[0][1] == 40.0
+    assert rig.recording
+    assert not any(entry[0] == "active_window" for entry in rig.trace)
+    microphone_event(rig, "audio.ready", device="USB-микрофон")
+    microphone_event(rig, "level", peak_dbfs=-18.0, rms_dbfs=-26.0)
+    assert updates[-1] == MicrophoneTestUpdate("recording", peak_dbfs=-18.0)
+    if stop == "button":
+        rig.core.stop_test()
+    elif stop == "limit":
+        rig.timer(TEST_RECORD_LIMIT_MS).fire()
+    else:
+        microphone_event(rig, stop)
+    assert str(updates[-1].state) == "processing"
+    assert not rig.recording
+    assert rig.commands() == [
+        "record.start",
+        *([] if stop == "record.limit" else ["record.stop"]),
+        "recognize",
+    ]
+    microphone_event(rig, "result", text=MARKER, t_ms=310)
+    assert updates[-1] == MicrophoneTestUpdate("done", text=MARKER, duration_s=0.31)
+    assert rig.core.phase == DictationPhase.IDLE
+    assert not rig.core.test_active
+    assert rig.core.last_text is None
+    assert not rig.pasted
+    assert not rig.stats.events
+    assert not rig.pill.calls
+    assert not rig.tray.has_last_text
+    rig.device_selected.assert_not_called()
+    rig.device_changed.assert_not_called()
+    rig.device_lost.assert_not_called()
+    assert MARKER not in caplog.text
+    assert not [timer for timer in rig.timers if not timer.cancelled and not timer.fired]
+    rig.core.stop_test()
+    assert str(updates[-1].state) == "done"
+
+
+@pytest.mark.parametrize("phase", ["recording", "processing"])
+def test_microphone_test_excludes_hotkey_dictation(rig: Rig, phase: str) -> None:
+    updates: list[MicrophoneTestUpdate] = []
+    rig.core.start_test("", updates.append)
+    if phase == "processing":
+        rig.core.stop_test()
+    before = rig.commands()
+    rig.start()
+    rig.stop()
+    assert rig.commands() == before
+    assert rig.core.phase.value == phase
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    rig.core.stop_test()
+    if phase == "recording":
+        microphone_event(rig, "result", text=MARKER, t_ms=310)
+    else:
+        microphone_event(rig, "cancelled")
+    rig.start()
+    assert rig.commands().count("record.start") == 2
+
+
+@pytest.mark.parametrize("phase", ["recording", "processing"])
+def test_dictation_cannot_be_interrupted_by_microphone_test(rig: Rig, phase: str) -> None:
+    rig.start()
+    if phase == "processing":
+        rig.stop()
+    commands = rig.commands()
+    updates: list[MicrophoneTestUpdate] = []
+    assert not rig.core.start_test("other", updates.append)
+    assert str(updates[-1].state) == "error"
+    assert "диктовку" in updates[-1].message
+    rig.core.stop_test()
+    rig.core.cancel_test()
+    assert rig.commands() == commands
+    if phase == "recording":
+        rig.stop()
+    rig.result()
+    assert len(rig.pasted) == len(rig.stats.events) == 1
+
+
+def test_microphone_processing_stop_cancels_and_discards_late_result(rig: Rig) -> None:
+    updates: list[MicrophoneTestUpdate] = []
+    rig.core.start_test("", updates.append)
+    rig.core.stop_test()
+    rig.core.stop_test()
+    rig.core.stop_test()
+    assert rig.commands() == ["record.start", "record.stop", "recognize", "record.cancel"]
+    microphone_event(rig, "result", text=MARKER, t_ms=310)
+    assert str(updates[-1].state) == "processing"
+    microphone_event(rig, "cancelled")
+    assert updates[-1] == MicrophoneTestUpdate("idle")
+    microphone_event(rig, "result", text=MARKER, t_ms=310)
+    assert str(updates[-1].state) == "idle"
+    assert not rig.pasted
+    assert not rig.stats.events
+
+
+@pytest.mark.parametrize(
+    "code", ["audio-no-device", "audio-busy", "audio-failed", "no-model", "engine-failed"]
+)
+def test_microphone_error_is_plain_and_private(
+    rig: Rig, code: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    updates: list[MicrophoneTestUpdate] = []
+    rig.core.start_test("alsa_input.usb-mic", updates.append)
+    microphone_event(rig, "error", code=code, message=f"{MARKER} /private/path alsa_input.usb-mic")
+    assert str(updates[-1].state) == "error"
+    assert updates[-1].message
+    assert not any(word in updates[-1].message for word in (MARKER, "alsa", "/", "engine"))
+    assert MARKER not in caplog.text
+    assert not rig.pasted
+    assert not rig.stats.events
+    assert not rig.pill.calls
+    rig.device_lost.assert_not_called()
+    assert not rig.recording
+
+
+@pytest.mark.parametrize("failure", ["record.start", "record.stop", "recognize", "watchdog"])
+def test_microphone_failures_release_recording_without_logging_exception(
+    rig: Rig, failure: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    def send(message: dict[str, Any]) -> None:
+        ipc.encode(message)
+        if message["type"] == failure:
+            raise RuntimeError(MARKER)
+
+    rig.during_send = send
+    updates: list[MicrophoneTestUpdate] = []
+    rig.core.start_test("", updates.append)
+    if failure != "record.start":
+        rig.core.stop_test()
+    if failure == "watchdog":
+        rig.timer(PROCESSING_WATCHDOG_MS).fire()
+    assert str(updates[-1].state) == "error"
+    assert rig.commands()[-1] == "record.cancel"
+    assert not rig.recording
+    microphone_event(rig, "cancelled")
+    assert not rig.pasted
+    assert not rig.stats.events
+    assert not rig.pill.calls
+    assert MARKER not in caplog.text
+
+
+def test_microphone_cancel_watchdogs_always_release_worker(rig: Rig) -> None:
+    updates: list[MicrophoneTestUpdate] = []
+    rig.core.start_test("", updates.append)
+    rig.core.cancel_test()
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert str(updates[-1].state) == "idle"
+    assert rig.commands()[-1] == "audio.close"
+    assert not rig.core.start_test("", Mock())
+    rig.timer(CANCEL_RESTART_MS).fire()
+    rig.restart_worker.assert_called_once_with()
+    assert not rig.pasted
+    assert not rig.stats.events
+    assert not rig.pill.calls
+
+
+def test_microphone_test_rejects_old_generation_and_preserves_last_dictation(rig: Rig) -> None:
+    rig.start()
+    rig.stop()
+    rig.result("Предыдущая диктовка")
+    previous = rig.core.last_text
+    rig.stats.events.clear()
+    rig.pasted.clear()
+    updates: list[MicrophoneTestUpdate] = []
+    rig.core.start_test("", updates.append)
+    rig.core.stop_test()
+    rig.core.on_worker_event(
+        {"type": "result", "generation": 0, "utterance_id": rig.uid, "text": MARKER, "t_ms": 1}
+    )
+    assert str(updates[-1].state) == "processing"
+    rig.worker_generation += 1
+    microphone_event(rig, "result", text=MARKER, t_ms=1)
+    assert str(updates[-1].state) == "error"
+    assert rig.core.last_text == previous
+    assert not rig.pasted
+    assert not rig.stats.events
+
+
+@pytest.mark.parametrize("action", ["result", "cancel-in-callback"])
+def test_microphone_synchronous_result_and_stop_callbacks(rig: Rig, action: str) -> None:
+    updates: list[MicrophoneTestUpdate] = []
+
+    def receive(update: MicrophoneTestUpdate) -> None:
+        updates.append(update)
+        if action == "cancel-in-callback" and update.state == "processing":
+            rig.core.stop_test()
+
+    def send(message: dict[str, Any]) -> None:
+        ipc.encode(message)
+        if message["type"] == "recognize":
+            microphone_event(rig, "result", text=MARKER, t_ms=310)
+        elif message["type"] == "record.cancel":
+            microphone_event(rig, "cancelled")
+
+    rig.during_send = send
+    rig.core.start_test("", receive)
+    rig.core.stop_test()
+    assert [update.state for update in updates] == [
+        "recording",
+        "processing",
+        "done" if action == "result" else "idle",
+    ]
+    assert ("recognize" in rig.commands()) == (action == "result")
+    assert not rig.recording
+    assert not rig.stats.events
+    assert not rig.pasted
+    assert not [timer for timer in rig.timers if not timer.cancelled and not timer.fired]
+
+
+def test_microphone_cancel_timeout_callback_cannot_restart_before_ack(rig: Rig) -> None:
+    attempts: list[bool] = []
+
+    def receive(update: MicrophoneTestUpdate) -> None:
+        if update.state == "idle":
+            attempts.append(rig.core.start_test("", Mock()))
+
+    rig.core.start_test("", receive)
+    rig.core.cancel_test()
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert attempts == [False]
+    assert rig.commands() == ["record.start", "record.cancel", "audio.close"]

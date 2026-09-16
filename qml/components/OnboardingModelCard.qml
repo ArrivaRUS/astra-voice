@@ -11,8 +11,9 @@ Rectangle {
     property string vendor: qsTr("Сбер (GigaChat Team)")
     property string purpose: qsTr("Русская диктовка с пунктуацией — по умолчанию")
     property string modelSize: qsTr("231,9 МБ")
-    property string modelRam: qsTr("415 МБ")
+    property string modelRam: ""
     property string modelHost: qsTr("huggingface.co")
+    property string modelMessage: ""
     property real progress: 0
     property string speed: ""
     property string eta: ""
@@ -35,11 +36,11 @@ Rectangle {
     readonly property real footerGap: 9 // spec §5.1: зазор нижнего блока.
 
     implicitWidth: 620 // Макет 08-onboarding-2-model.html: ширина карточки шага 2.
-    implicitHeight: footer.y + footer.height + Theme.modelCardPaddingY
+    implicitHeight: footer.y + footer.height + Theme.modelCardPaddingY + Theme.cardBorder
     width: parent ? parent.width : implicitWidth
     height: implicitHeight
     radius: Theme.modelCardRadius
-    border.width: 1 // spec §5.1: граница карточки.
+    border.width: Theme.cardBorder
     // design/spec.md §5.5: рекомендованную карточку отличает только бейдж.
     border.color: installed ? Theme.accent : Theme.border
     color: installed ? Theme.accentBg : Theme.bgSurface
@@ -49,6 +50,8 @@ Rectangle {
         color: Theme.fgMuted
         font.family: Theme.fontUi
         font.pixelSize: Theme.fontModelFooterSize
+        lineHeight: Theme.fontModelFooterSize * Theme.fontBodyLineHeight
+        lineHeightMode: Text.FixedHeight
         wrapMode: Text.Wrap
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
@@ -68,9 +71,9 @@ Rectangle {
 
     RowLayout {
         id: top
-        x: Theme.modelCardPaddingX
-        y: Theme.modelCardPaddingY
-        width: root.width - 2 * Theme.modelCardPaddingX
+        x: Theme.cardBorder + Theme.modelCardPaddingX
+        y: Theme.cardBorder + Theme.modelCardPaddingY
+        width: root.width - 2 * (Theme.cardBorder + Theme.modelCardPaddingX)
         spacing: Theme.modelCardTopGap
 
         Item {
@@ -87,6 +90,8 @@ Rectangle {
                     color: Theme.fg
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontModelNameSize
+                    lineHeight: Theme.fontModelNameSize * Theme.fontBodyLineHeight
+                    lineHeightMode: Text.FixedHeight
                     font.weight: Font.Medium
                     textFormat: Text.PlainText
                     renderType: Text.NativeRendering
@@ -96,6 +101,8 @@ Rectangle {
                     color: Theme.fgMuted
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontModelVendorSize
+                    lineHeight: Theme.fontModelVendorSize * Theme.fontBodyLineHeight
+                    lineHeightMode: Text.FixedHeight
                     wrapMode: Text.NoWrap
                     textFormat: Text.PlainText
                     renderType: Text.NativeRendering
@@ -109,6 +116,8 @@ Rectangle {
                 color: Theme.fgMuted
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontModelPurposeSize
+                lineHeight: Theme.fontModelPurposeSize * Theme.fontBodyLineHeight
+                lineHeightMode: Text.FixedHeight
                 wrapMode: Text.Wrap
                 textFormat: Text.PlainText
                 renderType: Text.NativeRendering
@@ -136,6 +145,8 @@ Rectangle {
                             color: parent.activeBadge ? Theme.accentInk : Theme.primary
                             font.family: Theme.fontUi
                             font.pixelSize: Theme.badgeSize
+                            lineHeight: Theme.badgeSize * Theme.fontBodyLineHeight
+                            lineHeightMode: Text.FixedHeight
                             font.weight: Font.Medium
                             textFormat: Text.PlainText
                             renderType: Text.NativeRendering
@@ -163,6 +174,8 @@ Rectangle {
                         color: Theme.fgMuted
                         font.family: Theme.fontUi
                         font.pixelSize: Theme.fontMetricSize
+                        lineHeight: Theme.fontMetricSize * Theme.fontBodyLineHeight
+                        lineHeightMode: Text.FixedHeight
                         textFormat: Text.PlainText
                         renderType: Text.NativeRendering
                     }
@@ -185,6 +198,7 @@ Rectangle {
                         font.family: Theme.fontUi
                         font.weight: Font.Bold
                         font.pixelSize: Theme.modelCardMetricValueSize
+                        lineHeight: Theme.modelCardMetricValueSize * Theme.fontBodyLineHeight
                     }
                 }
             }
@@ -193,7 +207,7 @@ Rectangle {
 
     Rectangle {
         id: divider
-        x: Theme.modelCardPaddingX
+        x: Theme.cardBorder + Theme.modelCardPaddingX
         y: top.y + top.height + 8 // spec §5.1: поле над разделителем.
         width: top.width
         height: 1 // spec §5.1: толщина разделителя.
@@ -202,7 +216,7 @@ Rectangle {
 
     Column {
         id: footer
-        x: Theme.modelCardPaddingX
+        x: Theme.cardBorder + Theme.modelCardPaddingX
         y: divider.y + divider.height + 7 // spec §5.1: поле под разделителем.
         width: top.width
         spacing: root.footerGap
@@ -320,6 +334,7 @@ Rectangle {
                 FooterText {
                     text: qsTr("%1 на диске").arg(root.modelSize)
                 }
+                Dot {}
             }
         }
 
@@ -337,36 +352,37 @@ Rectangle {
                 Layout.fillWidth: true
                 color: root.failed ? Theme.dangerInk : (root.warning ? Theme.warningInk : Theme.fgMuted)
                 // design/spec.md §5.4 и правило 5: число входит в переводимую фразу без моноширинного набора.
-                text: root.modelState === "broken" ? qsTr("Файл не прошёл проверку — скачайте заново")
+                text: root.modelMessage !== "" ? root.modelMessage
+                    : root.modelState === "broken" ? qsTr("Файл не прошёл проверку — скачайте заново")
                     : root.modelState === "no-space" ? qsTr("Не хватает места на диске — нужно ещё %1").arg(root.modelSize)
-                    : root.warning ? qsTr("Памяти может не хватить — модели нужно около %1").arg(root.modelRam)
+                    : root.warning ? (root.modelRam !== ""
+                        ? qsTr("Памяти может не хватить — модели нужно около %1").arg(root.modelRam)
+                        : qsTr("Памяти может не хватить"))
                     : qsTr("Нет доступа к %1").arg(root.modelHost)
             }
         }
 
-        RowLayout {
+        Flow {
             id: actions
             width: parent.width
             visible: !root.busy
             spacing: root.footerGap
             // design/refs/08-onboarding-2-model.png: при ширине карточки 620 ряд .mbot
             // переносится, и требование к памяти встаёт в строку с кнопками.
-            RowLayout {
-                visible: root.available || root.warning
-                Layout.fillWidth: true
-                Layout.minimumWidth: 0
+            Flow {
+                visible: (root.available || root.warning) && root.modelRam !== ""
+                width: Math.min(ramValue.implicitWidth + spacing + ramNote.implicitWidth, actions.width)
                 spacing: 3 // Зазор между числом и пояснением при кегле 12.
                 FooterText {
+                    id: ramValue
                     text: qsTr("%1 ОЗУ").arg(root.modelRam)
                     color: Theme.fg
                     font.weight: Font.Bold
                     wrapMode: Text.NoWrap
                 }
                 FooterText {
-                    Layout.fillWidth: true
-                    Layout.minimumWidth: 0
-                    elide: Text.ElideRight
-                    wrapMode: Text.NoWrap
+                    id: ramNote
+                    width: Math.min(implicitWidth, parent.width)
                     text: qsTr("· замерено на этом компьютере")
                 }
             }
