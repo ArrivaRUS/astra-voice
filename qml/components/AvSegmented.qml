@@ -64,6 +64,7 @@ FocusScope {
                     Text {
                         id: text
                         anchors.centerIn: parent
+                        textFormat: Text.PlainText
                         text: segment.modelData
                         font.family: Theme.fontUi
                         font.pixelSize: Theme.fontSegmentedSize

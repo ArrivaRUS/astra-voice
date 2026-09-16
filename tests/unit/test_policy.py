@@ -82,6 +82,39 @@ def test_effective_overrides_settings(tmp_path: Path) -> None:
     assert result.hotkey == "Ctrl+Space"
 
 
+@pytest.mark.parametrize(
+    "combo", ["Space", "Return", "A", "Shift+Space", "Ctrl", "Ctrl+Shift", "Ctrl+A+B", ""]
+)
+@pytest.mark.parametrize("previous", [Settings.hotkey, "Alt+Space"])
+def test_invalid_policy_hotkey_keeps_previous_value(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, combo: str, previous: str
+) -> None:
+    path = _write(tmp_path, f"[astra-voice]\nhotkey = {combo}\nlanguage = en\n")
+    policy = pol.load(path)
+    settings = Settings(hotkey=previous)
+
+    with caplog.at_level("WARNING", logger=pol.__name__):
+        result = pol.effective(settings, policy)
+
+    assert policy.status is pol.PolicyStatus.OK
+    assert policy.values["hotkey"] == combo
+    assert result.hotkey == settings.hotkey == previous
+    assert result.language == "en"
+    assert settings.language == "ru"
+    assert any(
+        record.name == pol.__name__
+        and record.levelname == "WARNING"
+        and "hotkey" in record.getMessage()
+        and repr(combo) in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_valid_policy_hotkey_overrides_settings(tmp_path: Path) -> None:
+    policy = pol.load(_write(tmp_path, "[astra-voice]\nhotkey = Ctrl+F9\n"))
+    assert pol.effective(Settings(hotkey="Alt+Space"), policy).hotkey == "Ctrl+F9"
+
+
 def test_effective_keeps_unknown_keys_in_extra(tmp_path: Path) -> None:
     path = _write(tmp_path, "[astra-voice]\nupdates = admin\n")
     result = pol.effective(Settings(), pol.load(path))

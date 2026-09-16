@@ -19,6 +19,7 @@ from PyQt5.QtCore import QEventLoop, QObject, Qt
 from astra_voice import runtime as module
 from astra_voice.app import _RuntimeOnboardingHost
 from astra_voice.core import paths
+from astra_voice.core import policy as policy_module
 from astra_voice.core import settings as settings_module
 from astra_voice.core import stats as stats_module
 from astra_voice.core.dictation import (
@@ -577,6 +578,49 @@ def test_start_wires_resources_and_real_dictation(rig: Rig) -> None:
     rig.stats.append.assert_called_once()
     rig.timers[-1].fire()
     assert_phase(runtime, DictationPhase.IDLE)
+
+
+@pytest.mark.parametrize("combo", ["Space", "Return", "A", "Shift+Space", "Ctrl", "Ctrl+A+B"])
+@pytest.mark.parametrize("source", ["settings-file", "policy-file", "direct"])
+def test_start_never_grabs_invalid_hotkey(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    combo: str,
+    source: str,
+) -> None:
+    expected = Settings.hotkey
+    logger = module.__name__
+    with caplog.at_level(logging.WARNING):
+        if source == "settings-file":
+            path = tmp_path / "settings.json"
+            path.write_text(
+                json.dumps({"schema_version": settings_module.SCHEMA_VERSION, "hotkey": combo}),
+                encoding="utf-8",
+            )
+            settings = settings_module.load(path)
+            logger = settings_module.__name__
+            assert settings.hotkey == expected
+        elif source == "policy-file":
+            path = tmp_path / "policy.conf"
+            path.write_text(f"[astra-voice]\nhotkey = {combo}\n", encoding="utf-8")
+            expected = "Alt+Space"
+            settings = policy_module.effective(Settings(hotkey=expected), policy_module.load(path))
+            logger = policy_module.__name__
+            assert settings.hotkey == expected
+        else:
+            settings = Settings(hotkey=combo)
+        rig = Rig(monkeypatch, settings)
+        rig.runtime.start()
+
+    rig.hotkey.grab.assert_called_once_with(expected, HotkeyMode.PTT)
+    assert rig.runtime.settings.hotkey == expected
+    assert any(
+        record.name == logger
+        and record.levelno == logging.WARNING
+        and repr(combo) in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_notification_actions_show_window_and_are_removed_on_shutdown(rig: Rig) -> None:
@@ -1324,6 +1368,39 @@ def test_regrab_busy_ticks_are_silent(rig: Rig, caplog: pytest.LogCaptureFixture
     )
 
 
+@pytest.mark.parametrize("combo", ["Space", "Return", "A", "Shift+Space", "Ctrl", "Ctrl+A+B"])
+@pytest.mark.parametrize("mode", list(HotkeyMode))
+def test_regrab_validates_current_hotkey(
+    rig: Rig, caplog: pytest.LogCaptureFixture, combo: str, mode: HotkeyMode
+) -> None:
+    rig.grab_code = "busy"
+    rig.runtime.settings.hotkey_mode = mode.value
+    rig.runtime.start()
+    timer = rig.timers[0]
+    # Обход загрузчика после старта: каждый повтор обязан проверять текущее значение.
+    rig.runtime.settings.hotkey = combo
+    rig.hotkey.grab.reset_mock()
+
+    with caplog.at_level(logging.WARNING, logger=module.__name__):
+        timer.fire()
+        timer.fire()
+
+    assert rig.hotkey.grab.call_args_list == [call(Settings.hotkey, mode)] * 2
+    assert rig.runtime.settings.hotkey == Settings.hotkey
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == module.__name__ and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert repr(combo) in warnings[0].getMessage()
+    rig.grab_code = "ok"
+    timer.fire()
+    rig.hotkey.grab.assert_called_with(Settings.hotkey, mode)
+    assert rig.runtime._regrab_timer is None
+    rig.notify.notify_hotkey_regrabbed.assert_called_once_with(Settings.hotkey)
+
+
 def test_regrab_logs_only_result_changes(rig: Rig, caplog: pytest.LogCaptureFixture) -> None:
     rig.grab_code = "busy"
     rig.runtime.start()
@@ -1462,6 +1539,37 @@ def test_regrab_restores_real_hotkey_manager(
     rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
     rig.notify.notify_hotkey_regrabbed.assert_called_once_with("Ctrl+Space")
     rig.stats.append.assert_any_call("hotkey_grab", key_role="text", result="regrabbed", attempts=2)
+
+
+@pytest.mark.parametrize("combo", ["Space", "Return", "A", "Shift+Space", "Ctrl", "Ctrl+A+B"])
+@pytest.mark.parametrize("code", ["ok", "busy"])
+@pytest.mark.parametrize("mode", list(HotkeyMode))
+def test_apply_invalid_hotkey_grabs_default(
+    rig: Rig,
+    caplog: pytest.LogCaptureFixture,
+    combo: str,
+    code: ResultCode,
+    mode: HotkeyMode,
+) -> None:
+    rig.grab_code = code
+    with caplog.at_level(logging.WARNING, logger=module.__name__):
+        assert rig.runtime.apply_hotkey(combo, mode.value) == code
+
+    rig.hotkey.grab.assert_called_once_with(Settings.hotkey, mode)
+    assert rig.runtime.settings.hotkey == Settings.hotkey
+    assert rig.runtime.settings.hotkey_mode == mode.value
+    assert any(
+        record.name == module.__name__
+        and record.levelno == logging.WARNING
+        and repr(combo) in record.getMessage()
+        for record in caplog.records
+    )
+    if code == "busy":
+        assert rig.runtime._regrab_target == (Settings.hotkey, mode.value)
+        rig.grab_code = "ok"
+        rig.timers[-1].fire()
+        assert rig.hotkey.grab.call_args_list == [call(Settings.hotkey, mode)] * 2
+        assert rig.runtime._regrab_timer is None
 
 
 def test_apply_hotkey_stops_regrab_on_success(rig: Rig) -> None:

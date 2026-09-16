@@ -84,6 +84,7 @@ Button {
         }
 
         Text {
+            textFormat: Text.PlainText
             text: control.text
             font: control.font
             renderType: Text.NativeRendering

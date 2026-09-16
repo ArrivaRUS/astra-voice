@@ -24,7 +24,7 @@ from astra_voice.core.dictation import (
 )
 from astra_voice.core.model_source import SmokeRunner
 from astra_voice.core.policy import Policy
-from astra_voice.core.settings import Settings
+from astra_voice.core.settings import Settings, is_valid_combo
 from astra_voice.core.settings import save as settings_save
 from astra_voice.core.version import __version__
 from astra_voice.models.catalog import CatalogEntry, load_builtin
@@ -176,16 +176,6 @@ class ModelService:
 def _megabytes(size_bytes: int, *, round_up: bool = False) -> str:
     value = size_bytes / 1_000_000
     return f"{math.ceil(value) if round_up else value:.0f} МБ"
-
-
-def _has_modifier(combo: str) -> bool:
-    """Одна основная клавиша и обязательный модификатор; Shift — только дополнительный."""
-    modifiers = {"ctrl", "control", "alt", "meta", "super", "win"}
-    parts = [part.strip().lower() for part in combo.split("+")]
-    return (
-        any(part in modifiers for part in parts)
-        and sum(1 for part in parts if part and part not in modifiers and part != "shift") == 1
-    )
 
 
 class _ModelJob(QObject):
@@ -397,11 +387,15 @@ class SettingsBridge(QObject):
         if (
             (name == "hotkeyMode" and value not in ("ptt", "toggle"))
             or (name == "language" and value not in ("ru", "en"))
-            or (name == "hotkey" and not _has_modifier(cast(str, value)))
+            or (name == "hotkey" and not is_valid_combo(cast(str, value)))
         ):
             log.warning("Недопустимое значение настройки %s", name)
             if name == "hotkey":
                 self.hotkeyChanged.emit()
+            return
+        if name == "hotkeyMode" and not is_valid_combo(self.hotkey):
+            log.warning("hotkey=%r недопустим, смена режима отменена", self.hotkey)
+            self.hotkeyModeChanged.emit()
             return
         device_present = "device" in self._settings.extra
         old = (
@@ -1250,7 +1244,7 @@ class OnboardingController(QObject):
         if not combo:
             self._set_capture_state("idle")
             return
-        if not _has_modifier(combo):
+        if not is_valid_combo(combo):
             self._set_capture_state("capturing")
             self._set_capture_hint("Добавьте к клавише Ctrl, Alt или Win")
             self.refreshCandidates()

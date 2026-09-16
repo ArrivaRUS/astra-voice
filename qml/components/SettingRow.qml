@@ -81,6 +81,7 @@ Item {
             Text {
                 width: parent.width
                 verticalAlignment: Text.AlignVCenter
+                textFormat: Text.PlainText
                 text: root.label
                 color: root.labelColor
                 font.family: Theme.fontUi
@@ -95,6 +96,7 @@ Item {
 
             Text {
                 width: parent.width
+                textFormat: Text.PlainText
                 text: root.sub
                 visible: root.sub !== ""
                 color: root.subColor
@@ -153,6 +155,7 @@ Item {
                 }
 
                 Text {
+                    textFormat: Text.PlainText
                     text: root.lockedText !== "" ? root.lockedText : qsTr("Задано администратором")
                     color: Theme.lockBadgeFg
                     font.family: Theme.fontUi

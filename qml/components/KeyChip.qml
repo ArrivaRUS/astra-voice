@@ -27,6 +27,7 @@ Rectangle {
 
     Text {
         id: label
+        textFormat: Text.PlainText
         text: root.text
         color: Theme.hotkeyChipFg
         font.family: Theme.fontMono

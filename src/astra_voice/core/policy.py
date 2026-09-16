@@ -20,7 +20,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from astra_voice.core.settings import Settings
+from astra_voice.core.settings import Settings, is_valid_combo
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +107,9 @@ def effective(settings: Settings, policy: Policy) -> Settings:
     """Возвращает копию настроек с наложенными значениями политики."""
     result = dataclasses.replace(settings, extra=dict(settings.extra))
     for key, value in policy.values.items():
+        if key == "hotkey" and (not isinstance(value, str) or not is_valid_combo(value)):
+            log.warning("hotkey=%r из политики недопустим, оставляю прежнее значение", value)
+            continue
         if key in _SETTINGS_TYPES:
             setattr(result, key, value)
         else:

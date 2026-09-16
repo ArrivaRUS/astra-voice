@@ -170,6 +170,70 @@ def test_bad_types_fall_back_to_defaults(path: Path) -> None:
     assert s.model_id is None
 
 
+@pytest.mark.parametrize(
+    "combo",
+    [
+        "Ctrl+Space",
+        "Ctrl+Shift+Space",
+        "Ctrl+Alt+D",
+        " cTrL + A ",
+        " CONTROL + A ",
+        " aLt + A ",
+        " MeTa + A ",
+        " SuPeR + A ",
+        " WIN + A ",
+        "Ctrl++Space",
+        "+Ctrl+Space+",
+        "Ctrl+Ctrl+Space",
+    ],
+)
+def test_valid_combo_preserves_gui_validation_rules(combo: str) -> None:
+    assert st.is_valid_combo(combo)
+    assert st.from_dict({"hotkey": combo}).hotkey == combo
+
+
+@pytest.mark.parametrize(
+    "combo",
+    [
+        "Space",
+        "Return",
+        "A",
+        "Shift+Space",
+        "",
+        "unknown",
+        "  sHiFt + A  ",
+        "ControlKey+A",
+        "Ctrl",
+        "Ctrl+Shift",
+        "Alt+Super",
+        "Ctrl+A+B",
+    ],
+)
+@pytest.mark.parametrize("source", ["file", "dict"])
+def test_invalid_hotkey_falls_back_with_warning(
+    path: Path, caplog: pytest.LogCaptureFixture, combo: str, source: str
+) -> None:
+    data = {"schema_version": st.SCHEMA_VERSION, "hotkey": combo, "hotkey_mode": "toggle"}
+    assert not st.is_valid_combo(combo)
+
+    with caplog.at_level("WARNING", logger=st.__name__):
+        if source == "file":
+            path.write_text(json.dumps(data), encoding="utf-8")
+            settings = st.load(path)
+        else:
+            settings = st.from_dict(data)
+
+    assert settings.hotkey == st.Settings.hotkey == "Ctrl+Space"
+    assert settings.hotkey_mode == "toggle"
+    assert any(
+        record.name == st.__name__
+        and record.levelname == "WARNING"
+        and "hotkey" in record.getMessage()
+        and repr(combo) in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_unknown_hotkey_mode_falls_back(path: Path) -> None:
     path.write_text(json.dumps({"schema_version": 1, "hotkey_mode": "тыр-пыр"}), encoding="utf-8")
     assert st.load(path).hotkey_mode == "ptt"

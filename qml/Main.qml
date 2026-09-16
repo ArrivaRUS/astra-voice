@@ -93,6 +93,7 @@ ApplicationWindow {
             spacing: 2
 
             Text {
+                textFormat: Text.PlainText
                 text: sidebar.debugCurrent ? qsTr("Отладка") : qsTr("Общие")
                 color: Theme.fg
                 font.family: Theme.fontUi
@@ -104,6 +105,7 @@ ApplicationWindow {
             }
 
             Text {
+                textFormat: Text.PlainText
                 text: sidebar.debugCurrent ? qsTr("Скрытый раздел: Ctrl + Shift + D")
                     : qsTr("Диктовка, индикация и запуск")
                 color: Theme.fgMuted

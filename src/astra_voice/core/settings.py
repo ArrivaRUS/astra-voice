@@ -22,6 +22,16 @@ SCHEMA_VERSION = 1
 HOTKEY_MODES = ("ptt", "toggle")
 
 
+def is_valid_combo(combo: str) -> bool:
+    """Одна основная клавиша и обязательный модификатор; Shift — только дополнительный."""
+    modifiers = {"ctrl", "control", "alt", "meta", "super", "win"}
+    parts = [part.strip().lower() for part in combo.split("+")]
+    return (
+        any(part in modifiers for part in parts)
+        and sum(1 for part in parts if part and part not in modifiers and part != "shift") == 1
+    )
+
+
 @dataclass
 class Settings:
     """Значения настроек. Незнакомые ключи сохраняются в ``extra``."""
@@ -94,6 +104,9 @@ def from_dict(data: dict[str, Any]) -> Settings:
             setattr(settings, name, value)
         else:
             log.warning("настройка %r негодного типа, беру значение по умолчанию", name)
+    if not is_valid_combo(settings.hotkey):
+        log.warning("hotkey=%r недопустим, беру значение по умолчанию", settings.hotkey)
+        settings.hotkey = Settings.hotkey
     if settings.hotkey_mode not in HOTKEY_MODES:
         log.warning("hotkey_mode=%r неизвестен, беру 'ptt'", settings.hotkey_mode)
         settings.hotkey_mode = "ptt"

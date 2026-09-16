@@ -30,11 +30,12 @@ from astra_voice.core.model_source import (
     smoke_matches,
     smoke_wav_path,
 )
-from astra_voice.core.settings import Settings
+from astra_voice.core.settings import Settings, is_valid_combo
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
 from astra_voice.platform.hotkey import (
     DEFAULT_CANDIDATES,
     RECORD_LIMIT_S,
+    GrabResult,
     HotkeyManager,
     HotkeyMode,
     HotkeyState,
@@ -663,7 +664,7 @@ class DictationRuntime(QObject):
         self.settings.hotkey = combo
         self.settings.hotkey_mode = hotkey_mode.value
         self.hotkey.ungrab()
-        result = self.hotkey.grab(combo, hotkey_mode)
+        result = self._grab_hotkey()
         if not result.ok:
             self.tray.set_state(TrayState.NOKEY)
             self._start_regrab(result.code)
@@ -672,6 +673,13 @@ class DictationRuntime(QObject):
             if self.orchestrator.phase == DictationPhase.IDLE and self._selfcheck != "failed":
                 self.tray.set_state(TrayState.IDLE)
         return result.code
+
+    def _grab_hotkey(self) -> GrabResult:
+        """Проверяет сочетание перед каждым захватом, включая старт и повторы."""
+        if not is_valid_combo(self.settings.hotkey):
+            log.warning("hotkey=%r недопустим, беру значение по умолчанию", self.settings.hotkey)
+            self.settings.hotkey = Settings.hotkey
+        return self.hotkey.grab(self.settings.hotkey, HotkeyMode(self.settings.hotkey_mode))
 
     def _start_regrab(self, code: str) -> None:
         """Повторяет захват; новая настройка начинает собственный отсчёт попыток."""
@@ -703,7 +711,7 @@ class DictationRuntime(QObject):
         if self._closed or self._regrab_timer is None:
             return
         self._regrab_attempts += 1
-        result = self.hotkey.grab(self.settings.hotkey, HotkeyMode(self.settings.hotkey_mode))
+        result = self._grab_hotkey()
         if result.ok:
             self._stop_regrab()
             if self.orchestrator.phase == DictationPhase.IDLE and self._selfcheck != "failed":
@@ -794,7 +802,7 @@ class DictationRuntime(QObject):
         self.x11.open()
         self.tray.start()
         self.supervisor.start()
-        result = self.hotkey.grab(self.settings.hotkey, HotkeyMode(self.settings.hotkey_mode))
+        result = self._grab_hotkey()
         self._record_hotkey_grab("ok" if result.ok else "busy", 1)
         if not result.ok:
             self.tray.set_state(TrayState.NOKEY)

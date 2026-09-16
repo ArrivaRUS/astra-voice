@@ -41,8 +41,10 @@ from astra_voice.worker.audio import (
     PA_ERR_BUSY,
     PA_ERR_NOENTITY,
     RATE,
+    RECORD_DEADLINE_GRACE_S,
     SAMPLE_BYTES,
     SILENCE_HOLD_S,
+    STOP_WATCHDOG_S,
     AudioCapture,
     AudioDevice,
     AudioError,
@@ -59,7 +61,7 @@ from astra_voice.worker.audio import (
     resolve_device,
 )
 from astra_voice.worker.ipc import FrameError, encode
-from astra_voice.worker.state import Message, State, WorkerState
+from astra_voice.worker.state import LIMIT_S_DEFAULT, Message, State, WorkerState
 
 # tests не пакет; подключаем общие фейки так же, как test_worker_state.py.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -708,7 +710,7 @@ def test_signal_levels_are_rate_limited(
     step = 1 / (LEVEL_RATE_HZ * 8)
     probe = CaptureProbe(WavFileSource(wav_factory(16384, 100)), step=step)
     probes.append(probe)
-    probe.capture.start("signal", None)
+    probe.capture.start("signal", None, limit_s=LIMIT_S_DEFAULT)
     wait_capture()
     levels = [(stamp, event) for stamp, event in probe.drain() if event["type"] == "level"]
     assert 2 <= len(levels) < len(probe.samples) == 100
@@ -729,7 +731,7 @@ def test_silence_is_reported_once_after_hold(
     step = SILENCE_HOLD_S / 8
     probe = CaptureProbe(WavFileSource(wav_factory(0, 32)), step=step)
     probes.append(probe)
-    probe.capture.start("silence", None)
+    probe.capture.start("silence", None, limit_s=LIMIT_S_DEFAULT)
     wait_capture()
     silent = [(stamp, event) for stamp, event in probe.drain() if event["type"] == "silent"]
     assert len(probe.samples) == 32
@@ -834,7 +836,7 @@ def test_wav_eof_is_not_an_error(
     source = WavFileSource(wav_factory(8192, 2))
     probe = CaptureProbe(source)
     probes.append(probe)
-    probe.capture.start("eof", None)
+    probe.capture.start("eof", None, limit_s=LIMIT_S_DEFAULT)
     wait_capture()
     assert source.ended
     assert not source.is_open
@@ -1341,7 +1343,7 @@ def test_level_preserves_fractional_rms(
     source.chunks.put(None)
     probe = CaptureProbe(source)
     probes.append(probe)
-    probe.capture.start("quiet", None)
+    probe.capture.start("quiet", None, limit_s=LIMIT_S_DEFAULT)
     wait_capture()
     levels = [event for _, event in probe.drain() if event["type"] == "level"]
     assert len(levels) == 1
@@ -1362,7 +1364,7 @@ def test_capture_bounds_label_in_event_and_log(
     probe = CaptureProbe(source)
     probes.append(probe)
     with caplog.at_level(logging.INFO, logger="astra_voice.worker.audio"):
-        probe.capture.start("label", "alsa_input.private")
+        probe.capture.start("label", "alsa_input.private", limit_s=LIMIT_S_DEFAULT)
         wait_capture()
     expected = "М" * (MAX_DEVICE_LABEL - 1) + "…"
     assert [event for _, event in probe.drain()] == [{"type": "audio.ready", "device": expected}]
@@ -1551,7 +1553,9 @@ def test_capture_reports_device_changes_between_recordings(
     for index, (device, changed_label) in enumerate(choices):
         selected = device if device is not None else fallback
         devices[:] = [selected]
-        probe.capture.start(str(index), device.name if device is not None else None)
+        probe.capture.start(
+            str(index), device.name if device is not None else None, limit_s=LIMIT_S_DEFAULT
+        )
         wait_capture()
         expected: Message = {"type": "audio.ready", "device": selected.label}
         if changed_label is not None:
@@ -1565,7 +1569,7 @@ def test_capture_reports_device_changes_between_recordings(
         assert source.selected_device is None
 
         # Неудачное открытие не выдаёт ready и не стирает предыдущий выбор.
-        probe.capture.start(f"missing-{index}", "alsa_input.missing")
+        probe.capture.start(f"missing-{index}", "alsa_input.missing", limit_s=LIMIT_S_DEFAULT)
         wait_capture()
         assert probe.errors.get_nowait()[1] == ERROR_NO_DEVICE
         assert probe.errors.empty()
@@ -1587,7 +1591,7 @@ def test_capture_bounds_change_notification(
     source = PulseSimpleSource(devices=lambda: [device])
     probe = CaptureProbe(source, sink=lambda uid, samples: False)
     probes.append(probe)
-    probe.capture.start("long", device.name)
+    probe.capture.start("long", device.name, limit_s=LIMIT_S_DEFAULT)
     wait_capture()
     events = [event for _, event in probe.drain()]
     assert len(events) == 1
@@ -1622,7 +1626,7 @@ def test_capture_sanitizes_pactl_description(
     probe = CaptureProbe(source, sink=lambda uid, samples: False)
     probes.append(probe)
     with caplog.at_level(logging.INFO, logger="astra_voice.worker.audio"):
-        probe.capture.start("untrusted-description", name)
+        probe.capture.start("untrusted-description", name, limit_s=LIMIT_S_DEFAULT)
         wait_capture()
     events = [event for _, event in probe.drain()]
     assert len(events) == 1
@@ -1749,7 +1753,7 @@ def test_total_deadline_bounds_nested_pulse_retries(
 
     pulse.open.side_effect = refuse
     monkeypatch.setattr("astra_voice.worker.audio._Pulse", lambda: pulse)
-    probe.capture.start("deadline", device.name)
+    probe.capture.start("deadline", device.name, limit_s=LIMIT_S_DEFAULT)
     wait_capture()
     assert probe.now == pytest.approx(OPEN_TOTAL_DEADLINE_S)
     assert timeouts == pytest.approx([2.0, 2.0, 2.0, 0.4])
@@ -1792,7 +1796,7 @@ def test_total_deadline_includes_device_listing(
         return list_devices(run=run, deadline=deadline)
 
     monkeypatch.setattr("astra_voice.worker.audio.list_devices", devices)
-    probe.capture.start("listing", "alsa_input.pci.microphone")
+    probe.capture.start("listing", "alsa_input.pci.microphone", limit_s=LIMIT_S_DEFAULT)
     wait_capture()
     assert timeouts == [5.0, OPEN_TOTAL_DEADLINE_S - 5.0]
     assert probe.now == OPEN_TOTAL_DEADLINE_S
@@ -1833,7 +1837,7 @@ def test_total_deadline_includes_default_lookup(
     source = PulseSimpleSource(default=partial(default_device, run=run))
     probe = CaptureProbe(source)
     probes.append(probe)
-    probe.capture.start("default-deadline", None)
+    probe.capture.start("default-deadline", None, limit_s=LIMIT_S_DEFAULT)
     wait_capture()
     assert timeouts == [5.0, 4.0, 2.0]
     assert probe.now == OPEN_TOTAL_DEADLINE_S
@@ -1863,7 +1867,7 @@ def test_total_deadline_shortens_retry_pause(
         raise AudioError(ERROR_FAILED, "Не удалось включить запись звука.")
 
     monkeypatch.setattr(source, "open", refuse)
-    probe.capture.start("pause", "alsa_input.chosen")
+    probe.capture.start("pause", "alsa_input.chosen", limit_s=LIMIT_S_DEFAULT)
     wait_capture()
     assert calls == ["alsa_input.chosen"] * 2
     assert probe.now == OPEN_TOTAL_DEADLINE_S
@@ -2100,6 +2104,177 @@ def test_capture_stop_before_start_closes_unowned_source() -> None:
     source.close.assert_called_once_with()
 
 
+def test_record_deadline_stops_blocked_capture_without_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ИБ-9: после audio.ready часы останавливают зависшее чтение без единого отсчёта."""
+    now = 100.0
+    limit_s = 10.0
+    deadline = now + limit_s + RECORD_DEADLINE_GRACE_S
+    monkeypatch.setattr("astra_voice.worker.audio.time", Mock(monotonic=lambda: now))
+    entered = threading.Event()
+    release = threading.Event()
+    source = ControlledSource()
+    close_threads: list[threading.Thread] = []
+    original_close = source.close
+
+    def read_chunk() -> bytes | None:
+        entered.set()
+        assert release.wait(0.5), "Тест не освободил заблокированное чтение"
+        return None
+
+    def close() -> None:
+        assert release.is_set(), "Живой источник закрыт до возврата read_chunk"
+        close_threads.append(threading.current_thread())
+        original_close()
+
+    monkeypatch.setattr(source, "read_chunk", read_chunk)
+    monkeypatch.setattr(source, "close", close)
+    worker = WorkerState(clock=lambda: now)
+    on_samples = Mock(wraps=worker.on_samples)
+    on_event = Mock()
+    on_error = Mock(wraps=worker.on_error)
+    capture = AudioCapture(
+        source=source,
+        on_samples=on_samples,
+        on_event=on_event,
+        on_error=on_error,
+        clock=lambda: now,
+    )
+    worker.set_capture(capture)
+    try:
+        assert (
+            worker.handle({"type": "record.start", "utterance_id": "blocked", "limit_s": limit_s})
+            == []
+        )
+        assert entered.wait(0.5)
+        owner = capture._thread
+        assert owner is not None and owner.daemon
+        on_event.assert_called_once_with({"type": "audio.ready"})
+        request_stop = Mock(wraps=capture.request_stop)
+        monkeypatch.setattr(capture, "request_stop", request_stop)
+
+        # Лимит PCM уже прошёл, но запас ещё не истёк: ранней остановки нет.
+        now = deadline - 0.001
+        worker.check_capture_watchdog()
+        request_stop.assert_not_called()
+        assert capture.active
+
+        now = deadline
+        worker.check_capture_watchdog()
+        request_stop.assert_called_once_with()
+        assert not capture.active
+        assert capture._record_deadline is None
+        now += STOP_WATCHDOG_S - 0.001
+        worker.check_capture_watchdog()
+        now = deadline + STOP_WATCHDOG_S
+        with pytest.raises(CaptureStopTimeout):
+            worker.check_capture_watchdog()
+        request_stop.assert_called_once_with()
+        on_samples.assert_not_called()
+        on_error.assert_not_called()
+        assert worker.buffers == {"blocked": array("f")}
+        assert owner.is_alive()
+        assert source.is_open
+        assert close_threads == []
+    finally:
+        release.set()
+        if capture._thread is not None:
+            capture._thread.join(timeout=0.5)
+            assert not capture._thread.is_alive()
+        worker.close()
+    assert close_threads == [owner]
+    assert not source.is_open
+    worker.check_capture_watchdog()
+
+
+@pytest.mark.parametrize("chunk", [b"", struct.pack("<h", 8192)], ids=["empty", "sparse"])
+@pytest.mark.parametrize("advance_on_samples", [False, True], ids=["during-read", "between-reads"])
+def test_record_deadline_checked_between_chunks(
+    chunk: bytes,
+    advance_on_samples: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    wait_capture: Callable[[], None],
+    probes: list[CaptureProbe],
+) -> None:
+    """ИБ-9: цикл сам прекращает редкие и пустые чанки без опроса владельцем."""
+    source = ControlledSource()
+    probe = CaptureProbe(source, step=1.0 if advance_on_samples else 0.0)
+    probes.append(probe)
+    probe.now = 100.0
+    read_calls = 0
+
+    def read_chunk() -> bytes | None:
+        nonlocal read_calls
+        read_calls += 1
+        if not advance_on_samples:
+            probe.now += 1.0
+        if read_calls > 10:
+            # Даже при регрессии тест завершится без бесконечного цикла.
+            source.ended = True
+            return None
+        return chunk
+
+    monkeypatch.setattr(source, "read_chunk", read_chunk)
+    probe.capture.start("slow", None, limit_s=3.0 - RECORD_DEADLINE_GRACE_S)
+    wait_capture()
+    assert probe.now == 103.0
+    assert read_calls == 3
+    assert len(probe.samples) == (3 if advance_on_samples else 2)
+    assert not probe.capture.active
+    assert probe.capture._record_deadline is None
+    assert not source.is_open
+    assert source.close_calls == 1
+    assert probe.errors.empty()
+
+
+@pytest.mark.parametrize("finish", ["stop", "eof"])
+def test_record_deadline_cleared_and_renewed_on_restart(
+    finish: str, wait_capture: Callable[[], None], probes: list[CaptureProbe]
+) -> None:
+    """Штатный выход снимает срок; новая запись получает полный собственный бюджет."""
+    source = ControlledSource()
+    probe = CaptureProbe(source)
+    probes.append(probe)
+    probe.now = 100.0
+    probe.capture.start("first", None, limit_s=10.0)
+    try:
+        assert source.reading.wait(0.5)
+        probe.now = 105.0
+        if finish == "stop":
+            probe.capture.request_stop()
+        else:
+            source.ended = True
+        source.chunks.put(None)
+        wait_capture()
+        assert probe.capture._record_deadline is None
+        assert not probe.capture.active
+
+        probe.now = 110.0
+        probe.capture.check_stop_watchdog()
+        source.ended = False
+        source.reading.clear()
+        probe.capture.start("next", None, limit_s=20.0)
+        assert source.reading.wait(0.5)
+        probe.now = 110.0 + RECORD_DEADLINE_GRACE_S
+        probe.capture.check_stop_watchdog()
+        assert probe.capture.active
+        probe.now = 130.0 + RECORD_DEADLINE_GRACE_S - 0.001
+        probe.capture.check_stop_watchdog()
+        assert probe.capture.active
+        probe.now = 130.0 + RECORD_DEADLINE_GRACE_S
+        probe.capture.check_stop_watchdog()
+        assert not probe.capture.active
+    finally:
+        probe.capture.request_stop()
+        source.chunks.put(None)
+        wait_capture()
+    assert probe.capture._record_deadline is None
+    assert probe.errors.empty()
+    assert not source.is_open
+    assert source.open_calls == source.close_calls == 2
+
+
 def test_watchdog_keeps_deadline_for_previous_capture(
     pulse_library: Mock,
     monkeypatch: pytest.MonkeyPatch,
@@ -2128,13 +2303,13 @@ def test_watchdog_keeps_deadline_for_previous_capture(
         on_event=lambda _: None,
         on_error=Mock(),
     )
-    capture.start("first", device.name)
+    capture.start("first", device.name, limit_s=LIMIT_S_DEFAULT)
     try:
         assert entered.wait(TIMEOUT)
         first = capture._thread
         assert first is not None
         now = STOP_WATCHDOG_S - 1
-        capture.start("next", device.name)
+        capture.start("next", device.name, limit_s=LIMIT_S_DEFAULT)
         assert capture.active
         capture.check_stop_watchdog()
         capture.request_stop()

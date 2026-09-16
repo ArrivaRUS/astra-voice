@@ -3,8 +3,10 @@
 xvfb в системе не установлен. Запуск без X-сервера:
 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software pytest -m xvfb.
 Снимки всегда включают поля тени 18/18/18/24 px и принимаются только при альфе
-фона 240 ± 1 в центре пилюли. Все 10 PNG публикуются из временного каталога
-атомарной заменой каждого файла только после успешных проверок всего модуля.
+фона 240 ± 1 в центре пилюли. Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR
+или по умолчанию design/refs/impl/pill. PNG публикуются из временного каталога
+атомарной заменой только при изменении пикселей (или отсутствии читаемого PNG)
+и после успешных проверок всего модуля; метаданные PNG не учитываются.
 Референс design/refs/09-pill.png проверяется на наличие, без попиксельного сравнения.
 """
 
@@ -28,7 +30,7 @@ from helpers.qt_app import get_qapplication  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-SNAPSHOTS = REPO / "design/refs/impl/pill"
+SNAPSHOTS = REPO / Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR") or "design/refs/impl/pill")
 LABELS = {
     "hidden": "",
     "loading-model": "Загружаю модель…",
@@ -326,7 +328,11 @@ def capture_state(
 def rendered_states(
     pill_app: Any, request: pytest.FixtureRequest
 ) -> Iterator[dict[str, RenderedState]]:
+    from PyQt5.QtGui import QImage
+
     # Общая фикстура гарантирует снимки и при отдельном запуске теста референса.
+    # Соседний staging сохраняет атомарность замены и не попадает в glob снимков.
+    SNAPSHOTS.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".pill-", dir=SNAPSHOTS.parent))
     failures_before = request.session.testsfailed
     try:
@@ -342,7 +348,12 @@ def rendered_states(
         if request.session.testsfailed == failures_before:
             SNAPSHOTS.mkdir(parents=True, exist_ok=True)
             for name in sorted(expected):
-                os.replace(staging / name, SNAPSHOTS / name)
+                source = staging / name
+                destination = SNAPSHOTS / name
+                current = QImage(str(destination)).convertToFormat(QImage.Format_RGBA8888)
+                candidate = QImage(str(source)).convertToFormat(QImage.Format_RGBA8888)
+                if current.isNull() or current != candidate:
+                    os.replace(source, destination)
     finally:
         shutil.rmtree(staging)
 

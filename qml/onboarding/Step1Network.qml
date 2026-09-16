@@ -37,7 +37,7 @@ Item {
         Column {
             Layout.fillWidth: true
             Layout.alignment: Qt.AlignVCenter
-            spacing: 3 // spec §10: зазор в колонке заголовка.
+            spacing: 5 // Дизайн-ревью круга 4: +2 px для зазора 13 px между заголовком и подзаголовком.
 
             Text {
                 width: parent.width

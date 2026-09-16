@@ -504,6 +504,57 @@ def test_cancel_blocks_all_later_results_and_retries(rig: Rig, phase: str) -> No
     assert len(rig.pasted) == attempts and len(rig.stats.events) == 1
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("microphone_test", [False, True])
+@pytest.mark.parametrize("phase", ["recording", "processing"])
+def test_ib8_cancel_survives_persistent_ui_failures(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    microphone_test: bool,
+    phase: str,
+) -> None:
+    """ИБ-8: оба UI-порта всегда падают, отмена и её сторож всё равно работают."""
+    if microphone_test:
+        assert rig.core.start_test("", Mock())
+        if phase == "processing":
+            rig.core.stop_test()
+    else:
+        rig.start()
+        if phase == "processing":
+            rig.stop()
+    old_timers = list(rig.timers)
+    set_recording = Mock(side_effect=RuntimeError(MARKER))
+    set_state = Mock(side_effect=RuntimeError(MARKER))
+    monkeypatch.setattr(rig.core, "_set_recording", set_recording)
+    monkeypatch.setattr(rig.tray, "set_state", set_state)
+    at_send: list[tuple[int, int, list[Timer]]] = []
+
+    def observe_send(message: dict[str, Any]) -> None:
+        at_send.append(
+            (
+                set_recording.call_count,
+                set_state.call_count,
+                [timer for timer in rig.timers if not timer.cancelled and not timer.fired],
+            )
+        )
+
+    rig.during_send = observe_send
+    rig.core.cancel("tray")
+
+    assert rig.sent[-1][0] == {"type": "record.cancel", "utterance_id": rig.uid}
+    watchdog = rig.timer(CANCEL_TIMEOUT_MS)
+    assert at_send == [(0, 0, [watchdog])]
+    assert all(timer.cancelled for timer in old_timers)
+    assert set_recording.call_count == set_state.call_count == 1
+    assert len(caplog.records) == 2
+    assert all(
+        record.levelno == logging.WARNING and record.exc_info is not None
+        for record in caplog.records
+    )
+    assert MARKER not in caplog.text
+
+
 def test_cancel_idle_and_finishing_is_noop(rig: Rig) -> None:
     rig.core.cancel("tray")
     assert not rig.sent and not rig.timers and not rig.pill.calls
@@ -2036,6 +2087,72 @@ def test_microphone_cancel_watchdogs_always_release_worker(rig: Rig) -> None:
     assert not rig.pasted
     assert not rig.stats.events
     assert not rig.pill.calls
+
+
+@pytest.mark.parametrize("microphone_test", [False, True])
+def test_stop_survives_persistent_ui_failures(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    microphone_test: bool,
+) -> None:
+    if microphone_test:
+        assert rig.core.start_test("", Mock())
+        monkeypatch.setattr(rig.core, "_test_callback", Mock(side_effect=RuntimeError(MARKER)))
+    else:
+        rig.start()
+    set_recording = Mock(side_effect=RuntimeError(MARKER))
+    set_state = Mock(side_effect=RuntimeError(MARKER))
+    show_state = Mock(side_effect=RuntimeError(MARKER))
+    monkeypatch.setattr(rig.core, "_set_recording", set_recording)
+    monkeypatch.setattr(rig.tray, "set_state", set_state)
+    monkeypatch.setattr(rig.pill, "show_state", show_state)
+
+    if microphone_test:
+        rig.core.stop_test()
+    else:
+        rig.stop()
+
+    assert rig.commands() == ["record.start", "record.stop", "recognize"]
+    rig.timer(PROCESSING_WATCHDOG_MS)
+    assert set_recording.call_count == (2 if microphone_test else 1)
+    assert set_state.call_count == 1
+    assert show_state.call_count == (0 if microphone_test else 1)
+    assert len(caplog.records) == (4 if microphone_test else 3)
+    assert all(record.exc_info is not None for record in caplog.records)
+    assert MARKER not in caplog.text
+
+
+@pytest.mark.parametrize("terminal", ["result", "timeout"])
+def test_finish_microphone_test_survives_persistent_ui_failures(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    terminal: str,
+) -> None:
+    assert rig.core.start_test("", Mock())
+    if terminal == "result":
+        rig.core.stop_test()
+    else:
+        rig.core.cancel("tray")
+    callback = Mock(side_effect=RuntimeError(MARKER))
+    monkeypatch.setattr(rig.core, "_test_callback", callback)
+    monkeypatch.setattr(rig.core, "_set_recording", Mock(side_effect=RuntimeError(MARKER)))
+    monkeypatch.setattr(rig.tray, "set_state", Mock(side_effect=RuntimeError(MARKER)))
+
+    if terminal == "result":
+        microphone_event(rig, "result", text=MARKER, t_ms=310)
+    else:
+        rig.timer(CANCEL_TIMEOUT_MS).fire()
+        assert rig.sent[-1][0] == {"type": "audio.close"}
+        rig.timer(CANCEL_RESTART_MS).fire()
+        rig.restart_worker.assert_called_once_with()
+
+    assert not rig.core.test_active
+    assert callback.call_count == 1
+    assert len(caplog.records) == 3
+    assert all(record.exc_info is not None for record in caplog.records)
+    assert MARKER not in caplog.text
 
 
 def test_microphone_test_rejects_old_generation_and_preserves_last_dictation(rig: Rig) -> None:

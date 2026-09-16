@@ -216,14 +216,30 @@ class DictationOrchestrator:
         if self.test_active:
             self.cancel("microphone-test")
 
+    def _safe_ui(self, call: Callable[[], None], message: str) -> None:
+        try:
+            call()
+        except Exception as error:
+            # Сообщение и цепочка исключений могут содержать речь из callback.
+            # Сохраняем стек, заменяя исключение служебным сообщением.
+            self._log.warning(
+                message, exc_info=(RuntimeError, RuntimeError(message), error.__traceback__)
+            )
+
     def _finish_test(self, update: MicrophoneTestUpdate) -> None:
         callback, self._test_callback = self._test_callback, None
         self._cancel_timers()
         self._change_phase(DictationPhase.IDLE)
-        self._set_recording(False)
-        self._tray.set_state(TrayState.IDLE)
+        self._safe_ui(
+            lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
+        )
+        self._safe_ui(
+            lambda: self._tray.set_state(TrayState.IDLE), "диктовка: не удалось обновить трей"
+        )
         if callback is not None:
-            callback(update)
+            self._safe_ui(
+                lambda: callback(update), "диктовка: не удалось обновить экран проверки микрофона"
+            )
 
     @property
     def phase(self) -> DictationPhase:
@@ -350,8 +366,14 @@ class DictationOrchestrator:
         if self.phase != DictationPhase.PROCESSING or self._cancel_requested:
             return
         if self._test_callback is not None:
-            self._set_recording(False)
-            self._test_callback(MicrophoneTestUpdate("processing"))
+            callback = self._test_callback
+            self._safe_ui(
+                lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
+            )
+            self._safe_ui(
+                lambda: callback(MicrophoneTestUpdate("processing")),
+                "диктовка: не удалось обновить экран проверки микрофона",
+            )
             # Обработчик состояния вправе сразу отменить распознавание.
             if self.phase != DictationPhase.PROCESSING or self._cancel_requested:
                 return
@@ -361,10 +383,17 @@ class DictationOrchestrator:
             return
         if self.phase != DictationPhase.PROCESSING or self._cancel_requested:
             return
-        self._set_recording(False)
+        self._safe_ui(
+            lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
+        )
         if not self.test_active:
-            self._pill.show_state(PillState.PROCESSING)
-        self._tray.set_state(TrayState.PROCESSING)
+            self._safe_ui(
+                lambda: self._pill.show_state(PillState.PROCESSING),
+                "диктовка: не удалось обновить пилюлю",
+            )
+        self._safe_ui(
+            lambda: self._tray.set_state(TrayState.PROCESSING), "диктовка: не удалось обновить трей"
+        )
         self._later(PROCESSING_WATCHDOG_MS, self._watchdog)
 
     def on_worker_event(self, event: dict[str, Any]) -> None:
@@ -577,15 +606,20 @@ class DictationOrchestrator:
             return
         self._cancel_requested = True
         self._cancel_pending = True
-        self._hotkey_cancel()
         if self._t_stop is None:
             self._t_stop = self._clock()
+        # _cancel_timers снимает все ручки _later, поэтому сначала очищаем старые.
         self._cancel_timers()
-        self._set_recording(False)
-        self._tray.set_state(TrayState.IDLE)
         # Сторож ставится до send: синхронный cancelled тоже должен его отменить.
         self._later(CANCEL_TIMEOUT_MS, self._cancel_timeout)
         self._send_cancel()
+        self._safe_ui(self._hotkey_cancel, "диктовка: не удалось сбросить горячую клавишу")
+        self._safe_ui(
+            lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
+        )
+        self._safe_ui(
+            lambda: self._tray.set_state(TrayState.IDLE), "диктовка: не удалось обновить трей"
+        )
 
     def _send_cancel(self) -> None:
         try:

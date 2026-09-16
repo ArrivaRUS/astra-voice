@@ -21,8 +21,9 @@ record.cancel, model.unload или close (граница жизни поколе
 
 Отмена неизвестного id возвращает error с кодом bad-state. Отмена существующей
 записываемой, остановленной, выполняемой или ожидающей utterance выдаёт cancelled.
-Повторная отмена выдаёт тот же ответ: помним отменённые id без PCM до повторного
-использования id, model.unload или close. Поздний результат отменённого задания
+Повторная отмена выдаёт тот же ответ для последних CANCELLED_HISTORY_LIMIT id:
+помним их без PCM до вытеснения, повторного использования, model.unload или close.
+Поздний результат отменённого задания
 не выдаётся. Callback вызывается под блокировкой автомата, в том числе из
 рабочего потока: он должен быстро передать событие транспорту.
 """
@@ -36,6 +37,7 @@ import math
 import time
 import wave
 from array import array
+from collections import deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -47,6 +49,7 @@ from threading import RLock
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from astra_voice.core.constants import RECORD_LIMIT_S
 from astra_voice.core.logging import RedactTextFilter
 from astra_voice.core.paths import data_dir
 from astra_voice.core.version import __version__
@@ -59,8 +62,10 @@ logger = logging.getLogger(__name__)
 logger.addFilter(RedactTextFilter())
 Message = dict[str, Any]
 SAMPLE_RATE = 16_000
-LIMIT_S_DEFAULT = 120.0
+LIMIT_S_DEFAULT = RECORD_LIMIT_S
 STOPPED_TTL_S_DEFAULT = 300.0
+# 64 недавние отмены дают запас для повторов IPC без роста памяти за всё время работы.
+CANCELLED_HISTORY_LIMIT = 64
 _vad_unavailable_warned = False
 _vad_availability_lock = RLock()
 
@@ -254,6 +259,7 @@ class WorkerState:
         self._clock = clock
         self._stopped: dict[str, float] = {}
         self._cancelled: set[str] = set()
+        self._cancelled_order: deque[str] = deque(maxlen=CANCELLED_HISTORY_LIMIT)
         self.min_ram_mb = 0
         self._engine_factory = engine_factory
         self._source = audio_source
@@ -336,13 +342,15 @@ class WorkerState:
             if uid in self._stopped:
                 self._stopped.pop(uid)
                 logger.info("Остановленный буфер вытеснен новой записью: %s.", uid)
-            self._cancelled.discard(uid)
+            self._forget_cancelled(uid)
             self.buffers[uid] = array("f")
             self._recording = uid
             self._update_state()
             if self._capture is not None:
                 self._device = msg.get("device")
-                self._capture.start(uid, self._device)
+                self._capture.start(
+                    uid, self._device, limit_s=self._record_limit_samples / SAMPLE_RATE
+                )
             return []
         if kind == "record.stop":
             if self._recording != uid:
@@ -390,7 +398,7 @@ class WorkerState:
                 deferred.append(self._capture.stop)
 
     def check_capture_watchdog(self) -> None:
-        """Проверяет остановку после фоновых событий, не ожидая под RLock."""
+        """Проверяет сроки захвата и остановки независимо от поступления отсчётов."""
         if self._capture is not None:
             self._capture.check_stop_watchdog()
 
@@ -483,7 +491,7 @@ class WorkerState:
         if path is not None and uid in self.buffers:
             return [error("bad-state", "Служебный идентификатор занят записью.")]
         job = _Job(uid, self._cancel_factory(), self._clock(), path)
-        self._cancelled.discard(uid)
+        self._forget_cancelled(uid)
         self._stopped.pop(uid, None)
         if self._recording == uid:
             self._stop_capture(deferred)
@@ -607,7 +615,7 @@ class WorkerState:
             if msg["type"] in {"result", "cancelled"}:
                 self.buffers.pop(job.utterance_id, None)
                 if msg["type"] == "cancelled":
-                    self._cancelled.add(job.utterance_id)
+                    self._remember_cancelled(job.utterance_id)
             elif job.utterance_id in self.buffers:
                 self._stopped[job.utterance_id] = self._clock()
             self._active = None
@@ -632,6 +640,23 @@ class WorkerState:
         except Exception:
             logger.warning("Не удалось передать событие воркера.")
 
+    def _remember_cancelled(self, uid: str) -> None:
+        """Хранит ограниченную историю под блокировкой автомата."""
+        # FIFO сохраняет повторы IPC после доставки cancelled; множество даёт O(1)
+        # для проверки. Повтор отмены не занимает ещё одно место в очереди.
+        if uid in self._cancelled:
+            return
+        if len(self._cancelled_order) == CANCELLED_HISTORY_LIMIT:
+            self._cancelled.remove(self._cancelled_order.popleft())
+        self._cancelled_order.append(uid)
+        self._cancelled.add(uid)
+
+    def _forget_cancelled(self, uid: str) -> None:
+        """Начинает новую жизнь id без старой записи в очереди вытеснения."""
+        if uid in self._cancelled:
+            self._cancelled.remove(uid)
+            self._cancelled_order.remove(uid)
+
     def _cancel(self, uid: str, deferred: list[Callable[[], None]] | None = None) -> list[Message]:
         if uid not in self.buffers and not self._has_job(uid) and uid not in self._cancelled:
             return [error("bad-state", "Нет такой utterance для отмены.")]
@@ -646,7 +671,7 @@ class WorkerState:
             self._recording = None
         self.buffers.pop(uid, None)
         self._stopped.pop(uid, None)
-        self._cancelled.add(uid)
+        self._remember_cancelled(uid)
         self._update_state()
         return [{"type": "cancelled", "utterance_id": uid}]
 
@@ -669,6 +694,7 @@ class WorkerState:
         self.buffers.clear()
         self._stopped.clear()
         self._cancelled.clear()
+        self._cancelled_order.clear()
         self._update_state()
         engine, self._engine = self._engine, None
         self._loaded = None

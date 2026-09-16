@@ -193,6 +193,7 @@ Item {
 
                 Text {
                     width: parent.width
+                    textFormat: Text.PlainText
                     text: root.silent ? qsTr("Пока тишина") : qsTr("Слышим вас")
                     color: Theme.fg
                     font.family: Theme.fontUi
@@ -205,6 +206,7 @@ Item {
 
                 Text {
                     width: parent.width
+                    textFormat: Text.PlainText
                     text: root.testState === "preparing" ? root.testMessage
                         : root.testState === "idle" ? qsTr("Нажмите «Тестовая диктовка», чтобы проверить микрофон")
                         : root.testState === "recording" && root.silent ? qsTr("Звука с этого микрофона пока нет")
@@ -293,7 +295,7 @@ Item {
         y: resultField.y + resultField.height + (visible ? 7 : 0) // Макет: margin-top .c12.
         width: root.width
         height: visible ? implicitHeight : 0
-        spacing: 4 // Макет: пробел между иконкой и подписью итога.
+        spacing: 6 // Макет: зазор 6 px между иконкой и подписью итога.
 
         Icon {
             name: root.testState === "error" ? "alert" : "check"
@@ -307,6 +309,7 @@ Item {
         Text {
             Layout.fillWidth: true
             Layout.alignment: Qt.AlignBaseline
+            textFormat: Text.PlainText
             text: root.testState === "error"
                 ? (root.testMessage !== "" ? root.testMessage : qsTr("Не удалось распознать — попробуйте ещё раз"))
                 : root.testDuration !== ""

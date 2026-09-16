@@ -32,6 +32,8 @@ LEVEL_RATE_HZ = 30
 OPEN_FIRST_RETRIES = 3
 OPEN_FIRST_PAUSE_S = 1.0
 STOP_WATCHDOG_S = 5.0
+# Секунда допускает задержки между чанками, чтобы штатный лимит PCM успел сработать.
+RECORD_DEADLINE_GRACE_S = 1.0
 
 PA_SAMPLE_S16LE = 3
 PA_STREAM_RECORD = 2
@@ -361,10 +363,11 @@ class AudioCapture:
         self._thread: threading.Thread | None = None
         self._watchdog_lock = threading.Lock()
         self._stop_deadlines: dict[threading.Thread, float] = {}
+        self._record_deadline: float | None = None
         self._first_open = True
         self._previous_device: AudioDevice | None = None
 
-    def start(self, utterance_id: str, device: str | None) -> None:
+    def start(self, utterance_id: str, device: str | None, *, limit_s: float) -> None:
         """Запускает запись, не ожидая открытия устройства в вызывающем потоке."""
         self.request_stop()
         self.check_stop_watchdog()
@@ -372,9 +375,12 @@ class AudioCapture:
         running = threading.Event()
         running.set()
         self._running = running
+        deadline = self._clock() + limit_s + RECORD_DEADLINE_GRACE_S
+        with self._watchdog_lock:
+            self._record_deadline = deadline
         self._thread = threading.Thread(
             target=self._run,
-            args=(utterance_id, device, running, previous),
+            args=(utterance_id, device, running, previous, deadline),
             name="audio-capture",
             daemon=True,
         )
@@ -422,6 +428,7 @@ class AudioCapture:
         device: str | None,
         running: threading.Event,
         previous: threading.Thread | None,
+        deadline: float,
     ) -> None:
         """Владеет циклом чтения; лимит и хранение отсчётов остаются у автомата."""
         try:
@@ -449,7 +456,7 @@ class AudioCapture:
                 self._on_event(WorkerState.audio_ready(device=label, changed=changed))
             else:
                 self._source.flush()
-            self._read(uid, running)
+            self._read(uid, running, deadline)
         except AudioError as err:
             if running.is_set():
                 self._on_error(uid, err.code, err.message)
@@ -458,14 +465,16 @@ class AudioCapture:
             self._mark_stopping(threading.current_thread(), running)
             self._source.close()
 
-    def _read(self, uid: str, running: threading.Event) -> None:
+    def _read(self, uid: str, running: threading.Event, deadline: float) -> None:
         """Передаёт PCM, прореживает уровни по часам и один раз сообщает о тишине."""
         silence_since = self._clock()
         silent_sent = False
         last_level: float | None = None
         while running.is_set():
+            if self._clock() >= deadline:
+                return
             chunk = self._source.read_chunk()
-            if not running.is_set():
+            if not running.is_set() or self._clock() >= deadline:
                 return
             if chunk is None:
                 if self._source.ended:
@@ -510,11 +519,18 @@ class AudioCapture:
         """Сохраняет первый срок остановки; новая запись не скрывает старый поток."""
         with self._watchdog_lock:
             running.clear()
+            # Выход предыдущего потока не снимает дедлайн новой записи.
+            if running is self._running:
+                self._record_deadline = None
             if thread is not None:
                 self._stop_deadlines.setdefault(thread, time.monotonic() + STOP_WATCHDOG_S)
 
     def check_stop_watchdog(self) -> None:
-        """Сообщает владельцу о зависании, в том числе после фоновой отмены."""
+        """Ограничивает захват по часам и сообщает владельцу о зависшей остановке."""
+        with self._watchdog_lock:
+            deadline = self._record_deadline
+        if deadline is not None and self._clock() >= deadline:
+            self.request_stop()
         with self._watchdog_lock:
             for thread, deadline in list(self._stop_deadlines.items()):
                 if not thread.is_alive():

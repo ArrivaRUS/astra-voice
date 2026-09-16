@@ -16,12 +16,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal, Protocol
 
+from astra_voice.core.constants import RECORD_LIMIT_S as RECORD_LIMIT_S
 from astra_voice.platform.x11 import BadCombo, ParsedCombo, X11Display, X11Unavailable
 
 log = logging.getLogger(__name__)
 
 PTT_THRESHOLD_S = 0.3
-RECORD_LIMIT_S = 120.0
 LOOKAHEAD_S = 0.002
 DEFAULT_CANDIDATES = ("Ctrl+Shift+Space", "Ctrl+Alt+D")
 BUSY_MESSAGE = "Комбинация занята другой программой (возможно Handy или переключатель ввода)"

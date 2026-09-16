@@ -65,6 +65,7 @@ Item {
             }
 
             Text {
+                textFormat: Text.PlainText
                 text: root.modelText
                 color: Theme.statusbarFg
                 font.family: Theme.fontUi
@@ -80,6 +81,7 @@ Item {
             spacing: Theme.statusbarGap
 
             Text {
+                textFormat: Text.PlainText
                 text: root.updateText
                 color: Theme.statusbarFg
                 font.family: Theme.fontUi
@@ -104,6 +106,7 @@ Item {
             }
 
             Text {
+                textFormat: Text.PlainText
                 text: root.version
                 color: Theme.statusbarFg
                 font.family: Theme.fontMono

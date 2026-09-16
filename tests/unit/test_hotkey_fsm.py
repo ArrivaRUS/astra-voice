@@ -108,6 +108,14 @@ def test_ptt_release_and_done() -> None:
     assert states[-1] == (HotkeyState.IDLE, "done")
 
 
+def test_record_limit_matches_worker_default() -> None:
+    from astra_voice.core.constants import RECORD_LIMIT_S as CORE_RECORD_LIMIT_S
+    from astra_voice.platform.hotkey import RECORD_LIMIT_S
+    from astra_voice.worker.state import LIMIT_S_DEFAULT
+
+    assert RECORD_LIMIT_S == LIMIT_S_DEFAULT == CORE_RECORD_LIMIT_S == 120.0
+
+
 def test_tap_switches_to_toggle_for_one_recording() -> None:
     fsm, states = observed_fsm()
     fsm.press(0.0)

@@ -29,6 +29,7 @@ from astra_voice.worker.audio import AudioCapture, WavFileSource
 from astra_voice.worker.ipc import BAD_FIELD, FrameError, FrameReader, decode, encode
 from astra_voice.worker.main import WorkerLoop
 from astra_voice.worker.state import (
+    CANCELLED_HISTORY_LIMIT,
     LIMIT_S_DEFAULT,
     SAMPLE_RATE,
     STOPPED_TTL_S_DEFAULT,
@@ -585,6 +586,55 @@ def test_cancel_stopped_is_idempotent(factory: Factory) -> None:
     assert events.empty()
 
 
+@pytest.mark.parametrize("cancel_by_result", [False, True])
+def test_cancelled_history_is_bounded(factory: Factory, cancel_by_result: bool) -> None:
+    worker, _, events = factory(FakeEngine(cancelled_result=cancel_by_result))
+    count = 3 * CANCELLED_HISTORY_LIMIT
+    for index in range(count):
+        uid = f"u{index}"
+        start(worker, uid)
+        expected = {"type": "cancelled", "utterance_id": uid}
+        if cancel_by_result:
+            recognize(worker, uid)
+            assert events.get(timeout=2) == expected
+        else:
+            assert command(worker, "record.cancel", uid) == [expected]
+        assert len(worker._cancelled) <= CANCELLED_HISTORY_LIMIT
+        assert len(worker._cancelled_order) <= CANCELLED_HISTORY_LIMIT
+
+    recent = [f"u{index}" for index in range(count - CANCELLED_HISTORY_LIMIT, count)]
+    assert worker._cancelled == set(recent)
+    assert list(worker._cancelled_order) == recent
+    for uid in recent:
+        for _ in range(2):
+            assert command(worker, "record.cancel", uid) == [
+                {"type": "cancelled", "utterance_id": uid}
+            ]
+    assert list(worker._cancelled_order) == recent
+    for index in range(count - CANCELLED_HISTORY_LIMIT):
+        assert command(worker, "record.cancel", f"u{index}")[0]["code"] == "bad-state"
+
+    # Вытесненный id можно снова записать и отменить без повреждения истории.
+    start(worker, "u0")
+    assert command(worker, "record.cancel", "u0") == [{"type": "cancelled", "utterance_id": "u0"}]
+    assert len(worker._cancelled) == len(worker._cancelled_order) == CANCELLED_HISTORY_LIMIT
+    assert worker._cancelled == set(worker._cancelled_order)
+    assert command(worker, "record.cancel", recent[0])[0]["code"] == "bad-state"
+    assert worker.buffers == {}
+    assert_state(worker, State.idle)
+
+
+def test_reusing_cancelled_id_does_not_leave_stale_history(factory: Factory) -> None:
+    worker, _, _ = factory()
+    for _ in range(3 * CANCELLED_HISTORY_LIMIT):
+        start(worker)
+        assert not worker._cancelled
+        assert not worker._cancelled_order
+        assert command(worker, "record.cancel") == [{"type": "cancelled", "utterance_id": "u1"}]
+        assert worker._cancelled == {"u1"}
+        assert list(worker._cancelled_order) == ["u1"]
+
+
 @pytest.mark.parametrize("ttl", [STOPPED_TTL_S_DEFAULT, 2.0])
 def test_stopped_expires_on_next_message(
     factory: Factory, caplog: pytest.LogCaptureFixture, ttl: float
@@ -671,7 +721,7 @@ def test_record_start_limit_stops_capture_without_gui(
     if limit_s is not None:
         message["limit_s"] = limit_s
     assert worker.handle(decode(encode(message)[4:])) == []
-    capture.start.assert_called_once_with("u1", None)
+    capture.start.assert_called_once_with("u1", None, limit_s=count / SAMPLE_RATE)
     worker.feed_audio("u1", repeat(0.25, count - 1))
     assert_state(worker, State.recording)
     assert events.empty()
@@ -885,6 +935,8 @@ def test_unload_forgets_cancelled_ids(factory: Factory) -> None:
     start(worker)
     command(worker, "record.cancel")
     worker.handle({"type": "model.unload"})
+    assert not worker._cancelled
+    assert not worker._cancelled_order
     assert command(worker, "record.cancel")[0]["code"] == "bad-state"
 
 

@@ -185,6 +185,7 @@ Item {
                 Item { Layout.fillWidth: true }
 
                 Text {
+                    textFormat: Text.PlainText
                     text: root.state7 === "captured" ? qsTr("Отпустите клавиши") : qsTr("Esc — отмена")
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontCaptionSize

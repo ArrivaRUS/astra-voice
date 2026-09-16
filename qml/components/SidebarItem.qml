@@ -79,6 +79,7 @@ FocusScope {
             id: label
             Layout.fillWidth: true
             Layout.alignment: Qt.AlignVCenter
+            textFormat: Text.PlainText
             text: root.title
             color: root.current ? Theme.primaryFg : (root.muted ? Theme.fgMuted : Theme.fgSecondary)
             font.family: Theme.fontUi
@@ -95,6 +96,7 @@ FocusScope {
 
         Text {
             id: counterText
+            textFormat: Text.PlainText
             text: root.counter
             visible: root.counter !== ""
             color: root.current ? Theme.sidebarCounterOnActive : Theme.fgMuted

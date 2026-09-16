@@ -65,6 +65,7 @@ Item {
 
         Text {
             Layout.alignment: Qt.AlignVCenter
+            textFormat: Text.PlainText
             text: qsTr("Шаг %1 из %2").arg(root.step).arg(Theme.onboardingSteps)
             color: Theme.fgMuted
             font.family: Theme.fontUi
@@ -97,6 +98,7 @@ Item {
 
         Text {
             Layout.alignment: Qt.AlignVCenter
+            textFormat: Text.PlainText
             text: root.stepNames[root.step - 1]
             color: Theme.fgMuted
             font.family: Theme.fontUi
@@ -156,6 +158,7 @@ Item {
             Text {
                 Layout.alignment: Qt.AlignVCenter
                 Layout.maximumWidth: bar.width / 2
+                textFormat: Text.PlainText
                 text: root.barHint
                 visible: text !== ""
                 color: Theme.fgMuted

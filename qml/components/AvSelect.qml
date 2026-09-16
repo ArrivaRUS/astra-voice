@@ -17,6 +17,7 @@ ComboBox {
     font.pixelSize: Theme.fontSelectSize
 
     contentItem: Text {
+        textFormat: Text.PlainText
         text: control.displayText
         font: control.font
         renderType: Text.NativeRendering
@@ -64,6 +65,7 @@ ComboBox {
         rightPadding: Theme.popoverItemPaddingX
 
         contentItem: Text {
+            textFormat: Text.PlainText
             text: parent.modelData
             font.family: Theme.fontUi
             font.pixelSize: Theme.fontMenuItemSize

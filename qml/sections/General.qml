@@ -61,6 +61,7 @@ Column {
             locked: root.isLocked("hotkey")
 
             Text {
+                textFormat: Text.PlainText
                 text: root.hotkeyStatus === "busy" ? qsTr("Занята другой программой")
                     : root.hotkeyStatus === "not-grabbed" ? qsTr("Горячая клавиша не захвачена")
                     : root.hotkeyStatus === "bad-combo" ? qsTr("Такое сочетание не подходит — выберите другое")

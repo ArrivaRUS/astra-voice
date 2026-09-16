@@ -658,6 +658,37 @@ def test_hotkey_with_modifier_is_applied_and_saved(tmp_path: Path, combo: str) -
     assert len(changed) == 1
 
 
+@pytest.mark.parametrize("combo", ["Space", "Return", "A", "Shift+Space", "Ctrl", "Ctrl+A+B"])
+@pytest.mark.parametrize("with_mirror", [False, True])
+def test_mode_change_does_not_apply_invalid_saved_hotkey(
+    combo: str, with_mirror: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = Settings(hotkey=combo)
+    mirror = Settings(hotkey=combo) if with_mirror else None
+    save = Mock()
+    apply = Mock(spec=SettingsApply)
+    apply.hotkey.return_value = "ok"
+    bridge = SettingsBridge(settings, mirror=mirror, save=save, apply=apply)
+    original = settings.to_dict()
+    changed = QSignalSpy(bridge.hotkeyModeChanged)
+
+    with caplog.at_level(logging.WARNING):
+        assert bridge.setProperty("hotkeyMode", "toggle")
+
+    apply.hotkey.assert_not_called()
+    save.assert_not_called()
+    assert settings.to_dict() == original
+    assert bridge.hotkey == combo
+    assert bridge.hotkeyMode == "ptt"
+    if mirror is not None:
+        assert mirror.hotkey == combo and mirror.hotkey_mode == "ptt"
+    assert len(changed) == 1
+    assert any(
+        record.levelno == logging.WARNING and repr(combo) in record.getMessage()
+        for record in caplog.records
+    )
+
+
 @pytest.mark.parametrize("name", ["hotkeyMode", "language"])
 @pytest.mark.parametrize("value", ["", "invalid", "PTT", "RU"])
 def test_invalid_values_are_ignored(
@@ -2939,6 +2970,39 @@ def _microphone_log_violations(
     log_prefixes: Collection[str] = ("log.",),
 ) -> list[int]:
     """Как гейт notify: AST, раскрытие псевдонимов и цепочек присваиваний."""
+    # ИБ-13: проверяем явный поток приватных значений в аргументы журнала, включая
+    # log.exception(text) и exc_info=RuntimeError(text). Неявный поток через текущее
+    # исключение (log.exception("сбой"), exc_info=True/err/(type(err), err, tb))
+    # остаётся в поведенческих тестах, перечисленных ниже.
+    #
+    # Проверенный вариант запрета этих форм в функции, где приватное имя читается,
+    # присваивается или приходит параметром, ложно отвергает OnboardingController
+    # .__init__: self._test_text = "" соседствует с exc_info=True при ошибке
+    # host.subscribe_device_resolved. Runtime.subscribe_device_resolved лишь
+    # сохраняет callback и возвращает имя устройства; распознанной речи здесь нет.
+    # test_microphone_resolved_device_host_failure намеренно требует traceback.
+    # Исключить пустую инициализацию означало бы ослабить правило присваиваний,
+    # а исключить конструктор по имени — скрыть будущую настоящую утечку.
+    # Разрешение безопасного кортежа не решает этот случай: здесь exc_info=True.
+    #
+    # DictationOrchestrator._safe_ui, напротив, не обращается к приватным именам
+    # и подменяет исключение свежим RuntimeError(message) со служебным сообщением,
+    # сохраняя только error.__traceback__. Запрет любого exc_info сломал бы и его;
+    # наличие приватных имён в других методах не делает этот метод чувствительным.
+    # Для точного общего запрета нужен анализ происхождения исключений и вызовов,
+    # которого этот небольшой AST-сторож не выполняет. Не вводим разрешений по
+    # именам функций и не меняем законное журналирование ради прохождения гейта.
+    #
+    # Неявные утечки проверяют тесты этого файла:
+    # - test_microphone_host_exception_is_not_logged: приватная строка из ошибки
+    #   start_test отсутствует в caplog.text;
+    # - test_microphone_start_failure_cancels_even_from_error_state: ошибки старта
+    #   и отмены не оставляют ни приватной строки, ни record.exc_info;
+    # - test_microphone_command_failure_logs_warning_without_exception: ошибки
+    #   record.start/record.stop/recognize не оставляют приватной строки, и
+    #   assert all(record.exc_info is None for record in caplog.records).
+    # Эти поведенческие проверки обязательны вместе с AST-гейтом: его зелёный
+    # результат сам по себе не гарантирует отсутствие утечки через исключение.
     nodes = list(ast.walk(ast.parse(source)))
     aliases: dict[str, str] = {}
     private = set(private_roots)
@@ -3014,6 +3078,13 @@ def test_microphone_text_never_reaches_log_ast(
         'log.error("failure", extra={"text": self.testText})',
         "log.debug(self._test_text)",
         'log.info("%s", update)',
+        "text = update.text\nlog.exception(text)",
+        'log.exception("%r", update.text)',
+        'log.warning("failure", exc_info=RuntimeError(update.text))',
+        'log.warning("failure", exc_info=(RuntimeError, RuntimeError(update.text), tb))',
+        'log.warning("failure", exc_info=(RuntimeError, RuntimeError(repr(update.text)), tb))',
+        'log.warning("failure", exc_info=(RuntimeError, RuntimeError(update.text[:20]), tb))',
+        'log.warning("failure", exc_info=RuntimeError(update.text.encode()))',
     ],
 )
 @pytest.mark.parametrize("logger", ["log", "self._log"])
@@ -3023,6 +3094,34 @@ def test_microphone_privacy_ast_gate_detects_leaks(body: str, logger: str) -> No
         "    " + line for line in body.splitlines()
     )
     assert _microphone_log_violations(source, log_prefixes={f"{logger}."})
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'def receive(update: MicrophoneTestUpdate):\n    log.warning("failure")',
+        'def receive(update: MicrophoneTestUpdate):\n    log.warning("failure", exc_info=False)',
+        'def receive(update: MicrophoneTestUpdate):\n    log.warning("failure", exc_info=None)',
+        "def receive(update: MicrophoneTestUpdate):\n"
+        '    log.warning("failure", exc_info=(RuntimeError, RuntimeError("failure"), tb))',
+        "def receive(update: MicrophoneTestUpdate):\n"
+        '    message = "failure"\n'
+        "    log.warning(message, exc_info=(RuntimeError, RuntimeError(message), tb))",
+        'def report():\n    log.exception("failure")',
+        'def report():\n    log.warning("failure", exc_info=True)',
+        "def helper(self, callback, message: str):\n"
+        "    try:\n"
+        "        callback()\n"
+        "    except Exception as error:\n"
+        "        log.warning(message,\n"
+        "            exc_info=(RuntimeError, RuntimeError(message), error.__traceback__))\n",
+    ],
+)
+@pytest.mark.parametrize("logger", ["log", "self._log"])
+def test_microphone_privacy_ast_gate_allows_safe_logging(source: str, logger: str) -> None:
+    # Вариант _safe_ui назван helper: безопасность не зависит от имени функции.
+    source = source.replace("log.", f"{logger}.")
+    assert _microphone_log_violations(source, log_prefixes={f"{logger}."}) == []
 
 
 @pytest.mark.parametrize("root", ["text", "self._last_text", "self._test_text"])

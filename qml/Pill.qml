@@ -197,7 +197,7 @@ Item {
                         ? Number(root.levels[index]) || 0 : 0
 
                     x: index * (PillTheme.pillBarW + PillTheme.pillBarGap)
-                    y: (bars.height - height) / 2
+                    y: bars.height - height // Макет design/mockups/final/09-pill.html: .pill .lv { align-items: flex-end }.
                     width: PillTheme.pillBarW
                     // §8.3: напрямую по кадрам, без интерполяции или сглаживания истории.
                     height: root.silent || presentation.name === "limit" ? PillTheme.pillBarHFlat

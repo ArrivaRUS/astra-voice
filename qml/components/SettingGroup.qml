@@ -13,6 +13,7 @@ Column {
     spacing: Theme.spaceGroupCaptionGap
 
     Text {
+        textFormat: Text.PlainText
         text: root.title
         color: Theme.fgMuted
         font.family: Theme.fontUi
