@@ -110,7 +110,9 @@ class ModelService:
         self._downloader = Downloader(http, self._store)
         self._cancel = threading.Event()
         self._installer = Installer(
-            self._store, make_smoke_check(cancel=lambda: self._cancel.is_set())
+            self._store,
+            make_smoke_check(cancel=lambda: self._cancel.is_set()),
+            catalog=self._catalog,
         )
 
     def set_cancel(self, cancel: threading.Event) -> None:

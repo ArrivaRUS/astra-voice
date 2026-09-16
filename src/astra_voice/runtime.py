@@ -256,8 +256,8 @@ class DictationRuntime(QObject):
         """Загружает настроенную модель при каждом запуске нового воркера."""
         if self._model_load_generation == self.supervisor.generation:
             return
-        if self._selfcheck == "failed" and self._selfcheck_attempts == 2:
-            # Автоматический hello после повтора не даёт третью попытку.
+        if self._selfcheck == "failed":
+            # После провала новую серию разрешает только жест пользователя.
             return
         self._reset_selfcheck(retry=self._selfcheck == "retrying")
         self._loading_model = False

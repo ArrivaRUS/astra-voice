@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -24,10 +25,10 @@ from astra_voice.core import policy as policy_mod
 from astra_voice.core import settings as settings_mod
 from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
-from astra_voice.models.catalog import CatalogEntry
+from astra_voice.models.catalog import Catalog, CatalogEntry, FileSpec, RevokedEntry
 from astra_voice.models.downloader import DownloadError, Progress
 from astra_voice.models.installer import InstallResult, ReasonCode
-from astra_voice.models.store import StoreError
+from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net.http import NetworkError
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
 from astra_voice.ui.bridges import (
@@ -1653,6 +1654,7 @@ def test_model_service_uses_existing_modules(monkeypatch: pytest.MonkeyPatch) ->
     factories["Downloader"].assert_called_once_with(factories["HttpClient"].return_value, store)
     assert factories["Installer"].call_args.args[0] is store
     assert callable(factories["Installer"].call_args.args[1])
+    assert factories["Installer"].call_args.kwargs == {"catalog": catalog}
     service.allowed()
     gate.allowed.assert_called_once_with("download")
     store.records.return_value = [Mock(state="broken")]
@@ -1660,6 +1662,57 @@ def test_model_service_uses_existing_modules(monkeypatch: pytest.MonkeyPatch) ->
     assert not service.installed_ok()
     store.records.return_value = [Mock(state="ok")]
     assert service.installed_ok()
+
+
+@pytest.mark.parametrize("from_path", [False, True])
+def test_model_service_rejects_revoked_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, from_path: bool
+) -> None:
+    from astra_voice.ui import bridges
+
+    contents = {
+        "v3_e2e_ctc.int8.onnx": b"\x08\x03\x12\x04test",
+        "v3_e2e_ctc_vocab.txt": "а\nб\n".encode(),
+        "config.json": b'{"model_type":"gigaam"}',
+    }
+    entry = CatalogEntry(
+        id="gigaam-v3-e2e-ctc-int8",
+        revision="rev-new",
+        name="Модель для проверки",
+        description="Крошечные файлы настоящей раскладки CTC.",
+        size_bytes=sum(len(data) for data in contents.values()),
+        min_ram_mb=1,
+        layout="onnx-asr-gigaam-v3",
+        variant="gigaam-v3-e2e-ctc",
+        recommended=True,
+        host="huggingface.co",
+        files=tuple(
+            FileSpec(name, hashlib.sha256(data).hexdigest(), len(data), f"/rev-new/{name}")
+            for name, data in contents.items()
+        ),
+    )
+    catalog = Catalog(1, 1, (RevokedEntry(entry.id, entry.revision, "Ошибка модели"),), (entry,))
+    store = ModelStore(tmp_path / "models")
+    source = tmp_path / "source" if from_path else store.staging_dir(entry.id, entry.revision)
+    source.mkdir(parents=True, exist_ok=True)
+    for name, data in contents.items():
+        (source / name).write_bytes(data)
+    monkeypatch.setattr(bridges, "load_builtin", Mock(return_value=catalog))
+    monkeypatch.setattr(bridges, "ModelStore", Mock(return_value=store))
+    service = ModelService(Settings(), policy_mod.Policy())
+
+    result = (
+        service.install_from_path(source, entry)
+        if from_path
+        else service.install_from_staging(entry)
+    )
+
+    assert result.state == "error"
+    assert result.reason_code == "revoked"
+    assert result.record is None
+    assert store.records() == ()
+    assert store.current() is None
+    assert {file.name: file.read_bytes() for file in source.iterdir()} == contents
 
 
 def test_model_install_disk_error_survives_space_becoming_available(model_rig: ModelRig) -> None:
@@ -1768,7 +1821,9 @@ def test_model_shutdown_cancels_active_smoke_check(
     runner = Mock(side_effect=run_smoke)
     monkeypatch.setattr(bridges, "SmokeRunner", Mock(return_value=runner))
 
-    def installer_factory(store: object, smoke: Callable[..., object]) -> Mock:
+    def installer_factory(
+        store: object, smoke: Callable[..., object], catalog: Catalog | None = None
+    ) -> Mock:
         def install(*args: object) -> InstallResult:
             smoke(Path("/fake/model"), port.entry)
             return InstallResult("broken", reason_code="selfcheck")

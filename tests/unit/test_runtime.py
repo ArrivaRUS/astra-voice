@@ -118,6 +118,7 @@ class Rig:
         *,
         model_store: ModelStore | None = None,
         hotkey_factory: Callable[[], HotkeyManager] | None = None,
+        supervisor_factory: Callable[..., WorkerSupervisor] | None = None,
         session_kind: SessionKind = SessionKind.FLY,
     ) -> None:
         self.trace: list[str] = []
@@ -191,7 +192,7 @@ class Rig:
             settings=settings if settings is not None else Settings(),
             session_kind=session_kind,
             model_store=model_store,
-            supervisor_factory=self.supervisor_factory,
+            supervisor_factory=supervisor_factory or self.supervisor_factory,
             pill_factory=self.pill_factory,
             tray_factory=self.tray_factory,
             hotkey_factory=hotkey_factory
@@ -2816,13 +2817,91 @@ def test_selfcheck_ignores_foreign_results_and_unrelated_errors(
     assert rig.supervisor.send.call_args.args[0]["type"] == "record.start"
 
 
-@pytest.mark.parametrize("result", ["проверка", ""])
-def test_selfcheck_runs_after_each_worker_load(
-    checking_rig: Rig, caplog: pytest.LogCaptureFixture, result: str
+def test_failed_selfcheck_survives_worker_crash_until_tray_recheck(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=module.__name__)
+    # Реальные IPC, корреляция и перезапуск; подменён только запуск процесса.
+    monkeypatch.setattr(
+        WorkerSupervisor, "_launch", lambda supervisor: setattr(supervisor, "state", "running")
+    )
+
+    def factory(**kwargs: Any) -> WorkerSupervisor:
+        return WorkerSupervisor(on_event=kwargs["on_event"], use_qt=False)
+
+    rig = Rig(
+        monkeypatch,
+        from_dict({"model_dir": "/tmp/model"}),
+        supervisor_factory=factory,
+    )
+
+    def event(message: dict[str, Any]) -> None:
+        supervisor = rig.runtime.supervisor
+        supervisor._receive(ipc.encode(message), supervisor.generation)
+
+    loaded = {
+        "type": "model.loaded",
+        "id": "gigaam",
+        "revision": "r3",
+        "variant": "v3",
+        "load_ms": 123,
+        "engine_version": "1.24.4",
+    }
+    rig.runtime.start()
+    event(ipc.make_hello())
+    event(loaded)
+    event({"type": "result", "utterance_id": "file", "text": "", "t_ms": 1})
+    assert_selfcheck_log(caplog, "no-match", 1)
+    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    rig.tray.set_state.assert_called_with(TrayState.ERROR)
+    rig.tray.set_model_recheck_enabled.assert_called_with(True)
+    tray_calls = list(rig.tray.mock_calls)
+    pill_calls = list(rig.pill.mock_calls)
+    stats_calls = list(rig.stats.mock_calls)
+    supervisor = rig.runtime.supervisor
+    send = Mock(wraps=supervisor.send)
+    monkeypatch.setattr(supervisor, "send", send)
+    generation = supervisor.generation
+
+    supervisor._restart()
+    assert supervisor.generation == generation + 1
+    assert supervisor.state == "running"
+    event(ipc.make_hello())
+    for timer in rig.timers:
+        if timer.single_shot:
+            timer.fire()
+    send.assert_not_called()
+    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    assert rig.tray.mock_calls == tray_calls
+    assert rig.pill.mock_calls == pill_calls
+    assert rig.stats.mock_calls == stats_calls
+
+    # Только жест меню снимает запрет и разрешает новую первую попытку.
+    rig.tray.on_model_recheck()
+    replacement = rig.runtime.supervisor
+    assert replacement is not supervisor
+    send = Mock(wraps=replacement.send)
+    monkeypatch.setattr(replacement, "send", send)
+    event(ipc.make_hello())
+    event(loaded)
+    assert [entry.args[0]["type"] for entry in send.call_args_list] == [
+        "model.load",
+        "transcribe.file",
+    ]
+    event({"type": "result", "utterance_id": "file", "text": "проверка", "t_ms": 1})
+    assert_selfcheck_log(caplog, "ok", 1)
+    rig.tray.set_state.assert_called_with(TrayState.IDLE)
+    rig.tray.set_model_recheck_enabled.assert_called_with(False)
+    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    rig.runtime.shutdown()
+
+
+def test_successful_selfcheck_runs_after_each_worker_load(
+    checking_rig: Rig, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO, logger=module.__name__)
     rig = checking_rig
-    rig.event(type="result", utterance_id="file", text=result)
+    rig.event(type="result", utterance_id="file", text="проверка")
     rig.pill.hide.reset_mock()
     rig.supervisor.generation += 1
     rig.event(type="hello")
