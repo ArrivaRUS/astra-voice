@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import shutil
 import stat
@@ -85,7 +86,9 @@ def test_commit_moves_once_and_writes_state(
     assert sum(call.args == (staging, directory) for call in replace.call_args_list) == 1
     assert not staging.exists()
     assert (directory / "weights.onnx").read_bytes() == b"weights"
-    assert json.loads((directory / "state.json").read_text()) == {
+    assert not (directory / "state.json").exists()
+    state_path = directory.with_name("rev.json")
+    assert json.loads(state_path.read_text()) == {
         "state": "ok",
         "reason": "",
         "layout": "",
@@ -93,7 +96,7 @@ def test_commit_moves_once_and_writes_state(
         "size_bytes": 7,
     }
     assert stat.S_IMODE(directory.stat().st_mode) == 0o700
-    assert stat.S_IMODE((directory / "state.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
 
 
 def test_commit_preserves_staged_metadata(store: ModelStore) -> None:
@@ -110,6 +113,8 @@ def test_commit_preserves_staged_metadata(store: ModelStore) -> None:
         )
     )
     directory = store.commit("model", "rev")
+    assert not (directory / "state.json").exists()
+    assert stat.S_IMODE(directory.with_name("rev.json").stat().st_mode) == 0o600
     assert store.records() == (
         ModelRecord("model", "rev", directory, "onnx-asr-gigaam-v3", "gigaam-v3-e2e-rnnt", 123),
     )
@@ -150,8 +155,8 @@ def test_commit_replaces_existing_revision(
     assert first.args[0] == installed
     assert first.args[1].name.startswith("rev.old-")
     assert second.args == (staging, installed)
-    assert set(installed.iterdir()) == {installed / "new.onnx", installed / "state.json"}
-    assert list(installed.parent.iterdir()) == [installed]
+    assert set(installed.iterdir()) == {installed / "new.onnx"}
+    assert set(installed.parent.iterdir()) == {installed, installed.with_name("rev.json")}
     assert store.current() == store.records()[0]
 
 
@@ -159,6 +164,9 @@ def test_failed_rename_restores_old_revision(
     store: ModelStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     installed = install(store)
+    store.set_current("model", "rev")
+    previous = store.current()
+    state_before = installed.with_name("rev.json").read_bytes()
     staging = store.staging_dir("model", "rev")
     (staging / "new").write_bytes(b"new")
     original_replace = os.replace
@@ -175,6 +183,8 @@ def test_failed_rename_restores_old_revision(
     assert (installed / "weights.onnx").read_bytes() == b"weights"
     assert (staging / "new").read_bytes() == b"new"
     assert not list(installed.parent.glob("*.old-*"))
+    assert installed.with_name("rev.json").read_bytes() == state_before
+    assert store.current() == previous
 
 
 def test_current_roundtrip_and_permissions(store: ModelStore) -> None:
@@ -210,9 +220,10 @@ def test_atomic_json_flushes_file_before_replace_and_directory_after(
     monkeypatch.setattr(os, "replace", replaced)
     store.set_current("model", "rev")
     store.mark_broken("model", "rev", "Не загружается")
-    assert events == ["файл", "current.json", "каталог", "файл", "state.json", "каталог"]
+    assert events == ["файл", "current.json", "каталог", "файл", "rev.json", "каталог"]
     assert not list(store.root.rglob("*.tmp"))
-    assert stat.S_IMODE((directory / "state.json").stat().st_mode) == 0o600
+    assert not (directory / "state.json").exists()
+    assert stat.S_IMODE(directory.with_name("rev.json").stat().st_mode) == 0o600
 
 
 def test_failed_json_write_keeps_current_and_removes_temp(
@@ -292,6 +303,97 @@ def test_empty_records_and_ignored_staging(store: ModelStore) -> None:
     assert store.records() == ()
 
 
+@pytest.mark.parametrize("operation", ["records", "current"])
+@pytest.mark.parametrize("neighbor_exists", [False, True])
+def test_legacy_state_is_migrated_once(
+    store: ModelStore,
+    caplog: pytest.LogCaptureFixture,
+    operation: str,
+    neighbor_exists: bool,
+) -> None:
+    directory = install(store)
+    store.set_current("model", "rev")
+    expected = store.current()
+    state_path = directory.with_name("rev.json")
+    contents = state_path.read_bytes()
+    legacy = directory / "state.json"
+    legacy.write_bytes(b"outdated" if neighbor_exists else contents)
+    if not neighbor_exists:
+        state_path.unlink()
+    with caplog.at_level(logging.INFO, logger=st.__name__):
+        result = store.records() if operation == "records" else store.current()
+        assert result == ((expected,) if operation == "records" else expected)
+        assert store.records() == (expected,)
+        assert store.current() == expected
+    assert not legacy.exists()
+    assert state_path.read_bytes() == contents
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.INFO
+    assert "перенесено" in caplog.records[0].message
+
+
+@pytest.mark.parametrize("operation", ["records", "current"])
+@pytest.mark.parametrize("neighbor_exists", [False, True])
+def test_failed_legacy_state_migration_is_broken(
+    store: ModelStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    operation: str,
+    neighbor_exists: bool,
+) -> None:
+    directory = install(store)
+    store.set_current("model", "rev")
+    state_path = directory.with_name("rev.json")
+    legacy = directory / "state.json"
+    legacy.write_bytes(state_path.read_bytes())
+    if not neighbor_exists:
+        state_path.unlink()
+    failure = Mock(side_effect=PermissionError("Нет доступа"))
+    if neighbor_exists:
+        monkeypatch.setattr(Path, "unlink", failure)
+    else:
+        monkeypatch.setattr(os, "replace", failure)
+    if operation == "records":
+        (record,) = store.records()
+        assert record.state == "broken"
+        assert record.reason == "Файл состояния модели (state.json) повреждён или недоступен."
+    else:
+        assert store.current() is None
+    assert legacy.is_file()
+    failure.assert_called_once()
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    assert "Не удалось перенести" in caplog.records[0].message
+
+
+def test_legacy_state_symlink_is_not_migrated(store: ModelStore) -> None:
+    directory = install(store)
+    store.set_current("model", "rev")
+    state_path = directory.with_name("rev.json")
+    target = directory.parent / "legacy.json"
+    state_path.rename(target)
+    contents = target.read_bytes()
+    legacy = directory / "state.json"
+    legacy.symlink_to(target)
+    (record,) = store.records()
+    assert record.state == "broken"
+    assert store.current() is None
+    assert legacy.is_symlink()
+    assert not state_path.exists()
+    assert target.read_bytes() == contents
+
+
+@pytest.mark.parametrize("revision", ["rev", "r" * 64])
+def test_records_ignore_neighbor_state_files(store: ModelStore, revision: str) -> None:
+    directory = install(store, revision=revision)
+    (directory.parent / "orphan.json").write_text("{}")
+    (directory.parent / "linked.json").symlink_to(store.root.parent)
+    assert store.records() == (ModelRecord("model", revision, directory, "", "", 7),)
+    assert store.recover_incomplete() == ()
+    assert directory.with_name(f"{revision}.json").is_file()
+
+
 @pytest.mark.parametrize("name", ("bad revision", ".hidden", "ревизия", "r" * 65, "bad\n"))
 def test_records_ignore_invalid_revision_directory(store: ModelStore, name: str) -> None:
     installed = install(store)
@@ -329,7 +431,7 @@ def test_missing_or_broken_state_is_listed_as_broken(
 ) -> None:
     directory = install(store)
     store.set_current("model", "rev")
-    state = directory / "state.json"
+    state = directory.with_name("rev.json")
     if contents is None:
         state.unlink()
     else:
@@ -508,6 +610,7 @@ def test_remove_current(store: ModelStore, broken: bool) -> None:
         store.mark_broken("model", "rev", "Ошибка")
     store.remove("model", "rev")
     assert not directory.exists()
+    assert not directory.with_name("rev.json").exists()
     assert not (store.root / "current.json").exists()
     assert store.current() is None
     assert store.records() == ()
@@ -520,7 +623,27 @@ def test_remove_other_revision_preserves_current(store: ModelStore) -> None:
     current = store.current()
     store.remove("model", "other")
     assert not other.exists()
+    assert not other.with_name("other.json").exists()
     assert store.current() == current
+
+
+def test_remove_flushes_after_neighbor_state_is_deleted(
+    store: ModelStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = install(store)
+    state_path = directory.with_name("rev.json")
+    original_fsync = st._fsync_dir
+    synced: list[Path] = []
+
+    def fsync_after_removal(parent: Path) -> None:
+        assert not directory.exists()
+        assert not state_path.exists()
+        original_fsync(parent)
+        synced.append(parent)
+
+    monkeypatch.setattr(st, "_fsync_dir", fsync_after_removal)
+    store.remove("model", "rev")
+    assert synced == [directory.parent]
 
 
 def test_filesystem_errors_have_public_codes(store: ModelStore) -> None:

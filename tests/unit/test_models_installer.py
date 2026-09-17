@@ -293,7 +293,7 @@ def test_smoke_failure_marks_broken_and_preserves_current(
     assert "internal.onnx" not in result.reason
     assert installed.is_dir()
     assert not staging.exists()
-    state = json.loads((installed / "state.json").read_text())
+    state = json.loads(installed.with_name(f"{entry.revision}.json").read_text())
     assert state["state"] == "broken"
     assert state["reason"] == result.reason
     assert result.record in store.records()
@@ -337,7 +337,7 @@ def test_temporary_parts_are_removed_before_layout_check(
     assert result.state == "ok"
     assert result.reason_code == ""
     assert result.record is not None
-    assert {file.name for file in result.record.dir.iterdir()} == {*contents, "state.json"}
+    assert {file.name for file in result.record.dir.iterdir()} == set(contents)
 
 
 @pytest.mark.parametrize("missing_staging", [False, True])
@@ -684,7 +684,7 @@ def test_recovery_then_fresh_install_has_no_garbage(
     assert result.state == "ok"
     assert result.reason_code == ""
     assert result.record is not None
-    assert {file.name for file in result.record.dir.iterdir()} == {*contents, "state.json"}
+    assert {file.name for file in result.record.dir.iterdir()} == set(contents)
     assert not staging.exists()
 
 

@@ -143,6 +143,9 @@ class ModelStore:
             raise StoreError("bad-id", "Каталог модели не должен быть символической ссылкой.")
         return result
 
+    def _state_path(self, model_id: str, revision: str) -> Path:
+        return self._revision_path(model_id, revision, ".json")
+
     def _private_dir(self, directory: Path) -> None:
         """Создаёт также отсутствующих родителей с правами 0700."""
         if not directory.exists() and not directory.is_symlink():
@@ -185,6 +188,7 @@ class ModelStore:
         """Атомарно переносит staging и записывает состояние установленной ревизии."""
         staging = self._revision_path(model_id, revision, ".partial")
         directory = self._revision_path(model_id, revision)
+        state_path = self._state_path(model_id, revision)
         with _store_errors():
             if not staging.is_dir():
                 raise StoreError("not-found")
@@ -194,6 +198,8 @@ class ModelStore:
             self._private_dir(staging.parent)
             self._private_dir(staging)
             layout, variant, size = self._staged_metadata(staging)
+            self._checked(staging / "state.json").unlink(missing_ok=True)
+            _fsync_dir(staging)
             backup = self._checked(directory.with_name(f"{revision}.old-{uuid4().hex}"))
             had_previous = directory.exists()
             if had_previous:
@@ -206,7 +212,7 @@ class ModelStore:
                 raise
             _fsync_dir(directory.parent)
             record = ModelRecord(model_id, revision, directory, layout, variant, size)
-            _write_json(self._checked(directory / "state.json"), _state_data(record))
+            _write_json(state_path, _state_data(record))
             if had_previous:
                 shutil.rmtree(backup)
                 _fsync_dir(directory.parent)
@@ -246,7 +252,22 @@ class ModelStore:
 
     def _record(self, model_id: str, revision: str, directory: Path) -> ModelRecord:
         try:
-            data = _read_json(self._checked(directory / "state.json"))
+            state_path = self._state_path(model_id, revision)
+            legacy = directory / "state.json"
+            try:
+                if not legacy.is_symlink() and legacy.is_file():
+                    if state_path.exists():
+                        legacy.unlink()
+                    else:
+                        legacy.chmod(0o600)
+                        os.replace(legacy, state_path)
+                    _fsync_dir(directory)
+                    _fsync_dir(state_path.parent)
+                    log.info("Состояние ревизии перенесено из %s в %s.", legacy, state_path)
+            except OSError as exc:
+                log.warning("Не удалось перенести состояние ревизии из %s: %s", legacy, exc)
+                raise
+            data = _read_json(state_path)
             layout, variant, size = _metadata(data)
             state, reason = data.get("state"), data.get("reason")
             if state not in ("ok", "broken") or not isinstance(reason, str):
@@ -325,7 +346,7 @@ class ModelStore:
             record = replace(
                 self._record(model_id, revision, directory), state="broken", reason=reason
             )
-            _write_json(self._checked(directory / "state.json"), _state_data(record))
+            _write_json(self._state_path(model_id, revision), _state_data(record))
 
     def disk_ok(self, size_bytes: int) -> bool:
         """Проверяет свободное место с запасом 20 %, без округления float."""
@@ -377,8 +398,10 @@ class ModelStore:
         """Удаляет установленную ревизию и указатель, если он ссылается на неё."""
         with _store_errors():
             directory = self._installed(model_id, revision)
+            state_path = self._state_path(model_id, revision)
             was_current = self._current_ids() == (model_id, revision)
             shutil.rmtree(directory)
+            state_path.unlink(missing_ok=True)
             _fsync_dir(directory.parent)
             if was_current:
                 self._checked(self.root / "current.json").unlink(missing_ok=True)
