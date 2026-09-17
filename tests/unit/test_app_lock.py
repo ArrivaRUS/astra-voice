@@ -45,9 +45,16 @@ def _env(tmp_path: Path) -> dict[str, str]:
     env = dict(os.environ)
     env.pop("DISPLAY", None)
     env.pop("WAYLAND_DISPLAY", None)
+    # Qt Multimedia иначе запускает отдельный PulseAudio в тестовом runtime:
+    # он переживает GUI-процесс и забирает звуковую карту у рабочего PipeWire.
+    # Этим тестам нужен только IPC, поэтому аудиосервер полностью изолирован.
+    pulse_config = tmp_path / "pulse-client.conf"
+    pulse_config.write_text("autospawn = no\n", encoding="utf-8")
     env.update(
         {
             "QT_QPA_PLATFORM": "offscreen",
+            "PULSE_CLIENTCONFIG": str(pulse_config),
+            "PULSE_SERVER": f"unix:{tmp_path / 'no-pulse-server'}",
             "XDG_RUNTIME_DIR": str(tmp_path / "run"),
             "XDG_CONFIG_HOME": str(tmp_path / "config"),
             "XDG_DATA_HOME": str(tmp_path / "data"),
