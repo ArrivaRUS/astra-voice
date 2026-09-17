@@ -220,6 +220,51 @@ Rectangle {
 
         Column {
             width: parent.width
+            visible: !root.busy
+            spacing: 3 // spec §5.2 — зазор строк блока «Занимает места»
+
+            FontMetrics {
+                id: sizeFontMetrics
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontModelFooterSize
+            }
+
+            FooterText {
+                text: qsTr("Занимает места:")
+                font.weight: Font.Normal
+            }
+            Row {
+                x: 12 // spec §5.2 — отступ строк значений
+                visible: root.modelSize !== ""
+                spacing: sizeFontMetrics.advanceWidth(" ")
+                FooterText {
+                    text: qsTr("на диске:")
+                    font.weight: Font.Normal
+                }
+                FooterText {
+                    text: root.modelSize
+                    color: Theme.fg
+                    font.weight: Font.Normal
+                }
+            }
+            Row {
+                x: 12 // spec §5.2 — отступ строк значений
+                visible: root.modelRam !== ""
+                spacing: sizeFontMetrics.advanceWidth(" ")
+                FooterText {
+                    text: qsTr("в памяти при работе:")
+                    font.weight: Font.Normal
+                }
+                FooterText {
+                    text: root.modelRam
+                    color: Theme.fg
+                    font.weight: Font.Normal
+                }
+            }
+        }
+
+        Column {
+            width: parent.width
             visible: root.busy
             spacing: 7 // spec §5.5: отступ под прогрессом.
             Rectangle {
@@ -321,18 +366,6 @@ Rectangle {
                     }
                 }
             }
-            Item {
-                width: Math.max(0, tagsRow.width - tags.width - diskSize.width - 2 * root.footerGap)
-                height: diskSize.height
-            }
-            RowLayout {
-                id: diskSize
-                spacing: root.footerGap
-                FooterText {
-                    text: qsTr("%1 на диске").arg(root.modelSize)
-                }
-                Dot {}
-            }
         }
 
         RowLayout {
@@ -364,25 +397,6 @@ Rectangle {
             width: parent.width
             visible: !root.busy
             spacing: root.footerGap
-            // design/refs/08-onboarding-2-model.png: при ширине карточки 620 ряд .mbot
-            // переносится, и требование к памяти встаёт в строку с кнопками.
-            Flow {
-                visible: (root.available || root.warning) && root.modelRam !== ""
-                width: Math.min(ramValue.implicitWidth + spacing + ramNote.implicitWidth, actions.width)
-                spacing: 3 // Зазор между числом и пояснением при кегле 12.
-                FooterText {
-                    id: ramValue
-                    text: qsTr("%1 ОЗУ").arg(root.modelRam)
-                    color: Theme.fg
-                    font.weight: Font.Bold
-                    wrapMode: Text.NoWrap
-                }
-                FooterText {
-                    id: ramNote
-                    width: Math.min(implicitWidth, parent.width)
-                    text: qsTr("· замерено на этом компьютере")
-                }
-            }
             SmallButton {
                 visible: root.available || root.warning || root.offline
                 variant: root.warning ? "secondary" : "primary"

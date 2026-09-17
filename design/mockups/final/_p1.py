@@ -325,8 +325,6 @@ def mcard(mid, state=None, badges=None, note=None, acts=None, extra="", cls_extr
            + (f'<div class="mbadges">{bh}</div>' if bh else "")
            + f'</div>{mets}</div>')
     punct = "с пунктуацией" if mo["punct"] else "без пунктуации"
-    ram = (f'<b style="color:var(--fg1)">{mo["ram"]} ОЗУ</b> · {mo["ramkind"]}' if mo["measured"]
-           else f'{mo["ram"]} ОЗУ · {mo["ramkind"]}')
     tags = (f'{mo["lang"]} <span class="dot"></span> {punct} <span class="dot"></span> '
             f'{mo["lic"]} <span class="dot"></span> {mo["origin"]}')
 
@@ -380,9 +378,10 @@ def mcard(mid, state=None, badges=None, note=None, acts=None, extra="", cls_extr
             "notrec": btn("Скачать", "sm") + " " + btn("Из файла…", "sm"),
         }[st]
         a = acts if acts is not None else default_acts
-        body = ('<div class="mhr"></div><div class="mbot">'
-                f'{tags}<span class="sp"></span>{n}<span>{mo["disk"]} на диске</span>'
-                f'<span class="dot"></span><span>{ram}</span> {a}</div>')
+        body = ('<div class="mhr"></div>'
+                f'<div style="font-size:12px;line-height:18px;color:var(--fg3)">Занимает места:<div style="margin-top:3px;padding-left:12px">на диске: <span style="color:var(--fg1)">{mo["disk"]}</span></div><div style="margin-top:3px;padding-left:12px">в памяти при работе: <span style="color:var(--fg1)">{mo["ram"]}</span></div></div>'
+                '<div class="mbot" style="margin-top:9px">'
+                f'{tags}<span class="sp"></span>{n} {a}</div>')
     return f'<div class="{cls}">{top}{body}{extra}</div>'
 
 
@@ -454,7 +453,7 @@ def models_catalog(theme):
            "LibriSpeech, бенчмарк onnx-asr; скорость — столбец «x64 RTFx (int8)». Где int8-замера нет "
            "(T-one, обе GigaAM Multilingual) — полоска помечена «бенчмарк fp32». У Whisper small цифр "
            "по протоколу нет вовсе: полоски пунктиром и «нет данных», выдумывать нельзя (§7.1). "
-           "<b>ОЗУ:</b> «415 МБ · замерено на этом компьютере» жирным против «~416 МБ · оценка» серым. "
+           "<b>Место:</b> «на диске» и «в памяти при работе» — один блок одним стилем; слово «замерено» в карточке не появляется, пока замер не сделан на этом компьютере (веха M6). "
            "<b>Фильтр «только отечественные»</b> смотрит на юрлицо правообладателя: остаются 5 GigaAM "
            "и T-one, обе Vosk уходят (Alpha Cephei Inc., США).")
     return page(f"A · Модели: каталог — {th(theme)}",
