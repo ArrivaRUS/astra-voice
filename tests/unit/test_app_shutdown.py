@@ -22,7 +22,7 @@ from astra_voice.core.settings import Settings
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind
 from astra_voice.runtime import DictationRuntime
-from astra_voice.ui import notify
+from astra_voice.ui import model_downloads, notify
 
 pytestmark = pytest.mark.unit
 
@@ -280,7 +280,7 @@ def test_model_service_receives_effective_settings_and_onboarding_receives_store
     expected = policy_mod.effective(rig.settings, policy)
     model_factory = Mock(return_value=None)
     onboarding_factory = Mock(wraps=bridges.OnboardingController)
-    monkeypatch.setattr(bridges, "ModelService", model_factory)
+    monkeypatch.setattr(model_downloads, "ModelService", model_factory)
     monkeypatch.setattr(bridges, "OnboardingController", onboarding_factory)
 
     assert app_mod.main([]) == 7
@@ -539,11 +539,11 @@ def test_onboarding_host_delegates_and_hides_root(
 
 
 def test_finishing_onboarding_updates_context(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
-    from astra_voice.ui import bridges, notify
+    from astra_voice.ui import notify
 
     monkeypatch.setattr(notify, "notify_onboarding_ready", Mock())
     model = Mock(
-        spec_set=bridges.ModelPort,
+        spec_set=model_downloads.ModelPort,
         recommended=Mock(return_value=None),
         installed_ok=Mock(return_value=True),
         broken=Mock(return_value=False),
@@ -554,7 +554,7 @@ def test_finishing_onboarding_updates_context(rig: Rig, monkeypatch: pytest.Monk
         install_from_staging=Mock(side_effect=AssertionError("Неожиданная установка модели")),
         install_from_path=Mock(side_effect=AssertionError("Неожиданная установка модели")),
     )
-    monkeypatch.setattr(bridges, "ModelService", Mock(return_value=model))
+    monkeypatch.setattr(model_downloads, "ModelService", Mock(return_value=model))
 
     def exec_loop() -> int:
         properties = dict(

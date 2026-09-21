@@ -1379,7 +1379,8 @@ def test_download_status_menu_item(harness: Harness) -> None:
 def test_download_name_from_catalog_is_safe_in_menu_and_qml(harness: Harness) -> None:
     from astra_voice.core.settings import Settings
     from astra_voice.models.catalog import CatalogEntry
-    from astra_voice.ui.bridges import ModelDownloads, SettingsBridge
+    from astra_voice.ui.bridges import SettingsBridge
+    from astra_voice.ui.model_downloads import ModelDownloads
 
     name = "A&B\r\n\u202e\u2066\u200e\x00\x85" + "я" * 500
     entry = CatalogEntry(

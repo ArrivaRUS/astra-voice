@@ -775,12 +775,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         from PyQt5.QtQml import QQmlEngine
 
-        from astra_voice.ui.bridges import (
-            ModelDownloads,
-            ModelService,
-            OnboardingController,
-            SettingsBridge,
-        )
+        from astra_voice.ui.bridges import OnboardingController, SettingsBridge
+        from astra_voice.ui.model_downloads import ModelDownloads, ModelService
 
         model = None
         try:

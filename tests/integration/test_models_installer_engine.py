@@ -45,7 +45,7 @@ def model_dir() -> Path:
 
 
 def test_install_from_staging_with_real_worker(tmp_path: Path, model_dir: Path) -> None:
-    from astra_voice.ui.bridges import make_smoke_check
+    from astra_voice.ui.model_downloads import make_smoke_check
 
     wav_path = REPO_ROOT / "data/smoke/smoke-ru.wav"
     if not wav_path.is_file():

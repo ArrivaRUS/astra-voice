@@ -51,14 +51,17 @@ from astra_voice.net.http import NetworkError
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
 from astra_voice.platform.paste import PasteMode
 from astra_voice.platform.session import SessionKind
+from astra_voice.ui import model_downloads
 from astra_voice.ui.bridges import (
-    ModelDownloads,
-    ModelPort,
-    ModelService,
     OnboardingController,
     OnboardingHost,
     SettingsApply,
     SettingsBridge,
+)
+from astra_voice.ui.model_downloads import (
+    ModelDownloads,
+    ModelPort,
+    ModelService,
     _ModelJob,
     make_smoke_check,
 )
@@ -1748,7 +1751,7 @@ def test_model_absent_and_settings_fallback(model_rig: ModelRig) -> None:
     assert controller.modelRam == ""
     controller.download()
     controller.installFromPath("/fake/model")
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
     assert not create(port, onboarding_model_ready=True).canFinish
 
 
@@ -1787,7 +1790,7 @@ def test_model_download_refreshes_persistent_block_message(
     assert controller.modelState == state
     assert controller.modelMessage != before
     assert len(changed) == 1
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
     assert port.download_calls == 0
 
 
@@ -1800,7 +1803,7 @@ def test_model_download_rechecks_other_resource_blocks(model_rig: ModelRig, init
     controller.download()
     assert controller.modelState == "no-network"
     assert controller.modelMessage == port.allowed()[1]
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
     assert port.download_calls == 0
 
 
@@ -1880,8 +1883,8 @@ def test_model_download_signals_progress_and_thread_completion(
     assert controller.progress == 1
     assert controller.speed == controller.eta == ""
     assert controller.canFinish
-    assert controller._model_thread is None
-    assert controller._model_job is None
+    assert controller._downloads._model_thread is None
+    assert controller._downloads._model_job is None
     assert port.download_calls == 1
     assert port.download_thread != threading.get_ident()
 
@@ -1896,7 +1899,7 @@ def test_model_cancel_stops_thread_and_allows_retry(model_rig: ModelRig) -> None
     controller.download()
     assert done.wait(1000)
     assert controller.modelState == "cancelled"
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
     assert not controller.canFinish
     controller.progressChanged.disconnect(controller.cancelDownload)
     port.block = False
@@ -1931,7 +1934,7 @@ def test_model_download_errors_are_readable(
     assert controller.modelMessage
     assert "SECRET" not in controller.modelMessage
     assert "/path" not in controller.modelMessage
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
 
 
 def test_model_bad_download_path_shows_install_failure(model_rig: ModelRig) -> None:
@@ -1946,7 +1949,7 @@ def test_model_bad_download_path_shows_install_failure(model_rig: ModelRig) -> N
         "Модель не прошла проверку. Попробуйте скачать или установить её заново."
     )
     assert not controller.canFinish
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
 
 
 @pytest.mark.parametrize("state", ["broken", "error"])
@@ -2047,8 +2050,8 @@ def test_model_install_revoked_or_cancelled(
     assert controller.modelState == expected_state
     assert controller.modelMessage == expected_message
     assert not controller.canFinish
-    assert not controller._model_cancel.is_set()
-    assert controller._model_thread is None
+    assert not controller._downloads._model_cancel.is_set()
+    assert controller._downloads._model_thread is None
 
 
 def test_model_job_unexpected_exception_logs_traceback(caplog: pytest.LogCaptureFixture) -> None:
@@ -2122,7 +2125,7 @@ def test_pick_install_path_cancel_does_nothing(
     dialog.assert_called_once_with()
     install.assert_not_called()
     assert not changed
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
     assert port.sources == []
     assert port.download_calls == 0
 
@@ -2136,7 +2139,7 @@ def test_model_shutdown_during_download_needs_no_gui_polling(model_rig: ModelRig
     controller.download()
     assert done.wait(1000)
     assert controller.modelState == "cancelled"
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
     controller.shutdown()
     controller.download()
     assert port.download_calls == 1
@@ -2145,7 +2148,6 @@ def test_model_shutdown_during_download_needs_no_gui_polling(model_rig: ModelRig
 def test_model_shutdown_times_out_and_logs_warning(
     model_rig: ModelRig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from astra_voice.ui import bridges
 
     port, create = model_rig
     controller = create()
@@ -2158,10 +2160,10 @@ def test_model_shutdown_times_out_and_logs_warning(
 
     monkeypatch.setattr(port, "install_from_staging", install)
     controller.download()
-    thread = controller._model_thread
+    thread = controller._downloads._model_thread
     assert thread is not None
-    assert controller._model_job is not None
-    job_ref = weakref.ref(controller._model_job)
+    assert controller._downloads._model_job is not None
+    job_ref = weakref.ref(controller._downloads._model_job)
     try:
         assert started.wait(1)
         before = time.monotonic()
@@ -2169,14 +2171,14 @@ def test_model_shutdown_times_out_and_logs_warning(
             controller.shutdown()
         elapsed = time.monotonic() - before
         assert 4.9 <= elapsed < 5.5
-        assert controller._model_cancel.is_set()
+        assert controller._downloads._model_cancel.is_set()
         assert thread.isRunning()
         assert thread.parent() is None
         assert "не завершилась за 5 секунд" in caplog.text
         assert "выход из приложения продолжается" in caplog.text
-        assert (thread, job_ref()) in bridges._finishing_model_threads
-        assert controller._model_job is None
-        assert controller._model_thread is None
+        assert (thread, job_ref()) in model_downloads._finishing_model_threads
+        assert controller._downloads._model_job is None
+        assert controller._downloads._model_thread is None
         controller.shutdown()
         sip.delete(controller)
         gc.collect()
@@ -2190,10 +2192,10 @@ def test_model_shutdown_times_out_and_logs_warning(
     finally:
         release.set()
         assert thread.wait(1000)
-        controller._model_thread = None
+        controller._downloads._model_thread = None
         QCoreApplication.sendPostedEvents(None, QEvent.MetaCall)
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-    assert (thread, job) not in bridges._finishing_model_threads
+    assert (thread, job) not in model_downloads._finishing_model_threads
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
@@ -2245,7 +2247,7 @@ def test_smoke_adapter_builds_model_load_without_leaking_text(ok: bool) -> None:
 
 
 def test_model_service_uses_existing_modules(monkeypatch: pytest.MonkeyPatch) -> None:
-    import astra_voice.ui.bridges as bridges
+    import astra_voice.ui.model_downloads as bridges
 
     settings, policy = Settings(), policy_mod.Policy(values={"ca_bundle": "/fake/ca"})
     entry = FakeModelPort().entry
@@ -2298,7 +2300,6 @@ def test_model_service_uses_existing_modules(monkeypatch: pytest.MonkeyPatch) ->
 def test_model_service_rejects_revoked_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, from_path: bool
 ) -> None:
-    from astra_voice.ui import bridges
 
     contents = {
         "v3_e2e_ctc.int8.onnx": b"\x08\x03\x12\x04test",
@@ -2327,8 +2328,8 @@ def test_model_service_rejects_revoked_revision(
     source.mkdir(parents=True, exist_ok=True)
     for name, data in contents.items():
         (source / name).write_bytes(data)
-    monkeypatch.setattr(bridges, "load_builtin", Mock(return_value=catalog))
-    monkeypatch.setattr(bridges, "ModelStore", Mock(return_value=store))
+    monkeypatch.setattr(model_downloads, "load_builtin", Mock(return_value=catalog))
+    monkeypatch.setattr(model_downloads, "ModelStore", Mock(return_value=store))
     service = ModelService(Settings(), policy_mod.Policy())
 
     result = (
@@ -2350,7 +2351,6 @@ def test_model_service_cancel_during_checksum_preserves_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, from_path: bool
 ) -> None:
     from astra_voice.security import verify
-    from astra_voice.ui import bridges
 
     contents = {
         "v3_e2e_ctc.int8.onnx": b"\x08" * ((1 << 20) + 1),
@@ -2367,7 +2367,9 @@ def test_model_service_cancel_during_checksum_preserves_source(
             for name, data in contents.items()
         ),
     )
-    monkeypatch.setattr(bridges, "load_builtin", lambda verifier: Catalog(1, 1, (), (entry,)))
+    monkeypatch.setattr(
+        model_downloads, "load_builtin", lambda verifier: Catalog(1, 1, (), (entry,))
+    )
     monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
     service = ModelService(Settings(), policy_mod.Policy())
     store = service._store
@@ -2494,7 +2496,6 @@ def test_smoke_adapter_exception_does_not_leak_details(
 def test_model_shutdown_cancels_active_smoke_check(
     model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch, local: bool
 ) -> None:
-    from astra_voice.ui import bridges
 
     port, create = model_rig
     started, stopped = threading.Event(), threading.Event()
@@ -2504,12 +2505,12 @@ def test_model_shutdown_cancels_active_smoke_check(
     gate.allowed.return_value = (True, "")
     catalog = Mock(entries=[port.entry])
     catalog.is_revoked.return_value = False
-    monkeypatch.setattr(bridges, "load_builtin", Mock(return_value=catalog))
-    monkeypatch.setattr(bridges, "Verifier", Mock())
-    monkeypatch.setattr(bridges, "ModelStore", Mock(return_value=store))
-    monkeypatch.setattr(bridges, "NetworkGate", Mock(return_value=gate))
-    monkeypatch.setattr(bridges, "HttpClient", Mock())
-    monkeypatch.setattr(bridges, "Downloader", Mock())
+    monkeypatch.setattr(model_downloads, "load_builtin", Mock(return_value=catalog))
+    monkeypatch.setattr(model_downloads, "Verifier", Mock())
+    monkeypatch.setattr(model_downloads, "ModelStore", Mock(return_value=store))
+    monkeypatch.setattr(model_downloads, "NetworkGate", Mock(return_value=gate))
+    monkeypatch.setattr(model_downloads, "HttpClient", Mock())
+    monkeypatch.setattr(model_downloads, "Downloader", Mock())
 
     def run_smoke(request: object, *, cancel: Callable[[], bool]) -> Mock:
         assert not cancel(), "Отмена предыдущей попытки не должна попадать в новую"
@@ -2522,7 +2523,7 @@ def test_model_shutdown_cancels_active_smoke_check(
         return Mock(ok=False)
 
     runner = Mock(side_effect=run_smoke)
-    monkeypatch.setattr(bridges, "SmokeRunner", Mock(return_value=runner))
+    monkeypatch.setattr(model_downloads, "SmokeRunner", Mock(return_value=runner))
 
     def installer_factory(
         store: object, smoke: Callable[..., object], catalog: Catalog | None = None
@@ -2536,13 +2537,13 @@ def test_model_shutdown_cancels_active_smoke_check(
             install_from_staging=Mock(side_effect=install),
         )
 
-    monkeypatch.setattr(bridges, "Installer", installer_factory)
+    monkeypatch.setattr(model_downloads, "Installer", installer_factory)
     service = ModelService(Settings(), policy_mod.Policy())
     monkeypatch.setattr(service, "free_bytes", Mock(return_value=port.available_bytes))
     controller = create(service)
     # Проверка создаётся до привязки Event; попытка должна видеть новый Event.
-    service.set_cancel(controller._model_cancel)
-    controller._model_cancel.set()
+    service.set_cancel(controller._downloads._model_cancel)
+    controller._downloads._model_cancel.set()
     done = QSignalSpy(controller.canFinishChanged)
     if local:
         controller.installFromPath("/fake/model")
@@ -2551,8 +2552,8 @@ def test_model_shutdown_cancels_active_smoke_check(
     assert started.wait(1)
     controller.shutdown()
     assert stopped.is_set()
-    assert controller._model_thread is not None
-    assert not controller._model_thread.isRunning()
+    assert controller._downloads._model_thread is not None
+    assert not controller._downloads._model_thread.isRunning()
     if not done:
         assert done.wait(1000)
     assert controller.modelState == "cancelled"
@@ -2572,14 +2573,13 @@ def test_model_app_assembly_and_shutdown(
     from test_app_shutdown import Rig
 
     from astra_voice import app as app_mod
-    from astra_voice.ui import bridges
 
     rig = Rig(monkeypatch, tmp_path)
     model = FakeModelPort()
     factory = Mock(return_value=model)
     if service_fails:
         factory.side_effect = RuntimeError("SECRET /catalog/path")
-    monkeypatch.setattr(bridges, "ModelService", factory)
+    monkeypatch.setattr(model_downloads, "ModelService", factory)
     original_shutdown = OnboardingController.shutdown
     shutdown_call = Mock()
     rig.calls.attach_mock(shutdown_call, "onboarding_shutdown")
@@ -2602,7 +2602,7 @@ def test_model_app_assembly_and_shutdown(
         item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
     )
     controller = properties["onboarding"]
-    assert controller._model is (None if service_fails else model)
+    assert controller._downloads.model is (None if service_fails else model)
     assert controller.modelState == ("absent" if service_fails else "downloadable")
     shutdown_call.assert_called_once_with()
     assert rig.calls.mock_calls.index(call.onboarding_shutdown()) < rig.calls.mock_calls.index(
@@ -3341,7 +3341,7 @@ def test_model_toggle_rejects_unavailable_ids(
     before = downloads.models
     changed = QSignalSpy(downloads.selectionChanged)
     create_job = Mock(side_effect=AssertionError("Недоступный id не создаёт задание"))
-    monkeypatch.setattr("astra_voice.ui.bridges._ModelJob", create_job)
+    monkeypatch.setattr("astra_voice.ui.model_downloads._ModelJob", create_job)
     downloads.toggleModel(model_id)
     downloads.retryModel(model_id)
     assert downloads.models == before
@@ -3360,10 +3360,10 @@ def test_model_retry_only_accepts_failed_cards(
     controller = create()
     controller._downloads._set_card(port.entry, state)
     create_job = Mock(side_effect=AssertionError("Исправная карточка не создаёт задание"))
-    monkeypatch.setattr("astra_voice.ui.bridges._ModelJob", create_job)
+    monkeypatch.setattr("astra_voice.ui.model_downloads._ModelJob", create_job)
     controller.retryModel(port.entry.id)
     assert controller.models[0]["state"] == state
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
     assert port.download_calls == 0
     create_job.assert_not_called()
 
@@ -3501,7 +3501,7 @@ def test_model_queue_serial_bytes_titles_and_first_current(model_rig: ModelRig) 
     progress = QSignalSpy(controller.downloadProgressChanged)
     finished = QSignalSpy(controller.canFinishChanged)
     controller.startSelectedDownloads()
-    first_thread = controller._model_thread
+    first_thread = controller._downloads._model_thread
     assert first_thread is not None
     assert controller.models[1]["state"] == "queued"
     controller.startSelectedDownloads()
@@ -3515,7 +3515,10 @@ def test_model_queue_serial_bytes_titles_and_first_current(model_rig: ModelRig) 
     port.releases[port.entry.id].set()
     assert finished.wait(1000)
     assert not first_thread.isRunning()
-    assert controller._model_thread is not None and controller._model_thread is not first_thread
+    assert (
+        controller._downloads._model_thread is not None
+        and controller._downloads._model_thread is not first_thread
+    )
     if controller.models[1]["progress"] == 0:
         assert progress.wait(1000)
     assert controller.downloadProgress == 0.625
@@ -3539,7 +3542,7 @@ def test_model_queue_serial_bytes_titles_and_first_current(model_rig: ModelRig) 
     assert controller.selectionSummary == ""
     assert controller.modelReady and controller.canFinish and controller.canContinueFromModel
     controller.startSelectedDownloads()
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
 
 
 def test_model_queue_failure_continues_and_retries(model_rig: ModelRig) -> None:
@@ -3558,7 +3561,7 @@ def test_model_queue_failure_continues_and_retries(model_rig: ModelRig) -> None:
         == "Модель не прошла проверку. Попробуйте скачать или установить её заново."
     )
     controller.retryModel(port.entry.id)
-    assert controller._active_entry == port.second
+    assert controller._downloads._active_entry == port.second
     port.releases[port.second.id].set()
     assert finished.wait(1000)
     assert controller.downloadState == "done"
@@ -3573,7 +3576,7 @@ def test_model_queue_failure_continues_and_retries(model_rig: ModelRig) -> None:
     assert controller.models[0]["message"] == ""
     assert controller.models[0]["state"] == "installed"
     controller.retryModel(port.entry.id)
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
 
 
 @pytest.mark.parametrize("no_space", [False, True])
@@ -3616,7 +3619,7 @@ def test_model_queue_cancel_clears_pending_and_ignores_late_progress(model_rig: 
     assert finished.wait(1000)
     assert port.visits == [port.entry.id]
     assert not port.installs
-    assert controller._model_thread is None
+    assert controller._downloads._model_thread is None
     assert controller.downloadState == "idle"
     assert controller.models[0]["message"] == ""
     assert controller.selectionSummary == "Будет скачано 400 МБ"
@@ -3666,10 +3669,10 @@ def test_model_queue_estimates_use_clock_and_throttle(
     clock = Mock(return_value=100.0)
     controller = create(port, clock=clock)
     # Здесь проверяются только вычисления: потоки покрыты тестами очереди выше.
-    monkeypatch.setattr(controller, "_start_model_job", lambda source=None: None)
+    monkeypatch.setattr(controller._downloads, "_start_model_job", lambda source=None: None)
     select_queue(controller, port)
     controller.startSelectedDownloads()
-    controller._active_entry = port.entry
+    controller._downloads._active_entry = port.entry
     transitions: list[tuple[str, str, str]] = []
     controller.downloadStateChanged.connect(
         lambda: transitions.append((controller.downloadState, controller.speed, controller.eta))
@@ -3696,19 +3699,19 @@ def test_model_queue_estimates_use_clock_and_throttle(
     controller._model_progressed(0.055, float("nan"), float("inf"))
     assert controller.downloadProgress == 5_500_000 / 400_000_000
     assert len(progress) == 1 and len(speed) == len(eta) == 0
-    assert controller._tracker.elapsed_s == 5.5
+    assert controller._downloads._tracker.elapsed_s == 5.5
     clock.return_value = 106.0
     controller._model_progressed(0.12, 0, -1)
     assert controller.speed == "2,0 МБ/с"
     assert controller.eta == "осталось ~3 мин"
     assert len(speed) == len(eta) == 1
     # Следующая модель продолжает тот же счётчик байтов и времени.
-    controller._queue_completed_bytes = port.entry.size_bytes
-    controller._active_entry = port.second
+    controller._downloads._queue_completed_bytes = port.entry.size_bytes
+    controller._downloads._active_entry = port.second
     clock.return_value = 110.0
     controller._model_progressed(0.1, 0, -1)
     assert controller.downloadProgress == 0.325
-    assert controller._tracker.elapsed_s == 10.0
+    assert controller._downloads._tracker.elapsed_s == 10.0
     assert controller.speed == "25,0 МБ/с"
     assert controller.eta == "осталось меньше минуты"
 
@@ -4114,7 +4117,7 @@ def test_unavailable_test_does_not_stop_level_monitor() -> None:
 
 class SharedDownloadsRig:
     def __init__(self) -> None:
-        from astra_voice.ui.bridges import ModelDownloads
+        from astra_voice.ui.model_downloads import ModelDownloads
 
         self.port = QueueModelPort()
         self.settings = Settings(extra={"onboarding_language_set": True})
@@ -4550,23 +4553,22 @@ def test_app_uses_one_download_queue_and_shuts_it_down_once(
     from test_app_shutdown import Rig
 
     from astra_voice import app as app_mod
-    from astra_voice.ui import bridges
 
     rig = Rig(monkeypatch, tmp_path)
     rig.settings.extra["onboarding_done"] = onboarding_done
     port = FakeModelPort()
     service_factory = Mock(return_value=port)
-    download_factory = Mock(wraps=bridges.ModelDownloads)
+    download_factory = Mock(wraps=model_downloads.ModelDownloads)
     stop = Mock()
-    shutdown = bridges.ModelDownloads.shutdown
+    shutdown = model_downloads.ModelDownloads.shutdown
 
-    def stop_downloads(downloads: bridges.ModelDownloads) -> None:
+    def stop_downloads(downloads: model_downloads.ModelDownloads) -> None:
         stop(downloads)
         shutdown(downloads)
 
-    monkeypatch.setattr(bridges, "ModelService", service_factory)
-    monkeypatch.setattr(bridges.ModelDownloads, "shutdown", stop_downloads)
-    monkeypatch.setattr(bridges, "ModelDownloads", download_factory)
+    monkeypatch.setattr(model_downloads, "ModelService", service_factory)
+    monkeypatch.setattr(model_downloads.ModelDownloads, "shutdown", stop_downloads)
+    monkeypatch.setattr(model_downloads, "ModelDownloads", download_factory)
 
     def event_loop() -> int:
         properties = dict(
@@ -4670,7 +4672,6 @@ def test_model_install_engine_failure_reaches_card(model_rig: ModelRig, local: b
 
 class RecheckRig:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        from astra_voice.ui import bridges
 
         contents = {
             "v3_e2e_ctc.int8.onnx": b"verified model contents",
@@ -4725,7 +4726,7 @@ class RecheckRig:
             return Mock(ok=self.code == "ok", reason=self.code, text="PRIVATE SPEECH")
 
         self.runner = Mock(side_effect=run)
-        monkeypatch.setattr(bridges, "SmokeRunner", Mock(return_value=self.runner))
+        monkeypatch.setattr(model_downloads, "SmokeRunner", Mock(return_value=self.runner))
         self.ok = Mock(wraps=self.service.mark_ok)
         self.broken = Mock(wraps=self.service.mark_broken)
         self.current = Mock(wraps=self.service.set_current)
@@ -4734,7 +4735,7 @@ class RecheckRig:
         monkeypatch.setattr(self.service, "set_current", self.current)
         self.verify = Mock(wraps=self.service.verify_files)
         monkeypatch.setattr(self.service, "verify_files", self.verify)
-        self.downloads = bridges.ModelDownloads(self.service)
+        self.downloads = model_downloads.ModelDownloads(self.service)
         self.ready = QSignalSpy(self.downloads.modelReadyChanged)
 
     def finish(self) -> None:
@@ -5033,11 +5034,10 @@ def test_recheck_verifies_entire_installed_contents(recheck_rig: RecheckRig, dam
 def test_model_service_returns_installer_verdict(
     recheck_rig: RecheckRig, monkeypatch: pytest.MonkeyPatch, verdict: tuple[bool, str]
 ) -> None:
-    from astra_voice.ui import bridges
 
     rig = recheck_rig
     verify = Mock(return_value=verdict)
-    monkeypatch.setattr(bridges, "verify_installed", verify)
+    monkeypatch.setattr(model_downloads, "verify_installed", verify)
 
     assert rig.service.verify_files(rig.entry) == verdict
     verify.assert_called_once_with(rig.directory, rig.entry, cancel=rig.service._cancel.is_set)
@@ -5472,7 +5472,7 @@ def test_model_service_free_bytes_uses_store_filesystem(
     if root_exists:
         service._store.root.mkdir(parents=True)
     usage = Mock(return_value=Mock(free=42_100_000_000))
-    monkeypatch.setattr("astra_voice.ui.bridges.shutil.disk_usage", usage)
+    monkeypatch.setattr("astra_voice.ui.model_downloads.shutil.disk_usage", usage)
     assert service.free_bytes() == 42_100_000_000
     usage.assert_called_once_with(service._store.root if root_exists else tmp_path)
     assert service._store.root.exists() is root_exists
@@ -5595,7 +5595,7 @@ def test_open_models_folder_unavailable_is_private_noop(
         )
         monkeypatch.setattr(Path, "is_dir", Mock(side_effect=error))
     target = rig.bridge if via_settings else rig.controller
-    with caplog.at_level(logging.DEBUG, logger="astra_voice.ui.bridges"):
+    with caplog.at_level(logging.DEBUG, logger="astra_voice.ui"):
         target.openModelsFolder()
     desktop_opener.assert_not_called()
     assert len(caplog.records) == 1
@@ -5832,7 +5832,7 @@ def test_free_space_text_handles_service_disk_usage_error(
     service._store = ModelStore(tmp_path / "models")
     monkeypatch.setattr(port, "free_bytes", service.free_bytes)
     usage = Mock(side_effect=OSError("SECRET /disk"))
-    monkeypatch.setattr("astra_voice.ui.bridges.shutil.disk_usage", usage)
+    monkeypatch.setattr("astra_voice.ui.model_downloads.shutil.disk_usage", usage)
     controller = create()
     assert controller.freeSpaceText == ""
     usage.assert_called_once_with(tmp_path)
