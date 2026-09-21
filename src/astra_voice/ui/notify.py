@@ -26,6 +26,7 @@ __all__ = [
     "flush_pending",
     "last_delivery_ok",
     "notify",
+    "notify_engine_failed",
     "notify_hotkey_not_grabbed",
     "notify_hotkey_regrabbed",
     "notify_indicators_lost",
@@ -33,6 +34,7 @@ __all__ = [
     "notify_microphone_lost",
     "notify_microphone_selected",
     "notify_onboarding_ready",
+    "notify_model_installed",
     "notify_selfcheck_failed",
     "notify_tray_depends_on_panel",
     "notify_tray_unavailable",
@@ -333,6 +335,16 @@ def notify_indicators_lost() -> None:
     )
 
 
+def notify_engine_failed() -> None:
+    """Сообщить, что движок распознавания не удалось запустить."""
+    notify(
+        "Не удалось запустить распознавание",
+        "Попробуйте переустановить модель.",
+        urgency="critical",
+        actions=[(ACTION_SHOW_DETAILS, "Подробности")],
+    )
+
+
 def notify_selfcheck_failed() -> None:
     """Сообщить, что модель не прошла пробное распознавание."""
     notify(
@@ -341,3 +353,8 @@ def notify_selfcheck_failed() -> None:
         urgency="critical",
         actions=[(ACTION_SHOW_DETAILS, "Подробности")],
     )
+
+
+def notify_model_installed() -> None:
+    """Сообщить о готовности модели после фоновой установки."""
+    notify("Модель установлена", "Можно диктовать.", urgency="normal")

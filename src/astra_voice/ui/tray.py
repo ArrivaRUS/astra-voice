@@ -315,6 +315,9 @@ class Tray(QObject):
         self._menu.setObjectName("astravoice-tray-menu")
         self._status_action = self._menu.addAction("Готов")
         self._status_action.setEnabled(False)
+        self._download_action = QAction(self._menu)
+        self._download_action.setEnabled(False)
+        self._download_action.setVisible(False)
         self._menu.addSeparator()
         self._cancel_action = self._add_action("Отмена", lambda: self._invoke(self.on_cancel))
         self._model_action = self._menu.addAction("Модель не установлена")
@@ -371,6 +374,17 @@ class Tray(QObject):
                 self._begin_retry()
             if has_icon:
                 self._try_register()
+
+    def set_download_status(self, text: str) -> None:
+        """Показывает прогресс сразу под состоянием, пока есть текст загрузки."""
+        self._download_action.setText(text)
+        self._download_action.setVisible(bool(text))
+        # Отсутствующий прогресс не меняет состав обычного меню и его сочетания.
+        if text:
+            if self._download_action not in self._menu.actions():
+                self._menu.insertAction(self._menu.actions()[1], self._download_action)
+        else:
+            self._menu.removeAction(self._download_action)
 
     def _done_expired(self) -> None:
         if self._state == TrayState.DONE:

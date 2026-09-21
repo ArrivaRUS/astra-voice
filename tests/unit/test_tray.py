@@ -1350,3 +1350,24 @@ def test_real_worker_delivers_to_gui_and_cleans_up(
         wait_for(qapp, lambda: not module._bus_threads)
     harness.connection.disconnectFromBus.assert_called_once()
     assert cleanup_threads and gui_thread not in cleanup_threads
+
+
+def test_download_status_menu_item(harness: Harness) -> None:
+    original = harness.menu.actions()
+    harness.tray.set_download_status("Загружается GigaAM v3 — 42%")
+    actions = harness.menu.actions()
+    download = actions[1]
+    assert actions[0] is original[0]
+    assert actions[2:] == original[1:]
+    assert download.text() == "Загружается GigaAM v3 — 42%"
+    assert download.isVisible() and not download.isEnabled()
+    harness.tray.set_download_status("Загружается GigaAM v3 — 80%")
+    harness.tray.set_state(TrayState.LISTENING)
+    assert harness.menu.actions() == actions
+    assert download.text() == "Загружается GigaAM v3 — 80%"
+    harness.tray.set_download_status("")
+    assert not download.isVisible()
+    assert harness.menu.actions() == original
+    harness.tray.set_download_status("Проверяю модель… — 100%")
+    assert harness.menu.actions()[1] is download
+    assert download.isVisible() and not download.isEnabled()

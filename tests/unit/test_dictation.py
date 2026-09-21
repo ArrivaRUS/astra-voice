@@ -15,11 +15,14 @@ from astra_voice.core.dictation import (
     BUSY_RETRY_MS,
     CANCEL_RESTART_MS,
     CANCEL_TIMEOUT_MS,
+    LEVEL_RECORD_LIMIT_S,
     PROCESSING_WATCHDOG_MS,
     RECOGNIZE_TIMEOUT_S,
+    TEST_BUSY,
     TEST_RECORD_LIMIT_MS,
     DictationOrchestrator,
     DictationPhase,
+    MicrophoneLevelUpdate,
     MicrophoneTestUpdate,
     level_from_dbfs,
 )
@@ -2220,3 +2223,182 @@ def test_microphone_cancel_timeout_callback_cannot_restart_before_ack(rig: Rig) 
     rig.timer(CANCEL_TIMEOUT_MS).fire()
     assert attempts == [False]
     assert rig.commands() == ["record.start", "record.cancel", "audio.close"]
+
+
+@pytest.mark.parametrize("device", ["", "alsa_input.usb-mic"])
+def test_level_monitor_records_without_recognition(rig: Rig, device: str) -> None:
+    updates: list[MicrophoneLevelUpdate] = []
+    assert rig.core.start_level_monitor(device, updates.append)
+    assert updates == [MicrophoneLevelUpdate("listening")]
+    assert rig.core.level_active and not rig.core.test_active
+    assert rig.sent[0][0].get("device") == (device or None)
+    assert rig.sent[0][0]["limit_s"] == LEVEL_RECORD_LIMIT_S
+    assert rig.recording and rig.tray.state == TrayState.LISTENING
+    assert not any(entry[0] == "active_window" for entry in rig.trace)
+    microphone_event(rig, "level", peak_dbfs=-18, rms_dbfs=-30)
+    assert updates[-1] == MicrophoneLevelUpdate("listening", peak_dbfs=-18)
+    microphone_event(rig, "silent")
+    microphone_event(rig, "result", text=MARKER, t_ms=1)
+    assert updates[-1].state == "listening"
+    rig.core.stop_level_monitor()
+    rig.core.stop_level_monitor()
+    assert rig.commands() == ["record.start", "record.cancel"]
+    assert not rig.recording and rig.tray.state == TrayState.IDLE
+    microphone_event(rig, "cancelled")
+    assert updates[-1] == MicrophoneLevelUpdate("idle")
+    assert not rig.core.level_active and not rig.core.test_active
+    assert not rig.stats.events and not rig.pasted and not rig.pill.calls
+    assert rig.core.last_text is None
+
+
+@pytest.mark.parametrize("synchronous", [False, True])
+def test_level_limit_restarts_with_fresh_id(rig: Rig, synchronous: bool) -> None:
+    updates: list[MicrophoneLevelUpdate] = []
+    rig.core.start_level_monitor("chosen", updates.append)
+    previous = rig.uid
+
+    def send(message: dict[str, Any]) -> None:
+        if message["type"] == "record.cancel" and synchronous:
+            rig.core.on_worker_event({**message, "type": "cancelled", "generation": 1})
+
+    rig.during_send = send
+    microphone_event(rig, "record.limit")
+    assert rig.uid != previous
+    assert rig.commands() == ["record.start", "record.cancel", "record.start"]
+    rig.core.on_worker_event({"type": "cancelled", "utterance_id": previous, "generation": 1})
+    microphone_event(rig, "level", peak_dbfs=-20, rms_dbfs=-30)
+    assert updates[-1] == MicrophoneLevelUpdate("listening", peak_dbfs=-20)
+    assert rig.recording and rig.core.level_active
+    assert rig.sent[-1][0]["device"] == "chosen"
+
+
+@pytest.mark.parametrize("busy", ["dictation", "test", "level", "cancel", "closed"])
+def test_level_monitor_rejects_busy(rig: Rig, busy: str) -> None:
+    if busy in ("dictation", "cancel"):
+        rig.start()
+        if busy == "cancel":
+            rig.core.cancel("test")
+    elif busy == "test":
+        rig.core.start_test("", Mock())
+    elif busy == "level":
+        rig.core.start_level_monitor("", Mock())
+    else:
+        rig.core.shutdown()
+    before = rig.commands()
+    updates: list[MicrophoneLevelUpdate] = []
+    assert not rig.core.start_level_monitor("", updates.append)
+    assert updates == [MicrophoneLevelUpdate("error", message=TEST_BUSY)]
+    assert rig.commands() == before
+
+
+def test_level_monitor_excludes_test_and_hotkey(rig: Rig) -> None:
+    rig.core.start_level_monitor("", Mock())
+    updates: list[MicrophoneTestUpdate] = []
+    assert not rig.core.start_test("", updates.append)
+    assert updates == [MicrophoneTestUpdate("error", message=TEST_BUSY)]
+    rig.start()
+    rig.stop()
+    rig.core.stop_test()
+    rig.core.cancel_test()
+    assert rig.commands() == ["record.start"]
+    assert rig.core.level_active and not rig.core.test_active
+
+
+@pytest.mark.parametrize("action", ["cancel", "shutdown", "generation"])
+def test_level_monitor_lifecycle_closes_microphone(rig: Rig, action: str) -> None:
+    updates: list[MicrophoneLevelUpdate] = []
+    rig.core.start_level_monitor("", updates.append)
+    if action == "cancel":
+        rig.core.cancel("tray")
+        microphone_event(rig, "cancelled")
+    elif action == "shutdown":
+        rig.core.shutdown()
+    else:
+        rig.worker_generation += 1
+        microphone_event(rig, "level", peak_dbfs=-10, rms_dbfs=-20)
+    assert rig.commands()[-1] == "record.cancel"
+    assert not rig.recording and rig.tray.state == TrayState.IDLE
+    assert updates[-1].state == ("error" if action == "generation" else "idle")
+    assert not rig.core.level_active
+    assert not rig.stats.events and not rig.pill.calls
+
+
+@pytest.mark.parametrize("failure", ["start", "level", "indicator", "callback", "stop", "limit"])
+def test_level_exceptions_close_without_leaking(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    updates: list[MicrophoneLevelUpdate] = []
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError(MARKER)
+
+    def receive(update: MicrophoneLevelUpdate) -> None:
+        updates.append(update)
+        if failure == "callback" and update.state == "listening":
+            fail()
+
+    if failure == "indicator":
+        original = rig.core._set_recording
+
+        def indicator(value: bool) -> None:
+            if value:
+                fail()
+            original(value)
+
+        monkeypatch.setattr(rig.core, "_set_recording", indicator)
+    if failure == "start":
+        rig.during_send = lambda msg: fail() if msg["type"] == "record.start" else None
+    rig.core.start_level_monitor("", receive)
+    if failure == "level":
+        monkeypatch.setattr(rig.core, "_on_device_resolved", fail)
+        microphone_event(rig, "audio.ready", device="ALSA /path")
+    elif failure in ("stop", "limit"):
+        rig.during_send = lambda msg: fail() if msg["type"] == "record.cancel" else None
+        if failure == "stop":
+            rig.core.stop_level_monitor()
+        else:
+            microphone_event(rig, "record.limit")
+    assert updates[-1].state == "error"
+    assert "record.cancel" in rig.commands()
+    assert not rig.recording and not rig.core.level_active
+    assert not rig.stats.events and not rig.pill.calls
+    assert MARKER not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+def test_level_cancel_waits_for_audio_closed_before_idle(rig: Rig) -> None:
+    updates: list[MicrophoneLevelUpdate] = []
+    rig.core.start_level_monitor("", updates.append)
+    rig.core.stop_level_monitor()
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert updates[-1].state == "listening"
+    assert rig.commands()[-1] == "audio.close"
+    assert not rig.core.start_test("", Mock())
+    rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+    assert str(updates[-1].state) == "idle"
+    assert rig.core.start_test("", Mock())
+    rig.restart_worker.assert_not_called()
+
+
+def test_level_shutdown_callback_cannot_reopen_microphone(rig: Rig) -> None:
+    attempts: list[bool] = []
+
+    def receive(update: MicrophoneLevelUpdate) -> None:
+        if update.state == "idle":
+            attempts.append(rig.core.start_level_monitor("", Mock()))
+
+    rig.core.start_level_monitor("", receive)
+    rig.core.shutdown()
+    assert attempts == [False]
+    assert rig.commands() == ["record.start", "record.cancel"]
+    assert not rig.recording
+
+
+def test_level_late_limit_cannot_restart_after_stop(rig: Rig) -> None:
+    rig.core.start_level_monitor("", Mock())
+    rig.core.stop_level_monitor()
+    microphone_event(rig, "record.limit")
+    microphone_event(rig, "cancelled")
+    microphone_event(rig, "record.limit")
+    assert rig.commands() == ["record.start", "record.cancel"]
+    assert not rig.core.level_active

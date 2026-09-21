@@ -16,11 +16,14 @@ from PyQt5.QtCore import QCoreApplication, QEventLoop, QObject, QSocketNotifier,
 from astra_voice.core import paths
 from astra_voice.core.capture_watchdog import CaptureFieldWatchdog
 from astra_voice.core.dictation import (
+    LEVEL_FAILED,
     TEST_BUSY,
     TEST_MODEL_UNAVAILABLE,
     TEST_PREPARING,
     DictationOrchestrator,
     DictationPhase,
+    LevelCallback,
+    MicrophoneLevelUpdate,
     MicrophoneTestUpdate,
     TestCallback,
 )
@@ -238,11 +241,26 @@ class DictationRuntime(QObject):
         """Адаптирует возвращаемое значение супервизора к порту команд."""
         self.supervisor.send(message, timeout=timeout)
 
+    def start_level_monitor(self, device: str, callback: LevelCallback) -> bool:
+        """Измерение уровня не зависит от модели и её самопроверки."""
+        if self._closed or not self._started or self.supervisor.state != "running":
+            callback(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
+            return False
+        if self._pending_test is not None:
+            callback(MicrophoneLevelUpdate("error", message=TEST_BUSY))
+            return False
+        return self.orchestrator.start_level_monitor(device, callback)
+
+    def stop_level_monitor(self) -> None:
+        """Освобождает микрофон без распознавания."""
+        self.orchestrator.stop_level_monitor()
+
     def start_test(self, device: str, callback: TestCallback) -> bool:
         """Запускает частную проверку; новую модель мастера сначала загружает."""
         if (
             self._pending_test is not None
             or self.orchestrator.test_active
+            or self.orchestrator.level_active
             or self.phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
         ):
             callback(MicrophoneTestUpdate("error", message=TEST_BUSY))
@@ -533,7 +551,10 @@ class DictationRuntime(QObject):
             self.tray.set_model_recheck_enabled(True)
             self.tray.set_state(TrayState.ERROR)
             self.pill.show_state(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
-            notify.notify_selfcheck_failed()
+            if reason in {"load-failed", "worker-error", "no-wav", "timeout"}:
+                notify.notify_engine_failed()
+            else:
+                notify.notify_selfcheck_failed()
 
     def _on_worker_event(self, event: dict[str, Any]) -> None:
         """Обрабатывает загрузку модели и передаёт исходное событие оркестратору."""

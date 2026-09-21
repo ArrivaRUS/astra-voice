@@ -38,6 +38,20 @@ CANCEL_TIMEOUT_MS = 1500
 CANCEL_RESTART_MS = 2000
 BUSY_RETRY_MS = 200
 TEST_RECORD_LIMIT_MS = 10000
+LEVEL_RECORD_LIMIT_S = 60.0
+LEVEL_FAILED = "Не удалось проверить микрофон. Попробуйте ещё раз."
+
+
+@dataclass(frozen=True)
+class MicrophoneLevelUpdate:
+    """Отдельный канал измерения, никогда не содержащий распознанной речи."""
+
+    state: Literal["idle", "listening", "error"]
+    peak_dbfs: float | None = None
+    message: str = ""
+
+
+LevelCallback = Callable[[MicrophoneLevelUpdate], None]
 
 
 @dataclass(frozen=True)
@@ -182,6 +196,176 @@ class DictationOrchestrator:
         self._timer_serial = 0
         self._timers: dict[int, tuple[object, Callable[[], None]]] = {}
         self._test_callback: TestCallback | None = None
+        self._level_callback: LevelCallback | None = None
+        self._level_device = ""
+        self._level_failed = False
+
+    @property
+    def level_active(self) -> bool:
+        """Идёт измерение; ожидание подтверждения отмены сюда не входит."""
+        return self._level_callback is not None and not self._cancel_requested
+
+    def start_level_monitor(self, device: str, callback: LevelCallback) -> bool:
+        """Открывает микрофон без обращения к модели или распознаванию."""
+        if (
+            self._closed
+            or self._level_callback is not None
+            or self.test_active
+            or self._cancel_pending
+            or self._phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
+        ):
+            callback(MicrophoneLevelUpdate("error", message=TEST_BUSY))
+            return False
+        self._level_callback = callback
+        self._level_device = device
+        self._level_failed = False
+        self._cancel_requested = False
+        try:
+            self._utterance_id = uuid4().hex
+            self._cancel_timers()
+            self._target_window = None
+            self._delivered = False
+            self._worker_generation = self._generation()
+            self._sync_device_generation()
+            self._phase = DictationPhase.RECORDING
+            self._start_level_recording()
+        except Exception:
+            self._end_level(LEVEL_FAILED)
+            return False
+        return not self._level_failed
+
+    def _start_level_recording(self) -> None:
+        # Индикация включается до открытия: ошибка индикатора запрещает запись.
+        self._tray.set_state(TrayState.LISTENING)
+        if not self.level_active:
+            return
+        self._set_recording(True)
+        if not self.level_active:
+            return
+        message: dict[str, Any] = {
+            "type": "record.start",
+            "utterance_id": self._utterance_id,
+            "limit_s": LEVEL_RECORD_LIMIT_S,
+        }
+        if self._level_device:
+            message["device"] = self._level_device
+        self._send(message, timeout=LEVEL_RECORD_LIMIT_S + RECOGNIZE_TIMEOUT_S)
+        if self.level_active and self._level_callback is not None:
+            self._level_callback(MicrophoneLevelUpdate("listening"))
+
+    def stop_level_monitor(self) -> None:
+        """Отменяет запись; idle приходит только после освобождения микрофона."""
+        if self._level_callback is not None and not self._cancel_requested:
+            self._end_level()
+
+    def _level_notify(self, update: MicrophoneLevelUpdate) -> None:
+        if self._level_callback is not None:
+            try:
+                self._level_callback(update)
+            except Exception:
+                # Терминальное уведомление не должно мешать освобождению микрофона.
+                self._level_failed = True
+
+    def _end_level(self, message: str = "") -> None:
+        self._cancel_requested = True
+        self._cancel_pending = True
+        self._cancel_timers()
+        actions: tuple[Callable[[], None], ...] = (
+            lambda: self._set_recording(False),
+            lambda: self._tray.set_state(TrayState.IDLE),
+        )
+        for action in actions:
+            try:
+                action()
+            except Exception:
+                message = message or LEVEL_FAILED
+        if message:
+            self._level_failed = True
+            self._level_notify(MicrophoneLevelUpdate("error", message=message))
+        try:
+            self._later(CANCEL_TIMEOUT_MS, self._level_cancel_timeout)
+            self._send({"type": "record.cancel", "utterance_id": self._utterance_id})
+        except Exception:
+            self._level_failed = True
+            self._level_notify(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
+            self._level_cancel_timeout()
+
+    def _finish_level(self) -> None:
+        callback, self._level_callback = self._level_callback, None
+        self._cancel_pending = False
+        self._cancel_timers()
+        self._phase = DictationPhase.IDLE
+        if callback is not None and not self._level_failed:
+            try:
+                callback(MicrophoneLevelUpdate("idle"))
+            except Exception:
+                try:
+                    callback(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
+                except Exception:
+                    pass
+
+    def _level_cancel_timeout(self) -> None:
+        if self._level_callback is None:
+            return
+        self._cancel_timers()
+        try:
+            self._later(CANCEL_RESTART_MS, self._level_cancel_restart)
+        except Exception:
+            self._level_failed = True
+            self._level_notify(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
+        try:
+            self._send({"type": "audio.close"})
+        except Exception:
+            self._level_failed = True
+            self._level_notify(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
+            self._level_cancel_restart()
+
+    def _level_cancel_restart(self) -> None:
+        try:
+            if self._generation() == self._worker_generation:
+                self._restart_worker()
+        except Exception:
+            self._level_failed = True
+            self._level_notify(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
+        finally:
+            self._finish_level()
+
+    def _level_event(self, event: dict[str, Any]) -> None:
+        if self._generation() != self._worker_generation or (
+            isinstance(event.get("generation"), int)
+            and event["generation"] > self._worker_generation
+        ):
+            self._end_level(LEVEL_FAILED)
+            self._finish_level()
+            self._sync_device_generation()
+            return
+        if event.get("generation") != self._worker_generation:
+            return
+        if event.get("utterance_id", self._utterance_id) != self._utterance_id:
+            return
+        kind = event.get("type")
+        if kind in ("cancelled", "audio.closed"):
+            if not self._cancel_requested:
+                self._end_level(LEVEL_FAILED)
+            self._finish_level()
+        elif self._cancel_pending:
+            return
+        elif kind == "error":
+            self._error(event.get("code"))
+        elif kind == "audio.ready":
+            self._audio_ready(event)
+        elif kind == "level":
+            peak = event.get("peak_dbfs")
+            if isinstance(peak, (int, float)) and not isinstance(peak, bool):
+                if self._level_callback is not None:
+                    self._level_callback(MicrophoneLevelUpdate("listening", peak_dbfs=float(peak)))
+        elif kind == "record.limit" and self.level_active:
+            # Удаляем завершённый буфер. Его поздний cancelled отсеется по старому id.
+            previous = self._utterance_id
+            self._utterance_id = uuid4().hex
+            self._send({"type": "record.cancel", "utterance_id": previous})
+            if self.level_active:
+                self._start_level_recording()
 
     @property
     def test_active(self) -> bool:
@@ -192,6 +376,7 @@ class DictationOrchestrator:
         """Записывает выбранный микрофон без вставки, статистики и последнего текста."""
         if (
             self._closed
+            or self._level_callback is not None
             or self.test_active
             or self._cancel_pending
             or self._phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
@@ -274,7 +459,7 @@ class DictationOrchestrator:
         """Принимает состояния HotkeyFsm, включая IDLE с escape-cancel."""
         if self._closed:
             return
-        if self.test_active:
+        if self.test_active or self._level_callback is not None:
             # Сброс FSM вызывает вложенный IDLE/escape-cancel: его тоже игнорируем.
             # Отмена самой проверки идёт через stop_test/cancel_test, а не хоткей.
             if state in (HotkeyState.RECORDING, HotkeyState.PROCESSING):
@@ -352,6 +537,9 @@ class DictationOrchestrator:
             self._test_callback(MicrophoneTestUpdate("recording"))
 
     def _stop(self, *, recording_stopped: bool = False) -> None:
+        if self._level_callback is not None:
+            self.stop_level_monitor()
+            return
         if self._phase != DictationPhase.RECORDING or self._cancel_requested:
             return
         if self.test_active:
@@ -399,6 +587,12 @@ class DictationOrchestrator:
     def on_worker_event(self, event: dict[str, Any]) -> None:
         """Отбрасывает чужие результаты до чтения содержимого распознанной речи."""
         if self._closed:
+            return
+        if self._level_callback is not None:
+            try:
+                self._level_event(event)
+            except Exception:
+                self._end_level(LEVEL_FAILED)
             return
         if self._suspended:
             saved = event.copy()
@@ -489,7 +683,7 @@ class DictationOrchestrator:
             self._resolved_device = name
             if self._on_device_resolved is not None:
                 self._on_device_resolved(name)
-        if self.test_active:
+        if self.test_active or self._level_callback is not None:
             return
         self._log.debug("диктовка: audio.ready")
         if self._t_ready is None:
@@ -594,6 +788,9 @@ class DictationOrchestrator:
         """Единая отмена до доставки; успешную вставку отменить уже нельзя."""
         if self._closed:
             return
+        if self._level_callback is not None:
+            self.stop_level_monitor()
+            return
         if self._suspended:
             self._queue.append(lambda: self.cancel(source))
             return
@@ -674,13 +871,16 @@ class DictationOrchestrator:
             self._cancel_pending = False
 
     def _error(self, code: object) -> None:
-        if self.test_active:
+        if self.test_active or self._level_callback is not None:
             message = {
                 "audio-no-device": "Микрофон недоступен. Подключите его или выберите другой.",
                 "audio-busy": "Микрофон занят. Закройте другую программу и попробуйте ещё раз.",
                 "audio-failed": "Не удалось записать звук. Выберите другой микрофон.",
                 "no-model": TEST_MODEL_UNAVAILABLE,
             }.get(str(code), TEST_FAILED)
+            if self._level_callback is not None:
+                self._end_level(message)
+                return
             self._finish_test(MicrophoneTestUpdate("error", message=message))
             return
         if code in ("worker-crashed", "restart-limit", "worker-start"):
@@ -833,8 +1033,11 @@ class DictationOrchestrator:
         """Закрывает автомат, освобождая таймеры и индикаторы даже при ошибках."""
         if self._closed:
             return
-        active = self._phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
         self._closed = True
+        if self._level_callback is not None:
+            self.stop_level_monitor()
+            self._finish_level()
+        active = self._phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
         self._cancel_pending = False
         self._cancel_requested = True
         self._queue.clear()

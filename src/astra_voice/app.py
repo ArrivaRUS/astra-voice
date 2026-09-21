@@ -31,7 +31,7 @@ from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
 
 if TYPE_CHECKING:
-    from astra_voice.core.dictation import TestCallback
+    from astra_voice.core.dictation import LevelCallback, TestCallback
     from astra_voice.runtime import DictationRuntime
 
 log = logging.getLogger(__name__)
@@ -469,6 +469,12 @@ class _RuntimeOnboardingHost:
     def apply_hotkey(self, combo: str, mode: str) -> str:
         return self._runtime.apply_hotkey(combo, mode)
 
+    def start_level_monitor(self, device: str, callback: LevelCallback) -> bool:
+        return self._runtime.start_level_monitor(device, callback)
+
+    def stop_level_monitor(self) -> None:
+        self._runtime.stop_level_monitor()
+
     def start_test(self, device: str, callback: TestCallback) -> bool:
         return self._runtime.start_test(device, callback)
 
@@ -714,6 +720,7 @@ def main(argv: list[str] | None = None) -> int:
     runtime: DictationRuntime | None = None
     settings_bridge = None  # держим Python-обёртку живой до выхода из main
     onboarding = None
+    downloads = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
     close_watcher = _wire_close(  # держим ссылку на фильтр
         app, shell, is_tray_ready=lambda: runtime is not None and runtime.tray.registered
@@ -765,11 +772,25 @@ def main(argv: list[str] | None = None) -> int:
             )
         from PyQt5.QtQml import QQmlEngine
 
-        from astra_voice.ui.bridges import ModelService, OnboardingController, SettingsBridge
+        from astra_voice.ui.bridges import (
+            ModelDownloads,
+            ModelService,
+            OnboardingController,
+            SettingsBridge,
+        )
+
+        model = None
+        try:
+            model = ModelService(settings, policy)
+        except Exception:  # noqa: BLE001 — каталог не должен мешать запуску окна
+            log.warning("Не удалось подготовить каталог моделей, настройка продолжится без него")
+        downloads = ModelDownloads(model)
+        downloads.start_recheck()
 
         settings_bridge = SettingsBridge(
             stored,
             mirror=settings,
+            downloads=downloads,
             apply=_RuntimeSettingsApply(runtime) if runtime_ready and runtime is not None else None,
             locked=policy.locked_keys,
         )
@@ -777,17 +798,13 @@ def main(argv: list[str] | None = None) -> int:
         _set_context_property(shell, "settingsBridge", settings_bridge)
         show_onboarding = stored.extra.get("onboarding_done") is not True
         if show_onboarding:
-            model = None
-            try:
-                model = ModelService(settings, policy)
-            except Exception:  # noqa: BLE001 — каталог не должен мешать запуску окна
-                log.warning(
-                    "Не удалось подготовить каталог моделей, настройка продолжится без него"
-                )
             onboarding = OnboardingController(
                 settings_bridge,
                 settings=stored,
-                model=model,
+                downloads=downloads,
+                status_sink=runtime.tray.set_download_status
+                if runtime_ready and runtime is not None
+                else None,
                 host=_RuntimeOnboardingHost(runtime, shell)
                 if runtime_ready and runtime is not None
                 else None,
@@ -800,6 +817,15 @@ def main(argv: list[str] | None = None) -> int:
             onboarding.doneChanged.connect(
                 lambda: _set_context_property(shell, "showOnboarding", not onboarding.done)
             )
+        elif runtime_ready and runtime is not None:
+            # Переустановка из настроек видна в трее и после первого запуска.
+            def update_download_status() -> None:
+                if downloads is not None and runtime is not None:
+                    runtime.tray.set_download_status(downloads.status_text())
+
+            downloads.downloadTitleChanged.connect(update_download_status)
+            downloads.downloadProgressChanged.connect(update_download_status)
+            downloads.downloadStateChanged.connect(update_download_status)
         _set_context_property(shell, "showOnboarding", show_onboarding)
         return int(app.exec_())
     finally:
@@ -810,6 +836,11 @@ def main(argv: list[str] | None = None) -> int:
                 onboarding.shutdown()
             except Exception:  # noqa: BLE001 — остальные ресурсы тоже нужно освободить
                 log.warning("Не удалось завершить установку модели")
+        if downloads is not None:
+            try:
+                downloads.shutdown()
+            except Exception:  # noqa: BLE001 — остальные ресурсы тоже нужно освободить
+                log.warning("Не удалось завершить очередь установки моделей")
         if runtime is not None:
             try:
                 runtime.shutdown()

@@ -30,6 +30,7 @@ from astra_voice.core.dictation import (
     TEST_MODEL_UNAVAILABLE,
     TEST_PREPARING,
     DictationPhase,
+    MicrophoneLevelUpdate,
     MicrophoneTestUpdate,
 )
 from astra_voice.core.model_source import resolve_model_request
@@ -2299,6 +2300,20 @@ def assert_recording_blocked(rig: Rig, *, loading: bool = False, offset: int = 0
     assert len(rig.capture_watchdogs) == captures
 
 
+# Решение заказчика от 2026-09-16 (m5): отказ запуска — notify_engine_failed, не F4.9.
+@pytest.mark.parametrize("reason", ["load-failed", "worker-error", "no-wav", "timeout", "no-match"])
+def test_selfcheck_failure_uses_distinct_notification(checking_rig: Rig, reason: str) -> None:
+    rig = checking_rig
+    rig.runtime._selfcheck_attempts = 2
+    rig.runtime._finish_selfcheck(reason)
+    if reason == "no-match":
+        rig.notify.notify_selfcheck_failed.assert_called_once_with()
+        rig.notify.notify_engine_failed.assert_not_called()
+    else:
+        rig.notify.notify_engine_failed.assert_called_once_with()
+        rig.notify.notify_selfcheck_failed.assert_not_called()
+
+
 def test_selfcheck_waits_for_match_before_ready(
     checking_rig: Rig, smoke_wav: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -2383,7 +2398,12 @@ def test_selfcheck_failure_blocks_dictation_once(
     rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
     rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
     rig.pill.hide.assert_not_called()
-    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    if reason == "no-match":
+        rig.notify.notify_selfcheck_failed.assert_called_once_with()
+        rig.notify.notify_engine_failed.assert_not_called()
+    else:
+        rig.notify.notify_engine_failed.assert_called_once_with()
+        rig.notify.notify_selfcheck_failed.assert_not_called()
     rig.stats.append.assert_called_once_with(
         "model_selfcheck",
         model_id="gigaam",
@@ -2400,7 +2420,12 @@ def test_selfcheck_failure_blocks_dictation_once(
     rig.event(type="error", utterance_id="file", message=MARKER)
     rig.tray.set_model_recheck_enabled.assert_called_with(True)
     on_event.assert_not_called()
-    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    if reason == "no-match":
+        rig.notify.notify_selfcheck_failed.assert_called_once_with()
+        rig.notify.notify_engine_failed.assert_not_called()
+    else:
+        rig.notify.notify_engine_failed.assert_called_once_with()
+        rig.notify.notify_selfcheck_failed.assert_not_called()
     rig.stats.append.assert_called_once()
     for offset in (0, 3):
         assert_recording_blocked(rig, offset=offset)
@@ -2556,7 +2581,12 @@ def test_selfcheck_second_transient_failure_blocks_without_third_attempt(
     rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
     rig.pill.show_state.assert_called_once_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
     rig.pill.hide.assert_not_called()
-    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    if second == "cancelled":
+        rig.notify.notify_selfcheck_failed.assert_called_once_with()
+        rig.notify.notify_engine_failed.assert_not_called()
+    else:
+        rig.notify.notify_engine_failed.assert_called_once_with()
+        rig.notify.notify_selfcheck_failed.assert_not_called()
     assert rig.stats.append.call_args_list == [
         call(
             "model_selfcheck",
@@ -2584,7 +2614,12 @@ def test_selfcheck_second_transient_failure_blocks_without_third_attempt(
     rig.paste.assert_not_called()
     assert rig.runtime.last_text is None
     assert rig.stats.append.call_count == 2
-    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    if second == "cancelled":
+        rig.notify.notify_selfcheck_failed.assert_called_once_with()
+        rig.notify.notify_engine_failed.assert_not_called()
+    else:
+        rig.notify.notify_engine_failed.assert_called_once_with()
+        rig.notify.notify_selfcheck_failed.assert_not_called()
     assert MARKER not in caplog.text
     assert "модель загружена" not in caplog.text
     assert MARKER not in repr(rig.stats.mock_calls + rig.notify.mock_calls + rig.pill.mock_calls)
@@ -2614,7 +2649,12 @@ def test_selfcheck_retry_engine_failure_blocks_immediately(
     rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
     rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
     rig.pill.hide.assert_not_called()
-    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    if reason == "no-match":
+        rig.notify.notify_selfcheck_failed.assert_called_once_with()
+        rig.notify.notify_engine_failed.assert_not_called()
+    else:
+        rig.notify.notify_engine_failed.assert_called_once_with()
+        rig.notify.notify_selfcheck_failed.assert_not_called()
     assert_recording_blocked(rig)
     assert "record.start" not in rig.trace
     assert_phase(rig.runtime, DictationPhase.IDLE)
@@ -2660,7 +2700,8 @@ def test_selfcheck_retry_setup_failure_blocks(
     assert rig.stats.append.call_args.kwargs["result"] == "fail"
     rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
     rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
-    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    rig.notify.notify_engine_failed.assert_called_once_with()
+    rig.notify.notify_selfcheck_failed.assert_not_called()
     assert_recording_blocked(rig)
     assert "record.start" not in rig.trace
     assert MARKER not in caplog.text
@@ -2808,7 +2849,12 @@ def test_selfcheck_outcome_is_logged_and_prd_stats_roundtrip(
         rig.tray.set_state.assert_called_with(TrayState.ERROR)
         rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
         rig.pill.hide.assert_not_called()
-        rig.notify.notify_selfcheck_failed.assert_called_once_with()
+        if reason in ("no-match", "cancelled"):
+            rig.notify.notify_selfcheck_failed.assert_called_once_with()
+            rig.notify.notify_engine_failed.assert_not_called()
+        else:
+            rig.notify.notify_engine_failed.assert_called_once_with()
+            rig.notify.notify_selfcheck_failed.assert_not_called()
         rig.hotkey.fsm.press(rig.now)
         assert_phase(rig.runtime, DictationPhase.IDLE)
         assert "record.start" not in rig.trace
@@ -2835,7 +2881,8 @@ def test_selfcheck_missing_reference_blocks_dictation_with_warning(
     rig.pill.hide.assert_not_called()
     rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
     rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
-    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    rig.notify.notify_engine_failed.assert_called_once_with()
+    rig.notify.notify_selfcheck_failed.assert_not_called()
     assert "transcribe.file" not in rig.trace
     assert not rig.runtime.timers
     assert rig.stats.append.call_args_list == [
@@ -2856,7 +2903,8 @@ def test_selfcheck_missing_reference_blocks_dictation_with_warning(
     assert "record.start" not in rig.trace
     assert_phase(rig.runtime, DictationPhase.IDLE)
     assert rig.stats.append.call_count == 2
-    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    rig.notify.notify_engine_failed.assert_called_once_with()
+    rig.notify.notify_selfcheck_failed.assert_not_called()
     rig.paste.assert_not_called()
 
 
@@ -2872,7 +2920,8 @@ def test_selfcheck_send_error_is_private_failure(
     rig.tray.set_model_recheck_enabled.assert_called_with(True)
     assert rig.runtime._model_load_failures == 0
     assert not rig.runtime.timers
-    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    rig.notify.notify_engine_failed.assert_called_once_with()
+    rig.notify.notify_selfcheck_failed.assert_not_called()
     assert rig.stats.append.call_args.kwargs["result"] == "fail"
     assert_selfcheck_log(caplog, "worker-error", 1)
     assert rig.stats.append.call_args.kwargs["engine_version"] == ""
@@ -3090,7 +3139,8 @@ def test_selfcheck_tray_recheck_recovers_or_blocks_again(
     else:
         rig.tray.set_state.assert_called_with(TrayState.ERROR)
         rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
-        assert rig.notify.notify_selfcheck_failed.call_count == 2
+        assert rig.notify.notify_selfcheck_failed.call_count == (1 if exhausted else 2)
+        assert rig.notify.notify_engine_failed.call_count == (1 if exhausted else 0)
     if success:
         rig.hotkey.fsm.press(rig.now + 9)
         assert rig.supervisor.send.call_args.args[0]["type"] == "record.start"
@@ -3109,7 +3159,8 @@ def test_selfcheck_tray_recheck_worker_start_failure_remains_available(checking_
     rig.tray.set_model_recheck_enabled.assert_called_with(True)
     rig.tray.set_state.assert_called_with(TrayState.ERROR)
     rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
-    assert rig.notify.notify_selfcheck_failed.call_count == 2
+    rig.notify.notify_selfcheck_failed.assert_called_once_with()
+    rig.notify.notify_engine_failed.assert_called_once_with()
     assert_recording_blocked(rig)
     assert "record.start" not in rig.trace
 
@@ -3516,6 +3567,7 @@ def microphone_runtime(
             "onboarding_step": 4,
             "onboarding_language_set": True,
             "model_dir": "/tmp/model" if model else None,
+            "onboarding_model_ready": model,
         }
     )
     rig = Rig(monkeypatch, settings, supervisor_factory=factory, model_store=store)
@@ -3822,4 +3874,47 @@ def test_microphone_loads_model_installed_in_wizard_before_finish(
     assert requests[0]["revision"] == "r2"
     assert requests[-1]["device"] == "selected-mic"
     assert not rig.runtime.settings.extra.get("onboarding_done")
+    rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("selfcheck", ["idle", "running", "failed"])
+def test_level_runtime_does_not_prepare_model(
+    monkeypatch: pytest.MonkeyPatch, selfcheck: str
+) -> None:
+    rig = microphone_runtime(monkeypatch, model=False)
+    rig.runtime._selfcheck = selfcheck
+    resolve = Mock(side_effect=AssertionError("Модель не нужна"))
+    restart = Mock(side_effect=AssertionError("Перезапуск не нужен"))
+    monkeypatch.setattr(module, "resolve_model_request", resolve)
+    monkeypatch.setattr(rig.runtime, "restart_worker", restart)
+    send = Mock(wraps=rig.runtime.supervisor.send)
+    monkeypatch.setattr(rig.runtime.supervisor, "send", send)
+    host = _RuntimeOnboardingHost(rig.runtime, Mock())
+    updates: list[MicrophoneLevelUpdate] = []
+    assert host.start_level_monitor("selected", updates.append)
+    assert updates == [MicrophoneLevelUpdate("listening")]
+    assert send.call_args.args[0]["type"] == "record.start"
+    host.stop_level_monitor()
+    assert [c.args[0]["type"] for c in send.call_args_list] == ["record.start", "record.cancel"]
+    assert rig.runtime._pending_test is None
+    resolve.assert_not_called()
+    restart.assert_not_called()
+    rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("unavailable", ["not-started", "closed", "stopped", "busy"])
+def test_level_runtime_unavailable(monkeypatch: pytest.MonkeyPatch, unavailable: str) -> None:
+    rig = microphone_runtime(monkeypatch, model=False)
+    if unavailable == "not-started":
+        rig.runtime._started = False
+    elif unavailable == "closed":
+        rig.runtime.shutdown()
+    elif unavailable == "stopped":
+        rig.runtime.supervisor.state = "stopped"
+    else:
+        assert rig.runtime.start_level_monitor("", Mock())
+    updates: list[MicrophoneLevelUpdate] = []
+    assert not rig.runtime.start_level_monitor("", updates.append)
+    assert updates[-1].state == "error"
+    assert updates[-1].message
     rig.runtime.shutdown()

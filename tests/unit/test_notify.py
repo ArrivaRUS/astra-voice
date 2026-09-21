@@ -56,6 +56,15 @@ def _arguments(message: QDBusMessage) -> list[Any]:
     return cast(list[Any], message.setArguments.call_args.args[0])
 
 
+def test_engine_failed_notification_message_and_details(transport: Mock) -> None:
+    assert "notify_engine_failed" in notifications.__all__
+    notifications.notify_engine_failed()
+    args = _arguments(transport.bus.call.call_args.args[0])
+    assert args[3:5] == ["Не удалось запустить распознавание", "Попробуйте переустановить модель."]
+    assert args[5].value() == ["show-details", "Подробности"]
+    assert args[6]["urgency"].value() == b"\x02"
+
+
 @pytest.mark.parametrize(("urgency", "expected"), [("low", 0), ("normal", 1), ("critical", 2)])
 def test_notify_arguments(transport: Mock, urgency: str, expected: int) -> None:
     notifications.notify("Заголовок", "Сообщение", urgency=urgency)
@@ -957,3 +966,12 @@ def test_onboarding_ready_message(transport: Mock, combo: str) -> None:
 )
 def test_ast_rejects_onboarding_dictation(source: str) -> None:
     assert _notification_violations(source)
+
+
+def test_model_installed_message(transport: Mock) -> None:
+    notifications.notify_model_installed()
+    args = _arguments(transport.bus.call.call_args.args[0])
+    assert args[3:5] == ["Модель установлена", "Можно диктовать."]
+    assert args[5].value() == []
+    assert args[6]["urgency"].value() == b"\x01"
+    assert "notify_model_installed" in notifications.__all__
