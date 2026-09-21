@@ -22,7 +22,14 @@ EXPECTED_FILES = (
 ONBOARDING_FILES = sorted(ONBOARDING.glob("*.qml"))
 COMPONENTS = [
     REPO / "qml/components" / f"{name}.qml"
-    for name in ("NoteBanner", "CaptureField", "OnboardingModelCard", "LevelMeter", "AvDialog")
+    for name in (
+        "NoteBanner",
+        "CaptureField",
+        "OnboardingModelCard",
+        "DownloadStrip",
+        "LevelMeter",
+        "AvDialog",
+    )
 ]
 UI_FILES = ONBOARDING_FILES + COMPONENTS
 MAIN = REPO / "qml/Main.qml"
@@ -129,17 +136,18 @@ def test_onboarding_step_labels() -> None:
         (
             "OnboardingModelCard",
             (
-                "downloadable",
+                "available",
+                "queued",
                 "downloading",
                 "verifying",
-                "installing",
                 "installed",
-                "broken",
-                "no-network",
+                "failed",
                 "no-space",
-                "no-ram",
-                "cancelled",
             ),
+        ),
+        (
+            "DownloadStrip",
+            ("idle", "downloading", "verifying", "done", "failed", "no-space"),
         ),
     ],
 )

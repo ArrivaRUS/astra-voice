@@ -1,5 +1,5 @@
 // Раздел «Общие» — референс design/refs/01-general-base.png (+ -dark), спека §3.
-// Семь настроек в трёх группах. Без моста настроек используются дефолты M1.
+// Восемь настроек в трёх группах. Без моста настроек используются дефолты M1.
 import QtQuick 2.15
 import QtQuick.Layouts 1.15
 import ".."
@@ -12,6 +12,7 @@ Column {
     readonly property string hotkeyStatus: settings ? settings.hotkeyStatus : "ok"
     readonly property string saveError: root.settings ? root.settings.saveError : ""
     readonly property string modelSelfcheck: root.settings ? root.settings.modelSelfcheck : ""
+    readonly property string activeModelState: root.settings ? root.settings.activeModelState : "none"
 
     function isLocked(name) {
         return settings && settings.lockedSettings
@@ -51,11 +52,63 @@ Column {
         width: root.width
         title: qsTr("Диктовка")
 
+        SettingRow {
+            width: parent.width
+            divider: false
+            label: qsTr("Модель распознавания")
+            sub: !root.settings || root.activeModelState === "none" || root.settings.activeModelName === ""
+                ? qsTr("Модель не установлена")
+                : root.settings.activeModelSize !== ""
+                    ? qsTr("%1 · %2 на диске").arg(root.settings.activeModelName).arg(root.settings.activeModelSize)
+                    : root.settings.activeModelName
+
+            Text {
+                textFormat: Text.PlainText
+                text: {
+                    if (root.activeModelState === "downloading" || root.activeModelState === "verifying") {
+                        var parts = []
+                        if (root.settings.downloadTitle !== "")
+                            parts.push(root.settings.downloadTitle)
+                        if (root.settings.eta !== "")
+                            parts.push(root.settings.eta)
+                        return parts.join(" · ")
+                    }
+                    if (root.activeModelState === "broken")
+                        return qsTr("Файлы модели не читаются")
+                    if (root.activeModelState === "failed")
+                        return qsTr("Не удалось загрузить модель")
+                    if (root.activeModelState === "no-space")
+                        return qsTr("Не хватает места на диске")
+                    return ""
+                }
+                visible: text !== ""
+                color: root.activeModelState === "downloading" || root.activeModelState === "verifying"
+                    ? Theme.fgMuted : Theme.dangerInk
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                renderType: Text.NativeRendering
+                wrapMode: Text.WordWrap
+                Layout.maximumWidth: root.width / 4
+                Layout.alignment: Qt.AlignVCenter
+            }
+
+            // Слота «Установить модель» (§3.3, модели нет) в мосте нет:
+            // «Переустановить» просто неактивна; тихую заглушку ставить нельзя.
+            AvButton {
+                text: qsTr("Переустановить")
+                small: true
+                iconName: "refresh"
+                enabled: root.settings !== null && root.activeModelState !== "none"
+                    && root.activeModelState !== "downloading" && root.activeModelState !== "verifying"
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: if (root.settings) root.settings.reinstallActiveModel()
+            }
+        }
+
         // Кнопки «Повторить» нет по решению заказчика от 15.09.2026 (PRD 0.8 F2.11):
         // бэкенд выполняет автоповтор раз в 30 секунд.
         SettingRow {
             width: parent.width
-            divider: false
             label: qsTr("Горячая клавиша")
             sub: qsTr("Удерживайте и говорите — текст появится там, где курсор")
             locked: root.isLocked("hotkey")
@@ -155,7 +208,7 @@ Column {
             width: parent.width
             divider: false
             label: qsTr("Индикатор записи")
-            sub: qsTr("Пилюля не забирает фокус и не появляется в Alt+Tab")
+            sub: qsTr("Показывает, что идёт запись")
             locked: root.isLocked("pill_enabled")
 
             AvSelect {

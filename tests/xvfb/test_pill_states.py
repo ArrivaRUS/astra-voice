@@ -3,7 +3,7 @@
 xvfb в системе не установлен. Запуск без X-сервера:
 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software pytest -m xvfb.
 Снимки всегда включают поля тени 18/18/18/24 px и принимаются только при альфе
-фона 240 ± 1 в центре пилюли. Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR
+фона 240 ± 1 в центре пилюли. Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_PILL
 или по умолчанию design/refs/impl/pill. PNG публикуются из временного каталога
 атомарной заменой только при изменении пикселей (или отсутствии читаемого PNG)
 и после успешных проверок всего модуля; метаданные PNG не учитываются.
@@ -30,7 +30,7 @@ from helpers.qt_app import get_qapplication  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-SNAPSHOTS = REPO / Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR") or "design/refs/impl/pill")
+SNAPSHOTS = REPO / Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_PILL") or "design/refs/impl/pill")
 LABELS = {
     "hidden": "",
     "loading-model": "Загружаю модель…",

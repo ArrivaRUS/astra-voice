@@ -1,5 +1,7 @@
 """Пять шагов и настройки в двух темах: Qt5, состояния мостов и детерминированные PNG.
 
+Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING
+или по умолчанию design/refs/impl/onboarding.
 Все записи тестов, включая временные PNG, ограничены SNAPSHOTS. Публикация
 через os.replace выполняется в teardown только после успеха всего модуля.
 """
@@ -10,6 +12,7 @@ import os
 import sys
 import tempfile
 from collections.abc import Callable, Iterator
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -22,6 +25,7 @@ from PyQt5.QtCore import (
     QIODevice,
     QMetaObject,
     QObject,
+    QPointF,
     Qt,
     QUrl,
     pyqtProperty,
@@ -40,29 +44,18 @@ from helpers.qt_app import get_qapplication  # noqa: E402
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
 # Промежуточные прогоны разработки не трогают эталоны репозитория.
-SNAPSHOTS = REPO / Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR") or "design/refs/impl/onboarding")
+SNAPSHOTS = REPO / Path(
+    os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING") or "design/refs/impl/onboarding"
+)
 WIDTH, HEIGHT = 900, 588
-STEP_NAMES = {
-    1: "01-welcome",
-    2: "02-model",
-    3: "03-hotkey",
-    4: "04-mic",
-    5: "05-done",
-    6: "06-settings-general",
-}
-CASES = [(step, dark) for step in STEP_NAMES for dark in (False, True)]
 MODEL_STATES = (
-    "absent",
-    "downloadable",
+    "available",
+    "queued",
     "downloading",
     "verifying",
-    "installing",
     "installed",
-    "broken",
-    "no-network",
+    "failed",
     "no-space",
-    "no-ram",
-    "cancelled",
 )
 CAPTURE_STATES = (
     "idle",
@@ -119,18 +112,37 @@ class FakeOnboarding(QObject):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[str] = []
+        self.toggled_model_ids: list[str] = []
         self._step: int = 1
         self._policyLocked: bool = False
         self._policyLockedText: str = "Задано администратором"
-        self._modelState: str = "downloadable"
-        self._modelName: str = "GigaAM v3 RNN-T"
-        self._modelSize: str = "231,9 МБ"
-        self._modelRam: str = "415 МБ"
-        self._modelHost: str = "huggingface.co"
-        self._modelMessage: str = ""
-        self._progress: float = 0.43
+        self._models: list[dict[str, Any]] = [
+            {
+                "id": "gigaam-v3-rnnt",
+                "name": "GigaAM v3 RNN-T",
+                "description": "Русская диктовка с пунктуацией — по умолчанию",
+                "host": "huggingface.co",
+                "recommended": True,
+                "sizeBytes": 226431968,
+                "sizeText": "226 МБ",
+                "ramText": "768 МБ",
+                "selected": False,
+                "badge": "",
+                "state": "available",
+                "message": "",
+                "progress": 0.0,
+            },
+        ]
+        self._selectionSummary: str = ""
+        self._selectionFits: bool = True
+        self._selectionMessage: str = ""
+        self._canContinueFromModel: bool = False
+        self._modelReady: bool = True
+        self._downloadState: str = "idle"
+        self._downloadProgress: float = 0.0
+        self._downloadTitle: str = ""
         self._speed: str = "5,2 МБ/с"
-        self._eta: str = "~25 с"
+        self._eta: str = "осталось ~3 мин"
         self._hotkey: str = "Ctrl + Space"
         self._hotkeyMode: str = "ptt"
         self._captureState: str = "idle"
@@ -144,6 +156,8 @@ class FakeOnboarding(QObject):
         self._device: str = ""
         self._deviceResolved: str = "Встроенный микрофон"
         self._level: float = 1.0
+        self._levelState: str = "listening"
+        self._levelMessage: str = ""
         self._peak: str = "−18 дБ"
         self._testDuration: str = "0,31 с"
         self._testPhrase: str = "Сегодня хороший день для прогулки."
@@ -184,68 +198,101 @@ class FakeOnboarding(QObject):
         str, _get_policyLockedText, _set_policyLockedText, notify=changed
     )
 
-    def _get_modelState(self) -> str:
-        return self._modelState
+    def _get_models(self) -> list[dict[str, Any]]:
+        return self._models
 
-    def _set_modelState(self, value: str) -> None:
-        self._modelState = value
+    def _set_models(self, value: list[dict[str, Any]]) -> None:
+        self._models = value
         self.changed.emit()
 
-    modelState = pyqtProperty(str, _get_modelState, _set_modelState, notify=changed)
+    models = pyqtProperty("QVariantList", _get_models, _set_models, notify=changed)
 
-    def _get_modelName(self) -> str:
-        return self._modelName
+    def _get_selectionSummary(self) -> str:
+        return self._selectionSummary
 
-    def _set_modelName(self, value: str) -> None:
-        self._modelName = value
+    def _set_selectionSummary(self, value: str) -> None:
+        self._selectionSummary = value
         self.changed.emit()
 
-    modelName = pyqtProperty(str, _get_modelName, _set_modelName, notify=changed)
+    selectionSummary = pyqtProperty(
+        str, _get_selectionSummary, _set_selectionSummary, notify=changed
+    )
 
-    def _get_modelSize(self) -> str:
-        return self._modelSize
+    def _get_selectionFits(self) -> bool:
+        return self._selectionFits
 
-    def _set_modelSize(self, value: str) -> None:
-        self._modelSize = value
+    def _set_selectionFits(self, value: bool) -> None:
+        self._selectionFits = value
         self.changed.emit()
 
-    modelSize = pyqtProperty(str, _get_modelSize, _set_modelSize, notify=changed)
+    selectionFits = pyqtProperty(bool, _get_selectionFits, _set_selectionFits, notify=changed)
 
-    def _get_modelRam(self) -> str:
-        return self._modelRam
+    def _get_selectionMessage(self) -> str:
+        return self._selectionMessage
 
-    def _set_modelRam(self, value: str) -> None:
-        self._modelRam = value
+    def _set_selectionMessage(self, value: str) -> None:
+        self._selectionMessage = value
         self.changed.emit()
 
-    modelRam = pyqtProperty(str, _get_modelRam, _set_modelRam, notify=changed)
+    selectionMessage = pyqtProperty(
+        str, _get_selectionMessage, _set_selectionMessage, notify=changed
+    )
 
-    def _get_modelHost(self) -> str:
-        return self._modelHost
+    def _get_canContinueFromModel(self) -> bool:
+        return self._canContinueFromModel
 
-    def _set_modelHost(self, value: str) -> None:
-        self._modelHost = value
+    def _set_canContinueFromModel(self, value: bool) -> None:
+        self._canContinueFromModel = value
         self.changed.emit()
 
-    modelHost = pyqtProperty(str, _get_modelHost, _set_modelHost, notify=changed)
+    canContinueFromModel = pyqtProperty(
+        bool, _get_canContinueFromModel, _set_canContinueFromModel, notify=changed
+    )
 
-    def _get_modelMessage(self) -> str:
-        return self._modelMessage
+    def _get_modelReady(self) -> bool:
+        return self._modelReady
 
-    def _set_modelMessage(self, value: str) -> None:
-        self._modelMessage = value
+    def _set_modelReady(self, value: bool) -> None:
+        self._modelReady = value
+        # В настоящем мосте canFinish вычисляется из modelReady.
+        self._canFinish = value
         self.changed.emit()
 
-    modelMessage = pyqtProperty(str, _get_modelMessage, _set_modelMessage, notify=changed)
+    modelReady = pyqtProperty(bool, _get_modelReady, _set_modelReady, notify=changed)
 
-    def _get_progress(self) -> float:
-        return self._progress
+    def _get_totalSteps(self) -> int:
+        return 5
 
-    def _set_progress(self, value: float) -> None:
-        self._progress = value
+    totalSteps = pyqtProperty(int, _get_totalSteps, notify=changed)
+
+    def _get_downloadState(self) -> str:
+        return self._downloadState
+
+    def _set_downloadState(self, value: str) -> None:
+        self._downloadState = value
         self.changed.emit()
 
-    progress = pyqtProperty(float, _get_progress, _set_progress, notify=changed)
+    downloadState = pyqtProperty(str, _get_downloadState, _set_downloadState, notify=changed)
+
+    def _get_downloadProgress(self) -> float:
+        return self._downloadProgress
+
+    def _set_downloadProgress(self, value: float) -> None:
+        self._downloadProgress = value
+        self.changed.emit()
+
+    downloadProgress = pyqtProperty(
+        float, _get_downloadProgress, _set_downloadProgress, notify=changed
+    )
+
+    def _get_downloadTitle(self) -> str:
+        return self._downloadTitle
+
+    def _set_downloadTitle(self, value: str) -> None:
+        self._downloadTitle = value
+        self.changed.emit()
+
+    downloadTitle = pyqtProperty(str, _get_downloadTitle, _set_downloadTitle, notify=changed)
 
     def _get_speed(self) -> str:
         return self._speed
@@ -352,6 +399,24 @@ class FakeOnboarding(QObject):
 
     level = pyqtProperty(float, _get_level, _set_level, notify=changed)
 
+    def _get_levelState(self) -> str:
+        return self._levelState
+
+    def _set_levelState(self, value: str) -> None:
+        self._levelState = value
+        self.changed.emit()
+
+    levelState = pyqtProperty(str, _get_levelState, _set_levelState, notify=changed)
+
+    def _get_levelMessage(self) -> str:
+        return self._levelMessage
+
+    def _set_levelMessage(self, value: str) -> None:
+        self._levelMessage = value
+        self.changed.emit()
+
+    levelMessage = pyqtProperty(str, _get_levelMessage, _set_levelMessage, notify=changed)
+
     def _get_peak(self) -> str:
         return self._peak
 
@@ -456,13 +521,22 @@ class FakeOnboarding(QObject):
     def skip(self) -> None:
         self.calls.append("skip")
 
-    @pyqtSlot()
-    def download(self) -> None:
-        self.calls.append("download")
+    @pyqtSlot(str)
+    def toggleModel(self, model_id: str) -> None:
+        self.calls.append("toggleModel")
+        self.toggled_model_ids.append(model_id)
 
     @pyqtSlot()
-    def cancelDownload(self) -> None:
-        self.calls.append("cancelDownload")
+    def startSelectedDownloads(self) -> None:
+        self.calls.append("startSelectedDownloads")
+
+    @pyqtSlot(str)
+    def retryModel(self, model_id: str) -> None:
+        self.calls.append("retryModel")
+
+    @pyqtSlot()
+    def cancelDownloads(self) -> None:
+        self.calls.append("cancelDownloads")
 
     @pyqtSlot(str)
     def installFromPath(self, path: str) -> None:
@@ -493,6 +567,14 @@ class FakeOnboarding(QObject):
         self.calls.append("refreshCandidates")
 
     @pyqtSlot()
+    def startLevelMonitor(self) -> None:
+        self.calls.append("startLevelMonitor")
+
+    @pyqtSlot()
+    def stopLevelMonitor(self) -> None:
+        self.calls.append("stopLevelMonitor")
+
+    @pyqtSlot()
     def startTest(self) -> None:
         self.calls.append("startTest")
 
@@ -512,6 +594,7 @@ class FakeSettings(QObject):
 
     def __init__(self) -> None:
         super().__init__()
+        self.calls: list[str] = []
         self._hotkey: str = "Ctrl + Space"
         self._hotkeyMode: str = "ptt"
         self._pillEnabled: bool = True
@@ -524,6 +607,14 @@ class FakeSettings(QObject):
         self._lockedSettings: list[str] = []
         self._saveError: str = ""
         self._modelSelfcheck: str = "idle"
+        self._activeModelName: str = "GigaAM v3 RNN-T"
+        self._activeModelSize: str = "226 МБ"
+        self._activeModelState: str = "ok"
+        self._downloadState: str = "idle"
+        self._downloadProgress: float = 0.0
+        self._downloadTitle: str = ""
+        self._speed: str = ""
+        self._eta: str = ""
 
     def _get_hotkey(self) -> str:
         return self._hotkey
@@ -629,6 +720,86 @@ class FakeSettings(QObject):
 
     modelSelfcheck = pyqtProperty(str, _get_modelSelfcheck, notify=changed)
 
+    def _get_activeModelName(self) -> str:
+        return self._activeModelName
+
+    def _set_activeModelName(self, value: str) -> None:
+        self._activeModelName = value
+        self.changed.emit()
+
+    activeModelName = pyqtProperty(str, _get_activeModelName, _set_activeModelName, notify=changed)
+
+    def _get_activeModelSize(self) -> str:
+        return self._activeModelSize
+
+    def _set_activeModelSize(self, value: str) -> None:
+        self._activeModelSize = value
+        self.changed.emit()
+
+    activeModelSize = pyqtProperty(str, _get_activeModelSize, _set_activeModelSize, notify=changed)
+
+    def _get_activeModelState(self) -> str:
+        return self._activeModelState
+
+    def _set_activeModelState(self, value: str) -> None:
+        self._activeModelState = value
+        self.changed.emit()
+
+    activeModelState = pyqtProperty(
+        str, _get_activeModelState, _set_activeModelState, notify=changed
+    )
+
+    def _get_downloadState(self) -> str:
+        return self._downloadState
+
+    def _set_downloadState(self, value: str) -> None:
+        self._downloadState = value
+        self.changed.emit()
+
+    downloadState = pyqtProperty(str, _get_downloadState, _set_downloadState, notify=changed)
+
+    def _get_downloadProgress(self) -> float:
+        return self._downloadProgress
+
+    def _set_downloadProgress(self, value: float) -> None:
+        self._downloadProgress = value
+        self.changed.emit()
+
+    downloadProgress = pyqtProperty(
+        float, _get_downloadProgress, _set_downloadProgress, notify=changed
+    )
+
+    def _get_downloadTitle(self) -> str:
+        return self._downloadTitle
+
+    def _set_downloadTitle(self, value: str) -> None:
+        self._downloadTitle = value
+        self.changed.emit()
+
+    downloadTitle = pyqtProperty(str, _get_downloadTitle, _set_downloadTitle, notify=changed)
+
+    def _get_speed(self) -> str:
+        return self._speed
+
+    def _set_speed(self, value: str) -> None:
+        self._speed = value
+        self.changed.emit()
+
+    speed = pyqtProperty(str, _get_speed, _set_speed, notify=changed)
+
+    def _get_eta(self) -> str:
+        return self._eta
+
+    def _set_eta(self, value: str) -> None:
+        self._eta = value
+        self.changed.emit()
+
+    eta = pyqtProperty(str, _get_eta, _set_eta, notify=changed)
+
+    @pyqtSlot()
+    def reinstallActiveModel(self) -> None:
+        self.calls.append("reinstallActiveModel")
+
     @pyqtSlot(str, result=bool)
     def is_locked(self, name: str) -> bool:
         return False
@@ -636,6 +807,70 @@ class FakeSettings(QObject):
     @pyqtSlot()
     def retryHotkey(self) -> None:
         pass
+
+
+def configure_onboarding(step: int, **properties: Any) -> FakeOnboarding:
+    fake = FakeOnboarding()
+    fake.step = step
+    for name, value in properties.items():
+        setattr(fake, name, value)
+    return fake
+
+
+def configure_selected_model() -> FakeOnboarding:
+    fake = configure_onboarding(
+        2, selectionSummary="Будет скачано 226 МБ", canContinueFromModel=True
+    )
+    fake.models = [{**fake.models[0], "selected": True}, *fake.models[1:]]
+    return fake
+
+
+def configure_mic() -> FakeOnboarding:
+    fake = configure_onboarding(4)
+    fake.models = [{**fake.models[0], "badge": "active", "state": "installed", "selected": True}]
+    return fake
+
+
+SNAPSHOT_SETUPS: dict[str, Callable[[], FakeOnboarding | FakeSettings]] = {
+    "01-welcome": partial(configure_onboarding, 1),
+    "02-model": partial(configure_onboarding, 2),
+    "02-model-selected": configure_selected_model,
+    "03-hotkey": partial(configure_onboarding, 3),
+    "03-hotkey-progress": partial(
+        configure_onboarding,
+        3,
+        downloadState="downloading",
+        downloadProgress=0.43,
+        downloadTitle="Загружается GigaAM v3 RNN-T",
+        speed="5,2 МБ/с",
+        eta="осталось ~3 мин",
+    ),
+    "04-mic": configure_mic,
+    "04-mic-downloading": partial(
+        configure_onboarding,
+        4,
+        modelReady=False,
+        downloadState="verifying",
+        downloadTitle="Проверяю модель…",
+        testState="idle",
+        testText="",
+        testDuration="",
+    ),
+    "05-done": partial(configure_onboarding, 5),
+    "05-done-waiting": partial(
+        configure_onboarding,
+        5,
+        modelReady=False,
+        canFinish=False,
+        downloadState="downloading",
+        downloadProgress=0.43,
+        downloadTitle="Загружается GigaAM v3 RNN-T",
+        speed="5,2 МБ/с",
+        eta="осталось ~3 мин",
+    ),
+    "06-settings-general": FakeSettings,
+}
+CASES = [(name, dark) for name in SNAPSHOT_SETUPS for dark in (False, True)]
 
 
 @pytest.fixture(scope="session")
@@ -650,8 +885,45 @@ def visual_tree(root: Any) -> Iterator[Any]:
         yield from visual_tree(child)
 
 
-def snapshot_name(step: int, dark: bool) -> str:
-    return f"{STEP_NAMES[step]}-{'dark' if dark else 'light'}.png"
+def visible_texts(root: Any) -> set[str]:
+    return {
+        item.property("text")
+        for item in visual_tree(root)
+        if item.isVisible() and isinstance(item.property("text"), str)
+    }
+
+
+def visible_button(root: Any, text: str) -> Any:
+    buttons = [
+        item
+        for item in visual_tree(root)
+        if item.isVisible()
+        and item.property("text") == text
+        and item.metaObject().indexOfSignal(b"clicked()") >= 0
+    ]
+    assert len(buttons) == 1, f"ожидалась одна кнопка «{text}», найдено {len(buttons)}"
+    return buttons[0]
+
+
+def click_item(item: Any) -> None:
+    assert item.isVisible()
+    position = item.mapToScene(QPointF(item.width() / 2, item.height() / 2))
+    QTest.mouseClick(item.window(), Qt.LeftButton, Qt.NoModifier, position.toPoint())
+
+
+def microphone_card(root: Any) -> Any:
+    group = next(
+        item for item in visual_tree(root) if item.property("title") == "Проверка микрофона"
+    )
+    cards = [
+        item for item in visual_tree(group) if item.metaObject().indexOfProperty("rowData") >= 0
+    ]
+    assert len(cards) == 1
+    return cards[0]
+
+
+def snapshot_name(name: str, dark: bool) -> str:
+    return f"{name}-{'dark' if dark else 'light'}.png"
 
 
 def assert_frame(image: QImage) -> None:
@@ -725,6 +997,10 @@ def render_onboarding(
         assert view.status() == QQuickView.Ready, [error.toString() for error in view.errors()]
         root = view.rootObject()
         assert root is not None
+        assert root.setProperty("freezeAnimations", True), (
+            "в QML нет свойства freezeAnimations — заморозка анимаций не сработала"
+        )
+        assert root.property("freezeAnimations") is True
         view.show()
         QTest.qWait(180 + extra_wait_ms)
         app.processEvents()
@@ -736,7 +1012,7 @@ def render_onboarding(
         ), f"не показан шаг {fake.step}"
         assert view.isVisible() and view.isExposed()
 
-        image = grab_frame(app, view, snapshot_name(fake.step, dark))
+        image = grab_frame(app, view, f"step={fake.step}, dark={dark}")
         if inspect is not None:
             inspect(root)
             app.processEvents()
@@ -751,7 +1027,14 @@ def render_onboarding(
             qInstallMessageHandler(previous)
 
 
-def render_settings(app: Any, dark: bool, *, extra_wait_ms: int = 0) -> tuple[QImage, list[str]]:
+def render_settings(
+    app: Any,
+    dark: bool,
+    *,
+    fake: FakeSettings | None = None,
+    extra_wait_ms: int = 0,
+    inspect: Callable[[Any], None] | None = None,
+) -> tuple[QImage, list[str]]:
     """Загружает раздел «Общие» настоящего Main.qml без appInfo."""
     messages: list[str] = []
 
@@ -761,7 +1044,7 @@ def render_settings(app: Any, dark: bool, *, extra_wait_ms: int = 0) -> tuple[QI
     previous = qInstallMessageHandler(handler)
     engine = QQmlApplicationEngine()
     theme = FakeTheme(dark)
-    settings = FakeSettings()
+    settings = fake if fake is not None else FakeSettings()
     try:
         engine.rootContext().setContextProperty("themeSource", theme)
         engine.rootContext().setContextProperty("showOnboarding", False)
@@ -794,13 +1077,17 @@ def render_settings(app: Any, dark: bool, *, extra_wait_ms: int = 0) -> tuple[QI
             item.isVisible() and item.property("text") == "Диктовка, индикация и запуск"
             for item in visual_tree(window.contentItem())
         ), "не показан раздел «Общие»"
-        image = grab_frame(app, window, snapshot_name(6, dark))
+        image = grab_frame(app, window, snapshot_name("06-settings-general", dark))
+        if inspect is not None:
+            inspect(window)
+            app.processEvents()
         return image, messages
     finally:
         # Движок владеет окном; контекстные объекты удаляются после него.
         try:
             sip.delete(engine)
-            sip.delete(settings)
+            if fake is None:
+                sip.delete(settings)
             sip.delete(theme)
             app.processEvents()
         finally:
@@ -900,12 +1187,11 @@ def test_show_section_only_navigates_to_available_pages(onboarding_app: Any, dar
 
 
 def render_case(
-    app: Any, step: int, dark: bool, *, extra_wait_ms: int = 0
+    app: Any, name: str, dark: bool, *, extra_wait_ms: int = 0
 ) -> tuple[QImage, list[str]]:
-    if step == 6:
-        return render_settings(app, dark, extra_wait_ms=extra_wait_ms)
-    fake = FakeOnboarding()
-    fake.step = step
+    fake = SNAPSHOT_SETUPS[name]()
+    if isinstance(fake, FakeSettings):
+        return render_settings(app, dark, fake=fake, extra_wait_ms=extra_wait_ms)
     return render_onboarding(app, fake, dark, extra_wait_ms=extra_wait_ms)
 
 
@@ -938,21 +1224,21 @@ def assert_saved_snapshot(path: Path, original: QImage) -> None:
 @pytest.fixture(scope="module", autouse=True)
 def rendered_steps(
     onboarding_app: Any, request: pytest.FixtureRequest
-) -> Iterator[dict[tuple[int, bool], tuple[QImage, list[str], Path]]]:
-    """Готовит двенадцать кадров; публикует их только после успеха всех тестов модуля."""
+) -> Iterator[dict[tuple[str, bool], tuple[QImage, list[str], Path]]]:
+    """Готовит двадцать кадров; публикует их только после успеха всех тестов модуля."""
     failures_before = request.session.testsfailed
     SNAPSHOTS.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".onboarding-", dir=SNAPSHOTS) as temporary:
         staging = Path(temporary)
-        rendered: dict[tuple[int, bool], tuple[QImage, list[str], Path]] = {}
-        for step, dark in CASES:
-            image, messages = render_case(onboarding_app, step, dark)
-            name = snapshot_name(step, dark)
-            assert_no_messages(messages, name)
-            path = staging / name
+        rendered: dict[tuple[str, bool], tuple[QImage, list[str], Path]] = {}
+        for name, dark in CASES:
+            image, messages = render_case(onboarding_app, name, dark)
+            filename = snapshot_name(name, dark)
+            assert_no_messages(messages, filename)
+            path = staging / filename
             assert image.save(str(path), "PNG"), f"не удалось сохранить {path}"
             assert_saved_snapshot(path, image)
-            rendered[step, dark] = image, messages, path
+            rendered[name, dark] = image, messages, path
         yield rendered
         if request.session.testsfailed == failures_before:
             for image, messages, path in rendered.values():
@@ -967,25 +1253,25 @@ def rendered_steps(
                     (SNAPSHOTS / f"step{step}-{theme}.png").unlink(missing_ok=True)
 
 
-@pytest.mark.parametrize("step", STEP_NAMES, ids=STEP_NAMES.values())
+@pytest.mark.parametrize("name", SNAPSHOT_SETUPS)
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_steps_render_without_warnings(
-    step: int,
+    name: str,
     dark: bool,
-    rendered_steps: dict[tuple[int, bool], tuple[QImage, list[str], Path]],
+    rendered_steps: dict[tuple[str, bool], tuple[QImage, list[str], Path]],
 ) -> None:
-    image, messages, _ = rendered_steps[step, dark]
-    assert_no_messages(messages, snapshot_name(step, dark))
+    image, messages, _ = rendered_steps[name, dark]
+    assert_no_messages(messages, snapshot_name(name, dark))
     assert_frame(image)
 
 
 def test_step_snapshots_are_saved(
-    rendered_steps: dict[tuple[int, bool], tuple[QImage, list[str], Path]],
+    rendered_steps: dict[tuple[str, bool], tuple[QImage, list[str], Path]],
 ) -> None:
     """Проверяет подготовленные PNG; атомарная публикация отложена до teardown."""
     assert set(rendered_steps) == set(CASES)
-    expected = {snapshot_name(step, dark) for step, dark in CASES}
-    assert len(expected) == 12
+    expected = {snapshot_name(name, dark) for name, dark in CASES}
+    assert len(expected) == 20
     paths = [path for _, _, path in rendered_steps.values()]
     assert {path.name for path in paths[0].parent.glob("*.png")} == expected
     for image, messages, path in rendered_steps.values():
@@ -993,16 +1279,16 @@ def test_step_snapshots_are_saved(
         assert_saved_snapshot(path, image)
 
 
-@pytest.mark.parametrize("step", STEP_NAMES, ids=STEP_NAMES.values())
+@pytest.mark.parametrize("name", SNAPSHOT_SETUPS)
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_snapshots_are_deterministic(
-    step: int,
+    name: str,
     dark: bool,
     onboarding_app: Any,
-    rendered_steps: dict[tuple[int, bool], tuple[QImage, list[str], Path]],
+    rendered_steps: dict[tuple[str, bool], tuple[QImage, list[str], Path]],
 ) -> None:
-    _, _, first = rendered_steps[step, dark]
-    second, messages = render_case(onboarding_app, step, dark, extra_wait_ms=250)
+    _, _, first = rendered_steps[name, dark]
+    second, messages = render_case(onboarding_app, name, dark, extra_wait_ms=250)
     assert_no_messages(messages, first.name)
     first_hash = sha256(first.read_bytes()).hexdigest()
     second_hash = sha256(png_bytes(second)).hexdigest()
@@ -1015,9 +1301,9 @@ def test_snapshots_are_deterministic(
 def test_model_card_states_render(state: str, onboarding_app: Any) -> None:
     fake = FakeOnboarding()
     fake.step = 2
-    fake.modelState = state
+    fake.models = [{**fake.models[0], "state": state}, *fake.models[1:]]
     _, messages = render_onboarding(onboarding_app, fake, False)
-    assert_no_messages(messages, f"modelState={state}")
+    assert_no_messages(messages, f"models[0].state={state}")
 
 
 @pytest.mark.parametrize("state", CAPTURE_STATES)
@@ -1126,11 +1412,13 @@ def test_policy_locked_step1(onboarding_app: Any) -> None:
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize("model_ready", [False, True], ids=["waiting", "ready"])
 def test_mic_test_button_starts_and_stops_including_processing(
-    onboarding_app: Any, dark: bool
+    onboarding_app: Any, dark: bool, model_ready: bool
 ) -> None:
     fake = FakeOnboarding()
     fake.step = 4
+    fake.modelReady = model_ready
 
     def inspect(root: Any) -> None:
         for state in ("idle", "preparing", "recording", "processing", "done", "error"):
@@ -1146,10 +1434,15 @@ def test_mic_test_button_starts_and_stops_including_processing(
                 and item.metaObject().indexOfSignal(b"clicked()") >= 0
             ]
             assert len(buttons) == 1, state
-            assert buttons[0].isEnabled(), state
+            assert buttons[0].isEnabled() == (model_ready or testing), state
             fake.calls.clear()
-            QMetaObject.invokeMethod(buttons[0], "clicked", Qt.DirectConnection)
-            assert fake.calls == ["stopTest" if testing else "startTest"], state
+            if buttons[0].isEnabled():
+                QMetaObject.invokeMethod(buttons[0], "clicked", Qt.DirectConnection)
+                assert fake.calls == ["stopTest" if testing else "startTest"], state
+            else:
+                click_item(buttons[0])
+                onboarding_app.processEvents()
+                assert fake.calls == [], state
 
     _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
     assert_no_messages(messages, "microphone test button")
@@ -1164,7 +1457,9 @@ def test_mic_card_with_resolved_default_device_is_57px(onboarding_app: Any, dark
         row = next(item for item in visual_tree(root) if item.property("label") == "Микрофон")
         assert row.property("sub") == "Встроенный микрофон"
         assert row.height() == 55
-        assert row.parentItem().parentItem().height() == 57
+        card = microphone_card(root)
+        assert row in list(visual_tree(card))
+        assert card.height() == 57
 
     _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
     assert_no_messages(messages, "resolved default microphone card height")
@@ -1245,7 +1540,7 @@ def test_mic_missing_device_displays_fallback_without_writing_bridge(
             item.isVisible() and item.property("text") == explanation for item in visual_tree(root)
         )
         assert fake.device == "ghost-id"
-        assert fake.calls == []
+        assert fake.calls == ["startLevelMonitor"]
         row = next(item for item in visual_tree(root) if item.property("label") == "Микрофон")
         assert row.property("sub") == ""
 
@@ -1257,45 +1552,48 @@ def test_mic_missing_device_displays_fallback_without_writing_bridge(
         )
         QTest.qWait(25)  # Дожидаемся кадра с обновлённой геометрией Column.
         assert row.property("sub") == ""
-        assert row.parentItem().parentItem().height() == 50
+        assert row.height() == 48
+        card = microphone_card(root)
+        assert row in list(visual_tree(card))
+        assert card.height() == 50
+        assert fake.calls == ["startLevelMonitor"]
 
     _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
     assert_no_messages(messages, "missing microphone")
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
-def test_mic_silence_is_only_reported_while_recording(onboarding_app: Any, dark: bool) -> None:
+def test_mic_silence_is_reported_while_listening(onboarding_app: Any, dark: bool) -> None:
     fake = FakeOnboarding()
     fake.step = 4
     fake.level = 0
     fake.testText = ""
-    prompt = "Нажмите «Тестовая диктовка», чтобы проверить микрофон"
-    silence = "Звука с этого микрофона пока нет"
+    fake.levelMessage = "Не удалось открыть микрофон"
+    silence = "Пока тишина"
     warning = "Микрофон молчит"
 
     def inspect(root: Any) -> None:
         for state, level in (
             ("idle", 0),
-            ("preparing", 0),
-            ("recording", 0),
-            ("recording", 0.5),
-            ("processing", 0),
-            ("done", 0),
+            ("listening", 0),
+            ("listening", 0.02),
+            ("listening", 0.021),
+            ("listening", 0.5),
             ("error", 0),
             ("idle", 0),
         ):
-            fake.testState = state
+            fake.levelState = state
             fake.level = level
             onboarding_app.processEvents()
-            texts = {
-                item.property("text")
-                for item in visual_tree(root)
-                if item.isVisible() and isinstance(item.property("text"), str)
-            }
-            assert (prompt in texts) == (state == "idle"), (state, level)
-            silent_recording = state == "recording" and level == 0
-            assert (silence in texts) == silent_recording, (state, level)
-            assert (warning in texts) == silent_recording, (state, level)
+            texts = visible_texts(root)
+            assert (warning in texts) == (state == "listening" and level <= 0.02), (state, level)
+            assert (fake.levelMessage in texts) == (state == "error"), (state, level)
+            if state == "listening":
+                assert (silence in texts) == (level <= 0.02), level
+                assert ("Слышим вас" in texts) == (level > 0.02), level
+            elif state == "error":
+                assert silence not in texts
+                assert "Слышим вас" not in texts
 
     _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
     assert_no_messages(messages, "microphone silence")
@@ -1323,3 +1621,178 @@ def test_finish_calls_bridge(onboarding_app: Any) -> None:
 
     _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
     assert_no_messages(messages, "finish")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_model_continue_requires_selection(onboarding_app: Any, dark: bool) -> None:
+    fake = configure_onboarding(2, canContinueFromModel=False)
+    hint = "Выберите хотя бы одну модель — без неё диктовка не работает"
+
+    def inspect(root: Any) -> None:
+        button = visible_button(root, "Продолжить")
+        for allowed in (False, True, False):
+            fake.canContinueFromModel = allowed
+            onboarding_app.processEvents()
+            assert button.isEnabled() == allowed
+            assert (hint in visible_texts(root)) == (not allowed)
+            if not allowed:
+                click_item(button)
+                onboarding_app.processEvents()
+                assert fake.calls == []
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "model selection gates continuation")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_model_card_click_toggles_entry(onboarding_app: Any, dark: bool) -> None:
+    fake = configure_onboarding(2)
+    # Отличающийся от каталожного id ловит захардкоженный аргумент слота.
+    model_id = "test-selectable-model"
+    fake.models = [{**fake.models[0], "id": model_id}]
+
+    def inspect(root: Any) -> None:
+        cards = [item for item in visual_tree(root) if item.property("modelId") == model_id]
+        assert len(cards) == 1
+        assert cards[0].isEnabled()
+        assert fake.calls == []
+        click_item(cards[0])
+        onboarding_app.processEvents()
+        assert fake.calls == ["toggleModel"]
+        assert fake.toggled_model_ids == [model_id]
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "model card click")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_model_continue_starts_downloads_before_next(onboarding_app: Any, dark: bool) -> None:
+    fake = configure_selected_model()
+
+    def inspect(root: Any) -> None:
+        button = visible_button(root, "Продолжить")
+        assert button.isEnabled()
+        assert fake.calls == []
+        QMetaObject.invokeMethod(button, "clicked", Qt.DirectConnection)
+        assert fake.calls == ["startSelectedDownloads", "next"]
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "download before next")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_download_strip_visibility_across_steps(onboarding_app: Any, dark: bool) -> None:
+    fake = configure_onboarding(
+        1, downloadProgress=0.43, downloadTitle="Загружается GigaAM v3 RNN-T"
+    )
+
+    def inspect(root: Any) -> None:
+        strips = [
+            item
+            for item in visual_tree(root)
+            if item.metaObject().indexOfProperty("downloadState") >= 0
+        ]
+        assert len(strips) == 1
+        strip = strips[0]
+        for state in ("downloading", "idle"):
+            fake.downloadState = state
+            for step in (1, 2, 3, 4, 5, 1):
+                fake.step = step
+                QTest.qWait(25)
+                onboarding_app.processEvents()
+                assert root.property("step") == step
+                visible = state == "downloading" and step >= 2
+                assert strip.isVisible() == visible, (state, step)
+                assert strip.property("downloadState") == (state if step >= 2 else "idle")
+                assert (fake.downloadTitle in visible_texts(root)) == visible, (state, step)
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "download strip across steps")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize("model_ready", [False, True], ids=["waiting", "ready"])
+def test_mic_level_monitor_follows_step_visibility(
+    onboarding_app: Any, dark: bool, model_ready: bool
+) -> None:
+    fake = configure_onboarding(4, modelReady=model_ready)
+
+    def inspect(root: Any) -> None:
+        calls_after_render = fake.calls.copy()
+        assert calls_after_render == ["startLevelMonitor"]
+        fake.step = 3
+        QTest.qWait(25)
+        onboarding_app.processEvents()
+        assert root.property("step") == 3
+        assert fake.calls == [*calls_after_render, "stopLevelMonitor"]
+        fake.step = 4
+        QTest.qWait(25)
+        onboarding_app.processEvents()
+        assert root.property("step") == 4
+        assert fake.calls == [*calls_after_render, "stopLevelMonitor", "startLevelMonitor"]
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "level monitor lifecycle")
+    assert fake.calls == [
+        "startLevelMonitor",
+        "stopLevelMonitor",
+        "startLevelMonitor",
+        "stopLevelMonitor",
+    ]
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_mic_dictation_requires_ready_model(onboarding_app: Any, dark: bool) -> None:
+    fake = configure_onboarding(4, modelReady=False, testState="idle")
+    waiting = "Будет доступно после установки модели"
+    ready = "Скажите фразу — покажем, что распознали."
+
+    def inspect(root: Any) -> None:
+        button = visible_button(root, "Тестовая диктовка")
+        for model_ready in (False, True, False):
+            fake.modelReady = model_ready
+            onboarding_app.processEvents()
+            assert button.isEnabled() == model_ready
+            texts = visible_texts(root)
+            assert (waiting in texts) == (not model_ready)
+            assert (ready in texts) == model_ready
+            assert fake.calls == ["startLevelMonitor"]
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "dictation model readiness")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_done_updates_when_model_becomes_ready(onboarding_app: Any, dark: bool) -> None:
+    fake = configure_onboarding(5, modelReady=False, canFinish=False)
+
+    def inspect(root: Any) -> None:
+        button = visible_button(root, "Готово")
+        for model_ready in (False, True, False):
+            fake.modelReady = model_ready
+            onboarding_app.processEvents()
+            texts = visible_texts(root)
+            assert ("Почти всё" in texts) == (not model_ready)
+            assert ("Комбинация уже назначена: Ctrl + Space" in texts) == (not model_ready)
+            assert ("Всё готово" in texts) == model_ready
+            assert ("Готово: зажмите Ctrl + Space и говорите" in texts) == model_ready
+            assert button.isEnabled() == model_ready
+            assert fake.calls == []
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "done follows model readiness without slot calls")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_settings_reinstall_calls_bridge(onboarding_app: Any, dark: bool) -> None:
+    fake = FakeSettings()
+
+    def inspect(window: Any) -> None:
+        button = visible_button(window.contentItem(), "Переустановить")
+        assert button.isEnabled()
+        assert fake.calls == []
+        QMetaObject.invokeMethod(button, "clicked", Qt.DirectConnection)
+        assert fake.calls == ["reinstallActiveModel"]
+
+    _, messages = render_settings(onboarding_app, dark, fake=fake, inspect=inspect)
+    assert_no_messages(messages, "reinstall active model")

@@ -9,10 +9,12 @@ Item {
     id: root
 
     readonly property var bridge: (typeof onboarding !== "undefined" && onboarding !== null) ? onboarding : null
-    readonly property int step: Math.max(1, Math.min(Theme.onboardingSteps, bridge ? bridge.step : 1))
+    property bool freezeAnimations: false
+    readonly property int totalSteps: root.bridge ? root.bridge.totalSteps : Theme.onboardingSteps
+    readonly property int step: Math.max(1, Math.min(root.totalSteps, root.bridge ? root.bridge.step : 1))
     readonly property string barHint: loader.item && loader.item.barHint !== undefined ? loader.item.barHint : ""
     readonly property bool skipEnabled: loader.item && loader.item.skipEnabled !== undefined ? loader.item.skipEnabled : true
-    readonly property bool canFinish: bridge ? bridge.canFinish : false
+    readonly property bool canFinish: root.bridge ? root.bridge.canFinish : false
     readonly property var stepNames: [qsTr("Сеть"), qsTr("Модель"), qsTr("Горячая клавиша"), qsTr("Микрофон"), qsTr("Готово")]
     readonly property var stepSources: ["Step1Network.qml", "Step2Model.qml", "Step3Hotkey.qml", "Step4Mic.qml", "Step5Done.qml"]
 
@@ -24,11 +26,13 @@ Item {
     function advance() {
         if (!continueButton.enabled)
             return
-        if (step === Theme.onboardingSteps) {
-            if (bridge && bridge.finish)
-                bridge.finish()
-        } else if (bridge && bridge.next) {
-            bridge.next()
+        if (root.step === root.totalSteps) {
+            if (root.bridge)
+                root.bridge.finish()
+        } else if (root.bridge) {
+            if (root.step === 2)
+                root.bridge.startSelectedDownloads()
+            root.bridge.next()
         }
     }
 
@@ -66,7 +70,7 @@ Item {
         Text {
             Layout.alignment: Qt.AlignVCenter
             textFormat: Text.PlainText
-            text: qsTr("Шаг %1 из %2").arg(root.step).arg(Theme.onboardingSteps)
+            text: qsTr("Шаг %1 из %2").arg(root.step).arg(root.totalSteps)
             color: Theme.fgMuted
             font.family: Theme.fontUi
             font.pixelSize: Theme.fontCaptionSize
@@ -80,7 +84,7 @@ Item {
             spacing: Theme.onboardingDotsGap
 
             Repeater {
-                model: Theme.onboardingSteps
+                model: root.totalSteps
 
                 Rectangle {
                     required property int index
@@ -111,7 +115,7 @@ Item {
     Item {
         id: body
         anchors.top: header.bottom
-        anchors.bottom: bar.top
+        anchors.bottom: dlStrip.visible ? dlStrip.top : bar.top
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.leftMargin: 40 // spec §10: левый паддинг тела.
@@ -125,6 +129,20 @@ Item {
             source: root.stepSources[root.step - 1]
             focus: true
         }
+    }
+
+    DownloadStrip {
+        id: dlStrip
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: bar.top
+        downloadState: (root.step >= 2 && root.bridge) ? root.bridge.downloadState : "idle"
+        title: root.bridge ? root.bridge.downloadTitle : ""
+        progress: root.bridge ? root.bridge.downloadProgress : 0
+        speed: root.bridge ? root.bridge.speed : ""
+        eta: root.bridge ? root.bridge.eta : ""
+        freezeAnimations: root.freezeAnimations
+        onRetryRequested: { if (root.bridge) root.bridge.startSelectedDownloads(); }
     }
 
     Rectangle {
@@ -173,29 +191,18 @@ Item {
             AvButton {
                 text: qsTr("Пропустить")
                 variant: "ghost"
-                visible: root.step < Theme.onboardingSteps
+                visible: root.step < root.totalSteps
                 enabled: root.skipEnabled
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: if (root.bridge && root.bridge.skip) root.bridge.skip()
             }
 
-            Text {
-                Layout.alignment: Qt.AlignVCenter
-                Layout.maximumWidth: bar.width / 2
-                text: qsTr("Сначала установите модель — без неё диктовка не работает")
-                visible: root.step === Theme.onboardingSteps && !root.canFinish
-                color: Theme.fgMuted
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontCaptionSize
-                renderType: Text.NativeRendering
-                wrapMode: Text.WordWrap
-            }
-
             AvButton {
                 id: continueButton
-                text: root.step === Theme.onboardingSteps ? qsTr("Готово") : qsTr("Продолжить")
+                text: root.step === root.totalSteps ? qsTr("Готово") : qsTr("Продолжить")
                 variant: "primary"
-                enabled: root.step < Theme.onboardingSteps || root.canFinish
+                enabled: root.step === root.totalSteps ? root.canFinish
+                    : root.step === 2 ? (root.bridge ? root.bridge.canContinueFromModel : false) : true
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: root.advance()
             }

@@ -6,64 +6,128 @@ import ".."
 Rectangle {
     id: root
 
-    property string modelState: "downloadable"
-    property string modelName: qsTr("GigaAM v3 RNN-T")
-    property string vendor: qsTr("Сбер (GigaChat Team)")
-    property string purpose: qsTr("Русская диктовка с пунктуацией — по умолчанию")
-    property string modelSize: qsTr("231,9 МБ")
-    property string modelRam: ""
-    property string modelHost: qsTr("huggingface.co")
-    property string modelMessage: ""
-    property real progress: 0
-    property string speed: ""
-    property string eta: ""
+    property string modelId: ""
+    property string modelTitle: ""
+    property string vendor: ""
+    property string purpose: ""
+    property string host: ""
+    property bool recommended: false
+    property string sizeText: ""
+    property string ramText: ""
+    property bool selected: false
+    property string badge: ""
+    property string cardState: "available"
+    // Пока в мосте нет слота «открыть папку моделей», кнопка скрыта, чтобы не быть тихой заглушкой.
+    property bool openFolderEnabled: false
+    property string message: ""
+    property var metrics: []
+    property var tags: []
 
-    signal downloadRequested()
-    signal cancelRequested()
-    signal installFromPathRequested()
+    signal toggleRequested()
     signal retryRequested()
+    signal cancelRequested()
     signal openFolderRequested()
-    signal removeDownloadRequested()
 
-    readonly property bool installed: modelState === "installed"
-    readonly property bool transferring: modelState === "downloading"
-    readonly property bool busy: transferring || modelState === "verifying" || modelState === "installing"
-    readonly property bool failed: modelState === "broken" || modelState === "no-space"
-    readonly property bool warning: modelState === "no-ram"
-    readonly property bool offline: modelState === "no-network"
-    readonly property bool available: !installed && !busy && !failed && !warning && !offline
-    readonly property real boundedProgress: Math.max(0, Math.min(1, progress))
+    readonly property bool selectionAvailable: badge === ""
+        && (cardState === "available" || cardState === "failed")
+    readonly property bool busy: cardState === "queued" || cardState === "downloading"
+        || cardState === "verifying"
+    readonly property bool hasError: cardState === "failed" || cardState === "no-space"
+    readonly property string selectionMark: cardState === "no-space" ? "blocked"
+        : badge !== "" || busy || cardState === "installed" ? "locked"
+        : selected ? "on" : "off"
+    readonly property string statusLabel: cardState === "downloading" ? qsTr("Загружается")
+        : cardState === "queued" ? qsTr("В очереди")
+        : cardState === "verifying" ? qsTr("Проверяю…")
+        : badge === "active" ? qsTr("Установлена и активна")
+        : badge === "installed" ? qsTr("Установлена") : ""
+    readonly property bool hasMetricData: metrics.some(function(metric) {
+        return metric.hasData === true;
+    })
     readonly property real footerGap: 9 // spec §5.1: зазор нижнего блока.
 
-    implicitWidth: 620 // Макет 08-onboarding-2-model.html: ширина карточки шага 2.
+    implicitWidth: Theme.onboardingStep2ContentW
     implicitHeight: footer.y + footer.height + Theme.modelCardPaddingY + Theme.cardBorder
     width: parent ? parent.width : implicitWidth
     height: implicitHeight
     radius: Theme.modelCardRadius
-    color: installed ? Theme.accentBg : Theme.bgSurface
+    color: selectionAvailable && cardMouse.pressed ? Theme.statePressedOnSurface
+        : selectionAvailable && cardMouse.containsMouse ? Theme.stateHoverOnSurface
+        : badge === "active" ? Theme.accentBg
+        : selected || busy ? Theme.primaryBg : Theme.bgSurface
+    activeFocusOnTab: selectionAvailable
+    onSelectionAvailableChanged: {
+        if (!selectionAvailable)
+            focus = false;
+    }
+    Keys.onPressed: {
+        if (root.activeFocus && root.selectionAvailable
+                && (event.key === Qt.Key_Space || event.key === Qt.Key_Return
+                    || event.key === Qt.Key_Enter)) {
+            if (!event.isAutoRepeat)
+                root.toggleRequested();
+            event.accepted = true;
+        }
+    }
+
+    // Под содержимым: кнопки действий принимают нажатие раньше карточки.
+    MouseArea {
+        id: cardMouse
+        anchors.fill: parent
+        enabled: root.selectionAvailable
+        hoverEnabled: root.selectionAvailable
+        cursorShape: Qt.PointingHandCursor
+        onClicked: {
+            root.forceActiveFocus(Qt.MouseFocusReason);
+            root.toggleRequested();
+        }
+    }
 
     // Inline components доступны в Qt 5.15 и не требуют записи в qmldir.
     component FooterText: Text {
         color: Theme.fgMuted
         font.family: Theme.fontUi
         font.pixelSize: Theme.fontModelFooterSize
-        lineHeight: Theme.fontModelFooterSize * Theme.fontBodyLineHeight
+        font.weight: Font.Normal
+        lineHeight: font.pixelSize * Theme.fontBodyLineHeight
         lineHeightMode: Text.FixedHeight
         wrapMode: Text.Wrap
         textFormat: Text.PlainText
         renderType: Text.NativeRendering
     }
 
+    component SpaceText: FooterText {
+        color: Theme.modelCardSpaceLineLabel
+        font.pixelSize: Theme.modelCardSpaceLineSize
+        lineHeight: Theme.modelCardSpaceLineLineHeight
+        wrapMode: Text.NoWrap
+    }
+
     component Dot: Rectangle {
-        width: 4 // spec §5.2 / макет .dot: диаметр разделителя.
+        width: 4 // spec §5.2: диаметр разделителя.
         height: width
         radius: width / 2
         color: Theme.fgFaint
     }
 
-    component SmallButton: AvButton {
-        small: true
-        Layout.minimumWidth: implicitWidth
+    component CardBadge: Rectangle {
+        property alias text: badgeText.text
+        property alias textColor: badgeText.color
+        width: badgeText.implicitWidth + 2 * Theme.badgePaddingX
+        height: Math.ceil(Theme.badgeHeight)
+        radius: Theme.badgeRadius
+        Text {
+            id: badgeText
+            x: Theme.badgePaddingX
+            y: Theme.badgePaddingY
+            height: parent.height - 2 * Theme.badgePaddingY
+            verticalAlignment: Text.AlignVCenter
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.badgeSize
+            font.weight: Font.Medium
+            textFormat: Text.PlainText
+            renderType: Text.NativeRendering
+        }
     }
 
     RowLayout {
@@ -73,131 +137,137 @@ Rectangle {
         width: root.width - 2 * (Theme.cardBorder + Theme.modelCardPaddingX)
         spacing: Theme.modelCardTopGap
 
-        Item {
+        RowLayout {
             Layout.fillWidth: true
             Layout.minimumWidth: 0
             Layout.alignment: Qt.AlignTop
-            implicitHeight: badges.y + badges.height
-            Flow {
-                id: nameRow
-                width: parent.width
-                spacing: 0
-                Text {
-                    text: root.modelName
-                    color: Theme.fg
-                    font.family: Theme.fontUi
-                    font.pixelSize: Theme.fontModelNameSize
-                    lineHeight: Theme.fontModelNameSize * Theme.fontBodyLineHeight
-                    lineHeightMode: Text.FixedHeight
-                    font.weight: Font.Medium
-                    textFormat: Text.PlainText
-                    renderType: Text.NativeRendering
-                }
-                Text {
-                    text: qsTr(" · %1").arg(root.vendor)
-                    color: Theme.fgMuted
-                    font.family: Theme.fontUi
-                    font.pixelSize: Theme.fontModelVendorSize
-                    lineHeight: Theme.fontModelVendorSize * Theme.fontBodyLineHeight
-                    lineHeightMode: Text.FixedHeight
-                    wrapMode: Text.NoWrap
-                    textFormat: Text.PlainText
-                    renderType: Text.NativeRendering
+            spacing: Theme.modelCardSelectGap
+
+            Rectangle {
+                Layout.preferredWidth: Theme.modelCardSelectSize
+                Layout.preferredHeight: Theme.modelCardSelectSize
+                Layout.alignment: Qt.AlignTop
+                Layout.topMargin: 2
+                radius: Theme.modelCardSelectRadius
+                border.width: Theme.modelCardSelectBorder
+                border.color: root.selectionMark === "on" ? Theme.primary
+                    : root.selectionMark === "off" ? Theme.fgFaint : Theme.border
+                color: root.selectionMark === "on" ? Theme.primary
+                    : root.selectionMark === "off" ? Theme.bgSurface : Theme.bgSurface2
+                Icon {
+                    anchors.centerIn: parent
+                    name: "check"
+                    size: 12
+                    color: root.selectionMark === "on" ? Theme.primaryFg : Theme.fgDisabled
+                    visible: root.selectionMark === "on" || root.selectionMark === "locked"
                 }
             }
-            Text {
-                id: purposeText
-                y: nameRow.height + 2 // spec §5.2: отступ назначения.
-                width: parent.width
-                text: root.purpose
-                color: Theme.fgMuted
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontModelPurposeSize
-                lineHeight: Theme.fontModelPurposeSize * Theme.fontBodyLineHeight
-                lineHeightMode: Text.FixedHeight
-                wrapMode: Text.Wrap
-                textFormat: Text.PlainText
-                renderType: Text.NativeRendering
-            }
-            Row {
-                id: badges
-                y: purposeText.y + purposeText.height + 4 // spec §5.2: отступ бейджей.
-                spacing: Theme.modelCardBadgesGap
-                Repeater {
-                    model: root.installed ? [qsTr("Активна"), qsTr("Рекомендуем")] : [qsTr("Рекомендуем")]
-                    Rectangle {
-                        readonly property bool activeBadge: root.installed && index === 0
-                        width: badgeText.implicitWidth + 2 * Theme.badgePaddingX
-                        // design/spec.md §4.8: округляем вверх до 22 px, чтобы избежать субпиксельных граней.
-                        height: Math.ceil(Theme.badgeHeight)
-                        radius: Theme.badgeRadius
-                        color: activeBadge ? Theme.accentBg : Theme.primaryBg
-                        Text {
-                            id: badgeText
-                            x: Theme.badgePaddingX
-                            y: Theme.badgePaddingY
-                            height: parent.height - 2 * Theme.badgePaddingY
-                            verticalAlignment: Text.AlignVCenter
-                            text: modelData
-                            color: parent.activeBadge ? Theme.accentInk : Theme.primary
-                            font.family: Theme.fontUi
-                            font.pixelSize: Theme.badgeSize
-                            lineHeight: Theme.badgeSize * Theme.fontBodyLineHeight
-                            lineHeightMode: Text.FixedHeight
-                            font.weight: Font.Medium
-                            textFormat: Text.PlainText
-                            renderType: Text.NativeRendering
-                        }
+
+            Item {
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                Layout.alignment: Qt.AlignTop
+                implicitHeight: purposeText.y + purposeText.height
+                Flow {
+                    id: nameRow
+                    width: parent.width
+                    spacing: Theme.modelCardHeadGap
+                    FooterText {
+                        text: root.modelTitle
+                        width: Math.min(implicitWidth, nameRow.width)
+                        color: Theme.fg
+                        font.pixelSize: Theme.fontModelNameSize
+                        font.weight: Font.Medium
                     }
+                    FooterText {
+                        visible: root.vendor !== ""
+                        text: qsTr(" · %1").arg(root.vendor)
+                        font.pixelSize: Theme.fontModelVendorSize
+                        wrapMode: Text.NoWrap
+                    }
+                    CardBadge {
+                        visible: root.recommended
+                        text: qsTr("Рекомендуем")
+                        color: Theme.primaryBg
+                        textColor: Theme.primary
+                    }
+                    CardBadge {
+                        visible: root.statusLabel !== ""
+                        text: root.statusLabel
+                        color: root.busy ? Theme.bgSurface2
+                            : root.badge === "active" ? Theme.bgSurface : Theme.successBg
+                        textColor: root.busy ? Theme.fgMuted
+                            : root.badge === "active" ? Theme.accentInk : Theme.successInk
+                    }
+                }
+                FooterText {
+                    id: purposeText
+                    y: nameRow.height + 2 // spec §5.2: отступ назначения.
+                    width: parent.width
+                    text: root.purpose
+                    font.pixelSize: Theme.fontModelPurposeSize
                 }
             }
         }
 
-        Column {
+        Item {
+            visible: root.metrics.length > 0
             Layout.alignment: Qt.AlignTop
             Layout.minimumWidth: implicitWidth
-            spacing: Theme.modelCardMetricsGap
-            Repeater {
-                model: [
-                    { label: qsTr("Качество"), fill: 0.90, prefix: qsTr("WER "), number: qsTr("7,60 %"), suffix: "" },
-                    { label: qsTr("Скорость"), fill: 0.50, prefix: "", number: qsTr("42,5×"), suffix: qsTr(" быстрее речи") }
-                ]
-                RowLayout {
-                    spacing: Theme.modelCardMetricGap
-                    Text {
-                        Layout.preferredWidth: Theme.modelCardMetricLabelW
-                        horizontalAlignment: Text.AlignRight
-                        text: modelData.label
-                        color: Theme.fgMuted
-                        font.family: Theme.fontUi
-                        font.pixelSize: Theme.fontMetricSize
-                        lineHeight: Theme.fontMetricSize * Theme.fontBodyLineHeight
-                        lineHeightMode: Text.FixedHeight
-                        textFormat: Text.PlainText
-                        renderType: Text.NativeRendering
-                    }
-                    Rectangle {
-                        width: Theme.modelCardMetricTrackW
-                        height: Theme.modelCardMetricTrackH
-                        radius: Theme.modelCardMetricTrackRadius
-                        color: Theme.modelCardMetricTrackBg
+            implicitWidth: Math.max(metricRows.implicitWidth,
+                sourceCaption.visible ? sourceCaption.implicitWidth : 0)
+            implicitHeight: metricRows.height + (sourceCaption.visible
+                ? Theme.modelCardMetricSourceCaptionMarginTop + sourceCaption.height : 0)
+            Column {
+                id: metricRows
+                spacing: Theme.modelCardMetricsGap
+                Repeater {
+                    model: root.metrics
+                    RowLayout {
+                        spacing: Theme.modelCardMetricGap
+                        FooterText {
+                            Layout.preferredWidth: Theme.modelCardMetricLabelW
+                            horizontalAlignment: Text.AlignRight
+                            text: modelData.label
+                            font.pixelSize: Theme.fontMetricSize
+                        }
                         Rectangle {
-                            width: parent.width * modelData.fill
-                            height: parent.height
+                            Layout.preferredWidth: Theme.modelCardMetricTrackW
+                            Layout.preferredHeight: Theme.modelCardMetricTrackH
                             radius: Theme.modelCardMetricTrackRadius
-                            color: Theme.modelCardMetricFillMeasured
+                            color: modelData.hasData === false ? "transparent" : Theme.modelCardMetricTrackBg
+                            border.width: modelData.hasData === false ? 1 : 0
+                            border.color: Theme.fgFaint
+                            Rectangle {
+                                visible: modelData.hasData !== false
+                                width: parent.width * Math.max(0, Math.min(1, modelData.fill))
+                                height: parent.height
+                                radius: Theme.modelCardMetricTrackRadius
+                                color: Theme.modelCardMetricFillEstimated
+                            }
+                        }
+                        FooterText {
+                            Layout.fillWidth: true
+                            text: modelData.text
+                            font.pixelSize: Theme.modelCardMetricValueSize
+                            font.weight: Font.Normal
+                            font.italic: modelData.hasData === false
+                            color: modelData.hasData === false ? Theme.fgDisabled : Theme.fgMuted
+                            wrapMode: Text.NoWrap
                         }
                     }
-                    // design/spec.md, сквозное правило 5: вся строка метрики — шрифтом интерфейса.
-                    FooterText {
-                        text: modelData.prefix + modelData.number + modelData.suffix
-                        color: Theme.fg
-                        font.family: Theme.fontUi
-                        font.weight: Font.Bold
-                        font.pixelSize: Theme.modelCardMetricValueSize
-                        lineHeight: Theme.modelCardMetricValueSize * Theme.fontBodyLineHeight
-                    }
                 }
+            }
+            FooterText {
+                id: sourceCaption
+                visible: root.hasMetricData
+                y: metricRows.height + Theme.modelCardMetricSourceCaptionMarginTop
+                width: parent.width
+                horizontalAlignment: Text.AlignRight
+                text: qsTr("цифры авторов, не с этого компьютера")
+                font.pixelSize: Theme.modelCardMetricSourceCaptionSize
+                color: Theme.modelCardMetricSourceCaptionColor
+                wrapMode: Text.NoWrap
             }
         }
     }
@@ -216,149 +286,42 @@ Rectangle {
         x: Theme.cardBorder + Theme.modelCardPaddingX
         y: divider.y + divider.height + 7 // spec §5.1: поле под разделителем.
         width: top.width
-        spacing: root.footerGap
+        spacing: Theme.modelCardSpaceLineGapToTags
 
-        Column {
-            width: parent.width
-            visible: !root.busy
-            spacing: 3 // spec §5.2 — зазор строк блока «Занимает места»
-
-            FontMetrics {
-                id: sizeFontMetrics
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontModelFooterSize
+        Row {
+            spacing: 0
+            SpaceText { text: qsTr("Занимает места: ") }
+            SpaceText {
+                text: root.sizeText
+                color: Theme.fg
             }
-
-            FooterText {
-                text: qsTr("Занимает места:")
-                font.weight: Font.Normal
+            SpaceText { text: qsTr(" на диске") }
+            Item {
+                width: 4 + 2 * root.footerGap
+                height: Theme.modelCardSpaceLineLineHeight
+                Dot { anchors.centerIn: parent }
             }
-            Row {
-                x: 12 // spec §5.2 — отступ строк значений
-                visible: root.modelSize !== ""
-                spacing: sizeFontMetrics.advanceWidth(" ")
-                FooterText {
-                    text: qsTr("на диске:")
-                    font.weight: Font.Normal
-                }
-                FooterText {
-                    text: root.modelSize
-                    color: Theme.fg
-                    font.weight: Font.Normal
-                }
+            SpaceText {
+                text: root.ramText
+                color: Theme.fg
             }
-            Row {
-                x: 12 // spec §5.2 — отступ строк значений
-                visible: root.modelRam !== ""
-                spacing: sizeFontMetrics.advanceWidth(" ")
-                FooterText {
-                    text: qsTr("в памяти при работе:")
-                    font.weight: Font.Normal
-                }
-                FooterText {
-                    text: root.modelRam
-                    color: Theme.fg
-                    font.weight: Font.Normal
-                }
-            }
+            SpaceText { text: qsTr(" в памяти при работе") }
         }
 
-        Column {
+        RowLayout {
+            id: bottomRow
             width: parent.width
-            visible: root.busy
-            spacing: 7 // spec §5.5: отступ под прогрессом.
-            Rectangle {
-                width: parent.width
-                height: Theme.progressH
-                radius: Theme.progressRadius
-                color: Theme.progressBg
-                Rectangle {
-                    width: parent.width * (root.transferring ? root.boundedProgress : 1)
-                    height: parent.height
-                    radius: Theme.progressRadius
-                    color: Theme.progressFill
-                }
-            }
-            RowLayout {
-                width: parent.width
-                spacing: root.footerGap
-                RowLayout {
-                    Layout.fillWidth: true
-                    Layout.minimumWidth: 0
-                    spacing: 0
-                    FooterText {
-                        text: root.transferring ? qsTr("Загрузка ")
-                            : root.modelState === "verifying" ? qsTr("Проверяю контрольную сумму…") : qsTr("Устанавливаю…")
-                        Layout.fillWidth: !root.transferring
-                        elide: Text.ElideRight
-                        wrapMode: Text.NoWrap
-                    }
-                    FooterText {
-                        visible: root.transferring
-                        text: qsTr("%1 %").arg(Math.round(root.boundedProgress * 100))
-                        font.family: Theme.fontMono
-                    }
-                    FooterText {
-                        visible: root.transferring && root.speed !== ""
-                        text: qsTr(" · ")
-                    }
-                    FooterText {
-                        visible: root.transferring && root.speed !== ""
-                        text: root.speed
-                        font.family: Theme.fontMono
-                    }
-                    FooterText {
-                        visible: root.transferring && root.eta !== ""
-                        text: qsTr(" · осталось ")
-                    }
-                    FooterText {
-                        visible: root.transferring && root.eta !== ""
-                        text: root.eta
-                        font.family: Theme.fontMono
-                    }
-                }
-                Dot { visible: root.transferring }
-                FooterText {
-                    visible: root.transferring
-                    text: root.modelHost
-                    Layout.fillWidth: true
-                    Layout.minimumWidth: 0
-                    elide: Text.ElideRight
-                    wrapMode: Text.NoWrap
-                }
-                Item { Layout.fillWidth: true }
-                AvButton {
-                    small: true
-                    Layout.minimumWidth: implicitWidth
-                    visible: root.transferring
-                    text: qsTr("Отмена")
-                    onClicked: root.cancelRequested()
-                }
-                FooterText {
-                    visible: !root.transferring
-                    text: qsTr("Отмена недоступна")
-                    color: Theme.fgDisabled
-                }
-            }
-        }
-
-        FooterText {
-            width: parent.width
-            visible: root.modelState === "cancelled"
-            text: qsTr("Загрузка отменена")
-        }
-
-        Flow {
-            id: tagsRow
-            width: parent.width
-            visible: root.available || root.installed
+            visible: root.tags.length > 0 || root.busy || root.hasError
             spacing: root.footerGap
-            Row {
-                id: tags
+
+            Flow {
+                visible: root.tags.length > 0
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                Layout.preferredHeight: height
                 spacing: root.footerGap
                 Repeater {
-                    // design/spec.md §5.2: лицензия и автор — один тег, как в макете.
-                    model: [qsTr("Только русский"), qsTr("с пунктуацией"), qsTr("MIT · Сбер"), qsTr("отечественная")]
+                    model: root.tags
                     RowLayout {
                         spacing: root.footerGap
                         Dot { visible: index !== 0 }
@@ -366,77 +329,58 @@ Rectangle {
                     }
                 }
             }
-        }
 
-        RowLayout {
-            width: parent.width
-            visible: root.failed || root.warning || root.offline
-            spacing: root.footerGap
-            Icon {
-                name: root.offline ? "globe" : "alert"
-                size: 15 // spec §5.4 / макет: иконка сообщения об ошибке.
-                color: statusText.color
-            }
-            FooterText {
-                id: statusText
+            Item {
+                visible: root.tags.length === 0
                 Layout.fillWidth: true
-                color: root.failed ? Theme.dangerInk : (root.warning ? Theme.warningInk : Theme.fgMuted)
-                // design/spec.md §5.4 и правило 5: число входит в переводимую фразу без моноширинного набора.
-                text: root.modelMessage !== "" ? root.modelMessage
-                    : root.modelState === "broken" ? qsTr("Файл не прошёл проверку — скачайте заново")
-                    : root.modelState === "no-space" ? qsTr("Не хватает места на диске — нужно ещё %1").arg(root.modelSize)
-                    : root.warning ? (root.modelRam !== ""
-                        ? qsTr("Памяти может не хватить — модели нужно около %1").arg(root.modelRam)
-                        : qsTr("Памяти может не хватить"))
-                    : qsTr("Нет доступа к %1").arg(root.modelHost)
             }
-        }
 
-        Flow {
-            id: actions
-            width: parent.width
-            visible: !root.busy
-            spacing: root.footerGap
-            SmallButton {
-                visible: root.available || root.warning || root.offline
-                variant: root.warning ? "secondary" : "primary"
-                iconName: "down"
-                enabled: !root.offline
-                text: qsTr("Скачать %1").arg(root.modelSize)
-                onClicked: root.downloadRequested()
-            }
-            AvButton {
-                id: fileButton
-                Layout.minimumWidth: implicitWidth
-                visible: root.available || root.warning || root.offline
-                small: true
-                iconName: "folder"
-                text: root.offline ? qsTr("Установить из файла…") : qsTr("Из файла…")
-                onClicked: root.installFromPathRequested()
-            }
-            SmallButton {
-                id: installedButton
-                visible: root.installed
-                enabled: false
-                text: qsTr("Установлена · %1").arg(root.modelSize)
-            }
-            AvButton {
-                id: retryButton
-                Layout.minimumWidth: implicitWidth
-                visible: root.failed
-                small: true
-                text: qsTr("Повторить")
-                onClicked: root.retryRequested()
-            }
-            AvButton {
-                id: recoveryButton
-                Layout.minimumWidth: implicitWidth
-                visible: root.failed
-                small: true
-                text: root.modelState === "broken" ? qsTr("Удалить загрузку") : qsTr("Открыть папку")
-                onClicked: {
-                    if (root.modelState === "broken") root.removeDownloadRequested();
-                    else root.openFolderRequested();
+            RowLayout {
+                visible: root.busy || root.hasError
+                Layout.maximumWidth: root.tags.length > 0 ? bottomRow.width * 0.65 : bottomRow.width
+                spacing: root.footerGap
+                Icon {
+                    visible: root.hasError
+                    name: "alert"
+                    size: 12
+                    color: Theme.dangerInk
+                }
+                FooterText {
+                    visible: root.hasError
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    text: root.message !== "" ? root.message
+                        : root.cardState === "no-space" ? qsTr("Не хватает места на диске")
+                        : qsTr("Не удалось загрузить модель")
+                    color: Theme.dangerInk
+                }
+                AvButton {
+                    visible: root.cardState === "downloading" || root.cardState === "queued"
+                    Layout.minimumWidth: implicitWidth
+                    small: true
+                    text: qsTr("Отмена")
+                    onClicked: root.cancelRequested()
+                }
+                FooterText {
+                    visible: root.cardState === "verifying"
+                    text: qsTr("Отмена недоступна")
+                    color: Theme.fgDisabled
+                }
+                AvButton {
+                    visible: root.cardState === "failed"
+                    Layout.minimumWidth: implicitWidth
+                    small: true
+                    variant: "primary"
+                    text: qsTr("Повторить")
+                    onClicked: root.retryRequested()
+                }
+                AvButton {
+                    visible: root.cardState === "no-space" && root.openFolderEnabled
+                    Layout.minimumWidth: implicitWidth
+                    small: true
+                    iconName: "folder"
+                    text: qsTr("Открыть папку моделей")
+                    onClicked: root.openFolderRequested()
                 }
             }
         }
@@ -449,8 +393,19 @@ Rectangle {
         radius: parent.radius
         color: "transparent"
         border.width: Theme.cardBorder
-        // design/spec.md §5.5: рекомендованную карточку отличает только бейдж.
-        border.color: root.installed ? Theme.accent : Theme.border
+        border.color: root.badge === "active" ? Theme.accent
+            : root.selected || root.busy ? Theme.primary : Theme.border
         antialiasing: true
+    }
+
+    Rectangle {
+        anchors.fill: parent
+        anchors.margins: -(Theme.focusOffset + Theme.focusWidth)
+        radius: Theme.focusRadius
+        color: "transparent"
+        border.width: Theme.focusWidth
+        border.color: Theme.stateFocusRing
+        antialiasing: true
+        visible: root.activeFocus
     }
 }

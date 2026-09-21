@@ -221,7 +221,7 @@ Item {
             height: visible ? implicitHeight : 0
             variant: "warn"
             iconName: "alert"
-            title: qsTr("Комбинация %1 занята в KDE").arg(root.displayedCombo)
+            title: qsTr("Комбинация %1 занята в системе").arg(root.displayedCombo)
             body: (root.captureMessage !== "" ? root.captureMessage
                 : root.conflictOwner.trim() !== ""
                     ? qsTr("%1 уже назначена на действие «%2». Оставить её можно, но диктовка может не сработать — система заберёт нажатие себе.").arg(root.displayedCombo).arg(root.conflictOwner)
