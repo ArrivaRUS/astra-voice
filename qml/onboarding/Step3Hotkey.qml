@@ -72,7 +72,6 @@ Item {
                 divider: false
                 showHint: false
                 label: qsTr("Текущая комбинация")
-                sub: qsTr("По умолчанию — как в Handy")
 
                 RowLayout {
                     spacing: 8 // design/spec.md §7: чип + «Изменить».

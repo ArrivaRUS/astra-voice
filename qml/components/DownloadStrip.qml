@@ -11,9 +11,12 @@ Rectangle {
     property real progress: 0
     property string speed: ""
     property string eta: ""
+    // Уточнение к заголовку: «нужно ещё 126 МБ» при нехватке места (§10.3).
+    property string detail: ""
     property bool freezeAnimations: false
 
     signal retryRequested()
+    signal openFolderRequested()
 
     property bool doneExpired: false
     readonly property bool hasError: downloadState === "failed" || downloadState === "no-space"
@@ -132,6 +135,18 @@ Rectangle {
         }
 
         Text {
+            visible: root.downloadState === "no-space" && root.detail !== ""
+            Layout.minimumWidth: implicitWidth
+            text: root.detail
+            textFormat: Text.PlainText
+            renderType: Text.NativeRendering
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.onboardingProgressStripTailSize
+            wrapMode: Text.NoWrap
+            color: Theme.onboardingProgressStripTailColor
+        }
+
+        Text {
             visible: root.downloadState === "downloading" && root.tail !== ""
             Layout.minimumWidth: implicitWidth
             text: root.tail
@@ -152,7 +167,13 @@ Rectangle {
             onClicked: root.retryRequested()
         }
 
-        // В no-space нет кнопки «Открыть папку моделей»: в мосте нет слота,
-        // который открывает папку, а тихую заглушку ставить нельзя.
+        AvButton {
+            visible: root.downloadState === "no-space"
+            Layout.minimumWidth: implicitWidth
+            small: true
+            iconName: "folder"
+            text: qsTr("Открыть папку моделей")
+            onClicked: root.openFolderRequested()
+        }
     }
 }

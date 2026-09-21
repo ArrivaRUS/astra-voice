@@ -100,7 +100,7 @@ Item {
                 width: parent.width
                 showHint: false
                 label: qsTr("Проверять обновления утилиты")
-                sub: qsTr("Раз в сутки, github.com")
+                sub: qsTr("Раз в сутки")
                 toggle: appUpdates
                 locked: root.bridge ? root.bridge.policyLocked : false
                 lockedText: root.bridge ? root.bridge.policyLockedText : ""
@@ -161,6 +161,6 @@ Item {
         variant: "info"
         iconName: "info" // design/spec.md §7; макет 08-onboarding-1-network.html: информационная иконка.
         title: qsTr("Пока оба переключателя выключены, программа не выходит в сеть")
-        body: qsTr("Скачать модель на следующем шаге можно и без них — это ваше явное действие. Список хостов и способ выключить сеть совсем — в «О программе → Приватность».")
+        body: qsTr("Скачать модель на следующем шаге можно и без них — это ваше явное действие. Куда программа ходит в сеть и как это выключить — в «О программе → Приватность».")
     }
 }

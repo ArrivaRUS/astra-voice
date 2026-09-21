@@ -30,6 +30,9 @@ Item {
     readonly property int selectedDeviceIndex: deviceIndex(device) >= 0 ? deviceIndex(device)
         : deviceIndex("") >= 0 ? deviceIndex("") : 0
     property bool levelMonitorRequested: false
+    // Мост сам останавливает проверку по общему потолку эпизода (ИБ, У62):
+    // тогда он возвращает idle с пояснением, и продолжить может только человек.
+    readonly property bool levelStopped: root.levelState === "idle" && root.levelMessage !== ""
 
     function setLevelMonitoring(requested) {
         if (!root.bridge || root.levelMonitorRequested === requested)
@@ -40,6 +43,10 @@ Item {
         else
             root.bridge.stopLevelMonitor()
     }
+
+    // Проверку мог остановить мост; без сброса отметки кнопка «Проверить ещё
+    // раз» считала бы, что измерение уже идёт, и молчала бы.
+    onLevelStateChanged: if (root.levelState === "idle") root.levelMonitorRequested = false
 
     Component.onCompleted: root.setLevelMonitoring(root.visible)
     onVisibleChanged: root.setLevelMonitoring(root.visible)
@@ -206,7 +213,7 @@ Item {
                 Text {
                     width: parent.width
                     textFormat: Text.PlainText
-                    text: root.levelState === "error" ? root.levelMessage
+                    text: root.levelState === "error" || root.levelStopped ? root.levelMessage
                         : root.silent ? qsTr("Пока тишина") : qsTr("Слышим вас")
                     color: root.levelState === "error" ? Theme.dangerInk : Theme.fg
                     font.family: Theme.fontUi
@@ -220,7 +227,7 @@ Item {
                 Text {
                     width: parent.width
                     textFormat: Text.PlainText
-                    text: root.levelState !== "error" && root.peak !== ""
+                    text: root.levelState === "listening" && root.peak !== ""
                         ? qsTr("Пик %1 · уровень в норме").arg(root.peak) : ""
                     visible: text !== ""
                     height: visible ? implicitHeight : 0
@@ -232,6 +239,15 @@ Item {
                     renderType: Text.NativeRendering
                     wrapMode: Text.WordWrap
                 }
+            }
+
+            AvButton {
+                text: qsTr("Проверить ещё раз")
+                small: true
+                iconName: "refresh"
+                visible: root.levelStopped
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: root.setLevelMonitoring(true)
             }
         }
     }

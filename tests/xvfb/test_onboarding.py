@@ -141,6 +141,8 @@ class FakeOnboarding(QObject):
         self._downloadState: str = "idle"
         self._downloadProgress: float = 0.0
         self._downloadTitle: str = ""
+        self._downloadDetail: str = ""
+        self._freeSpaceText: str = ""
         self._speed: str = "5,2 МБ/с"
         self._eta: str = "осталось ~3 мин"
         self._hotkey: str = "Ctrl + Space"
@@ -293,6 +295,24 @@ class FakeOnboarding(QObject):
         self.changed.emit()
 
     downloadTitle = pyqtProperty(str, _get_downloadTitle, _set_downloadTitle, notify=changed)
+
+    def _get_downloadDetail(self) -> str:
+        return self._downloadDetail
+
+    def _set_downloadDetail(self, value: str) -> None:
+        self._downloadDetail = value
+        self.changed.emit()
+
+    downloadDetail = pyqtProperty(str, _get_downloadDetail, _set_downloadDetail, notify=changed)
+
+    def _get_freeSpaceText(self) -> str:
+        return self._freeSpaceText
+
+    def _set_freeSpaceText(self, value: str) -> None:
+        self._freeSpaceText = value
+        self.changed.emit()
+
+    freeSpaceText = pyqtProperty(str, _get_freeSpaceText, _set_freeSpaceText, notify=changed)
 
     def _get_speed(self) -> str:
         return self._speed
@@ -583,6 +603,10 @@ class FakeOnboarding(QObject):
         self.calls.append("stopTest")
 
     @pyqtSlot()
+    def openModelsFolder(self) -> None:
+        self.calls.append("openModelsFolder")
+
+    @pyqtSlot()
     def finish(self) -> None:
         self.calls.append("finish")
 
@@ -610,9 +634,13 @@ class FakeSettings(QObject):
         self._activeModelName: str = "GigaAM v3 RNN-T"
         self._activeModelSize: str = "226 МБ"
         self._activeModelState: str = "ok"
+        self._activeModelMessage: str = ""
+        self._canReinstall: bool = True
+        self._canInstall: bool = False
         self._downloadState: str = "idle"
         self._downloadProgress: float = 0.0
         self._downloadTitle: str = ""
+        self._downloadDetail: str = ""
         self._speed: str = ""
         self._eta: str = ""
 
@@ -749,6 +777,35 @@ class FakeSettings(QObject):
         str, _get_activeModelState, _set_activeModelState, notify=changed
     )
 
+    def _get_activeModelMessage(self) -> str:
+        return self._activeModelMessage
+
+    def _set_activeModelMessage(self, value: str) -> None:
+        self._activeModelMessage = value
+        self.changed.emit()
+
+    activeModelMessage = pyqtProperty(
+        str, _get_activeModelMessage, _set_activeModelMessage, notify=changed
+    )
+
+    def _get_canReinstall(self) -> bool:
+        return self._canReinstall
+
+    def _set_canReinstall(self, value: bool) -> None:
+        self._canReinstall = value
+        self.changed.emit()
+
+    canReinstall = pyqtProperty(bool, _get_canReinstall, _set_canReinstall, notify=changed)
+
+    def _get_canInstall(self) -> bool:
+        return self._canInstall
+
+    def _set_canInstall(self, value: bool) -> None:
+        self._canInstall = value
+        self.changed.emit()
+
+    canInstall = pyqtProperty(bool, _get_canInstall, _set_canInstall, notify=changed)
+
     def _get_downloadState(self) -> str:
         return self._downloadState
 
@@ -778,6 +835,15 @@ class FakeSettings(QObject):
 
     downloadTitle = pyqtProperty(str, _get_downloadTitle, _set_downloadTitle, notify=changed)
 
+    def _get_downloadDetail(self) -> str:
+        return self._downloadDetail
+
+    def _set_downloadDetail(self, value: str) -> None:
+        self._downloadDetail = value
+        self.changed.emit()
+
+    downloadDetail = pyqtProperty(str, _get_downloadDetail, _set_downloadDetail, notify=changed)
+
     def _get_speed(self) -> str:
         return self._speed
 
@@ -799,6 +865,18 @@ class FakeSettings(QObject):
     @pyqtSlot()
     def reinstallActiveModel(self) -> None:
         self.calls.append("reinstallActiveModel")
+
+    @pyqtSlot()
+    def installRecommendedModel(self) -> None:
+        self.calls.append("installRecommendedModel")
+
+    @pyqtSlot()
+    def cancelDownloads(self) -> None:
+        self.calls.append("cancelDownloads")
+
+    @pyqtSlot()
+    def openModelsFolder(self) -> None:
+        self.calls.append("openModelsFolder")
 
     @pyqtSlot(str, result=bool)
     def is_locked(self, name: str) -> bool:
@@ -1571,6 +1649,7 @@ def test_mic_silence_is_reported_while_listening(onboarding_app: Any, dark: bool
     fake.levelMessage = "Не удалось открыть микрофон"
     silence = "Пока тишина"
     warning = "Микрофон молчит"
+    retry = "Проверить ещё раз"
 
     def inspect(root: Any) -> None:
         for state, level in (
@@ -1587,7 +1666,10 @@ def test_mic_silence_is_reported_while_listening(onboarding_app: Any, dark: bool
             onboarding_app.processEvents()
             texts = visible_texts(root)
             assert (warning in texts) == (state == "listening" and level <= 0.02), (state, level)
-            assert (fake.levelMessage in texts) == (state == "error"), (state, level)
+            # В idle пояснение означает, что мост сам остановил проверку по
+            # общему потолку (ИБ, У62): показываем его и даём повторить.
+            assert (fake.levelMessage in texts) == (state in ("error", "idle")), (state, level)
+            assert (retry in texts) == (state == "idle"), (state, level)
             if state == "listening":
                 assert (silence in texts) == (level <= 0.02), level
                 assert ("Слышим вас" in texts) == (level > 0.02), level

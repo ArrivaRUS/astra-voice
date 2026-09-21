@@ -13,6 +13,11 @@ Column {
     readonly property string saveError: root.settings ? root.settings.saveError : ""
     readonly property string modelSelfcheck: root.settings ? root.settings.modelSelfcheck : ""
     readonly property string activeModelState: root.settings ? root.settings.activeModelState : "none"
+    // Пока модель качается или проверяется, действия над ней недоступны.
+    readonly property bool busyWithModel: root.activeModelState === "downloading"
+        || root.activeModelState === "verifying"
+    // Модели нет вовсе — предлагаем поставить рекомендованную, а не «переустановить».
+    readonly property bool canInstall: root.activeModelState === "none"
 
     function isLocked(name) {
         return settings && settings.lockedSettings
@@ -65,7 +70,9 @@ Column {
             Text {
                 textFormat: Text.PlainText
                 text: {
-                    if (root.activeModelState === "downloading" || root.activeModelState === "verifying") {
+                    if (!root.settings)
+                        return ""
+                    if (root.busyWithModel) {
                         var parts = []
                         if (root.settings.downloadTitle !== "")
                             parts.push(root.settings.downloadTitle)
@@ -73,17 +80,11 @@ Column {
                             parts.push(root.settings.eta)
                         return parts.join(" · ")
                     }
-                    if (root.activeModelState === "broken")
-                        return qsTr("Файлы модели не читаются")
-                    if (root.activeModelState === "failed")
-                        return qsTr("Не удалось загрузить модель")
-                    if (root.activeModelState === "no-space")
-                        return qsTr("Не хватает места на диске")
-                    return ""
+                    // Текст отказа приходит из моста готовой фразой (§4.4).
+                    return root.settings.activeModelMessage
                 }
                 visible: text !== ""
-                color: root.activeModelState === "downloading" || root.activeModelState === "verifying"
-                    ? Theme.fgMuted : Theme.dangerInk
+                color: root.busyWithModel ? Theme.fgMuted : Theme.dangerInk
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSettingSubSize
                 renderType: Text.NativeRendering
@@ -92,16 +93,32 @@ Column {
                 Layout.alignment: Qt.AlignVCenter
             }
 
-            // Слота «Установить модель» (§3.3, модели нет) в мосте нет:
-            // «Переустановить» просто неактивна; тихую заглушку ставить нельзя.
+            // Во время загрузки её можно прервать — иначе фоновая сеть
+            // остаётся без управления (ИБ, У66).
             AvButton {
-                text: qsTr("Переустановить")
+                text: qsTr("Отмена")
                 small: true
-                iconName: "refresh"
-                enabled: root.settings !== null && root.activeModelState !== "none"
-                    && root.activeModelState !== "downloading" && root.activeModelState !== "verifying"
+                visible: root.busyWithModel
                 Layout.alignment: Qt.AlignVCenter
-                onClicked: if (root.settings) root.settings.reinstallActiveModel()
+                onClicked: if (root.settings) root.settings.cancelDownloads()
+            }
+
+            AvButton {
+                text: root.canInstall ? qsTr("Установить") : qsTr("Переустановить")
+                small: true
+                iconName: root.canInstall ? "download" : "refresh"
+                visible: !root.busyWithModel
+                enabled: root.settings !== null
+                    && (root.canInstall ? root.settings.canInstall : root.settings.canReinstall)
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: {
+                    if (!root.settings)
+                        return
+                    if (root.canInstall)
+                        root.settings.installRecommendedModel()
+                    else
+                        root.settings.reinstallActiveModel()
+                }
             }
         }
 

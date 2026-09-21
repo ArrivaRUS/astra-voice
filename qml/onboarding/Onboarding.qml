@@ -141,8 +141,10 @@ Item {
         progress: root.bridge ? root.bridge.downloadProgress : 0
         speed: root.bridge ? root.bridge.speed : ""
         eta: root.bridge ? root.bridge.eta : ""
+        detail: root.bridge ? root.bridge.downloadDetail : ""
         freezeAnimations: root.freezeAnimations
         onRetryRequested: { if (root.bridge) root.bridge.startSelectedDownloads(); }
+        onOpenFolderRequested: { if (root.bridge) root.bridge.openModelsFolder(); }
     }
 
     Rectangle {

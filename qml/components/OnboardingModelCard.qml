@@ -17,7 +17,7 @@ Rectangle {
     property bool selected: false
     property string badge: ""
     property string cardState: "available"
-    // Пока в мосте нет слота «открыть папку моделей», кнопка скрыта, чтобы не быть тихой заглушкой.
+    // Кнопку показываем только там, где мост умеет открыть папку.
     property bool openFolderEnabled: false
     property string message: ""
     property var metrics: []

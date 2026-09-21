@@ -94,6 +94,8 @@ Item {
                 onToggleRequested: { if (root.bridge) root.bridge.toggleModel(modelData.id); }
                 onRetryRequested: { if (root.bridge) root.bridge.retryModel(modelData.id); }
                 onCancelRequested: { if (root.bridge) root.bridge.cancelDownloads(); }
+                openFolderEnabled: root.bridge !== null
+                onOpenFolderRequested: { if (root.bridge) root.bridge.openModelsFolder(); }
             }
         }
     }
@@ -131,9 +133,15 @@ Item {
             Layout.minimumWidth: 0
             Layout.maximumWidth: implicitWidth
             visible: text !== ""
-            text: root.bridge ? root.bridge.selectionMessage : ""
+            // Пока места хватает, показываем сколько его свободно; при нехватке
+            // мост присылает объяснение, и оно важнее (§10.2).
+            text: root.bridge
+                ? (root.bridge.selectionMessage !== ""
+                    ? root.bridge.selectionMessage : root.bridge.freeSpaceText)
+                : ""
             textFormat: Text.PlainText
-            color: Theme.onboardingSummaryLineFreeColor
+            color: root.bridge && root.bridge.selectionMessage !== ""
+                ? Theme.onboardingSummaryLineColorWarn : Theme.onboardingSummaryLineFreeColor
             font.family: Theme.fontUi
             font.pixelSize: Theme.onboardingSummaryLineSize
             renderType: Text.NativeRendering
