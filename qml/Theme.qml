@@ -1,4 +1,4 @@
-// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.1.4 — НЕ ПРАВИТЬ РУКАМИ.
+// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.2.0 — НЕ ПРАВИТЬ РУКАМИ.
 // Перегенерация: python3 scripts/gen_theme.py · проверка: python3 scripts/gen_theme.py --check
 
 pragma Singleton
@@ -324,11 +324,16 @@ QtObject {
     readonly property var micLevelMeterSampleLive: [9, 16, 26, 31, 20, 12, 22, 15, 8]
     readonly property var micLevelMeterSampleQuiet: [5, 7, 6, 8, 6, 5, 7, 6, 5]
     readonly property real modelCardBadgesGap: 5
+    readonly property real modelCardHeadGap: 6
+    readonly property bool modelCardHeadWrap: true
     readonly property real modelCardMarginBottom: 8
     readonly property color modelCardMetricFillEstimated: fgFaint
     readonly property color modelCardMetricFillMeasured: primary
     readonly property real modelCardMetricGap: 8
     readonly property real modelCardMetricLabelW: 54
+    readonly property color modelCardMetricSourceCaptionColor: fgFaint
+    readonly property real modelCardMetricSourceCaptionMarginTop: 2
+    readonly property real modelCardMetricSourceCaptionSize: 11.5
     readonly property color modelCardMetricTrackBg: bgSurface2
     readonly property real modelCardMetricTrackH: 6
     readonly property real modelCardMetricTrackRadius: 3
@@ -338,6 +343,15 @@ QtObject {
     readonly property real modelCardPaddingY: 9
     readonly property real modelCardPaddingX: 13
     readonly property real modelCardRadius: 10
+    readonly property real modelCardSelectBorder: 1.5
+    readonly property real modelCardSelectGap: 14
+    readonly property bool modelCardSelectMultiple: true
+    readonly property real modelCardSelectRadius: 5
+    readonly property real modelCardSelectSize: 18
+    readonly property real modelCardSpaceLineGapToTags: 6
+    readonly property color modelCardSpaceLineLabel: fgMuted
+    readonly property real modelCardSpaceLineLineHeight: 18
+    readonly property real modelCardSpaceLineSize: 12
     readonly property real modelCardTopGap: 14
     readonly property real noteBannerGap: 9
     readonly property real noteBannerIcon: 15
@@ -359,8 +373,25 @@ QtObject {
     readonly property real onboardingDotActiveRadius: 4
     readonly property real onboardingDotActiveW: 20
     readonly property real onboardingDotsGap: 7
+    readonly property color onboardingProgressStripBg: bgApp
+    readonly property real onboardingProgressStripBodyShrink: 36
+    readonly property real onboardingProgressStripGap: 10
+    readonly property real onboardingProgressStripH: 36
+    readonly property real onboardingProgressStripIcon: 14
+    readonly property color onboardingProgressStripTailColor: fgMuted
+    readonly property real onboardingProgressStripTailSize: 12
+    readonly property color onboardingProgressStripTextColor: fgSecondary
+    readonly property real onboardingProgressStripTextSize: 12.5
+    readonly property real onboardingProgressStripTrackH: 6
+    readonly property real onboardingProgressStripTrackW: 160
     readonly property bool onboardingSkippable: true
+    readonly property real onboardingStep2ContentW: 720
     readonly property int onboardingSteps: 5
+    readonly property color onboardingSummaryLineColor: fg
+    readonly property color onboardingSummaryLineColorWarn: dangerInk
+    readonly property color onboardingSummaryLineFreeColor: fgMuted
+    readonly property real onboardingSummaryLineMarginTop: 10
+    readonly property real onboardingSummaryLineSize: 13
     readonly property real popoverItemDescSize: 11.5
     readonly property real popoverItemGap: 8
     readonly property real popoverItemH: 38

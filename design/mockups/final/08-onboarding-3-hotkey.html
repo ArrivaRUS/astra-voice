@@ -219,8 +219,43 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 .trk{width:78px}
 .mhr{margin:8px 0 7px}
 
-/* --- фокус клавиатуры (§8 PRD): видимая рамка 2 px ------------------------ */
-.foc{outline:2px solid var(--primary);outline-offset:2px;border-radius:8px}
+/* --- карточка модели = ВЫБОР (решение заказчика 2026-09-17) --------------
+   Кнопки «Скачать» и «Из файла…» из карточки убраны, прогресс уехал в сквозную
+   полоску мастера; в карточке осталась отметка выбора слева и один бейдж состояния. */
+.cbx{width:18px;height:18px;border-radius:5px;border:1.5px solid var(--fg4);background:var(--bg-surface);
+  display:inline-flex;align-items:center;justify-content:center;flex:none;margin-top:2px}
+.cbx.on{background:var(--primary);border-color:var(--primary)}
+.cbx.dis{background:var(--bg-sunk);border-color:var(--border)}
+.mc.pick{border-color:var(--primary);background:var(--primary-bg)}
+.mc.hov{background:var(--bg-sunk)}
+.mhead{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.bd.ins{background:var(--ok-bg);color:var(--ok-ink)}
+/* на активной карточке фон бейджа совпал бы с фоном карточки — поднимаем его на поверхность */
+.mc.act .bd.act{background:var(--bg-surface)}
+/* одна строка «Занимает места»: обычный вес, значения fg, подписи fg-muted, разделитель — точка */
+.mspace{font-size:12px;line-height:18px;color:var(--fg3)}
+.mspace b{font-weight:400;color:var(--fg1)}
+/* источник цифр под полосками метрик: чужой бенчмарк, а не замер на этом компьютере (§5.3) */
+.msrc{font-size:11.5px;line-height:1.35;color:var(--fg4);text-align:right;margin-top:2px}
+
+/* --- сквозная полоска загрузки модели: обрамление мастера, шаги 2–5 ------ */
+.dlbar{height:36px;flex:none;display:flex;align-items:center;gap:10px;padding:0 22px;
+  background:var(--bg-app);border-top:1px solid var(--border);font-size:12.5px;color:var(--fg2)}
+.dlbar .sp{flex:1}
+.dlbar .tail{font-size:12px;color:var(--fg3);white-space:nowrap}
+.dlbar .ttl{white-space:nowrap}
+/* неопределённая полоска: сегмент 38 % ездит по дорожке (см. spec §10) */
+.prog.ind i{width:38%;margin-left:26%}
+
+/* --- фокус клавиатуры (§8 PRD): видимая рамка 2 px ------------------------
+   Цвет — решение У1 (`state.<тема>.focus-ring`): светлая accent-ink #0A776A (5,16:1),
+   тёмная accent #2FD9C4 (10,6:1). Ровно это рисует реализация (`Theme.stateFocusRing`
+   в AvButton/AvSelect/AvToggle/AvSegmented/SidebarItem). До 2026-09-21 макет рисовал
+   здесь `primary` — отклонение макета от принятого решения, исправлено. */
+.foc{outline:2px solid var(--accent-ink);outline-offset:2px;border-radius:8px}
+/* раскрытый выпадающий список — ЭТО НЕ ФОКУС: граница primary, как `Theme.selectOpenState`
+   в AvSelect.qml:43 (токен component.select.open-state) */
+.selopen{border-color:var(--primary)}
 
 /* --- выпадающий список (раскрытый) --------------------------------------- */
 .pop{position:absolute;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;
@@ -315,6 +350,6 @@ table.t td.f{font-family:var(--font-mono);font-size:11.5px}
 </style></head>
 <body class="light">
 <div class="cap"><b>Онбординг 3/5</b> — горячая клавиша и захват · светлая тема</div>
-<div class="win" style="width:900px;height:620px"><div class="tbar"><svg viewBox="0 0 100 51.7238" width="16" height="8.28" aria-hidden="true" style="flex:none"><circle cx="8.1233" cy="12.8619" r="6.7694" fill="var(--fg1)"/><circle cx="41.4966" cy="12.8619" r="9.3418" fill="var(--fg1)"/><circle cx="69.7928" cy="12.8619" r="12.8619" fill="var(--accent)"/><rect x="0" y="31.7238" width="100" height="20" rx="10" fill="var(--fg1)"/></svg><span class="t">Astra Voice — первый запуск</span><span class="sp"></span><span class="wbtn"></span><span class="wbtn"></span><span class="wbtn c"></span></div><div style="display:flex;align-items:center;gap:12px;padding:14px 22px 0"><span class="c12">Шаг 3 из 5</span><span class="steps"><span class="sd dn"></span><span class="sd dn"></span><span class="sd on"></span><span class="sd "></span><span class="sd "></span></span><span style="flex:1"></span><span class="c12">Горячая клавиша</span></div><div class="obody"><div style="width:580px"><div class="h2">Горячая клавиша</div><div class="sm" style="margin:4px 0 14px">Зажмите её и говорите. Отпустили — текст появится там, где стоит курсор.</div><div class="card"><div class="r"><div class="left"><div class="lbl">Текущая комбинация</div><div class="sub">По умолчанию — как в Handy</div></div><div style="display:flex;gap:8px;align-items:center"><span class="key">Ctrl + Space</span><span class="btn sm">Изменить</span></div></div><div class="r"><div class="left"><div class="lbl">Режим</div><div class="sub">Удерживать — самый предсказуемый вариант</div></div><span class="seg"><span class="on">Удерживать</span><span class="">Нажать-нажать</span></span></div></div><div class="grp" style="margin:16px 0 7px">Назначение новой комбинации</div><div class="field cap"><span class="mono" style="font-size:14px;color:var(--fg1)">Нажмите комбинацию…</span><span style="flex:1"></span><span class="c12">Esc — отмена</span></div><div class="note w" style="margin-top:8px"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="var(--warn-ink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 2.6l6 10.8H2zM8 6.6v3.1M8 11.4v.1"/></svg><div><b>Комбинация занята в KDE</b><span class="mono">Alt + F2</span> назначена на действие «Показать KRunner». Оставить её можно, но диктовка может не сработать — система заберёт нажатие себе.<div style="display:flex;gap:8px;margin-top:9px"><span class="btn ">Оставить Alt + F2</span><span class="btn pri">Выбрать другую</span></div></div></div></div></div><div class="obar"><span class="btn ">Назад</span><span style="flex:1"></span><span class="btn gh">Пропустить</span><span class="btn pri">Продолжить</span></div></div>
-<div class="legend"><b>Шаг 3 из 5.</b> Конфликт с KDE показывается <b>с именем чужого действия</b> («Показать KRunner») и не запрещает выбор — решает человек (PRD S1-A4). Полный набор состояний поля захвата — на экране «Общие: захват комбинации».</div>
+<div class="win" style="width:900px;height:620px"><div class="tbar"><svg viewBox="0 0 100 51.7238" width="16" height="8.28" aria-hidden="true" style="flex:none"><circle cx="8.1233" cy="12.8619" r="6.7694" fill="var(--fg1)"/><circle cx="41.4966" cy="12.8619" r="9.3418" fill="var(--fg1)"/><circle cx="69.7928" cy="12.8619" r="12.8619" fill="var(--accent)"/><rect x="0" y="31.7238" width="100" height="20" rx="10" fill="var(--fg1)"/></svg><span class="t">Astra Voice — первый запуск</span><span class="sp"></span><span class="wbtn"></span><span class="wbtn"></span><span class="wbtn c"></span></div><div style="display:flex;align-items:center;gap:12px;padding:14px 22px 0"><span class="c12">Шаг 3 из 5</span><span class="steps"><span class="sd dn"></span><span class="sd dn"></span><span class="sd on"></span><span class="sd "></span><span class="sd "></span></span><span style="flex:1"></span><span class="c12">Горячая клавиша</span></div><div class="obody"><div style="width:580px"><div class="h2">Горячая клавиша</div><div class="sm" style="margin:4px 0 14px">Зажмите её и говорите. Отпустили — текст появится там, где стоит курсор.</div><div class="card"><div class="r"><div class="left"><div class="lbl">Текущая комбинация</div><div class="sub">По умолчанию — как в Handy</div></div><div style="display:flex;gap:8px;align-items:center"><span class="key">Ctrl + Space</span><span class="btn sm">Изменить</span></div></div><div class="r"><div class="left"><div class="lbl">Режим</div><div class="sub">Удерживать — самый предсказуемый вариант</div></div><span class="seg"><span class="on">Удерживать</span><span class="">Нажать-нажать</span></span></div></div><div class="grp" style="margin:16px 0 7px">Назначение новой комбинации</div><div class="field cap"><span class="mono" style="font-size:14px;color:var(--fg1)">Нажмите комбинацию…</span><span style="flex:1"></span><span class="c12">Esc — отмена</span></div><div class="note w" style="margin-top:8px"><svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="var(--warn-ink)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 2.6l6 10.8H2zM8 6.6v3.1M8 11.4v.1"/></svg><div><b>Комбинация занята в системе</b><span class="mono">Alt + F2</span> назначена на действие «Показать KRunner». Оставить её можно, но диктовка может не сработать — система заберёт нажатие себе.<div style="display:flex;gap:8px;margin-top:9px"><span class="btn ">Оставить Alt + F2</span><span class="btn pri">Выбрать другую</span></div></div></div></div></div><div class="dlbar"><svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="var(--primary)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="flex:none"><path d="M8 2.8v7.4m0 0l-3-3m3 3l3-3M2.8 13.2h10.4"/></svg><span class="ttl">Загружается GigaAM v3 RNN-T</span><span class="sp"></span><span class="prog" style="width:160px;flex:none"><i style="width:43%"></i></span><span class="tail">5,2 МБ/с · осталось ~3 мин</span></div><div class="obar"><span class="btn ">Назад</span><span style="flex:1"></span><span class="btn gh">Пропустить</span><span class="btn pri">Продолжить</span></div></div>
+<div class="legend"><b>Шаг 3 из 5.</b> Занятая комбинация показывается <b>с именем чужого действия</b> («Показать KRunner») и не запрещает выбор — решает человек (PRD S1-A4). Полный набор состояний поля захвата — на экране «Общие: захват комбинации». Внизу — <b>сквозная полоска загрузки</b>: модель, выбранная на шаге 2, качается фоном, мастер не ждёт её.</div>
 </body></html>

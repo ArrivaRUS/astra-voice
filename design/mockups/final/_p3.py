@@ -2,8 +2,8 @@
 """Онбординг (08), пилюля и трей (09), диалоги и системные окна (10)."""
 from _shell import (page, write, titlebar, sb, ic, tgl, key, btn, row, card, group, met,
                     level_bars, stcell, sech, grid, th, pill, tray, mark, logo, appicon,
-                    PILL_MIN, PILL_MAX, W, H)
-from _p1 import sel, seg, mcard, hotkey_field, mic_row_states
+                    dlbar, DL_STATES, PILL_MIN, PILL_MAX, W, H)
+from _p1 import sel, seg, mcard, hotkey_field, mic_row_states, pick_bar
 
 DD = 'var(--fg3)'
 
@@ -22,7 +22,12 @@ EXTRA_CSS = """
 # ══════════════════════════════════════════════════════════════════════════
 # 08 · ОНБОРДИНГ
 # ══════════════════════════════════════════════════════════════════════════
-def onb(step, body, actions, title="Astra Voice — первый запуск"):
+def onb(step, body, actions, title="Astra Voice — первый запуск", progress=None, queue=""):
+    """progress — состояние сквозной полоски загрузки (None = загрузки нет, полоски нет).
+
+    Полоска — часть ОБРАМЛЕНИЯ мастера, а не содержимого шага: она стоит над нижней панелью
+    с кнопками и видна на шагах 2–5, пока идёт загрузка (решение заказчика 2026-09-16).
+    """
     dots = "".join(f'<span class="sd {"on" if i == step else ("dn" if i < step else "")}"></span>'
                    for i in range(1, 6))
     hd = ('<div style="display:flex;align-items:center;gap:12px;padding:14px 22px 0">'
@@ -30,17 +35,18 @@ def onb(step, body, actions, title="Astra Voice — первый запуск"):
           '<span style="flex:1"></span>'
           f'<span class="c12">{["", "Сеть", "Модель", "Горячая клавиша", "Микрофон", "Готово"][step]}</span>'
           '</div>')
+    bar = dlbar(progress, queue=queue) if progress else ""
     return (f'<div class="win" style="width:{W}px;height:{H}px">{titlebar(title)}{hd}'
-            f'<div class="obody">{body}</div><div class="obar">{actions}</div></div>')
+            f'<div class="obody">{body}</div>{bar}<div class="obar">{actions}</div></div>')
 
 
-def acts(back=True, skip=True, skip_dis=False, next_="Продолжить", note=""):
+def acts(back=True, skip=True, skip_dis=False, next_="Продолжить", note="", next_dis=False):
     b = btn("Назад") if back else ""
     s = ""
     if skip:
         s = btn("Пропустить", "gh dis" if skip_dis else "gh")
     n = f'<span class="c12">{note}</span>' if note else ""
-    return f'{b}{n}<span style="flex:1"></span>{s}{btn(next_, "pri")}'
+    return f'{b}{n}<span style="flex:1"></span>{s}{btn(next_, "dis" if next_dis else "pri")}'
 
 
 def onb1(theme):
@@ -71,70 +77,72 @@ def onb1(theme):
                 b, theme, leg, EXTRA_CSS)
 
 
-def onb2_card(state):
-    if state == "avail":
-        return mcard("rnnt", "avail", [("Рекомендуем", "rec")],
-                     acts=btn("Скачать 231,9 МБ", "sm pri", "down") + " " + btn("Из файла…", "sm", "folder"))
-    if state == "downloading":
-        return mcard("rnnt", "downloading", [("Рекомендуем", "rec")])
-    if state == "nonet":
-        return mcard("rnnt", "nonet", [("Рекомендуем", "rec")],
-                     note=("i", "Нет доступа к huggingface.co"),
-                     acts=btn("Скачать", "sm dis") + " " + btn("Установить из файла…", "sm pri", "folder"))
-    if state == "installed":
-        return mcard("rnnt", "active", [("Активна", "act"), ("Рекомендуем", "rec")],
-                     acts=btn("Установлена · 231,9 МБ", "sm dis", "check"))
-    raise KeyError(state)
+ONB2_W = 720   # шире колонки настроек: имя, «Рекомендуем» и бейдж состояния встают в одну строку
+
+
+def onb2_body(cards, total, free="свободно на диске 42,1 ГБ", action=None, warn=False,
+              head_sub=None, catalog=False):
+    """Тело шага 2: карточки выбора + строка итога + одна общая кнопка «из файла»."""
+    sub = head_sub or ('Отметьте, что скачать. Рекомендуем русскую GigaAM: она расставляет знаки '
+                       'препинания сама. Загрузка начнётся, когда нажмёте «Продолжить».')
+    act = btn("Установить из файла или папки…", "", "folder") if action is None else action
+    more = (f'{btn("Показать все 12 моделей", "gh")}' if catalog else "")
+    return (f'<div style="width:{ONB2_W}px">'
+            '<div class="h2">Выберите модель распознавания</div>'
+            f'<div class="sm" style="margin:4px 0 14px">{sub}</div>'
+            + cards
+            + pick_bar(total, free, "", warn)
+            + '<div style="display:flex;gap:8px;align-items:center;margin-top:10px">'
+            + act + '<span style="flex:1"></span>' + more + '</div></div>')
+
+
+def onb2_cards(rec_state="avail", extra=""):
+    return mcard("rnnt", rec_state, [("Рекомендуем", "rec")]) + extra
 
 
 def onb2(theme):
-    body = ('<div style="width:620px">'
-            '<div class="h2">Выберите модель распознавания</div>'
-            '<div class="sm" style="margin:4px 0 14px">Без модели диктовка не работает — это '
-            'единственный шаг, который нельзя пропустить. Рекомендуем русскую GigaAM: она '
-            'расставляет знаки препинания сама.</div>'
-            + onb2_card("avail")
-            + mcard("vosk-s", "avail",
-                    acts=btn("Скачать 26,7 МБ", "sm", "down") + " " + btn("Из файла…", "sm"))
-            + f'<div style="display:flex;gap:8px;align-items:center;margin-top:4px">'
-              f'{btn("Показать все 12 моделей", "gh")}<span style="flex:1"></span>'
-              f'{btn("Установить из файла или папки…", "", "folder")}</div>'
-            '</div>')
-    b = onb(2, body, acts(next_="Продолжить", skip=True, skip_dis=True,
-                          note="Пропустить нельзя: без модели программа не работает"))
-    dl = mcard("rnnt", "downloading", [("Рекомендуем", "rec")])
-    err_net = (f'<div class="note e">{ic("alert", 15, "var(--err-ink)")}'
-               '<div><b>Нет доступа к huggingface.co</b>'
-               'Проверьте подключение или попросите у администратора адрес корпоративного зеркала. '
-               'Модель можно поставить из файла — например, с флешки.'
-               f'<div style="display:flex;gap:8px;margin-top:9px">'
-               f'{btn("Установить из файла…", "pri", "folder")}{btn("Повторить", "", "refresh")}'
-               '</div></div></div>')
-    err_sha = (f'<div class="note e">{ic("alert", 15, "var(--err-ink)")}'
-               '<div><b>Файл не прошёл проверку</b>'
-               'Загруженные файлы повреждены или подменены. Мы их удалили — попробуйте скачать заново.'
-               f'<div style="margin-top:9px">{btn("Скачать заново", "pri", "down")}</div></div></div>')
-    err_space = (f'<div class="note e">{ic("alert", 15, "var(--err-ink)")}'
-                 '<div><b>Недостаточно места на диске</b>'
-                 'Нужно ~270 МБ, свободно 100 МБ. Освободите место или выберите модель полегче — '
-                 'Vosk small занимает 26,7 МБ.'
-                 f'<div style="display:flex;gap:8px;margin-top:9px">'
-                 f'{btn("Открыть папку моделей", "pri", "folder")}{btn("Выбрать полегче")}</div></div></div>')
-    leg = ("<b>Шаг 2 из 5 — единственный обязательный.</b> «Пропустить» показан, но недоступен: "
-           "объяснение стоит рядом, а не всплывает после нажатия. Показаны две модели и ссылка на полный "
-           "каталог — на первом запуске выбор из двенадцати мешает. «Установить из файла или папки…» "
-           "доступна всегда, даже когда сети нет.")
+    # основной кадр M5: в каталоге одна модель, ничего не выбрано → «Продолжить» неактивна
+    body = onb2_body(onb2_cards("avail"), "Пока ничего не выбрано")
+    b = onb(2, body, acts(next_="Продолжить", skip=True, skip_dis=True, next_dis=True,
+                          note="Выберите хотя бы одну модель — без неё диктовка не работает"))
+    one = onb(2, onb2_body(onb2_cards("selected"), "Будет скачано 226 МБ"),
+              acts(next_="Продолжить", skip=True, skip_dis=True))
+    two = onb(2, onb2_body(onb2_cards("selected", mcard("vosk-s", "selected")),
+                           "Будет скачано 252,7 МБ", catalog=True),
+              acts(next_="Продолжить", skip=True, skip_dis=True))
+    nospace = onb(2, onb2_body(
+        mcard("rnnt", "nospace", [("Рекомендуем", "rec")],
+              note=("e", "Нужно ещё 126 МБ, свободно 100 МБ"))
+        + mcard("vosk-s", "avail"),
+        "Не хватает места: нужно ещё 126 МБ", "свободно на диске 100 МБ", warn=True),
+        acts(next_="Продолжить", skip=True, skip_dis=True, next_dis=True,
+             note="Освободите место или выберите модель полегче"))
+    nonet = onb2_body(onb2_cards("nonet"), "Пока ничего не выбрано",
+                      head_sub='Сети нет — модель можно поставить из файла, например с флешки.')
+    failed = onb2_body(
+        mcard("rnnt", "failed", [("Рекомендуем", "rec")],
+              note=("e", "Не удалось загрузить модель — соединение оборвалось")),
+        "Будет скачано 226 МБ")
+    leg = ("<b>Шаг 2 из 5 — карточка теперь только ВЫБОР</b> (решение заказчика 2026-09-17): кнопок "
+           "«Скачать» и «Из файла…» в карточке нет, отметка слева, выбор множественный, карточка "
+           "кликабельна целиком. Под карточками — <b>итог «Будет скачано N МБ»</b> и свободное место; "
+           "внизу <b>одна общая</b> «Установить из файла или папки…», она работает и без сети. "
+           "«Продолжить» <b>неактивна, пока ничего не выбрано</b>, подсказка стоит рядом, а не "
+           "всплывает после нажатия; нажатие запускает загрузку и сразу ведёт на шаг 3 — дальше её "
+           "ход показывает сквозная полоска внизу мастера. Отдельного заслона «нет модели» в конце "
+           "мастера больше не нужно: пройти шаг 2, не выбрав модель, нельзя. В M5 в каталоге одна "
+           "модель — кадр с двумя карточками показывает, как это работает в M6.")
     return page(f"A · Онбординг 2/5 — {th(theme)}",
-                f'<b>Онбординг 2/5</b> — модель: скачать, из файла, прогресс, ошибки · {th(theme)} тема',
-                b + sech("Состояния шага «Модель»") + grid([
-                    stcell("скачивание идёт", dl, "downloading"),
-                    stcell("модель установлена — шаг пройден", onb2_card("installed"), "installed"),
+                f'<b>Онбординг 2/5</b> — выбор модели: ничего не выбрано, выбрана, нет места · {th(theme)} тема',
+                b + sech("Шаг 2: выбрана одна модель — «Продолжить» доступна") + one
+                + sech("Шаг 2 (M6): выбраны две модели — итог суммируется") + two
+                + sech("Шаг 2: не хватает места на диске") + nospace
+                + sech("Состояния содержимого шага") + grid([
+                    stcell("нет сети — отметка недоступна, остаётся путь через файл", nonet,
+                           "no-network"),
                 ], 1) + grid([
-                    stcell("нет сети — путь через файл", onb2_card("nonet"), "no-network"),
-                ], 1) + grid([
-                    stcell("сеть отвалилась", err_net, "error-net"),
-                    stcell("контрольная сумма не совпала", err_sha, "error-sha"),
-                ]) + grid([stcell("не хватает места", err_space, "no-space")], 1),
+                    stcell("загрузка не удалась — «Повторить» в карточке", failed, "failed"),
+                ], 1),
                 theme, leg, EXTRA_CSS)
 
 
@@ -152,40 +160,62 @@ def onb3(theme):
             + '<div class="grp" style="margin:16px 0 7px">Назначение новой комбинации</div>'
             + hotkey_field("capturing") + hotkey_field("conflict")
             + '</div>')
-    b = onb(3, body, acts())
-    leg = ("<b>Шаг 3 из 5.</b> Конфликт с KDE показывается <b>с именем чужого действия</b> («Показать "
-           "KRunner») и не запрещает выбор — решает человек (PRD S1-A4). Полный набор состояний поля "
-           "захвата — на экране «Общие: захват комбинации».")
+    # загрузка, запущенная на шаге 2, едет по остальным экранам мастера
+    b = onb(3, body, acts(), progress="downloading")
+    leg = ("<b>Шаг 3 из 5.</b> Занятая комбинация показывается <b>с именем чужого действия</b> "
+           "(«Показать KRunner») и не запрещает выбор — решает человек (PRD S1-A4). Полный набор "
+           "состояний поля захвата — на экране «Общие: захват комбинации». Внизу — <b>сквозная "
+           "полоска загрузки</b>: модель, выбранная на шаге 2, качается фоном, мастер не ждёт её.")
     return page(f"A · Онбординг 3/5 — {th(theme)}",
                 f'<b>Онбординг 3/5</b> — горячая клавиша и захват · {th(theme)} тема',
                 b, theme, leg, EXTRA_CSS)
 
 
+# ── шаг 4: проверка микрофона и тестовая диктовка — ДВЕ РАЗНЫЕ ЧАСТИ ──────
+# Решение заказчика 2026-09-16: микрофон проверяется всегда, модель для этого не нужна.
+def onb4_mic(kind="live", label="Слышим вас", sub="Пик −18 дБ · уровень в норме"):
+    return ('<div class="grp" style="margin:0 0 7px">Проверка микрофона</div>'
+            + card([row("Микрофон", sel("Системный по умолчанию", 236),
+                        "Встроенный микрофон", hint=False)])
+            + f'<div class="lvbox" style="margin-top:9px">{level_bars(kind)}'
+              f'<div style="flex:1"><div class="lbl">{label}</div>'
+              f'<div class="sub">{sub}</div></div></div>')
+
+
+def onb4_test(ready=True):
+    if ready:
+        return ('<div class="grp" style="margin:16px 0 7px">Тестовая диктовка</div>'
+                + f'<div class="lvbox">{btn("Тестовая диктовка", "pri", "chip")}'
+                  '<div style="flex:1"><div class="sub">Скажите фразу — покажем, что распознали. '
+                  'Никуда вставлять не будем.</div></div></div>'
+                + '<div class="field" style="margin-top:9px;color:var(--fg1)">'
+                  'Проверка связи, раз, два, три.</div>'
+                + f'<div class="c12" style="margin-top:7px;color:var(--ok-ink)">'
+                  f'{ic("check", 12, "var(--ok-ink)")} Распознано за 0,31 с · '
+                  'модель GigaAM v3 RNN-T</div>')
+    return ('<div class="grp" style="margin:16px 0 7px">Тестовая диктовка</div>'
+            + f'<div class="lvbox">{btn("Тестовая диктовка", "dis", "chip")}'
+              '<div style="flex:1"><div class="sub">Будет доступно после установки модели</div>'
+              '</div></div>')
+
+
 def onb4(theme):
     body = ('<div style="width:580px">'
             '<div class="h2">Проверим микрофон</div>'
-            '<div class="sm" style="margin:4px 0 14px">Скажите любую фразу — мы покажем уровень и '
-            'распознаем её прямо здесь. Никуда вставлять не будем.</div>'
-            + card([row("Микрофон", sel("Системный по умолчанию", 236),
-                        "Встроенный микрофон", hint=False)])
-            + f'<div class="lvbox" style="margin-top:12px">{level_bars("live")}'
-              '<div style="flex:1"><div class="lbl">Слышим вас</div>'
-              '<div class="sub">Пик −18 дБ · уровень в норме</div></div>'
-              f'{btn("Тестовая диктовка", "", "chip")}</div>'
-            + '<div class="field" style="margin-top:10px;color:var(--fg1)">Проверка связи, раз, два, три.'
-              '</div>'
-            + f'<div class="c12" style="margin-top:7px;color:var(--ok-ink)">{ic("check", 12, "var(--ok-ink)")}'
-              ' Распознано за 0,31 с · модель GigaAM v3 RNN-T · текст никуда не вставлен</div>'
-            '</div>')
+            '<div class="sm" style="margin:4px 0 14px">Сначала убедимся, что вас слышно. '
+            'Распознавание можно попробовать здесь же, когда модель будет готова.</div>'
+            + onb4_mic() + onb4_test(True) + '</div>')
     b = onb(4, body, acts())
+    body_wait = ('<div style="width:580px">'
+                 '<div class="h2">Проверим микрофон</div>'
+                 '<div class="sm" style="margin:4px 0 14px">Сначала убедимся, что вас слышно. '
+                 'Распознавание можно попробовать здесь же, когда модель будет готова.</div>'
+                 + onb4_mic() + onb4_test(False) + '</div>')
+    b_wait = onb(4, body_wait, acts(), progress="verifying")
     b_silent = onb(4, ('<div style="width:580px">'
                        '<div class="h2">Проверим микрофон</div>'
-                       '<div class="sm" style="margin:4px 0 14px">Скажите любую фразу — мы покажем '
-                       'уровень и распознаем её прямо здесь.</div>'
-                       + card([row("Микрофон", sel("Системный по умолчанию", 236), hint=False)])
-                       + f'<div class="lvbox" style="margin-top:12px">{level_bars("flat")}'
-                         '<div style="flex:1"><div class="lbl">Пока тишина</div>'
-                         '<div class="sub">Пик ниже −60 дБ уже 2 секунды</div></div></div>'
+                       '<div class="sm" style="margin:4px 0 14px">Сначала убедимся, что вас слышно.</div>'
+                       + onb4_mic("flat", "Пока тишина", "Пик ниже −60 дБ уже 2 секунды")
                        + f'<div class="note w" style="margin-top:11px">{ic("alert", 15, "var(--warn-ink)")}'
                          '<div><b>Микрофон молчит</b>'
                          'Устройство открыто, но звука нет. Обычно помогает перезапуск звуковой '
@@ -194,17 +224,23 @@ def onb4(theme):
                          f'{btn("Перезапустить звуковую службу", "pri", "refresh")}{btn("Что это", "gh")}'
                          '</div></div></div></div>'),
                    acts(note="Можно продолжить и разобраться позже"))
-    leg = ("<b>Шаг 4 из 5.</b> Тестовая диктовка идёт <b>без вставки</b> — на первом запуске курсор ещё "
-           "неизвестно где. Уровень показан столбиками и числом (−18 дБ), состояние «молчит» — плоскими "
-           "столбиками, значком и подписью, то есть не одним цветом. Кнопка перезапуска звуковой службы "
-           "стоит здесь же: это самая частая поломка на Astra.")
+    leg = ("<b>Шаг 4 из 5 — две разные части</b> (решение заказчика 2026-09-16). "
+           "<b>(а) Проверка микрофона</b> — выбор устройства и живая полоска уровня — работает "
+           "<b>всегда, без модели</b>: человеку не надо ждать 226 МБ, чтобы узнать, слышно его или нет. "
+           "<b>(б) Тестовая диктовка</b> — только при готовой модели; пока модель качается, кнопка "
+           "неактивна и прямо говорит почему («Будет доступно после установки модели»), а внизу видно "
+           "сквозную полоску. Строка результата — «Распознано за 0,31 с · модель GigaAM v3 RNN-T»; "
+           "слова «текст никуда не вставлен» убраны по решению заказчика 2026-09-17 (поведение не "
+           "меняется: пробная диктовка по-прежнему ничего не вставляет). Состояние «молчит» показано "
+           "плоскими столбиками, значком и подписью — не одним цветом.")
     return page(f"A · Онбординг 4/5 — {th(theme)}",
-                f'<b>Онбординг 4/5</b> — микрофон, уровень и «микрофон молчит» · {th(theme)} тема',
-                b + sech("Тот же шаг: устройство даёт тишину") + b_silent, theme, leg, EXTRA_CSS)
+                f'<b>Онбординг 4/5</b> — проверка микрофона и тестовая диктовка · {th(theme)} тема',
+                b + sech("Тот же шаг: модель ещё готовится — тестовая диктовка недоступна") + b_wait
+                + sech("Тот же шаг: устройство даёт тишину") + b_silent, theme, leg, EXTRA_CSS)
 
 
-def onb5(theme):
-    body = ('<div style="width:580px">'
+def onb5_ready_body():
+    return ('<div style="width:580px">'
             '<div class="h2">Всё готово</div>'
             '<div class="sm" style="margin:4px 0 14px">Осталось запомнить одно сочетание — остальное '
             'программа сделает сама.</div>'
@@ -216,7 +252,27 @@ def onb5(theme):
               f'{pill("listening")}<span class="c12" style="max-width:250px">Так выглядит запись: '
               'пилюля у нижнего края экрана. Она не забирает фокус и не появляется в Alt+Tab.</span></div>'
             '</div>')
-    b = onb(5, body, acts(skip=False, next_="Готово"))
+
+
+def onb5_wait_body():
+    return ('<div style="width:580px">'
+            '<div class="h2">Почти всё</div>'
+            '<div class="sm" style="margin:4px 0 14px">Начать можно будет, как только загрузится '
+            'модель. Окно можно закрыть — загрузка продолжится, мы сообщим, когда всё будет готово.'
+            '</div>'
+            + f'<div class="note i" style="margin-top:16px">{ic("info", 15, DD)}'
+              '<div><b>Комбинация уже назначена: Ctrl + Space</b>'
+              'Как только модель будет готова, зажмите её и говорите — текст появится там, где '
+              'стоит курсор. Значок в трее покажет, что всё готово.</div></div>'
+            '</div>')
+
+
+def onb5(theme):
+    b = onb(5, onb5_ready_body(), acts(skip=False, next_="Готово"))
+    b_wait = onb(5, onb5_wait_body(),
+                 acts(skip=False, next_="Готово", next_dis=True,
+                      note="Модель ещё загружается"),
+                 progress="downloading")
     notif = ('<div class="kn"><div class="knh">' + tray("idle", 14, "#8C97AC")
              + 'Astra Voice</div><b>Astra Voice готов</b>'
              'Зажмите <span style="font-family:var(--font-mono)">Ctrl + Space</span> и говорите — '
@@ -229,21 +285,65 @@ def onb5(theme):
                   + '</span><span class="pb mono">14:26</span></div>'
                   '<div style="position:absolute;right:44px;bottom:52px" class="tip">'
                   'Astra Voice — готов · Ctrl + Space</div></div>')
-    leg = ("<b>Шаг 5 из 5.</b> Решать здесь нечего: шаг только подтверждает результат и показывает "
-           "комбинацию. Автозапуска на шаге нет — он отложен до вехи M9 (решение от 16.09.2026). "
-           "«Готово» закрывает окно в трей и показывает одно системное уведомление с той же фразой, "
-           "что и на экране, — человек не должен запоминать комбинацию с одного взгляда.")
+    leg = ("<b>Шаг 5 из 5 — два вида.</b> <b>Ожидание:</b> «Почти всё», кнопка «Готово» неактивна, "
+           "внизу едет сквозная полоска; окно <b>само не закрывается</b> и его можно закрыть в любой "
+           "момент — загрузка продолжится в трее, по готовности придёт уведомление (решение заказчика "
+           "2026-09-16, поправки 1 и 2). <b>Готово:</b> «Всё готово», подсказка про клавишу диктовки, "
+           "кнопка активна; экран сам переходит из ожидания в готовность, без действий человека. "
+           "Автозапуска на шаге нет — он отложен до вехи M9.")
     return page(f"A · Онбординг 5/5 — {th(theme)}",
-                f'<b>Онбординг 5/5</b> — «Готово» и что дальше · {th(theme)} тема',
-                b + sech("Что происходит после «Готово»")
+                f'<b>Онбординг 5/5</b> — ожидание модели и «Всё готово» · {th(theme)} тема',
+                b + sech("Тот же шаг, пока модель не загрузилась") + b_wait
+                + sech("Что происходит после «Готово»")
                 + grid([stcell("уведомление KDE", notif, "notify"),
                         stcell("значок появился в трее", tray_scene, "tray")]),
                 theme, leg, EXTRA_CSS)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 09 · ПИЛЮЛЯ И ТРЕЙ
-# ══════════════════════════════════════════════════════════════════════════
+# ── сквозная полоска загрузки: отдельный экран со всеми состояниями ───────
+def onb_progress(theme):
+    fmt = ('<div class="stc"><div class="stn">формат времени и скорости'
+           '<span class="code">eta · speed</span></div>'
+           '<div class="sm" style="line-height:1.8">'
+           'Первые секунды, пока скорость не устоялась — <b>«считаю…»</b><br>'
+           'меньше минуты — <b>«осталось меньше минуты»</b><br>'
+           'меньше часа — <b>«осталось ~12 мин»</b><br>'
+           'час и больше — <b>«осталось ~1 ч 10 мин»</b><br>'
+           'Секунд нет ни в одном виде — они дёргаются, точность мнимая.<br>'
+           'Скорость: <b>«860 КБ/с»</b> ниже мегабайта, <b>«5,2 МБ/с»</b> выше.'
+           '</div></div>')
+    where = ('<div class="stc"><div class="stn">где стоит полоска</div>'
+             '<div class="sm" style="line-height:1.7">Полоска — часть <b>обрамления мастера</b>, '
+             'а не содержимого шага: она стоит <b>над нижней панелью с кнопками</b>, во всю ширину '
+             'окна, и видна на шагах <b>2–5</b>, пока есть загрузка. Так она повторяет строку-статус '
+             'из направления A (§2): у окна внизу одна полоса, которая говорит, что сейчас '
+             'происходит. В панель с кнопками её не кладём — там человек принимает решение, и живой '
+             'текст рядом с «Продолжить» заставлял бы кнопки прыгать.'
+             '<div style="margin-top:9px">Высота <b>36</b>, поля <b>0 22</b>, граница сверху 1 px, '
+             'фон окна. Тело шага при появлении полоски становится ниже на 36 — окно 900 × 620 '
+             'не меняется.</div></div></div>')
+    cells = [stcell(name, dlbar(st, queue="· 1 из 2" if st in ("downloading", "calc") else ""), code)
+             for st, name, code in DL_STATES]
+    leg = ("<b>Пять состояний полоски</b> (решение заказчика 2026-09-16, поправка 3): идёт загрузка · "
+           "проверяю модель · готово · не получилось · не хватает места. Шестая ячейка — та же "
+           "«идёт загрузка» в первые секунды, когда оценка времени ещё не устоялась: вместо «осталось "
+           "~4 ч» человек видит «считаю…» (поправка 4). «Проверяю модель…» — <b>неопределённая</b> "
+           "полоска: сумма и пробное распознавание идут без процентов. Счётчик «1 из 2» появляется "
+           "только когда моделей в очереди больше одной; в M5 модель одна. «Модель готова» держится "
+           "3 с и исчезает вместе с полоской.")
+    return page(f"A · Онбординг: полоска загрузки — {th(theme)}",
+                f'<b>Онбординг → полоска загрузки</b> — пять состояний обрамления · {th(theme)} тема',
+                onb(3, ('<div style="width:580px">'
+                        '<div class="h2">Горячая клавиша</div>'
+                        '<div class="sm" style="margin:4px 0 14px">Зажмите её и говорите. Отпустили — '
+                        'текст появится там, где стоит курсор.</div>'
+                        + card([row("Текущая комбинация", hotkey_field("idle"),
+                                    "По умолчанию — как в Handy", hint=False)]) + '</div>'),
+                    acts(), progress="downloading", queue="· 1 из 2")
+                + sech("Пять состояний полоски") + grid(cells, 1)
+                + sech("Правила") + grid([where, fmt]), theme, leg, EXTRA_CSS)
+
+
 def desk(pill_html, light=False, top=False, w=880, h=380, mini=False):
     cls = "desk lt" if light else "desk"
     pos = ('top:14px' if mini else 'top:52px') if top else 'bottom:52px'
@@ -518,6 +618,7 @@ def build():
         out.append(write(f"08-onboarding-3-hotkey{d}.html", onb3(theme)))
         out.append(write(f"08-onboarding-4-mic{d}.html", onb4(theme)))
         out.append(write(f"08-onboarding-5-done{d}.html", onb5(theme)))
+        out.append(write(f"08-onboarding-progress{d}.html", onb_progress(theme)))
         out.append(write(f"09-pill{d}.html", pill_screen(theme)))
         out.append(write(f"09-tray{d}.html", tray_screen(theme)))
         out.append(write(f"10-dialogs{d}.html", dialogs(theme)))

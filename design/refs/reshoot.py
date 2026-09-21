@@ -8,7 +8,7 @@
 
 ЗАПУСК (из корня репозитория, каталог значения не имеет — пути берутся от файла скрипта):
 
-    python3 design/refs/reshoot.py                     переснять все 48 экранов
+    python3 design/refs/reshoot.py                     переснять все 50 экранов
     python3 design/refs/reshoot.py 09-pill 09-tray     только названные (имя без .html/.png)
     python3 design/refs/reshoot.py --check             НИЧЕГО НЕ ПИШЕТ: сверка
     python3 design/refs/reshoot.py --check-head        контроль механизма (см. ниже)
@@ -167,7 +167,7 @@ def one(job):
 
 def main():
     ap = argparse.ArgumentParser(add_help=True, description="съёмка референсов design/refs")
-    ap.add_argument("names", nargs="*", help="имена экранов без расширения; пусто — все 48")
+    ap.add_argument("names", nargs="*", help="имена экранов без расширения; пусто — все")
     ap.add_argument("--check", action="store_true", help="не писать: сверить PNG с рабочими макетами")
     ap.add_argument("--check-head", action="store_true", help="контроль механизма: HEAD-версия против PNG")
     ap.add_argument("--out", default=REFS, help="куда писать (по умолчанию design/refs)")

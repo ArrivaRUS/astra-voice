@@ -79,8 +79,43 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 .trk{width:78px}
 .mhr{margin:8px 0 7px}
 
-/* --- фокус клавиатуры (§8 PRD): видимая рамка 2 px ------------------------ */
-.foc{outline:2px solid var(--primary);outline-offset:2px;border-radius:8px}
+/* --- карточка модели = ВЫБОР (решение заказчика 2026-09-17) --------------
+   Кнопки «Скачать» и «Из файла…» из карточки убраны, прогресс уехал в сквозную
+   полоску мастера; в карточке осталась отметка выбора слева и один бейдж состояния. */
+.cbx{width:18px;height:18px;border-radius:5px;border:1.5px solid var(--fg4);background:var(--bg-surface);
+  display:inline-flex;align-items:center;justify-content:center;flex:none;margin-top:2px}
+.cbx.on{background:var(--primary);border-color:var(--primary)}
+.cbx.dis{background:var(--bg-sunk);border-color:var(--border)}
+.mc.pick{border-color:var(--primary);background:var(--primary-bg)}
+.mc.hov{background:var(--bg-sunk)}
+.mhead{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.bd.ins{background:var(--ok-bg);color:var(--ok-ink)}
+/* на активной карточке фон бейджа совпал бы с фоном карточки — поднимаем его на поверхность */
+.mc.act .bd.act{background:var(--bg-surface)}
+/* одна строка «Занимает места»: обычный вес, значения fg, подписи fg-muted, разделитель — точка */
+.mspace{font-size:12px;line-height:18px;color:var(--fg3)}
+.mspace b{font-weight:400;color:var(--fg1)}
+/* источник цифр под полосками метрик: чужой бенчмарк, а не замер на этом компьютере (§5.3) */
+.msrc{font-size:11.5px;line-height:1.35;color:var(--fg4);text-align:right;margin-top:2px}
+
+/* --- сквозная полоска загрузки модели: обрамление мастера, шаги 2–5 ------ */
+.dlbar{height:36px;flex:none;display:flex;align-items:center;gap:10px;padding:0 22px;
+  background:var(--bg-app);border-top:1px solid var(--border);font-size:12.5px;color:var(--fg2)}
+.dlbar .sp{flex:1}
+.dlbar .tail{font-size:12px;color:var(--fg3);white-space:nowrap}
+.dlbar .ttl{white-space:nowrap}
+/* неопределённая полоска: сегмент 38 % ездит по дорожке (см. spec §10) */
+.prog.ind i{width:38%;margin-left:26%}
+
+/* --- фокус клавиатуры (§8 PRD): видимая рамка 2 px ------------------------
+   Цвет — решение У1 (`state.<тема>.focus-ring`): светлая accent-ink #0A776A (5,16:1),
+   тёмная accent #2FD9C4 (10,6:1). Ровно это рисует реализация (`Theme.stateFocusRing`
+   в AvButton/AvSelect/AvToggle/AvSegmented/SidebarItem). До 2026-09-21 макет рисовал
+   здесь `primary` — отклонение макета от принятого решения, исправлено. */
+.foc{outline:2px solid var(--accent-ink);outline-offset:2px;border-radius:8px}
+/* раскрытый выпадающий список — ЭТО НЕ ФОКУС: граница primary, как `Theme.selectOpenState`
+   в AvSelect.qml:43 (токен component.select.open-state) */
+.selopen{border-color:var(--primary)}
 
 /* --- выпадающий список (раскрытый) --------------------------------------- */
 .pop{position:absolute;background:var(--bg-surface);border:1px solid var(--border);border-radius:8px;
@@ -298,79 +333,84 @@ def footer(model="GigaAM v3 RNN-T", state="disabled", icon="idle"):
 
 # ── каталог: 12 моделей — источник истины research/catalog-numbers.md (2026-09-08) ──
 # Размер = сумма точных байт файлов рантайма из HF API, десятичные МБ.
+# ИСКЛЮЧЕНИЕ (2026-09-17): у GigaAM v3 RNN-T цифры взяты из каталога программы
+# data/catalog.json — size_bytes 226 431 968 → «226 МБ», min_ram_mb 768 → «768 МБ».
+# Макет обязан показывать те же числа, что покажет программа; расхождение 231,9 / 415
+# было находкой живой проверки m5 (decisions/log.md 2026-09-16, 2026-09-17).
+# measured=False у ВСЕХ записей: ни одна цифра не получена на этом компьютере (§5.3).
 # WER = Russian LibriSpeech test, бенчмарк onnx-asr (измерен на fp32-весах — оговорка в подсказке).
 # RTFx = столбец «x64 RTFx (int8)»; где int8-замера нет — помечено «бенчмарк fp32».
 # Полоска качества: 4 % WER = 100, 40 % = 0. Полоска скорости: RTFx / 85.
 MODELS = [
     dict(id="rnnt", name="GigaAM v3 RNN-T", vendor="Сбер (GigaChat Team)",
          purpose="Русская диктовка с пунктуацией — по умолчанию",
-         disk="231,9 МБ", ram="415 МБ", ramkind="замерено на этом компьютере", measured=True,
+         disk="226 МБ", ram="768 МБ", measured=False,
          q=90, qv="WER 7,60 %", qkind="ok", s=50, sv="42,5× быстрее речи", skind="ok",
          punct=True, lang="Только русский", lic="MIT · Сбер", origin="отечественная",
-         status="active", badges=[("Активна", "act"), ("Рекомендуем", "rec")]),
+         status="active", badges=[("Рекомендуем", "rec")]),
     dict(id="ctc", name="GigaAM v3 CTC", vendor="Сбер (GigaChat Team)",
          purpose="То же, быстрее на ~25 %, точность чуть ниже",
-         disk="224,9 МБ", ram="~416 МБ", ramkind="оценка", measured=False,
+         disk="224,9 МБ", ram="~416 МБ", measured=False,
          q=89, qv="WER 7,80 %", qkind="ok", s=61, sv="52,2× быстрее речи", skind="ok",
          punct=True, lang="Только русский", lic="MIT · Сбер", origin="отечественная",
          status="installed", badges=[]),
     dict(id="rnnt-np", name="GigaAM v3 RNN-T без пунктуации", vendor="Сбер (GigaChat Team)",
          purpose="Самая точная по словам, без знаков препинания",
-         disk="229,3 МБ", ram="~424 МБ", ramkind="оценка", measured=False,
+         disk="229,3 МБ", ram="~424 МБ", measured=False,
          q=99, qv="WER 4,39 %", qkind="ok", s=50, sv="42,8× быстрее речи", skind="ok",
          punct=False, lang="Только русский", lic="MIT · Сбер", origin="отечественная",
-         status="downloading", badges=[("Обновление доступно", "upd")]),
+         status="downloading", badges=[]),
     dict(id="ml", name="GigaAM Multilingual CTC 220M", vendor="Сбер (GigaChat Team)",
          purpose="Русский + казахский, киргизский, узбекский, английский; без пунктуации",
-         disk="224,8 МБ", ram="~416 МБ", ramkind="оценка", measured=False,
+         disk="224,8 МБ", ram="~416 МБ", measured=False,
          q=88, qv="WER 8,43 %", qkind="ok", s=69, sv="58,5× · бенчмарк fp32", skind="fp32",
          punct=False, lang="ru, kk, ky, uz, en", lic="MIT · Сбер", origin="отечественная",
-         status="new", badges=[("Новое", "new")]),
+         status="new", badges=[]),
     dict(id="tone", name="T-one", vendor="Т-Банк",
          purpose="Русская, лёгкая, без пунктуации; веса только fp32",
-         disk="144,2 МБ", ram="~300 МБ", ramkind="грубая оценка · веса fp32", measured=False,
+         disk="144,2 МБ", ram="~300 МБ", measured=False,
          q=93, qv="WER 6,57 %", qkind="ok", s=31, sv="26,3× · бенчмарк fp32", skind="fp32",
          punct=False, lang="Только русский", lic="Apache-2.0 · Т-Банк", origin="отечественная",
          status="avail", badges=[]),
     dict(id="vosk", name="Vosk ru 0.54", vendor="Alpha Cephei",
          purpose="Лёгкая полная Vosk; точность ниже GigaAM",
-         disk="72,5 МБ", ram="~134 МБ", ramkind="оценка", measured=False,
+         disk="72,5 МБ", ram="~134 МБ", measured=False,
          q=84, qv="WER 9,89 %", qkind="ok", s=83, sv="70,5× быстрее речи", skind="ok",
          punct=False, lang="Только русский", lic="Apache-2.0 · Alpha Cephei",
          origin="зарубежная · команда из России", status="avail", badges=[]),
     dict(id="vosk-s", name="Vosk small ru 0.52", vendor="Alpha Cephei",
          purpose="Для слабых машин и малого диска",
-         disk="26,7 МБ", ram="~50 МБ", ramkind="оценка", measured=False,
+         disk="26,7 МБ", ram="~50 МБ", measured=False,
          q=71, qv="WER 14,53 %", qkind="ok", s=98, sv="83,5× быстрее речи", skind="ok",
          punct=False, lang="Только русский", lic="Apache-2.0 · Alpha Cephei",
          origin="зарубежная · команда из России", status="avail", badges=[]),
     dict(id="wturbo", name="Whisper large-v3-turbo", vendor="OpenAI",
          purpose="Многоязычная, качественно, очень медленно на процессоре",
-         disk="1 089,1 МБ", ram="~2,0 ГБ", ramkind="оценка", measured=False,
+         disk="1 089,1 МБ", ram="~2,0 ГБ", measured=False,
          q=83, qv="WER 10,10 %", qkind="ok", s=5, sv="3,9× быстрее речи", skind="ok",
          punct=True, lang="99 языков", lic="MIT · OpenAI", origin="зарубежная",
          status="lowram", badges=[]),
     dict(id="wsmall", name="Whisper small", vendor="OpenAI",
          purpose="Многоязычная, средняя; по-русски слабее GigaAM",
-         disk="253,5 МБ", ram="~470 МБ", ramkind="оценка", measured=False,
+         disk="253,5 МБ", ram="~470 МБ", measured=False,
          q=0, qv="нет данных", qkind="none", s=0, sv="нет данных", skind="none",
          punct=True, lang="99 языков", lic="Apache-2.0 · OpenAI", origin="зарубежная",
          status="avail", badges=[]),
     dict(id="wbase", name="Whisper base", vendor="OpenAI",
          purpose="Быстрая и лёгкая; для русского не рекомендуется",
-         disk="109,1 МБ", ram="~200 МБ", ramkind="оценка", measured=False,
+         disk="109,1 МБ", ram="~200 МБ", measured=False,
          q=5, qv="WER 38,33 %", qkind="ok", s=61, sv="51,6× быстрее речи", skind="ok",
          punct=True, lang="99 языков", lic="Apache-2.0 · OpenAI", origin="зарубежная",
          status="avail", badges=[]),
     dict(id="mllarge", name="GigaAM Multilingual Large CTC", vendor="Сбер (GigaChat Team)",
          purpose="«Качество любой ценой»: тяжёлая, без пунктуации",
-         disk="591,6 МБ", ram="~1,1 ГБ", ramkind="оценка", measured=False,
+         disk="591,6 МБ", ram="~1,1 ГБ", measured=False,
          q=96, qv="WER 5,55 %", qkind="ok", s=36, sv="30,4× · бенчмарк fp32", skind="fp32",
          punct=False, lang="ru, kk, ky, uz, en", lic="MIT · Сбер", origin="отечественная",
          status="avail", badges=[]),
     dict(id="nemo", name="NeMo FastConformer ru pc", vendor="NVIDIA",
          purpose="Быстрая, с пунктуацией, точность ниже GigaAM",
-         disk="131,6 МБ", ram="~245 МБ", ramkind="оценка", measured=False,
+         disk="131,6 МБ", ram="~245 МБ", measured=False,
          q=75, qv="WER 13,10 %", qkind="ok", s=83, sv="70,6× быстрее речи", skind="ok",
          punct=True, lang="Только русский", lic="CC-BY-4.0 (атрибуция) · NVIDIA",
          origin="зарубежная", status="avail", badges=[]),
@@ -378,7 +418,7 @@ MODELS = [
 CATALOG_ORDER = ["rnnt", "ctc", "rnnt-np", "ml", "tone", "vosk", "vosk-s",
                  "wturbo", "wsmall", "wbase", "mllarge", "nemo"]
 DOMESTIC = ["rnnt", "ctc", "rnnt-np", "ml", "mllarge", "tone"]   # по юрлицу правообладателя
-INSTALLED_SIZE = "686 МБ"                                        # 231,9 + 224,9 + 229,3
+INSTALLED_SIZE = "680 МБ"                                        # 226 + 224,9 + 229,3
 
 
 def met2(name, pct, value, measured=False, kind="ok"):
@@ -399,6 +439,68 @@ def m(mid):
         if x["id"] == mid:
             return dict(x)
     raise KeyError(mid)
+
+
+# ── отметка выбора в карточке модели (решение заказчика 2026-09-17) ────────
+def cbx(state="off"):
+    """Отметка выбора модели, четыре вида:
+
+    off      — не выбрана, выбрать можно;
+    on       — выбрана;
+    locked   — отмечена, менять нельзя (уже установлена, идёт загрузка) — галочка `fg-dis`;
+    blocked  — НЕ отмечена и выбрать нельзя (нет места, нет сети, запрет) — галочки нет.
+    """
+    if state == "on":
+        return f'<span class="cbx on">{ic("check", 12, "var(--primary-fg)")}</span>'
+    if state == "locked":
+        return f'<span class="cbx dis">{ic("check", 12, "var(--fg-dis)")}</span>'
+    if state == "blocked":
+        return '<span class="cbx dis"></span>'
+    return '<span class="cbx"></span>'
+
+
+# ── сквозная полоска загрузки модели: обрамление мастера, видна на шагах 2–5 ──
+# Пять состояний (решение заказчика 2026-09-16, поправка 3). Оставшееся время и скорость
+# приходят готовой фразой из моста; секунд нет (решение 2026-09-16 «Оставшееся время»).
+DL_STATES = [
+    ("downloading", "идёт загрузка", "downloading"),
+    ("calc", "первые секунды: оценки ещё нет", "downloading · eta=считаю…"),
+    ("verifying", "проверяю модель", "verifying"),
+    ("ready", "модель готова", "ready"),
+    ("failed", "не получилось загрузить", "failed"),
+    ("nospace", "не хватает места на диске", "no-space"),
+]
+
+
+def dlbar(state, name="GigaAM v3 RNN-T", queue=""):
+    """Полоска загрузки модели. queue — «· 1 из 2», показывается только когда моделей больше одной."""
+    q = f' <span class="tail">{queue}</span>' if queue else ""
+    track = '<span class="prog" style="width:160px;flex:none"><i style="width:43%"></i></span>'
+    ind = '<span class="prog ind" style="width:160px;flex:none"><i></i></span>'
+    if state in ("downloading", "calc"):
+        tail = "считаю…" if state == "calc" else "5,2 МБ/с · осталось ~3 мин"
+        inner = (f'{ic("down", 14, "var(--primary)")}'
+                 f'<span class="ttl">Загружается {name}</span>{q}'
+                 f'<span class="sp"></span>{track}<span class="tail">{tail}</span>')
+    elif state == "verifying":
+        inner = (f'{ic("refresh", 14, "var(--fg3)")}<span class="ttl">Проверяю модель…</span>'
+                 f'<span class="sp"></span>{ind}')
+    elif state == "ready":
+        inner = (f'{ic("check", 14, "var(--ok-ink)")}'
+                 '<span class="ttl" style="color:var(--ok-ink)">Модель готова</span>'
+                 '<span class="sp"></span>')
+    elif state == "failed":
+        inner = (f'{ic("alert", 14, "var(--err-ink)")}'
+                 '<span class="ttl" style="color:var(--err-ink)">Не удалось загрузить модель</span>'
+                 f'<span class="sp"></span>{btn("Повторить", "sm", "refresh")}')
+    elif state == "nospace":
+        inner = (f'{ic("alert", 14, "var(--err-ink)")}'
+                 '<span class="ttl" style="color:var(--err-ink)">Не хватает места на диске</span>'
+                 '<span class="tail">нужно ещё 126 МБ</span>'
+                 f'<span class="sp"></span>{btn("Открыть папку моделей", "sm", "folder")}')
+    else:
+        raise KeyError(state)
+    return f'<div class="dlbar">{inner}</div>'
 
 
 # ── резиновая пилюля (решение G2): min 172 → max 320, без ellipsis ─────────

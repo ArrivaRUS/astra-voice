@@ -2,7 +2,7 @@
 """Разделы «Общие» (01) и «Модели» (02) — полный макет A «Панель»."""
 from _shell import (page, write, shell, head, footer, sb, m, MODELS, CATALOG_ORDER, DOMESTIC,
                     INSTALLED_SIZE, ic, tgl, key, btn, row, card, group, met, met2, level_bars,
-                    stcell, sech, grid, W, H, th)
+                    stcell, sech, grid, cbx, dlbar, W, H, th)
 
 DD = 'var(--fg3)'
 
@@ -12,7 +12,7 @@ DD = 'var(--fg3)'
 # ══════════════════════════════════════════════════════════════════════════
 def sel(text, w=None, open_=False, dis=False):
     st = f' style="width:{w}px"' if w else ""
-    cls = "sel" + (" foc" if open_ else "")
+    cls = "sel" + (" selopen" if open_ else "")   # раскрытый список — граница primary, не фокус
     col = ' style="color:var(--fg-dis)"' if dis else ""
     return (f'<span class="{cls}"{st}><span{col}>{text}</span>'
             f'<span style="flex:1"></span>{ic("chevd", 13, DD)}</span>')
@@ -37,7 +37,7 @@ def hotkey_field(state):
                 'Alt + F2</span><span style="flex:1"></span><span class="c12">Отпустите клавиши</span></div>')
     if state == "conflict":
         return (f'<div class="note w" style="margin-top:8px">{ic("alert", 15, "var(--warn-ink)")}'
-                '<div><b>Комбинация занята в KDE</b>'
+                '<div><b>Комбинация занята в системе</b>'
                 '<span class="mono">Alt + F2</span> назначена на действие «Показать KRunner». Оставить её '
                 'можно, но диктовка может не сработать — система заберёт нажатие себе.'
                 f'<div style="display:flex;gap:8px;margin-top:9px">{btn("Оставить Alt + F2")}'
@@ -66,6 +66,8 @@ def hotkey_field(state):
 
 def general_rows(mode_first=True, autostart="on", indicator="Пилюля снизу экрана"):
     g1 = group("Диктовка", [
+        row("Модель распознавания", btn("Переустановить", "sm", "refresh"),
+            "GigaAM v3 RNN-T · 226 МБ на диске"),
         row("Горячая клавиша", hotkey_field("idle"),
             "Удерживайте и говорите — текст появится там, где курсор"),
         row("Режим", seg("Удерживать", "Нажать-нажать", mode_first),
@@ -96,10 +98,12 @@ def general_rows(mode_first=True, autostart="on", indicator="Пилюля сни
 
 
 def general_base(theme):
-    body = general_rows()
-    b = shell("Общие", head("Общие", "Диктовка, индикация и запуск"), body,
+    body = general_rows() + sb(6, 200)
+    b = shell("Общие", head("Общие", "Модель, диктовка, индикация и запуск"), body,
               footer(state="disabled"))
-    leg = ("<b>Базовое состояние раздела.</b> Семь настроек помещаются без прокрутки; строка «Вторая "
+    leg = ("<b>Базовое состояние раздела.</b> Первая строка — <b>модель распознавания</b>: имя, размер "
+           "на диске и «Переустановить» (решение 2026-09-17: после мастера моделью управлять было негде; "
+           "полноценный раздел «Модели» с каталогом — веха M6). Строка «Вторая "
            "комбинация» появляется только в режиме «нажать-нажать» — в режиме «удерживать» она не нужна. "
            "Строка = «заголовок · подпись · «?» · контрол справа» (канон категории). "
            "<b>disabled:</b> «Значок в системном трее» выключить нельзя — иначе запись стала бы скрытой "
@@ -136,14 +140,14 @@ def general_hotkey(theme):
         stcell("клавиши зажаты", hotkey_field("captured"), "capturing"),
         stcell("успех", hotkey_field("success"), "success"),
     ]) + grid([
-        stcell("конфликт с KDE — предупреждение, не запрет", hotkey_field("conflict"), "conflict"),
+        stcell("комбинация занята в системе — предупреждение, не запрет", hotkey_field("conflict"), "conflict"),
         stcell("уже назначена на другой режим", hotkey_field("duplicate"), "duplicate"),
     ]) + grid([
         stcell("комбинацию не удалось захватить (X11 забрал другое приложение)",
                hotkey_field("not-grabbed"), "not-grabbed"),
     ], 1)
     body_full = b + sech("Поле захвата — все состояния") + gal
-    leg = ("<b>Правило:</b> конфликт с KDE — это <b>предупреждение с именем чужого действия</b>, а не "
+    leg = ("<b>Правило:</b> занятая комбинация — это <b>предупреждение с именем чужого действия</b>, а не "
            "запрет (PRD S1-A4): пользователь вправе оставить комбинацию. «Не захвачена» — единственное "
            "красное состояние, потому что диктовка в нём не работает. Захват идёт по «сырым» нажатиям; "
            "Esc всегда отменяет и возвращает прежнюю комбинацию.")
@@ -247,7 +251,7 @@ def general_mic(theme):
 
 
 def general_indicator(theme):
-    pop = ('<div class="pop" style="right:22px;top:152px">'
+    pop = ('<div class="pop" style="right:22px;top:208px">'
            f'<div class="po on">{ic("check", 13, "var(--primary)")}<span>Пилюля снизу экрана'
            '<span class="d2">Как в Handy: у нижнего края, поверх окон</span></span></div>'
            '<div class="po"><span style="width:13px"></span><span>Пилюля сверху экрана'
@@ -301,87 +305,110 @@ def general_indicator(theme):
 # ══════════════════════════════════════════════════════════════════════════
 # 02 · МОДЕЛИ
 # ══════════════════════════════════════════════════════════════════════════
-BADGE_PRIORITY = ["act", "upd", "rec", "new"]
+# Карточка модели = ВЫБОР (решение заказчика 2026-09-17, decisions/log.md).
+# Верхняя строка: имя · вендор + «Рекомендуем» + ОДИН бейдж состояния.
+# Слева отметка выбора (чекбокс — выбор множественный); «Скачать» и «Из файла…» из карточки
+# убраны, прогресс загрузки уехал в сквозную полоску мастера (_shell.dlbar).
+#
+# состояние → (отметка выбора, доп. класс карточки, бейдж состояния)
+CARD_STATE = {
+    # ── выбор сетевой модели ────────────────────────────────────────────
+    "avail":         ("off",     "",      None),
+    "selected":      ("on",      " pick", None),
+    "hover":         ("off",     " hov",  None),
+    "focus":         ("off",     " foc",  None),
+    "new":           ("off",     "",      ("Новое", "new")),
+    "lowram":        ("off",     "",      None),
+    "notrec":        ("off",     "",      None),
+    # выбрать нельзя: отметка ПУСТАЯ и недоступная, причина — текстом в низу карточки
+    "nospace":       ("blocked", "",      None),
+    "nonet":         ("blocked", "",      None),
+    "offline-user":  ("blocked", "",      None),
+    "policy":        ("blocked", "",      None),
+    # ── загрузка: подробности в сквозной полоске, в карточке только итог ──
+    "downloading":   ("locked",  " pick", ("Загружается", "new")),
+    "queued":        ("locked",  " pick", ("В очереди", "new")),
+    "verifying":     ("locked",  " pick", ("Проверяю…", "new")),
+    "failed":        ("off",     "",      None),
+    "badsha":        ("off",     "",      None),
+    # ── установленные: отметка стоит, менять её нельзя ───────────────────
+    "installed":     ("locked",  "",      ("Установлена", "ins")),
+    "active":        ("locked",  " act",  ("Установлена и активна", "act")),
+    "switching":     ("locked",  " act",  ("Переключаю…", "act")),
+    "custom":        ("locked",  "",      ("Установлена", "ins")),
+    "corrupted":     ("locked",  "",      None),
+    "removed":       ("locked",  "",      ("Установлена", "ins")),
+    "update":        ("locked",  "",      ("Обновление доступно", "upd")),
+    "updating":      ("locked",  "",      ("Обновляю…", "upd")),
+    "update-failed": ("locked",  "",      ("Обновление доступно", "upd")),
+}
+
+# Низ карточки. Действий по загрузке здесь больше нет — только то, что делают
+# с УЖЕ установленной моделью, и «Повторить» после неудачи.
+CARD_ACTS = {
+    "active": btn("Удалить", "sm dis"),
+    "switching": btn("Удалить", "sm dis"),
+    "installed": btn("Сделать рабочей", "sm pri") + " " + btn("Удалить", "sm"),
+    "custom": btn("Сделать рабочей", "sm pri") + " " + btn("Удалить", "sm"),
+    "removed": btn("Сделать рабочей", "sm pri") + " " + btn("Удалить", "sm"),
+    "corrupted": btn("Переустановить", "sm pri") + " " + btn("Удалить", "sm"),
+    "update": btn("Обновить", "sm pri") + " " + btn("Что нового", "sm"),
+    "update-failed": btn("Повторить", "sm pri") + " " + btn("Подробнее", "sm"),
+    "updating": btn("Отмена", "sm"),
+    "failed": btn("Повторить", "sm pri"),
+    "badsha": btn("Повторить", "sm pri") + " " + btn("Подробнее", "sm"),
+    "nospace": btn("Открыть папку моделей", "sm", "folder"),
+    "downloading": btn("Отмена", "sm"),
+    "queued": btn("Отмена", "sm"),
+    "verifying": '<span class="c12">Отмена недоступна</span>',
+}
 
 
 def badges_html(items):
-    """Максимум два бейджа: Активна > Обновление доступно > Рекомендуем > Новое."""
-    items = sorted(items, key=lambda x: BADGE_PRIORITY.index(x[1]))[:2]
-    return "".join(f'<span class="bd {k}">{t}</span>' for t, k in items)
+    """Бейджи верхней строки: «Рекомендуем» и один бейдж состояния, больше двух не бывает."""
+    return "".join(f'<span class="bd {k}">{t}</span>' for t, k in items[:2])
 
 
-def mcard(mid, state=None, badges=None, note=None, acts=None, extra="", cls_extra=""):
+def mets_block(mo):
+    """Полоски метрик + честная подпись об источнике цифр (§5.3): это чужой бенчмарк."""
+    has_data = mo["qkind"] != "none" or mo["skind"] != "none"
+    src = '<div class="msrc">цифры авторов, не с этого компьютера</div>' if has_data else ""
+    return ('<div class="mmets">'
+            + met2("Качество", mo["q"], mo["qv"], mo["measured"], mo["qkind"])
+            + met2("Скорость", mo["s"], mo["sv"], mo["measured"], mo["skind"])
+            + src + '</div>')
+
+
+def mcard(mid, state=None, badges=None, note=None, acts=None, extra="", cls_extra="", mets=True):
     mo = m(mid)
     st = state or mo["status"]
-    bl = badges if badges is not None else mo["badges"]
-    cls = "mc" + (" act" if st in ("active", "switching") else "") + cls_extra
-    mets = ('<div class="mmets">'
-            + met2("Качество", mo["q"], mo["qv"], mo["measured"], mo["qkind"])
-            + met2("Скорость", mo["s"], mo["sv"], mo["measured"], mo["skind"]) + '</div>')
+    sel, cls_state, state_bd = CARD_STATE[st]
+    cls = "mc" + cls_state + cls_extra
+    bl = list(badges if badges is not None else mo["badges"])
+    if state_bd:
+        bl.append(state_bd)
     bh = badges_html(bl)
-    top = ('<div class="mtop"><div class="ml">'
-           f'<div class="mname">{mo["name"]} <span class="mven">· {mo["vendor"]}</span></div>'
+    top = (f'<div class="mtop">{cbx(sel)}<div class="ml">'
+           f'<div class="mhead"><span class="mname">{mo["name"]} '
+           f'<span class="mven">· {mo["vendor"]}</span></span>{bh}</div>'
            f'<div class="mpurp">{mo["purpose"]}</div>'
-           + (f'<div class="mbadges">{bh}</div>' if bh else "")
-           + f'</div>{mets}</div>')
+           f'</div>{mets_block(mo) if mets else ""}</div>')
     punct = "с пунктуацией" if mo["punct"] else "без пунктуации"
     tags = (f'{mo["lang"]} <span class="dot"></span> {punct} <span class="dot"></span> '
             f'{mo["lic"]} <span class="dot"></span> {mo["origin"]}')
-
-    # ── состояния с собственным телом карточки ───────────────────────────
-    if st == "downloading":
-        body = ('<div class="mhr"></div>'
-                '<div class="prog" style="margin-bottom:7px"><i style="width:43%"></i></div>'
-                '<div class="mbot"><span class="num">Загрузка 43 % · 5,2 МБ/с · осталось ~25 с</span>'
-                '<span class="dot"></span><span>huggingface.co</span>'
-                f'<span class="sp"></span>{btn("Отмена", "sm")}</div>')
-    elif st == "queued":
-        body = ('<div class="mhr"></div><div class="mbot"><span>В очереди — начнём, когда докачается '
-                'GigaAM v3 RNN-T без пунктуации</span>'
-                f'<span class="sp"></span>{btn("Отмена", "sm")}</div>')
-    elif st == "verifying":
-        body = ('<div class="mhr"></div>'
-                '<div class="prog" style="margin-bottom:7px"><i style="width:100%"></i></div>'
-                '<div class="mbot"><span>Проверяю контрольную сумму… 4 файла</span>'
-                f'<span class="sp"></span><span class="c12">Отмена недоступна</span></div>')
-    elif st == "updating":
-        body = ('<div class="mhr"></div>'
-                '<div class="prog" style="margin-bottom:7px"><i style="width:66%"></i></div>'
-                '<div class="mbot"><span>Проверяю новую ревизию: скачано → проверка целостности → '
-                'пробное распознавание</span>'
-                f'<span class="sp"></span>{btn("Отмена", "sm")}</div>')
-    else:
-        n = ""
-        if note:
-            kind, text = note
-            colors = {"w": "var(--warn-ink)", "e": "var(--err-ink)", "i": "var(--fg3)"}
-            icon = "alert" if kind in ("w", "e") else "info"
-            n = (f'<span style="color:{colors[kind]};display:inline-flex;align-items:center;gap:5px">'
-                 f'{ic(icon, 12, colors[kind])}{text}</span><span class="dot"></span>')
-        default_acts = {
-            "active": btn("Удалить", "sm dis"),
-            "installed": btn("Выбрать", "sm pri") + " " + btn("Удалить", "sm"),
-            "switching": btn("Удалить", "sm dis"),
-            "avail": btn("Скачать", "sm pri") + " " + btn("Из файла…", "sm"),
-            "new": btn("Скачать", "sm pri") + " " + btn("Из файла…", "sm"),
-            "lowram": btn("Скачать", "sm") + " " + btn("Из файла…", "sm"),
-            "nonet": btn("Скачать", "sm dis") + " " + btn("Установить из файла…", "sm"),
-            "offline-user": btn("Скачать", "sm dis") + " " + btn("Из файла…", "sm"),
-            "policy": btn("Скачать", "sm dis") + " " + btn("Из файла…", "sm"),
-            "update": btn("Обновить", "sm pri") + " " + btn("Что нового", "sm"),
-            "update-failed": btn("Повторить", "sm pri") + " " + btn("Подробнее", "sm"),
-            "corrupted": btn("Переустановить", "sm pri") + " " + btn("Удалить", "sm"),
-            "nospace": btn("Повторить", "sm pri") + " " + btn("Открыть папку", "sm"),
-            "badsha": btn("Скачать заново", "sm pri") + " " + btn("Подробнее", "sm"),
-            "removed": btn("Выбрать", "sm pri") + " " + btn("Удалить", "sm"),
-            "custom": btn("Выбрать", "sm pri") + " " + btn("Удалить", "sm"),
-            "notrec": btn("Скачать", "sm") + " " + btn("Из файла…", "sm"),
-        }[st]
-        a = acts if acts is not None else default_acts
-        body = ('<div class="mhr"></div>'
-                f'<div style="font-size:12px;line-height:18px;color:var(--fg3)">Занимает места:<div style="margin-top:3px;padding-left:12px">на диске: <span style="color:var(--fg1)">{mo["disk"]}</span></div><div style="margin-top:3px;padding-left:12px">в памяти при работе: <span style="color:var(--fg1)">{mo["ram"]}</span></div></div>'
-                '<div class="mbot" style="margin-top:9px">'
-                f'{tags}<span class="sp"></span>{n} {a}</div>')
+    n = ""
+    if note:
+        kind, text = note
+        colors = {"w": "var(--warn-ink)", "e": "var(--err-ink)", "i": "var(--fg3)"}
+        icon = "alert" if kind in ("w", "e") else "info"
+        n = (f'<span style="color:{colors[kind]};display:inline-flex;align-items:center;gap:5px">'
+             f'{ic(icon, 12, colors[kind])}{text}</span><span class="dot"></span>')
+    a = acts if acts is not None else CARD_ACTS.get(st, "")
+    body = ('<div class="mhr"></div>'
+            f'<div class="mspace">Занимает места: <b>{mo["disk"]}</b> на диске '
+            f'<span class="dot"></span> <b>{mo["ram"]}</b> в памяти при работе</div>'
+            '<div class="mbot" style="margin-top:6px">'
+            f'{tags}<span class="sp"></span>{n} {a}</div>')
     return f'<div class="{cls}">{top}{body}{extra}</div>'
 
 
@@ -395,15 +422,24 @@ def filters(theme, domestic=False, count=None):
             f'<span style="flex:1"></span><span class="c12">{count}</span></div>')
 
 
+def pick_bar(total, free, action="", warn=False):
+    """Строка итога под карточками: сколько будет скачано + действие. Общая для шага 2 и каталога."""
+    col = "var(--err-ink)" if warn else "var(--fg1)"
+    return ('<div style="display:flex;align-items:center;gap:9px;margin:10px 0 0;flex-wrap:wrap">'
+            f'<span style="font-size:13px;color:{col}">{total}</span>'
+            f'<span class="dot"></span><span class="c12">{free}</span>'
+            f'<span style="flex:1"></span>{action}</div>')
+
+
 def catalog_body(theme):
     s = filters(theme)
     s += '<div class="grp">Установленные · 3</div>'
-    s += mcard("rnnt", "active", [("Активна", "act"), ("Рекомендуем", "rec")])
+    s += mcard("rnnt", "active", [("Рекомендуем", "rec")])
     s += mcard("ctc", "installed")
     s += mcard("rnnt-np", "downloading")
     s += '<div class="grp" style="margin-top:14px">Доступные · 9</div>'
-    s += mcard("ml", "new", [("Новое", "new")])
-    s += mcard("tone", "avail")
+    s += mcard("ml", "new")
+    s += mcard("tone", "selected")
     s += mcard("vosk", "avail",
                note=("i", "Правообладатель — Alpha Cephei Inc. (США), команда из России"))
     s += mcard("vosk-s", "avail")
@@ -417,6 +453,8 @@ def catalog_body(theme):
     s += mcard("mllarge", "avail")
     s += mcard("nemo", "avail",
                note=("i", "Лицензия CC-BY-4.0 — атрибуция автора попадёт в «О программе»"))
+    s += pick_bar("Будет скачано 144,2 МБ", "свободно на диске 42,1 ГБ",
+                  btn("Скачать выбранное", "pri", "down"))
     return s
 
 
@@ -424,13 +462,15 @@ def catalog_domestic():
     """Состояние фильтра «только отечественные»: 5 GigaAM + T-one (по юрлицу правообладателя)."""
     s = filters(None, domestic=True)
     s += '<div class="grp">Установленные · 3</div>'
-    s += mcard("rnnt", "active", [("Активна", "act"), ("Рекомендуем", "rec")])
+    s += mcard("rnnt", "active", [("Рекомендуем", "rec")])
     s += mcard("ctc", "installed")
     s += mcard("rnnt-np", "downloading")
     s += '<div class="grp" style="margin-top:14px">Доступные · 3</div>'
-    s += mcard("ml", "new", [("Новое", "new")])
+    s += mcard("ml", "new")
     s += mcard("tone", "avail")
     s += mcard("mllarge", "avail")
+    s += pick_bar("Ничего не выбрано", "свободно на диске 42,1 ГБ",
+                  btn("Скачать выбранное", "pri dis", "down"))
     s += ('<div class="note i" style="margin-top:4px">' + ic("info", 15, DD)
           + '<div><b>Скрыто 6 моделей</b>'
             'Whisper (OpenAI, США), NeMo FastConformer (NVIDIA, США) и обе Vosk '
@@ -440,20 +480,23 @@ def catalog_domestic():
 
 
 def models_catalog(theme):
-    right = btn("Установить из файла…", "sm", "folder")
+    right = btn("Установить из файла или папки…", "sm", "folder")
     hd = head("Модели", "Честные цифры: размер на диске, память в работе, качество и скорость", right)
     b = shell("Модели", hd, catalog_body(theme) + sb(40, 150), footer(state="model-update"))
     full = ('<div class="win" style="width:900px;padding:0">'
             '<div style="background:var(--bg-app);padding:14px 22px 18px">'
             + catalog_body(theme) + '</div></div>')
     leg = ("<b>Решение G2: каталог показывается целиком с прокруткой</b> — без «показать ещё». Всего 12 "
-           "карточек (10 Must + 2 Could, PRD §7.2); нужная стоит первой и помечена «Активна». "
+           "карточек (10 Must + 2 Could, PRD §7.2); нужная стоит первой и помечена «Установлена и активна». "
            "<b>Все цифры — из <span class=\"mono\">research/catalog-numbers.md</span> (2026-09-08):</b> "
            "размер = сумма точных байт файлов рантайма из HF API в десятичных МБ; WER — Russian "
            "LibriSpeech, бенчмарк onnx-asr; скорость — столбец «x64 RTFx (int8)». Где int8-замера нет "
            "(T-one, обе GigaAM Multilingual) — полоска помечена «бенчмарк fp32». У Whisper small цифр "
            "по протоколу нет вовсе: полоски пунктиром и «нет данных», выдумывать нельзя (§7.1). "
-           "<b>Место:</b> «на диске» и «в памяти при работе» — один блок одним стилем; слово «замерено» в карточке не появляется, пока замер не сделан на этом компьютере (веха M6). "
+           "<b>Место:</b> «Занимает места: 226 МБ на диске · 768 МБ в памяти при работе» — ОДНА строка обычным "
+           "весом; слово «замерено» в карточке не появляется, пока замер не сделан на этом компьютере "
+           "(веха M6), поэтому все полоски метрик серые. <b>Карточка — это выбор:</b> отметка слева, "
+           "кнопок «Скачать»/«Из файла…» в ней нет, внизу списка общий итог и одна кнопка. "
            "<b>Фильтр «только отечественные»</b> смотрит на юрлицо правообладателя: остаются 5 GigaAM "
            "и T-one, обе Vosk уходят (Alpha Cephei Inc., США).")
     return page(f"A · Модели: каталог — {th(theme)}",
@@ -480,18 +523,29 @@ def tooltip_bars():
 
 def models_card_states(theme):
     cells = [
-        stcell("активная модель", mcard("rnnt", "active", [("Активна", "act"), ("Рекомендуем", "rec")]),
-               "active"),
-        stcell("установлена", mcard("ctc", "installed"), "installed"),
-        stcell("скачивается", mcard("rnnt-np", "downloading"), "downloading"),
-        stcell("в очереди", mcard("tone", "queued"), "queued"),
-        stcell("проверка контрольной суммы", mcard("tone", "verifying"), "verifying"),
-        stcell("переключение активной модели",
-               mcard("ctc", "switching", [("Переключаю…", "act")]), "switching"),
-        stcell("доступна для скачивания", mcard("tone", "avail"), "not-downloaded"),
-        stcell("новая в каталоге (≤ 30 дней)", mcard("ml", "new", [("Новое", "new")]), "new"),
+        stcell("не выбрана — исходное состояние сетевой модели",
+               mcard("tone", "avail"), "unselected"),
+        stcell("выбрана — отметка стоит, карточка подсвечена",
+               mcard("tone", "selected"), "selected"),
+        stcell("наведена мышью — вся карточка кликабельна",
+               mcard("tone", "hover"), "hover"),
+        stcell("в фокусе с клавиатуры — рамка 2 px, Пробел переключает отметку",
+               mcard("tone", "focus"), "focus"),
+        stcell("установлена и активна — отметка недоступна",
+               mcard("rnnt", "active", [("Рекомендуем", "rec")]), "active"),
+        stcell("установлена, но не рабочая", mcard("ctc", "installed"), "installed"),
+        stcell("загружается — подробности в сквозной полоске мастера",
+               mcard("rnnt-np", "downloading"), "downloading"),
+        stcell("в очереди — загрузки идут по одной", mcard("tone", "queued"), "queued"),
+        stcell("проверяю модель", mcard("tone", "verifying"), "verifying"),
+        stcell("переключение рабочей модели",
+               mcard("ctc", "switching"), "switching"),
+        stcell("не получилось загрузить",
+               mcard("tone", "failed",
+                     note=("e", "Не удалось загрузить модель — соединение оборвалось")), "failed"),
+        stcell("новая в каталоге (≤ 30 дней)", mcard("ml", "new"), "new"),
         stcell("доступно обновление ревизии",
-               mcard("ctc", "update", [("Обновление доступно · ревизия от 04.09.2026", "upd")]),
+               mcard("ctc", "update"),
                "update-available"),
         stcell("проверяю новую ревизию", mcard("ctc", "updating"), "updating"),
         stcell("новая ревизия не прошла проверку",
@@ -526,9 +580,9 @@ def models_card_states(theme):
         stcell("ошибка: файл не прошёл проверку",
                mcard("tone", "badsha",
                      note=("e", "Файл не прошёл проверку — загруженное удалено")), "error-sha"),
-        stcell("ошибка: кончилось место на диске",
+        stcell("не хватает места — выбрать нельзя",
                mcard("wturbo", "nospace",
-                     note=("e", "Пауза: нужно ещё 120 МБ, свободно 100 МБ")), "paused-no-space"),
+                     note=("e", "Нужно ещё 120 МБ, свободно 100 МБ")), "no-space"),
         stcell("модель повреждена",
                mcard("ctc", "corrupted",
                      note=("e", "Файлы модели не читаются — переустановите")), "corrupted"),
@@ -536,22 +590,29 @@ def models_card_states(theme):
                mcard("vosk-s", "removed", note=("i", "Снята с каталога — обновлений не будет")),
                "removed-from-catalog"),
     ]
-    rules = ('<div class="stc"><div class="stn">правило бейджей — максимум два</div>'
-             '<div class="sm" style="line-height:1.7">Приоритет: <b>Активна</b> → <b>Обновление '
-             'доступно</b> → <b>Рекомендуем</b> → <b>Новое</b>. Третий бейдж не рисуется: сообщение '
-             'уходит текстом в нижнюю строку карточки. Поэтому «не рекомендуется для русского» и '
-             '«мало ОЗУ» — это подписи с иконкой, а не бейджи.'
+    rules = ('<div class="stc"><div class="stn">правило бейджей — «Рекомендуем» + один бейдж состояния</div>'
+             '<div class="sm" style="line-height:1.7">Верхняя строка карточки: имя · производитель, '
+             'затем <b>Рекомендуем</b> и справа от него <b>ровно один</b> бейдж состояния — '
+             '«Установлена и активна» у рабочей модели, «Установлена» у скачанной, но не рабочей, '
+             '«Загружается» / «В очереди» / «Проверяю…» / «Обновление доступно» по ходу дела. '
+             'Одновременно «Установлена» и «Установлена и активна» не показываются. Нижний чип '
+             '«Установлена · 226 МБ» убран — размер стоит строкой «Занимает места».'
              '<div style="display:flex;gap:6px;margin-top:9px;flex-wrap:wrap">'
-             + badges_html([("Активна", "act"), ("Рекомендуем", "rec"), ("Новое", "new")])
-             + '<span class="c12" style="align-self:center">← из трёх остались два</span></div></div></div>')
+             + badges_html([("Рекомендуем", "rec"), ("Установлена и активна", "act")])
+             + badges_html([("Установлена", "ins")]) + badges_html([("Загружается", "new")])
+             + badges_html([("Обновление доступно", "upd")])
+             + '</div></div></div>')
     tip = ('<div class="stc"><div class="stn">подсказка при наведении на полоску</div>'
            + tooltip_bars() + '</div>')
-    leg = ("<b>20 состояний карточки</b> (flows.md §3.3) — каждое различимо не только цветом: у ошибок "
-           "треугольник и красная подпись, у предупреждений — треугольник и жёлтая, у нейтральных пояснений "
-           "— «i». Кнопка «Удалить» у активной модели <b>недоступна</b>: сначала выберите другую. "
-           "Скачивание всегда показывает <b>источник</b> (huggingface.co) — это важно для ИБ.")
+    leg = ("<b>Карточка сетевой модели — это ВЫБОР</b> (решение заказчика 2026-09-17): кликабельна "
+           "целиком, слева отметка выбора, выбор <b>множественный</b>. Кнопок «Скачать» и «Из файла…» "
+           "в карточке больше нет — загрузка стартует по «Продолжить», а её ход показывает сквозная "
+           "полоска внизу мастера. Каждое состояние различимо не только цветом: у ошибок треугольник и "
+           "красная подпись, у предупреждений — треугольник и жёлтая, у нейтральных пояснений — «i». "
+           "<b>Полоски метрик серые у всех моделей</b>: это чужой бенчмарк, а не замер на этом "
+           "компьютере (§5.3) — под ними стоит подпись «цифры авторов, не с этого компьютера».")
     return page(f"A · Модели: состояния карточки — {th(theme)}",
-                f'<b>Модели → карточка</b> — все 20 состояний · {th(theme)} тема',
+                f'<b>Модели → карточка</b> — все состояния выбора и установки · {th(theme)} тема',
                 grid(cells, 1) + sech("Правила") + grid([rules, tip]), theme, leg)
 
 
@@ -563,12 +624,12 @@ def models_file_dialogs(theme):
               'администратора.</div>'
               '<div class="field mono" style="font-size:12px">/media/usb/models/gigaam-v3-e2e-rnnt-int8'
               f'<span style="flex:1"></span>{ic("folder", 13, DD)}</div>'
-              '<div class="c12">Найдено 4 файла · 231,9 МБ</div></div>'
+              '<div class="c12">Найдено 4 файла · 226 МБ</div></div>'
               f'<div class="df"><span class="sp"></span>{btn("Отмена")}{btn("Проверить и установить", "pri")}'
               '</div></div>')
     ok = (f'<div class="note o">{ic("check", 15, "var(--ok-ink)")}'
           '<div><b>Модель установлена</b>'
-          'GigaAM v3 RNN-T · 231,9 МБ · контрольные суммы совпали с манифестом каталога. '
+          'GigaAM v3 RNN-T · 226 МБ · контрольные суммы совпали с манифестом каталога. '
           'Ревизия <span class="mono">a6039be</span> от 16.12.2025.'
           f'<div style="margin-top:9px">{btn("Выбрать активной", "pri")}</div></div></div>')
     bad = (f'<div class="note e">{ic("alert", 15, "var(--err-ink)")}'
@@ -634,7 +695,7 @@ def models_empty_offline(theme):
               'или попросите у администратора адрес корпоративного зеркала. Модель можно поставить '
               'из файла или папки — например, с флешки.'
               f'<div style="display:flex;gap:8px;margin-top:10px">'
-              f'{btn("Установить из файла…", "pri", "folder")}{btn("Повторить", "", "refresh")}'
+              f'{btn("Установить из файла или папки…", "pri", "folder")}{btn("Повторить", "", "refresh")}'
               f'{btn("Указать адрес каталога", "gh")}</div></div></div>'
             + '<div class="grp">Установленные · 0</div>'
               '<div class="card"><div class="r" style="padding:22px 14px;justify-content:center">'
@@ -651,8 +712,9 @@ def models_empty_offline(theme):
     b = shell("Модели", head("Модели", "Каталог недоступен — работает установка из файла"), body,
               footer("Модель не выбрана — установить", "unavailable"))
     leg = ("<b>Пустое состояние + нет сети.</b> Правило PRD: сеть не блокирует UI модалкой и не даёт "
-           "пустого списка — встроенный манифест показывается всегда, у карточек неактивна только кнопка "
-           "«Скачать», а «Установить из файла…» работает. В сообщении нет слова «VPN» (запрет F14.5) — "
+           "пустого списка — встроенный манифест показывается всегда, у карточек недоступна только "
+           "отметка выбора, а «Установить из файла или папки…» работает. В сообщении нет слова «VPN» "
+           "(запрет F14.5) — "
            "есть путь через администратора и корпоративное зеркало. Строка внизу слева честно говорит "
            "«Модель не выбрана — установить».")
     return page(f"A · Модели: пусто и нет сети — {th(theme)}",

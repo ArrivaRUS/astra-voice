@@ -26,6 +26,8 @@ chromium --headless=new --no-sandbox --disable-gpu --hide-scrollbars \
   страницы под предел 1506 px — из-за этого пиксели «плыли». Сейчас масштабирования нет.
 
 **2026-09-16 набор переснят целиком**, все 48 кадров — одним прогоном по этой инструкции.
+**2026-09-21 набор вырос до 50 кадров**: добавлен экран `08-onboarding-progress` (сквозная
+полоска загрузки мастера, пять состояний).
 Кадров, снятых старым инструментом, в папке не осталось: признаки таких кадров — высота
 ровно 1506 px (обрез под предел) и ширина 931 px вместо 951 (было у `09-pill`, `09-tray`).
 Если такое снова появится — кадр снят не тем инструментом, переснимайте.
@@ -44,7 +46,7 @@ chromium --headless=new --no-sandbox --disable-gpu --hide-scrollbars \
 
 ## Когда пересматривать
 
-**Правка в общем CSS — переснимаем весь набор, все 48.** Это `VARS_LIGHT`/`VARS_DARK` и `CSS`
+**Правка в общем CSS — переснимаем весь набор, все 50.** Это `VARS_LIGHT`/`VARS_DARK` и `CSS`
 в `design/mockups/directions/_base.py` и `CSS_FINAL` в `design/mockups/final/_shell.py`.
 Прежнее правило «только затронутые экраны» подводит: на глаз не видно, где именно всплывёт
 переменная, и 2026-09-16 ревизия нашла **18 протухших кадров из 48** — их не переснимали
@@ -60,7 +62,7 @@ chromium --headless=new --no-sandbox --disable-gpu --hide-scrollbars \
 
 ```bash
 python3 design/mockups/final/_build.py      # сперва собрать макеты
-python3 design/refs/reshoot.py              # переснять все 48
+python3 design/refs/reshoot.py              # переснять все 50
 python3 design/refs/reshoot.py 09-pill 09-tray   # только названные экраны
 python3 design/refs/reshoot.py --check      # ничего не писать, только сверить
 python3 design/refs/reshoot.py --check-head # контроль механизма, см. ниже

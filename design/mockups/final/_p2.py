@@ -460,7 +460,7 @@ def footer_states(theme):
 def advanced(theme):
     g1 = group("Память и скорость", [
         row("Модель в памяти", seg("Держать постоянно", "Выгружать", True),
-            "Держать — первая диктовка мгновенная, занято 415 МБ ОЗУ"),
+            "Держать — первая диктовка мгновенная, занято 768 МБ ОЗУ"),
         row("Выгружать через", stepper("5", "мин"),
             "Считается от последней диктовки; следующая после выгрузки ждёт ~2 с", dis=True),
         row("Потоки распознавания (ORT)", stepper("4", "из 8"),
@@ -479,7 +479,7 @@ def advanced(theme):
         row("Папка моделей",
             f'<span style="display:flex;gap:8px;align-items:center">'
             f'{btn("Открыть", "sm", "folder")}{btn("Изменить", "sm")}</span>',
-            "Занято 686 МБ · свободно на диске 42,1 ГБ", hint=False),
+            "Занято 680 МБ · свободно на диске 42,1 ГБ", hint=False),
         row("Надёжный режим захвата клавиш", tgl(False),
             "Включайте, если комбинацию перехватывает другая программа — потребуются дополнительные права"),
         row("Посимвольный ввод вместо буфера обмена", tgl(False),
@@ -498,7 +498,7 @@ def advanced(theme):
                        "Следующая диктовка после выгрузки ждёт загрузку ~2 с", hint=False) + '</div>')
     disk_low = (f'<div class="note w">{ic("alert", 15, "var(--warn-ink)")}'
                 '<div><b>Мало места на диске</b>'
-                'В папке моделей занято 686 МБ, свободно 340 МБ. Скачать Whisper large-v3-turbo '
+                'В папке моделей занято 680 МБ, свободно 340 МБ. Скачать Whisper large-v3-turbo '
                 '(1 089 МБ) не получится — освободите место или выберите модель полегче.'
                 f'<div style="display:flex;gap:8px;margin-top:9px">{btn("Открыть папку", "pri", "folder")}'
                 f'{btn("Показать лёгкие модели", "gh")}</div></div></div>')
@@ -552,7 +552,7 @@ def about(theme):
         row("Настройки", f'<span style="display:flex;gap:8px;align-items:center">'
             f'{btn("Открыть", "sm", "folder")}</span>', hint=False),
         row("Модели", f'<span style="display:flex;gap:8px;align-items:center">'
-            f'<span class="c12 mono">686 МБ</span>'
+            f'<span class="c12 mono">680 МБ</span>'
             f'{btn("Открыть", "sm", "folder")}</span>', hint=False),
         row("Логи и статистика", f'<span style="display:flex;gap:8px;align-items:center">'
             f'<span class="c12 mono">2,1 МБ</span>'
@@ -624,7 +624,7 @@ def about(theme):
     remove = ('<div class="card">'
               + row("Удалить данные программы",
                     btn("Показать, что удалять", "sm", "trash"),
-                    "При удалении пакета остаются: настройки (12 КБ), модели (686 МБ), логи (2,1 МБ)",
+                    "При удалении пакета остаются: настройки (12 КБ), модели (680 МБ), логи (2,1 МБ)",
                     hint=False) + '</div>')
     leg = ("<b>Экран для ИБ-службы (П3):</b> версии всех компонентов, лицензия <b>GPL-3.0-or-later</b>, "
            "NOTICE с атрибуцией каждой модели, PRIVACY со списком ровно двух хостов и дисклеймер о "
