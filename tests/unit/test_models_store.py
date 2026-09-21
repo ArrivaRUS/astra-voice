@@ -91,6 +91,7 @@ def test_commit_moves_once_and_writes_state(
     assert json.loads(state_path.read_text()) == {
         "state": "ok",
         "reason": "",
+        "recheck": False,
         "layout": "",
         "variant": "",
         "size_bytes": 7,
@@ -129,7 +130,7 @@ def test_commit_counts_nested_payload(store: ModelStore) -> None:
     assert store.records()[0].size_bytes == 7
 
 
-@pytest.mark.parametrize("operation", ["commit", "set_current", "mark_broken", "remove"])
+@pytest.mark.parametrize("operation", ["commit", "set_current", "mark_broken", "mark_ok", "remove"])
 def test_missing_revision(store: ModelStore, operation: str) -> None:
     with pytest.raises(StoreError) as error:
         if operation == "mark_broken":
@@ -303,6 +304,141 @@ def test_empty_records_and_ignored_staging(store: ModelStore) -> None:
     assert store.records() == ()
 
 
+@pytest.mark.parametrize("state", ["ok", "broken"])
+@pytest.mark.parametrize("neighbor_exists", [False, True])
+@pytest.mark.parametrize("reason", ["", "Произвольная причина отказа"])
+def test_legacy_migration_marks_only_migrated_broken_state_for_recheck(
+    store: ModelStore, state: str, neighbor_exists: bool, reason: str
+) -> None:
+    directory = install(store)
+    store.set_current("model", "rev")
+    state_path = directory.with_name("rev.json")
+    data = json.loads(state_path.read_text())
+    data.update(state=state, reason=reason)
+    del data["recheck"]
+    contents = json.dumps(data).encode()
+    legacy = directory / "state.json"
+    legacy.write_bytes(contents)
+    legacy.chmod(0o644)
+    if neighbor_exists:
+        state_path.write_bytes(contents)
+    else:
+        state_path.unlink()
+
+    (record,) = store.records()
+    expected_recheck = state == "broken" and not neighbor_exists
+    assert record.state == state
+    assert record.reason == reason
+    assert record.recheck is expected_recheck
+    assert (record.layout, record.variant, record.size_bytes) == ("", "", 7)
+    assert not legacy.exists()
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    if expected_recheck:
+        assert json.loads(state_path.read_text()) == {**data, "recheck": True}
+    else:
+        assert state_path.read_bytes() == contents
+    assert store.records() == (record,)
+    assert store.current() == (record if state == "ok" else None)
+
+
+def test_external_broken_state_without_recheck_is_not_marked(store: ModelStore) -> None:
+    directory = install(store)
+    state_path = directory.with_name("rev.json")
+    data = json.loads(state_path.read_text())
+    data.update(state="broken", reason="Ошибка проверки модели")
+    del data["recheck"]
+    state_path.write_text(json.dumps(data))
+    before = state_path.read_bytes()
+    (record,) = store.records()
+    assert record.state == "broken"
+    assert record.reason == data["reason"]
+    assert record.recheck is False
+    assert not (directory / "state.json").exists()
+    assert state_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("operation", ["mark_ok", "mark_broken"])
+def test_recheck_verdict_clears_flag_and_preserves_metadata(
+    store: ModelStore, operation: str
+) -> None:
+    directory = install(store)
+    state_path = directory.with_name("rev.json")
+    data = json.loads(state_path.read_text())
+    data.update(state="broken", reason="Старая причина", recheck=True)
+    state_path.write_text(json.dumps(data))
+    store.set_current("model", "rev")
+    pointer = store.root / "current.json"
+    before = pointer.read_bytes()
+    assert store.records()[0].recheck is True
+    assert store.current() is None
+
+    if operation == "mark_ok":
+        store.mark_ok("model", "rev")
+        state, reason = "ok", ""
+    else:
+        store.mark_broken("model", "rev", "Новая причина")
+        state, reason = "broken", "Новая причина"
+    (record,) = store.records()
+    assert record.state == state
+    assert record.reason == reason
+    assert record.recheck is False
+    assert json.loads(state_path.read_text()) == {
+        **data,
+        "state": state,
+        "reason": reason,
+        "recheck": False,
+    }
+    assert pointer.read_bytes() == before
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    store.set_current("model", "rev")
+    assert store.current() == (record if state == "ok" else None)
+
+
+@pytest.mark.parametrize("failure_stage", ["replace", "fsync_dir", "unlink"])
+def test_failed_broken_migration_preserves_legacy_until_recheck_is_written(
+    store: ModelStore, monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    directory = install(store)
+    state_path = directory.with_name("rev.json")
+    data = json.loads(state_path.read_text())
+    data.update(state="broken", reason="Старая причина")
+    del data["recheck"]
+    legacy = directory / "state.json"
+    contents = json.dumps(data).encode()
+    legacy.write_bytes(contents)
+    state_path.unlink()
+    original_unlink = Path.unlink
+
+    def fail_legacy_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path == legacy:
+            assert json.loads(state_path.read_text())["recheck"] is True
+            raise PermissionError("Нет доступа")
+        original_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as patch:
+        if failure_stage == "replace":
+            patch.setattr(os, "replace", Mock(side_effect=OSError(errno.ENOSPC, "Нет места")))
+        elif failure_stage == "fsync_dir":
+            patch.setattr(st, "_fsync_dir", Mock(side_effect=OSError(errno.EIO, "Ошибка записи")))
+        else:
+            patch.setattr(Path, "unlink", fail_legacy_unlink)
+        (record,) = store.records()
+        assert record.state == "broken"
+        assert record.reason == "Файл состояния модели (state.json) повреждён или недоступен."
+        assert legacy.read_bytes() == contents
+        if failure_stage == "replace":
+            assert not state_path.exists()
+        else:
+            assert json.loads(state_path.read_text())["recheck"] is True
+        assert not list(directory.parent.glob("*.tmp"))
+
+    (record,) = store.records()
+    assert record.state == "broken"
+    assert record.recheck is True
+    assert record.reason == data["reason"]
+    assert not legacy.exists()
+
+
 @pytest.mark.parametrize("operation", ["records", "current"])
 @pytest.mark.parametrize("neighbor_exists", [False, True])
 def test_legacy_state_is_migrated_once(
@@ -444,6 +580,42 @@ def test_missing_or_broken_state_is_listed_as_broken(
     assert store.current() is None
 
 
+def test_state_without_reason_is_ok(store: ModelStore) -> None:
+    directory = install(store)
+    state = directory.with_name("rev.json")
+    data = json.loads(state.read_text())
+    del data["reason"]
+    state.write_text(json.dumps(data))
+    (record,) = store.records()
+    assert record.state == "ok"
+    assert record.reason == ""
+
+
+@pytest.mark.parametrize("reason", [123, None])
+def test_state_with_non_string_reason_is_broken(store: ModelStore, reason: object) -> None:
+    directory = install(store)
+    state = directory.with_name("rev.json")
+    data = json.loads(state.read_text())
+    data["reason"] = reason
+    state.write_text(json.dumps(data))
+    (record,) = store.records()
+    assert record.state == "broken"
+    assert record.reason == "Файл состояния модели (state.json) повреждён или недоступен."
+
+
+@pytest.mark.parametrize("recheck", ["yes", 0, 1, None, [], {}])
+def test_state_with_non_bool_recheck_is_broken(store: ModelStore, recheck: object) -> None:
+    directory = install(store)
+    state_path = directory.with_name("rev.json")
+    data = json.loads(state_path.read_text())
+    data["recheck"] = recheck
+    state_path.write_text(json.dumps(data))
+    (record,) = store.records()
+    assert record.state == "broken"
+    assert record.recheck is False
+    assert record.reason == "Файл состояния модели (state.json) повреждён или недоступен."
+
+
 def test_records_enumerate_models_and_revisions(store: ModelStore) -> None:
     for model_id, revision in (("b", "2"), ("a", "2"), ("a", "1")):
         install(store, model_id, revision)
@@ -457,7 +629,7 @@ def test_records_enumerate_models_and_revisions(store: ModelStore) -> None:
 @pytest.mark.parametrize("value", ["../evil", "a/b", "", "a" * 65, ".", "..", "a\x00b"])
 @pytest.mark.parametrize("field", ["model_id", "revision"])
 @pytest.mark.parametrize(
-    "operation", ["staging_dir", "commit", "set_current", "mark_broken", "remove"]
+    "operation", ["staging_dir", "commit", "set_current", "mark_broken", "mark_ok", "remove"]
 )
 def test_bad_identifiers_have_no_side_effects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, field: str, operation: str

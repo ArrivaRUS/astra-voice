@@ -426,6 +426,7 @@ class HttpClient:
                 session.mount(scheme, _RequestAdapter(watchdog))
             while True:
                 host = _validate_url(url)
+                log.info("Запрос к %s", host)
                 proxies = urllib.request.getproxies()
                 # trust_env отключён: учитываем исключения явно для каждого адреса.
                 if requests.utils.should_bypass_proxies(url, no_proxy=proxies.get("no")):

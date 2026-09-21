@@ -459,7 +459,9 @@ class WorkerState:
         except Exception:
             if engine is not None:
                 self._release_engine(engine)
-            logger.warning("Не удалось загрузить движок.")
+            # Трассировка безопасна: при загрузке распознанного текста ещё нет;
+            # engine.load(dir, layout, variant, threads) не получает аудио или текст.
+            logger.warning("Не удалось загрузить движок.", exc_info=True)
             return [error("engine-failed", "Не удалось загрузить движок.")]
         self._engine = engine
         self._sessions = result.sessions

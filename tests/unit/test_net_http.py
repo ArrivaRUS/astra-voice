@@ -363,6 +363,20 @@ def test_download_and_headers(
     assert "Cookie" not in headers
 
 
+def test_download_logs_only_host(
+    client: HttpClient, local_server: LocalServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    url = local_server.url + "/private-model?private_token=secret-value#private-fragment"
+    with caplog.at_level(logging.INFO, logger=http.__name__):
+        with client.get_stream(url, deadline_s=2, cancel=threading.Event()) as response:
+            assert b"".join(response.iter_chunks()) == _BODY
+    (record,) = [record for record in caplog.records if record.name == http.__name__]
+    assert record.levelno == logging.INFO
+    assert record.getMessage() == f"Запрос к {urlsplit(url).hostname}"
+    for private in ("private-model", "private_token", "secret-value", "private-fragment"):
+        assert private not in record.getMessage()
+
+
 def test_stream_socket_is_available(client: HttpClient, local_server: LocalServer) -> None:
     with client.get_stream(
         local_server.url + "/ok", deadline_s=2, cancel=threading.Event()
@@ -404,14 +418,22 @@ def test_range_response_is_preserved(
 
 @pytest.mark.parametrize("status", (301, 302, 303, 307, 308))
 def test_relative_redirect_without_cookies(
-    client: HttpClient, local_server: LocalServer, status: int
+    client: HttpClient,
+    local_server: LocalServer,
+    status: int,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO, logger=http.__name__)
     with client.get_stream(
         f"{local_server.url}/redirect/{status}", deadline_s=2, cancel=threading.Event()
     ) as response:
         assert response.url == local_server.url + "/ok"
         assert b"".join(response.iter_chunks()) == _BODY
     assert len(local_server.requests) == 2
+    assert [record for record in caplog.record_tuples if record[0] == http.__name__] == [
+        (http.__name__, logging.INFO, "Запрос к 127.0.0.1"),
+        (http.__name__, logging.INFO, "Запрос к 127.0.0.1"),
+    ]
     assert "Cookie" not in local_server.requests[-1][1]
     assert "Authorization" not in local_server.requests[-1][1]
 

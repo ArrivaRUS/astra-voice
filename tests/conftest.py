@@ -1,4 +1,4 @@
-"""Общий страж сбора: движку Qt не нужен, а unit/xvfb без него обязаны падать."""
+"""Общая изоляция звука и страж сбора: unit/xvfb без Qt обязаны падать."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Mapping, Set
+from collections.abc import Iterator, Mapping, Set
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 from _pytest.nodes import Node
@@ -21,6 +22,10 @@ _QT_ENV_ERROR = pytest.StashKey[str | None]()
 _IGNORED = pytest.StashKey[dict[Path, str]]()
 _QT_MODULES = pytest.StashKey[Set[str]]()
 _TEST_NEEDS_QT = pytest.StashKey[dict[Path, bool]]()
+_PULSE_DIRECTORY = pytest.StashKey[TemporaryDirectory[str]]()
+_PULSE_ORIGINAL_ENV = pytest.StashKey[dict[str, str | None]]()
+_PULSE_ENV = pytest.StashKey[dict[str, str]]()
+_PULSE_PROCESSES = pytest.StashKey[set[tuple[int, int]] | None]()
 _QT_REASON = "недоступен PyQt5/QtWidgets (нужен python3-pyqt5)"
 _QT_MISSED = "модуль исключён, детект промахнулся — сообщите разработчику"
 _QT_ERROR = (
@@ -57,6 +62,106 @@ qml = (
 )
 print('ASTRA_QT_PROBE=' + json.dumps({'svg': svg, 'qml': qml}), flush=True)
 """
+
+
+def pulseaudio_processes(proc_root: Path = Path("/proc")) -> set[tuple[int, int]] | None:
+    """Читаем только /proc; время старта защищает от переиспользования pid."""
+    try:
+        entries = os.listdir(proc_root)
+    except (OSError, ValueError):
+        # На системах без доступного /proc сторож не работает.
+        return None
+    processes: set[tuple[int, int]] = set()
+    for name in entries:
+        if not name.isdecimal():
+            continue
+        try:
+            directory = proc_root / name
+            if (directory / "comm").read_text(encoding="utf-8").rstrip("\n") != "pulseaudio":
+                continue
+            stat = (directory / "stat").read_text(encoding="utf-8")
+            # После последней скобки идёт поле 3; starttime (поле 22) имеет индекс 19.
+            # Имя внутри скобок само может содержать пробелы и скобки.
+            _, closing, tail = stat.rpartition(")")
+            fields = tail.split()
+            if not closing or len(fields) < 20:
+                continue
+            processes.add((int(name), int(fields[19])))
+        except (OSError, ValueError):
+            # Процесс мог исчезнуть или стать недоступным между чтениями.
+            continue
+    return processes
+
+
+def check_pulseaudio_processes(
+    before: set[tuple[int, int]] | None, after: set[tuple[int, int]] | None
+) -> None:
+    """Новые процессы считаем пробоем изоляции; ничего не завершаем."""
+    if before is None or after is None:
+        return
+    appeared = after - before
+    if appeared:
+        pids = ", ".join(str(pid) for pid, _ in sorted(appeared))
+        pytest.fail(
+            f"Появилось новых процессов pulseaudio: {len(appeared)}; pid: {pids}. "
+            "Тест поднял настоящий pulseaudio, изоляция звука пробита; "
+            "см. PULSE_CLIENTCONFIG/PULSE_SERVER.",
+            pytrace=False,
+        )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config: pytest.Config) -> None:
+    """Изолируем всех потомков ещё до сбора тестов и подпроцесса проверки Qt."""
+    directory = TemporaryDirectory(prefix="astra-tests-pulse-")
+    config.stash[_PULSE_DIRECTORY] = directory
+    config.stash[_PULSE_ORIGINAL_ENV] = {
+        name: os.environ.get(name) for name in ("PULSE_CLIENTCONFIG", "PULSE_SERVER")
+    }
+    root = Path(directory.name)
+    client_config = root / "client.conf"
+    client_config.write_text("autospawn = no\n", encoding="utf-8")
+    pulse_env = {
+        "PULSE_CLIENTCONFIG": str(client_config),
+        "PULSE_SERVER": f"unix:{root / 'no-pulse-server'}",
+    }
+    config.stash[_PULSE_ENV] = pulse_env
+    os.environ.update(pulse_env)
+    config.stash[_PULSE_PROCESSES] = pulseaudio_processes()
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    """Возвращаем окружение вызывающей стороны и удаляем временный каталог."""
+    if _PULSE_DIRECTORY not in config.stash:
+        return
+    try:
+        for name, value in config.stash[_PULSE_ORIGINAL_ENV].items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    finally:
+        config.stash[_PULSE_DIRECTORY].cleanup()
+        del config.stash[_PULSE_DIRECTORY]
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    # Session-фикстура запускается один раз; исправляем также изменения прошлых тестов.
+    pulse_env = item.config.stash[_PULSE_ENV]
+    os.environ.update(pulse_env)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def audio_isolation(pytestconfig: pytest.Config) -> Iterator[None]:
+    """Восстанавливаем защиту после сбора и проверяем процессы после всех тестов."""
+    pulse_env = pytestconfig.stash[_PULSE_ENV]
+    os.environ.update(pulse_env)
+    try:
+        yield
+    finally:
+        os.environ.update(pulse_env)
+        check_pulseaudio_processes(pytestconfig.stash[_PULSE_PROCESSES], pulseaudio_processes())
 
 
 def qt_environment_error(

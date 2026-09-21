@@ -1124,11 +1124,25 @@ def test_model_loaded_and_repeat(factory: Factory) -> None:
 
 
 def test_load_failure_is_sanitized(factory: Factory, caplog: pytest.LogCaptureFixture) -> None:
+    """Пользователю — обезличенная ошибка, в журнал — трассировка загрузки без диктовки.
+
+    FakeEngine использует text как сообщение исключения загрузки, а не результат распознавания.
+    """
     worker, engine, _ = factory(FakeEngine(load_raises=True, text="секрет загрузки"), loaded=False)
     msg = worker.handle(load_message())[0]
     assert msg["code"] == "engine-failed"
     assert engine.unload_calls == 1
-    assert "секрет загрузки" not in caplog.text + str(msg)
+    assert "секрет загрузки" not in str(msg)
+    (record,) = [
+        record
+        for record in caplog.records
+        if record.name == state_module.__name__
+        and record.getMessage() == "Не удалось загрузить движок."
+    ]
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None
+    assert record.exc_info[0] is RuntimeError
+    assert "RuntimeError" in caplog.text
 
 
 def test_ping_during_slow_recognition(factory: Factory) -> None:

@@ -36,6 +36,7 @@ class ModelRecord:
     size_bytes: int
     state: ModelState = "ok"
     reason: str = ""
+    recheck: bool = False
 
 
 class StoreError(Exception):
@@ -112,6 +113,7 @@ def _state_data(record: ModelRecord) -> dict[str, object]:
     return {
         "state": record.state,
         "reason": record.reason,
+        "recheck": record.recheck,
         "layout": record.layout,
         "variant": record.variant,
         "size_bytes": record.size_bytes,
@@ -259,8 +261,18 @@ class ModelStore:
                     if state_path.exists():
                         legacy.unlink()
                     else:
-                        legacy.chmod(0o600)
-                        os.replace(legacy, state_path)
+                        try:
+                            legacy_data = _read_json(legacy)
+                        except (ValueError, RecursionError):
+                            legacy_data = {}
+                        if legacy_data.get("state") == "broken":
+                            legacy_data["recheck"] = True
+                            # Сначала закрепляем отметку, затем удаляем признак старой раскладки.
+                            _write_json(state_path, legacy_data)
+                            legacy.unlink()
+                        else:
+                            legacy.chmod(0o600)
+                            os.replace(legacy, state_path)
                     _fsync_dir(directory)
                     _fsync_dir(state_path.parent)
                     log.info("Состояние ревизии перенесено из %s в %s.", legacy, state_path)
@@ -269,8 +281,13 @@ class ModelStore:
                 raise
             data = _read_json(state_path)
             layout, variant, size = _metadata(data)
-            state, reason = data.get("state"), data.get("reason")
-            if state not in ("ok", "broken") or not isinstance(reason, str):
+            state, reason = data.get("state"), data.get("reason", "")
+            recheck = data.get("recheck", False)
+            if (
+                state not in ("ok", "broken")
+                or not isinstance(reason, str)
+                or not isinstance(recheck, bool)
+            ):
                 raise ValueError("Неверно указано состояние модели.")
             return ModelRecord(
                 model_id,
@@ -281,6 +298,7 @@ class ModelStore:
                 size,
                 state,
                 reason,
+                recheck,
             )
         except FileNotFoundError:
             reason = "Отсутствует файл состояния модели (state.json)."
@@ -344,7 +362,22 @@ class ModelStore:
         with _store_errors():
             directory = self._installed(model_id, revision)
             record = replace(
-                self._record(model_id, revision, directory), state="broken", reason=reason
+                self._record(model_id, revision, directory),
+                state="broken",
+                reason=reason,
+                recheck=False,
+            )
+            _write_json(self._state_path(model_id, revision), _state_data(record))
+
+    def mark_ok(self, model_id: str, revision: str) -> None:
+        """Снимает пометку брака и необходимость перепроверки.
+
+        Вызывать только после сверки контрольных сумм и успешного пробного распознавания.
+        """
+        with _store_errors():
+            directory = self._installed(model_id, revision)
+            record = replace(
+                self._record(model_id, revision, directory), state="ok", reason="", recheck=False
             )
             _write_json(self._state_path(model_id, revision), _state_data(record))
 

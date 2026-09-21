@@ -26,6 +26,166 @@ def guard() -> ModuleType:
     return module
 
 
+def write_process(
+    proc_root: Path, pid: int, comm: str, starttime: int, name: str = "pulse"
+) -> None:
+    """Подставной /proc: соседние поля отличаются от времени старта."""
+    directory = proc_root / str(pid)
+    directory.mkdir()
+    (directory / "comm").write_text(comm + "\n", encoding="utf-8")
+    fields = ["S", *(str(field) for field in range(4, 22)), str(starttime), "23"]
+    (directory / "stat").write_text(f"{pid} ({name}) {' '.join(fields)}\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("comm", ["pulseaudio", "pipewire", "pulseaudio-x", "x-pulseaudio"])
+@pytest.mark.parametrize("name", ["pulseaudio", "pulse (audio) worker)"])
+def test_pulseaudio_processes(guard: ModuleType, tmp_path: Path, comm: str, name: str) -> None:
+    write_process(tmp_path, 101, comm, 12345, name)
+    # Нечисловые записи /proc пропускаются независимо от их содержимого.
+    (tmp_path / "self").symlink_to(tmp_path / "101", target_is_directory=True)
+    assert guard.pulseaudio_processes(tmp_path) == (
+        {(101, 12345)} if comm == "pulseaudio" else set()
+    )
+
+
+@pytest.mark.parametrize("filename", ["comm", "stat"])
+@pytest.mark.parametrize("error", [FileNotFoundError, PermissionError, ValueError])
+def test_pulseaudio_processes_read_race(
+    guard: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    error: type[Exception],
+) -> None:
+    write_process(tmp_path, 101, "pulseaudio", 12345)
+    write_process(tmp_path, 102, "pulseaudio", 67890)
+    read_text = Path.read_text
+
+    def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        if path == tmp_path / "101" / filename:
+            raise error("процесс исчез или недоступен")
+        return read_text(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    assert guard.pulseaudio_processes(tmp_path) == {(102, 67890)}
+
+
+@pytest.mark.parametrize("stat", ["", "101 (pulse) S 0", "101 pulse S", "101 (pulse) " + "x " * 20])
+def test_pulseaudio_processes_invalid_stat(guard: ModuleType, tmp_path: Path, stat: str) -> None:
+    write_process(tmp_path, 101, "pulseaudio", 12345)
+    (tmp_path / "101" / "stat").write_text(stat, encoding="utf-8")
+    assert guard.pulseaudio_processes(tmp_path) == set()
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError, PermissionError])
+def test_pulseaudio_processes_without_proc(
+    guard: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: type[OSError]
+) -> None:
+    monkeypatch.setattr(guard.os, "listdir", Mock(side_effect=error("/proc недоступен")))
+    assert guard.pulseaudio_processes(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (set(), set()),
+        ({(101, 10)}, {(101, 10)}),
+        ({(101, 10), (102, 20)}, {(102, 20)}),
+        ({(101, 10)}, set()),
+        (None, {(101, 10)}),
+        ({(101, 10)}, None),
+    ],
+)
+def test_pulseaudio_processes_unchanged_or_gone(
+    guard: ModuleType, before: set[tuple[int, int]] | None, after: set[tuple[int, int]] | None
+) -> None:
+    guard.check_pulseaudio_processes(before, after)
+
+
+@pytest.mark.parametrize(
+    ("after", "pids"),
+    [({(101, 10), (102, 20), (103, 30)}, "102, 103"), ({(101, 20)}, "101")],
+)
+def test_pulseaudio_processes_new_or_reused_pid(
+    guard: ModuleType, after: set[tuple[int, int]], pids: str
+) -> None:
+    with pytest.raises(pytest.fail.Exception) as failure:
+        guard.check_pulseaudio_processes({(101, 10)}, after)
+    message = str(failure.value)
+    assert f"процессов pulseaudio: {len(after - {(101, 10)})}" in message
+    assert f"pid: {pids}." in message
+    assert "Тест поднял настоящий pulseaudio, изоляция звука пробита" in message
+    assert "PULSE_CLIENTCONFIG/PULSE_SERVER" in message
+
+
+@pytest.mark.parametrize("clientconfig", [None, "/прежний/client.conf"])
+@pytest.mark.parametrize("server", [None, "unix:/прежний/socket"])
+def test_audio_isolation_environment(
+    guard: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    clientconfig: str | None,
+    server: str | None,
+) -> None:
+    original = {"PULSE_CLIENTCONFIG": clientconfig, "PULSE_SERVER": server}
+    for name, value in original.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    snapshot = Mock(return_value={(101, 10)})
+    monkeypatch.setattr(guard, "pulseaudio_processes", snapshot)
+    config = Mock(stash=pytest.Stash())
+    guard.pytest_configure(config)
+    try:
+        client = Path(os.environ["PULSE_CLIENTCONFIG"])
+        assert client.is_file()
+        assert client.read_text(encoding="utf-8") == "autospawn = no\n"
+        assert os.environ["PULSE_SERVER"].startswith("unix:")
+        socket = Path(os.environ["PULSE_SERVER"].removeprefix("unix:"))
+        assert socket.parent == client.parent
+        assert socket.is_absolute()
+        assert not socket.exists()
+        snapshot.assert_called_once_with()
+        expected = {name: os.environ[name] for name in original}
+        # Повреждение при сборе исправляет session-фикстура.
+        os.environ.pop("PULSE_CLIENTCONFIG")
+        os.environ["PULSE_SERVER"] = "неверное значение"
+        fixture = guard.audio_isolation.__wrapped__(config)
+        next(fixture)
+        try:
+            assert {name: os.environ[name] for name in original} == expected
+            # Изменения предыдущего теста исправляются до следующего setup.
+            os.environ["PULSE_CLIENTCONFIG"] = "неверное значение"
+            os.environ.pop("PULSE_SERVER")
+            guard.pytest_runtest_setup(Mock(config=config))
+            assert {name: os.environ[name] for name in original} == expected
+        finally:
+            fixture.close()
+        assert snapshot.call_count == 2
+    finally:
+        guard.pytest_unconfigure(config)
+    assert {name: os.environ.get(name) for name in original} == original
+    assert not client.parent.exists()
+
+
+def test_audio_isolation_guard_uses_snapshot_before_collection(
+    guard: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Новый процесс появился при сборе, ещё до запуска session-фикстуры.
+    snapshot = Mock(side_effect=[set(), {(101, 20)}])
+    monkeypatch.setattr(guard, "pulseaudio_processes", snapshot)
+    config = Mock(stash=pytest.Stash())
+    guard.pytest_configure(config)
+    try:
+        fixture = guard.audio_isolation.__wrapped__(config)
+        next(fixture)
+        with pytest.raises(pytest.fail.Exception, match="pid: 101"):
+            fixture.close()
+        assert snapshot.call_count == 2
+    finally:
+        guard.pytest_unconfigure(config)
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
