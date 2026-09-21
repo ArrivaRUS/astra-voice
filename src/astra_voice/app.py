@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 from astra_voice.core import paths
 from astra_voice.core import policy as policy_mod
 from astra_voice.core import settings as settings_mod
+from astra_voice.core.audio_env import deny_pulse_autospawn
 from astra_voice.core.logging import setup_logging
 from astra_voice.core.model_request import build_model_load
 from astra_voice.core.paths import ipc_socket_path, lock_path, qml_dir, settings_path
@@ -684,6 +685,10 @@ def main(argv: list[str] | None = None) -> int:
 
     session_kind = detect()
     setup_logging(session_kind.value, debug=args.debug)
+    try:
+        deny_pulse_autospawn()
+    except Exception:
+        log.warning("Не удалось запретить автозапуск звукового сервера.", exc_info=True)
     _install_qt_message_handler()  # до создания QApplication: GL-жалобы идут оттуда
     policy = policy_mod.load()
     stored = settings_mod.load()
@@ -721,14 +726,13 @@ def main(argv: list[str] | None = None) -> int:
     settings_bridge = None  # держим Python-обёртку живой до выхода из main
     onboarding = None
     downloads = None
+    model_store: ModelStore | None = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
     close_watcher = _wire_close(  # держим ссылку на фильтр
         app, shell, is_tray_ready=lambda: runtime is not None and runtime.tray.registered
     )
     server = ShowServer(lambda timestamp: _show(shell, timestamp))
     timer = _install_signal_handlers(app)
-    if not args.hidden:
-        _show(shell)
 
     try:
         runtime_ready = False
@@ -744,7 +748,6 @@ def main(argv: list[str] | None = None) -> int:
                 _show(shell)
                 app_info.show_section(SECTION_GENERAL)
 
-            model_store: ModelStore | None = None
             try:
                 model_store = ModelStore()
             except (StoreError, OSError):
@@ -784,7 +787,7 @@ def main(argv: list[str] | None = None) -> int:
             model = ModelService(settings, policy)
         except Exception:  # noqa: BLE001 — каталог не должен мешать запуску окна
             log.warning("Не удалось подготовить каталог моделей, настройка продолжится без него")
-        downloads = ModelDownloads(model)
+        downloads = ModelDownloads(model, store=model_store)
         downloads.start_recheck()
 
         settings_bridge = SettingsBridge(
@@ -813,7 +816,7 @@ def main(argv: list[str] | None = None) -> int:
             _set_context_property(shell, "onboarding", onboarding)
             root = _root_window(shell)
             if root is not None:
-                root.installEventFilter(onboarding)
+                onboarding.attach_window(root)
             onboarding.doneChanged.connect(
                 lambda: _set_context_property(shell, "showOnboarding", not onboarding.done)
             )
@@ -827,6 +830,8 @@ def main(argv: list[str] | None = None) -> int:
             downloads.downloadProgressChanged.connect(update_download_status)
             downloads.downloadStateChanged.connect(update_download_status)
         _set_context_property(shell, "showOnboarding", show_onboarding)
+        if not args.hidden:
+            _show(shell)
         return int(app.exec_())
     finally:
         # US-8.4: выход из трея и SIGTERM/SIGINT вызывают app.quit() и приходят

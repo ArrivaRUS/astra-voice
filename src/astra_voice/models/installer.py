@@ -25,6 +25,7 @@ _COPY_CHUNK = 1 << 20
 _CHECKSUM_REASON = "Файлы модели повреждены: контрольная сумма не совпала. Получите их заново."
 _MISSING_REASON = "В папке не хватает файлов модели. Получите их заново."
 _EXTRA_REASON = "В папке есть лишние файлы. Оставьте только файлы выбранной модели."
+_LAYOUT_REASON = "Файлы в папке не подходят для выбранной модели."
 _SMOKE_REASON = "Модель не прошла пробное распознавание. Попробуйте установить её заново."
 _DISK_REASON = "На диске недостаточно места для установки модели. Освободите место."
 _FILES_REASON = "Не удалось прочитать или сохранить файлы модели. Попробуйте ещё раз."
@@ -74,7 +75,7 @@ def _file_path(directory: Path, name: str) -> Path:
         or target.is_symlink()
     ):
         log.warning("Недопустимый путь файла модели: %r в %s", name, directory)
-        raise _InstallError("Файлы в папке не подходят для выбранной модели.", "layout")
+        raise _InstallError(_LAYOUT_REASON, "layout")
     return target
 
 
@@ -98,6 +99,50 @@ def _check_contents(directory: Path, entry: CatalogEntry, *, allow_parts: bool) 
             log.warning("Отсутствует файл модели: %s / %s", directory, file.path)
             raise _InstallError(_MISSING_REASON, "layout")
     return tuple(parts)
+
+
+def _check_files(
+    directory: Path, entry: CatalogEntry, *, cancel: Callable[[], bool] | None = None
+) -> None:
+    """Перечитывает файлы каталога, сверяя sha256 и фактический размер."""
+    for file in entry.files:
+        source = _file_path(directory, file.path)
+        if not source.is_file():
+            log.warning("Отсутствует файл модели: %s", source)
+            raise _InstallError(_MISSING_REASON, "layout")
+        actual = sha256_file(source, cancel=cancel)
+        if not hmac.compare_digest(actual, file.sha256):
+            log.warning("Не совпала sha256 файла модели: %s", source)
+            raise _InstallError(_CHECKSUM_REASON, "checksum")
+        if source.stat().st_size != file.size:
+            log.warning("Не совпал размер файла модели: %s", source)
+            raise _InstallError(_CHECKSUM_REASON, "checksum")
+
+
+def _check_model_layout(directory: Path, entry: CatalogEntry) -> None:
+    try:
+        check_layout(directory, entry.layout, entry.variant)
+    except (EngineError, ValueError) as exc:
+        log.exception("Набор файлов не соответствует раскладке модели")
+        reason = _MISSING_REASON if isinstance(exc, ModelMissingError) else _LAYOUT_REASON
+        raise _InstallError(reason, "layout") from exc
+
+
+def verify_installed(
+    directory: Path, entry: CatalogEntry, *, cancel: Callable[[], bool] | None = None
+) -> tuple[bool, str]:
+    """Проверяет состав, байты и раскладку без остатков докачки.
+
+    Отмена и ошибки чтения пробрасываются: они не доказывают повреждение модели.
+    Причина отказа проверки предназначена для пользователя и не содержит путей.
+    """
+    try:
+        _check_contents(directory, entry, allow_parts=False)
+        _check_files(directory, entry, cancel=cancel)
+        _check_model_layout(directory, entry)
+    except _InstallError as exc:
+        return False, str(exc)
+    return True, ""
 
 
 def _check_cancel(cancel: Callable[[], bool] | None) -> None:
@@ -196,35 +241,15 @@ class Installer:
                 )
 
             # О2.1: даже проверенные загрузчиком файлы перечитываются перед переносом.
-            for file in entry.files:
-                source = _file_path(staging, file.path)
-                if not source.is_file():
-                    log.warning("Отсутствует файл модели: %s", source)
-                    raise _InstallError(_MISSING_REASON, "layout")
-                try:
-                    actual = sha256_file(source, cancel=cancel)
-                except HashCancelledError as exc:
-                    raise _InstallError("Установка отменена.", "cancelled") from exc
-                if not hmac.compare_digest(actual, file.sha256):
-                    log.warning("Не совпала sha256 файла модели: %s", source)
-                    raise _InstallError(_CHECKSUM_REASON, "checksum")
-                if source.stat().st_size != file.size:
-                    log.warning("Не совпал размер файла модели: %s", source)
-                    raise _InstallError(_CHECKSUM_REASON, "checksum")
+            try:
+                _check_files(staging, entry, cancel=cancel)
+            except HashCancelledError as exc:
+                raise _InstallError("Установка отменена.", "cancelled") from exc
 
             # О2.2: остатки докачки разрешены, но в установленный набор не попадают.
             for part in _check_contents(staging, entry, allow_parts=True):
                 part.unlink()
-            try:
-                check_layout(staging, entry.layout, entry.variant)
-            except (EngineError, ValueError) as exc:
-                log.exception("Набор файлов не соответствует раскладке модели")
-                reason = (
-                    _MISSING_REASON
-                    if isinstance(exc, ModelMissingError)
-                    else "Файлы в папке не подходят для выбранной модели."
-                )
-                raise _InstallError(reason, "layout") from exc
+            _check_model_layout(staging, entry)
 
             # Служебные метаданные добавляем сами и только после проверки состава.
             metadata = _file_path(staging, "state.json")

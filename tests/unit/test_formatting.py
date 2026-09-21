@@ -7,9 +7,46 @@ from typing import cast
 
 import pytest
 
-from astra_voice.ui.formatting import SpeedTracker, format_eta, format_size, format_speed
+from astra_voice.ui.formatting import (
+    SpeedTracker,
+    clean_display_name,
+    format_eta,
+    format_size,
+    format_space,
+    format_speed,
+)
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("for_menu", [False, True])
+def test_clean_display_name_controls_and_mnemonics(for_menu: bool) -> None:
+    controls = "".join(chr(code) for code in (*range(32), *range(127, 160)))
+    bidi = "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f"
+    text = f"  A&B{controls}{bidi}\r\n  модель\u00a0   один  "
+    assert clean_display_name(text, for_menu=for_menu) == (
+        "A&&B модель один" if for_menu else "A&B модель один"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "limit", "expected"),
+    [
+        ("abcdef", 4, "abc…"),
+        ("abcd", 4, "abcd"),
+        ("abc", 1, "…"),
+        ("abc", 0, ""),
+        ("abc", -1, ""),
+        ("", 80, ""),
+        ("x" * 500, 80, "x" * 79 + "…"),
+    ],
+)
+def test_clean_display_name_limit(text: str, limit: int, expected: str) -> None:
+    assert clean_display_name(text, limit=limit) == expected
+
+
+def test_clean_display_name_escapes_complete_mnemonics_after_limit() -> None:
+    assert clean_display_name("&&&&", limit=3, for_menu=True) == "&&&&…"
 
 
 @pytest.mark.parametrize(
@@ -58,6 +95,7 @@ def test_formatters_reject_non_numbers(value: object) -> None:
     assert format_eta(60, elapsed_s=number, stable=True) == "считаю…"
     assert format_speed(number) == ""
     assert format_size(number) == ""
+    assert format_space(number) == ""
 
 
 @pytest.mark.parametrize("elapsed_s", [float("inf"), float("nan"), -1.0])
@@ -105,6 +143,24 @@ def test_format_speed(speed: float, expected: str) -> None:
 def test_format_size(size: float, round_up: bool, expected: str) -> None:
     """Размер округляется по выбранному правилу."""
     assert format_size(size, round_up=round_up) == expected
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        (0, "0 МБ"),
+        (512_000_000, "512 МБ"),
+        (999_999_999, "1000 МБ"),
+        (1_000_000_000, "1,0 ГБ"),
+        (42_100_000_000, "42,1 ГБ"),
+        (-1, ""),
+        (float("nan"), ""),
+        (float("inf"), ""),
+        (float("-inf"), ""),
+    ],
+)
+def test_format_space(size: float, expected: str) -> None:
+    assert format_space(size) == expected
 
 
 def test_tracker_uniform_download() -> None:

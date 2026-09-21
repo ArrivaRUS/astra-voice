@@ -15,7 +15,7 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -138,6 +138,47 @@ def test_version_needs_no_display(tmp_path: Path) -> None:
     proc = _run(["--version"], env)
     assert proc.returncode == 0
     assert proc.stdout.startswith("astra-voice ")
+
+
+@pytest.mark.parametrize("failure", [None, OSError("нет доступа"), RuntimeError("сбой путей")])
+def test_main_repeats_audio_guard_after_logging_without_fatal_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception | None,
+) -> None:
+    from PyQt5 import QtCore
+
+    from astra_voice import app as app_mod
+    from astra_voice.platform.session import SessionKind
+
+    monkeypatch.setattr(app_mod, "lock_path", lambda: tmp_path / "lock")
+    monkeypatch.setattr(
+        QtCore, "QLockFile", Mock(return_value=Mock(tryLock=Mock(return_value=True)))
+    )
+    monkeypatch.setattr(app_mod, "detect", lambda: SessionKind.OTHER)
+    calls = Mock()
+    calls.deny.side_effect = failure
+    # Останавливаем main до создания QApplication и загрузки интерфейса.
+    calls.qt.side_effect = EOFError("остановка перед Qt")
+    monkeypatch.setattr(app_mod, "setup_logging", calls.logging)
+    monkeypatch.setattr(app_mod, "deny_pulse_autospawn", calls.deny)
+    monkeypatch.setattr(app_mod, "_install_qt_message_handler", calls.qt)
+
+    with caplog.at_level(logging.WARNING, logger=app_mod.__name__):
+        with pytest.raises(EOFError, match="остановка перед Qt"):
+            app_mod.main([])
+
+    assert calls.mock_calls == [
+        call.logging(SessionKind.OTHER.value, debug=False),
+        call.deny(),
+        call.qt(),
+    ]
+    assert caplog.record_tuples == (
+        [(app_mod.__name__, logging.WARNING, "Не удалось запретить автозапуск звукового сервера.")]
+        if failure is not None
+        else []
+    )
 
 
 def test_lock_is_created(

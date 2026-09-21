@@ -478,6 +478,34 @@ def test_onboarding_context(rig: Rig, done: int | None, runtime_available: bool)
         controller.cancelCapture()
 
 
+@pytest.mark.parametrize("hidden", [False, True])
+def test_onboarding_attaches_window_before_show(rig: Rig, hidden: bool) -> None:
+    root = rig.shell.rootObjects.return_value[0]
+    root.isVisible.return_value = False
+    rig.calls.attach_mock(root.installEventFilter, "attach_filter")
+    rig.calls.attach_mock(root.isVisible, "read_visibility")
+    rig.calls.attach_mock(rig.show, "show")
+
+    assert app_mod.main(["--hidden"] if hidden else []) == 7
+
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    controller = properties["onboarding"]
+    assert controller._window is root
+    assert controller._window_visible is False
+    root.installEventFilter.assert_called_once_with(controller)
+    calls = rig.calls.mock_calls
+    attached = calls.index(call.attach_filter(controller))
+    read = calls.index(call.read_visibility())
+    assert attached < read < calls.index(call.exec())
+    if hidden:
+        rig.show.assert_not_called()
+    else:
+        rig.show.assert_called_once_with(rig.shell)
+        assert read < calls.index(call.show(rig.shell)) < calls.index(call.exec())
+
+
 def test_onboarding_host_delegates_and_hides_root(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

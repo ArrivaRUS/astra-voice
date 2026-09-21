@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import Mock
 
 import pytest
 
+from astra_voice.core.dictation import DictationOrchestrator, MicrophoneLevelUpdate
+from astra_voice.platform.paste import PasteMode
 from astra_voice.ui import indicators as module
 from astra_voice.ui import notify
 from astra_voice.ui.indicators import IndicatorGuard, indicator_visible
+from astra_voice.ui.pill import PillState
+from astra_voice.ui.tray_icons import TrayState
 
 if TYPE_CHECKING:
     from astra_voice.ui.pill import Pill
@@ -28,12 +32,23 @@ class FakePill:
     forced_calls: list[bool] = field(default_factory=list)
     on_visible: Callable[[], None] | None = None
     on_forced: Callable[[], None] | None = None
+    state: PillState = PillState.LISTENING
+    level: float | None = None
 
     @property
     def visible(self) -> bool:
         if self.on_visible is not None:
             self.on_visible()
-        return self.available and (self.enabled or self.forced)
+        return self.available and (self.enabled or self.forced) and self.state != PillState.HIDDEN
+
+    def show_state(
+        self, state: PillState, *, text: str | None = None, level: float | None = None
+    ) -> None:
+        self.state = state
+        self.level = level
+
+    def hide(self) -> None:
+        self.state = PillState.HIDDEN
 
     def set_forced(self, value: bool) -> None:
         self.forced_calls.append(value)
@@ -46,6 +61,13 @@ class FakePill:
 class FakeTray:
     _registered: bool = True
     on_registered: Callable[[], None] | None = None
+    state: TrayState = TrayState.IDLE
+
+    def set_state(self, state: TrayState, tooltip: str | None = None) -> None:
+        self.state = state
+
+    def set_has_last_text(self, value: bool) -> None:
+        pass
 
     @property
     def registered(self) -> bool:
@@ -557,3 +579,87 @@ def test_nested_recording_change_invalidates_check(
         assert not guard.check()
         harness.flush_notifications()
         assert harness.events == ["stop", "notify"]
+
+
+@pytest.mark.parametrize("scenario", ["no-tray", "tray-lost", "no-indicators"])
+def test_level_monitor_with_real_indicator_guard(harness: Harness, scenario: str) -> None:
+    commands: list[dict[str, Any]] = []
+    updates: list[MicrophoneLevelUpdate] = []
+    microphone_open = False
+    # Выключенная пилюля хранит состояние предыдущей диктовки до нового show_state.
+    harness.pill.state = PillState.ERROR
+    harness.pill.enabled = False
+    harness.tray.registered = scenario == "tray-lost"
+    harness.pill.available = scenario != "no-indicators"
+
+    def send(message: dict[str, Any], *, timeout: float | None = None) -> None:
+        nonlocal microphone_open
+        commands.append(message)
+        if message["type"] == "record.start":
+            assert harness.pill.state == PillState.LISTENING
+            assert harness.tray.state == TrayState.LISTENING
+            assert harness.guard.recording and harness.guard.ok
+            microphone_open = True
+        elif message["type"] == "record.cancel":
+            microphone_open = False
+            core.on_worker_event({**message, "type": "cancelled", "generation": 1})
+
+    core = DictationOrchestrator(
+        send=send,
+        generation=lambda: 1,
+        restart_worker=Mock(),
+        pill=harness.pill,
+        tray=harness.tray,
+        paste=Mock(),
+        active_window=Mock(),
+        schedule=Mock(return_value=object()),
+        cancel_timer=Mock(),
+        hotkey_done=Mock(),
+        hotkey_cancel=Mock(),
+        hotkey_idle=lambda: True,
+        set_recording=harness.guard.set_recording,
+        paste_mode=lambda: PasteMode.AUTO,
+        record_params=lambda: {},
+    )
+    harness.guard.on_stop_recording = core.on_indicators_lost
+    if scenario == "no-indicators":
+        harness.guard._grace_seconds = 0
+
+        def check_synchronously() -> None:
+            harness.pill.on_forced = None
+            harness.guard.check()
+
+        harness.pill.on_forced = check_synchronously
+    core.start_level_monitor("", updates.append)
+    if scenario == "no-indicators":
+        assert [message["type"] for message in commands] == ["record.cancel"]
+        assert updates == [MicrophoneLevelUpdate("idle")]
+        assert not microphone_open and not core.level_active
+    else:
+        assert microphone_open and core.level_active
+        # Отвал трея форсирует текущее «Слушаю», а не старую ошибку диктовки.
+        harness.clock.advance(1500)
+        harness.tray.registered = False
+        harness.timer.fire()
+        harness.clock.advance(1500)
+        harness.timer.fire()
+        harness.flush_notifications()
+        assert harness.events == []
+        assert harness.guard.recording and core.level_active
+        assert harness.pill.visible and harness.pill.state == PillState.LISTENING
+        assert [message["type"] for message in commands] == ["record.start"]
+        core.on_worker_event(
+            {
+                "type": "level",
+                "generation": 1,
+                "utterance_id": commands[0]["utterance_id"],
+                "peak_dbfs": -18.0,
+            }
+        )
+        assert harness.pill.level == pytest.approx(0.7)
+        assert updates[-1] == MicrophoneLevelUpdate("listening", peak_dbfs=-18.0)
+        core.stop_level_monitor()
+        assert not microphone_open
+    assert harness.pill.state == PillState.HIDDEN
+    assert harness.tray.state == TrayState.IDLE
+    assert not harness.guard.recording and not harness.timer.active

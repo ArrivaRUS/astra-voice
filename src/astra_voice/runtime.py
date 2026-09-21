@@ -549,6 +549,8 @@ class DictationRuntime(QObject):
             self._loading_model = False
             self._fail_pending_test()
             self.tray.set_model_recheck_enabled(True)
+            if reason == "cancelled":
+                return
             self.tray.set_state(TrayState.ERROR)
             self.pill.show_state(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
             if reason in {"load-failed", "worker-error", "no-wav", "timeout"}:

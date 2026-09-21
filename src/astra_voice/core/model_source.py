@@ -156,7 +156,12 @@ def resolve_model_request(
         except Exception:
             log.warning("Не удалось получить выбранную модель из хранилища")
         else:
-            if record is not None and record.state == "ok":
+            if (
+                record is not None
+                and record.state == "ok"
+                and record.recheck is not True
+                and record.metadata_ok
+            ):
                 return build_model_load(
                     {
                         **data,

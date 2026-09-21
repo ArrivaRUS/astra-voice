@@ -212,6 +212,9 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
     factory = Mock(return_value=icon)
     provider = Mock(spec=TrayIconProvider)
     provider.has_icon.return_value = True
+    # Подпись значка чистится как внешняя строка, поэтому провайдер обязан
+    # вернуть именно текст, а не заглушку.
+    provider.tooltip.return_value = "Astra Voice"
     tray = module.Tray(provider, tray_factory=factory)
     menu = icon.setContextMenu.call_args.args[0]
     try:

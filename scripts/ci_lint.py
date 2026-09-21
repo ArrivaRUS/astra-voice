@@ -12,7 +12,9 @@
 * **секреты вне Environment** — Environment `release` даёт required reviewer и
   ограничение по ветке/тегу; секрет в обычном job такой защиты не имеет;
 * **`${{ … }}` внутри `run:`** — подстановка идёт до запуска shell, поэтому
-  заголовок PR вида `"; rm -rf /` исполняется. Значения передаются через `env:`.
+  заголовок PR вида `"; rm -rf /` исполняется. Значения передаются через `env:`;
+* **широкий `paths-ignore`** — позволяет вывести код из-под проверок;
+* **релиз без `needs: engine`** — позволяет выпустить пакет без проверки движка.
 
     scripts/ci_lint.py .github/workflows/*.yml
 """
@@ -31,6 +33,17 @@ import yaml
 ALLOWED_WRITE_JOBS = frozenset({"release"})
 #: Разрешённые значения прав на уровне workflow.
 READ_ONLY = {"read", "none"}
+ALLOWED_PATHS_IGNORE = frozenset(
+    {
+        "HEARTBEAT.md",
+        "decisions/**",
+        ".patches/**",
+        "research/**",
+        "docs/status.md",
+        "docs/plans.md",
+        "docs/test-plan.md",
+    }
+)
 
 _SHA_RE = re.compile(r"^[^@\s]+/[^@\s]+@[0-9a-f]{40}(\s|$)")
 _LOCAL_RE = re.compile(r"^\./")
@@ -95,6 +108,21 @@ def check_workflow(path: Path) -> list[str]:
     )
     if "pull_request_target" in trigger_names:
         problems.append(f"{name}: pull_request_target запрещён (секреты в контексте форка)")
+    if isinstance(triggers, dict):
+        for event, options in triggers.items():
+            if not isinstance(options, dict) or "paths-ignore" not in options:
+                continue
+            ignored = options["paths-ignore"]
+            where = f"{name}:on.{event}.paths-ignore"
+            if not isinstance(ignored, list):
+                problems.append(f"{where}: ожидался список разрешённых шаблонов")
+                continue
+            for pattern in ignored:
+                if not isinstance(pattern, str) or pattern not in ALLOWED_PATHS_IGNORE:
+                    problems.append(
+                        f"{where}: шаблон {pattern!r} вне белого списка — "
+                        "может вывести код из-под проверок"
+                    )
 
     if "permissions" not in doc:
         problems.append(f"{name}: нет permissions на верхнем уровне (нужен contents: read)")
@@ -110,6 +138,9 @@ def check_workflow(path: Path) -> list[str]:
         if uses_secret and not job.get("environment"):
             problems.append(f"{where}: использует secrets без environment (нужен `release`)")
         if job_id in ALLOWED_WRITE_JOBS:
+            needs = job.get("needs", [])
+            if needs != "engine" and (not isinstance(needs, list) or "engine" not in needs):
+                problems.append(f"{where}: needs задачи релиза должен содержать `engine`")
             cond = str(job.get("if", ""))
             if "refs/tags/" not in cond:
                 problems.append(f"{where}: job релиза должен быть ограничен тегом (`if:`)")

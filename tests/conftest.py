@@ -26,6 +26,7 @@ _PULSE_DIRECTORY = pytest.StashKey[TemporaryDirectory[str]]()
 _PULSE_ORIGINAL_ENV = pytest.StashKey[dict[str, str | None]]()
 _PULSE_ENV = pytest.StashKey[dict[str, str]]()
 _PULSE_PROCESSES = pytest.StashKey[set[tuple[int, int]] | None]()
+_PULSE_TEST_PROCESSES = pytest.StashKey[set[tuple[int, int]] | None]()
 _QT_REASON = "недоступен PyQt5/QtWidgets (нужен python3-pyqt5)"
 _QT_MISSED = "модуль исключён, детект промахнулся — сообщите разработчику"
 _QT_ERROR = (
@@ -64,8 +65,39 @@ print('ASTRA_QT_PROBE=' + json.dumps({'svg': svg, 'qml': qml}), flush=True)
 """
 
 
+def _read_proc_file(path: Path) -> str:
+    """Читаем через os, а не через Path.open: тесты подменяют его у себя.
+
+    Сторож работает в setup и teardown каждого теста, в том числе пока чужой
+    monkeypatch ещё не откатился (`test_models_downloader` подменяет
+    `Path.open` своей сигнатурой). Низкоуровневые вызовы такие подмены не
+    задевают, поэтому оснастка не падает из-за них и не рушит весь прогон.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        chunks: list[bytes] = []
+        while block := os.read(fd, 4096):
+            chunks.append(block)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
 def pulseaudio_processes(proc_root: Path = Path("/proc")) -> set[tuple[int, int]] | None:
-    """Читаем только /proc; время старта защищает от переиспользования pid."""
+    """Читаем только /proc; время старта защищает от переиспользования pid.
+
+    Сторож обязан деградировать в «не знаю» (None), а не ронять чужой тест:
+    он работает и тогда, когда тест ещё держит свои подмены (`test_models_store`
+    подменяет `os.open` моком, который бросает `AssertionError`). Поэтому
+    наружу не выпускаем ничего, кроме отсутствия ответа.
+    """
+    try:
+        return _scan_pulseaudio_processes(proc_root)
+    except Exception:
+        return None
+
+
+def _scan_pulseaudio_processes(proc_root: Path) -> set[tuple[int, int]] | None:
     try:
         entries = os.listdir(proc_root)
     except (OSError, ValueError):
@@ -77,9 +109,9 @@ def pulseaudio_processes(proc_root: Path = Path("/proc")) -> set[tuple[int, int]
             continue
         try:
             directory = proc_root / name
-            if (directory / "comm").read_text(encoding="utf-8").rstrip("\n") != "pulseaudio":
+            if _read_proc_file(directory / "comm").rstrip("\n") != "pulseaudio":
                 continue
-            stat = (directory / "stat").read_text(encoding="utf-8")
+            stat = _read_proc_file(directory / "stat")
             # После последней скобки идёт поле 3; starttime (поле 22) имеет индекс 19.
             # Имя внутри скобок само может содержать пробелы и скобки.
             _, closing, tail = stat.rpartition(")")
@@ -94,17 +126,22 @@ def pulseaudio_processes(proc_root: Path = Path("/proc")) -> set[tuple[int, int]
 
 
 def check_pulseaudio_processes(
-    before: set[tuple[int, int]] | None, after: set[tuple[int, int]] | None
+    before: set[tuple[int, int]] | None,
+    after: set[tuple[int, int]] | None,
+    *,
+    nodeid: str | None = None,
 ) -> None:
-    """Новые процессы считаем пробоем изоляции; ничего не завершаем."""
+    """Новые процессы требуют проверки изоляции; их происхождение нам неизвестно."""
     if before is None or after is None:
         return
     appeared = after - before
     if appeared:
         pids = ", ".join(str(pid) for pid, _ in sorted(appeared))
+        where = f" Во время теста {nodeid}." if nodeid is not None else " За время сессии."
         pytest.fail(
-            f"Появилось новых процессов pulseaudio: {len(appeared)}; pid: {pids}. "
-            "Тест поднял настоящий pulseaudio, изоляция звука пробита; "
+            f"Появилось новых процессов pulseaudio: {len(appeared)}; pid: {pids}."
+            f"{where} Процесс мог быть запущен пользователем или другой программой. "
+            "Проверьте изоляцию звука в тесте; "
             "см. PULSE_CLIENTCONFIG/PULSE_SERVER.",
             pytrace=False,
         )
@@ -132,36 +169,61 @@ def pytest_configure(config: pytest.Config) -> None:
 
 def pytest_unconfigure(config: pytest.Config) -> None:
     """Возвращаем окружение вызывающей стороны и удаляем временный каталог."""
-    if _PULSE_DIRECTORY not in config.stash:
+    directory = config.stash.get(_PULSE_DIRECTORY, None)
+    if directory is None:
         return
     try:
-        for name, value in config.stash[_PULSE_ORIGINAL_ENV].items():
+        for name, value in config.stash.get(_PULSE_ORIGINAL_ENV, {}).items():
             if value is None:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
     finally:
-        config.stash[_PULSE_DIRECTORY].cleanup()
+        directory.cleanup()
         del config.stash[_PULSE_DIRECTORY]
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item: pytest.Item) -> None:
     # Session-фикстура запускается один раз; исправляем также изменения прошлых тестов.
-    pulse_env = item.config.stash[_PULSE_ENV]
+    pulse_env = item.config.stash.get(_PULSE_ENV, {})
     os.environ.update(pulse_env)
+    item.stash[_PULSE_TEST_PROCESSES] = pulseaudio_processes()
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_teardown(item: pytest.Item) -> Iterator[None]:
+    # Снимок до финализаторов ловит процесс, который они успеют убрать; пока
+    # живы подмены самого теста, обход /proc отдаёт «не знаю» — тогда работает
+    # только снимок после финализаторов, и прогон из-за этого не падает.
+    after_call = pulseaudio_processes()
+    try:
+        yield
+    finally:
+        # Снимок после финализаторов ловит также процессы из самого teardown.
+        after_teardown = pulseaudio_processes()
+        after = (
+            None
+            if after_call is None and after_teardown is None
+            else (after_call or set()) | (after_teardown or set())
+        )
+        check_pulseaudio_processes(
+            item.stash.get(_PULSE_TEST_PROCESSES, None), after, nodeid=item.nodeid
+        )
 
 
 @pytest.fixture(scope="session", autouse=True)
 def audio_isolation(pytestconfig: pytest.Config) -> Iterator[None]:
     """Восстанавливаем защиту после сбора и проверяем процессы после всех тестов."""
-    pulse_env = pytestconfig.stash[_PULSE_ENV]
+    pulse_env = pytestconfig.stash.get(_PULSE_ENV, {})
     os.environ.update(pulse_env)
     try:
         yield
     finally:
         os.environ.update(pulse_env)
-        check_pulseaudio_processes(pytestconfig.stash[_PULSE_PROCESSES], pulseaudio_processes())
+        check_pulseaudio_processes(
+            pytestconfig.stash.get(_PULSE_PROCESSES, None), pulseaudio_processes()
+        )
 
 
 def qt_environment_error(

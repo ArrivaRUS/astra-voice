@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import QAction, QActionGroup, QMenu, QSystemTrayIcon
 
 from astra_voice.platform.session import SessionKind, detect
 from astra_voice.ui import notify
+from astra_voice.ui.formatting import clean_display_name
 from astra_voice.ui.tray_icons import TrayIconProvider
 from astra_voice.ui.tray_icons import TrayState as TrayState
 
@@ -363,9 +364,7 @@ class Tray(QObject):
             self._tray.setIcon(self._provider.icon(state))
         else:
             self._invalidate_registration()
-        self._tray.setToolTip(
-            self._provider.tooltip(state, hotkey=self._hotkey) if tooltip is None else tooltip
-        )
+        self._update_tooltip(tooltip)
         self._update_menu()
         if state == TrayState.DONE:
             self._done_timer.start(800)
@@ -377,6 +376,7 @@ class Tray(QObject):
 
     def set_download_status(self, text: str) -> None:
         """Показывает прогресс сразу под состоянием, пока есть текст загрузки."""
+        text = clean_display_name(text, for_menu=True)
         self._download_action.setText(text)
         self._download_action.setVisible(bool(text))
         # Отсутствующий прогресс не меняет состав обычного меню и его сочетания.
@@ -385,6 +385,14 @@ class Tray(QObject):
                 self._menu.insertAction(self._menu.actions()[1], self._download_action)
         else:
             self._menu.removeAction(self._download_action)
+        self._update_tooltip()
+
+    def _update_tooltip(self, tooltip: str | None = None) -> None:
+        if self._download_action.isVisible():
+            tooltip = "Astra Voice — загружается модель"
+        elif tooltip is None:
+            tooltip = self._provider.tooltip(self._state, hotkey=self._hotkey)
+        self._tray.setToolTip(clean_display_name(tooltip))
 
     def _done_expired(self) -> None:
         if self._state == TrayState.DONE:

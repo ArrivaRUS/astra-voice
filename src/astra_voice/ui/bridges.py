@@ -3,18 +3,29 @@
 from __future__ import annotations
 
 import errno
-import hmac
 import logging
 import math
 import os
 import shutil
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from PyQt5.QtCore import QEvent, QObject, Qt, QThread, QUrl, pyqtProperty, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import (
+    QEvent,
+    QObject,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    pyqtProperty,
+    pyqtSignal,
+    pyqtSlot,
+)
+from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import QFileDialog
 
 from astra_voice.core import paths
@@ -34,14 +45,27 @@ from astra_voice.core.settings import save as settings_save
 from astra_voice.core.version import __version__
 from astra_voice.models.catalog import CatalogEntry, load_builtin
 from astra_voice.models.downloader import Downloader, DownloadError, Progress
-from astra_voice.models.installer import Installer, InstallResult, SmokeCheck, SmokeResult
+from astra_voice.models.installer import (
+    Installer,
+    InstallResult,
+    SmokeCheck,
+    SmokeResult,
+    verify_installed,
+)
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net.gate import NetworkGate
 from astra_voice.net.http import HttpClient, NetworkError
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
-from astra_voice.security.verify import Verifier, sha256_file
+from astra_voice.security.verify import Verifier
 from astra_voice.ui import notify
-from astra_voice.ui.formatting import SpeedTracker, format_eta, format_size, format_speed
+from astra_voice.ui.formatting import (
+    SpeedTracker,
+    clean_display_name,
+    format_eta,
+    format_size,
+    format_space,
+    format_speed,
+)
 from astra_voice.worker.audio import AudioDevice, AudioError, list_devices
 
 log = logging.getLogger(__name__)
@@ -53,6 +77,27 @@ _ENGINE_FAILED_MESSAGE = "Не удалось запустить распозн�
 _REVOKED_MESSAGE = (
     "Издатель больше не рекомендует эту версию модели. "
     "Не устанавливайте её — скачайте свежую версию."
+)
+_CURRENT_FAILED_MESSAGE = (
+    "Модель установлена. Сделать её рабочей не удалось — попробуйте переустановить."
+)
+_SAFE_MODEL_MESSAGES = frozenset(
+    {
+        _BROKEN_MESSAGE,
+        _SELFCHECK_MESSAGE,
+        _ENGINE_FAILED_MESSAGE,
+        _REVOKED_MESSAGE,
+        _CURRENT_FAILED_MESSAGE,
+        "Не удалось установить модель. Попробуйте ещё раз.",
+        "Модель нужно переустановить.",
+        "В папке есть лишние файлы. Оставьте только файлы выбранной модели.",
+        "Файлы в папке не подходят для выбранной модели.",
+        "В папке не хватает файлов модели. Получите их заново.",
+        "Файлы модели повреждены: контрольная сумма не совпала. Получите их заново.",
+        "Не удалось проверить правила администратора: работа без сети",
+        "Задано администратором: работа без сети",
+        "Включена работа без сети",
+    }
 )
 # После таймаута поток и задание должны оставаться живы до выхода run().
 _finishing_model_threads: set[tuple[QThread, _ModelJob | _RecheckJob | None]] = set()
@@ -90,6 +135,10 @@ class ModelPort(Protocol):
     def allowed(self) -> tuple[bool, str]: ...
 
     def disk_ok(self, size_bytes: int) -> bool: ...
+
+    def disk_missing_bytes(self, size_bytes: int) -> int: ...
+
+    def free_bytes(self) -> int: ...
 
     def ram_ok(self, min_ram_mb: int) -> bool: ...
 
@@ -222,29 +271,7 @@ class ModelService:
     def verify_files(self, entry: Any) -> tuple[bool, str]:
         """Сверяет установленный набор; ошибки чтения не становятся вердиктом."""
         directory = self._store._installed(entry.id, entry.revision)
-        names = {file.path for file in entry.files}
-        for child in directory.iterdir():
-            if child.is_symlink() or not child.is_file() or child.name not in names:
-                return False, "В папке есть лишние файлы. Оставьте только файлы выбранной модели."
-        for file in entry.files:
-            source = directory / file.path
-            if (
-                not file.path
-                or file.path in {".", ".."}
-                or Path(file.path).name != file.path
-                or "\\" in file.path
-                or source.is_symlink()
-                or not source.resolve().is_relative_to(directory.resolve())
-            ):
-                return False, "Файлы в папке не подходят для выбранной модели."
-            if not source.is_file():
-                return False, "В папке не хватает файлов модели. Получите их заново."
-            actual = sha256_file(source, cancel=self._cancel.is_set)
-            if not hmac.compare_digest(actual, file.sha256) or source.stat().st_size != file.size:
-                return False, (
-                    "Файлы модели повреждены: контрольная сумма не совпала. Получите их заново."
-                )
-        return True, ""
+        return verify_installed(directory, entry, cancel=self._cancel.is_set)
 
     def smoke(self, entry: Any) -> tuple[bool, str]:
         result = make_smoke_check(cancel=self._cancel.is_set, require_verdict=True)(
@@ -293,6 +320,16 @@ class ModelService:
             directory = directory.parent
         return max(0, (size_bytes * 6 + 4) // 5 - shutil.disk_usage(directory).free)
 
+    def free_bytes(self) -> int:
+        """Прочитать свободное место, не создавая каталог моделей."""
+        directory = self._store.root
+        while not directory.exists():
+            parent = directory.parent
+            if parent == directory:
+                raise FileNotFoundError("Хранилище моделей недоступно")
+            directory = parent
+        return shutil.disk_usage(directory).free
+
     def ram_ok(self, min_ram_mb: int) -> bool:
         return self._store.ram_ok(min_ram_mb)
 
@@ -313,7 +350,7 @@ class ModelService:
 class _ModelJob(QObject):
     """Одна попытка установки. С GUI общается только сигналами и Event отмены."""
 
-    progressed = pyqtSignal(float, float, float)
+    progressed = pyqtSignal(float)
     staged = pyqtSignal(str)
     finished = pyqtSignal(str, str)
 
@@ -334,11 +371,7 @@ class _ModelJob(QObject):
 
     def _progress(self, value: Progress) -> None:
         fraction = value.bytes_done / value.bytes_total if value.bytes_total > 0 else 0.0
-        self.progressed.emit(
-            max(0.0, min(1.0, fraction)),
-            value.speed_bps,
-            value.eta_s if value.eta_s is not None else -1.0,
-        )
+        self.progressed.emit(max(0.0, min(1.0, fraction)))
 
     def _check_cancel(self) -> None:
         if self._cancel.is_set():
@@ -356,7 +389,7 @@ class _ModelJob(QObject):
             self.staged.emit("downloading")
             self._model.download(self._entry, progress=self._progress, cancel=self._cancel)
             self._check_cancel()
-            self.progressed.emit(1.0, 0.0, -1.0)
+            self.progressed.emit(1.0)
         self.staged.emit("verifying")
         self._check_cancel()
         # Installer объединяет проверку файлов, перенос и пробное распознавание
@@ -450,6 +483,7 @@ class ModelDownloads(QObject):
     downloadStateChanged = pyqtSignal()
     downloadProgressChanged = pyqtSignal()
     downloadTitleChanged = pyqtSignal()
+    downloadDetailChanged = pyqtSignal()
     modelReadyChanged = pyqtSignal()
     modelStateChanged = pyqtSignal()
     modelNameChanged = pyqtSignal()
@@ -467,11 +501,13 @@ class ModelDownloads(QObject):
         self,
         model: ModelPort | None,
         *,
+        store: ModelStore | None = None,
         clock: Callable[[], float] = time.monotonic,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._model = model
+        self._store = store
         self._entry = model.recommended() if model is not None else None
         self._entries = model.entries() if model is not None else ()
         self._selected: set[str] = set()
@@ -491,6 +527,8 @@ class ModelDownloads(QObject):
         self._download_state = "idle"
         self._download_progress = 0.0
         self._download_title = ""
+        self._download_detail = ""
+        self._no_space_size_bytes = 0
         self._clock = clock
         self._tracker = SpeedTracker()
         self._last_estimate_at = float("-inf")
@@ -509,7 +547,30 @@ class ModelDownloads(QObject):
         self._recheck_started = False
         self._recheck_card: tuple[str | None, str | None, float | None] = (None, None, None)
         self._recheck_model_state = ("", "")
+        self._update_depth = 0
+        self._pending_notifications: dict[str, tuple[object, ...]] = {}
         self._initial_model_state()
+
+    @contextmanager
+    def _update(self) -> Iterator[None]:
+        """Публикует переход целиком: прямой обработчик Qt может вызвать любой слот."""
+        self._update_depth += 1
+        try:
+            yield
+        finally:
+            self._update_depth -= 1
+            if not self._update_depth:
+                pending, self._pending_notifications = self._pending_notifications, {}
+                # После первого emit нельзя менять поля завершённого перехода:
+                # обработчик уже мог запустить или отменить следующую работу.
+                for name, args in pending.items():
+                    getattr(self, name).emit(*args)
+
+    def _notify(self, name: str, *args: object) -> None:
+        if self._update_depth:
+            self._pending_notifications[name] = args
+        else:
+            getattr(self, name).emit(*args)
 
     @property
     def modelReady(self) -> bool:  # noqa: N802
@@ -517,7 +578,24 @@ class ModelDownloads(QObject):
 
     def active_entry(self) -> Any | None:
         if self._model is None:
-            return None
+            if self._store is None:
+                return None
+            try:
+                current_record = self._store.current()
+                if current_record is not None:
+                    return current_record
+                records = self._store.records()
+            except (OSError, StoreError):
+                log.warning("Не удалось прочитать установленные модели")
+                return None
+            return next(
+                (
+                    record
+                    for record in records
+                    if record.state == "ok" and not record.recheck and record.metadata_ok
+                ),
+                records[0] if records else None,
+            )
         current = self._model.current_ids()
         for entry in self._entries:
             if (entry.id, entry.revision) == current:
@@ -532,8 +610,10 @@ class ModelDownloads(QObject):
 
     def active_state(self) -> str:
         entry = self.active_entry()
-        if entry is None or self._model is None:
+        if entry is None:
             return "none"
+        if self._model is None:
+            return "catalog-unavailable"
         state = self._card_states.get(entry.id, "")
         if state in {"downloading", "verifying", "failed", "no-space"}:
             return state
@@ -543,12 +623,58 @@ class ModelDownloads(QObject):
     def status_text(self) -> str:
         if self.downloadState in {"idle", "done"}:
             return ""
+        if self._rechecking:
+            return "Проверяю модель…"
         return f"{self.downloadTitle} — {self.downloadProgress:.0%}"
 
+    def can_reinstall(self) -> bool:
+        if (
+            self._model is None
+            or self._queue_running
+            or self._rechecking
+            or self._model_thread is not None
+            or self._shutting_down
+        ):
+            return False
+        entry = self.active_entry()
+        return entry is not None and bool(self._model.record_state(entry.id, entry.revision))
+
     def reinstall_active(self) -> None:
+        if not self.can_reinstall():
+            return
         entry = self.active_entry()
         if entry is not None:
             self._begin_queue((entry,))
+
+    def can_install(self) -> bool:
+        """Разрешить первую установку только при доступной рекомендации и очереди."""
+        return (
+            self._model is not None
+            and self._entry is not None
+            and self._entry in self._entries
+            and not self._queue_running
+            and not self._rechecking
+            and self._model_thread is None
+            and not self._shutting_down
+            and self.active_entry() is None
+        )
+
+    def install_recommended(self) -> None:
+        if self.can_install():
+            self._begin_queue((self._entry,))
+
+    def open_models_folder(self, opener: Callable[[QUrl], bool]) -> None:
+        """Открыть корень хранилища без создания каталогов и публикации пути в QML."""
+        try:
+            store = self._store
+            if store is None:
+                store = getattr(self._model, "_store", None)
+            if store is None or not store.root.is_dir():
+                log.debug("Каталог моделей недоступен для открытия")
+                return
+            opener(QUrl.fromLocalFile(str(store.root)))
+        except (OSError, StoreError):
+            log.debug("Не удалось открыть каталог моделей")
 
     def _badge(self, entry: Any) -> str:
         if self._model is None:
@@ -565,7 +691,7 @@ class ModelDownloads(QObject):
         return [
             {
                 "id": entry.id,
-                "name": entry.name,
+                "name": clean_display_name(entry.name),
                 "description": entry.description,
                 "host": entry.host,
                 "recommended": entry.recommended,
@@ -623,26 +749,49 @@ class ModelDownloads(QObject):
     def downloadTitle(self) -> str:  # noqa: N802
         return self._download_title
 
+    @property
+    def downloadDetail(self) -> str:  # noqa: N802
+        return self._download_detail
+
+    def _space_detail(self) -> str:
+        missing = getattr(self._model, "disk_missing_bytes", None)
+        if callable(missing):
+            try:
+                size = format_size(missing(self._no_space_size_bytes), round_up=True)
+                if size:
+                    return f"нужно ещё {size}"
+            except (OSError, StoreError):
+                log.debug("Не удалось определить дефицит места на диске")
+        return ""
+
     def _set_download_state(self, state: str) -> None:
-        title = {
-            "idle": "",
-            "verifying": "Проверяю модель…",
-            "done": "Модель готова",
-            "failed": "Не получилось загрузить модель",
-            "no-space": "Не хватает места на диске",
-        }.get(state, "")
-        if state == "downloading" and self._active_entry is not None:
-            title = f"Загружается {self._active_entry.name}"
-            if len(self._queue_entries) > 1:
-                number = len(self._queue_entries) - len(self._queue)
-                title += f" · {number} из {len(self._queue_entries)}"
-        state_changed = state != self._download_state
-        title_changed = title != self._download_title
-        self._download_state, self._download_title = state, title
-        if state_changed:
-            self.downloadStateChanged.emit()
-        if title_changed:
-            self.downloadTitleChanged.emit()
+        with self._update():
+            detail = self._space_detail() if state == "no-space" else ""
+            if detail != self._download_detail:
+                self._download_detail = detail
+                self._notify("downloadDetailChanged")
+            title = {
+                "idle": "",
+                "verifying": "Проверяю модель…",
+                "done": "Модель готова",
+                "failed": "Не получилось загрузить модель",
+                "no-space": "Не хватает места на диске",
+            }.get(state, "")
+            if state == "downloading" and self._active_entry is not None:
+                title = f"Загружается {self._active_entry.name}"
+                if len(self._queue_entries) > 1:
+                    number = len(self._queue_entries) - len(self._queue)
+                    title += f" · {number} из {len(self._queue_entries)}"
+            title = clean_display_name(title)
+            state_changed = state != self._download_state
+            title_changed = title != self._download_title
+            self._download_state, self._download_title = state, title
+            if state == "downloading" and not self._eta:
+                self._set_estimates("", format_eta(float("inf"), 0.0, False))
+            if state_changed:
+                self._notify("downloadStateChanged")
+            if title_changed:
+                self._notify("downloadTitleChanged")
 
     def _set_download_progress(self, bytes_done: float) -> None:
         value = (
@@ -652,31 +801,38 @@ class ModelDownloads(QObject):
         )
         if value != self._download_progress:
             self._download_progress = value
-            self.downloadProgressChanged.emit()
+            self._notify("downloadProgressChanged")
 
     def _set_estimates(self, speed: str, eta: str) -> None:
-        if speed != self._speed:
-            self._speed = speed
-            self.speedChanged.emit()
-        if eta != self._eta:
-            self._eta = eta
-            self.etaChanged.emit()
+        if self._download_state == "downloading" and not eta:
+            eta = format_eta(float("inf"), 0.0, False)
+        speed_changed, eta_changed = speed != self._speed, eta != self._eta
+        self._speed, self._eta = speed, eta
+        if speed_changed:
+            self._notify("speedChanged")
+        if eta_changed:
+            self._notify("etaChanged")
 
     def _set_card(self, entry: Any, state: str, message: str = "", progress: float = 0.0) -> None:
         self._card_states[entry.id] = state
         self._card_messages[entry.id] = message
         self._card_progress[entry.id] = progress if state == "downloading" else 0.0
-        self.modelsChanged.emit()
+        self._notify("modelsChanged")
 
     def toggleModel(self, model_id: str) -> None:  # noqa: N802
-        if self._queue_running or self._model_thread is not None or self._shutting_down:
+        if (
+            self._queue_running
+            or self._rechecking
+            or self._model_thread is not None
+            or self._shutting_down
+        ):
             return
         entry = next((entry for entry in self._entries if entry.id == model_id), None)
         if entry is None or self._badge(entry):
             return
         self._selected.symmetric_difference_update({model_id})
-        self.modelsChanged.emit()
-        self.selectionChanged.emit()
+        self._notify("modelsChanged")
+        self._notify("selectionChanged")
 
     def startSelectedDownloads(self) -> None:  # noqa: N802
         self._begin_queue(self._selected_downloads())
@@ -687,50 +843,53 @@ class ModelDownloads(QObject):
             self._begin_queue((entry,))
 
     def cancelDownloads(self) -> None:  # noqa: N802
-        if self._rechecking:
+        with self._update():
+            if self._rechecking:
+                self._model_cancel.set()
+                self._recheck_queue.clear()
+                return
+            if not self._queue_running or self._queue_cancelled:
+                return
+            self._queue_cancelled = True
             self._model_cancel.set()
-            self._recheck_queue.clear()
-            return
-        if not self._queue_running:
-            return
-        self._queue_cancelled = True
-        self._model_cancel.set()
-        for entry in (self._active_entry, *self._queue):
-            if entry is not None:
-                self._set_card(entry, "available")
-        self._queue.clear()
-        self._set_download_state("idle")
-        self._set_download_progress(0)
-        self._set_estimates("", "")
-        self.selectionChanged.emit()
+            for entry in (self._active_entry, *self._queue):
+                if entry is not None:
+                    self._set_card(entry, "available")
+            self._queue.clear()
+            self._set_download_state("idle")
+            self._set_download_progress(0)
+            self._set_estimates("", "")
+            self._notify("selectionChanged")
 
     def _begin_queue(self, entries: tuple[Any, ...], source: Path | None = None) -> None:
-        if (
-            not entries
-            or self._model is None
-            or self._shutting_down
-            or self._queue_running
-            or self._model_thread is not None
-        ):
-            return
-        self._queue_running = True
-        self._queue_cancelled = False
-        self._queue_entries = entries
-        self._queue = list(entries)
-        self._queue_successes = 0
-        self._queue_completed_bytes = 0
-        self._queue_total_bytes = sum(entry.size_bytes for entry in entries)
-        self._queue_current = self._model.current_ids()
-        self._last_failure = "failed"
-        now = self._clock()
-        self._tracker.reset(now)
-        self._tracker.update(0, now)
-        self._last_estimate_at = float("-inf")
-        self._set_download_progress(0)
-        self._set_estimates("", "")
-        for entry in entries:
-            self._set_card(entry, "queued")
-        self._start_model_job(source)
+        with self._update():
+            if (
+                not entries
+                or self._model is None
+                or self._shutting_down
+                or self._queue_running
+                or self._rechecking
+                or self._model_thread is not None
+            ):
+                return
+            self._queue_running = True
+            self._queue_cancelled = False
+            self._queue_entries = entries
+            self._queue = list(entries)
+            self._queue_successes = 0
+            self._queue_completed_bytes = 0
+            self._queue_total_bytes = sum(entry.size_bytes for entry in entries)
+            self._queue_current = self._model.current_ids()
+            self._last_failure = "failed"
+            now = self._clock()
+            self._tracker.reset(now)
+            self._tracker.update(0, now)
+            self._last_estimate_at = now
+            self._set_download_progress(0)
+            self._set_estimates("", "")
+            for entry in entries:
+                self._set_card(entry, "queued")
+            self._start_model_job(source)
 
     def _initial_model_state(self) -> None:
         model, entry = self._model, self._entry
@@ -757,7 +916,7 @@ class ModelDownloads(QObject):
 
     @property
     def modelName(self) -> str:  # noqa: N802
-        return str(self._entry.name) if self._entry is not None else ""
+        return clean_display_name(str(self._entry.name)) if self._entry is not None else ""
 
     @property
     def modelHost(self) -> str:  # noqa: N802
@@ -809,8 +968,8 @@ class ModelDownloads(QObject):
             f"Недостаточно места на диске для модели {format_size(size_bytes)}. Освободите место."
         )
 
-    def _set_model_state(self, state: str, reason: str = "") -> None:
-        messages = {
+    def _model_messages(self) -> dict[str, str]:
+        return {
             "absent": "Каталог моделей недоступен. Попробуйте открыть приложение ещё раз.",
             "downloadable": f"Модель будет скачана с {self.modelHost}, объём — {self.modelSize}.",
             "downloading": f"Скачиваю модель с {self.modelHost}…",
@@ -822,55 +981,73 @@ class ModelDownloads(QObject):
             "no-ram": "Может не хватить оперативной памяти. Можно скачать и проверить модель.",
             "cancelled": "Загрузка отменена. Можно продолжить скачивание.",
         }
-        message = reason or (
-            self._space_message() if state == "no-space" else messages.get(state, _BROKEN_MESSAGE)
+
+    def _safe_model_message(self, reason: str) -> str:
+        if reason in _SAFE_MODEL_MESSAGES or reason in self._model_messages().values():
+            return reason
+        if reason == self._space_message():
+            return reason
+        return _BROKEN_MESSAGE
+
+    def _set_model_state(self, state: str, reason: str = "") -> None:
+        message = (
+            self._safe_model_message(reason)
+            if reason
+            else (
+                self._space_message()
+                if state == "no-space"
+                else self._model_messages().get(state, _BROKEN_MESSAGE)
+            )
         )
         changed = state != self._model_state
         message_changed = message != self._model_message
         self._model_state, self._model_message = state, message
         if changed:
-            self.modelStateChanged.emit()
+            self._notify("modelStateChanged")
         if message_changed:
-            self.modelMessageChanged.emit()
+            self._notify("modelMessageChanged")
 
+    @pyqtSlot(float)
     @pyqtSlot(float, float, float)
-    def _model_progressed(self, fraction: float, speed: float, eta: float) -> None:
-        if self._queue_cancelled:
-            return
-        fraction = max(0.0, min(1.0, fraction)) if math.isfinite(fraction) else 0.0
-        entry = self._active_entry
-        if entry is None or entry == self._entry:
-            if fraction != self._progress_value:
-                self._progress_value = fraction
-                self.progressChanged.emit()
-        # Слот старого интерфейса тоже безопасен вне запущенной очереди.
-        if entry is None or self._queue_cancelled:
-            return
-        self._set_card(entry, self._card_states.get(entry.id, "downloading"), progress=fraction)
-        bytes_done = self._queue_completed_bytes + fraction * entry.size_bytes
-        self._set_download_progress(bytes_done)
-        now = self._clock()
-        self._tracker.update(int(bytes_done), now)
-        if now - self._last_estimate_at >= 1.0:
-            self._last_estimate_at = now
-            self._set_estimates(
-                format_speed(self._tracker.speed_bps),
-                format_eta(
-                    self._tracker.eta_s(self._queue_total_bytes),
-                    self._tracker.elapsed_s,
-                    self._tracker.stable,
-                ),
-            )
+    def _model_progressed(self, fraction: float, speed: float = 0.0, eta: float = -1.0) -> None:
+        with self._update():
+            if self._queue_cancelled:
+                return
+            fraction = max(0.0, min(1.0, fraction)) if math.isfinite(fraction) else 0.0
+            entry = self._active_entry
+            if entry is None or entry == self._entry:
+                if fraction != self._progress_value:
+                    self._progress_value = fraction
+                    self._notify("progressChanged")
+            # Слот старого интерфейса тоже безопасен вне запущенной очереди.
+            if entry is None or self._queue_cancelled:
+                return
+            self._set_card(entry, self._card_states.get(entry.id, "downloading"), progress=fraction)
+            bytes_done = self._queue_completed_bytes + fraction * entry.size_bytes
+            self._set_download_progress(bytes_done)
+            now = self._clock()
+            self._tracker.update(int(bytes_done), now)
+            if now - self._last_estimate_at >= 1.0:
+                self._last_estimate_at = now
+                self._set_estimates(
+                    format_speed(self._tracker.speed_bps),
+                    format_eta(
+                        self._tracker.eta_s(self._queue_total_bytes),
+                        self._tracker.elapsed_s,
+                        self._tracker.stable,
+                    ),
+                )
 
     @pyqtSlot(str)
     def _model_staged(self, stage: str) -> None:
-        if self._queue_cancelled or self._active_entry is None:
-            return
-        if self._active_entry == self._entry:
-            self._set_model_state(stage)
-        state = "verifying" if stage == "installing" else stage
-        self._set_card(self._active_entry, state)
-        self._set_download_state(state)
+        with self._update():
+            if self._queue_cancelled or self._active_entry is None:
+                return
+            if self._active_entry == self._entry:
+                self._set_model_state(stage)
+            state = "verifying" if stage == "installing" else stage
+            self._set_card(self._active_entry, state)
+            self._set_download_state(state)
 
     @pyqtSlot(str, str)
     def _model_finished(self, state: str, reason: str) -> None:
@@ -897,67 +1074,123 @@ class ModelDownloads(QObject):
             return (
                 "Нет доступа к источнику модели. Проверьте подключение или установите её из папки."
             )
-        if reason in {_SELFCHECK_MESSAGE, _ENGINE_FAILED_MESSAGE, _REVOKED_MESSAGE}:
-            return reason
-        return _BROKEN_MESSAGE
+        return self._safe_model_message(reason)
 
     @pyqtSlot()
     def _model_thread_finished(self) -> None:
         # finished приходит до удаления отложенных QObject в рабочем потоке.
         # Держим Python-обёртки до конца этой очистки, прежде чем запускать
         # следующую работу: иначе их деструкторы могут пересечься между потоками.
-        if self._model_thread is not None:
-            self._model_thread.wait()
+        thread = self._model_thread
+        if thread is not None:
+            if not thread.wait(5000):
+                log.warning("Поток установки модели не завершился за 5 секунд; ожидаем очистку")
+                # Не удаляем обёртки и не запускаем следующую работу до выхода
+                # run()/очистки TLS. GUI между ограниченными ожиданиями свободен.
+                QTimer.singleShot(
+                    100,
+                    lambda: self._model_thread_finished() if self._model_thread is thread else None,
+                )
+                return
+            thread.deleteLater()
         self._model_job = None
         self._model_thread = None
         entry = self._active_entry
+        if self._queue_running and (self._model_result is None or entry is None):
+            self._reset_broken_queue()
+            self._start_next_recheck()
+            return
         if self._rechecking:
             self._finish_recheck()
             return
         if self._model_result is None or entry is None:
             return
-        state, reason = self._model_result
-        self._model_result = None
-        if state == "installed":
-            try:
-                self._keep_current(entry)
-            except (OSError, StoreError):
-                state, reason = "error", _BROKEN_MESSAGE
-            else:
+        with self._update():
+            state, reason = self._model_result
+            self._model_result = None
+            if state == "installed":
+                try:
+                    self._keep_current(entry)
+                except (OSError, StoreError):
+                    reason = _CURRENT_FAILED_MESSAGE
                 self._queue_successes += 1
                 self._queue_completed_bytes += entry.size_bytes
                 self._selected.add(entry.id)
                 if entry == self._entry and self._progress_value != 1.0:
                     self._progress_value = 1.0
-                    self.progressChanged.emit()
-        if entry == self._entry:
-            self._set_model_state("broken" if state == "error" else state, reason)
-        if state == "installed":
-            self._set_card(entry, "installed")
-        elif self._queue_cancelled or state == "cancelled":
-            self._set_card(entry, "available")
-        else:
-            self._last_failure = "no-space" if state == "no-space" else "failed"
-            self._set_card(entry, self._last_failure, self._failure_message(entry, state, reason))
-        self._active_entry = None
-        if not self._queue_cancelled:
-            self._set_download_progress(self._queue_completed_bytes)
-        if self._queue and not self._queue_cancelled and not self._shutting_down:
-            self._start_model_job()
-        else:
+                    self._notify("progressChanged")
+            if entry == self._entry:
+                self._set_model_state("broken" if state == "error" else state, reason)
+            if state == "installed":
+                self._set_card(
+                    entry, "installed", self._safe_model_message(reason) if reason else ""
+                )
+            elif self._queue_cancelled or state == "cancelled":
+                self._set_card(entry, "available")
+            else:
+                self._last_failure = "no-space" if state == "no-space" else "failed"
+                if state == "no-space":
+                    self._no_space_size_bytes = entry.size_bytes
+                self._set_card(
+                    entry, self._last_failure, self._failure_message(entry, state, reason)
+                )
+            self._active_entry = None
+            if not self._queue_cancelled:
+                self._set_download_progress(self._queue_completed_bytes)
+            if self._queue and not self._queue_cancelled and not self._shutting_down:
+                self._start_model_job()
+            else:
+                self._queue.clear()
+                self._queue_running = False
+                terminal = "done" if self._queue_successes else self._last_failure
+                self._set_download_state(
+                    "idle" if self._queue_cancelled or state == "cancelled" else terminal
+                )
+                self._set_estimates("", "")
+            self._notify("modelsChanged")
+            self._notify("selectionChanged")
+            self._notify("modelReadyChanged")
+            if not self._queue_running:
+                self._notify("queueFinished", bool(self._queue_successes))
+        self._start_next_recheck()
+
+    def _reset_broken_queue(self) -> None:
+        """Освобождает очередь без результата/задания, чтобы слоты снова работали."""
+        with self._update():
+            entries = self._queue_entries
+            cancelled = self._queue_cancelled or self._shutting_down
+            self._model_cancel.set()
             self._queue.clear()
+            self._queue_entries = ()
             self._queue_running = False
-            terminal = "done" if self._queue_successes else self._last_failure
-            self._set_download_state(
-                "idle" if self._queue_cancelled or state == "cancelled" else terminal
-            )
+            self._active_entry = None
+            self._model_result = None
+            self._rechecking = False
+            self._recheck_card = (None, None, None)
+            self._recheck_model_state = ("", "")
+            self._queue_cancelled = False
+            self._queue_successes = 0
+            self._queue_completed_bytes = 0
+            self._queue_total_bytes = 0
+            self._queue_current = None
+            self._last_failure = "failed"
+            self._tracker.reset(self._clock())
+            self._last_estimate_at = float("-inf")
+            log.warning("Несогласованное состояние очереди моделей; очередь сброшена")
+            for entry in entries:
+                if self._card_states.get(entry.id) in {"queued", "downloading", "verifying"}:
+                    self._set_card(entry, "available" if cancelled else "failed")
+            if self._entry in entries:
+                self._set_model_state("cancelled" if cancelled else "broken")
+            if self._progress_value:
+                self._progress_value = 0.0
+                self._notify("progressChanged")
+            self._set_download_state("idle" if cancelled else "failed")
+            self._set_download_progress(0)
             self._set_estimates("", "")
-        self.modelsChanged.emit()
-        self.selectionChanged.emit()
-        self.modelReadyChanged.emit()
-        if not self._queue_running:
-            self.queueFinished.emit(bool(self._queue_successes))
-            self._start_next_recheck()
+            self._notify("selectionChanged")
+            self._notify("modelReadyChanged")
+            self._notify("queueFinished", False)
 
     def start_recheck(self) -> None:
         """Ставит мигрированные ревизии на фоновую проверку после загрузок."""
@@ -972,133 +1205,153 @@ class ModelDownloads(QObject):
         self._start_next_recheck()
 
     def _start_next_recheck(self) -> None:
-        if (
-            self._shutting_down
-            or self._queue_running
-            or self._model_thread is not None
-            or self._model is None
-            or not self._recheck_queue
-        ):
-            return
-        entry = self._recheck_queue.pop(0)
-        self._active_entry = entry
-        self._rechecking = True
-        self._recheck_card = (
-            self._card_states.get(entry.id),
-            self._card_messages.get(entry.id),
-            self._card_progress.get(entry.id),
-        )
-        self._recheck_model_state = (self._model_state, self._model_message)
-        self._model_cancel = threading.Event()
-        self._model_result = None
-        thread = QThread(self)
-        job = _RecheckJob(self._model, entry, self._model_cancel)
-        self._model_thread, self._model_job = thread, job
-        job.moveToThread(thread)
-        thread.started.connect(job.run)
-        job.finished.connect(self._model_finished)
-        job.finished.connect(job.deleteLater)
-        job.finished.connect(thread.quit, Qt.DirectConnection)
-        thread.finished.connect(self._model_thread_finished)
-        thread.finished.connect(thread.deleteLater)
-        self._set_card(entry, "verifying")
-        if entry == self._entry:
-            self._set_model_state("verifying")
-        self._set_download_progress(0)
-        self._set_estimates("", "")
-        self._set_download_state("verifying")
-        thread.start()
+        with self._update():
+            if (
+                self._shutting_down
+                or self._queue_running
+                or self._rechecking
+                or self._model_thread is not None
+                or self._model is None
+                or not self._recheck_queue
+            ):
+                return
+            entry = self._recheck_queue.pop(0)
+            self._active_entry = entry
+            self._rechecking = True
+            self._recheck_card = (
+                self._card_states.get(entry.id),
+                self._card_messages.get(entry.id),
+                self._card_progress.get(entry.id),
+            )
+            self._recheck_model_state = (self._model_state, self._model_message)
+            self._model_cancel = threading.Event()
+            self._model_result = None
+            thread = QThread(self)
+            job = _RecheckJob(self._model, entry, self._model_cancel)
+            self._model_thread, self._model_job = thread, job
+            job.moveToThread(thread)
+            thread.started.connect(job.run)
+            job.finished.connect(self._model_finished)
+            job.finished.connect(job.deleteLater)
+            job.finished.connect(thread.quit, Qt.DirectConnection)
+            thread.finished.connect(self._model_thread_finished)
+            self._set_card(entry, "verifying")
+            if entry == self._entry:
+                self._set_model_state("verifying")
+            self._set_download_progress(0)
+            self._set_estimates("", "")
+            self._set_download_state("verifying")
+            thread.start()
 
     def _finish_recheck(self) -> None:
-        entry, model = self._active_entry, self._model
-        state, reason = self._model_result or ("cancelled", "")
-        self._model_result = None
-        if self._model_cancel.is_set() or self._shutting_down:
-            state = "cancelled"
-        try:
-            if model is not None and entry is not None:
-                if state == "installed":
-                    model.mark_ok(entry.id, entry.revision)
-                    if model.current_ids() is None:
-                        model.set_current(entry.id, entry.revision)
-                elif state == "failed":
-                    reason = reason or _BROKEN_MESSAGE
-                    model.mark_broken(entry.id, entry.revision, reason)
-        except Exception:
-            log.warning("Не удалось сохранить результат перепроверки модели")
-            state = "cancelled"
-        if entry is not None:
-            if state == "cancelled":
-                old_state, old_message, old_progress = self._recheck_card
-                for mapping, value in (
-                    (self._card_states, old_state),
-                    (self._card_messages, old_message),
-                ):
-                    if value is None:
-                        mapping.pop(entry.id, None)
+        with self._update():
+            entry, model = self._active_entry, self._model
+            state, reason = self._model_result or ("cancelled", "")
+            old_card, old_model_state = self._recheck_card, self._recheck_model_state
+            self._rechecking = False
+            self._active_entry = None
+            self._model_result = None
+            self._recheck_card = (None, None, None)
+            self._recheck_model_state = ("", "")
+            if self._model_cancel.is_set() or self._shutting_down:
+                state = "cancelled"
+            try:
+                if model is not None and entry is not None:
+                    if state == "installed":
+                        try:
+                            model.mark_ok(entry.id, entry.revision)
+                        except StoreError:
+                            log.warning(
+                                "Хранилище отклонило успешный результат перепроверки модели"
+                            )
+                            state, reason = "failed", "Модель нужно переустановить."
+                        else:
+                            if model.current_ids() is None:
+                                model.set_current(entry.id, entry.revision)
+                    elif state == "failed":
+                        reason = reason or _BROKEN_MESSAGE
+                        model.mark_broken(entry.id, entry.revision, reason)
+            except Exception:
+                log.warning("Не удалось сохранить результат перепроверки модели")
+                state = "cancelled"
+            if entry is not None:
+                if state == "cancelled":
+                    old_state, old_message, old_progress = old_card
+                    for mapping, value in (
+                        (self._card_states, old_state),
+                        (self._card_messages, old_message),
+                    ):
+                        if value is None:
+                            mapping.pop(entry.id, None)
+                        else:
+                            mapping[entry.id] = value
+                    if old_progress is None:
+                        self._card_progress.pop(entry.id, None)
                     else:
-                        mapping[entry.id] = value
-                if old_progress is None:
-                    self._card_progress.pop(entry.id, None)
+                        self._card_progress[entry.id] = old_progress
+                    if entry == self._entry:
+                        self._set_model_state(*old_model_state)
+                    self._notify("modelsChanged")
                 else:
-                    self._card_progress[entry.id] = old_progress
-                if entry == self._entry:
-                    self._set_model_state(*self._recheck_model_state)
-                self.modelsChanged.emit()
-            else:
-                self._set_card(entry, state, reason)
-                if entry == self._entry:
-                    self._set_model_state("broken" if state == "failed" else state, reason)
-                self.modelReadyChanged.emit()
-                self.selectionChanged.emit()
-        self._rechecking = False
-        self._active_entry = None
-        self._set_download_state(
-            "idle" if state == "cancelled" else "done" if state == "installed" else "failed"
-        )
+                    self._set_card(entry, state, reason)
+                    if entry == self._entry:
+                        self._set_model_state("broken" if state == "failed" else state, reason)
+                    self._notify("modelReadyChanged")
+                    self._notify("selectionChanged")
+            self._set_download_state(
+                "idle" if state == "cancelled" else "done" if state == "installed" else "failed"
+            )
         self._start_next_recheck()
 
     def _start_model_job(self, source: Path | None = None) -> None:
-        if (
-            self._shutting_down
-            or self._model_thread is not None
-            or self._model is None
-            or not self._queue
-        ):
-            return
-        self._active_entry = self._queue.pop(0)
-        self._model_cancel = threading.Event()
-        self._model_result = None
-        thread = QThread(self)
-        job = _ModelJob(self._model, self._active_entry, self._model_cancel, source)
-        self._model_thread, self._model_job = thread, job
-        job.moveToThread(thread)
-        thread.started.connect(job.run)
-        job.progressed.connect(self._model_progressed)
-        job.staged.connect(self._model_staged)
-        job.finished.connect(self._model_finished)
-        job.finished.connect(job.deleteLater)
-        # quit() потокобезопасен. Прямой вызов нужен и при shutdown(), когда GUI
-        # ждёт wait() и уже не обрабатывает очередь сигналов.
-        job.finished.connect(thread.quit, Qt.DirectConnection)
-        thread.finished.connect(self._model_thread_finished)
-        thread.finished.connect(thread.deleteLater)
-        self._model_staged("downloading" if source is None else "verifying")
-        self._model_progressed(0.0, 0.0, -1.0)
-        thread.start()
+        with self._update():
+            if (
+                self._shutting_down
+                or self._rechecking
+                or self._queue_cancelled
+                or self._model_thread is not None
+                or self._model is None
+                or not self._queue
+            ):
+                return
+            self._active_entry = self._queue.pop(0)
+            self._model_cancel = threading.Event()
+            self._model_result = None
+            thread = QThread(self)
+            job = _ModelJob(self._model, self._active_entry, self._model_cancel, source)
+            self._model_thread, self._model_job = thread, job
+            job.moveToThread(thread)
+            thread.started.connect(job.run)
+            job.progressed.connect(self._model_progressed)
+            job.staged.connect(self._model_staged)
+            job.finished.connect(self._model_finished)
+            job.finished.connect(job.deleteLater)
+            # quit() потокобезопасен. Прямой вызов нужен и при shutdown(), когда GUI
+            # ждёт wait() и уже не обрабатывает очередь сигналов.
+            job.finished.connect(thread.quit, Qt.DirectConnection)
+            thread.finished.connect(self._model_thread_finished)
+            self._model_staged("downloading" if source is None else "verifying")
+            self._model_progressed(0.0, 0.0, -1.0)
+            thread.start()
 
     def download(self) -> None:
-        if self._shutting_down or self._model_thread is not None or self._queue_running:
-            return
-        if self._model_state in {"no-network", "no-space", "no-ram"}:
-            self._initial_model_state()
-        if self._entry is not None and self._model_state in {
-            "downloadable",
-            "no-ram",
-            "cancelled",
-            "broken",
-        }:
-            self._begin_queue((self._entry,))
+        with self._update():
+            if (
+                self._shutting_down
+                or self._model_thread is not None
+                or self._queue_running
+                or self._rechecking
+            ):
+                return
+            if self._model_state in {"no-network", "no-space", "no-ram"}:
+                self._initial_model_state()
+            if self._entry is not None and self._model_state in {
+                "downloadable",
+                "no-ram",
+                "cancelled",
+                "broken",
+            }:
+                self._begin_queue((self._entry,))
 
     def cancelDownload(self) -> None:  # noqa: N802
         self.cancelDownloads()
@@ -1116,6 +1369,7 @@ class ModelDownloads(QObject):
             return
         self._shutting_down = True
         self._recheck_queue.clear()
+        self.cancelDownloads()
         self._model_cancel.set()
         if self._model_thread is not None:
             self._model_thread.quit()
@@ -1131,6 +1385,7 @@ class ModelDownloads(QObject):
                 # После отсоединения потока обработчик finished может не выполниться,
                 # если очередь GUI уже не крутится; тогда реестр держит пару до конца процесса.
                 thread.finished.connect(lambda: _finishing_model_threads.discard(pair))
+                thread.finished.connect(thread.deleteLater)
                 self._model_job = None
                 self._model_thread = None
 
@@ -1168,6 +1423,7 @@ class SettingsBridge(QObject):
     downloadStateChanged = pyqtSignal()
     downloadProgressChanged = pyqtSignal()
     downloadTitleChanged = pyqtSignal()
+    downloadDetailChanged = pyqtSignal()
     speedChanged = pyqtSignal()
     etaChanged = pyqtSignal()
 
@@ -1191,6 +1447,7 @@ class SettingsBridge(QObject):
         locked: Iterable[str] = (),
         apply: SettingsApply | None = None,
         save: Callable[[Settings], None] = settings_save,
+        open_url: Callable[[QUrl], bool] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1204,18 +1461,23 @@ class SettingsBridge(QObject):
         self._save_error = ""
         self._model_selfcheck = "idle"
         self._downloads = downloads
+        self._open_url = open_url if open_url is not None else QDesktopServices.openUrl
         if downloads is not None:
             for name in ("downloadState", "downloadProgress", "downloadTitle", "speed", "eta"):
                 getattr(downloads, name + "Changed").connect(getattr(self, name + "Changed"))
+            downloads.downloadDetailChanged.connect(self.downloadDetailChanged)
             downloads.modelsChanged.connect(self.activeModelChanged)
             downloads.modelsChanged.connect(self.activeModelStateChanged)
             downloads.modelReadyChanged.connect(self.activeModelChanged)
             downloads.modelReadyChanged.connect(self.activeModelStateChanged)
+            downloads.downloadStateChanged.connect(self.activeModelStateChanged)
 
     @pyqtProperty(str, notify=activeModelChanged)
     def activeModelName(self) -> str:  # noqa: N802
         entry = self._downloads.active_entry() if self._downloads is not None else None
-        return str(entry.name) if entry is not None else ""
+        return (
+            clean_display_name(str(getattr(entry, "name", entry.id))) if entry is not None else ""
+        )
 
     @pyqtProperty(str, notify=activeModelChanged)
     def activeModelSize(self) -> str:  # noqa: N802
@@ -1226,10 +1488,44 @@ class SettingsBridge(QObject):
     def activeModelState(self) -> str:  # noqa: N802
         return self._downloads.active_state() if self._downloads is not None else "none"
 
+    @pyqtProperty(str, notify=activeModelStateChanged)
+    def activeModelMessage(self) -> str:  # noqa: N802
+        return {
+            "broken": "Файлы модели повреждены. Переустановите модель",
+            "failed": "Не удалось загрузить модель",
+            "no-space": "Не хватает места на диске",
+            "catalog-unavailable": "Не удалось проверить список моделей",
+        }.get(self.activeModelState, "")
+
+    @pyqtProperty(bool, notify=activeModelStateChanged)
+    def canInstall(self) -> bool:  # noqa: N802
+        return self._downloads is not None and self._downloads.can_install()
+
+    @pyqtSlot()
+    def installRecommendedModel(self) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.install_recommended()
+
+    @pyqtSlot()
+    def openModelsFolder(self) -> None:  # noqa: N802
+        if self._downloads is None:
+            log.debug("Хранилище моделей недоступно для открытия")
+            return
+        self._downloads.open_models_folder(self._open_url)
+
+    @pyqtProperty(bool, notify=activeModelStateChanged)
+    def canReinstall(self) -> bool:  # noqa: N802
+        return self._downloads is not None and self._downloads.can_reinstall()
+
     @pyqtSlot()
     def reinstallActiveModel(self) -> None:  # noqa: N802
-        if self._downloads is not None:
+        if self._downloads is not None and self.canReinstall:
             self._downloads.reinstall_active()
+
+    @pyqtSlot()
+    def cancelDownloads(self) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.cancelDownloads()
 
     @pyqtProperty(str, notify=downloadStateChanged)
     def downloadState(self) -> str:  # noqa: N802
@@ -1242,6 +1538,10 @@ class SettingsBridge(QObject):
     @pyqtProperty(str, notify=downloadTitleChanged)
     def downloadTitle(self) -> str:  # noqa: N802
         return self._downloads.downloadTitle if self._downloads is not None else ""
+
+    @pyqtProperty(str, notify=downloadDetailChanged)
+    def downloadDetail(self) -> str:  # noqa: N802
+        return self._downloads.downloadDetail if self._downloads is not None else ""
 
     @pyqtProperty(str, notify=speedChanged)
     def speed(self) -> str:  # noqa: N802
@@ -1526,9 +1826,11 @@ class OnboardingController(QObject):
     pendingComboChanged = pyqtSignal()
     modelsChanged = pyqtSignal()
     selectionChanged = pyqtSignal()
+    freeSpaceTextChanged = pyqtSignal()
     downloadStateChanged = pyqtSignal()
     downloadProgressChanged = pyqtSignal()
     downloadTitleChanged = pyqtSignal()
+    downloadDetailChanged = pyqtSignal()
     modelReadyChanged = pyqtSignal()
     modelStateChanged = pyqtSignal()
     modelNameChanged = pyqtSignal()
@@ -1569,6 +1871,7 @@ class OnboardingController(QObject):
         downloads: ModelDownloads | None = None,
         status_sink: Callable[[str], None] | None = None,
         dialog_factory: Callable[[], str] = QFileDialog.getExistingDirectory,
+        open_url: Callable[[QUrl], bool] | None = None,
         device_provider: Callable[[], list[AudioDevice]] = list_devices,
         clock: Callable[[], float] = time.monotonic,
         parent: QObject | None = None,
@@ -1579,6 +1882,7 @@ class OnboardingController(QObject):
         self._host = host
         self._resolved_device = ""
         self._dialog_factory = dialog_factory
+        self._open_url = open_url if open_url is not None else QDesktopServices.openUrl
         self._devices = [{"id": "", "name": "Системный по умолчанию"}]
         try:
             self._devices.extend(
@@ -1588,7 +1892,12 @@ class OnboardingController(QObject):
             log.warning("Не удалось получить список микрофонов. Доступен системный по умолчанию.")
         self._owns_downloads = downloads is None
         self._downloads = downloads if downloads is not None else ModelDownloads(model, clock=clock)
+        self._free_space_text = ""
+        self._refresh_free_space_text()
+        # selectionChanged публикуется также после завершения каждой модели в очереди.
+        self._downloads.selectionChanged.connect(self._refresh_free_space_text)
         self._shutting_down = False
+        self._window: QObject | None = None
         self._window_visible: bool | None = None
         self._status_sink = status_sink
         for name in (
@@ -1597,6 +1906,7 @@ class OnboardingController(QObject):
             "downloadStateChanged",
             "downloadProgressChanged",
             "downloadTitleChanged",
+            "downloadDetailChanged",
             "modelReadyChanged",
             "modelStateChanged",
             "modelNameChanged",
@@ -1679,10 +1989,36 @@ class OnboardingController(QObject):
         except Exception:
             log.warning("Не удалось обновить состояние загрузки в трее")
 
+    def attach_window(self, window: QObject) -> None:
+        """Подключает корневое окно и читает видимость до первого события Show."""
+        if self._window is not None:
+            self._window.removeEventFilter(self)
+        self._window = window
+        window.installEventFilter(self)
+        visible = getattr(window, "isVisible", None)
+        self._window_visible = bool(visible()) if callable(visible) else None
+
+    @staticmethod
+    def _window_minimized(window: QObject) -> bool:
+        state = getattr(window, "windowState", None)
+        return callable(state) and bool(state() & Qt.WindowMinimized)
+
+    def _window_allows_level(self) -> bool:
+        if self._window is None:
+            return self._window_visible is not False
+        visible = getattr(self._window, "isVisible", None)
+        shown = bool(visible()) if callable(visible) else self._window_visible is not False
+        return shown and not self._window_minimized(self._window)
+
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
         if event.type() == QEvent.Show:
             self._window_visible = True
-        if event.type() in (QEvent.Hide, QEvent.Close):
+        minimized = event.type() == QEvent.WindowStateChange and self._window_minimized(obj)
+        if event.type() == QEvent.WindowStateChange and not minimized:
+            visible = getattr(obj, "isVisible", None)
+            if callable(visible):
+                self._window_visible = bool(visible())
+        if event.type() in (QEvent.Hide, QEvent.Close) or minimized:
             self._window_visible = False
             if self._capture_state == "capturing":
                 self.cancelCapture()
@@ -1734,6 +2070,27 @@ class OnboardingController(QObject):
     def models(self) -> list[dict[str, Any]]:
         return self._downloads.models
 
+    def _refresh_free_space_text(self) -> None:
+        size = ""
+        free_bytes = getattr(self._model, "free_bytes", None)
+        if callable(free_bytes):
+            try:
+                size = format_space(free_bytes())
+            except (OSError, StoreError):
+                log.debug("Не удалось определить свободное место на диске")
+        text = f"свободно на диске {size}" if size else ""
+        if text != self._free_space_text:
+            self._free_space_text = text
+            self.freeSpaceTextChanged.emit()
+
+    @pyqtProperty(str, notify=freeSpaceTextChanged)
+    def freeSpaceText(self) -> str:  # noqa: N802
+        return self._free_space_text
+
+    @pyqtSlot()
+    def openModelsFolder(self) -> None:  # noqa: N802
+        self._downloads.open_models_folder(self._open_url)
+
     @pyqtProperty(str, notify=selectionChanged)
     def selectionSummary(self) -> str:  # noqa: N802
         return self._downloads.selectionSummary
@@ -1763,6 +2120,10 @@ class OnboardingController(QObject):
     @pyqtProperty(str, notify=downloadTitleChanged)
     def downloadTitle(self) -> str:  # noqa: N802
         return self._downloads.downloadTitle
+
+    @pyqtProperty(str, notify=downloadDetailChanged)
+    def downloadDetail(self) -> str:  # noqa: N802
+        return self._downloads.downloadDetail
 
     @pyqtSlot(str)
     def toggleModel(self, model_id: str) -> None:  # noqa: N802
@@ -1975,6 +2336,7 @@ class OnboardingController(QObject):
             self._host is None
             or self._step != 4
             or self._shutting_down
+            or not self._window_allows_level()
             or self.done
             or self._level_running
             or self._test_state in ("preparing", "recording", "processing")
@@ -1986,7 +2348,7 @@ class OnboardingController(QObject):
         self._level_stopping = False
 
         def receive(update: MicrophoneLevelUpdate) -> None:
-            if epoch != self._level_epoch:
+            if epoch != self._level_epoch or self._shutting_down or self._step != 4:
                 return
             if self._level_stopping and update.state == "listening":
                 return
@@ -2093,6 +2455,12 @@ class OnboardingController(QObject):
 
     def _clear_test(self) -> None:
         self.stopLevelMonitor()
+        # Уход со шага/закрытие запрещает receive, в том числе поздний idle.
+        # Сбрасываем экран здесь и отсекаем уведомления предыдущего измерения.
+        self._level_epoch += 1
+        self._level_running = False
+        self._level_stopping = False
+        self._level_updated(MicrophoneLevelUpdate("idle"))
         self._test_epoch += 1
         self._test_updated(MicrophoneTestUpdate("idle"))
         if self._peak:

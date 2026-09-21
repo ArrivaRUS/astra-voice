@@ -199,6 +199,39 @@ def test_current_roundtrip_and_permissions(store: ModelStore) -> None:
     assert stat.S_IMODE(pointer.stat().st_mode) == 0o600
 
 
+def test_current_rejects_ok_revision_pending_recheck(store: ModelStore) -> None:
+    directory = install(store)
+    store.set_current("model", "rev")
+    state_path = directory.with_name("rev.json")
+    data = json.loads(state_path.read_text())
+    data["recheck"] = True
+    state_path.write_text(json.dumps(data))
+    before = state_path.read_bytes()
+    pointer = (store.root / "current.json").read_bytes()
+
+    assert store.records()[0].state == "ok"
+    assert store.current() is None
+    assert state_path.read_bytes() == before
+    assert (store.root / "current.json").read_bytes() == pointer
+
+
+def test_unread_metadata_blocks_current_and_mark_ok(
+    store: ModelStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    directory = install(store)
+    store.set_current("model", "rev")
+    record = ModelRecord("model", "rev", directory, "layout", "variant", 7, metadata_ok=False)
+    monkeypatch.setattr(store, "_record", Mock(return_value=record))
+    write = Mock(wraps=st._write_json)
+    monkeypatch.setattr(st, "_write_json", write)
+
+    assert store.current() is None
+    with pytest.raises(StoreError) as error:
+        store.mark_ok("model", "rev")
+    assert error.value.code == "invalid-metadata"
+    write.assert_not_called()
+
+
 def test_atomic_json_flushes_file_before_replace_and_directory_after(
     store: ModelStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -364,7 +397,13 @@ def test_recheck_verdict_clears_flag_and_preserves_metadata(
     directory = install(store)
     state_path = directory.with_name("rev.json")
     data = json.loads(state_path.read_text())
-    data.update(state="broken", reason="Старая причина", recheck=True)
+    data.update(
+        state="broken",
+        reason="Старая причина",
+        recheck=True,
+        layout="onnx-asr-gigaam-v3",
+        variant="gigaam-v3-e2e-rnnt",
+    )
     state_path.write_text(json.dumps(data))
     store.set_current("model", "rev")
     pointer = store.root / "current.json"
@@ -382,6 +421,7 @@ def test_recheck_verdict_clears_flag_and_preserves_metadata(
     assert record.state == state
     assert record.reason == reason
     assert record.recheck is False
+    assert record.metadata_ok is True
     assert json.loads(state_path.read_text()) == {
         **data,
         "state": state,
@@ -392,6 +432,96 @@ def test_recheck_verdict_clears_flag_and_preserves_metadata(
     assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
     store.set_current("model", "rev")
     assert store.current() == (record if state == "ok" else None)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize(
+    "failure", ["missing", "corrupt", "unreadable", "empty-layout", "empty-variant"]
+)
+def test_mark_ok_rejects_invalid_metadata_without_writing(
+    store: ModelStore, monkeypatch: pytest.MonkeyPatch, legacy: bool, failure: str
+) -> None:
+    directory = install(store)
+    store.set_current("model", "rev")
+    state_path = directory.with_name("rev.json")
+    data = json.loads(state_path.read_text())
+    data.update(state="broken", recheck=True, layout="layout", variant="variant")
+    if legacy:
+        state_path.unlink()
+        state_path = directory / "state.json"
+    state_path.write_text(json.dumps(data))
+    if failure == "missing":
+        state_path.unlink()
+    elif failure == "corrupt":
+        state_path.write_bytes(b'{"metadata_ok": true}')
+    elif failure == "unreadable":
+        read_json = st._read_json
+
+        def read(path: Path) -> dict[str, object]:
+            if path == state_path:
+                raise PermissionError("PRIVATE /private/model")
+            return read_json(path)
+
+        monkeypatch.setattr(st, "_read_json", read)
+    else:
+        data[failure.removeprefix("empty-")] = ""
+        state_path.write_text(json.dumps(data))
+    before = {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file()}
+    write = Mock(wraps=st._write_json)
+    monkeypatch.setattr(st, "_write_json", write)
+
+    with pytest.raises(StoreError) as error:
+        store.mark_ok("model", "rev")
+
+    assert error.value.code == "invalid-metadata"
+    assert error.value.message == (
+        "Метаданные модели недоступны или неполны. Модель нужно переустановить."
+    )
+    write.assert_not_called()
+    assert {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file()} == before
+
+
+@pytest.mark.parametrize("contents", [None, b"{"])
+def test_mark_broken_still_works_without_metadata(
+    store: ModelStore, contents: bytes | None
+) -> None:
+    directory = install(store)
+    state_path = directory.with_name("rev.json")
+    if contents is None:
+        state_path.unlink()
+    else:
+        state_path.write_bytes(contents)
+    (record,) = store.records()
+    assert record.metadata_ok is False
+
+    store.mark_broken("model", "rev", "Ошибка проверки")
+
+    assert json.loads(state_path.read_text()) == {
+        "state": "broken",
+        "reason": "Ошибка проверки",
+        "recheck": False,
+        "layout": "",
+        "variant": "",
+        "size_bytes": 0,
+    }
+    with pytest.raises(StoreError) as error:
+        store.mark_ok("model", "rev")
+    assert error.value.code == "invalid-metadata"
+
+
+@pytest.mark.parametrize("metadata_ok", [False, True])
+def test_metadata_ok_is_neither_read_nor_written(store: ModelStore, metadata_ok: bool) -> None:
+    directory = install(store)
+    state_path = directory.with_name("rev.json")
+    data = json.loads(state_path.read_text())
+    data["metadata_ok"] = metadata_ok
+    state_path.write_text(json.dumps(data))
+
+    (record,) = store.records()
+
+    assert record.metadata_ok is True
+    store.mark_broken("model", "rev", "Ошибка проверки")
+    assert "metadata_ok" not in json.loads(state_path.read_text())
 
 
 @pytest.mark.parametrize("failure_stage", ["replace", "fsync_dir", "unlink"])
@@ -577,6 +707,7 @@ def test_missing_or_broken_state_is_listed_as_broken(
     assert record.revision == "rev"
     assert record.state == "broken"
     assert "состояния модели" in record.reason
+    assert record.metadata_ok is False
     assert store.current() is None
 
 

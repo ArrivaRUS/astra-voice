@@ -15,7 +15,9 @@ from astra_voice.core.dictation import (
     BUSY_RETRY_MS,
     CANCEL_RESTART_MS,
     CANCEL_TIMEOUT_MS,
+    LEVEL_LIMIT_MESSAGE,
     LEVEL_RECORD_LIMIT_S,
+    LEVEL_TOTAL_LIMIT_S,
     PROCESSING_WATCHDOG_MS,
     RECOGNIZE_TIMEOUT_S,
     TEST_BUSY,
@@ -2234,6 +2236,12 @@ def test_level_monitor_records_without_recognition(rig: Rig, device: str) -> Non
     assert rig.sent[0][0].get("device") == (device or None)
     assert rig.sent[0][0]["limit_s"] == LEVEL_RECORD_LIMIT_S
     assert rig.recording and rig.tray.state == TrayState.LISTENING
+    assert (
+        rig.trace.index(("pill", PillState.LISTENING, None, None))
+        < rig.trace.index(("tray", TrayState.LISTENING, None))
+        < rig.trace.index(("recording", True))
+        < rig.trace.index(("send", "record.start"))
+    )
     assert not any(entry[0] == "active_window" for entry in rig.trace)
     microphone_event(rig, "level", peak_dbfs=-18, rms_dbfs=-30)
     assert updates[-1] == MicrophoneLevelUpdate("listening", peak_dbfs=-18)
@@ -2247,7 +2255,12 @@ def test_level_monitor_records_without_recognition(rig: Rig, device: str) -> Non
     microphone_event(rig, "cancelled")
     assert updates[-1] == MicrophoneLevelUpdate("idle")
     assert not rig.core.level_active and not rig.core.test_active
-    assert not rig.stats.events and not rig.pasted and not rig.pill.calls
+    assert not rig.stats.events and not rig.pasted
+    assert rig.pill.calls == [
+        (PillState.LISTENING, None, None),
+        (PillState.LISTENING, None, 0.7),
+    ]
+    assert rig.pill.hidden
     assert rig.core.last_text is None
 
 
@@ -2320,7 +2333,9 @@ def test_level_monitor_lifecycle_closes_microphone(rig: Rig, action: str) -> Non
     assert not rig.recording and rig.tray.state == TrayState.IDLE
     assert updates[-1].state == ("error" if action == "generation" else "idle")
     assert not rig.core.level_active
-    assert not rig.stats.events and not rig.pill.calls
+    assert not rig.stats.events
+    assert rig.pill.calls == [(PillState.LISTENING, None, None)]
+    assert rig.pill.hidden
 
 
 @pytest.mark.parametrize("failure", ["start", "level", "indicator", "callback", "stop", "limit"])
@@ -2361,7 +2376,9 @@ def test_level_exceptions_close_without_leaking(
     assert updates[-1].state == "error"
     assert "record.cancel" in rig.commands()
     assert not rig.recording and not rig.core.level_active
-    assert not rig.stats.events and not rig.pill.calls
+    assert not rig.stats.events
+    assert rig.pill.calls == [(PillState.LISTENING, None, None)]
+    assert rig.pill.hidden
     assert MARKER not in caplog.text
     assert all(record.exc_info is None for record in caplog.records)
 
@@ -2402,3 +2419,143 @@ def test_level_late_limit_cannot_restart_after_stop(rig: Rig) -> None:
     microphone_event(rig, "record.limit")
     assert rig.commands() == ["record.start", "record.cancel"]
     assert not rig.core.level_active
+
+
+@pytest.mark.parametrize("ack", ["cancelled", "audio.closed", "restart"])
+def test_level_total_limit_survives_record_limits(rig: Rig, ack: str) -> None:
+    updates: list[MicrophoneLevelUpdate] = []
+    microphone_open = False
+
+    def send(message: dict[str, Any]) -> None:
+        nonlocal microphone_open
+        ipc.encode(message)
+        if message["type"] == "record.start":
+            microphone_open = True
+        elif message["type"] in ("record.cancel", "audio.close"):
+            microphone_open = False
+
+    rig.during_send = send
+    assert LEVEL_TOTAL_LIMIT_S == 180.0
+    assert rig.core.start_level_monitor("", updates.append)
+    total = rig.timer(180000)
+    for _ in range(8):
+        microphone_event(rig, "record.limit")
+        assert rig.timer(180000) is total
+        assert microphone_open
+    assert len([timer for timer in rig.timers if timer.delay == 180000]) == 1
+    total.fire()
+    assert rig.commands()[-1] == "record.cancel"
+    assert not microphone_open and not rig.recording and not rig.core.level_active
+    assert rig.tray.state == TrayState.IDLE and rig.pill.hidden
+    starts = rig.commands().count("record.start")
+    microphone_event(rig, "record.limit")
+    if ack == "cancelled":
+        microphone_event(rig, "cancelled")
+    else:
+        rig.timer(CANCEL_TIMEOUT_MS).fire()
+        assert rig.commands()[-1] == "audio.close"
+        if ack == "audio.closed":
+            rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+        else:
+            rig.timer(CANCEL_RESTART_MS).fire()
+            rig.restart_worker.assert_called_once_with()
+    microphone_event(rig, "record.limit")
+    assert rig.commands().count("record.start") == starts
+    assert set(rig.commands()) <= {"record.start", "record.cancel", "audio.close"}
+    assert updates[-1] == MicrophoneLevelUpdate("idle", message=LEVEL_LIMIT_MESSAGE)
+    assert not any(update.state == "error" for update in updates)
+    assert rig.core.phase == DictationPhase.IDLE
+    assert not [timer for timer in rig.timers if not timer.cancelled and not timer.fired]
+    assert not rig.pasted and not rig.stats.events
+
+    # Продление разрешено только новым явным запуском; старый таймер уже безвреден.
+    assert rig.core.start_level_monitor("", updates.append)
+    total.callback()
+    assert updates[-1] == MicrophoneLevelUpdate("listening")
+    assert rig.core.level_active and microphone_open
+    assert rig.timer(180000) is not total
+    rig.core.stop_level_monitor()
+    microphone_event(rig, "cancelled")
+    assert updates[-1] == MicrophoneLevelUpdate("idle")
+
+
+@pytest.mark.parametrize("stopping", [False, True])
+def test_late_audio_closed_cannot_finish_new_level_episode(rig: Rig, stopping: bool) -> None:
+    assert rig.core.start_level_monitor("", Mock())
+    rig.core.stop_level_monitor()
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert rig.commands()[-1] == "audio.close"
+    old_watchdog = rig.timer(CANCEL_RESTART_MS)
+    microphone_event(rig, "cancelled")
+    assert old_watchdog.cancelled
+
+    updates: list[MicrophoneLevelUpdate] = []
+    assert rig.core.start_level_monitor("", updates.append)
+    if stopping:
+        rig.core.stop_level_monitor()
+    watchdog = rig.timer(CANCEL_TIMEOUT_MS if stopping else int(LEVEL_TOTAL_LIMIT_S * 1000))
+    before = rig.commands()
+    rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+    old_watchdog.callback()
+    assert rig.commands() == before
+    assert not watchdog.cancelled
+    assert updates == [MicrophoneLevelUpdate("listening")]
+    assert rig.core.phase == DictationPhase.RECORDING
+    assert rig.core.level_active is not stopping
+    watchdog.fire()
+    if not stopping:
+        rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert rig.commands()[-1] == "audio.close"
+    rig.timer(CANCEL_RESTART_MS).fire()
+    rig.restart_worker.assert_called_once_with()
+    assert updates[-1].state == "idle"
+
+
+def test_level_audio_closed_can_arrive_synchronously(rig: Rig) -> None:
+    updates: list[MicrophoneLevelUpdate] = []
+    assert rig.core.start_level_monitor("", updates.append)
+    rig.core.stop_level_monitor()
+
+    def send(message: dict[str, Any]) -> None:
+        if message["type"] == "audio.close":
+            rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+
+    rig.during_send = send
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert updates[-1] == MicrophoneLevelUpdate("idle")
+    assert not [timer for timer in rig.timers if not timer.cancelled and not timer.fired]
+    rig.restart_worker.assert_not_called()
+
+
+def test_level_callback_exception_after_finish_cannot_cancel_new_test(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    test_updates: list[MicrophoneTestUpdate] = []
+    accepted: list[bool] = []
+
+    def receive(update: MicrophoneLevelUpdate) -> None:
+        if update.state == "idle":
+            accepted.append(rig.core.start_test("", test_updates.append))
+        elif update.peak_dbfs is not None:
+            rig.core.stop_level_monitor()
+            raise RuntimeError(MARKER)
+
+    def send(message: dict[str, Any]) -> None:
+        if message["type"] == "record.cancel":
+            microphone_event(rig, "cancelled")
+
+    rig.during_send = send
+    assert rig.core.start_level_monitor("", receive)
+    microphone_event(rig, "level", peak_dbfs=-20, rms_dbfs=-30)
+
+    assert accepted == [True]
+    assert not rig.core.level_active and rig.core.test_active
+    assert rig.core.phase == DictationPhase.RECORDING
+    assert rig.recording and not rig.core._cancel_pending
+    assert rig.commands() == ["record.start", "record.cancel", "record.start"]
+    rig.core.stop_test()
+    microphone_event(rig, "result", text=MARKER, t_ms=500)
+    assert test_updates[-1].state == "done"
+    assert test_updates[-1].text == MARKER
+    assert rig.core.phase.name == "IDLE"
+    assert MARKER not in caplog.text

@@ -2578,13 +2578,15 @@ def test_selfcheck_second_transient_failure_blocks_without_third_attempt(
     assert rig.runtime._model_load_failures == 1
     assert timer.deleted and not timer.active
     assert not rig.runtime.timers
-    rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
-    rig.pill.show_state.assert_called_once_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
     rig.pill.hide.assert_not_called()
     if second == "cancelled":
-        rig.notify.notify_selfcheck_failed.assert_called_once_with()
+        rig.tray.set_state.assert_not_called()
+        rig.pill.show_state.assert_not_called()
+        rig.notify.notify_selfcheck_failed.assert_not_called()
         rig.notify.notify_engine_failed.assert_not_called()
     else:
+        rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
+        rig.pill.show_state.assert_called_once_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
         rig.notify.notify_engine_failed.assert_called_once_with()
         rig.notify.notify_selfcheck_failed.assert_not_called()
     assert rig.stats.append.call_args_list == [
@@ -2604,6 +2606,8 @@ def test_selfcheck_second_transient_failure_blocks_without_third_attempt(
     on_event.assert_not_called()
     rig.event(type="hello")
     rig.event(type="model.loaded")
+    if second == "cancelled":
+        rig.pill.show_state.assert_not_called()
     for offset in (0, 3):
         assert_recording_blocked(rig, offset=offset)
     rig.tray.set_model_recheck_enabled.assert_called_with(True)
@@ -2615,7 +2619,13 @@ def test_selfcheck_second_transient_failure_blocks_without_third_attempt(
     assert rig.runtime.last_text is None
     assert rig.stats.append.call_count == 2
     if second == "cancelled":
-        rig.notify.notify_selfcheck_failed.assert_called_once_with()
+        rig.tray.set_state.assert_not_called()
+        # Только явные нажатия хоткея сообщают, почему диктовка недоступна.
+        assert rig.pill.show_state.call_args_list == [
+            call(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED),
+            call(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED),
+        ]
+        rig.notify.notify_selfcheck_failed.assert_not_called()
         rig.notify.notify_engine_failed.assert_not_called()
     else:
         rig.notify.notify_engine_failed.assert_called_once_with()
@@ -2846,10 +2856,21 @@ def test_selfcheck_outcome_is_logged_and_prd_stats_roundtrip(
         assert_phase(rig.runtime, DictationPhase.RECORDING)
         assert "record.start" in rig.trace
     else:
-        rig.tray.set_state.assert_called_with(TrayState.ERROR)
-        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
+        assert rig.runtime._selfcheck == "failed"
+        rig.tray.set_model_recheck_enabled.assert_called_with(True)
+        if reason == "cancelled":
+            rig.tray.set_state.assert_not_called()
+            assert all(
+                entry.args[0] != PillState.ERROR for entry in rig.pill.show_state.call_args_list
+            )
+        else:
+            rig.tray.set_state.assert_called_with(TrayState.ERROR)
+            rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
         rig.pill.hide.assert_not_called()
-        if reason in ("no-match", "cancelled"):
+        if reason == "cancelled":
+            rig.notify.notify_selfcheck_failed.assert_not_called()
+            rig.notify.notify_engine_failed.assert_not_called()
+        elif reason == "no-match":
             rig.notify.notify_selfcheck_failed.assert_called_once_with()
             rig.notify.notify_engine_failed.assert_not_called()
         else:
@@ -3917,4 +3938,47 @@ def test_level_runtime_unavailable(monkeypatch: pytest.MonkeyPatch, unavailable:
     assert not rig.runtime.start_level_monitor("", updates.append)
     assert updates[-1].state == "error"
     assert updates[-1].message
+    rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("source", ["pill", "tray"])
+@pytest.mark.parametrize("responsive", [False, True])
+def test_level_cancel_buttons_close_microphone(rig: Rig, source: str, responsive: bool) -> None:
+    rig.runtime.start()
+    commands: list[dict[str, Any]] = []
+    microphone_open = False
+    updates: list[MicrophoneLevelUpdate] = []
+
+    def send(message: dict[str, Any], **kwargs: object) -> None:
+        nonlocal microphone_open
+        commands.append(message)
+        if message["type"] == "record.start":
+            microphone_open = True
+        elif message["type"] == "record.cancel" and responsive:
+            microphone_open = False
+            rig.event(type="cancelled", utterance_id=message["utterance_id"])
+        elif message["type"] == "audio.close":
+            microphone_open = False
+            rig.event(type="audio.closed")
+
+    rig.supervisor.send.side_effect = send
+    assert rig.runtime.start_level_monitor("", updates.append)
+    assert microphone_open
+    callback = rig.pill.on_cancel_clicked if source == "pill" else rig.tray.on_cancel
+    callback()
+    callback()
+    assert [message["type"] for message in commands] == ["record.start", "record.cancel"]
+    assert not rig.runtime.orchestrator.level_active
+    if not responsive:
+        assert microphone_open
+        watchdogs = [timer for timer in rig.timers if timer.interval == CANCEL_TIMEOUT_MS]
+        assert len(watchdogs) == 1
+        watchdogs[0].fire()
+        assert commands[-1] == {"type": "audio.close"}
+    assert not microphone_open
+    assert updates == [MicrophoneLevelUpdate("listening"), MicrophoneLevelUpdate("idle")]
+    rig.guard.set_recording.assert_called_with(False)
+    rig.tray.set_state.assert_called_with(TrayState.IDLE)
+    rig.pill.hide.assert_called_once_with()
+    assert rig.runtime.phase == DictationPhase.IDLE
     rig.runtime.shutdown()

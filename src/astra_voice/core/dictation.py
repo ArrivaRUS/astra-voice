@@ -39,6 +39,8 @@ CANCEL_RESTART_MS = 2000
 BUSY_RETRY_MS = 200
 TEST_RECORD_LIMIT_MS = 10000
 LEVEL_RECORD_LIMIT_S = 60.0
+LEVEL_TOTAL_LIMIT_S = 180.0
+LEVEL_LIMIT_MESSAGE = "Проверка микрофона остановлена. Нажмите, чтобы продолжить"
 LEVEL_FAILED = "Не удалось проверить микрофон. Попробуйте ещё раз."
 
 
@@ -199,6 +201,8 @@ class DictationOrchestrator:
         self._level_callback: LevelCallback | None = None
         self._level_device = ""
         self._level_failed = False
+        self._level_idle_message = ""
+        self._level_awaiting_audio_closed = False
 
     @property
     def level_active(self) -> bool:
@@ -219,6 +223,8 @@ class DictationOrchestrator:
         self._level_callback = callback
         self._level_device = device
         self._level_failed = False
+        self._level_idle_message = ""
+        self._level_awaiting_audio_closed = False
         self._cancel_requested = False
         try:
             self._utterance_id = uuid4().hex
@@ -228,6 +234,7 @@ class DictationOrchestrator:
             self._worker_generation = self._generation()
             self._sync_device_generation()
             self._phase = DictationPhase.RECORDING
+            self._later(int(LEVEL_TOTAL_LIMIT_S * 1000), self._level_total_timeout)
             self._start_level_recording()
         except Exception:
             self._end_level(LEVEL_FAILED)
@@ -236,6 +243,9 @@ class DictationOrchestrator:
 
     def _start_level_recording(self) -> None:
         # Индикация включается до открытия: ошибка индикатора запрещает запись.
+        self._pill.show_state(PillState.LISTENING)
+        if not self.level_active:
+            return
         self._tray.set_state(TrayState.LISTENING)
         if not self.level_active:
             return
@@ -258,6 +268,10 @@ class DictationOrchestrator:
         if self._level_callback is not None and not self._cancel_requested:
             self._end_level()
 
+    def _level_total_timeout(self) -> None:
+        if self.level_active:
+            self._end_level(idle_message=LEVEL_LIMIT_MESSAGE)
+
     def _level_notify(self, update: MicrophoneLevelUpdate) -> None:
         if self._level_callback is not None:
             try:
@@ -266,13 +280,15 @@ class DictationOrchestrator:
                 # Терминальное уведомление не должно мешать освобождению микрофона.
                 self._level_failed = True
 
-    def _end_level(self, message: str = "") -> None:
+    def _end_level(self, message: str = "", *, idle_message: str = "") -> None:
         self._cancel_requested = True
         self._cancel_pending = True
+        self._level_idle_message = idle_message
         self._cancel_timers()
         actions: tuple[Callable[[], None], ...] = (
             lambda: self._set_recording(False),
             lambda: self._tray.set_state(TrayState.IDLE),
+            self._pill.hide,
         )
         for action in actions:
             try:
@@ -292,12 +308,14 @@ class DictationOrchestrator:
 
     def _finish_level(self) -> None:
         callback, self._level_callback = self._level_callback, None
+        idle_message, self._level_idle_message = self._level_idle_message, ""
+        self._level_awaiting_audio_closed = False
         self._cancel_pending = False
         self._cancel_timers()
         self._phase = DictationPhase.IDLE
         if callback is not None and not self._level_failed:
             try:
-                callback(MicrophoneLevelUpdate("idle"))
+                callback(MicrophoneLevelUpdate("idle", message=idle_message))
             except Exception:
                 try:
                     callback(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
@@ -314,6 +332,8 @@ class DictationOrchestrator:
             self._level_failed = True
             self._level_notify(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
         try:
+            # Ставим до send: ответ может прийти синхронно.
+            self._level_awaiting_audio_closed = True
             self._send({"type": "audio.close"})
         except Exception:
             self._level_failed = True
@@ -344,7 +364,11 @@ class DictationOrchestrator:
         if event.get("utterance_id", self._utterance_id) != self._utterance_id:
             return
         kind = event.get("type")
-        if kind in ("cancelled", "audio.closed"):
+        if kind == "audio.closed":
+            # В ответе нет utterance_id: чужой поздний ответ не снимает сторожей.
+            if self._cancel_pending and self._level_awaiting_audio_closed:
+                self._finish_level()
+        elif kind == "cancelled":
             if not self._cancel_requested:
                 self._end_level(LEVEL_FAILED)
             self._finish_level()
@@ -357,7 +381,8 @@ class DictationOrchestrator:
         elif kind == "level":
             peak = event.get("peak_dbfs")
             if isinstance(peak, (int, float)) and not isinstance(peak, bool):
-                if self._level_callback is not None:
+                self._pill.show_state(PillState.LISTENING, level=level_from_dbfs(float(peak)))
+                if self.level_active and self._level_callback is not None:
                     self._level_callback(MicrophoneLevelUpdate("listening", peak_dbfs=float(peak)))
         elif kind == "record.limit" and self.level_active:
             # Удаляем завершённый буфер. Его поздний cancelled отсеется по старому id.
@@ -592,7 +617,8 @@ class DictationOrchestrator:
             try:
                 self._level_event(event)
             except Exception:
-                self._end_level(LEVEL_FAILED)
+                if self._level_callback is not None:
+                    self._end_level(LEVEL_FAILED)
             return
         if self._suspended:
             saved = event.copy()

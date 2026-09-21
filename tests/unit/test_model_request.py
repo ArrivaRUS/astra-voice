@@ -5,12 +5,48 @@ from __future__ import annotations
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
 from astra_voice.core.model_request import ModelNotConfigured, build_model_load
+from astra_voice.core.model_source import resolve_model_request
+from astra_voice.core.settings import from_dict
+from astra_voice.models.store import ModelRecord, ModelStore
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("failure", ["recheck", "metadata"])
+@pytest.mark.parametrize("configured", [False, True])
+def test_resolver_rejects_unverified_store_record_even_if_current_returns_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, configured: bool
+) -> None:
+    store = ModelStore(tmp_path / "models")
+    record = ModelRecord(
+        "stored-model",
+        "r1",
+        store.root / "stored-model/r1",
+        "stored-layout",
+        "stored-variant",
+        123,
+        recheck=failure == "recheck",
+        metadata_ok=failure != "metadata",
+    )
+    current = Mock(return_value=record)
+    monkeypatch.setattr(store, "current", current)
+    settings = from_dict(
+        {"model_id": "fallback-model", "model_revision": "r2"} if configured else {}
+    )
+
+    request = resolve_model_request(settings, store, store_dir=store.root)
+
+    current.assert_called_once_with()
+    if configured:
+        assert request == build_model_load(settings.to_dict(), store_dir=store.root)
+        assert request["id"] == "fallback-model"
+    else:
+        assert request is None
 
 
 @pytest.mark.parametrize("prefix", ["model_", ""])

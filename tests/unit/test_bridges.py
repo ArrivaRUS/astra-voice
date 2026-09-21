@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import re
+import socket
 import stat
 import threading
 import time
@@ -21,8 +22,10 @@ from typing import Any, Literal, Protocol, cast
 from unittest.mock import Mock, call
 
 import pytest
+import requests
 from PyQt5 import sip
-from PyQt5.QtCore import QCoreApplication, QEvent
+from PyQt5.QtCore import QCoreApplication, QEvent, QObject, Qt, QTimer, QUrl
+from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtTest import QSignalSpy
 
 from astra_voice.app import _make_app_info
@@ -30,9 +33,11 @@ from astra_voice.core import paths
 from astra_voice.core import policy as policy_mod
 from astra_voice.core import settings as settings_mod
 from astra_voice.core.dictation import (
+    LEVEL_TOTAL_LIMIT_S,
     TEST_PREPARING,
     DictationOrchestrator,
     DictationPhase,
+    MicrophoneLevelUpdate,
     MicrophoneTestUpdate,
 )
 from astra_voice.core.model_source import SMOKE_EXPECT_ANY
@@ -47,6 +52,7 @@ from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
 from astra_voice.platform.paste import PasteMode
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui.bridges import (
+    ModelDownloads,
     ModelPort,
     ModelService,
     OnboardingController,
@@ -56,6 +62,7 @@ from astra_voice.ui.bridges import (
     _ModelJob,
     make_smoke_check,
 )
+from astra_voice.ui.pill import PillState
 from astra_voice.ui.tray_icons import TrayState
 from astra_voice.worker import ipc
 from astra_voice.worker.audio import AudioDevice, AudioError
@@ -66,6 +73,14 @@ pytestmark = pytest.mark.unit
 @pytest.fixture(scope="module", autouse=True)
 def qcore_app() -> QCoreApplication:
     return QCoreApplication.instance() or QCoreApplication([])
+
+
+@pytest.fixture(autouse=True)
+def desktop_opener(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Ни один тест мостов не может запустить настоящий файловый менеджер."""
+    opener = Mock(return_value=True)
+    monkeypatch.setattr(QDesktopServices, "openUrl", opener)
+    return opener
 
 
 @pytest.mark.parametrize("debug", [False, True])
@@ -1535,6 +1550,7 @@ class FakeModelPort:
         self.damaged = False
         self.network = True
         self.space = True
+        self.available_bytes = 42_100_000_000
         self.ram = True
         self.download_calls = 0
         self.sources: list[Path] = []
@@ -1593,6 +1609,9 @@ class FakeModelPort:
 
     def disk_missing_bytes(self, size_bytes: int) -> int:
         return 12_500_000
+
+    def free_bytes(self) -> int:
+        return self.available_bytes
 
     def ram_ok(self, min_ram_mb: int) -> bool:
         assert min_ram_mb == self.entry.min_ram_mb
@@ -1703,6 +1722,21 @@ def test_model_initial_states(
     elif expected == "broken":
         assert "не прошла проверку" in controller.modelMessage
         assert "заново" in controller.modelMessage
+
+
+def test_model_space_message_supports_port_without_missing_bytes(
+    model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port, create = model_rig
+    port.space = False
+    monkeypatch.delattr(FakeModelPort, "disk_missing_bytes")
+
+    controller = create()
+
+    assert controller.modelState == "no-space"
+    assert controller.modelMessage == (
+        "Недостаточно места на диске для модели 226 МБ. Освободите место."
+    )
 
 
 def test_model_absent_and_settings_fallback(model_rig: ModelRig) -> None:
@@ -1938,11 +1972,27 @@ def test_model_failed_install_is_broken_and_retryable(
 @pytest.mark.parametrize("reason_code", ["selfcheck", "checksum", "layout"])
 @pytest.mark.parametrize("local", [False, True])
 def test_model_install_failure_message_uses_reason_code(
-    model_rig: ModelRig, reason_code: ReasonCode, local: bool, reason: str
+    model_rig: ModelRig,
+    reason_code: ReasonCode,
+    local: bool,
+    reason: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     port, create = model_rig
     port.result = InstallResult("broken", reason, reason_code=reason_code)
     controller = create()
+    displayed: list[str] = []
+
+    def capture_messages() -> None:
+        displayed.extend((controller.modelMessage, controller.downloadTitle))
+        displayed.extend(card["message"] for card in controller.models)
+
+    for signal in (
+        controller.modelMessageChanged,
+        controller.modelsChanged,
+        controller.downloadTitleChanged,
+    ):
+        signal.connect(capture_messages)
     done = QSignalSpy(controller.canFinishChanged)
     if local:
         controller.installFromPath("/fake/model")
@@ -1950,12 +2000,17 @@ def test_model_install_failure_message_uses_reason_code(
         controller.download()
     assert done.wait(1000)
     assert controller.modelState == "broken"
-    # Решение заказчика от 2026-09-16 (m5): показываем причину установщика; F4.9 — запасной текст.
+    # Причина установщика проходит тот же белый список, что и сообщение карточки.
     assert controller.modelMessage == (
-        (reason or "Распознавание на этом компьютере не работает. Обратитесь к администратору")
-        if reason_code == "selfcheck"
+        "Распознавание на этом компьютере не работает. Обратитесь к администратору"
+        if reason_code == "selfcheck" and not reason
         else "Модель не прошла проверку. Попробуйте скачать или установить её заново."
     )
+    assert controller.models[0]["message"] == controller.modelMessage
+    capture_messages()
+    assert displayed
+    for text in (*displayed, caplog.text):
+        assert "SECRET" not in text and "/path/service" not in text
 
 
 @pytest.mark.parametrize(
@@ -2158,7 +2213,9 @@ def test_model_job_can_run_synchronously_without_event_polling(cancelled: bool) 
     assert finished[0][0] == ("cancelled" if cancelled else "installed")
     if not cancelled:
         assert list(staged) == [["downloading"], ["verifying"], ["installing"]]
-        assert progressed[0] == [0.5, 5_200_000.0, 25.0]
+        assert list(progressed) == [[0.5], [1.0]]
+    else:
+        assert not progressed
 
 
 @pytest.mark.parametrize("ok", [True, False])
@@ -2413,7 +2470,7 @@ def test_model_job_unknown_progress_and_cancel_before_install(
     progress = QSignalSpy(job.progressed)
     finished = QSignalSpy(job.finished)
     job._progress(Progress(0, 0, 0, None, 1, 1))
-    assert progress[0] == [0.0, 0.0, -1.0]
+    assert progress[0] == [0.0]
     job.staged.connect(lambda stage: cancel.set() if stage == "verifying" else None)
     job.run()
     assert finished[0][0] == "cancelled"
@@ -2481,6 +2538,7 @@ def test_model_shutdown_cancels_active_smoke_check(
 
     monkeypatch.setattr(bridges, "Installer", installer_factory)
     service = ModelService(Settings(), policy_mod.Policy())
+    monkeypatch.setattr(service, "free_bytes", Mock(return_value=port.available_bytes))
     controller = create(service)
     # Проверка создаётся до привязки Event; попытка должна видеть новый Event.
     service.set_cancel(controller._model_cancel)
@@ -3201,7 +3259,7 @@ class QueueModelPort(FakeModelPort):
         self.releases = {entry.id: threading.Event() for entry in self.catalog}
         self.active = 0
         self.max_active = 0
-        self.free_bytes = 1_000_000_000
+        self.available_bytes = 1_000_000_000
         self.restore_calls: list[tuple[str, str]] = []
 
     def entries(self) -> tuple[CatalogEntry, ...]:
@@ -3228,7 +3286,7 @@ class QueueModelPort(FakeModelPort):
         return self.disk_missing_bytes(size_bytes) == 0
 
     def disk_missing_bytes(self, size_bytes: int) -> int:
-        return max(0, (size_bytes * 6 + 4) // 5 - self.free_bytes)
+        return max(0, (size_bytes * 6 + 4) // 5 - self.available_bytes)
 
     def download(
         self, entry: CatalogEntry, *, progress: Callable[[Progress], None], cancel: threading.Event
@@ -3262,6 +3320,93 @@ def select_queue(controller: OnboardingController, port: QueueModelPort) -> None
     # Порядок кликов не должен влиять на порядок каталога.
     controller.toggleModel(port.second.id)
     controller.toggleModel(port.entry.id)
+
+
+@pytest.mark.parametrize("model_id", ["../x", "", "unknown", "revoked"])
+def test_model_toggle_rejects_unavailable_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, model_id: str
+) -> None:
+    first = FakeModelPort().entry
+    revoked = replace(first, id="revoked", recommended=False)
+    service = ModelService.__new__(ModelService)
+    service._catalog = Catalog(
+        1, 1, (RevokedEntry(revoked.id, revoked.revision, "revoked"),), (first, revoked)
+    )
+    service._store = ModelStore(tmp_path / "models")
+    monkeypatch.setattr(service, "allowed", lambda: (True, ""))
+    monkeypatch.setattr(service, "disk_ok", lambda size: True)
+    monkeypatch.setattr(service, "ram_ok", lambda size: True)
+    downloads = ModelDownloads(service)
+    downloads.toggleModel(first.id)
+    before = downloads.models
+    changed = QSignalSpy(downloads.selectionChanged)
+    create_job = Mock(side_effect=AssertionError("Недоступный id не создаёт задание"))
+    monkeypatch.setattr("astra_voice.ui.bridges._ModelJob", create_job)
+    downloads.toggleModel(model_id)
+    downloads.retryModel(model_id)
+    assert downloads.models == before
+    assert len(changed) == 0
+    assert downloads._selected == {first.id}
+    assert downloads._model_thread is None and not downloads._queue_running
+    assert downloads._queue == []
+    create_job.assert_not_called()
+
+
+@pytest.mark.parametrize("state", ["available", "queued", "downloading", "verifying", "installed"])
+def test_model_retry_only_accepts_failed_cards(
+    model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    port, create = model_rig
+    controller = create()
+    controller._downloads._set_card(port.entry, state)
+    create_job = Mock(side_effect=AssertionError("Исправная карточка не создаёт задание"))
+    monkeypatch.setattr("astra_voice.ui.bridges._ModelJob", create_job)
+    controller.retryModel(port.entry.id)
+    assert controller.models[0]["state"] == state
+    assert controller._model_thread is None
+    assert port.download_calls == 0
+    create_job.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [OSError("SECRET /path/service"), StoreError("broken-store")])
+def test_model_current_failure_keeps_installation_and_continues_queue(
+    model_rig: ModelRig,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _, create = model_rig
+    port = QueueModelPort()
+    previous = ("previous", "r1")
+    port.records[previous] = "ok"
+    port.current = previous
+    set_current = Mock(side_effect=error)
+    monkeypatch.setattr(port, "set_current", set_current)
+    controller = create(port)
+    select_queue(controller, port)
+    ready = QSignalSpy(controller.canFinishChanged)
+    finished = QSignalSpy(controller._downloads.queueFinished)
+    port.releases[port.entry.id].set()
+    controller.startSelectedDownloads()
+    assert ready.wait(1000)
+    message = "Модель установлена. Сделать её рабочей не удалось — попробуйте переустановить."
+    assert controller.modelState == "installed"
+    assert controller.modelMessage == message
+    card = controller.models[0]
+    assert card["state"] == "installed" and card["message"] == message
+    assert card["badge"] in {"installed", "active"}
+    assert controller.models[1]["state"] == "downloading"
+    port.releases[port.second.id].set()
+    assert finished.wait(1000)
+    assert list(finished) == [[True]]
+    assert port.installs == [port.entry.id, port.second.id]
+    assert set_current.call_args_list == [call(*previous), call(*previous)]
+    assert controller.downloadState == "done" and controller.downloadProgress == 1.0
+    assert all(
+        card["state"] == "installed" and card["message"] == message for card in controller.models
+    )
+    assert controller.models[0]["badge"] == "installed"
+    assert "SECRET" not in caplog.text and "/path/service" not in caplog.text
 
 
 def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
@@ -3330,11 +3475,11 @@ def test_model_selection_total_space_and_inactive_badge(model_rig: ModelRig) -> 
     controller = create(port)
     select_queue(controller, port)
     assert controller.selectionSummary == "Будет скачано 400 МБ"
-    port.free_bytes = 466_999_999
+    port.available_bytes = 466_999_999
     assert not controller.selectionFits
     assert controller.selectionMessage == "На диске не хватает 14 МБ. Освободите место."
     assert not controller.canContinueFromModel
-    port.free_bytes = 480_000_000
+    port.available_bytes = 480_000_000
     assert controller.selectionFits
     assert controller.selectionMessage == ""
     port.records[(port.entry.id, port.entry.revision)] = "ok"
@@ -3525,9 +3670,21 @@ def test_model_queue_estimates_use_clock_and_throttle(
     select_queue(controller, port)
     controller.startSelectedDownloads()
     controller._active_entry = port.entry
+    transitions: list[tuple[str, str, str]] = []
+    controller.downloadStateChanged.connect(
+        lambda: transitions.append((controller.downloadState, controller.speed, controller.eta))
+    )
     controller._model_staged("downloading")
+    assert transitions == [("downloading", "", "считаю…")]
+    assert controller.speed == "" and controller.eta == "считаю…"
     controller._model_progressed(0, 999_000_000, 0)
     assert controller.speed == "" and controller.eta == "считаю…"
+    speed = QSignalSpy(controller.speedChanged)
+    eta = QSignalSpy(controller.etaChanged)
+    clock.return_value = 100.5
+    controller._model_progressed(0.005, 999_000_000, 0)
+    assert controller.speed == "" and controller.eta == "считаю…"
+    assert len(speed) == len(eta) == 0
     clock.return_value = 105.0
     controller._model_progressed(0.05, 0, -1)
     assert controller.speed == "1,0 МБ/с"
@@ -3702,7 +3859,11 @@ def test_level_monitor_without_model_is_separate(dbfs: float, expected: float) -
     rig.event("cancelled")
     assert controller.levelState == "idle" and controller.level == 0.0
     assert len(state_spy) == 2
-    rig.pill.show_state.assert_not_called()
+    assert rig.pill.show_state.call_args_list == [
+        call(PillState.LISTENING),
+        call(PillState.LISTENING, level=expected),
+    ]
+    rig.pill.hide.assert_called_once_with()
     rig.paste.assert_not_called()
     rig.stats.append.assert_not_called()
 
@@ -3721,6 +3882,125 @@ def test_level_monitor_plain_error(code: str, caplog: pytest.LogCaptureFixture) 
     assert rig.controller.testState == "idle"
     rig.recording.assert_called_with(False)
     assert "Личная речь" not in caplog.text
+
+
+class LevelWindow(QObject):
+    """Состояние окна без QWidget, QWindow, дисплея и нативных событий."""
+
+    def __init__(self, visible: bool = True) -> None:
+        super().__init__()
+        self.visible = visible
+        self.state = int(Qt.WindowNoState)
+
+    def isVisible(self) -> bool:  # noqa: N802
+        return self.visible
+
+    def windowState(self) -> int:  # noqa: N802
+        return self.state
+
+
+@pytest.mark.parametrize("initially_visible", [False, True])
+@pytest.mark.parametrize("visible, minimized", [(False, False), (True, True), (True, False)])
+def test_level_start_reads_current_attached_window(
+    initially_visible: bool, visible: bool, minimized: bool
+) -> None:
+    rig = MicrophoneBridgeRig()
+    window = LevelWindow(initially_visible)
+    rig.controller.attach_window(window)
+    assert rig.controller._window_visible is initially_visible
+    # Событие ещё не доставлено: сохранённая отметка может быть устаревшей.
+    window.visible = visible
+    window.state = int(Qt.WindowMinimized if minimized else Qt.WindowNoState)
+    rig.controller.startLevelMonitor()
+    if not visible or minimized:
+        rig.host.start_level_monitor.assert_not_called()
+        assert rig.commands == []
+        assert rig.controller.levelState == "idle"
+    else:
+        rig.host.start_level_monitor.assert_called_once()
+        assert rig.controller.levelState == "listening"
+    rig.controller.shutdown()
+
+
+@pytest.mark.parametrize("attached", [False, True])
+@pytest.mark.parametrize("event", [QEvent.WindowStateChange, QEvent.Hide, QEvent.Close])
+def test_window_events_stop_level_monitor_once(attached: bool, event: QEvent.Type) -> None:
+    rig = MicrophoneBridgeRig()
+    window = LevelWindow()
+    if attached:
+        rig.controller.attach_window(window)
+    else:
+        window.installEventFilter(rig.controller)
+    rig.controller.startLevelMonitor()
+    if event == QEvent.WindowStateChange:
+        # Максимизация измерению не мешает.
+        window.state = int(Qt.WindowMaximized)
+        QCoreApplication.sendEvent(window, QEvent(event))
+        rig.host.stop_level_monitor.assert_not_called()
+        window.state = int(Qt.WindowMinimized)
+    else:
+        window.visible = False
+    for following in (event, event, QEvent.Hide, QEvent.Close):
+        QCoreApplication.sendEvent(window, QEvent(following))
+    rig.host.stop_level_monitor.assert_called_once_with()
+    assert [message["type"] for message in rig.commands] == ["record.start", "record.cancel"]
+    rig.event("cancelled")
+    assert not rig.core.level_active
+    assert rig.controller.levelState == "idle"
+    rig.recording.assert_called_with(False)
+    rig.controller.shutdown()
+    rig.host.stop_level_monitor.assert_called_once_with()
+
+
+def test_attached_object_without_window_methods_is_supported() -> None:
+    rig = MicrophoneBridgeRig()
+    window = QObject()
+    rig.controller.attach_window(window)
+    QCoreApplication.sendEvent(window, QEvent(QEvent.WindowStateChange))
+    rig.controller.startLevelMonitor()
+    rig.host.start_level_monitor.assert_called_once()
+    rig.controller.shutdown()
+
+
+@pytest.mark.parametrize("visible", [False, True])
+def test_attached_window_initial_visibility_controls_model_notification(
+    monkeypatch: pytest.MonkeyPatch, visible: bool
+) -> None:
+    from astra_voice.ui import notify
+
+    rig = MicrophoneBridgeRig()
+    window = LevelWindow(visible)
+    notification = Mock()
+    monkeypatch.setattr(notify, "notify_model_installed", notification)
+    rig.controller.attach_window(window)
+    rig.controller._downloads.queueFinished.emit(True)
+    assert notification.call_count == int(not visible)
+    rig.controller.shutdown()
+
+
+def test_level_limit_message_is_idle_and_clears_on_explicit_start() -> None:
+    rig = MicrophoneBridgeRig()
+    callbacks: dict[int, Callable[[], None]] = {}
+
+    def schedule(delay: int, callback: Callable[[], None]) -> object:
+        callbacks[delay] = callback
+        return object()
+
+    rig.core._schedule = schedule
+    rig.controller.startLevelMonitor()
+    callbacks[int(LEVEL_TOTAL_LIMIT_S * 1000)]()
+    rig.event("cancelled")
+    assert rig.controller.levelState == "idle"
+    assert rig.controller.levelMessage == (
+        "Проверка микрофона остановлена. Нажмите, чтобы продолжить"
+    )
+    assert rig.controller.level == 0
+    assert rig.host.start_level_monitor.call_count == 1
+    rig.controller.startLevelMonitor()
+    assert rig.controller.levelState == "listening"
+    assert rig.controller.levelMessage == ""
+    assert rig.host.start_level_monitor.call_count == 2
+    rig.controller.shutdown()
 
 
 @pytest.mark.parametrize("leave", ["next", "back", "hide", "close", "shutdown", "device"])
@@ -3876,6 +4156,7 @@ def test_settings_active_model(shared_downloads: SharedDownloadsRig, state: str)
     assert rig.bridge.activeModelName == ("" if state == "none" else entry.name)
     assert rig.bridge.activeModelSize == ("" if state == "none" else "300 МБ")
     assert rig.bridge.activeModelState == state
+    assert rig.bridge.canReinstall is (state != "none")
     if state == "none":
         rig.bridge.reinstallActiveModel()
         assert rig.downloads.downloadState == "idle"
@@ -3914,6 +4195,7 @@ def test_settings_active_model_fallback_order(
     expected = entries[expected_index] if expected_index is not None else None
     assert rig.downloads.active_entry() == expected
     assert rig.bridge.activeModelState == expected_state
+    assert rig.bridge.canReinstall is (expected_state != "none")
 
 
 def test_settings_active_model_without_catalog(shared_downloads: SharedDownloadsRig) -> None:
@@ -3927,6 +4209,112 @@ def test_settings_active_model_without_catalog(shared_downloads: SharedDownloads
     rig.bridge.reinstallActiveModel()
     assert rig.port.visits == []
     assert rig.bridge.downloadState == "idle"
+
+
+@pytest.mark.parametrize("state", ["ok", "broken", "recheck"])
+@pytest.mark.parametrize("has_current", [False, True])
+def test_settings_uses_store_when_catalog_unavailable(
+    tmp_path: Path, state: str, has_current: bool
+) -> None:
+    store = ModelStore(tmp_path / "SECRET" / "models")
+    staged = store.staging_dir("saved-model", "r1")
+    (staged / "state.json").write_text(
+        json.dumps({"layout": "layout", "variant": "variant", "size_bytes": 42_000_000})
+    )
+    store.commit("saved-model", "r1")
+    if has_current:
+        store.set_current("saved-model", "r1")
+    if state == "broken":
+        store.mark_broken("saved-model", "r1", "SECRET /path/service")
+    elif state == "recheck":
+        state_path = store.root / "saved-model" / "r1.json"
+        data = json.loads(state_path.read_text())
+        data["recheck"] = True
+        state_path.write_text(json.dumps(data))
+    before = {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file()}
+    downloads = ModelDownloads(None, store=store)
+    bridge = SettingsBridge(Settings(), downloads=downloads, save=Mock())
+    assert bridge.activeModelState == "catalog-unavailable"
+    assert bridge.activeModelName == "saved-model"
+    assert bridge.activeModelSize == "42 МБ"
+    assert not bridge.canReinstall
+    assert not downloads.modelReady
+    assert downloads.models == []
+    bridge.reinstallActiveModel()
+    bridge.cancelDownloads()
+    assert downloads._model_thread is None and not downloads._queue_running
+    assert downloads.downloadState == "idle"
+    assert {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file()} == before
+
+
+def test_settings_catalog_unavailable_prefers_current_then_usable_record(tmp_path: Path) -> None:
+    store = ModelStore(tmp_path / "models")
+    for model_id in ("a-broken", "b-ok", "c-current"):
+        staged = store.staging_dir(model_id, "r1")
+        (staged / "model.bin").write_bytes(b"model")
+        store.commit(model_id, "r1")
+    store.mark_broken("a-broken", "r1", "broken")
+    bridge = SettingsBridge(Settings(), downloads=ModelDownloads(None, store=store), save=Mock())
+    assert bridge.activeModelName == "b-ok"
+    store.set_current("c-current", "r1")
+    assert bridge.activeModelName == "c-current"
+    assert bridge.activeModelState == "catalog-unavailable"
+
+
+def test_settings_catalog_unavailable_empty_store(tmp_path: Path) -> None:
+    downloads = ModelDownloads(None, store=ModelStore(tmp_path / "models"))
+    bridge = SettingsBridge(Settings(), downloads=downloads, save=Mock())
+    assert bridge.activeModelState == "none"
+    assert bridge.activeModelName == bridge.activeModelSize == ""
+    assert not bridge.canReinstall
+    bridge.reinstallActiveModel()
+    assert downloads._model_thread is None
+
+
+def test_settings_catalog_ignores_fallback_store() -> None:
+    port = FakeModelPort()
+    port.ready = True
+    store = Mock(spec=ModelStore)
+    store.current.side_effect = AssertionError("При доступном каталоге хранилище не читается")
+    store.records.side_effect = store.current.side_effect
+    downloads = ModelDownloads(port, store=store)
+    bridge = SettingsBridge(Settings(), downloads=downloads, save=Mock())
+    assert bridge.activeModelState == "ok"
+    assert bridge.activeModelName == port.entry.name
+    assert bridge.activeModelSize == "226 МБ"
+    assert bridge.canReinstall
+    store.current.assert_not_called()
+    store.records.assert_not_called()
+
+
+@pytest.mark.parametrize("initial", ["ok", "broken"])
+def test_settings_cancel_downloads_cancels_reinstall(
+    shared_downloads: SharedDownloadsRig, initial: str
+) -> None:
+    rig = shared_downloads
+    entry = rig.port.second
+    ids = (entry.id, entry.revision)
+    rig.port.current = ids
+    rig.port.records[ids] = initial
+    rig.port.block = True
+    progress = QSignalSpy(rig.bridge.downloadProgressChanged)
+    finished = QSignalSpy(rig.downloads.queueFinished)
+    rig.bridge.reinstallActiveModel()
+    assert progress.wait(1000)
+    assert not rig.bridge.canReinstall
+    rig.bridge.cancelDownloads()
+    assert rig.downloads._model_cancel.is_set()
+    assert not rig.bridge.canReinstall  # Поток ещё завершает отменённое задание.
+    assert finished.wait(1000)
+    assert list(finished) == [[False]]
+    assert rig.port.visits == [entry.id]
+    assert rig.port.installs == []
+    assert rig.port.records == {ids: initial}
+    assert rig.port.current == ids
+    assert rig.downloads._model_thread is None and not rig.downloads._queue_running
+    assert rig.bridge.downloadState == rig.controller.downloadState == "idle"
+    assert rig.bridge.canReinstall
+    rig.status.assert_called_with("")
 
 
 @pytest.mark.parametrize("error", [None, "bad-path", "disk-full"])
@@ -3977,15 +4365,18 @@ def test_settings_model_without_downloads() -> None:
     bridge = SettingsBridge(Settings(), save=Mock())
     assert bridge.activeModelName == bridge.activeModelSize == ""
     assert bridge.activeModelState == "none"
+    assert not bridge.canReinstall
     assert bridge.downloadState == ""
     assert bridge.downloadProgress == 0.0
     assert bridge.downloadTitle == bridge.speed == bridge.eta == ""
     bridge.reinstallActiveModel()
+    bridge.cancelDownloads()
     meta = bridge.metaObject()
     for name in (
         "activeModelName",
         "activeModelSize",
         "activeModelState",
+        "canReinstall",
         "downloadState",
         "downloadProgress",
         "downloadTitle",
@@ -3995,6 +4386,10 @@ def test_settings_model_without_downloads() -> None:
         prop = meta.property(meta.indexOfProperty(name))
         assert prop.isValid() and prop.hasNotifySignal() and not prop.isWritable()
     assert meta.indexOfSlot(b"reinstallActiveModel()") >= 0
+    assert meta.indexOfSlot(b"cancelDownloads()") >= 0
+    prop = meta.property(meta.indexOfProperty("canReinstall"))
+    assert prop.typeName() == "bool"
+    assert prop.notifySignal().methodSignature() == b"activeModelStateChanged()"
 
 
 @pytest.mark.parametrize("initial", ["ok", "broken"])
@@ -4006,11 +4401,16 @@ def test_reinstall_shares_progress_and_preserves_existing_model(
     rig.port.current = (entry.id, entry.revision)
     rig.port.records[rig.port.current] = initial
     states: list[str] = []
+    can_reinstall: list[bool] = []
     rig.bridge.activeModelStateChanged.connect(lambda: states.append(rig.bridge.activeModelState))
+    rig.bridge.activeModelStateChanged.connect(
+        lambda: can_reinstall.append(rig.bridge.canReinstall)
+    )
     settings_progress = QSignalSpy(rig.bridge.downloadProgressChanged)
     wizard_progress = QSignalSpy(rig.controller.downloadProgressChanged)
     finished = QSignalSpy(rig.downloads.queueFinished)
     rig.bridge.reinstallActiveModel()
+    assert not rig.bridge.canReinstall
     assert settings_progress.wait(1000)
     rig.bridge.reinstallActiveModel()
     assert rig.port.visits == [entry.id]
@@ -4029,6 +4429,8 @@ def test_reinstall_shares_progress_and_preserves_existing_model(
     assert rig.port.installs == [entry.id]
     assert rig.controller.downloadState == rig.bridge.downloadState == "done"
     assert rig.controller.downloadProgress == rig.bridge.downloadProgress == 1.0
+    assert rig.bridge.canReinstall
+    assert False in can_reinstall and can_reinstall[-1] is True
     rig.status.assert_called_with("")
 
 
@@ -4187,7 +4589,9 @@ def test_app_uses_one_download_queue_and_shuts_it_down_once(
     rig.app.exec_.side_effect = event_loop
     assert app_mod.main([]) == 7
     service_factory.assert_called_once()
-    download_factory.assert_called_once_with(port)
+    download_factory.assert_called_once_with(
+        port, store=rig.factory.call_args.kwargs["model_store"]
+    )
     stop.assert_called_once()
 
 
@@ -4268,10 +4672,20 @@ class RecheckRig:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from astra_voice.ui import bridges
 
-        content = b"verified model contents"
+        contents = {
+            "v3_e2e_ctc.int8.onnx": b"verified model contents",
+            "v3_e2e_ctc_vocab.txt": "а\nб\n".encode(),
+            "config.json": b'{"model_type":"gigaam"}',
+        }
         self.entry = replace(
             FakeModelPort().entry,
-            files=(FileSpec("model.bin", hashlib.sha256(content).hexdigest(), len(content), "/m"),),
+            layout="onnx-asr-gigaam-v3",
+            variant="gigaam-v3-e2e-ctc",
+            size_bytes=sum(len(content) for content in contents.values()),
+            files=tuple(
+                FileSpec(name, hashlib.sha256(content).hexdigest(), len(content), f"/{name}")
+                for name, content in contents.items()
+            ),
         )
         self.service = ModelService.__new__(ModelService)
         self.service._catalog = Catalog(1, 1, (), (self.entry,))
@@ -4279,7 +4693,8 @@ class RecheckRig:
         self.service._cancel = threading.Event()
         self.directory = self.service._store.root / self.entry.id / self.entry.revision
         self.directory.mkdir(parents=True)
-        (self.directory / "model.bin").write_bytes(content)
+        for name, content in contents.items():
+            (self.directory / name).write_bytes(content)
         # Старый установщик оставлял состояние внутри установленного набора.
         (self.directory / "state.json").write_text(
             json.dumps(
@@ -4357,6 +4772,7 @@ def test_recheck_success_selects_only_when_no_current(
     assert rig.worker_thread != threading.get_ident()
     assert rig.downloads.downloadState == "verifying"
     assert rig.downloads.downloadTitle == "Проверяю модель…"
+    assert rig.downloads.status_text() == "Проверяю модель…"
     assert rig.downloads.models[0]["state"] == "verifying"
     assert rig.downloads.models[0]["message"] == ""
     assert rig.downloads.modelState == "verifying"
@@ -4379,7 +4795,7 @@ def test_recheck_success_selects_only_when_no_current(
 def test_recheck_confirmed_failure_marks_broken(recheck_rig: RecheckRig, failure: str) -> None:
     rig = recheck_rig
     if failure == "checksum":
-        (rig.directory / "model.bin").write_bytes(b"corruption")
+        (rig.directory / rig.entry.files[0].path).write_bytes(b"corruption")
         expected = "Файлы модели повреждены: контрольная сумма не совпала. Получите их заново."
     else:
         rig.code = failure
@@ -4398,6 +4814,95 @@ def test_recheck_confirmed_failure_marks_broken(recheck_rig: RecheckRig, failure
     assert rig.downloads.models[0]["message"] == expected
     if failure == "checksum":
         rig.runner.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "missing", "store-error"])
+def test_recheck_mark_ok_rejection_fails_without_store_writes_or_downloads(
+    recheck_rig: RecheckRig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+) -> None:
+    from astra_voice.models import store as store_mod
+
+    rig = recheck_rig
+    store = rig.service._store
+    rig.downloads.start_recheck()
+    assert rig.started.wait(1)
+    # Метаданные могут стать недоступны уже после постановки на перепроверку.
+    state_path = rig.directory.with_suffix(".json")
+    if failure == "corrupt":
+        state_path.write_bytes(b"{")
+    elif failure == "missing":
+        state_path.unlink()
+    else:
+        rig.ok.side_effect = StoreError("invalid-metadata", "PRIVATE SPEECH /private/model")
+    before = {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file()}
+    write = Mock(wraps=store_mod._write_json)
+    monkeypatch.setattr(store_mod, "_write_json", write)
+    start_queue = Mock(wraps=rig.downloads._begin_queue)
+    monkeypatch.setattr(rig.downloads, "_begin_queue", start_queue)
+
+    rig.finish()
+    QCoreApplication.processEvents()
+
+    rig.ok.assert_called_once_with(rig.entry.id, rig.entry.revision)
+    rig.broken.assert_not_called()
+    rig.current.assert_not_called()
+    write.assert_not_called()
+    assert {path: path.read_bytes() for path in store.root.rglob("*") if path.is_file()} == before
+    card = rig.downloads.models[0]
+    assert card["state"] == "failed"
+    assert card["message"] == "Модель нужно переустановить."
+    assert rig.downloads.modelState == "broken"
+    assert rig.downloads.modelMessage == card["message"]
+    assert rig.downloads.downloadState == "failed"
+    assert not rig.downloads.modelReady
+    start_queue.assert_not_called()
+    assert not rig.downloads._queue_running and not rig.downloads._queue
+    assert rig.downloads._model_thread is None
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.WARNING, "Хранилище отклонило успешный результат перепроверки модели")
+    ]
+    assert caplog.records[0].exc_info is None
+    assert "PRIVATE SPEECH" not in caplog.text and "/private/model" not in caplog.text
+
+
+@pytest.mark.parametrize("result", ["ok", "checksum", "no-match", "metadata"])
+def test_recheck_never_uses_network_or_starts_download_queue(
+    recheck_rig: RecheckRig, monkeypatch: pytest.MonkeyPatch, result: str
+) -> None:
+    rig = recheck_rig
+    assert rig.service._store.records()[0].recheck is True
+    network_calls = [
+        Mock(side_effect=AssertionError("Перепроверка обратилась к сети")) for _ in range(3)
+    ]
+    monkeypatch.setattr(socket, "getaddrinfo", network_calls[0])
+    monkeypatch.setattr(socket.socket, "connect", network_calls[1])
+    monkeypatch.setattr(requests, "get", network_calls[2])
+    download = Mock(side_effect=AssertionError("Перепроверка запустила загрузку"))
+    monkeypatch.setattr(rig.service, "download", download)
+    start_queue = Mock(wraps=rig.downloads._begin_queue)
+    monkeypatch.setattr(rig.downloads, "_begin_queue", start_queue)
+    if result == "checksum":
+        (rig.directory / rig.entry.files[0].path).write_bytes(b"corruption")
+    elif result == "no-match":
+        rig.code = "no-match"
+
+    rig.downloads.start_recheck()
+    if result == "metadata":
+        assert rig.started.wait(1)
+        rig.directory.with_suffix(".json").write_bytes(b"{")
+    rig.finish()
+    QCoreApplication.processEvents()
+
+    assert [probe.call_count for probe in network_calls] == [0, 0, 0]
+    download.assert_not_called()
+    start_queue.assert_not_called()
+    assert not rig.downloads._queue_running and not rig.downloads._queue
+    assert rig.downloads._model_thread is None
+    assert rig.downloads.downloadState == ("done" if result == "ok" else "failed")
+    assert rig.downloads.models[0]["state"] == ("installed" if result == "ok" else "failed")
 
 
 @pytest.mark.parametrize(
@@ -4446,14 +4951,14 @@ def test_recheck_read_exception_does_not_write(recheck_rig: RecheckRig) -> None:
 def test_recheck_shutdown_cancels_hashing(
     recheck_rig: RecheckRig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from astra_voice.models import installer
     from astra_voice.security.verify import HashCancelledError
-    from astra_voice.ui import bridges
 
     rig = recheck_rig
     started, stopped = threading.Event(), threading.Event()
 
     def hash_file(path: Path, *, cancel: Callable[[], bool]) -> str:
-        assert path == rig.directory / "model.bin"
+        assert path == rig.directory / rig.entry.files[0].path
         assert threading.get_ident() != threading.main_thread().ident
         started.set()
         deadline = time.monotonic() + 2
@@ -4463,7 +4968,7 @@ def test_recheck_shutdown_cancels_hashing(
         stopped.set()
         raise HashCancelledError
 
-    monkeypatch.setattr(bridges, "sha256_file", hash_file)
+    monkeypatch.setattr(installer, "sha256_file", hash_file)
     rig.downloads.start_recheck()
     assert started.wait(1)
     rig.downloads.shutdown()
@@ -4487,13 +4992,15 @@ def test_recheck_shutdown_discards_result_waiting_for_gui(recheck_rig: RecheckRi
     assert rig.service.recheck_entries() == (rig.entry,)
 
 
-@pytest.mark.parametrize("damage", ["extra", "missing", "symlink", "directory", "size", "checksum"])
+@pytest.mark.parametrize(
+    "damage", ["extra", "missing", "symlink", "directory", "size", "checksum", "layout"]
+)
 def test_recheck_verifies_entire_installed_contents(recheck_rig: RecheckRig, damage: str) -> None:
     rig = recheck_rig
     assert rig.service.recheck_entries() == (rig.entry,)
     assert not (rig.directory / "state.json").exists()
     assert rig.service.verify_files(rig.entry) == (True, "")
-    model_file = rig.directory / "model.bin"
+    model_file = rig.directory / rig.entry.files[0].path
     if damage == "extra":
         (rig.directory / "unexpected").touch()
     elif damage == "missing":
@@ -4504,12 +5011,36 @@ def test_recheck_verifies_entire_installed_contents(recheck_rig: RecheckRig, dam
     elif damage == "directory":
         (rig.directory / "subdir").mkdir()
     elif damage == "size":
-        rig.entry = replace(rig.entry, files=(replace(rig.entry.files[0], size=999),))
+        rig.entry = replace(
+            rig.entry, files=(replace(rig.entry.files[0], size=999), *rig.entry.files[1:])
+        )
+    elif damage == "layout":
+        rig.entry = replace(rig.entry, variant="unknown-variant")
     else:
         model_file.write_bytes(b"X" * model_file.stat().st_size)
     ok, reason = rig.service.verify_files(rig.entry)
     assert not ok and reason
-    assert all(value not in reason for value in ("model.bin", str(rig.directory), "unexpected"))
+    assert all(
+        value not in reason
+        for value in (model_file.name, str(rig.directory), "unexpected", "unknown-variant")
+    )
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [(True, ""), (False, "Файлы в папке не подходят для выбранной модели.")],
+)
+def test_model_service_returns_installer_verdict(
+    recheck_rig: RecheckRig, monkeypatch: pytest.MonkeyPatch, verdict: tuple[bool, str]
+) -> None:
+    from astra_voice.ui import bridges
+
+    rig = recheck_rig
+    verify = Mock(return_value=verdict)
+    monkeypatch.setattr(bridges, "verify_installed", verify)
+
+    assert rig.service.verify_files(rig.entry) == verdict
+    verify.assert_called_once_with(rig.directory, rig.entry, cancel=rig.service._cancel.is_set)
 
 
 def test_recheck_entries_match_revision_and_exclude_revoked(recheck_rig: RecheckRig) -> None:
@@ -4566,3 +5097,743 @@ def test_recheck_waits_for_download_queue_and_runs_one_at_a_time(
         time.sleep(0.001)
     assert visits == [port.entry.id, port.second.id]
     assert mark_ok.call_args_list == [call(entry.id, entry.revision) for entry in port.catalog]
+
+
+_REENTRANT_MODEL_SIGNALS = (
+    "modelsChanged",
+    "modelReadyChanged",
+    "selectionChanged",
+    "downloadStateChanged",
+    "queueFinished",
+)
+
+
+def finish_downloads(downloads: ModelDownloads) -> None:
+    deadline = time.monotonic() + 2
+    while downloads._model_thread is not None or downloads._queue_running:
+        QCoreApplication.processEvents()
+        assert time.monotonic() < deadline, "Очередь моделей не завершилась"
+        time.sleep(0.001)
+    assert downloads._active_entry is None
+    assert downloads._model_result is None
+    assert downloads.downloadState in {"idle", "done", "failed", "no-space"}
+
+
+def exercise_reentrant_model_start(
+    rig: SharedDownloadsRig,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_name: str,
+    phase: str,
+    action: str,
+) -> None:
+    downloads, port = rig.downloads, rig.port
+    # Первая модель есть, но повреждена; вторая выбрана для новой загрузки.
+    port.records[(port.entry.id, port.entry.revision)] = "broken"
+    port.errors[port.entry.id] = DownloadError("bad-path")
+    downloads.toggleModel(port.second.id)
+    for release in port.releases.values():
+        release.set()
+    monkeypatch.setattr(port, "recheck_entries", lambda: (port.entry,))
+    monkeypatch.setattr(port, "verify_files", lambda entry: (False, "Ошибка проверки"))
+    monkeypatch.setattr(port, "mark_broken", Mock())
+    before: list[tuple[bool, Any, Any, str]] = []
+    started: list[tuple[bool, Any, Any]] = []
+    finished = QSignalSpy(downloads.queueFinished)
+
+    def receive(*args: object) -> None:
+        if before or downloads._model_thread is not None:
+            return
+        before.append(
+            (
+                downloads._rechecking,
+                downloads._active_entry,
+                downloads._model_result,
+                downloads.downloadState,
+            )
+        )
+        port.errors.clear()
+        if action == "startSelectedDownloads":
+            downloads.startSelectedDownloads()
+        elif action == "retryModel":
+            downloads.retryModel(port.entry.id)
+        elif action == "reinstallActiveModel":
+            rig.bridge.reinstallActiveModel()
+        else:
+            downloads.installFromPath("/fake/model")
+        started.append((downloads._queue_running, downloads._active_entry, downloads._model_thread))
+
+    signal = getattr(downloads, signal_name)
+    signal.connect(receive)
+    if phase == "recheck":
+        downloads.start_recheck()
+        finish_downloads(downloads)
+        if signal_name == "queueFinished":
+            # Перепроверка не эмитит queueFinished; проверяем первую очередь после неё.
+            assert before == []
+            downloads.download()
+    else:
+        downloads.download()
+    finish_downloads(downloads)
+    signal.disconnect(receive)
+    assert len(before) == 1
+    assert before[0] == (False, None, None, "failed")
+    assert len(started) == 1
+    running, entry, thread = started[0]
+    assert running and thread is not None
+    assert entry == (port.second if action == "startSelectedDownloads" else port.entry)
+    assert downloads.downloadState == "done"
+    assert port.max_active == bool(port.visits)
+    assert port.installs == [entry.id]
+    assert list(finished) == (
+        [[False], [True]] if phase == "queue" or signal_name == "queueFinished" else [[True]]
+    )
+
+    # После повторного входа запускаем ещё одну настоящую очередь через публичный слот.
+    # Освобождаем вторую модель в фейковом хранилище, чтобы она требовала загрузки.
+    port.records.pop((port.second.id, port.second.revision), None)
+    previous = len(port.visits)
+    downloads.startSelectedDownloads()
+    assert downloads._queue_running and downloads._model_thread is not None
+    finish_downloads(downloads)
+    assert port.visits[previous:] == [port.second.id]
+    assert downloads.downloadState == "done"
+
+
+@pytest.mark.parametrize("signal_name", _REENTRANT_MODEL_SIGNALS)
+@pytest.mark.parametrize("phase", ["recheck", "queue"])
+def test_model_signals_can_synchronously_start_selected_downloads(
+    shared_downloads: SharedDownloadsRig,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_name: str,
+    phase: str,
+) -> None:
+    exercise_reentrant_model_start(
+        shared_downloads, monkeypatch, signal_name, phase, "startSelectedDownloads"
+    )
+
+
+@pytest.mark.parametrize("signal_name", _REENTRANT_MODEL_SIGNALS)
+@pytest.mark.parametrize("phase", ["recheck", "queue"])
+@pytest.mark.parametrize("action", ["retryModel", "reinstallActiveModel", "installFromPath"])
+def test_model_signals_can_synchronously_retry_or_reinstall(
+    shared_downloads: SharedDownloadsRig,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_name: str,
+    phase: str,
+    action: str,
+) -> None:
+    exercise_reentrant_model_start(shared_downloads, monkeypatch, signal_name, phase, action)
+
+
+@pytest.mark.parametrize("missing", ["result", "entry", "both"])
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_model_thread_finished_recovers_inconsistent_queue(
+    shared_downloads: SharedDownloadsRig,
+    caplog: pytest.LogCaptureFixture,
+    missing: str,
+    cancelled: bool,
+) -> None:
+    downloads, port = shared_downloads.downloads, shared_downloads.port
+    downloads.toggleModel(port.entry.id)
+    downloads._queue_running = True
+    downloads._queue_cancelled = cancelled
+    downloads._queue_entries = port.catalog
+    downloads._queue = [port.second]
+    downloads._active_entry = None if missing in {"entry", "both"} else port.entry
+    downloads._model_result = None if missing in {"result", "both"} else ("error", "PRIVATE SPEECH")
+    downloads._set_card(port.entry, "downloading")
+    downloads._set_card(port.second, "queued")
+    downloads._set_download_state("downloading")
+    finished = QSignalSpy(downloads.queueFinished)
+
+    downloads._model_thread_finished()
+
+    assert not downloads._queue_running and not downloads._queue
+    assert not downloads._queue_entries
+    assert downloads._active_entry is None
+    assert downloads._model_result is None
+    assert downloads.downloadState == ("idle" if cancelled else "failed")
+    assert list(finished) == [[False]]
+    assert "очередь сброшена" in caplog.text
+    assert "PRIVATE SPEECH" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    port.releases[port.entry.id].set()
+    downloads.startSelectedDownloads()
+    assert downloads._model_thread is not None
+    finish_downloads(downloads)
+    assert port.visits == [port.entry.id]
+    assert downloads.downloadState == "done"
+
+
+def test_begin_queue_rejects_recheck_without_thread(shared_downloads: SharedDownloadsRig) -> None:
+    downloads, port = shared_downloads.downloads, shared_downloads.port
+    downloads.toggleModel(port.second.id)
+    downloads._rechecking = True
+    downloads._active_entry = port.entry
+    downloads._model_result = ("installed", "")
+    changed = QSignalSpy(downloads.modelsChanged)
+    downloads.startSelectedDownloads()
+    downloads.installFromPath("/fake/model")
+    downloads.toggleModel(port.second.id)
+    assert not downloads._queue_running and not downloads._queue
+    assert downloads._active_entry is port.entry
+    assert downloads._model_result == ("installed", "")
+    assert downloads._model_thread is None
+    assert not changed and not port.visits
+    downloads._rechecking = False
+    downloads._active_entry = None
+    downloads._model_result = None
+    port.releases[port.second.id].set()
+    downloads.startSelectedDownloads()
+    finish_downloads(downloads)
+    assert port.visits == [port.second.id]
+
+
+def test_model_thread_finished_wait_is_bounded_and_keeps_job_until_cleanup(
+    shared_downloads: SharedDownloadsRig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    downloads, port = shared_downloads.downloads, shared_downloads.port
+    port.releases[port.entry.id].set()
+    downloads.download()
+    thread, job = downloads._model_thread, downloads._model_job
+    assert thread is not None and job is not None
+    assert thread.wait(1000)
+    wait = Mock(side_effect=[False, True])
+    monkeypatch.setattr(thread, "wait", wait)
+    retry = Mock()
+    monkeypatch.setattr(QTimer, "singleShot", retry)
+    QCoreApplication.sendPostedEvents(None, QEvent.MetaCall)
+    assert wait.call_args_list == [call(5000)]
+    assert "не завершился за 5 секунд" in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    assert downloads._model_thread is thread and downloads._model_job is job
+    assert downloads._queue_running
+    downloads.startSelectedDownloads()
+    assert downloads._model_thread is thread
+    assert not sip.isdeleted(thread)
+    assert retry.call_count == 1
+    delay, callback = retry.call_args.args
+    assert delay == 100
+    callback()
+    assert wait.call_args_list == [call(5000), call(5000)]
+    assert downloads._model_thread is downloads._model_job is None
+    assert not downloads._queue_running
+    assert downloads.downloadState == "done"
+
+
+@pytest.mark.parametrize("blocked", ["step", "shutdown"])
+@pytest.mark.parametrize("state", ["listening", "idle", "error"])
+def test_level_receive_ignores_shutdown_and_other_steps(
+    blocked: str, state: Literal["listening", "idle", "error"]
+) -> None:
+    rig = MicrophoneBridgeRig()
+    controller = rig.controller
+    controller.startLevelMonitor()
+    receive = rig.host.start_level_monitor.call_args.args[1]
+    if blocked == "step":
+        controller._step = 5
+    else:
+        controller._shutting_down = True
+    before = (
+        controller.levelState,
+        controller.levelMessage,
+        controller.level,
+        controller._level_epoch,
+    )
+    spies = [
+        QSignalSpy(getattr(controller, name))
+        for name in ("levelStateChanged", "levelMessageChanged", "levelChanged", "peakChanged")
+    ]
+    controller._test_after_level = True
+    receive(MicrophoneLevelUpdate(state, peak_dbfs=-10, message="Позднее событие"))
+    assert before == (
+        controller.levelState,
+        controller.levelMessage,
+        controller.level,
+        controller._level_epoch,
+    )
+    assert all(not spy for spy in spies)
+    rig.host.start_test.assert_not_called()
+    controller.shutdown()
+    rig.event("cancelled")
+
+
+@pytest.mark.parametrize("visible", [None, False, True])
+def test_level_monitor_requires_window_not_explicitly_hidden(visible: bool | None) -> None:
+    rig = MicrophoneBridgeRig()
+    controller = rig.controller
+    if visible is not None:
+        controller.eventFilter(controller, QEvent(QEvent.Show if visible else QEvent.Hide))
+    rig.host.reset_mock()
+    controller.startLevelMonitor()
+    if visible is False:
+        rig.host.start_level_monitor.assert_not_called()
+        assert rig.commands == []
+        assert controller.levelState == "idle"
+    else:
+        rig.host.start_level_monitor.assert_called_once()
+        assert [message["type"] for message in rig.commands] == ["record.start"]
+        controller.shutdown()
+        rig.event("cancelled")
+
+
+@pytest.mark.parametrize(
+    "signal_name",
+    [
+        "modelsChanged",
+        "downloadStateChanged",
+        "downloadProgressChanged",
+        "downloadTitleChanged",
+        "progressChanged",
+        "speedChanged",
+        "etaChanged",
+    ],
+)
+def test_model_signal_cancel_is_idempotent_and_cannot_restore_stale_progress(
+    shared_downloads: SharedDownloadsRig, monkeypatch: pytest.MonkeyPatch, signal_name: str
+) -> None:
+    downloads, port = shared_downloads.downloads, shared_downloads.port
+    port.block = True
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(downloads, "_clock", clock)
+    select_queue(shared_downloads.controller, port)
+    calls: list[str] = []
+
+    def cancel() -> None:
+        calls.append(downloads.downloadState)
+        # Оставляем обработчик подключённым и во время уведомлений самой отмены.
+        downloads.cancelDownloads()
+        downloads.cancelDownload()
+        if downloads._queue_running:
+            downloads.startSelectedDownloads()
+
+    signal = getattr(downloads, signal_name)
+    signal.connect(cancel)
+    downloads.startSelectedDownloads()
+    clock.return_value = 105.0
+    downloads._model_progressed(0.5, 0, -1)
+    finish_downloads(downloads)
+    signal.disconnect(cancel)
+    assert calls
+    assert downloads.downloadState == "idle"
+    assert downloads.downloadProgress == 0
+    assert downloads.speed == downloads.eta == ""
+    assert all(card["state"] == "available" for card in downloads.models)
+    assert not port.installs and not downloads._queue
+    assert port.second.id not in port.visits
+    port.block = False
+    for release in port.releases.values():
+        release.set()
+    downloads.startSelectedDownloads()
+    finish_downloads(downloads)
+    assert port.installs == [port.entry.id, port.second.id]
+    assert downloads.downloadState == "done"
+
+
+@pytest.mark.parametrize("phase", ["recheck", "queue"])
+def test_model_start_signal_can_shutdown_started_thread(
+    shared_downloads: SharedDownloadsRig, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    downloads, port = shared_downloads.downloads, shared_downloads.port
+    port.block = True
+    monkeypatch.setattr(port, "recheck_entries", lambda: (port.entry,))
+    monkeypatch.setattr(port, "verify_files", lambda entry: (True, ""))
+    monkeypatch.setattr(port, "smoke", lambda entry: (True, ""))
+    monkeypatch.setattr(port, "mark_ok", Mock())
+    calls: list[bool] = []
+
+    def shutdown() -> None:
+        calls.append(downloads._model_thread is not None)
+        downloads.shutdown()
+
+    downloads.modelsChanged.connect(shutdown)
+    if phase == "recheck":
+        downloads.start_recheck()
+    else:
+        downloads.download()
+    finish_downloads(downloads)
+    assert calls[0]
+    assert downloads._shutting_down
+    assert not downloads._rechecking
+    assert downloads.downloadState == "idle"
+    downloads.startSelectedDownloads()
+    downloads.installFromPath("/fake/model")
+    assert downloads._model_thread is None and not downloads._queue_running
+
+
+@pytest.mark.parametrize("root_exists", [False, True])
+def test_model_service_free_bytes_uses_store_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, root_exists: bool
+) -> None:
+    service = ModelService.__new__(ModelService)
+    service._store = ModelStore(tmp_path / "missing-parent" / "models")
+    if root_exists:
+        service._store.root.mkdir(parents=True)
+    usage = Mock(return_value=Mock(free=42_100_000_000))
+    monkeypatch.setattr("astra_voice.ui.bridges.shutil.disk_usage", usage)
+    assert service.free_bytes() == 42_100_000_000
+    usage.assert_called_once_with(service._store.root if root_exists else tmp_path)
+    assert service._store.root.exists() is root_exists
+    usage.return_value.free = 234_000_001
+    assert service.disk_missing_bytes(300_000_000) == 125_999_999
+
+
+def test_free_space_text_updates_selection_and_each_download(
+    shared_downloads: SharedDownloadsRig,
+) -> None:
+    rig = shared_downloads
+    changes = QSignalSpy(rig.controller.freeSpaceTextChanged)
+    assert rig.controller.freeSpaceText == "свободно на диске 1,0 ГБ"
+    rig.port.available_bytes = 42_100_000_000
+    select_queue(rig.controller, rig.port)
+    assert rig.controller.freeSpaceText == "свободно на диске 42,1 ГБ"
+    assert len(changes) == 1
+    rig.controller.startSelectedDownloads()
+    completed = QSignalSpy(rig.controller.modelReadyChanged)
+    rig.port.available_bytes = 40_000_000_000
+    rig.port.releases[rig.port.entry.id].set()
+    assert completed.wait(1000)
+    assert rig.controller.downloadState == "downloading"
+    assert rig.controller.freeSpaceText == "свободно на диске 40,0 ГБ"
+    assert len(changes) == 2
+    rig.port.available_bytes = 512_000_000
+    rig.port.releases[rig.port.second.id].set()
+    assert completed.wait(1000)
+    assert rig.controller.downloadState == "done"
+    assert rig.controller.freeSpaceText == "свободно на диске 512 МБ"
+    assert len(changes) == 3
+
+
+@pytest.mark.parametrize("error", [OSError("SECRET /path"), StoreError("broken-store")])
+def test_free_space_text_clears_on_error(
+    model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    port, create = model_rig
+    controller = create()
+    assert controller.freeSpaceText == "свободно на диске 42,1 ГБ"
+    changes = QSignalSpy(controller.freeSpaceTextChanged)
+    monkeypatch.setattr(port, "free_bytes", Mock(side_effect=error))
+    controller.toggleModel(port.entry.id)
+    assert controller.freeSpaceText == ""
+    assert len(changes) == 1
+    assert create().freeSpaceText == ""
+
+
+def test_free_space_text_without_catalog_or_optional_port_method(
+    model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, create = model_rig
+    assert create(None).freeSpaceText == ""
+    monkeypatch.delattr(FakeModelPort, "free_bytes")
+    assert create().freeSpaceText == ""
+
+
+@pytest.mark.parametrize("via_settings", [False, True])
+@pytest.mark.parametrize("service_store", [False, True])
+def test_open_models_folder_uses_store_root_and_injected_opener(
+    shared_downloads: SharedDownloadsRig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    desktop_opener: Mock,
+    via_settings: bool,
+    service_store: bool,
+) -> None:
+    rig = shared_downloads
+    store = ModelStore(tmp_path / "SECRET models #1")
+    store.root.mkdir()
+    if service_store:
+        monkeypatch.setattr(rig.port, "_store", store, raising=False)
+    else:
+        rig.downloads._store = store
+    target = rig.bridge if via_settings else rig.controller
+    opener = Mock(return_value=True)
+    monkeypatch.setattr(target, "_open_url", opener)
+    target.openModelsFolder()
+    opener.assert_called_once_with(QUrl.fromLocalFile(str(store.root)))
+    assert opener.call_args.args[0].toLocalFile() == str(store.root)
+    desktop_opener.assert_not_called()
+    meta = target.metaObject()
+    for index in range(meta.propertyOffset(), meta.propertyCount()):
+        prop = meta.property(index)
+        if prop.typeName() == "QString":
+            assert str(store.root) not in prop.read(target)
+
+
+@pytest.mark.parametrize("via_settings", [False, True])
+def test_open_models_folder_default_opener_is_replaceable(
+    shared_downloads: SharedDownloadsRig, tmp_path: Path, desktop_opener: Mock, via_settings: bool
+) -> None:
+    rig = shared_downloads
+    rig.downloads._store = ModelStore(tmp_path)
+    target = rig.bridge if via_settings else rig.controller
+    target.openModelsFolder()
+    desktop_opener.assert_called_once_with(QUrl.fromLocalFile(str(tmp_path)))
+
+
+@pytest.mark.parametrize("via_settings", [False, True])
+@pytest.mark.parametrize("unavailable", ["no-store", "missing", "file", "os-error", "store-error"])
+def test_open_models_folder_unavailable_is_private_noop(
+    shared_downloads: SharedDownloadsRig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    desktop_opener: Mock,
+    via_settings: bool,
+    unavailable: str,
+) -> None:
+    rig = shared_downloads
+    root = tmp_path / "SECRET models"
+    if unavailable != "no-store":
+        rig.downloads._store = ModelStore(root)
+    if unavailable == "file":
+        root.write_text("not a directory")
+    if unavailable in {"os-error", "store-error"}:
+        error = (
+            OSError(f"SECRET {root}") if unavailable == "os-error" else StoreError("broken-store")
+        )
+        monkeypatch.setattr(Path, "is_dir", Mock(side_effect=error))
+    target = rig.bridge if via_settings else rig.controller
+    with caplog.at_level(logging.DEBUG, logger="astra_voice.ui.bridges"):
+        target.openModelsFolder()
+    desktop_opener.assert_not_called()
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.DEBUG
+    assert caplog.records[0].exc_info is None
+    assert "SECRET" not in caplog.text and str(tmp_path) not in caplog.text
+    if unavailable == "missing":
+        assert not root.exists()
+
+
+def test_settings_new_members_without_downloads(desktop_opener: Mock) -> None:
+    bridge = SettingsBridge(Settings(), save=Mock())
+    assert bridge.downloadDetail == bridge.activeModelMessage == ""
+    assert not bridge.canInstall
+    bridge.installRecommendedModel()
+    bridge.openModelsFolder()
+    desktop_opener.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "state", ["idle", "downloading", "verifying", "done", "failed", "no-space"]
+)
+def test_download_detail_only_in_no_space(
+    shared_downloads: SharedDownloadsRig, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    rig = shared_downloads
+    missing = Mock(return_value=125_999_999)
+    monkeypatch.setattr(rig.port, "disk_missing_bytes", missing)
+    rig.downloads._no_space_size_bytes = rig.port.second.size_bytes
+    rig.downloads._set_download_state(state)
+    expected = "нужно ещё 126 МБ" if state == "no-space" else ""
+    assert rig.bridge.downloadDetail == rig.controller.downloadDetail == expected
+    if state == "no-space":
+        missing.assert_called_once_with(rig.port.second.size_bytes)
+    else:
+        missing.assert_not_called()
+
+
+def test_download_detail_tracks_failed_entry_and_clears_on_retry(
+    shared_downloads: SharedDownloadsRig,
+) -> None:
+    rig = shared_downloads
+    rig.port.available_bytes = 234_000_001
+    rig.controller.toggleModel(rig.port.second.id)
+    settings_changes = QSignalSpy(rig.bridge.downloadDetailChanged)
+    wizard_changes = QSignalSpy(rig.controller.downloadDetailChanged)
+    details: list[tuple[str, str]] = []
+    rig.bridge.downloadDetailChanged.connect(
+        lambda: details.append((rig.bridge.downloadState, rig.bridge.downloadDetail))
+    )
+    finished = QSignalSpy(rig.downloads.queueFinished)
+    rig.controller.startSelectedDownloads()
+    assert finished.wait(1000)
+    assert rig.bridge.downloadState == "no-space"
+    assert rig.bridge.downloadDetail == rig.controller.downloadDetail == "нужно ещё 126 МБ"
+    assert details == [("no-space", "нужно ещё 126 МБ")]
+    rig.port.available_bytes = 1_000_000_000
+    rig.port.releases[rig.port.second.id].set()
+    rig.controller.retryModel(rig.port.second.id)
+    assert rig.bridge.downloadDetail == rig.controller.downloadDetail == ""
+    assert finished.wait(1000)
+    assert rig.bridge.downloadState == "done"
+    assert len(settings_changes) == len(wizard_changes) == 2
+
+
+@pytest.mark.parametrize("missing", ["method", "os-error", "store-error"])
+def test_download_detail_unavailable_is_empty(
+    shared_downloads: SharedDownloadsRig, monkeypatch: pytest.MonkeyPatch, missing: str
+) -> None:
+    rig = shared_downloads
+    if missing == "method":
+        monkeypatch.setattr(rig.port, "disk_missing_bytes", None)
+    else:
+        error = OSError("SECRET") if missing == "os-error" else StoreError("broken-store")
+        monkeypatch.setattr(rig.port, "disk_missing_bytes", Mock(side_effect=error))
+    rig.downloads._set_download_state("no-space")
+    assert rig.bridge.downloadDetail == rig.controller.downloadDetail == ""
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ("none", ""),
+        ("ok", ""),
+        ("broken", "Файлы модели повреждены. Переустановите модель"),
+        ("failed", "Не удалось загрузить модель"),
+        ("no-space", "Не хватает места на диске"),
+        ("catalog-unavailable", "Не удалось проверить список моделей"),
+        ("downloading", ""),
+        ("verifying", ""),
+    ],
+)
+def test_active_model_message_all_states(
+    shared_downloads: SharedDownloadsRig, state: str, expected: str
+) -> None:
+    rig = shared_downloads
+    entry = rig.port.entry
+    if state != "none":
+        rig.port.records[(entry.id, entry.revision)] = "ok" if state == "ok" else "broken"
+    if state == "catalog-unavailable":
+        store = Mock(spec=ModelStore)
+        store.current.return_value = entry
+        rig.downloads._store = store
+        rig.downloads._model = None
+    elif state in {"downloading", "verifying", "failed", "no-space"}:
+        rig.downloads._set_card(entry, state)
+    assert rig.bridge.activeModelState == state
+    assert rig.bridge.activeModelMessage == expected
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "none",
+        "catalog",
+        "entries",
+        "recommendation",
+        "installed",
+        "broken",
+        "queue",
+        "recheck",
+        "thread",
+        "shutdown",
+    ],
+)
+def test_can_install_and_recommended_slot_guards(
+    shared_downloads: SharedDownloadsRig, monkeypatch: pytest.MonkeyPatch, blocker: str
+) -> None:
+    rig = shared_downloads
+    with monkeypatch.context() as patch:
+        if blocker == "catalog":
+            patch.setattr(rig.downloads, "_model", None)
+        elif blocker == "entries":
+            patch.setattr(rig.downloads, "_entries", ())
+        elif blocker == "recommendation":
+            patch.setattr(rig.downloads, "_entry", None)
+        elif blocker in {"installed", "broken"}:
+            # Запись без current тоже показывается как активная в настройках.
+            rig.port.records[(rig.port.second.id, rig.port.second.revision)] = (
+                "ok" if blocker == "installed" else "broken"
+            )
+        elif blocker in {"queue", "recheck", "shutdown"}:
+            name = {
+                "queue": "_queue_running",
+                "recheck": "_rechecking",
+                "shutdown": "_shutting_down",
+            }
+            patch.setattr(rig.downloads, name[blocker], True)
+        elif blocker == "thread":
+            patch.setattr(rig.downloads, "_model_thread", Mock())
+        begin = Mock()
+        patch.setattr(rig.downloads, "_begin_queue", begin)
+        assert rig.bridge.canInstall is (blocker == "none")
+        rig.bridge.installRecommendedModel()
+        if blocker == "none":
+            begin.assert_called_once_with((rig.port.entry,))
+        else:
+            begin.assert_not_called()
+
+
+def test_install_recommended_uses_shared_queue_and_notifies(
+    shared_downloads: SharedDownloadsRig,
+) -> None:
+    rig = shared_downloads
+    rig.controller.toggleModel(rig.port.second.id)
+    assert rig.bridge.canInstall
+    states: list[bool] = []
+    rig.bridge.activeModelStateChanged.connect(lambda: states.append(rig.bridge.canInstall))
+    finished = QSignalSpy(rig.downloads.queueFinished)
+    rig.bridge.installRecommendedModel()
+    assert not rig.bridge.canInstall
+    assert rig.downloads._queue_entries == (rig.port.entry,)
+    assert rig.controller.downloadState == rig.bridge.downloadState == "downloading"
+    rig.bridge.installRecommendedModel()
+    rig.port.releases[rig.port.entry.id].set()
+    assert finished.wait(1000)
+    assert rig.port.visits == rig.port.installs == [rig.port.entry.id]
+    assert not rig.bridge.canInstall
+    assert states and all(value is False for value in states)
+    assert rig.bridge.activeModelState == "ok"
+
+
+def test_can_install_returns_after_failed_download(shared_downloads: SharedDownloadsRig) -> None:
+    rig = shared_downloads
+    rig.port.errors[rig.port.entry.id] = DownloadError("bad-path")
+    states: list[bool] = []
+    rig.bridge.activeModelStateChanged.connect(lambda: states.append(rig.bridge.canInstall))
+    finished = QSignalSpy(rig.downloads.queueFinished)
+    rig.bridge.installRecommendedModel()
+    rig.port.releases[rig.port.entry.id].set()
+    assert finished.wait(1000)
+    assert rig.bridge.canInstall
+    assert states[0] is False and states[-1] is True
+
+
+def test_added_screen_members_have_readonly_qt_contract(
+    shared_downloads: SharedDownloadsRig,
+) -> None:
+    rig = shared_downloads
+    for target, properties, slots in (
+        (
+            rig.controller,
+            {
+                "freeSpaceText": ("QString", "freeSpaceTextChanged"),
+                "downloadDetail": ("QString", "downloadDetailChanged"),
+            },
+            (b"openModelsFolder()",),
+        ),
+        (
+            rig.bridge,
+            {
+                "downloadDetail": ("QString", "downloadDetailChanged"),
+                "activeModelMessage": ("QString", "activeModelStateChanged"),
+                "canInstall": ("bool", "activeModelStateChanged"),
+            },
+            (b"openModelsFolder()", b"installRecommendedModel()"),
+        ),
+    ):
+        meta = target.metaObject()
+        for name, (type_name, signal) in properties.items():
+            prop = meta.property(meta.indexOfProperty(name))
+            assert prop.isValid() and not prop.isWritable()
+            assert prop.typeName() == type_name
+            assert bytes(prop.notifySignal().name()).decode() == signal
+        for slot in slots:
+            assert meta.indexOfSlot(slot) >= 0
+
+
+def test_free_space_text_handles_service_disk_usage_error(
+    model_rig: ModelRig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port, create = model_rig
+    service = ModelService.__new__(ModelService)
+    service._store = ModelStore(tmp_path / "models")
+    monkeypatch.setattr(port, "free_bytes", service.free_bytes)
+    usage = Mock(side_effect=OSError("SECRET /disk"))
+    monkeypatch.setattr("astra_voice.ui.bridges.shutil.disk_usage", usage)
+    controller = create()
+    assert controller.freeSpaceText == ""
+    usage.assert_called_once_with(tmp_path)
+    assert not service._store.root.exists()

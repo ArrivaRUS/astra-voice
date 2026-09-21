@@ -59,14 +59,15 @@ def test_pulseaudio_processes_read_race(
 ) -> None:
     write_process(tmp_path, 101, "pulseaudio", 12345)
     write_process(tmp_path, 102, "pulseaudio", 67890)
-    read_text = Path.read_text
+    # Подменяем то, чем сторож читает на самом деле: os.open, а не Path.read_text.
+    os_open = os.open
 
-    def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+    def open_file(path: Path, flags: int, /, *args: object, **kwargs: object) -> int:
         if path == tmp_path / "101" / filename:
             raise error("процесс исчез или недоступен")
-        return read_text(path, encoding=encoding, errors=errors)
+        return os_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(guard.os, "open", open_file)
     assert guard.pulseaudio_processes(tmp_path) == {(102, 67890)}
 
 
@@ -114,7 +115,8 @@ def test_pulseaudio_processes_new_or_reused_pid(
     message = str(failure.value)
     assert f"процессов pulseaudio: {len(after - {(101, 10)})}" in message
     assert f"pid: {pids}." in message
-    assert "Тест поднял настоящий pulseaudio, изоляция звука пробита" in message
+    assert "Процесс мог быть запущен пользователем или другой программой" in message
+    assert "Проверьте изоляцию звука в тесте" in message
     assert "PULSE_CLIENTCONFIG/PULSE_SERVER" in message
 
 
@@ -157,11 +159,11 @@ def test_audio_isolation_environment(
             # Изменения предыдущего теста исправляются до следующего setup.
             os.environ["PULSE_CLIENTCONFIG"] = "неверное значение"
             os.environ.pop("PULSE_SERVER")
-            guard.pytest_runtest_setup(Mock(config=config))
+            guard.pytest_runtest_setup(Mock(config=config, stash=pytest.Stash()))
             assert {name: os.environ[name] for name in original} == expected
         finally:
             fixture.close()
-        assert snapshot.call_count == 2
+        assert snapshot.call_count == 3
     finally:
         guard.pytest_unconfigure(config)
     assert {name: os.environ.get(name) for name in original} == original
@@ -184,6 +186,95 @@ def test_audio_isolation_guard_uses_snapshot_before_collection(
         assert snapshot.call_count == 2
     finally:
         guard.pytest_unconfigure(config)
+
+
+def test_audio_guard_without_configure(guard: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(guard, "pulseaudio_processes", lambda: set())
+    config = Mock(stash=pytest.Stash())
+    item = Mock(config=config, stash=pytest.Stash(), nodeid="test_plain.py::test_plain")
+    original = {name: os.environ.get(name) for name in ("PULSE_CLIENTCONFIG", "PULSE_SERVER")}
+    guard.pytest_runtest_setup(item)
+    fixture = guard.audio_isolation.__wrapped__(config)
+    next(fixture)
+    teardown = guard.pytest_runtest_teardown(item)
+    next(teardown)
+    with pytest.raises(StopIteration):
+        next(teardown)
+    fixture.close()
+    guard.pytest_unconfigure(config)
+    assert {name: os.environ.get(name) for name in original} == original
+
+
+@pytest.mark.parametrize("phase", ["call", "teardown"])
+def test_audio_guard_reports_transient_process_in_session(
+    guard: ModuleType, tmp_path: Path, phase: str
+) -> None:
+    """ИБ-24: подставной /proc меняется в настоящей pytest-сессии, без демона."""
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    write_process(proc_root, 101, "pulseaudio", 10)
+    # Запись нового процесса заранее готова, но попадёт в /proc только внутри теста.
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    write_process(staging, 202, "pulseaudio", 20)
+    (tmp_path / "conftest.py").write_text(
+        GUARD_PATH.read_text(encoding="utf-8")
+        + "\n_original_pulseaudio_processes = pulseaudio_processes\n"
+        + "def pulseaudio_processes():\n"
+        + f"    return _original_pulseaudio_processes(Path({str(proc_root)!r}))\n"
+        + "def qt_available():\n    return True\n"
+        + "def run_qt_environment_probe():\n    return None\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (tmp_path / "test_pulse.py").write_text(
+        "import shutil\n"
+        "from pathlib import Path\n"
+        "import pytest\n"
+        f"proc = Path({str(proc_root)!r})\n"
+        f"staged = Path({str(staging / '202')!r})\n"
+        "@pytest.fixture\n"
+        "def cleanup():\n"
+        "    yield\n"
+        + (
+            "    shutil.rmtree(proc / '202')\n"
+            if phase == "call"
+            else "    staged.rename(proc / '202')\n"
+        )
+        + "def test_before():\n"
+        "    assert not (proc / '202').exists()\n"
+        "def test_spawns_pulse(cleanup):\n"
+        + ("    staged.rename(proc / '202')\n" if phase == "call" else "    pass\n")
+        + "def test_after():\n"
+        + (
+            "    assert not (proc / '202').exists()\n"
+            if phase == "call"
+            else "    shutil.rmtree(proc / '202')\n"
+        ),
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.pop("PYTEST_ADDOPTS", None)
+    env.pop("ASTRA_VOICE_REQUIRE_QT", None)
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == pytest.ExitCode.TESTS_FAILED, output
+    assert "3 passed, 1 error" in output
+    assert "ERROR test_pulse.py::test_spawns_pulse" in output
+    assert "Во время теста test_pulse.py::test_spawns_pulse" in output
+    assert "pid: 202." in output
+    assert "Процесс мог быть запущен пользователем или другой программой" in output
+    assert "Проверьте изоляцию звука в тесте" in output
+    assert "KeyError" not in output
+    assert guard.pulseaudio_processes(proc_root) == {(101, 10)}
 
 
 @pytest.mark.parametrize(

@@ -37,6 +37,7 @@ class ModelRecord:
     state: ModelState = "ok"
     reason: str = ""
     recheck: bool = False
+    metadata_ok: bool = True
 
 
 class StoreError(Exception):
@@ -52,6 +53,9 @@ class StoreError(Exception):
             "not-found": "Ревизия модели не найдена.",
             "disk-full": "На диске недостаточно места.",
             "broken-store": "Не удалось обратиться к хранилищу моделей.",
+            "invalid-metadata": (
+                "Метаданные модели недоступны или неполны. Модель нужно переустановить."
+            ),
         }.get(code, "Ошибка хранилища моделей.")
         super().__init__(self.message)
 
@@ -252,12 +256,14 @@ class ModelStore:
             return None
         return model_id, revision
 
-    def _record(self, model_id: str, revision: str, directory: Path) -> ModelRecord:
+    def _record(
+        self, model_id: str, revision: str, directory: Path, *, migrate_legacy: bool = True
+    ) -> ModelRecord:
         try:
             state_path = self._state_path(model_id, revision)
             legacy = directory / "state.json"
             try:
-                if not legacy.is_symlink() and legacy.is_file():
+                if migrate_legacy and not legacy.is_symlink() and legacy.is_file():
                     if state_path.exists():
                         legacy.unlink()
                     else:
@@ -279,6 +285,8 @@ class ModelStore:
             except OSError as exc:
                 log.warning("Не удалось перенести состояние ревизии из %s: %s", legacy, exc)
                 raise
+            if not migrate_legacy and not state_path.exists() and not legacy.is_symlink():
+                state_path = legacy
             data = _read_json(state_path)
             layout, variant, size = _metadata(data)
             state, reason = data.get("state"), data.get("reason", "")
@@ -304,7 +312,9 @@ class ModelStore:
             reason = "Отсутствует файл состояния модели (state.json)."
         except (OSError, ValueError, StoreError, RecursionError):
             reason = "Файл состояния модели (state.json) повреждён или недоступен."
-        return ModelRecord(model_id, revision, directory, "", "", 0, "broken", reason)
+        return ModelRecord(
+            model_id, revision, directory, "", "", 0, "broken", reason, metadata_ok=False
+        )
 
     def current(self) -> ModelRecord | None:
         """Возвращает текущую исправную ревизию; порча указателя не мешает старту."""
@@ -316,7 +326,11 @@ class ModelStore:
             record = self._record(*ids, directory)
         except (OSError, StoreError):
             return None
-        return record if record.state == "ok" else None
+        return (
+            record
+            if record.state == "ok" and record.recheck is not True and record.metadata_ok
+            else None
+        )
 
     def _directories(self) -> Iterator[tuple[str, Path]]:
         if not self.root.exists():
@@ -376,9 +390,11 @@ class ModelStore:
         """
         with _store_errors():
             directory = self._installed(model_id, revision)
-            record = replace(
-                self._record(model_id, revision, directory), state="ok", reason="", recheck=False
-            )
+            # Отказ не должен менять даже старую раскладку файла состояния.
+            record = self._record(model_id, revision, directory, migrate_legacy=False)
+            if not record.metadata_ok or not record.layout or not record.variant:
+                raise StoreError("invalid-metadata")
+            record = replace(record, state="ok", reason="", recheck=False)
             _write_json(self._state_path(model_id, revision), _state_data(record))
 
     def disk_ok(self, size_bytes: int) -> bool:

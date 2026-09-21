@@ -58,6 +58,72 @@ def test_good_workflow_passes(tmp_path: Path) -> None:
     assert ci_lint.check_workflow(_write(tmp_path, GOOD)) == []
 
 
+@pytest.mark.parametrize("event", ["push", "pull_request"])
+@pytest.mark.parametrize("pattern", ["src/**", "**.md", "docs/**", "tests/**", "*"])
+def test_paths_ignore_extra_pattern_rejected(tmp_path: Path, event: str, pattern: str) -> None:
+    text = GOOD.replace(
+        "  push:\n    branches: [main]",
+        f"  {event}:\n    paths-ignore:\n      - 'HEARTBEAT.md'\n      - '{pattern}'",
+    )
+    problems = ci_lint.check_workflow(_write(tmp_path, text))
+    assert len(problems) == 1
+    assert f"on.{event}.paths-ignore" in problems[0]
+    assert repr(pattern) in problems[0]
+    assert "вне белого списка" in problems[0]
+
+
+def test_paths_ignore_allowlist_passes(tmp_path: Path) -> None:
+    patterns = (
+        "HEARTBEAT.md",
+        "decisions/**",
+        ".patches/**",
+        "research/**",
+        "docs/status.md",
+        "docs/plans.md",
+        "docs/test-plan.md",
+    )
+    text = GOOD.replace(
+        "    branches: [main]",
+        "    paths-ignore:\n" + "\n".join(f"      - '{pattern}'" for pattern in patterns),
+    )
+    assert ci_lint.check_workflow(_write(tmp_path, text)) == []
+
+
+@pytest.mark.parametrize("ignored", ["'src/**'", "null", "[null]", "[{src: '**'}]"])
+def test_paths_ignore_invalid_type_rejected(tmp_path: Path, ignored: str) -> None:
+    text = GOOD.replace("    branches: [main]", f"    paths-ignore: {ignored}")
+    problems = ci_lint.check_workflow(_write(tmp_path, text))
+    assert len(problems) == 1
+    assert "paths-ignore" in problems[0]
+
+
+@pytest.mark.parametrize(
+    "needs", ["", "    needs: [lint, unit, deb]\n", "    needs: engine-extra\n"]
+)
+def test_release_needs_engine(tmp_path: Path, needs: str) -> None:
+    text = GOOD.replace(
+        "  unit:\n",
+        "  release:\n"
+        "    if: startsWith(github.ref, 'refs/tags/v')\n"
+        "    environment: release\n" + needs,
+    )
+    problems = ci_lint.check_workflow(_write(tmp_path, text))
+    assert len(problems) == 1
+    assert "release" in problems[0] and "needs" in problems[0] and "engine" in problems[0]
+
+
+@pytest.mark.parametrize("needs", ["engine", "[lint, engine, unit]"])
+def test_release_with_engine_passes(tmp_path: Path, needs: str) -> None:
+    text = GOOD.replace(
+        "  unit:\n",
+        "  release:\n"
+        "    if: startsWith(github.ref, 'refs/tags/v')\n"
+        "    environment: release\n"
+        f"    needs: {needs}\n",
+    )
+    assert ci_lint.check_workflow(_write(tmp_path, text)) == []
+
+
 def test_pull_request_target_rejected(tmp_path: Path) -> None:
     text = GOOD.replace("  push:\n    branches: [main]", "  pull_request_target:")
     problems = ci_lint.check_workflow(_write(tmp_path, text))

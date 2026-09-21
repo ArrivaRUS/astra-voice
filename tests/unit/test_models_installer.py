@@ -16,7 +16,7 @@ import pytest
 from astra_voice.core.model_request import build_model_load
 from astra_voice.models import installer as inst
 from astra_voice.models.catalog import Catalog, CatalogEntry, FileSpec, RevokedEntry
-from astra_voice.models.installer import Installer, SmokeResult
+from astra_voice.models.installer import Installer, SmokeResult, verify_installed
 from astra_voice.models.store import ModelRecord, ModelStore, StoreError
 from astra_voice.worker import ipc
 
@@ -94,6 +94,62 @@ def _flip_byte(file: Path) -> None:
 def _pointer(store: ModelStore) -> bytes | None:
     path = store.root / "current.json"
     return path.read_bytes() if path.exists() else None
+
+
+def test_verify_installed_accepts_complete_model(
+    tmp_path: Path, entry: CatalogEntry, contents: dict[str, bytes]
+) -> None:
+    directory = _write_files(tmp_path / "installed", contents)
+
+    assert verify_installed(directory, entry) == (True, "")
+
+
+@pytest.mark.parametrize(
+    ("damage", "reason"),
+    [
+        ("extra", "В папке есть лишние файлы. Оставьте только файлы выбранной модели."),
+        ("part", "В папке есть лишние файлы. Оставьте только файлы выбранной модели."),
+        ("missing", "В папке не хватает файлов модели. Получите их заново."),
+        (
+            "checksum",
+            "Файлы модели повреждены: контрольная сумма не совпала. Получите их заново.",
+        ),
+        ("size", "Файлы модели повреждены: контрольная сумма не совпала. Получите их заново."),
+        ("layout", "Файлы в папке не подходят для выбранной модели."),
+        ("variant", "Файлы в папке не подходят для выбранной модели."),
+        ("missing-required", "В папке не хватает файлов модели. Получите их заново."),
+        ("extra-listed", "Файлы в папке не подходят для выбранной модели."),
+    ],
+)
+def test_verify_installed_rejects_invalid_model(
+    tmp_path: Path, entry: CatalogEntry, contents: dict[str, bytes], damage: str, reason: str
+) -> None:
+    directory = _write_files(tmp_path / "installed", contents)
+    first = directory / entry.files[0].path
+    if damage in {"extra", "part", "extra-listed"}:
+        name = "unexpected.part" if damage == "part" else "unexpected.bin"
+        (directory / name).write_bytes(b"extra")
+        if damage == "extra-listed":
+            extra = FileSpec(name, hashlib.sha256(b"extra").hexdigest(), 5, "/extra")
+            entry = replace(entry, files=(*entry.files, extra))
+    elif damage == "missing":
+        first.unlink()
+    elif damage == "checksum":
+        _flip_byte(first)
+    elif damage == "size":
+        # Хеш совпадает: отказ должен дать именно размер из каталога.
+        spec = replace(entry.files[0], size=entry.files[0].size + 1)
+        entry = replace(entry, files=(spec, *entry.files[1:]))
+    elif damage == "layout":
+        entry = replace(entry, layout="unknown-layout")
+    elif damage == "variant":
+        entry = replace(entry, variant="unknown-variant")
+    else:
+        # Состав и суммы совпадают с каталогом, но раскладка требует config.json.
+        (directory / entry.files[-1].path).unlink()
+        entry = replace(entry, files=entry.files[:-1])
+
+    assert verify_installed(directory, entry) == (False, reason)
 
 
 def test_success_obeys_o2_order(

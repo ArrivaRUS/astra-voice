@@ -6,6 +6,28 @@ import math
 from collections import deque
 
 
+def clean_display_name(text: str, *, limit: int = 80, for_menu: bool = False) -> str:
+    """Ограничить видимое имя; для QAction экранировать мнемоники после обрезки."""
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = "".join(
+        char
+        for char in text
+        if not (
+            ord(char) < 32
+            or 127 <= ord(char) <= 159
+            or "\u202a" <= char <= "\u202e"
+            or "\u2066" <= char <= "\u2069"
+            or char in "\u200e\u200f"
+        )
+    )
+    text = " ".join(text.split())
+    if limit <= 0:
+        return ""
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    return text.replace("&", "&&") if for_menu else text
+
+
 def _is_finite_number(value: object) -> bool:
     """Проверить, что значение — конечное число, а не логический признак."""
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
@@ -50,6 +72,15 @@ def format_size(size_bytes: float, *, round_up: bool = False) -> str:
         return ""
     value = size_bytes / 1_000_000
     return f"{math.ceil(value) if round_up else value:.0f} МБ"
+
+
+def format_space(size_bytes: float) -> str:
+    """Описать свободное место в десятичных гигабайтах или целых мегабайтах."""
+    if not _is_finite_number(size_bytes) or size_bytes < 0:
+        return ""
+    if size_bytes >= 1_000_000_000:
+        return f"{size_bytes / 1_000_000_000:.1f} ГБ".replace(".", ",")
+    return format_size(size_bytes)
 
 
 class SpeedTracker:

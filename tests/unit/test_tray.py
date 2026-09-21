@@ -1361,13 +1361,61 @@ def test_download_status_menu_item(harness: Harness) -> None:
     assert actions[2:] == original[1:]
     assert download.text() == "Загружается GigaAM v3 — 42%"
     assert download.isVisible() and not download.isEnabled()
+    harness.icon.setToolTip.assert_called_with("Astra Voice — загружается модель")
     harness.tray.set_download_status("Загружается GigaAM v3 — 80%")
     harness.tray.set_state(TrayState.LISTENING)
+    harness.icon.setToolTip.assert_called_with("Astra Voice — загружается модель")
     assert harness.menu.actions() == actions
     assert download.text() == "Загружается GigaAM v3 — 80%"
     harness.tray.set_download_status("")
+    harness.icon.setToolTip.assert_called_with("tip:listening:Alt+F9")
     assert not download.isVisible()
     assert harness.menu.actions() == original
     harness.tray.set_download_status("Проверяю модель… — 100%")
     assert harness.menu.actions()[1] is download
     assert download.isVisible() and not download.isEnabled()
+
+
+def test_download_name_from_catalog_is_safe_in_menu_and_qml(harness: Harness) -> None:
+    from astra_voice.core.settings import Settings
+    from astra_voice.models.catalog import CatalogEntry
+    from astra_voice.ui.bridges import ModelDownloads, SettingsBridge
+
+    name = "A&B\r\n\u202e\u2066\u200e\x00\x85" + "я" * 500
+    entry = CatalogEntry(
+        "model", "r1", name, "", 1_000_000, 1, "layout", "variant", True, "host", ()
+    )
+    port = Mock()
+    port.entries.return_value = (entry,)
+    port.recommended.return_value = entry
+    port.current_ids.return_value = (entry.id, entry.revision)
+    port.record_state.return_value = "ok"
+    downloads = ModelDownloads(port)
+    bridge = SettingsBridge(Settings(), downloads=downloads, save=Mock())
+    downloads._active_entry = entry
+    downloads._set_download_state("downloading")
+    harness.tray.set_download_status(downloads.status_text())
+    menu_text = harness.menu.actions()[1].text()
+    assert menu_text.startswith("Загружается A&&B ")
+    assert len(menu_text.replace("&&", "&")) <= 80
+    assert menu_text.endswith("…")
+    assert downloads.models[0]["name"] == bridge.activeModelName == downloads.modelName
+    for text in (downloads.models[0]["name"], bridge.activeModelName, downloads.downloadTitle):
+        assert "A&B" in text and "&&" not in text
+        assert len(text) <= 80 and text.endswith("…")
+    for text in (menu_text, downloads.models[0]["name"], downloads.downloadTitle):
+        assert not any(char in text for char in "\r\n\u202e\u2066\u200e\x00\x85")
+    harness.icon.setToolTip.assert_called_with("Astra Voice — загружается модель")
+    harness.tray.set_download_status("")
+    harness.tray.set_state(TrayState.IDLE, name)
+    tooltip = harness.icon.setToolTip.call_args.args[0]
+    assert tooltip == bridge.activeModelName
+
+
+@pytest.mark.parametrize("state", list(TrayState))
+def test_download_tooltip_restores_current_state(harness: Harness, state: TrayState) -> None:
+    harness.tray.set_download_status("Загружается модель — 10%")
+    harness.tray.set_state(state, "Временная подсказка")
+    harness.icon.setToolTip.assert_called_with("Astra Voice — загружается модель")
+    harness.tray.set_download_status("")
+    harness.icon.setToolTip.assert_called_with(f"tip:{state.value}:Alt+F9")
