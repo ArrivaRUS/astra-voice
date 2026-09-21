@@ -13,7 +13,12 @@ import pytest
 from astra_voice.core import paths
 from astra_voice.core.theme import ThemeSource
 from astra_voice.platform.session import SessionKind
-from astra_voice.ui.tray_icons import TrayIconProvider, TrayState, _fly_svg, find_tray_icon_path
+from astra_voice.ui.tray_icons import (
+    TrayIconProvider,
+    TrayState,
+    _explicit_svg,
+    find_tray_icon_path,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from helpers.qt_app import get_qapplication  # noqa: E402
@@ -142,13 +147,13 @@ def test_icons_load_from_installed_theme_or_mixed_directories(
 @pytest.mark.parametrize("state", list(TrayState))
 @pytest.mark.parametrize("size", [16, 22])
 @pytest.mark.parametrize(("dark", "color"), [(False, "#232629"), (True, "#eff0f1")])
-def test_fly_svg_changes_only_current_color(
+def test_explicit_svg_changes_only_current_color(
     state: TrayState, size: int, dark: bool, color: str
 ) -> None:
     name = TrayIconProvider(SessionKind.FLY).icon_name(state)
     path = DATA / "icons" / "hicolor" / f"{size}x{size}" / "status" / f"{name}.svg"
     source = path.read_text(encoding="utf-8")
-    result = _fly_svg(path, dark=dark).decode("utf-8")
+    result = _explicit_svg(path, dark=dark).decode("utf-8")
     assert "currentColor" in source
     assert "currentColor" not in result
     assert f'fill="{color}"' in result

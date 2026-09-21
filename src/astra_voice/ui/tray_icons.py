@@ -36,8 +36,17 @@ _TOOLTIPS = {
 }
 
 
-def _fly_svg(path: Path, *, dark: bool) -> bytes:
-    """Явные цвета знака из current-color-scheme; цвета состояний сохраняются."""
+def _explicit_svg(path: Path, *, dark: bool) -> bytes:
+    """Явные цвета знака вместо currentColor; цвета состояний сохраняются.
+
+    Файл рассчитан на перекраску оболочкой: цвет берётся из
+    `<style id="current-color-scheme">`, а тёмный вариант — из
+    `@media (prefers-color-scheme: dark)`. Когда значок грузится из файла
+    (оболочка не подставила свой из темы), ни того, ни другого не происходит:
+    Qt рендерит SVG Tiny и медиазапросы игнорирует, `currentColor` остаётся
+    неразрешённым. На тёмной панели знак тогда либо чёрный, либо пустой —
+    видно только то, что он нажимается. Поэтому цвет подставляем сами.
+    """
     color = "#eff0f1" if dark else "#232629"
     return path.read_text(encoding="utf-8").replace("currentColor", color).encode("utf-8")
 
@@ -83,7 +92,9 @@ class TrayIconProvider:
                 dark = self._theme.dark if self._theme is not None else False
                 for size in (16, 22):
                     path = find_tray_icon_path(name, size)
-                    data = _fly_svg(path, dark=dark) if fly else path.read_bytes()
+                    # Из файла — всегда с явным цветом: перекрашивать здесь
+                    # уже некому, в любой оболочке (У…, дефект тёмной панели).
+                    data = _explicit_svg(path, dark=dark)
                     pixmap = QPixmap()
                     if not pixmap.loadFromData(data, "SVG") or pixmap.isNull():
                         raise ValueError(f"SVG не даёт непустой значок: {path}")
