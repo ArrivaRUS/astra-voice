@@ -94,6 +94,11 @@ def main(argv: list[str] | None = None) -> int:
     _setup_sys_path(Path(__file__).resolve().parent)
 
     if command in ("app", "worker"):
+        from astra_voice.core.audio_env import deny_pulse_autospawn
+
+        # Журнал ещё не настроен: важнее успеть до импорта Qt и libpulse.
+        # Воркер повторит вызов после настройки журнала и запишет возможный сбой.
+        deny_pulse_autospawn()
         _harden(command)
     if command == "app":
         # Fly навязывает свой стиль через /etc/X11/Xsession.d/06-fly-misc-env,

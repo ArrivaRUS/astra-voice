@@ -15,6 +15,7 @@ from pathlib import Path
 from queue import Empty, SimpleQueue
 from typing import NoReturn
 
+from astra_voice.core.audio_env import deny_pulse_autospawn
 from astra_voice.core.logging import setup_logging
 from astra_voice.worker import ipc
 from astra_voice.worker.audio import CaptureStopTimeout
@@ -281,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     setup_logging(session_kind="WORKER")
+    deny_pulse_autospawn()
     if not harden_process(parent_pid):
         return 0
     apply_address_space_limit(None)

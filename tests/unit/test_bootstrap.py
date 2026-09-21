@@ -18,6 +18,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEV_BOOTSTRAP = REPO_ROOT / "src" / "astra_voice" / "bootstrap.py"
 
 
+@pytest.fixture(autouse=True)
+def isolated_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("CACHE", "CONFIG", "DATA", "STATE"):
+        monkeypatch.setenv(f"XDG_{name}_HOME", str(tmp_path / name.lower()))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
+
+
 def _run(script: Path, args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-I", str(script), *args],
@@ -47,6 +54,39 @@ def test_dev_layout_dispatches_worker_without_fd(
     proc = _run(DEV_BOOTSTRAP, ["worker"], cwd=tmp_path)
     assert proc.returncode == 2
     assert "astra-voice worker: требуется числовой IPC fd" in proc.stderr
+
+
+def test_worker_bootstrap_sets_pulse_clientconfig(tmp_path: Path) -> None:
+    script = tmp_path / "check_bootstrap.py"
+    script.write_text(
+        "import os, runpy\n"
+        "from pathlib import Path\n"
+        f"bootstrap = runpy.run_path({str(DEV_BOOTSTRAP)!r})\n"
+        "assert bootstrap['main'](['worker']) == 2\n"
+        "assert os.environ['PULSE_SERVER'] == 'unix:/nonexistent'\n"
+        "path = Path(os.environ['PULSE_CLIENTCONFIG'])\n"
+        "print(path)\n"
+        "print(path.read_text(encoding='utf-8'))\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.pop("PULSE_CLIENTCONFIG", None)
+    env.pop("ASTRA_VOICE_IPC_FD", None)
+    env["PULSE_SERVER"] = "unix:/nonexistent"
+    proc = subprocess.run(
+        [sys.executable, "-I", str(script)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    filename, content = proc.stdout.split("\n", 1)
+    path = Path(filename)
+    assert path.is_absolute() and path.is_relative_to(tmp_path)
+    assert path == tmp_path / "cache" / "astra-voice" / "pulse-client.conf"
+    assert "autospawn = no" in content
 
 
 def test_installed_layout_dispatches_helper_stub(tmp_path: Path) -> None:

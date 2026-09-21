@@ -35,6 +35,12 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture(autouse=True)
+def isolated_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+
+@pytest.fixture(autouse=True)
 def no_onnxruntime(monkeypatch: pytest.MonkeyPatch) -> None:
     """Запрещает реальный импорт ORT даже при установленном пакете."""
     monkeypatch.setitem(sys.modules, "onnxruntime", None)
@@ -96,9 +102,14 @@ def test_main_inherited_fd(monkeypatch: pytest.MonkeyPatch, use_env: bool) -> No
     connection, peer = socket.socketpair()
     fd = connection.detach()
     setup = Mock()
+    deny_autospawn = Mock()
+    startup = Mock()
+    startup.attach_mock(setup, "logging")
+    startup.attach_mock(deny_autospawn, "audio_env")
     harden = Mock(return_value=True)
     limit = Mock(return_value=worker_main.MIN_ADDRESS_SPACE)
     monkeypatch.setattr(worker_main, "setup_logging", setup)
+    monkeypatch.setattr(worker_main, "deny_pulse_autospawn", deny_autospawn)
     monkeypatch.setattr(worker_main, "harden_process", harden)
     monkeypatch.setattr(worker_main, "apply_address_space_limit", limit)
     monkeypatch.setenv("ASTRA_VOICE_IPC_FD", str(fd) if use_env else "не-число")
@@ -119,6 +130,8 @@ def test_main_inherited_fd(monkeypatch: pytest.MonkeyPatch, use_env: bool) -> No
     finally:
         peer.close()
     setup.assert_called_once_with(session_kind="WORKER")
+    deny_autospawn.assert_called_once_with()
+    assert startup.mock_calls == [call.logging(session_kind="WORKER"), call.audio_env()]
     harden.assert_called_once()
     limit.assert_called_once_with(None)
 
