@@ -76,7 +76,7 @@ def general_rows(mode_first=True, autostart="on", indicator="Пилюля сни
     ])
     g2 = group("Индикация", [
         row("Индикатор записи", sel(indicator, 236),
-            "Пилюля не забирает фокус и не появляется в Alt+Tab"),
+            "Показывает, что идёт запись"),
         row("Звук начала и конца записи", tgl(False)),
         row("Значок в системном трее",
             f'<span style="display:flex;gap:9px;align-items:center">'

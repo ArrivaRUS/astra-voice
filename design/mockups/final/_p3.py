@@ -252,7 +252,7 @@ def onb5_ready_body():
               'открывает настройки, правый — меню с отменой и выбором модели.</div></div>'
             + f'<div class="lvbox" style="margin-top:14px;justify-content:center;gap:14px;padding:14px">'
               f'{pill("listening")}<span class="c12" style="max-width:250px">Так выглядит запись: '
-              'пилюля у нижнего края экрана. Она не забирает фокус и не появляется в Alt+Tab.</span></div>'
+              'пилюля у нижнего края экрана.</span></div>'
             '</div>')
 
 
