@@ -307,11 +307,11 @@ R2 стек/фокус пилюли на KWin и fly-wm · R3/R4 `Ctrl+Space`, �
 - [x] `models/store.py`: `~/.local/share/astra-voice/models/<id>/<revision>/` + `current.json`, staging `<rev>.partial/`, `disk_usage ≥ size×1,2`, `MemTotal` vs `min_ram_mb`, размер на диске + unit tmpdir.
 - [x] `net/http.py` минимум (T1 У13, И5/И6): `requests.Session(trust_env=False)`, UA `astra-voice/X.Y.Z (+repo)`, CA `policy.ca_bundle or /etc/ssl/certs/ca-certificates.crt` + `SSL_CERT_FILE`, `allow_redirects=False` + ручные редиректы по allowlist ≤ 5, `stream=True` с общим deadline по `time.monotonic()` и `cancel` Event между чанками; гейт «сеть разрешена?» (явное «Скачать» разрешено при пустых тумблерах, запрещено при `offline`/policy/`HF_HUB_OFFLINE=1`); `HF_ENDPOINT` не учитывается (T-26).
 - [x] `models/downloader.py` минимум: один источник `hf` по `/resolve/{revision}/`, `.part`, `Range` только при 206 с корректным `Content-Range` (200 → сначала), инкрементальный sha256, обрыв на `size+1` **фактических** байт, `fsync`, `os.replace`, прогресс/скорость/ETA, отмена + unit на fault-server (206/200/обрыв/подмена/`size+1`/redirect-evil).
-- [~] `models/installer.py`: из папки/файла — те же sha256; порядок О2: скачать → sha256 → `rename` в `<rev>/` → смоук `transcribe.file` вшитого wav (`expect_any`) → `current.json` → `model.load`; провал смоука → `broken` в `state.json`, старая остаётся; незавершённая транзакция на старте → перепроверка + интеграционный тест «подменённый байт → откат».
+- [x] `models/installer.py`: из папки/файла — те же sha256; порядок О2: скачать → sha256 → `rename` в `<rev>/` → смоук `transcribe.file` вшитого wav (`expect_any`) → `current.json` → `model.load`; провал смоука → `broken` в `state.json`, старая остаётся; незавершённая транзакция на старте → перепроверка + интеграционный тест «подменённый байт → откат».
 - [x] `models/catalog.py` минимум + `catalog.schema.json` (поля PRD 0.5 §7.3 с `serial`/`trust_epoch`/`revoked[]`): встроенный `data/catalog.json` с одной записью `gigaam-v3-e2e-rnnt-int8` (`files[]` из S3) + `catalog.json.sig` (S1) → `Verifier(catalog)`; валидатор путей (У6: regex `id`/`revision`, `path` относительный без `..`/NUL, `realpath` внутри staging) — T-09.
-- [~] Шаг 2: карточка рекомендованной модели (состояния 7 · 3 · 5 · 1 · 17 · 18 спеки §5.4), «Скачать» показывает хост и объём (226 МБ), «Установить из файла/папки…» (`QFileDialog`) — референсы `08-onboarding-2-model.png`, `02-models-file-dialogs.png`; нет сети → состояние 14 «Нет доступа к huggingface.co».
+- [x] Шаг 2: карточка рекомендованной модели (состояния 7 · 3 · 5 · 1 · 17 · 18 спеки §5.4), «Скачать» показывает хост и объём (226 МБ), «Установить из файла/папки…» (`QFileDialog`) — референсы `08-onboarding-2-model.png`, `02-models-file-dialogs.png`; нет сети → состояние 14 «Нет доступа к huggingface.co».
 - [x] Шаг 3 + строка «Горячая клавиша» в «Общих»: поле захвата 7 состояний спеки §7 (`idle · capturing · captured · success · conflict · duplicate · not-grabbed`), `XGrabKeyboard` только пока открыто; сегмент «удерживать / нажать-нажать» — референсы `08-onboarding-3-hotkey.png`, `01-general-hotkey.png`.
-- [~] Шаг 4: выбор устройства, живой уровень, «Сказать тестовую фразу» → текст на экране **без вставки** (S1-A5) — референсы `08-onboarding-4-mic.png`, `01-general-mic.png`.
+- [x] Шаг 4: выбор устройства, живой уровень, «Сказать тестовую фразу» → текст на экране **без вставки** (S1-A5) — референсы `08-onboarding-4-mic.png`, `01-general-mic.png`.
 - [x] Шаг 5 «Готово»: в v0.1 без автозапуска (тумблер появится в M9), уведомление «Astra Voice готов: зажмите <хоткей> и говорите», окно → трей, флаг `onboarding_done`; закрытие окна на середине → следующий запуск с первого незавершённого шага (спека §10).
 - [~] Диалог подтверждения §11.1 как компонент — референс `10-dialogs.png` (+`-dark`).
 - [x] `tools/validate downloads --faults`, `tools/validate privacy --network-denied` (минимум: гейт + `tcpdump`-обёртка).
@@ -359,6 +359,19 @@ rm -rf ~/.config/astra-voice ~/.local/share/astra-voice ~/.local/state/astra-voi
 sudo tcpdump -nn -i any 'tcp[13]&2!=0 and not host 127.0.0.1' -w /tmp/s1.pcap & astra-voice     # до «Скачать» — 0 SYN
 tools/validate downloads --faults && tools/validate privacy --network-denied
 ```
+**2026-09-21 — доводка M5 (после живой проверки у заказчика, всё в `main`):** шаг «Модель» переделан под решение
+заказчика (карточка = выбор, загрузка по «Продолжить», множественный выбор, рабочая = первая установленная);
+сквозная полоска загрузки на шагах 2–5 (5 состояний, «считаю…», время без секунд); шаг 4 разделён (проверка
+микрофона без модели, тестовая диктовка только при `modelReady`, потолок эпизода 180 с и остановка при скрытом
+окне — ИБ У62); строка модели в «Общих» с «Переустановить»/«Установить»/«Отмена»; перепроверка модели, помеченной
+сломанной старым установщиком; запрет автозапуска `pulseaudio` (`core/audio_env.py`); журнал «Запрос к <хост>»
+вместо перехвата трафика (на машине с туннелем перехват бесполезен). Проверки: ревью кода (2 MAJOR + 10 minor) и
+ИБ T2 (M1/У62 + У63–У69) закрыты. **Находки второй машины:** установка без `python3-jsonschema` (проверка схемы за
+фасадом `models/schema.py`, пакет в `Recommends`, `require_schema=True` для чужого каталога в M6); значок трея не
+отрисовывался на тёмной панели (явный цвет при загрузке из файла). Собран `0.1.0~m5.4`.
+**Осталось до закрытия M5:** живая проверка `m5.4` у заказчика по новым экранам; строки ИБ-28/ИБ-29 в `test-plan`;
+хвосты качества (property-шимы `ModelDownloads`, размер `bridges.py`, автосверка `docs/ui-bridge.md` с метаобъектом).
+
 ### Known Risks
 R6 HF недоступен из РФ → «Из файла» · чистая ВМ не выделена (A-13) · `QFileDialog` платформенный (Fly — стиль Fusion без platform-theme? проверить).
 ### Stop-and-Fix
