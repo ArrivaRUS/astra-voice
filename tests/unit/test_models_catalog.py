@@ -8,6 +8,7 @@ import builtins
 import hashlib
 import io
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -224,11 +225,37 @@ def test_incompatible_jsonschema_resolver(
         monkeypatch.setattr(replacement, "RefResolver", None, raising=False)
     monkeypatch.setitem(sys.modules, "jsonschema", replacement)
 
+    # Чужому каталогу проверка схемой обязательна.
     with pytest.raises(CatalogError) as error:
-        load_builtin(StubVerifier(), root=catalog_root)
+        load_builtin(StubVerifier(), root=catalog_root, require_schema=True)
 
     assert error.value.code == "bad-schema"
-    assert error.value.message == "Не удалось проверить каталог: несовместимая версия jsonschema."
+    assert error.value.message == "Не удалось проверить каталог: недоступен модуль jsonschema."
+
+
+@pytest.mark.parametrize("reason", ["missing", "incompatible"])
+def test_builtin_catalog_survives_without_jsonschema(
+    catalog_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    reason: str,
+) -> None:
+    """Встроенный каталог подтверждён подписью: без модуля он всё равно читается."""
+    if reason == "missing":
+        monkeypatch.setitem(sys.modules, "jsonschema", None)
+    else:
+        monkeypatch.setitem(sys.modules, "jsonschema", ModuleType("jsonschema"))
+
+    with caplog.at_level(logging.WARNING, logger="astra_voice.models.catalog"):
+        result = load_builtin(StubVerifier(), root=catalog_root)
+
+    assert result.entry(MODEL_ID) is not None
+    assert "схеме пропущена" in caplog.text
+
+    # Тот же каталог с требованием проверки — отказ, а не тихий пропуск.
+    with pytest.raises(CatalogError) as error:
+        load_builtin(StubVerifier(), root=catalog_root, require_schema=True)
+    assert error.value.code == "bad-schema"
 
 
 def test_schema_tampering_rejected_with_real_signature(tmp_path: Path) -> None:

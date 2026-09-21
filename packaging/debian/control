@@ -30,14 +30,14 @@ Depends: ${misc:Depends},
          python3-sympy,
          python3-packaging,
          python3-requests,
-         python3-jsonschema (<< 5),
          python3-xlib,
          gpgv
 # Шрифты — Recommends, а не Depends: на ALSE apt ставит Recommends по умолчанию,
 # а в чистом debian:12 (CI, сборочный контейнер) пакетов PT нет, и жёсткая
 # зависимость ломала бы проверку установки. Резерв — PT Astra Sans/Fact через
 # QFontDatabase (A-03, Р8).
-Recommends: fonts-pt-root-ui,
+Recommends: python3-jsonschema (<< 5),
+            fonts-pt-root-ui,
             fonts-pt-mono,
             polkit-kde-agent-1,
             pipewire-pulse | pulseaudio,
