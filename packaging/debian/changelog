@@ -1,3 +1,10 @@
+astra-voice (0.1.0~m5.4) unstable; urgency=medium
+
+  * Значок в системном трее снова виден на тёмной панели. Раньше он был на
+    месте и нажимался, но сам знак не отрисовывался.
+
+ -- ArrivaRUS <arrivarus@gmail.com>  Mon, 21 Sep 2026 18:39:54 +0300
+
 astra-voice (0.1.0~m5.3) unstable; urgency=medium
 
   * Программа ставится на компьютеры, где нет пакета python3-jsonschema.
