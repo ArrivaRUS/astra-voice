@@ -253,7 +253,7 @@ def general_mic(theme):
 def general_indicator(theme):
     pop = ('<div class="pop" style="right:22px;top:208px">'
            f'<div class="po on">{ic("check", 13, "var(--primary)")}<span>Пилюля снизу экрана'
-           '<span class="d2">Как в Handy: у нижнего края, поверх окон</span></span></div>'
+           '<span class="d2">У нижнего края экрана, поверх окон</span></span></div>'
            '<div class="po"><span style="width:13px"></span><span>Пилюля сверху экрана'
            '<span class="d2">Если снизу мешает панель задач</span></span></div>'
            '<div class="po"><span style="width:13px"></span><span>Только значок в трее'

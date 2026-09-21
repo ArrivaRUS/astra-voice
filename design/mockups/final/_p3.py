@@ -58,13 +58,13 @@ def onb1(theme):
             + card([
                 row("Язык интерфейса", sel("Русский", 200),
                     "Определён по системной локали ru_RU", hint=False),
-                row("Проверять обновления утилиты", tgl(False), "Раз в сутки, github.com", hint=False),
+                row("Проверять обновления утилиты", tgl(False), "Раз в сутки", hint=False),
                 row("Проверять обновления моделей", tgl(False), "Раз в сутки, huggingface.co", hint=False),
             ])
             + f'<div class="note i" style="margin-top:14px">{ic("info", 15, DD)}'
               '<div><b>Пока оба переключателя выключены, программа не выходит в сеть</b>'
               'Скачать модель на следующем шаге можно и без них — это ваше явное действие. '
-              'Список хостов и способ выключить сеть совсем — в «О программе → Приватность».</div></div>'
+              'Куда программа ходит в сеть и как это выключить — в «О программе → Приватность».</div></div>'
             '</div>')
     b = onb(1, body, acts(back=False, skip=True,
                           note="Изменить можно позже в «Сеть и обновления»"))
@@ -152,8 +152,7 @@ def onb3(theme):
             '<div class="sm" style="margin:4px 0 14px">Зажмите её и говорите. Отпустили — текст появится '
             'там, где стоит курсор.</div>'
             + card([
-                row("Текущая комбинация", hotkey_field("idle"),
-                    "По умолчанию — как в Handy", hint=False),
+                row("Текущая комбинация", hotkey_field("idle"), hint=False),
                 row("Режим", seg("Удерживать", "Нажать-нажать", True),
                     "Удерживать — самый предсказуемый вариант", hint=False),
             ])
@@ -340,7 +339,7 @@ def onb_progress(theme):
                         '<div class="sm" style="margin:4px 0 14px">Зажмите её и говорите. Отпустили — '
                         'текст появится там, где стоит курсор.</div>'
                         + card([row("Текущая комбинация", hotkey_field("idle"),
-                                    "По умолчанию — как в Handy", hint=False)]) + '</div>'),
+                                    hint=False)]) + '</div>'),
                     acts(), progress="downloading", queue="· 1 из 2")
                 + sech("Пять состояний полоски") + grid(cells, 1)
                 + sech("Правила") + grid([where, fmt]), theme, leg, EXTRA_CSS)
