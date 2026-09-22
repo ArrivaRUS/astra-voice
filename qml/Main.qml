@@ -3,12 +3,12 @@
 // Заголовок и кнопки окна рисует оконный менеджер — свои не рисуем (§1.2).
 //
 // Файл обязан открываться и БЕЗ контекста Python (`qmlscene qml/Main.qml`):
-// appInfo и themeSource могут отсутствовать — тогда работают дефолты.
+// appInfo, settingsBridge и themeSource могут отсутствовать — тогда работают дефолты.
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import "."
 import "." as Av
-import "sections"
+import "components"
 import "onboarding"
 
 ApplicationWindow {
@@ -16,6 +16,7 @@ ApplicationWindow {
 
     // ── контекст из app.py (может отсутствовать при запуске через qmlscene) ──
     readonly property var info: (typeof appInfo !== "undefined" && appInfo !== null) ? appInfo : null
+    readonly property var bridge: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
     readonly property string appVersion: (info && info.version) ? info.version : "0.1.0"
     readonly property string sessionKind: (info && info.sessionKind) ? info.sessionKind : "OTHER"
     readonly property bool debugVisible: (info && info.debug === true)
@@ -29,7 +30,27 @@ ApplicationWindow {
         indices.debug = sidebar.sections.length
         return indices
     }
-    readonly property var availableSections: ["general", "debug"]
+
+    // Экран раздела по ключу: и заголовок шапки, и содержимое берутся отсюда.
+    readonly property var sectionPages: ({
+        "general": "sections/General.qml",
+        "models": "sections/Models.qml",
+        "output": "sections/Output.qml",
+        "network": "sections/Network.qml",
+        "advanced": "sections/Advanced.qml",
+        "about": "sections/About.qml",
+        "debug": "sections/Debug.qml"
+    })
+
+    // «Отладка» живёт вне списка сайдбара: у неё свой заголовок и подзаголовок (§1.3).
+    readonly property var currentSection: sidebar.debugCurrent
+        ? { "key": "debug", "title": qsTr("Отладка"),
+            "subtitle": qsTr("Скрытый раздел: Ctrl + Shift + D") }
+        : sidebar.sections[sidebar.currentIndex]
+
+    // Плавное появление раздела включается только после сборки окна: при первой
+    // загрузке анимировать нечего, а снимок обязан быть одинаковым в любой момент.
+    property bool sectionFadeReady: false
 
     width: Theme.sizeWindowW
     height: Theme.sizeWindowMinH
@@ -42,6 +63,8 @@ ApplicationWindow {
     color: Theme.bgApp
     font.family: Theme.fontUi
 
+    Component.onCompleted: window.sectionFadeReady = true
+
     Connections {
         target: window.info
 
@@ -49,8 +72,7 @@ ApplicationWindow {
             window.show()
             window.raise()
             window.requestActivate()
-            if (window.availableSections.indexOf(section) !== -1
-                    && window.sectionIndices.hasOwnProperty(section))
+            if (window.sectionIndices.hasOwnProperty(section))
                 sidebar.currentIndex = window.sectionIndices[section]
         }
     }
@@ -67,7 +89,7 @@ ApplicationWindow {
         visible: !window.onboardingVisible
         anchors.left: parent.left
         anchors.top: parent.top
-        anchors.bottom: statusBar.top
+        anchors.bottom: downloadStrip.visible ? downloadStrip.top : statusBar.top
         width: Theme.sidebarW
         debugVisible: window.debugVisible
     }
@@ -78,7 +100,7 @@ ApplicationWindow {
         anchors.left: sidebar.right
         anchors.right: parent.right
         anchors.top: parent.top
-        anchors.bottom: statusBar.top
+        anchors.bottom: downloadStrip.visible ? downloadStrip.top : statusBar.top
 
         // Шапка раздела: паддинг 12 22 8 (§1.4).
         Column {
@@ -94,7 +116,7 @@ ApplicationWindow {
 
             Text {
                 textFormat: Text.PlainText
-                text: sidebar.debugCurrent ? qsTr("Отладка") : qsTr("Общие")
+                text: window.currentSection.title
                 color: Theme.fg
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontH2SectionSize
@@ -106,8 +128,7 @@ ApplicationWindow {
 
             Text {
                 textFormat: Text.PlainText
-                text: sidebar.debugCurrent ? qsTr("Скрытый раздел: Ctrl + Shift + D")
-                    : qsTr("Диктовка, индикация и запуск")
+                text: window.currentSection.subtitle
                 color: Theme.fgMuted
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSmallSize
@@ -129,7 +150,7 @@ ApplicationWindow {
             anchors.bottomMargin: Theme.spaceWindowContentBottom
             clip: true
             contentWidth: width
-            contentHeight: sidebar.debugCurrent ? debugPlaceholder.implicitHeight : general.implicitHeight
+            contentHeight: page.implicitHeight
             boundsBehavior: Flickable.StopAtBounds
 
             // Полоса поверх содержимого: ширины у колонки не отнимает, появляется только
@@ -157,25 +178,47 @@ ApplicationWindow {
                 }
             }
 
-            General {
-                id: general
+            Loader {
+                id: page
                 width: body.width
-                visible: !sidebar.debugCurrent
+                source: window.sectionPages[window.currentSection.key]
+
+                onSourceChanged: {
+                    // Новый раздел всегда открывается сверху, а не там, где бросили прошлый.
+                    body.contentY = 0
+                    if (window.sectionFadeReady)
+                        sectionFade.restart()
+                }
             }
 
-            Text {
-                id: debugPlaceholder
-                width: body.width
-                visible: sidebar.debugCurrent
-                text: qsTr("Здесь будут сведения для поддержки")
-                color: Theme.fgMuted
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontSettingSubSize
-                lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
-                lineHeightMode: Text.FixedHeight
-                renderType: Text.NativeRendering
+            NumberAnimation {
+                id: sectionFade
+                target: page
+                property: "opacity"
+                from: 0
+                to: 1
+                duration: Theme.durationEnter
+                easing.type: Easing.Bezier
+                easing.bezierCurve: Theme.easingEnter.concat([1, 1])
             }
         }
+    }
+
+    // Сквозная полоска загрузки — та же, что в мастере (§10.3): очередь одна.
+    DownloadStrip {
+        id: downloadStrip
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: statusBar.top
+        visible: !window.onboardingVisible && downloadState !== "idle" && !doneExpired
+        downloadState: window.bridge ? window.bridge.downloadState : "idle"
+        title: window.bridge ? window.bridge.downloadTitle : ""
+        progress: window.bridge ? window.bridge.downloadProgress : 0
+        speed: window.bridge ? window.bridge.speed : ""
+        eta: window.bridge ? window.bridge.eta : ""
+        detail: window.bridge ? window.bridge.downloadDetail : ""
+        onRetryRequested: { if (window.bridge) window.bridge.startSelectedDownloads(); }
+        onOpenFolderRequested: { if (window.bridge) window.bridge.openModelsFolder(); }
     }
 
     Av.StatusBar {

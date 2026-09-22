@@ -32,13 +32,11 @@ from astra_voice.core.dictation import (
 )
 from astra_voice.core.settings import Settings, is_valid_combo
 from astra_voice.core.settings import save as settings_save
-from astra_voice.models.store import StoreError
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
 from astra_voice.ui import notify
 from astra_voice.ui.formatting import (
     clean_display_name,
     format_size,
-    format_space,
 )
 from astra_voice.ui.model_downloads import (
     ModelDownloads,
@@ -109,6 +107,9 @@ class SettingsBridge(QObject):
 
     activeModelChanged = pyqtSignal()
     activeModelStateChanged = pyqtSignal()
+    modelsChanged = pyqtSignal()
+    selectionChanged = pyqtSignal()
+    freeSpaceTextChanged = pyqtSignal()
     downloadStateChanged = pyqtSignal()
     downloadProgressChanged = pyqtSignal()
     downloadTitleChanged = pyqtSignal()
@@ -137,6 +138,7 @@ class SettingsBridge(QObject):
         apply: SettingsApply | None = None,
         save: Callable[[Settings], None] = settings_save,
         open_url: Callable[[QUrl], bool] | None = None,
+        dialog_factory: Callable[[], str] = QFileDialog.getExistingDirectory,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -151,10 +153,14 @@ class SettingsBridge(QObject):
         self._model_selfcheck = "idle"
         self._downloads = downloads
         self._open_url = open_url if open_url is not None else QDesktopServices.openUrl
+        self._dialog_factory = dialog_factory
         if downloads is not None:
             for name in ("downloadState", "downloadProgress", "downloadTitle", "speed", "eta"):
                 getattr(downloads, name + "Changed").connect(getattr(self, name + "Changed"))
             downloads.downloadDetailChanged.connect(self.downloadDetailChanged)
+            downloads.modelsChanged.connect(self.modelsChanged)
+            downloads.selectionChanged.connect(self.selectionChanged)
+            downloads.freeSpaceTextChanged.connect(self.freeSpaceTextChanged)
             downloads.modelsChanged.connect(self.activeModelChanged)
             downloads.modelsChanged.connect(self.activeModelStateChanged)
             downloads.modelReadyChanged.connect(self.activeModelChanged)
@@ -189,6 +195,51 @@ class SettingsBridge(QObject):
     @pyqtProperty(bool, notify=activeModelStateChanged)
     def canInstall(self) -> bool:  # noqa: N802
         return self._downloads is not None and self._downloads.can_install()
+
+    # ── раздел «Модели»: те же данные очереди, что видит мастер (§3.6) ──────
+    @pyqtProperty("QVariantList", notify=modelsChanged)
+    def models(self) -> list[dict[str, Any]]:
+        return self._downloads.models if self._downloads is not None else []
+
+    @pyqtProperty(str, notify=selectionChanged)
+    def selectionSummary(self) -> str:  # noqa: N802
+        return self._downloads.selectionSummary if self._downloads is not None else ""
+
+    @pyqtProperty(bool, notify=selectionChanged)
+    def selectionFits(self) -> bool:  # noqa: N802
+        return self._downloads.selectionFits if self._downloads is not None else True
+
+    @pyqtProperty(str, notify=selectionChanged)
+    def selectionMessage(self) -> str:  # noqa: N802
+        return self._downloads.selectionMessage if self._downloads is not None else ""
+
+    @pyqtProperty(str, notify=freeSpaceTextChanged)
+    def freeSpaceText(self) -> str:  # noqa: N802
+        return self._downloads.freeSpaceText if self._downloads is not None else ""
+
+    @pyqtSlot(str)
+    def toggleModel(self, model_id: str) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.toggleModel(model_id)
+
+    @pyqtSlot()
+    def startSelectedDownloads(self) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.startSelectedDownloads()
+
+    @pyqtSlot(str)
+    def retryModel(self, model_id: str) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.retryModel(model_id)
+
+    @pyqtSlot()
+    def pickInstallPath(self) -> None:  # noqa: N802
+        if self._downloads is None:
+            log.debug("Хранилище моделей недоступно для установки из папки")
+            return
+        path = self._dialog_factory()
+        if path:
+            self._downloads.installFromPath(path)
 
     @pyqtSlot()
     def installRecommendedModel(self) -> None:  # noqa: N802
@@ -581,10 +632,6 @@ class OnboardingController(QObject):
             log.warning("Не удалось получить список микрофонов. Доступен системный по умолчанию.")
         self._owns_downloads = downloads is None
         self._downloads = downloads if downloads is not None else ModelDownloads(model, clock=clock)
-        self._free_space_text = ""
-        self._refresh_free_space_text()
-        # selectionChanged публикуется также после завершения каждой модели в очереди.
-        self._downloads.selectionChanged.connect(self._refresh_free_space_text)
         self._shutting_down = False
         self._window: QObject | None = None
         self._window_visible: bool | None = None
@@ -592,6 +639,7 @@ class OnboardingController(QObject):
         for name in (
             "modelsChanged",
             "selectionChanged",
+            "freeSpaceTextChanged",
             "downloadStateChanged",
             "downloadProgressChanged",
             "downloadTitleChanged",
@@ -759,22 +807,9 @@ class OnboardingController(QObject):
     def models(self) -> list[dict[str, Any]]:
         return self._downloads.models
 
-    def _refresh_free_space_text(self) -> None:
-        size = ""
-        free_bytes = getattr(self._downloads.model, "free_bytes", None)
-        if callable(free_bytes):
-            try:
-                size = format_space(free_bytes())
-            except (OSError, StoreError):
-                log.debug("Не удалось определить свободное место на диске")
-        text = f"свободно на диске {size}" if size else ""
-        if text != self._free_space_text:
-            self._free_space_text = text
-            self.freeSpaceTextChanged.emit()
-
     @pyqtProperty(str, notify=freeSpaceTextChanged)
     def freeSpaceText(self) -> str:  # noqa: N802
-        return self._free_space_text
+        return self._downloads.freeSpaceText
 
     @pyqtSlot()
     def openModelsFolder(self) -> None:  # noqa: N802

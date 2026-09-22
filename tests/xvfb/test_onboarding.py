@@ -619,6 +619,7 @@ class FakeSettings(QObject):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[str] = []
+        self.toggled_model_ids: list[str] = []
         self._hotkey: str = "Ctrl + Space"
         self._hotkeyMode: str = "ptt"
         self._pillEnabled: bool = True
@@ -637,6 +638,27 @@ class FakeSettings(QObject):
         self._activeModelMessage: str = ""
         self._canReinstall: bool = True
         self._canInstall: bool = False
+        self._models: list[dict[str, Any]] = [
+            {
+                "id": "gigaam-v3-rnnt",
+                "name": "GigaAM v3 RNN-T",
+                "description": "Русская диктовка с пунктуацией — по умолчанию",
+                "host": "huggingface.co",
+                "recommended": True,
+                "sizeBytes": 226431968,
+                "sizeText": "226 МБ",
+                "ramText": "768 МБ",
+                "selected": True,
+                "badge": "active",
+                "state": "installed",
+                "message": "",
+                "progress": 0.0,
+            },
+        ]
+        self._selectionSummary: str = ""
+        self._selectionFits: bool = True
+        self._selectionMessage: str = ""
+        self._freeSpaceText: str = "свободно на диске 42,1 ГБ"
         self._downloadState: str = "idle"
         self._downloadProgress: float = 0.0
         self._downloadTitle: str = ""
@@ -806,6 +828,55 @@ class FakeSettings(QObject):
 
     canInstall = pyqtProperty(bool, _get_canInstall, _set_canInstall, notify=changed)
 
+    def _get_models(self) -> list[dict[str, Any]]:
+        return self._models
+
+    def _set_models(self, value: list[dict[str, Any]]) -> None:
+        self._models = value
+        self.changed.emit()
+
+    models = pyqtProperty("QVariantList", _get_models, _set_models, notify=changed)
+
+    def _get_selectionSummary(self) -> str:
+        return self._selectionSummary
+
+    def _set_selectionSummary(self, value: str) -> None:
+        self._selectionSummary = value
+        self.changed.emit()
+
+    selectionSummary = pyqtProperty(
+        str, _get_selectionSummary, _set_selectionSummary, notify=changed
+    )
+
+    def _get_selectionFits(self) -> bool:
+        return self._selectionFits
+
+    def _set_selectionFits(self, value: bool) -> None:
+        self._selectionFits = value
+        self.changed.emit()
+
+    selectionFits = pyqtProperty(bool, _get_selectionFits, _set_selectionFits, notify=changed)
+
+    def _get_selectionMessage(self) -> str:
+        return self._selectionMessage
+
+    def _set_selectionMessage(self, value: str) -> None:
+        self._selectionMessage = value
+        self.changed.emit()
+
+    selectionMessage = pyqtProperty(
+        str, _get_selectionMessage, _set_selectionMessage, notify=changed
+    )
+
+    def _get_freeSpaceText(self) -> str:
+        return self._freeSpaceText
+
+    def _set_freeSpaceText(self, value: str) -> None:
+        self._freeSpaceText = value
+        self.changed.emit()
+
+    freeSpaceText = pyqtProperty(str, _get_freeSpaceText, _set_freeSpaceText, notify=changed)
+
     def _get_downloadState(self) -> str:
         return self._downloadState
 
@@ -878,6 +949,22 @@ class FakeSettings(QObject):
     def openModelsFolder(self) -> None:
         self.calls.append("openModelsFolder")
 
+    @pyqtSlot(str)
+    def toggleModel(self, model_id: str) -> None:
+        self.toggled_model_ids.append(model_id)
+
+    @pyqtSlot()
+    def startSelectedDownloads(self) -> None:
+        self.calls.append("startSelectedDownloads")
+
+    @pyqtSlot(str)
+    def retryModel(self, model_id: str) -> None:
+        self.calls.append("retryModel")
+
+    @pyqtSlot()
+    def pickInstallPath(self) -> None:
+        self.calls.append("pickInstallPath")
+
     @pyqtSlot(str, result=bool)
     def is_locked(self, name: str) -> bool:
         return False
@@ -947,7 +1034,11 @@ SNAPSHOT_SETUPS: dict[str, Callable[[], FakeOnboarding | FakeSettings]] = {
         eta="осталось ~3 мин",
     ),
     "06-settings-general": FakeSettings,
+    "07-settings-models": FakeSettings,
+    "08-settings-about": FakeSettings,
 }
+#: Снимок окна настроек делается в этом разделе; остальные — «Общие».
+SNAPSHOT_SECTIONS = {"07-settings-models": "models", "08-settings-about": "about"}
 CASES = [(name, dark) for name in SNAPSHOT_SETUPS for dark in (False, True)]
 
 
@@ -987,6 +1078,39 @@ def click_item(item: Any) -> None:
     assert item.isVisible()
     position = item.mapToScene(QPointF(item.width() / 2, item.height() / 2))
     QTest.mouseClick(item.window(), Qt.LeftButton, Qt.NoModifier, position.toPoint())
+
+
+def settings_sidebar(window: Any) -> Any:
+    return next(
+        item
+        for item in visual_tree(window.contentItem())
+        if item.metaObject().indexOfProperty("debugCurrent") >= 0
+    )
+
+
+def section_descriptions(window: Any) -> list[dict[str, str]]:
+    return list(settings_sidebar(window).property("sections").toVariant())
+
+
+def select_section(app: Any, window: Any, section: str) -> dict[str, str]:
+    """Кликает по пункту бокового меню и ждёт, пока раздел проявится."""
+    sidebar = settings_sidebar(window)
+    descriptions = section_descriptions(window)
+    keys = [description["key"] for description in descriptions]
+    index = keys.index(section)
+    items = [
+        item
+        for item in visual_tree(sidebar)
+        if item.isVisible() and item.property("title") == descriptions[index]["title"]
+    ]
+    assert len(items) == 1, f"ожидался один пункт меню «{descriptions[index]['title']}»"
+    click_item(items[0])
+    app.processEvents()
+    assert sidebar.property("currentIndex") == index
+    # Переход между разделами — плавное появление (motion.duration.enter = 160).
+    QTest.qWait(220)
+    app.processEvents()
+    return descriptions[index]
 
 
 def microphone_card(root: Any) -> Any:
@@ -1110,10 +1234,11 @@ def render_settings(
     dark: bool,
     *,
     fake: FakeSettings | None = None,
+    section: str = "general",
     extra_wait_ms: int = 0,
     inspect: Callable[[Any], None] | None = None,
 ) -> tuple[QImage, list[str]]:
-    """Загружает раздел «Общие» настоящего Main.qml без appInfo."""
+    """Загружает настоящий Main.qml без appInfo и открывает нужный раздел."""
     messages: list[str] = []
 
     def handler(_mode: Any, _context: Any, message: str) -> None:
@@ -1151,11 +1276,18 @@ def render_settings(
         assert window.isVisible() and window.isExposed()
         assert (window.width(), window.height()) == (WIDTH, HEIGHT)
         assert window.property("onboardingVisible") is False
-        assert any(
-            item.isVisible() and item.property("text") == "Диктовка, индикация и запуск"
-            for item in visual_tree(window.contentItem())
-        ), "не показан раздел «Общие»"
-        image = grab_frame(app, window, snapshot_name("06-settings-general", dark))
+        description = (
+            section_descriptions(window)[0]
+            if section == "general"
+            else select_section(app, window, section)
+        )
+        assert description["key"] == section
+        # Шапка берёт заголовок и подзаголовок из описания раздела (§1.4).
+        texts = visible_texts(window.contentItem())
+        assert {description["title"], description["subtitle"]} <= texts, (
+            f"не показан раздел «{description['title']}»"
+        )
+        image = grab_frame(app, window, snapshot_name(f"settings-{section}", dark))
         if inspect is not None:
             inspect(window)
             app.processEvents()
@@ -1173,7 +1305,8 @@ def render_settings(
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
-def test_show_section_only_navigates_to_available_pages(onboarding_app: Any, dark: bool) -> None:
+def test_menu_and_show_section_switch_real_sections(onboarding_app: Any, dark: bool) -> None:
+    """Каждый пункт меню открывает свой раздел; из Python переход делает showSection."""
     messages: list[str] = []
 
     def handler(_mode: Any, _context: Any, message: str) -> None:
@@ -1183,22 +1316,25 @@ def test_show_section_only_navigates_to_available_pages(onboarding_app: Any, dar
     engine = QQmlApplicationEngine()
     app_info = FakeAppInfo()
     theme = FakeTheme(dark)
+    settings = FakeSettings()
     try:
         engine.rootContext().setContextProperty("appInfo", app_info)
         engine.rootContext().setContextProperty("themeSource", theme)
         engine.rootContext().setContextProperty("showOnboarding", False)
+        engine.rootContext().setContextProperty("settingsBridge", settings)
         engine.load(QUrl.fromLocalFile(str(REPO / "qml/Main.qml")))
         roots = engine.rootObjects()
         assert len(roots) == 1, messages
         window = roots[0]
         assert isinstance(window, QQuickWindow)
-        sidebar = next(
-            item
-            for item in visual_tree(window.contentItem())
-            if item.metaObject().indexOfProperty("debugCurrent") >= 0
-        )
-        sections = sidebar.property("sections").toVariant()
-        assert [section["key"] for section in sections] == [
+        window.setWidth(WIDTH)
+        window.setHeight(HEIGHT)
+        window.show()
+        QTest.qWait(180)
+        onboarding_app.processEvents()
+        sidebar = settings_sidebar(window)
+        descriptions = section_descriptions(window)
+        assert [description["key"] for description in descriptions] == [
             "general",
             "models",
             "output",
@@ -1207,51 +1343,54 @@ def test_show_section_only_navigates_to_available_pages(onboarding_app: Any, dar
             "about",
         ]
         assert window.property("sectionIndices").toVariant() == {
-            **{section["key"]: index for index, section in enumerate(sections)},
-            "debug": len(sections),
+            **{description["key"]: index for index, description in enumerate(descriptions)},
+            "debug": len(descriptions),
         }
+        subtitles = {description["subtitle"] for description in descriptions}
+        assert len(subtitles) == len(descriptions), "подзаголовки разделов не различаются"
 
-        def visible_texts() -> set[str]:
-            return {
-                item.property("text")
-                for item in visual_tree(window.contentItem())
-                if item.isVisible() and isinstance(item.property("text"), str)
-            }
+        assert sidebar.property("currentIndex") == 0
+        for index, description in enumerate(descriptions):
+            assert select_section(onboarding_app, window, description["key"]) == description
+            assert sidebar.property("currentIndex") == index
+            texts = visible_texts(window.contentItem())
+            # Заголовок и подзаголовок шапки — из описания раздела; чужих нет.
+            assert {description["title"], description["subtitle"]} <= texts
+            assert not (subtitles - {description["subtitle"]}) & texts
 
-        def show_section(section: str, expected_index: int) -> None:
+        def show_section(section: str, expected_index: int) -> set[str]:
             window.hide()
             assert not window.isVisible()
             app_info.showSection.emit(section)
             onboarding_app.processEvents()
             assert window.isVisible()
             assert sidebar.property("currentIndex") == expected_index
+            QTest.qWait(220)
+            onboarding_app.processEvents()
+            return visible_texts(window.contentItem())
 
-        assert sidebar.property("currentIndex") == 0
-        unavailable = ("models", "output", "network", "advanced", "about", "unknown")
-        for section in unavailable:
-            show_section(section, 0)
-            assert "Диктовка, индикация и запуск" in visible_texts()
+        texts = show_section("models", 1)
+        assert {"Модели", "Какая модель распознаёт речь", "Скачать выбранное"} <= texts
+        # Неизвестный ключ выделение не меняет.
+        assert show_section("unknown", 1) == texts
 
-        show_section("debug", len(sections))
+        texts = show_section("general", 0)
+        assert {"Общие", "Диктовка, индикация и запуск", "Горячая клавиша"} <= texts
+        assert "Модель распознавания" not in texts
+
+        texts = show_section("debug", len(descriptions))
         assert sidebar.property("debugCurrent") is True
         assert {
             "Отладка",
             "Скрытый раздел: Ctrl + Shift + D",
             "Здесь будут сведения для поддержки",
-        } <= visible_texts()
-        assert "Диктовка, индикация и запуск" not in visible_texts()
-        assert "Горячая клавиша" not in visible_texts()
-        for section in unavailable:
-            show_section(section, len(sections))
-            assert "Здесь будут сведения для поддержки" in visible_texts()
-
-        show_section("general", 0)
-        assert {"Общие", "Диктовка, индикация и запуск", "Горячая клавиша"} <= visible_texts()
-        assert "Здесь будут сведения для поддержки" not in visible_texts()
+        } <= texts
+        assert not subtitles & texts
     finally:
         try:
             sip.delete(engine)
             sip.delete(app_info)
+            sip.delete(settings)
             sip.delete(theme)
             onboarding_app.processEvents()
         finally:
@@ -1269,7 +1408,13 @@ def render_case(
 ) -> tuple[QImage, list[str]]:
     fake = SNAPSHOT_SETUPS[name]()
     if isinstance(fake, FakeSettings):
-        return render_settings(app, dark, fake=fake, extra_wait_ms=extra_wait_ms)
+        return render_settings(
+            app,
+            dark,
+            fake=fake,
+            section=SNAPSHOT_SECTIONS.get(name, "general"),
+            extra_wait_ms=extra_wait_ms,
+        )
     return render_onboarding(app, fake, dark, extra_wait_ms=extra_wait_ms)
 
 
@@ -1303,7 +1448,7 @@ def assert_saved_snapshot(path: Path, original: QImage) -> None:
 def rendered_steps(
     onboarding_app: Any, request: pytest.FixtureRequest
 ) -> Iterator[dict[tuple[str, bool], tuple[QImage, list[str], Path]]]:
-    """Готовит двадцать кадров; публикует их только после успеха всех тестов модуля."""
+    """Готовит кадры всех случаев; публикует их только после успеха тестов модуля."""
     failures_before = request.session.testsfailed
     SNAPSHOTS.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".onboarding-", dir=SNAPSHOTS) as temporary:
@@ -1349,7 +1494,7 @@ def test_step_snapshots_are_saved(
     """Проверяет подготовленные PNG; атомарная публикация отложена до teardown."""
     assert set(rendered_steps) == set(CASES)
     expected = {snapshot_name(name, dark) for name, dark in CASES}
-    assert len(expected) == 20
+    assert len(expected) == 24
     paths = [path for _, _, path in rendered_steps.values()]
     assert {path.name for path in paths[0].parent.glob("*.png")} == expected
     for image, messages, path in rendered_steps.values():
@@ -1866,57 +2011,122 @@ def test_done_updates_when_model_becomes_ready(onboarding_app: Any, dark: bool) 
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
-def test_settings_reinstall_calls_bridge(onboarding_app: Any, dark: bool) -> None:
+def test_settings_models_section_calls_bridge(onboarding_app: Any, dark: bool) -> None:
+    """Карточка, «Скачать выбранное» и установка из папки зовут мост, а не молчат."""
     fake = FakeSettings()
-    # У исправной модели кнопки нет: перекачивать рабочую модель незачем.
-    fake.activeModelState = "broken"
+    fake.models = [{**fake.models[0], "badge": "", "state": "available", "selected": True}]
+    fake.selectionSummary = "Будет скачано 226 МБ"
 
     def inspect(window: Any) -> None:
-        button = visible_button(window.contentItem(), "Переустановить")
-        assert button.isEnabled()
-        assert fake.calls == []
-        QMetaObject.invokeMethod(button, "clicked", Qt.DirectConnection)
-        assert fake.calls == ["reinstallActiveModel"]
+        root = window.contentItem()
+        cards = [
+            item
+            for item in visual_tree(root)
+            if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
+        ]
+        assert len(cards) == 1, f"ожидалась одна карточка, найдено {len(cards)}"
+        assert fake.toggled_model_ids == [] and fake.calls == []
+        click_item(cards[0])
+        assert fake.toggled_model_ids == [fake.models[0]["id"]]
 
-    _, messages = render_settings(onboarding_app, dark, fake=fake, inspect=inspect)
-    assert_no_messages(messages, "reinstall active model")
+        download = visible_button(root, "Скачать выбранное")
+        assert download.isEnabled()
+        QMetaObject.invokeMethod(download, "clicked", Qt.DirectConnection)
+        assert fake.calls == ["startSelectedDownloads"]
+
+        install = visible_button(root, "Установить из файла или папки…")
+        assert install.isEnabled()
+        QMetaObject.invokeMethod(install, "clicked", Qt.DirectConnection)
+        assert fake.calls == ["startSelectedDownloads", "pickInstallPath"]
+
+    _, messages = render_settings(
+        onboarding_app, dark, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "models section calls bridge")
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
-def test_settings_model_row_survives_long_texts(onboarding_app: Any, dark: bool) -> None:
-    """Длинные подписи справа не должны зацикливать расчёт высоты строки.
+def test_settings_models_survive_long_texts(onboarding_app: Any, dark: bool) -> None:
+    """Длинные подписи каталога не должны зацикливать расчёт высоты карточки.
 
-    Строка без пояснения берёт высоту от правой части; текст с переносом
-    делает высоту зависимой от ширины, и SettingRow уходит в Binding loop.
-    На живом сеансе это видно сразу, а в снимке — нет, поэтому длины здесь
-    заведомо больше, чем помещается.
+    Текст с переносом делает высоту зависимой от ширины, ширину — от раскладки,
+    и строка уходит в Binding loop. На живом сеансе это видно сразу, а в снимке —
+    нет, поэтому длины здесь заведомо больше, чем помещается.
     """
     fake = FakeSettings()
-    fake.activeModelState = "downloading"
-    fake.activeModelName = "GigaAM v3 RNN-T с очень длинным названием записи каталога"
-    fake.activeModelSize = "1 234,5 МБ"
-    fake.downloadTitle = "Загружается GigaAM v3 RNN-T с очень длинным названием · 1 из 2"
-    fake.eta = "осталось ~1 ч 10 мин"
-
-    def inspect(window: Any) -> None:
-        row = visible_texts(window.contentItem())
-        assert any("Модель распознавания" in text for text in row)
-
-    _, messages = render_settings(onboarding_app, dark, fake=fake, inspect=inspect)
-    assert_no_messages(messages, "long model texts")
-
-
-@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
-def test_settings_hides_model_button_when_model_is_ok(onboarding_app: Any, dark: bool) -> None:
-    """Рабочая модель не предлагает себя перекачать: кнопки в норме нет."""
-    fake = FakeSettings()
-    fake.activeModelState = "ok"
+    fake.models = [
+        {
+            **fake.models[0],
+            "name": "GigaAM v3 RNN-T с очень длинным названием записи каталога",
+            "description": "Очень длинное описание записи каталога, которое заведомо "
+            "не помещается в одну строку карточки ни при какой ширине окна",
+            "sizeText": "1 234,5 МБ",
+            "ramText": "4 096 МБ",
+            "badge": "",
+            "state": "failed",
+            "message": "Не удалось загрузить модель: источник ответил ошибкой, "
+            "попробуйте позже или поставьте модель из папки",
+        }
+    ]
+    fake.selectionMessage = "На диске не хватает 1 234,5 МБ. Освободите место."
+    fake.selectionFits = False
+    fake.selectionSummary = "Будет скачано 1 234,5 МБ"
 
     def inspect(window: Any) -> None:
         texts = visible_texts(window.contentItem())
-        assert "Переустановить" not in texts
-        assert "Установить" not in texts
-        assert fake.activeModelName in " ".join(texts)
+        assert any(text.startswith("GigaAM v3 RNN-T с очень длинным") for text in texts)
+        assert not visible_button(window.contentItem(), "Скачать выбранное").isEnabled()
 
-    _, messages = render_settings(onboarding_app, dark, fake=fake, inspect=inspect)
-    assert_no_messages(messages, "model row without button")
+    _, messages = render_settings(
+        onboarding_app, dark, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "long catalog texts")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_settings_models_show_active_model(onboarding_app: Any, dark: bool) -> None:
+    """Рабочая модель помечена бейджем и не предлагает себя перекачать."""
+    fake = FakeSettings()
+
+    def inspect(window: Any) -> None:
+        texts = visible_texts(window.contentItem())
+        assert "Установлена и активна" in texts
+        assert fake.models[0]["name"] in texts
+        assert {"Переустановить", "Установить", "Повторить", "Отмена"} & texts == set()
+        assert not visible_button(window.contentItem(), "Скачать выбранное").isEnabled()
+
+    _, messages = render_settings(
+        onboarding_app, dark, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "active model card")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_settings_hide_debug_section_without_flag(onboarding_app: Any, dark: bool) -> None:
+    """Без appInfo.debug «Отладки» нет ни в меню, ни в области контента."""
+
+    def inspect(window: Any) -> None:
+        assert settings_sidebar(window).property("debugVisible") is False
+        texts = visible_texts(window.contentItem())
+        assert "Отладка (Ctrl+Shift+D)" not in texts
+        assert "Здесь будут сведения для поддержки" not in texts
+
+    _, messages = render_settings(onboarding_app, dark, inspect=inspect)
+    assert_no_messages(messages, "debug hidden without flag")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_settings_about_shows_version_and_privacy(onboarding_app: Any, dark: bool) -> None:
+    """Раздел «О программе» без appInfo показывает запасную версию и две строки."""
+
+    def inspect(window: Any) -> None:
+        texts = visible_texts(window.contentItem())
+        assert {
+            "Astra Voice",
+            "0.1.0",
+            "Программа не выходит в сеть без вашего действия",
+            "Исходный код открыт",
+        } <= texts
+
+    _, messages = render_settings(onboarding_app, dark, section="about", inspect=inspect)
+    assert_no_messages(messages, "about section")

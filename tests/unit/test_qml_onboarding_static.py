@@ -34,6 +34,9 @@ COMPONENTS = [
 UI_FILES = ONBOARDING_FILES + COMPONENTS
 MAIN = REPO / "qml/Main.qml"
 GENERAL = REPO / "qml/sections/General.qml"
+MODELS = REPO / "qml/sections/Models.qml"
+ABOUT = REPO / "qml/sections/About.qml"
+SECTIONS = [GENERAL, MODELS, ABOUT]
 QSTR = re.compile(r'\bqsTr\s*\(\s*"((?:\\.|[^"\\])*)"', re.DOTALL)
 STRINGS_OR_COMMENT = re.compile(r""""(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|//[^\n]*""")
 FORBIDDEN = (
@@ -95,9 +98,11 @@ def test_steps_declare_bar_contract(path: Path) -> None:
 @pytest.mark.parametrize(
     ("path", "identifier"),
     [(path, "onboarding") for path in UI_FILES]
-    + [(MAIN, "settingsBridge"), (GENERAL, "settingsBridge"), (MAIN, "showOnboarding")],
+    + [(MAIN, "settingsBridge"), (GENERAL, "settingsBridge"), (MODELS, "settingsBridge")]
+    + [(ABOUT, "appInfo"), (MAIN, "showOnboarding")],
     ids=[f"{path.name}-onboarding" for path in UI_FILES]
-    + ["Main-settingsBridge", "General-settingsBridge", "Main-showOnboarding"],
+    + ["Main-settingsBridge", "General-settingsBridge", "Models-settingsBridge"]
+    + ["About-appInfo", "Main-showOnboarding"],
 )
 def test_context_identifiers_are_guarded(path: Path, identifier: str) -> None:
     guard = f'typeof {identifier} !== "undefined"'
@@ -109,7 +114,7 @@ def test_context_identifiers_are_guarded(path: Path, identifier: str) -> None:
     assert not failures, f"нет защиты {guard}:\n" + "\n".join(failures)
 
 
-@pytest.mark.parametrize("path", UI_FILES + [MAIN, GENERAL], ids=lambda path: path.name)
+@pytest.mark.parametrize("path", UI_FILES + [MAIN] + SECTIONS, ids=lambda path: path.name)
 def test_colors_come_from_theme(path: Path) -> None:
     failures = [
         f"{path}:{number}: {line.strip()}"

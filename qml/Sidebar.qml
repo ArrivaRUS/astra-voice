@@ -12,13 +12,24 @@ FocusScope {
     property bool debugVisible: false
     property bool debugCurrent: currentIndex === sections.length
 
+    // subtitle — подзаголовок шапки раздела (§1.4): его показывает Main.qml.
     readonly property var sections: [
-        { "key": "general", "title": qsTr("Общие"), "icon": "cog", "counter": "" },
-        { "key": "models", "title": qsTr("Модели"), "icon": "chip", "counter": "3" },
-        { "key": "output", "title": qsTr("Вывод"), "icon": "out", "counter": "" },
-        { "key": "network", "title": qsTr("Сеть и обновления"), "icon": "refresh", "counter": "" },
-        { "key": "advanced", "title": qsTr("Продвинутые"), "icon": "sliders", "counter": "" },
-        { "key": "about", "title": qsTr("О программе"), "icon": "info", "counter": "" }
+        { "key": "general", "title": qsTr("Общие"),
+            "subtitle": qsTr("Диктовка, индикация и запуск"), "icon": "cog", "counter": "" },
+        { "key": "models", "title": qsTr("Модели"),
+            "subtitle": qsTr("Какая модель распознаёт речь"), "icon": "chip", "counter": "3" },
+        { "key": "output", "title": qsTr("Вывод"),
+            "subtitle": qsTr("Куда попадает текст и что происходит с буфером обмена"),
+            "icon": "out", "counter": "" },
+        { "key": "network", "title": qsTr("Сеть и обновления"),
+            "subtitle": qsTr("Четыре сетевых действия — и ни одного больше"),
+            "icon": "refresh", "counter": "" },
+        { "key": "advanced", "title": qsTr("Продвинутые"),
+            "subtitle": qsTr("То, что почти никому не нужно менять"),
+            "icon": "sliders", "counter": "" },
+        { "key": "about", "title": qsTr("О программе"),
+            "subtitle": qsTr("Версии, лицензии, приватность и данные на диске"),
+            "icon": "info", "counter": "" }
     ]
 
     implicitWidth: Theme.sidebarW

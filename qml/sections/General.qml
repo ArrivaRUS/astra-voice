@@ -1,5 +1,6 @@
 // Раздел «Общие» — референс design/refs/01-general-base.png (+ -dark), спека §3.
-// Восемь настроек в трёх группах. Без моста настроек используются дефолты M1.
+// Семь настроек в трёх группах; модель переехала в раздел «Модели».
+// Без моста настроек используются дефолты M1.
 import QtQuick 2.15
 import QtQuick.Layouts 1.15
 import ".."
@@ -12,12 +13,6 @@ Column {
     readonly property string hotkeyStatus: settings ? settings.hotkeyStatus : "ok"
     readonly property string saveError: root.settings ? root.settings.saveError : ""
     readonly property string modelSelfcheck: root.settings ? root.settings.modelSelfcheck : ""
-    readonly property string activeModelState: root.settings ? root.settings.activeModelState : "none"
-    // Пока модель качается или проверяется, действия над ней недоступны.
-    readonly property bool busyWithModel: root.activeModelState === "downloading"
-        || root.activeModelState === "verifying"
-    // Модели нет вовсе — предлагаем поставить рекомендованную, а не «переустановить».
-    readonly property bool canInstall: root.activeModelState === "none"
 
     function isLocked(name) {
         return settings && settings.lockedSettings
@@ -57,97 +52,11 @@ Column {
         width: root.width
         title: qsTr("Диктовка")
 
-        SettingRow {
-            width: parent.width
-            divider: false
-            label: qsTr("Модель распознавания")
-            // Подписи нет намеренно: имя модели стоит справа, у самих кнопок.
-            // Со второй строкой раздел перестаёт помещаться без прокрутки.
-            showHint: false
-
-            Text {
-                textFormat: Text.PlainText
-                text: !root.settings || root.activeModelState === "none"
-                        || root.settings.activeModelName === ""
-                    ? qsTr("Модель не установлена")
-                    : root.settings.activeModelSize !== ""
-                        ? qsTr("%1 · %2").arg(root.settings.activeModelName)
-                            .arg(root.settings.activeModelSize)
-                        : root.settings.activeModelName
-                color: Theme.fgMuted
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontSettingSubSize
-                renderType: Text.NativeRendering
-                elide: Text.ElideRight
-                Layout.maximumWidth: root.width / 3
-                Layout.alignment: Qt.AlignVCenter
-            }
-
-            Text {
-                textFormat: Text.PlainText
-                text: {
-                    if (!root.settings)
-                        return ""
-                    if (root.busyWithModel) {
-                        var parts = []
-                        if (root.settings.downloadTitle !== "")
-                            parts.push(root.settings.downloadTitle)
-                        if (root.settings.eta !== "")
-                            parts.push(root.settings.eta)
-                        return parts.join(" · ")
-                    }
-                    // Текст отказа приходит из моста готовой фразой (§4.4).
-                    return root.settings.activeModelMessage
-                }
-                visible: text !== ""
-                color: root.busyWithModel ? Theme.fgMuted : Theme.dangerInk
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontSettingSubSize
-                renderType: Text.NativeRendering
-                // Только одна строка с обрезкой: с переносом высота зависит от
-                // ширины, ширина — от раскладки, и SettingRow зацикливает
-                // расчёт высоты (Binding loop, тот же класс, что и 16.09).
-                elide: Text.ElideRight
-                Layout.maximumWidth: root.width / 4
-                Layout.alignment: Qt.AlignVCenter
-            }
-
-            // Во время загрузки её можно прервать — иначе фоновая сеть
-            // остаётся без управления (ИБ, У66).
-            AvButton {
-                text: qsTr("Отмена")
-                small: true
-                visible: root.busyWithModel
-                Layout.alignment: Qt.AlignVCenter
-                onClicked: if (root.settings) root.settings.cancelDownloads()
-            }
-
-            // В норме кнопки нет: рабочую модель трогать незачем, а соблазн
-            // перекачать 226 МБ без причины — вред. Показываем только когда
-            // с моделью что-то не так или её нет вовсе (решение 22.09).
-            AvButton {
-                text: root.canInstall ? qsTr("Установить") : qsTr("Переустановить")
-                small: true
-                iconName: root.canInstall ? "download" : "refresh"
-                visible: !root.busyWithModel && root.activeModelState !== "ok"
-                enabled: root.settings !== null
-                    && (root.canInstall ? root.settings.canInstall : root.settings.canReinstall)
-                Layout.alignment: Qt.AlignVCenter
-                onClicked: {
-                    if (!root.settings)
-                        return
-                    if (root.canInstall)
-                        root.settings.installRecommendedModel()
-                    else
-                        root.settings.reinstallActiveModel()
-                }
-            }
-        }
-
         // Кнопки «Повторить» нет по решению заказчика от 15.09.2026 (PRD 0.8 F2.11):
         // бэкенд выполняет автоповтор раз в 30 секунд.
         SettingRow {
             width: parent.width
+            divider: false
             label: qsTr("Горячая клавиша")
             sub: qsTr("Удерживайте и говорите — текст появится там, где курсор")
             locked: root.isLocked("hotkey")
@@ -184,9 +93,9 @@ Column {
         SettingRow {
             width: parent.width
             label: qsTr("Режим")
-            // Подписи нет: смысл виден по самим кнопкам, а раздел должен
-            // помещаться без прокрутки (решение заказчика 22.09).
-            showHint: false
+            // Подпись вернулась вместе с переездом модели в раздел «Модели»:
+            // без строки модели раздел снова помещается без прокрутки.
+            sub: qsTr("Удерживать — самый предсказуемый вариант")
             locked: root.isLocked("hotkey_mode")
 
             AvSegmented {

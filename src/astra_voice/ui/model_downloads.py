@@ -53,6 +53,7 @@ from astra_voice.ui.formatting import (
     clean_display_name,
     format_eta,
     format_size,
+    format_space,
     format_speed,
 )
 
@@ -468,6 +469,7 @@ class ModelDownloads(QObject):
 
     modelsChanged = pyqtSignal()
     selectionChanged = pyqtSignal()
+    freeSpaceTextChanged = pyqtSignal()
     downloadStateChanged = pyqtSignal()
     downloadProgressChanged = pyqtSignal()
     downloadTitleChanged = pyqtSignal()
@@ -537,7 +539,11 @@ class ModelDownloads(QObject):
         self._recheck_model_state = ("", "")
         self._update_depth = 0
         self._pending_notifications: dict[str, tuple[object, ...]] = {}
+        self._free_space_text = ""
         self._initial_model_state()
+        self._refresh_free_space_text()
+        # selectionChanged публикуется также после завершения каждой модели в очереди.
+        self.selectionChanged.connect(self._refresh_free_space_text)
 
     @property
     def model(self) -> ModelPort | None:
@@ -678,6 +684,23 @@ class ModelDownloads(QObject):
         if state == "ok" and self._model.current_ids() == (entry.id, entry.revision):
             return "active"
         return "installed"
+
+    def _refresh_free_space_text(self) -> None:
+        size = ""
+        free_bytes = getattr(self._model, "free_bytes", None)
+        if callable(free_bytes):
+            try:
+                size = format_space(free_bytes())
+            except (OSError, StoreError):
+                log.debug("Не удалось определить свободное место на диске")
+        text = f"свободно на диске {size}" if size else ""
+        if text != self._free_space_text:
+            self._free_space_text = text
+            self.freeSpaceTextChanged.emit()
+
+    @property
+    def freeSpaceText(self) -> str:  # noqa: N802
+        return self._free_space_text
 
     @property
     def models(self) -> list[dict[str, Any]]:
