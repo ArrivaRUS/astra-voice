@@ -1,6 +1,10 @@
 // Выпадающий список — design/spec.md §4.4.
 // Закрытый: 33,5 высоты, паддинг 6/10, шеврон chevd 13. Раскрытый: не более 6 пунктов (238 px),
 // вниз, а если места нет — вверх; выбранный пункт — selection-bg / selection-fg.
+// Ширина 236 у поповера — минимальная (§4.4): если названия длиннее поля (микрофоны на
+// машинах заказчика 22.09 различаются только хвостом), список расширяется под самое длинное
+// название до popupMaxWidth и раскрывается влево, чтобы правый край остался на месте.
+// Закрытое поле с обрезанным названием показывает полное подсказкой (§11.3).
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import ".."
@@ -15,6 +19,54 @@ ComboBox {
     implicitHeight: Math.ceil(Theme.selectHeight)
     font.family: Theme.fontUi
     font.pixelSize: Theme.fontSelectSize
+
+    // Предел ширины раскрытого списка; 0 — не шире самого поля (как в макете).
+    property real popupMaxWidth: 0
+    // Ширина самого длинного пункта с паддингами; считается при раскрытии.
+    property real itemsWidth: 0
+
+    FontMetrics {
+        id: itemMetrics
+        font.family: Theme.fontUi
+        font.pixelSize: Theme.fontMenuItemSize
+        font.weight: Font.Medium
+    }
+
+    function measureItems() {
+        var widest = 0
+        for (var i = 0; i < control.count; ++i)
+            widest = Math.max(widest, itemMetrics.advanceWidth(control.textAt(i)))
+        return Math.ceil(widest + Theme.popoverItemPaddingX * 2 + Theme.popoverPadding * 2
+                         + Theme.scrollbarW)
+    }
+
+    ToolTip {
+        id: fullTextTip
+        parent: control
+        visible: control.hovered && !control.popup.visible && control.contentItem.truncated
+        text: control.displayText
+        delay: 500
+        y: -implicitHeight - 4
+        padding: 0
+        // §11.3: фон/текст фиксированные (PillTheme), 12 px, паддинг 5/9, радиус 6.
+        contentItem: Text {
+            textFormat: Text.PlainText
+            text: fullTextTip.text
+            font.family: Theme.fontUi
+            font.pixelSize: 12
+            renderType: Text.NativeRendering
+            color: PillTheme.tooltipFg
+            leftPadding: 9
+            rightPadding: 9
+            topPadding: 5
+            bottomPadding: 5
+        }
+        background: Rectangle {
+            radius: Theme.radiusTooltip
+            antialiasing: true
+            color: PillTheme.tooltipBg
+        }
+    }
 
     contentItem: Text {
         textFormat: Text.PlainText
@@ -86,7 +138,12 @@ ComboBox {
 
     popup: Popup {
         y: control.height
-        width: control.width
+        width: control.popupMaxWidth > 0
+               ? Math.max(control.width, Math.min(control.popupMaxWidth, control.itemsWidth))
+               : control.width
+        // Правый край на месте: широкий список уходит влево, к подписи строки.
+        x: control.width - width
+        onAboutToShow: control.itemsWidth = control.measureItems()
         implicitHeight: Math.min(listView.contentHeight + Theme.popoverPadding * 2, Theme.popoverMaxH)
         padding: Theme.popoverPadding
 

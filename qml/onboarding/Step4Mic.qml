@@ -148,6 +148,8 @@ Item {
 
             AvSelect {
                 id: deviceSelector
+                // Длинные названия микрофонов: список раскрывается на ширину строки.
+                popupMaxWidth: deviceRow.width - Theme.cardRowPaddingX * 2
                 Layout.preferredWidth: 236 // Макет: ширина списка микрофонов.
                 Layout.alignment: Qt.AlignVCenter
                 model: root.deviceNames()

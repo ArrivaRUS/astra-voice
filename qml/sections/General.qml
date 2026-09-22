@@ -157,12 +157,15 @@ Column {
         }
 
         SettingRow {
+            id: deviceRow
             width: parent.width
             label: qsTr("Микрофон")
             locked: root.isLocked("device")
 
             AvSelect {
                 id: deviceSelector
+                // Длинные названия микрофонов: список раскрывается на ширину строки.
+                popupMaxWidth: deviceRow.width - Theme.cardRowPaddingX * 2
                 Layout.preferredWidth: 236  // §4.4: типовая ширина списка в строке настройки
                 Layout.alignment: Qt.AlignVCenter
                 enabled: !root.isLocked("device")
