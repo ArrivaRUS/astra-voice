@@ -119,11 +119,14 @@ Column {
                 onClicked: if (root.settings) root.settings.cancelDownloads()
             }
 
+            // В норме кнопки нет: рабочую модель трогать незачем, а соблазн
+            // перекачать 226 МБ без причины — вред. Показываем только когда
+            // с моделью что-то не так или её нет вовсе (решение 22.09).
             AvButton {
                 text: root.canInstall ? qsTr("Установить") : qsTr("Переустановить")
                 small: true
                 iconName: root.canInstall ? "download" : "refresh"
-                visible: !root.busyWithModel
+                visible: !root.busyWithModel && root.activeModelState !== "ok"
                 enabled: root.settings !== null
                     && (root.canInstall ? root.settings.canInstall : root.settings.canReinstall)
                 Layout.alignment: Qt.AlignVCenter

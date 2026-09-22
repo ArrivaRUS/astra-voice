@@ -1868,6 +1868,8 @@ def test_done_updates_when_model_becomes_ready(onboarding_app: Any, dark: bool) 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_settings_reinstall_calls_bridge(onboarding_app: Any, dark: bool) -> None:
     fake = FakeSettings()
+    # У исправной модели кнопки нет: перекачивать рабочую модель незачем.
+    fake.activeModelState = "broken"
 
     def inspect(window: Any) -> None:
         button = visible_button(window.contentItem(), "Переустановить")
@@ -1878,3 +1880,19 @@ def test_settings_reinstall_calls_bridge(onboarding_app: Any, dark: bool) -> Non
 
     _, messages = render_settings(onboarding_app, dark, fake=fake, inspect=inspect)
     assert_no_messages(messages, "reinstall active model")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_settings_hides_model_button_when_model_is_ok(onboarding_app: Any, dark: bool) -> None:
+    """Рабочая модель не предлагает себя перекачать: кнопки в норме нет."""
+    fake = FakeSettings()
+    fake.activeModelState = "ok"
+
+    def inspect(window: Any) -> None:
+        texts = visible_texts(window.contentItem())
+        assert "Переустановить" not in texts
+        assert "Установить" not in texts
+        assert fake.activeModelName in " ".join(texts)
+
+    _, messages = render_settings(onboarding_app, dark, fake=fake, inspect=inspect)
+    assert_no_messages(messages, "model row without button")
