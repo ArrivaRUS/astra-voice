@@ -221,6 +221,10 @@ class SettingsBridge(QObject):
     def installedSummary(self) -> str:  # noqa: N802
         return self._downloads.installedSummary if self._downloads is not None else ""
 
+    @pyqtProperty(int, notify=modelsChanged)
+    def installedCount(self) -> int:  # noqa: N802
+        return self._downloads.installedCount if self._downloads is not None else 0
+
     @pyqtSlot(str)
     def makeModelCurrent(self, model_id: str) -> None:  # noqa: N802
         if self._downloads is not None:

@@ -79,6 +79,9 @@ class FakeManagedPort:
     def is_revoked(self, entry: Any) -> bool:
         return False
 
+    def revoked_revision(self, model_id: str, revision: str) -> bool:
+        return False
+
     def recheck_entries(self) -> tuple[CatalogEntry, ...]:
         return ()
 
@@ -184,9 +187,21 @@ def test_installed_summary_is_empty_without_catalog() -> None:
     downloads = ModelDownloads(None)
     try:
         assert downloads.installedSummary == ""
+        assert downloads.installedCount == 0
         assert downloads.models == []
     finally:
         downloads.shutdown()
+
+
+def test_installed_count_matches_summary(rig: Rig) -> None:
+    """Цифра значка сайдбара — то же число, что первое число счётчика шапки."""
+    port, downloads, _ = rig
+    assert downloads.installedCount == 0
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    assert downloads.installedCount == 1
+    port.records[(TONE.id, TONE.revision)] = "broken"
+    assert downloads.installedCount == 2
+    assert downloads.installedSummary.startswith("Установлено 2 из 2")
 
 
 def test_domestic_flag_comes_from_catalog(rig: Rig) -> None:
@@ -324,8 +339,10 @@ def test_settings_bridge_forwards_model_management() -> None:
     downloads = Mock(spec=ModelDownloads)
     bridge = SettingsBridge(settings_mod.from_dict({}), save=Mock(), downloads=downloads)
     downloads.installedSummary = "Установлено 1 из 12 · 226 МБ на диске"
+    downloads.installedCount = 1
 
     assert bridge.installedSummary == "Установлено 1 из 12 · 226 МБ на диске"
+    assert bridge.installedCount == 1
     bridge.makeModelCurrent("t-one")
     bridge.removeModel("t-one")
     bridge.updateModel("t-one")
@@ -339,6 +356,7 @@ def test_settings_bridge_without_downloads_is_silent() -> None:
     bridge = SettingsBridge(settings_mod.from_dict({}), save=Mock())
 
     assert bridge.installedSummary == ""
+    assert bridge.installedCount == 0
     bridge.makeModelCurrent("t-one")
     bridge.removeModel("t-one")
     bridge.updateModel("t-one")

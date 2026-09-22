@@ -576,3 +576,63 @@ def test_smoke_matches_defaults(text: str, matched: bool) -> None:
 )
 def test_smoke_matches_custom_words(text: str, expected: Sequence[str], matched: bool) -> None:
     assert model_source.smoke_matches(text, expected) is matched
+
+
+# ── отозванная ревизия при запуске (US-6.6) ────────────────────────────────
+
+
+@pytest.mark.parametrize("source", ["settings", "store", "model-dir"])
+def test_revoked_revision_is_not_loaded(settings: Settings, tmp_path: Path, source: str) -> None:
+    store: FakeStore | None = None
+    if source == "store":
+        store = FakeStore(record=FakeRecord())
+        expected = ("stored-model", "stored-revision")
+    elif source == "model-dir":
+        settings = from_dict({"model_dir": str(tmp_path / "gigaam" / "v3")})
+        expected = ("gigaam", "v3")
+    else:
+        expected = ("saved-model", "r1")
+    seen: list[tuple[str, str]] = []
+
+    def revoked(model_id: str, revision: str) -> bool:
+        seen.append((model_id, revision))
+        return True
+
+    with pytest.raises(model_source.ModelRevoked):
+        resolve_model_request(settings, store, store_dir=tmp_path, revoked=revoked)
+
+    assert seen == [expected]
+
+
+@pytest.mark.parametrize("source", ["settings", "store"])
+def test_other_revocation_does_not_block_model(
+    settings: Settings, tmp_path: Path, source: str
+) -> None:
+    store = FakeStore(record=FakeRecord()) if source == "store" else None
+    revoked = Mock(return_value=False)
+
+    request = resolve_model_request(settings, store, store_dir=tmp_path, revoked=revoked)
+
+    assert request is not None
+    assert request["type"] == "model.load"
+    revoked.assert_called_once()
+
+
+def test_unreadable_catalog_does_not_block_model(
+    settings: Settings, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Каталог прочитать не удалось — это не повод остаться без диктовки."""
+    with caplog.at_level(logging.WARNING, logger=model_source.__name__):
+        request = resolve_model_request(
+            settings, None, store_dir=tmp_path, revoked=Mock(side_effect=OSError("нет файла"))
+        )
+
+    assert request is not None
+    assert "Не удалось проверить отзыв версии модели" in caplog.text
+
+
+def test_missing_model_is_still_not_configured(tmp_path: Path) -> None:
+    revoked = Mock(return_value=True)
+
+    assert resolve_model_request(from_dict({}), None, store_dir=tmp_path, revoked=revoked) is None
+    revoked.assert_not_called()

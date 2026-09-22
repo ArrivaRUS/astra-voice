@@ -81,6 +81,8 @@ class CatalogEntry:
     recommended: bool
     host: str
     files: tuple[FileSpec, ...]
+    # Запасные источники тех же путей в порядке каталога: hf → github → корпоративный.
+    mirrors: tuple[str, ...] = ()
     # Поля ниже появились в манифесте 12 записей и необязательны:
     # каталог из одной записи без них остаётся валидным.
     ram_estimated: bool = False
@@ -220,6 +222,21 @@ def _languages(value: object) -> tuple[str, ...]:
     return languages
 
 
+def _mirrors(value: object, host: str) -> tuple[str, ...]:
+    """Запасные хосты: из того же списка разрешённых, без повторов и без основного."""
+    if value is None:
+        return ()
+    mirrors = tuple(_string(item) for item in _array(value))
+    if not mirrors or len(set(mirrors)) != len(mirrors) or host in mirrors:
+        raise CatalogError("bad-schema", "В каталоге неверный список запасных источников.")
+    for mirror in mirrors:
+        if not host_allowed(mirror):
+            raise CatalogError(
+                "bad-schema", "Запасной источник модели отсутствует в списке разрешённых."
+            )
+    return mirrors
+
+
 def _metric(value: object) -> Metric:
     data = _object(value)
     number = data.get("value")
@@ -334,6 +351,7 @@ def _model(value: object) -> CatalogEntry:
         recommended=_boolean(data.get("recommended")),
         host=host,
         files=files,
+        mirrors=_mirrors(data.get("mirrors"), host),
         ram_estimated=_optional_boolean(data.get("ram_estimated")),
         vendor=_optional_string(data.get("vendor")),
         vendor_short=_optional_string(data.get("vendor_short")),

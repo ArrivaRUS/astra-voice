@@ -140,15 +140,46 @@ class SmokeRunner:
     __call__ = run
 
 
+class ModelRevoked(RuntimeError):
+    """Издатель отозвал установленную ревизию: загружать её нельзя (US-6.6)."""
+
+
+RevokedCheck = Callable[[str, str], bool]
+
+
+def _not_revoked(request: dict[str, Any], revoked: RevokedCheck | None) -> dict[str, Any]:
+    """Последний рубеж перед загрузкой: настройки каталог сами по себе не видят."""
+    if revoked is None:
+        return request
+    try:
+        if not revoked(str(request.get("id", "")), str(request.get("revision", ""))):
+            return request
+    except Exception:
+        # Каталог прочитать не удалось: молча загружаем то, что выбрано в хранилище.
+        log.warning("Не удалось проверить отзыв версии модели")
+        return request
+    log.warning("Версия модели отозвана издателем: загрузка отменена")
+    raise ModelRevoked("Эта версия модели отозвана.")
+
+
 def resolve_model_request(
-    settings: Settings, store: ModelStore | None = None, *, store_dir: Path
+    settings: Settings,
+    store: ModelStore | None = None,
+    *,
+    store_dir: Path,
+    revoked: RevokedCheck | None = None,
 ) -> dict[str, Any] | None:
-    """Выбирает явно заданную модель, модель хранилища или модель из настроек."""
+    """Выбирает явно заданную модель, модель хранилища или модель из настроек.
+
+    `revoked` — проверка отзыва по каталогу; отозванная ревизия не возвращается,
+    вместо запроса поднимается :class:`ModelRevoked`.
+    """
     data = settings.to_dict()
     if model_dir := data.get("model_dir"):
         if data.get("model_id") and data.get("model_revision"):
-            return build_model_load(data, store_dir=store_dir)
-        return build_model_load(data, model_dir=model_dir, store_dir=store_dir)
+            return _not_revoked(build_model_load(data, store_dir=store_dir), revoked)
+        request = build_model_load(data, model_dir=model_dir, store_dir=store_dir)
+        return _not_revoked(request, revoked)
 
     if store is not None:
         try:
@@ -162,19 +193,22 @@ def resolve_model_request(
                 and record.recheck is not True
                 and record.metadata_ok
             ):
-                return build_model_load(
-                    {
-                        **data,
-                        "model_id": record.id,
-                        "model_revision": record.revision,
-                        "model_dir": str(record.dir),
-                        "model_layout": record.layout,
-                        "model_variant": record.variant,
-                    },
-                    store_dir=store_dir,
+                return _not_revoked(
+                    build_model_load(
+                        {
+                            **data,
+                            "model_id": record.id,
+                            "model_revision": record.revision,
+                            "model_dir": str(record.dir),
+                            "model_layout": record.layout,
+                            "model_variant": record.variant,
+                        },
+                        store_dir=store_dir,
+                    ),
+                    revoked,
                 )
 
     try:
-        return build_model_load(data, store_dir=store_dir)
+        return _not_revoked(build_model_load(data, store_dir=store_dir), revoked)
     except ModelNotConfigured:
         return None

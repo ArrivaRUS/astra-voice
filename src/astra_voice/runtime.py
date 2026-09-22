@@ -28,7 +28,9 @@ from astra_voice.core.dictation import (
     TestCallback,
 )
 from astra_voice.core.model_source import (
+    ModelRevoked,
     ModelStore,
+    RevokedCheck,
     resolve_model_request,
     smoke_matches,
     smoke_wav_path,
@@ -62,6 +64,7 @@ from astra_voice.ui.notify import (
 from astra_voice.ui.pill import (
     ERROR_MODEL_LOAD_FAILED,
     ERROR_MODEL_NOT_LOADED,
+    ERROR_MODEL_REVOKED,
     ERROR_SELFCHECK_FAILED,
     Pill,
     PillState,
@@ -126,6 +129,9 @@ class DictationRuntime(QObject):
         self.settings = settings
         self.model_store = model_store
         self.session_kind = session_kind
+        # Каталог создаётся позже окна: проверку отзыва подставляют сеттером.
+        self._revoked_check: RevokedCheck | None = None
+        self._revoked_notified = False
         self.on_quit_requested: Callable[[], None] | None = None
         self.on_show_requested: Callable[[], None] | None = None
         self._resolved_device = ""
@@ -237,6 +243,19 @@ class DictationRuntime(QObject):
         """Последняя фраза в памяти; не передаётся журналу или уведомлениям."""
         return self.orchestrator.last_text
 
+    def set_revoked_check(self, revoked: RevokedCheck | None) -> None:
+        """Подключает проверку отзыва ревизии по каталогу (US-6.6)."""
+        self._revoked_check = revoked
+
+    def _resolve_model_request(self) -> dict[str, Any] | None:
+        """Запрос загрузки с учётом отзыва; ModelRevoked пробрасывается выше."""
+        return resolve_model_request(
+            self.settings,
+            self.model_store,
+            store_dir=paths.model_store_dir(),
+            revoked=self._revoked_check,
+        )
+
     def _send(self, message: dict[str, Any], *, timeout: float | None = None) -> None:
         """Адаптирует возвращаемое значение супервизора к порту команд."""
         self.supervisor.send(message, timeout=timeout)
@@ -269,9 +288,7 @@ class DictationRuntime(QObject):
             callback(MicrophoneTestUpdate("error", message=TEST_MODEL_UNAVAILABLE))
             return False
         try:
-            request = resolve_model_request(
-                self.settings, self.model_store, store_dir=paths.model_store_dir()
-            )
+            request = self._resolve_model_request()
         except Exception:
             request = None
         same_model = request == self._model_load_request
@@ -314,9 +331,7 @@ class DictationRuntime(QObject):
     def reload_model(self) -> None:
         """Перезапускает воркер, если текущая модель ещё не загружена и проверена."""
         try:
-            request = resolve_model_request(
-                self.settings, self.model_store, store_dir=paths.model_store_dir()
-            )
+            request = self._resolve_model_request()
         except Exception:
             request = None
         if (
@@ -382,6 +397,19 @@ class DictationRuntime(QObject):
             self._model_load_failures = 0
         self.supervisor.start()
 
+    def _model_revoked(self) -> None:
+        """Отозванную ревизию не грузим: показываем состояние и зовём поставить другую."""
+        self._loading_model = False
+        if self._selfcheck == "retrying":
+            self._finish_selfcheck("load-failed")
+            return
+        if self.orchestrator.phase == DictationPhase.IDLE:
+            self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_REVOKED)
+        self.tray.set_state(TrayState.ERROR)
+        if not self._revoked_notified:
+            self._revoked_notified = True
+            notify.notify_model_revoked()
+
     def _load_model(self) -> None:
         """Загружает настроенную модель при каждом запуске нового воркера."""
         if self._model_load_generation == self.supervisor.generation:
@@ -397,9 +425,12 @@ class DictationRuntime(QObject):
             self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
             self.tray.set_state(TrayState.ERROR)
             return
-        request = resolve_model_request(
-            self.settings, self.model_store, store_dir=paths.model_store_dir()
-        )
+        try:
+            request = self._resolve_model_request()
+        except ModelRevoked:
+            self._fail_pending_test()
+            self._model_revoked()
+            return
         if request is None:
             self._fail_pending_test()
             log.info("модель в настройках не указана")

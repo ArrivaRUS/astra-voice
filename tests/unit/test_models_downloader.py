@@ -808,3 +808,170 @@ def test_progress_throttle_window_and_cached_bytes(
     assert progress[-1].eta_s is None
     reporter.report(3, finished=True)
     assert progress[-1].file_index == 3
+
+
+# ── перебор источников каталога (mirrors) ──────────────────────────────────
+
+
+class FakeResponse:
+    """Ответ фейкового транспорта: ровно то, что читает загрузчик."""
+
+    def __init__(self, body: bytes, status: int = 200) -> None:
+        self.status = status
+        self.headers: dict[str, str] = {}
+        self._body = body
+        self.closed = False
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.closed = True
+
+    def iter_chunks(self, size: int, *, limit: int) -> Iterator[bytes]:
+        for start in range(0, len(self._body), size):
+            yield self._body[start : start + size]
+
+
+@dataclass
+class FakeTransport:
+    """Отдаёт файл только с перечисленных хостов; остальные «не отвечают»."""
+
+    bodies: dict[str, bytes]
+    working: set[str]
+    failure: Exception
+    urls: list[str] = field(default_factory=list)
+
+    def get_stream(
+        self,
+        url: str,
+        *,
+        range_from: int | None = None,
+        deadline_s: float,
+        cancel: threading.Event,
+        kind: str = "download",
+    ) -> FakeResponse:
+        self.urls.append(url)
+        host = urlsplit(url).hostname or ""
+        if host not in self.working:
+            raise self.failure
+        return FakeResponse(self.bodies[urlsplit(url).path])
+
+
+@pytest.fixture
+def mirrored(single_entry: CatalogEntry) -> CatalogEntry:
+    return replace(
+        single_entry,
+        host="huggingface.co",
+        mirrors=("github.com", "mirror.example"),
+    )
+
+
+def _fake_loader(
+    store: ModelStore,
+    entry: CatalogEntry,
+    payloads: dict[str, bytes],
+    working: set[str],
+    failure: Exception,
+) -> tuple[Downloader, FakeTransport]:
+    bodies = {file.url_path: payloads[file.path] for file in entry.files}
+    transport = FakeTransport(bodies, working, failure)
+    return Downloader(cast(HttpClient, transport), store), transport
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        http.NetworkError("host-unreachable", "Не удалось связаться с сервером."),
+        http.NetworkError("timeout", "Время ожидания истекло."),
+        DownloadError("bad-status"),
+    ],
+)
+def test_network_failure_moves_to_next_source(
+    store: ModelStore,
+    mirrored: CatalogEntry,
+    payloads: dict[str, bytes],
+    failure: Exception,
+) -> None:
+    loader, transport = _fake_loader(store, mirrored, payloads, {"mirror.example"}, failure)
+    progress: list[Progress] = []
+
+    staging = loader.download(mirrored, progress=progress.append, cancel=threading.Event())
+
+    file = mirrored.files[0]
+    assert (staging / file.path).read_bytes() == payloads[file.path]
+    assert transport.urls == [
+        "https://huggingface.co" + file.url_path,
+        "https://github.com" + file.url_path,
+        "https://mirror.example" + file.url_path,
+    ]
+    # Прогресс не удваивается из-за неудачных источников.
+    assert progress[-1].bytes_done == mirrored.size_bytes
+
+
+def test_last_source_error_is_reported(
+    store: ModelStore, mirrored: CatalogEntry, payloads: dict[str, bytes]
+) -> None:
+    loader, transport = _fake_loader(
+        store, mirrored, payloads, set(), http.NetworkError("host-unreachable", "Нет сервера.")
+    )
+
+    error = _assert_error(loader, mirrored, "host-unreachable")
+
+    assert len(transport.urls) == 3
+    assert "huggingface" not in error.message and "github" not in error.message
+
+
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    [
+        (http.NetworkError("not-allowed", "Источник не разрешён."), "not-allowed"),
+        (http.NetworkError("no-network", "Нет доступа к сети."), "no-network"),
+        (http.NetworkError("cancelled", "Отменено."), "cancelled"),
+    ],
+)
+def test_non_network_failure_does_not_try_mirrors(
+    store: ModelStore,
+    mirrored: CatalogEntry,
+    payloads: dict[str, bytes],
+    failure: Exception,
+    code: str,
+) -> None:
+    loader, transport = _fake_loader(store, mirrored, payloads, set(), failure)
+
+    _assert_error(loader, mirrored, code)
+
+    assert transport.urls == ["https://huggingface.co" + mirrored.files[0].url_path]
+
+
+def test_checksum_is_checked_for_every_source(
+    store: ModelStore, mirrored: CatalogEntry, payloads: dict[str, bytes]
+) -> None:
+    """Запасной источник не освобождён от проверки байтов."""
+    file = mirrored.files[0]
+    # Столько же байт, сколько обещает каталог, но другие: остаётся только sha256.
+    bodies = {file.url_path: bytes(file.size)}
+    transport = FakeTransport(
+        bodies, {"github.com"}, http.NetworkError("host-unreachable", "Нет сервера.")
+    )
+    loader = Downloader(cast(HttpClient, transport), store)
+
+    _assert_error(loader, mirrored, "bad-checksum")
+
+    assert transport.urls[-1] == "https://github.com" + file.url_path
+
+
+def test_entry_without_mirrors_uses_single_source(
+    store: ModelStore, single_entry: CatalogEntry, payloads: dict[str, bytes]
+) -> None:
+    entry = replace(single_entry, host="huggingface.co")
+    loader, transport = _fake_loader(
+        store, entry, payloads, set(), http.NetworkError("host-unreachable", "Нет сервера.")
+    )
+
+    _assert_error(loader, entry, "host-unreachable")
+
+    assert transport.urls == ["https://huggingface.co" + entry.files[0].url_path]

@@ -182,6 +182,12 @@ def _entry(model: dict[str, Any], cache: dict[str, Any], sources: dict[str, str]
         "license": model["license"],
         "domestic": bool(model["domestic"]),
     }
+    mirrors = [str(host) for host in model.get("mirrors", [])]
+    if mirrors:
+        # Порядок источников берём из таблицы как есть: hf → github → корпоративный.
+        if len(set(mirrors)) != len(mirrors) or model["host"] in mirrors:
+            raise BuildError(f"Повторяющийся запасной источник у записи {model['id']}.")
+        entry["mirrors"] = mirrors
     metrics = {
         name: {"value": value, "source": sources[name]}
         for name, value in sorted(model["metrics"].items())

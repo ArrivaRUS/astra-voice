@@ -25,6 +25,9 @@ _FILE_DEADLINE_S = 6 * 60 * 60
 _PROGRESS_INTERVAL_S = 0.2
 _SPEED_WINDOW_S = 5.0
 _CONTENT_RANGE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)", re.IGNORECASE)
+# Сетевые отказы одного источника: пробуем следующий. Повреждение, отмена,
+# выключенная сеть и запрещённый источник смены источника не оправдывают.
+_MIRROR_CODES = frozenset({"host-unreachable", "timeout", "bad-status"})
 
 
 @dataclass(frozen=True)
@@ -212,14 +215,8 @@ class Downloader:
                         reporter.done += file.size
                     else:
                         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                        self._download_file(
-                            "https://" + entry.host + file.url_path,
-                            file,
-                            part,
-                            budget,
-                            reporter,
-                            index,
-                            cancel,
+                        self._download_from_sources(
+                            entry, file, part, budget, reporter, index, cancel
                         )
                         replaced_size = target.stat().st_size if target.exists() else 0
                         os.replace(part, target)
@@ -240,6 +237,47 @@ class Downloader:
             if exc.errno in {errno.ENOSPC, errno.EDQUOT}:
                 raise DownloadError("disk-full") from exc
             raise
+
+    def _download_from_sources(
+        self,
+        entry: CatalogEntry,
+        file: FileSpec,
+        part: Path,
+        budget: _Budget,
+        reporter: _Reporter,
+        index: int,
+        cancel: threading.Event,
+    ) -> None:
+        """Перебирает источники каталога по порядку; проверки байт у всех одни.
+
+        Хост в журнал и на экран не выносим: пользователю он ничего не говорит.
+        """
+        sources = (entry.host, *entry.mirrors)
+        done_before = reporter.done
+        for number, host in enumerate(sources, start=1):
+            try:
+                self._download_file(
+                    "https://" + host + file.url_path,
+                    file,
+                    part,
+                    budget,
+                    reporter,
+                    index,
+                    cancel,
+                )
+            except (DownloadError, NetworkError) as exc:
+                if exc.code not in _MIRROR_CODES or number == len(sources):
+                    raise
+                log.warning(
+                    "Источник %d из %d не ответил (%s); пробуем следующий",
+                    number,
+                    len(sources),
+                    exc.code,
+                )
+                # Следующая попытка сама посчитает уже загруженную часть файла.
+                reporter.done = done_before
+                continue
+            return
 
     def _download_file(
         self,

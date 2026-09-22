@@ -1,9 +1,9 @@
 {
   "manifest_version": 1,
-  "schema_sha256": "966678a59bfff4e1910c9bb4bf6c5bb15e0c076c5d572e0065167d50a31757cc",
-  "serial": 3,
+  "schema_sha256": "5e7f8390b0cf3b442b22a54e7b6052e2868cdaa22e2e5a9fe5dba858d8a026f3",
+  "serial": 4,
   "trust_epoch": 1,
-  "generated_at": "2026-09-22T10:04:27Z",
+  "generated_at": "2026-09-22T11:15:00Z",
   "publisher": "astra-voice",
   "revoked": [],
   "models": [

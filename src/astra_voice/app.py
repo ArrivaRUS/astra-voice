@@ -785,6 +785,9 @@ def main(argv: list[str] | None = None) -> int:
             log.warning("Не удалось подготовить каталог моделей, настройка продолжится без него")
         downloads = ModelDownloads(model, store=model_store)
         downloads.start_recheck()
+        if runtime_ready and runtime is not None and model is not None:
+            # Отозванную ревизию рантайм видит только через каталог (US-6.6).
+            runtime.set_revoked_check(model.revoked_revision)
 
         settings_bridge = SettingsBridge(
             stored,

@@ -32,6 +32,7 @@ ERROR_RECOGNITION_FAILED: Final = "Не удалось распознать"
 ERROR_MODEL_NOT_LOADED: Final = "Модель не загружена"
 ERROR_MODEL_LOAD_FAILED: Final = "Не удалось загрузить модель"
 ERROR_SELFCHECK_FAILED: Final = "Распознавание не работает"
+ERROR_MODEL_REVOKED: Final = "Модель недоступна"
 ERROR_REASONS: Final = frozenset(
     (
         ERROR_MICROPHONE_UNAVAILABLE,
@@ -43,6 +44,7 @@ ERROR_REASONS: Final = frozenset(
         ERROR_MODEL_NOT_LOADED,
         ERROR_MODEL_LOAD_FAILED,
         ERROR_SELFCHECK_FAILED,
+        ERROR_MODEL_REVOKED,
     )
 )
 

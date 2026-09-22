@@ -1573,6 +1573,9 @@ class FakeModelPort:
     def is_revoked(self, entry: Any) -> bool:
         return (entry.id, entry.revision) in self.revoked
 
+    def revoked_revision(self, model_id: str, revision: str) -> bool:
+        return (model_id, revision) in self.revoked
+
     def recheck_entries(self) -> tuple[CatalogEntry, ...]:
         return ()
 

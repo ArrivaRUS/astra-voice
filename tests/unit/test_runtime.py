@@ -59,6 +59,7 @@ from astra_voice.ui.bridges import OnboardingController, SettingsBridge
 from astra_voice.ui.pill import (
     ERROR_MODEL_LOAD_FAILED,
     ERROR_MODEL_NOT_LOADED,
+    ERROR_MODEL_REVOKED,
     ERROR_SELFCHECK_FAILED,
     PillState,
 )
@@ -3982,3 +3983,57 @@ def test_level_cancel_buttons_close_microphone(rig: Rig, source: str, responsive
     rig.pill.hide.assert_called_once_with()
     assert rig.runtime.phase == DictationPhase.IDLE
     rig.runtime.shutdown()
+
+
+# ── отозванная ревизия не грузится при запуске (US-6.6) ────────────────────
+
+
+def test_revoked_revision_is_not_loaded_and_shows_state(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": f"/tmp/{MARKER}/gigaam/v3"}))
+    rig.runtime.set_revoked_check(lambda model_id, revision: True)
+    rig.runtime.start()
+    with caplog.at_level(logging.WARNING):
+        rig.event(type="hello")
+
+    rig.supervisor.send.assert_not_called()
+    rig.pill.show_state.assert_called_once_with(PillState.ERROR, text=ERROR_MODEL_REVOKED)
+    rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
+    assert rig.notify.mock_calls == [call.notify_model_revoked()]
+    assert not rig.runtime._loading_model
+    assert rig.runtime._model_load_failures == 0
+    assert MARKER not in caplog.text
+
+
+def test_revoked_revision_notifies_once_across_restarts(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": f"/tmp/{MARKER}/gigaam/v3"}))
+    rig.runtime.set_revoked_check(lambda model_id, revision: True)
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.runtime.restart_worker()
+    rig.event(type="hello", generation=rig.supervisor.generation)
+
+    assert rig.notify.mock_calls == [call.notify_model_revoked()]
+    rig.supervisor.send.assert_not_called()
+
+
+def test_model_without_revocation_loads_as_before(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": f"/tmp/{MARKER}/gigaam/v3"}))
+    rig.runtime.set_revoked_check(lambda model_id, revision: False)
+    rig.runtime.start()
+    rig.event(type="hello")
+
+    assert rig.supervisor.send.call_args.args[0]["type"] == "model.load"
+    rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
+    assert not rig.notify.mock_calls
+
+
+def test_revoked_revision_blocks_microphone_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": f"/tmp/{MARKER}/gigaam/v3"}))
+    rig.runtime.set_revoked_check(lambda model_id, revision: True)
+    rig.runtime.start()
+    callback = Mock()
+
+    assert rig.runtime.start_test("alsa_input.usb", callback) is False
+    assert callback.call_args.args[0].message == TEST_MODEL_UNAVAILABLE

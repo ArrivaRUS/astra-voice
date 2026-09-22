@@ -693,3 +693,43 @@ def test_validate_attribute_error_is_catalog_schema_mismatch(
     validate.assert_called_once_with(document)
     assert error.value.code == "bad-schema"
     assert error.value.message == "Каталог не соответствует схеме."
+
+
+# ── запасные источники записи каталога ─────────────────────────────────────
+
+
+def test_mirrors_are_optional_and_parsed_in_order(
+    catalog_root: Path, document: dict[str, Any]
+) -> None:
+    assert "mirrors" not in document["models"][0]
+    catalog = load_builtin(StubVerifier(), root=catalog_root)
+    assert catalog.entries[0].mirrors == ()
+
+    document["models"][0]["mirrors"] = ["github.com", "objects.githubusercontent.com"]
+    write_document(catalog_root, document)
+
+    catalog = load_builtin(StubVerifier(), root=catalog_root)
+    assert catalog.entries[0].mirrors == ("github.com", "objects.githubusercontent.com")
+
+
+@pytest.mark.parametrize(
+    "mirrors",
+    [
+        ["evil.example"],
+        ["github.com", "github.com"],
+        ["huggingface.co"],
+        [],
+        ["github.com", 1],
+        "github.com",
+    ],
+    ids=["not-allowed", "duplicate", "same-as-host", "empty", "not-a-string", "not-a-list"],
+)
+def test_bad_mirrors_are_rejected(
+    catalog_root: Path,
+    document: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    mirrors: object,
+) -> None:
+    document["models"][0]["mirrors"] = mirrors
+    write_document(catalog_root, document)
+    assert_rejected_without_side_effects(catalog_root, "bad-schema", monkeypatch)

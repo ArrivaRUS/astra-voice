@@ -178,6 +178,8 @@ class ModelPort(Protocol):
 
     def is_revoked(self, entry: Any) -> bool: ...
 
+    def revoked_revision(self, model_id: str, revision: str) -> bool: ...
+
     def recheck_entries(self) -> tuple[Any, ...]: ...
 
     def verify_files(self, entry: Any) -> tuple[bool, str]: ...
@@ -315,6 +317,10 @@ class ModelService:
     def is_revoked(self, entry: Any) -> bool:
         """Издатель отозвал именно эту ревизию модели."""
         return self._catalog.is_revoked(entry.id, entry.revision)
+
+    def revoked_revision(self, model_id: str, revision: str) -> bool:
+        """То же по паре «модель, ревизия» — для проверки перед загрузкой моделью."""
+        return self._catalog.is_revoked(model_id, revision)
 
     def entries(self) -> tuple[CatalogEntry, ...]:
         # Отозванную ревизию не предлагаем, но уже установленную показываем:
@@ -895,6 +901,12 @@ class ModelDownloads(QObject):
             }
             for entry in self._entries
         ]
+
+    @property
+    def installedCount(self) -> int:  # noqa: N802
+        """Сколько записей каталога установлено: цифра значка у пункта «Модели»."""
+        installed = self._installed_ids()
+        return sum(1 for entry in self._entries if self._badge(entry, installed))
 
     @property
     def installedSummary(self) -> str:  # noqa: N802

@@ -35,6 +35,7 @@ from astra_voice.ui.pill import (
     ERROR_MICROPHONE_UNAVAILABLE,
     ERROR_MODEL_LOAD_FAILED,
     ERROR_MODEL_NOT_LOADED,
+    ERROR_MODEL_REVOKED,
     ERROR_REASONS,
     ERROR_RECOGNITION_FAILED,
     ERROR_RECOGNITION_RESTARTED,
@@ -905,6 +906,7 @@ def test_error_registry_is_exact() -> None:
         "Модель не загружена",
         "Не удалось загрузить модель",
         "Распознавание не работает",
+        "Модель недоступна",
     }
     assert ERROR_REASONS == {
         ERROR_MICROPHONE_UNAVAILABLE,
@@ -916,6 +918,7 @@ def test_error_registry_is_exact() -> None:
         ERROR_MODEL_NOT_LOADED,
         ERROR_MODEL_LOAD_FAILED,
         ERROR_SELFCHECK_FAILED,
+        ERROR_MODEL_REVOKED,
     }
 
 

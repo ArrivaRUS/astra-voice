@@ -8,17 +8,24 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+from astra_voice.core import paths
 from astra_voice.models.catalog import ID_RE, Catalog, CatalogEntry, FileSpec
 from astra_voice.models.store import ModelRecord, ModelStore, StoreError
 from astra_voice.security.verify import HashCancelledError
 from astra_voice.security.verify import sha256_file as sha256_file
-from astra_voice.worker.engine import EngineError, ModelMissingError, check_layout
+from astra_voice.worker.engine import (
+    MAX_LAYOUT_DEPTH,
+    EngineError,
+    ModelMissingError,
+    check_layout,
+)
 
 log = logging.getLogger(__name__)
 _COPY_CHUNK = 1 << 20
@@ -28,6 +35,8 @@ _EXTRA_REASON = "В папке есть лишние файлы. Оставьт�
 _LAYOUT_REASON = "Файлы в папке не подходят для выбранной модели."
 _SMOKE_REASON = "Модель не прошла пробное распознавание. Попробуйте установить её заново."
 _DISK_REASON = "На диске недостаточно места для установки модели. Освободите место."
+# Части относительного пути внутри каталога ревизии: без пробелов и юникода.
+_PATH_PART_RE = re.compile(r"[A-Za-z0-9._-]+")
 _FILES_REASON = "Не удалось прочитать или сохранить файлы модели. Попробуйте ещё раз."
 
 
@@ -62,38 +71,94 @@ class _InstallError(Exception):
         self.reason_code = reason_code
 
 
-def _file_path(directory: Path, name: str) -> Path:
-    """Проверяет границу resolve перед чтением и каждой записью (У6)."""
-    target = directory / name
-    # Поддерживаемые check_layout раскладки содержат только файлы первого уровня.
-    if (
-        not name
-        or name in {".", ".."}
-        or Path(name).name != name
-        or "\\" in name
-        or not target.resolve().is_relative_to(directory.resolve())
-        or target.is_symlink()
+def _path_parts(name: str) -> tuple[str, ...]:
+    """Разбирает относительный путь каталога до обращения к файловой системе (У6).
+
+    Раскладки вроде `am-onnx/encoder.int8.onnx` вложенность допускают, поэтому
+    разрешены только простые части `[A-Za-z0-9._-]+`: ни `..`, ни абсолютного
+    пути, ни обратной косой черты, ни пустых частей, ни глубины больше
+    `MAX_LAYOUT_DEPTH` (столько же, сколько обходит проверка раскладки).
+    """
+    if not name or "\\" in name or name.startswith("/"):
+        raise _InstallError(_LAYOUT_REASON, "layout")
+    parts = tuple(name.split("/"))
+    if len(parts) > MAX_LAYOUT_DEPTH or any(
+        _PATH_PART_RE.fullmatch(part) is None or part in {".", ".."} for part in parts
     ):
+        raise _InstallError(_LAYOUT_REASON, "layout")
+    return parts
+
+
+def _file_path(directory: Path, name: str) -> Path:
+    """Проверяет каждую часть пути и границу resolve перед чтением и записью (У6)."""
+    try:
+        parts = _path_parts(name)
+    except _InstallError:
         log.warning("Недопустимый путь файла модели: %r в %s", name, directory)
+        raise
+    target = directory
+    for part in parts:
+        target = target / part
+        # lstat каждой части: ссылка на любом уровне уводит запись из каталога.
+        if target.is_symlink():
+            log.warning("Символическая ссылка в пути файла модели: %r в %s", name, directory)
+            raise _InstallError(_LAYOUT_REASON, "layout")
+    if not target.resolve().is_relative_to(directory.resolve()):
+        log.warning("Путь файла модели выходит за каталог: %r в %s", name, directory)
         raise _InstallError(_LAYOUT_REASON, "layout")
     return target
 
 
+def _make_parents(directory: Path, name: str) -> Path:
+    """Создаёт недостающие подкаталоги ревизии с правами 0700 и возвращает файл."""
+    target = _file_path(directory, name)
+    parents = [parent for parent in target.parents if parent.is_relative_to(directory)]
+    for parent in reversed(parents):
+        paths._ensure_private_dir(parent)
+    # Каталоги могли появиться между проверкой и созданием: проверяем ссылки заново.
+    return _file_path(directory, name)
+
+
+def _layout_dirs(names: set[str]) -> set[str]:
+    """Подкаталоги, которые разрешает список файлов записи каталога."""
+    directories: set[str] = set()
+    for name in names:
+        parts = name.split("/")
+        for depth in range(1, len(parts)):
+            directories.add("/".join(parts[:depth]))
+    return directories
+
+
 def _check_contents(directory: Path, entry: CatalogEntry, *, allow_parts: bool) -> tuple[Path, ...]:
-    """Отвергает всё вне списка каталога, включая подкаталоги и ссылки."""
+    """Отвергает всё вне списка каталога, включая чужие подкаталоги и ссылки."""
     names = {file.path for file in entry.files}
+    allowed_dirs = _layout_dirs(names)
     parts: list[Path] = []
-    for child in directory.iterdir():
-        if child.is_symlink() or not child.is_file():
-            log.warning("Вместо обычного файла модели обнаружен %s", child)
+
+    def scan(current: Path, prefix: str, depth: int) -> None:
+        for child in current.iterdir():
+            relative = prefix + child.name
+            if child.is_symlink():
+                log.warning("Вместо обычного файла модели обнаружена ссылка %s", child)
+                raise _InstallError(_EXTRA_REASON, "layout")
+            if child.is_dir():
+                if relative not in allowed_dirs or depth + 1 >= MAX_LAYOUT_DEPTH:
+                    log.warning("Лишний подкаталог модели: %s", child)
+                    raise _InstallError(_EXTRA_REASON, "layout")
+                scan(child, relative + "/", depth + 1)
+                continue
+            if not child.is_file():
+                log.warning("Вместо обычного файла модели обнаружен %s", child)
+                raise _InstallError(_EXTRA_REASON, "layout")
+            if relative in names:
+                continue
+            if allow_parts and relative.endswith(".part"):
+                parts.append(_file_path(directory, relative))
+                continue
+            log.warning("Лишний файл модели: %s", child)
             raise _InstallError(_EXTRA_REASON, "layout")
-        if child.name in names:
-            continue
-        if allow_parts and child.name.endswith(".part"):
-            parts.append(_file_path(directory, child.name))
-            continue
-        log.warning("Лишний файл модели: %s", child)
-        raise _InstallError(_EXTRA_REASON, "layout")
+
+    scan(directory, "", 0)
     for file in entry.files:
         if not _file_path(directory, file.path).is_file():
             log.warning("Отсутствует файл модели: %s / %s", directory, file.path)
@@ -333,7 +398,7 @@ class Installer:
             staging = self._store.staging_dir(entry.id, entry.revision)
             for file in entry.files:
                 source = _file_path(src, file.path)
-                target = _file_path(staging, file.path)
+                target = _make_parents(staging, file.path)
                 _copy_file(source, target, file, cancel=cancel)
             return self.install_from_staging(entry, cancel=cancel)
         except (_InstallError, StoreError, OSError, ValueError, RuntimeError) as exc:

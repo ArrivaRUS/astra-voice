@@ -12,12 +12,17 @@ FocusScope {
     property bool debugVisible: false
     property bool debugCurrent: currentIndex === sections.length
 
+    readonly property var settings: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
+    // Значок у «Моделей» — сколько записей каталога установлено; ноль не показываем.
+    readonly property string modelsCounter: root.settings && root.settings.installedCount > 0
+        ? String(root.settings.installedCount) : ""
+
     // subtitle — подзаголовок шапки раздела (§1.4): его показывает Main.qml.
     readonly property var sections: [
         { "key": "general", "title": qsTr("Общие"),
             "subtitle": qsTr("Диктовка, индикация и запуск"), "icon": "cog", "counter": "" },
         { "key": "models", "title": qsTr("Модели"),
-            "subtitle": qsTr("Какая модель распознаёт речь"), "icon": "chip", "counter": "3" },
+            "subtitle": qsTr("Какая модель распознаёт речь"), "icon": "chip", "counter": "" },
         { "key": "output", "title": qsTr("Вывод"),
             "subtitle": qsTr("Куда попадает текст и что происходит с буфером обмена"),
             "icon": "out", "counter": "" },
@@ -119,7 +124,8 @@ FocusScope {
                     width: nav.width
                     title: modelData.title
                     iconName: modelData.icon
-                    counter: modelData.counter
+                    // Список разделов остаётся статическим; цифра приходит из моста.
+                    counter: modelData.key === "models" ? root.modelsCounter : modelData.counter
                     current: index === root.currentIndex
                     onActivated: root.currentIndex = index
                 }

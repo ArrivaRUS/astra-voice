@@ -982,3 +982,254 @@ def test_commit_error_reason_codes(
     assert not (staging / "state.json").exists()
     assert store.records() == ()
     smoke.assert_not_called()
+
+
+# ── вложенные пути раскладки (Vosk/Whisper) ────────────────────────────────
+
+
+NESTED_CONTENTS: dict[str, bytes] = {
+    "am-onnx/encoder.int8.onnx": b"\x08\x03\x12\x04enc",
+    "am-onnx/decoder.int8.onnx": b"\x08\x03\x12\x04dec",
+    "am-onnx/joiner.int8.onnx": b"\x08\x03\x12\x04joi",
+    "lang/tokens.txt": "а 0\nб 1\n".encode(),
+}
+
+
+@pytest.fixture
+def nested_contents() -> dict[str, bytes]:
+    return dict(NESTED_CONTENTS)
+
+
+@pytest.fixture
+def nested_entry(nested_contents: dict[str, bytes]) -> CatalogEntry:
+    return CatalogEntry(
+        id="vosk-ru-int8",
+        revision="rev-nested",
+        name="Модель с подкаталогами",
+        description="Раскладка Vosk: веса в подкаталоге, словарь в lang.",
+        size_bytes=sum(len(data) for data in nested_contents.values()),
+        min_ram_mb=1,
+        layout="onnx-asr-vosk",
+        variant="vosk-am-onnx",
+        recommended=False,
+        host="huggingface.co",
+        files=tuple(
+            FileSpec(name, hashlib.sha256(data).hexdigest(), len(data), f"/rev-nested/{name}")
+            for name, data in nested_contents.items()
+        ),
+    )
+
+
+def _write_nested(directory: Path, contents: dict[str, bytes]) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, data in contents.items():
+        target = directory / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    return directory
+
+
+def test_nested_layout_verifies_and_installs_from_folder(
+    tmp_path: Path,
+    store: ModelStore,
+    nested_entry: CatalogEntry,
+    nested_contents: dict[str, bytes],
+    smoke: Mock,
+) -> None:
+    source = _write_nested(tmp_path / "source", nested_contents)
+
+    assert verify_installed(source, nested_entry) == (True, "")
+
+    result = Installer(store, smoke).install_from_path(source, nested_entry)
+
+    assert result.state == "ok"
+    assert result.reason_code == ""
+    assert result.record is not None
+    installed = result.record.dir
+    for name, data in nested_contents.items():
+        assert (installed / name).read_bytes() == data
+    # Подкаталоги ревизии создаются приватными, как и сам каталог ревизии.
+    assert (installed / "am-onnx").stat().st_mode & 0o777 == 0o700
+    assert store.current() is not None
+
+
+def test_nested_layout_installs_from_staging(
+    store: ModelStore,
+    nested_entry: CatalogEntry,
+    nested_contents: dict[str, bytes],
+    smoke: Mock,
+) -> None:
+    staging = _write_nested(
+        store.staging_dir(nested_entry.id, nested_entry.revision), nested_contents
+    )
+    (staging / "am-onnx" / "encoder.int8.onnx.part").write_bytes(b"hvost")
+
+    result = Installer(store, smoke).install_from_staging(nested_entry)
+
+    assert result.state == "ok"
+    assert result.record is not None
+    assert not (result.record.dir / "am-onnx" / "encoder.int8.onnx.part").exists()
+    assert (result.record.dir / "lang" / "tokens.txt").is_file()
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "am-onnx/../../outside",
+        "am-onnx/../outside",
+        "../outside",
+        "/etc/passwd",
+        "am-onnx//encoder.int8.onnx",
+        "am-onnx/./encoder.int8.onnx",
+        "am-onnx\\encoder.int8.onnx",
+        "am onnx/encoder.int8.onnx",
+        "a/b/c/d/e/encoder.int8.onnx",
+    ],
+)
+def test_nested_unsafe_path_is_rejected_without_writing(
+    tmp_path: Path,
+    store: ModelStore,
+    nested_entry: CatalogEntry,
+    nested_contents: dict[str, bytes],
+    smoke: Mock,
+    unsafe: str,
+) -> None:
+    source = _write_nested(tmp_path / "source", nested_contents)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"keep")
+    spec = nested_entry.files[0]
+    entry = replace(nested_entry, files=(replace(spec, path=unsafe), *nested_entry.files[1:]))
+
+    result = Installer(store, smoke).install_from_path(source, entry)
+
+    assert result.state == "error"
+    assert result.reason_code == "layout"
+    assert "outside" not in result.reason and "/" not in result.reason
+    assert outside.read_bytes() == b"keep"
+    assert not (store.root / entry.id / entry.revision).exists()
+    smoke.assert_not_called()
+
+
+def test_symlinked_subdirectory_in_source_is_rejected(
+    tmp_path: Path,
+    store: ModelStore,
+    nested_entry: CatalogEntry,
+    nested_contents: dict[str, bytes],
+    smoke: Mock,
+) -> None:
+    source = _write_nested(tmp_path / "source", nested_contents)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "encoder.int8.onnx").write_bytes(NESTED_CONTENTS["am-onnx/encoder.int8.onnx"])
+    shutil.rmtree(source / "am-onnx")
+    (source / "am-onnx").symlink_to(outside, target_is_directory=True)
+
+    assert verify_installed(source, nested_entry)[0] is False
+
+    result = Installer(store, smoke).install_from_path(source, nested_entry)
+
+    assert result.state == "error"
+    assert result.reason_code == "layout"
+    assert not (store.root / nested_entry.id / nested_entry.revision).exists()
+    smoke.assert_not_called()
+
+
+def test_symlinked_subdirectory_in_staging_is_rejected(
+    tmp_path: Path,
+    store: ModelStore,
+    nested_entry: CatalogEntry,
+    nested_contents: dict[str, bytes],
+    smoke: Mock,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    staging = store.staging_dir(nested_entry.id, nested_entry.revision)
+    (staging / "am-onnx").symlink_to(outside, target_is_directory=True)
+
+    result = Installer(store, smoke).install_from_staging(nested_entry)
+
+    assert result.state == "error"
+    assert result.reason_code == "layout"
+    assert list(outside.iterdir()) == []
+    smoke.assert_not_called()
+
+
+@pytest.mark.parametrize("extra", ["am-onnx/extra.bin", "other/encoder.int8.onnx"])
+def test_extra_entries_in_subdirectories_are_rejected(
+    tmp_path: Path,
+    nested_entry: CatalogEntry,
+    nested_contents: dict[str, bytes],
+    extra: str,
+) -> None:
+    directory = _write_nested(tmp_path / "installed", nested_contents)
+    target = directory / extra
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"x")
+
+    ok, reason = verify_installed(directory, nested_entry)
+
+    assert ok is False
+    assert reason == "В папке есть лишние файлы. Оставьте только файлы выбранной модели."
+
+
+def test_file_outside_layout_is_rejected_by_engine(
+    tmp_path: Path,
+    nested_entry: CatalogEntry,
+    nested_contents: dict[str, bytes],
+) -> None:
+    """Состав совпал с каталогом, но раскладке движка такой набор не подходит."""
+    contents = dict(nested_contents)
+    contents["lang/other.txt"] = contents.pop("lang/tokens.txt")
+    entry = replace(
+        nested_entry,
+        files=tuple(
+            FileSpec(name, hashlib.sha256(data).hexdigest(), len(data), f"/rev-nested/{name}")
+            for name, data in contents.items()
+        ),
+    )
+    directory = _write_nested(tmp_path / "installed", contents)
+
+    ok, reason = verify_installed(directory, entry)
+
+    assert ok is False
+    assert reason in {
+        "В папке не хватает файлов модели. Получите их заново.",
+        "Файлы в папке не подходят для выбранной модели.",
+    }
+
+
+def _catalog_entries() -> list[CatalogEntry]:
+    document = json.loads((Path(__file__).resolve().parents[2] / "data/catalog.json").read_bytes())
+    return [
+        CatalogEntry(
+            id=model["id"],
+            revision=model["revision"],
+            name=model["name"],
+            description=model["description"],
+            size_bytes=model["size_bytes"],
+            min_ram_mb=model["min_ram_mb"],
+            layout=model["layout"],
+            variant=model["variant"],
+            recommended=model["recommended"],
+            host=model["host"],
+            files=tuple(
+                FileSpec(file["path"], file["sha256"], file["size"], file["url_path"])
+                for file in model["files"]
+            ),
+        )
+        for model in document["models"]
+    ]
+
+
+@pytest.mark.parametrize("entry", _catalog_entries(), ids=lambda entry: entry.id)
+def test_every_catalog_entry_passes_contents_and_layout(
+    tmp_path: Path, entry: CatalogEntry
+) -> None:
+    """Каждая запись встроенного каталога должна доходить до проверки байтов."""
+    directory = tmp_path / entry.id
+    directory.mkdir()
+    for file in entry.files:
+        inst._make_parents(directory, file.path).write_bytes(b"")
+
+    inst._check_contents(directory, entry, allow_parts=False)
+    inst._check_model_layout(directory, entry)
