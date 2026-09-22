@@ -240,3 +240,13 @@ def test_unload_releases_sessions(model_dir: Path, audio_6s: npt.NDArray[np.floa
         assert active_sessions() == baseline
     finally:
         engine.unload()
+
+
+def test_empty_audio_gives_empty_text(loaded_engine: tuple[Engine, LoadResult]) -> None:
+    """Молчащий микрофон: пустой массив → пустой текст, а не исключение onnx-asr."""
+    import numpy as np
+
+    engine, _ = loaded_engine
+    result = engine.transcribe(np.zeros(0, dtype=np.float32), CancelToken())
+    assert result.text == ""
+    assert result.cancelled is False

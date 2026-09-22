@@ -659,6 +659,10 @@ class OnnxAsrEngine:
                 raise EngineUnavailableError("Рантайм numpy недоступен") from exc
             if not isinstance(audio, np.ndarray) or audio.dtype != np.float32 or audio.ndim != 1:
                 raise ValueError("Ожидается одномерный numpy.ndarray с dtype float32")
+            if len(audio) == 0:
+                # Молчащий источник (2026-09-22, машины с Fly): onnx-asr на пустом массиве
+                # бросает исключение, а для человека это «ничего не распознано».
+                return TranscribeResult(text="", infer_ms=0.0, cancelled=cancel.cancelled)
             started = time.perf_counter()
 
             def timeout(pending: _PendingCall[tuple[str, bool]]) -> EngineError | None:
