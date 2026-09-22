@@ -147,15 +147,26 @@ def check_pulseaudio_processes(
         )
 
 
+_XDG_NAMES = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config: pytest.Config) -> None:
     """Изолируем всех потомков ещё до сбора тестов и подпроцесса проверки Qt."""
     directory = TemporaryDirectory(prefix="astra-tests-pulse-")
     config.stash[_PULSE_DIRECTORY] = directory
     config.stash[_PULSE_ORIGINAL_ENV] = {
-        name: os.environ.get(name) for name in ("PULSE_CLIENTCONFIG", "PULSE_SERVER")
+        name: os.environ.get(name) for name in ("PULSE_CLIENTCONFIG", "PULSE_SERVER", *_XDG_NAMES)
     }
     root = Path(directory.name)
+    # Каталоги XDG уводим во временный корень: тесты не должны трогать настоящие
+    # настройки, состояние (анти-откат каталога) и статистику пользователя
+    # (2026-09-22: прогон тестов записал catalog-state.json заказчика, программа
+    # отвергла встроенный каталог как «устаревший»).
+    for name in _XDG_NAMES:
+        xdg_dir = root / name.lower()
+        xdg_dir.mkdir(mode=0o700)
+        os.environ[name] = str(xdg_dir)
     client_config = root / "client.conf"
     client_config.write_text("autospawn = no\n", encoding="utf-8")
     pulse_env = {
