@@ -160,16 +160,15 @@ Column {
             }
         }
 
-        // Строки нет, если менять громкость в системе нечем (§«Общие», F6.7).
+        // Строка только при проблеме (выключен или тише 30 %): в норме «Общие»
+        // помещаются без прокрутки (решение заказчика 22.09, как «Переустановить»).
         SettingRow {
             width: parent.width
             label: qsTr("Громкость микрофона")
             sub: root.micMuted
                 ? qsTr("Звук микрофона выключен в системе — вас не слышно")
-                : root.micVolume >= 0 && root.micVolume < 30
-                    ? qsTr("Громкость слишком низкая — вас плохо слышно")
-                    : qsTr("Программа поставит громкость этого микрофона на максимум")
-            visible: root.canRaiseMic
+                : qsTr("Громкость слишком низкая — вас плохо слышно")
+            visible: root.canRaiseMic && (root.micMuted || (root.micVolume >= 0 && root.micVolume < 30))
             height: visible ? implicitHeight : 0
 
             Text {
