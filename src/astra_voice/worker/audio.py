@@ -276,6 +276,7 @@ def list_devices(
         if fallback_devices is None:
             raise AudioError(ERROR_FAILED, message)
         return fallback_devices
+    logger.debug("pactl list short sources: строк %d", len(output.splitlines()))
 
     descriptions = _device_descriptions(run, env, deadline)
     devices: list[AudioDevice] = []

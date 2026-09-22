@@ -547,6 +547,8 @@ class SettingsBridge(QObject):
             )
         except (AudioError, OSError):
             log.warning("Не удалось получить список микрофонов. Доступен системный по умолчанию.")
+        # Число, не имена: имена устройств в журнал не пишем.
+        log.info("Список микрофонов: найдено %d", len(devices) - 1)
         if devices != self._devices:
             self._devices = devices
             self.devicesChanged.emit()

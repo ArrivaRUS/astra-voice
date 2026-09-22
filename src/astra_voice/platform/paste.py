@@ -280,9 +280,14 @@ def _focus_mismatch(
         return "no-target", None
     if not wm_class:
         return "no-wm-class", None
+    # Решает реальный фокус ввода: XTest попадёт именно в него. _NET_ACTIVE_WINDOW —
+    # только подсказка: fly-wm меняет его при показе пилюли, хотя фокус остаётся
+    # в поле ввода (журнал заказчика 22.09: reason=active-changed, wm_class kate).
+    active_changed = False
     try:
         if x.active_window() != target_window:
-            return "active-changed", None
+            active_changed = True
+            log.debug("вставка: активное окно EWMH сменилось, проверяем фокус ввода")
         if x.d is None or x.root is None:
             return "x-unavailable", None
         window = x.d.get_input_focus().focus
@@ -291,9 +296,11 @@ def _focus_mismatch(
         for _ in range(32):
             wid = int(getattr(window, "id", 0))
             if wid <= 1 or wid == int(x.root.id):
-                return ("focus-unknown" if not seen else "focus-outside"), None
+                if not seen:
+                    return "focus-unknown", None
+                return ("active-changed" if active_changed else "focus-outside"), None
             if wid in seen:
-                return "focus-outside", None
+                return ("active-changed" if active_changed else "focus-outside"), None
             seen.add(wid)
             if window.get_attributes().override_redirect:
                 return "focus-override-redirect", None
@@ -306,7 +313,7 @@ def _focus_mismatch(
         # Содержимое исключения не журналируем: оно может содержать приватные данные.
         log.debug("вставка: проверка фокуса прервана ошибкой %s", type(exc).__name__)
         return "x-error", None
-    return "focus-outside", None
+    return ("active-changed" if active_changed else "focus-outside"), None
 
 
 def _focus_matches(

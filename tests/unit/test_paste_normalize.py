@@ -607,6 +607,7 @@ def test_focus_guard(
     def switch_window(ms: int) -> None:
         if ms == 50:
             x.active_window.return_value = 99 if target else None
+            x.d.get_input_focus.return_value.focus.id = 99
 
     monkeypatch.setattr(paste, "_wait_ms", switch_window)
     outcome = paste.paste_text("фраза", target, PasteMode.AUTO)
@@ -793,6 +794,7 @@ def test_secret_not_republished_without_xtest(
     cb, x, _ = harness
     cb.data[False][paste.KDE_HINT] = b"secret"
     x.active_window.return_value = 99
+    x.d.get_input_focus.return_value.focus.id = 99
     outcome = paste.paste_text("фраза", 42, mode)
     assert outcome.kind == (
         PasteOutcomeKind.WINDOW_CHANGED
@@ -1477,6 +1479,7 @@ def test_outcome_reason_names_the_branch(
         x.wm_class.return_value = None
     elif scenario == "active-changed":
         x.active_window.return_value = 99
+        focus.id = 99
     elif scenario == "focus-unknown":
         x.d.get_input_focus.return_value.focus = 1
     elif scenario == "focus-outside":
@@ -1539,3 +1542,16 @@ def test_outcome_is_logged_once_without_phrase(
     assert "target=set" in message and f"wm_class={outcome.wm_class}" in message
     assert private not in caplog.text and "ПРЕЖНИЙ-БУФЕР" not in caplog.text
     assert all(private not in str(arg) for arg in (records[0].args or ()))
+
+
+def test_active_window_hint_ignored_when_focus_stays(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+) -> None:
+    """Fly (журнал заказчика 22.09): _NET_ACTIVE_WINDOW сменился при показе пилюли,
+    а фокус ввода остался в Kate — вставка должна пройти."""
+    cb, x, _ = harness
+    x.active_window.return_value = 99
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    assert outcome.reason == ""
+    x.send_combo.assert_called_once()

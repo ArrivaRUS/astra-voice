@@ -1072,6 +1072,9 @@ class DictationOrchestrator:
         )
 
     def _append_stat(self, event_type: str, **fields: object) -> None:
+        # Неизвестные значения (open_ms без audio.ready — машины с Fly, 22.09) не
+        # пишутся вовсе: статистика принимает только числа, строки и флаги.
+        fields = {key: value for key, value in fields.items() if value is not None}
         if self._stats is not None:
             try:
                 self._stats.append(event_type, **fields)
