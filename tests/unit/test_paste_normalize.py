@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -135,6 +137,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeClipboard, Mock, list[
     x.send_combo.return_value = True
     x.grab_keyboard.return_value = True
     x.keyboard_grab_deadline = None
+    x.keys_held.return_value = False
     x.root.id = 2
     focus = x.d.get_input_focus.return_value.focus
     focus.id = 42
@@ -571,10 +574,12 @@ def test_chain_and_both_snapshots(
             assert cb.data[True] == cb.data[False]
         if ms == 800:
             x.wm_class.assert_called_once_with(42)
-            x.grab_keyboard.assert_called_once_with()
-            x.ungrab_keyboard.assert_called_once_with()
+            x.grab_keyboard.assert_not_called()
             x.send_combo.assert_not_called()
         else:
+            # Проба захвата идёт на окне фокуса (42) после паузы, прямо перед XTest.
+            x.grab_keyboard.assert_called_once_with(42)
+            x.ungrab_keyboard.assert_called_once_with()
             x.send_combo.assert_called_once_with(mods, key)
 
     monkeypatch.setattr(paste, "_wait_ms", wait)
@@ -619,7 +624,7 @@ def test_keyboard_probe_failure_keeps_phrase(
     monkeypatch: pytest.MonkeyPatch,
     grabbed: bool,
 ) -> None:
-    """Отказ захвата или неснятый захват запрещает XTest до проверки фокуса."""
+    """Отказ захвата или неснятый захват запрещает XTest после проверки фокуса."""
     cb, x, delays = harness
     x.grab_keyboard.return_value = grabbed
     if grabbed:
@@ -627,16 +632,20 @@ def test_keyboard_probe_failure_keeps_phrase(
 
     def wait(ms: int) -> None:
         delays.append(ms)
-        x.grab_keyboard.assert_called_once_with()
-        if grabbed:
-            x.ungrab_keyboard.assert_called_once_with()
+        if ms == 50:
+            x.grab_keyboard.assert_not_called()
         else:
-            x.ungrab_keyboard.assert_not_called()
+            x.grab_keyboard.assert_called_once_with(42)
+            if grabbed:
+                x.ungrab_keyboard.assert_called_once_with()
+            else:
+                x.ungrab_keyboard.assert_not_called()
         x.send_combo.assert_not_called()
 
     monkeypatch.setattr(paste, "_wait_ms", wait)
     outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
     assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+    assert outcome.reason == ("grab-stuck" if grabbed else "grab-refused")
     assert outcome.restore == PasteRestore.KEPT_OURS
     assert cb.data[False]["text/plain"] == "фраза".encode()
     assert delays == [50, 100]
@@ -1133,6 +1142,7 @@ def test_qt_process_returns_outcome_without_abort(scenario: str) -> None:
                 x.send_combo.return_value = True
                 x.grab_keyboard.return_value = True
                 x.keyboard_grab_deadline = None
+                x.keys_held.return_value = False
                 x.root.id = 2
                 focus = x.d.get_input_focus.return_value.focus
                 focus.id = 42
@@ -1364,3 +1374,168 @@ def test_no_qt_import_for_pure_functions(monkeypatch: pytest.MonkeyPatch) -> Non
         spec.loader.exec_module(isolated)
         assert isolated.normalize("ёж\n") == "ёж "
         assert isolated.method_for_wm_class("xterm") == "shift+insert"
+
+
+@pytest.mark.parametrize("held_polls", [0, 1, 3])
+def test_keys_held_before_probe_waits_on_qt_loop(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    held_polls: int,
+) -> None:
+    """Toggle: зажатая клавиша хоткея держит активный захват X до отпускания (X GrabKey).
+
+    Отпускания ждём до пробы захвата, короткими шагами цикла Qt, а не time.sleep.
+    """
+    cb, x, delays = harness
+    x.keys_held.side_effect = [True] * held_polls + [False]
+    order: list[str] = []
+
+    def grab(*args: object) -> bool:
+        order.append(f"grab{args}")
+        return True
+
+    x.grab_keyboard.side_effect = grab
+
+    def wait(ms: int) -> None:
+        delays.append(ms)
+        order.append(f"wait{ms}")
+
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    assert outcome.reason == ""
+    assert delays == [paste.KEYS_POLL_MS] * held_polls + [50, 100]
+    assert order == [f"wait{paste.KEYS_POLL_MS}"] * held_polls + ["wait50", "grab(42,)", "wait100"]
+    x.ungrab_keyboard.assert_called_once_with()
+    x.send_combo.assert_called_once_with(["Control_L"], "v")
+
+
+def test_keys_held_beyond_timeout_keeps_phrase(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Залипшая клавиша: фраза остаётся в буфере, пробы и XTest нет, причина в исходе."""
+    cb, x, delays = harness
+    x.keys_held.return_value = True
+    clock_ms = [100_000]
+    monkeypatch.setattr(time, "monotonic", lambda: clock_ms[0] / 1000)
+
+    def wait(ms: int) -> None:
+        delays.append(ms)
+        clock_ms[0] += ms
+
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+    assert outcome.reason == "keys-held"
+    assert outcome.restore == PasteRestore.KEPT_OURS
+    assert cb.data[False]["text/plain"] == "фраза".encode()
+    assert delays[-2:] == [50, 100]
+    polls = delays[:-2]
+    assert set(polls) == {paste.KEYS_POLL_MS}
+    assert len(polls) == paste.KEYS_RELEASE_TIMEOUT_MS // paste.KEYS_POLL_MS
+    x.grab_keyboard.assert_not_called()
+    x.send_combo.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "kind", "reason"),
+    [
+        ("pasted", PasteOutcomeKind.PASTED, ""),
+        ("manual", PasteOutcomeKind.CLIPBOARD_ONLY, "manual"),
+        ("no-target", PasteOutcomeKind.WINDOW_CHANGED, "no-target"),
+        ("no-wm-class", PasteOutcomeKind.WINDOW_CHANGED, "no-wm-class"),
+        ("active-changed", PasteOutcomeKind.WINDOW_CHANGED, "active-changed"),
+        ("focus-unknown", PasteOutcomeKind.WINDOW_CHANGED, "focus-unknown"),
+        ("focus-outside", PasteOutcomeKind.WINDOW_CHANGED, "focus-outside"),
+        ("focus-override-redirect", PasteOutcomeKind.WINDOW_CHANGED, "focus-override-redirect"),
+        ("wm-class-changed", PasteOutcomeKind.WINDOW_CHANGED, "wm-class-changed"),
+        ("x-error", PasteOutcomeKind.WINDOW_CHANGED, "x-error"),
+        ("x-unavailable", PasteOutcomeKind.WINDOW_CHANGED, "x-unavailable"),
+        ("grab-refused", PasteOutcomeKind.WINDOW_CHANGED, "grab-refused"),
+        ("grab-stuck", PasteOutcomeKind.WINDOW_CHANGED, "grab-stuck"),
+        ("xtest-refused", PasteOutcomeKind.WINDOW_CHANGED, "xtest-refused"),
+        ("restored-early", PasteOutcomeKind.WINDOW_CHANGED, "restored-early"),
+        ("publish-failed", PasteOutcomeKind.FAILED, "publish-failed"),
+    ],
+)
+def test_outcome_reason_names_the_branch(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    scenario: str,
+    kind: PasteOutcomeKind,
+    reason: str,
+) -> None:
+    """Каждая ветка «только буфер» получает код, по которому её видно в журнале."""
+    cb, x, _ = harness
+    focus = x.d.get_input_focus.return_value.focus
+    mode = PasteMode.CLIPBOARD_ONLY if scenario == "manual" else PasteMode.AUTO
+    target: int | None = 42
+    if scenario == "no-target":
+        target = None
+    elif scenario == "no-wm-class":
+        x.wm_class.return_value = None
+    elif scenario == "active-changed":
+        x.active_window.return_value = 99
+    elif scenario == "focus-unknown":
+        x.d.get_input_focus.return_value.focus = 1
+    elif scenario == "focus-outside":
+        focus.id = 99
+        focus.query_tree.return_value.parent = x.root
+    elif scenario == "focus-override-redirect":
+        focus.get_attributes.return_value.override_redirect = True
+    elif scenario == "wm-class-changed":
+        x.wm_class.side_effect = [("kate", "kate"), ("kate", "other")]
+    elif scenario == "x-error":
+        x.d.get_input_focus.side_effect = RuntimeError("ПРИВАТНО")
+    elif scenario == "x-unavailable":
+        x.d = None
+    elif scenario == "grab-refused":
+        x.grab_keyboard.return_value = False
+    elif scenario == "grab-stuck":
+        x.keyboard_grab_deadline = 30.0
+    elif scenario == "xtest-refused":
+        x.send_combo.return_value = False
+    elif scenario == "restored-early":
+        monkeypatch.setattr(
+            paste, "_wait_ms", lambda ms: paste.restore_pending() if ms == 50 else None
+        )
+    elif scenario == "publish-failed":
+        monkeypatch.setattr(cb, "put", Mock(side_effect=RuntimeError("ПРИВАТНО")))
+    with caplog.at_level(logging.DEBUG, logger="astra_voice.platform.paste"):
+        outcome = paste.paste_text("ФРАЗА", target, mode)
+    assert outcome.kind == kind
+    assert outcome.reason == reason
+    assert "ФРАЗА" not in caplog.text and "ПРИВАТНО" not in caplog.text
+    if kind == PasteOutcomeKind.WINDOW_CHANGED:
+        assert f"причина {reason}" in caplog.text
+
+
+@pytest.mark.parametrize("scenario", ["pasted", "window-changed", "manual", "busy"])
+def test_outcome_is_logged_once_without_phrase(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    scenario: str,
+) -> None:
+    """INFO-строка исхода: вид, метод, восстановление, причина, класс окна — без текста."""
+    cb, x, _ = harness
+    private = "ПРИВАТНАЯ-ФРАЗА-ЁЖ"
+    cb.data[False]["text/plain"] = "ПРЕЖНИЙ-БУФЕР".encode()
+    mode = PasteMode.CLIPBOARD_ONLY if scenario == "manual" else PasteMode.AUTO
+    if scenario == "window-changed":
+        x.send_combo.return_value = False
+    if scenario == "busy":
+        monkeypatch.setattr(paste, "_running", True)
+    with caplog.at_level(logging.INFO, logger="astra_voice.platform.paste"):
+        outcome = paste.paste_text(private, 42, mode)
+    records = [r for r in caplog.records if r.getMessage().startswith("вставка: ")]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert records[0].levelno == logging.INFO
+    assert message.startswith(f"вставка: {outcome.kind}")
+    assert f"method={outcome.method} restore={outcome.restore}" in message
+    assert f"reason={outcome.reason or '-'}" in message
+    assert "target=set" in message and f"wm_class={outcome.wm_class}" in message
+    assert private not in caplog.text and "ПРЕЖНИЙ-БУФЕР" not in caplog.text
+    assert all(private not in str(arg) for arg in (records[0].args or ()))

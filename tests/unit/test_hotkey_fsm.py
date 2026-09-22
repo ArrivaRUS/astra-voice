@@ -909,3 +909,23 @@ def test_wm_class_limits_nodes_and_cycles(mocked_x11: X11Display) -> None:
     root.query_tree.return_value.children = children
     assert mocked_x11.wm_class(1) is None
     assert all(not child.get_wm_class.called for child in children)
+
+
+@pytest.mark.parametrize("property_type", [33, 6], ids=["WINDOW", "CARDINAL"])
+def test_active_window_accepts_cardinal_typed_property(
+    mocked_x11: X11Display, connection: MagicMock, property_type: int
+) -> None:
+    """fly-wm (наследник qvwm) пишет списки окон типом CARDINAL: важен только формат 32."""
+    from Xlib import X
+
+    root = connection.screen.return_value.root
+    connection.intern_atom.return_value = 77
+    root.get_full_property.return_value = SimpleNamespace(
+        property_type=property_type, format=32, value=[91, 0]
+    )
+    assert mocked_x11.active_window() == 91
+    root.get_full_property.assert_called_with(77, X.AnyPropertyType)
+    root.get_full_property.return_value = SimpleNamespace(
+        property_type=property_type, format=16, value=[91]
+    )
+    assert mocked_x11.active_window() is None

@@ -542,10 +542,12 @@ class X11Display:
                 held = self.keys_held()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 and timeout_s > 0:
+                    log.debug("XTest: клавиши всё ещё зажаты, ввод отменён")
                     return False
                 if not held:
                     break
                 if remaining <= 0:
+                    log.debug("XTest: клавиши зажаты, ожидание не разрешено")
                     return False
                 time.sleep(min(_POLL_S, remaining))
             for code in codes:
@@ -564,12 +566,19 @@ class X11Display:
         return ok
 
     def _root_windows(self, name: str) -> list[int]:
+        """Список окон из свойства корня; тип свойства не проверяется.
+
+        EWMH требует тип WINDOW, но оконный менеджер вправе записать список
+        типом CARDINAL (наследие GNOME-хинтов, как в qvwm/fly-wm). При запросе
+        с несовпадающим типом сервер отдаёт пустое значение, поэтому читаем
+        AnyPropertyType и доверяем только формату 32.
+        """
         try:
-            from Xlib import Xatom
+            from Xlib import X
 
             conn = self._require_display()
             atom = conn.intern_atom(name, only_if_exists=True)
-            prop = self.root.get_full_property(atom, Xatom.WINDOW) if atom else None
+            prop = self.root.get_full_property(atom, X.AnyPropertyType) if atom else None
             if prop is not None and prop.format == 32:
                 return [int(wid) for wid in prop.value if wid]
         except Exception as exc:

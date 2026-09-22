@@ -32,6 +32,11 @@ log = logging.getLogger(__name__)
 KDE_HINT = "x-kde-passwordManagerHint"
 DELAY_BEFORE_MS = 50
 DELAY_AFTER_MS = 100
+# Toggle: распознавание стартует по нажатию, а клавиша хоткея ещё зажата; по X GrabKey
+# её активный захват держится до отпускания, и XTest до этого момента ушёл бы в наш же
+# захват. Ждём отпускания дольше окна send_combo (200 мс), но в пределах Ц2.
+KEYS_RELEASE_TIMEOUT_MS = 300
+KEYS_POLL_MS = 5
 FLY_SYSTEM_THEME = Path("/usr/share/fly-wm/theme/default.themerc")
 FLY_FALLBACK_TYPE = "x-openoffice-link"
 _MAX_MIME_BYTES = 1024 * 1024
@@ -102,6 +107,8 @@ class PasteOutcome:
     CR/LF: они заменяются пробелами, включая пару CRLF. busy ничего не меняет;
     его нулевые счётчики означают, что фраза не обрабатывалась. failed сообщает
     об ошибке до публикации или при восстановлении, без текста исключения.
+    reason — короткий код ветки, по которой XTest не состоялся (для журнала);
+    пустая строка при pasted.
     """
 
     kind: PasteOutcomeKind
@@ -111,6 +118,7 @@ class PasteOutcome:
     chars: int
     stripped_controls: int
     t_ms: float
+    reason: str = ""
 
 
 def normalize(text: str) -> str:
@@ -256,36 +264,90 @@ def _session_kind(mode: PasteMode) -> session.SessionKind:
     return session.detect()
 
 
-def _focus_matches(
+def _focus_mismatch(
     x: X11Display, target_window: int | None, wm_class: tuple[str, str] | None
-) -> bool:
+) -> tuple[str, int | None]:
     """Сверить EWMH, реальный фокус и WM_CLASS запомненного клиента.
 
-    Фокус может находиться у дочернего виджета: поднимаемся до клиента,
-    не принимая другое окно того же класса, корень или override-redirect.
-    Ошибка/исчезновение окна запрещает XTest; обход ограничен 32 предками.
+    Возвращает код причины несовпадения (пустая строка — совпало) и окно
+    реального фокуса. Фокус может находиться у дочернего виджета: поднимаемся
+    до клиента, не принимая другое окно того же класса, корень или
+    override-redirect. Ошибка/исчезновение окна запрещает XTest; обход
+    ограничен 32 предками. Коды нужны журналу: без них ветки «окно сменилось»
+    неотличимы друг от друга на чужой машине.
     """
+    if not target_window:
+        return "no-target", None
+    if not wm_class:
+        return "no-wm-class", None
     try:
-        if not target_window or not wm_class or x.active_window() != target_window:
-            return False
+        if x.active_window() != target_window:
+            return "active-changed", None
         if x.d is None or x.root is None:
-            return False
+            return "x-unavailable", None
         window = x.d.get_input_focus().focus
+        focus = int(getattr(window, "id", 0))
         seen: set[int] = set()
         for _ in range(32):
             wid = int(getattr(window, "id", 0))
-            if wid <= 1 or wid == int(x.root.id) or wid in seen:
-                return False
+            if wid <= 1 or wid == int(x.root.id):
+                return ("focus-unknown" if not seen else "focus-outside"), None
+            if wid in seen:
+                return "focus-outside", None
             seen.add(wid)
             if window.get_attributes().override_redirect:
-                return False
+                return "focus-override-redirect", None
             if wid == target_window:
-                return x.wm_class(wid) == wm_class
+                if x.wm_class(wid) != wm_class:
+                    return "wm-class-changed", None
+                return "", focus
             window = window.query_tree().parent
-    except Exception:
+    except Exception as exc:
         # Содержимое исключения не журналируем: оно может содержать приватные данные.
-        return False
-    return False
+        log.debug("вставка: проверка фокуса прервана ошибкой %s", type(exc).__name__)
+        return "x-error", None
+    return "focus-outside", None
+
+
+def _focus_matches(
+    x: X11Display, target_window: int | None, wm_class: tuple[str, str] | None
+) -> bool:
+    """Совместимая обёртка над :func:`_focus_mismatch`."""
+    return not _focus_mismatch(x, target_window, wm_class)[0]
+
+
+def _keyboard_busy(x: X11Display, focus_window: int | None) -> str:
+    """Проба захвата клавиатуры на окне фокуса, снимаемая сразу же.
+
+    Захват на самом окне фокуса не порождает FocusIn/FocusOut: правила Xlib
+    описывают события только для смены окна фокуса. Поэтому оконный менеджер
+    пробы не видит (fly-wm на фокус корня отвечает собственным перезахватом).
+    Чужой активный захват — меню, блокировщик, зажатый хоткей — даёт отказ.
+    """
+    if not x.grab_keyboard(focus_window):
+        return "grab-refused"
+    x.ungrab_keyboard()
+    return "" if x.keyboard_grab_deadline is None else "grab-stuck"
+
+
+def _wait_keys_released(x: X11Display, timeout_ms: int) -> bool:
+    """Дождаться отпускания всех клавиш вне строк Lock, обслуживая цикл Qt.
+
+    Нужен именно цикл Qt, а не time.sleep: фраза уже опубликована, и менеджер
+    буфера (Klipper, fly-wm) прямо сейчас запрашивает её по SelectionRequest.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        try:
+            held = bool(x.keys_held())
+        except Exception as exc:
+            log.debug("вставка: не удалось прочитать состояние клавиш: %s", type(exc).__name__)
+            return False
+        if not held:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        _wait_ms(KEYS_POLL_MS)
 
 
 def _publish(cb: _Clipboard, snapshot: dict[str, bytes], primary: bool) -> None:
@@ -391,6 +453,26 @@ def restore_pending() -> bool:
         return False
 
 
+def _log_outcome(outcome: PasteOutcome, target_window: int | None) -> None:
+    """Исход в журнал на INFO: без фразы и без содержимого буфера (§6.4).
+
+    Одна строка на диктовку; по коду reason на чужой машине видно, какая ветка
+    оставила текст только в буфере. Логгер модуля — не dictation.py: его
+    AST-страж запрещает журналировать всё, что получено из вызова с текстом.
+    """
+    log.info(
+        "вставка: %s method=%s restore=%s reason=%s target=%s wm_class=%s chars=%d t_ms=%s",
+        outcome.kind,
+        outcome.method,
+        outcome.restore,
+        outcome.reason or "-",
+        "set" if target_window else "none",
+        outcome.wm_class,
+        outcome.chars,
+        outcome.t_ms,
+    )
+
+
 class PasteFlow:
     """Цепочка S4 с переопределяемыми задержками для тестов.
 
@@ -399,10 +481,11 @@ class PasteFlow:
     Штатно CLIPBOARD возвращается только после успешного XTest; иначе фраза
     остаётся для ручной вставки. restore_pending позволяет вернуть его раньше
     при завершении. PRIMARY возвращается по правилам владения/секрета.
-    Перед паузой пробуем XGrabKeyboard на корне и сразу снимаем захват:
-    XSetInputFocus не вызывается, XGetInputFocus по-прежнему указывает на цель;
-    возможны FocusOut/FocusIn с NotifyGrab/NotifyUngrab. Принят остаточный риск
-    гонки между пробой и XTest: атомарности в X11 нет (У12/У46).
+    Порядок: публикация → ожидание отпускания клавиш → пауза → проверка фокуса
+    → проба XGrabKeyboard на окне фокуса со снятием захвата → XTest. Проба на
+    окне фокуса не порождает FocusIn/FocusOut и не трогает оконный менеджер
+    (проба на корне давала fly-wm повод считать корень в фокусе). Принят
+    остаточный риск гонки между пробой и XTest: атомарности в X11 нет (У12/У46).
     """
 
     def __init__(
@@ -418,9 +501,11 @@ class PasteFlow:
         global _running, _pending
         if _running:
             # BUSY не создаёт снимок и не отменяет ожидание внешней цепочки.
-            return PasteOutcome(
+            outcome = PasteOutcome(
                 PasteOutcomeKind.BUSY, PasteMethod.NONE, PasteRestore.KEPT_OURS, None, 0, 0, 0.0
             )
+            _log_outcome(outcome, target_window)
+            return outcome
         _running = True
         x: X11Display | None = None
         try:
@@ -428,11 +513,11 @@ class PasteFlow:
             if mode == PasteMode.AUTO:
                 x = X11Display()
                 x.open()
-            return self._run(text, target_window, mode, cb, x)
+            outcome = self._run(text, target_window, mode, cb, x)
         except Exception:
             # Нет QApplication/GUI-потока либо ошибка до публикации. Ничего не обещаем
             # о наличии фразы в буфере и не выдаём сообщение исключения наружу.
-            return PasteOutcome(
+            outcome = PasteOutcome(
                 PasteOutcomeKind.FAILED,
                 PasteMethod.NONE,
                 PasteRestore.SKIPPED_NOT_OWNER,
@@ -440,6 +525,7 @@ class PasteFlow:
                 0,
                 0,
                 0.0,
+                reason="setup-failed",
             )
         finally:
             _pending = None
@@ -450,6 +536,8 @@ class PasteFlow:
                 pass
             finally:
                 _running = False
+        _log_outcome(outcome, target_window)
+        return outcome
 
     def _run(
         self,
@@ -476,6 +564,7 @@ class PasteFlow:
         kind = PasteOutcomeKind.FAILED
         method = PasteMethod.NONE
         restore = PasteRestore.SKIPPED_NOT_OWNER
+        reason = "manual" if x is None else "publish-failed"
         primary_restore: PasteRestore | None = None
         primary_touched = False
         started = time.monotonic()
@@ -489,26 +578,35 @@ class PasteFlow:
                 if pending is not None:
                     pending.primary_touched = True
                 cb.put(out, True)
-            keyboard_available = False
-            if x is not None and x.grab_keyboard():
-                x.ungrab_keyboard()
-                keyboard_available = x.keyboard_grab_deadline is None
+            released = x is None or _wait_keys_released(x, KEYS_RELEASE_TIMEOUT_MS)
             _wait_ms(self.delay_before_ms)
             if pending is not None and pending.consumed:
-                kind = PasteOutcomeKind.WINDOW_CHANGED
+                kind, reason = PasteOutcomeKind.WINDOW_CHANGED, "restored-early"
             elif x is not None:
-                if not keyboard_available or not _focus_matches(x, target_window, wm_class):
-                    kind = PasteOutcomeKind.WINDOW_CHANGED
+                if x.d is None:
+                    kind, reason = PasteOutcomeKind.WINDOW_CHANGED, "x-unavailable"
+                elif not released:
+                    kind, reason = PasteOutcomeKind.WINDOW_CHANGED, "keys-held"
                 else:
-                    mods, key = {
-                        PasteMethod.CTRL_V: (["Control_L"], "v"),
-                        PasteMethod.CTRL_SHIFT_V: (["Control_L", "Shift_L"], "v"),
-                        PasteMethod.SHIFT_INSERT: (["Shift_L"], "Insert"),
-                    }[planned]
-                    if x.send_combo(mods, key):
-                        kind, method = PasteOutcomeKind.PASTED, planned
-                    else:
+                    reason, focus = _focus_mismatch(x, target_window, wm_class)
+                    if not reason:
+                        reason = _keyboard_busy(x, focus)
+                    if reason:
                         kind = PasteOutcomeKind.WINDOW_CHANGED
+                    else:
+                        mods, key = {
+                            PasteMethod.CTRL_V: (["Control_L"], "v"),
+                            PasteMethod.CTRL_SHIFT_V: (["Control_L", "Shift_L"], "v"),
+                            PasteMethod.SHIFT_INSERT: (["Shift_L"], "Insert"),
+                        }[planned]
+                        if x.send_combo(mods, key):
+                            kind, method = PasteOutcomeKind.PASTED, planned
+                        else:
+                            kind, reason = PasteOutcomeKind.WINDOW_CHANGED, "xtest-refused"
+            if kind == PasteOutcomeKind.WINDOW_CHANGED:
+                # Код ветки без окон и текста: этого достаточно, чтобы отличить
+                # «нет захвата», «фокус не совпал», «XTest отказал», «клавиши зажаты».
+                log.debug("вставка: XTest не выполнен, причина %s", reason)
             if kind != PasteOutcomeKind.PASTED:
                 _pending = None
             _wait_ms(self.delay_after_ms)
@@ -550,9 +648,10 @@ class PasteFlow:
                 ch not in "\r\n" and (ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F) for ch in text
             ),
             t_ms=round((time.monotonic() - started) * 1000, 1),
+            reason="" if kind == PasteOutcomeKind.PASTED else reason,
         )
 
 
 def paste_text(text: str, target_window: int | None, mode: PasteMode) -> PasteOutcome:
-    """Проба захвата → 50 мс → проверка фокуса/XTest → 100 мс → возврат при pasted."""
+    """Публикация → отпускание клавиш → 50 мс → фокус → проба → XTest → 100 мс → возврат."""
     return PasteFlow().run(text, target_window, mode)
