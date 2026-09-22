@@ -89,6 +89,9 @@ class _OpenDeadline:
         return min(limit, remaining)
 
 
+_EMPTY_DESCRIPTIONS = frozenset({"(null)", "null", "none"})
+
+
 def _clean_device_description(description: str) -> str:
     """Сворачивает пробелы и удаляет управляющие и форматные символы чужого ввода."""
     normalized = " ".join(description.split())
@@ -156,10 +159,45 @@ def _device_descriptions(
         description = item.get("description")
         if isinstance(name, str) and isinstance(description, str):
             description = _clean_device_description(description)
-            if description:
+            # pactl на Astra 1.8 (Fly, 22.09) печатает «(null)» вместо описания —
+            # это не имя устройства, а отсутствие имени.
+            if description and description.lower() not in _EMPTY_DESCRIPTIONS:
                 descriptions[name] = description
                 continue
         logger.debug("Пропущено некорректное описание устройства записи.")
+    return descriptions
+
+
+def _pipewire_descriptions(
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    env: dict[str, str],
+    deadline: _OpenDeadline | None = None,
+) -> dict[str, str]:
+    """Описания источников из `pw-dump`, когда pactl их не отдал; без службы — пусто."""
+    output = _run_text(run, ["pw-dump"], env, deadline)
+    if output is None:
+        return {}
+    try:
+        payload: object = json.loads(output)
+    except (ValueError, RecursionError):
+        return {}
+    if not isinstance(payload, list):
+        return {}
+    descriptions: dict[str, str] = {}
+    for item in payload:
+        info = item.get("info") if isinstance(item, dict) else None
+        props = info.get("props") if isinstance(info, dict) else None
+        if not isinstance(props, dict):
+            continue
+        name = props.get("node.name")
+        raw = props.get("node.description")
+        if not isinstance(raw, str) or not raw.strip():
+            raw = props.get("node.nick")
+        if not isinstance(name, str) or not isinstance(raw, str):
+            continue
+        description = _clean_device_description(raw)
+        if description and description.lower() not in _EMPTY_DESCRIPTIONS:
+            descriptions[name] = description
     return descriptions
 
 
@@ -279,6 +317,11 @@ def list_devices(
     logger.debug("pactl list short sources: строк %d", len(output.splitlines()))
 
     descriptions = _device_descriptions(run, env, deadline)
+    rows = [line.split("\t") for line in output.splitlines()]
+    if any(len(fields) >= 2 and fields[1] not in descriptions for fields in rows):
+        # У pactl нет описаний (Astra: «(null)») — спрашиваем саму звуковую службу.
+        for pw_name, pw_description in _pipewire_descriptions(run, env, deadline).items():
+            descriptions.setdefault(pw_name, pw_description)
     devices: list[AudioDevice] = []
     fallback_counts: dict[str, int] = {}
     for line in output.splitlines():

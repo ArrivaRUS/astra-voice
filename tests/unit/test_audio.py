@@ -1952,6 +1952,9 @@ def test_total_deadline_includes_default_lookup(
 
     def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         """Расходует шесть секунд на список и остаток бюджета на поиск умолчания."""
+        if args == ["pw-dump"]:
+            # Описаний нет — список спрашивает службу; в этой системе её нет.
+            raise FileNotFoundError("pw-dump")
         timeout = kwargs["timeout"]
         assert isinstance(timeout, (int, float))
         timeouts.append(timeout)
@@ -2550,3 +2553,19 @@ def test_watchdog_keeps_deadline_for_previous_capture(
     pulse_library.pa_simple_new.assert_called_once()
     pulse_library.pa_simple_free.assert_called_once()
     capture.check_stop_watchdog()
+
+
+def test_list_devices_null_descriptions_come_from_pipewire(short_sources: str) -> None:
+    """Astra 1.8 (Fly, 22.09): pactl -f json печатает «(null)» вместо описаний —
+    подписи берём у звуковой службы, а без неё — понятные запасные названия."""
+    null_details = json.dumps(
+        [
+            {"name": "alsa_input.pci.microphone", "description": "(null)"},
+            {"name": "alsa_output.pci.stereo.monitor", "description": "(null)"},
+        ]
+    )
+    devices = list_devices(run=pactl_run(short_sources, null_details, pw_dump=PW_DUMP))
+    assert [device.description for device in devices] == ["Встроенный микрофон Ё", "Звук системы"]
+    assert all("(null)" not in device.label for device in devices)
+    devices = list_devices(run=pactl_run(short_sources, null_details))
+    assert [device.description for device in devices] == ["Микрофон", "Звук системы"]
