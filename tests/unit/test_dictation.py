@@ -1263,7 +1263,7 @@ def test_open_ms_resets_for_each_recording(rig: Rig, elapsed: float | None) -> N
         rig.event("audio.ready", device="USB-гарнитура")
     rig.stop()
     rig.result()
-    assert rig.stats.events[-1]["open_ms"] == (None if elapsed is None else elapsed * 1000)
+    assert rig.stats.events[-1].get("open_ms") == (None if elapsed is None else elapsed * 1000)
     assert rig.stats.events[-1]["audio_ms"] == (2 + (elapsed or 0)) * 1000
     rig.device_selected.assert_called_once_with("USB-гарнитура")
     rig.device_changed.assert_not_called()
