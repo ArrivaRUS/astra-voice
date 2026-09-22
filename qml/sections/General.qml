@@ -104,7 +104,10 @@ Column {
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSettingSubSize
                 renderType: Text.NativeRendering
-                wrapMode: Text.WordWrap
+                // Только одна строка с обрезкой: с переносом высота зависит от
+                // ширины, ширина — от раскладки, и SettingRow зацикливает
+                // расчёт высоты (Binding loop, тот же класс, что и 16.09).
+                elide: Text.ElideRight
                 Layout.maximumWidth: root.width / 4
                 Layout.alignment: Qt.AlignVCenter
             }

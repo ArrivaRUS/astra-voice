@@ -1883,6 +1883,30 @@ def test_settings_reinstall_calls_bridge(onboarding_app: Any, dark: bool) -> Non
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_settings_model_row_survives_long_texts(onboarding_app: Any, dark: bool) -> None:
+    """Длинные подписи справа не должны зацикливать расчёт высоты строки.
+
+    Строка без пояснения берёт высоту от правой части; текст с переносом
+    делает высоту зависимой от ширины, и SettingRow уходит в Binding loop.
+    На живом сеансе это видно сразу, а в снимке — нет, поэтому длины здесь
+    заведомо больше, чем помещается.
+    """
+    fake = FakeSettings()
+    fake.activeModelState = "downloading"
+    fake.activeModelName = "GigaAM v3 RNN-T с очень длинным названием записи каталога"
+    fake.activeModelSize = "1 234,5 МБ"
+    fake.downloadTitle = "Загружается GigaAM v3 RNN-T с очень длинным названием · 1 из 2"
+    fake.eta = "осталось ~1 ч 10 мин"
+
+    def inspect(window: Any) -> None:
+        row = visible_texts(window.contentItem())
+        assert any("Модель распознавания" in text for text in row)
+
+    _, messages = render_settings(onboarding_app, dark, fake=fake, inspect=inspect)
+    assert_no_messages(messages, "long model texts")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_settings_hides_model_button_when_model_is_ok(onboarding_app: Any, dark: bool) -> None:
     """Рабочая модель не предлагает себя перекачать: кнопки в норме нет."""
     fake = FakeSettings()
