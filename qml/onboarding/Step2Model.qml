@@ -19,22 +19,6 @@ Item {
     width: implicitWidth
     height: implicitHeight
 
-    // Этих полей нет в контракте моста (docs/ui-bridge.md 4.3): значения взяты
-    // из каталога программы для рекомендованной записи. Как только мост начнёт
-    // отдавать vendor/metrics/tags — брать оттуда.
-    function catalogDetails(entry) {
-        if (entry.recommended !== true)
-            return { vendor: "", metrics: [], tags: [] };
-        return {
-            vendor: qsTr("Сбер (GigaChat Team)"),
-            metrics: [
-                { label: qsTr("Качество"), fill: 0.90, text: qsTr("WER 7,60 %"), hasData: true },
-                { label: qsTr("Скорость"), fill: 0.50, text: qsTr("42,5× быстрее речи"), hasData: true }
-            ],
-            tags: [qsTr("Только русский"), qsTr("с пунктуацией"), qsTr("MIT · Сбер"), qsTr("отечественная")]
-        };
-    }
-
     Text {
         id: heading
         width: root.width
@@ -74,7 +58,6 @@ Item {
 
             OnboardingModelCard {
                 required property var modelData
-                readonly property var details: root.catalogDetails(modelData)
 
                 width: cards.width
                 modelId: modelData.id
@@ -88,9 +71,9 @@ Item {
                 badge: modelData.badge
                 cardState: modelData.state
                 message: modelData.message
-                vendor: details.vendor
-                metrics: details.metrics
-                tags: details.tags
+                vendor: modelData.vendor
+                metrics: modelData.metrics
+                tags: modelData.tags
                 onToggleRequested: { if (root.bridge) root.bridge.toggleModel(modelData.id); }
                 onRetryRequested: { if (root.bridge) root.bridge.retryModel(modelData.id); }
                 onCancelRequested: { if (root.bridge) root.bridge.cancelDownloads(); }

@@ -217,6 +217,25 @@ class SettingsBridge(QObject):
     def freeSpaceText(self) -> str:  # noqa: N802
         return self._downloads.freeSpaceText if self._downloads is not None else ""
 
+    @pyqtProperty(str, notify=modelsChanged)
+    def installedSummary(self) -> str:  # noqa: N802
+        return self._downloads.installedSummary if self._downloads is not None else ""
+
+    @pyqtSlot(str)
+    def makeModelCurrent(self, model_id: str) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.makeModelCurrent(model_id)
+
+    @pyqtSlot(str)
+    def removeModel(self, model_id: str) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.removeModel(model_id)
+
+    @pyqtSlot(str)
+    def updateModel(self, model_id: str) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.updateModel(model_id)
+
     @pyqtSlot(str)
     def toggleModel(self, model_id: str) -> None:  # noqa: N802
         if self._downloads is not None:

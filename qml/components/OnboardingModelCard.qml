@@ -19,6 +19,9 @@ Rectangle {
     property string cardState: "available"
     // Кнопку показываем только там, где мост умеет открыть папку.
     property bool openFolderEnabled: false
+    // Управление установленной моделью есть в разделе «Модели» и нет в мастере.
+    property bool manageEnabled: false
+    property bool updateAvailable: false
     property string message: ""
     property var metrics: []
     property var tags: []
@@ -27,12 +30,24 @@ Rectangle {
     signal retryRequested()
     signal cancelRequested()
     signal openFolderRequested()
+    signal activateRequested()
+    signal removeRequested()
+    signal updateRequested()
 
     readonly property bool selectionAvailable: badge === ""
         && (cardState === "available" || cardState === "failed")
+    // У установленной модели выбора нет: с ней работают кнопки, а серая галочка
+    // читалась как «отмечена к загрузке» и путала (решение по блоку 1 M6).
+    readonly property bool showSelection: badge === ""
+    // Установленная карточка не красится как «выбрана к загрузке»: отметки у неё
+    // нет, а мост оставляет её в выборе после успешной установки.
+    readonly property bool highlighted: showSelection && selected
+    readonly property bool manageVisible: manageEnabled && badge !== ""
     readonly property bool busy: cardState === "queued" || cardState === "downloading"
         || cardState === "verifying"
     readonly property bool hasError: cardState === "failed" || cardState === "no-space"
+    // Отказ переключения или удаления приходит сообщением на исправной карточке.
+    readonly property bool hasMessage: hasError || message !== ""
     readonly property string selectionMark: cardState === "no-space" ? "blocked"
         : badge !== "" || busy || cardState === "installed" ? "locked"
         : selected ? "on" : "off"
@@ -54,7 +69,7 @@ Rectangle {
     color: selectionAvailable && cardMouse.pressed ? Theme.statePressedOnSurface
         : selectionAvailable && cardMouse.containsMouse ? Theme.stateHoverOnSurface
         : badge === "active" ? Theme.accentBg
-        : selected || busy ? Theme.primaryBg : Theme.bgSurface
+        : highlighted || busy ? Theme.primaryBg : Theme.bgSurface
     activeFocusOnTab: selectionAvailable
     onSelectionAvailableChanged: {
         if (!selectionAvailable)
@@ -143,7 +158,18 @@ Rectangle {
             Layout.alignment: Qt.AlignTop
             spacing: Theme.modelCardSelectGap
 
+            // Место отметки сохраняем и у установленной карточки: иначе её
+            // название съезжает влево относительно соседних (§5.1).
+            Item {
+                visible: !root.showSelection
+                Layout.preferredWidth: Theme.modelCardSelectSize
+                Layout.preferredHeight: Theme.modelCardSelectSize
+                Layout.alignment: Qt.AlignTop
+                Layout.topMargin: 2
+            }
+
             Rectangle {
+                visible: root.showSelection
                 Layout.preferredWidth: Theme.modelCardSelectSize
                 Layout.preferredHeight: Theme.modelCardSelectSize
                 Layout.alignment: Qt.AlignTop
@@ -311,7 +337,7 @@ Rectangle {
         RowLayout {
             id: bottomRow
             width: parent.width
-            visible: root.tags.length > 0 || root.busy || root.hasError
+            visible: root.tags.length > 0 || root.busy || root.hasMessage || root.manageVisible
             spacing: root.footerGap
 
             Flow {
@@ -336,17 +362,17 @@ Rectangle {
             }
 
             RowLayout {
-                visible: root.busy || root.hasError
+                visible: root.busy || root.hasMessage || root.manageVisible
                 Layout.maximumWidth: root.tags.length > 0 ? bottomRow.width * 0.65 : bottomRow.width
                 spacing: root.footerGap
                 Icon {
-                    visible: root.hasError
+                    visible: root.hasMessage
                     name: "alert"
                     size: 12
                     color: Theme.dangerInk
                 }
                 FooterText {
-                    visible: root.hasError
+                    visible: root.hasMessage
                     Layout.fillWidth: true
                     Layout.minimumWidth: 0
                     text: root.message !== "" ? root.message
@@ -382,6 +408,33 @@ Rectangle {
                     text: qsTr("Открыть папку моделей")
                     onClicked: root.openFolderRequested()
                 }
+
+                // Кнопки установленной модели (§5.4, состояния 19–20, 25).
+                AvButton {
+                    visible: root.manageVisible && root.updateAvailable
+                    Layout.minimumWidth: implicitWidth
+                    small: true
+                    iconName: "down"
+                    text: qsTr("Обновить")
+                    onClicked: root.updateRequested()
+                }
+                AvButton {
+                    visible: root.manageVisible && root.badge !== "active"
+                    Layout.minimumWidth: implicitWidth
+                    small: true
+                    variant: "primary"
+                    text: qsTr("Сделать рабочей")
+                    onClicked: root.activateRequested()
+                }
+                AvButton {
+                    visible: root.manageVisible
+                    // Рабочую модель удалить нельзя: сначала выбирают другую (§5.4, 19).
+                    enabled: root.badge !== "active"
+                    Layout.minimumWidth: implicitWidth
+                    small: true
+                    text: qsTr("Удалить")
+                    onClicked: root.removeRequested()
+                }
             }
         }
     }
@@ -394,7 +447,7 @@ Rectangle {
         color: "transparent"
         border.width: Theme.cardBorder
         border.color: root.badge === "active" ? Theme.accent
-            : root.selected || root.busy ? Theme.primary : Theme.border
+            : root.highlighted || root.busy ? Theme.primary : Theme.border
         antialiasing: true
     }
 

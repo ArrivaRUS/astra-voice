@@ -131,6 +131,26 @@ class FakeOnboarding(QObject):
                 "state": "available",
                 "message": "",
                 "progress": 0.0,
+                "vendor": "Сбер (GigaChat Team)",
+                "domestic": True,
+                "updateAvailable": False,
+                "tags": ["Только русский", "с пунктуацией", "MIT · Сбер", "отечественная"],
+                "metrics": [
+                    {
+                        "label": "Качество",
+                        "text": "WER 7,60 %",
+                        "fill": 0.58,
+                        "hasData": True,
+                        "measured": False,
+                    },
+                    {
+                        "label": "Скорость",
+                        "text": "42,5× быстрее речи",
+                        "fill": 0.51,
+                        "hasData": True,
+                        "measured": False,
+                    },
+                ],
             },
         ]
         self._selectionSummary: str = ""
@@ -653,8 +673,69 @@ class FakeSettings(QObject):
                 "state": "installed",
                 "message": "",
                 "progress": 0.0,
+                "vendor": "Сбер (GigaChat Team)",
+                "domestic": True,
+                "updateAvailable": False,
+                "tags": ["Только русский", "с пунктуацией", "MIT · Сбер", "отечественная"],
+                "metrics": [
+                    {
+                        "label": "Качество",
+                        "text": "WER 7,60 %",
+                        "fill": 0.58,
+                        "hasData": True,
+                        "measured": False,
+                    },
+                    {
+                        "label": "Скорость",
+                        "text": "42,5× быстрее речи",
+                        "fill": 0.51,
+                        "hasData": True,
+                        "measured": False,
+                    },
+                ],
+            },
+            {
+                "id": "t-one",
+                "name": "T-one",
+                "description": "Русская, лёгкая, без пунктуации; вес только fp32",
+                "host": "huggingface.co",
+                "recommended": False,
+                "sizeBytes": 144_200_000,
+                "sizeText": "144 МБ",
+                "ramText": "300 МБ",
+                "selected": False,
+                "badge": "",
+                "state": "available",
+                "message": "",
+                "progress": 0.0,
+                "vendor": "Т-Банк",
+                "domestic": True,
+                "updateAvailable": False,
+                "tags": [
+                    "Только русский",
+                    "без пунктуации",
+                    "Apache-2.0 · Т-Банк",
+                    "отечественная",
+                ],
+                "metrics": [
+                    {
+                        "label": "Качество",
+                        "text": "WER 6,57 %",
+                        "fill": 0.67,
+                        "hasData": True,
+                        "measured": False,
+                    },
+                    {
+                        "label": "Скорость",
+                        "text": "26,3× быстрее речи",
+                        "fill": 0.31,
+                        "hasData": True,
+                        "measured": False,
+                    },
+                ],
             },
         ]
+        self._installedSummary: str = "Установлено 1 из 12 · 226 МБ на диске"
         self._selectionSummary: str = ""
         self._selectionFits: bool = True
         self._selectionMessage: str = ""
@@ -877,6 +958,17 @@ class FakeSettings(QObject):
 
     freeSpaceText = pyqtProperty(str, _get_freeSpaceText, _set_freeSpaceText, notify=changed)
 
+    def _get_installedSummary(self) -> str:
+        return self._installedSummary
+
+    def _set_installedSummary(self, value: str) -> None:
+        self._installedSummary = value
+        self.changed.emit()
+
+    installedSummary = pyqtProperty(
+        str, _get_installedSummary, _set_installedSummary, notify=changed
+    )
+
     def _get_downloadState(self) -> str:
         return self._downloadState
 
@@ -932,6 +1024,18 @@ class FakeSettings(QObject):
         self.changed.emit()
 
     eta = pyqtProperty(str, _get_eta, _set_eta, notify=changed)
+
+    @pyqtSlot(str)
+    def makeModelCurrent(self, model_id: str) -> None:
+        self.calls.append("makeModelCurrent")
+
+    @pyqtSlot(str)
+    def removeModel(self, model_id: str) -> None:
+        self.calls.append("removeModel")
+
+    @pyqtSlot(str)
+    def updateModel(self, model_id: str) -> None:
+        self.calls.append("updateModel")
 
     @pyqtSlot()
     def reinstallActiveModel(self) -> None:

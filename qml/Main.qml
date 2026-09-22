@@ -6,6 +6,7 @@
 // appInfo, settingsBridge и themeSource могут отсутствовать — тогда работают дефолты.
 import QtQuick 2.15
 import QtQuick.Controls 2.15
+import QtQuick.Layouts 1.15
 import "."
 import "." as Av
 import "components"
@@ -102,8 +103,8 @@ ApplicationWindow {
         anchors.top: parent.top
         anchors.bottom: downloadStrip.visible ? downloadStrip.top : statusBar.top
 
-        // Шапка раздела: паддинг 12 22 8 (§1.4).
-        Column {
+        // Шапка раздела: паддинг 12 22 8 (§1.4). Справа — действие раздела (§5.6).
+        RowLayout {
             id: header
             anchors.top: parent.top
             anchors.left: parent.left
@@ -111,30 +112,46 @@ ApplicationWindow {
             anchors.leftMargin: Theme.spaceWindowContentX
             anchors.rightMargin: Theme.spaceWindowContentX
             anchors.topMargin: Theme.spaceWindowContentTop
-            bottomPadding: Theme.spaceHeadGap
-            spacing: 2
+            spacing: 10 // Макет: зазор между заголовком и кнопкой действия.
 
-            Text {
-                textFormat: Text.PlainText
-                text: window.currentSection.title
-                color: Theme.fg
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontH2SectionSize
-                font.weight: Font.Bold
-                lineHeight: Theme.fontH2SectionSize * Theme.fontH2SectionLineHeight
-                lineHeightMode: Text.FixedHeight
-                renderType: Text.NativeRendering
+            Column {
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                spacing: 2
+
+                Text {
+                    textFormat: Text.PlainText
+                    text: window.currentSection.title
+                    color: Theme.fg
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontH2SectionSize
+                    font.weight: Font.Bold
+                    lineHeight: Theme.fontH2SectionSize * Theme.fontH2SectionLineHeight
+                    lineHeightMode: Text.FixedHeight
+                    renderType: Text.NativeRendering
+                }
+
+                Text {
+                    textFormat: Text.PlainText
+                    text: window.currentSection.subtitle
+                    color: Theme.fgMuted
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontSmallSize
+                    lineHeight: Theme.fontSmallSize * Theme.fontSmallLineHeight
+                    lineHeightMode: Text.FixedHeight
+                    renderType: Text.NativeRendering
+                }
             }
 
-            Text {
-                textFormat: Text.PlainText
-                text: window.currentSection.subtitle
-                color: Theme.fgMuted
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontSmallSize
-                lineHeight: Theme.fontSmallSize * Theme.fontSmallLineHeight
-                lineHeightMode: Text.FixedHeight
-                renderType: Text.NativeRendering
+            // Установка из папки работает всегда, в том числе без сети (§5.6).
+            AvButton {
+                visible: window.currentSection.key === "models"
+                Layout.alignment: Qt.AlignVCenter
+                small: true
+                iconName: "folder"
+                text: qsTr("Установить из файла или папки…")
+                enabled: window.bridge !== null
+                onClicked: { if (window.bridge) window.bridge.pickInstallPath(); }
             }
         }
 
@@ -142,6 +159,7 @@ ApplicationWindow {
         Flickable {
             id: body
             anchors.top: header.bottom
+            anchors.topMargin: Theme.spaceHeadGap
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: parent.bottom

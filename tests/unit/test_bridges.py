@@ -1602,6 +1602,9 @@ class FakeModelPort:
     def set_current(self, model_id: str, revision: str) -> None:
         assert (model_id, revision) == (self.entry.id, self.entry.revision)
 
+    def remove(self, model_id: str, revision: str) -> None:
+        raise AssertionError("У тестового порта нечего удалять")
+
     def installed_ok(self) -> bool:
         return self.ready
 
@@ -3452,6 +3455,8 @@ def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
             "message": "",
             "progress": 0.0,
             "vendor": "",
+            "domestic": False,
+            "updateAvailable": False,
             "tags": [],
             "metrics": [
                 {"label": "Качество", "text": "", "fill": 0.0, "hasData": False, "measured": False},

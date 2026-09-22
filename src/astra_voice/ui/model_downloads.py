@@ -73,6 +73,7 @@ _REVOKED_MESSAGE = (
 _CURRENT_FAILED_MESSAGE = (
     "Модель установлена. Сделать её рабочей не удалось — попробуйте переустановить."
 )
+_REMOVE_FAILED_MESSAGE = "Не удалось удалить модель. Попробуйте ещё раз."
 _SAFE_MODEL_MESSAGES = frozenset(
     {
         _BROKEN_MESSAGE,
@@ -80,6 +81,7 @@ _SAFE_MODEL_MESSAGES = frozenset(
         _ENGINE_FAILED_MESSAGE,
         _REVOKED_MESSAGE,
         _CURRENT_FAILED_MESSAGE,
+        _REMOVE_FAILED_MESSAGE,
         "Не удалось установить модель. Попробуйте ещё раз.",
         "Модель нужно переустановить.",
         "В папке есть лишние файлы. Оставьте только файлы выбранной модели.",
@@ -193,6 +195,8 @@ class ModelPort(Protocol):
     def installed_ids(self) -> tuple[tuple[str, str], ...]: ...
 
     def set_current(self, model_id: str, revision: str) -> None: ...
+
+    def remove(self, model_id: str, revision: str) -> None: ...
 
     def installed_ok(self) -> bool: ...
 
@@ -384,6 +388,9 @@ class ModelService:
 
     def set_current(self, model_id: str, revision: str) -> None:
         self._store.set_current(model_id, revision)
+
+    def remove(self, model_id: str, revision: str) -> None:
+        self._store.remove(model_id, revision)
 
     def installed_ok(self) -> bool:
         return any(
@@ -800,13 +807,47 @@ class ModelDownloads(QObject):
         except (OSError, StoreError):
             log.debug("Не удалось открыть каталог моделей")
 
-    def _badge(self, entry: Any) -> str:
+    def _installed_ids(self) -> tuple[tuple[str, str], ...]:
+        """Что лежит в хранилище; недоступное хранилище не считается установкой."""
+        if self._model is None:
+            return ()
+        try:
+            return self._model.installed_ids()
+        except (OSError, StoreError):
+            log.warning("Не удалось прочитать список установленных моделей")
+            return ()
+
+    def _installed_revision(
+        self, entry: Any, installed: tuple[tuple[str, str], ...] | None = None
+    ) -> str:
+        """Ревизия этой модели в хранилище: своя из каталога, иначе прежняя.
+
+        Каталог хранит одну — самую свежую — ревизию каждой модели. Если
+        установлена другая, модель всё равно установлена, просто старой версии:
+        именно на этом держится «Обновить» в карточке.
+        """
+        known = self._installed_ids() if installed is None else installed
+        if (entry.id, entry.revision) in known:
+            return str(entry.revision)
+        return next((revision for model_id, revision in known if model_id == entry.id), "")
+
+    def _update_available(
+        self, entry: Any, installed: tuple[tuple[str, str], ...] | None = None
+    ) -> bool:
+        """Каталог знает ревизию новее установленной."""
+        revision = self._installed_revision(entry, installed)
+        return bool(revision) and revision != entry.revision
+
+    def _badge(self, entry: Any, installed: tuple[tuple[str, str], ...] | None = None) -> str:
         if self._model is None:
             return ""
-        state = self._model.record_state(entry.id, entry.revision)
+        revision = self._installed_revision(entry, installed)
+        if not revision:
+            return ""
+        state = self._model.record_state(entry.id, revision)
         if not state:
             return ""
-        if state == "ok" and self._model.current_ids() == (entry.id, entry.revision):
+        if state == "ok" and self._model.current_ids() == (entry.id, revision):
             return "active"
         return "installed"
 
@@ -830,6 +871,7 @@ class ModelDownloads(QObject):
     @property
     def models(self) -> list[dict[str, Any]]:
         best_wer, best_rtfx = catalog_best(self._entries)
+        installed = self._installed_ids()
         return [
             {
                 "id": entry.id,
@@ -841,22 +883,37 @@ class ModelDownloads(QObject):
                 "sizeText": format_size(entry.size_bytes),
                 "ramText": format_size(entry.min_ram_mb * 1_000_000),
                 "selected": entry.id in self._selected,
-                "badge": self._badge(entry),
+                "badge": self._badge(entry, installed),
                 "state": self._card_state(entry),
                 "message": self._card_message(entry),
                 "progress": self._card_progress.get(entry.id, 0.0),
                 "vendor": getattr(entry, "vendor", ""),
+                "domestic": bool(getattr(entry, "domestic", False)),
+                "updateAvailable": self._update_available(entry, installed),
                 "tags": entry_tags(entry),
                 "metrics": entry_metrics(entry, best_wer, best_rtfx),
             }
             for entry in self._entries
         ]
 
+    @property
+    def installedSummary(self) -> str:  # noqa: N802
+        """Счётчик шапки раздела: сколько записей каталога уже стоит и сколько занимают."""
+        if not self._entries:
+            return ""
+        installed = self._installed_ids()
+        entries = [entry for entry in self._entries if self._badge(entry, installed)]
+        total = f"Установлено {len(entries)} из {len(self._entries)}"
+        size = sum(entry.size_bytes for entry in entries)
+        # Цифра каталога — та же, что в строке «Занимает места» каждой карточки.
+        return f"{total} · {format_size(size)} на диске" if size else total
+
     def _selected_downloads(self) -> tuple[Any, ...]:
+        installed = self._installed_ids()
         return tuple(
             entry
             for entry in self._entries
-            if entry.id in self._selected and not self._badge(entry)
+            if entry.id in self._selected and not self._badge(entry, installed)
         )
 
     def _selection_bytes(self) -> int:
@@ -983,6 +1040,71 @@ class ModelDownloads(QObject):
     def retryModel(self, model_id: str) -> None:  # noqa: N802
         entry = next((entry for entry in self._entries if entry.id == model_id), None)
         if entry is not None and self._card_states.get(model_id) in {"failed", "no-space"}:
+            self._begin_queue((entry,))
+
+    def _idle(self) -> bool:
+        """Действия с установленными моделями не пересекаются с очередью и проверкой."""
+        return not (
+            self._model is None
+            or self._queue_running
+            or self._rechecking
+            or self._model_thread is not None
+            or self._shutting_down
+        )
+
+    def _managed_entry(self, model_id: str) -> Any | None:
+        """Запись каталога, которой можно управлять прямо сейчас."""
+        if not self._idle():
+            return None
+        return next((entry for entry in self._entries if entry.id == model_id), None)
+
+    def makeModelCurrent(self, model_id: str) -> None:  # noqa: N802
+        """Делает установленную ревизию рабочей; сломанную рабочей не делаем."""
+        entry = self._managed_entry(model_id)
+        if entry is None or self._model is None:
+            return
+        revision = self._installed_revision(entry)
+        if not revision or self._model.record_state(entry.id, revision) != "ok":
+            return
+        with self._update():
+            try:
+                self._model.set_current(entry.id, revision)
+            except (OSError, StoreError):
+                log.warning("Не удалось сделать модель рабочей")
+                self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
+                return
+            self._card_messages.pop(entry.id, None)
+            self._notify("modelsChanged")
+            self._notify("modelReadyChanged")
+            self._notify("selectionChanged")
+
+    def removeModel(self, model_id: str) -> None:  # noqa: N802
+        """Удаляет установленную ревизию; рабочую модель удалить нельзя."""
+        entry = self._managed_entry(model_id)
+        if entry is None or self._model is None:
+            return
+        revision = self._installed_revision(entry)
+        if not revision or self._badge(entry) == "active":
+            return
+        with self._update():
+            try:
+                self._model.remove(entry.id, revision)
+            except (OSError, StoreError):
+                log.warning("Не удалось удалить модель")
+                self._set_card(entry, self._card_state(entry), _REMOVE_FAILED_MESSAGE)
+                return
+            self._selected.discard(entry.id)
+            self._card_states.pop(entry.id, None)
+            self._card_messages.pop(entry.id, None)
+            self._card_progress.pop(entry.id, None)
+            self._notify("modelsChanged")
+            self._notify("modelReadyChanged")
+            self._notify("selectionChanged")
+
+    def updateModel(self, model_id: str) -> None:  # noqa: N802
+        """Ставит в очередь ревизию из каталога, когда установлена прежняя."""
+        entry = self._managed_entry(model_id)
+        if entry is not None and self._update_available(entry):
             self._begin_queue((entry,))
 
     def cancelDownloads(self) -> None:  # noqa: N802
