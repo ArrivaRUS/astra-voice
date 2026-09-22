@@ -31,6 +31,7 @@ Depends: ${misc:Depends},
          python3-packaging,
          python3-requests,
          python3-xlib,
+         pulseaudio-utils,
          gpgv
 # Шрифты — Recommends, а не Depends: на ALSE apt ставит Recommends по умолчанию,
 # а в чистом debian:12 (CI, сборочный контейнер) пакетов PT нет, и жёсткая
