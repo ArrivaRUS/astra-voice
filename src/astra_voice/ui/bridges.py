@@ -109,6 +109,9 @@ class SettingsApply(Protocol):
     def has_sound_service(self) -> bool: ...
 
 
+_DEFAULT_DEVICE = {"id": "", "name": "Системный по умолчанию"}
+
+
 class SettingsBridge(QObject):
     """Публикует настройки и ошибки записи; каждый сеттер сразу пишет файл."""
 
@@ -120,6 +123,7 @@ class SettingsBridge(QObject):
     checkModelUpdatesChanged = pyqtSignal()
     autostartChanged = pyqtSignal()
     deviceChanged = pyqtSignal()
+    devicesChanged = pyqtSignal()
     hotkeyStatusChanged = pyqtSignal()
     saveErrorChanged = pyqtSignal()
     modelSelfcheckChanged = pyqtSignal()
@@ -160,11 +164,17 @@ class SettingsBridge(QObject):
         save: Callable[[Settings], None] = settings_save,
         open_url: Callable[[QUrl], bool] | None = None,
         dialog_factory: Callable[[], str] = QFileDialog.getExistingDirectory,
+        device_provider: Callable[[], list[AudioDevice]] = list_devices,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._settings = settings
         self._mirror = mirror
+        # Список микрофонов читается по запросу экрана (refreshDevices), а не при
+        # старте: звуковая служба может подняться позже программы, а устройства —
+        # подключаться позже (2026-09-22: в «Общих» нельзя было выбрать микрофон).
+        self._device_provider = device_provider
+        self._devices: list[dict[str, str]] = [_DEFAULT_DEVICE.copy()]
         self._locked = frozenset(locked)
         self._apply = apply
         self._save = save
@@ -522,6 +532,25 @@ class SettingsBridge(QObject):
     def device(self, value: str) -> None:
         self._set_value("device", value)
 
+    @pyqtProperty("QVariantList", notify=devicesChanged)
+    def devices(self) -> list[dict[str, str]]:
+        """Микрофоны для выбора: первый — системный по умолчанию, далее из списка службы."""
+        return [dict(device) for device in self._devices]
+
+    @pyqtSlot()
+    def refreshDevices(self) -> None:  # noqa: N802
+        """Перечитывает список микрофонов (только список, микрофон не открывается)."""
+        devices = [_DEFAULT_DEVICE.copy()]
+        try:
+            devices.extend(
+                {"id": device.name, "name": device.label} for device in self._device_provider()
+            )
+        except (AudioError, OSError):
+            log.warning("Не удалось получить список микрофонов. Доступен системный по умолчанию.")
+        if devices != self._devices:
+            self._devices = devices
+            self.devicesChanged.emit()
+
     @pyqtProperty(int, notify=microphoneChanged)
     def microphoneVolume(self) -> int:  # noqa: N802
         """Системная громкость выбранного микрофона в процентах; −1 — неизвестна."""
@@ -733,7 +762,7 @@ class OnboardingController(QObject):
         self._resolved_device = ""
         self._dialog_factory = dialog_factory
         self._open_url = open_url if open_url is not None else QDesktopServices.openUrl
-        self._devices = [{"id": "", "name": "Системный по умолчанию"}]
+        self._devices = [_DEFAULT_DEVICE.copy()]
         try:
             self._devices.extend(
                 {"id": device.name, "name": device.label} for device in device_provider()

@@ -168,6 +168,13 @@ class FakeOnboarding(QObject):
         self._eta: str = "осталось ~3 мин"
         self._hotkey: str = "Ctrl + Space"
         self._hotkeyMode: str = "ptt"
+        self._microphoneVolume: int = 80
+        self._microphoneMuted: bool = False
+        self._canRaiseMicrophone: bool = True
+        self._devices: list[dict[str, str]] = [
+            {"id": "", "name": "Системный по умолчанию"},
+            {"id": "alsa_input.mic", "name": "Микрофон гарнитуры"},
+        ]
         self._captureState: str = "idle"
         self._captureMessage: str = ""
         self._pendingCombo: str = ""
@@ -1055,6 +1062,77 @@ class FakeSettings(QObject):
     @pyqtSlot()
     def installRecommendedModel(self) -> None:
         self.calls.append("installRecommendedModel")
+
+    # Микрофон и звук (блок 5 M6) — без системных вызовов.
+    def _get_microphoneVolume(self) -> int:
+        return self._microphoneVolume
+
+    def _set_microphoneVolume(self, value: int) -> None:
+        self._microphoneVolume = value
+        self.changed.emit()
+
+    microphoneVolume = pyqtProperty(
+        int, _get_microphoneVolume, _set_microphoneVolume, notify=changed
+    )
+
+    def _get_microphoneMuted(self) -> bool:
+        return self._microphoneMuted
+
+    def _set_microphoneMuted(self, value: bool) -> None:
+        self._microphoneMuted = value
+        self.changed.emit()
+
+    microphoneMuted = pyqtProperty(bool, _get_microphoneMuted, _set_microphoneMuted, notify=changed)
+
+    def _get_canRaiseMicrophone(self) -> bool:
+        return self._canRaiseMicrophone
+
+    def _set_canRaiseMicrophone(self, value: bool) -> None:
+        self._canRaiseMicrophone = value
+        self.changed.emit()
+
+    canRaiseMicrophone = pyqtProperty(
+        bool, _get_canRaiseMicrophone, _set_canRaiseMicrophone, notify=changed
+    )
+
+    def _get_canOpenSoundSettings(self) -> bool:
+        return True
+
+    canOpenSoundSettings = pyqtProperty(bool, _get_canOpenSoundSettings, notify=changed)
+
+    def _get_canRestartSoundService(self) -> bool:
+        return True
+
+    canRestartSoundService = pyqtProperty(bool, _get_canRestartSoundService, notify=changed)
+
+    def _get_devices(self) -> list[dict[str, str]]:
+        return self._devices
+
+    def _set_devices(self, value: list[dict[str, str]]) -> None:
+        self._devices = value
+        self.changed.emit()
+
+    devices = pyqtProperty("QVariantList", _get_devices, _set_devices, notify=changed)
+
+    @pyqtSlot()
+    def refreshMicrophone(self) -> None:
+        self.calls.append("refreshMicrophone")
+
+    @pyqtSlot()
+    def raiseMicrophoneVolume(self) -> None:
+        self.calls.append("raiseMicrophoneVolume")
+
+    @pyqtSlot()
+    def openSoundSettings(self) -> None:
+        self.calls.append("openSoundSettings")
+
+    @pyqtSlot()
+    def restartSoundService(self) -> None:
+        self.calls.append("restartSoundService")
+
+    @pyqtSlot()
+    def refreshDevices(self) -> None:
+        self.calls.append("refreshDevices")
 
     @pyqtSlot()
     def cancelDownloads(self) -> None:

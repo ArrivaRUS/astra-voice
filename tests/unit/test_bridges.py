@@ -5922,3 +5922,41 @@ def test_free_space_text_handles_service_disk_usage_error(
     assert controller.freeSpaceText == ""
     usage.assert_called_once_with(tmp_path)
     assert not service._store.root.exists()
+
+
+def test_settings_devices_default_until_refresh() -> None:
+    """До refreshDevices() в «Общих» только системный по умолчанию; поставщик не зовётся."""
+    provider = Mock(return_value=[AudioDevice(1, "alsa_input.mic", "Микрофон", False)])
+    bridge = SettingsBridge(Settings(), save=Mock(), device_provider=provider)
+    assert bridge.devices == [{"id": "", "name": "Системный по умолчанию"}]
+    provider.assert_not_called()
+
+
+def test_settings_refresh_devices_lists_microphones() -> None:
+    """2026-09-22: в «Общих» нельзя было выбрать микрофон — список берётся из моста."""
+    devices = [
+        AudioDevice(1, "alsa_input.mic", "Микрофон гарнитуры", False),
+        AudioDevice(2, "alsa_output.monitor", "Колонки", True),
+    ]
+    provider = Mock(return_value=devices)
+    bridge = SettingsBridge(Settings(), save=Mock(), device_provider=provider)
+    changed = Mock()
+    bridge.devicesChanged.connect(changed)
+    bridge.refreshDevices()
+    assert bridge.devices == [
+        {"id": "", "name": "Системный по умолчанию"},
+        {"id": "alsa_input.mic", "name": "Микрофон гарнитуры"},
+        {"id": "alsa_output.monitor", "name": "Колонки (звук системы)"},
+    ]
+    changed.assert_called_once()
+    bridge.refreshDevices()
+    changed.assert_called_once()  # без изменений сигнала нет
+
+
+def test_settings_refresh_devices_failure_keeps_default(caplog: pytest.LogCaptureFixture) -> None:
+    provider = Mock(side_effect=AudioError("audio-failed", "нет службы"))
+    bridge = SettingsBridge(Settings(), save=Mock(), device_provider=provider)
+    with caplog.at_level("WARNING", logger="astra_voice.ui"):
+        bridge.refreshDevices()
+    assert bridge.devices == [{"id": "", "name": "Системный по умолчанию"}]
+    assert any("список микрофонов" in record.getMessage() for record in caplog.records)

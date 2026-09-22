@@ -130,6 +130,8 @@ Python вызывает метод `show_section(name)`
 | `checkModelUpdates` | `bool` | чтение и запись | Только запись файла | `checkModelUpdatesChanged` |
 | `autostart` | `bool` | чтение и запись | Только запись файла; ничего в системе пока не создаётся (см. раздел 5) | `autostartChanged` |
 | `device` | `string` | чтение и запись | Пишется в `settings.extra["device"]` (пустая строка сохраняется как `null`) → `apply.device()`. Рантайм сбрасывает объявление микрофона; устройство читается перед следующей записью, текущая продолжается на прежнем | `deviceChanged` |
+| `devices` | `QVariantList` | только чтение | Список микрофонов для строки «Микрофон» в «Общих»: объекты с полями `id` и `name`, первый — `{'id': '', 'name': 'Системный по умолчанию'}`; до первого `refreshDevices()` — только он | `devicesChanged` |
+| `refreshDevices()` | слот | — | Перечитывает список микрофонов у звуковой службы (микрофон не открывается); при ошибке остаётся системный по умолчанию, в журнале предупреждение. Экран «Общие» зовёт при открытии | `devicesChanged` при изменении |
 | `hotkeyStatus` | `string` | только чтение | Ставится из Python (`set_hotkey_status`) после каждой попытки захвата клавиши | `hotkeyStatusChanged` |
 | `saveError` | `string` | только чтение | Пусто, если последняя запись удалась; иначе `«Не удалось сохранить настройки»` | `saveErrorChanged` |
 | `modelSelfcheck` | `string` | только чтение | Ставится из Python (`set_model_selfcheck`); сейчас никто не вызывает (раздел 5) | `modelSelfcheckChanged` |

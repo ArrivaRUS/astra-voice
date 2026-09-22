@@ -21,8 +21,35 @@ Column {
     readonly property int micVolume: root.settings ? root.settings.microphoneVolume : -1
 
     Component.onCompleted: {
-        if (root.settings)
+        if (root.settings) {
+            root.settings.refreshDevices()
             root.settings.refreshMicrophone()
+        }
+    }
+
+    // Список микрофонов из моста (как в шаге «Микрофон» мастера): имена в списке,
+    // идентификаторы — в объектах; выбор ищем по идентификатору.
+    readonly property var devices: (root.settings && root.settings.devices.length > 0)
+        ? root.settings.devices
+        : [{ id: "", name: qsTr("Системный по умолчанию") }]
+
+    function deviceNames() {
+        var names = []
+        for (var i = 0; i < root.devices.length; ++i)
+            names.push(root.devices[i].name)
+        return names
+    }
+
+    function deviceIndex(deviceId) {
+        for (var i = 0; i < root.devices.length; ++i) {
+            if (root.devices[i].id === deviceId)
+                return i
+        }
+        return -1
+    }
+
+    function deviceIdAt(index) {
+        return index >= 0 && index < root.devices.length ? root.devices[index].id : ""
     }
 
     function isLocked(name) {
@@ -139,23 +166,19 @@ Column {
                 Layout.preferredWidth: 236  // §4.4: типовая ширина списка в строке настройки
                 Layout.alignment: Qt.AlignVCenter
                 enabled: !root.isLocked("device")
-                model: (root.settings && root.settings.device
-                    && root.settings.device !== qsTr("Системный по умолчанию"))
-                    ? [root.settings.device, qsTr("Системный по умолчанию")]
-                    : [qsTr("Системный по умолчанию")]
+                model: root.deviceNames()
 
                 Binding {
                     target: deviceSelector
                     property: "currentIndex"
-                    value: Math.max(0, deviceSelector.model.indexOf(
-                        root.settings ? root.settings.device : ""))
+                    value: Math.max(0, root.deviceIndex(root.settings ? root.settings.device : ""))
                 }
 
                 onCurrentIndexChanged: {
                     if (root.settings && !root.isLocked("device")
-                            && currentIndex >= 0 && currentIndex < model.length
-                            && root.settings.device !== model[currentIndex])
-                        root.settings.device = model[currentIndex]
+                            && currentIndex >= 0 && currentIndex < root.devices.length
+                            && root.settings.device !== root.deviceIdAt(currentIndex))
+                        root.settings.device = root.deviceIdAt(currentIndex)
                 }
             }
         }
