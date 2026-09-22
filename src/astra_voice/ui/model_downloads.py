@@ -15,7 +15,7 @@ import math
 import shutil
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Protocol
@@ -35,6 +35,7 @@ from astra_voice.core.model_source import SmokeRunner
 from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
+from astra_voice.models import catalog_state
 from astra_voice.models.catalog import CatalogEntry, load_builtin
 from astra_voice.models.downloader import Downloader, DownloadError, Progress
 from astra_voice.models.installer import (
@@ -52,9 +53,11 @@ from astra_voice.ui.formatting import (
     SpeedTracker,
     clean_display_name,
     format_eta,
+    format_rtfx,
     format_size,
     format_space,
     format_speed,
+    format_wer,
 )
 
 log = logging.getLogger(__name__)
@@ -88,6 +91,78 @@ _SAFE_MODEL_MESSAGES = frozenset(
         "Включена работа без сети",
     }
 )
+_PUNCTUATION_TAG = "с пунктуацией"
+_DOMESTIC_TAG = "отечественная"
+_QUALITY_LABEL = "Качество"
+_SPEED_LABEL = "Скорость"
+
+
+def _metric(entry: Any, name: str) -> Any | None:
+    """Достаёт одну метрику записи, не полагаясь на её наличие у подставных объектов."""
+    return getattr(getattr(entry, "metrics", None), name, None)
+
+
+def _metric_row(label: str, text: str, fill: float) -> dict[str, Any]:
+    """Строка полоски карточки; measured — признак замера на этом компьютере."""
+    return {
+        "label": label,
+        "text": text,
+        "fill": max(0.0, min(1.0, fill)),
+        "hasData": bool(text),
+        "measured": False,
+    }
+
+
+def entry_tags(entry: Any) -> list[str]:
+    """Готовые подписи карточки: язык, пунктуация, лицензия с вендором, происхождение."""
+    tags: list[str] = []
+    language_tag = getattr(entry, "language_tag", "")
+    if language_tag:
+        tags.append(language_tag)
+    if getattr(entry, "punctuation", False):
+        tags.append(_PUNCTUATION_TAG)
+    license_name = getattr(entry, "license", "")
+    vendor_short = getattr(entry, "vendor_short", "")
+    if license_name and vendor_short:
+        tags.append(f"{license_name} · {vendor_short}")
+    elif license_name or vendor_short:
+        tags.append(license_name or vendor_short)
+    if getattr(entry, "domestic", False):
+        tags.append(_DOMESTIC_TAG)
+    return tags
+
+
+def entry_metrics(entry: Any, best_wer: float, best_rtfx: float) -> list[dict[str, Any]]:
+    """Качество и скорость записи; доля заливки — относительно лучшего в каталоге."""
+    wer = _metric(entry, "wer_ru")
+    rtfx = _metric(entry, "rtfx")
+    wer_value = getattr(wer, "value", 0.0) if wer is not None else 0.0
+    rtfx_value = getattr(rtfx, "value", 0.0) if rtfx is not None else 0.0
+    return [
+        _metric_row(
+            _QUALITY_LABEL,
+            format_wer(wer_value) if wer_value > 0 else "",
+            best_wer / wer_value if wer_value > 0 and best_wer > 0 else 0.0,
+        ),
+        _metric_row(
+            _SPEED_LABEL,
+            format_rtfx(rtfx_value) if rtfx_value > 0 else "",
+            rtfx_value / best_rtfx if rtfx_value > 0 and best_rtfx > 0 else 0.0,
+        ),
+    ]
+
+
+def catalog_best(entries: Iterable[Any]) -> tuple[float, float]:
+    """Лучшие цифры каталога: наименьший WER и наибольшая скорость."""
+    wer_values = [
+        value for entry in entries if (value := getattr(_metric(entry, "wer_ru"), "value", 0.0)) > 0
+    ]
+    rtfx_values = [
+        value for entry in entries if (value := getattr(_metric(entry, "rtfx"), "value", 0.0)) > 0
+    ]
+    return (min(wer_values) if wer_values else 0.0, max(rtfx_values) if rtfx_values else 0.0)
+
+
 # После таймаута поток и задание должны оставаться живы до выхода run().
 _finishing_model_threads: set[tuple[QThread, _ModelJob | _RecheckJob | None]] = set()
 
@@ -98,6 +173,8 @@ class ModelPort(Protocol):
     def recommended(self) -> Any | None: ...
 
     def entries(self) -> tuple[Any, ...]: ...
+
+    def is_revoked(self, entry: Any) -> bool: ...
 
     def recheck_entries(self) -> tuple[Any, ...]: ...
 
@@ -197,7 +274,10 @@ class ModelService:
 
     def __init__(self, settings: Settings, policy: Policy) -> None:
         keyring = paths.data_dir_static() / "keys" / "release.gpg"
-        self._catalog = load_builtin(Verifier("catalog", keyring=keyring))
+        self._catalog = load_builtin(
+            Verifier("catalog", keyring=keyring),
+            state_path=catalog_state.state_path(paths.state_dir()),
+        )
         self._store = ModelStore()
         self._gate = NetworkGate(settings, policy)
         ca_bundle = policy.values.get("ca_bundle")
@@ -228,11 +308,23 @@ class ModelService:
             None,
         )
 
+    def is_revoked(self, entry: Any) -> bool:
+        """Издатель отозвал именно эту ревизию модели."""
+        return self._catalog.is_revoked(entry.id, entry.revision)
+
     def entries(self) -> tuple[CatalogEntry, ...]:
+        # Отозванную ревизию не предлагаем, но уже установленную показываем:
+        # иначе человек не увидит, почему модель перестала работать.
+        try:
+            installed = {(record.id, record.revision) for record in self._store.records()}
+        except (OSError, StoreError):
+            log.warning("Не удалось прочитать установленные модели для списка каталога")
+            installed = set()
         entries = tuple(
             entry
             for entry in self._catalog.entries
             if not self._catalog.is_revoked(entry.id, entry.revision)
+            or (entry.id, entry.revision) in installed
         )
         recommended = next((entry for entry in entries if entry.recommended), None)
         if recommended is None:
@@ -255,7 +347,12 @@ class ModelService:
             for record in self._store.records()
             if record.recheck is True
         }
-        return tuple(entry for entry in self.entries() if (entry.id, entry.revision) in pending)
+        # Отозванную ревизию не перепроверяем: её всё равно нельзя сделать рабочей.
+        return tuple(
+            entry
+            for entry in self.entries()
+            if (entry.id, entry.revision) in pending and not self.is_revoked(entry)
+        )
 
     def verify_files(self, entry: Any) -> tuple[bool, str]:
         """Сверяет установленный набор; ошибки чтения не становятся вердиктом."""
@@ -290,7 +387,10 @@ class ModelService:
 
     def installed_ok(self) -> bool:
         return any(
-            record.state == "ok" and record.recheck is not True for record in self._store.records()
+            record.state == "ok"
+            and record.recheck is not True
+            and not self._catalog.is_revoked(record.id, record.revision)
+            for record in self._store.records()
         )
 
     def broken(self) -> bool:
@@ -575,6 +675,31 @@ class ModelDownloads(QObject):
     def modelReady(self) -> bool:  # noqa: N802
         return self._model is not None and self._model.installed_ok()
 
+    def _is_revoked(self, entry: Any) -> bool:
+        """Спрашивает порт об отзыве; порт без этого метода отзывов не знает."""
+        checker = getattr(self._model, "is_revoked", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(entry))
+        except (OSError, StoreError):
+            log.warning("Не удалось проверить отзыв версии модели")
+            return False
+
+    def _card_state(self, entry: Any) -> str:
+        state = self._card_states.get(entry.id)
+        if state is not None:
+            return state
+        if self._is_revoked(entry):
+            return "failed"
+        return "installed" if self._badge(entry) else "available"
+
+    def _card_message(self, entry: Any) -> str:
+        message = self._card_messages.get(entry.id, "")
+        if message:
+            return message
+        return _REVOKED_MESSAGE if self._is_revoked(entry) else ""
+
     def active_entry(self) -> Any | None:
         if self._model is None:
             if self._store is None:
@@ -596,16 +721,16 @@ class ModelDownloads(QObject):
                 records[0] if records else None,
             )
         current = self._model.current_ids()
-        for entry in self._entries:
+        # Отозванная ревизия рабочей быть не может: её место занимает замена.
+        usable = tuple(entry for entry in self._entries if not self._is_revoked(entry))
+        for entry in usable:
             if (entry.id, entry.revision) == current:
                 return entry
-        for entry in self._entries:
+        for entry in usable:
             if self._model.record_state(entry.id, entry.revision) == "ok":
                 return entry
         installed = self._model.installed_ids()
-        return next(
-            (entry for entry in self._entries if (entry.id, entry.revision) in installed), None
-        )
+        return next((entry for entry in usable if (entry.id, entry.revision) in installed), None)
 
     def active_state(self) -> str:
         entry = self.active_entry()
@@ -704,6 +829,7 @@ class ModelDownloads(QObject):
 
     @property
     def models(self) -> list[dict[str, Any]]:
+        best_wer, best_rtfx = catalog_best(self._entries)
         return [
             {
                 "id": entry.id,
@@ -716,11 +842,12 @@ class ModelDownloads(QObject):
                 "ramText": format_size(entry.min_ram_mb * 1_000_000),
                 "selected": entry.id in self._selected,
                 "badge": self._badge(entry),
-                "state": self._card_states.get(
-                    entry.id, "installed" if self._badge(entry) else "available"
-                ),
-                "message": self._card_messages.get(entry.id, ""),
+                "state": self._card_state(entry),
+                "message": self._card_message(entry),
                 "progress": self._card_progress.get(entry.id, 0.0),
+                "vendor": getattr(entry, "vendor", ""),
+                "tags": entry_tags(entry),
+                "metrics": entry_metrics(entry, best_wer, best_rtfx),
             }
             for entry in self._entries
         ]

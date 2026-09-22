@@ -1,4 +1,4 @@
-"""Контракт движка, раскладки GigaAM v3 и сторожевой таймер (S3, M2).
+"""Контракт движка, шесть раскладок каталога и сторожевой таймер (S3, M2, M6).
 
 Импорт модуля не требует установленных numpy, onnxruntime или onnx-asr.
 """
@@ -132,12 +132,19 @@ class Engine(Protocol):
 
 @dataclass(frozen=True)
 class VariantSpec:
-    """Имя модели onnx-asr, состав каталога и ожидаемое число сессий."""
+    """Имя модели onnx-asr, состав каталога и ожидаемое число сессий.
+
+    Пути в `required`/`optional` — относительные, с `/` как разделителем:
+    раскладка Vosk держит веса и словарь в разных подкаталогах.
+    `quantization` передаётся onnx-asr при поиске файлов; у T-one int8-весов
+    не существует, поэтому там None и рантайм берёт fp32.
+    """
 
     onnx_asr_name: str
     required: tuple[str, ...]
     optional: tuple[str, ...]
     sessions: int
+    quantization: str | None = "int8"
 
 
 # S3 §2.1–2.3: int8-веса и конфигурация обязательны, YAML не читается рантаймом.
@@ -161,6 +168,12 @@ LAYOUTS: dict[str, dict[str, VariantSpec]] = {
             optional=("v3_e2e_ctc.yaml",),
             sessions=1,
         ),
+        "gigaam-v3-ctc": VariantSpec(
+            onnx_asr_name="gigaam-v3-ctc",
+            required=("v3_ctc.int8.onnx", "v3_vocab.txt", "config.json"),
+            optional=("v3_ctc.yaml",),
+            sessions=1,
+        ),
         "gigaam-v3-rnnt": VariantSpec(
             onnx_asr_name="gigaam-v3-rnnt",
             required=(
@@ -174,7 +187,116 @@ LAYOUTS: dict[str, dict[str, VariantSpec]] = {
             sessions=3,
         ),
     },
+    "onnx-asr-gigaam-multilingual": {
+        "gigaam-multilingual-ctc": VariantSpec(
+            onnx_asr_name="gigaam-multilingual-ctc",
+            required=("multilingual_ctc.int8.onnx", "multilingual_vocab.txt", "config.json"),
+            optional=("multilingual_ctc.yaml",),
+            sessions=1,
+        ),
+        "gigaam-multilingual-large-ctc": VariantSpec(
+            onnx_asr_name="gigaam-multilingual-large-ctc",
+            required=("multilingual_large_ctc.int8.onnx", "multilingual_vocab.txt", "config.json"),
+            optional=("multilingual_large_ctc.yaml",),
+            sessions=1,
+        ),
+    },
+    # У T-one опубликованы только fp32-веса: int8-экспорта не существует.
+    "onnx-asr-t-one": {
+        "t-one-ctc": VariantSpec(
+            onnx_asr_name="t-one-ctc",
+            required=("model.onnx", "config.json"),
+            optional=(),
+            sessions=1,
+            quantization=None,
+        ),
+    },
+    # Vosk: onnx-asr ищет веса в подкаталоге (`*/encoder.int8.onnx`), словарь — в `lang/`.
+    "onnx-asr-vosk": {
+        "vosk-am-onnx": VariantSpec(
+            onnx_asr_name="vosk",
+            required=(
+                "am-onnx/encoder.int8.onnx",
+                "am-onnx/decoder.int8.onnx",
+                "am-onnx/joiner.int8.onnx",
+                "lang/tokens.txt",
+            ),
+            optional=(),
+            sessions=3,
+        ),
+        "vosk-am": VariantSpec(
+            onnx_asr_name="vosk",
+            required=(
+                "am/encoder.int8.onnx",
+                "am/decoder.int8.onnx",
+                "am/joiner.int8.onnx",
+                "lang/tokens.txt",
+            ),
+            optional=(),
+            sessions=3,
+        ),
+    },
+    "onnx-community-whisper": {
+        "whisper-hf": VariantSpec(
+            onnx_asr_name="whisper",
+            required=(
+                "onnx/encoder_model_int8.onnx",
+                "onnx/decoder_model_merged_int8.onnx",
+                "vocab.json",
+                "added_tokens.json",
+                "config.json",
+            ),
+            optional=(),
+            sessions=2,
+        ),
+    },
+    "onnx-asr-nemo": {
+        "nemo-fastconformer-ru-ctc": VariantSpec(
+            onnx_asr_name="nemo-conformer-ctc",
+            required=("model.int8.onnx", "vocab.txt", "config.json"),
+            optional=(),
+            sessions=1,
+        ),
+    },
 }
+
+
+MAX_LAYOUT_DEPTH = 4
+
+
+def _layout_directories(spec: VariantSpec) -> set[str]:
+    """Подкаталоги, которые раскладка разрешает: только родители её файлов."""
+    directories: set[str] = set()
+    for path in spec.required + spec.optional:
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            directories.add("/".join(parts[:index]))
+    return directories
+
+
+def _scan_layout(model_dir: Path) -> tuple[set[str], set[str], set[str]]:
+    """Обходит каталог модели, не переходя по ссылкам: файлы, каталоги, прочее."""
+    files: set[str] = set()
+    directories: set[str] = set()
+    other: set[str] = set()
+    pending: list[tuple[str, Path, int]] = [("", model_dir, 0)]
+    while pending:
+        prefix, current, depth = pending.pop()
+        for entry in current.iterdir():
+            name = prefix + entry.name
+            if entry.is_symlink():
+                other.add(name)
+            elif entry.is_dir():
+                directories.add(name)
+                if depth + 1 < MAX_LAYOUT_DEPTH:
+                    pending.append((name + "/", entry, depth + 1))
+                else:
+                    other.add(name + "/…")
+            elif entry.is_file():
+                files.add(name)
+            else:
+                other.add(name)
+    return files, directories, other
 
 
 def check_layout(model_dir: Path, layout: str, variant: str) -> None:
@@ -188,20 +310,16 @@ def check_layout(model_dir: Path, layout: str, variant: str) -> None:
         logging.getLogger(__name__).debug("Каталог модели отсутствует: %s", model_dir)
         raise ModelMissingError("Каталог модели отсутствует или не является каталогом")
 
-    entries = list(model_dir.iterdir())
+    files, directories, other = _scan_layout(model_dir)
     allowed = set(spec.required + spec.optional)
-    extra = sorted(
-        entry.name
-        for entry in entries
-        if entry.name not in allowed or entry.is_symlink() or not entry.is_file()
-    )
+    extra = sorted(other | (files - allowed) | (directories - _layout_directories(spec)))
     if extra:
         logging.getLogger(__name__).debug("Недопустимые файлы в %s: %s", model_dir, extra)
         raise ExtraFileError(
             "В каталоге модели есть лишние файлы, подкаталоги или ссылки. "
             "Оставьте только файлы одного варианта модели"
         )
-    missing = sorted(set(spec.required) - {entry.name for entry in entries})
+    missing = sorted(set(spec.required) - files)
     if missing:
         logging.getLogger(__name__).debug("Отсутствуют файлы в %s: %s", model_dir, missing)
         raise ModelMissingError(
@@ -467,7 +585,7 @@ class OnnxAsrEngine:
             model = manager.create_asr(
                 LAYOUTS[layout][variant].onnx_asr_name,
                 model_dir,
-                quantization="int8",
+                quantization=LAYOUTS[layout][variant].quantization,
                 offline=True,
                 config={"sess_options": sess_options, "providers": ["CPUExecutionProvider"]},
             )
@@ -629,6 +747,6 @@ class OnnxAsrEngine:
 
 def make_engine(layout: str) -> Engine:
     """Создаёт адаптер для поддерживаемой раскладки."""
-    if layout == "onnx-asr-gigaam-v3":
+    if layout in LAYOUTS:
         return OnnxAsrEngine()
     raise ValueError(f"Неизвестная раскладка модели: {layout!r}")

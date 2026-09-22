@@ -176,16 +176,17 @@ def assert_rejected_without_side_effects(
 
 def test_builtin_catalog() -> None:
     result = load_builtin(Verifier("catalog", keyring=KEYRING), root=DATA_ROOT)
-    assert result.serial == 1
+    assert result.serial >= 2
     assert result.trust_epoch == 1
     assert result.revoked == ()
-    assert len(result.entries) == 1
+    assert len(result.entries) == 12
     entry = result.entries[0]
     assert result.entry(MODEL_ID) == entry
     assert entry.id == MODEL_ID
     assert entry.revision == REVISION
     assert entry.size_bytes == 226431968
-    assert entry.min_ram_mb == 768
+    assert entry.min_ram_mb == 419
+    assert entry.ram_estimated is True
     assert entry.layout == "onnx-asr-gigaam-v3"
     assert entry.variant == "gigaam-v3-e2e-rnnt"
     assert entry.host == "huggingface.co"
@@ -195,13 +196,85 @@ def test_builtin_catalog() -> None:
     assert all(file.url_path.startswith(URL_PREFIX) for file in entry.files)
 
 
+def test_builtin_catalog_descriptions() -> None:
+    """Все двенадцать записей несут поля карточки и ровно одну рекомендацию."""
+    result = load_builtin(Verifier("catalog", keyring=KEYRING), root=DATA_ROOT)
+    assert [entry.recommended for entry in result.entries].count(True) == 1
+    assert len({entry.id for entry in result.entries}) == 12
+    for entry in result.entries:
+        assert entry.vendor and entry.vendor_short and entry.language_tag
+        assert entry.license and entry.languages
+        assert entry.ram_estimated is True
+        assert entry.host == "huggingface.co"
+        assert entry.files
+    domestic = [entry.id for entry in result.entries if entry.domestic]
+    assert len(domestic) == 7
+    values = {
+        entry.id: entry.metrics.wer_ru.value
+        for entry in result.entries
+        if entry.metrics.wer_ru is not None
+    }
+    assert values[MODEL_ID] == 7.6
+    assert "whisper-small-int8" not in values
+
+
 def test_builtin_catalog_relative_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(REPO_ROOT)
     result = load_builtin(
         Verifier("catalog", keyring=Path("data/keys/release.gpg")), root=Path("data")
     )
-    assert result.serial == 1
+    assert result.serial >= 2
     assert result == load_builtin(Verifier("catalog", keyring=KEYRING), root=DATA_ROOT)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("languages", "ru"),
+        ("languages", []),
+        ("languages", ["ru", "ru"]),
+        ("languages", ["РУС"]),
+        ("punctuation", "да"),
+        ("domestic", 1),
+        ("ram_estimated", "нет"),
+        ("vendor", 5),
+        ("metrics", []),
+        ("metrics", {"wer_ru": {"value": 7.6}}),
+        ("metrics", {"wer_ru": {"value": True, "source": "x"}}),
+        ("metrics", {"wer_ru": {"value": 0, "source": "x"}}),
+        ("metrics", {"unknown": {"value": 1, "source": "x"}}),
+    ],
+)
+def test_bad_optional_fields(
+    catalog_root: Path, document: dict[str, Any], field: str, value: object
+) -> None:
+    document["models"][0][field] = value
+    write_document(catalog_root, document)
+    assert_rejected(catalog_root, "bad-schema")
+
+
+def test_optional_fields_absent(catalog_root: Path, document: dict[str, Any]) -> None:
+    """Каталог без новых полей остаётся валидным: они необязательны."""
+    for model in document["models"]:
+        for field in (
+            "vendor",
+            "vendor_short",
+            "languages",
+            "language_tag",
+            "punctuation",
+            "license",
+            "domestic",
+            "ram_estimated",
+            "metrics",
+        ):
+            model.pop(field, None)
+    write_document(catalog_root, document)
+    result = load_builtin(StubVerifier(), root=catalog_root)
+    entry = result.entries[0]
+    assert entry.vendor == "" and entry.languages == ()
+    assert entry.punctuation is False and entry.domestic is False
+    assert entry.ram_estimated is False
+    assert entry.metrics.wer_ru is None and entry.metrics.rtfx is None
 
 
 def test_catalog_fixture_matches_schema(catalog_root: Path, document: dict[str, Any]) -> None:
@@ -442,8 +515,9 @@ def test_too_large_before_json(catalog_root: Path, monkeypatch: pytest.MonkeyPat
 
 def test_duplicate_json_keys(catalog_root: Path, document: dict[str, Any]) -> None:
     text = json.dumps(document)
-    assert '"serial": 1' in text
-    text = text.replace('"serial": 1', '"serial": 1, "serial": 2', 1)
+    serial = f'"serial": {document["serial"]}'
+    assert serial in text
+    text = text.replace(serial, f'{serial}, "serial": {document["serial"] + 1}', 1)
     (catalog_root / "catalog.json").write_text(text, encoding="utf-8")
     assert_rejected(catalog_root, "bad-schema")
 

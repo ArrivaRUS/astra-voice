@@ -1391,6 +1391,8 @@ def test_download_name_from_catalog_is_safe_in_menu_and_qml(harness: Harness) ->
     port.recommended.return_value = entry
     port.current_ids.return_value = (entry.id, entry.revision)
     port.record_state.return_value = "ok"
+    # Mock отвечает истиной на что угодно: отзыв задаём явно (урок 011).
+    port.is_revoked.return_value = False
     downloads = ModelDownloads(port)
     bridge = SettingsBridge(Settings(), downloads=downloads, save=Mock())
     downloads._active_entry = entry

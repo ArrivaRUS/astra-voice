@@ -16,6 +16,7 @@ from typing import cast
 from urllib.parse import unquote
 
 from astra_voice.core import paths
+from astra_voice.models import catalog_state
 from astra_voice.models import schema as schema_module
 from astra_voice.net.hosts import host_allowed
 from astra_voice.security.verify import Verifier
@@ -24,6 +25,7 @@ log = logging.getLogger(__name__)
 
 CATALOG_MAX_BYTES = 1 << 20
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+LANGUAGE_RE = re.compile(r"^[a-z]{2,8}(-[A-Za-z0-9]{2,8})?$")
 
 
 class CatalogError(Exception):
@@ -49,6 +51,22 @@ class FileSpec:
 
 
 @dataclass(frozen=True)
+class Metric:
+    """Опубликованный замер: значение и адрес, по которому его можно проверить."""
+
+    value: float
+    source: str
+
+
+@dataclass(frozen=True)
+class Metrics:
+    """Цифры качества и скорости из каталога; отсутствующие остаются None."""
+
+    wer_ru: Metric | None = None
+    rtfx: Metric | None = None
+
+
+@dataclass(frozen=True)
 class CatalogEntry:
     """Одна ревизия модели и полный список её файлов."""
 
@@ -63,6 +81,17 @@ class CatalogEntry:
     recommended: bool
     host: str
     files: tuple[FileSpec, ...]
+    # Поля ниже появились в манифесте 12 записей и необязательны:
+    # каталог из одной записи без них остаётся валидным.
+    ram_estimated: bool = False
+    vendor: str = ""
+    vendor_short: str = ""
+    languages: tuple[str, ...] = ()
+    language_tag: str = ""
+    punctuation: bool = False
+    license: str = ""
+    domestic: bool = False
+    metrics: Metrics = Metrics()
 
 
 @dataclass(frozen=True)
@@ -171,6 +200,50 @@ def _boolean(value: object) -> bool:
     return value
 
 
+def _optional_string(value: object) -> str:
+    return "" if value is None else _string(value)
+
+
+def _optional_boolean(value: object) -> bool:
+    return False if value is None else _boolean(value)
+
+
+def _languages(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    languages = tuple(_string(item) for item in _array(value))
+    if not languages or len(set(languages)) != len(languages):
+        raise CatalogError("bad-schema", "В каталоге неверный список языков модели.")
+    for language in languages:
+        if LANGUAGE_RE.fullmatch(language) is None:
+            raise CatalogError("bad-schema", "В каталоге недопустимый код языка модели.")
+    return languages
+
+
+def _metric(value: object) -> Metric:
+    data = _object(value)
+    number = data.get("value")
+    # Логическое значение — подкласс int, но метрикой быть не может.
+    if isinstance(number, bool) or not isinstance(number, int | float) or not 0 < number <= 1000:
+        raise CatalogError("bad-schema", "В каталоге недопустимое значение метрики модели.")
+    return Metric(value=float(number), source=_string(data.get("source")))
+
+
+def _metrics(value: object) -> Metrics:
+    if value is None:
+        return Metrics()
+    data = _object(value)
+    unknown = set(data) - {"wer_ru", "rtfx"}
+    if unknown:
+        raise CatalogError("bad-schema", "В каталоге неизвестная метрика модели.")
+    wer = data.get("wer_ru")
+    rtfx = data.get("rtfx")
+    return Metrics(
+        wer_ru=None if wer is None else _metric(wer),
+        rtfx=None if rtfx is None else _metric(rtfx),
+    )
+
+
 def _identifier(value: object) -> str:
     result = _string(value)
     if ID_RE.fullmatch(result) is None:
@@ -261,6 +334,15 @@ def _model(value: object) -> CatalogEntry:
         recommended=_boolean(data.get("recommended")),
         host=host,
         files=files,
+        ram_estimated=_optional_boolean(data.get("ram_estimated")),
+        vendor=_optional_string(data.get("vendor")),
+        vendor_short=_optional_string(data.get("vendor_short")),
+        languages=_languages(data.get("languages")),
+        language_tag=_optional_string(data.get("language_tag")),
+        punctuation=_optional_boolean(data.get("punctuation")),
+        license=_optional_string(data.get("license")),
+        domestic=_optional_boolean(data.get("domestic")),
+        metrics=_metrics(data.get("metrics")),
     )
 
 
@@ -273,10 +355,32 @@ def _revoked(value: object) -> RevokedEntry:
     )
 
 
+def _apply_state(state_path: Path, raw: bytes, serial: int, trust_epoch: int) -> None:
+    """Сверяет каталог с применённым и запоминает его (анти-откат, PRD §7.3)."""
+    candidate = catalog_state.CatalogState(
+        trust_epoch=trust_epoch, serial=serial, sha256=hashlib.sha256(raw).hexdigest()
+    )
+    try:
+        catalog_state.apply_state(state_path, candidate)
+    except ValueError as exc:
+        raise CatalogError("stale-catalog", str(exc)) from None
+    except OSError:
+        # Записать состояние не удалось: каталог исправен, продолжаем без отметки.
+        log.warning("Не удалось запомнить принятый список моделей.")
+
+
 def load_builtin(
-    verifier: Verifier, *, root: Path | None = None, require_schema: bool = False
+    verifier: Verifier,
+    *,
+    root: Path | None = None,
+    require_schema: bool = False,
+    state_path: Path | None = None,
 ) -> Catalog:
-    """Читает каталог: лимит → подпись → JSON → SHA-256 схемы → схема → поля."""
+    """Читает каталог: лимит → подпись → JSON → SHA-256 схемы → схема → поля.
+
+    `state_path` включает защиту от отката: каталог со старшей парой
+    (`trust_epoch`, `serial`) отвергается, принятый — запоминается.
+    """
     directory = (paths.data_dir_static() if root is None else root).resolve()
     catalog_path = (directory / "catalog.json").resolve()
     sig_path = (directory / "catalog.json.sig").resolve()
@@ -323,9 +427,13 @@ def load_builtin(
             _check_url_path(file.url_path, entry.revision)
             if re.fullmatch(r"[0-9a-f]{64}", file.sha256) is None:
                 raise CatalogError("bad-schema", "В каталоге неверная контрольная сумма файла.")
+    serial = _positive_integer(data.get("serial"))
+    trust_epoch = _positive_integer(data.get("trust_epoch"))
+    if state_path is not None:
+        _apply_state(state_path, raw, serial, trust_epoch)
     return Catalog(
-        serial=_positive_integer(data.get("serial")),
-        trust_epoch=_positive_integer(data.get("trust_epoch")),
+        serial=serial,
+        trust_epoch=trust_epoch,
         revoked=revoked,
         entries=entries,
     )

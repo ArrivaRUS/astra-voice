@@ -83,6 +83,16 @@ def format_space(size_bytes: float) -> str:
     return format_size(size_bytes)
 
 
+def format_wer(value: float) -> str:
+    """Доля ошибок в словах как в источнике: «WER 7,60 %»."""
+    return f"WER {value:.2f} %".replace(".", ",")
+
+
+def format_rtfx(value: float) -> str:
+    """Во сколько раз распознавание быстрее речи: «42,5× быстрее речи»."""
+    return f"{value:.1f}× быстрее речи".replace(".", ",")
+
+
 class SpeedTracker:
     """Средняя скорость загрузки за последние несколько секунд."""
 

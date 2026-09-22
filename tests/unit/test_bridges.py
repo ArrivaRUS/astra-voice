@@ -43,6 +43,7 @@ from astra_voice.core.dictation import (
 from astra_voice.core.model_source import SMOKE_EXPECT_ANY
 from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
+from astra_voice.models import catalog_state
 from astra_voice.models.catalog import Catalog, CatalogEntry, FileSpec, RevokedEntry
 from astra_voice.models.downloader import DownloadError, Progress
 from astra_voice.models.installer import InstallResult, ReasonCode
@@ -1551,6 +1552,7 @@ class FakeModelPort:
         )
         self.ready = False
         self.damaged = False
+        self.revoked: set[tuple[str, str]] = set()
         self.network = True
         self.space = True
         self.available_bytes = 42_100_000_000
@@ -1567,6 +1569,9 @@ class FakeModelPort:
 
     def entries(self) -> tuple[CatalogEntry, ...]:
         return (self.entry,)
+
+    def is_revoked(self, entry: Any) -> bool:
+        return (entry.id, entry.revision) in self.revoked
 
     def recheck_entries(self) -> tuple[CatalogEntry, ...]:
         return ()
@@ -2274,7 +2279,10 @@ def test_model_service_uses_existing_modules(monkeypatch: pytest.MonkeyPatch) ->
         "catalog",
         keyring=paths.data_dir_static() / "keys" / "release.gpg",
     )
-    factories["load_builtin"].assert_called_once_with(factories["Verifier"].return_value)
+    factories["load_builtin"].assert_called_once_with(
+        factories["Verifier"].return_value,
+        state_path=catalog_state.state_path(paths.state_dir()),
+    )
     gate = factories["NetworkGate"].return_value
     store = factories["ModelStore"].return_value
     factories["NetworkGate"].assert_called_once_with(settings, policy)
@@ -2368,7 +2376,7 @@ def test_model_service_cancel_during_checksum_preserves_source(
         ),
     )
     monkeypatch.setattr(
-        model_downloads, "load_builtin", lambda verifier: Catalog(1, 1, (), (entry,))
+        model_downloads, "load_builtin", lambda verifier, **kwargs: Catalog(1, 1, (), (entry,))
     )
     monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
     service = ModelService(Settings(), policy_mod.Policy())
@@ -3409,6 +3417,22 @@ def test_model_current_failure_keeps_installation_and_continues_queue(
     assert "SECRET" not in caplog.text and "/path/service" not in caplog.text
 
 
+def test_installed_revoked_model_is_shown_as_recalled(model_rig: ModelRig) -> None:
+    """Отозванную установленную модель карточка объясняет, а рабочей она не станет."""
+    port, create = model_rig
+    port.revoked.add((port.entry.id, port.entry.revision))
+    port.ready = True
+    controller = create()
+
+    card = controller.models[0]
+    assert card["state"] == "failed"
+    assert card["message"] == model_downloads._REVOKED_MESSAGE
+    downloads = controller._downloads
+    assert downloads.active_entry() is None
+    assert downloads.active_state() == "none"
+    assert downloads.can_install() is True
+
+
 def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
     port, create = model_rig
     controller = create()
@@ -3427,6 +3451,12 @@ def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
             "state": "available",
             "message": "",
             "progress": 0.0,
+            "vendor": "",
+            "tags": [],
+            "metrics": [
+                {"label": "Качество", "text": "", "fill": 0.0, "hasData": False, "measured": False},
+                {"label": "Скорость", "text": "", "fill": 0.0, "hasData": False, "measured": False},
+            ],
         }
     ]
     assert controller.selectionSummary == controller.selectionMessage == ""
@@ -3726,6 +3756,7 @@ def test_model_service_catalog_order_and_store_proxies() -> None:
         1, 1, (RevokedEntry(revoked.id, revoked.revision, ""),), (other, revoked, first, last)
     )
     store = Mock()
+    store.records.return_value = ()
     service._store = store
     assert service.entries() == (first, other, last)
     store.records.return_value = [Mock(id=first.id, revision=first.revision, state="broken")]
@@ -5041,6 +5072,31 @@ def test_model_service_returns_installer_verdict(
 
     assert rig.service.verify_files(rig.entry) == verdict
     verify.assert_called_once_with(rig.directory, rig.entry, cancel=rig.service._cancel.is_set)
+
+
+def test_installed_revoked_entry_stays_visible_but_never_ready(
+    recheck_rig: RecheckRig,
+) -> None:
+    """Установленную отозванную ревизию показываем, но готовой моделью не считаем."""
+    rig = recheck_rig
+    rig.service._store.mark_ok(rig.entry.id, rig.entry.revision)
+    assert rig.service.installed_ok() is True
+    rig.service._catalog = Catalog(
+        1, 1, (RevokedEntry(rig.entry.id, rig.entry.revision, "битый экспорт"),), (rig.entry,)
+    )
+    assert rig.service.is_revoked(rig.entry) is True
+    assert rig.service.entries() == (rig.entry,)
+    assert rig.service.recommended() is None
+    assert rig.service.installed_ok() is False
+
+
+def test_revoked_entry_that_is_not_installed_is_hidden(recheck_rig: RecheckRig) -> None:
+    rig = recheck_rig
+    other = replace(rig.entry, id="other-model")
+    rig.service._catalog = Catalog(
+        1, 1, (RevokedEntry(other.id, other.revision, "битый экспорт"),), (rig.entry, other)
+    )
+    assert rig.service.entries() == (rig.entry,)
 
 
 def test_recheck_entries_match_revision_and_exclude_revoked(recheck_rig: RecheckRig) -> None:

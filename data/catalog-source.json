@@ -1,0 +1,395 @@
+{
+  "$comment": [
+    "Таблица-источник встроенного каталога моделей. Её читает scripts/build_manifest.py:",
+    "размеры и sha256 файлов приходят из HF API по закреплённой ревизии, всё остальное — отсюда.",
+    "Числа WER и RTFx и происхождение — research/catalog-numbers.md §1 (с поправкой спайка S3:",
+    "для рантайма onnx-asr берутся репозитории istupakov/*, onnx-community/*, alphacep/*, t-tech/T-one).",
+    "min_ram_mb вычисляется по правилу ресёрча: сумма байт .onnx-файлов рантайма × 1,85, вверх до целых МБ;",
+    "поэтому у каждой записи стоит ram_estimated: true — это оценка, а не замер на этом компьютере.",
+    "files[] перечисляет ровно те файлы, которые нужны рантайму onnx-asr; лишнее не скачивается."
+  ],
+  "publisher": "astra-voice",
+  "manifest_version": 1,
+  "trust_epoch": 1,
+  "revoked": [],
+  "metric_sources": {
+    "wer_ru": "https://github.com/istupakov/onnx-asr/blob/main/docs/comparison.md",
+    "rtfx": "https://istupakov.github.io/onnx-asr/benchmarks/"
+  },
+  "models": [
+    {
+      "id": "gigaam-v3-e2e-rnnt-int8",
+      "name": "GigaAM v3 RNN-T",
+      "description": "Русская диктовка с пунктуацией — модель по умолчанию",
+      "repo": "istupakov/gigaam-v3-onnx",
+      "revision": "322c3b29492673eb7d0b434bfa9dfb8653e34d02",
+      "host": "huggingface.co",
+      "layout": "onnx-asr-gigaam-v3",
+      "variant": "gigaam-v3-e2e-rnnt",
+      "recommended": true,
+      "files": [
+        "config.json",
+        "v3_e2e_rnnt.yaml",
+        "v3_e2e_rnnt_vocab.txt",
+        "v3_e2e_rnnt_encoder.int8.onnx",
+        "v3_e2e_rnnt_decoder.int8.onnx",
+        "v3_e2e_rnnt_joint.int8.onnx"
+      ],
+      "vendor": "Сбер (GigaChat Team)",
+      "vendor_short": "Сбер",
+      "languages": [
+        "ru"
+      ],
+      "language_tag": "Только русский",
+      "punctuation": true,
+      "license": "MIT",
+      "domestic": true,
+      "ram_estimated": true,
+      "metrics": {
+        "wer_ru": 7.6,
+        "rtfx": 42.5
+      }
+    },
+    {
+      "id": "gigaam-v3-e2e-ctc-int8",
+      "name": "GigaAM v3 CTC",
+      "description": "Русская диктовка с пунктуацией, работает чуть быстрее",
+      "repo": "istupakov/gigaam-v3-onnx",
+      "revision": "322c3b29492673eb7d0b434bfa9dfb8653e34d02",
+      "host": "huggingface.co",
+      "layout": "onnx-asr-gigaam-v3",
+      "variant": "gigaam-v3-e2e-ctc",
+      "recommended": false,
+      "files": [
+        "config.json",
+        "v3_e2e_ctc.yaml",
+        "v3_e2e_ctc_vocab.txt",
+        "v3_e2e_ctc.int8.onnx"
+      ],
+      "vendor": "Сбер (GigaChat Team)",
+      "vendor_short": "Сбер",
+      "languages": [
+        "ru"
+      ],
+      "language_tag": "Только русский",
+      "punctuation": true,
+      "license": "MIT",
+      "domestic": true,
+      "ram_estimated": true,
+      "metrics": {
+        "wer_ru": 7.8,
+        "rtfx": 52.2
+      }
+    },
+    {
+      "id": "gigaam-v3-rnnt-int8",
+      "name": "GigaAM v3 RNN-T без пунктуации",
+      "description": "Русская диктовка без знаков препинания — зато реже ошибается в словах",
+      "repo": "istupakov/gigaam-v3-onnx",
+      "revision": "322c3b29492673eb7d0b434bfa9dfb8653e34d02",
+      "host": "huggingface.co",
+      "layout": "onnx-asr-gigaam-v3",
+      "variant": "gigaam-v3-rnnt",
+      "recommended": false,
+      "files": [
+        "config.json",
+        "v3_rnnt.yaml",
+        "v3_vocab.txt",
+        "v3_rnnt_encoder.int8.onnx",
+        "v3_rnnt_decoder.int8.onnx",
+        "v3_rnnt_joint.int8.onnx"
+      ],
+      "vendor": "Сбер (GigaChat Team)",
+      "vendor_short": "Сбер",
+      "languages": [
+        "ru"
+      ],
+      "language_tag": "Только русский",
+      "punctuation": false,
+      "license": "MIT",
+      "domestic": true,
+      "ram_estimated": true,
+      "metrics": {
+        "wer_ru": 4.39,
+        "rtfx": 42.8
+      }
+    },
+    {
+      "id": "gigaam-v3-ctc-int8",
+      "name": "GigaAM v3 CTC без пунктуации",
+      "description": "Русская диктовка без знаков препинания. Качество и скорость этой сборки никто не замерял",
+      "repo": "istupakov/gigaam-v3-onnx",
+      "revision": "322c3b29492673eb7d0b434bfa9dfb8653e34d02",
+      "host": "huggingface.co",
+      "layout": "onnx-asr-gigaam-v3",
+      "variant": "gigaam-v3-ctc",
+      "recommended": false,
+      "files": [
+        "config.json",
+        "v3_ctc.yaml",
+        "v3_vocab.txt",
+        "v3_ctc.int8.onnx"
+      ],
+      "vendor": "Сбер (GigaChat Team)",
+      "vendor_short": "Сбер",
+      "languages": [
+        "ru"
+      ],
+      "language_tag": "Только русский",
+      "punctuation": false,
+      "license": "MIT",
+      "domestic": true,
+      "ram_estimated": true,
+      "metrics": {}
+    },
+    {
+      "id": "gigaam-multilingual-ctc-int8",
+      "name": "GigaAM Multilingual CTC",
+      "description": "Понимает русский, английский, казахский, киргизский и узбекский. Знаки препинания не ставит",
+      "repo": "istupakov/gigaam-multilingual-ctc-onnx",
+      "revision": "458860e1983aef670dd9795fb6af603c82767d5d",
+      "host": "huggingface.co",
+      "layout": "onnx-asr-gigaam-multilingual",
+      "variant": "gigaam-multilingual-ctc",
+      "recommended": false,
+      "files": [
+        "config.json",
+        "multilingual_ctc.yaml",
+        "multilingual_vocab.txt",
+        "multilingual_ctc.int8.onnx"
+      ],
+      "vendor": "Сбер (GigaChat Team)",
+      "vendor_short": "Сбер",
+      "languages": [
+        "ru",
+        "en",
+        "kk",
+        "ky",
+        "uz"
+      ],
+      "language_tag": "Русский и ещё четыре языка",
+      "punctuation": false,
+      "license": "MIT",
+      "domestic": true,
+      "ram_estimated": true,
+      "metrics": {
+        "wer_ru": 8.43
+      }
+    },
+    {
+      "id": "gigaam-multilingual-large-ctc-int8",
+      "name": "GigaAM Multilingual Large CTC",
+      "description": "Самая точная из многоязычных: русский, английский, казахский, киргизский, узбекский. Знаки препинания не ставит",
+      "repo": "istupakov/gigaam-multilingual-large-ctc-onnx",
+      "revision": "07665ab5e54371dd1ac7b8b10f06478003723573",
+      "host": "huggingface.co",
+      "layout": "onnx-asr-gigaam-multilingual",
+      "variant": "gigaam-multilingual-large-ctc",
+      "recommended": false,
+      "files": [
+        "config.json",
+        "multilingual_large_ctc.yaml",
+        "multilingual_vocab.txt",
+        "multilingual_large_ctc.int8.onnx"
+      ],
+      "vendor": "Сбер (GigaChat Team)",
+      "vendor_short": "Сбер",
+      "languages": [
+        "ru",
+        "en",
+        "kk",
+        "ky",
+        "uz"
+      ],
+      "language_tag": "Русский и ещё четыре языка",
+      "punctuation": false,
+      "license": "MIT",
+      "domestic": true,
+      "ram_estimated": true,
+      "metrics": {
+        "wer_ru": 5.55
+      }
+    },
+    {
+      "id": "t-one-fp32",
+      "name": "T-one",
+      "description": "Русская диктовка от Т-Банка. Знаки препинания не ставит",
+      "repo": "t-tech/T-one",
+      "revision": "106f3b0b32a9e107eb613312e4ebc61ff3d53926",
+      "host": "huggingface.co",
+      "layout": "onnx-asr-t-one",
+      "variant": "t-one-ctc",
+      "recommended": false,
+      "files": [
+        "config.json",
+        "model.onnx"
+      ],
+      "vendor": "Т-Банк (T-Tech)",
+      "vendor_short": "Т-Банк",
+      "languages": [
+        "ru"
+      ],
+      "language_tag": "Только русский",
+      "punctuation": false,
+      "license": "Apache-2.0",
+      "domestic": true,
+      "ram_estimated": true,
+      "metrics": {
+        "wer_ru": 6.57
+      }
+    },
+    {
+      "id": "vosk-ru-int8",
+      "name": "Vosk ru",
+      "description": "Небольшая и быстрая, для не самых мощных компьютеров. Знаки препинания не ставит",
+      "repo": "alphacep/vosk-model-ru",
+      "revision": "df6a54a4d8e5d43e82675e4f5dba2d507731a0d1",
+      "host": "huggingface.co",
+      "layout": "onnx-asr-vosk",
+      "variant": "vosk-am-onnx",
+      "recommended": false,
+      "files": [
+        "lang/tokens.txt",
+        "am-onnx/encoder.int8.onnx",
+        "am-onnx/decoder.int8.onnx",
+        "am-onnx/joiner.int8.onnx"
+      ],
+      "vendor": "Alpha Cephei",
+      "vendor_short": "Alpha Cephei",
+      "languages": [
+        "ru"
+      ],
+      "language_tag": "Только русский",
+      "punctuation": false,
+      "license": "Apache-2.0",
+      "domestic": false,
+      "ram_estimated": true,
+      "metrics": {
+        "wer_ru": 9.89,
+        "rtfx": 70.5
+      }
+    },
+    {
+      "id": "vosk-small-ru-int8",
+      "name": "Vosk small ru",
+      "description": "Самая маленькая и самая быстрая, для слабых компьютеров. Ошибается чаще, знаки препинания не ставит",
+      "repo": "alphacep/vosk-model-small-ru",
+      "revision": "4d68c4017bcfa44e2a79581f7933339e916a35da",
+      "host": "huggingface.co",
+      "layout": "onnx-asr-vosk",
+      "variant": "vosk-am",
+      "recommended": false,
+      "files": [
+        "lang/tokens.txt",
+        "am/encoder.int8.onnx",
+        "am/decoder.int8.onnx",
+        "am/joiner.int8.onnx"
+      ],
+      "vendor": "Alpha Cephei",
+      "vendor_short": "Alpha Cephei",
+      "languages": [
+        "ru"
+      ],
+      "language_tag": "Только русский",
+      "punctuation": false,
+      "license": "Apache-2.0",
+      "domestic": false,
+      "ram_estimated": true,
+      "metrics": {
+        "wer_ru": 14.53,
+        "rtfx": 83.5
+      }
+    },
+    {
+      "id": "whisper-large-v3-turbo-int8",
+      "name": "Whisper large-v3-turbo",
+      "description": "Понимает почти любой язык и ставит знаки препинания. Много весит и требует мощного компьютера",
+      "repo": "onnx-community/whisper-large-v3-turbo",
+      "revision": "360ebcde2559d60bb474678be3c1de9ef347d01a",
+      "host": "huggingface.co",
+      "layout": "onnx-community-whisper",
+      "variant": "whisper-hf",
+      "recommended": false,
+      "files": [
+        "config.json",
+        "vocab.json",
+        "added_tokens.json",
+        "onnx/encoder_model_int8.onnx",
+        "onnx/decoder_model_merged_int8.onnx"
+      ],
+      "vendor": "OpenAI",
+      "vendor_short": "OpenAI",
+      "languages": [
+        "multi"
+      ],
+      "language_tag": "Русский и ещё много языков",
+      "punctuation": true,
+      "license": "MIT",
+      "domestic": false,
+      "ram_estimated": true,
+      "metrics": {
+        "wer_ru": 10.1,
+        "rtfx": 3.9
+      }
+    },
+    {
+      "id": "whisper-small-int8",
+      "name": "Whisper small",
+      "description": "Понимает почти любой язык и ставит знаки препинания. Насколько точна по-русски — никто не замерял",
+      "repo": "onnx-community/whisper-small",
+      "revision": "36050c46d777d46dc4b5f43f6d90574fc38f8732",
+      "host": "huggingface.co",
+      "layout": "onnx-community-whisper",
+      "variant": "whisper-hf",
+      "recommended": false,
+      "files": [
+        "config.json",
+        "vocab.json",
+        "added_tokens.json",
+        "onnx/encoder_model_int8.onnx",
+        "onnx/decoder_model_merged_int8.onnx"
+      ],
+      "vendor": "OpenAI",
+      "vendor_short": "OpenAI",
+      "languages": [
+        "multi"
+      ],
+      "language_tag": "Русский и ещё много языков",
+      "punctuation": true,
+      "license": "Apache-2.0",
+      "domestic": false,
+      "ram_estimated": true,
+      "metrics": {}
+    },
+    {
+      "id": "nemo-fastconformer-ru-pc-ctc-int8",
+      "name": "NeMo FastConformer ru",
+      "description": "Русская диктовка с пунктуацией от NVIDIA. Ошибается чаще, чем GigaAM",
+      "repo": "istupakov/stt_ru_fastconformer_hybrid_large_pc_onnx",
+      "revision": "fb6753736c56de3259d78a26a488548c84b9dccb",
+      "host": "huggingface.co",
+      "layout": "onnx-asr-nemo",
+      "variant": "nemo-fastconformer-ru-ctc",
+      "recommended": false,
+      "files": [
+        "config.json",
+        "vocab.txt",
+        "model.int8.onnx"
+      ],
+      "vendor": "NVIDIA",
+      "vendor_short": "NVIDIA",
+      "languages": [
+        "ru"
+      ],
+      "language_tag": "Только русский",
+      "punctuation": true,
+      "license": "CC-BY-4.0",
+      "domestic": false,
+      "ram_estimated": true,
+      "metrics": {
+        "wer_ru": 13.1,
+        "rtfx": 70.6
+      }
+    }
+  ]
+}

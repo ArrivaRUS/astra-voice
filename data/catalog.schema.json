@@ -16,7 +16,9 @@
   "properties": {
     "manifest_version": {
       "type": "integer",
-      "enum": [1]
+      "enum": [
+        1
+      ]
     },
     "schema_sha256": {
       "type": "string",
@@ -64,7 +66,11 @@
     "revoked": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["model_id", "revision", "reason"],
+      "required": [
+        "model_id",
+        "revision",
+        "reason"
+      ],
       "properties": {
         "model_id": {
           "$ref": "#/$defs/identifier"
@@ -124,13 +130,32 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 64,
-          "enum": ["onnx-asr-gigaam-v3"]
+          "enum": [
+            "onnx-asr-gigaam-v3",
+            "onnx-asr-gigaam-multilingual",
+            "onnx-asr-t-one",
+            "onnx-asr-vosk",
+            "onnx-community-whisper",
+            "onnx-asr-nemo"
+          ]
         },
         "variant": {
           "type": "string",
           "minLength": 1,
           "maxLength": 64,
-          "enum": ["gigaam-v3-e2e-rnnt", "gigaam-v3-e2e-ctc", "gigaam-v3-rnnt"]
+          "enum": [
+            "gigaam-v3-e2e-rnnt",
+            "gigaam-v3-e2e-ctc",
+            "gigaam-v3-rnnt",
+            "gigaam-v3-ctc",
+            "gigaam-multilingual-ctc",
+            "gigaam-multilingual-large-ctc",
+            "t-one-ctc",
+            "vosk-am-onnx",
+            "vosk-am",
+            "whisper-hf",
+            "nemo-fastconformer-ru-ctc"
+          ]
         },
         "recommended": {
           "type": "boolean"
@@ -139,7 +164,9 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 253,
-          "enum": ["huggingface.co"]
+          "enum": [
+            "huggingface.co"
+          ]
         },
         "files": {
           "type": "array",
@@ -147,13 +174,71 @@
           "items": {
             "$ref": "#/$defs/file"
           }
+        },
+        "ram_estimated": {
+          "$comment": "Требуемая память — оценка по правилу ресёрча, а не замер на этом компьютере.",
+          "type": "boolean"
+        },
+        "vendor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "vendor_short": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "languages": {
+          "$comment": "Коды языков; значение multi — «много языков», точный список не перечисляем.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z]{2,8}(-[A-Za-z0-9]{2,8})?$"
+          }
+        },
+        "language_tag": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "punctuation": {
+          "type": "boolean"
+        },
+        "license": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "domestic": {
+          "type": "boolean"
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "properties": {
+            "wer_ru": {
+              "$ref": "#/$defs/metric"
+            },
+            "rtfx": {
+              "$ref": "#/$defs/metric"
+            }
+          }
         }
       }
     },
     "file": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "sha256", "size", "url_path"],
+      "required": [
+        "path",
+        "sha256",
+        "size",
+        "url_path"
+      ],
       "properties": {
         "path": {
           "$comment": "Пустые пути и пределы 255/1024 байта проверяет разборщик с кодом bad-path.",
@@ -176,6 +261,27 @@
           "type": "string",
           "minLength": 0,
           "maxLength": 1048576
+        }
+      }
+    },
+    "metric": {
+      "$comment": "Опубликованный замер: значение и адрес, по которому его можно проверить.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value",
+        "source"
+      ],
+      "properties": {
+        "value": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1000
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
         }
       }
     }
