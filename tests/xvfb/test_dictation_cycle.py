@@ -435,7 +435,9 @@ def test_us84_shutdown_releases_runtime_resources(cycle: Cycle) -> None:
     cycle.press()
     cycle.release()
     # Останавливаем в PROCESSING: активны сторож и таймер хоткея, result ещё в Qt.
+    # После отпускания запись живёт ещё RELEASE_TAIL_MS (блок 5 M6) — ждём перехода.
     runtime = cycle.runtime
+    wait_until(lambda: runtime.phase == DictationPhase.PROCESSING)
     assert runtime.phase == DictationPhase.PROCESSING
     assert runtime.timers and runtime.tick_timer is not None and runtime.tick_timer.isActive()
     timers = list(runtime.findChildren(QTimer))

@@ -2239,7 +2239,11 @@ def test_settings_models_section_calls_bridge(onboarding_app: Any, dark: bool) -
             if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
         ]
         assert len(cards) == 1, f"ожидалась одна карточка, найдено {len(cards)}"
-        assert fake.toggled_model_ids == [] and fake.calls == []
+        # Раздел «Общие» грузится первым и при открытии читает список микрофонов
+        # и состояние громкости — это не вызовы раздела «Модели».
+        assert set(fake.calls) <= {"refreshDevices", "refreshMicrophone"}, fake.calls
+        fake.calls.clear()
+        assert fake.toggled_model_ids == []
         click_item(cards[0])
         assert fake.toggled_model_ids == [fake.models[0]["id"]]
 
