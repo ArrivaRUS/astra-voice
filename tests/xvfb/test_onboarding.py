@@ -25,6 +25,7 @@ from PyQt5.QtCore import (
     QIODevice,
     QMetaObject,
     QObject,
+    QPoint,
     QPointF,
     Qt,
     QUrl,
@@ -736,6 +737,7 @@ class FakeSettings(QObject):
             },
         ]
         self._installedSummary: str = "Установлено 1 из 12 · 226 МБ на диске"
+        self._installedCount: int = 1
         self._selectionSummary: str = ""
         self._selectionFits: bool = True
         self._selectionMessage: str = ""
@@ -968,6 +970,15 @@ class FakeSettings(QObject):
     installedSummary = pyqtProperty(
         str, _get_installedSummary, _set_installedSummary, notify=changed
     )
+
+    def _get_installedCount(self) -> int:
+        return self._installedCount
+
+    def _set_installedCount(self, value: int) -> None:
+        self._installedCount = value
+        self.changed.emit()
+
+    installedCount = pyqtProperty(int, _get_installedCount, _set_installedCount, notify=changed)
 
     def _get_downloadState(self) -> str:
         return self._downloadState
@@ -1245,6 +1256,21 @@ def assert_frame(image: QImage) -> None:
     ), "снимок залит одним цветом"
 
 
+def settle_pointer(app: Any, window: Any) -> None:
+    """Уводит указатель в угол, где нет ни одного элемента с наведением.
+
+    Под Xvfb настоящий курсор стоит в центре экрана, то есть внутри окна:
+    карточка или кнопка под ним подсвечивается наведением, а момент, когда X
+    доставит это событие окну, снимку не подвластен — два кадра одного и того
+    же экрана расходятся побайтно. Синтетическое перемещение задаёт последнюю
+    известную позицию мыши явно и одинаково для всех кадров.
+    """
+    QTest.mouseMove(window, QPoint(1, HEIGHT - 2))
+    app.processEvents()
+    QTest.qWait(20)
+    app.processEvents()
+
+
 def grab_frame(app: Any, window: QQuickWindow, case: str) -> QImage:
     """Общий захват QQuickView и ApplicationWindow с повторами для Qt5/offscreen."""
     grab = None
@@ -1318,6 +1344,7 @@ def render_onboarding(
         ), f"не показан шаг {fake.step}"
         assert view.isVisible() and view.isExposed()
 
+        settle_pointer(app, view)
         image = grab_frame(app, view, f"step={fake.step}, dark={dark}")
         if inspect is not None:
             inspect(root)
@@ -1363,6 +1390,10 @@ def render_settings(
         assert isinstance(window, QQuickWindow)
         window.setWidth(WIDTH)
         window.setHeight(HEIGHT)
+        assert window.setProperty("freezeAnimations", True), (
+            "в Main.qml нет свойства freezeAnimations — заморозка анимаций не сработала"
+        )
+        assert window.property("freezeAnimations") is True
         # Qt5/software grabToImage не включает цвет очистки QQuickWindow.
         # Повторяем его под содержимым, чтобы запасной захват сохранил фон окна.
         background_component = QQmlComponent(engine)
@@ -1391,6 +1422,7 @@ def render_settings(
         assert {description["title"], description["subtitle"]} <= texts, (
             f"не показан раздел «{description['title']}»"
         )
+        settle_pointer(app, window)
         image = grab_frame(app, window, snapshot_name(f"settings-{section}", dark))
         if inspect is not None:
             inspect(window)

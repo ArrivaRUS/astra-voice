@@ -53,6 +53,11 @@ ApplicationWindow {
     // загрузке анимировать нечего, а снимок обязан быть одинаковым в любой момент.
     property bool sectionFadeReady: false
 
+    // Снимки экрана обязаны совпадать в любой момент времени: тест выставляет
+    // freezeAnimations, и всё, что зависит от хода времени, встаёт на конечную
+    // фазу. Так же устроены Onboarding.qml, Pill.qml и DownloadStrip.qml.
+    property bool freezeAnimations: false
+
     width: Theme.sizeWindowW
     height: Theme.sizeWindowMinH
     // 900 × 620 — размер С ДЕКОРАЦИЕЙ KWin (спека §1.2), поэтому минимум клиентской
@@ -187,6 +192,8 @@ ApplicationWindow {
                     opacity: bodyScroll.active ? Theme.scrollbarOpacity : 0
 
                     Behavior on opacity {
+                        enabled: !window.freezeAnimations
+
                         NumberAnimation {
                             duration: Theme.durationExit
                             easing.type: Easing.Bezier
@@ -204,7 +211,11 @@ ApplicationWindow {
                 onSourceChanged: {
                     // Новый раздел всегда открывается сверху, а не там, где бросили прошлый.
                     body.contentY = 0
-                    if (window.sectionFadeReady)
+                    // Конечная фаза выставляется сразу: незапущенная анимация не
+                    // должна оставить раздел полупрозрачным (и на снимке тоже).
+                    sectionFade.stop()
+                    page.opacity = 1
+                    if (window.sectionFadeReady && !window.freezeAnimations)
                         sectionFade.restart()
                 }
             }
@@ -229,6 +240,7 @@ ApplicationWindow {
         anchors.right: parent.right
         anchors.bottom: statusBar.top
         visible: !window.onboardingVisible && downloadState !== "idle" && !doneExpired
+        freezeAnimations: window.freezeAnimations
         downloadState: window.bridge ? window.bridge.downloadState : "idle"
         title: window.bridge ? window.bridge.downloadTitle : ""
         progress: window.bridge ? window.bridge.downloadProgress : 0
