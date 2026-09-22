@@ -14,6 +14,17 @@ Column {
     readonly property string saveError: root.settings ? root.settings.saveError : ""
     readonly property string modelSelfcheck: root.settings ? root.settings.modelSelfcheck : ""
 
+    // Громкость микрофона (PRD 0.9 F6.6/F6.7, ступени 1–2): читаем по открытию
+    // раздела и после нажатия — сама программа системную громкость не крутит.
+    readonly property bool canRaiseMic: root.settings ? root.settings.canRaiseMicrophone : false
+    readonly property bool micMuted: root.settings ? root.settings.microphoneMuted : false
+    readonly property int micVolume: root.settings ? root.settings.microphoneVolume : -1
+
+    Component.onCompleted: {
+        if (root.settings)
+            root.settings.refreshMicrophone()
+    }
+
     function isLocked(name) {
         return settings && settings.lockedSettings
             ? settings.lockedSettings.indexOf(name) >= 0 : false
@@ -145,6 +156,41 @@ Column {
                             && currentIndex >= 0 && currentIndex < model.length
                             && root.settings.device !== model[currentIndex])
                         root.settings.device = model[currentIndex]
+                }
+            }
+        }
+
+        // Строки нет, если менять громкость в системе нечем (§«Общие», F6.7).
+        SettingRow {
+            width: parent.width
+            label: qsTr("Громкость микрофона")
+            sub: root.micMuted
+                ? qsTr("Звук микрофона выключен в системе — вас не слышно")
+                : root.micVolume >= 0 && root.micVolume < 30
+                    ? qsTr("Громкость слишком низкая — вас плохо слышно")
+                    : qsTr("Программа поставит громкость этого микрофона на максимум")
+            visible: root.canRaiseMic
+            height: visible ? implicitHeight : 0
+
+            Text {
+                textFormat: Text.PlainText
+                text: root.micMuted ? qsTr("Выключен")
+                    : root.micVolume >= 0 ? qsTr("Сейчас %1 %").arg(root.micVolume)
+                    : qsTr("Не удалось узнать")
+                color: Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                renderType: Text.NativeRendering
+                Layout.alignment: Qt.AlignVCenter
+            }
+
+            AvButton {
+                text: qsTr("Поднять")
+                small: true
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: {
+                    if (root.settings)
+                        root.settings.raiseMicrophoneVolume()
                 }
             }
         }

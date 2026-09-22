@@ -33,6 +33,7 @@ from astra_voice.core.dictation import (
 from astra_voice.core.settings import Settings, is_valid_combo
 from astra_voice.core.settings import save as settings_save
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
+from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui import notify
 from astra_voice.ui.formatting import (
     clean_display_name,
@@ -88,6 +89,25 @@ class SettingsApply(Protocol):
 
     def device(self, value: str | None) -> None: ...
 
+    def microphone_state(self) -> MicrophoneState:
+        """Состояние выбранного источника записи; микрофон при этом не открывается."""
+        ...
+
+    def raise_microphone_volume(self) -> bool: ...
+
+    def open_sound_settings(self) -> bool: ...
+
+    def restart_sound_service(self) -> bool: ...
+
+    @property
+    def has_volume_control(self) -> bool: ...
+
+    @property
+    def has_sound_settings(self) -> bool: ...
+
+    @property
+    def has_sound_service(self) -> bool: ...
+
 
 class SettingsBridge(QObject):
     """Публикует настройки и ошибки записи; каждый сеттер сразу пишет файл."""
@@ -103,6 +123,7 @@ class SettingsBridge(QObject):
     hotkeyStatusChanged = pyqtSignal()
     saveErrorChanged = pyqtSignal()
     modelSelfcheckChanged = pyqtSignal()
+    microphoneChanged = pyqtSignal()
     extraChanged = pyqtSignal(str)
 
     activeModelChanged = pyqtSignal()
@@ -151,6 +172,7 @@ class SettingsBridge(QObject):
         self._hotkey_status = "ok"
         self._save_error = ""
         self._model_selfcheck = "idle"
+        self._microphone = MicrophoneState()
         self._downloads = downloads
         self._open_url = open_url if open_url is not None else QDesktopServices.openUrl
         self._dialog_factory = dialog_factory
@@ -424,6 +446,7 @@ class SettingsBridge(QObject):
                 self.set_hotkey_status("ok")
             elif name == "device":
                 self._apply.device(self.device or None)
+                self.refreshMicrophone()
         getattr(self, name + "Changed").emit()
 
     @pyqtProperty("QStringList", constant=True)
@@ -498,6 +521,70 @@ class SettingsBridge(QObject):
     @device.setter  # type: ignore[no-redef]
     def device(self, value: str) -> None:
         self._set_value("device", value)
+
+    @pyqtProperty(int, notify=microphoneChanged)
+    def microphoneVolume(self) -> int:  # noqa: N802
+        """Системная громкость выбранного микрофона в процентах; −1 — неизвестна."""
+        return self._microphone.percent if self._microphone.known else -1
+
+    @pyqtProperty(bool, notify=microphoneChanged)
+    def microphoneMuted(self) -> bool:  # noqa: N802
+        return self._microphone.known and self._microphone.muted
+
+    @pyqtProperty(bool, notify=microphoneChanged)
+    def canRaiseMicrophone(self) -> bool:  # noqa: N802
+        """Есть чем и куда поднимать громкость; иначе строку в «Общих» не показываем."""
+        return self._apply is not None and self._apply.has_volume_control
+
+    @pyqtProperty(bool, notify=microphoneChanged)
+    def canOpenSoundSettings(self) -> bool:  # noqa: N802
+        return self._apply is not None and self._apply.has_sound_settings
+
+    @pyqtProperty(bool, notify=microphoneChanged)
+    def canRestartSoundService(self) -> bool:  # noqa: N802
+        return self._apply is not None and self._apply.has_sound_service
+
+    @pyqtSlot()
+    def refreshMicrophone(self) -> None:  # noqa: N802
+        """Перечитывает состояние источника: при открытии раздела и смене микрофона."""
+        state = MicrophoneState()
+        if self._apply is not None and self._apply.has_volume_control:
+            try:
+                state = self._apply.microphone_state()
+            except Exception:
+                log.warning("Не удалось узнать громкость микрофона")
+        if state != self._microphone:
+            self._microphone = state
+            self.microphoneChanged.emit()
+
+    @pyqtSlot()
+    def raiseMicrophoneVolume(self) -> None:  # noqa: N802
+        """Нажатие «Поднять»: звук включается, громкость выставляется на 100 %."""
+        if self._apply is not None:
+            try:
+                self._apply.raise_microphone_volume()
+            except Exception:
+                log.warning("Не удалось поднять громкость микрофона")
+        self.refreshMicrophone()
+
+    @pyqtSlot()
+    def openSoundSettings(self) -> None:  # noqa: N802
+        """Нажатие «Открыть настройки звука»: системная панель, ничего не меняем."""
+        if self._apply is not None:
+            try:
+                self._apply.open_sound_settings()
+            except Exception:
+                log.warning("Не удалось открыть системные настройки звука")
+
+    @pyqtSlot()
+    def restartSoundService(self) -> None:  # noqa: N802
+        """Нажатие в «Отладке»: перезапуск звуковой службы сеанса."""
+        if self._apply is not None:
+            try:
+                self._apply.restart_sound_service()
+            except Exception:
+                log.warning("Не удалось перезапустить звуковую службу")
+        self.refreshMicrophone()
 
     @pyqtProperty(str, notify=hotkeyStatusChanged)
     def hotkeyStatus(self) -> str:  # noqa: N802

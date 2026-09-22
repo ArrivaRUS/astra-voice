@@ -20,6 +20,7 @@ from astra_voice.core.dictation import (
     LEVEL_TOTAL_LIMIT_S,
     PROCESSING_WATCHDOG_MS,
     RECOGNIZE_TIMEOUT_S,
+    RELEASE_TAIL_MS,
     TEST_BUSY,
     TEST_RECORD_LIMIT_MS,
     DictationOrchestrator,
@@ -51,6 +52,7 @@ from astra_voice.ui.pill import (
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
     ERROR_MICROPHONE_LOST,
+    ERROR_MICROPHONE_SILENT,
     ERROR_MICROPHONE_UNAVAILABLE,
     ERROR_MODEL_NOT_LOADED,
     ERROR_REASONS,
@@ -164,6 +166,7 @@ class Rig:
         self.device_lost = Mock()
         self.device_selected = Mock()
         self.device_resolved = Mock()
+        self.silent = Mock()
         self.backend = Mock(spec=HotkeyBackend)
         self.backend.grab_combo.return_value = GrabResult("ok", keycode=65)
         self.backend.grab_escape.return_value = GrabResult("ok", keycode=9)
@@ -192,6 +195,7 @@ class Rig:
             on_device_lost=self.device_lost,
             on_device_selected=self.device_selected,
             on_device_resolved=self.device_resolved,
+            on_silent=self.silent,
             log=logging.getLogger("test.dictation"),
         )
         self.hotkey.on_state = self.core.on_hotkey_state
@@ -258,12 +262,25 @@ class Rig:
     def assert_hotkey_state(self, state: HotkeyState) -> None:
         assert self.fsm.state == state
 
-    def stop(self) -> None:
+    def stop(self, *, tail: bool = True) -> None:
         self.now += 2.0
         if self.fsm.mode == HotkeyMode.TOGGLE:
             self.fsm.press(self.now)
         else:
             self.fsm.release(self.now)
+        if tail:
+            self.fire_tail()
+
+    def fire_tail(self) -> None:
+        """Дописывает хвост записи после отпускания клавиши (RELEASE_TAIL_MS)."""
+        matching = [
+            t for t in self.timers if t.delay == RELEASE_TAIL_MS and not t.cancelled and not t.fired
+        ]
+        if matching:
+            timer = matching[-1]
+            # Сработавшую ручку оркестратор уже не держит: убираем и из журнала.
+            self.timers.remove(timer)
+            timer.fire()
 
     @property
     def uid(self) -> str:
@@ -285,6 +302,11 @@ class Rig:
 @pytest.fixture
 def rig() -> Rig:
     return Rig()
+
+
+def assert_phase(rig: Rig, expected: DictationPhase) -> None:
+    """Читает фазу заново после событий, не сохраняя сужение типа mypy."""
+    assert rig.core.phase == expected
 
 
 def test_full_ptt_cycle_and_timings(rig: Rig) -> None:
@@ -317,7 +339,11 @@ def test_full_ptt_cycle_and_timings(rig: Rig) -> None:
     rig.event("audio.ready")
     rig.now += 2.0
     rig.fsm.release(rig.now)
-    assert rig.core.phase.value == "processing"
+    # Хвост записи: фаза и пилюля ещё «слушаю», команд воркеру нет.
+    assert_phase(rig, DictationPhase.RECORDING)
+    assert rig.commands() == ["record.start"]
+    rig.fire_tail()
+    assert_phase(rig, DictationPhase.PROCESSING)
     assert rig.sent[1:] == [
         ({"type": "record.stop", "utterance_id": uid}, None),
         ({"type": "recognize", "utterance_id": uid}, RECOGNIZE_TIMEOUT_S),
@@ -352,8 +378,62 @@ def test_full_ptt_cycle_and_timings(rig: Rig) -> None:
         }
     ]
     rig.timer(STATE_DURATION_MS[PillState.DONE]).fire()
-    assert rig.core.phase.value == "idle"
+    assert_phase(rig, DictationPhase.IDLE)
     assert rig.tray.state.value == "idle"
+
+
+def test_release_tail_keeps_recording_open_until_it_ends(rig: Rig) -> None:
+    """Хвост фразы: 250 мс после отпускания запись идёт, индикация не меняется."""
+    rig.start()
+    uid = rig.uid
+    rig.now += 2.0
+    rig.fsm.release(rig.now)
+    tail = rig.timer(RELEASE_TAIL_MS)
+    assert tail.delay == RELEASE_TAIL_MS
+    assert_phase(rig, DictationPhase.RECORDING)
+    assert rig.recording
+    assert rig.commands() == ["record.start"]
+    # Уровень во время хвоста по-прежнему приходит в пилюлю «Слушаю».
+    rig.event("level", peak_dbfs=-30.0)
+    assert rig.pill.calls[-1] == (PillState.LISTENING, None, 0.5)
+    assert rig.tray.state == TrayState.LISTENING
+    rig.now += RELEASE_TAIL_MS / 1000
+    rig.fire_tail()
+    assert_phase(rig, DictationPhase.PROCESSING)
+    assert not rig.recording
+    assert rig.sent[-2:] == [
+        ({"type": "record.stop", "utterance_id": uid}, None),
+        ({"type": "recognize", "utterance_id": uid}, RECOGNIZE_TIMEOUT_S),
+    ]
+    rig.result()
+    # Хвост входит в длительность звука: 2 с речи и 0,25 с дописи.
+    assert rig.stats.events[-1]["audio_ms"] == pytest.approx(2250.0)
+
+
+def test_release_tail_is_cancelled_by_escape_without_recognition(rig: Rig) -> None:
+    rig.start()
+    rig.now += 1.0
+    rig.fsm.release(rig.now)
+    tail = rig.timer(RELEASE_TAIL_MS)
+    rig.core.cancel("escape")
+    assert tail.cancelled
+    assert rig.commands() == ["record.start", "record.cancel"]
+    rig.event("cancelled")
+    assert rig.pill.calls[-1] == (PillState.CANCELLED, None, None)
+    assert "recognize" not in rig.commands()
+
+
+def test_record_limit_during_release_tail_stops_recording_once(rig: Rig) -> None:
+    rig.start()
+    rig.now += 1.0
+    rig.fsm.release(rig.now)
+    tail = rig.timer(RELEASE_TAIL_MS)
+    rig.event("record.limit")
+    assert_phase(rig, DictationPhase.PROCESSING)
+    assert rig.commands() == ["record.start", "recognize"]
+    # Сработавший позже хвост ничего не повторяет.
+    tail.fire()
+    assert rig.commands() == ["record.start", "recognize"]
 
 
 def test_last_text_is_normalized_but_paste_receives_worker_text(rig: Rig) -> None:
@@ -761,6 +841,7 @@ def test_processing_watchdog_releases_hotkey_without_empty_stat(
     rig.fsm.press(rig.now)
     rig.now += 1
     rig.fsm.release(rig.now)
+    rig.fire_tail()
 
     def cancel_sent(message: dict[str, Any]) -> None:
         assert message == {"type": "record.cancel", "utterance_id": rig.uid}
@@ -804,6 +885,39 @@ def test_error_mapping(rig: Rig, code: str, reason: str, kind: str | None) -> No
         [] if kind is None else [{"type": "mic_error", "kind": kind, "recovered_by": "none"}]
     )
     assert rig.done == 1 and not rig.recording
+
+
+def test_audio_silent_error_names_the_reason_and_asks_for_it(rig: Rig) -> None:
+    """Источник открылся, но звука не даёт: пилюля «Микрофон молчит» + причина."""
+    rig.start()
+    rig.event("error", code="audio-silent", message=MARKER)
+    assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_MICROPHONE_SILENT, None)
+    assert rig.tray.state == TrayState.ERROR
+    assert rig.done == 1 and not rig.recording
+    # Статистику и причину пишет обработчик тишины: у автомата их нет.
+    assert rig.stats.events == []
+    rig.silent.assert_called_once_with()
+
+
+def test_worker_silence_event_asks_for_the_reason_once_per_record(rig: Rig) -> None:
+    rig.start()
+    rig.event("silent")
+    assert rig.pill.calls[-1] == (PillState.LISTENING_SILENT, None, None)
+    rig.silent.assert_called_once_with()
+
+
+def test_silence_reason_failure_does_not_break_dictation(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.silent.side_effect = RuntimeError(MARKER)
+    rig.start()
+    with caplog.at_level(logging.WARNING):
+        rig.event("silent")
+    assert rig.pill.calls[-1] == (PillState.LISTENING_SILENT, None, None)
+    assert MARKER not in caplog.text
+    rig.stop()
+    rig.result()
+    assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
 
 
 @pytest.mark.parametrize("mode", list(HotkeyMode))
@@ -1397,6 +1511,9 @@ def test_short_ptt_tap_switches_to_toggle_without_cancelling(rig: Rig) -> None:
     rig.now += 1
     rig.combo_key(pressed=True)
     rig.assert_hotkey_state(HotkeyState.PROCESSING)
+    # Второе нажатие в режиме «нажать-отпустить» тоже дописывает хвост.
+    assert rig.commands() == ["record.start"]
+    rig.fire_tail()
     assert rig.commands() == ["record.start", "record.stop", "recognize"]
     rig.result()
     assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]

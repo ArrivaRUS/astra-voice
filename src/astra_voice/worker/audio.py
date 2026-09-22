@@ -28,6 +28,10 @@ CHUNK_MS = 20
 CHUNK_BYTES = RATE * CHANNELS * SAMPLE_BYTES * CHUNK_MS // 1000
 SILENCE_DBFS = -60.0
 SILENCE_HOLD_S = 2.0
+# Источник открылся, но ни одной порции звука не отдал: поток мёртв (P0 на Fly).
+FIRST_CHUNK_TIMEOUT_S = 2.0
+# Ровно нули приходят, когда источник заглушён в системе; живой микрофон шумит.
+ZERO_SAMPLES_HOLD_S = 3.0
 LEVEL_RATE_HZ = 30
 OPEN_FIRST_RETRIES = 3
 OPEN_FIRST_PAUSE_S = 1.0
@@ -51,6 +55,8 @@ MAX_DEVICE_LABEL = 120
 ERROR_NO_DEVICE = "audio-no-device"
 ERROR_BUSY = "audio-busy"
 ERROR_FAILED = "audio-failed"
+ERROR_SILENT = "audio-silent"
+SILENT_MESSAGE = "Микрофон молчит. Проверьте, что он включён, или выберите другой в настройках."
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +163,104 @@ def _device_descriptions(
     return descriptions
 
 
+def _run_text(
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    command: list[str],
+    env: dict[str, str],
+    deadline: _OpenDeadline | None,
+    *,
+    limit: float = 5.0,
+) -> str | None:
+    """Возвращает вывод команды или None: нет утилиты, отказ, мусор в кодировке."""
+    try:
+        result = run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=limit if deadline is None else deadline.remaining(limit),
+            env=env,
+            shell=False,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        # Утилиты может не быть в системе: это не ошибка, а повод к запасному пути.
+        logger.debug("Команда опроса устройств записи недоступна.")
+        return None
+    if result.returncode != 0:
+        logger.debug("Команда опроса устройств записи вернула отказ.")
+        return None
+    return str(result.stdout)
+
+
+def _pipewire_devices(
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    env: dict[str, str],
+    deadline: _OpenDeadline | None = None,
+) -> list[AudioDevice] | None:
+    """Запасной список источников записи для систем без pulseaudio-utils."""
+    output = _run_text(run, ["pw-dump"], env, deadline)
+    if output is None:
+        return None
+    try:
+        payload: object = json.loads(output)
+    except (ValueError, RecursionError):
+        logger.debug("Не удалось разобрать список устройств записи звуковой службы.")
+        return None
+    if not isinstance(payload, list):
+        return None
+    devices: list[AudioDevice] = []
+    fallback_counts: dict[str, int] = {}
+    seen: set[str] = set()
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        info = item.get("info")
+        props = info.get("props") if isinstance(info, dict) else None
+        if not isinstance(props, dict) or props.get("media.class") != "Audio/Source":
+            continue
+        name = props.get("node.name")
+        if not isinstance(name, str) or not name.strip() or name in seen:
+            continue
+        seen.add(name)
+        serial = props.get("object.serial")
+        if not isinstance(serial, int) or isinstance(serial, bool) or serial < 0:
+            node_id = item.get("id")
+            serial = node_id if isinstance(node_id, int) and not isinstance(node_id, bool) else -1
+        index = serial if serial >= 0 else len(devices)
+        monitor = name.endswith(".monitor")
+        raw = props.get("node.description")
+        if not isinstance(raw, str) or not raw.strip():
+            raw = props.get("node.nick")
+        description = _clean_device_description(raw) if isinstance(raw, str) else ""
+        if not description:
+            fallback = "Звук системы" if monitor else "Микрофон"
+            count = fallback_counts.get(fallback, 0) + 1
+            fallback_counts[fallback] = count
+            description = fallback if count == 1 else f"{fallback} {count}"
+        devices.append(
+            AudioDevice(index=index, name=name, description=description, monitor=monitor)
+        )
+    return devices
+
+
+def _pipewire_default_name(
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    env: dict[str, str],
+    deadline: _OpenDeadline | None = None,
+) -> str | None:
+    """Имя источника по умолчанию для систем без pulseaudio-utils."""
+    output = _run_text(run, ["wpctl", "inspect", "@DEFAULT_AUDIO_SOURCE@"], env, deadline)
+    if output is None:
+        return None
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key.strip().lstrip("* ").strip() != "node.name":
+            continue
+        return value.strip().strip('"').strip()
+    logger.debug("Звуковая служба не назвала источник записи по умолчанию.")
+    return None
+
+
 def list_devices(
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
@@ -165,25 +269,18 @@ def list_devices(
     """Возвращает источники из краткого списка, по возможности дополняя описаниями."""
     env = {**os.environ, "LC_ALL": "C"}
     message = "Не удалось получить список устройств записи."
-    try:
-        result = run(
-            ["pactl", "list", "short", "sources"],
-            capture_output=True,
-            text=True,
-            timeout=5 if deadline is None else deadline.remaining(5),
-            env=env,
-            shell=False,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        raise AudioError(ERROR_FAILED, message) from None
-    if result.returncode != 0:
-        raise AudioError(ERROR_FAILED, message)
+    output = _run_text(run, ["pactl", "list", "short", "sources"], env, deadline)
+    if output is None:
+        # Без pulseaudio-utils спрашиваем саму звуковую службу (находка на Fly).
+        fallback_devices = _pipewire_devices(run, env, deadline)
+        if fallback_devices is None:
+            raise AudioError(ERROR_FAILED, message)
+        return fallback_devices
 
     descriptions = _device_descriptions(run, env, deadline)
     devices: list[AudioDevice] = []
     fallback_counts: dict[str, int] = {}
-    for line in result.stdout.splitlines():
+    for line in output.splitlines():
         fields = line.split("\t")
         if len(fields) < 2 or any(not field.strip() for field in fields[:2]):
             continue
@@ -220,24 +317,15 @@ def default_device(
 ) -> AudioDevice:
     """Проверяет фактическое умолчание, запрещая неявную запись звука системы."""
     message = "Микрофон не найден. Выберите устройство записи в настройках."
-    try:
-        result = run(
-            ["pactl", "get-default-source"],
-            capture_output=True,
-            text=True,
-            timeout=5 if deadline is None else deadline.remaining(5),
-            env={**os.environ, "LC_ALL": "C"},
-            shell=False,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        logger.debug("Не удалось узнать устройство записи по умолчанию.")
-        raise AudioError(ERROR_NO_DEVICE, message) from None
-    if result.returncode != 0:
+    env = {**os.environ, "LC_ALL": "C"}
+    output = _run_text(run, ["pactl", "get-default-source"], env, deadline)
+    if output is None:
+        output = _pipewire_default_name(run, env, deadline)
+    if output is None:
         logger.debug("Не удалось узнать устройство записи по умолчанию.")
         raise AudioError(ERROR_NO_DEVICE, message)
 
-    name = result.stdout.strip()
+    name = output.strip()
     if not name or name in ("@DEFAULT_SOURCE@", "@NONE@"):
         logger.debug("Не задано устройство записи по умолчанию: %r", name)
         raise AudioError(ERROR_NO_DEVICE, message)
@@ -314,6 +402,11 @@ class AudioSource(Protocol):
         ...
 
     @property
+    def live(self) -> bool:
+        """Живой микрофон: молчание и ровные нули в нём — неисправность, а не данные."""
+        ...
+
+    @property
     def device_name(self) -> str | None:
         """Возвращает имя, запрошенное при открытии."""
         ...
@@ -364,11 +457,17 @@ class AudioCapture:
         self._watchdog_lock = threading.Lock()
         self._stop_deadlines: dict[threading.Thread, float] = {}
         self._record_deadline: float | None = None
+        self._first_chunk_deadline: float | None = None
+        self._silent_uid: str | None = None
         self._first_open = True
         self._previous_device: AudioDevice | None = None
 
     def start(self, utterance_id: str, device: str | None, *, limit_s: float) -> None:
         """Запускает запись, не ожидая открытия устройства в вызывающем потоке."""
+        with self._watchdog_lock:
+            # Снимаем сторож прошлой записи до его проверки: он уже не про неё.
+            self._first_chunk_deadline = None
+            self._silent_uid = None
         self.request_stop()
         self.check_stop_watchdog()
         previous = self._thread
@@ -456,6 +555,11 @@ class AudioCapture:
                 self._on_event(WorkerState.audio_ready(device=label, changed=changed))
             else:
                 self._source.flush()
+            # Источник открыт: с этого мига ждём первую порцию звука (P0 на Fly).
+            with self._watchdog_lock:
+                if self._source.live and running is self._running:
+                    self._first_chunk_deadline = self._clock() + FIRST_CHUNK_TIMEOUT_S
+                    self._silent_uid = uid
             self._read(uid, running, deadline)
         except AudioError as err:
             if running.is_set():
@@ -468,6 +572,7 @@ class AudioCapture:
     def _read(self, uid: str, running: threading.Event, deadline: float) -> None:
         """Передаёт PCM, прореживает уровни по часам и один раз сообщает о тишине."""
         silence_since = self._clock()
+        zero_since: float | None = self._clock()
         silent_sent = False
         last_level: float | None = None
         while running.is_set():
@@ -481,6 +586,9 @@ class AudioCapture:
                     return
                 self._source.close()
                 raise AudioError(ERROR_FAILED, "Запись звука прервалась.")
+            with self._watchdog_lock:
+                # Порция пришла: сторож «ни одного отсчёта» больше не нужен.
+                self._first_chunk_deadline = None
             samples = array("h")
             samples.frombytes(chunk)
             if sys.byteorder != "little":
@@ -505,6 +613,15 @@ class AudioCapture:
                     }
                 )
                 last_level = now
+            if peak > 0 or not samples or not self._source.live:
+                zero_since = None
+            else:
+                if zero_since is None:
+                    zero_since = now
+                if now - zero_since >= ZERO_SAMPLES_HOLD_S:
+                    # Ровные нули столько времени даёт только заглушённый источник;
+                    # у живого микрофона всегда есть собственный шум.
+                    raise AudioError(ERROR_SILENT, SILENT_MESSAGE)
             if peak_dbfs >= SILENCE_DBFS:
                 silence_since = now
             elif not silent_sent and now - silence_since >= SILENCE_HOLD_S:
@@ -527,6 +644,7 @@ class AudioCapture:
 
     def check_stop_watchdog(self) -> None:
         """Ограничивает захват по часам и сообщает владельцу о зависшей остановке."""
+        self._check_first_chunk()
         with self._watchdog_lock:
             deadline = self._record_deadline
         if deadline is not None and self._clock() >= deadline:
@@ -537,6 +655,18 @@ class AudioCapture:
                     del self._stop_deadlines[thread]
                 elif time.monotonic() >= deadline:
                     raise CaptureStopTimeout("Поток захвата не завершился после отмены.")
+
+    def _check_first_chunk(self) -> None:
+        """Сторож живёт в цикле воркера: поток захвата спит внутри libpulse."""
+        with self._watchdog_lock:
+            deadline, uid = self._first_chunk_deadline, self._silent_uid
+            if deadline is None or uid is None or self._clock() < deadline:
+                return
+            self._first_chunk_deadline = None
+            self._silent_uid = None
+        logger.warning("Источник записи открыт, но не отдал ни одной порции звука.")
+        self.request_stop()
+        self._on_error(uid, ERROR_SILENT, SILENT_MESSAGE)
 
     def stop(self) -> None:
         """Ждёт выхода владельца до срока сторожа; живой источник не трогает."""
@@ -773,6 +903,11 @@ class PulseSimpleSource:
         return False
 
     @property
+    def live(self) -> bool:
+        """Живой источник: ровные нули означают заглушённый микрофон."""
+        return True
+
+    @property
     def device_name(self) -> str | None:
         """Возвращает конкретное имя, переданное libpulse при открытии."""
         return self._device_name
@@ -854,6 +989,11 @@ class WavFileSource:
     def ended(self) -> bool:
         """Показывает, достигнут ли конец данных при чтении файла."""
         return self._ended
+
+    @property
+    def live(self) -> bool:
+        """В файле тишина — это данные: сторож ровных нулей здесь не работает."""
+        return False
 
     @property
     def device_name(self) -> str | None:

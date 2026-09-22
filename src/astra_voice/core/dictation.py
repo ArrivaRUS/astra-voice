@@ -23,6 +23,7 @@ from astra_voice.ui.pill import (
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
     ERROR_MICROPHONE_LOST,
+    ERROR_MICROPHONE_SILENT,
     ERROR_MICROPHONE_UNAVAILABLE,
     ERROR_MODEL_NOT_LOADED,
     ERROR_RECOGNITION_FAILED,
@@ -34,6 +35,9 @@ from astra_voice.ui.tray_icons import TrayState
 
 RECOGNIZE_TIMEOUT_S = 30.0
 PROCESSING_WATCHDOG_MS = 35000
+# Люди отпускают клавишу на последнем слоге: дописываем хвост фразы.
+# Запись в это время продолжается, поэтому фаза, пилюля и трей остаются «слушаю».
+RELEASE_TAIL_MS = 250
 CANCEL_TIMEOUT_MS = 1500
 CANCEL_RESTART_MS = 2000
 BUSY_RETRY_MS = 200
@@ -148,6 +152,7 @@ class DictationOrchestrator:
         on_device_lost: Callable[[], None] | None = None,
         on_device_selected: Callable[[str], None] | None = None,
         on_device_resolved: Callable[[str], None] | None = None,
+        on_silent: Callable[[], None] | None = None,
     ) -> None:
         self._send = send
         self._generation = generation
@@ -170,6 +175,7 @@ class DictationOrchestrator:
         self._on_device_lost = on_device_lost
         self._on_device_selected = on_device_selected
         self._on_device_resolved = on_device_resolved
+        self._on_silent = on_silent
         self._resolved_device: str = ""
         self._announced_selected_device: str | None = None
         self._audio_opened = False
@@ -191,6 +197,7 @@ class DictationOrchestrator:
         self._retries = 0
         self._cancel_requested = False
         self._cancel_pending = False
+        self._tail_pending = False
         self._delivered = False
         self._closed = False
         self._suspended = False
@@ -501,7 +508,8 @@ class DictationOrchestrator:
                 # о продолжающейся записи и не должны её отменять.
                 self._hotkey_cancel()
         elif state == HotkeyState.PROCESSING:
-            self._stop()
+            # Предел длительности фразы — не отпускание клавиши: хвост не нужен.
+            self._stop(tail=reason != "limit")
         elif state == HotkeyState.IDLE and reason == "escape-cancel":
             self.cancel("escape")
 
@@ -516,6 +524,7 @@ class DictationOrchestrator:
         self._worker_generation = self._generation()
         self._cancel_timers()
         self._cancel_requested = False
+        self._tail_pending = False
         self._delivered = False
         if not self.test_active:
             self._cold, self._started = not self._started, True
@@ -561,12 +570,33 @@ class DictationOrchestrator:
         if self._test_callback is not None:
             self._test_callback(MicrophoneTestUpdate("recording"))
 
-    def _stop(self, *, recording_stopped: bool = False) -> None:
+    def _stop(self, *, recording_stopped: bool = False, tail: bool = True) -> None:
+        """Отпускание клавиши даёт хвост записи; фаза меняется только после него."""
         if self._level_callback is not None:
             self.stop_level_monitor()
             return
         if self._phase != DictationPhase.RECORDING or self._cancel_requested:
             return
+        # По record.limit запись уже остановлена, а проверка микрофона хвоста не ждёт.
+        if RELEASE_TAIL_MS > 0 and tail and not recording_stopped and not self.test_active:
+            if self._tail_pending:
+                return
+            self._tail_pending = True
+            self._later(RELEASE_TAIL_MS, self._release_tail_elapsed)
+            return
+        self._finish_recording(recording_stopped=recording_stopped)
+
+    def _release_tail_elapsed(self) -> None:
+        """Хвост дописан: дальше обычная остановка записи и распознавание."""
+        if not self._tail_pending:
+            return
+        self._tail_pending = False
+        if self._phase != DictationPhase.RECORDING or self._cancel_requested:
+            return
+        self._finish_recording()
+
+    def _finish_recording(self, *, recording_stopped: bool = False) -> None:
+        self._tail_pending = False
         if self.test_active:
             self._cancel_timers()
         self._t_stop = self._clock()
@@ -692,10 +722,17 @@ class DictationOrchestrator:
                     self._stop()
                 else:
                     self._pill.show_state(PillState.LISTENING_SILENT)
+                    self._announce_silent()
             elif kind == "record.limit":
                 if not self.test_active:
                     self._pill.show_state(PillState.LIMIT)
                 self._stop(recording_stopped=True)
+
+    def _announce_silent(self) -> None:
+        """Сообщает наружу о тишине; причину выясняет рантайм, не автомат."""
+        if self._on_silent is None:
+            return
+        self._safe_ui(self._on_silent, "диктовка: не удалось назвать причину тишины")
 
     def _audio_ready(self, event: dict[str, Any]) -> None:
         # Воркер передаёт системное описание, а не идентификатор из record_params.
@@ -829,6 +866,7 @@ class DictationOrchestrator:
             return
         self._cancel_requested = True
         self._cancel_pending = True
+        self._tail_pending = False
         if self._t_stop is None:
             self._t_stop = self._clock()
         # _cancel_timers снимает все ручки _later, поэтому сначала очищаем старые.
@@ -902,6 +940,9 @@ class DictationOrchestrator:
                 "audio-no-device": "Микрофон недоступен. Подключите его или выберите другой.",
                 "audio-busy": "Микрофон занят. Закройте другую программу и попробуйте ещё раз.",
                 "audio-failed": "Не удалось записать звук. Выберите другой микрофон.",
+                "audio-silent": (
+                    "Микрофон молчит. Проверьте, что он включён, или выберите другой."
+                ),
                 "no-model": TEST_MODEL_UNAVAILABLE,
             }.get(str(code), TEST_FAILED)
             if self._level_callback is not None:
@@ -918,6 +959,13 @@ class DictationOrchestrator:
             self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
             if self._on_device_lost is not None:
                 self._on_device_lost()
+        elif code == "audio-silent":
+            # Источник открыт, но звука не даёт. Статистику и причину пишет
+            # обработчик тишины: у него есть состояние источника (kind=muted/…).
+            self._begin_finish()
+            self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_SILENT)
+            self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
+            self._announce_silent()
         elif code in ("audio-no-device", "audio-busy", "audio-failed"):
             kind = {"audio-no-device": "none", "audio-busy": "busy"}.get(str(code), "other")
             self._append_stat("mic_error", kind=kind, recovered_by="none")
@@ -977,6 +1025,7 @@ class DictationOrchestrator:
 
     def _begin_finish(self) -> None:
         self._cancel_pending = False
+        self._tail_pending = False
         self._cancel_timers()
         self._change_phase(DictationPhase.FINISHING)
         self._set_recording(False)
@@ -1065,6 +1114,7 @@ class DictationOrchestrator:
             self._finish_level()
         active = self._phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
         self._cancel_pending = False
+        self._tail_pending = False
         self._cancel_requested = True
         self._queue.clear()
         self._cancel_timers()

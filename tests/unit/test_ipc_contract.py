@@ -9,7 +9,12 @@ from unittest.mock import Mock
 
 import pytest
 
-from astra_voice.core.dictation import CANCEL_TIMEOUT_MS, RECOGNIZE_TIMEOUT_S, DictationPhase
+from astra_voice.core.dictation import (
+    CANCEL_TIMEOUT_MS,
+    RECOGNIZE_TIMEOUT_S,
+    RELEASE_TAIL_MS,
+    DictationPhase,
+)
 from astra_voice.core.model_request import build_model_load
 from astra_voice.core.settings import Settings
 from astra_voice.platform.hotkey import RECORD_LIMIT_S, HotkeyState
@@ -72,6 +77,9 @@ def test_gui_dictation_commands_encode(runtime: DictationRuntime, extra: dict[st
     assert send.call_args.kwargs == {"timeout": RECORD_LIMIT_S + RECOGNIZE_TIMEOUT_S}
 
     on_state(HotkeyState.PROCESSING, "release")
+    # Хвост записи после отпускания клавиши: команды уходят только после него.
+    tail = next(t for t in runtime.timers if t.start.call_args.args == (RELEASE_TAIL_MS,))
+    tail.timeout.connect.call_args.args[0]()
     runtime.orchestrator.cancel("escape")
     # Нет подтверждения отмены: настоящий callback таймера отправляет audio.close.
     timer = next(t for t in runtime.timers if t.start.call_args.args == (CANCEL_TIMEOUT_MS,))

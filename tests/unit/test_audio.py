@@ -29,6 +29,8 @@ from astra_voice.worker.audio import (
     ERROR_BUSY,
     ERROR_FAILED,
     ERROR_NO_DEVICE,
+    ERROR_SILENT,
+    FIRST_CHUNK_TIMEOUT_S,
     LEVEL_RATE_HZ,
     MAX_DEVICE_LABEL,
     OPEN_DEADLINE_S,
@@ -44,7 +46,9 @@ from astra_voice.worker.audio import (
     RECORD_DEADLINE_GRACE_S,
     SAMPLE_BYTES,
     SILENCE_HOLD_S,
+    SILENT_MESSAGE,
     STOP_WATCHDOG_S,
+    ZERO_SAMPLES_HOLD_S,
     AudioCapture,
     AudioDevice,
     AudioError,
@@ -104,13 +108,29 @@ def descriptions() -> list[dict[str, str]]:
     ]
 
 
-def pactl_run(short: str, details: str | Exception = "[]", code: int = 0) -> Run:
-    """Подставляет ответы обеих команд pactl, не вызывая subprocess."""
+def pactl_run(
+    short: str,
+    details: str | Exception = "[]",
+    code: int = 0,
+    *,
+    short_code: int = 0,
+    pw_dump: str | Exception | None = None,
+) -> Run:
+    """Подставляет ответы обеих команд pactl, не вызывая subprocess.
+
+    Запасного пути по умолчанию нет: `pw-dump` в системе не найден.
+    """
 
     def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         """Выбирает фикстуру по точной команде."""
         if args == ["pactl", "list", "short", "sources"]:
-            return subprocess.CompletedProcess(args, 0, short, "")
+            return subprocess.CompletedProcess(args, short_code, short, "")
+        if args == ["pw-dump"]:
+            if pw_dump is None:
+                raise FileNotFoundError("pw-dump")
+            if isinstance(pw_dump, Exception):
+                raise pw_dump
+            return subprocess.CompletedProcess(args, 0, pw_dump, "")
         assert args == ["pactl", "-f", "json", "list", "sources"]
         if isinstance(details, Exception):
             raise details
@@ -119,11 +139,22 @@ def pactl_run(short: str, details: str | Exception = "[]", code: int = 0) -> Run
     return run
 
 
-def default_source_run(output: str | Exception, code: int = 0) -> Run:
-    """Подставляет результат запроса умолчания, не обращаясь к звуковому серверу."""
+def default_source_run(
+    output: str | Exception, code: int = 0, *, wpctl: str | Exception | None = None
+) -> Run:
+    """Подставляет результат запроса умолчания, не обращаясь к звуковому серверу.
+
+    Запасного пути по умолчанию нет: `wpctl` в системе не найден.
+    """
 
     def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        """Принимает только фиксированную команду поиска источника."""
+        """Принимает только команду pactl и её замену для систем без неё."""
+        if args == ["wpctl", "inspect", "@DEFAULT_AUDIO_SOURCE@"]:
+            if wpctl is None:
+                raise FileNotFoundError("wpctl")
+            if isinstance(wpctl, Exception):
+                raise wpctl
+            return subprocess.CompletedProcess(args, 0, wpctl, "")
         assert args == ["pactl", "get-default-source"]
         if isinstance(output, Exception):
             raise output
@@ -274,17 +305,115 @@ def test_list_devices_skips_broken_rows(short_sources: str) -> None:
     ]
 
 
-def test_list_devices_nonzero_short_list() -> None:
-    """Ошибка обязательного краткого списка выдаёт машинный код audio-failed."""
+PW_DUMP = """[
+  {"id": 40, "info": {"props": {"media.class": "Audio/Device"}}},
+  {"id": 56, "info": {"props": {
+      "media.class": "Audio/Source",
+      "node.name": "alsa_input.pci.microphone",
+      "node.description": "  Встроенный микрофон Ё  ",
+      "object.serial": 56}}},
+  {"id": 57, "info": {"props": {
+      "media.class": "Audio/Source",
+      "node.name": "alsa_input.usb.headset",
+      "node.nick": "Гарнитура",
+      "object.serial": 57}}},
+  {"id": 58, "info": {"props": {
+      "media.class": "Audio/Source",
+      "node.name": "alsa_output.pci.stereo.monitor",
+      "object.serial": 58}}},
+  {"id": 59, "info": {"props": {
+      "media.class": "Audio/Source", "node.name": "alsa_input.pci.microphone"}}},
+  {"id": 60, "info": {"props": {"media.class": "Audio/Sink", "node.name": "alsa_output.pci"}}},
+  {"id": 61, "info": {"props": {"media.class": "Audio/Source"}}}
+]"""
 
+
+def test_list_devices_falls_back_to_pipewire_without_pactl() -> None:
+    """Машина без pulseaudio-utils: список берём у самой звуковой службы."""
+    run = Mock(wraps=pactl_run("", pw_dump=PW_DUMP))
+
+    def missing(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[0] == "pactl":
+            raise FileNotFoundError("pactl")
+        result: subprocess.CompletedProcess[str] = run(args, **kwargs)
+        return result
+
+    devices = list_devices(run=missing)
+    assert devices == [
+        AudioDevice(56, "alsa_input.pci.microphone", "Встроенный микрофон Ё", False),
+        AudioDevice(57, "alsa_input.usb.headset", "Гарнитура", False),
+        AudioDevice(58, "alsa_output.pci.stereo.monitor", "Звук системы", True),
+    ]
+    assert devices[2].label == "Звук системы (звук системы)"
+
+
+def test_list_devices_without_both_utilities_keeps_the_old_error() -> None:
+    def missing(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError(args[0])
+
+    with pytest.raises(AudioError) as caught:
+        list_devices(run=missing)
+    assert caught.value.code == ERROR_FAILED
+    assert str(caught.value) == "Не удалось получить список устройств записи."
+
+
+def _pipewire_only(payload: str) -> Run:
     def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        """Имитирует отказ первой команды, запрещая продолжение опроса."""
-        assert args == ["pactl", "list", "short", "sources"]
-        return subprocess.CompletedProcess(args, 1, "", "сервер недоступен")
+        if args[0] == "pactl":
+            raise FileNotFoundError("pactl")
+        return subprocess.CompletedProcess(args, 0, payload, "")
 
+    return run
+
+
+@pytest.mark.parametrize("payload", ["не json", "{}", ""])
+def test_list_devices_rejects_unreadable_pipewire_answer(payload: str) -> None:
+    with pytest.raises(AudioError) as caught:
+        list_devices(run=_pipewire_only(payload))
+    assert caught.value.code == ERROR_FAILED
+
+
+def test_pipewire_answer_without_sources_gives_empty_list() -> None:
+    """Пустой список — не ошибка: «микрофон не найден» скажет выбор устройства."""
+    assert list_devices(run=_pipewire_only("[1, 2]")) == []
+
+
+def test_default_device_falls_back_to_wireplumber_without_pactl() -> None:
+    """Имя источника по умолчанию берём у звуковой службы; текст ошибки прежний."""
+    microphone = AudioDevice(2, "alsa_input.usb.microphone", "USB-микрофон", False)
+    inspect = (
+        "id 57, type PipeWire:Interface:Node\n"
+        '  * media.class = "Audio/Source"\n'
+        f'  * node.name = "{microphone.name}"\n'
+        '    node.description = "USB-микрофон"\n'
+    )
+    run = Mock(wraps=default_source_run(FileNotFoundError("pactl"), wpctl=inspect))
+    assert default_device([microphone], run=run) is microphone
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["pactl", "get-default-source"],
+        ["wpctl", "inspect", "@DEFAULT_AUDIO_SOURCE@"],
+    ]
+
+
+@pytest.mark.parametrize("inspect", ["", "id 57, type PipeWire:Interface:Node\n"])
+def test_default_device_without_both_utilities_keeps_the_old_error(inspect: str) -> None:
+    run = default_source_run(FileNotFoundError("pactl"), wpctl=inspect or None)
+    with pytest.raises(AudioError) as caught:
+        default_device([], run=run)
+    assert caught.value.code == ERROR_NO_DEVICE
+    assert str(caught.value) == "Микрофон не найден. Выберите устройство записи в настройках."
+
+
+def test_list_devices_nonzero_short_list() -> None:
+    """Отказ краткого списка и отсутствие запасного пути дают audio-failed."""
+    run = Mock(wraps=pactl_run("", short_code=1))
     with pytest.raises(AudioError) as caught:
         list_devices(run=run)
     assert caught.value.code == ERROR_FAILED
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["pactl", "list", "short", "sources"],
+        ["pw-dump"],
+    ]
 
 
 def test_resolve_device_fail_closed(short_sources: str) -> None:
@@ -855,6 +984,8 @@ class ControlledSource:
         self.device_name: str | None = None
         self.is_open = False
         self.ended = False
+        # Управляемый фейк не живой микрофон: сторожа тишины включаем адресно.
+        self.live = False
         self.open_calls = 0
         self.close_calls = 0
         self.flush_calls = 0
@@ -1460,7 +1591,10 @@ def test_record_start_rejects_unsafe_default_before_libpulse(
     assert worker.buffers == {}
     assert not source.is_open
     assert source.selected_device is None
-    assert run.call_count == OPEN_FIRST_RETRIES + 1
+    # Запасной путь пробуется после каждого отказа pactl, но его в системе нет.
+    commands = [call.args[0][0] for call in run.call_args_list]
+    assert commands.count("pactl") == OPEN_FIRST_RETRIES + 1
+    assert set(commands) <= {"pactl", "wpctl"}
     cdll.assert_not_called()
     assert pulse_library.pa_simple_new.call_count == 0
 
@@ -2186,6 +2320,94 @@ def test_record_deadline_stops_blocked_capture_without_samples(
     assert close_threads == [owner]
     assert not source.is_open
     worker.check_capture_watchdog()
+
+
+class LiveWavSource(WavFileSource):
+    """WAV, выданный за живой микрофон: для сторожей молчания и ровных нулей."""
+
+    @property
+    def live(self) -> bool:
+        """Тишина здесь означает неисправность, как у настоящего источника."""
+        return True
+
+
+def test_open_source_without_a_single_chunk_reports_silent(
+    monkeypatch: pytest.MonkeyPatch, probes: list[CaptureProbe]
+) -> None:
+    """P0 на Fly: источник открылся, но ни одной порции не отдал — называем причину."""
+    entered = threading.Event()
+    release = threading.Event()
+    source = ControlledSource()
+    source.live = True
+
+    def read_chunk() -> bytes | None:
+        entered.set()
+        assert release.wait(TIMEOUT), "Тест не освободил заблокированное чтение"
+        return None
+
+    monkeypatch.setattr(source, "read_chunk", read_chunk)
+    probe = CaptureProbe(source)
+    probes.append(probe)
+    probe.now = 100.0
+    probe.capture.start("mute", None, limit_s=LIMIT_S_DEFAULT)
+    try:
+        assert entered.wait(TIMEOUT)
+        probe.now = 100.0 + FIRST_CHUNK_TIMEOUT_S - 0.001
+        probe.capture.check_stop_watchdog()
+        assert probe.errors.empty() and probe.capture.active
+        probe.now = 100.0 + FIRST_CHUNK_TIMEOUT_S
+        probe.capture.check_stop_watchdog()
+        assert probe.errors.get_nowait() == ("mute", ERROR_SILENT, SILENT_MESSAGE)
+        assert not probe.capture.active
+        # Сторож срабатывает один раз: повторных ошибок нет.
+        probe.now += 10.0
+        probe.capture.check_stop_watchdog()
+        assert probe.errors.empty()
+    finally:
+        release.set()
+
+
+def test_first_chunk_cancels_the_silent_watchdog(
+    wav_factory: WavFactory, wait_capture: Callable[[], None], probes: list[CaptureProbe]
+) -> None:
+    source = WavFileSource(wav_factory(8192, 2))
+    probe = CaptureProbe(source)
+    probes.append(probe)
+    probe.now = 100.0
+    probe.capture.start("ok", None, limit_s=LIMIT_S_DEFAULT)
+    wait_capture()
+    probe.now = 100.0 + FIRST_CHUNK_TIMEOUT_S
+    probe.capture.check_stop_watchdog()
+    assert probe.errors.empty()
+    assert len(probe.samples) == 2
+
+
+def test_exact_zeros_from_live_source_report_silent(
+    wav_factory: WavFactory, wait_capture: Callable[[], None], probes: list[CaptureProbe]
+) -> None:
+    """Заглушённый в системе микрофон отдаёт ровные нули; живой всегда шумит."""
+    step = 1.0
+    # Тот же файл, но выданный за живой микрофон: проверяем сторож ровных нулей.
+    source = LiveWavSource(wav_factory(0, 32))
+    probe = CaptureProbe(source, step=step)
+    probes.append(probe)
+    probe.capture.start("zeros", None, limit_s=LIMIT_S_DEFAULT)
+    wait_capture()
+    assert probe.errors.get_nowait() == ("zeros", ERROR_SILENT, SILENT_MESSAGE)
+    # Хватило ровно выдержки: лишние порции после неё не читаются.
+    assert len(probe.samples) == int(ZERO_SAMPLES_HOLD_S / step)
+
+
+def test_file_source_keeps_digital_silence(
+    wav_factory: WavFactory, wait_capture: Callable[[], None], probes: list[CaptureProbe]
+) -> None:
+    """В файле тишина — это данные: сторож ровных нулей на него не действует."""
+    probe = CaptureProbe(WavFileSource(wav_factory(0, 32)), step=1.0)
+    probes.append(probe)
+    probe.capture.start("file", None, limit_s=LIMIT_S_DEFAULT)
+    wait_capture()
+    assert probe.errors.empty()
+    assert len(probe.samples) == 32
 
 
 @pytest.mark.parametrize("chunk", [b"", struct.pack("<h", 8192)], ids=["empty", "sparse"])

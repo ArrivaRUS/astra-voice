@@ -52,6 +52,7 @@ from astra_voice.net.http import NetworkError
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
 from astra_voice.platform.paste import PasteMode
 from astra_voice.platform.session import SessionKind
+from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui import model_downloads
 from astra_voice.ui.bridges import (
     OnboardingController,
@@ -811,7 +812,21 @@ def test_retry_without_runtime_is_noop() -> None:
 def test_runtime_adapter_routes_bridge_changes() -> None:
     from astra_voice.app import _RuntimeSettingsApply
 
-    runtime = Mock(spec=["apply_pill_enabled", "apply_hotkey", "apply_device"])
+    runtime = Mock(
+        spec=[
+            "apply_pill_enabled",
+            "apply_hotkey",
+            "apply_device",
+            "microphone_state",
+            "raise_microphone_volume",
+            "open_sound_settings",
+            "restart_sound_service",
+            "has_volume_control",
+            "has_sound_settings",
+            "has_sound_service",
+        ]
+    )
+    runtime.microphone_state.return_value = MicrophoneState()
     runtime.apply_hotkey.return_value = "busy"
     bridge = SettingsBridge(Settings(), apply=_RuntimeSettingsApply(runtime), save=Mock())
     set_qt_property(bridge, "pillEnabled", False)
@@ -988,7 +1003,13 @@ def test_onboarding_device_real_save_matches_settings_bridge(
         apply.device.assert_called_with(value or None)
         assert target.setProperty("device", value)
         assert len(spy) == index
-    assert apply.mock_calls == [call.device("alsa_input.mic"), call.device(None)]
+    # Смена микрофона перечитывает его громкость для строки в «Общих».
+    assert apply.mock_calls == [
+        call.device("alsa_input.mic"),
+        call.microphone_state(),
+        call.device(None),
+        call.microphone_state(),
+    ]
 
 
 @pytest.mark.parametrize("initial", [None, "old mic"])

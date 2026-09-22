@@ -21,6 +21,7 @@ from PyQt5.QtDBus import QDBusInterface as QDBusInterface
 __all__ = [
     "ACTION_CHOOSE_HOTKEY",
     "ACTION_CHOOSE_MICROPHONE",
+    "ACTION_OPEN_SOUND_SETTINGS",
     "ACTION_SHOW_DETAILS",
     "drop_pending",
     "flush_pending",
@@ -32,7 +33,9 @@ __all__ = [
     "notify_indicators_lost",
     "notify_microphone_changed",
     "notify_microphone_lost",
+    "notify_microphone_muted",
     "notify_microphone_selected",
+    "notify_microphone_too_quiet",
     "notify_onboarding_ready",
     "notify_model_installed",
     "notify_selfcheck_failed",
@@ -45,7 +48,15 @@ __all__ = [
 
 ACTION_CHOOSE_HOTKEY = "choose-hotkey"
 ACTION_CHOOSE_MICROPHONE = "choose-microphone"
+ACTION_OPEN_SOUND_SETTINGS = "open-sound-settings"
 ACTION_SHOW_DETAILS = "show-details"
+
+# Тексты причин «вас не слышно»: без децибел, процентов, имён устройств и служб.
+_MIC_MUTED_TITLE = "Микрофон выключен"
+_MIC_MUTED_BODY = "Звук микрофона выключен в настройках системы, поэтому программа вас не слышит."
+_MIC_QUIET_TITLE = "Микрофон почти не слышно"
+_MIC_QUIET_BODY = "Громкость микрофона в системе слишком низкая — вас плохо слышно."
+_OPEN_SOUND_SETTINGS = "Открыть настройки звука"
 
 _logger = logging.getLogger(__name__)
 _URGENCY = {"low": 0, "normal": 1, "critical": 2}
@@ -301,6 +312,24 @@ def notify_microphone_lost() -> None:
         "Микрофон отключился",
         "Проверьте подключение или выберите микрофон в настройках.",
         urgency="critical",
+    )
+
+
+def notify_microphone_muted() -> None:
+    """Сообщить, что звук выбранного микрофона выключен в настройках системы."""
+    notify(
+        _MIC_MUTED_TITLE,
+        _MIC_MUTED_BODY,
+        actions=[(ACTION_OPEN_SOUND_SETTINGS, _OPEN_SOUND_SETTINGS)],
+    )
+
+
+def notify_microphone_too_quiet() -> None:
+    """Сообщить, что системная громкость выбранного микрофона слишком низкая."""
+    notify(
+        _MIC_QUIET_TITLE,
+        _MIC_QUIET_BODY,
+        actions=[(ACTION_OPEN_SOUND_SETTINGS, _OPEN_SOUND_SETTINGS)],
     )
 
 

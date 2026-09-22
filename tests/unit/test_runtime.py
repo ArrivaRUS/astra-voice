@@ -27,6 +27,7 @@ from astra_voice.core.dictation import (
     CANCEL_RESTART_MS,
     CANCEL_TIMEOUT_MS,
     RECOGNIZE_TIMEOUT_S,
+    RELEASE_TAIL_MS,
     TEST_MODEL_UNAVAILABLE,
     TEST_PREPARING,
     DictationPhase,
@@ -53,6 +54,7 @@ from astra_voice.platform.hotkey import (
 )
 from astra_voice.platform.paste import PasteMode, PasteOutcomeKind, normalize
 from astra_voice.platform.session import SessionKind
+from astra_voice.platform.sound import MicrophoneState, SoundControl
 from astra_voice.runtime import DictationRuntime
 from astra_voice.ui import notify
 from astra_voice.ui.bridges import OnboardingController, SettingsBridge
@@ -198,6 +200,12 @@ class Rig:
         monkeypatch.setattr(module, "notify", self.notify)
         monkeypatch.setattr(atexit, "register", self.atexit_register)
         monkeypatch.setattr(atexit, "unregister", self.atexit_unregister)
+        # Настоящие команды звуковой службы в тестах не запускаются никогда.
+        self.sound = Mock(spec=SoundControl)
+        self.sound.microphone_state.return_value = MicrophoneState()
+        self.sound.raise_microphone.return_value = True
+        self.sound.open_sound_settings.return_value = True
+        self.sound.restart_sound_service.return_value = True
         # Любое случайное создание реального таймера/наблюдателя ломает тест.
         monkeypatch.setattr(module, "QTimer", Mock(side_effect=AssertionError("Реальный таймер")))
         monkeypatch.setattr(
@@ -220,6 +228,7 @@ class Rig:
             guard_factory=self.guard_factory,
             provider_factory=Mock(return_value=self.provider),
             capture_watchdog_factory=self.capture_watchdog_factory,
+            sound_factory=lambda kind: self.sound,
         )
 
     def create_capture_watchdog(self) -> Mock:
@@ -274,9 +283,24 @@ class Rig:
         callback = self.supervisor_factory.call_args.kwargs["on_event"]
         callback({"generation": self.supervisor.generation, **event})
 
+    def fire_tail(self) -> None:
+        """Дописывает хвост записи после отпускания клавиши (RELEASE_TAIL_MS)."""
+        tail = [
+            timer
+            for timer in self.timers
+            if timer.active and not timer.deleted and timer.interval == RELEASE_TAIL_MS
+        ]
+        if tail:
+            tail[-1].fire()
+
+    def release(self, now: float) -> None:
+        """Отпускание клавиши вместе с хвостом записи."""
+        self.hotkey.fsm.release(now)
+        self.fire_tail()
+
     def recognize(self, text: str = MARKER) -> None:
         self.hotkey.fsm.press(self.now)
-        self.hotkey.fsm.release(self.now + 1)
+        self.release(self.now + 1)
         self.event(type="result", text=text)
 
 
@@ -311,7 +335,7 @@ def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_k
         )
         assert rig.notify.mock_calls == [call.notify_microphone_selected("Встроенный микрофон")]
         if event_kind == "changed":
-            rig.hotkey.fsm.release(rig.now + 1)
+            rig.release(rig.now + 1)
             rig.event(type="result", text=MARKER)
             rig.hotkey.fsm.press(rig.now + 2)
             rig.event(
@@ -323,6 +347,67 @@ def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_k
                 call.notify_microphone_selected("Встроенный микрофон"),
                 call.notify_microphone_changed("USB-гарнитура"),
             ]
+
+
+@pytest.mark.parametrize(
+    ("state", "problem", "wrapper"),
+    [
+        (MicrophoneState(known=True, muted=True, percent=100), "muted", "notify_microphone_muted"),
+        (
+            MicrophoneState(known=True, muted=False, percent=10),
+            "too-quiet",
+            "notify_microphone_too_quiet",
+        ),
+    ],
+)
+def test_silence_names_the_reason_once_per_session(
+    rig: Rig, state: MicrophoneState, problem: str, wrapper: str
+) -> None:
+    """S21-A5: причина с кнопкой — один раз на причину, `mic_error` — каждый раз."""
+    rig.runtime.start()
+    rig.sound.microphone_state.return_value = state
+    rig.hotkey.fsm.press(rig.now)
+    rig.event(type="silent")
+    assert getattr(rig.notify, wrapper).call_count == 1
+    rig.stats.append.assert_any_call("mic_error", kind=problem, recovered_by="none")
+    # Микрофон ради причины не открывается: читается только состояние источника.
+    rig.sound.microphone_state.assert_called_with(None)
+    rig.event(type="silent")
+    assert getattr(rig.notify, wrapper).call_count == 1
+    # Успешное нажатие кнопки снимает причину: следующая тишина объявится снова.
+    assert rig.runtime.raise_microphone_volume()
+    rig.event(type="silent")
+    assert getattr(rig.notify, wrapper).call_count == 2
+
+
+def test_silence_with_unknown_source_state_notifies_nothing(rig: Rig) -> None:
+    rig.runtime.start()
+    rig.hotkey.fsm.press(rig.now)
+    rig.event(type="silent")
+    rig.notify.notify_microphone_muted.assert_not_called()
+    rig.notify.notify_microphone_too_quiet.assert_not_called()
+    # Факт тишины в статистике есть, причины у неё нет.
+    rig.stats.append.assert_any_call("mic_error", kind="silent", recovered_by="none")
+
+
+def test_microphone_actions_use_selected_device_and_record_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = Rig(monkeypatch, from_dict({"device": "alsa_input.usb-headset"}))
+    rig.runtime.start()
+    assert rig.runtime.raise_microphone_volume()
+    rig.sound.raise_microphone.assert_called_once_with("alsa_input.usb-headset")
+    rig.stats.append.assert_any_call("mic_error", kind="silent", recovered_by="raise_volume")
+    assert rig.runtime.open_sound_settings()
+    assert rig.runtime.restart_sound_service()
+    rig.sound.restart_sound_service.assert_called_once_with()
+
+
+def test_failed_raise_does_not_record_recovery(rig: Rig) -> None:
+    rig.runtime.start()
+    rig.sound.raise_microphone.return_value = False
+    assert not rig.runtime.raise_microphone_volume()
+    assert all(item.args[0] != "mic_error" for item in rig.stats.append.call_args_list)
 
 
 def test_device_resolved_subscription_returns_current_and_replaces_subscriber(rig: Rig) -> None:
@@ -388,7 +473,7 @@ def test_microphone_announcement_follows_worker_generations(
                 event({"type": "audio.ready", "device": "USB-гарнитура", "changed": "смена"})
                 # Повторный или поздний hello того же поколения не сбрасывает имя.
                 event(ipc.make_hello())
-                rig.hotkey.fsm.release(rig.now + 1)
+                rig.release(rig.now + 1)
                 event(
                     {
                         "type": "result",
@@ -422,7 +507,7 @@ def test_apply_device_announces_next_open_as_selected(
         rig.event(type="audio.ready", device="Встроенный микрофон")
         # Выбор во время записи применяется при следующем открытии.
         assert bridge.setProperty("device", value)
-        rig.hotkey.fsm.release(rig.now + 1)
+        rig.release(rig.now + 1)
         rig.event(type="result", text=MARKER)
         name = "USB-гарнитура" if value else "Встроенный микрофон"
         for _ in range(2):
@@ -431,7 +516,7 @@ def test_apply_device_announces_next_open_as_selected(
             message = rig.supervisor.send.call_args.args[0]
             assert message.get("device") == (value or None)
             rig.event(type="audio.ready", device=name, **({"changed": "смена"} if value else {}))
-            rig.hotkey.fsm.release(rig.now + 1)
+            rig.release(rig.now + 1)
             rig.event(type="result", text=MARKER)
         assert rig.notify.notify_microphone_selected.call_args_list == [
             call("Встроенный микрофон"),
@@ -633,8 +718,13 @@ def test_notification_actions_show_window_and_are_removed_on_shutdown(rig: Rig) 
         key: callback
         for key, callback in (item.args for item in rig.set_action_handler.call_args_list)
     }
-    assert set(handlers) == {"choose-hotkey", "show-details", "choose-microphone"}
-    assert rig.set_action_handler.call_count == 3
+    assert set(handlers) == {
+        "choose-hotkey",
+        "show-details",
+        "choose-microphone",
+        "open-sound-settings",
+    }
+    assert rig.set_action_handler.call_count == 4
     # Назначение окна после start тоже работает; до него нажатие безопасно.
     for callback in handlers.values():
         callback()
@@ -642,7 +732,9 @@ def test_notification_actions_show_window_and_are_removed_on_shutdown(rig: Rig) 
     rig.runtime.on_show_requested = show
     for callback in handlers.values():
         callback()
+    # Кнопка «Открыть настройки звука» окно программы не открывает.
     assert show.call_args_list == [call(), call(), call()]
+    assert rig.sound.open_sound_settings.call_count == 2
     rig.set_action_handler.reset_mock()
     rig.runtime.shutdown()
     rig.runtime.shutdown()
@@ -652,6 +744,7 @@ def test_notification_actions_show_window_and_are_removed_on_shutdown(rig: Rig) 
     for callback in handlers.values():
         callback()  # Уже поставленные в очередь вызовы после shutdown не открывают окно.
     assert show.call_count == 3
+    assert rig.sound.open_sound_settings.call_count == 2
 
 
 def test_notification_actions_registered_before_startup_notification(rig: Rig) -> None:
@@ -672,7 +765,7 @@ def test_partial_start_unregisters_notification_actions(rig: Rig) -> None:
     rig.x11.open.side_effect = RuntimeError("Ошибка запуска")
     with pytest.raises(RuntimeError, match="Ошибка запуска"):
         rig.runtime.start()
-    assert rig.set_action_handler.call_count == 3
+    assert rig.set_action_handler.call_count == 4
     keys = [item.args[0] for item in rig.set_action_handler.call_args_list]
     rig.set_action_handler.reset_mock()
     rig.runtime.shutdown()
@@ -992,7 +1085,7 @@ def test_press_retries_model_load_after_two_failures(monkeypatch: pytest.MonkeyP
     rig.supervisor.stop.assert_not_called()
 
     rig.hotkey.on_state(HotkeyState.RECORDING, "press")
-    rig.hotkey.fsm.release(rig.now + 1)
+    rig.release(rig.now + 1)
     rig.event(type="hello")
     assert rig.supervisor.send.call_count == 3
     rig.event(type="model.loaded")
@@ -1104,7 +1197,7 @@ def test_hotkey_during_model_load_only_blocks_recording(
     rig.pill.show_state.reset_mock()
     rig.supervisor.send.reset_mock()
     rig.hotkey.fsm.press(rig.now)
-    rig.hotkey.fsm.release(rig.now + 1)
+    rig.release(rig.now + 1)
     rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
     on_state.assert_called_once_with(HotkeyState.PROCESSING, "release (1.000 с)")
     on_state.reset_mock()
@@ -1155,7 +1248,7 @@ def test_model_load_preserves_recording_started_before_hello(
         rig.guard.set_recording.assert_called_once_with(True)
         rig.pill.hide.assert_not_called()
 
-    rig.hotkey.fsm.release(rig.now + 1)
+    rig.release(rig.now + 1)
     assert_phase(rig.runtime, DictationPhase.PROCESSING)
     rig.supervisor.send.assert_any_call(
         {"type": "record.stop", "utterance_id": record_start["utterance_id"]}, timeout=None
@@ -1214,7 +1307,7 @@ def test_model_load_error_preserves_recording_and_hotkey_retries(
         (logging.WARNING, "Не удалось загрузить модель")
     ]
 
-    rig.hotkey.fsm.release(rig.now + 1)
+    rig.release(rig.now + 1)
     assert_phase(rig.runtime, DictationPhase.PROCESSING)
     rig.event(type="result", text=MARKER)
     rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
@@ -1536,6 +1629,7 @@ def test_regrab_restores_real_hotkey_manager(
     hotkey.handle_event(HotkeyEvent("KeyRelease", 65, 2000, mods=4), rig.now + 1)
     if mode == HotkeyMode.TOGGLE:
         hotkey.handle_event(HotkeyEvent("KeyPress", 65, 3000, mods=4), rig.now + 2)
+    rig.fire_tail()
     assert_phase(rig.runtime, DictationPhase.PROCESSING)
     rig.event(type="result", text=MARKER)
     rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
@@ -1644,6 +1738,7 @@ def test_tick_enforces_record_limit(rig: Rig) -> None:
     assert_phase(rig.runtime, DictationPhase.RECORDING)
     rig.now += RECORD_LIMIT_S
     rig.timers[0].fire()
+    # Предел длительности фразы хвоста не ждёт: клавишу никто не отпускал.
     assert_phase(rig.runtime, DictationPhase.PROCESSING)
     assert [item.args[0]["type"] for item in rig.supervisor.send.call_args_list] == [
         "record.start",
@@ -1679,6 +1774,7 @@ def test_settings_are_used_for_recording_and_paste(monkeypatch: pytest.MonkeyPat
         "limit_s": RECORD_LIMIT_S,
     }
     rig.hotkey.fsm.press(rig.now + 1)
+    rig.fire_tail()
     rig.event(type="result", text=MARKER)
     rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.CLIPBOARD_ONLY)
     settings.extra.clear()
@@ -1972,7 +2068,7 @@ def test_hotkey_done_uses_current_fsm_and_monotonic_time(rig: Rig) -> None:
     """grab заменяет автомат, поэтому done должен обращаться к актуальному fsm."""
     rig.runtime.start()
     rig.hotkey.fsm.press(rig.now)
-    rig.hotkey.fsm.release(rig.now + 1)
+    rig.release(rig.now + 1)
     done = Mock(wraps=rig.hotkey.fsm.done)
     rig.hotkey.fsm.done = done
     rig.now = 42.0
@@ -2090,7 +2186,7 @@ def test_cancel_restart_replaces_supervisor_and_routes_new_cycle(
     old.send.reset_mock()
     rig.hotkey.fsm.press(rig.now + 3)
     assert new.send.call_args.args[0]["type"] == "record.start"
-    rig.hotkey.fsm.release(rig.now + 4)
+    rig.release(rig.now + 4)
     assert [c.args[0]["type"] for c in new.send.call_args_list] == [
         "record.start",
         "record.stop",
@@ -2294,7 +2390,7 @@ def assert_recording_blocked(rig: Rig, *, loading: bool = False, offset: int = 0
         rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
     else:
         rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
-    rig.hotkey.fsm.release(rig.now + offset + 1)
+    rig.release(rig.now + offset + 1)
     rig.hotkey.fsm.escape(rig.now + offset + 2)
     assert_phase(rig.runtime, DictationPhase.IDLE)
     assert rig.supervisor.send.call_args_list == sent
@@ -2770,7 +2866,7 @@ def test_selfcheck_retry_uses_real_supervisor_correlation(
     rig.pill.hide.assert_not_called()
     rig.hotkey.fsm.press(rig.now)
     assert_phase(rig.runtime, DictationPhase.IDLE)
-    rig.hotkey.fsm.release(rig.now + 1)
+    rig.release(rig.now + 1)
     rig.hotkey.fsm.escape(rig.now + 2)
     assert send.call_count == 2
     second._accept({"type": "result", "utterance_id": "file", "text": "проверка"}, 2)
@@ -3101,7 +3197,7 @@ def test_selfcheck_tray_recheck_recovers_or_blocks_again(
     rig.hotkey.fsm.press(rig.now)
     assert_phase(rig.runtime, DictationPhase.IDLE)
     rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
-    rig.hotkey.fsm.release(rig.now + 1)
+    rig.release(rig.now + 1)
     assert rig.supervisor.send.call_args_list == sent
     # PROCESSING должен сбросить именно жест меню, а не тестовый Escape.
     assert rig.hotkey.fsm.state == HotkeyState.PROCESSING
@@ -3329,7 +3425,7 @@ def test_onboarding_install_and_finish_loads_model_for_next_dictation(
 
         # Между finish и hello запись ещё закрыта, отпускание хоткея допустимо.
         rig.hotkey.fsm.press(rig.now)
-        rig.hotkey.fsm.release(rig.now + 1)
+        rig.release(rig.now + 1)
         assert_phase(rig.runtime, DictationPhase.IDLE)
         send.assert_not_called()
         rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
@@ -3352,7 +3448,7 @@ def test_onboarding_install_and_finish_loads_model_for_next_dictation(
 
         rig.hotkey.fsm.press(rig.now + 3)
         assert_phase(rig.runtime, DictationPhase.RECORDING)
-        rig.hotkey.fsm.release(rig.now + 4)
+        rig.release(rig.now + 4)
         assert [entry.args[0]["type"] for entry in send.call_args_list] == [
             "model.load",
             "transcribe.file",
@@ -3658,7 +3754,7 @@ def test_microphone_runtime_and_app_host_use_real_ipc_without_side_effects(
     assert controller.level == pytest.approx(0.7)
     assert controller.peak == "−18 дБ"
     rig.hotkey.fsm.press(rig.now)
-    rig.hotkey.fsm.release(rig.now + 1)
+    rig.release(rig.now + 1)
     assert send.call_count == 1
     controller.stopTest()
     assert controller.testState == "processing"
@@ -3699,7 +3795,7 @@ def test_microphone_waits_for_model_and_stop_is_allowed_before_hello(
     send = Mock(wraps=rig.runtime.supervisor.send)
     monkeypatch.setattr(rig.runtime.supervisor, "send", send)
     rig.hotkey.fsm.press(rig.now)
-    rig.hotkey.fsm.release(rig.now + 1)
+    rig.release(rig.now + 1)
     send.assert_not_called()
     if stop == "stop":
         rig.runtime.stop_test()

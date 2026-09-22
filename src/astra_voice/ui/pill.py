@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 ERROR_MICROPHONE_UNAVAILABLE: Final = "Микрофон недоступен"
 ERROR_MICROPHONE_CHANGED: Final = "Микрофон сменился"
 ERROR_MICROPHONE_LOST: Final = "Микрофон отключился"
+ERROR_MICROPHONE_SILENT: Final = "Микрофон молчит"
 ERROR_RECOGNITION_RESTARTED: Final = "Распознавание перезапущено"
 ERROR_BUFFER_CLEARED: Final = "Буфер очищен"
 ERROR_RECOGNITION_FAILED: Final = "Не удалось распознать"
@@ -38,6 +39,7 @@ ERROR_REASONS: Final = frozenset(
         ERROR_MICROPHONE_UNAVAILABLE,
         ERROR_MICROPHONE_CHANGED,
         ERROR_MICROPHONE_LOST,
+        ERROR_MICROPHONE_SILENT,
         ERROR_RECOGNITION_RESTARTED,
         ERROR_BUFFER_CLEARED,
         ERROR_RECOGNITION_FAILED,

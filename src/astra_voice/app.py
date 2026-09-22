@@ -30,6 +30,7 @@ from astra_voice.core.paths import ipc_socket_path, lock_path, qml_dir, settings
 from astra_voice.core.version import __version__
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
+from astra_voice.platform.sound import MicrophoneState
 
 if TYPE_CHECKING:
     from astra_voice.core.dictation import LevelCallback, TestCallback
@@ -446,6 +447,30 @@ class _RuntimeSettingsApply:
 
     def device(self, value: str | None) -> None:
         self._runtime.apply_device(value)
+
+    def microphone_state(self) -> MicrophoneState:
+        return self._runtime.microphone_state()
+
+    def raise_microphone_volume(self) -> bool:
+        return self._runtime.raise_microphone_volume()
+
+    def open_sound_settings(self) -> bool:
+        return self._runtime.open_sound_settings()
+
+    def restart_sound_service(self) -> bool:
+        return self._runtime.restart_sound_service()
+
+    @property
+    def has_volume_control(self) -> bool:
+        return self._runtime.has_volume_control
+
+    @property
+    def has_sound_settings(self) -> bool:
+        return self._runtime.has_sound_settings
+
+    @property
+    def has_sound_service(self) -> bool:
+        return self._runtime.has_sound_service
 
 
 class _RuntimeOnboardingHost:

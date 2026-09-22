@@ -53,12 +53,14 @@ from astra_voice.platform.paste import (
     restore_pending,
 )
 from astra_voice.platform.session import SessionKind
+from astra_voice.platform.sound import MicrophoneProblem, MicrophoneState, SoundControl
 from astra_voice.platform.x11 import X11Display
 from astra_voice.ui import notify
 from astra_voice.ui.indicators import IndicatorGuard
 from astra_voice.ui.notify import (
     ACTION_CHOOSE_HOTKEY,
     ACTION_CHOOSE_MICROPHONE,
+    ACTION_OPEN_SOUND_SETTINGS,
     ACTION_SHOW_DETAILS,
 )
 from astra_voice.ui.pill import (
@@ -124,6 +126,9 @@ class DictationRuntime(QObject):
         guard_factory: Callable[..., IndicatorGuard] = IndicatorGuard,
         provider_factory: Callable[[SessionKind], TrayIconProvider] = TrayIconProvider,
         capture_watchdog_factory: Callable[[], CaptureFieldWatchdog] = CaptureFieldWatchdog,
+        sound_factory: Callable[[SessionKind], SoundControl] = lambda kind: SoundControl(
+            session=kind
+        ),
     ) -> None:
         super().__init__(parent)
         self.settings = settings
@@ -136,6 +141,9 @@ class DictationRuntime(QObject):
         self.on_show_requested: Callable[[], None] | None = None
         self._resolved_device = ""
         self._on_device_resolved: Callable[[str], None] | None = None
+        self.sound = sound_factory(session_kind)
+        # Причина «вас не слышно» объявляется один раз на причину за сеанс (F6.6 (д)).
+        self._announced_mic_problems: set[MicrophoneProblem] = set()
         self._started = False
         self._closed = False
         self._loading_model = False
@@ -206,6 +214,7 @@ class DictationRuntime(QObject):
                 on_device_lost=notify.notify_microphone_lost,
                 on_device_selected=notify.notify_microphone_selected,
                 on_device_resolved=self._device_resolved,
+                on_silent=self._microphone_silent,
             )
             rollback.append(("оркестратор", self.orchestrator.shutdown))
             self.supervisor = supervisor_factory(on_event=self._on_worker_event, use_qt=True)
@@ -694,6 +703,65 @@ class DictationRuntime(QObject):
             return
         self.orchestrator.on_hotkey_state(state, reason)
 
+    @property
+    def has_volume_control(self) -> bool:
+        """Есть ли в системе чем менять громкость микрофона."""
+        return self.sound.has_volume_control
+
+    @property
+    def has_sound_settings(self) -> bool:
+        """Есть ли в системе чем открыть панель настроек звука."""
+        return self.sound.has_sound_settings
+
+    @property
+    def has_sound_service(self) -> bool:
+        """Есть ли в системе чем перезапустить звуковую службу сеанса."""
+        return self.sound.has_sound_service
+
+    def microphone_state(self) -> MicrophoneState:
+        """Состояние выбранного микрофона по звуковой службе, без его открытия."""
+        return self.sound.microphone_state(self.settings.extra.get("device"))
+
+    def raise_microphone_volume(self) -> bool:
+        """Действие человека: включить звук микрофона и поднять громкость до полной."""
+        raised = self.sound.raise_microphone(self.settings.extra.get("device"))
+        if raised:
+            self._mic_error_stat(recovered_by="raise_volume")
+            self._announced_mic_problems.clear()
+        return raised
+
+    def open_sound_settings(self) -> bool:
+        """Действие человека: открыть системную панель звука; ничего не меняет."""
+        return self.sound.open_sound_settings()
+
+    def restart_sound_service(self) -> bool:
+        """Действие человека из «Отладки»: перезапустить звуковую службу сеанса."""
+        return self.sound.restart_sound_service()
+
+    def _microphone_silent(self) -> None:
+        """Уточняет причину тишины по звуковой службе и называет её один раз."""
+        if self._closed:
+            return
+        problem = self.microphone_state().problem
+        self._mic_error_stat(kind="silent" if problem is None else problem.value)
+        if problem is None:
+            # Причина устранена (или неизвестна): следующая даст новое уведомление.
+            self._announced_mic_problems.clear()
+            return
+        if problem in self._announced_mic_problems:
+            return
+        self._announced_mic_problems.add(problem)
+        if problem is MicrophoneProblem.MUTED:
+            notify.notify_microphone_muted()
+        else:
+            notify.notify_microphone_too_quiet()
+
+    def _mic_error_stat(self, *, kind: str = "silent", recovered_by: str = "none") -> None:
+        try:
+            self.stats.append("mic_error", kind=kind, recovered_by=recovered_by)
+        except Exception:
+            log.warning("Не удалось сохранить статистику микрофона")
+
     def _device_resolved(self, name: str) -> None:
         self._resolved_device = name
         if self._on_device_resolved is not None:
@@ -852,6 +920,7 @@ class DictationRuntime(QObject):
         self._started = True
         for key in _NOTIFICATION_ACTIONS:
             notify.set_action_handler(key, self._show_requested)
+        notify.set_action_handler(ACTION_OPEN_SOUND_SETTINGS, self._open_sound_settings_requested)
         atexit.register(self.restore_paste)
         self.x11.open()
         self.tray.start()
@@ -938,6 +1007,11 @@ class DictationRuntime(QObject):
         if not self._closed and self.on_show_requested is not None:
             self.on_show_requested()
 
+    def _open_sound_settings_requested(self) -> None:
+        """Кнопка уведомления: открыть системную панель звука."""
+        if not self._closed:
+            self.sound.open_sound_settings()
+
     def _drain_worker_events(self) -> None:
         """Даёт IPC до 50 мс на освобождение микрофона и обрабатывает события Qt."""
         self.supervisor.pump(timeout=0.05)
@@ -962,6 +1036,7 @@ class DictationRuntime(QObject):
         if self._started:
             for key in _NOTIFICATION_ACTIONS:
                 notify.set_action_handler(key, None)
+            notify.set_action_handler(ACTION_OPEN_SOUND_SETTINGS, None)
         self.on_show_requested = None
         self._cleanup("оркестратор", self.orchestrator.shutdown)
         self._cleanup("страж индикаторов", self.guard.stop)
