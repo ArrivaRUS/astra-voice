@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, TypeVar
 
 from astra_voice.worker.onnx_scan import scan_model_dir as scan_model_dir
+from astra_voice.worker.resample import (
+    SOURCE_RATE,
+    TARGET_RATE,
+    resample_batch_16k_to_8k,
+)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -262,6 +267,8 @@ LAYOUTS: dict[str, dict[str, VariantSpec]] = {
 
 
 MAX_LAYOUT_DEPTH = 4
+# Текст один на оба рубежа: и на создание ресемплера, и на приведение частоты.
+MODEL_RATE_MESSAGE = "Движок поддерживает только модели с частотой 16000 Гц"
 
 
 def _layout_directories(spec: VariantSpec) -> set[str]:
@@ -297,6 +304,31 @@ def _scan_layout(model_dir: Path) -> tuple[set[str], set[str], set[str]]:
             else:
                 other.add(name)
     return files, directories, other
+
+
+def check_model_rate(sample_rate: int) -> None:
+    """Пропускает только частоты, на которых движок умеет работать."""
+    if sample_rate not in (TARGET_RATE, SOURCE_RATE):
+        raise ValueError(MODEL_RATE_MESSAGE)
+
+
+def resample_for_model(
+    target_rate: int,
+    waveforms: "npt.NDArray[np.float32]",  # noqa: UP037 — строка для ленивых типов numpy
+    waveforms_lens: "npt.NDArray[np.int64]",  # noqa: UP037
+    sample_rate: int,
+) -> tuple["npt.NDArray[np.float32]", "npt.NDArray[np.int64]"]:  # noqa: UP037
+    """Приводит захват 16 кГц к частоте модели; чужую частоту не искажает молча.
+
+    Захват у программы всегда 16 кГц. Модели на 8 кГц (T-one) получают поток
+    после децимации 2:1 с фильтром низких частот, остальным отдаём как есть.
+    """
+    if sample_rate != SOURCE_RATE:
+        raise ValueError(f"Ожидается аудио 16000 Гц, получено {sample_rate} Гц")
+    check_model_rate(target_rate)
+    if target_rate == SOURCE_RATE:
+        return waveforms, waveforms_lens
+    return resample_batch_16k_to_8k(waveforms, waveforms_lens)
 
 
 def check_layout(model_dir: Path, layout: str, variant: str) -> None:
@@ -543,11 +575,14 @@ class OnnxAsrEngine:
             raise EngineUnavailableError("Рантайм onnxruntime или onnx-asr недоступен") from exc
 
         class Pcm16Resampler(Resampler):
-            """Пропускает только PCM 16 кГц, не создавая InferenceSession."""
+            """PCM 16 кГц без сессий; моделям на 8 кГц понижает частоту сам.
+
+            Захват остаётся 16 кГц для всех моделей. Сессии ресемплера onnx-asr
+            не создаются (S3-R4), понижение делает numpy — см. worker/resample.
+            """
 
             def __init__(self, sample_rate: int) -> None:
-                if sample_rate != 16000:
-                    raise ValueError("Движок поддерживает только модели с частотой 16000 Гц")
+                check_model_rate(sample_rate)
                 self._target_sample_rate = sample_rate
                 self._preprocessors: dict[int, Any] = {}
 
@@ -558,9 +593,9 @@ class OnnxAsrEngine:
                 sample_rate: int,
             ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.int64]]:
                 """Отклоняет другую частоту вместо молчаливого искажения аудио."""
-                if sample_rate != 16000:
-                    raise ValueError(f"Ожидается аудио 16000 Гц, получено {sample_rate} Гц")
-                return waveforms, waveforms_lens
+                return resample_for_model(
+                    self._target_sample_rate, waveforms, waveforms_lens, sample_rate
+                )
 
         class Pcm16Manager(Manager):
             """Исключает семь неиспользуемых сессий ресемплера (S3-R4)."""
