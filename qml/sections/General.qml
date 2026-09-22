@@ -61,11 +61,27 @@ Column {
             width: parent.width
             divider: false
             label: qsTr("Модель распознавания")
-            sub: !root.settings || root.activeModelState === "none" || root.settings.activeModelName === ""
-                ? qsTr("Модель не установлена")
-                : root.settings.activeModelSize !== ""
-                    ? qsTr("%1 · %2 на диске").arg(root.settings.activeModelName).arg(root.settings.activeModelSize)
-                    : root.settings.activeModelName
+            // Подписи нет намеренно: имя модели стоит справа, у самих кнопок.
+            // Со второй строкой раздел перестаёт помещаться без прокрутки.
+            showHint: false
+
+            Text {
+                textFormat: Text.PlainText
+                text: !root.settings || root.activeModelState === "none"
+                        || root.settings.activeModelName === ""
+                    ? qsTr("Модель не установлена")
+                    : root.settings.activeModelSize !== ""
+                        ? qsTr("%1 · %2").arg(root.settings.activeModelName)
+                            .arg(root.settings.activeModelSize)
+                        : root.settings.activeModelName
+                color: Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                renderType: Text.NativeRendering
+                elide: Text.ElideRight
+                Layout.maximumWidth: root.width / 3
+                Layout.alignment: Qt.AlignVCenter
+            }
 
             Text {
                 textFormat: Text.PlainText
@@ -162,7 +178,9 @@ Column {
         SettingRow {
             width: parent.width
             label: qsTr("Режим")
-            sub: qsTr("Удерживать — самый предсказуемый вариант")
+            // Подписи нет: смысл виден по самим кнопкам, а раздел должен
+            // помещаться без прокрутки (решение заказчика 22.09).
+            showHint: false
             locked: root.isLocked("hotkey_mode")
 
             AvSegmented {
