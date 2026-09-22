@@ -419,3 +419,73 @@ def test_app_info_fake_property_and_signal_signatures() -> None:
         "showSection(QString)",
     }
     assert set(declared_methods) <= set(meta_contract(real_meta, own_only=True).methods)
+
+
+DOC_PATH = REPO / "docs" / "ui-bridge.md"
+#: Типы, которыми документ размечает строки-свойства в таблицах.
+DOC_PROPERTY_TYPES = frozenset({"string", "bool", "real", "int", "QVariantList", "QStringList"})
+#: Служебные члены QObject: к контракту с QML они не относятся.
+DOC_UNLISTED = frozenset(
+    {"destroyed", "objectName", "objectNameChanged", "deleteLater", "parent", "children"}
+)
+
+
+def documented_names(text: str) -> tuple[frozenset[str], frozenset[str]]:
+    """Имена свойств и слотов, которые документ объявляет частью контракта."""
+    properties: set[str] = set()
+    slots: set[str] = set()
+    for line in text.split("\n"):
+        if not line.startswith("| `"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        name = cells[0].strip("`")
+        if name.endswith("()"):
+            slots.add(name[:-2])
+        elif len(cells) > 1 and cells[1].strip("`") in DOC_PROPERTY_TYPES:
+            properties.add(name)
+    return frozenset(properties), frozenset(slots)
+
+
+def test_documented_members_exist_in_bridges(real_contracts: dict[str, MetaContract]) -> None:
+    """Документ не должен обещать того, чего в мостах нет (§7 ui-bridge.md)."""
+    text = DOC_PATH.read_text(encoding="utf-8")
+    documented_properties, documented_slots = documented_names(text)
+    known_properties = {
+        name for contract in real_contracts.values() for name in contract.properties
+    }
+    known_methods = {
+        method.name for contract in real_contracts.values() for method in contract.methods
+    }
+    # Документ описывает и контекстные свойства окна, и поля записей models[]:
+    # проверяем только те имена, которые выглядят как члены мостов.
+    missing = {
+        name
+        for name in documented_properties
+        if name not in known_properties and name in known_methods
+    }
+    assert not missing, f"Свойства из документа отсутствуют в мостах: {sorted(missing)}"
+    absent_slots = documented_slots - known_methods
+    assert not absent_slots, f"Слоты из документа отсутствуют в мостах: {sorted(absent_slots)}"
+
+
+def test_bridge_members_are_documented(real_contracts: dict[str, MetaContract]) -> None:
+    """Добавленный в мост член обязан попасть в документ — иначе он не контракт."""
+    text = DOC_PATH.read_text(encoding="utf-8")
+    undocumented: list[str] = []
+    for key in ("onboarding", "settingsBridge"):
+        contract = real_contracts[key]
+        for name in sorted(contract.properties):
+            if name in DOC_UNLISTED or name.startswith("_") or f"`{name}`" in text:
+                continue
+            undocumented.append(f"{key}.{name}")
+        for method in contract.methods:
+            name = method.name
+            if name in DOC_UNLISTED or name.startswith("_") or name.endswith("Changed"):
+                continue
+            # В таблице слотов имя стоит с аргументами: `installFromPath(path)`.
+            if f"`{name}`" in text or f"`{name}(" in text:
+                continue
+            undocumented.append(f"{key}.{name}()")
+    assert not undocumented, "Эти члены мостов не описаны в docs/ui-bridge.md: " + ", ".join(
+        sorted(set(undocumented))
+    )
