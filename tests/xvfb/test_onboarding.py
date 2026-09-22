@@ -168,13 +168,6 @@ class FakeOnboarding(QObject):
         self._eta: str = "осталось ~3 мин"
         self._hotkey: str = "Ctrl + Space"
         self._hotkeyMode: str = "ptt"
-        self._microphoneVolume: int = 80
-        self._microphoneMuted: bool = False
-        self._canRaiseMicrophone: bool = True
-        self._devices: list[dict[str, str]] = [
-            {"id": "", "name": "Системный по умолчанию"},
-            {"id": "alsa_input.mic", "name": "Микрофон гарнитуры"},
-        ]
         self._captureState: str = "idle"
         self._captureMessage: str = ""
         self._pendingCombo: str = ""
@@ -650,6 +643,13 @@ class FakeSettings(QObject):
         self.toggled_model_ids: list[str] = []
         self._hotkey: str = "Ctrl + Space"
         self._hotkeyMode: str = "ptt"
+        self._microphoneVolume: int = 80
+        self._microphoneMuted: bool = False
+        self._canRaiseMicrophone: bool = True
+        self._devices: list[dict[str, str]] = [
+            {"id": "", "name": "Системный по умолчанию"},
+            {"id": "alsa_input.mic", "name": "Микрофон гарнитуры"},
+        ]
         self._pillEnabled: bool = True
         self._language: str = "ru"
         self._checkAppUpdates: bool = False
