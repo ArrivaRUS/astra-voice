@@ -1,3 +1,10 @@
+astra-voice (0.1.0~m6.7) unstable; urgency=medium
+
+  * В списке микрофонов вместо «(null)» показываются настоящие названия
+    устройств.
+
+ -- ArrivaRUS <arrivarus@gmail.com>  Tue, 22 Sep 2026 18:14:43 +0300
+
 astra-voice (0.1.0~m6.6) unstable; urgency=medium
 
   * Вставка текста на рабочем столе Fly: программа смотрит, где на самом деле
