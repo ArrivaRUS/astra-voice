@@ -133,6 +133,30 @@ def _diag(result: TranscribeResult, loaded: LoadResult) -> str:
     )
 
 
+def _cpu_has_amx() -> bool:
+    """Известный дефект: int8-ядра onnxruntime ≤ 1.24.4 на CPU с AMX дают пустой текст.
+
+    Зафиксировано в CI на Xeon 8573C и 6973P-C (docs/status.md, Blockers). Тесты на
+    таких раннерах помечаются xfail(strict=True): пройдут — значит, дефект ушёл и
+    пометку надо снять. Машина заказчика (Core Ultra, без AMX) под пометку не попадает.
+    """
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(
+        key.strip() == "flags" and "amx_int8" in value.split()
+        for key, _, value in (line.partition(":") for line in cpuinfo.splitlines())
+    )
+
+
+AMX_XFAIL = pytest.mark.xfail(
+    _cpu_has_amx(),
+    reason="int8 GigaAM на CPU с AMX возвращает пустой текст (onnxruntime 1.24.4, известно)",
+    strict=True,
+)
+
+
 def test_load(loaded_engine: tuple[Engine, LoadResult]) -> None:
     _, loaded = loaded_engine
     # S3 §4.1: около 667 мс при двух потоках; контракт допускает 10 с.
@@ -142,6 +166,7 @@ def test_load(loaded_engine: tuple[Engine, LoadResult]) -> None:
     assert "onnx-asr" in loaded.engine_version
 
 
+@AMX_XFAIL
 def test_transcribe(
     loaded_engine: tuple[Engine, LoadResult], audio_6s: npt.NDArray[np.float32]
 ) -> None:
@@ -152,6 +177,7 @@ def test_transcribe(
     assert result.infer_ms > 0
 
 
+@AMX_XFAIL
 def test_cancel_and_transcribe_again(
     loaded_engine: tuple[Engine, LoadResult],
     audio_6s: npt.NDArray[np.float32],
@@ -198,6 +224,7 @@ def test_missing_model_directory(tmp_path: Path) -> None:
 
 
 # Последний тест использует собственный движок, не выгружая модульную фикстуру.
+@AMX_XFAIL
 def test_unload_releases_sessions(model_dir: Path, audio_6s: npt.NDArray[np.float32]) -> None:
     baseline = active_sessions()
     engine = make_engine(LAYOUT)
