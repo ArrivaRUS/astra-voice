@@ -46,6 +46,7 @@ from astra_voice.ui.pill import (
     Pill,
     PillState,
 )
+from astra_voice.worker import ipc
 
 if TYPE_CHECKING:
     from astra_voice.ui.tray import Tray
@@ -1704,8 +1705,9 @@ def _qualified_pill_name(node: ast.AST, aliases: dict[str, str]) -> str:
 def _pill_text_violations(source: str, *, package: str = "astra_voice") -> list[str]:
     """Гейт для всех будущих вызовов show_state, включая app.py и псевдонимы.
 
-    Разрешены строковые литералы и импорты именно из реестра pill, без перезаписи
-    или затенения. Любая **распаковка может скрывать text, поэтому запрещена.
+    Разрешены строковые литералы, импорты из реестра pill и фиксированное
+    сообщение несовпадения протокола, без перезаписи или затенения.
+    Любая **распаковка может скрывать text, поэтому запрещена.
     """
     tree = ast.parse(source)
     nodes = list(ast.walk(tree))
@@ -1757,6 +1759,8 @@ def _pill_text_violations(source: str, *, package: str = "astra_voice") -> list[
         for name, value in vars(module).items()
         if name.isupper() and isinstance(value, str) and value in ERROR_REASONS | CLIPBOARD_REASONS
     }
+    assert ipc.PROTOCOL_MISMATCH_MESSAGE == "Программа обновлена — перезапустите её"
+    registry_names.add("astra_voice.worker.ipc.PROTOCOL_MISMATCH_MESSAGE")
     overwritten = {
         _qualified_pill_name(node, aliases)
         for node in nodes

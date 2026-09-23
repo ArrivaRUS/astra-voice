@@ -86,6 +86,8 @@ SELFCHECK_WATCHDOG_MS = 3000
 PREPARING_WATCHDOG_MS = 30_000
 # Хватает на запуск воркера, загрузку большой модели и повтор самопроверки.
 SWITCH_TIMEOUT_S = 60.0
+# Ожидание границы диктовки: не меньше максимальной записи плюс запас на распознавание.
+PENDING_SWITCH_TIMEOUT_S = RECORD_LIMIT_S + SWITCH_TIMEOUT_S
 REGRAB_INTERVAL_MS = 30000
 _NOTIFICATION_ACTIONS = (ACTION_CHOOSE_HOTKEY, ACTION_SHOW_DETAILS, ACTION_CHOOSE_MICROPHONE)
 
@@ -144,6 +146,7 @@ class DictationRuntime(QObject):
         self.on_show_requested: Callable[[], None] | None = None
         self.on_switch_finished: Callable[[str], None] | None = None
         self._pending_switch: tuple[int, bool] | None = None
+        self._pending_switch_timer: QTimer | None = None
         self._switch_candidate: WorkerSupervisor | None = None
         self._switch_request: dict[str, Any] | None = None
         self._switch_loaded_event: dict[str, Any] | None = None
@@ -408,8 +411,24 @@ class DictationRuntime(QObject):
             return
         if self.phase != DictationPhase.IDLE:
             self._pending_switch = (min_ram_mb, pause)
+            self._pending_switch_timer = self.schedule(
+                int(PENDING_SWITCH_TIMEOUT_S * 1000), self._pending_switch_watchdog
+            )
             return
         self._begin_switch(min_ram_mb, pause)
+
+    def _pending_switch_watchdog(self) -> None:
+        self._pending_switch_timer = None
+        if self._pending_switch is None:
+            return
+        self._pending_switch = None
+        if self.on_switch_finished is not None and not self._closed:
+            self.on_switch_finished("failed")
+
+    def _cancel_pending_switch_timer(self) -> None:
+        timer, self._pending_switch_timer = self._pending_switch_timer, None
+        if timer is not None:
+            self.cancel_timer(timer)
 
     def _switch_active(self) -> bool:
         return self._switch_in_progress
@@ -833,7 +852,15 @@ class DictationRuntime(QObject):
             not self._closed
             and event.get("generation") == self.supervisor.generation
             and event.get("type") == "error"
-            and event.get("code") == "measure-failed"
+            and (
+                event.get("code") == "measure-failed"
+                or (
+                    # При обычном перезапуске load-timeout приходит со старым
+                    # generation; сюда он доходит лишь без перезапуска (restart-limit).
+                    event.get("code") in ("timeout", "load-timeout")
+                    and event.get("response_type") == "measured"
+                )
+            )
         ):
             self.measurements.measure_failed()
         if (
@@ -841,10 +868,11 @@ class DictationRuntime(QObject):
             and event.get("generation") == self.supervisor.generation
             and event.get("type") == "error"
             and event.get("code") == ipc.PROTOCOL_MISMATCH
+            and "utterance_id" not in event
         ):
             self._loading_model = False
             self._fail_pending_test()
-            self.pill.show_state(PillState.ERROR, text="Программа обновлена — перезапустите её")
+            self.pill.show_state(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
             self.tray.set_state(TrayState.ERROR)
             return
         if (
@@ -1159,6 +1187,7 @@ class DictationRuntime(QObject):
         if not self._closed and self.phase == DictationPhase.IDLE and self._pending_switch:
             min_ram_mb, pause = self._pending_switch
             self._pending_switch = None
+            self._cancel_pending_switch_timer()
             self._begin_switch(min_ram_mb, pause)
 
     def cancel_timer(self, handle: object) -> None:
@@ -1298,6 +1327,7 @@ class DictationRuntime(QObject):
             return
         self._closed = True
         self._pending_switch = None
+        self._cancel_pending_switch_timer()
         timer, self._switch_timer = self._switch_timer, None
         if timer is not None:
             self.cancel_timer(timer)

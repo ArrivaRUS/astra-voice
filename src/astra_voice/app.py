@@ -496,9 +496,6 @@ class _RuntimeOnboardingHost:
     def free_candidates(self, prefer: list[str]) -> list[str]:
         return self._runtime.hotkey.free_candidates(prefer)
 
-    def apply_hotkey(self, combo: str, mode: str) -> str:
-        return self._runtime.apply_hotkey(combo, mode)
-
     def start_level_monitor(self, device: str, callback: LevelCallback) -> bool:
         return self._runtime.start_level_monitor(device, callback)
 

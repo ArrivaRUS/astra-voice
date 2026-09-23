@@ -84,15 +84,21 @@ class CaptureFieldWatchdog:
             if self._closed:
                 return False
             if self._thread is None:
-                self._thread = threading.Thread(
-                    target=self._run,
-                    args=(window_id,),
-                    name="capture-field-watchdog",
-                    daemon=True,
-                )
                 try:
                     self._wake_read, self._wake_write = os.pipe()
                     self._wake_closed = False
+                except Exception:
+                    self._closed = True
+                    self._stop.set()
+                    log.warning("Не удалось создать канал сторожа поля захвата")
+                    return False
+                try:
+                    self._thread = threading.Thread(
+                        target=self._run,
+                        args=(window_id,),
+                        name="capture-field-watchdog",
+                        daemon=True,
+                    )
                     self._thread.start()
                 except Exception:
                     self._closed = True

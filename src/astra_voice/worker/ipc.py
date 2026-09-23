@@ -23,6 +23,7 @@ BAD_FRAME = "bad-frame"
 UNKNOWN_MESSAGE = "unknown-message"
 BAD_FIELD = "bad-field"
 PROTOCOL_MISMATCH = "protocol-mismatch"
+PROTOCOL_MISMATCH_MESSAGE = "Программа обновлена — перезапустите её"
 
 _UTTERANCE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _HEADER = struct.Struct(">I")
@@ -151,7 +152,7 @@ def _validate(msg: dict[str, Any]) -> dict[str, Any]:
             raise FrameError(BAD_FIELD, "Поле text превышает 32 КиБ.")
     if kind == "hello":
         if result["protocol"] != PROTOCOL_VERSION:
-            raise FrameError(PROTOCOL_MISMATCH, "Программа обновлена — перезапустите её.")
+            raise FrameError(PROTOCOL_MISMATCH, f"{PROTOCOL_MISMATCH_MESSAGE}.")
         result["runtime"] = _fields(result["runtime"], _RUNTIME)
     return result
 

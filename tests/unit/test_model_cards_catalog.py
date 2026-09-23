@@ -149,6 +149,7 @@ def test_merge_measurements_and_scales(catalog: Catalog) -> None:
         is False
     )
     assert merge_measurement(entry, {f"{entry.id}@old": {"ram_mb": 600}}) == fallback
+    assert merge_measurement(entry, {key: {"ram_mb": 600, "threads": True}}, 1) == fallback
 
 
 def test_merge_missing_and_fp32_sources(catalog: Catalog) -> None:

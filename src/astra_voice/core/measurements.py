@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from astra_voice.core.paths import PathError, ensure_private_dir
+from astra_voice.core.version import __version__
 
 log = logging.getLogger(__name__)
 MAX_MEASUREMENTS_BYTES = 1 << 20
@@ -34,7 +35,11 @@ def read_measurements(path: Path | None) -> dict[str, Any]:
         data = json.loads(raw.decode("utf-8"))
         if not isinstance(data, dict):
             raise ValueError("ожидался объект")
-        return data
+        return {
+            key: value
+            for key, value in data.items()
+            if isinstance(value, dict) and value.get("build") == __version__
+        }
     except FileNotFoundError:
         return {}
     except (OSError, ValueError, UnicodeError, RecursionError):
@@ -137,9 +142,11 @@ class MeasurementTracker:
         if self.identity is None or vm_hwm_kb < 0:
             return False
         measured = round(vm_hwm_kb * 1024 / 1_000_000)
-        self.ram_mb = max(self.ram_mb or 0, measured)
+        ram_mb = max(self.ram_mb or 0, measured)
+        if ram_mb != self.ram_mb:
+            self.ram_mb = ram_mb
+            self.measured_at = datetime.now(UTC).isoformat()
         self.requested = False
-        self.measured_at = datetime.now(UTC).isoformat()
         self._save()
         if self.remeasure_pending:
             self.remeasure_pending = False
@@ -158,6 +165,7 @@ class MeasurementTracker:
             "rtfx": statistics.median(self.warm_runs) if len(self.warm_runs) >= 5 else None,
             "measured_at": self.measured_at,
             "threads": threads,
+            "build": __version__,
         }
         previous = entries.get(key)
         if isinstance(previous, dict) and all(

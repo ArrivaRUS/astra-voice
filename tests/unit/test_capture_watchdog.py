@@ -29,6 +29,19 @@ def test_unused_watchdog_does_not_open_pipe(monkeypatch: pytest.MonkeyPatch) -> 
     pipe.assert_not_called()
 
 
+def test_pipe_failure_does_not_create_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    thread = Mock()
+    monkeypatch.setattr(
+        "astra_voice.core.capture_watchdog.os.pipe", Mock(side_effect=OSError("pipe failed"))
+    )
+    monkeypatch.setattr("astra_voice.core.capture_watchdog.threading.Thread", thread)
+    watchdog = CaptureFieldWatchdog()
+    assert not watchdog.open()
+    assert watchdog._thread is None
+    thread.assert_not_called()
+    assert watchdog._wake_closed
+
+
 @pytest.mark.parametrize("failure", ["select", "next_event"])
 def test_event_read_failure_waits(monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
     display = Mock(spec=X11Display)
