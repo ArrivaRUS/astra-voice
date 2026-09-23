@@ -13,11 +13,14 @@ import pytest
 from astra_voice.core import paths
 from astra_voice.core.theme import ThemeSource
 from astra_voice.platform.session import SessionKind
+from astra_voice.ui import tray_icons
 from astra_voice.ui.tray_icons import (
     TrayIconProvider,
     TrayState,
     _explicit_svg,
+    color_is_dark,
     find_tray_icon_path,
+    fly_panel_dark,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -53,6 +56,12 @@ class PanelTheme(ThemeSource):
 @pytest.fixture(scope="module")
 def qapp() -> QApplication:
     return get_qapplication()
+
+
+@pytest.fixture(autouse=True)
+def no_fly_panel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Тесты не читают ~/.fly машины: панель Fly «неизвестна», цвет — по теме окон."""
+    monkeypatch.setattr(tray_icons, "fly_panel_dark", lambda: None)
 
 
 @pytest.fixture
@@ -427,3 +436,54 @@ def test_idle_tooltip_hotkey() -> None:
     assert TrayIconProvider(SessionKind.FLY).tooltip(TrayState.IDLE, hotkey="Alt+F9") == (
         "Astra Voice — готов · Alt+F9"
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("#ffffff", False),
+        ("#000000", True),
+        ("#118bcc", True),
+        ("white", False),
+        ('"white"', False),
+        ("PrimaryDarkColor", True),
+        ("PrimaryLightColor", False),
+        ("PrimaryColor", None),
+        ("", None),
+    ],
+)
+def test_color_is_dark(value: str, expected: bool | None) -> None:
+    assert color_is_dark(value) is expected
+
+
+def test_fly_panel_dark_reads_first_readable_theme(tmp_path: Path) -> None:
+    current = tmp_path / "current.themerc"
+    default = tmp_path / "default.themerc"
+    default.write_text('[Variables]\nTaskbarImage = ""\nTaskbarColor = PrimaryDarkColor\n')
+    # Нет current.themerc — берём default: панель тёмная (поставка Astra).
+    assert fly_panel_dark((current, default)) is True
+    current.write_text(";comment\n[Variables]\nTaskbarColor=#ffffff\nTaskbarImage=\n")
+    assert fly_panel_dark((current, default)) is False
+    # Картинка на панели — цвет неизвестен, вниз по списку не идём.
+    current.write_text("[Variables]\nTaskbarImage=/usr/share/x.png\nTaskbarColor=#ffffff\n")
+    assert fly_panel_dark((current, default)) is None
+    assert fly_panel_dark((tmp_path / "missing.themerc",)) is None
+
+
+@pytest.mark.parametrize("panel", [True, False, None])
+def test_fly_icon_color_follows_panel_not_window_theme(
+    qapp: QApplication, bundled_icons: None, panel: bool | None
+) -> None:
+    theme = PanelTheme()
+    theme.is_dark = False
+    provider = TrayIconProvider(SessionKind.FLY, theme, panel_dark=lambda: panel)
+    icon = provider.icon(TrayState.IDLE)
+    assert not icon.isNull()
+    expected = "#eff0f1" if panel else "#232629"
+    assert icon.pixmap(16, 16).toImage().pixelColor(5, 10).name() == expected
+
+
+def test_kde_file_icon_ignores_fly_panel(qapp: QApplication, bundled_icons: None) -> None:
+    provider = TrayIconProvider(SessionKind.KDE, None, panel_dark=lambda: True)
+    icon = provider.icon(TrayState.IDLE)
+    assert icon.pixmap(16, 16).toImage().pixelColor(5, 10).name() == "#232629"
