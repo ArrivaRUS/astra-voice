@@ -20,6 +20,7 @@ from uuid import uuid4
 from astra_voice.platform.hotkey import HotkeyState
 from astra_voice.platform.paste import PasteMode, PasteOutcome, PasteOutcomeKind, normalize
 from astra_voice.ui.pill import (
+    CLIPBOARD_NOT_FETCHED,
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
     ERROR_MICROPHONE_LOST,
@@ -807,8 +808,11 @@ class DictationOrchestrator:
             return
         started = self._clock()
         self._suspended = True
+        not_fetched = False
         try:
-            kind = self._paste(text, self._target_window, self._paste_mode()).kind
+            outcome = self._paste(text, self._target_window, self._paste_mode())
+            kind = outcome.kind
+            not_fetched = outcome.reason == "not-fetched"
         except Exception:
             # Исключение может содержать фразу: не передаём даже его repr в журнал.
             self._log.warning("диктовка: ошибка вызова вставки")
@@ -846,7 +850,10 @@ class DictationOrchestrator:
         elif kind == PasteOutcomeKind.WINDOW_CHANGED:
             self._dictation_stat("ok")
             self._begin_finish()
-            self._pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED)
+            if not_fetched:
+                self._pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_NOT_FETCHED)
+            else:
+                self._pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED)
             self._end_finish(PillState.CLIPBOARD_ONLY, tray=TrayState.IDLE)
         elif kind in (PasteOutcomeKind.CLIPBOARD_ONLY, PasteOutcomeKind.BUSY):
             self._dictation_stat("ok")

@@ -27,6 +27,7 @@ from astra_voice.platform.session import SessionKind
 from astra_voice.ui import indicators, notify
 from astra_voice.ui import pill as module
 from astra_voice.ui.pill import (
+    CLIPBOARD_NOT_FETCHED,
     CLIPBOARD_REASONS,
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
@@ -866,8 +867,10 @@ def test_unregistered_clipboard_reason_uses_fallback_and_is_not_logged(
 
 
 def test_clipboard_registry_is_exact() -> None:
-    assert CLIPBOARD_REASONS == frozenset(("Окно сменилось — текст в буфере",))
-    assert CLIPBOARD_REASONS == frozenset((CLIPBOARD_WINDOW_CHANGED,))
+    assert CLIPBOARD_REASONS == frozenset(
+        ("Окно сменилось — текст в буфере", "Окно не приняло текст — он в буфере")
+    )
+    assert CLIPBOARD_REASONS == frozenset((CLIPBOARD_WINDOW_CHANGED, CLIPBOARD_NOT_FETCHED))
 
 
 @pytest.mark.parametrize("state", [s for s in PillState if s is not PillState.CLIPBOARD_ONLY])
