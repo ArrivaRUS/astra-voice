@@ -569,3 +569,27 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
 ## Anti-drift (конец сессии 2026-09-09)
 - delegations: 37 (за 09.09 — 15)
 - yurka_direct_actions: 0 (микроправки PRD/спеки ≤3 строк, синтез и свод — зона Юрки)
+
+## 2026-09-23 17:35 — ПАУЗА на демо (заказчик: «заканчивай на сейчас»)
+- **Состояние main `21556ec`** (push ok): слита `wip/m6-validate` (`tools/validate catalog --all|--switch`, T-93/T-94 **живые PASS**
+  на dev-хранилище `~/.cache/astra-voice-dev/store-validate` = GigaAM v3 RNN-T 15,8× + **T-one 8,0×** (скачана по «да» заказчика,
+  установлена штатным `Installer.install_from_path` через `venv-e`; переключение A→B 1849 мс, `current.json` возвращён байт-в-байт);
+  unit 5404 ✓, xvfb 213 ✓ (offscreen, снимки в scratchpad), ruff/mypy ✓. Docs: M11 en+fr + французская модель; решение по карточке;
+  макеты `final/` + спека 0.5 + flows (вариант A, «Точность» = 100 − WER, цветные полоски, окно 1024×620, без сноски/попапа).
+- **Заказчик протестировал установку с нуля** (`apt purge` → `apt install m6.12`, данные пользователя стёрты, копия в scratchpad
+  `reset-backup-16xx`): мастер прошёл, модель скачалась с HF с первого раза; `astra-voice-spike 0.0.2` удалён. Находка для M9:
+  purge оставляет `/var/lib/astra-voice/staging` (root) — нужен postrm.
+- **Замечания заказчика к экрану моделей** → решение (decisions/log.md 23.09): вариант **A**, «Точность» вместо WER, полоски
+  `successInk/warningInk/dangerInk` (пороги 92/88 %, 20×/5×), маркер ✓ для замера, окно 1024, **никакой сноски и «Как мы считаем»**.
+- **Открыто в worktree `wt-oom` (`wip/m6-oom`, 11 файлов незакоммичено, попап вырезан, M1–M5 закрыты, всё зелёное у разработчика):**
+  повторное ревью code-reviewer было ОСТАНОВЛЕНО на паузу → после паузы: запустить ревью заново (бриф: требования (а)–(д), M1–M5,
+  следов попапа нет, Step2Model.qml с новыми свойствами, `memoryShortage` в ui-bridge §4.3 и двойнике; риск: `record_state` без try
+  в обработчике отказа переключения) → коммит → merge → поправить `docs/plans.md` стр. 390/403 (упоминания Popup) → полный прогон → сборка `m6.13`.
+- **Далее:** design-engineer по записке дизайнера (tokens.json → Theme.qml: sizeWindowW 1024, sizeContentColMax 796,
+  onboardingStep2ContentW 796, modelCard* по таблице, новые `modelCardMetricFill{Good,Fair,Weak}`, удалить `FillEstimated/Measured`,
+  `SourceCaption*`, `hr`) → developer-codex в новом worktree `wt-card` от main после merge oom (QML карточка A + мост:
+  `format_accuracy` ROUND_HALF_UP, `_QUALITY_LABEL="Точность"`, заливка = точность/100, уровни good/fair/weak, «N МБ в памяти ✓»,
+  теги без производителя, `vendor_short`; **пункт 5 записки дизайнера про попап — НЕ делать**) → пересъёмка эталонов
+  `design/refs/02-models-*`, `08-onboarding-2-model*` (`design/refs/reshoot.py`) → карточка 20 состояний.
+- Открытые вопросы дизайнера: остальные экраны перерисовывать в 1024 (пока нет — 900 минимум корректен); 1366×768 @125 % высота 614 < 620.
+- Остальное без изменений: ИБ T2 24.09 после 15:43; T-92 живой; Fly-ветки.
