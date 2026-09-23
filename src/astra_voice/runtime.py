@@ -200,7 +200,7 @@ class DictationRuntime(QObject):
                 pill=self.pill,
                 tray=self.tray,
                 paste=self.paste_func,
-                active_window=self.x11.active_window,
+                active_window=self.x11.target_window,
                 schedule=self.schedule,
                 cancel_timer=self.cancel_timer,
                 hotkey_done=lambda: self.hotkey.fsm.done(monotonic()),

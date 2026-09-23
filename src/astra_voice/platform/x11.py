@@ -591,6 +591,54 @@ class X11Display:
         windows = self._root_windows("_NET_ACTIVE_WINDOW")
         return windows[0] if windows else None
 
+    def focus_client(self) -> int | None:
+        """Клиент EWMH, которому принадлежит фокус ввода, или None.
+
+        От окна фокуса поднимаемся по предкам до окна из ``_NET_CLIENT_LIST_STACKING``
+        (у KWin фокус часто у дочернего виджета, а клиент — внутри рамки).
+        Override-redirect (меню, выпадающие списки), корень и PointerRoot — None.
+        """
+        self._enforce_keyboard_deadline()
+        try:
+            if self.d is None or self.root is None:
+                return None
+            clients = set(self.client_list_stacking())
+            if not clients:
+                return None
+            window = self.d.get_input_focus().focus
+            seen: set[int] = set()
+            for _ in range(32):
+                wid = int(getattr(window, "id", 0))
+                if wid <= 1 or wid == int(self.root.id) or wid in seen:
+                    return None
+                seen.add(wid)
+                if window.get_attributes().override_redirect:
+                    return None
+                if wid in clients:
+                    return wid
+                window = window.query_tree().parent
+        except Exception as exc:
+            log.debug("не удалось найти клиента фокуса: %s", type(exc).__name__)
+        return None
+
+    def target_window(self) -> int | None:
+        """Окно-цель для вставки в момент старта записи.
+
+        Сначала активное окно EWMH; если оконный менеджер держит его пустым
+        (журнал заказчика 23.09: `reason=no-target` на KDE при живом фокусе в
+        поле ввода) — клиент фокуса ввода. Источник пишем в журнал: без этого
+        ветки «цели нет» неотличимы на чужой машине.
+        """
+        active = self.active_window()
+        if active:
+            return active
+        focus = self.focus_client()
+        if focus:
+            log.info("окно-цель взято из фокуса ввода: активное окно EWMH пусто")
+            return focus
+        log.info("окно-цель не найдено: активное окно EWMH пусто, фокус ввода неизвестен")
+        return None
+
     def client_list_stacking(self) -> list[int]:
         """Клиенты EWMH снизу вверх; при ошибке пустой список."""
         self._enforce_keyboard_deadline()

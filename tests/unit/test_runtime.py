@@ -149,6 +149,7 @@ class Rig:
         self.provider = Mock()
         self.x11 = Mock()
         self.x11.active_window.return_value = 4321
+        self.x11.target_window.return_value = 4321
         self.x11.open.side_effect = lambda: self.record("x11.open")
         self.x11.close.side_effect = lambda: self.record("x11.close")
         self.capture_watchdogs: list[Mock] = []
