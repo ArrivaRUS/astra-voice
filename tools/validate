@@ -5,6 +5,8 @@
     tools/validate dictation --virtual-mic --silence 3
     tools/validate downloads --faults
     tools/validate privacy --network-denied --json
+    tools/validate catalog --all --json
+    tools/validate catalog --switch --from ID@REV --to ID@REV
 
 Коды возврата: 0 — уложились, 1 — нарушен критерий, 2 — прогон невозможен.
 Проверяется интервал record.cancel → cancelled, а не остановка всех вызовов ORT.
@@ -37,19 +39,46 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from astra_voice.core import policy, settings  # noqa: E402
+from astra_voice.core import (  # noqa: E402
+    paths,  # noqa: E402
+    policy,
+    settings,
+)
+from astra_voice.core.model_source import smoke_matches, smoke_wav_path  # noqa: E402
 from astra_voice.core.stats import Stats, percentile  # noqa: E402
+from astra_voice.models.catalog import ID_RE, Catalog, CatalogEntry, load_builtin  # noqa: E402
+from astra_voice.models.store import ModelRecord, ModelStore  # noqa: E402
 from astra_voice.platform.hotkey import (  # noqa: E402
     PTT_THRESHOLD_S,
     HotkeyFsm,
     HotkeyMode,
     HotkeyState,
 )
+from astra_voice.security.verify import Verifier  # noqa: E402
 from astra_voice.worker import ipc  # noqa: E402
 from astra_voice.worker.supervisor import Message, WorkerSupervisor  # noqa: E402
 
 CANCEL_LIMIT_MS = 1000.0
 SILENT_LIMIT_MS = 2200.0
+CATALOG_MODEL_TIMEOUT_S = 120.0
+CATALOG_LOAD_TIMEOUT_S = 60.0
+CATALOG_SELFCHECK_TIMEOUT_S = 60.0
+CATALOG_SWITCH_TIMEOUT_S = 180.0
+
+
+class CatalogSwitchError(RuntimeError):
+    """Отказ проверки с заранее заданным сообщением для публичного вывода."""
+
+
+def positive_finite(raw: str) -> float:
+    """Принимает конечное число строго больше нуля."""
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Нужно конечное число больше 0.") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("Нужно конечное число больше 0.")
+    return value
 
 
 def positive_int(raw: str) -> int:
@@ -1010,6 +1039,760 @@ def privacy(args: argparse.Namespace) -> int:
     return network_report(args, checks, notes, error)
 
 
+def load_catalog() -> Catalog:
+    """Читает подписанный встроенный каталог без сетевых обращений."""
+    keyring = paths.data_dir_static() / "keys" / "release.gpg"
+    return load_builtin(Verifier("catalog", keyring=keyring))
+
+
+def catalog_probe(args: argparse.Namespace) -> int:
+    """Дочерний процесс: 2 потока; раскладка и вариант из каталога; PCM как у воркера."""
+    from astra_voice.worker.engine import CancelToken, make_engine
+    from astra_voice.worker.state import WorkerState
+
+    result: dict[str, Any] = {
+        "load_ms": None,
+        "infer_ms": None,
+        "audio_s": None,
+        "text_len": 0,
+        "match": False,
+        "ok": False,
+        "error": "",
+    }
+    engine = None
+    try:
+        import numpy as np
+
+        engine = make_engine(args.layout)
+        started = time.perf_counter()
+        engine.load(args.model_dir, args.layout, args.variant, 2)
+        result["load_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        samples = WorkerState._read_wav(args.wav)
+        audio = np.frombuffer(samples, dtype=np.float32)
+        result["audio_s"] = round(len(samples) / 16000, 3)
+        started = time.perf_counter()
+        recognized = engine.transcribe(audio, CancelToken())
+        result["infer_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        result["text_len"] = len(recognized.text.strip())
+        result["match"] = smoke_matches(recognized.text)
+        result["ok"] = bool(result["text_len"]) and not recognized.cancelled
+        if not result["ok"]:
+            result["error"] = "пустой текст"
+    except Exception as exc:
+        # Исключения движка могут содержать путь и фрагмент входа; наружу идёт только тип.
+        result["error"] = type(exc).__name__
+    finally:
+        if engine is not None:
+            try:
+                engine.unload()
+            except Exception:
+                pass
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+    return 0
+
+
+def run_catalog_probe(
+    model_dir: Path, layout: str, variant: str, wav: Path, timeout: float
+) -> dict[str, Any]:
+    """Ограничивает весь жизненный цикл движка отдельным убиваемым процессом."""
+    command = [
+        sys.executable,
+        str(ROOT / "tools/validate"),
+        "_catalog-probe",
+        "--model-dir",
+        str(model_dir),
+        "--layout",
+        layout,
+        "--variant",
+        variant,
+        "--wav",
+        str(wav),
+    ]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "таймаут"}
+    except (OSError, subprocess.SubprocessError):
+        return {"ok": False, "error": "не удалось запустить процесс"}
+    if completed.returncode:
+        return {"ok": False, "error": f"код процесса {completed.returncode}"}
+    try:
+        lines = completed.stdout.splitlines()
+        if len(lines) != 1:
+            raise ValueError
+        value = json.loads(lines[0])
+        if not isinstance(value, dict) or type(value.get("ok")) is not bool:
+            raise ValueError
+        return value
+    except (ValueError, TypeError):
+        return {"ok": False, "error": "неверный ответ процесса"}
+
+
+def catalog_exit_code(rows: list[dict[str, Any]]) -> int:
+    """Код 2 означает отсутствие установленной модели, 1 — её неуспешный смоук."""
+    installed = [row for row in rows if row["installed"]]
+    if not installed:
+        return 2
+    return int(any(row["status"] != "ок" for row in installed))
+
+
+def format_catalog_table(rows: list[dict[str, Any]]) -> str:
+    """Форматирует фиксированные колонки без вывода распознанной речи."""
+    headers = (
+        "модель",
+        "раскладка",
+        "загрузка, мс",
+        "распознавание, мс",
+        "RTFx",
+        "текст",
+        "эталон",
+        "итог",
+    )
+
+    def value(row: dict[str, Any], field: str) -> str:
+        item = row.get(field)
+        return "—" if item is None else str(item)
+
+    lines = [headers]
+    for row in rows:
+        lines.append(
+            (
+                value(row, "model"),
+                value(row, "layout"),
+                value(row, "load_ms"),
+                value(row, "infer_ms"),
+                "—" if row.get("rtfx") is None else f"{row['rtfx']:.1f}",
+                "да" if row.get("text") else "нет",
+                "—" if row.get("match") is None else "да" if row["match"] else "нет",
+                value(row, "status"),
+            )
+        )
+    widths = [max(len(line[index]) for line in lines) for index in range(len(headers))]
+    return "\n".join(
+        "  ".join(cell.ljust(widths[index]) for index, cell in enumerate(line)).rstrip()
+        for line in lines
+    )
+
+
+def catalog_all(
+    args: argparse.Namespace, entries: tuple[CatalogEntry, ...], store: ModelStore
+) -> tuple[int, dict[str, Any]]:
+    """Проверяет только исправные установленные ревизии каталога."""
+    records = {(record.id, record.revision): record for record in store.records()}
+    wav = smoke_wav_path()
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        record = records.get((entry.id, entry.revision))
+        installed = record is not None and record.state == "ok"
+        row: dict[str, Any] = {
+            "model": f"{entry.id}@{entry.revision}",
+            "layout": entry.layout,
+            "load_ms": None,
+            "infer_ms": None,
+            "rtfx": None,
+            "text": False,
+            "match": None,
+            "status": "повреждена"
+            if record is not None and record.state == "broken"
+            else "пропущена"
+            if installed and not wav.is_file()
+            else "не установлена",
+            "installed": installed,
+        }
+        if installed and wav.is_file():
+            assert record is not None
+            try:
+                result = run_catalog_probe(
+                    record.dir, entry.layout, entry.variant, wav, args.timeout
+                )
+            except (TimeoutError, subprocess.TimeoutExpired):
+                result = {"ok": False, "error": "таймаут"}
+            except Exception:
+                result = {"ok": False, "error": "сбой движка"}
+            for field in ("load_ms", "infer_ms"):
+                number = result.get(field)
+                if type(number) in (int, float) and math.isfinite(number) and number >= 0:
+                    row[field] = round(number, 1)
+            row["text"] = type(result.get("text_len")) is int and result["text_len"] > 0
+            row["match"] = result.get("match") if type(result.get("match")) is bool else None
+            audio_s, infer_ms = result.get("audio_s"), row["infer_ms"]
+            if (
+                type(audio_s) in (int, float)
+                and math.isfinite(audio_s)
+                and infer_ms
+                and infer_ms > 0
+            ):
+                row["rtfx"] = round(audio_s / (infer_ms / 1000), 1)
+            if result.get("error") == "таймаут":
+                row["status"] = "таймаут"
+            elif result.get("ok") is True and row["text"]:
+                row["status"] = "ок"
+            elif not row["text"] and result.get("ok") is True:
+                row["status"] = "ошибка: пустой текст"
+            else:
+                # Ответ процесса недоверенный: не включаем произвольный текст и пути.
+                reason = str(result.get("error", "сбой"))
+                allowed = {
+                    "таймаут",
+                    "пустой текст",
+                    "не удалось запустить процесс",
+                    "неверный ответ процесса",
+                    "сбой движка",
+                }
+                process_code = reason.removeprefix("код процесса ")
+                if reason not in allowed and not (
+                    reason.startswith("код процесса ") and process_code.lstrip("-").isdigit()
+                ):
+                    reason = "сбой движка"
+                row["status"] = f"ошибка: {reason}"
+        rows.append(row)
+    code = 2 if not wav.is_file() else catalog_exit_code(rows)
+    return code, {
+        "command": "catalog",
+        "mode": "all",
+        "rows": rows,
+        "verdict": {0: "ок", 1: "failed", 2: "прогон невозможен"}[code],
+        "exit_code": code,
+        "explanation": "Эталонный WAV не найден." if not wav.is_file() else "",
+    }
+
+
+def parse_model_ref(raw: str) -> tuple[str, str]:
+    """Разбирает полный идентификатор одной ревизии."""
+    from astra_voice.models.catalog import ID_RE
+
+    parts = raw.split("@")
+    if len(parts) != 2 or any(ID_RE.fullmatch(part) is None for part in parts):
+        raise argparse.ArgumentTypeError("Нужен идентификатор ID@REV.")
+    return parts[0], parts[1]
+
+
+def choose_catalog_pair(
+    entries: tuple[CatalogEntry, ...],
+    records: tuple[ModelRecord, ...],
+    current: ModelRecord | None,
+    from_ref: tuple[str, str] | None,
+    to_ref: tuple[str, str] | None,
+) -> tuple[CatalogEntry, ModelRecord, CatalogEntry, ModelRecord] | None:
+    """Выбирает две разные установленные ревизии из проверенного каталога."""
+    installed = {
+        (record.id, record.revision): record
+        for record in records
+        if record.state == "ok" and record.recheck is not True
+    }
+    available = [
+        (entry, installed[(entry.id, entry.revision)])
+        for entry in entries
+        if (entry.id, entry.revision) in installed
+    ]
+    if len(available) < 2:
+        return None
+    source = from_ref or ((current.id, current.revision) if current is not None else None)
+    if source is None:
+        return None
+    first = next(
+        ((entry, record) for entry, record in available if (entry.id, entry.revision) == source),
+        None,
+    )
+    second = (
+        next(
+            (
+                (entry, record)
+                for entry, record in available
+                if (entry.id, entry.revision) == to_ref
+            ),
+            None,
+        )
+        if to_ref
+        else next(
+            (
+                (entry, record)
+                for entry, record in available
+                if (entry.id, entry.revision) != source
+            ),
+            None,
+        )
+    )
+    if first is None or second is None or first[0] == second[0]:
+        return None
+    return first[0], first[1], second[0], second[1]
+
+
+def catalog_switch_exit_code(result: str, old_stopped: bool, loaded_is_b: bool) -> int:
+    """Три обязательных условия успеха Р5."""
+    return int(result != "ok" or not old_stopped or not loaded_is_b)
+
+
+class CatalogPill:
+    """Индикатор без окна."""
+
+    def show_state(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def hide(self) -> None:
+        pass
+
+    def set_enabled(self, enabled: bool) -> None:
+        pass
+
+
+class CatalogTray:
+    """Трей без регистрации в рабочем столе."""
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def set_state(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def set_model_recheck_enabled(self, enabled: bool) -> None:
+        pass
+
+
+class CatalogGuard:
+    def stop(self) -> None:
+        pass
+
+    def set_recording(self, recording: bool) -> None:
+        pass
+
+
+class CatalogX11:
+    def open(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def target_window(self) -> None:
+        return None
+
+
+class CatalogHotkey:
+    def __init__(self) -> None:
+        self.on_state: Any = None
+        self.backend = self
+        self.fsm = HotkeyFsm(on_state=self._on_state)
+
+    def _on_state(self, state: HotkeyState, reason: str) -> None:
+        if self.on_state is not None:
+            self.on_state(state, reason)
+
+    def grab(self, combo: str, mode: HotkeyMode) -> Any:
+        from astra_voice.platform.hotkey import GrabResult
+
+        return GrabResult("ok")
+
+    def ungrab(self) -> None:
+        pass
+
+    def ungrab_escape(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def fileno(self) -> int:
+        return -1
+
+
+class CatalogCaptureWatchdog:
+    active = False
+
+    def open(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        pass
+
+
+class CatalogProvider:
+    """Поставщик значков без обращения к рабочему столу."""
+
+
+class CatalogSound:
+    has_volume_control = False
+    has_sound_settings = False
+    has_sound_service = False
+
+    def microphone_state(self, device: str | None = None) -> Any:
+        from astra_voice.platform.sound import MicrophoneState
+
+        return MicrophoneState()
+
+
+class CatalogStats:
+    def append(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass
+
+
+class CatalogNotify:
+    """Уведомления рантайма не уходят во внешний сервис."""
+
+    def __getattr__(self, name: str) -> Any:
+        return lambda *args, **kwargs: None
+
+
+def catalog_runtime_settings() -> Any:
+    """Читает настройки как приложение, не переименовывая испорченный файл."""
+    stored = settings.load(paths.settings_path(), quarantine=False)
+    return policy.effective(stored, policy.load())
+
+
+def make_catalog_runtime(store: ModelStore, *, supervisor_factory: Any = WorkerSupervisor) -> Any:
+    """Собирает настоящий рантайм с настоящим воркером и пустыми UI-портами."""
+    from astra_voice.platform.session import SessionKind
+    from astra_voice.runtime import DictationRuntime
+
+    return DictationRuntime(
+        settings=catalog_runtime_settings(),
+        session_kind=SessionKind.OTHER,
+        model_store=store,
+        supervisor_factory=supervisor_factory,
+        pill_factory=lambda **kwargs: CatalogPill(),
+        tray_factory=lambda *args, **kwargs: CatalogTray(),
+        hotkey_factory=CatalogHotkey,
+        x11_factory=CatalogX11,
+        guard_factory=lambda *args, **kwargs: CatalogGuard(),
+        provider_factory=lambda kind: CatalogProvider(),
+        capture_watchdog_factory=CatalogCaptureWatchdog,
+        sound_factory=lambda kind: CatalogSound(),
+        stats_factory=CatalogStats,
+        paste_func=lambda *args: None,
+        restore_paste=lambda: False,
+    )
+
+
+def catalog_switch(
+    args: argparse.Namespace, entries: tuple[CatalogEntry, ...], store: ModelStore
+) -> tuple[int, dict[str, Any]]:
+    """Проверяет переключение без GUI и звука.
+
+    Ctrl+C, SIGTERM и SIGHUP дают код 2 с возвратом прежнего выбора модели.
+    """
+    facts: dict[str, Any] = {
+        "command": "catalog",
+        "mode": "switch",
+        "result": "failed",
+        "switch_ms": None,
+        "branch": "",
+        "old_stopped": False,
+        "current_is_b": False,
+        "loaded_is_b": False,
+        "new_pid": None,
+        "new_process": False,
+        "workers_stopped": False,
+        "exit_code": 2,
+    }
+    current_path = store.root / "current.json"
+    original_bytes = current_path.read_bytes() if current_path.exists() else None
+    if catalog_runtime_settings().to_dict().get("model_dir"):
+        facts["explanation"] = "В настройках задана модель вручную"
+        return 2, facts
+    records = store.records()
+    by_id = {(record.id, record.revision): record for record in records}
+    selected_ref = None
+    if original_bytes is not None:
+        try:
+            raw_current = json.loads(original_bytes)
+            if isinstance(raw_current, dict):
+                candidate = (raw_current.get("id"), raw_current.get("revision"))
+                if all(isinstance(part, str) and ID_RE.fullmatch(part) for part in candidate):
+                    selected_ref = candidate
+        except (ValueError, TypeError):
+            pass
+    current_record = by_id.get(selected_ref) if selected_ref is not None else None
+    current = (
+        current_record
+        if current_record is not None
+        and current_record.state == "ok"
+        and current_record.recheck is not True
+        and current_record.metadata_ok
+        else None
+    )
+    for ref in (args.from_ref, args.to_ref, selected_ref):
+        record = by_id.get(ref) if ref is not None else None
+        if record is not None and record.recheck is True:
+            facts["explanation"] = f"Модель {record.id}@{record.revision} нужно перепроверить"
+            return 2, facts
+    pair = choose_catalog_pair(entries, records, current, args.from_ref, args.to_ref)
+    if pair is None:
+        facts["explanation"] = (
+            "Нужно минимум 2 установленные модели"
+            if sum(record.state == "ok" and record.recheck is not True for record in records) < 2
+            else "Не удалось выбрать две разные модели"
+        )
+        return 2, facts
+    entry_a, _, entry_b, _ = pair
+    runtime: Any = None
+    old_process: Any = None
+    previous_handlers: dict[signal.Signals, Any] = {}
+    switch_model_called = False
+    interrupted = False
+
+    def interrupt(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    def restore_current() -> None:
+        if original_bytes is None:
+            current_path.unlink(missing_ok=True)
+            fsync_store_dir()
+            return
+        descriptor, temporary = tempfile.mkstemp(prefix=".current.json.restore-", dir=store.root)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(original_bytes)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, current_path)
+            fsync_store_dir()
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+
+    def fsync_store_dir() -> None:
+        descriptor = os.open(store.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    try:
+        from PyQt5.QtCore import QCoreApplication, QEventLoop
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+
+        def until(done: Any, timeout: float) -> bool:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                app.processEvents(QEventLoop.AllEvents, 50)
+                if done():
+                    return True
+                time.sleep(0.01)
+            return False
+
+        prior = f"{selected_ref[0]}@{selected_ref[1]}" if selected_ref else "не выбрана"
+        print(f"На время проверки меняю выбранную модель; прежняя — {prior}.", file=sys.stderr)
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            previous_handlers[signum] = signal.signal(signum, interrupt)
+        store.set_current(entry_a.id, entry_a.revision)
+        with (
+            patch("astra_voice.runtime.notify", CatalogNotify()),
+            patch("astra_voice.runtime.paths.measurements_path", return_value=None),
+        ):
+            try:
+                runtime = make_catalog_runtime(store)
+                runtime.start()
+                model_a = (entry_a.id, entry_a.revision)
+
+                def loaded_a() -> bool:
+                    return (
+                        runtime._loaded_model.get("model_id"),
+                        runtime._loaded_model.get("revision"),
+                    ) == model_a
+
+                def load_a_finished() -> bool:
+                    return (
+                        loaded_a()
+                        or runtime._selfcheck == "failed"
+                        or getattr(runtime, "_model_load_failures", 0) > 0
+                        or (
+                            getattr(runtime, "_model_load_request", None) is not None
+                            and not getattr(runtime, "_loading_model", False)
+                            and runtime._selfcheck == "idle"
+                        )
+                    )
+
+                if not until(load_a_finished, CATALOG_LOAD_TIMEOUT_S):
+                    raise CatalogSwitchError("Таймаут загрузки модели A")
+                if getattr(runtime, "_model_load_failures", 0) > 0 or not loaded_a():
+                    raise CatalogSwitchError("Загрузка модели A не удалась")
+                if not until(
+                    lambda: runtime._selfcheck in ("ok", "failed"), CATALOG_SELFCHECK_TIMEOUT_S
+                ):
+                    raise CatalogSwitchError("Таймаут самопроверки модели A")
+                if runtime._selfcheck != "ok":
+                    raise CatalogSwitchError("Самопроверка модели A не прошла")
+                old_process = runtime.supervisor.process
+                if old_process is None or old_process.poll() is not None:
+                    raise CatalogSwitchError("Исходный воркер не работает")
+                old_pid = old_process.pid
+                pause = not runtime.can_switch_without_pause(entry_b.min_ram_mb)
+                facts["branch"] = (
+                    "с паузой по свободной памяти (MemAvailable)" if pause else "временный воркер"
+                )
+                store.set_current(entry_b.id, entry_b.revision)
+                results: list[tuple[str, float]] = []
+
+                def on_switch_finished(result: str) -> None:
+                    safe_result = result if result in ("ok", "failed") else "failed"
+                    results.append((safe_result, time.monotonic()))
+
+                runtime.on_switch_finished = on_switch_finished
+                switched = time.monotonic()
+                switch_model_called = True
+                runtime.switch_model(min_ram_mb=entry_b.min_ram_mb, pause=pause)
+                if not until(lambda: bool(results), CATALOG_SWITCH_TIMEOUT_S):
+                    raise CatalogSwitchError("Таймаут переключения модели")
+                facts["result"] = results[0][0]
+                facts["switch_ms"] = round((results[0][1] - switched) * 1000, 1)
+                facts["old_stopped"] = old_process.poll() is not None
+                loaded = runtime._loaded_model
+                facts["loaded_is_b"] = (loaded.get("model_id"), loaded.get("revision")) == (
+                    entry_b.id,
+                    entry_b.revision,
+                )
+                selected = store.current()
+                facts["current_is_b"] = selected is not None and (
+                    selected.id,
+                    selected.revision,
+                ) == (
+                    entry_b.id,
+                    entry_b.revision,
+                )
+                new_process = runtime.supervisor.process
+                facts["new_pid"] = new_process.pid if new_process is not None else None
+                facts["new_process"] = (
+                    new_process is not None
+                    and new_process.poll() is None
+                    and new_process.pid != old_pid
+                )
+            finally:
+                if runtime is not None:
+                    processes = [
+                        process
+                        for process in (
+                            old_process,
+                            getattr(runtime.supervisor, "process", None),
+                            getattr(getattr(runtime, "_switch_candidate", None), "process", None),
+                        )
+                        if process is not None
+                    ]
+                    runtime.shutdown()
+                    facts["workers_stopped"] = all(
+                        process.poll() is not None for process in processes
+                    )
+    except (OSError, RuntimeError, ValueError, KeyboardInterrupt) as exc:
+        interrupted = isinstance(exc, KeyboardInterrupt)
+        facts["result"] = "failed"
+        facts["explanation"] = (
+            str(exc) if isinstance(exc, CatalogSwitchError) else type(exc).__name__
+        )
+    finally:
+        try:
+            if previous_handlers:
+                previous_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+                )
+                try:
+                    restore_current()
+                except KeyboardInterrupt:
+                    interrupted = True
+                    facts.setdefault("explanation", "KeyboardInterrupt")
+                except Exception:
+                    prior = f"{selected_ref[0]}@{selected_ref[1]}" if selected_ref else "не выбрана"
+                    facts["explanation"] = (
+                        f"Не удалось вернуть прежний выбор модели ({prior})"
+                        " — выберите её в настройках"
+                    )
+                    interrupted = True
+                finally:
+                    try:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                    except KeyboardInterrupt:
+                        interrupted = True
+                        facts.setdefault("explanation", "KeyboardInterrupt")
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
+    code = catalog_switch_exit_code(facts["result"], facts["old_stopped"], facts["loaded_is_b"])
+    if facts.get("explanation") and (not switch_model_called or interrupted):
+        code = 2
+    if code != 2 and not facts["new_process"]:
+        code = 1
+    if code != 2 and not facts["workers_stopped"]:
+        code = 1
+    facts["exit_code"] = code
+    return code, facts
+
+
+def catalog(args: argparse.Namespace) -> int:
+    """Общий вход: подписанный каталог и локальное хранилище, без загрузок."""
+    lock = None
+    locked = False
+    try:
+        if args.switch and (
+            args.store is None or args.store.resolve() == paths.model_store_dir().resolve()
+        ):
+            from PyQt5.QtCore import QLockFile
+
+            lock = QLockFile(str(paths.lock_path()))
+            if not lock.tryLock(paths.LOCK_TIMEOUT_MS):
+                facts = {
+                    "command": "catalog",
+                    "mode": "switch",
+                    "result": "failed",
+                    "loaded_is_b": False,
+                    "current_is_b": False,
+                    "explanation": "Закройте Astra Voice и повторите проверку",
+                    "exit_code": 2,
+                }
+                return catalog_report(args, 2, facts)
+            locked = True
+        entries = load_catalog().entries
+        store = ModelStore(args.store if args.store is not None else paths.model_store_dir())
+        code, facts = (
+            catalog_all(args, entries, store) if args.all else catalog_switch(args, entries, store)
+        )
+    except Exception as exc:
+        code = 2
+        facts = {
+            "command": "catalog",
+            "mode": "all" if args.all else "switch",
+            "rows": [],
+            "verdict": "прогон невозможен",
+            "explanation": type(exc).__name__,
+            "exit_code": 2,
+        }
+    finally:
+        if locked and lock is not None:
+            lock.unlock()
+    return catalog_report(args, code, facts)
+
+
+def catalog_report(args: argparse.Namespace, code: int, facts: dict[str, Any]) -> int:
+    """Выводит только проверенные факты каталога."""
+    if args.json:
+        print(json.dumps(facts, ensure_ascii=False), flush=True)
+    elif args.all:
+        print(format_catalog_table(facts["rows"]))
+        print(f"Итог: {facts['verdict']}; код {code}.")
+        if facts.get("explanation"):
+            print(facts["explanation"])
+    else:
+        print(
+            f"Итог: {facts.get('result', 'failed')}; "
+            f"переключение: {facts.get('switch_ms')} мс; ветка: {facts.get('branch', '')}."
+        )
+        print(
+            f"Старый воркер остановлен: {'да' if facts.get('old_stopped') else 'нет'}; "
+            f"загружена модель B: {'да' if facts.get('loaded_is_b') else 'нет'}; "
+            f"выбор в хранилище B: {'да' if facts.get('current_is_b') else 'нет'}; "
+            f"новый процесс (pid {facts.get('new_pid')}): "
+            f"{'да' if facts.get('new_process') else 'нет'}."
+        )
+        if facts.get("explanation"):
+            print(facts["explanation"])
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     """Разбирает подкоманды; новые проверки добавляются отдельными обработчиками."""
     parser = argparse.ArgumentParser(description="Проверки Astra Voice без GUI")
@@ -1057,13 +1840,36 @@ def main(argv: list[str] | None = None) -> int:
         help="проверить закрытый сетевой гейт",
     )
     private.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    models = commands.add_parser("catalog", help="проверить установленные модели и переключение")
+    mode = models.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--all", action="store_true", help="смоук каждой установленной модели")
+    mode.add_argument("--switch", action="store_true", help="проверить смену двух моделей")
+    models.add_argument("--store", type=Path, metavar="DIR", help="локальное хранилище моделей")
+    models.add_argument(
+        "--timeout",
+        type=positive_finite,
+        default=CATALOG_MODEL_TIMEOUT_S,
+        help="таймаут одной модели, с; для --switch игнорируется",
+    )
+    models.add_argument("--from", dest="from_ref", type=parse_model_ref, metavar="ID@REV")
+    models.add_argument("--to", dest="to_ref", type=parse_model_ref, metavar="ID@REV")
+    models.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    probe = commands.add_parser("_catalog-probe", help=argparse.SUPPRESS)
+    probe.add_argument("--model-dir", type=Path, required=True)
+    probe.add_argument("--layout", required=True)
+    probe.add_argument("--variant", required=True)
+    probe.add_argument("--wav", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.command == "catalog" and args.all and (args.from_ref or args.to_ref):
+        parser.error("--from/--to применимы только с --switch")
     handlers = {
         "worker-cancel": worker_cancel,
         "dictation": dictation,
         "stats": stats,
         "downloads": downloads,
         "privacy": privacy,
+        "catalog": catalog,
+        "_catalog-probe": catalog_probe,
     }
     return handlers[args.command](args)
 

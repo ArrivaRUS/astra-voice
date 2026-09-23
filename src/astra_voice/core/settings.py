@@ -123,8 +123,8 @@ def _quarantine(path: Path) -> None:
         log.warning("%s испорчен, переименован в %s, беру значения по умолчанию", path, backup)
 
 
-def load(path: Path | None = None) -> Settings:
-    """Читает настройки; при любой порче возвращает дефолты."""
+def load(path: Path | None = None, *, quarantine: bool = True) -> Settings:
+    """Читает настройки; при порче возвращает дефолты, при необходимости сохраняя файл."""
     if path is None:
         from astra_voice.core.paths import settings_path
 
@@ -139,10 +139,12 @@ def load(path: Path | None = None) -> Settings:
     try:
         data = json.loads(raw)
     except ValueError:
-        _quarantine(path)
+        if quarantine:
+            _quarantine(path)
         return Settings()
     if not isinstance(data, dict):
-        _quarantine(path)
+        if quarantine:
+            _quarantine(path)
         return Settings()
     return from_dict(_migrate(data))
 

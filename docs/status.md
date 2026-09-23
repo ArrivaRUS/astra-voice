@@ -39,6 +39,7 @@
 - engine: `pytest -m engine -q`
 - build: `make deb && lintian dist/astra-voice_*.deb && tools/elf-audit --strict dist/astra-voice_*.deb`
 - validate: `tools/validate <тема> [--session kde|fly]` · `tools/benchmark --model gigaam-v3-e2e-rnnt-int8 --runs 50 --threads 4`
+- каталог: `tools/validate catalog --all|--switch` — смоук установленных моделей и проверка смены без GUI.
 - virtual mic up: `pactl load-module module-null-sink sink_name=av_test sink_properties=device.description=av_test && pactl load-module module-remap-source master=av_test.monitor source_name=av_test_mic source_properties=device.description=av_test_mic`
 - e2e dictation: `xdotool keydown ctrl+space; paplay --device=av_test data/test/test-ru-6s.wav; xdotool keyup ctrl+space; astra-voice --stats`
 - virtual mic down: `pactl unload-module module-remap-source; pactl unload-module module-null-sink`

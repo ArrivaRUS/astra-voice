@@ -142,6 +142,14 @@ def test_broken_json_is_quarantined(path: Path) -> None:
     assert not path.exists()
 
 
+@pytest.mark.parametrize("raw", ["{это не json", "[1, 2, 3]"])
+def test_broken_settings_are_not_quarantined_when_disabled(path: Path, raw: str) -> None:
+    path.write_text(raw, encoding="utf-8")
+    assert st.load(path, quarantine=False) == st.Settings()
+    assert path.read_text(encoding="utf-8") == raw
+    assert not list(path.parent.glob("settings.json.bak-*"))
+
+
 def test_non_object_json_is_quarantined(path: Path) -> None:
     path.write_text("[1, 2, 3]", encoding="utf-8")
     st.load(path)
