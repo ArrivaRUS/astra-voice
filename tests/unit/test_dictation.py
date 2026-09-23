@@ -167,6 +167,7 @@ class Rig:
         self.device_selected = Mock()
         self.device_resolved = Mock()
         self.silent = Mock()
+        self.idle = Mock()
         self.backend = Mock(spec=HotkeyBackend)
         self.backend.grab_combo.return_value = GrabResult("ok", keycode=65)
         self.backend.grab_escape.return_value = GrabResult("ok", keycode=9)
@@ -196,6 +197,7 @@ class Rig:
             on_device_selected=self.device_selected,
             on_device_resolved=self.device_resolved,
             on_silent=self.silent,
+            on_idle=self.idle,
             log=logging.getLogger("test.dictation"),
         )
         self.hotkey.on_state = self.core.on_hotkey_state
@@ -307,6 +309,26 @@ def rig() -> Rig:
 def assert_phase(rig: Rig, expected: DictationPhase) -> None:
     """Читает фазу заново после событий, не сохраняя сужение типа mypy."""
     assert rig.core.phase == expected
+
+
+@pytest.mark.parametrize(
+    "previous",
+    [DictationPhase.RECORDING, DictationPhase.PROCESSING, DictationPhase.FINISHING],
+)
+def test_on_idle_runs_once_when_returning_from_any_phase(
+    rig: Rig, previous: DictationPhase
+) -> None:
+    rig.core._change_phase(previous)
+    rig.core._change_phase(DictationPhase.IDLE)
+    rig.core._change_phase(DictationPhase.IDLE)
+    rig.idle.assert_called_once_with()
+
+
+def test_on_idle_failure_does_not_escape_phase_change(rig: Rig) -> None:
+    rig.idle.side_effect = RuntimeError("secret")
+    rig.core._change_phase(DictationPhase.RECORDING)
+    rig.core._change_phase(DictationPhase.IDLE)
+    assert rig.core.phase == DictationPhase.IDLE
 
 
 def test_full_ptt_cycle_and_timings(rig: Rig) -> None:

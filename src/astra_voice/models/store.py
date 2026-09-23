@@ -405,20 +405,35 @@ class ModelStore:
                 directory = directory.parent
             return shutil.disk_usage(directory).free * 5 >= size_bytes * 6
 
-    def ram_ok(self, min_ram_mb: int) -> bool:
-        """Проверяет MemTotal; неизвестный объём памяти не блокирует пользователя."""
+    def _memory_kb(self, field: str) -> int | None:
+        """Читает поле meminfo; повреждённые или отсутствующие данные неизвестны."""
         try:
             for line in MEMINFO_PATH.read_text(encoding="utf-8").splitlines():
                 fields = line.split()
-                if fields and fields[0] == "MemTotal:":
+                if fields and fields[0] == f"{field}:":
                     if len(fields) != 3 or fields[2] != "kB" or int(fields[1]) < 0:
-                        raise ValueError("Неверный формат MemTotal.")
-                    return int(fields[1]) >= min_ram_mb * 1024
+                        raise ValueError(f"Неверный формат {field}.")
+                    return int(fields[1])
         except (OSError, ValueError) as exc:
             log.warning("Не удалось определить объём памяти по %s: %s", MEMINFO_PATH, exc)
-            return True
-        log.warning("В %s отсутствует MemTotal; проверка памяти пропущена.", MEMINFO_PATH)
-        return True
+            return None
+        log.warning("В %s отсутствует %s; проверка памяти пропущена.", MEMINFO_PATH, field)
+        return None
+
+    def mem_total_mb(self) -> float | None:
+        """Возвращает полный объём памяти в МБ или None."""
+        total = self._memory_kb("MemTotal")
+        return None if total is None else total * 1024 / 1_000_000
+
+    def mem_available_mb(self) -> float | None:
+        """Возвращает доступную память в МБ или None."""
+        available = self._memory_kb("MemAvailable")
+        return None if available is None else available * 1024 / 1_000_000
+
+    def ram_ok(self, min_ram_mb: int) -> bool:
+        """Проверяет MemTotal; неизвестный объём памяти не блокирует пользователя."""
+        total_kb = self._memory_kb("MemTotal")
+        return total_kb is None or total_kb * 1024 >= min_ram_mb * 1_000_000
 
     def recover_incomplete(self) -> tuple[str, ...]:
         """Удаляет staging прошлых запусков и старые каталоги, продолжая после ошибок."""

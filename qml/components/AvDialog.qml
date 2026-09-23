@@ -105,36 +105,35 @@ Dialog {
     }
 
     contentItem: Item {
-        implicitHeight: Theme.dialogBodyPaddingTop + bodyLine.implicitHeight + Theme.dialogBodyPaddingBottom
+        implicitHeight: Theme.dialogBodyPaddingTop
+            + Math.max(bodyText.paintedHeight, root.iconName !== "" ? Theme.noteBannerIcon : 0)
+            + Theme.dialogBodyPaddingBottom
 
-        RowLayout {
-            id: bodyLine
+        Icon {
+            id: bodyIcon
             x: Theme.dialogBodyPaddingX
             y: Theme.dialogBodyPaddingTop
-            width: Math.max(0, parent.width - Theme.dialogBodyPaddingX * 2)
-            spacing: Theme.dialogBodyGap
+            name: root.iconName
+            visible: name !== ""
+            size: Theme.noteBannerIcon
+            color: Theme.fgMuted
+        }
 
-            Icon {
-                name: root.iconName
-                visible: name !== ""
-                size: Theme.noteBannerIcon
-                color: Theme.fgMuted
-                Layout.alignment: Qt.AlignTop
-            }
-
-            Text {
-                text: root.message
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontBodySize
-                lineHeight: Theme.fontBodySize * Theme.fontBodyLineHeight
-                lineHeightMode: Text.FixedHeight
-                color: Theme.fg
-                textFormat: Text.PlainText
-                wrapMode: Text.WordWrap
-                renderType: Text.NativeRendering
-                Layout.fillWidth: true
-                Layout.alignment: Qt.AlignTop
-            }
+        Text {
+            id: bodyText
+            x: Theme.dialogBodyPaddingX + (bodyIcon.visible
+                ? Theme.noteBannerIcon + Theme.dialogBodyGap : 0)
+            y: Theme.dialogBodyPaddingTop
+            width: Math.max(0, root.width - x - Theme.dialogBodyPaddingX)
+            text: root.message
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.fontBodySize
+            lineHeight: Theme.fontBodySize * Theme.fontBodyLineHeight
+            lineHeightMode: Text.FixedHeight
+            color: Theme.fg
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            renderType: Text.NativeRendering
         }
     }
 
@@ -166,6 +165,8 @@ Dialog {
 
             AvButton {
                 text: root.cancelText
+                // Пустой текст оставляет в диалоге только первичную кнопку.
+                visible: root.cancelText !== ""
                 variant: "secondary"
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: root.reject()

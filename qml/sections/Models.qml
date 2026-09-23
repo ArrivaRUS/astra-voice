@@ -4,6 +4,7 @@
 // Кнопки остались только у установленной модели («Сделать рабочей», «Удалить»,
 // «Обновить»); «Установить из файла или папки…» живёт в шапке раздела (§5.6).
 import QtQuick 2.15
+import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import ".."
 import "../components"
@@ -18,6 +19,34 @@ Item {
 
     // Фильтр раздела: «Все языки» или только отечественные модели (§5.6).
     property bool domesticOnly: false
+
+    Component.onDestruction: {
+        removeDialog.close();
+        unavailableDialog.close();
+    }
+
+    function requestRemoval(modelId) {
+        for (var i = 0; i < root.entries.length; ++i) {
+            var entry = root.entries[i];
+            if (entry.id !== modelId)
+                continue;
+            if (entry.badge === "active") {
+                unavailableDialog.modelName = entry.name;
+                unavailableDialog.heading = qsTr("Сначала выберите другую модель");
+                unavailableDialog.message = qsTr("%1 сейчас активна — без модели диктовка работать не будет. Выберите другую установленную модель, после этого удаление станет доступно.").arg(unavailableDialog.modelName);
+                unavailableDialog.open();
+            } else {
+                removeDialog.modelId = modelId;
+                removeDialog.modelName = entry.name;
+                removeDialog.modelSize = entry.sizeText;
+                removeDialog.bridge = root.settings;
+                removeDialog.heading = qsTr("Удалить %1?").arg(removeDialog.modelName);
+                removeDialog.message = qsTr("С диска будет удалено %1 из папки моделей. Настройки и статистика останутся.").arg(removeDialog.modelSize);
+                removeDialog.open();
+            }
+            return;
+        }
+    }
 
     readonly property var shownEntries: {
         if (!root.domesticOnly)
@@ -64,6 +93,7 @@ Item {
     component CatalogCard: OnboardingModelCard {
         property var entry: ({})
         property var bridge: null
+        property var removalSection: null
 
         modelId: entry.id !== undefined ? entry.id : ""
         modelTitle: entry.name !== undefined ? entry.name : ""
@@ -76,6 +106,10 @@ Item {
         badge: entry.badge !== undefined ? entry.badge : ""
         cardState: entry.state !== undefined ? entry.state : "available"
         message: entry.message !== undefined ? entry.message : ""
+        hint: entry.hint !== undefined ? entry.hint : ""
+        hintKind: entry.hintKind !== undefined ? entry.hintKind : ""
+        canSwitchWithPause: entry.canSwitchWithPause !== undefined
+            ? entry.canSwitchWithPause : false
         vendor: entry.vendor !== undefined ? entry.vendor : ""
         metrics: entry.metrics !== undefined ? entry.metrics : []
         tags: entry.tags !== undefined ? entry.tags : []
@@ -87,7 +121,9 @@ Item {
         onCancelRequested: { if (bridge) bridge.cancelDownloads(); }
         onOpenFolderRequested: { if (bridge) bridge.openModelsFolder(); }
         onActivateRequested: { if (bridge) bridge.makeModelCurrent(entry.id); }
-        onRemoveRequested: { if (bridge) bridge.removeModel(entry.id); }
+        onSwitchWithPauseRequested: { if (bridge) bridge.switchModelWithPause(entry.id); }
+        onReinstallRequested: { if (bridge) bridge.reinstallModel(entry.id); }
+        onRemoveRequested: { if (removalSection) removalSection.requestRemoval(entry.id); }
         onUpdateRequested: { if (bridge) bridge.updateModel(entry.id); }
     }
 
@@ -148,7 +184,11 @@ Item {
 
                 Repeater {
                     model: root.installedEntries
-                    CatalogCard { entry: modelData; bridge: root.settings }
+                    CatalogCard {
+                        entry: modelData
+                        bridge: root.settings
+                        removalSection: root
+                    }
                 }
             }
         }
@@ -168,7 +208,11 @@ Item {
 
                 Repeater {
                     model: root.availableEntries
-                    CatalogCard { entry: modelData; bridge: root.settings }
+                    CatalogCard {
+                        entry: modelData
+                        bridge: root.settings
+                        removalSection: root
+                    }
                 }
             }
         }
@@ -254,5 +298,33 @@ Item {
                 onClicked: { if (root.settings) root.settings.startSelectedDownloads(); }
             }
         }
+    }
+
+    AvDialog {
+        id: removeDialog
+        parent: root.Overlay.overlay ? root.Overlay.overlay : root
+        property string modelId: ""
+        property string modelName: ""
+        property string modelSize: ""
+        property var bridge: null
+        iconName: "trash"
+        note: qsTr("Скачать модель заново можно в любой момент.")
+        confirmText: qsTr("Удалить")
+        cancelText: qsTr("Отмена")
+        onConfirmed: {
+            var id = removeDialog.modelId;
+            removeDialog.modelId = "";
+            if (id !== "" && removeDialog.bridge)
+                removeDialog.bridge.removeModel(id);
+        }
+        onCancelled: removeDialog.modelId = ""
+    }
+
+    AvDialog {
+        id: unavailableDialog
+        parent: root.Overlay.overlay ? root.Overlay.overlay : root
+        property string modelName: ""
+        confirmText: qsTr("Понятно")
+        cancelText: ""
     }
 }

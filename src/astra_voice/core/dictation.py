@@ -153,6 +153,7 @@ class DictationOrchestrator:
         on_device_selected: Callable[[str], None] | None = None,
         on_device_resolved: Callable[[str], None] | None = None,
         on_silent: Callable[[], None] | None = None,
+        on_idle: Callable[[], None] | None = None,
     ) -> None:
         self._send = send
         self._generation = generation
@@ -176,6 +177,7 @@ class DictationOrchestrator:
         self._on_device_selected = on_device_selected
         self._on_device_resolved = on_device_resolved
         self._on_silent = on_silent
+        self._on_idle = on_idle
         self._resolved_device: str = ""
         self._announced_selected_device: str | None = None
         self._audio_opened = False
@@ -1082,8 +1084,11 @@ class DictationOrchestrator:
                 self._log.warning("диктовка: статистика недоступна")
 
     def _change_phase(self, phase: DictationPhase) -> None:
+        previous = self._phase
         self._phase = phase
         self._log.debug("диктовка: фаза %s", phase.value)
+        if phase == DictationPhase.IDLE and previous != phase and self._on_idle is not None:
+            self._safe_ui(self._on_idle, "диктовка: не удалось обработать простой")
 
     def _later(self, milliseconds: int, callback: Callable[[], None]) -> None:
         self._timer_serial += 1

@@ -83,6 +83,8 @@ log = logging.getLogger(__name__)
 SELFCHECK_TIMEOUT_S = 3.0
 SELFCHECK_WATCHDOG_MS = 3000
 PREPARING_WATCHDOG_MS = 30_000
+# Хватает на запуск воркера, загрузку большой модели и повтор самопроверки.
+SWITCH_TIMEOUT_S = 60.0
 REGRAB_INTERVAL_MS = 30000
 _NOTIFICATION_ACTIONS = (ACTION_CHOOSE_HOTKEY, ACTION_SHOW_DETAILS, ACTION_CHOOSE_MICROPHONE)
 
@@ -139,6 +141,16 @@ class DictationRuntime(QObject):
         self._revoked_notified = False
         self.on_quit_requested: Callable[[], None] | None = None
         self.on_show_requested: Callable[[], None] | None = None
+        self.on_switch_finished: Callable[[str], None] | None = None
+        self._pending_switch: tuple[int, bool] | None = None
+        self._switch_candidate: WorkerSupervisor | None = None
+        self._switch_request: dict[str, Any] | None = None
+        self._switch_loaded_event: dict[str, Any] | None = None
+        self._switch_in_progress = False
+        self._switch_paused = False
+        self._switch_promoted = False
+        self._switch_request_sent = False
+        self._switch_timer: QTimer | None = None
         self._resolved_device = ""
         self._on_device_resolved: Callable[[str], None] | None = None
         self.sound = sound_factory(session_kind)
@@ -215,6 +227,7 @@ class DictationRuntime(QObject):
                 on_device_selected=notify.notify_microphone_selected,
                 on_device_resolved=self._device_resolved,
                 on_silent=self._microphone_silent,
+                on_idle=self._run_pending_switch,
             )
             rollback.append(("оркестратор", self.orchestrator.shutdown))
             self.supervisor = supervisor_factory(on_event=self._on_worker_event, use_qt=True)
@@ -353,6 +366,147 @@ class DictationRuntime(QObject):
             return
         self.restart_worker(wait_for_model=True)
 
+    def can_switch_without_pause(self, min_ram_mb: int) -> bool:
+        """Проверяет свободную память с запасом для второго воркера."""
+        store = self.model_store or ModelStore(paths.model_store_dir())
+        available = store.mem_available_mb()
+        return available is not None and available >= min_ram_mb + 200
+
+    def switch_model(self, *, min_ram_mb: int, pause: bool = False) -> None:
+        """Меняет выбранную модель после завершения текущей диктовки."""
+        if self._closed or self._pending_switch is not None or self._switch_active():
+            return
+        if self.phase != DictationPhase.IDLE:
+            self._pending_switch = (min_ram_mb, pause)
+            return
+        self._begin_switch(min_ram_mb, pause)
+
+    def _switch_active(self) -> bool:
+        return self._switch_in_progress
+
+    def _finish_switch(self, result: str) -> None:
+        if not self._switch_in_progress:
+            return
+        self._switch_in_progress = False
+        self._switch_paused = False
+        self._switch_promoted = False
+        self._switch_request_sent = False
+        timer, self._switch_timer = self._switch_timer, None
+        if timer is not None:
+            self.cancel_timer(timer)
+        candidate, self._switch_candidate = self._switch_candidate, None
+        self._switch_request = None
+        self._switch_loaded_event = None
+        if candidate is not None:
+            self._cleanup("временный воркер", candidate.stop)
+        if self.on_switch_finished is not None and not self._closed:
+            self.on_switch_finished(result)
+
+    def _switch_watchdog(self) -> None:
+        # schedule уже снял сработавший таймер.
+        self._switch_timer = None
+        if self._switch_promoted:
+            # Новый воркер уже рабочий; ожидание самопроверки не держит раздел.
+            self._finish_switch("ok")
+            return
+        paused = self._switch_paused
+        # Подписчик синхронно возвращает прежнюю рабочую модель до нового hello.
+        self._finish_switch("failed")
+        if paused:
+            self.restart_worker(wait_for_model=True)
+
+    def _begin_switch(self, min_ram_mb: int, pause: bool) -> None:
+        self._switch_in_progress = True
+        self._switch_timer = self.schedule(int(SWITCH_TIMEOUT_S * 1000), self._switch_watchdog)
+        try:
+            request = self._resolve_model_request()
+            if request is None:
+                raise ValueError("Модель не выбрана")
+            ipc.encode(request)
+            if request["threads"] < 1 or request["min_ram_mb"] < 1:
+                raise ValueError("Неверные параметры модели")
+        except Exception:
+            log.warning("Не удалось подготовить переключение модели")
+            self._finish_switch("failed")
+            return
+        if not pause:
+            try:
+                enough_memory = self.can_switch_without_pause(min_ram_mb)
+            except Exception:
+                enough_memory = False
+            if not enough_memory:
+                self._finish_switch("failed")
+                return
+        if pause:
+            self._switch_paused = True
+            try:
+                self.restart_worker(wait_for_model=True, _for_switch=True)
+            except Exception:
+                self._finish_switch("failed")
+            return
+        candidate: WorkerSupervisor | None = None
+        try:
+            candidate = self._supervisor_factory(
+                on_event=lambda event: self._on_candidate_event(candidate, event), use_qt=True
+            )
+            candidate.generation = self.supervisor.generation + 1
+            self._switch_candidate = candidate
+            self._switch_request = request
+            candidate.start()
+        except Exception:
+            self._finish_switch("failed")
+
+    def _on_candidate_event(self, source: WorkerSupervisor | None, event: dict[str, Any]) -> None:
+        """Не пропускает события кандидата в текущую диктовку."""
+        if self._closed:
+            return
+        if source is self.supervisor:
+            self._on_worker_event(event)
+            return
+        candidate = self._switch_candidate
+        if candidate is None or source is not candidate:
+            return
+        if event.get("type") == "hello" and event.get("generation") == candidate.generation:
+            try:
+                assert self._switch_request is not None
+                candidate.send(self._switch_request, timeout=10.0)
+            except Exception:
+                self._fail_candidate()
+            return
+        if event.get("type") == "model.loaded" and event.get("generation") == candidate.generation:
+            if self._switch_loaded_event is not None:
+                return
+            self._switch_loaded_event = event
+            if self.phase == DictationPhase.IDLE:
+                self._promote_candidate()
+            return
+        if event.get("type") == "error":
+            # Ошибка загрузки может относиться к поколению до автоматического рестарта.
+            self._fail_candidate()
+
+    def _promote_candidate(self) -> None:
+        candidate = self._switch_candidate
+        event = self._switch_loaded_event
+        if candidate is not None and event is not None and self.phase == DictationPhase.IDLE:
+            request = self._switch_request
+            assert request is not None
+            old = self.supervisor
+            self._switch_candidate = None
+            self._switch_request = None
+            self._switch_loaded_event = None
+            self._cleanup("прежний воркер", old.stop)
+            self.supervisor = candidate
+            self._switch_promoted = True
+            self._reset_selfcheck()
+            self._loading_model = True
+            self._model_load_generation = candidate.generation
+            self._model_load_request = request
+            self._model_load_failures = 0
+            self._on_worker_event(event)
+
+    def _fail_candidate(self) -> None:
+        self._finish_switch("failed")
+
     def _fail_pending_test(self) -> None:
         self._cancel_preparing_timer()
         pending, self._pending_test = self._pending_test, None
@@ -384,7 +538,11 @@ class DictationRuntime(QObject):
             self._finish_selfcheck("worker-error")
 
     def restart_worker(
-        self, *, retry_selfcheck: bool = False, wait_for_model: bool = False
+        self,
+        *,
+        retry_selfcheck: bool = False,
+        wait_for_model: bool = False,
+        _for_switch: bool = False,
     ) -> None:
         """Заменяет супервизор, сохраняя уникальность поколений между заменами.
 
@@ -394,6 +552,8 @@ class DictationRuntime(QObject):
         """
         if self._closed:
             return
+        if self._switch_active() and not (_for_switch or retry_selfcheck):
+            self._finish_switch("failed")
         # После пользовательского сброса хоткей закрыт уже до первого hello.
         self._loading_model = wait_for_model or retry_selfcheck or self._selfcheck == "failed"
         self._reset_selfcheck(retry=retry_selfcheck)
@@ -422,13 +582,17 @@ class DictationRuntime(QObject):
     def _load_model(self) -> None:
         """Загружает настроенную модель при каждом запуске нового воркера."""
         if self._model_load_generation == self.supervisor.generation:
+            if self._switch_active():
+                self._finish_switch("failed")
             return
         if self._selfcheck == "failed":
             # После провала новую серию разрешает только жест пользователя.
+            self._finish_switch("failed")
             return
         self._reset_selfcheck(retry=self._selfcheck == "retrying")
         self._loading_model = False
         if self._model_load_failures >= 2:
+            self._finish_switch("failed")
             self._fail_pending_test()
             log.warning("Загрузка модели остановлена после двух неудачных попыток подряд")
             self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
@@ -437,10 +601,12 @@ class DictationRuntime(QObject):
         try:
             request = self._resolve_model_request()
         except ModelRevoked:
+            self._finish_switch("failed")
             self._fail_pending_test()
             self._model_revoked()
             return
         if request is None:
+            self._finish_switch("failed")
             self._fail_pending_test()
             log.info("модель в настройках не указана")
             if self._selfcheck == "retrying":
@@ -450,7 +616,8 @@ class DictationRuntime(QObject):
             ipc.encode(request)
             if request["threads"] < 1 or request["min_ram_mb"] < 1:
                 raise ValueError
-        except (ipc.FrameError, TypeError, ValueError):
+        except (ipc.FrameError, KeyError, TypeError, ValueError):
+            self._finish_switch("failed")
             self._fail_pending_test()
             self._model_load_failures += 1
             if self._selfcheck == "retrying":
@@ -467,7 +634,10 @@ class DictationRuntime(QObject):
             self.pill.show_state(PillState.LOADING_MODEL)
         try:
             self.supervisor.send(request, timeout=10.0)
+            if self._switch_paused:
+                self._switch_request_sent = True
         except Exception:
+            self._finish_switch("failed")
             self._loading_model = False
             self._fail_pending_test()
             self._model_load_failures += 1
@@ -585,7 +755,11 @@ class DictationRuntime(QObject):
             return
         if reason == "ok":
             self._model_ready()
+            if self._switch_active() and self._switch_candidate is None:
+                self._finish_switch("ok")
         else:
+            if self._switch_active() and self._switch_candidate is None:
+                self._finish_switch("failed")
             self._loading_model = False
             self._fail_pending_test()
             self.tray.set_model_recheck_enabled(True)
@@ -600,6 +774,13 @@ class DictationRuntime(QObject):
 
     def _on_worker_event(self, event: dict[str, Any]) -> None:
         """Обрабатывает загрузку модели и передаёт исходное событие оркестратору."""
+        if self._switch_paused and self._switch_request_sent:
+            if event.get("type") == "error" and (
+                event.get("request_type") == "model.load"
+                or event.get("response_type") == "model.loaded"
+                or event.get("code") == "restart-limit"
+            ):
+                self._finish_switch("failed")
         if (
             not self._closed
             and event.get("generation") == self.supervisor.generation
@@ -659,6 +840,7 @@ class DictationRuntime(QObject):
                 event.get("request_type") == "model.load"
                 or event.get("response_type") == "model.loaded"
             ):
+                self._finish_switch("failed")
                 self._loading_model = False
                 self._fail_pending_test()
                 self._model_load_failures += 1
@@ -904,6 +1086,13 @@ class DictationRuntime(QObject):
         timer.start(ms)
         return timer
 
+    def _run_pending_switch(self) -> None:
+        self._promote_candidate()
+        if not self._closed and self.phase == DictationPhase.IDLE and self._pending_switch:
+            min_ram_mb, pause = self._pending_switch
+            self._pending_switch = None
+            self._begin_switch(min_ram_mb, pause)
+
     def cancel_timer(self, handle: object) -> None:
         """Останавливает доставку и освобождает ручку, включая отложенный повтор."""
         timer = cast(QTimer, handle)
@@ -1030,6 +1219,19 @@ class DictationRuntime(QObject):
         if self._closed:
             return
         self._closed = True
+        self._pending_switch = None
+        timer, self._switch_timer = self._switch_timer, None
+        if timer is not None:
+            self.cancel_timer(timer)
+        self._switch_in_progress = False
+        self._switch_paused = False
+        self._switch_promoted = False
+        self._switch_request_sent = False
+        self._switch_request = None
+        self._switch_loaded_event = None
+        candidate, self._switch_candidate = self._switch_candidate, None
+        if candidate is not None:
+            self._cleanup("временный воркер", candidate.stop)
         self._cancel_preparing_timer()
         if self._pending_test is not None:
             self.stop_test()

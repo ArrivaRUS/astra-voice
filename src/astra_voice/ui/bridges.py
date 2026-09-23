@@ -263,9 +263,19 @@ class SettingsBridge(QObject):
             self._downloads.makeModelCurrent(model_id)
 
     @pyqtSlot(str)
+    def switchModelWithPause(self, model_id: str) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.switchModelWithPause(model_id)
+
+    @pyqtSlot(str)
     def removeModel(self, model_id: str) -> None:  # noqa: N802
         if self._downloads is not None:
             self._downloads.removeModel(model_id)
+
+    @pyqtSlot(str)
+    def reinstallModel(self, model_id: str) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.reinstallModel(model_id)
 
     @pyqtSlot(str)
     def updateModel(self, model_id: str) -> None:  # noqa: N802

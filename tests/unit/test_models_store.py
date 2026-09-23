@@ -832,7 +832,8 @@ def test_disk_usage_uses_existing_root(store: ModelStore, monkeypatch: pytest.Mo
 
 
 @pytest.mark.parametrize(
-    "total,minimum,expected", [(2048, 1, True), (2048, 2, True), (2048, 3, False), (2047, 2, False)]
+    "total,minimum,expected",
+    [(2048, 1, True), (2048, 2, True), (2048, 3, False), (1953, 2, False), (1954, 2, True)],
 )
 def test_ram_memtotal(
     tmp_path: Path,
@@ -865,6 +866,29 @@ def test_unknown_ram_does_not_block(
     monkeypatch.setattr(st, "MEMINFO_PATH", meminfo)
     assert store.ram_ok(100000) is True
     assert caplog.records
+
+
+@pytest.mark.parametrize(
+    "contents,total,available",
+    [
+        ("MemTotal: 4096 kB\nMemAvailable: 3072 kB\n", 4.194304, 3.145728),
+        ("MemTotal: 2048 kB\n", 2.097152, None),
+        ("MemTotal: 1 MB\nMemAvailable: -1 kB\n", None, None),
+    ],
+)
+def test_memory_readers(
+    tmp_path: Path,
+    store: ModelStore,
+    monkeypatch: pytest.MonkeyPatch,
+    contents: str,
+    total: float | None,
+    available: float | None,
+) -> None:
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(contents)
+    monkeypatch.setattr(st, "MEMINFO_PATH", meminfo)
+    assert store.mem_total_mb() == total
+    assert store.mem_available_mb() == available
 
 
 def test_recover_cleans_partial_and_old_only(store: ModelStore) -> None:

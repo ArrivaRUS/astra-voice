@@ -23,6 +23,9 @@ Rectangle {
     property bool manageEnabled: false
     property bool updateAvailable: false
     property string message: ""
+    property string hint: ""
+    property string hintKind: ""
+    property bool canSwitchWithPause: false
     property var metrics: []
     property var tags: []
 
@@ -33,6 +36,8 @@ Rectangle {
     signal activateRequested()
     signal removeRequested()
     signal updateRequested()
+    signal switchWithPauseRequested()
+    signal reinstallRequested()
 
     readonly property bool selectionAvailable: badge === ""
         && (cardState === "available" || cardState === "failed")
@@ -48,12 +53,14 @@ Rectangle {
     readonly property bool hasError: cardState === "failed" || cardState === "no-space"
     // Отказ переключения или удаления приходит сообщением на исправной карточке.
     readonly property bool hasMessage: hasError || message !== ""
+    readonly property bool showHint: hint !== "" && !hasMessage
     readonly property string selectionMark: cardState === "no-space" ? "blocked"
         : badge !== "" || busy || cardState === "installed" ? "locked"
         : selected ? "on" : "off"
     readonly property string statusLabel: cardState === "downloading" ? qsTr("Загружается")
         : cardState === "queued" ? qsTr("В очереди")
         : cardState === "verifying" ? qsTr("Проверяю…")
+        : cardState === "switching" ? qsTr("Переключаю…")
         : badge === "active" ? qsTr("Установлена и активна")
         : badge === "installed" ? qsTr("Установлена") : ""
     readonly property bool hasMetricData: metrics.some(function(metric) {
@@ -337,7 +344,8 @@ Rectangle {
         RowLayout {
             id: bottomRow
             width: parent.width
-            visible: root.tags.length > 0 || root.busy || root.hasMessage || root.manageVisible
+            visible: root.tags.length > 0 || root.busy || root.hasMessage
+                || root.showHint || root.manageVisible
             spacing: root.footerGap
 
             Flow {
@@ -362,7 +370,7 @@ Rectangle {
             }
 
             RowLayout {
-                visible: root.busy || root.hasMessage || root.manageVisible
+                visible: root.busy || root.hasMessage || root.showHint || root.manageVisible
                 Layout.maximumWidth: root.tags.length > 0 ? bottomRow.width * 0.65 : bottomRow.width
                 spacing: root.footerGap
                 Icon {
@@ -379,6 +387,19 @@ Rectangle {
                         : root.cardState === "no-space" ? qsTr("Не хватает места на диске")
                         : qsTr("Не удалось загрузить модель")
                     color: Theme.dangerInk
+                }
+                Icon {
+                    visible: root.showHint && root.hintKind === "warning"
+                    name: "alert"
+                    size: 12
+                    color: Theme.warningInk
+                }
+                FooterText {
+                    visible: root.showHint
+                    Layout.fillWidth: true
+                    Layout.minimumWidth: 0
+                    text: root.hint
+                    color: root.hintKind === "warning" ? Theme.warningInk : Theme.fgMuted
                 }
                 AvButton {
                     visible: root.cardState === "downloading" || root.cardState === "queued"
@@ -412,6 +433,7 @@ Rectangle {
                 // Кнопки установленной модели (§5.4, состояния 19–20, 25).
                 AvButton {
                     visible: root.manageVisible && root.updateAvailable
+                        && root.cardState !== "switching" && root.cardState !== "broken"
                     Layout.minimumWidth: implicitWidth
                     small: true
                     iconName: "down"
@@ -420,6 +442,7 @@ Rectangle {
                 }
                 AvButton {
                     visible: root.manageVisible && root.badge !== "active"
+                        && root.cardState !== "switching" && root.cardState !== "broken"
                     Layout.minimumWidth: implicitWidth
                     small: true
                     variant: "primary"
@@ -427,9 +450,23 @@ Rectangle {
                     onClicked: root.activateRequested()
                 }
                 AvButton {
+                    visible: root.manageVisible && root.canSwitchWithPause
+                    Layout.minimumWidth: implicitWidth
+                    small: true
+                    text: qsTr("Переключить с паузой")
+                    onClicked: root.switchWithPauseRequested()
+                }
+                AvButton {
+                    visible: root.manageVisible && root.cardState === "broken"
+                    Layout.minimumWidth: implicitWidth
+                    small: true
+                    variant: "primary"
+                    text: qsTr("Переустановить")
+                    onClicked: root.reinstallRequested()
+                }
+                AvButton {
                     visible: root.manageVisible
-                    // Рабочую модель удалить нельзя: сначала выбирают другую (§5.4, 19).
-                    enabled: root.badge !== "active"
+                    enabled: root.cardState !== "switching"
                     Layout.minimumWidth: implicitWidth
                     small: true
                     text: qsTr("Удалить")
@@ -446,7 +483,7 @@ Rectangle {
         radius: parent.radius
         color: "transparent"
         border.width: Theme.cardBorder
-        border.color: root.badge === "active" ? Theme.accent
+        border.color: root.badge === "active" || root.cardState === "switching" ? Theme.accent
             : root.highlighted || root.busy ? Theme.primary : Theme.border
         antialiasing: true
     }

@@ -1617,6 +1617,9 @@ class FakeModelPort:
             return ""
         return "ok" if self.ready else "broken" if self.damaged else ""
 
+    def record_size_bytes(self, model_id: str, revision: str) -> int:
+        return self.entry.size_bytes
+
     def current_ids(self) -> tuple[str, str] | None:
         return (self.entry.id, self.entry.revision) if self.ready else None
 
@@ -1651,6 +1654,9 @@ class FakeModelPort:
     def ram_ok(self, min_ram_mb: int) -> bool:
         assert min_ram_mb == self.entry.min_ram_mb
         return self.ram
+
+    def mem_total_mb(self) -> float | None:
+        return None
 
     def download(
         self, entry: CatalogEntry, *, progress: Callable[[Progress], None], cancel: threading.Event
@@ -3477,6 +3483,9 @@ def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
             "badge": "",
             "state": "available",
             "message": "",
+            "hint": "",
+            "hintKind": "",
+            "canSwitchWithPause": False,
             "progress": 0.0,
             "vendor": "",
             "domestic": False,
