@@ -17,6 +17,8 @@ Rectangle {
     property bool measurementMode: false
     property int ramMb: 0
     property bool ramMeasured: false
+    readonly property bool showRam: measurementMode
+        ? (ramMb !== 0 || ramMeasured) : ramText !== ""
     property string speedKind: "no_data"
     property string speedText: ""
     property real speedValue: 0
@@ -32,7 +34,9 @@ Rectangle {
     property string message: ""
     property string hint: ""
     property string hintKind: ""
+    property bool memoryShortage: false
     property bool canSwitchWithPause: false
+    property bool canReinstall: true
     property var metrics: []
     property var tags: []
 
@@ -60,7 +64,7 @@ Rectangle {
     readonly property bool hasError: cardState === "failed" || cardState === "no-space"
     // Отказ переключения или удаления приходит сообщением на исправной карточке.
     readonly property bool hasMessage: hasError || message !== ""
-    readonly property bool showHint: hint !== "" && !hasMessage
+    readonly property bool showHint: hint !== "" && (!hasMessage || memoryShortage)
     readonly property string selectionMark: cardState === "no-space" ? "blocked"
         : badge !== "" || busy || cardState === "installed" ? "locked"
         : selected ? "on" : "off"
@@ -356,11 +360,13 @@ Rectangle {
             }
             SpaceText { text: qsTr(" на диске") }
             Item {
+                visible: root.showRam
                 width: 4 + 2 * root.footerGap
                 height: Theme.modelCardSpaceLineLineHeight
                 Dot { anchors.centerIn: parent }
             }
             SpaceText {
+                visible: root.showRam
                 text: root.measurementMode
                     ? (root.ramMeasured
                         ? qsTr("Память: %1 МБ (замерено на этом компьютере)").arg(root.ramMb)
@@ -370,7 +376,7 @@ Rectangle {
                 font.weight: root.measurementMode && root.ramMeasured ? Font.Bold : Font.Normal
             }
             SpaceText {
-                visible: !root.measurementMode
+                visible: root.showRam && !root.measurementMode
                 text: qsTr(" в памяти при работе")
             }
         }
@@ -492,6 +498,7 @@ Rectangle {
                 }
                 AvButton {
                     visible: root.manageVisible && root.cardState === "broken"
+                        && root.canReinstall
                     Layout.minimumWidth: implicitWidth
                     small: true
                     variant: "primary"
