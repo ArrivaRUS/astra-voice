@@ -1,4 +1,4 @@
-// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.2.0 — НЕ ПРАВИТЬ РУКАМИ.
+// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.3.0 — НЕ ПРАВИТЬ РУКАМИ.
 // Перегенерация: python3 scripts/gen_theme.py · проверка: python3 scripts/gen_theme.py --check
 
 pragma Singleton
@@ -171,17 +171,17 @@ QtObject {
 
     // ── size
     readonly property real sizeBodyH: 552
-    readonly property real sizeContentColMax: 760
+    readonly property real sizeContentColMax: 796
     readonly property real sizeContentColW: 672
     readonly property real sizeSheetMaxW: 900
     readonly property real sizeSidebarW: 184
     readonly property real sizeStatusbarH: 36
     readonly property real sizeTitlebarH: 32
     readonly property real sizeWindowH: 620
-    readonly property real sizeWindowMaxUsefulW: 988
+    readonly property real sizeWindowMaxUsefulW: 1024
     readonly property real sizeWindowMinH: 588
     readonly property real sizeWindowMinW: 900
-    readonly property real sizeWindowW: 900
+    readonly property real sizeWindowW: 1024
 
     // ── radius
     readonly property real radiusBadge: 5
@@ -324,27 +324,57 @@ QtObject {
     readonly property var micLevelMeterSampleLive: [9, 16, 26, 31, 20, 12, 22, 15, 8]
     readonly property var micLevelMeterSampleQuiet: [5, 7, 6, 8, 6, 5, 7, 6, 5]
     readonly property real modelCardBadgesGap: 5
+    readonly property real modelCardFooterActionsGap: 8
+    readonly property real modelCardFooterActionsMaxShare: 0.65
+    readonly property real modelCardFooterBtnTextOffset: 5
+    readonly property real modelCardFooterColsGap: 12
+    readonly property real modelCardFooterDotGap: 7
+    readonly property real modelCardFooterDotSize: 4
+    readonly property real modelCardFooterGap: 6
+    readonly property real modelCardFooterMsgGap: 5
+    readonly property real modelCardFooterMsgIconSize: 12
     readonly property real modelCardHeadGap: 6
+    readonly property real modelCardHeadMinH: 22
     readonly property bool modelCardHeadWrap: true
-    readonly property real modelCardMarginBottom: 8
+    readonly property real modelCardMarginBottom: 6
     readonly property color modelCardMetricFillEstimated: fgFaint
+    readonly property color modelCardMetricFillFair: warningInk
+    readonly property color modelCardMetricFillGood: successInk
     readonly property color modelCardMetricFillMeasured: primary
-    readonly property real modelCardMetricGap: 8
-    readonly property real modelCardMetricLabelW: 54
+    readonly property color modelCardMetricFillWeak: dangerInk
+    readonly property real modelCardMetricGap: 6
+    readonly property real modelCardMetricLabelMarginRight: 2
+    readonly property real modelCardMetricLabelW: 46
+    readonly property color modelCardMetricMeasuredMark: primary
+    readonly property real modelCardMetricMeasuredMarkGap: 6
+    readonly property real modelCardMetricMeasuredMarkSize: 11
+    readonly property real modelCardMetricMeasuredMarkStroke: 2
+    readonly property color modelCardMetricMeasuredValueColor: fg
+    readonly property int modelCardMetricMeasuredValueWeight: 500
+    readonly property color modelCardMetricNoDataBorder: fgFaint
+    readonly property color modelCardMetricNoDataValueColor: fgDisabled
+    readonly property real modelCardMetricRowH: 18
     readonly property color modelCardMetricSourceCaptionColor: fgFaint
     readonly property real modelCardMetricSourceCaptionMarginTop: 2
     readonly property real modelCardMetricSourceCaptionSize: 11.5
     readonly property color modelCardMetricTrackBg: bgSurface2
-    readonly property real modelCardMetricTrackH: 6
-    readonly property real modelCardMetricTrackRadius: 3
-    readonly property real modelCardMetricTrackW: 78
-    readonly property real modelCardMetricValueSize: 11.5
-    readonly property real modelCardMetricsGap: 5
-    readonly property real modelCardPaddingY: 9
-    readonly property real modelCardPaddingX: 13
+    readonly property real modelCardMetricTrackH: 8
+    readonly property real modelCardMetricTrackRadius: 4
+    readonly property real modelCardMetricTrackW: 60
+    readonly property color modelCardMetricValueColor: fgSecondary
+    readonly property real modelCardMetricValueSize: 12
+    readonly property real modelCardMetricValueW: 118
+    readonly property real modelCardMetricsGap: 4
+    readonly property real modelCardPaddingY: 8
+    readonly property real modelCardPaddingX: 12
+    readonly property real modelCardPurposeLineHeight: 18
     readonly property real modelCardRadius: 10
+    readonly property int modelCardScaleQualityFair: 88
+    readonly property int modelCardScaleQualityGood: 92
+    readonly property int modelCardScaleSpeedFair: 5
+    readonly property int modelCardScaleSpeedGood: 20
     readonly property real modelCardSelectBorder: 1.5
-    readonly property real modelCardSelectGap: 14
+    readonly property real modelCardSelectGap: 12
     readonly property bool modelCardSelectMultiple: true
     readonly property real modelCardSelectRadius: 5
     readonly property real modelCardSelectSize: 18
@@ -352,7 +382,7 @@ QtObject {
     readonly property color modelCardSpaceLineLabel: fgMuted
     readonly property real modelCardSpaceLineLineHeight: 18
     readonly property real modelCardSpaceLineSize: 12
-    readonly property real modelCardTopGap: 14
+    readonly property real modelCardTopGap: 12
     readonly property real noteBannerGap: 9
     readonly property real noteBannerIcon: 15
     readonly property real noteBannerPaddingY: 10
@@ -385,7 +415,7 @@ QtObject {
     readonly property real onboardingProgressStripTrackH: 6
     readonly property real onboardingProgressStripTrackW: 160
     readonly property bool onboardingSkippable: true
-    readonly property real onboardingStep2ContentW: 720
+    readonly property real onboardingStep2ContentW: 796
     readonly property int onboardingSteps: 5
     readonly property color onboardingSummaryLineColor: fg
     readonly property color onboardingSummaryLineColorWarn: dangerInk

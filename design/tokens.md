@@ -1,9 +1,12 @@
 # Токены дизайн-системы — Astra Voice
 
 > Шаг **P9 «токены»** · направление **A «Панель»** (принято на ⛔ G2, 2026-09-08).
-> Машиночитаемая версия: **`design/tokens.json`** — **661 токен**, **108 посчитанных пар** контраста
-> (96 актуальных + 12 помеченных устаревшими после правок раундов 2–3).
-> Автор: `design-engineer` · дата: 2026-09-21 · **версия 2.2.0 (раунд 4)**.
+> Машиночитаемая версия: **`design/tokens.json`** — **693 токена** (листья с `value`, 11 из них
+> помечены `deprecated`), **108 посчитанных пар** контраста
+> (96 актуальных + 12 помеченных устаревшими после правок раундов 2–3) и 6 пар заливок полосок метрик (§22).
+> Автор: `design-engineer` · дата: 2026-09-23 · **версия 2.3.0 (раунд 5)**.
+> **Раунд 5** — карточка модели «Три строки» и окно по умолчанию 1024 (решения заказчика
+> 2026-09-23, спека 0.5). Что изменилось — в §22.
 > **Раунд 4** — решения заказчика с живой проверки `0.1.0~m5.1`: карточка модели стала выбором,
 > прогресс загрузки уехал в сквозную полоску мастера. Что добавилось — в §21.
 >
@@ -171,11 +174,14 @@ font.family.mono = 'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace     
 
 | Токен | Значение | Источник |
 |---|---|---|
-| `size.window-w` × `size.window-h` | **900 × 620** | `_shell.py:29` (решение G2) |
+| `size.window-w` × `size.window-h` | **1024 × 620** (было 900 × 620) | `_shell.py:30` `W_DEF` (решение заказчика 2026-09-23) |
+| `size.window-min-w` × `size.window-min-h` | **900 × 588** (клиентская область; с декорацией 900 × 620) | `_shell.py:29` (решение В3) |
 | `size.titlebar-h` / `size.statusbar-h` | 32 / 36 | `_base.py:52,139` |
 | `size.body-h` | 552 = 620 − 32 − 36 | `_shell.py:31` |
 | `size.sidebar-w` | **184** | `_shell.py:53` |
-| `size.content-col-w` | **672** = 900 − 184 − 2×22 | `_shell.py:73` |
+| `size.content-col-w` | **672** = 900 − 184 − 2×22 — колонка при минимальном окне | `_shell.py:73` |
+| `size.content-col-max` | **796** = 1024 − 184 − 2×22 — колонка при окне по умолчанию, дальше центрируется (было 760) | `_shell.py:31` `COL_DEF` |
+| `size.window-max-useful-w` | **1024** — шире колонка не растёт (было 988) | спека §1.5 |
 | `space.window-content-x` | 22 (слева и справа от контента) | `_shell.py:67-68` |
 | `space.window-content-top` / `-bottom` | 12 / 16 | `_shell.py:67-68` |
 | `space.group-gap` | 8 (между группами настроек) | `_shell.py:27` |
@@ -188,8 +194,8 @@ font.family.mono = 'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace     
 | `component.sidebar.item-gap` | 2 | `_shell.py:57` |
 | `component.scrollbar` | ширина **8**, overlay, `AsNeeded`, отступ справа 4, r 4, `fg-faint` @ 0.45 | `decisions/log.md` (У3) |
 
-**Минимальный размер окна.** `900 × 620` — не только стартовый, но и практически минимальный
-по ширине: при W < 900 колонка контента становится уже 672 px, и карточка модели рвётся —
+**Минимальный размер окна.** С раунда 5 окно открывается в `1024 × 620`, а `900 × 620` —
+минимум по ширине: при W < 900 колонка контента становится уже 672 px, и карточка модели рвётся —
 это прямо зафиксировано в комментарии `_shell.py:73`. Поэтому `size.window-min-w = 900`.
 Минимальная высота — **588**: в макете `620` нарисовано вместе с титлбаром KWin (32 px),
 клиентской области Qt достаётся `620 − 32 = 588 = wrap 552 + статусбар 36`. Поэтому
@@ -340,19 +346,32 @@ focus — кольцо 2 px акцентом снаружи с зазором 2 
 
 ### 5.6 Карточка модели
 
-Паддинг `9 × 13`, радиус 10, отступ снизу 8, разделитель `1 px border-soft` с полями `8 0 7`.
-Активная — граница `accent` и фон `accent-bg`; рекомендованная — граница `primary`;
+**Раунд 5 — «Три строки»** (спека 0.5 §5.1–5.3, `_shell.py:88-123`). Паддинг `8 × 12`, радиус 10,
+отступ снизу 6, **разделителя нет**. Верхний блок — отметка выбора · текст · метрики, зазор **12**
+между всеми тремя. Текст слева: шапка высотой 22 + назначение 18 = 40 — вровень с блоком метрик.
+Активная — граница `accent` и фон `accent-bg`; выбранная — `primary` / `primary-bg`;
 недоступная — `fg-disabled` при `opacity: 1` (раунд 2, Р5 закрыт).
 
-Полоски метрик — то место, где макет отличает **замер от чужого бенчмарка**:
+Полоски метрик: длина — сравнение, **цвет — оценка по шкале**; замер отличается от цифр авторов
+маркером ✓ и начертанием значения, а не цветом полоски.
 
-| | Значение |
-|---|---|
-| Подпись слева | ширина **54**, 11.5 px, справа по краю |
-| Дорожка | **78 × 6**, радиус 3, фон `bg-surface-2` |
-| Заливка «замерено на этом компьютере» | **`primary`** |
-| Заливка «оценка / бенчмарк автора» | **`fg-faint`** — другой цвет **и** другая подпись |
-| Значение справа | 11.5 px, число внутри — вес 700 |
+| | Значение | Токен |
+|---|---|---|
+| Строка метрики | высота 18; две строки, зазор **4** | `metric.row-h`, `metrics-gap` |
+| Подпись слева | ширина **46** + отступ справа 2, 11.5 px, `fg-muted`, выключка вправо | `metric.label-w`, `metric.label-margin-right` |
+| Зазоры в строке | **6** | `metric.gap` |
+| Дорожка | **60 × 8**, радиус 4, фон `bg-surface-2` | `metric.track-*` |
+| Заливка «хорошо / средне / слабо» | `success-ink` / `warning-ink` / `danger-ink` | `metric.fill-good/fair/weak` |
+| Шкала точности (= 100 − WER) | ≥ 92 хорошо · 88–91,9 средне · < 88 слабо | `scale.quality-good/fair` |
+| Шкала скорости (× быстрее речи) | ≥ 20 хорошо · 5–19,9 средне · < 5 слабо | `scale.speed-good/fair` |
+| Значение справа | ширина **118**, 12 / 400, `fg-secondary`, не переносится | `metric.value-w/-size/-color` |
+| Замерено на этом компьютере | значение `fg` / 500 + маркер ✓ 11 px, линия 2, `primary`, зазор 6 | `metric.measured-*` |
+| Нет цифр | дорожка прозрачная, граница 1 px пунктиром `fg-faint`; «нет данных» курсивом `fg-disabled` | `metric.no-data-*` |
+
+Нижняя строка (одна): отступ сверху **6**; слева место, память и теги 12 / 18 `fg-muted`, числа `fg`,
+разделители — точки 4 px с зазором **7**; справа сообщение (иконка 12, зазор 5) и кнопки высотой 28,
+зазор **8**, не шире 65 % строки; между частями **12**. Когда справа кнопки, текст слева опущен на **5**.
+Токены — `component.model-card.footer.*`.
 
 ### 5.7 Прогресс и строка-статус
 
@@ -935,3 +954,75 @@ M1-C замерил три величины по референсу и врем�
 Имя `color.<тема>.focus-ring` историческое и вводит в заблуждение — оно про раскрытый список,
 а не про фокус. Не переименовываю: переименование заденет генерат `Theme.focusRing` и `AvSelect`.
 Пометка добавлена в `note` обоих ключей.
+
+## 22. Версия 2.3.0 (раунд 5) — карточка «Три строки» и окно 1024
+
+Основание: спека 0.5 (2026-09-23) §1.1, §1.4, §1.5, §5.1–5.3, §10.2; макеты
+`02-models-card-states.html` (+ `-dark`); `_shell.py` (блок CSS «Три строки», `W_DEF`, `COL_DEF`,
+`Q_GOOD/Q_FAIR/S_GOOD/S_FAIR`, `MEAS_MARK`). Значения сверены с CSS обоих HTML-макетов.
+
+### Изменённые токены
+
+| Токен (`Theme.*`) | Было | Стало |
+|---|---|---|
+| `size.window-w` (`sizeWindowW`) | 900 | **1024** |
+| `size.window-max-useful-w` (`sizeWindowMaxUsefulW`) | 988 | **1024** |
+| `size.content-col-max` (`sizeContentColMax`) | 760 | **796** |
+| `size.window-resize` (текст) | 900…988, колонка 672→760 | **900…1024, колонка 672→796, свыше — 796 по центру** |
+| `component.onboarding.step2-content-w` (`onboardingStep2ContentW`) | 720 | **796** |
+| `component.model-card.padding` (`modelCardPaddingY/X`) | 9 / 13 | **8 / 12** |
+| `component.model-card.margin-bottom` | 8 | **6** |
+| `component.model-card.top-gap` | 14 | **12** |
+| `component.model-card.select.gap` | 14 | **12** |
+| `component.model-card.metrics-gap` | 5 | **4** |
+| `component.model-card.metric.gap` | 8 | **6** |
+| `component.model-card.metric.label-w` | 54 | **46** |
+| `component.model-card.metric.track-w` | 78 | **60** |
+| `component.model-card.metric.track-h` | 6 | **8** |
+| `component.model-card.metric.track-radius` | 3 | **4** — его же читает `DownloadStrip.qml` |
+| `component.model-card.metric.value-size` | 11.5 | **12** |
+
+`size.window-min-w/h` = 900 × 588 — без изменений.
+
+### Новые токены
+
+| Токен (`Theme.*`) | Значение |
+|---|---|
+| `modelCardHeadMinH` | 22 |
+| `modelCardPurposeLineHeight` | 18 |
+| `modelCardMetricRowH` | 18 |
+| `modelCardMetricLabelMarginRight` | 2 |
+| `modelCardMetricValueW` | 118 |
+| `modelCardMetricValueColor` | `fgSecondary` |
+| `modelCardMetricFillGood` / `Fair` / `Weak` | `successInk` / `warningInk` / `dangerInk` |
+| `modelCardMetricMeasuredMark` | `primary` |
+| `modelCardMetricMeasuredMarkSize` / `Stroke` / `Gap` | 11 / 2 / 6 |
+| `modelCardMetricMeasuredValueColor` / `Weight` | `fg` / 500 (в Qt 5.15 — `Font.Medium`) |
+| `modelCardMetricNoDataBorder` / `NoDataValueColor` | `fgFaint` / `fgDisabled` |
+| `modelCardScaleQualityGood` / `Fair` | 92 / 88 |
+| `modelCardScaleSpeedGood` / `Fair` | 20 / 5 |
+| `modelCardFooterGap` | 6 (заменяет `modelCardSpaceLineGapToTags`) |
+| `modelCardFooterColsGap` | 12 |
+| `modelCardFooterDotGap` / `DotSize` | 7 / 4 |
+| `modelCardFooterBtnTextOffset` | 5 |
+| `modelCardFooterActionsGap` / `ActionsMaxShare` | 8 / 0.65 |
+| `modelCardFooterMsgGap` / `MsgIconSize` | 5 / 12 |
+
+Контраст заливок к дорожке `bg-surface-2` (нетекстовая графика, порог 3 : 1), пересчитан:
+
+| Заливка | Светлая | Тёмная |
+|---|---|---|
+| `success-ink` | #1F7D50 — 4,51 : 1 | #4FBF88 — 8,45 : 1 |
+| `warning-ink` | #8F5E12 — 4,90 : 1 | #F2B559 — 10,66 : 1 |
+| `danger-ink` | #C0322F — 4,96 : 1 | #F0645F — 6,19 : 1 |
+
+### Устаревшие (`deprecated: true`) — держатся до перехода `OnboardingModelCard.qml`
+
+`component.model-card.metric.fill-measured`, `metric.fill-estimated`, вся ветка
+`metric.source-caption.*`, `component.model-card.hr`, `space-line.gap-to-tags`, `space-line.text`.
+В `Theme.qml` пока остаются `modelCardMetricFillEstimated`, `modelCardMetricFillMeasured`,
+`modelCardMetricSourceCaptionColor/MarginTop/Size`, `modelCardSpaceLineGapToTags`
+(`hr`, `space-line.text` и прозаические листья `source-caption` в QML не генерируются).
+Удалить из `tokens.json` после того, как QML перестанет их читать.
+
+Всего токенов 663 → **693** (+30 новых; счёт — листья с `value`, прежние 601/661 в шапках были неточны).
