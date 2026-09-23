@@ -11,6 +11,7 @@ import stat
 from pathlib import Path
 
 APP_NAME = "astra-voice"
+LOCK_TIMEOUT_MS = 100
 INSTALL_LIB_DIR = Path("/usr/lib/astra-voice")
 INSTALL_SHARE_DIR = Path("/usr/share/astra-voice")
 RESOURCES_ENV = "ASTRA_VOICE_RESOURCES"

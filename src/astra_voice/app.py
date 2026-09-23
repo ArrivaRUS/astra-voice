@@ -26,7 +26,13 @@ from astra_voice.core import settings as settings_mod
 from astra_voice.core.audio_env import deny_pulse_autospawn
 from astra_voice.core.logging import setup_logging
 from astra_voice.core.model_request import build_model_load
-from astra_voice.core.paths import ipc_socket_path, lock_path, qml_dir, settings_path
+from astra_voice.core.paths import (
+    LOCK_TIMEOUT_MS,
+    ipc_socket_path,
+    lock_path,
+    qml_dir,
+    settings_path,
+)
 from astra_voice.core.version import __version__
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
@@ -44,7 +50,6 @@ ORGANIZATION_DOMAIN = "io.github.arrivarus"
 DESKTOP_FILE_NAME = "astra-voice"
 SHOW_COMMAND = b"show"
 CONNECT_TIMEOUT_MS = 2000
-LOCK_TIMEOUT_MS = 100
 SIGNAL_POLL_MS = 200
 
 # Программный рендер (bootstrap ставит QT_QUICK_BACKEND=software и
