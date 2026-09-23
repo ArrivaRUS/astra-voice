@@ -26,6 +26,7 @@ import pytest
 from astra_voice.worker.audio import (
     CHANNELS,
     CHUNK_BYTES,
+    DEVICE_CACHE_TTL_S,
     ERROR_BUSY,
     ERROR_FAILED,
     ERROR_NO_DEVICE,
@@ -60,6 +61,7 @@ from astra_voice.worker.audio import (
     _Pulse,
     dbfs,
     default_device,
+    invalidate_device_cache,
     list_devices,
     normalize,
     resolve_device,
@@ -88,6 +90,7 @@ def no_system_audio(monkeypatch: pytest.MonkeyPatch) -> None:
     # Popen блокирует и subprocess.run, захваченный аргументом по умолчанию.
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     monkeypatch.setattr(ctypes, "CDLL", forbidden)
+    invalidate_device_cache()
 
 
 @pytest.fixture
@@ -485,6 +488,238 @@ def pulse_library(monkeypatch: pytest.MonkeyPatch) -> Mock:
     libraries = {"libpulse-simple.so.0": simple, "libpulse.so.0": pulse}
     monkeypatch.setattr(ctypes, "CDLL", lambda name, **kwargs: libraries[name])
     return simple
+
+
+def _cached_source_factory(
+    monkeypatch: pytest.MonkeyPatch, short_sources: str, now: list[float]
+) -> tuple[Callable[[], PulseSimpleSource], list[list[str]]]:
+    """Подставляет ответы pactl и wpctl с общим счётчиком команд."""
+    name = "alsa_input.pci.microphone"
+    listing = pactl_run(
+        short_sources,
+        json.dumps(
+            [
+                {"name": name, "description": "Микрофон"},
+                {"name": "alsa_output.pci.stereo.monitor", "description": "Колонки"},
+            ]
+        ),
+    )
+    default = default_source_run(FileNotFoundError("pactl"), wpctl=f'node.name = "{name}"')
+    commands: list[list[str]] = []
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(args)
+        if args in (
+            ["pactl", "list", "short", "sources"],
+            ["pactl", "-f", "json", "list", "sources"],
+        ):
+            return listing(args, **kwargs)
+        return default(args, **kwargs)
+
+    monkeypatch.setattr("astra_voice.worker.audio.list_devices", partial(list_devices, run=run))
+
+    def source() -> PulseSimpleSource:
+        return PulseSimpleSource(default=partial(default_device, run=run), clock=lambda: now[0])
+
+    return source, commands
+
+
+def test_device_cache_second_default_open_skips_commands(
+    pulse_library: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    short_sources: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = [10.0]
+    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    first = source_factory()
+    with caplog.at_level(logging.INFO, logger="astra_voice.worker.audio"):
+        first.open(None)
+        first.close()
+        assert [command[0] for command in commands] == ["pactl", "pactl", "pactl", "wpctl"]
+        second = source_factory()
+        now[0] += DEVICE_CACHE_TTL_S - 0.001
+        second.open(None)
+        second.close()
+    assert len(commands) == 4
+    assert pulse_library.pa_simple_new.call_count == 2
+    assert caplog.messages == [
+        "Источник записи: список устройств запрошен заново.",
+        "Источник записи: список устройств из кэша.",
+    ]
+
+
+def test_device_cache_logs_once_after_capture_open_retry(
+    pulse_library: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    short_sources: str,
+    wait_capture: Callable[[], None],
+    probes: list[CaptureProbe],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = [10.0]
+    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    pulse_library.pa_simple_new.side_effect = [None] * OPEN_RETRIES + [123]
+    probe = CaptureProbe(source_factory(), sink=lambda uid, samples: False)
+    probes.append(probe)
+    with caplog.at_level(logging.INFO, logger="astra_voice.worker.audio"):
+        probe.capture.start("retry", None, limit_s=LIMIT_S_DEFAULT)
+        wait_capture()
+    assert probe.sleeps == [OPEN_FIRST_PAUSE_S]
+    assert pulse_library.pa_simple_new.call_count == OPEN_RETRIES + 1
+    assert len(commands) == 8
+    assert [
+        message for message in caplog.messages if message.startswith("Источник записи: список")
+    ] == ["Источник записи: список устройств запрошен заново."]
+    assert probe.errors.empty()
+
+
+def test_device_cache_explicit_miss_preserves_cached_default(
+    pulse_library: Mock, monkeypatch: pytest.MonkeyPatch, short_sources: str
+) -> None:
+    now = [10.0]
+    microphone = "alsa_input.pci.microphone"
+    added = "alsa_input.usb.new"
+    listing_calls = 0
+    commands: list[list[str]] = []
+    default = default_source_run(FileNotFoundError("pactl"), wpctl=f'node.name = "{microphone}"')
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal listing_calls
+        commands.append(args)
+        if args == ["pactl", "list", "short", "sources"]:
+            listing_calls += 1
+            extra = (
+                f"3\t{added}\tmodule-alsa-card.c\ts16le 1ch 16000Hz\tRUNNING\n"
+                if listing_calls > 1
+                else ""
+            )
+            return subprocess.CompletedProcess(args, 0, short_sources + extra, "")
+        if args == ["pactl", "-f", "json", "list", "sources"]:
+            descriptions = [{"name": microphone, "description": "Микрофон"}]
+            if listing_calls > 1:
+                descriptions.append({"name": added, "description": "USB"})
+            return subprocess.CompletedProcess(args, 0, json.dumps(descriptions), "")
+        if args == ["pw-dump"]:
+            raise FileNotFoundError("pw-dump")
+        return default(args, **kwargs)
+
+    monkeypatch.setattr("astra_voice.worker.audio.list_devices", partial(list_devices, run=run))
+
+    def source() -> PulseSimpleSource:
+        return PulseSimpleSource(default=partial(default_device, run=run), clock=lambda: now[0])
+
+    first = source()
+    first.open(None)
+    first.close()
+    now[0] += 0.5
+    explicit = source()
+    explicit.open(added)
+    explicit.close()
+    before_default = len(commands)
+    cached = source()
+    cached.open(None)
+    cached.close()
+    assert before_default == 8
+    assert len(commands) == before_default
+    assert pulse_library.pa_simple_new.call_count == 3
+    now[0] = 10.0 + DEVICE_CACHE_TTL_S
+    expired_default = source()
+    expired_default.open(None)
+    expired_default.close()
+    assert len(commands) == before_default + 5
+    assert pulse_library.pa_simple_new.call_count == 4
+
+
+def test_device_cache_public_invalidation(
+    pulse_library: Mock, monkeypatch: pytest.MonkeyPatch, short_sources: str
+) -> None:
+    now = [10.0]
+    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    first = source_factory()
+    first.open(None)
+    first.close()
+    invalidate_device_cache()
+    second = source_factory()
+    second.open(None)
+    second.close()
+    assert len(commands) == 8
+
+
+def test_device_cache_invalidates_on_first_chunk_timeout(
+    pulse_library: Mock, monkeypatch: pytest.MonkeyPatch, short_sources: str
+) -> None:
+    now = [10.0]
+    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    first = source_factory()
+    first.open(None)
+    first.close()
+    on_error = Mock()
+    capture = AudioCapture(
+        source=ControlledSource(),
+        on_samples=Mock(),
+        on_event=Mock(),
+        on_error=on_error,
+        clock=lambda: now[0],
+    )
+    capture._first_chunk_deadline = now[0]
+    capture._silent_uid = "mute"
+    capture._check_first_chunk()
+    on_error.assert_called_once_with("mute", ERROR_SILENT, SILENT_MESSAGE)
+    second = source_factory()
+    second.open(None)
+    second.close()
+    assert len(commands) == 8
+
+
+def test_device_cache_expires_at_two_seconds(
+    pulse_library: Mock, monkeypatch: pytest.MonkeyPatch, short_sources: str
+) -> None:
+    now = [10.0]
+    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    first = source_factory()
+    first.open(None)
+    first.close()
+    now[0] += DEVICE_CACHE_TTL_S
+    second = source_factory()
+    second.open(None)
+    second.close()
+    assert [command[0] for command in commands].count("pactl") == 6
+    assert [command[0] for command in commands].count("wpctl") == 2
+
+
+def test_device_cache_invalidates_after_open_error(
+    pulse_library: Mock, monkeypatch: pytest.MonkeyPatch, short_sources: str
+) -> None:
+    now = [10.0]
+    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    pulse_library.pa_simple_new.side_effect = [None] * OPEN_RETRIES + [123]
+    first = source_factory()
+    with pytest.raises(AudioError) as caught:
+        first.open(None)
+    assert caught.value.code == ERROR_FAILED
+    first.close()
+    second = source_factory()
+    second.open(None)
+    second.close()
+    assert len(commands) == 8
+    assert pulse_library.pa_simple_new.call_count == OPEN_RETRIES + 1
+
+
+def test_device_cache_explicit_name_skips_listing(
+    pulse_library: Mock, monkeypatch: pytest.MonkeyPatch, short_sources: str
+) -> None:
+    now = [10.0]
+    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    first = source_factory()
+    first.open(None)
+    name = first.device_name
+    first.close()
+    second = source_factory()
+    second.open(name)
+    second.close()
+    assert len(commands) == 4
+    assert pulse_library.pa_simple_new.call_count == 2
 
 
 @pytest.mark.parametrize(
@@ -1500,7 +1735,11 @@ def test_capture_bounds_label_in_event_and_log(
     expected = "М" * (MAX_DEVICE_LABEL - 1) + "…"
     assert [event for _, event in probe.drain()] == [{"type": "audio.ready", "device": expected}]
     prefix = "Источник записи готов: "
-    assert caplog.messages == [prefix + "М" * (MAX_DEVICE_LABEL - len(prefix) - 1) + "…"]
+    suffix = " t_ms=0"
+    assert caplog.messages == [
+        prefix + "М" * (MAX_DEVICE_LABEL - len(prefix) - len(suffix) - 1) + "…" + suffix
+    ]
+    assert len(caplog.messages[0]) == MAX_DEVICE_LABEL
     assert label not in caplog.text
     assert "alsa_" not in caplog.text
     assert probe.errors.empty()
@@ -1772,6 +2011,7 @@ def test_capture_sanitizes_pactl_description(
         if record.getMessage().startswith("Источник записи готов: ")
     ]
     assert len(readiness) == 1
+    assert readiness[0].endswith(" t_ms=0")
     for text in (event["device"], event["changed"], readiness[0]):
         assert isinstance(text, str)
         assert text.splitlines() == [text]
@@ -2036,8 +2276,7 @@ def test_pulse_uses_human_label(
         assert len(source.device_label) == MAX_DEVICE_LABEL
         assert name not in caplog.text
         assert device.description not in caplog.text
-        if monitor:
-            assert caplog.messages == [f"Выбран источник записи: {device.label}"]
+        assert caplog.messages == ([f"Выбран источник записи: {device.label}"] if monitor else [])
     finally:
         source.close()
 
@@ -2386,9 +2625,20 @@ def test_first_chunk_cancels_the_silent_watchdog(
 
 
 def test_exact_zeros_from_live_source_report_silent(
-    wav_factory: WavFactory, wait_capture: Callable[[], None], probes: list[CaptureProbe]
+    wav_factory: WavFactory,
+    wait_capture: Callable[[], None],
+    probes: list[CaptureProbe],
+    pulse_library: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    short_sources: str,
 ) -> None:
     """Заглушённый в системе микрофон отдаёт ровные нули; живой всегда шумит."""
+    now = [10.0]
+    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    first = source_factory()
+    first.open(None)
+    first.close()
+    assert len(commands) == 4
     step = 1.0
     # Тот же файл, но выданный за живой микрофон: проверяем сторож ровных нулей.
     source = LiveWavSource(wav_factory(0, 32))
@@ -2399,6 +2649,10 @@ def test_exact_zeros_from_live_source_report_silent(
     assert probe.errors.get_nowait() == ("zeros", ERROR_SILENT, SILENT_MESSAGE)
     # Хватило ровно выдержки: лишние порции после неё не читаются.
     assert len(probe.samples) == int(ZERO_SAMPLES_HOLD_S / step)
+    second = source_factory()
+    second.open(None)
+    second.close()
+    assert len(commands) == 8
 
 
 def test_file_source_keeps_digital_silence(

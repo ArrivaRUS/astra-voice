@@ -50,6 +50,7 @@ OPEN_RETRIES = 3
 OPEN_RETRY_MS = 300
 OPEN_DEADLINE_S = 2.0
 OPEN_TOTAL_DEADLINE_S = 8.0
+DEVICE_CACHE_TTL_S = 2.0
 MAX_DEVICE_LABEL = 120
 
 ERROR_NO_DEVICE = "audio-no-device"
@@ -120,6 +121,64 @@ class AudioDevice:
     def label(self) -> str:
         """Возвращает подпись с явным предупреждением о записи звука колонок."""
         return _device_label(self.description, " (звук системы)" if self.monitor else "")
+
+
+class _DeviceCache:
+    """Короткоживущий снимок источников для пути открытия записи."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._devices: list[AudioDevice] | None = None
+        self._default: AudioDevice | None = None
+        self._devices_updated_at: float | None = None
+        self._default_updated_at: float | None = None
+
+    def get(
+        self, clock: Callable[[], float]
+    ) -> tuple[list[AudioDevice] | None, AudioDevice | None]:
+        with self._lock:
+            now = clock()
+            devices = (
+                self._devices
+                if self._devices_updated_at is not None
+                and 0 <= now - self._devices_updated_at < DEVICE_CACHE_TTL_S
+                else None
+            )
+            default = (
+                self._default
+                if self._default_updated_at is not None
+                and 0 <= now - self._default_updated_at < DEVICE_CACHE_TTL_S
+                else None
+            )
+            return devices, default
+
+    def put_devices(self, devices: list[AudioDevice], clock: Callable[[], float]) -> None:
+        with self._lock:
+            self._devices = devices
+            self._devices_updated_at = clock()
+
+    def put(
+        self, devices: list[AudioDevice], default: AudioDevice | None, clock: Callable[[], float]
+    ) -> None:
+        with self._lock:
+            self._devices = devices
+            self._default = default
+            self._devices_updated_at = self._default_updated_at = clock()
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._devices = None
+            self._default = None
+            self._devices_updated_at = None
+            self._default_updated_at = None
+
+
+_device_cache = _DeviceCache()
+
+
+def invalidate_device_cache() -> None:
+    """Сбрасывает снимок устройств перед следующим открытием записи."""
+    _device_cache.invalidate()
 
 
 def _device_descriptions(
@@ -577,6 +636,7 @@ class AudioCapture:
         try:
             if previous is not None:
                 previous.join()
+            open_started = self._clock()
             opened_now = self._open(device, running)
             if opened_now is None:
                 return
@@ -593,7 +653,10 @@ class AudioCapture:
                 label = getattr(self._source, "device_label", None)
                 if isinstance(label, str) and label.strip():
                     label = _device_label(label)
-                    logger.info("%s", _device_label(f"Источник записи готов: {label}"))
+                    t_ms = int((self._clock() - open_started) * 1000)
+                    logger.info(
+                        "%s", _device_label(f"Источник записи готов: {label}", f" t_ms={t_ms}")
+                    )
                 else:
                     label = None
                 self._on_event(WorkerState.audio_ready(device=label, changed=changed))
@@ -665,6 +728,7 @@ class AudioCapture:
                 if now - zero_since >= ZERO_SAMPLES_HOLD_S:
                     # Ровные нули столько времени даёт только заглушённый источник;
                     # у живого микрофона всегда есть собственный шум.
+                    invalidate_device_cache()
                     raise AudioError(ERROR_SILENT, SILENT_MESSAGE)
             if peak_dbfs >= SILENCE_DBFS:
                 silence_since = now
@@ -709,6 +773,7 @@ class AudioCapture:
             self._first_chunk_deadline = None
             self._silent_uid = None
         logger.warning("Источник записи открыт, но не отдал ни одной порции звука.")
+        invalidate_device_cache()
         self.request_stop()
         self._on_error(uid, ERROR_SILENT, SILENT_MESSAGE)
 
@@ -840,10 +905,12 @@ class PulseSimpleSource:
         devices: Callable[[], list[AudioDevice]] | None = None,
         default: Callable[..., AudioDevice] = default_device,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._devices = devices
         self._default = default
         self._sleep = sleep
+        self._clock = clock
         self._pulse: _Pulse | None = None
         self._handle: ctypes.c_void_p | None = None
         self._buffer = (ctypes.c_char * CHUNK_BYTES)()
@@ -861,49 +928,82 @@ class PulseSimpleSource:
         """Проверяет выбор и отмену перед каждой попыткой открытия."""
         if running is not None and not running.is_set():
             return
-        self.close()
-        devices = list_devices(deadline=deadline) if self._devices is None else self._devices()
-        if deadline is not None:
-            deadline.remaining(OPEN_TOTAL_DEADLINE_S)
-        # У44: проверяем умолчание до загрузки libpulse и открываем только конкретное имя.
-        selected = (
-            self._default(devices, deadline=deadline)
-            if device is None
-            else resolve_device(device, devices)
-        )
-        assert selected is not None
-        if deadline is not None:
-            deadline.remaining(OPEN_TOTAL_DEADLINE_S)
-        if selected.monitor:
-            logger.info("Выбран источник записи: %s", selected.label)
-        if self._pulse is None:
-            self._pulse = _Pulse()
-        error = 0
-        for attempt in range(OPEN_RETRIES):
-            if running is not None and not running.is_set():
-                return
-            timeout = OPEN_DEADLINE_S if deadline is None else deadline.remaining(OPEN_DEADLINE_S)
-            handle, error = self._pulse.open(selected.name, timeout=timeout)
-            if handle is not None:
-                self._handle = handle
-                self._device_name = selected.name
-                self._selected_device = selected
-                self.device_label = selected.label
-                return
-            if running is not None and not running.is_set():
-                return
-            logger.debug("Не удалось открыть запись: %s", self._pulse.strerror(error))
-            if attempt + 1 < OPEN_RETRIES:
-                pause = OPEN_RETRY_MS / 1000
-                self._sleep(pause if deadline is None else deadline.remaining(pause))
-        if error in (PA_ERR_BUSY, PA_ERR_ACCESS):
-            raise AudioError(ERROR_BUSY, "Микрофон занят другой программой.")
-        if error == PA_ERR_NOENTITY:
-            raise AudioError(
-                ERROR_NO_DEVICE,
-                "Выбранный микрофон недоступен. Выберите устройство записи в настройках.",
+        try:
+            self.close()
+            cached_devices, cached_default = (
+                _device_cache.get(self._clock) if self._devices is None else (None, None)
             )
-        raise AudioError(ERROR_FAILED, "Не удалось включить запись звука.")
+            if cached_devices is not None and (device is not None or cached_default is not None):
+                selected = (
+                    cached_default
+                    if device is None
+                    else next((item for item in cached_devices if item.name == device), None)
+                )
+                from_cache = selected is not None
+            else:
+                selected = None
+                from_cache = False
+            if not from_cache:
+                devices = (
+                    list_devices(deadline=deadline) if self._devices is None else self._devices()
+                )
+                if deadline is not None:
+                    deadline.remaining(OPEN_TOTAL_DEADLINE_S)
+                # У44: проверяем умолчание до загрузки libpulse.
+                selected = (
+                    self._default(devices, deadline=deadline)
+                    if device is None
+                    else resolve_device(device, devices)
+                )
+                if self._devices is None:
+                    if device is None:
+                        _device_cache.put(devices, selected, self._clock)
+                    else:
+                        _device_cache.put_devices(devices, self._clock)
+            assert selected is not None
+            if deadline is not None:
+                deadline.remaining(OPEN_TOTAL_DEADLINE_S)
+            if selected.monitor:
+                logger.info("Выбран источник записи: %s", selected.label)
+            if self._pulse is None:
+                self._pulse = _Pulse()
+            error = 0
+            for attempt in range(OPEN_RETRIES):
+                if running is not None and not running.is_set():
+                    return
+                timeout = (
+                    OPEN_DEADLINE_S if deadline is None else deadline.remaining(OPEN_DEADLINE_S)
+                )
+                handle, error = self._pulse.open(selected.name, timeout=timeout)
+                if handle is not None:
+                    self._handle = handle
+                    self._device_name = selected.name
+                    self._selected_device = selected
+                    self.device_label = selected.label
+                    if self._devices is None:
+                        logger.info(
+                            "Источник записи: список устройств из кэша."
+                            if from_cache
+                            else "Источник записи: список устройств запрошен заново."
+                        )
+                    return
+                if running is not None and not running.is_set():
+                    return
+                logger.debug("Не удалось открыть запись: %s", self._pulse.strerror(error))
+                if attempt + 1 < OPEN_RETRIES:
+                    pause = OPEN_RETRY_MS / 1000
+                    self._sleep(pause if deadline is None else deadline.remaining(pause))
+            if error in (PA_ERR_BUSY, PA_ERR_ACCESS):
+                raise AudioError(ERROR_BUSY, "Микрофон занят другой программой.")
+            if error == PA_ERR_NOENTITY:
+                raise AudioError(
+                    ERROR_NO_DEVICE,
+                    "Выбранный микрофон недоступен. Выберите устройство записи в настройках.",
+                )
+            raise AudioError(ERROR_FAILED, "Не удалось включить запись звука.")
+        except AudioError:
+            invalidate_device_cache()
+            raise
 
     def read_chunk(self) -> bytes | None:
         """Читает одну порцию в переиспользуемый буфер; при ошибке возвращает None."""
