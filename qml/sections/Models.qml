@@ -72,6 +72,13 @@ Item {
         recommended: entry.recommended === true
         sizeText: entry.sizeText !== undefined ? entry.sizeText : ""
         ramText: entry.ramText !== undefined ? entry.ramText : ""
+        measurementMode: true
+        ramMb: entry.ramMb !== undefined ? entry.ramMb : 0
+        ramMeasured: entry.ramMeasured === true
+        speedKind: entry.speedKind !== undefined ? entry.speedKind : "no_data"
+        speedText: entry.speedText !== undefined ? entry.speedText : ""
+        speedValue: entry.speedValue !== undefined ? entry.speedValue : 0
+        qualityValue: entry.qualityValue !== undefined ? entry.qualityValue : null
         selected: entry.selected === true
         badge: entry.badge !== undefined ? entry.badge : ""
         cardState: entry.state !== undefined ? entry.state : "available"

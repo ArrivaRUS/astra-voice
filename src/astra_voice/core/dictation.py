@@ -153,6 +153,7 @@ class DictationOrchestrator:
         on_device_selected: Callable[[str], None] | None = None,
         on_device_resolved: Callable[[str], None] | None = None,
         on_silent: Callable[[], None] | None = None,
+        on_success: Callable[[float | None, float | None, bool], None] | None = None,
     ) -> None:
         self._send = send
         self._generation = generation
@@ -176,6 +177,7 @@ class DictationOrchestrator:
         self._on_device_selected = on_device_selected
         self._on_device_resolved = on_device_resolved
         self._on_silent = on_silent
+        self._on_success = on_success
         self._resolved_device: str = ""
         self._announced_selected_device: str | None = None
         self._audio_opened = False
@@ -194,6 +196,8 @@ class DictationOrchestrator:
         self._t_stop: float | None = None
         self._t_ms = 0.0
         self._paste_ms = 0.0
+        self._result_audio_ms: float | None = None
+        self._result_infer_ms: float | None = None
         self._retries = 0
         self._cancel_requested = False
         self._cancel_pending = False
@@ -531,6 +535,8 @@ class DictationOrchestrator:
         self._t_ready = None
         self._t_stop = None
         self._t_ms = self._paste_ms = 0.0
+        self._result_audio_ms = None
+        self._result_infer_ms = None
         self._retries = 0
         try:
             self._device_selected = False
@@ -690,6 +696,8 @@ class DictationOrchestrator:
                 self._log.debug("диктовка: некорректное поле text")
                 text = ""
             duration = event.get("t_ms")
+            self._result_audio_ms = self._measurement_number(event.get("audio_ms"))
+            self._result_infer_ms = self._measurement_number(event.get("infer_ms"))
             self._result(
                 text,
                 duration_s=(
@@ -1057,11 +1065,12 @@ class DictationOrchestrator:
 
     def _dictation_stat(self, result: str) -> None:
         stop = self._t_stop if self._t_stop is not None else self._clock()
+        audio_ms = max(0.0, (stop - self._t0) * 1000)
         self._append_stat(
             "dictation",
             result=result,
             # Включает открытие устройства: _t0 ставится до отправки record.start.
-            audio_ms=max(0.0, (stop - self._t0) * 1000),
+            audio_ms=audio_ms,
             # До получения первого audio.ready в GUI, включая доставку события.
             open_ms=(
                 max(0.0, (self._t_ready - self._t0) * 1000) if self._t_ready is not None else None
@@ -1070,6 +1079,20 @@ class DictationOrchestrator:
             paste_ms=self._paste_ms,
             cold=self._cold,
         )
+        if result == "ok" and self._on_success is not None:
+            self._on_success(self._result_audio_ms, self._result_infer_ms, self._cold)
+
+    @staticmethod
+    def _measurement_number(value: object) -> float | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            number = float(value)
+            if math.isfinite(number) and number > 0:
+                return number
+        return None
+
+    def model_changed(self) -> None:
+        """Первая диктовка новой модели снова считается холодной."""
+        self._started = False
 
     def _append_stat(self, event_type: str, **fields: object) -> None:
         # Неизвестные значения (open_ms без audio.ready — машины с Fly, 22.09) не

@@ -24,6 +24,14 @@ def test_xdg_dirs_follow_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert stat.S_IMODE(paths.config_dir().stat().st_mode) == 0o700
 
 
+def test_measurements_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "dat"))
+    path = paths.measurements_path()
+    assert path == tmp_path / "dat" / "astra-voice" / "measurements.json"
+    assert path.parent == paths.data_dir()
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
 def test_relative_xdg_value_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", "relative/path")

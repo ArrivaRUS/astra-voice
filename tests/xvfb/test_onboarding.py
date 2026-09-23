@@ -127,6 +127,11 @@ class FakeOnboarding(QObject):
                 "sizeBytes": 226431968,
                 "sizeText": "226 МБ",
                 "ramText": "768 МБ",
+                "ramMb": 768,
+                "ramMeasured": False,
+                "speedKind": "benchmark",
+                "speedValue": 0.916,
+                "qualityValue": 0.896,
                 "selected": False,
                 "badge": "",
                 "state": "available",
@@ -138,6 +143,7 @@ class FakeOnboarding(QObject):
                 "tags": ["Только русский", "с пунктуацией", "MIT · Сбер", "отечественная"],
                 "metrics": [
                     {
+                        "kind": "quality",
                         "label": "Качество",
                         "text": "WER 7,60 %",
                         "fill": 0.58,
@@ -145,6 +151,7 @@ class FakeOnboarding(QObject):
                         "measured": False,
                     },
                     {
+                        "kind": "speed",
                         "label": "Скорость",
                         "text": "42,5× быстрее речи",
                         "fill": 0.51,
@@ -676,6 +683,11 @@ class FakeSettings(QObject):
                 "sizeBytes": 226431968,
                 "sizeText": "226 МБ",
                 "ramText": "768 МБ",
+                "ramMb": 768,
+                "ramMeasured": False,
+                "speedKind": "benchmark",
+                "speedValue": 0.916,
+                "qualityValue": 0.896,
                 "selected": True,
                 "badge": "active",
                 "state": "installed",
@@ -687,6 +699,7 @@ class FakeSettings(QObject):
                 "tags": ["Только русский", "с пунктуацией", "MIT · Сбер", "отечественная"],
                 "metrics": [
                     {
+                        "kind": "quality",
                         "label": "Качество",
                         "text": "WER 7,60 %",
                         "fill": 0.58,
@@ -694,6 +707,7 @@ class FakeSettings(QObject):
                         "measured": False,
                     },
                     {
+                        "kind": "speed",
                         "label": "Скорость",
                         "text": "42,5× быстрее речи",
                         "fill": 0.51,
@@ -711,6 +725,11 @@ class FakeSettings(QObject):
                 "sizeBytes": 144_200_000,
                 "sizeText": "144 МБ",
                 "ramText": "300 МБ",
+                "ramMb": 300,
+                "ramMeasured": False,
+                "speedKind": "benchmark",
+                "speedValue": 0.798,
+                "qualityValue": 0.937,
                 "selected": False,
                 "badge": "",
                 "state": "available",
@@ -727,6 +746,7 @@ class FakeSettings(QObject):
                 ],
                 "metrics": [
                     {
+                        "kind": "quality",
                         "label": "Качество",
                         "text": "WER 6,57 %",
                         "fill": 0.67,
@@ -734,6 +754,7 @@ class FakeSettings(QObject):
                         "measured": False,
                     },
                     {
+                        "kind": "speed",
                         "label": "Скорость",
                         "text": "26,3× быстрее речи",
                         "fill": 0.31,

@@ -6,13 +6,15 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import posixpath
 import re
 import stat
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from urllib.parse import unquote
 
 from astra_voice.core import paths
@@ -123,6 +125,50 @@ class Catalog:
         return any(
             entry.model_id == model_id and entry.revision == revision for entry in self.revoked
         )
+
+
+def measured_rtfx(local: Mapping[str, Any]) -> float | None:
+    """Проверенный локальный RTFx для карточки и подписи."""
+    value = local.get("rtfx")
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    ):
+        return float(value)
+    return None
+
+
+def merge_measurement(
+    entry: CatalogEntry, measurements: Mapping[str, Any], threads: int = 2
+) -> dict[str, Any]:
+    """Сводит опубликованные цифры с локальным итогом той же ревизии."""
+    raw = measurements.get(f"{entry.id}@{entry.revision}")
+    local = raw if isinstance(raw, dict) and raw.get("threads") == threads else {}
+    ram = local.get("ram_mb")
+    measured_ram = type(ram) is int and ram >= 0
+    speed = measured_rtfx(local)
+    benchmark = entry.metrics.rtfx
+    if speed is not None:
+        speed_kind = "measured"
+        speed_number = speed
+    elif benchmark is not None:
+        speed_kind = "benchmark"
+        speed_number = benchmark.value
+    else:
+        speed_kind = "no_data"
+        speed_number = 0.0
+    wer = entry.metrics.wer_ru
+    return {
+        "ramMb": ram if measured_ram else entry.min_ram_mb,
+        "ramMeasured": measured_ram,
+        "speedKind": speed_kind,
+        "speedValue": min(1.0, max(0.0, math.log(speed_number) / math.log(60)))
+        if speed_number > 0
+        else 0.0,
+        "qualityValue": min(1.0, max(0.0, (30 - wer.value) / 25)) if wer else None,
+    }
 
 
 def _read_limited(path: Path, label: str) -> bytes:

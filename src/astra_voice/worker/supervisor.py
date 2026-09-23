@@ -288,6 +288,14 @@ class WorkerSupervisor:
             try:
                 message = ipc.decode(frame)
             except ipc.FrameError as exc:
+                if exc.code == ipc.PROTOCOL_MISMATCH:
+                    self.state = "stopped"
+                    self._close_connection()
+                    if self.process is not None and self.process.poll() is None:
+                        self.process.kill()
+                        self._retired.append(self.process)
+                    self._emit(ipc.error(exc.code, exc.message), generation=generation)
+                    return
                 self._emit(ipc.error(exc.code, exc.message))
                 continue
             self._accept(message, generation)

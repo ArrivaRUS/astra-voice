@@ -14,6 +14,13 @@ Rectangle {
     property bool recommended: false
     property string sizeText: ""
     property string ramText: ""
+    property bool measurementMode: false
+    property int ramMb: 0
+    property bool ramMeasured: false
+    property string speedKind: "no_data"
+    property string speedText: ""
+    property real speedValue: 0
+    property var qualityValue: null
     property bool selected: false
     property string badge: ""
     property string cardState: "available"
@@ -249,44 +256,63 @@ Rectangle {
                 spacing: Theme.modelCardMetricsGap
                 Repeater {
                     model: root.metrics
-                    RowLayout {
-                        spacing: Theme.modelCardMetricGap
-                        FooterText {
-                            Layout.preferredWidth: Theme.modelCardMetricLabelW
-                            horizontalAlignment: Text.AlignRight
-                            text: modelData.label
-                            font.pixelSize: Theme.fontMetricSize
-                        }
-                        Rectangle {
-                            Layout.preferredWidth: Theme.modelCardMetricTrackW
-                            Layout.preferredHeight: Theme.modelCardMetricTrackH
-                            radius: Theme.modelCardMetricTrackRadius
-                            color: modelData.hasData === false ? "transparent" : Theme.modelCardMetricTrackBg
-                            border.width: modelData.hasData === false ? 1 : 0
-                            border.color: Theme.fgFaint
+                    Column {
+                        property bool metricHasData: root.measurementMode && modelData.kind === "speed"
+                            ? root.speedKind !== "no_data" : modelData.hasData !== false
+                        visible: !root.measurementMode
+                            || (modelData.kind === "speed"
+                                ? root.speedKind !== "no_data" : root.qualityValue !== null)
+                        spacing: 2
+                        RowLayout {
+                            spacing: Theme.modelCardMetricGap
+                            FooterText {
+                                Layout.preferredWidth: Theme.modelCardMetricLabelW
+                                horizontalAlignment: Text.AlignRight
+                                text: modelData.label
+                                font.pixelSize: Theme.fontMetricSize
+                            }
                             Rectangle {
-                                visible: modelData.hasData !== false
-                                width: parent.width * Math.max(0, Math.min(1, modelData.fill))
-                                height: parent.height
+                                Layout.preferredWidth: Theme.modelCardMetricTrackW
+                                Layout.preferredHeight: Theme.modelCardMetricTrackH
                                 radius: Theme.modelCardMetricTrackRadius
-                                color: Theme.modelCardMetricFillEstimated
+                                color: metricHasData ? Theme.modelCardMetricTrackBg : "transparent"
+                                border.width: metricHasData ? 0 : 1
+                                border.color: Theme.fgFaint
+                                Rectangle {
+                                    visible: metricHasData
+                                    width: parent.width * Math.max(0, Math.min(1,
+                                        root.measurementMode
+                                            ? (modelData.kind === "speed"
+                                                ? root.speedValue : root.qualityValue)
+                                            : modelData.fill))
+                                    height: parent.height
+                                    radius: Theme.modelCardMetricTrackRadius
+                                    color: Theme.modelCardMetricFillEstimated
+                                }
+                            }
+                            FooterText {
+                                Layout.fillWidth: true
+                                text: root.measurementMode && modelData.kind === "speed"
+                                    ? root.speedText : modelData.text
+                                font.pixelSize: Theme.modelCardMetricValueSize
+                                font.weight: Font.Normal
+                                font.italic: !metricHasData
+                                color: metricHasData ? Theme.fgMuted : Theme.fgDisabled
+                                wrapMode: Text.NoWrap
                             }
                         }
                         FooterText {
-                            Layout.fillWidth: true
-                            text: modelData.text
-                            font.pixelSize: Theme.modelCardMetricValueSize
-                            font.weight: Font.Normal
-                            font.italic: modelData.hasData === false
-                            color: modelData.hasData === false ? Theme.fgDisabled : Theme.fgMuted
-                            wrapMode: Text.NoWrap
+                            visible: root.measurementMode && modelData.kind === "speed"
+                            text: root.speedKind === "measured" ? qsTr("замерено")
+                                : qsTr("по цифрам авторов")
+                            font.pixelSize: Theme.modelCardMetricSourceCaptionSize
                         }
                     }
                 }
             }
             FooterText {
                 id: sourceCaption
-                visible: root.hasMetricData
+                visible: !root.measurementMode && root.hasMetricData
                 y: metricRows.height + Theme.modelCardMetricSourceCaptionMarginTop
                 width: parent.width
                 horizontalAlignment: Text.AlignRight
@@ -328,10 +354,18 @@ Rectangle {
                 Dot { anchors.centerIn: parent }
             }
             SpaceText {
-                text: root.ramText
+                text: root.measurementMode
+                    ? (root.ramMeasured
+                        ? qsTr("Память: %1 МБ (замерено на этом компьютере)").arg(root.ramMb)
+                        : qsTr("Память: около %1 МБ").arg(root.ramMb))
+                    : root.ramText
                 color: Theme.fg
+                font.weight: root.measurementMode && root.ramMeasured ? Font.Bold : Font.Normal
             }
-            SpaceText { text: qsTr(" в памяти при работе") }
+            SpaceText {
+                visible: !root.measurementMode
+                text: qsTr(" в памяти при работе")
+            }
         }
 
         RowLayout {

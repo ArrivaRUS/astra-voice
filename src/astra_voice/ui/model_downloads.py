@@ -31,12 +31,14 @@ from PyQt5.QtCore import (
 )
 
 from astra_voice.core import paths
+from astra_voice.core.measurements import read_measurements
+from astra_voice.core.model_request import model_threads
 from astra_voice.core.model_source import SmokeRunner
 from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
 from astra_voice.models import catalog_state
-from astra_voice.models.catalog import CatalogEntry, load_builtin
+from astra_voice.models.catalog import CatalogEntry, load_builtin, measured_rtfx, merge_measurement
 from astra_voice.models.downloader import Downloader, DownloadError, Progress
 from astra_voice.models.installer import (
     Installer,
@@ -104,9 +106,10 @@ def _metric(entry: Any, name: str) -> Any | None:
     return getattr(getattr(entry, "metrics", None), name, None)
 
 
-def _metric_row(label: str, text: str, fill: float) -> dict[str, Any]:
+def _metric_row(kind: str, label: str, text: str, fill: float) -> dict[str, Any]:
     """Строка полоски карточки; measured — признак замера на этом компьютере."""
     return {
+        "kind": kind,
         "label": label,
         "text": text,
         "fill": max(0.0, min(1.0, fill)),
@@ -140,18 +143,30 @@ def entry_metrics(entry: Any, best_wer: float, best_rtfx: float) -> list[dict[st
     rtfx = _metric(entry, "rtfx")
     wer_value = getattr(wer, "value", 0.0) if wer is not None else 0.0
     rtfx_value = getattr(rtfx, "value", 0.0) if rtfx is not None else 0.0
-    return [
+    rows = [
         _metric_row(
+            "quality",
             _QUALITY_LABEL,
             format_wer(wer_value) if wer_value > 0 else "",
             best_wer / wer_value if wer_value > 0 and best_wer > 0 else 0.0,
         ),
         _metric_row(
+            "speed",
             _SPEED_LABEL,
             format_rtfx(rtfx_value) if rtfx_value > 0 else "",
             rtfx_value / best_rtfx if rtfx_value > 0 and best_rtfx > 0 else 0.0,
         ),
     ]
+    return rows
+
+
+def _card_speed_text(entry: Any, measurements: dict[str, Any], threads: int, published: str) -> str:
+    local = measurements.get(f"{entry.id}@{entry.revision}")
+    if isinstance(local, dict) and local.get("threads") == threads:
+        speed = measured_rtfx(local)
+        if speed is not None:
+            return format_rtfx(speed)
+    return published
 
 
 def catalog_best(entries: Iterable[Any]) -> tuple[float, float]:
@@ -606,11 +621,14 @@ class ModelDownloads(QObject):
         *,
         store: ModelStore | None = None,
         clock: Callable[[], float] = time.monotonic,
+        settings: Settings | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._model = model
         self._store = store
+        self._settings = settings or Settings()
+        self._measurements_cache: dict[str, Any] | None = None
         self._entry = model.recommended() if model is not None else None
         self._entries = model.entries() if model is not None else ()
         self._selected: set[str] = set()
@@ -877,6 +895,14 @@ class ModelDownloads(QObject):
     @property
     def models(self) -> list[dict[str, Any]]:
         best_wer, best_rtfx = catalog_best(self._entries)
+        if self._measurements_cache is None:
+            try:
+                self._measurements_cache = read_measurements(paths.measurements_path())
+            except (OSError, paths.PathError):
+                log.warning("Каталог замеров моделей недоступен")
+                self._measurements_cache = {}
+        measurements = self._measurements_cache
+        threads = model_threads(self._settings.to_dict())
         installed = self._installed_ids()
         return [
             {
@@ -888,6 +914,13 @@ class ModelDownloads(QObject):
                 "sizeBytes": entry.size_bytes,
                 "sizeText": format_size(entry.size_bytes),
                 "ramText": format_size(entry.min_ram_mb * 1_000_000),
+                **merge_measurement(entry, measurements, threads),
+                "speedText": _card_speed_text(
+                    entry,
+                    measurements,
+                    threads,
+                    entry_metrics(entry, best_wer, best_rtfx)[1]["text"],
+                ),
                 "selected": entry.id in self._selected,
                 "badge": self._badge(entry, installed),
                 "state": self._card_state(entry),
@@ -901,6 +934,11 @@ class ModelDownloads(QObject):
             }
             for entry in self._entries
         ]
+
+    def measurements_changed(self) -> None:
+        """Сбрасывает кэш перед уведомлением QML о новом замере."""
+        self._measurements_cache = None
+        self.modelsChanged.emit()
 
     @property
     def installedCount(self) -> int:  # noqa: N802

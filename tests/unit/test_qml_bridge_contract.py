@@ -379,7 +379,19 @@ def test_xvfb_fakes_match_real_bridges(real_contracts: dict[str, MetaContract]) 
             f"{declared.class_name}.{name} — нет свойства в {real.class_name}"
             for name in sorted(declared.properties - real.properties)
         )
+        if context == "settingsBridge":
+            failures.extend(
+                f"{real.class_name}.{name} — нет свойства в {declared.class_name}"
+                for name in sorted(real.properties - declared.properties - DOC_UNLISTED)
+            )
         real_methods = {method.signature for method in real.methods if not method.is_signal}
+        if context == "settingsBridge":
+            fake_methods = {method.signature for method in declared.methods if not method.is_signal}
+            failures.extend(
+                f"{real.class_name}.{name} — нет метода в {declared.class_name}"
+                for name in sorted(real_methods - fake_methods)
+                if name.split("(", 1)[0] not in DOC_UNLISTED and not name.startswith("_")
+            )
         for method in declared.methods:
             # Собственный notify-сигнал фейка не является частью контракта моста.
             if method.is_signal or method.signature in real_methods:
@@ -489,3 +501,13 @@ def test_bridge_members_are_documented(real_contracts: dict[str, MetaContract]) 
     assert not undocumented, "Эти члены мостов не описаны в docs/ui-bridge.md: " + ", ".join(
         sorted(set(undocumented))
     )
+
+
+def test_model_measurement_card_contract() -> None:
+    document = DOC_PATH.read_text(encoding="utf-8")
+    section = (REPO / "qml/sections/Models.qml").read_text(encoding="utf-8")
+    card = (REPO / "qml/components/OnboardingModelCard.qml").read_text(encoding="utf-8")
+    for field in ("ramMb", "ramMeasured", "speedKind", "speedText", "speedValue", "qualityValue"):
+        assert f"| `{field}` |" in document
+        assert f"entry.{field}" in section
+        assert f"root.{field}" in card

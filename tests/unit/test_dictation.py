@@ -382,6 +382,21 @@ def test_full_ptt_cycle_and_timings(rig: Rig) -> None:
     assert rig.tray.state.value == "idle"
 
 
+def test_success_callback_uses_worker_timings_only(rig: Rig) -> None:
+    succeeded = Mock()
+    rig.core._on_success = succeeded
+    rig.start()
+    rig.stop()
+    rig.event("result", text=MARKER, audio_ms=1000.0, infer_ms=25.0)
+    succeeded.assert_called_once_with(1000.0, 25.0, True)
+    rig.timer(STATE_DURATION_MS[PillState.DONE]).fire()
+    rig.start()
+    rig.stop()
+    rig.event("result", text=MARKER)
+    assert succeeded.call_args_list[-1] == call(None, None, False)
+    assert succeeded.call_count == 2
+
+
 def test_release_tail_keeps_recording_open_until_it_ends(rig: Rig) -> None:
     """Хвост фразы: 250 мс после отпускания запись идёт, индикация не меняется."""
     rig.start()
@@ -2005,6 +2020,8 @@ def test_audio_close_failure_still_restarts_worker(rig: Rig) -> None:
 def microphone_event(rig: Rig, kind: str, **fields: object) -> None:
     """События проходят настоящий IPC; generation добавляет супервизор."""
     message = {"type": kind, "utterance_id": rig.uid, **fields}
+    if kind == "result":
+        message.update(infer_ms=5.0, audio_ms=1000.0)
     decoded = ipc.FrameReader().feed(ipc.encode(message))[0]
     rig.core.on_worker_event({**decoded, "generation": rig.worker_generation})
 

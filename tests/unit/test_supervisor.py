@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -28,6 +30,24 @@ from astra_voice.worker.supervisor import (
 
 pytestmark = pytest.mark.unit
 ECHO_WORKER = Path(__file__).resolve().parents[1] / "echo_worker.py"
+
+
+def test_protocol_mismatch_stops_without_restart() -> None:
+    events: list[Message] = []
+    supervisor = WorkerSupervisor(events.append, use_qt=False)
+    supervisor.state = "running"
+    supervisor.generation = 1
+    process = Mock()
+    process.poll.return_value = None
+    supervisor.process = process
+    hello = {**ipc.make_hello(), "protocol": ipc.PROTOCOL_VERSION - 1}
+    payload = json.dumps(hello).encode("utf-8")
+    supervisor._receive(struct.pack(">I", len(payload)) + payload, 1)
+    assert str(supervisor.state) == "stopped"
+    assert supervisor.generation == 1
+    process.kill.assert_called_once_with()
+    assert events[-1]["code"] == ipc.PROTOCOL_MISMATCH
+    assert events[-1]["message"] == "Программа обновлена — перезапустите её."
 
 
 class Clock:
@@ -132,9 +152,9 @@ def test_import_does_not_load_qt() -> None:
 
 
 def test_hello_ping_and_stop() -> None:
-    """Hello версии 1, ping/pong и идемпотентная остановка реального процесса."""
+    """Hello текущей версии, ping/pong и идемпотентная остановка реального процесса."""
     with running() as (supervisor, events):
-        assert events[0]["protocol"] == 1
+        assert events[0]["protocol"] == ipc.PROTOCOL_VERSION
         assert supervisor.generation == 1
         process = supervisor.process
         assert process is not None
@@ -217,7 +237,14 @@ def test_old_generation_and_unknown_id_are_dropped() -> None:
         supervisor.send({"type": "recognize", "utterance_id": "old"})
         # Моделируем уже разобранное сообщение, задержанное прошлым соединением.
         supervisor._accept(
-            {"type": "result", "utterance_id": "old", "text": "Поздний", "t_ms": 1},
+            {
+                "type": "result",
+                "utterance_id": "old",
+                "text": "Поздний",
+                "t_ms": 1,
+                "infer_ms": 5.0,
+                "audio_ms": 1000.0,
+            },
             old_generation,
         )
         assert supervisor.dropped_late == 3
@@ -363,6 +390,8 @@ def test_transcribe_file_correlates_with_service_id(timeout: float | None) -> No
                 "utterance_id": "file",
                 "text": "Проверка файла",
                 "t_ms": 1,
+                "infer_ms": 5.0,
+                "audio_ms": 1000.0,
                 "generation": 1,
             }
         ]
@@ -472,7 +501,14 @@ def test_cancel_is_always_sent_and_registers_pending(terminal: str) -> None:
     if terminal != "unknown":
         supervisor.send({"type": "recognize", "utterance_id": "done"})
         responses: dict[str, Message] = {
-            "result": {"type": "result", "utterance_id": "done", "text": "Тест", "t_ms": 1},
+            "result": {
+                "type": "result",
+                "utterance_id": "done",
+                "text": "Тест",
+                "t_ms": 1,
+                "infer_ms": 5.0,
+                "audio_ms": 1000.0,
+            },
             "cancelled": {"type": "cancelled", "utterance_id": "done"},
             "error": {**ipc.error("no-model", "Тест."), "utterance_id": "done"},
         }
@@ -569,7 +605,14 @@ def test_record_notifications_keep_pending_until_result(timeout: float | None) -
         supervisor._receive(ipc.encode(notification), 1)
         assert key in supervisor._pending
         assert key not in supervisor._finished
-    result: Message = {"type": "result", "utterance_id": "one", "text": "Тест", "t_ms": 1}
+    result: Message = {
+        "type": "result",
+        "utterance_id": "one",
+        "text": "Тест",
+        "t_ms": 1,
+        "infer_ms": 5.0,
+        "audio_ms": 1000.0,
+    }
     supervisor._receive(ipc.encode(result), 1)
     assert not supervisor._pending
     assert key in supervisor._finished
@@ -657,7 +700,17 @@ def test_file_error_by_request_type_uses_same_correlation() -> None:
         ipc.encode({**ipc.error("bad-audio", "Тест."), "request_type": "transcribe.file"}), 1
     )
     supervisor._receive(
-        ipc.encode({"type": "result", "utterance_id": "file", "text": "Тест", "t_ms": 1}), 1
+        ipc.encode(
+            {
+                "type": "result",
+                "utterance_id": "file",
+                "text": "Тест",
+                "t_ms": 1,
+                "infer_ms": 5.0,
+                "audio_ms": 1000.0,
+            }
+        ),
+        1,
     )
     assert len(events) == 1
     assert events[0]["utterance_id"] == "file"
@@ -675,7 +728,14 @@ def test_each_request_has_one_terminal_event(terminal: str) -> None:
     supervisor._receive(ipc.encode({"type": "pong"}), 1)
     events.clear()
     responses: dict[str, Message] = {
-        "result": {"type": "result", "utterance_id": "one", "text": "Тест", "t_ms": 1},
+        "result": {
+            "type": "result",
+            "utterance_id": "one",
+            "text": "Тест",
+            "t_ms": 1,
+            "infer_ms": 5.0,
+            "audio_ms": 1000.0,
+        },
         "cancelled": {"type": "cancelled", "utterance_id": "one"},
         "error": {**ipc.error("engine-failed", "Тест."), "utterance_id": "one"},
     }
@@ -736,7 +796,17 @@ def test_unknown_correlated_error_does_not_finish_other_request() -> None:
     assert events == []
     assert supervisor.dropped_late == 2
     supervisor._receive(
-        ipc.encode({"type": "result", "utterance_id": "one", "text": "Тест", "t_ms": 1}), 1
+        ipc.encode(
+            {
+                "type": "result",
+                "utterance_id": "one",
+                "text": "Тест",
+                "t_ms": 1,
+                "infer_ms": 5.0,
+                "audio_ms": 1000.0,
+            }
+        ),
+        1,
     )
     assert len(events) == 1
     assert events[0]["type"] == "result"
