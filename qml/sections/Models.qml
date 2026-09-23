@@ -115,6 +115,8 @@ Item {
         message: entry.message !== undefined ? entry.message : ""
         hint: entry.hint !== undefined ? entry.hint : ""
         hintKind: entry.hintKind !== undefined ? entry.hintKind : ""
+        memoryShortage: entry.memoryShortage === true
+        canReinstall: entry.canReinstall !== false
         canSwitchWithPause: entry.canSwitchWithPause !== undefined
             ? entry.canSwitchWithPause : false
         vendor: entry.vendor !== undefined ? entry.vendor : ""
