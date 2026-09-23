@@ -160,6 +160,7 @@ class DictationRuntime(QObject):
         self._supervisor_factory = supervisor_factory
         self._capture_watchdog_factory = capture_watchdog_factory
         self._capture_watchdog: CaptureFieldWatchdog | None = None
+        self._capture_key_callback: Callable[[str, str], None] | None = None
         self.notifier: QSocketNotifier | None = None
         self.tick_timer: QTimer | None = None
         self.stats_timer: QTimer | None = None
@@ -956,10 +957,10 @@ class DictationRuntime(QObject):
                 log.warning("Не удалось сохранить статистику")
 
     def begin_hotkey_capture(self) -> bool:
-        """Единственная точка захвата клавиатуры полем комбинации (экран в M5).
+        """Захватывает клавиатуру; сторож читает клавиши со своего X-соединения.
 
-        Сторож сам создаёт отдельное X-соединение в своём потоке. GUI к нему
-        не обращается; будущий экран читает клавиши своим обычным путём.
+        Сторож создаёт отдельное X-соединение в своём потоке. GUI получает
+        события через колбэк, который должен ставить их в очередь Qt.
         Повторный вызов при активном захвате не продлевает его срок.
         """
         if self._closed:
@@ -969,11 +970,21 @@ class DictationRuntime(QObject):
                 return True
             self.end_hotkey_capture()
         watchdog = self._capture_watchdog_factory()
+        watchdog.on_key_event = self._capture_key_callback
+        watchdog.on_expired = (
+            partial(self._capture_key_callback, "expired", "")
+            if self._capture_key_callback is not None
+            else None
+        )
         self._capture_watchdog = watchdog
         if watchdog.open():
             return True
         self.end_hotkey_capture()
         return False
+
+    def set_hotkey_capture_callback(self, callback: Callable[[str, str], None] | None) -> None:
+        """Задаёт потокобезопасную передачу событий поля в GUI."""
+        self._capture_key_callback = callback
 
     def end_hotkey_capture(self) -> None:
         """Завершает выбор комбинации и останавливает его сторож; идемпотентно."""
@@ -1065,6 +1076,7 @@ class DictationRuntime(QObject):
         self._cleanup("захват хоткея", self.hotkey.ungrab)
         self._cleanup("захват Escape", self._ungrab_escape)
         self._cleanup("сторож поля комбинации", self.end_hotkey_capture)
+        self._capture_key_callback = None
         self._cleanup("соединение хоткея", self._close_hotkey_backend)
         self._cleanup("трей", self.tray.stop)
         self._cleanup("основное соединение X11", self.x11.close)

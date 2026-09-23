@@ -13,6 +13,7 @@ Item {
     property string captureHint: ""
     property string pendingCombo: ""
     property var freeCandidates: []
+    property bool showIdleRow: true
 
     readonly property string displayedCombo: pendingCombo !== "" ? pendingCombo : hotkey
     readonly property string candidatesHint: freeCandidates.length > 0
@@ -29,9 +30,11 @@ Item {
     readonly property bool captureActive: state7 === "capturing" || state7 === "captured"
     readonly property bool hasResult: state7 === "success" || state7 === "conflict"
         || state7 === "duplicate" || state7 === "not-grabbed"
+    readonly property bool settingsResultFocus: !showIdleRow && (state7 === "conflict"
+        || state7 === "duplicate" || state7 === "not-grabbed")
 
     function escPressed() {
-        if (!captureActive)
+        if (!captureActive && !settingsResultFocus)
             return false
         cancelRequested()
         return true
@@ -45,6 +48,10 @@ Item {
     // имена keysym для прочих клавиш из QML безопасно не собрать.
     function buildCombo(event) {
         var key = ""
+        if (event.modifiers & Qt.KeypadModifier) {
+            root.captureHint = qsTr("Эта клавиша не поддерживается. Выберите букву, цифру, пробел или F1–F12")
+            return ""
+        }
         if (event.key === Qt.Key_Space)
             key = "Space"
         else if (event.key >= Qt.Key_F1 && event.key <= Qt.Key_F12)
@@ -54,7 +61,10 @@ Item {
         else if (event.key >= Qt.Key_0 && event.key <= Qt.Key_9)
             key = String(event.key - Qt.Key_0)
         else
+        {
+            root.captureHint = qsTr("Эта клавиша не поддерживается. Выберите букву, цифру, пробел или F1–F12")
             return ""
+        }
 
         if (!(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
             root.captureHint = qsTr("Удерживайте Ctrl, Alt или Win и нажмите клавишу")
@@ -76,7 +86,7 @@ Item {
     }
 
     function updateCaptureFocus() {
-        if (captureActive)
+        if (captureActive || settingsResultFocus)
             forceActiveFocus()
     }
 
@@ -84,7 +94,7 @@ Item {
     implicitHeight: content.implicitHeight
     width: parent ? parent.width : implicitWidth
     height: implicitHeight
-    focus: captureActive
+    focus: captureActive || settingsResultFocus
 
     // Loader должен завершить создание поля до установки активного фокуса.
     onCaptureActiveChanged: {
@@ -92,6 +102,7 @@ Item {
             root.captureHint = ""
         Qt.callLater(root.updateCaptureFocus)
     }
+    onSettingsResultFocusChanged: Qt.callLater(root.updateCaptureFocus)
     Component.onCompleted: Qt.callLater(root.updateCaptureFocus)
 
     Keys.onPressed: {
@@ -102,11 +113,11 @@ Item {
         if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift
                 || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta
                 || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R
-                || event.key === Qt.Key_AltGr) {
+                || event.key === Qt.Key_AltGr || event.key === Qt.Key_CapsLock) {
             event.accepted = true
             return
         }
-        if (event.key === Qt.Key_Escape) {
+        if (event.key === Qt.Key_Escape && event.modifiers === Qt.NoModifier) {
             event.accepted = root.escPressed()
             return
         }
@@ -125,7 +136,7 @@ Item {
 
         RowLayout {
             id: idleRow
-            visible: root.state7 === "idle" || root.hasResult
+            visible: root.showIdleRow && (root.state7 === "idle" || root.hasResult)
             height: visible ? implicitHeight : 0
             spacing: 8 // design/spec.md §7: чип + «Изменить».
 

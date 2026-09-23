@@ -60,6 +60,7 @@ from astra_voice.ui.bridges import (
     SettingsApply,
     SettingsBridge,
 )
+from astra_voice.ui.hotkey_capture import CaptureHost, HotkeyCapture
 from astra_voice.ui.model_downloads import (
     ModelDownloads,
     ModelPort,
@@ -1059,8 +1060,12 @@ def test_onboarding_device_save_failure_rolls_back(
 def onboarding_rig() -> OnboardingRig:
     settings = settings_mod.from_dict({"onboarding_language_set": True})
     save = Mock()
-    bridge = SettingsBridge(settings, save=save)
+    apply = Mock(spec=SettingsApply)
+    apply.hotkey.return_value = "ok"
+    bridge = SettingsBridge(settings, save=save, apply=apply)
+    # Ответ применения независим от keep_busy: проверяем поведение, а не сам флаг.
     host = Mock(spec=OnboardingHost)
+    host.set_capture_callback = lambda _callback: None
     host.subscribe_device_resolved.return_value = ""
     host.begin_capture.return_value = True
     host.probe.return_value = "ok"
@@ -1071,6 +1076,216 @@ def onboarding_rig() -> OnboardingRig:
     )
     host.reset_mock()
     return controller, bridge, settings, host, save
+
+
+def test_capture_is_shared_by_onboarding_and_settings(onboarding_rig: OnboardingRig) -> None:
+    controller, bridge, _, _, _ = onboarding_rig
+    assert controller._capture is bridge._capture
+    bridge.beginCapture()
+    assert controller.captureState == bridge.captureState == "capturing"
+    controller.cancelCapture()
+    assert controller.captureState == bridge.captureState == "idle"
+
+
+@pytest.mark.parametrize("screen", ["settings", "onboarding"])
+def test_capture_apply_busy_does_not_save(onboarding_rig: OnboardingRig, screen: str) -> None:
+    controller, bridge, settings, host, save = onboarding_rig
+    apply = cast(Mock, bridge._apply)
+    apply.hotkey.return_value = "busy"
+    target = bridge if screen == "settings" else controller
+    target.beginCapture()
+    target.endCapture("Ctrl+Alt+D")
+    assert target.captureState == "conflict"
+    assert settings.hotkey == bridge.hotkey == "Ctrl+Space"
+    assert bridge.hotkeyStatus == "busy"
+    save.assert_not_called()
+    assert apply.hotkey.call_args_list == [
+        call("Ctrl+Alt+D", "ptt"),
+        call("Ctrl+Space", "ptt"),
+    ]
+    host.apply_hotkey.assert_not_called()
+
+
+@pytest.mark.parametrize("screen", ["settings", "onboarding"])
+def test_capture_keep_applies_once(onboarding_rig: OnboardingRig, screen: str) -> None:
+    controller, bridge, settings, host, save = onboarding_rig
+    apply = cast(Mock, bridge._apply)
+    apply.hotkey.return_value = "busy"
+    host.probe.return_value = "busy"
+    target = bridge if screen == "settings" else controller
+    target.endCapture("Ctrl+Alt+D")
+    apply.hotkey.assert_not_called()
+    target.keepCombo()
+    apply.hotkey.assert_called_once_with("Ctrl+Alt+D", "ptt")
+    host.apply_hotkey.assert_not_called()
+    save.assert_called_once_with(settings)
+    assert target.captureState == "success"
+    assert settings.hotkey == bridge.hotkey == "Ctrl+Alt+D"
+    assert bridge.hotkeyStatus == "busy"
+    assert not bridge.capture.keep_busy
+
+
+def test_capture_expiry_reaches_gui_queued(onboarding_rig: OnboardingRig) -> None:
+    controller, bridge, _, host, save = onboarding_rig
+    host.set_capture_callback = Mock()
+    gui_thread = threading.get_ident()
+    states: list[tuple[str, int]] = []
+    controller.captureStateChanged.connect(
+        lambda: states.append((controller.captureState, threading.get_ident()))
+    )
+    controller.beginCapture()
+    callback = host.set_capture_callback.call_args.args[0]
+    worker = threading.Thread(target=callback, args=("expired", ""))
+    worker.start()
+    worker.join()
+    assert controller.captureState == "capturing"
+    QCoreApplication.processEvents()
+    assert controller.captureState == bridge.captureState == "not-grabbed"
+    assert controller.captureMessage == "Время вышло — нажмите «Изменить» ещё раз"
+    assert states == [("capturing", gui_thread), ("not-grabbed", gui_thread)]
+    host.end_capture.assert_called_once_with()
+    save.assert_not_called()
+    controller.beginCapture()
+    assert controller.captureState == "capturing"
+    assert controller.captureMessage == ""
+    callback = host.set_capture_callback.call_args.args[0]
+    worker = threading.Thread(target=callback, args=("combo", "Ctrl+Alt+D"))
+    worker.start()
+    worker.join()
+    QCoreApplication.processEvents()
+    assert controller.captureState == "success"
+
+
+def test_capture_callback_attribute_error_is_reported_as_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    host = Mock(spec=CaptureHost)
+    host.set_capture_callback.side_effect = AttributeError("Ошибка внутри метода")
+    capture = HotkeyCapture(host)
+    capture.begin(lambda _combo, _keep: "ok")
+    assert capture.state == "not-grabbed"
+    host.begin_capture.assert_not_called()
+    host.end_capture.assert_called_once_with()
+    assert "Не удалось начать захват клавиатуры" in caplog.text
+    assert "Хост захвата не поддерживает передачу клавиш" not in caplog.text
+
+
+def test_onboarding_window_hide_ends_capture_once(onboarding_rig: OnboardingRig) -> None:
+    controller, bridge, _, host, _ = onboarding_rig
+    window = QObject()
+    bridge.capture.attach_window(window)
+    controller.attach_window(window)
+    controller.beginCapture()
+    QCoreApplication.sendEvent(window, QEvent(QEvent.Hide))
+    assert controller.captureState == "idle"
+    assert controller._window_visible is False
+    host.end_capture.assert_called_once_with()
+
+
+def test_settings_window_hide_releases_capture() -> None:
+    host = Mock(spec=CaptureHost)
+    host.begin_capture.return_value = True
+    bridge = SettingsBridge(Settings(), save=Mock(), capture_host=host)
+    window = QObject()
+    bridge.capture.attach_window(window)
+    bridge.beginCapture()
+    assert bridge.captureState == "capturing"
+
+    QCoreApplication.sendEvent(window, QEvent(QEvent.Hide))
+
+    assert bridge.captureState == "idle"
+    host.end_capture.assert_called_once_with()
+
+
+def test_capture_without_host_degrades_and_can_cancel() -> None:
+    capture = HotkeyCapture()
+    states = QSignalSpy(capture.captureStateChanged)
+    capture.begin(lambda _combo, _keep: "ok")
+    assert capture.state == "not-grabbed"
+    capture.cancel()
+    assert capture.state == "idle"
+    assert len(states) == 2
+
+
+def test_settings_capture_without_host_degrades() -> None:
+    bridge = SettingsBridge(Settings(), save=Mock())
+    bridge.beginCapture()
+    assert bridge.captureState == "not-grabbed"
+    bridge.endCapture("")
+    assert bridge.captureState == "idle"
+
+
+@pytest.mark.parametrize("probe_code", ["ok", "busy"])
+def test_settings_capture_saves_only_free_combo(probe_code: str) -> None:
+    settings = Settings()
+    save = Mock()
+    host = Mock(spec=CaptureHost)
+    host.begin_capture.return_value = True
+    host.probe.return_value = probe_code
+    apply = Mock(spec=SettingsApply)
+    apply.hotkey.return_value = "ok"
+    bridge = SettingsBridge(settings, save=save, apply=apply, capture_host=host)
+
+    bridge.beginCapture()
+    assert bridge.captureState == "capturing"
+    bridge.endCapture("Ctrl+Alt+D")
+    assert bridge.captureState == ("success" if probe_code == "ok" else "conflict")
+    assert (
+        bridge.hotkey == settings.hotkey == ("Ctrl+Alt+D" if probe_code == "ok" else "Ctrl+Space")
+    )
+    host.end_capture.assert_called_once_with()
+    if probe_code == "ok":
+        apply.hotkey.assert_called_once_with("Ctrl+Alt+D", "ptt")
+        save.assert_called_once_with(settings)
+    else:
+        apply.hotkey.assert_not_called()
+        save.assert_not_called()
+    bridge.endCapture("")
+    assert bridge.captureState == "idle"
+
+
+def test_settings_keep_busy_combo_uses_hotkey_property() -> None:
+    settings = Settings()
+    save = Mock()
+    host = Mock(spec=CaptureHost)
+    host.probe.return_value = "busy"
+    apply = Mock(spec=SettingsApply)
+    apply.hotkey.return_value = "busy"
+    bridge = SettingsBridge(settings, save=save, apply=apply, capture_host=host)
+
+    bridge.endCapture("Ctrl+Alt+D")
+    assert bridge.captureState == "conflict"
+    bridge.keepCombo()
+    assert bridge.captureState == "success"
+    assert bridge.hotkey == settings.hotkey == "Ctrl+Alt+D"
+    assert bridge.hotkeyStatus == "busy"
+    apply.hotkey.assert_called_once_with("Ctrl+Alt+D", "ptt")
+    save.assert_called_once_with(settings)
+
+
+@pytest.mark.parametrize("probe_code", ["ok", "busy"])
+def test_watchdog_signal_reaches_gui_thread_queued(
+    onboarding_rig: OnboardingRig, probe_code: str
+) -> None:
+    controller, bridge, _, host, _ = onboarding_rig
+    host.probe.return_value = probe_code
+    gui_thread = threading.get_ident()
+    states: list[tuple[str, int]] = []
+    controller.captureStateChanged.connect(
+        lambda: states.append((controller.captureState, threading.get_ident()))
+    )
+    controller.beginCapture()
+    worker = threading.Thread(target=lambda: bridge._capture.keyEvent.emit("combo", "Ctrl+Alt+D"))
+    worker.start()
+    worker.join()
+    assert controller.captureState == "capturing"
+    QCoreApplication.processEvents()
+    assert controller.captureState == ("success" if probe_code == "ok" else "conflict")
+    assert states == [
+        ("capturing", gui_thread),
+        ("captured", gui_thread),
+        (controller.captureState, gui_thread),
+    ]
 
 
 def test_onboarding_navigation_persists_every_transition(tmp_path: Path) -> None:
@@ -1250,7 +1465,8 @@ def test_onboarding_capture_states(
     ]
     if code == "ok":
         assert settings.hotkey == "Ctrl+Alt+D"
-        host.apply_hotkey.assert_called_once_with("Ctrl+Alt+D", "ptt")
+        # Применение объединено: мастер и настройки идут одним путём.
+        cast(Mock, bridge._apply).hotkey.assert_called_once_with("Ctrl+Alt+D", "ptt")
         save.assert_called_once()
     else:
         assert settings.hotkey == "Ctrl+Space"
@@ -1308,13 +1524,18 @@ def test_onboarding_valid_capture_clears_modifier_hint(onboarding_rig: Onboardin
     assert controller.captureMessage
     messages = QSignalSpy(controller.captureMessageChanged)
     host.reset_mock()
+    # Применение объединено: мастер и настройки идут одним путём; сохраняем порядок.
+    calls = Mock()
+    calls.attach_mock(host, "host")
+    calls.attach_mock(cast(Mock, bridge._apply), "apply")
 
     controller.endCapture("Ctrl+Alt+D")
 
-    assert host.mock_calls == [
-        call.end_capture(),
-        call.probe("Ctrl+Alt+D"),
-        call.apply_hotkey("Ctrl+Alt+D", "ptt"),
+    # Применение объединено: мастер и настройки идут одним путём, вызов ровно один.
+    assert calls.mock_calls == [
+        call.host.end_capture(),
+        call.host.probe("Ctrl+Alt+D"),
+        call.apply.hotkey("Ctrl+Alt+D", "ptt"),
     ]
     save.assert_called_once_with(settings)
     assert settings.hotkey == bridge.hotkey == "Ctrl+Alt+D"
@@ -1382,13 +1603,16 @@ def test_onboarding_begin_failure(onboarding_rig: OnboardingRig, error: bool) ->
 def test_onboarding_keep_conflict_is_explicit(onboarding_rig: OnboardingRig, result: str) -> None:
     controller, bridge, settings, host, save = onboarding_rig
     host.probe.return_value = "busy"
-    host.apply_hotkey.return_value = result
+    # Применение объединено: мастер и настройки идут одним путём.
+    apply = cast(Mock, bridge._apply)
+    apply.hotkey.return_value = result
     controller.endCapture("Ctrl+Alt+D")
     assert settings.hotkey == "Ctrl+Space"
     save.assert_not_called()
     controller.keepCombo()
     assert settings.hotkey == bridge.hotkey == "Ctrl+Alt+D"
-    host.apply_hotkey.assert_called_once_with("Ctrl+Alt+D", "ptt")
+    # Применение объединено: мастер и настройки идут одним путём, вызов ровно один.
+    apply.hotkey.assert_called_once_with("Ctrl+Alt+D", "ptt")
     assert controller.captureState == "success"
 
 
@@ -1407,11 +1631,13 @@ def test_onboarding_hotkey_save_failure_does_not_apply(onboarding_rig: Onboardin
 def test_onboarding_apply_failure(
     onboarding_rig: OnboardingRig, result: str | RuntimeError
 ) -> None:
-    controller, _, _, host, _ = onboarding_rig
+    # Применение объединено: мастер и настройки идут одним путём.
+    controller, bridge, _, _, _ = onboarding_rig
+    apply = cast(Mock, bridge._apply)
     if isinstance(result, Exception):
-        host.apply_hotkey.side_effect = result
+        apply.hotkey.side_effect = result
     else:
-        host.apply_hotkey.return_value = result
+        apply.hotkey.return_value = result
     controller.endCapture("Ctrl+Alt+D")
     states: dict[str | RuntimeError, str] = {"busy": "conflict", "duplicate": "duplicate"}
     expected = states.get(result, "not-grabbed")
@@ -1545,8 +1771,11 @@ def test_onboarding_leaving_capture_releases_keyboard(
     controller.next()
     controller.beginCapture()
     if action in ("hide", "close"):
-        controller.eventFilter(
-            controller, QEvent(QEvent.Hide if action == "hide" else QEvent.Close)
+        # Применение объединено: мастер и настройки идут одним путём, фильтр общий.
+        window = QObject()
+        controller.attach_window(window)
+        QCoreApplication.sendEvent(
+            window, QEvent(QEvent.Hide if action == "hide" else QEvent.Close)
         )
     else:
         getattr(controller, action)()

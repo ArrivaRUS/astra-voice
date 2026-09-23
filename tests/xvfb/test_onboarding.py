@@ -643,6 +643,10 @@ class FakeSettings(QObject):
         self.toggled_model_ids: list[str] = []
         self._hotkey: str = "Ctrl + Space"
         self._hotkeyMode: str = "ptt"
+        self._captureState: str = "idle"
+        self._captureMessage: str = ""
+        self._pendingCombo: str = ""
+        self._freeCandidates: list[str] = []
         self._microphoneVolume: int = 80
         self._microphoneMuted: bool = False
         self._canRaiseMicrophone: bool = True
@@ -773,6 +777,30 @@ class FakeSettings(QObject):
         self.changed.emit()
 
     hotkeyMode = pyqtProperty(str, _get_hotkeyMode, _set_hotkeyMode, notify=changed)
+
+    def _get_captureState(self) -> str:
+        return self._captureState
+
+    def _set_captureState(self, value: str) -> None:
+        self._captureState = value
+        self.changed.emit()
+
+    captureState = pyqtProperty(str, _get_captureState, _set_captureState, notify=changed)
+
+    def _get_captureMessage(self) -> str:
+        return self._captureMessage
+
+    captureMessage = pyqtProperty(str, _get_captureMessage, notify=changed)
+
+    def _get_pendingCombo(self) -> str:
+        return self._pendingCombo
+
+    pendingCombo = pyqtProperty(str, _get_pendingCombo, notify=changed)
+
+    def _get_freeCandidates(self) -> list[str]:
+        return self._freeCandidates
+
+    freeCandidates = pyqtProperty("QStringList", _get_freeCandidates, notify=changed)
 
     def _get_pillEnabled(self) -> bool:
         return self._pillEnabled
@@ -1133,6 +1161,29 @@ class FakeSettings(QObject):
     @pyqtSlot()
     def refreshDevices(self) -> None:
         self.calls.append("refreshDevices")
+
+    @pyqtSlot()
+    def beginCapture(self) -> None:
+        self.calls.append("beginCapture")
+        self.captureState = "capturing"
+
+    @pyqtSlot(str)
+    def endCapture(self, combo: str) -> None:
+        self.calls.append("endCapture")
+        self.captureState = "captured" if combo else "idle"
+
+    @pyqtSlot()
+    def cancelCapture(self) -> None:
+        self.calls.append("cancelCapture")
+        self.captureState = "idle"
+
+    @pyqtSlot()
+    def keepCombo(self) -> None:
+        self.calls.append("keepCombo")
+
+    @pyqtSlot()
+    def refreshCandidates(self) -> None:
+        self.calls.append("refreshCandidates")
 
     @pyqtSlot()
     def cancelDownloads(self) -> None:
@@ -1808,12 +1859,23 @@ def test_capture_ignores_other_keys_and_clears_hint_on_exit(onboarding_app: Any)
         assert isinstance(view, QQuickView)
         capture = next(item for item in visual_tree(root) if item.property("captureActive"))
         assert capture.hasActiveFocus()
-        for key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta, Qt.Key_Comma):
+        for key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
             QTest.keyClick(view, key, Qt.NoModifier)
             onboarding_app.processEvents()
             assert fake.calls == []
             assert capture.property("captureHint") == ""
             assert capture.property("state7") == "capturing"
+
+        QTest.keyClick(view, Qt.Key_Comma, Qt.NoModifier)
+        assert capture.property("captureHint") == (
+            "Эта клавиша не поддерживается. Выберите букву, цифру, пробел или F1–F12"
+        )
+        assert fake.calls == []
+        QTest.keyClick(view, Qt.Key_1, Qt.KeypadModifier | Qt.ControlModifier)
+        assert capture.property("captureHint") == (
+            "Эта клавиша не поддерживается. Выберите букву, цифру, пробел или F1–F12"
+        )
+        assert fake.calls == []
 
         QTest.keyClick(view, Qt.Key_Space, Qt.NoModifier)
         assert capture.property("captureHint") != ""
@@ -1832,6 +1894,60 @@ def test_capture_ignores_other_keys_and_clears_hint_on_exit(onboarding_app: Any)
 
     _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
     assert_no_messages(messages, "capture ignored keys and exit")
+
+
+def test_capture_caps_lock_is_silent(onboarding_app: Any) -> None:
+    fake = FakeOnboarding()
+    fake.step = 3
+    fake.captureState = "capturing"
+
+    def inspect(root: Any) -> None:
+        view = root.window()
+        capture = next(item for item in visual_tree(root) if item.property("captureActive"))
+        assert capture.hasActiveFocus()
+        QTest.keyClick(view, Qt.Key_CapsLock, Qt.NoModifier)
+        onboarding_app.processEvents()
+        assert capture.property("captureHint") == ""
+        assert capture.property("state7") == "capturing"
+        assert fake.calls == []
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, "Caps Lock")
+
+
+def test_settings_change_hotkey_shows_capture_field(onboarding_app: Any) -> None:
+    fake = FakeSettings()
+
+    def inspect(window: Any) -> None:
+        body = next(
+            item
+            for item in visual_tree(window.contentItem())
+            if item.metaObject().className() == "QQuickFlickable" and item.isVisible()
+        )
+        assert body.property("contentHeight") <= body.height()
+        button = visible_button(window.contentItem(), "Изменить")
+        QMetaObject.invokeMethod(button, "clicked", Qt.DirectConnection)
+        onboarding_app.processEvents()
+        assert "beginCapture" in fake.calls
+        capture = next(
+            item
+            for item in visual_tree(window.contentItem())
+            if item.property("state7") == "capturing" and item.isVisible()
+        )
+        QTest.keyClick(window, Qt.Key_D, Qt.ControlModifier | Qt.AltModifier)
+        onboarding_app.processEvents()
+        assert "endCapture" in fake.calls
+        assert fake.captureState == capture.property("state7") == "captured"
+        fake.captureState = "conflict"
+        onboarding_app.processEvents()
+        assert capture.hasActiveFocus()
+        QTest.keyClick(window, Qt.Key_Escape, Qt.NoModifier)
+        onboarding_app.processEvents()
+        assert fake.calls[-1] == "cancelCapture"
+        assert fake.captureState == capture.property("state7") == "idle"
+
+    _, messages = render_settings(onboarding_app, False, fake=fake, inspect=inspect)
+    assert_no_messages(messages, "settings capture")
 
 
 def test_policy_locked_step1(onboarding_app: Any) -> None:
@@ -2241,7 +2357,7 @@ def test_settings_models_section_calls_bridge(onboarding_app: Any, dark: bool) -
         assert len(cards) == 1, f"ожидалась одна карточка, найдено {len(cards)}"
         # Раздел «Общие» грузится первым и при открытии читает список микрофонов
         # и состояние громкости — это не вызовы раздела «Модели».
-        assert set(fake.calls) <= {"refreshDevices", "refreshMicrophone"}, fake.calls
+        assert fake.calls == ["refreshDevices", "refreshMicrophone", "cancelCapture"]
         fake.calls.clear()
         assert fake.toggled_model_ids == []
         click_item(cards[0])

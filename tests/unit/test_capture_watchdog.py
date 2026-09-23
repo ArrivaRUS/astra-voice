@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import threading
+import time
 from collections.abc import Iterator
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -15,6 +18,41 @@ from astra_voice.platform.x11 import X11Display
 
 pytestmark = pytest.mark.unit
 WAIT_S = 1.0
+
+
+def test_unused_watchdog_does_not_open_pipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipe = Mock(wraps=os.pipe)
+    monkeypatch.setattr("astra_voice.core.capture_watchdog.os.pipe", pipe)
+    watchdog = CaptureFieldWatchdog()
+    pipe.assert_not_called()
+    watchdog.close()
+    pipe.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["select", "next_event"])
+def test_event_read_failure_waits(monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    display = Mock(spec=X11Display)
+    display.d = SimpleNamespace(pending_events=lambda: 0)
+    display.pending_events.return_value = 0 if failure == "select" else 1
+    display.fileno.return_value = 42
+    display.next_event.side_effect = OSError("Ошибка чтения")
+    monkeypatch.setattr(
+        "astra_voice.core.capture_watchdog.select.select",
+        Mock(side_effect=OSError("Ошибка ожидания")),
+    )
+    watchdog = CaptureFieldWatchdog()
+    wait = Mock()
+    monkeypatch.setattr(watchdog._stop, "wait", wait)
+    watchdog._poll_keys(display, 0.25)
+    wait.assert_called_once_with(0.25)
+
+
+def test_caps_lock_is_silent() -> None:
+    from Xlib import XK
+
+    display = X11Display()
+    display.d = SimpleNamespace(keycode_to_keysym=lambda _code, _index: XK.XK_Caps_Lock)
+    assert CaptureFieldWatchdog._key_event(display, 66, 0) is None
 
 
 class FakeSocket:
@@ -279,3 +317,206 @@ def test_connection_is_created_and_used_only_by_watchdog_thread(rig: Rig) -> Non
     assert thread is not None and thread.ident != threading.get_ident()
     assert {ident for _, ident in display.calls} == {thread.ident}
     assert main_display.calls == main_calls
+
+
+@pytest.mark.parametrize(
+    ("keysym", "state", "expected"),
+    [
+        ("Control_L", 0, []),
+        ("k", 4, [("combo", "Ctrl+K")]),
+        ("Escape", 0, [("cancel", "")]),
+        (
+            "Escape",
+            4,
+            [("hint", "Эта клавиша не поддерживается. Выберите букву, цифру, пробел или F1–F12")],
+        ),
+        (
+            "Return",
+            4,
+            [("hint", "Эта клавиша не поддерживается. Выберите букву, цифру, пробел или F1–F12")],
+        ),
+        (
+            "Tab",
+            4,
+            [("hint", "Эта клавиша не поддерживается. Выберите букву, цифру, пробел или F1–F12")],
+        ),
+        (
+            "KP_1",
+            4,
+            [("hint", "Эта клавиша не поддерживается. Выберите букву, цифру, пробел или F1–F12")],
+        ),
+        ("a", 0, [("hint", "Добавьте к клавише Ctrl, Alt или Win")]),
+    ],
+)
+def test_watchdog_reads_grabbed_keypress(
+    keysym: str, state: int, expected: list[tuple[str, str]]
+) -> None:
+    from Xlib import XK, X
+
+    class EventDisplay(X11Display):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events = [SimpleNamespace(type=X.KeyPress, detail=38, state=state)]
+            self.d = SimpleNamespace(
+                pending_events=lambda: len(self.events),
+                keycode_to_keysym=lambda _code, index: (
+                    XK.string_to_keysym(keysym) if index == 0 else 0
+                ),
+            )
+
+        def pending_events(self) -> int:
+            return len(self.events)
+
+        def next_event(self) -> object:
+            return self.events.pop(0)
+
+    received: list[tuple[str, str]] = []
+    watchdog = CaptureFieldWatchdog(
+        on_key_event=lambda action, value: received.append((action, value))
+    )
+    watchdog._poll_keys(EventDisplay(), 0)
+    assert received == expected
+
+
+def test_watchdog_refreshes_mapping_and_orders_modifiers() -> None:
+    from Xlib import XK, X
+
+    class EventDisplay(X11Display):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events = [
+                SimpleNamespace(type=X.MappingNotify, request=X.MappingKeyboard),
+                SimpleNamespace(
+                    type=X.KeyPress,
+                    detail=38,
+                    state=X.Mod4Mask | X.Mod1Mask | X.ShiftMask | X.ControlMask | X.LockMask,
+                ),
+            ]
+            self.d = SimpleNamespace(
+                pending_events=lambda: len(self.events),
+                keycode_to_keysym=lambda _code, _index: XK.XK_F12,
+            )
+            self.refreshed = False
+
+        def pending_events(self) -> int:
+            return len(self.events)
+
+        def next_event(self) -> object:
+            return self.events.pop(0)
+
+        def refresh_keyboard_mapping(self, event: object) -> bool:
+            self.refreshed = True
+            return True
+
+    received: list[tuple[str, str]] = []
+    display = EventDisplay()
+    watchdog = CaptureFieldWatchdog(
+        on_key_event=lambda action, value: received.append((action, value))
+    )
+    watchdog._poll_keys(display, 0)
+    assert display.refreshed
+    assert received == [("combo", "Ctrl+Shift+Alt+Super+F12")]
+
+
+def test_close_wakes_real_select_without_x_event() -> None:
+    reading, writing = os.pipe()
+    selected = threading.Event()
+    transport = SimpleNamespace(shutdown=lambda _how: None, close=lambda: os.close(reading))
+
+    class SilentDisplay(X11Display):
+        def open(self, display_name: str | None = None) -> bool:
+            self.d = SimpleNamespace(
+                display=SimpleNamespace(socket=transport),
+                pending_events=lambda: 0,
+            )
+            return True
+
+        def grab_keyboard(self, window_id: int | None = None, timeout_s: float = 30.0) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            selected.set()
+            return reading
+
+        def pending_events(self) -> int:
+            return 0
+
+        def close(self) -> None:
+            self.d = None
+
+    watchdog = CaptureFieldWatchdog(display_factory=SilentDisplay, poll_ms=1000)
+    try:
+        assert watchdog.open()
+        assert selected.wait(WAIT_S)
+        start = time.monotonic()
+        watchdog.close()
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.1
+        assert watchdog._thread is not None and not watchdog._thread.is_alive()
+        with pytest.raises(OSError):
+            os.fstat(watchdog._wake_read)
+        with pytest.raises(OSError):
+            os.fstat(watchdog._wake_write)
+    finally:
+        watchdog.close()
+        os.close(writing)
+
+
+def test_watchdog_thread_reads_key_after_real_select() -> None:
+    from Xlib import XK, X
+
+    reading, writing = os.pipe()
+    received: list[tuple[str, str]] = []
+    delivered = threading.Event()
+    transport = SimpleNamespace(shutdown=lambda _how: None, close=lambda: os.close(reading))
+
+    def on_key(action: str, value: str) -> None:
+        received.append((action, value))
+        delivered.set()
+
+    class EventDisplay(X11Display):
+        def __init__(self) -> None:
+            super().__init__()
+            self.events: list[object] = []
+
+        def open(self, display_name: str | None = None) -> bool:
+            self.d = SimpleNamespace(
+                display=SimpleNamespace(socket=transport),
+                pending_events=lambda: len(self.events),
+                keycode_to_keysym=lambda _code, index: XK.XK_a if index == 0 else 0,
+            )
+            return True
+
+        def grab_keyboard(self, window_id: int | None = None, timeout_s: float = 30.0) -> bool:
+            return True
+
+        def fileno(self) -> int:
+            return reading
+
+        def pending_events(self) -> int:
+            return len(self.events)
+
+        def next_event(self) -> object:
+            os.read(reading, 1)
+            return self.events.pop(0)
+
+        def close(self) -> None:
+            self.d = None
+
+    display = EventDisplay()
+    watchdog = CaptureFieldWatchdog(
+        display_factory=lambda: display,
+        on_key_event=on_key,
+        poll_ms=1000,
+    )
+    try:
+        assert watchdog.open()
+        display.events.append(SimpleNamespace(type=X.KeyPress, detail=38, state=X.ControlMask))
+        os.write(writing, b"x")
+        assert delivered.wait(WAIT_S)
+        assert received == [("combo", "Ctrl+A")]
+        watchdog.close()
+        assert watchdog._thread is not None and not watchdog._thread.is_alive()
+    finally:
+        watchdog.close()
+        os.close(writing)

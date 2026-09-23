@@ -26,6 +26,20 @@ Column {
             root.settings.refreshMicrophone()
         }
     }
+    Component.onDestruction: {
+        if (root.settings)
+            root.settings.cancelCapture()
+    }
+
+    Timer {
+        interval: Theme.durationUptodateMessage
+        running: root.settings && root.settings.captureState === "success"
+        repeat: false
+        onTriggered: {
+            if (root.settings)
+                root.settings.cancelCapture()
+        }
+    }
 
     // Список микрофонов из моста (как в шаге «Микрофон» мастера): имена в списке,
     // идентификаторы — в объектах; выбор ищем по идентификатору.
@@ -125,6 +139,57 @@ Column {
                 small: true
                 enabled: !root.isLocked("hotkey")
                 Layout.alignment: Qt.AlignVCenter
+                onClicked: {
+                    if (root.settings && root.settings.beginCapture)
+                        root.settings.beginCapture()
+                }
+            }
+        }
+
+        CaptureField {
+            id: hotkeyCapture
+            width: parent.width
+            visible: state7 !== "idle"
+            height: visible ? implicitHeight : 0
+            showIdleRow: false
+            state7: root.settings ? root.settings.captureState : "idle"
+            hotkey: root.settings ? root.settings.hotkey : qsTr("Ctrl + Space")
+            captureMessage: root.settings ? root.settings.captureMessage : ""
+            pendingCombo: root.settings ? root.settings.pendingCombo : ""
+            freeCandidates: root.settings ? root.settings.freeCandidates : []
+
+            onState7Changed: {
+                if ((state7 === "conflict" || state7 === "duplicate" || state7 === "not-grabbed")
+                        && root.settings && root.settings.refreshCandidates)
+                    root.settings.refreshCandidates()
+            }
+            onChangeRequested: {
+                if (root.settings && root.settings.beginCapture)
+                    root.settings.beginCapture()
+            }
+            onCancelRequested: {
+                if (root.settings && root.settings.cancelCapture)
+                    root.settings.cancelCapture()
+            }
+            onComboCaptured: {
+                if (root.settings && root.settings.endCapture)
+                    root.settings.endCapture(combo)
+            }
+            onChooseAnotherRequested: {
+                if (root.settings && root.settings.beginCapture)
+                    root.settings.beginCapture()
+            }
+            onRetryRequested: {
+                if (root.settings && root.settings.beginCapture)
+                    root.settings.beginCapture()
+            }
+            onKeepRequested: {
+                if (root.settings && root.settings.keepCombo)
+                    root.settings.keepCombo()
+            }
+            onToggleModeRequested: {
+                if (root.settings)
+                    root.settings.hotkeyMode = "toggle"
             }
         }
 
