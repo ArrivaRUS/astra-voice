@@ -215,6 +215,8 @@ class SettingsBridge(QObject):
     @pyqtProperty(str, notify=activeModelChanged)
     def activeModelName(self) -> str:  # noqa: N802
         entry = self._downloads.active_entry() if self._downloads is not None else None
+        if entry is not None and getattr(entry, "removed_from_catalog", False):
+            return "Установленная модель"
         return (
             clean_display_name(str(getattr(entry, "name", entry.id))) if entry is not None else ""
         )

@@ -71,6 +71,10 @@ Item {
                 badge: modelData.badge
                 cardState: modelData.state
                 message: modelData.message
+                hint: modelData.hint !== undefined ? modelData.hint : ""
+                hintKind: modelData.hintKind !== undefined ? modelData.hintKind : ""
+                memoryShortage: modelData.memoryShortage === true
+                canReinstall: modelData.canReinstall !== false
                 vendor: modelData.vendor
                 metrics: modelData.metrics
                 tags: modelData.tags

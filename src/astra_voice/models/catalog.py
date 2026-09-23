@@ -96,6 +96,8 @@ class CatalogEntry:
     license: str = ""
     domestic: bool = False
     metrics: Metrics = Metrics()
+    # Локальная запись установленной ревизии, отсутствующей в каталоге.
+    removed_from_catalog: bool = False
 
 
 @dataclass(frozen=True)

@@ -19,7 +19,7 @@ from PyQt5.QtTest import QSignalSpy
 from astra_voice.core import settings as settings_mod
 from astra_voice.models.catalog import CatalogEntry
 from astra_voice.models.downloader import Progress
-from astra_voice.models.store import StoreError
+from astra_voice.models.store import ModelRecord, ModelState, StoreError
 from astra_voice.ui import model_downloads
 from astra_voice.ui.bridges import SettingsBridge
 from astra_voice.ui.model_downloads import ModelDownloads, ModelService
@@ -173,6 +173,7 @@ class FakeSwitchPort:
 
     def __init__(self, *, enough_memory: bool) -> None:
         self.enough_memory = enough_memory
+        self.available_mb: float | None = None
         self.checked: list[int] = []
         self.calls: list[tuple[int, bool]] = []
         self.on_switch_finished: Callable[[str], None] | None = None
@@ -180,6 +181,9 @@ class FakeSwitchPort:
     def can_switch_without_pause(self, min_ram_mb: int) -> bool:
         self.checked.append(min_ram_mb)
         return self.enough_memory
+
+    def mem_available_mb(self) -> float | None:
+        return self.available_mb
 
     def switch_model(self, *, min_ram_mb: int, pause: bool = False) -> None:
         self.calls.append((min_ram_mb, pause))
@@ -218,7 +222,9 @@ def test_hint_fields_are_present_without_switcher(rig: Rig) -> None:
     for item in downloads.models:
         assert item["hint"] == ""
         assert item["hintKind"] == ""
+        assert item["memoryShortage"] is False
         assert item["canSwitchWithPause"] is False
+        assert item["canReinstall"] is True
 
 
 def test_installed_summary_counts_catalog_entries(rig: Rig) -> None:
@@ -378,6 +384,434 @@ def test_failed_switch_restores_previous_working_model() -> None:
         item = card(downloads, TONE.id)
         assert item["state"] == "installed"
         assert item["message"] == "Не удалось загрузить модель. Рабочая модель не изменилась."
+    finally:
+        downloads.shutdown()
+
+
+def test_failed_switch_reports_confirmed_memory_shortage() -> None:
+    port, downloads, switcher = switched_rig(True)
+    lighter = replace(TONE, min_ram_mb=300)
+    port.catalog = (GIGAAM, lighter)
+    downloads._entries = port.catalog
+    port.current = (lighter.id, lighter.revision)
+    switcher.available_mb = 600
+    try:
+        downloads.makeModelCurrent(GIGAAM.id)
+        switcher.finish("failed")
+
+        item = card(downloads, GIGAAM.id)
+        assert port.current == (lighter.id, lighter.revision)
+        assert item["message"] == "Недостаточно памяти — нужно около 768 МБ"
+        assert item["hint"] == ""
+        assert item["hintKind"] == ""
+        assert item["memoryShortage"] is False
+    finally:
+        downloads.shutdown()
+
+
+def test_failed_switch_with_enough_available_memory_keeps_general_error() -> None:
+    port, downloads, switcher = switched_rig(True)
+    switcher.available_mb = TONE.min_ram_mb
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        switcher.finish("failed")
+        item = card(downloads, TONE.id)
+        assert item["message"] == model_downloads._SWITCH_FAILED_MESSAGE
+        assert item["hint"] == ""
+    finally:
+        downloads.shutdown()
+
+
+def test_failed_switch_without_lighter_model_has_no_hint() -> None:
+    port = FakeManagedPort()
+    port.catalog = (GIGAAM,)
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    switcher = FakeSwitchPort(enough_memory=True)
+    switcher.available_mb = 100
+    downloads = ModelDownloads(port, switcher=switcher)
+    try:
+        downloads.makeModelCurrent(GIGAAM.id)
+        switcher.finish("failed")
+        item = card(downloads, GIGAAM.id)
+        assert item["message"] == "Недостаточно памяти — нужно около 768 МБ"
+        assert item["hint"] == ""
+        assert item["hintKind"] == ""
+    finally:
+        downloads.shutdown()
+
+
+def test_failed_first_switch_suggests_lighter_catalog_model() -> None:
+    port = FakeManagedPort()
+    port.catalog = (GIGAAM, replace(TONE, min_ram_mb=300))
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    switcher = FakeSwitchPort(enough_memory=True)
+    switcher.available_mb = 600
+    downloads = ModelDownloads(port, switcher=switcher)
+    try:
+        downloads.makeModelCurrent(GIGAAM.id)
+        switcher.finish("failed")
+        item = card(downloads, GIGAAM.id)
+        assert item["message"] == "Недостаточно памяти — нужно около 768 МБ"
+        assert item["hint"] == "Попробуйте более лёгкую модель: T-one"
+        assert item["hintKind"] == "warning"
+        assert item["memoryShortage"] is True
+    finally:
+        downloads.shutdown()
+
+
+def test_failed_switch_skips_broken_lighter_model() -> None:
+    port = FakeManagedPort()
+    lighter = replace(TONE, min_ram_mb=300)
+    fallback = replace(TONE, id="fallback", revision="r2", name="Другая модель", min_ram_mb=400)
+    port.catalog = (GIGAAM, lighter, fallback)
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.records[(lighter.id, lighter.revision)] = "broken"
+    switcher = FakeSwitchPort(enough_memory=True)
+    switcher.available_mb = 600
+    downloads = ModelDownloads(port, switcher=switcher)
+    try:
+        downloads.makeModelCurrent(GIGAAM.id)
+        switcher.finish("failed")
+        assert card(downloads, GIGAAM.id)["hint"] == "Попробуйте более лёгкую модель: Другая модель"
+    finally:
+        downloads.shutdown()
+
+
+def test_failed_switch_store_error_still_notifies_and_keeps_message() -> None:
+    port = FakeManagedPort()
+    lighter = replace(TONE, min_ram_mb=300)
+    port.catalog = (GIGAAM, lighter)
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.records[(lighter.id, lighter.revision)] = "ok"
+    original = port.record_state
+    switcher = FakeSwitchPort(enough_memory=True)
+    switcher.available_mb = 100
+    downloads = ModelDownloads(port, switcher=switcher)
+    failed_once = False
+
+    def flaky_state(model_id: str, revision: str) -> str:
+        nonlocal failed_once
+        if model_id == lighter.id and not failed_once:
+            failed_once = True
+            raise StoreError("unavailable")
+        return original(model_id, revision)
+
+    port.record_state = Mock(side_effect=flaky_state)  # type: ignore[method-assign]
+    changed = QSignalSpy(downloads.modelsChanged)
+    try:
+        downloads.makeModelCurrent(GIGAAM.id)
+        switcher.finish("failed")
+        item = card(downloads, GIGAAM.id)
+        assert len(changed) >= 2
+        assert downloads._switching_entry is None
+        assert item["state"] != "switching"
+        assert item["message"]
+        assert item["hint"] == ""
+        assert item["hintKind"] == ""
+    finally:
+        downloads.shutdown()
+
+
+@pytest.mark.parametrize("result", ["ok", "failed"])
+def test_recheck_waits_for_switch_to_finish(result: str) -> None:
+    port, downloads, switcher = switched_rig(True)
+    pending = TONE
+    downloads._recheck_queue = [pending]
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        assert downloads._switching_entry is not None
+        downloads._start_next_recheck()
+        assert downloads._recheck_queue == [pending]
+        assert downloads._rechecking is False
+
+        started: list[Any] = []
+
+        def start_pending() -> None:
+            started.extend(downloads._recheck_queue)
+            downloads._recheck_queue.clear()
+
+        downloads._start_next_recheck = start_pending  # type: ignore[method-assign]
+        switcher.finish(result)
+        assert started == [pending]
+        assert downloads._switching_entry is None
+    finally:
+        downloads.shutdown()
+
+
+def test_failed_switch_memory_reader_error_keeps_general_message() -> None:
+    port, downloads, switcher = switched_rig(True)
+    switcher.mem_available_mb = Mock(side_effect=RuntimeError("private data"))  # type: ignore[method-assign]
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        switcher.finish("failed")
+        item = card(downloads, TONE.id)
+        assert item["message"] == model_downloads._SWITCH_FAILED_MESSAGE
+        assert item["memoryShortage"] is False
+    finally:
+        downloads.shutdown()
+
+
+def test_removed_catalog_model_stays_manageable(rig: Rig) -> None:
+    port, downloads, queued = rig
+    removed = replace(
+        TONE,
+        id="old-model",
+        revision="r1",
+        name="old-model",
+        min_ram_mb=GIGAAM.min_ram_mb,
+        removed_from_catalog=True,
+    )
+    port.catalog = (*port.catalog, removed)
+    downloads._entries = port.catalog
+    port.records[(removed.id, removed.revision)] = "ok"
+    item = card(downloads, removed.id)
+    assert item["state"] == "removed-from-catalog"
+    assert item["name"] == removed.id
+    assert item["badge"] == "installed"
+    assert item["message"] == ""
+    assert item["hint"] == "Снята с каталога — обновлений не будет"
+    assert item["hintKind"] == "info"
+    assert item["memoryShortage"] is False
+    assert item["canReinstall"] is False
+    assert item["updateAvailable"] is False
+    assert item["ramText"] == ""
+    assert item["ramMb"] == 0
+    assert item["tags"] == []
+    assert all(not metric["hasData"] for metric in item["metrics"])
+    downloads.updateModel(removed.id)
+    assert queued == []
+    downloads.makeModelCurrent(removed.id)
+    assert port.current == (removed.id, removed.revision)
+    assert card(downloads, removed.id)["badge"] == "active"
+    port.current = None
+    downloads.removeModel(removed.id)
+    assert port.removed == [(removed.id, removed.revision)]
+
+
+def test_removed_catalog_card_shows_local_memory_measurement(rig: Rig) -> None:
+    port, downloads, _ = rig
+    removed = replace(
+        TONE, id="old-model", revision="r1", name="old-model", removed_from_catalog=True
+    )
+    port.catalog = (*port.catalog, removed)
+    downloads._entries = port.catalog
+    port.records[(removed.id, removed.revision)] = "ok"
+    downloads._measurements_cache = {"old-model@r1": {"threads": 2, "ram_mb": 512}}
+
+    item = card(downloads, removed.id)
+
+    assert item["ramMeasured"] is True
+    assert item["ramMb"] == 512
+    assert item["ramText"] == "512 МБ"
+
+
+def test_removed_catalog_shortage_message_has_no_estimate() -> None:
+    port = FakeManagedPort()
+    removed = replace(
+        TONE,
+        id="old-model",
+        revision="r1",
+        name="old-model",
+        min_ram_mb=GIGAAM.min_ram_mb,
+        removed_from_catalog=True,
+    )
+    lighter = replace(TONE, min_ram_mb=300)
+    port.catalog = (lighter, removed)
+    port.records[(removed.id, removed.revision)] = "ok"
+    switcher = FakeSwitchPort(enough_memory=True)
+    switcher.available_mb = 100
+    downloads = ModelDownloads(port, switcher=switcher)
+    try:
+        downloads.makeModelCurrent(removed.id)
+        switcher.finish("failed")
+        item = card(downloads, removed.id)
+        assert item["message"] == "Недостаточно памяти для этой модели"
+        assert item["hint"] == "Попробуйте более лёгкую модель: T-one"
+        assert item["hintKind"] == "warning"
+    finally:
+        downloads.shutdown()
+
+
+def test_service_appends_only_non_revoked_models_missing_from_catalog() -> None:
+    service = ModelService.__new__(ModelService)
+    record = ModelRecord("old-model", "r1", Path("/unused"), "layout", "int8", 42_000_000)
+    revoked = replace(record, id="revoked-model")
+    service._store = Mock(records=Mock(return_value=[record, revoked]))
+    service._catalog = Mock(entries=(GIGAAM,))
+    service._catalog.is_revoked.side_effect = lambda model_id, _revision: (
+        model_id == "revoked-model"
+    )
+
+    entries = service.entries()
+
+    assert [entry.id for entry in entries] == [GIGAAM.id, record.id]
+    assert entries[-1].removed_from_catalog is True
+    assert entries[-1].name == record.id
+    assert entries[-1].size_bytes == record.size_bytes
+    assert entries[-1].min_ram_mb == GIGAAM.min_ram_mb
+
+
+@pytest.mark.parametrize(
+    ("current_revision", "states", "expected"),
+    [
+        ("r2", ("ok", "ok"), "r2"),
+        (None, ("broken", "ok"), "r2"),
+    ],
+)
+def test_service_selects_one_removed_revision(
+    current_revision: str | None, states: tuple[ModelState, ModelState], expected: str
+) -> None:
+    service = ModelService.__new__(ModelService)
+    r1 = ModelRecord("old-model", "r1", Path("/unused"), "layout", "int8", 41_000_000, states[0])
+    r2 = replace(r1, revision="r2", size_bytes=42_000_000, state=states[1])
+    service._store = Mock()
+    service._store.records.return_value = [r1, r2]
+    service._store.current.return_value = r2 if current_revision == "r2" else None
+    service._catalog = Mock(entries=(GIGAAM,))
+    service._catalog.is_revoked.return_value = False
+
+    entries = service.entries()
+
+    assert [entry.id for entry in entries] == [GIGAAM.id, "old-model"]
+    assert entries[1].revision == expected
+    assert entries[1].name == "old-model"
+
+
+def test_removed_model_two_revisions_have_one_manageable_card() -> None:
+    service = ModelService.__new__(ModelService)
+    r1 = ModelRecord("old-model", "r1", Path("/unused"), "layout", "int8", 41_000_000)
+    r2 = replace(r1, revision="r2", size_bytes=42_000_000)
+    service._store = Mock()
+    service._store.records.return_value = [r1, r2]
+    service._store.current.return_value = r1
+    service._catalog = Mock(entries=(GIGAAM,))
+    service._catalog.is_revoked.return_value = False
+    port = FakeManagedPort()
+    port.catalog = service.entries()
+    port.records[(r1.id, r1.revision)] = "ok"
+    port.records[(r2.id, r2.revision)] = "ok"
+    downloads = ModelDownloads(port)
+    try:
+        cards = [item for item in downloads.models if item["id"] == r1.id]
+        assert len(cards) == 1
+        assert cards[0]["name"] == r1.id
+        assert downloads.installedSummary.startswith("Установлено 1 из 2")
+        downloads.makeModelCurrent(r1.id)
+        assert port.current == (r1.id, r1.revision)
+        port.current = None
+        downloads.removeModel(r1.id)
+        assert port.removed == [(r1.id, r1.revision)]
+        assert port.records[(r2.id, r2.revision)] == "ok"
+    finally:
+        downloads.shutdown()
+
+
+def test_removed_catalog_model_uses_fallback_memory_and_skips_recheck() -> None:
+    service = ModelService.__new__(ModelService)
+    record = ModelRecord(
+        "old-model", "r1", Path("/unused"), "layout", "int8", 42_000_000, recheck=True
+    )
+    service._store = Mock(records=Mock(return_value=[record]))
+    service._catalog = Mock(entries=())
+    service._catalog.is_revoked.return_value = False
+
+    entries = service.entries()
+
+    assert entries[0].min_ram_mb == 768
+    assert service.recheck_entries() == ()
+
+
+def test_removed_catalog_switch_succeeds_and_bridge_hides_raw_id() -> None:
+    port = FakeManagedPort()
+    removed = replace(
+        TONE, id="old-model", revision="r1", name="old-model", removed_from_catalog=True
+    )
+    port.catalog = (GIGAAM, removed)
+    port.records[(removed.id, removed.revision)] = "ok"
+    switcher = FakeSwitchPort(enough_memory=True)
+    downloads = ModelDownloads(port, switcher=switcher)
+    bridge = SettingsBridge(settings_mod.from_dict({}), downloads=downloads, save=Mock())
+    try:
+        downloads.makeModelCurrent(removed.id)
+        assert card(downloads, removed.id)["state"] == "switching"
+        switcher.finish("ok")
+        assert port.current == (removed.id, removed.revision)
+        assert card(downloads, removed.id)["badge"] == "active"
+        assert card(downloads, removed.id)["state"] == "removed-from-catalog"
+        assert bridge.activeModelName == "Установленная модель"
+        queued = Mock()
+        downloads._begin_queue = queued  # type: ignore[method-assign]
+        assert downloads.can_reinstall() is False
+        downloads.reinstall_active()
+        queued.assert_not_called()
+    finally:
+        downloads.shutdown()
+
+
+def test_removed_catalog_switch_failure_keeps_message() -> None:
+    port = FakeManagedPort()
+    removed = replace(TONE, id="old-model", revision="r1", removed_from_catalog=True)
+    port.catalog = (GIGAAM, removed)
+    port.records[(removed.id, removed.revision)] = "ok"
+    switcher = FakeSwitchPort(enough_memory=True)
+    downloads = ModelDownloads(port, switcher=switcher)
+    try:
+        downloads.makeModelCurrent(removed.id)
+        switcher.finish("failed")
+        item = card(downloads, removed.id)
+        assert item["message"] == model_downloads._FIRST_SWITCH_FAILED_MESSAGE
+        assert item["hint"] == ""
+    finally:
+        downloads.shutdown()
+
+
+def test_removed_catalog_remove_failure_keeps_message(rig: Rig) -> None:
+    port, downloads, _ = rig
+    removed = replace(TONE, id="old-model", revision="r1", removed_from_catalog=True)
+    port.catalog = (*port.catalog, removed)
+    downloads._entries = port.catalog
+    port.records[(removed.id, removed.revision)] = "ok"
+    port.remove_error = OSError("private path")
+
+    downloads.removeModel(removed.id)
+
+    item = card(downloads, removed.id)
+    assert item["message"] == model_downloads._REMOVE_FAILED_MESSAGE
+    assert item["hint"] == ""
+
+
+def test_removed_catalog_broken_card_only_offers_removal(rig: Rig) -> None:
+    port, downloads, queued = rig
+    removed = replace(TONE, id="old-model", revision="r1", removed_from_catalog=True)
+    port.catalog = (*port.catalog, removed)
+    downloads._entries = port.catalog
+    port.records[(removed.id, removed.revision)] = "broken"
+
+    item = card(downloads, removed.id)
+    assert item["state"] == "broken"
+    assert item["canReinstall"] is False
+    assert item["message"] == "Файлы модели не читаются"
+    downloads._card_states[removed.id] = "verifying"
+    assert card(downloads, removed.id)["state"] == "verifying"
+    downloads._card_states[removed.id] = "removed-from-catalog"
+    assert card(downloads, removed.id)["state"] == "broken"
+    downloads.reinstallModel(removed.id)
+    assert queued == []
+
+
+def test_removed_catalog_pause_hint_takes_priority() -> None:
+    port = FakeManagedPort()
+    removed = replace(TONE, id="old-model", revision="r1", removed_from_catalog=True)
+    port.catalog = (GIGAAM, removed)
+    port.records[(removed.id, removed.revision)] = "ok"
+    switcher = FakeSwitchPort(enough_memory=False)
+    downloads = ModelDownloads(port, switcher=switcher)
+    try:
+        downloads.makeModelCurrent(removed.id)
+        item = card(downloads, removed.id)
+        assert item["canSwitchWithPause"] is True
+        assert item["hint"] == model_downloads._SWITCH_PAUSE_HINT
+        assert item["hintKind"] == "warning"
     finally:
         downloads.shutdown()
 

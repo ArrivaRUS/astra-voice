@@ -405,6 +405,11 @@ class DictationRuntime(QObject):
         available = store.mem_available_mb()
         return available is not None and available >= min_ram_mb + 200
 
+    def mem_available_mb(self) -> float | None:
+        """Доступная сейчас память в десятичных МБ; None, если узнать нельзя."""
+        store = self.model_store or ModelStore(paths.model_store_dir())
+        return store.mem_available_mb()
+
     def switch_model(self, *, min_ram_mb: int, pause: bool = False) -> None:
         """Меняет выбранную модель после завершения текущей диктовки."""
         if self._closed or self._pending_switch is not None or self._switch_active():
