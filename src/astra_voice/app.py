@@ -31,6 +31,7 @@ from astra_voice.core.version import __version__
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.sound import MicrophoneState
+from astra_voice.ui.hotkey_capture import HotkeyCapture
 
 if TYPE_CHECKING:
     from astra_voice.core.dictation import LevelCallback, TestCallback
@@ -483,6 +484,9 @@ class _RuntimeOnboardingHost:
     def begin_capture(self) -> bool:
         return self._runtime.begin_hotkey_capture()
 
+    def set_capture_callback(self, callback: Callable[[str, str], None]) -> None:
+        self._runtime.set_hotkey_capture_callback(callback)
+
     def end_capture(self) -> None:
         self._runtime.end_hotkey_capture()
 
@@ -814,15 +818,25 @@ def main(argv: list[str] | None = None) -> int:
             # Отозванную ревизию рантайм видит только через каталог (US-6.6).
             runtime.set_revoked_check(model.revoked_revision)
 
+        capture_host = (
+            _RuntimeOnboardingHost(runtime, shell)
+            if runtime_ready and runtime is not None
+            else None
+        )
+        capture = HotkeyCapture(capture_host)
         settings_bridge = SettingsBridge(
             stored,
             mirror=settings,
             downloads=downloads,
             apply=_RuntimeSettingsApply(runtime) if runtime_ready and runtime is not None else None,
+            capture=capture,
             locked=policy.locked_keys,
         )
         QQmlEngine.setObjectOwnership(settings_bridge, QQmlEngine.CppOwnership)
         _set_context_property(shell, "settingsBridge", settings_bridge)
+        root = _root_window(shell)
+        if root is not None:
+            capture.attach_window(root)
         show_onboarding = stored.extra.get("onboarding_done") is not True
         if show_onboarding:
             onboarding = OnboardingController(
@@ -832,13 +846,11 @@ def main(argv: list[str] | None = None) -> int:
                 status_sink=runtime.tray.set_download_status
                 if runtime_ready and runtime is not None
                 else None,
-                host=_RuntimeOnboardingHost(runtime, shell)
-                if runtime_ready and runtime is not None
-                else None,
+                host=capture_host,
+                capture=capture,
             )
             QQmlEngine.setObjectOwnership(onboarding, QQmlEngine.CppOwnership)
             _set_context_property(shell, "onboarding", onboarding)
-            root = _root_window(shell)
             if root is not None:
                 onboarding.attach_window(root)
             onboarding.doneChanged.connect(

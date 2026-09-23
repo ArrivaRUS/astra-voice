@@ -32,13 +32,13 @@ from astra_voice.core.dictation import (
 )
 from astra_voice.core.settings import Settings, is_valid_combo
 from astra_voice.core.settings import save as settings_save
-from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
 from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui import notify
 from astra_voice.ui.formatting import (
     clean_display_name,
     format_size,
 )
+from astra_voice.ui.hotkey_capture import CaptureHost, HotkeyCapture
 from astra_voice.ui.model_downloads import (
     ModelDownloads,
     ModelPort,
@@ -125,6 +125,10 @@ class SettingsBridge(QObject):
     deviceChanged = pyqtSignal()
     devicesChanged = pyqtSignal()
     hotkeyStatusChanged = pyqtSignal()
+    captureStateChanged = pyqtSignal()
+    captureMessageChanged = pyqtSignal()
+    pendingComboChanged = pyqtSignal()
+    freeCandidatesChanged = pyqtSignal()
     saveErrorChanged = pyqtSignal()
     modelSelfcheckChanged = pyqtSignal()
     microphoneChanged = pyqtSignal()
@@ -161,6 +165,8 @@ class SettingsBridge(QObject):
         downloads: ModelDownloads | None = None,
         locked: Iterable[str] = (),
         apply: SettingsApply | None = None,
+        capture_host: CaptureHost | None = None,
+        capture: HotkeyCapture | None = None,
         save: Callable[[Settings], None] = settings_save,
         open_url: Callable[[QUrl], bool] | None = None,
         dialog_factory: Callable[[], str] = QFileDialog.getExistingDirectory,
@@ -177,6 +183,9 @@ class SettingsBridge(QObject):
         self._devices: list[dict[str, str]] = [_DEFAULT_DEVICE.copy()]
         self._locked = frozenset(locked)
         self._apply = apply
+        self._capture = capture if capture is not None else HotkeyCapture(capture_host, self)
+        for name in ("captureState", "captureMessage", "pendingCombo", "freeCandidates"):
+            getattr(self._capture, name + "Changed").connect(getattr(self, name + "Changed"))
         self._save = save
         self._values = self._read_values()
         self._hotkey_status = "ok"
@@ -198,6 +207,10 @@ class SettingsBridge(QObject):
             downloads.modelReadyChanged.connect(self.activeModelChanged)
             downloads.modelReadyChanged.connect(self.activeModelStateChanged)
             downloads.downloadStateChanged.connect(self.activeModelStateChanged)
+
+    @property
+    def capture(self) -> HotkeyCapture:
+        return self._capture
 
     @pyqtProperty(str, notify=activeModelChanged)
     def activeModelName(self) -> str:  # noqa: N802
@@ -411,7 +424,9 @@ class SettingsBridge(QObject):
             combo = cast(str, value) if name == "hotkey" else self.hotkey
             mode = cast(str, value) if name == "hotkeyMode" else self.hotkeyMode
             code = hotkey_apply.hotkey(combo, mode)
-            if code not in ("", "ok"):
+            if code not in ("", "ok") and not (
+                name == "hotkey" and self._capture.keep_busy and code == "busy"
+            ):
                 hotkey_apply.hotkey(self.hotkey, self.hotkeyMode)
                 # apply_hotkey может менять тот же Settings, что сохраняет мост.
                 setattr(self._settings, field, old)
@@ -453,7 +468,11 @@ class SettingsBridge(QObject):
             if name == "pillEnabled":
                 self._apply.pill_enabled(self.pillEnabled)
             elif hotkey_apply is not None:
-                self.set_hotkey_status("ok")
+                self.set_hotkey_status(
+                    "busy"
+                    if name == "hotkey" and self._capture.keep_busy and code == "busy"
+                    else "ok"
+                )
             elif name == "device":
                 self._apply.device(self.device or None)
                 self.refreshMicrophone()
@@ -475,6 +494,54 @@ class SettingsBridge(QObject):
     @hotkey.setter  # type: ignore[no-redef]
     def hotkey(self, value: str) -> None:
         self._set_value("hotkey", value)
+
+    @pyqtProperty(str, notify=captureStateChanged)
+    def captureState(self) -> str:  # noqa: N802
+        return self._capture.state
+
+    @pyqtProperty(str, notify=captureMessageChanged)
+    def captureMessage(self) -> str:  # noqa: N802
+        return self._capture.message
+
+    @pyqtProperty(str, notify=pendingComboChanged)
+    def pendingCombo(self) -> str:  # noqa: N802
+        return self._capture.pending_combo
+
+    @pyqtProperty("QStringList", notify=freeCandidatesChanged)
+    def freeCandidates(self) -> list[str]:  # noqa: N802
+        return list(self._capture.free_candidates)
+
+    def save_capture_combo(self, combo: str, keep: bool) -> str:
+        """Применяет и сохраняет комбинацию общим путём для обоих экранов."""
+        if self._apply is None:
+            return "not-grabbed"
+        # «Оставить» учитывается в _set_value через общий HotkeyCapture.keep_busy.
+        self._set_value("hotkey", combo)
+        if self.saveError:
+            return "not-grabbed"
+        if self.hotkey != combo:
+            return self.hotkeyStatus if self.hotkeyStatus != "ok" else "not-grabbed"
+        return "ok"
+
+    @pyqtSlot()
+    def beginCapture(self) -> None:  # noqa: N802
+        self._capture.begin(self.save_capture_combo)
+
+    @pyqtSlot(str)
+    def endCapture(self, combo: str) -> None:  # noqa: N802
+        self._capture.end(combo, self.save_capture_combo)
+
+    @pyqtSlot()
+    def cancelCapture(self) -> None:  # noqa: N802
+        self._capture.cancel()
+
+    @pyqtSlot()
+    def keepCombo(self) -> None:  # noqa: N802
+        self._capture.keep()
+
+    @pyqtSlot()
+    def refreshCandidates(self) -> None:  # noqa: N802
+        self._capture.refresh_candidates()
 
     @pyqtProperty(str, notify=hotkeyModeChanged)
     def hotkeyMode(self) -> str:  # noqa: N802 — имя свойства для QML
@@ -657,7 +724,7 @@ class SettingsBridge(QObject):
                 getattr(self, name + "Changed").emit()
 
 
-class OnboardingHost(Protocol):
+class OnboardingHost(CaptureHost, Protocol):
     """Действия приложения, доступные мастеру первого запуска."""
 
     def begin_capture(self) -> bool: ...
@@ -736,18 +803,13 @@ class OnboardingController(QObject):
     testDurationChanged = pyqtSignal()
     testMessageChanged = pyqtSignal()
 
-    _MESSAGES = {
-        "conflict": "Эта комбинация занята другой программой. Можно оставить её или выбрать другую",
-        "duplicate": "Эта комбинация уже назначена",
-        "not-grabbed": "Не удалось назначить комбинацию. Выберите другую",
-    }
-
     def __init__(
         self,
         bridge: SettingsBridge,
         *,
         settings: Settings,
         host: OnboardingHost | None = None,
+        capture: HotkeyCapture | None = None,
         model: ModelPort | None = None,
         downloads: ModelDownloads | None = None,
         status_sink: Callable[[str], None] | None = None,
@@ -819,10 +881,13 @@ class OnboardingController(QObject):
         self._test_epoch = 0
         step = settings.extra.get("onboarding_step")
         self._step = step if type(step) is int and 1 <= step <= 5 else 1
-        self._capture_state = "idle"
-        self._capture_hint: str = ""
-        self._pending_combo = ""
-        self._free_candidates: list[str] = []
+        self._capture = capture if capture is not None else bridge.capture
+        # События окна принимает один фильтр; мастер очищает только свою пробу.
+        self._capture.windowEvent.connect(self.eventFilter, Qt.DirectConnection)
+        if host is not None:
+            self._capture.host = host
+        for name in ("captureState", "captureMessage", "pendingCombo", "freeCandidates"):
+            getattr(self._capture, name + "Changed").connect(getattr(self, name + "Changed"))
         for name in (
             "language",
             "checkAppUpdates",
@@ -869,10 +934,8 @@ class OnboardingController(QObject):
 
     def attach_window(self, window: QObject) -> None:
         """Подключает корневое окно и читает видимость до первого события Show."""
-        if self._window is not None:
-            self._window.removeEventFilter(self)
         self._window = window
-        window.installEventFilter(self)
+        self._capture.attach_window(window)
         visible = getattr(window, "isVisible", None)
         self._window_visible = bool(visible()) if callable(visible) else None
 
@@ -898,8 +961,6 @@ class OnboardingController(QObject):
                 self._window_visible = bool(visible())
         if event.type() in (QEvent.Hide, QEvent.Close) or minimized:
             self._window_visible = False
-            if self._capture_state == "capturing":
-                self.cancelCapture()
             self._clear_test()
         return bool(super().eventFilter(obj, event))
 
@@ -916,7 +977,7 @@ class OnboardingController(QObject):
             return
         if not self._bridge.set_extra("onboarding_step", step):
             return
-        if self._capture_state == "capturing":
+        if self.captureState == "capturing":
             self.cancelCapture()
         self._clear_test()
         self._step = step
@@ -1397,136 +1458,39 @@ class OnboardingController(QObject):
 
     @pyqtProperty(str, notify=captureStateChanged)
     def captureState(self) -> str:  # noqa: N802
-        return self._capture_state
+        return self._capture.state
 
     @pyqtProperty(str, notify=captureMessageChanged)
     def captureMessage(self) -> str:  # noqa: N802
-        return self._capture_hint or self._MESSAGES.get(self._capture_state, "")
+        return self._capture.message
 
     @pyqtProperty("QStringList", notify=freeCandidatesChanged)
     def freeCandidates(self) -> list[str]:  # noqa: N802
-        return list(self._free_candidates)
+        return list(self._capture.free_candidates)
 
     @pyqtProperty(str, notify=pendingComboChanged)
     def pendingCombo(self) -> str:  # noqa: N802
-        return self._pending_combo
-
-    def _set_capture_state(self, state: str) -> None:
-        if state != self._capture_state:
-            old_message = self.captureMessage
-            self._capture_state = state
-            self._capture_hint = ""
-            self.captureStateChanged.emit()
-            if old_message != self.captureMessage:
-                self.captureMessageChanged.emit()
-
-    def _set_capture_hint(self, hint: str) -> None:
-        old_message = self.captureMessage
-        self._capture_hint = hint
-        if old_message != self.captureMessage:
-            self.captureMessageChanged.emit()
-
-    def _set_pending_combo(self, combo: str) -> None:
-        if combo != self._pending_combo:
-            self._pending_combo = combo
-            self.pendingComboChanged.emit()
-
-    def _end_capture(self) -> None:
-        if self._host is not None:
-            try:
-                self._host.end_capture()
-            except Exception:
-                log.warning("Не удалось завершить захват клавиатуры", exc_info=True)
+        return self._capture.pending_combo
 
     @pyqtSlot()
     def beginCapture(self) -> None:  # noqa: N802
-        self._set_capture_hint("")
-        self._set_pending_combo("")
-        try:
-            available = self._host is not None and self._host.begin_capture()
-        except Exception:
-            log.warning("Не удалось начать захват клавиатуры", exc_info=True)
-            available = False
-        if not available:
-            self._end_capture()
-        self._set_capture_state("capturing" if available else "not-grabbed")
+        self._capture.begin(self._bridge.save_capture_combo)
 
     @pyqtSlot(str)
     def endCapture(self, combo: str) -> None:  # noqa: N802
-        # XGrabKeyboard снимается ДО любого пробника, сохранения или применения.
-        self._end_capture()
-        self._set_pending_combo(combo)
-        if not combo:
-            self._set_capture_state("idle")
-            return
-        if not is_valid_combo(combo):
-            self._set_capture_state("capturing")
-            self._set_capture_hint("Добавьте к клавише Ctrl, Alt или Win")
-            self.refreshCandidates()
-            return
-        self._set_capture_state("captured")
-        try:
-            code = self._host.probe(combo) if self._host is not None else "not-grabbed"
-        except Exception:
-            log.warning("Не удалось проверить сочетание клавиш", exc_info=True)
-            code = "not-grabbed"
-        if code == "ok":
-            self._save_combo()
-        else:
-            self._set_capture_state(
-                {"busy": "conflict", "duplicate": "duplicate"}.get(code, "not-grabbed")
-            )
+        self._capture.end(combo, self._bridge.save_capture_combo)
 
     @pyqtSlot()
     def cancelCapture(self) -> None:  # noqa: N802
-        self._end_capture()
-        self._set_capture_hint("")
-        self._set_pending_combo("")
-        self._set_capture_state("idle")
-
-    def _save_combo(self, *, keep: bool = False) -> None:
-        if self._host is None:
-            self._set_capture_state("not-grabbed")
-            return
-        self._bridge.setProperty("hotkey", self._pending_combo)
-        if self._bridge.hotkey != self._pending_combo:
-            self._set_capture_state("not-grabbed")
-            return
-        try:
-            code = self._host.apply_hotkey(self.hotkey, self.hotkeyMode)
-        except Exception:
-            log.warning("Не удалось применить сочетание клавиш", exc_info=True)
-            code = "not-grabbed"
-        # «Оставить» принимает занятость: рантайм продолжает автоматический перезахват.
-        if code == "ok" or (keep and code == "busy"):
-            self._set_capture_state("success")
-        else:
-            self._set_capture_state(
-                {"busy": "conflict", "duplicate": "duplicate"}.get(code, "not-grabbed")
-            )
+        self._capture.cancel()
 
     @pyqtSlot()
     def keepCombo(self) -> None:  # noqa: N802
-        if self._capture_state == "conflict" and self._pending_combo:
-            self._save_combo(keep=True)
+        self._capture.keep()
 
     @pyqtSlot()
     def refreshCandidates(self) -> None:  # noqa: N802
-        try:
-            candidates = (
-                self._host.free_candidates(list(DEFAULT_CANDIDATES))
-                if self._host is not None
-                else []
-            )
-        except Exception:
-            log.warning("Не удалось найти свободные сочетания клавиш", exc_info=True)
-            candidates = []
-            self._set_capture_state("not-grabbed")
-        if self._host is None:
-            self._set_capture_state("not-grabbed")
-        if candidates != self._free_candidates:
-            self._free_candidates = list(candidates)
-            self.freeCandidatesChanged.emit()
+        self._capture.refresh_candidates()
 
     @pyqtProperty(bool, notify=doneChanged)
     def done(self) -> bool:
@@ -1539,7 +1503,7 @@ class OnboardingController(QObject):
         if not self._bridge.set_extra("onboarding_done", True):
             return
         self._clear_test()
-        if self._capture_state == "capturing":
+        if self.captureState == "capturing":
             self.cancelCapture()
         if self._host is not None:
             try:

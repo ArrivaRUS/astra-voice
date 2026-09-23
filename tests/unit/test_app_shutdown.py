@@ -492,18 +492,42 @@ def test_onboarding_attaches_window_before_show(rig: Rig, hidden: bool) -> None:
         item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
     )
     controller = properties["onboarding"]
+    capture = properties["settingsBridge"].capture
     assert controller._window is root
     assert controller._window_visible is False
-    root.installEventFilter.assert_called_once_with(controller)
+    # Один фильтр снимает захват и передаёт мастеру события для очистки пробы.
+    assert root.installEventFilter.call_args_list == [call(capture)]
     calls = rig.calls.mock_calls
-    attached = calls.index(call.attach_filter(controller))
+    capture_attached = calls.index(call.attach_filter(capture))
     read = calls.index(call.read_visibility())
-    assert attached < read < calls.index(call.exec())
+    assert capture_attached < read < calls.index(call.exec())
     if hidden:
         rig.show.assert_not_called()
     else:
         rig.show.assert_called_once_with(rig.shell)
         assert read < calls.index(call.show(rig.shell)) < calls.index(call.exec())
+
+
+@pytest.mark.parametrize("code", ["ok", "busy"])
+def test_main_onboarding_uses_settings_apply(rig: Rig, code: str) -> None:
+    rig.runtime.hotkey.probe.return_value.code = "ok"
+    rig.runtime.apply_hotkey.return_value = code
+    assert app_mod.main([]) == 7
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    controller = properties["onboarding"]
+    bridge = properties["settingsBridge"]
+    assert isinstance(bridge._apply, app_mod._RuntimeSettingsApply)
+    original = rig.settings.hotkey
+    controller.endCapture("Ctrl+Alt+D")
+    assert controller.captureState == ("success" if code == "ok" else "conflict")
+    assert rig.settings.hotkey == ("Ctrl+Alt+D" if code == "ok" else original)
+    assert rig.runtime.apply_hotkey.call_args_list == (
+        [call("Ctrl+Alt+D", "ptt")]
+        if code == "ok"
+        else [call("Ctrl+Alt+D", "ptt"), call(original, "ptt")]
+    )
 
 
 def test_onboarding_host_delegates_and_hides_root(

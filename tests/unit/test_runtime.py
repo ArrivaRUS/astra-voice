@@ -2126,6 +2126,21 @@ def test_begin_and_end_hotkey_capture_use_dedicated_watchdog(rig: Rig) -> None:
     assert not rig.timers, "Сторож поля использовал GUI-таймер"
 
 
+def test_hotkey_capture_passes_key_callback_to_watchdog(rig: Rig) -> None:
+    received: list[tuple[str, str]] = []
+    rig.runtime.set_hotkey_capture_callback(lambda action, value: received.append((action, value)))
+    assert rig.runtime.begin_hotkey_capture()
+    callback = rig.capture_watchdogs[0].on_key_event
+    callback("combo", "Ctrl+K")
+    assert received == [("combo", "Ctrl+K")]
+    rig.runtime.end_hotkey_capture()
+    # Колбэк должен переживать end/begin, иначе повторный захват теряет клавиши.
+    assert rig.runtime._capture_key_callback is callback
+    assert rig.runtime.begin_hotkey_capture()
+    assert rig.capture_watchdogs[-1].on_key_event is callback
+    rig.runtime.end_hotkey_capture()
+
+
 def test_begin_hotkey_capture_failure_cleans_up_and_allows_retry(rig: Rig) -> None:
     rig.capture_open_ok = False
     assert not rig.runtime.begin_hotkey_capture()
@@ -2147,6 +2162,30 @@ def test_begin_hotkey_capture_after_expiry_replaces_watchdog(rig: Rig) -> None:
     expired.close.assert_called_once_with()
     assert len(rig.capture_watchdogs) == 2
     rig.runtime.end_hotkey_capture()
+
+
+def test_capture_callback_survives_expired_watchdog(rig: Rig) -> None:
+    received: list[tuple[str, str]] = []
+
+    def callback(action: str, value: str) -> None:
+        received.append((action, value))
+
+    rig.runtime.set_hotkey_capture_callback(callback)
+    assert rig.runtime.begin_hotkey_capture()
+    expired = rig.capture_watchdogs[0]
+    expired.active = False
+    expired.on_expired()
+    assert received == [("expired", "")]
+    # GUI повторно задаёт колбэк до очистки протухшего сторожа в begin.
+    rig.runtime.set_hotkey_capture_callback(callback)
+    assert rig.runtime.begin_hotkey_capture()
+    current = rig.capture_watchdogs[-1]
+    assert current is not expired
+    assert current.on_key_event is callback
+    current.on_key_event("combo", "Ctrl+K")
+    assert received[-1] == ("combo", "Ctrl+K")
+    rig.runtime.shutdown()
+    assert rig.runtime._capture_key_callback is None
 
 
 def test_shutdown_stops_capture_even_without_runtime_start(rig: Rig) -> None:
