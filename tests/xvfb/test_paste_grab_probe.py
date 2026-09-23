@@ -43,6 +43,12 @@ SETTLE_MS = 50
 POLL_MS = 5
 
 
+#: Режимы Focus-событий по протоколу X11 (X.NotifyNormal … X.NotifyWhileGrabbed).
+_MODE_NAMES = {0: "NotifyNormal", 1: "NotifyGrab", 2: "NotifyUngrab", 3: "NotifyWhileGrabbed"}
+#: Режимы, которые приложение (Qt xcb, GTK) не считает сменой фокуса.
+_GRAB_MODES = {"NotifyGrab", "NotifyUngrab"}
+
+
 def _window_id(event: Any) -> int:
     """Поле window события — ресурс Xlib либо целое, в зависимости от версии python-xlib."""
     window = getattr(event, "window", 0)
@@ -64,7 +70,12 @@ class FocusWatcher:
         return int(self.other.id)
 
     def _read(self) -> list[str]:
-        """Забрать очередь до конца; вернуть имена Focus-событий мишени."""
+        """Забрать очередь до конца; вернуть Focus-события мишени как «Вид/Режим».
+
+        Режим важнее факта события: при захвате сервер шлёт FocusOut/FocusIn с
+        NotifyGrab/NotifyUngrab даже на самом окне фокуса (CI 23.09), а тулкиты
+        (Qt xcb, GTK) такие события не считают сменой фокуса.
+        """
         names: list[str] = []
         self.conn.sync()
         while self.conn.pending_events():
@@ -73,7 +84,7 @@ class FocusWatcher:
                 continue
             kind = type(event).__name__
             if kind in {"FocusIn", "FocusOut"}:
-                names.append(kind)
+                names.append(f"{kind}/{_MODE_NAMES.get(int(getattr(event, 'mode', -1)), '?')}")
         return names
 
     def settle(self) -> None:
@@ -166,11 +177,16 @@ def watcher() -> Iterator[FocusWatcher]:
 
 
 def test_probe_on_focus_window_is_silent(watcher: FocusWatcher, xdisplay: X11Display) -> None:
-    """Проба на окне фокуса: ни FocusIn, ни FocusOut за 300 мс, фокус на месте, захват снят."""
+    """Проба на окне фокуса: только события захвата (NotifyGrab/NotifyUngrab), фокус на месте.
+
+    Обычной смены фокуса (NotifyNormal/NotifyWhileGrabbed) приложение видеть не должно.
+    """
     watcher.settle()
     assert _keyboard_busy(xdisplay, watcher.target_id()) == "", "проба обязана была захватить"
     assert xdisplay.keyboard_grab_deadline is None
-    assert watcher.collect(WATCH_MS) == []
+    events = watcher.collect(WATCH_MS)
+    unexpected = [name for name in events if name.split("/")[1] not in _GRAB_MODES]
+    assert unexpected == [], f"смена фокуса вне захвата: {unexpected} (все события: {events})"
     assert watcher.focus_id() == watcher.target_id()
     assert watcher.foreign_grab_status() == "GrabSuccess"
 
@@ -181,6 +197,7 @@ def test_probe_on_other_window_moves_focus(watcher: FocusWatcher, xdisplay: X11D
     assert _keyboard_busy(xdisplay, watcher.other_id()) == "", "проба обязана была захватить"
     assert xdisplay.keyboard_grab_deadline is None
     events = watcher.collect(WATCH_MS)
-    assert "FocusOut" in events and "FocusIn" in events, f"стенд не увидел смены фокуса: {events}"
+    kinds = {name.split("/")[0] for name in events}
+    assert {"FocusOut", "FocusIn"} <= kinds, f"стенд не увидел смены фокуса: {events}"
     assert watcher.focus_id() == watcher.target_id()
     assert watcher.foreign_grab_status() == "GrabSuccess"
