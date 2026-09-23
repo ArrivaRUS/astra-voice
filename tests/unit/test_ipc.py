@@ -40,7 +40,7 @@ _MESSAGES: list[dict[str, Any]] = [
     {"type": "audio.close"},
     {
         "type": "hello",
-        "protocol": 1,
+        "protocol": 2,
         "build": "0.1.0",
         "runtime": {"python": "3.11.0", "onnxruntime": None},
     },
@@ -52,7 +52,14 @@ _MESSAGES: list[dict[str, Any]] = [
         "load_ms": 12.5,
         "engine_version": "0.12.0",
     },
-    {"type": "result", "utterance_id": "a-B_09", "text": "Проверка", "t_ms": 42},
+    {
+        "type": "result",
+        "utterance_id": "a-B_09",
+        "text": "Проверка",
+        "t_ms": 42,
+        "infer_ms": 5.0,
+        "audio_ms": 1000.0,
+    },
     {"type": "cancelled", "utterance_id": "a-B_09"},
     {"type": "error", "code": "bad-field", "message": "Неверное поле"},
     {"type": "pong"},
@@ -99,7 +106,14 @@ def test_several_frames_and_partial_tail() -> None:
 
 
 def test_bytewise_utf8_frame() -> None:
-    msg = {"type": "result", "utterance_id": "u", "text": "Привет 🎤", "t_ms": 1.5}
+    msg = {
+        "type": "result",
+        "utterance_id": "u",
+        "text": "Привет 🎤",
+        "t_ms": 1.5,
+        "infer_ms": 5.0,
+        "audio_ms": 1000.0,
+    }
     reader = ipc.FrameReader()
     result: list[dict[str, Any]] = []
     for byte in ipc.encode(msg):
@@ -169,7 +183,14 @@ def test_bad_payload_and_recovery(payload: bytes) -> None:
 
 @pytest.mark.parametrize("length", [ipc.MAX_TEXT_BYTES + 1, 50 * 1024 * 1024])
 def test_oversized_text_rejected_before_serialization(length: int) -> None:
-    msg = {"type": "result", "utterance_id": "u", "text": "x" * length, "t_ms": 1}
+    msg = {
+        "type": "result",
+        "utterance_id": "u",
+        "text": "x" * length,
+        "t_ms": 1,
+        "infer_ms": 5.0,
+        "audio_ms": 1000.0,
+    }
     tracemalloc.start()
     try:
         with pytest.raises(ipc.FrameError) as caught:
@@ -182,7 +203,14 @@ def test_oversized_text_rejected_before_serialization(length: int) -> None:
 
 
 def test_text_limit_counts_utf8_bytes() -> None:
-    msg: dict[str, Any] = {"type": "result", "utterance_id": "u", "text": "я" * 16384, "t_ms": 0}
+    msg: dict[str, Any] = {
+        "type": "result",
+        "utterance_id": "u",
+        "text": "я" * 16384,
+        "t_ms": 0,
+        "infer_ms": 5.0,
+        "audio_ms": 1000.0,
+    }
     assert ipc.FrameReader().feed(ipc.encode(msg)) == [msg]
     msg["text"] += "я"
     with pytest.raises(ipc.FrameError) as caught:
@@ -225,7 +253,7 @@ def test_required_fields_and_types(msg: dict[str, Any]) -> None:
 @pytest.mark.parametrize(
     "changes",
     [
-        {"protocol": 2},
+        {"protocol": 1},
         {"runtime": {}},
         {"runtime": {"python": "3.11"}},
         {"runtime": {"onnxruntime": None}},
@@ -237,7 +265,25 @@ def test_invalid_hello(changes: dict[str, Any]) -> None:
     msg = {**_MESSAGES[10], **changes}
     with pytest.raises(ipc.FrameError) as caught:
         ipc.encode(msg)
-    assert caught.value.code == "bad-field"
+    assert caught.value.code == (ipc.PROTOCOL_MISMATCH if "protocol" in changes else "bad-field")
+
+
+def test_protocol_versions_reject_both_directions(monkeypatch: pytest.MonkeyPatch) -> None:
+    new_hello = ipc.make_hello()
+    old_hello = {**new_hello, "protocol": 1}
+    with pytest.raises(ipc.FrameError, match="Программа обновлена"):
+        ipc.decode(_payload(old_hello))
+    monkeypatch.setattr(ipc, "PROTOCOL_VERSION", 1)
+    with pytest.raises(ipc.FrameError, match="Программа обновлена"):
+        ipc.decode(_payload(new_hello))
+
+
+@pytest.mark.parametrize("missing", ["infer_ms", "audio_ms"])
+def test_result_requires_measurement_numbers(missing: str) -> None:
+    message = next(msg for msg in _MESSAGES if msg["type"] == "result")
+    with pytest.raises(ipc.FrameError) as caught:
+        ipc.encode({key: value for key, value in message.items() if key != missing})
+    assert caught.value.code == ipc.BAD_FIELD
 
 
 def test_unknown_message() -> None:
@@ -306,7 +352,7 @@ def test_hello_without_onnxruntime(monkeypatch: pytest.MonkeyPatch) -> None:
     assert type(hello["protocol"]) is int
     assert hello == {
         "type": "hello",
-        "protocol": 1,
+        "protocol": 2,
         "build": __version__,
         "runtime": {"python": platform.python_version(), "onnxruntime": None},
     }

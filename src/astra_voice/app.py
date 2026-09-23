@@ -812,11 +812,12 @@ def main(argv: list[str] | None = None) -> int:
             model = ModelService(settings, policy)
         except Exception:  # noqa: BLE001 — каталог не должен мешать запуску окна
             log.warning("Не удалось подготовить каталог моделей, настройка продолжится без него")
-        downloads = ModelDownloads(model, store=model_store)
+        downloads = ModelDownloads(model, store=model_store, settings=settings)
         downloads.start_recheck()
         if runtime_ready and runtime is not None and model is not None:
             # Отозванную ревизию рантайм видит только через каталог (US-6.6).
             runtime.set_revoked_check(model.revoked_revision)
+            runtime.on_measurements_changed = downloads.measurements_changed
 
         capture_host = (
             _RuntimeOnboardingHost(runtime, shell)

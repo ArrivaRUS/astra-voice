@@ -73,6 +73,55 @@ pytestmark = pytest.mark.unit
 MARKER = "ГЕЛИОТРОП-7"
 
 
+def test_measure_send_failure_still_saves_five_warm_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = Rig(monkeypatch)
+    path = tmp_path / "measurements.json"
+    rig.runtime.measurements.path = path
+    rig.runtime.measurements.set_model("model", "rev", 2)
+    monkeypatch.setattr(rig.runtime, "_send", Mock(side_effect=RuntimeError("send failed")))
+    rig.runtime._dictation_succeeded(1000, 100, True)
+    for _ in range(5):
+        rig.runtime._dictation_succeeded(1000, 100, False)
+    saved = json.loads(path.read_text())["model@rev"]
+    assert saved["rtfx"] == 10
+    assert saved["ram_mb"] is None
+
+
+def test_worker_restart_discards_warm_runs_even_for_same_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = Rig(monkeypatch, from_dict({"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="проверка")
+    for _ in range(2):
+        rig.hotkey.fsm.press(rig.now)
+        rig.release(rig.now + 1)
+        rig.event(type="result", text=MARKER, t_ms=1, audio_ms=1000, infer_ms=100)
+    assert rig.runtime.measurements.warm_runs
+    rig.runtime.restart_worker(wait_for_model=True)
+    rig.event(type="hello")
+    assert rig.runtime.measurements.warm_runs == []
+    rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="проверка")
+    rig.hotkey.fsm.press(rig.now)
+    rig.release(rig.now + 1)
+    rig.event(type="result", text=MARKER, t_ms=1, audio_ms=1000, infer_ms=100)
+    assert rig.runtime.measurements.warm_runs == []
+
+
+def test_protocol_mismatch_shows_restart_instruction(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch)
+    rig.event(type="error", code=ipc.PROTOCOL_MISMATCH)
+    rig.pill.show_state.assert_called_once_with(
+        PillState.ERROR, text="Программа обновлена — перезапустите её"
+    )
+    rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
+
+
 class Signal:
     """Синхронная доставка сигнала без объектов Qt."""
 
@@ -481,6 +530,8 @@ def test_microphone_announcement_follows_worker_generations(
                         "utterance_id": send.call_args.args[0]["utterance_id"],
                         "text": MARKER,
                         "t_ms": 1,
+                        "infer_ms": 5.0,
+                        "audio_ms": 1000.0,
                     }
                 )
                 assert rig.notify.notify_microphone_selected.call_count == cycle + 1
@@ -3410,7 +3461,16 @@ def test_onboarding_install_and_finish_loads_model_for_next_dictation(
             rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
         elif previous_state == "selfcheck-failed":
             event({**loaded, "id": "previous-model", "revision": "r1"})
-            event({"type": "result", "utterance_id": "file", "text": "", "t_ms": 1})
+            event(
+                {
+                    "type": "result",
+                    "utterance_id": "file",
+                    "text": "",
+                    "t_ms": 1,
+                    "infer_ms": 5.0,
+                    "audio_ms": 1000.0,
+                }
+            )
             previous._restart()
             event(ipc.make_hello())
             assert previous_send.call_count == 2
@@ -3480,7 +3540,16 @@ def test_onboarding_install_and_finish_loads_model_for_next_dictation(
         assert request["variant"] == entry.variant
         event(loaded)
         assert send.call_args.args[0]["type"] == "transcribe.file"
-        event({"type": "result", "utterance_id": "file", "text": "проверка", "t_ms": 1})
+        event(
+            {
+                "type": "result",
+                "utterance_id": "file",
+                "text": "проверка",
+                "t_ms": 1,
+                "infer_ms": 5.0,
+                "audio_ms": 1000.0,
+            }
+        )
         assert_selfcheck_log(caplog, "ok", 1)
         rig.tray.set_model_recheck_enabled.assert_called_with(False)
         assert rig.hotkey.fsm.state == HotkeyState.IDLE
@@ -3502,6 +3571,8 @@ def test_onboarding_install_and_finish_loads_model_for_next_dictation(
                 "utterance_id": send.call_args.args[0]["utterance_id"],
                 "text": MARKER,
                 "t_ms": 1,
+                "infer_ms": 5.0,
+                "audio_ms": 1000.0,
             }
         )
         rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
@@ -3544,7 +3615,16 @@ def test_failed_selfcheck_survives_worker_crash_until_tray_recheck(
     rig.runtime.start()
     event(ipc.make_hello())
     event(loaded)
-    event({"type": "result", "utterance_id": "file", "text": "", "t_ms": 1})
+    event(
+        {
+            "type": "result",
+            "utterance_id": "file",
+            "text": "",
+            "t_ms": 1,
+            "infer_ms": 5.0,
+            "audio_ms": 1000.0,
+        }
+    )
     assert_selfcheck_log(caplog, "no-match", 1)
     rig.notify.notify_selfcheck_failed.assert_called_once_with()
     rig.tray.set_state.assert_called_with(TrayState.ERROR)
@@ -3582,7 +3662,16 @@ def test_failed_selfcheck_survives_worker_crash_until_tray_recheck(
         "model.load",
         "transcribe.file",
     ]
-    event({"type": "result", "utterance_id": "file", "text": "проверка", "t_ms": 1})
+    event(
+        {
+            "type": "result",
+            "utterance_id": "file",
+            "text": "проверка",
+            "t_ms": 1,
+            "infer_ms": 5.0,
+            "audio_ms": 1000.0,
+        }
+    )
     assert_selfcheck_log(caplog, "ok", 1)
     rig.tray.set_state.assert_called_with(TrayState.IDLE)
     rig.tray.set_model_recheck_enabled.assert_called_with(False)
@@ -3760,6 +3849,8 @@ def microphone_model_ready(rig: Rig, *, success: bool = True) -> None:
             "utterance_id": "file",
             "text": "проверка" if success else "",
             "t_ms": 1,
+            "infer_ms": 5.0,
+            "audio_ms": 1000.0,
         },
     )
 
@@ -3799,7 +3890,15 @@ def test_microphone_runtime_and_app_host_use_real_ipc_without_side_effects(
     controller.stopTest()
     assert controller.testState == "processing"
     microphone_runtime_event(
-        rig, {"type": "result", "utterance_id": uid, "text": MARKER, "t_ms": 310}
+        rig,
+        {
+            "type": "result",
+            "utterance_id": uid,
+            "text": MARKER,
+            "t_ms": 310,
+            "infer_ms": 5.0,
+            "audio_ms": 1000.0,
+        },
     )
     assert controller.testState == "done"
     assert controller.testText == MARKER
@@ -3955,7 +4054,15 @@ def test_microphone_model_preparation_reports_plain_error(
             },
         )
         microphone_runtime_event(
-            rig, {"type": "result", "utterance_id": "file", "text": "", "t_ms": 1}
+            rig,
+            {
+                "type": "result",
+                "utterance_id": "file",
+                "text": "",
+                "t_ms": 1,
+                "infer_ms": 5.0,
+                "audio_ms": 1000.0,
+            },
         )
     assert str(updates[-1].state) == "error"
     assert updates[-1].message
@@ -3987,7 +4094,15 @@ def test_microphone_processing_cancel_through_runtime_ignores_late_result(
     assert send.call_args.args[0] == {"type": "record.cancel", "utterance_id": uid}
     microphone_runtime_event(rig, {"type": "cancelled", "utterance_id": uid})
     microphone_runtime_event(
-        rig, {"type": "result", "utterance_id": uid, "text": MARKER, "t_ms": 310}
+        rig,
+        {
+            "type": "result",
+            "utterance_id": uid,
+            "text": MARKER,
+            "t_ms": 310,
+            "infer_ms": 5.0,
+            "audio_ms": 1000.0,
+        },
     )
     assert str(updates[-1].state) == "idle"
     assert all(update.text == "" for update in updates)

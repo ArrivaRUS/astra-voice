@@ -14,7 +14,7 @@ from typing import Any
 
 from astra_voice.core.version import __version__
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_FRAME_BYTES = 64 * 1024
 MAX_TEXT_BYTES = 32 * 1024
 
@@ -22,6 +22,7 @@ FRAME_TOO_LARGE = "frame-too-large"
 BAD_FRAME = "bad-frame"
 UNKNOWN_MESSAGE = "unknown-message"
 BAD_FIELD = "bad-field"
+PROTOCOL_MISMATCH = "protocol-mismatch"
 
 _UTTERANCE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _HEADER = struct.Struct(">I")
@@ -80,7 +81,15 @@ _SCHEMAS = {
             "engine_version": _STR,
         }
     ),
-    "result": _Schema({"utterance_id": _STR, "text": _STR, "t_ms": _NUMBER}),
+    "result": _Schema(
+        {
+            "utterance_id": _STR,
+            "text": _STR,
+            "t_ms": _NUMBER,
+            "infer_ms": _NUMBER,
+            "audio_ms": _NUMBER,
+        }
+    ),
     "cancelled": _UTTERANCE,
     "error": _Schema(
         {"code": _STR, "message": _STR},
@@ -142,7 +151,7 @@ def _validate(msg: dict[str, Any]) -> dict[str, Any]:
             raise FrameError(BAD_FIELD, "Поле text превышает 32 КиБ.")
     if kind == "hello":
         if result["protocol"] != PROTOCOL_VERSION:
-            raise FrameError(BAD_FIELD, "Неподдерживаемая версия протокола.")
+            raise FrameError(PROTOCOL_MISMATCH, "Программа обновлена — перезапустите её.")
         result["runtime"] = _fields(result["runtime"], _RUNTIME)
     return result
 

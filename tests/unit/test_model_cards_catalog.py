@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 pytest.importorskip("jsonschema")
 
 # ruff: noqa: E402
-from astra_voice.models.catalog import Catalog, load_builtin
+from astra_voice.models.catalog import Catalog, Metric, Metrics, load_builtin, merge_measurement
 from astra_voice.security.verify import Verifier
 from astra_voice.ui.formatting import format_rtfx, format_wer
 from astra_voice.ui.model_downloads import catalog_best, entry_metrics, entry_tags
@@ -52,6 +53,7 @@ def test_metrics_fill_is_relative_to_the_best_in_catalog(catalog: Catalog) -> No
     entry = catalog.entries[0]
     quality, speed = entry_metrics(entry, best_wer, best_rtfx)
     assert quality == {
+        "kind": "quality",
         "label": "Качество",
         "text": format_wer(7.6),
         "fill": pytest.approx(best_wer / 7.6),
@@ -59,6 +61,7 @@ def test_metrics_fill_is_relative_to_the_best_in_catalog(catalog: Catalog) -> No
         "measured": False,
     }
     assert speed == {
+        "kind": "speed",
         "label": "Скорость",
         "text": format_rtfx(42.5),
         "fill": pytest.approx(42.5 / best_rtfx),
@@ -115,3 +118,55 @@ def test_empty_catalog_has_no_best(catalog: Catalog) -> None:
 def test_formatters_use_russian_decimal_comma() -> None:
     assert format_wer(7.6) == "WER 7,60 %"
     assert format_rtfx(42.5) == "42,5× быстрее речи"
+
+
+def test_merge_measurements_and_scales(catalog: Catalog) -> None:
+    entry = catalog.entries[0]
+    fallback = merge_measurement(entry, {})
+    assert fallback["ramMb"] == entry.min_ram_mb
+    assert fallback["ramMeasured"] is False
+    assert fallback["speedKind"] == "benchmark"
+    assert fallback["qualityValue"] == pytest.approx((30 - 7.6) / 25)
+    key = f"{entry.id}@{entry.revision}"
+    local = merge_measurement(entry, {key: {"ram_mb": 600, "rtfx": 60, "threads": 2}}, 2)
+    assert local == {
+        "ramMb": 600,
+        "ramMeasured": True,
+        "speedKind": "measured",
+        "speedValue": 1.0,
+        "qualityValue": pytest.approx((30 - 7.6) / 25),
+    }
+    assert (
+        merge_measurement(entry, {key: {"ram_mb": 600, "rtfx": 1, "threads": 2}})["speedValue"] == 0
+    )
+    assert merge_measurement(entry, {key: {"rtfx": 600, "threads": 2}})["speedValue"] == 1
+    assert merge_measurement(entry, {key: {"rtfx": 0, "threads": 2}})["speedKind"] == "benchmark"
+    assert merge_measurement(entry, {key: {"ram_mb": 600, "rtfx": 60, "threads": 4}}, 2) == fallback
+    assert (
+        merge_measurement(entry, {key: {"ram_mb": None, "rtfx": 60, "threads": 2}}, 2)[
+            "ramMeasured"
+        ]
+        is False
+    )
+    assert merge_measurement(entry, {f"{entry.id}@old": {"ram_mb": 600}}) == fallback
+
+
+def test_merge_missing_and_fp32_sources(catalog: Catalog) -> None:
+    missing = catalog.entry("whisper-small-int8")
+    assert missing is not None
+    assert merge_measurement(missing, {})["speedKind"] == "no_data"
+    assert merge_measurement(missing, {})["speedValue"] == 0
+    assert merge_measurement(missing, {})["qualityValue"] is None
+    fp32 = replace(
+        missing,
+        id="fp32-model",
+        metrics=Metrics(wer_ru=Metric(0.1, "source"), rtfx=Metric(2, "fp32")),
+    )
+    assert merge_measurement(fp32, {})["speedKind"] == "benchmark"
+    assert merge_measurement(fp32, {})["qualityValue"] == 1.0
+    assert (
+        merge_measurement(replace(fp32, metrics=Metrics(wer_ru=Metric(40, "source"))), {})[
+            "qualityValue"
+        ]
+        == 0.0
+    )

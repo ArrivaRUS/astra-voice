@@ -66,7 +66,7 @@ from astra_voice.worker.audio import (
     normalize,
     resolve_device,
 )
-from astra_voice.worker.ipc import FrameError, encode
+from astra_voice.worker.ipc import FrameError, decode, encode
 from astra_voice.worker.state import LIMIT_S_DEFAULT, Message, State, WorkerState
 
 # tests не пакет; подключаем общие фейки так же, как test_worker_state.py.
@@ -1040,6 +1040,7 @@ class CaptureProbe:
 
     def on_event(self, event: Message) -> None:
         """Сохраняет событие вместе с показанием виртуальных часов."""
+        assert decode(encode(event)[4:]) == event
         self.events.put((self.now, event))
 
     def on_error(self, uid: str, code: str, message: str) -> None:

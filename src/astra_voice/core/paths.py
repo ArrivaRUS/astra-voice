@@ -46,6 +46,11 @@ def _ensure_private_dir(path: Path) -> Path:
     return path
 
 
+def ensure_private_dir(path: Path) -> Path:
+    """Гарантирует приватный каталог по заданному пути."""
+    return _ensure_private_dir(path)
+
+
 def config_dir() -> Path:
     """``$XDG_CONFIG_HOME/astra-voice`` (по умолчанию ``~/.config/astra-voice``)."""
     return _ensure_private_dir(_xdg("XDG_CONFIG_HOME", Path.home() / ".config"))
@@ -54,6 +59,11 @@ def config_dir() -> Path:
 def data_dir() -> Path:
     """``$XDG_DATA_HOME/astra-voice`` (по умолчанию ``~/.local/share/astra-voice``)."""
     return _ensure_private_dir(_xdg("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+
+
+def measurements_path() -> Path:
+    """Файл замеров моделей в приватном каталоге данных."""
+    return data_dir() / "measurements.json"
 
 
 def model_store_dir() -> Path:

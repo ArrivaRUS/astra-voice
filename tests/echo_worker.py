@@ -56,6 +56,8 @@ def main() -> int:
                                     "utterance_id": command.partition(":")[2],
                                     "text": "Проверка",
                                     "t_ms": 1,
+                                    "infer_ms": 5.0,
+                                    "audio_ms": 1000.0,
                                 }
                             )
                         )
@@ -76,6 +78,8 @@ def main() -> int:
                                     "utterance_id": "file",
                                     "text": "Проверка файла",
                                     "t_ms": 1,
+                                    "infer_ms": 5.0,
+                                    "audio_ms": 1000.0,
                                 }
                             )
                         )

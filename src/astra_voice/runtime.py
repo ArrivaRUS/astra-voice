@@ -27,6 +27,7 @@ from astra_voice.core.dictation import (
     MicrophoneTestUpdate,
     TestCallback,
 )
+from astra_voice.core.measurements import MeasurementTracker
 from astra_voice.core.model_source import (
     ModelRevoked,
     ModelStore,
@@ -154,6 +155,13 @@ class DictationRuntime(QObject):
         self._selfcheck_attempts = 0
         self._selfcheck_timer: QTimer | None = None
         self._loaded_model: dict[str, str] = {}
+        try:
+            measurements_path = paths.measurements_path()
+        except (OSError, paths.PathError):
+            log.warning("Каталог замеров моделей недоступен")
+            measurements_path = None
+        self.measurements = MeasurementTracker(measurements_path)
+        self.on_measurements_changed: Callable[[], None] | None = None
         self._pending_test: tuple[str, TestCallback] | None = None
         self._preparing_timer: QTimer | None = None
         self._model_load_ms: int | float | None = None
@@ -216,6 +224,7 @@ class DictationRuntime(QObject):
                 on_device_selected=notify.notify_microphone_selected,
                 on_device_resolved=self._device_resolved,
                 on_silent=self._microphone_silent,
+                on_success=self._dictation_succeeded,
             )
             rollback.append(("оркестратор", self.orchestrator.shutdown))
             self.supervisor = supervisor_factory(on_event=self._on_worker_event, use_qt=True)
@@ -269,6 +278,26 @@ class DictationRuntime(QObject):
     def _send(self, message: dict[str, Any], *, timeout: float | None = None) -> None:
         """Адаптирует возвращаемое значение супервизора к порту команд."""
         self.supervisor.send(message, timeout=timeout)
+
+    def _dictation_succeeded(
+        self, audio_ms: float | None, infer_ms: float | None, cold: bool
+    ) -> None:
+        before = len(self.measurements.warm_runs)
+        if self.measurements.dictation(audio_ms=audio_ms, infer_ms=infer_ms, cold=cold):
+            self._request_measure()
+        if len(self.measurements.warm_runs) >= 5 and before < 5:
+            self._measurements_changed()
+
+    def _request_measure(self) -> None:
+        try:
+            self._send({"type": "measure"}, timeout=10.0)
+        except Exception:
+            self.measurements.measure_failed()
+            log.warning("Не удалось запросить замер памяти")
+
+    def _measurements_changed(self) -> None:
+        if self.on_measurements_changed is not None:
+            self.on_measurements_changed()
 
     def start_level_monitor(self, device: str, callback: LevelCallback) -> bool:
         """Измерение уровня не зависит от модели и её самопроверки."""
@@ -463,7 +492,14 @@ class DictationRuntime(QObject):
             return
         self._loading_model = True
         self._model_load_generation = self.supervisor.generation
+        previous_identity = self.measurements.identity
         self._model_load_request = request
+        self.measurements.set_model(
+            str(request["id"]), str(request["revision"]), int(request["threads"])
+        )
+        if self.measurements.identity != previous_identity:
+            self.orchestrator.model_changed()
+        self._measurements_changed()
         if self.orchestrator.phase == DictationPhase.IDLE:
             self.pill.show_state(PillState.LOADING_MODEL)
         try:
@@ -604,6 +640,35 @@ class DictationRuntime(QObject):
         if (
             not self._closed
             and event.get("generation") == self.supervisor.generation
+            and event.get("type") == "measured"
+            and type(event.get("vm_hwm_kb")) is int
+        ):
+            again = self.measurements.measured(event["vm_hwm_kb"])
+            self._measurements_changed()
+            if again:
+                self._request_measure()
+            return
+        if (
+            not self._closed
+            and event.get("generation") == self.supervisor.generation
+            and event.get("type") == "error"
+            and event.get("code") == "measure-failed"
+        ):
+            self.measurements.measure_failed()
+        if (
+            not self._closed
+            and event.get("generation") == self.supervisor.generation
+            and event.get("type") == "error"
+            and event.get("code") == ipc.PROTOCOL_MISMATCH
+        ):
+            self._loading_model = False
+            self._fail_pending_test()
+            self.pill.show_state(PillState.ERROR, text="Программа обновлена — перезапустите её")
+            self.tray.set_state(TrayState.ERROR)
+            return
+        if (
+            not self._closed
+            and event.get("generation") == self.supervisor.generation
             and event.get("type") == "error"
             and event.get("code") in ("worker-start", "worker-crashed", "restart-limit")
         ):
@@ -644,6 +709,8 @@ class DictationRuntime(QObject):
             and event.get("type") == "hello"
             and event.get("generation") == self.supervisor.generation
         ):
+            self.measurements.new_generation()
+            self.orchestrator.model_changed()
             self._load_model()
         if (
             not self._closed

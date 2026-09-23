@@ -137,11 +137,11 @@ def test_main_inherited_fd(monkeypatch: pytest.MonkeyPatch, use_env: bool) -> No
 
 
 def test_hello_then_ping() -> None:
-    """Первый кадр — hello версии 1; разделённый на части ping даёт pong."""
+    """Первый кадр — hello текущей версии; разделённый на части ping даёт pong."""
     with running_loop() as (_, peer, _):
         hello = receive(peer)[0]
         assert hello["type"] == "hello"
-        assert hello["protocol"] == 1
+        assert hello["protocol"] == ipc.PROTOCOL_VERSION
         frame = ipc.encode({"type": "ping"})
         peer.sendall(frame[:2])
         peer.sendall(frame[2:])
@@ -277,7 +277,14 @@ def test_slow_reader_preserves_pending_frames() -> None:
     with running_loop(send_buffer_size=4096) as (loop, peer, thread):
         receive(peer)
         events = [
-            {"type": "result", "utterance_id": f"u{i}", "text": "я" * 16000, "t_ms": i}
+            {
+                "type": "result",
+                "utterance_id": f"u{i}",
+                "text": "я" * 16000,
+                "t_ms": i,
+                "infer_ms": 5.0,
+                "audio_ms": 1000.0,
+            }
             for i in range(16)
         ]
         for event in events:
@@ -301,7 +308,14 @@ def test_disconnect_with_pending_output(
         receive(peer)
         for i in range(16):
             loop._events.put(
-                {"type": "result", "utterance_id": f"u{i}", "text": "я" * 16000, "t_ms": i}
+                {
+                    "type": "result",
+                    "utterance_id": f"u{i}",
+                    "text": "я" * 16000,
+                    "t_ms": i,
+                    "infer_ms": 5.0,
+                    "audio_ms": 1000.0,
+                }
             )
         thread.join(2 * worker_main.POLL_INTERVAL)
         assert thread.is_alive()
@@ -417,7 +431,14 @@ def test_send_buffer_overflow_closes_loop(
     """Буфер ограничен 4 МиБ; переполнение завершает цикл с предупреждением."""
     connection = Mock(spec=socket.socket)
     loop = worker_main.WorkerLoop(connection)
-    event = {"type": "result", "utterance_id": "u1", "text": "я" * 16000, "t_ms": 1}
+    event = {
+        "type": "result",
+        "utterance_id": "u1",
+        "text": "я" * 16000,
+        "t_ms": 1,
+        "infer_ms": 5.0,
+        "audio_ms": 1000.0,
+    }
     assert worker_main.MAX_SEND_BUFFER == 4 * 1024 * 1024
     for _ in range(worker_main.MAX_SEND_BUFFER // len(ipc.encode(event)) + 1):
         loop._events.put(event)
@@ -535,7 +556,14 @@ def test_events_from_background_thread(
     monkeypatch.setattr(worker_main, "WorkerState", make_state)
     with running_loop() as (_, peer, _):
         receive(peer)
-        event = {"type": "result", "utterance_id": "u1", "text": "секретная фраза", "t_ms": 1}
+        event = {
+            "type": "result",
+            "utterance_id": "u1",
+            "text": "секретная фраза",
+            "t_ms": 1,
+            "infer_ms": 5.0,
+            "audio_ms": 1000.0,
+        }
         sender = Thread(target=callbacks[0], args=(event,))
         sender.start()
         peer.sendall(ipc.encode({"type": "ping"}))
@@ -573,7 +601,14 @@ def test_background_result_wakes_idle_loop(monkeypatch: pytest.MonkeyPatch) -> N
     with running_loop() as (_, peer, _):
         assert receive(peer)[0]["type"] == "hello"
         assert idle.wait(1), "Воркер не перешёл к ожиданию событий"
-        event = {"type": "result", "utterance_id": "u1", "text": "готово", "t_ms": 1}
+        event = {
+            "type": "result",
+            "utterance_id": "u1",
+            "text": "готово",
+            "t_ms": 1,
+            "infer_ms": 5.0,
+            "audio_ms": 1000.0,
+        }
         started: list[float] = []
 
         def emit() -> None:
@@ -597,7 +632,14 @@ def test_event_wakeup_buffer_overflow() -> None:
     """Полный неблокирующий будильник не мешает добавлять события в очередь."""
     connection, peer = socket.socketpair()
     loop = worker_main.WorkerLoop(connection, capture=False)
-    event = {"type": "result", "utterance_id": "u1", "text": "готово", "t_ms": 1}
+    event = {
+        "type": "result",
+        "utterance_id": "u1",
+        "text": "готово",
+        "t_ms": 1,
+        "infer_ms": 5.0,
+        "audio_ms": 1000.0,
+    }
     try:
         assert not loop._wake_r.getblocking()
         assert not loop._wake_w.getblocking()

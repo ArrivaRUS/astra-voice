@@ -2953,6 +2953,8 @@ class MicrophoneBridgeRig:
             msg["utterance_id"] for msg in reversed(self.commands) if msg["type"] == "record.start"
         )
         message = {"type": kind, "utterance_id": uid, **fields}
+        if kind == "result":
+            message.update(infer_ms=5.0, audio_ms=1000.0)
         event = ipc.FrameReader().feed(ipc.encode(message))[0]
         self.core.on_worker_event({**event, "generation": self.generation})
 
@@ -3689,6 +3691,24 @@ def test_installed_revoked_model_is_shown_as_recalled(model_rig: ModelRig) -> No
     assert downloads.can_install() is True
 
 
+def test_measurements_cache_refreshes_on_signal(
+    model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    port, create = model_rig
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    controller = create()
+    downloads = controller._downloads
+    assert not downloads.models[0]["ramMeasured"]
+    path = tmp_path / "measurements.json"
+    path.write_text(
+        json.dumps({f"{port.entry.id}@{port.entry.revision}": {"ram_mb": 600, "threads": 2}})
+    )
+    assert not downloads.models[0]["ramMeasured"]
+    downloads.measurements_changed()
+    assert downloads.models[0]["ramMb"] == 600
+    assert downloads.models[0]["ramMeasured"]
+
+
 def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
     port, create = model_rig
     controller = create()
@@ -3702,6 +3722,12 @@ def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
             "sizeBytes": 226_000_000,
             "sizeText": "226 МБ",
             "ramText": "768 МБ",
+            "ramMb": 768,
+            "ramMeasured": False,
+            "speedKind": "no_data",
+            "speedText": "",
+            "speedValue": 0.0,
+            "qualityValue": None,
             "selected": False,
             "badge": "",
             "state": "available",
@@ -3712,8 +3738,22 @@ def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
             "updateAvailable": False,
             "tags": [],
             "metrics": [
-                {"label": "Качество", "text": "", "fill": 0.0, "hasData": False, "measured": False},
-                {"label": "Скорость", "text": "", "fill": 0.0, "hasData": False, "measured": False},
+                {
+                    "kind": "quality",
+                    "label": "Качество",
+                    "text": "",
+                    "fill": 0.0,
+                    "hasData": False,
+                    "measured": False,
+                },
+                {
+                    "kind": "speed",
+                    "label": "Скорость",
+                    "text": "",
+                    "fill": 0.0,
+                    "hasData": False,
+                    "measured": False,
+                },
             ],
         }
     ]
@@ -4881,7 +4921,7 @@ def test_app_uses_one_download_queue_and_shuts_it_down_once(
     assert app_mod.main([]) == 7
     service_factory.assert_called_once()
     download_factory.assert_called_once_with(
-        port, store=rig.factory.call_args.kwargs["model_store"]
+        port, store=rig.factory.call_args.kwargs["model_store"], settings=rig.settings
     )
     stop.assert_called_once()
 

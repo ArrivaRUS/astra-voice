@@ -23,7 +23,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from astra_voice.core.version import __version__
+from astra_voice.worker import ipc
 from astra_voice.worker import state as state_module
 from astra_voice.worker.audio import AudioCapture, WavFileSource
 from astra_voice.worker.ipc import BAD_FIELD, FrameError, FrameReader, decode, encode
@@ -55,6 +55,42 @@ pytestmark = pytest.mark.unit
 Factory = Callable[..., tuple[WorkerState, FakeEngine, Queue[Message]]]
 
 
+def test_worker_messages_use_real_ipc(factory: Factory, tmp_path: Path) -> None:
+    """Ответы автомата и фоновые события проходят настоящий кодировщик IPC."""
+    status = tmp_path / "status"
+    smaps = tmp_path / "smaps"
+    status.write_text("VmHWM: 2048 kB\n")
+    smaps.write_text("Pss: 1024 kB\n")
+    worker, _, events = factory(loaded=False, status_path=status, smaps_path=smaps)
+    messages = [ipc.make_hello(), WorkerState.audio_ready(device="Микрофон")]
+    messages += worker.handle({"type": "ping"})
+    messages += worker.handle(load_message())
+    messages += worker.handle({"type": "measure"})
+    messages += worker.handle({"type": "record.stop", "utterance_id": "missing"})
+    worker.handle({"type": "record.start", "utterance_id": "u1", "limit_s": 1 / SAMPLE_RATE})
+    worker.feed_audio("u1", [0.25])
+    messages.append(events.get(timeout=2))
+    worker.handle({"type": "recognize", "utterance_id": "u1"})
+    messages.append(events.get(timeout=2))
+    worker.handle({"type": "record.start", "utterance_id": "u2"})
+    messages += worker.handle({"type": "record.cancel", "utterance_id": "u2"})
+    messages += worker.handle({"type": "audio.close"})
+    assert {message["type"] for message in messages} == {
+        "hello",
+        "audio.ready",
+        "pong",
+        "model.loaded",
+        "measured",
+        "error",
+        "record.limit",
+        "result",
+        "cancelled",
+        "audio.closed",
+    }
+    for message in messages:
+        assert decode(encode(message)[4:]) == message
+
+
 class FakeVAD(ModuleType):
     """Подменяет весь модуль, исключая загрузку настоящей модели в тестах автомата."""
 
@@ -77,7 +113,7 @@ class SegmentEngine(FakeEngine):
         self.text = self.parts[self.transcribe_calls]
         result = super().transcribe(audio, cancel)
         self.after_segment()
-        return result
+        return FakeTranscribeResult(result.text, 25.0, result.cancelled)
 
 
 @pytest.fixture(autouse=True)
@@ -115,16 +151,23 @@ def factory(tmp_path: Path) -> Iterator[Factory]:
         events: Queue[Message] = Queue()
         if kwargs.pop("numpy_audio", False) is False:
             kwargs.setdefault("audio_factory", list)
+
+        def on_event(event: Message) -> None:
+            assert decode(encode(event)[4:]) == event
+            events.put(event)
+
         worker = WorkerState(
             engine_factory=lambda layout: fake,
             cancel_factory=kwargs.pop("cancel_factory", FakeCancelToken),
             data_dir_factory=lambda: tmp_path,
-            on_event=events.put,
+            on_event=on_event,
             **kwargs,
         )
         workers.append((worker, fake))
         if loaded:
-            assert worker.handle(load_message())[0]["type"] == "model.loaded"
+            loaded_reply = worker.handle(load_message())[0]
+            assert decode(encode(loaded_reply)[4:]) == loaded_reply
+            assert loaded_reply["type"] == "model.loaded"
         return worker, fake, events
 
     yield create
@@ -347,6 +390,8 @@ def test_vad_segments_real_recognition_path(
         "utterance_id": "u1",
         "text": expected,
         "t_ms": 750,
+        "infer_ms": 75.0,
+        "audio_ms": 49000.0,
     }
     fake_vad.trim_trailing_silence.assert_called_once()
     trim_call = fake_vad.trim_trailing_silence.call_args
@@ -388,7 +433,9 @@ def test_vad_duration_uses_trimmed_audio(factory: Factory, fake_vad: FakeVAD) ->
     worker, engine, events = factory(numpy_audio=True)
     record_samples(worker, 25 * SAMPLE_RATE)
     recognize(worker)
-    assert events.get(timeout=2)["type"] == "result"
+    result = events.get(timeout=2)
+    assert result["type"] == "result"
+    assert result["audio_ms"] == 20000.0
     fake_vad.segment.assert_not_called()
     assert engine.transcribe_calls == 1
     assert engine.audios[0] is trimmed
@@ -1190,30 +1237,14 @@ def test_measure_proc_fixtures(factory: Factory, tmp_path: Path, missing_smaps: 
     pss = None if missing_smaps else 65432
     assert msg == {"type": "measured", "vm_hwm_kb": 123456, "pss_kb": pss, "sessions": 3}
     encode(msg)
-    entries = json.loads(path.read_text(encoding="utf-8"))
-    assert entries.pop("previous") == {"vm_hwm_kb": 1}
-    key, entry = next(iter(entries.items()))
-    assert json.loads(key) == ["gigaam", "r1", 2, "fake-ort", __version__]
-    assert entry == {
-        "id": "gigaam",
-        "revision": "r1",
-        "threads": 2,
-        "runtime": "fake-ort",
-        "build": __version__,
-        "vm_hwm_kb": 123456,
-        "pss_kb": pss,
-    }
+    assert json.loads(path.read_text(encoding="utf-8")) == {"previous": {"vm_hwm_kb": 1}}
 
 
-def test_measure_explicit_destination(factory: Factory, tmp_path: Path) -> None:
+def test_measure_does_not_create_destination(factory: Factory, tmp_path: Path) -> None:
     status = tmp_path / "status"
     status.write_text("VmHWM:  123456 kB\n", encoding="utf-8")
-    target = tmp_path / "custom" / "memory.json"
-    worker, _, _ = factory(
-        status_path=status, smaps_path=tmp_path / "missing", measurements_path=target
-    )
+    worker, _, _ = factory(status_path=status, smaps_path=tmp_path / "missing")
     assert worker.handle({"type": "measure"})[0]["type"] == "measured"
-    assert target.is_file()
     assert not (tmp_path / "measurements.json").exists()
 
 

@@ -31,7 +31,6 @@ record.cancel, model.unload или close (граница жизни поколе
 from __future__ import annotations
 
 import importlib
-import json
 import logging
 import math
 import time
@@ -52,7 +51,6 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from astra_voice.core.constants import RECORD_LIMIT_S
 from astra_voice.core.logging import RedactTextFilter
 from astra_voice.core.paths import data_dir
-from astra_voice.core.version import __version__
 from astra_voice.worker.ipc import UNKNOWN_MESSAGE, FrameError, encode, error
 
 if TYPE_CHECKING:
@@ -150,6 +148,9 @@ class Transcript(Protocol):
     def text(self) -> str: ...
 
     @property
+    def infer_ms(self) -> float: ...
+
+    @property
     def cancelled(self) -> bool: ...
 
 
@@ -241,7 +242,6 @@ class WorkerState:
         audio_factory: Callable[[array[float]], Any] = _numpy_audio,
         status_path: Path = Path("/proc/self/status"),
         smaps_path: Path = Path("/proc/self/smaps_rollup"),
-        measurements_path: Path | None = None,
         runtime: str | None = None,
         limit_s: float = LIMIT_S_DEFAULT,
         stopped_ttl_s: float = STOPPED_TTL_S_DEFAULT,
@@ -273,7 +273,6 @@ class WorkerState:
         self._audio_factory = audio_factory
         self._status_path = status_path
         self._smaps_path = smaps_path
-        self._measurements_path = measurements_path
         self._runtime = _runtime() if runtime is None else runtime
         self._lock = RLock()
         self._engine_lock = RLock()
@@ -556,7 +555,7 @@ class WorkerState:
                     msg = {"type": "cancelled", "utterance_id": job.utterance_id}
                 else:
                     audio = self._audio_factory(samples)
-                    text, cancelled = self._transcribe_audio(audio, job, engine)
+                    text, cancelled, infer_ms, audio_ms = self._transcribe_audio(audio, job, engine)
                     msg = (
                         {"type": "cancelled", "utterance_id": job.utterance_id}
                         if cancelled
@@ -565,6 +564,8 @@ class WorkerState:
                             "utterance_id": job.utterance_id,
                             "text": text,
                             "t_ms": int((self._clock() - job.started) * 1000),
+                            "infer_ms": infer_ms,
+                            "audio_ms": audio_ms,
                         }
                     )
                     # Лимиты и безопасные сообщения об ошибках принадлежат IPC.
@@ -577,36 +578,52 @@ class WorkerState:
             msg = error("engine-failed", "Ошибка распознавания движка.")
         self._finish(job, msg)
 
-    def _transcribe_audio(self, audio: Any, job: _Job, engine: EngineBackend) -> tuple[str, bool]:
+    def _transcribe_audio(
+        self, audio: Any, job: _Job, engine: EngineBackend
+    ) -> tuple[str, bool, float, float]:
         """Обрезает хвост и распознаёт сегменты под замком движка из _run."""
         boundaries: list[tuple[int, int]] = []
         # Инъекция audio_factory может возвращать список вместо ndarray.
         if getattr(audio, "ndim", None) == 1 and getattr(audio, "dtype", None) == "float32":
             vad = _available_vad()
             if job.cancel.cancelled:
-                return "", True
+                return "", True, 0.0, 0.0
             if vad is not None:
                 audio = vad.trim_trailing_silence(audio, SAMPLE_RATE, cancel=job.cancel)
                 if job.cancel.cancelled:
-                    return "", True
+                    return "", True, 0.0, 0.0
                 if len(audio) / SAMPLE_RATE > 20.0:
                     boundaries = vad.segment(
                         audio, SAMPLE_RATE, max_window_s=24.0, cancel=job.cancel
                     )
         if job.cancel.cancelled:
-            return "", True
+            return "", True, 0.0, 0.0
         if len(boundaries) <= 1:
             result = engine.transcribe(audio, job.cancel)
-            return result.text, job.cancel.cancelled or result.cancelled
+            return (
+                result.text,
+                job.cancel.cancelled or result.cancelled,
+                float(result.infer_ms),
+                len(audio) / SAMPLE_RATE * 1000.0,
+            )
         parts: list[str] = []
+        infer_ms = 0.0
+        sample_count = 0
         for start, stop in boundaries:
             if job.cancel.cancelled:
-                return "", True
+                return "", True, 0.0, 0.0
             result = engine.transcribe(audio[start:stop], job.cancel)
             if job.cancel.cancelled or result.cancelled:
-                return "", True
+                return "", True, 0.0, 0.0
             parts.append(result.text)
-        return join_segment_texts(parts), False
+            infer_ms += result.infer_ms
+            sample_count += stop - start
+        return (
+            join_segment_texts(parts),
+            False,
+            float(infer_ms),
+            sample_count / SAMPLE_RATE * 1000.0,
+        )
 
     def _finish(self, job: _Job, msg: Message) -> None:
         with self._lock:
@@ -732,28 +749,9 @@ class WorkerState:
             msg: Message = {"type": "measured", "vm_hwm_kb": vm_hwm, "pss_kb": pss}
             if self._sessions is not None:
                 msg["sessions"] = self._sessions
-            path = self._measurements_path
-            if path is None:
-                path = self._data_dir() / "measurements.json"
-            entries = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-            if not isinstance(entries, dict):
-                raise ValueError("Замеры должны быть JSON-объектом.")
-            identity = self._identity or ("none", "none", 0)
-            key = json.dumps([*identity, self._runtime, __version__], ensure_ascii=False)
-            entries[key] = {
-                "id": identity[0],
-                "revision": identity[1],
-                "threads": identity[2],
-                "runtime": self._runtime,
-                "build": __version__,
-                "vm_hwm_kb": vm_hwm,
-                "pss_kb": pss,
-            }
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
             return [msg]
         except (OSError, ValueError, IndexError):
-            return [error("measure-failed", "Не удалось прочитать или сохранить замер памяти.")]
+            return [error("measure-failed", "Не удалось прочитать замер памяти.")]
 
     def close(self) -> None:
         """Отменяет задания, освобождает источник и завершает собственный executor."""
