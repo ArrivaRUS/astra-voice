@@ -76,6 +76,12 @@ _CURRENT_FAILED_MESSAGE = (
     "Модель установлена. Сделать её рабочей не удалось — попробуйте переустановить."
 )
 _REMOVE_FAILED_MESSAGE = "Не удалось удалить модель. Попробуйте ещё раз."
+_SWITCH_FAILED_MESSAGE = "Не удалось загрузить модель. Рабочая модель не изменилась."
+_FIRST_SWITCH_FAILED_MESSAGE = "Не удалось загрузить модель. Попробуйте ещё раз."
+_SWITCH_PAUSE_HINT = (
+    "Не хватает свободной памяти для переключения во время работы. "
+    "Можно переключить с короткой паузой: около 5 секунд без диктовки."
+)
 _SAFE_MODEL_MESSAGES = frozenset(
     {
         _BROKEN_MESSAGE,
@@ -207,6 +213,8 @@ class ModelPort(Protocol):
 
     def record_state(self, model_id: str, revision: str) -> str: ...
 
+    def record_size_bytes(self, model_id: str, revision: str) -> int: ...
+
     def current_ids(self) -> tuple[str, str] | None: ...
 
     def installed_ids(self) -> tuple[tuple[str, str], ...]: ...
@@ -229,6 +237,8 @@ class ModelPort(Protocol):
 
     def ram_ok(self, min_ram_mb: int) -> bool: ...
 
+    def mem_total_mb(self) -> float | None: ...
+
     def download(
         self, entry: Any, *, progress: Callable[[Progress], None], cancel: threading.Event
     ) -> Path: ...
@@ -236,6 +246,16 @@ class ModelPort(Protocol):
     def install_from_staging(self, entry: Any) -> Any: ...
 
     def install_from_path(self, source: Path, entry: Any) -> Any: ...
+
+
+class SwitchPort(Protocol):
+    """Переключение загруженной модели после завершения текущей диктовки."""
+
+    on_switch_finished: Callable[[str], None] | None
+
+    def can_switch_without_pause(self, min_ram_mb: int) -> bool: ...
+
+    def switch_model(self, *, min_ram_mb: int, pause: bool = False) -> None: ...
 
 
 class _RecheckUnavailable(Exception):
@@ -366,6 +386,16 @@ class ModelService:
             "",
         )
 
+    def record_size_bytes(self, model_id: str, revision: str) -> int:
+        return next(
+            (
+                record.size_bytes
+                for record in self._store.records()
+                if (record.id, record.revision) == (model_id, revision)
+            ),
+            0,
+        )
+
     def recheck_entries(self) -> tuple[CatalogEntry, ...]:
         pending = {
             (record.id, record.revision)
@@ -449,6 +479,9 @@ class ModelService:
 
     def ram_ok(self, min_ram_mb: int) -> bool:
         return self._store.ram_ok(min_ram_mb)
+
+    def mem_total_mb(self) -> float | None:
+        return self._store.mem_total_mb()
 
     def download(
         self, entry: Any, *, progress: Callable[[Progress], None], cancel: threading.Event
@@ -620,6 +653,7 @@ class ModelDownloads(QObject):
         model: ModelPort | None,
         *,
         store: ModelStore | None = None,
+        switcher: SwitchPort | None = None,
         clock: Callable[[], float] = time.monotonic,
         settings: Settings | None = None,
         parent: QObject | None = None,
@@ -629,11 +663,15 @@ class ModelDownloads(QObject):
         self._store = store
         self._settings = settings or Settings()
         self._measurements_cache: dict[str, Any] | None = None
+        self._switcher = switcher
+        self._switching_entry: Any | None = None
+        self._previous_current: tuple[str, str] | None = None
         self._entry = model.recommended() if model is not None else None
         self._entries = model.entries() if model is not None else ()
         self._selected: set[str] = set()
         self._card_states: dict[str, str] = {}
         self._card_messages: dict[str, str] = {}
+        self._card_hints: dict[str, str] = {}
         self._card_progress: dict[str, float] = {}
         self._queue: list[Any] = []
         self._queue_entries: tuple[Any, ...] = ()
@@ -675,6 +713,8 @@ class ModelDownloads(QObject):
         self._refresh_free_space_text()
         # selectionChanged публикуется также после завершения каждой модели в очереди.
         self.selectionChanged.connect(self._refresh_free_space_text)
+        if switcher is not None:
+            switcher.on_switch_finished = self._switch_finished
 
     @property
     def model(self) -> ModelPort | None:
@@ -717,19 +757,73 @@ class ModelDownloads(QObject):
             log.warning("Не удалось проверить отзыв версии модели")
             return False
 
-    def _card_state(self, entry: Any) -> str:
+    def _card_state(self, entry: Any, installed: tuple[tuple[str, str], ...] | None = None) -> str:
         state = self._card_states.get(entry.id)
         if state is not None:
             return state
         if self._is_revoked(entry):
             return "failed"
-        return "installed" if self._badge(entry) else "available"
+        if self._model is not None:
+            revision = self._installed_revision(entry, installed)
+            try:
+                if revision and self._model.record_state(entry.id, revision) == "broken":
+                    return "broken"
+            except (OSError, StoreError):
+                log.warning("Не удалось прочитать состояние установленной модели")
+                return "installed" if revision else "available"
+        return "installed" if self._badge(entry, installed) else "available"
 
-    def _card_message(self, entry: Any) -> str:
+    def _card_hint(
+        self, entry: Any, installed: tuple[tuple[str, str], ...], total: float | None
+    ) -> tuple[str, str]:
+        badge = self._badge(entry, installed)
+        if badge == "active":
+            return "", ""
+        hint = self._card_hints.get(entry.id)
+        if hint is not None:
+            return hint, "warning" if hint == _SWITCH_PAUSE_HINT else "info" if hint else ""
+        if self._model is not None:
+            if (
+                isinstance(total, (int, float))
+                and math.isfinite(total)
+                and total < 2 * entry.min_ram_mb
+            ):
+                needed = format_space(entry.min_ram_mb * 1_000_000)
+                present = format_space(total * 1_000_000)
+                return (
+                    f"Нужно ~{needed} памяти — на этом компьютере {present}, может не хватить",
+                    "warning",
+                )
+        return "", ""
+
+    def _card_extras(
+        self, entry: Any, installed: tuple[tuple[str, str], ...], total: float | None
+    ) -> dict[str, Any]:
+        """Поля подсказки присутствуют у каждой записи каталога."""
+        hint, kind = self._card_hint(entry, installed, total)
+        badge = self._badge(entry, installed)
+        return {
+            "hint": hint,
+            "hintKind": kind,
+            "canSwitchWithPause": (
+                self._switcher is not None
+                and badge != "active"
+                and self._card_hints.get(entry.id) == _SWITCH_PAUSE_HINT
+                and self._switching_entry is None
+            ),
+        }
+
+    def _card_message(
+        self, entry: Any, installed: tuple[tuple[str, str], ...] | None = None
+    ) -> str:
         message = self._card_messages.get(entry.id, "")
         if message:
             return message
-        return _REVOKED_MESSAGE if self._is_revoked(entry) else ""
+        if self._is_revoked(entry):
+            return _REVOKED_MESSAGE
+        if self._card_state(entry, installed) == "broken":
+            return "Файлы модели не читаются — переустановите"
+        return ""
 
     def active_entry(self) -> Any | None:
         if self._model is None:
@@ -904,6 +998,10 @@ class ModelDownloads(QObject):
         measurements = self._measurements_cache
         threads = model_threads(self._settings.to_dict())
         installed = self._installed_ids()
+        try:
+            total = self._model.mem_total_mb() if self._model is not None else None
+        except (OSError, StoreError):
+            total = None
         return [
             {
                 "id": entry.id,
@@ -923,8 +1021,9 @@ class ModelDownloads(QObject):
                 ),
                 "selected": entry.id in self._selected,
                 "badge": self._badge(entry, installed),
-                "state": self._card_state(entry),
-                "message": self._card_message(entry),
+                "state": self._card_state(entry, installed),
+                "message": self._card_message(entry, installed),
+                **self._card_extras(entry, installed, total),
                 "progress": self._card_progress.get(entry.id, 0.0),
                 "vendor": getattr(entry, "vendor", ""),
                 "domestic": bool(getattr(entry, "domestic", False)),
@@ -1066,6 +1165,7 @@ class ModelDownloads(QObject):
     def _set_card(self, entry: Any, state: str, message: str = "", progress: float = 0.0) -> None:
         self._card_states[entry.id] = state
         self._card_messages[entry.id] = message
+        self._card_hints.pop(entry.id, None)
         self._card_progress[entry.id] = progress if state == "downloading" else 0.0
         self._notify("modelsChanged")
 
@@ -1075,6 +1175,7 @@ class ModelDownloads(QObject):
             or self._rechecking
             or self._model_thread is not None
             or self._shutting_down
+            or self._switching_entry is not None
         ):
             return
         entry = next((entry for entry in self._entries if entry.id == model_id), None)
@@ -1100,6 +1201,7 @@ class ModelDownloads(QObject):
             or self._rechecking
             or self._model_thread is not None
             or self._shutting_down
+            or self._switching_entry is not None
         )
 
     def _managed_entry(self, model_id: str) -> Any | None:
@@ -1116,6 +1218,9 @@ class ModelDownloads(QObject):
         revision = self._installed_revision(entry)
         if not revision or self._model.record_state(entry.id, revision) != "ok":
             return
+        if self._switcher is not None:
+            self._start_switch(entry, revision, pause=False)
+            return
         with self._update():
             try:
                 self._model.set_current(entry.id, revision)
@@ -1124,6 +1229,71 @@ class ModelDownloads(QObject):
                 self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
                 return
             self._card_messages.pop(entry.id, None)
+            self._card_hints.clear()
+            self._notify("modelsChanged")
+            self._notify("modelReadyChanged")
+            self._notify("selectionChanged")
+
+    def switchModelWithPause(self, model_id: str) -> None:  # noqa: N802
+        """Переключает рабочую модель с короткой паузой в диктовке."""
+        entry = self._managed_entry(model_id)
+        if entry is None or self._model is None or self._switcher is None:
+            return
+        revision = self._installed_revision(entry)
+        if revision and self._model.record_state(entry.id, revision) == "ok":
+            self._start_switch(entry, revision, pause=True)
+
+    def _start_switch(self, entry: Any, revision: str, *, pause: bool) -> None:
+        model, switcher = self._model, self._switcher
+        if model is None or switcher is None:
+            return
+        previous = model.current_ids()
+        if previous == (entry.id, revision):
+            return
+        if not pause and not switcher.can_switch_without_pause(entry.min_ram_mb):
+            self._card_messages.pop(entry.id, None)
+            self._card_hints[entry.id] = _SWITCH_PAUSE_HINT
+            self._notify("modelsChanged")
+            return
+        with self._update():
+            try:
+                model.set_current(entry.id, revision)
+            except (OSError, StoreError):
+                log.warning("Не удалось сделать модель рабочей")
+                self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
+                return
+            self._previous_current = previous
+            self._switching_entry = entry
+            self._card_hints.clear()
+            self._set_card(entry, "switching")
+            self._notify("modelReadyChanged")
+            self._notify("selectionChanged")
+            try:
+                switcher.switch_model(min_ram_mb=entry.min_ram_mb, pause=pause)
+            except Exception:
+                log.warning("Не удалось переключить модель", exc_info=True)
+                self._switch_finished("failed")
+
+    def _switch_finished(self, result: str) -> None:
+        entry, previous = self._switching_entry, self._previous_current
+        if entry is None or self._model is None:
+            return
+        with self._update():
+            self._switching_entry = None
+            self._previous_current = None
+            self._card_states.pop(entry.id, None)
+            if result == "ok":
+                self._card_messages.pop(entry.id, None)
+                self._card_hints.clear()
+            else:
+                if previous is not None:
+                    try:
+                        self._model.set_current(*previous)
+                    except (OSError, StoreError):
+                        log.warning("Не удалось восстановить прежнюю рабочую модель")
+                self._card_messages[entry.id] = (
+                    _SWITCH_FAILED_MESSAGE if previous is not None else _FIRST_SWITCH_FAILED_MESSAGE
+                )
             self._notify("modelsChanged")
             self._notify("modelReadyChanged")
             self._notify("selectionChanged")
@@ -1138,6 +1308,7 @@ class ModelDownloads(QObject):
             return
         with self._update():
             try:
+                size_bytes = self._model.record_size_bytes(entry.id, revision)
                 self._model.remove(entry.id, revision)
             except (OSError, StoreError):
                 log.warning("Не удалось удалить модель")
@@ -1147,6 +1318,7 @@ class ModelDownloads(QObject):
             self._card_states.pop(entry.id, None)
             self._card_messages.pop(entry.id, None)
             self._card_progress.pop(entry.id, None)
+            self._card_hints[entry.id] = f"Освобождено {format_size(size_bytes)} на диске"
             self._notify("modelsChanged")
             self._notify("modelReadyChanged")
             self._notify("selectionChanged")
@@ -1155,6 +1327,15 @@ class ModelDownloads(QObject):
         """Ставит в очередь ревизию из каталога, когда установлена прежняя."""
         entry = self._managed_entry(model_id)
         if entry is not None and self._update_available(entry):
+            self._begin_queue((entry,))
+
+    def reinstallModel(self, model_id: str) -> None:  # noqa: N802
+        """Ставит повреждённую установленную модель в общую очередь."""
+        entry = self._managed_entry(model_id)
+        if entry is None or self._model is None:
+            return
+        revision = self._installed_revision(entry)
+        if revision and self._model.record_state(entry.id, revision) == "broken":
             self._begin_queue((entry,))
 
     def cancelDownloads(self) -> None:  # noqa: N802
@@ -1185,6 +1366,7 @@ class ModelDownloads(QObject):
                 or self._queue_running
                 or self._rechecking
                 or self._model_thread is not None
+                or self._switching_entry is not None
             ):
                 return
             self._queue_running = True
@@ -1683,6 +1865,11 @@ class ModelDownloads(QObject):
         if self._shutting_down:
             return
         self._shutting_down = True
+        if (
+            self._switcher is not None
+            and self._switcher.on_switch_finished == self._switch_finished
+        ):
+            self._switcher.on_switch_finished = None
         self._recheck_queue.clear()
         self.cancelDownloads()
         self._model_cancel.set()

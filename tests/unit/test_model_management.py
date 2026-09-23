@@ -68,6 +68,7 @@ class FakeManagedPort:
         self.removed: list[tuple[str, str]] = []
         self.set_current_error: Exception | None = None
         self.remove_error: Exception | None = None
+        self.total_ram_mb: float | None = None
 
     # ── то, что спрашивает ModelDownloads ────────────────────────────────
     def recommended(self) -> CatalogEntry:
@@ -99,6 +100,11 @@ class FakeManagedPort:
 
     def record_state(self, model_id: str, revision: str) -> str:
         return self.records.get((model_id, revision), "")
+
+    def record_size_bytes(self, model_id: str, revision: str) -> int:
+        if (model_id, revision) == (TONE.id, TONE.revision):
+            return 101_000_000
+        return 226_000_000
 
     def current_ids(self) -> tuple[str, str] | None:
         return self.current
@@ -140,6 +146,9 @@ class FakeManagedPort:
     def ram_ok(self, min_ram_mb: int) -> bool:
         return True
 
+    def mem_total_mb(self) -> float | None:
+        return self.total_ram_mb
+
     def download(
         self,
         entry: Any,
@@ -159,6 +168,36 @@ class FakeManagedPort:
 Rig = tuple[FakeManagedPort, ModelDownloads, list[tuple[Any, ...]]]
 
 
+class FakeSwitchPort:
+    """Сохраняет запрос и отдаёт ответ вручную, как рантайм после загрузки."""
+
+    def __init__(self, *, enough_memory: bool) -> None:
+        self.enough_memory = enough_memory
+        self.checked: list[int] = []
+        self.calls: list[tuple[int, bool]] = []
+        self.on_switch_finished: Callable[[str], None] | None = None
+
+    def can_switch_without_pause(self, min_ram_mb: int) -> bool:
+        self.checked.append(min_ram_mb)
+        return self.enough_memory
+
+    def switch_model(self, *, min_ram_mb: int, pause: bool = False) -> None:
+        self.calls.append((min_ram_mb, pause))
+
+    def finish(self, result: str) -> None:
+        assert self.on_switch_finished is not None
+        self.on_switch_finished(result)
+
+
+def switched_rig(enough_memory: bool) -> tuple[FakeManagedPort, ModelDownloads, FakeSwitchPort]:
+    port = FakeManagedPort()
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    switcher = FakeSwitchPort(enough_memory=enough_memory)
+    return port, ModelDownloads(port, switcher=switcher), switcher
+
+
 @pytest.fixture
 def rig() -> Iterator[Rig]:
     port = FakeManagedPort()
@@ -172,6 +211,14 @@ def rig() -> Iterator[Rig]:
 
 def card(downloads: ModelDownloads, model_id: str) -> dict[str, Any]:
     return next(item for item in downloads.models if item["id"] == model_id)
+
+
+def test_hint_fields_are_present_without_switcher(rig: Rig) -> None:
+    _, downloads, _ = rig
+    for item in downloads.models:
+        assert item["hint"] == ""
+        assert item["hintKind"] == ""
+        assert item["canSwitchWithPause"] is False
 
 
 def test_installed_summary_counts_catalog_entries(rig: Rig) -> None:
@@ -258,7 +305,9 @@ def test_make_model_current_refuses_missing_and_broken(rig: Rig, state: str) -> 
     downloads.makeModelCurrent(TONE.id)
     downloads.makeModelCurrent("неизвестная")
     assert port.current is None
-    assert card(downloads, TONE.id)["message"] == ""
+    assert card(downloads, TONE.id)["message"] == (
+        "Файлы модели не читаются — переустановите" if state == "broken" else ""
+    )
 
 
 def test_make_model_current_explains_store_failure(rig: Rig) -> None:
@@ -270,6 +319,108 @@ def test_make_model_current_explains_store_failure(rig: Rig) -> None:
 
     assert port.current is None
     assert card(downloads, TONE.id)["message"] == model_downloads._CURRENT_FAILED_MESSAGE
+
+
+def test_switch_without_pause_when_memory_is_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    port, downloads, switcher = switched_rig(True)
+    set_current = Mock(wraps=port.set_current)
+    monkeypatch.setattr(port, "set_current", set_current)
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        assert switcher.checked == [TONE.min_ram_mb]
+        assert switcher.calls == [(TONE.min_ram_mb, False)]
+        assert port.current == (TONE.id, TONE.revision)
+        assert card(downloads, TONE.id)["state"] == "switching"
+        downloads.removeModel(TONE.id)
+        assert port.removed == []
+
+        switcher.finish("ok")
+        set_current.assert_called_once_with(TONE.id, TONE.revision)
+        assert card(downloads, TONE.id)["state"] == "installed"
+        assert card(downloads, TONE.id)["badge"] == "active"
+        downloads.makeModelCurrent(TONE.id)
+        assert switcher.calls == [(TONE.min_ram_mb, False)]
+    finally:
+        downloads.shutdown()
+
+
+def test_switch_offers_pause_when_free_memory_is_low() -> None:
+    port, downloads, switcher = switched_rig(False)
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        item = card(downloads, TONE.id)
+        assert port.current == (GIGAAM.id, GIGAAM.revision)
+        assert switcher.calls == []
+        assert item["canSwitchWithPause"] is True
+        assert item["hintKind"] == "warning"
+        assert "свободной памяти" in item["hint"]
+        assert "5 секунд" in item["hint"]
+        assert item["message"] == ""
+
+        downloads.switchModelWithPause(TONE.id)
+        assert switcher.calls == [(TONE.min_ram_mb, True)]
+        assert port.current == (TONE.id, TONE.revision)
+        assert card(downloads, TONE.id)["state"] == "switching"
+        assert card(downloads, TONE.id)["canSwitchWithPause"] is False
+        switcher.finish("ok")
+    finally:
+        downloads.shutdown()
+
+
+def test_failed_switch_restores_previous_working_model() -> None:
+    port, downloads, switcher = switched_rig(True)
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        switcher.finish("failed")
+
+        assert port.current == (GIGAAM.id, GIGAAM.revision)
+        assert card(downloads, GIGAAM.id)["badge"] == "active"
+        item = card(downloads, TONE.id)
+        assert item["state"] == "installed"
+        assert item["message"] == "Не удалось загрузить модель. Рабочая модель не изменилась."
+    finally:
+        downloads.shutdown()
+
+
+def test_failed_first_switch_does_not_claim_previous_model() -> None:
+    port = FakeManagedPort()
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    switcher = FakeSwitchPort(enough_memory=True)
+    downloads = ModelDownloads(port, switcher=switcher)
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        switcher.finish("failed")
+        assert card(downloads, TONE.id)["message"] == (
+            "Не удалось загрузить модель. Попробуйте ещё раз."
+        )
+    finally:
+        downloads.shutdown()
+    assert switcher.on_switch_finished is None
+
+
+def test_active_model_drops_pause_hint_and_reads_memory_once(rig: Rig) -> None:
+    port, downloads, _ = rig
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    downloads._card_hints[GIGAAM.id] = model_downloads._SWITCH_PAUSE_HINT
+    read = Mock(return_value=1000.0)
+    port.mem_total_mb = read  # type: ignore[method-assign]
+
+    models = downloads.models
+    active = next(item for item in models if item["id"] == GIGAAM.id)
+    assert active["hint"] == ""
+    assert active["canSwitchWithPause"] is False
+    read.assert_called_once_with()
+
+
+def test_low_total_memory_is_warning_not_error(rig: Rig) -> None:
+    port, downloads, _ = rig
+    port.total_ram_mb = 1024
+    item = card(downloads, TONE.id)
+    assert item["state"] == "available"
+    assert item["message"] == ""
+    assert item["hintKind"] == "warning"
+    assert "может не хватить" in item["hint"]
 
 
 def test_remove_model_deletes_revision_and_forgets_the_card(rig: Rig) -> None:
@@ -285,6 +436,8 @@ def test_remove_model_deletes_revision_and_forgets_the_card(rig: Rig) -> None:
     assert port.removed == [(TONE.id, TONE.revision)]
     item = card(downloads, TONE.id)
     assert item["badge"] == "" and item["state"] == "available" and item["message"] == ""
+    assert item["hint"] == "Освобождено 101 МБ на диске"
+    assert item["hintKind"] == "info"
     assert downloads.installedSummary == "Установлено 1 из 2 · 226 МБ на диске"
     assert len(ready) == 1
 
@@ -298,6 +451,17 @@ def test_remove_model_removes_the_installed_old_revision(rig: Rig) -> None:
     assert port.removed == [(GIGAAM.id, "r1")]
 
 
+def test_remove_old_revision_uses_its_saved_size(rig: Rig) -> None:
+    port, downloads, _ = rig
+    port.records[(GIGAAM.id, "r1")] = "ok"
+    port.record_size_bytes = Mock(return_value=91_000_000)  # type: ignore[method-assign]
+
+    downloads.removeModel(GIGAAM.id)
+
+    port.record_size_bytes.assert_called_once_with(GIGAAM.id, "r1")
+    assert card(downloads, GIGAAM.id)["hint"] == "Освобождено 91 МБ на диске"
+
+
 def test_remove_model_refuses_the_working_model(rig: Rig) -> None:
     port, downloads, _ = rig
     port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
@@ -308,6 +472,16 @@ def test_remove_model_refuses_the_working_model(rig: Rig) -> None:
 
     assert port.removed == []
     assert card(downloads, GIGAAM.id)["badge"] == "active"
+
+
+def test_broken_installed_model_can_be_reinstalled(rig: Rig) -> None:
+    port, downloads, queued = rig
+    port.records[(TONE.id, TONE.revision)] = "broken"
+    assert card(downloads, TONE.id)["state"] == "broken"
+    assert card(downloads, TONE.id)["badge"] == "installed"
+
+    downloads.reinstallModel(TONE.id)
+    assert queued == [(TONE,)]
 
 
 def test_remove_model_explains_store_failure(rig: Rig) -> None:
@@ -344,11 +518,15 @@ def test_settings_bridge_forwards_model_management() -> None:
     assert bridge.installedSummary == "Установлено 1 из 12 · 226 МБ на диске"
     assert bridge.installedCount == 1
     bridge.makeModelCurrent("t-one")
+    bridge.switchModelWithPause("t-one")
     bridge.removeModel("t-one")
+    bridge.reinstallModel("t-one")
     bridge.updateModel("t-one")
 
     downloads.makeModelCurrent.assert_called_once_with("t-one")
+    downloads.switchModelWithPause.assert_called_once_with("t-one")
     downloads.removeModel.assert_called_once_with("t-one")
+    downloads.reinstallModel.assert_called_once_with("t-one")
     downloads.updateModel.assert_called_once_with("t-one")
 
 
@@ -358,7 +536,9 @@ def test_settings_bridge_without_downloads_is_silent() -> None:
     assert bridge.installedSummary == ""
     assert bridge.installedCount == 0
     bridge.makeModelCurrent("t-one")
+    bridge.switchModelWithPause("t-one")
     bridge.removeModel("t-one")
+    bridge.reinstallModel("t-one")
     bridge.updateModel("t-one")
 
 
@@ -370,3 +550,25 @@ def test_model_service_delegates_removal_to_the_store() -> None:
     service.remove("t-one", "r1")
 
     store.remove.assert_called_once_with("t-one", "r1")
+
+
+def test_model_service_reads_installed_revision_size() -> None:
+    service = ModelService.__new__(ModelService)
+    store = Mock()
+    store.records.return_value = [
+        Mock(id="t-one", revision="r1", size_bytes=91_000_000),
+        Mock(id="t-one", revision="r2", size_bytes=144_000_000),
+    ]
+    service._store = store
+
+    assert service.record_size_bytes("t-one", "r1") == 91_000_000
+
+
+def test_model_service_reads_total_memory_from_store() -> None:
+    service = ModelService.__new__(ModelService)
+    store = Mock()
+    store.mem_total_mb.return_value = 8192.0
+    service._store = store
+
+    assert service.mem_total_mb() == 8192.0
+    store.mem_total_mb.assert_called_once_with()

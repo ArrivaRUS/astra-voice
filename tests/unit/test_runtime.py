@@ -36,6 +36,7 @@ from astra_voice.core.dictation import (
 )
 from astra_voice.core.model_source import resolve_model_request
 from astra_voice.core.settings import Settings, from_dict
+from astra_voice.models import store as store_module
 from astra_voice.models.catalog import CatalogEntry, FileSpec
 from astra_voice.models.installer import Installer, SmokeResult
 from astra_voice.models.store import ModelRecord, ModelState, ModelStore
@@ -582,6 +583,293 @@ def test_apply_device_announces_next_open_as_selected(
 def assert_phase(runtime: DictationRuntime, expected: DictationPhase) -> None:
     """Читает фазу заново после событий, не сохраняя сужение типа mypy."""
     assert runtime.phase == expected
+
+
+@pytest.mark.parametrize("available,expected", [("292969", True), ("292968", False), (None, False)])
+def test_switch_memory_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    available: str | None,
+    expected: bool,
+) -> None:
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        "MemTotal: 1048576 kB\n" + (f"MemAvailable: {available} kB\n" if available else "")
+    )
+    monkeypatch.setattr(store_module, "MEMINFO_PATH", meminfo)
+    rig = Rig(
+        monkeypatch,
+        Settings(extra={"model_dir": "/tmp/model"}),
+        model_store=ModelStore(tmp_path / "models"),
+    )
+    assert rig.runtime.can_switch_without_pause(100) is expected
+    candidate = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = candidate
+    finished = Mock()
+    rig.runtime.on_switch_finished = finished
+    rig.runtime.switch_model(min_ram_mb=100)
+    assert rig.supervisor_factory.call_count == (2 if expected else 1)
+    if expected:
+        candidate.start.assert_called_once_with()
+        finished.assert_not_called()
+    else:
+        finished.assert_called_once_with("failed")
+    rig.runtime.shutdown()
+    if expected:
+        candidate.stop.assert_called_once_with()
+
+
+def test_switch_waits_for_dictation_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.hotkey.fsm.press(rig.now)
+    rig.runtime.switch_model(min_ram_mb=100, pause=True)
+    assert rig.supervisor_factory.call_count == 1
+    rig.release(rig.now + 1)
+    rig.event(type="result", text=MARKER)
+    assert_phase(rig.runtime, DictationPhase.FINISHING)
+    assert rig.supervisor_factory.call_count == 1
+    replacement = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = replacement
+    rig.timers[-1].fire()
+    assert_phase(rig.runtime, DictationPhase.IDLE)
+    rig.supervisor.stop.assert_called_once_with()
+    assert rig.runtime.supervisor is replacement
+    rig.runtime.shutdown()
+
+
+def test_pending_switch_runs_on_idle_without_runtime_timer_firing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    rig.hotkey.fsm.press(rig.now)
+    rig.runtime.switch_model(min_ram_mb=100, pause=True)
+    rig.release(rig.now + 1)
+    rig.event(type="result", text=MARKER)
+    assert_phase(rig.runtime, DictationPhase.FINISHING)
+    replacement = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = replacement
+    # Доставка перехода в IDLE происходит без вызова fire у таймера рантайма.
+    rig.runtime.orchestrator._tail_done()
+    assert_phase(rig.runtime, DictationPhase.IDLE)
+    assert rig.timers[-1].active
+    assert rig.runtime.supervisor is replacement
+    rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("outcome", ["failed", "ok"])
+def test_seamless_switch_candidate_outcome(
+    monkeypatch: pytest.MonkeyPatch, smoke_wav: Path, outcome: str
+) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    old = rig.supervisor
+    old_callback = rig.supervisor_factory.call_args.kwargs["on_event"]
+    candidate = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = candidate
+    monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
+    finished = Mock()
+    rig.runtime.on_switch_finished = finished
+    rig.runtime.switch_model(min_ram_mb=100)
+    rig.runtime.switch_model(min_ram_mb=100)
+    assert rig.supervisor_factory.call_count == 2
+    switch_timer = rig.runtime._switch_timer
+    assert switch_timer is not None
+    callback = rig.supervisor_factory.call_args.kwargs["on_event"]
+    callback({"type": "hello", "generation": candidate.generation})
+    assert candidate.send.call_args.args[0]["type"] == "model.load"
+    old.stop.assert_not_called()
+    if outcome == "failed":
+        callback(
+            {
+                "type": "error",
+                "generation": candidate.generation,
+                "code": "load-timeout",
+                "request_type": "model.load",
+            }
+        )
+        assert rig.runtime.supervisor is old
+        candidate.stop.assert_called_once_with()
+    else:
+        rig.hotkey.fsm.press(rig.now)
+        assert_phase(rig.runtime, DictationPhase.RECORDING)
+        callback({"type": "model.loaded", "generation": candidate.generation})
+        finished.assert_not_called()
+        assert rig.runtime.supervisor is old
+        old.stop.assert_not_called()
+        rig.release(rig.now + 1)
+        old_callback({"type": "result", "generation": old.generation, "text": MARKER})
+        rig.timers[-1].fire()
+        assert rig.runtime.supervisor is candidate
+        old.stop.assert_called_once_with()
+        finished.assert_not_called()
+        assert rig.runtime._switch_active()
+        assert rig.runtime._switch_timer is switch_timer
+        assert switch_timer is not None and switch_timer.active and not switch_timer.deleted
+        finished.assert_not_called()
+        callback(
+            {
+                "type": "result",
+                "generation": candidate.generation,
+                "utterance_id": "file",
+                "text": "проверка",
+            }
+        )
+    finished.assert_called_once_with(outcome)
+    if outcome == "ok":
+        next_candidate = Mock(state="running", generation=1)
+        rig.supervisor_factory.return_value = next_candidate
+        rig.runtime.switch_model(min_ram_mb=100)
+        on_worker_event = Mock()
+        monkeypatch.setattr(rig.runtime.orchestrator, "on_worker_event", on_worker_event)
+        active_event = {"type": "level", "generation": candidate.generation, "peak_db": -20}
+        callback(active_event)
+        on_worker_event.assert_called_once_with(active_event)
+        next_candidate.stop.assert_not_called()
+    rig.runtime.shutdown()
+
+
+def test_promoted_switch_watchdog_accepts_silent_selfcheck(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    old = rig.supervisor
+    candidate = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = candidate
+    monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
+    finished = Mock()
+    rig.runtime.on_switch_finished = finished
+
+    rig.runtime.switch_model(min_ram_mb=100)
+    timer = rig.runtime._switch_timer
+    assert timer is not None
+    callback = rig.supervisor_factory.call_args.kwargs["on_event"]
+    callback({"type": "hello", "generation": candidate.generation})
+    callback({"type": "model.loaded", "generation": candidate.generation})
+    assert rig.runtime.supervisor is candidate
+    assert rig.runtime._switch_candidate is None
+    assert rig.runtime._switch_active()
+    old.stop.assert_called_once_with()
+
+    timer.fire()
+    finished.assert_called_once_with("ok")
+    assert not rig.runtime._switch_active()
+    assert rig.runtime.supervisor is candidate
+    candidate.stop.assert_not_called()
+    assert rig.supervisor_factory.call_count == 2
+    rig.runtime.shutdown()
+
+
+def test_paused_switch_survives_restart_before_hello(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    replacement = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = replacement
+    finished = Mock()
+    rig.runtime.on_switch_finished = finished
+
+    rig.runtime.switch_model(min_ram_mb=100, pause=True)
+    callback = rig.supervisor_factory.call_args.kwargs["on_event"]
+    replacement.generation += 1
+    callback({"type": "error", "generation": replacement.generation, "code": "worker-crashed"})
+    finished.assert_not_called()
+    callback({"type": "hello", "generation": replacement.generation})
+    callback({"type": "model.loaded", "generation": replacement.generation})
+    finished.assert_not_called()
+    callback(
+        {
+            "type": "result",
+            "generation": replacement.generation,
+            "utterance_id": "file",
+            "text": "проверка",
+        }
+    )
+    finished.assert_called_once_with("ok")
+    assert not rig.runtime._switch_active()
+    rig.runtime.shutdown()
+
+
+def test_switch_watchdog_stops_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    candidate = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = candidate
+    monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
+    finished = Mock()
+    rig.runtime.on_switch_finished = finished
+
+    rig.runtime.switch_model(min_ram_mb=100)
+    timer = rig.runtime._switch_timer
+    assert timer is not None and timer.interval == module.SWITCH_TIMEOUT_S * 1000
+    timer.fire()
+    finished.assert_called_once_with("failed")
+    candidate.stop.assert_called_once_with()
+    assert not rig.runtime._switch_active()
+    assert rig.runtime._switch_timer is None
+    rig.runtime.shutdown()
+
+
+def test_paused_switch_watchdog_stops_unresponsive_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    replacement = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = replacement
+    recovered = Mock(state="running", generation=1)
+
+    def rolled_back(result: str) -> None:
+        assert result == "failed"
+        assert rig.runtime.supervisor is replacement
+        assert rig.supervisor_factory.call_count == 2
+        rig.supervisor_factory.return_value = recovered
+
+    finished = Mock(side_effect=rolled_back)
+    rig.runtime.on_switch_finished = finished
+
+    rig.runtime.switch_model(min_ram_mb=100, pause=True)
+    timer = rig.runtime._switch_timer
+    assert timer is not None
+    timer.fire()
+
+    replacement.stop.assert_called_once_with()
+    finished.assert_called_once_with("failed")
+    assert rig.runtime.supervisor is recovered
+    recovered.start.assert_called_once_with()
+    assert rig.supervisor_factory.call_count == 3
+    assert not rig.runtime._switch_active()
+    assert rig.runtime._loading_model
+    rig.hotkey.fsm.press(rig.now)
+    recovered.send.assert_not_called()
+    callback = rig.supervisor_factory.call_args.kwargs["on_event"]
+    callback({"type": "hello", "generation": recovered.generation})
+    callback({"type": "model.loaded", "generation": recovered.generation})
+    callback(
+        {
+            "type": "result",
+            "generation": recovered.generation,
+            "utterance_id": "file",
+            "text": "проверка",
+        }
+    )
+    rig.hotkey.fsm.press(rig.now)
+    assert recovered.send.call_args.args[0]["type"] == "record.start"
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    rig.runtime.shutdown()
+
+
+def test_restart_worker_fails_paused_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    replacement = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = replacement
+    finished = Mock()
+    rig.runtime.on_switch_finished = finished
+    rig.runtime.switch_model(min_ram_mb=100, pause=True)
+    timer = rig.runtime._switch_timer
+    rig.runtime.restart_worker()
+    finished.assert_called_once_with("failed")
+    assert not rig.runtime._switch_active()
+    assert rig.runtime._switch_timer is None
+    assert timer is not None and timer.deleted
+    assert rig.runtime._switch_candidate is None
+    rig.runtime.shutdown()
 
 
 @pytest.mark.parametrize("failure", ["pill", "provider", "tray", "guard", "stats", "supervisor"])

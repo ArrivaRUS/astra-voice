@@ -136,6 +136,9 @@ class FakeOnboarding(QObject):
                 "badge": "",
                 "state": "available",
                 "message": "",
+                "hint": "",
+                "hintKind": "",
+                "canSwitchWithPause": False,
                 "progress": 0.0,
                 "vendor": "Сбер (GigaChat Team)",
                 "domestic": True,
@@ -696,6 +699,9 @@ class FakeSettings(QObject):
                 "badge": "active",
                 "state": "installed",
                 "message": "",
+                "hint": "",
+                "hintKind": "",
+                "canSwitchWithPause": False,
                 "progress": 0.0,
                 "vendor": "Сбер (GigaChat Team)",
                 "domestic": True,
@@ -738,6 +744,9 @@ class FakeSettings(QObject):
                 "badge": "",
                 "state": "available",
                 "message": "",
+                "hint": "",
+                "hintKind": "",
+                "canSwitchWithPause": False,
                 "progress": 0.0,
                 "vendor": "Т-Банк",
                 "domestic": True,
@@ -1095,6 +1104,14 @@ class FakeSettings(QObject):
     @pyqtSlot(str)
     def makeModelCurrent(self, model_id: str) -> None:
         self.calls.append("makeModelCurrent")
+
+    @pyqtSlot(str)
+    def switchModelWithPause(self, model_id: str) -> None:
+        self.calls.append("switchModelWithPause")
+
+    @pyqtSlot(str)
+    def reinstallModel(self, model_id: str) -> None:
+        self.calls.append("reinstallModel")
 
     @pyqtSlot(str)
     def removeModel(self, model_id: str) -> None:
@@ -2398,6 +2415,231 @@ def test_settings_models_section_calls_bridge(onboarding_app: Any, dark: bool) -
         onboarding_app, dark, fake=fake, section="models", inspect=inspect
     )
     assert_no_messages(messages, "models section calls bridge")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_settings_model_removal_requires_confirmation(onboarding_app: Any, dark: bool) -> None:
+    """Удаление установленной модели проходит через оконный диалог."""
+    fake = FakeSettings()
+    fake.models = [{**fake.models[0], "badge": "installed", "selected": False}]
+
+    def inspect(window: Any) -> None:
+        root = window.contentItem()
+        card = next(
+            item
+            for item in visual_tree(root)
+            if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
+        )
+        assert set(fake.calls) <= {"refreshDevices", "refreshMicrophone", "cancelCapture"}
+        fake.calls.clear()
+
+        def open_dialog() -> Any:
+            remove = visible_button(card, "Удалить")
+            assert remove.isEnabled()
+            QMetaObject.invokeMethod(remove, "clicked", Qt.DirectConnection)
+            onboarding_app.processEvents()
+            assert fake.calls == []
+            dialogs = [
+                item
+                for item in window.findChildren(QObject)
+                if item.property("heading") == "Удалить GigaAM v3 RNN-T?"
+            ]
+            assert len(dialogs) == 1
+            dialog = dialogs[0]
+            assert dialog.property("visible") is True
+            assert dialog.property("modal") is True
+            assert (
+                "С диска будет удалено 226 МБ из папки моделей. Настройки и статистика останутся."
+            ) in visible_texts(root)
+            assert "Скачать модель заново можно в любой момент." in visible_texts(root)
+            assert dialog.property("note") == "Скачать модель заново можно в любой момент."
+            assert dialog.property("iconName") == "trash"
+            return dialog
+
+        dialog = open_dialog()
+        cancel = visible_button(dialog.property("footer"), "Отмена")
+        QMetaObject.invokeMethod(cancel, "clicked", Qt.DirectConnection)
+        onboarding_app.processEvents()
+        assert fake.calls == []
+        assert dialog.property("visible") is False
+
+        dialog = open_dialog()
+        confirm = visible_button(dialog.property("footer"), "Удалить")
+        QMetaObject.invokeMethod(confirm, "clicked", Qt.DirectConnection)
+        onboarding_app.processEvents()
+        assert fake.calls == ["removeModel"]
+        assert dialog.property("visible") is False
+
+    _, messages = render_settings(
+        onboarding_app, dark, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "model removal confirmation")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_broken_installed_card_keeps_badge_and_message(onboarding_app: Any, dark: bool) -> None:
+    fake = FakeSettings()
+    fake.models = [
+        {
+            **fake.models[0],
+            "badge": "installed",
+            "state": "broken",
+            "message": "Файлы модели не читаются — переустановите",
+        }
+    ]
+
+    def inspect(window: Any) -> None:
+        card = next(
+            item
+            for item in visual_tree(window.contentItem())
+            if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
+        )
+        texts = visible_texts(card)
+        assert "Файлы модели не читаются — переустановите" in texts
+        assert "Установлена" in texts
+        assert visible_button(card, "Переустановить").isEnabled()
+        assert visible_button(card, "Удалить").isEnabled()
+
+    _, messages = render_settings(
+        onboarding_app, dark, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "broken installed model")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_active_model_removal_explains_why_unavailable(onboarding_app: Any, dark: bool) -> None:
+    fake = FakeSettings()
+    fake.models = [{**fake.models[0], "badge": "active", "state": "installed"}]
+
+    def inspect(window: Any) -> None:
+        root = window.contentItem()
+        card = next(
+            item
+            for item in visual_tree(root)
+            if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
+        )
+        fake.calls.clear()
+        remove = visible_button(card, "Удалить")
+        assert remove.isEnabled()
+        QMetaObject.invokeMethod(remove, "clicked", Qt.DirectConnection)
+        onboarding_app.processEvents()
+        dialogs = [
+            item
+            for item in window.findChildren(QObject)
+            if item.property("heading") == "Сначала выберите другую модель"
+        ]
+        assert len(dialogs) == 1
+        dialog = dialogs[0]
+        assert dialog.property("visible") is True
+        assert (
+            "GigaAM v3 RNN-T сейчас активна — без модели диктовка работать не будет. "
+            "Выберите другую установленную модель, после этого удаление станет доступно."
+        ) in visible_texts(root)
+        assert [
+            item.property("text")
+            for item in visual_tree(dialog.property("footer"))
+            if item.isVisible() and item.metaObject().indexOfSignal(b"clicked()") >= 0
+        ] == ["Понятно"]
+        QMetaObject.invokeMethod(
+            visible_button(dialog.property("footer"), "Понятно"), "clicked", Qt.DirectConnection
+        )
+        onboarding_app.processEvents()
+        assert dialog.property("visible") is False
+        assert fake.calls == []
+        QMetaObject.invokeMethod(remove, "clicked", Qt.DirectConnection)
+        onboarding_app.processEvents()
+        assert dialog.property("visible") is True
+        QMetaObject.invokeMethod(
+            visible_button(dialog.property("footer"), "Понятно"),
+            "clicked",
+            Qt.DirectConnection,
+        )
+        onboarding_app.processEvents()
+        assert dialog.property("visible") is False
+        assert fake.calls == []
+
+    _, messages = render_settings(
+        onboarding_app, dark, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "active model removal")
+
+
+@pytest.mark.parametrize("badge", ["installed", "active"], ids=["remove", "unavailable"])
+def test_model_dialog_survives_section_reloading(onboarding_app: Any, badge: str) -> None:
+    """Открытый popup закрывается до уничтожения раздела при каждом переходе."""
+    fake = FakeSettings()
+    fake.models = [{**fake.models[0], "badge": badge, "selected": False}]
+    heading = (
+        "Удалить GigaAM v3 RNN-T?" if badge == "installed" else "Сначала выберите другую модель"
+    )
+
+    def inspect(window: Any) -> None:
+        sidebar = settings_sidebar(window)
+        for _ in range(30):
+            root = window.contentItem()
+            card = next(
+                item
+                for item in visual_tree(root)
+                if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
+            )
+            QMetaObject.invokeMethod(
+                visible_button(card, "Удалить"), "clicked", Qt.DirectConnection
+            )
+            onboarding_app.processEvents()
+            dialogs = [
+                item
+                for item in window.findChildren(QObject)
+                if item.property("heading") == heading and item.property("visible") is True
+            ]
+            assert len(dialogs) == 1
+            # Модальный popup блокирует клик; смену source запускает сам сайдбар.
+            assert sidebar.setProperty("currentIndex", 0)
+            onboarding_app.processEvents()
+            assert sidebar.property("currentIndex") == 0
+            assert sidebar.setProperty("currentIndex", 1)
+            onboarding_app.processEvents()
+            assert sidebar.property("currentIndex") == 1
+
+    _, messages = render_settings(
+        onboarding_app, False, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, f"{badge} dialog section reload")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_long_active_model_name_wraps_in_dialog(onboarding_app: Any, dark: bool) -> None:
+    fake = FakeSettings()
+    long_name = "Очень длинное название модели для проверки переноса текста в диалоге " * 5
+    fake.models = [{**fake.models[0], "name": long_name, "badge": "active", "state": "installed"}]
+
+    def inspect(window: Any) -> None:
+        root = window.contentItem()
+        card = next(
+            item
+            for item in visual_tree(root)
+            if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
+        )
+        QMetaObject.invokeMethod(visible_button(card, "Удалить"), "clicked", Qt.DirectConnection)
+        onboarding_app.processEvents()
+        dialog = next(
+            item
+            for item in window.findChildren(QObject)
+            if item.property("heading") == "Сначала выберите другую модель"
+        )
+        body = dialog.property("contentItem")
+        message = next(
+            item
+            for item in visual_tree(body)
+            if item.property("text") == dialog.property("message")
+        )
+        assert message.property("paintedHeight") > 3 * message.property("font").pixelSize()
+        assert body.property("height") >= message.property("y") + message.property("paintedHeight")
+        assert dialog.property("message").startswith(long_name)
+
+    _, messages = render_settings(
+        onboarding_app, dark, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "long model name removal dialog")
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
