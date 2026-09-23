@@ -48,6 +48,7 @@ from astra_voice.platform.paste import (
     normalize,
 )
 from astra_voice.ui.pill import (
+    CLIPBOARD_NOT_FETCHED,
     CLIPBOARD_REASONS,
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
@@ -152,6 +153,7 @@ class Rig:
         self.sent: list[tuple[dict[str, Any], float | None]] = []
         self.pasted: list[tuple[str, int | None, PasteMode]] = []
         self.outcomes: deque[PasteOutcomeKind] = deque()
+        self.paste_reason = ""
         self.during_paste: Callable[[], None] | None = None
         self.during_send: Callable[[dict[str, Any]], None] | None = None
         self.timers: list[Timer] = []
@@ -223,7 +225,16 @@ class Rig:
             self.during_paste()
         self.now += 0.125
         kind = self.outcomes.popleft() if self.outcomes else PasteOutcomeKind.PASTED
-        return PasteOutcome(kind, PasteMethod.NONE, PasteRestore.KEPT_OURS, None, 0, 0, 0.0)
+        return PasteOutcome(
+            kind,
+            PasteMethod.NONE,
+            PasteRestore.KEPT_OURS,
+            None,
+            0,
+            0,
+            0.0,
+            reason=self.paste_reason,
+        )
 
     def schedule(self, delay: int, callback: Callable[[], None]) -> object:
         timer = Timer(delay, callback)
@@ -552,6 +563,27 @@ def test_paste_outcomes(
     assert rig.core.phase == DictationPhase.FINISHING and rig.done == 1
     assert rig.core.last_text == MARKER
     assert [e["result"] for e in rig.stats.events] == ([] if stat_result is None else [stat_result])
+
+
+@pytest.mark.parametrize(
+    ("paste_reason", "pill_text"),
+    [
+        ("not-fetched", CLIPBOARD_NOT_FETCHED),
+        ("focus-outside", CLIPBOARD_WINDOW_CHANGED),
+        ("", CLIPBOARD_WINDOW_CHANGED),
+    ],
+)
+def test_window_changed_pill_distinguishes_unfetched(
+    rig: Rig, paste_reason: str, pill_text: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.paste_reason = paste_reason
+    rig.outcomes.append(PasteOutcomeKind.WINDOW_CHANGED)
+    rig.start()
+    rig.stop()
+    with caplog.at_level(logging.DEBUG, logger="test.dictation"):
+        rig.result()
+    assert rig.pill.calls[-1] == (PillState.CLIPBOARD_ONLY, pill_text, None)
+    assert MARKER not in caplog.text
 
 
 @pytest.mark.parametrize("second", [PasteOutcomeKind.BUSY, PasteOutcomeKind.PASTED])

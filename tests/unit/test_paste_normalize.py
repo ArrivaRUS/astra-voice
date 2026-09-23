@@ -101,13 +101,20 @@ class FakeClipboard:
         }
         self.owned = {False: False, True: False}
         self.writes: list[tuple[bool, dict[str, bytes]]] = []
+        self.trackers: dict[bool, paste._FetchTracker | None] = {False: None, True: None}
 
     def snapshot(self, primary: bool) -> dict[str, bytes]:
         return self.data[primary].copy()
 
-    def put(self, snapshot: dict[str, bytes], primary: bool) -> None:
+    def put(
+        self,
+        snapshot: dict[str, bytes],
+        primary: bool,
+        tracker: paste._FetchTracker | None = None,
+    ) -> None:
         self.data[primary] = snapshot.copy()
         self.writes.append((primary, snapshot.copy()))
+        self.trackers[primary] = tracker
         self.owned[primary] = True
 
     def owns(self, primary: bool) -> bool:
@@ -135,6 +142,15 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeClipboard, Mock, list[
     x.wm_class.return_value = ("kate", "kate")
     x.active_window.return_value = 42
     x.send_combo.return_value = True
+
+    def send_combo(*_args: object) -> bool:
+        if x.send_combo.return_value:
+            tracker = cb.trackers[False]
+            assert tracker is not None
+            tracker.mark()
+        return bool(x.send_combo.return_value)
+
+    x.send_combo.side_effect = send_combo
     x.grab_keyboard.return_value = True
     x.keyboard_grab_deadline = None
     x.keys_held.return_value = False
@@ -380,8 +396,12 @@ def test_restore_pending_keeps_phrase_for_non_pasted(
         # Публикация произошла, но адаптер сообщил об ошибке.
         put = cb.put
 
-        def failing_put(snapshot: dict[str, bytes], primary: bool) -> None:
-            put(snapshot, primary)
+        def failing_put(
+            snapshot: dict[str, bytes],
+            primary: bool,
+            tracker: paste._FetchTracker | None = None,
+        ) -> None:
+            put(snapshot, primary, tracker)
             raise RuntimeError("публикация прервана")
 
         monkeypatch.setattr(cb, "put", failing_put)
@@ -594,6 +614,215 @@ def test_chain_and_both_snapshots(
     assert not paste.has_pending()
     assert not paste.restore_pending()
     x.close.assert_called_once()
+
+
+def test_delayed_fetch_restores_after_six_polls(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cb, x, delays = harness
+    before = cb.snapshot(False)
+    x.send_combo.side_effect = lambda *_args: True
+
+    def wait(ms: int) -> None:
+        delays.append(ms)
+        if delays.count(paste.KEYS_POLL_MS) == 6:
+            tracker = cb.trackers[False]
+            assert tracker is not None
+            tracker.mark()
+
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    outcome = paste.paste_text("поздняя фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    assert outcome.restore == PasteRestore.RESTORED
+    assert outcome.fetched_ms is not None and outcome.fetched_ms >= 0
+    assert cb.data[False] == before
+    assert delays == [50] + [paste.KEYS_POLL_MS] * 6 + [100]
+
+
+def test_unfetched_phrase_stays_in_clipboard(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+) -> None:
+    cb, x, delays = harness
+    x.send_combo.side_effect = lambda *_args: True
+    outcome = paste.paste_text("фраза для ручной вставки", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+    assert outcome.method == PasteMethod.CTRL_V
+    assert outcome.reason == "not-fetched"
+    assert outcome.restore == PasteRestore.KEPT_OURS
+    assert outcome.fetched_ms is None
+    assert cb.data[False]["text/plain"] == "фраза для ручной вставки".encode()
+    assert delays == [50] + [paste.KEYS_POLL_MS] * (
+        (paste.FETCH_TIMEOUT_MS + paste.KEYS_POLL_MS - 1) // paste.KEYS_POLL_MS
+    ) + [100]
+    assert not paste.has_pending()
+    assert not paste.restore_pending()
+    assert cb.data[False]["text/plain"] == "фраза для ручной вставки".encode()
+
+
+def test_new_clipboard_owner_after_xtest_counts_as_pasted(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+) -> None:
+    cb, x, delays = harness
+
+    def send_combo(*_args: object) -> bool:
+        cb.owned[False] = False
+        return True
+
+    x.send_combo.side_effect = send_combo
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    assert outcome.restore == PasteRestore.SKIPPED_NOT_OWNER
+    assert outcome.reason == ""
+    assert outcome.fetched_ms is None
+    assert delays == [50, 100]
+
+
+def test_unfetched_shift_insert_keeps_phrase_in_both_clipboards(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+) -> None:
+    cb, x, _ = harness
+    x.wm_class.return_value = ("xterm", "xterm")
+    x.send_combo.side_effect = lambda *_args: True
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+    assert outcome.method == PasteMethod.SHIFT_INSERT
+    assert outcome.reason == "not-fetched"
+    assert outcome.fetched_ms is None
+    for primary in (False, True):
+        assert cb.data[primary]["text/plain"] == "фраза".encode()
+
+
+def test_fetch_wait_stops_at_wall_clock_deadline(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, x, delays = harness
+    x.send_combo.side_effect = lambda *_args: True
+    now = [0.0]
+    monkeypatch.setattr(paste, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+    def wait(ms: int) -> None:
+        delays.append(ms)
+        if ms == paste.KEYS_POLL_MS:
+            now[0] += paste.FETCH_TIMEOUT_MS / 1000 + 0.1
+
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+    assert outcome.reason == "not-fetched"
+    assert delays == [50, paste.KEYS_POLL_MS, 100]
+
+
+def test_restore_pending_during_fetch_wait_stops_polling(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cb, x, delays = harness
+    before = cb.snapshot(False)
+    x.send_combo.side_effect = lambda *_args: True
+
+    def wait(ms: int) -> None:
+        delays.append(ms)
+        if ms == paste.KEYS_POLL_MS:
+            assert paste.has_pending()
+            assert paste.restore_pending()
+
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    assert outcome.restore == PasteRestore.RESTORED
+    assert cb.data[False] == before
+    assert delays == [50, paste.KEYS_POLL_MS, 100]
+
+
+def test_fetch_before_xtest_does_not_count(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cb, x, _ = harness
+    x.send_combo.side_effect = lambda *_args: True
+    original_put = cb.put
+
+    def put(
+        snapshot: dict[str, bytes], primary: bool, tracker: paste._FetchTracker | None = None
+    ) -> None:
+        original_put(snapshot, primary, tracker)
+        if tracker is not None:
+            tracker.mark()
+
+    monkeypatch.setattr(cb, "put", put)
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+    assert outcome.reason == "not-fetched"
+    assert outcome.fetched_ms is None
+    assert cb.data[False]["text/plain"] == "фраза".encode()
+
+
+def test_shift_insert_primary_fetch_counts(harness: tuple[FakeClipboard, Mock, list[int]]) -> None:
+    cb, x, _ = harness
+    x.wm_class.return_value = ("xterm", "xterm")
+    before = {mode: cb.snapshot(mode) for mode in (False, True)}
+
+    def send_combo(*_args: object) -> bool:
+        assert cb.trackers[True] is cb.trackers[False]
+        tracker = cb.trackers[True]
+        assert tracker is not None
+        tracker.mark()
+        return True
+
+    x.send_combo.side_effect = send_combo
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    assert outcome.method == PasteMethod.SHIFT_INSERT
+    assert outcome.fetched_ms is not None
+    assert cb.data == before
+
+
+@pytest.mark.parametrize("fetched", [True, False])
+def test_info_log_reports_fetch_without_phrase(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    caplog: pytest.LogCaptureFixture,
+    fetched: bool,
+) -> None:
+    _, x, _ = harness
+    if not fetched:
+        x.send_combo.side_effect = lambda *_args: True
+    caplog.set_level(logging.INFO, logger=paste.__name__)
+    outcome = paste.paste_text("СЕКРЕТНАЯ-ФРАЗА", 42, PasteMode.AUTO)
+    lines = [record.getMessage() for record in caplog.records if record.name == paste.__name__]
+    assert len(lines) == 1
+    if fetched:
+        assert isinstance(outcome.fetched_ms, int)
+    else:
+        assert outcome.reason == "not-fetched"
+        assert "reason=not-fetched" in lines[0]
+    assert f"fetched_ms={outcome.fetched_ms if fetched else '-'}" in lines[0]
+    assert "СЕКРЕТНАЯ-ФРАЗА" not in lines[0]
+
+
+def test_tracked_mime_marks_data_request_without_system_clipboard() -> None:
+    pytest.importorskip("PyQt5")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from helpers.qt_app import get_qapplication
+
+    app = get_qapplication()
+    assert app is not None
+    tracker = paste._FetchTracker()
+    md = paste._tracked_mime(
+        {
+            "text/plain": "фраза".encode(),
+            paste.KDE_HINT: b"secret",
+            paste.FLY_FALLBACK_TYPE: b"",
+        },
+        tracker,
+    )
+    assert tracker.fetched_at is None
+    assert bytes(md.data(paste.KDE_HINT)) == b"secret"
+    assert tracker.fetched_at is None
+    assert bytes(md.data(paste.FLY_FALLBACK_TYPE)) == b""
+    assert tracker.fetched_at is None
+    assert bytes(md.data("text/plain")) == "фраза".encode()
+    assert tracker.fetched_at is not None
+    assert type(md) is type(
+        paste._tracked_mime({"text/plain": "другая".encode()}, paste._FetchTracker())
+    )
 
 
 @pytest.mark.parametrize("target", [42, None])
@@ -921,7 +1150,7 @@ def test_clipboard_errors_return_outcome(
     original = getattr(cb, operation)
 
     def fail_clipboard(*args: object) -> object:
-        if args[-1] is False:
+        if (args[1] if operation == "put" else args[-1]) is False:
             raise RuntimeError("буфер недоступен")
         return original(*args)
 
@@ -1141,7 +1370,7 @@ def test_qt_process_returns_outcome_without_abort(scenario: str) -> None:
                 x = Mock()
                 x.wm_class.return_value = ("kate", "kate")
                 x.active_window.return_value = 42
-                x.send_combo.return_value = True
+                x.send_combo.side_effect = lambda *args: (tracker.mark(), True)[1]
                 x.grab_keyboard.return_value = True
                 x.keyboard_grab_deadline = None
                 x.keys_held.return_value = False
@@ -1153,7 +1382,12 @@ def test_qt_process_returns_outcome_without_abort(scenario: str) -> None:
                 factory.return_value = x
                 outcomes = []
                 writes = []
-                cb.put.side_effect = lambda data, primary: writes.append(data.copy())
+                tracker = None
+                def put(data, primary, fetched=None):
+                    global tracker
+                    tracker = fetched
+                    writes.append(data.copy())
+                cb.put.side_effect = put
                 def reenter():
                     outcomes.append(paste.paste_text("вторая", 42, paste.PasteMode.AUTO))
                 QTimer.singleShot(0, reenter)

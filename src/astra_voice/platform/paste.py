@@ -32,6 +32,9 @@ log = logging.getLogger(__name__)
 KDE_HINT = "x-kde-passwordManagerHint"
 DELAY_BEFORE_MS = 50
 DELAY_AFTER_MS = 100
+# Зависший или перегруженный приёмник может прочитать буфер позже Ctrl+V.
+# 1500 мс дольше типичной паузы GC/перегрузки, но ещё в пределах ожидания пользователя.
+FETCH_TIMEOUT_MS = 1500
 # Toggle: распознавание стартует по нажатию, а клавиша хоткея ещё зажата; по X GrabKey
 # её активный захват держится до отпускания, и XTest до этого момента ушёл бы в наш же
 # захват. Ждём отпускания дольше окна send_combo (200 мс), но в пределах Ц2.
@@ -107,8 +110,8 @@ class PasteOutcome:
     CR/LF: они заменяются пробелами, включая пару CRLF. busy ничего не меняет;
     его нулевые счётчики означают, что фраза не обрабатывалась. failed сообщает
     об ошибке до публикации или при восстановлении, без текста исключения.
-    reason — короткий код ветки, по которой XTest не состоялся (для журнала);
-    пустая строка при pasted.
+    reason — короткий код ветки, помешавшей автоматической вставке (для журнала);
+    пустая строка при pasted. fetched_ms — время от XTest до выдачи фразы.
     """
 
     kind: PasteOutcomeKind
@@ -119,6 +122,7 @@ class PasteOutcome:
     stripped_controls: int
     t_ms: float
     reason: str = ""
+    fetched_ms: int | None = None
 
 
 def normalize(text: str) -> str:
@@ -207,6 +211,46 @@ def restore_mime(snapshot: dict[str, bytes]) -> Any:
     return md
 
 
+class _FetchTracker:
+    def __init__(self) -> None:
+        self.fetched_at: float | None = None
+
+    def reset(self) -> None:
+        self.fetched_at = None
+
+    def mark(self) -> None:
+        if self.fetched_at is None:
+            self.fetched_at = time.monotonic()
+
+
+@cache
+def _tracked_mime_class() -> type[Any]:
+    """Импортировать Qt и создать один класс QMimeData при первом использовании."""
+    from PyQt5.QtCore import QMimeData
+
+    class _TrackedMimeData(QMimeData):
+        def __init__(self, tracker: _FetchTracker) -> None:
+            super().__init__()
+            self._tracker = tracker
+
+        def retrieveData(self, mimetype: str, preferred_type: Any) -> Any:
+            if mimetype.lower().startswith("text/"):
+                self._tracker.mark()
+            return super().retrieveData(mimetype, preferred_type)
+
+    return _TrackedMimeData
+
+
+def _tracked_mime(snapshot: dict[str, bytes], tracker: _FetchTracker) -> Any:
+    """Создать ленивый QMimeData, отмечающий выдачу текстового формата."""
+    from PyQt5.QtCore import QByteArray
+
+    md = _tracked_mime_class()(tracker)
+    for fmt, data in snapshot.items():
+        md.setData(fmt, QByteArray(data))
+    return md
+
+
 class _Clipboard:
     """Ленивый адаптер Qt; QApplication создаёт только оркестрация."""
 
@@ -227,8 +271,11 @@ class _Clipboard:
     def snapshot(self, primary: bool) -> dict[str, bytes]:
         return snapshot_mime(self.cb.mimeData(self._mode(primary)))
 
-    def put(self, snapshot: dict[str, bytes], primary: bool) -> None:
-        self.cb.setMimeData(restore_mime(snapshot), self._mode(primary))
+    def put(
+        self, snapshot: dict[str, bytes], primary: bool, tracker: _FetchTracker | None = None
+    ) -> None:
+        md = _tracked_mime(snapshot, tracker) if tracker is not None else restore_mime(snapshot)
+        self.cb.setMimeData(md, self._mode(primary))
 
     def owns(self, primary: bool) -> bool:
         return bool(self.cb.ownsSelection() if primary else self.cb.ownsClipboard())
@@ -358,10 +405,18 @@ def _wait_keys_released(x: X11Display, timeout_ms: int) -> bool:
         _wait_ms(KEYS_POLL_MS)
 
 
-def _publish(cb: _Clipboard, snapshot: dict[str, bytes], primary: bool) -> None:
+def _publish(
+    cb: _Clipboard,
+    snapshot: dict[str, bytes],
+    primary: bool,
+    tracker: _FetchTracker | None = None,
+) -> None:
     """Запомнить байтовую копию последней нашей публикации в CLIPBOARD."""
     global _last_clipboard_snapshot
-    cb.put(snapshot, primary)
+    if tracker is None:
+        cb.put(snapshot, primary)
+    else:
+        cb.put(snapshot, primary, tracker)
     if not primary:
         _last_clipboard_snapshot = snapshot.copy()
 
@@ -469,11 +524,13 @@ def _log_outcome(outcome: PasteOutcome, target_window: int | None) -> None:
     AST-страж запрещает журналировать всё, что получено из вызова с текстом.
     """
     log.info(
-        "вставка: %s method=%s restore=%s reason=%s target=%s wm_class=%s chars=%d t_ms=%s",
+        "вставка: %s method=%s restore=%s reason=%s fetched_ms=%s "
+        "target=%s wm_class=%s chars=%d t_ms=%s",
         outcome.kind,
         outcome.method,
         outcome.restore,
         outcome.reason or "-",
+        outcome.fetched_ms if outcome.fetched_ms is not None else "-",
         "set" if target_window else "none",
         outcome.wm_class,
         outcome.chars,
@@ -490,7 +547,8 @@ class PasteFlow:
     остаётся для ручной вставки. restore_pending позволяет вернуть его раньше
     при завершении. PRIMARY возвращается по правилам владения/секрета.
     Порядок: публикация → ожидание отпускания клавиш → пауза → проверка фокуса
-    → проба XGrabKeyboard на окне фокуса со снятием захвата → XTest. Проба на
+    → проба XGrabKeyboard на окне фокуса со снятием захвата → XTest → забор
+    → пауза → возврат. Проба на
     окне фокуса не порождает FocusIn/FocusOut и не трогает оконный менеджер
     (проба на корне давала fly-wm повод считать корень в фокусе). Принят
     остаточный риск гонки между пробой и XTest: атомарности в X11 нет (У12/У46).
@@ -575,17 +633,19 @@ class PasteFlow:
         reason = "manual" if x is None else "publish-failed"
         primary_restore: PasteRestore | None = None
         primary_touched = False
+        tracker = _FetchTracker() if x is not None else None
+        fetched_ms: int | None = None
         started = time.monotonic()
         try:
             _pending = pending
-            _publish(cb, out, False)
+            _publish(cb, out, False, tracker)
             kind = PasteOutcomeKind.CLIPBOARD_ONLY
             restore = PasteRestore.KEPT_OURS
             if primary is not None:
                 primary_touched = True
                 if pending is not None:
                     pending.primary_touched = True
-                cb.put(out, True)
+                cb.put(out, True, tracker)
             released = x is None or _wait_keys_released(x, KEYS_RELEASE_TIMEOUT_MS)
             _wait_ms(self.delay_before_ms)
             if pending is not None and pending.consumed:
@@ -607,14 +667,41 @@ class PasteFlow:
                             PasteMethod.CTRL_SHIFT_V: (["Control_L", "Shift_L"], "v"),
                             PasteMethod.SHIFT_INSERT: (["Shift_L"], "Insert"),
                         }[planned]
+                        if tracker is not None:
+                            tracker.reset()
+                        sent_at = time.monotonic()
                         if x.send_combo(mods, key):
                             kind, method = PasteOutcomeKind.PASTED, planned
+                            if tracker is not None:
+                                deadline = sent_at + FETCH_TIMEOUT_MS / 1000
+                                owner_changed = False
+                                for _ in range(
+                                    (FETCH_TIMEOUT_MS + KEYS_POLL_MS - 1) // KEYS_POLL_MS
+                                ):
+                                    if tracker.fetched_at is not None or (
+                                        pending is not None and pending.consumed
+                                    ):
+                                        break
+                                    if not cb.owns(False):
+                                        owner_changed = True
+                                        break
+                                    if time.monotonic() >= deadline:
+                                        break
+                                    _wait_ms(KEYS_POLL_MS)
+                                if tracker.fetched_at is not None:
+                                    fetched_ms = max(0, int((tracker.fetched_at - sent_at) * 1000))
+                                elif pending is None or not pending.consumed:
+                                    if not owner_changed and not cb.owns(False):
+                                        owner_changed = True
+                                    if not owner_changed:
+                                        kind = PasteOutcomeKind.WINDOW_CHANGED
+                                        reason = "not-fetched"
                         else:
                             kind, reason = PasteOutcomeKind.WINDOW_CHANGED, "xtest-refused"
             if kind == PasteOutcomeKind.WINDOW_CHANGED:
                 # Код ветки без окон и текста: этого достаточно, чтобы отличить
                 # «нет захвата», «фокус не совпал», «XTest отказал», «клавиши зажаты».
-                log.debug("вставка: XTest не выполнен, причина %s", reason)
+                log.debug("вставка: автоматическая вставка не подтверждена, причина %s", reason)
             if kind != PasteOutcomeKind.PASTED:
                 _pending = None
             _wait_ms(self.delay_after_ms)
@@ -640,6 +727,7 @@ class PasteFlow:
                         and primary is not None
                         and pending is not None
                         and not pending.consumed
+                        and reason != "not-fetched"
                     ):
                         primary_restore = _restore(cb, primary, True)
                 except Exception:
@@ -657,9 +745,10 @@ class PasteFlow:
             ),
             t_ms=round((time.monotonic() - started) * 1000, 1),
             reason="" if kind == PasteOutcomeKind.PASTED else reason,
+            fetched_ms=fetched_ms,
         )
 
 
 def paste_text(text: str, target_window: int | None, mode: PasteMode) -> PasteOutcome:
-    """Публикация → отпускание клавиш → 50 мс → фокус → проба → XTest → 100 мс → возврат."""
+    """Публикация → отпускание клавиш → 50 мс → фокус → проба → XTest → забор → возврат."""
     return PasteFlow().run(text, target_window, mode)
