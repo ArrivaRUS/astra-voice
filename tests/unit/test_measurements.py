@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from astra_voice.core.measurements import MeasurementTracker, read_measurements
+from astra_voice.core.version import __version__
 
 pytestmark = pytest.mark.unit
 
@@ -23,6 +24,7 @@ def test_first_success_requests_measure_and_warm_median(tmp_path: Path) -> None:
     assert saved["ram_mb"] == 2
     assert saved["rtfx"] is None
     assert saved["threads"] == 2
+    assert saved["build"] == __version__
     assert isinstance(saved["measured_at"], str)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
@@ -136,3 +138,29 @@ def test_old_result_without_timings_does_not_start_measurement(tmp_path: Path) -
     assert tracker.warm_runs == []
     assert tracker.dictation(audio_ms=1000, infer_ms=100, cold=True)
     assert tracker.requested
+
+
+@pytest.mark.parametrize("build", [None, "other-version"])
+def test_old_build_measurement_is_ignored(tmp_path: Path, build: str | None) -> None:
+    path = tmp_path / "measurements.json"
+    saved = {"ram_mb": 900, "rtfx": 20, "threads": 2, "measured_at": "old"}
+    if build is not None:
+        saved["build"] = build
+    path.write_text(json.dumps({"model@rev": saved}))
+    assert read_measurements(path) == {}
+    tracker = MeasurementTracker(path)
+    tracker.set_model("model", "rev", 2)
+    assert tracker.ram_mb is None
+    assert tracker.dictation(audio_ms=1000, infer_ms=100, cold=True)
+
+
+def test_repeated_measurement_keeps_timestamp_and_file(tmp_path: Path) -> None:
+    path = tmp_path / "measurements.json"
+    tracker = MeasurementTracker(path)
+    tracker.set_model("model", "rev", 2)
+    tracker.measured(2000)
+    measured_at = tracker.measured_at
+    before = path.stat().st_mtime_ns
+    tracker.measured(1000)
+    assert tracker.measured_at == measured_at
+    assert path.stat().st_mtime_ns == before

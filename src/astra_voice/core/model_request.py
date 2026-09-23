@@ -11,12 +11,18 @@ class ModelNotConfigured(ValueError):
     """В настройках отсутствуют модель или ревизия."""
 
 
-def model_threads(settings: Mapping[str, Any], *, explicit: int | None = None) -> Any:
-    """Тот же приоритет потоков, что у запроса загрузки модели."""
+def _raw_model_threads(settings: Mapping[str, Any], *, explicit: int | None = None) -> Any:
+    """Возвращает значение потоков без изменения для проверки запроса."""
     for value in (explicit, settings.get("model_threads"), settings.get("threads")):
         if value is not None:
             return value
     return 2
+
+
+def model_threads(settings: Mapping[str, Any], *, explicit: int | None = None) -> int:
+    """Число потоков для замеров и каталога с безопасным умолчанием."""
+    value = _raw_model_threads(settings, explicit=explicit)
+    return value if type(value) is int and value > 0 else 2
 
 
 def build_model_load(
@@ -58,6 +64,6 @@ def build_model_load(
         "dir": str(Path(directory).expanduser()),
         "layout": option("layout", "onnx-asr-gigaam-v3"),
         "variant": option("variant", "gigaam-v3-e2e-rnnt", explicit=variant),
-        "threads": model_threads(settings, explicit=threads),
+        "threads": _raw_model_threads(settings, explicit=threads),
         "min_ram_mb": option("min_ram_mb", 768),
     }

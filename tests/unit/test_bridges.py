@@ -1069,7 +1069,6 @@ def onboarding_rig() -> OnboardingRig:
     host.subscribe_device_resolved.return_value = ""
     host.begin_capture.return_value = True
     host.probe.return_value = "ok"
-    host.apply_hotkey.return_value = "ok"
     host.free_candidates.return_value = ["Ctrl+Alt+D"]
     controller = OnboardingController(
         bridge, settings=settings, host=host, device_provider=lambda: []
@@ -1103,7 +1102,6 @@ def test_capture_apply_busy_does_not_save(onboarding_rig: OnboardingRig, screen:
         call("Ctrl+Alt+D", "ptt"),
         call("Ctrl+Space", "ptt"),
     ]
-    host.apply_hotkey.assert_not_called()
 
 
 @pytest.mark.parametrize("screen", ["settings", "onboarding"])
@@ -1117,7 +1115,6 @@ def test_capture_keep_applies_once(onboarding_rig: OnboardingRig, screen: str) -
     apply.hotkey.assert_not_called()
     target.keepCombo()
     apply.hotkey.assert_called_once_with("Ctrl+Alt+D", "ptt")
-    host.apply_hotkey.assert_not_called()
     save.assert_called_once_with(settings)
     assert target.captureState == "success"
     assert settings.hotkey == bridge.hotkey == "Ctrl+Alt+D"
@@ -1205,6 +1202,28 @@ def test_capture_without_host_degrades_and_can_cancel() -> None:
     capture.cancel()
     assert capture.state == "idle"
     assert len(states) == 2
+
+
+def test_window_event_emits_only_lifecycle_events() -> None:
+    capture = HotkeyCapture()
+    window = QObject()
+    capture.attach_window(window)
+    seen: list[QEvent.Type] = []
+    capture.windowEvent.connect(
+        lambda _window, event: seen.append(event.type()), Qt.DirectConnection
+    )
+
+    for kind in (
+        QEvent.MouseMove,
+        QEvent.Show,
+        QEvent.Hide,
+        QEvent.Close,
+        QEvent.WindowStateChange,
+        QEvent.KeyPress,
+    ):
+        capture.eventFilter(window, QEvent(kind))
+
+    assert seen == [QEvent.Show, QEvent.Hide, QEvent.Close, QEvent.WindowStateChange]
 
 
 def test_settings_capture_without_host_degrades() -> None:
@@ -1470,7 +1489,7 @@ def test_onboarding_capture_states(
         save.assert_called_once()
     else:
         assert settings.hotkey == "Ctrl+Space"
-        host.apply_hotkey.assert_not_called()
+        cast(Mock, bridge._apply).hotkey.assert_not_called()
         save.assert_not_called()
     controller.cancelCapture()
     assert controller.captureState == "idle" and controller.pendingCombo == ""
@@ -1492,7 +1511,7 @@ def test_onboarding_capture_without_modifier_is_rejected(
     controller.endCapture(combo)
 
     host.probe.assert_not_called()
-    host.apply_hotkey.assert_not_called()
+    cast(Mock, bridge._apply).hotkey.assert_not_called()
     save.assert_not_called()
     assert settings.to_dict() == original
     assert bridge.hotkey == settings.hotkey == original["hotkey"]
@@ -1512,7 +1531,7 @@ def test_onboarding_capture_without_modifier_is_rejected(
 
     assert len(messages) == len(candidates) == 1
     host.probe.assert_not_called()
-    host.apply_hotkey.assert_not_called()
+    cast(Mock, bridge._apply).hotkey.assert_not_called()
     save.assert_not_called()
     assert settings.to_dict() == original
 
@@ -1547,7 +1566,7 @@ def test_onboarding_valid_capture_clears_modifier_hint(onboarding_rig: Onboardin
 def test_onboarding_modifier_hint_clears_on_restart_or_cancel(
     onboarding_rig: OnboardingRig, action: str
 ) -> None:
-    controller, _, settings, host, save = onboarding_rig
+    controller, bridge, settings, host, save = onboarding_rig
     original = settings.to_dict()
     controller.beginCapture()
     controller.endCapture("Shift+A")
@@ -1564,7 +1583,7 @@ def test_onboarding_modifier_hint_clears_on_restart_or_cancel(
         assert controller.pendingCombo == ""
 
     host.probe.assert_not_called()
-    host.apply_hotkey.assert_not_called()
+    cast(Mock, bridge._apply).hotkey.assert_not_called()
     save.assert_not_called()
     assert settings.to_dict() == original
 
@@ -1616,12 +1635,15 @@ def test_onboarding_keep_conflict_is_explicit(onboarding_rig: OnboardingRig, res
     assert controller.captureState == "success"
 
 
-def test_onboarding_hotkey_save_failure_does_not_apply(onboarding_rig: OnboardingRig) -> None:
+def test_onboarding_hotkey_save_failure_rolls_back_apply(onboarding_rig: OnboardingRig) -> None:
     controller, bridge, settings, host, save = onboarding_rig
     save.side_effect = OSError()
     controller.endCapture("Ctrl+Alt+D")
     assert settings.hotkey == "Ctrl+Space"
-    host.apply_hotkey.assert_not_called()
+    assert cast(Mock, bridge._apply).hotkey.call_args_list == [
+        call("Ctrl+Alt+D", "ptt"),
+        call("Ctrl+Space", "ptt"),
+    ]
     assert controller.captureState == "not-grabbed" and bridge.saveError
 
 
@@ -3707,7 +3729,15 @@ def test_measurements_cache_refreshes_on_signal(
     assert not downloads.models[0]["ramMeasured"]
     path = tmp_path / "measurements.json"
     path.write_text(
-        json.dumps({f"{port.entry.id}@{port.entry.revision}": {"ram_mb": 600, "threads": 2}})
+        json.dumps(
+            {
+                f"{port.entry.id}@{port.entry.revision}": {
+                    "ram_mb": 600,
+                    "threads": 2,
+                    "build": __version__,
+                }
+            }
+        )
     )
     assert not downloads.models[0]["ramMeasured"]
     downloads.measurements_changed()

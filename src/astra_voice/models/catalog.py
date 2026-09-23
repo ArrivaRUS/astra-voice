@@ -145,7 +145,11 @@ def merge_measurement(
 ) -> dict[str, Any]:
     """Сводит опубликованные цифры с локальным итогом той же ревизии."""
     raw = measurements.get(f"{entry.id}@{entry.revision}")
-    local = raw if isinstance(raw, dict) and raw.get("threads") == threads else {}
+    local = (
+        raw
+        if isinstance(raw, dict) and type(raw.get("threads")) is int and raw["threads"] == threads
+        else {}
+    )
     ram = local.get("ram_mb")
     measured_ram = type(ram) is int and ram >= 0
     speed = measured_rtfx(local)

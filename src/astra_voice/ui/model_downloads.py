@@ -813,15 +813,13 @@ class ModelDownloads(QObject):
             ),
         }
 
-    def _card_message(
-        self, entry: Any, installed: tuple[tuple[str, str], ...] | None = None
-    ) -> str:
+    def _card_message(self, entry: Any, state: str) -> str:
         message = self._card_messages.get(entry.id, "")
         if message:
             return message
         if self._is_revoked(entry):
             return _REVOKED_MESSAGE
-        if self._card_state(entry, installed) == "broken":
+        if state == "broken":
             return "Файлы модели не читаются — переустановите"
         return ""
 
@@ -1021,8 +1019,8 @@ class ModelDownloads(QObject):
                 ),
                 "selected": entry.id in self._selected,
                 "badge": self._badge(entry, installed),
-                "state": self._card_state(entry, installed),
-                "message": self._card_message(entry, installed),
+                "state": (state := self._card_state(entry, installed)),
+                "message": self._card_message(entry, state),
                 **self._card_extras(entry, installed, total),
                 "progress": self._card_progress.get(entry.id, 0.0),
                 "vendor": getattr(entry, "vendor", ""),

@@ -36,6 +36,7 @@ class HotkeyCapture(QObject):
     pendingComboChanged = pyqtSignal()
     freeCandidatesChanged = pyqtSignal()
     keyEvent = pyqtSignal(str, str)
+    # Подключать только через Qt.ConnectionType.DirectConnection: несёт сырой QEvent.
     windowEvent = pyqtSignal(QObject, QEvent)
 
     _MESSAGES = {
@@ -71,7 +72,12 @@ class HotkeyCapture(QObject):
         if obj is self._window and (event.type() in (QEvent.Hide, QEvent.Close) or minimized):
             if self.state == "capturing":
                 self.cancel()
-        if obj is self._window:
+        if obj is self._window and event.type() in (
+            QEvent.Show,
+            QEvent.Hide,
+            QEvent.Close,
+            QEvent.WindowStateChange,
+        ):
             self.windowEvent.emit(obj, event)
         return bool(super().eventFilter(obj, event))
 

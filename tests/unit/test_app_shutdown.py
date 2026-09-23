@@ -543,19 +543,16 @@ def test_onboarding_host_delegates_and_hides_root(
     rig.runtime.begin_hotkey_capture.return_value = True
     rig.runtime.hotkey.probe.return_value.code = "busy"
     rig.runtime.hotkey.free_candidates.return_value = ["Ctrl+Alt+D"]
-    rig.runtime.apply_hotkey.return_value = "ok"
     assert host.begin_capture() is True
     host.end_capture()
     assert host.probe("Ctrl+Space") == "busy"
     assert host.free_candidates(["Ctrl+Alt+D"]) == ["Ctrl+Alt+D"]
-    assert host.apply_hotkey("Ctrl+Alt+D", "toggle") == "ok"
     host.notify_ready("Ctrl+Alt+D")
     host.hide_window()
     rig.runtime.begin_hotkey_capture.assert_called_once_with()
     rig.runtime.end_hotkey_capture.assert_called_once_with()
     rig.runtime.hotkey.probe.assert_called_once_with("Ctrl+Space")
     rig.runtime.hotkey.free_candidates.assert_called_once_with(["Ctrl+Alt+D"])
-    rig.runtime.apply_hotkey.assert_called_once_with("Ctrl+Alt+D", "toggle")
     notification.assert_called_once_with("Ctrl+Alt+D")
     root.hide.assert_called_once_with()
     rig.shell.rootObjects.return_value = []

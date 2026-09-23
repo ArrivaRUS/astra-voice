@@ -9,12 +9,23 @@ from unittest.mock import Mock
 
 import pytest
 
-from astra_voice.core.model_request import ModelNotConfigured, build_model_load
+from astra_voice.core.model_request import ModelNotConfigured, build_model_load, model_threads
 from astra_voice.core.model_source import resolve_model_request
 from astra_voice.core.settings import from_dict
 from astra_voice.models.store import ModelRecord, ModelStore
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("value", [None, "bad", "4", 0, -2, True, False])
+def test_invalid_model_threads_use_default(value: object) -> None:
+    assert model_threads({"model_threads": value}) == 2
+    assert type(model_threads({"model_threads": value})) is int
+
+
+def test_numeric_model_threads_are_int() -> None:
+    assert model_threads({"model_threads": 4}) == 4
+    assert type(model_threads({"model_threads": 4})) is int
 
 
 @pytest.mark.parametrize("failure", ["recheck", "metadata"])

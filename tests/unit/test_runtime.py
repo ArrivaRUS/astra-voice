@@ -123,6 +123,48 @@ def test_protocol_mismatch_shows_restart_instruction(monkeypatch: pytest.MonkeyP
     rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
 
 
+def test_protocol_mismatch_for_dictation_reaches_orchestrator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = Rig(monkeypatch)
+    on_worker_event = Mock()
+    monkeypatch.setattr(rig.runtime.orchestrator, "on_worker_event", on_worker_event)
+    event = {
+        "type": "error",
+        "generation": rig.supervisor.generation,
+        "code": ipc.PROTOCOL_MISMATCH,
+        "utterance_id": "dictation",
+    }
+    rig.supervisor_factory.call_args.kwargs["on_event"](event)
+    on_worker_event.assert_called_once_with(event)
+    assert on_worker_event.call_args.args[0] is event
+    rig.pill.show_state.assert_not_called()
+    rig.tray.set_state.assert_not_called()
+
+
+@pytest.mark.parametrize("code", ["timeout", "load-timeout", "measure-failed"])
+def test_measure_error_allows_retry(monkeypatch: pytest.MonkeyPatch, code: str) -> None:
+    rig = Rig(monkeypatch)
+    tracker = rig.runtime.measurements
+    tracker.set_model("model", "rev", 2)
+    tracker.requested = True
+    rig.event(type="error", code=code, response_type="measured")
+    assert not tracker.requested
+    assert tracker.remeasure_pending
+    rig.runtime.shutdown()
+
+
+def test_unrelated_timeout_does_not_fail_measure(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch)
+    tracker = rig.runtime.measurements
+    tracker.set_model("model", "rev", 2)
+    tracker.requested = True
+    rig.event(type="error", code="timeout", response_type="model.loaded")
+    assert tracker.requested
+    assert not tracker.remeasure_pending
+    rig.runtime.shutdown()
+
+
 class Signal:
     """Синхронная доставка сигнала без объектов Qt."""
 
@@ -655,6 +697,53 @@ def test_pending_switch_runs_on_idle_without_runtime_timer_firing(
     assert_phase(rig.runtime, DictationPhase.IDLE)
     assert rig.timers[-1].active
     assert rig.runtime.supervisor is replacement
+    rig.runtime.shutdown()
+
+
+def test_pending_switch_times_out_and_reports_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    finished = Mock()
+    rig.runtime.on_switch_finished = finished
+    rig.hotkey.fsm.press(rig.now)
+    rig.runtime.switch_model(min_ram_mb=100)
+    timer = rig.runtime._pending_switch_timer
+    assert timer is not None and timer.interval == module.PENDING_SWITCH_TIMEOUT_S * 1000
+    assert rig.runtime._pending_switch == (100, False)
+    short_timers = [
+        item
+        for item in rig.timers
+        if item.active and item.interval <= module.SWITCH_TIMEOUT_S * 1000
+    ]
+    assert short_timers
+    for short_timer in short_timers:
+        short_timer.fire()
+        finished.assert_not_called()
+        assert rig.runtime._pending_switch == (100, False)
+    timer.fire()
+    finished.assert_called_once_with("failed")
+    assert rig.runtime._pending_switch is None
+    rig.runtime._run_pending_switch()
+    assert rig.runtime._switch_timer is None
+    rig.runtime.shutdown()
+
+
+def test_pending_switch_timer_is_cancelled_on_idle(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    finished = Mock()
+    rig.runtime.on_switch_finished = finished
+    rig.hotkey.fsm.press(rig.now)
+    rig.runtime.switch_model(min_ram_mb=100, pause=True)
+    timer = rig.runtime._pending_switch_timer
+    rig.release(rig.now + 1)
+    rig.event(type="result", text=MARKER)
+    rig.runtime.orchestrator._tail_done()
+    assert timer is not None and timer.deleted
+    assert rig.runtime._pending_switch_timer is None
+    assert rig.runtime._pending_switch is None
+    timer.fire()
+    finished.assert_not_called()
     rig.runtime.shutdown()
 
 
@@ -2849,6 +2938,7 @@ def test_selfcheck_waits_for_match_before_ready(
         ({"type": "result", "text": ""}, "no-match"),
         ({"type": "result", "text": None}, "no-match"),
         ({"type": "error", "code": "engine-failed", "message": MARKER}, "worker-error"),
+        ({"type": "error", "code": ipc.PROTOCOL_MISMATCH}, "worker-error"),
         ({"type": "error", "request_type": "transcribe.file", "message": MARKER}, "worker-error"),
     ],
 )

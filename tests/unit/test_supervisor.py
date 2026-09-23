@@ -24,6 +24,7 @@ from astra_voice.worker.supervisor import (
     RESTART_WINDOW_S,
     Message,
     WorkerSupervisor,
+    _Pending,
     launcher_path,
     worker_command,
 )
@@ -46,8 +47,51 @@ def test_protocol_mismatch_stops_without_restart() -> None:
     assert str(supervisor.state) == "stopped"
     assert supervisor.generation == 1
     process.kill.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=2)
+    assert supervisor._retired == []
     assert events[-1]["code"] == ipc.PROTOCOL_MISMATCH
     assert events[-1]["message"] == "Программа обновлена — перезапустите её."
+
+
+def test_protocol_mismatch_finishes_all_pending_requests() -> None:
+    events: list[Message] = []
+    supervisor = WorkerSupervisor(events.append, use_qt=False)
+    supervisor.state = "running"
+    process = Mock()
+    process.poll.return_value = None
+    supervisor.process = process
+    supervisor._pending[("reply", "measured")] = _Pending(None, 0, "measure", None)
+    supervisor._pending[("reply", "model.loaded")] = _Pending(None, 0, "model.load", None)
+    hello = {**ipc.make_hello(), "protocol": ipc.PROTOCOL_VERSION - 1}
+    payload = json.dumps(hello).encode("utf-8")
+    supervisor._receive(struct.pack(">I", len(payload)) + payload, 1)
+    assert {event.get("response_type") for event in events[:-1]} == {
+        "measured",
+        "model.loaded",
+    }
+    assert all(event["code"] == ipc.PROTOCOL_MISMATCH for event in events)
+    assert supervisor._pending == {}
+    process.wait.assert_called_once_with(timeout=2)
+
+
+def test_protocol_mismatch_retains_process_after_wait_timeout() -> None:
+    events: list[Message] = []
+    supervisor = WorkerSupervisor(events.append, use_qt=False)
+    supervisor.state = "running"
+    process = Mock()
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired(cmd="worker", timeout=2)
+    supervisor.process = process
+    hello = {**ipc.make_hello(), "protocol": ipc.PROTOCOL_VERSION - 1}
+    payload = json.dumps(hello).encode("utf-8")
+
+    supervisor._receive(struct.pack(">I", len(payload)) + payload, 1)
+
+    assert str(supervisor.state) == "stopped"
+    process.kill.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=2)
+    assert supervisor._retired == [process]
+    assert events[-1]["code"] == ipc.PROTOCOL_MISMATCH
 
 
 class Clock:
