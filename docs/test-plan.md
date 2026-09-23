@@ -8,7 +8,7 @@
 | Уровень | Среда | Маркер / команда | Что покрывает |
 | --- | --- | --- | --- |
 | **Unit** | контейнер debian:12 / локально, без дисплея | `pytest -m unit -q` | settings/миграции, policy-таблица истинности, автомат хоткея, парсеры конфликтов (`kglobalshortcutsrc`/`keyshortcutrc`), комбинация вставки по `WM_CLASS`, нормализация текста, downloader (206/200/обрыв/подмена/`size+1`), схема/подпись/анти-откат манифеста, валидатор путей, SemVer/`tag_name`, выбор трека, помощник с фейками, статистика p95, `kdeglobals`/`paletterc`, IPC-кодек и лимиты, автомат воркера (`FakeAudioSource`+`FakeEngine`), фильтр логов, ELF-count deb, glibc колёс, `scripts/ci_lint.py` |
-| **Integration xvfb** | CI: `xvfb-run`, `QT_QPA_PLATFORM=xcb` | `xvfb-run -a pytest -m xvfb -q` | каждый QML без warnings + скриншоты состояний (24 экрана × 2 темы; пилюля 12, карточка 20, строка-статус 17, поле захвата 7, панель обновления 14); `XGrabKey`/`BadAccess`/XTest в тестовое окно; буфер с восстановлением и сменой активного окна; single-instance и fallback `/tmp`; трей-ветка «недоступен»; уведомления с тестовым сервером |
+| **Integration xvfb** | CI: `xvfb-run`, `QT_QPA_PLATFORM=xcb` | `xvfb-run -a pytest -m xvfb -q` | каждый QML без warnings + скриншоты состояний (24 экрана × 2 темы; пилюля 12, карточка 20, строка-статус 17, поле захвата 7, панель обновления 14); `XGrabKey`/`BadAccess`/XTest в тестовое окно; проба захвата перед XTest не порождает FocusIn/FocusOut у мишени; буфер с восстановлением и сменой активного окна; single-instance и fallback `/tmp`; трей-ветка «недоступен»; уведомления с тестовым сервером |
 | **Integration engine** | CI с кэшем модели (226 МБ по ревизии) | `pytest -m engine -q` | onnx-asr 0.12.0 + ORT 1.24.4 на 3 раскладках GigaAM с тестовым wav; смоук-откат при подменённом байте; VAD-границы; скан `external_data`; `RLIMIT_AS`/OOM |
 | **Integration chroot (помощник)** | непривилегированно; фейки `gpgv`/`apt-get`/`dpkg-deb`/`dpkg` по **абсолютным путям** в тестовом chroot-каталоге | `pytest -m unit tests/unit/test_update_helper.py -q` | T-01…T-04, T-07, T-17, T-27, T-29, T-30, T-31 |
 | **Integration virtual mic** | машина ALSE, PipeWire-pulse | `tools/validate dictation --virtual-mic` | `record.start` → `paplay` → `result`; тишина; лимит; рестарт WirePlumber; 0 аудиофайлов |
@@ -72,6 +72,7 @@
 | N-27 | U | настоящий файл политики запрещает проверки обновлений при включённом пользовательском тумблере → проверка запрещена |
 | N-28 | U | адрес в списке исключений прокси при заданном прокси → прямое соединение, прокси не используется |
 | N-29 | U | установка отозванной ревизии → отказ до переноса файлов и до пробного распознавания |
+| N-30 | I-xvfb | проба захвата перед XTest на **окне фокуса** (фикс 22.09, P0 «текст только в буфере» под Fly) → мишень не получает ни `FocusIn`, ни `FocusOut` за 300 мс, фокус ввода прежний, захват снят (`XGrabKeyboard` другого клиента = `GrabSuccess`); контроль — та же проба на другом окне даёт мишени `FocusOut` и `FocusIn` (`tests/xvfb/test_paste_grab_probe.py`) |
 
 ### Безопасность — `docs/threat-model.md` §6, дословно (уровень: U — unit (CI), I — integration (CI/xvfb/chroot), M — машина ALSE)
 | ID | Уровень | Строка для test-plan | Веха | Статус |
