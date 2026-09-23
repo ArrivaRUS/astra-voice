@@ -2,7 +2,7 @@
 """Онбординг (08), пилюля и трей (09), диалоги и системные окна (10)."""
 from _shell import (page, write, titlebar, sb, ic, tgl, key, btn, row, card, group, met,
                     level_bars, stcell, sech, grid, th, pill, tray, mark, logo, appicon,
-                    dlbar, DL_STATES, PILL_MIN, PILL_MAX, W, H)
+                    dlbar, DL_STATES, PILL_MIN, PILL_MAX, W, H, W_DEF, COL_DEF)
 from _p1 import sel, seg, mcard, hotkey_field, mic_row_states, pick_bar
 
 DD = 'var(--fg3)'
@@ -22,7 +22,7 @@ EXTRA_CSS = """
 # ══════════════════════════════════════════════════════════════════════════
 # 08 · ОНБОРДИНГ
 # ══════════════════════════════════════════════════════════════════════════
-def onb(step, body, actions, title="Astra Voice — первый запуск", progress=None, queue=""):
+def onb(step, body, actions, title="Astra Voice — первый запуск", progress=None, queue="", w=None):
     """progress — состояние сквозной полоски загрузки (None = загрузки нет, полоски нет).
 
     Полоска — часть ОБРАМЛЕНИЯ мастера, а не содержимого шага: она стоит над нижней панелью
@@ -36,7 +36,7 @@ def onb(step, body, actions, title="Astra Voice — первый запуск", 
           f'<span class="c12">{["", "Сеть", "Модель", "Горячая клавиша", "Микрофон", "Готово"][step]}</span>'
           '</div>')
     bar = dlbar(progress, queue=queue) if progress else ""
-    return (f'<div class="win" style="width:{W}px;height:{H}px">{titlebar(title)}{hd}'
+    return (f'<div class="win" style="width:{w or W}px;height:{H}px">{titlebar(title)}{hd}'
             f'<div class="obody">{body}</div>{bar}<div class="obar">{actions}</div></div>')
 
 
@@ -77,17 +77,17 @@ def onb1(theme):
                 b, theme, leg, EXTRA_CSS)
 
 
-ONB2_W = 720   # шире колонки настроек: имя, «Рекомендуем» и бейдж состояния встают в одну строку
+ONB2_W = COL_DEF   # 796 при окне 1024 — та же ширина карточки, что в разделе «Модели» (решение 2026-09-23)
 
 
 def onb2_body(cards, total, free="свободно на диске 42,1 ГБ", action=None, warn=False,
-              head_sub=None, catalog=False):
+              head_sub=None, catalog=False, width=None):
     """Тело шага 2: карточки выбора + строка итога + одна общая кнопка «из файла»."""
     sub = head_sub or ('Отметьте, что скачать. Рекомендуем русскую GigaAM: она расставляет знаки '
                        'препинания сама. Загрузка начнётся, когда нажмёте «Продолжить».')
     act = btn("Установить из файла или папки…", "", "folder") if action is None else action
     more = (f'{btn("Показать все 12 моделей", "gh")}' if catalog else "")
-    return (f'<div style="width:{ONB2_W}px">'
+    return (f'<div style="width:{width or ONB2_W}px">'
             '<div class="h2">Выберите модель распознавания</div>'
             f'<div class="sm" style="margin:4px 0 14px">{sub}</div>'
             + cards
@@ -104,19 +104,19 @@ def onb2(theme):
     # основной кадр M5: в каталоге одна модель, ничего не выбрано → «Продолжить» неактивна
     body = onb2_body(onb2_cards("avail"), "Пока ничего не выбрано")
     b = onb(2, body, acts(next_="Продолжить", skip=True, skip_dis=True, next_dis=True,
-                          note="Выберите хотя бы одну модель — без неё диктовка не работает"))
+                          note="Выберите хотя бы одну модель — без неё диктовка не работает"), w=W_DEF)
     one = onb(2, onb2_body(onb2_cards("selected"), "Будет скачано 226 МБ"),
-              acts(next_="Продолжить", skip=True, skip_dis=True))
+              acts(next_="Продолжить", skip=True, skip_dis=True), w=W_DEF)
     two = onb(2, onb2_body(onb2_cards("selected", mcard("vosk-s", "selected")),
                            "Будет скачано 252,7 МБ", catalog=True),
-              acts(next_="Продолжить", skip=True, skip_dis=True))
+              acts(next_="Продолжить", skip=True, skip_dis=True), w=W_DEF)
     nospace = onb(2, onb2_body(
         mcard("rnnt", "nospace", [("Рекомендуем", "rec")],
               note=("e", "Нужно ещё 126 МБ, свободно 100 МБ"))
         + mcard("vosk-s", "avail"),
         "Не хватает места: нужно ещё 126 МБ", "свободно на диске 100 МБ", warn=True),
         acts(next_="Продолжить", skip=True, skip_dis=True, next_dis=True,
-             note="Освободите место или выберите модель полегче"))
+             note="Освободите место или выберите модель полегче"), w=W_DEF)
     nonet = onb2_body(onb2_cards("nonet"), "Пока ничего не выбрано",
                       head_sub='Сети нет — модель можно поставить из файла, например с флешки.')
     failed = onb2_body(
@@ -133,7 +133,7 @@ def onb2(theme):
            "мастера больше не нужно: пройти шаг 2, не выбрав модель, нельзя. В M5 в каталоге одна "
            "модель — кадр с двумя карточками показывает, как это работает в M6.")
     return page(f"A · Онбординг 2/5 — {th(theme)}",
-                f'<b>Онбординг 2/5</b> — выбор модели: ничего не выбрано, выбрана, нет места · {th(theme)} тема',
+                f'<b>Онбординг 2/5</b> — выбор модели: ничего не выбрано, выбрана, нет места · {th(theme)} тема · 1024×620',
                 b + sech("Шаг 2: выбрана одна модель — «Продолжить» доступна") + one
                 + sech("Шаг 2 (M6): выбраны две модели — итог суммируется") + two
                 + sech("Шаг 2: не хватает места на диске") + nospace
@@ -143,7 +143,7 @@ def onb2(theme):
                 ], 1) + grid([
                     stcell("загрузка не удалась — «Повторить» в карточке", failed, "failed"),
                 ], 1),
-                theme, leg, EXTRA_CSS)
+                theme, leg, EXTRA_CSS + ".sec,.sech,.grid,.grid1,.grid3,.legend,.cap{max-width:1024px}")
 
 
 def onb3(theme):

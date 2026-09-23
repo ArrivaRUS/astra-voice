@@ -210,15 +210,6 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 .r{padding:7px 14px;min-height:38px}
 .grp{margin:0 0 5px 2px}
 
-/* --- карточка модели: плотнее по горизонтали, чтобы не рвалась в колонке 672 px --- */
-.mven{white-space:nowrap}
-.trk.nd{background:transparent;border:1px dashed var(--fg4);height:6px;border-radius:3px}
-.mv.nd{color:var(--fg-dis);font-style:italic}
-.mc{padding:9px 13px;margin-bottom:8px}
-.met .mn{width:54px}
-.trk{width:78px}
-.mhr{margin:8px 0 7px}
-
 /* --- карточка модели = ВЫБОР (решение заказчика 2026-09-17) --------------
    Кнопки «Скачать» и «Из файла…» из карточки убраны, прогресс уехал в сквозную
    полоску мастера; в карточке осталась отметка выбора слева и один бейдж состояния. */
@@ -232,11 +223,42 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 .bd.ins{background:var(--ok-bg);color:var(--ok-ink)}
 /* на активной карточке фон бейджа совпал бы с фоном карточки — поднимаем его на поверхность */
 .mc.act .bd.act{background:var(--bg-surface)}
-/* одна строка «Занимает места»: обычный вес, значения fg, подписи fg-muted, разделитель — точка */
-.mspace{font-size:12px;line-height:18px;color:var(--fg3)}
-.mspace b{font-weight:400;color:var(--fg1)}
-/* источник цифр под полосками метрик: чужой бенчмарк, а не замер на этом компьютере (§5.3) */
-.msrc{font-size:11.5px;line-height:1.35;color:var(--fg4);text-align:right;margin-top:2px}
+/* --- карточка модели «Три строки» (решение заказчика 2026-09-23, spec §5.1–5.3) ---
+   1) отметка · имя и назначение · две метрики справа; 2) одна нижняя строка: размер, память,
+   теги слева, сообщение и кнопки справа. Разделителя и подписи об источнике цифр НЕТ. */
+.mc{padding:8px 12px;margin-bottom:6px}
+.mtop{gap:12px}
+.mname{line-height:22px}
+.mven{white-space:nowrap}
+.mhead{min-height:22px}
+.mpurp{line-height:18px;margin-top:0}
+.mmets{display:flex;flex-direction:column;gap:4px;flex:none}
+.mm{display:flex;align-items:center;gap:6px;height:18px;font-size:12px}
+.mm .mml{width:46px;margin-right:2px;text-align:right;font-size:11.5px;color:var(--fg3);flex:none}
+/* полоска: длина — сравнение, цвет — оценка по шкале (хорошо/средне/слабо) */
+.mbar{width:60px;height:8px;border-radius:4px;background:var(--bg-sunk);overflow:hidden;flex:none;display:inline-block}
+.mbar i{display:block;height:100%;border-radius:4px}
+.mbar.lv-g i{background:var(--ok-ink)}
+.mbar.lv-a i{background:var(--warn-ink)}
+.mbar.lv-r i{background:var(--err-ink)}
+.mbar.nd{background:transparent;border:1px dashed var(--fg4)}
+.mmv{width:118px;flex:none;white-space:nowrap;display:inline-flex;align-items:center;gap:3px;color:var(--fg2)}
+/* замерено на этом компьютере: значение fg / 500 + маркер ✓ primary; слова «замерено» на экране нет */
+.mmv.meas{color:var(--fg1);font-weight:500}
+.mmv.nd{color:var(--fg-dis);font-style:italic}
+.mfoot{display:flex;align-items:flex-start;gap:12px;margin-top:6px}
+.mfacts{flex:1;min-width:0;font-size:12px;line-height:18px;color:var(--fg3);display:flex;flex-wrap:wrap;
+  align-items:center;column-gap:7px}
+.mfoot.hasbtn .mfacts{padding-top:5px}
+.mfacts b{font-weight:400;color:var(--fg1)}
+.mact{display:flex;align-items:center;gap:8px;flex:none;max-width:65%;justify-content:flex-end;flex-wrap:wrap}
+.mact .mmsg{display:inline-flex;align-items:flex-start;gap:5px;font-size:12px;line-height:18px;flex:1 1 auto;min-width:0}
+.mact .mmsg svg{margin-top:3px;flex:none}
+.mc .btn.sm{height:28px}
+/* на выбранной карточке фон «Рекомендуем» совпал бы с фоном карточки — поднимаем на поверхность */
+.mc.pick .bd.rec{background:var(--bg-surface)}
+/* недоступная для выбора (нет места, нет сети, запрет): текст fg-disabled, не прозрачность */
+.mc.blk .mname,.mc.blk .mven,.mc.blk .mpurp,.mc.blk .mfacts,.mc.blk .mfacts b{color:var(--fg-dis)}
 
 /* --- сквозная полоска загрузки модели: обрамление мастера, шаги 2–5 ------ */
 .dlbar{height:36px;flex:none;display:flex;align-items:center;gap:10px;padding:0 22px;

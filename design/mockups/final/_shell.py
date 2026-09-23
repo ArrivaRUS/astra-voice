@@ -26,7 +26,9 @@ def group(title, rows, mb=8):
     """Группа настроек: серый CAPS-заголовок + карточка. Отступ плотнее базового."""
     return f'<div style="margin-bottom:{mb}px"><div class="grp">{title}</div>{card(rows)}</div>'
 
-W, H = 900, 620
+W, H = 900, 620          # минимальное окно (sizeWindowMinW; клиент 900×588)
+W_DEF = 1024             # окно по умолчанию (sizeWindowW, решение заказчика 2026-09-23)
+COL_DEF = W_DEF - 184 - 2 * 22   # 796 — колонка содержимого при окне по умолчанию
 TB, FT = 32, 36
 BODY_H = H - TB - FT  # 552
 
@@ -70,15 +72,6 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 .r{padding:7px 14px;min-height:38px}
 .grp{margin:0 0 5px 2px}
 
-/* --- карточка модели: плотнее по горизонтали, чтобы не рвалась в колонке 672 px --- */
-.mven{white-space:nowrap}
-.trk.nd{background:transparent;border:1px dashed var(--fg4);height:6px;border-radius:3px}
-.mv.nd{color:var(--fg-dis);font-style:italic}
-.mc{padding:9px 13px;margin-bottom:8px}
-.met .mn{width:54px}
-.trk{width:78px}
-.mhr{margin:8px 0 7px}
-
 /* --- карточка модели = ВЫБОР (решение заказчика 2026-09-17) --------------
    Кнопки «Скачать» и «Из файла…» из карточки убраны, прогресс уехал в сквозную
    полоску мастера; в карточке осталась отметка выбора слева и один бейдж состояния. */
@@ -92,11 +85,42 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 .bd.ins{background:var(--ok-bg);color:var(--ok-ink)}
 /* на активной карточке фон бейджа совпал бы с фоном карточки — поднимаем его на поверхность */
 .mc.act .bd.act{background:var(--bg-surface)}
-/* одна строка «Занимает места»: обычный вес, значения fg, подписи fg-muted, разделитель — точка */
-.mspace{font-size:12px;line-height:18px;color:var(--fg3)}
-.mspace b{font-weight:400;color:var(--fg1)}
-/* источник цифр под полосками метрик: чужой бенчмарк, а не замер на этом компьютере (§5.3) */
-.msrc{font-size:11.5px;line-height:1.35;color:var(--fg4);text-align:right;margin-top:2px}
+/* --- карточка модели «Три строки» (решение заказчика 2026-09-23, spec §5.1–5.3) ---
+   1) отметка · имя и назначение · две метрики справа; 2) одна нижняя строка: размер, память,
+   теги слева, сообщение и кнопки справа. Разделителя и подписи об источнике цифр НЕТ. */
+.mc{padding:8px 12px;margin-bottom:6px}
+.mtop{gap:12px}
+.mname{line-height:22px}
+.mven{white-space:nowrap}
+.mhead{min-height:22px}
+.mpurp{line-height:18px;margin-top:0}
+.mmets{display:flex;flex-direction:column;gap:4px;flex:none}
+.mm{display:flex;align-items:center;gap:6px;height:18px;font-size:12px}
+.mm .mml{width:46px;margin-right:2px;text-align:right;font-size:11.5px;color:var(--fg3);flex:none}
+/* полоска: длина — сравнение, цвет — оценка по шкале (хорошо/средне/слабо) */
+.mbar{width:60px;height:8px;border-radius:4px;background:var(--bg-sunk);overflow:hidden;flex:none;display:inline-block}
+.mbar i{display:block;height:100%;border-radius:4px}
+.mbar.lv-g i{background:var(--ok-ink)}
+.mbar.lv-a i{background:var(--warn-ink)}
+.mbar.lv-r i{background:var(--err-ink)}
+.mbar.nd{background:transparent;border:1px dashed var(--fg4)}
+.mmv{width:118px;flex:none;white-space:nowrap;display:inline-flex;align-items:center;gap:3px;color:var(--fg2)}
+/* замерено на этом компьютере: значение fg / 500 + маркер ✓ primary; слова «замерено» на экране нет */
+.mmv.meas{color:var(--fg1);font-weight:500}
+.mmv.nd{color:var(--fg-dis);font-style:italic}
+.mfoot{display:flex;align-items:flex-start;gap:12px;margin-top:6px}
+.mfacts{flex:1;min-width:0;font-size:12px;line-height:18px;color:var(--fg3);display:flex;flex-wrap:wrap;
+  align-items:center;column-gap:7px}
+.mfoot.hasbtn .mfacts{padding-top:5px}
+.mfacts b{font-weight:400;color:var(--fg1)}
+.mact{display:flex;align-items:center;gap:8px;flex:none;max-width:65%;justify-content:flex-end;flex-wrap:wrap}
+.mact .mmsg{display:inline-flex;align-items:flex-start;gap:5px;font-size:12px;line-height:18px;flex:1 1 auto;min-width:0}
+.mact .mmsg svg{margin-top:3px;flex:none}
+.mc .btn.sm{height:28px}
+/* на выбранной карточке фон «Рекомендуем» совпал бы с фоном карточки — поднимаем на поверхность */
+.mc.pick .bd.rec{background:var(--bg-surface)}
+/* недоступная для выбора (нет места, нет сети, запрет): текст fg-disabled, не прозрачность */
+.mc.blk .mname,.mc.blk .mven,.mc.blk .mpurp,.mc.blk .mfacts,.mc.blk .mfacts b{color:var(--fg-dis)}
 
 /* --- сквозная полоска загрузки модели: обрамление мастера, шаги 2–5 ------ */
 .dlbar{height:36px;flex:none;display:flex;align-items:center;gap:10px;padding:0 22px;
@@ -236,8 +260,9 @@ def titlebar(title="Astra Voice — Настройки"):
             f'<span class="wbtn"></span><span class="wbtn"></span><span class="wbtn c"></span></div>')
 
 
-def shell(active, head_html, body, footer, title="Astra Voice — Настройки", debug_on=False, over=""):
-    return (f'<div class="win rel" style="width:{W}px;height:{H}px">{titlebar(title)}'
+def shell(active, head_html, body, footer, title="Astra Voice — Настройки", debug_on=False, over="",
+          w=None):
+    return (f'<div class="win rel" style="width:{w or W}px;height:{H}px">{titlebar(title)}'
             f'<div class="wrap">{side(active, debug_on)}<div class="cont">'
             f'<div class="chead">{head_html}</div><div class="cbody scr rel">{body}</div></div></div>'
             f'{footer}{over}</div>')
@@ -337,101 +362,140 @@ def footer(model="GigaAM v3 RNN-T", state="disabled", icon="idle"):
 # data/catalog.json — size_bytes 226 431 968 → «226 МБ», min_ram_mb 768 → «768 МБ».
 # Макет обязан показывать те же числа, что покажет программа; расхождение 231,9 / 415
 # было находкой живой проверки m5 (decisions/log.md 2026-09-16, 2026-09-17).
-# measured=False у ВСЕХ записей: ни одна цифра не получена на этом компьютере (§5.3).
-# WER = Russian LibriSpeech test, бенчмарк onnx-asr (измерен на fp32-весах — оговорка в подсказке).
-# RTFx = столбец «x64 RTFx (int8)»; где int8-замера нет — помечено «бенчмарк fp32».
-# Полоска качества: 4 % WER = 100, 40 % = 0. Полоска скорости: RTFx / 85.
+# Цифры — из data/catalog.json (сверка 2026-09-23). Макет показывает то же, что покажет программа.
+# wer — Russian LibriSpeech, бенчмарк onnx-asr; на экране «Точность» = 100 − WER.
+# rtfx — «во сколько раз быстрее речи»; None — цифры не опубликованы (полоска пунктиром).
+# vs — короткое имя производителя для шапки карточки, vendor — полное (подсказка).
+# lic — только лицензия: производитель уже стоит в шапке (тег «MIT · Сбер» → «MIT»).
 MODELS = [
-    dict(id="rnnt", name="GigaAM v3 RNN-T", vendor="Сбер (GigaChat Team)",
-         purpose="Русская диктовка с пунктуацией — по умолчанию",
-         disk="226 МБ", ram="768 МБ", measured=False,
-         q=90, qv="WER 7,60 %", qkind="ok", s=50, sv="42,5× быстрее речи", skind="ok",
-         punct=True, lang="Только русский", lic="MIT · Сбер", origin="отечественная",
+    dict(id="rnnt", name="GigaAM v3 RNN-T", vendor="Сбер (GigaChat Team)", vs="Сбер",
+         purpose="Русская диктовка с пунктуацией — модель по умолчанию",
+         disk="226 МБ", ram="419 МБ", wer=7.6, rtfx=42.5,
+         punct=True, lang="Только русский", lic="MIT", origin="отечественная",
          status="active", badges=[("Рекомендуем", "rec")]),
-    dict(id="ctc", name="GigaAM v3 CTC", vendor="Сбер (GigaChat Team)",
-         purpose="То же, быстрее на ~25 %, точность чуть ниже",
-         disk="224,9 МБ", ram="~416 МБ", measured=False,
-         q=89, qv="WER 7,80 %", qkind="ok", s=61, sv="52,2× быстрее речи", skind="ok",
-         punct=True, lang="Только русский", lic="MIT · Сбер", origin="отечественная",
+    dict(id="ctc", name="GigaAM v3 CTC", vendor="Сбер (GigaChat Team)", vs="Сбер",
+         purpose="Русская диктовка с пунктуацией, работает чуть быстрее",
+         disk="225 МБ", ram="417 МБ", wer=7.8, rtfx=52.2,
+         punct=True, lang="Только русский", lic="MIT", origin="отечественная",
          status="installed", badges=[]),
-    dict(id="rnnt-np", name="GigaAM v3 RNN-T без пунктуации", vendor="Сбер (GigaChat Team)",
-         purpose="Самая точная по словам, без знаков препинания",
-         disk="229,3 МБ", ram="~424 МБ", measured=False,
-         q=99, qv="WER 4,39 %", qkind="ok", s=50, sv="42,8× быстрее речи", skind="ok",
-         punct=False, lang="Только русский", lic="MIT · Сбер", origin="отечественная",
+    dict(id="rnnt-np", name="GigaAM v3 RNN-T без пунктуации", vendor="Сбер (GigaChat Team)", vs="Сбер",
+         purpose="Русская диктовка без знаков препинания — зато реже ошибается в словах",
+         disk="226 МБ", ram="418 МБ", wer=4.39, rtfx=42.8,
+         punct=False, lang="Только русский", lic="MIT", origin="отечественная",
          status="downloading", badges=[]),
-    dict(id="ml", name="GigaAM Multilingual CTC 220M", vendor="Сбер (GigaChat Team)",
-         purpose="Русский + казахский, киргизский, узбекский, английский; без пунктуации",
-         disk="224,8 МБ", ram="~416 МБ", measured=False,
-         q=88, qv="WER 8,43 %", qkind="ok", s=69, sv="58,5× · бенчмарк fp32", skind="fp32",
-         punct=False, lang="ru, kk, ky, uz, en", lic="MIT · Сбер", origin="отечественная",
+    dict(id="ml", name="GigaAM Multilingual CTC", vendor="Сбер (GigaChat Team)", vs="Сбер",
+         purpose="Понимает русский, английский, казахский, киргизский и узбекский. Знаки препинания не ставит",
+         disk="225 МБ", ram="416 МБ", wer=8.43, rtfx=None,
+         punct=False, lang="Русский и ещё четыре языка", lic="MIT", origin="отечественная",
          status="new", badges=[]),
-    dict(id="tone", name="T-one", vendor="Т-Банк",
-         purpose="Русская, лёгкая, без пунктуации; веса только fp32",
-         disk="144,2 МБ", ram="~300 МБ", measured=False,
-         q=93, qv="WER 6,57 %", qkind="ok", s=31, sv="26,3× · бенчмарк fp32", skind="fp32",
-         punct=False, lang="Только русский", lic="Apache-2.0 · Т-Банк", origin="отечественная",
+    dict(id="tone", name="T-one", vendor="Т-Банк (T-Tech)", vs="Т-Банк",
+         purpose="Русская диктовка от Т-Банка. Знаки препинания не ставит",
+         disk="144 МБ", ram="267 МБ", wer=6.57, rtfx=None,
+         punct=False, lang="Только русский", lic="Apache-2.0", origin="отечественная",
          status="avail", badges=[]),
-    dict(id="vosk", name="Vosk ru 0.54", vendor="Alpha Cephei",
-         purpose="Лёгкая полная Vosk; точность ниже GigaAM",
-         disk="72,5 МБ", ram="~134 МБ", measured=False,
-         q=84, qv="WER 9,89 %", qkind="ok", s=83, sv="70,5× быстрее речи", skind="ok",
-         punct=False, lang="Только русский", lic="Apache-2.0 · Alpha Cephei",
+    dict(id="vosk", name="Vosk ru", vendor="Alpha Cephei", vs="Alpha Cephei",
+         purpose="Небольшая и быстрая, для не самых мощных компьютеров. Знаки препинания не ставит",
+         disk="72 МБ", ram="135 МБ", wer=9.89, rtfx=70.5,
+         punct=False, lang="Только русский", lic="Apache-2.0",
          origin="зарубежная · команда из России", status="avail", badges=[]),
-    dict(id="vosk-s", name="Vosk small ru 0.52", vendor="Alpha Cephei",
-         purpose="Для слабых машин и малого диска",
-         disk="26,7 МБ", ram="~50 МБ", measured=False,
-         q=71, qv="WER 14,53 %", qkind="ok", s=98, sv="83,5× быстрее речи", skind="ok",
-         punct=False, lang="Только русский", lic="Apache-2.0 · Alpha Cephei",
+    dict(id="vosk-s", name="Vosk small ru", vendor="Alpha Cephei", vs="Alpha Cephei",
+         purpose="Самая маленькая и самая быстрая, для слабых компьютеров. Ошибается чаще, знаки препинания не ставит",
+         disk="27 МБ", ram="50 МБ", wer=14.53, rtfx=83.5,
+         punct=False, lang="Только русский", lic="Apache-2.0",
          origin="зарубежная · команда из России", status="avail", badges=[]),
-    dict(id="wturbo", name="Whisper large-v3-turbo", vendor="OpenAI",
-         purpose="Многоязычная, качественно, очень медленно на процессоре",
-         disk="1 089,1 МБ", ram="~2,0 ГБ", measured=False,
-         q=83, qv="WER 10,10 %", qkind="ok", s=5, sv="3,9× быстрее речи", skind="ok",
-         punct=True, lang="99 языков", lic="MIT · OpenAI", origin="зарубежная",
+    dict(id="wturbo", name="Whisper large-v3-turbo", vendor="OpenAI", vs="OpenAI",
+         purpose="Понимает почти любой язык и ставит знаки препинания. Много весит и требует мощного компьютера",
+         disk="1086 МБ", ram="2007 МБ", wer=10.1, rtfx=3.9,
+         punct=True, lang="Русский и ещё много языков", lic="MIT", origin="зарубежная",
          status="lowram", badges=[]),
-    dict(id="wsmall", name="Whisper small", vendor="OpenAI",
-         purpose="Многоязычная, средняя; по-русски слабее GigaAM",
-         disk="253,5 МБ", ram="~470 МБ", measured=False,
-         q=0, qv="нет данных", qkind="none", s=0, sv="нет данных", skind="none",
-         punct=True, lang="99 языков", lic="Apache-2.0 · OpenAI", origin="зарубежная",
+    dict(id="wsmall", name="Whisper small", vendor="OpenAI", vs="OpenAI",
+         purpose="Понимает почти любой язык и ставит знаки препинания. Насколько точна по-русски — никто не замерял",
+         disk="250 МБ", ram="461 МБ", wer=None, rtfx=None,
+         punct=True, lang="Русский и ещё много языков", lic="Apache-2.0", origin="зарубежная",
          status="avail", badges=[]),
-    dict(id="wbase", name="Whisper base", vendor="OpenAI",
+    # Whisper base в каталоге программы больше нет; оставлена как пример состояния not-recommended.
+    dict(id="wbase", name="Whisper base", vendor="OpenAI", vs="OpenAI",
          purpose="Быстрая и лёгкая; для русского не рекомендуется",
-         disk="109,1 МБ", ram="~200 МБ", measured=False,
-         q=5, qv="WER 38,33 %", qkind="ok", s=61, sv="51,6× быстрее речи", skind="ok",
-         punct=True, lang="99 языков", lic="Apache-2.0 · OpenAI", origin="зарубежная",
+         disk="109 МБ", ram="200 МБ", wer=38.33, rtfx=51.6,
+         punct=True, lang="Русский и ещё много языков", lic="Apache-2.0", origin="зарубежная",
          status="avail", badges=[]),
-    dict(id="mllarge", name="GigaAM Multilingual Large CTC", vendor="Сбер (GigaChat Team)",
-         purpose="«Качество любой ценой»: тяжёлая, без пунктуации",
-         disk="591,6 МБ", ram="~1,1 ГБ", measured=False,
-         q=96, qv="WER 5,55 %", qkind="ok", s=36, sv="30,4× · бенчмарк fp32", skind="fp32",
-         punct=False, lang="ru, kk, ky, uz, en", lic="MIT · Сбер", origin="отечественная",
+    dict(id="mllarge", name="GigaAM Multilingual Large CTC", vendor="Сбер (GigaChat Team)", vs="Сбер",
+         purpose="Самая точная из многоязычных: русский, английский, казахский, киргизский, узбекский. Знаки препинания не ставит",
+         disk="592 МБ", ram="1095 МБ", wer=5.55, rtfx=None,
+         punct=False, lang="Русский и ещё четыре языка", lic="MIT", origin="отечественная",
          status="avail", badges=[]),
-    dict(id="nemo", name="NeMo FastConformer ru pc", vendor="NVIDIA",
-         purpose="Быстрая, с пунктуацией, точность ниже GigaAM",
-         disk="131,6 МБ", ram="~245 МБ", measured=False,
-         q=75, qv="WER 13,10 %", qkind="ok", s=83, sv="70,6× быстрее речи", skind="ok",
-         punct=True, lang="Только русский", lic="CC-BY-4.0 (атрибуция) · NVIDIA",
-         origin="зарубежная", status="avail", badges=[]),
+    dict(id="nemo", name="NeMo FastConformer ru", vendor="NVIDIA", vs="NVIDIA",
+         purpose="Русская диктовка с пунктуацией от NVIDIA. Ошибается чаще, чем GigaAM",
+         disk="132 МБ", ram="244 МБ", wer=13.1, rtfx=70.6,
+         punct=True, lang="Только русский", lic="CC-BY-4.0", origin="зарубежная",
+         status="avail", badges=[]),
 ]
 CATALOG_ORDER = ["rnnt", "ctc", "rnnt-np", "ml", "tone", "vosk", "vosk-s",
                  "wturbo", "wsmall", "wbase", "mllarge", "nemo"]
 DOMESTIC = ["rnnt", "ctc", "rnnt-np", "ml", "mllarge", "tone"]   # по юрлицу правообладателя
-INSTALLED_SIZE = "680 МБ"                                        # 226 + 224,9 + 229,3
+INSTALLED_SIZE = "677 МБ"                                        # 226 + 225 + 226
+BEST_RTFX = 83.5                                                 # самая быстрая модель каталога
 
 
-def met2(name, pct, value, measured=False, kind="ok"):
-    """Полоска метрики. kind: ok · fp32 (замер на fp32-весах) · none (нет данных по протоколу)."""
-    if kind == "none":
-        return (f'<div class="met"><span class="mn">{name}</span>'
-                '<span class="trk nd"></span>'
-                f'<span class="mv nd">{value}</span></div>')
-    cls = "trk" if measured else "trk est"
-    val = f'<b>{value}</b>' if measured else value
-    return (f'<div class="met"><span class="mn">{name}</span>'
-            f'<span class="{cls}"><i style="width:{pct}%"></i></span>'
-            f'<span class="mv">{val}</span></div>')
+# ── метрики карточки (spec §5.3) ────────────────────────────────────────────
+# Точность = 100 − WER, одна десятая, округление половины вверх; полоска = точность / 100.
+# Скорость — «N× быстрее речи»; полоска = N / самая быстрая модель каталога.
+# Цвет полоски — оценка по шкале: lv-g хорошо (successInk) · lv-a средне (warningInk) · lv-r слабо (dangerInk).
+Q_GOOD, Q_FAIR = 92, 88     # точность, %
+S_GOOD, S_FAIR = 20, 5      # скорость, раз быстрее речи
+
+
+def dec1(x):
+    from decimal import Decimal, ROUND_HALF_UP
+    return str(Decimal(str(x)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)).replace(".", ",")
+
+
+def accuracy(wer):
+    from decimal import Decimal
+    return Decimal("100") - Decimal(str(wer))
+
+
+def q_level(acc):
+    return "lv-g" if acc >= Q_GOOD else "lv-a" if acc >= Q_FAIR else "lv-r"
+
+
+def s_level(x):
+    return "lv-g" if x >= S_GOOD else "lv-a" if x >= S_FAIR else "lv-r"
+
+
+MEAS_MARK = ('<svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="var(--primary)" '
+             'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" '
+             'style="flex:none;margin-left:3px"><path d="M3 8.6l3.2 3.1L13 4.8"/></svg>')
+
+
+def met_row(label, level, fill, value, measured=False):
+    """Строка метрики: подпись 46 · полоска 60×8 · значение 118. level=None — нет данных."""
+    if level is None:
+        return (f'<div class="mm"><span class="mml">{label}</span><span class="mbar nd"></span>'
+                '<span class="mmv nd">нет данных</span></div>')
+    cls = "mmv meas" if measured else "mmv"
+    tip = ' title="замерено на этом компьютере"' if measured else ""
+    mark = MEAS_MARK if measured else ""
+    return (f'<div class="mm"><span class="mml">{label}</span>'
+            f'<span class="mbar {level}"><i style="width:{fill}%"></i></span>'
+            f'<span class="{cls}"{tip}>{value}{mark}</span></div>')
+
+
+def met2(mo, meas_speed=None):
+    """Две метрики карточки: «Точность» и «Скорость». meas_speed — замер на этом компьютере."""
+    if mo["wer"] is None:
+        q = met_row("Точность", None, 0, "")
+    else:
+        acc = accuracy(mo["wer"])
+        q = met_row("Точность", q_level(acc), acc, f"{dec1(acc)} %")
+    speed = meas_speed if meas_speed is not None else mo["rtfx"]
+    if speed is None:
+        sp = met_row("Скорость", None, 0, "")
+    else:
+        fill = f"{min(100.0, speed / BEST_RTFX * 100):.1f}"
+        sp = met_row("Скорость", s_level(speed), fill, f"{dec1(speed)}× быстрее речи",
+                     measured=meas_speed is not None)
+    return q + sp
 
 
 def m(mid):

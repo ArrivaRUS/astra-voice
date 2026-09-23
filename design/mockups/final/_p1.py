@@ -2,7 +2,8 @@
 """Разделы «Общие» (01) и «Модели» (02) — полный макет A «Панель»."""
 from _shell import (page, write, shell, head, footer, sb, m, MODELS, CATALOG_ORDER, DOMESTIC,
                     INSTALLED_SIZE, ic, tgl, key, btn, row, card, group, met, met2, level_bars,
-                    stcell, sech, grid, cbx, dlbar, W, H, th)
+                    stcell, sech, grid, cbx, dlbar, W, H, th, W_DEF, COL_DEF, MEAS_MARK,
+                    Q_GOOD, Q_FAIR, S_GOOD, S_FAIR)
 
 DD = 'var(--fg3)'
 
@@ -369,46 +370,46 @@ def badges_html(items):
     return "".join(f'<span class="bd {k}">{t}</span>' for t, k in items[:2])
 
 
-def mets_block(mo):
-    """Полоски метрик + честная подпись об источнике цифр (§5.3): это чужой бенчмарк."""
-    has_data = mo["qkind"] != "none" or mo["skind"] != "none"
-    src = '<div class="msrc">цифры авторов, не с этого компьютера</div>' if has_data else ""
-    return ('<div class="mmets">'
-            + met2("Качество", mo["q"], mo["qv"], mo["measured"], mo["qkind"])
-            + met2("Скорость", mo["s"], mo["sv"], mo["measured"], mo["skind"])
-            + src + '</div>')
+def mets_block(mo, meas_speed=None):
+    """Две полоски метрик справа (§5.3). Подписи об источнике цифр нет (решение 2026-09-23)."""
+    return f'<div class="mmets">{met2(mo, meas_speed)}</div>'
 
 
-def mcard(mid, state=None, badges=None, note=None, acts=None, extra="", cls_extra="", mets=True):
+def mcard(mid, state=None, badges=None, note=None, acts=None, extra="", cls_extra="", mets=True,
+          meas_speed=None, meas_ram=None):
+    """Карточка «Три строки» (spec §5.1): верх — отметка · имя, назначение · метрики;
+    низ — одна строка: размер, память, теги слева; сообщение и кнопки справа.
+    meas_speed / meas_ram — замер на этом компьютере: значение fg/500 и маркер ✓."""
     mo = m(mid)
     st = state or mo["status"]
     sel, cls_state, state_bd = CARD_STATE[st]
-    cls = "mc" + cls_state + cls_extra
+    cls = "mc" + cls_state + cls_extra + (" blk" if sel == "blocked" else "")
     bl = list(badges if badges is not None else mo["badges"])
     if state_bd:
         bl.append(state_bd)
     bh = badges_html(bl)
     top = (f'<div class="mtop">{cbx(sel)}<div class="ml">'
-           f'<div class="mhead"><span class="mname">{mo["name"]} '
-           f'<span class="mven">· {mo["vendor"]}</span></span>{bh}</div>'
+           f'<div class="mhead"><span class="mname">{mo["name"]}</span>'
+           f'<span class="mven" title="{mo["vendor"]}">· {mo["vs"]}</span>{bh}</div>'
            f'<div class="mpurp">{mo["purpose"]}</div>'
-           f'</div>{mets_block(mo) if mets else ""}</div>')
-    punct = "с пунктуацией" if mo["punct"] else "без пунктуации"
-    tags = (f'{mo["lang"]} <span class="dot"></span> {punct} <span class="dot"></span> '
-            f'{mo["lic"]} <span class="dot"></span> {mo["origin"]}')
+           f'</div>{mets_block(mo, meas_speed) if mets else ""}</div>')
+    ram = (f'<b>{meas_ram} МБ</b>&nbsp;в памяти{MEAS_MARK}' if meas_ram
+           else f'<b>{mo["ram"]}</b>&nbsp;в памяти')
+    facts = [f'<b>{mo["disk"]}</b>&nbsp;на диске', ram, mo["lang"]]
+    if mo["punct"]:
+        facts.append("с пунктуацией")
+    facts += [mo["lic"], mo["origin"]]
+    facts_html = '<span class="dot"></span>'.join(f'<span>{f}</span>' for f in facts)
     n = ""
     if note:
         kind, text = note
         colors = {"w": "var(--warn-ink)", "e": "var(--err-ink)", "i": "var(--fg3)"}
         icon = "alert" if kind in ("w", "e") else "info"
-        n = (f'<span style="color:{colors[kind]};display:inline-flex;align-items:center;gap:5px">'
-             f'{ic(icon, 12, colors[kind])}{text}</span><span class="dot"></span>')
+        n = f'<span class="mmsg" style="color:{colors[kind]}">{ic(icon, 12, colors[kind])}<span>{text}</span></span>'
     a = acts if acts is not None else CARD_ACTS.get(st, "")
-    body = ('<div class="mhr"></div>'
-            f'<div class="mspace">Занимает места: <b>{mo["disk"]}</b> на диске '
-            f'<span class="dot"></span> <b>{mo["ram"]}</b> в памяти при работе</div>'
-            '<div class="mbot" style="margin-top:6px">'
-            f'{tags}<span class="sp"></span>{n} {a}</div>')
+    right = f'<span class="mact">{n}{a}</span>' if (n or a) else ""
+    hasbtn = " hasbtn" if "btn" in a else ""
+    body = f'<div class="mfoot{hasbtn}"><span class="mfacts">{facts_html}</span>{right}</div>'
     return f'<div class="{cls}">{top}{body}{extra}</div>'
 
 
@@ -444,10 +445,9 @@ def catalog_body(theme):
                note=("i", "Правообладатель — Alpha Cephei Inc. (США), команда из России"))
     s += mcard("vosk-s", "avail")
     s += mcard("wturbo", "lowram",
-               note=("w", "Нужно ~2,0 ГБ ОЗУ — на этом компьютере 8 ГБ, может не хватить"))
+               note=("w", "Нужно ~2 ГБ памяти — на этом компьютере 8 ГБ, может не хватить"))
     s += mcard("wsmall", "avail",
-               note=("i", "Нет цифр по нашему протоколу: FLEURS 11,4 % — другой набор; "
-                          "замерим на вашем компьютере"))
+               note=("i", "Цифр для русского никто не публиковал — замерим на вашем компьютере"))
     s += mcard("wbase", "notrec",
                note=("w", "Для русского не рекомендуется: ошибка в каждом третьем слове"))
     s += mcard("mllarge", "avail")
@@ -481,47 +481,51 @@ def catalog_domestic():
 
 def models_catalog(theme):
     right = btn("Установить из файла или папки…", "sm", "folder")
-    hd = head("Модели", "Честные цифры: размер на диске, память в работе, качество и скорость", right)
-    b = shell("Модели", hd, catalog_body(theme) + sb(40, 150), footer(state="model-update"))
-    full = ('<div class="win" style="width:900px;padding:0">'
+    hd = head("Модели", "Какая модель распознаёт речь", right)
+    b = shell("Модели", hd, catalog_body(theme) + sb(40, 150), footer(state="model-update"), w=W_DEF)
+    strip_w = COL_DEF + 2 * 22
+    full = (f'<div class="win" style="width:{strip_w}px;padding:0">'
             '<div style="background:var(--bg-app);padding:14px 22px 18px">'
             + catalog_body(theme) + '</div></div>')
-    leg = ("<b>Решение G2: каталог показывается целиком с прокруткой</b> — без «показать ещё». Всего 12 "
-           "карточек (10 Must + 2 Could, PRD §7.2); нужная стоит первой и помечена «Установлена и активна». "
-           "<b>Все цифры — из <span class=\"mono\">research/catalog-numbers.md</span> (2026-09-08):</b> "
-           "размер = сумма точных байт файлов рантайма из HF API в десятичных МБ; WER — Russian "
-           "LibriSpeech, бенчмарк onnx-asr; скорость — столбец «x64 RTFx (int8)». Где int8-замера нет "
-           "(T-one, обе GigaAM Multilingual) — полоска помечена «бенчмарк fp32». У Whisper small цифр "
-           "по протоколу нет вовсе: полоски пунктиром и «нет данных», выдумывать нельзя (§7.1). "
-           "<b>Место:</b> «Занимает места: 226 МБ на диске · 768 МБ в памяти при работе» — ОДНА строка обычным "
-           "весом; слово «замерено» в карточке не появляется, пока замер не сделан на этом компьютере "
-           "(веха M6), поэтому все полоски метрик серые. <b>Карточка — это выбор:</b> отметка слева, "
-           "кнопок «Скачать»/«Из файла…» в ней нет, внизу списка общий итог и одна кнопка. "
+    leg = ("<b>Решение G2: каталог показывается целиком с прокруткой</b> — без «показать ещё». "
+           "<b>Окно по умолчанию 1024×620</b> (решение заказчика 2026-09-23), колонка 796; минимум — 900×588. "
+           "<b>Карточка «Три строки»</b> (§5.1): отметка · имя и назначение · две полоски справа; одна "
+           "нижняя строка — место на диске, память, теги, а справа сообщение и кнопки. "
+           "<b>Точность = 100 − WER</b>, больше — лучше; <b>скорость</b> — «N× быстрее речи», полоска "
+           "относительно самой быстрой модели. <b>Цвет полоски — оценка</b>: зелёный — хорошо, охра — "
+           "средне, красный — слабо (§5.3). Подписи об источнике цифр и ссылки «Как мы считаем» на экране "
+           "нет. Замер на этом компьютере — значение темнее и маркер ✓ (у рабочей модели). Цифры — из "
+           "<span class=\"mono\">data/catalog.json</span>; где цифр нет — полоска пунктиром и «нет данных». "
            "<b>Фильтр «только отечественные»</b> смотрит на юрлицо правообладателя: остаются 5 GigaAM "
            "и T-one, обе Vosk уходят (Alpha Cephei Inc., США).")
     return page(f"A · Модели: каталог — {th(theme)}",
-                f'<b>Модели</b> — каталог целиком (12 карточек) · {th(theme)} тема · 900×620',
+                f'<b>Модели</b> — каталог целиком (12 карточек) · {th(theme)} тема · 1024×620',
                 b + sech("Каталог целиком — лента прокрутки, 12 карточек") + full
                 + sech("Фильтр «только отечественные» включён — 6 моделей")
-                + '<div class="win" style="width:900px;padding:0">'
+                + f'<div class="win" style="width:{strip_w}px;padding:0">'
                   '<div style="background:var(--bg-app);padding:14px 22px 18px">'
-                + catalog_domestic() + '</div></div>', theme, leg)
+                + catalog_domestic() + '</div></div>', theme, leg,
+                ".sec,.sech,.grid,.grid1,.grid3,.legend,.cap{max-width:1024px}")
 
 
-def tooltip_bars():
-    return ('<div class="pop" style="position:static;box-shadow:none;width:340px;min-width:0;padding:12px">'
-            '<div class="strong" style="font-size:13px;margin-bottom:5px">Качество · WER 7,60 %</div>'
-            '<div class="c12" style="line-height:1.55">Доля слов с ошибкой на наборе Russian LibriSpeech, '
-            'бенчмарк onnx-asr. Полоска одна и та же для всех моделей: чем длиннее — тем меньше ошибок. '
-            'Пунктуация в полоску не входит — у неё отдельный значок.<br>'
-            '<b>WER бенчмарка измерен на fp32-весах</b> той же модели: для int8, которые мы скачиваем, '
-            'публичных замеров нет ни у одной модели.<br>'
-            'Скорость берётся из столбца «x64 RTFx (int8)»; где int8-замера нет, полоска помечена '
-            '«бенчмарк fp32».<br>'
-            '<span style="color:var(--primary)">Как мы считаем →</span></div></div>')
+def scale_legend():
+    """Шкала оценок полосок (§5.3) — для легенды макета, не элемент интерфейса."""
+    def bar(level, w):
+        return f'<span class="mbar {level}"><i style="width:{w}%"></i></span>'
+    rows = [("хорошо", "lv-g", f"≥ {Q_GOOD},0 %", f"≥ {S_GOOD}×", "successInk"),
+            ("средне", "lv-a", f"{Q_FAIR},0–{Q_GOOD - 1},9 %", f"{S_FAIR}–{S_GOOD - 1},9×", "warningInk"),
+            ("слабо", "lv-r", f"&lt; {Q_FAIR},0 %", f"&lt; {S_FAIR}×", "dangerInk")]
+    tr = "".join(f'<tr><td>{bar(lv, 70)}</td><td>{n}</td><td>{q}</td><td>{sp}</td>'
+                 f'<td class="mono">{tok}</td></tr>' for n, lv, q, sp, tok in rows)
+    return ('<table class="t"><tr><th>полоска</th><th>оценка</th><th>точность</th><th>скорость</th>'
+            f'<th>токен заливки</th></tr>{tr}</table>'
+            '<div class="c12" style="margin-top:8px;line-height:1.6">Дорожка — <span class="mono">bgSurface2</span>. '
+            'Нет цифр — дорожка пунктиром и «нет данных». Замер на этом компьютере — та же полоска, '
+            f'значение цветом fg, вес 500 и маркер {MEAS_MARK} (подсказка «замерено на этом компьютере»).</div>')
 
 
 def models_card_states(theme):
+    from _p3 import onb, onb2_body, acts   # поздний импорт: _p3 сам импортирует _p1
     cells = [
         stcell("не выбрана — исходное состояние сетевой модели",
                mcard("tone", "avail"), "unselected"),
@@ -531,8 +535,9 @@ def models_card_states(theme):
                mcard("tone", "hover"), "hover"),
         stcell("в фокусе с клавиатуры — рамка 2 px, Пробел переключает отметку",
                mcard("tone", "focus"), "focus"),
-        stcell("установлена и активна — отметка недоступна",
-               mcard("rnnt", "active", [("Рекомендуем", "rec")]), "active"),
+        stcell("установлена и активна · скорость и память замерены здесь (маркер ✓)",
+               mcard("rnnt", "active", [("Рекомендуем", "rec")], meas_speed=38.7, meas_ram=402),
+               "active"),
         stcell("установлена, но не рабочая", mcard("ctc", "installed"), "installed"),
         stcell("загружается — подробности в сквозной полоске мастера",
                mcard("rnnt-np", "downloading"), "downloading"),
@@ -554,21 +559,19 @@ def models_card_states(theme):
                "update-failed"),
         stcell("предупреждение по ОЗУ (не запрет)",
                mcard("wturbo", "lowram",
-                     note=("w", "Нужно ~2,0 ГБ ОЗУ — на этом компьютере 8 ГБ, может не хватить")),
+                     note=("w", "Нужно ~2 ГБ памяти — на этом компьютере 8 ГБ, может не хватить")),
                "low-ram"),
         stcell("не рекомендуется для русского",
                mcard("wbase", "notrec",
                      note=("w", "Для русского не рекомендуется: ошибка в каждом третьем слове")),
                "not-recommended"),
-        stcell("нет цифр по нашему протоколу — полоски пунктиром",
+        stcell("нет цифр — обе полоски пунктиром",
                mcard("wsmall", "avail",
-                     note=("i", "FLEURS 11,4 % — другой набор и другой формат весов; "
-                                "замерим на вашем компьютере")),
+                     note=("i", "Цифр для русского никто не публиковал — замерим на вашем компьютере")),
                "no-benchmark"),
-        stcell("скорость измерена на fp32-весах (int8-замера нет)",
-               mcard("tone", "avail",
-                     note=("i", "Модель поставляется только в fp32 — 144,2 МБ, ОЗУ выше оценки")),
-               "fp32-benchmark"),
+        stcell("скорость не опубликована — одна полоска пунктиром", mcard("tone", "avail"),
+               "no-speed"),
+        stcell("слабые цифры — красная шкала", mcard("vosk-s", "avail"), "weak"),
         stcell("нет сети",
                mcard("tone", "nonet", note=("i", "Нет доступа к huggingface.co")), "no-network"),
         stcell("офлайн-режим включён вами",
@@ -591,29 +594,45 @@ def models_card_states(theme):
                "removed-from-catalog"),
     ]
     rules = ('<div class="stc"><div class="stn">правило бейджей — «Рекомендуем» + один бейдж состояния</div>'
-             '<div class="sm" style="line-height:1.7">Верхняя строка карточки: имя · производитель, '
-             'затем <b>Рекомендуем</b> и справа от него <b>ровно один</b> бейдж состояния — '
-             '«Установлена и активна» у рабочей модели, «Установлена» у скачанной, но не рабочей, '
-             '«Загружается» / «В очереди» / «Проверяю…» / «Обновление доступно» по ходу дела. '
-             'Одновременно «Установлена» и «Установлена и активна» не показываются. Нижний чип '
-             '«Установлена · 226 МБ» убран — размер стоит строкой «Занимает места».'
+             '<div class="sm" style="line-height:1.7">Верхняя строка карточки: имя · производитель '
+             '(коротко, полное имя — в подсказке), затем <b>Рекомендуем</b> и справа от него <b>ровно '
+             'один</b> бейдж состояния — «Установлена и активна» у рабочей модели, «Установлена» у '
+             'скачанной, но не рабочей, «Загружается» / «В очереди» / «Проверяю…» / «Обновление '
+             'доступно» по ходу дела.'
              '<div style="display:flex;gap:6px;margin-top:9px;flex-wrap:wrap">'
              + badges_html([("Рекомендуем", "rec"), ("Установлена и активна", "act")])
              + badges_html([("Установлена", "ins")]) + badges_html([("Загружается", "new")])
              + badges_html([("Обновление доступно", "upd")])
              + '</div></div></div>')
-    tip = ('<div class="stc"><div class="stn">подсказка при наведении на полоску</div>'
-           + tooltip_bars() + '</div>')
-    leg = ("<b>Карточка сетевой модели — это ВЫБОР</b> (решение заказчика 2026-09-17): кликабельна "
-           "целиком, слева отметка выбора, выбор <b>множественный</b>. Кнопок «Скачать» и «Из файла…» "
-           "в карточке больше нет — загрузка стартует по «Продолжить», а её ход показывает сквозная "
-           "полоска внизу мастера. Каждое состояние различимо не только цветом: у ошибок треугольник и "
-           "красная подпись, у предупреждений — треугольник и жёлтая, у нейтральных пояснений — «i». "
-           "<b>Полоски метрик серые у всех моделей</b>: это чужой бенчмарк, а не замер на этом "
-           "компьютере (§5.3) — под ними стоит подпись «цифры авторов, не с этого компьютера».")
+    scale = ('<div class="stc"><div class="stn">шкала полосок — цвет = оценка, длина = сравнение</div>'
+             + scale_legend() + '</div>')
+    right = btn("Установить из файла или папки…", "sm", "folder")
+    hd = head("Модели", "Какая модель распознаёт речь", right)
+    win_def = shell("Модели", hd, catalog_body(theme) + sb(40, 150), footer(state="model-update"), w=W_DEF)
+    win_min = shell("Модели", hd, catalog_body(theme) + sb(40, 120), footer(state="model-update"))
+    wiz_cards = (mcard("rnnt", "selected", [("Рекомендуем", "rec")]) + mcard("ctc", "avail")
+                 + mcard("rnnt-np", "avail") + mcard("tone", "avail") + mcard("vosk", "avail"))
+    wiz = onb(2, onb2_body(wiz_cards, "Будет скачано 226 МБ", catalog=True, width=COL_DEF),
+              acts(next_="Продолжить", skip=True, skip_dis=True), w=W_DEF)
+    leg = ("<b>Карточка «Три строки»</b> (решение заказчика 2026-09-23, spec §5.1–5.3): отметка · имя и "
+           "назначение · две полоски справа; одна нижняя строка — место на диске, память и теги слева, "
+           "сообщение и кнопки справа. Разделителя, строки «Занимает места» и подписи об источнике цифр "
+           "больше нет; ссылки «Как мы считаем» на экране нет. Высота: 82 px без кнопок, 92 с кнопками "
+           "(колонка 796; было 140 и 150). <b>Точность = 100 − WER</b> (больше — лучше), <b>скорость</b> — "
+           "«N× быстрее речи». <b>Цвет полоски — оценка по шкале</b>, длина — сравнение. Замер на этом "
+           "компьютере — значение темнее и маркер ✓. Карточка сетевой модели — это <b>выбор</b>: "
+           "кликабельна целиком, отметка слева, выбор множественный; загрузку показывает сквозная полоска. "
+           "Каждое состояние различимо не только цветом: у ошибок треугольник и красная подпись, у "
+           "предупреждений — треугольник и охра, у пояснений — «i».")
+    css = (".sec,.sech,.grid,.grid1,.grid3,.legend,.cap{max-width:1024px}"
+           f".grid1 .stc>.mc{{width:{COL_DEF}px;max-width:100%}}")
     return page(f"A · Модели: состояния карточки — {th(theme)}",
-                f'<b>Модели → карточка</b> — все состояния выбора и установки · {th(theme)} тема',
-                grid(cells, 1) + sech("Правила") + grid([rules, tip]), theme, leg)
+                f'<b>Модели → карточка</b> — все состояния выбора и установки · {th(theme)} тема · колонка 796',
+                grid(cells, 1) + sech("Правила") + grid([rules, scale])
+                + sech("Раздел «Модели» · окно по умолчанию 1024×620 (колонка 796)") + win_def
+                + sech("Раздел «Модели» · минимальное окно 900×620 (колонка 672)") + win_min
+                + sech("Мастер, шаг 2 · окно 1024×620 (колонка 796)") + wiz,
+                theme, leg, css)
 
 
 def models_file_dialogs(theme):
