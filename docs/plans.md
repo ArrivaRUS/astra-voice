@@ -403,7 +403,7 @@ R6 HF недоступен из РФ → «Из файла» · чистая В�
 - [~] Замеры и полоски (US-5.4, 5.5): `VmHWM`/PSS после первой диктовки → «ОЗУ: N МБ (замерено на этом компьютере)» жирным; медиана RTFx по ≥ 5 тёплым прогонам → полоска «замерено»; сброс при смене ревизии/потоков (Д4); `quality = clamp((30 − WER)/25, 0, 1)`, лог-шкала RTFx 1…60, `benchmark_fp32` подпись, `no_data` — полоска не рисуется; Popup «Как мы считаем» с источником и датой.
 - [ ] `qml/components/ModelCard.qml` — 20 состояний спеки §5.4 (state-машина в одном компоненте), бейджи «Рекомендуем/Активна/Новое/Обновление доступно», значок пунктуации — референсы `02-models-card-states.png`, `02-models-catalog.png`, `02-models-empty-offline.png`, `02-models-file-dialogs.png` (+`-dark`); xvfb-скриншоты 20 × 2.
 - [x] `OnnxAsrEngine`: остальные 6 раскладок (`onnx-asr-gigaam-multilingual`, `onnx-asr-t-one`, `onnx-asr-vosk`, `onnx-community-whisper`, `onnx-asr-whisper-ort`, `onnx-asr-nemo`) по таблице S3/`build_manifest`; `pytest -m engine` на 3 раскладках GigaAM в CI; остальные — `tools/validate catalog --all` на машине (кэш весов).
-- [ ] CLI: `tools/validate catalog --all|--switch`, `tools/validate downloads --faults` (полный), `tools/benchmark --catalog --minimum-models 3`.
+- [~] CLI: `tools/validate catalog --all|--switch` `[x]` 23.09 (T-93/T-94 живые PASS на dev-хранилище), `tools/validate downloads --faults` (полный), `tools/benchmark --catalog --minimum-models 3`.
 ### Definition of Done
 - S7-A1…A4, S15-A1…A3 зелёные; **≥ 3 модели замерены** (Ц6); каталог показывает 12 карточек, «только отечественные» — 6; скриншоты 20 состояний = референсы (DesignReviewer PASS); T-08, T-09, T-22, T-23, T-26, T-32, T-33, T-36 зелёные; `catalog-state.json` переживает очистку `~/.cache`.
 ### Validation
