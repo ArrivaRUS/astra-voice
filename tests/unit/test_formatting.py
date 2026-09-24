@@ -10,6 +10,7 @@ import pytest
 from astra_voice.ui.formatting import (
     SpeedTracker,
     clean_display_name,
+    format_accuracy,
     format_eta,
     format_size,
     format_space,
@@ -17,6 +18,14 @@ from astra_voice.ui.formatting import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize(
+    ("wer", "expected"),
+    [(0, "100,0 %"), (100, "0,0 %"), (5.55, "94,5 %"), (5.45, "94,6 %")],
+)
+def test_format_accuracy(wer: float, expected: str) -> None:
+    assert format_accuracy(wer) == expected
 
 
 @pytest.mark.parametrize("for_menu", [False, True])

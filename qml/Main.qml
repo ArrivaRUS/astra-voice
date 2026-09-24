@@ -112,10 +112,9 @@ ApplicationWindow {
         RowLayout {
             id: header
             anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.leftMargin: Theme.spaceWindowContentX
-            anchors.rightMargin: Theme.spaceWindowContentX
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: Math.min(Theme.sizeContentColMax,
+                content.width - 2 * Theme.spaceWindowContentX)
             anchors.topMargin: Theme.spaceWindowContentTop
             spacing: 10 // Макет: зазор между заголовком и кнопкой действия.
 
@@ -165,11 +164,10 @@ ApplicationWindow {
             id: body
             anchors.top: header.bottom
             anchors.topMargin: Theme.spaceHeadGap
-            anchors.left: parent.left
-            anchors.right: parent.right
+            anchors.horizontalCenter: parent.horizontalCenter
             anchors.bottom: parent.bottom
-            anchors.leftMargin: Theme.spaceWindowContentX
-            anchors.rightMargin: Theme.spaceWindowContentX
+            width: Math.min(Theme.sizeContentColMax,
+                content.width - 2 * Theme.spaceWindowContentX)
             anchors.bottomMargin: Theme.spaceWindowContentBottom
             clip: true
             contentWidth: width

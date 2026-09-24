@@ -1,4 +1,4 @@
-// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.3.0 — НЕ ПРАВИТЬ РУКАМИ.
+// СГЕНЕРИРОВАНО scripts/gen_theme.py из design/tokens.json 2.3.1 — НЕ ПРАВИТЬ РУКАМИ.
 // Перегенерация: python3 scripts/gen_theme.py · проверка: python3 scripts/gen_theme.py --check
 
 pragma Singleton
@@ -113,7 +113,7 @@ QtObject {
     readonly property int fontMenuItemWeight: 400
     readonly property real fontMenuShortcutSize: 11.5
     readonly property int fontMenuShortcutWeight: 400
-    readonly property real fontMetricSize: 11.5
+    readonly property real fontMetricSize: 11
     readonly property int fontMetricWeight: 400
     readonly property real fontModelFooterSize: 12
     readonly property int fontModelFooterWeight: 400
@@ -161,6 +161,7 @@ QtObject {
     readonly property real spaceCardRowDivider: 1
     readonly property real spaceGroupCaptionGap: 5
     readonly property real spaceGroupGap: 8
+    readonly property real spaceGroupTopGap: 14
     readonly property real spaceHeadGap: 8
     readonly property real spaceRowGap: 10
     readonly property var spaceScale: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 20, 22, 26, 40]
@@ -337,10 +338,8 @@ QtObject {
     readonly property real modelCardHeadMinH: 22
     readonly property bool modelCardHeadWrap: true
     readonly property real modelCardMarginBottom: 6
-    readonly property color modelCardMetricFillEstimated: fgFaint
     readonly property color modelCardMetricFillFair: warningInk
     readonly property color modelCardMetricFillGood: successInk
-    readonly property color modelCardMetricFillMeasured: primary
     readonly property color modelCardMetricFillWeak: dangerInk
     readonly property real modelCardMetricGap: 6
     readonly property real modelCardMetricLabelMarginRight: 2
@@ -354,9 +353,6 @@ QtObject {
     readonly property color modelCardMetricNoDataBorder: fgFaint
     readonly property color modelCardMetricNoDataValueColor: fgDisabled
     readonly property real modelCardMetricRowH: 18
-    readonly property color modelCardMetricSourceCaptionColor: fgFaint
-    readonly property real modelCardMetricSourceCaptionMarginTop: 2
-    readonly property real modelCardMetricSourceCaptionSize: 11.5
     readonly property color modelCardMetricTrackBg: bgSurface2
     readonly property real modelCardMetricTrackH: 8
     readonly property real modelCardMetricTrackRadius: 4
@@ -373,12 +369,11 @@ QtObject {
     readonly property int modelCardScaleQualityGood: 92
     readonly property int modelCardScaleSpeedFair: 5
     readonly property int modelCardScaleSpeedGood: 20
-    readonly property real modelCardSelectBorder: 1.5
+    readonly property real modelCardSelectBorder: 1
     readonly property real modelCardSelectGap: 12
     readonly property bool modelCardSelectMultiple: true
     readonly property real modelCardSelectRadius: 5
     readonly property real modelCardSelectSize: 18
-    readonly property real modelCardSpaceLineGapToTags: 6
     readonly property color modelCardSpaceLineLabel: fgMuted
     readonly property real modelCardSpaceLineLineHeight: 18
     readonly property real modelCardSpaceLineSize: 12
@@ -420,6 +415,7 @@ QtObject {
     readonly property color onboardingSummaryLineColor: fg
     readonly property color onboardingSummaryLineColorWarn: dangerInk
     readonly property color onboardingSummaryLineFreeColor: fgMuted
+    readonly property real onboardingSummaryLineFreeSize: 12
     readonly property real onboardingSummaryLineMarginTop: 10
     readonly property real onboardingSummaryLineSize: 13
     readonly property real popoverItemDescSize: 11.5

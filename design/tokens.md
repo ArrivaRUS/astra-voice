@@ -1,10 +1,10 @@
 # Токены дизайн-системы — Astra Voice
 
 > Шаг **P9 «токены»** · направление **A «Панель»** (принято на ⛔ G2, 2026-09-08).
-> Машиночитаемая версия: **`design/tokens.json`** — **693 токена** (листья с `value`, 11 из них
-> помечены `deprecated`), **108 посчитанных пар** контраста
+> Машиночитаемая версия: **`design/tokens.json`** — **684 токена** (листья с `value`,
+> устаревшие токены удалены), **108 посчитанных пар** контраста
 > (96 актуальных + 12 помеченных устаревшими после правок раундов 2–3) и 6 пар заливок полосок метрик (§22).
-> Автор: `design-engineer` · дата: 2026-09-23 · **версия 2.3.0 (раунд 5)**.
+> Автор: `design-engineer` · дата: 2026-09-23 · **версия 2.3.1 (раунд 5)**.
 > **Раунд 5** — карточка модели «Три строки» и окно по умолчанию 1024 (решения заказчика
 > 2026-09-23, спека 0.5). Что изменилось — в §22.
 > **Раунд 4** — решения заказчика с живой проверки `0.1.0~m5.1`: карточка модели стала выбором,
@@ -160,7 +160,7 @@ font.family.mono = 'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace     
 | `model-name` | 15 | 500 | ui | `_base.py:193` |
 | `model-vendor` / `model-purpose` | 12.5 | 400 | ui | `_base.py:194,195` |
 | `model-footer` | 12 | 400 | ui | `_base.py:199` |
-| `metric` — подпись/значение полоски | 11.5 (число 700) | 400 | ui | `_base.py:121,126` |
+| `metric` — подпись полоски | 11 | 400 | ui | `spec 0.5 §5.2` |
 | `note-banner` | 12.5 / 1.45 | 400 | ui | `_base.py:131` |
 
 **Правило «цифры — PT Mono»** (`font.rule.digits-mono`, `brand §3`): моноширинным набираются
@@ -185,6 +185,7 @@ font.family.mono = 'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace     
 | `space.window-content-x` | 22 (слева и справа от контента) | `_shell.py:67-68` |
 | `space.window-content-top` / `-bottom` | 12 / 16 | `_shell.py:67-68` |
 | `space.group-gap` | 8 (между группами настроек) | `_shell.py:27` |
+| `space.group-top-gap` | 14 (между карточкой и следующим заголовком в «Моделях») | `design/spec.md` 0.5 §5.6 |
 | `space.group-caption-gap` | 5 (CAPS-заголовок → карточка) | `_shell.py:71` — перекрывает 7 из `_base.py:66` |
 | `space.row-gap` | 10 (подпись → контрол) | `_base.py:73` |
 | `component.card.row-padding` / `row-min-h` | **7 × 14** / **38** (строка без подстроки) | `_shell.py:70` |
@@ -358,7 +359,7 @@ focus — кольцо 2 px акцентом снаружи с зазором 2 
 | | Значение | Токен |
 |---|---|---|
 | Строка метрики | высота 18; две строки, зазор **4** | `metric.row-h`, `metrics-gap` |
-| Подпись слева | ширина **46** + отступ справа 2, 11.5 px, `fg-muted`, выключка вправо | `metric.label-w`, `metric.label-margin-right` |
+| Подпись слева | ширина **46** + отступ справа 2, 11 px, `fg-muted`, выключка вправо | `metric.label-w`, `metric.label-margin-right` |
 | Зазоры в строке | **6** | `metric.gap` |
 | Дорожка | **60 × 8**, радиус 4, фон `bg-surface-2` | `metric.track-*` |
 | Заливка «хорошо / средне / слабо» | `success-ink` / `warning-ink` / `danger-ink` | `metric.fill-good/fair/weak` |
@@ -909,16 +910,16 @@ M1-C замерил три величины по референсу и врем�
 
 | Группа | Что описывает |
 |---|---|
-| `component.model-card.select.*` | отметка выбора: 18 × 18, радиус 5, граница 1.5, зазор 14, иконка `check` 12; **четыре** вида — `off` / `on` (`primary` + `primary-fg`) / `locked` (`bg-surface-2` + галочка `fg-disabled` — отмечена, менять нельзя) / `blocked` (`bg-surface-2`, **галочки нет** — выбрать нельзя); `multiple: true`, `hit-area: вся карточка` |
+| `component.model-card.select.*` | отметка выбора: 18 × 18, радиус 5, граница 1 px ровно, зазор 14, иконка `check` 12; **четыре** вида — `off` / `on` (`primary` + `primary-fg`) / `locked` (`bg-surface-2` + галочка `fg-disabled` — отмечена, менять нельзя) / `blocked` (`bg-surface-2`, **галочки нет** — выбрать нельзя); `multiple: true`, `hit-area: вся карточка` |
 | `component.model-card.picked` | выбранная карточка: граница `primary`, фон `primary-bg` |
 | `component.model-card.head.*` | верхняя строка «имя · вендор + бейджи»: зазор 6, перенос разрешён |
-| `component.model-card.space-line.*` | строка «Занимает места»: 12 / 18, подписи `fg-muted`, значения `fg` весом **400**, разделитель — точка 4 px, зазор до тегов 6 |
-| `component.model-card.metric.source-caption.*` | подпись «цифры авторов, не с этого компьютера»: 11.5, `fg-faint`, вправо, отступ сверху 2 |
+| `component.model-card.space-line.*` | размер 12 / 18 и цвета нижней строки; отдельная строка удалена |
+| `component.model-card.metric.source-caption.*` | удалено: подписи источника под метриками больше нет |
 | `component.badge.kind.installed` | бейдж «Установлена»: `success-bg` / `success-ink` |
 | `component.badge.kind.progress` | бейджи хода работы: «Загружается» / «В очереди» / «Проверяю…», `bg-surface-2` / `fg-muted` |
 | `component.progress.indeterminate.*` | неопределённая полоска: сегмент 38 %, 1200 мс `linear` бесконечно |
 | `component.onboarding.progress-strip.*` | сквозная полоска мастера: 36 высотой, поля `0 22`, дорожка 160 × 6, пять состояний, форматы времени и скорости, поведение при закрытии окна |
-| `component.onboarding.summary-line.*` | строка итога «Будет скачано N МБ»: 13 px, `fg`, при нехватке места `danger-ink` |
+| `component.onboarding.summary-line.*` | строка итога «Будет скачано N МБ»: 13 px, свободное место 12 px; `fg`, при нехватке места `danger-ink` |
 | `component.onboarding.continue-gate` | «Продолжить» на шаге 2 неактивна, пока ничего не выбрано |
 | `component.onboarding.step2-content-w` | ширина содержимого шага 2 — 720 |
 
@@ -955,7 +956,7 @@ M1-C замерил три величины по референсу и врем�
 а не про фокус. Не переименовываю: переименование заденет генерат `Theme.focusRing` и `AvSelect`.
 Пометка добавлена в `note` обоих ключей.
 
-## 22. Версия 2.3.0 (раунд 5) — карточка «Три строки» и окно 1024
+## 22. Версия 2.3.1 (раунд 5) — карточка «Три строки» и окно 1024
 
 Основание: спека 0.5 (2026-09-23) §1.1, §1.4, §1.5, §5.1–5.3, §10.2; макеты
 `02-models-card-states.html` (+ `-dark`); `_shell.py` (блок CSS «Три строки», `W_DEF`, `COL_DEF`,
@@ -1016,13 +1017,10 @@ M1-C замерил три величины по референсу и врем�
 | `warning-ink` | #8F5E12 — 4,90 : 1 | #F2B559 — 10,66 : 1 |
 | `danger-ink` | #C0322F — 4,96 : 1 | #F0645F — 6,19 : 1 |
 
-### Устаревшие (`deprecated: true`) — держатся до перехода `OnboardingModelCard.qml`
+### Удалённые после перехода `OnboardingModelCard.qml`
 
 `component.model-card.metric.fill-measured`, `metric.fill-estimated`, вся ветка
 `metric.source-caption.*`, `component.model-card.hr`, `space-line.gap-to-tags`, `space-line.text`.
-В `Theme.qml` пока остаются `modelCardMetricFillEstimated`, `modelCardMetricFillMeasured`,
-`modelCardMetricSourceCaptionColor/MarginTop/Size`, `modelCardSpaceLineGapToTags`
-(`hr`, `space-line.text` и прозаические листья `source-caption` в QML не генерируются).
-Удалить из `tokens.json` после того, как QML перестанет их читать.
+Эти токены удалены из `tokens.json` и сгенерированного `Theme.qml`.
 
-Всего токенов 663 → **693** (+30 новых; счёт — листья с `value`, прежние 601/661 в шапках были неточны).
+Всего токенов **683** (листья с `value`; 10 устаревших удалены после перехода QML).

@@ -124,6 +124,11 @@ Item {
 
         Loader {
             id: loader
+            objectName: "stepLoader"
+            // Окно минус (sizeWindowW − onboardingStep2ContentW) = 228 px;
+            // реальная ширина тела остаётся верхней границей.
+            readonly property real step2AvailableWidth: Math.max(0, Math.min(body.width,
+                root.width - (Theme.sizeWindowW - Theme.onboardingStep2ContentW)))
             y: 24 // design/spec.md §10: верхний паддинг тела, отдельного токена нет.
             anchors.horizontalCenter: parent.horizontalCenter
             source: root.stepSources[root.step - 1]

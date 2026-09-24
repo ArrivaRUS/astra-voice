@@ -99,7 +99,7 @@ Rectangle {
             Layout.maximumWidth: Theme.onboardingProgressStripTrackW
             Layout.preferredWidth: Theme.onboardingProgressStripTrackW
             Layout.preferredHeight: Theme.onboardingProgressStripTrackH
-            radius: Theme.modelCardMetricTrackRadius
+            radius: Theme.progressRadius
             color: Theme.bgSurface2
             clip: true
 
@@ -107,7 +107,7 @@ Rectangle {
                 visible: root.downloadState === "downloading"
                 width: track.width * Math.max(0, Math.min(1, root.progress))
                 height: track.height
-                radius: Theme.modelCardMetricTrackRadius
+                radius: Theme.progressRadius
                 color: Theme.primary
             }
 
@@ -117,7 +117,7 @@ Rectangle {
                 visible: root.downloadState === "verifying"
                 width: track.width * 0.38
                 height: track.height
-                radius: Theme.modelCardMetricTrackRadius
+                radius: Theme.progressRadius
                 color: Theme.primary
             }
 
