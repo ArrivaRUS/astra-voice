@@ -2,6 +2,7 @@
   "title": "Тестовые векторы контракта Astra Voice ↔ Astra Cowork (ru.astralinux.Cowork.Command1)",
   "contract": 1,
   "fixed": "2026-09-24",
+  "document": "1.2",
   "bus_name": "ru.astralinux.Cowork",
   "object_path": "/ru/astralinux/Cowork",
   "interface": "ru.astralinux.Cowork.Command1",
@@ -13,6 +14,8 @@
     "forbidden_chars": "U+0000–U+001F, U+007F–U+009F (включая U+0085), U+2028, U+2029; пустота после strip; длина 1…4000",
     "defaults": "если в векторе нет text — берётся base.text; если нет now_mono_ms — base.now_mono_ms; options_vectors проверяются с валидным текстом, text_vectors — с валидными options; отправитель — тот же UID; сервер готов, сеанс разблокирован, сна не было, окно rate limit закрыто, незавершённых допусков 0",
     "admission_state": "поля state описывают предусловие на стороне сервера (для заглушки исполнителя и тестов C1/S9); значения — по описанию §7 спецификации",
+    "deadline_margin": "сервер допускает новый request_id, пока now ≤ deadline_mono_ms − margin, margin = max((deadline − sent) · 5 // 100, 30) мс (при бюджете 300 — 30 мс, т.е. не позже sent + 270); причина — таймаут QtDBus у клиента срабатывает до 5 % раньше срока (S9: NoReply за 286,7 мс); вектора O-33, O-46…O-49",
+    "error_names": "клиент сопоставляет ошибки D-Bus по полному имени QDBusError.name() (org.freedesktop.DBus.Error.*), не по суффиксу и не по одному type(); callWithCallback вернул False → sent=False → исход сразу без ожидания (C-31, C-33)",
     "nul": "U+0000 в строках D-Bus недопустим — сообщение не уйдёт с клиента (libdbus отвергает); на сервер не попадает, вектора нет; Voice удаляет C0 до отправки"
   },
   "base": {
@@ -719,7 +722,7 @@
     },
     {
       "id": "O-33",
-      "name": "deadline = sent, now = deadline — допуск (истечение только при now > deadline)",
+      "name": "deadline = sent (формат допускает окно 0), now = deadline — просрочено: margin 30 мс больше окна",
       "options": {
         "source": "astra-voice",
         "contract": 1,
@@ -728,7 +731,8 @@
         "deadline_mono_ms": 5000000
       },
       "expect": {
-        "status": "accepted"
+        "status": "expired",
+        "reason": "deadline"
       }
     },
     {
@@ -928,6 +932,68 @@
       "expect": {
         "status": "refused",
         "reason": "unsupported_contract"
+      }
+    },
+    {
+      "id": "O-46",
+      "name": "граница margin: бюджет 300 (margin 30), now = sent + 270 — допуск",
+      "now_mono_ms": 5000270,
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-47",
+      "name": "за границей margin: бюджет 300, now = sent + 271 — expired/deadline",
+      "now_mono_ms": 5000271,
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "expired",
+        "reason": "deadline"
+      }
+    },
+    {
+      "id": "O-48",
+      "name": "бюджет 5000 (margin 250): now = sent + 4750 — допуск",
+      "now_mono_ms": 5004750,
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5005000
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-49",
+      "name": "бюджет 5000: now = sent + 4751 — expired/deadline",
+      "now_mono_ms": 5004751,
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5005000
+      },
+      "expect": {
+        "status": "expired",
+        "reason": "deadline"
       }
     }
   ],
@@ -1703,6 +1769,47 @@
       "expect": {
         "mode_registered": false,
         "settings_line": "Astra Cowork не установлен"
+      }
+    },
+    {
+      "id": "C-31",
+      "name": "callWithCallback вернул False при живом соединении (сообщение отвергнуто локально) — sent=False, исход сразу, без ожидания",
+      "input": {
+        "pre": "call_returned_false",
+        "connected": true
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "refused",
+        "sent": false,
+        "waited": false,
+        "error_name_logged": true
+      }
+    },
+    {
+      "id": "C-32",
+      "name": "чужое имя ошибки с суффиксом NoReply — сопоставление по полному имени org.freedesktop.DBus.Error.*, не по суффиксу",
+      "input": {
+        "error_name": "com.example.Error.NoReply"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "refused",
+        "error_name_logged": true
+      }
+    },
+    {
+      "id": "C-33",
+      "name": "callWithCallback вернул False, соединения нет — no_bus, исход сразу",
+      "input": {
+        "pre": "call_returned_false",
+        "connected": false
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "no_bus",
+        "sent": false,
+        "waited": false
       }
     }
   ],
