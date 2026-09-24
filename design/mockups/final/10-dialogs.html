@@ -232,9 +232,17 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 .mven{white-space:nowrap}
 .mhead{min-height:22px}
 .mpurp{line-height:18px;margin-top:0}
+/* фильтр списка «Модели» = два чипа-сегмента, как в реализации (qml/components/FilterChip.qml, M6):
+   высота 25 (текст + паддинг 4 сверху и снизу), паддинг 11 от края вместе с границей 1, радиус 14,
+   зазор 6 (chipGap). Активный — primary / primary-fg / 500, второй — bg-surface / border / fg-secondary */
+.fchips{display:flex;gap:6px;align-items:center;margin:0 0 12px}
+.chip.seg{height:25px;box-sizing:border-box;padding:0 10px;line-height:23px;gap:0;white-space:nowrap}
 .mmets{display:flex;flex-direction:column;gap:4px;flex:none}
 .mm{display:flex;align-items:center;gap:6px;height:18px;font-size:12px}
-.mm .mml{width:46px;margin-right:2px;text-align:right;font-size:11.5px;color:var(--fg3);flex:none}
+/* подпись 11 px: при 11.5 «Скорость» шире 46 (51,6 в Chromium) и вылезала под полоску. Трекинг −0.02em —
+   компенсация Chromium («Скорость» 47,6 → 45,8), чтобы край подписи стоял на 46, как в реализации */
+.mm .mml{width:46px;margin-right:2px;text-align:right;font-size:11px;letter-spacing:-0.02em;white-space:nowrap;
+  color:var(--fg3);flex:none}
 /* полоска: длина — сравнение, цвет — оценка по шкале (хорошо/средне/слабо) */
 .mbar{width:60px;height:8px;border-radius:4px;background:var(--bg-sunk);overflow:hidden;flex:none;display:inline-block}
 .mbar i{display:block;height:100%;border-radius:4px}

@@ -417,9 +417,10 @@ def filters(theme, domestic=False, count=None):
     if count is None:
         count = (f"Показано 6 из 12 · установлено 3 · {INSTALLED_SIZE} на диске" if domestic
                  else f"Установлено 3 из 12 · {INSTALLED_SIZE} на диске")
-    return ('<div style="display:flex;gap:8px;align-items:center;margin:0 0 12px">'
-            f'<span class="chip">{ic("globe", 13, DD)} Все языки {ic("chevd", 12, DD)}</span>'
-            f'<span class="chip{" on" if domestic else ""}">Только отечественные {tgl(domestic)}</span>'
+    # Два чипа-сегмента, выбран ровно один (реализация M6, qml/sections/Models.qml; spec §4.6, §5.6)
+    return ('<div class="fchips">'
+            f'<span class="chip seg{"" if domestic else " on"}">Все языки</span>'
+            f'<span class="chip seg{" on" if domestic else ""}">Только отечественные</span>'
             f'<span style="flex:1"></span><span class="c12">{count}</span></div>')
 
 
