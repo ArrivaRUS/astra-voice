@@ -1,0 +1,35 @@
+UID_LOOKUP 0.218 ms uid 1000 error none limit 100
+REPLY accepted none signature  sent True starts 0
+WORK_START 1 length 5 sha8 ba9c736f running 1
+WORK_DONE 1 running 0
+UID_LOOKUP 0.189 ms uid 1000 error none limit 100
+REPLY accepted none signature  sent True starts 1
+WORK_START 2 length 5 sha8 ba9c736f running 1
+WORK_DONE 2 running 0
+UID_LOOKUP 0.121 ms uid 1000 error none limit 100
+REPLY accepted none signature  sent True starts 2
+WORK_START 3 length 5 sha8 ba9c736f running 1
+WORK_DONE 3 running 0
+UID_LOOKUP 0.098 ms uid 1000 error none limit 100
+REPLY accepted none signature  sent True starts 3
+WORK_START 4 length 5 sha8 ba9c736f running 1
+WORK_DONE 4 running 0
+UID_LOOKUP 0.095 ms uid 1000 error none limit 100
+REPLY accepted none signature  sent True starts 4
+WORK_START 5 length 5 sha8 ba9c736f running 1
+WORK_DONE 5 running 0
+UID_LOOKUP 0.112 ms uid 1000 error none limit 100
+REPLY accepted none signature  sent True starts 5
+WORK_START 6 length 5 sha8 ba9c736f running 1
+WORK_DONE 6 running 0
+UID_LOOKUP 0.094 ms uid 1000 error none limit 100
+REPLY accepted none signature  sent True starts 6
+WORK_START 7 length 15 sha8 2d782fab running 1
+WORK_DONE 7 running 0
+REPLY refused invalid_options signature  sent True starts 7
+REPLY refused invalid_options signature  sent True starts 7
+REPLY refused invalid_options signature  sent True starts 7
+REPLY refused invalid_text signature  sent True starts 7
+qt.dbus.integration: QDBusConnection: couldn't handle call to Unknown, no slot matched
+qt.dbus.integration: QDBusConnection: couldn't handle call to Unknown, no slot matched
+qt.dbus.integration: Could not find slot API::Unknown

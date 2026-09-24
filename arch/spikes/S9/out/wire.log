@@ -1,0 +1,381 @@
+signal time=1790227362.374184 sender=org.freedesktop.DBus -> destination=:1.4 serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.4"
+signal time=1790227362.374208 sender=org.freedesktop.DBus -> destination=:1.4 serial=4 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.4"
+method return time=1790227362.408695 sender=org.freedesktop.DBus -> destination=:1.5 serial=1 reply_serial=1
+   string ":1.5"
+method call time=1790227362.409075 sender=:1.5 -> destination=ru.astralinux.Cowork serial=2 path=/ru/astralinux/Cowork; interface=ru.astralinux.Cowork.Command1; member=Submit
+   string "probe"
+   array [
+      dict entry(
+         string "contract"
+         variant             int32 1
+      )
+      dict entry(
+         string "deadline_mono_ms"
+         variant             int32 15167890
+      )
+      dict entry(
+         string "request_id"
+         variant             string "5d5e4de193834f05a7f1dca68f39983b"
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             int32 15167590
+      )
+      dict entry(
+         string "source"
+         variant             string "astra-voice"
+      )
+   ]
+method return time=1790227362.409398 sender=org.freedesktop.DBus -> destination=:1.1 serial=6 reply_serial=6
+   uint32 1000
+method return time=1790227362.409564 sender=:1.1 -> destination=:1.5 serial=7 reply_serial=2
+   array [
+      dict entry(
+         string "already"
+         variant             boolean false
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             int32 15167590
+      )
+      dict entry(
+         string "status"
+         variant             string "accepted"
+      )
+      dict entry(
+         string "uid"
+         variant             int32 1000
+      )
+   ]
+method call time=1790227362.409769 sender=:1.5 -> destination=ru.astralinux.Cowork serial=3 path=/ru/astralinux/Cowork; interface=ru.astralinux.Cowork.Command1; member=Submit
+   string "probe"
+   array [
+      dict entry(
+         string "contract"
+         variant             int32 1
+      )
+      dict entry(
+         string "deadline_mono_ms"
+         variant             uint32 15167890
+      )
+      dict entry(
+         string "request_id"
+         variant             string "56bc053cd68c4989af6fa6d25e551a49"
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             uint32 15167590
+      )
+      dict entry(
+         string "source"
+         variant             string "astra-voice"
+      )
+   ]
+method return time=1790227362.409933 sender=org.freedesktop.DBus -> destination=:1.1 serial=7 reply_serial=8
+   uint32 1000
+method return time=1790227362.410023 sender=:1.1 -> destination=:1.5 serial=9 reply_serial=3
+   array [
+      dict entry(
+         string "already"
+         variant             boolean false
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             int32 15167590
+      )
+      dict entry(
+         string "status"
+         variant             string "accepted"
+      )
+      dict entry(
+         string "uid"
+         variant             int32 1000
+      )
+   ]
+method call time=1790227362.410162 sender=:1.5 -> destination=ru.astralinux.Cowork serial=4 path=/ru/astralinux/Cowork; interface=ru.astralinux.Cowork.Command1; member=Submit
+   string "probe"
+   array [
+      dict entry(
+         string "contract"
+         variant             int32 1
+      )
+      dict entry(
+         string "deadline_mono_ms"
+         variant             int64 15167891
+      )
+      dict entry(
+         string "request_id"
+         variant             string "61f6acad024046238857fb79735456c0"
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             int64 15167591
+      )
+      dict entry(
+         string "source"
+         variant             string "astra-voice"
+      )
+   ]
+method return time=1790227362.410284 sender=org.freedesktop.DBus -> destination=:1.1 serial=8 reply_serial=10
+   uint32 1000
+method return time=1790227362.410365 sender=:1.1 -> destination=:1.5 serial=11 reply_serial=4
+   array [
+      dict entry(
+         string "already"
+         variant             boolean false
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             int32 15167591
+      )
+      dict entry(
+         string "status"
+         variant             string "accepted"
+      )
+      dict entry(
+         string "uid"
+         variant             int32 1000
+      )
+   ]
+method call time=1790227362.410490 sender=:1.5 -> destination=ru.astralinux.Cowork serial=5 path=/ru/astralinux/Cowork; interface=ru.astralinux.Cowork.Command1; member=Submit
+   string "probe"
+   array [
+      dict entry(
+         string "contract"
+         variant             int32 1
+      )
+      dict entry(
+         string "deadline_mono_ms"
+         variant             uint64 15167891
+      )
+      dict entry(
+         string "request_id"
+         variant             string "4a570b4a3e7246c8a6f650378b707da9"
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             uint64 15167591
+      )
+      dict entry(
+         string "source"
+         variant             string "astra-voice"
+      )
+   ]
+method return time=1790227362.410602 sender=org.freedesktop.DBus -> destination=:1.1 serial=9 reply_serial=12
+   uint32 1000
+method return time=1790227362.410677 sender=:1.1 -> destination=:1.5 serial=13 reply_serial=5
+   array [
+      dict entry(
+         string "already"
+         variant             boolean false
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             int32 15167591
+      )
+      dict entry(
+         string "status"
+         variant             string "accepted"
+      )
+      dict entry(
+         string "uid"
+         variant             int32 1000
+      )
+   ]
+method call time=1790227362.410843 sender=:1.5 -> destination=ru.astralinux.Cowork serial=6 path=/ru/astralinux/Cowork; interface=ru.astralinux.Cowork.Command1; member=Submit
+   string "probe"
+   array [
+      dict entry(
+         string "contract"
+         variant             int32 1
+      )
+      dict entry(
+         string "deadline_mono_ms"
+         variant             int32 15167891
+      )
+      dict entry(
+         string "request_id"
+         variant             string "b004889cf5ba44e4b3ef5fb2142e5589"
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             int32 15167591
+      )
+      dict entry(
+         string "source"
+         variant             string "astra-voice"
+      )
+   ]
+method return time=1790227362.410965 sender=org.freedesktop.DBus -> destination=:1.1 serial=10 reply_serial=14
+   uint32 1000
+method return time=1790227362.411051 sender=:1.1 -> destination=:1.5 serial=15 reply_serial=6
+   array [
+      dict entry(
+         string "already"
+         variant             boolean false
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             int32 15167591
+      )
+      dict entry(
+         string "status"
+         variant             string "accepted"
+      )
+      dict entry(
+         string "uid"
+         variant             int32 1000
+      )
+   ]
+method call time=1790227362.411167 sender=:1.5 -> destination=ru.astralinux.Cowork serial=7 path=/ru/astralinux/Cowork; interface=ru.astralinux.Cowork.Command1; member=Submit
+   string "probe_plain_big"
+   array [
+      dict entry(
+         string "contract"
+         variant             int32 1
+      )
+      dict entry(
+         string "deadline_mono_ms"
+         variant             uint32 2147483953
+      )
+      dict entry(
+         string "request_id"
+         variant             string "de423410bfec4358b3a55db67695f54a"
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             uint32 2147483653
+      )
+      dict entry(
+         string "source"
+         variant             string "astra-voice"
+      )
+   ]
+method return time=1790227362.411279 sender=org.freedesktop.DBus -> destination=:1.1 serial=11 reply_serial=16
+   uint32 1000
+method return time=1790227362.411353 sender=:1.1 -> destination=:1.5 serial=17 reply_serial=7
+   array [
+      dict entry(
+         string "already"
+         variant             boolean false
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             uint32 2147483653
+      )
+      dict entry(
+         string "status"
+         variant             string "accepted"
+      )
+      dict entry(
+         string "uid"
+         variant             int32 1000
+      )
+   ]
+method call time=1790227362.411472 sender=:1.5 -> destination=ru.astralinux.Cowork serial=8 path=/ru/astralinux/Cowork; interface=ru.astralinux.Cowork.Command1; member=Submit
+   string "probe_i_big"
+   array [
+      dict entry(
+         string "contract"
+         variant             int32 1
+      )
+      dict entry(
+         string "deadline_mono_ms"
+         variant             int32 -2147483343
+      )
+      dict entry(
+         string "request_id"
+         variant             string "a43dfc96d1dc43a1b9256e2c04434c53"
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             int32 -2147483643
+      )
+      dict entry(
+         string "source"
+         variant             string "astra-voice"
+      )
+   ]
+method return time=1790227362.411542 sender=:1.1 -> destination=:1.5 serial=18 reply_serial=8
+   array [
+      dict entry(
+         string "reason"
+         variant             string "invalid_options"
+      )
+      dict entry(
+         string "status"
+         variant             string "refused"
+      )
+   ]
+method call time=1790227362.411656 sender=:1.5 -> destination=ru.astralinux.Cowork serial=9 path=/ru/astralinux/Cowork; interface=ru.astralinux.Cowork.Command1; member=Submit
+   string "probe"
+   array [
+      dict entry(
+         string "contract"
+         variant             int32 1
+      )
+      dict entry(
+         string "deadline_mono_ms"
+         variant             int32 15167892
+      )
+      dict entry(
+         string "request_id"
+         variant             string "5ab4d82bcb5941028c61b34ee7965fbb"
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             boolean true
+      )
+      dict entry(
+         string "source"
+         variant             string "astra-voice"
+      )
+   ]
+method return time=1790227362.411716 sender=:1.1 -> destination=:1.5 serial=19 reply_serial=9
+   array [
+      dict entry(
+         string "reason"
+         variant             string "invalid_options"
+      )
+      dict entry(
+         string "status"
+         variant             string "refused"
+      )
+   ]
+method call time=1790227362.411811 sender=:1.5 -> destination=ru.astralinux.Cowork serial=10 path=/ru/astralinux/Cowork; interface=ru.astralinux.Cowork.Command1; member=Submit
+   string "probe"
+   array [
+      dict entry(
+         string "contract"
+         variant             int32 1
+      )
+      dict entry(
+         string "deadline_mono_ms"
+         variant             int32 15167893
+      )
+      dict entry(
+         string "request_id"
+         variant             string "b3aefab1972f4663b1b788fc970562f8"
+      )
+      dict entry(
+         string "sent_mono_ms"
+         variant             double 1.5
+      )
+      dict entry(
+         string "source"
+         variant             string "astra-voice"
+      )
+   ]
+method return time=1790227362.411870 sender=:1.1 -> destination=:1.5 serial=20 reply_serial=10
+   array [
+      dict entry(
+         string "reason"
+         variant             string "invalid_options"
+      )
+      dict entry(
+         string "status"
+         variant             string "refused"
+      )
+   ]
