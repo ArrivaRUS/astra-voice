@@ -1,0 +1,328 @@
+S9 DATE 2026-09-24 HOST astra-23876 KERNEL Linux 6.12.60-1-generic x86_64 GNU/Linux
+S9 SERVER /home/astra/Документы/Astra Cowork/astra-cowork/.venv/bin/python 3.11.2 6.7.1 6.7.1
+S9 CLIENT /home/astra/.cache/astra-voice-dev/venv-a/bin/python 3.11.2 5.15.9 5.15.8
+S9 DATE 2026-09-24 HOST astra-23876 UID 1000 ADDRESS unix:path=/tmp/dbus-SUlLDAJKa1,guid=a883676223795f555747b48a6ab4b3a2
+S9 SERVER 3.11.2 6.7.1 6.7.1
+S9 CLIENT 3.11.2 5.15.9 5.15.8
+CALL {"callbacks": 1, "elapsed_ms": 0.28, "error_name": "org.freedesktop.DBus.Error.NameHasNoOwner", "error_type": "1", "method": "Submit", "outcome": "not_running", "sent": true}
+SCENARIO 2a EXPECTED not_running RESULT not_running PASS
+SERVER basic READY pid=239385 flags=--no-limits --executor instant --echo-ints
+CALL {"callbacks": 1, "elapsed_ms": 0.299, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 0, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+SCENARIO 1a EXPECTED ready RESULT ready PASS
+CALL {"callbacks": 1, "elapsed_ms": 1.108, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "sent_mono_ms": 15167544, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+SCENARIO 1b EXPECTED accepted RESULT accepted PASS
+dbus-daemon[239373]: [session uid=1000 pid=239373 parsec= Уровень_0:Low:Нет:0x0!. Caps (eff,inh,prm) 0-0-0] Connection :1.4 (uid=1000 pid=239396 comm="dbus-monitor --session type='method_call',interfac") became a monitor.
+CALL {"callbacks": 1, "elapsed_ms": 0.622, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "sent_mono_ms": 15167590, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+SCENARIO 1c_i EXPECTED accepted RESULT accepted PASS
+CALL {"callbacks": 1, "elapsed_ms": 0.334, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "sent_mono_ms": 15167590, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+SCENARIO 1c_u EXPECTED accepted RESULT accepted PASS
+CALL {"callbacks": 1, "elapsed_ms": 0.272, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "sent_mono_ms": 15167591, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+SCENARIO 1c_x EXPECTED accepted RESULT accepted PASS
+CALL {"callbacks": 1, "elapsed_ms": 0.253, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "sent_mono_ms": 15167591, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+SCENARIO 1c_t EXPECTED accepted RESULT accepted PASS
+CALL {"callbacks": 1, "elapsed_ms": 0.317, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "sent_mono_ms": 15167591, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+SCENARIO 1c_plain EXPECTED accepted RESULT accepted PASS
+CALL {"callbacks": 1, "elapsed_ms": 0.253, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "sent_mono_ms": 2147483653, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+INT_OBSERVATION 1c_plain_big {"echoed": 2147483653, "outcome": "accepted", "reply": {"already": false, "sent_mono_ms": 2147483653, "status": "accepted", "uid": 1000}, "sent": 2147483653}
+SCENARIO 1c_plain_big EXPECTED accepted/echo=2147483653 RESULT accepted/echo=2147483653 PASS
+CALL {"callbacks": 1, "elapsed_ms": 0.133, "error_name": "", "error_type": "", "method": "Submit", "outcome": "refused", "reply": {"reason": "invalid_options", "status": "refused"}, "sent": true, "signature": "a{sv}"}
+INT_OBSERVATION 1c_i_big {"callbacks": 1, "outcome": "refused", "reply": {"reason": "invalid_options", "status": "refused"}, "sent": 2147483653}
+SCENARIO 1c_i_big EXPECTED one callback or exception RESULT one callback or exception PASS
+CALL {"callbacks": 1, "elapsed_ms": 0.122, "error_name": "", "error_type": "", "method": "Submit", "outcome": "refused", "reply": {"reason": "invalid_options", "status": "refused"}, "sent": true, "signature": "a{sv}"}
+SCENARIO 1c_bool EXPECTED refused/invalid_options RESULT refused/invalid_options PASS
+CALL {"callbacks": 1, "elapsed_ms": 0.117, "error_name": "", "error_type": "", "method": "Submit", "outcome": "refused", "reply": {"reason": "invalid_options", "status": "refused"}, "sent": true, "signature": "a{sv}"}
+SCENARIO 1c_float EXPECTED refused/invalid_options RESULT refused/invalid_options PASS
+dbus-daemon[239373]: [session uid=1000 pid=239373 parsec= Уровень_0:Low:Нет:0x0!. Caps (eff,inh,prm) 0-0-0] Monitoring connection :1.4 closed.
+WIRE 1c_plain_big sent_mono_ms=uint32 2147483653 deadline_mono_ms=uint32 2147483953
+WIRE 1c_i_big sent_mono_ms=int32 -2147483643 deadline_mono_ms=int32 -2147483343
+SCENARIO 1c_plain_big_wire EXPECTED 1 RESULT 1 PASS
+CALL {"callbacks": 1, "elapsed_ms": 0.487, "error_name": "", "error_type": "", "method": "Submit", "outcome": "refused", "reply": {"reason": "invalid_text", "status": "refused"}, "sent": true, "signature": "a{sv}"}
+SCENARIO 1d EXPECTED refused/invalid_text RESULT refused/invalid_text PASS
+CALL {"callbacks": 1, "elapsed_ms": 0.266, "error_name": "org.freedesktop.DBus.Error.UnknownInterface", "error_type": "19", "method": "Submit", "outcome": "no_contract/UnknownInterface", "sent": true}
+SCENARIO 2b EXPECTED no_contract/UnknownInterface RESULT no_contract/UnknownInterface PASS
+CALL {"callbacks": 1, "elapsed_ms": 0.653, "error_name": "org.freedesktop.DBus.Error.UnknownMethod", "error_type": "16", "method": "Unknown", "outcome": "no_contract/UnknownMethod", "sent": true}
+SCENARIO 2c EXPECTED no_contract/UnknownMethod RESULT no_contract/UnknownMethod PASS
+SERVER bad READY pid=239408 flags=--bad-reply
+CALL {"callbacks": 1, "elapsed_ms": 1.369, "error_name": "", "error_type": "", "method": "Submit", "outcome": "unknown/bad_reply", "reply": {"broken": true}, "sent": true, "signature": "a{sv}"}
+SCENARIO 2d EXPECTED unknown/bad_reply RESULT unknown/bad_reply PASS
+SERVER slow READY pid=239417 flags=--block-before-ms 600
+CALL {"callbacks": 1, "elapsed_ms": 286.668, "error_name": "org.freedesktop.DBus.Error.NoReply", "error_type": "5", "method": "Submit", "outcome": "unknown/NoReply", "sent": true}
+SCENARIO 2e EXPECTED unknown/NoReply RESULT unknown/NoReply PASS
+CALL {"callbacks": 1, "elapsed_ms": 306.567, "error_name": "org.freedesktop.DBus.Error.NoReply", "error_type": "5", "method": "Submit", "outcome": "unknown/NoReply", "sent": true}
+SCENARIO 4a EXPECTED unknown/NoReply RESULT unknown/NoReply PASS
+SCENARIO 4a_server_expired EXPECTED 2 RESULT 2 PASS
+SERVER dedup READY pid=239432 flags=--executor never
+CALL {"callbacks": 1, "elapsed_ms": 0.953, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.773, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": true, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.658, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": true, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+SCENARIO 3a EXPECTED accepted,accepted/already,accepted/already RESULT accepted,accepted/already,accepted/already PASS
+SCENARIO 3a_work EXPECTED 1 RESULT 1 PASS
+SERVER conflict READY pid=239443 flags=--executor never
+CALL {"callbacks": 1, "elapsed_ms": 0.815, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.255, "error_name": "", "error_type": "", "method": "Submit", "outcome": "refused", "reply": {"reason": "request_conflict", "status": "refused"}, "sent": true, "signature": "a{sv}"}
+SCENARIO 3b EXPECTED refused/request_conflict RESULT refused/request_conflict PASS
+SERVER rate READY pid=239452 flags=--executor never
+CALL {"callbacks": 1, "elapsed_ms": 0.867, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.278, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "rate_limited", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+SCENARIO 3c EXPECTED busy/rate_limited RESULT busy/rate_limited PASS
+SERVER queue READY pid=239461 flags=--executor never
+CALL {"callbacks": 1, "elapsed_ms": 0.95, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.783, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.782, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.692, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.182, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.035, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.716, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.812, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.04, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.791, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.209, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.176, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.164, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.934, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.177, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.99, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.193, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.192, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.051, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.757, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.672, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 2.111, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.616, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.991, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.35, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.822, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.694, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.439, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.686, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.446, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.037, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.904, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.885, "error_name": "", "error_type": "", "method": "Submit", "outcome": "busy", "reply": {"reason": "queue_full", "status": "busy"}, "sent": true, "signature": "a{sv}"}
+QUEUE_TALLY {"accepted": 3, "callbacks": 33, "queue_full": 30}
+SCENARIO 3d EXPECTED 3/30/33 RESULT 3/30/33 PASS
+SCENARIO 3d_work EXPECTED 3 RESULT 3 PASS
+SERVER quit READY pid=239523 flags=--quit-after-reply --executor never
+CALL {"callbacks": 1, "elapsed_ms": 1.106, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+OBSERVED 3e_quit outcome=accepted error=
+SCENARIO 3e_quit EXPECTED one callback; outcome observed RESULT one callback; outcome observed PASS
+SCENARIO 3e_quit_work RESULT 1 starts (observed)
+SERVER guard READY pid=239535 flags=--shutdown-after-reply --executor never
+CALL {"callbacks": 1, "elapsed_ms": 1.415, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+SCENARIO 3e_guard EXPECTED accepted RESULT accepted PASS
+SCENARIO 3e_guard_work EXPECTED 0 RESULT 0 PASS
+SCENARIO 3e_guard_skipped EXPECTED 1 RESULT 1 PASS
+SERVER exit READY pid=239548 flags=--exit-after-reply --executor never
+CALL {"callbacks": 1, "elapsed_ms": 1.046, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+OBSERVED 3e_exit outcome=accepted error=
+SCENARIO 3e_exit EXPECTED one callback; outcome observed RESULT one callback; outcome observed PASS
+SCENARIO 3e_exit_work EXPECTED 0 RESULT 0 PASS
+SERVER post READY pid=239561 flags=--block-after-reply-ms 600 --executor instant
+CALL {"callbacks": 1, "elapsed_ms": 1.209, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+SCENARIO 4b EXPECTED accepted RESULT accepted PASS
+SERVER measure READY pid=239571 flags=--no-limits --executor instant
+CALL {"callbacks": 1, "elapsed_ms": 0.865, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.594, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.347, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.21, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.198, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.197, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.195, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.221, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.201, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.196, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.186, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.192, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.184, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.185, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.182, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.2, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.192, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.184, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.189, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.181, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.215, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.183, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.182, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.184, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.206, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.191, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.193, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.238, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.226, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.368, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.062, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.329, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.307, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.265, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.284, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.253, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.249, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.241, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.239, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.241, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.244, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.242, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.255, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.239, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.31, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.276, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.254, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.288, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.265, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.249, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.242, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.243, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 1.063, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.269, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.252, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.249, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.243, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.25, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.262, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.244, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.239, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.235, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.242, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.262, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.243, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.243, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.243, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.234, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.235, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.238, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.238, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.245, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.25, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.237, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.231, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.239, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.334, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.313, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.32, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.286, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.4, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.449, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.372, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.325, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.258, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.214, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.194, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.192, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.192, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.202, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.193, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.204, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.189, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.185, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.194, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.186, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.182, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.18, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.386, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.293, "error_name": "", "error_type": "", "method": "Submit", "outcome": "accepted", "reply": {"already": false, "status": "accepted", "uid": 1000}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.114, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.1, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.099, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.097, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.097, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.104, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.105, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.097, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.093, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.105, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.098, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.097, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.115, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.114, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.103, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.123, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.115, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.113, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.114, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.119, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.113, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.13, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.113, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.134, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.145, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.13, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.115, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.109, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.106, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.113, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.099, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.095, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.096, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.093, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.093, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.093, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.092, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.094, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.092, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.093, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+CALL {"callbacks": 1, "elapsed_ms": 0.092, "error_name": "", "error_type": "", "method": "Status", "outcome": "ready", "reply": {"contract": 1, "running": 0, "starts": 100, "state": "ready"}, "sent": true, "signature": "a{sv}"}
+MEASURE Submit {"n": 100, "p50_ms": 0.24, "p95_ms": 0.402, "max_ms": 1.063}
+MEASURE Status {"n": 100, "p50_ms": 0.095, "p95_ms": 0.119, "max_ms": 0.145}
+SCENARIO 5 EXPECTED 100+100 callbacks RESULT 100+100 callbacks PASS
+MEASURE GetConnectionUnixUser n 100 p50_ms 0.086 p95_ms 0.142
+SUMMARY PASS rc=0
