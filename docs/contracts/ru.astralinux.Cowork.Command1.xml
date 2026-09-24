@@ -1,0 +1,21 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!--
+  Astra Cowork — интерфейс приёма внешней команды (Astra Voice → Astra Cowork).
+  Контракт 1, зафиксирован 2026-09-24 (K0). Описание: astra-cowork-command1.md.
+  Имя на шине сеанса: ru.astralinux.Cowork; объект: /ru/astralinux/Cowork.
+  Стандартные интерфейсы (Introspectable, Peer, Properties) добавляет Qt — здесь не перечислены.
+  Сигналов и свойств у интерфейса нет. Значения словарей a{sv} — в описании, §4–§6.
+-->
+<node name="/ru/astralinux/Cowork">
+  <interface name="ru.astralinux.Cowork.Command1">
+    <method name="Status">
+      <arg name="info" type="a{sv}" direction="out"/>
+    </method>
+    <method name="Submit">
+      <arg name="text" type="s" direction="in"/>
+      <arg name="options" type="a{sv}" direction="in"/>
+      <arg name="reply" type="a{sv}" direction="out"/>
+    </method>
+  </interface>
+</node>

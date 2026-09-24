@@ -2,7 +2,7 @@
 
 > Источник правды по сборке. Собран по скиллу `execution-pack` (P13) после принятого синтеза архитектуры.
 > Доски/issues — зеркала, не канон. Статусы инспектируемые: `[ ]` не начато · `[~]` в работе · `[x]` сделано.
-> **Обновлено:** 2026-09-09 · architect-claude (Fable 5.1) · приёмка — Юрка. Правки — узкими диффами, аудит в `status.md`.
+> **Обновлено:** 2026-09-09 · architect-claude (Fable 5.1) · приёмка — Юрка; 2026-09-24 — K0 контракт Cowork (US-2.10: K0/C0/S9 в v0.2, реализация режима в M10). Правки — узкими диффами, аудит в `status.md`.
 
 ## Source
 - Task: голосовой ввод для ALSE 1.8 (KDE Plasma 5.27 ∥ родной Fly, X11): хоткей → речь → текст в активном окне; каталог моделей с честными цифрами, обновления модели и утилиты из GUI, автозапуск; один `.deb`.
@@ -11,6 +11,7 @@
 - Security: `docs/threat-model.md` (T1 ✅; §4 ответы; **§5 требования по вехам = обязательные критерии DoD**; §6 T-01…T-36 → `docs/test-plan.md`).
 - Design: `design/spec.md` 0.2 · `design/tokens.json` 2.1.1 · `design/refs/*.png` (карта «экран → референс» — спека §14).
 - Decisions: `decisions/log.md` — 2026-09-09 «Архитектура принята; допуски на спайки», «G4 закрыт», «Fly-сессия: адаптеры», «KDE и родной Fly»; 2026-09-08 G3/У1–У14/цифры/токены; 2026-09-07 G1/G2a/рамки/лицензия.
+- Contract (US-2.10, K0 2026-09-24): `docs/contracts/astra-cowork-command1.md` + `ru.astralinux.Cowork.Command1.xml` + `astra-cowork-command1-vectors.json` (канон — репо Cowork `docs/contracts/`, здесь зеркало байт в байт, sha256 в шапке md) ← `arch/plan-synth-cowork-contract.md` v2 (суд двух планов + челлендж GPT-6 Astra) ← `arch/plan-claude-cowork-contract.md`, `arch/plan-codex-cowork-contract.md`. Решение заказчика 24.09: K0 + C0 + S9 — v0.2, реализация режима — v1.0 (M10); В-1…В-4 открыты.
 - Repo area: `ArrivaRUS/astra-voice` (`main`); структура §7.1 плана #1 — `src/astra_voice/{app.py,core,platform,ui,worker,models,net,updates,security,helper,diag,tools}`, `qml/`, `data/`, `packaging/`, `scripts/`, `tools/`, `tests/{unit,integration,e2e}`, `docs/`. Кода в репо пока нет.
 - Last updated: 2026-09-09.
 
@@ -72,11 +73,11 @@ paplay --device=av_test data/test/test-ru-6s.wav
 | M5 | Онбординг и первая модель | M4 | v0.1 | [~] `0.1.0~m5` собран 16.09, ждёт живой проверки |
 | R1 | **Релиз v0.1 «Диктовка работает» — 30.09** (⛔ G5) | M5 | v0.1 | [ ] |
 | M6 | Каталог (+T1 §5 M6) | R1 | v0.2 | [ ] |
-| M7 | Сеть и проверки (+T1 §5 M7) | M6 | v0.2 | [ ] |
+| M7 | Сеть и проверки (+T1 §5 M7; K0 контракт Cowork + T1/T2, C0) | M6 | v0.2 | [ ] |
 | M8 | Обновлятор, трек A (+T1 §5 M8, T2) | M7, S2 | v0.2 | [ ] |
-| M9 | Автозапуск, уведомления, звуки, разделы, живая тема KDE/Fly | M4, M7 (M8 не блокирует) | v0.2 | [ ] |
+| M9 | Автозапуск, уведомления, звуки, разделы, живая тема KDE/Fly (+ S9 спайк D-Bus Voice↔Cowork) | M4, M7 (M8 не блокирует) | v0.2 | [ ] |
 | R2 | **Релиз v0.2 — 15.10** (⛔ T3 до тега, ⛔ G5, P21½ в обеих сессиях) | M8, M9 | v0.2 | [ ] |
-| M10 | Корпоративный контур, трек B, Fly-адаптеры (S17) | R2 | v1.0 | [ ] |
+| M10 | Корпоративный контур, трек B, Fly-адаптеры (S17), US-2.10 «Команда помощнику» по контракту K0 | R2, K0+S9 (v0.2), C0/C1–C6 в Cowork | v1.0 | [ ] |
 | M11 | Полировка (i18n en+fr, французская модель, У13, отладка, DesignReviewer 24×2, soak) | M10 | v1.0 | [ ] |
 | R3 | **Релиз v1.0 — 31.10** (⛔ G5) | M11 | v1.0 | [ ] |
 | v1.1 | ГОСТ-подпись 3 `.so` + ВМ с ЗПС (Ц5) · user-bundle C1 | R3 | v1.1 | [ ] |
@@ -435,8 +436,11 @@ xvfb-run -a pytest -m xvfb tests/ui/test_model_card_states.py -q   # 20 × 2 →
 - [ ] Манифест с `catalog_url` той же частотой + анти-откат M6; «Новое» ≤ 30 дней; «снята с каталога» (US-6.3).
 - [ ] Раздел «Сеть и обновления» — референс `04-network.png` (+`-dark`): три тумблера (US-10.1), офлайн-режим (перекрывает оба, скрывает «Скачать» с сети), URL каталога/обновлений, «Проверить сейчас», «Обновить из файла…» (действие — M8), «Доверенные ключи → Импортировать trust.json» (действие — M8); трей «Проверить обновления» активно всегда, кроме офлайн/policy (Р9).
 - [ ] CLI: `tools/validate model-updates`, `tools/validate privacy --network-denied` (полный), `tools/validate updater --check-only`.
+- [~] **K0 контракт Voice↔Cowork** (US-2.10; решение заказчика 24.09 — контракт в v0.2): `docs/contracts/astra-cowork-command1.md` + `ru.astralinux.Cowork.Command1.xml` + `astra-cowork-command1-vectors.json` по `arch/plan-synth-cowork-contract.md` v2 — канон в репо Cowork `docs/contracts/`, здесь зеркало байт в байт (sha256 XML/JSON в шапке md); документы готовы 24.09 (architect-claude); **готово после T1/T2 security-analyst** (после 24.09 15:43; вход — контракт §10, синтез §1/§1а/§6); уточнения K0 сверх синтеза — контракт §16, на подтверждение Юрке; вопросы В-1…В-4 — заказчику до реализации (контракт §15).
+- [~] **C0 чистка журналов Cowork** (предпосылка контракта, blocker; работа в репо Cowork, ветка `wip/c0-log-hygiene`): текст запросов и ошибок не попадает в журналы INFO и DEBUG (три `preview`, заголовки диалогов, границы HTTP/SSE/decision, pydantic, SQLAlchemy, `task_pool`, `service`), процессор чёрного списка приватных полей в `core/logging.py`, тест контрольной фразой на DEBUG; здесь — только отметка готовности (условие старта C1 в v1.0).
 ### Definition of Done
 - S6-A1…A3, S8-A1…A4/A6/A7 зелёные; `tcpdump` за сессию — только хосты `PRIVACY.md`, в офлайне — 0 (Ц4); GUI готов ≤ 1,5 с без сети, модалок нет; T-16, T-19, T-23, T-26, T-36 зелёные; скриншоты 17 состояний = референс.
+- K0: три файла контракта лежат в `docs/contracts/` обоих репо и совпадают по sha256; T1/T2 security-analyst по контракту без blocker; C0 закрыт в Cowork (контрольная фраза не найдена в журналах на DEBUG).
 ### Validation
 ```sh
 pytest -m unit tests/net tests/updates/test_checker.py tests/core/test_policy.py -q
@@ -501,6 +505,7 @@ XDG-автозапуск + экран O5; D-Bus-уведомления с кно
 - [ ] `core/theme.py` `ThemeSource` FLY: `~/.fly/paletterc` (`ColorScheme` `*Dark*`/`*Light*`, иначе яркость `BackgroundColor`) + watcher на `paletterc` и `current.themerc`; настройка «Тема: авто / светлая / тёмная»; живая смена ≤ 2 с в KDE; во Fly — ≤ 2 с либо подсказка «перезапустить» (S13, S17-A7); палитру Qt не читаем + unit фикстуры AstraLight/AstraDark/generated.
 - [ ] Старт `--hidden` ≤ 1,5 с до трея (монитор влияния Fly), аудио не открывается (`wpctl status` без потока), модель грузится в фоне после трея.
 - [ ] CLI: `tools/validate autostart`, `tools/validate e2e --suite v0.2 --session kde|fly`.
+- [ ] **S9 спайк D-Bus Voice↔Cowork** (US-2.10; решение заказчика 24.09 — в v0.2; `arch/spikes/S9.md`; песочница `dbus-run-session`, без рабочего сеанса и файлов пользователя; developer): PyQt6-сервер (`QDBusAbstractAdaptor` + `pyqtClassInfo` + `ExportAdaptors`, служебный `QDBusMessage`, отложенный ответ, асинхронный `GetConnectionUnixUser`) ↔ PyQt5-клиент (сырой `QDBusMessage`, `setAutoStartService(False)`, `callWithCallback` 300 мс): `a{sv}` в обе стороны, целые `i/u/x/t`, отказ `b/d`, `NoReply` при задержке 600 мс, `ServiceUnknown` после остановки, ровно один терминальный callback при позднем ответе, сохранение `error.name()`; допуск/дедуп/очередь на заглушке исполнителя (вектора A-04…A-08, A-17, A-28 из `docs/contracts/astra-cowork-command1-vectors.json`); задержка главного цикла до/после `accepted` (A-29, A-30) и передача работы в GUI очередью сигналов; итог — замеры и go/no-go по формам QtDBus контракта §5 (при no-go — запасной приёмник в рабочем потоке, синтез §4).
 ### Definition of Done
 - S11-A1…A4, S12-A1…A3, S13-A1/A2, F13-acceptance зелёные **в обеих сессиях**; после перелогина (KDE и Fly) — трей есть, окно не открыто, аудио не открыто; во Fly пункт виден в `fly-admin-autostart`; T-28 зелёный; уведомление с кнопкой приходит через Plasma и `fly-notifications`, при убитом владельце шины — баннер ≤ 1 с; скриншоты разделов 03/05/06 × 2 темы = референсы (DesignReviewer PASS).
 ### Validation
@@ -528,8 +533,8 @@ Fly-модуль «Уведомления» убивает владельца ш
 
 ## M10. Корпоративный контур, трек B, Fly-адаптеры `[ ]` — v1.0
 ### Goal
-`policy.conf` с замками, «только отечественные», корпоративный URL + `catalog_pubkey` + `latest.json`, трек B + детект ЗПС + вопрос, `INSTALL-ADMIN.md`, документ для админа ИБ, SBOM, NOTICE/PRIVACY/дисклеймер; S17 A1–A9 во Fly зелёные.
-### Tasks (US-10.2, 9.4, 5.9, 10.3, 7.3, 7.4, 10.6, 12.4, 10.7, 8.5-часть 2; компоненты `core/policy.py`, `models/catalog.py`, `updates/track.py`, `qml/sections/*`, документы; синтез §7 Д2; T1 У14, У16, У31, У37, У38)
+`policy.conf` с замками, «только отечественные», корпоративный URL + `catalog_pubkey` + `latest.json`, трек B + детект ЗПС + вопрос, `INSTALL-ADMIN.md`, документ для админа ИБ, SBOM, NOTICE/PRIVACY/дисклеймер; S17 A1–A9 во Fly зелёные; режим «Команда помощнику Astra Cowork» (US-2.10) по зафиксированному контракту K0 — S18 A1–A13 в KDE и Fly.
+### Tasks (US-10.2, 9.4, 5.9, 10.3, 7.3, 7.4, 10.6, 12.4, 10.7, 8.5-часть 2, **2.10**; компоненты `core/policy.py`, `models/catalog.py`, `updates/track.py`, `qml/sections/*`, документы; синтез §7 Д2; T1 У14, У16, У31, У37, У38)
 - [ ] `policy.conf` полный: `profile/offline/catalog_url/updates_url/updates/zps/domestic_only/autostart_default/catalog_pubkey/insecure_http/ca_bundle`; `profile=secure` ⇒ производные; замки «Задано администратором» на всех зависимых строках (US-9.4); `examples/policy.conf` в `/usr/share/doc`.
 - [ ] Фильтр «только отечественные» (6 моделей; автоматически в secure) (US-5.9) — референс `02-models-catalog.png` (замки).
 - [ ] Корпоративный каталог (US-10.3): `catalog_url` + `Verifier(catalog)` с `catalog_pubkey` (keyring root-owned под `/etc/astra-voice/`), `sources[].type=corp` относительно `corp_base` (Д2), без публичного fallback (У38); `latest.json` с `updates_url` (F9); перекрёстная подпись → `purpose mismatch` (T-31); `tools/catalog_cli.py` (P2, если дёшево).
@@ -538,8 +543,9 @@ Fly-модуль «Уведомления» убивает владельца ш
 - [ ] Fly-адаптеры — закрытие списка §13.2 плана #1 (US-8.5 часть 2): полный прогон S17-A1…A9 во Fly, фиксы по расхождениям из R1/R2-чеков (`TrayIconProvider`, пилюля/анимации, `fly-term`, клип-менеджер, polkit-агент Fly S17-A5, автозапуск S17-A6, тема S17-A7, буфер S17-A8).
 - [ ] S16: `apt remove`/`purge` не трогает `$HOME`; подсказка «Удалить модели и настройки» с путями в «О программе».
 - [ ] CLI: `tools/validate policy --matrix`, `tools/validate corporate --no-public-egress`, `tools/validate e2e --suite s17 --session fly`.
+- [ ] **US-2.10 «Команда помощнику Astra Cowork»** (решение заказчика 24.09: контракт в v0.2, реализация в v1.0; ⛔ В-1…В-4 к утверждению перед стартом) — по синтезу `arch/plan-synth-cowork-contract.md` v2 и контракту `docs/contracts/astra-cowork-command1.md` (+ `ru.astralinux.Cowork.Command1.xml`, `astra-cowork-command1-vectors.json`; канон — репо Cowork): **V1** `platform/cowork.py` (L0/L1, проверка адреса шины `unix:`, клиент в рабочем потоке с сырым `QDBusMessage`, исходы `delivered/undelivered/unknown` по контракту §8, действие «Запустить Astra Cowork» только при отсутствии владельца) ∥ **V3** `core/command_mode.py` + `command_hotkey` fail-closed (вкл. `PolicyStatus.INVALID`, неверный тип, алиасы) ∥ **V7** `platform/session_state.py` (login1 по системной шине: блокировка + сон, кеш, «неизвестно = нет допуска») → **V2** роли клавиш в `HotkeyManager`, одиночная `Super_L`, сторож захвата на всё время записи со снятием на всех исходах (спайк **S7** — живой пробник на `:0` только с «ок» заказчика) → **V4** фаза `DELIVERING` в `DictationOrchestrator` (гейты блокировки/сна, три исхода, буфер по результату `publish_clipboard()`, последняя фраза в памяти, статистика `delivered/undelivered/unknown` + `deliver_reason`) → **V5** пилюля (состояния «команда», «недоступен», «неизвестно», «не скопировано» — тексты контракта §11)/трей/мост/`General.qml`/`Step3Hotkey.qml` → **V6** `tools/validate cowork` (детект, шина, фейковый сервер из XML и векторов, privacy-кейс «команда») + PRIVACY + `docs/test-plan.md` S18. Сторона Cowork **C1–C6** — в репо Cowork (сервер раньше клиента; V1/V3 параллельно против фейкового сервера). **K5** живая приёмка на машине заказчика (KDE и Fly, с «ок»): одна шина у GUI и юнита, evdev-комбинации Cowork при записи, блокировка/сон, буфер после выхода, перезапуск демона, `tcpdump` 20 команд, контрольная фраза в журналах обеих сторон. Оценка после челленджа Astra: **13,25 дн.** агента на обе программы (Voice 6,0 с S7 · Cowork 4,5 · общее 2,75, из них K0/S9/C0 — уже в v0.2); прежняя оценка беклога **3,5** (только Voice, без Cowork) не действует.
 ### Definition of Done
-- S10-A1…A4, S16, S17-A1…A9, F14/F15-acceptance зелёные; `profile=secure` → 0 соединений и 6 карточек; корпоративный манифест на локальном HTTPS с `catalog_pubkey`: модель скачивается и становится активной; T-17, T-19, T-25 (secure), T-31 зелёные; документы в пакете.
+- S18-A1…A13 (KDE и Fly) и K5 зелёные, `tools/validate cowork` зелёный, контрактный тест sha256 зеркала зелёный; S10-A1…A4, S16, S17-A1…A9, F14/F15-acceptance зелёные; `profile=secure` → 0 соединений и 6 карточек; корпоративный манифест на локальном HTTPS с `catalog_pubkey`: модель скачивается и становится активной; T-17, T-19, T-25 (secure), T-31 зелёные; документы в пакете.
 ### Validation
 ```sh
 pytest -m unit tests/core/test_policy.py tests/updates/test_track.py tests/security/test_purpose.py -q

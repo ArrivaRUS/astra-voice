@@ -1,0 +1,1872 @@
+{
+  "title": "Тестовые векторы контракта Astra Voice ↔ Astra Cowork (ru.astralinux.Cowork.Command1)",
+  "contract": 1,
+  "fixed": "2026-09-24",
+  "bus_name": "ru.astralinux.Cowork",
+  "object_path": "/ru/astralinux/Cowork",
+  "interface": "ru.astralinux.Cowork.Command1",
+  "spec": "astra-cowork-command1.md",
+  "conventions": {
+    "typed_value": "объект {\"$dbus\": <сигнатура>, \"value\": …} задаёт тип D-Bus явно (i/u/x/t/d/b/s); обычное число JSON — целое, тип по умолчанию у биндинга (сервер обязан принять i/u/x/t); true/false — тип b; строка — s",
+    "text_gen": "{\"repeat\": <строка>, \"count\": N} — строка, повторённая N раз; {\"concat\": [<элементы>]} — конкатенация элементов (строка или repeat); используется для длинных текстов",
+    "length": "длина текста — число кодовых точек Unicode (Python len(str)); не байты и не единицы UTF-16",
+    "forbidden_chars": "U+0000–U+001F, U+007F–U+009F (включая U+0085), U+2028, U+2029; пустота после strip; длина 1…4000",
+    "defaults": "если в векторе нет text — берётся base.text; если нет now_mono_ms — base.now_mono_ms; options_vectors проверяются с валидным текстом, text_vectors — с валидными options; отправитель — тот же UID; сервер готов, сеанс разблокирован, сна не было, окно rate limit закрыто, незавершённых допусков 0",
+    "admission_state": "поля state описывают предусловие на стороне сервера (для заглушки исполнителя и тестов C1/S9); значения — по описанию §7 спецификации",
+    "nul": "U+0000 в строках D-Bus недопустим — сообщение не уйдёт с клиента (libdbus отвергает); на сервер не попадает, вектора нет; Voice удаляет C0 до отправки"
+  },
+  "base": {
+    "now_mono_ms": 5000000,
+    "text": "открой папку загрузки",
+    "options": {
+      "source": "astra-voice",
+      "contract": 1,
+      "request_id": "0123456789abcdef0123456789abcdef",
+      "sent_mono_ms": 5000000,
+      "deadline_mono_ms": 5000300
+    }
+  },
+  "text_vectors": [
+    {
+      "id": "T-01",
+      "name": "обычная команда",
+      "text": "открой папку загрузки",
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "T-02",
+      "name": "пустая строка",
+      "text": "",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-03",
+      "name": "только пробелы (пусто после strip)",
+      "text": "   ",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-04",
+      "name": "ровно 4000 кодовых точек (кириллица, 8000 байт UTF-8)",
+      "text_gen": {
+        "repeat": "а",
+        "count": 4000
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "T-05",
+      "name": "4001 кодовая точка",
+      "text_gen": {
+        "repeat": "а",
+        "count": 4001
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-06",
+      "name": "табуляция U+0009 (C0)",
+      "text": "открой\tпапку",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-07",
+      "name": "U+0001 (C0)",
+      "text": "открой\u0001папку",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-08",
+      "name": "CR U+000D",
+      "text": "открой\rпапку",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-09",
+      "name": "LF U+000A",
+      "text": "открой\nпапку",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-10",
+      "name": "LINE SEPARATOR U+2028",
+      "text": "открой папку",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-11",
+      "name": "PARAGRAPH SEPARATOR U+2029",
+      "text": "открой папку",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-12",
+      "name": "NEL U+0085 (C1)",
+      "text": "откройпапку",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-13",
+      "name": "DEL U+007F",
+      "text": "откройпапку",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-14",
+      "name": "U+009F (C1)",
+      "text": "откройпапку",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-15",
+      "name": "пробелы по краям — сервер не исправляет, передаёт как есть",
+      "text": " открой папку ",
+      "expect": {
+        "status": "accepted",
+        "text_passed_as_is": true
+      }
+    },
+    {
+      "id": "T-16",
+      "name": "двойной пробел внутри — как есть",
+      "text": "открой  папку",
+      "expect": {
+        "status": "accepted",
+        "text_passed_as_is": true
+      }
+    },
+    {
+      "id": "T-17",
+      "name": "2001 × U+1F642 — считаем кодовые точки, не единицы UTF-16 (4002) и не байты",
+      "text_gen": {
+        "repeat": "🙂",
+        "count": 2001
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "T-18",
+      "name": "неразрывный пробел U+00A0 — допустим",
+      "text": "открой папку загрузки",
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "T-19",
+      "name": "латиница, цифры, знаки",
+      "text": "Open the Downloads folder, please! 123 ?",
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "T-20",
+      "name": "4000 пробелов — длина в норме, но пусто после strip",
+      "text_gen": {
+        "repeat": " ",
+        "count": 4000
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-21",
+      "name": "3999 символов + LF — управляющий символ важнее длины",
+      "text_gen": {
+        "concat": [
+          {
+            "repeat": "а",
+            "count": 3999
+          },
+          "\n"
+        ]
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    }
+  ],
+  "options_vectors": [
+    {
+      "id": "O-01",
+      "name": "минимальный валидный набор",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-02",
+      "name": "с необязательными mode и client_version",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300,
+        "mode": "submit",
+        "client_version": "0.2.0"
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-03",
+      "name": "неизвестный ключ игнорируется",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300,
+        "future_key": "x"
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-04",
+      "name": "нет source",
+      "options": {
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-05",
+      "name": "нет contract",
+      "options": {
+        "source": "astra-voice",
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-06",
+      "name": "нет request_id",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-07",
+      "name": "нет sent_mono_ms",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-08",
+      "name": "нет deadline_mono_ms",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-09",
+      "name": "пустой словарь",
+      "options": {},
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-10",
+      "name": "source с подчёркиванием",
+      "options": {
+        "source": "astra_voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "bad_source"
+      }
+    },
+    {
+      "id": "O-11",
+      "name": "source пустая строка",
+      "options": {
+        "source": "",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "bad_source"
+      }
+    },
+    {
+      "id": "O-12",
+      "name": "source не строка",
+      "options": {
+        "source": 1,
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-13",
+      "name": "contract 2 — новее сервера",
+      "options": {
+        "source": "astra-voice",
+        "contract": 2,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "unsupported_contract",
+        "reply_contract": 1
+      }
+    },
+    {
+      "id": "O-14",
+      "name": "contract 0",
+      "options": {
+        "source": "astra-voice",
+        "contract": 0,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-15",
+      "name": "contract строкой",
+      "options": {
+        "source": "astra-voice",
+        "contract": "1",
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-16",
+      "name": "contract bool",
+      "options": {
+        "source": "astra-voice",
+        "contract": true,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-17",
+      "name": "contract double",
+      "options": {
+        "source": "astra-voice",
+        "contract": {
+          "$dbus": "d",
+          "value": 1.0
+        },
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-18",
+      "name": "contract как x (int64)",
+      "options": {
+        "source": "astra-voice",
+        "contract": {
+          "$dbus": "x",
+          "value": 1
+        },
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-19",
+      "name": "contract как u (uint32)",
+      "options": {
+        "source": "astra-voice",
+        "contract": {
+          "$dbus": "u",
+          "value": 1
+        },
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-20",
+      "name": "contract как t (uint64)",
+      "options": {
+        "source": "astra-voice",
+        "contract": {
+          "$dbus": "t",
+          "value": 1
+        },
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-21",
+      "name": "request_id в верхнем регистре",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789ABCDEF0123456789ABCDEF",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-22",
+      "name": "request_id с дефисами (36 символов)",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "01234567-89ab-cdef-0123-456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-23",
+      "name": "request_id 31 символ",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcde",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-24",
+      "name": "request_id пустой",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-25",
+      "name": "request_id не строка",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": 42,
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-26",
+      "name": "sent_mono_ms double",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": {
+          "$dbus": "d",
+          "value": 5000000.0
+        },
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-27",
+      "name": "sent_mono_ms bool",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": true,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-28",
+      "name": "sent_mono_ms строкой",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": "5000000",
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-29",
+      "name": "sent_mono_ms отрицательный",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": {
+          "$dbus": "i",
+          "value": -1
+        },
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-30",
+      "name": "deadline раньше sent",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 4999999
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-31",
+      "name": "окно deadline−sent = 5001 мс (больше потолка 5000)",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5005001
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-32",
+      "name": "окно ровно 5000 мс — допустимо",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5005000
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-33",
+      "name": "deadline = sent, now = deadline — допуск (истечение только при now > deadline)",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000000
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-34",
+      "name": "большие значения x/t (> 2^32): now задан отдельно",
+      "now_mono_ms": 5000000000,
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": {
+          "$dbus": "x",
+          "value": 5000000000
+        },
+        "deadline_mono_ms": {
+          "$dbus": "t",
+          "value": 5000000300
+        }
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-35",
+      "name": "sent/deadline как i и u",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": {
+          "$dbus": "i",
+          "value": 5000000
+        },
+        "deadline_mono_ms": {
+          "$dbus": "u",
+          "value": 5000300
+        }
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-36",
+      "name": "mode draft при modes=[submit] (v1.0)",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300,
+        "mode": "draft"
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "bad_mode",
+        "note": "если сервер объявляет draft в Status.modes — accepted с открытием формы"
+      }
+    },
+    {
+      "id": "O-37",
+      "name": "mode в верхнем регистре",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300,
+        "mode": "SUBMIT"
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "bad_mode"
+      }
+    },
+    {
+      "id": "O-38",
+      "name": "mode не строка",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300,
+        "mode": 1
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-39",
+      "name": "client_version не строка",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300,
+        "client_version": 1
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-40",
+      "name": "client_version с тильдой (deb-версия)",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300,
+        "client_version": "0.2.0~m9.1"
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "O-41",
+      "name": "client_version вне безопасного шаблона — принимается, но в журнал не пишется",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300,
+        "client_version": "0.2.0 (тест)\u0001"
+      },
+      "expect": {
+        "status": "accepted",
+        "client_version_logged": false
+      }
+    },
+    {
+      "id": "O-42",
+      "name": "порядок: options невалидны и текст невалиден → invalid_options",
+      "text": "",
+      "options": {
+        "source": "astra-voice",
+        "contract": 1,
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_options"
+      }
+    },
+    {
+      "id": "O-43",
+      "name": "порядок: contract 2 и текст пустой → invalid_text (текст раньше версии)",
+      "text": "",
+      "options": {
+        "source": "astra-voice",
+        "contract": 2,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "O-44",
+      "name": "порядок: source и mode негодные → bad_source",
+      "options": {
+        "source": "x",
+        "contract": 1,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300,
+        "mode": "y"
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "bad_source"
+      }
+    },
+    {
+      "id": "O-45",
+      "name": "порядок: contract 2 и source негодный → unsupported_contract",
+      "options": {
+        "source": "x",
+        "contract": 2,
+        "request_id": "0123456789abcdef0123456789abcdef",
+        "sent_mono_ms": 5000000,
+        "deadline_mono_ms": 5000300
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "unsupported_contract"
+      }
+    }
+  ],
+  "admission_vectors": [
+    {
+      "id": "A-01",
+      "name": "отправитель — другой UID",
+      "state": {
+        "sender_uid": "other"
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "unverified_sender"
+      }
+    },
+    {
+      "id": "A-02",
+      "name": "GetConnectionUnixUser не ответил в срок",
+      "state": {
+        "sender_uid": "timeout"
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "unverified_sender"
+      }
+    },
+    {
+      "id": "A-03",
+      "name": "GetConnectionUnixUser вернул ошибку",
+      "state": {
+        "sender_uid": "error"
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "unverified_sender"
+      }
+    },
+    {
+      "id": "A-04",
+      "name": "повтор принятого ID через 100 мс, тот же текст и mode",
+      "state": {
+        "accepted_before_ms": 100,
+        "same_payload": true
+      },
+      "expect": {
+        "status": "accepted",
+        "duplicate": true,
+        "new_task": false,
+        "rate_window_touched": false
+      }
+    },
+    {
+      "id": "A-05",
+      "name": "повтор принятого ID через 350 мс (deadline прошёл) — дедуп раньше deadline",
+      "state": {
+        "accepted_before_ms": 350,
+        "same_payload": true
+      },
+      "expect": {
+        "status": "accepted",
+        "duplicate": true,
+        "new_task": false
+      }
+    },
+    {
+      "id": "A-06",
+      "name": "тот же ID, другой текст",
+      "state": {
+        "accepted_before_ms": 100,
+        "same_payload": false,
+        "diff": "text"
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "request_conflict"
+      }
+    },
+    {
+      "id": "A-07",
+      "name": "тот же ID, тот же текст, другой mode",
+      "state": {
+        "accepted_before_ms": 100,
+        "same_payload": false,
+        "diff": "mode"
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "request_conflict"
+      }
+    },
+    {
+      "id": "A-08",
+      "name": "повтор ID после терминального исхода + 61 с — запись дедупа удалена, ID считается новым",
+      "state": {
+        "accepted_before_ms": 61000,
+        "terminal_before_ms": 61000,
+        "same_payload": true
+      },
+      "expect": {
+        "status": "accepted",
+        "duplicate": false,
+        "new_task": true
+      }
+    },
+    {
+      "id": "A-09",
+      "name": "now = deadline + 1",
+      "state": {
+        "now_mono_ms": 5000301
+      },
+      "expect": {
+        "status": "expired",
+        "reason": "deadline"
+      }
+    },
+    {
+      "id": "A-10",
+      "name": "запрос отправлен до последнего сна (sent ≤ sleep_start_mono)",
+      "state": {
+        "sleep_start_mono_ms": 5000010
+      },
+      "expect": {
+        "status": "expired",
+        "reason": "suspended"
+      }
+    },
+    {
+      "id": "A-11",
+      "name": "демон завершается (begin_shutdown)",
+      "state": {
+        "shutting_down": true
+      },
+      "expect": {
+        "status": "busy",
+        "reason": "shutting_down"
+      }
+    },
+    {
+      "id": "A-12",
+      "name": "между PrepareForSleep(true) и (false)",
+      "state": {
+        "suspending": true
+      },
+      "expect": {
+        "status": "busy",
+        "reason": "suspending"
+      }
+    },
+    {
+      "id": "A-13",
+      "name": "сеанс заблокирован",
+      "state": {
+        "session": "locked"
+      },
+      "expect": {
+        "status": "busy",
+        "reason": "locked"
+      }
+    },
+    {
+      "id": "A-14",
+      "name": "состояние сеанса неизвестно (login1 недоступен)",
+      "state": {
+        "session": "unknown"
+      },
+      "expect": {
+        "status": "busy",
+        "reason": "locked"
+      }
+    },
+    {
+      "id": "A-15",
+      "name": "предыдущий новый ID принят 400 мс назад",
+      "state": {
+        "last_new_accept_before_ms": 400
+      },
+      "expect": {
+        "status": "busy",
+        "reason": "rate_limited"
+      }
+    },
+    {
+      "id": "A-16",
+      "name": "предыдущий новый ID принят 500 мс назад — окно закрыто",
+      "state": {
+        "last_new_accept_before_ms": 500
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "A-17",
+      "name": "три незавершённых допуска — четвёртый",
+      "state": {
+        "pending": 3
+      },
+      "expect": {
+        "status": "busy",
+        "reason": "queue_full"
+      }
+    },
+    {
+      "id": "A-18",
+      "name": "после терминального исхода одной из трёх — место свободно",
+      "state": {
+        "pending": 2
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "A-19",
+      "name": "оркестратора нет",
+      "state": {
+        "orchestrator": null
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "not_ready"
+      }
+    },
+    {
+      "id": "A-20",
+      "name": "приём выключен настройкой/политикой Cowork",
+      "state": {
+        "accept_voice": false
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "policy_disabled"
+      }
+    },
+    {
+      "id": "A-21",
+      "name": "старшинство: deadline истёк и сеанс заблокирован → deadline",
+      "state": {
+        "now_mono_ms": 5000301,
+        "session": "locked"
+      },
+      "expect": {
+        "status": "expired",
+        "reason": "deadline"
+      }
+    },
+    {
+      "id": "A-22",
+      "name": "старшинство: завершение и блокировка → shutting_down",
+      "state": {
+        "shutting_down": true,
+        "session": "locked"
+      },
+      "expect": {
+        "status": "busy",
+        "reason": "shutting_down"
+      }
+    },
+    {
+      "id": "A-23",
+      "name": "старшинство: блокировка и rate limit → locked",
+      "state": {
+        "session": "locked",
+        "last_new_accept_before_ms": 100
+      },
+      "expect": {
+        "status": "busy",
+        "reason": "locked"
+      }
+    },
+    {
+      "id": "A-24",
+      "name": "старшинство: очередь полна и приём выключен → queue_full",
+      "state": {
+        "pending": 3,
+        "accept_voice": false
+      },
+      "expect": {
+        "status": "busy",
+        "reason": "queue_full"
+      }
+    },
+    {
+      "id": "A-25",
+      "name": "старшинство: другой UID и deadline истёк → unverified_sender (отправитель раньше допуска)",
+      "state": {
+        "sender_uid": "other",
+        "now_mono_ms": 5000301
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "unverified_sender"
+      }
+    },
+    {
+      "id": "A-26",
+      "name": "исключение в работе после accepted — место освобождено, уведомление Cowork, журнал без текста",
+      "state": {
+        "work_raises": true
+      },
+      "expect": {
+        "status": "accepted",
+        "place_freed": true,
+        "cowork_notification": "Не удалось принять голосовую команду",
+        "log_contains_text": false
+      }
+    },
+    {
+      "id": "A-27",
+      "name": "принят, затем блокировка сеанса — исполняется, новых допусков нет",
+      "state": {
+        "lock_after_accept": true
+      },
+      "expect": {
+        "status": "accepted",
+        "executed": true,
+        "next_new_submit": {
+          "status": "busy",
+          "reason": "locked"
+        }
+      }
+    },
+    {
+      "id": "A-28",
+      "name": "S9-3: 33 разных ID с шагом 500 мс при незавершающемся исполнителе",
+      "state": {
+        "executor": "never_finishes",
+        "sequence": {
+          "count": 33,
+          "step_ms": 500
+        }
+      },
+      "expect": {
+        "accepted": 3,
+        "busy_queue_full": 30
+      }
+    },
+    {
+      "id": "A-29",
+      "name": "S9-4: главный цикл занят 600 мс до обработки Submit",
+      "state": {
+        "loop_busy_ms_before": 600
+      },
+      "expect": {
+        "status": "expired",
+        "reason": "deadline",
+        "client_outcome": {
+          "kind": "unknown",
+          "reason": "timeout"
+        }
+      }
+    },
+    {
+      "id": "A-30",
+      "name": "S9-4: главный цикл занят 600 мс после формирования accepted",
+      "state": {
+        "loop_busy_ms_after_accept": 600
+      },
+      "expect": {
+        "status": "accepted",
+        "client_outcome": {
+          "kind": "unknown",
+          "reason": "timeout"
+        },
+        "tasks_started": 1
+      }
+    },
+    {
+      "id": "A-31",
+      "name": "остановка демона между ответом accepted и callback",
+      "state": {
+        "stop_between_reply_and_callback": true
+      },
+      "expect": {
+        "status": "accepted",
+        "tasks_started": 0,
+        "place_freed": true
+      }
+    }
+  ],
+  "client_outcome_vectors": [
+    {
+      "id": "C-01",
+      "name": "ответ status=accepted",
+      "input": {
+        "reply": {
+          "status": "accepted",
+          "request_id": "0123456789abcdef0123456789abcdef",
+          "contract": 1
+        }
+      },
+      "expect": {
+        "kind": "delivered",
+        "reason": "none",
+        "clipboard": "untouched"
+      }
+    },
+    {
+      "id": "C-02",
+      "name": "ответ status=busy (любая причина)",
+      "input": {
+        "reply": {
+          "status": "busy",
+          "reason": "rate_limited",
+          "request_id": "0123456789abcdef0123456789abcdef",
+          "contract": 1
+        }
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "busy",
+        "clipboard": "publish"
+      }
+    },
+    {
+      "id": "C-03",
+      "name": "ответ status=refused",
+      "input": {
+        "reply": {
+          "status": "refused",
+          "reason": "invalid_text",
+          "request_id": "0123456789abcdef0123456789abcdef",
+          "contract": 1
+        }
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "refused",
+        "clipboard": "publish"
+      }
+    },
+    {
+      "id": "C-04",
+      "name": "ответ status=expired",
+      "input": {
+        "reply": {
+          "status": "expired",
+          "reason": "deadline",
+          "request_id": "0123456789abcdef0123456789abcdef",
+          "contract": 1
+        }
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "expired",
+        "clipboard": "publish"
+      }
+    },
+    {
+      "id": "C-05",
+      "name": "ответ busy с незнакомой причиной — причина не в закрытом списке клиента, статус понятен",
+      "input": {
+        "reply": {
+          "status": "busy",
+          "reason": "future_reason",
+          "request_id": "0123456789abcdef0123456789abcdef",
+          "contract": 1
+        }
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "busy"
+      }
+    },
+    {
+      "id": "C-06",
+      "name": "неизвестный status",
+      "input": {
+        "reply": {
+          "status": "queued",
+          "request_id": "0123456789abcdef0123456789abcdef",
+          "contract": 1
+        }
+      },
+      "expect": {
+        "kind": "unknown",
+        "reason": "bad_reply",
+        "clipboard": "publish"
+      }
+    },
+    {
+      "id": "C-07",
+      "name": "ответ без status",
+      "input": {
+        "reply": {
+          "request_id": "0123456789abcdef0123456789abcdef"
+        }
+      },
+      "expect": {
+        "kind": "unknown",
+        "reason": "bad_reply"
+      }
+    },
+    {
+      "id": "C-08",
+      "name": "ответ не a{sv} (например, строка)",
+      "input": {
+        "reply_signature": "s"
+      },
+      "expect": {
+        "kind": "unknown",
+        "reason": "bad_reply"
+      }
+    },
+    {
+      "id": "C-09",
+      "name": "accepted с чужим request_id",
+      "input": {
+        "reply": {
+          "status": "accepted",
+          "request_id": "ffffffffffffffffffffffffffffffff",
+          "contract": 1
+        }
+      },
+      "expect": {
+        "kind": "unknown",
+        "reason": "bad_reply"
+      }
+    },
+    {
+      "id": "C-10",
+      "name": "ошибка org.freedesktop.DBus.Error.NoReply",
+      "input": {
+        "error_name": "org.freedesktop.DBus.Error.NoReply"
+      },
+      "expect": {
+        "kind": "unknown",
+        "reason": "timeout"
+      }
+    },
+    {
+      "id": "C-11",
+      "name": "ошибка org.freedesktop.DBus.Error.Timeout / TimedOut",
+      "input": {
+        "error_name": "org.freedesktop.DBus.Error.Timeout"
+      },
+      "expect": {
+        "kind": "unknown",
+        "reason": "timeout"
+      }
+    },
+    {
+      "id": "C-12",
+      "name": "ошибка org.freedesktop.DBus.Error.Disconnected после отправки",
+      "input": {
+        "error_name": "org.freedesktop.DBus.Error.Disconnected",
+        "sent": true
+      },
+      "expect": {
+        "kind": "unknown",
+        "reason": "disconnected"
+      }
+    },
+    {
+      "id": "C-13",
+      "name": "ошибка Disconnected до отправки (соединение не поднялось)",
+      "input": {
+        "error_name": "org.freedesktop.DBus.Error.Disconnected",
+        "sent": false
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "no_bus"
+      }
+    },
+    {
+      "id": "C-14",
+      "name": "ошибка org.freedesktop.DBus.Error.ServiceUnknown",
+      "input": {
+        "error_name": "org.freedesktop.DBus.Error.ServiceUnknown"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "not_running",
+        "offer_launch": true
+      }
+    },
+    {
+      "id": "C-15",
+      "name": "ошибка org.freedesktop.DBus.Error.NameHasNoOwner",
+      "input": {
+        "error_name": "org.freedesktop.DBus.Error.NameHasNoOwner"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "not_running",
+        "offer_launch": true
+      }
+    },
+    {
+      "id": "C-16",
+      "name": "ошибка UnknownInterface / UnknownMethod / UnknownObject — старый Cowork",
+      "input": {
+        "error_name": "org.freedesktop.DBus.Error.UnknownInterface"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "no_contract"
+      }
+    },
+    {
+      "id": "C-17",
+      "name": "ошибка InvalidArgs / InvalidSignature — ответ-ошибка от Qt/сервера",
+      "input": {
+        "error_name": "org.freedesktop.DBus.Error.InvalidArgs"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "refused",
+        "error_name_logged": true
+      }
+    },
+    {
+      "id": "C-18",
+      "name": "любая другая ошибка-ответ (AccessDenied, LimitsExceeded, Failed…)",
+      "input": {
+        "error_name": "org.freedesktop.DBus.Error.AccessDenied"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "refused",
+        "error_name_logged": true
+      }
+    },
+    {
+      "id": "C-19",
+      "name": "у имени нет владельца до отправки (L1) — вызова нет",
+      "input": {
+        "pre": "no_owner"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "not_running",
+        "call_made": false,
+        "offer_launch": true
+      }
+    },
+    {
+      "id": "C-20",
+      "name": "адрес шины не unix: (tcp:/autolaunch:) — вызова нет",
+      "input": {
+        "pre": "bus_unsupported"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "no_bus",
+        "call_made": false
+      }
+    },
+    {
+      "id": "C-21",
+      "name": "адрес не передан и нет $XDG_RUNTIME_DIR/bus — вызова нет",
+      "input": {
+        "pre": "address_not_passed"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "no_bus",
+        "call_made": false
+      }
+    },
+    {
+      "id": "C-22",
+      "name": "сеанс заблокирован или неизвестен в момент доставки — вызова нет, буфер не трогаем, уведомления нет",
+      "input": {
+        "pre": "session_locked_or_unknown"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "locked",
+        "call_made": false,
+        "clipboard": "untouched",
+        "notification": false,
+        "phrase_kept_in_memory": true
+      }
+    },
+    {
+      "id": "C-23",
+      "name": "PrepareForSleep(true) до отправки",
+      "input": {
+        "pre": "sleep_before_send"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "suspended",
+        "call_made": false
+      }
+    },
+    {
+      "id": "C-24",
+      "name": "PrepareForSleep(true) после отправки; поздний ответ после resume отброшен",
+      "input": {
+        "pre": "sleep_after_send"
+      },
+      "expect": {
+        "kind": "unknown",
+        "reason": "suspended",
+        "late_reply_ignored": true
+      }
+    },
+    {
+      "id": "C-25",
+      "name": "остаток бюджета ≤ 0 перед вызовом — вызова нет",
+      "input": {
+        "pre": "budget_exhausted"
+      },
+      "expect": {
+        "kind": "undelivered",
+        "reason": "timeout",
+        "call_made": false
+      }
+    },
+    {
+      "id": "C-26",
+      "name": "смена владельца имени во время вызова, затем NoReply",
+      "input": {
+        "error_name": "org.freedesktop.DBus.Error.NoReply",
+        "owner_changed_during_call": true
+      },
+      "expect": {
+        "kind": "unknown",
+        "reason": "timeout",
+        "retry": false
+      }
+    },
+    {
+      "id": "C-27",
+      "name": "перезапуск демона до отправки — доставка новому владельцу",
+      "input": {
+        "pre": "owner_changed_before_send"
+      },
+      "expect": {
+        "kind": "delivered",
+        "reason": "none"
+      }
+    },
+    {
+      "id": "C-28",
+      "name": "ровно один терминальный callback при позднем ответе после таймаута",
+      "input": {
+        "error_name": "org.freedesktop.DBus.Error.NoReply",
+        "late_reply_after_timeout": true
+      },
+      "expect": {
+        "kind": "unknown",
+        "reason": "timeout",
+        "terminal_callbacks": 1
+      }
+    },
+    {
+      "id": "C-29",
+      "name": "не доставлено, публикация в буфер не удалась",
+      "input": {
+        "reply": {
+          "status": "busy",
+          "reason": "locked"
+        },
+        "publish_clipboard": false
+      },
+      "expect": {
+        "kind": "undelivered",
+        "stats_deliver_reason": "clipboard_failed",
+        "pill": "Помощник недоступен — не удалось скопировать текст",
+        "phrase_kept_in_memory": true
+      }
+    },
+    {
+      "id": "C-30",
+      "name": "Cowork не установлен (L0) — режим не регистрируется, доставки нет",
+      "input": {
+        "pre": "not_installed"
+      },
+      "expect": {
+        "mode_registered": false,
+        "settings_line": "Astra Cowork не установлен"
+      }
+    }
+  ],
+  "status_vectors": [
+    {
+      "id": "S-01",
+      "name": "штатно",
+      "state": {},
+      "expect": {
+        "contract": 1,
+        "state": "ready",
+        "modes": [
+          "submit"
+        ],
+        "version": "<версия Cowork, строка>"
+      }
+    },
+    {
+      "id": "S-02",
+      "name": "сеанс заблокирован или неизвестен",
+      "state": {
+        "session": "locked"
+      },
+      "expect": {
+        "state": "locked"
+      }
+    },
+    {
+      "id": "S-03",
+      "name": "демон завершается",
+      "state": {
+        "shutting_down": true
+      },
+      "expect": {
+        "state": "shutting_down"
+      }
+    },
+    {
+      "id": "S-04",
+      "name": "окно сна",
+      "state": {
+        "suspending": true
+      },
+      "expect": {
+        "state": "suspending"
+      }
+    },
+    {
+      "id": "S-05",
+      "name": "приём выключен",
+      "state": {
+        "accept_voice": false
+      },
+      "expect": {
+        "state": "disabled"
+      }
+    },
+    {
+      "id": "S-06",
+      "name": "оркестратора нет",
+      "state": {
+        "orchestrator": null
+      },
+      "expect": {
+        "state": "not_ready"
+      }
+    },
+    {
+      "id": "S-07",
+      "name": "старшинство: shutting_down > suspending > locked > not_ready > disabled > ready",
+      "state": {
+        "suspending": true,
+        "session": "locked"
+      },
+      "expect": {
+        "state": "suspending"
+      }
+    },
+    {
+      "id": "S-08",
+      "name": "Status от другого UID — отвечает (проверки UID нет)",
+      "state": {
+        "sender_uid": "other"
+      },
+      "expect": {
+        "answered": true
+      }
+    },
+    {
+      "id": "S-09",
+      "name": "Status без побочных эффектов: окно rate limit и дедуп не меняются",
+      "state": {},
+      "expect": {
+        "side_effects": false
+      }
+    },
+    {
+      "id": "S-10",
+      "name": "Status отвечает ≤ 50 мс при свободном цикле",
+      "state": {},
+      "expect": {
+        "reply_within_ms": 50
+      }
+    }
+  ],
+  "introspection_vectors": [
+    {
+      "id": "I-01",
+      "name": "Introspect объекта содержит интерфейс ru.astralinux.Cowork.Command1 с методами и аргументами XML (сравнение нормализованное: имя метода → список (direction, type))",
+      "expect": {
+        "interface": "ru.astralinux.Cowork.Command1",
+        "methods": {
+          "Status": [
+            [
+              "out",
+              "a{sv}"
+            ]
+          ],
+          "Submit": [
+            [
+              "in",
+              "s"
+            ],
+            [
+              "in",
+              "a{sv}"
+            ],
+            [
+              "out",
+              "a{sv}"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "id": "I-02",
+      "name": "у интерфейса нет сигналов и свойств",
+      "expect": {
+        "signals": [],
+        "properties": []
+      }
+    },
+    {
+      "id": "I-03",
+      "name": "служебный аргумент QDBusMessage не виден в интроспекции",
+      "expect": {
+        "Submit_in_args": 2
+      }
+    },
+    {
+      "id": "I-04",
+      "name": "зеркало: sha256 XML и JSON в Voice = sha256 в Cowork (дрейф ловится на CI)",
+      "expect": {
+        "mirror_equal": true
+      }
+    },
+    {
+      "id": "I-05",
+      "name": "имя ru.astralinux.Cowork зарегистрировано после инициализации демона и снято при выходе; объект регистрируется раньше имени",
+      "expect": {
+        "name_after_object": true,
+        "unregistered_on_quit": true
+      }
+    }
+  ]
+}
