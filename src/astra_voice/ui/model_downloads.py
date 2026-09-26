@@ -17,6 +17,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -38,7 +39,7 @@ from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
 from astra_voice.models import catalog_state
-from astra_voice.models.catalog import CatalogEntry, load_builtin, measured_rtfx, merge_measurement
+from astra_voice.models.catalog import CatalogEntry, load_builtin, merge_measurement
 from astra_voice.models.downloader import Downloader, DownloadError, Progress
 from astra_voice.models.installer import (
     Installer,
@@ -53,13 +54,14 @@ from astra_voice.net.http import HttpClient, NetworkError
 from astra_voice.security.verify import Verifier
 from astra_voice.ui.formatting import (
     SpeedTracker,
+    _shown,
     clean_display_name,
+    format_accuracy,
     format_eta,
     format_rtfx,
     format_size,
     format_space,
     format_speed,
-    format_wer,
 )
 
 log = logging.getLogger(__name__)
@@ -104,8 +106,24 @@ _SAFE_MODEL_MESSAGES = frozenset(
 )
 _PUNCTUATION_TAG = "с пунктуацией"
 _DOMESTIC_TAG = "отечественная"
-_QUALITY_LABEL = "Качество"
+_QUALITY_LABEL = "Точность"
 _SPEED_LABEL = "Скорость"
+# design/tokens.json: component.model-card.scale.quality-good/quality-fair,
+# speed-good/speed-fair. Константы не загружают файл дизайна в рантайме.
+_QUALITY_GOOD, _QUALITY_FAIR = 92.0, 88.0
+_SPEED_GOOD, _SPEED_FAIR = 20.0, 5.0
+_VENDOR_SHORT_FALLBACK = {
+    "Сбер (GigaChat Team)": "Сбер",
+    "Т-Банк (T-Tech)": "Т-Банк",
+    "Alpha Cephei": "Alpha Cephei",
+    "OpenAI": "OpenAI",
+    "NVIDIA": "NVIDIA",
+}
+
+
+def _vendor_short(entry: Any) -> str:
+    full = getattr(entry, "vendor", "")
+    return getattr(entry, "vendor_short", "") or _VENDOR_SHORT_FALLBACK.get(full, full)
 
 
 def _metric(entry: Any, name: str) -> Any | None:
@@ -113,7 +131,18 @@ def _metric(entry: Any, name: str) -> Any | None:
     return getattr(getattr(entry, "metrics", None), name, None)
 
 
-def _metric_row(kind: str, label: str, text: str, fill: float) -> dict[str, Any]:
+def _level(kind: str, shown: Decimal) -> str:
+    """Уровень по числу, округлённому как видимая подпись метрики."""
+    good = _QUALITY_GOOD if kind == "quality" else _SPEED_GOOD
+    fair = _QUALITY_FAIR if kind == "quality" else _SPEED_FAIR
+    if shown >= Decimal(str(good)):
+        return "good"
+    if shown >= Decimal(str(fair)):
+        return "fair"
+    return "weak"
+
+
+def _metric_row(kind: str, label: str, text: str, fill: float, shown: Decimal) -> dict[str, Any]:
     """Строка полоски карточки; measured — признак замера на этом компьютере."""
     return {
         "kind": kind,
@@ -121,12 +150,13 @@ def _metric_row(kind: str, label: str, text: str, fill: float) -> dict[str, Any]
         "text": text,
         "fill": max(0.0, min(1.0, fill)),
         "hasData": bool(text),
+        "level": _level(kind, shown) if text else "",
         "measured": False,
     }
 
 
 def entry_tags(entry: Any) -> list[str]:
-    """Готовые подписи карточки: язык, пунктуация, лицензия с вендором, происхождение."""
+    """Готовые подписи карточки: язык, пунктуация, лицензия, происхождение."""
     tags: list[str] = []
     language_tag = getattr(entry, "language_tag", "")
     if language_tag:
@@ -134,72 +164,77 @@ def entry_tags(entry: Any) -> list[str]:
     if getattr(entry, "punctuation", False):
         tags.append(_PUNCTUATION_TAG)
     license_name = getattr(entry, "license", "")
-    vendor_short = getattr(entry, "vendor_short", "")
-    if license_name and vendor_short:
-        tags.append(f"{license_name} · {vendor_short}")
-    elif license_name or vendor_short:
-        tags.append(license_name or vendor_short)
+    if license_name:
+        tags.append(license_name)
     if getattr(entry, "domestic", False):
         tags.append(_DOMESTIC_TAG)
     return tags
 
 
-def entry_metrics(entry: Any, best_wer: float, best_rtfx: float) -> list[dict[str, Any]]:
-    """Качество и скорость записи; доля заливки — относительно лучшего в каталоге."""
+def entry_metrics(entry: Any, best_rtfx: float) -> list[dict[str, Any]]:
+    """Точность от ста процентов, скорость относительно лучшей в каталоге."""
     wer = _metric(entry, "wer_ru")
     rtfx = _metric(entry, "rtfx")
     wer_value = getattr(wer, "value", 0.0) if wer is not None else 0.0
     rtfx_value = getattr(rtfx, "value", 0.0) if rtfx is not None else 0.0
+    quality_shown = _shown(Decimal(100) - Decimal(str(wer_value)))
+    speed_shown = _shown(rtfx_value)
     rows = [
         _metric_row(
             "quality",
             _QUALITY_LABEL,
-            format_wer(wer_value) if wer_value > 0 else "",
-            best_wer / wer_value if wer_value > 0 and best_wer > 0 else 0.0,
+            format_accuracy(wer_value, shown=quality_shown) if wer_value > 0 else "",
+            (100 - wer_value) / 100 if wer_value > 0 else 0.0,
+            quality_shown,
         ),
         _metric_row(
             "speed",
             _SPEED_LABEL,
-            format_rtfx(rtfx_value) if rtfx_value > 0 else "",
+            format_rtfx(rtfx_value, shown=speed_shown) if rtfx_value > 0 else "",
             rtfx_value / best_rtfx if rtfx_value > 0 and best_rtfx > 0 else 0.0,
+            speed_shown,
         ),
     ]
     return rows
 
 
-def _card_speed_text(entry: Any, measurements: dict[str, Any], threads: int, published: str) -> str:
-    local = measurements.get(f"{entry.id}@{entry.revision}")
-    if isinstance(local, dict) and local.get("threads") == threads:
-        speed = measured_rtfx(local)
-        if speed is not None:
-            return format_rtfx(speed)
-    return published
+def _card_metrics(entry: Any, best_rtfx: float, merged: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = entry_metrics(entry, best_rtfx)
+    speed = merged["measuredRtfx"]
+    if speed is not None:
+        speed_shown = _shown(speed)
+        rows[1] = _metric_row(
+            "speed",
+            _SPEED_LABEL,
+            format_rtfx(speed, shown=speed_shown),
+            speed / max(best_rtfx, speed),
+            speed_shown,
+        )
+        rows[1]["measured"] = True
+    return rows
 
 
-def _card_memory(entry: Any, measurements: dict[str, Any], threads: int) -> dict[str, Any]:
-    merged = merge_measurement(entry, measurements, threads)
+def _card_memory(entry: Any, merged: dict[str, Any]) -> dict[str, Any]:
     if entry.removed_from_catalog:
         ram_mb = merged["ramMb"] if merged["ramMeasured"] else 0
         return {
-            **merged,
             "ramMb": ram_mb,
+            "ramMeasured": merged["ramMeasured"],
             "ramText": format_size(ram_mb * 1_000_000) if ram_mb else "",
         }
     return {
-        **merged,
-        "ramText": format_size(entry.min_ram_mb * 1_000_000) if entry.min_ram_mb else "",
+        "ramMb": merged["ramMb"],
+        "ramMeasured": merged["ramMeasured"],
+        "ramText": format_size(merged["ramMb"] * 1_000_000) if merged["ramMb"] else "",
     }
 
 
-def catalog_best(entries: Iterable[Any]) -> tuple[float, float]:
-    """Лучшие цифры каталога: наименьший WER и наибольшая скорость."""
-    wer_values = [
-        value for entry in entries if (value := getattr(_metric(entry, "wer_ru"), "value", 0.0)) > 0
-    ]
+def catalog_best(entries: Iterable[Any]) -> float:
+    """Наибольшая опубликованная скорость каталога для шкалы карточки."""
     rtfx_values = [
         value for entry in entries if (value := getattr(_metric(entry, "rtfx"), "value", 0.0)) > 0
     ]
-    return (min(wer_values) if wer_values else 0.0, max(rtfx_values) if rtfx_values else 0.0)
+    return max(rtfx_values) if rtfx_values else 0.0
 
 
 # После таймаута поток и задание должны оставаться живы до выхода run().
@@ -1084,7 +1119,7 @@ class ModelDownloads(QObject):
 
     @property
     def models(self) -> list[dict[str, Any]]:
-        best_wer, best_rtfx = catalog_best(self._entries)
+        best_rtfx = catalog_best(self._entries)
         if self._measurements_cache is None:
             try:
                 self._measurements_cache = read_measurements(paths.measurements_path())
@@ -1107,13 +1142,7 @@ class ModelDownloads(QObject):
                 "recommended": entry.recommended,
                 "sizeBytes": entry.size_bytes,
                 "sizeText": format_size(entry.size_bytes),
-                **_card_memory(entry, measurements, threads),
-                "speedText": _card_speed_text(
-                    entry,
-                    measurements,
-                    threads,
-                    entry_metrics(entry, best_wer, best_rtfx)[1]["text"],
-                ),
+                **_card_memory(entry, merged := merge_measurement(entry, measurements, threads)),
                 "selected": entry.id in self._selected,
                 "badge": self._badge(entry, installed),
                 "state": (state := self._card_state(entry, installed)),
@@ -1121,12 +1150,13 @@ class ModelDownloads(QObject):
                 **self._card_extras(entry, installed, total),
                 "progress": self._card_progress.get(entry.id, 0.0),
                 "vendor": getattr(entry, "vendor", ""),
+                "vendorShort": _vendor_short(entry),
                 "domestic": bool(getattr(entry, "domestic", False)),
                 "updateAvailable": not entry.removed_from_catalog
                 and self._update_available(entry, installed),
                 "canReinstall": not entry.removed_from_catalog,
                 "tags": entry_tags(entry),
-                "metrics": entry_metrics(entry, best_wer, best_rtfx),
+                "metrics": _card_metrics(entry, best_rtfx, merged),
             }
             for entry in self._entries
             if not entry.removed_from_catalog or self._badge(entry, installed)
@@ -1157,7 +1187,7 @@ class ModelDownloads(QObject):
         )
         total = f"Установлено {len(entries)} из {visible}"
         size = sum(entry.size_bytes for entry in entries)
-        # Цифра каталога — та же, что в строке «Занимает места» каждой карточки.
+        # Цифра каталога — та же, что в нижней строке каждой карточки.
         return f"{total} · {format_size(size)} на диске" if size else total
 
     def _selected_downloads(self) -> tuple[Any, ...]:

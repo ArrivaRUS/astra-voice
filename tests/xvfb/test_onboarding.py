@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 from collections.abc import Callable, Iterator
+from decimal import Decimal
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
@@ -34,7 +36,7 @@ from PyQt5.QtCore import (
     pyqtSlot,
     qInstallMessageHandler,
 )
-from PyQt5.QtGui import QImage
+from PyQt5.QtGui import QColor, QImage
 from PyQt5.QtQml import QQmlApplicationEngine, QQmlComponent
 from PyQt5.QtQuick import QQuickView, QQuickWindow
 from PyQt5.QtTest import QTest
@@ -48,13 +50,49 @@ REPO = Path(__file__).resolve().parents[2]
 SNAPSHOTS = REPO / Path(
     os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING") or "design/refs/impl/onboarding"
 )
-WIDTH, HEIGHT = 900, 588
+WIDTH, HEIGHT = 1024, 620
+
+
+def theme_number(name: str) -> float:
+    source = (REPO / "qml/Theme.qml").read_text()
+    match = re.search(rf"readonly property (?:real|int) {name}: ([0-9.]+)", source)
+    assert match is not None, name
+    return float(match[1])
+
+
+def theme_color(name: str, dark: bool) -> QColor:
+    source = (REPO / "qml/Theme.qml").read_text()
+    match = re.search(rf"readonly property color {name}: ([^\n]+)", source)
+    assert match is not None, name
+    value = match[1]
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", value):
+        return theme_color(value, dark)
+    colors = re.fullmatch(r'dark \? "(#[0-9A-Fa-f]+)" : "(#[0-9A-Fa-f]+)"', value)
+    assert colors is not None, (name, value)
+    return QColor(colors[1 if dark else 2])
+
+
 MODEL_STATES = (
     "available",
+    "new",
+    "low-ram",
+    "not-recommended",
+    "no-network",
+    "offline-user",
+    "policy",
+    "no-benchmark",
     "queued",
     "downloading",
     "verifying",
+    "sha-failed",
     "installed",
+    "switching",
+    "custom",
+    "broken",
+    "corrupted",
+    "update-available",
+    "updating",
+    "update-failed",
     "removed-from-catalog",
     "failed",
     "no-space",
@@ -130,9 +168,6 @@ class FakeOnboarding(QObject):
                 "ramText": "768 МБ",
                 "ramMb": 768,
                 "ramMeasured": False,
-                "speedKind": "benchmark",
-                "speedValue": 0.916,
-                "qualityValue": 0.896,
                 "selected": False,
                 "badge": "",
                 "state": "available",
@@ -144,16 +179,18 @@ class FakeOnboarding(QObject):
                 "canReinstall": True,
                 "progress": 0.0,
                 "vendor": "Сбер (GigaChat Team)",
+                "vendorShort": "Сбер",
                 "domestic": True,
                 "updateAvailable": False,
-                "tags": ["Только русский", "с пунктуацией", "MIT · Сбер", "отечественная"],
+                "tags": ["Только русский", "с пунктуацией", "MIT", "отечественная"],
                 "metrics": [
                     {
                         "kind": "quality",
-                        "label": "Качество",
-                        "text": "WER 7,60 %",
-                        "fill": 0.58,
+                        "label": "Точность",
+                        "text": "92,4 %",
+                        "fill": 0.924,
                         "hasData": True,
+                        "level": "good",
                         "measured": False,
                     },
                     {
@@ -162,6 +199,7 @@ class FakeOnboarding(QObject):
                         "text": "42,5× быстрее речи",
                         "fill": 0.51,
                         "hasData": True,
+                        "level": "good",
                         "measured": False,
                     },
                 ],
@@ -176,7 +214,7 @@ class FakeOnboarding(QObject):
         self._downloadProgress: float = 0.0
         self._downloadTitle: str = ""
         self._downloadDetail: str = ""
-        self._freeSpaceText: str = ""
+        self._freeSpaceText: str = "свободно на диске 42,1 ГБ"
         self._speed: str = "5,2 МБ/с"
         self._eta: str = "осталось ~3 мин"
         self._hotkey: str = "Ctrl + Space"
@@ -695,9 +733,6 @@ class FakeSettings(QObject):
                 "ramText": "768 МБ",
                 "ramMb": 768,
                 "ramMeasured": False,
-                "speedKind": "benchmark",
-                "speedValue": 0.916,
-                "qualityValue": 0.896,
                 "selected": True,
                 "badge": "active",
                 "state": "installed",
@@ -709,16 +744,18 @@ class FakeSettings(QObject):
                 "canReinstall": True,
                 "progress": 0.0,
                 "vendor": "Сбер (GigaChat Team)",
+                "vendorShort": "Сбер",
                 "domestic": True,
                 "updateAvailable": False,
-                "tags": ["Только русский", "с пунктуацией", "MIT · Сбер", "отечественная"],
+                "tags": ["Только русский", "с пунктуацией", "MIT", "отечественная"],
                 "metrics": [
                     {
                         "kind": "quality",
-                        "label": "Качество",
-                        "text": "WER 7,60 %",
-                        "fill": 0.58,
+                        "label": "Точность",
+                        "text": "92,4 %",
+                        "fill": 0.924,
                         "hasData": True,
+                        "level": "good",
                         "measured": False,
                     },
                     {
@@ -727,6 +764,7 @@ class FakeSettings(QObject):
                         "text": "42,5× быстрее речи",
                         "fill": 0.51,
                         "hasData": True,
+                        "level": "good",
                         "measured": False,
                     },
                 ],
@@ -742,9 +780,6 @@ class FakeSettings(QObject):
                 "ramText": "300 МБ",
                 "ramMb": 300,
                 "ramMeasured": False,
-                "speedKind": "benchmark",
-                "speedValue": 0.798,
-                "qualityValue": 0.937,
                 "selected": False,
                 "badge": "",
                 "state": "available",
@@ -756,21 +791,23 @@ class FakeSettings(QObject):
                 "canReinstall": True,
                 "progress": 0.0,
                 "vendor": "Т-Банк",
+                "vendorShort": "Т-Банк",
                 "domestic": True,
                 "updateAvailable": False,
                 "tags": [
                     "Только русский",
                     "без пунктуации",
-                    "Apache-2.0 · Т-Банк",
+                    "Apache-2.0",
                     "отечественная",
                 ],
                 "metrics": [
                     {
                         "kind": "quality",
-                        "label": "Качество",
-                        "text": "WER 6,57 %",
-                        "fill": 0.67,
+                        "label": "Точность",
+                        "text": "93,4 %",
+                        "fill": 0.9343,
                         "hasData": True,
+                        "level": "good",
                         "measured": False,
                     },
                     {
@@ -779,6 +816,7 @@ class FakeSettings(QObject):
                         "text": "26,3× быстрее речи",
                         "fill": 0.31,
                         "hasData": True,
+                        "level": "good",
                         "measured": False,
                     },
                 ],
@@ -1834,9 +1872,411 @@ def test_snapshots_are_deterministic(
 def test_model_card_states_render(state: str, onboarding_app: Any) -> None:
     fake = FakeOnboarding()
     fake.step = 2
-    fake.models = [{**fake.models[0], "state": state}, *fake.models[1:]]
-    _, messages = render_onboarding(onboarding_app, fake, False)
+    installed = state in {
+        "installed",
+        "switching",
+        "custom",
+        "broken",
+        "corrupted",
+        "update-available",
+        "updating",
+        "update-failed",
+        "removed-from-catalog",
+    }
+    fake.models = [
+        {**fake.models[0], "state": state, "badge": "installed" if installed else ""},
+        *fake.models[1:],
+    ]
+
+    def inspect(root: Any) -> None:
+        card = next(item for item in visual_tree(root) if item.property("modelId"))
+        expected = (
+            "blocked"
+            if state in {"no-space", "no-network", "offline-user", "policy"}
+            else "locked"
+            if installed or state in {"queued", "downloading", "verifying"}
+            else "off"
+        )
+        assert card.property("selectionMark") == expected
+        alert = next(item for item in visual_tree(card) if item.objectName() == "messageAlert")
+        message = next(item for item in visual_tree(card) if item.objectName() == "messageText")
+        error_states = {"failed", "sha-failed", "no-space", "broken", "corrupted", "update-failed"}
+        neutral_states = {"no-network", "offline-user", "policy"}
+        hint_states = {"low-ram", "not-recommended", "no-benchmark"}
+        assert alert.isVisible() == (state in error_states)
+        assert message.isVisible() == (state in error_states | neutral_states)
+        assert card.property("showHint") == (state in hint_states)
+        if state in error_states:
+            assert alert.property("name") == "alert"
+            assert message.property("color") == alert.property("color")
+        if state in error_states | neutral_states:
+            assert message.property("text") in visible_texts(card)
+        expected_buttons = {
+            "queued": {"Отмена"},
+            "downloading": {"Отмена"},
+            "failed": {"Повторить"},
+            "sha-failed": {"Повторить"},
+            "no-space": {"Открыть папку моделей"},
+        }.get(state, set())
+        buttons = {
+            item.property("text")
+            for item in visual_tree(card)
+            if item.isVisible() and item.metaObject().indexOfSignal(b"clicked()") >= 0
+        }
+        assert buttons == expected_buttons
+        if state == "sha-failed":
+            assert visible_button(card, "Повторить").isEnabled()
+            assert card.property("detailsActionAvailable") is False
+        if state in {"updating", "update-failed"}:
+            assert card.property("updateActionsAvailable") is False
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
     assert_no_messages(messages, f"models[0].state={state}")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Не удалось удалить модель. Попробуйте ещё раз.",
+        "Модель установлена. Сделать её рабочей не удалось — попробуйте переустановить.",
+        "Не удалось загрузить модель. Рабочая модель не изменилась.",
+        "Модель не прошла проверку. Попробуйте скачать или установить её заново.",
+        "Издатель больше не рекомендует эту версию модели.",
+    ],
+)
+def test_healthy_card_message_has_alert(onboarding_app: Any, message: str) -> None:
+    fake = FakeOnboarding()
+    fake.step = 2
+    fake.models = [{**fake.models[0], "message": message}, *fake.models[1:]]
+
+    def inspect(root: Any) -> None:
+        card = next(item for item in visual_tree(root) if item.property("modelId"))
+        alert = next(item for item in visual_tree(card) if item.objectName() == "messageAlert")
+        text = next(item for item in visual_tree(card) if item.objectName() == "messageText")
+        assert alert.isVisible() and alert.property("name") == "alert"
+        assert text.isVisible() and text.property("text") == message
+        assert text.property("color") == alert.property("color")
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, "healthy card error message")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_rounded_metric_levels_render(onboarding_app: Any, dark: bool) -> None:
+    from astra_voice.ui.formatting import _shown
+    from astra_voice.ui.model_downloads import _level
+
+    quality_level = _level("quality", _shown(Decimal(100) - Decimal("8.04")))
+    speed_level = _level("speed", _shown(19.96))
+    assert quality_level == speed_level == "good"
+    fake = FakeOnboarding()
+    fake.step = 2
+    metrics = [dict(row) for row in fake.models[0]["metrics"]]
+    metrics[0]["level"] = quality_level
+    metrics[1]["level"] = speed_level
+    fake.models = [{**fake.models[0], "metrics": metrics}]
+
+    def inspect(root: Any) -> None:
+        card = next(item for item in visual_tree(root) if item.property("modelId"))
+        fills = [
+            item
+            for item in visual_tree(card)
+            if item.objectName() == "metricFill" and item.isVisible()
+        ]
+        assert len(fills) == 2
+        assert all(
+            fill.property("color") == theme_color("modelCardMetricFillGood", dark) for fill in fills
+        )
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "rounded metric levels")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_metric_labels_fit_their_field(onboarding_app: Any, dark: bool) -> None:
+    fake = FakeOnboarding()
+    fake.step = 2
+
+    def inspect(root: Any) -> None:
+        card = next(item for item in visual_tree(root) if item.property("modelId"))
+        for caption in ("Точность", "Скорость"):
+            labels = [
+                item
+                for item in visual_tree(card)
+                if item.isVisible() and item.property("text") == caption
+            ]
+            assert len(labels) == 1, caption
+            label = labels[0]
+            assert label.width() == theme_number("modelCardMetricLabelW")
+            assert label.property("horizontalAlignment") == Qt.AlignRight
+            assert label.property("font").pixelSize() == theme_number("fontMetricSize")
+            content_width = float(label.property("contentWidth"))
+            implicit_width = float(label.implicitWidth())
+            assert max(content_width, implicit_width) - label.width() <= 2, (
+                caption,
+                content_width,
+                implicit_width,
+                label.width(),
+            )
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "metric labels")
+
+
+def test_compact_cards_fit_at_default_size(onboarding_app: Any, monkeypatch: Any) -> None:
+    col_max = theme_number("sizeContentColMax")
+    window_w = theme_number("sizeWindowW")
+    sidebar_w = theme_number("sidebarW")
+    body_inset = window_w - theme_number("onboardingStep2ContentW")
+
+    def assert_cards(root: Any, count: int) -> None:
+        surface = root.contentItem() if isinstance(root, QQuickWindow) else root
+        cards = [
+            item for item in visual_tree(surface) if item.isVisible() and item.property("modelId")
+        ]
+        assert len(cards) >= count
+        for card in cards[:count]:
+            left = card.mapToScene(QPointF(0, 0)).x()
+            top = card.mapToScene(QPointF(0, 0)).y()
+            assert top >= 0
+            assert card.width() == min(col_max, WIDTH - body_inset)
+            expected_left = (
+                sidebar_w + (WIDTH - sidebar_w - card.width()) / 2
+                if isinstance(root, QQuickWindow)
+                else (WIDTH - card.width()) / 2
+            )
+            assert left == expected_left
+            assert top + card.height() <= HEIGHT - 36, (top, card.height())
+
+    onboarding = FakeOnboarding()
+    onboarding.step = 2
+    onboarding.models = [{**onboarding.models[0], "id": f"card-{index}"} for index in range(4)]
+    image, messages = render_onboarding(
+        onboarding_app, onboarding, False, inspect=lambda root: assert_cards(root, 4)
+    )
+    assert_frame(image)
+    assert_no_messages(messages, "four model cards")
+
+    settings = FakeSettings()
+    settings.models = [
+        *settings.models,
+        {**settings.models[-1], "id": "third-model", "name": "Третья модель"},
+    ]
+    image, messages = render_settings(
+        onboarding_app,
+        False,
+        fake=settings,
+        section="models",
+        inspect=lambda root: assert_cards(root, 3),
+    )
+    assert_frame(image)
+    assert_no_messages(messages, "three model cards")
+
+    monkeypatch.setattr(sys.modules[__name__], "WIDTH", 900)
+    monkeypatch.setattr(sys.modules[__name__], "HEIGHT", 588)
+    _, messages = render_onboarding(
+        onboarding_app, onboarding, False, inspect=lambda root: assert_cards(root, 4)
+    )
+    assert_no_messages(messages, "four model cards at minimum width")
+    _, messages = render_settings(
+        onboarding_app,
+        False,
+        fake=settings,
+        section="models",
+        inspect=lambda root: assert_cards(root, 3),
+    )
+    assert_no_messages(messages, "three model cards at minimum width")
+
+    monkeypatch.setattr(sys.modules[__name__], "WIDTH", 1200)
+    monkeypatch.setattr(sys.modules[__name__], "HEIGHT", 620)
+    _, messages = render_onboarding(
+        onboarding_app, onboarding, False, inspect=lambda root: assert_cards(root, 4)
+    )
+    assert_no_messages(messages, "centered model cards in wide wizard")
+    _, messages = render_settings(
+        onboarding_app,
+        False,
+        fake=settings,
+        section="models",
+        inspect=lambda root: assert_cards(root, 3),
+    )
+    assert_no_messages(messages, "centered model cards in wide settings")
+
+
+@pytest.mark.parametrize("window_width", [1024, 900])
+@pytest.mark.parametrize("step", [1, 2, 3, 4, 5])
+def test_onboarding_step_width_and_position(
+    onboarding_app: Any, monkeypatch: Any, window_width: int, step: int
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "WIDTH", window_width)
+    fake = FakeOnboarding()
+    fake.step = step
+
+    def inspect(root: Any) -> None:
+        loader = next(item for item in visual_tree(root) if item.objectName() == "stepLoader")
+        body_inset = theme_number("sizeWindowW") - theme_number("onboardingStep2ContentW")
+        expected_width = (
+            min(theme_number("onboardingStep2ContentW"), window_width - body_inset)
+            if step == 2
+            else 580
+        )
+        assert loader.width() == expected_width, (step, window_width, loader.width())
+        assert loader.mapToScene(QPointF(0, 0)).x() == (window_width - expected_width) / 2
+        if step == 2:
+            assert "Пока ничего не выбрано" in visible_texts(root)
+            assert "свободно на диске 42,1 ГБ" in visible_texts(root)
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, f"step {step} at {window_width}")
+
+
+def test_settings_card_action_edge_and_group_gap(onboarding_app: Any) -> None:
+    fake = FakeSettings()
+
+    def inspect(window: Any) -> None:
+        root = window.contentItem()
+        active = next(
+            item
+            for item in visual_tree(root)
+            if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
+        )
+        remove = visible_button(active, "Удалить")
+        right = remove.mapToScene(QPointF(remove.width(), 0)).x()
+        caption = next(
+            item for item in visual_tree(root) if item.objectName() == "availableCaption"
+        )
+        card_bottom = active.mapToScene(QPointF(0, active.height())).y()
+        caption_top = caption.mapToScene(QPointF(0, 0)).y()
+        assert right == 988, right
+        assert caption_top - card_bottom == theme_number("spaceGroupTopGap"), (
+            caption_top,
+            card_bottom,
+        )
+
+    _, messages = render_settings(
+        onboarding_app, False, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "model card geometry")
+
+
+def test_models_first_card_vertical_alignment(onboarding_app: Any) -> None:
+    fake = FakeSettings()
+    geometry: list[tuple[int, int, int, int, int, int]] = []
+
+    def inspect(window: Any) -> None:
+        root = window.contentItem()
+        chip = next(item for item in visual_tree(root) if item.objectName() == "allLanguagesChip")
+        caption = next(
+            item for item in visual_tree(root) if item.objectName() == "installedCaption"
+        )
+        card = next(
+            item
+            for item in visual_tree(root)
+            if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
+        )
+        chip_top = chip.mapToScene(QPointF(0, 0)).y()
+        chip_bottom = chip.mapToScene(QPointF(0, chip.height())).y()
+        caption_point = caption.mapToScene(QPointF(0, 0))
+        caption_bottom = caption.mapToScene(QPointF(0, caption.height())).y()
+        card_top = card.mapToScene(QPointF(0, 0)).y()
+        geometry.append(
+            (
+                int(chip_top),
+                int(chip_bottom),
+                int(caption_point.x()),
+                int(caption_point.y()),
+                int(caption_bottom),
+                int(card_top),
+            )
+        )
+
+    _, messages = render_settings(
+        onboarding_app, False, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "models first card position")
+    _, chip_bottom, _, caption_top, _, card_top = geometry[0]
+    assert caption_top - chip_bottom == theme_number("modelCardFirstGroupTopGap"), geometry[0]
+    assert 123 <= card_top <= 126, geometry[0]
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize("screen", ["onboarding", "models"])
+def test_model_summary_uses_two_type_sizes(onboarding_app: Any, screen: str, dark: bool) -> None:
+    def inspect(root: Any) -> None:
+        surface = root.contentItem() if isinstance(root, QQuickWindow) else root
+        summary = next(
+            item for item in visual_tree(surface) if item.objectName() == "selectionSummary"
+        )
+        free = next(
+            item for item in visual_tree(surface) if item.objectName() == "selectionMessage"
+        )
+        assert summary.property("text") == "Пока ничего не выбрано"
+        assert free.property("text") == "свободно на диске 42,1 ГБ"
+        assert summary.property("font").pixelSize() == theme_number("onboardingSummaryLineSize")
+        assert free.property("font").pixelSize() == theme_number("onboardingSummaryLineFreeSize")
+
+    if screen == "onboarding":
+        fake = FakeOnboarding()
+        fake.step = 2
+        _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    else:
+        _, messages = render_settings(
+            onboarding_app, dark, fake=FakeSettings(), section="models", inspect=inspect
+        )
+    assert_no_messages(messages, f"summary type sizes: {screen}, dark={dark}")
+
+
+def test_dark_filter_border_blends_with_chip_fill(onboarding_app: Any) -> None:
+    border_point: list[tuple[int, int]] = []
+
+    def inspect(window: Any) -> None:
+        chip = next(
+            item
+            for item in visual_tree(window.contentItem())
+            if item.objectName() == "domesticChip"
+        )
+        point = chip.mapToScene(QPointF(0, chip.height() / 2))
+        border_point.append((int(point.x()), int(point.y())))
+
+    image, messages = render_settings(
+        onboarding_app, True, fake=FakeSettings(), section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "dark filter chip border")
+    assert len(border_point) == 1
+    color = image.pixelColor(*border_point[0])
+    assert all(
+        abs(channel - target) <= 1
+        for channel, target in zip(
+            (color.red(), color.green(), color.blue()), (44, 52, 69), strict=True
+        )
+    ), (border_point[0], color.name())
+
+
+def test_card_with_action_is_105_high_at_narrow_width(
+    onboarding_app: Any, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "WIDTH", 900)
+    fake = FakeOnboarding()
+    fake.step = 2
+    fake.models = [{**fake.models[0], "state": "failed"}]
+
+    def inspect(root: Any) -> None:
+        card = next(item for item in visual_tree(root) if item.property("modelId"))
+        assert card.width() == 672
+        top = next(item for item in visual_tree(card) if item.objectName() == "cardTop")
+        footer = next(item for item in visual_tree(card) if item.objectName() == "cardFooter")
+        facts = next(item for item in visual_tree(card) if item.objectName() == "footerFacts")
+        actions = next(item for item in visual_tree(card) if item.objectName() == "footerActions")
+        assert card.height() == 105, (
+            f"card={card.height()} top={top.height()} footer=({footer.y()},{footer.height()}) "
+            f"facts={facts.height()} actions={actions.height()}"
+        )
+        mark = next(item for item in visual_tree(card) if item.objectName() == "selectionBox")
+        assert mark.isVisible()
+        assert card.property("selectBorderWidth") == theme_number("modelCardSelectBorder") == 1
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, "narrow card with action")
 
 
 @pytest.mark.parametrize("state", CAPTURE_STATES)
@@ -2514,7 +2954,7 @@ def test_broken_installed_card_keeps_badge_and_message(onboarding_app: Any, dark
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
-def test_active_model_removal_explains_why_unavailable(onboarding_app: Any, dark: bool) -> None:
+def test_active_model_removal_is_disabled(onboarding_app: Any, dark: bool) -> None:
     fake = FakeSettings()
     fake.models = [{**fake.models[0], "badge": "active", "state": "installed"}]
 
@@ -2527,42 +2967,12 @@ def test_active_model_removal_explains_why_unavailable(onboarding_app: Any, dark
         )
         fake.calls.clear()
         remove = visible_button(card, "Удалить")
-        assert remove.isEnabled()
-        QMetaObject.invokeMethod(remove, "clicked", Qt.DirectConnection)
-        onboarding_app.processEvents()
-        dialogs = [
-            item
+        assert not remove.isEnabled()
+        assert not any(
+            item.property("visible") is True and item.property("modal") is True
             for item in window.findChildren(QObject)
-            if item.property("heading") == "Сначала выберите другую модель"
-        ]
-        assert len(dialogs) == 1
-        dialog = dialogs[0]
-        assert dialog.property("visible") is True
-        assert (
-            "GigaAM v3 RNN-T сейчас активна — без модели диктовка работать не будет. "
-            "Выберите другую установленную модель, после этого удаление станет доступно."
-        ) in visible_texts(root)
-        assert [
-            item.property("text")
-            for item in visual_tree(dialog.property("footer"))
-            if item.isVisible() and item.metaObject().indexOfSignal(b"clicked()") >= 0
-        ] == ["Понятно"]
-        QMetaObject.invokeMethod(
-            visible_button(dialog.property("footer"), "Понятно"), "clicked", Qt.DirectConnection
+            if item.property("heading")
         )
-        onboarding_app.processEvents()
-        assert dialog.property("visible") is False
-        assert fake.calls == []
-        QMetaObject.invokeMethod(remove, "clicked", Qt.DirectConnection)
-        onboarding_app.processEvents()
-        assert dialog.property("visible") is True
-        QMetaObject.invokeMethod(
-            visible_button(dialog.property("footer"), "Понятно"),
-            "clicked",
-            Qt.DirectConnection,
-        )
-        onboarding_app.processEvents()
-        assert dialog.property("visible") is False
         assert fake.calls == []
 
     _, messages = render_settings(
@@ -2571,14 +2981,11 @@ def test_active_model_removal_explains_why_unavailable(onboarding_app: Any, dark
     assert_no_messages(messages, "active model removal")
 
 
-@pytest.mark.parametrize("badge", ["installed", "active"], ids=["remove", "unavailable"])
-def test_model_dialog_survives_section_reloading(onboarding_app: Any, badge: str) -> None:
+def test_model_dialog_survives_section_reloading(onboarding_app: Any) -> None:
     """Открытый popup закрывается до уничтожения раздела при каждом переходе."""
     fake = FakeSettings()
-    fake.models = [{**fake.models[0], "badge": badge, "selected": False}]
-    heading = (
-        "Удалить GigaAM v3 RNN-T?" if badge == "installed" else "Сначала выберите другую модель"
-    )
+    fake.models = [{**fake.models[0], "badge": "installed", "selected": False}]
+    heading = "Удалить GigaAM v3 RNN-T?"
 
     def inspect(window: Any) -> None:
         sidebar = settings_sidebar(window)
@@ -2610,14 +3017,23 @@ def test_model_dialog_survives_section_reloading(onboarding_app: Any, badge: str
     _, messages = render_settings(
         onboarding_app, False, fake=fake, section="models", inspect=inspect
     )
-    assert_no_messages(messages, f"{badge} dialog section reload")
+    assert_no_messages(messages, "removal dialog section reload")
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
-def test_long_active_model_name_wraps_in_dialog(onboarding_app: Any, dark: bool) -> None:
+def test_long_removal_message_wraps_in_dialog(onboarding_app: Any, dark: bool) -> None:
     fake = FakeSettings()
     long_name = "Очень длинное название модели для проверки переноса текста в диалоге " * 5
-    fake.models = [{**fake.models[0], "name": long_name, "badge": "active", "state": "installed"}]
+    long_size = "226 МБ " * 40
+    fake.models = [
+        {
+            **fake.models[0],
+            "name": long_name,
+            "sizeText": long_size,
+            "badge": "installed",
+            "state": "installed",
+        }
+    ]
 
     def inspect(window: Any) -> None:
         root = window.contentItem()
@@ -2631,7 +3047,7 @@ def test_long_active_model_name_wraps_in_dialog(onboarding_app: Any, dark: bool)
         dialog = next(
             item
             for item in window.findChildren(QObject)
-            if item.property("heading") == "Сначала выберите другую модель"
+            if item.property("heading") == f"Удалить {long_name}?"
         )
         body = dialog.property("contentItem")
         message = next(
@@ -2641,7 +3057,7 @@ def test_long_active_model_name_wraps_in_dialog(onboarding_app: Any, dark: bool)
         )
         assert message.property("paintedHeight") > 3 * message.property("font").pixelSize()
         assert body.property("height") >= message.property("y") + message.property("paintedHeight")
-        assert dialog.property("message").startswith(long_name)
+        assert long_size in dialog.property("message")
 
     _, messages = render_settings(
         onboarding_app, dark, fake=fake, section="models", inspect=inspect

@@ -1,5 +1,6 @@
 // design/spec.md §5.1–5.5; design/mockups/final/08-onboarding-2-model.html (.mc).
 import QtQuick 2.15
+import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import ".."
 
@@ -9,6 +10,7 @@ Rectangle {
     property string modelId: ""
     property string modelTitle: ""
     property string vendor: ""
+    property string vendorShort: ""
     property string purpose: ""
     property string host: ""
     property bool recommended: false
@@ -19,10 +21,6 @@ Rectangle {
     property bool ramMeasured: false
     readonly property bool showRam: measurementMode
         ? (ramMb !== 0 || ramMeasured) : ramText !== ""
-    property string speedKind: "no_data"
-    property string speedText: ""
-    property real speedValue: 0
-    property var qualityValue: null
     property bool selected: false
     property string badge: ""
     property string cardState: "available"
@@ -37,6 +35,9 @@ Rectangle {
     property bool memoryShortage: false
     property bool canSwitchWithPause: false
     property bool canReinstall: true
+    // Вернуть, когда мост выдаёт эти состояния и у действий появятся обработчики.
+    property bool detailsActionAvailable: false
+    property bool updateActionsAvailable: false
     property var metrics: []
     property var tags: []
 
@@ -49,35 +50,47 @@ Rectangle {
     signal updateRequested()
     signal switchWithPauseRequested()
     signal reinstallRequested()
+    signal detailsRequested()
 
     readonly property bool selectionAvailable: badge === ""
-        && (cardState === "available" || cardState === "failed")
-    // У установленной модели выбора нет: с ней работают кнопки, а серая галочка
-    // читалась как «отмечена к загрузке» и путала (решение по блоку 1 M6).
-    readonly property bool showSelection: badge === ""
-    // Установленная карточка не красится как «выбрана к загрузке»: отметки у неё
-    // нет, а мост оставляет её в выборе после успешной установки.
-    readonly property bool highlighted: showSelection && selected
+        && ["available", "failed", "sha-failed", "new", "low-ram",
+            "not-recommended", "no-benchmark"].indexOf(cardState) >= 0
+    readonly property bool highlighted: badge === "" && selected
     readonly property bool manageVisible: manageEnabled && badge !== ""
     readonly property bool busy: cardState === "queued" || cardState === "downloading"
         || cardState === "verifying"
-    readonly property bool hasError: cardState === "failed" || cardState === "no-space"
+    readonly property bool hasError: ["failed", "sha-failed", "no-space",
+        "broken", "corrupted", "update-failed"].indexOf(cardState) >= 0
     // Отказ переключения или удаления приходит сообщением на исправной карточке.
     readonly property bool hasMessage: hasError || message !== ""
-    readonly property bool showHint: hint !== "" && (!hasMessage || memoryShortage)
-    readonly property string selectionMark: cardState === "no-space" ? "blocked"
+        || ["no-network", "offline-user", "policy"].indexOf(cardState) >= 0
+    readonly property bool neutralMessage: ["no-network", "offline-user", "policy"]
+        .indexOf(cardState) >= 0
+    readonly property bool messageError: hasMessage && !neutralMessage
+    readonly property bool unavailable: ["no-space", "no-network", "offline-user", "policy"]
+        .indexOf(cardState) >= 0
+    readonly property bool showHint: (hint !== "" || ["low-ram", "not-recommended",
+        "no-benchmark"].indexOf(cardState) >= 0) && (!hasMessage || memoryShortage)
+    readonly property bool footerHasButtons: cardState === "queued"
+        || cardState === "downloading" || cardState === "failed"
+        || cardState === "sha-failed"
+        || (updateActionsAvailable && (cardState === "updating"
+            || cardState === "update-failed"))
+        || (cardState === "no-space" && openFolderEnabled) || manageVisible
+    readonly property string selectionMark: ["no-space", "no-network", "offline-user",
+        "policy"].indexOf(cardState) >= 0 ? "blocked"
         : badge !== "" || busy || cardState === "installed" ? "locked"
         : selected ? "on" : "off"
+    readonly property real selectBorderWidth: Theme.modelCardSelectBorder
     readonly property string statusLabel: cardState === "downloading" ? qsTr("Загружается")
         : cardState === "queued" ? qsTr("В очереди")
         : cardState === "verifying" ? qsTr("Проверяю…")
         : cardState === "switching" ? qsTr("Переключаю…")
+        : cardState === "new" ? qsTr("Новое")
+        : cardState === "updating" ? qsTr("Обновляю…")
+        : cardState === "update-available" ? qsTr("Обновление доступно")
         : badge === "active" ? qsTr("Установлена и активна")
         : badge === "installed" ? qsTr("Установлена") : ""
-    readonly property bool hasMetricData: metrics.some(function(metric) {
-        return metric.hasData === true;
-    })
-    readonly property real footerGap: 9 // spec §5.1: зазор нижнего блока.
 
     implicitWidth: Theme.onboardingStep2ContentW
     implicitHeight: footer.y + footer.height + Theme.modelCardPaddingY + Theme.cardBorder
@@ -129,15 +142,8 @@ Rectangle {
         renderType: Text.NativeRendering
     }
 
-    component SpaceText: FooterText {
-        color: Theme.modelCardSpaceLineLabel
-        font.pixelSize: Theme.modelCardSpaceLineSize
-        lineHeight: Theme.modelCardSpaceLineLineHeight
-        wrapMode: Text.NoWrap
-    }
-
     component Dot: Rectangle {
-        width: 4 // spec §5.2: диаметр разделителя.
+        width: Theme.modelCardFooterDotSize
         height: width
         radius: width / 2
         color: Theme.fgFaint
@@ -165,6 +171,7 @@ Rectangle {
 
     RowLayout {
         id: top
+        objectName: "cardTop"
         x: Theme.cardBorder + Theme.modelCardPaddingX
         y: Theme.cardBorder + Theme.modelCardPaddingY
         width: root.width - 2 * (Theme.cardBorder + Theme.modelCardPaddingX)
@@ -176,24 +183,15 @@ Rectangle {
             Layout.alignment: Qt.AlignTop
             spacing: Theme.modelCardSelectGap
 
-            // Место отметки сохраняем и у установленной карточки: иначе её
-            // название съезжает влево относительно соседних (§5.1).
-            Item {
-                visible: !root.showSelection
-                Layout.preferredWidth: Theme.modelCardSelectSize
-                Layout.preferredHeight: Theme.modelCardSelectSize
-                Layout.alignment: Qt.AlignTop
-                Layout.topMargin: 2
-            }
-
             Rectangle {
-                visible: root.showSelection
+                objectName: "selectionBox"
                 Layout.preferredWidth: Theme.modelCardSelectSize
                 Layout.preferredHeight: Theme.modelCardSelectSize
                 Layout.alignment: Qt.AlignTop
                 Layout.topMargin: 2
                 radius: Theme.modelCardSelectRadius
-                border.width: Theme.modelCardSelectBorder
+                border.width: root.selectBorderWidth
+                antialiasing: false
                 border.color: root.selectionMark === "on" ? Theme.primary
                     : root.selectionMark === "off" ? Theme.fgFaint : Theme.border
                 color: root.selectionMark === "on" ? Theme.primary
@@ -211,7 +209,8 @@ Rectangle {
                 Layout.fillWidth: true
                 Layout.minimumWidth: 0
                 Layout.alignment: Qt.AlignTop
-                implicitHeight: purposeText.y + purposeText.height
+                implicitHeight: Math.max(Theme.modelCardHeadMinH, nameRow.height)
+                    + purposeText.height
                 Flow {
                     id: nameRow
                     width: parent.width
@@ -219,68 +218,93 @@ Rectangle {
                     FooterText {
                         text: root.modelTitle
                         width: Math.min(implicitWidth, nameRow.width)
-                        color: Theme.fg
+                        color: root.unavailable ? Theme.fgDisabled : Theme.fg
                         font.pixelSize: Theme.fontModelNameSize
                         font.weight: Font.Medium
+                        lineHeight: Theme.modelCardHeadMinH
                     }
                     FooterText {
-                        visible: root.vendor !== ""
-                        text: qsTr(" · %1").arg(root.vendor)
+                        visible: root.vendorShort !== ""
+                        text: qsTr("· %1").arg(root.vendorShort)
+                        color: root.unavailable ? Theme.fgDisabled : Theme.fgMuted
                         font.pixelSize: Theme.fontModelVendorSize
+                        lineHeight: Theme.modelCardHeadMinH
                         wrapMode: Text.NoWrap
+                        ToolTip {
+                            visible: vendorHover.containsMouse && root.vendor !== ""
+                            text: root.vendor
+                            contentItem: Text {
+                                text: root.vendor
+                                textFormat: Text.PlainText
+                                color: Theme.fg
+                                font.family: Theme.fontUi
+                            }
+                        }
+                        MouseArea {
+                            id: vendorHover
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            acceptedButtons: Qt.NoButton
+                        }
                     }
                     CardBadge {
                         visible: root.recommended
                         text: qsTr("Рекомендуем")
-                        color: Theme.primaryBg
+                        color: root.highlighted ? Theme.bgSurface : Theme.primaryBg
                         textColor: Theme.primary
                     }
                     CardBadge {
                         visible: root.statusLabel !== ""
                         text: root.statusLabel
-                        color: root.busy ? Theme.bgSurface2
+                        color: root.busy || root.cardState === "new" ? Theme.bgSurface2
                             : root.badge === "active" ? Theme.bgSurface : Theme.successBg
-                        textColor: root.busy ? Theme.fgMuted
+                        textColor: root.busy || root.cardState === "new" ? Theme.fgMuted
                             : root.badge === "active" ? Theme.accentInk : Theme.successInk
                     }
                 }
                 FooterText {
                     id: purposeText
-                    y: nameRow.height + 2 // spec §5.2: отступ назначения.
+                    y: Math.max(Theme.modelCardHeadMinH, nameRow.height)
                     width: parent.width
                     text: root.purpose
+                    color: root.unavailable ? Theme.fgDisabled : Theme.fgMuted
                     font.pixelSize: Theme.fontModelPurposeSize
+                    lineHeight: Theme.modelCardPurposeLineHeight
                 }
             }
         }
 
         Item {
-            visible: root.metrics.length > 0
+            visible: root.metrics.length > 0 && root.cardState !== "custom"
             Layout.alignment: Qt.AlignTop
             Layout.minimumWidth: implicitWidth
-            implicitWidth: Math.max(metricRows.implicitWidth,
-                sourceCaption.visible ? sourceCaption.implicitWidth : 0)
-            implicitHeight: metricRows.height + (sourceCaption.visible
-                ? Theme.modelCardMetricSourceCaptionMarginTop + sourceCaption.height : 0)
+            implicitWidth: Theme.modelCardMetricLabelW + Theme.modelCardMetricLabelMarginRight
+                + 2 * Theme.modelCardMetricGap + Theme.modelCardMetricTrackW
+                + Theme.modelCardMetricValueW
+            implicitHeight: metricRows.height
             Column {
                 id: metricRows
                 spacing: Theme.modelCardMetricsGap
                 Repeater {
                     model: root.metrics
-                    Column {
-                        property bool metricHasData: root.measurementMode && modelData.kind === "speed"
-                            ? root.speedKind !== "no_data" : modelData.hasData !== false
-                        visible: !root.measurementMode
-                            || (modelData.kind === "speed"
-                                ? root.speedKind !== "no_data" : root.qualityValue !== null)
-                        spacing: 2
+                    Item {
+                        property bool metricHasData: modelData.hasData === true
+                        width: Theme.modelCardMetricLabelW + Theme.modelCardMetricLabelMarginRight
+                            + 2 * Theme.modelCardMetricGap + Theme.modelCardMetricTrackW
+                            + Theme.modelCardMetricValueW
+                        height: Theme.modelCardMetricRowH
                         RowLayout {
                             spacing: Theme.modelCardMetricGap
+                            width: parent.width
+                            height: parent.height
                             FooterText {
                                 Layout.preferredWidth: Theme.modelCardMetricLabelW
+                                Layout.rightMargin: Theme.modelCardMetricLabelMarginRight
                                 horizontalAlignment: Text.AlignRight
                                 text: modelData.label
+                                color: root.unavailable ? Theme.fgDisabled : Theme.fgMuted
                                 font.pixelSize: Theme.fontMetricSize
+                                wrapMode: Text.NoWrap
                             }
                             Rectangle {
                                 Layout.preferredWidth: Theme.modelCardMetricTrackW
@@ -288,231 +312,303 @@ Rectangle {
                                 radius: Theme.modelCardMetricTrackRadius
                                 color: metricHasData ? Theme.modelCardMetricTrackBg : "transparent"
                                 border.width: metricHasData ? 0 : 1
-                                border.color: Theme.fgFaint
+                                border.color: Theme.modelCardMetricNoDataBorder
                                 Rectangle {
+                                    objectName: "metricFill"
                                     visible: metricHasData
                                     width: parent.width * Math.max(0, Math.min(1,
-                                        root.measurementMode
-                                            ? (modelData.kind === "speed"
-                                                ? root.speedValue : root.qualityValue)
-                                            : modelData.fill))
+                                        modelData.fill))
                                     height: parent.height
                                     radius: Theme.modelCardMetricTrackRadius
-                                    color: Theme.modelCardMetricFillEstimated
+                                    color: modelData.level === "good" ? Theme.modelCardMetricFillGood
+                                        : modelData.level === "fair" ? Theme.modelCardMetricFillFair
+                                        : modelData.level === "weak" ? Theme.modelCardMetricFillWeak
+                                        : Theme.fgFaint
                                 }
                             }
-                            FooterText {
-                                Layout.fillWidth: true
-                                text: root.measurementMode && modelData.kind === "speed"
-                                    ? root.speedText : modelData.text
-                                font.pixelSize: Theme.modelCardMetricValueSize
-                                font.weight: Font.Normal
-                                font.italic: !metricHasData
-                                color: metricHasData ? Theme.fgMuted : Theme.fgDisabled
-                                wrapMode: Text.NoWrap
+                            Row {
+                                Layout.preferredWidth: Theme.modelCardMetricValueW
+                                spacing: Theme.modelCardMetricMeasuredMarkGap
+                                FooterText {
+                                    text: metricHasData ? modelData.text : qsTr("нет данных")
+                                    font.pixelSize: Theme.modelCardMetricValueSize
+                                    font.weight: modelData.measured === true ? Font.Medium : Font.Normal
+                                    font.italic: !metricHasData
+                                    color: root.unavailable ? Theme.fgDisabled
+                                        : !metricHasData ? Theme.modelCardMetricNoDataValueColor
+                                        : modelData.measured === true
+                                            ? Theme.modelCardMetricMeasuredValueColor
+                                            : Theme.modelCardMetricValueColor
+                                    wrapMode: Text.NoWrap
+                                    ToolTip.visible: modelData.measured === true
+                                        && metricValueHover.containsMouse
+                                    ToolTip.text: qsTr("замерено на этом компьютере")
+                                    MouseArea {
+                                        id: metricValueHover
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        acceptedButtons: Qt.NoButton
+                                    }
+                                }
+                                Text {
+                                    visible: modelData.measured === true && metricHasData
+                                    text: "✓"
+                                    color: Theme.modelCardMetricMeasuredMark
+                                    font.pixelSize: Theme.modelCardMetricMeasuredMarkSize
+                                    font.weight: Font.Bold
+                                    ToolTip.visible: metricMarkHover.containsMouse
+                                    ToolTip.text: qsTr("замерено на этом компьютере")
+                                    MouseArea {
+                                        id: metricMarkHover
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        acceptedButtons: Qt.NoButton
+                                    }
+                                }
                             }
-                        }
-                        FooterText {
-                            visible: root.measurementMode && modelData.kind === "speed"
-                            text: root.speedKind === "measured" ? qsTr("замерено")
-                                : qsTr("по цифрам авторов")
-                            font.pixelSize: Theme.modelCardMetricSourceCaptionSize
                         }
                     }
                 }
             }
-            FooterText {
-                id: sourceCaption
-                visible: !root.measurementMode && root.hasMetricData
-                y: metricRows.height + Theme.modelCardMetricSourceCaptionMarginTop
-                width: parent.width
-                horizontalAlignment: Text.AlignRight
-                text: qsTr("цифры авторов, не с этого компьютера")
-                font.pixelSize: Theme.modelCardMetricSourceCaptionSize
-                color: Theme.modelCardMetricSourceCaptionColor
-                wrapMode: Text.NoWrap
-            }
         }
     }
 
-    Rectangle {
-        id: divider
-        x: Theme.cardBorder + Theme.modelCardPaddingX
-        y: top.y + top.height + 8 // spec §5.1: поле над разделителем.
-        width: top.width
-        height: 1 // spec §5.1: толщина разделителя.
-        color: Theme.borderSoft
-    }
-
-    Column {
+    RowLayout {
         id: footer
+        objectName: "cardFooter"
         x: Theme.cardBorder + Theme.modelCardPaddingX
-        y: divider.y + divider.height + 7 // spec §5.1: поле под разделителем.
+        y: top.y + top.height + Theme.modelCardFooterGap
         width: top.width
-        spacing: Theme.modelCardSpaceLineGapToTags
-
-        Row {
+        spacing: Theme.modelCardFooterColsGap
+        Flow {
+            id: footerFacts
+            objectName: "footerFacts"
+            Layout.fillWidth: true
+            Layout.minimumWidth: 0
+            Layout.preferredHeight: implicitHeight
+            Layout.alignment: Qt.AlignTop
+            Layout.topMargin: root.footerHasButtons ? Theme.modelCardFooterBtnTextOffset : 0
             spacing: 0
-            SpaceText { text: qsTr("Занимает места: ") }
-            SpaceText {
-                text: root.sizeText
-                color: Theme.fg
+
+            Row {
+                spacing: 0
+                FooterText { text: root.sizeText; color: root.unavailable ? Theme.fgDisabled : Theme.fg; wrapMode: Text.NoWrap }
+                FooterText { text: qsTr(" на диске"); color: root.unavailable ? Theme.fgDisabled : Theme.fgMuted; wrapMode: Text.NoWrap }
+                Item { width: Theme.modelCardFooterDotGap; height: 1 }
             }
-            SpaceText { text: qsTr(" на диске") }
             Item {
                 visible: root.showRam
-                width: 4 + 2 * root.footerGap
+                width: Theme.modelCardFooterDotSize + Theme.modelCardFooterDotGap
                 height: Theme.modelCardSpaceLineLineHeight
-                Dot { anchors.centerIn: parent }
+                Dot { x: 0; anchors.verticalCenter: parent.verticalCenter }
             }
-            SpaceText {
+            Row {
                 visible: root.showRam
-                text: root.measurementMode
-                    ? (root.ramMeasured
-                        ? qsTr("Память: %1 МБ (замерено на этом компьютере)").arg(root.ramMb)
-                        : qsTr("Память: около %1 МБ").arg(root.ramMb))
-                    : root.ramText
-                color: Theme.fg
-                font.weight: root.measurementMode && root.ramMeasured ? Font.Bold : Font.Normal
+                spacing: 0
+                FooterText {
+                    text: root.ramText
+                    color: root.unavailable ? Theme.fgDisabled : Theme.fg
+                    font.weight: root.ramMeasured ? Font.Medium : Font.Normal
+                    wrapMode: Text.NoWrap
+                    ToolTip.visible: root.ramMeasured && ramValueHover.containsMouse
+                    ToolTip.text: qsTr("замерено на этом компьютере")
+                    MouseArea {
+                        id: ramValueHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        acceptedButtons: Qt.NoButton
+                    }
+                }
+                FooterText { text: qsTr(" в памяти"); color: root.unavailable ? Theme.fgDisabled : Theme.fgMuted; wrapMode: Text.NoWrap }
+                Text {
+                    visible: root.ramMeasured
+                    text: "✓"
+                    color: Theme.modelCardMetricMeasuredMark
+                    font.pixelSize: Theme.modelCardMetricMeasuredMarkSize
+                    font.weight: Font.Bold
+                    ToolTip.visible: ramMarkHover.containsMouse
+                    ToolTip.text: qsTr("замерено на этом компьютере")
+                    MouseArea {
+                        id: ramMarkHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        acceptedButtons: Qt.NoButton
+                    }
+                }
+                Item { width: Theme.modelCardFooterDotGap; height: 1 }
             }
-            SpaceText {
-                visible: root.showRam && !root.measurementMode
-                text: qsTr(" в памяти при работе")
+            Repeater {
+                model: root.tags
+                Row {
+                    spacing: 0
+                    Item {
+                        width: Theme.modelCardFooterDotSize + Theme.modelCardFooterDotGap
+                        height: Theme.modelCardSpaceLineLineHeight
+                        Dot { x: 0; anchors.verticalCenter: parent.verticalCenter }
+                    }
+                    FooterText { text: modelData; color: root.unavailable ? Theme.fgDisabled : Theme.fgMuted; wrapMode: Text.NoWrap }
+                    Item { width: Theme.modelCardFooterDotGap; height: 1 }
+                }
             }
         }
 
         RowLayout {
-            id: bottomRow
-            width: parent.width
-            visible: root.tags.length > 0 || root.busy || root.hasMessage
-                || root.showHint || root.manageVisible
-            spacing: root.footerGap
-
-            Flow {
-                visible: root.tags.length > 0
-                Layout.fillWidth: true
-                Layout.minimumWidth: 0
-                Layout.preferredHeight: height
-                spacing: root.footerGap
-                Repeater {
-                    model: root.tags
-                    RowLayout {
-                        spacing: root.footerGap
-                        Dot { visible: index !== 0 }
-                        FooterText { text: modelData }
+            objectName: "footerActions"
+            visible: root.busy || root.hasMessage || root.showHint || root.manageVisible
+                || (root.cardState === "updating" && root.updateActionsAvailable)
+            Layout.maximumWidth: footer.width * Theme.modelCardFooterActionsMaxShare
+            Layout.preferredWidth: {
+                var total = 0;
+                var count = 0;
+                for (var i = 0; i < children.length; ++i) {
+                    if (children[i].visible && children[i].implicitWidth > 0) {
+                        total += children[i].implicitWidth;
+                        ++count;
                     }
                 }
+                return total + Math.max(0, count - 1) * spacing + Theme.cardBorder;
             }
-
-            Item {
-                visible: root.tags.length === 0
+            Layout.alignment: Qt.AlignTop
+            spacing: Theme.modelCardFooterActionsGap
+            Icon {
+                objectName: "messageAlert"
+                visible: root.messageError
+                name: "alert"
+                size: Theme.modelCardFooterMsgIconSize
+                color: Theme.dangerInk
+            }
+            FooterText {
+                objectName: "messageText"
+                visible: root.hasMessage
                 Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                text: root.message !== "" ? root.message
+                    : root.cardState === "no-network"
+                        ? qsTr("Нет доступа к источнику модели")
+                    : root.cardState === "offline-user"
+                        ? qsTr("Включена работа без сети")
+                    : root.cardState === "policy"
+                        ? qsTr("Выбор ограничен администратором")
+                    : root.cardState === "no-space" ? qsTr("Не хватает места на диске")
+                    : root.cardState === "sha-failed"
+                        ? qsTr("Файл не прошёл проверку — загруженное удалено")
+                    : root.cardState === "broken" || root.cardState === "corrupted"
+                        ? qsTr("Файлы модели не читаются")
+                    : root.cardState === "update-failed"
+                        ? qsTr("Не удалось обновить модель")
+                    : qsTr("Не удалось загрузить модель")
+                color: root.messageError ? Theme.dangerInk : Theme.fgMuted
+            }
+            Icon {
+                visible: root.showHint && (root.hintKind === "warning"
+                    || root.cardState === "low-ram" || root.cardState === "not-recommended")
+                name: "alert"
+                size: Theme.modelCardFooterMsgIconSize
+                color: Theme.warningInk
+            }
+            Icon {
+                visible: root.showHint && (root.hintKind === "info"
+                    || root.cardState === "no-benchmark")
+                name: "info"
+                size: Theme.modelCardFooterMsgIconSize
+                color: Theme.fgMuted
+            }
+            FooterText {
+                visible: root.showHint
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                text: root.hint !== "" ? root.hint
+                    : root.cardState === "low-ram" ? qsTr("Может не хватить памяти")
+                    : root.cardState === "not-recommended"
+                        ? qsTr("Хуже подходит для русского языка")
+                    : qsTr("Для этой модели пока нет цифр")
+                color: root.hintKind === "warning" || root.cardState === "low-ram"
+                    || root.cardState === "not-recommended"
+                    ? Theme.warningInk : Theme.fgMuted
+            }
+            AvButton {
+                visible: root.cardState === "downloading" || root.cardState === "queued"
+                    || (root.cardState === "updating" && root.updateActionsAvailable)
+                Layout.minimumWidth: visible ? implicitWidth : 0
+                small: true
+                text: qsTr("Отмена")
+                onClicked: root.cancelRequested()
+            }
+            FooterText {
+                visible: root.cardState === "verifying"
+                text: qsTr("Отмена недоступна")
+                color: Theme.fgDisabled
+            }
+            AvButton {
+                visible: root.cardState === "failed" || root.cardState === "sha-failed"
+                    || (root.cardState === "update-failed" && root.updateActionsAvailable)
+                Layout.minimumWidth: visible ? implicitWidth : 0
+                small: true
+                variant: "primary"
+                text: qsTr("Повторить")
+                onClicked: root.retryRequested()
+            }
+            AvButton {
+                visible: root.cardState === "sha-failed" && root.detailsActionAvailable
+                Layout.minimumWidth: visible ? implicitWidth : 0
+                small: true
+                text: qsTr("Подробнее")
+                onClicked: root.detailsRequested()
+            }
+            AvButton {
+                visible: root.cardState === "no-space" && root.openFolderEnabled
+                Layout.minimumWidth: visible ? implicitWidth : 0
+                small: true
+                iconName: "folder"
+                text: qsTr("Открыть папку моделей")
+                onClicked: root.openFolderRequested()
             }
 
-            RowLayout {
-                visible: root.busy || root.hasMessage || root.showHint || root.manageVisible
-                Layout.maximumWidth: root.tags.length > 0 ? bottomRow.width * 0.65 : bottomRow.width
-                spacing: root.footerGap
-                Icon {
-                    visible: root.hasMessage
-                    name: "alert"
-                    size: 12
-                    color: Theme.dangerInk
-                }
-                FooterText {
-                    visible: root.hasMessage
-                    Layout.fillWidth: true
-                    Layout.minimumWidth: 0
-                    text: root.message !== "" ? root.message
-                        : root.cardState === "no-space" ? qsTr("Не хватает места на диске")
-                        : qsTr("Не удалось загрузить модель")
-                    color: Theme.dangerInk
-                }
-                Icon {
-                    visible: root.showHint && root.hintKind === "warning"
-                    name: "alert"
-                    size: 12
-                    color: Theme.warningInk
-                }
-                FooterText {
-                    visible: root.showHint
-                    Layout.fillWidth: true
-                    Layout.minimumWidth: 0
-                    text: root.hint
-                    color: root.hintKind === "warning" ? Theme.warningInk : Theme.fgMuted
-                }
-                AvButton {
-                    visible: root.cardState === "downloading" || root.cardState === "queued"
-                    Layout.minimumWidth: implicitWidth
-                    small: true
-                    text: qsTr("Отмена")
-                    onClicked: root.cancelRequested()
-                }
-                FooterText {
-                    visible: root.cardState === "verifying"
-                    text: qsTr("Отмена недоступна")
-                    color: Theme.fgDisabled
-                }
-                AvButton {
-                    visible: root.cardState === "failed"
-                    Layout.minimumWidth: implicitWidth
-                    small: true
-                    variant: "primary"
-                    text: qsTr("Повторить")
-                    onClicked: root.retryRequested()
-                }
-                AvButton {
-                    visible: root.cardState === "no-space" && root.openFolderEnabled
-                    Layout.minimumWidth: implicitWidth
-                    small: true
-                    iconName: "folder"
-                    text: qsTr("Открыть папку моделей")
-                    onClicked: root.openFolderRequested()
-                }
-
-                // Кнопки установленной модели (§5.4, состояния 19–20, 25).
-                AvButton {
-                    visible: root.manageVisible && root.updateAvailable
-                        && root.cardState !== "switching" && root.cardState !== "broken"
-                    Layout.minimumWidth: implicitWidth
-                    small: true
-                    iconName: "down"
-                    text: qsTr("Обновить")
-                    onClicked: root.updateRequested()
-                }
-                AvButton {
-                    visible: root.manageVisible && root.badge !== "active"
-                        && root.cardState !== "switching" && root.cardState !== "broken"
-                    Layout.minimumWidth: implicitWidth
-                    small: true
-                    variant: "primary"
-                    text: qsTr("Сделать рабочей")
-                    onClicked: root.activateRequested()
-                }
-                AvButton {
-                    visible: root.manageVisible && root.canSwitchWithPause
-                    Layout.minimumWidth: implicitWidth
-                    small: true
-                    text: qsTr("Переключить с паузой")
-                    onClicked: root.switchWithPauseRequested()
-                }
-                AvButton {
-                    visible: root.manageVisible && root.cardState === "broken"
-                        && root.canReinstall
-                    Layout.minimumWidth: implicitWidth
-                    small: true
-                    variant: "primary"
-                    text: qsTr("Переустановить")
-                    onClicked: root.reinstallRequested()
-                }
-                AvButton {
-                    visible: root.manageVisible
-                    enabled: root.cardState !== "switching"
-                    Layout.minimumWidth: implicitWidth
-                    small: true
-                    text: qsTr("Удалить")
-                    onClicked: root.removeRequested()
-                }
+            // Кнопки установленной модели (§5.4, состояния 19–20, 25).
+            AvButton {
+                visible: root.manageVisible && root.updateAvailable
+                    && root.cardState !== "switching" && root.cardState !== "broken"
+                Layout.minimumWidth: visible ? implicitWidth : 0
+                small: true
+                iconName: "down"
+                text: qsTr("Обновить")
+                onClicked: root.updateRequested()
+            }
+            AvButton {
+                visible: root.manageVisible && root.badge !== "active"
+                    && root.cardState !== "switching" && root.cardState !== "broken"
+                Layout.minimumWidth: visible ? implicitWidth : 0
+                small: true
+                variant: "primary"
+                text: qsTr("Сделать рабочей")
+                onClicked: root.activateRequested()
+            }
+            AvButton {
+                visible: root.manageVisible && root.canSwitchWithPause
+                Layout.minimumWidth: visible ? implicitWidth : 0
+                small: true
+                text: qsTr("Переключить с паузой")
+                onClicked: root.switchWithPauseRequested()
+            }
+            AvButton {
+                visible: root.manageVisible
+                    && (root.cardState === "broken" || root.cardState === "corrupted")
+                    && root.canReinstall
+                Layout.minimumWidth: visible ? implicitWidth : 0
+                small: true
+                variant: "primary"
+                text: qsTr("Переустановить")
+                onClicked: root.reinstallRequested()
+            }
+            AvButton {
+                visible: root.manageVisible
+                enabled: root.cardState !== "switching" && root.badge !== "active"
+                Layout.minimumWidth: visible ? implicitWidth : 0
+                Layout.alignment: Qt.AlignRight | Qt.AlignTop
+                Layout.rightMargin: Theme.cardBorder
+                small: true
+                text: qsTr("Удалить")
+                onClicked: root.removeRequested()
             }
         }
     }

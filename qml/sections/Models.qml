@@ -22,7 +22,6 @@ Item {
 
     Component.onDestruction: {
         removeDialog.close();
-        unavailableDialog.close();
     }
 
     function requestRemoval(modelId) {
@@ -30,20 +29,15 @@ Item {
             var entry = root.entries[i];
             if (entry.id !== modelId)
                 continue;
-            if (entry.badge === "active") {
-                unavailableDialog.modelName = entry.name;
-                unavailableDialog.heading = qsTr("Сначала выберите другую модель");
-                unavailableDialog.message = qsTr("%1 сейчас активна — без модели диктовка работать не будет. Выберите другую установленную модель, после этого удаление станет доступно.").arg(unavailableDialog.modelName);
-                unavailableDialog.open();
-            } else {
-                removeDialog.modelId = modelId;
-                removeDialog.modelName = entry.name;
-                removeDialog.modelSize = entry.sizeText;
-                removeDialog.bridge = root.settings;
-                removeDialog.heading = qsTr("Удалить %1?").arg(removeDialog.modelName);
-                removeDialog.message = qsTr("С диска будет удалено %1 из папки моделей. Настройки и статистика останутся.").arg(removeDialog.modelSize);
-                removeDialog.open();
-            }
+            if (entry.badge === "active")
+                return;
+            removeDialog.modelId = modelId;
+            removeDialog.modelName = entry.name;
+            removeDialog.modelSize = entry.sizeText;
+            removeDialog.bridge = root.settings;
+            removeDialog.heading = qsTr("Удалить %1?").arg(removeDialog.modelName);
+            removeDialog.message = qsTr("С диска будет удалено %1 из папки моделей. Настройки и статистика останутся.").arg(removeDialog.modelSize);
+            removeDialog.open();
             return;
         }
     }
@@ -105,10 +99,6 @@ Item {
         measurementMode: true
         ramMb: entry.ramMb !== undefined ? entry.ramMb : 0
         ramMeasured: entry.ramMeasured === true
-        speedKind: entry.speedKind !== undefined ? entry.speedKind : "no_data"
-        speedText: entry.speedText !== undefined ? entry.speedText : ""
-        speedValue: entry.speedValue !== undefined ? entry.speedValue : 0
-        qualityValue: entry.qualityValue !== undefined ? entry.qualityValue : null
         selected: entry.selected === true
         badge: entry.badge !== undefined ? entry.badge : ""
         cardState: entry.state !== undefined ? entry.state : "available"
@@ -120,6 +110,7 @@ Item {
         canSwitchWithPause: entry.canSwitchWithPause !== undefined
             ? entry.canSwitchWithPause : false
         vendor: entry.vendor !== undefined ? entry.vendor : ""
+        vendorShort: entry.vendorShort !== undefined ? entry.vendorShort : vendor
         metrics: entry.metrics !== undefined ? entry.metrics : []
         tags: entry.tags !== undefined ? entry.tags : []
         updateAvailable: entry.updateAvailable === true
@@ -144,16 +135,19 @@ Item {
         // Шапка списка: фильтр слева, счётчик справа (§5.6).
         RowLayout {
             id: filterRow
+            objectName: "modelFilterRow"
             width: content.width
             spacing: Theme.chipGap
 
             FilterChip {
+                objectName: "allLanguagesChip"
                 label: qsTr("Все языки")
                 active: !root.domesticOnly
                 onClicked: root.domesticOnly = false
             }
 
             FilterChip {
+                objectName: "domesticChip"
                 label: qsTr("Только отечественные")
                 active: root.domesticOnly
                 onClicked: root.domesticOnly = true
@@ -172,19 +166,21 @@ Item {
             }
         }
 
-        // Добор до 12 между строкой фильтра и первой группой (макет §5.6).
-        Item {
-            width: 1
-            height: 4
-        }
-
         Column {
             width: content.width
             spacing: Theme.spaceGroupCaptionGap
             visible: root.installedEntries.length > 0
 
-            GroupCaption {
-                text: qsTr("Установленные · %1").arg(root.installedEntries.length)
+            Item {
+                width: parent.width
+                height: installedCaption.implicitHeight + Theme.modelCardFirstGroupTopGap - content.spacing
+
+                GroupCaption {
+                    id: installedCaption
+                    objectName: "installedCaption"
+                    anchors.bottom: parent.bottom
+                    text: qsTr("Установленные · %1").arg(root.installedEntries.length)
+                }
             }
 
             Column {
@@ -202,13 +198,27 @@ Item {
             }
         }
 
+        Item {
+            visible: root.installedEntries.length > 0 && root.availableEntries.length > 0
+            width: 1
+            height: Theme.spaceGroupTopGap - 2 * content.spacing
+        }
+
         Column {
             width: content.width
             spacing: Theme.spaceGroupCaptionGap
             visible: root.availableEntries.length > 0
 
-            GroupCaption {
-                text: qsTr("Доступные · %1").arg(root.availableEntries.length)
+            Item {
+                width: parent.width
+                height: availableCaption.implicitHeight + (root.installedEntries.length > 0 ? 0 : Theme.modelCardFirstGroupTopGap - content.spacing)
+
+                GroupCaption {
+                    id: availableCaption
+                    objectName: "availableCaption"
+                    anchors.bottom: parent.bottom
+                    text: qsTr("Доступные · %1").arg(root.availableEntries.length)
+                }
             }
 
             Column {
@@ -254,6 +264,7 @@ Item {
             spacing: 9 // Макет шага 2: зазор между частями итога.
 
             Text {
+                objectName: "selectionSummary"
                 Layout.maximumWidth: summary.width
                 text: root.hasSelection ? root.settings.selectionSummary
                     : qsTr("Пока ничего не выбрано")
@@ -276,6 +287,7 @@ Item {
 
             Text {
                 id: selectionMessage
+                objectName: "selectionMessage"
                 Layout.fillWidth: true
                 Layout.minimumWidth: 0
                 Layout.maximumWidth: implicitWidth
@@ -290,7 +302,8 @@ Item {
                 color: root.settings && root.settings.selectionMessage !== ""
                     ? Theme.onboardingSummaryLineColorWarn : Theme.onboardingSummaryLineFreeColor
                 font.family: Theme.fontUi
-                font.pixelSize: Theme.onboardingSummaryLineSize
+                font.pixelSize: root.settings && root.settings.selectionMessage !== ""
+                    ? Theme.onboardingSummaryLineSize : Theme.onboardingSummaryLineFreeSize
                 renderType: Text.NativeRendering
                 wrapMode: Text.WordWrap
             }
@@ -329,11 +342,4 @@ Item {
         onCancelled: removeDialog.modelId = ""
     }
 
-    AvDialog {
-        id: unavailableDialog
-        parent: root.Overlay.overlay ? root.Overlay.overlay : root
-        property string modelName: ""
-        confirmText: qsTr("Понятно")
-        cancelText: ""
-    }
 }

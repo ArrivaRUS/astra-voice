@@ -900,10 +900,16 @@ def test_remove_model_refuses_the_working_model(rig: Rig) -> None:
     port, downloads, _ = rig
     port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
     port.current = (GIGAAM.id, GIGAAM.revision)
+    port.record_size_bytes = Mock(side_effect=AssertionError("active removal reached storage"))  # type: ignore[method-assign]
+    changed = QSignalSpy(downloads.modelsChanged)
+    before = card(downloads, GIGAAM.id)
 
     downloads.removeModel(GIGAAM.id)
     downloads.removeModel("неизвестная")
 
+    assert len(changed) == 0
+    assert card(downloads, GIGAAM.id) == before
+    port.record_size_bytes.assert_not_called()
     assert port.removed == []
     assert card(downloads, GIGAAM.id)["badge"] == "active"
 

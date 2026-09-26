@@ -16,7 +16,7 @@ Item {
 
     implicitWidth: Theme.onboardingStep2ContentW
     implicitHeight: installButton.y + installButton.height
-    width: implicitWidth
+    width: Math.min(implicitWidth, parent ? parent.step2AvailableWidth : implicitWidth)
     height: implicitHeight
 
     Text {
@@ -67,6 +67,7 @@ Item {
                 recommended: modelData.recommended
                 sizeText: modelData.sizeText
                 ramText: modelData.ramText
+                ramMeasured: modelData.ramMeasured === true
                 selected: modelData.selected
                 badge: modelData.badge
                 cardState: modelData.state
@@ -76,6 +77,8 @@ Item {
                 memoryShortage: modelData.memoryShortage === true
                 canReinstall: modelData.canReinstall !== false
                 vendor: modelData.vendor
+                vendorShort: modelData.vendorShort !== undefined
+                    ? modelData.vendorShort : modelData.vendor
                 metrics: modelData.metrics
                 tags: modelData.tags
                 onToggleRequested: { if (root.bridge) root.bridge.toggleModel(modelData.id); }
@@ -94,6 +97,7 @@ Item {
         spacing: 9 // Макет шага 2: зазор между частями итога.
 
         Text {
+            objectName: "selectionSummary"
             Layout.maximumWidth: summary.width
             text: root.bridge && root.bridge.selectionSummary !== ""
                 ? root.bridge.selectionSummary : qsTr("Пока ничего не выбрано")
@@ -116,6 +120,7 @@ Item {
 
         Text {
             id: selectionMessage
+            objectName: "selectionMessage"
             Layout.fillWidth: true
             Layout.minimumWidth: 0
             Layout.maximumWidth: implicitWidth
@@ -130,7 +135,8 @@ Item {
             color: root.bridge && root.bridge.selectionMessage !== ""
                 ? Theme.onboardingSummaryLineColorWarn : Theme.onboardingSummaryLineFreeColor
             font.family: Theme.fontUi
-            font.pixelSize: Theme.onboardingSummaryLineSize
+            font.pixelSize: root.bridge && root.bridge.selectionMessage !== ""
+                ? Theme.onboardingSummaryLineSize : Theme.onboardingSummaryLineFreeSize
             renderType: Text.NativeRendering
             wrapMode: Text.WordWrap
         }

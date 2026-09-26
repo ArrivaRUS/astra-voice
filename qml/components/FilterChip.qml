@@ -17,8 +17,6 @@ Rectangle {
     color: root.active ? Theme.primary
         : mouse.pressed ? Theme.statePressedOnSurface
         : mouse.containsMouse ? Theme.stateHoverOnSurface : Theme.bgSurface
-    border.width: Theme.borderHairline
-    border.color: root.active ? Theme.primary : Theme.border
     antialiasing: true
     activeFocusOnTab: true
 
@@ -52,6 +50,16 @@ Rectangle {
             root.forceActiveFocus(Qt.MouseFocusReason);
             root.clicked();
         }
+    }
+
+    // Полупрозрачную обводку смешиваем с заливкой чипа, а не с фоном окна.
+    Rectangle {
+        anchors.fill: parent
+        radius: parent.radius
+        color: "transparent"
+        border.width: Theme.borderHairline
+        border.color: root.active ? Theme.primary : Theme.border
+        antialiasing: false
     }
 
     // Кольцо фокуса: 2 px снаружи, зазор 2 (сквозное правило 1).

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from decimal import ROUND_HALF_UP, Decimal
 
 
 def clean_display_name(text: str, *, limit: int = 80, for_menu: bool = False) -> str:
@@ -83,14 +84,21 @@ def format_space(size_bytes: float) -> str:
     return format_size(size_bytes)
 
 
-def format_wer(value: float) -> str:
-    """Доля ошибок в словах как в источнике: «WER 7,60 %»."""
-    return f"WER {value:.2f} %".replace(".", ",")
+def _shown(value: Decimal | float) -> Decimal:
+    """Округлить показанную метрику до десятых с половиной вверх."""
+    return Decimal(str(value)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
 
 
-def format_rtfx(value: float) -> str:
+def format_accuracy(wer: float, *, shown: Decimal | None = None) -> str:
+    """Доля верно распознанных слов с округлением половины вверх."""
+    accuracy = shown if shown is not None else _shown(Decimal(100) - Decimal(str(wer)))
+    return f"{str(accuracy).replace('.', ',')} %"
+
+
+def format_rtfx(value: float, *, shown: Decimal | None = None) -> str:
     """Во сколько раз распознавание быстрее речи: «42,5× быстрее речи»."""
-    return f"{value:.1f}× быстрее речи".replace(".", ",")
+    rounded = shown if shown is not None else _shown(value)
+    return f"{str(rounded).replace('.', ',')}× быстрее речи"
 
 
 class SpeedTracker:

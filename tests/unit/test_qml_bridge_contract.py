@@ -507,7 +507,14 @@ def test_model_measurement_card_contract() -> None:
     document = DOC_PATH.read_text(encoding="utf-8")
     section = (REPO / "qml/sections/Models.qml").read_text(encoding="utf-8")
     card = (REPO / "qml/components/OnboardingModelCard.qml").read_text(encoding="utf-8")
-    for field in ("ramMb", "ramMeasured", "speedKind", "speedText", "speedValue", "qualityValue"):
+    for field in ("ramText", "ramMeasured", "vendorShort", "metrics"):
         assert f"| `{field}` |" in document
         assert f"entry.{field}" in section
         assert f"root.{field}" in card
+    for field in ("fill", "level", "measured"):
+        assert f"| `{field}` |" in document
+        assert f"modelData.{field}" in card
+    for field in ("speedKind", "speedText", "speedValue", "qualityValue"):
+        assert field not in document
+        assert field not in card
+        assert field not in section

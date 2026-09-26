@@ -154,26 +154,10 @@ def merge_measurement(
     )
     ram = local.get("ram_mb")
     measured_ram = type(ram) is int and ram >= 0
-    speed = measured_rtfx(local)
-    benchmark = entry.metrics.rtfx
-    if speed is not None:
-        speed_kind = "measured"
-        speed_number = speed
-    elif benchmark is not None:
-        speed_kind = "benchmark"
-        speed_number = benchmark.value
-    else:
-        speed_kind = "no_data"
-        speed_number = 0.0
-    wer = entry.metrics.wer_ru
     return {
         "ramMb": ram if measured_ram else entry.min_ram_mb,
         "ramMeasured": measured_ram,
-        "speedKind": speed_kind,
-        "speedValue": min(1.0, max(0.0, math.log(speed_number) / math.log(60)))
-        if speed_number > 0
-        else 0.0,
-        "qualityValue": min(1.0, max(0.0, (30 - wer.value) / 25)) if wer else None,
+        "measuredRtfx": measured_rtfx(local),
     }
 
 

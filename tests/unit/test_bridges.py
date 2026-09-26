@@ -3733,6 +3733,7 @@ def test_measurements_cache_refreshes_on_signal(
             {
                 f"{port.entry.id}@{port.entry.revision}": {
                     "ram_mb": 600,
+                    "rtfx": 25,
                     "threads": 2,
                     "build": __version__,
                 }
@@ -3743,6 +3744,12 @@ def test_measurements_cache_refreshes_on_signal(
     downloads.measurements_changed()
     assert downloads.models[0]["ramMb"] == 600
     assert downloads.models[0]["ramMeasured"]
+    assert downloads.models[0]["ramText"] == "600 МБ"
+    speed = downloads.models[0]["metrics"][1]
+    assert speed["measured"] is True
+    assert speed["text"] == "25,0× быстрее речи"
+    assert speed["fill"] == 1.0
+    assert speed["level"] == "good"
 
 
 def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
@@ -3760,10 +3767,6 @@ def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
             "ramText": "768 МБ",
             "ramMb": 768,
             "ramMeasured": False,
-            "speedKind": "no_data",
-            "speedText": "",
-            "speedValue": 0.0,
-            "qualityValue": None,
             "selected": False,
             "badge": "",
             "state": "available",
@@ -3775,16 +3778,18 @@ def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
             "canReinstall": True,
             "progress": 0.0,
             "vendor": "",
+            "vendorShort": "",
             "domestic": False,
             "updateAvailable": False,
             "tags": [],
             "metrics": [
                 {
                     "kind": "quality",
-                    "label": "Качество",
+                    "label": "Точность",
                     "text": "",
                     "fill": 0.0,
                     "hasData": False,
+                    "level": "",
                     "measured": False,
                 },
                 {
@@ -3793,6 +3798,7 @@ def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
                     "text": "",
                     "fill": 0.0,
                     "hasData": False,
+                    "level": "",
                     "measured": False,
                 },
             ],
