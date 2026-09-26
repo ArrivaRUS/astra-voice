@@ -91,3 +91,35 @@ def test_active_window_change_releases_grab_within_200_ms(
         assert received == [("cancel", "")]
     finally:
         watchdog.close()
+
+
+def test_empty_active_window_then_own_window_keeps_capture(
+    active_windows: tuple[Any, Any, Any, Any, int],
+) -> None:
+    conn, root, first, second, atom = active_windows
+    received: list[tuple[str, str]] = []
+    root.change_property(atom, Xatom.WINDOW, 32, [0])
+    conn.sync()
+    watchdog = CaptureFieldWatchdog(
+        display_factory=X11Display,
+        on_key_event=lambda action, value: received.append((action, value)),
+    )
+    try:
+        assert watchdog.open(own_window=first.id)
+        root.change_property(atom, Xatom.WINDOW, 32, [first.id])
+        conn.sync()
+        time.sleep(0.03)
+        assert _foreign_grab(root, conn) != X.GrabSuccess
+        assert watchdog.active
+        assert received == []
+
+        root.change_property(atom, Xatom.WINDOW, 32, [second.id])
+        conn.sync()
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline and (watchdog.active or not received):
+            time.sleep(0.005)
+        assert not watchdog.active
+        assert received == [("cancel", "")]
+        assert _foreign_grab(root, conn) == X.GrabSuccess
+    finally:
+        watchdog.close()

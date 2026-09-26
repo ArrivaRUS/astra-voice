@@ -69,6 +69,7 @@ class CaptureFieldWatchdog:
         self._thread: threading.Thread | None = None
         self._closed = False
         self._result_sent = False
+        self._own_window: int | None = None
         self._wake_read = self._wake_write = -1
         self._wake_closed = True
 
@@ -81,12 +82,13 @@ class CaptureFieldWatchdog:
         """Захват ещё держится, включая просроченный до закрытия соединения."""
         return self._active.is_set()
 
-    def open(self, window_id: int | None = None) -> bool:
+    def open(self, window_id: int | None = None, *, own_window: int | None = None) -> bool:
         """Запускает поток и ждёт факт захвата не более секунды; ошибка → False."""
         with self._lock:
             if self._closed:
                 return False
             if self._thread is None:
+                self._own_window = own_window or None
                 try:
                     self._wake_read, self._wake_write = os.pipe()
                     self._wake_closed = False
@@ -254,7 +256,10 @@ class CaptureFieldWatchdog:
                     except (AttributeError, ValueError, OSError):
                         log.warning("Не удалось прочитать активное окно: захват снимается")
                         return True
-                    if active_window != active_watch[1]:
+                    if self._own_window is not None:
+                        if active_window not in (None, 0, self._own_window):
+                            return True
+                    elif active_window != active_watch[1]:
                         return True
                 elif event.type == X.MappingNotify:
                     if event.request in (X.MappingKeyboard, X.MappingModifier):

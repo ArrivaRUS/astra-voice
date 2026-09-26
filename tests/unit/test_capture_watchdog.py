@@ -312,8 +312,45 @@ def test_active_window_change_closes_socket_then_cancels(rig: Rig, next_window: 
     assert not rig.expired.is_set()
 
 
+@pytest.mark.parametrize("initial", [None, 42])
+@pytest.mark.parametrize("next_window", [None, 0, 42, 43])
+def test_own_window_only_cancels_on_foreign_window(
+    rig: Rig, initial: int | None, next_window: int | None
+) -> None:
+    received: list[tuple[str, str]] = []
+    notified = threading.Event()
+
+    def factory() -> PropertyDisplay:
+        display = PropertyDisplay(rig, property_present=True)
+        display.active_id = initial
+        rig.displays.append(display)
+        return display
+
+    def on_key(action: str, value: str) -> None:
+        received.append((action, value))
+        notified.set()
+
+    rig.watchdog = CaptureFieldWatchdog(display_factory=factory, on_key_event=on_key)
+    assert rig.watchdog.open(own_window=42)
+    display = rig.displays[0]
+    assert isinstance(display, PropertyDisplay)
+    display.publish(1, next_window)
+    if next_window == 43:
+        assert notified.wait(WAIT_S)
+        assert received == [("cancel", "")]
+        assert not rig.watchdog.active
+    else:
+        assert not notified.wait(0.03)
+        assert rig.watchdog.active
+        assert received == []
+    rig.watchdog.close()
+
+
 @pytest.mark.parametrize("error", [AttributeError, ValueError, OSError])
-def test_active_window_read_failure_cancels_capture(rig: Rig, error: type[Exception]) -> None:
+@pytest.mark.parametrize("own_window", [None, 42])
+def test_active_window_read_failure_cancels_capture(
+    rig: Rig, error: type[Exception], own_window: int | None
+) -> None:
     received: list[tuple[str, str]] = []
     notified = threading.Event()
     callback_saw_closed: list[bool] = []
@@ -333,7 +370,7 @@ def test_active_window_read_failure_cancels_capture(rig: Rig, error: type[Except
         notified.set()
 
     rig.watchdog = CaptureFieldWatchdog(display_factory=factory, poll_ms=1000, on_key_event=on_key)
-    assert rig.watchdog.open()
+    assert rig.watchdog.open(own_window=own_window)
     display = rig.displays[0]
     assert isinstance(display, BrokenReadDisplay)
     display.publish(1, 42)

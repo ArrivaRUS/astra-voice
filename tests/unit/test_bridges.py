@@ -4968,8 +4968,14 @@ def test_app_uses_one_download_queue_and_shuts_it_down_once(
     rig.app.exec_.side_effect = event_loop
     assert app_mod.main([]) == 7
     service_factory.assert_called_once()
+    revoked_check = download_factory.call_args.kwargs["revoked_check"]
+    assert callable(revoked_check)
+    rig.runtime.set_revoked_check.assert_called_once_with(revoked_check)
     download_factory.assert_called_once_with(
-        port, store=rig.factory.call_args.kwargs["model_store"], settings=rig.settings
+        port,
+        store=rig.factory.call_args.kwargs["model_store"],
+        settings=rig.settings,
+        revoked_check=revoked_check,
     )
     stop.assert_called_once()
 
