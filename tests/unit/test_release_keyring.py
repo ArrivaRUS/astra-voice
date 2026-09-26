@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -128,26 +128,89 @@ def test_verifier_accepts_signature_from_expired_subkey(tmp_path: Path) -> None:
     assert result.ok, result.reason
     assert result.fingerprint == fprs[1]
     assert result.primary_fingerprint == primary
+    assert any(line.startswith("EXPKEYSIG") for line in result.status)
 
 
-def test_build_manifest_sign_pins_exact_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _build_manifest_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location(
         "build_manifest", ROOT / "scripts/build_manifest.py"
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def test_build_manifest_sign_pins_exact_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _build_manifest_module()
+    key = "7602A029F0E34CD2344A9CDA657ED04689FF4D79"
     calls: list[list[str]] = []
 
-    def fake_run(argv: list[str], *, check: bool) -> SimpleNamespace:
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        check = kwargs["check"]
         assert check is False
+        calls.append(argv)
+        if argv[0] == "gpgv":
+            assert kwargs["capture_output"] is True
+            assert kwargs["text"] is True
+            return SimpleNamespace(returncode=0, stdout=f"[GNUPG:] VALIDSIG {key} metadata\n")
+        assert argv[0] == "gpg"
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    module._sign(tmp_path, key)
+    module._sign(tmp_path, key + "!")
+    signing = [argv for argv in calls if argv[0] == "gpg"]
+    verifying = [argv for argv in calls if argv[0] == "gpgv"]
+    assert len(signing) == len(verifying) == 2
+    assert [argv[argv.index("--local-user") + 1] for argv in signing] == [key + "!"] * 2
+    for argv in verifying:
+        assert argv[argv.index("--status-fd") + 1] == "1"
+        assert argv[argv.index("--keyring") + 1] == str((ROOT / "data/keys/release.gpg").resolve())
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "error"),
+    [
+        ("[GNUPG:] VALIDSIG 9053EE0C0085683CE6C7042EDC2E593225D80428\n", 0, "не тем ключом"),
+        ("", 1, "gpgv не подтвердил подпись"),
+    ],
+)
+def test_build_manifest_rejects_unverified_signer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+    returncode: int,
+    error: str,
+) -> None:
+    module = _build_manifest_module()
+    key = "7602A029F0E34CD2344A9CDA657ED04689FF4D79"
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[0] == "gpgv":
+            return SimpleNamespace(returncode=returncode, stdout=stdout)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    with pytest.raises(module.BuildError, match=error):
+        module._sign(tmp_path, key)
+
+
+def test_build_manifest_rejects_short_key_before_signing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _build_manifest_module()
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         calls.append(argv)
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
-    module._sign(tmp_path, "ABC")
-    module._sign(tmp_path, "ABC!")
-    assert len(calls) == 2
-    assert [argv[argv.index("--local-user") + 1] for argv in calls] == ["ABC!", "ABC!"]
+    with pytest.raises(
+        module.BuildError, match=r"--key должен быть отпечатком подключа \(40 hex\)"
+    ):
+        module._sign(tmp_path, "ABC")
+    assert calls == []

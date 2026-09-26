@@ -27,8 +27,10 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import subprocess  # nosec B404 — вызывается только явный gpg с фиксированным argv
 import sys
+import tempfile
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +43,7 @@ CACHE_PATH = DATA / "catalog-hf-cache.json"
 CATALOG_PATH = DATA / "catalog.json"
 SCHEMA_PATH = DATA / "catalog.schema.json"
 SIGNATURE_PATH = DATA / "catalog.json.sig"
+KEYRING_PATH = DATA / "keys" / "release.gpg"
 
 API_BASE = "https://huggingface.co/api/models"
 RESOLVE_BASE = "https://huggingface.co"
@@ -234,6 +237,9 @@ def _current() -> dict[str, Any] | None:
 
 
 def _sign(homedir: Path, key: str) -> None:
+    expected = key.removesuffix("!").upper()
+    if re.fullmatch(r"[0-9A-F]{40}", expected) is None:
+        raise BuildError("--key должен быть отпечатком подключа (40 hex)")
     argv = [
         "gpg",
         "--homedir",
@@ -241,7 +247,7 @@ def _sign(homedir: Path, key: str) -> None:
         "--batch",
         "--yes",
         "--local-user",
-        key if key.endswith("!") else key + "!",
+        expected + "!",
         "--detach-sign",
         "--output",
         str(SIGNATURE_PATH),
@@ -250,6 +256,33 @@ def _sign(homedir: Path, key: str) -> None:
     result = subprocess.run(argv, check=False)  # nosec B603 — argv фиксирован, shell не нужен
     if result.returncode != 0:
         raise BuildError("gpg не подписал каталог.")
+    with tempfile.TemporaryDirectory(prefix="astra-voice-gpgv-") as empty_home:
+        verify_argv = [
+            "gpgv",
+            "--status-fd",
+            "1",
+            "--homedir",
+            empty_home,
+            "--keyring",
+            str(KEYRING_PATH.resolve()),
+            str(SIGNATURE_PATH),
+            str(CATALOG_PATH),
+        ]
+        try:
+            verified = subprocess.run(  # nosec B603 — argv фиксирован, shell не нужен
+                verify_argv, capture_output=True, text=True, check=False
+            )
+        except OSError as exc:
+            raise BuildError(f"gpgv не подтвердил подпись встроенной связкой: {exc}") from exc
+    valid = [
+        line.split()[2].upper()
+        for line in verified.stdout.splitlines()
+        if line.startswith("[GNUPG:] VALIDSIG ") and len(line.split()) > 2
+    ]
+    if verified.returncode != 0 or len(valid) != 1:
+        raise BuildError("gpgv не подтвердил подпись встроенной связкой")
+    if valid[0] != expected:
+        raise BuildError(f"каталог подписан не тем ключом: {valid[0]}, ожидался {expected}")
     print(f"подписан: {SIGNATURE_PATH.relative_to(REPO)}")
 
 
