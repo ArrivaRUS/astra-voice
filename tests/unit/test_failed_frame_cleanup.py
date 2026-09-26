@@ -70,14 +70,27 @@ def test_failure():
     assert references[0]() is None
 
 
-def test_non_xvfb_failure_shows_locals(pytester: pytest.Pytester) -> None:
+def test_non_xvfb_failure_shows_locals(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    references: list[weakref.ReferenceType[object]] = []
+    witness = ModuleType("frame_cleanup_witness")
+    witness.__dict__["references"] = references
+    monkeypatch.setitem(sys.modules, witness.__name__, witness)
     _install_hook(pytester)
     pytester.makepyfile(
         """
+import weakref
 import pytest
+import frame_cleanup_witness
+
+class Held:
+    pass
 
 @pytest.mark.unit
 def test_failure():
+    held = Held()
+    frame_cleanup_witness.references.append(weakref.ref(held))
     actual = 1
     expected = 2
     assert actual == expected
@@ -88,6 +101,63 @@ def test_failure():
     report = result.stdout.str()
     assert "actual = 1" in report
     assert "expected = 2" in report
+    assert len(references) == 1
+    assert references[0]() is not None
+
+
+def test_xvfb_failure_without_debugging_plugin(pytester: pytest.Pytester) -> None:
+    _install_hook(pytester)
+    pytester.makepyfile(
+        """
+import pytest
+
+@pytest.mark.xvfb
+def test_failure():
+    assert False
+"""
+    )
+    result = pytester.runpytest_inprocess("-q", "-p", "no:debugging")
+    result.assert_outcomes(failed=1)
+    assert "INTERNALERROR" not in result.stdout.str()
+
+
+def test_xvfb_exception_group_releases_nested_frame(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    references: list[weakref.ReferenceType[object]] = []
+    witness = ModuleType("frame_cleanup_witness")
+    witness.__dict__["references"] = references
+    monkeypatch.setitem(sys.modules, witness.__name__, witness)
+    _install_hook(pytester)
+    pytester.makepyfile(
+        """
+import weakref
+import pytest
+import frame_cleanup_witness
+
+class Held:
+    pass
+
+def fail_with_local():
+    held = Held()
+    frame_cleanup_witness.references.append(weakref.ref(held))
+    raise ValueError("nested failure")
+
+def make_group():
+    try:
+        fail_with_local()
+    except ValueError as error:
+        return ExceptionGroup("group failure", [error])
+
+@pytest.mark.xvfb
+def test_failure():
+    raise make_group()
+"""
+    )
+    result = pytester.runpytest_inprocess("-q")
+    result.assert_outcomes(failed=1)
+    assert len(references) == 1
+    assert references[0]() is None
 
 
 def test_xvfb_failure_respects_tracebackhide(pytester: pytest.Pytester) -> None:

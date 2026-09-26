@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib.util
 import json
 import os
@@ -206,7 +207,7 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 
 
 def _clear_failed_test_frames(error: BaseException) -> None:
-    pending = [error]
+    pending: list[BaseException] = [error]
     seen: set[int] = set()
     while pending:
         current = pending.pop()
@@ -221,6 +222,7 @@ def _clear_failed_test_frames(error: BaseException) -> None:
             pending.append(current.__cause__)
         if current.__context__ is not None:
             pending.append(current.__context__)
+        pending.extend(getattr(current, "exceptions", ()))
 
 
 @pytest.hookimpl(wrapper=True)
@@ -232,13 +234,15 @@ def pytest_runtest_makereport(
         call.when == "call"
         and call.excinfo is not None
         and item.get_closest_marker("xvfb") is not None
-        and not item.config.getoption("usepdb")
+        and not item.config.getoption("usepdb", False)
     ):
         # Кадры держат обёртки QML удалённого окна; sip может отдать адрес новым
-        # объектам и вызвать use-after-free. Здесь отчёт уже построен: -l и
-        # __tracebackhide__ работают. В Python 3.11 повторное чтение f_locals
-        # очищает его снимок после clear_frames; только xvfb и без --pdb.
-        _clear_failed_test_frames(call.excinfo.value)
+        # объектам и вызвать use-after-free. Отчёт уже построен: -l и
+        # __tracebackhide__ работают. В Python 3.11 перечитываем снимок f_locals;
+        # в 3.13+ (PEP 667) это прокси, перечитывание не нужно и ничего не делает.
+        # Поведение проверяет tests/unit/test_failed_frame_cleanup.py.
+        with contextlib.suppress(Exception):
+            _clear_failed_test_frames(call.excinfo.value)
     return report
 
 
