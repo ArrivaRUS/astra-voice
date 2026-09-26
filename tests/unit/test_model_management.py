@@ -612,12 +612,12 @@ def test_source_text_and_progress_stay_safe(kind: str, text: str) -> None:
 @pytest.mark.parametrize(
     "code, message",
     [
-        ("admin", "Не удалось загрузить модель — скачивание запрещено администратором"),
-        ("offline", "Не удалось загрузить модель — сеть отключена в настройках"),
-        ("settings", "Не удалось загрузить модель — сеть отключена в настройках"),
+        ("admin", "Скачивание запрещено администратором"),
+        ("offline", "Сеть отключена"),
+        ("settings", "Сеть отключена в настройках"),
         ("no-network", "Не удалось загрузить модель — нет связи с сервером"),
         ("not-allowed", "Не удалось загрузить модель — источник запрещён настройками"),
-        ("bad-sha", "Файл не прошёл проверку — загруженное удалено"),
+        ("bad-sha", "Не удалось загрузить модель — файл не прошёл проверку ни на одном сервере"),
         ("no-space", "Не удалось загрузить модель — не хватает места на диске"),
         ("timeout", "Не удалось загрузить модель — сервер не отвечает"),
         ("server", "Не удалось загрузить модель — сервер ответил ошибкой"),
@@ -632,8 +632,10 @@ def test_download_failure_reason_is_closed(code: str, message: str) -> None:
         downloads._model_finished(f"failed:{code}", "SECRET /private/path")
         downloads._model_thread_finished()
         row = card(downloads, GIGAAM.id)
-        assert (row["state"], row["message"]) == ("failed", message)
-        assert row["canRetry"]
+        blocked = code in {"admin", "offline", "settings"}
+        expected_state = "policy" if code == "admin" else "offline-user" if blocked else "failed"
+        assert (row["state"], row["message"]) == (expected_state, message)
+        assert row["canRetry"] is not blocked
         assert port.discarded == []
     finally:
         downloads.shutdown()
@@ -1655,3 +1657,220 @@ def test_model_service_reads_total_memory_from_store() -> None:
 
     assert service.mem_total_mb() == 8192.0
     store.mem_total_mb.assert_called_once_with()
+
+
+# Сценарии повторного ревью загрузчика (rv2).
+def _manual(downloads: ModelDownloads) -> list[str]:
+    started: list[str] = []
+
+    def start(source: Path | None = None) -> None:
+        if not downloads._queue:
+            return
+        entry = downloads._queue.pop(0)
+        downloads._active_entry = entry
+        started.append(entry.id)
+        downloads._set_card(entry, "downloading")
+        downloads._set_download_state("downloading")
+
+    downloads._start_model_job = start  # type: ignore[method-assign]
+    return started
+
+
+def test_retry_during_switch_then_install_reverts_user_switch(qcore_app: QCoreApplication) -> None:
+    port = FakeManagedPort()
+    third = replace(TONE, id="third", name="Третья")
+    port.catalog = (GIGAAM, TONE, third)
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    port.records[(third.id, third.revision)] = "ok"
+    port.current = (third.id, third.revision)
+    switcher = FakeSwitchPort(enough_memory=True)
+    downloads = ModelDownloads(port, switcher=switcher)
+    started = _manual(downloads)
+    downloads.toggleModel(GIGAAM.id)
+    downloads.startSelectedDownloads()
+    port.space = False
+    downloads._model_finished("no-space", "")
+    downloads._model_thread_finished()
+    downloads.switchModelWithPause(TONE.id)  # пользователь переключает на TONE
+    assert downloads._switching_entry is not None
+    port.space = True
+    downloads.retryModel(GIGAAM.id)  # «Повторить» во время переключения
+    assert started == [GIGAAM.id]
+    switcher.finish("ok")
+    assert port.current == (TONE.id, TONE.revision)
+    downloads._model_finished("installed", "")
+    downloads._model_thread_finished()
+    assert port.current == (TONE.id, TONE.revision), ("started", started, "current", port.current)
+
+
+def test_onboarding_back_to_step2_while_downloading(qcore_app: QCoreApplication) -> None:
+    port = FakeManagedPort()
+    downloads, started = manual_queue(port)
+    downloads.toggleModel(GIGAAM.id)
+    downloads.startSelectedDownloads()
+    assert started == [GIGAAM.id]
+    assert downloads.canContinueFromModel, "во время загрузки выбранной модели «Продолжить» гаснет"
+
+
+def test_onboarding_cancel_paused_then_start_again(qcore_app: QCoreApplication) -> None:
+    port = FakeManagedPort()
+    downloads, started = manual_queue(port)
+    downloads.toggleModel(GIGAAM.id)
+    downloads.toggleModel(TONE.id)
+    downloads.startSelectedDownloads()
+    port.space = False
+    downloads._model_finished("no-space", "")
+    downloads._model_thread_finished()
+    downloads.cancelDownloads(discard=False)
+    assert port.discarded == []
+    assert not downloads._queue_running and downloads._paused_entry is None and not downloads._queue
+    assert card(downloads, GIGAAM.id)["state"] == "available"
+    assert card(downloads, TONE.id)["state"] == "available"
+    port.space = True
+    downloads.startSelectedDownloads()
+    assert started == [GIGAAM.id, GIGAAM.id]
+
+
+def test_remove_while_paused_then_retry(qcore_app: QCoreApplication) -> None:
+    port = FakeManagedPort()
+    third = replace(TONE, id="third", name="Третья")
+    port.catalog = (GIGAAM, TONE, third)
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    port.records[(third.id, third.revision)] = "ok"
+    port.current = (third.id, third.revision)
+    downloads, started = manual_queue(port)
+    downloads.toggleModel(GIGAAM.id)
+    downloads.startSelectedDownloads()
+    port.space = False
+    downloads._model_finished("no-space", "")
+    downloads._model_thread_finished()
+    downloads.removeModel(TONE.id)
+    assert port.removed == [(TONE.id, TONE.revision)]
+    assert card(downloads, GIGAAM.id)["state"] == "paused-no-space"
+    port.space = True
+    downloads.retryModel(GIGAAM.id)
+    assert started == [GIGAAM.id, GIGAAM.id]
+    downloads._model_finished("installed", "")
+    downloads._model_thread_finished()
+    assert port.current == (third.id, third.revision)
+    assert downloads.downloadState == "done"
+
+
+def test_cancel_paused_during_switch_does_not_start_next() -> None:
+    port = FakeManagedPort()
+    third = replace(TONE, id="third", name="Третья")
+    port.catalog = (GIGAAM, TONE, third)
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    switcher = FakeSwitchPort(enough_memory=True)
+    downloads = ModelDownloads(port, switcher=switcher)
+    started = _manual(downloads)
+    downloads.toggleModel(GIGAAM.id)
+    downloads.toggleModel(third.id)
+    downloads.startSelectedDownloads()
+    port.space = False
+    downloads._model_finished("no-space", "")
+    downloads._model_thread_finished()
+    downloads.switchModelWithPause(TONE.id)
+    assert downloads._switching_entry is not None
+    downloads.cancelModel(GIGAAM.id)
+    assert started == [GIGAAM.id]
+    assert downloads._paused_entry is GIGAAM
+    assert [entry.id for entry in downloads._queue] == [third.id]
+    assert card(downloads, GIGAAM.id)["state"] == "paused-no-space"
+    switcher.finish("ok")
+
+
+def test_start_model_job_waits_for_switch_and_recheck() -> None:
+    downloads = ModelDownloads(FakeManagedPort())
+    downloads._queue = [GIGAAM]
+    downloads._queue_running = True
+    downloads._switching_entry = TONE
+    downloads._start_model_job()
+    assert downloads._queue == [GIGAAM]
+    assert downloads._model_thread is None
+    downloads._switching_entry = None
+    downloads._rechecking = True
+    downloads._start_model_job()
+    assert downloads._queue == [GIGAAM]
+    assert downloads._model_thread is None
+
+
+def test_install_after_switch_keeps_user_choice() -> None:
+    port = FakeManagedPort()
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    switcher = FakeSwitchPort(enough_memory=True)
+    downloads = ModelDownloads(port, switcher=switcher)
+    started = _manual(downloads)
+    downloads.toggleModel(GIGAAM.id)
+    downloads.startSelectedDownloads()
+    port.space = False
+    downloads._model_finished("no-space", "")
+    downloads._model_thread_finished()
+    downloads.switchModelWithPause(TONE.id)
+    switcher.finish("ok")
+    assert downloads._queue_current == (TONE.id, TONE.revision)
+    port.space = True
+    downloads.retryModel(GIGAAM.id)
+    assert started == [GIGAAM.id, GIGAAM.id]
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    downloads._model_finished("installed", "")
+    downloads._model_thread_finished()
+    assert port.current == (TONE.id, TONE.revision)
+
+
+def test_remove_paused_update_keeps_previous_revision() -> None:
+    port = FakeManagedPort()
+    old_revision = "r1"
+    port.records[(GIGAAM.id, old_revision)] = "ok"
+    downloads, started = manual_queue(port)
+    downloads.updateModel(GIGAAM.id)
+    assert started == [GIGAAM.id]
+    port.space = False
+    downloads._model_finished("no-space", "")
+    downloads._model_thread_finished()
+    row = card(downloads, GIGAAM.id)
+    assert (row["state"], row["badge"]) == ("paused-no-space", "installed")
+    downloads.removeModel(GIGAAM.id)
+    assert port.removed == []
+    assert port.records[(GIGAAM.id, old_revision)] == "ok"
+
+
+@pytest.mark.parametrize(
+    ("code", "state", "message", "legacy_message"),
+    [
+        (
+            "admin",
+            "policy",
+            "Скачивание запрещено администратором",
+            "Задано администратором: работа без сети",
+        ),
+        ("offline", "offline-user", "Сеть отключена", "Включена работа без сети"),
+        (
+            "settings",
+            "offline-user",
+            "Сеть отключена в настройках",
+            "Проверка обновлений выключена в настройках",
+        ),
+    ],
+)
+def test_gate_refusal_blocks_card_actions(
+    code: str, state: str, message: str, legacy_message: str
+) -> None:
+    port = FakeManagedPort()
+    port.allowed = lambda: (False, legacy_message)  # type: ignore[method-assign]
+    downloads, started = manual_queue(port)
+    downloads.toggleModel(GIGAAM.id)
+    downloads.startSelectedDownloads()
+    downloads._model_finished(f"failed:{code}", "")
+    downloads._model_thread_finished()
+    row = card(downloads, GIGAAM.id)
+    assert (row["state"], row["message"], row["canRetry"]) == (state, message, False)
+    assert downloads.modelState == "no-network"
+    assert downloads.modelMessage == legacy_message
+    downloads.retryModel(GIGAAM.id)
+    downloads.toggleModel(GIGAAM.id)
+    downloads.startSelectedDownloads()
+    downloads.download()
+    assert started == [GIGAAM.id]
+    assert card(downloads, GIGAAM.id)["state"] == state

@@ -28,8 +28,11 @@ _PROGRESS_INTERVAL_S = 0.2
 _SPEED_WINDOW_S = 5.0
 INACTIVITY_TIMEOUT_S = 30.0
 _CONTENT_RANGE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)", re.IGNORECASE)
-# Сетевые отказы одного источника: пробуем следующий. Повреждение, отмена,
-# выключенная сеть и запрещённый источник смены источника не оправдывают.
+# Сетевые сбои, bad-status (включая запрещённый редирект) и short-read переходят
+# к следующему источнику с сохранённым .part. bad-checksum полного файла и too-large
+# удаляют .part и переходят дальше; после неверной суммы при докачке сначала один
+# повтор того же источника с нуля. not-allowed, no-network, cancelled и disk-full
+# не запускают перебор источников.
 _MIRROR_CODES = frozenset({"host-unreachable", "timeout", "bad-status", "short-read"})
 
 
@@ -106,6 +109,7 @@ class DownloadError(Exception):
 
     code: str
     message: str
+    resumed_from: int = 0
 
     def __init__(self, code: str, message: str = "") -> None:
         self.code = code
@@ -394,8 +398,7 @@ class Downloader:
                 except Exception:
                     log.warning("Не удалось сообщить об источнике загрузки модели.")
             try:
-                resumed = part.exists() and 0 < part.stat().st_size < file.size
-                for attempt in range(2 if resumed else 1):
+                for attempt in range(2):
                     try:
                         self._download_file(
                             url,
@@ -412,7 +415,7 @@ class Downloader:
                     except DownloadError as error:
                         if error.code in {"bad-checksum", "too-large"}:
                             self._discard_bad_part(part, budget)
-                        if error.code != "bad-checksum" or not resumed or attempt:
+                        if error.code != "bad-checksum" or not error.resumed_from or attempt:
                             raise
                         log.warning(
                             "Источник %d из %d (%s) отдал файл с неверной контрольной суммой; "
@@ -545,7 +548,9 @@ class Downloader:
                             "Файл загружен не полностью. Попробуйте загрузить ещё раз.",
                         )
                     if not hmac.compare_digest(digest.hexdigest(), file.sha256):
-                        raise DownloadError("bad-checksum")
+                        error = DownloadError("bad-checksum")
+                        error.resumed_from = offset
+                        raise error
                     stream.flush()
                     os.fsync(stream.fileno())
                     return

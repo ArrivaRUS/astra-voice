@@ -108,7 +108,7 @@ _FAILURE_MESSAGES = {
     "settings": "Не удалось загрузить модель — сеть отключена в настройках",
     "no-network": "Не удалось загрузить модель — нет связи с сервером",
     "not-allowed": "Не удалось загрузить модель — источник запрещён настройками",
-    "bad-sha": "Файл не прошёл проверку — загруженное удалено",
+    "bad-sha": "Не удалось загрузить модель — файл не прошёл проверку ни на одном сервере",
     "no-space": "Не удалось загрузить модель — не хватает места на диске",
     "timeout": "Не удалось загрузить модель — сервер не отвечает",
     "server": "Не удалось загрузить модель — сервер ответил ошибкой",
@@ -140,6 +140,7 @@ _SAFE_MODEL_MESSAGES = frozenset(
         "Не удалось проверить правила администратора: работа без сети",
         "Задано администратором: работа без сети",
         "Включена работа без сети",
+        "Проверка обновлений выключена в настройках",
     }
 )
 _PUNCTUATION_TAG = "с пунктуацией"
@@ -1362,7 +1363,7 @@ class ModelDownloads(QObject):
         # Цифра каталога — та же, что в нижней строке каждой карточки.
         return f"{total} · {format_size(size)} на диске" if size else total
 
-    def _selected_downloads(self) -> tuple[Any, ...]:
+    def _selected_new(self) -> tuple[Any, ...]:
         installed = self._installed_ids()
         in_queue = {
             entry.id
@@ -1375,11 +1376,22 @@ class ModelDownloads(QObject):
             if entry.id in self._selected
             and not entry.removed_from_catalog
             and not self._badge(entry, installed)
+            and self._card_state(entry, installed) not in {"policy", "offline-user"}
             and entry.id not in in_queue
         )
 
+    def _selected_without_badge(self) -> tuple[Any, ...]:
+        installed = self._installed_ids()
+        return tuple(
+            entry
+            for entry in self._entries
+            if entry.id in self._selected
+            and not entry.removed_from_catalog
+            and not self._badge(entry, installed)
+        )
+
     def _selection_bytes(self) -> int:
-        return sum(entry.size_bytes for entry in self._selected_downloads())
+        return sum(entry.size_bytes for entry in self._selected_new())
 
     def _selection_required_bytes(self) -> int:
         active = self._active_entry or self._paused_entry
@@ -1407,7 +1419,7 @@ class ModelDownloads(QObject):
 
     @property
     def canContinueFromModel(self) -> bool:  # noqa: N802
-        return bool((self._selected_downloads() or self.modelReady) and self.selectionFits)
+        return bool((self._selected_without_badge() or self.modelReady) and self.selectionFits)
 
     @property
     def downloadState(self) -> str:  # noqa: N802
@@ -1526,7 +1538,7 @@ class ModelDownloads(QObject):
         self._notify("selectionChanged")
 
     def startSelectedDownloads(self) -> None:  # noqa: N802
-        entries = self._selected_downloads()
+        entries = self._selected_new()
         if self._queue_running and not self._queue_cancelled:
             self._append_queue(entries)
         else:
@@ -1559,6 +1571,8 @@ class ModelDownloads(QObject):
             self._notify("selectionChanged")
 
     def retryModel(self, model_id: str) -> None:  # noqa: N802
+        if self._switching_entry is not None or self._rechecking:
+            return
         entry = next((entry for entry in self._entries if entry.id == model_id), None)
         if (
             entry is not None
@@ -1684,7 +1698,7 @@ class ModelDownloads(QObject):
             self._previous_current = None
             self._card_states.pop(entry.id, None)
             if result == "ok":
-                if self._paused_entry is not None:
+                if self._queue_running:
                     self._queue_current = self._model.current_ids()
                 self._card_messages.pop(entry.id, None)
                 self._clear_card_hints()
@@ -1883,6 +1897,8 @@ class ModelDownloads(QObject):
             self._notify("selectionChanged")
 
     def cancelModel(self, model_id: str, discard: bool = True) -> None:  # noqa: N802
+        if self._switching_entry is not None or self._rechecking:
+            return
         if any(entry.id == model_id for entry in self._queue):
             self.dequeueModel(model_id)
             return
@@ -2219,17 +2235,24 @@ class ModelDownloads(QObject):
             if entry == self._entry:
                 legacy_state = (
                     "no-network"
-                    if state in {"failed:no-network", "failed:timeout"}
+                    if state
+                    in {
+                        "failed:no-network",
+                        "failed:timeout",
+                        "failed:admin",
+                        "failed:offline",
+                        "failed:settings",
+                    }
                     else "broken"
                     if state.startswith("failed:") or state == "error"
                     else state
                 )
-                self._set_model_state(
-                    legacy_state,
-                    "Загрузка отменена. Можно продолжить скачивание."
-                    if legacy_state == "cancelled" and not self._cancelled_discard
-                    else reason,
-                )
+                legacy_reason = reason
+                if legacy_state == "cancelled" and not self._cancelled_discard:
+                    legacy_reason = "Загрузка отменена. Можно продолжить скачивание."
+                elif state in {"failed:admin", "failed:offline", "failed:settings"}:
+                    legacy_reason = self._model.allowed()[1] if self._model is not None else ""
+                self._set_model_state(legacy_state, legacy_reason)
             if state == "installed":
                 self._set_card(
                     entry, "installed", self._safe_model_message(reason) if reason else ""
@@ -2244,6 +2267,18 @@ class ModelDownloads(QObject):
                     )
                 else:
                     self._set_card(entry, "available")
+            elif state in {"failed:admin", "failed:offline", "failed:settings"}:
+                self._last_failure = "failed"
+                code = state.partition(":")[2]
+                self._set_card(
+                    entry,
+                    "policy" if code == "admin" else "offline-user",
+                    {
+                        "admin": "Скачивание запрещено администратором",
+                        "offline": "Сеть отключена",
+                        "settings": "Сеть отключена в настройках",
+                    }[code],
+                )
             else:
                 self._last_failure = "no-space" if state == "no-space" else "failed"
                 if state == "no-space":
@@ -2432,6 +2467,7 @@ class ModelDownloads(QObject):
             if (
                 self._shutting_down
                 or self._rechecking
+                or self._switching_entry is not None
                 or self._queue_cancelled
                 or self._model_thread is not None
                 or self._model is None
@@ -2468,6 +2504,10 @@ class ModelDownloads(QObject):
                 or self._model_thread is not None
                 or self._queue_running
                 or self._rechecking
+                or (
+                    self._entry is not None
+                    and self._card_state(self._entry) in {"policy", "offline-user"}
+                )
             ):
                 return
             if self._model_state in {"no-network", "no-space", "no-ram"}:

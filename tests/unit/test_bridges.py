@@ -4011,6 +4011,32 @@ def test_model_cards_installed_cannot_be_selected(
     assert port.download_calls == 0
 
 
+def test_onboarding_and_settings_can_continue_while_selected_model_downloads(
+    model_rig: ModelRig,
+) -> None:
+    port, create = model_rig
+    controller = create()
+    downloads = controller._downloads
+    settings = Settings()
+    bridge = SettingsBridge(settings, downloads=downloads, save=Mock())
+    started: list[str] = []
+
+    def start(source: Path | None = None) -> None:
+        entry = downloads._queue.pop(0)
+        downloads._active_entry = entry
+        started.append(entry.id)
+        downloads._set_card(entry, "downloading")
+
+    downloads._start_model_job = start  # type: ignore[method-assign]
+    controller.toggleModel(port.entry.id)
+    controller.startSelectedDownloads()
+    assert started == [port.entry.id]
+    assert downloads.selectionSummary == ""
+    assert controller.canContinueFromModel
+    assert bridge.selectionFits
+    assert bridge.selectionSummary == ""
+
+
 def test_model_selection_total_space_and_inactive_badge(model_rig: ModelRig) -> None:
     _, create = model_rig
     port = QueueModelPort()

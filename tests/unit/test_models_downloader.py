@@ -1162,6 +1162,27 @@ def test_bad_checksum_full_file_uses_next_source(
     assert "huggingface.co" not in caplog.text
 
 
+def test_existing_part_ignored_by_200_does_not_retry_same_source(
+    store: ModelStore, mirrored: CatalogEntry, payloads: dict[str, bytes]
+) -> None:
+    file = mirrored.files[0]
+    good = payloads[file.path]
+    _part(store, mirrored, b"old")
+    seen: list[tuple[str, int | None]] = []
+
+    def get_stream(url: str, *, range_from: int | None, **kwargs: object) -> FakeResponse:
+        host = urlsplit(url).hostname or ""
+        seen.append((host, range_from))
+        return FakeResponse(b"x" * file.size if host == "huggingface.co" else good)
+
+    transport = Mock()
+    transport.get_stream.side_effect = get_stream
+    loader = Downloader(cast(HttpClient, transport), store)
+    result = loader.download(mirrored, progress=lambda state: None, cancel=threading.Event())
+    assert (result / file.path).read_bytes() == good
+    assert seen == [("huggingface.co", 3), ("github.com", None)]
+
+
 def test_all_sources_bad_checksum_removes_part(
     store: ModelStore, mirrored: CatalogEntry, payloads: dict[str, bytes]
 ) -> None:
@@ -1266,6 +1287,26 @@ def test_next_source_log_records_code_and_status_without_url(
     assert "Источник 1 из 3 (hf) не ответил: bad-status 503; пробуем следующий" in caplog.text
     assert "huggingface.co" not in caplog.text
     assert mirrored.files[0].url_path not in caplog.text
+
+
+def test_source_failure_log_omits_redirect_query(
+    store: ModelStore,
+    mirrored: CatalogEntry,
+    payloads: dict[str, bytes],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker = "MARKER"
+    loader, _ = _fake_loader(
+        store,
+        mirrored,
+        payloads,
+        {"github.com"},
+        http.NetworkError("bad-status", f"https://mirror.example.local/probe?token={marker}"),
+    )
+    loader.download(mirrored, progress=lambda state: None, cancel=threading.Event())
+    assert "bad-status" in caplog.text
+    assert marker not in caplog.text
+    assert "/probe?" not in caplog.text
 
 
 def test_corp_is_first_and_uses_escaped_components(
