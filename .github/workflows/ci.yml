@@ -276,6 +276,14 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+      - name: Версия тега и changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          changelog_version="$(sed -n '1s/.*(\([^)]*\)).*/\1/p' packaging/debian/changelog)"
+          if [ "$version" != "$changelog_version" ]; then
+            echo "::error::Версия тега $version не совпадает с changelog $changelog_version"
+            exit 1
+          fi
       - name: Инструменты сборки
         run: |
           apt-get update
@@ -295,7 +303,11 @@ jobs:
           GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
         run: |
           cd dist
-          sha256sum astra-voice_*.deb sbom.cdx.json > SHA256SUMS
+          test -f ../docs/INSTALL-ADMIN.md || { echo '::error::Нет docs/INSTALL-ADMIN.md'; exit 1; }
+          cp ../docs/INSTALL-ADMIN.md .
+          cp ../data/keys/release.gpg release.gpg
+          python3 ../scripts/release_latest_json.py --dist . --version "${GITHUB_REF_NAME#v}"
+          sha256sum astra-voice_*.deb sbom.cdx.json INSTALL-ADMIN.md latest.json release.gpg > SHA256SUMS
           export GNUPGHOME="$(mktemp -d)"
           chmod 700 "$GNUPGHOME"
           printf '%s' "$GPG_SIGNING_KEY" | gpg --batch --quiet --import
@@ -312,4 +324,5 @@ jobs:
             > /etc/apt/sources.list.d/github-cli.list
           apt-get update && apt-get install -y --no-install-recommends gh
           gh release create "${GITHUB_REF_NAME}" --generate-notes \
-            dist/astra-voice_*.deb dist/sbom.cdx.json dist/SHA256SUMS dist/SHA256SUMS.asc
+            dist/astra-voice_*.deb dist/sbom.cdx.json dist/SHA256SUMS dist/SHA256SUMS.asc \
+            dist/INSTALL-ADMIN.md dist/latest.json dist/release.gpg
