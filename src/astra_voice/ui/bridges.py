@@ -143,6 +143,7 @@ class SettingsBridge(QObject):
     downloadStateChanged = pyqtSignal()
     downloadProgressChanged = pyqtSignal()
     downloadTitleChanged = pyqtSignal()
+    downloadCounterChanged = pyqtSignal()
     downloadSourceChanged = pyqtSignal()
     downloadDetailChanged = pyqtSignal()
     speedChanged = pyqtSignal()
@@ -202,6 +203,7 @@ class SettingsBridge(QObject):
                 "downloadState",
                 "downloadProgress",
                 "downloadTitle",
+                "downloadCounter",
                 "downloadSource",
                 "speed",
                 "eta",
@@ -266,6 +268,14 @@ class SettingsBridge(QObject):
     @pyqtProperty(str, notify=selectionChanged)
     def selectionSummary(self) -> str:  # noqa: N802
         return self._downloads.selectionSummary if self._downloads is not None else ""
+
+    @pyqtProperty(str, notify=selectionChanged)
+    def selectionLine(self) -> str:  # noqa: N802
+        return (
+            self._downloads.selectionLine
+            if self._downloads is not None
+            else "Пока ничего не выбрано"
+        )
 
     @pyqtProperty(bool, notify=selectionChanged)
     def selectionFits(self) -> bool:  # noqa: N802
@@ -383,6 +393,10 @@ class SettingsBridge(QObject):
     @pyqtProperty(str, notify=downloadTitleChanged)
     def downloadTitle(self) -> str:  # noqa: N802
         return self._downloads.downloadTitle if self._downloads is not None else ""
+
+    @pyqtProperty(str, notify=downloadCounterChanged)
+    def downloadCounter(self) -> str:  # noqa: N802
+        return self._downloads.downloadCounter if self._downloads is not None else ""
 
     @pyqtProperty(str, notify=downloadSourceChanged)
     def downloadSource(self) -> str:  # noqa: N802
@@ -817,6 +831,7 @@ class OnboardingController(QObject):
     downloadStateChanged = pyqtSignal()
     downloadProgressChanged = pyqtSignal()
     downloadTitleChanged = pyqtSignal()
+    downloadCounterChanged = pyqtSignal()
     downloadSourceChanged = pyqtSignal()
     downloadDetailChanged = pyqtSignal()
     modelReadyChanged = pyqtSignal()
@@ -886,6 +901,7 @@ class OnboardingController(QObject):
             "downloadStateChanged",
             "downloadProgressChanged",
             "downloadTitleChanged",
+            "downloadCounterChanged",
             "downloadSourceChanged",
             "downloadDetailChanged",
             "modelReadyChanged",
@@ -1062,6 +1078,10 @@ class OnboardingController(QObject):
     def selectionSummary(self) -> str:  # noqa: N802
         return self._downloads.selectionSummary
 
+    @pyqtProperty(str, notify=selectionChanged)
+    def selectionLine(self) -> str:  # noqa: N802
+        return self._downloads.selectionLine
+
     @pyqtProperty(bool, notify=selectionChanged)
     def selectionFits(self) -> bool:  # noqa: N802
         return self._downloads.selectionFits
@@ -1087,6 +1107,10 @@ class OnboardingController(QObject):
     @pyqtProperty(str, notify=downloadTitleChanged)
     def downloadTitle(self) -> str:  # noqa: N802
         return self._downloads.downloadTitle
+
+    @pyqtProperty(str, notify=downloadCounterChanged)
+    def downloadCounter(self) -> str:  # noqa: N802
+        return self._downloads.downloadCounter
 
     @pyqtProperty(str, notify=downloadSourceChanged)
     def downloadSource(self) -> str:  # noqa: N802

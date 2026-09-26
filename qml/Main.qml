@@ -241,6 +241,7 @@ ApplicationWindow {
         freezeAnimations: window.freezeAnimations
         downloadState: window.bridge ? window.bridge.downloadState : "idle"
         title: window.bridge ? window.bridge.downloadTitle : ""
+        downloadCounter: window.bridge ? window.bridge.downloadCounter : ""
         sourceText: window.bridge && window.bridge.downloadSource !== undefined
             ? window.bridge.downloadSource : ""
         progress: window.bridge ? window.bridge.downloadProgress : 0

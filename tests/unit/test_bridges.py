@@ -4066,6 +4066,8 @@ def test_model_queue_serial_bytes_titles_and_first_current(model_rig: ModelRig) 
     select_queue(controller, port)
     titles: list[str] = []
     controller.downloadTitleChanged.connect(lambda: titles.append(controller.downloadTitle))
+    counters: list[str] = []
+    controller.downloadCounterChanged.connect(lambda: counters.append(controller.downloadCounter))
     progress = QSignalSpy(controller.downloadProgressChanged)
     finished = QSignalSpy(controller.canFinishChanged)
     controller.startSelectedDownloads()
@@ -4079,7 +4081,9 @@ def test_model_queue_serial_bytes_titles_and_first_current(model_rig: ModelRig) 
     assert port.visits == [port.entry.id]
     assert controller.models[0]["progress"] == 0.5
     assert controller.downloadProgress == 0.125
-    assert controller.downloadTitle == "Загружается Тестовая модель · 1 из 2"
+    assert controller.downloadTitle == "Загружается Тестовая модель"
+    assert controller.downloadCounter == "1 из 2"
+    assert controller.selectionLine == "Идёт загрузка"
     port.releases[port.entry.id].set()
     assert finished.wait(1000)
     assert not first_thread.isRunning()
@@ -4090,7 +4094,8 @@ def test_model_queue_serial_bytes_titles_and_first_current(model_rig: ModelRig) 
     if controller.models[1]["progress"] == 0:
         assert progress.wait(1000)
     assert controller.downloadProgress == 0.625
-    assert controller.downloadTitle == "Загружается Вторая модель · 2 из 2"
+    assert controller.downloadTitle == "Загружается Вторая модель"
+    assert controller.downloadCounter == "2 из 2"
     # Старые свойства по-прежнему описывают первую модель.
     assert controller.modelState == "installed"
     assert controller.modelName == port.entry.name
@@ -4101,6 +4106,8 @@ def test_model_queue_serial_bytes_titles_and_first_current(model_rig: ModelRig) 
     assert port.max_active == 1
     assert controller.downloadState == "done"
     assert controller.downloadTitle == "Модель готова"
+    assert controller.downloadCounter == ""
+    assert counters == ["1 из 2", "", "2 из 2", ""]
     assert controller.downloadProgress == 1.0
     assert "Проверяю модель…" in titles
     assert port.current == (port.entry.id, port.entry.revision)
@@ -4124,6 +4131,7 @@ def test_model_queue_failure_continues_and_retries(model_rig: ModelRig) -> None:
     controller.startSelectedDownloads()
     assert finished.wait(1000)
     assert controller.models[0]["state"] == "failed"
+    assert controller.models[0]["selected"] is False
     assert (
         controller.models[0]["message"]
         == "Не удалось загрузить модель — источник запрещён настройками"
@@ -4162,10 +4170,12 @@ def test_model_queue_all_failed_titles(model_rig: ModelRig, no_space: bool) -> N
     assert done.wait(1000)
     assert controller.downloadState == ("no-space" if no_space else "failed")
     assert controller.downloadTitle == (
-        "Не хватает места на диске" if no_space else "Не получилось загрузить модель"
+        "Не хватает места на диске" if no_space else "Не удалось загрузить модель"
     )
     row = controller.models[0]
     assert row["state"] == ("paused-no-space" if no_space else "failed")
+    assert row["selected"] is no_space
+    assert controller.selectionLine == ("Идёт загрузка" if no_space else "Пока ничего не выбрано")
     assert row["message"] and "private" not in row["message"]
     assert not controller.modelReady and not controller.canFinish
 
@@ -4336,12 +4346,14 @@ def test_model_new_properties_and_slots_have_qt_contract(model_rig: ModelRig) ->
     for name in (
         "models",
         "selectionSummary",
+        "selectionLine",
         "selectionFits",
         "selectionMessage",
         "canContinueFromModel",
         "downloadState",
         "downloadProgress",
         "downloadTitle",
+        "downloadCounter",
         "modelReady",
     ):
         prop = meta.property(meta.indexOfProperty(name))
@@ -4951,7 +4963,7 @@ def test_settings_model_without_downloads() -> None:
     assert not bridge.canReinstall
     assert bridge.downloadState == ""
     assert bridge.downloadProgress == 0.0
-    assert bridge.downloadTitle == bridge.speed == bridge.eta == ""
+    assert bridge.downloadTitle == bridge.downloadCounter == bridge.speed == bridge.eta == ""
     bridge.reinstallActiveModel()
     bridge.cancelDownloads()
     meta = bridge.metaObject()
@@ -4963,6 +4975,7 @@ def test_settings_model_without_downloads() -> None:
         "downloadState",
         "downloadProgress",
         "downloadTitle",
+        "downloadCounter",
         "speed",
         "eta",
     ):
@@ -5001,7 +5014,14 @@ def test_reinstall_shares_progress_and_preserves_existing_model(
     assert rig.bridge.activeModelState == "downloading"
     assert rig.controller.downloadProgress == rig.bridge.downloadProgress == 0.5
     assert len(settings_progress) == len(wizard_progress)
-    for name in ("downloadState", "downloadProgress", "downloadTitle", "speed", "eta"):
+    for name in (
+        "downloadState",
+        "downloadProgress",
+        "downloadTitle",
+        "downloadCounter",
+        "speed",
+        "eta",
+    ):
         assert getattr(rig.bridge, name) == getattr(rig.controller, name)
     rig.status.assert_any_call(f"Загружается {entry.name} — 50%")
     rig.port.releases[entry.id].set()

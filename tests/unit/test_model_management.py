@@ -277,7 +277,8 @@ def test_dynamic_queue_fifo_dequeue_and_card_fields() -> None:
         downloads.toggleModel(TONE.id)
         downloads.startSelectedDownloads()
         assert [entry.id for entry in downloads._queue] == [third.id, TONE.id]
-        assert downloads.downloadTitle == "Загружается GigaAM v3 RNN-T · 1 из 3"
+        assert downloads.downloadTitle == "Загружается GigaAM v3 RNN-T"
+        assert downloads.downloadCounter == "1 из 3"
         assert card(downloads, TONE.id)["state"] == "queued"
         assert downloads.downloadProgress == 0.5 * GIGAAM.size_bytes / (
             GIGAAM.size_bytes + TONE.size_bytes + third.size_bytes
@@ -332,7 +333,8 @@ def test_cancel_active_updates_next_download_title() -> None:
         downloads._model_thread_finished()
 
         assert started == [GIGAAM.id, TONE.id]
-        assert downloads.downloadTitle == "Загружается T-one · 1 из 2"
+        assert downloads.downloadTitle == "Загружается T-one"
+        assert downloads.downloadCounter == "1 из 2"
     finally:
         downloads.shutdown()
 
@@ -348,6 +350,38 @@ def test_shutdown_while_paused_keeps_part() -> None:
     assert card(downloads, GIGAAM.id)["state"] == "paused-no-space"
     downloads.shutdown()
     assert port.discarded == []
+
+
+def test_failed_download_clears_selection_but_stays_selectable() -> None:
+    port = FakeManagedPort()
+    downloads, _started = manual_queue(port)
+    try:
+        downloads.toggleModel(GIGAAM.id)
+        downloads.startSelectedDownloads()
+        downloads._model_finished("failed:timeout", "")
+        downloads._model_thread_finished()
+        row = card(downloads, GIGAAM.id)
+        assert row["state"] == "failed"
+        assert row["selected"] is False
+        assert downloads.selectionLine == "Пока ничего не выбрано"
+        downloads.toggleModel(GIGAAM.id)
+        assert card(downloads, GIGAAM.id)["selected"] is True
+    finally:
+        downloads.shutdown()
+
+
+def test_paused_download_uses_short_fallback_when_deficit_is_unknown() -> None:
+    port = FakeManagedPort()
+    downloads, _started = manual_queue(port)
+    try:
+        downloads.toggleModel(GIGAAM.id)
+        downloads.startSelectedDownloads()
+        port.space = False
+        downloads._model_finished("no-space", "")
+        downloads._model_thread_finished()
+        assert card(downloads, GIGAAM.id)["message"] == ("Не хватает места — освободите место")
+    finally:
+        downloads.shutdown()
 
 
 def test_shutdown_while_active_keeps_part() -> None:
@@ -406,9 +440,7 @@ def test_remove_other_model_while_paused() -> None:
         port.remove = remove  # type: ignore[method-assign]
         downloads.removeModel(TONE.id)
         assert port.removed == [(TONE.id, TONE.revision)]
-        assert card(downloads, GIGAAM.id)["message"] == (
-            "Не хватает места на диске — освободите 25 МБ"
-        )
+        assert card(downloads, GIGAAM.id)["message"] == ("Не хватает места — освободите 25 МБ")
         assert downloads.downloadDetail == "нужно ещё 25 МБ"
         downloads.makeModelCurrent(TONE.id)
         assert port.current == (third.id, third.revision)
@@ -502,9 +534,7 @@ def test_pause_retry_preserves_staging_until_cancel(monkeypatch: pytest.MonkeyPa
         downloads._model_thread_finished()
         assert downloads.downloadState == "no-space"
         assert card(downloads, GIGAAM.id)["state"] == "paused-no-space"
-        assert card(downloads, GIGAAM.id)["message"] == (
-            "Не хватает места на диске — освободите 13 МБ"
-        )
+        assert card(downloads, GIGAAM.id)["message"] == ("Не хватает места — освободите 13 МБ")
         assert card(downloads, TONE.id)["state"] == "queued"
         downloads.retryModel(GIGAAM.id)
         assert started == [GIGAAM.id] and port.discarded == []
@@ -540,9 +570,7 @@ def test_pause_retry_uses_part_file_remainder(tmp_path: Path) -> None:
         downloads._model_finished("no-space", "")
         downloads._model_thread_finished()
         assert remaining_bytes(store, entry) == 22_600_000
-        assert card(downloads, entry.id)["message"] == (
-            "Не хватает места на диске — освободите 13 МБ"
-        )
+        assert card(downloads, entry.id)["message"] == ("Не хватает места — освободите 13 МБ")
         assert downloads.downloadDetail == "нужно ещё 13 МБ"
         downloads.retryModel(entry.id)
         assert started == [entry.id]

@@ -258,7 +258,7 @@ Rectangle {
                     CardBadge {
                         visible: root.recommended
                         text: qsTr("Рекомендуем")
-                        color: root.highlighted ? Theme.bgSurface : Theme.primaryBg
+                        color: root.highlighted || root.busy ? Theme.bgSurface : Theme.primaryBg
                         textColor: Theme.primary
                     }
                     CardBadge {
@@ -465,19 +465,14 @@ Rectangle {
             visible: root.busy || root.hasMessage || root.showHint || root.manageVisible
                 || (root.cardState === "updating" && root.updateActionsAvailable)
             Layout.maximumWidth: footer.width * Theme.modelCardFooterActionsMaxShare
-            Layout.preferredWidth: {
-                var total = 0;
-                var count = 0;
-                for (var i = 0; i < children.length; ++i) {
-                    if (children[i].visible && children[i].implicitWidth > 0) {
-                        total += children[i].implicitWidth;
-                        ++count;
-                    }
-                }
-                return total + Math.max(0, count - 1) * spacing + Theme.cardBorder;
-            }
-            Layout.alignment: Qt.AlignTop
+            Layout.preferredWidth: implicitWidth
+            Layout.alignment: Qt.AlignRight | Qt.AlignTop
             spacing: Theme.modelCardFooterActionsGap
+            Item {
+                visible: root.busy
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+            }
             Icon {
                 objectName: "messageAlert"
                 visible: root.messageError
@@ -538,7 +533,7 @@ Rectangle {
             FooterText {
                 visible: root.cardState === "verifying"
                 text: qsTr("Отмена недоступна")
-                color: Theme.fgDisabled
+                color: Theme.fgMuted
             }
             AvButton {
                 visible: ((root.cardState === "failed" || root.cardState === "sha-failed"

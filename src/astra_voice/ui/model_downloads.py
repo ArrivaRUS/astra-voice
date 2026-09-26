@@ -825,6 +825,7 @@ class ModelDownloads(QObject):
     downloadStateChanged = pyqtSignal()
     downloadProgressChanged = pyqtSignal()
     downloadTitleChanged = pyqtSignal()
+    downloadCounterChanged = pyqtSignal()
     downloadSourceChanged = pyqtSignal()
     downloadDetailChanged = pyqtSignal()
     modelReadyChanged = pyqtSignal()
@@ -890,6 +891,7 @@ class ModelDownloads(QObject):
         self._download_state = "idle"
         self._download_progress = 0.0
         self._download_title = ""
+        self._download_counter = ""
         self._download_source = ""
         self._download_detail = ""
         self._no_space_size_bytes = 0
@@ -1407,6 +1409,17 @@ class ModelDownloads(QObject):
         return f"Будет скачано {format_size(size)}" if size else ""
 
     @property
+    def selectionLine(self) -> str:  # noqa: N802
+        if self.selectionSummary:
+            return self.selectionSummary
+        if any(
+            state in {"queued", "downloading", "verifying", "paused-no-space"}
+            for state in self._card_states.values()
+        ):
+            return "Идёт загрузка"
+        return "Пока ничего не выбрано"
+
+    @property
     def selectionFits(self) -> bool:  # noqa: N802
         if not self._selection_bytes():
             return True
@@ -1432,6 +1445,10 @@ class ModelDownloads(QObject):
     @property
     def downloadTitle(self) -> str:  # noqa: N802
         return self._download_title
+
+    @property
+    def downloadCounter(self) -> str:  # noqa: N802
+        return self._download_counter
 
     @property
     def downloadSource(self) -> str:  # noqa: N802
@@ -1468,18 +1485,21 @@ class ModelDownloads(QObject):
                 "idle": "",
                 "verifying": "Проверяю модель…",
                 "done": "Модель готова",
-                "failed": "Не получилось загрузить модель",
+                "failed": "Не удалось загрузить модель",
                 "no-space": "Не хватает места на диске",
             }.get(state, "")
+            counter = ""
             if state == "downloading" and self._active_entry is not None:
                 title = f"Загружается {self._active_entry.name}"
                 if len(self._queue_entries) > 1:
                     number = len(self._queue_entries) - len(self._queue)
-                    title += f" · {number} из {len(self._queue_entries)}"
+                    counter = f"{number} из {len(self._queue_entries)}"
             title = clean_display_name(title)
             state_changed = state != self._download_state
             title_changed = title != self._download_title
+            counter_changed = counter != self._download_counter
             self._download_state, self._download_title = state, title
+            self._download_counter = counter
             if state != "downloading":
                 self._set_download_source("")
             if state == "downloading" and not self._eta:
@@ -1488,6 +1508,8 @@ class ModelDownloads(QObject):
                 self._notify("downloadStateChanged")
             if title_changed:
                 self._notify("downloadTitleChanged")
+            if counter_changed:
+                self._notify("downloadCounterChanged")
 
     def _set_download_progress(self, bytes_done: float) -> None:
         value = (
@@ -2175,10 +2197,10 @@ class ModelDownloads(QObject):
                 count = missing(_remaining_download_bytes(self._model, entry))
                 if count > 0:
                     size = format_size(count, round_up=True)
-                    return f"Не хватает места на диске — освободите {size}"
+                    return f"Не хватает места — освободите {size}"
             except (OSError, StoreError):
                 log.warning("Не удалось определить дефицит места для загрузки")
-        return "Не хватает места на диске — освободите место"
+        return "Не хватает места — освободите место"
 
     @pyqtSlot()
     def _model_thread_finished(self) -> None:
@@ -2284,6 +2306,8 @@ class ModelDownloads(QObject):
                 if state == "no-space":
                     self._no_space_size_bytes = _remaining_download_bytes(self._model, entry)
                     self._paused_entry = entry
+                else:
+                    self._selected.discard(entry.id)
                 self._set_card(
                     entry,
                     "paused-no-space" if state == "no-space" else "failed",

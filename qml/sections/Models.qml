@@ -294,7 +294,7 @@ Item {
             Text {
                 objectName: "selectionSummary"
                 Layout.maximumWidth: summary.width
-                text: root.hasSelection ? root.settings.selectionSummary
+                text: root.settings ? root.settings.selectionLine
                     : qsTr("Пока ничего не выбрано")
                 textFormat: Text.PlainText
                 color: root.settings && root.settings.selectionFits === false

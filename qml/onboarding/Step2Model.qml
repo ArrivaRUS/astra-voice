@@ -106,8 +106,7 @@ Item {
         Text {
             objectName: "selectionSummary"
             Layout.maximumWidth: summary.width
-            text: root.bridge && root.bridge.selectionSummary !== ""
-                ? root.bridge.selectionSummary : qsTr("Пока ничего не выбрано")
+            text: root.bridge ? root.bridge.selectionLine : qsTr("Пока ничего не выбрано")
             textFormat: Text.PlainText
             color: root.bridge && root.bridge.selectionFits === false
                 ? Theme.onboardingSummaryLineColorWarn : Theme.onboardingSummaryLineColor
