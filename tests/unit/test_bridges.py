@@ -4175,7 +4175,9 @@ def test_model_queue_all_failed_titles(model_rig: ModelRig, no_space: bool) -> N
     row = controller.models[0]
     assert row["state"] == ("paused-no-space" if no_space else "failed")
     assert row["selected"] is no_space
-    assert controller.selectionLine == ("Идёт загрузка" if no_space else "Пока ничего не выбрано")
+    assert controller.selectionLine == (
+        "Загрузка на паузе" if no_space else "Пока ничего не выбрано"
+    )
     assert row["message"] and "private" not in row["message"]
     assert not controller.modelReady and not controller.canFinish
 

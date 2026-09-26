@@ -352,6 +352,30 @@ def test_shutdown_while_paused_keeps_part() -> None:
     assert port.discarded == []
 
 
+def test_selection_line_changes_from_no_space_pause_to_retry() -> None:
+    port = FakeManagedPort()
+    port.free_bytes = lambda: 100_000_000  # type: ignore[method-assign]
+    downloads, started = manual_queue(port)
+    try:
+        downloads.toggleModel(GIGAAM.id)
+        downloads.startSelectedDownloads()
+        assert downloads.selectionLine == "Идёт загрузка"
+
+        port.space = False
+        downloads._model_finished("no-space", "")
+        downloads._model_thread_finished()
+        assert card(downloads, GIGAAM.id)["state"] == "paused-no-space"
+        assert downloads.selectionLine == "Загрузка на паузе"
+
+        port.space = True
+        downloads.retryModel(GIGAAM.id)
+        assert started == [GIGAAM.id, GIGAAM.id]
+        assert card(downloads, GIGAAM.id)["state"] == "downloading"
+        assert downloads.selectionLine == "Идёт загрузка"
+    finally:
+        downloads.shutdown()
+
+
 def test_failed_download_clears_selection_but_stays_selectable() -> None:
     port = FakeManagedPort()
     downloads, _started = manual_queue(port)

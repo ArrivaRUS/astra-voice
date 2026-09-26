@@ -1412,9 +1412,12 @@ class ModelDownloads(QObject):
     def selectionLine(self) -> str:  # noqa: N802
         if self.selectionSummary:
             return self.selectionSummary
+        if self._model_thread is None and any(
+            state == "paused-no-space" for state in self._card_states.values()
+        ):
+            return "Загрузка на паузе"
         if any(
-            state in {"queued", "downloading", "verifying", "paused-no-space"}
-            for state in self._card_states.values()
+            state in {"queued", "downloading", "verifying"} for state in self._card_states.values()
         ):
             return "Идёт загрузка"
         return "Пока ничего не выбрано"

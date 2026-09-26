@@ -304,10 +304,11 @@ class FakeOnboarding(QObject):
     def selectionLine(self) -> str:  # noqa: N802
         if self._selectionSummary:
             return self._selectionSummary
-        if any(
-            row["state"] in {"queued", "downloading", "verifying", "paused-no-space"}
-            for row in self.models
+        if self.downloadState == "no-space" and any(
+            row["state"] == "paused-no-space" for row in self.models
         ):
+            return "Загрузка на паузе"
+        if any(row["state"] in {"queued", "downloading", "verifying"} for row in self.models):
             return "Идёт загрузка"
         return "Пока ничего не выбрано"
 
@@ -1110,10 +1111,11 @@ class FakeSettings(QObject):
     def selectionLine(self) -> str:  # noqa: N802
         if self._selectionSummary:
             return self._selectionSummary
-        if any(
-            row["state"] in {"queued", "downloading", "verifying", "paused-no-space"}
-            for row in self.models
+        if self.downloadState == "no-space" and any(
+            row["state"] == "paused-no-space" for row in self.models
         ):
+            return "Загрузка на паузе"
+        if any(row["state"] in {"queued", "downloading", "verifying"} for row in self.models):
             return "Идёт загрузка"
         return "Пока ничего не выбрано"
 
@@ -2444,7 +2446,9 @@ def test_download_card_state_frames(onboarding_app: Any) -> None:
             }[state]
             fake.downloadCounter = "1 из 2" if state == "queued" else ""
             fake.downloadProgress = 0.42 if state in {"downloading", "downloading-calc"} else 0.0
-            fake.downloadSource = _SOURCE_TEXT["hf"] if state in {"downloading", "queued"} else ""
+            fake.downloadSource = (
+                _SOURCE_TEXT["hf"] if state in {"downloading", "downloading-calc", "queued"} else ""
+            )
             fake.downloadDetail = "нужно ещё 172 МБ" if state == "paused-no-space" else ""
             fake.freeSpaceText = (
                 "свободно на диске 100 МБ"
@@ -2467,8 +2471,21 @@ def test_download_card_state_frames(onboarding_app: Any) -> None:
                     item for item in visual_tree(root) if item.objectName() == "selectionSummary"
                 )
                 assert summary.property("text") == (
-                    "Пока ничего не выбрано" if state == "failed" else "Идёт загрузка"
+                    "Пока ничего не выбрано"
+                    if state == "failed"
+                    else "Загрузка на паузе"
+                    if state == "paused-no-space"
+                    else "Идёт загрузка"
                 )
+                if state == "paused-no-space":
+                    assert (
+                        sum(
+                            item.property("text").count(fake.freeSpaceText)
+                            for item in visual_tree(summary.parentItem())
+                            if item.isVisible() and isinstance(item.property("text"), str)
+                        )
+                        == 1
+                    )
                 assert card.property("selected") is (state != "failed")
                 if state in {
                     "queued",
@@ -2556,7 +2573,8 @@ def test_download_card_state_frames(onboarding_app: Any) -> None:
                         < button.mapToScene(QPointF(0, 0)).x()
                     )
                 if state == "downloading-calc":
-                    assert "считаю…" in visible_texts(strip)
+                    assert strip.property("tail") == "Скачиваю с huggingface.co · считаю…"
+                    assert strip.property("tail") in visible_texts(strip)
                 if screen == "onboarding" and state != "failed":
                     assert visible_button(root, "Продолжить").isEnabled()
                     assert not any(
