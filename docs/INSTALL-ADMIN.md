@@ -133,6 +133,7 @@ gpg --show-keys --fingerprint /usr/share/astra-voice/data/keys/release.gpg    # 
 
 > **Важно.** Мастер заказчика: `5F1F 7718 559F 8F57 FFE1  1780 55BB 1162 F17A 5CB0`,
 > uid `Astra Voice Release <alekovalev@astralinux.ru>`; создан 26.09.2026.
+> Он создан на рабочей машине заказчика; риск принят для v0.1, преемник M2 будет сгенерирован офлайн до v1.0 (см. `docs/SECURITY.md`).
 > Подписывающие подключи `S1` (`7602 A029 F0E3 4CD2 344A  9CDA 657E D046 89FF 4D79`)
 > и `S2` (`9053 EE0C 0085 683C E6C7  042E DC2E 5932 25D8 0428`) действуют до 26.09.2027.
 

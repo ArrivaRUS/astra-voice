@@ -241,7 +241,7 @@ def _sign(homedir: Path, key: str) -> None:
         "--batch",
         "--yes",
         "--local-user",
-        key,
+        key if key.endswith("!") else key + "!",
         "--detach-sign",
         "--output",
         str(SIGNATURE_PATH),
