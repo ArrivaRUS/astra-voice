@@ -51,7 +51,7 @@ override_dh_auto_install:
 		$(PKG)/usr/share/applications/astra-voice.desktop
 	cd data/icons/hicolor && find . -type f -exec \
 		install -D -m 0644 {} $(abspath $(PKG))/usr/share/icons/hicolor/{} \;
-	for f in NOTICE docs/PRIVACY.md packaging/INSTALL-ADMIN.md docs/SECURITY.md; do \
+	for f in NOTICE docs/PRIVACY.md docs/INSTALL-ADMIN.md docs/SECURITY.md; do \
 		[ -f "$$f" ] && install -m 0644 "$$f" $(DOCDIR)/ || true; \
 	done
 

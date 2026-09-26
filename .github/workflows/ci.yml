@@ -11,7 +11,7 @@ on:
     branches: [main]
     tags: ['v*']
     # Журналы проекта не влияют ни на код, ни на пакет: коммит только с ними CI не запускает.
-    # Список узкий намеренно: docs/PRIVACY.md, docs/SECURITY.md, INSTALL-ADMIN.md и README в data/
+    # Список узкий намеренно: docs/PRIVACY.md, docs/SECURITY.md, docs/INSTALL-ADMIN.md и README в data/
     # попадают в .deb, поэтому `**.md` целиком игнорировать нельзя. На теги фильтр путей не действует.
     paths-ignore:
       - 'HEARTBEAT.md'

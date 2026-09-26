@@ -26,7 +26,7 @@ astra-voice --version
 ```
 
 Порядок проверки подписи, работа в закрытом контуре и удаление — в
-[`packaging/INSTALL-ADMIN.md`](packaging/INSTALL-ADMIN.md).
+[`docs/INSTALL-ADMIN.md`](docs/INSTALL-ADMIN.md).
 
 Установка без прав администратора (пользовательская сборка в `$HOME`) в v1.0 не
 поддерживается и запланирована на v1.1.

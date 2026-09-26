@@ -1,7 +1,7 @@
 """Гейт сборки: сколько собственных ELF уносит `.deb` и под какую glibc они собраны.
 
 Число ELF — не любопытство, а цифра, которую заказчик подписывает по ГОСТ в
-контуре с ЗПС (v1.1) и которая стоит в `packaging/INSTALL-ADMIN.md` и в SBOM.
+контуре с ЗПС (v1.1) и которая стоит в `docs/INSTALL-ADMIN.md` и в SBOM.
 Ожидание жёсткое: 3 `.so` onnxruntime при сборке с vendor, 0 при `--no-vendor`
 (`arch/spikes/S3.md` §1.3, `docs/plans.md` M1 «Stop-and-Fix»).
 

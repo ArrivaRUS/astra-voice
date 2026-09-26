@@ -382,7 +382,7 @@ R6 HF недоступен из РФ → «Из файла» · чистая В�
 - [ ] Чеклист v0.1 беклога: S1 (A1 A2 A3 A5 A7), S2, S3, S4 (A1 A3 A4), S5, S11-A4, S12-A3, S13-A1, S14 зелёные на машине заказчика (KDE); p95 ≤ 0,5 с по ≥ 50 диктовкам (Ц2); CI зелёный; `make deb` ≤ 5 мин (Ц7).
 - [ ] Should: E2E-чек S2, S4, S5 во Fly (US-8.5 часть 1) — расхождения → issues (вход для M10).
 - [ ] `docs/test-plan.md` строки v0.1 закрыты; `status.md` обновлён; 0 ошибок в консоли/логах за прогон.
-- [ ] `INSTALL-ADMIN.md` (черновик): раздел «needrestart на рабочих станциях» — режим `l` и чёрный список `user@`,
+- [x] 2026-09-26 `docs/INSTALL-ADMIN.md` (черновик v0.1 по коду m6.17, канон вместо `packaging/`, 11 «[уточнить]»): раздел «needrestart на рабочих станциях» — режим `l` и чёрный список `user@`,
   иначе после `apt install` диалог предлагает перезапустить сеанс пользователя (16.09, живая установка m5).
 - [ ] `scripts/release.sh v0.1.0`: тег → CI job `release` (Environment `release`, подключ S1; сборка и подпись в одном job) → `deb` + `SHA256SUMS` + `SHA256SUMS.asc` + `sbom.cdx.json` + `INSTALL-ADMIN.md` (черновик) + `latest.json` → GitHub Release; changelog-writer → тело релиза; fingerprint мастера в README.
 - [ ] ⛔ G5 заказчика: публичный релиз; откат известен — снять релиз/тег, `apt install` предыдущего deb.

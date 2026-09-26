@@ -2,7 +2,7 @@
 
 `release.gpg` — связка ключей, по которой `astra_voice.security.verify` проверяет
 подпись `SHA256SUMS.asc` у релизов и `.deb` «из файла». Файл попадает в пакет как
-`/usr/share/astra-voice/keys/release.gpg`, root-owned, и отпечатки в коде
+`/usr/share/astra-voice/data/keys/release.gpg`, root-owned, и отпечатки в коде
 (`PINNED_FINGERPRINTS`) едут в том же пакете — подменить одно без другого нельзя
 (`docs/threat-model.md` §4.2 «б»).
 
@@ -29,4 +29,4 @@
 2. `gpg --export <master-fpr> > data/keys/release.gpg`;
 3. в `src/astra_voice/security/verify.py` заменить `PINNED_FINGERPRINTS` на отпечаток
    мастера (TODO там же), тестовый ключ убрать;
-4. отпечаток мастера — в `README.md` и `packaging/INSTALL-ADMIN.md`.
+4. отпечаток мастера — в `README.md` и `docs/INSTALL-ADMIN.md` (раздел 2).

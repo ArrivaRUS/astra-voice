@@ -80,7 +80,7 @@ gpg --export-secret-subkeys --armor '<S1-fpr>!' > s1-secret.asc
 
 Далее в репозитории одним коммитом: новый `data/keys/release.gpg`, отпечаток мастера в
 `PINNED_FINGERPRINTS` (`src/astra_voice/security/verify.py`), отпечаток в `README.md`
-и `packaging/INSTALL-ADMIN.md`.
+и `docs/INSTALL-ADMIN.md` (раздел 2).
 
 ## 5. Компрометация подписывающего ключа
 
