@@ -1547,6 +1547,7 @@ def render_onboarding(
     view = QQuickView()
     install_icon_provider(view.engine())
     theme = FakeTheme(dark)
+    root: Any = None
     try:
         view.rootContext().setContextProperty("onboarding", fake)
         view.rootContext().setContextProperty("themeSource", theme)
@@ -1584,8 +1585,7 @@ def render_onboarding(
             sip.delete(theme)
             app.processEvents()
         finally:
-            if "root" in locals():
-                root = None
+            root = None
             qInstallMessageHandler(previous)
 
 
@@ -1609,6 +1609,10 @@ def render_settings(
     install_icon_provider(engine)
     theme = FakeTheme(dark)
     settings = fake if fake is not None else FakeSettings()
+    roots: list[Any] = []
+    window: Any = None
+    background_component: Any = None
+    background: Any = None
     try:
         engine.rootContext().setContextProperty("themeSource", theme)
         engine.rootContext().setContextProperty("showOnboarding", False)
@@ -1667,14 +1671,10 @@ def render_settings(
             sip.delete(theme)
             app.processEvents()
         finally:
-            if "window" in locals():
-                window = None
-            if "background" in locals():
-                background = None
-            if "background_component" in locals():
-                del background_component
-            if "roots" in locals():
-                roots.clear()
+            window = None
+            background = None
+            background_component = None
+            roots.clear()
             qInstallMessageHandler(previous)
 
 

@@ -17,7 +17,6 @@ from tempfile import TemporaryDirectory
 import pytest
 from _pytest.nodes import Node
 from _pytest.terminal import TerminalReporter
-from pluggy import Result
 
 pytest_plugins = ("pytester",)
 
@@ -206,14 +205,41 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     item.stash[_PULSE_TEST_PROCESSES] = pulseaudio_processes()
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_call(item: pytest.Item) -> Generator[None, Result[None], None]:
-    outcome = yield
-    excinfo = outcome.excinfo
-    if excinfo is not None:
-        # Кадры упавшего теста держат обёртки QML удалённого окна: sip отдаст
-        # их новым объектам по тому же адресу — use-after-free.
-        traceback.clear_frames(excinfo[2])
+def _clear_failed_test_frames(error: BaseException) -> None:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.__traceback__ is not None:
+            traceback.clear_frames(current.__traceback__)
+            for frame, _lineno in traceback.walk_tb(current.__traceback__):
+                _ = frame.f_locals
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    report = yield
+    if (
+        call.when == "call"
+        and call.excinfo is not None
+        and item.get_closest_marker("xvfb") is not None
+        and not item.config.getoption("usepdb")
+    ):
+        # Кадры держат обёртки QML удалённого окна; sip может отдать адрес новым
+        # объектам и вызвать use-after-free. Здесь отчёт уже построен: -l и
+        # __tracebackhide__ работают. В Python 3.11 повторное чтение f_locals
+        # очищает его снимок после clear_frames; только xvfb и без --pdb.
+        _clear_failed_test_frames(call.excinfo.value)
+    return report
 
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)

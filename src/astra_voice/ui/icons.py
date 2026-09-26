@@ -20,7 +20,7 @@ from PyQt5.QtQuick import QQuickImageProvider
 
 log = logging.getLogger(__name__)
 PROVIDER_ID = "avicon"
-_providers: dict[int, IconProvider] = {}
+_providers: list[IconProvider] = []
 
 PATHS: dict[str, str] = {
     "chev": "M6.5 3.5L11 8l-4.5 4.5",
@@ -106,17 +106,20 @@ class IconProvider(QQuickImageProvider):
         if not math.isfinite(stroke) or not 0.5 <= stroke <= 4 or requestedSize != size:
             log.warning("icon_request_invalid")
             return _transparent(size), size
-        # This QImage copy shares pixels until a caller writes to it, then detaches
-        # without changing the cached original.
+        # Копия QImage разделяет пиксели до первой записи, затем отделяется,
+        # не меняя исходное изображение в кеше.
         return QImage(_render_icon(match[1], match[2], stroke, size.width(), size.height())), size
 
 
 def install_icon_provider(engine: QQmlEngine) -> None:
-    if engine.imageProvider(PROVIDER_ID) is None:
-        provider = IconProvider()
-        # Qt owns the C++ provider. Keep its Python wrapper separately: the
-        # temporary engine wrapper from QQuickView.engine() can itself be GC'd.
-        key = sip.unwrapinstance(engine)
-        _providers[key] = provider
-        engine.destroyed.connect(lambda _object: _providers.pop(key, None))
-        engine.addImageProvider(PROVIDER_ID, provider)
+    if engine.imageProvider(PROVIDER_ID) is not None:
+        return
+    provider = IconProvider()
+    # C++-провайдером владеет движок (/Transfer/), но без живой Python-обёртки
+    # requestImage уходит в пустую базовую реализацию. Храним обёртку здесь и
+    # при каждой установке убираем удалённые провайдеры. Не подключаем лямбду
+    # с замыканием к engine.destroyed: GC может обнулить её __closure__ через
+    # устаревшую обёртку движка, что приводит к segfault (урок 021).
+    _providers[:] = [p for p in _providers if not sip.isdeleted(p)]
+    _providers.append(provider)
+    engine.addImageProvider(PROVIDER_ID, provider)
