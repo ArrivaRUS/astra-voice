@@ -642,3 +642,7 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
   (нужны живые звонки + `pw-dump` с «ок»), T1 по F18, макеты «Встреч», очный юрист; тестовый адрес GLM 5.3 — запросить.
 - Worktree: остались `wt-oom`? нет — убраны; живые: `wt-ort125` (старый), Cowork `wt-c0`.
 - Хвосты: CI job xvfb для `tests/xvfb/test_capture_focus_loss.py` (на машине Xvfb нет); М8 postrm staging; nit'ы ревью.
+- **10:20 дополнение:** слит `wip/m6-sec-minors-2` (сторож: отмена только при переходе на чужое окно; отзыв по каталогу/снимку до
+  `set_current`), полный набор зелёный (5768 unit+xvfb). На ~/Desktop **`m6.16`** (m6.14/m6.15 удалены). C0 Cowork слита в main Cowork
+  `18d31ca` (полная сюита Cowork: 23 F — все чужие: demo/nds, libreoffice, порядок structlog; 1 тест C0 приведён к типу ошибки).
+  Модель угроз §10.1 — статус У83/У84, П14. Worktree Voice: только `wt-ort125`; Cowork: `wt-c0` (можно удалить после pull другой сессии).
