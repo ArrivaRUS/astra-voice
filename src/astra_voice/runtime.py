@@ -139,8 +139,10 @@ class DictationRuntime(QObject):
         self.settings = settings
         self.model_store = model_store
         self.session_kind = session_kind
-        # Каталог создаётся позже окна: проверку отзыва подставляют сеттером.
+        # Проверка подключается до start(): первый ответ воркера может вызвать загрузку.
         self._revoked_check: RevokedCheck | None = None
+        self.revocation_unknown = False
+        self.on_revocation_unknown: Callable[[], None] | None = None
         self._revoked_notified = False
         self.on_quit_requested: Callable[[], None] | None = None
         self.on_show_requested: Callable[[], None] | None = None
@@ -282,6 +284,13 @@ class DictationRuntime(QObject):
         """Подключает проверку отзыва ревизии по каталогу (US-6.6)."""
         self._revoked_check = revoked
 
+    def _mark_revocation_unknown(self) -> None:
+        if not self.revocation_unknown:
+            self.revocation_unknown = True
+            log.warning("Не удалось проверить список отозванных версий модели")
+            if self.on_revocation_unknown is not None:
+                self.on_revocation_unknown()
+
     def _resolve_model_request(self) -> dict[str, Any] | None:
         """Запрос загрузки с учётом отзыва; ModelRevoked пробрасывается выше."""
         return resolve_model_request(
@@ -289,6 +298,7 @@ class DictationRuntime(QObject):
             self.model_store,
             store_dir=paths.model_store_dir(),
             revoked=self._revoked_check,
+            on_revocation_unknown=self._mark_revocation_unknown,
         )
 
     def _send(self, message: dict[str, Any], *, timeout: float | None = None) -> None:

@@ -1208,6 +1208,7 @@ def test_window_event_emits_only_lifecycle_events() -> None:
     capture = HotkeyCapture()
     window = QObject()
     capture.attach_window(window)
+    capture.attach_window(window)
     seen: list[QEvent.Type] = []
     capture.windowEvent.connect(
         lambda _window, event: seen.append(event.type()), Qt.DirectConnection
@@ -1221,7 +1222,7 @@ def test_window_event_emits_only_lifecycle_events() -> None:
         QEvent.WindowStateChange,
         QEvent.KeyPress,
     ):
-        capture.eventFilter(window, QEvent(kind))
+        QCoreApplication.sendEvent(window, QEvent(kind))
 
     assert seen == [QEvent.Show, QEvent.Hide, QEvent.Close, QEvent.WindowStateChange]
 

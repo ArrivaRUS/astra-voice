@@ -137,6 +137,7 @@ class SettingsBridge(QObject):
     activeModelChanged = pyqtSignal()
     activeModelStateChanged = pyqtSignal()
     modelsChanged = pyqtSignal()
+    revocationUnknownChanged = pyqtSignal()
     selectionChanged = pyqtSignal()
     freeSpaceTextChanged = pyqtSignal()
     downloadStateChanged = pyqtSignal()
@@ -200,6 +201,7 @@ class SettingsBridge(QObject):
                 getattr(downloads, name + "Changed").connect(getattr(self, name + "Changed"))
             downloads.downloadDetailChanged.connect(self.downloadDetailChanged)
             downloads.modelsChanged.connect(self.modelsChanged)
+            downloads.revocationUnknownChanged.connect(self.revocationUnknownChanged)
             downloads.selectionChanged.connect(self.selectionChanged)
             downloads.freeSpaceTextChanged.connect(self.freeSpaceTextChanged)
             downloads.modelsChanged.connect(self.activeModelChanged)
@@ -247,6 +249,10 @@ class SettingsBridge(QObject):
     @pyqtProperty("QVariantList", notify=modelsChanged)
     def models(self) -> list[dict[str, Any]]:
         return self._downloads.models if self._downloads is not None else []
+
+    @pyqtProperty(bool, notify=revocationUnknownChanged)
+    def revocationUnknown(self) -> bool:  # noqa: N802
+        return self._downloads.revocationUnknown if self._downloads is not None else False
 
     @pyqtProperty(str, notify=selectionChanged)
     def selectionSummary(self) -> str:  # noqa: N802

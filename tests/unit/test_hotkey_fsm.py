@@ -34,6 +34,45 @@ from astra_voice.platform.x11 import BadCombo, GrabReport, ParsedCombo, X11Displ
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize("platform", ["xcb", "offscreen"])
+@pytest.mark.parametrize("event_type", ["WindowDeactivate", "ApplicationStateChange"])
+def test_capture_focus_loss_is_platform_specific(
+    monkeypatch: pytest.MonkeyPatch, platform: str, event_type: str
+) -> None:
+    from PyQt5.QtCore import QEvent, QObject, Qt, pyqtSignal
+
+    from astra_voice.ui import hotkey_capture
+
+    class Application(QObject):
+        applicationStateChanged = pyqtSignal(int)
+
+    application = Application()
+    monkeypatch.setattr(
+        hotkey_capture,
+        "QGuiApplication",
+        SimpleNamespace(
+            platformName=lambda: platform,
+            instance=lambda: application,
+        ),
+    )
+    host = MagicMock()
+    host.begin_capture.return_value = True
+    capture = hotkey_capture.HotkeyCapture(host)
+    window = QObject()
+    capture.attach_window(window)
+    capture.attach_window(window)
+    assert application.receivers(application.applicationStateChanged) == (
+        0 if platform == "xcb" else 1
+    )
+    capture.begin(lambda _combo, _keep: "ok")
+    if event_type == "WindowDeactivate":
+        capture.eventFilter(window, QEvent(QEvent.WindowDeactivate))
+    else:
+        application.applicationStateChanged.emit(Qt.ApplicationInactive)
+    assert capture.state == ("capturing" if platform == "xcb" else "idle")
+    assert host.end_capture.call_count == (0 if platform == "xcb" else 1)
+
+
 class FakeBackend:
     """Очередь и захваты в памяти; никаких обращений к дисплею."""
 

@@ -227,6 +227,56 @@ def test_hint_fields_are_present_without_switcher(rig: Rig) -> None:
         assert item["canReinstall"] is True
 
 
+def test_unknown_revocation_hint_on_active_model_card() -> None:
+    port = FakeManagedPort()
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    unknown = False
+    downloads = ModelDownloads(port, revocation_unknown=lambda: unknown)
+    try:
+        unknown = True
+        downloads.revocation_unknown_changed()
+        item = card(downloads, GIGAAM.id)
+        assert item["hint"] == "Не удалось проверить список отозванных версий"
+        assert item["hintKind"] == "warning"
+        port.records[(TONE.id, TONE.revision)] = "ok"
+        downloads.makeModelCurrent(TONE.id)
+        assert card(downloads, GIGAAM.id)["hint"] == ""
+        assert card(downloads, TONE.id)["hint"] == "Не удалось проверить список отозванных версий"
+        assert card(downloads, TONE.id)["hintKind"] == "warning"
+    finally:
+        downloads.shutdown()
+
+
+def test_unknown_revocation_hint_on_initial_active_model_card() -> None:
+    port = FakeManagedPort()
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    downloads = ModelDownloads(port, revocation_unknown=lambda: True)
+    try:
+        assert card(downloads, GIGAAM.id)["hint"] == "Не удалось проверить список отозванных версий"
+        assert card(downloads, GIGAAM.id)["hintKind"] == "warning"
+    finally:
+        downloads.shutdown()
+
+
+def test_unknown_revocation_hint_survives_switching_card_update() -> None:
+    port = FakeManagedPort()
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    switcher = FakeSwitchPort(enough_memory=True)
+    downloads = ModelDownloads(port, switcher=switcher, revocation_unknown=lambda: True)
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        assert card(downloads, GIGAAM.id)["hint"] == ""
+        assert card(downloads, TONE.id)["hint"] == "Не удалось проверить список отозванных версий"
+        switcher.finish("ok")
+        assert card(downloads, TONE.id)["hintKind"] == "warning"
+    finally:
+        downloads.shutdown()
+
+
 def test_installed_summary_counts_catalog_entries(rig: Rig) -> None:
     port, downloads, _ = rig
     assert downloads.installedSummary == "Установлено 0 из 2"

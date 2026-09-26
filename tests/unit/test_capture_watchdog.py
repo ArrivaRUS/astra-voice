@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import threading
@@ -132,6 +133,56 @@ class FakeDisplay(X11Display):
             raise RuntimeError("Ошибка закрытия")
 
 
+class PropertyDisplay(FakeDisplay):
+    """PropertyNotify будит настоящий select через fd фейкового соединения."""
+
+    def __init__(self, rig: Rig, *, property_present: bool) -> None:
+        super().__init__(rig)
+        self.property_present = property_present
+        self.active_id: int | None = 42 if property_present else None
+        self.events: list[object] = []
+        self.read_fd, self.write_fd = os.pipe()
+
+    def open(self, display_name: str | None = None) -> bool:
+        opened = super().open(display_name)
+        if opened:
+            self.d.pending_events = lambda: len(self.events)
+        return opened
+
+    def watch_active_window(self) -> tuple[int, int | None] | None:
+        self.record("watch")
+        return (1, self.active_id) if self.property_present else None
+
+    def active_window(self) -> int | None:
+        self.record("active_window")
+        return self.active_id
+
+    def fileno(self) -> int:
+        return self.read_fd
+
+    def pending_events(self) -> int:
+        return len(self.events)
+
+    def next_event(self) -> object:
+        os.read(self.read_fd, 1)
+        return self.events.pop(0)
+
+    def publish(self, atom: int, active_id: int | None = None) -> None:
+        from Xlib import X
+
+        if atom == 1:
+            self.active_id = active_id
+        self.events.append(SimpleNamespace(type=X.PropertyNotify, atom=atom))
+        os.write(self.write_fd, b"x")
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            os.close(self.read_fd)
+            os.close(self.write_fd)
+
+
 class Rig:
     """Фабрика выполняется в стороже, Event переводит часы за дедлайн."""
 
@@ -221,6 +272,131 @@ def test_expiry_closes_socket_without_gui_event_loop(rig: Rig) -> None:
     assert rig.callback_threads == [thread.ident]
     assert thread.ident != threading.get_ident()
     assert not rig.watchdog.open(), "Одноразовый сторож запустился после истечения срока"
+
+
+@pytest.mark.parametrize("next_window", [43, 0, None])
+def test_active_window_change_closes_socket_then_cancels(rig: Rig, next_window: int | None) -> None:
+    received: list[tuple[str, str]] = []
+    notified = threading.Event()
+    callback_saw_closed: list[bool] = []
+
+    def factory() -> PropertyDisplay:
+        display = PropertyDisplay(rig, property_present=True)
+        rig.displays.append(display)
+        return display
+
+    def on_key(action: str, value: str) -> None:
+        received.append((action, value))
+        callback_saw_closed.append(rig.closed.is_set() and not rig.watchdog.active)
+        notified.set()
+
+    rig.watchdog = CaptureFieldWatchdog(display_factory=factory, poll_ms=1000, on_key_event=on_key)
+    assert rig.watchdog.open()
+    display = rig.displays[0]
+    assert isinstance(display, PropertyDisplay)
+    display.publish(2)
+    display.publish(1, 42)
+    assert not notified.wait(0.03)
+    assert rig.watchdog.active
+    assert not display.transport.closed
+
+    start = time.monotonic()
+    display.publish(1, next_window)
+    assert notified.wait(WAIT_S)
+    assert time.monotonic() - start < 0.1
+    rig.watchdog.close()
+    rig.assert_stopped()
+    assert received == [("cancel", "")]
+    assert callback_saw_closed == [True]
+    assert display.transport.closed
+    assert not rig.expired.is_set()
+
+
+@pytest.mark.parametrize("error", [AttributeError, ValueError, OSError])
+def test_active_window_read_failure_cancels_capture(rig: Rig, error: type[Exception]) -> None:
+    received: list[tuple[str, str]] = []
+    notified = threading.Event()
+    callback_saw_closed: list[bool] = []
+
+    class BrokenReadDisplay(PropertyDisplay):
+        def active_window(self) -> int | None:
+            raise error("private X details")
+
+    def factory() -> BrokenReadDisplay:
+        display = BrokenReadDisplay(rig, property_present=True)
+        rig.displays.append(display)
+        return display
+
+    def on_key(action: str, value: str) -> None:
+        received.append((action, value))
+        callback_saw_closed.append(rig.closed.is_set() and not rig.watchdog.active)
+        notified.set()
+
+    rig.watchdog = CaptureFieldWatchdog(display_factory=factory, poll_ms=1000, on_key_event=on_key)
+    assert rig.watchdog.open()
+    display = rig.displays[0]
+    assert isinstance(display, BrokenReadDisplay)
+    display.publish(1, 42)
+    assert notified.wait(WAIT_S)
+    rig.watchdog.close()
+    assert received == [("cancel", "")]
+    assert callback_saw_closed == [True]
+    assert display.transport.closed
+    assert not rig.expired.is_set()
+
+
+def test_missing_active_window_property_only_expires(rig: Rig) -> None:
+    received: list[tuple[str, str]] = []
+
+    def factory() -> PropertyDisplay:
+        display = PropertyDisplay(rig, property_present=False)
+        rig.displays.append(display)
+        return display
+
+    rig.watchdog = CaptureFieldWatchdog(
+        display_factory=factory,
+        poll_ms=1,
+        on_expired=rig.on_expired,
+        on_key_event=lambda action, value: received.append((action, value)),
+    )
+    assert rig.watchdog.open()
+    display = rig.displays[0]
+    assert isinstance(display, PropertyDisplay)
+    display.publish(1, 43)
+    assert not rig.closed.wait(0.03)
+    assert rig.watchdog.active
+    rig.elapsed.set()
+    assert rig.expired.wait(WAIT_S)
+    rig.watchdog.close()
+    assert received == []
+    assert display.transport.closed
+
+
+def test_active_window_subscription_failure_keeps_capture(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    class BrokenWatchDisplay(FakeDisplay):
+        def watch_active_window(self) -> tuple[int, int | None] | None:
+            self.record("watch")
+            raise RuntimeError("private X details")
+
+    def factory() -> BrokenWatchDisplay:
+        display = BrokenWatchDisplay(rig)
+        rig.displays.append(display)
+        return display
+
+    rig.watchdog = CaptureFieldWatchdog(
+        display_factory=factory, poll_ms=1, on_expired=rig.on_expired
+    )
+    with caplog.at_level(logging.WARNING, logger=module.__name__):
+        assert rig.watchdog.open()
+        assert rig.watchdog.active
+        assert rig.displays[0].grab_args == (None, 30.0)
+        assert not rig.closed.is_set()
+        rig.elapsed.set()
+        assert rig.expired.wait(WAIT_S)
+    warnings = [record.message for record in caplog.records if record.levelno == logging.WARNING]
+    assert warnings == ["Не удалось подписаться на смену активного окна: захват снимется по сроку"]
 
 
 @pytest.mark.parametrize("expires", [False, True])

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import stat
 from pathlib import Path
 
 import pytest
 
 from astra_voice.models import catalog_state
-from astra_voice.models.catalog import CatalogError, load_builtin
+from astra_voice.models.catalog import CatalogError, RevokedEntry, _apply_state, load_builtin
 from astra_voice.models.catalog_state import CatalogState
 
 pytestmark = pytest.mark.unit
@@ -44,6 +45,34 @@ def test_same_catalog_is_not_rewritten(state_file: Path) -> None:
     before = state_file.stat().st_mtime_ns
     assert catalog_state.apply_state(state_file, CatalogState(1, 2, SHA_A)) is False
     assert state_file.stat().st_mtime_ns == before
+
+
+def test_same_catalog_migrates_missing_snapshot(state_file: Path) -> None:
+    catalog_state.write_state(state_file, CatalogState(1, 2, SHA_A))
+    candidate = CatalogState(1, 2, SHA_A, (("model", "r1"),))
+    assert catalog_state.apply_state(state_file, candidate) is True
+    assert catalog_state.read_state(state_file) == candidate
+    assert read_raw(state_file)["revoked"] == [{"model_id": "model", "revision": "r1"}]
+    assert catalog_state.apply_state(state_file, candidate) is False
+
+
+def test_same_catalog_replaces_different_snapshot(state_file: Path) -> None:
+    old = CatalogState(1, 2, SHA_A, (("old", "r1"),))
+    candidate = CatalogState(1, 2, SHA_A, (("new", "r2"),))
+    catalog_state.write_state(state_file, old)
+    assert catalog_state.apply_state(state_file, candidate) is True
+    assert catalog_state.read_state(state_file) == candidate
+    assert catalog_state.apply_state(state_file, candidate) is False
+
+
+def test_same_catalog_repairs_bad_snapshot(state_file: Path) -> None:
+    state_file.write_text(
+        json.dumps({"trust_epoch": 1, "serial": 2, "sha256": SHA_A, "revoked": "broken"}),
+        encoding="utf-8",
+    )
+    candidate = CatalogState(1, 2, SHA_A, (("model", "r1"),))
+    assert catalog_state.apply_state(state_file, candidate) is True
+    assert catalog_state.read_state(state_file) == candidate
 
 
 def test_newer_serial_is_applied(state_file: Path) -> None:
@@ -104,6 +133,49 @@ def test_oversized_state_is_ignored(state_file: Path) -> None:
     assert catalog_state.read_state(state_file) is None
 
 
+@pytest.mark.parametrize(
+    "revoked",
+    [
+        None,
+        {},
+        [{"model_id": "model"}],
+        [{"model_id": "model", "revision": "r1", "reason": "extra"}],
+        [{"model_id": 1, "revision": "r1"}],
+        [{"model_id": "model", "revision": "не-id"}],
+        [{"model_id": "a" * 65, "revision": "r1"}],
+        [{"model_id": "m", "revision": "r"}] * 1025,
+    ],
+)
+def test_bad_snapshot_preserves_rollback_state(
+    state_file: Path, revoked: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    state_file.write_text(
+        json.dumps({"trust_epoch": 2, "serial": 3, "sha256": SHA_A, "revoked": revoked}),
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING, logger=catalog_state.__name__):
+        assert catalog_state.read_state(state_file) == CatalogState(2, 3, SHA_A)
+    assert sum("Снимок отозванных версий" in row.message for row in caplog.records) == 1
+    with pytest.raises(ValueError, match="устарел"):
+        catalog_state.apply_state(state_file, CatalogState(2, 2, SHA_B))
+
+
+def test_maximum_snapshot_fits_state_limit(state_file: Path) -> None:
+    pairs = (("a" * 64, "b" * 64),) * 1024
+    catalog_state.write_state(state_file, CatalogState(1, 1, SHA_A, pairs))
+    assert state_file.stat().st_size <= catalog_state.STATE_MAX_BYTES
+    assert catalog_state.read_state(state_file) == CatalogState(1, 1, SHA_A, pairs)
+
+
+def test_catalog_application_records_revoked_pairs_without_reason(state_file: Path) -> None:
+    raw = b"signed catalog bytes"
+    _apply_state(state_file, raw, 3, 2, (RevokedEntry("model", "r1", "private reason"),))
+    assert catalog_state.read_state(state_file) == CatalogState(
+        2, 3, hashlib.sha256(raw).hexdigest(), (("model", "r1"),)
+    )
+    assert "private reason" not in state_file.read_text(encoding="utf-8")
+
+
 def test_state_directory_instead_of_file_is_ignored(state_file: Path) -> None:
     state_file.mkdir()
     assert catalog_state.read_state(state_file) is None
@@ -118,7 +190,10 @@ def test_load_builtin_records_and_then_rejects_rollback(tmp_path: Path) -> None:
     catalog = load_builtin(verifier, root=DATA_ROOT, state_path=state_file)
     raw = (DATA_ROOT / "catalog.json").read_bytes()
     assert catalog_state.read_state(state_file) == CatalogState(
-        catalog.trust_epoch, catalog.serial, hashlib.sha256(raw).hexdigest()
+        catalog.trust_epoch,
+        catalog.serial,
+        hashlib.sha256(raw).hexdigest(),
+        tuple((item.model_id, item.revision) for item in catalog.revoked),
     )
     # Тот же каталог принимается повторно: состояние не меняется.
     assert load_builtin(verifier, root=DATA_ROOT, state_path=state_file).serial == catalog.serial

@@ -721,6 +721,7 @@ class FakeSettings(QObject):
         self._activeModelMessage: str = ""
         self._canReinstall: bool = True
         self._canInstall: bool = False
+        self._revocationUnknown: bool = False
         self._models: list[dict[str, Any]] = [
             {
                 "id": "gigaam-v3-rnnt",
@@ -1029,6 +1030,17 @@ class FakeSettings(QObject):
         self.changed.emit()
 
     models = pyqtProperty("QVariantList", _get_models, _set_models, notify=changed)
+
+    def _get_revocationUnknown(self) -> bool:
+        return self._revocationUnknown
+
+    def _set_revocationUnknown(self, value: bool) -> None:
+        self._revocationUnknown = value
+        self.changed.emit()
+
+    revocationUnknown = pyqtProperty(
+        bool, _get_revocationUnknown, _set_revocationUnknown, notify=changed
+    )
 
     def _get_selectionSummary(self) -> str:
         return self._selectionSummary
@@ -3119,6 +3131,38 @@ def test_settings_models_show_active_model(onboarding_app: Any, dark: bool) -> N
         onboarding_app, dark, fake=fake, section="models", inspect=inspect
     )
     assert_no_messages(messages, "active model card")
+
+
+@pytest.mark.parametrize("unknown", [False, True], ids=["snapshot", "unknown"])
+def test_models_empty_catalog_revocation_warning(onboarding_app: Any, unknown: bool) -> None:
+    fake = FakeSettings()
+    available_models = fake.models
+    fake.models = []
+    fake.revocationUnknown = unknown
+    warning = (
+        "Проверить, не отозвана ли текущая версия модели, сейчас нельзя — "
+        "программа работает с той моделью, что была выбрана раньше."
+    )
+
+    def inspect(window: Any) -> None:
+        texts = visible_texts(window.contentItem())
+        assert "Список моделей недоступен. Модель можно поставить из файла или папки." in texts
+        assert (warning in texts) is unknown
+        note = next(
+            item
+            for item in visual_tree(window.contentItem())
+            if item.objectName() == "revocationUnknownNote"
+        )
+        assert note.isVisible() is unknown
+        fake.models = available_models
+        onboarding_app.processEvents()
+        assert not note.isVisible()
+        assert warning not in visible_texts(window.contentItem())
+
+    _, messages = render_settings(
+        onboarding_app, False, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "empty catalog revocation warning")
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])

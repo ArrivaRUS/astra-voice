@@ -256,6 +256,7 @@ ApplicationWindow {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         height: Theme.statusbarH
+        revocationUnknown: window.bridge ? window.bridge.revocationUnknown : false
         version: "v" + window.appVersion
     }
 }

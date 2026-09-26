@@ -20,7 +20,10 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 STATE_FILE_NAME = "catalog-state.json"
-STATE_MAX_BYTES = 4096
+# При indent=2 первая пара добавляет 186 байт, следующие — по 184
+# (два идентификатора по 64 ASCII-символа). Сохраняем прежние 4096 байт
+# для остальных полей и добавляем ровно место для 1024 пар.
+STATE_MAX_BYTES = 4096 + 186 + 1023 * 184
 STALE_MESSAGE = "Список моделей устарел: программа уже получала более свежий список."
 
 
@@ -31,6 +34,7 @@ class CatalogState:
     trust_epoch: int
     serial: int
     sha256: str
+    revoked: tuple[tuple[str, str], ...] | None = None
 
 
 def state_path(directory: Path) -> Path:
@@ -72,14 +76,45 @@ def read_state(path: Path) -> CatalogState | None:
     ):
         log.warning("Состояние каталога неполно и будет перезаписано.")
         return None
-    return CatalogState(trust_epoch=trust_epoch, serial=serial, sha256=sha256)
+    revoked: tuple[tuple[str, str], ...] | None = None
+    if "revoked" in document:
+        value = document["revoked"]
+        # Локальный импорт исключает цикл: catalog импортирует этот модуль.
+        from astra_voice.models.catalog import ID_RE
+
+        if (
+            isinstance(value, list)
+            and len(value) <= 1024
+            and all(
+                isinstance(item, dict)
+                and set(item) == {"model_id", "revision"}
+                and type(item["model_id"]) is str
+                and type(item["revision"]) is str
+                and ID_RE.fullmatch(item["model_id"]) is not None
+                and ID_RE.fullmatch(item["revision"]) is not None
+                for item in value
+            )
+        ):
+            revoked = tuple((item["model_id"], item["revision"]) for item in value)
+        else:
+            log.warning("Снимок отозванных версий в состоянии каталога повреждён.")
+    return CatalogState(trust_epoch=trust_epoch, serial=serial, sha256=sha256, revoked=revoked)
 
 
 def write_state(path: Path, state: CatalogState) -> None:
     """Публикует состояние 0600 через соседний временный файл (как в store)."""
+    document: dict[str, object] = {
+        "trust_epoch": state.trust_epoch,
+        "serial": state.serial,
+        "sha256": state.sha256,
+    }
+    if state.revoked is not None:
+        document["revoked"] = [
+            {"model_id": model_id, "revision": revision} for model_id, revision in state.revoked
+        ]
     payload = (
         json.dumps(
-            {"trust_epoch": state.trust_epoch, "serial": state.serial, "sha256": state.sha256},
+            document,
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -130,7 +165,12 @@ def apply_state(path: Path, candidate: CatalogState) -> bool:
             "нет" if applied is None else f"{applied.trust_epoch}, {applied.serial}",
         )
         raise ValueError(STALE_MESSAGE)
-    if applied is not None and candidate == applied:
-        return False
+    if applied is not None and (candidate.trust_epoch, candidate.serial, candidate.sha256) == (
+        applied.trust_epoch,
+        applied.serial,
+        applied.sha256,
+    ):
+        if applied.revoked == candidate.revoked:
+            return False
     write_state(path, candidate)
     return True
