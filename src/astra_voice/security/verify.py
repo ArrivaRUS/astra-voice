@@ -142,6 +142,10 @@ class Verifier:
         keyring = self.keyring
         if not keyring.is_absolute():
             keyring = keyring.resolve()
+        if not data.is_absolute():
+            data = data.resolve()
+        if not sig.is_absolute():
+            sig = sig.resolve()
         for label, path in (("keyring", keyring), ("данные", data), ("подпись", sig)):
             if not path.is_file():
                 return self._fail(f"{label}: файл не найден или не обычный файл: {path}")

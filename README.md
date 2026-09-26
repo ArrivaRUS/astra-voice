@@ -62,6 +62,29 @@ make lint && make test
 Гейты сборки (`tools/elf-audit`, `tools/deps-audit`) считают собственные ELF в пакете,
 проверяют максимальную требуемую glibc и сверяют зависимости колёс с версиями в apt.
 
+## Как выпустить релиз
+
+1. Добавить запись версии `0.1.0` в первую строку `packaging/debian/changelog`.
+2. Проверить выпуск командой `scripts/release.sh v0.1.0` (по умолчанию dry-run).
+3. Создать и отправить тег командой `scripts/release.sh v0.1.0 --push`.
+4. Одобрить job `release` в GitHub Environment `release`.
+5. Скачать ассеты и проверить их: `tools/validate release --version 0.1.0 --dir <папка>`.
+
+Dry-run обращается в сеть только через `gh` (`gh auth status`, `gh run list`).
+Если последний коммит меняет только журнал и CI пропускает его через `paths-ignore`,
+на HEAD нет успешного запуска CI: тегируйте последний коммит с CI либо осознанно
+используйте `--skip-ci-check`.
+
+Формат указателя описан в [`docs/contracts/latest.json.md`](docs/contracts/latest.json.md).
+Job `release` публикует семь ассетов: `astra-voice_*.deb`, `sbom.cdx.json`,
+`SHA256SUMS`, `SHA256SUMS.asc`, `INSTALL-ADMIN.md` (копия
+[`docs/INSTALL-ADMIN.md`](docs/INSTALL-ADMIN.md)), `latest.json` и `release.gpg`
+(копия `data/keys/release.gpg`). В пакете связка лежит по пути
+`/usr/share/astra-voice/data/keys/release.gpg`.
+Ассет `release.gpg` нельзя использовать как корень доверия при проверке того же релиза:
+сверьте отпечаток мастера по этому README и `docs/INSTALL-ADMIN.md`.
+Отпечаток мастера — `5F1F 7718 559F 8F57 FFE1  1780 55BB 1162 F17A 5CB0` (см. раздел о ключах выше).
+
 ## Откуда растёт
 Предшественник — сборка [Handy](https://github.com/cjpais/Handy) с GigaAM v3
 (`ArrivaRUS/handy-gigaam`): фраза 6 секунд распознаётся за ~130 мс на Intel Core Ultra 7 без GPU.

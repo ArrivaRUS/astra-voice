@@ -1,0 +1,372 @@
+"""Проверки публичной связки настоящими временными GPG-ключами."""
+
+from __future__ import annotations
+
+import os
+import runpy
+import shutil
+import subprocess
+import sys
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import cast
+
+import pytest
+
+import astra_voice.security.verify as verify_module
+
+pytestmark = pytest.mark.unit
+ROOT = Path(__file__).resolve().parents[2]
+Check = Callable[[Path, frozenset[str], frozenset[str], str | None], tuple[bool, list[str]]]
+
+
+@pytest.fixture(scope="module")
+def key(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Path, str, str]]:
+    if any(shutil.which(name) is None for name in ("gpg", "gpgconf")):
+        pytest.skip("нет gpg или gpgconf")
+    root = tmp_path_factory.mktemp("check-keyring")
+    home = root / "gnupg"
+    home.mkdir(mode=0o700)
+    env = {**os.environ, "GNUPGHOME": str(home)}
+    try:
+        generated = subprocess.run(
+            [
+                "gpg",
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-gen-key",
+                "Test <t@example.invalid>",
+                "ed25519",
+                "sign",
+                "never",
+            ],
+            env=env,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if generated.returncode:
+            pytest.skip("генерация GPG-ключа невозможна")
+        listing = subprocess.run(
+            ["gpg", "--batch", "--with-colons", "--list-keys"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        ).stdout
+        primary = next(
+            line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")
+        )
+        added = subprocess.run(
+            [
+                "gpg",
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-add-key",
+                primary,
+                "ed25519",
+                "sign",
+                "never",
+            ],
+            env=env,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if added.returncode:
+            pytest.skip("генерация GPG-подключа невозможна")
+        listing = subprocess.run(
+            ["gpg", "--batch", "--with-colons", "--list-keys"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        ).stdout
+        fingerprints = [
+            line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")
+        ]
+        exported = root / "release.gpg"
+        with exported.open("wb") as output:
+            subprocess.run(
+                ["gpg", "--batch", "--export"], env=env, stdout=output, check=True, timeout=30
+            )
+        yield exported, fingerprints[0], fingerprints[1]
+    finally:
+        subprocess.run(["gpgconf", "--kill", "gpg-agent"], env=env, check=False, timeout=10)
+
+
+@pytest.fixture
+def check() -> Check:
+    return cast(Check, runpy.run_path(str(ROOT / "scripts/check_keyring.py"))["check"])
+
+
+def test_pinned_and_unpinned(key: tuple[Path, str, str], check: Check) -> None:
+    path, primary, _ = key
+    assert check(path, frozenset({primary}), frozenset(), None)[0]
+    ok, messages = check(path, frozenset(), frozenset(), None)
+    assert not ok and primary in " ".join(messages)
+
+
+def test_revoked_primary_and_subkey(key: tuple[Path, str, str], check: Check) -> None:
+    path, primary, subkey = key
+    for revoked in (primary, subkey):
+        ok, messages = check(path, frozenset({primary}), frozenset({revoked}), None)
+        assert not ok and revoked in " ".join(messages)
+
+
+@pytest.mark.parametrize("content", [b"garbage", b""])
+def test_invalid_keyring(tmp_path: Path, check: Check, content: bytes) -> None:
+    path = tmp_path / "bad.gpg"
+    path.write_bytes(content)
+    assert not check(path, frozenset(), frozenset(), None)[0]
+
+
+def test_empty_gpg_listing_has_no_primary(tmp_path: Path, check: Check) -> None:
+    fake = tmp_path / "gpg"
+    fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    ok, messages = check(tmp_path / "release.gpg", frozenset(), frozenset(), str(fake))
+    assert not ok
+    assert "нет первичного ключа" in " ".join(messages)
+
+
+def test_subkey_only_listing_has_no_primary(tmp_path: Path, check: Check) -> None:
+    fake = tmp_path / "gpg"
+    fingerprint = "A" * 40
+    fake.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' 'sub:::::::::' 'fpr:::::::::{fingerprint}:'\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    ok, messages = check(tmp_path / "release.gpg", frozenset(), frozenset(), str(fake))
+    assert not ok
+    assert "нет первичного ключа" in " ".join(messages)
+
+
+def test_gpg_failure(tmp_path: Path, key: tuple[Path, str, str], check: Check) -> None:
+    fake = tmp_path / "gpg"
+    fake.write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+    fake.chmod(0o755)
+    assert not check(key[0], frozenset({key[1]}), frozenset(), str(fake))[0]
+
+
+def test_gpg_missing(
+    monkeypatch: pytest.MonkeyPatch, key: tuple[Path, str, str], check: Check
+) -> None:
+    # runpy создаёт отдельное пространство имён, но импортированный модуль shutil общий.
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    assert not check(key[0], frozenset({key[1]}), frozenset(), None)[0]
+
+
+def test_cli(tmp_path: Path, key: tuple[Path, str, str]) -> None:
+    script = tmp_path / "scripts" / "check_keyring.py"
+    script.parent.mkdir()
+    shutil.copy2(ROOT / "scripts/check_keyring.py", script)
+    security = tmp_path / "src" / "astra_voice" / "security"
+    security.mkdir(parents=True)
+    (security.parent / "__init__.py").write_text("", encoding="utf-8")
+    (security / "__init__.py").write_text("", encoding="utf-8")
+    verify = security / "verify.py"
+    verify.write_text(
+        f"PINNED_FINGERPRINTS = frozenset({{{key[1]!r}}})\nREVOKED_FINGERPRINTS = frozenset()\n",
+        encoding="utf-8",
+    )
+    assert subprocess.run([sys.executable, str(script), str(key[0])], check=False).returncode == 0
+    verify.write_text(
+        'PINNED_FINGERPRINTS = frozenset({"0" * 40})\nREVOKED_FINGERPRINTS = frozenset()\n',
+        encoding="utf-8",
+    )
+    assert subprocess.run([sys.executable, str(script), str(key[0])], check=False).returncode == 1
+
+
+def test_cli_usage() -> None:
+    assert (
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts/check_keyring.py")],
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 2
+    )
+
+
+def test_cli_relative_keyring_from_other_cwd(key: tuple[Path, str, str], tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copy2(key[0], tmp_path / "release.gpg")
+    script = ROOT / "scripts/check_keyring.py"
+    code = (
+        "import runpy, sys; "
+        "from pathlib import Path; "
+        "sys.path.insert(0, str(Path(sys.argv[1]).parents[1] / 'src')); "
+        "import astra_voice.security.verify as verify; "
+        "verify.PINNED_FINGERPRINTS = frozenset({sys.argv[2]}); "
+        "sys.argv = [sys.argv[1], '../release.gpg']; "
+        "raise SystemExit(runpy.run_path(sys.argv[0])['main']())"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(script), key[1]],
+        cwd=work,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@contextmanager
+def generated_bundle(
+    tmp_path: Path, expirations: tuple[str, ...] = (), second_master: bool = False
+) -> Iterator[tuple[Path, str, str | None, Path]]:
+    if any(shutil.which(name) is None for name in ("gpg", "gpgconf")):
+        pytest.skip("нет gpg или gpgconf")
+    home = tmp_path / "generated-gnupg"
+    home.mkdir(mode=0o700)
+    env = {**os.environ, "GNUPGHOME": str(home)}
+
+    def gpg(*args: str) -> bytes:
+        return subprocess.run(
+            [
+                "gpg",
+                "--batch",
+                "--no-tty",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                *args,
+            ],
+            env=env,
+            capture_output=True,
+            timeout=30,
+            check=True,
+        ).stdout
+
+    try:
+        gpg("--quick-gen-key", "Bundle <b@example.invalid>", "ed25519", "cert", "never")
+        listing = gpg("--with-colons", "--list-keys").decode()
+        master = next(
+            line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")
+        )
+        for expiration in expirations:
+            gpg("--quick-add-key", master, "ed25519", "sign", expiration)
+        public = tmp_path / "release.gpg"
+        public.write_bytes(gpg("--export", master))
+        other: str | None = None
+        if second_master:
+            gpg("--quick-gen-key", "Other <o@example.invalid>", "ed25519", "cert", "never")
+            listing = gpg("--with-colons", "--list-keys").decode()
+            other = [
+                line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")
+            ][-1]
+            public.write_bytes(public.read_bytes() + gpg("--export", other))
+        yield public, master, other, home
+    finally:
+        subprocess.run(["gpgconf", "--kill", "gpg-agent"], env=env, check=False, timeout=10)
+
+
+def test_public_plus_secret_packets(tmp_path: Path, check: Check) -> None:
+    with generated_bundle(tmp_path) as (public, master, _, home):
+        secret = subprocess.run(
+            ["gpg", "--batch", "--export-secret-keys", master],
+            env={**os.environ, "GNUPGHOME": str(home)},
+            capture_output=True,
+            check=True,
+            timeout=30,
+        ).stdout
+        public.write_bytes(public.read_bytes() + secret)
+        ok, messages = check(public, frozenset({master}), frozenset(), None)
+        assert not ok
+        assert "секретные пакеты" in " ".join(messages)
+
+
+def test_secret_only_packets(tmp_path: Path, check: Check) -> None:
+    with generated_bundle(tmp_path) as (public, master, _, home):
+        public.write_bytes(
+            subprocess.run(
+                ["gpg", "--batch", "--export-secret-keys", master],
+                env={**os.environ, "GNUPGHOME": str(home)},
+                capture_output=True,
+                check=True,
+                timeout=30,
+            ).stdout
+        )
+        ok, messages = check(public, frozenset({master}), frozenset(), None)
+        assert not ok
+        assert "секретные пакеты" in " ".join(messages)
+
+
+def test_pinned_plus_unpinned_primary_rejected(tmp_path: Path, check: Check) -> None:
+    with generated_bundle(tmp_path, second_master=True) as (public, master, other, _):
+        ok, messages = check(public, frozenset({master}), frozenset(), None)
+        assert not ok
+        assert "первичный ключ не закреплён" in " ".join(messages)
+        assert other is not None and other in " ".join(messages)
+
+
+def test_two_pinned_primary_keys(tmp_path: Path, check: Check) -> None:
+    with generated_bundle(tmp_path, second_master=True) as (public, master, other, _):
+        assert other is not None
+        ok, messages = check(public, frozenset({master, other}), frozenset(), None)
+        assert ok is True
+        assert messages == []
+
+
+def test_two_pinned_one_revoked_primary_rejected(tmp_path: Path, check: Check) -> None:
+    with generated_bundle(tmp_path, second_master=True) as (public, master, other, _):
+        assert other is not None
+        ok, messages = check(public, frozenset({master, other}), frozenset({other}), None)
+        assert not ok
+        assert "первичный ключ отозван" in " ".join(messages)
+        assert other in " ".join(messages)
+
+
+@pytest.mark.parametrize(
+    ("expirations", "expected"),
+    [
+        (("2030-01-01", "2030-01-01"), True),
+        (("2030-01-01", "2031-01-01"), False),
+        (("never", "never"), False),
+    ],
+)
+def test_expiration_warning(tmp_path: Path, expirations: tuple[str, ...], expected: bool) -> None:
+    namespace = runpy.run_path(str(ROOT / "scripts/check_keyring.py"))
+    warn = cast(Callable[[Path, str | None], list[str]], namespace["warnings"])
+    with generated_bundle(tmp_path, expirations) as (public, _, _, _):
+        messages = warn(public, None)
+        assert bool(messages) is expected
+        if expected:
+            assert "ПРЕДУПРЕЖДЕНИЕ" not in messages[0]
+            assert "2030-01-01" in messages[0]
+
+
+def test_warning_printed_to_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    namespace = runpy.run_path(str(ROOT / "scripts/check_keyring.py"))
+    main = cast(Callable[[], int], namespace["main"])
+    with generated_bundle(tmp_path, ("2030-01-01", "2030-01-01")) as (
+        public,
+        master,
+        _,
+        _,
+    ):
+        monkeypatch.setattr(verify_module, "PINNED_FINGERPRINTS", frozenset({master}))
+        monkeypatch.setattr(verify_module, "REVOKED_FINGERPRINTS", frozenset())
+        monkeypatch.setattr(sys, "argv", ["check_keyring.py", str(public)])
+        assert main() == 0
+        output = capsys.readouterr()
+        assert (
+            "ПРЕДУПРЕЖДЕНИЕ: все подписывающие подключи истекают в один день (2030-01-01)"
+            in output.err
+        )
