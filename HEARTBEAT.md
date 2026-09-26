@@ -663,3 +663,24 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
   (метка сеанса). Открыто: вопрос ИБ-практику заказчика про голос+shell; тестовый адрес GLM 5.3 — к реализации E13.
 - Cowork: C0 в main `18d31ca`, wt-c0 удалён; другая сессия забрала утечку structlog в тестах; C1/T2 по C0 — v1.0.
 - Worktree Voice: `wt-release`, `wt-downloader`, `wt-ort125` (старый). R1 30.09: чеклист живых сценариев у заказчика (KDE) — ещё не начат.
+
+### 2026-09-26 23:55 — снимок: m6.19 на рабочем столе, CI main зелёный, ключ/релиз/загрузчик в main
+- **У заказчика установлена `m6.17`** (pid 231230). На ~/Desktop — `astra-voice_0.1.0~m6.19_amd64.deb` (m6.18 не ставилась,
+  заменена): фикс «призраков» иконок (Python-провайдер `image://avicon`, урок 019), фикс segfault провайдера (урок 021),
+  мастер-ключ заказчика, полный загрузчик M6. После установки — перезапуск по точному pid; проверка: «Модели» прокрутить →
+  «Общие» без галочек над шапкой, чёткие значки на HDMI-1 (масштаб 1,25), загрузка модели/очередь.
+- **CI main:** зелёный с `170d5db` (впервые с `4bf0308`); причины красного — шрифт PT Root UI в контейнере + use-after-free
+  sip-обёрток после упавших тестов (урок 020) + лямбда на `engine.destroyed` (урок 021). Правило: после push — `gh run list`.
+- **Слито 26.09:** `wip/m6-icon-clip`, `wip/master-key` (пин 5F1F…5CB0, S1 7602…4D79 в Environment `release`, S2 9053…0428;
+  риск K-1 принят заказчиком для v0.1, M2 офлайн до 31.10), `wip/r1-release` (release.sh, validate release, latest.json,
+  check_keyring/check_signing_secret), `wip/ci-xvfb` (PR #1), `wip/m6-downloader` (PR #2). ИБ T2 по всем — PASS с условиями,
+  условия закрыты (`docs/security/T2-2026-09-26-*.md`).
+- **GitHub (через API, «да» заказчика):** Environment `release` только теги `v*`; rulesets `release-tags`, `main-guard`;
+  Actions — только GitHub-owned, SHA pinning. 2FA — приложение GitHub (достаточно).
+- **Заказчик просил:** не напоминать про гигиену машины/ключей на бете (память `feedback_no_security_nagging_beta`).
+- **Лимит Fable** исчерпан 26.09 — агентов с моделью fable (security-analyst и др.) запускать с `model: opus`.
+- **Дальше к R1 30.09:** fine-grained PAT для агентов (после слияния релиза — готово к выдаче, инструкция заказчику);
+  T3 перед тегом; changelog `0.1.0`; чеклист живых сценариев у заказчика (KDE); INSTALL-ADMIN «[уточнить]»; мелочи:
+  чистка QtQuick.Shapes из Depends/CI/conftest, сторож регистрации провайдера по функциям, лямбды на сигналах в
+  `app.py:328`, `model_downloads.py:2180`, `tray.py:246` (урок 021), состояния policy/offline-user до перезапуска (M7).
+- Worktree: `wt-ort125` (старый); остальные ветки слиты — worktree можно убрать.
