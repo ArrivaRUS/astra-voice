@@ -1,3 +1,10 @@
+astra-voice (0.1.0~m6.17) unstable; urgency=medium
+
+  * В карточке модели строка с размером и тегами выровнена по левому краю
+    названия.
+
+ -- ArrivaRUS <arrivarus@gmail.com>  Sat, 26 Sep 2026 12:06:04 +0300
+
 astra-voice (0.1.0~m6.16) unstable; urgency=medium
 
   * Поле выбора горячей клавиши больше не закрывается само сразу после
