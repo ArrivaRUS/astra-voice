@@ -47,6 +47,9 @@ def qt() -> Iterator[dict[str, Any]]:
     previous = qInstallMessageHandler(handler)
     app = get_qapplication()
     engine = QQmlEngine()
+    from astra_voice.ui.icons import install_icon_provider
+
+    install_icon_provider(engine)
     try:
         yield {"app": app, "engine": engine, "messages": messages, "url": QUrl.fromLocalFile}
     finally:
@@ -138,6 +141,9 @@ def test_main_window_loads_without_warnings(qt: dict[str, Any]) -> None:
     start = len(messages)
 
     engine = QQmlApplicationEngine()
+    from astra_voice.ui.icons import install_icon_provider
+
+    install_icon_provider(engine)
     engine.load(qt["url"](str(QML_DIR / "Main.qml")))
     assert engine.rootObjects(), "Main.qml не создал корневой объект"
 

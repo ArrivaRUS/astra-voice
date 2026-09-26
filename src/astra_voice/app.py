@@ -40,6 +40,7 @@ from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui.hotkey_capture import HotkeyCapture
+from astra_voice.ui.icons import install_icon_provider
 
 if TYPE_CHECKING:
     from astra_voice.core.dictation import LevelCallback, TestCallback
@@ -436,6 +437,7 @@ def _load_qml(app_info: Any, theme_bridge: Any | None) -> Any | None:
         log.warning("модуль QML недоступен (%s), показываю заглушку", exc)
         return None
     engine = QQmlApplicationEngine()
+    install_icon_provider(engine)
     context = engine.rootContext()
     context.setContextProperty("appInfo", app_info)
     context.setContextProperty("showOnboarding", False)

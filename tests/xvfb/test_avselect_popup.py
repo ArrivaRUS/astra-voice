@@ -20,6 +20,7 @@ from PyQt5.QtQuick import QQuickItem, QQuickView
 from PyQt5.QtTest import QTest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
@@ -40,6 +41,7 @@ def popup_app() -> Any:
 @pytest.fixture
 def popup_view(popup_app: Any) -> Iterator[QQuickView]:
     view = QQuickView()
+    install_icon_provider(view.engine())
     try:
         yield view
     finally:

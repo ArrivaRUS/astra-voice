@@ -93,6 +93,9 @@ def textformat_app() -> Any:
 @pytest.fixture
 def textformat_view(textformat_app: Any) -> Iterator[tuple[QQuickView, RecordingNetworkFactory]]:
     view = QQuickView()
+    from astra_voice.ui.icons import install_icon_provider
+
+    install_icon_provider(view.engine())
     factory = RecordingNetworkFactory()
     # Фабрика устанавливается ДО загрузки любого QML и живёт дольше движка.
     view.engine().setNetworkAccessManagerFactory(factory)
