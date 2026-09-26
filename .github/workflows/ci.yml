@@ -275,7 +275,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Git для полного checkout
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          fetch-depth: 0
       - name: Версия тега и changelog
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -293,6 +299,13 @@ jobs:
             lintian file binutils git make gnupg gpgv curl jq \
             python3 python3-venv python3-pip python3-pyqt5 python3-pyqt5.qtquick \
             python3-requests python3-jsonschema
+      - name: Тег стоит на коммите из main
+        run: |
+          test -d .git || { echo "::error::Checkout без истории Git"; exit 1; }
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::Тег не на коммите из main"; exit 1; }
+      - name: Связка ключей в белом списке
+        run: python3 scripts/check_keyring.py data/keys/release.gpg
       - name: Колёса
         run: packaging/build-deb.sh --fetch-wheels
       # Сборка и подпись — в одном job: между ними артефакт никуда не уезжает (У32).

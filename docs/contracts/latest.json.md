@@ -10,6 +10,9 @@
 | `published_at` | строка | Время публикации в UTC, ISO 8601, `YYYY-MM-DDTHH:MM:SSZ` |
 | `min_astra` | строка | Минимальная версия Astra Linux SE |
 
+Минимум `1.8` задан PRD/ТЗ для Astra Linux SE 1.8. Пакет собирается под
+`debian:12` = ALSE 1.8 (см. `packaging/Containerfile`).
+
 ```json
 {
   "deb": "astra-voice_0.1.0_amd64.deb",

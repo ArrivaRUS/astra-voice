@@ -43,7 +43,11 @@ check() {
     fi
 }
 
-if [[ -z $(git status --porcelain) ]]; then check 'рабочее дерево чистое' true; else check 'рабочее дерево не чистое' false; fi
+if status=$(git status --porcelain); then
+    if [[ -z $status ]]; then check 'рабочее дерево чистое' true; else check 'рабочее дерево не чистое' false; fi
+else
+    check 'не удалось проверить состояние рабочего дерева' false
+fi
 branch=$(git branch --show-current)
 if [[ $branch == main ]]; then check 'текущая ветка main' true; else check "текущая ветка $branch, требуется main" false; fi
 for asset in docs/INSTALL-ADMIN.md data/keys/release.gpg; do
@@ -53,17 +57,10 @@ for asset in docs/INSTALL-ADMIN.md data/keys/release.gpg; do
         check "$asset отсутствует или не отслеживается Git" false
     fi
 done
-if [[ -f data/keys/release.gpg ]] && command -v gpg >/dev/null 2>&1; then
-    gpg_home=$(mktemp -d)
-    trap 'rm -rf "$gpg_home"' EXIT
-    key_info=$(gpg --homedir "$gpg_home" --batch --with-colons --show-keys data/keys/release.gpg 2>/dev/null || true)
-    if awk -F: '$1 == "fpr" && toupper($10) == "CB951AD794407972A0B1A5BBAFA87398C4953A71" { found=1 } END { exit !found }' <<< "$key_info"; then
-        check 'в связке тестовый ключ — публичный релиз запрещён до мастер-ключа (data/keys/README.md)' false
-    else
-        check 'связка не содержит тестовый ключ спайка' true
-    fi
-elif ! command -v gpg >/dev/null 2>&1; then
-    echo 'ПРЕДУПРЕЖДЕНИЕ: gpg отсутствует; проверка тестового отпечатка пропущена.'
+if python3 scripts/check_keyring.py data/keys/release.gpg; then
+    check 'связка ключей в белом списке' true
+else
+    check 'связка ключей в белом списке' false
 fi
 head=$(git rev-parse HEAD)
 if $push; then
@@ -97,7 +94,7 @@ else
 fi
 
 if $skip_ci; then
-    echo 'ПРЕДУПРЕЖДЕНИЕ: проверка CI пропущена (--skip-ci-check).'
+    echo 'ПРЕДУПРЕЖДЕНИЕ: CI НЕ проверен (--skip-ci-check)'
 elif ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
     check 'gh отсутствует или не авторизован; установите/авторизуйте gh или повторите с --skip-ci-check' false
 else
@@ -135,13 +132,20 @@ cat <<'ASSETS'
   latest.json
   release.gpg (из data/keys/release.gpg)
 ASSETS
+if $skip_ci; then echo 'ПРЕДУПРЕЖДЕНИЕ: CI НЕ проверен (--skip-ci-check)'; fi
 if [[ -n $(git config user.signingkey || true) ]]; then tag_kind=-s; else tag_kind=-a; fi
 printf 'git tag %s %s -m %q\n' "$tag_kind" "$tag" "Astra Voice $tag"
-printf 'git push origin %s\n' "$tag"
+printf 'git push origin refs/tags/%s\n' "$tag"
 if ! $push; then
     echo 'dry-run: ничего не создано'
     exit 0
 fi
-git tag "$tag_kind" "$tag" -m "Astra Voice $tag"
-git push origin "$tag"
+if ! git tag "$tag_kind" "$tag" -m "Astra Voice $tag"; then
+    echo "ОШИБКА: не удалось создать тег $tag" >&2
+    exit 1
+fi
+if ! git push origin "refs/tags/$tag"; then
+    echo "ОШИБКА: не удалось отправить тег $tag; локальный тег создан. Для удаления: git tag -d $tag" >&2
+    exit 1
+fi
 echo 'Далее CI выполнит job release; Environment release ожидает одобрения ревьюера.'

@@ -10,6 +10,10 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+# Минимальная поддерживаемая ОС — Astra Linux SE 1.8 (PRD/ТЗ).
+# Пакет собирается под debian:12 = ALSE 1.8; см. packaging/Containerfile.
+MIN_ASTRA = "1.8"
+
 
 def published_at(raw: str | None) -> str:
     """Вернуть дату в строгом UTC ISO 8601 без долей секунды."""
@@ -35,7 +39,7 @@ def generate(dist: Path, version: str, date: str | None = None) -> dict[str, str
         "deb": deb.name,
         "sha256": digest,
         "published_at": published_at(date),
-        "min_astra": "1.8",
+        "min_astra": MIN_ASTRA,
     }
     (dist / "latest.json").write_text(
         json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"

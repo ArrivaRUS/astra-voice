@@ -16,12 +16,14 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import math
 import os
 import re
 import shutil
+import stat
 import signal
 import subprocess
 import sys
@@ -58,6 +60,7 @@ from astra_voice.platform.hotkey import (  # noqa: E402
     HotkeyMode,
     HotkeyState,
 )
+import astra_voice.security.verify as verify_module  # noqa: E402
 from astra_voice.security.verify import Verifier  # noqa: E402
 from astra_voice.worker import ipc  # noqa: E402
 from astra_voice.worker.supervisor import Message, WorkerSupervisor  # noqa: E402
@@ -70,115 +73,195 @@ CATALOG_SELFCHECK_TIMEOUT_S = 60.0
 CATALOG_SWITCH_TIMEOUT_S = 180.0
 
 
+class ReleaseCriterionError(Exception):
+    """Ассет существует, но не является допустимым обычным файлом."""
+
+
+def release_read(path: Path, limit: int) -> bytes:
+    """Снять ограниченный снимок файла без следования за симлинком."""
+    if stat.S_ISLNK(path.lstat().st_mode):
+        raise ReleaseCriterionError("не обычный файл")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:  # симлинк между lstat и open
+            raise ReleaseCriterionError("не обычный файл") from exc
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ReleaseCriterionError("не обычный файл")
+        if info.st_size > limit:
+            raise ReleaseCriterionError("файл слишком большой")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(fd, min(1 << 20, limit + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > limit:
+                raise ReleaseCriterionError("файл слишком большой")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def release(args: argparse.Namespace) -> int:
     """Проверить локальные ассеты релиза, подпись, суммы и метаданные."""
     checks: list[dict[str, str | bool]] = []
-    impossible = False
 
     def record(name: str, ok: bool, detail: str) -> None:
         checks.append({"name": name, "ok": ok, "detail": detail})
 
+    def finish(code: int) -> int:
+        if args.json:
+            print(json.dumps({"ok": code == 0, "checks": checks}, ensure_ascii=False))
+        else:
+            for item in checks:
+                print(f"{'OK' if item['ok'] else 'ОШИБКА'}: {item['name']}: {item['detail']}")
+        return code
+
     directory: Path = args.dir
-    keyring: Path = args.keyring.resolve()
-    version: str = args.version
-    if version.startswith("v"):
-        version = version[1:]
-    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
-        record("version", False, "Версия должна иметь вид X.Y.Z или vX.Y.Z.")
-        impossible = True
-    else:
-        record("version", True, version)
-    for name, valid, detail in (
+    keyring: Path = args.keyring.absolute()
+    version: str = args.version.removeprefix("v")
+    valid_version = bool(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version))
+    record(
+        "version",
+        valid_version,
+        version if valid_version else "Версия должна иметь вид X.Y.Z или vX.Y.Z.",
+    )
+    available = (
         ("directory", directory.is_dir(), str(directory)),
-        ("keyring", keyring.is_file(), str(keyring)),
-        ("gpgv", shutil.which("gpgv") is not None, "команда gpgv"),
+        ("gpgv", verify_module.GPGV_PATH.is_file(), str(verify_module.GPGV_PATH)),
         ("dpkg-deb", shutil.which("dpkg-deb") is not None, "команда dpkg-deb"),
-    ):
-        record(name, valid, detail if valid else f"Недоступно: {detail}")
-        impossible |= not valid
-    if impossible:
-        code = 2
+    )
+    for name, ok, detail in available:
+        record(name, ok, detail if ok else f"Недоступно: {detail}")
+    if not valid_version or not all(item[1] for item in available):
+        return finish(2)
+
+    debs = sorted(directory.glob(f"astra-voice_{version}_*.deb"))
+    deb = debs[0] if len(debs) == 1 else None
+    required = (
+        "sbom.cdx.json",
+        "SHA256SUMS",
+        "SHA256SUMS.asc",
+        "INSTALL-ADMIN.md",
+        "latest.json",
+        "release.gpg",
+    )
+    paths = {name: directory / name for name in required}
+    if deb is not None:
+        paths[deb.name] = deb
+    snapshots: dict[str, bytes] = {}
+    missing: list[str] = []
+    invalid: list[str] = []
+    for name, path in paths.items():
+        try:
+            snapshots[name] = release_read(path, 512 << 20 if name.endswith(".deb") else 16 << 20)
+        except FileNotFoundError:
+            missing.append(name)
+        except ReleaseCriterionError as exc:
+            invalid.append(f"{name}: {exc}")
+        except OSError as exc:
+            record(name, False, f"не удалось прочитать: {exc.strerror or exc}")
+            return finish(2)
+    if keyring == (directory / "release.gpg").absolute() and "release.gpg" in snapshots:
+        key_bytes = snapshots["release.gpg"]
     else:
-        debs = sorted(directory.glob(f"astra-voice_{version}_*.deb"))
-        deb = debs[0] if len(debs) == 1 else None
-        required = (
-            "sbom.cdx.json",
-            "SHA256SUMS",
-            "SHA256SUMS.asc",
-            "INSTALL-ADMIN.md",
-            "latest.json",
-            "release.gpg",
-        )
-        missing = [name for name in required if not (directory / name).is_file()]
-        assets_ok = deb is not None and not missing
-        record("assets", assets_ok, f"deb: {len(debs)}; отсутствуют: {', '.join(missing) or 'нет'}")
-        release_keyring = directory / "release.gpg"
-        keyring_match = release_keyring.is_file() and release_keyring.read_bytes() == keyring.read_bytes()
-        record(
-            "release.gpg",
-            keyring_match,
-            "совпадает с --keyring" if keyring_match else "не совпадает с --keyring или отсутствует",
-        )
-        signature_ok = False
-        if (directory / "SHA256SUMS").is_file() and (directory / "SHA256SUMS.asc").is_file():
-            try:
-                signed = subprocess.run(
-                    ["gpgv", "--keyring", str(keyring), "SHA256SUMS.asc", "SHA256SUMS"],
-                    cwd=directory,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    check=False,
-                )
-                signature_ok = signed.returncode == 0
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        record(
-            "signature",
-            signature_ok,
-            "подпись верна" if signature_ok else "подпись неверна или отсутствует",
-        )
+        try:
+            key_bytes = release_read(keyring, 16 << 20)
+        except FileNotFoundError:
+            record(keyring.name, False, f"отсутствует: {keyring}")
+            return finish(2)
+        except ReleaseCriterionError as exc:
+            record(keyring.name, False, str(exc))
+            return finish(1)
+        except OSError as exc:
+            record(keyring.name, False, f"не удалось прочитать: {exc.strerror or exc}")
+            return finish(2)
+    assets_ok = deb is not None and not missing and not invalid
+    record(
+        "assets",
+        assets_ok,
+        f"deb: {len(debs)}; отсутствуют: {', '.join(missing) or 'нет'}; "
+        f"недопустимы: {', '.join(invalid) or 'нет'}",
+    )
+    match_keyring = snapshots.get("release.gpg") == key_bytes
+    record(
+        "release.gpg",
+        match_keyring,
+        "совпадает с --keyring" if match_keyring else "не совпадает с --keyring или отсутствует",
+    )
 
-        sums_ok = False
-        actual_sha = ""
-        if deb is not None:
-            actual_sha = hashlib.sha256(deb.read_bytes()).hexdigest()
-        if (directory / "SHA256SUMS").is_file():
-            try:
-                lines = (directory / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
-                seen: set[str] = set()
-                sums_ok = bool(lines)
+    signature_ok = False
+    signature_detail = "SHA256SUMS или подпись отсутствует"
+    if "SHA256SUMS" in snapshots and "SHA256SUMS.asc" in snapshots:
+        with tempfile.TemporaryDirectory(prefix="astra-release-verify-") as home:
+            temp = Path(home)
+            sums_copy = temp / "SHA256SUMS"
+            sig_copy = temp / "SHA256SUMS.asc"
+            key_copy = temp / "release.gpg"
+            sums_copy.write_bytes(snapshots["SHA256SUMS"])
+            sig_copy.write_bytes(snapshots["SHA256SUMS.asc"])
+            key_copy.write_bytes(key_bytes)
+            result = Verifier(
+                "release",
+                key_copy,
+                pinned=verify_module.PINNED_FINGERPRINTS,
+                revoked=verify_module.REVOKED_FINGERPRINTS,
+            ).verify_detached(sums_copy, sig_copy)
+            signature_ok = result.ok
+            signature_detail = result.primary_fingerprint or "" if result.ok else result.reason
+    record("signature", signature_ok, signature_detail)
+
+    sums_detail = "SHA256SUMS отсутствует"
+    if "SHA256SUMS" in snapshots:
+        try:
+            lines = snapshots["SHA256SUMS"].decode("utf-8").splitlines()
+            seen: set[str] = set()
+            if not lines:
+                sums_detail = "пустой SHA256SUMS"
+            else:
                 for line in lines:
-                    match = re.fullmatch(r"([0-9a-fA-F]{64}) [ *](.+)", line)
+                    match = re.fullmatch(r"([0-9a-f]{64}) [ *](.+)", line)
                     if match is None:
-                        sums_ok = False
-                        continue
+                        sums_detail = "неверный формат строки"
+                        break
                     digest, filename = match.groups()
-                    if "/" in filename or ".." in filename or "\\" in filename or filename in seen:
-                        sums_ok = False
-                        continue
+                    if "/" in filename or "\\" in filename or ".." in filename or filename == ".":
+                        sums_detail = f"недопустимое имя: {filename}"
+                        break
+                    if filename in seen:
+                        sums_detail = f"повтор имени: {filename}"
+                        break
                     seen.add(filename)
-                    path = directory / filename
-                    if (
-                        not path.is_file()
-                        or hashlib.sha256(path.read_bytes()).hexdigest() != digest.lower()
-                    ):
-                        sums_ok = False
-                expected = {"sbom.cdx.json", "INSTALL-ADMIN.md", "latest.json", "release.gpg"}
-                if deb is not None:
-                    expected.add(deb.name)
-                sums_ok &= expected <= seen
-            except (OSError, UnicodeError):
-                sums_ok = False
-        record(
-            "sha256", sums_ok, "суммы и покрытие верны" if sums_ok else "суммы или покрытие неверны"
-        )
+                    content = snapshots.get(filename)
+                    if content is None:
+                        sums_detail = f"нет файла для строки: {filename}"
+                        break
+                    if hashlib.sha256(content).hexdigest() != digest:
+                        sums_detail = f"неверная сумма: {filename}"
+                        break
+                else:
+                    expected = {"sbom.cdx.json", "INSTALL-ADMIN.md", "latest.json", "release.gpg"}
+                    if deb is not None:
+                        expected.add(deb.name)
+                    uncovered = sorted(expected - seen)
+                    sums_detail = (
+                        f"не покрыты: {', '.join(uncovered)}" if uncovered else "суммы и покрытие верны"
+                    )
+        except UnicodeError:
+            sums_detail = "неверный формат строки"
+    record("sha256", sums_detail == "суммы и покрытие верны", sums_detail)
 
-        package_ok = False
-        if deb is not None:
+    package_ok = False
+    if deb is not None and deb.name in snapshots:
+        with tempfile.TemporaryDirectory(prefix="astra-release-deb-") as home:
+            deb_copy = Path(home) / deb.name
+            deb_copy.write_bytes(snapshots[deb.name])
             try:
                 fields = subprocess.run(
-                    ["dpkg-deb", "-f", str(deb), "Package", "Version"],
+                    ["dpkg-deb", "-f", str(deb_copy), "Package", "Version"],
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -190,41 +273,40 @@ def release(args: argparse.Namespace) -> int:
                 ]
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        record(
-            "deb", package_ok, "поля пакета верны" if package_ok else "Package или Version неверны"
-        )
+    record(
+        "deb",
+        package_ok,
+        "поля пакета верны" if package_ok else "Package или Version неверны",
+    )
 
-        latest_ok = False
-        latest_path = directory / "latest.json"
-        if latest_path.is_file() and deb is not None:
-            try:
-                latest = json.loads(latest_path.read_text(encoding="utf-8"))
-                published = latest.get("published_at") if isinstance(latest, dict) else None
-                date_ok = isinstance(published, str) and bool(
-                    re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", published)
-                )
-                if date_ok:
-                    datetime.strptime(published, "%Y-%m-%dT%H:%M:%SZ")
-                latest_ok = (
-                    isinstance(latest, dict)
-                    and set(latest) == {"version", "deb", "sha256", "published_at", "min_astra"}
-                    and latest["version"] == version
-                    and latest["deb"] == deb.name
-                    and latest["sha256"] == actual_sha
-                    and date_ok
-                    and isinstance(latest["min_astra"], str)
-                    and bool(latest["min_astra"])
-                )
-            except (OSError, UnicodeError, ValueError, TypeError, KeyError):
-                pass
-        record("latest.json", latest_ok, "указатель верен" if latest_ok else "указатель неверен")
-        code = int(not all(check["ok"] for check in checks))
-    if args.json:
-        print(json.dumps({"ok": code == 0, "checks": checks}, ensure_ascii=False))
-    else:
-        for check in checks:
-            print(f"{'OK' if check['ok'] else 'ОШИБКА'}: {check['name']}: {check['detail']}")
-    return code
+    latest_ok = False
+    if "latest.json" in snapshots and deb is not None and deb.name in snapshots:
+        try:
+            latest = json.loads(snapshots["latest.json"])
+            published = latest.get("published_at") if isinstance(latest, dict) else None
+            date_ok = isinstance(published, str) and bool(
+                re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", published)
+            )
+            if date_ok:
+                datetime.strptime(published, "%Y-%m-%dT%H:%M:%SZ")
+            latest_ok = (
+                isinstance(latest, dict)
+                and set(latest) == {"version", "deb", "sha256", "published_at", "min_astra"}
+                and latest["version"] == version
+                and latest["deb"] == deb.name
+                and latest["sha256"] == hashlib.sha256(snapshots[deb.name]).hexdigest()
+                and date_ok
+                and isinstance(latest["min_astra"], str)
+                and bool(latest["min_astra"])
+            )
+        except (UnicodeError, ValueError, TypeError, KeyError):
+            pass
+    record(
+        "latest.json",
+        latest_ok,
+        "указатель верен" if latest_ok else "указатель неверен",
+    )
+    return finish(int(not all(item["ok"] for item in checks)))
 
 
 class CatalogSwitchError(RuntimeError):

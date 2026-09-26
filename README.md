@@ -71,6 +71,11 @@ make lint && make test
 4. Одобрить job `release` в GitHub Environment `release`.
 5. Скачать ассеты и проверить их: `tools/validate release --version 0.1.0 --dir <папка>`.
 
+Dry-run обращается в сеть только через `gh` (`gh auth status`, `gh run list`).
+Если последний коммит меняет только журнал и CI пропускает его через `paths-ignore`,
+на HEAD нет успешного запуска CI: тегируйте последний коммит с CI либо осознанно
+используйте `--skip-ci-check`.
+
 Формат указателя описан в [`docs/contracts/latest.json.md`](docs/contracts/latest.json.md).
 Job `release` публикует семь ассетов: `astra-voice_*.deb`, `sbom.cdx.json`,
 `SHA256SUMS`, `SHA256SUMS.asc`, `INSTALL-ADMIN.md` (копия
