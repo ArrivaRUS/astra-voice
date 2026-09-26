@@ -9,7 +9,7 @@
     python3 scripts/build_manifest.py --refresh   # обновить снимок метаданных (сеть)
     python3 scripts/build_manifest.py             # пересобрать data/catalog.json
     python3 scripts/build_manifest.py --check     # сравнить с репозиторием (CI, без сети)
-    python3 scripts/build_manifest.py --sign --homedir ~/.cache/astra-voice-spike/gpg
+    python3 scripts/build_manifest.py --sign --homedir <каталог GnuPG с подключом S1>
 
 Правило оперативной памяти — из `research/catalog-numbers.md`: сумма байт
 `.onnx`-файлов рантайма, умноженная на 1,85 и округлённая вверх до целых МБ.
@@ -266,7 +266,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--homedir", type=Path, help="каталог GnuPG с закрытым ключом подписи")
     parser.add_argument(
         "--key",
-        default="CB951AD794407972A0B1A5BBAFA87398C4953A71",
+        default="7602A029F0E34CD2344A9CDA657ED04689FF4D79",
         help="отпечаток ключа подписи",
     )
     args = parser.parse_args(argv)
