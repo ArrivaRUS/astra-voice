@@ -24,12 +24,8 @@ Rectangle {
     property bool selected: false
     property string badge: ""
     property string cardState: "available"
-    property int queuePosition: 0
-    property string sourceText: ""
-    property string failReason: ""
     property bool canCancel: cardState === "downloading" || cardState === "paused-no-space"
     property bool canRetry: cardState === "failed" || cardState === "paused-no-space"
-        || cardState === "sha-failed"
     property bool canDequeue: cardState === "queued"
     // Кнопку показываем только там, где мост умеет открыть папку.
     property bool openFolderEnabled: false

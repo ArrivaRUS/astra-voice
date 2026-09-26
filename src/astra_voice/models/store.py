@@ -141,7 +141,12 @@ class ModelStore:
 
     def _revision_path(self, model_id: str, revision: str, suffix: str = "") -> Path:
         # Проверяем оба значения до первого включения пользовательских строк в путь (У6).
-        if ID_RE.fullmatch(model_id) is None or ID_RE.fullmatch(revision) is None:
+        if (
+            ID_RE.fullmatch(model_id) is None
+            or ID_RE.fullmatch(revision) is None
+            or revision.endswith((".partial", ".json"))
+            or ".old-" in revision
+        ):
             raise StoreError("bad-id")
         directory = self._checked(self.root / model_id)
         result = self._checked(directory / f"{revision}{suffix}")

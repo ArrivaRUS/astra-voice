@@ -330,7 +330,7 @@ class SettingsBridge(QObject):
     @pyqtSlot(str)
     def cancelModel(self, model_id: str) -> None:  # noqa: N802
         if self._downloads is not None:
-            self._downloads.cancelModel(model_id)
+            self._downloads.cancelModel(model_id, discard=True)
 
     @pyqtSlot(str)
     def dequeueModel(self, model_id: str) -> None:  # noqa: N802
@@ -370,7 +370,7 @@ class SettingsBridge(QObject):
     @pyqtSlot()
     def cancelDownloads(self) -> None:  # noqa: N802
         if self._downloads is not None:
-            self._downloads.cancelDownloads()
+            self._downloads.cancelDownloads(discard=True)
 
     @pyqtProperty(str, notify=downloadStateChanged)
     def downloadState(self) -> str:  # noqa: N802
@@ -1110,7 +1110,7 @@ class OnboardingController(QObject):
 
     @pyqtSlot(str)
     def cancelModel(self, model_id: str) -> None:  # noqa: N802
-        self._downloads.cancelModel(model_id)
+        self._downloads.cancelModel(model_id, discard=False)
 
     @pyqtSlot(str)
     def dequeueModel(self, model_id: str) -> None:  # noqa: N802
@@ -1118,7 +1118,7 @@ class OnboardingController(QObject):
 
     @pyqtSlot()
     def cancelDownloads(self) -> None:  # noqa: N802
-        self._downloads.cancelDownloads()
+        self._downloads.cancelDownloads(discard=False)
 
     @pyqtProperty(str, notify=modelStateChanged)
     def modelState(self) -> str:  # noqa: N802

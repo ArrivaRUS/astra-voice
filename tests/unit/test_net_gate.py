@@ -59,6 +59,37 @@ def assert_denied(result: tuple[bool, str]) -> None:
     assert "/" not in reason
 
 
+@pytest.mark.parametrize(
+    ("policy_values", "status", "offline_env", "checks", "kind", "expected"),
+    [
+        ({}, PolicyStatus.INVALID, None, True, "download", "admin"),
+        ({"offline": True}, PolicyStatus.OK, None, True, "download", "admin"),
+        ({"profile": "secure"}, PolicyStatus.OK, None, True, "download", "admin"),
+        ({}, PolicyStatus.OK, "1", True, "download", "offline"),
+        ({}, PolicyStatus.OK, None, False, "check_app", "settings"),
+        ({}, PolicyStatus.OK, None, False, "check_models", "settings"),
+        ({}, PolicyStatus.OK, None, False, "download", ""),
+    ],
+)
+def test_refusal_codes(
+    policy_values: dict[str, object],
+    status: PolicyStatus,
+    offline_env: str | None,
+    checks: bool,
+    kind: NetworkKind,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if offline_env is not None:
+        monkeypatch.setenv("HF_HUB_OFFLINE", offline_env)
+    gate = NetworkGate(
+        Settings(check_app_updates=checks, check_model_updates=checks),
+        Policy(values=policy_values, status=status),
+    )
+    assert gate.refusal(kind) == expected
+    assert gate.allowed(kind)[0] is (expected == "")
+
+
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("check_app", [False, True])
 @pytest.mark.parametrize("check_models", [False, True])

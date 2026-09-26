@@ -14,6 +14,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote, unquote, urlsplit
 
 from astra_voice.models.catalog import ID_RE, CatalogEntry, FileSpec
@@ -29,7 +30,7 @@ INACTIVITY_TIMEOUT_S = 30.0
 _CONTENT_RANGE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)", re.IGNORECASE)
 # Сетевые отказы одного источника: пробуем следующий. Повреждение, отмена,
 # выключенная сеть и запрещённый источник смены источника не оправдывают.
-_MIRROR_CODES = frozenset({"host-unreachable", "timeout", "bad-status"})
+_MIRROR_CODES = frozenset({"host-unreachable", "timeout", "bad-status", "short-read"})
 
 
 def fail_reason(code: str) -> str:
@@ -40,7 +41,7 @@ def fail_reason(code: str) -> str:
         return "bad-sha"
     if code == "disk-full":
         return "no-space"
-    if code in {"no-network", "host-unreachable"}:
+    if code in {"no-network", "host-unreachable", "short-read"}:
         return "no-network"
     if code in {"not-allowed", "bad-path"}:
         return "not-allowed"
@@ -49,11 +50,13 @@ def fail_reason(code: str) -> str:
     return "server"
 
 
-def corp_origin(base: str | None) -> str | None:
+def corp_origin(base: str | None, *, warn: bool = True) -> str | None:
     if base is None:
         return None
     try:
         parts = urlsplit(base)
+        if not parts.netloc.isascii():
+            raise ValueError
         host = parts.hostname
         port = parts.port
         if (
@@ -63,6 +66,7 @@ def corp_origin(base: str | None) -> str | None:
             or parts.password is not None
             or parts.netloc.endswith(":")
             or "%" in parts.netloc
+            or "%" in parts.path
             or "?" in base
             or "#" in base
             or "\\" in base
@@ -72,7 +76,8 @@ def corp_origin(base: str | None) -> str | None:
         ):
             raise ValueError
     except ValueError:
-        log.warning("Корпоративный источник не используется: некорректный адрес.")
+        if warn:
+            log.warning("Корпоративный источник не используется: некорректный адрес.")
         return None
     return base.rstrip("/")
 
@@ -107,6 +112,7 @@ class DownloadError(Exception):
         self.message = message or {
             "no-network": "Нет доступа к сети.",
             "host-unreachable": "Не удалось связаться с сервером.",
+            "short-read": "Соединение оборвалось до конца загрузки файла.",
             "bad-checksum": "Файл повреждён: контрольная сумма не совпадает.",
             "too-large": "Размер не совпадает: сервер прислал слишком много данных.",
             "cancelled": "Загрузка отменена.",
@@ -284,7 +290,7 @@ class Downloader:
     ) -> None:
         self._http = http
         self._store = store
-        self._corp_base = corp_origin(corp_base)
+        self._corp_base = corp_origin(corp_base, warn=False)
 
     def download(
         self,
@@ -366,7 +372,8 @@ class Downloader:
         ]
         if self._corp_base is not None:
             suffix = "/".join(quote(part, safe="") for part in file.path.split("/"))
-            sources.append(
+            sources.insert(
+                0,
                 (
                     "corp",
                     self._corp_base
@@ -376,7 +383,7 @@ class Downloader:
                     + quote(entry.revision, safe="")
                     + "/"
                     + suffix,
-                )
+                ),
             )
         done_before = reporter.done
         for number, (kind, url) in enumerate(sources, start=1):
@@ -387,29 +394,67 @@ class Downloader:
                 except Exception:
                     log.warning("Не удалось сообщить об источнике загрузки модели.")
             try:
-                self._download_file(
-                    url,
-                    file,
-                    part,
-                    budget,
-                    reporter,
-                    index,
-                    cancel,
-                    entry.size_bytes,
-                )
+                resumed = part.exists() and 0 < part.stat().st_size < file.size
+                for attempt in range(2 if resumed else 1):
+                    try:
+                        self._download_file(
+                            url,
+                            file,
+                            part,
+                            budget,
+                            reporter,
+                            index,
+                            cancel,
+                            entry.size_bytes,
+                            scope="corp" if kind == "corp" else "public",
+                        )
+                        break
+                    except DownloadError as error:
+                        if error.code in {"bad-checksum", "too-large"}:
+                            self._discard_bad_part(part, budget)
+                        if error.code != "bad-checksum" or not resumed or attempt:
+                            raise
+                        log.warning(
+                            "Источник %d из %d (%s) отдал файл с неверной контрольной суммой; "
+                            "повторяем с начала",
+                            number,
+                            len(sources),
+                            kind,
+                        )
+                        reporter.done = done_before
             except (DownloadError, NetworkError) as exc:
-                if exc.code not in _MIRROR_CODES or number == len(sources):
+                if exc.code == "bad-checksum":
+                    log.warning(
+                        "Источник %d из %d (%s) отдал файл с неверной контрольной суммой",
+                        number,
+                        len(sources),
+                        kind,
+                    )
+                if exc.code not in _MIRROR_CODES | {"bad-checksum", "too-large"} or number == len(
+                    sources
+                ):
                     raise
-                log.warning(
-                    "Источник %d из %d (%s) не ответил; пробуем следующий",
-                    number,
-                    len(sources),
-                    kind,
-                )
+                if exc.code != "bad-checksum":
+                    log.warning(
+                        "Источник %d из %d (%s) не ответил: %s %s; пробуем следующий",
+                        number,
+                        len(sources),
+                        kind,
+                        exc.code,
+                        exc.status
+                        if isinstance(exc, NetworkError) and exc.status is not None
+                        else "-",
+                    )
                 # Следующая попытка сама посчитает уже загруженную часть файла.
                 reporter.done = done_before
                 continue
             return
+
+    @staticmethod
+    def _discard_bad_part(part: Path, budget: _Budget) -> None:
+        if part.exists():
+            budget.used -= part.stat().st_size
+            part.unlink()
 
     def _download_file(
         self,
@@ -421,6 +466,8 @@ class Downloader:
         index: int,
         cancel: threading.Event,
         model_size: int,
+        *,
+        scope: Literal["public", "corp"] = "public",
     ) -> None:
         deadline_at = time.monotonic() + _FILE_DEADLINE_S
         digest = hashlib.sha256()
@@ -434,7 +481,7 @@ class Downloader:
                     _check_cancel(cancel)
                     block = stream.read(min(_CHUNK_SIZE, remaining))
                     if not block:
-                        raise DownloadError("bad-checksum", "Сохранённая часть файла неполная.")
+                        raise DownloadError("short-read", "Сохранённая часть файла неполная.")
                     digest.update(block)
                     remaining -= len(block)
             else:
@@ -449,6 +496,7 @@ class Downloader:
                     deadline_s=max(0.0, deadline_at - time.monotonic()),
                     cancel=cancel,
                     idle_timeout_s=INACTIVITY_TIMEOUT_S,
+                    scope=scope,
                 ) as response:
                     valid_range = response.status == 206 and _range_matches(
                         response.headers.get("Content-Range", ""), offset, file.size
@@ -491,9 +539,9 @@ class Downloader:
                         reporter.written(count)
                         reporter.report(index)
                     _check_cancel(cancel)
-                    if written != file.size:
+                    if written < file.size:
                         raise DownloadError(
-                            "bad-checksum",
+                            "short-read",
                             "Файл загружен не полностью. Попробуйте загрузить ещё раз.",
                         )
                     if not hmac.compare_digest(digest.hexdigest(), file.sha256):

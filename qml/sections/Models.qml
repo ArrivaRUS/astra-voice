@@ -103,14 +103,10 @@ Item {
         badge: entry.badge !== undefined ? entry.badge : ""
         cardState: entry.state !== undefined ? entry.state : "available"
         message: entry.message !== undefined ? entry.message : ""
-        queuePosition: entry.queuePosition !== undefined ? entry.queuePosition : 0
-        sourceText: entry.sourceText !== undefined ? entry.sourceText : ""
-        failReason: entry.failReason !== undefined ? entry.failReason : ""
         canCancel: entry.canCancel !== undefined ? entry.canCancel
             : entry.state === "downloading" || entry.state === "paused-no-space"
         canRetry: entry.canRetry !== undefined ? entry.canRetry
             : entry.state === "failed" || entry.state === "paused-no-space"
-                || entry.state === "sha-failed"
         canDequeue: entry.canDequeue !== undefined ? entry.canDequeue
             : entry.state === "queued"
         hint: entry.hint !== undefined ? entry.hint : ""

@@ -2152,7 +2152,7 @@ def test_model_card_states_render(state: str, onboarding_app: Any) -> None:
             "downloading": {"Отмена"},
             "paused-no-space": {"Повторить", "Отмена"},
             "failed": {"Повторить"},
-            "sha-failed": {"Повторить"},
+            "sha-failed": set(),
             "no-space": {"Открыть папку моделей"},
         }.get(state, set())
         buttons = {
@@ -2162,7 +2162,6 @@ def test_model_card_states_render(state: str, onboarding_app: Any) -> None:
         }
         assert buttons == expected_buttons
         if state == "sha-failed":
-            assert visible_button(card, "Повторить").isEnabled()
             assert card.property("detailsActionAvailable") is False
         if state in {"updating", "update-failed"}:
             assert card.property("updateActionsAvailable") is False
@@ -2331,12 +2330,15 @@ def test_download_strip_shows_source(onboarding_app: Any, screen: str) -> None:
 
 
 def test_download_card_state_frames(onboarding_app: Any) -> None:
+    from astra_voice.ui.model_downloads import _FAILURE_MESSAGES, _SOURCE_TEXT
+
     destination = os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_M6DL")
     if not destination:
         pytest.skip("ASTRA_VOICE_SNAPSHOT_DIR_M6DL не задан")
     snapshots = Path(destination)
     snapshots.mkdir(parents=True, exist_ok=True)
     states = ("queued", "downloading", "verifying", "paused-no-space", "failed")
+    paused_message = "Не хватает места на диске — освободите 126 МБ"
     for state in states:
         for screen in ("onboarding", "models"):
             fake = FakeOnboarding() if screen == "onboarding" else FakeSettings()
@@ -2347,25 +2349,50 @@ def test_download_card_state_frames(onboarding_app: Any) -> None:
                     **fake.models[0],
                     "badge": "",
                     "state": state,
-                    "message": "Не хватает места на диске"
+                    "message": paused_message
                     if state == "paused-no-space"
-                    else "Не удалось загрузить модель — сервер не отвечает"
+                    else _FAILURE_MESSAGES["timeout"]
                     if state == "failed"
                     else "",
+                    "progress": 0.42 if state == "downloading" else 0.0,
                     "canCancel": state in {"downloading", "paused-no-space"},
                     "canRetry": state in {"paused-no-space", "failed"},
                     "canDequeue": state == "queued",
                 }
             ]
+            if state == "queued":
+                fake.models.append(
+                    {
+                        **fake.models[0],
+                        "id": "t-one",
+                        "name": "T-one",
+                        "recommended": False,
+                        "state": "queued",
+                        "message": "",
+                    }
+                )
+                fake.models[0] = {**fake.models[0], "state": "downloading", "canCancel": True}
             fake.downloadState = (
                 "no-space"
                 if state == "paused-no-space"
+                else "downloading"
+                if state == "queued"
                 else state
                 if state in {"downloading", "verifying", "failed"}
                 else "idle"
             )
-            fake.downloadTitle = "Загружаю GigaAM v3 RNN-T"
-            fake.downloadSource = "Скачиваю с huggingface.co" if state == "downloading" else ""
+            fake.downloadTitle = {
+                "queued": "Загружается GigaAM v3 RNN-T · 1 из 2",
+                "downloading": "Загружается GigaAM v3 RNN-T",
+                "verifying": "Проверяю модель…",
+                "paused-no-space": "Не хватает места на диске",
+                "failed": "Не получилось загрузить модель",
+            }[state]
+            fake.downloadProgress = 0.42 if state == "downloading" else 0.0
+            fake.downloadSource = _SOURCE_TEXT["hf"] if state == "downloading" else ""
+            fake.downloadDetail = "нужно ещё 126 МБ" if state == "paused-no-space" else ""
+            fake.speed = "5,2 МБ/с" if state == "downloading" else ""
+            fake.eta = "осталось ~3 мин" if state == "downloading" else ""
             if screen == "onboarding":
                 image, messages = render_onboarding(onboarding_app, fake, False)
             else:

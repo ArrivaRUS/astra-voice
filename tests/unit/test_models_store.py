@@ -68,6 +68,20 @@ def test_discard_staging_removes_only_selected_pair_and_is_idempotent(store: Mod
     assert (other_model / "keep").read_bytes() == b"two"
 
 
+@pytest.mark.parametrize("revision", ("r.partial", "r.json", "r.old-backup"))
+def test_reserved_revision_rejected_before_staging_or_discard(
+    store: ModelStore, revision: str
+) -> None:
+    with pytest.raises(StoreError) as staging_error:
+        store.staging_dir("model", revision)
+    assert staging_error.value.code == "bad-id"
+    with pytest.raises(StoreError) as path_error:
+        store._revision_path("model", revision, ".partial")
+    assert path_error.value.code == "bad-id"
+    store.discard_staging("model", revision)
+    assert not (store.root / "model").exists()
+
+
 def test_discard_staging_does_not_follow_symlink(
     store: ModelStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

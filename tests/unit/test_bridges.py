@@ -45,7 +45,7 @@ from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
 from astra_voice.models import catalog_state
 from astra_voice.models.catalog import Catalog, CatalogEntry, FileSpec, RevokedEntry
-from astra_voice.models.downloader import DownloadError, Progress
+from astra_voice.models.downloader import Downloader, DownloadError, Progress
 from astra_voice.models.installer import InstallResult, ReasonCode
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net.http import NetworkError
@@ -1896,6 +1896,9 @@ class FakeModelPort:
     def allowed(self) -> tuple[bool, str]:
         return self.network, "Задано администратором: работа без сети" if not self.network else ""
 
+    def refusal(self) -> str:
+        return "" if self.network else "admin"
+
     def disk_ok(self, size_bytes: int) -> bool:
         assert size_bytes == self.entry.size_bytes
         return self.space
@@ -2604,7 +2607,10 @@ def test_smoke_adapter_builds_model_load_without_leaking_text(ok: bool) -> None:
     ],
 )
 def test_model_service_uses_existing_modules(
-    monkeypatch: pytest.MonkeyPatch, corp_base: str | int | None, expected_host: tuple[str, ...]
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    corp_base: str | int | None,
+    expected_host: tuple[str, ...],
 ) -> None:
     import astra_voice.ui.model_downloads as bridges
 
@@ -2654,16 +2660,51 @@ def test_model_service_uses_existing_modules(
         store,
         corp_base=corp_base if expected_host else None,
     )
+    warnings = [
+        record for record in caplog.records if "Корпоративный источник" in record.getMessage()
+    ]
+    assert len(warnings) == int(isinstance(corp_base, str) and not expected_host)
     assert factories["Installer"].call_args.args[0] is store
     assert callable(factories["Installer"].call_args.args[1])
     assert factories["Installer"].call_args.kwargs == {"catalog": catalog}
     service.allowed()
     gate.allowed.assert_called_once_with("download")
+    service.refusal()
+    gate.refusal.assert_called_once_with("download")
     store.records.return_value = [Mock(state="broken")]
     assert service.broken()
     assert not service.installed_ok()
     store.records.return_value = [Mock(state="ok")]
     assert service.installed_ok()
+
+
+def test_model_service_invalid_corp_base_warns_once_without_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import astra_voice.ui.model_downloads as bridges
+
+    address = "http://corp.example"
+    policy = policy_mod.Policy(values={"corp_base": address})
+    store = ModelStore(tmp_path / "models")
+    for name in (
+        "Verifier",
+        "load_builtin",
+        "NetworkGate",
+        "HttpClient",
+        "Installer",
+        "SmokeRunner",
+    ):
+        monkeypatch.setattr(bridges, name, Mock())
+    monkeypatch.setattr(bridges, "ModelStore", Mock(return_value=store))
+
+    with caplog.at_level(logging.WARNING):
+        service = ModelService(Settings(), policy)
+
+    assert isinstance(service._downloader, Downloader)
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.WARNING, "Корпоративный источник не используется: некорректный адрес.")
+    ]
+    assert address not in caplog.text
 
 
 @pytest.mark.parametrize("from_path", [False, True])
@@ -2821,14 +2862,49 @@ def test_model_progress_limits_and_unknown_estimates(
     assert (controller.progress, controller.speed, controller.eta) == expected
 
 
-def test_model_job_rechecks_permissions_before_network() -> None:
+def test_model_job_rechecks_permissions_before_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(FakeModelPort, "refusal")
     port = FakeModelPort()
     port.network = False
     job = _ModelJob(port, port.entry, threading.Event())
     finished = QSignalSpy(job.finished)
     job.run()
-    assert list(finished) == [["failed:no-network", ""]]
+    assert list(finished) == [["failed:admin", ""]]
     assert port.download_calls == 0
+
+
+@pytest.mark.parametrize("refusal", ["admin", "offline", "settings"])
+def test_model_job_reports_gate_refusal_without_network(
+    refusal: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port = FakeModelPort()
+    monkeypatch.setattr(port, "refusal", lambda: refusal)
+    job = _ModelJob(port, port.entry, threading.Event())
+    finished = QSignalSpy(job.finished)
+    job.run()
+    assert list(finished) == [[f"failed:{refusal}", ""]]
+    assert port.download_calls == 0
+
+
+def test_bridges_choose_staging_policy_for_cancel(model_rig: ModelRig) -> None:
+    _port, create = model_rig
+    controller = create()
+    settings = SettingsBridge(Settings(), downloads=controller._downloads, save=Mock())
+    cancel_model = Mock()
+    cancel_all = Mock()
+    controller._downloads.cancelModel = cancel_model  # type: ignore[method-assign]
+    controller._downloads.cancelDownloads = cancel_all  # type: ignore[method-assign]
+
+    controller.cancelModel("model")
+    controller.cancelDownloads()
+    settings.cancelModel("model")
+    settings.cancelDownloads()
+
+    assert cancel_model.call_args_list == [
+        call("model", discard=False),
+        call("model", discard=True),
+    ]
+    assert cancel_all.call_args_list == [call(discard=False), call(discard=True)]
 
 
 def test_model_job_unknown_progress_and_cancel_before_install(
@@ -3859,9 +3935,6 @@ def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
             "badge": "",
             "state": "available",
             "message": "",
-            "queuePosition": 0,
-            "sourceText": "",
-            "failReason": "",
             "canCancel": False,
             "canRetry": False,
             "canDequeue": False,
@@ -4029,7 +4102,7 @@ def test_model_queue_failure_continues_and_retries(model_rig: ModelRig) -> None:
         controller.models[0]["message"]
         == "Не удалось загрузить модель — источник запрещён настройками"
     )
-    assert controller.models[0]["failReason"] == "not-allowed"
+    assert "failReason" not in controller.models[0]
     controller.retryModel(port.entry.id)
     assert controller._downloads._active_entry == port.second
     assert controller.models[0]["state"] == "queued"
@@ -4088,13 +4161,14 @@ def test_model_queue_cancel_clears_pending_and_ignores_late_progress(model_rig: 
     assert controller.downloadState == "idle"
     assert controller.downloadTitle == ""
     assert controller.downloadProgress == 0
-    assert all(row["state"] == "available" and row["selected"] for row in controller.models)
+    assert [row["state"] for row in controller.models] == ["available", "available"]
+    assert all(row["selected"] for row in controller.models)
     assert finished.wait(1000)
     assert port.visits == [port.entry.id]
     assert not port.installs
     assert controller._downloads._model_thread is None
     assert controller.downloadState == "idle"
-    assert controller.models[0]["message"] == ""
+    assert controller.models[0]["message"] == "Загрузка отменена. Можно продолжить скачивание."
     assert controller.selectionSummary == "Будет скачано 400 МБ"
     controller.toggleModel(port.second.id)
     assert not controller.models[1]["selected"]

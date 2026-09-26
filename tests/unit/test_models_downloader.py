@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import BinaryIO, cast
+from typing import BinaryIO, Literal, cast
 from unittest.mock import MagicMock, Mock
 from urllib.parse import urlsplit
 
@@ -135,12 +135,23 @@ def local_server(
                     status = fault.status
             elif fault.mode == "other-success":
                 status = 200
+            if fault.mode == "truncate" and range_header is None:
+                body = body[: len(body) // 2]
             try:
                 if fault.mode == "slow-headers":
                     state.release.wait(2)
                 self.send_response(status)
                 # Chunked намеренно сочетается с ложным Content-Length для проверки У20.
-                self.send_header("Content-Length", str(1 if fault.mode == "chunked" else len(body)))
+                self.send_header(
+                    "Content-Length",
+                    str(
+                        1
+                        if fault.mode == "chunked"
+                        else len(fault.body)
+                        if fault.mode == "truncate" and range_header is None
+                        else len(body)
+                    ),
+                )
                 if fault.mode in {"chunked", "disconnect", "slow-body"}:
                     self.send_header("Transfer-Encoding", "chunked")
                 for name, value in headers.items():
@@ -187,6 +198,7 @@ def local_server(
         cancel: threading.Event,
         kind: NetworkKind = "download",
         idle_timeout_s: float | None = None,
+        scope: Literal["public", "corp"] = "public",
     ) -> StreamResponse:
         # Загрузчик обязан собрать HTTPS буквально. Только тест переводит его в HTTP.
         assert url.startswith(f"https://{state.host}/")
@@ -199,6 +211,7 @@ def local_server(
             cancel=cancel,
             kind=kind,
             idle_timeout_s=idle_timeout_s,
+            scope=scope,
         )
         state.responses.append(response)
         return response
@@ -384,8 +397,49 @@ def test_disconnect_keeps_part_and_next_call_resumes(
     assert local_server.requests[-1][1]["Range"] == "bytes=8-"
 
 
+def test_truncate_moves_to_next_source_with_range(
+    loader: Downloader,
+    single_entry: CatalogEntry,
+    local_server: LocalServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = single_entry.files[0]
+    local_server.faults[file.url_path].mode = "truncate"
+    # Два источника доступны через один loopback fault-сервер.
+    item = replace(single_entry, mirrors=(local_server.host,))
+    monkeypatch.setattr(downloader, "_PROGRESS_INTERVAL_S", 0)
+    progress: list[Progress] = []
+    result = loader.download(item, progress=progress.append, cancel=threading.Event())
+    assert (result / file.path).read_bytes() == local_server.faults[file.url_path].body
+    assert [headers.get("Range") for _, headers in local_server.requests] == [
+        None,
+        f"bytes={file.size // 2}-",
+    ]
+    assert [state.bytes_done for state in progress] == sorted(
+        state.bytes_done for state in progress
+    )
+
+
+def test_truncate_last_source_keeps_part_and_retry_resumes(
+    loader: Downloader,
+    store: ModelStore,
+    single_entry: CatalogEntry,
+    local_server: LocalServer,
+) -> None:
+    file = single_entry.files[0]
+    fault = local_server.faults[file.url_path]
+    fault.mode = "truncate"
+    _assert_error(loader, single_entry, "short-read")
+    part = store.staging_dir(single_entry.id, single_entry.revision) / (file.path + ".part")
+    assert part.read_bytes() == fault.body[: file.size // 2]
+    fault.mode = "normal"
+    result = _download(loader, single_entry)
+    assert (result / file.path).read_bytes() == fault.body
+    assert local_server.requests[-1][1]["Range"] == f"bytes={file.size // 2}-"
+
+
 @pytest.mark.parametrize("corruption", ("same-size", "short", "resume-prefix"))
-def test_bad_checksum_removes_part(
+def test_bad_checksum_and_short_read_handling(
     loader: Downloader,
     store: ModelStore,
     single_entry: CatalogEntry,
@@ -399,10 +453,15 @@ def test_bad_checksum_removes_part(
         fault.body = b"x" * file.size
     elif corruption == "short":
         fault.body = fault.body[:-1]
-    error = _assert_error(loader, single_entry, "bad-checksum")
+    if corruption == "resume-prefix":
+        assert (_download(loader, single_entry) / file.path).read_bytes() == fault.body
+        assert not part.exists()
+        return
+    _assert_error(loader, single_entry, "short-read" if corruption == "short" else "bad-checksum")
     if corruption == "short":
-        assert "не полностью" in error.message
-    assert not part.exists()
+        assert part.read_bytes() == fault.body
+    else:
+        assert not part.exists()
     assert not part.with_suffix("").exists()
     assert local_server.responses[-1]._response.raw.closed
 
@@ -504,12 +563,78 @@ def test_reading_stops_at_first_excess_byte(
     assert local_server.responses[-1]._response.raw.closed
 
 
-def test_redirect_to_foreign_host_preserves_not_allowed(
-    loader: Downloader, single_entry: CatalogEntry, local_server: LocalServer
+def test_redirect_to_foreign_host_tries_next_source_without_requesting_foreign_host(
+    store: ModelStore,
+    entry: CatalogEntry,
+    payloads: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    local_server.faults[single_entry.files[0].url_path].mode = "redirect"
-    _assert_error(loader, single_entry, "not-allowed")
-    assert len(local_server.requests) == 1
+    file = entry.files[0]
+    item = replace(entry, files=(file,), size_bytes=file.size, mirrors=("github.com",))
+    hosts: list[str] = []
+
+    def send(
+        adapter: requests.adapters.HTTPAdapter,
+        request: requests.PreparedRequest,
+        **kwargs: object,
+    ) -> requests.Response:
+        host = urlsplit(request.url).hostname or ""
+        hosts.append(host)
+        response = requests.Response()
+        response.status_code = 302 if host == "huggingface.co" else 200
+        response.raw = BytesIO(b"" if response.status_code == 302 else payloads[file.path])
+        if response.status_code == 302:
+            response.headers["Location"] = "https://evil.example/file"
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+    client = HttpClient(NetworkGate(Settings(), Policy()), user_agent="Astra-Voice/test")
+    loader = Downloader(client, store)
+    single = replace(item, mirrors=())
+    _assert_error(loader, single, "bad-status")
+    assert hosts == ["huggingface.co"]
+
+    result = loader.download(item, progress=lambda state: None, cancel=threading.Event())
+    assert (result / file.path).read_bytes() == payloads[file.path]
+    assert hosts == ["huggingface.co", "huggingface.co", "github.com"]
+
+
+def test_unicode_redirect_host_tries_next_source_without_socket(
+    store: ModelStore,
+    entry: CatalogEntry,
+    payloads: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = entry.files[0]
+    item = replace(entry, files=(file,), size_bytes=file.size, mirrors=("github.com",))
+    urls: list[str] = []
+
+    def send(
+        adapter: requests.adapters.HTTPAdapter,
+        request: requests.PreparedRequest,
+        **kwargs: object,
+    ) -> requests.Response:
+        urls.append(request.url)
+        host = urlsplit(request.url).hostname
+        assert host in {"huggingface.co", "github.com"}
+        response = requests.Response()
+        response.status_code = 302 if host == "huggingface.co" else 200
+        response.raw = BytesIO(b"" if response.status_code == 302 else payloads[file.path])
+        if response.status_code == 302:
+            response.headers["Location"] = "https://faß.example/x"
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+    client = HttpClient(NetworkGate(Settings(), Policy()), user_agent="Astra-Voice/test")
+    loader = Downloader(client, store)
+    sources: list[str] = []
+    result = loader.download(
+        item, progress=lambda state: None, cancel=threading.Event(), source=sources.append
+    )
+    assert (result / file.path).read_bytes() == payloads[file.path]
+    assert sources == ["hf", "github"]
+    assert [urlsplit(url).hostname for url in urls] == ["huggingface.co", "github.com"]
+    assert all(url.isascii() and "xn--" not in url.lower() for url in urls)
 
 
 def test_source_policy_error_keeps_code_and_message(
@@ -847,6 +972,7 @@ class FakeTransport:
     working: set[str]
     failure: Exception
     urls: list[str] = field(default_factory=list)
+    scopes: list[str] = field(default_factory=list)
 
     def get_stream(
         self,
@@ -857,8 +983,10 @@ class FakeTransport:
         cancel: threading.Event,
         kind: str = "download",
         idle_timeout_s: float | None = None,
+        scope: Literal["public", "corp"] = "public",
     ) -> FakeResponse:
         self.urls.append(url)
+        self.scopes.append(scope)
         host = urlsplit(url).hostname or ""
         if host not in self.working:
             raise self.failure
@@ -961,13 +1089,132 @@ def test_checksum_is_checked_for_every_source(
     # Столько же байт, сколько обещает каталог, но другие: остаётся только sha256.
     bodies = {file.url_path: bytes(file.size)}
     transport = FakeTransport(
-        bodies, {"github.com"}, http.NetworkError("host-unreachable", "Нет сервера.")
+        bodies,
+        {"github.com", "mirror.example"},
+        http.NetworkError("host-unreachable", "Нет сервера."),
     )
     loader = Downloader(cast(HttpClient, transport), store)
 
     _assert_error(loader, mirrored, "bad-checksum")
 
-    assert transport.urls[-1] == "https://github.com" + file.url_path
+    assert transport.urls[-1] == "https://mirror.example" + file.url_path
+
+
+def test_poisoned_prefix_retries_same_source_from_zero(
+    store: ModelStore,
+    mirrored: CatalogEntry,
+    payloads: dict[str, bytes],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    file = mirrored.files[0]
+    body = payloads[file.path]
+    seen: list[tuple[str, int | None]] = []
+
+    class Poisoned(FakeResponse):
+        def iter_chunks(self, size: int, *, limit: int) -> Iterator[bytes]:
+            yield b"XX"
+            raise http.NetworkError("host-unreachable", "Обрыв chunked-ответа.")
+
+    def get_stream(url: str, *, range_from: int | None, **kwargs: object) -> FakeResponse:
+        host = urlsplit(url).hostname or ""
+        seen.append((host, range_from))
+        if host == "huggingface.co":
+            return Poisoned(body)
+        assert host == "github.com"
+        if range_from is not None:
+            response = FakeResponse(body[range_from:], 206)
+            response.headers["Content-Range"] = f"bytes {range_from}-{len(body) - 1}/{len(body)}"
+            return response
+        return FakeResponse(body)
+
+    transport = Mock()
+    transport.get_stream.side_effect = get_stream
+    loader = Downloader(cast(HttpClient, transport), store)
+    result = loader.download(mirrored, progress=lambda state: None, cancel=threading.Event())
+    assert (result / file.path).read_bytes() == body
+    assert seen == [("huggingface.co", None), ("github.com", 2), ("github.com", None)]
+    assert "Источник 2 из 3 (github) отдал файл с неверной контрольной суммой" in caplog.text
+    assert list(result.rglob("*.part")) == []
+
+
+def test_bad_checksum_full_file_uses_next_source(
+    store: ModelStore,
+    mirrored: CatalogEntry,
+    payloads: dict[str, bytes],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    file = mirrored.files[0]
+    body = payloads[file.path]
+    seen: list[str] = []
+
+    def get_stream(url: str, **kwargs: object) -> FakeResponse:
+        host = urlsplit(url).hostname or ""
+        seen.append(host)
+        return FakeResponse(b"x" * file.size if host == "huggingface.co" else body)
+
+    transport = Mock()
+    transport.get_stream.side_effect = get_stream
+    loader = Downloader(cast(HttpClient, transport), store)
+    result = loader.download(mirrored, progress=lambda state: None, cancel=threading.Event())
+    assert (result / file.path).read_bytes() == body
+    assert seen == ["huggingface.co", "github.com"]
+    assert "Источник 1 из 3 (hf) отдал файл с неверной контрольной суммой" in caplog.text
+    assert "huggingface.co" not in caplog.text
+
+
+def test_all_sources_bad_checksum_removes_part(
+    store: ModelStore, mirrored: CatalogEntry, payloads: dict[str, bytes]
+) -> None:
+    file = mirrored.files[0]
+    transport = Mock()
+    transport.get_stream.return_value = FakeResponse(b"x" * file.size)
+    loader = Downloader(cast(HttpClient, transport), store)
+    _assert_error(loader, mirrored, "bad-checksum")
+    part = store.root / mirrored.id / f"{mirrored.revision}.partial" / (file.path + ".part")
+    assert not part.exists()
+    assert transport.get_stream.call_count == 3
+
+
+def test_too_large_discards_part_and_uses_next_source(
+    store: ModelStore, mirrored: CatalogEntry, payloads: dict[str, bytes]
+) -> None:
+    file = mirrored.files[0]
+    body = payloads[file.path]
+    seen: list[str] = []
+
+    def get_stream(url: str, **kwargs: object) -> FakeResponse:
+        host = urlsplit(url).hostname or ""
+        seen.append(host)
+        return FakeResponse(body + b"x" if host == "huggingface.co" else body)
+
+    transport = Mock()
+    transport.get_stream.side_effect = get_stream
+    loader = Downloader(cast(HttpClient, transport), store)
+    result = loader.download(mirrored, progress=lambda state: None, cancel=threading.Event())
+    assert (result / file.path).read_bytes() == body
+    assert seen == ["huggingface.co", "github.com"]
+    assert list(result.rglob("*.part")) == []
+
+
+def test_second_file_bad_checksum_keeps_verified_first_file(
+    store: ModelStore, entry: CatalogEntry, payloads: dict[str, bytes]
+) -> None:
+    first, second = entry.files[:2]
+    item = replace(entry, files=(first, second), size_bytes=first.size + second.size)
+    transport = Mock()
+
+    def get_stream(url: str, **kwargs: object) -> FakeResponse:
+        path = urlsplit(url).path
+        if path == first.url_path:
+            return FakeResponse(payloads[first.path])
+        return FakeResponse(b"x" * second.size)
+
+    transport.get_stream.side_effect = get_stream
+    loader = Downloader(cast(HttpClient, transport), store)
+    _assert_error(loader, item, "bad-checksum")
+    staging = store.root / item.id / f"{item.revision}.partial"
+    assert (staging / first.path).read_bytes() == payloads[first.path]
+    assert not (staging / (second.path + ".part")).exists()
 
 
 def test_entry_without_mirrors_uses_single_source(
@@ -1002,7 +1249,26 @@ def test_http_status_moves_to_next_source(
     assert [urlsplit(url).hostname for url in transport.urls] == ["huggingface.co", "github.com"]
 
 
-def test_corp_is_last_and_uses_escaped_components(
+def test_next_source_log_records_code_and_status_without_url(
+    store: ModelStore,
+    mirrored: CatalogEntry,
+    payloads: dict[str, bytes],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    loader, _ = _fake_loader(
+        store,
+        mirrored,
+        payloads,
+        {"github.com"},
+        http.NetworkError("bad-status", "Отказ сервера.", status=503),
+    )
+    loader.download(mirrored, progress=lambda state: None, cancel=threading.Event())
+    assert "Источник 1 из 3 (hf) не ответил: bad-status 503; пробуем следующий" in caplog.text
+    assert "huggingface.co" not in caplog.text
+    assert mirrored.files[0].url_path not in caplog.text
+
+
+def test_corp_is_first_and_uses_escaped_components(
     store: ModelStore, entry: CatalogEntry, caplog: pytest.LogCaptureFixture
 ) -> None:
     body = b"safe"
@@ -1026,24 +1292,56 @@ def test_corp_is_last_and_uses_escaped_components(
         item, progress=lambda state: None, cancel=threading.Event(), source=kinds.append
     )
     assert (result / file.path).read_bytes() == body
-    assert kinds == ["hf", "github", "corp"]
-    assert transport.urls[-1] == "https://corp.example" + corp_path
-    assert ".." not in transport.urls[-1]
+    assert kinds == ["corp"]
+    assert transport.scopes == ["corp"]
+    assert transport.urls[0] == "https://corp.example" + corp_path
+    assert ".." not in transport.urls[0]
     assert "corp.example" not in caplog.text
     assert "hf.co" not in caplog.text
     assert "objects.githubusercontent.com" not in caplog.text
+
+
+def test_corp_failure_falls_back_to_hf_then_github(
+    store: ModelStore, mirrored: CatalogEntry, payloads: dict[str, bytes]
+) -> None:
+    file = mirrored.files[0]
+    transport = FakeTransport(
+        {file.url_path: payloads[file.path]},
+        {"github.com"},
+        http.NetworkError("host-unreachable", "Нет сервера."),
+    )
+    loader = Downloader(cast(HttpClient, transport), store, corp_base="https://corp.example")
+    kinds: list[str] = []
+    loader.download(
+        mirrored, progress=lambda state: None, cancel=threading.Event(), source=kinds.append
+    )
+    assert kinds == ["corp", "hf", "github"]
+    assert transport.scopes == ["corp", "public", "public"]
+    assert [urlsplit(url).hostname for url in transport.urls] == [
+        "corp.example",
+        "huggingface.co",
+        "github.com",
+    ]
 
 
 @pytest.mark.parametrize(
     "base",
     (
         None,
-        "http://corp.example/base",
+        "http://corp.example",
         "https://user:pass@corp.example",
-        "https://corp.example/base?",
-        "https://corp.example/base#",
-        "https://corp.example:0/base",
-        "https://corp.example:/base",
+        "https://user@corp.example",
+        "https://corp.example/..",
+        "https://corp.example/%2e%2e/x",
+        "https://corp.example/%252e%252e/x",
+        "https://faß.example",
+        "https://corp.example\\x",
+        "https://corp.example/a b",
+        "https:///x",
+        "https://corp.example:abc",
+        "https://corp.example:0",
+        "https://corp.example?x=1",
+        "https://corp.example#f",
     ),
 )
 def test_invalid_or_absent_corp_is_not_used(
@@ -1053,14 +1351,15 @@ def test_invalid_or_absent_corp_is_not_used(
     base: str | None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    item = replace(mirrored, mirrors=("github.com",))
     loader, transport = _fake_loader(
-        store, mirrored, payloads, set(), http.NetworkError("host-unreachable", "Нет сервера.")
+        store, item, payloads, set(), http.NetworkError("host-unreachable", "Нет сервера.")
     )
     loader = Downloader(cast(HttpClient, transport), store, corp_base=base)
-    _assert_error(loader, mirrored, "host-unreachable")
-    assert len(transport.urls) == 3
-    assert "corp.example" not in caplog.text
-    assert "user:pass" not in caplog.text
+    _assert_error(loader, item, "host-unreachable")
+    assert [urlsplit(url).hostname for url in transport.urls] == ["huggingface.co", "github.com"]
+    assert base is None or base not in caplog.text
+    assert "Корпоративный источник не используется" not in caplog.text
 
 
 def test_corp_rejects_dot_segment_before_request(store: ModelStore, entry: CatalogEntry) -> None:
@@ -1115,6 +1414,7 @@ def test_source_callback_failure_does_not_stop_or_log_exception(
     (
         ("no-network", "no-network"),
         ("host-unreachable", "no-network"),
+        ("short-read", "no-network"),
         ("not-allowed", "not-allowed"),
         ("bad-path", "not-allowed"),
         ("bad-checksum", "bad-sha"),
@@ -1169,6 +1469,66 @@ def test_second_source_resumes_half_and_progress_stays_monotonic(
     amounts = [state.bytes_done for state in progress]
     assert amounts == sorted(amounts)
     assert max(amounts) == len(body)
+
+
+def test_short_read_uses_next_source_with_range_without_socket(
+    store: ModelStore,
+    mirrored: CatalogEntry,
+    payloads: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = mirrored.files[0]
+    body = payloads[file.path]
+    seen: list[tuple[str, int | None]] = []
+
+    def get_stream(url: str, *, range_from: int | None, **kwargs: object) -> FakeResponse:
+        host = urlsplit(url).hostname or ""
+        seen.append((host, range_from))
+        if host == "huggingface.co":
+            return FakeResponse(body[:7])
+        assert host == "github.com" and range_from == 7
+        response = FakeResponse(body[7:], 206)
+        response.headers["Content-Range"] = f"bytes 7-{len(body) - 1}/{len(body)}"
+        return response
+
+    transport = Mock()
+    transport.get_stream.side_effect = get_stream
+    loader = Downloader(cast(HttpClient, transport), store)
+    monkeypatch.setattr(downloader, "_PROGRESS_INTERVAL_S", 0)
+    progress: list[Progress] = []
+    result = loader.download(mirrored, progress=progress.append, cancel=threading.Event())
+    assert (result / file.path).read_bytes() == body
+    assert seen == [("huggingface.co", None), ("github.com", 7)]
+    assert [state.bytes_done for state in progress] == sorted(
+        state.bytes_done for state in progress
+    )
+
+
+def test_short_read_last_source_keeps_part_for_retry_without_socket(
+    store: ModelStore, entry: CatalogEntry, payloads: dict[str, bytes]
+) -> None:
+    file = entry.files[0]
+    item = replace(entry, files=(file,), size_bytes=file.size)
+    body = payloads[file.path]
+    seen: list[int | None] = []
+
+    def get_stream(url: str, *, range_from: int | None, **kwargs: object) -> FakeResponse:
+        seen.append(range_from)
+        if range_from is None:
+            return FakeResponse(body[:7])
+        response = FakeResponse(body[range_from:], 206)
+        response.headers["Content-Range"] = f"bytes {range_from}-{len(body) - 1}/{len(body)}"
+        return response
+
+    transport = Mock()
+    transport.get_stream.side_effect = get_stream
+    loader = Downloader(cast(HttpClient, transport), store)
+    _assert_error(loader, item, "short-read")
+    part = store.root / item.id / f"{item.revision}.partial" / (file.path + ".part")
+    assert part.read_bytes() == body[:7]
+    result = _download(loader, item)
+    assert (result / file.path).read_bytes() == body
+    assert seen == [None, 7]
 
 
 def test_last_source_idle_timeout_preserves_part(

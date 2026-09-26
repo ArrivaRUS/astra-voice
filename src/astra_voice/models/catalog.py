@@ -297,9 +297,11 @@ def _metrics(value: object) -> Metrics:
     )
 
 
-def _identifier(value: object) -> str:
+def _identifier(value: object, *, revision: bool = False) -> str:
     result = _string(value)
-    if ID_RE.fullmatch(result) is None:
+    if ID_RE.fullmatch(result) is None or (
+        revision and (result.endswith((".partial", ".json")) or ".old-" in result)
+    ):
         raise CatalogError("bad-schema", "В каталоге недопустимый идентификатор или ревизия.")
     return result
 
@@ -365,7 +367,7 @@ def _file(value: object) -> FileSpec:
 def _model(value: object) -> CatalogEntry:
     data = _object(value)
     model_id = _identifier(data.get("id"))
-    revision = _identifier(data.get("revision"))
+    revision = _identifier(data.get("revision"), revision=True)
     host = _string(data.get("host"))
     if not host_allowed(host):
         raise CatalogError("bad-schema", "Источник модели отсутствует в списке разрешённых.")
@@ -404,7 +406,7 @@ def _revoked(value: object) -> RevokedEntry:
     data = _object(value)
     return RevokedEntry(
         model_id=_identifier(data.get("model_id")),
-        revision=_identifier(data.get("revision")),
+        revision=_identifier(data.get("revision"), revision=True),
         reason=_string(data.get("reason")),
     )
 

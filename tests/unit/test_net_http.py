@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import Mock
 from urllib.parse import urlsplit
 
@@ -442,7 +443,8 @@ def test_invalid_redirect_stops_loading(
 ) -> None:
     with pytest.raises(NetworkError) as caught:
         client.get_stream(local_server.url + path, deadline_s=2, cancel=threading.Event())
-    assert caught.value.code == "not-allowed"
+    assert caught.value.code == "bad-status"
+    assert caught.value.status is None
     assert "private-user" not in str(caught.value)
     assert "private-password" not in str(caught.value)
     assert len(local_server.requests) == 1
@@ -456,7 +458,8 @@ def test_redirect_limit(client: HttpClient, local_server: LocalServer, count: in
             client.get_stream(
                 f"{local_server.url}/chain/{count}", deadline_s=2, cancel=threading.Event()
             )
-        assert caught.value.code == "not-allowed"
+        assert caught.value.code == "bad-status"
+        assert caught.value.status is None
     else:
         with client.get_stream(
             f"{local_server.url}/chain/{count}", deadline_s=2, cancel=threading.Event()
@@ -537,7 +540,10 @@ def test_bad_status(
 
 def test_extra_host_is_exact_and_port_is_pinned() -> None:
     allowed = ("corp.example:8443",)
-    assert http._validate_url("https://corp.example:8443/models", allowed) == "corp.example"
+    assert (
+        http._validate_url("https://corp.example:8443/models", allowed, scope="corp")
+        == "corp.example"
+    )
     with pytest.raises(NetworkError) as without_extra:
         http._validate_url("https://corp.example:8443/models")
     assert without_extra.value.code == "not-allowed"
@@ -548,9 +554,12 @@ def test_extra_host_is_exact_and_port_is_pinned() -> None:
         "http://corp.example:8443/models",
     ):
         with pytest.raises(NetworkError) as caught:
-            http._validate_url(url, allowed)
+            http._validate_url(url, allowed, scope="corp")
         assert caught.value.code == "not-allowed"
-    assert http._validate_url("https://corp.example/models", ("corp.example",)) == "corp.example"
+    assert (
+        http._validate_url("https://corp.example/models", ("corp.example",), scope="corp")
+        == "corp.example"
+    )
 
 
 def test_extra_host_redirect_is_checked_on_each_hop(transport: Mock) -> None:
@@ -559,20 +568,149 @@ def test_extra_host_redirect_is_checked_on_each_hop(transport: Mock) -> None:
         user_agent=_USER_AGENT,
         extra_hosts=("corp.example:8443",),
     )
-    first = _response(302, "https://corp.example:8443/file")
-    transport.side_effect = [first, _response()]
-    with client.get_stream(
-        "https://huggingface.co/file", deadline_s=2, cancel=threading.Event()
-    ) as response:
-        assert b"".join(response.iter_chunks()) == _BODY
-    assert transport.call_count == 2
+    first = _response(302, "https://huggingface.co/file")
+    transport.side_effect = [first]
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream(
+            "https://corp.example:8443/file", deadline_s=2, cancel=threading.Event(), scope="corp"
+        )
+    assert caught.value.code == "bad-status"
+    assert transport.call_count == 1
 
     transport.reset_mock()
     transport.side_effect = [_response(302, "https://sub.corp.example:8443/file")]
     with pytest.raises(NetworkError) as caught:
-        client.get_stream("https://huggingface.co/file", deadline_s=2, cancel=threading.Event())
-    assert caught.value.code == "not-allowed"
+        client.get_stream(
+            "https://corp.example:8443/file", deadline_s=2, cancel=threading.Event(), scope="corp"
+        )
+    assert caught.value.code == "bad-status"
+    assert caught.value.status is None
     assert transport.call_count == 1
+
+
+def test_public_redirect_cannot_reach_corp(transport: Mock) -> None:
+    client = HttpClient(
+        NetworkGate(Settings(), Policy()),
+        user_agent=_USER_AGENT,
+        extra_hosts=("corp.example:8443",),
+    )
+    transport.side_effect = [_response(302, "https://corp.example:8443/probe")]
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream("https://huggingface.co/file", deadline_s=2, cancel=threading.Event())
+    assert caught.value.code == "bad-status"
+    assert transport.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "host", ("faß.example", "ß.huggingface.co", "ｈｕｇｇｉｎｇｆａｃｅ.co", "K.huggingface.co")
+)
+def test_unicode_redirect_host_is_bad_status_without_second_request(
+    transport: Mock, host: str
+) -> None:
+    client = HttpClient(
+        NetworkGate(Settings(), Policy()), user_agent=_USER_AGENT, extra_hosts=("fass.example",)
+    )
+    transport.side_effect = [_response(302, f"https://{host}/probe")]
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream("https://huggingface.co/file", deadline_s=2, cancel=threading.Event())
+    assert caught.value.code == "bad-status"
+    assert caught.value.status is None
+    assert caught.value.message == "Сервер вернул недопустимое перенаправление."
+    assert transport.call_count == 1
+    assert all(
+        call.args[0].url.isascii() and "xn--" not in call.args[0].url.lower()
+        for call in transport.call_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    "host", ("faß.example", "ß.huggingface.co", "ｈｕｇｇｉｎｇｆａｃｅ.co", "K.huggingface.co")
+)
+def test_unicode_initial_host_is_refused_before_transport(transport: Mock, host: str) -> None:
+    client = HttpClient(
+        NetworkGate(Settings(), Policy()), user_agent=_USER_AGENT, extra_hosts=("fass.example",)
+    )
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream(f"https://{host}/probe", deadline_s=2, cancel=threading.Event())
+    assert caught.value.code == "not-allowed"
+    transport.assert_not_called()
+
+
+def test_ascii_punycode_host_uses_normal_allowlist(transport: Mock) -> None:
+    transport.side_effect = [_response()]
+    with pytest.raises(NetworkError) as caught:
+        http._validate_url("https://xn--zca.huggingface.co/x", ("fass.example",), scope="corp")
+    assert caught.value.code == "not-allowed"
+    assert http._validate_url("https://xn--zca.huggingface.co/x") == "xn--zca.huggingface.co"
+    with pytest.raises(NetworkError) as caught:
+        http._validate_url("https://fass.example/x", ("faß.example",), scope="corp")
+    assert caught.value.code == "not-allowed"
+    client = HttpClient(NetworkGate(Settings(), Policy()), user_agent=_USER_AGENT)
+    with client.get_stream(
+        "https://xn--zca.huggingface.co/x", deadline_s=2, cancel=threading.Event()
+    ):
+        pass
+    assert urlsplit(transport.call_args.args[0].url).hostname == "xn--zca.huggingface.co"
+
+
+def test_checked_host_equals_transport_host(
+    transport: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = HttpClient(NetworkGate(Settings(), Policy()), user_agent=_USER_AGENT)
+    checked: list[str] = []
+    original = http._validate_url
+
+    def validate(
+        url: str, extra_hosts: tuple[str, ...] = (), *, scope: Literal["public", "corp"] = "public"
+    ) -> str:
+        host = original(url, extra_hosts, scope=scope)
+        checked.append(host)
+        return host
+
+    monkeypatch.setattr(http, "_validate_url", validate)
+    transport.side_effect = [_response(302, "https://hf.co/file"), _response()]
+    with client.get_stream("https://huggingface.co/file", deadline_s=2, cancel=threading.Event()):
+        pass
+    sent_hosts = [urlsplit(call.args[0].url).hostname for call in transport.call_args_list]
+    assert sent_hosts == ["huggingface.co", "hf.co"]
+    assert sent_hosts == [host for host in checked if host in sent_hosts][::2]
+
+
+def test_foreign_redirect_is_bad_status_without_foreign_request(
+    client: HttpClient, transport: Mock
+) -> None:
+    transport.side_effect = [_response(302, "https://evil.example/private?token=secret")]
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream("https://huggingface.co/file", deadline_s=2, cancel=threading.Event())
+    assert caught.value.code == "bad-status"
+    assert caught.value.status is None
+    assert "evil.example" not in caught.value.message
+    assert "secret" not in caught.value.message
+    transport.assert_called_once()
+
+
+def test_redirect_limit_without_socket(client: HttpClient, transport: Mock) -> None:
+    transport.side_effect = [_response(302, "/again") for _ in range(6)]
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream("https://huggingface.co/file", deadline_s=2, cancel=threading.Event())
+    assert caught.value.code == "bad-status"
+    assert caught.value.status is None
+    assert transport.call_count == 6
+
+
+def test_request_debug_log_contains_only_host(
+    client: HttpClient, transport: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=http.__name__)
+    with client.get_stream(
+        "https://huggingface.co/private/path?token=secret",
+        deadline_s=2,
+        cancel=threading.Event(),
+    ) as response:
+        assert b"".join(response.iter_chunks()) == _BODY
+    assert "Запрос к huggingface.co" in caplog.text
+    assert "private/path" not in caplog.text
+    assert "secret" not in caplog.text
 
 
 def test_bad_status_attribute_without_socket(transport: Mock) -> None:
@@ -606,6 +744,27 @@ def test_idle_timeout_while_reading_without_socket(transport: Mock) -> None:
         ) as response:
             list(response.iter_chunks(8))
     assert caught.value.code == "timeout"
+
+
+def test_idle_timeout_resets_after_each_chunk_without_socket(transport: Mock) -> None:
+    class DrippingBody(BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            time.sleep(0.1)
+            return super().read(size)
+
+    body = b"abcdefghij"
+    reply = _response()
+    reply.raw = DrippingBody(body)
+    transport.side_effect = None
+    transport.return_value = reply
+    client = HttpClient(NetworkGate(Settings(), Policy()), user_agent=_USER_AGENT)
+    with client.get_stream(
+        "https://huggingface.co/file",
+        deadline_s=5,
+        idle_timeout_s=0.3,
+        cancel=threading.Event(),
+    ) as response:
+        assert b"".join(response.iter_chunks(1)) == body
 
 
 def test_idle_timeout_before_headers_without_socket(transport: Mock) -> None:
@@ -890,7 +1049,8 @@ def test_gzip_server_rejected_before_body_read(
         client.get_stream(
             f"{local_server.url}/gzip/{status}", deadline_s=2, cancel=threading.Event()
         )
-    assert caught.value.code == "not-allowed"
+    assert caught.value.code == "bad-status"
+    assert caught.value.status is None
     read.assert_not_called()
     iterate.assert_not_called()
     assert len(received) == 1
@@ -1148,7 +1308,8 @@ def test_content_encoding_rejected_without_reading(
     transport.side_effect = [received]
     with pytest.raises(NetworkError) as caught:
         client.get_stream("https://huggingface.co/file", deadline_s=2, cancel=threading.Event())
-    assert caught.value.code == "not-allowed"
+    assert caught.value.code == "bad-status"
+    assert caught.value.status is None
     read.assert_not_called()
     iterate.assert_not_called()
     transport.assert_called_once()
@@ -1376,7 +1537,8 @@ def test_malformed_redirect_is_rejected(client: HttpClient, transport: Mock, loc
     transport.return_value = redirected
     with pytest.raises(NetworkError) as caught:
         client.get_stream("https://huggingface.co/file", deadline_s=2, cancel=threading.Event())
-    assert caught.value.code == "not-allowed"
+    assert caught.value.code == "bad-status"
+    assert caught.value.status is None
     transport.assert_called_once()
     assert redirected.raw.closed
 

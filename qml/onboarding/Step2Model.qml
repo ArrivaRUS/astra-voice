@@ -72,14 +72,10 @@ Item {
                 badge: modelData.badge
                 cardState: modelData.state
                 message: modelData.message
-                queuePosition: modelData.queuePosition !== undefined ? modelData.queuePosition : 0
-                sourceText: modelData.sourceText !== undefined ? modelData.sourceText : ""
-                failReason: modelData.failReason !== undefined ? modelData.failReason : ""
                 canCancel: modelData.canCancel !== undefined ? modelData.canCancel
                     : modelData.state === "downloading" || modelData.state === "paused-no-space"
                 canRetry: modelData.canRetry !== undefined ? modelData.canRetry
                     : modelData.state === "failed" || modelData.state === "paused-no-space"
-                        || modelData.state === "sha-failed"
                 canDequeue: modelData.canDequeue !== undefined ? modelData.canDequeue
                     : modelData.state === "queued"
                 hint: modelData.hint !== undefined ? modelData.hint : ""

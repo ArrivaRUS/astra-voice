@@ -11,6 +11,7 @@ import urllib.request
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from types import TracebackType
+from typing import Literal
 from urllib.parse import urljoin, urlsplit
 
 import requests
@@ -59,6 +60,8 @@ def _extra_host_allowed(host: str, port: int | None, extra_hosts: tuple[str, ...
     for candidate in extra_hosts:
         if not candidate or candidate.endswith(":") or any(char in candidate for char in "/\\@?#%"):
             continue
+        if not candidate.isascii():
+            continue
         try:
             parts = urlsplit("https://" + candidate)
             candidate_host = (parts.hostname or "").encode("idna").decode("ascii").lower()
@@ -74,11 +77,15 @@ def _extra_host_allowed(host: str, port: int | None, extra_hosts: tuple[str, ...
     return False
 
 
-def _validate_url(url: str, extra_hosts: tuple[str, ...] = ()) -> str:
+def _validate_url(
+    url: str, extra_hosts: tuple[str, ...] = (), *, scope: Literal["public", "corp"] = "public"
+) -> str:
     """Проверяет весь адрес и возвращает хост без учётных данных."""
     _check_url_text(url)
     try:
         parts = urlsplit(url)
+        if not parts.netloc.isascii():
+            raise NetworkError("not-allowed", "Источник не разрешён: некорректный адрес.")
         host = (parts.hostname or "").encode("idna").decode("ascii").lower()
         port = parts.port
     except (ValueError, UnicodeError):
@@ -88,11 +95,11 @@ def _validate_url(url: str, extra_hosts: tuple[str, ...] = ()) -> str:
         raise NetworkError("not-allowed", "Источник не разрешён: адрес содержит учётные данные.")
     if parts.scheme not in ALLOWED_SCHEMES:
         raise NetworkError("not-allowed", "Источник не разрешён: требуется защищённое соединение.")
-    extra = _extra_host_allowed(host, port, extra_hosts)
+    extra = _extra_host_allowed(host, port, extra_hosts) if scope == "corp" else False
     if port not in ALLOWED_PORTS and not extra:
         raise NetworkError("not-allowed", "Источник не разрешён: недопустимый порт.")
     # Передаём текущий список: подмена http.ALLOWED_HOSTS действует и на редиректы.
-    if not host_allowed(host, ALLOWED_HOSTS) and not extra:
+    if not (host_allowed(host, ALLOWED_HOSTS) if scope == "public" else extra):
         raise NetworkError("not-allowed", "Источник не разрешён: сервер отсутствует в списке.")
     return host
 
@@ -161,6 +168,10 @@ class _RequestWatchdog:
         self._triggered = threading.Event()
         self._thread = threading.Thread(target=self._watch, name="http-request-watchdog")
         self._thread.start()
+
+    @property
+    def triggered(self) -> bool:
+        return self._triggered.is_set()
 
     def register(self, connection: HTTPConnection) -> None:
         original_connect = connection.connect
@@ -460,6 +471,7 @@ class HttpClient:
         cancel: threading.Event,
         kind: NetworkKind = "download",
         idle_timeout_s: float | None = None,
+        scope: Literal["public", "corp"] = "public",
     ) -> StreamResponse:
         """Проверяет гейт, открывает поток и вручную проходит до пяти перенаправлений."""
         started_at = time.monotonic()
@@ -468,7 +480,7 @@ class HttpClient:
             raise NetworkError("no-network", reason)
         deadline_at = started_at + deadline_s
         _remaining(deadline_at, cancel)
-        _validate_url(url, self._extra_hosts)
+        _validate_url(url, self._extra_hosts, scope=scope)
         verify = _verify_bundle(self._ca_bundle)
         session = _Session()
         session.trust_env = False
@@ -480,7 +492,7 @@ class HttpClient:
             for scheme in ("http://", "https://"):
                 session.mount(scheme, _RequestAdapter(watchdog))
             while True:
-                host = _validate_url(url, self._extra_hosts)
+                host = _validate_url(url, self._extra_hosts, scope=scope)
                 proxies = urllib.request.getproxies()
                 # trust_env отключён: учитываем исключения явно для каждого адреса.
                 if requests.utils.should_bypass_proxies(url, no_proxy=proxies.get("no")):
@@ -496,6 +508,7 @@ class HttpClient:
                 session.cookies.clear()
                 remaining = _remaining(deadline_at, cancel)
                 watchdog.reset_idle(idle_timeout_s)
+                log.debug("Запрос к %s", host)
                 try:
                     response = session.get(
                         url,
@@ -515,14 +528,14 @@ class HttpClient:
                         _remaining(deadline_at, cancel)
                     except NetworkError as stopped:
                         raise stopped from None
-                    if idle_timeout_s is not None and watchdog._triggered.is_set():
+                    if idle_timeout_s is not None and watchdog.triggered:
                         raise NetworkError(
                             "timeout", "Время ожидания ответа сервера истекло."
                         ) from None
                     raise _request_error(error, host) from None
                 try:
                     _remaining(deadline_at, cancel)
-                    if idle_timeout_s is not None and watchdog._triggered.is_set():
+                    if idle_timeout_s is not None and watchdog.triggered:
                         raise NetworkError("timeout", "Время ожидания ответа сервера истекло.")
                     # iter_content распаковывает до учёта бюджета. Отказываем по
                     # заголовкам, включая редиректы, и закрываем без чтения тела.
@@ -530,24 +543,47 @@ class HttpClient:
                         "",
                         "identity",
                     ):
-                        raise NetworkError("not-allowed", "Сжатие ответа сервера не разрешено.")
+                        raise NetworkError("bad-status", "Сжатый ответ сервера не поддерживается.")
                     if response.status_code in _REDIRECT_STATUSES:
                         if redirects >= 5:
-                            raise NetworkError("not-allowed", "Слишком много перенаправлений.")
+                            raise NetworkError("bad-status", "Слишком много перенаправлений.")
                         location = response.headers.get("Location", "")
-                        _check_url_text(location)
+                        # Проверяем исходную authority до urlsplit: его hostname
+                        # уже приводит регистр Unicode, а NFKC может дать ValueError.
+                        if location.startswith("//") or "://" in location:
+                            authority = location.split("//", 1)[1]
+                            authority = authority.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+                            if not authority.isascii():
+                                raise NetworkError(
+                                    "bad-status", "Сервер вернул недопустимое перенаправление."
+                                )
                         try:
+                            _check_url_text(location)
                             destination = urlsplit(location)
                             if (destination.scheme or location.startswith("//")) and not (
                                 destination.netloc
                             ):
                                 raise ValueError
                             target = urljoin(url, location)
-                        except (ValueError, UnicodeError):
+                        except (ValueError, UnicodeError, NetworkError):
                             raise NetworkError(
-                                "not-allowed", "Источник не разрешён: некорректное перенаправление."
+                                "bad-status", "Сервер вернул недопустимое перенаправление."
                             ) from None
-                        _validate_url(target, self._extra_hosts)
+                        # Дополнительно проверяем хост собранного адреса до запроса.
+                        try:
+                            target_host = urlsplit(target).hostname or ""
+                        except ValueError:
+                            target_host = ""
+                        if not target_host.isascii():
+                            raise NetworkError(
+                                "bad-status", "Сервер вернул недопустимое перенаправление."
+                            )
+                        try:
+                            _validate_url(target, self._extra_hosts, scope=scope)
+                        except NetworkError:
+                            raise NetworkError(
+                                "bad-status", "Сервер вернул недопустимое перенаправление."
+                            ) from None
                         _remaining(deadline_at, cancel)
                         url = target
                         redirects += 1
