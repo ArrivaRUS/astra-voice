@@ -254,7 +254,9 @@ body.dark .nv.on .cnt{color:rgba(11,18,32,.7)}
 /* замерено на этом компьютере: значение fg / 500 + маркер ✓ primary; слова «замерено» на экране нет */
 .mmv.meas{color:var(--fg1);font-weight:500}
 .mmv.nd{color:var(--fg-dis);font-style:italic}
-.mfoot{display:flex;align-items:flex-start;gap:12px;margin-top:6px}
+/* нижняя строка начинается по левому краю имени и описания: отметка 18 + зазор 12 = 30 от внутреннего
+   края карточки (решение заказчика 2026-09-26); правый край кнопок не меняется */
+.mfoot{display:flex;align-items:flex-start;gap:12px;margin-top:6px;padding-left:30px}
 .mfacts{flex:1;min-width:0;font-size:12px;line-height:18px;color:var(--fg3);display:flex;flex-wrap:wrap;
   align-items:center;column-gap:7px}
 .mfoot.hasbtn .mfacts{padding-top:5px}
