@@ -535,3 +535,19 @@ def test_models_revocation_warning_bridge_contract(real_contracts: dict[str, Met
         "Проверить, не отозвана ли текущая версия модели, сейчас нельзя — программа работает "
         "с той моделью, что была выбрана раньше."
     ) in section
+
+
+def test_download_counter_and_selection_line_contract(
+    real_contracts: dict[str, MetaContract],
+) -> None:
+    for name in ("onboarding", "settingsBridge"):
+        contract = real_contracts[name]
+        assert {"downloadCounter", "selectionLine"} <= contract.properties
+        signals = {method.name for method in contract.methods if method.is_signal}
+        assert "downloadCounterChanged" in signals
+    for path in ("qml/onboarding/Onboarding.qml", "qml/Main.qml"):
+        code = (REPO / path).read_text(encoding="utf-8")
+        assert "downloadCounter:" in code
+        assert ".downloadCounter" in code
+    for path in ("qml/onboarding/Step2Model.qml", "qml/sections/Models.qml"):
+        assert ".selectionLine" in (REPO / path).read_text(encoding="utf-8")

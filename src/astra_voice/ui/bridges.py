@@ -143,6 +143,8 @@ class SettingsBridge(QObject):
     downloadStateChanged = pyqtSignal()
     downloadProgressChanged = pyqtSignal()
     downloadTitleChanged = pyqtSignal()
+    downloadCounterChanged = pyqtSignal()
+    downloadSourceChanged = pyqtSignal()
     downloadDetailChanged = pyqtSignal()
     speedChanged = pyqtSignal()
     etaChanged = pyqtSignal()
@@ -197,7 +199,15 @@ class SettingsBridge(QObject):
         self._open_url = open_url if open_url is not None else QDesktopServices.openUrl
         self._dialog_factory = dialog_factory
         if downloads is not None:
-            for name in ("downloadState", "downloadProgress", "downloadTitle", "speed", "eta"):
+            for name in (
+                "downloadState",
+                "downloadProgress",
+                "downloadTitle",
+                "downloadCounter",
+                "downloadSource",
+                "speed",
+                "eta",
+            ):
                 getattr(downloads, name + "Changed").connect(getattr(self, name + "Changed"))
             downloads.downloadDetailChanged.connect(self.downloadDetailChanged)
             downloads.modelsChanged.connect(self.modelsChanged)
@@ -238,6 +248,7 @@ class SettingsBridge(QObject):
             "broken": "Файлы модели повреждены. Переустановите модель",
             "failed": "Не удалось загрузить модель",
             "no-space": "Не хватает места на диске",
+            "paused-no-space": "Не хватает места на диске",
             "catalog-unavailable": "Не удалось проверить список моделей",
         }.get(self.activeModelState, "")
 
@@ -257,6 +268,14 @@ class SettingsBridge(QObject):
     @pyqtProperty(str, notify=selectionChanged)
     def selectionSummary(self) -> str:  # noqa: N802
         return self._downloads.selectionSummary if self._downloads is not None else ""
+
+    @pyqtProperty(str, notify=selectionChanged)
+    def selectionLine(self) -> str:  # noqa: N802
+        return (
+            self._downloads.selectionLine
+            if self._downloads is not None
+            else "Пока ничего не выбрано"
+        )
 
     @pyqtProperty(bool, notify=selectionChanged)
     def selectionFits(self) -> bool:  # noqa: N802
@@ -318,6 +337,16 @@ class SettingsBridge(QObject):
         if self._downloads is not None:
             self._downloads.retryModel(model_id)
 
+    @pyqtSlot(str)
+    def cancelModel(self, model_id: str) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.cancelModel(model_id, discard=True)
+
+    @pyqtSlot(str)
+    def dequeueModel(self, model_id: str) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.dequeueModel(model_id)
+
     @pyqtSlot()
     def pickInstallPath(self) -> None:  # noqa: N802
         if self._downloads is None:
@@ -351,7 +380,7 @@ class SettingsBridge(QObject):
     @pyqtSlot()
     def cancelDownloads(self) -> None:  # noqa: N802
         if self._downloads is not None:
-            self._downloads.cancelDownloads()
+            self._downloads.cancelDownloads(discard=True)
 
     @pyqtProperty(str, notify=downloadStateChanged)
     def downloadState(self) -> str:  # noqa: N802
@@ -364,6 +393,14 @@ class SettingsBridge(QObject):
     @pyqtProperty(str, notify=downloadTitleChanged)
     def downloadTitle(self) -> str:  # noqa: N802
         return self._downloads.downloadTitle if self._downloads is not None else ""
+
+    @pyqtProperty(str, notify=downloadCounterChanged)
+    def downloadCounter(self) -> str:  # noqa: N802
+        return self._downloads.downloadCounter if self._downloads is not None else ""
+
+    @pyqtProperty(str, notify=downloadSourceChanged)
+    def downloadSource(self) -> str:  # noqa: N802
+        return self._downloads.downloadSource if self._downloads is not None else ""
 
     @pyqtProperty(str, notify=downloadDetailChanged)
     def downloadDetail(self) -> str:  # noqa: N802
@@ -794,6 +831,8 @@ class OnboardingController(QObject):
     downloadStateChanged = pyqtSignal()
     downloadProgressChanged = pyqtSignal()
     downloadTitleChanged = pyqtSignal()
+    downloadCounterChanged = pyqtSignal()
+    downloadSourceChanged = pyqtSignal()
     downloadDetailChanged = pyqtSignal()
     modelReadyChanged = pyqtSignal()
     modelStateChanged = pyqtSignal()
@@ -862,6 +901,8 @@ class OnboardingController(QObject):
             "downloadStateChanged",
             "downloadProgressChanged",
             "downloadTitleChanged",
+            "downloadCounterChanged",
+            "downloadSourceChanged",
             "downloadDetailChanged",
             "modelReadyChanged",
             "modelStateChanged",
@@ -1037,6 +1078,10 @@ class OnboardingController(QObject):
     def selectionSummary(self) -> str:  # noqa: N802
         return self._downloads.selectionSummary
 
+    @pyqtProperty(str, notify=selectionChanged)
+    def selectionLine(self) -> str:  # noqa: N802
+        return self._downloads.selectionLine
+
     @pyqtProperty(bool, notify=selectionChanged)
     def selectionFits(self) -> bool:  # noqa: N802
         return self._downloads.selectionFits
@@ -1063,6 +1108,14 @@ class OnboardingController(QObject):
     def downloadTitle(self) -> str:  # noqa: N802
         return self._downloads.downloadTitle
 
+    @pyqtProperty(str, notify=downloadCounterChanged)
+    def downloadCounter(self) -> str:  # noqa: N802
+        return self._downloads.downloadCounter
+
+    @pyqtProperty(str, notify=downloadSourceChanged)
+    def downloadSource(self) -> str:  # noqa: N802
+        return self._downloads.downloadSource
+
     @pyqtProperty(str, notify=downloadDetailChanged)
     def downloadDetail(self) -> str:  # noqa: N802
         return self._downloads.downloadDetail
@@ -1079,9 +1132,17 @@ class OnboardingController(QObject):
     def retryModel(self, model_id: str) -> None:  # noqa: N802
         self._downloads.retryModel(model_id)
 
+    @pyqtSlot(str)
+    def cancelModel(self, model_id: str) -> None:  # noqa: N802
+        self._downloads.cancelModel(model_id, discard=False)
+
+    @pyqtSlot(str)
+    def dequeueModel(self, model_id: str) -> None:  # noqa: N802
+        self._downloads.dequeueModel(model_id)
+
     @pyqtSlot()
     def cancelDownloads(self) -> None:  # noqa: N802
-        self._downloads.cancelDownloads()
+        self._downloads.cancelDownloads(discard=False)
 
     @pyqtProperty(str, notify=modelStateChanged)
     def modelState(self) -> str:  # noqa: N802

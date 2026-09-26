@@ -77,6 +77,8 @@ def setup_logging(
     root = logging.getLogger()
     _clear_own_handlers(root)
     root.setLevel(level)
+    for logger_name in ("urllib3", "requests"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
     file_handler = RotatingFileHandler(
         directory / LOG_FILE_NAME,

@@ -141,7 +141,12 @@ class ModelStore:
 
     def _revision_path(self, model_id: str, revision: str, suffix: str = "") -> Path:
         # Проверяем оба значения до первого включения пользовательских строк в путь (У6).
-        if ID_RE.fullmatch(model_id) is None or ID_RE.fullmatch(revision) is None:
+        if (
+            ID_RE.fullmatch(model_id) is None
+            or ID_RE.fullmatch(revision) is None
+            or revision.endswith((".partial", ".json"))
+            or ".old-" in revision
+        ):
             raise StoreError("bad-id")
         directory = self._checked(self.root / model_id)
         result = self._checked(directory / f"{revision}{suffix}")
@@ -168,6 +173,20 @@ class ModelStore:
             self._private_dir(directory.parent)
             self._private_dir(directory)
         return directory
+
+    def discard_staging(self, model_id: str, revision: str) -> None:
+        """Идемпотентно удаляет только staging указанной пары, не следуя ссылкам."""
+        try:
+            directory = self._revision_path(model_id, revision, ".partial")
+            if directory.is_dir():
+                shutil.rmtree(directory)
+            elif directory.exists():
+                directory.unlink()
+            else:
+                return
+            _fsync_dir(directory.parent)
+        except (OSError, StoreError):
+            log.warning("Не удалось удалить незавершённую загрузку модели.")
 
     def _installed(self, model_id: str, revision: str) -> Path:
         directory = self._revision_path(model_id, revision)

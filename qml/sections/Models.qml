@@ -103,6 +103,12 @@ Item {
         badge: entry.badge !== undefined ? entry.badge : ""
         cardState: entry.state !== undefined ? entry.state : "available"
         message: entry.message !== undefined ? entry.message : ""
+        canCancel: entry.canCancel !== undefined ? entry.canCancel
+            : entry.state === "downloading" || entry.state === "paused-no-space"
+        canRetry: entry.canRetry !== undefined ? entry.canRetry
+            : entry.state === "failed" || entry.state === "paused-no-space"
+        canDequeue: entry.canDequeue !== undefined ? entry.canDequeue
+            : entry.state === "queued"
         hint: entry.hint !== undefined ? entry.hint : ""
         hintKind: entry.hintKind !== undefined ? entry.hintKind : ""
         memoryShortage: entry.memoryShortage === true
@@ -118,7 +124,8 @@ Item {
         openFolderEnabled: bridge !== null
         onToggleRequested: { if (bridge) bridge.toggleModel(entry.id); }
         onRetryRequested: { if (bridge) bridge.retryModel(entry.id); }
-        onCancelRequested: { if (bridge) bridge.cancelDownloads(); }
+        onCancelRequested: { if (bridge) bridge.cancelModel(entry.id); }
+        onDequeueRequested: { if (bridge) bridge.dequeueModel(entry.id); }
         onOpenFolderRequested: { if (bridge) bridge.openModelsFolder(); }
         onActivateRequested: { if (bridge) bridge.makeModelCurrent(entry.id); }
         onSwitchWithPauseRequested: { if (bridge) bridge.switchModelWithPause(entry.id); }
@@ -287,7 +294,7 @@ Item {
             Text {
                 objectName: "selectionSummary"
                 Layout.maximumWidth: summary.width
-                text: root.hasSelection ? root.settings.selectionSummary
+                text: root.settings ? root.settings.selectionLine
                     : qsTr("Пока ничего не выбрано")
                 textFormat: Text.PlainText
                 color: root.settings && root.settings.selectionFits === false

@@ -44,19 +44,32 @@ class NetworkGate:
 
     def allowed(self, kind: NetworkKind) -> tuple[bool, str]:
         """Возвращает разрешение и понятную пользователю причину отказа."""
+        refusal = self.refusal(kind)
+        if refusal == "admin":
+            if self._policy.status == PolicyStatus.INVALID:
+                return False, "Не удалось проверить правила администратора: работа без сети"
+            return False, "Задано администратором: работа без сети"
+        if refusal == "offline":
+            return False, "Включена работа без сети"
+        if refusal == "settings":
+            return False, "Проверка обновлений выключена в настройках"
+        return True, ""
+
+    def refusal(self, kind: NetworkKind) -> str:
+        """Возвращает закрытый код причины отказа или пустую строку."""
         if kind not in ("download", "check_app", "check_models"):
             raise ValueError("Неизвестный вид сетевого действия")
 
         if self._policy.status == PolicyStatus.INVALID:
-            return False, "Не удалось проверить правила администратора: работа без сети"
+            return "admin"
         if _policy_offline(self._policy.values.get("offline")) or _policy_profile_offline(
             self._policy.values.get("profile")
         ):
-            return False, "Задано администратором: работа без сети"
+            return "admin"
         if os.environ.get("HF_HUB_OFFLINE", "").lower() in ("1", "true", "yes", "on"):
-            return False, "Включена работа без сети"
+            return "offline"
         if (kind == "check_app" and self._settings.check_app_updates is not True) or (
             kind == "check_models" and self._settings.check_model_updates is not True
         ):
-            return False, "Проверка обновлений выключена в настройках"
-        return True, ""
+            return "settings"
+        return ""

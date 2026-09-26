@@ -86,6 +86,7 @@ MODEL_STATES = (
     "queued",
     "downloading",
     "verifying",
+    "paused-no-space",
     "sha-failed",
     "installed",
     "switching",
@@ -155,6 +156,9 @@ class FakeOnboarding(QObject):
         super().__init__()
         self.calls: list[str] = []
         self.toggled_model_ids: list[str] = []
+        self.cancelled_model_ids: list[str] = []
+        self.dequeued_model_ids: list[str] = []
+        self.retried_model_ids: list[str] = []
         self._step: int = 1
         self._policyLocked: bool = False
         self._policyLockedText: str = "Задано администратором"
@@ -208,6 +212,7 @@ class FakeOnboarding(QObject):
             },
         ]
         self._selectionSummary: str = ""
+        self._downloadCounter: str = ""
         self._selectionFits: bool = True
         self._selectionMessage: str = ""
         self._canContinueFromModel: bool = False
@@ -215,6 +220,7 @@ class FakeOnboarding(QObject):
         self._downloadState: str = "idle"
         self._downloadProgress: float = 0.0
         self._downloadTitle: str = ""
+        self._downloadSource: str = ""
         self._downloadDetail: str = ""
         self._freeSpaceText: str = "свободно на диске 42,1 ГБ"
         self._speed: str = "5,2 МБ/с"
@@ -294,6 +300,18 @@ class FakeOnboarding(QObject):
         str, _get_selectionSummary, _set_selectionSummary, notify=changed
     )
 
+    @pyqtProperty(str, notify=changed)
+    def selectionLine(self) -> str:  # noqa: N802
+        if self._selectionSummary:
+            return self._selectionSummary
+        if self.downloadState == "no-space" and any(
+            row["state"] == "paused-no-space" for row in self.models
+        ):
+            return "Загрузка на паузе"
+        if any(row["state"] in {"queued", "downloading", "verifying"} for row in self.models):
+            return "Идёт загрузка"
+        return "Пока ничего не выбрано"
+
     def _get_selectionFits(self) -> bool:
         return self._selectionFits
 
@@ -369,6 +387,24 @@ class FakeOnboarding(QObject):
         self.changed.emit()
 
     downloadTitle = pyqtProperty(str, _get_downloadTitle, _set_downloadTitle, notify=changed)
+
+    def _get_downloadCounter(self) -> str:
+        return self._downloadCounter
+
+    def _set_downloadCounter(self, value: str) -> None:
+        self._downloadCounter = value
+        self.changed.emit()
+
+    downloadCounter = pyqtProperty(str, _get_downloadCounter, _set_downloadCounter, notify=changed)
+
+    def _get_downloadSource(self) -> str:
+        return self._downloadSource
+
+    def _set_downloadSource(self, value: str) -> None:
+        self._downloadSource = value
+        self.changed.emit()
+
+    downloadSource = pyqtProperty(str, _get_downloadSource, _set_downloadSource, notify=changed)
 
     def _get_downloadDetail(self) -> str:
         return self._downloadDetail
@@ -627,6 +663,17 @@ class FakeOnboarding(QObject):
     @pyqtSlot(str)
     def retryModel(self, model_id: str) -> None:
         self.calls.append("retryModel")
+        self.retried_model_ids.append(model_id)
+
+    @pyqtSlot(str)
+    def cancelModel(self, model_id: str) -> None:
+        self.calls.append("cancelModel")
+        self.cancelled_model_ids.append(model_id)
+
+    @pyqtSlot(str)
+    def dequeueModel(self, model_id: str) -> None:
+        self.calls.append("dequeueModel")
+        self.dequeued_model_ids.append(model_id)
 
     @pyqtSlot()
     def cancelDownloads(self) -> None:
@@ -694,6 +741,9 @@ class FakeSettings(QObject):
         super().__init__()
         self.calls: list[str] = []
         self.toggled_model_ids: list[str] = []
+        self.cancelled_model_ids: list[str] = []
+        self.dequeued_model_ids: list[str] = []
+        self.retried_model_ids: list[str] = []
         self._hotkey: str = "Ctrl + Space"
         self._hotkeyMode: str = "ptt"
         self._captureState: str = "idle"
@@ -828,12 +878,14 @@ class FakeSettings(QObject):
         self._installedSummary: str = "Установлено 1 из 12 · 226 МБ на диске"
         self._installedCount: int = 1
         self._selectionSummary: str = ""
+        self._downloadCounter: str = ""
         self._selectionFits: bool = True
         self._selectionMessage: str = ""
         self._freeSpaceText: str = "свободно на диске 42,1 ГБ"
         self._downloadState: str = "idle"
         self._downloadProgress: float = 0.0
         self._downloadTitle: str = ""
+        self._downloadSource: str = ""
         self._downloadDetail: str = ""
         self._speed: str = ""
         self._eta: str = ""
@@ -1055,6 +1107,18 @@ class FakeSettings(QObject):
         str, _get_selectionSummary, _set_selectionSummary, notify=changed
     )
 
+    @pyqtProperty(str, notify=changed)
+    def selectionLine(self) -> str:  # noqa: N802
+        if self._selectionSummary:
+            return self._selectionSummary
+        if self.downloadState == "no-space" and any(
+            row["state"] == "paused-no-space" for row in self.models
+        ):
+            return "Загрузка на паузе"
+        if any(row["state"] in {"queued", "downloading", "verifying"} for row in self.models):
+            return "Идёт загрузка"
+        return "Пока ничего не выбрано"
+
     def _get_selectionFits(self) -> bool:
         return self._selectionFits
 
@@ -1132,6 +1196,24 @@ class FakeSettings(QObject):
         self.changed.emit()
 
     downloadTitle = pyqtProperty(str, _get_downloadTitle, _set_downloadTitle, notify=changed)
+
+    def _get_downloadCounter(self) -> str:
+        return self._downloadCounter
+
+    def _set_downloadCounter(self, value: str) -> None:
+        self._downloadCounter = value
+        self.changed.emit()
+
+    downloadCounter = pyqtProperty(str, _get_downloadCounter, _set_downloadCounter, notify=changed)
+
+    def _get_downloadSource(self) -> str:
+        return self._downloadSource
+
+    def _set_downloadSource(self, value: str) -> None:
+        self._downloadSource = value
+        self.changed.emit()
+
+    downloadSource = pyqtProperty(str, _get_downloadSource, _set_downloadSource, notify=changed)
 
     def _get_downloadDetail(self) -> str:
         return self._downloadDetail
@@ -1286,6 +1368,16 @@ class FakeSettings(QObject):
     def cancelDownloads(self) -> None:
         self.calls.append("cancelDownloads")
 
+    @pyqtSlot(str)
+    def cancelModel(self, model_id: str) -> None:
+        self.calls.append("cancelModel")
+        self.cancelled_model_ids.append(model_id)
+
+    @pyqtSlot(str)
+    def dequeueModel(self, model_id: str) -> None:
+        self.calls.append("dequeueModel")
+        self.dequeued_model_ids.append(model_id)
+
     @pyqtSlot()
     def openModelsFolder(self) -> None:
         self.calls.append("openModelsFolder")
@@ -1301,6 +1393,7 @@ class FakeSettings(QObject):
     @pyqtSlot(str)
     def retryModel(self, model_id: str) -> None:
         self.calls.append("retryModel")
+        self.retried_model_ids.append(model_id)
 
     @pyqtSlot()
     def pickInstallPath(self) -> None:
@@ -2047,7 +2140,18 @@ def test_model_card_states_render(state: str, onboarding_app: Any) -> None:
         "removed-from-catalog",
     }
     fake.models = [
-        {**fake.models[0], "state": state, "badge": "installed" if installed else ""},
+        {
+            **fake.models[0],
+            "state": state,
+            "badge": "installed" if installed else "",
+            "message": (
+                "Не хватает места на диске"
+                if state == "paused-no-space"
+                else "Не удалось загрузить модель — сервер не отвечает"
+                if state == "failed"
+                else ""
+            ),
+        },
         *fake.models[1:],
     ]
 
@@ -2057,13 +2161,21 @@ def test_model_card_states_render(state: str, onboarding_app: Any) -> None:
             "blocked"
             if state in {"no-space", "no-network", "offline-user", "policy"}
             else "locked"
-            if installed or state in {"queued", "downloading", "verifying"}
+            if installed or state in {"queued", "downloading", "verifying", "paused-no-space"}
             else "off"
         )
         assert card.property("selectionMark") == expected
         alert = next(item for item in visual_tree(card) if item.objectName() == "messageAlert")
         message = next(item for item in visual_tree(card) if item.objectName() == "messageText")
-        error_states = {"failed", "sha-failed", "no-space", "broken", "corrupted", "update-failed"}
+        error_states = {
+            "failed",
+            "sha-failed",
+            "no-space",
+            "paused-no-space",
+            "broken",
+            "corrupted",
+            "update-failed",
+        }
         neutral_states = {"no-network", "offline-user", "policy"}
         hint_states = {"low-ram", "not-recommended", "no-benchmark"}
         assert alert.isVisible() == (state in error_states)
@@ -2074,11 +2186,17 @@ def test_model_card_states_render(state: str, onboarding_app: Any) -> None:
             assert message.property("color") == alert.property("color")
         if state in error_states | neutral_states:
             assert message.property("text") in visible_texts(card)
+        if state in {"failed", "paused-no-space"}:
+            assert message.property("text") == fake.models[0]["message"]
+        if state == "paused-no-space":
+            assert card.property("highlighted") is True
+            assert card.property("statusLabel") == ""
         expected_buttons = {
             "queued": {"Отмена"},
             "downloading": {"Отмена"},
+            "paused-no-space": {"Повторить", "Отмена"},
             "failed": {"Повторить"},
-            "sha-failed": {"Повторить"},
+            "sha-failed": set(),
             "no-space": {"Открыть папку моделей"},
         }.get(state, set())
         buttons = {
@@ -2088,13 +2206,403 @@ def test_model_card_states_render(state: str, onboarding_app: Any) -> None:
         }
         assert buttons == expected_buttons
         if state == "sha-failed":
-            assert visible_button(card, "Повторить").isEnabled()
             assert card.property("detailsActionAvailable") is False
         if state in {"updating", "update-failed"}:
             assert card.property("updateActionsAvailable") is False
 
     _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
     assert_no_messages(messages, f"models[0].state={state}")
+
+
+@pytest.mark.parametrize("screen", ["onboarding", "models"])
+@pytest.mark.parametrize(
+    ("state", "button", "call", "ids_attribute"),
+    [
+        ("queued", "Отмена", "dequeueModel", "dequeued_model_ids"),
+        ("downloading", "Отмена", "cancelModel", "cancelled_model_ids"),
+        ("paused-no-space", "Повторить", "retryModel", "retried_model_ids"),
+        ("failed", "Повторить", "retryModel", "retried_model_ids"),
+    ],
+)
+def test_download_card_actions_target_model(
+    onboarding_app: Any, screen: str, state: str, button: str, call: str, ids_attribute: str
+) -> None:
+    fake = FakeOnboarding() if screen == "onboarding" else FakeSettings()
+    if isinstance(fake, FakeOnboarding):
+        fake.step = 2
+    model_id = "target-download-model"
+    fake.models = [
+        {
+            **fake.models[0],
+            "id": model_id,
+            "badge": "",
+            "state": state,
+            "message": "Не хватает места на диске" if state == "paused-no-space" else "",
+        }
+    ]
+
+    def inspect(root: Any) -> None:
+        card = next(item for item in visual_tree(root) if item.property("modelId") == model_id)
+        QMetaObject.invokeMethod(visible_button(card, button), "clicked", Qt.DirectConnection)
+        assert fake.calls[-1] == call
+        assert getattr(fake, ids_attribute) == [model_id]
+        assert "cancelDownloads" not in fake.calls
+
+    if screen == "onboarding":
+        _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    else:
+        _, messages = render_settings(
+            onboarding_app,
+            False,
+            fake=fake,
+            section="models",
+            inspect=lambda window: inspect(window.contentItem()),
+        )
+    assert_no_messages(messages, f"{screen} {state} action")
+
+
+@pytest.mark.parametrize("screen", ["onboarding", "models"])
+@pytest.mark.parametrize(
+    ("state", "flag", "button"),
+    [
+        ("queued", "canDequeue", "Отмена"),
+        ("downloading", "canCancel", "Отмена"),
+        ("paused-no-space", "canCancel", "Отмена"),
+        ("paused-no-space", "canRetry", "Повторить"),
+        ("failed", "canRetry", "Повторить"),
+    ],
+)
+def test_download_card_bridge_can_hide_action(
+    onboarding_app: Any, screen: str, state: str, flag: str, button: str
+) -> None:
+    fake = FakeOnboarding() if screen == "onboarding" else FakeSettings()
+    if isinstance(fake, FakeOnboarding):
+        fake.step = 2
+    fake.models = [
+        {
+            **fake.models[0],
+            "badge": "",
+            "state": state,
+            flag: False,
+        }
+    ]
+
+    def inspect(root: Any) -> None:
+        card = next(item for item in visual_tree(root) if item.property("modelId"))
+        assert button not in visible_texts(card)
+
+    if screen == "onboarding":
+        _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    else:
+        _, messages = render_settings(
+            onboarding_app,
+            False,
+            fake=fake,
+            section="models",
+            inspect=lambda window: inspect(window.contentItem()),
+        )
+    assert_no_messages(messages, f"{screen} {state} {flag}")
+
+
+@pytest.mark.parametrize("screen", ["onboarding", "models"])
+def test_available_card_stays_selectable_while_downloading(
+    onboarding_app: Any, screen: str
+) -> None:
+    fake = FakeOnboarding() if screen == "onboarding" else FakeSettings()
+    if isinstance(fake, FakeOnboarding):
+        fake.step = 2
+    fake.downloadState = "downloading"
+    fake.models = [{**fake.models[0], "badge": "", "state": "available", "selected": True}]
+    fake.selectionSummary = "Будет скачано 226 МБ"
+
+    def inspect(root: Any) -> None:
+        card = next(item for item in visual_tree(root) if item.property("modelId"))
+        assert card.property("selectionAvailable") is True
+        click_item(card)
+        assert fake.toggled_model_ids == [fake.models[0]["id"]]
+        if screen == "models":
+            button = visible_button(root, "Скачать выбранное")
+            assert button.isEnabled()
+            QMetaObject.invokeMethod(button, "clicked", Qt.DirectConnection)
+            assert fake.calls[-1] == "startSelectedDownloads"
+
+    if screen == "onboarding":
+        _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    else:
+        _, messages = render_settings(
+            onboarding_app,
+            False,
+            fake=fake,
+            section="models",
+            inspect=lambda window: inspect(window.contentItem()),
+        )
+    assert_no_messages(messages, f"{screen} selectable during download")
+
+
+@pytest.mark.parametrize("screen", ["onboarding", "models"])
+def test_download_strip_shows_source(onboarding_app: Any, screen: str) -> None:
+    fake = FakeOnboarding() if screen == "onboarding" else FakeSettings()
+    if isinstance(fake, FakeOnboarding):
+        fake.step = 2
+    fake.downloadState = "downloading"
+    fake.downloadTitle = "Загружаю GigaAM v3 RNN-T"
+    fake.downloadSource = "Скачиваю с huggingface.co"
+    fake.speed = "5,2 МБ/с"
+    fake.eta = "осталось ~3 мин"
+
+    def inspect(root: Any) -> None:
+        strip = next(
+            item
+            for item in visual_tree(root)
+            if item.metaObject().indexOfProperty("downloadState") >= 0
+        )
+        assert strip.property("sourceText") == fake.downloadSource
+        assert strip.property("tail") == ("Скачиваю с huggingface.co · 5,2 МБ/с · осталось ~3 мин")
+        assert strip.property("tail") in visible_texts(strip)
+
+    if screen == "onboarding":
+        _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    else:
+        _, messages = render_settings(
+            onboarding_app,
+            False,
+            fake=fake,
+            section="models",
+            inspect=lambda window: inspect(window.contentItem()),
+        )
+    assert_no_messages(messages, f"{screen} download source")
+
+
+def test_download_card_state_frames(onboarding_app: Any) -> None:
+    from astra_voice.ui.model_downloads import _FAILURE_MESSAGES, _SOURCE_TEXT
+
+    destination = os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_M6DL")
+    if not destination:
+        pytest.skip("ASTRA_VOICE_SNAPSHOT_DIR_M6DL не задан")
+    snapshots = Path(destination)
+    snapshots.mkdir(parents=True, exist_ok=True)
+    states = ("queued", "downloading", "downloading-calc", "verifying", "paused-no-space", "failed")
+    paused_message = "Не хватает места — освободите 172 МБ"
+    for state in states:
+        for screen in ("onboarding",) if state == "downloading-calc" else ("onboarding", "models"):
+            fake = FakeOnboarding() if screen == "onboarding" else FakeSettings()
+            if isinstance(fake, FakeOnboarding):
+                fake.step = 2
+                fake.canContinueFromModel = state != "failed"
+            t_one = copy.deepcopy(FakeSettings().models[1])
+            t_one.update(
+                id="t-one-fp32",
+                description="Русская диктовка от Т-Банка. Знаки препинания не ставит",
+                sizeBytes=144_195_192,
+                ramText="267 МБ",
+                ramMb=267,
+                tags=["Только русский", "Apache-2.0", "отечественная"],
+            )
+            t_one["metrics"][1].update(text="", fill=0.0, hasData=False)
+            fake.models = [
+                {
+                    **fake.models[0],
+                    "badge": "",
+                    "selected": state != "failed",
+                    "state": "downloading" if state == "downloading-calc" else state,
+                    "message": paused_message
+                    if state == "paused-no-space"
+                    else _FAILURE_MESSAGES["timeout"]
+                    if state == "failed"
+                    else "",
+                    "progress": 0.42 if state in {"downloading", "downloading-calc"} else 0.0,
+                    "canCancel": state in {"downloading", "downloading-calc", "paused-no-space"},
+                    "canRetry": state in {"paused-no-space", "failed"},
+                    "canDequeue": state == "queued",
+                }
+            ]
+            if state == "queued":
+                fake.models.append(
+                    {
+                        **t_one,
+                        "selected": True,
+                        "state": "queued",
+                        "message": "",
+                        "canDequeue": True,
+                    }
+                )
+                fake.models[0] = {**fake.models[0], "state": "downloading", "canCancel": True}
+            fake.downloadState = (
+                "no-space"
+                if state == "paused-no-space"
+                else "downloading"
+                if state in {"queued", "downloading-calc"}
+                else state
+                if state in {"downloading", "verifying", "failed"}
+                else "idle"
+            )
+            fake.downloadTitle = {
+                "queued": "Загружается GigaAM v3 RNN-T",
+                "downloading": "Загружается GigaAM v3 RNN-T",
+                "downloading-calc": "Загружается GigaAM v3 RNN-T",
+                "verifying": "Проверяю модель…",
+                "paused-no-space": "Не хватает места на диске",
+                "failed": "Не удалось загрузить модель",
+            }[state]
+            fake.downloadCounter = "1 из 2" if state == "queued" else ""
+            fake.downloadProgress = 0.42 if state in {"downloading", "downloading-calc"} else 0.0
+            fake.downloadSource = (
+                _SOURCE_TEXT["hf"] if state in {"downloading", "downloading-calc", "queued"} else ""
+            )
+            fake.downloadDetail = "нужно ещё 172 МБ" if state == "paused-no-space" else ""
+            fake.freeSpaceText = (
+                "свободно на диске 100 МБ"
+                if state == "paused-no-space"
+                else "свободно на диске 42,1 ГБ"
+            )
+            fake.speed = "5,2 МБ/с" if state == "downloading" else ""
+            fake.eta = "осталось ~3 мин" if state == "downloading" else ""
+
+            def inspect(
+                root: Any, state: str = state, screen: str = screen, fake: Any = fake
+            ) -> None:
+                cards = [
+                    item
+                    for item in visual_tree(root)
+                    if item.isVisible() and item.property("modelId")
+                ]
+                card = cards[0]
+                summary = next(
+                    item for item in visual_tree(root) if item.objectName() == "selectionSummary"
+                )
+                assert summary.property("text") == (
+                    "Пока ничего не выбрано"
+                    if state == "failed"
+                    else "Загрузка на паузе"
+                    if state == "paused-no-space"
+                    else "Идёт загрузка"
+                )
+                if state == "paused-no-space":
+                    assert (
+                        sum(
+                            item.property("text").count(fake.freeSpaceText)
+                            for item in visual_tree(summary.parentItem())
+                            if item.isVisible() and isinstance(item.property("text"), str)
+                        )
+                        == 1
+                    )
+                assert card.property("selected") is (state != "failed")
+                if state in {
+                    "queued",
+                    "downloading",
+                    "downloading-calc",
+                    "verifying",
+                    "paused-no-space",
+                }:
+                    badge = next(
+                        item for item in visual_tree(card) if item.property("text") == "Рекомендуем"
+                    )
+                    assert badge.property("color") == theme_color("bgSurface", False)
+                action = (
+                    "Повторить"
+                    if state == "failed"
+                    else "Отмена"
+                    if state in {"queued", "downloading", "downloading-calc", "paused-no-space"}
+                    else "Отмена недоступна"
+                )
+                item = next(
+                    item
+                    for item in visual_tree(card)
+                    if item.isVisible() and item.property("text") == action
+                )
+                right = item.mapToScene(QPointF(item.width(), 0)).x()
+                card_right = card.mapToScene(QPointF(card.width(), 0)).x()
+                actions = next(
+                    item for item in visual_tree(card) if item.objectName() == "footerActions"
+                )
+                actions_right = actions.mapToScene(QPointF(actions.width(), 0)).x()
+                assert 11 <= card_right - right <= 15, (
+                    state,
+                    screen,
+                    card_right - right,
+                    card_right - actions_right,
+                    actions.width(),
+                    item.width(),
+                )
+                if state == "verifying":
+                    assert item.property("color") == theme_color("fgMuted", False)
+                strip = next(
+                    item
+                    for item in visual_tree(root)
+                    if item.property("downloadState") == fake.downloadState
+                    and item.property("title") == fake.downloadTitle
+                )
+                counter = next(
+                    item for item in visual_tree(strip) if item.objectName() == "downloadCounter"
+                )
+                detail = next(
+                    item for item in visual_tree(strip) if item.objectName() == "downloadDetail"
+                )
+                assert counter.isVisible() == (state == "queued")
+                assert detail.isVisible() == (state == "paused-no-space")
+                if state == "queued":
+                    assert counter.property("text") == "1 из 2"
+                    assert {"GigaAM v3 RNN-T", "T-one"} <= visible_texts(root)
+                    title = next(
+                        item
+                        for item in visual_tree(strip)
+                        if item.property("text") == fake.downloadTitle
+                    )
+                    gap = (
+                        counter.mapToScene(QPointF(0, 0)).x()
+                        - title.mapToScene(QPointF(title.width(), 0)).x()
+                    )
+                    assert 9 <= gap <= 11
+                if state == "paused-no-space":
+                    assert detail.property("text") == "нужно ещё 172 МБ"
+                    assert paused_message in visible_texts(card)
+                    assert fake.freeSpaceText in visible_texts(root)
+                    title = next(
+                        item
+                        for item in visual_tree(strip)
+                        if item.property("text") == fake.downloadTitle
+                    )
+                    gap = (
+                        detail.mapToScene(QPointF(0, 0)).x()
+                        - title.mapToScene(QPointF(title.width(), 0)).x()
+                    )
+                    assert 9 <= gap <= 11
+                    button = visible_button(strip, "Открыть папку моделей")
+                    assert (
+                        detail.mapToScene(QPointF(detail.width(), 0)).x()
+                        < button.mapToScene(QPointF(0, 0)).x()
+                    )
+                if state == "downloading-calc":
+                    assert strip.property("tail") == "Скачиваю с huggingface.co · считаю…"
+                    assert strip.property("tail") in visible_texts(strip)
+                if screen == "onboarding" and state != "failed":
+                    assert visible_button(root, "Продолжить").isEnabled()
+                    assert not any(
+                        text.startswith("Выберите хотя бы одну модель")
+                        for text in visible_texts(root)
+                    )
+
+            if screen == "onboarding":
+                image, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+            else:
+
+                def inspect_settings(
+                    window: Any, callback: Callable[[Any], None] = inspect
+                ) -> None:
+                    callback(window.contentItem())
+
+                image, messages = render_settings(
+                    onboarding_app,
+                    False,
+                    fake=fake,
+                    section="models",
+                    inspect=inspect_settings,
+                )
+            filename = f"m6dl-{screen}-{state}.png"
+            assert_no_messages(messages, filename)
+            path = snapshots / filename
+            assert image.save(str(path), "PNG"), filename
+            assert_saved_snapshot(path, image)
 
 
 @pytest.mark.parametrize(

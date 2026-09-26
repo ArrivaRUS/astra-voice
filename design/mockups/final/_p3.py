@@ -323,7 +323,7 @@ def onb_progress(theme):
              '<div style="margin-top:9px">Высота <b>36</b>, поля <b>0 22</b>, граница сверху 1 px, '
              'фон окна. Тело шага при появлении полоски становится ниже на 36 — окно 900 × 620 '
              'не меняется.</div></div></div>')
-    cells = [stcell(name, dlbar(st, queue="· 1 из 2" if st in ("downloading", "calc") else ""), code)
+    cells = [stcell(name, dlbar(st, queue="1 из 2" if st in ("downloading", "calc") else ""), code)
              for st, name, code in DL_STATES]
     leg = ("<b>Пять состояний полоски</b> (решение заказчика 2026-09-16, поправка 3): идёт загрузка · "
            "проверяю модель · готово · не получилось · не хватает места. Шестая ячейка — та же "
@@ -340,7 +340,7 @@ def onb_progress(theme):
                         'текст появится там, где стоит курсор.</div>'
                         + card([row("Текущая комбинация", hotkey_field("idle"),
                                     hint=False)]) + '</div>'),
-                    acts(), progress="downloading", queue="· 1 из 2")
+                    acts(), progress="downloading", queue="1 из 2")
                 + sech("Пять состояний полоски") + grid(cells, 1)
                 + sech("Правила") + grid([where, fmt]), theme, leg, EXTRA_CSS)
 

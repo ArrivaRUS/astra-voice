@@ -76,6 +76,15 @@ def write_document(root: Path, document: dict[str, Any]) -> None:
     (root / "catalog.json").write_text(json.dumps(document), encoding="utf-8")
 
 
+@pytest.mark.parametrize("revision", ("r.partial", "r.json", "r.old-backup"))
+def test_reserved_revision_is_bad_schema(
+    catalog_root: Path, document: dict[str, Any], revision: str
+) -> None:
+    document["models"][0]["revision"] = revision
+    write_document(catalog_root, document)
+    assert_rejected(catalog_root, "bad-schema")
+
+
 def test_model_parsing_does_not_import_http(document: dict[str, Any]) -> None:
     subprocess.run(
         [

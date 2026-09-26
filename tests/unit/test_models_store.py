@@ -54,6 +54,47 @@ def test_staging_layout_and_permissions(store: ModelStore, tmp_path: Path) -> No
     assert store.staging_dir("model", "rev") == directory
 
 
+def test_discard_staging_removes_only_selected_pair_and_is_idempotent(store: ModelStore) -> None:
+    selected = store.staging_dir("model", "rev")
+    other_revision = store.staging_dir("model", "other")
+    other_model = store.staging_dir("other-model", "rev")
+    (selected / "weights.part").write_bytes(b"partial")
+    (other_revision / "keep").write_bytes(b"one")
+    (other_model / "keep").write_bytes(b"two")
+    store.discard_staging("model", "rev")
+    store.discard_staging("model", "rev")
+    assert not selected.exists()
+    assert (other_revision / "keep").read_bytes() == b"one"
+    assert (other_model / "keep").read_bytes() == b"two"
+
+
+@pytest.mark.parametrize("revision", ("r.partial", "r.json", "r.old-backup"))
+def test_reserved_revision_rejected_before_staging_or_discard(
+    store: ModelStore, revision: str
+) -> None:
+    with pytest.raises(StoreError) as staging_error:
+        store.staging_dir("model", revision)
+    assert staging_error.value.code == "bad-id"
+    with pytest.raises(StoreError) as path_error:
+        store._revision_path("model", revision, ".partial")
+    assert path_error.value.code == "bad-id"
+    store.discard_staging("model", revision)
+    assert not (store.root / "model").exists()
+
+
+def test_discard_staging_does_not_follow_symlink(
+    store: ModelStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_bytes(b"safe")
+    parent = store.staging_dir("model", "other").parent
+    (parent / "rev.partial").symlink_to(outside, target_is_directory=True)
+    store.discard_staging("model", "rev")
+    assert (outside / "keep").read_bytes() == b"safe"
+    assert "outside" not in caplog.text
+
+
 def test_missing_parents_are_private(tmp_path: Path) -> None:
     directory = ModelStore(tmp_path / "a/b/models").staging_dir("model", "rev")
     while directory != tmp_path:

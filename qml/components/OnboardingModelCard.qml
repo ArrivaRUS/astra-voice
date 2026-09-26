@@ -24,6 +24,9 @@ Rectangle {
     property bool selected: false
     property string badge: ""
     property string cardState: "available"
+    property bool canCancel: cardState === "downloading" || cardState === "paused-no-space"
+    property bool canRetry: cardState === "failed" || cardState === "paused-no-space"
+    property bool canDequeue: cardState === "queued"
     // Кнопку показываем только там, где мост умеет открыть папку.
     property bool openFolderEnabled: false
     // Управление установленной моделью есть в разделе «Модели» и нет в мастере.
@@ -44,6 +47,7 @@ Rectangle {
     signal toggleRequested()
     signal retryRequested()
     signal cancelRequested()
+    signal dequeueRequested()
     signal openFolderRequested()
     signal activateRequested()
     signal removeRequested()
@@ -55,11 +59,11 @@ Rectangle {
     readonly property bool selectionAvailable: badge === ""
         && ["available", "failed", "sha-failed", "new", "low-ram",
             "not-recommended", "no-benchmark"].indexOf(cardState) >= 0
-    readonly property bool highlighted: badge === "" && selected
+    readonly property bool highlighted: badge === "" && (selected || cardState === "paused-no-space")
     readonly property bool manageVisible: manageEnabled && badge !== ""
     readonly property bool busy: cardState === "queued" || cardState === "downloading"
         || cardState === "verifying"
-    readonly property bool hasError: ["failed", "sha-failed", "no-space",
+    readonly property bool hasError: ["failed", "sha-failed", "no-space", "paused-no-space",
         "broken", "corrupted", "update-failed"].indexOf(cardState) >= 0
     // Отказ переключения или удаления приходит сообщением на исправной карточке.
     readonly property bool hasMessage: hasError || message !== ""
@@ -72,14 +76,16 @@ Rectangle {
     readonly property bool showHint: (hint !== "" || ["low-ram", "not-recommended",
         "no-benchmark"].indexOf(cardState) >= 0) && (!hasMessage || memoryShortage)
     readonly property bool footerHasButtons: cardState === "queued"
-        || cardState === "downloading" || cardState === "failed"
+        || cardState === "downloading" || cardState === "paused-no-space"
+        || cardState === "failed"
         || cardState === "sha-failed"
         || (updateActionsAvailable && (cardState === "updating"
             || cardState === "update-failed"))
         || (cardState === "no-space" && openFolderEnabled) || manageVisible
     readonly property string selectionMark: ["no-space", "no-network", "offline-user",
         "policy"].indexOf(cardState) >= 0 ? "blocked"
-        : badge !== "" || busy || cardState === "installed" ? "locked"
+        : badge !== "" || busy || cardState === "installed"
+            || cardState === "paused-no-space" ? "locked"
         : selected ? "on" : "off"
     readonly property real selectBorderWidth: Theme.modelCardSelectBorder
     readonly property real footerIndent: Theme.modelCardSelectSize + Theme.modelCardSelectGap
@@ -252,7 +258,7 @@ Rectangle {
                     CardBadge {
                         visible: root.recommended
                         text: qsTr("Рекомендуем")
-                        color: root.highlighted ? Theme.bgSurface : Theme.primaryBg
+                        color: root.highlighted || root.busy ? Theme.bgSurface : Theme.primaryBg
                         textColor: Theme.primary
                     }
                     CardBadge {
@@ -459,19 +465,14 @@ Rectangle {
             visible: root.busy || root.hasMessage || root.showHint || root.manageVisible
                 || (root.cardState === "updating" && root.updateActionsAvailable)
             Layout.maximumWidth: footer.width * Theme.modelCardFooterActionsMaxShare
-            Layout.preferredWidth: {
-                var total = 0;
-                var count = 0;
-                for (var i = 0; i < children.length; ++i) {
-                    if (children[i].visible && children[i].implicitWidth > 0) {
-                        total += children[i].implicitWidth;
-                        ++count;
-                    }
-                }
-                return total + Math.max(0, count - 1) * spacing + Theme.cardBorder;
-            }
-            Layout.alignment: Qt.AlignTop
+            Layout.preferredWidth: implicitWidth
+            Layout.alignment: Qt.AlignRight | Qt.AlignTop
             spacing: Theme.modelCardFooterActionsGap
+            Item {
+                visible: root.busy
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+            }
             Icon {
                 objectName: "messageAlert"
                 visible: root.messageError
@@ -491,7 +492,8 @@ Rectangle {
                         ? qsTr("Включена работа без сети")
                     : root.cardState === "policy"
                         ? qsTr("Выбор ограничен администратором")
-                    : root.cardState === "no-space" ? qsTr("Не хватает места на диске")
+                    : root.cardState === "no-space" || root.cardState === "paused-no-space"
+                        ? qsTr("Не хватает места на диске")
                     : root.cardState === "sha-failed"
                         ? qsTr("Файл не прошёл проверку — загруженное удалено")
                     : root.cardState === "broken" || root.cardState === "corrupted"
@@ -528,27 +530,35 @@ Rectangle {
                     || root.cardState === "not-recommended"
                     ? Theme.warningInk : Theme.fgMuted
             }
-            AvButton {
-                visible: root.cardState === "downloading" || root.cardState === "queued"
-                    || (root.cardState === "updating" && root.updateActionsAvailable)
-                Layout.minimumWidth: visible ? implicitWidth : 0
-                small: true
-                text: qsTr("Отмена")
-                onClicked: root.cancelRequested()
-            }
             FooterText {
                 visible: root.cardState === "verifying"
                 text: qsTr("Отмена недоступна")
-                color: Theme.fgDisabled
+                color: Theme.fgMuted
             }
             AvButton {
-                visible: root.cardState === "failed" || root.cardState === "sha-failed"
+                visible: ((root.cardState === "failed" || root.cardState === "sha-failed"
+                    || root.cardState === "paused-no-space") && root.canRetry)
                     || (root.cardState === "update-failed" && root.updateActionsAvailable)
                 Layout.minimumWidth: visible ? implicitWidth : 0
                 small: true
                 variant: "primary"
                 text: qsTr("Повторить")
                 onClicked: root.retryRequested()
+            }
+            AvButton {
+                visible: (root.cardState === "downloading" && root.canCancel)
+                    || (root.cardState === "queued" && root.canDequeue)
+                    || (root.cardState === "paused-no-space" && root.canCancel)
+                    || (root.cardState === "updating" && root.updateActionsAvailable)
+                Layout.minimumWidth: visible ? implicitWidth : 0
+                small: true
+                text: qsTr("Отмена")
+                onClicked: {
+                    if (root.cardState === "queued")
+                        root.dequeueRequested();
+                    else
+                        root.cancelRequested();
+                }
             }
             AvButton {
                 visible: root.cardState === "sha-failed" && root.detailsActionAvailable

@@ -8,7 +8,9 @@ Rectangle {
 
     property string downloadState: "idle" // idle | downloading | verifying | done | failed | no-space
     property string title: ""
+    property string downloadCounter: ""
     property real progress: 0
+    property string sourceText: ""
     property string speed: ""
     property string eta: ""
     // Уточнение к заголовку: «нужно ещё 126 МБ» при нехватке места (§10.3).
@@ -20,7 +22,9 @@ Rectangle {
 
     property bool doneExpired: false
     readonly property bool hasError: downloadState === "failed" || downloadState === "no-space"
-    readonly property string tail: [speed, eta].filter(function(part) {
+    readonly property string tail: [sourceText, speed,
+        downloadState === "downloading" && speed === "" && eta === "" ? qsTr("считаю…") : eta
+    ].filter(function(part) {
         return part !== "";
     }).join(qsTr(" · "))
 
@@ -87,6 +91,31 @@ Rectangle {
                 : root.hasError ? Theme.dangerInk : Theme.onboardingProgressStripTextColor
         }
 
+        Text {
+            objectName: "downloadCounter"
+            visible: root.downloadState === "downloading" && root.downloadCounter !== ""
+            Layout.minimumWidth: visible ? implicitWidth : 0
+            text: root.downloadCounter
+            textFormat: Text.PlainText
+            renderType: Text.NativeRendering
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.onboardingProgressStripTailSize
+            color: Theme.fgMuted
+        }
+
+        Text {
+            objectName: "downloadDetail"
+            visible: root.downloadState === "no-space" && root.detail !== ""
+            Layout.minimumWidth: visible ? implicitWidth : 0
+            text: root.detail
+            textFormat: Text.PlainText
+            renderType: Text.NativeRendering
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.onboardingProgressStripTailSize
+            wrapMode: Text.NoWrap
+            color: Theme.onboardingProgressStripTailColor
+        }
+
         Item {
             Layout.fillWidth: true
         }
@@ -132,18 +161,6 @@ Rectangle {
                 loops: Animation.Infinite
                 running: root.visible && root.downloadState === "verifying" && !root.freezeAnimations
             }
-        }
-
-        Text {
-            visible: root.downloadState === "no-space" && root.detail !== ""
-            Layout.minimumWidth: implicitWidth
-            text: root.detail
-            textFormat: Text.PlainText
-            renderType: Text.NativeRendering
-            font.family: Theme.fontUi
-            font.pixelSize: Theme.onboardingProgressStripTailSize
-            wrapMode: Text.NoWrap
-            color: Theme.onboardingProgressStripTailColor
         }
 
         Text {

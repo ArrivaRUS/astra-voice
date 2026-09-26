@@ -72,6 +72,12 @@ Item {
                 badge: modelData.badge
                 cardState: modelData.state
                 message: modelData.message
+                canCancel: modelData.canCancel !== undefined ? modelData.canCancel
+                    : modelData.state === "downloading" || modelData.state === "paused-no-space"
+                canRetry: modelData.canRetry !== undefined ? modelData.canRetry
+                    : modelData.state === "failed" || modelData.state === "paused-no-space"
+                canDequeue: modelData.canDequeue !== undefined ? modelData.canDequeue
+                    : modelData.state === "queued"
                 hint: modelData.hint !== undefined ? modelData.hint : ""
                 hintKind: modelData.hintKind !== undefined ? modelData.hintKind : ""
                 memoryShortage: modelData.memoryShortage === true
@@ -83,7 +89,8 @@ Item {
                 tags: modelData.tags
                 onToggleRequested: { if (root.bridge) root.bridge.toggleModel(modelData.id); }
                 onRetryRequested: { if (root.bridge) root.bridge.retryModel(modelData.id); }
-                onCancelRequested: { if (root.bridge) root.bridge.cancelDownloads(); }
+                onCancelRequested: { if (root.bridge) root.bridge.cancelModel(modelData.id); }
+                onDequeueRequested: { if (root.bridge) root.bridge.dequeueModel(modelData.id); }
                 openFolderEnabled: root.bridge !== null
                 onOpenFolderRequested: { if (root.bridge) root.bridge.openModelsFolder(); }
             }
@@ -99,8 +106,7 @@ Item {
         Text {
             objectName: "selectionSummary"
             Layout.maximumWidth: summary.width
-            text: root.bridge && root.bridge.selectionSummary !== ""
-                ? root.bridge.selectionSummary : qsTr("Пока ничего не выбрано")
+            text: root.bridge ? root.bridge.selectionLine : qsTr("Пока ничего не выбрано")
             textFormat: Text.PlainText
             color: root.bridge && root.bridge.selectionFits === false
                 ? Theme.onboardingSummaryLineColorWarn : Theme.onboardingSummaryLineColor

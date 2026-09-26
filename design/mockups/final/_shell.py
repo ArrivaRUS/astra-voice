@@ -547,7 +547,7 @@ DL_STATES = [
 
 
 def dlbar(state, name="GigaAM v3 RNN-T", queue=""):
-    """Полоска загрузки модели. queue — «· 1 из 2», показывается только когда моделей больше одной."""
+    """Полоска загрузки модели. queue — «1 из 2», показывается только когда моделей больше одной."""
     q = f' <span class="tail">{queue}</span>' if queue else ""
     track = '<span class="prog" style="width:160px;flex:none"><i style="width:43%"></i></span>'
     ind = '<span class="prog ind" style="width:160px;flex:none"><i></i></span>'

@@ -58,6 +58,8 @@ def test_session_kind_in_format(log_dir: Path) -> None:
 def test_debug_flag_raises_level(log_dir: Path) -> None:
     av_logging.setup_logging("OTHER", debug=True, directory=log_dir)
     assert logging.getLogger().level == logging.DEBUG
+    assert logging.getLogger("urllib3").getEffectiveLevel() >= logging.WARNING
+    assert logging.getLogger("requests").getEffectiveLevel() >= logging.WARNING
     av_logging.setup_logging("OTHER", directory=log_dir)
     assert logging.getLogger().level == logging.INFO
 
