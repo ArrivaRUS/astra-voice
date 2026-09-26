@@ -135,6 +135,7 @@ def test_dry_run(repo: tuple[Path, dict[str, str]]) -> None:
     assert "git push origin refs/tags/v0.1.0" in result.stdout
     assert "ПРЕДУПРЕЖДЕНИЕ: CI НЕ проверен (--skip-ci-check)" in result.stdout
     assert "dry-run: ничего не создано" in result.stdout
+    assert result.stdout.count("связка ключей в белом списке") == 1
     for asset in (
         "astra-voice_*.deb",
         "sbom.cdx.json",

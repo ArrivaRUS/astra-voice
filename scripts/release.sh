@@ -57,7 +57,7 @@ for asset in docs/INSTALL-ADMIN.md data/keys/release.gpg; do
         check "$asset отсутствует или не отслеживается Git" false
     fi
 done
-if python3 scripts/check_keyring.py data/keys/release.gpg; then
+if python3 scripts/check_keyring.py data/keys/release.gpg >/dev/null; then
     check 'связка ключей в белом списке' true
 else
     check 'связка ключей в белом списке' false

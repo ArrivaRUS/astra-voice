@@ -8,10 +8,13 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 
 import pytest
+
+import astra_voice.security.verify as verify_module
 
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]
@@ -194,3 +197,151 @@ def test_cli_usage() -> None:
         ).returncode
         == 2
     )
+
+
+@contextmanager
+def generated_bundle(
+    tmp_path: Path, expirations: tuple[str, ...] = (), second_master: bool = False
+) -> Iterator[tuple[Path, str, str | None, Path]]:
+    if any(shutil.which(name) is None for name in ("gpg", "gpgconf")):
+        pytest.skip("нет gpg или gpgconf")
+    home = tmp_path / "generated-gnupg"
+    home.mkdir(mode=0o700)
+    env = {**os.environ, "GNUPGHOME": str(home)}
+
+    def gpg(*args: str) -> bytes:
+        return subprocess.run(
+            [
+                "gpg",
+                "--batch",
+                "--no-tty",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                *args,
+            ],
+            env=env,
+            capture_output=True,
+            timeout=30,
+            check=True,
+        ).stdout
+
+    try:
+        gpg("--quick-gen-key", "Bundle <b@example.invalid>", "ed25519", "cert", "never")
+        listing = gpg("--with-colons", "--list-keys").decode()
+        master = next(
+            line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")
+        )
+        for expiration in expirations:
+            gpg("--quick-add-key", master, "ed25519", "sign", expiration)
+        public = tmp_path / "release.gpg"
+        public.write_bytes(gpg("--export", master))
+        other: str | None = None
+        if second_master:
+            gpg("--quick-gen-key", "Other <o@example.invalid>", "ed25519", "cert", "never")
+            listing = gpg("--with-colons", "--list-keys").decode()
+            other = [
+                line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")
+            ][-1]
+            public.write_bytes(public.read_bytes() + gpg("--export", other))
+        yield public, master, other, home
+    finally:
+        subprocess.run(["gpgconf", "--kill", "gpg-agent"], env=env, check=False, timeout=10)
+
+
+def test_public_plus_secret_packets(tmp_path: Path, check: Check) -> None:
+    with generated_bundle(tmp_path) as (public, master, _, home):
+        secret = subprocess.run(
+            ["gpg", "--batch", "--export-secret-keys", master],
+            env={**os.environ, "GNUPGHOME": str(home)},
+            capture_output=True,
+            check=True,
+            timeout=30,
+        ).stdout
+        public.write_bytes(public.read_bytes() + secret)
+        ok, messages = check(public, frozenset({master}), frozenset(), None)
+        assert not ok
+        assert "секретные пакеты" in " ".join(messages)
+
+
+def test_secret_only_packets(tmp_path: Path, check: Check) -> None:
+    with generated_bundle(tmp_path) as (public, master, _, home):
+        public.write_bytes(
+            subprocess.run(
+                ["gpg", "--batch", "--export-secret-keys", master],
+                env={**os.environ, "GNUPGHOME": str(home)},
+                capture_output=True,
+                check=True,
+                timeout=30,
+            ).stdout
+        )
+        ok, messages = check(public, frozenset({master}), frozenset(), None)
+        assert not ok
+        assert "секретные пакеты" in " ".join(messages)
+
+
+def test_pinned_plus_unpinned_primary_rejected(tmp_path: Path, check: Check) -> None:
+    with generated_bundle(tmp_path, second_master=True) as (public, master, other, _):
+        ok, messages = check(public, frozenset({master}), frozenset(), None)
+        assert not ok
+        assert "первичный ключ не закреплён" in " ".join(messages)
+        assert other is not None and other in " ".join(messages)
+
+
+def test_two_pinned_primary_keys(tmp_path: Path, check: Check) -> None:
+    with generated_bundle(tmp_path, second_master=True) as (public, master, other, _):
+        assert other is not None
+        ok, messages = check(public, frozenset({master, other}), frozenset(), None)
+        assert ok is True
+        assert messages == []
+
+
+def test_two_pinned_one_revoked_primary_rejected(tmp_path: Path, check: Check) -> None:
+    with generated_bundle(tmp_path, second_master=True) as (public, master, other, _):
+        assert other is not None
+        ok, messages = check(public, frozenset({master, other}), frozenset({other}), None)
+        assert not ok
+        assert "первичный ключ отозван" in " ".join(messages)
+        assert other in " ".join(messages)
+
+
+@pytest.mark.parametrize(
+    ("expirations", "expected"),
+    [
+        (("2030-01-01", "2030-01-01"), True),
+        (("2030-01-01", "2031-01-01"), False),
+        (("never", "never"), False),
+    ],
+)
+def test_expiration_warning(tmp_path: Path, expirations: tuple[str, ...], expected: bool) -> None:
+    namespace = runpy.run_path(str(ROOT / "scripts/check_keyring.py"))
+    warn = cast(Callable[[Path, str | None], list[str]], namespace["warnings"])
+    with generated_bundle(tmp_path, expirations) as (public, _, _, _):
+        messages = warn(public, None)
+        assert bool(messages) is expected
+        if expected:
+            assert "ПРЕДУПРЕЖДЕНИЕ" not in messages[0]
+            assert "2030-01-01" in messages[0]
+
+
+def test_warning_printed_to_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    namespace = runpy.run_path(str(ROOT / "scripts/check_keyring.py"))
+    main = cast(Callable[[], int], namespace["main"])
+    with generated_bundle(tmp_path, ("2030-01-01", "2030-01-01")) as (
+        public,
+        master,
+        _,
+        _,
+    ):
+        monkeypatch.setattr(verify_module, "PINNED_FINGERPRINTS", frozenset({master}))
+        monkeypatch.setattr(verify_module, "REVOKED_FINGERPRINTS", frozenset())
+        monkeypatch.setattr(sys, "argv", ["check_keyring.py", str(public)])
+        assert main() == 0
+        output = capsys.readouterr()
+        assert (
+            "ПРЕДУПРЕЖДЕНИЕ: все подписывающие подключи истекают в один день (2030-01-01)"
+            in output.err
+        )

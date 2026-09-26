@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,14 +28,10 @@ def check(
     try:
         with tempfile.TemporaryDirectory(prefix="astra-keyring-") as home:
             os.chmod(home, 0o700)
+            command = [executable, "--homedir", home, "--batch", "--no-tty", "--with-colons"]
             result = subprocess.run(
                 [
-                    executable,
-                    "--homedir",
-                    home,
-                    "--batch",
-                    "--no-tty",
-                    "--with-colons",
+                    *command,
                     "--show-keys",
                     str(keyring),
                 ],
@@ -44,11 +41,26 @@ def check(
                 timeout=30,
                 check=False,
             )
+            packets = subprocess.run(
+                [*command, "--list-packets", str(keyring)],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "LC_ALL": "C", "GNUPGHOME": home},
+                timeout=30,
+                check=False,
+            )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, [f"не удалось проверить связку: {exc}"]
+    if ":secret key packet:" in packets.stdout or ":secret sub key packet:" in packets.stdout:
+        return False, ["в публичной связке есть секретные пакеты"]
     if result.returncode != 0:
         return False, [
             f"gpg не смог прочитать связку (код {result.returncode}): {result.stderr.strip()}"
+        ]
+    if packets.returncode != 0:
+        return False, [
+            f"gpg не смог разобрать пакеты связки (код {packets.returncode}): "
+            f"{packets.stderr.strip()}"
         ]
 
     allowed = {value.upper() for value in pinned}
@@ -82,6 +94,56 @@ def check(
     return not errors, errors
 
 
+def warnings(keyring: Path, gpg: str | None = None) -> list[str]:
+    """Предупредить об общей дате истечения подписывающих подключей."""
+    executable = gpg if gpg is not None else shutil.which("gpg")
+    if executable is None:
+        return []
+    try:
+        with tempfile.TemporaryDirectory(prefix="astra-keyring-") as home:
+            os.chmod(home, 0o700)
+            result = subprocess.run(
+                [
+                    executable,
+                    "--homedir",
+                    home,
+                    "--batch",
+                    "--no-tty",
+                    "--with-colons",
+                    "--show-keys",
+                    str(keyring),
+                ],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "LC_ALL": "C", "GNUPGHOME": home},
+                timeout=30,
+                check=False,
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode:
+        return []
+    dates: list[str | None] = []
+    for line in result.stdout.splitlines():
+        fields = line.split(":")
+        if fields[0] != "sub" or len(fields) <= 11:
+            continue
+        if fields[1] in ("r", "e") or "s" not in fields[11]:
+            continue
+        expiry = fields[6]
+        dates.append(
+            datetime.fromtimestamp(int(expiry), UTC).date().isoformat()
+            if expiry.isdigit()
+            else None
+        )
+    if len(dates) >= 2 and dates[0] is not None and len(set(dates)) == 1:
+        return [
+            f"все подписывающие подключи истекают в один день ({dates[0]})"
+            " — резерв не даёт запаса времени"
+        ]
+    return []
+
+
 def main() -> int:
     """Разобрать CLI и прочитать пины из единственного источника."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -97,6 +159,8 @@ def main() -> int:
     for message in messages:
         print(f"ОШИБКА: {message}", file=sys.stderr)
     if ok:
+        for message in warnings(args.keyring):
+            print(f"ПРЕДУПРЕЖДЕНИЕ: {message}", file=sys.stderr)
         print("OK: связка ключей в белом списке")
     return 0 if ok else 1
 

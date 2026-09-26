@@ -211,7 +211,7 @@ def release(args: argparse.Namespace) -> int:
                 revoked=verify_module.REVOKED_FINGERPRINTS,
             ).verify_detached(sums_copy, sig_copy)
             signature_ok = result.ok
-            signature_detail = result.primary_fingerprint or "" if result.ok else result.reason
+            signature_detail = (result.primary_fingerprint or "") if result.ok else result.reason
     record("signature", signature_ok, signature_detail)
 
     sums_detail = "SHA256SUMS отсутствует"

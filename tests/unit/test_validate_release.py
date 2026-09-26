@@ -309,8 +309,16 @@ def test_signature_tampered_sums(
 ) -> None:
     with (assets.dist / "SHA256SUMS").open("ab") as output:
         output.write(b"x")
+    reason = (
+        verify_module.Verifier("release", assets.keyring, pinned=frozenset({assets.fingerprint}))
+        .verify_detached(assets.dist / "SHA256SUMS", assets.dist / "SHA256SUMS.asc")
+        .reason
+    )
     checks = release_checks(validate, assets, capsys)
     assert checks["signature"]["ok"] is False
+    assert reason
+    assert checks["signature"]["detail"] == reason
+    assert checks["signature"]["detail"] != assets.fingerprint
     assert checks["release.gpg"]["ok"] is True
     assert checks["deb"]["ok"] is True
     assert checks["latest.json"]["ok"] is True
@@ -415,6 +423,10 @@ def test_unpinned_signature(
     monkeypatch.setattr(verify_module, "PINNED_FINGERPRINTS", frozenset({"0" * 40}))
     checks = release_checks(validate, assets, capsys)
     assert checks["signature"]["ok"] is False
+    detail = str(checks["signature"]["detail"])
+    assert "не закреплён" in detail
+    assert detail != assets.fingerprint
+    assert re.fullmatch(r"[0-9A-Fa-f]{40}", detail) is None
     assert checks["sha256"]["ok"] is True
     assert checks["release.gpg"]["ok"] is True
 
@@ -428,6 +440,10 @@ def test_revoked_signature(
     monkeypatch.setattr(verify_module, "REVOKED_FINGERPRINTS", frozenset({assets.fingerprint}))
     checks = release_checks(validate, assets, capsys)
     assert checks["signature"]["ok"] is False
+    detail = str(checks["signature"]["detail"])
+    assert "отозван" in detail
+    assert detail != assets.fingerprint
+    assert re.fullmatch(r"[0-9A-Fa-f]{40}", detail) is None
     assert checks["sha256"]["ok"] is True
     assert checks["release.gpg"]["ok"] is True
 

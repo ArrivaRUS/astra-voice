@@ -324,8 +324,10 @@ jobs:
           export GNUPGHOME="$(mktemp -d)"
           chmod 700 "$GNUPGHOME"
           printf '%s' "$GPG_SIGNING_KEY" | gpg --batch --quiet --import
-          gpg --batch --yes --detach-sign --armor --output SHA256SUMS.asc SHA256SUMS
+          SIGNING_FPR="$(python3 ../scripts/check_signing_secret.py secret --homedir "$GNUPGHOME" --keyring ../data/keys/release.gpg)" || { echo '::error::Секрет подписи не прошёл проверку состава'; exit 1; }
+          gpg --batch --yes --local-user "${SIGNING_FPR}!" --detach-sign --armor --output SHA256SUMS.asc SHA256SUMS
           gpgv --keyring ../data/keys/release.gpg SHA256SUMS.asc SHA256SUMS
+          python3 ../scripts/check_signing_secret.py signature --keyring ../data/keys/release.gpg --subkey "$SIGNING_FPR" SHA256SUMS.asc SHA256SUMS
           rm -rf "$GNUPGHOME"
       - name: Публикация
         env:
