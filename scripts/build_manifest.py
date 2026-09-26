@@ -9,7 +9,7 @@
     python3 scripts/build_manifest.py --refresh   # обновить снимок метаданных (сеть)
     python3 scripts/build_manifest.py             # пересобрать data/catalog.json
     python3 scripts/build_manifest.py --check     # сравнить с репозиторием (CI, без сети)
-    python3 scripts/build_manifest.py --sign --homedir ~/.cache/astra-voice-spike/gpg
+    python3 scripts/build_manifest.py --sign --homedir <каталог GnuPG с подключом S1>
 
 Правило оперативной памяти — из `research/catalog-numbers.md`: сумма байт
 `.onnx`-файлов рантайма, умноженная на 1,85 и округлённая вверх до целых МБ.
@@ -27,8 +27,10 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import subprocess  # nosec B404 — вызывается только явный gpg с фиксированным argv
 import sys
+import tempfile
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +43,7 @@ CACHE_PATH = DATA / "catalog-hf-cache.json"
 CATALOG_PATH = DATA / "catalog.json"
 SCHEMA_PATH = DATA / "catalog.schema.json"
 SIGNATURE_PATH = DATA / "catalog.json.sig"
+KEYRING_PATH = DATA / "keys" / "release.gpg"
 
 API_BASE = "https://huggingface.co/api/models"
 RESOLVE_BASE = "https://huggingface.co"
@@ -234,6 +237,9 @@ def _current() -> dict[str, Any] | None:
 
 
 def _sign(homedir: Path, key: str) -> None:
+    expected = key.removesuffix("!").upper()
+    if re.fullmatch(r"[0-9A-F]{40}", expected) is None:
+        raise BuildError("--key должен быть отпечатком подключа (40 hex)")
     argv = [
         "gpg",
         "--homedir",
@@ -241,7 +247,7 @@ def _sign(homedir: Path, key: str) -> None:
         "--batch",
         "--yes",
         "--local-user",
-        key,
+        expected + "!",
         "--detach-sign",
         "--output",
         str(SIGNATURE_PATH),
@@ -250,6 +256,33 @@ def _sign(homedir: Path, key: str) -> None:
     result = subprocess.run(argv, check=False)  # nosec B603 — argv фиксирован, shell не нужен
     if result.returncode != 0:
         raise BuildError("gpg не подписал каталог.")
+    with tempfile.TemporaryDirectory(prefix="astra-voice-gpgv-") as empty_home:
+        verify_argv = [
+            "gpgv",
+            "--status-fd",
+            "1",
+            "--homedir",
+            empty_home,
+            "--keyring",
+            str(KEYRING_PATH.resolve()),
+            str(SIGNATURE_PATH),
+            str(CATALOG_PATH),
+        ]
+        try:
+            verified = subprocess.run(  # nosec B603 — argv фиксирован, shell не нужен
+                verify_argv, capture_output=True, text=True, check=False
+            )
+        except OSError as exc:
+            raise BuildError(f"gpgv не подтвердил подпись встроенной связкой: {exc}") from exc
+    valid = [
+        line.split()[2].upper()
+        for line in verified.stdout.splitlines()
+        if line.startswith("[GNUPG:] VALIDSIG ") and len(line.split()) > 2
+    ]
+    if verified.returncode != 0 or len(valid) != 1:
+        raise BuildError("gpgv не подтвердил подпись встроенной связкой")
+    if valid[0] != expected:
+        raise BuildError(f"каталог подписан не тем ключом: {valid[0]}, ожидался {expected}")
     print(f"подписан: {SIGNATURE_PATH.relative_to(REPO)}")
 
 
@@ -266,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--homedir", type=Path, help="каталог GnuPG с закрытым ключом подписи")
     parser.add_argument(
         "--key",
-        default="CB951AD794407972A0B1A5BBAFA87398C4953A71",
+        default="7602A029F0E34CD2344A9CDA657ED04689FF4D79",
         help="отпечаток ключа подписи",
     )
     args = parser.parse_args(argv)
