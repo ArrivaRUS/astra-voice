@@ -1643,9 +1643,11 @@ from PyQt5.QtCore import QObject
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtQuick import QQuickView
 from astra_voice.ui.pill import Pill, PillState, ERROR_MICROPHONE_UNAVAILABLE
+from astra_voice.ui.icons import install_icon_provider
 
 app = QApplication([])
 view = QQuickView()
+install_icon_provider(view.engine())
 pill = Pill(view_factory=lambda: view)
 root = view.rootObject()
 presentation = next(

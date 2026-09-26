@@ -18,6 +18,7 @@ from PyQt5.QtQuick import QQuickView
 from astra_voice.core.paths import qml_dir
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.x11 import X11Display
+from astra_voice.ui.icons import install_icon_provider
 
 log = logging.getLogger(__name__)
 
@@ -147,6 +148,7 @@ class Pill(QObject):
 
         factory = view_factory if view_factory is not None else lambda: QQuickView()
         self._view = factory()
+        install_icon_provider(self._view.engine())
         self._view.installEventFilter(self)
         # QWindow.setParent принимает QWindow; здесь нужно именно владение QObject.
         self.destroyed.connect(self._view.deleteLater)

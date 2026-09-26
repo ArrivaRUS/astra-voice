@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 import sys
@@ -36,12 +37,13 @@ from PyQt5.QtCore import (
     pyqtSlot,
     qInstallMessageHandler,
 )
-from PyQt5.QtGui import QColor, QImage
+from PyQt5.QtGui import QColor, QGuiApplication, QImage
 from PyQt5.QtQml import QQmlApplicationEngine, QQmlComponent
 from PyQt5.QtQuick import QQuickView, QQuickWindow
 from PyQt5.QtTest import QTest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
@@ -1543,6 +1545,7 @@ def render_onboarding(
 
     previous = qInstallMessageHandler(handler)
     view = QQuickView()
+    install_icon_provider(view.engine())
     theme = FakeTheme(dark)
     try:
         view.rootContext().setContextProperty("onboarding", fake)
@@ -1601,6 +1604,7 @@ def render_settings(
 
     previous = qInstallMessageHandler(handler)
     engine = QQmlApplicationEngine()
+    install_icon_provider(engine)
     theme = FakeTheme(dark)
     settings = fake if fake is not None else FakeSettings()
     try:
@@ -1665,6 +1669,142 @@ def render_settings(
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_section_frame_has_no_card_icons_after_models_scroll(
+    onboarding_app: Any, dark: bool
+) -> None:
+    messages: list[str] = []
+
+    def handler(_mode: Any, _context: Any, message: str) -> None:
+        messages.append(message)
+
+    previous = qInstallMessageHandler(handler)
+    engine = QQmlApplicationEngine()
+    install_icon_provider(engine)
+    theme = FakeTheme(dark)
+    settings = FakeSettings()
+    settings.models = [
+        *settings.models,
+        *[
+            {**copy.deepcopy(settings.models[1]), "id": f"extra-{i}", "name": f"T-one {i}"}
+            for i in range(10)
+        ],
+    ]
+    app = onboarding_app
+    try:
+        engine.rootContext().setContextProperty("themeSource", theme)
+        engine.rootContext().setContextProperty("showOnboarding", False)
+        engine.rootContext().setContextProperty("settingsBridge", settings)
+        engine.load(QUrl.fromLocalFile(str(REPO / "qml/Main.qml")))
+        roots = engine.rootObjects()
+        assert len(roots) == 1, messages
+        window = roots[0]
+        assert isinstance(window, QQuickWindow)
+        window_height = 588
+        window.setWidth(1024)
+        window.setHeight(window_height)
+        assert window.setProperty("freezeAnimations", True)
+        window.show()
+        QTest.qWait(250)
+        app.processEvents()
+        assert window.isVisible() and window.isExposed()
+        body = next(
+            item
+            for item in visual_tree(window.contentItem())
+            if item.metaObject().className() == "QQuickFlickable"
+        )
+        top = round(body.mapToScene(QPointF(0, 0)).y())
+        bottom = top + round(body.height())
+
+        def capture() -> QImage:
+            QTest.qWait(80)
+            app.processEvents()
+            # QQuickWindow.grabWindow() рисует кадр заново и прячет дефект:
+            # он остаётся только в уже нарисованном буфере окна.
+            screen = QGuiApplication.primaryScreen()
+            assert screen is not None
+            image = screen.grabWindow(window.winId()).toImage()
+            if image.isNull():
+                message = "Qt/offscreen не отдал буфер окна"
+                if (
+                    os.environ.get("QT_QPA_PLATFORM") == "xcb"
+                    or os.environ.get("ASTRA_VOICE_REQUIRE_QT") == "1"
+                ):
+                    pytest.fail(message)
+                pytest.skip(message)
+            first = image.pixel(0, 0)
+            if not any(
+                image.pixel(x, y) != first
+                for y in range(image.height())
+                for x in range(image.width())
+            ):
+                message = "Qt/offscreen отдал одноцветный буфер окна"
+                if (
+                    os.environ.get("QT_QPA_PLATFORM") == "xcb"
+                    or os.environ.get("ASTRA_VOICE_REQUIRE_QT") == "1"
+                ):
+                    pytest.fail(message)
+                pytest.skip(message)
+            return image
+
+        def settle_local_pointer() -> None:
+            QTest.mouseMove(window, QPoint(1, window.height() - 2))
+            app.processEvents()
+            QTest.qWait(20)
+            app.processEvents()
+
+        def strip(image: QImage, y0: int, y1: int) -> QImage:
+            dpr = image.devicePixelRatio()
+            start, end = round(y0 * dpr), round(y1 * dpr)
+            assert 0 <= start < end <= image.height(), (start, end, image.height())
+            return image.copy(0, start, image.width(), end - start)
+
+        def assert_same(actual: QImage, expected: QImage, label: str) -> None:
+            assert actual.size() == expected.size()
+            changed = sum(
+                actual.pixel(x, y) != expected.pixel(x, y)
+                for y in range(actual.height())
+                for x in range(actual.width())
+            )
+            assert actual == expected, f"{label}: {changed} отличающихся пикселей"
+
+        settle_local_pointer()
+        clean = capture()
+        select_section(app, window, "models")
+        models_top = capture()
+        maximum = max(float(body.property("contentHeight")) - body.height(), 0.0)
+        assert maximum > 0, "раздел моделей не прокручивается"
+        for y in [*range(0, int(maximum), 12), maximum]:
+            body.setProperty("contentY", y)
+            QTest.qWait(16)
+            app.processEvents()
+        models_scrolled = capture()
+        select_section(app, window, "general")
+        settle_local_pointer()
+        after = capture()
+
+        assert_same(strip(after, 0, top), strip(clean, 0, top), "шапка после прокрутки")
+        assert_same(
+            strip(after, bottom, window.height()),
+            strip(clean, bottom, window.height()),
+            "строка состояния после прокрутки",
+        )
+        assert_same(
+            strip(models_scrolled, 0, top),
+            strip(models_top, 0, top),
+            "шапка раздела моделей после прокрутки",
+        )
+        assert_no_messages(messages, "раздел после прокрутки моделей")
+    finally:
+        try:
+            sip.delete(engine)
+            sip.delete(settings)
+            sip.delete(theme)
+            app.processEvents()
+        finally:
+            qInstallMessageHandler(previous)
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_menu_and_show_section_switch_real_sections(onboarding_app: Any, dark: bool) -> None:
     """Каждый пункт меню открывает свой раздел; из Python переход делает showSection."""
     messages: list[str] = []
@@ -1674,6 +1814,7 @@ def test_menu_and_show_section_switch_real_sections(onboarding_app: Any, dark: b
 
     previous = qInstallMessageHandler(handler)
     engine = QQmlApplicationEngine()
+    install_icon_provider(engine)
     app_info = FakeAppInfo()
     theme = FakeTheme(dark)
     settings = FakeSettings()

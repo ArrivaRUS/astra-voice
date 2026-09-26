@@ -61,6 +61,7 @@ from astra_voice.ui.bridges import (
     SettingsBridge,
 )
 from astra_voice.ui.hotkey_capture import CaptureHost, HotkeyCapture
+from astra_voice.ui.icons import install_icon_provider
 from astra_voice.ui.model_downloads import (
     ModelDownloads,
     ModelPort,
@@ -852,6 +853,7 @@ def test_qml_accepts_bridge_after_loading_and_observes_changes() -> None:
     from astra_voice.app import _set_context_property
 
     engine = QQmlEngine()
+    install_icon_provider(engine)
     component = QQmlComponent(engine)
     component.setData(
         b"import QtQml 2.15; QtObject { "
