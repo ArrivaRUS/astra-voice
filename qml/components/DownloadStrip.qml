@@ -9,6 +9,7 @@ Rectangle {
     property string downloadState: "idle" // idle | downloading | verifying | done | failed | no-space
     property string title: ""
     property real progress: 0
+    property string sourceText: ""
     property string speed: ""
     property string eta: ""
     // Уточнение к заголовку: «нужно ещё 126 МБ» при нехватке места (§10.3).
@@ -20,7 +21,7 @@ Rectangle {
 
     property bool doneExpired: false
     readonly property bool hasError: downloadState === "failed" || downloadState === "no-space"
-    readonly property string tail: [speed, eta].filter(function(part) {
+    readonly property string tail: [sourceText, speed, eta].filter(function(part) {
         return part !== "";
     }).join(qsTr(" · "))
 

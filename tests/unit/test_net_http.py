@@ -363,18 +363,14 @@ def test_download_and_headers(
     assert "Cookie" not in headers
 
 
-def test_download_logs_only_host(
+def test_download_does_not_log_host_or_url(
     client: HttpClient, local_server: LocalServer, caplog: pytest.LogCaptureFixture
 ) -> None:
     url = local_server.url + "/private-model?private_token=secret-value#private-fragment"
     with caplog.at_level(logging.INFO, logger=http.__name__):
         with client.get_stream(url, deadline_s=2, cancel=threading.Event()) as response:
             assert b"".join(response.iter_chunks()) == _BODY
-    (record,) = [record for record in caplog.records if record.name == http.__name__]
-    assert record.levelno == logging.INFO
-    assert record.getMessage() == f"Запрос к {urlsplit(url).hostname}"
-    for private in ("private-model", "private_token", "secret-value", "private-fragment"):
-        assert private not in record.getMessage()
+    assert not [record for record in caplog.records if record.name == http.__name__]
 
 
 def test_stream_socket_is_available(client: HttpClient, local_server: LocalServer) -> None:
@@ -430,10 +426,7 @@ def test_relative_redirect_without_cookies(
         assert response.url == local_server.url + "/ok"
         assert b"".join(response.iter_chunks()) == _BODY
     assert len(local_server.requests) == 2
-    assert [record for record in caplog.record_tuples if record[0] == http.__name__] == [
-        (http.__name__, logging.INFO, "Запрос к 127.0.0.1"),
-        (http.__name__, logging.INFO, "Запрос к 127.0.0.1"),
-    ]
+    assert not [record for record in caplog.record_tuples if record[0] == http.__name__]
     assert "Cookie" not in local_server.requests[-1][1]
     assert "Authorization" not in local_server.requests[-1][1]
 
@@ -538,7 +531,98 @@ def test_bad_status(
     with pytest.raises(NetworkError, match=str(status)) as caught:
         client.get_stream(f"{local_server.url}/{status}", deadline_s=2, cancel=threading.Event())
     assert caught.value.code == "bad-status"
+    assert caught.value.status == status
     sessions[0].close.assert_called_once()
+
+
+def test_extra_host_is_exact_and_port_is_pinned() -> None:
+    allowed = ("corp.example:8443",)
+    assert http._validate_url("https://corp.example:8443/models", allowed) == "corp.example"
+    with pytest.raises(NetworkError) as without_extra:
+        http._validate_url("https://corp.example:8443/models")
+    assert without_extra.value.code == "not-allowed"
+    for url in (
+        "https://sub.corp.example:8443/models",
+        "https://corp.example:8444/models",
+        "https://user@corp.example:8443/models",
+        "http://corp.example:8443/models",
+    ):
+        with pytest.raises(NetworkError) as caught:
+            http._validate_url(url, allowed)
+        assert caught.value.code == "not-allowed"
+    assert http._validate_url("https://corp.example/models", ("corp.example",)) == "corp.example"
+
+
+def test_extra_host_redirect_is_checked_on_each_hop(transport: Mock) -> None:
+    client = HttpClient(
+        NetworkGate(Settings(), Policy()),
+        user_agent=_USER_AGENT,
+        extra_hosts=("corp.example:8443",),
+    )
+    first = _response(302, "https://corp.example:8443/file")
+    transport.side_effect = [first, _response()]
+    with client.get_stream(
+        "https://huggingface.co/file", deadline_s=2, cancel=threading.Event()
+    ) as response:
+        assert b"".join(response.iter_chunks()) == _BODY
+    assert transport.call_count == 2
+
+    transport.reset_mock()
+    transport.side_effect = [_response(302, "https://sub.corp.example:8443/file")]
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream("https://huggingface.co/file", deadline_s=2, cancel=threading.Event())
+    assert caught.value.code == "not-allowed"
+    assert transport.call_count == 1
+
+
+def test_bad_status_attribute_without_socket(transport: Mock) -> None:
+    transport.side_effect = None
+    transport.return_value = _response(429)
+    client = HttpClient(NetworkGate(Settings(), Policy()), user_agent=_USER_AGENT)
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream("https://huggingface.co/file", deadline_s=2, cancel=threading.Event())
+    assert caught.value.code == "bad-status"
+    assert caught.value.status == 429
+    assert "429" in str(caught.value)
+
+
+def test_idle_timeout_while_reading_without_socket(transport: Mock) -> None:
+    class SlowBody(BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            time.sleep(0.3)
+            return super().read(size)
+
+    reply = _response()
+    reply.raw = SlowBody(_BODY)
+    transport.side_effect = None
+    transport.return_value = reply
+    client = HttpClient(NetworkGate(Settings(), Policy()), user_agent=_USER_AGENT)
+    with pytest.raises(NetworkError) as caught:
+        with client.get_stream(
+            "https://huggingface.co/file",
+            deadline_s=2,
+            idle_timeout_s=0.2,
+            cancel=threading.Event(),
+        ) as response:
+            list(response.iter_chunks(8))
+    assert caught.value.code == "timeout"
+
+
+def test_idle_timeout_before_headers_without_socket(transport: Mock) -> None:
+    def delayed(*args: object, **kwargs: object) -> requests.Response:
+        time.sleep(0.3)
+        return _response()
+
+    transport.side_effect = delayed
+    client = HttpClient(NetworkGate(Settings(), Policy()), user_agent=_USER_AGENT)
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream(
+            "https://huggingface.co/file",
+            deadline_s=2,
+            idle_timeout_s=0.2,
+            cancel=threading.Event(),
+        )
+    assert caught.value.code == "timeout"
 
 
 @pytest.mark.parametrize("path", ("/slow-headers", "/slow-body"))

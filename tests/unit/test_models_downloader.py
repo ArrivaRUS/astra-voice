@@ -9,6 +9,7 @@ import hashlib
 import os
 import stat
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,7 +26,7 @@ from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
 from astra_voice.models import downloader
 from astra_voice.models.catalog import CatalogEntry, FileSpec
-from astra_voice.models.downloader import Downloader, DownloadError, Progress
+from astra_voice.models.downloader import Downloader, DownloadError, Progress, fail_reason
 from astra_voice.models.store import ModelStore
 from astra_voice.net import http
 from astra_voice.net.gate import NetworkGate, NetworkKind
@@ -185,6 +186,7 @@ def local_server(
         deadline_s: float,
         cancel: threading.Event,
         kind: NetworkKind = "download",
+        idle_timeout_s: float | None = None,
     ) -> StreamResponse:
         # Загрузчик обязан собрать HTTPS буквально. Только тест переводит его в HTTP.
         assert url.startswith(f"https://{state.host}/")
@@ -196,6 +198,7 @@ def local_server(
             deadline_s=deadline_s,
             cancel=cancel,
             kind=kind,
+            idle_timeout_s=idle_timeout_s,
         )
         state.responses.append(response)
         return response
@@ -853,6 +856,7 @@ class FakeTransport:
         deadline_s: float,
         cancel: threading.Event,
         kind: str = "download",
+        idle_timeout_s: float | None = None,
     ) -> FakeResponse:
         self.urls.append(url)
         host = urlsplit(url).hostname or ""
@@ -862,11 +866,13 @@ class FakeTransport:
 
 
 @pytest.fixture
-def mirrored(single_entry: CatalogEntry) -> CatalogEntry:
+def mirrored(entry: CatalogEntry) -> CatalogEntry:
     return replace(
-        single_entry,
+        entry,
         host="huggingface.co",
         mirrors=("github.com", "mirror.example"),
+        files=entry.files[:1],
+        size_bytes=entry.files[0].size,
     )
 
 
@@ -965,9 +971,14 @@ def test_checksum_is_checked_for_every_source(
 
 
 def test_entry_without_mirrors_uses_single_source(
-    store: ModelStore, single_entry: CatalogEntry, payloads: dict[str, bytes]
+    store: ModelStore, entry: CatalogEntry, payloads: dict[str, bytes]
 ) -> None:
-    entry = replace(single_entry, host="huggingface.co")
+    entry = replace(
+        entry,
+        host="huggingface.co",
+        files=entry.files[:1],
+        size_bytes=entry.files[0].size,
+    )
     loader, transport = _fake_loader(
         store, entry, payloads, set(), http.NetworkError("host-unreachable", "Нет сервера.")
     )
@@ -975,3 +986,308 @@ def test_entry_without_mirrors_uses_single_source(
     _assert_error(loader, entry, "host-unreachable")
 
     assert transport.urls == ["https://huggingface.co" + entry.files[0].url_path]
+
+
+@pytest.mark.parametrize("status", (429, 404, 403, 500))
+def test_http_status_moves_to_next_source(
+    store: ModelStore, mirrored: CatalogEntry, payloads: dict[str, bytes], status: int
+) -> None:
+    failure = http.NetworkError("bad-status", "Отказ сервера.", status=status)
+    loader, transport = _fake_loader(store, mirrored, payloads, {"github.com"}, failure)
+    kinds: list[str] = []
+    loader.download(
+        mirrored, progress=lambda state: None, cancel=threading.Event(), source=kinds.append
+    )
+    assert kinds == ["hf", "github"]
+    assert [urlsplit(url).hostname for url in transport.urls] == ["huggingface.co", "github.com"]
+
+
+def test_corp_is_last_and_uses_escaped_components(
+    store: ModelStore, entry: CatalogEntry, caplog: pytest.LogCaptureFixture
+) -> None:
+    body = b"safe"
+    file = FileSpec("folder name/a#b.bin", hashlib.sha256(body).hexdigest(), len(body), "/old")
+    item = replace(
+        entry,
+        id="model.id",
+        revision="rev-1",
+        host="hf.co",
+        mirrors=("objects.githubusercontent.com",),
+        files=(file,),
+        size_bytes=len(body),
+    )
+    corp_path = "/base/model.id/rev-1/folder%20name/a%23b.bin"
+    transport = FakeTransport(
+        {corp_path: body}, {"corp.example"}, http.NetworkError("host-unreachable", "Нет сервера.")
+    )
+    loader = Downloader(cast(HttpClient, transport), store, corp_base="https://corp.example/base/")
+    kinds: list[str] = []
+    result = loader.download(
+        item, progress=lambda state: None, cancel=threading.Event(), source=kinds.append
+    )
+    assert (result / file.path).read_bytes() == body
+    assert kinds == ["hf", "github", "corp"]
+    assert transport.urls[-1] == "https://corp.example" + corp_path
+    assert ".." not in transport.urls[-1]
+    assert "corp.example" not in caplog.text
+    assert "hf.co" not in caplog.text
+    assert "objects.githubusercontent.com" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "base",
+    (
+        None,
+        "http://corp.example/base",
+        "https://user:pass@corp.example",
+        "https://corp.example/base?",
+        "https://corp.example/base#",
+        "https://corp.example:0/base",
+        "https://corp.example:/base",
+    ),
+)
+def test_invalid_or_absent_corp_is_not_used(
+    store: ModelStore,
+    mirrored: CatalogEntry,
+    payloads: dict[str, bytes],
+    base: str | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    loader, transport = _fake_loader(
+        store, mirrored, payloads, set(), http.NetworkError("host-unreachable", "Нет сервера.")
+    )
+    loader = Downloader(cast(HttpClient, transport), store, corp_base=base)
+    _assert_error(loader, mirrored, "host-unreachable")
+    assert len(transport.urls) == 3
+    assert "corp.example" not in caplog.text
+    assert "user:pass" not in caplog.text
+
+
+def test_corp_rejects_dot_segment_before_request(store: ModelStore, entry: CatalogEntry) -> None:
+    file = replace(entry.files[0], path="folder/../weights.bin")
+    item = replace(entry, files=(file,), size_bytes=file.size)
+    transport = Mock()
+    loader = Downloader(cast(HttpClient, transport), store, corp_base="https://corp.example")
+    _assert_error(loader, item, "bad-path")
+    transport.get_stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("host", "kind"),
+    (
+        ("huggingface.co", "hf"),
+        ("cdn.huggingface.co", "hf"),
+        ("hf.co", "hf"),
+        ("cdn.hf.co", "hf"),
+        ("github.com", "github"),
+        ("objects.githubusercontent.com", "github"),
+        ("api.github.com", "github"),
+    ),
+)
+def test_source_kind_for_catalog_hosts(host: str, kind: str) -> None:
+    assert downloader._source_kind(host) == kind
+
+
+def test_source_callback_failure_does_not_stop_or_log_exception(
+    store: ModelStore,
+    mirrored: CatalogEntry,
+    payloads: dict[str, bytes],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    loader, _ = _fake_loader(
+        store,
+        mirrored,
+        payloads,
+        {"github.com"},
+        http.NetworkError("host-unreachable", "Нет сервера."),
+    )
+
+    def broken(kind: str) -> None:
+        raise RuntimeError("secret-host")
+
+    loader.download(mirrored, progress=lambda state: None, cancel=threading.Event(), source=broken)
+    assert "Не удалось сообщить об источнике" in caplog.text
+    assert "secret-host" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("code", "reason"),
+    (
+        ("no-network", "no-network"),
+        ("host-unreachable", "no-network"),
+        ("not-allowed", "not-allowed"),
+        ("bad-path", "not-allowed"),
+        ("bad-checksum", "bad-sha"),
+        ("too-large", "bad-sha"),
+        ("disk-full", "no-space"),
+        ("timeout", "timeout"),
+        ("bad-status", "server"),
+        ("other", "server"),
+    ),
+)
+def test_fail_reason_is_closed(code: str, reason: str) -> None:
+    assert fail_reason(code) == reason
+
+
+def test_cancelled_has_no_fail_reason() -> None:
+    with pytest.raises(ValueError):
+        fail_reason("cancelled")
+
+
+def test_second_source_resumes_half_and_progress_stays_monotonic(
+    store: ModelStore,
+    mirrored: CatalogEntry,
+    payloads: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = payloads[mirrored.files[0].path]
+    seen: list[tuple[str, int | None]] = []
+
+    class BrokenResponse(FakeResponse):
+        def iter_chunks(self, size: int, *, limit: int) -> Iterator[bytes]:
+            yield body[: len(body) // 2]
+            raise http.NetworkError("timeout", "Обрыв.")
+
+    def get_stream(url: str, *, range_from: int | None, **kwargs: object) -> FakeResponse:
+        host = urlsplit(url).hostname or ""
+        seen.append((host, range_from))
+        if host == "huggingface.co":
+            return BrokenResponse(body)
+        assert host == "github.com" and range_from == len(body) // 2
+        response = FakeResponse(body[range_from:], 206)
+        response.headers["Content-Range"] = f"bytes {range_from}-{len(body) - 1}/{len(body)}"
+        return response
+
+    transport = Mock()
+    transport.get_stream.side_effect = get_stream
+    loader = Downloader(cast(HttpClient, transport), store)
+    monkeypatch.setattr(downloader, "_PROGRESS_INTERVAL_S", 0)
+    progress: list[Progress] = []
+    result = loader.download(mirrored, progress=progress.append, cancel=threading.Event())
+    assert (result / mirrored.files[0].path).read_bytes() == body
+    assert seen == [("huggingface.co", None), ("github.com", len(body) // 2)]
+    amounts = [state.bytes_done for state in progress]
+    assert amounts == sorted(amounts)
+    assert max(amounts) == len(body)
+
+
+def test_last_source_idle_timeout_preserves_part(
+    store: ModelStore,
+    entry: CatalogEntry,
+    payloads: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = entry.files[0]
+    item = replace(entry, files=(file,), size_bytes=file.size)
+    body = payloads[file.path]
+
+    class StalledResponse(FakeResponse):
+        def iter_chunks(self, size: int, *, limit: int) -> Iterator[bytes]:
+            yield body[:4]
+            raise http.NetworkError("timeout", "Простой.")
+
+    transport = Mock()
+    transport.get_stream.return_value = StalledResponse(body)
+    loader = Downloader(cast(HttpClient, transport), store)
+    monkeypatch.setattr(downloader, "INACTIVITY_TIMEOUT_S", 0.2)
+    _assert_error(loader, item, "timeout")
+    part = store.staging_dir(item.id, item.revision) / (file.path + ".part")
+    assert part.read_bytes() == body[:4]
+    assert transport.get_stream.call_args.kwargs["idle_timeout_s"] == 0.2
+
+
+def test_real_stream_idle_timeout_keeps_written_part_without_socket(
+    client: HttpClient,
+    store: ModelStore,
+    entry: CatalogEntry,
+    payloads: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = entry.files[0]
+    item = replace(entry, files=(file,), size_bytes=file.size)
+    body = payloads[file.path]
+
+    class StalledBody(BytesIO):
+        reads = 0
+
+        def read(self, size: int | None = -1) -> bytes:
+            self.reads += 1
+            if self.reads == 2:
+                time.sleep(0.3)
+            return super().read(size)
+
+    response = requests.Response()
+    response.status_code = 200
+    response.headers["Content-Length"] = str(len(body))
+    response.raw = StalledBody(body)
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", Mock(return_value=response))
+    monkeypatch.setattr(downloader, "_CHUNK_SIZE", 4)
+    monkeypatch.setattr(downloader, "INACTIVITY_TIMEOUT_S", 0.2)
+    _assert_error(Downloader(client, store), item, "timeout")
+    part = store.staging_dir(item.id, item.revision) / (file.path + ".part")
+    assert part.read_bytes() == body[:4]
+
+
+def test_disk_check_pauses_with_part_and_next_call_resumes(
+    store: ModelStore,
+    entry: CatalogEntry,
+    payloads: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file = entry.files[0]
+    item = replace(entry, files=(file,), size_bytes=file.size)
+    body = payloads[file.path]
+    offsets: list[int | None] = []
+
+    def get_stream(url: str, *, range_from: int | None, **kwargs: object) -> FakeResponse:
+        offsets.append(range_from)
+        if range_from is None:
+            return FakeResponse(body)
+        response = FakeResponse(body[range_from:], 206)
+        response.headers["Content-Range"] = f"bytes {range_from}-{len(body) - 1}/{len(body)}"
+        return response
+
+    transport = Mock()
+    transport.get_stream.side_effect = get_stream
+    loader = Downloader(cast(HttpClient, transport), store)
+    monkeypatch.setattr(downloader, "_CHUNK_SIZE", 4)
+    now = [0.0]
+
+    def monotonic() -> float:
+        now[0] += 0.6
+        return now[0]
+
+    monkeypatch.setattr(downloader, "time", SimpleNamespace(monotonic=monotonic))
+    disk_ok = Mock(side_effect=[True, True, False, True, True, True, True])
+    monkeypatch.setattr(store, "disk_ok", disk_ok)
+    _assert_error(loader, item, "disk-full")
+    part = store.staging_dir(item.id, item.revision) / (file.path + ".part")
+    assert part.read_bytes() == body[:4]
+    assert (store.staging_dir(item.id, item.revision) / file.path).exists() is False
+    result = _download(loader, item)
+    assert (result / file.path).read_bytes() == body
+    assert offsets == [None, 4]
+    assert disk_ok.call_args_list[0].args == (item.size_bytes,)
+    assert disk_ok.call_args_list[2].args == (item.size_bytes - 4,)
+    assert disk_ok.call_args_list[3].args == (item.size_bytes - 4,)
+
+
+def test_remaining_bytes_uses_sizes_without_reading_files(
+    store: ModelStore, entry: CatalogEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    staging = store.staging_dir(entry.id, entry.revision)
+    ready, partial, invalid = entry.files
+    ready_path = staging / ready.path
+    ready_path.parent.mkdir(parents=True, exist_ok=True)
+    ready_path.write_bytes(b"x" * ready.size)
+    partial_path = staging / (partial.path + ".part")
+    partial_path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path.write_bytes(b"ab")
+    invalid_path = staging / (invalid.path + ".part")
+    invalid_path.parent.mkdir(parents=True, exist_ok=True)
+    invalid_path.write_bytes(b"x" * (invalid.size + 1))
+
+    monkeypatch.setattr(downloader, "_ready", Mock(side_effect=AssertionError("SHA check")))
+    monkeypatch.setattr(Path, "open", Mock(side_effect=AssertionError("file read")))
+
+    assert downloader.remaining_bytes(store, entry) == partial.size - 2 + invalid.size

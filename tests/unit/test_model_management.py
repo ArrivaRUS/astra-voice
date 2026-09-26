@@ -19,9 +19,9 @@ from PyQt5.QtTest import QSignalSpy
 
 from astra_voice.core import settings as settings_mod
 from astra_voice.core.model_source import RevocationUnknown
-from astra_voice.models.catalog import CatalogEntry
-from astra_voice.models.downloader import Progress
-from astra_voice.models.store import ModelRecord, ModelState, StoreError
+from astra_voice.models.catalog import CatalogEntry, FileSpec
+from astra_voice.models.downloader import Progress, remaining_bytes
+from astra_voice.models.store import ModelRecord, ModelState, ModelStore, StoreError
 from astra_voice.ui import model_downloads
 from astra_voice.ui.bridges import SettingsBridge
 from astra_voice.ui.model_downloads import ModelDownloads, ModelService
@@ -71,6 +71,10 @@ class FakeManagedPort:
         self.set_current_error: Exception | None = None
         self.remove_error: Exception | None = None
         self.total_ram_mb: float | None = None
+        self.discarded: list[str] = []
+        self.space = True
+        self.missing_bytes = 0
+        self.staged_store: ModelStore | None = None
 
     # ── то, что спрашивает ModelDownloads ────────────────────────────────
     def recommended(self) -> CatalogEntry:
@@ -137,10 +141,17 @@ class FakeManagedPort:
         return True, ""
 
     def disk_ok(self, size_bytes: int) -> bool:
-        return True
+        return self.space
+
+    def remaining_bytes(self, entry: CatalogEntry) -> int:
+        return (
+            remaining_bytes(self.staged_store, entry)
+            if self.staged_store is not None
+            else entry.size_bytes
+        )
 
     def disk_missing_bytes(self, size_bytes: int) -> int:
-        return 0
+        return self.missing_bytes
 
     def free_bytes(self) -> int:
         return 42_100_000_000
@@ -157,8 +168,12 @@ class FakeManagedPort:
         *,
         progress: Callable[[Progress], None],
         cancel: threading.Event,
+        source: Callable[[str], None] | None = None,
     ) -> Path:
         raise AssertionError("Очередь в этих тестах не запускается")
+
+    def discard_staging(self, entry: Any) -> None:
+        self.discarded.append(entry.id)
 
     def install_from_staging(self, entry: Any) -> Any:
         raise AssertionError("Очередь в этих тестах не запускается")
@@ -217,6 +232,221 @@ def rig() -> Iterator[Rig]:
 
 def card(downloads: ModelDownloads, model_id: str) -> dict[str, Any]:
     return next(item for item in downloads.models if item["id"] == model_id)
+
+
+def manual_queue(port: FakeManagedPort) -> tuple[ModelDownloads, list[str]]:
+    """Запускает решения очереди без рабочих потоков и сети."""
+    downloads = ModelDownloads(port)
+    started: list[str] = []
+
+    def start(source: Path | None = None) -> None:
+        if not downloads._queue:
+            return
+        entry = downloads._queue.pop(0)
+        downloads._active_entry = entry
+        started.append(entry.id)
+        downloads._set_card(entry, "downloading")
+        downloads._set_download_state("downloading")
+
+    downloads._start_model_job = start  # type: ignore[method-assign]
+    return downloads, started
+
+
+def test_dynamic_queue_fifo_dequeue_and_card_fields() -> None:
+    port = FakeManagedPort()
+    third = replace(TONE, id="third", name="Третья")
+    port.catalog = (GIGAAM, TONE, third)
+    downloads, started = manual_queue(port)
+    try:
+        for row in downloads.models:
+            assert {
+                "queuePosition",
+                "sourceText",
+                "failReason",
+                "canCancel",
+                "canRetry",
+                "canDequeue",
+            } <= row.keys()
+        downloads.toggleModel(GIGAAM.id)
+        downloads.toggleModel(third.id)
+        downloads.startSelectedDownloads()
+        assert started == [GIGAAM.id]
+        assert card(downloads, third.id)["queuePosition"] == 1
+        downloads._model_progressed(0.5)
+        downloads.toggleModel(TONE.id)
+        downloads.startSelectedDownloads()
+        assert [entry.id for entry in downloads._queue] == [third.id, TONE.id]
+        assert downloads.downloadTitle == "Загружается GigaAM v3 RNN-T · 1 из 3"
+        assert card(downloads, TONE.id)["queuePosition"] == 2
+        assert downloads.downloadProgress == 0.5 * GIGAAM.size_bytes / (
+            GIGAAM.size_bytes + TONE.size_bytes + third.size_bytes
+        )
+        downloads.dequeueModel(third.id)
+        assert card(downloads, third.id)["state"] == "available"
+        assert card(downloads, TONE.id)["queuePosition"] == 1
+        assert card(downloads, TONE.id)["canDequeue"]
+        assert downloads._queue_total_bytes == GIGAAM.size_bytes + TONE.size_bytes
+        assert downloads.downloadProgress == 0.5 * GIGAAM.size_bytes / (
+            GIGAAM.size_bytes + TONE.size_bytes
+        )
+    finally:
+        downloads.shutdown()
+
+
+def test_cancel_one_and_cancel_all_discard_staging() -> None:
+    port = FakeManagedPort()
+    downloads, started = manual_queue(port)
+    try:
+        downloads.toggleModel(GIGAAM.id)
+        downloads.toggleModel(TONE.id)
+        downloads.startSelectedDownloads()
+        downloads.cancelModel(GIGAAM.id)
+        assert card(downloads, GIGAAM.id)["state"] == "available"
+        downloads._model_finished("cancelled", "")
+        downloads._model_thread_finished()
+        assert port.discarded == [GIGAAM.id]
+        assert started == [GIGAAM.id, TONE.id]
+        downloads.cancelDownloads()
+        downloads._model_finished("cancelled", "")
+        downloads._model_thread_finished()
+        assert port.discarded == [GIGAAM.id, TONE.id]
+    finally:
+        downloads.shutdown()
+
+
+def test_pause_retry_preserves_staging_until_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(FakeManagedPort, "remaining_bytes")
+    port = FakeManagedPort()
+    downloads, started = manual_queue(port)
+    try:
+        downloads.toggleModel(GIGAAM.id)
+        downloads.toggleModel(TONE.id)
+        downloads.startSelectedDownloads()
+        port.space = False
+        port.missing_bytes = 12_500_000
+        downloads._model_finished("no-space", "")
+        downloads._model_thread_finished()
+        assert downloads.downloadState == "no-space"
+        assert card(downloads, GIGAAM.id)["state"] == "paused-no-space"
+        assert card(downloads, GIGAAM.id)["message"] == (
+            "Не хватает места на диске — освободите 13 МБ"
+        )
+        assert card(downloads, TONE.id)["state"] == "queued"
+        downloads.retryModel(GIGAAM.id)
+        assert started == [GIGAAM.id] and port.discarded == []
+        port.space = True
+        downloads.retryModel(GIGAAM.id)
+        assert started == [GIGAAM.id, GIGAAM.id]
+        assert port.discarded == []
+    finally:
+        downloads.shutdown()
+
+
+def test_pause_retry_uses_part_file_remainder(tmp_path: Path) -> None:
+    port = FakeManagedPort()
+    entry = replace(
+        GIGAAM,
+        files=(FileSpec("model.bin", "0" * 64, GIGAAM.size_bytes, "model.bin"),),
+    )
+    port.catalog = (entry, TONE)
+    store = ModelStore(tmp_path / "models")
+    port.staged_store = store
+    part = store.staging_dir(entry.id, entry.revision) / "model.bin.part"
+    with part.open("wb") as stream:
+        stream.truncate(203_400_000)
+    available = 15_000_000
+    port.disk_ok = lambda size: (size * 6 + 4) // 5 <= available  # type: ignore[assignment]
+    port.disk_missing_bytes = lambda size: max(  # type: ignore[assignment]
+        0, (size * 6 + 4) // 5 - available
+    )
+    downloads, started = manual_queue(port)
+    try:
+        downloads.toggleModel(entry.id)
+        downloads.startSelectedDownloads()
+        downloads._model_finished("no-space", "")
+        downloads._model_thread_finished()
+        assert remaining_bytes(store, entry) == 22_600_000
+        assert card(downloads, entry.id)["message"] == (
+            "Не хватает места на диске — освободите 13 МБ"
+        )
+        assert downloads.downloadDetail == "нужно ещё 13 МБ"
+        downloads.retryModel(entry.id)
+        assert started == [entry.id]
+        available = 28_000_000
+        assert not port.disk_ok(entry.size_bytes)
+        downloads.retryModel(entry.id)
+        assert started == [entry.id, entry.id]
+        assert part.exists()
+    finally:
+        downloads.shutdown()
+
+
+@pytest.mark.parametrize(
+    "kind, text",
+    [
+        ("hf", "Скачиваю с huggingface.co"),
+        ("github", "Скачиваю с github.com"),
+        ("corp", "Скачиваю с корпоративного сервера"),
+    ],
+)
+def test_source_text_and_progress_stay_safe(kind: str, text: str) -> None:
+    port = FakeManagedPort()
+    downloads, _started = manual_queue(port)
+    try:
+        downloads.toggleModel(GIGAAM.id)
+        downloads.startSelectedDownloads()
+        downloads._model_progressed(0.5)
+        before = downloads.downloadProgress
+        downloads._model_sourced(kind)
+        downloads._model_progressed(0.4)
+        assert downloads.downloadProgress == before
+        assert downloads.downloadSource == card(downloads, GIGAAM.id)["sourceText"] == text
+        downloads._model_staged("verifying")
+        assert downloads.downloadSource == card(downloads, GIGAAM.id)["sourceText"] == ""
+    finally:
+        downloads.shutdown()
+
+
+@pytest.mark.parametrize(
+    "code, message",
+    [
+        ("no-network", "Не удалось загрузить модель — нет связи с сервером"),
+        ("not-allowed", "Не удалось загрузить модель — источник запрещён настройками"),
+        ("bad-sha", "Файл не прошёл проверку — загруженное удалено"),
+        ("no-space", "Не удалось загрузить модель — не хватает места на диске"),
+        ("timeout", "Не удалось загрузить модель — сервер не отвечает"),
+        ("server", "Не удалось загрузить модель — сервер ответил ошибкой"),
+    ],
+)
+def test_download_failure_reason_is_closed(code: str, message: str) -> None:
+    port = FakeManagedPort()
+    downloads, _started = manual_queue(port)
+    try:
+        downloads.toggleModel(GIGAAM.id)
+        downloads.startSelectedDownloads()
+        downloads._model_finished(f"failed:{code}", "SECRET /private/path")
+        downloads._model_thread_finished()
+        row = card(downloads, GIGAAM.id)
+        assert (row["state"], row["failReason"], row["message"]) == ("failed", code, message)
+        assert row["canRetry"]
+        assert port.discarded == ([GIGAAM.id] if code == "bad-sha" else [])
+    finally:
+        downloads.shutdown()
+
+
+def test_service_forwards_source_and_discards_one_revision() -> None:
+    service = ModelService.__new__(ModelService)
+    service._downloader = Mock()
+    service._store = Mock()
+    progress = Mock()
+    source = Mock()
+    cancel = threading.Event()
+    service.download(GIGAAM, progress=progress, cancel=cancel, source=source)
+    service._downloader.download.assert_called_once_with(
+        GIGAAM, progress=progress, cancel=cancel, source=source
+    )
+    service.discard_staging(GIGAAM)
+    service._store.discard_staging.assert_called_once_with(GIGAAM.id, GIGAAM.revision)
 
 
 def test_hint_fields_are_present_without_switcher(rig: Rig) -> None:

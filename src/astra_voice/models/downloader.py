@@ -14,8 +14,9 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
 
-from astra_voice.models.catalog import CatalogEntry, FileSpec
+from astra_voice.models.catalog import ID_RE, CatalogEntry, FileSpec
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net.http import HttpClient, NetworkError
 
@@ -24,10 +25,63 @@ _CHUNK_SIZE = 65536
 _FILE_DEADLINE_S = 6 * 60 * 60
 _PROGRESS_INTERVAL_S = 0.2
 _SPEED_WINDOW_S = 5.0
+INACTIVITY_TIMEOUT_S = 30.0
 _CONTENT_RANGE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)", re.IGNORECASE)
 # Сетевые отказы одного источника: пробуем следующий. Повреждение, отмена,
 # выключенная сеть и запрещённый источник смены источника не оправдывают.
 _MIRROR_CODES = frozenset({"host-unreachable", "timeout", "bad-status"})
+
+
+def fail_reason(code: str) -> str:
+    """Возвращает только публичную причину отказа, без текста исключения."""
+    if code == "cancelled":
+        raise ValueError("Отмена не является причиной отказа.")
+    if code in {"bad-checksum", "too-large"}:
+        return "bad-sha"
+    if code == "disk-full":
+        return "no-space"
+    if code in {"no-network", "host-unreachable"}:
+        return "no-network"
+    if code in {"not-allowed", "bad-path"}:
+        return "not-allowed"
+    if code == "timeout":
+        return "timeout"
+    return "server"
+
+
+def corp_origin(base: str | None) -> str | None:
+    if base is None:
+        return None
+    try:
+        parts = urlsplit(base)
+        host = parts.hostname
+        port = parts.port
+        if (
+            parts.scheme != "https"
+            or not host
+            or parts.username is not None
+            or parts.password is not None
+            or parts.netloc.endswith(":")
+            or "%" in parts.netloc
+            or "?" in base
+            or "#" in base
+            or "\\" in base
+            or any(ord(char) <= 32 or ord(char) == 127 for char in base)
+            or any(segment in {".", ".."} for segment in unquote(parts.path).split("/"))
+            or port == 0
+        ):
+            raise ValueError
+    except ValueError:
+        log.warning("Корпоративный источник не используется: некорректный адрес.")
+        return None
+    return base.rstrip("/")
+
+
+def _source_kind(host: str) -> str:
+    name = host.split(":", 1)[0].lower()
+    if name in {"huggingface.co", "hf.co"} or name.endswith((".huggingface.co", ".hf.co")):
+        return "hf"
+    return "github"
 
 
 @dataclass(frozen=True)
@@ -81,6 +135,16 @@ def _checked_path(staging: Path, path: Path) -> Path:
     return path
 
 
+def _checked_file_path(path: str) -> str:
+    if (
+        path.startswith("/")
+        or "\\" in path
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+    ):
+        raise DownloadError("bad-path")
+    return path
+
+
 def _staging_size(staging: Path) -> int:
     size = 0
 
@@ -118,6 +182,37 @@ def _ready(path: Path, file: FileSpec, cancel: threading.Event) -> bool:
     return hmac.compare_digest(digest.hexdigest(), file.sha256)
 
 
+def _remaining_model_bytes(staging: Path, entry: CatalogEntry, cancel: threading.Event) -> int:
+    if not staging.is_dir():
+        return entry.size_bytes
+    remaining = entry.size_bytes
+    for file in entry.files:
+        _check_cancel(cancel)
+        path = _checked_file_path(file.path)
+        target = _checked_path(staging, staging / path)
+        part = _checked_path(staging, staging / (path + ".part"))
+        if target.is_file() and target.stat().st_size == file.size:
+            remaining -= file.size
+        elif part.is_file():
+            size = part.stat().st_size
+            if 0 < size < file.size:
+                remaining -= size
+    return max(0, remaining)
+
+
+def remaining_bytes(
+    store: ModelStore, entry: CatalogEntry, *, cancel: threading.Event | None = None
+) -> int:
+    """Остаток загрузки с учётом готовых файлов и .part, без создания staging."""
+    if ID_RE.fullmatch(entry.id) is None or ID_RE.fullmatch(entry.revision) is None:
+        raise StoreError("bad-id")
+    directory = store.root / entry.id
+    staging = directory / f"{entry.revision}.partial"
+    if directory.is_symlink() or staging.is_symlink():
+        raise StoreError("bad-id", "Каталог модели не должен быть символической ссылкой.")
+    return _remaining_model_bytes(staging, entry, cancel or threading.Event())
+
+
 def _fsync_dir(directory: Path) -> None:
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -147,6 +242,7 @@ class _Reporter:
         self._last_report = self._started
         self._samples: deque[tuple[float, int]] = deque()
         self._window_bytes = 0
+        self._last_emitted = 0
 
     def written(self, count: int) -> None:
         self.done += count
@@ -161,24 +257,34 @@ class _Reporter:
             return
         elapsed = min(now - self._started, _SPEED_WINDOW_S)
         speed = self._window_bytes / elapsed if elapsed > 0 else 0.0
-        eta = max(0, self._entry.size_bytes - self.done) / speed if speed > 0 else None
+        visible_done = max(self._last_emitted, self.done)
+        eta = max(0, self._entry.size_bytes - visible_done) / speed if speed > 0 else None
         self._last_report = now
+        self._last_emitted = visible_done
         try:
             self._callback(
                 Progress(
-                    self.done, self._entry.size_bytes, speed, eta, index, len(self._entry.files)
+                    visible_done,
+                    self._entry.size_bytes,
+                    speed,
+                    eta,
+                    index,
+                    len(self._entry.files),
                 )
             )
         except Exception:
-            log.exception("Не удалось сообщить о ходе загрузки модели.")
+            log.warning("Не удалось сообщить о ходе загрузки модели.")
 
 
 class Downloader:
     """Проверяет файлы в staging; установку и проверку ОЗУ выполняет вызывающий."""
 
-    def __init__(self, http: HttpClient, store: ModelStore) -> None:
+    def __init__(
+        self, http: HttpClient, store: ModelStore, *, corp_base: str | None = None
+    ) -> None:
         self._http = http
         self._store = store
+        self._corp_base = corp_origin(corp_base)
 
     def download(
         self,
@@ -186,17 +292,18 @@ class Downloader:
         *,
         progress: Callable[[Progress], None],
         cancel: threading.Event,
+        source: Callable[[str], None] | None = None,
     ) -> Path:
-        """Возвращает staging после проверки всех файлов, сохраняя докачку при обрыве."""
+        """Возвращает staging; место повторно проверяется перед записью каждые 0,5 с."""
         try:
-            if not self._store.disk_ok(entry.size_bytes):
+            if not self._store.disk_ok(remaining_bytes(self._store, entry, cancel=cancel)):
                 raise DownloadError("disk-full")
             _check_cancel(cancel)
             staging = self._store.staging_dir(entry.id, entry.revision)
             destinations = [
                 (
-                    _checked_path(staging, staging / file.path),
-                    _checked_path(staging, staging / (file.path + ".part")),
+                    _checked_path(staging, staging / _checked_file_path(file.path)),
+                    _checked_path(staging, staging / (_checked_file_path(file.path) + ".part")),
                 )
                 for file in entry.files
             ]
@@ -216,7 +323,7 @@ class Downloader:
                     else:
                         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                         self._download_from_sources(
-                            entry, file, part, budget, reporter, index, cancel
+                            entry, file, part, budget, reporter, index, cancel, source
                         )
                         replaced_size = target.stat().st_size if target.exists() else 0
                         os.replace(part, target)
@@ -247,32 +354,57 @@ class Downloader:
         reporter: _Reporter,
         index: int,
         cancel: threading.Event,
+        source: Callable[[str], None] | None,
     ) -> None:
         """Перебирает источники каталога по порядку; проверки байт у всех одни.
 
         Хост в журнал и на экран не выносим: пользователю он ничего не говорит.
         """
-        sources = (entry.host, *entry.mirrors)
+        sources = [
+            (_source_kind(host), "https://" + host + file.url_path)
+            for host in (entry.host, *entry.mirrors)
+        ]
+        if self._corp_base is not None:
+            suffix = "/".join(quote(part, safe="") for part in file.path.split("/"))
+            sources.append(
+                (
+                    "corp",
+                    self._corp_base
+                    + "/"
+                    + quote(entry.id, safe="")
+                    + "/"
+                    + quote(entry.revision, safe="")
+                    + "/"
+                    + suffix,
+                )
+            )
         done_before = reporter.done
-        for number, host in enumerate(sources, start=1):
+        for number, (kind, url) in enumerate(sources, start=1):
+            _check_cancel(cancel)
+            if source is not None:
+                try:
+                    source(kind)
+                except Exception:
+                    log.warning("Не удалось сообщить об источнике загрузки модели.")
             try:
                 self._download_file(
-                    "https://" + host + file.url_path,
+                    url,
                     file,
                     part,
                     budget,
                     reporter,
                     index,
                     cancel,
+                    entry.size_bytes,
                 )
             except (DownloadError, NetworkError) as exc:
                 if exc.code not in _MIRROR_CODES or number == len(sources):
                     raise
                 log.warning(
-                    "Источник %d из %d не ответил (%s); пробуем следующий",
+                    "Источник %d из %d (%s) не ответил; пробуем следующий",
                     number,
                     len(sources),
-                    exc.code,
+                    kind,
                 )
                 # Следующая попытка сама посчитает уже загруженную часть файла.
                 reporter.done = done_before
@@ -288,11 +420,13 @@ class Downloader:
         reporter: _Reporter,
         index: int,
         cancel: threading.Event,
+        model_size: int,
     ) -> None:
         deadline_at = time.monotonic() + _FILE_DEADLINE_S
         digest = hashlib.sha256()
         existing = part.stat().st_size if part.exists() else 0
         offset = existing if 0 < existing < file.size else 0
+        last_disk_check = float("-inf")
         with part.open("r+b" if part.exists() else "w+b") as stream:
             if offset:
                 remaining = offset
@@ -314,6 +448,7 @@ class Downloader:
                     range_from=offset or None,
                     deadline_s=max(0.0, deadline_at - time.monotonic()),
                     cancel=cancel,
+                    idle_timeout_s=INACTIVITY_TIMEOUT_S,
                 ) as response:
                     valid_range = response.status == 206 and _range_matches(
                         response.headers.get("Content-Range", ""), offset, file.size
@@ -344,6 +479,11 @@ class Downloader:
                         if written + len(block) > file.size:
                             raise DownloadError("too-large")
                         budget.check(len(block))
+                        now = time.monotonic()
+                        if now - last_disk_check >= 0.5:
+                            if not self._store.disk_ok(max(0, model_size - reporter.done)):
+                                raise DownloadError("disk-full")
+                            last_disk_check = now
                         count = stream.write(block)
                         digest.update(block[:count])
                         written += count

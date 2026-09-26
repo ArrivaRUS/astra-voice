@@ -169,6 +169,20 @@ class ModelStore:
             self._private_dir(directory)
         return directory
 
+    def discard_staging(self, model_id: str, revision: str) -> None:
+        """Идемпотентно удаляет только staging указанной пары, не следуя ссылкам."""
+        try:
+            directory = self._revision_path(model_id, revision, ".partial")
+            if directory.is_dir():
+                shutil.rmtree(directory)
+            elif directory.exists():
+                directory.unlink()
+            else:
+                return
+            _fsync_dir(directory.parent)
+        except (OSError, StoreError):
+            log.warning("Не удалось удалить незавершённую загрузку модели.")
+
     def _installed(self, model_id: str, revision: str) -> Path:
         directory = self._revision_path(model_id, revision)
         if not directory.is_dir():

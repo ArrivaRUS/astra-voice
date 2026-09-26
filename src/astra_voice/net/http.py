@@ -40,11 +40,13 @@ class NetworkError(Exception):
 
     code: str
     message: str
+    status: int | None
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.status = status
 
 
 def _check_url_text(url: str) -> None:
@@ -53,7 +55,26 @@ def _check_url_text(url: str) -> None:
         raise NetworkError("not-allowed", "Источник не разрешён: некорректный адрес.")
 
 
-def _validate_url(url: str) -> str:
+def _extra_host_allowed(host: str, port: int | None, extra_hosts: tuple[str, ...]) -> bool:
+    for candidate in extra_hosts:
+        if not candidate or candidate.endswith(":") or any(char in candidate for char in "/\\@?#%"):
+            continue
+        try:
+            parts = urlsplit("https://" + candidate)
+            candidate_host = (parts.hostname or "").encode("idna").decode("ascii").lower()
+            candidate_port = parts.port
+        except (ValueError, UnicodeError):
+            continue
+        if not candidate_host or candidate_host != host or candidate_port == 0:
+            continue
+        if candidate_port is None and port in (None, 443):
+            return True
+        if candidate_port == port or (candidate_port == 443 and port is None):
+            return True
+    return False
+
+
+def _validate_url(url: str, extra_hosts: tuple[str, ...] = ()) -> str:
     """Проверяет весь адрес и возвращает хост без учётных данных."""
     _check_url_text(url)
     try:
@@ -67,10 +88,11 @@ def _validate_url(url: str) -> str:
         raise NetworkError("not-allowed", "Источник не разрешён: адрес содержит учётные данные.")
     if parts.scheme not in ALLOWED_SCHEMES:
         raise NetworkError("not-allowed", "Источник не разрешён: требуется защищённое соединение.")
-    if port not in ALLOWED_PORTS:
+    extra = _extra_host_allowed(host, port, extra_hosts)
+    if port not in ALLOWED_PORTS and not extra:
         raise NetworkError("not-allowed", "Источник не разрешён: недопустимый порт.")
     # Передаём текущий список: подмена http.ALLOWED_HOSTS действует и на редиректы.
-    if not host_allowed(host, ALLOWED_HOSTS):
+    if not host_allowed(host, ALLOWED_HOSTS) and not extra:
         raise NetworkError("not-allowed", "Источник не разрешён: сервер отсутствует в списке.")
     return host
 
@@ -125,9 +147,14 @@ def _shutdown_socket(sock: socket.socket | None) -> None:
 class _RequestWatchdog:
     """Прерывает отправку и чтение заголовков, пока StreamResponse ещё не создан."""
 
-    def __init__(self, deadline_at: float, cancel: threading.Event) -> None:
+    def __init__(
+        self, deadline_at: float, cancel: threading.Event, idle_timeout_s: float | None = None
+    ) -> None:
         self._deadline_at = deadline_at
         self._cancel = cancel
+        self._idle_deadline_at = (
+            time.monotonic() + idle_timeout_s if idle_timeout_s is not None else None
+        )
         self._connections: list[HTTPConnection] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -159,6 +186,11 @@ class _RequestWatchdog:
         while not self._stop.wait(_WATCHDOG_INTERVAL_S):
             try:
                 _remaining(self._deadline_at, self._cancel)
+                if (
+                    self._idle_deadline_at is not None
+                    and time.monotonic() >= self._idle_deadline_at
+                ):
+                    raise NetworkError("timeout", "Время ожидания ответа сервера истекло.")
             except NetworkError:
                 with self._lock:
                     self._triggered.set()
@@ -171,6 +203,12 @@ class _RequestWatchdog:
     def close(self) -> None:
         self._stop.set()
         self._thread.join()
+
+    def reset_idle(self, idle_timeout_s: float | None) -> None:
+        with self._lock:
+            self._idle_deadline_at = (
+                time.monotonic() + idle_timeout_s if idle_timeout_s is not None else None
+            )
 
 
 class _RequestAdapter(requests.adapters.HTTPAdapter):
@@ -239,6 +277,7 @@ class StreamResponse:
         host: str,
         deadline_at: float,
         cancel: threading.Event,
+        idle_timeout_s: float | None = None,
     ) -> None:
         self.url = url
         self.status = response.status_code
@@ -256,6 +295,10 @@ class StreamResponse:
         self._error: NetworkError | None = None
         self._speed_budget = _MIN_SPEED_GRACE_S
         self._read_deadline_at: float | None = None
+        self._idle_timeout_s = idle_timeout_s
+        self._idle_deadline_at = (
+            time.monotonic() + idle_timeout_s if idle_timeout_s is not None else None
+        )
         # При Connection: close urllib3.connection.sock уже может быть None.
         # Сохраняем сокет из файлового объекта до первого чтения и его закрытия.
         fp = getattr(response.raw, "_fp", None)
@@ -274,6 +317,8 @@ class StreamResponse:
         if self._closed:
             return False
         _remaining(self._deadline_at, self._cancel)
+        if self._idle_deadline_at is not None and time.monotonic() >= self._idle_deadline_at:
+            raise NetworkError("timeout", "Время ожидания ответа сервера истекло.")
         if self._read_deadline_at is not None and time.monotonic() >= self._read_deadline_at:
             raise NetworkError("timeout", "Слишком низкая скорость загрузки.")
         return True
@@ -345,6 +390,9 @@ class StreamResponse:
                         )
                 if not chunk:
                     return
+                if self._idle_timeout_s is not None:
+                    with self._lock:
+                        self._idle_deadline_at = time.monotonic() + self._idle_timeout_s
                 if limit is not None:
                     limit -= len(chunk)
                 yield chunk
@@ -388,14 +436,20 @@ class StreamResponse:
 
 
 class HttpClient:
-    """Выполняет только разрешённые загрузки без пользовательских учётных данных."""
+    """Выполняет разрешённые загрузки; extra_hosts содержит точные host[:port]."""
 
     def __init__(
-        self, gate: NetworkGate, *, ca_bundle: Path | None = None, user_agent: str
+        self,
+        gate: NetworkGate,
+        *,
+        ca_bundle: Path | None = None,
+        user_agent: str,
+        extra_hosts: tuple[str, ...] = (),
     ) -> None:
         self._gate = gate
         self._ca_bundle = ca_bundle
         self._user_agent = user_agent
+        self._extra_hosts = extra_hosts
 
     def get_stream(
         self,
@@ -405,6 +459,7 @@ class HttpClient:
         deadline_s: float,
         cancel: threading.Event,
         kind: NetworkKind = "download",
+        idle_timeout_s: float | None = None,
     ) -> StreamResponse:
         """Проверяет гейт, открывает поток и вручную проходит до пяти перенаправлений."""
         started_at = time.monotonic()
@@ -413,7 +468,7 @@ class HttpClient:
             raise NetworkError("no-network", reason)
         deadline_at = started_at + deadline_s
         _remaining(deadline_at, cancel)
-        _validate_url(url)
+        _validate_url(url, self._extra_hosts)
         verify = _verify_bundle(self._ca_bundle)
         session = _Session()
         session.trust_env = False
@@ -421,12 +476,11 @@ class HttpClient:
         redirects = 0
         watchdog: _RequestWatchdog | None = None
         try:
-            watchdog = _RequestWatchdog(deadline_at, cancel)
+            watchdog = _RequestWatchdog(deadline_at, cancel, idle_timeout_s)
             for scheme in ("http://", "https://"):
                 session.mount(scheme, _RequestAdapter(watchdog))
             while True:
-                host = _validate_url(url)
-                log.info("Запрос к %s", host)
+                host = _validate_url(url, self._extra_hosts)
                 proxies = urllib.request.getproxies()
                 # trust_env отключён: учитываем исключения явно для каждого адреса.
                 if requests.utils.should_bypass_proxies(url, no_proxy=proxies.get("no")):
@@ -441,13 +495,17 @@ class HttpClient:
                 # Включая тот же origin: полученные от сервера cookies не отправляются.
                 session.cookies.clear()
                 remaining = _remaining(deadline_at, cancel)
+                watchdog.reset_idle(idle_timeout_s)
                 try:
                     response = session.get(
                         url,
                         headers=headers,
                         proxies=proxies,
                         verify=verify,
-                        timeout=(min(3.0, remaining), min(30.0, remaining)),
+                        timeout=(
+                            min(3.0, idle_timeout_s or 3.0, remaining),
+                            min(idle_timeout_s or 30.0, remaining),
+                        ),
                         stream=True,
                         allow_redirects=False,
                     )
@@ -457,9 +515,15 @@ class HttpClient:
                         _remaining(deadline_at, cancel)
                     except NetworkError as stopped:
                         raise stopped from None
+                    if idle_timeout_s is not None and watchdog._triggered.is_set():
+                        raise NetworkError(
+                            "timeout", "Время ожидания ответа сервера истекло."
+                        ) from None
                     raise _request_error(error, host) from None
                 try:
                     _remaining(deadline_at, cancel)
+                    if idle_timeout_s is not None and watchdog._triggered.is_set():
+                        raise NetworkError("timeout", "Время ожидания ответа сервера истекло.")
                     # iter_content распаковывает до учёта бюджета. Отказываем по
                     # заголовкам, включая редиректы, и закрываем без чтения тела.
                     if response.headers.get("Content-Encoding", "").strip().lower() not in (
@@ -483,7 +547,7 @@ class HttpClient:
                             raise NetworkError(
                                 "not-allowed", "Источник не разрешён: некорректное перенаправление."
                             ) from None
-                        _validate_url(target)
+                        _validate_url(target, self._extra_hosts)
                         _remaining(deadline_at, cancel)
                         url = target
                         redirects += 1
@@ -491,6 +555,7 @@ class HttpClient:
                         raise NetworkError(
                             "bad-status",
                             f"Сервер {host} отклонил запрос (код {response.status_code}).",
+                            status=response.status_code,
                         )
                     else:
                         return StreamResponse(
@@ -500,6 +565,7 @@ class HttpClient:
                             host=host,
                             deadline_at=deadline_at,
                             cancel=cancel,
+                            idle_timeout_s=idle_timeout_s,
                         )
                 except BaseException:
                     response.close()

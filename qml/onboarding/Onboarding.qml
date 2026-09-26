@@ -143,6 +143,8 @@ Item {
         anchors.bottom: bar.top
         downloadState: (root.step >= 2 && root.bridge) ? root.bridge.downloadState : "idle"
         title: root.bridge ? root.bridge.downloadTitle : ""
+        sourceText: root.bridge && root.bridge.downloadSource !== undefined
+            ? root.bridge.downloadSource : ""
         progress: root.bridge ? root.bridge.downloadProgress : 0
         speed: root.bridge ? root.bridge.speed : ""
         eta: root.bridge ? root.bridge.eta : ""

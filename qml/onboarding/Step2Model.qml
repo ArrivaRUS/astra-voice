@@ -72,6 +72,16 @@ Item {
                 badge: modelData.badge
                 cardState: modelData.state
                 message: modelData.message
+                queuePosition: modelData.queuePosition !== undefined ? modelData.queuePosition : 0
+                sourceText: modelData.sourceText !== undefined ? modelData.sourceText : ""
+                failReason: modelData.failReason !== undefined ? modelData.failReason : ""
+                canCancel: modelData.canCancel !== undefined ? modelData.canCancel
+                    : modelData.state === "downloading" || modelData.state === "paused-no-space"
+                canRetry: modelData.canRetry !== undefined ? modelData.canRetry
+                    : modelData.state === "failed" || modelData.state === "paused-no-space"
+                        || modelData.state === "sha-failed"
+                canDequeue: modelData.canDequeue !== undefined ? modelData.canDequeue
+                    : modelData.state === "queued"
                 hint: modelData.hint !== undefined ? modelData.hint : ""
                 hintKind: modelData.hintKind !== undefined ? modelData.hintKind : ""
                 memoryShortage: modelData.memoryShortage === true
@@ -83,7 +93,8 @@ Item {
                 tags: modelData.tags
                 onToggleRequested: { if (root.bridge) root.bridge.toggleModel(modelData.id); }
                 onRetryRequested: { if (root.bridge) root.bridge.retryModel(modelData.id); }
-                onCancelRequested: { if (root.bridge) root.bridge.cancelDownloads(); }
+                onCancelRequested: { if (root.bridge) root.bridge.cancelModel(modelData.id); }
+                onDequeueRequested: { if (root.bridge) root.bridge.dequeueModel(modelData.id); }
                 openFolderEnabled: root.bridge !== null
                 onOpenFolderRequested: { if (root.bridge) root.bridge.openModelsFolder(); }
             }
