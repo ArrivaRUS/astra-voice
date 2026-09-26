@@ -2287,3 +2287,11 @@
   вшит в связку и `PINNED_FINGERPRINTS` рядом с M1, затем пин M1 снимается. `SECURITY.md`/`README.md` честно описывают
   происхождение ключа (K-6). Гигиена машины заказчика — §5.1 отчёта.
 - Вопрос живому ИБ-практику заказчика: достаточно ли письменного принятия риска для ФСТЭК-контекста пилота.
+
+## 2026-09-26 — Настройки GitHub по ИБ T2 K-3 (заказчик: «Да, давай»), применены через API
+- Environment `release`: deployment policy — только теги `v*` (required reviewer ArrivaRUS сохранён).
+- Ruleset `release-tags` (id 24047043): теги `refs/tags/v*` — запрет создания/изменения/удаления, обход — роль Repository admin.
+- Ruleset `main-guard` (id 24047044): ветка по умолчанию — запрет удаления и force-push, обход — Repository admin.
+- Actions: только действия GitHub (`github_owned_allowed`), обязательное закрепление по полному SHA (`sha_pinning_required`).
+- Осталось за заказчиком: 2FA на passkey/аппаратном ключе (§4 Q4 п. 5); fine-grained PAT для агентов без
+  Workflows/Administration/Deployments/Environments — после слияния `wip/r1-release` (она меняет CI).
