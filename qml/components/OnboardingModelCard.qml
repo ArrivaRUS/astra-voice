@@ -82,6 +82,7 @@ Rectangle {
         : badge !== "" || busy || cardState === "installed" ? "locked"
         : selected ? "on" : "off"
     readonly property real selectBorderWidth: Theme.modelCardSelectBorder
+    readonly property real footerIndent: Theme.modelCardSelectSize + Theme.modelCardSelectGap
     readonly property string statusLabel: cardState === "downloading" ? qsTr("Загружается")
         : cardState === "queued" ? qsTr("В очереди")
         : cardState === "verifying" ? qsTr("Проверяю…")
@@ -216,6 +217,7 @@ Rectangle {
                     width: parent.width
                     spacing: Theme.modelCardHeadGap
                     FooterText {
+                        objectName: "modelName"
                         text: root.modelTitle
                         width: Math.min(implicitWidth, nameRow.width)
                         color: root.unavailable ? Theme.fgDisabled : Theme.fg
@@ -376,9 +378,9 @@ Rectangle {
     RowLayout {
         id: footer
         objectName: "cardFooter"
-        x: Theme.cardBorder + Theme.modelCardPaddingX
+        x: Theme.cardBorder + Theme.modelCardPaddingX + root.footerIndent
         y: top.y + top.height + Theme.modelCardFooterGap
-        width: top.width
+        width: top.width - root.footerIndent
         spacing: Theme.modelCardFooterColsGap
         Flow {
             id: footerFacts

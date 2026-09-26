@@ -2171,6 +2171,90 @@ def test_settings_card_action_edge_and_group_gap(onboarding_app: Any) -> None:
     assert_no_messages(messages, "model card geometry")
 
 
+@pytest.mark.parametrize("screen", ["models", "onboarding"])
+def test_model_card_footer_aligns_with_name(onboarding_app: Any, screen: str) -> None:
+    assert WIDTH == 1024
+
+    def inspect(root: Any) -> None:
+        surface = root.contentItem() if isinstance(root, QQuickWindow) else root
+        cards = [
+            item for item in visual_tree(surface) if item.isVisible() and item.property("modelId")
+        ]
+        assert cards
+        for card in cards:
+            name = next(item for item in visual_tree(card) if item.objectName() == "modelName")
+            facts = next(item for item in visual_tree(card) if item.objectName() == "footerFacts")
+            name_x = name.mapToScene(QPointF(0, 0)).x()
+            facts_x = facts.mapToScene(QPointF(0, 0)).x()
+            assert facts_x == name_x, (card.property("modelId"), facts_x, name_x)
+            if screen == "models":
+                assert facts_x == 249, (card.property("modelId"), facts_x)
+
+    if screen == "models":
+        _, messages = render_settings(
+            onboarding_app, False, fake=FakeSettings(), section="models", inspect=inspect
+        )
+    else:
+        fake = FakeOnboarding()
+        fake.step = 2
+        fake.models = [fake.models[0], {**fake.models[0], "id": "failed", "state": "failed"}]
+        _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, f"model card footer alignment: {screen}")
+
+
+def test_settings_model_card_heights_and_action_edges(onboarding_app: Any) -> None:
+    assert WIDTH == 1024
+    fake = FakeSettings()
+    models = fake.models
+    fake.models = [
+        models[0],
+        {**models[0], "id": "second-installed", "badge": "installed", "selected": False},
+        *models[1:],
+    ]
+
+    def inspect(window: Any) -> None:
+        cards = {
+            item.property("modelId"): item
+            for item in visual_tree(window.contentItem())
+            if item.isVisible() and item.property("modelId")
+        }
+        expected_heights = {
+            models[0]["id"]: 92,
+            "second-installed": 105,
+            models[1]["id"]: 82,
+        }
+        heights = {model_id: card.height() for model_id, card in cards.items()}
+        assert set(cards) == set(expected_heights), heights
+        for model_id, expected_height in expected_heights.items():
+            card = cards[model_id]
+            assert card.width() == 796, f"{model_id}: width={card.width()}, heights={heights}"
+            assert card.height() == expected_height, f"{model_id}: heights={heights}"
+
+        for model_id, expected_buttons in (
+            (models[0]["id"], {"Удалить"}),
+            ("second-installed", {"Сделать рабочей", "Удалить"}),
+            (models[1]["id"], set()),
+        ):
+            card = cards[model_id]
+            buttons = {
+                item.property("text")
+                for item in visual_tree(card)
+                if item.isVisible() and item.metaObject().indexOfSignal(b"clicked()") >= 0
+            }
+            assert buttons == expected_buttons, f"{model_id}: {buttons}, heights={heights}"
+
+        visible_button(cards["second-installed"], "Сделать рабочей")
+        for model_id in (models[0]["id"], "second-installed"):
+            remove = visible_button(cards[model_id], "Удалить")
+            right = remove.mapToScene(QPointF(remove.width(), 0)).x()
+            assert right == 988, f"{model_id}: right={right}, heights={heights}"
+
+    _, messages = render_settings(
+        onboarding_app, False, fake=fake, section="models", inspect=inspect
+    )
+    assert_no_messages(messages, "model card heights and action edges")
+
+
 def test_models_first_card_vertical_alignment(onboarding_app: Any) -> None:
     fake = FakeSettings()
     geometry: list[tuple[int, int, int, int, int, int]] = []
