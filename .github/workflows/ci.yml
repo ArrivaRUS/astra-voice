@@ -107,6 +107,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             make git python3 python3-venv python3-pip python3-numpy \
             xvfb xauth \
+            fontconfig \
             python3-requests python3-jsonschema \
             python3-pyqt5 python3-pyqt5.qtquick python3-xlib python3-yaml \
             qml-module-qtquick2 qml-module-qtquick-controls2 \
@@ -123,6 +124,14 @@ jobs:
       - name: Зависимости xvfb-тестов обязаны быть установлены
         run: |
           "$VENV/bin/python" scripts/ci_require_imports.py tests/xvfb
+      # PT Root UI есть только в ALSE: с DejaVu подписи шире и тесты размеров падают.
+      # Проверка fc-match роняет шаг, если шрифт не установлен.
+      - name: Шрифт QML для тестов размеров
+        run: |
+          set -eu
+          install -D -m 0644 tests/fixtures/fonts/pt-root-ui/*.ttf -t /usr/local/share/fonts/pt-root-ui/
+          fc-cache -f
+          fc-match -f '%{family}' 'PT Root UI' | grep -q 'PT Root UI'
       - run: make test-xvfb VENV=$VENV
         env:
           ASTRA_VOICE_REQUIRE_QT: "1"

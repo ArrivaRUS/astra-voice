@@ -9,13 +9,17 @@ import os
 import re
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping, Set
+import traceback
+from collections.abc import Generator, Iterator, Mapping, Set
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
 from _pytest.nodes import Node
 from _pytest.terminal import TerminalReporter
+from pluggy import Result
+
+pytest_plugins = ("pytester",)
 
 _QT_AVAILABLE = pytest.StashKey[bool]()
 _QT_ENV_ERROR = pytest.StashKey[str | None]()
@@ -200,6 +204,16 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     pulse_env = item.config.stash.get(_PULSE_ENV, {})
     os.environ.update(pulse_env)
     item.stash[_PULSE_TEST_PROCESSES] = pulseaudio_processes()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item: pytest.Item) -> Generator[None, Result[None], None]:
+    outcome = yield
+    excinfo = outcome.excinfo
+    if excinfo is not None:
+        # Кадры упавшего теста держат обёртки QML удалённого окна: sip отдаст
+        # их новым объектам по тому же адресу — use-after-free.
+        traceback.clear_frames(excinfo[2])
 
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)

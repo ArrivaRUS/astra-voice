@@ -1584,6 +1584,8 @@ def render_onboarding(
             sip.delete(theme)
             app.processEvents()
         finally:
+            if "root" in locals():
+                root = None
             qInstallMessageHandler(previous)
 
 
@@ -1665,6 +1667,14 @@ def render_settings(
             sip.delete(theme)
             app.processEvents()
         finally:
+            if "window" in locals():
+                window = None
+            if "background" in locals():
+                background = None
+            if "background_component" in locals():
+                del background_component
+            if "roots" in locals():
+                roots.clear()
             qInstallMessageHandler(previous)
 
 
