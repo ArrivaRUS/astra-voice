@@ -151,6 +151,30 @@ def test_release_valid(assets: ReleaseAssets, validate: Callable[[list[str]], in
     )
 
 
+def test_release_relative_paths_from_other_cwd(
+    assets: ReleaseAssets,
+    validate: Callable[[list[str]], int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = assets.dist.parent / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    assert (
+        validate(
+            [
+                "release",
+                "--version",
+                "0.1.0",
+                "--dir",
+                "../dist",
+                "--keyring",
+                "../release.gpg",
+            ]
+        )
+        == 0
+    )
+
+
 def test_release_missing_admin(assets: ReleaseAssets, validate: Callable[[list[str]], int]) -> None:
     dist, keyring = assets
     (dist / "INSTALL-ADMIN.md").unlink()

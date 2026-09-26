@@ -199,6 +199,31 @@ def test_cli_usage() -> None:
     )
 
 
+def test_cli_relative_keyring_from_other_cwd(key: tuple[Path, str, str], tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copy2(key[0], tmp_path / "release.gpg")
+    script = ROOT / "scripts/check_keyring.py"
+    code = (
+        "import runpy, sys; "
+        "from pathlib import Path; "
+        "sys.path.insert(0, str(Path(sys.argv[1]).parents[1] / 'src')); "
+        "import astra_voice.security.verify as verify; "
+        "verify.PINNED_FINGERPRINTS = frozenset({sys.argv[2]}); "
+        "sys.argv = [sys.argv[1], '../release.gpg']; "
+        "raise SystemExit(runpy.run_path(sys.argv[0])['main']())"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(script), key[1]],
+        cwd=work,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 @contextmanager
 def generated_bundle(
     tmp_path: Path, expirations: tuple[str, ...] = (), second_master: bool = False

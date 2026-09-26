@@ -6,6 +6,7 @@ import os
 import runpy
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -120,8 +121,103 @@ def secret_for(keys: Keys, fingerprint: str | None = None) -> bytes:
     )
 
 
+def fake_secret_gpg(
+    tmp_path: Path, *, marker: str = "+", primary_validity: str = "u", subkey_validity: str = "u"
+) -> tuple[Path, Path, Path]:
+    master, signing = "A" * 40, "B" * 40
+
+    def record(kind: str, validity: str = "", capabilities: str = "", marker: str = "") -> str:
+        fields = [""] * 15
+        fields[0], fields[1], fields[11], fields[14] = kind, validity, capabilities, marker
+        return ":".join(fields)
+
+    def fpr(value: str) -> str:
+        fields = [""] * 10
+        fields[0], fields[9] = "fpr", value
+        return ":".join(fields)
+
+    secret = "\n".join(
+        (
+            record("sec", primary_validity, "cC", "#"),
+            fpr(master),
+            record("ssb", subkey_validity, "s", marker),
+            fpr(signing),
+        )
+    )
+    public = "\n".join((record("pub"), fpr(master), record("sub"), fpr(signing)))
+    fake = tmp_path / "fake-gpg"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'for arg in "$@"; do\n'
+        '  case "$arg" in\n'
+        "    --list-secret-keys) cat <<'SECRET'\n"
+        f"{secret}\n"
+        "SECRET\n"
+        "      exit 0 ;;\n"
+        "    --show-keys) cat <<'PUBLIC'\n"
+        f"{public}\n"
+        "PUBLIC\n"
+        "      exit 0 ;;\n"
+        "  esac\n"
+        "done\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    keyring = tmp_path / "release.gpg"
+    keyring.touch()
+    return fake, keyring, tmp_path
+
+
+def test_fake_secret_listing_returns_signing_fingerprint(
+    api: dict[str, object], tmp_path: Path
+) -> None:
+    fake, keyring, home = fake_secret_gpg(tmp_path)
+    assert check(api)(home, keyring, frozenset({"A" * 40}), frozenset(), str(fake)) == (
+        "B" * 40,
+        [],
+    )
+
+
+@pytest.mark.parametrize("marker", ["", ">D2760001240103040006"])
+def test_fake_token_or_missing_secret_rejected(
+    api: dict[str, object], tmp_path: Path, marker: str
+) -> None:
+    fake, keyring, home = fake_secret_gpg(tmp_path, marker=marker)
+    fingerprint, errors = check(api)(home, keyring, frozenset({"A" * 40}), frozenset(), str(fake))
+    assert fingerprint is None
+    assert "подключ на токене или без секрета" in " ".join(errors)
+    assert "ровно один секретный ssb" in " ".join(errors)
+
+
+@pytest.mark.parametrize("validity", ["i", "d"])
+@pytest.mark.parametrize(
+    ("key_kind", "expected"),
+    [
+        ("ssb", "секретный подключ отозван или истёк либо недействителен"),
+        ("sec", "первичный ключ отозван или истёк либо недействителен"),
+    ],
+    ids=["ssb", "sec"],
+)
+def test_fake_invalid_validity_rejected(
+    api: dict[str, object], tmp_path: Path, validity: str, key_kind: str, expected: str
+) -> None:
+    fake, keyring, home = fake_secret_gpg(
+        tmp_path,
+        primary_validity=validity if key_kind == "sec" else "u",
+        subkey_validity=validity if key_kind == "ssb" else "u",
+    )
+    fingerprint, errors = check(api)(home, keyring, frozenset({"A" * 40}), frozenset(), str(fake))
+    assert fingerprint is None
+    assert expected in " ".join(errors)
+
+
 def test_reference(keys: Keys, api: dict[str, object], tmp_path: Path) -> None:
     with imported(tmp_path, secret_for(keys, keys.s1)) as home:
+        listing = gpg(home, "--with-colons", "--list-secret-keys").decode()
+        markers = [line.split(":")[14] for line in listing.splitlines() if line.startswith("ssb:")]
+        assert markers.count("+") == 1, listing
+        assert set(markers) <= {"#", "+"}, listing
         assert check(api)(home, keys.keyring, frozenset({keys.master}), frozenset(), None) == (
             keys.s1,
             [],
@@ -144,6 +240,18 @@ def test_two_secret_subkeys_rejected(keys: Keys, api: dict[str, object], tmp_pat
         )
         assert fingerprint is None
         assert "ровно один секретный ssb" in " ".join(errors)
+
+
+def test_two_secret_masters_rejected(keys: Keys, api: dict[str, object], tmp_path: Path) -> None:
+    keyring = tmp_path / "both.gpg"
+    keyring.write_bytes(gpg(keys.home, "--export", keys.master, keys.m2))
+    with imported(tmp_path, secret_for(keys, keys.s1)) as home:
+        gpg(home, "--import", input_data=secret_for(keys, keys.m2_subkey))
+        fingerprint, errors = check(api)(
+            home, keyring, frozenset({keys.master, keys.m2}), frozenset(), None
+        )
+        assert fingerprint is None
+        assert "ожидался ровно один sec, найдено 2" in " ".join(errors)
 
 
 def test_foreign_subkey_rejected(keys: Keys, api: dict[str, object], tmp_path: Path) -> None:
@@ -337,3 +445,61 @@ def test_main_output(
         out = capsys.readouterr()
         assert out.out == ""
         assert "ОШИБКА: первичный ключ не закреплён" in out.err
+
+
+def run_pinned_cli(cwd: Path, master: str, *argv: str) -> subprocess.CompletedProcess[str]:
+    script = ROOT / "scripts/check_signing_secret.py"
+    code = (
+        "import runpy, sys; "
+        "main = runpy.run_path(sys.argv[1])['main']; "
+        "raise SystemExit(main(sys.argv[3:], frozenset({sys.argv[2]}), frozenset()))"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code, str(script), master, *argv],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
+def test_signature_cli_relative_paths(
+    keys: Keys, signed: tuple[Path, Path], tmp_path: Path
+) -> None:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    sig, data = signed
+    shutil.copy2(sig, dist / "SHA256SUMS.asc")
+    shutil.copy2(data, dist / "SHA256SUMS")
+    shutil.copy2(keys.keyring, tmp_path / "release.gpg")
+    result = run_pinned_cli(
+        dist,
+        keys.master,
+        "signature",
+        "--keyring",
+        "../release.gpg",
+        "--subkey",
+        keys.s1,
+        "SHA256SUMS.asc",
+        "SHA256SUMS",
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_secret_cli_relative_paths(keys: Keys, tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copy2(keys.keyring, tmp_path / "release.gpg")
+    with imported(tmp_path, secret_for(keys, keys.s1)):
+        result = run_pinned_cli(
+            work,
+            keys.master,
+            "secret",
+            "--homedir",
+            "../imported",
+            "--keyring",
+            "../release.gpg",
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == keys.s1 + "\n"

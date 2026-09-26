@@ -22,6 +22,7 @@ from astra_voice.security.verify import (  # noqa: E402
 )
 
 _FPR = re.compile(r"[0-9A-F]{40}\Z")
+_INVALID_VALIDITY = frozenset({"r", "e", "i", "d"})
 
 
 class _KeyRecord(NamedTuple):
@@ -100,23 +101,25 @@ def check_secret(
     if master is not None:
         if primary[0].marker != "#":
             errors.append("секрет мастера не является заглушкой")
-        if primary[0].validity in ("r", "e"):
-            errors.append(f"первичный ключ отозван или истёк: {master}")
+        if primary[0].validity in _INVALID_VALIDITY:
+            errors.append(f"первичный ключ отозван или истёк либо недействителен: {master}")
         if not _FPR.fullmatch(master):
             errors.append("отпечаток мастера некорректен")
         if master not in allowed:
             errors.append(f"первичный ключ не закреплён: {master}")
         if master in denied:
             errors.append(f"первичный ключ отозван: {master}")
-    real = [record for record in subkeys if record.marker != "#"]
+    real = [record for record in subkeys if record.marker == "+"]
+    if any(record.marker not in ("#", "+") for record in subkeys):
+        errors.append("подключ на токене или без секрета")
     if len(real) != 1:
         errors.append(f"ожидался ровно один секретный ssb, найдено {len(real)}")
     signing = real[0].fingerprint if len(real) == 1 else None
     if signing is not None:
         if "s" not in real[0].capabilities:
             errors.append(f"секретный подключ не имеет возможности подписи: {signing}")
-        if real[0].validity in ("r", "e"):
-            errors.append(f"секретный подключ отозван или истёк: {signing}")
+        if real[0].validity in _INVALID_VALIDITY:
+            errors.append(f"секретный подключ отозван или истёк либо недействителен: {signing}")
         if not _FPR.fullmatch(signing):
             errors.append("отпечаток подключа некорректен")
         if signing in denied:
@@ -197,10 +200,19 @@ def main(
     allowed = PINNED_FINGERPRINTS if pinned is None else pinned
     denied = REVOKED_FINGERPRINTS if revoked is None else revoked
     if args.command == "secret":
-        fingerprint, errors = check_secret(args.homedir, args.keyring, allowed, denied)
+        fingerprint, errors = check_secret(
+            args.homedir.resolve(), args.keyring.resolve(), allowed, denied
+        )
     else:
         fingerprint = None
-        errors = check_signature(args.keyring, args.sig, args.data, args.subkey, allowed, denied)
+        errors = check_signature(
+            args.keyring.resolve(),
+            args.sig.resolve(),
+            args.data.resolve(),
+            args.subkey,
+            allowed,
+            denied,
+        )
     for error in errors:
         print(f"ОШИБКА: {error}", file=sys.stderr)
     if errors:

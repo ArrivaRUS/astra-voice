@@ -137,6 +137,15 @@ def test_valid_signature_accepted(env: dict[str, object]) -> None:
     assert res.primary_fingerprint == env["release_fpr"]
 
 
+def test_relative_signature_paths_accepted(
+    env: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(Path(str(env["root"])))
+    verifier = _verifier(env, keyring=Path("release.gpg"))
+    result = verifier.verify_detached(Path("SHA256SUMS"), Path("release.sig"))
+    assert result.ok, result.reason
+
+
 def test_subkey_accepted_by_primary_pin(env: dict[str, object]) -> None:
     """Пин первичного ключа принимает подпись его подключа (ротация S1→S2)."""
     res = _verifier(env).verify_detached(Path(str(env["data"])), Path(str(env["sig_subkey"])))
