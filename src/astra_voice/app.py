@@ -511,7 +511,12 @@ class _RuntimeOnboardingHost:
         self._shell = shell
 
     def begin_capture(self) -> bool:
-        return self._runtime.begin_hotkey_capture()
+        try:
+            root = _root_window(self._shell)
+            own_window = int(root.winId()) if root is not None else None
+        except Exception:
+            own_window = None
+        return self._runtime.begin_hotkey_capture(own_window=own_window or None)
 
     def set_capture_callback(self, callback: Callable[[str, str], None]) -> None:
         self._runtime.set_hotkey_capture_callback(callback)
@@ -852,9 +857,12 @@ def main(argv: list[str] | None = None) -> int:
                 settings=settings,
                 switcher=runtime,
                 revocation_unknown=lambda: runtime.revocation_unknown,
+                revoked_check=revoked_check,
             )
         else:
-            downloads = ModelDownloads(model, store=model_store, settings=settings)
+            downloads = ModelDownloads(
+                model, store=model_store, settings=settings, revoked_check=revoked_check
+            )
         downloads.start_recheck()
         if runtime_ready and runtime is not None:
             runtime.on_revocation_unknown = downloads.revocation_unknown_changed

@@ -538,6 +538,7 @@ def test_onboarding_host_delegates_and_hides_root(
     notification = Mock()
     monkeypatch.setattr(notify, "notify_onboarding_ready", notification)
     root = Mock()
+    root.winId.return_value = 271
     rig.shell.rootObjects.return_value = [root]
     host = app_mod._RuntimeOnboardingHost(rig.runtime, rig.shell)
     rig.runtime.begin_hotkey_capture.return_value = True
@@ -549,7 +550,7 @@ def test_onboarding_host_delegates_and_hides_root(
     assert host.free_candidates(["Ctrl+Alt+D"]) == ["Ctrl+Alt+D"]
     host.notify_ready("Ctrl+Alt+D")
     host.hide_window()
-    rig.runtime.begin_hotkey_capture.assert_called_once_with()
+    rig.runtime.begin_hotkey_capture.assert_called_once_with(own_window=271)
     rig.runtime.end_hotkey_capture.assert_called_once_with()
     rig.runtime.hotkey.probe.assert_called_once_with("Ctrl+Space")
     rig.runtime.hotkey.free_candidates.assert_called_once_with(["Ctrl+Alt+D"])
@@ -557,6 +558,19 @@ def test_onboarding_host_delegates_and_hides_root(
     root.hide.assert_called_once_with()
     rig.shell.rootObjects.return_value = []
     host.hide_window()
+
+
+@pytest.mark.parametrize("window_id", [0, RuntimeError("window unavailable")])
+def test_onboarding_host_ignores_unavailable_window_id(rig: Rig, window_id: object) -> None:
+    root = Mock()
+    if isinstance(window_id, Exception):
+        root.winId.side_effect = window_id
+    else:
+        root.winId.return_value = window_id
+    rig.shell.rootObjects.return_value = [root]
+    host = app_mod._RuntimeOnboardingHost(rig.runtime, rig.shell)
+    host.begin_capture()
+    rig.runtime.begin_hotkey_capture.assert_called_once_with(own_window=None)
 
 
 def test_finishing_onboarding_updates_context(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:

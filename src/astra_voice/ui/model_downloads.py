@@ -34,12 +34,12 @@ from PyQt5.QtCore import (
 from astra_voice.core import paths
 from astra_voice.core.measurements import read_measurements
 from astra_voice.core.model_request import model_threads
-from astra_voice.core.model_source import SmokeRunner
+from astra_voice.core.model_source import RevocationUnknown, SmokeRunner
 from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
 from astra_voice.models import catalog_state
-from astra_voice.models.catalog import CatalogEntry, load_builtin, merge_measurement
+from astra_voice.models.catalog import CatalogEntry, CatalogError, load_builtin, merge_measurement
 from astra_voice.models.downloader import Downloader, DownloadError, Progress
 from astra_voice.models.installer import (
     Installer,
@@ -761,6 +761,7 @@ class ModelDownloads(QObject):
         clock: Callable[[], float] = time.monotonic,
         settings: Settings | None = None,
         revocation_unknown: Callable[[], bool] | None = None,
+        revoked_check: Callable[[str, str], bool] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -768,6 +769,9 @@ class ModelDownloads(QObject):
         self._store = store
         self._settings = settings or Settings()
         self._revocation_unknown = revocation_unknown
+        self._revoked_check = revoked_check
+        self._catalog_revocation_warned = False
+        self._snapshot_revocation_warned = False
         self._revocation_unknown_state = bool(revocation_unknown()) if revocation_unknown else False
         self._measurements_cache: dict[str, Any] | None = None
         self._switcher = switcher
@@ -900,15 +904,37 @@ class ModelDownloads(QObject):
     def modelReady(self) -> bool:  # noqa: N802
         return self._model is not None and self._model.installed_ok()
 
-    def _is_revoked(self, entry: Any) -> bool:
-        """Спрашивает порт об отзыве; порт без этого метода отзывов не знает."""
+    def _is_revoked(self, entry: Any, revision: str | None = None) -> bool:
+        """Проверяет отзыв версии в каталоге.
+
+        Проверка по снимку защитная: в проде без каталога карточек нет.
+        Она нужна, если порт каталога есть, но проверка отзыва упала или отсутствует.
+        """
+        revision = revision or self._installed_revision(entry) or entry.revision
         checker = getattr(self._model, "is_revoked", None)
-        if not callable(checker):
+        if callable(checker):
+            try:
+                if revision == entry.revision:
+                    return bool(checker(entry))
+                revision_checker = getattr(self._model, "revoked_revision", None)
+                if callable(revision_checker):
+                    return bool(revision_checker(entry.id, revision))
+            except (OSError, StoreError, CatalogError, RevocationUnknown):
+                if not self._catalog_revocation_warned:
+                    log.warning("Не удалось проверить отзыв версии модели", exc_info=True)
+                    self._catalog_revocation_warned = True
+                else:
+                    log.debug("Не удалось проверить отзыв версии модели", exc_info=True)
+        if self._revoked_check is None:
             return False
         try:
-            return bool(checker(entry))
-        except (OSError, StoreError):
-            log.warning("Не удалось проверить отзыв версии модели")
+            return bool(self._revoked_check(entry.id, revision))
+        except (OSError, StoreError, CatalogError, RevocationUnknown):
+            if not self._snapshot_revocation_warned:
+                log.warning("Не удалось проверить отзыв версии модели по снимку", exc_info=True)
+                self._snapshot_revocation_warned = True
+            else:
+                log.debug("Не удалось проверить отзыв версии модели по снимку", exc_info=True)
             return False
 
     def _card_state(self, entry: Any, installed: tuple[tuple[str, str], ...] | None = None) -> str:
@@ -1409,6 +1435,9 @@ class ModelDownloads(QObject):
         revision = self._installed_revision(entry)
         if not revision or self._model.record_state(entry.id, revision) != "ok":
             return
+        if self._is_revoked(entry, revision):
+            self._set_card(entry, "failed", _REVOKED_MESSAGE)
+            return
         if self._switcher is not None:
             self._start_switch(entry, revision, pause=False)
             return
@@ -1432,11 +1461,17 @@ class ModelDownloads(QObject):
             return
         revision = self._installed_revision(entry)
         if revision and self._model.record_state(entry.id, revision) == "ok":
+            if self._is_revoked(entry, revision):
+                self._set_card(entry, "failed", _REVOKED_MESSAGE)
+                return
             self._start_switch(entry, revision, pause=True)
 
     def _start_switch(self, entry: Any, revision: str, *, pause: bool) -> None:
         model, switcher = self._model, self._switcher
         if model is None or switcher is None:
+            return
+        if self._is_revoked(entry, revision):
+            self._set_card(entry, "failed", _REVOKED_MESSAGE)
             return
         previous = model.current_ids()
         if previous == (entry.id, revision):

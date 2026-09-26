@@ -1256,7 +1256,7 @@ class DictationRuntime(QObject):
             except Exception:
                 log.warning("Не удалось сохранить статистику")
 
-    def begin_hotkey_capture(self) -> bool:
+    def begin_hotkey_capture(self, own_window: int | None = None) -> bool:
         """Захватывает клавиатуру; сторож читает клавиши со своего X-соединения.
 
         Сторож создаёт отдельное X-соединение в своём потоке. GUI получает
@@ -1277,7 +1277,8 @@ class DictationRuntime(QObject):
             else None
         )
         self._capture_watchdog = watchdog
-        if watchdog.open():
+        opened = watchdog.open(own_window=own_window or None)
+        if opened:
             return True
         self.end_hotkey_capture()
         return False

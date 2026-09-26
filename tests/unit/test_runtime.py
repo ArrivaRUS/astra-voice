@@ -327,7 +327,8 @@ class Rig:
     def create_capture_watchdog(self) -> Mock:
         watchdog = Mock(active=False)
 
-        def open_capture() -> bool:
+        def open_capture(*, own_window: int | None = None) -> bool:
+            del own_window
             self.record("capture.open")
             watchdog.active = self.capture_open_ok
             return self.capture_open_ok
@@ -2535,10 +2536,10 @@ def test_begin_and_end_hotkey_capture_use_dedicated_watchdog(rig: Rig) -> None:
     assert runtime.begin_hotkey_capture()
     watchdog = rig.capture_watchdogs[0]
     rig.capture_watchdog_factory.assert_called_once_with()
-    watchdog.open.assert_called_once_with()
+    watchdog.open.assert_called_once_with(own_window=None)
     assert watchdog.active
     assert runtime.begin_hotkey_capture()
-    watchdog.open.assert_called_once_with()
+    watchdog.open.assert_called_once_with(own_window=None)
     rig.capture_watchdog_factory.assert_called_once_with()
     runtime.end_hotkey_capture()
     runtime.end_hotkey_capture()
@@ -2552,6 +2553,12 @@ def test_begin_and_end_hotkey_capture_use_dedicated_watchdog(rig: Rig) -> None:
     assert rig.x11.mock_calls == [], "Захват поля затронул основное X-соединение"
     assert rig.hotkey.mock_calls == [], "Захват поля затронул соединение хоткея"
     assert not rig.timers, "Сторож поля использовал GUI-таймер"
+
+
+def test_begin_hotkey_capture_passes_own_window_to_watchdog(rig: Rig) -> None:
+    assert rig.runtime.begin_hotkey_capture(own_window=271)
+    rig.capture_watchdogs[0].open.assert_called_once_with(own_window=271)
+    rig.runtime.end_hotkey_capture()
 
 
 def test_hotkey_capture_passes_key_callback_to_watchdog(rig: Rig) -> None:

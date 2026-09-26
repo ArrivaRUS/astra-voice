@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import replace
@@ -17,6 +18,7 @@ from PyQt5.QtCore import QCoreApplication
 from PyQt5.QtTest import QSignalSpy
 
 from astra_voice.core import settings as settings_mod
+from astra_voice.core.model_source import RevocationUnknown
 from astra_voice.models.catalog import CatalogEntry
 from astra_voice.models.downloader import Progress
 from astra_voice.models.store import ModelRecord, ModelState, StoreError
@@ -292,6 +294,162 @@ def test_installed_summary_is_empty_without_catalog() -> None:
         assert downloads.installedSummary == ""
         assert downloads.installedCount == 0
         assert downloads.models == []
+    finally:
+        downloads.shutdown()
+
+
+@pytest.mark.parametrize("catalog_failure", ["missing", "store_error", "os_error"])
+@pytest.mark.parametrize("action", ["make_direct", "make", "pause"])
+def test_snapshot_revocation_blocks_current_change_when_catalog_unavailable(
+    catalog_failure: str, action: str
+) -> None:
+    port = FakeManagedPort()
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    if catalog_failure == "missing":
+        port.is_revoked = None  # type: ignore[assignment]
+    else:
+        error = StoreError("catalog") if catalog_failure == "store_error" else OSError("catalog")
+        port.is_revoked = Mock(side_effect=error)  # type: ignore[method-assign]
+    set_current = Mock(wraps=port.set_current)
+    port.set_current = set_current  # type: ignore[method-assign]
+    switcher = FakeSwitchPort(enough_memory=True)
+    checked: list[tuple[str, str]] = []
+
+    def revoked(model_id: str, revision: str) -> bool:
+        checked.append((model_id, revision))
+        return (model_id, revision) == (TONE.id, TONE.revision)
+
+    downloads = ModelDownloads(
+        port, switcher=None if action == "make_direct" else switcher, revoked_check=revoked
+    )
+    try:
+        item = card(downloads, TONE.id)
+        assert item["state"] == "failed"
+        assert item["message"] == model_downloads._REVOKED_MESSAGE
+        if action in {"make", "make_direct"}:
+            downloads.makeModelCurrent(TONE.id)
+        else:
+            downloads.switchModelWithPause(TONE.id)
+        assert (TONE.id, TONE.revision) in checked
+        assert port.current == (GIGAAM.id, GIGAAM.revision)
+        set_current.assert_not_called()
+        assert switcher.calls == []
+        assert card(downloads, TONE.id)["state"] == "failed"
+    finally:
+        downloads.shutdown()
+
+
+@pytest.mark.parametrize("action", ["make", "pause"])
+def test_snapshot_without_revocation_allows_switch(action: str) -> None:
+    port = FakeManagedPort()
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    port.is_revoked = None  # type: ignore[assignment]
+    switcher = FakeSwitchPort(enough_memory=True)
+    downloads = ModelDownloads(port, switcher=switcher, revoked_check=lambda _id, _rev: False)
+    try:
+        if action == "make":
+            downloads.makeModelCurrent(TONE.id)
+            assert switcher.calls == [(TONE.min_ram_mb, False)]
+        else:
+            downloads.switchModelWithPause(TONE.id)
+            assert switcher.calls == [(TONE.min_ram_mb, True)]
+        assert port.current == (TONE.id, TONE.revision)
+    finally:
+        downloads.shutdown()
+
+
+def test_snapshot_checks_installed_revision_before_switch() -> None:
+    port = FakeManagedPort()
+    old_revision = "r0"
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.records[(TONE.id, old_revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    port.is_revoked = None  # type: ignore[assignment]
+    checked: list[tuple[str, str]] = []
+
+    def revoked(model_id: str, revision: str) -> bool:
+        checked.append((model_id, revision))
+        return (model_id, revision) == (TONE.id, old_revision)
+
+    downloads = ModelDownloads(port, revoked_check=revoked)
+    try:
+        assert card(downloads, TONE.id)["state"] == "failed"
+        downloads.makeModelCurrent(TONE.id)
+        assert port.current == (GIGAAM.id, GIGAAM.revision)
+        assert (TONE.id, old_revision) in checked
+        assert (TONE.id, TONE.revision) not in checked
+    finally:
+        downloads.shutdown()
+
+
+@pytest.mark.parametrize("with_switcher", [False, True])
+def test_catalog_revokes_installed_old_revision_without_snapshot(with_switcher: bool) -> None:
+    port = FakeManagedPort()
+    old_revision = "r0"
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.records[(TONE.id, old_revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    revoked_revision = Mock(
+        side_effect=lambda model_id, revision: (model_id, revision) == (TONE.id, old_revision)
+    )
+    port.revoked_revision = revoked_revision  # type: ignore[method-assign]
+    set_current = Mock(wraps=port.set_current)
+    port.set_current = set_current  # type: ignore[method-assign]
+    switcher = FakeSwitchPort(enough_memory=True)
+    downloads = ModelDownloads(port, switcher=switcher if with_switcher else None)
+    try:
+        assert card(downloads, TONE.id)["state"] == "failed"
+        revoked_revision.assert_any_call(TONE.id, old_revision)
+        downloads.makeModelCurrent(TONE.id)
+        assert port.current == (GIGAAM.id, GIGAAM.revision)
+        set_current.assert_not_called()
+        assert switcher.calls == []
+    finally:
+        downloads.shutdown()
+
+
+def test_revocation_failures_warn_once_per_source(caplog: pytest.LogCaptureFixture) -> None:
+    port = FakeManagedPort()
+    port.is_revoked = Mock(side_effect=StoreError("catalog unavailable"))  # type: ignore[method-assign]
+
+    def failed_snapshot(_model_id: str, _revision: str) -> bool:
+        raise RevocationUnknown("snapshot unavailable")
+
+    downloads = ModelDownloads(port, revoked_check=failed_snapshot)
+    try:
+        with caplog.at_level(logging.DEBUG, logger=model_downloads.__name__):
+            for _ in range(3):
+                card(downloads, TONE.id)
+                downloads.modelsChanged.emit()
+        warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert [record.message for record in warnings] == [
+            "Не удалось проверить отзыв версии модели",
+            "Не удалось проверить отзыв версии модели по снимку",
+        ]
+        assert all(record.exc_info is not None for record in warnings)
+        assert any(record.levelno == logging.DEBUG for record in caplog.records)
+    finally:
+        downloads.shutdown()
+
+
+@pytest.mark.parametrize("error", [RevocationUnknown, OSError])
+def test_snapshot_check_failure_keeps_previous_behavior(error: type[Exception]) -> None:
+    port = FakeManagedPort()
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    port.is_revoked = None  # type: ignore[assignment]
+
+    def failed_check(_model_id: str, _revision: str) -> bool:
+        raise error("snapshot unavailable")
+
+    downloads = ModelDownloads(port, revoked_check=failed_check)
+    try:
+        assert card(downloads, TONE.id)["state"] == "installed"
+        downloads.makeModelCurrent(TONE.id)
+        assert port.current == (TONE.id, TONE.revision)
     finally:
         downloads.shutdown()
 
