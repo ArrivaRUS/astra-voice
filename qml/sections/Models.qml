@@ -171,9 +171,16 @@ Item {
             spacing: Theme.spaceGroupCaptionGap
             visible: root.installedEntries.length > 0
 
-            GroupCaption {
-                objectName: "installedCaption"
-                text: qsTr("Установленные · %1").arg(root.installedEntries.length)
+            Item {
+                width: parent.width
+                height: installedCaption.implicitHeight + Theme.modelCardFirstGroupTopGap - content.spacing
+
+                GroupCaption {
+                    id: installedCaption
+                    objectName: "installedCaption"
+                    anchors.bottom: parent.bottom
+                    text: qsTr("Установленные · %1").arg(root.installedEntries.length)
+                }
             }
 
             Column {
@@ -202,9 +209,16 @@ Item {
             spacing: Theme.spaceGroupCaptionGap
             visible: root.availableEntries.length > 0
 
-            GroupCaption {
-                objectName: "availableCaption"
-                text: qsTr("Доступные · %1").arg(root.availableEntries.length)
+            Item {
+                width: parent.width
+                height: availableCaption.implicitHeight + (root.installedEntries.length > 0 ? 0 : Theme.modelCardFirstGroupTopGap - content.spacing)
+
+                GroupCaption {
+                    id: availableCaption
+                    objectName: "availableCaption"
+                    anchors.bottom: parent.bottom
+                    text: qsTr("Доступные · %1").arg(root.availableEntries.length)
+                }
             }
 
             Column {

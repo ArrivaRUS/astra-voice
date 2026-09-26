@@ -325,6 +325,7 @@ QtObject {
     readonly property var micLevelMeterSampleLive: [9, 16, 26, 31, 20, 12, 22, 15, 8]
     readonly property var micLevelMeterSampleQuiet: [5, 7, 6, 8, 6, 5, 7, 6, 5]
     readonly property real modelCardBadgesGap: 5
+    readonly property real modelCardFirstGroupTopGap: 12
     readonly property real modelCardFooterActionsGap: 8
     readonly property real modelCardFooterActionsMaxShare: 0.65
     readonly property real modelCardFooterBtnTextOffset: 5

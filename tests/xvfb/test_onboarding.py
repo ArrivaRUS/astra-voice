@@ -2190,27 +2190,13 @@ def test_models_first_card_vertical_alignment(onboarding_app: Any) -> None:
             )
         )
 
-    image, messages = render_settings(
+    _, messages = render_settings(
         onboarding_app, False, fake=fake, section="models", inspect=inspect
     )
     assert_no_messages(messages, "models first card position")
-    chip_top, chip_bottom, caption_x, caption_top, caption_bottom, card_top = geometry[0]
-    background = image.pixelColor(caption_x, caption_top)
-    ink_top = next(
-        y
-        for y in range(caption_top, card_top)
-        if any(
-            abs(image.pixelColor(x, y).red() - background.red()) > 20
-            for x in range(caption_x, caption_x + 200)
-        )
-    )
-    print(
-        "Models geometry:",
-        f"chip={chip_top}..{chip_bottom}, caption={caption_top}..{caption_bottom}, "
-        f"ink={ink_top}, card={card_top}",
-    )
+    _, chip_bottom, _, caption_top, _, card_top = geometry[0]
+    assert caption_top - chip_bottom == theme_number("modelCardFirstGroupTopGap"), geometry[0]
     assert 123 <= card_top <= 126, geometry[0]
-    assert 17 <= card_top - caption_bottom <= 19, geometry[0]
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
