@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Protocol
+from typing import Protocol, cast
 
 from PyQt5.QtCore import QEvent, QObject, Qt, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QGuiApplication
 
 from astra_voice.core.settings import is_valid_combo
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
@@ -55,6 +56,7 @@ class HotkeyCapture(QObject):
         self._save: Callable[[str, bool], str] | None = None
         self.keep_busy = False
         self._window: QObject | None = None
+        self._application: QGuiApplication | None = None
         self.keyEvent.connect(self._handle_key_event, Qt.QueuedConnection)
 
     def attach_window(self, window: QObject) -> None:
@@ -64,6 +66,23 @@ class HotkeyCapture(QObject):
             self._window.removeEventFilter(self)
         self._window = window
         window.installEventFilter(self)
+        application = QGuiApplication.instance()
+        if (
+            application is not None
+            and QGuiApplication.platformName() != "xcb"
+            and hasattr(application, "applicationStateChanged")
+            and application is not self._application
+        ):
+            if self._application is not None:
+                self._application.applicationStateChanged.disconnect(
+                    self._application_state_changed
+                )
+            self._application = cast(QGuiApplication, application)
+            self._application.applicationStateChanged.connect(self._application_state_changed)
+
+    def _application_state_changed(self, state: Qt.ApplicationState) -> None:
+        if self.state == "capturing" and state != Qt.ApplicationActive:
+            self.cancel()
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
         minimized = event.type() == QEvent.WindowStateChange and bool(
@@ -72,6 +91,15 @@ class HotkeyCapture(QObject):
         if obj is self._window and (event.type() in (QEvent.Hide, QEvent.Close) or minimized):
             if self.state == "capturing":
                 self.cancel()
+        # На xcb наш XGrabKeyboard(root) сам даёт FocusOut(NotifyGrab),
+        # который Qt превращает в WindowDeactivate; реальную смену ловит сторож.
+        if (
+            self.state == "capturing"
+            and QGuiApplication.platformName() != "xcb"
+            and obj is self._window
+            and event.type() == QEvent.WindowDeactivate
+        ):
+            self.cancel()
         if obj is self._window and event.type() in (
             QEvent.Show,
             QEvent.Hide,

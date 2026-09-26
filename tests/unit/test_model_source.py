@@ -628,7 +628,19 @@ def test_unreadable_catalog_does_not_block_model(
         )
 
     assert request is not None
-    assert "Не удалось проверить отзыв версии модели" in caplog.text
+    assert "Не удалось проверить список отозванных версий модели" in caplog.text
+
+
+def test_unreadable_catalog_without_callback_warns_each_time(
+    settings: Settings, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    revoked = Mock(side_effect=OSError("нет файла"))
+    with caplog.at_level(logging.WARNING, logger=model_source.__name__):
+        for _ in range(2):
+            assert resolve_model_request(settings, None, store_dir=tmp_path, revoked=revoked)
+    assert [row.message for row in caplog.records if row.name == model_source.__name__] == [
+        "Не удалось проверить список отозванных версий модели"
+    ] * 2
 
 
 def test_missing_model_is_still_not_configured(tmp_path: Path) -> None:

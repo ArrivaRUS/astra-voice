@@ -11,6 +11,7 @@ Item {
     // Левая часть (§2.1): loading | active | switching | error | none.
     property string modelState: "active"
     property string modelName: "GigaAM v3 RNN-T"
+    property bool revocationUnknown: false
     // Правая часть (§2.2). В M1 реализовано состояние 1 — `disabled`.
     property string updateState: "disabled"
     property string version: "v0.2.0"
@@ -24,6 +25,9 @@ Item {
         default: return modelName;
         }
     }
+
+    readonly property string warningText: revocationUnknown && modelState === "active"
+        ? qsTr("Проверить отозванные версии сейчас нельзя") : ""
 
     readonly property string updateText: {
         switch (updateState) {
@@ -48,16 +52,19 @@ Item {
     }
 
     Item {
+        id: content
         anchors.fill: parent
         anchors.leftMargin: Theme.cardRowPaddingX
         anchors.rightMargin: Theme.cardRowPaddingX
 
         RowLayout {
+            id: modelRow
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             spacing: 7  // §2: зазор иконки трея до текста
 
             BrandMark {
+                id: statusMark
                 size: Theme.statusbarTrayIcon
                 tray: true  // иконка состояния — мастер-геометрия 22 (§9.1), не логотип
                 color: Theme.statusbarFg
@@ -65,8 +72,40 @@ Item {
             }
 
             Text {
+                objectName: "statusModelName"
                 textFormat: Text.PlainText
                 text: root.modelText
+                elide: Text.ElideRight
+                color: Theme.statusbarFg
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontStatusbarSize
+                renderType: Text.NativeRendering
+                Layout.alignment: Qt.AlignVCenter
+                Layout.maximumWidth: root.warningText
+                    ? Math.max(0, content.width - updateRow.width - Theme.statusbarGap
+                               - statusMark.width - modelRow.spacing * 3
+                               - warningSeparator.implicitWidth - warningLabel.implicitWidth)
+                    : implicitWidth
+            }
+
+            Text {
+                id: warningSeparator
+                textFormat: Text.PlainText
+                text: " · "
+                visible: root.warningText !== ""
+                color: Theme.statusbarFg
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontStatusbarSize
+                renderType: Text.NativeRendering
+                Layout.alignment: Qt.AlignVCenter
+            }
+
+            Text {
+                id: warningLabel
+                objectName: "statusRevocationWarning"
+                textFormat: Text.PlainText
+                text: root.warningText
+                visible: root.warningText !== ""
                 color: Theme.statusbarFg
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontStatusbarSize
@@ -76,6 +115,7 @@ Item {
         }
 
         RowLayout {
+            id: updateRow
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             spacing: Theme.statusbarGap

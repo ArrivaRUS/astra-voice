@@ -35,8 +35,9 @@ def qt() -> Iterator[dict[str, Any]]:
     """Приложение Qt + перехват сообщений. Без QtQuick тест не имеет смысла — skip."""
     pytest.importorskip("PyQt5.QtQuick", reason="нужен python3-pyqt5.qtquick")
     from PyQt5.QtCore import QUrl, qInstallMessageHandler
-    from PyQt5.QtGui import QGuiApplication
     from PyQt5.QtQml import QQmlEngine
+
+    from helpers.qt_app import get_qapplication
 
     messages: list[str] = []
 
@@ -44,7 +45,7 @@ def qt() -> Iterator[dict[str, Any]]:
         messages.append(text)
 
     previous = qInstallMessageHandler(handler)
-    app = QGuiApplication.instance() or QGuiApplication([])
+    app = get_qapplication()
     engine = QQmlEngine()
     try:
         yield {"app": app, "engine": engine, "messages": messages, "url": QUrl.fromLocalFile}
@@ -54,6 +55,57 @@ def qt() -> Iterator[dict[str, Any]]:
 
 def test_qml_tree_is_not_empty() -> None:
     assert QML_FILES, "не найдено ни одного qml/**/*.qml"
+
+
+def test_status_bar_revocation_warning_priority(qt: dict[str, Any]) -> None:
+    from PyQt5.QtCore import QObject
+    from PyQt5.QtQml import QQmlComponent
+    from PyQt5.QtQuick import QQuickWindow
+
+    component = QQmlComponent(qt["engine"], qt["url"](str(QML_DIR / "StatusBar.qml")))
+    bar = component.create()
+    assert bar is not None, [error.toString() for error in component.errors()]
+    name = bar.findChild(QObject, "statusModelName")
+    warning = bar.findChild(QObject, "statusRevocationWarning")
+    assert name is not None and warning is not None
+
+    assert bar.setProperty("modelName", "Текущая модель")
+    assert bar.setProperty("revocationUnknown", True)
+    assert bar.property("modelText") == "Текущая модель"
+    assert bar.property("warningText") == "Проверить отозванные версии сейчас нельзя"
+    assert warning.property("visible")
+    assert warning.property("text") == bar.property("warningText")
+
+    for state, expected in (
+        ("error", "Модель не загрузилась — открыть Модели"),
+        ("loading", "Загружаю Текущая модель…"),
+        ("switching", "Переключаю на Текущая модель…"),
+        ("none", "Модель не выбрана — установить"),
+    ):
+        assert bar.setProperty("modelState", state)
+        assert bar.property("modelText") == expected
+        assert bar.property("warningText") == ""
+        assert not warning.property("visible")
+
+    assert bar.setProperty("modelState", "active")
+    assert bar.setProperty("revocationUnknown", False)
+    assert bar.property("modelText") == "Текущая модель"
+    assert bar.property("warningText") == ""
+    assert not warning.property("visible")
+
+    assert bar.setProperty(
+        "modelName", "Текущая модель с очень длинным названием для узкой строки состояния"
+    )
+    assert bar.setProperty("revocationUnknown", True)
+    window = QQuickWindow()
+    bar.setParentItem(window.contentItem())
+    window.setWidth(700)
+    window.show()
+    assert bar.setProperty("width", 700)
+    qt["app"].processEvents()
+    assert warning.property("implicitWidth") <= warning.property("width")
+    assert name.property("truncated")
+    window.close()
 
 
 @pytest.mark.parametrize("qml_file", QML_FILES, ids=lambda p: str(p.relative_to(QML_DIR)))

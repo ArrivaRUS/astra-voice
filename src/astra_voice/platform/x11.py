@@ -591,6 +591,27 @@ class X11Display:
         windows = self._root_windows("_NET_ACTIVE_WINDOW")
         return windows[0] if windows else None
 
+    def watch_active_window(self) -> tuple[int, int | None] | None:
+        """Подписаться на изменения корня и вернуть атом и исходное окно.
+
+        Если свойства нет, оконный менеджер не предоставляет этот сигнал.
+        Вызывать только на отдельном соединении сторожа захвата.
+        """
+        from Xlib import X
+
+        if self.root is None:
+            return None
+        conn = self._require_display()
+        atom = conn.intern_atom("_NET_ACTIVE_WINDOW", only_if_exists=True)
+        if not atom:
+            return None
+        self.root.change_attributes(event_mask=X.PropertyChangeMask)
+        prop = self.root.get_full_property(atom, X.AnyPropertyType)
+        if prop is None or prop.format != 32:
+            return None
+        window = int(prop.value[0]) if len(prop.value) else 0
+        return int(atom), window or None
+
     def focus_client(self) -> int | None:
         """Клиент EWMH, которому принадлежит фокус ввода, или None.
 

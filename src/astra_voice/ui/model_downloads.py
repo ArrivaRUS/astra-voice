@@ -81,6 +81,7 @@ _REMOVE_FAILED_MESSAGE = "Не удалось удалить модель. По�
 _SWITCH_FAILED_MESSAGE = "Не удалось загрузить модель. Рабочая модель не изменилась."
 _FIRST_SWITCH_FAILED_MESSAGE = "Не удалось загрузить модель. Попробуйте ещё раз."
 _REMOVED_HINT = "Снята с каталога — обновлений не будет"
+_REVOCATION_UNKNOWN_HINT = "Не удалось проверить список отозванных версий"
 _SWITCH_PAUSE_HINT = (
     "Не хватает свободной памяти для переключения во время работы. "
     "Можно переключить с короткой паузой: около 5 секунд без диктовки."
@@ -731,6 +732,7 @@ class ModelDownloads(QObject):
     """Общая очередь установки и состояния каталога, независимые от окна."""
 
     modelsChanged = pyqtSignal()
+    revocationUnknownChanged = pyqtSignal()
     selectionChanged = pyqtSignal()
     freeSpaceTextChanged = pyqtSignal()
     downloadStateChanged = pyqtSignal()
@@ -758,12 +760,15 @@ class ModelDownloads(QObject):
         switcher: SwitchPort | None = None,
         clock: Callable[[], float] = time.monotonic,
         settings: Settings | None = None,
+        revocation_unknown: Callable[[], bool] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._model = model
         self._store = store
         self._settings = settings or Settings()
+        self._revocation_unknown = revocation_unknown
+        self._revocation_unknown_state = bool(revocation_unknown()) if revocation_unknown else False
         self._measurements_cache: dict[str, Any] | None = None
         self._switcher = switcher
         self._switching_entry: Any | None = None
@@ -813,6 +818,8 @@ class ModelDownloads(QObject):
         self._pending_notifications: dict[str, tuple[object, ...]] = {}
         self._free_space_text = ""
         self._initial_model_state()
+        # защитный: начальное состояние до первого чтения карточек
+        self._sync_revocation_hint()
         self._refresh_free_space_text()
         # selectionChanged публикуется также после завершения каждой модели в очереди.
         self.selectionChanged.connect(self._refresh_free_space_text)
@@ -823,6 +830,50 @@ class ModelDownloads(QObject):
     def model(self) -> ModelPort | None:
         """Доступ к службе моделей для мостов: очередь владеет ею одна."""
         return self._model
+
+    def _sync_revocation_hint(self) -> None:
+        if self._model is None:
+            return
+        if not self._revocation_unknown_state:
+            for model_id, hint in tuple(self._card_hints.items()):
+                if hint == _REVOCATION_UNKNOWN_HINT:
+                    self._card_hints.pop(model_id, None)
+                    self._card_hint_kinds.pop(model_id, None)
+            return
+        try:
+            current = self._model.current_ids()
+        except (OSError, StoreError):
+            return
+        for model_id, hint in tuple(self._card_hints.items()):
+            if hint == _REVOCATION_UNKNOWN_HINT and (current is None or model_id != current[0]):
+                self._card_hints.pop(model_id, None)
+                self._card_hint_kinds.pop(model_id, None)
+        if current is None:
+            return
+        for entry in self._entries:
+            if entry.id == current[0]:
+                self._card_hints[entry.id] = _REVOCATION_UNKNOWN_HINT
+                self._card_hint_kinds[entry.id] = "warning"
+                break
+
+    def _clear_card_hints(self) -> None:
+        self._card_hints.clear()
+        self._card_hint_kinds.clear()
+        self._sync_revocation_hint()
+
+    def revocation_unknown_changed(self) -> None:
+        """Обновляет подсказку после неопределённой проверки рантайма."""
+        with self._update():
+            unknown = bool(self._revocation_unknown()) if self._revocation_unknown else False
+            if unknown != self._revocation_unknown_state:
+                self._revocation_unknown_state = unknown
+                self._notify("revocationUnknownChanged")
+            self._sync_revocation_hint()
+            self._notify("modelsChanged")
+
+    @property
+    def revocationUnknown(self) -> bool:  # noqa: N802
+        return self._revocation_unknown_state
 
     @contextmanager
     def _update(self) -> Iterator[None]:
@@ -885,13 +936,13 @@ class ModelDownloads(QObject):
         badge = self._badge(entry, installed)
         hint = self._card_hints.get(entry.id)
         kind = self._card_hint_kinds.get(entry.id, "")
-        if badge == "active" and hint is not None and kind != "memory-shortage":
+        if badge == "active" and hint is not None and kind not in {"memory-shortage", "warning"}:
             return "", "", False
         if hint is not None:
             return (
                 hint,
                 "warning"
-                if kind in {"switch-pause", "memory-shortage"}
+                if kind in {"switch-pause", "memory-shortage", "warning"}
                 else "info"
                 if hint
                 else "",
@@ -1369,8 +1420,7 @@ class ModelDownloads(QObject):
                 self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
                 return
             self._card_messages.pop(entry.id, None)
-            self._card_hints.clear()
-            self._card_hint_kinds.clear()
+            self._clear_card_hints()
             self._notify("modelsChanged")
             self._notify("modelReadyChanged")
             self._notify("selectionChanged")
@@ -1406,9 +1456,8 @@ class ModelDownloads(QObject):
                 return
             self._previous_current = previous
             self._switching_entry = entry
-            self._card_hints.clear()
-            self._card_hint_kinds.clear()
             self._set_card(entry, "switching")
+            self._clear_card_hints()
             self._notify("modelReadyChanged")
             self._notify("selectionChanged")
             try:
@@ -1427,8 +1476,7 @@ class ModelDownloads(QObject):
             self._card_states.pop(entry.id, None)
             if result == "ok":
                 self._card_messages.pop(entry.id, None)
-                self._card_hints.clear()
-                self._card_hint_kinds.clear()
+                self._clear_card_hints()
             else:
                 if previous is not None:
                     try:

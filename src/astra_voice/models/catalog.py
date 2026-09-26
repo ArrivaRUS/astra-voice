@@ -409,10 +409,19 @@ def _revoked(value: object) -> RevokedEntry:
     )
 
 
-def _apply_state(state_path: Path, raw: bytes, serial: int, trust_epoch: int) -> None:
+def _apply_state(
+    state_path: Path,
+    raw: bytes,
+    serial: int,
+    trust_epoch: int,
+    revoked: tuple[RevokedEntry, ...],
+) -> None:
     """Сверяет каталог с применённым и запоминает его (анти-откат, PRD §7.3)."""
     candidate = catalog_state.CatalogState(
-        trust_epoch=trust_epoch, serial=serial, sha256=hashlib.sha256(raw).hexdigest()
+        trust_epoch=trust_epoch,
+        serial=serial,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        revoked=tuple((entry.model_id, entry.revision) for entry in revoked),
     )
     try:
         catalog_state.apply_state(state_path, candidate)
@@ -475,6 +484,8 @@ def load_builtin(
     if len({entry.id for entry in entries}) != len(entries):
         raise CatalogError("bad-schema", "В каталоге повторяются идентификаторы моделей.")
     revoked = tuple(_revoked(item) for item in _array(data.get("revoked")))
+    if len(revoked) > 1024:
+        raise CatalogError("bad-schema", "В каталоге слишком много отозванных версий.")
     for entry in entries:
         for file in entry.files:
             _check_path(file.path)
@@ -484,7 +495,7 @@ def load_builtin(
     serial = _positive_integer(data.get("serial"))
     trust_epoch = _positive_integer(data.get("trust_epoch"))
     if state_path is not None:
-        _apply_state(state_path, raw, serial, trust_epoch)
+        _apply_state(state_path, raw, serial, trust_epoch, revoked)
     return Catalog(
         serial=serial,
         trust_epoch=trust_epoch,

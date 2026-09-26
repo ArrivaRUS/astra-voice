@@ -236,19 +236,40 @@ Item {
             }
         }
 
-        Text {
-            id: emptyNote
+        Column {
             width: content.width
             visible: root.entries.length === 0
-            textFormat: Text.PlainText
-            text: qsTr("Список моделей недоступен. Модель можно поставить из файла или папки.")
-            color: Theme.fgMuted
-            font.family: Theme.fontUi
-            font.pixelSize: Theme.fontSettingSubSize
-            lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
-            lineHeightMode: Text.FixedHeight
-            renderType: Text.NativeRendering
-            wrapMode: Text.WordWrap
+            spacing: 0
+
+            Text {
+                id: emptyNote
+                width: parent.width
+                textFormat: Text.PlainText
+                text: qsTr("Список моделей недоступен. Модель можно поставить из файла или папки.")
+                color: Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+                lineHeightMode: Text.FixedHeight
+                renderType: Text.NativeRendering
+                wrapMode: Text.WordWrap
+            }
+
+            Text {
+                id: revocationUnknownNote
+                objectName: "revocationUnknownNote"
+                width: parent.width
+                visible: root.settings && root.settings.revocationUnknown
+                textFormat: Text.PlainText
+                text: qsTr("Проверить, не отозвана ли текущая версия модели, сейчас нельзя — программа работает с той моделью, что была выбрана раньше.")
+                color: Theme.warningInk
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+                lineHeightMode: Text.FixedHeight
+                renderType: Text.NativeRendering
+                wrapMode: Text.WordWrap
+            }
         }
 
         // Добор до отступа строки итога от списка (§10.2).

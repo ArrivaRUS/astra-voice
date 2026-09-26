@@ -518,3 +518,20 @@ def test_model_measurement_card_contract() -> None:
         assert field not in document
         assert field not in card
         assert field not in section
+
+
+def test_models_revocation_warning_bridge_contract(real_contracts: dict[str, MetaContract]) -> None:
+    section = (REPO / "qml/sections/Models.qml").read_text(encoding="utf-8")
+    contract = real_contracts["settingsBridge"]
+    assert "revocationUnknown" in contract.properties
+    assert any(
+        method.name == "revocationUnknownChanged" and method.is_signal
+        for method in contract.methods
+    )
+    assert "visible: root.settings && root.settings.revocationUnknown" in section
+    assert "visible: root.entries.length === 0" in section
+    assert "color: Theme.warningInk" in section
+    assert (
+        "Проверить, не отозвана ли текущая версия модели, сейчас нельзя — программа работает "
+        "с той моделью, что была выбрана раньше."
+    ) in section

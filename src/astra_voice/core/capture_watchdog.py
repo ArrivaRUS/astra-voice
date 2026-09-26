@@ -27,6 +27,9 @@ class CaptureFieldWatchdog:
     GUI получает факт захвата и события клавиш через потокобезопасный колбэк;
     соединение наружу не передаётся. Клавиши читает сам сторож, потому что
     XGrabKeyboard направляет их только захватившему X-клиенту.
+    Ошибка чтения _NET_ACTIVE_WINDOW во время захвата снимает захват: соединение
+    закрывается, а поле получает cancel. Ошибка подписки при старте оставляет
+    захват открытым до срока 30 с.
 
     По дедлайну monotonic первым действием разрывается сокет: снятие захвата
     сервером не зависит от ответа на ungrab или работоспособности потока GUI.
@@ -144,12 +147,20 @@ class CaptureFieldWatchdog:
     def _run(self, window_id: int | None) -> None:
         display: X11Display | None = None
         expired = False
+        focus_lost = False
         try:
             if self._stop.is_set():
                 return
             display = self._display_factory()
             if not display.open() or self._stop.is_set():
                 return
+            try:
+                active_watch = display.watch_active_window()
+            except Exception:
+                log.warning(
+                    "Не удалось подписаться на смену активного окна: захват снимется по сроку"
+                )
+                active_watch = None
             deadline = monotonic() + self._timeout_s
             if not display.grab_keyboard(window_id, self._timeout_s):
                 return
@@ -160,10 +171,9 @@ class CaptureFieldWatchdog:
                     expired = True
                     break
                 interval = min(self._poll_s, max(0.0, deadline - monotonic()))
-                if self._result_sent:
-                    self._stop.wait(interval)
-                else:
-                    self._poll_keys(display, interval, deadline)
+                if self._poll_keys(display, interval, deadline, active_watch):
+                    focus_lost = True
+                    break
         except Exception:
             log.warning("Ошибка сторожа поля захвата")
         finally:
@@ -177,64 +187,90 @@ class CaptureFieldWatchdog:
                 self.on_expired()
             except Exception:
                 log.warning("Не удалось уведомить поле об истечении захвата")
+        if focus_lost:
+            log.info("Захват снят: активное окно сменилось")
+            if self.on_key_event is not None and not self._result_sent:
+                try:
+                    self.on_key_event("cancel", "")
+                except Exception:
+                    log.warning("Не удалось уведомить поле о смене активного окна")
 
     def _poll_keys(
-        self, display: X11Display, timeout: float, deadline: float | None = None
-    ) -> None:
+        self,
+        display: X11Display,
+        timeout: float,
+        deadline: float | None = None,
+        active_watch: tuple[int, int | None] | None = None,
+    ) -> bool:
         """Читает все ожидающие события с соединения, удерживающего захват."""
         if not callable(getattr(display.d, "pending_events", None)):
             self._stop.wait(timeout)
-            return
+            return False
         if deadline is not None and monotonic() >= deadline:
-            return
+            return False
         try:
             pending = display.pending_events()
         except (AttributeError, ValueError, OSError):
             log.debug("Не удалось проверить события X11", exc_info=True)
             self._stop.wait(timeout)
-            return
+            return False
         if not pending:
             try:
                 fd = display.fileno()
             except (AttributeError, ValueError, OSError):
                 log.debug("Не удалось получить дескриптор X11", exc_info=True)
                 self._stop.wait(timeout)
-                return
+                return False
             if fd >= 0:
                 try:
                     select.select([fd, self._wake_read], [], [], timeout)
                 except (ValueError, OSError):
                     log.debug("Не удалось ждать дескриптор X11", exc_info=True)
                     self._stop.wait(timeout)
-                    return
+                    return False
             else:
                 self._stop.wait(timeout)
         if deadline is not None and monotonic() >= deadline:
-            return
+            return False
         from Xlib import X
 
         while not self._stop.is_set():
             if deadline is not None and monotonic() >= deadline:
-                return
+                return False
             result: tuple[str, str] | None = None
             try:
                 if not display.pending_events():
-                    return
+                    return False
                 event = display.next_event()
-                if event.type == X.MappingNotify:
+                if (
+                    active_watch is not None
+                    and event.type == X.PropertyNotify
+                    and int(event.atom) == active_watch[0]
+                ):
+                    # kscreenlocker может не сменить активное окно до своих
+                    # попыток XGrabKeyboard; в этом случае остаётся срок 30 с.
+                    try:
+                        active_window = display.active_window()
+                    except (AttributeError, ValueError, OSError):
+                        log.warning("Не удалось прочитать активное окно: захват снимается")
+                        return True
+                    if active_window != active_watch[1]:
+                        return True
+                elif event.type == X.MappingNotify:
                     if event.request in (X.MappingKeyboard, X.MappingModifier):
                         display.refresh_keyboard_mapping(event)
-                elif event.type == X.KeyPress:
+                elif event.type == X.KeyPress and not self._result_sent:
                     result = self._key_event(display, int(event.detail), int(event.state))
             except (AttributeError, ValueError, OSError):
                 log.debug("Не удалось прочитать событие X11", exc_info=True)
                 self._stop.wait(timeout)
-                return
+                return False
             if result is not None and self.on_key_event is not None:
                 self.on_key_event(*result)
                 if result[0] in ("combo", "cancel"):
                     self._result_sent = True
-                    return
+                    return False
+        return False
 
     @staticmethod
     def _key_event(display: X11Display, keycode: int, state: int) -> tuple[str, str] | None:

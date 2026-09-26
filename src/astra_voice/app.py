@@ -26,6 +26,7 @@ from astra_voice.core import settings as settings_mod
 from astra_voice.core.audio_env import deny_pulse_autospawn
 from astra_voice.core.logging import setup_logging
 from astra_voice.core.model_request import build_model_load
+from astra_voice.core.model_source import RevocationUnknown
 from astra_voice.core.paths import (
     LOCK_TIMEOUT_MS,
     ipc_socket_path,
@@ -34,6 +35,7 @@ from astra_voice.core.paths import (
     settings_path,
 )
 from astra_voice.core.version import __version__
+from astra_voice.models import catalog_state
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.sound import MicrophoneState
@@ -44,6 +46,28 @@ if TYPE_CHECKING:
     from astra_voice.runtime import DictationRuntime
 
 log = logging.getLogger(__name__)
+
+
+def _revoked_check(model: Any | None) -> Callable[[str, str], bool]:
+    """Проверяет каталог, а при его отказе — снимок последнего принятого."""
+    try:
+        state = catalog_state.read_state(catalog_state.state_path(paths.state_dir()))
+    except (OSError, paths.PathError):
+        state = None
+    snapshot = None if state is None else state.revoked
+
+    def check(model_id: str, revision: str) -> bool:
+        if model is not None:
+            try:
+                return bool(model.revoked_revision(model_id, revision))
+            except Exception:
+                pass
+        if snapshot is None:
+            raise RevocationUnknown
+        return (model_id, revision) in snapshot
+
+    return check
+
 
 APP_NAME = "astra-voice"
 ORGANIZATION_DOMAIN = "io.github.arrivarus"
@@ -767,6 +791,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         runtime_ready = False
+        from astra_voice.ui.model_downloads import ModelDownloads, ModelService
+
+        model = None
+        try:
+            model = ModelService(settings, policy)
+        except Exception:  # noqa: BLE001 — каталог не должен мешать запуску окна
+            log.warning("Не удалось подготовить каталог моделей, настройка продолжится без него")
+        revoked_check = _revoked_check(model)
         try:
             from astra_voice.runtime import DictationRuntime
             from astra_voice.ui import notify
@@ -789,6 +821,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime = DictationRuntime(
                 settings=settings, session_kind=session_kind, model_store=model_store
             )
+            runtime.set_revoked_check(revoked_check)
             runtime.on_quit_requested = app.quit
             runtime.on_show_requested = lambda: _show(shell)
             runtime.tray.on_settings = lambda: _show(shell)
@@ -807,27 +840,24 @@ def main(argv: list[str] | None = None) -> int:
         from PyQt5.QtQml import QQmlEngine
 
         from astra_voice.ui.bridges import OnboardingController, SettingsBridge
-        from astra_voice.ui.model_downloads import ModelDownloads, ModelService
 
-        model = None
-        try:
-            model = ModelService(settings, policy)
-        except Exception:  # noqa: BLE001 — каталог не должен мешать запуску окна
-            log.warning("Не удалось подготовить каталог моделей, настройка продолжится без него")
         if (
             runtime_ready
             and isinstance(DictationRuntime, type)
             and isinstance(runtime, DictationRuntime)
         ):
             downloads = ModelDownloads(
-                model, store=model_store, settings=settings, switcher=runtime
+                model,
+                store=model_store,
+                settings=settings,
+                switcher=runtime,
+                revocation_unknown=lambda: runtime.revocation_unknown,
             )
         else:
             downloads = ModelDownloads(model, store=model_store, settings=settings)
         downloads.start_recheck()
-        if runtime_ready and runtime is not None and model is not None:
-            # Отозванную ревизию рантайм видит только через каталог (US-6.6).
-            runtime.set_revoked_check(model.revoked_revision)
+        if runtime_ready and runtime is not None:
+            runtime.on_revocation_unknown = downloads.revocation_unknown_changed
             runtime.on_measurements_changed = downloads.measurements_changed
 
         capture_host = (
