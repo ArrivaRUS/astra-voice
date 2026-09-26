@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping, Set
+import traceback
+from collections.abc import Generator, Iterator, Mapping, Set
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
 from _pytest.nodes import Node
 from _pytest.terminal import TerminalReporter
+
+pytest_plugins = ("pytester",)
 
 _QT_AVAILABLE = pytest.StashKey[bool]()
 _QT_ENV_ERROR = pytest.StashKey[str | None]()
@@ -200,6 +204,46 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     pulse_env = item.config.stash.get(_PULSE_ENV, {})
     os.environ.update(pulse_env)
     item.stash[_PULSE_TEST_PROCESSES] = pulseaudio_processes()
+
+
+def _clear_failed_test_frames(error: BaseException) -> None:
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.__traceback__ is not None:
+            traceback.clear_frames(current.__traceback__)
+            for frame, _lineno in traceback.walk_tb(current.__traceback__):
+                _ = frame.f_locals
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        pending.extend(getattr(current, "exceptions", ()))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    report = yield
+    if (
+        call.when == "call"
+        and call.excinfo is not None
+        and item.get_closest_marker("xvfb") is not None
+        and not item.config.getoption("usepdb", False)
+    ):
+        # Кадры держат обёртки QML удалённого окна; sip может отдать адрес новым
+        # объектам и вызвать use-after-free. Отчёт уже построен: -l и
+        # __tracebackhide__ работают. В Python 3.11 перечитываем снимок f_locals;
+        # в 3.13+ (PEP 667) это прокси, перечитывание не нужно и ничего не делает.
+        # Поведение проверяет tests/unit/test_failed_frame_cleanup.py.
+        with contextlib.suppress(Exception):
+            _clear_failed_test_frames(call.excinfo.value)
+    return report
 
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)

@@ -1,4 +1,4 @@
-"""SVG image provider and registration guard for every production QML engine."""
+"""SVG-провайдер и проверка его установки во всех рабочих движках QML."""
 
 from __future__ import annotations
 
@@ -123,6 +123,94 @@ def _run_qt(source: str) -> str:
     return result.stdout
 
 
+def test_destroyed_engine_with_stale_wrapper_does_not_crash() -> None:
+    # Урок 021: сборка устаревшей обёртки не должна ломать уничтожение движка.
+    source = """
+import gc
+import json
+from pathlib import Path
+from PyQt5 import sip
+from PyQt5.QtCore import QEvent, QObject, QUrl, qInstallMessageHandler
+from PyQt5.QtQuick import QQuickView
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import QApplication
+import astra_voice.ui.icons as icons
+
+class Box:
+    pass
+
+app = QApplication([])
+messages = []
+previous = qInstallMessageHandler(lambda _mode, _context, text: messages.append(text))
+for _ in range(3):
+    view = QQuickView()
+    icons.install_icon_provider(view.engine())
+    box = Box()
+    box.me = box
+    box.wrapper = sip.wrapinstance(sip.unwrapinstance(view.engine()), QObject)
+    del box
+    gc.collect()
+    view.setSource(QUrl.fromLocalFile(str(Path('qml/components/Icon.qml').resolve())))
+    root = view.rootObject()
+    assert root is not None, 'Корневой объект QML не создан'
+    root.setProperty('name', 'check')
+    view.show()
+    QTest.qWait(50)
+    view.deleteLater()
+    app.sendPostedEvents(None, QEvent.DeferredDelete)
+    app.processEvents()
+    gc.collect()
+qInstallMessageHandler(previous)
+print(json.dumps(messages))
+"""
+    assert json.loads(_run_qt(source)) == []
+
+
+def test_deleted_providers_are_pruned_and_python_handles_requests() -> None:
+    source = """
+import gc
+import json
+from pathlib import Path
+from PyQt5 import sip
+from PyQt5.QtCore import QEvent, QUrl
+from PyQt5.QtQuick import QQuickView
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import QApplication
+import astra_voice.ui.icons as icons
+
+app = QApplication([])
+calls = []
+original = icons.IconProvider.requestImage
+def spy(self, identifier, size):
+    calls.append(identifier)
+    return original(self, identifier, size)
+icons.IconProvider.requestImage = spy
+for index in range(40):
+    view = QQuickView()
+    icons.install_icon_provider(view.engine())
+    assert len(icons._providers) <= 1, 'Список провайдеров вырос'
+    provider = view.engine().imageProvider(icons.PROVIDER_ID)
+    assert provider is not None, 'Провайдер не установлен'
+    gc.collect()
+    view.setSource(QUrl.fromLocalFile(str(Path('qml/components/Icon.qml').resolve())))
+    root = view.rootObject()
+    assert root is not None, 'Корневой объект QML не создан'
+    root.setProperty('name', 'check')
+    root.setProperty('size', 16 + index)
+    view.show()
+    QTest.qWait(30)
+    view.deleteLater()
+    app.sendPostedEvents(None, QEvent.DeferredDelete)
+    app.processEvents()
+    assert sip.isdeleted(provider), 'Провайдер пережил движок'
+    gc.collect()
+print(json.dumps({'calls': len(calls), 'kept': len(icons._providers)}))
+"""
+    result = json.loads(_run_qt(source))
+    assert result["calls"] > 0
+    assert result["kept"] <= 1
+
+
 @pytest.mark.parametrize("installed", [False, True])
 def test_qml_reports_missing_provider_only_when_absent(installed: bool) -> None:
     source = """
@@ -180,4 +268,4 @@ def test_every_production_engine_installs_icon_provider() -> None:
             called_name(node) == "install_icon_provider" for node in ast.walk(tree)
         ):
             failures.append(str(path.relative_to(REPO)))
-    assert not failures, f"QML engine without icon provider: {failures}"
+    assert not failures, f"Движок QML без провайдера иконок: {failures}"
