@@ -217,9 +217,11 @@ def test_kde_reload_reports_change_only_on_real_change(tmp_path: Path) -> None:
 
 def test_kde_watcher_survives_atomic_rewrite(tmp_path: Path) -> None:
     """kwriteconfig пишет tmp + rename — путь выпадает из наблюдателя, его надо вернуть."""
-    from PyQt5.QtCore import QCoreApplication, QEventLoop, QTimer
+    from PyQt5.QtCore import QEventLoop, QTimer
 
-    app = QCoreApplication.instance() or QCoreApplication([])
+    from helpers.qt_app import get_qapplication
+
+    app = get_qapplication()
     path = write(tmp_path, BREEZE_LIGHT)
     source = KdeThemeSource(path)
     source.start()
@@ -258,11 +260,10 @@ def test_fly_stub_is_honestly_light(tmp_path: Path) -> None:
 
 
 def test_bridge_exposes_properties_and_emits_changed(tmp_path: Path) -> None:
-    from PyQt5.QtCore import QCoreApplication
-
     from astra_voice.ui.theme_bridge import ThemeBridge
+    from helpers.qt_app import get_qapplication
 
-    QCoreApplication.instance() or QCoreApplication([])
+    get_qapplication()
     path = write(tmp_path, BREEZE_LIGHT)
     source = KdeThemeSource(path)
     bridge = ThemeBridge(source)
@@ -281,11 +282,10 @@ def test_bridge_exposes_properties_and_emits_changed(tmp_path: Path) -> None:
 
 
 def test_bridge_falls_back_when_system_silent(tmp_path: Path) -> None:
-    from PyQt5.QtCore import QCoreApplication
-
     from astra_voice.ui.theme_bridge import ThemeBridge
+    from helpers.qt_app import get_qapplication
 
-    QCoreApplication.instance() or QCoreApplication([])
+    get_qapplication()
     bridge = ThemeBridge(KdeThemeSource(tmp_path / "kdeglobals"))
     assert bridge.dark is False
     assert bridge.accent.name().upper() == "#1B3A73"

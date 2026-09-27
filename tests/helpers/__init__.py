@@ -37,9 +37,11 @@ def xapp() -> Any:
     """Один QApplication с настоящим xcb, независимо от offscreen у QML-тестов."""
     from PyQt5.QtWidgets import QApplication
 
-    app = QApplication.instance() or QApplication(["astra-xvfb-tests", "-platform", "xcb"])
+    from .qt_app import get_qapplication
+
+    app = get_qapplication()
     assert isinstance(app, QApplication)
-    assert app.platformName() == "xcb", "запустите xvfb-тесты отдельно от offscreen-тестов"
+    assert app.platformName() == "xcb", "задайте QT_QPA_PLATFORM=xcb (make test-xvfb)"
     app.setQuitOnLastWindowClosed(False)
     return app
 

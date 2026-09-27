@@ -35,7 +35,7 @@
 ## Commands (copy-paste)
 - lint: `ruff check src tests scripts tools && mypy --strict src && qmllint qml/**/*.qml`
 - unit: `pytest -m unit -q`
-- xvfb: `xvfb-run -a -s "-screen 0 1600x1000x24" pytest -m xvfb -q`
+- xvfb: `QT_QPA_PLATFORM=xcb xvfb-run -a -s "-screen 0 1600x1000x24" pytest -m xvfb -q`
 - engine: `pytest -m engine -q`
 - build: `make deb && lintian dist/astra-voice_*.deb && tools/elf-audit --strict dist/astra-voice_*.deb`
 - validate: `tools/validate <тема> [--session kde|fly]` · `tools/benchmark --model gigaam-v3-e2e-rnnt-int8 --runs 50 --threads 4`

@@ -86,14 +86,13 @@ class Clock:
     now: int = 0
     pending: list[tuple[int, Callable[[], None]]] = field(default_factory=list)
     timers: list[Timer] = field(default_factory=list)
+    parents: list[QObject] = field(default_factory=list)
 
     def __call__(self, parent: QObject) -> Timer:
-        timer = Timer()
+        self.parents.append(parent)
+        timer = Timer(self)
         self.timers.append(timer)
         return timer
-
-    def singleShot(self, milliseconds: int, callback: Callable[[], None]) -> None:
-        self.pending.append((self.now + milliseconds, callback))
 
     def advance(self, milliseconds: int) -> None:
         end = self.now + milliseconds
@@ -108,7 +107,8 @@ class Clock:
 
 
 class Timer:
-    def __init__(self) -> None:
+    def __init__(self, clock: Clock) -> None:
+        self.clock = clock
         self.timeout = Signal()
         self.interval = -1
         self.active = False
@@ -123,16 +123,24 @@ class Timer:
     def isActive(self) -> bool:
         return self.active
 
-    def start(self) -> None:
+    def start(self, milliseconds: int | None = None) -> None:
+        self.stop()
+        if milliseconds is not None:
+            self.interval = milliseconds
         self.active = True
+        if self.single_shot and self.interval > 0:
+            self.clock.pending.append((self.clock.now + self.interval, self.fire))
 
     def stop(self) -> None:
         self.active = False
+        self.clock.pending = [
+            (time, callback) for time, callback in self.clock.pending if callback != self.fire
+        ]
 
     def fire(self) -> None:
         if self.active:
             if self.single_shot:
-                self.active = False
+                self.stop()
             self.timeout.emit()
 
 
@@ -1035,14 +1043,14 @@ def test_ewmh_uses_one_lazy_connection_before_map_and_after_show(harness: Harnes
     assert any(
         c.args[3] == ["_NET_WM_STATE_SKIP_TASKBAR", "_NET_WM_STATE_SKIP_PAGER"] for c in writes
     )
-    after_show, _ = harness.clock.timers
+    after_show, _, _expiry = harness.clock.timers
     after_show.fire()
     assert harness.pill.visible
     assert harness.ewmh.ClientMessage.call_count == 4
     harness.x11.open.assert_called_once_with()
     harness.view.winId.assert_called_once_with()
     harness.factory.assert_called_once_with()
-    assert len(harness.clock.timers) == 2
+    assert len(harness.clock.timers) == 3
 
 
 @pytest.mark.parametrize("session", list(SessionKind))
@@ -1094,12 +1102,14 @@ def test_compositor_switch_refreshes_and_removes_mask_at_each_show(harness: Harn
 
 @pytest.mark.parametrize("hide", ["explicit", "expiry", "disabled", "external"])
 def test_reassert_timer_lives_only_while_visible(harness: Harness, hide: str) -> None:
-    after_show, above = harness.clock.timers
+    after_show, above, expiry = harness.clock.timers
+    assert harness.clock.parents == [harness.pill] * 3
     assert above.interval == 1000
     assert after_show.interval == 0 and after_show.single_shot
+    assert expiry.single_shot and not expiry.active
     assert not above.active and not after_show.active
     harness.pill.show_state(PillState.DONE)
-    assert above.active and after_show.active
+    assert above.active and after_show.active and expiry.active
     if hide == "explicit":
         harness.pill.hide()
     elif hide == "expiry":
@@ -1109,6 +1119,7 @@ def test_reassert_timer_lives_only_while_visible(harness: Harness, hide: str) ->
     else:
         harness.view.hide()
     assert not above.active and not after_show.active
+    assert expiry.active == (hide in ("disabled", "external"))
     harness.x11.client_list_stacking.reset_mock()
     after_show.fire()
     above.fire()

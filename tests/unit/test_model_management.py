@@ -56,7 +56,9 @@ TONE = replace(
 
 @pytest.fixture(scope="module", autouse=True)
 def qcore_app() -> QCoreApplication:
-    return QCoreApplication.instance() or QCoreApplication([])
+    from helpers.qt_app import get_qapplication
+
+    return get_qapplication()
 
 
 class FakeManagedPort:

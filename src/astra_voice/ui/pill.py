@@ -6,7 +6,6 @@ import logging
 from collections import deque
 from collections.abc import Callable
 from enum import Enum
-from functools import partial
 from math import ceil
 from time import monotonic, perf_counter
 from typing import Any, Final
@@ -145,6 +144,9 @@ class Pill(QObject):
         self._above_timer = QTimer(self)
         self._above_timer.setInterval(1000)
         self._above_timer.timeout.connect(self._reassert_above)
+        self._expiry_timer = QTimer(self)
+        self._expiry_timer.setSingleShot(True)
+        self._expiry_timer.timeout.connect(self._expire_timeout)
 
         factory = view_factory if view_factory is not None else lambda: QQuickView()
         self._view = factory()
@@ -184,6 +186,7 @@ class Pill(QObject):
     ) -> None:
         started = perf_counter()
         self._timer_generation += 1
+        self._expiry_timer.stop()
         self._requested_state = state
         self._label = ""
         if state in (PillState.ERROR, PillState.CLIPBOARD_ONLY):
@@ -202,8 +205,7 @@ class Pill(QObject):
         self._render(show_started=started)
         duration = STATE_DURATION_MS.get(state)
         if duration is not None:
-            # singleShot нельзя остановить: поколение отменяет действие старого вызова.
-            QTimer.singleShot(duration, partial(self._expire, self._timer_generation))
+            self._expiry_timer.start(duration)
 
     def hide(self) -> None:
         self.show_state(PillState.HIDDEN)
@@ -353,6 +355,9 @@ class Pill(QObject):
         if generation == self._timer_generation:
             # LIMIT через 2000 мс скрывается; PROCESSING включает зона оркестрации.
             self.hide()
+
+    def _expire_timeout(self) -> None:
+        self._expire(self._timer_generation)
 
     def _resize(self) -> None:
         # В Qt 5 Item.polish() лишь планирует работу на кадр. QML forceLayout()
