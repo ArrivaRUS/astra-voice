@@ -42,7 +42,7 @@ mypy --strict src
 qmllint qml/**/*.qml
 # тесты по маркерам
 pytest -m unit -q                                                # CI, без дисплея
-xvfb-run -a -s "-screen 0 1600x1000x24" pytest -m xvfb -q        # CI, QT_QPA_PLATFORM=xcb
+QT_QPA_PLATFORM=xcb xvfb-run -a -s "-screen 0 1600x1000x24" pytest -m xvfb -q        # CI, QT_QPA_PLATFORM=xcb
 pytest -m engine -q                                              # CI, кэш модели по ревизии (~/.cache/astra-voice-ci/)
 pytest -m machine -q                                             # только ALSE (KDE/Fly), не в CI
 # сборка и пакет
@@ -181,7 +181,7 @@ R1 Python-декодер RNN-T — **снят S3** (~52 мс на 6 с) · R2 fl
 - T1 §5 M1: лаунчер `python3 -I`; `RLIMIT_CORE=0`/`PR_SET_DUMPABLE=0`; CI-гейты (SHA, permissions, секрет только в `release`, без `pull_request_target`); keyring мастер+S1+S2; `PINNED/REVOKED_FINGERPRINTS`; `docs/SECURITY.md`; `Verifier` по `VALIDSIG`+пин для релиза/deb-из-файла/манифеста/`catalog_pubkey`.
 ### Validation
 ```sh
-make lint && pytest -m unit -q && xvfb-run -a pytest -m xvfb -q
+make lint && pytest -m unit -q && QT_QPA_PLATFORM=xcb xvfb-run -a pytest -m xvfb -q
 time make deb && lintian dist/astra-voice_*.deb
 dpkg-deb -c dist/astra-voice_*.deb | grep -c '\.so' ; tools/elf-audit --strict dist/astra-voice_*.deb          # 3
 sudo apt install ./dist/astra-voice_*.deb && astra-voice --version
@@ -282,7 +282,7 @@ R14 гонка WirePlumber · `EBUSY` при эксклюзивном захва
 - На машине заказчика **в KDE и во Fly**: S2-A1…A4, S3-A1…A3, S4-A1/A3/A4, S12-A3, S14-A1/A2 зелёные; **p95 «отпустил → текст» ≤ 0,5 с по 50 диктовкам** (Ц2) в каждой сессии; фокус остаётся в Kate/`fly-term`; пилюли нет в Alt+Tab; T-13 (маркерная фраза — 0 совпадений), T-14, T-15, T-20, T-24 зелёные; CPU пилюли при записи ≤ 3 %.
 ### Validation
 ```sh
-xvfb-run -a pytest -m xvfb -q            # тесты платформы и интерфейса — tests/xvfb/
+QT_QPA_PLATFORM=xcb xvfb-run -a pytest -m xvfb -q            # тесты платформы и интерфейса — tests/xvfb/
 pytest -m unit -q                        # автоматы, нормализация, конфликты, статистика — tests/unit/
 scripts/e2e/virtual_mic.sh up && scripts/e2e/dictate50.sh --session kde     # xdotool keydown ctrl+space; paplay --device=av_test …; xdotool keyup ctrl+space
 astra-voice --stats                                                          # p95 t_ms ≤ 500

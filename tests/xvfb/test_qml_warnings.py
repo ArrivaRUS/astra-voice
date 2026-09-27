@@ -5,7 +5,8 @@
 Предупреждение вида «Cannot specify anchors for items inside Row» или несуществующее
 свойство здесь именно ловится, а не тонет в консоли.
 
-Запуск: `xvfb-run -a pytest -m xvfb` либо `QT_QPA_PLATFORM=offscreen pytest -m xvfb`.
+Запуск: `QT_QPA_PLATFORM=xcb xvfb-run -a pytest -m xvfb`
+либо `QT_QPA_PLATFORM=offscreen pytest -m xvfb`.
 """
 
 from __future__ import annotations

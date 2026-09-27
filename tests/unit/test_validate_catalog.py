@@ -263,9 +263,9 @@ def test_switch_pair_and_too_few(
 def test_runtime_stubs_construct_without_worker(
     validate: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from PyQt5.QtCore import QCoreApplication
+    from helpers.qt_app import get_qapplication
 
-    app = QCoreApplication.instance() or QCoreApplication([])
+    app = get_qapplication()
     assert app is not None
     store = ModelStore(tmp_path / "store")
 

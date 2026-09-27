@@ -133,6 +133,7 @@ jobs:
           fc-cache -f
           fc-match -f '%{family}' 'PT Root UI' | grep -q 'PT Root UI'
       - run: make test-xvfb VENV=$VENV
+        timeout-minutes: 12
         env:
           ASTRA_VOICE_REQUIRE_QT: "1"
           QT_QPA_PLATFORM: xcb

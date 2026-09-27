@@ -4,35 +4,25 @@ from __future__ import annotations
 
 import os
 
-from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication
 from PyQt5.QtWidgets import QApplication
 
+_APP: QApplication | None = None
+
 
 def get_qapplication() -> QApplication:
-    """Вернуть QApplication, заменив приложение без поддержки виджетов.
-
-    Это временный мост между зонами тестов до общего conftest: соседняя зона
-    может первой создать голый QCoreApplication, а QMenu/QQuickView нужен
-    QApplication. Решение об общем conftest принимает Юрка. QApplication
-    совместим с последующим QCoreApplication.instance() or QCoreApplication([]).
-    """
+    """Вернуть единственный QApplication и удерживать его до конца процесса."""
+    global _APP
     app = QCoreApplication.instance()
     if isinstance(app, QApplication):
+        _APP = app
         return app
-
-    found = f"{app!r} (тип {type(app).__module__}.{type(app).__qualname__})"
-    message = (
-        f"Не удалось получить QApplication: QCoreApplication.instance() вернул {found}; "
-        "для QMenu/QQuickView нужен QApplication"
-    )
+    if app is not None:
+        raise RuntimeError(
+            "QApplication уже создан как QCoreApplication — пересоздавать нельзя, см. урок 022"
+        )
+    if _APP is not None:
+        raise RuntimeError("QApplication исчез после создания — пересоздавать нельзя, см. урок 022")
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    try:
-        if app is not None:
-            sip.delete(app)
-        app = QApplication([])
-    except Exception as exc:
-        raise RuntimeError(message) from exc
-    if not isinstance(app, QApplication):
-        raise RuntimeError(f"{message}; после создания получен {app!r} (тип {type(app)!r})")
-    return app
+    _APP = QApplication([])
+    return _APP

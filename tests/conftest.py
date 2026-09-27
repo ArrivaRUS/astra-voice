@@ -1,12 +1,25 @@
 """Общая изоляция звука и страж сбора: unit/xvfb без Qt обязаны падать."""
 
+# ruff: noqa: E402 — D-Bus нужно изолировать до остальных импортов.
+
 from __future__ import annotations
+
+import os
+
+_DBUS_ORIGINAL_ENV = {
+    name: os.environ.get(name)
+    for name in ("DBUS_SESSION_BUS_ADDRESS", "QT_ACCESSIBILITY", "AT_SPI_BUS_ADDRESS")
+}
+
+if os.environ.get("ASTRA_VOICE_TEST_ALLOW_SESSION_BUS") != "1":
+    os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/nonexistent"
+    os.environ.pop("QT_ACCESSIBILITY", None)
+    os.environ.pop("AT_SPI_BUS_ADDRESS", None)
 
 import ast
 import contextlib
 import importlib.util
 import json
-import os
 import re
 import subprocess
 import sys
@@ -22,6 +35,8 @@ from _pytest.terminal import TerminalReporter
 pytest_plugins = ("pytester",)
 
 _QT_AVAILABLE = pytest.StashKey[bool]()
+_QAPP_ADDRESS: int | None = None
+_QAPP_LAST_NODEID: str | None = None
 _QT_ENV_ERROR = pytest.StashKey[str | None]()
 _IGNORED = pytest.StashKey[dict[Path, str]]()
 _QT_MODULES = pytest.StashKey[Set[str]]()
@@ -184,6 +199,11 @@ def pytest_configure(config: pytest.Config) -> None:
 
 def pytest_unconfigure(config: pytest.Config) -> None:
     """Возвращаем окружение вызывающей стороны и удаляем временный каталог."""
+    for name, value in _DBUS_ORIGINAL_ENV.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
     directory = config.stash.get(_PULSE_DIRECTORY, None)
     if directory is None:
         return
@@ -200,10 +220,35 @@ def pytest_unconfigure(config: pytest.Config) -> None:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item: pytest.Item) -> None:
+    global _QAPP_ADDRESS, _QAPP_LAST_NODEID
     # Session-фикстура запускается один раз; исправляем также изменения прошлых тестов.
     pulse_env = item.config.stash.get(_PULSE_ENV, {})
     os.environ.update(pulse_env)
     item.stash[_PULSE_TEST_PROCESSES] = pulseaudio_processes()
+    if "PyQt5.QtCore" in sys.modules:
+        from PyQt5 import sip
+        from PyQt5.QtCore import QCoreApplication
+
+        app = QCoreApplication.instance()
+        if app is not None:
+            address = sip.unwrapinstance(app)
+            if _QAPP_ADDRESS is None:
+                _QAPP_ADDRESS = address
+            elif address != _QAPP_ADDRESS:
+                _QAPP_ADDRESS = address
+                pytest.fail(
+                    "QApplication пересоздан между тестами "
+                    f"(предыдущий тест: {_QAPP_LAST_NODEID}) — см. урок 022",
+                    pytrace=False,
+                )
+        elif _QAPP_ADDRESS is not None:
+            _QAPP_ADDRESS = None
+            pytest.fail(
+                "QApplication исчез между тестами "
+                f"(предыдущий тест: {_QAPP_LAST_NODEID}) — см. урок 022",
+                pytrace=False,
+            )
+    _QAPP_LAST_NODEID = item.nodeid
 
 
 def _clear_failed_test_frames(error: BaseException) -> None:
