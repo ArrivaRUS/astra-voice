@@ -43,6 +43,7 @@ from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui.hotkey_capture import HotkeyCapture
 from astra_voice.ui.icons import install_icon_provider
+from astra_voice.ui.tray import shutdown_bus_threads
 
 if TYPE_CHECKING:
     from astra_voice.core.dictation import LevelCallback, TestCallback
@@ -1008,6 +1009,10 @@ def main(argv: list[str] | None = None) -> int:
                 runtime.shutdown()
             except Exception:  # noqa: BLE001 — ошибка диктовки не должна оставить lock/ipc
                 log.warning("Не удалось завершить диктовку")
+        try:
+            shutdown_bus_threads()
+        except Exception:  # noqa: BLE001 — ошибка D-Bus не должна оставить lock/ipc
+            log.warning("Не удалось завершить потоки D-Bus")
         del close_watcher
         timer.stop()
         if theme_bridge is not None:

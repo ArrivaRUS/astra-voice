@@ -75,7 +75,7 @@ jobs:
             qml-module-qtquick2 qml-module-qtquick-controls2 \
             qml-module-qtquick-layouts qml-module-qtquick-window2 \
             qml-module-qtquick-shapes qml-module-qtgraphicaleffects \
-            libqt5svg5
+            libqt5svg5 dbus-daemon
       - name: Окружение разработчика
         run: |
           python3 -m venv --system-site-packages "$VENV"

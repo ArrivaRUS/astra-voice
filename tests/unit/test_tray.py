@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, get_type_hints
 from unittest.mock import Mock, call
 
 import pytest
+from PyQt5 import sip
+from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtCore import QTimer as QtTimer
 from PyQt5.QtDBus import QDBusMessage, QDBusVariant
 from PyQt5.QtWidgets import QSystemTrayIcon
@@ -1046,6 +1048,84 @@ def test_late_reply_cannot_cross_stop_and_start(harness: Harness) -> None:
     assert not harness.tray.registered
     harness.bus.calls[-1].reply(True)
     assert harness.tray.registered
+
+
+@pytest.mark.parametrize("completion", ["reply", "timeout"])
+def test_worker_stop_waits_for_inflight_request(
+    harness: Harness, qapp: QApplication, completion: str
+) -> None:
+    from astra_voice.ui import tray as module
+
+    harness.bus.auto_reply = False
+    worker = module._BusWorker(42)
+    worker._bus = harness.bus.transport
+    results: list[tuple[int, str, object]] = []
+    closed = Mock()
+    worker.result.connect(lambda token, event, payload: results.append((token, event, payload)))
+    worker.finished.connect(closed)
+    message = QDBusMessage.createMethodCall(SERVICE, "/StatusNotifierWatcher", SERVICE, "Get")
+    worker.command.emit("request", (1, message))
+    pending = harness.bus.calls[-1]
+    receiver = worker._requests[1]
+
+    worker.command.emit("cancel", 1)
+    assert 1 not in worker._requests
+    assert receiver in worker._inflight
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert not sip.isdeleted(receiver)
+
+    worker.command.emit("stop", None)
+    harness.connection.disconnectFromBus.assert_not_called()
+    closed.assert_not_called()
+    if completion == "reply":
+        pending.reply(True)
+        assert not worker._inflight
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        assert sip.isdeleted(receiver)
+    else:
+        harness.clock.advance(699)
+        harness.connection.disconnectFromBus.assert_not_called()
+        harness.clock.advance(1)
+        pending.reply(True)
+    harness.connection.disconnectFromBus.assert_called_once_with(worker._name)
+    closed.assert_called_once()
+    assert results == [(42, "closed", None)]
+    worker.command.emit("stop", None)
+    worker.command.emit("request", (2, message))
+    harness.connection.disconnectFromBus.assert_called_once()
+    closed.assert_called_once()
+    assert results == [(42, "closed", None), (42, "reply", (2, None))]
+    worker.deleteLater()
+
+
+def test_worker_stop_closes_after_close_setup_error(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from astra_voice.ui import tray as module
+
+    harness.bus.auto_reply = False
+    worker = module._BusWorker(42)
+    worker._bus = harness.bus.transport
+    results: list[tuple[int, str, object]] = []
+    finished = Mock()
+    worker.result.connect(lambda token, event, payload: results.append((token, event, payload)))
+    worker.finished.connect(finished)
+    message = QDBusMessage.createMethodCall(SERVICE, "/StatusNotifierWatcher", SERVICE, "Get")
+    worker.command.emit("request", (1, message))
+    pending = harness.bus.calls[-1]
+    monkeypatch.setattr(module, "QTimer", Mock(side_effect=RuntimeError("timer failed")))
+
+    worker.command.emit("stop", None)
+    assert results == [(42, "closed", None)]
+    finished.assert_called_once()
+    harness.connection.disconnectFromBus.assert_called_once_with(worker._name)
+
+    pending.reply(True)
+    worker.command.emit("stop", None)
+    assert results == [(42, "closed", None)]
+    finished.assert_called_once()
+    harness.connection.disconnectFromBus.assert_called_once_with(worker._name)
+    worker.deleteLater()
 
 
 def test_failed_async_request_is_retried_without_blocking(harness: Harness) -> None:

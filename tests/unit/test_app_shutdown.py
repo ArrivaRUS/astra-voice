@@ -44,6 +44,7 @@ class Rig:
         self.load_qml = Mock(return_value=self.shell)
         self.focuser = Mock()
         self.cleanup = Mock()
+        self.bus_shutdown = Mock()
         self.runtime = Mock()
         self.runtime.on_quit_requested = None
         self.runtime.tray.on_quit = lambda: DictationRuntime._quit_requested(self.runtime)
@@ -54,6 +55,7 @@ class Rig:
         self.calls.attach_mock(self.app.exec_, "exec")
         self.calls.attach_mock(self.app.quit, "quit")
         self.calls.attach_mock(self.runtime.shutdown, "shutdown")
+        self.calls.attach_mock(self.bus_shutdown, "bus_shutdown")
         self.calls.attach_mock(self.focuser.stop, "focuser_stop")
         self.calls.attach_mock(self.timer.stop, "timer_stop")
         self.calls.attach_mock(self.theme.source.stop, "theme_stop")
@@ -82,6 +84,7 @@ class Rig:
         self.focuser_factory = Mock(return_value=self.focuser)
         monkeypatch.setattr(app_mod, "_WindowFocuser", self.focuser_factory)
         monkeypatch.setattr(app_mod, "_cleanup", self.cleanup)
+        monkeypatch.setattr(app_mod, "shutdown_bus_threads", self.bus_shutdown)
         monkeypatch.setattr(runtime_mod, "DictationRuntime", self.factory)
 
 
@@ -161,6 +164,7 @@ def test_shutdown_once_before_other_cleanup(rig: Rig) -> None:
         call.exec(),
         call.focuser_stop(),
         call.shutdown(),
+        call.bus_shutdown(),
         call.timer_stop(),
         call.theme_stop(),
         call.cleanup(rig.server, rig.lock),
@@ -187,6 +191,7 @@ def test_model_store_failure_keeps_runtime_and_event_loop_running(
     rig.runtime.start.assert_called_once_with()
     rig.app.exec_.assert_called_once_with()
     rig.runtime.shutdown.assert_called_once_with()
+    rig.bus_shutdown.assert_called_once_with()
     rig.cleanup.assert_called_once_with(rig.server, rig.lock)
     assert any(
         record.levelno == logging.WARNING
@@ -473,9 +478,32 @@ def test_shutdown_failure_does_not_skip_cleanup(rig: Rig) -> None:
     assert app_mod.main([]) == 7
 
     rig.runtime.shutdown.assert_called_once_with()
+    rig.bus_shutdown.assert_called_once_with()
+    assert (
+        rig.calls.mock_calls.index(call.shutdown())
+        < rig.calls.mock_calls.index(call.bus_shutdown())
+        < rig.calls.mock_calls.index(call.timer_stop())
+    )
     rig.timer.stop.assert_called_once_with()
     rig.theme.source.stop.assert_called_once_with()
     rig.cleanup.assert_called_once_with(rig.server, rig.lock)
+
+
+def test_bus_thread_shutdown_failure_does_not_skip_cleanup(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.bus_shutdown.side_effect = RuntimeError("Ошибка D-Bus")
+
+    with caplog.at_level(logging.WARNING, logger=app_mod.__name__):
+        assert app_mod.main([]) == 7
+
+    rig.runtime.shutdown.assert_called_once_with()
+    rig.bus_shutdown.assert_called_once_with()
+    rig.timer.stop.assert_called_once_with()
+    rig.cleanup.assert_called_once_with(rig.server, rig.lock)
+    assert any(
+        "Не удалось завершить потоки D-Bus" in record.getMessage() for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize("done", [None, False, 1, True])
