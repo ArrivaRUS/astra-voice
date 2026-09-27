@@ -2373,6 +2373,109 @@ def test_download_strip_shows_source(onboarding_app: Any, screen: str) -> None:
     assert_no_messages(messages, f"{screen} download source")
 
 
+@pytest.mark.parametrize("screen", ["onboarding", "models"])
+def test_download_strip_track_stays_at_right_edge(onboarding_app: Any, screen: str) -> None:
+    fake = FakeOnboarding() if screen == "onboarding" else FakeSettings()
+    if isinstance(fake, FakeOnboarding):
+        fake.step = 2
+    fake.downloadState = "downloading"
+    fake.downloadTitle = "Загружается GigaAM v3 RNN-T"
+    fake.downloadSource = "Скачиваю с huggingface.co"
+    fake.speed = "5,2 МБ/с"
+    fake.eta = "осталось ~3 мин"
+
+    def inspect(root: Any) -> None:
+        strip = next(
+            item
+            for item in visual_tree(root)
+            if item.metaObject().indexOfProperty("downloadState") >= 0
+        )
+        track = next(item for item in visual_tree(strip) if item.objectName() == "downloadTrack")
+        tail = next(item for item in visual_tree(strip) if item.objectName() == "downloadTail")
+        right_margin = theme_number("spaceWindowContentX")
+        expected_gap = theme_number("onboardingProgressStripGap")
+
+        def track_x() -> float:
+            assert track.isVisible()
+            left = track.mapToItem(strip, QPointF(0, 0)).x()
+            right = track.mapToItem(strip, QPointF(track.width(), 0)).x()
+            assert abs(right - (strip.width() - right_margin)) <= 1
+            return float(left)
+
+        initial_x = track_x()
+        assert tail.isVisible()
+        initial_tail_right = tail.mapToItem(strip, QPointF(tail.width(), 0)).x()
+        assert initial_tail_right <= initial_x
+        assert abs((initial_x - initial_tail_right) - expected_gap) <= 1
+        for speed, eta in (
+            ("123 456,7 МБ/с", "осталось приблизительно 12 часов"),
+            ("1 Б/с", "1 с"),
+        ):
+            fake.speed = speed
+            fake.eta = eta
+            QTest.qWait(20)
+            onboarding_app.processEvents()
+            assert tail.isVisible()
+            assert tail.property("text") == strip.property("tail")
+            tail_right = tail.mapToItem(strip, QPointF(tail.width(), 0)).x()
+            left = track_x()
+            assert tail_right <= left
+            assert abs((left - tail_right) - expected_gap) <= 1
+            assert abs(left - initial_x) <= 1
+
+        fake.downloadState = "verifying"
+        QTest.qWait(20)
+        onboarding_app.processEvents()
+        assert not tail.isVisible()
+        assert abs(track_x() - initial_x) <= 1
+
+        fake.downloadState = "downloading"
+        fake.speed = "5,2 МБ/с"
+        fake.eta = "осталось ~3 мин"
+        strip.window().setWidth(int(theme_number("sizeWindowMinW")))
+        QTest.qWait(20)
+        onboarding_app.processEvents()
+        assert abs(strip.width() - 900) <= 1
+        left = track_x()
+        assert tail.isVisible()
+        assert tail.property("text") == "Скачиваю с huggingface.co · 5,2 МБ/с · осталось ~3 мин"
+        tail_left = tail.mapToItem(strip, QPointF(0, 0)).x()
+        tail_right = tail.mapToItem(strip, QPointF(tail.width(), 0)).x()
+        assert abs((left - tail_right) - expected_gap) <= 1
+        title = next(
+            item for item in visual_tree(strip) if item.property("text") == fake.downloadTitle
+        )
+        assert title.isVisible()
+        assert title.mapToItem(strip, QPointF(title.width(), 0)).x() <= tail_left
+
+        for state, title_text, button_text in (
+            ("failed", "Не удалось загрузить модель", "Повторить"),
+            ("no-space", "Не хватает места на диске", "Открыть папку моделей"),
+        ):
+            fake.downloadState = state
+            fake.downloadTitle = title_text
+            fake.downloadDetail = "нужно ещё 172 МБ" if state == "no-space" else ""
+            QTest.qWait(20)
+            onboarding_app.processEvents()
+            assert not track.isVisible()
+            assert not tail.isVisible()
+            button = visible_button(strip, button_text)
+            button_right = button.mapToItem(strip, QPointF(button.width(), 0)).x()
+            assert abs(button_right - (strip.width() - right_margin)) <= 1
+
+    if screen == "onboarding":
+        _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    else:
+        _, messages = render_settings(
+            onboarding_app,
+            False,
+            fake=fake,
+            section="models",
+            inspect=lambda window: inspect(window.contentItem()),
+        )
+    assert_no_messages(messages, f"{screen} download track position")
+
+
 def test_download_card_state_frames(onboarding_app: Any) -> None:
     from astra_voice.ui.model_downloads import _FAILURE_MESSAGES, _SOURCE_TEXT
 
