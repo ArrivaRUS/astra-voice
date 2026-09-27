@@ -42,7 +42,7 @@ class Rig:
         self.shell = Mock()
         self.shell.rootObjects.return_value = [Mock()]
         self.load_qml = Mock(return_value=self.shell)
-        self.show = Mock()
+        self.focuser = Mock()
         self.cleanup = Mock()
         self.runtime = Mock()
         self.runtime.on_quit_requested = None
@@ -54,6 +54,7 @@ class Rig:
         self.calls.attach_mock(self.app.exec_, "exec")
         self.calls.attach_mock(self.app.quit, "quit")
         self.calls.attach_mock(self.runtime.shutdown, "shutdown")
+        self.calls.attach_mock(self.focuser.stop, "focuser_stop")
         self.calls.attach_mock(self.timer.stop, "timer_stop")
         self.calls.attach_mock(self.theme.source.stop, "theme_stop")
         self.calls.attach_mock(self.cleanup, "cleanup")
@@ -76,8 +77,10 @@ class Rig:
         monkeypatch.setattr(app_mod, "_make_theme_bridge", Mock(return_value=self.theme))
         monkeypatch.setattr(app_mod, "_load_qml", self.load_qml)
         monkeypatch.setattr(app_mod, "_wire_close", Mock())
-        monkeypatch.setattr(app_mod, "ShowServer", Mock(return_value=self.server))
-        monkeypatch.setattr(app_mod, "_show", self.show)
+        self.server_factory = Mock(return_value=self.server)
+        monkeypatch.setattr(app_mod, "ShowServer", self.server_factory)
+        self.focuser_factory = Mock(return_value=self.focuser)
+        monkeypatch.setattr(app_mod, "_WindowFocuser", self.focuser_factory)
         monkeypatch.setattr(app_mod, "_cleanup", self.cleanup)
         monkeypatch.setattr(runtime_mod, "DictationRuntime", self.factory)
 
@@ -156,6 +159,7 @@ def test_shutdown_once_before_other_cleanup(rig: Rig) -> None:
     assert rig.calls.mock_calls == [
         call.start(),
         call.exec(),
+        call.focuser_stop(),
         call.shutdown(),
         call.timer_stop(),
         call.theme_stop(),
@@ -310,7 +314,7 @@ def test_runtime_failure_keeps_event_loop_running(
         assert app_mod.main([]) == 7
 
     rig.app.exec_.assert_called_once_with()
-    rig.show.assert_called_once_with(rig.shell)
+    rig.focuser.focus_shell.assert_called_once_with()
     assert any(
         record.levelno == logging.WARNING and "без неё" in record.getMessage()
         for record in caplog.records
@@ -338,7 +342,7 @@ def test_tray_quit_calls_app_quit_and_shuts_down(rig: Rig) -> None:
     assert rig.calls.mock_calls.index(call.quit()) < rig.calls.mock_calls.index(call.shutdown())
 
 
-@pytest.mark.parametrize("action", ["on_settings", "on_about"])
+@pytest.mark.parametrize("action", ["on_open", "on_settings", "on_about"])
 def test_tray_opens_main_window(rig: Rig, action: str) -> None:
     def exec_loop() -> int:
         getattr(rig.runtime.tray, action)()
@@ -346,7 +350,32 @@ def test_tray_opens_main_window(rig: Rig, action: str) -> None:
 
     rig.app.exec_.side_effect = exec_loop
     assert app_mod.main(["--hidden"]) == 0
-    rig.show.assert_called_once_with(rig.shell)
+    rig.focuser_factory.assert_called_once_with(rig.shell, None)
+    rig.focuser.focus_shell.assert_called_once_with()
+
+
+def test_tray_click_focuses_shell_while_hidden(rig: Rig) -> None:
+
+    def exec_loop() -> int:
+        rig.runtime.tray.on_open()
+        return 0
+
+    rig.app.exec_.side_effect = exec_loop
+    assert app_mod.main(["--hidden"]) == 0
+    rig.focuser_factory.assert_called_once_with(rig.shell, None)
+    rig.focuser.focus_shell.assert_called_once_with()
+
+
+def test_second_instance_passes_timestamp_to_focuser(rig: Rig) -> None:
+    def exec_loop() -> int:
+        on_show = rig.server_factory.call_args.args[0]
+        assert on_show == rig.focuser.focus_shell
+        on_show(1234)
+        return 0
+
+    rig.app.exec_.side_effect = exec_loop
+    assert app_mod.main(["--hidden"]) == 0
+    rig.focuser.focus_shell.assert_called_once_with(1234)
 
 
 @pytest.mark.parametrize("source", ["pill", "notification"])
@@ -358,7 +387,7 @@ def test_details_opens_main_window_and_debug_section(rig: Rig, source: str) -> N
         assert info.debug is False
         info.debugChanged.connect(lambda: events.append(("changed", info.debug)))
         info.showSection.connect(lambda name: events.append((name, info.debug)))
-        rig.show.side_effect = lambda shell: events.append(("show", info.debug))
+        rig.focuser.focus_shell.side_effect = lambda: events.append(("show", info.debug))
         if source == "pill":
             rig.runtime.pill.on_details_clicked()
         else:
@@ -367,7 +396,7 @@ def test_details_opens_main_window_and_debug_section(rig: Rig, source: str) -> N
 
     rig.app.exec_.side_effect = exec_loop
     assert app_mod.main(["--hidden"]) == 0
-    rig.show.assert_called_once_with(rig.shell)
+    rig.focuser.focus_shell.assert_called_once_with()
     assert events == [("show", False), ("changed", True), ("debug", True)]
 
 
@@ -386,7 +415,7 @@ def test_notification_action_shows_its_section(rig: Rig, action: str, section: s
 
         notify._action_handlers[action]()
 
-        rig.show.assert_called_once_with(rig.shell)
+        rig.focuser.focus_shell.assert_called_once_with()
         assert list(sections) == [[section]]
         return 0
 
@@ -405,7 +434,7 @@ def test_notification_action_opens_main_window(rig: Rig, during_start: bool) -> 
     else:
         rig.app.exec_.side_effect = click_action
     assert app_mod.main(["--hidden"]) == (7 if during_start else 0)
-    rig.show.assert_called_once_with(rig.shell)
+    rig.focuser.focus_shell.assert_called_once_with()
     assert rig.load_qml.call_args.args[0].debug is False
 
 
@@ -484,7 +513,7 @@ def test_onboarding_attaches_window_before_show(rig: Rig, hidden: bool) -> None:
     root.isVisible.return_value = False
     rig.calls.attach_mock(root.installEventFilter, "attach_filter")
     rig.calls.attach_mock(root.isVisible, "read_visibility")
-    rig.calls.attach_mock(rig.show, "show")
+    rig.calls.attach_mock(rig.focuser.focus_shell, "focus_shell")
 
     assert app_mod.main(["--hidden"] if hidden else []) == 7
 
@@ -502,10 +531,10 @@ def test_onboarding_attaches_window_before_show(rig: Rig, hidden: bool) -> None:
     read = calls.index(call.read_visibility())
     assert capture_attached < read < calls.index(call.exec())
     if hidden:
-        rig.show.assert_not_called()
+        rig.focuser.focus_shell.assert_not_called()
     else:
-        rig.show.assert_called_once_with(rig.shell)
-        assert read < calls.index(call.show(rig.shell)) < calls.index(call.exec())
+        rig.focuser.focus_shell.assert_called_once_with()
+        assert read < calls.index(call.focus_shell()) < calls.index(call.exec())
 
 
 @pytest.mark.parametrize("code", ["ok", "busy"])

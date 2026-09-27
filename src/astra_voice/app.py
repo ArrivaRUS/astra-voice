@@ -20,6 +20,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from PyQt5.QtCore import QObject, Qt, pyqtSlot
+
 from astra_voice.core import paths
 from astra_voice.core import policy as policy_mod
 from astra_voice.core import settings as settings_mod
@@ -586,38 +588,102 @@ def _root_window(target: Any) -> Any:
     return target
 
 
-def _show(target: Any, timestamp: int = 0) -> None:
-    """Показывает окно: разворачивает из свёрнутого, поднимает, активирует.
+def _restore(root: Any) -> None:
+    """Показывает окно и снимает свёрнутость, сохраняя развёрнутость."""
+    get_states = getattr(root, "windowStates", None)
+    set_states = getattr(root, "setWindowStates", None)
+    if not callable(get_states) or not callable(set_states):
+        get_states = getattr(root, "windowState", None)
+        set_states = getattr(root, "setWindowState", None)
+    states = get_states() if callable(get_states) else None
+    if states is not None and states & Qt.WindowMinimized:
+        if callable(set_states):
+            set_states(states & ~Qt.WindowMinimized)
+        elif hasattr(root, "showNormal"):
+            root.showNormal()
 
-    ``setVisible(True)`` не снимает состояние «свёрнуто», поэтому нужен
-    ``showNormal()``. Метка времени X (если пришла от второго экземпляра)
-    ставится окну до активации — иначе KWin отделается «требует внимания».
-    """
-    root = _root_window(target)
-    if root is None:
-        return
-    # Сначала развернуть: у свёрнутого окна нативный идентификатор может быть
-    # уже недействителен, и правка свойства дала бы BadWindow.
-    if hasattr(root, "showNormal"):
-        root.showNormal()
-    elif hasattr(root, "setVisible"):
-        root.setVisible(True)
-    if timestamp > 0:
-        window_id = 0
+    is_visible = getattr(root, "isVisible", None)
+    visibility = getattr(root, "visibility", None)
+    if callable(is_visible):
+        hidden = not is_visible()
+    elif callable(visibility):
+        from PyQt5.QtGui import QWindow
+
+        hidden = visibility() == QWindow.Hidden
+    else:
+        hidden = states is None
+    if hidden:
+        if hasattr(root, "setVisible"):
+            root.setVisible(True)
+        elif hasattr(root, "show"):
+            root.show()
+        elif hasattr(root, "showNormal"):
+            root.showNormal()
+
+
+class _WindowFocuser(QObject):
+    """Показ и отложенный фокус; timestamp второго экземпляра ставится перед активацией."""
+
+    def __init__(self, shell: Any, parent: QObject | None = None) -> None:
+        from PyQt5.QtCore import QTimer
+
+        super().__init__(parent)
+        self._shell = shell
+        self._root: Any = None
+        self._timestamp = 0
+        self._stopped = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(0)
+        self._timer.timeout.connect(self._activate)
+
+    def stop(self) -> None:
+        """Отменяет ожидающую активацию и запрещает новые запросы."""
+        self._stopped = True
+        self._timer.stop()
+        self._root = None
+        self._timestamp = 0
+
+    def focus_shell(self, timestamp: int = 0) -> None:
+        """Показывает shell; положительный X timestamp обновляет user time окна."""
+        self.focus(self._shell, timestamp)
+
+    def focus(self, target: Any, timestamp: int = 0) -> None:
+        if self._stopped:
+            return
+        root = _root_window(target)
+        if root is None:
+            return
+        _restore(root)
+        if hasattr(root, "raise_"):
+            root.raise_()
+        self._root = root
+        self._timestamp = timestamp
+        self._timer.start()
+
+    @pyqtSlot()
+    def _activate(self) -> None:
+        root = self._root
+        if self._stopped or root is None:
+            return
         try:
             window_id = int(root.winId())
-        except Exception:  # noqa: BLE001 — у окна может не быть winId
+        except Exception:  # noqa: BLE001 — окно могло ещё не получить нативный id
             window_id = 0
-        if window_id:
-            from astra_voice.platform.x11 import set_user_time
+        timestamp = self._timestamp
+        self._root = None
+        self._timestamp = 0
 
-            set_user_time(window_id, timestamp)
-    if hasattr(root, "raise_"):
-        root.raise_()
-    if hasattr(root, "requestActivate"):
-        root.requestActivate()
-    elif hasattr(root, "activateWindow"):
-        root.activateWindow()
+        if window_id:
+            from astra_voice.platform.x11 import focus_window, set_user_time
+
+            if timestamp > 0:
+                set_user_time(window_id, timestamp)
+            focus_window(window_id)
+        if hasattr(root, "requestActivate"):
+            root.requestActivate()
+        elif hasattr(root, "activateWindow"):
+            root.activateWindow()
 
 
 def _wire_close(
@@ -793,7 +859,8 @@ def main(argv: list[str] | None = None) -> int:
     close_watcher = _wire_close(  # держим ссылку на фильтр
         app, shell, is_tray_ready=lambda: runtime is not None and runtime.tray.registered
     )
-    server = ShowServer(lambda timestamp: _show(shell, timestamp))
+    focuser = _WindowFocuser(shell, app if isinstance(app, QObject) else None)
+    server = ShowServer(focuser.focus_shell)
     timer = _install_signal_handlers(app)
 
     try:
@@ -811,11 +878,11 @@ def main(argv: list[str] | None = None) -> int:
             from astra_voice.ui import notify
 
             def show_details() -> None:
-                _show(shell)
+                focuser.focus_shell()
                 app_info.show_section(SECTION_DEBUG)
 
             def show_general() -> None:
-                _show(shell)
+                focuser.focus_shell()
                 app_info.show_section(SECTION_GENERAL)
 
             try:
@@ -830,9 +897,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             runtime.set_revoked_check(revoked_check)
             runtime.on_quit_requested = app.quit
-            runtime.on_show_requested = lambda: _show(shell)
-            runtime.tray.on_settings = lambda: _show(shell)
-            runtime.tray.on_about = lambda: _show(shell)
+            runtime.on_show_requested = focuser.focus_shell
+            runtime.tray.on_open = focuser.focus_shell
+            runtime.tray.on_settings = focuser.focus_shell
+            runtime.tray.on_about = focuser.focus_shell
             runtime.pill.on_details_clicked = show_details
             runtime.start()
             # start() регистрирует общий показ окна для всех действий уведомлений.
@@ -919,11 +987,12 @@ def main(argv: list[str] | None = None) -> int:
             downloads.downloadStateChanged.connect(update_download_status)
         _set_context_property(shell, "showOnboarding", show_onboarding)
         if not args.hidden:
-            _show(shell)
+            focuser.focus_shell()
         return int(app.exec_())
     finally:
+        focuser.stop()
         # US-8.4: выход из трея и SIGTERM/SIGINT вызывают app.quit() и приходят
-        # сюда. Сначала освобождаем воркер и захваты клавиш, затем lock/ipc и UI.
+        # сюда. После отмены фокуса освобождаем воркер и захваты, затем lock/ipc и UI.
         if onboarding is not None:
             try:
                 onboarding.shutdown()

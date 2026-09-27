@@ -265,6 +265,7 @@ class Tray(QObject):
     ) -> None:
         super().__init__(parent)
         self.on_cancel: Callable[[], None] | None = None
+        self.on_open: Callable[[], None] | None = None
         self.on_settings: Callable[[], None] | None = None
         self.on_copy_last: Callable[[], None] | None = None
         self.on_check_updates: Callable[[], None] | None = None
@@ -277,6 +278,7 @@ class Tray(QObject):
         factory = tray_factory if tray_factory is not None else lambda: QSystemTrayIcon()
         self._tray = factory()
         self._tray.setParent(self)
+        self._tray.activated.connect(self._on_activated)
         self._registered = False
         self._running = False
         self._banner_shown = False
@@ -349,6 +351,11 @@ class Tray(QObject):
     def _invoke(callback: Callable[[], None] | None) -> None:
         if callback is not None:
             callback()
+
+    @pyqtSlot(QSystemTrayIcon.ActivationReason)
+    def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._invoke(self.on_open)
 
     def _add_action(self, label: str, callback: Callable[[], None]) -> QAction:
         action = QAction(label, self._menu)
