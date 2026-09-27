@@ -8,8 +8,16 @@ from functools import partial
 from time import monotonic
 from typing import Any
 
-from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import (
+    QObject,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+    pyqtSlot,
+)
 from PyQt5.QtDBus import (
+    QDBusArgument,
     QDBusConnection,
     QDBusError,
     QDBusMessage,
@@ -31,19 +39,45 @@ _HOST_PROPERTY = "IsStatusNotifierHostRegistered"
 _DBUS_SERVICE = "org.freedesktop.DBus"
 _DBUS_PATH = "/org/freedesktop/DBus"
 _UNAVAILABLE_SUMMARY = "Значок не появился на панели"
+_CALL_TIMEOUT_MS = 500
+# Запас сверх таймаута вызова: QtDBus должен успеть доставить failed до закрытия шины.
+_CLOSE_GRACE_MS = 700
 _logger = logging.getLogger(__name__)
+_BusReply = tuple[int, list[Any]]
+
+
+def _plain_dbus_value(value: Any) -> Any:
+    if isinstance(value, QDBusArgument):
+        _logger.warning("Непреобразованный аргумент D-Bus отброшен")
+        return None
+    if isinstance(value, QDBusVariant):
+        return _plain_dbus_value(value.variant())
+    if isinstance(value, list):
+        return [_plain_dbus_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_plain_dbus_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _plain_dbus_value(item) for key, item in value.items()}
+    return value
 
 
 class _BusRequest(QObject):
     """Типизированные Qt-слоты для одного запроса без Introspect и ожидания."""
 
-    def __init__(self, callback: Callable[[QDBusMessage | None], None], parent: QObject) -> None:
+    def __init__(self, callback: Callable[[_BusReply | None], None], parent: QObject) -> None:
         super().__init__(parent)
         self._callback = callback
 
     @pyqtSlot(QDBusMessage)
     def finished(self, message: QDBusMessage) -> None:
-        self._callback(message)
+        try:
+            arguments = [_plain_dbus_value(arg) for arg in message.arguments()]
+            reply = (int(message.type()), arguments)
+        except Exception:
+            _logger.exception("Не удалось разобрать ответ D-Bus")
+            self._callback(None)
+            return
+        self._callback(reply)
 
     @pyqtSlot(QDBusError, QDBusMessage)
     def failed(self, error: QDBusError, message: QDBusMessage) -> None:
@@ -54,24 +88,35 @@ class _BusWorker(QObject):
     """Все QtDBus-объекты живут и удаляются вне GUI, включая получателей сигналов."""
 
     command = pyqtSignal(str, object)
-    result = pyqtSignal(str, object)
+    result = pyqtSignal(int, str, object)
     finished = pyqtSignal()
 
-    def __init__(self) -> None:
+    def __init__(self, token: int) -> None:
         super().__init__()
+        self._token = token
         self.command.connect(self._command)
         self._bus: QDBusConnection | None = None
         self._name = f"astra-voice-tray-{id(self):x}"
         self._requests: dict[int, _BusRequest] = {}
+        self._inflight: set[_BusRequest] = set()
         self._connections: set[str] = set()
+        self._hooks: list[tuple[str, str, str, str, Callable[..., None]]] = []
         self._matches: set[str] = set()
         self._setup_id = 0
         self._setup_timer: QTimer | None = None
+        self._close_timer: QTimer | None = None
+        self._closing = False
+        self._closed = False
         self._is_kde = False
 
     @pyqtSlot(str, object)
     def _command(self, operation: str, payload: Any) -> None:
         try:
+            if self._closing and operation in ("setup", "request"):
+                if operation == "request":
+                    serial, _ = payload
+                    self.result.emit(self._token, "reply", (serial, None))
+                return
             if operation == "setup":
                 self._setup()
             elif operation == "request":
@@ -86,8 +131,10 @@ class _BusWorker(QObject):
             if operation == "request":
                 serial, _ = payload
                 self._cancel(serial)
-                self.result.emit("reply", (serial, None))
-            else:
+                self.result.emit(self._token, "reply", (serial, None))
+            elif operation == "stop":
+                self._finish_close()
+            elif not self._closing:
                 self._setup_expired()
 
     def _setup(self) -> None:
@@ -100,6 +147,7 @@ class _BusWorker(QObject):
         self._setup_timer.start(500)
         self._is_kde = detect() == SessionKind.KDE
         if self._bus is not None and not self._bus.isConnected():
+            self._drop_hooks()
             QDBusConnection.disconnectFromBus(self._name)
             self._bus = None
             self._connections.clear()
@@ -136,6 +184,7 @@ class _BusWorker(QObject):
                     self._setup_expired()
                     return
                 self._connections.add(rule)
+                self._hooks.append((service, path, interface, member, slot))
         for index, rule in enumerate(sorted(rules - self._matches), 1):
             message = QDBusMessage.createMethodCall(
                 _DBUS_SERVICE, _DBUS_PATH, _DBUS_SERVICE, "AddMatch"
@@ -148,11 +197,11 @@ class _BusWorker(QObject):
             self._setup_ready()
 
     def _match_reply(
-        self, setup_id: int, rule: str, rules: set[str], message: QDBusMessage | None
+        self, setup_id: int, rule: str, rules: set[str], reply: _BusReply | None
     ) -> None:
         if setup_id != self._setup_id:
             return
-        if message is None or message.type() != QDBusMessage.ReplyMessage:
+        if reply is None or reply[0] != QDBusMessage.ReplyMessage:
             self._setup_expired()
             return
         self._matches.add(rule)
@@ -163,7 +212,7 @@ class _BusWorker(QObject):
         self._setup_id += 1
         if self._setup_timer is not None:
             self._setup_timer.stop()
-        self.result.emit("ready", self._is_kde)
+        self.result.emit(self._token, "ready", self._is_kde)
 
     def _setup_expired(self) -> None:
         self._setup_id += 1
@@ -172,78 +221,146 @@ class _BusWorker(QObject):
         for serial in tuple(self._requests):
             if serial < 0:
                 self._cancel(serial)
-        self.result.emit("failed", None)
+        self.result.emit(self._token, "failed", None)
 
     def _request(
         self,
         serial: int,
         message: QDBusMessage,
-        callback: Callable[[QDBusMessage | None], None] | None = None,
+        callback: Callable[[_BusReply | None], None] | None = None,
     ) -> None:
-        def finished(reply: QDBusMessage | None) -> None:
-            if self._requests.get(serial) is not request:
+        def finished(reply: _BusReply | None) -> None:
+            if request not in self._inflight:
                 return
-            self._cancel(serial)
-            if callback is None:
-                self.result.emit("reply", (serial, reply))
-            else:
-                callback(reply)
+            self._inflight.remove(request)
+            request.deleteLater()
+            try:
+                if self._requests.get(serial) is request:
+                    self._cancel(serial)
+                    if callback is None:
+                        self.result.emit(self._token, "reply", (serial, reply))
+                    else:
+                        callback(reply)
+            finally:
+                if self._closing and not self._inflight:
+                    self._finish_close()
 
         self._cancel(serial)
         request = _BusRequest(finished, self)
         self._requests[serial] = request
+        self._inflight.add(request)
         if self._bus is None or not self._bus.callWithCallback(
-            message, request.finished, request.failed, 500
+            message, request.finished, request.failed, _CALL_TIMEOUT_MS
         ):
             finished(None)
 
     def _cancel(self, serial: int) -> None:
-        request = self._requests.pop(serial, None)
-        if request is not None:
-            request.deleteLater()
+        self._requests.pop(serial, None)
 
     @pyqtSlot(str, str, str)
     def _owner_changed(self, service: str, old_owner: str, new_owner: str) -> None:
-        self.result.emit("owner", (service, old_owner, new_owner))
+        self.result.emit(self._token, "owner", (service, old_owner, new_owner))
 
     @pyqtSlot()
     def _host_changed(self) -> None:
-        self.result.emit("host", None)
+        self.result.emit(self._token, "host", None)
 
     @pyqtSlot(str, "QVariantMap", "QStringList")
     def _properties_changed(
         self, interface: str, changed: dict[str, Any], invalidated: list[str]
     ) -> None:
-        self.result.emit("properties", (interface, changed, invalidated))
+        self.result.emit(
+            self._token, "properties", (interface, _plain_dbus_value(changed), invalidated)
+        )
 
     def _close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
         if self._setup_timer is not None:
             self._setup_timer.stop()
         self._setup_id += 1
         for serial in tuple(self._requests):
             self._cancel(serial)
-        # Отдельное соединение снимает также наши подтверждающие AddMatch.
+        if not self._inflight:
+            self._finish_close()
+            return
+        self._close_timer = QTimer(self)
+        self._close_timer.setSingleShot(True)
+        self._close_timer.timeout.connect(self._finish_close)
+        self._close_timer.start(_CLOSE_GRACE_MS)
+
+    def _drop_hooks(self) -> None:
+        # closeConnection() QtDBus зовёт hook.obj->disconnect() по сырому указателю
+        # в своём потоке: снимаем хуки до disconnectFromBus, пока воркер жив.
+        bus, hooks, self._hooks = self._bus, self._hooks, []
+        if bus is None:
+            return
+        for service, path, interface, member, slot in hooks:
+            if not bus.disconnect(service, path, interface, member, slot):
+                _logger.warning("Не удалось снять подписку D-Bus %s", member)
+
+    def _finish_close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._close_timer is not None:
+            self._close_timer.stop()
         try:
+            # Отдельное соединение снимает также наши подтверждающие AddMatch.
+            self._drop_hooks()
             QDBusConnection.disconnectFromBus(self._name)
         finally:
             self._bus = None
-            self.result.emit("closed", None)
+            self.result.emit(self._token, "closed", None)
             self.finished.emit()
 
 
 # stop() не ждёт поток и не уничтожает QThread, зависший внутри QtDBus.
 # Сильные ссылки живут до finished; один Tray не плодит потоки при ретраях.
 _bus_threads: dict[_BusWorker, QThread] = {}
+_abandoned_bus_threads: list[tuple[_BusWorker, QThread]] = []
+_bus_reaper: _BusThreadReaper | None = None
+
+
+class _BusThreadReaper(QObject):
+    """Удаляет QThread только после полного выхода рабочего потока."""
+
+    @pyqtSlot()
+    def collect(self) -> None:
+        thread = self.sender()
+        if not isinstance(thread, QThread):
+            return
+        thread.wait()
+        for worker, active_thread in tuple(_bus_threads.items()):
+            if active_thread is thread:
+                _bus_threads.pop(worker, None)
+                # После wait() QThread удаляется отложенно в GUI-потоке.
+                thread.deleteLater()
+                return
+
+
+def shutdown_bus_threads(timeout_ms: int = 1000) -> None:
+    """Вызывать после выхода из GUI; 1000 мс покрывают 700 мс закрытия."""
+    deadline = monotonic() + timeout_ms / 1000
+    for worker, thread in tuple(_bus_threads.items()):
+        remaining_ms = max(0, int((deadline - monotonic()) * 1000))
+        if not thread.wait(remaining_ms):
+            _logger.warning("Поток D-Bus не завершился за время ожидания")
+            _abandoned_bus_threads.append((worker, thread))
+    _bus_threads.clear()
 
 
 def _start_bus_worker(worker: _BusWorker) -> None:
+    global _bus_reaper
+    if _bus_reaper is None:
+        _bus_reaper = _BusThreadReaper()
     thread = QThread()
     _bus_threads[worker] = thread
     worker.moveToThread(thread)
     worker.finished.connect(thread.quit, Qt.DirectConnection)
     thread.finished.connect(worker.deleteLater)
-    thread.finished.connect(thread.deleteLater)
-    thread.finished.connect(lambda: _bus_threads.pop(worker, None))
+    thread.finished.connect(_bus_reaper.collect, Qt.QueuedConnection)
     thread.start()
 
 
@@ -284,12 +401,14 @@ class Tray(QObject):
         self._banner_shown = False
         self._deadline: float | None = None
         self._worker: _BusWorker | None = None
+        self._worker_generation = 0
+        self._worker_token: int | None = None
         self._worker_closing = False
         self._subscriptions_ready = False
         self._setup_pending = False
         self._setup_deadline = 0.0
         self._serial = 0
-        self._requests: dict[str, tuple[int, Callable[[QDBusMessage | None], None]]] = {}
+        self._requests: dict[str, tuple[int, Callable[[_BusReply | None], None]]] = {}
         self._host_registered = False
         self._is_kde = False
         self._plasma_alive = False
@@ -513,19 +632,23 @@ class Tray(QObject):
         if self._setup_pending or self._worker_closing:
             return
         if self._worker is None:
-            self._worker = _BusWorker()
+            self._worker_generation += 1
+            self._worker_token = self._worker_generation
+            self._worker = _BusWorker(self._worker_token)
             self._worker.result.connect(self._bus_event)
             _start_bus_worker(self._worker)
         self._setup_pending = True
         self._setup_deadline = monotonic() + 0.5
         self._worker.command.emit("setup", None)
 
-    @pyqtSlot(str, object)
-    def _bus_event(self, event: str, payload: Any) -> None:
-        if self.sender() is not self._worker:
+    @pyqtSlot(int, str, object)
+    def _bus_event(self, token: int, event: str, payload: Any) -> None:
+        # Queued "closed" может прийти после удаления QObject в рабочем потоке.
+        if token != self._worker_token:
             return
         if event == "closed":
             self._worker = None
+            self._worker_token = None
             self._worker_closing = False
             if self._running:
                 self._try_register()
@@ -577,9 +700,14 @@ class Tray(QObject):
         self,
         service: str,
         message: QDBusMessage,
-        callback: Callable[[QDBusMessage | None], None],
+        callback: Callable[[_BusReply | None], None],
     ) -> None:
-        if self._worker is None or not self._subscriptions_ready or service in self._requests:
+        if (
+            self._worker is None
+            or self._worker_closing
+            or not self._subscriptions_ready
+            or service in self._requests
+        ):
             return
         self._serial += 1
         # Номер не сбрасывается в stop(): ответ старого владельца или worker
@@ -589,7 +717,7 @@ class Tray(QObject):
 
     def _cancel_request(self, service: str) -> None:
         request = self._requests.pop(service, None)
-        if request is not None and self._worker is not None:
+        if request is not None and self._worker is not None and not self._worker_closing:
             self._worker.command.emit("cancel", request[0])
 
     def _query_host(self) -> None:
@@ -599,11 +727,9 @@ class Tray(QObject):
         message.setArguments([_WATCHER_SERVICE, _HOST_PROPERTY])
         self._request(_WATCHER_SERVICE, message, self._host_reply)
 
-    def _host_reply(self, message: QDBusMessage | None) -> None:
-        args = message.arguments() if message is not None else []
+    def _host_reply(self, reply: _BusReply | None) -> None:
+        args = reply[1] if reply is not None and reply[0] == QDBusMessage.ReplyMessage else []
         value = args[0] if len(args) == 1 else None
-        if isinstance(value, QDBusVariant):
-            value = value.variant()
         self._host_registered = value is True
         if self._host_registered:
             if self._deadline is None:
@@ -612,8 +738,8 @@ class Tray(QObject):
         else:
             self._invalidate_registration()
 
-    def _plasma_reply(self, message: QDBusMessage | None) -> None:
-        args = message.arguments() if message is not None else []
+    def _plasma_reply(self, reply: _BusReply | None) -> None:
+        args = reply[1] if reply is not None and reply[0] == QDBusMessage.ReplyMessage else []
         self._plasma_known = len(args) == 1 and isinstance(args[0], str) and bool(args[0])
         self._set_plasma_alive(self._plasma_known)
 
