@@ -684,3 +684,16 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
   чистка QtQuick.Shapes из Depends/CI/conftest, сторож регистрации провайдера по функциям, лямбды на сигналах в
   `app.py:328`, `model_downloads.py:2180`, `tray.py:246` (урок 021), состояния policy/offline-user до перезапуска (M7).
 - Worktree: `wt-ort125` (старый); остальные ветки слиты — worktree можно убрать.
+
+### 2026-09-27 05:30 — перед сжатием контекста
+- **У заказчика установлена `m6.19`** (apt 27.09 ~05:25), программа перезапущена Юркой: pid **707411**
+  (`/usr/bin/python3 -I /usr/lib/astra-voice/bootstrap.py app`), модель за 727 мс, самопроверка ok, новых ошибок в журнале нет.
+  На ~/Desktop — только `astra-voice_0.1.0~m6.19_amd64.deb`. Ждём от заказчика живую проверку: «Модели» → прокрутка →
+  «Общие» без галочек над шапкой, чёткие значки на HDMI-1 (1,25); очередь загрузки и полоса «Скачиваю с … · скорость · осталось».
+- **main `dec004d`+**, CI зелёный; все wip-ветки дня слиты, их worktree удалены (остался старый `wt-ort125`); PR #1, #2 — MERGED.
+- **Агенты:** в фоне никого. Лимит Fable исчерпан 26.09 — субагентов с моделью fable запускать с `model: opus`.
+- **Следующий шаг (R1 30.09):** (1) fine-grained PAT для агентов — инструкция заказчику (Contents/PR/Issues R/W, Actions/Metadata Read;
+  Workflows/Administration/Deployments/Environments/Secrets — No access; ≤90 дней; `gh auth login --with-token < файл`;
+  отозвать старый `gho_` у GitHub CLI) — внимание: после этого агенты не смогут пушить изменения `.github/workflows`;
+  (2) T3 security перед тегом; (3) changelog `0.1.0` + changelog-writer; (4) чеклист живых сценариев у заказчика (KDE);
+  (5) INSTALL-ADMIN «[уточнить]» (9 пунктов); мелочи из ревью — см. снимок 26.09 23:55.
