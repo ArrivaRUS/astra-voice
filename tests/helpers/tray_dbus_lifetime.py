@@ -46,7 +46,7 @@ def pump_until(predicate: Callable[[], bool], deadline: float) -> None:
 
 def plasma_reply() -> None:
     owner = subprocess.Popen(
-        [sys.executable, str(Path(__file__).with_name("tray_dbus_owner.py"))],
+        [sys.executable, str(Path(__file__).with_name("tray_dbus_owner.py")), str(os.getpid())],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

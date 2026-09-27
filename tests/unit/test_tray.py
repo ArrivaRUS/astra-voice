@@ -64,9 +64,11 @@ class Bus:
         self.calls: list[PendingCall] = []
         self.matches: list[PendingCall] = []
         self.signals: dict[str, Callable[..., None]] = {}
+        self.events: list[tuple[str, tuple[object, ...]]] = []
         self.transport = Mock()
         self.transport.callWithCallback.side_effect = self.submit
         self.transport.connect.side_effect = self.connect
+        self.transport.disconnect.side_effect = self.disconnect
         self.transport.call.side_effect = AssertionError("Synchronous D-Bus forbidden")
         self.transport.interface.side_effect = AssertionError("D-Bus interface forbidden")
         self.watcher = Mock(
@@ -100,6 +102,7 @@ class Bus:
     def connect(
         self, service: str, path: str, interface: str, member: str, slot: Callable[..., None]
     ) -> bool:
+        self.events.append(("connect", (service, path, interface, member, slot)))
         if member == "NameOwnerChanged":
             assert service == interface == "org.freedesktop.DBus"
             assert path == "/org/freedesktop/DBus"
@@ -111,6 +114,12 @@ class Bus:
             assert path == "/StatusNotifierWatcher"
             assert interface in (SERVICE, "org.freedesktop.DBus.Properties")
         self.signals[member] = slot
+        return True
+
+    def disconnect(
+        self, service: str, path: str, interface: str, member: str, slot: Callable[..., None]
+    ) -> bool:
+        self.events.append(("disconnect", (service, path, interface, member, slot)))
         return True
 
     def host_changed(self, value: bool) -> None:
@@ -1048,6 +1057,79 @@ def test_late_reply_cannot_cross_stop_and_start(harness: Harness) -> None:
     assert not harness.tray.registered
     harness.bus.calls[-1].reply(True)
     assert harness.tray.registered
+
+
+@pytest.mark.parametrize("reconnect", [False, True])
+def test_worker_drops_all_hooks_before_closing_bus(harness: Harness, reconnect: bool) -> None:
+    from astra_voice.ui import tray as module
+
+    worker = module._BusWorker(42)
+    events = harness.bus.events
+
+    def connect_bus(bus_type: object, name: str) -> Mock:
+        events.append(("connectToBus", (bus_type, name)))
+        return harness.bus.transport
+
+    def disconnect_bus(name: str) -> None:
+        events.append(("disconnectFromBus", (name,)))
+
+    harness.connection.connectToBus.side_effect = connect_bus
+    harness.connection.disconnectFromBus.side_effect = disconnect_bus
+    worker.command.emit("setup", None)
+    hooks = [
+        (
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameOwnerChanged",
+            worker._owner_changed,
+        ),
+        (
+            SERVICE,
+            "/StatusNotifierWatcher",
+            SERVICE,
+            "StatusNotifierHostRegistered",
+            worker._host_changed,
+        ),
+        (
+            SERVICE,
+            "/StatusNotifierWatcher",
+            SERVICE,
+            "StatusNotifierHostUnregistered",
+            worker._host_changed,
+        ),
+        (
+            SERVICE,
+            "/StatusNotifierWatcher",
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            worker._properties_changed,
+        ),
+    ]
+    assert worker._hooks == hooks
+    assert [args for action, args in events if action == "connect"] == hooks
+    events.clear()
+
+    if reconnect:
+        harness.bus.transport.isConnected.return_value = False
+        worker.command.emit("setup", None)
+        assert events == [
+            *(("disconnect", hook) for hook in hooks),
+            ("disconnectFromBus", (worker._name,)),
+            ("connectToBus", (harness.connection.SessionBus, worker._name)),
+            *(("connect", hook) for hook in hooks),
+        ]
+        assert worker._hooks == hooks
+        assert len(worker._connections) == 4
+        worker.command.emit("stop", None)
+    else:
+        worker.command.emit("stop", None)
+        assert events == [
+            *(("disconnect", hook) for hook in hooks),
+            ("disconnectFromBus", (worker._name,)),
+        ]
+        assert not worker._hooks
+    worker.deleteLater()
 
 
 @pytest.mark.parametrize("completion", ["reply", "timeout"])

@@ -100,6 +100,7 @@ class _BusWorker(QObject):
         self._requests: dict[int, _BusRequest] = {}
         self._inflight: set[_BusRequest] = set()
         self._connections: set[str] = set()
+        self._hooks: list[tuple[str, str, str, str, Callable[..., None]]] = []
         self._matches: set[str] = set()
         self._setup_id = 0
         self._setup_timer: QTimer | None = None
@@ -146,6 +147,7 @@ class _BusWorker(QObject):
         self._setup_timer.start(500)
         self._is_kde = detect() == SessionKind.KDE
         if self._bus is not None and not self._bus.isConnected():
+            self._drop_hooks()
             QDBusConnection.disconnectFromBus(self._name)
             self._bus = None
             self._connections.clear()
@@ -182,6 +184,7 @@ class _BusWorker(QObject):
                     self._setup_expired()
                     return
                 self._connections.add(rule)
+                self._hooks.append((service, path, interface, member, slot))
         for index, rule in enumerate(sorted(rules - self._matches), 1):
             message = QDBusMessage.createMethodCall(
                 _DBUS_SERVICE, _DBUS_PATH, _DBUS_SERVICE, "AddMatch"
@@ -287,6 +290,16 @@ class _BusWorker(QObject):
         self._close_timer.timeout.connect(self._finish_close)
         self._close_timer.start(_CLOSE_GRACE_MS)
 
+    def _drop_hooks(self) -> None:
+        # closeConnection() QtDBus зовёт hook.obj->disconnect() по сырому указателю
+        # в своём потоке: снимаем хуки до disconnectFromBus, пока воркер жив.
+        bus, hooks, self._hooks = self._bus, self._hooks, []
+        if bus is None:
+            return
+        for service, path, interface, member, slot in hooks:
+            if not bus.disconnect(service, path, interface, member, slot):
+                _logger.warning("Не удалось снять подписку D-Bus %s", member)
+
     def _finish_close(self) -> None:
         if self._closed:
             return
@@ -295,6 +308,7 @@ class _BusWorker(QObject):
             self._close_timer.stop()
         try:
             # Отдельное соединение снимает также наши подтверждающие AddMatch.
+            self._drop_hooks()
             QDBusConnection.disconnectFromBus(self._name)
         finally:
             self._bus = None

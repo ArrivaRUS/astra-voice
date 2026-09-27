@@ -62,5 +62,9 @@ def test_tray_dbus_lifetime(scenario: str, repeat: int) -> None:
                 os.killpg(proc.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-        assert proc.returncode == 0, (scenario, attempt, stdout, stderr)
-        assert f"TRAY_DBUS_OK:{scenario}" in stdout, (scenario, attempt, stdout, stderr)
+        if proc.returncode != 0 or f"TRAY_DBUS_OK:{scenario}" not in stdout:
+            pytest.fail(
+                f"{scenario} ({attempt}/{repeat}): rc={proc.returncode}"
+                f"\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                pytrace=False,
+            )
