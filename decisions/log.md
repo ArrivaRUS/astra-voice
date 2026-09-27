@@ -2324,7 +2324,7 @@
   трея без сбоя, повторный запуск — «всё отлично».
 
 ## 2026-09-27 — Токен GitHub для агентов (K-3 п. 6) выдан; состав v0.1; хвост записи 50 мс; честный замер Ц2
-- **Токен:** заказчик создал fine-grained PAT `agents-astra-machine` (до 26.12.2026, All repositories — токен общий для всех
+- **Токен:** заказчик создал fine-grained PAT `agents-astra-machine` (до 01.02.2027, All repositories — токен общий для всех
   сессий машины): Contents/Pull requests/Issues/Actions — R/W, Commit statuses — R, Metadata — R; Workflows, Administration,
   Deployments, Environments, Secrets, Variables — No access. Поставлен через `gh auth login --with-token` (токен Юрка не видел).
   Проверка Юрки: чтение/push веток/CI — работают; PATCH репо, настройки Actions, секреты `release` — отказ; push правки
