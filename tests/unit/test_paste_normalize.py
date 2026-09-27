@@ -544,6 +544,7 @@ def test_clipboard_only_without_x(
     primary = cb.snapshot(True)
     outcome = paste.paste_text("Проверка\nсвязи, ёж.\x0f", 42, PasteMode.CLIPBOARD_ONLY)
     assert outcome.kind == PasteOutcomeKind.CLIPBOARD_ONLY
+    assert outcome.delivered_ms is None
     assert outcome.method == PasteMethod.NONE
     assert outcome.wm_class is None
     assert outcome.restore == PasteRestore.KEPT_OURS
@@ -639,6 +640,64 @@ def test_delayed_fetch_restores_after_six_polls(
     assert delays == [50] + [paste.KEYS_POLL_MS] * 6 + [100]
 
 
+def test_delivered_ms_is_fetch_time_before_cleanup(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cb, x, _ = harness
+    now = [10.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def wait(ms: int) -> None:
+        now[0] += ms / 1000
+
+    def send_combo(*_args: object) -> bool:
+        now[0] += 0.03
+        tracker = cb.trackers[False]
+        assert tracker is not None
+        tracker.mark()
+        return True
+
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    x.send_combo.side_effect = send_combo
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    assert outcome.delivered_ms == pytest.approx(80)
+    assert outcome.t_ms == pytest.approx(180)
+
+
+def test_delivered_ms_includes_clipboard_snapshot_time(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cb, x, _ = harness
+    now = [10.0]
+    extra_snapshot_time = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    original_snapshot = cb.snapshot
+
+    def snapshot(primary: bool) -> dict[str, bytes]:
+        now[0] += extra_snapshot_time[0]
+        return original_snapshot(primary)
+
+    def send_combo(*_args: object) -> bool:
+        now[0] += 0.03
+        tracker = cb.trackers[False]
+        assert tracker is not None
+        tracker.mark()
+        return True
+
+    monkeypatch.setattr(cb, "snapshot", snapshot)
+    monkeypatch.setattr(paste, "_wait_ms", lambda ms: now.__setitem__(0, now[0] + ms / 1000))
+    x.send_combo.side_effect = send_combo
+    first = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    extra_snapshot_time[0] = 0.2
+    second = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert first.kind == second.kind == PasteOutcomeKind.PASTED
+    assert first.fetched_ms == second.fetched_ms
+    assert first.delivered_ms is not None
+    assert second.delivered_ms is not None
+    assert second.delivered_ms - first.delivered_ms == pytest.approx(200)
+
+
 def test_unfetched_phrase_stays_in_clipboard(
     harness: tuple[FakeClipboard, Mock, list[int]],
 ) -> None:
@@ -650,6 +709,7 @@ def test_unfetched_phrase_stays_in_clipboard(
     assert outcome.reason == "not-fetched"
     assert outcome.restore == PasteRestore.KEPT_OURS
     assert outcome.fetched_ms is None
+    assert outcome.delivered_ms is None
     assert cb.data[False]["text/plain"] == "фраза для ручной вставки".encode()
     assert delays == [50] + [paste.KEYS_POLL_MS] * (
         (paste.FETCH_TIMEOUT_MS + paste.KEYS_POLL_MS - 1) // paste.KEYS_POLL_MS
@@ -674,7 +734,51 @@ def test_new_clipboard_owner_after_xtest_counts_as_pasted(
     assert outcome.restore == PasteRestore.SKIPPED_NOT_OWNER
     assert outcome.reason == ""
     assert outcome.fetched_ms is None
+    assert outcome.delivered_ms is None
     assert delays == [50, 100]
+
+
+def test_unconfirmed_paste_has_no_delivery_time(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cb, x, _ = harness
+    now = [10.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(paste, "_wait_ms", lambda ms: now.__setitem__(0, now[0] + ms / 1000))
+
+    def send_combo(*_args: object) -> bool:
+        cb.owned[False] = False
+        return True
+
+    x.send_combo.side_effect = send_combo
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    assert outcome.fetched_ms is None
+    assert outcome.delivered_ms is None
+    assert outcome.t_ms == pytest.approx(150)
+
+
+def test_fetch_after_wait_does_not_confirm_delivery(
+    harness: tuple[FakeClipboard, Mock, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cb, x, _ = harness
+
+    def send_combo(*_args: object) -> bool:
+        cb.owned[False] = False
+        return True
+
+    def wait(ms: int) -> None:
+        if ms == 100:
+            tracker = cb.trackers[False]
+            assert tracker is not None
+            tracker.mark()
+
+    x.send_combo.side_effect = send_combo
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    assert outcome.fetched_ms is None
+    assert outcome.delivered_ms is None
 
 
 def test_unfetched_shift_insert_keeps_phrase_in_both_clipboards(
@@ -729,6 +833,8 @@ def test_restore_pending_during_fetch_wait_stops_polling(
     outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
     assert outcome.kind == PasteOutcomeKind.PASTED
     assert outcome.restore == PasteRestore.RESTORED
+    assert outcome.fetched_ms is None
+    assert outcome.delivered_ms is None
     assert cb.data[False] == before
     assert delays == [50, paste.KEYS_POLL_MS, 100]
 

@@ -36,9 +36,9 @@ from astra_voice.ui.tray_icons import TrayState
 
 RECOGNIZE_TIMEOUT_S = 30.0
 PROCESSING_WATCHDOG_MS = 35000
-# Люди отпускают клавишу на последнем слоге: дописываем хвост фразы.
+# Решение заказчика 2026-09-27: 50 мс хвоста; если последнее слово обрезается, поднять до 100 мс.
 # Запись в это время продолжается, поэтому фаза, пилюля и трей остаются «слушаю».
-RELEASE_TAIL_MS = 250
+RELEASE_TAIL_MS = 50
 CANCEL_TIMEOUT_MS = 1500
 CANCEL_RESTART_MS = 2000
 BUSY_RETRY_MS = 200
@@ -197,8 +197,10 @@ class DictationOrchestrator:
         self._t0 = 0.0
         self._t_ready: float | None = None
         self._t_stop: float | None = None
+        self._t_release: float | None = None
         self._t_ms = 0.0
         self._paste_ms = 0.0
+        self._t_total_ms: float | None = None
         self._result_audio_ms: float | None = None
         self._result_infer_ms: float | None = None
         self._retries = 0
@@ -537,7 +539,9 @@ class DictationOrchestrator:
             self._cold, self._started = not self._started, True
         self._t_ready = None
         self._t_stop = None
+        self._t_release = None
         self._t_ms = self._paste_ms = 0.0
+        self._t_total_ms = None
         self._result_audio_ms = None
         self._result_infer_ms = None
         self._retries = 0
@@ -586,6 +590,8 @@ class DictationOrchestrator:
             return
         if self._phase != DictationPhase.RECORDING or self._cancel_requested:
             return
+        if tail and not recording_stopped and self._t_release is None:
+            self._t_release = self._clock()
         # По record.limit запись уже остановлена, а проверка микрофона хвоста не ждёт.
         if RELEASE_TAIL_MS > 0 and tail and not recording_stopped and not self.test_active:
             if self._tail_pending:
@@ -809,6 +815,7 @@ class DictationOrchestrator:
         started = self._clock()
         self._suspended = True
         not_fetched = False
+        outcome: PasteOutcome | None = None
         try:
             outcome = self._paste(text, self._target_window, self._paste_mode())
             kind = outcome.kind
@@ -818,7 +825,8 @@ class DictationOrchestrator:
             self._log.warning("диктовка: ошибка вызова вставки")
             kind = PasteOutcomeKind.FAILED
         finally:
-            self._paste_ms += max(0.0, (self._clock() - started) * 1000)
+            finished = self._clock()
+            self._paste_ms += max(0.0, (finished - started) * 1000)
             self._suspended = False
         # Исход известен до разбора очереди: доставленную фразу отменить уже нельзя.
         self._delivered = kind in (
@@ -826,6 +834,15 @@ class DictationOrchestrator:
             PasteOutcomeKind.CLIPBOARD_ONLY,
             PasteOutcomeKind.WINDOW_CHANGED,
         )
+        if (
+            kind == PasteOutcomeKind.PASTED
+            and outcome is not None
+            and outcome.delivered_ms is not None
+            and self._t_total_ms is None
+        ):
+            release = self._t_release if self._t_release is not None else self._t_stop
+            assert release is not None
+            self._t_total_ms = max(0.0, (started + outcome.delivered_ms / 1000 - release) * 1000)
         # Сохраняем PASTING: нажатия внутри paste не запускают следующую диктовку.
         while self._queue and not self._closed:
             if self._phase in (DictationPhase.FINISHING, DictationPhase.IDLE):
@@ -1075,8 +1092,7 @@ class DictationOrchestrator:
     def _dictation_stat(self, result: str) -> None:
         stop = self._t_stop if self._t_stop is not None else self._clock()
         audio_ms = max(0.0, (stop - self._t0) * 1000)
-        self._append_stat(
-            "dictation",
+        fields: dict[str, object] = dict(
             result=result,
             # Включает открытие устройства: _t0 ставится до отправки record.start.
             audio_ms=audio_ms,
@@ -1088,6 +1104,9 @@ class DictationOrchestrator:
             paste_ms=self._paste_ms,
             cold=self._cold,
         )
+        if self._delivered and self._t_total_ms is not None:
+            fields["t_total_ms"] = self._t_total_ms
+        self._append_stat("dictation", **fields)
         if result == "ok" and self._on_success is not None:
             self._on_success(self._result_audio_ms, self._result_infer_ms, self._cold)
 

@@ -792,9 +792,15 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(f"Диктовок: {summary['dictations']}\n")
         p50, p95 = summary["p50_ms"], summary["p95_ms"]
         if p50 is None or p95 is None:
-            sys.stdout.write("Скорость: пока нет данных.\n")
+            sys.stdout.write("Распознавание: пока нет данных.\n")
         else:
-            sys.stdout.write(f"Скорость: обычно {p50:.0f} мс, в худших случаях {p95:.0f} мс\n")
+            sys.stdout.write(f"Распознавание: обычно {p50:.0f} мс, в худших случаях {p95:.0f} мс\n")
+        total_p50, total_p95 = summary["total_p50_ms"], summary["total_p95_ms"]
+        if total_p50 is not None and total_p95 is not None:
+            sys.stdout.write(
+                "Полное время (отпустил клавишу → текст в окне): "
+                f"обычно {total_p50:.0f} мс, в худших случаях {total_p95:.0f} мс\n"
+            )
         results = summary["results"]
         sys.stdout.write(
             f"Успешно: {results['ok']}, пусто: {results['empty']}, "

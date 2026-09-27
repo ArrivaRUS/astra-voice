@@ -270,7 +270,9 @@ class Rig:
         self.notify = Mock()
         self.set_action_handler = Mock(name="set_action_handler")
         self.notify.set_action_handler = self.set_action_handler
-        self.paste = Mock(return_value=Mock(kind=PasteOutcomeKind.PASTED))
+        self.paste = Mock(
+            return_value=Mock(kind=PasteOutcomeKind.PASTED, delivered_ms=0.0, reason="")
+        )
         self.publish_clipboard = Mock(return_value=True)
         self.restore_paste = Mock(side_effect=self.restore_pending)
         self.atexit_register = Mock()

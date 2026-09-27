@@ -248,7 +248,9 @@ def release(args: argparse.Namespace) -> int:
                         expected.add(deb.name)
                     uncovered = sorted(expected - seen)
                     sums_detail = (
-                        f"не покрыты: {', '.join(uncovered)}" if uncovered else "суммы и покрытие верны"
+                        f"не покрыты: {', '.join(uncovered)}"
+                        if uncovered
+                        else "суммы и покрытие верны"
                     )
         except UnicodeError:
             sums_detail = "неверный формат строки"
@@ -332,6 +334,17 @@ def positive_int(raw: str) -> int:
     return value
 
 
+def nonnegative_int(raw: str) -> int:
+    """Принимает целое число от нуля."""
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Нужно целое число от 0.") from exc
+    if value < 0:
+        raise argparse.ArgumentTypeError("Нужно целое число от 0.")
+    return value
+
+
 def delay_ms(raw: str) -> float:
     """Отклоняет отрицательную и бесконечную задержку."""
     value = float(raw)
@@ -351,25 +364,49 @@ def stats(args: argparse.Namespace) -> int:
         events = []
         explanation = f"Не удалось прочитать статистику: {exc}"
     dictations = [event for event in events if event["type"] == "dictation"]
-    timings = [
+    total_timings = [
+        float(event["t_total_ms"])
+        for event in dictations
+        if event.get("cold") is False and "t_total_ms" in event
+    ]
+    old_timings = [
         float(event["t_ms"])
         for event in dictations
         if event.get("cold") is False and "t_ms" in event
     ]
-    p95 = percentile(timings, 95)
-    code = 2 if p95 is None else int(p95 > args.target_ms)
-    verdict = {0: "уложились", 1: "не уложились", 2: "нет данных"}[code]
+
+    def timing_summary(values: list[float]) -> dict[str, float | int | None]:
+        return {
+            "p50": percentile(values, 50),
+            "p95": percentile(values, 95),
+            "max": max(values) if values else None,
+            "n": len(values),
+        }
+
+    total = timing_summary(total_timings)
+    old = timing_summary(old_timings)
+    p95 = total["p95"]
+    insufficient = total["n"] < args.min_n
+    code = 2 if insufficient or p95 is None else int(p95 > args.target_ms)
+    if insufficient:
+        verdict = "недостаточно данных"
+    else:
+        verdict = {0: "уложились", 1: "не уложились", 2: "нет данных"}[code]
     facts = {
         "events": len(events),
         "dictations": len(dictations),
-        "p50_ms": percentile(timings, 50),
+        "cold": sum(event.get("cold") is True for event in dictations),
+        "p50_ms": total["p50"],
         "p95_ms": p95,
+        "t_total_ms": total,
+        "t_ms": old,
         "results": {
             result: sum(event.get("result") == result for event in dictations)
             for result in ("ok", "empty", "cancelled")
         },
         "mic_errors": sum(event["type"] == "mic_error" for event in events),
         "target_ms": args.target_ms,
+        "min_n": args.min_n,
         "verdict": verdict,
     }
     if args.json:
@@ -378,8 +415,14 @@ def stats(args: argparse.Namespace) -> int:
             print(explanation, file=sys.stderr)
     else:
         print(f"Диктовок: {len(dictations)}; ошибок микрофона: {facts['mic_errors']}.")
-        measured = "нет данных" if p95 is None else f"{p95:g} мс"
-        print(f"p95: {measured}; цель ≤ {args.target_ms:g} мс; вердикт: {verdict}.")
+        print(f"Прогретых диктовок, вставленных в окно: {total['n']} из {args.min_n}.")
+        measured = "нет данных" if p95 is None else f"p95 {p95:g} мс, max {total['max']:g} мс"
+        print(f"Полное время (t_total_ms): {measured}; цель p95 ≤ {args.target_ms:g} мс; "
+              f"вердикт: {verdict}.")
+        old_measured = (
+            "нет данных" if old["p95"] is None else f"p95 {old['p95']:g} мс, max {old['max']:g} мс"
+        )
+        print(f"Справочно t_ms: {old_measured}.")
         if explanation:
             print(explanation)
     return code
@@ -2040,9 +2083,20 @@ def main(argv: list[str] | None = None) -> int:
     """Разбирает подкоманды; новые проверки добавляются отдельными обработчиками."""
     parser = argparse.ArgumentParser(description="Проверки Astra Voice без GUI")
     commands = parser.add_subparsers(dest="command", required=True)
-    summary = commands.add_parser("stats", help="проверить p95 локальной статистики")
+    summary = commands.add_parser(
+        "stats", help="проверить p95 полного времени t_total_ms по прогретым диктовкам"
+    )
     summary.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
-    summary.add_argument("--target-ms", type=delay_ms, default=500.0, help="цель p95 в мс")
+    summary.add_argument(
+        "--min-n", type=nonnegative_int, default=0,
+        help="минимум прогретых диктовок, вставленных в окно (по умолчанию 0)",
+    )
+    summary.add_argument(
+        "--target-ms",
+        type=delay_ms,
+        default=500.0,
+        help="цель p95 полного времени от отпускания до доставки текста, мс",
+    )
     summary.add_argument(
         "--since", type=delay_ms, help="учитывать события после Unix-времени начала прогона"
     )

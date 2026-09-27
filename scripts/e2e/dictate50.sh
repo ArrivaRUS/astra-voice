@@ -15,7 +15,7 @@ usage() {
   cat <<'EOF'
 Использование: scripts/e2e/dictate50.sh --session kde|fly [параметры]
   --count N          Число диктовок (по умолчанию 50)
-  --wav ПУТЬ         WAV (по умолчанию data/test/test-ru-20s.wav)
+  --wav ПУТЬ         WAV (по умолчанию data/test/test-ru-6s.wav)
   --hotkey СОЧЕТАНИЕ Хоткей (из settings.json, запасной Ctrl+Space)
   --yes              Не спрашивать подтверждение занятия клавиатуры и буфера
   --help             Эта справка
@@ -23,7 +23,7 @@ usage() {
 В Astra Voice выберите режим удержания хоткея и загрузите модель.
 Подготовьте поле ввода Kate/fly-term.
 После подтверждения даётся 5 секунд, чтобы перевести фокус в это поле.
-Цель: p95 «отпустил → текст» ≤ 500 мс по событиям текущего прогона.
+Цель: p95 полного времени «отпустил → текст в окне» (t_total_ms) ≤ 500 мс.
 Коды возврата: 0 — уложились, 1 — не уложились, 2 — прогон невозможен.
 EOF
 }
@@ -31,7 +31,7 @@ EOF
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 session=
 count=50
-wav="$ROOT/data/test/test-ru-20s.wav"
+wav="$ROOT/data/test/test-ru-6s.wav"
 hotkey=
 yes=0
 while [ "$#" -gt 0 ]; do
@@ -106,8 +106,8 @@ from pathlib import Path
 
 try:
     count = int(sys.argv[2])
-    if not 1 <= count <= 1000:
-        raise ValueError("--count должен быть от 1 до 1000 (размер истории статистики).")
+    if not 1 <= count <= 999:
+        raise ValueError("--count должен быть от 1 до 999 (история хранит до 1000 событий).")
     with wave.open(sys.argv[1], "rb") as source:
         duration = source.getnframes() / source.getframerate()
     if not 0 < duration < 119:
@@ -132,7 +132,7 @@ try:
     print(json.dumps({
         "count": count,
         # Статистика сбрасывается на диск раз в 30 с: учитываем ожидание каждой диктовки.
-        "minutes": max(1, math.ceil((count * (duration + 2 + 30) + 5) / 60)),
+        "minutes": max(1, math.ceil(((count + 1) * (duration + 2 + 30) + 5) / 60)),
         "hotkey": "+".join(aliases.get(part.lower(), part) for part in parts),
     }))
 except (OSError, ValueError, TypeError, AttributeError, EOFError, wave.Error) as exc:
@@ -142,7 +142,22 @@ PY
 ) || fail 'Проверьте WAV, число диктовок и настройку хоткея.'
 
 json_field() {
-  python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"
+  python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError):
+    print("Вердикт: прогон невозможен — итог статистики не читается как JSON.", file=sys.stderr)
+    sys.exit(2)
+for key in sys.argv[1].split("."):
+    if not isinstance(data, dict) or key not in data:
+        print(f"Вердикт: прогон невозможен — в итоге статистики нет поля {sys.argv[1]}.", file=sys.stderr)
+        sys.exit(2)
+    data = data[key]
+print(data)
+' "$1"
 }
 count=$(printf '%s\n' "$metadata" | json_field count)
 minutes=$(printf '%s\n' "$metadata" | json_field minutes)
@@ -168,8 +183,7 @@ read_stats() {
     0|1|2) ;;
     *) fail 'Не удалось запустить tools/validate stats. Проверьте Python и зависимости.' ;;
   esac
-  printf '%s\n' "$stats_json" | json_field dictations >/dev/null ||
-    fail 'tools/validate stats не вернул корректную статистику JSON.'
+  printf '%s\n' "$stats_json" | json_field dictations >/dev/null || exit 2
 }
 
 printf '%s\n' 'Статистика до прогона:'
@@ -198,9 +212,11 @@ trap 'exit 2' HUP INT TERM
 printf '%s\n' 'Переведите фокус в поле ввода Kate/fly-term. Начало через 5 секунд.'
 sleep 5
 iteration=1
+done_count=0
+max_iterations=$((count + 1))
 incomplete=0
-while [ "$iteration" -le "$count" ]; do
-  printf 'Диктовка %s из %s\n' "$iteration" "$count"
+while [ "$iteration" -le "$max_iterations" ]; do
+  printf 'Диктовка %s из не более %s\n' "$iteration" "$max_iterations"
   key_down=1
   xdotool keydown --delay 100 "$hotkey" || fail 'Не удалось нажать хоткей.'
   # Даём GUI открыть источник; даже короткий WAV не превращает удержание в тап.
@@ -208,12 +224,13 @@ while [ "$iteration" -le "$count" ]; do
   paplay --device=av_test "$wav" || fail 'Не удалось подать WAV в виртуальный микрофон.'
   xdotool keyup --delay 100 "$hotkey" || fail 'Не удалось отпустить хоткей.'
   key_down=0
+  done_count=$iteration
   attempts=0
   while :; do
     # Пауза между итерациями всегда больше 300 мс, ожидание ограничено.
     sleep 1
     read_stats --since "$since"
-    added=$(printf '%s\n' "$stats_json" | json_field dictations)
+    added=$(printf '%s\n' "$stats_json" | json_field dictations) || exit 2
     [ "$added" -lt "$iteration" ] || break
     attempts=$((attempts + 1))
     if [ "$attempts" -ge 120 ]; then
@@ -223,6 +240,16 @@ while [ "$iteration" -le "$count" ]; do
     fi
   done
   [ "$incomplete" -eq 0 ] || break
+  warm=$(printf '%s\n' "$stats_json" | json_field t_total_ms.n) || exit 2
+  [ "$warm" -lt "$count" ] || break
+  if [ "$iteration" -ge "$count" ]; then
+    cold=$(printf '%s\n' "$stats_json" | json_field cold) || exit 2
+    if [ "$iteration" -eq "$count" ] && [ "$warm" -eq "$((count - 1))" ] && [ "$cold" -ge 1 ]; then
+      printf '%s\n' 'Первая диктовка была холодной (модель прогревалась), делаем ещё одну'
+    else
+      break
+    fi
+  fi
   sleep 0.3
   iteration=$((iteration + 1))
 done
@@ -233,17 +260,34 @@ read_stats
 after_events=$(printf '%s\n' "$stats_json" | json_field events)
 printf 'Событий в истории: до %s, после %s (история ограничена 1000 событиями).\n' \
   "$before_events" "$after_events"
-read_stats --since "$since"
+read_stats --since "$since" --min-n "$count"
 added_events=$(printf '%s\n' "$stats_json" | json_field events)
-added=$(printf '%s\n' "$stats_json" | json_field dictations)
-printf 'За прогон добавилось событий: %s; диктовок: %s из %s.\n' "$added_events" "$added" "$count"
+added=$(printf '%s\n' "$stats_json" | json_field dictations) || exit 2
+warm=$(printf '%s\n' "$stats_json" | json_field t_total_ms.n) || exit 2
+printf 'За прогон добавилось событий: %s; диктовок: %s; прогретых вставленных: %s из %s.\n' \
+  "$added_events" "$added" "$warm" "$count"
 printf '%s\n' "$stats_json"
-if [ "$incomplete" -ne 0 ] || [ "$added" -ne "$count" ]; then
+if [ "$incomplete" -ne 0 ] || [ "$added" -ne "$done_count" ]; then
   fail 'Вердикт: прогон невозможен — число новых диктовок не совпало с заданным.'
 fi
+if [ "$warm" -lt "$count" ]; then
+  cold=$(printf '%s\n' "$stats_json" | json_field cold) || exit 2
+  empty=$(printf '%s\n' "$stats_json" | json_field results.empty) || exit 2
+  cancelled=$(printf '%s\n' "$stats_json" | json_field results.cancelled) || exit 2
+  other=$((added - warm - cold - empty - cancelled))
+  other_detail=
+  if [ "$other" -ge 0 ]; then
+    other_detail=", остальные не вставлены в окно (текст остался в буфере или окно сменилось): $other"
+  fi
+  say_error "Вердикт: недостаточно данных — прогретых вставленных $warm из $count, холодных $cold, пустых $empty, отменённых $cancelled$other_detail."
+  exit 2
+fi
+total_p95=$(printf '%s\n' "$stats_json" | json_field p95_ms) || exit 2
+reference_p95=$(printf '%s\n' "$stats_json" | json_field t_ms.p95) || exit 2
+printf 'Справочно: p95 t_ms = %s мс.\n' "$reference_p95"
 case "$stats_code" in
-  0) printf '%s\n' 'Вердикт: уложились — p95 «отпустил → текст» ≤ 500 мс.' ;;
-  1) printf '%s\n' 'Вердикт: не уложились — p95 «отпустил → текст» > 500 мс.' ;;
-  2) say_error 'Вердикт: прогон невозможен — нет данных о задержке прогретых диктовок.' ;;
+  0) printf 'Вердикт: уложились — p95 полного времени «отпустил → текст в окне» (t_total_ms) = %s мс ≤ 500 мс.\n' "$total_p95" ;;
+  1) printf 'Вердикт: не уложились — p95 полного времени «отпустил → текст в окне» (t_total_ms) = %s мс > 500 мс.\n' "$total_p95" ;;
+  2) say_error 'Вердикт: прогон невозможен — нет t_total_ms у прогретых диктовок.' ;;
 esac
 exit "$stats_code"

@@ -154,6 +154,8 @@ class Rig:
         self.pasted: list[tuple[str, int | None, PasteMode]] = []
         self.outcomes: deque[PasteOutcomeKind] = deque()
         self.paste_reason = ""
+        self.paste_duration_ms = 125.0
+        self.delivered_ms: float | None = 125.0
         self.during_paste: Callable[[], None] | None = None
         self.during_send: Callable[[dict[str, Any]], None] | None = None
         self.timers: list[Timer] = []
@@ -223,7 +225,7 @@ class Rig:
         self.trace.append(("paste",))
         if self.during_paste is not None:
             self.during_paste()
-        self.now += 0.125
+        self.now += self.paste_duration_ms / 1000
         kind = self.outcomes.popleft() if self.outcomes else PasteOutcomeKind.PASTED
         return PasteOutcome(
             kind,
@@ -234,6 +236,7 @@ class Rig:
             0,
             0.0,
             reason=self.paste_reason,
+            delivered_ms=self.delivered_ms if kind == PasteOutcomeKind.PASTED else None,
         )
 
     def schedule(self, delay: int, callback: Callable[[], None]) -> object:
@@ -404,6 +407,7 @@ def test_full_ptt_cycle_and_timings(rig: Rig) -> None:
             "type": "dictation",
             "result": "ok",
             "t_ms": 250.0,
+            "t_total_ms": 375.0,
             "audio_ms": 2000.0,
             "open_ms": 0.0,
             "paste_ms": 125.0,
@@ -431,7 +435,7 @@ def test_success_callback_uses_worker_timings_only(rig: Rig) -> None:
 
 
 def test_release_tail_keeps_recording_open_until_it_ends(rig: Rig) -> None:
-    """Хвост фразы: 250 мс после отпускания запись идёт, индикация не меняется."""
+    """Хвост фразы: RELEASE_TAIL_MS после отпускания запись и индикация продолжаются."""
     rig.start()
     uid = rig.uid
     rig.now += 2.0
@@ -454,8 +458,56 @@ def test_release_tail_keeps_recording_open_until_it_ends(rig: Rig) -> None:
         ({"type": "recognize", "utterance_id": uid}, RECOGNIZE_TIMEOUT_S),
     ]
     rig.result()
-    # Хвост входит в длительность звука: 2 с речи и 0,25 с дописи.
-    assert rig.stats.events[-1]["audio_ms"] == pytest.approx(2250.0)
+    # Хвост входит в длительность звука.
+    assert rig.stats.events[-1]["audio_ms"] == pytest.approx(2000.0 + RELEASE_TAIL_MS)
+    assert rig.stats.events[-1]["t_total_ms"] == pytest.approx(RELEASE_TAIL_MS + 250 + 125)
+    assert rig.stats.events[-1]["t_ms"] == pytest.approx(250.0)
+
+
+def test_total_time_starts_at_first_release_and_ends_at_delivering_paste(rig: Rig) -> None:
+    rig.start()
+    rig.now += 2.0
+    rig.fsm.release(rig.now)
+    released = rig.now
+    rig.now += RELEASE_TAIL_MS / 1000
+    rig.core._stop()  # Повторное событие во время хвоста не сдвигает начало.
+    rig.fire_tail()
+    rig.now += 0.4
+    rig.outcomes.extend((PasteOutcomeKind.BUSY, PasteOutcomeKind.PASTED))
+    rig.event("result", text=MARKER)
+    assert not rig.stats.events
+    rig.now += BUSY_RETRY_MS / 1000
+    rig.timer(BUSY_RETRY_MS).fire()
+    event = rig.stats.events[-1]
+    assert event["t_ms"] == pytest.approx(400.0)
+    assert event["paste_ms"] == pytest.approx(250.0)
+    assert event["t_total_ms"] == pytest.approx((rig.now - released) * 1000)
+    assert event["t_total_ms"] == pytest.approx(RELEASE_TAIL_MS + 400 + 125 + BUSY_RETRY_MS + 125)
+    total = event["t_total_ms"]
+    assert isinstance(total, (int, float))
+    assert total >= RELEASE_TAIL_MS + 400 + 125
+    assert all(MARKER not in str(value) for value in event.values())
+
+
+def test_total_time_ends_before_paste_cleanup(rig: Rig) -> None:
+    rig.paste_duration_ms = 250
+    rig.delivered_ms = 80
+    rig.start()
+    rig.stop(tail=False)
+    rig.now += RELEASE_TAIL_MS / 1000
+    rig.fire_tail()
+    rig.result()
+    event = rig.stats.events[-1]
+    assert event["paste_ms"] == pytest.approx(250)
+    assert event["t_total_ms"] == pytest.approx(RELEASE_TAIL_MS + 250 + 80)
+
+
+def test_pasted_without_delivery_timestamp_has_no_total_time(rig: Rig) -> None:
+    rig.delivered_ms = None
+    rig.start()
+    rig.stop()
+    rig.result()
+    assert "t_total_ms" not in rig.stats.events[-1]
 
 
 def test_release_tail_is_cancelled_by_escape_without_recognition(rig: Rig) -> None:
@@ -469,6 +521,7 @@ def test_release_tail_is_cancelled_by_escape_without_recognition(rig: Rig) -> No
     rig.event("cancelled")
     assert rig.pill.calls[-1] == (PillState.CANCELLED, None, None)
     assert "recognize" not in rig.commands()
+    assert all("t_total_ms" not in event for event in rig.stats.events)
 
 
 def test_record_limit_during_release_tail_stops_recording_once(rig: Rig) -> None:
@@ -563,6 +616,11 @@ def test_paste_outcomes(
     assert rig.core.phase == DictationPhase.FINISHING and rig.done == 1
     assert rig.core.last_text == MARKER
     assert [e["result"] for e in rig.stats.events] == ([] if stat_result is None else [stat_result])
+    assert all(MARKER not in str(value) for event in rig.stats.events for value in event.values())
+    if kind == PasteOutcomeKind.PASTED:
+        assert rig.stats.events[-1]["t_total_ms"] == pytest.approx(375.0)
+    else:
+        assert all("t_total_ms" not in event for event in rig.stats.events)
 
 
 @pytest.mark.parametrize(
@@ -618,7 +676,17 @@ def test_empty_result(rig: Rig, text: str) -> None:
     assert not rig.tray.has_last_text
     assert rig.pill.calls[-1][0] == PillState.EMPTY
     assert rig.stats.events[-1]["result"] == "empty"
+    assert "t_total_ms" not in rig.stats.events[-1]
     assert rig.stats.events[-1]["cold"] is True
+
+
+def test_recognition_error_does_not_write_total_time(rig: Rig) -> None:
+    rig.start()
+    rig.stop()
+    rig.event("error", code="recognition-failed", message=MARKER)
+    assert not rig.stats.events
+    assert all("t_total_ms" not in event for event in rig.stats.events)
+    assert all(MARKER not in str(value) for event in rig.stats.events for value in event.values())
 
 
 @pytest.mark.parametrize("phase", ["recording", "processing", "busy"])
@@ -652,6 +720,7 @@ def test_cancel_blocks_all_later_results_and_retries(rig: Rig, phase: str) -> No
     assert fallback.cancelled
     assert rig.pill.calls[-1:] == [(PillState.CANCELLED, None, None)]
     assert rig.stats.events[-1]["result"] == "cancelled"
+    assert "t_total_ms" not in rig.stats.events[-1]
     assert rig.done == 1
     rig.result()
     fallback.callback()
@@ -1033,6 +1102,7 @@ def test_late_first_audio_ready_keeps_recording_and_success_releases_hotkey(
             "audio_ms": pytest.approx((elapsed + 2) * 1000),
             "open_ms": pytest.approx(elapsed * 1000),
             "t_ms": 250.0,
+            "t_total_ms": 375.0,
             "paste_ms": 125.0,
             "cold": True,
         }
@@ -1477,6 +1547,7 @@ def test_limit_stops_once_and_late_levels_do_not_replace_processing(rig: Rig) ->
     assert len(rig.sent) == 2 and rig.pill.calls[-1][0] == PillState.PROCESSING
     rig.result()
     assert rig.stats.events[-1]["audio_ms"] == 120000.0
+    assert rig.stats.events[-1]["t_total_ms"] == pytest.approx(375.0)
 
 
 @pytest.mark.parametrize("mode", list(HotkeyMode))
@@ -1579,6 +1650,7 @@ def test_short_ptt_tap_switches_to_toggle_without_cancelling(rig: Rig) -> None:
 
     rig.now += 1
     rig.combo_key(pressed=True)
+    second_press = rig.now
     rig.assert_hotkey_state(HotkeyState.PROCESSING)
     # Второе нажатие в режиме «нажать-отпустить» тоже дописывает хвост.
     assert rig.commands() == ["record.start"]
@@ -1586,6 +1658,7 @@ def test_short_ptt_tap_switches_to_toggle_without_cancelling(rig: Rig) -> None:
     assert rig.commands() == ["record.start", "record.stop", "recognize"]
     rig.result()
     assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
+    assert rig.stats.events[-1]["t_total_ms"] == pytest.approx((rig.now - second_press) * 1000)
     rig.assert_hotkey_state(HotkeyState.IDLE)
     assert rig.cancels == 0
 

@@ -23,7 +23,7 @@ Event = dict[str, str | int | float | bool]
 
 _FIELDS: dict[str, frozenset[str]] = {
     "dictation": frozenset(
-        {"model_id", "audio_ms", "open_ms", "t_ms", "paste_ms", "cold", "result"}
+        {"model_id", "audio_ms", "open_ms", "t_ms", "t_total_ms", "paste_ms", "cold", "result"}
     ),
     "model_measure": frozenset({"model_id", "revision", "peak_rss_mb", "threads", "cpu"}),
     "model_selfcheck": frozenset({"model_id", "revision", "result", "engine_version", "cpu_model"}),
@@ -55,16 +55,27 @@ _CHOICES = {
     ("update_apply", "track"): ("A", "B", "file"),
 }
 _NUMBERS = frozenset(
-    {"audio_ms", "open_ms", "t_ms", "paste_ms", "peak_rss_mb", "duration_s", "attempts"}
+    {
+        "audio_ms",
+        "open_ms",
+        "t_ms",
+        "t_total_ms",
+        "paste_ms",
+        "peak_rss_mb",
+        "duration_s",
+        "attempts",
+    }
 )
 
 
 class Summary(TypedDict):
-    """Счётчики всех диктовок, скорость прогретых; доли результатов от 0 до 1."""
+    """Счётчики всех диктовок, время прогретых; доли результатов от 0 до 1."""
 
     dictations: int
     p50_ms: float | None
     p95_ms: float | None
+    total_p50_ms: float | None
+    total_p95_ms: float | None
     results: dict[str, int]
     result_shares: dict[str, float]
     mic_errors: int
@@ -96,13 +107,14 @@ def _number(value: object) -> bool:
     )
 
 
-def _event(event_type: str, fields: Mapping[str, object]) -> Event:
+def _event(event_type: str, fields: Mapping[str, object], *, warn_unknown: bool = True) -> Event:
     if event_type not in _FIELDS:
         raise ValueError("Неизвестный вид события статистики")
     event: Event = {"type": event_type}
     for key, value in fields.items():
         if key not in _FIELDS[event_type]:
-            log.warning("неизвестное поле статистики отброшено")
+            if warn_unknown:
+                log.warning("неизвестное поле статистики отброшено")
             continue
         choices = _CHOICES.get((event_type, key))
         if choices is not None:
@@ -162,6 +174,7 @@ class Stats:
             ):
                 raise ValueError("Неверный формат статистики")
             events: list[Event] = []
+            unknown_warned = False
             for raw in data["events"]:
                 if (
                     not isinstance(raw, dict)
@@ -169,9 +182,16 @@ class Stats:
                     or not _number(raw.get("ts"))
                 ):
                     raise ValueError("Неверный формат события")
-                event = _event(
-                    raw["type"], {k: v for k, v in raw.items() if k not in {"type", "ts"}}
-                )
+                event_type = raw["type"]
+                fields = {k: v for k, v in raw.items() if k not in {"type", "ts"}}
+                if (
+                    not unknown_warned
+                    and event_type in _FIELDS
+                    and any(key not in _FIELDS[event_type] for key in fields)
+                ):
+                    log.warning("неизвестное поле статистики отброшено")
+                    unknown_warned = True
+                event = _event(event_type, fields, warn_unknown=False)
                 event["ts"] = float(raw["ts"])
                 events.append(event)
             return events[-MAX_EVENTS:]
@@ -237,12 +257,17 @@ class Stats:
         self._saved()
 
     def summary(self) -> Summary:
-        """Скорость учитывает только dictation с явно указанным cold=False."""
+        """Время учитывает только dictation с явно указанным cold=False."""
         dictations = [event for event in self._buffer.events if event["type"] == "dictation"]
         timings = [
             float(event["t_ms"])
             for event in dictations
             if event.get("cold") is False and "t_ms" in event
+        ]
+        total_timings = [
+            float(event["t_total_ms"])
+            for event in dictations
+            if event.get("cold") is False and "t_total_ms" in event
         ]
         results = {
             result: sum(event.get("result") == result for event in dictations)
@@ -252,6 +277,8 @@ class Stats:
             "dictations": len(dictations),
             "p50_ms": percentile(timings, 50),
             "p95_ms": percentile(timings, 95),
+            "total_p50_ms": percentile(total_timings, 50),
+            "total_p95_ms": percentile(total_timings, 95),
             "results": results,
             "result_shares": {
                 result: count / len(dictations) if dictations else 0.0

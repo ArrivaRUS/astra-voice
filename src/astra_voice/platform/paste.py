@@ -112,6 +112,8 @@ class PasteOutcome:
     об ошибке до публикации или при восстановлении, без текста исключения.
     reason — короткий код ветки, помешавшей автоматической вставке (для журнала);
     пустая строка при pasted. fetched_ms — время от XTest до выдачи фразы.
+    delivered_ms — время от входа в вставку до забора текста окном; если забор
+    не подтверждён в цикле ожидания, значение None.
     """
 
     kind: PasteOutcomeKind
@@ -123,6 +125,7 @@ class PasteOutcome:
     t_ms: float
     reason: str = ""
     fetched_ms: int | None = None
+    delivered_ms: float | None = None
 
 
 def normalize(text: str) -> str:
@@ -563,7 +566,8 @@ class PasteFlow:
         self.delay_after_ms = delay_after_ms
 
     def run(self, text: str, target_window: int | None, mode: PasteMode) -> PasteOutcome:
-        """Вернуть исход без исключений и закрыть собственное X11-соединение."""
+        entered = time.monotonic()
+        # Вернуть исход без исключений и закрыть собственное X11-соединение.
         global _running, _pending
         if _running:
             # BUSY не создаёт снимок и не отменяет ожидание внешней цепочки.
@@ -579,7 +583,7 @@ class PasteFlow:
             if mode == PasteMode.AUTO:
                 x = X11Display()
                 x.open()
-            outcome = self._run(text, target_window, mode, cb, x)
+            outcome = self._run(text, target_window, mode, cb, x, entered=entered)
         except Exception:
             # Нет QApplication/GUI-потока либо ошибка до публикации. Ничего не обещаем
             # о наличии фразы в буфере и не выдаём сообщение исключения наружу.
@@ -612,6 +616,8 @@ class PasteFlow:
         mode: PasteMode,
         cb: _Clipboard,
         x: X11Display | None,
+        *,
+        entered: float,
     ) -> PasteOutcome:
         global _pending
         wm_class = x.wm_class(target_window) if x is not None and target_window else None
@@ -635,6 +641,8 @@ class PasteFlow:
         primary_touched = False
         tracker = _FetchTracker() if x is not None else None
         fetched_ms: int | None = None
+        sent_at: float | None = None
+        delivered_at: float | None = None
         started = time.monotonic()
         try:
             _pending = pending
@@ -689,6 +697,7 @@ class PasteFlow:
                                         break
                                     _wait_ms(KEYS_POLL_MS)
                                 if tracker.fetched_at is not None:
+                                    delivered_at = tracker.fetched_at
                                     fetched_ms = max(0, int((tracker.fetched_at - sent_at) * 1000))
                                 elif pending is None or not pending.consumed:
                                     if not owner_changed and not cb.owns(False):
@@ -746,6 +755,11 @@ class PasteFlow:
             t_ms=round((time.monotonic() - started) * 1000, 1),
             reason="" if kind == PasteOutcomeKind.PASTED else reason,
             fetched_ms=fetched_ms,
+            delivered_ms=(
+                max(0.0, (delivered_at - entered) * 1000)
+                if kind == PasteOutcomeKind.PASTED and delivered_at is not None
+                else None
+            ),
         )
 
 
