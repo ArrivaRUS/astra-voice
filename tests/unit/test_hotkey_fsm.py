@@ -781,6 +781,57 @@ def test_plain_escape_cancels_ctrl_escape_hotkey(mocked_x11: X11Display) -> None
     manager.ungrab()
 
 
+def test_ptt_hold_ctrl_esc_full_queue_cancels(
+    mocked_x11: X11Display, connection: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from Xlib import X
+
+    monkeypatch.setattr("astra_voice.platform.hotkey.select.select", lambda *_args: ([], [], []))
+    manager = HotkeyManager(X11HotkeyBackend(mocked_x11))
+    states: list[tuple[HotkeyState, str]] = []
+    cancelled: list[bool] = []
+    manager.on_state = lambda state, reason: states.append((state, reason))
+    manager.on_escape = lambda: cancelled.append(True)
+    assert manager.grab("Ctrl+space", HotkeyMode.PTT).ok
+
+    queue = [SimpleNamespace(type=X.KeyPress, detail=65, state=4, time=1)]
+    connection.pending_events.side_effect = lambda: len(queue)
+    connection.next_event.side_effect = lambda: queue.pop(0)
+    manager.process_pending(0)
+    assert states[-1] == (HotkeyState.RECORDING, "press")
+
+    queue.extend(
+        [
+            SimpleNamespace(type=X.KeyPress, detail=9, state=4, time=2),
+            SimpleNamespace(type=X.KeyRelease, detail=9, state=4, time=3),
+            SimpleNamespace(type=X.KeyRelease, detail=65, state=4, time=4),
+        ]
+    )
+    manager.process_pending(1)
+    assert (HotkeyState.IDLE, "escape-cancel") in states
+    assert cancelled == [True]
+    assert manager.fsm.state == HotkeyState.IDLE
+    manager.ungrab()
+
+
+def test_toggle_plain_escape_cancels_recording(mocked_x11: X11Display) -> None:
+    manager = HotkeyManager(X11HotkeyBackend(mocked_x11))
+    states: list[tuple[HotkeyState, str]] = []
+    cancelled: list[bool] = []
+    manager.on_state = lambda state, reason: states.append((state, reason))
+    manager.on_escape = lambda: cancelled.append(True)
+    assert manager.grab("Ctrl+space", HotkeyMode.TOGGLE).ok
+    manager.handle_event(HotkeyEvent("KeyPress", 65, 1, mods=4), 0)
+    manager.handle_event(HotkeyEvent("KeyRelease", 65, 2, mods=4), 1)
+    assert states[-1] == (HotkeyState.RECORDING, "press")
+
+    manager.handle_event(HotkeyEvent("KeyPress", 9, 3, escape=True, mods=0), 2)
+    assert (HotkeyState.IDLE, "escape-cancel") in states
+    assert cancelled == [True]
+    assert manager.fsm.state == HotkeyState.IDLE
+    manager.ungrab()
+
+
 def test_ptt_release_after_modifier_release_still_stops(mocked_x11: X11Display) -> None:
     manager = HotkeyManager(X11HotkeyBackend(mocked_x11))
     assert manager.grab("Ctrl+space", HotkeyMode.PTT).ok

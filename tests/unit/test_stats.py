@@ -35,9 +35,15 @@ def path() -> Path:
     return paths.state_dir() / "stats.json"
 
 
-def dictation(stats: st.Stats, t_ms: float, *, cold: bool = False, result: str = "ok") -> None:
-    stats.append(
-        "dictation",
+def dictation(
+    stats: st.Stats,
+    t_ms: float,
+    *,
+    cold: bool = False,
+    result: str = "ok",
+    t_total_ms: float | None = None,
+) -> None:
+    fields: dict[str, object] = dict(
         model_id="gigaam-v3",
         audio_ms=6000,
         t_ms=t_ms,
@@ -45,6 +51,9 @@ def dictation(stats: st.Stats, t_ms: float, *, cold: bool = False, result: str =
         cold=cold,
         result=result,
     )
+    if t_total_ms is not None:
+        fields["t_total_ms"] = t_total_ms
+    stats.append("dictation", **fields)
 
 
 def test_percentile_empty() -> None:
@@ -196,6 +205,8 @@ def test_cold_events_count_but_do_not_affect_percentiles() -> None:
         "dictations": 4,
         "p50_ms": 200.0,
         "p95_ms": 300.0,
+        "total_p50_ms": None,
+        "total_p95_ms": None,
         "results": {"ok": 2, "empty": 1, "cancelled": 1},
         "result_shares": {"ok": 0.5, "empty": 0.25, "cancelled": 0.25},
         "mic_errors": 1,
@@ -400,6 +411,27 @@ def test_unknown_fields_from_disk_are_not_resaved(path: Path) -> None:
     assert "private-content" not in path.read_text()
 
 
+def test_unknown_fields_warn_once_per_file_load(
+    path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "events": [
+                    {"type": "onboarding", "ts": index, "private": "secret"}
+                    for index in range(1, 4)
+                ],
+            }
+        )
+    )
+    assert len(st.Stats().events()) == 3
+    assert [record.message for record in caplog.records].count(
+        "неизвестное поле статистики отброшено"
+    ) == 1
+
+
 @pytest.mark.parametrize(
     ("event_type", "fields"),
     [
@@ -459,7 +491,7 @@ def test_cli_summary(capsys: pytest.CaptureFixture[str]) -> None:
     assert app.main(["--stats", "--debug-transcribe", "unused.wav"]) == 0
     assert capsys.readouterr().out == (
         "Диктовок: 3\n"
-        "Скорость: обычно 310 мс, в худших случаях 480 мс\n"
+        "Распознавание: обычно 310 мс, в худших случаях 480 мс\n"
         "Успешно: 1, пусто: 1, отменено: 1\n"
         "Ошибок микрофона: 1\n"
     )
@@ -469,7 +501,23 @@ def test_cli_summary(capsys: pytest.CaptureFixture[str]) -> None:
 def test_cli_only_cold(capsys: pytest.CaptureFixture[str]) -> None:
     dictation(st.Stats(), 9000, cold=True)
     assert app.main(["--stats"]) == 0
-    assert "Скорость: пока нет данных.\n" in capsys.readouterr().out
+    assert "Распознавание: пока нет данных.\n" in capsys.readouterr().out
+
+
+@pytest.mark.usefixtures("no_gui")
+def test_cli_total_time_from_warm_insertions(capsys: pytest.CaptureFixture[str]) -> None:
+    stats = st.Stats()
+    dictation(stats, 310, t_total_ms=350)
+    dictation(stats, 480, t_total_ms=490)
+    dictation(stats, 9000, cold=True, t_total_ms=9000)
+    summary = stats.summary()
+    assert summary["total_p50_ms"] == 350
+    assert summary["total_p95_ms"] == 490
+    assert app.main(["--stats"]) == 0
+    assert (
+        "Полное время (отпустил клавишу → текст в окне): обычно 350 мс, "
+        "в худших случаях 490 мс\n" in capsys.readouterr().out
+    )
 
 
 def test_validate_sees_pending_events(
@@ -480,14 +528,15 @@ def test_validate_sees_pending_events(
     monkeypatch.setattr(time, "monotonic", lambda: 0.0)
     module = runpy.run_path(str(Path(__file__).resolve().parents[2] / "tools/validate"))
     stats = st.Stats()
-    dictation(stats, 310)
-    dictation(stats, 480)
+    dictation(stats, 310, t_total_ms=350)
+    dictation(stats, 480, t_total_ms=490)
     assert not path.exists()
     assert module["main"](["stats", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["events"] == payload["dictations"] == 2
-    assert payload["p50_ms"] == 310.0
-    assert payload["p95_ms"] == 480.0
+    assert payload["p50_ms"] == 350.0
+    assert payload["p95_ms"] == 490.0
+    assert payload["t_ms"]["p95"] == 480.0
     assert not path.exists()
 
 
@@ -557,6 +606,18 @@ def test_dictation_open_ms_schema_roundtrips(path: Path, open_ms: int | float | 
     event = st.Stats().events()[0]
     assert event == {"type": "dictation", "ts": event["ts"], **fields}
     assert json.loads(path.read_text())["events"] == [event]
+
+
+def test_dictation_total_ms_roundtrips_with_legacy_event(path: Path) -> None:
+    stats = st.Stats()
+    dictation(stats, 250)
+    stats.append("dictation", t_ms=250, t_total_ms=425, cold=False, result="ok")
+    stats.flush()
+    events = st.Stats().events()
+    assert "t_total_ms" not in events[0]
+    assert events[1]["t_total_ms"] == 425
+    assert json.loads(path.read_text())["events"] == events
+    assert stats.summary()["p95_ms"] == 250
 
 
 @pytest.mark.parametrize("value", [True, -1, "2", None, float("nan"), float("inf")])
