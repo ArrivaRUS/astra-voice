@@ -697,3 +697,23 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
   отозвать старый `gho_` у GitHub CLI) — внимание: после этого агенты не смогут пушить изменения `.github/workflows`;
   (2) T3 security перед тегом; (3) changelog `0.1.0` + changelog-writer; (4) чеклист живых сценариев у заказчика (KDE);
   (5) INSTALL-ADMIN «[уточнить]» (9 пунктов); мелочи из ревью — см. снимок 26.09 23:55.
+
+### 2026-09-27 — m6.20 принята, m6.21 на рабочем столе, CI без плавающих сбоев
+- **m6.20 принята заказчиком** («всё отлично»): дорожка загрузки справа на постоянном месте (PR #3), клик по значку в трее
+  открывает окно и даёт фокус (`_WindowFocuser`, `_NET_ACTIVE_WINDOW` source=2, перенос на текущий стол; PR #4).
+- **Плавающий SIGSEGV CI (7 из ~35) устранён** (PR #5, урок 022): пересоздание QApplication в тестах → PyQt5 перестаёт
+  помечать удалённые QML-элементы. Одна QApplication на процесс + страж, контрольный тест, `faulthandler_timeout=120`,
+  `timeout -s ABRT` в `make test-xvfb`, `timeout-minutes: 12`.
+- **Изоляция D-Bus в тестах:** debugger 27.09 ~07:00–07:45 ходил в настоящую сессионную шину заказчика (заказчику сообщено).
+  Команда тестов агентов теперь: `env -u DISPLAY -u WAYLAND_DISPLAY -u QT_ACCESSIBILITY -u AT_SPI_BUS_ADDRESS
+  DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software
+  PULSE_SERVER=unix:/nonexistent ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING=<scratchpad> ASTRA_VOICE_SNAPSHOT_DIR_PILL=<scratchpad> …`;
+  conftest дублирует изоляцию до импорта Qt. Сценарии с шиной — только под `dbus-run-session`, сирот `dbus-daemon` не оставлять.
+- **Трей D-Bus (PR #6, 8 кругов, 4 ревью):** use-after-free ответа D-Bus в KDE, висячий `sender()`, deadlock лямбды на
+  `thread.finished` (урок 021 — лямбда `tray.py:246` закрыта), падение при выходе (~1/3), UAF подписок при закрытии соединения
+  (снимать `bus.disconnect` до `disconnectFromBus`). Регресс на изолированной шине; под нагрузкой 0 падений; CI 3/3.
+- **На ~/Desktop `m6.21`** (m6.20 удалена), main `b8d5db3`, CI зелёный. Ждём установку заказчиком → перезапуск по pid →
+  проверка: значок в трее, «Выход» без сбоя, диктовка, клик по значку.
+- **Cowork:** почтовой сессии дано «C0 в прод — да» (C0 прошёл 2 ревью; T2 по C0 — к C1/v1.0, выкладку не блокирует).
+- **Дальше (R1 30.09):** PAT для агентов (инструкция заказчику), T3 перед тегом, changelog `0.1.0`, чеклист живых сценариев,
+  INSTALL-ADMIN «[уточнить]»; мелочи: QtQuick.Shapes из Depends/CI, лямбды `app.py:328`, `model_downloads.py:2180`.
