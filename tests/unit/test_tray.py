@@ -16,6 +16,7 @@ from unittest.mock import Mock, call
 import pytest
 from PyQt5.QtCore import QTimer as QtTimer
 from PyQt5.QtDBus import QDBusMessage, QDBusVariant
+from PyQt5.QtWidgets import QSystemTrayIcon
 
 from astra_voice.platform.session import SessionKind
 from astra_voice.ui.tray import _start_bus_worker
@@ -288,6 +289,25 @@ def harness(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> Iterator[Har
 
 def menu_labels(harness: Harness) -> list[str | None]:
     return [None if action.isSeparator() else action.text() for action in harness.menu.actions()]
+
+
+def test_tray_activation_opens_only_on_left_click(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from astra_voice.ui import tray as module
+
+    monkeypatch.setattr(module, "QSystemTrayIcon", QSystemTrayIcon)
+    opened = Mock()
+    harness.tray.on_open = opened
+    harness.icon.activated.connect.assert_called_once_with(harness.tray._on_activated)
+    activated = harness.icon.activated.connect.call_args.args[0]
+    assert activated == harness.tray._on_activated
+    for reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+        activated(reason)
+    assert opened.call_count == 2
+    for reason in (QSystemTrayIcon.Context, QSystemTrayIcon.MiddleClick):
+        activated(reason)
+    assert opened.call_count == 2
 
 
 def test_exact_menu_and_shortcuts(harness: Harness) -> None:

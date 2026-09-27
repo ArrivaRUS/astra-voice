@@ -915,6 +915,61 @@ def server_timestamp() -> int:
                 pass
 
 
+def focus_window(window_id: int) -> bool:
+    """Просит WM перенести окно на текущий стол и активировать его как pager.
+
+    True подтверждает отправку сообщений без X-ошибок, а не получение фокуса.
+    """
+    if not window_id:
+        return False
+    with X11Display() as x11:
+        try:
+            from Xlib import X, Xatom
+            from Xlib.protocol import event
+
+            conn = x11._require_display()
+            before = x11._error_count
+            current_atom = conn.intern_atom("_NET_CURRENT_DESKTOP", only_if_exists=True)
+            window_atom = conn.intern_atom("_NET_WM_DESKTOP", only_if_exists=True)
+            if current_atom and window_atom:
+                current = x11.root.get_full_property(current_atom, Xatom.CARDINAL)
+                window = conn.create_resource_object("window", int(window_id))
+                desktop = window.get_full_property(window_atom, Xatom.CARDINAL)
+                if (
+                    current is not None
+                    and desktop is not None
+                    and current.format == 32
+                    and desktop.format == 32
+                    and len(current.value)
+                    and len(desktop.value)
+                ):
+                    current_number = int(current.value[0])
+                    window_number = int(desktop.value[0])
+                    if window_number not in (0xFFFFFFFF, current_number):
+                        move = event.ClientMessage(
+                            window=int(window_id),
+                            client_type=window_atom,
+                            data=(32, [current_number, 2, 0, 0, 0]),
+                        )
+                        x11.root.send_event(
+                            move,
+                            event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask,
+                        )
+            activate = event.ClientMessage(
+                window=int(window_id),
+                client_type=conn.intern_atom("_NET_ACTIVE_WINDOW"),
+                data=(32, [2, 0, 0, 0, 0]),
+            )
+            x11.root.send_event(
+                activate, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask
+            )
+            conn.sync()
+            return x11._error_count == before
+        except Exception as exc:
+            log.debug("не удалось запросить фокус окна X11: %s", exc)
+            return False
+
+
 def set_user_time(window_id: int, timestamp: int) -> bool:
     """Ставит ``_NET_WM_USER_TIME``; ноль до первого map запрещает забирать фокус."""
     if not window_id or timestamp < 0:
