@@ -120,8 +120,22 @@ Rectangle {
             Layout.fillWidth: true
         }
 
+        Text {
+            objectName: "downloadTail"
+            visible: root.downloadState === "downloading" && root.tail !== ""
+            Layout.minimumWidth: implicitWidth
+            text: root.tail
+            textFormat: Text.PlainText
+            renderType: Text.NativeRendering
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.onboardingProgressStripTailSize
+            wrapMode: Text.NoWrap
+            color: Theme.onboardingProgressStripTailColor
+        }
+
         Rectangle {
             id: track
+            objectName: "downloadTrack"
             property real slide: 0
             visible: root.downloadState === "downloading" || root.downloadState === "verifying"
             Layout.minimumWidth: Theme.onboardingProgressStripTrackW
@@ -161,18 +175,6 @@ Rectangle {
                 loops: Animation.Infinite
                 running: root.visible && root.downloadState === "verifying" && !root.freezeAnimations
             }
-        }
-
-        Text {
-            visible: root.downloadState === "downloading" && root.tail !== ""
-            Layout.minimumWidth: implicitWidth
-            text: root.tail
-            textFormat: Text.PlainText
-            renderType: Text.NativeRendering
-            font.family: Theme.fontUi
-            font.pixelSize: Theme.onboardingProgressStripTailSize
-            wrapMode: Text.NoWrap
-            color: Theme.onboardingProgressStripTailColor
         }
 
         AvButton {

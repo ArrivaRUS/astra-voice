@@ -552,10 +552,14 @@ def dlbar(state, name="GigaAM v3 RNN-T", queue=""):
     track = '<span class="prog" style="width:160px;flex:none"><i style="width:43%"></i></span>'
     ind = '<span class="prog ind" style="width:160px;flex:none"><i></i></span>'
     if state in ("downloading", "calc"):
-        tail = "считаю…" if state == "calc" else "5,2 МБ/с · осталось ~3 мин"
+        tail = (
+            "Скачиваю с huggingface.co · считаю…"
+            if state == "calc"
+            else "Скачиваю с huggingface.co · 5,2 МБ/с · осталось ~3 мин"
+        )
         inner = (f'{ic("down", 14, "var(--primary)")}'
                  f'<span class="ttl">Загружается {name}</span>{q}'
-                 f'<span class="sp"></span>{track}<span class="tail">{tail}</span>')
+                 f'<span class="sp"></span><span class="tail">{tail}</span>{track}')
     elif state == "verifying":
         inner = (f'{ic("refresh", 14, "var(--fg3)")}<span class="ttl">Проверяю модель…</span>'
                  f'<span class="sp"></span>{ind}')
