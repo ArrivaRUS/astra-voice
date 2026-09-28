@@ -803,8 +803,11 @@ def test_seamless_switch_candidate_outcome(
         old.stop.assert_called_once_with()
         finished.assert_not_called()
         assert rig.runtime._switch_active()
-        assert rig.runtime._switch_timer is switch_timer
-        assert switch_timer is not None and switch_timer.active and not switch_timer.deleted
+        # Продвижение взводит сторож заново на полный срок обеих самопроверок.
+        rearmed = rig.runtime._switch_timer
+        assert rearmed is not None and rearmed is not switch_timer
+        assert switch_timer is not None and switch_timer.deleted
+        assert rearmed.active and rearmed.interval == module.SWITCH_TIMEOUT_S * 1000
         finished.assert_not_called()
         callback(
             {
@@ -828,7 +831,7 @@ def test_seamless_switch_candidate_outcome(
     rig.runtime.shutdown()
 
 
-def test_promoted_switch_watchdog_accepts_silent_selfcheck(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_promoted_switch_watchdog_rejects_silent_selfcheck(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
     rig.runtime.start()
     old = rig.supervisor
@@ -850,11 +853,15 @@ def test_promoted_switch_watchdog_accepts_silent_selfcheck(monkeypatch: pytest.M
     old.stop.assert_called_once_with()
 
     timer.fire()
-    finished.assert_called_once_with("ok")
+    assert rig.runtime._switch_timer is not None and rig.runtime._switch_timer is not timer
+    rig.runtime._switch_timer.fire()
+    # Молчащая самопроверка не делает модель рабочей. Здесь откат не меняет модель
+    # (она задана в настройках), поэтому перезапуска нет, а ошибка видна.
+    finished.assert_called_once_with("failed")
     assert not rig.runtime._switch_active()
     assert rig.runtime.supervisor is candidate
-    candidate.stop.assert_not_called()
     assert rig.supervisor_factory.call_count == 2
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
     rig.runtime.shutdown()
 
 
@@ -912,12 +919,15 @@ def test_paused_switch_watchdog_stops_unresponsive_worker(monkeypatch: pytest.Mo
     replacement = Mock(state="running", generation=1)
     rig.supervisor_factory.return_value = replacement
     recovered = Mock(state="running", generation=1)
+    current = ["whisper"]
+    monkeypatch.setattr(rig.runtime, "_resolve_model_request", lambda: _switch_request(current[0]))
 
     def rolled_back(result: str) -> None:
         assert result == "failed"
         assert rig.runtime.supervisor is replacement
         assert rig.supervisor_factory.call_count == 2
         rig.supervisor_factory.return_value = recovered
+        current[0] = "gigaam"
 
     finished = Mock(side_effect=rolled_back)
     rig.runtime.on_switch_finished = finished
@@ -4851,11 +4861,12 @@ def test_switch_failure_after_supervisor_restart_loads_previous_model(
             "utterance_id": "file",
         }
     )
-    SwitchRig.emit(second, type="hello")
-    current = bench.rig.runtime.supervisor
-    if current is second:
-        assert bench.loads(second)[-1] == "gigaam"
     restored = bench.assert_rolled_back(second)
+    bench.finished.assert_called_once_with("too-slow")
+    # hello перезапущенного супервизором процесса после отката ничего не грузит.
+    second.send.reset_mock()
+    SwitchRig.emit(second, type="hello")
+    assert bench.loads(second) == []
     # Перезапуск процесса до model.loaded снова отправляет прежнюю модель.
     restored.generation += 1
     restored.send.reset_mock()
@@ -4966,3 +4977,130 @@ def test_selfcheck_deadline_prefers_own_measurement(
     timer = bench.rig.runtime._selfcheck_timer
     assert timer is not None and timer.interval == 3000
     bench.rig.runtime.shutdown()
+
+
+def test_switch_too_slow_through_supervisor_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = SwitchRig(monkeypatch)
+    bench.switch()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    second = bench.load_new_model()
+    SwitchRig.emit(
+        second,
+        type="error",
+        code="timeout",
+        request_type="transcribe.file",
+        utterance_id="file",
+    )
+    restored = bench.assert_rolled_back(second)
+    bench.finished.assert_called_once_with("too-slow")
+    bench.finish_restore(restored)
+    bench.rig.runtime.shutdown()
+
+
+def test_delayed_promotion_rearms_switch_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = SwitchRig(monkeypatch)
+    rig = bench.rig
+    runtime = rig.runtime
+    bench.switch()
+    before = runtime._switch_timer
+    assert before is not None
+    candidate = bench.workers[-1]
+    SwitchRig.emit(candidate, type="hello")
+    # Диктовка откладывает продвижение загруженного кандидата.
+    rig.hotkey.fsm.press(rig.now)
+    SwitchRig.emit(candidate, type="model.loaded", id="whisper")
+    assert runtime.supervisor is bench.old
+    rig.release(rig.now + 1)
+    rig.event(type="result", text=MARKER)
+    rig.timers[-1].fire()
+    assert runtime.supervisor is candidate
+    after = runtime._switch_timer
+    assert after is not None and after is not before
+    assert before.deleted and not before.active
+    assert after.active and after.interval == module.SWITCH_TIMEOUT_S * 1000
+    before.fire()
+    bench.finished.assert_not_called()
+    bench.fire_selfcheck()
+    second = bench.load_new_model()
+    bench.fire_selfcheck()
+    bench.finished.assert_called_once_with("too-slow")
+    assert bench.current == "gigaam"
+    restored = bench.assert_rolled_back(second)
+    bench.finish_restore(restored)
+    runtime.shutdown()
+
+
+def test_switch_watchdog_between_selfchecks_never_reports_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    bench.switch()
+    first = bench.load_new_model()
+    bench.fire_selfcheck()
+    timer = runtime._switch_timer
+    assert timer is not None
+    timer.fire()
+    assert call("ok") not in bench.finished.call_args_list
+    assert bench.current == "gigaam"
+    restored = bench.assert_rolled_back(first)
+    bench.finish_restore(restored)
+    runtime.shutdown()
+
+
+def test_switch_without_restored_model_fails_quietly_for_slow_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    # Подписчик не смог вернуть прежнюю модель: current.json остался на новой.
+    bench.finished.side_effect = None
+    bench.switch()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    second = bench.load_new_model()
+    workers = len(bench.workers)
+    bench.fire_selfcheck()
+    bench.finished.assert_called_once_with("too-slow")
+    assert len(bench.workers) == workers
+    assert bench.rig.runtime.supervisor is second
+    assert bench.rig.runtime._selfcheck == "failed"
+    bench.rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
+    bench.rig.notify.notify_engine_failed.assert_not_called()
+    bench.rig.runtime.shutdown()
+
+
+def test_first_switch_without_previous_model_does_not_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    bench.finished.side_effect = lambda result: setattr(bench, "current", None)
+    monkeypatch.setattr(
+        bench.rig.runtime,
+        "_resolve_model_request",
+        lambda: None if bench.current is None else _switch_request(bench.current),
+    )
+    bench.switch()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    bench.load_new_model()
+    workers = len(bench.workers)
+    bench.fire_selfcheck()
+    assert len(bench.workers) == workers
+    bench.rig.runtime.shutdown()
+
+
+def test_paused_switch_restart_error_shows_load_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = SwitchRig(monkeypatch, pause=True)
+    runtime = bench.rig.runtime
+
+    def broken(**kwargs: Any) -> Mock:
+        raise OSError("нет воркера")
+
+    runtime._supervisor_factory = broken
+    bench.switch()
+    bench.finished.assert_called_once_with("failed")
+    assert not runtime._switch_active()
+    bench.rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    bench.rig.tray.set_state.assert_called_with(TrayState.ERROR)
+    runtime.shutdown()

@@ -172,6 +172,8 @@ class DictationRuntime(QObject):
         self._pending_switch_timer: QTimer | None = None
         self._switch_candidate: WorkerSupervisor | None = None
         self._switch_request: dict[str, Any] | None = None
+        # Пара «модель, ревизия», на которую переключаемся: откат должен её сменить.
+        self._switch_target: tuple[object, object] | None = None
         self._switch_loaded_event: dict[str, Any] | None = None
         self._switch_in_progress = False
         self._switch_paused = False
@@ -504,6 +506,7 @@ class DictationRuntime(QObject):
             self.cancel_timer(timer)
         candidate, self._switch_candidate = self._switch_candidate, None
         self._switch_request = None
+        self._switch_target = None
         self._switch_loaded_event = None
         if candidate is not None:
             self._cleanup("временный воркер", candidate.stop)
@@ -513,11 +516,22 @@ class DictationRuntime(QObject):
     def _switch_watchdog(self) -> None:
         # schedule уже снял сработавший таймер.
         self._switch_timer = None
-        if self._switch_promoted:
-            # Новый воркер уже рабочий; ожидание самопроверки не держит раздел.
+        if self._switch_promoted and self._selfcheck == "ok":
             self._finish_switch("ok")
             return
-        self._fail_switch()
+        # Продвинутый кандидат взводит сторож заново; если и за этот срок самопроверка
+        # не решилась, новая модель не доказала работу — возвращаем прежнюю.
+        previous_stopped = self._switch_promoted or self._switch_paused
+        if not self._fail_switch() and previous_stopped:
+            self._show_load_failed()
+
+    def _show_load_failed(self) -> None:
+        """Прежний воркер остановлен, а вернуть модель не удалось: не молчим."""
+        self._loading_model = False
+        self._fail_pending_test()
+        if self.orchestrator.phase == DictationPhase.IDLE:
+            self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+        self.tray.set_state(TrayState.ERROR)
 
     def _fail_switch(self, result: str = "failed") -> bool:
         """Завершает переключение неудачей; True — начат возврат прежней модели.
@@ -530,8 +544,17 @@ class DictationRuntime(QObject):
         if not self._switch_active():
             return False
         previous_stopped = self._switch_promoted or self._switch_paused
+        target = self._switch_target
         self._finish_switch(result)
         if not previous_stopped or self._closed:
+            return False
+        try:
+            request = self._resolve_model_request()
+        except Exception:
+            request = None
+        if request is None or (request.get("id"), request.get("revision")) == target:
+            # Подписчик не вернул прежнюю модель (её нет или запись не удалась).
+            log.warning("Прежняя рабочая модель не восстановлена после неудачного переключения")
             return False
         log.warning("Новая модель не заработала: возвращаю прежнюю рабочую модель")
         try:
@@ -563,12 +586,14 @@ class DictationRuntime(QObject):
             if not enough_memory:
                 self._finish_switch("failed")
                 return
+        self._switch_target = (request.get("id"), request.get("revision"))
         if pause:
             self._switch_paused = True
             try:
                 self.restart_worker(wait_for_model=True, _for_switch=True)
             except Exception:
-                self._fail_switch()
+                if not self._fail_switch():
+                    self._show_load_failed()
             return
         candidate: WorkerSupervisor | None = None
         try:
@@ -623,6 +648,12 @@ class DictationRuntime(QObject):
             self._cleanup("прежний воркер", old.stop)
             self.supervisor = candidate
             self._switch_promoted = True
+            # Продвижение могла отложить диктовка: полный срок на обе самопроверки
+            # отсчитывается заново, чтобы сторож не сработал между ними.
+            timer, self._switch_timer = self._switch_timer, None
+            if timer is not None:
+                self.cancel_timer(timer)
+            self._switch_timer = self.schedule(int(SWITCH_TIMEOUT_S * 1000), self._switch_watchdog)
             self._reset_selfcheck()
             self._loading_model = True
             self._model_load_generation = candidate.generation
@@ -900,9 +931,11 @@ class DictationRuntime(QObject):
             if self._switch_active() and self._switch_candidate is None:
                 self._finish_switch("ok")
         else:
+            too_slow = False
             if self._switch_active() and self._switch_candidate is None:
                 # Верная, но медленная модель не укладывается в дедлайн самопроверки.
-                if self._fail_switch("too-slow" if reason == "timeout" else "failed"):
+                too_slow = reason == "timeout"
+                if self._fail_switch("too-slow" if too_slow else "failed"):
                     return
             self._loading_model = False
             self._fail_pending_test()
@@ -911,7 +944,10 @@ class DictationRuntime(QObject):
                 return
             self.tray.set_state(TrayState.ERROR)
             self.pill.show_state(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
-            if reason in {"load-failed", "worker-error", "no-wav", "timeout"}:
+            if too_slow:
+                # Движок исправен, модель медленная: совет переустановить неверен.
+                pass
+            elif reason in {"load-failed", "worker-error", "no-wav", "timeout"}:
                 notify.notify_engine_failed()
             else:
                 notify.notify_selfcheck_failed()
@@ -1425,6 +1461,7 @@ class DictationRuntime(QObject):
         self._switch_promoted = False
         self._switch_request_sent = False
         self._switch_request = None
+        self._switch_target = None
         self._switch_loaded_event = None
         candidate, self._switch_candidate = self._switch_candidate, None
         if candidate is not None:

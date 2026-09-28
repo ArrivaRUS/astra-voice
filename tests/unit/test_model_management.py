@@ -1136,6 +1136,20 @@ def test_too_slow_switch_says_so_without_reinstall_advice() -> None:
         downloads.shutdown()
 
 
+def test_too_slow_switch_ignores_memory_of_failed_model() -> None:
+    port, downloads, switcher = switched_rig(True)
+    switcher.available_mb = TONE.min_ram_mb - 1
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        switcher.finish("too-slow")
+        item = card(downloads, TONE.id)
+        assert item["message"] == "Модель слишком медленная для этого компьютера"
+        assert item["hint"] == ""
+        assert item["hintKind"] == ""
+    finally:
+        downloads.shutdown()
+
+
 def test_failed_switch_without_lighter_model_has_no_hint() -> None:
     port = FakeManagedPort()
     port.catalog = (GIGAAM,)
@@ -1720,11 +1734,12 @@ def test_model_service_reads_installed_revision_size() -> None:
 
 def test_model_service_reads_catalog_rtfx() -> None:
     service = ModelService.__new__(ModelService)
-    service._catalog = Mock()
-    service._catalog.entry.side_effect = {
-        "gigaam": replace(GIGAAM, metrics=Metrics(rtfx=Metric(42.5, "https://example.org"))),
-        "t-one": TONE,
-    }.get
+    service._catalog = Mock(
+        entries=(
+            replace(GIGAAM, id="gigaam", metrics=Metrics(rtfx=Metric(42.5, "https://example.org"))),
+            TONE,
+        )
+    )
 
     assert service.catalog_rtfx("gigaam") == 42.5
     assert service.catalog_rtfx("t-one") is None

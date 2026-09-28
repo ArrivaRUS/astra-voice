@@ -41,7 +41,13 @@ from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
 from astra_voice.models import catalog_state
-from astra_voice.models.catalog import CatalogEntry, CatalogError, load_builtin, merge_measurement
+from astra_voice.models.catalog import (
+    CatalogEntry,
+    CatalogError,
+    load_builtin,
+    merge_measurement,
+)
+from astra_voice.models.catalog import catalog_rtfx as _catalog_rtfx
 from astra_voice.models.downloader import (
     Downloader,
     DownloadError,
@@ -505,9 +511,7 @@ class ModelService:
 
     def catalog_rtfx(self, model_id: str) -> float | None:
         """Опубликованная скорость модели (RTFx) или None, если её нет в каталоге."""
-        entry = self._catalog.entry(model_id)
-        metric = None if entry is None else entry.metrics.rtfx
-        return None if metric is None else metric.value
+        return _catalog_rtfx(self._catalog.entries, model_id)
 
     def entries(self) -> tuple[CatalogEntry, ...]:
         # Отозванную ревизию не предлагаем, но уже установленную показываем:
@@ -1791,7 +1795,8 @@ class ModelDownloads(QObject):
                         available = reader()
                     except Exception:
                         log.warning("Не удалось определить доступную память после переключения")
-                if available is not None and available < entry.min_ram_mb:
+                # Медленная модель загрузилась: память, занятая ею же, не причина.
+                if result != "too-slow" and available is not None and available < entry.min_ram_mb:
                     if entry.removed_from_catalog:
                         message = "Недостаточно памяти для этой модели"
                     else:
