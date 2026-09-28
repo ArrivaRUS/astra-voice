@@ -10,26 +10,75 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from astra_voice.core import paths
+
 log = logging.getLogger(__name__)
 
 _NAME = "astra-voice.desktop"
-EXECUTABLE = "/usr/bin/astra-voice"
-_ENTRY = b"".join(
-    (
-        b"[Desktop Entry]\n",
-        b"Type=Application\n",
-        b"Name=Astra Voice\n",
-        f"Exec={EXECUTABLE} --hidden\n".encode(),
-        b"Icon=astravoice\n",
-        b"NoDisplay=true\n",
-        b"X-KDE-autostart-after=panel\n",
-        b"X-AstraVoice-Managed=true\n",
-    )
-)
+DEB_EXECUTABLE = "/usr/bin/astra-voice"
+# Совместимость: исполняемый файл трека .deb и исходников. Путь по треку — executable().
+EXECUTABLE = DEB_EXECUTABLE
+# Символы, из-за которых аргумент Exec нужно брать в кавычки (Desktop Entry, «Exec key»).
+_EXEC_RESERVED = frozenset(" \t\n\"'\\><~|&;$*?#()`")
 
 
 class AutostartError(OSError):
     """Unable to read or change the user's autostart entry."""
+
+
+class AutostartUnavailableError(AutostartError):
+    """AppImage работает без установки: запись автозапуска не пишется (arch/appimage.md §3)."""
+
+
+def executable() -> str:
+    """Что запускает автозапуск в этом треке (arch/appimage.md §3).
+
+    ``.deb`` и исходники — ``/usr/bin/astra-voice`` (как в v0.1); установленная
+    копия AppImage — ``<data_dir>/app/current/AppRun``; AppImage без установки —
+    отказ: запись на ``$APPIMAGE``, монтирование или распаковку не пишется никогда.
+    """
+    kind = paths.install_kind()
+    if kind is paths.InstallKind.APPIMAGE_INSTALLED:
+        # T1-01.10: MJ-1 — строгая проверка пути в paths.check_appimage_launcher().
+        return str(paths.check_appimage_launcher(paths.appimage_current_apprun()))
+    if kind is paths.InstallKind.APPIMAGE_PORTABLE:
+        raise AutostartUnavailableError("Автозапуск доступен после установки программы")
+    return DEB_EXECUTABLE
+
+
+def _exec_argument(path: str) -> str:
+    """Путь как аргумент ключа Exec: кавычки при необходимости, ``%%`` (MN-2)."""
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in path):
+        raise AutostartError("Путь к программе содержит управляющие символы")
+    if not _EXEC_RESERVED.intersection(path):
+        return path.replace("%", "%%")
+    quoted = "".join("\\" + char if char in '"`$\\' else char for char in path)
+    # Общее правило строк .desktop применяется поверх правила кавычек: «\» → «\\».
+    return '"' + quoted.replace("\\", "\\\\").replace("%", "%%") + '"'
+
+
+def entry_bytes(executable_path: str | None = None) -> bytes:
+    """Наша запись автозапуска; для ``.deb`` — байт в байт как в v0.1."""
+    path = executable() if executable_path is None else executable_path
+    lines = [
+        b"[Desktop Entry]\n",
+        b"Type=Application\n",
+        b"Name=Astra Voice\n",
+        f"Exec={_exec_argument(path)} --hidden\n".encode(),
+    ]
+    if path != DEB_EXECUTABLE and not _EXEC_RESERVED.intersection(path) and "%" not in path:
+        # Тихий пропуск, если пользователь удалил app/ (arch/appimage.md §3).
+        lines.append(f"TryExec={path}\n".encode())
+    lines += [
+        b"Icon=astravoice\n",
+        b"NoDisplay=true\n",
+        b"X-KDE-autostart-after=panel\n",
+        b"X-AstraVoice-Managed=true\n",
+    ]
+    return b"".join(lines)
+
+
+_ENTRY = entry_bytes(DEB_EXECUTABLE)
 
 
 @dataclass(frozen=True)
@@ -217,23 +266,23 @@ def set_enabled(enabled: bool) -> None:
         system_active = current.system and not current.system_hidden
         if enabled:
             if current.user == "none":
-                _write(path, _ENTRY)
+                _write(path, entry_bytes())
             elif current.user == "ours":
                 if system_active:
                     _unlink(path)
                 else:
-                    _write(path, _ENTRY)
+                    _write(path, entry_bytes())
             elif data is not None:
                 _write(path, _hidden_lines(data, enable=True))
         elif current.user == "ours":
             if system_active:
-                _write(path, _ENTRY + b"Hidden=true\n")
+                _write(path, entry_bytes() + b"Hidden=true\n")
             else:
                 _unlink(path)
         elif current.user == "foreign" and data is not None:
             _write(path, _hidden_lines(data, enable=False))
         elif system_active:
-            _write(path, _ENTRY + b"Hidden=true\n")
+            _write(path, entry_bytes() + b"Hidden=true\n")
         if _inspect()[0].enabled != enabled:
             raise AutostartError(f"Не удалось установить состояние автозапуска {path}")
     except OSError as exc:
