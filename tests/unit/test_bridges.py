@@ -2562,6 +2562,60 @@ def test_model_install_revoked_or_cancelled(
     assert controller._downloads._model_thread is None
 
 
+@pytest.mark.parametrize("scenario", ["download", "local", "recheck"])
+def test_model_job_is_destroyed_in_gui_thread(
+    model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    # ~QObject задания в рабочем потоке берёт GIL под мьютексом сигналов Qt,
+    # а GUI под GIL ждёт тот же мьютекс: взаимная блокировка. Удалять — только в GUI.
+    port, create = model_rig
+    gate = threading.Event()
+
+    def blocked_install(*args: object) -> InstallResult:
+        assert gate.wait(5), "Тест не освободил задание"
+        port.ready = True
+        return InstallResult("ok")
+
+    def blocked_verify(entry: Any) -> tuple[bool, str]:
+        assert gate.wait(5), "Тест не освободил задание"
+        return True, ""
+
+    if scenario == "recheck":
+        monkeypatch.setattr(port, "recheck_entries", lambda: (port.entry,))
+        monkeypatch.setattr(port, "verify_files", blocked_verify)
+        monkeypatch.setattr(port, "smoke", lambda entry: (True, ""))
+        monkeypatch.setattr(port, "mark_ok", lambda model_id, revision: None)
+    else:
+        monkeypatch.setattr(port, "install_from_staging", blocked_install)
+        monkeypatch.setattr(port, "install_from_path", blocked_install)
+    controller = create()
+    downloads = controller._downloads
+    if scenario == "download":
+        controller.download()
+    elif scenario == "local":
+        controller.installFromPath("/fake/model")
+    else:
+        downloads.start_recheck()
+    job = downloads._model_job
+    assert job is not None
+    destroyed_in: list[int] = []
+
+    def record(*args: object) -> None:
+        destroyed_in.append(threading.get_ident())
+
+    job.destroyed.connect(record, Qt.DirectConnection)
+    del job
+    gate.set()
+    deadline = time.monotonic() + 2
+    while downloads._model_thread is not None:
+        QCoreApplication.processEvents()
+        assert time.monotonic() < deadline, "Задание не завершилось"
+        time.sleep(0.001)
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    gc.collect()
+    assert destroyed_in == [threading.get_ident()]
+
+
 def test_model_job_unexpected_exception_does_not_log_private_details(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

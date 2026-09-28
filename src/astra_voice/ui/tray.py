@@ -8,7 +8,9 @@ from functools import partial
 from time import monotonic
 from typing import Any
 
+from PyQt5 import sip
 from PyQt5.QtCore import (
+    QCoreApplication,
     QObject,
     Qt,
     QThread,
@@ -313,6 +315,12 @@ class _BusWorker(QObject):
         finally:
             self._bus = None
             self.result.emit(self._token, "closed", None)
+            # Шина уже закрыта. Возвращаем воркер в GUI, чтобы после wait() его
+            # удалил _BusThreadReaper: PyQt удаляет QObject чужого потока через
+            # deleteLater(), а в завершившийся поток оно не доставляется.
+            app = QCoreApplication.instance()
+            if app is not None:
+                self.moveToThread(app.thread())
             self.finished.emit()
 
 
@@ -335,6 +343,11 @@ class _BusThreadReaper(QObject):
         for worker, active_thread in tuple(_bus_threads.items()):
             if active_thread is thread:
                 _bus_threads.pop(worker, None)
+                # Воркер удаляем здесь, в GUI после wait(): ~QObject в потоке шины
+                # берёт GIL под мьютексом сигналов Qt и взаимно блокируется с GUI.
+                # _finish_close() уже вернул воркер в поток GUI.
+                if not sip.isdeleted(worker):
+                    sip.delete(worker)
                 # После wait() QThread удаляется отложенно в GUI-потоке.
                 thread.deleteLater()
                 return
@@ -359,7 +372,6 @@ def _start_bus_worker(worker: _BusWorker) -> None:
     _bus_threads[worker] = thread
     worker.moveToThread(thread)
     worker.finished.connect(thread.quit, Qt.DirectConnection)
-    thread.finished.connect(worker.deleteLater)
     thread.finished.connect(_bus_reaper.collect, Qt.QueuedConnection)
     thread.start()
 

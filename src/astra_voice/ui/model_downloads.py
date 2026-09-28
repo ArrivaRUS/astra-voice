@@ -23,6 +23,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from PyQt5.QtCore import (
+    QCoreApplication,
     QObject,
     Qt,
     QThread,
@@ -278,6 +279,38 @@ def catalog_best(entries: Iterable[Any]) -> float:
 
 # После таймаута поток и задание должны оставаться живы до выхода run().
 _finishing_model_threads: set[tuple[QThread, _ModelJob | _RecheckJob | None]] = set()
+_model_thread_reaper: _ModelThreadReaper | None = None
+
+
+def _return_to_gui_thread(job: QObject) -> None:
+    """Вызывать в рабочем потоке задания перед его выходом.
+
+    PyQt удаляет QObject чужого потока через deleteLater(), а в завершившийся
+    поток оно не доставляется. Вернув задание в поток GUI, Python удалит его
+    там напрямую, когда контроллер отпустит ссылку после wait().
+    """
+    app = QCoreApplication.instance()
+    if app is not None and job.thread() is not app.thread():
+        job.moveToThread(app.thread())
+
+
+class _ModelThreadReaper(QObject):
+    """Отпускает пару (поток, задание) в GUI только после полного выхода потока.
+
+    finished приходит, пока поток ещё в QThreadPrivate::finish. Если отпустить
+    последнюю ссылку раньше wait(), ~QThread ждёт поток под GIL, а поток может
+    ждать GIL — взаимная блокировка. wait() отпускает GIL.
+    """
+
+    @pyqtSlot()
+    def collect(self) -> None:
+        thread = self.sender()
+        if not isinstance(thread, QThread):
+            return
+        thread.wait()
+        for pair in tuple(_finishing_model_threads):
+            if pair[0] is thread:
+                _finishing_model_threads.discard(pair)
 
 
 class ModelPort(Protocol):
@@ -785,6 +818,7 @@ class _ModelJob(QObject):
         except Exception:
             log.warning("Установка модели не удалась: unexpected")
         finally:
+            _return_to_gui_thread(self)
             self.finished.emit(state, reason)
 
 
@@ -812,6 +846,7 @@ class _RecheckJob(QObject):
         except Exception:
             # Исключение может содержать пути или речь, но не является отказом модели.
             log.warning("Перепроверка модели отложена до следующего запуска")
+        _return_to_gui_thread(self)
         self.finished.emit(state, reason)
 
 
@@ -2418,7 +2453,7 @@ class ModelDownloads(QObject):
             job.moveToThread(thread)
             thread.started.connect(job.run)
             job.finished.connect(self._model_finished)
-            job.finished.connect(job.deleteLater)
+            # job без родителя: им владеет Python, удаление — в GUI после wait().
             job.finished.connect(thread.quit, Qt.DirectConnection)
             thread.finished.connect(self._model_thread_finished)
             self._set_card(entry, "verifying")
@@ -2515,7 +2550,10 @@ class ModelDownloads(QObject):
             job.sourced.connect(self._model_sourced)
             job.staged.connect(self._model_staged)
             job.finished.connect(self._model_finished)
-            job.finished.connect(job.deleteLater)
+            # Без job.deleteLater: ~QObject в рабочем потоке берёт GIL под мьютексом
+            # сигналов Qt и взаимно блокируется с GUI. job без родителя, им владеет
+            # Python; удаляется в GUI, когда _model_thread_finished после wait()
+            # отпускает ссылку.
             # quit() потокобезопасен. Прямой вызов нужен и при shutdown(), когда GUI
             # ждёт wait() и уже не обрабатывает очередь сигналов.
             job.finished.connect(thread.quit, Qt.DirectConnection)
@@ -2577,13 +2615,14 @@ class ModelDownloads(QObject):
                     "Установка модели не завершилась за 5 секунд после отмены; "
                     "выход из приложения продолжается"
                 )
+                global _model_thread_reaper
+                if _model_thread_reaper is None:
+                    _model_thread_reaper = _ModelThreadReaper()
                 thread = self._model_thread
                 thread.setParent(None)
-                pair = (thread, self._model_job)
-                _finishing_model_threads.add(pair)
+                _finishing_model_threads.add((thread, self._model_job))
                 # После отсоединения потока обработчик finished может не выполниться,
                 # если очередь GUI уже не крутится; тогда реестр держит пару до конца процесса.
-                thread.finished.connect(lambda: _finishing_model_threads.discard(pair))
-                thread.finished.connect(thread.deleteLater)
+                thread.finished.connect(_model_thread_reaper.collect, Qt.QueuedConnection)
                 self._model_job = None
                 self._model_thread = None
