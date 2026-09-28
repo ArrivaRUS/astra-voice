@@ -131,6 +131,36 @@ def test_onboarding_step_labels() -> None:
         assert label in text, f"{path}: нет подписи {label!r}"
 
 
+def test_onboarding_body_and_network_copy() -> None:
+    shell = source(ONBOARDING / "Onboarding.qml")
+    assert re.search(r'Flickable\s*\{\s*id:\s*body\s*objectName:\s*"onboardingBody"', shell)
+    assert "contentHeight: loader.y + loader.height + 24" in shell
+    assert "onSourceChanged: body.contentY = 0" in shell
+
+    network = source(ONBOARDING / "Step1Network.qml")
+    assert (
+        r'qsTr("Голосовой ввод для Astra Linux.\nРаспознавание работает локально '
+        r'на этом компьютере —\nзаписи никуда не отправляются.")'
+    ) in network
+
+
+def test_onboarding_uses_qt_tab_navigation_and_filters_pointer_focus() -> None:
+    shell = source(ONBOARDING / "Onboarding.qml")
+    card = source(REPO / "qml/components/OnboardingModelCard.qml")
+    assert not re.search(r'\bsequence[s]?\s*:\s*(?:"Tab"|\["Backtab")', shell)
+    assert "moveFocusByTab" not in shell
+    assert "keyboardFocusPending" not in shell
+    assert "tabShortcutsEnabled" not in shell
+    assert "onActiveFocusItemChanged" in shell
+    assert "item.pointerFocus === true || item.focusReason === Qt.MouseFocusReason" in shell
+    assert "ancestor.pointerFocus" not in shell
+    assert "ancestor.focusReason" not in shell
+    assert "body.ensureVisible(item)" in shell
+    assert "root.pointerFocus = true" in card
+    assert "if (!root.activeFocus) root.pointerFocus = false;" in card
+    assert "onActiveFocusChanged: if (!activeFocus) pointerFocus = false" in card
+
+
 @pytest.mark.parametrize(
     ("component", "states"),
     [

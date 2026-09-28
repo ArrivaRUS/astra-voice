@@ -22,6 +22,7 @@ Rectangle {
     readonly property bool showRam: measurementMode
         ? (ramMb !== 0 || ramMeasured) : ramText !== ""
     property bool selected: false
+    property bool pointerFocus: false
     property string badge: ""
     property string cardState: "available"
     property bool canCancel: cardState === "downloading" || cardState === "paused-no-space"
@@ -109,6 +110,7 @@ Rectangle {
         : badge === "active" ? Theme.accentBg
         : highlighted || busy ? Theme.primaryBg : Theme.bgSurface
     activeFocusOnTab: selectionAvailable
+    onActiveFocusChanged: if (!activeFocus) pointerFocus = false
     onSelectionAvailableChanged: {
         if (!selectionAvailable)
             focus = false;
@@ -131,7 +133,9 @@ Rectangle {
         hoverEnabled: root.selectionAvailable
         cursorShape: Qt.PointingHandCursor
         onClicked: {
+            root.pointerFocus = true;
             root.forceActiveFocus(Qt.MouseFocusReason);
+            if (!root.activeFocus) root.pointerFocus = false;
             root.toggleRequested();
         }
     }
