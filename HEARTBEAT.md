@@ -782,3 +782,13 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
   ⛔ T2), M9 уведомления/звуки/разделы/живая тема + Fly; C0 в Cowork; перенесённое из 0.1 (смена микрофона посреди фразы S5-A5,
   T-116 часы, T3 P2: latest.json без секрета, persist-credentials — только браузером, отдельный job sign); мелочи (лямбды на
   сигналах app.py:328 / model_downloads.py:2180; QtQuick.Shapes из Depends/CI; спайки на private_bus).
+
+## 2026-09-28 16:15 — 0.1.0 ОПУБЛИКОВАН
+- https://github.com/ArrivaRUS/astra-voice/releases/tag/v0.1.0 — тег `ba5461e`, ассеты проверены (VALIDSIG мастера, sha256,
+  tools/validate release — OK), тело релиза — наше. У заказчика стоит m6.24 (код тот же).
+- В работе/дальше: debugger — плавающее зависание unit-теста (`test_model_install_failure_message_uses_reason_code`, CI run
+  36420705856 первая попытка); AppImage — спайк готов (ветка `wip/appimage-spike` `bb22692`: 77,5 МиБ, самоустановка в
+  `~/.local/share/astra-voice/app`, PARSEC `enable_exec_on_fuse=N` у заказчика, но запуск из FUSE работает, т.к. nochmodx=0) →
+  ручная GUI-проверка заказчиком → архитектура → T1 → план v0.2 (AppImage — второй артефакт, решение 28.09);
+  Cowork: контракт Command1 1.5 (8 пунктов согласованы + правка policy_disabled) — ждём sha256 для зеркала.
+- 28.09 до конца дня: только модели Claude (Fable/Opus), Codex не звать (память feedback_models_today_claude_only).
