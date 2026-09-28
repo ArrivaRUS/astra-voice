@@ -53,7 +53,7 @@ Item {
 
             Text {
                 width: parent.width
-                text: qsTr("Голосовой ввод для Astra Linux. Распознавание идёт на этом компьютере — записи никуда не отправляются.")
+                text: qsTr("Голосовой ввод для Astra Linux.\nРаспознавание работает локально на этом компьютере —\nзаписи никуда не отправляются.")
                 color: Theme.fgMuted
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSmallSize

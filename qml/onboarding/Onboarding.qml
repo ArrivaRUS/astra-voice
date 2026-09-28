@@ -2,6 +2,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import QtQuick.Window 2.15
 import ".."
 import "../components"
 
@@ -17,6 +18,20 @@ Item {
     readonly property bool canFinish: root.bridge ? root.bridge.canFinish : false
     readonly property var stepNames: [qsTr("Сеть"), qsTr("Модель"), qsTr("Горячая клавиша"), qsTr("Микрофон"), qsTr("Готово")]
     readonly property var stepSources: ["Step1Network.qml", "Step2Model.qml", "Step3Hotkey.qml", "Step4Mic.qml", "Step5Done.qml"]
+    property bool keyboardFocusPending: false
+    readonly property bool tabShortcutsEnabled: {
+        if (!root.visible || !root.enabled || !root.Window.window)
+            return false
+        var item = root.Window.window.activeFocusItem
+        while (item) {
+            if (item.captureActive === true)
+                return false
+            if (item === root)
+                return true
+            item = item.parent
+        }
+        return false
+    }
 
     anchors.fill: parent
     implicitWidth: Theme.sizeWindowW
@@ -40,6 +55,33 @@ Item {
         event.accepted = false
         if (loader.item && loader.item.escPressed)
             event.accepted = loader.item.escPressed() === true
+    }
+
+    // В Qt 5.15 Tab обрабатывается до Keys у предка; Shortcut сохраняет цепочку Qt.
+    function moveFocusByTab(forward) {
+        var current = root.Window.window.activeFocusItem
+        if (!current)
+            return
+        var next = current.nextItemInFocusChain(forward)
+        if (next && next !== current) {
+            root.keyboardFocusPending = true
+            next.forceActiveFocus(forward ? Qt.TabFocusReason : Qt.BacktabFocusReason)
+            root.keyboardFocusPending = false
+        }
+    }
+
+    Shortcut {
+        sequence: "Tab"
+        enabled: root.tabShortcutsEnabled
+        onActivated: root.moveFocusByTab(true)
+        onActivatedAmbiguously: root.moveFocusByTab(true)
+    }
+
+    Shortcut {
+        sequences: ["Backtab", "Shift+Backtab", "Shift+Tab"]
+        enabled: root.tabShortcutsEnabled
+        onActivated: root.moveFocusByTab(false)
+        onActivatedAmbiguously: root.moveFocusByTab(false)
     }
 
     // Shortcut обрабатывает Enter и когда фокус находится на контроле тела/панели.
@@ -112,8 +154,9 @@ Item {
     }
 
     // Объявление тела перед панелью задаёт порядок Tab: контент → кнопки панели.
-    Item {
+    Flickable {
         id: body
+        objectName: "onboardingBody"
         anchors.top: header.bottom
         anchors.bottom: dlStrip.visible ? dlStrip.top : bar.top
         anchors.left: parent.left
@@ -121,6 +164,53 @@ Item {
         anchors.leftMargin: 40 // spec §10: левый паддинг тела.
         anchors.rightMargin: 40 // spec §10: правый паддинг тела.
         clip: true
+        contentWidth: width
+        contentHeight: loader.y + loader.height + 24 // design/spec.md §10: зеркало верхнего паддинга тела.
+        boundsBehavior: Flickable.StopAtBounds
+
+        function ensureVisible(item) {
+            if (!item || !loader.item)
+                return
+            var ancestor = item
+            while (ancestor && ancestor !== loader.item)
+                ancestor = ancestor.parent
+            if (ancestor !== loader.item)
+                return
+
+            var position = item.mapToItem(body.contentItem, 0, 0)
+            var margin = Theme.focusOffset + Theme.focusWidth
+            var nextY = body.contentY
+            if (position.y - margin < nextY)
+                nextY = position.y - margin
+            else if (position.y + item.height + margin > nextY + body.height)
+                nextY = position.y + item.height + margin - body.height
+            body.contentY = Math.max(0, Math.min(nextY,
+                Math.max(0, body.contentHeight - body.height)))
+        }
+
+        ScrollBar.vertical: ScrollBar {
+            id: bodyScroll
+            policy: ScrollBar.AsNeeded
+            visible: size < 1.0
+            width: Theme.scrollbarW
+            rightPadding: Theme.scrollbarRight
+
+            contentItem: Rectangle {
+                implicitWidth: Theme.scrollbarW
+                radius: Theme.scrollbarRadius
+                color: Theme.scrollbarColor
+                opacity: bodyScroll.active ? Theme.scrollbarOpacity : 0
+
+                Behavior on opacity {
+                    enabled: !root.freezeAnimations
+                    NumberAnimation {
+                        duration: Theme.durationExit
+                        easing.type: Easing.Bezier
+                        easing.bezierCurve: Theme.easingExit.concat([1, 1])
+                    }
+                }
+            }
+        }
 
         Loader {
             id: loader
@@ -133,6 +223,16 @@ Item {
             anchors.horizontalCenter: parent.horizontalCenter
             source: root.stepSources[root.step - 1]
             focus: true
+            onSourceChanged: body.contentY = 0
+        }
+    }
+
+    Connections {
+        target: root.Window.window
+        function onActiveFocusItemChanged() {
+            if (root.keyboardFocusPending)
+                body.ensureVisible(root.Window.window.activeFocusItem)
+            root.keyboardFocusPending = false
         }
     }
 

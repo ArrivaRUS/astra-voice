@@ -131,6 +131,19 @@ def test_onboarding_step_labels() -> None:
         assert label in text, f"{path}: нет подписи {label!r}"
 
 
+def test_onboarding_body_and_network_copy() -> None:
+    shell = source(ONBOARDING / "Onboarding.qml")
+    assert re.search(r'Flickable\s*\{\s*id:\s*body\s*objectName:\s*"onboardingBody"', shell)
+    assert "contentHeight: loader.y + loader.height + 24" in shell
+    assert "onSourceChanged: body.contentY = 0" in shell
+
+    network = source(ONBOARDING / "Step1Network.qml")
+    assert (
+        r'qsTr("Голосовой ввод для Astra Linux.\nРаспознавание работает локально '
+        r'на этом компьютере —\nзаписи никуда не отправляются.")'
+    ) in network
+
+
 @pytest.mark.parametrize(
     ("component", "states"),
     [

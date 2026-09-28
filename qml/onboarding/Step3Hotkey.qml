@@ -98,7 +98,7 @@ Item {
                 width: parent.width
                 showHint: false
                 label: qsTr("Режим")
-                sub: qsTr("Удерживать — самый предсказуемый вариант")
+                sub: qsTr("Удерживать — самый удобный и предсказуемый вариант")
 
                 AvSegmented {
                     id: modeSelector

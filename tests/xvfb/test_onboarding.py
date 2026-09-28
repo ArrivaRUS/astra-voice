@@ -37,10 +37,10 @@ from PyQt5.QtCore import (
     pyqtSlot,
     qInstallMessageHandler,
 )
-from PyQt5.QtGui import QColor, QGuiApplication, QImage
+from PyQt5.QtGui import QColor, QGuiApplication, QImage, QWheelEvent
 from PyQt5.QtQml import QQmlApplicationEngine, QQmlComponent
 from PyQt5.QtQuick import QQuickView, QQuickWindow
-from PyQt5.QtTest import QTest
+from PyQt5.QtTest import QSignalSpy, QTest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
@@ -1908,6 +1908,95 @@ def test_section_frame_has_no_card_icons_after_models_scroll(
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_onboarding_header_has_no_card_icons_after_body_scroll(
+    onboarding_app: Any, monkeypatch: Any, dark: bool
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "HEIGHT", 588)
+    fake = FakeOnboarding()
+    fake.step = 2
+    fake.models = [{**fake.models[0], "id": f"model-{index}"} for index in range(12)]
+
+    def inspect(root: Any) -> None:
+        window = root.window()
+        assert isinstance(window, QQuickWindow)
+        assert (window.width(), window.height()) == (1024, 588)
+        body = next(item for item in visual_tree(root) if item.objectName() == "onboardingBody")
+        header_bottom = round(body.mapToScene(QPointF(0, 0)).y())
+        assert header_bottom > 0
+
+        def capture() -> QImage:
+            QTest.qWait(80)
+            onboarding_app.processEvents()
+            # QQuickWindow.grabWindow() перерисовывает кадр и скрывает «призраки»
+            # Shape; grabWindow экрана читает уже нарисованный буфер окна.
+            screen = QGuiApplication.primaryScreen()
+            assert screen is not None
+            image = screen.grabWindow(window.winId()).toImage()
+            if image.isNull():
+                message = "Qt/offscreen не отдал буфер окна"
+                if (
+                    os.environ.get("QT_QPA_PLATFORM") == "xcb"
+                    or os.environ.get("ASTRA_VOICE_REQUIRE_QT") == "1"
+                ):
+                    pytest.fail(message)
+                pytest.skip(message)
+            first = image.pixel(0, 0)
+            if not any(
+                image.pixel(x, y) != first
+                for y in range(image.height())
+                for x in range(image.width())
+            ):
+                message = "Qt/offscreen отдал одноцветный буфер окна"
+                if (
+                    os.environ.get("QT_QPA_PLATFORM") == "xcb"
+                    or os.environ.get("ASTRA_VOICE_REQUIRE_QT") == "1"
+                ):
+                    pytest.fail(message)
+                pytest.skip(message)
+            return image
+
+        def settle_local_pointer() -> None:
+            QTest.mouseMove(window, QPoint(1, window.height() - 2))
+            onboarding_app.processEvents()
+            QTest.qWait(20)
+            onboarding_app.processEvents()
+
+        def header_strip(image: QImage) -> QImage:
+            end = round(header_bottom * image.devicePixelRatio())
+            assert 0 < end <= image.height()
+            return image.copy(0, 0, image.width(), end)
+
+        settle_local_pointer()
+        clean = header_strip(capture())
+        maximum = float(body.property("contentHeight")) - body.height()
+        assert maximum > 0
+        for y in [*range(0, int(maximum), 12), maximum]:
+            body.setProperty("contentY", y)
+            QTest.qWait(16)
+            onboarding_app.processEvents()
+        for y in [*range(int(maximum), 0, -12), 0]:
+            body.setProperty("contentY", y)
+            QTest.qWait(16)
+            onboarding_app.processEvents()
+        fake.step = 3
+        onboarding_app.processEvents()
+        fake.step = 2
+        onboarding_app.processEvents()
+        settle_local_pointer()
+        after = header_strip(capture())
+        assert after.size() == clean.size()
+        changed = sum(
+            after.pixel(x, y) != clean.pixel(x, y)
+            for y in range(after.height())
+            for x in range(after.width())
+        )
+        assert after == clean, f"шапка после прокрутки: {changed} отличающихся пикселей"
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "шапка мастера после прокрутки моделей")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_menu_and_show_section_switch_real_sections(onboarding_app: Any, dark: bool) -> None:
     """Каждый пункт меню открывает свой раздел; из Python переход делает showSection."""
     messages: list[str] = []
@@ -2904,6 +2993,220 @@ def test_onboarding_step_width_and_position(
     assert_no_messages(messages, f"step {step} at {window_width}")
 
 
+@pytest.mark.parametrize("window_width", [1024, 900])
+@pytest.mark.parametrize("screen", ["onboarding", "settings"])
+def test_hotkey_mode_subtitle_fits_one_line(
+    onboarding_app: Any, monkeypatch: Any, window_width: int, screen: str
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "WIDTH", window_width)
+    subtitle = "Удерживать — самый удобный и предсказуемый вариант"
+
+    def inspect(root: Any) -> None:
+        surface = root.contentItem() if isinstance(root, QQuickWindow) else root
+        labels = [
+            item
+            for item in visual_tree(surface)
+            if item.isVisible() and item.property("text") == subtitle
+        ]
+        assert len(labels) == 1, (screen, window_width, len(labels))
+        label = labels[0]
+        line_count = int(label.property("lineCount"))
+        text_width = label.width()
+        implicit_width = label.implicitWidth()
+        print(
+            f"{screen} {window_width}px: lineCount={line_count}, "
+            f"Text.width={text_width:.1f}, implicitWidth={implicit_width:.1f}"
+        )
+        assert line_count == 1, (screen, window_width, line_count, text_width, implicit_width)
+
+    if screen == "onboarding":
+        fake = FakeOnboarding()
+        fake.step = 3
+        _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    else:
+        _, messages = render_settings(onboarding_app, False, section="general", inspect=inspect)
+    assert_no_messages(messages, f"{screen} mode subtitle at {window_width}")
+
+
+@pytest.mark.parametrize("window_width", [1024, 900])
+def test_network_intro_fits_three_lines(
+    onboarding_app: Any, monkeypatch: Any, window_width: int
+) -> None:
+    from PyQt5.QtGui import QFontMetricsF
+
+    monkeypatch.setattr(sys.modules[__name__], "WIDTH", window_width)
+    intro = (
+        "Голосовой ввод для Astra Linux.\n"
+        "Распознавание работает локально на этом компьютере —\n"
+        "записи никуда не отправляются."
+    )
+
+    def inspect(root: Any) -> None:
+        labels = [
+            item
+            for item in visual_tree(root)
+            if item.isVisible() and item.property("text") == intro
+        ]
+        assert len(labels) == 1, (window_width, len(labels))
+        label = labels[0]
+        line_count = int(label.property("lineCount"))
+        text_width = label.width()
+        metrics = QFontMetricsF(label.property("font"))
+        longest_line_width = max(metrics.horizontalAdvance(line) for line in intro.split("\n"))
+        print(
+            f"network intro {window_width}px: lineCount={line_count}, "
+            f"longest line={longest_line_width:.1f}px, Text.width={text_width:.1f}px, "
+            f"shortfall={longest_line_width - text_width:.1f}px"
+        )
+        assert line_count == 3, (window_width, line_count, longest_line_width, text_width)
+
+    fake = FakeOnboarding()
+    fake.step = 1
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, f"network intro at {window_width}")
+
+
+def test_onboarding_body_scrolls_twelve_models_and_resets(
+    onboarding_app: Any, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "HEIGHT", 250)
+    fake = FakeOnboarding()
+    fake.step = 2
+    fake.models = [{**fake.models[0], "id": f"model-{index}"} for index in range(12)]
+
+    def inspect(root: Any) -> None:
+        body = next(item for item in visual_tree(root) if item.objectName() == "onboardingBody")
+        maximum = body.property("contentHeight") - body.height()
+        assert maximum > 0
+        assert body.property("contentY") == 0
+
+        assert body.setProperty("contentY", maximum)
+        onboarding_app.processEvents()
+        assert abs(body.property("contentY") - maximum) < 1
+
+        assert body.setProperty("contentY", 0)
+        onboarding_app.processEvents()
+        cards = [item for item in visual_tree(root) if item.property("modelId")]
+        assert len(cards) == 12
+        first = cards[0]
+        point = first.mapToScene(QPointF(first.width() / 2, first.height() / 2)).toPoint()
+        wheel = QWheelEvent(
+            QPointF(point),
+            QPointF(root.window().mapToGlobal(point)),
+            QPoint(),
+            QPoint(0, -120),
+            Qt.NoButton,
+            Qt.NoModifier,
+            Qt.NoScrollPhase,
+            False,
+        )
+        QGuiApplication.sendEvent(root.window(), wheel)
+        QTest.qWait(200)
+        onboarding_app.processEvents()
+        assert body.property("contentY") > 0
+
+        assert body.setProperty("contentY", 0)
+        cards[-2].forceActiveFocus()
+        QTest.keyClick(root.window(), Qt.Key_Tab)
+        onboarding_app.processEvents()
+        assert root.window().activeFocusItem() == cards[-1]
+        top = cards[-1].mapToItem(body, QPointF(0, 0)).y()
+        assert top >= -0.5
+        assert top + cards[-1].height() <= body.height() + 0.5
+
+        assert body.setProperty("contentY", maximum)
+        onboarding_app.processEvents()
+        assert body.property("contentY") > 0
+        fake.step = 3
+        onboarding_app.processEvents()
+        assert body.property("contentY") == 0
+        assert body.property("contentHeight") > body.height()
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, "onboarding body scroll and focus")
+
+
+@pytest.mark.parametrize(
+    ("key", "modifiers", "forward"),
+    [
+        (Qt.Key_Tab, Qt.NoModifier, True),
+        (Qt.Key_Backtab, Qt.NoModifier, False),
+        (Qt.Key_Backtab, Qt.ShiftModifier, False),
+        (Qt.Key_Tab, Qt.ShiftModifier, False),
+    ],
+    ids=["tab", "backtab", "shift-backtab", "shift-tab"],
+)
+def test_onboarding_mouse_focus_does_not_scroll_but_tab_does(
+    onboarding_app: Any, key: Any, modifiers: Any, forward: bool
+) -> None:
+    fake = FakeOnboarding()
+    fake.step = 2
+    fake.models = [{**fake.models[0], "id": f"model-{index}"} for index in range(12)]
+
+    def inspect(root: Any) -> None:
+        body = next(item for item in visual_tree(root) if item.objectName() == "onboardingBody")
+        cards = [item for item in visual_tree(root) if item.property("modelId")]
+        assert len(cards) == 12
+        card = cards[5]
+        card_y = card.mapToItem(body, QPointF(0, 0)).y()
+        # Половина карточки остаётся видимой у нижнего/верхнего края тела.
+        scroll_y = card_y + card.height() / 2 - (body.height() if forward else 0)
+        assert 0 < scroll_y < body.property("contentHeight") - body.height()
+        assert body.setProperty("contentY", scroll_y)
+        onboarding_app.processEvents()
+        click_y = card.height() / 4 if forward else card.height() * 3 / 4
+        point = card.mapToScene(QPointF(card.width() / 2, click_y)).toPoint()
+        QTest.mouseClick(root.window(), Qt.LeftButton, Qt.NoModifier, point)
+        onboarding_app.processEvents()
+        assert root.window().activeFocusItem() == card
+        assert abs(body.property("contentY") - scroll_y) < 0.5
+
+        neighbor = cards[4] if forward else cards[6]
+        neighbor.forceActiveFocus()
+        onboarding_app.processEvents()
+        assert abs(body.property("contentY") - scroll_y) < 0.5
+        target = neighbor.nextItemInFocusChain(forward)
+        assert target == card
+        before_top = target.mapToItem(body, QPointF(0, 0)).y()
+        assert before_top + target.height() > body.height() if forward else before_top < 0
+        focus_changes = QSignalSpy(root.window().activeFocusItemChanged)
+        QTest.keyClick(root.window(), key, modifiers)
+        onboarding_app.processEvents()
+        assert len(focus_changes) == 1, "Tab перевёл фокус больше одного раза"
+        assert root.window().activeFocusItem() == target
+        assert abs(body.property("contentY") - scroll_y) > 1
+        top = target.mapToItem(body, QPointF(0, 0)).y()
+        assert top >= -0.5
+        assert top + target.height() <= body.height() + 0.5
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, "onboarding mouse and keyboard focus")
+
+
+@pytest.mark.parametrize("height", [588, 620])
+@pytest.mark.parametrize("step", [1, 3, 4, 5])
+def test_onboarding_fitting_steps_do_not_scroll(
+    onboarding_app: Any, monkeypatch: Any, step: int, height: int
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "HEIGHT", height)
+    fake = FakeOnboarding()
+    fake.step = step
+
+    def inspect(root: Any) -> None:
+        body = next(item for item in visual_tree(root) if item.objectName() == "onboardingBody")
+        content_height = body.property("contentHeight")
+        assert content_height <= body.height(), (step, height, content_height, body.height())
+        assert body.property("contentY") == 0
+        scrollbars = [
+            item for item in visual_tree(body) if "ScrollBar" in item.metaObject().className()
+        ]
+        assert len(scrollbars) == 1
+        assert not scrollbars[0].isVisible()
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, f"fitting onboarding step {step} at {height}")
+
+
 def test_settings_card_action_edge_and_group_gap(onboarding_app: Any) -> None:
     fake = FakeSettings()
 
@@ -3237,6 +3540,36 @@ def test_capture_ignores_other_keys_and_clears_hint_on_exit(onboarding_app: Any)
 
     _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
     assert_no_messages(messages, "capture ignored keys and exit")
+
+
+def test_capture_tab_keeps_focus_in_field(onboarding_app: Any) -> None:
+    fake = FakeOnboarding()
+    fake.step = 3
+    fake.captureState = "capturing"
+
+    def inspect(root: Any) -> None:
+        view = root.window()
+        assert isinstance(view, QQuickView)
+        capture = next(item for item in visual_tree(root) if item.property("captureActive"))
+        focused = view.activeFocusItem()
+        assert focused == capture
+        assert root.property("tabShortcutsEnabled") is False
+
+        QTest.keyClick(view, Qt.Key_Tab)
+        onboarding_app.processEvents()
+        assert view.activeFocusItem() == focused
+        assert capture.property("captureHint") == (
+            "Эта клавиша не поддерживается. Выберите букву, цифру, пробел или F1–F12"
+        )
+        assert fake.calls == []
+        QTest.keyClick(view, Qt.Key_Tab, Qt.ShiftModifier)
+        onboarding_app.processEvents()
+        assert view.activeFocusItem() == focused
+        assert root.property("tabShortcutsEnabled") is False
+        assert fake.calls == []
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, "capture Tab keeps focus")
 
 
 def test_capture_caps_lock_is_silent(onboarding_app: Any) -> None:
