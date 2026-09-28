@@ -32,6 +32,7 @@ from astra_voice.core.dictation import (
 )
 from astra_voice.core.settings import Settings, is_valid_combo
 from astra_voice.core.settings import save as settings_save
+from astra_voice.platform.autostart import AutostartState
 from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui import notify
 from astra_voice.ui.formatting import (
@@ -109,6 +110,14 @@ class SettingsApply(Protocol):
     def has_sound_service(self) -> bool: ...
 
 
+class AutostartControl(Protocol):
+    """Filesystem autostart control injected by the application."""
+
+    def state(self) -> AutostartState: ...
+
+    def set_enabled(self, enabled: bool) -> None: ...
+
+
 _DEFAULT_DEVICE = {"id": "", "name": "Системный по умолчанию"}
 
 
@@ -168,6 +177,7 @@ class SettingsBridge(QObject):
         downloads: ModelDownloads | None = None,
         locked: Iterable[str] = (),
         apply: SettingsApply | None = None,
+        autostart: AutostartControl | None = None,
         capture_host: CaptureHost | None = None,
         capture: HotkeyCapture | None = None,
         save: Callable[[Settings], None] = settings_save,
@@ -186,11 +196,13 @@ class SettingsBridge(QObject):
         self._devices: list[dict[str, str]] = [_DEFAULT_DEVICE.copy()]
         self._locked = frozenset(locked)
         self._apply = apply
+        self._autostart = autostart
         self._capture = capture if capture is not None else HotkeyCapture(capture_host, self)
         for name in ("captureState", "captureMessage", "pendingCombo", "freeCandidates"):
             getattr(self._capture, name + "Changed").connect(getattr(self, name + "Changed"))
         self._save = save
         self._values = self._read_values()
+        self._sync_autostart()
         self._hotkey_status = "ok"
         self._save_error = ""
         self._model_selfcheck = "idle"
@@ -423,6 +435,58 @@ class SettingsBridge(QObject):
             for name, field in self._FIELDS.items()
         }
 
+    def _sync_autostart(self) -> None:
+        # До завершения мастера отсутствие записи XDG ожидаемо: сохраняем выбор
+        # мастера, чтобы finish() мог применить автозапуск по умолчанию.
+        if self._autostart is None or self._settings.extra.get("onboarding_done") is not True:
+            return
+        try:
+            actual = self._autostart.state().enabled
+            if self.is_locked("autostart"):
+                if actual != self._values["autostart"]:
+                    log.warning("Автозапуск: запись XDG расходится с политикой администратора")
+                return
+            self._update_autostart(actual, persist=actual != self._settings.autostart)
+        except OSError:
+            log.warning("Не удалось синхронизировать настройку автозапуска", exc_info=True)
+
+    def _update_autostart(self, actual: bool, *, persist: bool) -> None:
+        changed = self._values["autostart"] != actual
+        self._settings.autostart = actual
+        if self._mirror is not None:
+            self._mirror.autostart = actual
+        self._values["autostart"] = actual
+        if persist:
+            try:
+                self._save(self._settings)
+            except OSError:
+                log.warning("Не удалось сохранить настройку автозапуска", exc_info=True)
+        if changed:
+            self.autostartChanged.emit()
+
+    def ensure_autostart_after_onboarding(self) -> None:
+        """Apply the onboarding choice after its completion was saved."""
+        if self._autostart is None or self.is_locked("autostart"):
+            return
+        try:
+            state = self._autostart.state()
+            if self._settings.autostart and state.user == "none" and not state.system:
+                self._autostart.set_enabled(True)
+            else:
+                self._update_autostart(
+                    state.enabled, persist=state.enabled != self._settings.autostart
+                )
+        except OSError:
+            log.warning("Не удалось включить автозапуск после онбординга", exc_info=True)
+            try:
+                actual = self._autostart.state().enabled
+            except OSError:
+                log.warning("Не удалось прочитать автозапуск после ошибки", exc_info=True)
+                actual = False
+            self._update_autostart(actual, persist=True)
+            self._save_error = "Не удалось изменить автозапуск"
+            self.saveErrorChanged.emit()
+
     def set_extra(self, key: str, value: object) -> bool:
         """Сохраняет дополнительную настройку; зеркало меняется только после записи."""
         present = key in self._settings.extra
@@ -468,6 +532,15 @@ class SettingsBridge(QObject):
             log.warning("hotkey=%r недопустим, смена режима отменена", self.hotkey)
             self.hotkeyModeChanged.emit()
             return
+        if name == "autostart" and self._autostart is not None:
+            try:
+                self._autostart.set_enabled(cast(bool, value))
+            except OSError:
+                log.warning("Не удалось изменить автозапуск", exc_info=True)
+                self._save_error = "Не удалось изменить автозапуск"
+                self.autostartChanged.emit()
+                self.saveErrorChanged.emit()
+                return
         device_present = "device" in self._settings.extra
         old = (
             self._settings.extra.get("device")
@@ -493,6 +566,7 @@ class SettingsBridge(QObject):
         else:
             setattr(self._settings, field, value)
         try:
+            # При ошибке сохранения состояние автозапуска остаётся равным XDG.
             self._save(self._settings)
         except OSError:
             if hotkey_apply is not None:
@@ -502,8 +576,12 @@ class SettingsBridge(QObject):
                     self._settings.extra["device"] = old
                 else:
                     self._settings.extra.pop("device", None)
-            else:
+            elif name != "autostart" or self._autostart is None:
                 setattr(self._settings, field, old)
+            if name == "autostart" and self._autostart is not None:
+                if self._mirror is not None:
+                    self._mirror.autostart = cast(bool, value)
+                self._values[name] = value
             self._save_error = "Не удалось сохранить настройки"
             log.warning("Не удалось сохранить настройки")
             getattr(self, name + "Changed").emit()
@@ -1579,6 +1657,7 @@ class OnboardingController(QObject):
             return
         if not self._bridge.set_extra("onboarding_done", True):
             return
+        self._bridge.ensure_autostart_after_onboarding()
         self._clear_test()
         if self.captureState == "capturing":
             self.cancelCapture()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import signal
 from pathlib import Path
@@ -20,6 +21,7 @@ from astra_voice.core.policy import Policy
 from astra_voice.core.policy import load as load_policy
 from astra_voice.core.settings import Settings
 from astra_voice.models.store import ModelStore, StoreError
+from astra_voice.platform import autostart
 from astra_voice.platform.session import SessionKind
 from astra_voice.runtime import DictationRuntime
 from astra_voice.ui import model_downloads, notify
@@ -51,6 +53,7 @@ class Rig:
         self.factory = Mock(return_value=self.runtime)
         self.signals = Mock()
         self.settings = Settings(hotkey="Alt+Space")
+        self.autostart_enabled = self.settings.autostart
         self.calls.attach_mock(self.runtime.start, "start")
         self.calls.attach_mock(self.app.exec_, "exec")
         self.calls.attach_mock(self.app.quit, "quit")
@@ -90,7 +93,22 @@ class Rig:
 
 @pytest.fixture
 def rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Rig:
-    return Rig(monkeypatch, tmp_path)
+    instance = Rig(monkeypatch, tmp_path)
+
+    def state() -> autostart.AutostartState:
+        return autostart.AutostartState(
+            instance.autostart_enabled,
+            "ours" if instance.autostart_enabled else "none",
+            False,
+            False,
+        )
+
+    def set_enabled(enabled: bool) -> None:
+        instance.autostart_enabled = enabled
+
+    monkeypatch.setattr(autostart, "state", state)
+    monkeypatch.setattr(autostart, "set_enabled", set_enabled)
+    return instance
 
 
 @pytest.mark.parametrize("debug", [False, True])
@@ -268,6 +286,21 @@ def test_explicit_policy_lock_rejects_hotkey_change_through_main_bridge(
     assert paths_mod.settings_path().read_bytes() == saved
     assert len(spy) == 1
     rig.runtime.apply_hotkey.assert_not_called()
+
+
+def test_main_syncs_missing_autostart_entry_after_onboarding(rig: Rig) -> None:
+    """T-147: main() сохраняет отсутствие записи автозапуска после онбординга."""
+    rig.settings.extra["onboarding_done"] = True
+    assert rig.settings.autostart is True
+    rig.autostart_enabled = False
+    settings_mod.save(rig.settings)
+    assert json.loads(paths_mod.settings_path().read_text(encoding="utf-8"))["autostart"] is True
+
+    assert app_mod.main([]) == 7
+
+    assert rig.settings.autostart is False
+    assert rig.factory.call_args.kwargs["settings"].autostart is False
+    assert json.loads(paths_mod.settings_path().read_text(encoding="utf-8"))["autostart"] is False
 
 
 @pytest.mark.parametrize(

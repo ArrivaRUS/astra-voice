@@ -49,6 +49,8 @@ from astra_voice.models.downloader import Downloader, DownloadError, Progress
 from astra_voice.models.installer import InstallResult, ReasonCode
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net.http import NetworkError
+from astra_voice.platform import autostart as autostart_mod
+from astra_voice.platform.autostart import AutostartState
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
 from astra_voice.platform.paste import PasteMode
 from astra_voice.platform.session import SessionKind
@@ -75,6 +77,203 @@ from astra_voice.worker import ipc
 from astra_voice.worker.audio import AudioDevice, AudioError
 
 pytestmark = pytest.mark.unit
+
+
+def _autostart_state(enabled: bool) -> AutostartState:
+    return AutostartState(enabled, "none", False, False)
+
+
+def test_autostart_initial_state_syncs_without_writing_files() -> None:
+    """T-139/T-146: after onboarding, XDG wins over the saved preference."""
+    settings = Settings(autostart=True, extra={"onboarding_done": True})
+    mirror = Settings(autostart=True, extra={"onboarding_done": True})
+    control = Mock()
+    control.state.return_value = _autostart_state(False)
+    save = Mock()
+    bridge = SettingsBridge(settings, mirror=mirror, autostart=control, save=save)
+    assert bridge.autostart is settings.autostart is mirror.autostart is False
+    save.assert_called_once_with(settings)
+    control.set_enabled.assert_not_called()
+
+
+def test_autostart_toggle_uses_control() -> None:
+    """T-140: a successful toggle changes XDG before saving settings."""
+    settings = Settings(autostart=False)
+    control = Mock()
+    control.state.return_value = _autostart_state(False)
+    save = Mock()
+    bridge = SettingsBridge(settings, autostart=control, save=save)
+    set_qt_property(bridge, "autostart", True)
+    control.set_enabled.assert_called_once_with(True)
+    assert bridge.autostart is settings.autostart is True
+    save.assert_called_once_with(settings)
+
+
+def test_autostart_toggle_error_restores_switch() -> None:
+    """T-141: an XDG failure leaves settings unchanged and reports a plain error."""
+    settings = Settings(autostart=False)
+    control = Mock()
+    control.state.return_value = _autostart_state(False)
+    control.set_enabled.side_effect = OSError("private path")
+    save = Mock()
+    bridge = SettingsBridge(settings, autostart=control, save=save)
+    changed = QSignalSpy(bridge.autostartChanged)
+    errors = QSignalSpy(bridge.saveErrorChanged)
+    set_qt_property(bridge, "autostart", True)
+    assert bridge.autostart is settings.autostart is False
+    assert bridge.saveError == "Не удалось изменить автозапуск"
+    assert len(changed) == len(errors) == 1
+    save.assert_not_called()
+
+
+def test_autostart_policy_does_not_write() -> None:
+    """T-142: a locked autostart keeps the policy value and never writes XDG."""
+    settings = Settings(autostart=False)
+    mirror = Settings(autostart=True)
+    control = Mock()
+    control.state.return_value = _autostart_state(False)
+    save = Mock()
+    bridge = SettingsBridge(
+        settings, mirror=mirror, locked=["autostart"], autostart=control, save=save
+    )
+    set_qt_property(bridge, "autostart", False)
+    assert bridge.autostart is True
+    control.set_enabled.assert_not_called()
+    save.assert_not_called()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_onboarding_finish_applies_autostart(fails: bool) -> None:
+    """T-143: absent XDG entry keeps the default until onboarding enables it."""
+    settings = Settings(extra={"onboarding_language_set": True, "onboarding_model_ready": True})
+    control = Mock()
+    control.state.return_value = _autostart_state(False)
+    if fails:
+        control.set_enabled.side_effect = OSError("private path")
+    save = Mock()
+    bridge = SettingsBridge(settings, autostart=control, save=save)
+    assert bridge.autostart is settings.autostart is True
+    assert "onboarding_done" not in settings.extra
+    control.state.assert_not_called()
+    save.assert_not_called()
+    controller = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
+    changed = QSignalSpy(bridge.autostartChanged)
+    errors = QSignalSpy(bridge.saveErrorChanged)
+    controller.finish()
+    assert controller.done is True
+    assert settings.extra["onboarding_done"] is True
+    assert bridge.autostart is settings.autostart is (not fails)
+    assert save.call_count == (2 if fails else 1)
+    assert control.state.call_count == (2 if fails else 1)
+    control.set_enabled.assert_called_once_with(True)
+    assert len(changed) == len(errors) == int(fails)
+    assert bridge.saveError == ("Не удалось изменить автозапуск" if fails else "")
+
+
+def test_onboarding_autostart_failure_with_unreadable_state() -> None:
+    """T-158: onboarding reports an autostart failure when state becomes unreadable."""
+    settings = Settings(extra={"onboarding_language_set": True, "onboarding_model_ready": True})
+    mirror = Settings(autostart=True)
+    control = Mock()
+    control.state.side_effect = [_autostart_state(False), OSError("unreadable")]
+    control.set_enabled.side_effect = OSError("write failed")
+    save = Mock()
+    bridge = SettingsBridge(settings, mirror=mirror, autostart=control, save=save)
+    changed = QSignalSpy(bridge.autostartChanged)
+    errors = QSignalSpy(bridge.saveErrorChanged)
+    controller = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
+    controller.finish()
+    assert controller.done is True
+    assert bridge.autostart is settings.autostart is mirror.autostart is False
+    assert bridge.saveError == "Не удалось изменить автозапуск"
+    assert len(changed) == len(errors) == 1
+    assert save.call_count == 2
+
+
+@pytest.fixture
+def real_autostart_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    user = tmp_path / "user"
+    system = tmp_path / "system"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user))
+    monkeypatch.setenv("XDG_CONFIG_DIRS", str(system))
+    return user / "autostart/astra-voice.desktop", system / "autostart/astra-voice.desktop"
+
+
+@pytest.mark.parametrize("with_system", [False, True])
+def test_onboarding_keeps_hidden_entry(
+    real_autostart_paths: tuple[Path, Path], with_system: bool
+) -> None:
+    """T-159: onboarding preserves a hidden user entry and its system counterpart."""
+    user, system = real_autostart_paths
+    user.parent.mkdir(parents=True)
+    original = b"[Desktop Entry]\nExec=custom --hidden\nHidden=true\n"
+    user.write_bytes(original)
+    system_content = b"[Desktop Entry]\nExec=system --hidden\n"
+    if with_system:
+        system.parent.mkdir(parents=True)
+        system.write_bytes(system_content)
+    settings = Settings(extra={"onboarding_language_set": True, "onboarding_model_ready": True})
+    mirror = Settings(autostart=True)
+    save = Mock()
+    bridge = SettingsBridge(settings, mirror=mirror, autostart=autostart_mod, save=save)
+    changed = QSignalSpy(bridge.autostartChanged)
+    OnboardingController(bridge, settings=settings, device_provider=lambda: []).finish()
+    assert user.read_bytes() == original
+    if with_system:
+        assert system.read_bytes() == system_content
+    assert bridge.autostart is settings.autostart is mirror.autostart is False
+    assert len(changed) == 1
+    assert save.call_count == 2
+
+
+def test_onboarding_creates_entry_when_absent(real_autostart_paths: tuple[Path, Path]) -> None:
+    """T-160: onboarding creates a managed entry when none exists."""
+    user, _ = real_autostart_paths
+    settings = Settings(extra={"onboarding_language_set": True, "onboarding_model_ready": True})
+    bridge = SettingsBridge(settings, autostart=autostart_mod, save=Mock())
+    OnboardingController(bridge, settings=settings, device_provider=lambda: []).finish()
+    assert user.read_bytes() == autostart_mod._ENTRY
+    assert bridge.autostart is True
+
+
+def test_autostart_save_failure_keeps_xdg_value(real_autostart_paths: tuple[Path, Path]) -> None:
+    """T-161: a settings save failure keeps the applied XDG autostart value."""
+    user, _ = real_autostart_paths
+    settings = Settings(autostart=False)
+    mirror = Settings(autostart=False)
+    save = Mock(side_effect=OSError("disk full"))
+    bridge = SettingsBridge(settings, mirror=mirror, autostart=autostart_mod, save=save)
+    changed = QSignalSpy(bridge.autostartChanged)
+    errors = QSignalSpy(bridge.saveErrorChanged)
+    set_qt_property(bridge, "autostart", True)
+    assert user.read_bytes() == autostart_mod._ENTRY
+    assert bridge.autostart is settings.autostart is mirror.autostart is True
+    assert bridge.saveError == "Не удалось сохранить настройки"
+    assert len(changed) == len(errors) == 1
+
+
+def test_locked_autostart_sync_does_not_save(
+    real_autostart_paths: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T-162: syncing locked autostart does not save settings."""
+    user, _ = real_autostart_paths
+    user.parent.mkdir(parents=True)
+    user.write_bytes(b"[Desktop Entry]\nHidden=true\n")
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(paths, "settings_path", lambda: settings_file)
+    settings = Settings(autostart=True, extra={"onboarding_done": True})
+    mirror = Settings(autostart=True)
+    bridge = SettingsBridge(
+        settings,
+        mirror=mirror,
+        locked=["autostart"],
+        autostart=autostart_mod,
+        save=settings_mod.save,
+    )
+    assert bridge.autostart is True
+    assert not settings_file.exists()
 
 
 @pytest.fixture(scope="module", autouse=True)

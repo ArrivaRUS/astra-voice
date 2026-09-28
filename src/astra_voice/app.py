@@ -921,6 +921,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         from PyQt5.QtQml import QQmlEngine
 
+        from astra_voice.platform import autostart
         from astra_voice.ui.bridges import OnboardingController, SettingsBridge
 
         if (
@@ -958,6 +959,7 @@ def main(argv: list[str] | None = None) -> int:
             apply=_RuntimeSettingsApply(runtime) if runtime_ready and runtime is not None else None,
             capture=capture,
             locked=policy.locked_keys,
+            autostart=autostart,
         )
         QQmlEngine.setObjectOwnership(settings_bridge, QQmlEngine.CppOwnership)
         _set_context_property(shell, "settingsBridge", settings_bridge)
