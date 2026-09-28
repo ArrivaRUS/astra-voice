@@ -41,7 +41,13 @@ from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
 from astra_voice.core.version import __version__
 from astra_voice.models import catalog_state
-from astra_voice.models.catalog import CatalogEntry, CatalogError, load_builtin, merge_measurement
+from astra_voice.models.catalog import (
+    CatalogEntry,
+    CatalogError,
+    load_builtin,
+    merge_measurement,
+)
+from astra_voice.models.catalog import catalog_rtfx as _catalog_rtfx
 from astra_voice.models.downloader import (
     Downloader,
     DownloadError,
@@ -102,6 +108,8 @@ _CURRENT_FAILED_MESSAGE = (
 _REMOVE_FAILED_MESSAGE = "Не удалось удалить модель. Попробуйте ещё раз."
 _SWITCH_FAILED_MESSAGE = "Не удалось загрузить модель. Рабочая модель не изменилась."
 _FIRST_SWITCH_FAILED_MESSAGE = "Не удалось загрузить модель. Попробуйте ещё раз."
+# Самопроверка верной модели не уложилась в срок; секунды — только в журнале.
+_SWITCH_TOO_SLOW_MESSAGE = "Модель слишком медленная для этого компьютера"
 _REMOVED_HINT = "Снята с каталога — обновлений не будет"
 _FAILURE_MESSAGES = {
     "admin": "Не удалось загрузить модель — скачивание запрещено администратором",
@@ -385,6 +393,8 @@ class ModelPort(Protocol):
 class SwitchPort(Protocol):
     """Переключение загруженной модели после завершения текущей диктовки."""
 
+    # Результат: "ok", "failed" или "too-slow" — верная модель не уложилась
+    # в срок самопроверки на этом компьютере.
     on_switch_finished: Callable[[str], None] | None
 
     def can_switch_without_pause(self, min_ram_mb: int) -> bool: ...
@@ -498,6 +508,10 @@ class ModelService:
     def revoked_revision(self, model_id: str, revision: str) -> bool:
         """То же по паре «модель, ревизия» — для проверки перед загрузкой моделью."""
         return self._catalog.is_revoked(model_id, revision)
+
+    def catalog_rtfx(self, model_id: str) -> float | None:
+        """Опубликованная скорость модели (RTFx) или None, если её нет в каталоге."""
+        return _catalog_rtfx(self._catalog.entries, model_id)
 
     def entries(self) -> tuple[CatalogEntry, ...]:
         # Отозванную ревизию не предлагаем, но уже установленную показываем:
@@ -1768,9 +1782,12 @@ class ModelDownloads(QObject):
                         self._model.set_current(*previous)
                     except (OSError, StoreError):
                         log.warning("Не удалось восстановить прежнюю рабочую модель")
-                message = (
-                    _SWITCH_FAILED_MESSAGE if previous is not None else _FIRST_SWITCH_FAILED_MESSAGE
-                )
+                if result == "too-slow":
+                    message = _SWITCH_TOO_SLOW_MESSAGE
+                elif previous is not None:
+                    message = _SWITCH_FAILED_MESSAGE
+                else:
+                    message = _FIRST_SWITCH_FAILED_MESSAGE
                 available = None
                 reader = getattr(self._switcher, "mem_available_mb", None)
                 if callable(reader):
@@ -1778,7 +1795,8 @@ class ModelDownloads(QObject):
                         available = reader()
                     except Exception:
                         log.warning("Не удалось определить доступную память после переключения")
-                if available is not None and available < entry.min_ram_mb:
+                # Медленная модель загрузилась: память, занятая ею же, не причина.
+                if result != "too-slow" and available is not None and available < entry.min_ram_mb:
                     if entry.removed_from_catalog:
                         message = "Недостаточно памяти для этой модели"
                     else:

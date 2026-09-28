@@ -52,7 +52,13 @@ from astra_voice.core import (  # noqa: E402
 )
 from astra_voice.core.model_source import smoke_matches, smoke_wav_path  # noqa: E402
 from astra_voice.core.stats import Stats, percentile  # noqa: E402
-from astra_voice.models.catalog import ID_RE, Catalog, CatalogEntry, load_builtin  # noqa: E402
+from astra_voice.models.catalog import (  # noqa: E402
+    ID_RE,
+    Catalog,
+    CatalogEntry,
+    catalog_rtfx,
+    load_builtin,
+)
 from astra_voice.models.store import ModelRecord, ModelStore  # noqa: E402
 from astra_voice.platform.hotkey import (  # noqa: E402
     PTT_THRESHOLD_S,
@@ -69,7 +75,9 @@ CANCEL_LIMIT_MS = 1000.0
 SILENT_LIMIT_MS = 2200.0
 CATALOG_MODEL_TIMEOUT_S = 120.0
 CATALOG_LOAD_TIMEOUT_S = 60.0
-CATALOG_SELFCHECK_TIMEOUT_S = 60.0
+# Две попытки «загрузка (до 10 с) + самопроверка (до runtime.SELFCHECK_MAX_S = 30 с)»
+# и запас на запуск воркера: медленная модель успевает дойти до вердикта рантайма.
+CATALOG_SELFCHECK_TIMEOUT_S = 2 * (10.0 + 30.0) + 30.0
 CATALOG_SWITCH_TIMEOUT_S = 180.0
 
 
@@ -1733,12 +1741,17 @@ def catalog_runtime_settings() -> Any:
     return policy.effective(stored, policy.load())
 
 
-def make_catalog_runtime(store: ModelStore, *, supervisor_factory: Any = WorkerSupervisor) -> Any:
+def make_catalog_runtime(
+    store: ModelStore,
+    *,
+    supervisor_factory: Any = WorkerSupervisor,
+    entries: tuple[CatalogEntry, ...] = (),
+) -> Any:
     """Собирает настоящий рантайм с настоящим воркером и пустыми UI-портами."""
     from astra_voice.platform.session import SessionKind
     from astra_voice.runtime import DictationRuntime
 
-    return DictationRuntime(
+    runtime = DictationRuntime(
         settings=catalog_runtime_settings(),
         session_kind=SessionKind.OTHER,
         model_store=store,
@@ -1755,6 +1768,9 @@ def make_catalog_runtime(store: ModelStore, *, supervisor_factory: Any = WorkerS
         paste_func=lambda *args: None,
         restore_paste=lambda: False,
     )
+    # Дедлайн самопроверки — по скорости из каталога, как в приложении.
+    runtime.set_catalog_rtfx(lambda model_id: catalog_rtfx(entries, model_id))
+    return runtime
 
 
 def catalog_switch(
@@ -1874,7 +1890,7 @@ def catalog_switch(
             patch("astra_voice.runtime.paths.measurements_path", return_value=None),
         ):
             try:
-                runtime = make_catalog_runtime(store)
+                runtime = make_catalog_runtime(store, entries=entries)
                 runtime.start()
                 model_a = (entry_a.id, entry_a.revision)
 

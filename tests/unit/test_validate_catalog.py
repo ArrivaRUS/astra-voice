@@ -8,14 +8,16 @@ import runpy
 import signal
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-from astra_voice.models.catalog import CatalogEntry
+from astra_voice.models.catalog import CatalogEntry, Metric, Metrics
 from astra_voice.models.store import ModelStore
+from astra_voice.runtime import SELFCHECK_MAX_S
 
 pytestmark = pytest.mark.unit
 
@@ -281,10 +283,21 @@ def test_runtime_stubs_construct_without_worker(
             self.state = "stopped"
 
     monkeypatch.setattr("astra_voice.runtime.notify", validate["CatalogNotify"]())
+    whisper = replace(
+        entry("whisper"),
+        layout="onnx-community-whisper",
+        metrics=Metrics(rtfx=Metric(3.9, "https://example.org")),
+    )
     runtime = validate["make_catalog_runtime"](
-        store, supervisor_factory=lambda **kwargs: FakeSupervisor(**kwargs)
+        store,
+        supervisor_factory=lambda **kwargs: FakeSupervisor(**kwargs),
+        entries=(entry("gigaam"), whisper),
     )
     assert isinstance(runtime.supervisor, FakeSupervisor)
+    # Скорость из каталога доходит до дедлайна самопроверки, как в приложении.
+    assert runtime._catalog_rtfx("whisper") == 3.9
+    assert runtime._catalog_rtfx("gigaam") is None
+    assert validate["CATALOG_SELFCHECK_TIMEOUT_S"] >= 2 * (10.0 + SELFCHECK_MAX_S)
     runtime.shutdown()
     assert runtime.supervisor.state == "stopped"
 
@@ -349,7 +362,7 @@ def test_switch_uses_runtime_callback_and_restores_original_current(
             self.closed = True
 
     runtime = FakeRuntime()
-    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store: runtime)
+    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store, **kwargs: runtime)
     args = SimpleNamespace(from_ref=("a", "r1"), to_ref=("b", "r1"))
     code, facts = validate["catalog_switch"](args, entries, store)
     assert code == expected
@@ -396,7 +409,7 @@ def test_switch_start_exception_is_safe_and_restores_selection(
         def shutdown(self) -> None:
             pass
 
-    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store: FailingRuntime())
+    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store, **kwargs: FailingRuntime())
     for output_format in ([], ["--json"]):
         code = validate["main"](
             [
@@ -458,7 +471,7 @@ def test_switch_timeout_is_failure_and_restores_selection(
             self.supervisor.process.stopped = True
 
     runtime = FakeRuntime()
-    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store: runtime)
+    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store, **kwargs: runtime)
     monkeypatch.setitem(validate, "CATALOG_SWITCH_TIMEOUT_S", 0.01)
     code, facts = validate["catalog_switch"](
         SimpleNamespace(from_ref=("a", "r1"), to_ref=("b", "r1")), entries, store
@@ -498,7 +511,7 @@ def test_switch_start_interrupt_restores_selection_and_handlers(
         def shutdown(self) -> None:
             pass
 
-    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store: FakeRuntime())
+    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store, **kwargs: FakeRuntime())
     code, facts = validate["catalog_switch"](
         SimpleNamespace(from_ref=("a", "r1"), to_ref=("b", "r1")), entries, store
     )
@@ -549,7 +562,7 @@ def test_loaded_model_controls_switch_result(
         def shutdown(self) -> None:
             self.supervisor.process.stopped = True
 
-    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store: Runtime())
+    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store, **kwargs: Runtime())
     code, facts = validate["catalog_switch"](
         SimpleNamespace(from_ref=("a", "r1"), to_ref=("b", "r1")), entries, store
     )
@@ -694,7 +707,7 @@ def test_restore_failure_is_safe_and_hides_path(
         def shutdown(self) -> None:
             pass
 
-    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store: FailingRuntime())
+    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store, **kwargs: FailingRuntime())
     real_replace = os.replace
     real_unlink = Path.unlink
     secret_path = "/private/secret/model.json"
@@ -767,7 +780,7 @@ def test_interrupt_during_restore_does_not_escape(
         def shutdown(self) -> None:
             pass
 
-    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store: FailingRuntime())
+    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store, **kwargs: FailingRuntime())
     monkeypatch.setattr(os, "replace", interrupt_restore)
     code, facts = validate["catalog_switch"](
         SimpleNamespace(from_ref=("a", "r1"), to_ref=("b", "r1")), entries, store
@@ -813,7 +826,7 @@ def test_load_a_fails_early_and_restores_current(
         def shutdown(self) -> None:
             pass
 
-    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store: FailedRuntime())
+    monkeypatch.setitem(validate, "make_catalog_runtime", lambda store, **kwargs: FailedRuntime())
     started = time.monotonic()
     code, facts = validate["catalog_switch"](
         SimpleNamespace(from_ref=("a", "r1"), to_ref=("b", "r1")), entries, store

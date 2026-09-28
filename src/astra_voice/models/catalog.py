@@ -11,7 +11,7 @@ import posixpath
 import re
 import stat
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -127,6 +127,13 @@ class Catalog:
         return any(
             entry.model_id == model_id and entry.revision == revision for entry in self.revoked
         )
+
+
+def catalog_rtfx(entries: Iterable[CatalogEntry], model_id: str) -> float | None:
+    """Опубликованная скорость модели (RTFx) или None, если её нет в каталоге."""
+    entry = next((item for item in entries if item.id == model_id), None)
+    metric = None if entry is None else entry.metrics.rtfx
+    return None if metric is None else metric.value
 
 
 def measured_rtfx(local: Mapping[str, Any]) -> float | None:
