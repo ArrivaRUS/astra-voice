@@ -15,7 +15,7 @@ from unittest.mock import Mock, call
 
 import pytest
 from PyQt5 import sip
-from PyQt5.QtCore import QCoreApplication, QEvent
+from PyQt5.QtCore import QCoreApplication, QEvent, Qt
 from PyQt5.QtCore import QTimer as QtTimer
 from PyQt5.QtDBus import QDBusMessage, QDBusVariant
 from PyQt5.QtWidgets import QSystemTrayIcon
@@ -1540,6 +1540,39 @@ def test_real_worker_delivers_to_gui_and_cleans_up(
         wait_for(qapp, lambda: not module._bus_threads)
     harness.connection.disconnectFromBus.assert_called_once()
     assert cleanup_threads and gui_thread not in cleanup_threads
+
+
+def test_bus_worker_is_destroyed_in_gui_thread(
+    harness: Harness,
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ~QObject воркера в потоке шины берёт GIL под мьютексом сигналов Qt,
+    # а GUI под GIL ждёт тот же мьютекс: удалять воркер можно только в GUI.
+    from astra_voice.ui import tray as module
+
+    harness.start_worker.side_effect = _start_bus_worker
+    monkeypatch.setattr(module, "QTimer", QtTimer)
+    gui_thread = get_ident()
+    destroyed_in: list[int] = []
+
+    def record(*args: object) -> None:
+        destroyed_in.append(get_ident())
+
+    try:
+        harness.tray.start()
+        wait_for(qapp, lambda: harness.tray.registered)
+        worker = harness.start_worker.call_args[0][0]
+        assert module._bus_threads.get(worker) is not None
+        worker.destroyed.connect(record, Qt.DirectConnection)
+        del worker
+        harness.tray.stop()
+        wait_for(qapp, lambda: not module._bus_threads)
+    finally:
+        harness.tray.stop()
+        wait_for(qapp, lambda: not module._bus_threads)
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert destroyed_in == [gui_thread]
 
 
 def test_download_status_menu_item(harness: Harness) -> None:
