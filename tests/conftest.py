@@ -166,7 +166,13 @@ def check_pulseaudio_processes(
         )
 
 
-_XDG_NAMES = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
+_XDG_NAMES = (
+    "XDG_CONFIG_HOME",
+    "XDG_CONFIG_DIRS",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+)
 
 
 @pytest.hookimpl(tryfirst=True)

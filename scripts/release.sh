@@ -83,8 +83,10 @@ else
     echo "Подсказка: добавьте запись через dch -v $version -D unstable или вручную; версия пакета берётся из changelog."
 fi
 if [[ -f src/astra_voice/_version.py ]]; then
-    generated=$(sed -n 's/^__version__ = ["'"']\([^"'"']*\)["'"']/\1/p' src/astra_voice/_version.py | head -n 1)
-    if [[ $generated != "$version" ]]; then
+    generated=$(sed -n "s/^__version__ = ['\"]\([^'\"]*\)['\"].*/\1/p" src/astra_voice/_version.py | head -n 1 || true)
+    if [[ -z $generated ]]; then
+        echo 'ПРЕДУПРЕЖДЕНИЕ: версия в _version.py не найдена; генерируется packaging/build-deb.sh из changelog, пересоберётся.'
+    elif [[ $generated != "$version" ]]; then
         echo "ПРЕДУПРЕЖДЕНИЕ: _version.py содержит $generated; генерируется packaging/build-deb.sh из changelog, пересоберётся."
     else
         echo 'OK: _version.py согласован с версией.'

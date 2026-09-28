@@ -159,6 +159,63 @@ def test_dry_run(repo: tuple[Path, dict[str, str]]) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "__version__ = '0.1.0~m6.1'\n",
+            "ПРЕДУПРЕЖДЕНИЕ: _version.py содержит 0.1.0~m6.1;",
+        ),
+        ('__version__ = "0.1.0"\n', "OK: _version.py согласован с версией."),
+        (
+            "# generated file without a version\n",
+            "ПРЕДУПРЕЖДЕНИЕ: версия в _version.py не найдена; генерируется "
+            "packaging/build-deb.sh из changelog, пересоберётся.",
+        ),
+    ],
+)
+def test_t130_generated_version_does_not_stop_release(
+    tmp_path: Path, source: str, expected: str
+) -> None:
+    """T-130: разбор _version.py сохраняет предупреждение или OK и доходит до проверки тега."""
+    if shutil.which("gpg") is None:
+        pytest.skip("нет gpg")
+    work = tmp_path / "work"
+    work.mkdir()
+    env = {**os.environ, "HOME": str(tmp_path), "GIT_CONFIG_GLOBAL": "/dev/null"}
+    git(work, env, "init", "-b", "main")
+    git(work, env, "config", "user.name", "Test")
+    git(work, env, "config", "user.email", "t@example.invalid")
+    (work / "scripts").mkdir()
+    shutil.copy2(ROOT / "scripts/release.sh", work / "scripts/release.sh")
+    shutil.copy2(ROOT / "scripts/check_keyring.py", work / "scripts/check_keyring.py")
+    (work / "docs").mkdir()
+    (work / "docs/INSTALL-ADMIN.md").write_text("# Test\n", encoding="utf-8")
+    (work / "data/keys").mkdir(parents=True)
+    shutil.copy2(ROOT / "data/keys/release.gpg", work / "data/keys/release.gpg")
+    security = work / "src/astra_voice/security"
+    security.mkdir(parents=True)
+    (security.parent / "__init__.py").write_text("", encoding="utf-8")
+    (security / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy2(ROOT / "src/astra_voice/security/verify.py", security / "verify.py")
+    (work / "packaging/debian").mkdir(parents=True)
+    (work / "packaging/debian/changelog").write_text(
+        "astra-voice (0.1.0) unstable; urgency=medium\n", encoding="utf-8"
+    )
+    (work / "src/astra_voice/_version.py").write_text(source, encoding="utf-8")
+    git(work, env, "add", ".")
+    git(work, env, "commit", "-m", "generated version")
+    git(work, env, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    result = run((work, env), "v0.1.0", "--dry-run", "--skip-ci-check")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert expected in result.stdout
+    assert "ПРЕДУПРЕЖДЕНИЕ: CI НЕ проверен (--skip-ci-check)" in result.stdout
+    assert "OK: локальный тег v0.1.0 свободен" in result.stdout
+    assert "dry-run: ничего не создано" in result.stdout
+
+
 def test_dirty_tree(repo: tuple[Path, dict[str, str]]) -> None:
     work, _ = repo
     (work / "new.txt").write_text("dirty", encoding="utf-8")
