@@ -903,6 +903,8 @@ def main(argv: list[str] | None = None) -> int:
                 settings=settings, session_kind=session_kind, model_store=model_store
             )
             runtime.set_revoked_check(revoked_check)
+            if model is not None:
+                runtime.set_catalog_rtfx(model.catalog_rtfx)
             runtime.on_quit_requested = app.quit
             runtime.on_show_requested = focuser.focus_shell
             runtime.tray.on_open = focuser.focus_shell

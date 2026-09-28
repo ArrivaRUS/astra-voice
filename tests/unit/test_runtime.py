@@ -72,6 +72,10 @@ from astra_voice.worker.supervisor import WorkerSupervisor
 
 pytestmark = pytest.mark.unit
 MARKER = "ГЕЛИОТРОП-7"
+GIGAAM_RTFX = 42.5
+# Сторож рантайма 3 с, супервизор ждёт на полсекунды дольше.
+SELFCHECK_SUPERVISOR_S = 3.5
+WHISPER_TURBO_RTFX = 3.9
 
 
 def test_measure_send_failure_still_saves_five_warm_runs(
@@ -325,6 +329,8 @@ class Rig:
             capture_watchdog_factory=self.capture_watchdog_factory,
             sound_factory=lambda kind: self.sound,
         )
+        # Скорость GigaAM из каталога: дедлайн самопроверки — нижняя граница.
+        self.runtime.set_catalog_rtfx(lambda model_id: GIGAAM_RTFX)
 
     def create_capture_watchdog(self) -> Mock:
         watchdog = Mock(active=False)
@@ -2892,17 +2898,16 @@ def test_selfcheck_waits_for_match_before_ready(
     checking_rig: Rig, smoke_wav: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     rig = checking_rig
-    assert module.SELFCHECK_TIMEOUT_S == 3.0
-    assert module.SELFCHECK_WATCHDOG_MS == 3000
+    assert module.SELFCHECK_MIN_S == 3.0
     rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
     rig.tray.set_model_recheck_enabled.assert_called_with(False)
     assert rig.runtime._loading_model
     assert rig.runtime._model_load_failures == 1
     rig.supervisor.send.assert_called_with(
-        {"type": "transcribe.file", "path": str(smoke_wav)}, timeout=module.SELFCHECK_TIMEOUT_S
+        {"type": "transcribe.file", "path": str(smoke_wav)}, timeout=SELFCHECK_SUPERVISOR_S
     )
     timer = rig.timers[-1]
-    assert timer.interval == module.SELFCHECK_WATCHDOG_MS
+    assert timer.interval == 3000
     rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
     rig.pill.hide.assert_not_called()
     rig.tray.set_state.assert_not_called()
@@ -3326,7 +3331,7 @@ def test_selfcheck_retry_uses_real_supervisor_correlation(
     else:
         if outcome == "timeout":
             first._accept({"type": "pong"}, 1)  # Живой воркер: timeout без рестарта.
-        rig.now += 3
+        rig.now += SELFCHECK_SUPERVISOR_S
         first._expire()
     second = rig.runtime.supervisor
     assert second.generation == 2
@@ -3715,7 +3720,7 @@ def test_selfcheck_tray_recheck_recovers_or_blocks_again(
     rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
     rig.tray.set_model_recheck_enabled.assert_called_with(False)
     rig.supervisor.send.assert_called_with(
-        {"type": "transcribe.file", "path": str(smoke_wav)}, timeout=module.SELFCHECK_TIMEOUT_S
+        {"type": "transcribe.file", "path": str(smoke_wav)}, timeout=SELFCHECK_SUPERVISOR_S
     )
     assert [entry.args[0]["type"] for entry in rig.supervisor.send.call_args_list] == [
         "model.load",
@@ -4675,3 +4680,289 @@ def test_revoked_revision_blocks_microphone_test(monkeypatch: pytest.MonkeyPatch
 
     assert rig.runtime.start_test("alsa_input.usb", callback) is False
     assert callback.call_args.args[0].message == TEST_MODEL_UNAVAILABLE
+
+
+# --- Откат неудачного переключения к прежней модели ---
+
+
+def _switch_request(model_id: str) -> dict[str, Any]:
+    layout = "onnx-community-whisper" if model_id == "whisper" else "onnx-asr-gigaam-v3"
+    return {
+        "type": "model.load",
+        "id": model_id,
+        "revision": "r1",
+        "dir": f"/tmp/models/{model_id}/r1",
+        "layout": layout,
+        "variant": model_id,
+        "threads": 2,
+        "min_ram_mb": 500,
+    }
+
+
+class SwitchRig:
+    """Прежняя GigaAM проверена; подписчик при провале возвращает её в current.json."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, pause: bool = False) -> None:
+        self.rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+        self.pause = pause
+        self.current = "gigaam"
+        runtime = self.rig.runtime
+        monkeypatch.setattr(runtime, "_resolve_model_request", self.request)
+        monkeypatch.setattr(runtime, "can_switch_without_pause", lambda minimum: True)
+        runtime.set_catalog_rtfx({"gigaam": GIGAAM_RTFX, "whisper": WHISPER_TURBO_RTFX}.get)
+        runtime.start()
+        self.rig.event(type="hello")
+        self.rig.event(type="model.loaded", id="gigaam")
+        self.rig.event(type="result", utterance_id="file", text="проверка связи")
+        assert runtime._selfcheck == "ok"
+        self.old = self.rig.supervisor
+        self.workers: list[Mock] = []
+        runtime._supervisor_factory = self.factory
+        self.finished = Mock(side_effect=self.switch_finished)
+        runtime.on_switch_finished = self.finished
+
+    def request(self) -> dict[str, Any]:
+        return _switch_request(self.current)
+
+    def factory(self, **kwargs: Any) -> Mock:
+        worker = Mock(state="running", generation=0)
+        worker.on_event = kwargs["on_event"]
+        self.workers.append(worker)
+        return worker
+
+    def switch_finished(self, result: str) -> None:
+        if result != "ok":
+            self.current = "gigaam"
+
+    def switch(self) -> None:
+        self.current = "whisper"
+        self.rig.runtime.switch_model(min_ram_mb=2007, pause=self.pause)
+
+    @staticmethod
+    def emit(worker: Mock, **event: Any) -> None:
+        worker.on_event({"generation": worker.generation, **event})
+
+    @staticmethod
+    def loads(worker: Mock) -> list[str]:
+        return [
+            entry.args[0]["id"]
+            for entry in worker.send.call_args_list
+            if entry.args[0]["type"] == "model.load"
+        ]
+
+    def load_new_model(self) -> Mock:
+        """Новая модель загружена и её самопроверка запущена."""
+        worker = self.workers[-1]
+        self.emit(worker, type="hello")
+        assert self.loads(worker) == ["whisper"]
+        self.emit(worker, type="model.loaded", id="whisper")
+        assert self.rig.runtime.supervisor is worker
+        assert self.rig.runtime._selfcheck in ("running", "retrying")
+        return worker
+
+    def fire_selfcheck(self) -> None:
+        timer = self.rig.runtime._selfcheck_timer
+        assert timer is not None
+        timer.fire()
+
+    def assert_rolled_back(self, failed: Mock) -> Mock:
+        """Прежняя модель снова загружается без ошибки и совета переустановить."""
+        runtime = self.rig.runtime
+        self.finished.assert_called_once()
+        assert self.finished.call_args.args[0] != "ok"
+        assert not runtime._switch_active()
+        restored = self.workers[-1]
+        assert restored is not failed
+        assert runtime.supervisor is restored
+        restored.start.assert_called_once_with()
+        assert runtime._loading_model
+        self.emit(restored, type="hello")
+        assert self.loads(restored) == ["gigaam"]
+        self.rig.notify.notify_engine_failed.assert_not_called()
+        self.rig.notify.notify_selfcheck_failed.assert_not_called()
+        assert (
+            call(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
+            not in self.rig.pill.show_state.call_args_list
+        )
+        assert TrayState.ERROR not in [c.args[0] for c in self.rig.tray.set_state.call_args_list]
+        return restored
+
+    def finish_restore(self, restored: Mock) -> None:
+        self.emit(restored, type="model.loaded", id="gigaam")
+        self.emit(restored, type="result", utterance_id="file", text="проверка связи")
+        assert self.rig.runtime._selfcheck == "ok"
+        assert not self.rig.runtime._loading_model
+        self.finished.assert_called_once()
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_switch_selfcheck_timeouts_restore_previous_model(
+    monkeypatch: pytest.MonkeyPatch, pause: bool
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=pause)
+    bench.switch()
+    first = bench.load_new_model()
+    if not pause:
+        bench.old.stop.assert_called_once_with()
+    bench.fire_selfcheck()
+    bench.finished.assert_not_called()
+    second = bench.load_new_model()
+    assert second is not first
+    bench.fire_selfcheck()
+    restored = bench.assert_rolled_back(second)
+    second.stop.assert_called_once_with()
+    bench.finish_restore(restored)
+    bench.rig.runtime.shutdown()
+
+
+def test_paused_switch_load_error_restores_previous_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=True)
+    bench.switch()
+    worker = bench.workers[-1]
+    bench.emit(worker, type="hello")
+    assert bench.loads(worker) == ["whisper"]
+    bench.emit(
+        worker, type="error", code="model-load", request_type="model.load", message="нет файла"
+    )
+    restored = bench.assert_rolled_back(worker)
+    bench.finish_restore(restored)
+    bench.rig.runtime.shutdown()
+
+
+def test_switch_failure_after_supervisor_restart_loads_previous_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    bench.switch()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    second = bench.load_new_model()
+    # Супервизор сам убил процесс по дедлайну распознавания эталона и поднял новый.
+    stale = second.generation
+    second.generation += 1
+    second.on_event(
+        {
+            "type": "error",
+            "generation": stale,
+            "code": "load-timeout",
+            "request_type": "transcribe.file",
+            "utterance_id": "file",
+        }
+    )
+    SwitchRig.emit(second, type="hello")
+    current = bench.rig.runtime.supervisor
+    if current is second:
+        assert bench.loads(second)[-1] == "gigaam"
+    restored = bench.assert_rolled_back(second)
+    # Перезапуск процесса до model.loaded снова отправляет прежнюю модель.
+    restored.generation += 1
+    restored.send.reset_mock()
+    SwitchRig.emit(restored, type="hello")
+    assert bench.loads(restored) == ["gigaam"]
+    bench.finish_restore(restored)
+    bench.rig.runtime.shutdown()
+
+
+def test_switch_selfcheck_timeout_reports_slow_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = SwitchRig(monkeypatch)
+    bench.switch()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    bench.finished.assert_called_once_with("too-slow")
+    bench.rig.notify.notify_engine_failed.assert_not_called()
+    bench.rig.runtime.shutdown()
+
+
+def test_switch_selfcheck_worker_error_reports_general_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    bench.switch()
+    worker = bench.load_new_model()
+    SwitchRig.emit(
+        worker,
+        type="error",
+        code="engine",
+        request_type="transcribe.file",
+        utterance_id="file",
+    )
+    bench.assert_rolled_back(worker)
+    bench.finished.assert_called_once_with("failed")
+    bench.rig.runtime.shutdown()
+
+
+def test_selfcheck_deadline_follows_model_speed() -> None:
+    whisper = module.selfcheck_deadline_s("onnx-community-whisper", WHISPER_TURBO_RTFX)
+    assert whisper >= 3 * 30.0 / WHISPER_TURBO_RTFX + 1.0
+    assert whisper <= module.SELFCHECK_MAX_S == 30.0
+    assert module.selfcheck_deadline_s("onnx-asr-gigaam-v3", GIGAAM_RTFX) == 3.0
+    assert module.selfcheck_deadline_s("onnx-community-whisper", None) == 30.0
+    assert module.selfcheck_deadline_s("onnx-asr-gigaam-v3", 0.0) == 30.0
+    assert module.selfcheck_deadline_s("onnx-asr-gigaam-v3", float("nan")) == 30.0
+    # Эталон 1,6 с без окна раскладки: 3 × 1,6 / 0,5 + 1 = 10,6 с.
+    assert module.selfcheck_deadline_s("onnx-asr-t-one", 0.5) == pytest.approx(10.6)
+    assert module.selfcheck_deadline_s("onnx-asr-t-one", 0.01) == 30.0
+
+
+@pytest.mark.parametrize(
+    "model_id,watchdog_ms",
+    [("gigaam", 3000), ("whisper", round((3 * 30.0 / WHISPER_TURBO_RTFX + 1.0) * 1000))],
+)
+def test_selfcheck_watchdog_and_supervisor_share_deadline(
+    monkeypatch: pytest.MonkeyPatch, model_id: str, watchdog_ms: int
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    worker = bench.old
+    if model_id == "whisper":
+        bench.switch()
+        worker = bench.load_new_model()
+    else:
+        bench.rig.runtime.restart_worker()
+        worker = bench.workers[-1]
+        SwitchRig.emit(worker, type="hello")
+        SwitchRig.emit(worker, type="model.loaded", id="gigaam")
+    timer = bench.rig.runtime._selfcheck_timer
+    assert timer is not None and timer.interval == watchdog_ms
+    sent = worker.send.call_args
+    assert sent.args[0]["type"] == "transcribe.file"
+    assert sent.kwargs["timeout"] == pytest.approx(
+        watchdog_ms / 1000 + module.SELFCHECK_SUPERVISOR_MARGIN_S, abs=1e-3
+    )
+    assert sent.kwargs["timeout"] > timer.interval / 1000
+    bench.rig.runtime.shutdown()
+
+
+def test_selfcheck_deadline_prefers_own_measurement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from astra_voice.core.version import __version__
+
+    measurements = tmp_path / "measurements.json"
+    measurements.write_text(
+        json.dumps({"gigaam@r1": {"rtfx": 0.5, "threads": 2, "build": __version__}}),
+        encoding="utf-8",
+    )
+    bench = SwitchRig(monkeypatch)
+    bench.rig.runtime.measurements.path = measurements
+    bench.rig.runtime.restart_worker()
+    worker = bench.workers[-1]
+    SwitchRig.emit(worker, type="hello")
+    SwitchRig.emit(worker, type="model.loaded", id="gigaam")
+    timer = bench.rig.runtime._selfcheck_timer
+    assert timer is not None and timer.interval == 10_600
+    # Замер при другом числе потоков не годится: берётся скорость из каталога.
+    measurements.write_text(
+        json.dumps({"gigaam@r1": {"rtfx": 0.5, "threads": 4, "build": __version__}}),
+        encoding="utf-8",
+    )
+    bench.rig.runtime.restart_worker()
+    worker = bench.workers[-1]
+    SwitchRig.emit(worker, type="hello")
+    SwitchRig.emit(worker, type="model.loaded", id="gigaam")
+    timer = bench.rig.runtime._selfcheck_timer
+    assert timer is not None and timer.interval == 3000
+    bench.rig.runtime.shutdown()

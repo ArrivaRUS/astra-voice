@@ -2053,6 +2053,9 @@ class FakeModelPort:
     def revoked_revision(self, model_id: str, revision: str) -> bool:
         return (model_id, revision) in self.revoked
 
+    def catalog_rtfx(self, model_id: str) -> float | None:
+        return None
+
     def recheck_entries(self) -> tuple[CatalogEntry, ...]:
         return ()
 

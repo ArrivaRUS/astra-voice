@@ -19,7 +19,7 @@ from PyQt5.QtTest import QSignalSpy
 
 from astra_voice.core import settings as settings_mod
 from astra_voice.core.model_source import RevocationUnknown
-from astra_voice.models.catalog import CatalogEntry, FileSpec
+from astra_voice.models.catalog import CatalogEntry, FileSpec, Metric, Metrics
 from astra_voice.models.downloader import Progress, remaining_bytes
 from astra_voice.models.store import ModelRecord, ModelState, ModelStore, StoreError
 from astra_voice.ui import model_downloads
@@ -1121,6 +1121,21 @@ def test_failed_switch_with_enough_available_memory_keeps_general_error() -> Non
         downloads.shutdown()
 
 
+def test_too_slow_switch_says_so_without_reinstall_advice() -> None:
+    port, downloads, switcher = switched_rig(True)
+    switcher.available_mb = TONE.min_ram_mb
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        switcher.finish("too-slow")
+        item = card(downloads, TONE.id)
+        assert port.current == (GIGAAM.id, GIGAAM.revision)
+        assert item["message"] == "Модель слишком медленная для этого компьютера"
+        assert "переустанов" not in item["message"].lower()
+        assert item["hint"] == ""
+    finally:
+        downloads.shutdown()
+
+
 def test_failed_switch_without_lighter_model_has_no_hint() -> None:
     port = FakeManagedPort()
     port.catalog = (GIGAAM,)
@@ -1701,6 +1716,19 @@ def test_model_service_reads_installed_revision_size() -> None:
     service._store = store
 
     assert service.record_size_bytes("t-one", "r1") == 91_000_000
+
+
+def test_model_service_reads_catalog_rtfx() -> None:
+    service = ModelService.__new__(ModelService)
+    service._catalog = Mock()
+    service._catalog.entry.side_effect = {
+        "gigaam": replace(GIGAAM, metrics=Metrics(rtfx=Metric(42.5, "https://example.org"))),
+        "t-one": TONE,
+    }.get
+
+    assert service.catalog_rtfx("gigaam") == 42.5
+    assert service.catalog_rtfx("t-one") is None
+    assert service.catalog_rtfx("missing") is None
 
 
 def test_model_service_reads_total_memory_from_store() -> None:
