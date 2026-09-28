@@ -809,3 +809,14 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
   - architect-claude (Fable) — `arch/appimage.md` в `wt-appimage-arch` (`wip/appimage-arch`) → затем T1 одним проходом;
   - debugger — плавающее зависание unit-теста (`test_model_install_failure_message_uses_reason_code`).
 - 28.09 до конца дня — только модели Claude.
+
+## 2026-09-28 ~17:30 — AppImage: GUI зелёная, архитектура; блокировка GIL/Qt исправлена
+- GUI-проверка AppImage у заказчика — зелёная (decisions `8771704`, замеры там). Обычная 0.1.0 снова запущена Юркой,
+  автозапуск не изменился.
+- `arch/appimage.md` (`2d4ba70`); решения заказчика: две копии, OpenSSL 1.1.1k в 0.2 — принятый риск (`a8b678b`).
+  **В работе: security-analyst T1 одним проходом** → отчёт `docs/security/T1-appimage-2026-09-28.md` (закоммитить Юрке).
+  Дальше — разработка по §13 архитектуры (фундамент без GUI → перенос сборки и CI `wip/r2-ci` к 03–04.10 → …).
+- Взаимная блокировка GIL ↔ мьютекс Qt (зависание unit-теста) — дефект продукта, исправлен PR #11 `09ca017`, урок 025.
+  Выпуск — в составе 0.2 (решение заказчика). Беклог по ревью: P2 moveToThread без ReleaseGIL, P3 `_RecheckJob` finally,
+  P3 connect после таймаута wait (`model_downloads.py:2625`), P3 общий помощник переноса, nit `model_rig` в helpers.
+- Command1 1.6 — ждём суммы от Cowork (невидимые символы + `session_unsupported` для Fly), перезеркалить в тот же день.
