@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from astra_voice import bootstrap
+from helpers.appimage_bundle import KEY, make_bundle
 
 pytestmark = pytest.mark.unit
 
@@ -182,3 +183,26 @@ def test_worker_command_leaves_render_env_alone(monkeypatch: pytest.MonkeyPatch)
     assert "QT_QUICK_BACKEND" not in os.environ
     assert "QT_XCB_GL_INTEGRATION" not in os.environ
     assert "QT_QUICK_CONTROLS_STYLE" not in os.environ
+
+
+def test_selfinstall_command_installs_bundle(tmp_path: Path) -> None:
+    """T-170 (unit-часть): bootstrap selfinstall ставит бандл без Qt и GUI."""
+    bundle = make_bundle(tmp_path / "appimage_extracted_1c866c1789f7")
+    proc = _run(DEV_BOOTSTRAP, ["selfinstall", str(bundle), "--hidden"], cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    app = tmp_path / "data" / "astra-voice" / "app"
+    assert os.readlink(app / "current") == KEY
+    assert (app / KEY / ".installed-ok").is_file()
+
+
+def test_selfinstall_service_flag_creates_nothing(tmp_path: Path) -> None:
+    bundle = make_bundle(tmp_path / "bundle")
+    proc = _run(DEV_BOOTSTRAP, ["selfinstall", str(bundle), "--version"], cwd=tmp_path)
+    assert proc.returncode == 10
+    assert not (tmp_path / "data").exists()
+
+
+def test_selfinstall_without_source_is_usage(tmp_path: Path) -> None:
+    proc = _run(DEV_BOOTSTRAP, ["selfinstall"], cwd=tmp_path)
+    assert proc.returncode == 2
+    assert "usage" in proc.stderr

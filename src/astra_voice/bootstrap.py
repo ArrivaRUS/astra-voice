@@ -10,6 +10,10 @@
   ``astra_voice/`` и (при наличии) ``vendor/``;
 * режим разработки — ``<репозиторий>/src/astra_voice/bootstrap.py``.
 
+Бандл AppImage повторяет установленную раскладку внутри AppDir
+(``<AppDir>/usr/lib/astra-voice/bootstrap.py``); команда ``selfinstall``
+копирует бандл в домашнюю папку (``arch/appimage.md`` §1).
+
 Пути вычисляются от ``__file__`` (relocatable), ``PYTHONPATH`` не используется.
 """
 
@@ -19,9 +23,9 @@ import os
 import sys
 from pathlib import Path
 
-COMMANDS = ("app", "worker", "helper")
+COMMANDS = ("app", "worker", "helper", "selfinstall")
 
-USAGE = "usage: bootstrap.py {app|worker|helper} [аргументы]\n"
+USAGE = "usage: bootstrap.py {app|worker|helper|selfinstall} [аргументы]\n"
 
 # Рендер Qt Quick. По умолчанию программный: GL-контекст стоит 65 МБ RSS
 # (167 740 → 102 580 кБ, замеры `spikes/m1_live/rss.md`), картинка совпадает.
@@ -84,6 +88,14 @@ def _setup_render_env() -> None:
         os.environ.setdefault(name, value)
 
 
+def _refuse_root_in_bundle() -> int | None:
+    """Отказ работы от root в бандле AppImage — точка расширения; до 01.10 пропускает."""
+    # T1-01.10: MJ-3 — в бандле (paths.install_kind().is_appimage) при os.geteuid() == 0
+    # любая команда (app, selfinstall, --uninstall, даже --version) → сообщение «Версия
+    # AppImage не запускается от имени root…» и код 3 до импорта Qt; трек .deb не затронут (T-179).
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] not in COMMANDS:
@@ -92,6 +104,16 @@ def main(argv: list[str] | None = None) -> int:
     command, rest = args[0], args[1:]
 
     _setup_sys_path(Path(__file__).resolve().parent)
+
+    refused = _refuse_root_in_bundle()
+    if refused is not None:
+        return refused
+
+    if command == "selfinstall":
+        # Самоустановка AppImage (arch/appimage.md §1): без Qt, без аудио.
+        from astra_voice.platform.userinstall import selfinstall_main
+
+        return selfinstall_main(rest)
 
     if command in ("app", "worker"):
         from astra_voice.core.audio_env import deny_pulse_autospawn
