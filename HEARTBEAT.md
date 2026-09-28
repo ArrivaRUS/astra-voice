@@ -820,3 +820,16 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
   Выпуск — в составе 0.2 (решение заказчика). Беклог по ревью: P2 moveToThread без ReleaseGIL, P3 `_RecheckJob` finally,
   P3 connect после таймаута wait (`model_downloads.py:2625`), P3 общий помощник переноса, nit `model_rig` в helpers.
 - Command1 1.6 — ждём суммы от Cowork (невидимые символы + `session_unsupported` для Fly), перезеркалить в тот же день.
+
+## 2026-09-28 18:40 — день закрыт; первое дело 29.09
+- AppImage: T1 PASS с условиями (`bdbde2f`), MJ-4 — заказчик «разрешить оба» (`e93e9e6`), архитектура ревизия 2 с условиями
+  T1 (`7781a17`, ≈11 дней потока; +1 день по T1 съедает запас — выносим US-4.5/1.8/3.6 «если останется время»).
+- **29.09 утром (Codex снова доступен):**
+  1. developer-codex — шаг 1 §12 `arch/appimage.md` «фундамент без GUI» (paths/install_kind, `platform/userinstall.py` с
+     BL-1/MJ-1/MJ-3/MN-1/MN-8, bootstrap selfinstall, AppRun, autostart `executable()`, `clean_env()`); риск-теги
+     «права/данные» → эскалация на Astra; ревью Claude; черновой PR + CI.
+  2. параллельно: перенос сборки спайка в `packaging/appimage/` + `wip/r2-ci` (workflow только вызывает скрипты, флаг
+     `ENABLED`) — к 03–04.10, правка в браузере заказчиком 05–06.10.
+  3. поток 2 — `net/http.py` + fault-сервер (M7); поток 3 — S5-A5 (живая проверка заказчиком ~30.09).
+  4. tech-writer: строки T1 §6 (B20–B23, У101–У113, П15–П19) → `docs/threat-model.md`, §7 (T-175…T-182) → `docs/test-plan.md`.
+- Ждём от Cowork суммы Command1 1.6 → зеркало в тот же день. V1 отложен до клиента Voice (решение заказчика).
