@@ -807,7 +807,7 @@ class Tray(QObject):
                 notify.drop_pending(_UNAVAILABLE_SUMMARY)
                 delivered = notify.flush_pending()
                 _logger.info(
-                    "Доставлено отложенных уведомлений после регистрации значка: %d", delivered
+                    "Отправлено отложенных уведомлений после регистрации значка: %d", delivered
                 )
                 self._warn_panel_dependency()
 

@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import ast
+import logging
+import threading
 from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from threading import Event
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
-from PyQt5.QtCore import QMetaType, QObject, QVariant
-from PyQt5.QtDBus import QDBus, QDBusMessage
+from PyQt5.QtCore import QCoreApplication, QMetaType, QObject, QVariant
+from PyQt5.QtDBus import QDBusMessage
 
 from astra_voice.ui import notify as notifications
 
@@ -32,8 +33,10 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> Iterator[Mock]:
     bus.connect.return_value = True
     reply = Mock()
     reply.type.return_value = QDBusMessage.ReplyMessage
+    reply.signature.return_value = "u"
     reply.arguments.return_value = [41]
-    bus.call.return_value = reply
+    reply.errorName.return_value = "org.freedesktop.DBus.Error.ServiceUnknown"
+    bus.asyncCall.return_value = reply
     connection = Mock()
     connection.sessionBus.return_value = bus
     forbidden_interface = Mock(side_effect=AssertionError("Синхронный Introspect запрещён"))
@@ -48,7 +51,37 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> Iterator[Mock]:
     monkeypatch.setattr(notifications, "QDBusConnection", connection)
     monkeypatch.setattr(notifications, "QDBusInterface", forbidden_interface)
     monkeypatch.setattr(QDBusMessage, "createMethodCall", create_message)
-    yield Mock(bus=bus, reply=reply, factory=forbidden_interface)
+    control = Mock()
+    control.auto = True
+    control.watchers = []
+
+    class FakeWatcher:
+        def __init__(self, _call: object) -> None:
+            self.finished = Mock()
+            self.callback: Callable[[FakeWatcher], None] | None = None
+            self._reply = reply
+            self.finished.connect.side_effect = self.connect
+            self.deleteLater = Mock()
+            control.watchers.append(self)
+
+        def connect(self, callback: Callable[[FakeWatcher], None]) -> None:
+            self.callback = callback
+            if control.auto:
+                self.complete()
+
+        def complete(self, answer: Mock | None = None) -> None:
+            if answer is not None:
+                self._reply = answer
+            assert self.callback is not None
+            self.callback(self)
+
+        def reply(self) -> Mock:
+            return self._reply
+
+    monkeypatch.setattr(notifications, "QDBusPendingCallWatcher", FakeWatcher)
+    monkeypatch.setattr(notifications, "QDBusPendingReply", lambda watcher: watcher)
+    yield Mock(bus=bus, reply=reply, factory=forbidden_interface, control=control)
+    bus.call.assert_not_called()
     notifications.reset_state()
 
 
@@ -59,7 +92,7 @@ def _arguments(message: QDBusMessage) -> list[Any]:
 def test_engine_failed_notification_message_and_details(transport: Mock) -> None:
     assert "notify_engine_failed" in notifications.__all__
     notifications.notify_engine_failed()
-    args = _arguments(transport.bus.call.call_args.args[0])
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
     assert args[3:5] == ["Не удалось запустить распознавание", "Попробуйте переустановить модель."]
     assert args[5].value() == ["show-details", "Подробности"]
     assert args[6]["urgency"].value() == b"\x02"
@@ -69,14 +102,13 @@ def test_engine_failed_notification_message_and_details(transport: Mock) -> None
 def test_notify_arguments(transport: Mock, urgency: str, expected: int) -> None:
     notifications.notify("Заголовок", "Сообщение", urgency=urgency)
     transport.factory.assert_not_called()
-    transport.bus.call.assert_called_once()
-    message, mode, timeout_ms = transport.bus.call.call_args.args
+    transport.bus.asyncCall.assert_called_once()
+    message, timeout_ms = transport.bus.asyncCall.call_args.args
     assert message.service() == "org.freedesktop.Notifications"
     assert message.path() == "/org/freedesktop/Notifications"
     assert message.interface() == "org.freedesktop.Notifications"
     assert message.member() == "Notify"
-    assert mode == QDBus.Block
-    assert 0 < timeout_ms <= 450
+    assert timeout_ms == notifications._CALL_TIMEOUT_MS
     args = _arguments(message)
     assert len(args) == 8
     assert args[0] == "Astra Voice"
@@ -93,7 +125,7 @@ def test_notify_arguments(transport: Mock, urgency: str, expected: int) -> None:
 
 def test_notify_defaults(transport: Mock) -> None:
     notifications.notify("Заголовок")
-    args = _arguments(transport.bus.call.call_args.args[0])
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
     assert args[4] == ""
     assert args[6]["urgency"].value() == b"\x01"
     assert notifications.last_delivery_ok() is True
@@ -108,7 +140,7 @@ def test_notify_actions_and_single_uint_signal_subscription(transport: Mock) -> 
     actions = [("first", "Первое"), ("second", "Второе")]
     for _ in range(3):
         notifications.notify("Заголовок", actions=actions)
-        value = _arguments(transport.bus.call.call_args.args[0])[5]
+        value = _arguments(transport.bus.asyncCall.call_args.args[0])[5]
         assert value.type() == QVariant.StringList
         assert value.value() == ["first", "Первое", "second", "Второе"]
     transport.bus.connect.assert_called_once()
@@ -274,7 +306,7 @@ def test_pending_actions_survive_failed_retry_and_recovery(
     transport.bus.connect.assert_not_called()
     transport.bus.isConnected.return_value = True
     transport.reply.type.return_value = QDBusMessage.ErrorMessage
-    assert notifications.flush_pending() == 0
+    assert notifications.flush_pending() == 1
     _invoke_action(transport, 41, notifications.ACTION_SHOW_DETAILS)
     handler.assert_not_called()
     transport.reply.type.return_value = QDBusMessage.ReplyMessage
@@ -283,8 +315,8 @@ def test_pending_actions_survive_failed_retry_and_recovery(
     else:
         assert notifications.flush_pending() == 1
     assert notifications.pending_count() == 0
-    assert transport.bus.call.call_count == 2
-    for call in transport.bus.call.call_args_list:
+    assert transport.bus.asyncCall.call_count == 2
+    for call in transport.bus.asyncCall.call_args_list:
         assert _arguments(call.args[0])[5].value() == ["show-details", "Подробности"]
     _invoke_action(transport, 41, notifications.ACTION_SHOW_DETAILS)
     handler.assert_called_once_with()
@@ -300,7 +332,7 @@ def test_pending_deduplication_includes_actions_and_drop_removes_them(transport:
     assert notifications.drop_pending("Первое") == 2
     transport.bus.isConnected.return_value = True
     assert notifications.flush_pending() == 1
-    assert _arguments(transport.bus.call.call_args.args[0])[5].value() == ["next", "Далее"]
+    assert _arguments(transport.bus.asyncCall.call_args.args[0])[5].value() == ["next", "Далее"]
 
 
 @pytest.mark.parametrize("failure", [False, RuntimeError("Сбой подписки")])
@@ -319,46 +351,41 @@ def test_subscription_failure_keeps_delivery_and_retries(transport: Mock, failur
 
 
 @pytest.mark.parametrize("backlog", [0, 8])
-def test_hung_owner_keeps_whole_notify_within_500_ms(transport: Mock, backlog: int) -> None:
+def test_hung_owner_keeps_whole_notify_within_50_ms(transport: Mock, backlog: int) -> None:
     transport.bus.isConnected.return_value = False
     for index in range(backlog):
         notifications.notify(f"Отложенное {index}")
     transport.bus.isConnected.return_value = True
-    owner = Event()  # Владелец существует, но никогда не отвечает; реальной шины нет.
+    transport.control.auto = False
 
-    def call_hung_owner(message: QDBusMessage, mode: object, timeout_ms: int) -> Mock:
-        # Даже регрессия таймаута не должна задержать unit-набор на 25 секунд.
-        owner.wait(min(timeout_ms, 600) / 1000)
+    def call_hung_owner(message: QDBusMessage, timeout_ms: int) -> Mock:
+        # asyncCall не ждёт ответа владельца; callback задерживается отдельно.
         return cast(Mock, transport.reply)
 
     transport.reply.type.return_value = QDBusMessage.ErrorMessage
-    transport.bus.call.side_effect = call_hung_owner
+    transport.bus.asyncCall.side_effect = call_hung_owner
     started = perf_counter()
     notifications.notify("Зависший владелец")
     elapsed_ms = (perf_counter() - started) * 1000
-    assert elapsed_ms <= 500, f"notify() занял {elapsed_ms:.1f} мс"
+    assert elapsed_ms < 50, f"notify() занял {elapsed_ms:.1f} мс"
     transport.factory.assert_not_called()
-    transport.bus.call.assert_called_once()
-    message, mode, timeout_ms = transport.bus.call.call_args.args
+    transport.bus.asyncCall.assert_called_once()
+    message, timeout_ms = transport.bus.asyncCall.call_args.args
     assert message.member() == "Notify"
-    assert mode == QDBus.Block
-    assert 0 < timeout_ms <= 500
+    assert timeout_ms == notifications._CALL_TIMEOUT_MS
     assert notifications.last_delivery_ok() is False
-    assert notifications.pending_count() == min(backlog + 1, 8)
+    assert notifications.pending_count() == min(backlog, 8)
 
 
 @pytest.mark.parametrize("preparation_seconds", [0.350, 0.500])
-def test_preparation_uses_same_transport_budget(
+def test_preparation_does_not_consume_transport_budget(
     transport: Mock, monkeypatch: pytest.MonkeyPatch, preparation_seconds: float
 ) -> None:
     ticks = iter([0.0, preparation_seconds])
     monkeypatch.setattr(notifications, "monotonic", lambda: next(ticks))
     notifications.notify("Заголовок")
-    if preparation_seconds < 0.450:
-        assert 0 < transport.bus.call.call_args.args[2] <= 100
-    else:
-        transport.bus.call.assert_not_called()
-        assert notifications.pending_count() == 1
+    assert transport.bus.asyncCall.call_args.args[1] == notifications._CALL_TIMEOUT_MS
+    assert notifications.pending_count() == 0
 
 
 def test_unknown_urgency(transport: Mock) -> None:
@@ -372,7 +399,9 @@ def test_replaces_last_successful_notification(transport: Mock) -> None:
     transport.reply.arguments.return_value = [72]
     notifications.notify("Второе")
     notifications.notify("Третье")
-    assert [_arguments(call.args[0])[1].value() for call in transport.bus.call.call_args_list] == [
+    assert [
+        _arguments(call.args[0])[1].value() for call in transport.bus.asyncCall.call_args_list
+    ] == [
         0,
         41,
         72,
@@ -393,7 +422,7 @@ def test_reset_state(transport: Mock, delivered: bool) -> None:
     assert notifications.last_delivery_ok() is False
     transport.bus.isConnected.return_value = True
     notifications.notify("Второе")
-    assert _arguments(transport.bus.call.call_args.args[0])[1].value() == 0
+    assert _arguments(transport.bus.asyncCall.call_args.args[0])[1].value() == 0
 
 
 @pytest.mark.parametrize("failure", ["bus", "reply", "exception"])
@@ -409,14 +438,14 @@ def test_transport_failure_resets_id(
     elif failure == "reply":
         transport.reply.type.return_value = QDBusMessage.ErrorMessage
     else:
-        transport.bus.call.side_effect = RuntimeError("Секретная диктовка")
-    transport.bus.call.reset_mock()
+        transport.bus.asyncCall.side_effect = RuntimeError("Секретная диктовка")
+    transport.bus.asyncCall.reset_mock()
     with caplog.at_level("DEBUG", logger=notifications.__name__):
         notifications.notify("Запись остановлена", "Секретная диктовка")
     assert notifications.last_delivery_ok() is False
-    assert 41 not in notifications._notification_actions
+    assert 41 in notifications._notification_actions
     _invoke_action(transport, 41, "details")
-    handler.assert_not_called()
+    handler.assert_called_once_with()
     assert notifications.pending_count() == 1
     assert any(
         record.levelname == "WARNING" and "Запись остановлена" in record.getMessage()
@@ -424,12 +453,12 @@ def test_transport_failure_resets_id(
     )
     assert "Секретная диктовка" not in caplog.text
     if failure == "bus":
-        transport.bus.call.assert_not_called()
+        transport.bus.asyncCall.assert_not_called()
     transport.bus.isConnected.return_value = True
     transport.reply.type.return_value = QDBusMessage.ReplyMessage
-    transport.bus.call.side_effect = None
+    transport.bus.asyncCall.side_effect = None
     notifications.notify("Восстановлено")
-    assert _arguments(transport.bus.call.call_args.args[0])[1].value() == 0
+    assert _arguments(transport.bus.asyncCall.call_args.args[0])[1].value() == 41
 
 
 @pytest.mark.parametrize("arguments", [[], [0], [-1], [2**32], ["41"], [True], [41, 42]])
@@ -438,10 +467,17 @@ def test_invalid_reply_resets_id(transport: Mock, arguments: list[object]) -> No
     transport.reply.arguments.return_value = arguments
     notifications.notify("Второе")
     assert notifications.last_delivery_ok() is False
-    assert notifications.pending_count() == 1
+    assert notifications.pending_count() == 0
     transport.reply.arguments.return_value = [42]
     notifications.notify("Третье")
-    assert _arguments(transport.bus.call.call_args.args[0])[1].value() == 0
+    assert _arguments(transport.bus.asyncCall.call_args.args[0])[1].value() == 41
+
+
+def test_signed_integer_reply_is_invalid(transport: Mock) -> None:
+    transport.reply.signature.return_value = "i"
+    notifications.notify("Заголовок")
+    assert not notifications.last_delivery_ok()
+    assert notifications.pending_count() == 0
 
 
 def test_flush_pending_after_recovery(transport: Mock) -> None:
@@ -454,7 +490,7 @@ def test_flush_pending_after_recovery(transport: Mock) -> None:
     assert notifications.flush_pending() == 2
     assert notifications.pending_count() == 0
     assert notifications.last_delivery_ok() is True
-    calls = transport.bus.call.call_args_list
+    calls = transport.bus.asyncCall.call_args_list
     assert [tuple(_arguments(call.args[0])[3:5]) for call in calls] == [
         ("Запись остановлена", "Пропали все указатели записи, поэтому запись остановлена."),
         (
@@ -466,7 +502,7 @@ def test_flush_pending_after_recovery(transport: Mock) -> None:
     assert [_arguments(call.args[0])[1].value() for call in calls] == [0, 41]
     assert notifications.flush_pending() == 0
     assert notifications.last_delivery_ok() is True
-    assert transport.bus.call.call_count == 2
+    assert transport.bus.asyncCall.call_count == 2
 
 
 def test_failed_retries_preserve_unique_pending(transport: Mock) -> None:
@@ -475,7 +511,7 @@ def test_failed_retries_preserve_unique_pending(transport: Mock) -> None:
         notifications.notify_indicators_lost()
     assert notifications.pending_count() == 1
     for _ in range(2):
-        assert notifications.flush_pending() == 0
+        assert notifications.flush_pending() == 1
         assert notifications.pending_count() == 1
         assert notifications.last_delivery_ok() is False
 
@@ -488,7 +524,7 @@ def test_pending_queue_limit(transport: Mock) -> None:
     transport.bus.isConnected.return_value = True
     assert notifications.flush_pending() == 8
     assert notifications.pending_count() == 0
-    assert [_arguments(call.args[0])[3] for call in transport.bus.call.call_args_list] == [
+    assert [_arguments(call.args[0])[3] for call in transport.bus.asyncCall.call_args_list] == [
         f"Тестовый заголовок {index}" for index in range(4, 12)
     ]
 
@@ -505,11 +541,11 @@ def test_drop_pending_removes_all_matching_summaries_and_keeps_order(transport: 
     assert notifications.drop_pending("Значок не появился на панели") == 2
     assert notifications.drop_pending("Значок не появился на панели") == 0
     assert notifications.pending_count() == 3
-    transport.bus.call.assert_not_called()
+    transport.bus.asyncCall.assert_not_called()
     assert notifications.last_delivery_ok() is False
     transport.bus.isConnected.return_value = True
     assert notifications.flush_pending() == 3
-    assert [_arguments(call.args[0])[3] for call in transport.bus.call.call_args_list] == [
+    assert [_arguments(call.args[0])[3] for call in transport.bus.asyncCall.call_args_list] == [
         "Первое",
         "Второе",
         "Значок не появился на панели снова",
@@ -522,13 +558,32 @@ def test_drop_pending_keeps_delivery_id_and_queue_limit(transport: Mock) -> None
     notifications.notify("Доставлено")
     assert notifications.drop_pending("Доставлено") == 0
     notifications.notify("Повтор")
-    assert _arguments(transport.bus.call.call_args.args[0])[1].value() == 41
+    assert _arguments(transport.bus.asyncCall.call_args.args[0])[1].value() == 41
     transport.bus.isConnected.return_value = False
     notifications.notify_tray_unavailable()
     assert notifications.drop_pending("Значок не появился на панели") == 1
     for index in range(12):
         notifications.notify(f"Отложенное {index}")
     assert notifications.pending_count() == 8
+
+
+def test_drop_pending_removes_slot_and_queued_as_well(transport: Mock) -> None:
+    transport.bus.isConnected.return_value = False
+    notifications.notify("В пути")
+    notifications.notify("Удалить", "Первый")
+    notifications.notify("Удалить", "Второй")
+    transport.bus.isConnected.return_value = True
+    transport.control.auto = False
+    assert notifications.flush_pending() == 3
+    notifications.notify("Удалить", "Новый")
+    assert notifications.drop_pending("Удалить") == 5
+    assert notifications.pending_count() == 0
+    assert notifications._slot is None
+    assert not notifications._queued
+    transport.control.watchers[0].complete(_reply_with_id(41))
+    assert [_arguments(call.args[0])[3] for call in transport.bus.asyncCall.call_args_list] == [
+        "В пути"
+    ]
 
 
 def test_successful_repeat_removes_pending(transport: Mock) -> None:
@@ -539,7 +594,7 @@ def test_successful_repeat_removes_pending(transport: Mock) -> None:
     assert notifications.last_delivery_ok() is True
     assert notifications.pending_count() == 0
     assert notifications.flush_pending() == 0
-    transport.bus.call.assert_called_once()
+    transport.bus.asyncCall.assert_called_once()
 
 
 def test_flush_pending_partial_delivery(transport: Mock) -> None:
@@ -548,20 +603,20 @@ def test_flush_pending_partial_delivery(transport: Mock) -> None:
     notifications.notify_tray_unavailable()
     notifications.notify_hotkey_not_grabbed("Ctrl+Space")
     transport.bus.isConnected.return_value = True
-    transport.bus.call.side_effect = [
+    transport.bus.asyncCall.side_effect = [
         RuntimeError("Сбой службы"),
         transport.reply,
         RuntimeError("Сбой службы"),
     ]
-    assert notifications.flush_pending() == 1
+    assert notifications.flush_pending() == 3
     assert notifications.pending_count() == 2
     assert notifications.last_delivery_ok() is False
-    transport.bus.call.side_effect = None
-    transport.bus.call.reset_mock()
+    transport.bus.asyncCall.side_effect = None
+    transport.bus.asyncCall.reset_mock()
     assert notifications.flush_pending() == 2
     assert notifications.pending_count() == 0
     assert notifications.last_delivery_ok() is True
-    assert [_arguments(call.args[0])[3] for call in transport.bus.call.call_args_list] == [
+    assert [_arguments(call.args[0])[3] for call in transport.bus.asyncCall.call_args_list] == [
         "Запись остановлена",
         "Горячая клавиша Ctrl+Space занята другой программой",
     ]
@@ -607,7 +662,7 @@ def test_fixed_messages(
     transport: Mock, wrapper: Callable[[], None], summary: str, body: str, priority: bytes
 ) -> None:
     wrapper()
-    args = _arguments(transport.bus.call.call_args.args[0])
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
     assert args[3:5] == [summary, body]
     assert args[5].value() == (
         ["show-details", "Подробности"] if wrapper is notifications.notify_selfcheck_failed else []
@@ -629,8 +684,8 @@ def test_hotkey_messages_name_combo_and_actions(
             f"Горячая клавиша {combo} занята другой программой",
             "Как только она освободится, диктовка заработает сама.",
         ]
-    transport.bus.call.assert_called_once()
-    args = _arguments(transport.bus.call.call_args.args[0])
+    transport.bus.asyncCall.assert_called_once()
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
     assert args[3:5] == expected
     assert args[5].value() == ([] if regrabbed else ["choose-hotkey", "Выбрать другую"])
     assert args[6]["urgency"].value() == b"\x01"
@@ -658,11 +713,377 @@ def test_microphone_messages_use_system_description_and_actions(
             "Микрофон сменился",
             f"Сейчас используется: {name}. Выбрать другой можно в настройках.",
         ]
-    transport.bus.call.assert_called_once()
-    args = _arguments(transport.bus.call.call_args.args[0])
+    transport.bus.asyncCall.assert_called_once()
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
     assert args[3:5] == expected
     assert args[5].value() == ([] if selected else ["choose-microphone", "Выбрать микрофон"])
     assert args[6]["urgency"].value() == b"\x01"
+
+
+def _reply_with_id(notification_id: int) -> Mock:
+    answer = Mock()
+    answer.type.return_value = QDBusMessage.ReplyMessage
+    answer.signature.return_value = "u"
+    answer.arguments.return_value = [notification_id]
+    return answer
+
+
+def _reply_with_error(name: str) -> Mock:
+    answer = Mock()
+    answer.type.return_value = QDBusMessage.ErrorMessage
+    answer.errorName.return_value = name
+    answer.errorMessage.return_value = "Секретное тело"
+    return answer
+
+
+def test_in_flight_slot_keeps_only_latest_and_uses_confirmed_id(transport: Mock) -> None:
+    transport.control.auto = False
+    notifications.notify("A")
+    notifications.notify("B")
+    notifications.notify("C")
+    assert transport.bus.asyncCall.call_count == 1
+    transport.control.watchers[0].complete(_reply_with_id(41))
+    assert [_arguments(call.args[0])[3] for call in transport.bus.asyncCall.call_args_list] == [
+        "A",
+        "C",
+    ]
+    assert _arguments(transport.bus.asyncCall.call_args_list[1].args[0])[1].value() == 41
+    transport.control.watchers[1].complete(_reply_with_id(41))
+    assert notifications.last_delivery_ok()
+
+
+def test_flushed_notices_precede_new_panel_warning(transport: Mock) -> None:
+    transport.bus.isConnected.return_value = False
+    notifications.notify_hotkey_not_grabbed("Ctrl+Space")
+    notifications.notify_onboarding_ready("Ctrl+Space")
+    transport.bus.isConnected.return_value = True
+    transport.control.auto = False
+    assert notifications.flush_pending() == 2
+    notifications.notify_tray_depends_on_panel()
+    for index, notification_id in enumerate((100, 101, 102)):
+        transport.control.watchers[index].complete(_reply_with_id(notification_id))
+    calls = transport.bus.asyncCall.call_args_list
+    assert [_arguments(call.args[0])[3] for call in calls] == [
+        "Горячая клавиша Ctrl+Space занята другой программой",
+        "Astra Voice готов",
+        "Виден только значок на панели",
+    ]
+    assert [_arguments(call.args[0])[1].value() for call in calls] == [0, 100, 101]
+
+
+def test_situational_notice_cannot_displace_important_slot(
+    transport: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    transport.control.auto = False
+    notifications.notify("Занято")
+    notifications.notify("Важное", "Важное тело", retry=True)
+    with caplog.at_level(logging.DEBUG, logger=notifications.__name__):
+        notifications.notify("Секретный заголовок", "Секретное тело", retry=False)
+    assert notifications._slot is not None and notifications._slot.summary == "Важное"
+    assert any(
+        record.levelno == logging.DEBUG
+        and "Ситуативное уведомление отброшено" in record.getMessage()
+        for record in caplog.records
+    )
+    assert "Секретный заголовок" not in caplog.text
+    assert "Секретное тело" not in caplog.text
+    transport.control.watchers[0].complete(_reply_with_id(41))
+    assert [_arguments(call.args[0])[3] for call in transport.bus.asyncCall.call_args_list] == [
+        "Занято",
+        "Важное",
+    ]
+
+
+def test_important_notice_displaces_situational_slot(transport: Mock) -> None:
+    transport.control.auto = False
+    notifications.notify("Занято")
+    notifications.notify("Ситуативное", retry=False)
+    notifications.notify("Важное", retry=True)
+    transport.control.watchers[0].complete(_reply_with_id(41))
+    assert [_arguments(call.args[0])[3] for call in transport.bus.asyncCall.call_args_list] == [
+        "Занято",
+        "Важное",
+    ]
+
+
+def test_last_important_notice_wins_slot(transport: Mock) -> None:
+    transport.control.auto = False
+    notifications.notify("Занято")
+    notifications.notify("Первое важное", retry=True)
+    notifications.notify("Последнее важное", retry=True)
+    transport.control.watchers[0].complete(_reply_with_id(41))
+    assert [_arguments(call.args[0])[3] for call in transport.bus.asyncCall.call_args_list] == [
+        "Занято",
+        "Последнее важное",
+    ]
+
+
+def test_last_situational_notice_wins_slot(transport: Mock) -> None:
+    transport.control.auto = False
+    notifications.notify("Занято")
+    notifications.notify("Первое ситуативное", retry=False)
+    notifications.notify("Последнее ситуативное", retry=False)
+    transport.control.watchers[0].complete(_reply_with_id(41))
+    assert [_arguments(call.args[0])[3] for call in transport.bus.asyncCall.call_args_list] == [
+        "Занято",
+        "Последнее ситуативное",
+    ]
+
+
+def test_late_replies_keep_newest_id_and_both_actions(transport: Mock) -> None:
+    transport.control.auto = False
+    old, new = Mock(), Mock()
+    notifications.set_action_handler("old", old)
+    notifications.set_action_handler("new", new)
+    notifications.notify("A", actions=[("old", "Первое")])
+    assert not notifications.last_delivery_ok()
+    notifications.notify("B", actions=[("new", "Второе")])
+    notifications._on_wait_elapsed(1, notifications._epoch)
+    assert transport.bus.asyncCall.call_count == 2
+    assert _arguments(transport.bus.asyncCall.call_args_list[1].args[0])[1].value() == 0
+    transport.control.watchers[1].complete(_reply_with_id(72))
+    transport.control.watchers[0].complete(_reply_with_id(41))
+    assert notifications._last_id == 72
+    _invoke_action(transport, 41, "old")
+    _invoke_action(transport, 72, "new")
+    old.assert_called_once_with()
+    new.assert_called_once_with()
+
+
+def test_old_timeout_cannot_change_newer_success(transport: Mock) -> None:
+    transport.control.auto = False
+    notifications.notify("Старая")
+    notifications.notify("Новая")
+    notifications._on_wait_elapsed(1, notifications._epoch)
+    transport.control.watchers[1].complete(_reply_with_id(72))
+    assert notifications.last_delivery_ok() is True
+    transport.control.watchers[0].complete(_reply_with_error("org.freedesktop.DBus.Error.NoReply"))
+    assert notifications.last_delivery_ok() is True
+    assert notifications._last_completed_seq == 2
+
+
+def test_old_success_keeps_actions_but_cannot_change_newer_failure(transport: Mock) -> None:
+    transport.control.auto = False
+    action = Mock()
+    notifications.set_action_handler("old", action)
+    notifications.notify("Старая", actions=[("old", "Действие")])
+    notifications.notify("Новая")
+    notifications._on_wait_elapsed(1, notifications._epoch)
+    transport.control.watchers[1].complete(
+        _reply_with_error("org.freedesktop.DBus.Error.Disconnected")
+    )
+    assert notifications.last_delivery_ok() is False
+    transport.control.watchers[0].complete(_reply_with_id(41))
+    assert notifications.last_delivery_ok() is False
+    assert notifications._last_completed_seq == 2
+    assert notifications._last_id == 41
+    _invoke_action(transport, 41, "old")
+    action.assert_called_once_with()
+
+
+def test_late_old_reply_cannot_replace_newer_actions_for_same_id(transport: Mock) -> None:
+    old, new = Mock(), Mock()
+    notifications.set_action_handler("old", old)
+    notifications.set_action_handler("new", new)
+    transport.control.auto = False
+    notifications.notify("A", actions=[("old", "Первое")])
+    notifications.notify("B", actions=[("new", "Второе")])
+    notifications._on_wait_elapsed(1, notifications._epoch)
+    transport.control.watchers[1].complete(_reply_with_id(41))
+    transport.control.watchers[0].complete(_reply_with_id(41))
+    _invoke_action(transport, 41, "old")
+    old.assert_not_called()
+    _invoke_action(transport, 41, "new")
+    new.assert_called_once_with()
+
+
+def test_late_success_after_old_timeout_registers_actions(transport: Mock) -> None:
+    transport.control.auto = False
+    action = Mock()
+    notifications.set_action_handler("details", action)
+    notifications.notify("A", actions=[("details", "Подробности")])
+    notifications._on_wait_elapsed(1, notifications._epoch)
+    transport.control.watchers[0].complete(_reply_with_id(41))
+    _invoke_action(transport, 41, "details")
+    action.assert_called_once_with()
+    assert notifications.pending_count() == 0
+
+
+def test_timeout_streak_logs_once_without_pending(
+    transport: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    transport.control.auto = False
+    with caplog.at_level(logging.INFO, logger=notifications.__name__):
+        for index in range(4):
+            notifications.notify(f"Таймаут {index}", "Секретное тело")
+            transport.control.watchers[index].complete(
+                _reply_with_error("org.freedesktop.DBus.Error.NoReply")
+            )
+    assert notifications.pending_count() == 0
+    assert len([record for record in caplog.records if record.levelno == logging.INFO]) == 4
+    assert len([record for record in caplog.records if record.levelno == logging.WARNING]) == 1
+    assert "Секретное тело" not in caplog.text
+    transport.control.auto = True
+    transport.reply.arguments.return_value = [72]
+    notifications.notify("Успех")
+    assert notifications._timeout_streak == 0
+
+
+@pytest.mark.parametrize(
+    ("error_name", "pending"),
+    [
+        ("org.freedesktop.DBus.Error.ServiceUnknown", 1),
+        ("org.freedesktop.DBus.Error.NameHasNoOwner", 1),
+        ("org.freedesktop.DBus.Error.Disconnected", 1),
+        ("org.freedesktop.DBus.Error.Spawn.ExecFailed", 1),
+        ("org.freedesktop.DBus.Error.Spawn.AnyOtherFailure", 1),
+        ("org.example.InvalidArgs", 0),
+    ],
+)
+def test_error_names_control_retry_and_never_log_body(
+    transport: Mock, caplog: pytest.LogCaptureFixture, error_name: str, pending: int
+) -> None:
+    transport.control.auto = False
+    notifications.notify("Заголовок", "Секретное тело")
+    transport.control.watchers[0].complete(_reply_with_error(error_name))
+    assert notifications.pending_count() == pending
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+    assert "Секретное тело" not in caplog.text
+    if pending:
+        assert "Не удалось показать уведомление: Заголовок" in caplog.text
+    if pending == 0:
+        assert error_name in caplog.text
+
+
+def test_pending_ttl_and_situational_wrappers(
+    transport: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(notifications, "monotonic", lambda: now[0])
+    transport.bus.isConnected.return_value = False
+    notifications.notify_onboarding_ready("Ctrl+Space")
+    wrappers: tuple[Callable[[], None], ...] = (
+        lambda: notifications.notify_microphone_selected("Встроенный"),
+        lambda: notifications.notify_microphone_changed("Встроенный"),
+        lambda: notifications.notify_hotkey_regrabbed("Ctrl+Space"),
+        notifications.notify_microphone_muted,
+        notifications.notify_microphone_too_quiet,
+    )
+    for wrapper in wrappers:
+        wrapper()
+    assert notifications.pending_count() == 1
+    now[0] += notifications._PENDING_TTL_S + 1
+    transport.bus.isConnected.return_value = True
+    assert notifications.flush_pending() == 0
+    assert transport.bus.asyncCall.call_count == 0
+
+
+def test_expired_pending_logs_only_count(
+    transport: Mock, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(notifications, "monotonic", lambda: now[0])
+    transport.bus.isConnected.return_value = False
+    notifications.notify("Секретный старый заголовок", "Секретное тело")
+    notifications.notify("Другой старый заголовок")
+    now[0] += notifications._PENDING_TTL_S + 1
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=notifications.__name__):
+        assert notifications.flush_pending() == 0
+    infos = [record for record in caplog.records if record.levelno == logging.INFO]
+    assert [record.getMessage() for record in infos] == [
+        "Отброшено устаревших отложенных уведомлений: 2"
+    ]
+    assert "Секретный старый заголовок" not in caplog.text
+    assert "Другой старый заголовок" not in caplog.text
+    assert "Секретное тело" not in caplog.text
+
+
+def test_flush_keeps_queued_pending_until_send_without_duplicates(transport: Mock) -> None:
+    transport.bus.isConnected.return_value = False
+    notifications.notify("A")
+    notifications.notify("B")
+    assert notifications.pending_count() == 2
+    transport.bus.isConnected.return_value = True
+    transport.control.auto = False
+    assert notifications.flush_pending() == 2
+    assert notifications.pending_count() == 1
+    assert notifications.flush_pending() == 0
+    assert transport.bus.asyncCall.call_count == 1
+    transport.control.watchers[0].complete(_reply_with_id(41))
+    assert notifications.pending_count() == 0
+    assert transport.bus.asyncCall.call_count == 2
+    transport.control.watchers[1].complete(_reply_with_id(42))
+    assert notifications.flush_pending() == 0
+
+
+def test_reset_disposes_in_flight_watcher(transport: Mock) -> None:
+    transport.control.auto = False
+    notifications.notify("A")
+    notifications.notify("B")
+    watcher = transport.control.watchers[0]
+    notifications.reset_state()
+    watcher.deleteLater.assert_called_once_with()
+    watcher.complete(_reply_with_id(41))
+    assert notifications._last_id == 0
+    assert notifications._seq == 0
+    assert notifications._last_completed_seq == 0
+    assert notifications._slot is None
+    assert notifications._in_flight_seq is None
+    assert not notifications._queued
+    assert not notifications._sent
+    assert notifications._watchers == {}
+
+
+def test_concurrent_notify_creates_one_gui_dispatcher(
+    transport: Mock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QCoreApplication.instance() or QCoreApplication([])
+    received: list[str] = []
+    monkeypatch.setattr(notifications, "_submit", lambda notice: received.append(notice.summary))
+    original_init = notifications._Dispatcher.__init__
+    created: list[notifications._Dispatcher] = []
+
+    def slow_init(dispatcher: notifications._Dispatcher) -> None:
+        original_init(dispatcher)
+        created.append(dispatcher)
+        sleep(0.005)
+
+    monkeypatch.setattr(notifications._Dispatcher, "__init__", slow_init)
+    for round_number in range(5):
+        notifications.reset_state()
+        received.clear()
+        created.clear()
+        barrier = threading.Barrier(6)
+        errors: list[BaseException] = []
+
+        def send(
+            index: int,
+            gate: threading.Barrier = barrier,
+            round_id: int = round_number,
+            failures: list[BaseException] = errors,
+        ) -> None:
+            try:
+                gate.wait(timeout=2)
+                notifications.notify(f"{round_id}-{index}")
+            except BaseException as exc:
+                failures.append(exc)
+
+        threads = [threading.Thread(target=send, args=(index,)) for index in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+        assert all(not thread.is_alive() for thread in threads)
+        assert not errors
+        assert len(created) == 1
+        assert notifications._dispatcher is created[0]
+        assert created[0].thread() is app.thread()
+        for _ in range(50):
+            app.processEvents()
+            if len(received) == 6:
+                break
+        assert set(received) == {f"{round_number}-{index}" for index in range(6)}
 
 
 def _qualified_name(node: ast.AST, aliases: dict[str, str]) -> str:
@@ -812,8 +1233,14 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
                 if not (
                     implementation
                     and leaf == "notify"
-                    and keyword.arg == "actions"
-                    and _is_static_actions(keyword.value, constants)
+                    and (
+                        (keyword.arg == "actions" and _is_static_actions(keyword.value, constants))
+                        or (
+                            keyword.arg == "retry"
+                            and isinstance(keyword.value, ast.Constant)
+                            and keyword.value.value is False
+                        )
+                    )
                 )
             ),
         ]
@@ -946,8 +1373,8 @@ def test_ast_accepts_wrapper_alias(wrapper: str) -> None:
 @pytest.mark.parametrize("combo", ["Ctrl+Space", "Ctrl+Alt+D"])
 def test_onboarding_ready_message(transport: Mock, combo: str) -> None:
     notifications.notify_onboarding_ready(combo)
-    transport.bus.call.assert_called_once()
-    args = _arguments(transport.bus.call.call_args.args[0])
+    transport.bus.asyncCall.assert_called_once()
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
     assert args[3:5] == ["Astra Voice готов", f"Зажмите {combo} и говорите."]
     assert args[5].value() == []
     assert args[6]["urgency"].value() == b"\x01"
@@ -970,7 +1397,7 @@ def test_ast_rejects_onboarding_dictation(source: str) -> None:
 
 def test_model_installed_message(transport: Mock) -> None:
     notifications.notify_model_installed()
-    args = _arguments(transport.bus.call.call_args.args[0])
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
     assert args[3:5] == ["Модель установлена", "Можно диктовать."]
     assert args[5].value() == []
     assert args[6]["urgency"].value() == b"\x01"

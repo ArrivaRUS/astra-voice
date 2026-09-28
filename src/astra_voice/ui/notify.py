@@ -2,17 +2,32 @@
 
 Остальной код вызывает готовые обёртки; переменные подписи — сочетание клавиш
 и системное описание микрофона. Запрет текста диктовки проверяет AST-тест пакета.
+Пока ожидается ID, последнее новое сообщение занимает один слот. Через 1,5 с
+слот отправляется с последним подтверждённым ID; поздний ответ всё ещё учитывается.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from collections import OrderedDict, deque
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from time import monotonic
+from typing import Any, cast
 
-from PyQt5.QtCore import QMetaType, QObject, QVariant, pyqtSlot
-from PyQt5.QtDBus import QDBus, QDBusConnection, QDBusMessage
+from PyQt5.QtCore import (
+    QCoreApplication,
+    QMetaType,
+    QObject,
+    Qt,
+    QThread,
+    QTimer,
+    QVariant,
+    pyqtSignal,
+    pyqtSlot,
+)
+from PyQt5.QtDBus import QDBusConnection, QDBusMessage, QDBusPendingCallWatcher, QDBusPendingReply
 
 # Совместимость с подменой старого транспорта в тестах соседней зоны.
 # Интерфейс не создаём: его конструктор синхронно запрашивает Introspect.
@@ -69,15 +84,71 @@ _ACTION_SIGNAL = (
 )
 _last_id = 0
 _last_delivery_ok = False
+_last_completed_seq = 0
+_last_id_seq = 0
+_seq = 0
+_epoch = 0
+_in_flight_seq: int | None = None
+_slot: _Notice | None = None
+_queued: deque[_Notice] = deque()
+_watchers: dict[int, QDBusPendingCallWatcher] = {}
+_sent: dict[int, tuple[_Notice, int]] = {}
+_dispatcher: _Dispatcher | None = None
+_dispatcher_lock = threading.Lock()
+_timeout_streak = 0
+_timeout_warned = False
+_CALL_TIMEOUT_MS = 10_000
+_WAIT_FOR_ID_MS = 1500
+_PENDING_TTL_S = 120
+_TIMEOUT_ERRORS = frozenset(
+    (
+        "org.freedesktop.DBus.Error.NoReply",
+        "org.freedesktop.DBus.Error.Timeout",
+        "org.freedesktop.DBus.Error.TimedOut",
+    )
+)
+_NOT_DELIVERED_ERRORS = frozenset(
+    (
+        "org.freedesktop.DBus.Error.ServiceUnknown",
+        "org.freedesktop.DBus.Error.NameHasNoOwner",
+        "org.freedesktop.DBus.Error.Disconnected",
+    )
+)
+_INVALID_REPLY = "invalid-reply"
+_TRANSPORT_ERROR = "transport-error"
 # При переполнении сохраняем последние восемь уникальных уведомлений.
 _MAX_NOTIFICATIONS = 8
-_pending: deque[tuple[str, str, int, tuple[tuple[str, str], ...]]] = deque(
-    maxlen=_MAX_NOTIFICATIONS
-)
+
+
+@dataclass(frozen=True)
+class _Notice:
+    summary: str
+    body: str
+    urgency: int
+    actions: tuple[tuple[str, str], ...]
+    created_at: float
+    retry: bool
+
+
+_pending: deque[_Notice] = deque(maxlen=_MAX_NOTIFICATIONS)
 _action_handlers: dict[str, Callable[[], None]] = {}
 _notification_actions: OrderedDict[int, set[str]] = OrderedDict()
+_action_id_seq: OrderedDict[int, int] = OrderedDict()
 _action_bus: QDBusConnection | None = None
 _action_receiver: _ActionReceiver | None = None
+
+
+class _Dispatcher(QObject):
+    submitted = pyqtSignal(object, int)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.submitted.connect(self.submit, Qt.QueuedConnection)
+
+    @pyqtSlot(object, int)
+    def submit(self, notice: _Notice, epoch: int) -> None:
+        if epoch == _epoch:
+            _submit(notice)
 
 
 class _ActionReceiver(QObject):
@@ -135,12 +206,35 @@ def _connect_actions(bus: QDBusConnection) -> None:
 
 def reset_state() -> None:
     """Очистить доставку, очередь и обработчики для изоляции тестов."""
-    global _last_id, _last_delivery_ok, _action_bus
+    global _last_id, _last_delivery_ok, _last_completed_seq, _last_id_seq, _seq, _epoch
+    global _in_flight_seq, _slot, _action_bus, _dispatcher, _timeout_streak, _timeout_warned
+    with _dispatcher_lock:
+        _epoch += 1
+        if _dispatcher is not None:
+            try:
+                _dispatcher.deleteLater()
+            except RuntimeError:
+                # QCoreApplication мог уже уничтожить C++ объект диспетчера.
+                pass
+            _dispatcher = None
     _last_id = 0
     _last_delivery_ok = False
+    _last_completed_seq = 0
+    _last_id_seq = 0
+    _seq = 0
+    _in_flight_seq = None
+    _slot = None
+    _queued.clear()
+    _sent.clear()
+    for watcher in _watchers.values():
+        watcher.deleteLater()
+    _watchers.clear()
+    _timeout_streak = 0
+    _timeout_warned = False
     _pending.clear()
     _action_handlers.clear()
     _notification_actions.clear()
+    _action_id_seq.clear()
     if _action_bus is not None and _action_receiver is not None:
         try:
             _action_bus.disconnect(*_ACTION_SIGNAL, _action_receiver.on_action_invoked)
@@ -156,41 +250,85 @@ def pending_count() -> int:
 
 def drop_pending(summary: str) -> int:
     """Удалить все отложенные уведомления с этим заголовком; вернуть их число."""
-    messages = [message for message in _pending if message[0] == summary]
+    global _slot
+    messages = [message for message in _pending if message.summary == summary]
     for message in messages:
         _pending.remove(message)
-    return len(messages)
+    removed = len(messages)
+    if _slot is not None and _slot.summary == summary:
+        _slot = None
+        removed += 1
+    kept = [notice for notice in _queued if notice.summary != summary]
+    removed += len(_queued) - len(kept)
+    _queued.clear()
+    _queued.extend(kept)
+    return removed
 
 
 def last_delivery_ok() -> bool:
-    """Вернуть результат последней попытки доставки; до первой попытки — False."""
+    """True после ответа с ID от самой новой завершившейся отправки."""
     return _last_delivery_ok
 
 
 def flush_pending() -> int:
-    """Повторить каждое отложенное уведомление один раз; вернуть число доставленных."""
-    delivered = 0
-    for message in tuple(_pending):
-        if _deliver(*message):
-            _pending.remove(message)
-            delivered += 1
-    return delivered
+    """Передать свежие записи в асинхронную очередь; вернуть их число."""
+    _expire_pending()
+    count = 0
+    for notice in tuple(_pending):
+        if not _already_active(notice):
+            _queued.append(notice)
+            count += 1
+    _drain()
+    return count
+
+
+def _expire_pending() -> None:
+    expired = len(_pending)
+    fresh = [notice for notice in _pending if monotonic() - notice.created_at <= _PENDING_TTL_S]
+    expired -= len(fresh)
+    _pending.clear()
+    _pending.extend(fresh)
+    if expired:
+        _logger.info("Отброшено устаревших отложенных уведомлений: %d", expired)
+
+
+def _same_notice(left: _Notice, right: _Notice) -> bool:
+    return (left.summary, left.body, left.urgency, left.actions) == (
+        right.summary,
+        right.body,
+        right.urgency,
+        right.actions,
+    )
+
+
+def _already_active(notice: _Notice) -> bool:
+    return (
+        any(_same_notice(notice, active) for active, _ in _sent.values())
+        or (_slot is not None and _same_notice(notice, _slot))
+        or any(_same_notice(notice, queued) for queued in _queued)
+    )
+
+
+def _remember_pending(notice: _Notice) -> None:
+    if not notice.retry:
+        return
+    _expire_pending()
+    if monotonic() - notice.created_at > _PENDING_TTL_S or _already_active(notice):
+        return
+    if not any(_same_notice(notice, pending) for pending in _pending):
+        _pending.append(notice)
 
 
 def _send(
-    summary: str,
-    body: str,
-    urgency: int,
+    seq: int,
+    notice: _Notice,
     replaces_id: int,
-    actions: Sequence[tuple[str, str]] = (),
-) -> int:
-    """Отправить сообщение через QtDBus; точка подмены транспорта в тестах."""
-    # Из общего бюджета notify() 500 мс оставляем 50 мс на обработку результата.
-    deadline = monotonic() + 0.450
+) -> None:
+    """Отправить без ожидания; watcher живёт в словаре до callback или reset."""
     bus = QDBusConnection.sessionBus()
     if not bus.isConnected():
-        _logger.debug("Шина уведомлений недоступна")
-        return 0
+        _on_reply(seq, None, "org.freedesktop.DBus.Error.Disconnected")
+        return
     _connect_actions(bus)
 
     message = QDBusMessage.createMethodCall(
@@ -203,57 +341,158 @@ def _send(
     # Python int и пустой list сами по себе дают неверные типы D-Bus.
     replacement = QVariant(replaces_id)
     replacement.convert(QVariant.UInt)
-    action_list = QVariant([item for action in actions for item in action])
+    action_list = QVariant([item for action in notice.actions for item in action])
     action_list.convert(QVariant.StringList)
-    priority = QVariant(urgency)
+    priority = QVariant(notice.urgency)
     priority.convert(QMetaType.UChar)
     message.setArguments(
         [
             "Astra Voice",
             replacement,
             "astravoice",
-            summary,
-            body,
+            notice.summary,
+            notice.body,
             action_list,
             {"urgency": priority},
             -1,
         ]
     )
-    timeout_ms = int((deadline - monotonic()) * 1000)
-    if timeout_ms <= 0:
-        return 0
-    reply = bus.call(message, QDBus.Block, timeout_ms)
-    if reply.type() != QDBusMessage.ReplyMessage:
-        _logger.debug("Служба уведомлений вернула ошибку")
-        return 0
-    arguments = reply.arguments()
-    if len(arguments) != 1 or type(arguments[0]) is not int or not 0 < arguments[0] <= 0xFFFFFFFF:
-        _logger.warning("Служба уведомлений вернула неверный ответ")
-        return 0
-    notification_id: int = arguments[0]
-    return notification_id
+    call = bus.asyncCall(message, _CALL_TIMEOUT_MS)
+    watcher = QDBusPendingCallWatcher(call)
+    _watchers[seq] = watcher
+    watcher.finished.connect(lambda finished, seq=seq: _finish(seq, finished))
 
 
-def _deliver(summary: str, body: str, urgency: int, actions: tuple[tuple[str, str], ...]) -> bool:
-    """Проверить доставку, записывая при сбое только заголовок-константу."""
-    global _last_id, _last_delivery_ok
-    replaces_id = _last_id
+def _finish(seq: int, watcher: QDBusPendingCallWatcher) -> None:
+    """Скопировать ответ в Python-данные до уничтожения Qt D-Bus объектов."""
+    if _watchers.get(seq) is not watcher:
+        return
     try:
-        _last_id = _send(summary, body, urgency, replaces_id, actions)
+        reply = cast(Any, QDBusPendingReply(watcher)).reply()
+        if reply.type() == QDBusMessage.ReplyMessage:
+            args = reply.arguments()
+            if (
+                reply.signature() == "u"
+                and len(args) == 1
+                and type(args[0]) is int
+                and 0 < args[0] <= 0xFFFFFFFF
+            ):
+                notification_id, error_name = args[0], None
+            else:
+                notification_id, error_name = None, _INVALID_REPLY
+        else:
+            notification_id, error_name = None, reply.errorName() or _TRANSPORT_ERROR
     except Exception:
-        # Исключение транспорта тоже может содержать переданное сообщение.
-        _last_id = 0
-    _last_delivery_ok = _last_id != 0
-    _notification_actions.pop(replaces_id, None)
-    if not _last_delivery_ok:
-        _logger.warning("Не удалось показать уведомление: %s", summary)
+        notification_id, error_name = None, _TRANSPORT_ERROR
+    _watchers.pop(seq).deleteLater()
+    _on_reply(seq, notification_id, error_name)
+
+
+def _on_reply(seq: int, notification_id: int | None, error_name: str | None) -> None:
+    """Обработать завершение по порядковому номеру без D-Bus типов."""
+    global _last_id, _last_id_seq, _last_delivery_ok, _last_completed_seq, _in_flight_seq
+    global _timeout_streak, _timeout_warned
+    sent = _sent.pop(seq, None)
+    if sent is None:
+        return
+    notice, replaces_id = sent
+    if seq > _last_completed_seq:
+        _last_completed_seq = seq
+        _last_delivery_ok = notification_id is not None
+    if notification_id is not None:
+        _timeout_streak = 0
+        _timeout_warned = False
+        if seq > _last_id_seq:
+            _last_id, _last_id_seq = notification_id, seq
+        if (
+            replaces_id
+            and replaces_id != notification_id
+            and seq >= _action_id_seq.get(replaces_id, 0)
+        ):
+            _notification_actions.pop(replaces_id, None)
+        if seq >= _action_id_seq.get(notification_id, 0):
+            _notification_actions.pop(notification_id, None)
+            _action_id_seq.pop(notification_id, None)
+            _action_id_seq[notification_id] = seq
+            if notice.actions:
+                _notification_actions[notification_id] = {key for key, _ in notice.actions}
+            while len(_action_id_seq) > _MAX_NOTIFICATIONS:
+                old_id, _ = _action_id_seq.popitem(last=False)
+                _notification_actions.pop(old_id, None)
+        for pending in tuple(_pending):
+            if _same_notice(pending, notice):
+                _pending.remove(pending)
+    elif error_name in _TIMEOUT_ERRORS:
+        _timeout_streak += 1
+        _logger.info(
+            "Служба уведомлений не ответила вовремя; сообщение могло быть показано: %s",
+            notice.summary,
+        )
+        if _timeout_streak >= 3 and not _timeout_warned:
+            _timeout_warned = True
+            _logger.warning("Служба уведомлений не отвечает вовремя")
+    elif (
+        error_name in _NOT_DELIVERED_ERRORS
+        or error_name == _TRANSPORT_ERROR
+        or (error_name is not None and error_name.startswith("org.freedesktop.DBus.Error.Spawn."))
+    ):
+        _timeout_streak = 0
+        _timeout_warned = False
+        _logger.warning("Не удалось показать уведомление: %s", notice.summary)
+        _remember_pending(notice)
+    elif error_name == _INVALID_REPLY:
+        _timeout_streak = 0
+        _timeout_warned = False
+        _logger.warning("Служба уведомлений вернула неверный ответ")
     else:
-        _notification_actions.pop(_last_id, None)
-        if actions:
-            _notification_actions[_last_id] = {key for key, _ in actions}
-            while len(_notification_actions) > _MAX_NOTIFICATIONS:
-                _notification_actions.popitem(last=False)
-    return _last_delivery_ok
+        _timeout_streak = 0
+        _timeout_warned = False
+        _logger.warning("Служба уведомлений вернула ошибку: %s", error_name)
+    if _in_flight_seq == seq:
+        _in_flight_seq = None
+        _drain()
+
+
+def _on_wait_elapsed(seq: int, epoch: int) -> None:
+    global _in_flight_seq
+    if epoch == _epoch and _in_flight_seq == seq:
+        _in_flight_seq = None
+        _drain()
+
+
+def _drain() -> None:
+    global _in_flight_seq, _slot, _seq
+    if _in_flight_seq is not None:
+        return
+    if _queued:
+        notice = _queued.popleft()
+    elif _slot is not None:
+        notice, _slot = _slot, None
+    else:
+        return
+    for pending in tuple(_pending):
+        if _same_notice(notice, pending):
+            _pending.remove(pending)
+    _seq += 1
+    seq = _seq
+    _sent[seq] = (notice, _last_id)
+    _in_flight_seq = seq
+    try:
+        _send(seq, notice, _last_id)
+    except Exception:
+        _on_reply(seq, None, _TRANSPORT_ERROR)
+    if _in_flight_seq == seq:
+        epoch = _epoch
+        QTimer.singleShot(_WAIT_FOR_ID_MS, lambda: _on_wait_elapsed(seq, epoch))
+
+
+def _submit(notice: _Notice) -> None:
+    global _slot
+    if _slot is not None and _slot.retry and not notice.retry:
+        _logger.debug("Ситуативное уведомление отброшено: в очереди важное")
+        return
+    _slot = notice
+    _drain()
 
 
 def notify(
@@ -262,20 +501,36 @@ def notify(
     *,
     urgency: str = "normal",
     actions: Sequence[tuple[str, str]] = (),
+    retry: bool = True,
 ) -> None:
     """Показать уведомление; внутри проекта доступно только готовым обёрткам.
 
-    Неизвестная срочность — ошибка вызывающего кода. При сбое транспорта
-    сохраняем сообщение для повторной доставки и логируем только заголовок.
+    Неизвестная срочность — ошибка вызывающего кода. При подтверждённом
+    недоставлении retry разрешает повтор. Тело никогда не попадает в журнал.
     """
     if urgency not in _URGENCY:
         raise ValueError("Неизвестная срочность уведомления")
-    message = (summary, body, _URGENCY[urgency], tuple(actions))
-    if _deliver(*message):
-        if message in _pending:
-            _pending.remove(message)
-    elif message not in _pending:
-        _pending.append(message)
+    notice = _Notice(summary, body, _URGENCY[urgency], tuple(actions), monotonic(), retry)
+    app = QCoreApplication.instance()
+    # Штатные вызовы из runtime, tray, bridges и app идут через Qt GUI thread;
+    # прямой вызов извне другого потока переводим туда до работы с QtDBus.
+    if app is not None and QThread.currentThread() != app.thread():
+        global _dispatcher
+        if _dispatcher is None:
+            with _dispatcher_lock:
+                if _dispatcher is None:
+                    dispatcher = _Dispatcher()
+                    dispatcher.moveToThread(app.thread())
+                    _dispatcher = dispatcher
+        with _dispatcher_lock:
+            # reset_state() может обнулить диспетчер между проверкой и emit.
+            if _dispatcher is None:
+                dispatcher = _Dispatcher()
+                dispatcher.moveToThread(app.thread())
+                _dispatcher = dispatcher
+            _dispatcher.submitted.emit(notice, _epoch)
+    else:
+        _submit(notice)
 
 
 def notify_hotkey_not_grabbed(combo: str) -> None:
@@ -289,7 +544,7 @@ def notify_hotkey_not_grabbed(combo: str) -> None:
 
 def notify_hotkey_regrabbed(combo: str) -> None:
     """Сообщить об автоматическом восстановлении горячей клавиши."""
-    notify(f"Горячая клавиша снова работает: {combo}", urgency="normal")
+    notify(f"Горячая клавиша снова работает: {combo}", urgency="normal", retry=False)
 
 
 def notify_onboarding_ready(combo: str) -> None:
@@ -303,6 +558,7 @@ def notify_microphone_changed(name: str) -> None:
         "Микрофон сменился",
         f"Сейчас используется: {name}. Выбрать другой можно в настройках.",
         actions=[(ACTION_CHOOSE_MICROPHONE, "Выбрать микрофон")],
+        retry=False,
     )
 
 
@@ -321,6 +577,7 @@ def notify_microphone_muted() -> None:
         _MIC_MUTED_TITLE,
         _MIC_MUTED_BODY,
         actions=[(ACTION_OPEN_SOUND_SETTINGS, _OPEN_SOUND_SETTINGS)],
+        retry=False,
     )
 
 
@@ -330,12 +587,13 @@ def notify_microphone_too_quiet() -> None:
         _MIC_QUIET_TITLE,
         _MIC_QUIET_BODY,
         actions=[(ACTION_OPEN_SOUND_SETTINGS, _OPEN_SOUND_SETTINGS)],
+        retry=False,
     )
 
 
 def notify_microphone_selected(name: str) -> None:
     """Объявить системное описание нового микрофона перед диктовкой."""
-    notify(f"Микрофон: {name}")
+    notify(f"Микрофон: {name}", retry=False)
 
 
 def notify_tray_unavailable() -> None:
