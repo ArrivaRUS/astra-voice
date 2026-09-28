@@ -734,8 +734,8 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
 - **Токен GitHub:** fine-grained PAT до 01.02.2027, без Workflows/Admin/Env/Secrets (память `reference_github_agent_token`);
   правки `.github/workflows` агенты не пушат (и заказчик тем же токеном тоже) — только правкой файла в браузере.
 - **Дальше:** code-reviewer по `wip/r1-code` → PR (черновой, CI) → merge → `m6.23` → заказчик проходит чеклист
-  (`scratchpad/Astra-Voice-0.1-чеклист.md`, отправлен 28.09; добавить пункт про автозапуск; перед чеклистом Юрка сохраняет
+  (`~/.cache/astra-voice-dev/r1-drafts/Astra-Voice-0.1-чеклист.md`, отправлен 28.09; добавить пункт про автозапуск; перед чеклистом Юрка сохраняет
   настройки и модель, сбрасывает к первому запуску, после — возвращает) → исправления → changelog `0.1.0`
-  (`scratchpad/changelog-0.1.0.txt`, тело релиза `scratchpad/release-notes-0.1.0.md` — Ctrl+Esc-формулировка поправлена; Fly —
+  (`~/.cache/astra-voice-dev/r1-drafts/changelog-0.1.0.txt`, тело релиза `…/r1-drafts/release-notes-0.1.0.md` — Ctrl+Esc-формулировка поправлена; Fly —
   «проверено меньше», если проверки не будет — «не проверено») → CI → **`release.sh v0.1.0 --push` запускает Юрка («ок» заказчика
   28.09)** → заказчик одобряет deployment в браузере → `tools/validate release --version 0.1.0`.
