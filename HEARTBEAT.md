@@ -739,3 +739,11 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
   (`~/.cache/astra-voice-dev/r1-drafts/changelog-0.1.0.txt`, тело релиза `…/r1-drafts/release-notes-0.1.0.md` — Ctrl+Esc-формулировка поправлена; Fly —
   «проверено меньше», если проверки не будет — «не проверено») → CI → **`release.sh v0.1.0 --push` запускает Юрка («ок» заказчика
   28.09)** → заказчик одобряет deployment в браузере → `tools/validate release --version 0.1.0`.
+
+## 2026-09-28 10:25 — m6.23 у заказчика, идёт чеклист
+- main `10a6265` (packaging m6.23), CI зелёный (run 36390568964). Слиты PR #8 `wip/r1-code` (автозапуск + P1-1 release.sh;
+  ревью Claude APPROVE после круга) и `wip/r1-autostart-docs` (INSTALL-ADMIN §6, У27/T-28, test-plan T-134…T-162, PRD F10).
+- m6.23 установлен заказчиком, запущен с чистого листа (pid 1831103). Резерв: `~/.cache/astra-voice-dev/checklist-backup-20260928/`
+  (settings.json, models/ — ПЕРЕНЕСЕНЫ туда mv, autostart-astra-voice.desktop sha256 e4816542…, log-offset). После чеклиста:
+  вернуть models/ и settings.json, сверить хэш записи автозапуска, просмотреть журнал с log-offset на ERROR/WARNING.
+- Дальше: исправления по чеклисту → changelog 0.1.0 → CI → `release.sh v0.1.0 --push` (Юрка) → одобрение deployment заказчиком.
