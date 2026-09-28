@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from astra_voice.core import childenv, paths
 from astra_voice.platform import userinstall
 from helpers.appimage_bundle import KEY, VERSION, make_bundle
 
@@ -34,8 +35,13 @@ shift
 printf '%s|%s|HERE=%s|EAR=%s|PP=%s\\n' "$cmd" "$*" "${ASTRA_VOICE_APPIMAGE_DIR:-}" \\
     "${APPIMAGE_EXTRACT_AND_RUN:-}" "${PYTHONPATH:-}" >> "$APPRUN_TEST_LOG"
 case $cmd in
-    selfinstall) exec "@REAL_PY@" -I "$boot" selfinstall "$@" ;;
+    selfinstall)
+        if [ -n "${APPRUN_TEST_SELFINSTALL_RC:-}" ]; then
+            exit "$APPRUN_TEST_SELFINSTALL_RC"
+        fi
+        exec "@REAL_PY@" -I "$boot" selfinstall "$@" ;;
     app)
+        env > "$APPRUN_TEST_LOG.env"
         for arg do
             if [ "$arg" = --version ]; then
                 echo "astra-voice ${APPRUN_TEST_VERSION:-@VERSION@}"
@@ -224,3 +230,120 @@ def test_t1_markers_present() -> None:
     text = APPRUN.read_text(encoding="utf-8")
     assert "# T1-01.10: MJ-3" in text
     assert "# T1-01.10: MN-1" in text
+
+
+def _mount(tmp_path: Path, bundle: Path) -> Path:
+    """Фикстура /proc/self/mountinfo: бандл смонтирован через FUSE, как runtime AppImage."""
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        "22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n"
+        f"311 22 0:61 / {bundle} ro,nosuid,nodev,relatime shared:170 - "
+        "fuse.Astra_Voice-0.2.0-x86_64.AppImage Astra_Voice-0.2.0-x86_64.AppImage "
+        "ro,user_id=1000,group_id=1000\n",
+        encoding="ascii",
+    )
+    return mountinfo
+
+
+def _fuse_env(tmp_path: Path, env: dict[str, str], bundle: Path) -> dict[str, str]:
+    return {
+        **env,
+        "APPIMAGE": str(tmp_path / "Astra_Voice-0.2.0-x86_64.AppImage"),
+        "ASTRA_VOICE_TEST_MOUNTINFO": str(_mount(tmp_path, bundle)),
+    }
+
+
+def test_fuse_mode_detected(tmp_path: Path, env: dict[str, str]) -> None:
+    bundle = _bundle(tmp_path / ".mount_Ab12Cd")
+    status = _run(bundle / "AppRun", ["--selfinstall-status"], _fuse_env(tmp_path, env, bundle))
+    assert status.stdout.splitlines()[0] == "MODE=Б"
+    # Без $APPIMAGE тот же каталог — режим Г.
+    plain = {**_fuse_env(tmp_path, env, bundle)}
+    del plain["APPIMAGE"]
+    assert _run(bundle / "AppRun", ["--selfinstall-status"], plain).stdout.startswith("MODE=Г")
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_fuse_mode_installs_and_starts_copy(
+    tmp_path: Path, env: dict[str, str], shell: str | None
+) -> None:
+    bundle = _bundle(tmp_path / ".mount_Ab12Cd")
+    proc = _run(bundle / "AppRun", ["--hidden"], _fuse_env(tmp_path, env, bundle), shell)
+    assert proc.returncode == 0, proc.stderr
+    assert os.readlink(_app(env) / "current") == KEY
+    assert bundle.exists()  # монтирование не удаляется
+    assert _calls(env)[-1] == f"app|--hidden|HERE={_app(env) / KEY}|EAR=|PP="
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_fuse_mode_falls_back_to_mount_on_failure(
+    tmp_path: Path, env: dict[str, str], shell: str | None
+) -> None:
+    """Режим Б: обычная ошибка установки (здесь смоук) — работа из монтирования."""
+    bundle = _bundle(tmp_path / ".mount_Ab12Cd")
+    fuse = {**_fuse_env(tmp_path, env, bundle), "APPRUN_TEST_VERSION": "9.9.9"}
+    proc = _run(bundle / "AppRun", ["--hidden"], fuse, shell)
+    assert proc.returncode == 0, proc.stderr
+    assert "работает без установки" in proc.stderr
+    assert not os.path.lexists(_app(env) / "current")
+    assert _calls(env)[-1] == f"app|--hidden|HERE={bundle}|EAR=|PP="
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("code", [userinstall.EXIT_ROOT, userinstall.EXIT_UNSAFE_SOURCE])
+@pytest.mark.parametrize("mode_dir", [".mount_Ab12Cd", "appimage_extracted_1"])
+def test_refusals_stop_in_any_mode(
+    tmp_path: Path, env: dict[str, str], shell: str | None, code: int, mode_dir: str
+) -> None:
+    """P2-2: отказ от root (3) и небезопасный источник (4) не дают работать без установки."""
+    bundle = _bundle(tmp_path / mode_dir)
+    run_env = {**_fuse_env(tmp_path, env, bundle), "APPRUN_TEST_SELFINSTALL_RC": str(code)}
+    proc = _run(bundle / "AppRun", ["--hidden"], run_env, shell)
+    assert proc.returncode == code
+    assert "работает без установки" not in proc.stderr
+    assert [call.split("|")[0] for call in _calls(env)] == ["selfinstall"]
+    assert bundle.exists()
+
+
+def test_originals_saved_once_and_restorable(tmp_path: Path, env: dict[str, str]) -> None:
+    """P3-5: исходные значения переживают вложенный AppRun; clean_env их возвращает."""
+    extracted = _bundle(tmp_path / "appimage_extracted_1")
+    run_env = {
+        **env,
+        "SSL_CERT_FILE": "/etc/corp/ca.pem",
+        "PYTHONPATH": "/home/u/lib",
+        "QT_QPA_PLATFORMTHEME": "kde",
+    }
+    assert _run(extracted / "AppRun", ["--hidden"], run_env).returncode == 0
+    lines = Path(env["APPRUN_TEST_LOG"] + ".env").read_text(encoding="utf-8").splitlines()
+    final = dict(line.split("=", 1) for line in lines if "=" in line)
+    assert final["SSL_CERT_FILE"] != "/etc/corp/ca.pem"  # бандлу — хостовый набор CA
+    assert "PYTHONPATH" not in final and "QT_QPA_PLATFORMTHEME" not in final
+    assert final["ASTRA_VOICE_ORIG_SSL_CERT_FILE"] == "/etc/corp/ca.pem"
+    assert final["ASTRA_VOICE_ORIG_PYTHONPATH"] == "/home/u/lib"
+    assert "PYTHONHOME" in final["ASTRA_VOICE_ORIG_UNSET"].split()
+    child = childenv.clean_env(final)
+    assert child["SSL_CERT_FILE"] == "/etc/corp/ca.pem"
+    assert child["PYTHONPATH"] == "/home/u/lib"
+    assert child["QT_QPA_PLATFORMTHEME"] == "kde"
+    assert "PYTHONHOME" not in child
+    assert not [name for name in child if name.startswith(("ASTRA_VOICE_", "APPIMAGE"))]
+
+
+def test_managed_list_matches_python() -> None:
+    text = APPRUN.read_text(encoding="utf-8")
+    match = re.search(r"^MANAGED='([^']*)'$", text, re.MULTILINE)
+    assert match is not None
+    assert tuple(match.group(1).split()) == childenv.APPRUN_MANAGED
+
+
+@pytest.mark.parametrize("value", [" /data", "/data ", "relative", ""])
+def test_xdg_data_home_same_as_python(
+    tmp_path: Path, env: dict[str, str], monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """P3-3: AppRun и paths.appimage_app_dir() видят один и тот же каталог app/."""
+    root = _bundle(tmp_path / "squashfs-root")
+    status = _run(root / "AppRun", ["--selfinstall-status"], {**env, "XDG_DATA_HOME": value})
+    monkeypatch.setenv("HOME", env["HOME"])
+    monkeypatch.setenv("XDG_DATA_HOME", value)
+    assert f"ROOT={paths.appimage_app_dir()}" in status.stdout.splitlines()

@@ -119,3 +119,30 @@ def test_check_launcher_is_passthrough_until_t1() -> None:
     """Точка расширения MJ-1: до 01.10 путь возвращается как есть."""
     target = paths.appimage_current_apprun()
     assert paths.check_appimage_launcher(target) == target
+
+
+def test_tmp_copy_is_not_installed(monkeypatch: pytest.MonkeyPatch, isolated_home: Path) -> None:
+    """P3-4: временная копия при смоуке (app/.tmp-*) — не установленная копия."""
+    app = isolated_home / ".local" / "share" / "astra-voice" / "app"
+    bundle = make_bundle(app / f".tmp-{KEY}.abc123")
+    (bundle / paths.INSTALLED_MARKER).write_bytes(b"")
+    _run_from(monkeypatch, bundle)
+    assert paths.install_kind() is paths.InstallKind.APPIMAGE_PORTABLE
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (" /data", None),  # не абсолютный как есть → по умолчанию, как `case /*` в AppRun
+        ("/data ", "/data "),  # хвостовой пробел — часть пути, как в AppRun
+        ("", None),
+        ("relative", None),
+    ],
+)
+def test_xdg_value_taken_as_is(
+    monkeypatch: pytest.MonkeyPatch, isolated_home: Path, value: str, expected: str | None
+) -> None:
+    """P3-3: XDG_DATA_HOME без strip — та же семантика, что в AppRun."""
+    monkeypatch.setenv("XDG_DATA_HOME", value)
+    base = Path(expected) if expected else isolated_home / ".local" / "share"
+    assert paths.appimage_app_dir() == base / "astra-voice" / "app"

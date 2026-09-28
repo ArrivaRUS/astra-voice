@@ -135,7 +135,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             raise argparse.ArgumentTypeError("число потоков должно быть целым и не меньше 1")
         return count
 
-    parser = argparse.ArgumentParser(prog=APP_NAME, add_help=True)
+    # Без сокращений: «--vers» не должен означать --version — AppRun и userinstall
+    # сверяют служебные флаги по точному совпадению.
+    parser = argparse.ArgumentParser(prog=APP_NAME, add_help=True, allow_abbrev=False)
     parser.add_argument("--version", action="store_true", help="напечатать версию и выйти")
     parser.add_argument("--stats", action="store_true", help="напечатать статистику и выйти")
     parser.add_argument("--hidden", action="store_true", help="запуск без окна, только в трее")

@@ -71,6 +71,7 @@ ROOT=$DATA/astra-voice/app
 TARGET=$ROOT/$KEY
 
 # Самая длинная точка монтирования-префикс HERE имеет тип fuse*.
+# ASTRA_VOICE_TEST_MOUNTINFO — только для тестов (подмена /proc/self/mountinfo).
 on_fuse() {
     awk -v path="$1" '
         {
@@ -83,7 +84,7 @@ on_fuse() {
             }
         }
         END { exit !(kind ~ /^fuse/) }
-    ' /proc/self/mountinfo
+    ' "${ASTRA_VOICE_TEST_MOUNTINFO:-/proc/self/mountinfo}"
 }
 
 MODE=Г
@@ -103,12 +104,35 @@ if [ "${1:-}" = --selfinstall-status ]; then
     exit 0
 fi
 
+# Исходные значения переменных, которые AppRun снимает или ставит, — для
+# внешних программ (childenv.clean_env). Только первый раз: вложенный AppRun
+# (exec установленной копии) видит уже изменённое окружение и ничего не пишет.
+# Тот же список — childenv.APPRUN_MANAGED (сверяет test_apprun.py).
+MANAGED='PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE QT_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH QT_QPA_PLATFORMTHEME LD_PRELOAD SSL_CERT_FILE'
+save_originals() {
+    for name in $MANAGED; do
+        case " ${ASTRA_VOICE_ORIG_UNSET-} " in
+            *" $name "*) continue ;;
+        esac
+        eval "saved=\${ASTRA_VOICE_ORIG_$name+x}"
+        [ -z "$saved" ] || continue
+        eval "present=\${$name+x}"
+        if [ -n "$present" ]; then
+            eval "ASTRA_VOICE_ORIG_$name=\$$name"
+            export "ASTRA_VOICE_ORIG_$name"
+        else
+            ASTRA_VOICE_ORIG_UNSET=${ASTRA_VOICE_ORIG_UNSET:+$ASTRA_VOICE_ORIG_UNSET }$name
+            export ASTRA_VOICE_ORIG_UNSET
+        fi
+    done
+}
+save_originals
+
 # Переменные runtime AppImage и хоста, которые не должны влиять на бандловый
 # Python и Qt (arch/appimage.md §10.4). LD_LIBRARY_PATH не ставим: RUNPATH.
-unset APPIMAGE APPDIR ARGV0 OWD APPIMAGE_EXTRACT_AND_RUN \
-    PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE \
-    QT_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH QT_QPA_PLATFORMTHEME LD_PRELOAD \
-    ASTRA_VOICE_APPIMAGE_DIR ASTRA_VOICE_RESOURCES
+# shellcheck disable=SC2086
+unset APPIMAGE APPDIR ARGV0 OWD APPIMAGE_EXTRACT_AND_RUN $MANAGED \
+    ASTRA_VOICE_APPIMAGE_DIR ASTRA_VOICE_RESOURCES ASTRA_VOICE_TEST_MOUNTINFO
 
 installed_ok() {
     [ -d "$TARGET" ] && [ ! -L "$TARGET" ] && [ -f "$TARGET/.installed-ok" ] &&
@@ -155,6 +179,11 @@ if [ "$INSTALL" = 1 ]; then
     if [ "$rc" = 0 ] && installed_ok; then
         run_installed "$@"
     fi
+    case $rc in
+        # Отказ от root (MJ-3) и небезопасный источник (BL-1) — не повод работать
+        # без установки: завершаем работу в любом режиме.
+        3 | 4) exit "$rc" ;;
+    esac
     if [ "$rc" != "$SKIPPED" ]; then
         if [ "$MODE" = В ]; then
             # Распаковка временная: работать из неё нельзя, сообщение уже напечатано.

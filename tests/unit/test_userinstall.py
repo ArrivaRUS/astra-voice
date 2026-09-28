@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import os
 import stat
@@ -22,6 +23,8 @@ pytestmark = pytest.mark.unit
 
 KEY2 = "0.3.0-aaaaaaaaaaaa"
 KEY3 = "0.4.0~rc1-bbbbbbbbbbbb"
+# Настоящий сброс на диск — до подмены в фикстуре synced.
+_REAL_SYNC = userinstall._sync_filesystem
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +39,17 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
     monkeypatch.delenv(paths.PORTABLE_ENV, raising=False)
     return home
+
+
+@pytest.fixture(autouse=True)
+def synced(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """syncfs корневого тома в каждом тесте не нужен: записываем вызовы.
+
+    Настоящий вызов проверяет test_sync_filesystem_real (и тесты AppRun).
+    """
+    calls: list[Path] = []
+    monkeypatch.setattr(userinstall, "_sync_filesystem", calls.append)
+    return calls
 
 
 def _app(home: Path) -> Path:
@@ -369,3 +383,132 @@ def test_t1_extension_points_pass_until_thursday(tmp_path: Path) -> None:
     """Метки T1-01.10: BL-1 и MJ-3 пока пропускают (решение заказчика 28.09)."""
     userinstall.refuse_root()
     userinstall.check_source(tmp_path)
+
+
+def test_sync_before_smoke_and_rename(tmp_path: Path, home: Path, synced: list[Path]) -> None:
+    """P2-1: данные копии сброшены на диск до смоука и до rename в app/<KEY>."""
+    app = _app(home)
+    order: list[str] = []
+
+    def smoke(copy: Path, info: userinstall.BuildInfo) -> None:
+        assert synced == [copy]
+        assert copy.parent == app and copy.name.startswith(f".tmp-{KEY}.")
+        assert (copy / paths.INSTALLED_MARKER).is_file()
+        assert not (app / KEY).exists()
+        order.append("smoke")
+
+    userinstall.install_from_dir(_bundle(tmp_path), smoke=smoke)
+    assert order == ["smoke"]
+    assert len(synced) == 1
+
+
+def test_sync_filesystem_real(tmp_path: Path) -> None:
+    _REAL_SYNC(tmp_path)
+
+
+class _FakeLibc:
+    def __init__(self, result: int) -> None:
+        self.result = result
+        self.calls = 0
+
+    def syncfs(self, fd: int) -> int:
+        self.calls += 1
+        return self.result
+
+
+def test_sync_filesystem_error_and_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failing = _FakeLibc(-1)
+    monkeypatch.setattr(ctypes, "CDLL", lambda name, use_errno: failing)
+    with pytest.raises(userinstall.UserInstallError, match="на диск"):
+        _REAL_SYNC(tmp_path)
+    assert failing.calls == 1
+
+    def no_libc(name: object, use_errno: bool) -> object:
+        raise OSError("нет libc")
+
+    synced: list[bool] = []
+    monkeypatch.setattr(ctypes, "CDLL", no_libc)
+    monkeypatch.setattr(os, "sync", lambda: synced.append(True))
+    _REAL_SYNC(tmp_path)
+    assert synced == [True]
+
+
+def test_sync_error_aborts_install(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failing(path: Path) -> None:
+        raise userinstall.UserInstallError("Не удалось записать файлы Astra Voice на диск: EIO")
+
+    monkeypatch.setattr(userinstall, "_sync_filesystem", failing)
+    with pytest.raises(userinstall.UserInstallError, match="на диск"):
+        userinstall.install_from_dir(_bundle(tmp_path))
+    assert sorted(os.listdir(_app(home))) == [".install.lock"]
+
+
+def test_smoke_timeout(tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Зависшая новая копия: смоук обрывается по таймауту, current не меняется."""
+    monkeypatch.setattr(userinstall, "SMOKE_TIMEOUT_S", 0.5)
+    userinstall.install_from_dir(_bundle(tmp_path))
+    hung = _bundle(tmp_path, KEY2, apprun="#!/bin/sh\nexec sleep 30\n")
+    with pytest.raises(userinstall.SmokeError, match="не запустилась"):
+        userinstall.install_from_dir(hung)
+    app = _app(home)
+    assert _link(app, "current") == KEY
+    assert sorted(os.listdir(app)) == [".install.lock", KEY, "current"]
+
+
+def test_abandoned_tmp_removed_before_space_check(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3-1: брошенная распаковка съела место — уборка под замком, затем установка."""
+    app = _app(home)
+    app.mkdir(parents=True, mode=0o700)
+    abandoned = app / f".tmp-{KEY2}.q1w2e3"
+    (abandoned / "usr").mkdir(parents=True)
+    (abandoned / "usr" / "big").write_bytes(b"x" * 1024)
+
+    def free(path: Path) -> int:
+        return 0 if abandoned.exists() else userinstall.MIN_FREE_BYTES
+
+    monkeypatch.setattr(userinstall, "free_bytes", free)
+    result = userinstall.install_from_dir(_bundle(tmp_path))
+    assert result.copied
+    assert not abandoned.exists()
+    assert sorted(os.listdir(app)) == [".install.lock", KEY, "current"]
+
+
+def test_no_space_even_after_cleanup(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _app(home)
+    app.mkdir(parents=True, mode=0o700)
+    (app / ".tmp-link-0000").symlink_to(tmp_path)
+    monkeypatch.setattr(userinstall, "free_bytes", lambda path: 10 * userinstall.MIB)
+    with pytest.raises(userinstall.NotEnoughSpaceError, match="нужно ещё 340 МБ"):
+        userinstall.install_from_dir(_bundle(tmp_path))
+    assert sorted(os.listdir(app)) == [".install.lock"]
+
+
+def test_check_source_runs_before_reading_build_info(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3-2: источник проверяется раньше, чем из него что-либо читается."""
+    seen: list[str] = []
+
+    def check(src: Path) -> None:
+        seen.append("check")
+        raise userinstall.UnsafeSourceError("Небезопасная временная папка.")
+
+    monkeypatch.setattr(userinstall, "check_source", check)
+    monkeypatch.setattr(userinstall, "read_build_info", lambda src: seen.append("read"))
+    with pytest.raises(userinstall.UnsafeSourceError):
+        userinstall.install_from_dir(tmp_path / "missing")
+    assert seen == ["check"]
+    assert userinstall.selfinstall_main([str(tmp_path / "missing")], {}) == 4
+    assert os.listdir(home) == []
+
+
+def test_lock_timeout_default() -> None:
+    assert userinstall.LOCK_TIMEOUT_S >= 180

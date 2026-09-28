@@ -117,6 +117,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if command in ("app", "worker"):
         from astra_voice.core.audio_env import deny_pulse_autospawn
+        from astra_voice.core.childenv import BOOTSTRAP_MANAGED, save_originals
+
+        # До любых перезаписей: внешним программам вернём исходные значения
+        # (childenv.clean_env), а не стиль и рендер, выбранные для нас.
+        save_originals(BOOTSTRAP_MANAGED)
 
         # Журнал ещё не настроен: важнее успеть до импорта Qt и libpulse.
         # Воркер повторит вызов после настройки журнала и запишет возможный сбой.

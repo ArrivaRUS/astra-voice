@@ -12,32 +12,25 @@ from astra_voice.core import childenv, paths
 
 pytestmark = pytest.mark.unit
 
-BUNDLE_ENV = {
+RUNTIME_ENV = {
     "APPIMAGE": "/home/u/Загрузки/Astra_Voice-0.2.0-x86_64.AppImage",
+    "APPIMAGE_EXTRACT_AND_RUN": "1",
+    "APPIMAGE_SILENT_INSTALL": "1",
     "APPDIR": "/tmp/.mount_abc",
     "ARGV0": "./Astra_Voice.AppImage",
     "OWD": "/home/u",
-    "APPIMAGE_EXTRACT_AND_RUN": "1",
     "ASTRA_VOICE_APPIMAGE_DIR": "/tmp/.mount_abc",
     "ASTRA_VOICE_RESOURCES": "/tmp/.mount_abc/usr/share/astra-voice",
     "ASTRA_VOICE_RENDER": "gl",
-    "QT_PLUGIN_PATH": "/tmp/.mount_abc/plugins",
-    "QT_QPA_PLATFORM_PLUGIN_PATH": "/tmp/.mount_abc/platforms",
-    "QML2_IMPORT_PATH": "/tmp/.mount_abc/qml",
-    "QML_IMPORT_PATH": "/tmp/.mount_abc/qml",
-    "QT_QUICK_BACKEND": "software",
-    "QT_QUICK_CONTROLS_STYLE": "Default",
-    "QT_XCB_GL_INTEGRATION": "none",
 }
 USER_ENV = {
     "HOME": "/home/u",
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     "LANG": "ru_RU.UTF-8",
     "DISPLAY": ":0",
-    "XDG_RUNTIME_DIR": "/run/user/1000",
-    "SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt",
-    "QT_QPA_PLATFORM": "xcb",
     "TMPDIR": "/tmp",
+    # Не тронуты нами — остаются как есть.
+    "QT_QPA_PLATFORM_PLUGIN_PATH": "/opt/user/platforms",
 }
 
 
@@ -48,27 +41,85 @@ def isolated_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return cache
 
 
-def test_bundle_variables_removed_user_kept(isolated_cache: Path) -> None:
-    env = childenv.clean_env({**BUNDLE_ENV, **USER_ENV})
-    assert not set(BUNDLE_ENV) & set(env)
-    expected = {**USER_ENV, "TMPDIR": str(isolated_cache / "astra-voice" / "tmp")}
-    assert env == expected
+def _launched(user: dict[str, str]) -> dict[str, str]:
+    """Окружение процесса после AppRun и bootstrap (как они его меняют)."""
+    env = {**RUNTIME_ENV, **user}
+    childenv.save_originals(childenv.APPRUN_MANAGED, env)
+    for name in childenv.APPRUN_MANAGED:
+        env.pop(name, None)
+    env["SSL_CERT_FILE"] = "/etc/ssl/certs/ca-certificates.crt"
+    childenv.save_originals(childenv.BOOTSTRAP_MANAGED, env)
+    env["QT_QUICK_CONTROLS_STYLE"] = "Default"
+    env.setdefault("QT_QUICK_BACKEND", "software")
+    env.setdefault("QT_XCB_GL_INTEGRATION", "none")
+    env["PULSE_CLIENTCONFIG"] = "/home/u/.cache/astra-voice/pulse-client.conf"
+    return env
 
 
-def test_private_tmp_is_private(isolated_cache: Path) -> None:
-    env = childenv.clean_env({"TMPDIR": "/tmp"})
+def test_runtime_removed_originals_restored() -> None:
+    user = {
+        **USER_ENV,
+        "SSL_CERT_FILE": "/etc/corp/ca.pem",
+        "PYTHONPATH": "/home/u/lib",
+        "QT_QPA_PLATFORMTHEME": "kde",
+        "QT_QUICK_CONTROLS_STYLE": "Fly",
+        "QT_QUICK_BACKEND": "rhi",
+    }
+    env = childenv.clean_env(_launched(user))
+    assert env == user
+
+
+def test_absent_originals_removed() -> None:
+    """Чего у пользователя не было, то детям и не передаётся."""
+    env = childenv.clean_env(_launched(USER_ENV))
+    assert env == USER_ENV
+
+
+def test_keep_pulse_config_for_pactl() -> None:
+    launched = _launched({**USER_ENV, "PULSE_CLIENTCONFIG": "/home/u/my.conf"})
+    assert childenv.clean_env(launched)["PULSE_CLIENTCONFIG"] == "/home/u/my.conf"
+    kept = childenv.clean_env(launched, keep_pulse_config=True)
+    assert kept["PULSE_CLIENTCONFIG"] == "/home/u/.cache/astra-voice/pulse-client.conf"
+
+
+def test_save_is_first_write_only() -> None:
+    env = {"SSL_CERT_FILE": "/corp.pem"}
+    childenv.save_originals(["SSL_CERT_FILE", "PYTHONHOME"], env)
+    env["SSL_CERT_FILE"] = "/bundle.pem"
+    env["PYTHONHOME"] = "/bundle"
+    childenv.save_originals(["SSL_CERT_FILE", "PYTHONHOME"], env)
+    assert env["ASTRA_VOICE_ORIG_SSL_CERT_FILE"] == "/corp.pem"
+    assert env["ASTRA_VOICE_ORIG_UNSET"] == "PYTHONHOME"
+    assert childenv.clean_env(env) == {"SSL_CERT_FILE": "/corp.pem"}
+
+
+def test_save_rejects_unknown_names() -> None:
+    with pytest.raises(ValueError):
+        childenv.save_originals(["HOME"], {})
+
+
+def test_unknown_orig_names_ignored() -> None:
+    """В окружении могли оказаться чужие ASTRA_VOICE_ORIG_*: восстанавливаем только свои."""
+    env = childenv.clean_env(
+        {
+            "ASTRA_VOICE_ORIG_LD_LIBRARY_PATH": "/evil",
+            "ASTRA_VOICE_ORIG_UNSET": "HOME",
+            "HOME": "/h",
+        }
+    )
+    assert env == {"HOME": "/h"}
+
+
+def test_private_tmp_only_on_request(isolated_cache: Path) -> None:
+    assert childenv.clean_env({"TMPDIR": "/tmp"}) == {"TMPDIR": "/tmp"}
+    assert not isolated_cache.exists()
+    env = childenv.clean_env({"TMPDIR": "/tmp"}, private_tmp=True)
     tmp = Path(env["TMPDIR"])
     assert tmp == isolated_cache / "astra-voice" / "tmp"
     info = tmp.lstat()
     assert stat.S_ISDIR(info.st_mode)
     assert stat.S_IMODE(info.st_mode) == 0o700
     assert info.st_uid == os.getuid()
-
-
-def test_without_private_tmp_keeps_user_tmpdir(isolated_cache: Path) -> None:
-    env = childenv.clean_env({**BUNDLE_ENV, **USER_ENV}, private_tmp=False)
-    assert env == USER_ENV
-    assert not isolated_cache.exists()
 
 
 def test_default_source_is_process_env_and_not_modified(
@@ -90,4 +141,4 @@ def test_symlinked_tmp_refused(isolated_cache: Path, tmp_path: Path) -> None:
     (tmp_path / "elsewhere").mkdir()
     (isolated_cache / "astra-voice" / "tmp").symlink_to(tmp_path / "elsewhere")
     with pytest.raises(paths.PathError):
-        childenv.clean_env({})
+        childenv.clean_env({}, private_tmp=True)

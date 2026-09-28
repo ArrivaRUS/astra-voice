@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import enum
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -35,6 +36,10 @@ APPIMAGE_PREVIOUS = "previous"
 APPIMAGE_LAUNCHER = "AppRun"
 # <AppDir>/usr/lib/astra-voice/astra_voice/core/paths.py → parents[5] = <AppDir>
 _BUNDLE_DEPTH = 5
+# T1-01.10: MN-1 — APPIMAGE_KEY_RE станет единственной грамматикой KEY: та же маска в
+# packaging/appimage/keylib.sh (key_ok) и общий набор векторов
+# tests/fixtures/appimage/keys.txt для sh и Python (T-181).
+APPIMAGE_KEY_RE = re.compile(r"\d+\.\d+\.\d+(?:~[A-Za-z0-9.]+)?-[0-9a-f]{12}", re.ASCII)
 
 # src/astra_voice/core/paths.py → src/astra_voice/core → src/astra_voice → src → корень
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -63,7 +68,9 @@ def _code_file() -> Path:
 
 
 def _xdg(env_name: str, default: Path) -> Path:
-    raw = os.environ.get(env_name, "").strip()
+    # Без strip(): значение берётся как есть, как в AppRun (`case $X in /*)`) —
+    # иначе Python и sh разошлись бы в каталоге установки AppImage.
+    raw = os.environ.get(env_name, "")
     base = Path(raw) if raw.startswith("/") else default
     return base / APP_NAME
 
@@ -203,6 +210,11 @@ def bundle_root() -> Path | None:
     return None
 
 
+def is_appimage_key(name: str) -> bool:
+    """Имя каталога копии ``<версия>-<build_id>`` в ``app/`` (маска чистки и детекта)."""
+    return APPIMAGE_KEY_RE.fullmatch(name) is not None
+
+
 def appimage_app_dir() -> Path:
     """``<data_dir>/app`` — только копии программы; каталог не создаётся."""
     return _xdg("XDG_DATA_HOME", Path.home() / ".local" / "share") / APPIMAGE_APP_SUBDIR
@@ -237,7 +249,8 @@ def install_kind() -> InstallKind:
     """Способ установки работающей копии (``arch/appimage.md`` §2, T-163).
 
     ``DEB`` — код лежит в ``/usr/lib/astra-voice``; ``APPIMAGE_INSTALLED`` — бандл
-    лежит прямо в ``<data_dir>/app/`` и помечен ``.installed-ok``;
+    лежит прямо в ``<data_dir>/app/<KEY>`` (имя по маске, не ``.tmp-*``) и помечен
+    ``.installed-ok``;
     ``APPIMAGE_PORTABLE`` — любой другой бандл (монтирование FUSE, распаковка);
     ``SOURCE`` — дерево исходников.
     """
@@ -251,6 +264,10 @@ def install_kind() -> InstallKind:
         app_dir = app_dir.resolve()
     except OSError:
         return InstallKind.APPIMAGE_PORTABLE
-    if bundle.parent == app_dir and (bundle / INSTALLED_MARKER).is_file():
+    if (
+        bundle.parent == app_dir
+        and is_appimage_key(bundle.name)
+        and (bundle / INSTALLED_MARKER).is_file()
+    ):
         return InstallKind.APPIMAGE_INSTALLED
     return InstallKind.APPIMAGE_PORTABLE

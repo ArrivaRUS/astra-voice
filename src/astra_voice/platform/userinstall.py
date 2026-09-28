@@ -14,11 +14,11 @@
 
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import logging
 import math
 import os
-import re
 import secrets
 import shutil
 import stat
@@ -35,17 +35,15 @@ from astra_voice.core import childenv, paths
 
 log = logging.getLogger(__name__)
 
-# T1-01.10: MN-1 — KEY_RE станет единственной грамматикой KEY: та же маска в
-# packaging/appimage/keylib.sh (key_ok) и общий набор векторов
-# tests/fixtures/appimage/keys.txt для sh и Python (T-181).
-KEY_RE = re.compile(r"\d+\.\d+\.\d+(?:~[A-Za-z0-9.]+)?-[0-9a-f]{12}", re.ASCII)
+# Грамматика KEY — одна, в paths (метка MN-1 там же).
+KEY_RE = paths.APPIMAGE_KEY_RE
 
 TMP_PREFIX = ".tmp-"
 LOCK_NAME = ".install.lock"
 RUNNING_KEY_NAME = "running-key"
 MIB = 1024 * 1024
 MIN_FREE_BYTES = 350 * MIB
-LOCK_TIMEOUT_S = 60.0
+LOCK_TIMEOUT_S = 180.0
 LOCK_POLL_S = 0.1
 SMOKE_TIMEOUT_S = 60.0
 BUILD_INFO_LIMIT = 4096
@@ -125,7 +123,7 @@ Smoke = Callable[[Path, BuildInfo], None]
 
 def is_key(name: str) -> bool:
     """Имя каталога копии ``<версия>-<build_id>`` (маска чистки)."""
-    return KEY_RE.fullmatch(name) is not None
+    return paths.is_appimage_key(name)
 
 
 def tilde(text: object) -> str:
@@ -265,6 +263,31 @@ def write_running_key(key: str) -> None:
     os.replace(temporary, path)
 
 
+def _sync_filesystem(path: Path) -> None:
+    """Сбрасывает на диск данные и метаданные тома, где лежит ``path`` (``syncfs(2)``).
+
+    Копия — тысячи файлов и каталогов; ``fsync`` каждого — тысячи коммитов журнала
+    ext4, а пропустить каталог легко. ``syncfs`` одним вызовом дожидается записи
+    всех файлов, каталогов и записей в каталогах этого тома и с Linux 5.8 сообщает
+    об ошибках записи. ``os.sync()`` — только запасной путь (libc без ``syncfs``):
+    он ошибок не возвращает и сбрасывает все тома.
+    """
+    try:
+        syncfs = ctypes.CDLL(None, use_errno=True).syncfs
+    except (OSError, AttributeError):
+        os.sync()
+        return
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        if syncfs(fd) != 0:
+            error = ctypes.get_errno()
+            raise UserInstallError(
+                f"Не удалось записать файлы Astra Voice на диск: {os.strerror(error)}"
+            )
+    finally:
+        os.close(fd)
+
+
 def _sync_directory(directory: Path) -> None:
     try:
         fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
@@ -307,7 +330,7 @@ def smoke_test(copy: Path, info: BuildInfo) -> None:
         proc = subprocess.run(
             [str(copy / paths.APPIMAGE_LAUNCHER), "--version"],
             cwd=copy,
-            env=childenv.clean_env(),
+            env=childenv.clean_env(private_tmp=True),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=SMOKE_TIMEOUT_S,
@@ -328,7 +351,12 @@ def smoke_test(copy: Path, info: BuildInfo) -> None:
 
 
 def _copy_verified(src: Path, app: Path, target: Path, info: BuildInfo, smoke: Smoke) -> None:
-    """Копия во временный каталог рядом → маркер → смоук → атомарный rename."""
+    """Копия во временный каталог рядом → маркер → сброс на диск → смоук → rename.
+
+    ``copytree`` не делает ``fsync``, а ``rename`` и ``current`` сбрасываются на
+    диск сразу; без ``syncfs`` до ``rename`` жёсткий сброс питания мог бы оставить
+    текущей копию с файлами нулевой длины.
+    """
     src_text = os.fspath(src)
 
     def ignore(directory: str, names: list[str]) -> list[str]:
@@ -344,6 +372,7 @@ def _copy_verified(src: Path, app: Path, target: Path, info: BuildInfo, smoke: S
             raise UserInstallError(
                 f"Не удалось скопировать файлы Astra Voice: {tilde(exc)}"
             ) from exc
+        _sync_filesystem(temporary)
         smoke(temporary, info)
         stale: Path | None = None
         if os.path.lexists(target):
@@ -412,7 +441,12 @@ def _remove_entry(path: Path) -> bool:
     return True
 
 
-def _cleanup(app: Path, keep: Iterable[str | None]) -> list[str]:
+def _drop_abandoned_tmp(app: Path) -> list[str]:
+    """Под замком: брошенные ``.tmp-*`` прерванных установок (иначе вечное «Недостаточно места»)."""
+    return _cleanup(app, (), only_tmp=True)
+
+
+def _cleanup(app: Path, keep: Iterable[str | None], *, only_tmp: bool = False) -> list[str]:
     keep_names = {name for name in keep if name}
     removed: list[str] = []
     with os.scandir(app) as entries:
@@ -420,7 +454,7 @@ def _cleanup(app: Path, keep: Iterable[str | None]) -> list[str]:
     for name in names:
         if name in keep_names:
             continue
-        if not (name.startswith(TMP_PREFIX) or is_key(name)):
+        if not (name.startswith(TMP_PREFIX) or (is_key(name) and not only_tmp)):
             continue
         if is_key(name) and not _is_real_dir(app / name):
             log.warning("Не удаляю %s: это не каталог копии", name)
@@ -463,25 +497,29 @@ def install_from_dir(
 ) -> InstallResult:
     """Устанавливает бандл ``src`` как ``app/<KEY>`` и делает его текущим.
 
-    Порядок (``arch/appimage.md`` §1): проверки → ``flock`` → повторная проверка
-    «уже установлено» → место → копия в ``app/.tmp-<KEY>.*`` → ``.installed-ok`` →
-    смоук → ``rename`` → ``previous := current`` → ``current := KEY`` → чистка.
+    Порядок (``arch/appimage.md`` §1): отказ от root и проверка источника (до
+    ``app/``) → сведения о сборке → ``flock`` → повторная проверка «уже
+    установлено» → уборка брошенных ``.tmp-*`` → место → копия в
+    ``app/.tmp-<KEY>.*`` → ``.installed-ok`` → ``syncfs`` → смоук → ``rename`` →
+    ``previous := current`` → ``current := KEY`` → чистка.
     Запуск файла всегда делает его версию текущей (старый файл — откат).
     """
     refuse_root()
     src = Path(src)
-    info = read_build_info(src)
     check_source(src)
+    info = read_build_info(src)
     app = paths.appimage_app_dir()
     target = app / info.key
-    if not installed_ok(target, info):
-        # До создания app/: при нехватке места не остаётся ничего.
+    if not os.path.lexists(app):
+        # Первая установка: место проверяем до создания app/ — при нехватке не
+        # остаётся ничего. Если app/ уже есть, проверка — под замком после уборки.
         check_free_space(app, min_free)
     paths.data_dir()
     paths.ensure_private_dir(app)
     with _install_lock(app, lock_timeout):
         copied = False
         if not installed_ok(target, info):
+            _drop_abandoned_tmp(app)
             check_free_space(app, min_free)
             _copy_verified(src, app, target, info, smoke if smoke is not None else smoke_test)
             copied = True
