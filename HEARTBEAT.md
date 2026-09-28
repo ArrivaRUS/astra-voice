@@ -747,3 +747,15 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
   (settings.json, models/ — ПЕРЕНЕСЕНЫ туда mv, autostart-astra-voice.desktop sha256 e4816542…, log-offset). После чеклиста:
   вернуть models/ и settings.json, сверить хэш записи автозапуска, просмотреть журнал с log-offset на ERROR/WARNING.
 - Дальше: исправления по чеклисту → changelog 0.1.0 → CI → `release.sh v0.1.0 --push` (Юрка) → одобрение deployment заказчиком.
+
+## 2026-09-28 14:40 — m6.24 принят заказчиком; готовим 0.1.0
+- Чеклист m6.23 пройден целиком (8.3 — перезагрузкой, 8.4 — запись вернулась байт-в-байт). Замечания исправлены в m6.24:
+  PR #9 (прокрутка мастера, штатный Tab + focusReason; тексты шага 1 и «Режим»), PR #10 (асинхронный Notify, private_bus).
+  Уроки 023, 024. main `728c36b` (packaging m6.24), CI зелёный (run 36406654999). m6.24 проверен заказчиком: «всё отлично»,
+  журнал без WARNING.
+- Настройки и три модели заказчика ВОЗВРАЩЕНЫ (14:33, app pid 272354). В резерве `~/.cache/astra-voice-dev/checklist-backup-20260928/`
+  лишняя копия GigaAM (`models-fresh-20260928`, ~400 МБ) и промежуточные settings — удалять только заказчику.
+- Дальше: changelog-writer дорабатывает `r1-drafts/changelog-0.1.0.txt` и `release-notes-0.1.0.md` (автозапуск в 0.1, «во Fly не
+  проверено», сверка фактов) → запись 0.1.0 в packaging/debian/changelog → CI → `scripts/release.sh v0.1.0 --push` (Юрка) →
+  `git tag -a v0.1.0` + push тега → заказчик одобряет deployment `release` в браузере → `gh release edit --notes-file` →
+  `tools/validate release --version 0.1.0`.
