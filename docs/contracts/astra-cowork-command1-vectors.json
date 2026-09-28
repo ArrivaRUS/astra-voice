@@ -2,13 +2,13 @@
   "title": "Тестовые векторы контракта Astra Voice ↔ Astra Cowork (ru.astralinux.Cowork.Command1)",
   "contract": 1,
   "fixed": "2026-09-24",
-  "document": "1.3",
+  "document": "1.5",
   "bus_name": "ru.astralinux.Cowork",
   "object_path": "/ru/astralinux/Cowork",
   "interface": "ru.astralinux.Cowork.Command1",
   "spec": "astra-cowork-command1.md",
   "conventions": {
-    "typed_value": "объект {\"$dbus\": <сигнатура>, \"value\": …} задаёт тип D-Bus явно (i/u/x/t/d/b/s); обычное число JSON — целое, тип по умолчанию у биндинга (сервер обязан принять i/u/x/t); true/false — тип b; строка — s",
+    "typed_value": "объект {\"$dbus\": <сигнатура>, \"value\": …} задаёт тип D-Bus явно (n/q/i/u/x/t/y/d/b/s/o/g); обычное число JSON — целое, тип по умолчанию у биндинга (сервер обязан принять любую целочисленную сигнатуру n/q/i/u/x/t); true/false — тип b; строка — s",
     "text_gen": "{\"repeat\": <строка>, \"count\": N} — строка, повторённая N раз; {\"concat\": [<элементы>]} — конкатенация элементов (строка или repeat); используется для длинных текстов",
     "length": "длина текста — число кодовых точек Unicode (Python len(str)); не байты и не единицы UTF-16",
     "forbidden_chars": "U+0000–U+001F, U+007F–U+009F (включая U+0085), U+2028, U+2029; с 1.3 (У77) также bidi-управление U+202A–U+202E и U+2066–U+2069 и невидимые U+200B, U+FEFF; ZWJ U+200D и ZWNJ U+200C допустимы; пустота после strip; длина 1…4000",
@@ -17,7 +17,8 @@
     "deadline_margin": "сервер допускает новый request_id, пока now ≤ deadline_mono_ms − margin, margin = max((deadline − sent) · 5 // 100, 30) мс (при бюджете 300 — 30 мс, т.е. не позже sent + 270); причина — таймаут QtDBus у клиента срабатывает до 5 % раньше срока (S9: NoReply за 286,7 мс); вектора O-33, O-46…O-49",
     "error_names": "клиент сопоставляет ошибки D-Bus по полному имени QDBusError.name() (org.freedesktop.DBus.Error.*), не по суффиксу и не по одному type(); callWithCallback вернул False → sent=False → исход сразу без ожидания (C-31, C-33)",
     "nul": "U+0000 в строках D-Bus недопустим — сообщение не уйдёт с клиента (libdbus отвергает); на сервер не попадает, вектора нет; Voice удаляет C0 до отправки",
-    "options_limits": "с 1.3 (У73): не более 16 ключей, суммарно ≤ 8192 байт UTF-8 строковых значений, значения — только базовые типы (строки, целые, b, d); контейнеры (массивы, словари, вложенные варианты) → invalid_options; проверяется синхронно до обращения к шине",
+    "options_limits": "с 1.3 (У73): не более 16 ключей, суммарно ≤ 8192 байт UTF-8 строковых значений, значения — только базовые типы (строки, целые, b, d); проверяется синхронно до обращения к шине. С 1.5: проверяется значение после демаршаллинга Qt, а не сигнатура на проводе; любая целочисленная сигнатура (n/q/i/u/x/t) на месте целого принимается, диапазон проверяется по значению; y на месте целого → отказ; o/g проверяются как строки; вложенные v Qt разворачивает — сервер их не различает и не обязан; контейнеры (a… включая ay, (…), a{…}) в любом ключе → refused/invalid_options; клиент Voice шлёт только s/x/i",
+    "introspection_order": "с 1.5: в нормализованной интроспекции аргументы метода — сначала in, затем out, внутри направления — порядок объявления; Qt выводит тип возврата первым и имён аргументов не экспортирует — имена справочные, сравниваются только (direction, type)",
     "options_gen": "{\"unknown_keys\": N} — к базовым options добавляются N незнакомых ключей k000001… со значением \"x\"; {\"long_string\": {\"key\": K, \"length\": L}} — строка из L символов \"x\" в ключе K; у вектора с cases каждый случай проверяется отдельно с общим expect, если у случая нет своего",
     "sent_boot_ms": "необязательный ключ 1.3 (У88): целое i/u/x/t ≥ 0, Voice шлёт явным x; при наличии сервер требует 0 ≤ boot_now − sent_boot_ms ≤ (deadline − sent) + margin, иначе expired/suspended; boot_now_ms в векторе — CLOCK_BOOTTIME сервера, по умолчанию base.boot_now_ms",
     "error_allowlist": "доказанный отказ у клиента — только имена, которые порождают шина/Qt до слота: NameHasNoOwner, ServiceUnknown (not_running); UnknownInterface, UnknownMethod, UnknownObject (no_contract); InvalidArgs, InvalidSignature, AccessDenied, LimitsExceeded (refused); NoReply/Timeout/TimedOut → unknown/timeout; Disconnected после отправки → unknown/disconnected; любое другое имя → unknown/bad_reply, в журнал код remote_error (У89, У74)",
@@ -1249,6 +1250,62 @@
           }
         }
       ]
+    },
+    {
+      "id": "O-57",
+      "name": "целые после демаршаллинга Qt (1.5): contract как n или q → допуск; как y → invalid_options",
+      "cases": [
+        {
+          "name": "contract как n (int16)",
+          "options": {
+            "source": "astra-voice",
+            "contract": {
+              "$dbus": "n",
+              "value": 1
+            },
+            "request_id": "0123456789abcdef0123456789abcdef",
+            "sent_mono_ms": 5000000,
+            "deadline_mono_ms": 5000300
+          },
+          "expect": {
+            "status": "accepted"
+          }
+        },
+        {
+          "name": "contract как q (uint16)",
+          "options": {
+            "source": "astra-voice",
+            "contract": {
+              "$dbus": "q",
+              "value": 1
+            },
+            "request_id": "0123456789abcdef0123456789abcdef",
+            "sent_mono_ms": 5000000,
+            "deadline_mono_ms": 5000300
+          },
+          "expect": {
+            "status": "accepted"
+          }
+        },
+        {
+          "name": "contract как y (байт)",
+          "options": {
+            "source": "astra-voice",
+            "contract": {
+              "$dbus": "y",
+              "value": 1
+            },
+            "request_id": "0123456789abcdef0123456789abcdef",
+            "sent_mono_ms": 5000000,
+            "deadline_mono_ms": 5000300
+          },
+          "expect": {
+            "status": "refused",
+            "reason": "invalid_options",
+            "uid_lookup": false
+          }
+        }
+      ]
     }
   ],
   "admission_vectors": [
@@ -1602,15 +1659,16 @@
     },
     {
       "id": "A-30",
-      "name": "S9-4: главный цикл занят 600 мс после формирования accepted",
+      "name": "S9-4: главный цикл занят 600 мс после отправки accepted (1.5) — ответ ушёл до блокировки, клиент получил его в срок",
       "state": {
         "loop_busy_ms_after_accept": 600
       },
       "expect": {
         "status": "accepted",
+        "reply_before_block": true,
         "client_outcome": {
-          "kind": "unknown",
-          "reason": "timeout"
+          "kind": "delivered",
+          "reason": "none"
         },
         "tasks_started": 1
       }
@@ -1709,6 +1767,76 @@
           }
         }
       ]
+    },
+    {
+      "id": "A-34",
+      "name": "остановка (1.5, §7 шаг 2): busy/shutting_down синхронно и без обращения к шине — для нового ID, повтора принятого и чужого UID",
+      "state": {
+        "shutting_down": true
+      },
+      "cases": [
+        {
+          "name": "новый request_id",
+          "state": {
+            "shutting_down": true
+          }
+        },
+        {
+          "name": "повтор принятого request_id — busy, а не duplicate",
+          "state": {
+            "shutting_down": true,
+            "accepted_before_ms": 100
+          }
+        },
+        {
+          "name": "отправитель — другой UID",
+          "state": {
+            "shutting_down": true,
+            "sender_uid": "other"
+          }
+        }
+      ],
+      "expect": {
+        "status": "busy",
+        "reason": "shutting_down",
+        "sync": true,
+        "uid_lookup": false,
+        "tasks_started": 0
+      }
+    },
+    {
+      "id": "A-35",
+      "name": "внутренняя ошибка до резервирования (1.5, §7 «ровно один ответ»): refused/not_ready, задач нет, текста исключения в журнале нет",
+      "state": {
+        "admission_raises_before_reservation": true
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "not_ready",
+        "replies": 1,
+        "tasks_started": 0,
+        "log_contains_exception_text": false
+      }
+    },
+    {
+      "id": "A-36",
+      "name": "таймаут login1 при старте (1.5, §9): busy/locked, затем повторное чтение без внешних событий — допуск через ≤ 2 с",
+      "state": {
+        "login1_first_read": "timeout",
+        "login1_available_after_ms": 0
+      },
+      "expect": {
+        "first": {
+          "status": "busy",
+          "reason": "locked"
+        },
+        "after_ms_max": 2000,
+        "then": {
+          "status": "accepted"
+        },
+        "external_events": 0,
+        "steady_state_reads": 0
+      }
     }
   ],
   "client_outcome_vectors": [
@@ -2463,6 +2591,15 @@
       "expect": {
         "name_after_object": true,
         "unregistered_on_quit": true
+      }
+    },
+    {
+      "id": "I-06",
+      "name": "копия QDBusMessage(message) до выхода из слота (1.5, §5.1): отложенный ответ уходит по копии, флаг отложенного ответа общий",
+      "expect": {
+        "copy_before_slot_returns": true,
+        "delayed_flag_shared": true,
+        "delayed_reply_delivered": true
       }
     }
   ]
