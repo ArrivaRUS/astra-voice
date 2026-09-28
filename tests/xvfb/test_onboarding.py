@@ -1660,13 +1660,14 @@ def wait_for_window_size(
     )
 
 
-def activate_for_keyclick(window: QQuickWindow) -> None:
+def activate_for_keyclick(window: QQuickWindow) -> bool:
     """Запросить активацию; QTest шлёт событие окну и без WM на xcb."""
     window.requestActivate()
     for _ in range(25):
         if window.isActive():
-            return
+            return True
         QTest.qWait(20)
+    return bool(window.isActive())
 
 
 def render_onboarding(
@@ -3160,10 +3161,10 @@ def test_onboarding_body_scrolls_twelve_models_and_resets(
 
         assert body.setProperty("contentY", 0)
         cards[-2].forceActiveFocus()
-        activate_for_keyclick(root.window())
+        active = activate_for_keyclick(root.window())
         QTest.keyClick(root.window(), Qt.Key_Tab)
         onboarding_app.processEvents()
-        assert root.window().activeFocusItem() == cards[-1]
+        assert root.window().activeFocusItem() == cards[-1], f"window active={active}"
         top = cards[-1].mapToItem(body, QPointF(0, 0)).y()
         assert top >= -0.5
         assert top + cards[-1].height() <= body.height() + 0.5
@@ -3225,18 +3226,71 @@ def test_onboarding_mouse_focus_does_not_scroll_but_tab_does(
         before_top = target.mapToItem(body, QPointF(0, 0)).y()
         assert before_top + target.height() > body.height() if forward else before_top < 0
         focus_changes = QSignalSpy(root.window().activeFocusItemChanged)
-        activate_for_keyclick(root.window())
+        active = activate_for_keyclick(root.window())
         QTest.keyClick(root.window(), key, modifiers)
         onboarding_app.processEvents()
-        assert len(focus_changes) == 1, "Tab перевёл фокус больше одного раза"
-        assert root.window().activeFocusItem() == target
-        assert abs(body.property("contentY") - scroll_y) > 1
+        assert len(focus_changes) == 1, (
+            f"Tab перевёл фокус {len(focus_changes)} раз; window active={active}"
+        )
+        assert root.window().activeFocusItem() == target, f"window active={active}"
+        assert abs(body.property("contentY") - scroll_y) > 1, f"window active={active}"
         top = target.mapToItem(body, QPointF(0, 0)).y()
         assert top >= -0.5
         assert top + target.height() <= body.height() + 0.5
 
     _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
     assert_no_messages(messages, "onboarding mouse and keyboard focus")
+
+
+def test_onboarding_tab_scrolls_to_retry_inside_mouse_focused_card(onboarding_app: Any) -> None:
+    fake = FakeOnboarding()
+    fake.step = 2
+    fake.models = [{**fake.models[0], "id": f"model-{index}"} for index in range(12)]
+    fake.models[5].update(state="failed", canRetry=True, badge="")
+
+    def inspect(root: Any) -> None:
+        window = root.window()
+        body = next(item for item in visual_tree(root) if item.objectName() == "onboardingBody")
+        cards = [item for item in visual_tree(root) if item.property("modelId")]
+        assert len(cards) == 12
+        card = cards[5]
+        retry = visible_button(card, "Повторить")
+        assert card.property("cardState") == "failed"
+        assert card.property("canRetry") is True
+        assert card.property("badge") == ""
+        assert card.nextItemInFocusChain(True) == retry
+
+        card_y = card.mapToItem(body, QPointF(0, 0)).y()
+        retry_offset = retry.mapToItem(card, QPointF(0, 0)).y()
+        card_top = max(16, body.height() - retry_offset + 8)
+        scroll_y = card_y - card_top
+        assert 0 < scroll_y < body.property("contentHeight") - body.height()
+        assert body.setProperty("contentY", scroll_y)
+        onboarding_app.processEvents()
+        top = card.mapToItem(body, QPointF(0, 0)).y()
+        retry_top = retry.mapToItem(body, QPointF(0, 0)).y()
+        assert 0 < top < body.height() < retry_top
+
+        point = card.mapToScene(QPointF(card.width() / 2, 12)).toPoint()
+        QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point)
+        onboarding_app.processEvents()
+        assert window.activeFocusItem() == card
+        assert abs(body.property("contentY") - scroll_y) < 0.5
+
+        active = activate_for_keyclick(window)
+        QTest.keyClick(window, Qt.Key_Tab)
+        onboarding_app.processEvents()
+        assert window.activeFocusItem() == retry, f"window active={active}"
+        assert abs(body.property("contentY") - scroll_y) > 1, f"window active={active}"
+        retry_top = retry.mapToItem(body, QPointF(0, 0)).y()
+        assert retry_top >= -0.5, f"window active={active}"
+        assert retry_top + retry.height() <= body.height() + 0.5, (
+            f"window active={active}; retry bottom={retry_top + retry.height()}; "
+            f"body height={body.height()}"
+        )
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, "onboarding Tab to retry after mouse focus")
 
 
 def test_onboarding_mouse_focus_on_partly_visible_button_does_not_scroll(
@@ -3668,18 +3722,18 @@ def test_capture_tab_keeps_focus_in_field(onboarding_app: Any) -> None:
         focused = view.activeFocusItem()
         assert focused == capture
 
-        activate_for_keyclick(view)
+        active = activate_for_keyclick(view)
         QTest.keyClick(view, Qt.Key_Tab)
         onboarding_app.processEvents()
-        assert view.activeFocusItem() == focused
+        assert view.activeFocusItem() == focused, f"window active={active}"
         assert capture.property("captureHint") == (
             "Эта клавиша не поддерживается. Выберите букву, цифру, пробел или F1–F12"
         )
         assert fake.calls == []
-        activate_for_keyclick(view)
+        active = activate_for_keyclick(view)
         QTest.keyClick(view, Qt.Key_Tab, Qt.ShiftModifier)
         onboarding_app.processEvents()
-        assert view.activeFocusItem() == focused
+        assert view.activeFocusItem() == focused, f"window active={active}"
         assert fake.calls == []
 
     _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)

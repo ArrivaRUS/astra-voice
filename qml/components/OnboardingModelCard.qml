@@ -135,6 +135,7 @@ Rectangle {
         onClicked: {
             root.pointerFocus = true;
             root.forceActiveFocus(Qt.MouseFocusReason);
+            if (!root.activeFocus) root.pointerFocus = false;
             root.toggleRequested();
         }
     }

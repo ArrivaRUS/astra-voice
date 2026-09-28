@@ -191,11 +191,10 @@ Item {
             var item = root.Window.window.activeFocusItem
             if (!item || !loader.item)
                 return
+            if (item.pointerFocus === true || item.focusReason === Qt.MouseFocusReason)
+                return
             var ancestor = item
             while (ancestor) {
-                if (ancestor.pointerFocus === true
-                        || ancestor.focusReason === Qt.MouseFocusReason)
-                    return
                 if (ancestor === loader.item) {
                     body.ensureVisible(item)
                     return

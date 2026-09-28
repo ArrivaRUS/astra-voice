@@ -152,10 +152,12 @@ def test_onboarding_uses_qt_tab_navigation_and_filters_pointer_focus() -> None:
     assert "keyboardFocusPending" not in shell
     assert "tabShortcutsEnabled" not in shell
     assert "onActiveFocusItemChanged" in shell
-    assert "ancestor.focusReason === Qt.MouseFocusReason" in shell
-    assert "ancestor.pointerFocus === true" in shell
+    assert "item.pointerFocus === true || item.focusReason === Qt.MouseFocusReason" in shell
+    assert "ancestor.pointerFocus" not in shell
+    assert "ancestor.focusReason" not in shell
     assert "body.ensureVisible(item)" in shell
     assert "root.pointerFocus = true" in card
+    assert "if (!root.activeFocus) root.pointerFocus = false;" in card
     assert "onActiveFocusChanged: if (!activeFocus) pointerFocus = false" in card
 
 
