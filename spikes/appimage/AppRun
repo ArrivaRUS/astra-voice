@@ -1,0 +1,122 @@
+#!/bin/sh
+set -eu
+
+HERE=$(dirname "$(readlink -f "$0")")
+APPDIR=${APPDIR:-$HERE}
+BUILD_FILE=$HERE/.astra-voice-build
+[ -r "$BUILD_FILE" ] || { echo 'Не найдены сведения о сборке Astra Voice.' >&2; exit 1; }
+VERSION=$(sed -n 's/^VERSION=//p' "$BUILD_FILE")
+BUILD_ID=$(sed -n 's/^BUILD_ID=//p' "$BUILD_FILE")
+case $VERSION:$BUILD_ID in
+    *[!a-zA-Z0-9._~+:-]*|'':*|*:'') echo 'Повреждены сведения о сборке Astra Voice.' >&2; exit 1 ;;
+esac
+KEY=$VERSION-$BUILD_ID
+ROOT=${XDG_DATA_HOME:-$HOME/.local/share}/astra-voice/app
+TARGET=$ROOT/$KEY
+
+MODE=Г
+if [ "$(readlink -f "$HERE")" = "$(readlink -m "$TARGET")" ]; then
+    MODE=А
+elif [ -n "${APPIMAGE:-}" ]; then
+    if awk -v path="$HERE" '
+        {
+            point=$5; gsub(/\\040/, " ", point)
+            if (path == point || index(path, point "/") == 1 || point == "/") {
+                for (i=6; i<=NF; i++) if ($i == "-") {
+                    if (length(point) > best) { best=length(point); kind=$(i+1) }
+                    break
+                }
+            }
+        }
+        END { exit !(kind ~ /^fuse/) }
+    ' /proc/self/mountinfo; then
+        MODE=Б
+    fi
+fi
+case $(basename "$HERE") in
+    appimage_extracted_*) MODE=В ;;
+esac
+
+# Служебный флаг для замеров. Имя без префикса --appimage-: такие аргументы
+# runtime AppImage перехватывает сам и до AppRun они не доходят.
+if [ "${1:-}" = --selfinstall-status ]; then
+    printf 'MODE=%s\nHERE=%s\nKEY=%s\nROOT=%s\n' "$MODE" "$HERE" "$KEY" "$ROOT"
+    exit 0
+fi
+
+installed_ok() {
+    [ -f "$TARGET/.installed-ok" ] && [ -x "$TARGET/AppRun" ] &&
+        [ -x "$TARGET/opt/python3.11/bin/python3.11" ] &&
+        [ -f "$TARGET/usr/lib/astra-voice/bootstrap.py" ] &&
+        [ -f "$TARGET/.astra-voice-build" ] &&
+        cmp -s "$BUILD_FILE" "$TARGET/.astra-voice-build"
+}
+
+INSTALL=0
+case $MODE in
+    В) INSTALL=1 ;;
+    Б) if [ "${ASTRA_VOICE_SELFINSTALL:-}" = 1 ] || installed_ok; then INSTALL=1; fi ;;
+esac
+
+if [ "$INSTALL" = 1 ]; then
+    (umask 077; mkdir -p "$ROOT") || { echo 'Не удалось создать каталог установки Astra Voice.' >&2; exit 1; }
+    chmod 700 "$ROOT"
+    if ! installed_ok; then
+        LOCK=$ROOT/.lock-$KEY
+        tries=0
+        until mkdir "$LOCK" 2>/dev/null; do
+            if installed_ok; then break; fi
+            tries=$((tries + 1))
+            if [ "$tries" -ge 30 ]; then
+                echo 'Не удалось дождаться окончания установки Astra Voice.' >&2
+                exit 1
+            fi
+            sleep 1
+        done
+        if [ -d "$LOCK" ] && [ "$tries" -lt 30 ]; then
+            if ! installed_ok; then
+                TMP=$(mktemp -d "$ROOT/.tmp-$KEY.XXXXXX") || { rmdir "$LOCK"; echo 'Не удалось подготовить установку Astra Voice.' >&2; exit 1; }
+                if ! cp -a "$HERE"/. "$TMP"/; then
+                    rm -rf "$TMP"
+                    rmdir "$LOCK"
+                    echo 'Не удалось скопировать файлы Astra Voice.' >&2
+                    exit 1
+                fi
+                : > "$TMP/.installed-ok"
+                if [ -e "$TARGET" ]; then rm -rf "$TARGET"; fi
+                if ! mv -T "$TMP" "$TARGET"; then
+                    rm -rf "$TMP"
+                    rmdir "$LOCK"
+                    echo 'Не удалось завершить установку Astra Voice.' >&2
+                    exit 1
+                fi
+            fi
+            rmdir "$LOCK" 2>/dev/null || true
+        fi
+    fi
+    installed_ok || { echo 'Установленная копия Astra Voice повреждена.' >&2; exit 1; }
+    # Runtime type2 20251108 после --appimage-extract-and-run НЕ удаляет свою
+    # распаковку ($TMPDIR/appimage_extracted_<md5>, ~270 МБ) — проверено на
+    # машине заказчика. Копия уже установлена, временная больше не нужна:
+    # удаляем её сами. Оболочка держит открытый дескриптор этого скрипта,
+    # поэтому удаление файла, который сейчас исполняется, безопасно.
+    if [ "$MODE" = В ]; then
+        case $(basename "$HERE") in
+            appimage_extracted_*) [ -f "$HERE/.astra-voice-build" ] && rm -rf "$HERE" ;;
+        esac
+    fi
+    unset ASTRA_VOICE_SELFINSTALL
+    exec "$TARGET/AppRun" "$@"
+fi
+
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE QT_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH QT_QPA_PLATFORMTHEME LD_PRELOAD
+if [ -r /etc/ssl/certs/ca-certificates.crt ]; then
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+else
+    SSL_CERT_FILE=$HERE/opt/python3.11/lib/python3.11/site-packages/certifi/cacert.pem
+fi
+export SSL_CERT_FILE
+ASTRA_VOICE_RESOURCES=$HERE/usr/share/astra-voice
+ASTRA_VOICE_APPIMAGE_DIR=$HERE
+export ASTRA_VOICE_RESOURCES ASTRA_VOICE_APPIMAGE_DIR
+exec "$HERE/opt/python3.11/bin/python3.11" -I "$HERE/usr/lib/astra-voice/bootstrap.py" app "$@"
