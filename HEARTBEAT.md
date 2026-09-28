@@ -717,3 +717,25 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
 - **Cowork:** почтовой сессии дано «C0 в прод — да» (C0 прошёл 2 ревью; T2 по C0 — к C1/v1.0, выкладку не блокирует).
 - **Дальше (R1 30.09):** PAT для агентов (инструкция заказчику), T3 перед тегом, changelog `0.1.0`, чеклист живых сценариев,
   INSTALL-ADMIN «[уточнить]»; мелочи: QtQuick.Shapes из Depends/CI, лямбды `app.py:328`, `model_downloads.py:2180`.
+
+### 2026-09-28 — перед сжатием контекста (до тега v0.1.0 — 2 дня)
+- **У заказчика `m6.22`** (pid 1541993 на момент установки 27.09), приняты m6.19–m6.22. Хвост записи 50 мс — не обрезает.
+  **Ц2 PASS 27.09** по `t_total_ms` (отпустил → окно забрало текст): 50/50, p50 327 · p95 352 · max 388 (`spikes/m4_live/`).
+- **main `7d808ad`**, CI зелёный на коде `901eb43` (m6.22). Слиты сегодня/вчера: PR #3–#7, `wip/r1-docs` (PRD Ц2 и §11.1,
+  test-plan/plans/status, README, INSTALL-ADMIN — проверка подписи по `VALIDSIG` мастера, часы; «[уточнить]» сняты).
+- **ИБ T3 v0.1.0:** PASS с условиями (`docs/security/T3-2026-09-28-v0.1.md`, §10 — сверка). P1-2 (INSTALL-ADMIN) закрыт;
+  **P1-1 `release.sh:86` — в работе** (ветка `wip/r1-code`, worktree `~/.cache/astra-voice-dev/wt-r1-code`, developer-codex).
+  Принятые риски P2 — в decisions 28.09. **ИБ-проверки реже** (заказчик 28.09, память `feedback_fewer_security_reviews`).
+- **В работе (`wip/r1-code`, developer-codex):** (1) P1-1 `release.sh` + тест T-130; (2) **рабочий переключатель автозапуска**
+  (решение заказчика 28.09): `~/.config/autostart/astra-voice.desktop`; ручную запись заказчика (`sleep 8; …pipewire-pulse.socket;
+  exec astra-voice --hidden`) не переписывать — выкл = `Hidden=true`, вкл = снять; стандартная — `Exec=astra-voice --hidden`,
+  метка `X-AstraVoice-Managed=true`; системный `/etc/xdg/autostart/` + переопределение; мастер создаёт запись. INSTALL-ADMIN/
+  README/PRD разработчик НЕ правит — после его отчёта дописать раздел автозапуска (tech-writer) по факту.
+- **Токен GitHub:** fine-grained PAT до 01.02.2027, без Workflows/Admin/Env/Secrets (память `reference_github_agent_token`);
+  правки `.github/workflows` агенты не пушат (и заказчик тем же токеном тоже) — только правкой файла в браузере.
+- **Дальше:** code-reviewer по `wip/r1-code` → PR (черновой, CI) → merge → `m6.23` → заказчик проходит чеклист
+  (`scratchpad/Astra-Voice-0.1-чеклист.md`, отправлен 28.09; добавить пункт про автозапуск; перед чеклистом Юрка сохраняет
+  настройки и модель, сбрасывает к первому запуску, после — возвращает) → исправления → changelog `0.1.0`
+  (`scratchpad/changelog-0.1.0.txt`, тело релиза `scratchpad/release-notes-0.1.0.md` — Ctrl+Esc-формулировка поправлена; Fly —
+  «проверено меньше», если проверки не будет — «не проверено») → CI → **`release.sh v0.1.0 --push` запускает Юрка («ок» заказчика
+  28.09)** → заказчик одобряет deployment в браузере → `tools/validate release --version 0.1.0`.
