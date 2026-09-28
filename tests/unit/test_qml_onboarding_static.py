@@ -144,6 +144,21 @@ def test_onboarding_body_and_network_copy() -> None:
     ) in network
 
 
+def test_onboarding_uses_qt_tab_navigation_and_filters_pointer_focus() -> None:
+    shell = source(ONBOARDING / "Onboarding.qml")
+    card = source(REPO / "qml/components/OnboardingModelCard.qml")
+    assert not re.search(r'\bsequence[s]?\s*:\s*(?:"Tab"|\["Backtab")', shell)
+    assert "moveFocusByTab" not in shell
+    assert "keyboardFocusPending" not in shell
+    assert "tabShortcutsEnabled" not in shell
+    assert "onActiveFocusItemChanged" in shell
+    assert "ancestor.focusReason === Qt.MouseFocusReason" in shell
+    assert "ancestor.pointerFocus === true" in shell
+    assert "body.ensureVisible(item)" in shell
+    assert "root.pointerFocus = true" in card
+    assert "onActiveFocusChanged: if (!activeFocus) pointerFocus = false" in card
+
+
 @pytest.mark.parametrize(
     ("component", "states"),
     [

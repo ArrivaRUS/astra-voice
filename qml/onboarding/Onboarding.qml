@@ -18,21 +18,6 @@ Item {
     readonly property bool canFinish: root.bridge ? root.bridge.canFinish : false
     readonly property var stepNames: [qsTr("Сеть"), qsTr("Модель"), qsTr("Горячая клавиша"), qsTr("Микрофон"), qsTr("Готово")]
     readonly property var stepSources: ["Step1Network.qml", "Step2Model.qml", "Step3Hotkey.qml", "Step4Mic.qml", "Step5Done.qml"]
-    property bool keyboardFocusPending: false
-    readonly property bool tabShortcutsEnabled: {
-        if (!root.visible || !root.enabled || !root.Window.window)
-            return false
-        var item = root.Window.window.activeFocusItem
-        while (item) {
-            if (item.captureActive === true)
-                return false
-            if (item === root)
-                return true
-            item = item.parent
-        }
-        return false
-    }
-
     anchors.fill: parent
     implicitWidth: Theme.sizeWindowW
     implicitHeight: Theme.sizeWindowH - Theme.sizeTitlebarH
@@ -55,33 +40,6 @@ Item {
         event.accepted = false
         if (loader.item && loader.item.escPressed)
             event.accepted = loader.item.escPressed() === true
-    }
-
-    // В Qt 5.15 Tab обрабатывается до Keys у предка; Shortcut сохраняет цепочку Qt.
-    function moveFocusByTab(forward) {
-        var current = root.Window.window.activeFocusItem
-        if (!current)
-            return
-        var next = current.nextItemInFocusChain(forward)
-        if (next && next !== current) {
-            root.keyboardFocusPending = true
-            next.forceActiveFocus(forward ? Qt.TabFocusReason : Qt.BacktabFocusReason)
-            root.keyboardFocusPending = false
-        }
-    }
-
-    Shortcut {
-        sequence: "Tab"
-        enabled: root.tabShortcutsEnabled
-        onActivated: root.moveFocusByTab(true)
-        onActivatedAmbiguously: root.moveFocusByTab(true)
-    }
-
-    Shortcut {
-        sequences: ["Backtab", "Shift+Backtab", "Shift+Tab"]
-        enabled: root.tabShortcutsEnabled
-        onActivated: root.moveFocusByTab(false)
-        onActivatedAmbiguously: root.moveFocusByTab(false)
     }
 
     // Shortcut обрабатывает Enter и когда фокус находится на контроле тела/панели.
@@ -230,9 +188,20 @@ Item {
     Connections {
         target: root.Window.window
         function onActiveFocusItemChanged() {
-            if (root.keyboardFocusPending)
-                body.ensureVisible(root.Window.window.activeFocusItem)
-            root.keyboardFocusPending = false
+            var item = root.Window.window.activeFocusItem
+            if (!item || !loader.item)
+                return
+            var ancestor = item
+            while (ancestor) {
+                if (ancestor.pointerFocus === true
+                        || ancestor.focusReason === Qt.MouseFocusReason)
+                    return
+                if (ancestor === loader.item) {
+                    body.ensureVisible(item)
+                    return
+                }
+                ancestor = ancestor.parent
+            }
         }
     }
 

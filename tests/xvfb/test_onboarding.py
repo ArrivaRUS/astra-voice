@@ -1622,6 +1622,53 @@ def grab_frame(app: Any, window: QQuickWindow, case: str) -> QImage:
     return image
 
 
+def wait_for_window_size(
+    app: Any, window: QQuickWindow, width: int, height: int, *, exposed: bool = False
+) -> None:
+    """Дождаться асинхронного изменения геометрии окна и тела в Qt/xcb."""
+    body = next(
+        (
+            item
+            for item in visual_tree(window.contentItem())
+            if item.objectName() == "onboardingBody"
+        ),
+        None,
+    )
+    stable_body_height = None
+    stable_count = 0
+    for _ in range(100):
+        app.processEvents()
+        body_height = body.height() if body is not None else None
+        ready = (
+            (not exposed or window.isExposed())
+            and (window.width(), window.height()) == (width, height)
+            and (body is None or (body_height is not None and body_height > 0))
+        )
+        if ready and body_height == stable_body_height:
+            stable_count += 1
+        else:
+            stable_count = 0
+        if ready and stable_count >= 1:
+            return
+        stable_body_height = body_height
+        QTest.qWait(20)
+    pytest.fail(
+        f"окно/тело не приняли размер {width}×{height} за 2 с: "
+        f"окно={window.width()}×{window.height()}, "
+        f"тело={body.height() if body is not None else 'отсутствует'}, "
+        f"isExposed={window.isExposed()}"
+    )
+
+
+def activate_for_keyclick(window: QQuickWindow) -> None:
+    """Запросить активацию; QTest шлёт событие окну и без WM на xcb."""
+    window.requestActivate()
+    for _ in range(25):
+        if window.isActive():
+            return
+        QTest.qWait(20)
+
+
 def render_onboarding(
     app: Any,
     fake: FakeOnboarding,
@@ -1655,6 +1702,7 @@ def render_onboarding(
         )
         assert root.property("freezeAnimations") is True
         view.show()
+        wait_for_window_size(app, view, WIDTH, HEIGHT, exposed=True)
         QTest.qWait(180 + extra_wait_ms)
         app.processEvents()
         assert view.status() == QQuickView.Ready, [error.toString() for error in view.errors()]
@@ -2521,36 +2569,41 @@ def test_download_strip_track_stays_at_right_edge(onboarding_app: Any, screen: s
         fake.downloadState = "downloading"
         fake.speed = "5,2 МБ/с"
         fake.eta = "осталось ~3 мин"
-        strip.window().setWidth(int(theme_number("sizeWindowMinW")))
-        QTest.qWait(20)
-        onboarding_app.processEvents()
-        assert abs(strip.width() - 900) <= 1
-        left = track_x()
-        assert tail.isVisible()
-        assert tail.property("text") == "Скачиваю с huggingface.co · 5,2 МБ/с · осталось ~3 мин"
-        tail_left = tail.mapToItem(strip, QPointF(0, 0)).x()
-        tail_right = tail.mapToItem(strip, QPointF(tail.width(), 0)).x()
-        assert abs((left - tail_right) - expected_gap) <= 1
-        title = next(
-            item for item in visual_tree(strip) if item.property("text") == fake.downloadTitle
-        )
-        assert title.isVisible()
-        assert title.mapToItem(strip, QPointF(title.width(), 0)).x() <= tail_left
+        window = strip.window()
+        original_size = (window.width(), window.height())
+        try:
+            window.setWidth(int(theme_number("sizeWindowMinW")))
+            wait_for_window_size(onboarding_app, window, 900, original_size[1])
+            assert abs(strip.width() - 900) <= 1
+            left = track_x()
+            assert tail.isVisible()
+            assert tail.property("text") == "Скачиваю с huggingface.co · 5,2 МБ/с · осталось ~3 мин"
+            tail_left = tail.mapToItem(strip, QPointF(0, 0)).x()
+            tail_right = tail.mapToItem(strip, QPointF(tail.width(), 0)).x()
+            assert abs((left - tail_right) - expected_gap) <= 1
+            title = next(
+                item for item in visual_tree(strip) if item.property("text") == fake.downloadTitle
+            )
+            assert title.isVisible()
+            assert title.mapToItem(strip, QPointF(title.width(), 0)).x() <= tail_left
 
-        for state, title_text, button_text in (
-            ("failed", "Не удалось загрузить модель", "Повторить"),
-            ("no-space", "Не хватает места на диске", "Открыть папку моделей"),
-        ):
-            fake.downloadState = state
-            fake.downloadTitle = title_text
-            fake.downloadDetail = "нужно ещё 172 МБ" if state == "no-space" else ""
-            QTest.qWait(20)
-            onboarding_app.processEvents()
-            assert not track.isVisible()
-            assert not tail.isVisible()
-            button = visible_button(strip, button_text)
-            button_right = button.mapToItem(strip, QPointF(button.width(), 0)).x()
-            assert abs(button_right - (strip.width() - right_margin)) <= 1
+            for state, title_text, button_text in (
+                ("failed", "Не удалось загрузить модель", "Повторить"),
+                ("no-space", "Не хватает места на диске", "Открыть папку моделей"),
+            ):
+                fake.downloadState = state
+                fake.downloadTitle = title_text
+                fake.downloadDetail = "нужно ещё 172 МБ" if state == "no-space" else ""
+                QTest.qWait(20)
+                onboarding_app.processEvents()
+                assert not track.isVisible()
+                assert not tail.isVisible()
+                button = visible_button(strip, button_text)
+                button_right = button.mapToItem(strip, QPointF(button.width(), 0)).x()
+                assert abs(button_right - (strip.width() - right_margin)) <= 1
+        finally:
+            window.resize(*original_size)
+            wait_for_window_size(onboarding_app, window, *original_size)
 
     if screen == "onboarding":
         _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
@@ -3107,6 +3160,7 @@ def test_onboarding_body_scrolls_twelve_models_and_resets(
 
         assert body.setProperty("contentY", 0)
         cards[-2].forceActiveFocus()
+        activate_for_keyclick(root.window())
         QTest.keyClick(root.window(), Qt.Key_Tab)
         onboarding_app.processEvents()
         assert root.window().activeFocusItem() == cards[-1]
@@ -3137,8 +3191,9 @@ def test_onboarding_body_scrolls_twelve_models_and_resets(
     ids=["tab", "backtab", "shift-backtab", "shift-tab"],
 )
 def test_onboarding_mouse_focus_does_not_scroll_but_tab_does(
-    onboarding_app: Any, key: Any, modifiers: Any, forward: bool
+    onboarding_app: Any, monkeypatch: Any, key: Any, modifiers: Any, forward: bool
 ) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "HEIGHT", 620)
     fake = FakeOnboarding()
     fake.step = 2
     fake.models = [{**fake.models[0], "id": f"model-{index}"} for index in range(12)]
@@ -3170,6 +3225,7 @@ def test_onboarding_mouse_focus_does_not_scroll_but_tab_does(
         before_top = target.mapToItem(body, QPointF(0, 0)).y()
         assert before_top + target.height() > body.height() if forward else before_top < 0
         focus_changes = QSignalSpy(root.window().activeFocusItemChanged)
+        activate_for_keyclick(root.window())
         QTest.keyClick(root.window(), key, modifiers)
         onboarding_app.processEvents()
         assert len(focus_changes) == 1, "Tab перевёл фокус больше одного раза"
@@ -3181,6 +3237,64 @@ def test_onboarding_mouse_focus_does_not_scroll_but_tab_does(
 
     _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
     assert_no_messages(messages, "onboarding mouse and keyboard focus")
+
+
+def test_onboarding_mouse_focus_on_partly_visible_button_does_not_scroll(
+    onboarding_app: Any, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "HEIGHT", 250)
+    fake = FakeOnboarding()
+    fake.step = 2
+
+    def inspect(root: Any) -> None:
+        window = root.window()
+        body = next(item for item in visual_tree(root) if item.objectName() == "onboardingBody")
+        button = visible_button(root, "Установить из файла или папки…")
+        card = next(item for item in visual_tree(root) if item.property("modelId"))
+        card.forceActiveFocus()
+        button_y = button.mapToItem(body.property("contentItem"), QPointF(0, 0)).y()
+        scroll_y = button_y + button.height() / 2 - body.height()
+        assert 0 < scroll_y < body.property("contentHeight") - body.height()
+        assert body.setProperty("contentY", scroll_y)
+        onboarding_app.processEvents()
+        button_top = button.mapToItem(body, QPointF(0, 0)).y()
+        assert 0 < button_top < body.height() < button_top + button.height()
+
+        reasons_at_signal: list[Any] = []
+
+        def record_focus_reason() -> None:
+            if window.activeFocusItem() == button:
+                reasons_at_signal.append(button.property("focusReason"))
+
+        window.activeFocusItemChanged.connect(record_focus_reason)
+        try:
+            point = button.mapToScene(QPointF(button.width() / 2, button.height() / 4)).toPoint()
+            body_top = body.mapToScene(QPointF(0, 0)).y()
+            assert body_top <= point.y() < body_top + body.height(), (
+                body_top,
+                body.height(),
+                button_y,
+                scroll_y,
+                body.property("contentY"),
+                point,
+            )
+            QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point)
+            onboarding_app.processEvents()
+        finally:
+            window.activeFocusItemChanged.disconnect(record_focus_reason)
+        assert window.activeFocusItem() == button, (
+            window.activeFocusItem(),
+            button,
+            point,
+            reasons_at_signal,
+            fake.calls,
+        )
+        assert reasons_at_signal == [Qt.MouseFocusReason]
+        assert abs(body.property("contentY") - scroll_y) < 0.5
+        assert fake.calls == ["pickInstallPath"]
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, "onboarding mouse focus on button")
 
 
 @pytest.mark.parametrize("height", [588, 620])
@@ -3553,8 +3667,8 @@ def test_capture_tab_keeps_focus_in_field(onboarding_app: Any) -> None:
         capture = next(item for item in visual_tree(root) if item.property("captureActive"))
         focused = view.activeFocusItem()
         assert focused == capture
-        assert root.property("tabShortcutsEnabled") is False
 
+        activate_for_keyclick(view)
         QTest.keyClick(view, Qt.Key_Tab)
         onboarding_app.processEvents()
         assert view.activeFocusItem() == focused
@@ -3562,10 +3676,10 @@ def test_capture_tab_keeps_focus_in_field(onboarding_app: Any) -> None:
             "Эта клавиша не поддерживается. Выберите букву, цифру, пробел или F1–F12"
         )
         assert fake.calls == []
+        activate_for_keyclick(view)
         QTest.keyClick(view, Qt.Key_Tab, Qt.ShiftModifier)
         onboarding_app.processEvents()
         assert view.activeFocusItem() == focused
-        assert root.property("tabShortcutsEnabled") is False
         assert fake.calls == []
 
     _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
