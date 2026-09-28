@@ -251,7 +251,15 @@ def harness(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> Iterator[Har
     monkeypatch.setattr(notify, "notify_tray_unavailable", banner)
     notify.reset_state()
     send = Mock(return_value=1)
-    monkeypatch.setattr(notify, "_send", send)
+
+    def send_stub(seq: int, notice: Any, replaces_id: int) -> None:
+        send(notice.summary, notice.body, notice.urgency, replaces_id, notice.actions)
+        if send.return_value:
+            notify._on_reply(seq, 41, None)
+        else:
+            notify._on_reply(seq, None, "org.freedesktop.DBus.Error.Disconnected")
+
+    monkeypatch.setattr(notify, "_send", send_stub)
     flush = Mock(wraps=notify.flush_pending)
     monkeypatch.setattr(notify, "flush_pending", flush)
     drop = Mock(wraps=notify.drop_pending)
