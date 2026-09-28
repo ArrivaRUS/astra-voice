@@ -759,3 +759,26 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
   проверено», сверка фактов) → запись 0.1.0 в packaging/debian/changelog → CI → `scripts/release.sh v0.1.0 --push` (Юрка) →
   `git tag -a v0.1.0` + push тега → заказчик одобряет deployment `release` в браузере → `gh release edit --notes-file` →
   `tools/validate release --version 0.1.0`.
+
+## 2026-09-28 ~14:45 — ПЕРЕД СЖАТИЕМ: выпуск 0.1.0 в процессе
+- **Состояние:** main `4326c2d` = запись `0.1.0` в packaging/debian/changelog (из `r1-drafts/changelog-0.1.0.txt`) поверх документов
+  к выпуску (`84ea309`, `e65aa5e`: README/INSTALL-ADMIN — Fly «не проверено», отмена Esc в режиме удержания, «подписанные выпуски
+  публикуются в GitHub Releases», шапка INSTALL-ADMIN «Инструкция к выпуску 0.1.0»; PRD §11.1 итог Fly). CI на `4326c2d` — идёт
+  (фоновое ожидание в сессии; проверить `gh run list --commit 4326c2d`).
+- **Решение заказчика:** выпуск СЕГОДНЯ 28.09 (decisions `6a8b56c`). «Ок» на запуск release.sh Юркой — с 28.09 (decisions `7d808ad`).
+- **Шаги выпуска (Юрка):**
+  1. CI зелёный на HEAD → `cd ~/Документы/astra-voice && scripts/release.sh v0.1.0 --push` (проверки: чистое дерево, main, HEAD ==
+     origin/main, changelog 0.1.0, CI на HEAD success, тег свободен). Скрипт только ПЕЧАТАЕТ команды тега.
+  2. `git tag -a v0.1.0 -m "Astra Voice v0.1.0"` (signingkey не задан → `-a`) → `git push origin refs/tags/v0.1.0`.
+  3. Job `release` в ci.yml ждёт одобрения deployment `release` → ЗАКАЗЧИК в браузере: Actions → run по тегу v0.1.0 → Review
+     deployments; сверить: коммит run = `4326c2d…` (коммит тега), `.github/workflows/ci.yml` на нём не менялся с последнего
+     зелёного main. Юрка присылает ссылку на run.
+  4. После публикации: `gh release edit v0.1.0 --notes-file ~/.cache/astra-voice-dev/r1-drafts/release-notes-0.1.0.md`
+     (релиз создаётся с --generate-notes) → `tools/validate release --version 0.1.0` → скачать ассеты в scratchpad и проверить
+     подпись по INSTALL-ADMIN §2 (1 pub, VALIDSIG мастера 5F1F7718559F8F57FFE1178055BB1162F17A5CB0, sha256sum -c).
+  5. Затем: decisions/HEARTBEAT/память «0.1.0 опубликован», заказчику — ставить ли 0.1.0 поверх m6.24 (версия 0.1.0 > 0.1.0~m6.24).
+- Заметки к выпуску готовы: `r1-drafts/release-notes-0.1.0.md` (changelog-writer, факты сверены; Fly не проверено; автозапуск в 0.1).
+- **Следующее по плану — R2 v0.2 (15.10)**: M6-хвост, M7 сеть/проверки обновлений, M8 обновлятор трек A (polkit+root-помощник,
+  ⛔ T2), M9 уведомления/звуки/разделы/живая тема + Fly; C0 в Cowork; перенесённое из 0.1 (смена микрофона посреди фразы S5-A5,
+  T-116 часы, T3 P2: latest.json без секрета, persist-credentials — только браузером, отдельный job sign); мелочи (лямбды на
+  сигналах app.py:328 / model_downloads.py:2180; QtQuick.Shapes из Depends/CI; спайки на private_bus).
