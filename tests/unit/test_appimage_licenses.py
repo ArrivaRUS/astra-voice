@@ -103,6 +103,23 @@ def test_missing_common_text_fails(tree: tuple[Path, Path]) -> None:
         lic.collect(appdir, ROOT, doc, DEBS)
 
 
+@pytest.mark.parametrize(
+    ("text", "refs"),
+    [
+        ("see /usr/share/common-licenses/LGPL-2.1.\n", ["LGPL-2.1"]),
+        ("in `/usr/share/common-licenses/Apache-2.0'.", ["Apache-2.0"]),
+        ("GPL: /usr/share/common-licenses/GPL-3", ["GPL-3"]),
+        (
+            "(/usr/share/common-licenses/MPL-2.0), /usr/share/common-licenses/GPL-2,",
+            ["MPL-2.0", "GPL-2"],
+        ),
+    ],
+)
+def test_common_license_references(text: str, refs: list[str]) -> None:
+    """Ревью Б: версии через точку, кавычки, точка в конце предложения и конец файла."""
+    assert lic._COMMON_REF_RE.findall(text) == refs
+
+
 def test_debian_copyright_missing_or_escaping(tree: tuple[Path, Path], tmp_path: Path) -> None:
     appdir, doc = tree
     with pytest.raises(lic.LicenseError, match="python3.11-minimal: нет copyright"):

@@ -47,7 +47,9 @@ COMMON = {
     "Apache-2.0": "Apache-2.0.txt",
     "MPL-2.0": "MPL-2.0.txt",
 }
-_COMMON_REF_RE = re.compile(r"/usr/share/common-licenses/([A-Za-z0-9.+-]+?)['\"\s.,)]")
+#: Имя лицензии: буквы/цифры/+/- и числовые суффиксы через точку (LGPL-2.1, Apache-2.0);
+#: завершающая точка предложения и конец файла не мешают (ревью Б).
+_COMMON_REF_RE = re.compile(r"/usr/share/common-licenses/([A-Za-z0-9+-]+(?:\.[0-9]+)*)")
 
 
 class LicenseError(RuntimeError):
