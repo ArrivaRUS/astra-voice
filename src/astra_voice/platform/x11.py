@@ -81,6 +81,7 @@ class X11Display:
         self._error_count = 0
         self._last_error: str | None = None
         self._finalizer: weakref.finalize[[Any], X11Display] | None = None
+        self._probe_window: Any = None
 
     def _on_error(self, exc: Any, request: Any) -> int:
         """Подавляет stderr Xlib и учитывает асинхронную ошибку."""
@@ -144,7 +145,8 @@ class X11Display:
             self._finalizer = None
         elif self.d is not None:
             self._close_connection(self.d)
-        self.d = self.root = None
+        # Окно пробы — ресурс этого соединения: сервер уничтожит его вместе с ним.
+        self.d = self.root = self._probe_window = None
         self.keyboard_grab_deadline = None
         self.lock_masks = dict.fromkeys(self.lock_masks, 0)
 
@@ -335,6 +337,54 @@ class X11Display:
         except Exception as exc:
             log.debug("не удалось захватить клавиатуру X11: %s", exc)
             return False
+
+    def probe_window(self) -> int | None:
+        """Собственное окно для пробы захвата клавиатуры; None — окна нет.
+
+        InputOnly 1×1 в (-1, -1), override-redirect, отображено: захват требует
+        видимого окна. Так же устроен nullFocus самого KWin. Оконный менеджер
+        такого окна не ведёт (нет MapRequest, нет в ``_NET_CLIENT_LIST``), корень
+        при захвате не получает Focus-событий — fly-wm не на что отвечать
+        перезахватом. Окну фокуса достаются только FocusOut/NotifyGrab и
+        FocusIn/NotifyUngrab, которые KWin 5.27 пропускает; FocusOut/NotifyUngrab
+        (захват на самом окне фокуса) KWin принимал за потерю активации.
+        Создаётся один раз и живёт до закрытия соединения.
+        """
+        self._enforce_keyboard_deadline()
+        if self._probe_window is not None:
+            return int(self._probe_window.id)
+        window: Any = None
+        try:
+            from Xlib import X
+
+            conn = self._require_display()
+            before = self._error_count
+            window = self.root.create_window(
+                -1,
+                -1,
+                1,
+                1,
+                0,
+                0,
+                window_class=X.InputOnly,
+                visual=X.CopyFromParent,
+                override_redirect=True,
+            )
+            window.map()
+            conn.sync()
+            if self._error_count == before and window.get_attributes().map_state == X.IsViewable:
+                self._probe_window = window
+                return int(window.id)
+            log.debug("окно пробы захвата не стало видимым")
+        except Exception as exc:
+            log.debug("не удалось создать окно пробы захвата: %s", type(exc).__name__)
+        if window is not None:
+            try:
+                window.destroy()
+                self._require_display().sync()
+            except Exception as exc:
+                log.debug("не удалось убрать окно пробы захвата: %s", type(exc).__name__)
+        return None
 
     def keyboard_grab_expired(self) -> bool:
         """Истёк ли срок активного захвата; чистая проверка для диагностики."""
