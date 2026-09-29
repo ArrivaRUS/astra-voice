@@ -93,7 +93,10 @@ jobs:
         run: |
           # --also yaml: test_ci_lint.py пропускает себя без PyYAML не через
           # importorskip, а вручную — гейт об этом сам не узнает.
-          "$VENV/bin/python" scripts/ci_require_imports.py tests/unit --also yaml
+          # tests/net и tests/updates (M7) — тоже unit и тоже на requests; пока
+          # каталога нет в дереве, --if-exists его пропускает.
+          "$VENV/bin/python" scripts/ci_require_imports.py tests/unit \
+            --if-exists tests/net tests/updates --also yaml
       - run: make test VENV=$VENV
         env:
           ASTRA_VOICE_REQUIRE_QT: "1"

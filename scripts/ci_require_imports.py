@@ -13,6 +13,11 @@
 
     scripts/ci_require_imports.py tests/xvfb            # все зависимости каталога
     scripts/ci_require_imports.py tests/unit --also numpy
+    scripts/ci_require_imports.py tests/unit --if-exists tests/net tests/updates
+
+`--if-exists` — каталоги, которых в дереве может ещё не быть (появляются с другой веткой):
+отсутствующий пропускается с пометкой. Обычный путь без файла — ошибка (опечатка не должна
+молча выключать гейт).
 
 Файл, где `importorskip` встречается внутри тестовой фикстуры, а не как настоящая
 зависимость (например, тест самого гейта), исключается строкой-меткой
@@ -76,7 +81,24 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="обязательные зависимости тестов в CI")
     ap.add_argument("paths", nargs="+", type=Path, help="каталоги или файлы тестов")
     ap.add_argument("--also", nargs="*", default=[], help="модули сверх найденных")
+    ap.add_argument(
+        "--if-exists",
+        nargs="*",
+        default=[],
+        type=Path,
+        help="каталоги, которые проверяются, только если уже есть в дереве",
+    )
     args = ap.parse_args(argv)
+
+    absent = [path for path in args.paths if not path.exists()]
+    if absent:
+        print(f"нет таких путей: {', '.join(map(str, absent))}", file=sys.stderr)
+        return 2
+    for path in args.if_exists:
+        if path.exists():
+            args.paths.append(path)
+        else:
+            print(f"  {path}: каталога ещё нет — пропуск")
 
     modules = sorted(set(required_modules(args.paths)) | set(args.also))
     if not modules:

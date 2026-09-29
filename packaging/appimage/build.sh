@@ -209,6 +209,11 @@ rm -rf "$SITE/pip" "$SITE"/pip-*.dist-info "$SITE/bin" \
     "$STDLIB/ensurepip" "$STDLIB/idlelib" "$STDLIB/tkinter" \
     "$STDLIB/turtledemo" "$STDLIB/test" "$STDLIB/lib2to3/tests" \
     "$APPDIR/opt/python3.11/include" "$APPDIR/usr/share/tcltk" "$APPDIR/usr/bin"
+# Обёртки консольных скриптов (bin/) не входят в образ, а их строки в RECORD несут хэш
+# файла с абсолютным путём интерпретатора в shebang — путь рабочего каталога попадал
+# бы в образ и BUILD_ID (две сборки в разных каталогах давали разные образы). Убираем
+# строки файлов вне site-packages: RECORD описывает ровно то, что лежит в образе.
+sed -i '/^\.\.\//d' "$SITE"/*.dist-info/RECORD
 
 # Состав site-packages = колёса lock, ни больше ни меньше (иначе SBOM врёт).
 # shellcheck disable=SC2046

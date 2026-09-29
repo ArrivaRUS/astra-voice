@@ -51,6 +51,8 @@
 | п.4 | больше ничего: `permissions`, пины SHA, `environment: release`, запрет `pull_request_target` | без изменений; `ci_lint.py` зелёный на `ci.yml.proposed` (тест `test_proposed_workflow_passes`) |
 | п.5 | отдельный job подписи (T-121) | не входит, v1.0 |
 
+Сверх §9.4: в job `unit` гейт `ci_require_imports.py` проверяет и `tests/net`, `tests/updates`
+(сетевые проверки M7 не должны молча пропускаться без `requests`; каталога ещё нет — пропуск).
 Сверх §9.4: `persist-credentials: false` добавлен и в остальные job (`lint`, `unit`, `xvfb`,
 `ci-lint`, `engine`, `deb`) — так требует T-131 (T3 P2-2: «во всех checkout»); на сборку не влияет.
 
@@ -112,7 +114,19 @@
        - name: Системные пакеты
          # test_real_qml_* грузит настоящий qml/Pill.qml; нужны QML-модули.
          # Трей рендерит SVG плагином Qt из libqt5svg5.
-@@ -100,6 +107,8 @@
+@@ -86,7 +93,10 @@
+         run: |
+           # --also yaml: test_ci_lint.py пропускает себя без PyYAML не через
+           # importorskip, а вручную — гейт об этом сам не узнает.
+-          "$VENV/bin/python" scripts/ci_require_imports.py tests/unit --also yaml
++          # tests/net и tests/updates (M7) — тоже unit и тоже на requests; пока
++          # каталога нет в дереве, --if-exists его пропускает.
++          "$VENV/bin/python" scripts/ci_require_imports.py tests/unit \
++            --if-exists tests/net tests/updates --also yaml
+       - run: make test VENV=$VENV
+         env:
+           ASTRA_VOICE_REQUIRE_QT: "1"
+@@ -100,6 +110,8 @@
      container: debian:12
      steps:
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
@@ -121,7 +135,7 @@
        - name: Системные пакеты (Qt + виртуальный дисплей)
          # Трей рендерит SVG плагином Qt; libqt5svg5 нужен явно.
          run: |
-@@ -147,6 +156,8 @@
+@@ -147,6 +159,8 @@
      container: debian:12
      steps:
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
@@ -130,7 +144,7 @@
        - run: |
            apt-get update
            apt-get install -y --no-install-recommends python3 python3-yaml
-@@ -160,6 +171,8 @@
+@@ -160,6 +174,8 @@
      container: debian:12
      steps:
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
@@ -139,7 +153,7 @@
        - name: Системные пакеты
          run: |
            apt-get update
-@@ -236,6 +249,8 @@
+@@ -236,6 +252,8 @@
      container: debian:12
      steps:
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
@@ -148,7 +162,7 @@
        - name: Инструменты сборки
          run: |
            apt-get update
-@@ -273,12 +288,60 @@
+@@ -273,12 +291,60 @@
              dist/sbom.cdx.json
            if-no-files-found: error
  
@@ -211,7 +225,7 @@
      container: debian:12
      # Секрет подписи живёт только здесь: Environment с required reviewer.
      environment: release
-@@ -292,6 +355,7 @@
+@@ -292,6 +358,7 @@
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
          with:
            fetch-depth: 0
@@ -219,7 +233,7 @@
        - name: Версия тега и changelog
          run: |
            version="${GITHUB_REF_NAME#v}"
-@@ -306,9 +370,14 @@
+@@ -306,9 +373,14 @@
            # Для гейта смоука установленного дерева: модули UI импортируют PyQt5 на уровне модуля.
            apt-get install -y --no-install-recommends \
              build-essential debhelper dh-python devscripts dpkg-dev fakeroot \
@@ -236,7 +250,7 @@
        - name: Тег стоит на коммите из main
          run: |
            test -d .git || { echo "::error::Checkout без истории Git"; exit 1; }
-@@ -316,21 +385,18 @@
+@@ -316,21 +388,18 @@
            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::Тег не на коммите из main"; exit 1; }
        - name: Связка ключей в белом списке
          run: python3 scripts/check_keyring.py data/keys/release.gpg
@@ -265,7 +279,7 @@
            export GNUPGHOME="$(mktemp -d)"
            chmod 700 "$GNUPGHOME"
            printf '%s' "$GPG_SIGNING_KEY" | gpg --batch --quiet --import
-@@ -348,6 +414,6 @@
+@@ -348,6 +417,6 @@
            echo "deb [signed-by=/usr/share/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" \
              > /etc/apt/sources.list.d/github-cli.list
            apt-get update && apt-get install -y --no-install-recommends gh
