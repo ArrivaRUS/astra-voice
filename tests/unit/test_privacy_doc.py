@@ -7,8 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from astra_voice.models.downloader import _source_kind
-
 pytestmark = pytest.mark.unit
 
 REPO = Path(__file__).resolve().parents[2]
@@ -27,7 +25,7 @@ def test_privacy_model_sources_match_builtin_catalog() -> None:
     hosts = {model["host"] for model in catalog["models"]}
     has_mirrors = any(model.get("mirrors") for model in catalog["models"])
     section = _download_section()
-    assert {_source_kind(host) for host in hosts} == {"hf"}
+    assert hosts == {"huggingface.co"}
     assert "Hugging Face" in section
     # Появилось зеркало (например, GitHub Releases) — раздел надо переписать.
     assert (NO_MIRRORS in section) is not has_mirrors
