@@ -882,3 +882,11 @@ T-163…T-174 перенести из arch/appimage.md в test-plan; текст�
 - Беклог мелочей: тест «None-timeout ограничен общим дедлайном» и тест на CHECK_CONNECT_TIMEOUT_S (ревью bdbf82c, minor);
   AppImage — TryExec дважды при нескольких Exec, лимит чтения `_menu_state`, `AutostartState.target compare=False`,
   `require_available()` не подключён (гейт `check_bundle.py`), текст кнопки «Использовать системную версию» про повторный запуск файла.
+
+## 2026-09-29 ~16:00 — AppImage шаг 1 одобрен, трей и перенос сборки на ревью
+- `wip/ma-foundation` до `c7a267b`: ревью APPROVE (P2 deny/--register закрыты). Не сливаем до T1+T2 в четверг 01.10.
+  Беклог P3: `read_running_keys()` — множество KEY из всех кандидатов runtime-каталога (или удалять метку при выходе);
+  nit — распаковка режима В остаётся при гибели AppRun от сигнала.
+- `wip/fix-tray-bus` `396734a` (GPT-6 Astra): на ревью code-reviewer → затем черновой PR + CI.
+- `wip/r2-ci` `6e8590a`: на ревью; ждёт «да» заказчика на скачивание 3 колёс (jsonschema 4.10.3, attrs 22.2.0,
+  pyrsistent 0.19.3) и ключа подписи runtime AppImage (<1 МБ) для закрепления хэшей.
