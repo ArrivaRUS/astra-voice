@@ -143,6 +143,14 @@ unset APPIMAGE APPDIR ARGV0 OWD APPIMAGE_EXTRACT_AND_RUN $MANAGED \
     ASTRA_VOICE_APPIMAGE_DIR ASTRA_VOICE_RESOURCES ASTRA_VOICE_TEST_MOUNTINFO \
     ASTRA_VOICE_POLICY_FILE
 
+# Пути Qt — явно (R3, находка 29.09): PyQt5 регистрирует qt.conf с префиксом пакета, а Qt 5
+# читает его как Latin-1 — в пути с кириллицей плагины платформы и QML не находятся
+# («no Qt platform plugin»). Переменные из MANAGED: внешним программам childenv вернёт исходные.
+QT5_DIR=$HERE/opt/python3.11/lib/python3.11/site-packages/PyQt5/Qt5
+QT_PLUGIN_PATH=$QT5_DIR/plugins
+QML2_IMPORT_PATH=$QT5_DIR/qml
+export QT_PLUGIN_PATH QML2_IMPORT_PATH
+
 installed_ok() {
     [ -d "$TARGET" ] && [ ! -L "$TARGET" ] && [ -f "$TARGET/.installed-ok" ] &&
         [ -x "$TARGET/AppRun" ] && [ -x "$TARGET/opt/python3.11/bin/python3.11" ] &&

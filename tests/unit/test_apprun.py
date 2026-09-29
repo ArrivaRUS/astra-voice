@@ -330,6 +330,23 @@ def test_originals_saved_once_and_restorable(tmp_path: Path, env: dict[str, str]
     assert not [name for name in child if name.startswith(("ASTRA_VOICE_", "APPIMAGE"))]
 
 
+def test_qt_paths_point_into_bundle_even_with_cyrillic_path(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    """R3: qt.conf PyQt5 ломается на не-ASCII пути — AppRun задаёт пути Qt явно, от своей копии."""
+    bundle = _bundle(tmp_path / "Мои программы" / "Astra Voice")
+    run_env = {**env, "ASTRA_VOICE_PORTABLE": "1", "QT_PLUGIN_PATH": "/home/u/qtplugins"}
+    assert _run(bundle / "AppRun", ["--hidden"], run_env).returncode == 0
+    lines = Path(env["APPRUN_TEST_LOG"] + ".env").read_text(encoding="utf-8").splitlines()
+    final = dict(line.split("=", 1) for line in lines if "=" in line)
+    qt5 = bundle / "opt" / "python3.11" / "lib" / "python3.11" / "site-packages" / "PyQt5" / "Qt5"
+    assert final["QT_PLUGIN_PATH"] == str(qt5 / "plugins")
+    assert final["QML2_IMPORT_PATH"] == str(qt5 / "qml")
+    child = childenv.clean_env(final)
+    assert child["QT_PLUGIN_PATH"] == "/home/u/qtplugins"
+    assert "QML2_IMPORT_PATH" not in child
+
+
 def test_managed_list_matches_python() -> None:
     text = APPRUN.read_text(encoding="utf-8")
     match = re.search(r"^MANAGED='([^']*)'$", text, re.MULTILINE)
