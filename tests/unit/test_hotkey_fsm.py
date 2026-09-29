@@ -384,11 +384,11 @@ class FakeDisplay(X11Display):
             raise BadCombo
         return ParsedCombo(0, 9, "Escape") if combo == "Escape" else ParsedCombo(4, 65, "space")
 
-    def grab_key(self, keycode: int, base_mask: int) -> GrabReport:
+    def grab_key(self, keycode: int, base_mask: int, **_kwargs: Any) -> GrabReport:
         self.calls.append(("grab", keycode, base_mask))
         return self.report
 
-    def ungrab_key(self, keycode: int, base_mask: int) -> None:
+    def ungrab_key(self, keycode: int, base_mask: int, **_kwargs: Any) -> None:
         self.calls.append(("ungrab", keycode, base_mask))
 
 
@@ -855,16 +855,14 @@ def test_mapping_notify_regrabs_combo_escape_and_notifies(
     manager.handle_event(HotkeyEvent("KeyPress", 65, 1, mods=4), 0)
     manager.handle_event(HotkeyEvent("KeyRelease", 65, 2, mods=4), 1)
     notification = MappingNotify(request=mapping_request, first_keycode=8, count=248)
+    old_masks = {code: mocked_x11.mask_variants(mods) for code, mods in ((9, 0), (65, 4))}
+    root = mocked_x11.root
+    root.reset_mock()
 
     def refresh(event: Any) -> None:
         assert event is notification
-        # Старые захваты снимаются по прежним keycode и маскам блокировок.
-        expected = [
-            call(code, mask)
-            for code, mods in ((9, 0), (65, 4))
-            for mask in mocked_x11.mask_variants(mods)
-        ]
-        assert mocked_x11.root.ungrab_key.call_args_list == expected
+        # До пересчёта карты прежний захват не снимается: окна без захвата нет.
+        root.ungrab_key.assert_not_called()
         connection.keysym_to_keycode.side_effect = lambda symbol: (
             10 if symbol == XK.string_to_keysym("Escape") else 66
         )
@@ -879,7 +877,19 @@ def test_mapping_notify_regrabs_combo_escape_and_notifies(
     assert (HotkeyState.RECORDING, "mapping-regrab:ok;escape:ok") in states
     assert manager.fsm.state == HotkeyState.PROCESSING
     assert manager.escape_result.keycode == 10
-    assert mocked_x11.root.grab_key.call_args_list[-2:] == [
+    # Сначала новый захват, затем снятие старого — по прежним маскам блокировок.
+    order = [
+        (name, args[:2])
+        for name, args, _ in root.method_calls
+        if name in ("grab_key", "ungrab_key")
+    ]
+    assert order == [
+        ("grab_key", (66, 4)),
+        *[("ungrab_key", (65, mask)) for mask in old_masks[65]],
+        ("grab_key", (10, 0)),
+        *[("ungrab_key", (9, mask)) for mask in old_masks[9]],
+    ]
+    assert root.grab_key.call_args_list == [
         call(66, 4, True, X.GrabModeAsync, X.GrabModeAsync, onerror=ANY),
         call(10, 0, True, X.GrabModeAsync, X.GrabModeAsync, onerror=ANY),
     ]
@@ -893,7 +903,7 @@ def test_mapping_notify_regrabs_combo_escape_and_notifies(
 def test_mapping_failure_is_reported(
     mocked_x11: X11Display, connection: MagicMock, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    from Xlib import X
+    from Xlib import XK, X
     from Xlib.protocol.event import MappingNotify
 
     manager = HotkeyManager(X11HotkeyBackend(mocked_x11))
@@ -904,6 +914,10 @@ def test_mapping_failure_is_reported(
     if failure == "refresh":
         connection.refresh_keyboard_mapping.side_effect = RuntimeError("X11")
     else:
+        # Новая карта двигает обе клавиши: без изменений перезахвата не было бы.
+        connection.keysym_to_keycode.side_effect = lambda symbol: (
+            10 if symbol == XK.string_to_keysym("Escape") else 66
+        )
         good = GrabReport(True, [(4, None)], False)
         busy = GrabReport(False, [(4, "BadAccess")], True)
         monkeypatch.setattr(
