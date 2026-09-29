@@ -150,6 +150,7 @@ echo '  sbom.cdx.json'
 if $appimage; then
     echo "  Astra_Voice-${version}-x86_64.AppImage (packaging/appimage/ENABLED)"
     echo '  sbom-appimage.cdx.json'
+    echo "  astra-voice-${version}-sources.tar.xz (исходники поставляемых версий, R3.6)"
 else
     echo '  (AppImage выключен: нет packaging/appimage/ENABLED)'
 fi

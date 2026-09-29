@@ -80,6 +80,20 @@ ASSET_LIMIT = 16 << 20
 ARTIFACT_LIMIT = 512 << 20
 
 
+def _release_sources_module() -> Any:
+    """scripts/release_sources.py — тот же формат, что пишет выпуск (R3.6)."""
+    name = "astra_voice_release_sources"
+    if name not in sys.modules:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / "release_sources.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
 class ReleaseCriterionError(Exception):
     """Ассет существует, но не является допустимым обычным файлом."""
 
@@ -257,8 +271,11 @@ def release(args: argparse.Namespace) -> int:
         "latest.json",
         "release.gpg",
     ]
+    # Архив исходников (R3.6) обязателен вместе с AppImage; он больше обычных ассетов,
+    # поэтому хэшируется и проверяется потоком (release_sources.check), без снимка в памяти.
+    sources_name = f"astra-voice-{version}-sources.tar.xz"
     if with_appimage:
-        required += [image_name, "sbom-appimage.cdx.json"]
+        required += [image_name, "sbom-appimage.cdx.json", sources_name]
     # SECURITY.md публикуется с v0.2 (release_assets.sh); в v0.1.0 его не было.
     optional = ["SECURITY.md"]
     paths = {name: directory / name for name in required}
@@ -266,9 +283,25 @@ def release(args: argparse.Namespace) -> int:
     if deb is not None:
         paths[deb.name] = deb
     snapshots: dict[str, bytes] = {}
+    streamed: dict[str, str] = {}
     missing: list[str] = []
     invalid: list[str] = []
+    sources_detail = ""
     for name, path in paths.items():
+        if name == sources_name:
+            release_sources = _release_sources_module()
+            try:
+                streamed[name], count = release_sources.check(path)
+                sources_detail = f"{count} файлов по манифесту"
+            except FileNotFoundError:
+                missing.append(name)
+            except release_sources.SourcesError as exc:
+                invalid.append(f"{name}: {exc}")
+                sources_detail = str(exc)
+            except OSError as exc:
+                record(name, False, f"не удалось прочитать: {exc.strerror or exc}")
+                return finish(2)
+            continue
         limit = ARTIFACT_LIMIT if name.endswith((".deb", ".AppImage")) else ASSET_LIMIT
         try:
             snapshots[name] = release_read(path, limit)
@@ -354,6 +387,11 @@ def release(args: argparse.Namespace) -> int:
                         break
                     seen.add(filename)
                     content = snapshots.get(filename)
+                    if content is None and filename in streamed:
+                        if streamed[filename] != digest:
+                            sums_detail = f"неверная сумма: {filename}"
+                            break
+                        continue
                     if content is None:
                         sums_detail = f"нет файла для строки: {filename}"
                         break
@@ -413,6 +451,7 @@ def release(args: argparse.Namespace) -> int:
             image_ok,
             "образ AppImage type 2" if image_ok else "нет файла, не type 2 или меньше 50 МиБ",
         )
+        record("sources", sources_name in streamed, sources_detail or "архива исходников нет")
 
     latest_ok = False
     latest_detail = "указатель неверен"

@@ -7,7 +7,8 @@
 #   1. .deb: колёса по wheels.lock (сеть) → dh + lintian + гейты (packaging/build-deb.sh);
 #   2. T3 P2-6: ставится ИМЕННО тот .deb, который будет подписан, — apt install,
 #      astra-voice --version, smoke-installed.sh; sha256 пакета до и после совпадает;
-#   3. при packaging/appimage/ENABLED: build.sh --fetch (сеть) → build.sh → smoke.sh.
+#   3. при packaging/appimage/ENABLED: build.sh --fetch (сеть) → build.sh → smoke.sh →
+#      release_sources.sh (архив исходников поставляемых версий, R3.6, без сети).
 # Секрет подписи здесь не нужен и не должен быть в окружении (T3 P2-1).
 set -euo pipefail
 
@@ -49,6 +50,8 @@ if [ -f packaging/appimage/ENABLED ]; then
     say 'AppImage: сборка и гейты'
     packaging/appimage/build.sh
     packaging/appimage/smoke.sh "dist/Astra_Voice-$VERSION-x86_64.AppImage"
+    say 'AppImage: архив исходников (R3.6)'
+    scripts/release_sources.sh dist
 else
     say 'AppImage выключен (нет packaging/appimage/ENABLED)'
 fi

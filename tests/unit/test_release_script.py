@@ -463,6 +463,7 @@ def test_dry_run_with_appimage(repo: tuple[Path, dict[str, str]]) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Astra_Voice-0.1.0-x86_64.AppImage (packaging/appimage/ENABLED)" in result.stdout
     assert "sbom-appimage.cdx.json" in result.stdout
+    assert "astra-voice-0.1.0-sources.tar.xz" in result.stdout
     assert "OK: packaging/appimage.lock существует и отслеживается Git" in result.stdout
     assert "OK: packaging/appimage.lock: все колёса закреплены по хэшу" in result.stdout
 
