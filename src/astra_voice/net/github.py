@@ -18,12 +18,15 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
 
-from astra_voice.net.gate import NetworkKind
-from astra_voice.net.http import CheckResult, HttpClient
 from astra_voice.net.update_cache import MAX_BODY_BYTES, UpdateCache
+
+if TYPE_CHECKING:
+    # Разбор версий нужен и без requests (состояние проверок, CI engine).
+    from astra_voice.net.gate import NetworkKind
+    from astra_voice.net.http import CheckResult, HttpClient
 
 log = logging.getLogger(__name__)
 
