@@ -925,3 +925,104 @@ def test_sbom_debian12_refuses_unattributed_elf(tmp_path: Path) -> None:
     assert proc.returncode == 1
     assert "ELF Qt без модуля в карте sbom.py: PyQt5/Qt5/lib/libQt5Designer.so.5" in proc.stderr
     assert not (tmp_path / "sbom.json").exists()
+
+
+# --- ревью P3-1/P3-4: структура clearsign и белый список статусов gpgv ------------------
+
+
+def _repin_inrelease(archive: Archive, data: bytes) -> None:
+    path = archive.cache / "metadata" / "debian-bookworm" / "InRelease"
+    path.write_bytes(data)
+    sha, size = digest(path)
+    archive.item("debian-bookworm").update(sha256=sha, size=size)
+
+
+@needs_tools
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda signed: signed.split(b"\n\n", 1)[1].split(b"-----BEGIN PGP SIGNATURE")[0],
+            "не clearsigned-файл",
+        ),
+        (lambda signed: signed + signed, "данные после подписи"),
+        (lambda signed: signed + b"Codename: evil\n", "данные после подписи"),
+        (
+            lambda signed: signed.replace(
+                b"\nSHA256:\n", b"\n-----BEGIN PGP SIGNED MESSAGE-----\nSHA256:\n"
+            ),
+            "неэкранированная строка",
+        ),
+        (lambda signed: signed.split(b"-----END PGP SIGNATURE-----")[0], "блок подписи не закрыт"),
+    ],
+)
+def test_inrelease_structure_rejected(archive: Archive, mutate: Any, message: str) -> None:
+    signed = (archive.cache / "metadata" / "debian-bookworm" / "InRelease").read_bytes()
+    _repin_inrelease(archive, mutate(signed))
+    with pytest.raises(debverify.VerifyError, match=message):
+        verify(archive)
+
+
+@needs_tools
+def test_expired_key_rejected(archive: Archive, tmp_path: Path) -> None:
+    """Ключ, истёкший до проверки (подпись сделана в прошлом) — EXPKEYSIG, отказ."""
+    gpg = Gpg(tmp_path / "gnupg-expired")
+    past = ["--faked-system-time", "20200101T000000!"]
+    gpg.run(*past, "--quick-gen-key", "Expired <e@test.invalid>", "ed25519", "sign", "1d")
+    out = gpg.run("--list-keys", "--with-colons").stdout.decode()
+    fpr = next(line.split(":")[9] for line in out.splitlines() if line.startswith("fpr:"))
+    gpg.export(fpr, archive.root / "packaging" / "appimage" / "keys" / "test-archive.gpg")
+    inrelease = archive.cache / "metadata" / "debian-bookworm" / "InRelease"
+    body = debverify.strip_pgp(inrelease.read_text("utf-8")) + "\n"
+    plain = tmp_path / "Release"
+    plain.write_text(body, "utf-8")
+    gpg.run(*past, "--clearsign", "--local-user", fpr + "!", "--output", str(inrelease), str(plain))
+    _repin_inrelease(archive, inrelease.read_bytes())
+    archive.item("debian-bookworm")["signer"] = fpr
+    with pytest.raises(debverify.VerifyError, match="плохая подпись \\(.*EXPKEYSIG"):
+        verify(archive)
+
+
+def _fake_gpgv(tmp_path: Path, statuses: list[str]) -> str:
+    script = tmp_path / "fake-gpgv"
+    lines = "\n".join(f"echo '[GNUPG:] {s}'" for s in statuses)
+    script.write_text(
+        "#!/bin/sh\n"
+        'while [ $# -gt 1 ]; do [ "$1" = --output ] && out=$2; shift; done\n'
+        'sed -n "/^$/,/^-----BEGIN PGP SIGNATURE/p" "$1" > "$out"\n' + lines + "\n",
+        "utf-8",
+    )
+    script.chmod(0o755)
+    return str(script)
+
+
+@needs_tools
+@pytest.mark.parametrize(
+    ("statuses", "message"),
+    [
+        (
+            ["PLAINTEXT 74 0", "GOODSIG X u", "VALIDSIG {s} 1 2 0 4 0 1 8 01 {s}", "ERROR x 1"],
+            "плохая подпись \\(ERROR\\)",
+        ),
+        (
+            ["PLAINTEXT 74 0", "GOODSIG X u", "VALIDSIG {s} 1 2 0 4 0 1 8 01 {s}", "BADARMOR 1"],
+            "BADARMOR",
+        ),
+        (["GOODSIG X u", "VALIDSIG {s} 1 2 0 4 0 1 8 01 {s}"], "ровно одна подпись"),
+        (
+            ["PLAINTEXT 74 0", "GOODSIG X u", "GOODSIG Y u", "VALIDSIG {s} 1 2 0 4 0 1 8 01 {s}"],
+            "ровно одна подпись",
+        ),
+        (
+            ["PLAINTEXT 74 0", "GOODSIG X u", "VALIDSIG A 1 2 0 4 0 1 8 01 AAAA"],
+            "нет подписи ключом",
+        ),
+    ],
+)
+def test_gpgv_status_whitelist(
+    archive: Archive, tmp_path: Path, statuses: list[str], message: str
+) -> None:
+    gpgv = _fake_gpgv(tmp_path, [s.format(s=archive.signer) for s in statuses])
+    verifier = debverify.Verifier(archive.write_lock(), archive.cache, archive.root, gpgv=gpgv)
+    with pytest.raises(debverify.VerifyError, match=message):
+        verifier.verify_debs()

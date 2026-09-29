@@ -36,8 +36,28 @@ from pathlib import Path
 
 import lockfile
 
-#: Статусы gpgv, при которых InRelease отвергается целиком, чья бы подпись это ни была.
-_BAD_STATUS = ("BADSIG", "EXPSIG", "EXPKEYSIG", "REVKEYSIG")
+#: Статусы gpgv, которые допускаются (белый список, ревью P3-1). ERRSIG/NO_PUBKEY — подписи
+#: ключами, которых намеренно нет в нашем keyring; всё остальное (BADSIG, EXPSIG,
+#: EXPKEYSIG, REVKEYSIG, ERROR, FAILURE, NODATA, BADARMOR …) — отказ целиком.
+_ALLOWED_STATUS = frozenset(
+    {
+        "NEWSIG",
+        "KEY_CONSIDERED",
+        "SIG_ID",
+        "GOODSIG",
+        "VALIDSIG",
+        "ERRSIG",
+        "NO_PUBKEY",
+        "PLAINTEXT",
+        "PLAINTEXT_LENGTH",
+        "NOTATION_NAME",
+        "NOTATION_DATA",
+        "NOTATION_FLAGS",
+    }
+)
+_SIGNED_BEGIN = "-----BEGIN PGP SIGNED MESSAGE-----"
+_SIG_BEGIN = "-----BEGIN PGP SIGNATURE-----"
+_SIG_END = "-----END PGP SIGNATURE-----"
 _SOURCE_RE = re.compile(r"(?P<name>[a-z0-9][a-z0-9.+-]+)(?:\s+\((?P<version>[^)\s]+)\))?")
 
 
@@ -66,13 +86,51 @@ def check_file(path: Path, sha256: str, size: int, what: str) -> None:
         raise VerifyError(f"{what}: sha256 {got_sha}, в lock {sha256} ({path})")
 
 
+def check_clearsigned(raw: bytes, what: str) -> None:
+    """Структура clearsigned-файла, как SplitClearSignedFile в apt (ревью P3-1).
+
+    Первая строка — BEGIN PGP SIGNED MESSAGE; заголовки Hash до пустой строки; в тексте
+    строки на «-» только экранированные «- » (второй блок не спрятать); затем ровно одна
+    подпись; после END PGP SIGNATURE — только пустые строки.
+    """
+    try:
+        lines = raw.decode("utf-8").split("\n")
+    except UnicodeDecodeError:
+        raise VerifyError(f"{what}: не UTF-8") from None
+    lines = [line.removesuffix("\r") for line in lines]
+    if not lines or lines[0] != _SIGNED_BEGIN:
+        raise VerifyError(f"{what}: не clearsigned-файл (первая строка не {_SIGNED_BEGIN})")
+    i = 1
+    while i < len(lines) and lines[i] != "":
+        if not lines[i].startswith("Hash:"):
+            raise VerifyError(f"{what}: неожиданный заголовок {lines[i][:40]!r}")
+        i += 1
+    i += 1
+    while i < len(lines) and lines[i] != _SIG_BEGIN:
+        if lines[i].startswith("-") and not lines[i].startswith("- "):
+            raise VerifyError(f"{what}: неэкранированная строка «-» в подписанном тексте")
+        i += 1
+    if i >= len(lines):
+        raise VerifyError(f"{what}: нет блока подписи")
+    while i < len(lines) and lines[i] != _SIG_END:
+        i += 1
+        if i < len(lines) and lines[i] in (_SIGNED_BEGIN, _SIG_BEGIN):
+            raise VerifyError(f"{what}: вложенный блок внутри подписи")
+    if i >= len(lines):
+        raise VerifyError(f"{what}: блок подписи не закрыт")
+    if any(line.strip() for line in lines[i + 1 :]):
+        raise VerifyError(f"{what}: данные после подписи")
+
+
 def gpgv_verify(inrelease: Path, keyring: Path, signer: str, gpgv: str = "gpgv") -> str:
     """Проверить подпись InRelease; вернуть только подписанный текст.
 
     Код выхода gpgv не решает: у Debian несколько подписей, ключи прочих подписантов в
-    нашем keyring намеренно отсутствуют (NO_PUBKEY). Решает статус: VALIDSIG с основным
-    ключом `signer` и ни одного BADSIG/EXPSIG/EXPKEYSIG/REVKEYSIG.
+    нашем keyring намеренно отсутствуют (NO_PUBKEY). Решает статус по белому списку:
+    ровно один GOODSIG и ровно один VALIDSIG — с основным ключом `signer`, ровно один
+    PLAINTEXT, остальные статусы — только из `_ALLOWED_STATUS`.
     """
+    check_clearsigned(inrelease.read_bytes(), inrelease.name)
     if not keyring.is_file():
         raise VerifyError(f"нет ключа архива {keyring}")
     with tempfile.TemporaryDirectory(prefix="debverify-") as tmp:
@@ -89,13 +147,21 @@ def gpgv_verify(inrelease: Path, keyring: Path, signer: str, gpgv: str = "gpgv")
             raise VerifyError(f"не запускается {gpgv}: {exc}") from None
         status = [line.split() for line in proc.stdout.splitlines()]
         status = [tokens[1:] for tokens in status if tokens[:1] == ["[GNUPG:]"] and tokens[1:]]
-        bad = [tokens[0] for tokens in status if tokens[0] in _BAD_STATUS]
+        bad = sorted({tokens[0] for tokens in status if tokens[0] not in _ALLOWED_STATUS})
         if bad:
             raise VerifyError(f"{inrelease.name}: плохая подпись ({', '.join(bad)})")
         primaries = [tokens[-1] for tokens in status if tokens[0] == "VALIDSIG"]
         if signer not in primaries:
             found = ", ".join(primaries) or "нет"
             raise VerifyError(f"{inrelease.name}: нет подписи ключом {signer} (VALIDSIG: {found})")
+        counts = {
+            name: sum(1 for tokens in status if tokens[0] == name)
+            for name in ("GOODSIG", "VALIDSIG", "PLAINTEXT")
+        }
+        if counts != {"GOODSIG": 1, "VALIDSIG": 1, "PLAINTEXT": 1}:
+            raise VerifyError(
+                f"{inrelease.name}: ожидалась ровно одна подпись и один текст {counts}"
+            )
         if not plain.is_file():
             raise VerifyError(f"{inrelease.name}: gpgv не выдал подписанный текст")
         return plain.read_text(encoding="utf-8")
