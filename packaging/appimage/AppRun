@@ -26,6 +26,11 @@ die() {
     exit "${2:-1}"
 }
 
+# «:» в пути ломает списки путей (QT_PLUGIN_PATH, QML2_IMPORT_PATH): отказ сразу и понятно.
+case $HERE in
+    *:*) die 'Astra Voice не запускается из папки, в пути к которой есть двоеточие «:». Переместите файл программы в другую папку.' ;;
+esac
+
 # T1-01.10: MJ-3 — при `id -u` = 0 отказ до любых действий: «Версия AppImage не
 # запускается от имени root. Управляйте ею под учётной записью пользователя», код 3 (T-179).
 refuse_root() {
@@ -118,7 +123,7 @@ fi
 # Тот же список — childenv.APPRUN_MANAGED (сверяет test_apprun.py).
 MANAGED='PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE QT_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH QT_QPA_PLATFORMTHEME LD_PRELOAD SSL_CERT_FILE'
 save_originals() {
-    for name in $MANAGED; do
+    for name in "$@"; do
         case " ${ASTRA_VOICE_ORIG_UNSET-} " in
             *" $name "*) continue ;;
         esac
@@ -134,7 +139,7 @@ save_originals() {
         fi
     done
 }
-save_originals
+save_originals $MANAGED
 
 # Переменные runtime AppImage и хоста, которые не должны влиять на бандловый
 # Python и Qt (arch/appimage.md §10.4). LD_LIBRARY_PATH не ставим: RUNPATH.
@@ -150,6 +155,19 @@ QT5_DIR=$HERE/opt/python3.11/lib/python3.11/site-packages/PyQt5/Qt5
 QT_PLUGIN_PATH=$QT5_DIR/plugins
 QML2_IMPORT_PATH=$QT5_DIR/qml
 export QT_PLUGIN_PATH QML2_IMPORT_PATH
+# Кириллица в пути при однобайтовой локали (LC_ALL=C и т. п.): Qt 5 зацикливается при
+# создании приложения (проверено 29.09, offscreen). Процессу программы — C.UTF-8; внешним
+# программам childenv вернёт исходное значение LC_ALL.
+if printf '%s' "$HERE" | LC_ALL=C grep -q '[^ -~]'; then
+    case $(locale charmap 2>/dev/null) in
+        UTF-8 | utf8) ;;
+        *)
+            save_originals LC_ALL
+            LC_ALL=C.UTF-8
+            export LC_ALL
+            ;;
+    esac
+fi
 
 installed_ok() {
     [ -d "$TARGET" ] && [ ! -L "$TARGET" ] && [ -f "$TARGET/.installed-ok" ] &&
