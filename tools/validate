@@ -8,6 +8,7 @@
     tools/validate catalog --all --json
     tools/validate catalog --switch --from ID@REV --to ID@REV
     tools/validate release --version 0.1.0 --dir dist/ --json
+    tools/validate autostart [--check-installed] --json
 
 Коды возврата: 0 — уложились, 1 — нарушен критерий, 2 — прогон невозможен.
 Проверяется интервал record.cancel → cancelled, а не остановка всех вызовов ORT.
@@ -2405,6 +2406,210 @@ def catalog_report(args: argparse.Namespace, code: int, facts: dict[str, Any]) -
     return code
 
 
+AUTOSTART_NAME = "astra-voice.desktop"
+# Канон spec §9.1 / plans M9 задан здесь независимо от модуля: расхождение модуля
+# с каноном должно проваливать проверку, а не переопределять ожидание.
+AUTOSTART_CANON = {
+    b"Type": b"Application",
+    b"Exec": b"/usr/bin/astra-voice --hidden",
+    b"Icon": b"astravoice",
+    b"X-KDE-autostart-after": b"panel",
+    b"X-AstraVoice-Managed": b"true",
+}
+AUTOSTART_FOREIGN = {
+    "handy.desktop": (
+        b"[Desktop Entry]\nType=Application\nName=Handy\nExec=/usr/bin/handy\n"
+        b"X-GNOME-Autostart-enabled=true\n"
+    ),
+    "other-hidden.desktop": (
+        b"[Desktop Entry]\nType=Application\nName=Other\nExec=/usr/bin/other\nHidden=true\n"
+    ),
+}
+
+
+def autostart_fields(data: bytes) -> list[str]:
+    """Расхождения записи с каноном; пустой список — запись каноническая."""
+    from astra_voice.platform import autostart as module
+
+    properties = module._properties(data)
+    problems = [
+        f"{key.decode()}="
+        + (
+            found.decode(errors="replace")
+            if (found := properties.get(key)) is not None
+            else "<нет>"
+        )
+        for key, value in AUTOSTART_CANON.items()
+        if properties.get(key) != value
+    ]
+    if b"OnlyShowIn" in properties:
+        problems.append("есть OnlyShowIn")
+    if module._true(properties, b"Hidden"):
+        problems.append("Hidden=true")
+    return problems
+
+
+def autostart_snapshot(path: Path) -> tuple[bytes, int, int, int] | None:
+    """Байты, права, inode и mtime: «не тронут» — все четыре совпали."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    return path.read_bytes(), stat.S_IMODE(info.st_mode), info.st_ino, info.st_mtime_ns
+
+
+def autostart_check_installed(args: argparse.Namespace) -> int:
+    """Только читает ~/.config/autostart/astra-voice.desktop и сверяет поля с каноном."""
+    from astra_voice.platform import autostart as module
+
+    checks: list[Message] = []
+    notes = ["Способ: только чтение записи автозапуска пользователя; ничего не пишется."]
+    path = module._paths()[0]
+    notes.append(f"Файл: {path}.")
+    try:
+        data = module._read(path)
+    except OSError as exc:
+        return network_report(args, checks, notes, f"Не удалось прочитать запись: {exc}")
+    checks.append(
+        {
+            "name": "file",
+            "title": "запись автозапуска есть",
+            "expected": "обычный файл",
+            "actual": "нет файла — автозапуск выключен" if data is None else "есть",
+            "passed": data is not None,
+        }
+    )
+    if data is not None:
+        problems = autostart_fields(data)
+        checks.append(
+            {
+                "name": "fields",
+                "title": "поля канонические, без OnlyShowIn и Hidden",
+                "expected": ", ".join(
+                    f"{key.decode()}={value.decode()}" for key, value in AUTOSTART_CANON.items()
+                ),
+                "actual": "совпадают" if not problems else "; ".join(problems),
+                "passed": not problems,
+            }
+        )
+    return network_report(args, checks, notes)
+
+
+def autostart_check(args: argparse.Namespace) -> int:
+    """Включение и выключение настоящим модулем во временном XDG_CONFIG_HOME."""
+    if args.check_installed:
+        return autostart_check_installed(args)
+    from astra_voice.platform import autostart as module
+
+    checks: list[Message] = []
+    notes = [
+        "Способ: настоящий platform/autostart.py во временных XDG_CONFIG_HOME и "
+        "XDG_CONFIG_DIRS; настоящий ~/.config не читается и не меняется.",
+    ]
+    names = ("XDG_CONFIG_HOME", "XDG_CONFIG_DIRS")
+    saved = {name: os.environ.get(name) for name in names}
+    error = ""
+
+    def record(name: str, title: str, expected: str, actual: str, passed: bool) -> None:
+        checks.append(
+            {"name": name, "title": title, "expected": expected, "actual": actual, "passed": passed}
+        )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="astra-autostart-") as directory:
+            home, system = Path(directory) / "config", Path(directory) / "xdg"
+            os.environ["XDG_CONFIG_HOME"] = str(home)
+            os.environ["XDG_CONFIG_DIRS"] = str(system)
+            ours = home / "autostart" / AUTOSTART_NAME
+            if module._paths()[0] != ours:
+                raise RuntimeError("Модуль не использует временный XDG_CONFIG_HOME.")
+            ours.parent.mkdir(parents=True, mode=0o755)
+            foreign = {name: ours.parent / name for name in AUTOSTART_FOREIGN}
+            for name, path in foreign.items():
+                path.write_bytes(AUTOSTART_FOREIGN[name])
+            before = {name: autostart_snapshot(path) for name, path in foreign.items()}
+
+            initial = module.state()
+            record(
+                "initial",
+                "до включения",
+                "выключен, нашего файла нет",
+                f"включён={initial.enabled}, файл={ours.exists()}",
+                not initial.enabled and not ours.exists(),
+            )
+
+            module.set_enabled(True)
+            enabled = module.state()
+            first = autostart_snapshot(ours)
+            problems = autostart_fields(first[0]) if first else ["файла нет"]
+            record(
+                "enable",
+                "включение создаёт наш файл",
+                "файл есть, включён, опознан как наш; "
+                + ", ".join(f"{k.decode()}={v.decode()}" for k, v in AUTOSTART_CANON.items())
+                + "; без OnlyShowIn и Hidden; права 0644",
+                f"файл={first is not None}, включён={enabled.enabled}, опознан={enabled.user}, "
+                f"права={oct(first[1]) if first else '—'}, "
+                f"расхождения: {'; '.join(problems) or 'нет'}",
+                first is not None
+                and enabled.enabled
+                and enabled.user == "ours"
+                and not problems
+                and first[1] == 0o644,
+            )
+
+            module.set_enabled(True)
+            again = autostart_snapshot(ours)
+            record(
+                "enable-again",
+                "повторное включение идемпотентно",
+                "файл не переписан: те же байты, inode и mtime",
+                "не переписан" if again == first and again is not None else "переписан или исчез",
+                again == first and again is not None,
+            )
+
+            module.set_enabled(False)
+            disabled = module.state()
+            record(
+                "disable",
+                "выключение удаляет только наш файл",
+                "нашего файла нет, выключен",
+                f"файл={ours.exists()}, включён={disabled.enabled}",
+                not ours.exists() and not disabled.enabled,
+            )
+
+            module.set_enabled(False)
+            record(
+                "disable-again",
+                "повторное выключение ничего не создаёт",
+                "нашего файла нет",
+                f"файл={ours.exists()}",
+                not ours.exists(),
+            )
+
+            after = {name: autostart_snapshot(path) for name, path in foreign.items()}
+            untouched = [name for name in foreign if before[name] == after[name]]
+            hidden_ok = after["other-hidden.desktop"] is not None and module._true(
+                module._properties(after["other-hidden.desktop"][0]), b"Hidden"
+            )
+            record(
+                "foreign",
+                "чужие handy.desktop и файл с Hidden=true не тронуты",
+                "байты, права, inode и mtime совпадают; Hidden=true на месте",
+                f"не тронуты: {untouched}; Hidden=true на месте={hidden_ok}",
+                len(untouched) == len(foreign) and hidden_ok,
+            )
+    except (OSError, RuntimeError) as exc:
+        error = f"Не удалось выполнить прогон: {exc}"
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    return network_report(args, checks, notes, error)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Разбирает подкоманды; новые проверки добавляются отдельными обработчиками."""
     parser = argparse.ArgumentParser(description="Проверки Astra Voice без GUI")
@@ -2477,6 +2682,15 @@ def main(argv: list[str] | None = None) -> int:
     models.add_argument("--from", dest="from_ref", type=parse_model_ref, metavar="ID@REV")
     models.add_argument("--to", dest="to_ref", type=parse_model_ref, metavar="ID@REV")
     models.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    autostart_parser = commands.add_parser(
+        "autostart", help="проверить запись автозапуска во временном XDG_CONFIG_HOME"
+    )
+    autostart_parser.add_argument(
+        "--check-installed",
+        action="store_true",
+        help="только прочитать ~/.config/autostart/astra-voice.desktop и сверить поля",
+    )
+    autostart_parser.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
     release_check = commands.add_parser("release", help="проверить ассеты релиза без сети")
     release_check.add_argument("--version", required=True, help="версия X.Y.Z или vX.Y.Z")
     release_check.add_argument("--dir", type=Path, default=ROOT / "dist")
@@ -2498,6 +2712,7 @@ def main(argv: list[str] | None = None) -> int:
         "privacy": privacy,
         "catalog": catalog,
         "release": release,
+        "autostart": autostart_check,
         "_catalog-probe": catalog_probe,
     }
     return handlers[args.command](args)
