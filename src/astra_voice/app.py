@@ -44,6 +44,8 @@ from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui.hotkey_capture import HotkeyCapture
 from astra_voice.ui.icons import install_icon_provider
+from astra_voice.ui.notify import install_dispatcher as install_notify_dispatcher
+from astra_voice.ui.notify import shutdown_dispatch as shutdown_notify_dispatch
 from astra_voice.ui.tray import shutdown_bus_threads
 
 if TYPE_CHECKING:
@@ -997,6 +999,8 @@ def main(argv: list[str] | None = None) -> int:
     app.setOrganizationDomain(ORGANIZATION_DOMAIN)
     app.setDesktopFileName(DESKTOP_FILE_NAME)
     app.setQuitOnLastWindowClosed(not CLOSE_TO_TRAY)
+    # Получатель уведомлений из рабочих потоков — в GUI до их запуска (урок 026).
+    install_notify_dispatcher()
 
     app_info = _make_app_info(session_kind, policy.status.value, debug=args.debug)
     theme_bridge = _make_theme_bridge(session_kind)
@@ -1223,6 +1227,8 @@ def main(argv: list[str] | None = None) -> int:
                 runtime.shutdown()
             except Exception:  # noqa: BLE001 — ошибка диктовки не должна оставить lock/ipc
                 log.warning("Не удалось завершить диктовку")
+        # Затворы постов в Qt закрываются до разрушения QApplication (урок 026).
+        shutdown_notify_dispatch()
         try:
             shutdown_bus_threads()
         except Exception:  # noqa: BLE001 — ошибка D-Bus не должна оставить lock/ipc

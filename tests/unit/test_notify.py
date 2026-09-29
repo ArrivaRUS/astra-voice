@@ -8,7 +8,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from time import perf_counter, sleep
+from time import perf_counter
 from typing import Any, cast
 from unittest.mock import Mock
 
@@ -1080,25 +1080,22 @@ def test_reset_disposes_in_flight_watcher(transport: Mock) -> None:
     assert notifications._watchers == {}
 
 
-def test_concurrent_notify_creates_one_gui_dispatcher(
+def test_concurrent_notify_uses_one_gui_receiver(
     transport: Mock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = QCoreApplication.instance() or QCoreApplication([])
-    received: list[str] = []
-    monkeypatch.setattr(notifications, "_submit", lambda notice: received.append(notice.summary))
-    original_init = notifications._Dispatcher.__init__
-    created: list[notifications._Dispatcher] = []
-
-    def slow_init(dispatcher: notifications._Dispatcher) -> None:
-        original_init(dispatcher)
-        created.append(dispatcher)
-        sleep(0.005)
-
-    monkeypatch.setattr(notifications._Dispatcher, "__init__", slow_init)
+    received: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        notifications,
+        "_submit",
+        lambda notice: received.append((notice.summary, threading.get_ident())),
+    )
+    notifications.install_dispatcher()
+    receiver = notifications._receiver
+    assert receiver is not None
     for round_number in range(5):
         notifications.reset_state()
         received.clear()
-        created.clear()
         barrier = threading.Barrier(6)
         errors: list[BaseException] = []
 
@@ -1121,14 +1118,17 @@ def test_concurrent_notify_creates_one_gui_dispatcher(
             thread.join(timeout=3)
         assert all(not thread.is_alive() for thread in threads)
         assert not errors
-        assert len(created) == 1
-        assert notifications._dispatcher is created[0]
-        assert created[0].thread() is app.thread()
+        # Один бессмертный получатель в GUI; рабочие потоки его не создают.
+        assert notifications._receiver is receiver
+        assert receiver.thread() is app.thread()
         for _ in range(50):
             app.processEvents()
             if len(received) == 6:
                 break
-        assert set(received) == {f"{round_number}-{index}" for index in range(6)}
+        assert {summary for summary, _ in received} == {
+            f"{round_number}-{index}" for index in range(6)
+        }
+        assert {thread for _, thread in received} == {threading.get_ident()}
 
 
 def _qualified_name(node: ast.AST, aliases: dict[str, str]) -> str:
