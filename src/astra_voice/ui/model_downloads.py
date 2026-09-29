@@ -15,15 +15,19 @@ import math
 import shutil
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+from PyQt5 import sip
 from PyQt5.QtCore import (
     QCoreApplication,
+    QMetaObject,
     QObject,
     Qt,
     QThread,
@@ -285,40 +289,91 @@ def catalog_best(entries: Iterable[Any]) -> float:
     return max(rtfx_values) if rtfx_values else 0.0
 
 
-# После таймаута поток и задание должны оставаться живы до выхода run().
-_finishing_model_threads: set[tuple[QThread, _ModelJob | _RecheckJob | None]] = set()
-_model_thread_reaper: _ModelThreadReaper | None = None
+# Рабочие потоки установки и перепроверки — обычные threading.Thread без
+# Python-QObject (уроки 025, 026). Всё, что рабочий поток сообщает GUI, — это
+# Python-значения в очереди канала; GUI будит бессмертный получатель через
+# invokeMethod(QueuedConnection) без Python-аргументов: в очереди Qt лежит только
+# C++-событие MetaCall, для удаления которого (в т. ч. в ~QApplication) GIL не нужен.
+# Рабочий поток не держит ссылок на QObject: владелец очереди виден ему только
+# через канал со слабой ссылкой, которую разыменовывает лишь GUI.
+_JOB_THREAD_NAME = "astra-voice-model-job"
+# Сколько shutdown() ждёт рабочий поток после отмены.
+_SHUTDOWN_JOIN_S = 5.0
+# Ограниченное ожидание выхода потока после его последнего сообщения.
+_FINISH_JOIN_S = 5.0
+_FINISH_RETRY_MS = 100
+
+_JobEvent = tuple[str, tuple[Any, ...]]
+_JobSink = Callable[[str, tuple[Any, ...]], None]
+_job_waker: _JobWaker | None = None
+# Каналы, в которых появились сообщения; получатель разбирает их в GUI.
+_woken_channels: Queue[_JobChannel] = Queue()
 
 
-def _return_to_gui_thread(job: QObject) -> None:
-    """Вызывать в рабочем потоке задания перед его выходом.
-
-    PyQt удаляет QObject чужого потока через deleteLater(), а в завершившийся
-    поток оно не доставляется. Вернув задание в поток GUI, Python удалит его
-    там напрямую, когда контроллер отпустит ссылку после wait().
-    """
-    app = QCoreApplication.instance()
-    if app is not None and job.thread() is not app.thread():
-        job.moveToThread(app.thread())
-
-
-class _ModelThreadReaper(QObject):
-    """Отпускает пару (поток, задание) в GUI только после полного выхода потока.
-
-    finished приходит, пока поток ещё в QThreadPrivate::finish. Если отпустить
-    последнюю ссылку раньше wait(), ~QThread ждёт поток под GIL, а поток может
-    ждать GIL — взаимная блокировка. wait() отпускает GIL.
-    """
+class _JobWaker(QObject):
+    """Бессмертный получатель пробуждений, всегда в потоке GUI."""
 
     @pyqtSlot()
-    def collect(self) -> None:
-        thread = self.sender()
-        if not isinstance(thread, QThread):
-            return
-        thread.wait()
-        for pair in tuple(_finishing_model_threads):
-            if pair[0] is thread:
-                _finishing_model_threads.discard(pair)
+    def _drain(self) -> None:
+        while True:
+            try:
+                channel = _woken_channels.get_nowait()
+            except Empty:
+                return
+            owner = channel.owner()
+            if owner is not None and not sip.isdeleted(owner):
+                owner._drain_channel(channel)
+
+
+def _get_job_waker() -> _JobWaker:
+    global _job_waker
+    if _job_waker is None:
+        app = QCoreApplication.instance()
+        if app is None or app.thread() != QThread.currentThread():
+            raise RuntimeError("Получатель заданий моделей должен создаваться в потоке GUI")
+        _job_waker = _JobWaker()
+        # Объект не удаляется никогда: ни Python, ни чужая инфраструктура Qt.
+        sip.transferto(_job_waker, None)
+    return _job_waker
+
+
+class _JobChannel:
+    """Сообщения одного задания и затвор постов в Qt.
+
+    После close() рабочий поток не трогает очередь событий Qt, даже если пережил
+    ожидание в shutdown(): иначе запоздалый пост во время ~QApplication может
+    взаимно заблокироваться с разрушением очереди событий (урок 026).
+    """
+
+    def __init__(self, owner: ModelDownloads) -> None:
+        # Слабая ссылка разыменовывается только в GUI: последняя ссылка на
+        # владельца никогда не отпускается в рабочем потоке.
+        self.owner: Callable[[], ModelDownloads | None] = weakref.ref(owner)
+        self.events: Queue[_JobEvent] = Queue()
+        self.gate = threading.Lock()
+        self.closed = False
+        # Получатель создаётся здесь, в GUI, до запуска рабочего потока.
+        self.waker = _get_job_waker()
+
+    def post(self, kind: str, args: tuple[Any, ...]) -> None:
+        """Вызывается из рабочего потока: только значения и C++-пробуждение."""
+        self.events.put((kind, args))
+        with self.gate:
+            if not self.closed:
+                _woken_channels.put(self)
+                QMetaObject.invokeMethod(self.waker, "_drain", Qt.ConnectionType.QueuedConnection)
+
+    def close(self) -> None:
+        with self.gate:
+            self.closed = True
+
+
+def _run_job(job: _ModelJob | _RecheckJob, channel: _JobChannel) -> None:
+    """Тело рабочего потока: задание, затем признак выхода (как finished у потока)."""
+    try:
+        job.run()
+    finally:
+        channel.post("exit", ())
 
 
 class ModelPort(Protocol):
@@ -716,13 +771,17 @@ class ModelService:
         )
 
 
-class _ModelJob(QObject):
-    """Одна попытка установки. С GUI общается только сигналами и Event отмены."""
+def _ignore_event(kind: str, args: tuple[Any, ...]) -> None:
+    """Приёмник по умолчанию для заданий, запущенных без канала."""
 
-    progressed = pyqtSignal(float)
-    sourced = pyqtSignal(str)
-    staged = pyqtSignal(str)
-    finished = pyqtSignal(str, str)
+
+class _ModelJob:
+    """Одна попытка установки, без Qt.
+
+    С GUI общается только Python-значениями через приёмник (`sink`): события
+    ``progress`` (доля), ``source`` (вид источника), ``stage`` (этап) и последним —
+    ``finished`` (состояние, причина). Отмена — через ``threading.Event``.
+    """
 
     def __init__(
         self,
@@ -730,18 +789,25 @@ class _ModelJob(QObject):
         entry: Any,
         cancel: threading.Event,
         source: Path | None = None,
+        sink: _JobSink = _ignore_event,
     ) -> None:
-        super().__init__()
         self._model = model
         self._entry = entry
         self._cancel = cancel
         self._source = source
+        self._sink = sink
         if isinstance(model, ModelService):
             model.set_cancel(cancel)
 
+    def _emit(self, kind: str, *args: Any) -> None:
+        self._sink(kind, args)
+
     def _progress(self, value: Progress) -> None:
         fraction = value.bytes_done / value.bytes_total if value.bytes_total > 0 else 0.0
-        self.progressed.emit(max(0.0, min(1.0, fraction)))
+        self._emit("progress", max(0.0, min(1.0, fraction)))
+
+    def _sourced(self, kind: str) -> None:
+        self._emit("source", kind)
 
     def _check_cancel(self) -> None:
         if self._cancel.is_set():
@@ -771,20 +837,20 @@ class _ModelJob(QObject):
         if not self._model.disk_ok(required_bytes):
             return "no-space", ""
         if self._source is None:
-            self.staged.emit("downloading")
+            self._emit("stage", "downloading")
             self._model.download(
                 self._entry,
                 progress=self._progress,
                 cancel=self._cancel,
-                source=self.sourced.emit,
+                source=self._sourced,
             )
             self._check_cancel()
-            self.progressed.emit(1.0)
-        self.staged.emit("verifying")
+            self._emit("progress", 1.0)
+        self._emit("stage", "verifying")
         self._check_cancel()
         # Installer объединяет проверку файлов, перенос и пробное распознавание
         # в одну операцию; частичные результаты не публикуются.
-        self.staged.emit("installing")
+        self._emit("stage", "installing")
         result = (
             self._model.install_from_staging(self._entry)
             if self._source is None
@@ -807,7 +873,6 @@ class _ModelJob(QObject):
             return "no-space", ""
         return "broken", _BROKEN_MESSAGE
 
-    @pyqtSlot()
     def run(self) -> None:
         state, reason = "error", "Не удалось установить модель. Попробуйте ещё раз."
         try:
@@ -832,22 +897,27 @@ class _ModelJob(QObject):
         except Exception:
             log.warning("Установка модели не удалась: unexpected")
         finally:
-            _return_to_gui_thread(self)
-            self.finished.emit(state, reason)
+            self._emit("finished", state, reason)
 
 
-class _RecheckJob(QObject):
-    """Проверяет файлы и распознавание, не меняя состояние хранилища."""
+class _RecheckJob:
+    """Проверяет файлы и распознавание, не меняя состояние хранилища; без Qt.
 
-    finished = pyqtSignal(str, str)
+    Итог — одно событие ``finished`` (состояние, причина) в приёмник.
+    """
 
-    def __init__(self, model: ModelPort, entry: Any, cancel: threading.Event) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        model: ModelPort,
+        entry: Any,
+        cancel: threading.Event,
+        sink: _JobSink = _ignore_event,
+    ) -> None:
         self._model, self._entry, self._cancel = model, entry, cancel
+        self._sink = sink
         if isinstance(model, ModelService):
             model.set_cancel(cancel)
 
-    @pyqtSlot()
     def run(self) -> None:
         state, reason = "cancelled", ""
         try:
@@ -860,8 +930,7 @@ class _RecheckJob(QObject):
         except Exception:
             # Исключение может содержать пути или речь, но не является отказом модели.
             log.warning("Перепроверка модели отложена до следующего запуска")
-        _return_to_gui_thread(self)
-        self.finished.emit(state, reason)
+        self._sink("finished", (state, reason))
 
 
 class ModelDownloads(QObject):
@@ -953,8 +1022,12 @@ class ModelDownloads(QObject):
         self._progress_value = 0.0
         self._speed = ""
         self._eta = ""
-        self._model_thread: QThread | None = None
+        self._model_thread: threading.Thread | None = None
         self._model_job: _ModelJob | _RecheckJob | None = None
+        # Канал текущего задания; сообщения прежних каналов GUI отбрасывает.
+        self._model_channel: _JobChannel | None = None
+        # Поток, выхода которого ждёт отложенная повторная проверка.
+        self._joining_thread: threading.Thread | None = None
         self._model_cancel = threading.Event()
         self._model_result: tuple[str, str] | None = None
         self._shutting_down = False
@@ -2295,25 +2368,49 @@ class ModelDownloads(QObject):
                 log.warning("Не удалось определить дефицит места для загрузки")
         return "Не хватает места — освободите место"
 
+    def _drain_channel(self, channel: _JobChannel) -> None:
+        """Разбирает сообщения задания в GUI; сообщения прежних каналов отбрасывает."""
+        # Слоты ниже могут повторно войти сюда (shutdown из обработчика сигнала)
+        # и сменить канал — тогда цикл сразу прекращается.
+        while channel is self._model_channel:
+            try:
+                kind, args = channel.events.get_nowait()
+            except Empty:
+                return
+            if kind == "progress":
+                self._model_progressed(*args)
+            elif kind == "stage":
+                self._model_staged(*args)
+            elif kind == "source":
+                self._model_sourced(*args)
+            elif kind == "finished":
+                self._model_finished(*args)
+            elif kind == "exit":
+                self._model_thread_finished()
+
     @pyqtSlot()
+    def _retry_thread_finished(self) -> None:
+        thread, self._joining_thread = self._joining_thread, None
+        if thread is not None and self._model_thread is thread:
+            self._model_thread_finished()
+
     def _model_thread_finished(self) -> None:
-        # finished приходит до удаления отложенных QObject в рабочем потоке.
-        # Держим Python-обёртки до конца этой очистки, прежде чем запускать
-        # следующую работу: иначе их деструкторы могут пересечься между потоками.
+        # Последнее сообщение задания приходит перед выходом run(). Ссылки на поток
+        # и задание держим до полного выхода потока и только потом запускаем
+        # следующую работу: задание отпускается в GUI, а не в рабочем потоке.
         thread = self._model_thread
         if thread is not None:
-            if not thread.wait(5000):
+            thread.join(_FINISH_JOIN_S)
+            if thread.is_alive():
                 log.warning("Поток установки модели не завершился за 5 секунд; ожидаем очистку")
-                # Не удаляем обёртки и не запускаем следующую работу до выхода
-                # run()/очистки TLS. GUI между ограниченными ожиданиями свободен.
-                QTimer.singleShot(
-                    100,
-                    lambda: self._model_thread_finished() if self._model_thread is thread else None,
-                )
+                # Не запускаем следующую работу до выхода run(). GUI между
+                # ограниченными ожиданиями свободен.
+                self._joining_thread = thread
+                QTimer.singleShot(_FINISH_RETRY_MS, self._retry_thread_finished)
                 return
-            thread.deleteLater()
         self._model_job = None
         self._model_thread = None
+        self._model_channel = None
         entry = self._active_entry
         if self._queue_running and (self._model_result is None or entry is None):
             self._reset_broken_queue()
@@ -2502,15 +2599,12 @@ class ModelDownloads(QObject):
             self._recheck_model_state = (self._model_state, self._model_message)
             self._model_cancel = threading.Event()
             self._model_result = None
-            thread = QThread(self)
-            job = _RecheckJob(self._model, entry, self._model_cancel)
-            self._model_thread, self._model_job = thread, job
-            job.moveToThread(thread)
-            thread.started.connect(job.run)
-            job.finished.connect(self._model_finished)
-            # job без родителя: им владеет Python, удаление — в GUI после wait().
-            job.finished.connect(thread.quit, Qt.DirectConnection)
-            thread.finished.connect(self._model_thread_finished)
+            channel = _JobChannel(self)
+            job = _RecheckJob(self._model, entry, self._model_cancel, channel.post)
+            thread = threading.Thread(
+                target=_run_job, args=(job, channel), name=_JOB_THREAD_NAME, daemon=True
+            )
+            self._model_thread, self._model_job, self._model_channel = thread, job, channel
             self._set_card(entry, "verifying")
             if entry == self._entry:
                 self._set_model_state("verifying")
@@ -2596,23 +2690,14 @@ class ModelDownloads(QObject):
             self._set_download_source("")
             self._model_cancel = threading.Event()
             self._model_result = None
-            thread = QThread(self)
-            job = _ModelJob(self._model, self._active_entry, self._model_cancel, source)
-            self._model_thread, self._model_job = thread, job
-            job.moveToThread(thread)
-            thread.started.connect(job.run)
-            job.progressed.connect(self._model_progressed)
-            job.sourced.connect(self._model_sourced)
-            job.staged.connect(self._model_staged)
-            job.finished.connect(self._model_finished)
-            # Без job.deleteLater: ~QObject в рабочем потоке берёт GIL под мьютексом
-            # сигналов Qt и взаимно блокируется с GUI. job без родителя, им владеет
-            # Python; удаляется в GUI, когда _model_thread_finished после wait()
-            # отпускает ссылку.
-            # quit() потокобезопасен. Прямой вызов нужен и при shutdown(), когда GUI
-            # ждёт wait() и уже не обрабатывает очередь сигналов.
-            job.finished.connect(thread.quit, Qt.DirectConnection)
-            thread.finished.connect(self._model_thread_finished)
+            channel = _JobChannel(self)
+            job = _ModelJob(
+                self._model, self._active_entry, self._model_cancel, source, channel.post
+            )
+            thread = threading.Thread(
+                target=_run_job, args=(job, channel), name=_JOB_THREAD_NAME, daemon=True
+            )
+            self._model_thread, self._model_job, self._model_channel = thread, job, channel
             self._model_staged("downloading" if source is None else "verifying")
             self._model_progressed(0.0, 0.0, -1.0)
             thread.start()
@@ -2651,7 +2736,11 @@ class ModelDownloads(QObject):
         self._begin_queue((self._entry,), Path(source).expanduser())
 
     def shutdown(self) -> None:
-        """Отменяет загрузку и пробное распознавание; ждёт поток не дольше пяти секунд."""
+        """Отменяет загрузку и пробное распознавание; ждёт поток не дольше пяти секунд.
+
+        Вызывать до разрушения QApplication: здесь закрывается затвор канала, и
+        после возврата рабочий поток уже не постит в очередь событий Qt.
+        """
         if self._shutting_down:
             return
         self._shutting_down = True
@@ -2663,21 +2752,25 @@ class ModelDownloads(QObject):
         self._recheck_queue.clear()
         self._cancel_queue(discard=False)
         self._model_cancel.set()
-        if self._model_thread is not None:
-            self._model_thread.quit()
-            if not self._model_thread.wait(5000):
-                log.warning(
-                    "Установка модели не завершилась за 5 секунд после отмены; "
-                    "выход из приложения продолжается"
-                )
-                global _model_thread_reaper
-                if _model_thread_reaper is None:
-                    _model_thread_reaper = _ModelThreadReaper()
-                thread = self._model_thread
-                thread.setParent(None)
-                _finishing_model_threads.add((thread, self._model_job))
-                # После отсоединения потока обработчик finished может не выполниться,
-                # если очередь GUI уже не крутится; тогда реестр держит пару до конца процесса.
-                thread.finished.connect(_model_thread_reaper.collect, Qt.QueuedConnection)
-                self._model_job = None
-                self._model_thread = None
+        thread, channel = self._model_thread, self._model_channel
+        if thread is None or channel is None:
+            return
+        # Затвор закрывается до join: даже если поток переживёт ожидание, в Qt он
+        # больше не постит. Итог после join разбираем сами, не дожидаясь пробуждения.
+        channel.close()
+        thread.join(_SHUTDOWN_JOIN_S)
+        if thread.is_alive():
+            log.warning(
+                "Установка модели не завершилась за 5 секунд после отмены; "
+                "выход из приложения продолжается"
+            )
+            # Поток-демон дорабатывает сам: задание держит только он, а владельца
+            # очереди он видит лишь через слабую ссылку канала.
+            self._model_job = None
+            self._model_thread = None
+            self._model_channel = None
+            return
+        self._drain_channel(channel)
+        if self._model_thread is thread:
+            # Поток вышел, не оставив признака выхода: завершаем без него.
+            self._model_thread_finished()
