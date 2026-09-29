@@ -745,6 +745,89 @@ def test_record_limit_stops_and_discards_extra(
     assert worker.buffers == {}
 
 
+def test_device_change_stops_trims_and_recognizes_remaining_pcm(factory: Factory) -> None:
+    capture = Mock(spec=AudioCapture)
+    worker, engine, events = factory(capture=capture)
+    assert command(worker, "record.start") == []
+    worker.feed_audio("u1", repeat(0.25, SAMPLE_RATE // 5))
+    worker.feed_audio("u1", repeat(0.75, SAMPLE_RATE // 10))
+
+    worker.on_device_change("u1", "switched", "Встроенный микрофон")
+
+    assert events.get_nowait() == {
+        "type": "audio.device.changed",
+        "utterance_id": "u1",
+        "kind": "switched",
+        "label": "Встроенный микрофон",
+        "audio_ms": 200,
+    }
+    assert_state(worker, State.idle)
+    assert "u1" in worker._stopped
+    assert len(worker.buffers["u1"]) == SAMPLE_RATE // 5
+    assert worker.buffers["u1"][-1] == 0.25
+    capture.request_stop.assert_called_once_with()
+    capture.stop.assert_not_called()
+    assert not worker.on_samples("u1", array("f", repeat(1.0, SAMPLE_RATE)))
+    worker.on_device_change("u1", "device-lost")
+    assert events.empty()
+    assert len(worker.buffers["u1"]) == SAMPLE_RATE // 5
+
+    recognize(worker)
+    assert events.get(timeout=2)["type"] == "result"
+    assert engine.audios == [[0.25] * (SAMPLE_RATE // 5)]
+
+
+@pytest.mark.parametrize("sample_count", [0, 500, SAMPLE_RATE // 10])
+def test_device_change_trims_short_recording_to_empty(factory: Factory, sample_count: int) -> None:
+    worker, _, events = factory()
+    assert command(worker, "record.start") == []
+    worker.feed_audio("u1", repeat(0.25, sample_count))
+    worker.on_device_change("u1", "device-lost", "Не передавать")
+    assert events.get_nowait() == {
+        "type": "audio.device.changed",
+        "utterance_id": "u1",
+        "kind": "device-lost",
+        "audio_ms": 0,
+    }
+    assert worker.buffers["u1"] == array("f")
+
+
+def test_device_change_after_record_stop_preserves_pcm(factory: Factory) -> None:
+    worker, _, events = factory()
+    assert command(worker, "record.start") == []
+    worker.feed_audio("u1", repeat(0.5, SAMPLE_RATE // 4))
+    assert command(worker, "record.stop") == []
+    saved = worker.buffers["u1"]
+    stopped_at = worker._stopped["u1"]
+
+    worker.on_device_change("u1", "device-lost")
+
+    assert events.get_nowait() == {
+        "type": "audio.device.changed",
+        "utterance_id": "u1",
+        "kind": "device-lost",
+        "audio_ms": 250,
+    }
+    assert worker.buffers["u1"] is saved
+    assert len(saved) == SAMPLE_RATE // 4
+    assert worker._stopped["u1"] == stopped_at
+    worker.on_device_change("u1", "switched", "Другое устройство")
+    assert events.empty()
+
+
+def test_device_change_ignores_cancelled_unknown_and_foreign_ids(factory: Factory) -> None:
+    worker, _, events = factory()
+    assert command(worker, "record.start", "u1") == []
+    worker.feed_audio("u1", [0.25])
+    worker.on_device_change("other", "device-lost")
+    worker.on_device_change("unknown", "device-lost")
+    assert events.empty()
+    assert_state(worker, State.recording)
+    assert command(worker, "record.cancel", "u1") == [{"type": "cancelled", "utterance_id": "u1"}]
+    worker.on_device_change("u1", "device-lost")
+    assert events.empty()
+
+
 @pytest.mark.parametrize(
     "limit_s, count",
     [

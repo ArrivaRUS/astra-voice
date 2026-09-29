@@ -720,6 +720,18 @@ def test_microphone_messages_use_system_description_and_actions(
     assert args[6]["urgency"].value() == b"\x01"
 
 
+def test_microphone_changed_escapes_markup_in_body(transport: Mock) -> None:
+    name = '<img src="http://127.0.0.1:1/x">'
+    notifications.notify_microphone_changed(name)
+    transport.bus.asyncCall.assert_called_once()
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
+    assert args[3] == "Микрофон сменился"
+    assert args[4] == (
+        'Сейчас используется: &lt;img src="http://127.0.0.1:1/x"&gt;.'
+        " Выбрать другой можно в настройках."
+    )
+
+
 def _reply_with_id(notification_id: int) -> Mock:
     answer = Mock()
     answer.type.return_value = QDBusMessage.ReplyMessage
@@ -1176,7 +1188,8 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
         **hotkey_templates,
         "notify_onboarding_ready": 'f"Зажмите {combo} и говорите."',
         "notify_microphone_changed": (
-            'f"Сейчас используется: {name}. Выбрать другой можно в настройках."'
+            'f"Сейчас используется: {escape(name, quote=False)}. '
+            'Выбрать другой можно в настройках."'
         ),
         "notify_microphone_selected": 'f"Микрофон: {name}"',
     }

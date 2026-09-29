@@ -23,6 +23,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from astra_voice.worker import pulse_stream as ps
 from astra_voice.worker.audio import (
     CHANNELS,
     CHUNK_BYTES,
@@ -55,6 +56,7 @@ from astra_voice.worker.audio import (
     AudioError,
     AudioSource,
     CaptureStopTimeout,
+    DeviceChange,
     PulseSimpleSource,
     WavFileSource,
     _OpenDeadline,
@@ -71,6 +73,8 @@ from astra_voice.worker.state import LIMIT_S_DEFAULT, Message, State, WorkerStat
 
 # tests не пакет; подключаем общие фейки так же, как test_worker_state.py.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from test_pulse_stream import MIC, FakePulse  # noqa: E402
+
 from fakes import FakeCancelToken, FakeEngine  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -490,9 +494,96 @@ def pulse_library(monkeypatch: pytest.MonkeyPatch) -> Mock:
     return simple
 
 
+class PulseCaptureRig:
+    """Оба настоящих источника; PCM и сбои приходят только через фейковый ABI."""
+
+    def __init__(self, backend: str, simple: Mock) -> None:
+        self.backend = backend
+        self.simple = simple
+        self.pulses: list[FakePulse] = []
+        self.threads: set[int] = set()
+        self.reader: Callable[[], bytes | None] = lambda: bytes(CHUNK_BYTES)
+        self.simple.pa_simple_read.side_effect = self._simple_read
+        self.simple.pa_simple_free.side_effect = lambda _: self.threads.add(threading.get_ident())
+        self.simple.pa_simple_new.side_effect = self._simple_open
+        self.source = self.make_source(devices=lambda: [MIC], default=lambda *_a, **_kw: MIC)
+
+    def _simple_open(self, *args: object) -> int:
+        self.threads.add(threading.get_ident())
+        return 123
+
+    def _simple_read(self, handle: object, buffer: object, size: int, error: object) -> int:
+        self.threads.add(threading.get_ident())
+        chunk = self.reader()
+        # pa_simple блокируется до полной порции: пустые опросы остаются внутри ABI.
+        while chunk == b"":
+            chunk = self.reader()
+        if chunk is None:
+            return -1
+        ctypes.memmove(buffer, chunk.ljust(size, b"\0"), size)  # type: ignore[arg-type]
+        return 0
+
+    def make_source(self, **kwargs: Any) -> PulseSimpleSource | ps.PulseStreamSource:
+        if self.backend == "simple":
+            return PulseSimpleSource(**kwargs)
+        pulse = FakePulse()
+        # Имя неизвестно фейковому серверу; выбор по списку остаётся у источника.
+        pulse.name = None
+        dispatch = pulse.dispatch
+        source = ps.PulseStreamSource(pulse_factory=lambda: pulse, **kwargs)
+
+        def read_dispatch() -> None:
+            dispatch()
+            if source.is_open:
+                chunk = self.reader()
+                if chunk is None:
+                    pulse.stream_state = ps.PA_STREAM_FAILED
+                elif chunk:
+                    # Сервер отдаёт полную порцию, в том числе для редкого сигнала.
+                    pulse.fragments.append(chunk.ljust(CHUNK_BYTES, b"\0"))
+
+        pulse.dispatch = read_dispatch  # type: ignore[method-assign]
+        self.pulses.append(pulse)
+        return source
+
+    def assert_released(self, count: int) -> None:
+        """Считаем реальные вызовы освобождения ABI, а не идемпотентные close()."""
+        if self.backend == "simple":
+            assert self.simple.pa_simple_new.call_count == count
+            assert self.simple.pa_simple_free.call_count == count
+        else:
+            names = [name for pulse in self.pulses for name in pulse.names()]
+            for name in (
+                "stream_new",
+                "stream_disconnect",
+                "stream_unref",
+                "context_unref",
+                "mainloop_free",
+            ):
+                assert names.count(name) == count
+
+    def assert_owner(self, owner: int | None) -> None:
+        owners = (
+            self.threads
+            if self.backend == "simple"
+            else set().union(*(p.threads for p in self.pulses))
+        )
+        assert owners == {owner}
+        assert threading.get_ident() not in owners
+
+
+@pytest.fixture(params=["simple", "stream"])
+def source_backend(request: pytest.FixtureRequest, pulse_library: Mock) -> PulseCaptureRig:
+    """Один контракт исполняется на существующих фейках обоих ABI."""
+    return PulseCaptureRig(request.param, pulse_library)
+
+
 def _cached_source_factory(
-    monkeypatch: pytest.MonkeyPatch, short_sources: str, now: list[float]
-) -> tuple[Callable[[], PulseSimpleSource], list[list[str]]]:
+    monkeypatch: pytest.MonkeyPatch,
+    short_sources: str,
+    now: list[float],
+    backend: PulseCaptureRig | None = None,
+) -> tuple[Callable[[], PulseSimpleSource | ps.PulseStreamSource], list[list[str]]]:
     """Подставляет ответы pactl и wpctl с общим счётчиком команд."""
     name = "alsa_input.pci.microphone"
     listing = pactl_run(
@@ -518,20 +609,26 @@ def _cached_source_factory(
 
     monkeypatch.setattr("astra_voice.worker.audio.list_devices", partial(list_devices, run=run))
 
-    def source() -> PulseSimpleSource:
-        return PulseSimpleSource(default=partial(default_device, run=run), clock=lambda: now[0])
+    monkeypatch.setattr(ps, "list_devices", partial(list_devices, run=run))
+
+    def source() -> PulseSimpleSource | ps.PulseStreamSource:
+        factory = PulseSimpleSource if backend is None else backend.make_source
+        return factory(default=partial(default_device, run=run), clock=lambda: now[0])
 
     return source, commands
 
 
 def test_device_cache_second_default_open_skips_commands(
+    source_backend: PulseCaptureRig,
     pulse_library: Mock,
     monkeypatch: pytest.MonkeyPatch,
     short_sources: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     now = [10.0]
-    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    source_factory, commands = _cached_source_factory(
+        monkeypatch, short_sources, now, source_backend
+    )
     first = source_factory()
     with caplog.at_level(logging.INFO, logger="astra_voice.worker.audio"):
         first.open(None)
@@ -542,11 +639,14 @@ def test_device_cache_second_default_open_skips_commands(
         second.open(None)
         second.close()
     assert len(commands) == 4
-    assert pulse_library.pa_simple_new.call_count == 2
-    assert caplog.messages == [
-        "Источник записи: список устройств запрошен заново.",
-        "Источник записи: список устройств из кэша.",
-    ]
+    if source_backend.backend == "simple":
+        assert pulse_library.pa_simple_new.call_count == 2
+    source_backend.assert_released(2)
+    if source_backend.backend == "simple":
+        assert caplog.messages == [
+            "Источник записи: список устройств запрошен заново.",
+            "Источник записи: список устройств из кэша.",
+        ]
 
 
 def test_device_cache_logs_once_after_capture_open_retry(
@@ -632,10 +732,15 @@ def test_device_cache_explicit_miss_preserves_cached_default(
 
 
 def test_device_cache_public_invalidation(
-    pulse_library: Mock, monkeypatch: pytest.MonkeyPatch, short_sources: str
+    source_backend: PulseCaptureRig,
+    pulse_library: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    short_sources: str,
 ) -> None:
     now = [10.0]
-    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    source_factory, commands = _cached_source_factory(
+        monkeypatch, short_sources, now, source_backend
+    )
     first = source_factory()
     first.open(None)
     first.close()
@@ -673,10 +778,15 @@ def test_device_cache_invalidates_on_first_chunk_timeout(
 
 
 def test_device_cache_expires_at_two_seconds(
-    pulse_library: Mock, monkeypatch: pytest.MonkeyPatch, short_sources: str
+    source_backend: PulseCaptureRig,
+    pulse_library: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    short_sources: str,
 ) -> None:
     now = [10.0]
-    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    source_factory, commands = _cached_source_factory(
+        monkeypatch, short_sources, now, source_backend
+    )
     first = source_factory()
     first.open(None)
     first.close()
@@ -707,10 +817,15 @@ def test_device_cache_invalidates_after_open_error(
 
 
 def test_device_cache_explicit_name_skips_listing(
-    pulse_library: Mock, monkeypatch: pytest.MonkeyPatch, short_sources: str
+    source_backend: PulseCaptureRig,
+    pulse_library: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    short_sources: str,
 ) -> None:
     now = [10.0]
-    source_factory, commands = _cached_source_factory(monkeypatch, short_sources, now)
+    source_factory, commands = _cached_source_factory(
+        monkeypatch, short_sources, now, source_backend
+    )
     first = source_factory()
     first.open(None)
     name = first.device_name
@@ -719,7 +834,9 @@ def test_device_cache_explicit_name_skips_listing(
     second.open(name)
     second.close()
     assert len(commands) == 4
-    assert pulse_library.pa_simple_new.call_count == 2
+    if source_backend.backend == "simple":
+        assert pulse_library.pa_simple_new.call_count == 2
+    source_backend.assert_released(2)
 
 
 @pytest.mark.parametrize(
@@ -1218,6 +1335,7 @@ class ControlledSource:
         """Подготавливает очередь, позволяющую остановить чтение без sleep."""
         self.device_label = label
         self.device_name: str | None = None
+        self.device_change: DeviceChange | None = None
         self.is_open = False
         self.ended = False
         # Управляемый фейк не живой микрофон: сторожа тишины включаем адресно.
@@ -2285,6 +2403,7 @@ def test_pulse_uses_human_label(
 @pytest.mark.parametrize("blocked_call", ["read", "flush", "second_new", "get_latency"])
 @pytest.mark.parametrize("cancel", ["request_stop", "audio.close", "engine-failed"])
 def test_capture_watchdog_never_frees_during_libpulse_call(
+    source_backend: PulseCaptureRig,
     blocked_call: str,
     cancel: str,
     pulse_library: Mock,
@@ -2312,7 +2431,7 @@ def test_capture_watchdog_never_frees_during_libpulse_call(
         assert engine.started.wait(TIMEOUT)
 
     device = AudioDevice(1, "alsa_input.chosen", "Микрофон", False)
-    source = PulseSimpleSource(devices=lambda: [device], sleep=lambda _: None)
+    source = source_backend.make_source(devices=lambda: [device], sleep=lambda _: None)
     close_threads: list[threading.Thread] = []
     free_threads: list[threading.Thread] = []
     new_threads: list[threading.Thread] = []
@@ -2354,10 +2473,35 @@ def test_capture_watchdog_never_frees_during_libpulse_call(
         on_error=worker.on_error,
     )
     monkeypatch.setattr(source, "close", close)
-    pulse_library.pa_simple_new.side_effect = new
-    pulse_library.pa_simple_free.side_effect = free
-    if blocked_call != "second_new":
-        getattr(pulse_library, f"pa_simple_{blocked_call}").side_effect = block
+    if source_backend.backend == "simple":
+        pulse_library.pa_simple_new.side_effect = new
+        pulse_library.pa_simple_free.side_effect = free
+        if blocked_call != "second_new":
+            getattr(pulse_library, f"pa_simple_{blocked_call}").side_effect = block
+    else:
+        pulse = source_backend.pulses[-1]
+        native_call = pulse.lib.call
+
+        def stream_call(symbol: str, *args: Any) -> Any:
+            # Эквиваленты pa_simple на сценарном ABI: блокируется только нативная граница.
+            if symbol == "pa_stream_new":
+                handle = new(*args)
+                if handle is None:
+                    return None
+                native_call(symbol, *args)
+                return handle
+            if symbol == "pa_stream_unref":
+                free(ctypes.c_void_p(args[0]))
+            blocked_symbol = {
+                "read": "pa_mainloop_poll",
+                "flush": "pa_stream_flush",
+                "get_latency": "pa_stream_get_latency",
+            }.get(blocked_call)
+            if symbol == blocked_symbol and (blocked_call != "read" or source.is_open):
+                block(*args)
+            return native_call(symbol, *args)
+
+        monkeypatch.setattr(pulse.lib, "call", stream_call)
     if blocked_call == "flush":
         original_open = capture._open
 
@@ -2395,11 +2539,18 @@ def test_capture_watchdog_never_frees_during_libpulse_call(
         assert not capture.active
         assert not returned.is_set()
         assert close_threads == closes_before_stop
-        pulse_library.pa_simple_free.assert_not_called()
+        if source_backend.backend == "simple":
+            pulse_library.pa_simple_free.assert_not_called()
+        else:
+            assert "stream_unref" not in pulse.names()
+            assert free_threads == []
         assert call_threads == [owner]
         assert new_threads == [owner] * (2 if blocked_call == "second_new" else 1)
         if blocked_call != "get_latency":
-            pulse_library.pa_simple_get_latency.assert_not_called()
+            if source_backend.backend == "simple":
+                pulse_library.pa_simple_get_latency.assert_not_called()
+            else:
+                assert "stream_get_latency" not in pulse.names()
     finally:
         release.set()
         engine_gate.set()
@@ -2411,7 +2562,19 @@ def test_capture_watchdog_never_frees_during_libpulse_call(
         wait_capture()
     assert not source.is_open
     assert free_threads == [owner]
-    assert close_threads == [owner, owner]  # open сбрасывает пустой источник, finally закрывает.
+    if source_backend.backend == "simple":
+        assert close_threads == [
+            owner,
+            owner,
+        ]  # open сбрасывает пустой источник, finally закрывает.
+    else:
+        # stream дополнительно закрывает отменённое открытие; ABI остаётся идемпотентным.
+        assert close_threads == [owner] * (3 if blocked_call == "second_new" else 2)
+        assert pulse.names().count("stream_unref") == 1
+        attempts = 2 if blocked_call == "second_new" else 1
+        assert pulse.names().count("context_unref") == attempts
+        assert pulse.names().count("mainloop_free") == attempts
+        assert pulse.threads == {owner.ident}
     worker.check_capture_watchdog()
 
 
@@ -2574,8 +2737,12 @@ class LiveWavSource(WavFileSource):
         return True
 
 
+@pytest.mark.parametrize("use_pulse", [False, True], ids=["original", "pulse"])
 def test_open_source_without_a_single_chunk_reports_silent(
-    monkeypatch: pytest.MonkeyPatch, probes: list[CaptureProbe]
+    source_backend: PulseCaptureRig,
+    use_pulse: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    probes: list[CaptureProbe],
 ) -> None:
     """P0 на Fly: источник открылся, но ни одной порции не отдал — называем причину."""
     entered = threading.Event()
@@ -2589,7 +2756,9 @@ def test_open_source_without_a_single_chunk_reports_silent(
         return None
 
     monkeypatch.setattr(source, "read_chunk", read_chunk)
-    probe = CaptureProbe(source)
+    if use_pulse:
+        source_backend.reader = read_chunk
+    probe = CaptureProbe(source_backend.source if use_pulse else source)
     probes.append(probe)
     probe.now = 100.0
     probe.capture.start("mute", None, limit_s=LIMIT_S_DEFAULT)
@@ -2625,7 +2794,10 @@ def test_first_chunk_cancels_the_silent_watchdog(
     assert len(probe.samples) == 2
 
 
+@pytest.mark.parametrize("use_pulse", [False, True], ids=["original", "pulse"])
 def test_exact_zeros_from_live_source_report_silent(
+    source_backend: PulseCaptureRig,
+    use_pulse: bool,
     wav_factory: WavFactory,
     wait_capture: Callable[[], None],
     probes: list[CaptureProbe],
@@ -2643,7 +2815,7 @@ def test_exact_zeros_from_live_source_report_silent(
     step = 1.0
     # Тот же файл, но выданный за живой микрофон: проверяем сторож ровных нулей.
     source = LiveWavSource(wav_factory(0, 32))
-    probe = CaptureProbe(source, step=step)
+    probe = CaptureProbe(source_backend.source if use_pulse else source, step=step)
     probes.append(probe)
     probe.capture.start("zeros", None, limit_s=LIMIT_S_DEFAULT)
     wait_capture()
@@ -2668,9 +2840,26 @@ def test_file_source_keeps_digital_silence(
     assert len(probe.samples) == 32
 
 
-@pytest.mark.parametrize("chunk", [b"", struct.pack("<h", 8192)], ids=["empty", "sparse"])
-@pytest.mark.parametrize("advance_on_samples", [False, True], ids=["during-read", "between-reads"])
+@pytest.mark.parametrize(
+    ("use_pulse", "source_backend", "advance_on_samples", "chunk"),
+    [
+        (False, "simple", advance, chunk)
+        for advance in (False, True)
+        for chunk in (b"", struct.pack("<h", 8192))
+    ]
+    + [
+        (True, backend, advance, chunk)
+        for backend in ("simple", "stream")
+        for advance in (False, True)
+        for chunk in (b"", struct.pack("<h", 8192))
+        # pa_simple не возвращает пустой опрос: его дедлайн проверяется при блокировке ABI.
+        if backend != "simple" or chunk
+    ],
+    indirect=["source_backend"],
+)
 def test_record_deadline_checked_between_chunks(
+    source_backend: PulseCaptureRig,
+    use_pulse: bool,
     chunk: bytes,
     advance_on_samples: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -2679,7 +2868,10 @@ def test_record_deadline_checked_between_chunks(
 ) -> None:
     """ИБ-9: цикл сам прекращает редкие и пустые чанки без опроса владельцем."""
     source = ControlledSource()
-    probe = CaptureProbe(source, step=1.0 if advance_on_samples else 0.0)
+    probe = CaptureProbe(
+        source_backend.source if use_pulse else source,
+        step=1.0 if advance_on_samples else 0.0,
+    )
     probes.append(probe)
     probe.now = 100.0
     read_calls = 0
@@ -2687,7 +2879,7 @@ def test_record_deadline_checked_between_chunks(
     def read_chunk() -> bytes | None:
         nonlocal read_calls
         read_calls += 1
-        if not advance_on_samples:
+        if not advance_on_samples or chunk == b"":
             probe.now += 1.0
         if read_calls > 10:
             # Даже при регрессии тест завершится без бесконечного цикла.
@@ -2696,15 +2888,21 @@ def test_record_deadline_checked_between_chunks(
         return chunk
 
     monkeypatch.setattr(source, "read_chunk", read_chunk)
+    if use_pulse:
+        source_backend.reader = read_chunk
     probe.capture.start("slow", None, limit_s=3.0 - RECORD_DEADLINE_GRACE_S)
     wait_capture()
     assert probe.now == 103.0
     assert read_calls == 3
-    assert len(probe.samples) == (3 if advance_on_samples else 2)
+    assert len(probe.samples) == (0 if chunk == b"" else 3 if advance_on_samples else 2)
     assert not probe.capture.active
     assert probe.capture._record_deadline is None
-    assert not source.is_open
-    assert source.close_calls == 1
+    if use_pulse:
+        assert not source_backend.source.is_open
+        source_backend.assert_released(1)
+    else:
+        assert not source.is_open
+        assert source.close_calls == 1
     assert probe.errors.empty()
 
 
@@ -2824,3 +3022,144 @@ def test_list_devices_null_descriptions_come_from_pipewire(short_sources: str) -
     assert all("(null)" not in device.label for device in devices)
     devices = list_devices(run=pactl_run(short_sources, null_details))
     assert [device.description for device in devices] == ["Микрофон", "Звук системы"]
+
+
+@pytest.mark.parametrize("finish", ["stop", "cancel", "error"])
+def test_pulse_capture_lifetime_contract(
+    source_backend: PulseCaptureRig,
+    finish: str,
+    probes: list[CaptureProbe],
+    wait_capture: Callable[[], None],
+) -> None:
+    """T-40/T-43: две записи, один владелец ABI, между записями нет соединения."""
+    source = source_backend.source
+    probe = CaptureProbe(source, sink=lambda _uid, _samples: False)
+    probes.append(probe)
+    chunk = struct.pack("<h", 8192) * (CHUNK_BYTES // SAMPLE_BYTES)
+    assert not source.is_open
+    source_backend.assert_released(0)
+    for index in range(1, 3):
+        entered, release = threading.Event(), threading.Event()
+        source_backend.threads.clear()
+        for pulse in source_backend.pulses:
+            pulse.threads.clear()
+
+        def read(
+            entered: threading.Event = entered, release: threading.Event = release
+        ) -> bytes | None:
+            entered.set()
+            assert release.wait(TIMEOUT)
+            return None if finish == "error" else chunk
+
+        source_backend.reader = read
+        probe.capture.start(str(index), MIC.name, limit_s=30)
+        try:
+            assert entered.wait(TIMEOUT)
+            assert source.is_open
+            owner = probe.capture._thread
+            assert owner is not None and owner.is_alive()
+            if finish == "cancel":
+                probe.capture.request_stop()
+                assert source.is_open
+        finally:
+            release.set()
+            wait_capture()
+        assert not probe.capture.active
+        assert not source.is_open
+        source_backend.assert_released(index)
+        source_backend.assert_owner(owner.ident)
+        # Повторная остановка не вызывает второе освобождение нативных ресурсов.
+        probe.capture.stop()
+        source_backend.assert_released(index)
+        if finish == "error":
+            assert probe.errors.get_nowait() == (
+                str(index),
+                ERROR_FAILED,
+                "Запись звука прервалась.",
+            )
+        assert probe.errors.empty()
+    assert len(probe.samples) == (2 if finish == "stop" else 0)
+
+
+def test_pulse_first_chunk_cancels_watchdog(
+    source_backend: PulseCaptureRig, probes: list[CaptureProbe], wait_capture: Callable[[], None]
+) -> None:
+    """Первая настоящая порция обоих ABI снимает сторож даже при следующем пустом чтении."""
+    entered, release = threading.Event(), threading.Event()
+    reads = 0
+
+    def read() -> bytes | None:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return struct.pack("<h", 8192) * (CHUNK_BYTES // SAMPLE_BYTES)
+        entered.set()
+        assert release.wait(TIMEOUT)
+        return None
+
+    source_backend.reader = read
+    probe = CaptureProbe(source_backend.source)
+    probes.append(probe)
+    probe.now = 100.0
+    probe.capture.start("ok", MIC.name, limit_s=30)
+    try:
+        assert entered.wait(TIMEOUT)
+        probe.now = 100.0 + FIRST_CHUNK_TIMEOUT_S
+        probe.capture.check_stop_watchdog()
+        assert probe.errors.empty()
+        assert probe.capture.active
+        assert len(probe.samples) == 1
+    finally:
+        probe.capture.request_stop()
+        release.set()
+        wait_capture()
+    assert probe.errors.empty()
+    source_backend.assert_released(1)
+
+
+def test_pulse_record_deadline_while_native_read_is_blocked(
+    source_backend: PulseCaptureRig, probes: list[CaptureProbe], wait_capture: Callable[[], None]
+) -> None:
+    """T-40: дедлайн снимает running, но ABI освобождает только вернувшийся владелец."""
+    entered, release = threading.Event(), threading.Event()
+
+    def read() -> bytes | None:
+        entered.set()
+        assert release.wait(TIMEOUT)
+        return None
+
+    source_backend.reader = read
+    source = source_backend.source
+    probe = CaptureProbe(source)
+    probes.append(probe)
+    probe.now = 100.0
+    # Срок записи раньше сторожа первой порции, чтобы проверять именно дедлайн.
+    limit_s = 0.5
+    deadline = probe.now + limit_s + RECORD_DEADLINE_GRACE_S
+    probe.capture.start("blocked", MIC.name, limit_s=limit_s)
+    try:
+        assert entered.wait(TIMEOUT)
+        owner = probe.capture._thread
+        assert owner is not None
+        probe.now = deadline - 0.001
+        probe.capture.check_stop_watchdog()
+        assert probe.capture.active
+        probe.now = deadline
+        probe.capture.check_stop_watchdog()
+        assert not probe.capture.active
+        assert probe.capture._record_deadline is None
+        assert owner.is_alive()
+        assert source.is_open
+        assert probe.samples == []
+        assert probe.errors.empty()
+        if source_backend.backend == "simple":
+            source_backend.simple.pa_simple_free.assert_not_called()
+        else:
+            assert "stream_unref" not in source_backend.pulses[-1].names()
+    finally:
+        release.set()
+        wait_capture()
+    assert not source.is_open
+    assert probe.errors.empty()
+    source_backend.assert_released(1)
+    source_backend.assert_owner(owner.ident)

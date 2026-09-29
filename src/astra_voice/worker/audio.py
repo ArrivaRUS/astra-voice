@@ -17,7 +17,7 @@ from array import array
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from astra_voice.worker.state import WorkerState
 
@@ -52,6 +52,14 @@ OPEN_DEADLINE_S = 2.0
 OPEN_TOTAL_DEADLINE_S = 8.0
 DEVICE_CACHE_TTL_S = 2.0
 MAX_DEVICE_LABEL = 120
+REASON_REMOVED = "removed"
+REASON_KILLED = "killed"
+REASON_MOVED = "moved"
+REASON_MISMATCH = "mismatch"
+KIND_SWITCHED = "switched"
+KIND_DEVICE_LOST = "device-lost"
+DEVICE_CHANGE_TRIM_MS = 100
+DEVICE_CHANGE_BUDGET_S = 0.7
 
 ERROR_NO_DEVICE = "audio-no-device"
 ERROR_BUSY = "audio-busy"
@@ -78,9 +86,9 @@ class CaptureStopTimeout(RuntimeError):
 class _OpenDeadline:
     """Общий бюджет подготовки источника по часам владельца захвата."""
 
-    def __init__(self, clock: Callable[[], float]) -> None:
+    def __init__(self, clock: Callable[[], float], duration: float = OPEN_TOTAL_DEADLINE_S) -> None:
         self._clock = clock
-        self._end = clock() + OPEN_TOTAL_DEADLINE_S
+        self._end = clock() + duration
 
     def remaining(self, limit: float) -> float:
         """Ограничивает ожидание остатком бюджета или сообщает об истечении."""
@@ -121,6 +129,44 @@ class AudioDevice:
     def label(self) -> str:
         """Возвращает подпись с явным предупреждением о записи звука колонок."""
         return _device_label(self.description, " (звук системы)" if self.monitor else "")
+
+
+@dataclass(frozen=True)
+class DeviceChange:
+    """Факт смены источника, установленный потоком записи."""
+
+    reason: str
+    original: AudioDevice | None
+    default_mode: bool
+    moved_to_name: str | None = None
+    server_changed: bool = False
+
+
+def classify_change(
+    change: DeviceChange,
+    devices: list[AudioDevice] | None,
+    default: AudioDevice | None,
+) -> tuple[str, str | None]:
+    """Определяет исход по свежему списку, не раскрывая технические имена."""
+    if devices is None:
+        return KIND_DEVICE_LOST, None
+    if change.reason in (REASON_REMOVED, REASON_KILLED):
+        if (
+            change.default_mode
+            and default is not None
+            and not default.monitor
+            and (change.original is None or default.name != change.original.name)
+        ):
+            return KIND_SWITCHED, default.label
+        return KIND_DEVICE_LOST, None
+    if change.reason in (REASON_MOVED, REASON_MISMATCH):
+        target = next((item for item in devices if item.name == change.moved_to_name), None)
+        original_present = change.original is not None and any(
+            item.name == change.original.name for item in devices
+        )
+        if target is not None and not target.monitor and (change.default_mode or original_present):
+            return KIND_SWITCHED, target.label
+    return KIND_DEVICE_LOST, None
 
 
 class _DeviceCache:
@@ -460,6 +506,46 @@ def resolve_device(name: str | None, devices: list[AudioDevice]) -> AudioDevice 
     )
 
 
+def select_device(
+    device: str | None,
+    *,
+    devices_fn: Callable[..., list[AudioDevice]],
+    default_fn: Callable[..., AudioDevice],
+    clock: Callable[[], float],
+    deadline: _OpenDeadline | None = None,
+    use_cache: bool = True,
+) -> tuple[AudioDevice, bool]:
+    """Выбирает проверенный источник с коротким кэшем перед загрузкой libpulse."""
+    cached_devices, cached_default = _device_cache.get(clock) if use_cache else (None, None)
+    if cached_devices is not None and (device is not None or cached_default is not None):
+        selected = (
+            cached_default
+            if device is None
+            else next((item for item in cached_devices if item.name == device), None)
+        )
+        if selected is not None:
+            return selected, True
+    try:
+        devices = devices_fn(deadline=deadline)
+        if deadline is not None:
+            deadline.remaining(OPEN_TOTAL_DEADLINE_S)
+        selected = (
+            default_fn(devices, deadline=deadline)
+            if device is None
+            else resolve_device(device, devices)
+        )
+        assert selected is not None
+        if use_cache:
+            if device is None:
+                _device_cache.put(devices, selected, clock)
+            else:
+                _device_cache.put_devices(devices, clock)
+        return selected, False
+    except AudioError:
+        invalidate_device_cache()
+        raise
+
+
 def describe_change(previous: AudioDevice | None, current: AudioDevice | None) -> str | None:
     """Сообщает о смене выбора или описания; None означает выбор по умолчанию."""
     if previous is None and current is None:
@@ -515,6 +601,26 @@ class AudioSource(Protocol):
         ...
 
 
+@runtime_checkable
+class ManagedSource(AudioSource, Protocol):
+    """Источник, принимающий общий срок открытия и флаг остановки."""
+
+    def open(
+        self,
+        device: str | None,
+        *,
+        deadline: _OpenDeadline | None = None,
+        running: threading.Event | None = None,
+    ) -> None:
+        """Открывает источник в срок с возможностью отмены."""
+        ...
+
+    @property
+    def selected_device(self) -> AudioDevice | None:
+        """Возвращает устройство, проверенное при открытии."""
+        ...
+
+
 def dbfs(peak: float) -> float:
     """Переводит амплитуду PCM16 в дБFS с конечным значением для нуля."""
     if peak <= 0:
@@ -546,6 +652,9 @@ class AudioCapture:
         on_samples: Callable[[str, array[float]], bool],
         on_event: Callable[[dict[str, Any]], None],
         on_error: Callable[[str, str, str], None],
+        on_device_change: Callable[[str, str, str | None], None] | None = None,
+        list_devices_fn: Callable[..., list[AudioDevice]] = list_devices,
+        default_device_fn: Callable[..., AudioDevice] = default_device,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -553,6 +662,9 @@ class AudioCapture:
         self._on_samples = on_samples
         self._on_event = on_event
         self._on_error = on_error
+        self._on_device_change = on_device_change
+        self._list_devices_fn = list_devices_fn
+        self._default_device_fn = default_device_fn
         self._clock = clock
         self._sleep = sleep
         self._running = threading.Event()
@@ -602,7 +714,7 @@ class AudioCapture:
             try:
                 opened_now = False
                 if not self._source.is_open:
-                    if isinstance(self._source, PulseSimpleSource):
+                    if isinstance(self._source, ManagedSource):
                         self._source.open(device, deadline=deadline, running=running)
                     else:
                         self._source.open(device)
@@ -618,6 +730,8 @@ class AudioCapture:
                 self._sleep(deadline.remaining(OPEN_FIRST_PAUSE_S))
             else:
                 if not running.is_set():
+                    if getattr(self._source, "device_change", None) is not None:
+                        return opened_now
                     return None
                 deadline.remaining(OPEN_TOTAL_DEADLINE_S)
                 self._first_open = False
@@ -640,10 +754,14 @@ class AudioCapture:
             opened_now = self._open(device, running)
             if opened_now is None:
                 return
+            change = getattr(self._source, "device_change", None)
+            if change is not None:
+                self._report_device_change(uid, change)
+                return
             if opened_now:
                 current = (
                     self._source.selected_device
-                    if isinstance(self._source, PulseSimpleSource)
+                    if isinstance(self._source, ManagedSource)
                     else None
                 )
                 changed = describe_change(self._previous_device, current)
@@ -686,8 +804,14 @@ class AudioCapture:
             if self._clock() >= deadline:
                 return
             chunk = self._source.read_chunk()
+            change = getattr(self._source, "device_change", None) if chunk is None else None
+            if change is not None:
+                self._report_device_change(uid, change)
+                return
             if not running.is_set() or self._clock() >= deadline:
                 return
+            if chunk == b"":
+                continue
             if chunk is None:
                 if self._source.ended:
                     return
@@ -735,6 +859,40 @@ class AudioCapture:
             elif not silent_sent and now - silence_since >= SILENCE_HOLD_S:
                 self._on_event({"type": "silent", "utterance_id": uid})
                 silent_sent = True
+
+    def _report_device_change(self, uid: str, change: DeviceChange) -> None:
+        """Классифицирует смену в отдельном бюджете и передаёт её автомату."""
+        with self._watchdog_lock:
+            self._first_chunk_deadline = None
+            self._silent_uid = None
+        if self._on_device_change is None:
+            raise AudioError(ERROR_FAILED, "Запись звука прервалась.")
+        started = self._clock()
+        budget = _OpenDeadline(self._clock, DEVICE_CHANGE_BUDGET_S)
+        devices: list[AudioDevice] | None = None
+        default: AudioDevice | None = None
+        try:
+            devices = self._list_devices_fn(deadline=budget)
+            budget.remaining(DEVICE_CHANGE_BUDGET_S)
+        except AudioError:
+            devices = None
+        if devices is not None and change.default_mode:
+            try:
+                default = self._default_device_fn(devices, deadline=budget)
+                budget.remaining(DEVICE_CHANGE_BUDGET_S)
+            except AudioError:
+                default = None
+        kind, label = classify_change(change, devices, default)
+        elapsed_ms = int((self._clock() - started) * 1000)
+        logger.info(
+            "Смена устройства записи: reason=%s kind=%s t_ms=%d label=%s",
+            change.reason,
+            kind,
+            elapsed_ms,
+            label,
+        )
+        logger.debug("Смена устройства записи: moved_to_name=%r", change.moved_to_name)
+        self._on_device_change(uid, kind, label)
 
     def request_stop(self) -> None:
         """Снимает флаг работы без ожидания потока и обращения к источнику."""
@@ -930,37 +1088,19 @@ class PulseSimpleSource:
             return
         try:
             self.close()
-            cached_devices, cached_default = (
-                _device_cache.get(self._clock) if self._devices is None else (None, None)
+
+            def devices_fn(*, deadline: _OpenDeadline | None) -> list[AudioDevice]:
+                """Сохраняет тестовую инъекцию списка без изменения её контракта."""
+                return list_devices(deadline=deadline) if self._devices is None else self._devices()
+
+            selected, from_cache = select_device(
+                device,
+                devices_fn=devices_fn,
+                default_fn=self._default,
+                clock=self._clock,
+                deadline=deadline,
+                use_cache=self._devices is None,
             )
-            if cached_devices is not None and (device is not None or cached_default is not None):
-                selected = (
-                    cached_default
-                    if device is None
-                    else next((item for item in cached_devices if item.name == device), None)
-                )
-                from_cache = selected is not None
-            else:
-                selected = None
-                from_cache = False
-            if not from_cache:
-                devices = (
-                    list_devices(deadline=deadline) if self._devices is None else self._devices()
-                )
-                if deadline is not None:
-                    deadline.remaining(OPEN_TOTAL_DEADLINE_S)
-                # У44: проверяем умолчание до загрузки libpulse.
-                selected = (
-                    self._default(devices, deadline=deadline)
-                    if device is None
-                    else resolve_device(device, devices)
-                )
-                if self._devices is None:
-                    if device is None:
-                        _device_cache.put(devices, selected, self._clock)
-                    else:
-                        _device_cache.put_devices(devices, self._clock)
-            assert selected is not None
             if deadline is not None:
                 deadline.remaining(OPEN_TOTAL_DEADLINE_S)
             if selected.monitor:

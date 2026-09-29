@@ -861,3 +861,67 @@ def test_hardening_failures_are_independent(monkeypatch: pytest.MonkeyPatch) -> 
     assert prctl.call_count == 2
     core.assert_called_once_with(resource.RLIMIT_CORE, (0, 0))
     oom.assert_called_once_with()
+
+
+@pytest.mark.parametrize("value", [None, "simple", "garbage", "STREAM", ""])
+def test_select_simple_without_importing_stream(
+    value: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Чистый выбор не читает окружение и не импортирует запасной модуль."""
+    from astra_voice.worker.audio import PulseSimpleSource
+
+    monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=AssertionError("libpulse")))
+    monkeypatch.setitem(sys.modules, "astra_voice.worker.pulse_stream", None)
+    monkeypatch.setenv("ASTRA_VOICE_AUDIO_BACKEND", "stream")
+    env = {} if value is None else {"ASTRA_VOICE_AUDIO_BACKEND": value}
+    source = worker_main.select_audio_source(env)
+    assert isinstance(source, PulseSimpleSource)
+    assert not source.is_open
+    assert env == ({} if value is None else {"ASTRA_VOICE_AUDIO_BACKEND": value})
+
+
+def test_select_stream_does_not_load_libpulse(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Конструктор нового источника также не загружает нативную библиотеку."""
+    from astra_voice.worker.pulse_stream import PulseStreamSource
+
+    monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=AssertionError("libpulse")))
+    source = worker_main.select_audio_source({"ASTRA_VOICE_AUDIO_BACKEND": "stream"})
+    assert isinstance(source, PulseStreamSource)
+    assert not source.is_open
+
+
+@pytest.mark.parametrize("value", [None, "simple", "stream", "private-" * 100, ""])
+def test_capture_logs_backend_once(
+    value: str | None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Сообщения принадлежат созданию захвата, значение неизвестной переменной не утекает."""
+    monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=AssertionError("libpulse")))
+    if value is None:
+        monkeypatch.delenv("ASTRA_VOICE_AUDIO_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("ASTRA_VOICE_AUDIO_BACKEND", value)
+    connection, peer = socket.socketpair()
+    loop = None
+    try:
+        with caplog.at_level(logging.INFO, logger=worker_main.__name__):
+            loop = worker_main.WorkerLoop(connection)
+            loop.worker.close()
+            loop.worker.close()
+        backend = "stream" if value == "stream" else "simple"
+        assert [r.message for r in caplog.records if r.levelno == logging.INFO] == [
+            f"Бэкенд записи: {backend}"
+        ]
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings == (
+            ["Неизвестный ASTRA_VOICE_AUDIO_BACKEND; выбран simple."]
+            if value not in (None, "simple", "stream")
+            else []
+        )
+        assert "private-" not in caplog.text
+    finally:
+        if loop is not None:
+            loop.worker.close()
+            loop._wake_r.close()
+            loop._wake_w.close()
+        connection.close()
+        peer.close()
