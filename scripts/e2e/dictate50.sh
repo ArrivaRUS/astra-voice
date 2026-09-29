@@ -23,6 +23,9 @@ usage() {
 В Astra Voice выберите режим удержания хоткея и загрузите модель.
 Подготовьте поле ввода Kate/fly-term.
 После подтверждения даётся 5 секунд, чтобы перевести фокус в это поле.
+Если нажатие за 2 с не дошло до диктовки (в журнале нет «record.start отправлен»),
+прогон прерывается с диагностикой хоткея. Журнал: $XDG_DATA_HOME/astra-voice/logs,
+другой путь — переменная ASTRA_VOICE_E2E_LOG.
 Цель: p95 полного времени «отпустил → текст в окне» (t_total_ms) ≤ 500 мс.
 Коды возврата: 0 — уложились, 1 — не уложились, 2 — прогон невозможен.
 EOF
@@ -194,6 +197,22 @@ before_dictations=$(printf '%s\n' "$stats_json" | json_field dictations)
 printf 'До прогона: событий %s, диктовок %s.\n' "$before_events" "$before_dictations"
 since=$(python3 -c 'import time; print(time.time())')
 
+diag="$ROOT/scripts/e2e/hotkey_diag.py"
+log_missing_said=0
+# Нажатие не дошло до диктовки: собрать диагностику (без текста) и прервать прогон.
+hotkey_diagnostics() {
+  say_error "Нажатие $hotkey не дошло до диктовки: за 2 с в журнале нет «record.start отправлен»."
+  printf '%s\n' 'Диагностика хоткея:'
+  python3 "$diag" probe-grab "$hotkey" || true
+  xdotool keyup --delay 100 "$hotkey" || say_error "Не удалось отпустить $hotkey. Отпустите клавиши вручную."
+  key_down=0
+  sleep 0.2
+  python3 "$diag" probe-keyboard || true
+  python3 "$diag" keymap "$hotkey" || true
+  python3 "$diag" hotkey-lines --offset "$log_offset" || true
+  fail 'Вердикт: прогон невозможен — хоткей не запускает диктовку (диагностика выше).'
+}
+
 key_down=0
 cleanup() {
   exit_status=$?
@@ -217,8 +236,22 @@ max_iterations=$((count + 1))
 incomplete=0
 while [ "$iteration" -le "$max_iterations" ]; do
   printf 'Диктовка %s из не более %s\n' "$iteration" "$max_iterations"
+  log_offset=$(python3 "$diag" offset) || log_offset=-1
   key_down=1
   xdotool keydown --delay 100 "$hotkey" || fail 'Не удалось нажать хоткей.'
+  # Нажатие должно дойти до диктовки за 2 с; иначе не ждём 120 опросов впустую.
+  start_code=0
+  python3 "$diag" wait-start --offset "$log_offset" --timeout 2 || start_code=$?
+  case "$start_code" in
+    0) ;;
+    1) hotkey_diagnostics ;;
+    *)
+      if [ "$log_missing_said" -eq 0 ]; then
+        say_error 'Журнал Astra Voice не найден: проверка «record.start отправлен» пропущена.'
+        log_missing_said=1
+      fi
+      ;;
+  esac
   # Даём GUI открыть источник; даже короткий WAV не превращает удержание в тап.
   sleep 0.5
   paplay --device=av_test "$wav" || fail 'Не удалось подать WAV в виртуальный микрофон.'
