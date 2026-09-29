@@ -47,6 +47,8 @@ class Rig:
         self.focuser = Mock()
         self.cleanup = Mock()
         self.bus_shutdown = Mock()
+        self.notify_install = Mock()
+        self.notify_shutdown = Mock()
         self.runtime = Mock()
         self.runtime.on_quit_requested = None
         self.runtime.tray.on_quit = lambda: DictationRuntime._quit_requested(self.runtime)
@@ -59,6 +61,8 @@ class Rig:
         self.calls.attach_mock(self.app.quit, "quit")
         self.calls.attach_mock(self.runtime.shutdown, "shutdown")
         self.calls.attach_mock(self.bus_shutdown, "bus_shutdown")
+        self.calls.attach_mock(self.notify_install, "notify_install")
+        self.calls.attach_mock(self.notify_shutdown, "notify_shutdown")
         self.calls.attach_mock(self.focuser.stop, "focuser_stop")
         self.calls.attach_mock(self.timer.stop, "timer_stop")
         self.calls.attach_mock(self.theme.source.stop, "theme_stop")
@@ -88,6 +92,8 @@ class Rig:
         monkeypatch.setattr(app_mod, "_WindowFocuser", self.focuser_factory)
         monkeypatch.setattr(app_mod, "_cleanup", self.cleanup)
         monkeypatch.setattr(app_mod, "shutdown_bus_threads", self.bus_shutdown)
+        monkeypatch.setattr(app_mod, "install_notify_dispatcher", self.notify_install)
+        monkeypatch.setattr(app_mod, "shutdown_notify_dispatch", self.notify_shutdown)
         monkeypatch.setattr(runtime_mod, "DictationRuntime", self.factory)
 
 
@@ -178,10 +184,12 @@ def test_shutdown_once_before_other_cleanup(rig: Rig) -> None:
     )
     rig.app.setQuitOnLastWindowClosed.assert_called_once_with(False)
     assert rig.calls.mock_calls == [
+        call.notify_install(),
         call.start(),
         call.exec(),
         call.focuser_stop(),
         call.shutdown(),
+        call.notify_shutdown(),
         call.bus_shutdown(),
         call.timer_stop(),
         call.theme_stop(),
@@ -610,6 +618,8 @@ def test_event_loop_failure_still_shuts_down(rig: Rig) -> None:
         app_mod.main([])
 
     rig.runtime.shutdown.assert_called_once_with()
+    # Затвор уведомлений закрыт и при выходе по исключению (урок 026).
+    rig.notify_shutdown.assert_called_once_with()
     rig.cleanup.assert_called_once_with(rig.server, rig.lock)
 
 
@@ -628,6 +638,33 @@ def test_shutdown_failure_does_not_skip_cleanup(rig: Rig) -> None:
     rig.timer.stop.assert_called_once_with()
     rig.theme.source.stop.assert_called_once_with()
     rig.cleanup.assert_called_once_with(rig.server, rig.lock)
+
+
+def test_focuser_stop_failure_does_not_skip_cleanup(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.focuser.stop.side_effect = RuntimeError("Ошибка фокуса")
+
+    with caplog.at_level(logging.WARNING, logger=app_mod.__name__):
+        assert app_mod.main([]) == 7
+
+    # Сбой фокуса не отменяет ни затвор уведомлений, ни остальную очистку.
+    assert rig.calls.mock_calls == [
+        call.notify_install(),
+        call.start(),
+        call.exec(),
+        call.focuser_stop(),
+        call.shutdown(),
+        call.notify_shutdown(),
+        call.bus_shutdown(),
+        call.timer_stop(),
+        call.theme_stop(),
+        call.cleanup(rig.server, rig.lock),
+    ]
+    rig.cleanup.assert_called_once_with(rig.server, rig.lock)
+    assert any(
+        "Не удалось остановить фокусировку окна" in record.getMessage() for record in caplog.records
+    )
 
 
 def test_bus_thread_shutdown_failure_does_not_skip_cleanup(

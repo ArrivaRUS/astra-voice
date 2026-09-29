@@ -14,18 +14,20 @@ from collections import OrderedDict, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from html import escape
+from queue import Empty, Queue
 from time import monotonic
 from typing import Any, cast
 
+from PyQt5 import sip
 from PyQt5.QtCore import (
     QCoreApplication,
+    QMetaObject,
     QMetaType,
     QObject,
     Qt,
     QThread,
     QTimer,
     QVariant,
-    pyqtSignal,
     pyqtSlot,
 )
 from PyQt5.QtDBus import QDBusConnection, QDBusMessage, QDBusPendingCallWatcher, QDBusPendingReply
@@ -41,6 +43,7 @@ __all__ = [
     "ACTION_SHOW_DETAILS",
     "drop_pending",
     "flush_pending",
+    "install_dispatcher",
     "last_delivery_ok",
     "notify",
     "notify_engine_failed",
@@ -60,6 +63,7 @@ __all__ = [
     "pending_count",
     "reset_state",
     "set_action_handler",
+    "shutdown_dispatch",
 ]
 
 ACTION_CHOOSE_HOTKEY = "choose-hotkey"
@@ -94,8 +98,6 @@ _slot: _Notice | None = None
 _queued: deque[_Notice] = deque()
 _watchers: dict[int, QDBusPendingCallWatcher] = {}
 _sent: dict[int, tuple[_Notice, int]] = {}
-_dispatcher: _Dispatcher | None = None
-_dispatcher_lock = threading.Lock()
 _timeout_streak = 0
 _timeout_warned = False
 _CALL_TIMEOUT_MS = 10_000
@@ -139,17 +141,97 @@ _action_bus: QDBusConnection | None = None
 _action_receiver: _ActionReceiver | None = None
 
 
-class _Dispatcher(QObject):
-    submitted = pyqtSignal(object, int)
+# Вызовы notify() не из GUI-потока (уроки 025, 026): рабочий поток не создаёт
+# QObject и не кладёт Python-объекты в очередь Qt. Уведомление — Python-значение в
+# _inbox; GUI будит бессмертный получатель через invokeMethod(QueuedConnection)
+# без аргументов: в очереди Qt лежит только C++-событие MetaCall, для удаления
+# которого (в т. ч. в ~QApplication) GIL не нужен. Получатель создаётся в GUI при
+# старте (install_dispatcher); до этого уведомления потоков копятся в _inbox.
+# Рабочий поток Qt не трогает ни до установки, ни после закрытия затвора.
+# Затвор _gate/_closed закрывается до разрушения QApplication (shutdown_dispatch).
+_inbox: Queue[tuple[_Notice, int]] = Queue()
+_gate = threading.Lock()
+_closed = False
+# Пробуждение уже в очереди Qt: посты сливаются в одно событие MetaCall.
+_wake_pending = False
+_receiver: _NotifyReceiver | None = None
+# Поток GUI, в котором создан получатель; сравнение идёт по threading.get_ident():
+# QThread.currentThread() в чужом потоке создал бы там QAdoptedThread.
+_gui_ident: int | None = None
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.submitted.connect(self.submit, Qt.QueuedConnection)
 
-    @pyqtSlot(object, int)
-    def submit(self, notice: _Notice, epoch: int) -> None:
-        if epoch == _epoch:
-            _submit(notice)
+class _NotifyReceiver(QObject):
+    """Бессмертный получатель пробуждений, всегда в потоке GUI."""
+
+    @pyqtSlot()
+    def _drain(self) -> None:
+        global _wake_pending
+        # Флаг снимается до разбора: пост во время разбора разбудит заново.
+        with _gate:
+            _wake_pending = False
+        while True:
+            try:
+                notice, epoch = _inbox.get_nowait()
+            except Empty:
+                return
+            if epoch == _epoch:
+                _submit(notice)
+
+
+def _install_receiver(app: QCoreApplication) -> bool:
+    """Создать получатель в GUI и разобрать накопленное; False — поток не GUI."""
+    global _receiver, _gui_ident
+    # Сначала без Qt: QThread.currentThread() в чужом потоке создал бы QAdoptedThread.
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    if QThread.currentThread() != app.thread():
+        return False
+    receiver = _receiver
+    if receiver is None:
+        receiver = _NotifyReceiver()
+        # Объект не удаляется никогда: ни Python, ни чужая инфраструктура Qt.
+        sip.transferto(receiver, None)
+        with _gate:
+            _receiver = receiver
+            _gui_ident = threading.get_ident()
+    # Уведомления потоков, пришедшие до создания получателя.
+    receiver._drain()
+    return True
+
+
+def install_dispatcher() -> None:
+    """Создать получатель уведомлений из рабочих потоков; вызывать в GUI при старте."""
+    if threading.current_thread() is not threading.main_thread():
+        # Отказ до любого обращения к Qt.
+        raise RuntimeError("Получатель уведомлений должен создаваться в потоке GUI")
+    app = QCoreApplication.instance()
+    if app is None or not _install_receiver(app):
+        raise RuntimeError("Получатель уведомлений должен создаваться в потоке GUI")
+
+
+def shutdown_dispatch() -> None:
+    """Закрыть затвор до разрушения QApplication.
+
+    После возврата рабочие потоки больше не постят в очередь событий Qt: их
+    уведомления отбрасываются. Вызовы из GUI-потока работают как прежде.
+    """
+    global _closed
+    with _gate:
+        _closed = True
+
+
+def _post_from_thread(notice: _Notice) -> None:
+    """Из не-GUI потока: только значение в очереди и C++-пробуждение под затвором."""
+    global _wake_pending
+    with _gate:
+        if _closed:
+            _logger.debug("Уведомление из потока после остановки отброшено")
+            return
+        _inbox.put((notice, _epoch))
+        # До установки получателя Qt не трогаем: очередь разберёт install_dispatcher().
+        if _receiver is not None and not _wake_pending:
+            _wake_pending = True
+            QMetaObject.invokeMethod(_receiver, "_drain", Qt.ConnectionType.QueuedConnection)
 
 
 class _ActionReceiver(QObject):
@@ -208,16 +290,18 @@ def _connect_actions(bus: QDBusConnection) -> None:
 def reset_state() -> None:
     """Очистить доставку, очередь и обработчики для изоляции тестов."""
     global _last_id, _last_delivery_ok, _last_completed_seq, _last_id_seq, _seq, _epoch
-    global _in_flight_seq, _slot, _action_bus, _dispatcher, _timeout_streak, _timeout_warned
-    with _dispatcher_lock:
+    global _in_flight_seq, _slot, _action_bus, _timeout_streak, _timeout_warned, _closed
+    global _wake_pending
+    # Получатель бессмертен и не пересоздаётся; сбрасываются очередь и затвор.
+    with _gate:
         _epoch += 1
-        if _dispatcher is not None:
+        _closed = False
+        _wake_pending = False
+        while True:
             try:
-                _dispatcher.deleteLater()
-            except RuntimeError:
-                # QCoreApplication мог уже уничтожить C++ объект диспетчера.
-                pass
-            _dispatcher = None
+                _inbox.get_nowait()
+            except Empty:
+                break
     _last_id = 0
     _last_delivery_ok = False
     _last_completed_seq = 0
@@ -512,26 +596,19 @@ def notify(
     if urgency not in _URGENCY:
         raise ValueError("Неизвестная срочность уведомления")
     notice = _Notice(summary, body, _URGENCY[urgency], tuple(actions), monotonic(), retry)
-    app = QCoreApplication.instance()
     # Штатные вызовы из runtime, tray, bridges и app идут через Qt GUI thread;
-    # прямой вызов извне другого потока переводим туда до работы с QtDBus.
-    if app is not None and QThread.currentThread() != app.thread():
-        global _dispatcher
-        if _dispatcher is None:
-            with _dispatcher_lock:
-                if _dispatcher is None:
-                    dispatcher = _Dispatcher()
-                    dispatcher.moveToThread(app.thread())
-                    _dispatcher = dispatcher
-        with _dispatcher_lock:
-            # reset_state() может обнулить диспетчер между проверкой и emit.
-            if _dispatcher is None:
-                dispatcher = _Dispatcher()
-                dispatcher.moveToThread(app.thread())
-                _dispatcher = dispatcher
-            _dispatcher.submitted.emit(notice, _epoch)
-    else:
+    # вызов из другого потока передаём туда до работы с QtDBus.
+    if threading.get_ident() == _gui_ident:
         _submit(notice)
+        return
+    # Рабочие потоки Qt не трогают вовсе: даже QCoreApplication.instance() — только
+    # в главном. Без приложения главный поток доставляет сразу, как раньше.
+    if _gui_ident is None and threading.current_thread() is threading.main_thread():
+        app = QCoreApplication.instance()
+        if app is None or _install_receiver(app):
+            _submit(notice)
+            return
+    _post_from_thread(notice)
 
 
 def notify_hotkey_not_grabbed(combo: str) -> None:
