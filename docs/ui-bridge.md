@@ -128,6 +128,7 @@ Python вызывает метод `show_section(name)`
 | `language` | `string` | чтение и запись | Допустимы только `"ru"` и `"en"`; иное отвергается. Только запись файла, живого применения нет | `languageChanged` |
 | `checkAppUpdates` | `bool` | чтение и запись | Только запись файла | `checkAppUpdatesChanged` |
 | `checkModelUpdates` | `bool` | чтение и запись | Только запись файла | `checkModelUpdatesChanged` |
+| `offline` | `bool` | чтение и запись | Офлайн-режим (раздел «Сеть и обновления»). Только запись файла; сетевой гейт читает зеркало сразу — отказ `offline` для скачивания, фоновой и ручной проверки. `app.py` по сигналу зовёт `updatesBridge.refresh()` (раздел 3.8). Ключ политики тот же — `offline` | `offlineChanged` |
 | `autostart` | `bool` | чтение и запись | При запуске читается действующая XDG-запись; переключение создаёт, скрывает или удаляет пользовательскую запись. При политике значение берётся из политики, XDG не меняется (см. раздел 5) | `autostartChanged` |
 | `device` | `string` | чтение и запись | Пишется в `settings.extra["device"]` (пустая строка сохраняется как `null`) → `apply.device()`. Рантайм сбрасывает объявление микрофона; устройство читается перед следующей записью, текущая продолжается на прежнем | `deviceChanged` |
 | `devices` | `QVariantList` | только чтение | Список микрофонов для строки «Микрофон» в «Общих»: объекты с полями `id` и `name`, первый — `{'id': '', 'name': 'Системный по умолчанию'}`; до первого `refreshDevices()` — только он | `devicesChanged` |
@@ -240,7 +241,7 @@ IPC v3; схема — `arch/s5a5-mic-change.md` §4). Воркер к этом�
 
 **Важно:** имена здесь — как в файле настроек и в `policy.conf`, не как в QML:
 `hotkey`, `hotkey_mode`, `pill_enabled`, `language`, `check_app_updates`,
-`check_model_updates`, `autostart`, `device`. `is_locked("pillEnabled")` вернёт
+`check_model_updates`, `offline`, `autostart`, `device`. `is_locked("pillEnabled")` вернёт
 `false` — это проверяется тестом.
 
 Показывать блокировку положено подписью, а не только серым цветом: строка

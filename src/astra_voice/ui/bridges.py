@@ -130,6 +130,7 @@ class SettingsBridge(QObject):
     languageChanged = pyqtSignal()
     checkAppUpdatesChanged = pyqtSignal()
     checkModelUpdatesChanged = pyqtSignal()
+    offlineChanged = pyqtSignal()
     autostartChanged = pyqtSignal()
     deviceChanged = pyqtSignal()
     devicesChanged = pyqtSignal()
@@ -165,6 +166,7 @@ class SettingsBridge(QObject):
         "language": "language",
         "checkAppUpdates": "check_app_updates",
         "checkModelUpdates": "check_model_updates",
+        "offline": "offline",
         "autostart": "autostart",
         "device": "device",
     }
@@ -715,6 +717,14 @@ class SettingsBridge(QObject):
     @checkModelUpdates.setter  # type: ignore[no-redef]
     def checkModelUpdates(self, value: bool) -> None:  # noqa: N802
         self._set_value("checkModelUpdates", value)
+
+    @pyqtProperty(bool, notify=offlineChanged)
+    def offline(self) -> bool:
+        return cast(bool, self._values["offline"])
+
+    @offline.setter  # type: ignore[no-redef]
+    def offline(self, value: bool) -> None:
+        self._set_value("offline", value)
 
     @pyqtProperty(bool, notify=autostartChanged)
     def autostart(self) -> bool:

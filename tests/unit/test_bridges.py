@@ -410,7 +410,7 @@ def test_each_property_saves_and_notifies_once(name: str, with_mirror: bool) -> 
     if name in ("hotkey", "hotkeyMode"):
         apply.hotkey.assert_called_once_with(settings.hotkey, settings.hotkey_mode)
 
-    if name in ("language", "autostart", "checkAppUpdates", "checkModelUpdates"):
+    if name in ("language", "autostart", "checkAppUpdates", "checkModelUpdates", "offline"):
         assert apply.mock_calls == []
     save.reset_mock()
     apply.reset_mock()
