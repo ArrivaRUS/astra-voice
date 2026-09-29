@@ -19,7 +19,7 @@ from queue import Empty, Queue
 from threading import Event
 from types import ModuleType
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -1506,3 +1506,154 @@ def test_close_is_idempotent(factory: Factory) -> None:
     assert worker.handle({"type": "ping"})[0]["code"] == "bad-state"
     with pytest.raises(Empty):
         events.get_nowait()
+
+
+@pytest.mark.parametrize("cause", ["device-change", "record.limit"])
+def test_late_record_stop_after_worker_stop_is_silent_and_recognizes(
+    factory: Factory, cause: str
+) -> None:
+    """S5-A5, ревью: stop вдогонку за остановкой воркера — [], буфер цел, recognize даёт result."""
+    worker, engine, events = factory()
+    limit_s = 1.0 if cause == "record.limit" else None
+    message: dict[str, Any] = {"type": "record.start", "utterance_id": "u1"}
+    if limit_s is not None:
+        message["limit_s"] = limit_s
+    assert worker.handle(message) == []
+    if cause == "record.limit":
+        worker.feed_audio("u1", repeat(0.25, SAMPLE_RATE))
+        assert events.get_nowait() == {"type": "record.limit", "utterance_id": "u1"}
+    else:
+        worker.feed_audio("u1", repeat(0.25, SAMPLE_RATE // 2))
+        worker.on_device_change("u1", "switched", "Встроенный микрофон")
+        assert events.get_nowait()["type"] == "audio.device.changed"
+    saved = list(worker.buffers["u1"])
+    assert command(worker, "record.stop") == []
+    assert command(worker, "record.stop") == []
+    assert list(worker.buffers["u1"]) == saved
+    assert command(worker, "recognize") == []
+    assert events.get(timeout=2)["type"] == "result"
+    assert engine.audios == [saved]
+    # После результата буфера нет: stop снова честно отвечает bad-state.
+    assert command(worker, "record.stop")[0]["code"] == "bad-state"
+
+
+@pytest.mark.parametrize("cause", ["switched", "record.limit"])
+def test_late_record_stop_through_supervisor_keeps_dictation(factory: Factory, cause: str) -> None:
+    """S5-A5, ревью P1: настоящие супервизор, IPC, автомат воркера и оркестратор GUI.
+
+    Воркер сам остановил запись (смена микрофона или предел), а GUI в это время отпустил
+    клавишу и подряд отправил record.stop и recognize; ответы воркера приходят позже.
+    Фраза распознаётся и вставляется, пилюля о смене не перебивается, поздних нет.
+    """
+    from astra_voice.core.dictation import RELEASE_TAIL_MS, DictationOrchestrator
+    from astra_voice.platform.hotkey import HotkeyState
+    from astra_voice.platform.paste import (
+        PasteMethod,
+        PasteMode,
+        PasteOutcome,
+        PasteOutcomeKind,
+        PasteRestore,
+    )
+    from astra_voice.ui.pill import ERROR_MICROPHONE_CHANGED, PillState
+
+    worker, _, worker_events = factory(FakeEngine(text="проверка"))
+    loop = WorkerLoop(Mock(spec=socket.socket), capture=False)
+    loop.worker.close()
+    loop.worker = worker
+    orchestrator: DictationOrchestrator | None = None
+
+    def to_gui(event: Message) -> None:
+        assert orchestrator is not None
+        orchestrator.on_worker_event(event)
+
+    supervisor = WorkerSupervisor(to_gui, use_qt=False)
+    supervisor.state = "running"
+    timers: list[tuple[int, Callable[[], None]]] = []
+    pill = Mock()
+    paste = Mock(
+        return_value=PasteOutcome(
+            PasteOutcomeKind.PASTED,
+            PasteMethod.NONE,
+            PasteRestore.KEPT_OURS,
+            None,
+            0,
+            0,
+            0.0,
+            delivered_ms=1.0,
+        )
+    )
+
+    def send(message: Message, *, timeout: float | None = None) -> None:
+        supervisor.send(message, timeout=timeout)
+
+    def schedule(delay: int, callback: Callable[[], None]) -> object:
+        timers.append((delay, callback))
+        return len(timers)
+
+    orchestrator = DictationOrchestrator(
+        send=send,
+        generation=lambda: supervisor.generation,
+        restart_worker=Mock(),
+        pill=pill,
+        tray=Mock(),
+        paste=paste,
+        active_window=lambda: 42,
+        schedule=schedule,
+        cancel_timer=lambda handle: None,
+        hotkey_done=Mock(),
+        hotkey_cancel=Mock(),
+        hotkey_idle=lambda: True,
+        set_recording=Mock(),
+        paste_mode=lambda: PasteMode.AUTO,
+        record_params=lambda: {"limit_s": 1.0 if cause == "record.limit" else 120.0},
+    )
+
+    def worker_takes_frames() -> None:
+        """GUI → воркер: все накопленные кадры разом, ответы остаются в буфере воркера."""
+        data = bytes(supervisor._outgoing)
+        supervisor._outgoing.clear()
+        assert loop._receive(data)
+
+    def worker_answers(*messages: Message) -> None:
+        """Воркер → GUI через настоящий IPC и корреляцию супервизора."""
+        for message in messages:
+            supervisor._receive(encode(message), supervisor.generation)
+
+    orchestrator.on_hotkey_state(HotkeyState.RECORDING, "press")
+    uid = str(FrameReader().feed(bytes(supervisor._outgoing))[0]["utterance_id"])
+    worker_takes_frames()
+    if cause == "record.limit":
+        worker.feed_audio(uid, repeat(0.25, SAMPLE_RATE))
+    else:
+        worker.feed_audio(uid, repeat(0.25, SAMPLE_RATE // 2))
+        worker.on_device_change(uid, "switched", "Встроенный микрофон")
+    stopped_by_worker = worker_events.get_nowait()
+    assert stopped_by_worker["type"] == (
+        "record.limit" if cause == "record.limit" else "audio.device.changed"
+    )
+    # Событие воркера ещё в пути, а человек уже отпустил клавишу: stop и recognize подряд.
+    orchestrator.on_hotkey_state(HotkeyState.PROCESSING, "release")
+    [tail] = [callback for delay, callback in timers if delay == RELEASE_TAIL_MS]
+    tail()
+    assert [m["type"] for m in FrameReader().feed(bytes(supervisor._outgoing))] == [
+        "record.stop",
+        "recognize",
+    ]
+    worker_takes_frames()
+    replies = FrameReader().feed(bytes(loop._send_buffer))
+    loop._send_buffer.clear()
+    # Порядок провода: событие воркера ушло раньше ответов на stop/recognize.
+    worker_answers(stopped_by_worker, *replies)
+    worker_answers(worker_events.get(timeout=2))
+    paste.assert_called_once_with("проверка", 42, PasteMode.AUTO)
+    assert supervisor.dropped_late == 0
+    assert not supervisor._pending
+    states = [c.args[0] for c in pill.show_state.call_args_list]
+    assert PillState.ERROR not in states or cause == "switched"
+    if cause == "switched":
+        shown = pill.show_state.call_args_list
+        error_at = shown.index(call(PillState.ERROR, text=ERROR_MICROPHONE_CHANGED))
+        assert [c.args[0] for c in shown[error_at + 1 :]] == []
+    else:
+        assert states[-1] == PillState.DONE
+    assert replies == []

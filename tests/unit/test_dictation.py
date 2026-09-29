@@ -15,9 +15,12 @@ from astra_voice.core.dictation import (
     BUSY_RETRY_MS,
     CANCEL_RESTART_MS,
     CANCEL_TIMEOUT_MS,
+    DEVICE_CHANGE_MIN_AUDIO_MS,
     LEVEL_LIMIT_MESSAGE,
     LEVEL_RECORD_LIMIT_S,
     LEVEL_TOTAL_LIMIT_S,
+    MICROPHONE_CHANGED_MESSAGE,
+    MICROPHONE_LOST_MESSAGE,
     PROCESSING_WATCHDOG_MS,
     RECOGNIZE_TIMEOUT_S,
     RELEASE_TAIL_MS,
@@ -52,6 +55,7 @@ from astra_voice.ui.pill import (
     CLIPBOARD_REASONS,
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
+    ERROR_MICROPHONE_CHANGED,
     ERROR_MICROPHONE_LOST,
     ERROR_MICROPHONE_SILENT,
     ERROR_MICROPHONE_UNAVAILABLE,
@@ -1160,8 +1164,12 @@ def test_microphone_selected_at_start_once(
     rig.result()
     rig.start()
     rig.event("audio.ready", changed="Источник звука изменился: Встроенный микрофон")
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
-    rig.device_changed.assert_called_once_with("Встроенный микрофон")
+    # A6: другой микрофон между диктовками — снова выбор, не «Микрофон сменился».
+    assert rig.device_selected.call_args_list == [
+        call("USB-гарнитура"),
+        call("Встроенный микрофон"),
+    ]
+    rig.device_changed.assert_not_called()
     assert rig.recording and rig.core.phase == DictationPhase.RECORDING
     assert rig.commands() == ["record.start", "record.stop", "recognize"] * 2 + ["record.start"]
     assert all(event["type"] == "dictation" for event in rig.stats.events)
@@ -1193,8 +1201,11 @@ def test_default_microphone_without_changed_is_selected_once(
     rig.result()
     rig.start()
     rig.event("audio.ready", device="Встроенный микрофон", changed="смена")
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
-    rig.device_changed.assert_called_once_with("Встроенный микрофон")
+    assert rig.device_selected.call_args_list == [
+        call("USB-гарнитура"),
+        call("Встроенный микрофон"),
+    ]
+    rig.device_changed.assert_not_called()
     assert rig.recording
 
 
@@ -1230,7 +1241,8 @@ def test_explicit_device_selection_resets_announcement(rig: Rig) -> None:
     rig.device_changed.assert_not_called()
 
 
-def test_device_change_is_announced_once_per_name_in_generation(rig: Rig) -> None:
+def test_microphone_between_dictations_is_announced_once_per_change(rig: Rig) -> None:
+    """A6 (S5-A5 D5): одно «Микрофон: X» на смену, повтор того же имени молчит."""
     for name, changed in (
         ("Встроенный микрофон", {}),
         ("USB-гарнитура", {"changed": "смена"}),
@@ -1242,8 +1254,12 @@ def test_device_change_is_announced_once_per_name_in_generation(rig: Rig) -> Non
         rig.event("audio.ready", device=name, **changed)
         rig.stop()
         rig.result()
-    rig.device_selected.assert_called_once_with("Встроенный микрофон")
-    assert rig.device_changed.call_args_list == [call("USB-гарнитура"), call("Встроенный микрофон")]
+    assert rig.device_selected.call_args_list == [
+        call("Встроенный микрофон"),
+        call("USB-гарнитура"),
+        call("Встроенный микрофон"),
+    ]
+    rig.device_changed.assert_not_called()
 
 
 @pytest.mark.parametrize("elapsed", [0.1, 2.0])
@@ -1288,8 +1304,11 @@ def test_microphone_notification_preserves_result(
         rig.device_selected.assert_called_once_with("Встроенный микрофон")
         rig.device_changed.assert_not_called()
     else:
-        rig.device_selected.assert_called_once_with("USB-гарнитура")
-        rig.device_changed.assert_called_once_with("Встроенный микрофон")
+        assert rig.device_selected.call_args_list == [
+            call("USB-гарнитура"),
+            call("Встроенный микрофон"),
+        ]
+        rig.device_changed.assert_not_called()
     assert rig.core.phase == DictationPhase.RECORDING and rig.recording
     rig.stop()
     assert rig.pill.calls[-1] == (PillState.PROCESSING, None, None)
@@ -1335,7 +1354,7 @@ def test_manual_stop_failure_after_audio_ready_releases_hotkey(rig: Rig, command
     assert not rig.recording
 
 
-def test_changed_notification_deduplicates_announced_names(rig: Rig) -> None:
+def test_selected_notification_deduplicates_announced_names(rig: Rig) -> None:
     # Разные системные имена могут иметь одинаковое описание в audio.ready.
     names = [
         "USB-гарнитура",
@@ -1344,25 +1363,24 @@ def test_changed_notification_deduplicates_announced_names(rig: Rig) -> None:
         "Встроенный микрофон",
         "USB-гарнитура",
     ]
-    changes = ["Встроенный микрофон", "USB-гарнитура"]
+    announced = ["USB-гарнитура", "Встроенный микрофон", "USB-гарнитура"]
 
     def notified(name: str) -> None:
         assert rig.commands()[-1] == "record.start"
         assert rig.recording and rig.core.phase == DictationPhase.RECORDING
 
-    rig.device_changed.side_effect = notified
+    rig.device_selected.side_effect = notified
     for index, name in enumerate(names):
         rig.start()
         rig.event("audio.ready", device=name, changed=f"Источник звука изменился: {name}")
-        rig.device_selected.assert_called_once_with(names[0])
-        assert rig.device_changed.call_args_list == [
-            call(value) for value in changes[: max(0, index - 2)]
+        assert rig.device_selected.call_args_list == [
+            call(value) for value in announced[: max(1, index - 1)]
         ]
         assert rig.recording and rig.core.phase == DictationPhase.RECORDING
         rig.stop()
         rig.result()
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
-    assert rig.device_changed.call_args_list == [call(name) for name in changes]
+    assert rig.device_selected.call_args_list == [call(name) for name in announced]
+    rig.device_changed.assert_not_called()
     assert rig.commands() == ["record.start", "record.stop", "recognize"] * len(names)
     assert all(event["type"] == "dictation" for event in rig.stats.events)
     assert all(state != PillState.ERROR for state, _, _ in rig.pill.calls)
@@ -2820,3 +2838,423 @@ def test_level_callback_exception_after_finish_cannot_cancel_new_test(
     assert test_updates[-1].text == MARKER
     assert rig.core.phase.name == "IDLE"
     assert MARKER not in caplog.text
+
+
+# --- S5-A5: смена микрофона посреди записи (audio.device.changed, IPC v3) ---
+
+LABEL = "Встроенный микрофон"
+DEVICE_TEXT = {"switched": ERROR_MICROPHONE_CHANGED, "device-lost": ERROR_MICROPHONE_LOST}
+DEVICE_STAT = {"switched": "device-changed", "device-lost": "device-lost"}
+
+
+def device_changed(rig: Rig, kind: str, *, audio_ms: object = 2140, **fields: object) -> None:
+    extra: dict[str, object] = {"kind": kind, **fields}
+    if kind == "switched" and "label" not in fields:
+        extra["label"] = LABEL
+    if audio_ms is not None:
+        extra["audio_ms"] = audio_ms
+    device_event(rig, **extra)
+
+
+def device_event(rig: Rig, **fields: object) -> None:
+    """Rig.event занят параметром kind: у этого события kind — поле сообщения."""
+    rig.core.on_worker_event(
+        {
+            "type": "audio.device.changed",
+            "generation": rig.worker_generation,
+            "utterance_id": rig.uid,
+            **fields,
+        }
+    )
+
+
+def mic_errors(rig: Rig) -> list[dict[str, object]]:
+    return [event for event in rig.stats.events if event["type"] == "mic_error"]
+
+
+def assert_device_notified(rig: Rig, kind: str) -> None:
+    if kind == "switched":
+        rig.device_changed.assert_called_once_with(LABEL)
+        rig.device_lost.assert_not_called()
+    else:
+        rig.device_lost.assert_called_once_with(during_recording=True)
+        rig.device_changed.assert_not_called()
+    rig.device_selected.assert_not_called()
+    assert mic_errors(rig) == [
+        {"type": "mic_error", "kind": DEVICE_STAT[kind], "recovered_by": "none"}
+    ]
+    assert rig.pill.calls.count((PillState.ERROR, DEVICE_TEXT[kind], None)) == 1
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+@pytest.mark.parametrize("audio_ms", [DEVICE_CHANGE_MIN_AUDIO_MS, 2140])
+def test_device_change_in_recording_recognizes_audio_before_change(
+    rig: Rig, kind: str, audio_ms: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """D2: ≥ 300 мс до смены — путь record.limit: recognize без record.stop, затем вставка."""
+    rig.start()
+    rig.now += 2.2
+    with caplog.at_level(logging.DEBUG, logger="test.dictation"):
+        device_changed(rig, kind, audio_ms=audio_ms)
+    assert_phase(rig, DictationPhase.PROCESSING)
+    assert rig.commands() == ["record.start", "recognize"]
+    assert not rig.recording
+    assert_device_notified(rig, kind)
+    if kind == "switched":
+        assert rig.core.resolved_device == LABEL
+        rig.device_resolved.assert_called_once_with(LABEL)
+    else:
+        rig.device_resolved.assert_not_called()
+    assert LABEL not in caplog.text
+    rig.result()
+    assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
+    assert rig.stats.events[-1]["type"] == "dictation"
+    assert rig.stats.events[-1]["result"] == "ok"
+    assert all(LABEL not in map(str, event.values()) for event in rig.stats.events)
+    assert all(MARKER not in map(str, event.values()) for event in rig.stats.events)
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+@pytest.mark.parametrize("audio_ms", [0, DEVICE_CHANGE_MIN_AUDIO_MS - 1, None, True, "900"])
+def test_device_change_with_short_audio_cancels_without_cancelled_pill(
+    rig: Rig, kind: str, audio_ms: object
+) -> None:
+    """D2: < 300 мс (или без audio_ms) — record.cancel, без распознавания и «Отменено»."""
+    rig.start()
+    rig.now += 0.2
+    device_changed(rig, kind, audio_ms=audio_ms)
+    assert rig.commands() == ["record.start", "record.cancel"]
+    assert_phase(rig, DictationPhase.FINISHING)
+    assert not rig.recording
+    assert_device_notified(rig, kind)
+    assert rig.pill.calls[-1] == (PillState.ERROR, DEVICE_TEXT[kind], None)
+    assert rig.tray.state == (TrayState.IDLE if kind == "switched" else TrayState.ERROR)
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    # Подтверждение отмены приходит в FINISHING и ничего не меняет.
+    rig.event("cancelled")
+    assert all(state != PillState.CANCELLED for state, _, _ in rig.pill.calls)
+    assert [event["type"] for event in rig.stats.events] == ["mic_error"]
+    rig.timer(STATE_DURATION_MS[PillState.ERROR]).fire()
+    assert_phase(rig, DictationPhase.IDLE)
+    assert rig.tray.state == TrayState.IDLE
+    rig.start()
+    assert rig.commands()[-1] == "record.start"
+    assert_phase(rig, DictationPhase.RECORDING)
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_device_change_during_release_tail_skips_record_stop(rig: Rig, kind: str) -> None:
+    rig.start()
+    rig.now += 1.0
+    rig.fsm.release(rig.now)
+    tail = rig.timer(RELEASE_TAIL_MS)
+    device_changed(rig, kind)
+    assert_phase(rig, DictationPhase.PROCESSING)
+    assert rig.commands() == ["record.start", "recognize"]
+    tail.fire()
+    assert rig.commands() == ["record.start", "recognize"]
+    assert_device_notified(rig, kind)
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_device_change_after_record_limit_is_shown_once(rig: Rig, kind: str) -> None:
+    """Гонка из ревью: воркер остановил запись по пределу, затем сообщил о смене."""
+    rig.start()
+    rig.now += 120
+    rig.event("record.limit")
+    assert_phase(rig, DictationPhase.PROCESSING)
+    device_changed(rig, kind)
+    device_changed(rig, kind)
+    device_changed(rig, "device-lost" if kind == "switched" else "switched")
+    assert rig.commands() == ["record.start", "recognize"]
+    assert_phase(rig, DictationPhase.PROCESSING)
+    assert_device_notified(rig, kind)
+    rig.result()
+    assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
+    assert rig.stats.events[-1]["result"] == "ok"
+
+
+@pytest.mark.parametrize("cause", ["record.limit", "switched", "device-lost"])
+def test_record_stop_bad_state_after_worker_stop_keeps_recognition(rig: Rig, cause: str) -> None:
+    """Страховка оркестратора: воркер (старый) ответил bad-state на опоздавший record.stop.
+
+    Порядок реальный: stop и recognize ушли подряд, ответ пришёл позже. Штатно воркер
+    на такой stop не отвечает вовсе (test_late_record_stop_through_supervisor_keeps_dictation).
+    """
+    rig.start()
+    rig.stop()
+    rig.event("error", code="bad-state", request_type="record.stop")
+    assert rig.commands() == ["record.start", "record.stop", "recognize"]
+    assert_phase(rig, DictationPhase.PROCESSING)
+    assert all(state != PillState.ERROR for state, _, _ in rig.pill.calls)
+    if cause == "record.limit":
+        rig.event("record.limit")
+    else:
+        device_changed(rig, cause)
+        assert_device_notified(rig, cause)
+    assert rig.commands() == ["record.start", "record.stop", "recognize"]
+    rig.result()
+    assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
+
+
+def test_recognize_bad_state_still_fails(rig: Rig) -> None:
+    rig.start()
+    rig.stop()
+    rig.event("error", code="bad-state", request_type="recognize")
+    assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
+
+
+@pytest.mark.parametrize("label", [None, "", "   ", 42])
+def test_switched_without_label_is_reported_as_lost(rig: Rig, label: object) -> None:
+    rig.start()
+    device_event(rig, kind="switched", label=label, audio_ms=2000)
+    rig.device_lost.assert_called_once_with(during_recording=True)
+    rig.device_changed.assert_not_called()
+    assert mic_errors(rig)[0]["kind"] == "device-lost"
+    assert rig.core.resolved_device == ""
+
+
+@pytest.mark.parametrize("kind", ["other", None, 1])
+def test_device_change_with_unknown_kind_is_ignored(rig: Rig, kind: object) -> None:
+    rig.start()
+    device_event(rig, kind=kind, label=LABEL, audio_ms=2000)
+    assert rig.commands() == ["record.start"]
+    assert_phase(rig, DictationPhase.RECORDING)
+    assert not rig.stats.events
+    rig.device_changed.assert_not_called()
+    rig.device_lost.assert_not_called()
+
+
+@pytest.mark.parametrize("when", ["idle", "foreign-id", "cancel-pending", "old-generation"])
+def test_device_change_ignored_outside_own_recording(rig: Rig, when: str) -> None:
+    fields = {"kind": "device-lost", "audio_ms": 2000}
+    if when == "idle":
+        rig.core.on_worker_event(
+            {"type": "audio.device.changed", "generation": 1, "utterance_id": "a" * 32, **fields}
+        )
+    else:
+        rig.start()
+        if when == "foreign-id":
+            rig.core.on_worker_event(
+                {"type": "audio.device.changed", "generation": 1, "utterance_id": "b" * 32} | fields
+            )
+        elif when == "cancel-pending":
+            rig.core.cancel("tray")
+            device_event(rig, **fields)
+        else:
+            rig.core.on_worker_event(
+                {"type": "audio.device.changed", "generation": 0, "utterance_id": rig.uid} | fields
+            )
+    rig.device_lost.assert_not_called()
+    assert not mic_errors(rig)
+    assert all(state != PillState.ERROR for state, _, _ in rig.pill.calls)
+
+
+def pill_states_after_device_error(rig: Rig, kind: str) -> list[PillState]:
+    index = rig.pill.calls.index((PillState.ERROR, DEVICE_TEXT[kind], None))
+    return [state for state, _, _ in rig.pill.calls[index + 1 :]]
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+@pytest.mark.parametrize("text", [MARKER, ""])
+def test_device_pill_is_not_replaced_by_processing_done_or_empty(
+    rig: Rig, kind: str, text: str
+) -> None:
+    """D3: пока видна пилюля о смене, PROCESSING/DONE/EMPTY её не перебивают."""
+    rig.start()
+    rig.now += 2.0
+    device_changed(rig, kind)
+    rig.result(text)
+    assert pill_states_after_device_error(rig, kind) == []
+    state = PillState.DONE if text else PillState.EMPTY
+    if kind == "switched":
+        assert rig.tray.state == (TrayState.DONE if text else TrayState.IDLE)
+        tail = STATE_DURATION_MS[state]
+    else:
+        # Трей в ошибке столько же, сколько видна пилюля «Микрофон отключился».
+        assert rig.tray.state == TrayState.ERROR
+        tail = STATE_DURATION_MS[PillState.ERROR] - 250 - (125 if text else 0)
+    assert rig.pasted == ([(MARKER, 42, PasteMode.AUTO)] if text else [])
+    rig.timer(tail).fire()
+    assert_phase(rig, DictationPhase.IDLE)
+    assert rig.tray.state == TrayState.IDLE
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_device_pill_hold_expires(rig: Rig, kind: str) -> None:
+    rig.start()
+    device_changed(rig, kind)
+    rig.now += STATE_DURATION_MS[PillState.ERROR] / 1000
+    rig.result()
+    assert pill_states_after_device_error(rig, kind) == [PillState.DONE]
+    assert rig.tray.state == TrayState.DONE
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_device_pill_hold_starts_in_processing_after_limit(rig: Rig, kind: str) -> None:
+    rig.start()
+    rig.now += 120
+    rig.event("record.limit")
+    device_changed(rig, kind)
+    rig.result("")
+    assert pill_states_after_device_error(rig, kind) == []
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+@pytest.mark.parametrize(
+    ("outcome", "pill"),
+    [
+        (PasteOutcomeKind.CLIPBOARD_ONLY, (PillState.CLIPBOARD_ONLY, None, None)),
+        (
+            PasteOutcomeKind.WINDOW_CHANGED,
+            (PillState.CLIPBOARD_ONLY, CLIPBOARD_WINDOW_CHANGED, None),
+        ),
+        (PasteOutcomeKind.FAILED, (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)),
+    ],
+)
+def test_clipboard_and_failures_replace_device_pill(
+    rig: Rig, kind: str, outcome: PasteOutcomeKind, pill: tuple[Any, ...]
+) -> None:
+    rig.start()
+    device_changed(rig, kind)
+    rig.outcomes.append(outcome)
+    rig.result()
+    assert rig.pill.calls[-1] == pill
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_recognition_error_replaces_device_pill(rig: Rig, kind: str) -> None:
+    rig.start()
+    device_changed(rig, kind)
+    rig.event("error", code="engine-failed")
+    assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_cancel_after_device_change_keeps_device_pill(rig: Rig, kind: str) -> None:
+    rig.start()
+    device_changed(rig, kind)
+    rig.core.cancel("tray")
+    rig.event("cancelled")
+    assert pill_states_after_device_error(rig, kind) == []
+    assert rig.stats.events[-1]["result"] == "cancelled"
+
+
+@pytest.mark.parametrize("mode", list(HotkeyMode))
+@pytest.mark.parametrize("released", [False, True])
+@pytest.mark.parametrize("audio_ms", [100, 2000])
+def test_hotkey_after_device_change_behaves_as_after_limit(
+    mode: HotkeyMode, released: bool, audio_ms: int
+) -> None:
+    """D3, T-56: клавиша не залипает; повторное нажатие в распознавании не стартует запись."""
+    if mode == HotkeyMode.TOGGLE and released and audio_ms < DEVICE_CHANGE_MIN_AUDIO_MS:
+        pytest.skip("в переключателе после завершения второе нажатие — новая запись")
+    rig = Rig(mode)
+    rig.start()
+    if mode == HotkeyMode.TOGGLE:
+        rig.fsm.release(rig.now)
+    rig.now += 1.0
+    device_changed(rig, "device-lost", audio_ms=audio_ms)
+    if released:
+        rig.stop(tail=False)
+        rig.fire_tail()
+    commands = rig.commands()
+    assert commands == ["record.start", "recognize" if audio_ms >= 300 else "record.cancel"]
+    if audio_ms >= 300:
+        rig.result()
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    assert rig.commands() == commands
+    rig.now += 1.0
+    rig.start()
+    assert rig.commands() == [*commands, "record.start"]
+    assert_phase(rig, DictationPhase.RECORDING)
+
+
+DEVICE_MESSAGE = {"switched": MICROPHONE_CHANGED_MESSAGE, "device-lost": MICROPHONE_LOST_MESSAGE}
+
+
+def ipc_device_event(rig: Rig, kind: str, *, audio_ms: int = 2000) -> None:
+    """Через настоящий IPC v3, как microphone_event (у него kind — тип сообщения)."""
+    message: dict[str, object] = {
+        "type": "audio.device.changed",
+        "utterance_id": rig.uid,
+        "kind": kind,
+        "audio_ms": audio_ms,
+    }
+    if kind == "switched":
+        message["label"] = LABEL
+    decoded = ipc.FrameReader().feed(ipc.encode(message))[0]
+    rig.core.on_worker_event({**decoded, "generation": rig.worker_generation})
+
+
+def assert_device_change_private(rig: Rig) -> None:
+    """Проверки микрофона не дают ни пилюли ошибки, ни уведомлений, ни статистики."""
+    rig.device_changed.assert_not_called()
+    rig.device_lost.assert_not_called()
+    rig.device_selected.assert_not_called()
+    assert not rig.stats.events
+    assert all(state != PillState.ERROR for state, _, _ in rig.pill.calls)
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_level_check_ends_with_device_change_message(rig: Rig, kind: str) -> None:
+    """D4: проверка уровня в настройках и мастере."""
+    updates: list[MicrophoneLevelUpdate] = []
+    assert rig.core.start_level_monitor("alsa_input.usb-mic", updates.append)
+    microphone_event(rig, "level", peak_dbfs=-20, rms_dbfs=-30)
+    ipc_device_event(rig, kind)
+    assert updates[-1] == MicrophoneLevelUpdate("error", message=DEVICE_MESSAGE[kind])
+    assert rig.commands() == ["record.start", "record.cancel"]
+    assert not rig.core.level_active and not rig.recording
+    assert rig.tray.state == TrayState.IDLE and rig.pill.hidden
+    microphone_event(rig, "cancelled")
+    assert updates[-1].state == "error"
+    assert rig.core.phase == DictationPhase.IDLE
+    assert_device_change_private(rig)
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_microphone_test_ends_with_device_change_message(rig: Rig, kind: str) -> None:
+    """D4: тестовая фраза; распознавания нет, запись отменяется."""
+    updates: list[MicrophoneTestUpdate] = []
+    assert rig.core.start_test("alsa_input.usb-mic", updates.append)
+    ipc_device_event(rig, kind)
+    assert updates[-1] == MicrophoneTestUpdate("error", message=DEVICE_MESSAGE[kind])
+    assert rig.commands() == ["record.start", "record.cancel"]
+    assert not rig.core.test_active and not rig.recording
+    assert rig.core.phase == DictationPhase.IDLE
+    # До подтверждения отмены новая проверка не стартует; после — стартует.
+    assert not rig.core.start_test("", updates.append)
+    microphone_event(rig, "cancelled")
+    assert rig.core.start_test("", updates.append)
+    assert rig.commands()[-1] == "record.start"
+    assert_device_change_private(rig)
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_microphone_test_after_stop_still_recognizes(rig: Rig, kind: str) -> None:
+    updates: list[MicrophoneTestUpdate] = []
+    assert rig.core.start_test("", updates.append)
+    rig.core.stop_test()
+    ipc_device_event(rig, kind)
+    microphone_event(rig, "result", text=MARKER, t_ms=500)
+    assert updates[-1].state == "done" and updates[-1].text == MARKER
+    assert_device_change_private(rig)
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_device_change_in_processing_does_not_touch_recognition(rig: Rig, kind: str) -> None:
+    """D4: клавишу уже отпустили — пилюля, уведомление и статистика; распознавание идёт."""
+    rig.start()
+    rig.stop()
+    assert rig.commands() == ["record.start", "record.stop", "recognize"]
+    watchdog = rig.timer(PROCESSING_WATCHDOG_MS)
+    ipc_device_event(rig, kind)
+    assert rig.commands() == ["record.start", "record.stop", "recognize"]
+    assert not watchdog.cancelled
+    assert_phase(rig, DictationPhase.PROCESSING)
+    assert_device_notified(rig, kind)
+    rig.result()
+    assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
+    assert pill_states_after_device_error(rig, kind) == []

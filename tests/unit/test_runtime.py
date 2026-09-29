@@ -445,10 +445,27 @@ def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_k
                 device="USB-гарнитура",
                 changed="Источник звука изменился: USB-гарнитура",
             )
+            # A6: смена между диктовками объявляется как выбор, не «Микрофон сменился».
             assert rig.notify.mock_calls == [
                 call.notify_microphone_selected("Встроенный микрофон"),
-                call.notify_microphone_changed("USB-гарнитура"),
+                call.notify_microphone_selected("USB-гарнитура"),
             ]
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_microphone_change_during_recording_wiring(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """S5-A5 D2: смена микрофона посреди записи доходит до штатных уведомлений."""
+    rig = Rig(monkeypatch)
+    rig.runtime.start()
+    rig.hotkey.fsm.press(rig.now)
+    fields = {"label": "Встроенный микрофон"} if kind == "switched" else {}
+    rig.event(type="audio.device.changed", kind=kind, audio_ms=2000, **fields)
+    if kind == "switched":
+        assert rig.notify.mock_calls == [call.notify_microphone_changed("Встроенный микрофон")]
+    else:
+        assert rig.notify.mock_calls == [call.notify_microphone_lost(during_recording=True)]
 
 
 @pytest.mark.parametrize(
