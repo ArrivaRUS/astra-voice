@@ -445,9 +445,10 @@ def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_k
                 device="USB-гарнитура",
                 changed="Источник звука изменился: USB-гарнитура",
             )
+            # A6: смена между диктовками объявляется как выбор, не «Микрофон сменился».
             assert rig.notify.mock_calls == [
                 call.notify_microphone_selected("Встроенный микрофон"),
-                call.notify_microphone_changed("USB-гарнитура"),
+                call.notify_microphone_selected("USB-гарнитура"),
             ]
 
 

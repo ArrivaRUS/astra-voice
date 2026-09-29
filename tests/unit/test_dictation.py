@@ -1164,8 +1164,12 @@ def test_microphone_selected_at_start_once(
     rig.result()
     rig.start()
     rig.event("audio.ready", changed="Источник звука изменился: Встроенный микрофон")
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
-    rig.device_changed.assert_called_once_with("Встроенный микрофон")
+    # A6: другой микрофон между диктовками — снова выбор, не «Микрофон сменился».
+    assert rig.device_selected.call_args_list == [
+        call("USB-гарнитура"),
+        call("Встроенный микрофон"),
+    ]
+    rig.device_changed.assert_not_called()
     assert rig.recording and rig.core.phase == DictationPhase.RECORDING
     assert rig.commands() == ["record.start", "record.stop", "recognize"] * 2 + ["record.start"]
     assert all(event["type"] == "dictation" for event in rig.stats.events)
@@ -1197,8 +1201,11 @@ def test_default_microphone_without_changed_is_selected_once(
     rig.result()
     rig.start()
     rig.event("audio.ready", device="Встроенный микрофон", changed="смена")
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
-    rig.device_changed.assert_called_once_with("Встроенный микрофон")
+    assert rig.device_selected.call_args_list == [
+        call("USB-гарнитура"),
+        call("Встроенный микрофон"),
+    ]
+    rig.device_changed.assert_not_called()
     assert rig.recording
 
 
@@ -1234,7 +1241,8 @@ def test_explicit_device_selection_resets_announcement(rig: Rig) -> None:
     rig.device_changed.assert_not_called()
 
 
-def test_device_change_is_announced_once_per_name_in_generation(rig: Rig) -> None:
+def test_microphone_between_dictations_is_announced_once_per_change(rig: Rig) -> None:
+    """A6 (S5-A5 D5): одно «Микрофон: X» на смену, повтор того же имени молчит."""
     for name, changed in (
         ("Встроенный микрофон", {}),
         ("USB-гарнитура", {"changed": "смена"}),
@@ -1246,8 +1254,12 @@ def test_device_change_is_announced_once_per_name_in_generation(rig: Rig) -> Non
         rig.event("audio.ready", device=name, **changed)
         rig.stop()
         rig.result()
-    rig.device_selected.assert_called_once_with("Встроенный микрофон")
-    assert rig.device_changed.call_args_list == [call("USB-гарнитура"), call("Встроенный микрофон")]
+    assert rig.device_selected.call_args_list == [
+        call("Встроенный микрофон"),
+        call("USB-гарнитура"),
+        call("Встроенный микрофон"),
+    ]
+    rig.device_changed.assert_not_called()
 
 
 @pytest.mark.parametrize("elapsed", [0.1, 2.0])
@@ -1292,8 +1304,11 @@ def test_microphone_notification_preserves_result(
         rig.device_selected.assert_called_once_with("Встроенный микрофон")
         rig.device_changed.assert_not_called()
     else:
-        rig.device_selected.assert_called_once_with("USB-гарнитура")
-        rig.device_changed.assert_called_once_with("Встроенный микрофон")
+        assert rig.device_selected.call_args_list == [
+            call("USB-гарнитура"),
+            call("Встроенный микрофон"),
+        ]
+        rig.device_changed.assert_not_called()
     assert rig.core.phase == DictationPhase.RECORDING and rig.recording
     rig.stop()
     assert rig.pill.calls[-1] == (PillState.PROCESSING, None, None)
@@ -1339,7 +1354,7 @@ def test_manual_stop_failure_after_audio_ready_releases_hotkey(rig: Rig, command
     assert not rig.recording
 
 
-def test_changed_notification_deduplicates_announced_names(rig: Rig) -> None:
+def test_selected_notification_deduplicates_announced_names(rig: Rig) -> None:
     # Разные системные имена могут иметь одинаковое описание в audio.ready.
     names = [
         "USB-гарнитура",
@@ -1348,25 +1363,24 @@ def test_changed_notification_deduplicates_announced_names(rig: Rig) -> None:
         "Встроенный микрофон",
         "USB-гарнитура",
     ]
-    changes = ["Встроенный микрофон", "USB-гарнитура"]
+    announced = ["USB-гарнитура", "Встроенный микрофон", "USB-гарнитура"]
 
     def notified(name: str) -> None:
         assert rig.commands()[-1] == "record.start"
         assert rig.recording and rig.core.phase == DictationPhase.RECORDING
 
-    rig.device_changed.side_effect = notified
+    rig.device_selected.side_effect = notified
     for index, name in enumerate(names):
         rig.start()
         rig.event("audio.ready", device=name, changed=f"Источник звука изменился: {name}")
-        rig.device_selected.assert_called_once_with(names[0])
-        assert rig.device_changed.call_args_list == [
-            call(value) for value in changes[: max(0, index - 2)]
+        assert rig.device_selected.call_args_list == [
+            call(value) for value in announced[: max(1, index - 1)]
         ]
         assert rig.recording and rig.core.phase == DictationPhase.RECORDING
         rig.stop()
         rig.result()
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
-    assert rig.device_changed.call_args_list == [call(name) for name in changes]
+    assert rig.device_selected.call_args_list == [call(name) for name in announced]
+    rig.device_changed.assert_not_called()
     assert rig.commands() == ["record.start", "record.stop", "recognize"] * len(names)
     assert all(event["type"] == "dictation" for event in rig.stats.events)
     assert all(state != PillState.ERROR for state, _, _ in rig.pill.calls)

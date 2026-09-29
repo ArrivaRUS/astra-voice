@@ -195,7 +195,6 @@ class DictationOrchestrator:
         self._on_idle = on_idle
         self._resolved_device: str = ""
         self._announced_selected_device: str | None = None
-        self._audio_opened = False
         self._announcement_generation: int | None = None
         self._device_selected = False
         self._log = log if log is not None else logging.getLogger(__name__)
@@ -503,7 +502,6 @@ class DictationOrchestrator:
 
     def reset_device_announcement(self) -> None:
         """Сбрасывает объявление при выборе в настройках или новом поколении воркера."""
-        self._audio_opened = False
         self._announced_selected_device = None
         self._announcement_generation = self._generation()
         if self._resolved_device:
@@ -891,22 +889,18 @@ class DictationOrchestrator:
         self._log.debug("диктовка: audio.ready")
         if self._t_ready is None:
             self._t_ready = self._clock()
-        first_open = not self._audio_opened
-        self._audio_opened = True
         if self._phase != DictationPhase.RECORDING:
             return
         if not name:
             return
         # audio.ready приходит только при открытии, в том числе после долгих повторов.
-        previous_name = self._announced_selected_device
-        if name == previous_name:
+        # Другой микрофон между диктовками — это выбор («Микрофон: X», A6): «Микрофон
+        # сменился» остаётся только за сменой посреди записи (audio.device.changed).
+        if name == self._announced_selected_device:
             return
         self._announced_selected_device = name
-        if first_open or previous_name is None:
-            if self._on_device_selected is not None:
-                self._on_device_selected(name)
-        elif self._on_device_changed is not None:
-            self._on_device_changed(name)
+        if self._on_device_selected is not None:
+            self._on_device_selected(name)
 
     def _result(self, text: str, *, duration_s: float | None = None) -> None:
         received = self._clock()
