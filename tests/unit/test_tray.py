@@ -15,13 +15,13 @@ from unittest.mock import Mock, call
 
 import pytest
 from PyQt5 import sip
-from PyQt5.QtCore import QCoreApplication, QEvent, Qt
+from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtCore import QTimer as QtTimer
 from PyQt5.QtDBus import QDBusMessage, QDBusVariant
 from PyQt5.QtWidgets import QSystemTrayIcon
 
 from astra_voice.platform.session import SessionKind
-from astra_voice.ui.tray import _start_bus_worker
+from astra_voice.ui.tray import _send_bus_command
 from astra_voice.ui.tray_icons import TrayIconProvider, TrayState
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -30,7 +30,7 @@ from helpers.qt_app import get_qapplication  # noqa: E402
 if TYPE_CHECKING:
     from PyQt5.QtWidgets import QApplication, QMenu
 
-    from astra_voice.ui.tray import Tray
+    from astra_voice.ui.tray import Tray, _TrayBusTransport
 
 pytestmark = pytest.mark.unit
 SERVICE = "org.kde.StatusNotifierWatcher"
@@ -57,47 +57,62 @@ class Bus:
     """Подмена транспорта: ответ может задержаться и пережить смену владельца."""
 
     def __init__(self) -> None:
+        self.executor: _TrayBusTransport
         self.host_registered: object = True
         self.plasma_owner = ":1.42"
         self.auto_reply = True
-        self.auto_match_reply = True
         self.calls: list[PendingCall] = []
         self.matches: list[PendingCall] = []
         self.signals: dict[str, Callable[..., None]] = {}
         self.events: list[tuple[str, tuple[object, ...]]] = []
         self.transport = Mock()
-        self.transport.callWithCallback.side_effect = self.submit
         self.transport.connect.side_effect = self.connect
         self.transport.disconnect.side_effect = self.disconnect
-        self.transport.call.side_effect = AssertionError("Synchronous D-Bus forbidden")
+        self.transport.call.side_effect = self.call
+        self.transport.isConnected.return_value = True
         self.transport.interface.side_effect = AssertionError("D-Bus interface forbidden")
         self.watcher = Mock(
             serviceRegistered=Signal(), serviceUnregistered=Signal(), serviceOwnerChanged=Signal()
         )
 
-    def submit(
-        self,
-        message: QDBusMessage,
-        success: Callable[[QDBusMessage], None],
-        error: Callable[..., None],
-        timeout: int,
-    ) -> bool:
-        assert 0 < timeout <= 500
-        pending = PendingCall(message, success, error)
+    def call(self, message: QDBusMessage, mode: object, timeout: int) -> QDBusMessage:
+        from PyQt5.QtDBus import QDBus
+
+        assert mode == QDBus.Block
+        assert timeout == 500
+        pending = PendingCall(message, lambda reply: None, lambda *args: None)
         if message.member() == "AddMatch":
             self.matches.append(pending)
-            if self.auto_match_reply:
-                pending.success(message.createReply([]))
-            return True
+            return message.createReply([])
         self.calls.append(pending)
-        if self.auto_reply:
-            if message.member() == "Get":
-                pending.reply(self.host_registered)
-            elif self.plasma_owner:
-                pending.reply(self.plasma_owner)
-            else:
-                pending.fail()
-        return True
+        if message.member() == "Get":
+            return message.createReply([QDBusVariant(self.host_registered)])
+        if self.plasma_owner:
+            return message.createReply([self.plasma_owner])
+        return message.createErrorReply(
+            "org.freedesktop.DBus.Error.NameHasNoOwner", "нет владельца"
+        )
+
+    def command(self, generation: int, operation: str, payload: Any) -> None:
+        from astra_voice.ui import tray as module
+
+        def deliver(reply: QDBusMessage | None) -> None:
+            plain = (
+                None
+                if reply is None
+                else (
+                    int(reply.type()),
+                    [module._plain_dbus_value(arg) for arg in reply.arguments()],
+                )
+            )
+            module._post_bus_result(generation, "reply", (payload[0], plain))
+            QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
+
+        if operation == "request" and not self.auto_reply:
+            self.calls.append(PendingCall(payload[1], deliver, lambda *args: deliver(None)))
+        else:
+            self.executor.execute(generation, operation, payload)
+        QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
 
     def connect(
         self, service: str, path: str, interface: str, member: str, slot: Callable[..., None]
@@ -207,7 +222,7 @@ class Harness:
     detect: Mock
     drop: Mock
     panel_warning: Mock
-    start_worker: Mock
+    send_command: Mock
 
     @property
     def menu(self) -> QMenu:
@@ -243,10 +258,11 @@ def harness(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> Iterator[Har
     detect = Mock(return_value=SessionKind.OTHER)
     monkeypatch.setattr(module, "detect", detect)
     watcher = bus.watcher
-    # В поведенческих тестах очередь рабочего потока исполняется сразу.
-    # Отдельные тесты ниже запускают настоящий QThread с тем же фейком шины.
-    start_worker = Mock()
-    monkeypatch.setattr(module, "_start_bus_worker", start_worker)
+    # Setup использует тот же код, что демон; ответы запросов можно задержать.
+    bus.executor = module._TrayBusTransport(module._get_bus_receiver())
+    send_command = Mock(side_effect=bus.command)
+    monkeypatch.setattr(module, "_send_bus_command", send_command)
+    monkeypatch.setattr(module, "_bus_transport", None)
     banner = Mock()
     monkeypatch.setattr(notify, "notify_tray_unavailable", banner)
     notify.reset_state()
@@ -299,10 +315,12 @@ def harness(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> Iterator[Har
         detect,
         drop,
         panel_warning,
-        start_worker,
+        send_command,
     )
     tray.stop()
-    tray.deleteLater()
+    module.shutdown_bus_threads()
+    if not sip.isdeleted(tray):
+        tray.deleteLater()
     notify.reset_state()
 
 
@@ -529,9 +547,7 @@ def test_register_immediately_and_stop(harness: Harness) -> None:
     harness.banner.assert_not_called()
     harness.tray.stop()
     assert not harness.tray.registered
-    harness.connection.disconnectFromBus.assert_called_once_with(
-        harness.connection.connectToBus.call_args.args[1]
-    )
+    harness.connection.disconnectFromBus.assert_not_called()
     harness.watcher.serviceRegistered.emit(SERVICE)
     harness.watcher.serviceUnregistered.emit(SERVICE)
     harness.clock.advance(60_000)
@@ -1009,6 +1025,7 @@ def test_registered_is_nonblocking_with_hung_owners(harness: Harness, ready: boo
     harness.bus.transport.call.side_effect = blocked
     harness.bus.transport.interface.side_effect = blocked
     requests_before = len(harness.bus.calls)
+    harness.bus.transport.call.reset_mock()
     started = monotonic()
     assert harness.tray.registered is ready
     elapsed = monotonic() - started
@@ -1057,9 +1074,7 @@ def test_late_reply_cannot_cross_stop_and_start(harness: Harness) -> None:
     harness.tray.stop()
     old.reply(True)
     assert not harness.tray.registered
-    harness.connection.disconnectFromBus.assert_called_once_with(
-        harness.connection.connectToBus.call_args.args[1]
-    )
+    harness.connection.disconnectFromBus.assert_not_called()
     harness.tray.start()
     old.reply(True)
     assert not harness.tray.registered
@@ -1067,155 +1082,76 @@ def test_late_reply_cannot_cross_stop_and_start(harness: Harness) -> None:
     assert harness.tray.registered
 
 
-@pytest.mark.parametrize("reconnect", [False, True])
-def test_worker_drops_all_hooks_before_closing_bus(harness: Harness, reconnect: bool) -> None:
-    from astra_voice.ui import tray as module
-
-    worker = module._BusWorker(42)
-    events = harness.bus.events
-
-    def connect_bus(bus_type: object, name: str) -> Mock:
-        events.append(("connectToBus", (bus_type, name)))
-        return harness.bus.transport
-
-    def disconnect_bus(name: str) -> None:
-        events.append(("disconnectFromBus", (name,)))
-
-    harness.connection.connectToBus.side_effect = connect_bus
-    harness.connection.disconnectFromBus.side_effect = disconnect_bus
-    worker.command.emit("setup", None)
-    hooks = [
-        (
-            "org.freedesktop.DBus",
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-            "NameOwnerChanged",
-            worker._owner_changed,
-        ),
-        (
-            SERVICE,
-            "/StatusNotifierWatcher",
-            SERVICE,
-            "StatusNotifierHostRegistered",
-            worker._host_changed,
-        ),
-        (
-            SERVICE,
-            "/StatusNotifierWatcher",
-            SERVICE,
-            "StatusNotifierHostUnregistered",
-            worker._host_changed,
-        ),
-        (
-            SERVICE,
-            "/StatusNotifierWatcher",
-            "org.freedesktop.DBus.Properties",
-            "PropertiesChanged",
-            worker._properties_changed,
-        ),
-    ]
-    assert worker._hooks == hooks
-    assert [args for action, args in events if action == "connect"] == hooks
-    events.clear()
-
-    if reconnect:
-        harness.bus.transport.isConnected.return_value = False
-        worker.command.emit("setup", None)
-        assert events == [
-            *(("disconnect", hook) for hook in hooks),
-            ("disconnectFromBus", (worker._name,)),
-            ("connectToBus", (harness.connection.SessionBus, worker._name)),
-            *(("connect", hook) for hook in hooks),
-        ]
-        assert worker._hooks == hooks
-        assert len(worker._connections) == 4
-        worker.command.emit("stop", None)
-    else:
-        worker.command.emit("stop", None)
-        assert events == [
-            *(("disconnect", hook) for hook in hooks),
-            ("disconnectFromBus", (worker._name,)),
-        ]
-        assert not worker._hooks
-    worker.deleteLater()
-
-
-@pytest.mark.parametrize("completion", ["reply", "timeout"])
-def test_worker_stop_waits_for_inflight_request(
-    harness: Harness, qapp: QApplication, completion: str
-) -> None:
-    from astra_voice.ui import tray as module
-
-    harness.bus.auto_reply = False
-    worker = module._BusWorker(42)
-    worker._bus = harness.bus.transport
-    results: list[tuple[int, str, object]] = []
-    closed = Mock()
-    worker.result.connect(lambda token, event, payload: results.append((token, event, payload)))
-    worker.finished.connect(closed)
-    message = QDBusMessage.createMethodCall(SERVICE, "/StatusNotifierWatcher", SERVICE, "Get")
-    worker.command.emit("request", (1, message))
-    pending = harness.bus.calls[-1]
-    receiver = worker._requests[1]
-
-    worker.command.emit("cancel", 1)
-    assert 1 not in worker._requests
-    assert receiver in worker._inflight
-    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-    assert not sip.isdeleted(receiver)
-
-    worker.command.emit("stop", None)
-    harness.connection.disconnectFromBus.assert_not_called()
-    closed.assert_not_called()
-    if completion == "reply":
-        pending.reply(True)
-        assert not worker._inflight
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        assert sip.isdeleted(receiver)
-    else:
-        harness.clock.advance(699)
-        harness.connection.disconnectFromBus.assert_not_called()
-        harness.clock.advance(1)
-        pending.reply(True)
-    harness.connection.disconnectFromBus.assert_called_once_with(worker._name)
-    closed.assert_called_once()
-    assert results == [(42, "closed", None)]
-    worker.command.emit("stop", None)
-    worker.command.emit("request", (2, message))
-    harness.connection.disconnectFromBus.assert_called_once()
-    closed.assert_called_once()
-    assert results == [(42, "closed", None), (42, "reply", (2, None))]
-    worker.deleteLater()
-
-
-def test_worker_stop_closes_after_close_setup_error(
+def test_receiver_survives_cycles_and_different_trays(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from astra_voice.ui import tray as module
 
+    receiver = module._get_bus_receiver()
+    deleted = Mock()
+    receiver.destroyed.connect(deleted)
+    deferred_delete = Mock(side_effect=AssertionError("получатель бессмертен"))
+    monkeypatch.setattr(receiver, "deleteLater", deferred_delete)
+    assert receiver.parent() is None
+    assert not sip.ispyowned(receiver)
+    for _ in range(30):
+        harness.tray.start()
+        assert harness.tray.registered
+        harness.tray.stop()
+    for _ in range(5):
+        tray = module.Tray(harness.provider, tray_factory=harness.factory)
+        tray.start()
+        assert tray.registered
+        assert module._bus_receiver is receiver
+        tray.stop()
+        tray.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert not sip.isdeleted(receiver)
+    deleted.assert_not_called()
+    deferred_delete.assert_not_called()
+    harness.connection.connectToBus.assert_called_once()
+    assert harness.bus.transport.connect.call_count == 4
+    assert len(harness.bus.matches) == 4
+    harness.connection.disconnectFromBus.assert_not_called()
+    harness.bus.transport.disconnect.assert_not_called()
+    receiver.destroyed.disconnect(deleted)
+
+
+def test_late_reply_cannot_reach_another_tray(harness: Harness) -> None:
+    from astra_voice.ui import tray as module
+
     harness.bus.auto_reply = False
-    worker = module._BusWorker(42)
-    worker._bus = harness.bus.transport
-    results: list[tuple[int, str, object]] = []
-    finished = Mock()
-    worker.result.connect(lambda token, event, payload: results.append((token, event, payload)))
-    worker.finished.connect(finished)
-    message = QDBusMessage.createMethodCall(SERVICE, "/StatusNotifierWatcher", SERVICE, "Get")
-    worker.command.emit("request", (1, message))
-    pending = harness.bus.calls[-1]
-    monkeypatch.setattr(module, "QTimer", Mock(side_effect=RuntimeError("timer failed")))
+    harness.tray.start()
+    old = harness.bus.calls[-1]
+    generation = harness.tray._bus_generation
+    tray = module.Tray(harness.provider, tray_factory=harness.factory)
+    try:
+        tray.start()
+        assert tray._bus_generation > generation
+        harness.tray.stop()
+        assert module._get_bus_receiver().tray is tray
+        old.reply(True)
+        assert not tray.registered
+        harness.bus.calls[-1].reply(True)
+        assert tray.registered
+    finally:
+        tray.stop()
+        tray.deleteLater()
 
-    worker.command.emit("stop", None)
-    assert results == [(42, "closed", None)]
-    finished.assert_called_once()
-    harness.connection.disconnectFromBus.assert_called_once_with(worker._name)
 
-    pending.reply(True)
-    worker.command.emit("stop", None)
-    assert results == [(42, "closed", None)]
-    finished.assert_called_once()
-    harness.connection.disconnectFromBus.assert_called_once_with(worker._name)
-    worker.deleteLater()
+def test_receiver_discards_events_for_deleted_tray(harness: Harness) -> None:
+    from astra_voice.ui import tray as module
+
+    harness.bus.auto_reply = False
+    harness.tray.start()
+    old = harness.bus.calls[-1]
+    harness.tray.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert sip.isdeleted(harness.tray)
+    old.reply(True)
+    module._get_bus_receiver()._host_changed()
+    module._get_bus_receiver().tray = None
+    # Фикстура завершает уже удалённый Tray только через фейки таймеров и значка.
 
 
 def test_failed_async_request_is_retried_without_blocking(harness: Harness) -> None:
@@ -1232,13 +1168,17 @@ def test_failed_async_request_is_retried_without_blocking(harness: Harness) -> N
 
 
 def test_send_failure_does_not_leave_request_pending(harness: Harness) -> None:
-    harness.bus.transport.callWithCallback.side_effect = lambda message, success, error, timeout: (
-        False if message.member() == "Get" else harness.bus.submit(message, success, error, timeout)
-    )
+    def failed(message: QDBusMessage, mode: object, timeout: int) -> QDBusMessage:
+        if message.member() == "Get":
+            raise RuntimeError("ошибка запроса")
+        return harness.bus.call(message, mode, timeout)
+
+    harness.bus.transport.call.side_effect = failed
     harness.tray.start()
     assert len(harness.bus.matches) == 4
     assert not harness.tray.registered
-    harness.bus.transport.callWithCallback.side_effect = harness.bus.submit
+    assert not harness.tray._requests
+    harness.bus.transport.call.side_effect = harness.bus.call
     harness.clock.advance(1000)
     assert harness.tray.registered
 
@@ -1305,85 +1245,84 @@ def wait_for(qapp: QApplication, predicate: Callable[[], bool], timeout: float =
 
 
 @pytest.mark.parametrize("kind", [SessionKind.KDE, SessionKind.OTHER])
-@pytest.mark.parametrize("blocked_at", ["connection", "subscription"])
+@pytest.mark.parametrize("blocked_at", ["connection", "subscription", "call", "request"])
 def test_public_methods_do_not_wait_for_hung_bus(
     harness: Harness,
     qapp: QApplication,
-    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     kind: SessionKind,
     blocked_at: str,
 ) -> None:
     from astra_voice.ui import tray as module
 
     harness.detect.return_value = kind
-    harness.bus.host_registered = False
-    harness.bus.plasma_owner = ""
-    harness.start_worker.side_effect = _start_bus_worker
-    # Только таймер worker настоящий; часы ретраев GUI остаются управляемыми.
-    monkeypatch.setattr(module, "QTimer", QtTimer)
-    entered = Event()
-    release = Event()
-    gui_thread = get_ident()
+    harness.send_command.side_effect = _send_bus_command
+    entered, release = Event(), Event()
     callers: list[int] = []
+    gui_thread = get_ident()
 
-    def blocked(*args: object) -> bool:
+    def blocked(*args: Any) -> Any:
+        if blocked_at == "request" and args[0].member() == "AddMatch":
+            return harness.bus.call(*args)
         callers.append(get_ident())
         entered.set()
-        # При ошибочном вызове из GUI снять задержку некому: он прождёт 5 с.
-        release.wait(5.0)
-        return False
+        assert release.wait(5)
+        if blocked_at == "connection":
+            return harness.bus.transport
+        if blocked_at == "subscription":
+            return harness.bus.connect(*args)
+        return harness.bus.call(*args)
 
-    def connect_bus(*args: object) -> Mock:
-        blocked(*args)
-        return harness.bus.transport
-
-    for name in ("call", "connect", "disconnect", "interface", "isConnected", "send"):
-        getattr(harness.bus.transport, name).side_effect = blocked
-    for name in ("addWatchedService", "setWatchedServices"):
-        getattr(harness.watcher, name).side_effect = blocked
-    harness.connection.sessionBus.side_effect = connect_bus
-    harness.connection.disconnectFromBus.side_effect = blocked
-    if blocked_at == "connection":
-        harness.connection.connectToBus.side_effect = connect_bus
-
+    target = (
+        harness.connection.connectToBus
+        if blocked_at == "connection"
+        else (
+            harness.bus.transport.connect
+            if blocked_at == "subscription"
+            else harness.bus.transport.call
+        )
+    )
+    target.side_effect = blocked
     try:
         started = monotonic()
         harness.tray.start()
-        assert monotonic() - started < 1.0
+        assert monotonic() - started < 0.5
         wait_for(qapp, entered.is_set)
+        transport = module._bus_transport
+        assert transport is not None
+        assert transport.thread.daemon
+        assert transport.thread.name == "astra-voice-tray-dbus"
         heartbeat = Event()
         QtTimer.singleShot(0, heartbeat.set)
         wait_for(qapp, heartbeat.is_set)
-        assert not release.is_set()  # Цикл GUI работает и во время зависшей подписки.
+        assert not release.is_set()
         for action in (
             lambda: harness.tray.registered,
             lambda: harness.tray.set_state(TrayState.LISTENING),
+            harness.tray.stop,
+            harness.tray.start,
         ):
             started = monotonic()
             action()
             assert monotonic() - started < 0.5
-        assert not harness.tray.registered
         harness.clock.advance(2000)
-        assert harness.clock.timers[1].due == 3000  # Ретраи не остановлены.
-        harness.start_worker.assert_called_once()
-        harness.icon.show.assert_not_called()
-        started = monotonic()
-        harness.tray.stop()
-        assert monotonic() - started < 0.5
-        # Повторный цикл не плодит потоки, пока прежний занят очисткой.
-        harness.tray.start()
-        harness.clock.advance(1000)
-        harness.start_worker.assert_called_once()
+        assert harness.clock.timers[1].due == 3000
+        assert module._bus_transport is transport
         assert not harness.tray.registered
+        started = monotonic()
+        module.shutdown_bus_threads(20)
+        assert monotonic() - started < 0.5
+        assert transport.thread.is_alive()
+        assert "Поток D-Bus не завершился" in caplog.text
     finally:
         harness.tray.stop()
         release.set()
-        wait_for(qapp, lambda: not module._bus_threads)
+        module.shutdown_bus_threads()
+    assert not transport.thread.is_alive()
     assert callers and gui_thread not in callers
     harness.icon.show.assert_not_called()
-    harness.bus.transport.call.assert_not_called()
-    harness.bus.transport.interface.assert_not_called()
-    harness.watcher.addWatchedService.assert_not_called()
+    harness.connection.disconnectFromBus.assert_not_called()
+    harness.bus.transport.disconnect.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1395,48 +1334,123 @@ def test_public_methods_do_not_wait_for_hung_bus(
         "PropertiesChanged",
     ],
 )
-@pytest.mark.parametrize("failure", ["connect", "send", "error", "timeout"])
-def test_subscription_failure_is_closed_and_retried(
-    harness: Harness,
-    member: str,
-    failure: str,
+@pytest.mark.parametrize(
+    "failure", ["connect", "connect_exception", "error", "timeout", "exception", "invalid"]
+)
+def test_subscription_failure_is_retained_and_retried(
+    harness: Harness, member: str, failure: str
 ) -> None:
-    if failure == "connect":
-        harness.bus.transport.connect.side_effect = lambda service, path, interface, name, slot: (
-            False if name == member else harness.bus.connect(service, path, interface, name, slot)
-        )
-    elif failure == "send":
-        harness.bus.transport.callWithCallback.side_effect = (
-            lambda message, success, error, timeout: (
-                False
-                if f"member='{member}'" in str(message.arguments())
-                else harness.bus.submit(message, success, error, timeout)
-            )
-        )
+    if failure in ("connect", "connect_exception"):
+
+        def connect(
+            service: str, path: str, interface: str, name: str, slot: Callable[..., None]
+        ) -> bool:
+            if name == member:
+                if failure == "connect_exception":
+                    raise RuntimeError("ошибка подключения подписки")
+                return False
+            return harness.bus.connect(service, path, interface, name, slot)
+
+        harness.bus.transport.connect.side_effect = connect
     else:
-        harness.bus.auto_match_reply = False
+
+        def failed(message: QDBusMessage, mode: object, timeout: int) -> QDBusMessage:
+            if f"member='{member}'" in str(message.arguments()):
+                if failure == "invalid":
+                    return QDBusMessage()
+                if failure == "exception":
+                    raise RuntimeError("ошибка подписки")
+                error = "NoReply" if failure == "timeout" else "Failed"
+                return message.createErrorReply(f"org.freedesktop.DBus.Error.{error}", "ошибка")
+            return harness.bus.call(message, mode, timeout)
+
+        harness.bus.transport.call.side_effect = failed
     harness.tray.start()
-    previous = list(harness.bus.matches)
-    if failure in ("error", "timeout"):
-        for pending in previous:
-            if f"member='{member}'" not in pending.message.arguments()[0]:
-                pending.success(pending.message.createReply([]))
-            elif failure == "error":
-                pending.fail()
-        harness.clock.advance(500)
-        # Даже запоздалый успех просроченного AddMatch не доказывает подписку.
-        for pending in previous:
-            pending.success(pending.message.createReply([]))
+    assert not harness.tray._setup_pending
+    assert not harness.tray._subscriptions_ready
     assert not harness.tray.registered
-    assert not harness.bus.calls  # Get(true) не обходит неудавшуюся подписку.
+    assert not harness.bus.calls
     harness.icon.show.assert_not_called()
     harness.flush.assert_not_called()
+    confirmed = set(harness.bus.executor.matches)
+    connected = set(harness.bus.executor.connections)
+    connect_count = harness.bus.transport.connect.call_count
+    match_count = len(harness.bus.matches)
     harness.bus.transport.connect.side_effect = harness.bus.connect
-    harness.bus.transport.callWithCallback.side_effect = harness.bus.submit
-    harness.bus.auto_match_reply = True
+    harness.bus.transport.call.side_effect = harness.bus.call
     harness.clock.advance(1000)
     assert harness.tray.registered
+    assert harness.bus.transport.connect.call_count - connect_count == 4 - len(connected)
+    assert len(harness.bus.matches) - match_count == 4 - len(confirmed)
     harness.icon.show.assert_called_once_with()
+    harness.connection.connectToBus.assert_called_once()
+    harness.connection.disconnectFromBus.assert_not_called()
+    harness.bus.transport.disconnect.assert_not_called()
+
+
+def test_connection_exception_is_failed_and_retried(harness: Harness) -> None:
+    harness.connection.connectToBus.side_effect = RuntimeError("ошибка соединения")
+    harness.tray.start()
+    assert not harness.tray._setup_pending
+    assert not harness.tray._subscriptions_ready
+    assert not harness.tray._requests
+    harness.icon.show.assert_not_called()
+    harness.connection.connectToBus.side_effect = None
+    harness.clock.advance(1000)
+    assert harness.tray.registered
+    harness.connection.disconnectFromBus.assert_not_called()
+
+
+@pytest.mark.parametrize("delay", [499, 500, 501])
+def test_setup_ready_must_arrive_before_deadline(harness: Harness, delay: int) -> None:
+    from astra_voice.ui import tray as module
+
+    harness.send_command.side_effect = None
+    harness.tray.start()
+    generation = harness.tray._bus_generation
+    harness.clock.advance(delay)
+    module._post_bus_result(generation, "ready", False)
+    QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
+    assert harness.tray._subscriptions_ready is (delay < 500)
+    assert not harness.tray._setup_pending
+    if delay >= 500:
+        assert not harness.tray._requests
+        harness.icon.show.assert_not_called()
+        harness.flush.assert_not_called()
+
+
+def test_late_setup_result_cannot_cross_stop_and_start(harness: Harness) -> None:
+    from astra_voice.ui import tray as module
+
+    harness.send_command.side_effect = None
+    harness.tray.start()
+    old_generation = harness.tray._bus_generation
+    harness.tray.stop()
+    harness.tray.start()
+    for event in ("ready", "failed"):
+        module._post_bus_result(old_generation, event, False)
+    QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
+    assert harness.tray._setup_pending
+    assert not harness.tray._subscriptions_ready
+    assert not harness.tray._requests
+    module._post_bus_result(harness.tray._bus_generation, "ready", False)
+    QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
+    assert harness.tray._subscriptions_ready
+    assert not harness.tray._setup_pending
+
+
+def test_receiver_normalizes_properties(harness: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    from astra_voice.ui import tray as module
+
+    harness.tray.start()
+    received = Mock()
+    monkeypatch.setattr(harness.tray, "_bus_event", received)
+    module._get_bus_receiver()._properties_changed(
+        SERVICE, {"value": QDBusVariant([QDBusVariant(True)])}, ["invalid"]
+    )
+    received.assert_called_once_with(
+        harness.tray._bus_generation, "properties", (SERVICE, {"value": [True]}, ["invalid"])
+    )
 
 
 def test_late_subscription_setup_cannot_register(harness: Harness) -> None:
@@ -1471,108 +1485,131 @@ def test_failed_plasma_query_retries_with_confirmed_host(harness: Harness) -> No
     assert sum(c.message.member() == "GetNameOwner" for c in harness.bus.calls) == 2
 
 
-def test_dead_connection_is_replaced_on_subscription_retry(harness: Harness) -> None:
-    harness.bus.transport.connect.return_value = False
-    harness.bus.transport.connect.side_effect = None
-    harness.bus.transport.isConnected.return_value = False
+@pytest.mark.parametrize("initially_ready", [False, True])
+def test_dead_connection_is_replaced_on_subscription_retry(
+    harness: Harness, initially_ready: bool
+) -> None:
+    harness.bus.transport.isConnected.return_value = initially_ready
     harness.tray.start()
-    assert not harness.tray.registered
-    harness.bus.transport.connect.side_effect = harness.bus.connect
-    harness.bus.transport.isConnected.return_value = True
-    # Первое чтение состояния старого соединения сообщает потерю шины.
-    harness.bus.transport.isConnected.side_effect = [False, True]
-    harness.clock.advance(1000)
+    assert harness.tray.registered is initially_ready
+    if initially_ready:
+        assert len(harness.bus.matches) == 4
+        harness.tray.stop()
+    replacement = Bus()
+    harness.bus.transport.isConnected.return_value = False
+    harness.connection.connectToBus.return_value = replacement.transport
+    if initially_ready:
+        harness.tray.start()
+    else:
+        harness.clock.advance(1000)
     assert harness.tray.registered
     assert harness.connection.connectToBus.call_count == 2
-    harness.connection.disconnectFromBus.assert_called_once()
+    names = [call.args[1] for call in harness.connection.connectToBus.call_args_list]
+    assert len(set(names)) == 2
+    assert replacement.transport.connect.call_count == 4
+    assert len(replacement.matches) == 4
+    harness.connection.disconnectFromBus.assert_not_called()
+    harness.bus.transport.disconnect.assert_not_called()
+    replacement.transport.disconnect.assert_not_called()
 
 
-def test_real_worker_delivers_to_gui_and_cleans_up(
-    harness: Harness,
-    qapp: QApplication,
-    monkeypatch: pytest.MonkeyPatch,
+def test_real_daemon_delivers_to_gui_and_keeps_receiver(
+    harness: Harness, qapp: QApplication, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from astra_voice.ui import tray as module
 
-    harness.start_worker.side_effect = _start_bus_worker
-    monkeypatch.setattr(module, "QTimer", QtTimer)
+    harness.send_command.side_effect = _send_bus_command
     gui_thread = get_ident()
     deliveries: list[int] = []
-    cleanup_entered = Event()
-    release = Event()
-    cleanup_threads: list[int] = []
+    slot_threads: list[int] = []
+    original_slot = harness.tray._bus_event
+
+    def record_slot(generation: int, event: str, payload: Any) -> None:
+        slot_threads.append(get_ident())
+        if event == "reply":
+            assert type(payload[1][0]) is int
+            assert payload[1][1] == [True]
+        original_slot(generation, event, payload)
+
+    monkeypatch.setattr(harness.tray, "_bus_event", record_slot)
+    callers: list[int] = []
+    receiver = module._get_bus_receiver()
+    assert receiver.thread() is qapp.thread()
 
     def show() -> None:
         deliveries.append(get_ident())
         harness.icon.isVisible.return_value = True
 
-    def blocked(*args: object) -> bool:
-        cleanup_threads.append(get_ident())
-        cleanup_entered.set()
-        release.wait(5.0)
-        return False
+    def call_bus(*args: Any) -> QDBusMessage:
+        callers.append(get_ident())
+        return harness.bus.call(*args)
 
     harness.icon.show.side_effect = show
-    try:
-        harness.tray.start()
-        wait_for(qapp, lambda: harness.tray.registered)
-        assert deliveries == [gui_thread]
-        assert len(harness.bus.matches) == 4
-        for name in ("call", "connect", "disconnect", "interface"):
-            getattr(harness.bus.transport, name).side_effect = blocked
-        harness.connection.disconnectFromBus.side_effect = blocked
-        for action in (
-            lambda: harness.tray.registered,
-            lambda: harness.tray.set_state(TrayState.LISTENING),
-        ):
-            started = monotonic()
-            action()
-            assert monotonic() - started < 0.5
-        assert harness.tray.registered
-        started = monotonic()
-        harness.tray.stop()
-        assert monotonic() - started < 0.5
-        assert not harness.tray.registered
-        wait_for(qapp, cleanup_entered.is_set)
-    finally:
-        harness.tray.stop()
-        release.set()
-        wait_for(qapp, lambda: not module._bus_threads)
-    harness.connection.disconnectFromBus.assert_called_once()
-    assert cleanup_threads and gui_thread not in cleanup_threads
+    harness.bus.transport.call.side_effect = call_bus
+    harness.tray.start()
+    wait_for(qapp, lambda: harness.tray.registered)
+    assert deliveries == [gui_thread]
+    assert callers and gui_thread not in callers
+    assert len(harness.bus.matches) == 4
+    harness.tray.stop()
+    transport = module._bus_transport
+    assert transport is not None and transport.thread.is_alive()
+    harness.tray.start()
+    wait_for(qapp, lambda: harness.tray.registered)
+    assert deliveries == [gui_thread, gui_thread]
+    assert len(slot_threads) == 4 and set(slot_threads) == {gui_thread}
+    assert len(harness.bus.matches) == 4
+    harness.tray.stop()
+    module.shutdown_bus_threads()
+    assert not transport.thread.is_alive()
+    assert receiver is module._bus_receiver and not sip.isdeleted(receiver)
+    harness.connection.disconnectFromBus.assert_not_called()
+    harness.bus.transport.disconnect.assert_not_called()
 
 
-def test_bus_worker_is_destroyed_in_gui_thread(
-    harness: Harness,
-    qapp: QApplication,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # ~QObject воркера в потоке шины берёт GIL под мьютексом сигналов Qt,
-    # а GUI под GIL ждёт тот же мьютекс: удалять воркер можно только в GUI.
+def test_daemon_coalesces_only_adjacent_setups(harness: Harness, qapp: QApplication) -> None:
     from astra_voice.ui import tray as module
 
-    harness.start_worker.side_effect = _start_bus_worker
-    monkeypatch.setattr(module, "QTimer", QtTimer)
-    gui_thread = get_ident()
-    destroyed_in: list[int] = []
+    harness.send_command.side_effect = _send_bus_command
+    entered, release = Event(), Event()
+    events: list[tuple[int, str]] = []
 
-    def record(*args: object) -> None:
-        destroyed_in.append(get_ident())
+    def connect_bus(*args: Any) -> Mock:
+        entered.set()
+        assert release.wait(5)
+        return harness.bus.transport
 
+    harness.connection.connectToBus.side_effect = connect_bus
+    harness.tray.start()
     try:
-        harness.tray.start()
-        wait_for(qapp, lambda: harness.tray.registered)
-        worker = harness.start_worker.call_args[0][0]
-        assert module._bus_threads.get(worker) is not None
-        worker.destroyed.connect(record, Qt.DirectConnection)
-        del worker
+        wait_for(qapp, entered.is_set)
+        transport = module._bus_transport
+        assert transport is not None
+        execute = transport.execute
+
+        def record(generation: int, operation: str, payload: Any) -> None:
+            events.append((generation, operation))
+            execute(generation, operation, payload)
+
+        transport.execute = record  # type: ignore[method-assign]
+        message = QDBusMessage.createMethodCall(SERVICE, "/StatusNotifierWatcher", SERVICE, "Get")
+        for generation in (101, 102, 103):
+            _send_bus_command(generation, "setup", None)
+        _send_bus_command(103, "request", (1, message))
+        for generation in (104, 105):
+            _send_bus_command(generation, "setup", None)
         harness.tray.stop()
-        wait_for(qapp, lambda: not module._bus_threads)
+        release.set()
+        module.shutdown_bus_threads()
+        assert not transport.thread.is_alive()
+        assert events == [(103, "setup"), (103, "request"), (105, "setup")]
+        assert len(harness.bus.matches) == 4
+        harness.connection.connectToBus.assert_called_once()
+        harness.bus.transport.disconnect.assert_not_called()
+        harness.connection.disconnectFromBus.assert_not_called()
     finally:
-        harness.tray.stop()
-        wait_for(qapp, lambda: not module._bus_threads)
-    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-    assert destroyed_in == [gui_thread]
+        release.set()
+        module.shutdown_bus_threads()
 
 
 def test_download_status_menu_item(harness: Harness) -> None:

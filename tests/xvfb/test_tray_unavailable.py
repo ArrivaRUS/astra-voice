@@ -2,7 +2,7 @@
 
 xvfb не установлен; запуск: QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software
 pytest -m xvfb. Урок .patches/002: offscreen не изолирует сессионную шину.
-Здесь реальный QSystemTrayIcon запрещён, транспорт D-Bus воркера подменён
+Здесь реальный QSystemTrayIcon запрещён, транспорт D-Bus подменён
 до создания Tray; виртуальные 30 секунд не требуют реального ожидания.
 """
 
@@ -16,8 +16,8 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
-from PyQt5.QtCore import QTimer
-from PyQt5.QtDBus import QDBusMessage, QDBusVariant
+from PyQt5.QtCore import QCoreApplication
+from PyQt5.QtDBus import QDBus, QDBusMessage, QDBusVariant
 
 from astra_voice.platform.session import SessionKind
 
@@ -108,30 +108,27 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
     monkeypatch.setattr(module, "QSystemTrayIcon", forbidden_tray)
     host_registered = False
     plasma_alive = False
+    registered_before_host_reply: list[bool] = []
 
-    def query(
-        message: QDBusMessage,
-        success: Callable[[QDBusMessage], None],
-        error: Callable[..., None],
-        timeout: int,
-    ) -> bool:
+    def query(message: QDBusMessage, mode: object, timeout: int) -> QDBusMessage:
+        assert mode == QDBus.Block
         assert timeout == 500
         if message.member() == "AddMatch":
-            success(message.createReply([]))
-            return True
+            return message.createReply([])
         if message.member() == "Get":
             assert message.arguments() == [
                 "org.kde.StatusNotifierWatcher",
                 "IsStatusNotifierHostRegistered",
             ]
-            value: object = QDBusVariant(host_registered)
-        else:
-            assert message.member() == "GetNameOwner"
-            assert message.arguments() == ["org.kde.plasmashell"]
-            value = ":1.42" if plasma_alive else ""
-        # Настоящая очередь событий Qt доставляет ответ в типизированный слот.
-        QTimer.singleShot(0, lambda: success(message.createReply([value])))
-        return True
+            registered_before_host_reply.append(tray.registered)
+            return message.createReply([QDBusVariant(host_registered)])
+        assert message.member() == "GetNameOwner"
+        assert message.arguments() == ["org.kde.plasmashell"]
+        if plasma_alive:
+            return message.createReply([":1.42"])
+        return message.createErrorReply(
+            "org.freedesktop.DBus.Error.NameHasNoOwner", "нет владельца"
+        )
 
     watcher = Mock(
         serviceRegistered=Signal(), serviceUnregistered=Signal(), serviceOwnerChanged=Signal()
@@ -157,18 +154,23 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
 
     transport = Mock(name="fake_dbus_transport")
     transport.isConnected.return_value = True
-    transport.callWithCallback.side_effect = query
+    transport.call.side_effect = query
     transport.connect.side_effect = connect
-    transport.call.side_effect = AssertionError("синхронный D-Bus запрещён")
     transport.interface.side_effect = AssertionError("интерфейс D-Bus запрещён")
     connection = Mock(name="fake_dbus_connection")
     connection.connectToBus.return_value = transport
     connection.sessionBus.side_effect = AssertionError("реальная сессионная шина запрещена")
     monkeypatch.setattr(module, "detect", lambda: kind)
     monkeypatch.setattr(module, "QDBusConnection", connection)
-    # Как в unit-тестах: настоящий воркер и его сигналы, но без рабочего потока.
-    start_worker = Mock()
-    monkeypatch.setattr(module, "_start_bus_worker", start_worker)
+    # Как в unit-тестах: настоящий исполнитель без запуска потока демона.
+    executor = module._TrayBusTransport(module._get_bus_receiver())
+
+    def command(generation: int, operation: str, payload: Any) -> None:
+        executor.execute(generation, operation, payload)
+        QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
+
+    monkeypatch.setattr(module, "_send_bus_command", command)
+    monkeypatch.setattr(module, "_bus_transport", None)
     clock = Clock()
     monkeypatch.setattr(module, "QTimer", clock.timer)
     monkeypatch.setattr(module, "monotonic", lambda: clock.now / 1000)
@@ -231,9 +233,11 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
         assert not tray.registered
         tray.start()
         factory.assert_called_once_with()
-        assert tray._worker is not None
-        start_worker.assert_called_once_with(tray._worker)
-        connection.connectToBus.assert_called_once_with(connection.SessionBus, tray._worker._name)
+        connection.connectToBus.assert_called_once()
+        bus_name = connection.connectToBus.call_args.args[1]
+        assert isinstance(bus_name, str)
+        assert bus_name.startswith("astra-voice-tray-")
+        connection.connectToBus.assert_called_once_with(connection.SessionBus, bus_name)
         assert transport.connect.call_count == 4
         assert not tray.registered
         tray_app.processEvents()
@@ -245,28 +249,26 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
         icon.isSystemTrayAvailable.assert_not_called()
         assert not tray.registered
         notification.assert_not_called()
-        assert (
-            sum(
-                call.args[0].member() == "Get" for call in transport.callWithCallback.call_args_list
-            )
-            == 30
-        )
+        assert sum(call.args[0].member() == "Get" for call in transport.call.call_args_list) == 30
         tray.start()  # Повторный start не должен сдвигать дедлайн.
         clock.advance(1)
         assert clock.now == 30_000
         notification.assert_called_once_with()
         assert not tray.registered
-        attempts = transport.callWithCallback.call_count
+        attempts = transport.call.call_count
         clock.advance(60_000)
-        assert transport.callWithCallback.call_count == attempts
+        assert transport.call.call_count == attempts
         icon.show.assert_not_called()
         flush.assert_not_called()
         notify.notify_indicators_lost()
         assert notify.pending_count() == 2  # Баннер отсутствия трея и остановка записи.
         send.return_value = 1
         host_registered = True
+        previous_gets = len(registered_before_host_reply)
         watcher.serviceRegistered.emit("org.kde.StatusNotifierWatcher")
-        assert not tray.registered  # Сигнал ещё не является ответом Get.
+        assert len(registered_before_host_reply) == previous_gets + 1
+        # Сигнал ещё не является ответом Get: проверяем состояние до возврата ответа.
+        assert registered_before_host_reply[-1] is False
         tray_app.processEvents()
         if kind == SessionKind.KDE:
             assert not tray.registered  # KDED есть, plasmashell пока нет.
@@ -344,13 +346,14 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
         forbidden_bus.assert_not_called()
         forbidden_bus.sessionBus.assert_not_called()
         connection.sessionBus.assert_not_called()
-        transport.call.assert_not_called()
         transport.interface.assert_not_called()
     finally:
         tray.stop()
         sip.delete(tray)
         sip.delete(menu)
         tray_app.processEvents()
-        for call in start_worker.call_args_list:
-            sip.delete(call.args[0])
         notify.reset_state()
+    connection.connectToBus.assert_called_once_with(connection.SessionBus, bus_name)
+    assert transport.connect.call_count == 4
+    transport.disconnect.assert_not_called()
+    connection.disconnectFromBus.assert_not_called()

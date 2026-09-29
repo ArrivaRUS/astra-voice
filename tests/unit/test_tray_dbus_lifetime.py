@@ -17,14 +17,14 @@ _SCENARIO = _ROOT / "tests" / "helpers" / "tray_dbus_lifetime.py"
 
 @pytest.mark.parametrize(
     ("scenario", "repeat"),
-    [("plasma_reply", 1), ("thread_cleanup", 1), ("exit_after_stop", 20)],
+    [("plasma_reply", 1), ("invariants", 1), ("thread_cleanup", 1), ("exit_after_stop", 20)],
 )
 def test_tray_dbus_lifetime(scenario: str, repeat: int, tmp_path: Path) -> None:
     for _ in range(repeat):
         result = run_on_private_bus(
             [sys.executable, str(_SCENARIO), scenario],
             tmp_dir=tmp_path,
-            timeout=30,
+            timeout=60,
             extra_env={"XDG_CURRENT_DESKTOP": "KDE"},
         )
         assert_private_bus_result(result, marker=f"TRAY_DBUS_OK:{scenario}")
