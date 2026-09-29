@@ -8,6 +8,7 @@ import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Empty
 from threading import Event, get_ident
 from time import monotonic, sleep
 from typing import TYPE_CHECKING, Any, get_type_hints
@@ -15,9 +16,9 @@ from unittest.mock import Mock, call
 
 import pytest
 from PyQt5 import sip
-from PyQt5.QtCore import QCoreApplication, QEvent
+from PyQt5.QtCore import QCoreApplication, QEvent, QMetaObject
 from PyQt5.QtCore import QTimer as QtTimer
-from PyQt5.QtDBus import QDBusMessage, QDBusVariant
+from PyQt5.QtDBus import QDBusConnection, QDBusMessage, QDBusVariant
 from PyQt5.QtWidgets import QSystemTrayIcon
 
 from astra_voice.platform.session import SessionKind
@@ -1505,12 +1506,91 @@ def test_dead_connection_is_replaced_on_subscription_retry(
     assert harness.tray.registered
     assert harness.connection.connectToBus.call_count == 2
     names = [call.args[1] for call in harness.connection.connectToBus.call_args_list]
-    assert len(set(names)) == 2
     assert replacement.transport.connect.call_count == 4
     assert len(replacement.matches) == 4
-    harness.connection.disconnectFromBus.assert_not_called()
+    if initially_ready:
+        # На мёртвом соединении висят хуки получателя: не разбираем, берём новое имя.
+        assert len(set(names)) == 2
+        harness.connection.disconnectFromBus.assert_not_called()
+    else:
+        # Хуков не было: имя освобождается и переиспользуется.
+        assert len(set(names)) == 1
+        harness.connection.disconnectFromBus.assert_called_once_with(names[0])
     harness.bus.transport.disconnect.assert_not_called()
     replacement.transport.disconnect.assert_not_called()
+
+
+def test_failed_connection_attempts_reuse_one_name(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from astra_voice.ui import tray as module
+
+    names: list[str] = []
+    released: list[str] = []
+    dead = Mock()
+    dead.isConnected.return_value = False
+
+    class FailingConnection:
+        SessionBus = QDBusConnection.SessionBus
+
+        @staticmethod
+        def connectToBus(bus_type: object, name: str) -> Mock:
+            names.append(name)
+            return dead
+
+        @staticmethod
+        def disconnectFromBus(name: str) -> None:
+            released.append(name)
+
+    monkeypatch.setattr(module, "QDBusConnection", FailingConnection)
+    monkeypatch.setattr(module, "detect", Mock(return_value=SessionKind.OTHER))
+    transport = module._TrayBusTransport(module._get_bus_receiver())
+    attempts = 10
+    for _ in range(attempts):
+        assert transport._setup() is False
+    assert len(names) == attempts
+    assert set(names) == {names[0]}
+    # Живым остаётся не больше одного именованного соединения.
+    assert released == names[:-1]
+    dead.connect.assert_not_called()
+
+
+def test_stale_setup_pending_is_retried(harness: Harness) -> None:
+    from astra_voice.ui import tray as module
+
+    # Команда setup «потерялась»: ни ready, ни failed не придут.
+    harness.send_command.side_effect = None
+    harness.tray.start()
+    assert harness.tray._setup_pending
+    assert harness.send_command.call_count == 1
+    stale_ms = int((module._SETUP_FRESH_S + module._SETUP_STALE_S) * 1000)
+    harness.clock.advance(stale_ms)
+    assert harness.send_command.call_count == 1
+    harness.send_command.side_effect = harness.bus.command
+    harness.clock.advance(1000)
+    operations = [c.args[1] for c in harness.send_command.call_args_list]
+    assert operations[:2] == ["setup", "setup"]
+    assert "setup" not in operations[2:]
+    assert harness.tray.registered
+
+
+def test_closed_transport_does_not_post_to_qt(
+    harness: Harness, qapp: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from astra_voice.ui import tray as module
+
+    transport = module._TrayBusTransport(module._get_bus_receiver())
+    invoked = Mock()
+    monkeypatch.setattr(QMetaObject, "invokeMethod", invoked)
+    transport.post(1, "failed", None)
+    invoked.assert_called_once()
+    transport.close()
+    transport.post(1, "failed", None)
+    transport.execute(1, "setup", None)
+    invoked.assert_called_once()
+    assert module._bus_results.get_nowait() == (1, "failed", None)
+    with pytest.raises(Empty):
+        module._bus_results.get_nowait()
 
 
 def test_real_daemon_delivers_to_gui_and_keeps_receiver(

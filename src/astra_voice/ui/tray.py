@@ -7,7 +7,7 @@ from collections.abc import Callable
 from functools import partial
 from itertools import count
 from queue import Empty, Queue
-from threading import Thread
+from threading import Lock, Thread
 from time import monotonic
 from typing import Any
 
@@ -15,6 +15,7 @@ from PyQt5 import sip
 from PyQt5.QtCore import (
     QCoreApplication,
     QEvent,
+    QMetaObject,
     QObject,
     Qt,
     QTimer,
@@ -44,6 +45,12 @@ _DBUS_SERVICE = "org.freedesktop.DBus"
 _DBUS_PATH = "/org/freedesktop/DBus"
 _UNAVAILABLE_SUMMARY = "Значок не появился на панели"
 _CALL_TIMEOUT_MS = 500
+# Setup последователен: соединение и до 4 AddMatch по _CALL_TIMEOUT_MS каждый, причём
+# за ним в очереди могут стоять запросы. Готовность засчитывается, только если ответ
+# пришёл за _SETUP_FRESH_S (медленная шина = панель не готова, повтор по таймеру 1 с).
+_SETUP_FRESH_S = 0.5
+# Если результат setup так и не пришёл (демон умер, команда отброшена), повторяем setup.
+_SETUP_STALE_S = 5.0
 _logger = logging.getLogger(__name__)
 _BusReply = tuple[int, list[Any]]
 
@@ -69,7 +76,9 @@ _bus_receiver: _TrayBusReceiver | None = None
 _bus_transport: _TrayBusTransport | None = None
 _bus_generations = count(1)
 _bus_names = count(1)
-_bus_event_type = QEvent.Type(QEvent.registerEventType())
+# Демон будит получателя через invokeMethod: в очереди Qt лежит только C++-событие
+# MetaCall, для удаления которого (в т. ч. в ~QApplication) GIL не нужен.
+_bus_event_type = QEvent.MetaCall
 _bus_results: Queue[tuple[int, str, Any]] = Queue()
 _BusCommand = tuple[int, str, Any]
 
@@ -86,14 +95,13 @@ class _TrayBusReceiver(QObject):
         if tray is not None and not sip.isdeleted(tray) and tray._running:
             tray._bus_event(generation, event, payload)
 
-    def event(self, event: QEvent) -> bool:
-        if event.type() != _bus_event_type:
-            return bool(super().event(event))
+    @pyqtSlot()
+    def _drain(self) -> None:
         while True:
             try:
                 result = _bus_results.get_nowait()
             except Empty:
-                return True
+                return
             self._deliver(*result)
 
     def _hook(self, event: str, payload: Any) -> None:
@@ -128,10 +136,11 @@ def _get_bus_receiver() -> _TrayBusReceiver:
 
 
 def _post_bus_result(generation: int, event: str, payload: Any) -> None:
+    """Положить результат и разбудить получатель; демон зовёт только через затвор."""
     _bus_results.put((generation, event, payload))
     # Получатель создан до запуска демона и никогда не удаляется.
     assert _bus_receiver is not None
-    QCoreApplication.postEvent(_bus_receiver, QEvent(_bus_event_type))
+    QMetaObject.invokeMethod(_bus_receiver, "_drain", Qt.ConnectionType.QueuedConnection)
 
 
 class _TrayBusTransport:
@@ -142,10 +151,24 @@ class _TrayBusTransport:
         self.commands: Queue[_BusCommand | None] = Queue()
         self.thread = Thread(target=self._run, daemon=True, name="astra-voice-tray-dbus")
         self.bus: QDBusConnection | None = None
+        self.bus_name: str | None = None
         self.connections: set[str] = set()
         self.matches: set[str] = set()
         self.stopping = False
         self.is_kde = False
+        # Затвор постов в Qt: после close() демон не трогает очередь событий Qt,
+        # даже если пережил join (иначе взаимная блокировка с ~QApplication).
+        self.gate = Lock()
+        self.closed = False
+
+    def post(self, generation: int, event: str, payload: Any) -> None:
+        with self.gate:
+            if not self.closed:
+                _post_bus_result(generation, event, payload)
+
+    def close(self) -> None:
+        with self.gate:
+            self.closed = True
 
     def _run(self) -> None:
         command = self.commands.get()
@@ -171,17 +194,17 @@ class _TrayBusTransport:
         try:
             if operation == "setup":
                 ready = self._setup()
-                _post_bus_result(generation, "ready" if ready else "failed", ready and self.is_kde)
+                self.post(generation, "ready" if ready else "failed", ready and self.is_kde)
             elif operation == "request":
                 serial, message = payload
                 reply = self._call(message)
-                _post_bus_result(generation, "reply", (serial, reply))
+                self.post(generation, "reply", (serial, reply))
         except Exception:
             _logger.exception("Ошибка наблюдения за панелью через D-Bus")
             if operation == "request":
-                _post_bus_result(generation, "reply", (payload[0], None))
+                self.post(generation, "reply", (payload[0], None))
             else:
-                _post_bus_result(generation, "failed", None)
+                self.post(generation, "failed", None)
 
     def _call(self, message: QDBusMessage) -> _BusReply | None:
         if self.bus is None:
@@ -192,14 +215,21 @@ class _TrayBusTransport:
     def _setup(self) -> bool:
         self.is_kde = detect() == SessionKind.KDE
         if self.bus is not None and not self.bus.isConnected():
-            # Старое именованное соединение остаётся у QtDBus до выхода процесса.
+            if self.connections:
+                # К мёртвому соединению привязаны хуки получателя: его не разбираем,
+                # оно остаётся у QtDBus до выхода процесса, берём новое имя.
+                self.bus_name = None
+            elif self.bus_name is not None:
+                # Хуков не было — освобождаем имя и переподключаемся под ним же,
+                # иначе каждая неудачная попытка оставляла бы новое соединение.
+                QDBusConnection.disconnectFromBus(self.bus_name)
             self.bus = None
             self.connections.clear()
             self.matches.clear()
         if self.bus is None:
-            self.bus = QDBusConnection.connectToBus(
-                QDBusConnection.SessionBus, f"astra-voice-tray-{next(_bus_names)}"
-            )
+            if self.bus_name is None:
+                self.bus_name = f"astra-voice-tray-{next(_bus_names)}"
+            self.bus = QDBusConnection.connectToBus(QDBusConnection.SessionBus, self.bus_name)
         if not self.bus.isConnected():
             return False
         subscriptions: list[tuple[str, str, str, str, Callable[..., None]]] = [
@@ -264,6 +294,8 @@ def shutdown_bus_threads(timeout_ms: int = 1000) -> None:
     transport = _bus_transport
     if transport is None:
         return
+    # Затвор закрывается до join: после возврата демон уже не постит в Qt.
+    transport.close()
     if not transport.stopping:
         transport.stopping = True
         transport.commands.put(None)
@@ -539,10 +571,9 @@ class Tray(QObject):
         if self._setup_pending:
             return
         self._setup_pending = True
-        self._setup_deadline = monotonic() + 0.5
+        self._setup_deadline = monotonic() + _SETUP_FRESH_S
         _send_bus_command(self._bus_generation, "setup", None)
 
-    @pyqtSlot(int, str, object)
     def _bus_event(self, generation: int, event: str, payload: Any) -> None:
         if generation != self._bus_generation or not self._running:
             return
@@ -676,6 +707,8 @@ class Tray(QObject):
         if self._deadline is None:
             return
         if not self._subscriptions_ready:
+            if self._setup_pending and monotonic() > self._setup_deadline + _SETUP_STALE_S:
+                self._setup_pending = False
             self._setup_bus()
         elif not self._host_registered:
             self._query_host()

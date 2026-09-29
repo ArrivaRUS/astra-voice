@@ -7,6 +7,7 @@ import gc
 import os
 import resource
 import select
+import signal
 import subprocess
 import sys
 import threading
@@ -16,7 +17,7 @@ from time import monotonic, sleep
 
 from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEvent, QTimer
-from PyQt5.QtDBus import QDBusConnection
+from PyQt5.QtDBus import QDBusConnection, QDBusMessage
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication
 
@@ -52,17 +53,22 @@ def wait_for_subscriptions(tray: Tray, deadline: float) -> None:
     pump_until(lambda: tray._subscriptions_ready, deadline)
 
 
-def plasma_reply() -> None:
+def start_plasma_owner() -> subprocess.Popen[str]:
     owner = subprocess.Popen(
         [sys.executable, str(Path(__file__).with_name("tray_dbus_owner.py")), str(os.getpid())],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
+    assert owner.stdout is not None
+    ready, _, _ = select.select([owner.stdout], [], [], 5)
+    assert ready and owner.stdout.readline().strip() == "PLASMA_OWNER_READY"
+    return owner
+
+
+def plasma_reply() -> None:
+    owner = start_plasma_owner()
     try:
-        assert owner.stdout is not None
-        ready, _, _ = select.select([owner.stdout], [], [], 5)
-        assert ready and owner.stdout.readline().strip() == "PLASMA_OWNER_READY"
         global _exit_app
         app = QApplication([])
         _exit_app = app
@@ -207,6 +213,38 @@ def exit_after_stop() -> None:
     sys.exit(0)
 
 
+def exit_while_call_blocked() -> None:
+    """Выход с живым QApplication, пока демон висит в вызове к остановленному владельцу."""
+    global _exit_app
+    owner = start_plasma_owner()
+    stopped = False
+    try:
+        _exit_app = QApplication([])
+        # Останавливаем только своего потомка по точному pid: Ping не получит ответа.
+        os.kill(owner.pid, signal.SIGSTOP)
+        stopped = True
+        generation = 1
+        tray_module._send_bus_command(generation, "setup", None)
+        ping = QDBusMessage.createMethodCall(
+            "org.kde.plasmashell", "/", "org.freedesktop.DBus.Peer", "Ping"
+        )
+        for serial in range(6):
+            tray_module._send_bus_command(generation, "request", (serial, ping))
+        sleep(0.2)
+        tray_module.shutdown_bus_threads()
+        transport = tray_module._bus_transport
+        assert transport is not None and transport.thread.is_alive(), "демон не висел в вызове"
+        # Сдвиг выхода относительно запоздалых ответов демона (0,5 с на вызов).
+        sleep(float(os.environ.get("ASTRA_VOICE_TRAY_EXIT_DELAY", "0")))
+    finally:
+        if stopped:
+            os.kill(owner.pid, signal.SIGCONT)
+        owner.kill()
+        owner.communicate(timeout=3)
+    # Разрушение QApplication при выходе интерпретатора — под сторожем.
+    faulthandler.dump_traceback_later(10, exit=True)
+
+
 def main() -> int:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     faulthandler.enable()
@@ -218,21 +256,23 @@ def main() -> int:
     address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
     assert address and address != "unix:path=/nonexistent", "нужна изолированная сессионная шина"
     scenario = sys.argv[1]
+    scenarios: dict[str, Callable[[], None]] = {
+        "plasma_reply": plasma_reply,
+        "invariants": invariants,
+        "thread_cleanup": thread_cleanup,
+        "exit_after_stop": exit_after_stop,
+        "exit_while_call_blocked": exit_while_call_blocked,
+    }
     try:
-        if scenario == "plasma_reply":
-            plasma_reply()
-        elif scenario == "invariants":
-            invariants()
-        elif scenario == "thread_cleanup":
-            thread_cleanup()
-        elif scenario == "exit_after_stop":
-            exit_after_stop()
-        else:
-            raise ValueError(scenario)
-        print(f"TRAY_DBUS_OK:{scenario}", flush=True)
-        return 0
-    finally:
+        scenarios[scenario]()
+    except BaseException:
         faulthandler.cancel_dump_traceback_later()
+        raise
+    print(f"TRAY_DBUS_OK:{scenario}", flush=True)
+    # Сценарий выхода оставляет сторож взведённым до конца разрушения QApplication.
+    if scenario != "exit_while_call_blocked":
+        faulthandler.cancel_dump_traceback_later()
+    return 0
 
 
 if __name__ == "__main__":
