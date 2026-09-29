@@ -33,10 +33,13 @@ from astra_voice.worker.audio import (
     REASON_MOVED,
     REASON_REMOVED,
     U32_MAX,
+    AudioApiUnavailable,
     AudioDevice,
     AudioError,
     DeviceChange,
     FreshDevices,
+    ManagedSource,
+    PulseSimpleSource,
     _OpenDeadline,
     _PaBufferAttr,
     _PaSampleSpec,
@@ -111,7 +114,7 @@ class _PulseAsync:
             self._declare()
         except (OSError, AttributeError) as exc:
             # AttributeError — в библиотеке нет нужного символа (старая или чужая сборка).
-            raise AudioError(ERROR_FAILED, "Звуковая подсистема недоступна.") from exc
+            raise AudioApiUnavailable(ERROR_FAILED, "Звуковая подсистема недоступна.") from exc
 
     def _declare(self) -> None:
         """Объявляет argtypes/restype; отсутствие символа даёт AttributeError."""
@@ -941,6 +944,82 @@ class PulseStreamSource:
         self._selected_device = None
         self.device_label = None
         self._default_mode = False
+
+
+class StreamWithFallback:
+    """pa_stream по умолчанию; один раз уходит на simple, если нет libpulse или символа.
+
+    Ошибки микрофона (занят, нет устройства, сбой службы) не маскируются:
+    откат только на AudioApiUnavailable, остальное идёт владельцу как есть.
+    """
+
+    def __init__(
+        self,
+        primary: ManagedSource | None = None,
+        fallback: Callable[[], ManagedSource] = PulseSimpleSource,
+    ) -> None:
+        self._active: ManagedSource = primary if primary is not None else PulseStreamSource()
+        self._fallback: Callable[[], ManagedSource] | None = fallback
+
+    def open(
+        self,
+        device: str | None,
+        *,
+        deadline: _OpenDeadline | None = None,
+        running: threading.Event | None = None,
+    ) -> None:
+        try:
+            self._active.open(device, deadline=deadline, running=running)
+        except AudioApiUnavailable:
+            fallback = self._fallback
+            if fallback is None:
+                raise
+            self._fallback = None
+            logger.warning(
+                "Бэкенд записи stream недоступен (нет libpulse или символа); выбран simple."
+            )
+            self._active.close()
+            self._active = fallback()
+            self._active.open(device, deadline=deadline, running=running)
+
+    def read_chunk(self) -> bytes | None:
+        return self._active.read_chunk()
+
+    def flush(self) -> None:
+        self._active.flush()
+
+    def close(self) -> None:
+        self._active.close()
+
+    @property
+    def is_open(self) -> bool:
+        return self._active.is_open
+
+    @property
+    def ended(self) -> bool:
+        return self._active.ended
+
+    @property
+    def live(self) -> bool:
+        return self._active.live
+
+    @property
+    def device_name(self) -> str | None:
+        return self._active.device_name
+
+    @property
+    def selected_device(self) -> AudioDevice | None:
+        return self._active.selected_device
+
+    @property
+    def device_label(self) -> str | None:
+        label = getattr(self._active, "device_label", None)
+        return label if isinstance(label, str) else None
+
+    @property
+    def device_change(self) -> DeviceChange | None:
+        change = getattr(self._active, "device_change", None)
+        return change if isinstance(change, DeviceChange) else None
 
 
 def _probe_seconds(value: str) -> float:

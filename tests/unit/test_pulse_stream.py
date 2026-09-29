@@ -1223,3 +1223,91 @@ def test_change_reported_when_stop_races_remove(cancel: bool) -> None:
     else:
         changed.assert_called_once_with("race", audio.KIND_DEVICE_LOST, None)
     assert not source.is_open
+
+
+def _unavailable_primary() -> ps.PulseStreamSource:
+    """Настоящий источник, у которого загрузка libpulse заканчивается отказом API."""
+    return ps.PulseStreamSource(
+        pulse_factory=ps._PulseAsync,
+        devices=lambda: [MIC],
+        default=lambda *_args, **_kwargs: MIC,
+    )
+
+
+@pytest.mark.parametrize("broken", ["no-library", "no-symbol"])
+def test_fallback_to_simple_when_api_unavailable(
+    broken: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Нет libpulse или символа — один WARNING и запись идёт через simple."""
+    if broken == "no-library":
+        monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=OSError("нет библиотеки")))
+    else:
+        monkeypatch.setattr(ctypes, "CDLL", Mock(return_value=Mock(spec=[])))
+    simple = Mock(spec=audio.PulseSimpleSource)
+    simple.read_chunk.return_value = b"\0" * audio.CHUNK_BYTES
+    factory = Mock(return_value=simple)
+    source = ps.StreamWithFallback(_unavailable_primary(), fallback=factory)
+    running = threading.Event()
+    running.set()
+    with caplog.at_level("WARNING", logger=ps.__name__):
+        source.open(MIC.name, running=running)
+        source.open(MIC.name, running=running)
+    factory.assert_called_once_with()
+    assert simple.open.call_count == 2
+    simple.open.assert_called_with(MIC.name, deadline=None, running=running)
+    assert source.read_chunk() == b"\0" * audio.CHUNK_BYTES
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == [
+        "Бэкенд записи stream недоступен (нет libpulse или символа); выбран simple."
+    ]
+
+
+def test_fallback_happens_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Если и запасной путь сообщает об отказе API, повторного отката нет."""
+    monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=OSError("нет библиотеки")))
+    simple = Mock(spec=audio.PulseSimpleSource)
+    simple.open.side_effect = audio.AudioApiUnavailable(audio.ERROR_FAILED, "нет")
+    factory = Mock(return_value=simple)
+    source = ps.StreamWithFallback(_unavailable_primary(), fallback=factory)
+    with caplog.at_level("WARNING", logger=ps.__name__):
+        for _ in range(2):
+            with pytest.raises(audio.AudioApiUnavailable):
+                source.open(MIC.name)
+    factory.assert_called_once_with()
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+
+
+@pytest.mark.parametrize("code", [audio.ERROR_BUSY, audio.ERROR_NO_DEVICE, audio.ERROR_FAILED])
+def test_microphone_errors_are_not_masked(code: str, caplog: pytest.LogCaptureFixture) -> None:
+    """Обычная ошибка микрофона идёт владельцу как есть, simple не подставляется."""
+    primary = Mock(spec=ps.PulseStreamSource)
+    primary.open.side_effect = audio.AudioError(code, "Микрофон занят другой программой.")
+    factory = Mock()
+    source = ps.StreamWithFallback(primary, fallback=factory)
+    with caplog.at_level("WARNING", logger=ps.__name__):
+        with pytest.raises(audio.AudioError) as exc:
+            source.open(MIC.name)
+    assert exc.value.code == code
+    assert not isinstance(exc.value, audio.AudioApiUnavailable)
+    factory.assert_not_called()
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_fallback_wrapper_delegates_to_stream() -> None:
+    """Без отказа API обёртка прозрачна: устройство, метка и закрытие — у pa_stream."""
+    pulse = FakePulse()
+    source = ps.StreamWithFallback(source_for(pulse), fallback=Mock(side_effect=AssertionError))
+    assert isinstance(source, audio.ManagedSource)
+    assert not source.is_open
+    source.open(MIC.name)
+    assert source.is_open
+    assert source.selected_device == MIC
+    assert source.device_name == MIC.name
+    assert source.device_label == MIC.label
+    assert source.device_change is None
+    assert source.live and not source.ended
+    source.close()
+    assert not source.is_open
+    assert source.device_label is None

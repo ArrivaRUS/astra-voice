@@ -79,6 +79,10 @@ class AudioError(Exception):
         self.message: str = message
 
 
+class AudioApiUnavailable(AudioError):
+    """Нет нужной библиотеки звука или символа в ней; ошибка микрофона сюда не относится."""
+
+
 class CaptureStopTimeout(RuntimeError):
     """Поток захвата не вышел после отмены; источник нельзя закрывать извне."""
 
