@@ -873,3 +873,12 @@ ma-foundation → слияние ma-foundation → rebase r2-ci. **05–06.10:**
 **Беклог правок:** P2 — докачка моделей M6 на urllib3 2.8 (бандл AppImage: обрыв → host-unreachable вместо short-read);
 P2 — moveToThread в model_downloads (теоретически); P3 из #12 (край: _selfcheck не failed при невозможном откате);
 T-163…T-174 перенести из arch/appimage.md в test-plan; тексты S5-A5 «Сейчас используется» (вопрос PM, не блокирует).
+
+## 2026-09-29 ~14:30 — M7 слит, AppImage на правках
+- PR #13 (M7 net/http) слит squash `c95c1f5`; worktree `wt-m7` убран, ветка удалена.
+- Следующий шаг M7 (Claude developer, `wt-m7b`, `wip/m7-checker`): `net/github.py`, `updates/checker.py` (только программа,
+  один UpdateCache на процесс), T-116. `core/policy.py` полный — ПОСЛЕ слияния ma-foundation (четверг), чтобы не конфликтовать.
+- AppImage шаг 1: ревью REQUEST CHANGES (P2 запрет appimage=deny), решение в `decisions/log.md`; правки — Claude developer в `wt-ma`.
+- Беклог мелочей: тест «None-timeout ограничен общим дедлайном» и тест на CHECK_CONNECT_TIMEOUT_S (ревью bdbf82c, minor);
+  AppImage — TryExec дважды при нескольких Exec, лимит чтения `_menu_state`, `AutostartState.target compare=False`,
+  `require_available()` не подключён (гейт `check_bundle.py`), текст кнопки «Использовать системную версию» про повторный запуск файла.
