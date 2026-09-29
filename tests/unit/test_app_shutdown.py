@@ -189,6 +189,38 @@ def test_shutdown_once_before_other_cleanup(rig: Rig) -> None:
     ]
 
 
+def test_update_checker_started_and_stopped_before_runtime(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M7: проверка обновлений стартует после окна и останавливается до диктовки."""
+    pytest.importorskip("requests")
+    from astra_voice.updates import checker as checker_mod
+
+    checker = Mock()
+    factory = Mock(return_value=checker)
+    monkeypatch.setattr(checker_mod, "create_app_checker", factory)
+    rig.calls.attach_mock(checker.start, "checker_start")
+    rig.calls.attach_mock(checker.stop, "checker_stop")
+    assert app_mod.main([]) == 7
+    factory.assert_called_once()
+    assert factory.call_args.args[1] == Policy()
+    names = [entry[0] for entry in rig.calls.mock_calls]
+    assert names.index("checker_start") < names.index("exec")
+    assert names.index("focuser_stop") < names.index("checker_stop") < names.index("shutdown")
+    assert callable(checker.on_event)
+
+
+def test_update_checker_failure_does_not_stop_app(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("requests")
+    from astra_voice.updates import checker as checker_mod
+
+    monkeypatch.setattr(checker_mod, "create_app_checker", Mock(side_effect=OSError("нет")))
+    assert app_mod.main([]) == 7
+    rig.runtime.shutdown.assert_called_once()
+
+
 @pytest.mark.parametrize("error", [StoreError("broken-store"), OSError("Хранилище недоступно")])
 def test_model_store_failure_keeps_runtime_and_event_loop_running(
     rig: Rig,
