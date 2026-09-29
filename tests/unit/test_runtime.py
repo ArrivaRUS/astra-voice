@@ -2138,6 +2138,11 @@ def feed(rig: Rig, batches: list[Any], *events: object) -> None:
     rig.runtime._process_hotkey()
 
 
+def runtime_timer(rig: Rig, timer: object) -> FakeTimer:
+    """FakeTimer, который runtime хранит под типом QTimer."""
+    return next(fake for fake in rig.timers if fake is timer)
+
+
 @pytest.mark.parametrize("code", ["not-grabbed", "busy", "bad-combo"])
 def test_mapping_regrab_failure_warns_sets_nokey_and_retries(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, code: ResultCode
@@ -2146,25 +2151,29 @@ def test_mapping_regrab_failure_warns_sets_nokey_and_retries(
     rig, hotkey, backend, batches = mapping_rig(monkeypatch)
     with caplog.at_level(logging.DEBUG, logger=module.__name__):
         feed(rig, batches, mapping(code))
-        # Повторный отказ той же потери: тот же таймер, DEBUG, без второго уведомления.
+        # Повторный отказ той же потери: тот же таймер, DEBUG.
         feed(rig, batches, mapping(code))
     message = f"Горячая клавиша потеряна после смены раскладки ({code}), повтор каждые 30 с"
     levels = [r.levelno for r in caplog.records if r.getMessage() == message]
     assert levels == [logging.WARNING, logging.DEBUG]
     rig.tray.set_state.assert_called_with(TrayState.NOKEY)
-    timer = rig.timers[-1]
-    assert rig.runtime._regrab_timer is timer
+    timer = runtime_timer(rig, rig.runtime._regrab_timer)
     assert timer.active and timer.interval == module.REGRAB_INTERVAL_MS
+    # Всплывающее уведомление ждёт 5 с; одно на потерю.
+    notice = runtime_timer(rig, rig.runtime._lost_notice_timer)
+    assert notice.single_shot and notice.interval == module.HOTKEY_LOST_NOTICE_DELAY_MS
+    assert not rig.notify.mock_calls
+    rig.now += 5
+    notice.fire()
+    assert notice.deleted and rig.runtime._lost_notice_timer is None
     # busy — «занята другой программой», прочие коды — простой текст без кодов.
     if code == "busy":
-        rig.notify.notify_hotkey_not_grabbed.assert_called_once_with("Ctrl+Space")
-        rig.notify.notify_hotkey_lost.assert_not_called()
+        assert rig.notify.mock_calls == [call.notify_hotkey_not_grabbed("Ctrl+Space")]
     else:
-        rig.notify.notify_hotkey_lost.assert_called_once_with()
-        rig.notify.notify_hotkey_not_grabbed.assert_not_called()
+        assert rig.notify.mock_calls == [call.notify_hotkey_lost()]
     # Тик таймера восстанавливает захват тем же grab(), без duplicate.
     backend.grab_combo.reset_mock()
-    rig.now += 30
+    rig.now += 25
     timer.fire()
     backend.grab_combo.assert_called_once_with("Ctrl+Space")
     assert rig.runtime._regrab_timer is None
@@ -2175,26 +2184,37 @@ def test_mapping_regrab_failure_warns_sets_nokey_and_retries(
     assert "record.start" in rig.trace
 
 
-@pytest.mark.parametrize(("lost_s", "announced"), [(2.0, False), (6.0, True)])
+@pytest.mark.parametrize("lost_s", [2.0, 6.0])
 def test_mapping_regrab_ok_while_waiting_restores_and_stops_timer(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    lost_s: float,
-    announced: bool,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, lost_s: float
 ) -> None:
     rig, hotkey, backend, batches = mapping_rig(monkeypatch)
     feed(rig, batches, mapping("not-grabbed"))
-    timer = rig.timers[-1]
-    assert rig.runtime._regrab_timer is timer
-    rig.now += lost_s
+    timer = runtime_timer(rig, rig.runtime._regrab_timer)
+    notice = runtime_timer(rig, rig.runtime._lost_notice_timer)
+    if lost_s >= 5:
+        rig.now += 5
+        notice.fire()
+        rig.now += lost_s - 5
+    else:
+        rig.now += lost_s
     with caplog.at_level(logging.INFO, logger=module.__name__):
         caplog.clear()
         feed(rig, batches, mapping_ok())
     assert rig.runtime._regrab_timer is None
     assert timer.deleted and not timer.active
+    assert notice.deleted and not notice.active and rig.runtime._lost_notice_timer is None
     rig.tray.set_state.assert_called_with(TrayState.IDLE)
-    # Короткая потеря (< 5 с) не даёт второго уведомления «снова работает».
-    assert rig.notify.notify_hotkey_regrabbed.call_count == int(announced)
+    if lost_s < 5:
+        # Вернулся за 2 с — ни «потеряна», ни «снова работает».
+        assert not rig.notify.mock_calls
+        notice.fire()
+        assert not rig.notify.mock_calls
+    else:
+        assert rig.notify.mock_calls == [
+            call.notify_hotkey_lost(),
+            call.notify_hotkey_regrabbed("Ctrl+Space"),
+        ]
     assert [r.getMessage() for r in caplog.records if r.name == module.__name__] == [
         "Горячая клавиша снова захвачена после смены раскладки: Ctrl+Space"
     ]
@@ -2207,11 +2227,17 @@ def test_mapping_regrab_ok_while_waiting_restores_and_stops_timer(
     assert_phase(rig.runtime, DictationPhase.RECORDING)
 
 
+def lose_and_wait(rig: Rig, batches: list[Any], code: ResultCode = "not-grabbed") -> None:
+    feed(rig, batches, mapping(code))
+    rig.now += 5
+    runtime_timer(rig, rig.runtime._lost_notice_timer).fire()
+
+
 def test_mapping_lost_notification_is_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:
     """«Потеряна» — не чаще раза в 60 с; «снова работает» — только для объявленной потери."""
     rig, hotkey, backend, batches = mapping_rig(monkeypatch)
-    feed(rig, batches, mapping("not-grabbed"))
-    rig.now += 6
+    lose_and_wait(rig, batches)
+    rig.now += 1
     feed(rig, batches, mapping_ok())
     assert rig.notify.mock_calls == [
         call.notify_hotkey_lost(),
@@ -2219,14 +2245,35 @@ def test_mapping_lost_notification_is_rate_limited(monkeypatch: pytest.MonkeyPat
     ]
     rig.notify.reset_mock()
     rig.now += 10
-    feed(rig, batches, mapping("not-grabbed"))
+    lose_and_wait(rig, batches)
     rig.now += 10
     feed(rig, batches, mapping_ok())
     assert not rig.notify.mock_calls
     assert rig.runtime._regrab_timer is None
     rig.now += 60
-    feed(rig, batches, mapping("busy"))
+    lose_and_wait(rig, batches, "busy")
     assert rig.notify.mock_calls == [call.notify_hotkey_not_grabbed("Ctrl+Space")]
+
+
+@pytest.mark.parametrize("stop", ["shutdown", "apply_hotkey"])
+def test_mapping_lost_notice_is_cancelled_by_shutdown_or_new_hotkey(
+    monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    feed(rig, batches, mapping("not-grabbed"))
+    notice = runtime_timer(rig, rig.runtime._lost_notice_timer)
+    rig.now += 2
+    if stop == "shutdown":
+        rig.runtime.shutdown()
+    else:
+        rig.runtime.apply_hotkey("Ctrl+Shift+Space", "ptt")
+    assert notice.deleted and not notice.active
+    assert rig.runtime._lost_notice_timer is None
+    rig.now += 10
+    notice.fire()
+    rig.runtime._announce_hotkey_lost()  # Уже доставленный сигнал после удаления безопасен.
+    rig.notify.notify_hotkey_lost.assert_not_called()
+    rig.notify.notify_hotkey_not_grabbed.assert_not_called()
 
 
 def test_mapping_lost_during_ptt_recording_stops_and_recognizes(
@@ -2265,7 +2312,7 @@ def test_mapping_lost_during_toggle_recording_ends_with_next_press(
     assert_phase(rig.runtime, DictationPhase.RECORDING)
     assert "record.stop" not in rig.trace
     rig.now += 30
-    rig.timers[-1].fire()
+    runtime_timer(rig, rig.runtime._regrab_timer).fire()
     assert rig.runtime._regrab_timer is None
     assert hotkey.fsm.state is HotkeyState.RECORDING
     feed(rig, batches, HotkeyEvent("KeyPress", 65, 2000, mods=4))

@@ -100,7 +100,8 @@ PENDING_SWITCH_TIMEOUT_S = RECORD_LIMIT_S + SWITCH_TIMEOUT_S
 REGRAB_INTERVAL_MS = 30000
 # «Горячая клавиша потеряна» — не чаще раза в минуту; «снова работает» — после потери ≥ 5 с.
 HOTKEY_LOST_NOTIFY_INTERVAL_S = 60.0
-HOTKEY_REGRABBED_NOTIFY_MIN_S = 5.0
+# Уведомление о потере ждёт 5 с: вернувшийся за это время захват не беспокоит вовсе.
+HOTKEY_LOST_NOTICE_DELAY_MS = 5000
 _NOTIFICATION_ACTIONS = (ACTION_CHOOSE_HOTKEY, ACTION_SHOW_DETAILS, ACTION_CHOOSE_MICROPHONE)
 
 
@@ -224,6 +225,8 @@ class DictationRuntime(QObject):
         self._hotkey_lost_at: float | None = None
         self._hotkey_lost_notified_at: float | None = None
         self._hotkey_lost_announced = False
+        self._hotkey_lost_code = ""
+        self._lost_notice_timer: QTimer | None = None
         self._regrab_target: tuple[str, str] | None = None
         self.timers: set[QTimer] = set()
         rollback: list[tuple[str, Callable[[], object]]] = [
@@ -1229,12 +1232,12 @@ class DictationRuntime(QObject):
     def _on_mapping_regrab(self, reason: str) -> None:
         """Итог перезахвата после смены раскладки: отказ не должен пройти молча.
 
-        Неудача → WARNING (повторы той же потери — DEBUG), трей «нет клавиши»,
-        уведомление не чаще раза в минуту и штатный повтор захвата по таймеру.
-        Запись с удержанием останавливается сразу: отпускания уже не будет,
-        а сказанное распознаётся как при обычном отпускании. Успех, пока таймер
-        ждёт, — восстановление; «снова работает» — только после объявленной
-        потери длительностью ≥ 5 с.
+        Неудача → сразу WARNING (повторы той же потери — DEBUG), трей «нет
+        клавиши» и штатный повтор захвата по таймеру; запись с удержанием
+        останавливается (отпускания уже не будет, сказанное распознаётся).
+        Всплывающее «потеряна» откладывается на 5 с и не чаще раза в минуту.
+        Успех, пока таймер ждёт, — восстановление; «снова работает» — только
+        если о потере было объявлено.
         """
         if self._closed:
             return
@@ -1248,38 +1251,60 @@ class DictationRuntime(QObject):
                 code,
                 REGRAB_INTERVAL_MS // 1000,
             )
-            if self._hotkey_lost_at is None:
-                self._hotkey_lost_at = now
-                self._hotkey_lost_announced = False
+            self._hotkey_lost_code = code
             fsm = self.hotkey.fsm
             if fsm.state == HotkeyState.RECORDING and fsm.mode == HotkeyMode.PTT:
                 log.info("хоткей: запись остановлена: горячая клавиша потеряна")
                 fsm.stop(now, "mapping-lost")
             self.tray.set_state(TrayState.NOKEY)
             self._start_regrab(code)
-            last = self._hotkey_lost_notified_at
-            if not already and (last is None or now - last >= HOTKEY_LOST_NOTIFY_INTERVAL_S):
-                self._hotkey_lost_notified_at = now
-                self._hotkey_lost_announced = True
-                if code == "busy":
-                    notify.notify_hotkey_not_grabbed(self.settings.hotkey)
-                else:
-                    notify.notify_hotkey_lost()
+            if self._hotkey_lost_at is None:
+                # После _start_regrab: его _stop_regrab сбрасывает прежнюю потерю.
+                self._hotkey_lost_at = now
+                self._hotkey_lost_announced = False
+                self._schedule_lost_notice()
             return
         if self._regrab_timer is None:
             return
-        lost_at, self._hotkey_lost_at = self._hotkey_lost_at, None
+        announced = self._hotkey_lost_announced
         self._stop_regrab()
         if self.orchestrator.phase == DictationPhase.IDLE and self._selfcheck != "failed":
             self.tray.set_state(TrayState.IDLE)
-        # «Снова работает» — только для объявленной потери дольше 5 с.
-        if (
-            self._hotkey_lost_announced
-            and lost_at is not None
-            and now - lost_at >= HOTKEY_REGRABBED_NOTIFY_MIN_S
-        ):
+        if announced:
             notify.notify_hotkey_regrabbed(self.settings.hotkey)
         log.info("Горячая клавиша снова захвачена после смены раскладки: %s", self.settings.hotkey)
+
+    def _schedule_lost_notice(self) -> None:
+        """Однократный таймер GUI-потока перед уведомлением о потере захвата."""
+        if self._closed or self._lost_notice_timer is not None:
+            return
+        timer = self._create_timer()
+        self._lost_notice_timer = timer
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._announce_hotkey_lost)
+        timer.start(HOTKEY_LOST_NOTICE_DELAY_MS)
+
+    def _cancel_lost_notice(self) -> None:
+        timer, self._lost_notice_timer = self._lost_notice_timer, None
+        if timer is not None:
+            self._cleanup("остановка таймера уведомления о хоткее", timer.stop)
+            self._cleanup("удаление таймера уведомления о хоткее", timer.deleteLater)
+
+    def _announce_hotkey_lost(self) -> None:
+        """Захват не вернулся за 5 с: «потеряна», но не чаще раза в минуту."""
+        self._cancel_lost_notice()
+        if self._closed or self._hotkey_lost_at is None:
+            return
+        now = monotonic()
+        last = self._hotkey_lost_notified_at
+        if last is not None and now - last < HOTKEY_LOST_NOTIFY_INTERVAL_S:
+            return
+        self._hotkey_lost_notified_at = now
+        self._hotkey_lost_announced = True
+        if self._hotkey_lost_code == "busy":
+            notify.notify_hotkey_not_grabbed(self.settings.hotkey)
+        else:
+            notify.notify_hotkey_lost()
 
     def _start_regrab(self, code: str) -> None:
         """Повторяет захват; новая настройка начинает собственный отсчёт попыток."""
@@ -1302,6 +1327,10 @@ class DictationRuntime(QObject):
         """Отменяет повтор и освобождает таймер."""
         timer, self._regrab_timer = self._regrab_timer, None
         self._regrab_target = None
+        # Повтор закончен (возврат, смена хоткея, выход): отложенное «потеряна» не нужно.
+        self._cancel_lost_notice()
+        self._hotkey_lost_at = None
+        self._hotkey_lost_announced = False
         if timer is not None:
             self._cleanup("остановка таймера перезахвата", timer.stop)
             self._cleanup("удаление таймера перезахвата", timer.deleteLater)
@@ -1313,11 +1342,13 @@ class DictationRuntime(QObject):
         self._regrab_attempts += 1
         result = self._grab_hotkey()
         if result.ok:
+            # Потеря после смены раскладки без объявления — без «снова работает».
+            silent = self._hotkey_lost_at is not None and not self._hotkey_lost_announced
             self._stop_regrab()
-            self._hotkey_lost_at = None
             if self.orchestrator.phase == DictationPhase.IDLE and self._selfcheck != "failed":
                 self.tray.set_state(TrayState.IDLE)
-            notify.notify_hotkey_regrabbed(self.settings.hotkey)
+            if not silent:
+                notify.notify_hotkey_regrabbed(self.settings.hotkey)
             log.info("Горячая клавиша снова захвачена: %s", self.settings.hotkey)
             self._record_hotkey_grab("regrabbed", self._regrab_attempts)
         elif result.code != self._regrab_code:
