@@ -468,7 +468,11 @@ def _make_about_bridge(runtime: DictationRuntime | None) -> Any | None:
     try:
         from astra_voice.ui.about_bridge import AboutBridge
 
-        return AboutBridge(stats=runtime.stats if runtime is not None else None)
+        bridge = AboutBridge(stats=runtime.stats if runtime is not None else None)
+        if runtime is not None:
+            # Статистика и мост живут в GUI-потоке: слушатель вызывается там же.
+            runtime.stats.on_append = bridge.on_stats_event
+        return bridge
     except Exception:  # noqa: BLE001 — сведения о программе не должны мешать окну
         log.warning("Не удалось подготовить раздел «О программе»", exc_info=True)
         return None
@@ -1138,8 +1142,17 @@ def main(argv: list[str] | None = None) -> int:
             QQmlEngine.setObjectOwnership(updates_bridge, QQmlEngine.CppOwnership)
             _set_context_property(shell, "updatesBridge", updates_bridge)
             if about_bridge is not None:
-                # Даты попытки и успеха проверки в «О программе» идут за строкой-статусом.
-                updates_bridge.statusChanged.connect(about_bridge.refresh_updates)
+                # Даты попытки и успеха в «О программе» перечитываются после каждого
+                # снимка проверки — и при повторной неудаче, когда строка-статус не
+                # меняется. Снимок приходит из рабочего потока: в GUI — очередью.
+                forward = checker.on_status
+
+                def post_status_and_dates(status: Any) -> None:
+                    if forward is not None:
+                        forward(status)
+                    gui_calls.post(about_bridge.refresh_updates)
+
+                checker.on_status = post_status_and_dates
             if runtime_ready and runtime is not None:
 
                 def show_network() -> None:

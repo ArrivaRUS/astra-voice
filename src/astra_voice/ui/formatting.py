@@ -4,7 +4,27 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
+
+
+def format_moment(timestamp: float | None, now: float) -> str:
+    """«сегодня в 14:05» / «07.09.2026 в 14:05»; нет даты или она негодная — пусто.
+
+    Метка приходит из файла состояния: слишком большое или отрицательное
+    значение не должно ронять окно (ValueError / OverflowError / OSError).
+    """
+    if timestamp is None:
+        return ""
+    try:
+        moment = datetime.fromtimestamp(timestamp)
+        today = datetime.fromtimestamp(now).date()
+    except (ValueError, OverflowError, OSError):
+        return ""
+    clock = moment.strftime("%H:%M")
+    if moment.date() == today:
+        return f"сегодня в {clock}"
+    return f"{moment.strftime('%d.%m.%Y')} в {clock}"
 
 
 def clean_display_name(text: str, *, limit: int = 80, for_menu: bool = False) -> str:

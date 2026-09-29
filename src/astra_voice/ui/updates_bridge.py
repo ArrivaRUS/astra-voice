@@ -18,13 +18,13 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
 
 from PyQt5.QtCore import QObject, pyqtProperty, pyqtSignal, pyqtSlot
 
 from astra_voice.core.version import __version__
 from astra_voice.net.github import RELEASE_URL_PREFIX, parse_semver
+from astra_voice.ui.formatting import format_moment
 
 if TYPE_CHECKING:
     from astra_voice.net.gate import NetworkKind
@@ -101,13 +101,8 @@ def display_notes(text: str) -> list[dict[str, object]]:
 
 def checked_text(timestamp: float | None, now: float) -> str:
     """«Проверено сегодня в 14:02» / «Проверено 07.09.2026 в 14:02»; нет даты — пусто."""
-    if timestamp is None:
-        return ""
-    moment = datetime.fromtimestamp(timestamp)
-    clock = moment.strftime("%H:%M")
-    if moment.date() == datetime.fromtimestamp(now).date():
-        return f"Проверено сегодня в {clock}"
-    return f"Проверено {moment.strftime('%d.%m.%Y')} в {clock}"
+    moment = format_moment(timestamp, now)
+    return f"Проверено {moment}" if moment else ""
 
 
 class UpdatesBridge(QObject):

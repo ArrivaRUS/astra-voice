@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 import os
 import platform
 import time
@@ -26,12 +27,20 @@ from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from PyQt5.QtCore import PYQT_VERSION_STR, QObject, QUrl, pyqtProperty, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import (
+    PYQT_VERSION_STR,
+    QObject,
+    QUrl,
+    pyqtProperty,
+    pyqtSignal,
+    pyqtSlot,
+    qVersion,
+)
 from PyQt5.QtGui import QDesktopServices
 
 from astra_voice.core import paths
 from astra_voice.core.version import __version__
-from astra_voice.ui.formatting import format_size
+from astra_voice.ui.formatting import format_moment, format_size
 
 if TYPE_CHECKING:
     from astra_voice.core.stats import Summary
@@ -39,10 +48,12 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-#: Где пакет кладёт документы (packaging/debian/rules, DOCDIR).
-INSTALL_DOC_DIR = Path("/usr/share/doc/astra-voice")
+#: Подкаталог ресурсов с копиями NOTICE и PRIVACY.md (packaging/debian/rules).
+#: Не /usr/share/doc: программа не должна от него зависеть (Debian Policy 12.3),
+#: и dh_compress может сжать там файлы в .gz.
+RESOURCE_DOCS = "docs"
 #: Текст GPL-3 в установленной системе: LICENSE в пакет не кладётся, лицензия
-#: та же (debian/copyright ссылается на этот файл).
+#: та же (debian/copyright ссылается на этот файл; его ставит base-files).
 SYSTEM_GPL3 = Path("/usr/share/common-licenses/GPL-3")
 
 DOC_LICENSE = "license"
@@ -59,18 +70,23 @@ class StatsPort(Protocol):
 
 
 def doc_paths(resources: Path | None = None) -> dict[str, Path]:
-    """Документы программы: в пакете — /usr/share/doc, в исходниках — корень репо."""
+    """Документы программы от корня ресурсов.
+
+    Исходники (есть ``src/astra_voice``) — ``LICENSE``, ``NOTICE`` и
+    ``docs/PRIVACY.md`` репозитория. Пакет (и распакованное дерево смоука) —
+    копии в ``<ресурсы>/docs/`` и системный текст GPL-3.
+    """
     root = paths.resource_root() if resources is None else resources
-    if root == paths.INSTALL_SHARE_DIR:
+    if (root / "src" / "astra_voice").is_dir():
         return {
-            DOC_LICENSE: SYSTEM_GPL3,
-            DOC_NOTICE: INSTALL_DOC_DIR / "NOTICE",
-            DOC_PRIVACY: INSTALL_DOC_DIR / "PRIVACY.md",
+            DOC_LICENSE: root / "LICENSE",
+            DOC_NOTICE: root / "NOTICE",
+            DOC_PRIVACY: root / "docs" / "PRIVACY.md",
         }
     return {
-        DOC_LICENSE: root / "LICENSE",
-        DOC_NOTICE: root / "NOTICE",
-        DOC_PRIVACY: root / "docs" / "PRIVACY.md",
+        DOC_LICENSE: SYSTEM_GPL3,
+        DOC_NOTICE: root / RESOURCE_DOCS / "NOTICE",
+        DOC_PRIVACY: root / RESOURCE_DOCS / "PRIVACY.md",
     }
 
 
@@ -116,6 +132,24 @@ def folder_size(path: Path) -> int:
     return total
 
 
+def disk_size(size_bytes: int) -> str:
+    """«12 КБ», «2,1 МБ», «680 МБ» — мелкие каталоги (журналы) без «0 МБ»."""
+    if size_bytes < 1_000_000:
+        return f"{math.ceil(size_bytes / 1000)} КБ"
+    if size_bytes < 10_000_000:
+        return f"{size_bytes / 1_000_000:.1f}".replace(".", ",") + " МБ"
+    return format_size(size_bytes)
+
+
+def _size_text(path: Path) -> str:
+    """Размер каталога для строки; ошибка — пусто."""
+    try:
+        return disk_size(folder_size(path))
+    except (OSError, ValueError):
+        log.debug("Не удалось посчитать размер каталога")
+        return ""
+
+
 def plural(count: int, one: str, few: str, many: str) -> str:
     """Русское согласование: 1 диктовка, 2 диктовки, 5 диктовок."""
     tail = count % 100
@@ -144,17 +178,6 @@ def stats_text(summary: Summary) -> str:
         parts.append(f"обычно {_seconds(p50)}, в худших случаях {_seconds(p95)}")
     parts.append(f"{count} {plural(count, 'диктовка', 'диктовки', 'диктовок')}")
     return " · ".join(parts)
-
-
-def moment_text(timestamp: float | None, now: float) -> str:
-    """«сегодня в 14:05» / «07.09.2026 в 14:05»; нет даты — пусто."""
-    if timestamp is None:
-        return ""
-    moment = datetime.fromtimestamp(timestamp)
-    clock = moment.strftime("%H:%M")
-    if moment.date() == datetime.fromtimestamp(now).date():
-        return f"сегодня в {clock}"
-    return f"{moment.strftime('%d.%m.%Y')} в {clock}"
 
 
 def _read_update_state() -> SourceState:
@@ -202,6 +225,7 @@ class AboutBridge(QObject):
         self._onnx_asr = package_version("onnx-asr")
         self._available: dict[str, bool] = {}
         self._models_size = ""
+        self._logs_size = ""
         self._last_attempt = ""
         self._last_success = ""
         self._stats_count = 0
@@ -224,6 +248,10 @@ class AboutBridge(QObject):
     @pyqtProperty(str, constant=True)
     def pythonVersion(self) -> str:  # noqa: N802
         return self._python
+
+    @pyqtProperty(str, constant=True)
+    def qtVersion(self) -> str:  # noqa: N802
+        return str(qVersion())
 
     @pyqtProperty(str, constant=True)
     def pyqtVersion(self) -> str:  # noqa: N802
@@ -295,6 +323,10 @@ class AboutBridge(QObject):
     def modelsSize(self) -> str:  # noqa: N802
         return self._models_size
 
+    @pyqtProperty(str, notify=infoChanged)
+    def logsSize(self) -> str:  # noqa: N802
+        return self._logs_size
+
     @pyqtSlot()
     def openSettingsFolder(self) -> None:  # noqa: N802
         self._open(self._settings_dir if self._settings_dir.is_dir() else None)
@@ -347,15 +379,12 @@ class AboutBridge(QObject):
             "models": self._models_dir.is_dir(),
             "logs": self._logs_dir.is_dir(),
         }
-        size = ""
-        if folders["models"]:
-            try:
-                size = format_size(folder_size(self._models_dir))
-            except OSError:
-                log.debug("Не удалось посчитать размер каталога моделей")
-        if folders != self._available or size != self._models_size:
+        size = _size_text(self._models_dir) if folders["models"] else ""
+        logs_size = _size_text(self._logs_dir) if folders["logs"] else ""
+        if (folders, size, logs_size) != (self._available, self._models_size, self._logs_size):
             self._available = folders
             self._models_size = size
+            self._logs_size = logs_size
             self.infoChanged.emit()
         self.refresh_updates()
         self._refresh_stats()
@@ -370,11 +399,16 @@ class AboutBridge(QObject):
                 log.debug("Состояние проверок обновлений недоступно")
             else:
                 now = self._clock()
-                attempt = moment_text(state.last_attempt_at, now)
-                success = moment_text(state.last_success_at, now)
+                attempt = format_moment(state.last_attempt_at, now)
+                success = format_moment(state.last_success_at, now)
         if (attempt, success) != (self._last_attempt, self._last_success):
             self._last_attempt, self._last_success = attempt, success
             self.updatesChanged.emit()
+
+    def on_stats_event(self, kind: str) -> None:
+        """Слушатель ``Stats.on_append``: после диктовки цифры обновляются сразу."""
+        if kind == "dictation":
+            self._refresh_stats()
 
     def _refresh_stats(self) -> None:
         count, text = 0, ""

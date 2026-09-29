@@ -18,16 +18,17 @@ from astra_voice.ui.about_bridge import (
     DOC_LICENSE,
     DOC_NOTICE,
     DOC_PRIVACY,
-    INSTALL_DOC_DIR,
+    RESOURCE_DOCS,
     SYSTEM_GPL3,
     AboutBridge,
+    disk_size,
     display_path,
     doc_paths,
     folder_size,
-    moment_text,
     plural,
     stats_text,
 )
+from astra_voice.ui.formatting import format_moment
 from astra_voice.updates.state import SourceState
 
 pytestmark = pytest.mark.unit
@@ -98,9 +99,12 @@ def test_doc_paths_installed_and_source(tmp_path: Path) -> None:
     installed = doc_paths(paths.INSTALL_SHARE_DIR)
     assert installed == {
         DOC_LICENSE: SYSTEM_GPL3,
-        DOC_NOTICE: INSTALL_DOC_DIR / "NOTICE",
-        DOC_PRIVACY: INSTALL_DOC_DIR / "PRIVACY.md",
+        DOC_NOTICE: paths.INSTALL_SHARE_DIR / "docs" / "NOTICE",
+        DOC_PRIVACY: paths.INSTALL_SHARE_DIR / "docs" / "PRIVACY.md",
     }
+    # Распакованное дерево пакета (смоук) — то же правило от своего корня.
+    unpacked = tmp_path / "usr/share/astra-voice"
+    assert doc_paths(unpacked)[DOC_NOTICE] == unpacked / RESOURCE_DOCS / "NOTICE"
     source = doc_paths(REPO)
     assert source == {
         DOC_LICENSE: REPO / "LICENSE",
@@ -111,10 +115,22 @@ def test_doc_paths_installed_and_source(tmp_path: Path) -> None:
 
 
 def test_debian_rules_install_documents_where_bridge_looks() -> None:
-    """NOTICE и PRIVACY.md пакет кладёт туда, где их ищет мост."""
+    """Копии NOTICE и PRIVACY.md — в ресурсах (там их ищет мост), /usr/share/doc — как было.
+
+    ``dh_compress`` в ``--dh`` сборке сжал бы файлы больше 4 КБ в ``.gz`` —
+    исключения стоят и для /usr/share/doc.
+    """
     rules = (REPO / "packaging/debian/rules").read_text(encoding="utf-8")
-    assert f"DOCDIR   := $(PKG){INSTALL_DOC_DIR}" in rules
+    assert "SHAREDIR := $(PKG)/usr/share/astra-voice" in rules
+    assert f"install -d $(SHAREDIR)/{RESOURCE_DOCS}" in rules
+    assert f"install -m 0644 NOTICE docs/PRIVACY.md $(SHAREDIR)/{RESOURCE_DOCS}/" in rules
+    assert "DOCDIR   := $(PKG)/usr/share/doc/astra-voice" in rules
     assert "for f in NOTICE docs/PRIVACY.md" in rules
+    assert "override_dh_compress:\n\tdh_compress -XNOTICE -XPRIVACY.md\n" in rules
+    smoke = (REPO / "packaging/smoke-installed.sh").read_text(encoding="utf-8")
+    assert "*doc_paths().values()," in smoke
+    assert '"$ROOTDIR/usr/share/astra-voice/docs" "$ROOTDIR/usr/share/doc/astra-voice"' in smoke
+    assert 'test -f "$dir/$f"' in smoke
 
 
 def test_build_date_from_generated_version(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -173,11 +189,32 @@ def test_stats_text() -> None:
     )
 
 
-def test_moment_text() -> None:
+def test_format_moment() -> None:
     now = datetime(2026, 9, 29, 18, 0).timestamp()
-    assert moment_text(None, now) == ""
-    assert moment_text(datetime(2026, 9, 29, 14, 5).timestamp(), now) == "сегодня в 14:05"
-    assert moment_text(datetime(2026, 9, 28, 9, 7).timestamp(), now) == "28.09.2026 в 09:07"
+    assert format_moment(None, now) == ""
+    assert format_moment(datetime(2026, 9, 29, 14, 5).timestamp(), now) == "сегодня в 14:05"
+    assert format_moment(datetime(2026, 9, 28, 9, 7).timestamp(), now) == "28.09.2026 в 09:07"
+
+
+@pytest.mark.parametrize("broken", [1e13, 1e20, -1e20, float("nan")])
+def test_format_moment_broken_timestamp_is_empty(broken: float) -> None:
+    now = datetime(2026, 9, 29, 18, 0).timestamp()
+    assert format_moment(broken, now) == ""
+    assert format_moment(now, broken) == ""
+
+
+def test_bridge_dates_with_broken_state(tmp_path: Path) -> None:
+    state = SourceState(last_attempt_at=1e13, last_success_at=1e13)
+    bridge, _ = make(tmp_path, update_state=lambda: state)
+    assert bridge.lastAttemptText == bridge.lastSuccessText == ""
+
+
+@pytest.mark.parametrize(
+    ("size", "text"),
+    [(0, "0 КБ"), (1, "1 КБ"), (12_300, "13 КБ"), (2_140_000, "2,1 МБ"), (680_000_000, "680 МБ")],
+)
+def test_disk_size(size: int, text: str) -> None:
+    assert disk_size(size) == text
 
 
 def test_folder_size_skips_symlinks(tmp_path: Path) -> None:
@@ -198,6 +235,7 @@ def test_bridge_constants(tmp_path: Path) -> None:
     assert bridge.installKind == "source"
     assert bridge.pythonVersion.count(".") == 2
     assert bridge.pyqtVersion
+    assert bridge.qtVersion.startswith("5.")
     assert bridge.settingsPath == str(tmp_path / "config")
     assert bridge.statsAvailable is False
     assert bridge.statsCount == 0 and bridge.statsText == ""
@@ -233,7 +271,12 @@ def test_documents_and_folders_open_only_when_present(tmp_path: Path) -> None:
     bridge.refresh()
     assert changes == [1]
     assert bridge.settingsFolderAvailable and bridge.logsFolderAvailable
-    assert bridge.modelsFolderAvailable and bridge.modelsSize
+    assert bridge.modelsFolderAvailable and bridge.modelsSize == "3 КБ"
+    assert bridge.logsSize == "0 КБ"
+    (tmp_path / "logs" / "astra-voice.log").write_bytes(b"x" * 2_140_000)
+    bridge.refresh()
+    assert bridge.logsSize == "2,1 МБ"
+    assert changes == [1, 1]
     assert not bridge.noticeAvailable
     opened.clear()
     bridge.openNotice()
@@ -241,7 +284,7 @@ def test_documents_and_folders_open_only_when_present(tmp_path: Path) -> None:
     bridge.openLogsFolder()
     assert opened == [str(tmp_path / "config"), str(tmp_path / "logs")]
     bridge.refresh()
-    assert changes == [1], "без перемен сигнал не повторяется"
+    assert changes == [1, 1], "без перемен сигнал не повторяется"
 
 
 def test_open_failure_does_not_raise(tmp_path: Path) -> None:
@@ -303,6 +346,16 @@ def test_stats_and_clear(tmp_path: Path) -> None:
     assert bridge.statsCount == 0 and bridge.statsText == ""
 
 
+def test_stats_event_refreshes_after_dictation(tmp_path: Path) -> None:
+    stats = FakeStats(summary(1))
+    bridge, _ = make(tmp_path, stats=stats)
+    stats.value = summary(2)
+    bridge.on_stats_event("update_check")
+    assert bridge.statsCount == 1, "не диктовка — не перечитываем"
+    bridge.on_stats_event("dictation")
+    assert bridge.statsCount == 2
+
+
 def test_stats_clear_failure_keeps_numbers(tmp_path: Path) -> None:
     stats = FakeStats(summary(2), fail_clear=True)
     bridge, _ = make(tmp_path, stats=stats)
@@ -324,6 +377,9 @@ def test_real_stats_clear(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     stats.append("dictation", model_id="m", t_ms=400.0, cold=False, result="ok")
     bridge, _ = make(tmp_path, stats=stats)
     assert bridge.statsCount == 1
+    stats.on_append = bridge.on_stats_event
+    stats.append("dictation", model_id="m", t_ms=500.0, cold=False, result="ok")
+    assert bridge.statsCount == 2, "слушатель Stats обновил цифры сразу"
     bridge.clearStats()
     assert bridge.statsCount == 0
     assert Stats().events() == []

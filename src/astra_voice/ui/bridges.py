@@ -252,13 +252,6 @@ class SettingsBridge(QObject):
         entry = self._downloads.active_entry() if self._downloads is not None else None
         return format_size(entry.size_bytes) if entry is not None else ""
 
-    @pyqtProperty(str, notify=activeModelChanged)
-    def activeModelRevision(self) -> str:  # noqa: N802
-        """Короткая ревизия рабочей модели (7 знаков коммита) для «О программе»."""
-        entry = self._downloads.active_entry() if self._downloads is not None else None
-        revision = str(getattr(entry, "revision", "") or "") if entry is not None else ""
-        return revision[:7]
-
     @pyqtProperty(str, notify=activeModelStateChanged)
     def activeModelState(self) -> str:  # noqa: N802
         return self._downloads.active_state() if self._downloads is not None else "none"

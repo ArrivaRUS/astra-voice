@@ -770,7 +770,6 @@ class FakeSettings(QObject):
         self._modelSelfcheck: str = "idle"
         self._activeModelName: str = "GigaAM v3 RNN-T"
         self._activeModelSize: str = "226 МБ"
-        self._activeModelRevision: str = "322c3b2"
         self._activeModelState: str = "ok"
         self._activeModelMessage: str = ""
         self._canReinstall: bool = True
@@ -1046,17 +1045,6 @@ class FakeSettings(QObject):
         self.changed.emit()
 
     activeModelSize = pyqtProperty(str, _get_activeModelSize, _set_activeModelSize, notify=changed)
-
-    def _get_activeModelRevision(self) -> str:
-        return self._activeModelRevision
-
-    def _set_activeModelRevision(self, value: str) -> None:
-        self._activeModelRevision = value
-        self.changed.emit()
-
-    activeModelRevision = pyqtProperty(
-        str, _get_activeModelRevision, _set_activeModelRevision, notify=changed
-    )
 
     def _get_activeModelState(self) -> str:
         return self._activeModelState

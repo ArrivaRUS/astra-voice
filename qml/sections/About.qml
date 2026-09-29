@@ -6,6 +6,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import QtQuick.Window 2.15
 import ".."
 import "../components"
 
@@ -41,17 +42,16 @@ Column {
             return name + " " + (value !== "" ? value : qsTr("не найден"))
         }
         return [item("Python", root.about.pythonVersion),
+                item("Qt", root.about.qtVersion),
                 item("PyQt5", root.about.pyqtVersion),
                 item("onnxruntime", root.about.onnxruntimeVersion),
                 item("onnx-asr", root.about.onnxAsrVersion)].join(" · ")
     }
 
+    // Без ревизии: технические идентификаторы — только в «Отладке» (сквозное правило 7).
     function modelLine() {
         var name = root.settings ? root.settings.activeModelName : ""
-        if (name === "")
-            return qsTr("Не выбрана")
-        var revision = root.settings.activeModelRevision
-        return revision !== "" ? name + " · " + revision : name
+        return name !== "" ? name : qsTr("Не выбрана")
     }
 
     function sessionLine() {
@@ -94,9 +94,19 @@ Column {
             .arg(success !== "" ? success : qsTr("не было"))
     }
 
+    // Перечитываем при открытии раздела и при каждой активации окна: статистика,
+    // размеры и даты проверок могли измениться, пока окно было скрыто.
     Component.onCompleted: {
         if (root.about)
             root.about.refresh()
+    }
+
+    Connections {
+        target: root.Window.window
+        function onActiveChanged() {
+            if (root.Window.window && root.Window.window.active && root.about)
+                root.about.refresh()
+        }
     }
 
     spacing: Theme.spaceGroupGap
@@ -107,6 +117,8 @@ Column {
         color: Theme.fgMuted
         font.family: Theme.fontMono
         font.pixelSize: Theme.fontSettingSubSize
+        // Трекинг `.mono` макета 06-about: +0.02em.
+        font.letterSpacing: Theme.fontMonoInlineTracking * Theme.fontSettingSubSize
         renderType: Text.NativeRendering
         elide: Text.ElideRight
         Layout.alignment: Qt.AlignVCenter
@@ -185,7 +197,7 @@ Column {
                 text: "GPL-3.0-or-later"
                 color: Theme.fgMuted
                 font.family: Theme.fontUi
-                font.pixelSize: Theme.fontBadgeSize
+                font.pixelSize: Theme.fontSettingSubSize
                 renderType: Text.NativeRendering
                 Layout.alignment: Qt.AlignVCenter
             }
@@ -199,6 +211,13 @@ Column {
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: { if (root.about) root.about.openLicense(); }
             }
+        }
+
+        SettingRow {
+            width: parent.width
+            showHint: false
+            label: qsTr("Библиотеки")
+            sub: qsTr("Qt 5 — LGPL-3.0 · The Qt Company; PyQt5 — GPL-3.0 · Riverbank Computing; onnxruntime — MIT · Microsoft")
         }
 
         SettingRow {
@@ -222,7 +241,7 @@ Column {
             width: parent.width
             showHint: false
             label: qsTr("Приватность и сетевые хосты")
-            sub: qsTr("Звук и текст не покидают компьютер и не сохраняются на диск. Хостов всего два: huggingface.co, github.com — и только по вашей команде")
+            sub: qsTr("Звук и текст не покидают компьютер и не сохраняются на диск. Сеть нужна только для скачивания моделей с huggingface.co (или с зеркала администратора) и проверки новой версии на github.com — по кнопке или раз в сутки, если вы это включили.")
 
             AvButton {
                 objectName: "aboutOpenPrivacy"
@@ -239,7 +258,7 @@ Column {
             width: parent.width
             showHint: false
             label: qsTr("Товарные знаки")
-            sub: qsTr("Astra Linux — товарный знак ПАО «Группа Астра»; GigaAM — обозначение СберДевайсы; Whisper — обозначение OpenAI. Продукт не аффилирован с указанными компаниями и не одобрен ими.")
+            sub: qsTr("Astra Linux — товарный знак ПАО «Группа Астра»; GigaAM — обозначение Сбера (СберДевайсы); Whisper — OpenAI; Vosk — Alpha Cephei; T-one — АО «ТБанк»; NeMo — NVIDIA. Программа разработана независимо и не аффилирована с правообладателями, не одобрена ими; названия указывают только на совместимость и происхождение компонентов.")
         }
     }
 
@@ -298,6 +317,12 @@ Column {
             sub: root.about ? root.about.logsPath : ""
             subMono: true
 
+            ValueText {
+                objectName: "aboutLogsSize"
+                text: root.about ? root.about.logsSize : ""
+                visible: text !== ""
+            }
+
             AvButton {
                 objectName: "aboutOpenLogs"
                 small: true
@@ -315,6 +340,8 @@ Column {
             width: parent.width
             showHint: false
             label: qsTr("Статистика распознавания")
+            // Статистики ещё нет — строка целиком в виде «выключено» (макет 06-about, empty).
+            rowEnabled: statsRow.hasStats
             sub: statsRow.hasStats ? qsTr("Только на этом компьютере, никуда не отправляется")
                 : qsTr("Появится после первой диктовки")
 
@@ -322,7 +349,7 @@ Column {
                 objectName: "aboutStats"
                 textFormat: Text.PlainText
                 text: statsRow.hasStats ? root.about.statsText : qsTr("Пока нет данных")
-                color: Theme.fgMuted
+                color: statsRow.hasStats ? Theme.fgMuted : Theme.fgDisabled
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSettingSubSize
                 renderType: Text.NativeRendering
@@ -382,7 +409,7 @@ Column {
         parent: root.Overlay.overlay ? root.Overlay.overlay : root
         heading: qsTr("Очистить статистику?")
         iconName: "trash"
-        message: qsTr("Счётчики диктовок и времени распознавания начнутся заново. Настройки и модели останутся.")
+        message: qsTr("Вся локальная статистика начнётся заново: диктовки, время распознавания, проверки обновлений, ошибки микрофона.")
         confirmText: qsTr("Очистить")
         cancelText: qsTr("Отмена")
         onConfirmed: { if (root.about) root.about.clearStats(); }

@@ -33,7 +33,7 @@ SNAPSHOTS = REPO / Path(
     os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_ABOUT") or "design/refs/impl/about"
 )
 WIDTH, HEIGHT = 1024, 620
-TALL = 1080
+TALL = 1200
 
 os.environ["QT_QUICK_CONTROLS_STYLE"] = "Default"
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -72,6 +72,7 @@ class FakeAbout(QObject):
             "buildDate": "01.10.2026",
             "installKind": "deb",
             "pythonVersion": "3.11.2",
+            "qtVersion": "5.15.8",
             "pyqtVersion": "5.15.9",
             "onnxruntimeVersion": "1.24.4",
             "onnxAsrVersion": "0.12.0",
@@ -85,6 +86,7 @@ class FakeAbout(QObject):
             "modelsFolderAvailable": True,
             "logsFolderAvailable": True,
             "modelsSize": "680 МБ",
+            "logsSize": "2,1 МБ",
             "lastAttemptText": "сегодня в 14:05",
             "lastSuccessText": "28.09.2026 в 10:12",
             "statsAvailable": True,
@@ -97,6 +99,7 @@ class FakeAbout(QObject):
     buildDate = pyqtProperty(str, _value("buildDate"), constant=True)
     installKind = pyqtProperty(str, _value("installKind"), constant=True)
     pythonVersion = pyqtProperty(str, _value("pythonVersion"), constant=True)
+    qtVersion = pyqtProperty(str, _value("qtVersion"), constant=True)
     pyqtVersion = pyqtProperty(str, _value("pyqtVersion"), constant=True)
     onnxruntimeVersion = pyqtProperty(str, _value("onnxruntimeVersion"), constant=True)
     onnxAsrVersion = pyqtProperty(str, _value("onnxAsrVersion"), constant=True)
@@ -112,6 +115,7 @@ class FakeAbout(QObject):
     modelsFolderAvailable = pyqtProperty(bool, _value("modelsFolderAvailable"), notify=infoChanged)
     logsFolderAvailable = pyqtProperty(bool, _value("logsFolderAvailable"), notify=infoChanged)
     modelsSize = pyqtProperty(str, _value("modelsSize"), notify=infoChanged)
+    logsSize = pyqtProperty(str, _value("logsSize"), notify=infoChanged)
     lastAttemptText = pyqtProperty(str, _value("lastAttemptText"), notify=updatesChanged)
     lastSuccessText = pyqtProperty(str, _value("lastSuccessText"), notify=updatesChanged)
     statsAvailable = pyqtProperty(bool, _value("statsAvailable"), constant=True)
@@ -193,6 +197,7 @@ CASES: dict[str, tuple[dict[str, Any], str, str, bool]] = {
             "installKind": "source",
             "onnxruntimeVersion": "",
             "modelsSize": "",
+            "logsSize": "",
             "modelsFolderAvailable": False,
             "logsFolderAvailable": False,
         },
@@ -326,6 +331,8 @@ def test_about_section_snapshot(app: Any, case: str, dark: bool) -> None:
         # Скрыто до своих вех: «Обновить из файла…» (M8), «Пройти настройку заново» (US-1.8).
         assert "Обновить из файла…" not in texts
         assert "Пройти настройку заново" not in texts
+        # Ревизия модели — технический идентификатор, её место в «Отладке».
+        assert not {text for text in texts if "322c3b2" in text}
         # Кнопки документов — простым языком, без имён файлов.
         assert {"Лицензия программы", "Лицензии компонентов", "Приватность"} <= texts
         assert not {"Открыть LICENSE", "NOTICE", "PRIVACY"} & texts
@@ -333,7 +340,10 @@ def test_about_section_snapshot(app: Any, case: str, dark: bool) -> None:
             assert {
                 "Данные на диске",
                 "Окружение",
-                "GigaAM v3 RNN-T · 322c3b2",
+                "GigaAM v3 RNN-T",
+                "Библиотеки",
+                "Qt 5 — LGPL-3.0 · The Qt Company; PyQt5 — GPL-3.0 · Riverbank Computing; "
+                "onnxruntime — MIT · Microsoft",
                 "GPL-3.0-or-later",
                 "Правила администратора",
                 "Проверка обновлений",
@@ -341,8 +351,10 @@ def test_about_section_snapshot(app: Any, case: str, dark: bool) -> None:
             if case == "about-base":
                 assert {
                     "Сборка от 01.10.2026 · пакет deb",
-                    "Python 3.11.2 · PyQt5 5.15.9 · onnxruntime 1.24.4 · onnx-asr 0.12.0",
+                    "Python 3.11.2 · Qt 5.15.8 · PyQt5 5.15.9 · onnxruntime 1.24.4 · "
+                    "onnx-asr 0.12.0",
                     "680 МБ",
+                    "2,1 МБ",
                     "KDE Plasma",
                     "Не заданы — все настройки в ваших руках",
                     "Последняя попытка: сегодня в 14:05 · последний успех: 28.09.2026 в 10:12",
@@ -352,7 +364,8 @@ def test_about_section_snapshot(app: Any, case: str, dark: bool) -> None:
             else:
                 assert {
                     "Запуск из исходного кода",
-                    "Python 3.11.2 · PyQt5 5.15.9 · onnxruntime не найден · onnx-asr 0.12.0",
+                    "Python 3.11.2 · Qt 5.15.8 · PyQt5 5.15.9 · onnxruntime не найден · "
+                    "onnx-asr 0.12.0",
                     "Fly",
                     "Ещё не проверялись",
                     "Пока нет данных",
@@ -387,6 +400,10 @@ def test_about_buttons_call_bridge(app: Any) -> None:
             if item.isVisible() and item.property("text") == "Очистить статистику?"
         )
         assert dialog is not None
+        assert (
+            "Вся локальная статистика начнётся заново: диктовки, время распознавания, "
+            "проверки обновлений, ошибки микрофона."
+        ) in onboarding.visible_texts(window.contentItem())
         confirm = [
             item
             for item in onboarding.visual_tree(window.contentItem())
@@ -400,6 +417,13 @@ def test_about_buttons_call_bridge(app: Any) -> None:
         QTest.qWait(50)
         app.processEvents()
         assert find_object(window, "aboutStats").property("text") == "Пока нет данных"
+        # Статистики нет — строка целиком в виде «выключено» (макет 06-about, empty).
+        stats_row = next(
+            item
+            for item in onboarding.visual_tree(window.contentItem())
+            if item.property("label") == "Статистика распознавания"
+        )
+        assert stats_row.property("rowEnabled") is False
         assert find_object(window, "aboutClearStats").property("enabled") is False
 
     try:

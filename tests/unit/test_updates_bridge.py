@@ -223,6 +223,12 @@ def test_checked_text_formats() -> None:
     assert checked_text(earlier, NOW) == "Проверено 07.09.2026 в 09:05"
 
 
+@pytest.mark.parametrize("broken", [1e13, -1e20])
+def test_checked_text_broken_timestamp_is_empty(broken: float) -> None:
+    """Метка из файла состояния вне диапазона дат не роняет строку (ревью 29.09)."""
+    assert checked_text(broken, NOW) == ""
+
+
 @pytest.fixture
 def real_tray(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
     """Настоящее меню трея без значка и без шины: start() не вызывается."""
