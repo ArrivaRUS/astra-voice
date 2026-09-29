@@ -24,7 +24,7 @@ Item {
     property string version: "v0.2.0"
 
     // Клик или Enter/Space по кликабельному состоянию (§2.3: 5, 12, 15, 17).
-    signal updateActivated(string state)
+    signal updateActivated(string kind)
 
     // «Установлена последняя версия» держится 3000 мс (token motion.duration.uptodate-message).
     property bool uptodateShown: false
@@ -82,6 +82,11 @@ Item {
         : updateAccent ? Theme.statusbarAccentFg : Theme.statusbarFg
     readonly property bool updateClickable: ["available", "unavailable", "error-net", "skipped"]
         .indexOf(updateState) >= 0
+    // Строка перестала быть кликабельной — фокус с неё снимается, иначе он «висит» на тексте.
+    onUpdateClickableChanged: {
+        if (!updateClickable && updateItem.activeFocus)
+            updateItem.focus = false
+    }
 
     implicitHeight: Theme.statusbarH
 
@@ -101,6 +106,8 @@ Item {
     Item {
         id: content
         anchors.fill: parent
+        // Центрируем по 35 px под верхней границей 1 px, а не по всей высоте 36.
+        anchors.topMargin: Theme.borderHairline
         anchors.leftMargin: Theme.cardRowPaddingX
         anchors.rightMargin: Theme.cardRowPaddingX
 
@@ -178,6 +185,10 @@ Item {
                 activeFocusOnTab: root.updateClickable
                 Accessible.role: root.updateClickable ? Accessible.Button : Accessible.StaticText
                 Accessible.name: root.updateText
+                Accessible.onPressAction: {
+                    if (root.updateClickable)
+                        root.updateActivated(root.updateState)
+                }
 
                 Keys.onPressed: {
                     if (root.updateClickable && (event.key === Qt.Key_Return

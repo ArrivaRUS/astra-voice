@@ -93,7 +93,10 @@ def test_available_fields_and_snooze() -> None:
         )
     )
     assert bridge.version == "0.2.1"
-    assert bridge.notes == "Что нового\n• Первое\n• Второе"
+    assert bridge.notes == [
+        {"text": "Первое", "bullet": True},
+        {"text": "Второе", "bullet": True},
+    ]
     assert bridge.snoozed is True
     assert bridge.checkedText == "Проверено сегодня в 14:02"
     assert bridge.releasePageAvailable is True
@@ -172,19 +175,36 @@ def test_refresh_rereads_gate_and_refreshes_checker() -> None:
 
 def test_notes_markup_stays_literal_text() -> None:
     attack = '<img src="http://127.0.0.1:1/x.png"> <b>жирный</b>'
-    assert display_notes(attack) == attack
+    assert display_notes(attack) == [{"text": attack, "bullet": False}]
+    assert display_notes("- " + attack) == [{"text": attack, "bullet": True}]
 
 
-def test_notes_are_capped_at_line_boundary() -> None:
+def test_notes_are_capped_by_total_length() -> None:
     notes = "\n".join(f"- пункт {index}" for index in range(1000))
     shown = display_notes(notes)
-    assert len(shown) <= MAX_NOTES_DISPLAY_CHARS + 2
-    assert shown.endswith("\n…")
-    assert all(line.startswith("• ") for line in shown.splitlines()[:-1])
+    assert sum(len(str(line["text"])) for line in shown[:-1]) <= MAX_NOTES_DISPLAY_CHARS
+    assert shown[-1] == {"text": "…", "bullet": False}
+    assert all(line["bullet"] is True for line in shown[:-1])
 
 
-def test_notes_collapse_blank_lines() -> None:
-    assert display_notes("\n\nА\n\n\n\nБ\n\n") == "А\n\nБ"
+def test_notes_drop_blank_lines_and_panel_heading() -> None:
+    assert display_notes("\n\n## Что нового\nА\n\n\n* Б\n\n") == [
+        {"text": "А", "bullet": False},
+        {"text": "Б", "bullet": True},
+    ]
+
+
+def test_notes_keep_issue_numbers_and_strip_only_markdown_headings() -> None:
+    """Ревью 29.09: «#123 …» — не заголовок; заголовок — только «#» и пробел."""
+    assert display_notes("#123 исправлено\n### Исправления\n#tag") == [
+        {"text": "#123 исправлено", "bullet": False},
+        {"text": "Исправления", "bullet": False},
+        {"text": "#tag", "bullet": False},
+    ]
+
+
+def test_current_version_is_exposed() -> None:
+    assert UpdatesBridge(current_version="0.2.0").currentVersion == "0.2.0"
 
 
 def test_checked_text_formats() -> None:

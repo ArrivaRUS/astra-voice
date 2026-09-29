@@ -15,7 +15,9 @@ Rectangle {
     // checking | uptodate | available | unavailable | skipped
     property string panelState: "available"
     property string version: ""
-    property string notes: ""
+    // Строки «Что нового» от моста: [{ text, bullet }] — недоверенный простой текст.
+    property var notes: []
+    property string currentVersion: ""
     property string checkedText: ""
     property bool releasePageAvailable: false
     property bool canCheckNow: false
@@ -29,7 +31,8 @@ Rectangle {
 
     readonly property bool accent: panelState === "available"
 
-    implicitHeight: body.implicitHeight + Theme.updatePanelPaddingY * 2
+    // Отступы 14 / 16 — внутри рамки 1 px (макет считает по border-box).
+    implicitHeight: body.implicitHeight + (Theme.updatePanelPaddingY + Theme.cardBorder) * 2
     height: implicitHeight
     radius: Theme.updatePanelRadius
     color: Theme.bgSurface
@@ -78,9 +81,9 @@ Rectangle {
 
     Column {
         id: body
-        x: Theme.updatePanelPaddingX
-        y: Theme.updatePanelPaddingY
-        width: root.width - Theme.updatePanelPaddingX * 2
+        x: Theme.updatePanelPaddingX + Theme.cardBorder
+        y: Theme.updatePanelPaddingY + Theme.cardBorder
+        width: root.width - (Theme.updatePanelPaddingX + Theme.cardBorder) * 2
 
         // ── шапка: иконка 17 · заголовок h3 · бейдж · справа подпись 12 (_p2.py:235) ──
         RowLayout {
@@ -148,7 +151,9 @@ Rectangle {
             width: parent.width
             text: root.panelState === "checking" ? qsTr("Ответ ждём не дольше 3 секунд.")
                 : root.panelState === "uptodate"
-                    ? (root.autoCheck
+                    ? (root.currentVersion !== ""
+                        ? qsTr("Установлена версия %1. ").arg(root.currentVersion) : "")
+                      + (root.autoCheck
                         ? qsTr("Следующая автоматическая проверка — не раньше чем через сутки.")
                         : qsTr("Автоматическая проверка выключена — проверяйте вручную, когда удобно."))
                 : root.panelState === "skipped" ? qsTr("Обновиться до неё всё ещё можно.")
@@ -165,27 +170,63 @@ Rectangle {
             text: qsTr("Что нового")
             color: Theme.fgSecondary
             font.weight: Font.Bold
-            visible: root.panelState === "available" && root.notes !== ""
+            visible: root.panelState === "available" && root.notes.length > 0
         }
 
-        Item { width: 1; height: 6; visible: notesText.visible }
+        Item { width: 1; height: 6; visible: notesList.visible }
 
-        Text {
-            id: notesText
+        // Список: маркер — отдельный элемент в отступе 17 (`.ul` padding-left, _shell.py:134),
+        // текст с x = 17 и висячим отступом при переносе.
+        Column {
+            id: notesList
             objectName: "updateNotes"
             width: parent.width
-            leftPadding: 17 // _shell.py:134 `.ul` padding-left
-            // Недоверенный текст из сети — строго простой текст (требование ревью 29.09).
-            textFormat: Text.PlainText
-            text: root.notes
             visible: whatsNewTitle.visible
-            color: Theme.fgSecondary
-            font.family: Theme.fontUi
-            font.pixelSize: Theme.updatePanelListSize
-            lineHeight: Math.round(Theme.updatePanelListSize * Theme.updatePanelListLineHeight)
-            lineHeightMode: Text.FixedHeight
-            renderType: Text.NativeRendering
-            wrapMode: Text.Wrap
+
+            Repeater {
+                model: root.notes
+
+                Item {
+                    required property var modelData
+                    readonly property int lineHeight:
+                        Math.round(Theme.updatePanelListSize * Theme.updatePanelListLineHeight)
+
+                    width: notesList.width
+                    height: noteLine.implicitHeight
+
+                    Text {
+                        visible: parent.modelData.bullet === true
+                        width: 17
+                        height: parent.lineHeight
+                        rightPadding: 7 // зазор маркера до текста, как у маркера списка в браузере
+                        horizontalAlignment: Text.AlignRight
+                        verticalAlignment: Text.AlignVCenter
+                        textFormat: Text.PlainText
+                        text: "•"
+                        color: Theme.fgSecondary
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.updatePanelListSize
+                        renderType: Text.NativeRendering
+                    }
+
+                    Text {
+                        id: noteLine
+                        objectName: "updateNoteLine"
+                        x: 17
+                        width: parent.width - x
+                        // Недоверенный текст из сети — строго простой текст (требование ревью 29.09).
+                        textFormat: Text.PlainText
+                        text: String(parent.modelData.text)
+                        color: Theme.fgSecondary
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.updatePanelListSize
+                        lineHeight: parent.lineHeight
+                        lineHeightMode: Text.FixedHeight
+                        renderType: Text.NativeRendering
+                        wrapMode: Text.Wrap
+                    }
+                }
+            }
         }
 
         // ── источник недоступен: баннер info с иконкой globe ─────────────────────
@@ -199,7 +240,6 @@ Rectangle {
 
             AvButton {
                 objectName: "updateRetry"
-                variant: "primary"
                 iconName: "refresh"
                 text: qsTr("Повторить")
                 enabled: root.canCheckNow

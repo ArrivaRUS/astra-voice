@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from PyQt5.QtCore import QObject, pyqtProperty, pyqtSignal, pyqtSlot
 
+from astra_voice.core.version import __version__
 from astra_voice.net.github import RELEASE_URL_PREFIX, parse_semver
 
 if TYPE_CHECKING:
@@ -46,8 +47,8 @@ STATES = (
 )
 #: Сколько символов «Что нового» показывает панель; остальное — на странице выпуска.
 MAX_NOTES_DISPLAY_CHARS = 2000
-_BULLET = re.compile(r"^\s*[-*+]\s+")
-_HEADING = re.compile(r"^\s*#{1,6}\s*")
+_BULLET = re.compile(r"^[-*+]\s+")
+_HEADING = re.compile(r"^#{1,6}\s+")
 
 
 class UpdateActions(Protocol):
@@ -64,28 +65,33 @@ class UpdateActions(Protocol):
     def remind_later(self) -> None: ...
 
 
-def display_notes(text: str) -> str:
-    """Текст выпуска для панели: пункты списка — «•», заголовки без «#», с пределом."""
-    lines: list[str] = []
-    blank = False
+def display_notes(text: str) -> list[dict[str, object]]:
+    """Текст выпуска для панели — строки ``{"text", "bullet"}``.
+
+    Пункт markdown-списка (``-``/``*``/``+`` и пробел) становится ``bullet``: маркер
+    рисует QML отдельно, с висячим отступом. Заголовок (``#`` и пробел) — обычная
+    строка без решёток; «Что нового» пропускается — это заголовок самой панели.
+    «#123 …» заголовком не считается. Пустые строки не нужны, предел — по строкам.
+    """
+    lines: list[dict[str, object]] = []
+    used = 0
     for raw in text.strip().splitlines():
-        line = raw.rstrip()
-        if not line.strip():
-            if lines and not blank:
-                lines.append("")
-            blank = True
+        line = raw.strip()
+        if not line:
             continue
-        blank = False
-        if _BULLET.match(line):
-            line = "• " + _BULLET.sub("", line)
+        bullet = _BULLET.match(line) is not None
+        if bullet:
+            line = _BULLET.sub("", line, count=1)
         elif _HEADING.match(line):
-            line = _HEADING.sub("", line)
-        lines.append(line)
-    result = "\n".join(lines).strip()
-    if len(result) > MAX_NOTES_DISPLAY_CHARS:
-        cut = result.rfind("\n", 0, MAX_NOTES_DISPLAY_CHARS)
-        result = result[: cut if cut > 0 else MAX_NOTES_DISPLAY_CHARS].rstrip() + "\n…"
-    return result
+            line = _HEADING.sub("", line, count=1).strip()
+            if not line or line.casefold() == "что нового":
+                continue
+        if used + len(line) > MAX_NOTES_DISPLAY_CHARS:
+            lines.append({"text": "…", "bullet": False})
+            break
+        used += len(line)
+        lines.append({"text": line, "bullet": bullet})
+    return lines
 
 
 def checked_text(timestamp: float | None, now: float) -> str:
@@ -112,16 +118,18 @@ class UpdatesBridge(QObject):
         refusal: Callable[[NetworkKind], str] | None = None,
         open_external: Callable[[str], bool] | None = None,
         clock: Callable[[], float] = time.time,
+        current_version: str = __version__,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
+        self._current_version = current_version
         self._checker = checker
         self._refusal = refusal
         self._open_external = open_external
         self._clock = clock
         self._state = "disabled"
         self._version = ""
-        self._notes = ""
+        self._notes: list[dict[str, object]] = []
         self._release_url = ""
         self._snoozed = False
         self._manual = False
@@ -196,12 +204,17 @@ class UpdatesBridge(QObject):
     def state(self) -> str:
         return self._state
 
+    @pyqtProperty(str, constant=True)
+    def currentVersion(self) -> str:  # noqa: N802
+        """Установленная версия программы — для «Установлена версия 0.2.0.»."""
+        return self._current_version
+
     @pyqtProperty(str, notify=statusChanged)
     def version(self) -> str:
         return self._version
 
-    @pyqtProperty(str, notify=statusChanged)
-    def notes(self) -> str:
+    @pyqtProperty("QVariantList", notify=statusChanged)
+    def notes(self) -> list[dict[str, object]]:
         return self._notes
 
     @pyqtProperty(bool, notify=statusChanged)

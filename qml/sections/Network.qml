@@ -67,7 +67,8 @@ Column {
         height: visible ? implicitHeight : 0
         panelState: root.panelState !== "" ? root.panelState : "available"
         version: root.updates ? root.updates.version : ""
-        notes: root.updates ? root.updates.notes : ""
+        notes: root.updates ? root.updates.notes : []
+        currentVersion: root.updates ? root.updates.currentVersion : ""
         checkedText: root.updates ? root.updates.checkedText : ""
         releasePageAvailable: root.updates ? root.updates.releasePageAvailable : false
         canCheckNow: root.canCheckNow
@@ -79,10 +80,10 @@ Column {
         onShowSkippedRequested: { if (root.updates) root.updates.clearSkip(); }
     }
 
-    // Макет 04-update-panel: между панелью и группами 16 = 8 зазора колонки + 8.
+    // Макет 04-update-panel: между панелью и группами 16 = два зазора колонки по 8.
     Item {
         width: 1
-        height: Theme.spaceGroupGap
+        height: 0
         visible: root.panelState !== ""
     }
 
@@ -95,7 +96,7 @@ Column {
             width: parent.width
             divider: false
             label: qsTr("Проверять обновления утилиты")
-            sub: qsTr("Не чаще раза в сутки · github.com/ArrivaRUS/astra-voice")
+            sub: locked ? qsTr("Задано администратором") : qsTr("Раз в сутки")
             toggle: appUpdates
             locked: root.isLocked("check_app_updates") || root.networkRefusal === "admin"
             rowEnabled: !locked && !root.offlineOn
@@ -104,13 +105,24 @@ Column {
                 id: appUpdates
                 objectName: "checkAppUpdatesToggle"
                 Layout.alignment: Qt.AlignVCenter
-                checked: root.settings ? root.settings.checkAppUpdates : false
                 locked: appRow.locked
                 // Офлайн перекрывает тумблер: положение сохраняется, переключить нельзя.
                 enabled: !appRow.locked && !root.offlineOn
+
+                // Как у автозапуска в «Общих»: положение всегда из моста, клик его не отвязывает.
+                Binding {
+                    target: appUpdates
+                    property: "checked"
+                    value: root.settings ? root.settings.checkAppUpdates : false
+                }
+
                 onCheckedChanged: {
-                    if (root.settings && enabled && root.settings.checkAppUpdates !== checked)
-                        root.settings.checkAppUpdates = checked
+                    if (!root.settings || !enabled || root.settings.checkAppUpdates === checked)
+                        return
+                    root.settings.checkAppUpdates = checked
+                    // Запись не удалась (saveError) — вернуть положение из моста.
+                    if (root.settings.checkAppUpdates !== checked)
+                        checked = root.settings.checkAppUpdates
                 }
             }
         }
@@ -121,9 +133,8 @@ Column {
             label: qsTr("Офлайн-режим")
             sub: root.offlineForced && root.networkRefusal === "offline"
                 ? qsTr("Включён при запуске программы — выключить здесь нельзя")
-                : root.offlineOn
-                    ? qsTr("Все сетевые кнопки скрыты; работает только установка из файла")
-                    : qsTr("Полностью запрещает сетевые запросы; «Установить из файла» остаётся")
+                : locked ? qsTr("Задано администратором")
+                : qsTr("Программа не выходит в сеть: не проверяет обновления и не скачивает модели. Установка модели из файла работает.")
             toggle: offlineToggle
             locked: root.isLocked("offline") || root.networkRefusal === "admin"
             rowEnabled: !locked && !root.offlineForced
@@ -132,11 +143,20 @@ Column {
                 id: offlineToggle
                 objectName: "offlineToggle"
                 Layout.alignment: Qt.AlignVCenter
-                checked: root.offlineOn
                 locked: offlineRow.locked || root.offlineForced
+
+                Binding {
+                    target: offlineToggle
+                    property: "checked"
+                    value: root.offlineOn
+                }
+
                 onCheckedChanged: {
-                    if (root.settings && !locked && root.settings.offline !== checked)
-                        root.settings.offline = checked
+                    if (!root.settings || locked || root.settings.offline === checked)
+                        return
+                    root.settings.offline = checked
+                    if (root.settings.offline !== checked)
+                        checked = root.offlineOn
                 }
             }
         }

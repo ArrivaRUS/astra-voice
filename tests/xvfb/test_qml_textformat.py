@@ -203,12 +203,11 @@ def test_update_panel_notes_are_plain_text_and_never_request_images(
     view, factory = textformat_view
     root = render_component(
         view,
-        'UpdatePanel { width: 780; panelState: "available"; version: "0.2.1"; notes: attackText }',
+        'UpdatePanel { width: 780; panelState: "available"; version: "0.2.1"; '
+        "notes: [{ text: attackText, bullet: true }, { text: attackText, bullet: false }] }",
     )
-    assert_literal_text(view, root, expected_count=1)
-    notes = root.findChild(QObject, "updateNotes")
-    assert notes is not None
-    assert notes.property("textFormat") == root.property("plainTextFormat")
+    # assert_literal_text сам требует PlainText у каждого Text с внешней строкой.
+    assert_literal_text(view, root, expected_count=2)
     assert factory.urls == [], f"HTML обошёл NetworkGate: {factory.urls}"
 
 
@@ -217,7 +216,7 @@ def test_update_panel_source_pins_plain_text_for_notes() -> None:
     text = (QML_DIR / "components" / "UpdatePanel.qml").read_text(encoding="utf-8")
     # Комментарии объясняют запрет и называют AutoText — их не считаем.
     source = "\n".join(line.split("//", 1)[0] for line in text.splitlines())
-    block = source[source.index('objectName: "updateNotes"') :]
+    block = source[source.index('objectName: "updateNoteLine"') :]
     block = block[: block.index("}")]
     assert "textFormat: Text.PlainText" in block
     for unsafe in ("AutoText", "RichText", "StyledText", "MarkdownText"):

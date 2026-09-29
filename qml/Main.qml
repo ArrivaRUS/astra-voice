@@ -268,10 +268,10 @@ ApplicationWindow {
         version: "v" + window.appVersion
 
         // §6.2: клик по «Доступна версия» открывает панель «Что нового» в разделе «Сеть».
-        onUpdateActivated: {
-            if (state === "skipped" && window.updates) {
+        onUpdateActivated: function(kind) {
+            if (kind === "skipped" && window.updates) {
                 window.updates.clearSkip()
-            } else if (state === "unavailable" && window.updates && window.updates.canCheckNow) {
+            } else if (kind === "unavailable" && window.updates && window.updates.canCheckNow) {
                 window.updates.checkNow()
             }
             if (window.sectionIndices.hasOwnProperty("network"))

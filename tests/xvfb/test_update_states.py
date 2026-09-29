@@ -36,11 +36,12 @@ SNAPSHOTS = REPO / Path(
 )
 FOOTER_W, FOOTER_H = 760, 36
 WIDTH, HEIGHT = 1024, 620
-NOTES = (
-    "• Каталог моделей: 12 моделей, память в работе замеряется на вашем компьютере\n"
-    "• Автозапуск при входе в систему\n"
-    "• Исправлено: пилюля перекрывалась панелью при смене раскладки"
+NOTE_LINES = (
+    "Каталог моделей: 12 моделей, память в работе замеряется на вашем компьютере",
+    "Автозапуск при входе в систему",
+    "Исправлено: пилюля перекрывалась панелью при смене раскладки",
 )
+NOTES = [{"text": line, "bullet": True} for line in NOTE_LINES]
 
 os.environ["QT_QUICK_CONTROLS_STYLE"] = "Default"
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -76,7 +77,8 @@ class FakeUpdates(QObject):
         self._values: dict[str, Any] = {
             "state": "disabled",
             "version": "",
-            "notes": "",
+            "notes": [],
+            "currentVersion": "0.2.0",
             "snoozed": False,
             "manual": False,
             "checkedText": "",
@@ -90,7 +92,8 @@ class FakeUpdates(QObject):
 
     state = pyqtProperty(str, _value("state"), notify=statusChanged)
     version = pyqtProperty(str, _value("version"), notify=statusChanged)
-    notes = pyqtProperty(str, _value("notes"), notify=statusChanged)
+    notes = pyqtProperty("QVariantList", _value("notes"), notify=statusChanged)
+    currentVersion = pyqtProperty(str, _value("currentVersion"), constant=True)
     snoozed = pyqtProperty(bool, _value("snoozed"), notify=statusChanged)
     manual = pyqtProperty(bool, _value("manual"), notify=statusChanged)
     checkedText = pyqtProperty(str, _value("checkedText"), notify=statusChanged)
@@ -436,7 +439,9 @@ def test_network_section_snapshot(app: Any, case: str, dark: bool) -> None:
     if panel_title is not None:
         assert panel_title in texts
     if case == "panel-available":
-        assert {"Что нового", NOTES, "Страница выпуска", "Пропустить эту версию"} <= texts
+        assert {"Что нового", *NOTE_LINES, "Страница выпуска", "Пропустить эту версию"} <= texts
+    if case == "panel-uptodate":
+        assert any(text.startswith("Установлена версия 0.2.0. ") for text in texts)
     if case == "network-offline":
         assert "Недоступно: включён офлайн-режим" in texts
     save_snapshot(image, f"{case}-{'dark' if dark else 'light'}.png")
@@ -455,8 +460,15 @@ def test_panel_buttons_call_bridge(app: Any) -> None:
     settings = make_settings({})
 
     def inspect(window: Any) -> None:
-        notes = find_object(window, "updateNotes")
-        assert notes.property("textFormat") == 0  # Text.PlainText
+        lines = [
+            item
+            for item in onboarding.visual_tree(window.contentItem())
+            if item.objectName() == "updateNoteLine"
+        ]
+        assert [line.property("text") for line in lines] == list(NOTE_LINES)
+        assert all(line.property("textFormat") == 0 for line in lines)  # Text.PlainText
+        # Висячий отступ: текст пункта начинается с x = 17 и переносится там же.
+        assert all(line.property("x") == 17 for line in lines)
         for name in ("updateReleasePage", "updateSkip", "updateRemindLater"):
             onboarding.click_item(find_object(window, name))
             app.processEvents()
@@ -515,7 +527,17 @@ def test_offline_toggle_writes_setting_and_policy_lock_blocks(app: Any) -> None:
     settings = make_settings({})
 
     def inspect(window: Any) -> None:
-        onboarding.click_item(find_object(window, "offlineToggle"))
+        toggle = find_object(window, "offlineToggle")
+        onboarding.click_item(toggle)
+        app.processEvents()
+        assert settings.offline is True and toggle.property("checked") is True
+        # Клик не отвязывает тумблер: мост вернул «выкл» — тумблер следует за ним.
+        settings.offline = False
+        app.processEvents()
+        assert toggle.property("checked") is False
+        settings.offline = True
+        app.processEvents()
+        assert toggle.property("checked") is True
 
     try:
         render_network(app, False, updates, settings, inspect)
