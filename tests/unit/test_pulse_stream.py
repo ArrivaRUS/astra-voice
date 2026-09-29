@@ -1303,6 +1303,26 @@ def test_no_library_gives_audio_failed_through_real_simple(
     assert not source.is_open
 
 
+def test_fallback_announced_only_after_simple_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """on_fallback — только после первого успешного открытия simple и один раз."""
+    monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=OSError("нет библиотеки")))
+    simple = Mock(spec=audio.PulseSimpleSource)
+    simple.open.side_effect = [audio.AudioError(audio.ERROR_FAILED, "нет"), None, None]
+    notified = Mock()
+    source = ps.StreamWithFallback(
+        _unavailable_primary(), fallback=Mock(return_value=simple), on_fallback=notified
+    )
+    with pytest.raises(audio.AudioError):
+        source.open(MIC.name)
+    notified.assert_not_called()
+    source.open(MIC.name)
+    notified.assert_called_once_with()
+    source.open(MIC.name)
+    notified.assert_called_once_with()
+
+
 def test_fallback_happens_once(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

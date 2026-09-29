@@ -963,6 +963,8 @@ class StreamWithFallback:
     ) -> None:
         self._active: ManagedSource = primary if primary is not None else PulseStreamSource()
         self._fallback: Callable[[], ManagedSource] | None = fallback
+        # Сообщаем об откате только после первого успешного открытия simple:
+        # без libpulse.so.0 simple тоже не откроется, и «simple работает» было бы неправдой.
         self._on_fallback = on_fallback
 
     def open(
@@ -986,9 +988,15 @@ class StreamWithFallback:
             )
             self._active.close()
             self._active = fallback()
-            if self._on_fallback is not None:
-                self._on_fallback()
             self._active.open(device, deadline=deadline, running=running)
+        self._announce_fallback()
+
+    def _announce_fallback(self) -> None:
+        """Однократно после успешного открытия запасного источника."""
+        if self._fallback is not None or self._on_fallback is None:
+            return
+        on_fallback, self._on_fallback = self._on_fallback, None
+        on_fallback()
 
     def read_chunk(self) -> bytes | None:
         return self._active.read_chunk()

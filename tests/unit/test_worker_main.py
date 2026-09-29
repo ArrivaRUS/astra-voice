@@ -925,6 +925,33 @@ def test_fallback_logs_actual_backend(
     simple.open.assert_called_once_with("mic.test", deadline=None, running=None)
 
 
+def test_fallback_not_logged_when_simple_cannot_open(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Нет libpulse.so.0: simple тоже не открылся — «simple (откат)» в журнале нет."""
+    from astra_voice.worker import pulse_stream
+    from astra_voice.worker.audio import AudioDevice, AudioError, PulseSimpleSource
+
+    mic = AudioDevice(7, "mic.test", "Тестовый микрофон", False)
+    source = worker_main.select_audio_source({})
+    assert isinstance(source, pulse_stream.StreamWithFallback)
+    source._active = pulse_stream.PulseStreamSource(
+        pulse_factory=pulse_stream._PulseAsync,
+        devices=lambda: [mic],
+        default=lambda *_a, **_kw: mic,
+    )
+    source._fallback = lambda: PulseSimpleSource(
+        devices=lambda: [mic], default=lambda *_a, **_kw: mic
+    )
+    monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=OSError("нет библиотеки")))
+    with caplog.at_level(logging.DEBUG):
+        for _ in range(2):
+            with pytest.raises(AudioError):
+                source.open(mic.name)
+    assert not source.is_open
+    assert "simple (откат)" not in caplog.text
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
