@@ -422,7 +422,10 @@ def test_push_failure(repo: tuple[Path, dict[str, str]]) -> None:
 
 
 SHA = "a" * 64
-APPIMAGE_LOCK = f"""# expect-elf: 157
+APPIMAGE_LOCK = f"""# base: python-appimage
+# openssl-origin: bundled
+# openssl-major: 1
+# expect-elf: 157
 # max-glibc: 2.28
 # runtime-key: 570C77ACEA40C0F1B758902CBF96CCA56490F695
 # tool: runtime-x86_64 {SHA} 1 https://example.invalid/runtime-x86_64

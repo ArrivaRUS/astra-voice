@@ -17,7 +17,10 @@ VERSION = "0.2.0"
 DEB = f"astra-voice_{VERSION}_amd64.deb"
 IMAGE = f"Astra_Voice-{VERSION}-x86_64.AppImage"
 SHA = "a" * 64
-LOCK = f"""# expect-elf: 157
+LOCK = f"""# base: python-appimage
+# openssl-origin: bundled
+# openssl-major: 1
+# expect-elf: 157
 # max-glibc: 2.28
 # runtime-key: 570C77ACEA40C0F1B758902CBF96CCA56490F695
 # tool: runtime-x86_64 {SHA} 1 https://example.invalid/runtime-x86_64

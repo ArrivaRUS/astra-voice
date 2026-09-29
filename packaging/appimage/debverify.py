@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Проверка происхождения Debian-входов AppImage по `packaging/appimage.lock` (R3.3, T-185).
+
+Цепочка для каждого бинарного пакета — любое расхождение означает отказ до распаковки:
+
+    ключ архива из репозитория (keyring) + отпечаток из lock (signer)
+      → `gpgv` по `InRelease` (VALIDSIG ключа signer, ни одной плохой подписи);
+        sha256 и размер самого `InRelease` — из lock
+      → sha256 и размер `Packages[.xz]` из раздела SHA256 подписанного текста = lock = файл
+      → строфа пакета в `Packages`: версия, архитектура, имя файла, Source, sha256, размер
+      → sha256 и размер `.deb` = lock = файл; поля control `.deb` (dpkg-deb) = lock.
+
+Исходники (`sources`): `.dsc` — по индексу `Sources` той же цепочки, архивы — по разделу
+Checksums-Sha256 своего `.dsc`, самостоятельные файлы — по sha256 и размеру из lock.
+
+Проверка идёт и при сборке из кэша (`build.sh` без `--fetch`): попадание в кэш ничего
+не доказывает. Сеть не используется.
+
+    debverify.py --lock packaging/appimage.lock --cache ~/.cache/astra-voice-dev/appimage debs
+    debverify.py --lock … --cache … sources
+
+Код возврата 0 — всё сошлось, 1 — расхождение (печатается понятная причина), 2 — вызов.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import lzma
+import re
+import subprocess
+import sys
+import tempfile
+from collections.abc import Iterable, Sequence
+from pathlib import Path
+
+import lockfile
+
+#: Статусы gpgv, при которых InRelease отвергается целиком, чья бы подпись это ни была.
+_BAD_STATUS = ("BADSIG", "EXPSIG", "EXPKEYSIG", "REVKEYSIG")
+_SOURCE_RE = re.compile(r"(?P<name>[a-z0-9][a-z0-9.+-]+)(?:\s+\((?P<version>[^)\s]+)\))?")
+
+
+class VerifyError(RuntimeError):
+    """Вход не прошёл проверку происхождения."""
+
+
+def file_digest(path: Path) -> tuple[str, int]:
+    """sha256 и размер файла потоком."""
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as fh:
+        while chunk := fh.read(1 << 20):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+def check_file(path: Path, sha256: str, size: int, what: str) -> None:
+    if not path.is_file():
+        raise VerifyError(f"{what}: нет файла {path} — нужен build.sh --fetch (сеть)")
+    got_sha, got_size = file_digest(path)
+    if got_size != size:
+        raise VerifyError(f"{what}: размер {got_size}, в lock {size} ({path})")
+    if got_sha != sha256:
+        raise VerifyError(f"{what}: sha256 {got_sha}, в lock {sha256} ({path})")
+
+
+def gpgv_verify(inrelease: Path, keyring: Path, signer: str, gpgv: str = "gpgv") -> str:
+    """Проверить подпись InRelease; вернуть только подписанный текст.
+
+    Код выхода gpgv не решает: у Debian несколько подписей, ключи прочих подписантов в
+    нашем keyring намеренно отсутствуют (NO_PUBKEY). Решает статус: VALIDSIG с основным
+    ключом `signer` и ни одного BADSIG/EXPSIG/EXPKEYSIG/REVKEYSIG.
+    """
+    if not keyring.is_file():
+        raise VerifyError(f"нет ключа архива {keyring}")
+    with tempfile.TemporaryDirectory(prefix="debverify-") as tmp:
+        plain = Path(tmp) / "InRelease.txt"
+        try:
+            proc = subprocess.run(
+                [gpgv, "--status-fd", "1", "--keyring", str(keyring), "--output", str(plain)]
+                + [str(inrelease)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise VerifyError(f"не запускается {gpgv}: {exc}") from None
+        status = [line.split() for line in proc.stdout.splitlines()]
+        status = [tokens[1:] for tokens in status if tokens[:1] == ["[GNUPG:]"] and tokens[1:]]
+        bad = [tokens[0] for tokens in status if tokens[0] in _BAD_STATUS]
+        if bad:
+            raise VerifyError(f"{inrelease.name}: плохая подпись ({', '.join(bad)})")
+        primaries = [tokens[-1] for tokens in status if tokens[0] == "VALIDSIG"]
+        if signer not in primaries:
+            found = ", ".join(primaries) or "нет"
+            raise VerifyError(f"{inrelease.name}: нет подписи ключом {signer} (VALIDSIG: {found})")
+        if not plain.is_file():
+            raise VerifyError(f"{inrelease.name}: gpgv не выдал подписанный текст")
+        return plain.read_text(encoding="utf-8")
+
+
+def release_sha256(text: str) -> dict[str, tuple[str, int]]:
+    """Раздел SHA256 файла Release/InRelease: путь → (sha256, размер)."""
+    entries: dict[str, tuple[str, int]] = {}
+    inside = False
+    for line in text.splitlines():
+        if not line[:1].isspace():
+            inside = line.rstrip() == "SHA256:"
+            continue
+        if inside:
+            parts = line.split()
+            if len(parts) != 3 or not re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+                raise VerifyError(f"InRelease: неверная строка SHA256: {line.strip()}")
+            entries[parts[2]] = (parts[0], int(parts[1]))
+    if not entries:
+        raise VerifyError("InRelease: нет раздела SHA256")
+    return entries
+
+
+def parse_deb822(text: str) -> list[dict[str, str]]:
+    """Строфы deb822 (Packages, Sources, control, .dsc без подписи)."""
+    stanzas: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    key: str | None = None
+    for line in text.splitlines():
+        if not line.strip():
+            if current:
+                stanzas.append(current)
+            current, key = {}, None
+        elif line[0] in " \t":
+            if key is None:
+                raise VerifyError(f"deb822: продолжение без поля: {line.strip()}")
+            current[key] += "\n" + line.strip()
+        else:
+            name, sep, value = line.partition(":")
+            if not sep:
+                raise VerifyError(f"deb822: строка без «:»: {line}")
+            key = name.strip()
+            current[key] = value.strip()
+    if current:
+        stanzas.append(current)
+    return stanzas
+
+
+def read_index(path: Path) -> str:
+    data = path.read_bytes()
+    if path.name.endswith(".xz"):
+        try:
+            data = lzma.decompress(data, format=lzma.FORMAT_XZ)
+        except lzma.LZMAError as exc:
+            raise VerifyError(f"{path.name}: не распаковывается xz: {exc}") from None
+    return data.decode("utf-8")
+
+
+def find_stanzas(text: str, field: str, values: Iterable[str]) -> list[dict[str, str]]:
+    """Строфы, где `field` — одно из `values` (без разбора всего индекса в словари)."""
+    wanted = set(values)
+    result: list[dict[str, str]] = []
+    for block in re.split(r"\n\s*\n", text):
+        match = re.search(rf"^{re.escape(field)}:\s*(\S+)\s*$", block, re.MULTILINE)
+        if match and match.group(1) in wanted:
+            result.extend(parse_deb822(block))
+    return result
+
+
+def source_of(stanza: dict[str, str]) -> tuple[str, str]:
+    """Исходник бинарного пакета: поле Source (с версией в скобках при binNMU) или сам пакет."""
+    raw = stanza.get("Source")
+    if raw is None:
+        return stanza["Package"], stanza["Version"]
+    match = _SOURCE_RE.fullmatch(raw.strip())
+    if match is None:
+        raise VerifyError(f"{stanza['Package']}: неверное поле Source: {raw}")
+    return match["name"], match["version"] or stanza["Version"]
+
+
+def checksums(field: str) -> dict[str, tuple[str, int]]:
+    """Поле Checksums-Sha256 (Sources/.dsc): имя файла → (sha256, размер)."""
+    result: dict[str, tuple[str, int]] = {}
+    for line in field.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if len(parts) != 3 or not re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+            raise VerifyError(f"неверная строка Checksums-Sha256: {line.strip()}")
+        result[parts[2]] = (parts[0], int(parts[1]))
+    return result
+
+
+def deb_control(path: Path, dpkg_deb: str = "dpkg-deb") -> dict[str, str]:
+    try:
+        proc = subprocess.run(
+            [dpkg_deb, "--field", str(path)], capture_output=True, text=True, check=False
+        )
+    except OSError as exc:
+        raise VerifyError(f"не запускается {dpkg_deb}: {exc}") from None
+    if proc.returncode != 0:
+        raise VerifyError(f"{path.name}: dpkg-deb не читает control: {proc.stderr.strip()}")
+    stanzas = parse_deb822(proc.stdout)
+    if len(stanzas) != 1:
+        raise VerifyError(f"{path.name}: control — не одна строфа")
+    return stanzas[0]
+
+
+class Verifier:
+    """Проверка входов одного lock против кэша; подписанные тексты кэшируются."""
+
+    def __init__(
+        self,
+        lock: lockfile.Lock,
+        cache: Path,
+        root: Path,
+        gpgv: str = "gpgv",
+        dpkg_deb: str = "dpkg-deb",
+    ) -> None:
+        self.lock = lock
+        self.cache = cache
+        self.root = root
+        self.gpgv = gpgv
+        self.dpkg_deb = dpkg_deb
+        self._release: dict[str, dict[str, tuple[str, int]]] = {}
+        self._index_text: dict[str, str] = {}
+
+    def archive_entries(self, ident: str) -> dict[str, tuple[str, int]]:
+        if ident not in self._release:
+            archive = self.lock.archive(ident)
+            path = self.cache / archive.cache_path
+            check_file(path, archive.sha256, archive.size, f"InRelease {ident}")
+            text = gpgv_verify(path, self.root / archive.keyring, archive.signer, self.gpgv)
+            self._release[ident] = release_sha256(text)
+        return self._release[ident]
+
+    def index_text(self, ident: str) -> str:
+        if ident not in self._index_text:
+            index = self.lock.index(ident)
+            listed = self.archive_entries(index.archive).get(index.file)
+            if listed is None:
+                raise VerifyError(f"index {ident}: {index.file} нет в InRelease {index.archive}")
+            if listed != (index.sha256, index.size):
+                raise VerifyError(
+                    f"index {ident}: в InRelease {listed[0]} {listed[1]}, "
+                    f"в lock {index.sha256} {index.size}"
+                )
+            path = self.cache / index.cache_path
+            check_file(path, index.sha256, index.size, f"index {ident}")
+            self._index_text[ident] = read_index(path)
+        return self._index_text[ident]
+
+    def verify_deb(self, deb: lockfile.Deb) -> Path:
+        what = f"deb {deb.package}"
+        stanzas = [
+            s
+            for s in find_stanzas(self.index_text(deb.index), "Package", [deb.package])
+            if s.get("Version") == deb.version and s.get("Architecture") == deb.arch
+        ]
+        if len(stanzas) != 1:
+            raise VerifyError(
+                f"{what}: в индексе {deb.index} {len(stanzas)} строф {deb.version} {deb.arch}"
+            )
+        stanza = stanzas[0]
+        filename = stanza.get("Filename", "")
+        if filename.rsplit("/", 1)[-1] != deb.file:
+            raise VerifyError(f"{what}: в индексе файл {filename}, в lock {deb.file}")
+        if not deb.url.endswith("/" + filename.replace("+", "%2B")) and not deb.url.endswith(
+            "/" + filename
+        ):
+            raise VerifyError(f"{what}: URL {deb.url} не ведёт на {filename} из индекса")
+        if (stanza.get("SHA256"), stanza.get("Size")) != (deb.sha256, str(deb.size)):
+            raise VerifyError(
+                f"{what}: в индексе {stanza.get('SHA256')} {stanza.get('Size')}, "
+                f"в lock {deb.sha256} {deb.size}"
+            )
+        if source_of(stanza) != (deb.source, deb.source_version):
+            raise VerifyError(
+                f"{what}: исходник в индексе {source_of(stanza)}, "
+                f"в lock {(deb.source, deb.source_version)}"
+            )
+        path = self.cache / deb.cache_path
+        check_file(path, deb.sha256, deb.size, what)
+        control = deb_control(path, self.dpkg_deb)
+        got = (control.get("Package"), control.get("Version"), control.get("Architecture"))
+        if got != (deb.package, deb.version, deb.arch):
+            raise VerifyError(f"{what}: control пакета {got}")
+        if source_of(control) != (deb.source, deb.source_version):
+            raise VerifyError(f"{what}: Source в control {source_of(control)}")
+        return path
+
+    def verify_debs(self) -> list[Path]:
+        if self.lock.todo_pin:
+            raise VerifyError(f"незакреплённые входы (TODO-PIN): {'; '.join(self.lock.todo_pin)}")
+        return [self.verify_deb(deb) for deb in self.lock.debs]
+
+    def verify_sources(self) -> list[Path]:
+        """Все `# source:` из lock и полнота архивов каждого `.dsc`."""
+        if self.lock.todo_pin:
+            raise VerifyError(f"незакреплённые входы (TODO-PIN): {'; '.join(self.lock.todo_pin)}")
+        paths: list[Path] = []
+        dsc_files: dict[str, dict[str, tuple[str, int]]] = {}
+        for source in self.lock.sources:
+            what = f"source {source.id}"
+            path = self.cache / source.cache_path
+            if source.index is not None:
+                listed = self._listed_in_sources(source)
+                if listed != (source.sha256, source.size):
+                    raise VerifyError(f"{what}: в индексе {listed}, в lock {source.sha256}")
+            check_file(path, source.sha256, source.size, what)
+            if source.file.endswith(".dsc"):
+                dsc = parse_deb822(strip_pgp(path.read_text(encoding="utf-8")))
+                if len(dsc) != 1 or "Checksums-Sha256" not in dsc[0]:
+                    raise VerifyError(f"{what}: нет Checksums-Sha256 в {source.file}")
+                dsc_files[source.id] = checksums(dsc[0]["Checksums-Sha256"])
+            paths.append(path)
+        for source in self.lock.sources:
+            if source.dsc is None:
+                continue
+            listed = dsc_files[source.dsc].get(source.file)
+            if listed != (source.sha256, source.size):
+                raise VerifyError(f"source {source.id}: в {source.dsc} {listed}, в lock другое")
+        for ident, files in dsc_files.items():
+            recorded = {s.file for s in self.lock.sources if s.dsc == ident}
+            missing = sorted(set(files) - recorded)
+            if missing:
+                raise VerifyError(f"source {ident}: в lock нет архивов {', '.join(missing)}")
+        return paths
+
+    def _listed_in_sources(self, source: lockfile.Source) -> tuple[str, int] | None:
+        assert source.index is not None
+        text = self.index_text(source.index)
+        found: list[tuple[str, int]] = []
+        for block in re.split(r"\n\s*\n", text):
+            if source.file not in block:
+                continue
+            for stanza in parse_deb822(block):
+                listed = checksums(stanza.get("Checksums-Sha256", "")).get(source.file)
+                if listed is not None:
+                    found.append(listed)
+        if len(found) > 1:
+            raise VerifyError(f"source {source.id}: {source.file} в индексе несколько раз")
+        return found[0] if found else None
+
+
+def strip_pgp(text: str) -> str:
+    """Тело clearsigned-файла (.dsc) без заголовка и подписи; неподписанный — как есть."""
+    lines = text.splitlines()
+    if not lines or lines[0] != "-----BEGIN PGP SIGNED MESSAGE-----":
+        return text
+    try:
+        start = lines.index("") + 1
+        end = lines.index("-----BEGIN PGP SIGNATURE-----")
+    except ValueError:
+        raise VerifyError("clearsigned-файл повреждён") from None
+    return "\n".join(line[2:] if line.startswith("- ") else line for line in lines[start:end])
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="проверка происхождения Debian-входов AppImage")
+    parser.add_argument("--lock", type=Path, required=True)
+    parser.add_argument("--cache", type=Path, required=True)
+    parser.add_argument(
+        "--root", type=Path, default=Path(__file__).resolve().parents[2], help="корень репозитория"
+    )
+    parser.add_argument("command", choices=("debs", "sources"))
+    args = parser.parse_args(argv)
+    try:
+        lock = lockfile.load(args.lock)
+        verifier = Verifier(lock, args.cache, args.root)
+        if args.command == "debs":
+            paths = verifier.verify_debs()
+            for deb in lock.debs:
+                print(f"происхождение: {deb.package} {deb.version} {deb.arch} — OK")
+        else:
+            paths = verifier.verify_sources()
+    except (OSError, lockfile.LockError, VerifyError) as exc:
+        print(f"ОШИБКА: происхождение: {exc}", file=sys.stderr)
+        return 1
+    print(f"debverify {args.command}: {len(paths)} файлов, цепочка подписи и sha256 сошлась")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

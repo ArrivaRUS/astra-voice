@@ -35,7 +35,10 @@ lockfile = load("appimage_lockfile", ROOT / "packaging" / "appimage" / "lockfile
 check_bundle = load("appimage_check_bundle", ROOT / "packaging" / "appimage" / "check_bundle.py")
 
 SHA = "a" * 64
-GOOD_LOCK = f"""# expect-elf: 157
+GOOD_LOCK = f"""# base: python-appimage
+# openssl-origin: bundled
+# openssl-major: 1
+# expect-elf: 157
 # max-glibc: 2.28
 # runtime-key: 570C77ACEA40C0F1B758902CBF96CCA56490F695
 # tool: runtime-x86_64 {SHA} 1 https://example.invalid/runtime-x86_64
@@ -53,18 +56,28 @@ numpy==1.24.2 \\
 
 def test_real_lock_parses_with_pins_from_t1() -> None:
     lock = lockfile.load(LOCK)
-    assert lock.expect_elf == 157
-    assert lock.max_glibc == (2, 28)
+    # «Ревизия 3»: база Debian 12, OpenSSL 3 с хоста, порог glibc гибрида.
+    assert lock.base == "debian12"
+    assert lock.directives["openssl-origin"] == "host"
+    assert lock.openssl_major == 3
+    assert lock.max_glibc == (2, 36)
     assert lock.runtime_key == "570C77ACEA40C0F1B758902CBF96CCA56490F695"
-    assert {tool.name for tool in lock.tools} >= set(lockfile.REQUIRED_TOOLS)
-    assert lock.python_tool.name.startswith("python3.11.16-")
+    assert {tool.name for tool in lock.tools} == set(lockfile.REQUIRED_TOOLS)
     assert all(tool.url.startswith("https://github.com/") for tool in lock.tools)
+    assert sorted(deb.package for deb in lock.debs) == sorted(lockfile.PYTHON_DEBS)
+    assert len({deb.version for deb in lock.debs}) == 1
+    assert all(deb.url.startswith("https://snapshot.debian.org/") for deb in lock.debs)
+    assert lock.todo_pin == []
     names = {req.name for req in lock.requirements} | {name for name, _ in lock.todo}
     # arch/appimage.md §11 п.1: схема каталога в бандле обязательна.
     assert {"jsonschema", "attrs", "pyrsistent"} <= names
     assert ("jsonschema", "4.10.3") in lock.todo or any(
         req.name == "jsonschema" and req.version == "4.10.3" for req in lock.requirements
     )
+    # Колёса прежние (R3: меняется только интерпретатор).
+    pins = {req.name: req.version for req in lock.requirements}
+    assert pins["PyQt5"] == "5.15.11"
+    assert pins["PyQt5-Qt5"] == "5.15.19"
 
 
 def test_engine_pins_match_deb_lock() -> None:
@@ -113,9 +126,15 @@ def test_bad_lock_rejected(change: tuple[str, str], message: str) -> None:
         lockfile.parse(GOOD_LOCK.replace(old, new, 1))
 
 
-def test_lock_needs_four_tools() -> None:
+def test_lock_needs_required_tools() -> None:
     text = "\n".join(line for line in GOOD_LOCK.splitlines() if "appimagetool" not in line)
-    with pytest.raises(lockfile.LockError, match="ожидалось 4"):
+    with pytest.raises(lockfile.LockError, match="нет инструмента appimagetool"):
+        lockfile.parse(text)
+
+
+def test_python_appimage_base_needs_python_tool() -> None:
+    text = "\n".join(line for line in GOOD_LOCK.splitlines() if "python3.11.16" not in line)
+    with pytest.raises(lockfile.LockError, match="нужен ровно один инструмент python3.11"):
         lockfile.parse(text)
 
 
@@ -236,13 +255,19 @@ def test_sbom_appdir_names_openssl_and_tools(tmp_path: Path) -> None:
     (lib / "libssl.so").symlink_to("libssl.so.1.1")
     (appdir / "data.txt").write_text("не ELF\n", encoding="utf-8")
     out = tmp_path / "sbom-appimage.cdx.json"
+    # SBOM базы debian12 (OpenSSL с хоста, Debian-компоненты) — следующий шаг R3; здесь
+    # проверяется прежняя модель на lock отката (г) с бандловым OpenSSL.
+    legacy = tmp_path / "appimage.lock"
+    legacy.write_text(
+        GOOD_LOCK.replace("# TODO-HASH: jsonschema==4.10.3 py3-none-any\n", ""), "utf-8"
+    )
     command = [
         sys.executable,
         str(ROOT / "scripts" / "sbom.py"),
         "--appdir",
         str(appdir),
         "--lock",
-        str(LOCK),
+        str(legacy),
         "--out",
         str(out),
     ]
@@ -251,13 +276,13 @@ def test_sbom_appdir_names_openssl_and_tools(tmp_path: Path) -> None:
     bom: dict[str, Any] = json.loads(out.read_text(encoding="utf-8"))
     components = {comp["bom-ref"]: comp for comp in bom["components"]}
     assert components["pkg:generic/openssl@1.1.1k"]["name"] == "openssl"
-    python = components[f"tool:{lockfile.load(LOCK).python_tool.name}"]
+    python = components[f"tool:{lockfile.load(legacy).python_tool.name}"]
     assert python["version"] == "3.11.16"
     assert components["tool:appimagetool-x86_64.AppImage"]["scope"] == "excluded"
     assert components["file:/usr/lib/libssl.so.1.1"]["hashes"][0]["alg"] == "SHA-256"
     assert "file:/usr/lib/libssl.so" not in components
     wheels = [ref for ref in components if ref.startswith("pkg:pypi/")]
-    assert len(wheels) == len(lockfile.load(LOCK).requirements)
+    assert len(wheels) == len(lockfile.load(legacy).requirements)
     assert bom["metadata"]["timestamp"] == "2026-09-21T14:13:20Z"
     assert bom["metadata"]["component"]["properties"][0]["value"] == "0123456789ab"
     # Без libssl версия OpenSSL не названа — SBOM не пишется.
