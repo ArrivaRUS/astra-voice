@@ -27,8 +27,19 @@ die() {
 }
 
 # «:» в пути ломает списки путей (QT_PLUGIN_PATH, QML2_IMPORT_PATH): отказ сразу и понятно.
+# Своя временная распаковка (appimage_extracted_*, наш владелец, маркер сборки, не ссылка)
+# перед отказом удаляется: runtime её не убирает.
 case $HERE in
-    *:*) die 'Astra Voice не запускается из папки, в пути к которой есть двоеточие «:». Переместите файл программы в другую папку.' ;;
+    *:*)
+        case ${HERE##*/} in
+            appimage_extracted_*)
+                if [ -O "$HERE" ] && [ ! -L "$HERE" ] && [ -f "$HERE/.astra-voice-build" ]; then
+                    rm -rf "$HERE" || :
+                fi
+                ;;
+        esac
+        die 'Astra Voice не запускается из папки, в пути к которой есть двоеточие «:». Переместите файл программы в другую папку.'
+        ;;
 esac
 
 # T1-01.10: MJ-3 — при `id -u` = 0 отказ до любых действий: «Версия AppImage не
@@ -155,16 +166,23 @@ QT5_DIR=$HERE/opt/python3.11/lib/python3.11/site-packages/PyQt5/Qt5
 QT_PLUGIN_PATH=$QT5_DIR/plugins
 QML2_IMPORT_PATH=$QT5_DIR/qml
 export QT_PLUGIN_PATH QML2_IMPORT_PATH
-# Кириллица в пути при однобайтовой локали (LC_ALL=C и т. п.): Qt 5 зацикливается при
-# создании приложения (проверено 29.09, offscreen). Процессу программы — C.UTF-8; внешним
-# программам childenv вернёт исходное значение LC_ALL.
+# Кириллица в пути при однобайтовой кодировке (LC_ALL=C, LC_CTYPE=C …): Qt 5 зацикливается
+# при создании приложения (проверено 29.09, offscreen). Меняем только кодировку: задан
+# LC_ALL — его на C.UTF-8; иначе только LC_CTYPE=C.UTF-8, чтобы язык сообщений (LC_MESSAGES,
+# LANG) остался прежним. Внешним программам childenv вернёт исходные значения.
 if printf '%s' "$HERE" | LC_ALL=C grep -q '[^ -~]'; then
     case $(locale charmap 2>/dev/null) in
         UTF-8 | utf8) ;;
         *)
-            save_originals LC_ALL
-            LC_ALL=C.UTF-8
-            export LC_ALL
+            if [ -n "${LC_ALL:-}" ]; then
+                save_originals LC_ALL
+                LC_ALL=C.UTF-8
+                export LC_ALL
+            else
+                save_originals LC_CTYPE
+                LC_CTYPE=C.UTF-8
+                export LC_CTYPE
+            fi
             ;;
     esac
 fi

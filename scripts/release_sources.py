@@ -241,6 +241,9 @@ def _members(tar: tarfile.TarFile) -> Iterator[tarfile.TarInfo]:
 class _LimitedTarInfo(tarfile.TarInfo):
     """Служебные заголовки (pax, длинные имена) больше HEADER_LIMIT — отказ до их чтения."""
 
+    # ВНИМАНИЕ: `_proc_member` — внутренний API tarfile (проверено на Python 3.11). При смене
+    # версии Python первым смотреть test_check_rejects_hardlink_and_huge_header.
+
     def _proc_member(self, tar: tarfile.TarFile) -> tarfile.TarInfo:
         if self.type in _HEADER_TYPES and self.size > HEADER_LIMIT:
             raise SourcesError(f"служебный заголовок tar {self.size} байт больше предела")

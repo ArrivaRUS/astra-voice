@@ -376,9 +376,16 @@ def test_colon_in_path_refused(tmp_path: Path, env: dict[str, str], shell: str |
 @pytest.mark.parametrize(
     ("where", "locale_env", "expected"),
     [
-        ("Мои программы", {"LC_ALL": "C"}, "C.UTF-8"),
-        ("Мои программы", {"LANG": "C.UTF-8"}, None),
-        ("programs", {"LC_ALL": "C"}, "C"),
+        ("Мои программы", {"LC_ALL": "C"}, {"LC_ALL": "C.UTF-8"}),
+        ("Мои программы", {"LANG": "C.UTF-8"}, {"LANG": "C.UTF-8"}),
+        ("programs", {"LC_ALL": "C"}, {"LC_ALL": "C"}),
+        # Ревью: язык сообщений не трогаем — только кодировка (LC_CTYPE).
+        (
+            "Мои программы",
+            {"LANG": "ru_RU.UTF-8", "LC_CTYPE": "C"},
+            {"LANG": "ru_RU.UTF-8", "LC_CTYPE": "C.UTF-8"},
+        ),
+        ("Мои программы", {"LANG": "C"}, {"LANG": "C", "LC_CTYPE": "C.UTF-8"}),
     ],
 )
 def test_cyrillic_path_with_single_byte_locale(
@@ -386,16 +393,31 @@ def test_cyrillic_path_with_single_byte_locale(
     env: dict[str, str],
     where: str,
     locale_env: dict[str, str],
-    expected: str | None,
+    expected: dict[str, str],
 ) -> None:
-    """Qt 5 зацикливается на кириллице в пути при LC_ALL=C: процессу — C.UTF-8, детям — своё."""
+    """Qt 5 зацикливается на кириллице в пути при однобайтовой кодировке: процессу — UTF-8
+    (LC_ALL, если он задан, иначе только LC_CTYPE), детям — исходные значения."""
     bundle = _bundle(tmp_path / where / "Astra Voice")
     run_env = {k: v for k, v in env.items() if k != "LANG"}
     run_env.update(locale_env, ASTRA_VOICE_PORTABLE="1")
     assert _run(bundle / "AppRun", ["--hidden"], run_env).returncode == 0
     final = _final_env(env)
-    assert final.get("LC_ALL") == expected
-    assert childenv.clean_env(final).get("LC_ALL") == locale_env.get("LC_ALL")
+    names = ("LC_ALL", "LC_CTYPE", "LANG")
+    assert {n: final[n] for n in names if n in final} == expected
+    child = childenv.clean_env(final)
+    assert {n: child[n] for n in names if n in child} == locale_env
+
+
+def test_colon_refusal_drops_own_extraction(tmp_path: Path, env: dict[str, str]) -> None:
+    """Ревью, nit: отказ при «:» в режиме распаковки убирает свою распаковку, чужое — нет."""
+    bundle = _bundle(tmp_path / "a:b" / "appimage_extracted_0123abcd")
+    proc = _run(bundle / "AppRun", ["--hidden"], env)
+    assert proc.returncode == 1
+    assert "двоеточие «:»" in proc.stderr
+    assert not bundle.exists()
+    foreign = _bundle(tmp_path / "c:d" / "Astra Voice")
+    assert _run(foreign / "AppRun", ["--hidden"], env).returncode == 1
+    assert foreign.exists()
 
 
 def test_managed_list_matches_python() -> None:

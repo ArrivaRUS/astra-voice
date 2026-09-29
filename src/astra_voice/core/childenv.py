@@ -39,7 +39,7 @@ APPRUN_MANAGED = (
     "SSL_CERT_FILE",
 )
 # Что AppRun меняет только по условию (кириллица в пути при однобайтовой локали), не снимая.
-APPRUN_CONDITIONAL = ("LC_ALL",)
+APPRUN_CONDITIONAL = ("LC_ALL", "LC_CTYPE")
 # Что ставит bootstrap.py (стиль и рендер Qt Quick, запрет autospawn PulseAudio).
 BOOTSTRAP_MANAGED = (
     "QT_QUICK_CONTROLS_STYLE",
