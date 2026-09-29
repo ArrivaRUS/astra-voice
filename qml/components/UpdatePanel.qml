@@ -227,13 +227,14 @@ Rectangle {
                     height: noteLine.implicitHeight
 
                     // Маркер — круг 4 × 4 в отступе (как маркер `ul` в макете): x = 2, центр на
-                    // 5,5 px ниже верха заглавных букв первой строки пункта.
+                    // верх маркера на 3 ряда ниже верха заглавных первой строки пункта, как в макете
+                    // (4,5 в расчёте: tightBoundingRect при NativeRendering и round дают ~1 px).
                     Rectangle {
                         objectName: "updateNoteMarker"
                         visible: parent.modelData.bullet === true
                         x: 2
                         y: Math.round(noteLine.baselineOffset + capBox.tightBoundingRect("Н").y
-                                      + 5.5 - height / 2)
+                                      + 4.5 - height / 2)
                         width: 4
                         height: 4
                         radius: 2
