@@ -840,6 +840,8 @@ def main(argv: list[str] | None = None) -> int:
             OSError,
             paths.PathError,
             autostart.AutostartError,
+            # UnicodeEncodeError: путь с байтами не в UTF-8 не кодируется в запись меню.
+            ValueError,
         ) as error:
             sys.stderr.write(
                 f"Не удалось добавить Astra Voice в меню: {userinstall.tilde(error)}\n"

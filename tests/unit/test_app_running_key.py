@@ -253,3 +253,22 @@ def test_unregister_failure_is_reported(
     output = capsys.readouterr()
     assert "Не удалось убрать Astra Voice из меню и автозапуска: ~/bad" in output.err
     assert output.out == ""
+
+
+def test_register_unencodable_path_warns_and_continues(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ревью P3: путь не в UTF-8 (UnicodeEncodeError ⊂ ValueError) не роняет запуск."""
+    monkeypatch.setattr(paths, "install_kind", lambda: paths.InstallKind.APPIMAGE_INSTALLED)
+    error = UnicodeEncodeError("utf-8", "/home/u/\udcff", 8, 9, "surrogates not allowed")
+    monkeypatch.setattr(userinstall, "register", Mock(side_effect=error))
+    assert app.main(["--register", "--version"]) == 0
+    output = capsys.readouterr()
+    assert "Не удалось добавить Astra Voice в меню" in output.err
+    assert output.out.startswith("astra-voice ")
+
+
+def test_menu_entry_for_unencodable_path_raises_value_error() -> None:
+    """Откуда берётся ValueError: запись меню кодируется в UTF-8 строго."""
+    with pytest.raises(ValueError):
+        userinstall.menu_entry_bytes(Path("/home/u/\udcff/AppRun"), "0.2.0")

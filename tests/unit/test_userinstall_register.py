@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -375,7 +376,6 @@ def test_register_guards_run_before_any_write(
 def test_remove_program_uses_install_lock_and_never_follows_copy_links(
     home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from collections.abc import Iterator
     from contextlib import contextmanager
 
     copy = installed(monkeypatch)
@@ -468,3 +468,114 @@ def test_status_reads_existing_runtime_without_chmod(
     assert userinstall.status().running == KEY
     assert tree_snapshot(home) == before
     assert mtimes(home) == times
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_autostart_symlink_does_not_stop_register_unregister_remove(
+    home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    dangling: bool,
+) -> None:
+    """Ревью P3: ссылка вместо записи автозапуска — предупреждение, остальное доделывается."""
+    installed(monkeypatch)
+    target = tmp_path / "linked.desktop"
+    if not dangling:
+        target.write_bytes(autostart.entry_bytes(autostart.DEB_EXECUTABLE))
+    startup = home / "config/autostart/astra-voice.desktop"
+    startup.parent.mkdir(parents=True)
+    startup.symlink_to(target)
+    deb = put(home / "fake-deb", b"never run")
+    deb.chmod(0o755)
+
+    result = userinstall.register()
+    assert result.menu == "written" and len(result.icons_written) == 2
+    assert result.autostart is False
+    assert "симлинк" in caplog.text and str(home) not in caplog.text
+
+    unregistered = userinstall.unregister(deb_executable=deb)
+    assert unregistered.menu and len(unregistered.icons) == 2
+    assert unregistered.autostart is False
+
+    userinstall.register()
+    monkeypatch.setattr(paths, "SYSTEM_EXECUTABLE", deb)
+    removed = userinstall.remove_program()
+    assert removed.unregistered.menu and KEY in removed.removed
+    assert not (paths.appimage_app_dir() / KEY).exists()
+    assert startup.is_symlink()
+    assert (
+        not target.exists()
+        if dangling
+        else target.read_bytes() == autostart.entry_bytes(autostart.DEB_EXECUTABLE)
+    )
+
+
+def test_icons_are_best_effort_and_autostart_still_retargeted(
+    home: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ревью P3: сбой значка — предупреждение; меню и автозапуск делаются независимо."""
+    installed(monkeypatch)
+    startup = put(
+        home / "config/autostart/astra-voice.desktop",
+        autostart.entry_bytes(autostart.DEB_EXECUTABLE),
+    )
+    put(home / "data/icons/hicolor/48x48/apps", b"not a directory")
+    result = userinstall.register()
+    assert result.menu == "written"
+    assert [icon.name for icon in result.icons_written] == ["astravoice.svg"]
+    assert result.autostart is True
+    assert startup.read_bytes() == autostart.entry_bytes(str(paths.appimage_current_apprun()))
+    assert "Значок astravoice.png не добавлен" in caplog.text
+    assert str(home) not in caplog.text
+
+
+def test_icons_walk_failure_does_not_stop_register(
+    home: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    installed(monkeypatch)
+    startup = put(
+        home / "config/autostart/astra-voice.desktop",
+        autostart.entry_bytes(autostart.DEB_EXECUTABLE),
+    )
+
+    def broken(_root: Path, *, links: bool = False) -> Iterator[Path]:
+        raise PermissionError("нет доступа")
+        yield _root  # pragma: no cover — генератор
+
+    monkeypatch.setattr(userinstall, "_icon_files", broken)
+    result = userinstall.register()
+    assert result.icons_written == () and result.autostart is True
+    assert startup.read_bytes() == autostart.entry_bytes(str(paths.appimage_current_apprun()))
+    assert "Значки программы не добавлены" in caplog.text
+
+
+@pytest.mark.parametrize("xdg", [None, "", "relative/run"])
+def test_running_key_read_without_xdg_checks_session_dir(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, xdg: str | None
+) -> None:
+    """Ревью P3: без XDG_RUNTIME_DIR чтение смотрит и /run/user/<uid>/astra-voice."""
+    root = tmp_path / "run-user"
+    monkeypatch.setattr(paths, "USER_RUNTIME_ROOT", root)
+    session = root / str(os.getuid()) / "astra-voice"
+    session.mkdir(parents=True, mode=0o700)
+    put(session / "running-key", (KEY + "\n").encode())
+    if xdg is None:
+        monkeypatch.delenv("XDG_RUNTIME_DIR")
+    else:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", xdg)
+    assert userinstall.running_key_path() == session / "running-key"
+    assert userinstall.read_running_key() == KEY
+    # Запись по-прежнему — в запасной каталог: /run/user без XDG не создаём и не трогаем.
+    assert paths.runtime_dir() == tmp_path / f"astra-voice-{os.getuid()}"
+
+
+def test_running_key_session_dir_ignored_with_xdg(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "run-user"
+    monkeypatch.setattr(paths, "USER_RUNTIME_ROOT", root)
+    session = root / str(os.getuid()) / "astra-voice"
+    session.mkdir(parents=True, mode=0o700)
+    put(session / "running-key", (KEY + "\n").encode())
+    assert userinstall.read_running_key() is None

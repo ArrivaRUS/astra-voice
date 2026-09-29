@@ -25,6 +25,8 @@ SYSTEM_EXECUTABLE = Path("/usr/bin/astra-voice")
 RESOURCES_ENV = "ASTRA_VOICE_RESOURCES"
 # Запасной корень runtime-каталога (тесты подменяют).
 FALLBACK_TMP_DIR = Path("/tmp")
+# Корень каталогов сеанса logind (/run/user/<uid>) — только для чтения без XDG_RUNTIME_DIR.
+USER_RUNTIME_ROOT = Path("/run/user")
 
 # AppImage (arch/appimage.md §1). Каталог бандла ставит AppRun.
 APPIMAGE_DIR_ENV = "ASTRA_VOICE_APPIMAGE_DIR"
@@ -142,20 +144,29 @@ def runtime_dir() -> Path:
     return _ensure_private_dir(fallback)
 
 
-def _runtime_dir_candidates() -> tuple[Path, ...]:
-    """Кандидаты ``runtime_dir()`` по порядку; последний — запасной в ``/tmp``."""
+def _runtime_dir_candidates(*, reading: bool = False) -> tuple[Path, ...]:
+    """Кандидаты ``runtime_dir()`` по порядку; последний — запасной в ``/tmp``.
+
+    ``reading`` — для чтения чужих отметок: без ``XDG_RUNTIME_DIR`` (терминал через
+    ``runuser``, cron) программа сеанса всё равно могла писать в ``/run/user/<uid>``.
+    """
     raw = os.environ.get("XDG_RUNTIME_DIR", "").strip()
     fallback = FALLBACK_TMP_DIR / f"{APP_NAME}-{os.getuid()}"
-    return (Path(raw) / APP_NAME, fallback) if raw.startswith("/") else (fallback,)
+    if raw.startswith("/"):
+        return (Path(raw) / APP_NAME, fallback)
+    if reading:
+        return (USER_RUNTIME_ROOT / str(os.getuid()) / APP_NAME, fallback)
+    return (fallback,)
 
 
 def existing_runtime_dir() -> Path | None:
-    """Каталог, который выбрал бы ``runtime_dir()``, — только чтение, без mkdir/chmod.
+    """Каталог, куда могла писать работающая копия, — только чтение, без mkdir/chmod.
 
     Первый кандидат, уже существующий как наш каталог (не symlink); ``None`` — ни
-    одного нет, значит, в runtime ещё ничего не записано.
+    одного нет, значит, в runtime ещё ничего не записано. Без ``XDG_RUNTIME_DIR``
+    сначала проверяется каталог сеанса ``/run/user/<uid>/astra-voice``.
     """
-    for candidate in _runtime_dir_candidates():
+    for candidate in _runtime_dir_candidates(reading=True):
         try:
             info = candidate.lstat()
         except OSError:

@@ -278,7 +278,8 @@ def check_free_space(path: Path, required: int = MIN_FREE_BYTES) -> None:
 def running_key_path() -> Path | None:
     """Путь для чтения без создания каталогов (в том числе из status()).
 
-    Каталог выбирается тем же правилом, что и при записи (``paths.runtime_dir()``).
+    Каталог выбирается тем же правилом, что и при записи (``paths.runtime_dir()``);
+    без ``XDG_RUNTIME_DIR`` сначала — каталог сеанса ``/run/user/<uid>/astra-voice``.
     """
     directory = paths.existing_runtime_dir()
     return None if directory is None else directory / RUNNING_KEY_NAME
@@ -710,22 +711,34 @@ def register() -> RegisterResult:
         menu_result = "written" if _write_desktop_file(menu, data) else "unchanged"
     written: list[Path] = []
     skipped: list[Path] = []
+    try:
+        _copy_icons(copy, icons, written, skipped)
+    except (OSError, UserInstallError) as exc:
+        log.warning("Значки программы не добавлены: %s", tilde(exc))
+    # Автозапуск перенацеливается независимо от значков.
+    retargeted = autostart.retarget()
+    return RegisterResult(menu_result, tuple(written), tuple(skipped), retargeted)
+
+
+def _copy_icons(copy: Path, icons: Path, written: list[Path], skipped: list[Path]) -> None:
+    """Значки приложения — по возможности: сбой одного значка не мешает остальным."""
     source = copy
     for part in ("usr", "share", "icons", "hicolor"):
         source /= part
         if not _is_real_dir(source):
-            break
-    else:
-        for icon in _icon_files(source):
-            destination = icons / icon.relative_to(source)
+            return
+    for icon in _icon_files(source):
+        destination = icons / icon.relative_to(source)
+        try:
             fd = os.open(icon, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
             with os.fdopen(fd, "rb") as file:
                 if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
                     continue
                 changed = _write_desktop_file(destination, file.read())
-            (written if changed else skipped).append(destination)
-    retargeted = autostart.retarget()
-    return RegisterResult(menu_result, tuple(written), tuple(skipped), retargeted)
+        except (OSError, UserInstallError) as exc:
+            log.warning("Значок %s не добавлен: %s", destination.name, tilde(exc))
+            continue
+        (written if changed else skipped).append(destination)
 
 
 def unregister(*, deb_executable: Path | None = None) -> UnregisterResult:

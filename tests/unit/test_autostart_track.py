@@ -361,14 +361,17 @@ def test_retarget_rejects_control_characters(
 
 
 @pytest.mark.parametrize("dangling", [False, True])
-def test_retarget_rejects_symlink(user_entry: Path, tmp_path: Path, dangling: bool) -> None:
+def test_retarget_skips_symlink(
+    user_entry: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture, dangling: bool
+) -> None:
+    """Ревью P3: ссылку не трогаем и не падаем — предупреждение в журнал, False."""
     target = tmp_path / "target.desktop"
     if not dangling:
         target.write_bytes(DEB_ENTRY)
     user_entry.parent.mkdir(parents=True)
     user_entry.symlink_to(target)
-    with pytest.raises(autostart.AutostartError, match="симлинком"):
-        autostart.retarget(str(paths.appimage_current_apprun()))
+    assert autostart.retarget(str(paths.appimage_current_apprun())) is False
+    assert "симлинк" in caplog.text
     assert user_entry.is_symlink()
     assert not target.exists() if dangling else target.read_bytes() == DEB_ENTRY
 
