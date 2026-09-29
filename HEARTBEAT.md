@@ -910,3 +910,15 @@ T-163…T-174 перенести из arch/appimage.md в test-plan; текст�
 - Дальше S5-A5: E3 мини-Ц2 на 20 диктовок со `stream` на стенде virtual_mic (предупредить заказчика), сверка подписи
   switched vs audio.ready (P3), затем PR на бэкенд по умолчанию, живая проверка ~03.10.
 - Порядок: агентам — уникальные имена скриптов в scratchpad (общий t.sh перезаписывался).
+
+## 2026-09-29 ~19:30 — M9-а и загрузчик в работе; лицензии
+- Заказчик проверил 0.1.1~dev1: Enter в форме Cowork ок, «Сеть и обновления» ок. Урок 027.
+- В работе (Claude developer): `wip/m9a-about` (раздел «О программе»), `wip/dl-threads` (загрузчик на threading + очередь
+  по уроку 026; лямбды на сигналах; флейк `test_model_install_failure_message_uses_reason_code`; докачка на urllib3 2.x).
+- `wip/m9a-docs` `23e34a7` (tech-writer): NOTICE и PRIVACY заново по коду; на сверке code-reviewer; + правка INSTALL-ADMIN.
+- **Лицензии (к legal-analyst):** OpenSSL 1.1.1k (OpenSSL/SSLeay) в бандле AppImage с GPL-3.0 (PyQt5 GPL-3.0) —
+  известная несовместимость; Qt LGPL — предложение исходников; нужно ли письменное предложение исходников GPL.
+- Упаковка (после четверга, в r2-ci/developer): `debian/rules` — цикл доков без `|| true` (падать на отсутствии);
+  `debian/copyright` — `silero_vad.onnx`, `smoke-ru.wav`; AppImage `build.sh` — класть NOTICE/PRIVACY в бандл;
+  `appimage.lock` — проверить отсутствие protobuf/flatbuffers/sympy/packaging (объявлены onnxruntime).
+- Мини-Ц2 S5-A5 (20 диктовок, ~5 мин клавиатура/буфер/микрофон заказчика) — ждёт удобного времени от заказчика.
