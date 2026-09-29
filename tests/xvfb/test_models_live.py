@@ -136,33 +136,56 @@ def settle(
             pytest.fail(f"не дождались: {what}; сообщения Qt: {live.messages}")
 
 
-def card_item(live: LiveWindow, model_id: str) -> Any:
+def find_card(live: LiveWindow, model_id: str) -> Any | None:
+    """Карточка, если на экране ровно одна; иначе None — для предикатов ``settle``."""
     cards = [
         item
         for item in visual_tree(live.root)
         if item.isVisible() and item.property("modelId") == model_id
     ]
-    assert len(cards) == 1, f"ожидалась одна карточка {model_id}, найдено {len(cards)}"
-    return cards[0]
+    return cards[0] if len(cards) == 1 else None
+
+
+def card_item(live: LiveWindow, model_id: str) -> Any:
+    card = find_card(live, model_id)
+    assert card is not None, f"ожидалась ровно одна карточка {model_id}"
+    return card
+
+
+def card_property(live: LiveWindow, model_id: str, name: str) -> Any:
+    card = find_card(live, model_id)
+    return card.property(name) if card is not None else None
 
 
 def card_state(live: LiveWindow, model_id: str) -> str:
-    return str(card_item(live, model_id).property("cardState"))
+    return str(card_property(live, model_id, "cardState"))
 
 
-def strip_item(live: LiveWindow) -> Any:
+def find_strip(live: LiveWindow) -> Any | None:
     strips = [
         item
         for item in visual_tree(live.root)
         if item.metaObject().indexOfProperty("downloadState") >= 0
         and item.metaObject().indexOfProperty("sourceText") >= 0
     ]
-    assert len(strips) == 1, f"ожидалась одна полоса загрузки, найдено {len(strips)}"
-    return strips[0]
+    return strips[0] if len(strips) == 1 else None
+
+
+def strip_item(live: LiveWindow) -> Any:
+    strip = find_strip(live)
+    assert strip is not None, "ожидалась ровно одна полоса загрузки"
+    return strip
+
+
+def strip_property(live: LiveWindow, name: str) -> Any:
+    strip = find_strip(live)
+    return strip.property(name) if strip is not None else None
 
 
 def strip_state(live: LiveWindow) -> str:
-    strip = strip_item(live)
+    strip = find_strip(live)
+    if strip is None:
+        return "missing"
     return str(strip.property("downloadState")) if strip.isVisible() else "hidden"
 
 
@@ -270,7 +293,7 @@ def select_and_download(live: LiveWindow, *model_ids: str) -> None:
         click_item(card_item(live, model_id))
 
         def selected(model_id: str = model_id) -> bool:
-            return card_item(live, model_id).property("selected") is True
+            return card_property(live, model_id, "selected") is True
 
         settle(live, selected, f"отметка карточки {model_id}")
     press(visible_button(live.root, "Скачать выбранное"))
@@ -295,8 +318,8 @@ def test_live_queue_download_verify_ready(models_app: Any) -> None:
         settle(
             live,
             lambda: (
-                strip_item(live).property("sourceText") == "Скачиваю с huggingface.co"
-                and strip_item(live).property("progress") > 0
+                strip_property(live, "sourceText") == "Скачиваю с huggingface.co"
+                and (strip_property(live, "progress") or 0) > 0
             ),
             "источник и прогресс в полосе",
         )
@@ -493,7 +516,7 @@ def test_live_onboarding_strip_retry(models_app: Any) -> None:
         click_item(card_item(live, FIRST.id))
         settle(
             live,
-            lambda: card_item(live, FIRST.id).property("selected") is True,
+            lambda: card_property(live, FIRST.id, "selected") is True,
             "отметка карточки в мастере",
         )
         # «Продолжить» вдобавок сменил бы шаг; очередь запускаем тем же слотом, что и он.

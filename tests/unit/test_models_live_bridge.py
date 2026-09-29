@@ -17,6 +17,7 @@ import pytest
 from PyQt5.QtCore import QCoreApplication, QEvent
 
 from astra_voice.core import settings as settings_mod
+from astra_voice.models.catalog import CatalogEntry
 from astra_voice.models.downloader import DownloadError
 from astra_voice.ui.bridges import OnboardingController, SettingsBridge
 from astra_voice.ui.model_downloads import ModelDownloads
@@ -153,14 +154,20 @@ def test_failed_download_retries_from_strip_and_card(live: Live, where: str) -> 
     assert_gui_thread_only(live)
 
 
-def test_strip_retry_repeats_every_failed_card_in_catalog_order(live: Live) -> None:
-    live.port.failures[FIRST.id] = DownloadError("no-network")
-    live.port.failures[SECOND.id] = DownloadError("bad-checksum")
-    live.port.open_gates()
-    live.bridge.toggleModel(SECOND.id)
-    live.bridge.toggleModel(FIRST.id)
+def fail_alone(live: Live, entry: CatalogEntry, error: DownloadError) -> None:
+    """Отдельная очередь из одной записи, которая падает."""
+    live.port.failures[entry.id] = error
+    live.bridge.toggleModel(entry.id)
     live.bridge.startSelectedDownloads()
-    pump_until(lambda: live.bridge.downloadState == "failed" and live.idle(), "обе ошибки")
+    pump_until(lambda: live.state(entry.id) == "failed" and live.idle(), f"ошибка {entry.id}")
+
+
+def test_strip_retry_follows_catalog_not_failure_order(live: Live) -> None:
+    live.port.open_gates()
+    # Вторая по каталогу упала раньше первой.
+    fail_alone(live, SECOND, DownloadError("bad-checksum"))
+    fail_alone(live, FIRST, DownloadError("no-network"))
+    assert live.port.download_calls == [SECOND.id, FIRST.id]
     assert live.card(SECOND.id)["message"] == (
         "Не удалось загрузить модель — файл не прошёл проверку ни на одном сервере"
     )
@@ -172,7 +179,51 @@ def test_strip_retry_repeats_every_failed_card_in_catalog_order(live: Live) -> N
     assert live.bridge.downloadCounter == "1 из 2"
     live.port.download_gate.set()
     pump_until(lambda: live.bridge.downloadState == "done" and live.idle(), "обе модели готовы")
+    assert live.port.download_calls == [SECOND.id, FIRST.id, FIRST.id, SECOND.id]
+
+
+def test_strip_retry_twice_does_not_duplicate_queue(live: Live) -> None:
+    live.port.failures[FIRST.id] = DownloadError("no-network")
+    live.port.failures[SECOND.id] = DownloadError("no-network")
+    live.port.open_gates()
+    live.bridge.toggleModel(FIRST.id)
+    live.bridge.toggleModel(SECOND.id)
+    live.bridge.startSelectedDownloads()
+    pump_until(lambda: live.bridge.downloadState == "failed" and live.idle(), "обе ошибки")
+
+    live.port.download_gate.clear()
+    live.bridge.retryFailedDownloads()
+    live.bridge.retryFailedDownloads()
+    assert [entry.id for entry in live.downloads._queue] == [SECOND.id]
+    assert live.bridge.downloadCounter == "1 из 2"
+    live.port.download_gate.set()
+    pump_until(lambda: live.bridge.downloadState == "done" and live.idle(), "обе модели готовы")
     assert live.port.download_calls == [FIRST.id, SECOND.id, FIRST.id, SECOND.id]
+
+
+def test_strip_retry_during_running_queue_appends_failed(live: Live) -> None:
+    # Первая падает сразу, вторая стоит на загрузке.
+    live.port.failures[FIRST.id] = DownloadError("no-network")
+    live.port.hold_ids = {SECOND.id}
+    live.port.install_gate.set()
+    live.bridge.toggleModel(FIRST.id)
+    live.bridge.toggleModel(SECOND.id)
+    live.bridge.startSelectedDownloads()
+    pump_until(
+        lambda: live.state(FIRST.id) == "failed" and live.state(SECOND.id) == "downloading",
+        "первая упала, вторая качается",
+    )
+    pump_until(live.port.downloading.is_set, "вторая на воротах")
+
+    live.bridge.retryFailedDownloads()
+    # Очередь не перезапускается: упавшая встаёт в конец (_append_queue).
+    assert (live.state(FIRST.id), live.state(SECOND.id)) == ("queued", "downloading")
+    assert [entry.id for entry in live.downloads._queue] == [FIRST.id]
+    assert live.bridge.downloadState == "downloading"
+    live.port.download_gate.set()
+    pump_until(lambda: live.bridge.downloadState == "done" and live.idle(), "обе модели готовы")
+    assert live.port.download_calls == [FIRST.id, SECOND.id, FIRST.id]
+    assert [live.state(entry.id) for entry in (FIRST, SECOND)] == ["installed", "installed"]
 
 
 def test_revoked_card_is_not_redownloaded() -> None:
