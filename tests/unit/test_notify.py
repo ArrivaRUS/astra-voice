@@ -736,6 +736,23 @@ def test_microphone_change_button_opens_microphone_choice(transport: Mock, lost:
     handler.assert_called_once_with()
 
 
+@pytest.mark.parametrize("during_recording", [False, True])
+def test_microphone_lost_urgency_and_retry_depend_on_moment(
+    transport: Mock, during_recording: bool
+) -> None:
+    """Ревью S5-A5: посреди записи — обычное и без повтора; на старте — как было."""
+    transport.bus.isConnected.return_value = False
+    notifications.notify_microphone_lost(during_recording=during_recording)
+    notifications.notify_microphone_lost(during_recording=during_recording)
+    assert notifications.pending_count() == (0 if during_recording else 1)
+    transport.bus.isConnected.return_value = True
+    notifications.notify_microphone_lost(during_recording=during_recording)
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
+    assert args[3] == "Микрофон отключился"
+    assert args[5].value() == ["choose-microphone", "Выбрать микрофон"]
+    assert args[6]["urgency"].value() == (b"\x01" if during_recording else b"\x02")
+
+
 def test_microphone_changed_escapes_markup_in_body(transport: Mock) -> None:
     name = '<img src="http://127.0.0.1:1/x">'
     notifications.notify_microphone_changed(name)

@@ -119,6 +119,12 @@ class TrayPort(Protocol):
     def set_has_last_text(self, value: bool) -> None: ...
 
 
+class DeviceLostPort(Protocol):
+    """Уведомление «Микрофон отключился»: на старте или посреди записи (S5-A5)."""
+
+    def __call__(self, *, during_recording: bool = False) -> None: ...
+
+
 class StatsPort(Protocol):
     """Приёмник обезличенной статистики, совместимый с Stats.append."""
 
@@ -162,7 +168,7 @@ class DictationOrchestrator:
         stats: StatsPort | None = None,
         log: logging.Logger | None = None,
         on_device_changed: Callable[[str], None] | None = None,
-        on_device_lost: Callable[[], None] | None = None,
+        on_device_lost: DeviceLostPort | None = None,
         on_device_selected: Callable[[str], None] | None = None,
         on_device_resolved: Callable[[str], None] | None = None,
         on_silent: Callable[[], None] | None = None,
@@ -823,6 +829,7 @@ class DictationOrchestrator:
             # Как после record.limit: воркер уже остановил запись, stop не нужен.
             self._stop(recording_stopped=True)
             return
+        # Статистика отмены — осознанно только mic_error: это не диктовка и не отмена человеком.
         self._begin_finish()
         self._send_cancel()
         self._end_finish(
@@ -867,7 +874,11 @@ class DictationOrchestrator:
                     lambda: on_changed(label), "диктовка: не удалось сообщить о смене микрофона"
                 )
         elif self._on_device_lost is not None:
-            self._safe_ui(self._on_device_lost, "диктовка: не удалось сообщить о смене микрофона")
+            on_lost = self._on_device_lost
+            self._safe_ui(
+                lambda: on_lost(during_recording=True),
+                "диктовка: не удалось сообщить о смене микрофона",
+            )
 
     def _announce_silent(self) -> None:
         """Сообщает наружу о тишине; причину выясняет рантайм, не автомат."""

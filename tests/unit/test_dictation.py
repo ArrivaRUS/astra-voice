@@ -2877,7 +2877,7 @@ def assert_device_notified(rig: Rig, kind: str) -> None:
         rig.device_changed.assert_called_once_with(LABEL)
         rig.device_lost.assert_not_called()
     else:
-        rig.device_lost.assert_called_once_with()
+        rig.device_lost.assert_called_once_with(during_recording=True)
         rig.device_changed.assert_not_called()
     rig.device_selected.assert_not_called()
     assert mic_errors(rig) == [
@@ -2977,16 +2977,14 @@ def test_device_change_after_record_limit_is_shown_once(rig: Rig, kind: str) -> 
 
 @pytest.mark.parametrize("cause", ["record.limit", "switched", "device-lost"])
 def test_record_stop_bad_state_after_worker_stop_keeps_recognition(rig: Rig, cause: str) -> None:
-    """Гонка из ревью: наш record.stop опоздал за остановкой воркера — bad-state не провал."""
+    """Страховка оркестратора: воркер (старый) ответил bad-state на опоздавший record.stop.
+
+    Порядок реальный: stop и recognize ушли подряд, ответ пришёл позже. Штатно воркер
+    на такой stop не отвечает вовсе (test_late_record_stop_through_supervisor_keeps_dictation).
+    """
     rig.start()
-
-    def worker(message: dict[str, Any]) -> None:
-        if message["type"] == "record.stop":
-            rig.event("error", code="bad-state", request_type="record.stop")
-
-    rig.during_send = worker
     rig.stop()
-    rig.during_send = None
+    rig.event("error", code="bad-state", request_type="record.stop")
     assert rig.commands() == ["record.start", "record.stop", "recognize"]
     assert_phase(rig, DictationPhase.PROCESSING)
     assert all(state != PillState.ERROR for state, _, _ in rig.pill.calls)
@@ -3011,7 +3009,7 @@ def test_recognize_bad_state_still_fails(rig: Rig) -> None:
 def test_switched_without_label_is_reported_as_lost(rig: Rig, label: object) -> None:
     rig.start()
     device_event(rig, kind="switched", label=label, audio_ms=2000)
-    rig.device_lost.assert_called_once_with()
+    rig.device_lost.assert_called_once_with(during_recording=True)
     rig.device_changed.assert_not_called()
     assert mic_errors(rig)[0]["kind"] == "device-lost"
     assert rig.core.resolved_device == ""

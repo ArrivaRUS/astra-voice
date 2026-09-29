@@ -563,14 +563,26 @@ def notify_microphone_changed(name: str) -> None:
     )
 
 
-def notify_microphone_lost() -> None:
-    """Сообщить о пропаже микрофона; кнопка ведёт к выбору другого в настройках."""
-    notify(
-        "Микрофон отключился",
-        "Проверьте подключение или выберите микрофон в настройках.",
-        urgency="critical",
-        actions=[(ACTION_CHOOSE_MICROPHONE, "Выбрать микрофон")],
-    )
+def notify_microphone_lost(*, during_recording: bool = False) -> None:
+    """Сообщить о пропаже микрофона; кнопка ведёт к выбору другого в настройках.
+
+    На старте диктовки (явно выбранного микрофона нет) — важное уведомление с повтором
+    доставки. Посреди записи — обычное и без повтора: дребезг разъёма не копит очередь.
+    """
+    if during_recording:
+        notify(
+            "Микрофон отключился",
+            "Проверьте подключение или выберите микрофон в настройках.",
+            actions=[(ACTION_CHOOSE_MICROPHONE, "Выбрать микрофон")],
+            retry=False,
+        )
+    else:
+        notify(
+            "Микрофон отключился",
+            "Проверьте подключение или выберите микрофон в настройках.",
+            urgency="critical",
+            actions=[(ACTION_CHOOSE_MICROPHONE, "Выбрать микрофон")],
+        )
 
 
 def notify_microphone_muted() -> None:

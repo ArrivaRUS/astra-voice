@@ -465,7 +465,7 @@ def test_microphone_change_during_recording_wiring(
     if kind == "switched":
         assert rig.notify.mock_calls == [call.notify_microphone_changed("Встроенный микрофон")]
     else:
-        assert rig.notify.mock_calls == [call.notify_microphone_lost()]
+        assert rig.notify.mock_calls == [call.notify_microphone_lost(during_recording=True)]
 
 
 @pytest.mark.parametrize(
