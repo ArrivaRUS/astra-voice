@@ -972,3 +972,9 @@ legal-analyst); правообладатель — ГК «Астра» (NOTICE, 
 - Порядок 01.10: T1 AppImage + T2 одним проходом → слить ma-foundation → r2-ci → перенести deb3 на main (конфликты AppRun/bootstrap) → PR/CI.
 - После слияния ma-foundation: `platform/userinstall.py` `running_key_path()` — удалять метку при штатном выходе, если в ней наш KEY (P3, решение Юрки 29.09: минимальный вариант).
 - Зеркало моделей `models-2026.10` на GitHub: при появлении `mirrors` в каталоге переписать раздел PRIVACY — тест `test_privacy_doc.py` упадёт.
+
+### 2026-09-29 поздний вечер — «продолжай кодить»
+- Слиты #26 мелкие правки по ревью (`9c9999f`) и #27 инструменты v0.2 (слияние ниже): `validate downloads --faults` 19/19 (мутации compare_digest/_range_matches ловятся), `tools/benchmark --catalog --minimum-models 3` (пределы воркера в зонде), `validate autostart` 6/6.
+- **Ц6 закрыт:** whisper-small-int8 скачан в dev-хранилище (250 МБ, разрешение заказчика). Замер (`--runs 5 --threads 2`): gigaam 22,8× p95 201 мс 427 МБ; t-one 13,1× 401 мс 653 МБ; whisper-small 3,5× 1504 мс 1083 МБ. RTFx gigaam плавает 23–30×.
+- Заказчик: автозапуск — ручную запись оставить до v1.0 (`validate autostart --check-installed` у него = код 1, ожидаемо).
+- Беклог nit: зонд benchmark — проверка `getppid()` после PDEATHSIG, `PR_SET_DUMPABLE=0`/`oom_score_adj` как у воркера.
