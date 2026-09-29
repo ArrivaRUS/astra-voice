@@ -80,13 +80,21 @@ class _Gpg:
         dest.write_bytes(raw)
         return dest
 
+    def kill_agent(self) -> None:
+        """Гасит gpg-agent, поднятый gpg для этого временного GNUPGHOME."""
+        subprocess.run(
+            ["gpgconf", "--homedir", str(self.home), "--kill", "gpg-agent"],
+            capture_output=True,
+            check=False,
+        )
+
     def sign(self, data: Path, sig: Path, key: str) -> Path:
         self._run("--detach-sign", "--local-user", key, "--output", str(sig), str(data))
         return sig
 
 
 @pytest.fixture(scope="module")
-def env(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
+def env(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, object]]:
     root = tmp_path_factory.mktemp("verify")
     gpg = _Gpg(root / "gnupg")
 
@@ -105,7 +113,7 @@ def env(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
         keyring.read_bytes() + gpg.export(foreign_uid, root / "foreign.gpg").read_bytes()
     )
 
-    return {
+    yield {
         "root": root,
         "gpg": gpg,
         "data": data,
@@ -119,6 +127,7 @@ def env(tmp_path_factory: pytest.TempPathFactory) -> dict[str, object]:
         "sig_foreign": gpg.sign(data, root / "foreign.sig", foreign_fpr),
         "sig_subkey": gpg.sign(data, root / "subkey.sig", subkey_fpr + "!"),
     }
+    gpg.kill_agent()
 
 
 def _verifier(env: dict[str, object], **kw: object) -> Verifier:
@@ -328,11 +337,7 @@ def future(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, objec
         "keyring": gpg.export(uid, root / "future.gpg"),
     }
     # Агент, поднятый gpg для временного каталога, не должен пережить тесты.
-    subprocess.run(
-        ["gpgconf", "--homedir", str(gpg.home), "--kill", "gpg-agent"],
-        capture_output=True,
-        check=False,
-    )
+    gpg.kill_agent()
 
 
 def _spy_argv(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
@@ -359,10 +364,16 @@ def test_key_from_future_reports_clock_behind(
     assert res.code == verify.CLOCK_BEHIND
     assert "часы отстают" in res.reason
     assert any(line.startswith("ERRSIG ") for line in res.status)
-    assert len(calls) == 1
-    assert calls[0][0] == str(verify.GPGV_PATH)
+    # gpgv проверяет подпись; gpg только читает даты создания ключей нашей связки.
+    assert [argv[0] for argv in calls] == [str(verify.GPGV_PATH), str(verify.GPG_PATH)]
     assert "--ignore-time-conflict" not in calls[0]
-    assert not any(arg.startswith("--ignore") or "faked" in arg for arg in calls[0])
+    for argv in calls:
+        assert not any(arg.startswith("--ignore") or "faked" in arg for arg in argv)
+    show = calls[1]
+    assert "--show-keys" in show and show[-1] == str(future["keyring"])
+    home = Path(show[show.index("--homedir") + 1])
+    assert home.name.startswith("astra-voice-gpg-") and not home.exists()
+    assert str(Path.home() / ".gnupg") not in " ".join(show)
 
 
 def test_future_signature_is_compared_with_clock(future: dict[str, object]) -> None:
@@ -388,32 +399,97 @@ def test_unknown_future_key_is_not_clock_behind(
     assert res.code == ""
 
 
+_BACK = 10 * 86400
+
+
 @pytest.mark.parametrize(
-    ("line", "clock_behind"),
+    ("rc", "key", "keyring", "back", "extra", "clock_behind"),
     [
-        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 {future} 6 {fpr}", True),
-        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 {future} 6", True),
-        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 {past} 6 {fpr}", False),
-        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 {future} 9 -", False),
-        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 {future} 4 -", False),
-        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 20271103T094325 6 {fpr}", False),
-        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00", False),
-        ("[GNUPG:] BADSIG 99806982213FFEC7 {future}", False),
+        ("6", "release_fpr", "keyring", True, {}, True),
+        ("6", "subkey_fpr", "keyring", True, {}, True),
+        # Подпись датирована будущим, issuer — наш, но ключ создан в прошлом.
+        ("6", "release_fpr", "keyring", False, {}, False),
+        # Коды, которые атакующий получает без закрытого ключа (ревью: MD5, RSA на Ed25519).
+        ("5", "release_fpr", "keyring", True, {}, False),
+        ("30", "release_fpr", "keyring", True, {}, False),
+        ("4", "release_fpr", "keyring", True, {}, False),
+        ("9", "release_fpr", "keyring", True, {}, False),
+        # Ключ есть в связке, но не закреплён / отпечатка нет в связке / нет поля.
+        ("6", "foreign_fpr", "keyring_both", True, {}, False),
+        ("6", "unknown", "keyring", True, {}, False),
+        ("6", "", "keyring", True, {}, False),
+        ("6", "release_fpr", "keyring", True, {"revoked": "release_fpr"}, False),
+        ("6", "release_fpr", "keyring", True, {"gpg_path": "missing"}, False),
     ],
 )
 def test_errsig_status_parsing(
-    env: dict[str, object], tmp_path: Path, line: str, clock_behind: bool
+    env: dict[str, object],
+    tmp_path: Path,
+    rc: str,
+    key: str,
+    keyring: str,
+    back: bool,
+    extra: dict[str, str],
+    clock_behind: bool,
 ) -> None:
-    now = int(time.time())
-    text = line.format(future=now + 86400, past=now - 86400, fpr="A" * 40)
+    fpr = {"unknown": "A" * 40, "": ""}.get(key, str(env.get(key, "")))
+    future = int(time.time()) + 86400
     fake = tmp_path / "fake-gpgv-errsig"
-    fake.write_text(f"#!/bin/sh\necho '{text}'\nexit 2\n", encoding="utf-8")
+    fake.write_text(
+        f"#!/bin/sh\necho '[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 {future} {rc} {fpr}'\nexit 2\n",
+        encoding="utf-8",
+    )
     fake.chmod(0o755)
-    res = _verifier(env, gpgv_path=fake).verify_detached(
+    options: dict[str, object] = {"gpgv_path": fake, "keyring": env[keyring]}
+    if back:
+        options["clock"] = lambda: time.time() - _BACK
+    if "revoked" in extra:
+        options["revoked"] = frozenset({str(env[extra["revoked"]])})
+    if "gpg_path" in extra:
+        options["gpg_path"] = tmp_path / "нет-gpg"
+    res = _verifier(env, **options).verify_detached(
         Path(str(env["data"])), Path(str(env["sig_release"]))
     )
     assert not res.ok
     assert (res.code == verify.CLOCK_BEHIND) is clock_behind
+    if not clock_behind:
+        assert "часы" not in res.reason
+
+
+def test_spoofed_issuer_with_future_date_is_plain_refusal(
+    env: dict[str, object], tmp_path: Path
+) -> None:
+    """Подпись чужим RSA-ключом «из будущего» с подменённым issuer на наш ключ."""
+    gpg = _Gpg(tmp_path / "attacker")
+    faked = f"{int(time.time()) + _FUTURE_S}!"
+    uid = "Attacker <attacker@test.invalid>"
+    gpg._run("--faked-system-time", faked, "--quick-gen-key", uid, "rsa2048", "sign", "never")
+    out = gpg._run("--list-keys", "--with-colons", uid).stdout
+    attacker = next(line.split(":")[9] for line in out.splitlines() if line.startswith("fpr:"))
+    sig = tmp_path / "spoofed.sig"
+    try:
+        gpg._run(
+            "--faked-system-time",
+            faked,
+            "--detach-sign",
+            "--local-user",
+            attacker + "!",
+            "--output",
+            str(sig),
+            str(env["data"]),
+        )
+    finally:
+        gpg.kill_agent()
+    ours = bytes.fromhex(str(env["release_fpr"]))
+    theirs = bytes.fromhex(attacker)
+    raw = sig.read_bytes()
+    assert theirs in raw and theirs[-8:] in raw
+    sig.write_bytes(raw.replace(theirs, ours).replace(theirs[-8:], ours[-8:]))
+    res = _verifier(env).verify_detached(Path(str(env["data"])), sig)
+    assert not res.ok
+    assert any(line.startswith(("ERRSIG ", "BADSIG ")) for line in res.status), res.status
+    assert res.code == ""
+    assert "часы" not in res.reason
 
 
 def test_errsig_with_zero_exit_is_not_accepted(env: dict[str, object], tmp_path: Path) -> None:

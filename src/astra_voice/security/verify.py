@@ -39,6 +39,7 @@ from typing import Final, Literal
 __all__ = [
     "CLOCK_BEHIND",
     "GPGV_PATH",
+    "GPG_PATH",
     "PINNED_FINGERPRINTS",
     "REVOKED_FINGERPRINTS",
     "HashCancelledError",
@@ -52,6 +53,9 @@ Purpose = Literal["release", "catalog"]
 
 #: Путь к `gpgv` по умолчанию. Абсолютный: `PATH` не используется намеренно.
 GPGV_PATH: Final = Path("/usr/bin/gpgv")
+#: `gpg` нужен только для чтения дат создания ключей нашей связки (`--show-keys`)
+#: при отказе подписи — чтобы отличить отстающие часы (У92). Нет его — обычный отказ.
+GPG_PATH: Final = Path("/usr/bin/gpg")
 
 # Офлайн-мастер заказчика от 2026-09-26. Подключи S1/S2 ротируются без правки
 # кода: VALIDSIG отдаёт отпечаток первичного ключа.
@@ -70,9 +74,9 @@ CLOCK_BEHIND: Final = "clock-behind"
 _STATUS_PREFIX: Final = "[GNUPG:] "
 _VALIDSIG: Final = "VALIDSIG"
 _ERRSIG: Final = "ERRSIG"
-#: Коды ERRSIG, при которых дата подписи ничего не говорит о часах:
-#: неизвестный алгоритм (4) и отсутствующий ключ (9).
-_ERRSIG_UNRELATED_RC: Final = frozenset({"4", "9"})
+#: Единственный код ERRSIG, который gpgv 2.2 выдаёт на ключ «из будущего»
+#: (GPG_ERR_BAD_PUBKEY). Белый список: остальные коды — обычный отказ.
+_ERRSIG_TIME_CONFLICT_RC: Final = "6"
 _FPR_RE: Final = re.compile(r"\A[0-9A-F]{40}\Z")
 _SUMS_LINE_RE: Final = re.compile(r"\A(?P<hex>[0-9a-f]{64}) [ *](?P<name>[^\n]+)\Z")
 
@@ -137,6 +141,7 @@ class Verifier:
         revoked: frozenset[str] = REVOKED_FINGERPRINTS,
         *,
         gpgv_path: Path = GPGV_PATH,
+        gpg_path: Path = GPG_PATH,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if purpose not in ("release", "catalog"):
@@ -146,6 +151,7 @@ class Verifier:
         self.pinned = frozenset(f.upper() for f in pinned)
         self.revoked = frozenset(f.upper() for f in revoked)
         self.gpgv_path = Path(gpgv_path)
+        self.gpg_path = Path(gpg_path)
         self._clock = clock
         bad = {f for f in self.pinned | self.revoked if not _FPR_RE.match(f)}
         if bad:
@@ -203,11 +209,11 @@ class Verifier:
         valid = [line.split() for line in status if line.split()[:1] == [_VALIDSIG]]
 
         if proc.returncode != 0:
-            signed_at = self._future_signature(status)
-            if signed_at is not None:
-                moment = datetime.fromtimestamp(signed_at, UTC).strftime("%Y-%m-%d %H:%M")
+            created_at = self._future_key(status, keyring)
+            if created_at is not None:
+                moment = datetime.fromtimestamp(created_at, UTC).strftime("%Y-%m-%d %H:%M")
                 return self._fail(
-                    f"часы отстают: подпись датирована {moment} UTC, это позже времени "
+                    f"часы отстают: ключ подписи создан {moment} UTC, это позже времени "
                     "компьютера — проверьте дату и время",
                     status,
                     code=CLOCK_BEHIND,
@@ -295,26 +301,89 @@ class Verifier:
 
     # -- служебное --------------------------------------------------------
 
-    def _future_signature(self, status: tuple[str, ...]) -> int | None:
-        """Дата подписи из ERRSIG, если она позже часов компьютера.
+    def _future_key(self, status: tuple[str, ...], keyring: Path) -> int | None:
+        """Дата создания нашего ключа, если она позже часов компьютера (У92).
 
-        gpgv 2.2 на ключе, созданном позже текущего времени, отдаёт `ERRSIG`
-        и код 2. Подпись не бывает старше своего ключа, поэтому её дата позже
-        часов — признак отстающих часов (У92). Отказ остаётся отказом, меняется
-        только причина.
+        Всё в строке ERRSIG, кроме кода, выбирает автор подписи: дата и issuer
+        подделываются без закрытого ключа. Поэтому «часы отстают» — только если
+        сразу: код 6 (конфликт времени gpgv 2.2), отпечаток из ERRSIG есть в
+        нашей связке и закреплён (сам или его первичный ключ), не отозван, и
+        дата **создания этого ключа по связке** позже часов. Отказ остаётся
+        отказом, меняется только причина.
         """
-        now = self._clock()
+        keys: dict[str, tuple[str, int]] | None = None
         for line in status:
             fields = line.split()
-            # ERRSIG <keyid> <pkalgo> <hashalgo> <class> <time> <rc> [<fpr>]
-            if fields[:1] != [_ERRSIG] or len(fields) < 7:
+            # ERRSIG <keyid> <pkalgo> <hashalgo> <class> <time> <rc> <fpr>
+            if fields[:1] != [_ERRSIG] or len(fields) < 8:
                 continue
-            signed, rc = fields[5], fields[6]
-            if rc in _ERRSIG_UNRELATED_RC or not signed.isdigit() or len(signed) > 12:
+            fpr = fields[7].upper()
+            if fields[6] != _ERRSIG_TIME_CONFLICT_RC or not _FPR_RE.match(fpr):
                 continue
-            if int(signed) > now:
-                return int(signed)
+            if keys is None:
+                keys = self._keyring_keys(keyring)
+            found = keys.get(fpr)
+            if found is None:
+                continue
+            primary, created = found
+            if {fpr, primary} & self.revoked or not {fpr, primary} & self.pinned:
+                continue
+            if created > self._clock():
+                return created
         return None
+
+    def _keyring_keys(self, keyring: Path) -> dict[str, tuple[str, int]]:
+        """Отпечаток → (первичный отпечаток, дата создания) по нашей связке.
+
+        `gpg --show-keys` во временном пустом GNUPGHOME: связка не импортируется,
+        состояние пользователя не читается. Любой сбой — пустой результат.
+        """
+        with tempfile.TemporaryDirectory(prefix="astra-voice-gpg-") as home:
+            os.chmod(home, 0o700)
+            argv = [
+                str(self.gpg_path),
+                "--homedir",
+                home,
+                "--batch",
+                "--no-options",
+                "--no-auto-check-trustdb",
+                "--with-colons",
+                "--show-keys",
+                str(keyring),
+            ]
+            try:
+                proc = subprocess.run(  # noqa: S603 - argv фиксирован, shell не используется
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=_GPGV_TIMEOUT_S,
+                    check=False,
+                    env={"LC_ALL": "C", "GNUPGHOME": home},
+                    cwd=home,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return {}
+        if proc.returncode != 0:
+            return {}
+        keys: dict[str, tuple[str, int]] = {}
+        primary = ""
+        created: int | None = None
+        for line in proc.stdout.splitlines():
+            fields = line.split(":")
+            if fields[0] in ("pub", "sub") and len(fields) > 5:
+                created = int(fields[5]) if fields[5].isdigit() and len(fields[5]) <= 12 else None
+                if fields[0] == "pub":
+                    primary = ""
+                continue
+            if fields[0] == "fpr" and len(fields) > 9 and created is not None:
+                fpr = fields[9].upper()
+                if _FPR_RE.match(fpr):
+                    primary = primary or fpr
+                    keys[fpr] = (primary, created)
+                created = None
+            elif fields[0] != "fpr":
+                created = None
+        return keys
 
     def _fail(
         self,
