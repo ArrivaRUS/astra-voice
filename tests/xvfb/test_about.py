@@ -343,7 +343,7 @@ def test_about_section_snapshot(app: Any, case: str, dark: bool) -> None:
                 "GigaAM v3 RNN-T",
                 "Библиотеки",
                 "Qt 5 — LGPL-3.0 · The Qt Company; PyQt5 — GPL-3.0 · Riverbank Computing; "
-                "onnxruntime — MIT · Microsoft",
+                "onnxruntime — MIT · Microsoft; onnx-asr — MIT",
                 "GPL-3.0-or-later",
                 "Правила администратора",
                 "Проверка обновлений",

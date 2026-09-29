@@ -217,7 +217,7 @@ Column {
             width: parent.width
             showHint: false
             label: qsTr("Библиотеки")
-            sub: qsTr("Qt 5 — LGPL-3.0 · The Qt Company; PyQt5 — GPL-3.0 · Riverbank Computing; onnxruntime — MIT · Microsoft")
+            sub: qsTr("Qt 5 — LGPL-3.0 · The Qt Company; PyQt5 — GPL-3.0 · Riverbank Computing; onnxruntime — MIT · Microsoft; onnx-asr — MIT")
         }
 
         SettingRow {

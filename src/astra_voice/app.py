@@ -1178,6 +1178,11 @@ def main(argv: list[str] | None = None) -> int:
             # здесь, в GUI-потоке, а не в рабочем (урок 025).
             update_checker.on_event = None
             update_checker.on_status = None
+        # Цикл aboutBridge → stats → on_append → aboutBridge разрываем здесь же,
+        # в GUI-потоке (урок 025).
+        runtime_stats = getattr(runtime, "stats", None) if runtime is not None else None
+        if runtime_stats is not None:
+            runtime_stats.on_append = None
         # US-8.4: выход из трея и SIGTERM/SIGINT вызывают app.quit() и приходят
         # сюда. После отмены фокуса освобождаем воркер и захваты, затем lock/ipc и UI.
         if onboarding is not None:
