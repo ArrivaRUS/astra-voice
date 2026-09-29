@@ -340,21 +340,42 @@ def test_admin_refusal_wins_over_user_offline(tmp_path: Path) -> None:
     assert gate.refusal("download") == "admin"
 
 
-@pytest.mark.parametrize(("value", "expected"), [("true", True), ("false", False)])
-def test_policy_offline_is_the_user_setting_and_locks_it(
-    tmp_path: Path, value: str, expected: bool
-) -> None:
+def test_policy_offline_true_locks_user_setting(tmp_path: Path) -> None:
     path = tmp_path / "policy.conf"
-    path.write_text(f"[astra-voice]\noffline = {value}\n", encoding="utf-8")
+    path.write_text("[astra-voice]\noffline = true\n", encoding="utf-8")
     policy = load(path)
     assert policy.status is PolicyStatus.OK
     assert policy.is_locked("offline")
-    assert effective(Settings(offline=not expected), policy).offline is expected
+    assert effective(Settings(offline=False), policy).offline is True
 
 
-def test_policy_offline_garbage_is_invalid_and_blocks(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extra", ["", "locked = offline\n"])
+def test_policy_offline_false_is_not_a_lock(tmp_path: Path, extra: str) -> None:
+    """Ревью P3-а: offline=false не блокирует — пользователь может уйти в офлайн сам."""
     path = tmp_path / "policy.conf"
-    path.write_text("[astra-voice]\noffline = мусор\n", encoding="utf-8")
+    path.write_text(f"[astra-voice]\noffline = false\n{extra}", encoding="utf-8")
     policy = load(path)
-    assert policy.status is PolicyStatus.INVALID
-    assert NetworkGate(Settings(), policy).refusal("download") == "admin"
+    assert policy.status is PolicyStatus.OK
+    assert not policy.is_locked("offline")
+    assert effective(Settings(offline=True), policy).offline is True
+    assert (
+        NetworkGate(effective(Settings(offline=True), policy), policy).refusal("download")
+        == "offline"
+    )
+    assert NetworkGate(Settings(), policy).refusal("download") == ""
+
+
+def test_policy_offline_garbage_means_offline_and_keeps_other_locks(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ревью P2-а: непонятное offline= — офлайн с предупреждением, статус OK, блокировки целы."""
+    path = tmp_path / "policy.conf"
+    path.write_text("[astra-voice]\noffline = мусор\nautostart = false\n", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        policy = load(path)
+    assert policy.status is PolicyStatus.OK
+    assert policy.is_locked("offline") and policy.is_locked("autostart")
+    settings = effective(Settings(offline=False, autostart=True), policy)
+    assert settings.offline is True and settings.autostart is False
+    assert NetworkGate(settings, policy).refusal("download") == "admin"
+    assert "offline" in caplog.text
