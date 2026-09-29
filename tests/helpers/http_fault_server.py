@@ -16,6 +16,8 @@ class FaultServer:
 
     requests: list[tuple[str, dict[str, str]]] = field(default_factory=list)
     release: threading.Event = field(default_factory=threading.Event)
+    # Ответы 200 по точному пути: тесты кладут сюда записанные фикстуры.
+    bodies: dict[str, bytes] = field(default_factory=dict)
     server: ThreadingHTTPServer | None = None
     thread: threading.Thread | None = None
 
@@ -45,7 +47,9 @@ class FaultServer:
                 body = b'{"version":"1.2"}'
                 status = 200
                 headers: dict[str, str] = {}
-                if path == "/etag":
+                if path in owner.bodies:
+                    body = owner.bodies[path]
+                elif path == "/etag":
                     headers["ETag"] = '"revision-one"'
                     if self.headers.get("If-None-Match") == headers["ETag"]:
                         status = 304
