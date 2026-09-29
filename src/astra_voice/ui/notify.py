@@ -147,10 +147,13 @@ _action_receiver: _ActionReceiver | None = None
 # без аргументов: в очереди Qt лежит только C++-событие MetaCall, для удаления
 # которого (в т. ч. в ~QApplication) GIL не нужен. Получатель создаётся в GUI при
 # старте (install_dispatcher); до этого уведомления потоков копятся в _inbox.
+# Рабочий поток Qt не трогает ни до установки, ни после закрытия затвора.
 # Затвор _gate/_closed закрывается до разрушения QApplication (shutdown_dispatch).
 _inbox: Queue[tuple[_Notice, int]] = Queue()
 _gate = threading.Lock()
 _closed = False
+# Пробуждение уже в очереди Qt: посты сливаются в одно событие MetaCall.
+_wake_pending = False
 _receiver: _NotifyReceiver | None = None
 # Поток GUI, в котором создан получатель; сравнение идёт по threading.get_ident():
 # QThread.currentThread() в чужом потоке создал бы там QAdoptedThread.
@@ -162,6 +165,10 @@ class _NotifyReceiver(QObject):
 
     @pyqtSlot()
     def _drain(self) -> None:
+        global _wake_pending
+        # Флаг снимается до разбора: пост во время разбора разбудит заново.
+        with _gate:
+            _wake_pending = False
         while True:
             try:
                 notice, epoch = _inbox.get_nowait()
@@ -174,6 +181,9 @@ class _NotifyReceiver(QObject):
 def _install_receiver(app: QCoreApplication) -> bool:
     """Создать получатель в GUI и разобрать накопленное; False — поток не GUI."""
     global _receiver, _gui_ident
+    # Сначала без Qt: QThread.currentThread() в чужом потоке создал бы QAdoptedThread.
+    if threading.current_thread() is not threading.main_thread():
+        return False
     if QThread.currentThread() != app.thread():
         return False
     receiver = _receiver
@@ -191,6 +201,9 @@ def _install_receiver(app: QCoreApplication) -> bool:
 
 def install_dispatcher() -> None:
     """Создать получатель уведомлений из рабочих потоков; вызывать в GUI при старте."""
+    if threading.current_thread() is not threading.main_thread():
+        # Отказ до любого обращения к Qt.
+        raise RuntimeError("Получатель уведомлений должен создаваться в потоке GUI")
     app = QCoreApplication.instance()
     if app is None or not _install_receiver(app):
         raise RuntimeError("Получатель уведомлений должен создаваться в потоке GUI")
@@ -209,12 +222,15 @@ def shutdown_dispatch() -> None:
 
 def _post_from_thread(notice: _Notice) -> None:
     """Из не-GUI потока: только значение в очереди и C++-пробуждение под затвором."""
+    global _wake_pending
     with _gate:
         if _closed:
             _logger.debug("Уведомление из потока после остановки отброшено")
             return
         _inbox.put((notice, _epoch))
-        if _receiver is not None:
+        # До установки получателя Qt не трогаем: очередь разберёт install_dispatcher().
+        if _receiver is not None and not _wake_pending:
+            _wake_pending = True
             QMetaObject.invokeMethod(_receiver, "_drain", Qt.ConnectionType.QueuedConnection)
 
 
@@ -275,10 +291,12 @@ def reset_state() -> None:
     """Очистить доставку, очередь и обработчики для изоляции тестов."""
     global _last_id, _last_delivery_ok, _last_completed_seq, _last_id_seq, _seq, _epoch
     global _in_flight_seq, _slot, _action_bus, _timeout_streak, _timeout_warned, _closed
+    global _wake_pending
     # Получатель бессмертен и не пересоздаётся; сбрасываются очередь и затвор.
     with _gate:
         _epoch += 1
         _closed = False
+        _wake_pending = False
         while True:
             try:
                 _inbox.get_nowait()
@@ -583,13 +601,11 @@ def notify(
     if threading.get_ident() == _gui_ident:
         _submit(notice)
         return
-    if _gui_ident is None:
+    # Рабочие потоки Qt не трогают вовсе: даже QCoreApplication.instance() — только
+    # в главном. Без приложения главный поток доставляет сразу, как раньше.
+    if _gui_ident is None and threading.current_thread() is threading.main_thread():
         app = QCoreApplication.instance()
-        if app is None:
-            # Цикла событий Qt нет: доставляем сразу, как раньше.
-            _submit(notice)
-            return
-        if threading.current_thread() is threading.main_thread() and _install_receiver(app):
+        if app is None or _install_receiver(app):
             _submit(notice)
             return
     _post_from_thread(notice)

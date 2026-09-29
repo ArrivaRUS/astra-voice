@@ -6,6 +6,9 @@
 закрывается до разрушения ``QApplication``, а поток продолжает слать. Процесс
 обязан завершиться сам, без зависания и падения. D-Bus не трогается: доставка в
 GUI подменена счётчиком.
+
+Это страховка от зависания на выходе, а не регресс-тест: старый код (до 9a9de83)
+сценарий в большинстве прогонов проходит.
 """
 
 from __future__ import annotations
@@ -75,8 +78,6 @@ def main() -> int:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     faulthandler.enable()
     faulthandler.dump_traceback_later(25, exit=True)
-    if interval := os.environ.get("ASTRA_VOICE_NOTIFY_SWITCH"):
-        sys.setswitchinterval(float(interval))
     scenario = sys.argv[1]
     scenarios: dict[str, Callable[[], None]] = {
         "exit_while_thread_notifies": exit_while_thread_notifies,

@@ -1195,7 +1195,10 @@ def main(argv: list[str] | None = None) -> int:
             focuser.focus_shell()
         return int(app.exec_())
     finally:
-        focuser.stop()
+        try:
+            focuser.stop()
+        except Exception:  # noqa: BLE001 — остальная очистка должна выполниться
+            log.warning("Не удалось остановить фокусировку окна")
         if update_checker is not None:
             try:
                 update_checker.stop()

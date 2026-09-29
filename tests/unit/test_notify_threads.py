@@ -141,11 +141,20 @@ def test_receiver_is_immortal_gui_object() -> None:
         except RuntimeError as exc:
             errors.append(exc)
 
-    worker = threading.Thread(target=install_in_worker)
-    worker.start()
-    worker.join(2)
+    touches = _QtTouches()
+    worker = threading.Thread(target=install_in_worker, name=_WORKER)
+    threading.setprofile(touches)
+    try:
+        worker.start()
+        worker.join(2)
+    finally:
+        threading.setprofile(None)
     assert errors, "получатель ставился бы из рабочего потока"
     assert notifications._receiver is receiver
+    # Отказ — до любого обращения к Qt (QThread.currentThread() создал бы QAdoptedThread).
+    assert touches.threads
+    assert touches.qt_calls == []
+    assert touches.qobject_methods == []
 
 
 def test_thread_notify_before_install_waits_for_receiver(
@@ -163,6 +172,8 @@ def test_thread_notify_before_install_waits_for_receiver(
     QCoreApplication.processEvents()
     assert delivered == []
     invoke.assert_not_called()
+    # До установки рабочий поток Qt не трогает вовсе.
+    assert touches.qt_calls == []
     assert touches.qobject_methods == []
     assert notifications._inbox.qsize() == 3
     gui = threading.get_ident()
@@ -170,6 +181,59 @@ def test_thread_notify_before_install_waits_for_receiver(
     assert notifications._receiver is existing
     assert sorted(summary for summary, _ in delivered) == [f"early-{index}" for index in range(3)]
     assert {thread for _, thread in delivered} == {gui}
+
+
+def test_thread_notify_without_app_waits_for_install(
+    monkeypatch: pytest.MonkeyPatch, delivered: list[tuple[str, int]]
+) -> None:
+    """Без QCoreApplication рабочий поток не зовёт _submit (QtDBus/QTimer) у себя."""
+    notifications.install_dispatcher()
+    existing = notifications._receiver
+    monkeypatch.setattr(notifications, "_receiver", None)
+    monkeypatch.setattr(notifications, "_gui_ident", None)
+    monkeypatch.setattr(notifications, "_NotifyReceiver", lambda: existing)
+    no_app = Mock()
+    no_app.instance.return_value = None
+    monkeypatch.setattr(notifications, "QCoreApplication", no_app)
+    touches = _run_workers(2, prefix="no-app")
+    assert delivered == []
+    no_app.instance.assert_not_called()
+    assert touches.qt_calls == []
+    assert notifications._inbox.qsize() == 2
+    # Главный поток без приложения по-прежнему доставляет сразу.
+    notifications.notify("главный")
+    assert delivered == [("главный", threading.get_ident())]
+    monkeypatch.setattr(notifications, "QCoreApplication", QCoreApplication)
+    notifications.install_dispatcher()
+    assert sorted(summary for summary, _ in delivered[1:]) == ["no-app-0", "no-app-1"]
+    assert {thread for _, thread in delivered} == {threading.get_ident()}
+
+
+def test_thread_wakeups_are_coalesced(
+    monkeypatch: pytest.MonkeyPatch, delivered: list[tuple[str, int]]
+) -> None:
+    notifications.install_dispatcher()
+    receiver = notifications._receiver
+    assert receiver is not None
+    invoke = Mock()
+    monkeypatch.setattr(QMetaObject, "invokeMethod", invoke)
+
+    def burst(count: int) -> None:
+        for index in range(count):
+            notifications.notify(f"пачка-{index}", retry=False)
+
+    worker = threading.Thread(target=burst, args=(50,), name=_WORKER)
+    worker.start()
+    worker.join(2)
+    # Пятьдесят постов — одно событие MetaCall в очереди Qt.
+    assert invoke.call_count == 1
+    receiver._drain()
+    assert len(delivered) == 50
+    worker = threading.Thread(target=burst, args=(3,), name=_WORKER)
+    worker.start()
+    worker.join(2)
+    # После разбора следующее уведомление снова будит получатель.
+    assert invoke.call_count == 2
 
 
 def test_gui_thread_notify_submits_directly(
@@ -269,7 +333,11 @@ def _run_exit_scenario(delay: float) -> subprocess.CompletedProcess[str]:
 
 
 def test_exit_while_thread_notifies() -> None:
-    """Выход, пока поток без передышки шлёт уведомления, не зависает и не падает."""
+    """Страховка от зависания: выход, пока поток шлёт уведомления, не виснет и не падает.
+
+    Не регресс-тест: на старом коде (до 9a9de83) сценарий у ревьюера проходил.
+    Отсутствие постов в Qt после затвора проверяет test_gate_stops_posts_to_qt_after_shutdown.
+    """
     for attempt in range(6):
         result = _run_exit_scenario(attempt * 0.02)
         output = f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"

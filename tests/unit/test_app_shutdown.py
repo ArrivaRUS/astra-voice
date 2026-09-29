@@ -640,6 +640,33 @@ def test_shutdown_failure_does_not_skip_cleanup(rig: Rig) -> None:
     rig.cleanup.assert_called_once_with(rig.server, rig.lock)
 
 
+def test_focuser_stop_failure_does_not_skip_cleanup(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.focuser.stop.side_effect = RuntimeError("Ошибка фокуса")
+
+    with caplog.at_level(logging.WARNING, logger=app_mod.__name__):
+        assert app_mod.main([]) == 7
+
+    # Сбой фокуса не отменяет ни затвор уведомлений, ни остальную очистку.
+    assert rig.calls.mock_calls == [
+        call.notify_install(),
+        call.start(),
+        call.exec(),
+        call.focuser_stop(),
+        call.shutdown(),
+        call.notify_shutdown(),
+        call.bus_shutdown(),
+        call.timer_stop(),
+        call.theme_stop(),
+        call.cleanup(rig.server, rig.lock),
+    ]
+    rig.cleanup.assert_called_once_with(rig.server, rig.lock)
+    assert any(
+        "Не удалось остановить фокусировку окна" in record.getMessage() for record in caplog.records
+    )
+
+
 def test_bus_thread_shutdown_failure_does_not_skip_cleanup(
     rig: Rig, caplog: pytest.LogCaptureFixture
 ) -> None:
