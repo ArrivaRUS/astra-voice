@@ -460,3 +460,42 @@ def test_manual_result_does_not_override_offline(rig: Rig, monkeypatch: pytest.M
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     checker.remind_later()  # любой пересчёт без refresh()
     rig.wait(lambda s: s.state == "disabled")
+
+
+def test_manual_check_postpones_scheduled(rig: Rig) -> None:
+    """Ручная проверка с запросом переносит плановую на сутки от неё."""
+    seed_cache(rig, fixture("plain"))
+    rig.store.set("app", SourceState(last_attempt_at=T0 - 3600, last_success_at=T0 - 3600))
+    checker = rig.start()
+    rig.wait(lambda s: s.state == "available")
+    rig.clock.now = T0 + 7200
+    checker.check_now()
+    rig.wait(lambda s: s.manual and s.last_attempt_at == T0 + 7200)
+    assert rig.requests() == 1
+    # Прежний срок (T0 − 1 ч + 24 ч) прошёл, но сутки от ручной — ещё нет.
+    rig.clock.now = T0 + CHECK_INTERVAL_S
+    checker.refresh()
+    rig.settle(checker)
+    assert rig.requests() == 1
+    rig.clock.now = T0 + 7200 + CHECK_INTERVAL_S + 1
+    checker.refresh()
+    rig.wait(lambda s: s.last_attempt_at == T0 + 7200 + CHECK_INTERVAL_S + 1)
+    assert rig.requests() == 2
+
+
+def test_blocked_manual_check_keeps_schedule(rig: Rig) -> None:
+    """Ручная проверка без запроса (окно 429) плановый срок не сдвигает."""
+    rig.cache.set(
+        github.CACHE_KEY,
+        CacheEntry(body=fixture("plain").decode(), url=rig.url, rate_limited_until=T0 + 60),
+    )
+    rig.store.set("app", SourceState(last_attempt_at=T0 - 3600, last_success_at=T0 - 3600))
+    checker = rig.start()
+    rig.wait(lambda s: s.state == "available")
+    checker.check_now()
+    rig.wait(lambda s: s.manual and s.retry_at == T0 + 60)
+    assert rig.requests() == 0
+    rig.clock.now = T0 - 3600 + CHECK_INTERVAL_S + 1
+    checker.refresh()
+    rig.wait(lambda s: s.last_attempt_at == rig.clock.now)
+    assert rig.requests() == 1

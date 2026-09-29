@@ -1068,6 +1068,10 @@ def main(argv: list[str] | None = None) -> int:
                 update_checker.stop()
             except Exception:  # noqa: BLE001 — остальные ресурсы тоже нужно освободить
                 log.warning("Не удалось остановить проверку обновлений")
+            # Замыкание держит _GuiCalls: последняя ссылка на QObject отпускается
+            # здесь, в GUI-потоке, а не в рабочем (урок 025).
+            update_checker.on_event = None
+            update_checker.on_status = None
         # US-8.4: выход из трея и SIGTERM/SIGINT вызывают app.quit() и приходят
         # сюда. После отмены фокуса освобождаем воркер и захваты, затем lock/ipc и UI.
         if onboarding is not None:

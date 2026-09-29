@@ -207,7 +207,8 @@ def test_update_checker_started_and_stopped_before_runtime(
     names = [entry[0] for entry in rig.calls.mock_calls]
     assert names.index("checker_start") < names.index("exec")
     assert names.index("focuser_stop") < names.index("checker_stop") < names.index("shutdown")
-    assert callable(checker.on_event)
+    # После stop() колбэк со ссылкой на QObject отпущен в GUI-потоке (урок 025).
+    assert checker.on_event is None and checker.on_status is None
 
 
 def test_update_checker_failure_does_not_stop_app(
