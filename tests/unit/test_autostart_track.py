@@ -173,6 +173,22 @@ def test_target_by_track(
         assert not user_entry.parent.exists()
 
 
+def test_state_survives_strict_launcher_check(
+    user_entry: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Строгая check_appimage_launcher (01.10) бросает PathError — state() не падает."""
+    _track(monkeypatch, paths.InstallKind.APPIMAGE_INSTALLED)
+    user_entry.parent.mkdir(parents=True)
+    user_entry.write_bytes(autostart.entry_bytes(str(paths.appimage_current_apprun())))
+    check = Mock(side_effect=paths.PathError("путь вне app/"))
+    monkeypatch.setattr(paths, "check_appimage_launcher", check)
+    result = autostart.state()
+    check.assert_called_once_with(paths.appimage_current_apprun())
+    assert result == autostart.AutostartState(True, "ours", False, False)
+    assert result.target == "ours-other"
+    assert "путь вне app/" in caplog.text
+
+
 def test_target_is_read_only_and_ignored_in_comparisons() -> None:
     current = autostart.AutostartState(True, "ours", False, False, "ours-this")
     assert current == autostart.AutostartState(True, "ours", False, False)

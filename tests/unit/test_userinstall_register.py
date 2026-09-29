@@ -408,6 +408,56 @@ def test_remove_program_uses_install_lock_and_never_follows_copy_links(
     assert tree_snapshot(outside) == before
 
 
+def _two_copies(monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    copy = installed(monkeypatch)
+    second = make_bundle(copy.parent / "0.3.0-aaaaaaaaaaaa")
+    (copy.parent / "previous").symlink_to(second.name)
+    return copy, second
+
+
+def test_remove_program_without_keep_spares_running_copy(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Р5: защита работающей копии не зависит от того, передал ли вызывающий keep."""
+    copy, second = _two_copies(monkeypatch)
+    userinstall.write_running_key(second.name)
+    result = userinstall.remove_program()
+    assert result.kept == (second.name,)
+    assert KEY in result.removed and second.name not in result.removed
+    assert second.is_dir() and not copy.exists()
+
+
+def test_remove_program_keep_adds_to_running_copy(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy, second = _two_copies(monkeypatch)
+    third = make_bundle(copy.parent / "0.4.0-bbbbbbbbbbbb")
+    userinstall.write_running_key(second.name)
+    result = userinstall.remove_program(keep=KEY)
+    assert result.kept == (KEY, second.name)
+    assert third.name in result.removed
+    assert copy.is_dir() and second.is_dir() and not third.exists()
+
+
+def test_running_key_read_follows_write_fallback(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Чтение выбирает тот же каталог, что запись, даже если XDG-каталог создать нельзя."""
+    readonly = tmp_path / "readonly"
+    readonly.mkdir(mode=0o500)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(readonly / "run"))
+    try:
+        assert userinstall.read_running_key() is None
+        userinstall.write_running_key(KEY)
+        fallback = tmp_path / f"astra-voice-{os.getuid()}"
+        assert paths.runtime_dir() == fallback
+        assert userinstall.running_key_path() == fallback / "running-key"
+        assert userinstall.read_running_key() == KEY
+        assert not (readonly / "run").exists()
+    finally:
+        readonly.chmod(0o700)
+
+
 def test_status_reads_existing_runtime_without_chmod(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

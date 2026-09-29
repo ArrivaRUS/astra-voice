@@ -131,14 +131,36 @@ def runtime_dir() -> Path:
     Каталог всегда 0700, принадлежит текущему пользователю и не является
     символической ссылкой (иначе — :class:`PathError`).
     """
-    raw = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    if raw.startswith("/"):
+    *preferred, fallback = _runtime_dir_candidates()
+    for candidate in preferred:
         try:
-            return _ensure_private_dir(Path(raw) / APP_NAME)
+            return _ensure_private_dir(candidate)
         except (PathError, OSError):
             pass
-    fallback = FALLBACK_TMP_DIR / f"{APP_NAME}-{os.getuid()}"
     return _ensure_private_dir(fallback)
+
+
+def _runtime_dir_candidates() -> tuple[Path, ...]:
+    """Кандидаты ``runtime_dir()`` по порядку; последний — запасной в ``/tmp``."""
+    raw = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    fallback = FALLBACK_TMP_DIR / f"{APP_NAME}-{os.getuid()}"
+    return (Path(raw) / APP_NAME, fallback) if raw.startswith("/") else (fallback,)
+
+
+def existing_runtime_dir() -> Path | None:
+    """Каталог, который выбрал бы ``runtime_dir()``, — только чтение, без mkdir/chmod.
+
+    Первый кандидат, уже существующий как наш каталог (не symlink); ``None`` — ни
+    одного нет, значит, в runtime ещё ничего не записано.
+    """
+    for candidate in _runtime_dir_candidates():
+        try:
+            info = candidate.lstat()
+        except OSError:
+            continue
+        if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
+            return candidate
+    return None
 
 
 def log_dir() -> Path:

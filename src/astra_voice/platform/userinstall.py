@@ -272,21 +272,13 @@ def check_free_space(path: Path, required: int = MIN_FREE_BYTES) -> None:
         raise NotEnoughSpaceError(f"Недостаточно места в домашней папке: нужно ещё {need} МБ.")
 
 
-def running_key_path() -> Path:
-    """Путь для чтения без создания каталогов (в том числе из status())."""
-    raw = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    if raw.startswith("/"):
-        directory = Path(raw) / paths.APP_NAME
-        try:
-            info = directory.lstat()
-        except FileNotFoundError:
-            return directory / RUNNING_KEY_NAME
-        except OSError:
-            pass
-        else:
-            if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
-                return directory / RUNNING_KEY_NAME
-    return paths.FALLBACK_TMP_DIR / f"{paths.APP_NAME}-{os.getuid()}" / RUNNING_KEY_NAME
+def running_key_path() -> Path | None:
+    """Путь для чтения без создания каталогов (в том числе из status()).
+
+    Каталог выбирается тем же правилом, что и при записи (``paths.runtime_dir()``).
+    """
+    directory = paths.existing_runtime_dir()
+    return None if directory is None else directory / RUNNING_KEY_NAME
 
 
 def read_running_key() -> str | None:
@@ -294,8 +286,11 @@ def read_running_key() -> str | None:
     # T1-01.10: MN-8 — чтение с O_NOFOLLOW и лимитом, значение принимается только по
     # KEY_RE; сравнивается как строка с именами app/<KEY>, путь из содержимого не
     # строится никогда (unit в наборе userinstall).
+    path = running_key_path()
+    if path is None:
+        return None
     try:
-        with running_key_path().open("rb") as file:
+        with path.open("rb") as file:
             data = file.read(RUNNING_KEY_LIMIT)
     except (OSError, paths.PathError):
         return None
@@ -752,13 +747,25 @@ def unregister(*, deb_executable: Path = Path("/usr/bin/astra-voice")) -> Unregi
 
 
 def remove_program(*, keep: str | None = None) -> RemoveResult:
-    """Удаляет только копии в app/ под замком; keep удалит вызывающий при выходе (§4)."""
+    """Удаляет только копии в app/ под замком (§4).
+
+    Работающая копия (``running-key``) не удаляется никогда (Р5); ``keep`` добавляет
+    к ней ещё одну копию, а не заменяет защиту. Оставленные копии удаляет вызывающий
+    при выходе.
+    """
     unregistered = unregister()
     app = paths.appimage_app_dir()
     if not _is_real_dir(app):
         return RemoveResult(unregistered, (), ())
     with _install_lock(app, LOCK_TIMEOUT_S):
-        kept = (keep,) if keep is not None and is_key(keep) and _is_real_dir(app / keep) else ()
+        protected = {read_running_key(), keep}
+        kept = tuple(
+            sorted(
+                name
+                for name in protected
+                if name is not None and is_key(name) and _is_real_dir(app / name)
+            )
+        )
         removed = _cleanup(app, kept)
         for name in (paths.APPIMAGE_CURRENT, paths.APPIMAGE_PREVIOUS):
             link = app / name

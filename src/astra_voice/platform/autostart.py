@@ -208,6 +208,10 @@ def _inspect() -> tuple[AutostartState, Path, bytes | None]:
                 target = "ours-this"
         except AutostartUnavailableError:
             pass
+        except paths.PathError as exc:
+            # Строгая проверка пути программы отказала: запись наша, но на эту копию
+            # не указывает достоверно — «ours-other», чтение состояния не падает.
+            log.warning("Не удалось проверить путь программы для автозапуска: %s", exc)
     else:
         user = "foreign"
         target = "foreign"
