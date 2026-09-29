@@ -5130,6 +5130,7 @@ def test_settings_catalog_ignores_fallback_store() -> None:
     assert bridge.activeModelState == "ok"
     assert bridge.activeModelName == port.entry.name
     assert bridge.activeModelSize == "226 МБ"
+    assert bridge.activeModelRevision == str(port.entry.revision)[:7]
     assert bridge.canReinstall
     store.current.assert_not_called()
     store.records.assert_not_called()
@@ -5218,7 +5219,7 @@ def test_reinstall_broken_model_without_current(
 
 def test_settings_model_without_downloads() -> None:
     bridge = SettingsBridge(Settings(), save=Mock())
-    assert bridge.activeModelName == bridge.activeModelSize == ""
+    assert bridge.activeModelName == bridge.activeModelSize == bridge.activeModelRevision == ""
     assert bridge.activeModelState == "none"
     assert not bridge.canReinstall
     assert bridge.downloadState == ""
@@ -5230,6 +5231,7 @@ def test_settings_model_without_downloads() -> None:
     for name in (
         "activeModelName",
         "activeModelSize",
+        "activeModelRevision",
         "activeModelState",
         "canReinstall",
         "downloadState",

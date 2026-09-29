@@ -770,6 +770,7 @@ class FakeSettings(QObject):
         self._modelSelfcheck: str = "idle"
         self._activeModelName: str = "GigaAM v3 RNN-T"
         self._activeModelSize: str = "226 МБ"
+        self._activeModelRevision: str = "322c3b2"
         self._activeModelState: str = "ok"
         self._activeModelMessage: str = ""
         self._canReinstall: bool = True
@@ -1045,6 +1046,17 @@ class FakeSettings(QObject):
         self.changed.emit()
 
     activeModelSize = pyqtProperty(str, _get_activeModelSize, _set_activeModelSize, notify=changed)
+
+    def _get_activeModelRevision(self) -> str:
+        return self._activeModelRevision
+
+    def _set_activeModelRevision(self, value: str) -> None:
+        self._activeModelRevision = value
+        self.changed.emit()
+
+    activeModelRevision = pyqtProperty(
+        str, _get_activeModelRevision, _set_activeModelRevision, notify=changed
+    )
 
     def _get_activeModelState(self) -> str:
         return self._activeModelState
@@ -4539,15 +4551,15 @@ def test_settings_hide_debug_section_without_flag(onboarding_app: Any, dark: boo
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_settings_about_shows_version_and_privacy(onboarding_app: Any, dark: bool) -> None:
-    """Раздел «О программе» без appInfo показывает запасную версию и две строки."""
+    """Раздел «О программе» без appInfo и aboutBridge открывается с запасной версией."""
 
     def inspect(window: Any) -> None:
         texts = visible_texts(window.contentItem())
         assert {
             "Astra Voice",
             "0.1.0",
-            "Программа не выходит в сеть без вашего действия",
-            "Исходный код открыт",
+            "Лицензия программы",
+            "Исходный код открыт: github.com/ArrivaRUS/astra-voice",
         } <= texts
 
     _, messages = render_settings(onboarding_app, dark, section="about", inspect=inspect)

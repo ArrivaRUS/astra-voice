@@ -21,6 +21,8 @@ Item {
     // Бейдж «Задано администратором» (§3.2).
     property bool locked: false
     property string lockedText: ""
+    // Пояснение моноширинным (пути в «О программе», сквозное правило 5).
+    property bool subMono: false
 
     default property alias controlData: slot.data
 
@@ -100,7 +102,7 @@ Item {
                 text: root.sub
                 visible: root.sub !== ""
                 color: root.subColor
-                font.family: Theme.fontUi
+                font.family: root.subMono ? Theme.fontMono : Theme.fontUi
                 font.pixelSize: Theme.fontSettingSubSize
                 lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
                 lineHeightMode: Text.FixedHeight

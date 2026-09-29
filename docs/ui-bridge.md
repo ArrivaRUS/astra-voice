@@ -57,6 +57,7 @@
 | `showOnboarding` | `bool` | до `engine.load()` — `false`; сразу после сборки мостов — настоящее значение | Показывать мастер первого запуска вместо окна настроек. Пересчитывается по сигналу `doneChanged` контроллера |
 | `settingsBridge` | `SettingsBridge` | после `engine.load()` | Настройки (раздел 3) |
 | `updatesBridge` | `UpdatesBridge` (`ui/updates_bridge.py`) | после `engine.load()`, если проверка обновлений собрана | Строка обновлений внизу окна, панель «Что нового» и ручная проверка (раздел 3.8) |
+| `aboutBridge` | `AboutBridge` (`ui/about_bridge.py`) | после `engine.load()`, если мост собрался | Раздел «О программе» (раздел 3.9) |
 | `onboarding` | `OnboardingController` | после `engine.load()`, **только если** `settings.extra["onboarding_done"] is not True` | Мастер первого запуска (раздел 4) |
 
 У `AppInfo` есть свойство **`debug`** (`bool`, только чтение, сигнал
@@ -285,6 +286,7 @@ IPC v3; схема — `arch/s5a5-mic-change.md` §4). Воркер к этом�
 |---|---|---|---|
 | `activeModelName` | `string` | Имя записи каталога: сначала совпадающей с `current_ids()`, иначе первой с состоянием `ok` в хранилище, иначе первой, для которой есть любая запись в хранилище (в том числе сломанная); для снятой с каталога записи — «Установленная модель», если ничего не найдено — пусто | `activeModelChanged` |
 | `activeModelSize` | `string` | Размер записи, выбранной в том же порядке, что и для `activeModelName`, через `format_size`, например «226 МБ»; без записи — пусто | `activeModelChanged` |
+| `activeModelRevision` | `string` | Первые 7 знаков ревизии (коммита) той же записи, что и `activeModelName`, — для «О программе»; без записи — пусто | `activeModelChanged` |
 | `activeModelState` | `string` | Состояние текущей модели, словарь — ниже | `activeModelStateChanged` |
 | `downloadState` | `string` | Состояние общей очереди из раздела 4.3 | `downloadStateChanged` |
 | `downloadProgress` | `real` | Доля общей загрузки от 0 до 1 | `downloadProgressChanged` |
@@ -474,6 +476,56 @@ IPC v3; схема — `arch/s5a5-mic-change.md` §4). Воркер к этом�
 доступность — `canCheckNow` (пересчёт по `networkChanged`), нажатие открывает окно
 на разделе `network` и вызывает `checkNow()`. Всё в GUI-потоке; логика шины трея
 не затрагивается.
+
+### 3.9 О программе — `aboutBridge` (M9-а v0.2, PRD F13)
+
+Мост `AboutBridge` (`src/astra_voice/ui/about_bridge.py`) создаётся в GUI-потоке после
+моста настроек; статистику (`runtime.stats`) трогает только он и только там. Файлы и
+папки открывает тем же способом, что и папку моделей: `QDesktopServices.openUrl` с
+`QUrl.fromLocalFile` по пути, который мост вычислил сам, и только если путь существует.
+Адресов из QML мост не принимает. Документы: в пакете — `/usr/share/doc/astra-voice/`
+(`NOTICE`, `PRIVACY.md`) и системный текст GPL-3; в исходниках — корень репозитория
+(`LICENSE`, `NOTICE`, `docs/PRIVACY.md`). Без моста раздел показывает версию из
+`appInfo`, кнопки документов и папок неактивны. Вид сеанса и состояние политики
+раздел берёт из `appInfo` (`sessionKind`, `policyStatus`), модель — из
+`settingsBridge` (`activeModelName`, `activeModelRevision`), «Открыть» у моделей —
+`settingsBridge.openModelsFolder()`, «Проверить обновления» — `updatesBridge.checkNow()`.
+
+| Свойство | Тип | Доступ | Что это | Сигнал |
+|---|---|---|---|---|
+| `version` | `string` | только чтение, неизменно | Версия программы (`core/version.py`) | — |
+| `buildDate` | `string` | только чтение, неизменно | Дата сборки «01.10.2026» из `_version.py` (`__build_date__`, пишет `packaging/build-deb.sh`); в исходниках — пусто | — |
+| `installKind` | `string` | только чтение, неизменно | `deb` — запуск из `/usr/lib/astra-voice`, иначе `source` | — |
+| `pythonVersion` | `string` | только чтение, неизменно | Версия Python | — |
+| `pyqtVersion` | `string` | только чтение, неизменно | Версия PyQt5 | — |
+| `onnxruntimeVersion` | `string` | только чтение, неизменно | Версия onnxruntime по метаданным пакета (без импорта); не найден — пусто | — |
+| `onnxAsrVersion` | `string` | только чтение, неизменно | Версия onnx-asr по метаданным пакета; не найден — пусто | — |
+| `licenseAvailable` | `bool` | только чтение | Текст лицензии есть на диске | `infoChanged` |
+| `noticeAvailable` | `bool` | только чтение | `NOTICE` есть на диске | `infoChanged` |
+| `privacyAvailable` | `bool` | только чтение | `PRIVACY.md` есть на диске | `infoChanged` |
+| `settingsPath` | `string` | только чтение, неизменно | Каталог настроек для показа, домашний каталог — «~» | — |
+| `modelsPath` | `string` | только чтение, неизменно | Каталог моделей для показа | — |
+| `logsPath` | `string` | только чтение, неизменно | Каталог журналов для показа | — |
+| `settingsFolderAvailable` | `bool` | только чтение | Каталог настроек существует | `infoChanged` |
+| `modelsFolderAvailable` | `bool` | только чтение | Каталог моделей существует | `infoChanged` |
+| `logsFolderAvailable` | `bool` | только чтение | Каталог журналов существует | `infoChanged` |
+| `modelsSize` | `string` | только чтение | Сколько занимают модели, «680 МБ»; каталога нет — пусто | `infoChanged` |
+| `lastAttemptText` | `string` | только чтение | Последняя попытка проверки обновлений «сегодня в 14:05» / «07.09.2026 в 14:05» (`updates/state.py`); не было — пусто | `updatesChanged` |
+| `lastSuccessText` | `string` | только чтение | Последняя удачная проверка в том же виде | `updatesChanged` |
+| `statsAvailable` | `bool` | только чтение, неизменно | Статистика подключена (диктовка запустилась) | — |
+| `statsCount` | `int` | только чтение | Сколько диктовок в статистике (PRD §10) | `statsChanged` |
+| `statsText` | `string` | только чтение | «обычно 0,38 с, в худших случаях 0,61 с · 148 диктовок»; без диктовок — пусто. Распознанного текста в статистике нет по построению | `statsChanged` |
+| `refresh()` | слот | — | Перечитать папки, размер моделей, даты проверок и статистику; раздел зовёт при открытии | — |
+| `openLicense()` | слот | — | Открыть текст лицензии | — |
+| `openNotice()` | слот | — | Открыть `NOTICE` | — |
+| `openPrivacy()` | слот | — | Открыть `PRIVACY.md` | — |
+| `openSettingsFolder()` | слот | — | Открыть каталог настроек | — |
+| `openLogsFolder()` | слот | — | Открыть каталог журналов | — |
+| `clearStats()` | слот | — | Очистить статистику (раздел спрашивает подтверждение) | — |
+
+Метод для Python: `refresh_updates()` — перечитать даты проверок; `app.py` зовёт его
+по `updatesBridge.statusChanged`. Не показываем до своих вех: «Обновить из файла…»
+(M8), «Пройти настройку заново» (US-1.8).
 
 ## 4. Онбординг — `onboarding`
 

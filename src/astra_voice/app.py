@@ -463,6 +463,17 @@ def _load_qml(app_info: Any, theme_bridge: Any | None) -> Any | None:
     return engine
 
 
+def _make_about_bridge(runtime: DictationRuntime | None) -> Any | None:
+    """Мост раздела «О программе»; без него раздел показывает только версию."""
+    try:
+        from astra_voice.ui.about_bridge import AboutBridge
+
+        return AboutBridge(stats=runtime.stats if runtime is not None else None)
+    except Exception:  # noqa: BLE001 — сведения о программе не должны мешать окну
+        log.warning("Не удалось подготовить раздел «О программе»", exc_info=True)
+        return None
+
+
 def _set_context_property(shell: Any, name: str, obj: Any) -> None:
     """Добавляет объект в контекст QML; для виджета-заглушки ничего не делает."""
     root_context = getattr(shell, "rootContext", None)
@@ -972,6 +983,7 @@ def main(argv: list[str] | None = None) -> int:
     downloads = None
     update_checker: UpdateChecker | None = None
     updates_bridge: Any = None  # держим Python-обёртку живой до выхода из main
+    about_bridge: Any = None  # держим Python-обёртку живой до выхода из main
     gui_calls = _GuiCalls()
     model_store: ModelStore | None = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
@@ -1081,6 +1093,10 @@ def main(argv: list[str] | None = None) -> int:
         _set_context_property(shell, "settingsBridge", settings_bridge)
         # Офлайн-режим скрывает «Скачать» и отменяет загрузку из сети (PRD F14.2).
         settings_bridge.offlineChanged.connect(downloads.network_changed)
+        about_bridge = _make_about_bridge(runtime if runtime_ready else None)
+        if about_bridge is not None:
+            QQmlEngine.setObjectOwnership(about_bridge, QQmlEngine.CppOwnership)
+            _set_context_property(shell, "aboutBridge", about_bridge)
         root = _root_window(shell)
         if root is not None:
             capture.attach_window(root)
@@ -1121,6 +1137,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             QQmlEngine.setObjectOwnership(updates_bridge, QQmlEngine.CppOwnership)
             _set_context_property(shell, "updatesBridge", updates_bridge)
+            if about_bridge is not None:
+                # Даты попытки и успеха проверки в «О программе» идут за строкой-статусом.
+                updates_bridge.statusChanged.connect(about_bridge.refresh_updates)
             if runtime_ready and runtime is not None:
 
                 def show_network() -> None:
