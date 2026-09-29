@@ -851,13 +851,17 @@ class DictationOrchestrator:
         self._append_stat(
             "mic_error", kind="device-changed" if switched else DEVICE_LOST, recovered_by="none"
         )
-        self._safe_ui(
-            lambda: self._pill.show_state(
-                PillState.ERROR,
-                text=ERROR_MICROPHONE_CHANGED if switched else ERROR_MICROPHONE_LOST,
-            ),
-            "диктовка: не удалось обновить пилюлю",
-        )
+        # Подпись пилюли — только константа реестра pill (AST-страж test_pill).
+        if switched:
+            self._safe_ui(
+                lambda: self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_CHANGED),
+                "диктовка: не удалось обновить пилюлю",
+            )
+        else:
+            self._safe_ui(
+                lambda: self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_LOST),
+                "диктовка: не удалось обновить пилюлю",
+            )
         if switched:
             # Следующая запись с этого микрофона не объявит «Микрофон: X» ещё раз.
             self._announced_selected_device = label
