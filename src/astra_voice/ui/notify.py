@@ -231,9 +231,14 @@ def _post_from_thread(notice: _Notice) -> None:
         # До установки получателя Qt не трогаем: очередь разберёт install_dispatcher().
         if _receiver is not None and not _wake_pending:
             _wake_pending = True
-            if not QMetaObject.invokeMethod(
-                _receiver, "_drain", Qt.ConnectionType.QueuedConnection
-            ):
+            try:
+                posted = QMetaObject.invokeMethod(
+                    _receiver, "_drain", Qt.ConnectionType.QueuedConnection
+                )
+            except Exception:
+                # Отказ Qt не должен долететь до вызывающего рабочего потока.
+                posted = False
+            if not posted:
                 # Событие не поставлено: без сброса флага следующие посты молча копятся.
                 _wake_pending = False
                 _logger.debug("Не удалось разбудить получатель уведомлений из потока")

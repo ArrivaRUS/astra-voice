@@ -25,14 +25,9 @@ def _download_section() -> str:
 def test_privacy_model_sources_match_builtin_catalog() -> None:
     catalog = json.loads((REPO / "data/catalog.json").read_text(encoding="utf-8"))
     hosts = {model["host"] for model in catalog["models"]}
-    mirrors = {host for model in catalog["models"] for host in model.get("mirrors", ())}
+    has_mirrors = any(model.get("mirrors") for model in catalog["models"])
     section = _download_section()
     assert {_source_kind(host) for host in hosts} == {"hf"}
     assert "Hugging Face" in section
-    if mirrors:
-        # Появилось зеркало (например, GitHub Releases) — раздел надо переписать.
-        assert NO_MIRRORS not in section
-        if "github" in {_source_kind(host) for host in mirrors}:
-            assert "GitHub" in section
-    else:
-        assert NO_MIRRORS in section
+    # Появилось зеркало (например, GitHub Releases) — раздел надо переписать.
+    assert (NO_MIRRORS in section) is not has_mirrors

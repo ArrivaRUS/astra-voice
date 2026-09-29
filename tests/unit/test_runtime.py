@@ -2162,6 +2162,7 @@ def test_mapping_regrab_failure_warns_sets_nokey_and_retries(
     # Всплывающее уведомление ждёт 5 с; одно на потерю.
     notice = runtime_timer(rig, rig.runtime._lost_notice_timer)
     assert notice.single_shot and notice.interval == module.HOTKEY_LOST_NOTICE_DELAY_MS
+    assert notice.timer_type is None
     assert not rig.notify.mock_calls
     rig.now += 5
     notice.fire()
@@ -2274,6 +2275,8 @@ def lose_again_within_interval(rig: Rig, batches: list[Any]) -> FakeTimer:
     deferred = runtime_timer(rig, rig.runtime._lost_notice_timer)
     assert deferred.single_shot and deferred.active
     assert deferred.interval == 40_000
+    # Точный таймер: грубый (±5 %) сработал бы раньше и перевзвёлся бы каскадом.
+    assert deferred.timer_type == Qt.TimerType.PreciseTimer
     return deferred
 
 

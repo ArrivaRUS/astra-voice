@@ -263,6 +263,38 @@ def test_failed_wakeup_does_not_block_next_post(
     assert [summary for summary, _ in delivered] == ["первое", "второе"]
 
 
+def test_wakeup_exception_is_swallowed_and_resets_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    delivered: list[tuple[str, int]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Исключение invokeMethod не выходит в рабочий поток; следующий пост будит снова."""
+    notifications.install_dispatcher()
+    receiver = notifications._receiver
+    assert receiver is not None
+    invoke = Mock(side_effect=[RuntimeError("сбой Qt"), True])
+    monkeypatch.setattr(QMetaObject, "invokeMethod", invoke)
+    errors: list[BaseException] = []
+
+    def post(summary: str) -> None:
+        try:
+            notifications.notify(summary, retry=False)
+        except BaseException as exc:
+            errors.append(exc)
+
+    with caplog.at_level("DEBUG", logger=notifications.__name__):
+        for summary in ("первое", "второе"):
+            worker = threading.Thread(target=post, args=(summary,), name=_WORKER)
+            worker.start()
+            worker.join(2)
+    assert errors == []
+    assert invoke.call_count == 2
+    assert notifications._wake_pending is True
+    assert "Не удалось разбудить получатель уведомлений из потока" in caplog.text
+    receiver._drain()
+    assert [summary for summary, _ in delivered] == ["первое", "второе"]
+
+
 def test_gui_thread_notify_submits_directly(
     monkeypatch: pytest.MonkeyPatch, delivered: list[tuple[str, int]]
 ) -> None:

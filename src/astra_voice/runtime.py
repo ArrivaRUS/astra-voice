@@ -1274,13 +1274,21 @@ class DictationRuntime(QObject):
             notify.notify_hotkey_regrabbed(self.settings.hotkey)
         log.info("Горячая клавиша снова захвачена после смены раскладки: %s", self.settings.hotkey)
 
-    def _schedule_lost_notice(self, delay_ms: int = HOTKEY_LOST_NOTICE_DELAY_MS) -> None:
-        """Однократный таймер GUI-потока перед уведомлением о потере захвата."""
+    def _schedule_lost_notice(
+        self, delay_ms: int = HOTKEY_LOST_NOTICE_DELAY_MS, *, precise: bool = False
+    ) -> None:
+        """Однократный таймер GUI-потока перед уведомлением о потере захвата.
+
+        ``precise`` — для остатка интервала: грубый таймер Qt (±5 %) сработал бы
+        раньше срока и перевзвёлся бы каскадом.
+        """
         if self._closed or self._lost_notice_timer is not None:
             return
         timer = self._create_timer()
         self._lost_notice_timer = timer
         timer.setSingleShot(True)
+        if precise:
+            timer.setTimerType(Qt.TimerType.PreciseTimer)
         timer.timeout.connect(self._announce_hotkey_lost)
         timer.start(delay_ms)
 
@@ -1304,7 +1312,7 @@ class DictationRuntime(QObject):
         last = self._hotkey_lost_notified_at
         if last is not None and now - last < HOTKEY_LOST_NOTIFY_INTERVAL_S:
             remaining_s = HOTKEY_LOST_NOTIFY_INTERVAL_S - (now - last)
-            self._schedule_lost_notice(max(1, math.ceil(remaining_s * 1000)))
+            self._schedule_lost_notice(max(1, math.ceil(remaining_s * 1000)), precise=True)
             return
         self._hotkey_lost_notified_at = now
         self._hotkey_lost_announced = True
