@@ -1,0 +1,20 @@
+{
+ "repo": "https://github.com/qt/qtsvg",
+ "commit": "62c4a8da3114174ea5b2c4ea46d2ab848066d534",
+ "tree": "56bc505c59477f882b1539976c781a0fd426306e",
+ "missing": [
+  {"path":".gitattributes","mode":"100644","sha1":"a96f8f547384d614618d6c5ba7defcbe699e9214"},
+  {"path":".gitignore","mode":"100644","sha1":"22ff3b8270bb011d20668cd21817f6650506ad83"},
+  {"path":"tests/auto/bic/.gitignore","mode":"100644","sha1":"6f26b868f11b78c0028fcc9d48ff604afc1ae8fe"},
+  {"path":"tests/auto/qsvgdevice/.gitignore","mode":"100644","sha1":"62909d2360e10b2dcb6aafea6b6c0c78e85db1ab"},
+  {"path":"tests/auto/qsvggenerator/.gitignore","mode":"100644","sha1":"acd17d1c16a1a4a63f4c50f792bd8b89e362cdba"},
+  {"path":"tests/auto/qsvgplugin/.gitignore","mode":"100644","sha1":"c41c448ed65f2fc57944edcc533513474aa74985"},
+  {"path":"tests/auto/qsvgrenderer/.gitattributes","mode":"100644","sha1":"0e69c230236a4bcdd6a791e39ca0f7cf28a874b2"},
+  {"path":"tests/auto/qsvgrenderer/.gitignore","mode":"100644","sha1":"c15ceec0460bf6f88370cf43d2aef34c25b9c6d0"},
+  {"path":"tests/global/.gitignore","mode":"100644","sha1":"1e49c6005c0e657ebd6bb41a2f59275e39602caf"},
+  {"path":"tests/manual/rendertestsuite/.gitignore","mode":"100644","sha1":"54f7094c87e9e1ca2743e0ce7b6842096bd5eb80"}
+ ],
+ "changed": [
+  {"path":".tag","mode":"100644","sha1":"6828f88dcb0e88b8cd738ad6044ce74d7a9a13c8"}
+ ]
+}

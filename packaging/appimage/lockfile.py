@@ -22,8 +22,10 @@
     из `InRelease` (`file` — путь как в разделе SHA256 `InRelease`);
   - `# deb: {"package","version","arch","file","size","sha256","url","index","source",
     "source_version","dsc"}` — бинарный пакет из индекса `Packages`;
-  - `# source: {"id","file","size","sha256","url"[,"index"|"dsc"]}` — исходник: `.dsc`
-    из индекса `Sources` (`index`), архив из `.dsc` (`dsc`) или самостоятельный файл;
+  - `# source: {"id","file","size","sha256","url"[,"index"|"dsc"][,"git_commit","git_tree"
+    [,"git_delta"]]}` — исходник: `.dsc` из индекса `Sources` (`index`), архив из `.dsc`
+    (`dsc`) или самостоятельный файл; архив GitHub по коммиту — ещё и дерево git (байты
+    архивов GitHub не стабильны, дерево — стабильно; `git_delta` — export-ignore/subst);
 * `# host-lib: <SONAME> <пакет Debian/ALSE>` — манифест внешних зависимостей (R3.2): библиотека
   берётся с хоста и в образ не кладётся. Читают check_bundle.py (каждый DT_NEEDED вне AppDir —
   только из манифеста, каждая запись нужна и есть на хосте) и sbom.py (origin=host, not-bundled);
@@ -124,7 +126,10 @@ _FIELDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ),
         (),
     ),
-    "source": (("id", "file", "size", "sha256", "url"), ("index", "dsc")),
+    "source": (
+        ("id", "file", "size", "sha256", "url"),
+        ("index", "dsc", "git_commit", "git_tree", "git_delta"),
+    ),
 }
 
 
@@ -206,6 +211,9 @@ class Source:
     url: str
     index: str | None = None
     dsc: str | None = None
+    git_commit: str | None = None
+    git_tree: str | None = None
+    git_delta: str | None = None
 
     @property
     def cache_path(self) -> str:
@@ -386,6 +394,18 @@ def _add_record(lock: Lock, kind: str, raw: str) -> None:
             raise LockError(f"source {source.id}: неверное имя файла {source.file}")
         if source.index is not None and source.dsc is not None:
             raise LockError(f"source {source.id}: index и dsc одновременно")
+        if (source.git_commit is None) != (source.git_tree is None):
+            raise LockError(f"source {source.id}: git_commit и git_tree — только вместе")
+        for name in ("git_commit", "git_tree"):
+            value = getattr(source, name)
+            if value is not None and not re.fullmatch(r"[0-9a-f]{40}", value):
+                raise LockError(f"source {source.id}: {name} — 40 hex")
+        if source.git_delta is not None:
+            if source.git_tree is None:
+                raise LockError(f"source {source.id}: git_delta без git_tree")
+            _check_relpath(f"source {source.id}", source.git_delta)
+            if not source.git_delta.startswith("packaging/appimage/git-trees/"):
+                raise LockError(f"source {source.id}: git_delta вне packaging/appimage/git-trees/")
         _check_url(f"source {source.id}", source.url, source.file)
         lock.sources.append(source)
 

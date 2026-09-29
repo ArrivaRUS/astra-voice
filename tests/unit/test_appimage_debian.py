@@ -245,6 +245,18 @@ def test_debian_lock_parses() -> None:
         ({"py-orig": {"index": "main-sources"}}, "index и dsc одновременно"),
         ({"py-orig": {"index": "main-sources", "dsc": None}}, "только .dsc"),
         ({"py-orig": {"dsc": "py-orig"}}, "не .dsc"),
+        ({"py-orig": {"git_commit": "a" * 40}}, "git_commit и git_tree — только вместе"),
+        ({"py-orig": {"git_commit": "a" * 40, "git_tree": "B" * 40}}, "git_tree — 40 hex"),
+        (
+            {
+                "py-orig": {
+                    "git_commit": "a" * 40,
+                    "git_tree": "b" * 40,
+                    "git_delta": "tests/x.json",
+                }
+            },
+            "вне packaging/appimage/git-trees/",
+        ),
     ],
 )
 def test_bad_debian_records_rejected(override: dict[str, dict[str, Any]], message: str) -> None:
@@ -1063,3 +1075,153 @@ def test_deb_dir_copy_is_what_gets_verified(archive: Archive, tmp_path: Path) ->
     (copies / f"python3.11-minimal_{VERSION}_amd64.deb").write_bytes(b"swapped")
     with pytest.raises(debverify.VerifyError, match="deb python3.11-minimal: размер"):
         debverify.Verifier(lock, archive.cache, archive.root, deb_dir=copies).verify_debs()
+
+
+# --- ревью P3-5: архив GitHub сверяется с деревом git коммита ---------------------------
+
+
+def _git(repo: Path, *args: str, data: bytes | None = None) -> str:
+    return (
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@test.invalid", *args],
+            input=data,
+            capture_output=True,
+            check=True,
+        )
+        .stdout.decode()
+        .strip()
+    )
+
+
+def _blob(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+@pytest.fixture
+def git_archive(tmp_path: Path) -> tuple[Path, str, str, dict[str, Any]]:
+    """Репозиторий как у Qt: export-ignore, export-subst .tag, eol=crlf; архив git archive."""
+    if shutil.which("git") is None:
+        pytest.skip("нужен git")
+    repo = tmp_path / "qtsvg"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    attrs = (
+        b".gitignore export-ignore\n.gitattributes export-ignore\n"
+        b".tag export-subst\n*_crlf.qml eol=crlf\n"
+    )
+    files = {
+        ".gitattributes": attrs,
+        ".gitignore": b"*.o\n",
+        "src/.gitignore": b"moc_*\n",
+        ".tag": b"$Format:%H$\n",
+        "src/svg.cpp": b"int main() {}\n",
+        "tests/a_crlf.qml": b"Item {\n}\n",
+        "bin/tool.sh": b"#!/bin/sh\n",
+    }
+    for rel, data in files.items():
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_bytes(data)
+    (repo / "bin" / "tool.sh").chmod(0o755)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "init")
+    commit, tree = _git(repo, "rev-parse", "HEAD"), _git(repo, "rev-parse", "HEAD^{tree}")
+    archive = tmp_path / f"{commit}.tar.gz"
+    _git(
+        repo, "archive", "--format=tar.gz", f"--prefix=qtsvg-{commit}/", "-o", str(archive), commit
+    )
+    delta = {
+        "commit": commit,
+        "tree": tree,
+        "missing": [
+            {"path": p, "mode": "100644", "sha1": _blob(files[p])}
+            for p in (".gitattributes", ".gitignore", "src/.gitignore")
+        ],
+        "changed": [
+            {"path": ".tag", "mode": "100644", "sha1": _blob(files[".tag"])},
+            {
+                "path": "tests/a_crlf.qml",
+                "mode": "100644",
+                "sha1": _blob(files["tests/a_crlf.qml"]),
+            },
+        ],
+    }
+    return archive, commit, tree, delta
+
+
+def test_git_tree_of_github_style_archive(
+    git_archive: tuple[Path, str, str, dict[str, Any]],
+) -> None:
+    archive, commit, tree, delta = git_archive
+    assert debverify.archive_git_tree(archive, commit, delta, tree) == tree
+    # Без дельты дерево не сходится — export-ignore/subst/eol действительно меняют архив.
+    assert debverify.archive_git_tree(archive, commit) != tree
+    with pytest.raises(debverify.VerifyError, match="архив не коммита"):
+        debverify.archive_git_tree(archive, "0" * 40, delta, tree)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda d: d["missing"].append(
+                {"path": "src/svg.cpp", "mode": "100644", "sha1": "0" * 40}
+            ),
+            "есть в архиве",
+        ),
+        (
+            lambda d: d["missing"].append(
+                {"path": "src/gone.cpp", "mode": "100644", "sha1": "0" * 40}
+            ),
+            "пропасть из архива может только",
+        ),
+        (
+            lambda d: d["changed"].append(
+                {"path": "src/svg.cpp", "mode": "100644", "sha1": "0" * 40}
+            ),
+            "не объясняется export-subst или eol",
+        ),
+        (
+            lambda d: d["changed"].__setitem__(0, {**d["changed"][0], "sha1": "0" * 40}),
+            "не объясняется export-subst или eol",
+        ),
+    ],
+)
+def test_git_delta_only_known_differences(
+    git_archive: tuple[Path, str, str, dict[str, Any]], mutate: Any, message: str
+) -> None:
+    archive, commit, tree, delta = git_archive
+    mutate(delta)
+    with pytest.raises(debverify.VerifyError, match=message):
+        debverify.archive_git_tree(archive, commit, delta, tree)
+
+
+@needs_tools
+def test_verifier_checks_git_tree_of_source(
+    archive: Archive, git_archive: tuple[Path, str, str, dict[str, Any]]
+) -> None:
+    path, commit, tree, delta = git_archive
+    target = archive.cache / "sources" / path.name
+    shutil.copy2(path, target)
+    delta_rel = "packaging/appimage/git-trees/qtsvg-test.json"
+    (archive.root / delta_rel).parent.mkdir(parents=True)
+    (archive.root / delta_rel).write_text(json.dumps(delta), "utf-8")
+    sha, size = digest(target)
+    record = {
+        "id": "qtsvg-test",
+        "file": path.name,
+        "size": size,
+        "sha256": sha,
+        "url": f"https://github.com/qt/qtsvg/archive/{path.name}",
+        "git_commit": commit,
+        "git_tree": tree,
+        "git_delta": delta_rel,
+    }
+    archive.items.append(("source", record))
+    assert len(verify(archive, "sources")) == 3
+    record["git_tree"] = "f" * 40
+    with pytest.raises(debverify.VerifyError, match="от другого коммита"):
+        verify(archive, "sources")
+    delta["tree"] = "f" * 40
+    (archive.root / delta_rel).write_text(json.dumps(delta), "utf-8")
+    with pytest.raises(debverify.VerifyError, match="дерево git [0-9a-f]{40}, в lock f{40}"):
+        verify(archive, "sources")

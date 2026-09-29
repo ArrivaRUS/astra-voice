@@ -1,0 +1,13 @@
+{
+ "repo": "https://github.com/qt/qtquickcontrols2",
+ "commit": "00c621488d674eccbb5e4d628a0489f6e70516bc",
+ "tree": "b8631e52862715da1b84c390b0bc369020df5853",
+ "missing": [
+  {"path":".gitattributes","mode":"100644","sha1":"1a045fa1f021637288fd980c5c934af674ca8f25"},
+  {"path":".gitignore","mode":"100644","sha1":"52b333ca6471910532de1220e9203a6b4ec946fe"},
+  {"path":"tests/manual/testbench/.gitignore","mode":"100644","sha1":"75fae8bc39294f0225a6d80d00ac67ab1cb0de18"}
+ ],
+ "changed": [
+  {"path":".tag","mode":"100644","sha1":"6828f88dcb0e88b8cd738ad6044ce74d7a9a13c8"}
+ ]
+}

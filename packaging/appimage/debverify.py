@@ -26,13 +26,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import lzma
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 from collections.abc import Iterable, Sequence
 from pathlib import Path
+from typing import Any
 
 import lockfile
 
@@ -383,6 +386,18 @@ class Verifier:
                 if listed != (source.sha256, source.size):
                     raise VerifyError(f"{what}: в индексе {listed}, в lock {source.sha256}")
             check_file(path, source.sha256, source.size, what)
+            if source.git_tree is not None:
+                delta = None
+                if source.git_delta is not None:
+                    delta = json.loads((self.root / source.git_delta).read_text(encoding="utf-8"))
+                    if (delta.get("commit"), delta.get("tree")) != (
+                        source.git_commit,
+                        source.git_tree,
+                    ):
+                        raise VerifyError(f"{what}: {source.git_delta} от другого коммита")
+                tree = archive_git_tree(path, str(source.git_commit), delta, source.git_tree)
+                if tree != source.git_tree:
+                    raise VerifyError(f"{what}: дерево git {tree}, в lock {source.git_tree}")
             if source.file.endswith(".dsc"):
                 dsc = parse_deb822(strip_pgp(path.read_text(encoding="utf-8")))
                 if len(dsc) != 1 or "Checksums-Sha256" not in dsc[0]:
@@ -416,6 +431,113 @@ class Verifier:
         if len(found) > 1:
             raise VerifyError(f"source {source.id}: {source.file} в индексе несколько раз")
         return found[0] if found else None
+
+
+#: Что архив GitHub (git archive) законно меняет относительно дерева коммита (ревью P3-5).
+_EXPORT_IGNORED = frozenset({".gitignore", ".gitattributes"})
+#: `.tag` Qt: в git — шаблон export-subst, в архиве — хэш коммита (%H) или дерева (%T).
+_TAG_TEMPLATES = {"%H": b"$Format:%H$\n", "%T": b"$Format:%T$\n"}
+
+
+def _blob(data: bytes) -> str:
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def archive_git_tree(
+    path: Path, commit: str, delta: dict[str, Any] | None = None, tree: str | None = None
+) -> str:
+    """Хэш дерева git, воспроизведённый из архива GitHub по коммиту (ревью P3-5).
+
+    Архив должен нести commit в pax-заголовке. Дельта допускается только известных видов,
+    и каждое её изменение воспроизводится: отсутствующие в архиве `.gitignore`/`.gitattributes`
+    (export-ignore) и подмодули (160000); `.tag` в корне (export-subst: в архиве — хэш
+    коммита или ожидаемого дерева, в git — `$Format:%H$`/`$Format:%T$`); файлы с CRLF в
+    архиве, чей git-блоб — тот же текст с LF.
+    """
+    files: dict[str, tuple[str, str]] = {}
+    contents: dict[str, bytes] = {}
+    changed: dict[str, Any] = {str(c["path"]): c for c in (delta or {}).get("changed", [])}
+    with tarfile.open(path) as tar:
+        top: str | None = None
+        for member in tar:
+            parts = member.name.rstrip("/").split("/")
+            if top is None:
+                top = parts[0]
+            if parts[0] != top or ".." in parts:
+                raise VerifyError(f"{path.name}: чужой путь {member.name}")
+            rel = "/".join(parts[1:])
+            if not rel or member.isdir():
+                continue
+            if member.issym():
+                data, mode = member.linkname.encode(), "120000"
+            elif member.isreg():
+                fh = tar.extractfile(member)
+                assert fh is not None
+                data = fh.read()
+                mode = "100755" if member.mode & 0o111 else "100644"
+            else:
+                raise VerifyError(f"{path.name}: неожиданный тип {member.name}")
+            files[rel] = (mode, _blob(data))
+            if rel in changed:
+                contents[rel] = data
+        if tar.pax_headers.get("comment") != commit:
+            raise VerifyError(f"{path.name}: архив не коммита {commit}")
+    for item in (delta or {}).get("missing", []):
+        rel, mode, sha = str(item["path"]), str(item["mode"]), str(item["sha1"])
+        if rel in files:
+            raise VerifyError(f"{path.name}: {rel} есть в архиве, а дельта считает его пропавшим")
+        if mode != "160000" and rel.rsplit("/", 1)[-1] not in _EXPORT_IGNORED:
+            raise VerifyError(
+                f"{path.name}: пропасть из архива может только .gitignore/.gitattributes"
+            )
+        files[rel] = (mode, sha)
+    for rel, item in changed.items():
+        mode, sha = str(item["mode"]), str(item["sha1"])
+        archived = contents.get(rel)
+        if archived is None:
+            raise VerifyError(f"{path.name}: изменённого {rel} нет в архиве")
+        substituted = {"%H": commit, "%T": tree}
+        if rel == ".tag" and any(
+            value is not None
+            and archived == value.encode() + b"\n"
+            and sha == _blob(_TAG_TEMPLATES[key])
+            for key, value in substituted.items()
+        ):
+            pass
+        elif b"\r\n" in archived and _blob(archived.replace(b"\r\n", b"\n")) == sha:
+            pass
+        else:
+            raise VerifyError(f"{path.name}: изменение {rel} не объясняется export-subst или eol")
+        files[rel] = (mode, sha)
+    return _tree_hash(files)
+
+
+def _tree_hash(files: dict[str, tuple[str, str]]) -> str:
+    root: dict[str, Any] = {}
+    for rel, entry in files.items():
+        node = root
+        *dirs, name = rel.split("/")
+        for part in dirs:
+            child = node.setdefault(part, {})
+            if not isinstance(child, dict):
+                raise VerifyError(f"конфликт файла и каталога: {rel}")
+            node = child
+        node[name] = entry
+
+    def digest(node: dict[str, Any]) -> bytes:
+        items: list[tuple[bytes, bytes]] = []
+        for name, value in node.items():
+            key = name.encode()
+            if isinstance(value, dict):
+                items.append((key + b"/", b"40000 " + key + b"\0" + digest(value)))
+            else:
+                entry_mode, entry_sha = value
+                head = str(entry_mode).encode() + b" " + key + b"\0"
+                items.append((key, head + bytes.fromhex(str(entry_sha))))
+        body = b"".join(entry for _, entry in sorted(items))
+        return hashlib.sha1(b"tree %d\0" % len(body) + body).digest()
+
+    return digest(root).hex()
 
 
 def strip_pgp(text: str) -> str:

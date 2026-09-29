@@ -1,0 +1,18 @@
+{
+ "repo": "https://github.com/qt/qtdeclarative",
+ "commit": "dbb2e3b6bc9b51f76f241c7d108c466d78ef5695",
+ "tree": "1fa3393e75dfda78114c2f225422f6348b45df27",
+ "missing": [
+  {"path":".gitattributes","mode":"100644","sha1":"9842d4e766fb8aa4f436f1242410bd456f766409"},
+  {"path":".gitignore","mode":"100644","sha1":"9905dd1fdc7492c141e818e299e86d534c6cfd92"},
+  {"path":"tests/auto/qml/ecmascripttests/test262","mode":"160000","sha1":"6b0c42c63c2492bd0a7a96d3179d122b5f71793f"},
+  {"path":"tests/auto/qml/qqmlerror/.gitattributes","mode":"100644","sha1":"f50af6522288a9d901df01ff6b2fc7db02fd9822"},
+  {"path":"tests/auto/qml/qqmlmoduleplugin/.gitignore","mode":"100644","sha1":"040a48c25fb28a8a7266000f9e3d08b6ff630363"},
+  {"path":"tests/auto/qml/qqmlxmlhttprequest/.gitattributes","mode":"100644","sha1":"7805eb6951e576104397f853ef49890c72d032fe"},
+  {"path":"tests/global/.gitignore","mode":"100644","sha1":"1e49c6005c0e657ebd6bb41a2f59275e39602caf"}
+ ],
+ "changed": [
+  {"path":".tag","mode":"100644","sha1":"8b42f85cf579613a444bf76db2a60e9a4bb56668"},
+  {"path":"tests/auto/qml/qqmlecmascript/data/rewriteMultiLineStrings_crlf.1.qml","mode":"100644","sha1":"f84ba8c722b55690a5ab9ae4c7b572b0775af72b"}
+ ]
+}
