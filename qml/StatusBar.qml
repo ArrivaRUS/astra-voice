@@ -19,6 +19,8 @@ Item {
     property string updateVersion: ""
     // «Напомнить позже»: версия доступна, но без акцента.
     property bool updateSnoozed: false
+    // Что показать после 3000 мс uptodate: idle (только версия) или disabled (тумблер выключен).
+    property string updateRestState: "idle"
     property string version: "v0.2.0"
 
     // Клик или Enter/Space по кликабельному состоянию (§2.3: 5, 12, 15, 17).
@@ -62,7 +64,8 @@ Item {
         case "idle": return "";
         case "policy-locked": return qsTr("Проверка обновлений отключена (задано администратором)");
         case "checking": return qsTr("Проверяю обновления…");
-        case "uptodate": return uptodateShown ? qsTr("Установлена последняя версия") : "";
+        case "uptodate": return uptodateShown ? qsTr("Установлена последняя версия")
+            : updateRestState === "disabled" ? qsTr("Проверка обновлений отключена") : "";
         case "available": return qsTr("Доступна версия %1 · Подробнее").arg(updateVersion);
         case "unavailable": return qsTr("Источник обновлений недоступен · Повторить");
         case "error-net": return qsTr("Не удалось скачать обновление · Повторить");
@@ -71,7 +74,7 @@ Item {
         }
     }
     readonly property string updateIcon: updateState === "policy-locked" ? "lock"
-        : updateState === "uptodate" ? "check"
+        : updateState === "uptodate" && uptodateShown ? "check"
         : updateState === "error-net" ? "alert" : ""
     // available — единственный цветовой акцент внизу окна (§2.2).
     readonly property bool updateAccent: updateState === "available" && !updateSnoozed

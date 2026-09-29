@@ -128,6 +128,7 @@ class UpdatesBridge(QObject):
         self._checked_text = ""
         self._check_refusal = ""
         self._network_refusal = ""
+        self._scheduled_refusal = ""
         self._read_network()
 
     # -- Python (GUI-поток) -------------------------------------------------
@@ -179,12 +180,14 @@ class UpdatesBridge(QObject):
             self._checker.refresh()
 
     def _read_network(self) -> None:
-        check = download = ""
+        check = download = scheduled = ""
         if self._refusal is not None:
             check = self._refusal("check_app_manual")
             download = self._refusal("download")
-        if (check, download) != (self._check_refusal, self._network_refusal):
-            self._check_refusal, self._network_refusal = check, download
+            scheduled = self._refusal("check_app")
+        values = (check, download, scheduled)
+        if values != (self._check_refusal, self._network_refusal, self._scheduled_refusal):
+            self._check_refusal, self._network_refusal, self._scheduled_refusal = values
             self.networkChanged.emit()
 
     # -- свойства ------------------------------------------------------------
@@ -224,6 +227,11 @@ class UpdatesBridge(QObject):
     @pyqtProperty(str, notify=networkChanged)
     def networkRefusal(self) -> str:  # noqa: N802
         return self._network_refusal
+
+    @pyqtProperty(str, notify=networkChanged)
+    def restState(self) -> str:  # noqa: N802
+        """Что строка показывает, когда 3000 мс «Установлена последняя версия» истекли."""
+        return "disabled" if self._refusal is None or self._scheduled_refusal else "idle"
 
     @pyqtProperty(bool, notify=networkChanged)
     def canCheckNow(self) -> bool:  # noqa: N802

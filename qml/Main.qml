@@ -264,6 +264,7 @@ ApplicationWindow {
         updateState: window.updates ? window.updates.state : "disabled"
         updateVersion: window.updates ? window.updates.version : ""
         updateSnoozed: window.updates ? window.updates.snoozed : false
+        updateRestState: window.updates ? window.updates.restState : "idle"
         version: "v" + window.appVersion
 
         // §6.2: клик по «Доступна версия» открывает панель «Что нового» в разделе «Сеть».

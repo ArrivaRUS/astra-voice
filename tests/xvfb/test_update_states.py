@@ -84,6 +84,7 @@ class FakeUpdates(QObject):
             "checkRefusal": "",
             "networkRefusal": "",
             "canCheckNow": True,
+            "restState": "idle",
         }
         self._values.update(values)
 
@@ -97,6 +98,7 @@ class FakeUpdates(QObject):
     checkRefusal = pyqtProperty(str, _value("checkRefusal"), notify=networkChanged)
     networkRefusal = pyqtProperty(str, _value("networkRefusal"), notify=networkChanged)
     canCheckNow = pyqtProperty(bool, _value("canCheckNow"), notify=networkChanged)
+    restState = pyqtProperty(str, _value("restState"), notify=networkChanged)
 
     def update(self, **values: Any) -> None:
         self._values.update(values)
@@ -369,6 +371,18 @@ def test_footer_uptodate_hides_after_3000_ms(status_bar: Any) -> None:
     assert bar.property("updateText") == "Установлена последняя версия"
     QTest.qWait(400)
     assert bar.property("updateText") == ""
+
+
+def test_footer_uptodate_returns_to_disabled_when_toggle_off(status_bar: Any) -> None:
+    """Ревью 29.09: после ручной проверки при выключенном тумблере строка не пустеет."""
+    bar = status_bar
+    assert bar.setProperty("updateRestState", "disabled")
+    assert bar.setProperty("updateState", "uptodate")
+    assert bar.property("updateText") == "Установлена последняя версия"
+    assert bar.property("updateIcon") == "check"
+    QTest.qWait(3200)
+    assert bar.property("updateText") == "Проверка обновлений отключена"
+    assert bar.property("updateIcon") == ""
 
 
 @pytest.mark.parametrize(
