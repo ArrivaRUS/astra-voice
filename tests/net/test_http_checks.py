@@ -497,6 +497,82 @@ def test_bounded_connection_without_connect_timeout(server: FaultServer, timeout
         sock.close()
 
 
+@pytest.fixture
+def blackhole(monkeypatch: pytest.MonkeyPatch) -> Iterator[int]:
+    """Порт на loopback, где connect висит: очередь accept переполнена, SYN отбрасываются.
+
+    Рассчитано на поведение Linux при net.ipv4.tcp_abort_on_overflow=0 (по умолчанию):
+    при переполненной очереди SYN молча отбрасывается. При 1 ядро ответит RST, и
+    connect упадёт сразу, а не по таймауту — тогда тесты с этой фикстурой не годятся.
+    """
+    listener = socket.socket()
+    fillers: list[socket.socket] = []
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(0)
+        port = listener.getsockname()[1]
+        for _ in range(4):
+            filler = socket.socket()
+            filler.setblocking(False)
+            try:
+                filler.connect(("127.0.0.1", port))
+            except BlockingIOError:
+                pass
+            fillers.append(filler)
+        time.sleep(0.05)
+        monkeypatch.setattr(http, "ALLOWED_HOSTS", ("127.0.0.1",))
+        monkeypatch.setattr(http, "ALLOWED_SCHEMES", ("http",))
+        monkeypatch.setattr(http, "ALLOWED_PORTS", (None, port))
+        yield port
+    finally:
+        for filler in fillers:
+            filler.close()
+        listener.close()
+
+
+@pytest.mark.parametrize("timeout", ["none", "urllib3-default"])
+def test_bounded_connection_none_timeout_limited_by_deadline(blackhole: int, timeout: str) -> None:
+    """Без своего таймаута соединения висящий connect обрывает общий дедлайн."""
+    from urllib3.connection import HTTPConnection
+
+    connection = HTTPConnection("127.0.0.1", blackhole)
+    if timeout == "none":
+        connection.timeout = None
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        http._bounded_connection(connection, started + 0.3)
+    assert 0.25 <= time.monotonic() - started <= 0.3 + 0.5
+
+
+def test_check_connect_timeout_bounds_connect(
+    blackhole: int, client: HttpClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Проверка обновлений ждёт соединение не дольше CHECK_CONNECT_TIMEOUT_S.
+
+    Общий бюджет здесь заведомо больше: без своего предела соединения проверка
+    ждала бы 3 с (запасной таймаут get_stream), а не CHECK_CONNECT_TIMEOUT_S.
+    """
+    monkeypatch.setattr(http, "CHECK_CONNECT_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(http, "CHECK_TOTAL_TIMEOUT_S", 6.0)
+    monkeypatch.setattr(os, "fsync", lambda descriptor: None)
+    started = time.monotonic()
+    result = client.get_check(
+        f"http://127.0.0.1:{blackhole}/etag",
+        cache_key="key",
+        cache=UpdateCache(tmp_path / "cache.json"),
+        cancel=threading.Event(),
+    )
+    elapsed = time.monotonic() - started
+    assert result.state == "unavailable"
+    assert result.requests_made == 1
+    assert 0.25 <= elapsed <= 0.3 + 0.7
+
+
+def test_check_connect_timeout_is_within_total_budget() -> None:
+    """Соединение укладывается в общий бюджет с запасом на запрос и ответ."""
+    assert 0 < http.CHECK_CONNECT_TIMEOUT_S < http.CHECK_TOTAL_TIMEOUT_S
+
+
 def test_urllib3_internals_for_bounded_connection() -> None:
     """Сторож: обновление urllib3 в бандле не должно молча снять ограничение DNS."""
     import inspect

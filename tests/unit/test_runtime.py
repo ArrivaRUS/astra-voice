@@ -883,6 +883,48 @@ def test_promoted_switch_watchdog_rejects_silent_selfcheck(monkeypatch: pytest.M
     rig.runtime.shutdown()
 
 
+@pytest.mark.parametrize("mode", ("paused", "promoted"))
+def test_switch_watchdog_without_rollback_allows_tray_recheck(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """P3 из #12: откат невозможен (current.json не записался), старт воркера завис.
+
+    Ошибка видна, и самопроверка переводится в failed: иначе «Проверить модель ещё
+    раз» в трее ничего не делает, а сторож самопроверки продвинутого кандидата
+    позже сам перезапускает воркер уже после показанной ошибки.
+    """
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    replacement = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = replacement
+    finished = Mock()
+    rig.runtime.on_switch_finished = finished
+    if mode == "paused":
+        rig.runtime.switch_model(min_ram_mb=100, pause=True)
+    else:
+        monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
+        rig.runtime.switch_model(min_ram_mb=100)
+        callback = rig.supervisor_factory.call_args.kwargs["on_event"]
+        callback({"type": "hello", "generation": replacement.generation})
+        callback({"type": "model.loaded", "generation": replacement.generation})
+        assert rig.runtime.supervisor is replacement
+        assert rig.runtime._selfcheck == "running"
+    timer = rig.runtime._switch_timer
+    assert timer is not None
+    # Для продвинутого кандидата это уже сторож, взведённый заново при продвижении.
+    timer.fire()
+    finished.assert_called_once_with("failed")
+    assert not rig.runtime._switch_active()
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    assert rig.runtime._selfcheck == "failed"
+    assert rig.runtime._selfcheck_timer is None
+    rig.tray.set_model_recheck_enabled.assert_called_with(True)
+    starts = rig.supervisor_factory.call_count
+    rig.runtime._recheck_model()
+    assert rig.supervisor_factory.call_count == starts + 1
+    rig.runtime.shutdown()
+
+
 def test_paused_switch_survives_restart_before_hello(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
     rig.runtime.start()

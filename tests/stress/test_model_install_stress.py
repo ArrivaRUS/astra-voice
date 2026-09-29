@@ -34,9 +34,9 @@ from astra_voice.models.installer import InstallResult, ReasonCode
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unit"))
-from test_bridges import model_rig  # noqa: E402
 from test_model_job_threads import _run_exit_scenario, assert_exit_scenario  # noqa: E402
 
+from helpers.model_rig import model_rig_session  # noqa: E402
 from helpers.qt_app import get_qapplication  # noqa: E402
 
 pytestmark = pytest.mark.stress
@@ -68,7 +68,6 @@ def _capture_messages(controller: Any, displayed: list[str]) -> None:
 
 def test_model_install_cycle_does_not_deadlock(stress_runtime: None) -> None:
     duration = float(os.environ.get("ASTRA_VOICE_STRESS_SECONDS", "180"))
-    rig = model_rig.__wrapped__  # type: ignore[attr-defined]
     params = itertools.cycle(
         itertools.product((False, True), _REASON_CODES, ("SECRET /path/service", ""))
     )
@@ -77,7 +76,7 @@ def test_model_install_cycle_does_not_deadlock(stress_runtime: None) -> None:
     while time.monotonic() < deadline:
         faulthandler.dump_traceback_later(_WATCHDOG_S, exit=True)
         local, reason_code, reason = next(params)
-        fixture = rig()
+        fixture = model_rig_session()
         port, create = next(fixture)
         port.result = InstallResult("broken", reason, reason_code=reason_code)
         controller = create()

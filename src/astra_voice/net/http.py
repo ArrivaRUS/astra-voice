@@ -241,11 +241,11 @@ def _request_error(error: requests.exceptions.RequestException, host: str) -> Ne
 def _is_body_break(error: requests.exceptions.RequestException) -> bool:
     """Соединение оборвалось посреди тела ответа (в urllib3 1.26 и 2.x одинаково).
 
-    Укороченное тело с Content-Length urllib3 1.26 просто заканчивает (нехватку видит
-    загрузчик), а 2.x по умолчанию проверяет длину и бросает IncompleteRead внутри
-    ProtocolError. Оборванный chunked-ответ и сброс соединения посреди тела — тоже
-    ProtocolError в обеих версиях. При чтении тела requests заворачивает
-    ProtocolError в ChunkedEncodingError.
+    Укороченное тело с Content-Length urllib3 1.26 просто заканчивает (нехватку ловит
+    StreamResponse.iter_chunks по _declared_length), а 2.x по умолчанию проверяет длину
+    и бросает IncompleteRead внутри ProtocolError. Оборванный chunked-ответ и сброс
+    соединения посреди тела — тоже ProtocolError в обеих версиях. При чтении тела
+    requests заворачивает ProtocolError в ChunkedEncodingError.
     """
     if isinstance(error, requests.exceptions.ChunkedEncodingError):
         return True
@@ -262,6 +262,25 @@ def _body_error(error: requests.exceptions.RequestException, host: str) -> Netwo
     if translated.code == "host-unreachable" and _is_body_break(error):
         return NetworkError("short-read", "Соединение оборвалось до конца загрузки файла.")
     return translated
+
+
+def _declared_length(status: int, headers: Mapping[str, str]) -> int | None:
+    """Длина тела по Content-Length, если она однозначна и тело у ответа есть.
+
+    Transfer-Encoding главнее Content-Length (RFC 9112 §6.3); у 1xx/204/304 тела нет.
+    Несколько значений requests склеивает через запятую — такое не сверяем.
+    Больше 18 цифр — не сверяем тоже: таких файлов нет, а int() на строке длиннее
+    4300 цифр бросает ValueError, который прошёл бы мимо NetworkError.
+    """
+    if status < 200 or status in (204, 304) or "Transfer-Encoding" in headers:
+        return None
+    value = headers.get("Content-Length", "").strip()
+    if len(value) > 18 or re.fullmatch(r"[0-9]+", value) is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _shutdown_socket(sock: socket.socket | None) -> None:
@@ -498,6 +517,10 @@ class StreamResponse:
         self._speed_budget = _MIN_SPEED_GRACE_S
         self._read_deadline_at: float | None = None
         self._idle_timeout_s = idle_timeout_s
+        # urllib3 2.x сам бросает IncompleteRead на теле короче Content-Length,
+        # 1.26 молча заканчивает поток. Сверяем сами: обрыв — short-read в обеих.
+        self._expected_length = _declared_length(self.status, self.headers)
+        self._received = 0
         self._idle_deadline_at = (
             time.monotonic() + idle_timeout_s if idle_timeout_s is not None else None
         )
@@ -591,7 +614,14 @@ class StreamResponse:
                             self._speed_budget + len(chunk) / _MIN_SPEED_BYTES_PER_SECOND,
                         )
                 if not chunk:
+                    # Сюда доходим только при настоящем конце потока: отмена, дедлайн
+                    # и close() уже отработали в _check_active выше.
+                    if self._expected_length is not None and self._received < self._expected_length:
+                        raise NetworkError(
+                            "short-read", "Соединение оборвалось до конца загрузки файла."
+                        )
                     return
+                self._received += len(chunk)
                 if self._idle_timeout_s is not None:
                     with self._lock:
                         self._idle_deadline_at = time.monotonic() + self._idle_timeout_s

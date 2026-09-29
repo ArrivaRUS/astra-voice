@@ -537,9 +537,18 @@ class DictationRuntime(QObject):
             self._show_load_failed()
 
     def _show_load_failed(self) -> None:
-        """Прежний воркер остановлен, а вернуть модель не удалось: не молчим."""
+        """Прежний воркер остановлен, а вернуть модель не удалось: не молчим.
+
+        Самопроверка считается проваленной: сторож самопроверки не перезапускает
+        воркер после показанной ошибки, а «Проверить модель ещё раз» в трее
+        (_recheck_model) начинает новую серию. Без этого при зависшем старте
+        воркера и незаписанном current.json восстановить диктовку было нечем.
+        """
+        self._cancel_selfcheck_timer()
+        self._selfcheck = "failed"
         self._loading_model = False
         self._fail_pending_test()
+        self.tray.set_model_recheck_enabled(True)
         if self.orchestrator.phase == DictationPhase.IDLE:
             self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
         self.tray.set_state(TrayState.ERROR)

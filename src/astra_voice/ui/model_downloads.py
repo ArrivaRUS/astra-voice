@@ -933,7 +933,9 @@ class _RecheckJob:
         except Exception:
             # Исключение может содержать пути или речь, но не является отказом модели.
             log.warning("Перепроверка модели отложена до следующего запуска")
-        self._sink("finished", (state, reason))
+        finally:
+            # Как у _ModelJob: итог сообщается при любом выходе из задания.
+            self._sink("finished", (state, reason))
 
 
 class ModelDownloads(QObject):
