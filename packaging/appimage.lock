@@ -94,6 +94,7 @@
 # packaging/appimage/keys/; отпечаток B8B80B5B…350947F8 «Debian Archive Automatic Signing Key
 # (12/bookworm)» совпадает с опубликованным ftp-master.debian.org/keys.html. InRelease подписан ещё
 # ключами 13/trixie и Stable Release 12 — их в keyring нет намеренно, решает VALIDSIG signer.
+# Срок ключа истекает 2031-01-19 11:44:21 UTC (создан 2023-01-21): до этой даты перепинить снимок.
 # Исходники (source) сборка не читает — их проверяет debverify.py sources (выпуск, R3.6).
 # archive: {"id":"debian-bookworm","keyring":"packaging/appimage/keys/debian-archive-bookworm-automatic.gpg","signer":"B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8","release":"https://snapshot.debian.org/archive/debian/20260929T083940Z/dists/bookworm/InRelease","sha256":"77737fa4b34f2693e982cc9ee35736816c35a7778fc2d326cc1bbf5b301fe1aa","size":151075,"codename":"bookworm","suite":"oldstable"}
 # index: {"id":"bookworm-main-amd64","archive":"debian-bookworm","kind":"Packages","file":"main/binary-amd64/Packages.xz","size":8790396,"sha256":"9e0b5aabb2465b3d2e7a7fe27f9913846277833f7a2826e7767acccff5b588c5","url":"https://snapshot.debian.org/archive/debian/20260929T083940Z/dists/bookworm/main/binary-amd64/Packages.xz"}
