@@ -79,6 +79,10 @@ class AudioError(Exception):
         self.message: str = message
 
 
+class AudioApiUnavailable(AudioError):
+    """Нет нужной библиотеки звука или символа в ней; ошибка микрофона сюда не относится."""
+
+
 class CaptureStopTimeout(RuntimeError):
     """Поток захвата не вышел после отмены; источник нельзя закрывать извне."""
 
@@ -1054,9 +1058,13 @@ class _Pulse:
         try:
             self.lib = ctypes.CDLL("libpulse-simple.so.0", use_errno=True)
             self.libpulse = ctypes.CDLL("libpulse.so.0", use_errno=True)
-        except OSError:
-            raise AudioError(ERROR_FAILED, "Звуковая подсистема недоступна.") from None
+            self._declare()
+        except (OSError, AttributeError) as exc:
+            # AttributeError — нет нужного символа: владелец получает on_error, а не падение потока.
+            raise AudioError(ERROR_FAILED, "Звуковая подсистема недоступна.") from exc
 
+    def _declare(self) -> None:
+        """Объявляет argtypes/restype; отсутствие символа даёт AttributeError."""
         self.lib.pa_simple_new.argtypes = [
             ctypes.c_char_p,
             ctypes.c_char_p,

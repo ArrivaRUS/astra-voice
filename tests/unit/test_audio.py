@@ -1044,6 +1044,15 @@ def test_pulse_load_failure(monkeypatch: pytest.MonkeyPatch, failed_library: str
     assert caught.value.code == ERROR_FAILED
 
 
+def test_pulse_missing_symbol_is_audio_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """В libpulse-simple нет символа — AudioError для on_error, а не AttributeError."""
+    monkeypatch.setattr(ctypes, "CDLL", Mock(return_value=Mock(spec=[])))
+    with pytest.raises(AudioError, match="Звуковая подсистема недоступна") as caught:
+        _Pulse()
+    assert caught.value.code == ERROR_FAILED
+    assert isinstance(caught.value.__cause__, AttributeError)
+
+
 @pytest.mark.parametrize("failed", [False, True])
 def test_pulse_flush_calls_server(monkeypatch: pytest.MonkeyPatch, failed: bool) -> None:
     """Сброс обращается к libpulse; при отказе продолжать запись нельзя."""

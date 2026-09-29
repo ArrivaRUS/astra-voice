@@ -17,6 +17,7 @@ from helpers.pulse_fakes import (
     OTHER,
     REMOVE,
     SERVER,
+    Clock,
     FakeLibrary,
     FakePulse,
     Step,
@@ -1222,4 +1223,199 @@ def test_change_reported_when_stop_races_remove(cancel: bool) -> None:
         lists.assert_not_called()
     else:
         changed.assert_called_once_with("race", audio.KIND_DEVICE_LOST, None)
+    assert not source.is_open
+
+
+WARNING_FALLBACK = "Бэкенд записи stream недоступен (нет libpulse или символа); пробуем simple."
+
+
+def _unavailable_primary() -> ps.PulseStreamSource:
+    """Настоящий источник, у которого загрузка libpulse заканчивается отказом API."""
+    return ps.PulseStreamSource(
+        pulse_factory=ps._PulseAsync,
+        devices=lambda: [MIC],
+        default=lambda *_args, **_kwargs: MIC,
+    )
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.message for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_fallback_to_simple_when_symbol_missing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """В libpulse нет символа pa_stream — один WARNING, запись идёт через simple."""
+    monkeypatch.setattr(ctypes, "CDLL", Mock(return_value=Mock(spec=[])))
+    invalidate = Mock()
+    monkeypatch.setattr(ps, "invalidate_device_cache", invalidate)
+    simple = Mock(spec=audio.PulseSimpleSource)
+    simple.read_chunk.return_value = b"\0" * audio.CHUNK_BYTES
+    factory, notified = Mock(return_value=simple), Mock()
+    source = ps.StreamWithFallback(_unavailable_primary(), fallback=factory, on_fallback=notified)
+    running = threading.Event()
+    running.set()
+    with caplog.at_level("WARNING", logger=ps.__name__):
+        source.open(MIC.name, running=running)
+        source.open(MIC.name, running=running)
+    factory.assert_called_once_with()
+    notified.assert_called_once_with()
+    assert simple.open.call_count == 2
+    simple.open.assert_called_with(MIC.name, deadline=None, running=running)
+    assert source.read_chunk() == b"\0" * audio.CHUNK_BYTES
+    assert _warnings(caplog) == [WARNING_FALLBACK]
+    # P3-2: отказ API не сбрасывает кэш устройств.
+    invalidate.assert_not_called()
+
+
+def test_no_library_gives_audio_failed_through_real_simple(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Нет libpulse.so.0: simple тоже не открывается, владелец получает прежний audio-failed."""
+    monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=OSError("нет библиотеки")))
+    source = ps.StreamWithFallback(
+        _unavailable_primary(),
+        fallback=lambda: audio.PulseSimpleSource(
+            devices=lambda: [MIC], default=lambda *_a, **_kw: MIC
+        ),
+    )
+    clock = Clock()
+    errors = Mock()
+    capture = audio.AudioCapture(
+        source=source,
+        on_samples=Mock(return_value=True),
+        on_event=Mock(),
+        on_error=errors,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    with caplog.at_level("WARNING", logger=ps.__name__):
+        capture.start("nolib", MIC.name, limit_s=30)
+        thread = capture._thread
+        assert thread is not None
+        thread.join(5)
+        assert not thread.is_alive()
+    errors.assert_called_once()
+    uid, code, message = errors.call_args.args
+    assert (uid, code) == ("nolib", audio.ERROR_FAILED)
+    assert isinstance(message, str) and message
+    assert _warnings(caplog) == [WARNING_FALLBACK]
+    assert not source.is_open
+
+
+def test_fallback_happens_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Если и запасной путь сообщает об отказе API, повторного отката нет."""
+    monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=OSError("нет библиотеки")))
+    simple = Mock(spec=audio.PulseSimpleSource)
+    simple.open.side_effect = audio.AudioApiUnavailable(audio.ERROR_FAILED, "нет")
+    factory = Mock(return_value=simple)
+    source = ps.StreamWithFallback(_unavailable_primary(), fallback=factory)
+    with caplog.at_level("WARNING", logger=ps.__name__):
+        for _ in range(2):
+            with pytest.raises(audio.AudioApiUnavailable):
+                source.open(MIC.name)
+    factory.assert_called_once_with()
+    assert _warnings(caplog) == [WARNING_FALLBACK]
+
+
+def test_fallback_passes_real_deadline() -> None:
+    """Запасной источник получает тот же _OpenDeadline и флаг, что и pa_stream."""
+    primary = Mock(spec=ps.PulseStreamSource)
+    primary.open.side_effect = audio.AudioApiUnavailable(audio.ERROR_FAILED, "нет")
+    simple = Mock(spec=audio.PulseSimpleSource)
+    source = ps.StreamWithFallback(primary, fallback=lambda: simple)
+    clock = Clock()
+    deadline = audio._OpenDeadline(clock)
+    running = threading.Event()
+    running.set()
+    source.open(MIC.name, deadline=deadline, running=running)
+    primary.open.assert_called_once_with(MIC.name, deadline=deadline, running=running)
+    simple.open.assert_called_once_with(MIC.name, deadline=deadline, running=running)
+    assert simple.open.call_args.kwargs["deadline"] is deadline
+
+
+def test_close_before_and_after_fallback() -> None:
+    """close до отката закрывает pa_stream; при откате он закрыт, дальше закрывается simple."""
+    primary = Mock(spec=ps.PulseStreamSource)
+    simple = Mock(spec=audio.PulseSimpleSource)
+    source = ps.StreamWithFallback(primary, fallback=lambda: simple)
+    source.close()
+    primary.close.assert_called_once_with()
+    primary.open.side_effect = audio.AudioApiUnavailable(audio.ERROR_FAILED, "нет")
+    source.open(MIC.name)
+    # Отброшенный pa_stream закрыт при откате.
+    assert primary.close.call_count == 2
+    simple.close.assert_not_called()
+    source.close()
+    simple.close.assert_called_once_with()
+    assert primary.close.call_count == 2
+
+
+@pytest.mark.parametrize("code", [audio.ERROR_BUSY, audio.ERROR_NO_DEVICE, audio.ERROR_FAILED])
+def test_microphone_errors_are_not_masked(
+    code: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Обычная ошибка микрофона идёт владельцу как есть, simple не подставляется."""
+    primary = Mock(spec=ps.PulseStreamSource)
+    primary.open.side_effect = audio.AudioError(code, "Микрофон занят другой программой.")
+    factory = Mock()
+    source = ps.StreamWithFallback(primary, fallback=factory)
+    with caplog.at_level("WARNING", logger=ps.__name__):
+        with pytest.raises(audio.AudioError) as exc:
+            source.open(MIC.name)
+    assert exc.value.code == code
+    assert not isinstance(exc.value, audio.AudioApiUnavailable)
+    factory.assert_not_called()
+    assert not _warnings(caplog)
+
+
+def test_fallback_wrapper_delegates_to_stream() -> None:
+    """Без отказа API обёртка прозрачна: устройство, метка и закрытие — у pa_stream."""
+    pulse = FakePulse()
+    source = ps.StreamWithFallback(source_for(pulse), fallback=Mock(side_effect=AssertionError))
+    assert isinstance(source, audio.ManagedSource)
+    assert not source.is_open
+    source.open(MIC.name)
+    assert source.is_open
+    assert source.selected_device == MIC
+    assert source.device_name == MIC.name
+    assert source.device_label == MIC.label
+    assert source.device_change is None
+    assert source.live and not source.ended
+    source.close()
+    assert not source.is_open
+    assert source.device_label is None
+
+
+def test_device_change_through_wrapper_in_capture() -> None:
+    """Смена устройства pa_stream видна AudioCapture и через обёртку."""
+    pulse = FakePulse()
+    source = ps.StreamWithFallback(source_for(pulse), fallback=Mock(side_effect=AssertionError))
+    changed, lists = Mock(), Mock(return_value=[OTHER])
+    capture = audio.AudioCapture(
+        source=source,
+        on_samples=Mock(return_value=True),
+        on_event=Mock(),
+        on_error=Mock(),
+        on_device_change=changed,
+        list_devices_fn=lists,
+        default_device_fn=lambda *_a, **_kw: OTHER,
+        clock=pulse.clock,
+        sleep=pulse.clock.sleep,
+    )
+    pulse.steps.extend(
+        [
+            Step(),
+            Step(),
+            Step(fragments=[b"a" * 640], events=[(REMOVE, MIC.index)]),
+        ]
+    )
+    capture.start("moved", MIC.name, limit_s=30)
+    thread = capture._thread
+    assert thread is not None
+    thread.join(5)
+    assert not thread.is_alive()
+    changed.assert_called_once_with("moved", audio.KIND_DEVICE_LOST, None)
     assert not source.is_open

@@ -30,14 +30,27 @@ POLL_INTERVAL = 0.25
 MAX_SEND_BUFFER = 4 * 1024 * 1024
 
 
+def audio_backend(env: Mapping[str, str]) -> tuple[str, bool]:
+    """Имя бэкенда записи и признак неизвестного значения переменной."""
+    # С 29.09 по умолчанию stream (живой прогон 11/11); simple — запасной путь через env.
+    value = env.get("ASTRA_VOICE_AUDIO_BACKEND")
+    if value == "simple":
+        return "simple", False
+    return "stream", value not in (None, "stream")
+
+
+def _log_backend_fallback() -> None:
+    """По журналу видно, какой бэкенд записи работает на самом деле."""
+    logger.info("Бэкенд записи: simple (откат)")
+
+
 def select_audio_source(env: Mapping[str, str]) -> AudioSource:
     """Выбирает источник только по переданному окружению, не открывая устройство."""
-    # Умолчание сменим на stream только после стенда и мини-Ц2 (решение Юрки).
-    if env.get("ASTRA_VOICE_AUDIO_BACKEND") == "stream":
-        from astra_voice.worker.pulse_stream import PulseStreamSource
+    if audio_backend(env)[0] == "simple":
+        return PulseSimpleSource()
+    from astra_voice.worker.pulse_stream import StreamWithFallback
 
-        return PulseStreamSource()
-    return PulseSimpleSource()
+    return StreamWithFallback(on_fallback=_log_backend_fallback)
 
 
 def _prctl(option: int, value: int) -> None:
@@ -120,11 +133,11 @@ class WorkerLoop:
             from astra_voice.worker.audio import AudioCapture
 
             source = select_audio_source(os.environ)
-            backend = os.environ.get("ASTRA_VOICE_AUDIO_BACKEND")
-            if backend is not None and backend not in ("simple", "stream"):
+            backend, unknown = audio_backend(os.environ)
+            if unknown:
                 # Значение не пишем: оно может быть длинным или содержать управляющие символы.
-                logger.warning("Неизвестный ASTRA_VOICE_AUDIO_BACKEND; выбран simple.")
-            logger.info("Бэкенд записи: %s", "stream" if backend == "stream" else "simple")
+                logger.warning("Неизвестный ASTRA_VOICE_AUDIO_BACKEND; выбран stream.")
+            logger.info("Бэкенд записи: %s", backend)
 
             self.worker.set_capture(
                 AudioCapture(
