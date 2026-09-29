@@ -107,12 +107,14 @@ class Heard:
 class BenchEngine:
     """Холодный прогон 900 мс, затем тёплые 100…500 мс."""
 
-    def __init__(self, text: str = SECRET) -> None:
+    def __init__(self, text: str = SECRET, log: list[object] | None = None) -> None:
         self.text = text
+        self.log = log if log is not None else []
         self.times: Iterator[float] = iter([900.0, 100.0, 200.0, 300.0, 400.0, 500.0])
 
     def load(self, model_dir: Path, layout: str, variant: str, threads: int) -> Loaded:
         assert threads == 2
+        self.log.append("load")
         return Loaded()
 
     def transcribe(self, audio: Any, cancel: Any) -> Heard:
@@ -143,7 +145,16 @@ def test_probe_uses_worker_rules(bench: dict[str, Any], monkeypatch: pytest.Monk
     with wave.open(str(WAV), "rb") as stream:
         audio_ms = stream.getnframes() / stream.getframerate() * 1000
 
-    result = bench["run_probe"](**probe_options(engine_factory=lambda layout: BenchEngine()))
+    log: list[object] = []
+    result = bench["run_probe"](
+        **probe_options(
+            engine_factory=lambda layout: BenchEngine(log=log),
+            limits=lambda mb: log.append(("limits", mb)),
+        )
+    )
+
+    # Пределы воркера ставятся до загрузки модели, по min_ram_mb каталога.
+    assert log == [("limits", 768), "load"]
 
     assert result["runs"] == 5
     assert result["cold_ms"] == 900.0  # холодный прогон не входит в медиану
@@ -158,7 +169,9 @@ def test_probe_uses_worker_rules(bench: dict[str, Any], monkeypatch: pytest.Monk
 def test_probe_rejects_empty_text(bench: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(worker_state, "_available_vad", lambda: None)
     with pytest.raises(bench["BenchmarkError"], match="пустой текст"):
-        bench["run_probe"](**probe_options(engine_factory=lambda layout: BenchEngine(" ")))
+        bench["run_probe"](
+            **probe_options(engine_factory=lambda layout: BenchEngine(" "), limits=lambda mb: None)
+        )
 
 
 def test_measures_models_and_writes_app_format(
@@ -338,3 +351,109 @@ def test_runs_below_five_rejected(bench: dict[str, Any], runs: str) -> None:
     with pytest.raises(SystemExit) as exit_info:
         main(["--catalog", "--runs", runs])
     assert exit_info.value.code == 2
+
+
+LIMITS_SCRIPT = """
+import ctypes, json, resource, runpy, sys
+namespace = runpy.run_path(sys.argv[1])
+globals_ = namespace["main"].__globals__
+globals_["apply_probe_limits"](2048)
+globals_["set_parent_death_signal"]()
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+signal_number = ctypes.c_int(0)
+libc.prctl(2, ctypes.byref(signal_number), 0, 0, 0)  # PR_GET_PDEATHSIG
+print(json.dumps({
+    "core": resource.getrlimit(resource.RLIMIT_CORE),
+    "address_space": resource.getrlimit(resource.RLIMIT_AS),
+    "pdeathsig": signal_number.value,
+}))
+"""
+
+
+def test_probe_limits_match_worker(tmp_path: Path) -> None:
+    """Настоящие пределы ставятся в отдельном процессе, чтобы не задеть pytest."""
+    import resource
+    import signal
+
+    from astra_voice.worker.main import MIN_ADDRESS_SPACE
+
+    completed = subprocess.run(
+        [sys.executable, "-c", LIMITS_SCRIPT, str(ROOT / "tools/benchmark")],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    facts = json.loads(completed.stdout.splitlines()[-1])
+    hard = resource.getrlimit(resource.RLIMIT_AS)[1]
+    requested = max(2048 * 3 * 1024 * 1024, MIN_ADDRESS_SPACE)
+    expected = requested if hard == resource.RLIM_INFINITY else min(requested, hard)
+
+    assert facts["core"] == [0, 0]
+    assert facts["address_space"][0] == expected
+    assert facts["pdeathsig"] == signal.SIGTERM
+
+
+def test_missing_wav_exit_2(
+    bench: dict[str, Any], fake_probe: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = ModelStore(tmp_path / "store")
+    install(store, "a-model")
+
+    facts = run(bench, ["--store", str(store.root), "--wav", str(tmp_path / "нет.wav")], capsys)
+
+    assert facts["exit_code"] == 2
+    assert "Эталонный WAV не найден" in facts["explanation"]
+    assert fake_probe == []
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink-file", "symlink-app"])
+def test_bad_out_exit_2_without_traceback(
+    bench: dict[str, Any],
+    fake_probe: list[str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    kind: str,
+) -> None:
+    store = ModelStore(tmp_path / "store")
+    install(store, "a-model")
+    app_file = Path(os.environ["XDG_DATA_HOME"]) / "astra-voice" / "measurements.json"
+    out = tmp_path / "out"
+    if kind == "directory":
+        out.mkdir()
+        text = "--out указывает на каталог"
+    elif kind == "symlink-file":
+        (tmp_path / "real.json").write_text("{}", encoding="utf-8")
+        out.symlink_to(tmp_path / "real.json")
+        text = "символической ссылкой"
+    else:
+        out.symlink_to(app_file)
+        text = "Файл замеров программы не перезаписывается"
+
+    facts = run(bench, ["--store", str(store.root), "--out", str(out)], capsys)
+
+    assert facts["exit_code"] == 2
+    assert text in facts["explanation"]
+    assert fake_probe == []
+    assert not app_file.exists()
+    if kind == "symlink-file":
+        assert (tmp_path / "real.json").read_text(encoding="utf-8") == "{}"
+
+
+def test_unverified_catalog_is_reported(
+    bench: dict[str, Any], fake_probe: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def bad_signature(*args: object, **kwargs: object) -> None:
+        raise ValueError("подпись не прошла")
+
+    bench["load_builtin"] = bad_signature
+    store = ModelStore(tmp_path / "store")
+    install(store, "a-model")
+    main = cast(Callable[[list[str]], int], bench["main"])
+
+    code = main(["--catalog", "--store", str(store.root), "--out", str(tmp_path / "m.json")])
+
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "Каталог не прочитан (ValueError)" in output
+    assert "min_ram_mb по умолчанию 768" in output
