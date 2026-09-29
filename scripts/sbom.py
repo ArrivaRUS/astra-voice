@@ -305,7 +305,8 @@ QT_MODULES: dict[str, tuple[str, ...]] = {
     "qtsvg": ("lib/libQt5Svg.", "plugins/imageformats/", "plugins/iconengines/"),
     "icu": ("lib/libicu",),
 }
-QT_VERSION = "5.15.19"
+#: Версия ICU — из имени файла Qt (libicuuc.so.56), версия Qt — из пина PyQt5-Qt5 в lock.
+_ICU_RE = re.compile(r"libicu[a-z0-9]*\.so\.([0-9]+)")
 #: Лицензии вложенных в колёса библиотек (по имени файла; auditwheel добавляет хэш к имени).
 NESTED_LICENSES = (
     (re.compile(r"libopenblas"), "BSD-3-Clause"),
@@ -464,9 +465,12 @@ def _wheel_components_r3(appdir: Path, lock: Any, origin: dict[str, str]) -> lis
                 if module is None and _is_elf(path):
                     raise ValueError(f"ELF Qt без модуля в карте sbom.py: {rel}")
                 if module is not None:
-                    qt_ref = f"pkg:generic/qt5-{module}@{QT_VERSION}"
+                    qt_ref = f"pkg:generic/qt5-{module}@{req.version}"
                     if module == "icu":
-                        qt_ref = "pkg:generic/icu@56"
+                        icu = _ICU_RE.fullmatch(path.name)
+                        if icu is None:
+                            raise ValueError(f"не определить версию ICU: {rel}")
+                        qt_ref = f"pkg:generic/icu@{icu.group(1)}"
                     qt_files.setdefault(qt_ref, []).append(rel)
                     if _is_elf(path):
                         origin[target] = qt_ref
@@ -488,14 +492,18 @@ def _wheel_components_r3(appdir: Path, lock: Any, origin: dict[str, str]) -> lis
                     if license_id:
                         comp["licenses"] = [{"expression": license_id}]
                     nested.append(comp)
+        icu_refs = sorted(r for r in qt_files if r.startswith("pkg:generic/icu@"))
+        if len(icu_refs) > 1:
+            raise ValueError(f"несколько версий ICU в колесе: {', '.join(icu_refs)}")
         for qt_ref, qt_rel in sorted(qt_files.items()):
-            module = qt_ref.split("/", 1)[1].split("@")[0].removeprefix("qt5-")
+            name, _, component_version = qt_ref.split("/", 1)[1].partition("@")
+            module = name.removeprefix("qt5-")
             is_icu = module == "icu"
             comp = {
                 "type": "library",
                 "bom-ref": qt_ref,
-                "name": "icu" if is_icu else f"qt5-{module}",
-                "version": "56" if is_icu else QT_VERSION,
+                "name": name,
+                "version": component_version,
                 "purl": qt_ref,
                 "licenses": [{"expression": "ICU" if is_icu else "LGPL-3.0-only"}],
                 "properties": [
@@ -504,7 +512,7 @@ def _wheel_components_r3(appdir: Path, lock: Any, origin: dict[str, str]) -> lis
                 ],
             }
             if not is_icu:
-                comp["externalReferences"] = _source_refs(lock, f"{module}-{QT_VERSION}")
+                comp["externalReferences"] = _source_refs(lock, f"{module}-{component_version}")
             nested.append(comp)
         comp = {
             "type": "library",
@@ -540,10 +548,8 @@ def _host_components(lock: Any) -> list[dict[str, Any]]:
             _prop("sonames", " ".join(sorted(sonames))),
         ]
         if package == "libssl3":
-            props += [
-                _prop("requirement", f"OpenSSL major {lock.openssl_major}"),
-                _prop("observed-build-host", ssl.OPENSSL_VERSION),
-            ]
+            # Версия OpenSSL машины сборки — не свойство образа: только в лог (ревью В).
+            props.append(_prop("requirement", f"OpenSSL major {lock.openssl_major}"))
         out.append(
             {
                 "type": "library",
@@ -697,6 +703,7 @@ def main(argv: list[str] | None = None) -> int:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(bom, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"SBOM: {args.out} ({len(bom['components'])} компонентов)")
+        print(f"OpenSSL машины сборки (наблюдение, в SBOM не пишется): {ssl.OPENSSL_VERSION}")
         return 0
 
     if not args.deb.is_file():

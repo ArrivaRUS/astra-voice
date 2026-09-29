@@ -894,6 +894,17 @@ def _sbom_tree(tmp_path: Path) -> tuple[Path, Path, Path]:
     return appdir, cache, lock
 
 
+def origins_or_refs(bom: dict[str, Any]) -> set[str]:
+    """Все bom-ref, включая вложенные компоненты."""
+    refs: set[str] = set()
+    stack = list(bom["components"])
+    while stack:
+        comp = stack.pop()
+        refs.add(comp["bom-ref"])
+        stack += comp.get("components", [])
+    return refs
+
+
 def _sbom(appdir: Path, cache: Path, lock: Path, out: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -938,6 +949,10 @@ def test_sbom_debian12(tmp_path: Path) -> None:
     assert host_props["astra-voice:origin"] == "host"
     assert host_props["astra-voice:not-bundled"] == "true"
     assert host_props["astra-voice:sonames"] == "libcrypto.so.3 libssl.so.3"
+    # Ревью В: версия OpenSSL машины сборки — только в лог, не в SBOM.
+    assert "astra-voice:observed-build-host" not in host_props
+    assert "OpenSSL машины сборки (наблюдение, в SBOM не пишется)" in proc.stdout
+    assert "pkg:generic/icu@56" in origins_or_refs(bom)
     assert "host:zlib1g" in comps
     runtime = next(c for c in bom["components"] if c["name"] == "type2-runtime")
     assert runtime["scope"] == "required"
