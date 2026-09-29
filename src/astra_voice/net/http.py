@@ -21,7 +21,13 @@ from urllib.parse import urljoin, urlsplit
 import requests
 from urllib3 import HTTPConnectionPool, HTTPSConnectionPool, ProxyManager
 from urllib3.connection import HTTPConnection
-from urllib3.exceptions import ConnectTimeoutError, NewConnectionError, ReadTimeoutError
+from urllib3.exceptions import (
+    ConnectTimeoutError,
+    IncompleteRead,
+    NewConnectionError,
+    ProtocolError,
+    ReadTimeoutError,
+)
 from urllib3.util.connection import _set_socket_options, allowed_gai_family
 
 from astra_voice.net.gate import NetworkGate, NetworkKind
@@ -230,6 +236,32 @@ def _request_error(error: requests.exceptions.RequestException, host: str) -> Ne
         f"Не удалось связаться с {host}.",
         proxy_error=isinstance(error, requests.exceptions.ProxyError),
     )
+
+
+def _is_body_break(error: requests.exceptions.RequestException) -> bool:
+    """Соединение оборвалось посреди тела ответа (в urllib3 1.26 и 2.x одинаково).
+
+    Укороченное тело с Content-Length urllib3 1.26 просто заканчивает (нехватку видит
+    загрузчик), а 2.x по умолчанию проверяет длину и бросает IncompleteRead внутри
+    ProtocolError. Оборванный chunked-ответ и сброс соединения посреди тела — тоже
+    ProtocolError в обеих версиях. При чтении тела requests заворачивает
+    ProtocolError в ChunkedEncodingError.
+    """
+    if isinstance(error, requests.exceptions.ChunkedEncodingError):
+        return True
+    return any(isinstance(arg, (ProtocolError, IncompleteRead)) for arg in error.args)
+
+
+def _body_error(error: requests.exceptions.RequestException, host: str) -> NetworkError:
+    """Переводит ошибку чтения тела: обрыв посреди ответа — short-read, не host-unreachable.
+
+    short-read сохраняет .part и ведёт к докачке с Range, как в загрузчике при
+    укороченном ответе; таймауты и прочие отказы переводятся как раньше.
+    """
+    translated = _request_error(error, host)
+    if translated.code == "host-unreachable" and _is_body_break(error):
+        return NetworkError("short-read", "Соединение оборвалось до конца загрузки файла.")
+    return translated
 
 
 def _shutdown_socket(sock: socket.socket | None) -> None:
@@ -570,7 +602,7 @@ class StreamResponse:
             with self._lock:
                 if not self._check_active():
                     return
-            raise _request_error(error, self._host) from None
+            raise _body_error(error, self._host) from None
         finally:
             self.close()
 
