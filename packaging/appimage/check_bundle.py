@@ -118,6 +118,7 @@ class Dynamic:
     needed: tuple[str, ...]
     rpath: tuple[str, ...] = ()
     runpath: tuple[str, ...] = ()
+    soname: str | None = None
 
 
 def read_dynamic(path: Path) -> Dynamic | None:
@@ -158,7 +159,7 @@ def read_dynamic(path: Path) -> Dynamic | None:
                 break
             if tag == 1:  # DT_NEEDED
                 needed.append(value)
-            elif tag in (5, 10, 15, 29):  # DT_STRTAB, DT_STRSZ, DT_RPATH, DT_RUNPATH
+            elif tag in (5, 10, 14, 15, 29):  # STRTAB, STRSZ, SONAME, RPATH, RUNPATH
                 tags[tag] = value
         if 5 not in tags or 10 not in tags:
             raise ElfError(f"{path}: нет DT_STRTAB/DT_STRSZ")
@@ -179,7 +180,8 @@ def read_dynamic(path: Path) -> Dynamic | None:
     def paths(tag: int) -> tuple[str, ...]:
         return tuple(p for p in string(tags[tag]).split(":") if p) if tag in tags else ()
 
-    return Dynamic(tuple(string(offset) for offset in needed), paths(15), paths(29))
+    soname = string(tags[14]) if 14 in tags else None
+    return Dynamic(tuple(string(offset) for offset in needed), paths(15), paths(29), soname)
 
 
 def _expand(entries: Iterable[str], origin: Path) -> tuple[Path, ...] | None:
@@ -257,6 +259,8 @@ def check_needed(
                     problems.append(f"{rel}: {soname} найден вне AppDir: {found}")
                 elif target in infos:
                     visit(target, chain)
+                else:
+                    problems.append(f"{rel}: {soname} по RUNPATH/RPATH — не ELF: {found}")
             elif soname in host_sonames:
                 used.add(soname)
             else:
@@ -319,17 +323,28 @@ def check_symlinks(appdir: Path) -> list[str]:
 _MAPS_LIB_RE = re.compile(r"lib(ssl|crypto)\.so(\.[0-9.]+)?")
 
 
+def _soname(path: str) -> str | None:
+    try:
+        info = read_dynamic(Path(path))
+    except (OSError, ElfError):
+        return None
+    return info.soname if info is not None else None
+
+
 def loaded_openssl(maps: str) -> dict[str, set[str]]:
-    """Пути libssl/libcrypto из текста /proc/self/maps: имя → множество путей."""
+    """libssl/libcrypto из текста /proc/self/maps: SONAME → множество реальных путей.
+
+    В карте памяти — реальный файл (у иных сборок libssl.so.3.0.13, а не libssl.so.3), поэтому
+    имя берётся из DT_SONAME самого файла; не читается — по имени файла (ревью, nit)."""
     found: dict[str, set[str]] = {}
     for line in maps.splitlines():
         parts = line.split(maxsplit=5)
         if len(parts) < 6:
             continue
         path = parts[5].removesuffix(" (deleted)")
-        name = os.path.basename(path)
-        if _MAPS_LIB_RE.fullmatch(name):
-            found.setdefault(name, set()).add(path)
+        if _MAPS_LIB_RE.fullmatch(os.path.basename(path)):
+            name = _soname(path) or os.path.basename(path)
+            found.setdefault(name, set()).add(os.path.realpath(path))
     return found
 
 

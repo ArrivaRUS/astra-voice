@@ -38,6 +38,7 @@ def make_elf(
     rpath: str | None = None,
     runpath: str | None = None,
     e_type: int = 3,
+    soname: str | None = None,
 ) -> Path:
     """Минимальный ELF64 LE: один PT_LOAD (vaddr = смещение) и PT_DYNAMIC."""
     strtab = b"\0"
@@ -53,6 +54,8 @@ def make_elf(
         entries.append((15, add(rpath)))
     if runpath is not None:
         entries.append((29, add(runpath)))
+    if soname is not None:
+        entries.append((14, add(soname)))
     strtab_off = 64 + 2 * 56
     dyn_off = (strtab_off + len(strtab) + 7) // 8 * 8
     entries += [(5, strtab_off), (10, len(strtab)), (0, 0)]
@@ -318,3 +321,28 @@ def test_prefixes_and_sitecustomize(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         "sys.base_prefix вне бандла: /usr",
         "sitecustomize подключён не из бандла: /etc/python3.11/sitecustomize.py",
     ]
+
+
+def test_runpath_target_must_be_elf(tree: tuple[Path, Path]) -> None:
+    """Ревью, nit: по RUNPATH нашёлся не ELF (текст, каталог) — ошибка, а не молчание."""
+    appdir, host = tree
+    make_elf(appdir / "ext.so", ("libfoo.so.1", "libc.so.6"), runpath="$ORIGIN/lib")
+    (appdir / "lib").mkdir()
+    (appdir / "lib" / "libfoo.so.1").write_text("not elf", "utf-8")
+    assert needed(appdir, host) == [
+        f"ext.so: libfoo.so.1 по RUNPATH/RPATH — не ELF: {appdir / 'lib' / 'libfoo.so.1'}"
+    ]
+
+
+def test_openssl_identified_by_soname(
+    ssl_appdir: tuple[Path, dict[str, str | None]], tmp_path: Path
+) -> None:
+    """Ревью, nit: реальный файл libssl.so.3.0.13 с DT_SONAME libssl.so.3 — это libssl.so.3."""
+    appdir, files = ssl_appdir
+    host = tmp_path / "usr" / "lib" / "x86_64-linux-gnu"
+    ssl_lib = make_elf(host / "libssl.so.3.0.13", soname="libssl.so.3")
+    crypto = make_elf(host / "libcrypto.so.3.0.13", soname="libcrypto.so.3")
+    maps = "\n".join([maps_line(str(ssl_lib)), maps_line(str(crypto))])
+    assert set(gate.loaded_openssl(maps)) == {"libssl.so.3", "libcrypto.so.3"}
+    problems = gate.check_openssl(appdir, 3, "host", (3, 0, 13), maps, files, [str(host)])
+    assert problems == []
