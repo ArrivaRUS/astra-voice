@@ -75,6 +75,8 @@ def records(**override: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
                 "release": f"{BASE_URL}/dists/bookworm/InRelease",
                 "sha256": SHA,
                 "size": 10,
+                "codename": "bookworm",
+                "suite": "oldstable",
             },
         ),
         (
@@ -457,7 +459,7 @@ class Archive:
             ident = "main-amd64" if "binary" in name else "main-sources"
             self.item(ident).update(sha256=sha, size=size)
         release = (
-            "Origin: Test\nCodename: bookworm\nMD5Sum:\n 0 0 ignored\nSHA256:\n"
+            "Origin: Test\nSuite: oldstable\nCodename: bookworm\nMD5Sum:\n 0 0 ignored\nSHA256:\n"
             + "\n".join(lines)
             + "\n"
             + self.release_extra
@@ -1026,3 +1028,12 @@ def test_gpgv_status_whitelist(
     verifier = debverify.Verifier(archive.write_lock(), archive.cache, archive.root, gpgv=gpgv)
     with pytest.raises(debverify.VerifyError, match=message):
         verifier.verify_debs()
+
+
+@needs_tools
+@pytest.mark.parametrize(("field", "value"), [("codename", "trixie"), ("suite", "stable")])
+def test_codename_and_suite_must_match_lock(archive: Archive, field: str, value: str) -> None:
+    """Ревью P3-2: подписанный InRelease другого выпуска Debian не подходит."""
+    archive.item("debian-bookworm")[field] = value
+    with pytest.raises(debverify.VerifyError, match="Codename/Suite"):
+        verify(archive)

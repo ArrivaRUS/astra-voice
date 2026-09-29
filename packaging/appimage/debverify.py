@@ -5,7 +5,7 @@
 
     ключ архива из репозитория (keyring) + отпечаток из lock (signer)
       → `gpgv` по `InRelease` (VALIDSIG ключа signer, ни одной плохой подписи);
-        sha256 и размер самого `InRelease` — из lock
+        sha256 и размер самого `InRelease` — из lock; Codename и Suite — из lock
       → sha256 и размер `Packages[.xz]` из раздела SHA256 подписанного текста = lock = файл
       → строфа пакета в `Packages`: версия, архитектура, имя файла, Source, sha256, размер
       → sha256 и размер `.deb` = lock = файл; поля control `.deb` (dpkg-deb) = lock.
@@ -295,6 +295,13 @@ class Verifier:
             path = self.cache / archive.cache_path
             check_file(path, archive.sha256, archive.size, f"InRelease {ident}")
             text = gpgv_verify(path, self.root / archive.keyring, archive.signer, self.gpgv)
+            header = parse_deb822(text.split("\nMD5Sum:", 1)[0].split("\nSHA256:", 1)[0])
+            got = (header[0].get("Codename"), header[0].get("Suite")) if header else (None, None)
+            if got != (archive.codename, archive.suite):
+                raise VerifyError(
+                    f"InRelease {ident}: Codename/Suite {got}, "
+                    f"в lock {(archive.codename, archive.suite)}"
+                )
             self._release[ident] = release_sha256(text)
         return self._release[ident]
 

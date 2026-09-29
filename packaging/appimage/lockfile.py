@@ -13,8 +13,9 @@
   - `expect-elf`, `max-glibc` — гейт `tools/elf-audit` (MN-9);
   - `runtime-key` — отпечаток ключа подписи `runtime-x86_64.sig`;
 * однострочные JSON-записи Debian-входов (R3.3), только при `base: debian12`:
-  - `# archive: {"id","keyring","signer","release","sha256","size"}` — подписанный
-    `InRelease`; `keyring` — путь в репозитории, `signer` — отпечаток основного ключа;
+  - `# archive: {"id","keyring","signer","release","sha256","size","codename","suite"}` —
+    подписанный `InRelease`; `keyring` — путь в репозитории, `signer` — отпечаток основного
+    ключа; `codename`/`suite` сверяются с подписанным текстом;
   - `# index: {"id","archive","kind","file","size","sha256","url"}` — `Packages`/`Sources`
     из `InRelease` (`file` — путь как в разделе SHA256 `InRelease`);
   - `# deb: {"package","version","arch","file","size","sha256","url","index","source",
@@ -99,7 +100,7 @@ _FILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]*")
 
 #: Поля JSON-записей: обязательные и необязательные; лишнее поле — ошибка.
 _FIELDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
-    "archive": (("id", "keyring", "signer", "release", "sha256", "size"), ()),
+    "archive": (("id", "keyring", "signer", "release", "sha256", "size", "codename", "suite"), ()),
     "index": (("id", "archive", "kind", "file", "size", "sha256", "url"), ()),
     "deb": (
         (
@@ -148,6 +149,8 @@ class Archive:
     release: str
     sha256: str
     size: int
+    codename: str
+    suite: str
 
     @property
     def cache_path(self) -> str:
