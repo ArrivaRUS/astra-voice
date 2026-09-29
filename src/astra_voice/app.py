@@ -777,6 +777,25 @@ def _bind_updates_bridge(
     return bridge
 
 
+def _wire_tray_updates(tray: Any, bridge: Any, show_network: Callable[[], None]) -> None:
+    """Пункт трея «Проверить обновления» (Р9): активен всегда, кроме офлайна и запрета.
+
+    Меню живёт в GUI-потоке, мост — тоже: проверка уходит в поток проверки через
+    ``checkNow()``, окно открывается на разделе «Сеть», где видна панель результата.
+    """
+
+    def sync() -> None:
+        tray.set_updates_enabled(bool(bridge.canCheckNow))
+
+    def check() -> None:
+        show_network()
+        bridge.checkNow()
+
+    tray.on_check_updates = check
+    bridge.networkChanged.connect(sync)
+    sync()
+
+
 def _wire_close(
     app: Any, shell: Any, is_tray_ready: Callable[[], bool] | None = None
 ) -> Any | None:
@@ -1100,6 +1119,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             QQmlEngine.setObjectOwnership(updates_bridge, QQmlEngine.CppOwnership)
             _set_context_property(shell, "updatesBridge", updates_bridge)
+            if runtime_ready and runtime is not None:
+
+                def show_network() -> None:
+                    focuser.focus_shell()
+                    app_info.show_section(SECTION_NETWORK)
+
+                _wire_tray_updates(runtime.tray, updates_bridge, show_network)
 
         update_checker = _start_update_checker(
             settings, policy, gui_calls, runtime if runtime_ready else None, bind_updates

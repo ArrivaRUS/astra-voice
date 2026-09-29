@@ -245,12 +245,18 @@ def test_updates_bridge_bound_before_start_and_refreshed_by_settings(
     # Кнопки «Страница выпуска» нет, пока нет platform/external.open_external.
     assert bridge.releasePageAvailable is False
 
+    # Пункт трея «Проверить обновления» (Р9) следует за гейтом.
+    tray = rig.runtime.tray
+    tray.set_updates_enabled.assert_called_with(True)
+    assert callable(tray.on_check_updates)
+
     settings_bridge = properties["settingsBridge"]
     checker.refresh.reset_mock()
     settings_bridge.offline = True
     checker.refresh.assert_called_once_with()
     assert bridge.checkRefusal == "offline"
     assert bridge.canCheckNow is False
+    tray.set_updates_enabled.assert_called_with(False)
     settings_bridge.checkAppUpdates = True
     assert checker.refresh.call_count == 2
 

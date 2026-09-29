@@ -7,9 +7,12 @@ import pytest
 pytest.importorskip("requests")
 
 # ruff: noqa: E402
+from collections.abc import Iterator
 from datetime import datetime
+from typing import Any
 from unittest.mock import Mock
 
+from PyQt5 import sip
 from PyQt5.QtTest import QSignalSpy
 
 from astra_voice.ui.updates_bridge import (
@@ -188,3 +191,79 @@ def test_checked_text_formats() -> None:
     assert checked_text(None, NOW) == ""
     earlier = datetime(2026, 9, 7, 9, 5).timestamp()
     assert checked_text(earlier, NOW) == "Проверено 07.09.2026 в 09:05"
+
+
+@pytest.fixture
+def real_tray(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    """Настоящее меню трея без значка и без шины: start() не вызывается."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from astra_voice.ui import tray as tray_module
+    from helpers.qt_app import get_qapplication
+
+    get_qapplication()
+    forbidden = Mock(side_effect=AssertionError("шина и настоящий значок запрещены"))
+    monkeypatch.setattr(tray_module, "QSystemTrayIcon", forbidden)
+    monkeypatch.setattr(tray_module, "QDBusConnection", forbidden)
+    monkeypatch.setattr(tray_module, "_send_bus_command", forbidden)
+    provider = Mock()
+    provider.tooltip.return_value = "Astra Voice"
+    tray = tray_module.Tray(provider, tray_factory=Mock)
+    try:
+        yield tray
+    finally:
+        sip.delete(tray._menu)
+        sip.delete(tray)
+
+
+def tray_updates_action(tray: Any) -> Any:
+    actions = [action for action in tray._menu.actions() if action.text() == "Проверить обновления"]
+    assert len(actions) == 1
+    return actions[0]
+
+
+@pytest.mark.parametrize(
+    ("refusal", "enabled"),
+    [("", True), ("offline", False), ("admin", False), ("policy", False)],
+    ids=["normal", "offline", "admin", "policy"],
+)
+def test_tray_check_updates_item_follows_gate(real_tray: Any, refusal: str, enabled: bool) -> None:
+    """Р9: пункт трея активен всегда, кроме офлайна и запрета администратором."""
+    from astra_voice.app import _wire_tray_updates
+
+    bridge, checker = make_bridge({"check_app_manual": refusal})
+    shown = Mock()
+    _wire_tray_updates(real_tray, bridge, shown)
+    action = tray_updates_action(real_tray)
+    assert action.isEnabled() is enabled
+    action.trigger()
+    if enabled:
+        shown.assert_called_once_with()
+        checker.check_now.assert_called_once_with()
+    else:
+        checker.check_now.assert_not_called()
+
+
+def test_tray_item_tracks_offline_toggle(real_tray: Any) -> None:
+    from astra_voice.app import _wire_tray_updates
+
+    refusals: dict[str, str] = {}
+    bridge, _ = make_bridge(refusals)
+    _wire_tray_updates(real_tray, bridge, Mock())
+    action = tray_updates_action(real_tray)
+    assert action.isEnabled()
+    refusals.update({"check_app_manual": "offline", "download": "offline"})
+    bridge.refresh()
+    assert not action.isEnabled()
+    refusals.clear()
+    bridge.refresh()
+    assert action.isEnabled()
+
+
+def test_tray_item_stays_disabled_without_checker(real_tray: Any) -> None:
+    from astra_voice.app import _wire_tray_updates
+
+    _wire_tray_updates(real_tray, UpdatesBridge(), Mock())
+    assert not tray_updates_action(real_tray).isEnabled()
