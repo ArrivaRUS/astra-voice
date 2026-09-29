@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -11,6 +12,7 @@ from types import ModuleType
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/e2e/hotkey_diag.py"
+DICTATE50 = SCRIPT.with_name("dictate50.sh")
 
 pytestmark = pytest.mark.unit
 
@@ -42,3 +44,19 @@ def test_app_pids_match_exact_argv_only(tmp_path: Path) -> None:
     (tmp_path / "self").mkdir()
     assert diag.app_pids(tmp_path, uid=os.getuid()) == [101, 102]
     assert diag.app_pids(tmp_path, uid=os.getuid() + 1) == []
+
+
+def test_dictate50_usage_names_packaged_app_only() -> None:
+    """Справка прогона честно говорит: app-pid видит только пакетную программу."""
+    diag = load_diag()
+    result = subprocess.run(
+        ["sh", str(DICTATE50), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    usage = " ".join(result.stdout.split())
+    assert " ".join(diag.APP_ARGV) in usage
+    assert "app-pid" in usage
+    assert "запуск из venv или AppImage она не видит" in usage
