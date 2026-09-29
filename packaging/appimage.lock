@@ -49,6 +49,14 @@
 # source: {"id":"python3.11-orig","file":"python3.11_3.11.2.orig.tar.gz","size":26437858,"sha256":"2411c74bda5bbcfcddaf4531f66d1adc73f247f529aee981b029513aefdbf849","url":"https://snapshot.debian.org/archive/debian/20260929T083940Z/pool/main/p/python3.11/python3.11_3.11.2.orig.tar.gz","dsc":"python3.11-dsc"}
 # source: {"id":"python3.11-debian","file":"python3.11_3.11.2-6+deb12u8.debian.tar.xz","size":279556,"sha256":"ece2d63c70ac0b7a401fbe6b51b0103be997c294a01a3865549be1862794ba97","url":"https://snapshot.debian.org/archive/debian/20260929T083940Z/pool/main/p/python3.11/python3.11_3.11.2-6%2Bdeb12u8.debian.tar.xz","dsc":"python3.11-dsc"}
 #
+# Исходники поставляемых компонентов вне Debian (R3.6), скачано 29.09 с «да» заказчика:
+# PyQt5 5.15.11 sdist — sha256 и размер совпали с digests PyPI JSON API (pypi.org/pypi/PyQt5/5.15.11/json);
+# type2-runtime — коммит dd6cebed тега 20251108 (GitHub API git/ref/tags/20251108), архив GitHub по
+# коммиту; sha256 снят при скачивании (у GitHub нет опубликованного хэша архива). Исходники Qt 5.15.19
+# и libfuse 3.15.0 (статически в runtime) ещё не получены — см. arch/appimage.md R3.6.
+# source: {"id":"pyqt5-sdist","file":"PyQt5-5.15.11.tar.gz","size":3216775,"sha256":"fda45743ebb4a27b4b1a51c6d8ef455c4c1b5d610c90d2934c7802b5c1557c52","url":"https://files.pythonhosted.org/packages/0e/07/c9ed0bd428df6f87183fca565a79fee19fa7c88c7f00a7f011ab4379e77a/PyQt5-5.15.11.tar.gz"}
+# source: {"id":"type2-runtime-src","file":"dd6cebedcbddde9c82f89b011e8e1d40b6e43868.tar.gz","size":31069,"sha256":"f5fec23be76e50e2445ed2d018bac49b367490fc483c62c4637e99ec705d27ba","url":"https://github.com/AppImage/type2-runtime/archive/dd6cebedcbddde9c82f89b011e8e1d40b6e43868.tar.gz"}
+#
 # Колёса PyPI (кэш: ~/.cache/astra-voice-dev/appimage/wheels).
 # numpy 1.24.2 — та же версия, что python3-numpy на ALSE 1.8 (с ней уже живёт .deb + ORT 1.24.4).
 # requests 2.32.5 — как python3-requests на ALSE; urllib3/idna/charset-normalizer/certifi/six/PyQt5-sip — свежие совместимые.
