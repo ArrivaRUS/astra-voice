@@ -472,6 +472,9 @@ class HotkeyManager:
         self._key_down = False
         # Перезахват после смены карты не удался; grab() того же сочетания восстановит.
         self._lost = False
+        # Диагностика журнала: пары автоповтора за удержание и пропуски нажатий подряд.
+        self._repeat_pairs = 0
+        self._skipped_presses = 0
 
     def grab(self, combo: str, mode: HotkeyMode) -> GrabResult:
         if combo == self._combo and self._lost:
@@ -550,17 +553,52 @@ class HotkeyManager:
             and self._escape_grabbed
             and event.kind == "KeyPress"
         ):
+            before = self.fsm.state
             self.fsm.escape(now)
             callback = self.on_escape
+            log.info("хоткей: Escape, автомат %s→%s", before.value, self.fsm.state.value)
         elif event.keycode == self._keycode:
+            before = self.fsm.state
             if event.kind == "KeyPress" and matches_combo and not self._key_down:
                 self._key_down = True
+                self._repeat_pairs = 0
+                self._skipped_presses = 0
                 self.fsm.press(now)
                 callback = self.on_press
+                log.info(
+                    "хоткей: нажатие keycode=%d mods=%#x key_down=1, автомат %s→%s",
+                    event.keycode,
+                    event.mods,
+                    before.value,
+                    self.fsm.state.value,
+                )
             elif event.kind == "KeyRelease" and self._key_down:
                 self._key_down = False
+                self._skipped_presses = 0
                 self.fsm.release(now)
                 callback = self.on_release
+                log.info(
+                    "хоткей: отпускание keycode=%d mods=%#x key_down=0, автомат %s→%s, "
+                    "отфильтровано пар автоповтора: %d",
+                    event.keycode,
+                    event.mods,
+                    before.value,
+                    self.fsm.state.value,
+                    self._repeat_pairs,
+                )
+            elif event.kind == "KeyPress":
+                # Первый пропуск подряд — INFO, остальные до следующего нажатия — DEBUG.
+                self._skipped_presses += 1
+                log.log(
+                    logging.INFO if self._skipped_presses == 1 else logging.DEBUG,
+                    "хоткей: нажатие пропущено: fsm=%s key_down=%d mods=%#x, ожидались %#x",
+                    self.fsm.state.value,
+                    self._key_down,
+                    event.mods,
+                    self._mods,
+                )
+            else:
+                log.debug("хоткей: отпускание без нажатия пропущено, mods=%#x", event.mods)
         if callback is not None:
             callback()
         self.last_result = GrabResult("ok")
@@ -568,6 +606,7 @@ class HotkeyManager:
 
     def _handle_mapping(self, event: MappingEvent) -> None:
         """Обновляет коды и сообщает наружу как успех, так и отказ перезахвата."""
+        self._log_mapping(event)
         if self._combo is None or self._combo not in event.combos:
             return
         self.last_result = event.combos[self._combo]
@@ -584,6 +623,29 @@ class HotkeyManager:
             reason += f";escape:{event.escape.code}"
         if self.on_state is not None:
             self.on_state(self.fsm.state, reason)
+
+    def _log_mapping(self, event: MappingEvent) -> None:
+        """Одна строка на MappingNotify: что пришло, что изменилось, что с захватом."""
+        if event.regrabbed:
+            parts = []
+            if self._combo is not None and self._combo in event.combos:
+                parts.append(f"хоткей={event.combos[self._combo].code}")
+            if event.escape is not None:
+                parts.append(f"escape={event.escape.code}")
+            outcome = ", ".join(parts) or "нечего перезахватывать"
+        else:
+            outcome = "не нужен"
+        log.info(
+            "хоткей: MappingNotify request=%s first=%d count=%d, keycode изменился: %s, "
+            "маски изменились: %s, перезахват: %s, %.1f мс",
+            event.request or "?",
+            event.first,
+            event.count,
+            "да" if event.keycode_changed else "нет",
+            "да" if event.masks_changed else "нет",
+            outcome,
+            event.elapsed_ms,
+        )
 
     def process_pending(self, now: float | None = None) -> GrabResult:
         """Разбирает очередь и убирает пары повтора, включая соседний read."""
@@ -608,6 +670,8 @@ class HotkeyManager:
                 and event.time == following.time
                 and event.mods == following.mods
             ):
+                if event.keycode == self._keycode:
+                    self._repeat_pairs += 1
                 index += 2
                 continue
             self.handle_event(event, self._clock() if now is None else now)

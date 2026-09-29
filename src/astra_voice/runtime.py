@@ -1079,10 +1079,13 @@ class DictationRuntime(QObject):
         if reason.startswith(MAPPING_REGRAB_PREFIX):
             self._on_mapping_regrab(reason)
         if self._pending_test is not None:
+            if state == HotkeyState.RECORDING:
+                log.info("хоткей: нажатие не передано диктовке — идёт проверка микрофона")
             if state in (HotkeyState.RECORDING, HotkeyState.PROCESSING):
                 self.hotkey.fsm.escape(monotonic())
             return
         if not self._closed and self._selfcheck == "failed" and state == HotkeyState.RECORDING:
+            log.info("хоткей: нажатие не передано диктовке — самопроверка модели не пройдена")
             if self.orchestrator.phase == DictationPhase.IDLE:
                 self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
             return
@@ -1094,6 +1097,7 @@ class DictationRuntime(QObject):
             and not self._loading_model
             and self.orchestrator.phase == DictationPhase.IDLE
         ):
+            log.info("хоткей: нажатие не передано диктовке — повторная загрузка модели")
             self._model_load_failures = 0
             self._model_load_generation = None
             self._load_model()
@@ -1103,6 +1107,10 @@ class DictationRuntime(QObject):
             and (self._loading_model or self._selfcheck == "retrying")
             and state == HotkeyState.RECORDING
         ):
+            log.info(
+                "хоткей: нажатие не передано диктовке — %s",
+                "модель загружается" if self._loading_model else "повтор самопроверки",
+            )
             if self.orchestrator.phase == DictationPhase.IDLE:
                 self.pill.show_state(PillState.LOADING_MODEL)
             return
