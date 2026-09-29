@@ -181,6 +181,9 @@ PY=$APPDIR/opt/python3.11/bin/python3.11
 SITE=$APPDIR/opt/python3.11/lib/python3.11/site-packages
 STDLIB=$APPDIR/opt/python3.11/lib/python3.11
 
+# База python-appimage приносит свои пакеты (certifi, packaging): их нет в lock и в SBOM,
+# а pip --target не заменяет существующие каталоги. Оставляем только pip на время установки.
+find "$SITE" -mindepth 1 -maxdepth 1 ! -name pip ! -name 'pip-*.dist-info' -exec rm -rf {} +
 say 'ставлю колёса бандловым Python по lock'
 find_links=(--find-links "$WHEELS")
 [ -d "$ORT_WHEELS" ] && find_links+=(--find-links "$ORT_WHEELS")
@@ -196,11 +199,26 @@ for vendor_patch in "$ROOT"/vendor/patches/*.patch; do
 done
 
 say 'удаляю ненужные модули Python и Qt'
-rm -rf "$SITE/pip" "$SITE"/pip-*.dist-info "$SITE/build" "$SITE"/build-*.dist-info \
-    "$SITE/pyproject_hooks" "$SITE"/pyproject_hooks-*.dist-info "$SITE/sitecustomize.py" \
-    "$SITE/bin" "$STDLIB/ensurepip" "$STDLIB/idlelib" "$STDLIB/tkinter" \
+rm -rf "$SITE/pip" "$SITE"/pip-*.dist-info "$SITE/bin" \
+    "$STDLIB/ensurepip" "$STDLIB/idlelib" "$STDLIB/tkinter" \
     "$STDLIB/turtledemo" "$STDLIB/test" "$STDLIB/lib2to3/tests" \
     "$APPDIR/opt/python3.11/include" "$APPDIR/usr/share/tcltk" "$APPDIR/usr/bin"
+
+# Состав site-packages = колёса lock, ни больше ни меньше (иначе SBOM врёт).
+# shellcheck disable=SC2046
+python3 - "$SITE" $(lockq requirements | sed 's/==.*//') <<'PY'
+import re
+import sys
+from pathlib import Path
+
+site = Path(sys.argv[1])
+norm = lambda name: re.sub(r"[-_.]+", "-", name).lower()  # noqa: E731
+want = {norm(name) for name in sys.argv[2:]}
+have = {norm(path.stem.rsplit("-", 1)[0]) for path in site.glob("*.dist-info")}
+if have != want:
+    sys.exit(f"ОШИБКА: site-packages ≠ lock: лишние {sorted(have - want)}, нет {sorted(want - have)}")
+print(f"site-packages: {len(have)} пакетов, ровно по lock")
+PY
 
 QT=$SITE/PyQt5/Qt5
 PYQT=$SITE/PyQt5
