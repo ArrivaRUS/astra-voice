@@ -182,9 +182,10 @@ OpenSSL 1.1.1k (openssl-libs 1.1.1k-17.el8_6) — OpenSSL
     Eric Young
     https://www.openssl.org/
     Файлы usr/lib/libssl.so.1.1 и usr/lib/libcrypto.so.1.1.
-    Ветка 1.1.1 не получает публичных исправлений безопасности. Решение
-    оставить её в AppImage версии 0.2 — принятый риск П16
-    (decisions/log.md, 28.09.2026); в SBOM компонент назван явно.
+    Ветка 1.1.1 не получает публичных исправлений безопасности. Относится
+    только к текущей сборке AppImage: принятый риск П16 от 28.09.2026
+    заменён решением от 29.09.2026 — AppImage версии 0.2 выходит на базе
+    Debian 12 с OpenSSL 3 (decisions/log.md); в SBOM компонент назван явно.
     This product includes software developed by the OpenSSL Project
     for use in the OpenSSL Toolkit (http://www.openssl.org/).
     This product includes cryptographic software written by Eric Young
