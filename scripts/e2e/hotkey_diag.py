@@ -5,6 +5,8 @@
 astra_voice. Печатает только имена клавиш, коды и статусы — без текста.
 
 Команды:
+  app-pid                         pid своего процесса Astra Voice по точному argv
+                                  из /proc/*/cmdline (0 — найден, 1 — нет)
   offset                          размер журнала приложения (-1 — журнала нет)
   wait-start --offset N --timeout S
                                   ждёт «record.start отправлен» после смещения N:
@@ -29,6 +31,8 @@ from typing import Any
 START_MARKER = "record.start отправлен"
 HOTKEY_MARKER = "хоткей:"
 LOG_NAME = "astra-voice.log"
+# argv пакетного приложения; допускается хвост --hidden (автозагрузка).
+APP_ARGV = ["/usr/bin/python3", "-I", "/usr/lib/astra-voice/bootstrap.py", "app"]
 MODIFIER_NAMES = (
     "Control_L",
     "Control_R",
@@ -88,6 +92,34 @@ def read_after(offset: int) -> str | None:
     except OSError:
         return None
     return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def app_pids(proc: Path = Path("/proc"), uid: int | None = None) -> list[int]:
+    """Процессы текущего пользователя с argv ровно APP_ARGV (или APP_ARGV + --hidden)."""
+    uid = os.getuid() if uid is None else uid
+    found: list[int] = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        argv = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0")]
+        if argv and argv[-1] == "":
+            argv.pop()
+        if argv in (APP_ARGV, [*APP_ARGV, "--hidden"]):
+            found.append(int(entry.name))
+    return sorted(found)
+
+
+def cmd_app_pid(_args: argparse.Namespace) -> int:
+    pids = app_pids()
+    for pid in pids:
+        print(pid)
+    return 0 if pids else 1
 
 
 def cmd_offset(_args: argparse.Namespace) -> int:
@@ -263,6 +295,7 @@ def cmd_keymap(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("app-pid").set_defaults(run=cmd_app_pid)
     commands.add_parser("offset").set_defaults(run=cmd_offset)
     wait = commands.add_parser("wait-start")
     wait.add_argument("--offset", type=int, required=True)
