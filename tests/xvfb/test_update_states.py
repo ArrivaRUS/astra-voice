@@ -266,6 +266,7 @@ def render_network(
     updates: FakeUpdates,
     settings: Any,
     inspect: Callable[[Any], None] | None = None,
+    section: str = "network",
 ) -> tuple[QImage, set[str], list[str]]:
     messages, previous = collect_messages()
     engine = QQmlApplicationEngine()
@@ -288,7 +289,7 @@ def render_network(
         window.show()
         QTest.qWait(180)
         app.processEvents()
-        onboarding.select_section(app, window, "network")
+        onboarding.select_section(app, window, section)
         onboarding.settle_pointer(app, window)
         image = grab(app, window, WIDTH, HEIGHT)
         texts = onboarding.visible_texts(window.contentItem())
@@ -441,7 +442,7 @@ def test_network_section_snapshot(app: Any, case: str, dark: bool) -> None:
     if case == "panel-available":
         assert {"Что нового", *NOTE_LINES, "Страница выпуска", "Пропустить эту версию"} <= texts
     if case == "panel-uptodate":
-        assert any(text.startswith("Установлена версия 0.2.0. ") for text in texts)
+        assert {"Версия ", "0.2.0"} <= texts
     if case == "network-offline":
         assert "Недоступно: включён офлайн-режим" in texts
     save_snapshot(image, f"{case}-{'dark' if dark else 'light'}.png")
@@ -600,3 +601,88 @@ def test_footer_click_opens_network_and_unskips(app: Any) -> None:
 def _snapshot_dir() -> Iterator[None]:
     SNAPSHOTS.mkdir(parents=True, exist_ok=True)
     yield
+
+
+def test_env_offline_toggle_shows_actual_state_after_user_turns_off(app: Any) -> None:
+    """Повторное ревью: пользователь выключил офлайн, но окружение держит его — тумблер «вкл»."""
+    updates = FakeUpdates(checkRefusal="offline", networkRefusal="offline", canCheckNow=False)
+    settings = make_settings({"_offline": True})
+
+    def inspect(window: Any) -> None:
+        toggle = find_object(window, "offlineToggle")
+        assert toggle.property("checked") is True
+        onboarding.click_item(toggle)
+        app.processEvents()
+        assert settings.offline is False
+        assert toggle.property("checked") is True
+        # Офлайн теперь держит окружение: тумблер заблокирован, подпись об этом.
+        assert toggle.property("enabled") is False
+        texts = onboarding.visible_texts(window.contentItem())
+        assert "Включён при запуске программы — выключить здесь нельзя" in texts
+
+    try:
+        render_network(app, False, updates, settings, inspect)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+
+
+@pytest.mark.parametrize(
+    ("values", "changes", "hidden"),
+    [
+        ({}, {}, False),
+        ({"networkRefusal": "offline"}, {}, True),
+        ({}, {"_offline": True}, True),
+    ],
+    ids=["online", "env-offline", "user-offline"],
+)
+def test_models_download_button_hidden_offline(
+    app: Any, values: dict[str, Any], changes: dict[str, Any], hidden: bool
+) -> None:
+    updates = FakeUpdates(**values)
+    settings = make_settings(changes)
+    try:
+        _, texts, messages = render_network(app, False, updates, settings, section="models")
+        assert not messages, "\n".join(messages)
+        assert ("Скачать выбранное" in texts) is not hidden
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+
+
+def test_panel_marker_and_mono_version(app: Any) -> None:
+    updates = FakeUpdates(**AVAILABLE)
+    settings = make_settings({})
+
+    def inspect(window: Any) -> None:
+        markers = [
+            item
+            for item in onboarding.visual_tree(window.contentItem())
+            if item.objectName() == "updateNoteMarker" and item.isVisible()
+        ]
+        assert len(markers) == len(NOTE_LINES)
+        for marker in markers:
+            assert (marker.property("x"), marker.width(), marker.height()) == (2, 4, 4)
+            assert marker.property("radius") == 2
+            assert 0 < marker.property("y") < 14
+
+    try:
+        render_network(app, False, updates, settings, inspect)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+
+    updates = FakeUpdates(state="uptodate", manual=True)
+    settings = make_settings({})
+
+    def inspect_version(window: Any) -> None:
+        version = find_object(window, "updateInstalledVersion")
+        assert version.property("text") == "0.2.0"
+        assert "Mono" in version.property("font").family()
+
+    try:
+        _, texts, _ = render_network(app, False, updates, settings, inspect_version)
+        assert "Версия " in texts
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)

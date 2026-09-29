@@ -182,9 +182,19 @@ def test_notes_markup_stays_literal_text() -> None:
 def test_notes_are_capped_by_total_length() -> None:
     notes = "\n".join(f"- пункт {index}" for index in range(1000))
     shown = display_notes(notes)
-    assert sum(len(str(line["text"])) for line in shown[:-1]) <= MAX_NOTES_DISPLAY_CHARS
-    assert shown[-1] == {"text": "…", "bullet": False}
+    assert sum(len(str(line["text"])) for line in shown) <= MAX_NOTES_DISPLAY_CHARS + 1
+    assert str(shown[-1]["text"]).endswith("…")
     assert all(line["bullet"] is True for line in shown[:-1])
+
+
+def test_long_first_line_is_cut_not_dropped() -> None:
+    """Повторное ревью P3: строка длиннее лимита обрезается по остатку, а не теряется."""
+    shown = display_notes("x" * 2500 + "\n- second")
+    assert shown == [{"text": "x" * MAX_NOTES_DISPLAY_CHARS + "…", "bullet": False}]
+    shown = display_notes("- коротко\n- " + "y" * 2500)
+    assert shown[0] == {"text": "коротко", "bullet": True}
+    assert shown[1]["bullet"] is True
+    assert shown[1]["text"] == "y" * (MAX_NOTES_DISPLAY_CHARS - len("коротко")) + "…"
 
 
 def test_notes_drop_blank_lines_and_panel_heading() -> None:

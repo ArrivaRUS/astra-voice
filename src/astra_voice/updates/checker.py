@@ -295,6 +295,10 @@ class UpdateChecker:
         attempted = result.requests_made > 0
         if not manual:
             self._next_due = max(now + CHECK_INTERVAL_S, result.retry_at or 0.0)
+            if attempted:
+                # Плановый результат вытесняет ручной: иначе через сутки строка
+                # снова показала бы «Установлена последняя версия» и панель.
+                self._manual_view = False
         elif attempted:
             # Ручная проверка ушла в сеть — плановая в эти сутки уже не нужна.
             self._next_due = max(self._next_due, now + CHECK_INTERVAL_S)

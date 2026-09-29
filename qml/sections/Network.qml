@@ -60,31 +60,31 @@ Column {
         height: visible ? implicitHeight : 0
     }
 
-    UpdatePanel {
-        objectName: "updatePanel"
+    // Макет 04-update-panel: панель → группа 16 = 8 внутри обёртки + 8 зазора колонки
+    // (Column пропускает распорки нулевой высоты).
+    Item {
         width: root.width
         visible: root.panelState !== ""
-        height: visible ? implicitHeight : 0
-        panelState: root.panelState !== "" ? root.panelState : "available"
-        version: root.updates ? root.updates.version : ""
-        notes: root.updates ? root.updates.notes : []
-        currentVersion: root.updates ? root.updates.currentVersion : ""
-        checkedText: root.updates ? root.updates.checkedText : ""
-        releasePageAvailable: root.updates ? root.updates.releasePageAvailable : false
-        canCheckNow: root.canCheckNow
-        autoCheck: root.settings ? root.settings.checkAppUpdates && !root.offlineOn : false
-        onReleasePageRequested: { if (root.updates) root.updates.openReleasePage(); }
-        onSkipRequested: { if (root.updates) root.updates.skipVersion(); }
-        onRemindLaterRequested: { if (root.updates) root.updates.remindLater(); }
-        onCheckRequested: { if (root.updates) root.updates.checkNow(); }
-        onShowSkippedRequested: { if (root.updates) root.updates.clearSkip(); }
-    }
+        height: visible ? updatePanel.height + Theme.spaceGroupGap : 0
 
-    // Макет 04-update-panel: между панелью и группами 16 = два зазора колонки по 8.
-    Item {
-        width: 1
-        height: 0
-        visible: root.panelState !== ""
+        UpdatePanel {
+            id: updatePanel
+            objectName: "updatePanel"
+            width: root.width
+            panelState: root.panelState !== "" ? root.panelState : "available"
+            version: root.updates ? root.updates.version : ""
+            notes: root.updates ? root.updates.notes : []
+            currentVersion: root.updates ? root.updates.currentVersion : ""
+            checkedText: root.updates ? root.updates.checkedText : ""
+            releasePageAvailable: root.updates ? root.updates.releasePageAvailable : false
+            canCheckNow: root.canCheckNow
+            autoCheck: root.settings ? root.settings.checkAppUpdates && !root.offlineOn : false
+            onReleasePageRequested: { if (root.updates) root.updates.openReleasePage(); }
+            onSkipRequested: { if (root.updates) root.updates.skipVersion(); }
+            onRemindLaterRequested: { if (root.updates) root.updates.remindLater(); }
+            onCheckRequested: { if (root.updates) root.updates.checkNow(); }
+            onShowSkippedRequested: { if (root.updates) root.updates.clearSkip(); }
+        }
     }
 
     SettingGroup {
@@ -134,7 +134,8 @@ Column {
             sub: root.offlineForced && root.networkRefusal === "offline"
                 ? qsTr("Включён при запуске программы — выключить здесь нельзя")
                 : locked ? qsTr("Задано администратором")
-                : qsTr("Программа не выходит в сеть: не проверяет обновления и не скачивает модели. Установка модели из файла работает.")
+                : root.offlineOn ? qsTr("Сетевые кнопки скрыты. Работает установка модели из файла.")
+                : qsTr("Полностью запрещает сетевые запросы. Установка модели из файла останется.")
             toggle: offlineToggle
             locked: root.isLocked("offline") || root.networkRefusal === "admin"
             rowEnabled: !locked && !root.offlineForced
@@ -155,7 +156,9 @@ Column {
                     if (!root.settings || locked || root.settings.offline === checked)
                         return
                     root.settings.offline = checked
-                    if (root.settings.offline !== checked)
+                    // Показываем фактическое состояние из моста: запись могла не удаться, а
+                    // офлайн может остаться включённым окружением запуска (тогда он заблокирован).
+                    if (checked !== root.offlineOn)
                         checked = root.offlineOn
                 }
             }

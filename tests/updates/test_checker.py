@@ -554,3 +554,22 @@ def test_remind_later_after_manual_check_removes_accent(rig: Rig) -> None:
     checker.remind_later()
     status = rig.wait(lambda s: s.state == "available" and s.reminder_until is not None)
     assert not status.manual
+
+
+def test_scheduled_result_replaces_manual_view(rig: Rig) -> None:
+    """Повторное ревью P2: плановая проверка через сутки вытесняет итог ручной."""
+    checker = rig.start(version="0.2.1")
+    rig.settle(checker)
+    checker.check_now()
+    rig.wait(lambda s: s.state == "uptodate" and s.manual)
+    rig.settle(checker)
+    count = len(rig.statuses)
+    requests = rig.requests()
+    rig.clock.now += CHECK_INTERVAL_S + 10
+    rig.settle(checker)
+    time.sleep(0.3)
+    rig.settle(checker)
+    assert rig.requests() > requests, "плановая проверка не состоялась"
+    after = [(s.state, s.manual) for s in rig.statuses[count:]]
+    assert ("uptodate", True) not in after, after
+    assert rig.statuses[-1].manual is False

@@ -13,6 +13,11 @@ Item {
     id: root
 
     readonly property var settings: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
+    readonly property var updates: (typeof updatesBridge !== "undefined" && updatesBridge !== null) ? updatesBridge : null
+    // Тот же признак, что у карточек offline-user: отказ гейта скачивания «offline» —
+    // офлайн-режим пользователя или окружения запуска (PRD F14.2).
+    readonly property bool downloadOffline: (root.updates && root.updates.networkRefusal === "offline")
+        || (root.settings !== null && root.settings.offline === true)
     readonly property var entries: root.settings ? root.settings.models : []
     readonly property bool hasSelection: root.settings !== null
         && root.settings.selectionSummary !== ""
@@ -345,7 +350,7 @@ Item {
                 // Пока ничего не отмечено или выбор не помещается — качать нечего (§5.6).
                 enabled: root.hasSelection && root.settings.selectionFits
                 // Офлайн-режим скрывает «Скачать»; установка из файла остаётся (PRD F14.2).
-                visible: !(root.settings && root.settings.offline)
+                visible: !root.downloadOffline
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: { if (root.settings) root.settings.startSelectedDownloads(); }
             }

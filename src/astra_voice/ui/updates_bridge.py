@@ -87,7 +87,12 @@ def display_notes(text: str) -> list[dict[str, object]]:
             if not line or line.casefold() == "что нового":
                 continue
         if used + len(line) > MAX_NOTES_DISPLAY_CHARS:
-            lines.append({"text": "…", "bullet": False})
+            rest = MAX_NOTES_DISPLAY_CHARS - used
+            if rest > 0:
+                # Длинную строку обрезаем по остатку лимита, а не выкидываем целиком.
+                lines.append({"text": line[:rest].rstrip() + "…", "bullet": bullet})
+            else:
+                lines.append({"text": "…", "bullet": False})
             break
         used += len(line)
         lines.append({"text": line, "bullet": bullet})

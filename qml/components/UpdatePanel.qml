@@ -150,15 +150,41 @@ Rectangle {
             id: explanation
             width: parent.width
             text: root.panelState === "checking" ? qsTr("Ответ ждём не дольше 3 секунд.")
-                : root.panelState === "uptodate"
-                    ? (root.currentVersion !== ""
-                        ? qsTr("Установлена версия %1. ").arg(root.currentVersion) : "")
-                      + (root.autoCheck
-                        ? qsTr("Следующая автоматическая проверка — не раньше чем через сутки.")
-                        : qsTr("Автоматическая проверка выключена — проверяйте вручную, когда удобно."))
                 : root.panelState === "skipped" ? qsTr("Обновиться до неё всё ещё можно.")
                 : ""
             visible: text !== ""
+        }
+
+        // uptodate: «Версия 0.2.0.» — номер моноширинным (сквозное правило 5), дальше пояснение.
+        Item { width: 1; height: 6; visible: uptodateLine.visible }
+
+        Flow {
+            id: uptodateLine
+            objectName: "updateInstalledLine"
+            width: parent.width
+            visible: root.panelState === "uptodate"
+
+            SmallText {
+                text: root.currentVersion !== "" ? qsTr("Версия") + " " : ""
+                visible: root.currentVersion !== ""
+                wrapMode: Text.NoWrap
+            }
+
+            SmallText {
+                objectName: "updateInstalledVersion"
+                text: root.currentVersion
+                visible: root.currentVersion !== ""
+                font.family: Theme.fontMono
+                wrapMode: Text.NoWrap
+            }
+
+            SmallText {
+                width: Math.min(implicitWidth, uptodateLine.width)
+                text: (root.currentVersion !== "" ? ". " : "")
+                    + (root.autoCheck
+                        ? qsTr("Следующая автоматическая проверка — не раньше чем через сутки.")
+                        : qsTr("Автоматическая проверка выключена — проверяйте вручную, когда удобно."))
+            }
         }
 
         // ── «Что нового» (.sm fg-secondary полужирный, отступ 7; список 12.5 / 1.6, слева 17) ──
@@ -183,6 +209,12 @@ Rectangle {
             width: parent.width
             visible: whatsNewTitle.visible
 
+            FontMetrics {
+                id: capBox
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.updatePanelListSize
+            }
+
             Repeater {
                 model: root.notes
 
@@ -194,19 +226,19 @@ Rectangle {
                     width: notesList.width
                     height: noteLine.implicitHeight
 
-                    Text {
+                    // Маркер — круг 4 × 4 в отступе (как маркер `ul` в макете): x = 2, центр на
+                    // 5,5 px ниже верха заглавных букв первой строки пункта.
+                    Rectangle {
+                        objectName: "updateNoteMarker"
                         visible: parent.modelData.bullet === true
-                        width: 17
-                        height: parent.lineHeight
-                        rightPadding: 7 // зазор маркера до текста, как у маркера списка в браузере
-                        horizontalAlignment: Text.AlignRight
-                        verticalAlignment: Text.AlignVCenter
-                        textFormat: Text.PlainText
-                        text: "•"
+                        x: 2
+                        y: Math.round(noteLine.baselineOffset + capBox.tightBoundingRect("Н").y
+                                      + 5.5 - height / 2)
+                        width: 4
+                        height: 4
+                        radius: 2
                         color: Theme.fgSecondary
-                        font.family: Theme.fontUi
-                        font.pixelSize: Theme.updatePanelListSize
-                        renderType: Text.NativeRendering
+                        antialiasing: true
                     }
 
                     Text {
