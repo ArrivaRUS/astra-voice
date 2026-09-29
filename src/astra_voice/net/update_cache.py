@@ -8,6 +8,7 @@ import math
 import os
 import stat
 import tempfile
+import threading
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
@@ -31,6 +32,7 @@ class CacheEntry:
     rate_limited_until: float | None = None
     backoff_until: float | None = None
     failures: int = 0
+    url: str | None = None
 
 
 def _entry(value: object) -> CacheEntry | None:
@@ -39,6 +41,9 @@ def _entry(value: object) -> CacheEntry | None:
     etag = value["etag"]
     body = value["body"]
     failures = value["failures"]
+    url = value["url"]
+    if url is not None and not isinstance(url, str):
+        return None
     if etag is not None and (not isinstance(etag, str) or not valid_etag(etag)):
         return None
     if body is not None and (
@@ -63,6 +68,7 @@ class UpdateCache:
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path
+        self._lock = threading.Lock()
 
     @property
     def path(self) -> Path:
@@ -104,7 +110,8 @@ class UpdateCache:
 
     def get(self, key: str) -> CacheEntry:
         """Возвращает запись или пустую запись при отсутствии кэша."""
-        return self._read().get(key, CacheEntry())
+        with self._lock:
+            return self._read().get(key, CacheEntry())
 
     def set(self, key: str, entry: CacheEntry) -> None:
         """Сохраняет запись без больших тел и негодных ETag."""
@@ -114,35 +121,36 @@ class UpdateCache:
             entry = replace(entry, body=None, etag=None)
         if not valid_etag(entry.etag):
             entry = replace(entry, etag=None)
-        entries = self._read()
-        entries[key] = entry
-        raw = json.dumps(
-            {name: asdict(item) for name, item in entries.items()},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(raw) > MAX_CACHE_BYTES:
-            log.warning("Кэш проверок превышает допустимый размер")
-            return
-        temporary: Path | None = None
-        try:
-            path = self.path
-            path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, name = tempfile.mkstemp(prefix=".update-cache-", dir=path.parent)
-            temporary = Path(name)
-            with os.fdopen(descriptor, "wb") as handle:
-                os.fchmod(handle.fileno(), 0o600)
-                handle.write(raw)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        with self._lock:
+            entries = self._read()
+            entries[key] = entry
+            raw = json.dumps(
+                {name: asdict(item) for name, item in entries.items()},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if len(raw) > MAX_CACHE_BYTES:
+                log.warning("Кэш проверок превышает допустимый размер")
+                return
+            temporary: Path | None = None
             try:
-                os.fsync(directory_fd)
+                path = self.path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                descriptor, name = tempfile.mkstemp(prefix=".update-cache-", dir=path.parent)
+                temporary = Path(name)
+                with os.fdopen(descriptor, "wb") as handle:
+                    os.fchmod(handle.fileno(), 0o600)
+                    handle.write(raw)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+                directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                log.warning("Не удалось сохранить кэш проверок")
             finally:
-                os.close(directory_fd)
-        except OSError:
-            log.warning("Не удалось сохранить кэш проверок")
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)

@@ -1,6 +1,7 @@
 """Кэш проверок устойчив к повреждённым и чужим файлам."""
 
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -44,3 +45,38 @@ def test_invalid_types(tmp_path: Path) -> None:
         '"rate_limited_until":null,"backoff_until":null,"failures":0}}'
     )
     assert UpdateCache(path).get("key") == CacheEntry()
+
+
+def test_invalid_url_type(tmp_path: Path) -> None:
+    cache = UpdateCache(tmp_path / "cache.json")
+    cache.set("key", CacheEntry(url="https://example.com"))
+    cache.path.write_text(cache.path.read_text().replace('"url":"https://example.com"', '"url":7'))
+    assert cache.get("key") == CacheEntry()
+
+
+def test_old_entry_without_url(tmp_path: Path) -> None:
+    path = tmp_path / "cache.json"
+    path.write_text(
+        '{"key":{"etag":"\\"old\\"","body":"old","stored_at":1,'
+        '"rate_limited_until":null,"backoff_until":null,"failures":0}}'
+    )
+    assert UpdateCache(path).get("key") == CacheEntry()
+
+
+def test_parallel_keys(tmp_path: Path) -> None:
+    cache = UpdateCache(tmp_path / "cache.json")
+    barrier = threading.Barrier(3)
+
+    def write(key: str) -> None:
+        barrier.wait()
+        for number in range(50):
+            cache.set(key, CacheEntry(body=str(number), url=f"https://{key}.example"))
+
+    threads = [threading.Thread(target=write, args=(key,)) for key in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+    assert cache.get("a").body == "49"
+    assert cache.get("b").body == "49"

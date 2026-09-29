@@ -50,6 +50,9 @@ class FaultServer:
                     if self.headers.get("If-None-Match") == headers["ETag"]:
                         status = 304
                         body = b""
+                elif path == "/etag-b":
+                    body = b'{"version":"2.0"}'
+                    headers["ETag"] = '"revision-two"'
                 elif path == "/304":
                     status = 304
                     body = b""
@@ -66,6 +69,13 @@ class FaultServer:
                 elif path == "/retry-seconds":
                     status = 429
                     headers["Retry-After"] = "90"
+                elif path == "/retry-zero":
+                    status = 429
+                    headers["Retry-After"] = "0"
+                elif path == "/forbidden":
+                    status = 403
+                elif path == "/429":
+                    status = 429
                 elif path == "/retry-date":
                     status = 429
                     date = datetime.now(UTC) + timedelta(seconds=80)
@@ -74,9 +84,11 @@ class FaultServer:
                     status = 407
                 elif path == "/503":
                     status = 503
+                elif path == "/503-then-502":
+                    status = 503 if sum(p == path for p, _ in owner.requests) == 1 else 502
                 elif path == "/evil":
                     status = 302
-                    headers["Location"] = "https://evil.example/secret"
+                    headers["Location"] = "http://evil.example/"
                 elif path.startswith("/chain/"):
                     remaining = int(path.rsplit("/", 1)[1])
                     if remaining:

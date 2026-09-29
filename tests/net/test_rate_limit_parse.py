@@ -21,6 +21,7 @@ def test_retry_after() -> None:
         ({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1030"}, 30),
         ({"RateLimit": "limit=60, remaining=0, reset=30"}, 30),
         ({"RateLimit": '"api";r=0;t=55'}, 55),
+        ({"RateLimit": '"burst";r=5;t=1, "api";r=0;t=55'}, 55),
         ({"RateLimit": "limit=60, remaining=1, reset=30"}, None),
         ({"RateLimit": "limit=60, remaining=0, reset=999999"}, 86400),
     ],
