@@ -2162,6 +2162,7 @@ def test_mapping_regrab_failure_warns_sets_nokey_and_retries(
     # Всплывающее уведомление ждёт 5 с; одно на потерю.
     notice = runtime_timer(rig, rig.runtime._lost_notice_timer)
     assert notice.single_shot and notice.interval == module.HOTKEY_LOST_NOTICE_DELAY_MS
+    assert notice.timer_type is None
     assert not rig.notify.mock_calls
     rig.now += 5
     notice.fire()
@@ -2253,6 +2254,71 @@ def test_mapping_lost_notification_is_rate_limited(monkeypatch: pytest.MonkeyPat
     rig.now += 60
     lose_and_wait(rig, batches, "busy")
     assert rig.notify.mock_calls == [call.notify_hotkey_not_grabbed("Ctrl+Space")]
+
+
+def lose_again_within_interval(rig: Rig, batches: list[Any]) -> FakeTimer:
+    """Потеря 1 объявлена и вернулась; потеря 2 через 20 с после объявления — отложена."""
+    lose_and_wait(rig, batches)
+    announced_at = rig.now
+    rig.now += 1
+    feed(rig, batches, mapping_ok())
+    assert rig.notify.mock_calls == [
+        call.notify_hotkey_lost(),
+        call.notify_hotkey_regrabbed("Ctrl+Space"),
+    ]
+    rig.notify.reset_mock()
+    rig.now = announced_at + 15
+    lose_and_wait(rig, batches)
+    assert rig.now == announced_at + 20
+    # Лимит «раз в 60 с» не глушит потерю: таймер ждёт оставшиеся 40 с.
+    assert not rig.notify.mock_calls
+    deferred = runtime_timer(rig, rig.runtime._lost_notice_timer)
+    assert deferred.single_shot and deferred.active
+    assert deferred.interval == 40_000
+    # Точный таймер: грубый (±5 %) сработал бы раньше и перевзвёлся бы каскадом.
+    assert deferred.timer_type == Qt.TimerType.PreciseTimer
+    return deferred
+
+
+def test_mapping_second_long_loss_is_announced_after_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    deferred = lose_again_within_interval(rig, batches)
+    rig.now += 40
+    deferred.fire()
+    assert rig.notify.mock_calls == [call.notify_hotkey_lost()]
+    assert deferred.deleted and rig.runtime._lost_notice_timer is None
+    # Объявленная потеря — при возврате «снова работает».
+    feed(rig, batches, mapping_ok())
+    assert rig.notify.mock_calls == [
+        call.notify_hotkey_lost(),
+        call.notify_hotkey_regrabbed("Ctrl+Space"),
+    ]
+
+
+@pytest.mark.parametrize("stop", ["regrab", "shutdown", "apply_hotkey"])
+def test_mapping_deferred_lost_notice_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    deferred = lose_again_within_interval(rig, batches)
+    rig.now += 10
+    if stop == "regrab":
+        feed(rig, batches, mapping_ok())
+    elif stop == "shutdown":
+        rig.runtime.shutdown()
+    else:
+        rig.runtime.apply_hotkey("Ctrl+Shift+Space", "ptt")
+    assert deferred.deleted and not deferred.active
+    assert rig.runtime._lost_notice_timer is None
+    rig.now += 30
+    deferred.fire()
+    rig.runtime._announce_hotkey_lost()  # Уже доставленный сигнал после удаления безопасен.
+    # Клавиша вернулась до конца интервала — ни «потеряна», ни «снова работает».
+    assert not rig.notify.notify_hotkey_lost.called
+    assert not rig.notify.notify_hotkey_not_grabbed.called
+    assert not rig.notify.notify_hotkey_regrabbed.called
 
 
 @pytest.mark.parametrize("stop", ["shutdown", "apply_hotkey"])
