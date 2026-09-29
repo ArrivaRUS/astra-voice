@@ -33,3 +33,21 @@ def test_tray_dbus_cycles(request: pytest.FixtureRequest, tmp_path: Path, amplif
         extra_env=env,
     )
     assert_private_bus_result(result, marker="TRAY_DBUS_OK:plasma_reply")
+
+
+def test_tray_exit_while_call_blocked(request: pytest.FixtureRequest, tmp_path: Path) -> None:
+    """Выход с живым QApplication, пока демон висит в вызове: 20 повторов."""
+    if "stress" not in (request.config.option.markexpr or ""):
+        pytest.skip("только по явному -m stress")
+    for attempt in range(20):
+        result = run_on_private_bus(
+            [sys.executable, str(_SCENARIO), "exit_while_call_blocked"],
+            tmp_dir=tmp_path,
+            timeout=30,
+            extra_env={
+                "XDG_CURRENT_DESKTOP": "KDE",
+                # Выход в разные моменты относительно запоздалых ответов демона.
+                "ASTRA_VOICE_TRAY_EXIT_DELAY": f"{attempt * 0.03:.2f}",
+            },
+        )
+        assert_private_bus_result(result, marker="TRAY_DBUS_OK:exit_while_call_blocked")

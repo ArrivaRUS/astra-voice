@@ -231,7 +231,8 @@ def exit_while_call_blocked() -> None:
         for serial in range(6):
             tray_module._send_bus_command(generation, "request", (serial, ping))
         sleep(0.2)
-        tray_module.shutdown_bus_threads()
+        # join короче вызова (0,5 с): демон гарантированно переживает shutdown.
+        tray_module.shutdown_bus_threads(100)
         transport = tray_module._bus_transport
         assert transport is not None and transport.thread.is_alive(), "демон не висел в вызове"
         # Сдвиг выхода относительно запоздалых ответов демона (0,5 с на вызов).

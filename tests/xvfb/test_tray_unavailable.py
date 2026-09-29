@@ -167,7 +167,7 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
 
     def command(generation: int, operation: str, payload: Any) -> None:
         executor.execute(generation, operation, payload)
-        QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
+        QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_wake_event_type)
 
     monkeypatch.setattr(module, "_send_bus_command", command)
     monkeypatch.setattr(module, "_bus_transport", None)

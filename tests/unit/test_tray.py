@@ -107,13 +107,13 @@ class Bus:
                 )
             )
             module._post_bus_result(generation, "reply", (payload[0], plain))
-            QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
+            QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_wake_event_type)
 
         if operation == "request" and not self.auto_reply:
             self.calls.append(PendingCall(payload[1], deliver, lambda *args: deliver(None)))
         else:
             self.executor.execute(generation, operation, payload)
-        QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
+        QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_wake_event_type)
 
     def connect(
         self, service: str, path: str, interface: str, member: str, slot: Callable[..., None]
@@ -1411,7 +1411,7 @@ def test_setup_ready_must_arrive_before_deadline(harness: Harness, delay: int) -
     generation = harness.tray._bus_generation
     harness.clock.advance(delay)
     module._post_bus_result(generation, "ready", False)
-    QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
+    QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_wake_event_type)
     assert harness.tray._subscriptions_ready is (delay < 500)
     assert not harness.tray._setup_pending
     if delay >= 500:
@@ -1430,12 +1430,12 @@ def test_late_setup_result_cannot_cross_stop_and_start(harness: Harness) -> None
     harness.tray.start()
     for event in ("ready", "failed"):
         module._post_bus_result(old_generation, event, False)
-    QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
+    QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_wake_event_type)
     assert harness.tray._setup_pending
     assert not harness.tray._subscriptions_ready
     assert not harness.tray._requests
     module._post_bus_result(harness.tray._bus_generation, "ready", False)
-    QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_event_type)
+    QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_wake_event_type)
     assert harness.tray._subscriptions_ready
     assert not harness.tray._setup_pending
 
@@ -1593,6 +1593,26 @@ def test_closed_transport_does_not_post_to_qt(
         module._bus_results.get_nowait()
 
 
+def test_closed_transport_skips_queued_commands(harness: Harness) -> None:
+    from astra_voice.ui import tray as module
+
+    transport = module._TrayBusTransport(module._get_bus_receiver())
+    executed: list[str] = []
+
+    def execute(generation: int, operation: str, payload: Any) -> None:
+        executed.append(operation)
+        # Затвор закрылся, пока демон выполнял первую команду.
+        transport.close()
+
+    transport.execute = execute  # type: ignore[method-assign]
+    message = QDBusMessage.createMethodCall(SERVICE, "/StatusNotifierWatcher", SERVICE, "Get")
+    for command in ((1, "request", (1, message)), (1, "setup", None), (1, "request", (2, message))):
+        transport.commands.put(command)
+    transport.commands.put(None)
+    transport._run()
+    assert executed == ["request"]
+
+
 def test_real_daemon_delivers_to_gui_and_keeps_receiver(
     harness: Harness, qapp: QApplication, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1680,6 +1700,8 @@ def test_daemon_coalesces_only_adjacent_setups(harness: Harness, qapp: QApplicat
             _send_bus_command(generation, "setup", None)
         harness.tray.stop()
         release.set()
+        # После shutdown очередь не исполняется: сначала ждём обработки команд.
+        wait_for(qapp, lambda: len(events) == 3)
         module.shutdown_bus_threads()
         assert not transport.thread.is_alive()
         assert events == [(103, "setup"), (103, "request"), (105, "setup")]

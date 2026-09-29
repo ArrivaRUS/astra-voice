@@ -78,7 +78,9 @@ _bus_generations = count(1)
 _bus_names = count(1)
 # Демон будит получателя через invokeMethod: в очереди Qt лежит только C++-событие
 # MetaCall, для удаления которого (в т. ч. в ~QApplication) GIL не нужен.
-_bus_event_type = QEvent.MetaCall
+# Это просто QEvent.MetaCall; имя — для тестов, которые доставляют посты синхронно
+# через sendPostedEvents(_bus_receiver, _bus_wake_event_type).
+_bus_wake_event_type = QEvent.MetaCall
 _bus_results: Queue[tuple[int, str, Any]] = Queue()
 _BusCommand = tuple[int, str, Any]
 
@@ -187,6 +189,9 @@ class _TrayBusTransport:
                     else:
                         has_following = True
                         break
+            if self.closed:
+                # После close() команды из очереди не выполняются: демон только выходит.
+                return
             self.execute(*command)
             command = following if has_following else self.commands.get()
 
@@ -290,7 +295,11 @@ def _send_bus_command(generation: int, operation: str, payload: Any) -> None:
 
 
 def shutdown_bus_threads(timeout_ms: int = 1000) -> None:
-    """Остановить демон с ограниченным ожиданием, не трогая QtDBus и получателя."""
+    """Остановить демон с ограниченным ожиданием, не трогая QtDBus и получателя.
+
+    Вызывать до разрушения QApplication: затвор закрывается здесь, и только после
+    этого запоздалые ответы демона гарантированно не попадают в очередь событий Qt.
+    """
     transport = _bus_transport
     if transport is None:
         return
