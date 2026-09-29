@@ -426,6 +426,13 @@ R6 HF недоступен из РФ → «Из файла» · чистая В�
 - [x] CLI: `tools/validate catalog --all|--switch` `[x]` 23.09 (T-93/T-94 живые PASS на dev-хранилище), `tools/validate downloads --faults` (полный) `[x]` 29.09 `d7826d1` (17 сценариев на 127.0.0.1: hf→github, corp→hf→github при `corp_base`, 429 с Retry-After без ожидания, 404, отказ всех источников, size+1, обрыв с докачкой Range у того же источника и у зеркала, сервер без Range, «нет места» до/во время/ENOSPC без заполнения диска, зеркала с другими байтами → отказ sha256 и установки, redirect на чужой хост; прежний прогон падал после PR #2), `tools/benchmark --catalog --minimum-models 3` `[x]` 29.09 `524e5a6` (процесс на модель, `WorkerState` воркера, правила полосок карточки; итог в формате `measurements.json` во временный файл или `--out`; запускать Python с onnx-asr; живой прогон на dev-хранилище — 2 модели, код 2 «недостаточно моделей»: DoD Ц6 «≥ 3 модели замерены» ещё открыт).
 ### Definition of Done
 - S7-A1…A4, S15-A1…A3 зелёные; **≥ 3 модели замерены** (Ц6); каталог показывает 12 карточек, «только отечественные» — 6; скриншоты 20 состояний = референсы (DesignReviewer PASS); T-08, T-09, T-22, T-23, T-26, T-32, T-33, T-36 зелёные; `catalog-state.json` переживает очистку `~/.cache`.
+  - **Ц6 — замерено 29.09** (`tools/benchmark --catalog --minimum-models 3 --runs 5 --threads 2`, dev-хранилище, машина разработки, venv-e, `test-ru-6s.wav`; код 0; `whisper-small-int8` поставлен штатным загрузчиком и установщиком с huggingface.co, 250 150 387 Б, sha256 по каталогу):
+
+    | Модель | RTFx (медиана 5 тёплых) | p95, мс | ОЗУ VmHWM, МБ | PSS, МБ |
+    |---|---|---|---|---|
+    | `gigaam-v3-e2e-rnnt-int8` | 22,81× | 201,3 | 427 | 410 |
+    | `t-one-fp32` | 13,05× | 401,3 | 653 | 637 |
+    | `whisper-small-int8` | 3,52× | 1503,7 | 1083 | 1057 |
 ### Validation
 ```sh
 pytest -m unit tests/models -q && pytest -m engine -q
