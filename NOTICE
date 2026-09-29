@@ -143,10 +143,11 @@ gpgv (2.2.40) — GPL-3.0-or-later
 
 Системные службы из Recommends (ставятся apt по умолчанию, программой
 не изменяются): polkit-kde-agent-1 (GPL-2.0-or-later),
-pipewire-pulse (LGPL-2.1-or-later), wireplumber (MIT).
+pipewire-pulse (MIT — Expat по copyright-файлу пакета) или, как альтернатива,
+pulseaudio (LGPL-2.1-or-later), wireplumber (MIT).
 
 ================================================================================
-3. Что входит в файл AppImage
+3. Что входит в файл AppImage (для сборки AppImage, версия 0.2)
 ================================================================================
 
 AppImage — отдельный вариант поставки для установки в домашнюю папку
@@ -167,8 +168,9 @@ CPython 3.11.16 — PSF-2.0
 
 3.2. Системные библиотеки, приложенные к интерпретатору
 
-Библиотеки взяты сборкой python-appimage из пакетов AlmaLinux 8 (manylinux_2_28);
-версия пакета указана в скобках. Лицензии — по лицензиям этих проектов.
+Библиотеки приложены к интерпретатору сборкой python-appimage. Все, кроме
+SQLite, взяты из пакетов AlmaLinux 8 (manylinux_2_28); версия пакета указана
+в скобках. Лицензии — по лицензиям этих проектов.
 
 OpenSSL 1.1.1k (openssl-libs 1.1.1k-17.el8_6) — OpenSSL
     (OpenSSL License и оригинальная SSLeay License)
@@ -215,6 +217,8 @@ libxcrypt 4.1.1 (libxcrypt 4.1.1-6.el8) — LGPL-2.1-or-later
 
 SQLite 3.53.4 — blessing (общественное достояние)
     https://www.sqlite.org/
+    Не из AlmaLinux: библиотека собрана из исходников SQLite и приложена
+    сборкой python-appimage (в библиотеке — дата исходников 2026-07-24).
 
 3.3. Колёса PyPI
 
@@ -246,7 +250,8 @@ NumPy 1.24.2 — BSD-3-Clause
       Project, https://github.com/xianyi/OpenBLAS;
       libgfortran — GPL-3.0-or-later WITH GCC-exception-3.1,
       Copyright (c) 2002-2017 Free Software Foundation, Inc.;
-      libquadmath — из состава GCC, Copyright (c) Free Software Foundation, Inc.
+      libquadmath — LGPL-2.1-or-later, из состава GCC,
+      Copyright (c) Free Software Foundation, Inc.
     Перечень лицензий этих библиотек — в файлах numpy-1.24.2.dist-info/LICENSE.txt
     и LICENSES_bundled.txt внутри AppImage.
 
@@ -316,8 +321,9 @@ type2-runtime (выпуск 20251108) — начальная часть файл
 ================================================================================
 
 Модели не входят ни в .deb, ни в AppImage. Пользователь скачивает их сам
-кнопкой «Скачать» — прямо из указанного репозитория Hugging Face (или
-с корпоративного зеркала), либо ставит из локального файла. Лицензия каждой
+своим действием (мастер первого запуска или раздел «Модели») — прямо из
+указанного репозитория Hugging Face (или с корпоративного зеркала), либо ставит
+из локального файла или папки. Лицензия каждой
 модели записана во встроенном каталоге моделей и показывается на её карточке.
 Ниже — все 12 моделей каталога с закреплёнными ревизиями.
 
@@ -400,7 +406,9 @@ https://huggingface.co/ai-sage/GigaAM-v3 (карточка: license: mit).
 ================================================================================
 
 Шрифты не входят ни в .deb, ни в AppImage: программа берёт их из пакетов
-операционной системы (Recommends), а если их нет — системные PT Astra Sans/Fact.
+операционной системы (Recommends). Если их нет, интерфейс переходит на
+установленные в системе PT Astra Sans, Open Sans или Roboto, а моноширинный
+текст — на DejaVu Sans Mono или Liberation Mono (qml/Theme.qml).
 
 PT Root UI (fonts-pt-root-ui) — OFL-1.1
     Copyright (c) 2018 Paratype Inc, Paratype Ltd,
