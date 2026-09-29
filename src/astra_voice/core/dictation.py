@@ -805,8 +805,11 @@ class DictationOrchestrator:
             # После «Стоп» записанное распознаётся как обычно.
             return
         self._device_change_kind = kind
-        # Только вид события: подпись устройства и текст в журнал не идут.
-        self._log.info("диктовка: смена микрофона посреди записи (%s)", kind)
+        # Только вид события строкой-константой: подпись устройства в журнал не идёт.
+        if kind == DEVICE_SWITCHED:
+            self._log.info("диктовка: микрофон сменился посреди записи")
+        else:
+            self._log.info("диктовка: микрофон отключился посреди записи")
         self._announce_device_change(kind, label)
         if self._phase != DictationPhase.RECORDING:
             # Клавишу уже отпустили: распознавание записанного идёт своим ходом.
