@@ -211,6 +211,50 @@ def test_update_checker_started_and_stopped_before_runtime(
     assert checker.on_event is None and checker.on_status is None
 
 
+def test_updates_bridge_bound_before_start_and_refreshed_by_settings(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Строка обновлений подключена до старта потока; тумблер и офлайн зовут refresh()."""
+    pytest.importorskip("requests")
+    from astra_voice.updates import checker as checker_mod
+
+    checker = Mock()
+    seen: dict[str, object] = {}
+    checker.start.side_effect = lambda: seen.setdefault("on_status", checker.on_status)
+    monkeypatch.setattr(checker_mod, "create_app_checker", Mock(return_value=checker))
+    posted: list[object] = []
+
+    def post(_self: object, call_: object) -> None:
+        posted.append(call_)
+        assert callable(call_)
+        call_()
+
+    monkeypatch.setattr(app_mod._GuiCalls, "post", post)
+    assert app_mod.main([]) == 7
+
+    on_status = seen["on_status"]
+    assert callable(on_status)
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    bridge = properties["updatesBridge"]
+    on_status(checker_mod.UpdateStatus("available", version="0.2.1"))
+    assert posted, "снимок проверки обязан идти через очередь GUI-потока"
+    assert bridge.state == "available"
+    assert bridge.version == "0.2.1"
+    # Кнопки «Страница выпуска» нет, пока нет platform/external.open_external.
+    assert bridge.releasePageAvailable is False
+
+    settings_bridge = properties["settingsBridge"]
+    checker.refresh.reset_mock()
+    settings_bridge.offline = True
+    checker.refresh.assert_called_once_with()
+    assert bridge.checkRefusal == "offline"
+    assert bridge.canCheckNow is False
+    settings_bridge.checkAppUpdates = True
+    assert checker.refresh.call_count == 2
+
+
 def test_update_checker_failure_does_not_stop_app(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
