@@ -102,6 +102,7 @@ def repo(tmp_path: Path, generated_key: tuple[Path, str]) -> tuple[Path, dict[st
     )
     (work / "docs").mkdir()
     (work / "docs/INSTALL-ADMIN.md").write_text("# Test\n", encoding="utf-8")
+    (work / "docs/SECURITY.md").write_text("# Security\n", encoding="utf-8")
     (work / "data/keys").mkdir(parents=True)
     shutil.copy2(generated_key[0], work / "data/keys/release.gpg")
     git(work, env, "add", ".")
@@ -137,15 +138,18 @@ def test_dry_run(repo: tuple[Path, dict[str, str]]) -> None:
     assert "dry-run: ничего не создано" in result.stdout
     assert result.stdout.count("связка ключей в белом списке") == 1
     for asset in (
-        "astra-voice_*.deb",
+        "astra-voice_0.1.0_amd64.deb",
         "sbom.cdx.json",
+        "(AppImage выключен: нет packaging/appimage/ENABLED)",
         "SHA256SUMS",
         "SHA256SUMS.asc",
         "INSTALL-ADMIN.md (из docs/INSTALL-ADMIN.md)",
+        "SECURITY.md (из docs/SECURITY.md)",
         "latest.json",
         "release.gpg (из data/keys/release.gpg)",
     ):
         assert asset in result.stdout
+    assert "OK: docs/SECURITY.md существует и отслеживается Git" in result.stdout
     assert (
         subprocess.run(
             ["git", "tag", "-l", "v0.1.0"],
@@ -191,6 +195,7 @@ def test_t130_generated_version_does_not_stop_release(
     shutil.copy2(ROOT / "scripts/check_keyring.py", work / "scripts/check_keyring.py")
     (work / "docs").mkdir()
     (work / "docs/INSTALL-ADMIN.md").write_text("# Test\n", encoding="utf-8")
+    (work / "docs/SECURITY.md").write_text("# Security\n", encoding="utf-8")
     (work / "data/keys").mkdir(parents=True)
     shutil.copy2(ROOT / "data/keys/release.gpg", work / "data/keys/release.gpg")
     security = work / "src/astra_voice/security"
@@ -414,3 +419,33 @@ def test_push_failure(repo: tuple[Path, dict[str, str]]) -> None:
         ).stdout.strip()
         == "v0.1.0"
     )
+
+
+def commit_appimage(repo: tuple[Path, dict[str, str]], *, lock: bool) -> None:
+    work, env = repo
+    flag = work / "packaging/appimage/ENABLED"
+    flag.parent.mkdir(parents=True)
+    flag.write_text("# флаг\n", encoding="utf-8")
+    if lock:
+        (work / "packaging/appimage.lock").write_text("# lock\n", encoding="utf-8")
+    git(work, env, "add", ".")
+    git(work, env, "commit", "-m", "appimage")
+    git(work, env, "push", "origin", "main")
+    git(work, env, "fetch", "origin")
+
+
+def test_dry_run_with_appimage(repo: tuple[Path, dict[str, str]]) -> None:
+    """arch/appimage.md §9.3: при ENABLED в списке — образ и его SBOM, lock в Git."""
+    commit_appimage(repo, lock=True)
+    result = run(repo, "v0.1.0", "--skip-ci-check")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Astra_Voice-0.1.0-x86_64.AppImage (packaging/appimage/ENABLED)" in result.stdout
+    assert "sbom-appimage.cdx.json" in result.stdout
+    assert "OK: packaging/appimage.lock существует и отслеживается Git" in result.stdout
+
+
+def test_appimage_enabled_without_lock_fails(repo: tuple[Path, dict[str, str]]) -> None:
+    commit_appimage(repo, lock=False)
+    result = run(repo, "v0.1.0", "--skip-ci-check")
+    assert result.returncode == 1
+    assert "ОШИБКА: packaging/appimage.lock отсутствует или не отслеживается Git" in result.stdout

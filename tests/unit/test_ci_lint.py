@@ -81,6 +81,8 @@ def test_paths_ignore_allowlist_passes(tmp_path: Path) -> None:
         "docs/status.md",
         "docs/plans.md",
         "docs/test-plan.md",
+        "arch/**",
+        "spikes/**",
     )
     text = GOOD.replace(
         "    branches: [main]",
@@ -177,3 +179,12 @@ def test_expression_injection_in_run_rejected(tmp_path: Path) -> None:
     )
     problems = ci_lint.check_workflow(_write(tmp_path, text))
     assert any("инъекция в shell" in p for p in problems)
+
+
+def test_proposed_workflow_passes() -> None:
+    """Пакет правки ci.yml для заказчика (packaging/appimage/ci-workflow-patch.md) чист.
+
+    Заказчик вносит его в браузере один раз; гейт T-06 обязан пройти до отправки.
+    """
+    proposed = Path(__file__).resolve().parents[2] / "packaging/appimage/ci.yml.proposed"
+    assert ci_lint.check_workflow(proposed) == []

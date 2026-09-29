@@ -42,6 +42,9 @@ ALLOWED_PATHS_IGNORE = frozenset(
         "docs/status.md",
         "docs/plans.md",
         "docs/test-plan.md",
+        # Архитектура и спайки не попадают ни в .deb, ни в AppImage (arch/appimage.md §9.4 п.3).
+        "arch/**",
+        "spikes/**",
     }
 )
 

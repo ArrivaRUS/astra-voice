@@ -1,0 +1,413 @@
+# CI Astra Voice. Инварианты этого файла проверяет scripts/ci_lint.py (гейт T-06):
+# все Actions — по SHA, permissions минимальные, секрет подписи только в
+# Environment `release` по тегу, pull_request_target запрещён.
+#
+# Сборочная база везде — debian:12: у ALSE 1.8.5 та же glibc 2.36, тот же
+# Python 3.11.2 и PyQt5 5.15.9 (arch/plan-claude.md §7.3).
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    # Журналы проекта не влияют ни на код, ни на пакет: коммит только с ними CI не запускает.
+    # Список узкий намеренно: docs/PRIVACY.md, docs/SECURITY.md, docs/INSTALL-ADMIN.md и README в data/
+    # попадают в .deb, поэтому `**.md` целиком игнорировать нельзя. На теги фильтр путей не действует.
+    paths-ignore:
+      - 'HEARTBEAT.md'
+      - 'decisions/**'
+      - '.patches/**'
+      - 'research/**'
+      - 'docs/status.md'
+      - 'docs/plans.md'
+      - 'docs/test-plan.md'
+      # Архитектура и спайки не входят ни в .deb, ни в AppImage (arch/appimage.md §9.4 п.3).
+      - 'arch/**'
+      - 'spikes/**'
+  pull_request:
+    branches: [main]
+
+# pull_request_target здесь запрещён намеренно: он дал бы форку секреты.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  VENV: /tmp/venv
+
+jobs:
+  lint:
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container: debian:12
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Системные пакеты
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            make git python3 python3-venv python3-pip python3-numpy
+      - name: Окружение разработчика
+        run: |
+          python3 -m venv --system-site-packages "$VENV"
+          "$VENV/bin/pip" install --quiet ruff mypy pytest
+      - run: make lint VENV=$VENV
+
+  unit:
+    name: pytest -m unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: debian:12
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Системные пакеты
+        # test_real_qml_* грузит настоящий qml/Pill.qml; нужны QML-модули.
+        # Трей рендерит SVG плагином Qt из libqt5svg5.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            make git python3 python3-venv python3-pip python3-numpy \
+            gnupg gpgv openssl dpkg-dev binutils file \
+            python3-requests python3-jsonschema \
+            python3-pyqt5 python3-pyqt5.qtquick python3-xlib python3-yaml \
+            qml-module-qtquick2 qml-module-qtquick-controls2 \
+            qml-module-qtquick-layouts qml-module-qtquick-window2 \
+            qml-module-qtquick-shapes qml-module-qtgraphicaleffects \
+            libqt5svg5 dbus-daemon
+      - name: Окружение разработчика
+        run: |
+          python3 -m venv --system-site-packages "$VENV"
+          "$VENV/bin/pip" install --quiet pytest pyyaml
+      # tests/unit/test_app_lock.py поднимает настоящий процесс GUI: нужен
+      # PyQt5 (выше) и платформа без дисплея.
+      - name: Зависимости unit-тестов обязаны быть установлены
+        run: |
+          # --also yaml: test_ci_lint.py пропускает себя без PyYAML не через
+          # importorskip, а вручную — гейт об этом сам не узнает.
+          "$VENV/bin/python" scripts/ci_require_imports.py tests/unit --also yaml
+      - run: make test VENV=$VENV
+        env:
+          ASTRA_VOICE_REQUIRE_QT: "1"
+          QT_QPA_PLATFORM: offscreen
+          PYTEST_ADDOPTS: -rs
+
+  xvfb:
+    name: pytest -m xvfb
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: debian:12
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Системные пакеты (Qt + виртуальный дисплей)
+        # Трей рендерит SVG плагином Qt; libqt5svg5 нужен явно.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            make git python3 python3-venv python3-pip python3-numpy \
+            xvfb xauth \
+            fontconfig \
+            python3-requests python3-jsonschema \
+            python3-pyqt5 python3-pyqt5.qtquick python3-xlib python3-yaml \
+            qml-module-qtquick2 qml-module-qtquick-controls2 \
+            qml-module-qtquick-layouts qml-module-qtquick-window2 \
+            qml-module-qtquick-shapes qml-module-qtgraphicaleffects \
+            libqt5svg5
+      - name: Окружение разработчика
+        run: |
+          python3 -m venv --system-site-packages "$VENV"
+          "$VENV/bin/pip" install --quiet pytest
+      # Гейт против ложной зелени: `pytest.importorskip` на машине разработчика
+      # — вежливый пропуск, а в CI — тихо выключенная проверка. Скрипт сам
+      # вычитывает зависимости из тестов, руками список вести не нужно.
+      - name: Зависимости xvfb-тестов обязаны быть установлены
+        run: |
+          "$VENV/bin/python" scripts/ci_require_imports.py tests/xvfb
+      # PT Root UI есть только в ALSE: с DejaVu подписи шире и тесты размеров падают.
+      # Проверка fc-match роняет шаг, если шрифт не установлен.
+      - name: Шрифт QML для тестов размеров
+        run: |
+          set -eu
+          install -D -m 0644 tests/fixtures/fonts/pt-root-ui/*.ttf -t /usr/local/share/fonts/pt-root-ui/
+          fc-cache -f
+          fc-match -f '%{family}' 'PT Root UI' | grep -q 'PT Root UI'
+      - run: make test-xvfb VENV=$VENV
+        timeout-minutes: 12
+        env:
+          ASTRA_VOICE_REQUIRE_QT: "1"
+          QT_QPA_PLATFORM: xcb
+          # -rs: причины пропусков видны в логе, а не только их число
+          PYTEST_ADDOPTS: -rs
+
+  ci-lint:
+    name: инварианты workflow (T-06)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    container: debian:12
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          persist-credentials: false
+      - run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 python3-yaml
+      - run: python3 scripts/ci_lint.py .github/workflows/*.yml
+
+  engine:
+    name: pytest -m engine
+    # M2: реальная модель, распознавание и отмена инференса.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: debian:12
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Системные пакеты
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            make git curl ca-certificates python3 python3-venv python3-pip \
+            python3-numpy python3-flatbuffers python3-protobuf python3-sympy \
+            python3-packaging
+      - name: Окружение движка
+        run: |
+          python3 -m venv --system-site-packages "$VENV"
+          "$VENV/bin/pip" install --quiet --no-deps --require-hashes -r packaging/wheels.lock
+          "$VENV/bin/pip" install --quiet pytest==9.1.1
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.0.1
+        id: model-cache
+        with:
+          path: ~/.cache/astra-voice-ci/gigaam-v3/e2e_rnnt
+          key: gigaam-v3-e2e-rnnt-322c3b29492673eb7d0b434bfa9dfb8653e34d02
+      # 226 МБ скачиваются только при промахе кэша; строго шесть файлов варианта.
+      - name: Скачать GigaAM v3 e2e_rnnt
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        env:
+          MODEL_REVISION: 322c3b29492673eb7d0b434bfa9dfb8653e34d02
+        run: |
+          set -eu
+          model_dir="$HOME/.cache/astra-voice-ci/gigaam-v3/e2e_rnnt"
+          mkdir -p "$model_dir"
+          cd "$model_dir"
+          for file in config.json v3_e2e_rnnt.yaml v3_e2e_rnnt_vocab.txt \
+            v3_e2e_rnnt_encoder.int8.onnx v3_e2e_rnnt_decoder.int8.onnx \
+            v3_e2e_rnnt_joint.int8.onnx; do
+            curl -sSL --fail \
+              "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/$MODEL_REVISION/$file" \
+              -o "$file"
+          done
+      - name: Сверка sha256 модели (всегда, в том числе при попадании кэша)
+        run: |
+          set -eu
+          model_dir="$HOME/.cache/astra-voice-ci/gigaam-v3/e2e_rnnt"
+          cd "$model_dir"
+          check_dir=$(mktemp -d)
+          trap 'rm -rf "$check_dir"' EXIT
+          cat > "$check_dir/SHA256SUMS" <<'SHA256SUMS'
+          0641fcf73f4af791c73f05083e38a658ff5dcbee3534a0c61396c10f4b97f0fe  config.json
+          d23270a1f327e365ebc4554b7ceee69ac12898e21092c18085151516aa58f91b  v3_e2e_rnnt.yaml
+          39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7  v3_e2e_rnnt_vocab.txt
+          4e0e076a6076cd110277e529b8ac8f32cd5297f7fbebad5341ae8ddb7d00817b  v3_e2e_rnnt_encoder.int8.onnx
+          89014e134865615b91e037157e46e389b1271e6072460efc010ea08e61e23146  v3_e2e_rnnt_decoder.int8.onnx
+          ade116563dbf66e503b0994efab6b5861412743e52bf31c39fc3fffa3783d5d1  v3_e2e_rnnt_joint.int8.onnx
+          SHA256SUMS
+          awk '{print $2}' "$check_dir/SHA256SUMS" | LC_ALL=C sort > "$check_dir/expected"
+          find . -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort > "$check_dir/actual"
+          if ! diff -u --label expected --label actual "$check_dir/expected" "$check_dir/actual"; then
+            echo 'Ошибка: каталог модели должен содержать ровно шесть ожидаемых файлов, без лишних записей.' >&2
+            exit 1
+          fi
+          sha256sum -c "$check_dir/SHA256SUMS"
+      # Плавающий сбой распознавания: подозреваем набор SIMD-инструкций раннера.
+      - name: CPU раннера
+        run: |
+          # || не дают отсутствующим полям CPU уронить диагностический шаг.
+          grep -m1 'model name' /proc/cpuinfo || echo 'model name: нет поля'
+          nproc
+          { grep -o -wE 'avx2|avx512[a-z_]*|avx_vnni|amx_[a-z0-9]*' /proc/cpuinfo || true; } | sort -u | tr '\n' ' '
+          echo
+      - name: Проверки движка
+        run: |
+          export ASTRA_VOICE_TEST_MODEL_DIR="$HOME/.cache/astra-voice-ci/gigaam-v3/e2e_rnnt"
+          make test-engine VENV=$VENV
+
+  deb:
+    name: сборка .deb и гейты
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: debian:12
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Инструменты сборки
+        run: |
+          apt-get update
+          # Для гейта смоука установленного дерева: модули UI импортируют PyQt5 на уровне модуля.
+          apt-get install -y --no-install-recommends \
+            build-essential debhelper dh-python devscripts dpkg-dev fakeroot \
+            lintian file binutils git make \
+            python3 python3-venv python3-pip python3-pyqt5 python3-pyqt5.qtquick \
+            python3-requests python3-jsonschema
+      - name: Колёса по wheels.lock (единственный шаг с сетью)
+        run: packaging/build-deb.sh --fetch-wheels
+      - name: Патч отмены применим к onnx-asr 0.12.0
+        run: |
+          T=$(mktemp -d)
+          python3 -m zipfile -e "${ASTRA_VOICE_WHEEL_CACHE:-$HOME/.cache/astra-voice-dev/wheels}/onnx_asr-0.12.0-py3-none-any.whl" "$T"
+          patch_file="$PWD/vendor/patches/onnx-asr-cancellable.patch"
+          (cd "$T" && patch -p1 --dry-run < "$patch_file")
+      - name: Сборка (dh + lintian) и гейты ELF/METADATA/SBOM
+        run: packaging/build-deb.sh --dh
+      - name: Проверка установки в чистой системе
+        # Шаг обязан быть зелёным без репозиториев ALSE: всё из Depends есть
+        # в debian:12, а шрифты PT переведены в Recommends (A-03) — apt их
+        # здесь просто пропустит.
+        run: |
+          apt-get update
+          apt-get install -y ./dist/astra-voice_*.deb
+          astra-voice --version
+          packaging/smoke-installed.sh /
+          python3 -c "import sys; sys.path.insert(0, '/usr/lib/astra-voice/vendor'); import onnxruntime, onnx_asr; print(onnxruntime.__version__)"
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: astra-voice-deb
+          path: |
+            dist/astra-voice_*.deb
+            dist/sbom.cdx.json
+          if-no-files-found: error
+
+  appimage:
+    name: сборка AppImage и гейты
+    # Второй артефакт v0.2 (arch/appimage.md §9). Workflow только вызывает скрипты
+    # репозитория; без packaging/appimage/ENABLED build.sh и smoke.sh завершаются
+    # успешно с пометкой «AppImage выключен», артефакт не выгружается.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: debian:12
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Системные пакеты (сборка, подпись runtime, Qt без дисплея и под xvfb)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            binutils file patch git curl ca-certificates gpgv util-linux \
+            python3 python3-pip \
+            xvfb xauth fontconfig libfontconfig1 libglib2.0-0 libgl1 libdbus-1-3 \
+            libgssapi-krb5-2 libx11-6 libx11-xcb1 libxkbcommon0 libxkbcommon-x11-0 \
+            libxcb-glx0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render0 libxcb-render-util0 libxcb-shape0 libxcb-shm0 libxcb-sync1 \
+            libxcb-util1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.0.1
+        with:
+          path: ~/.cache/astra-voice-dev/appimage
+          key: appimage-${{ hashFiles('packaging/appimage.lock') }}
+      - name: Входы по lock (единственный шаг с сетью)
+        run: packaging/appimage/build.sh --fetch
+      - name: Сборка и гейты
+        run: packaging/appimage/build.sh
+      - name: Смоук образа
+        run: packaging/appimage/smoke.sh dist/Astra_Voice-*-x86_64.AppImage
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        if: hashFiles('packaging/appimage/ENABLED') != ''
+        with:
+          name: astra-voice-appimage
+          path: |
+            dist/Astra_Voice-*.AppImage
+            dist/sbom-appimage.cdx.json
+          if-no-files-found: error
+
+  release:
+    name: релиз по тегу
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, unit, xvfb, engine, ci-lint, deb, appimage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    container: debian:12
+    # Секрет подписи живёт только здесь: Environment с required reviewer.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Git для полного checkout
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Версия тега и changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          changelog_version="$(sed -n '1s/.*(\([^)]*\)).*/\1/p' packaging/debian/changelog)"
+          if [ "$version" != "$changelog_version" ]; then
+            echo "::error::Версия тега $version не совпадает с changelog $changelog_version"
+            exit 1
+          fi
+      - name: Инструменты сборки
+        run: |
+          apt-get update
+          # Для гейта смоука установленного дерева: модули UI импортируют PyQt5 на уровне модуля.
+          apt-get install -y --no-install-recommends \
+            build-essential debhelper dh-python devscripts dpkg-dev fakeroot \
+            lintian file binutils git make gnupg gpgv curl jq patch ca-certificates util-linux \
+            python3 python3-venv python3-pip python3-pyqt5 python3-pyqt5.qtquick \
+            python3-requests python3-jsonschema \
+            xvfb xauth fontconfig libfontconfig1 libglib2.0-0 libgl1 libdbus-1-3 \
+            libgssapi-krb5-2 libx11-6 libx11-xcb1 libxkbcommon0 libxkbcommon-x11-0 \
+            libxcb-glx0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render0 libxcb-render-util0 libxcb-shape0 libxcb-shm0 libxcb-sync1 \
+            libxcb-util1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1
+      - name: Тег стоит на коммите из main
+        run: |
+          test -d .git || { echo "::error::Checkout без истории Git"; exit 1; }
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::Тег не на коммите из main"; exit 1; }
+      - name: Связка ключей в белом списке
+        run: python3 scripts/check_keyring.py data/keys/release.gpg
+      # Сборка и подпись — в одном job: между ними артефакт никуда не уезжает (У32).
+      # .deb, установка именно подписываемого пакета (T3 P2-6), AppImage при ENABLED.
+      - name: Сборка, установка и гейты
+        run: scripts/release_build.sh
+      # Без секрета (T3 P2-2): latest.json, SHA256SUMS, dist/assets.txt.
+      - name: Ассеты выпуска
+        run: scripts/release_assets.sh dist
+      - name: Отсоединённая подпись SHA256SUMS
+        env:
+          GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+        run: |
+          cd dist
+          export GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$GPG_SIGNING_KEY" | gpg --batch --quiet --import
+          SIGNING_FPR="$(python3 ../scripts/check_signing_secret.py secret --homedir "$GNUPGHOME" --keyring ../data/keys/release.gpg)" || { echo '::error::Секрет подписи не прошёл проверку состава'; exit 1; }
+          gpg --batch --yes --local-user "${SIGNING_FPR}!" --detach-sign --armor --output SHA256SUMS.asc SHA256SUMS
+          gpgv --keyring ../data/keys/release.gpg SHA256SUMS.asc SHA256SUMS
+          python3 ../scripts/check_signing_secret.py signature --keyring ../data/keys/release.gpg --subkey "$SIGNING_FPR" SHA256SUMS.asc SHA256SUMS
+          rm -rf "$GNUPGHOME"
+      - name: Публикация
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            -o /usr/share/keyrings/githubcli.gpg
+          echo "deb [signed-by=/usr/share/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" \
+            > /etc/apt/sources.list.d/github-cli.list
+          apt-get update && apt-get install -y --no-install-recommends gh
+          # Список ассетов пишет scripts/release_assets.sh (в т. ч. AppImage при ENABLED).
+          # shellcheck disable=SC2046
+          gh release create "${GITHUB_REF_NAME}" --generate-notes $(cat dist/assets.txt)

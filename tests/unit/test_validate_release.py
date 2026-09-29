@@ -36,9 +36,18 @@ class ReleaseAssets:
 
 
 @pytest.fixture
-def validate(monkeypatch: pytest.MonkeyPatch) -> Callable[[list[str]], int]:
+def validate_globals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, object]:
     monkeypatch.setattr(sys, "path", sys.path.copy())
-    return cast(Callable[[list[str]], int], runpy.run_path(str(ROOT / "tools/validate"))["main"])
+    namespace = runpy.run_path(str(ROOT / "tools/validate"))
+    module_globals = cast(dict[str, object], namespace["main"].__globals__)
+    # Флаг AppImage настоящего дерева не влияет на тесты: включаем его явно.
+    module_globals["APPIMAGE_ENABLED"] = tmp_path / "no-ENABLED"
+    return module_globals
+
+
+@pytest.fixture
+def validate(validate_globals: dict[str, object]) -> Callable[[list[str]], int]:
+    return cast(Callable[[list[str]], int], validate_globals["main"])
 
 
 @pytest.fixture
@@ -261,7 +270,7 @@ def test_release_wrong_latest_sha(
 ) -> None:
     dist, keyring = assets
     latest = json.loads((dist / "latest.json").read_text(encoding="utf-8"))
-    latest["sha256"] = "0" * 64
+    latest["artifacts"]["deb"]["sha256"] = "0" * 64
     (dist / "latest.json").write_text(json.dumps(latest), encoding="utf-8")
     assert invoke(validate, dist, keyring) == 1
 
@@ -291,10 +300,25 @@ def test_latest_generator(tmp_path: Path) -> None:
         generator(tmp_path, "0.1.0")
     (tmp_path / "astra-voice_0.1.0_arm64.deb").unlink()
     data = generator(tmp_path, "0.1.0", "2026-09-30T12:00:00Z")
-    assert set(data) == {"version", "deb", "sha256", "published_at", "min_astra"}
+    assert set(data) == {
+        "schema",
+        "version",
+        "published_at",
+        "min_astra",
+        "release_url",
+        "artifacts",
+    }
+    assert data["schema"] == 2
     assert data["published_at"] == "2026-09-30T12:00:00Z"
     assert data["version"] == "0.1.0"
-    assert len(data["sha256"]) == 64
+    assert data["release_url"] == "https://github.com/ArrivaRUS/astra-voice/releases/tag/v0.1.0"
+    assert data["artifacts"] == {
+        "deb": {
+            "name": "astra-voice_0.1.0_amd64.deb",
+            "sha256": hashlib.sha256(b"amd64").hexdigest(),
+            "size": 5,
+        }
+    }
     current = generator(tmp_path, "0.1.0")
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", current["published_at"])
     with pytest.raises(ValueError, match="published-at"):
@@ -504,3 +528,167 @@ def test_latest_symlink(
     assert "не обычный файл" in str(checks["assets"]["detail"])
     assert checks["signature"]["ok"] is True
     assert checks["release.gpg"]["ok"] is True
+
+
+# --- второй артефакт AppImage (arch/appimage.md §9.3, T-168) ---------------------------
+
+IMAGE = "Astra_Voice-0.1.0-x86_64.AppImage"
+IMAGE_SIZE = (50 << 20) + 4096
+
+
+def add_appimage(
+    assets: ReleaseAssets, *, size: int = IMAGE_SIZE, magic: bytes = b"AI\x02"
+) -> None:
+    """Дописать в выпуск фейковый AppImage type 2, SBOM, SECURITY.md; пересобрать суммы."""
+    dist = assets.dist
+    with (dist / IMAGE).open("wb") as output:
+        output.write(b"\x7fELF\x02\x01\x01\x00" + magic)
+        output.truncate(size)
+    (dist / "sbom-appimage.cdx.json").write_text("{}\n", encoding="utf-8")
+    (dist / "SECURITY.md").write_text("# security\n", encoding="utf-8")
+    generator = runpy.run_path(str(ROOT / "scripts/release_latest_json.py"))["generate"]
+    generator(dist, "0.1.0", "2026-09-30T12:00:00Z", appimage=True)
+    rewrite_sums(assets)
+
+
+def rewrite_sums(assets: ReleaseAssets, skip: str | None = None) -> None:
+    dist = assets.dist
+    names = sorted(
+        path.name
+        for path in dist.iterdir()
+        if path.name not in {"SHA256SUMS", "SHA256SUMS.asc", skip}
+    )
+    (dist / "SHA256SUMS").write_text(
+        "".join(
+            f"{hashlib.sha256((dist / name).read_bytes()).hexdigest()}  {name}\n" for name in names
+        ),
+        encoding="utf-8",
+    )
+    resign(assets, assets.fingerprint)
+
+
+def test_appimage_release_valid(
+    assets: ReleaseAssets,
+    validate: Callable[[list[str]], int],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    add_appimage(assets)
+    checks = release_checks(validate, assets, capsys, expected_code=0)
+    assert checks["appimage"]["ok"] is True
+    assert checks["latest.json"]["detail"] == "указатель верен (схема 2: appimage, deb)"
+    assert checks["sha256"]["detail"] == "суммы и покрытие верны"
+
+
+def test_appimage_expected_but_missing(
+    assets: ReleaseAssets,
+    validate: Callable[[list[str]], int],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert invoke(validate, *assets, "--json", "--expect-appimage", "yes") == 1
+    checks = {check["name"]: check for check in json.loads(capsys.readouterr().out)["checks"]}
+    assert checks["assets"]["ok"] is False
+    assert IMAGE in str(checks["assets"]["detail"])
+    assert checks["appimage"]["ok"] is False
+
+
+def test_appimage_required_by_enabled_flag_for_tree_version(
+    assets: ReleaseAssets,
+    validate: Callable[[list[str]], int],
+    validate_globals: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    flag = tmp_path / "ENABLED"
+    flag.write_text("", encoding="utf-8")
+    validate_globals["APPIMAGE_ENABLED"] = flag
+    validate_globals["tree_version"] = lambda: "0.1.0"
+    assert invoke(validate, *assets) == 1
+    # Старый выпуск (не версия дерева) флагом не затрагивается.
+    validate_globals["tree_version"] = lambda: "0.2.0"
+    assert invoke(validate, *assets) == 0
+    assert invoke(validate, *assets, "--expect-appimage", "no") == 0
+
+
+@pytest.mark.parametrize(
+    ("change", "failed"),
+    [
+        ("latest-without-appimage", "latest.json"),
+        ("latest-wrong-size", "latest.json"),
+        ("sums-without-appimage", "sha256"),
+        ("sums-without-sbom", "sha256"),
+        ("small", "appimage"),
+        ("not-type2", "appimage"),
+        ("stray-version", "assets"),
+    ],
+)
+def test_appimage_release_broken(
+    assets: ReleaseAssets,
+    validate: Callable[[list[str]], int],
+    capsys: pytest.CaptureFixture[str],
+    change: str,
+    failed: str,
+) -> None:
+    dist = assets.dist
+    if change == "small":
+        add_appimage(assets, size=1 << 20)
+    elif change == "not-type2":
+        add_appimage(assets, magic=b"AI\x01")
+    else:
+        add_appimage(assets)
+    if change.startswith("latest-"):
+        latest = json.loads((dist / "latest.json").read_text(encoding="utf-8"))
+        if change == "latest-without-appimage":
+            del latest["artifacts"]["appimage"]
+        else:
+            latest["artifacts"]["appimage"]["size"] += 1
+        (dist / "latest.json").write_text(json.dumps(latest), encoding="utf-8")
+        rewrite_sums(assets)
+    elif change == "sums-without-appimage":
+        rewrite_sums(assets, skip=IMAGE)
+    elif change == "sums-without-sbom":
+        rewrite_sums(assets, skip="sbom-appimage.cdx.json")
+    elif change == "stray-version":
+        (dist / "Astra_Voice-0.0.9-x86_64.AppImage").write_bytes(b"old")
+    checks = release_checks(validate, assets, capsys)
+    assert checks[failed]["ok"] is False
+    assert checks["signature"]["ok"] is True
+    if change.startswith("sums-"):
+        assert "не покрыты" in str(checks["sha256"]["detail"])
+
+
+def test_legacy_latest_schema_1_accepted(
+    assets: ReleaseAssets,
+    validate: Callable[[list[str]], int],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Выпуск v0.1.0 опубликован со схемой 1 — его повторная проверка (О-4) проходит."""
+    deb = next(assets.dist.glob("*.deb"))
+    legacy = {
+        "version": "0.1.0",
+        "deb": deb.name,
+        "sha256": hashlib.sha256(deb.read_bytes()).hexdigest(),
+        "published_at": "2026-09-28T12:00:00Z",
+        "min_astra": "1.8",
+    }
+    (assets.dist / "latest.json").write_text(json.dumps(legacy), encoding="utf-8")
+    rewrite_sums(assets)
+    checks = release_checks(validate, assets, capsys, expected_code=0)
+    assert checks["latest.json"]["detail"] == "указатель верен (схема 1)"
+
+
+def test_latest_generator_appimage(tmp_path: Path) -> None:
+    generator = runpy.run_path(str(ROOT / "scripts/release_latest_json.py"))["generate"]
+    (tmp_path / "astra-voice_0.2.0_amd64.deb").write_bytes(b"deb")
+    with pytest.raises(ValueError, match="ровно один Astra_Voice-0.2.0-x86_64.AppImage"):
+        generator(tmp_path, "0.2.0", appimage=True)
+    (tmp_path / "Astra_Voice-0.2.0-x86_64.AppImage").write_bytes(b"image")
+    with pytest.raises(ValueError, match="без него"):
+        generator(tmp_path, "0.2.0")
+    data = generator(tmp_path, "0.2.0", "2026-10-15T09:00:00Z", appimage=True)
+    assert data["artifacts"]["appimage"] == {
+        "name": "Astra_Voice-0.2.0-x86_64.AppImage",
+        "sha256": hashlib.sha256(b"image").hexdigest(),
+        "size": 5,
+    }
+    (tmp_path / "Astra_Voice-0.1.9-x86_64.AppImage").write_bytes(b"old")
+    with pytest.raises(ValueError, match="найдено: 2"):
+        generator(tmp_path, "0.2.0", appimage=True)

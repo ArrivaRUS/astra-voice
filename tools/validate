@@ -8,6 +8,7 @@
     tools/validate catalog --all --json
     tools/validate catalog --switch --from ID@REV --to ID@REV
     tools/validate release --version 0.1.0 --dir dist/ --json
+    tools/validate release --version 0.2.0 --dir dist/ --expect-appimage yes
 
 Коды возврата: 0 — уложились, 1 — нарушен критерий, 2 — прогон невозможен.
 Проверяется интервал record.cancel → cancelled, а не остановка всех вызовов ORT.
@@ -73,6 +74,13 @@ CATALOG_SELFCHECK_TIMEOUT_S = 60.0
 CATALOG_SWITCH_TIMEOUT_S = 180.0
 
 
+RELEASE_REPOSITORY = "ArrivaRUS/astra-voice"
+APPIMAGE_ENABLED = ROOT / "packaging" / "appimage" / "ENABLED"
+APPIMAGE_MIN_SIZE = 50 << 20
+ASSET_LIMIT = 16 << 20
+ARTIFACT_LIMIT = 512 << 20
+
+
 class ReleaseCriterionError(Exception):
     """Ассет существует, но не является допустимым обычным файлом."""
 
@@ -103,6 +111,83 @@ def release_read(path: Path, limit: int) -> bytes:
         return b"".join(chunks)
     finally:
         os.close(fd)
+
+
+def tree_version() -> str | None:
+    """Версия исходного дерева — первая запись packaging/debian/changelog."""
+    try:
+        first = (ROOT / "packaging" / "debian" / "changelog").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.match(r"\S+ \(([^)]*)\)", first)
+    return match.group(1) if match else None
+
+
+def _published_ok(published: object) -> bool:
+    if not isinstance(published, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", published
+    ):
+        return False
+    datetime.strptime(published, "%Y-%m-%dT%H:%M:%SZ")
+    return True
+
+
+def check_latest(
+    latest: object,
+    *,
+    version: str,
+    artifacts: dict[str, tuple[str, bytes]],
+    with_appimage: bool,
+) -> tuple[bool, str]:
+    """Сверить latest.json с артефактами: схема 2 (arch/appimage.md §6) или 1 (v0.1.0)."""
+    if not isinstance(latest, dict):
+        return False, "указатель неверен"
+    common = (
+        latest.get("version") == version
+        and _published_ok(latest.get("published_at"))
+        and isinstance(latest.get("min_astra"), str)
+        and bool(latest["min_astra"])
+    )
+    deb_name, deb_bytes = artifacts["deb"]
+    if "schema" not in latest:
+        # Схема 1 — выпуск v0.1.0: один deb, AppImage в ней не описать.
+        ok = (
+            not with_appimage
+            and common
+            and set(latest) == {"version", "deb", "sha256", "published_at", "min_astra"}
+            and latest["deb"] == deb_name
+            and latest["sha256"] == hashlib.sha256(deb_bytes).hexdigest()
+        )
+        return ok, "указатель верен (схема 1)" if ok else "указатель неверен"
+    kinds = {"deb", "appimage"} if with_appimage else {"deb"}
+    listed = latest.get("artifacts")
+    ok = (
+        latest.get("schema") == 2
+        and common
+        and set(latest)
+        == {"schema", "version", "published_at", "min_astra", "release_url", "artifacts"}
+        and latest.get("release_url")
+        == f"https://github.com/{RELEASE_REPOSITORY}/releases/tag/v{version}"
+        and isinstance(listed, dict)
+        and set(listed) == kinds
+        and set(artifacts) == kinds
+    )
+    if ok and isinstance(listed, dict):
+        for kind in sorted(kinds):
+            name, content = artifacts[kind]
+            entry = listed[kind]
+            if not (
+                isinstance(entry, dict)
+                and set(entry) == {"name", "sha256", "size"}
+                and entry["name"] == name
+                and entry["sha256"] == hashlib.sha256(content).hexdigest()
+                and type(entry["size"]) is int
+                and entry["size"] == len(content)
+            ):
+                return False, f"артефакт {kind}: имя, sha256 или размер неверны"
+    if not ok:
+        return False, "указатель неверен"
+    return True, f"указатель верен (схема 2: {', '.join(sorted(kinds))})"
 
 
 def release(args: argparse.Namespace) -> int:
@@ -141,23 +226,41 @@ def release(args: argparse.Namespace) -> int:
 
     debs = sorted(directory.glob(f"astra-voice_{version}_*.deb"))
     deb = debs[0] if len(debs) == 1 else None
-    required = (
+    image_name = f"Astra_Voice-{version}-x86_64.AppImage"
+    # Второй артефакт (arch/appimage.md §9.3): обязателен при --expect-appimage yes
+    # или (auto) при packaging/appimage/ENABLED для версии этого дерева (changelog) —
+    # старые выпуски без AppImage (v0.1.0) проверяются как раньше. Найденный в
+    # каталоге AppImage проверяется всегда.
+    expect = args.expect_appimage
+    with_appimage = (
+        expect == "yes"
+        or (expect == "auto" and APPIMAGE_ENABLED.is_file() and version == tree_version())
+        or (directory / image_name).exists()
+        or (directory / "sbom-appimage.cdx.json").exists()
+    )
+    required = [
         "sbom.cdx.json",
         "SHA256SUMS",
         "SHA256SUMS.asc",
         "INSTALL-ADMIN.md",
         "latest.json",
         "release.gpg",
-    )
+    ]
+    if with_appimage:
+        required += [image_name, "sbom-appimage.cdx.json"]
+    # SECURITY.md публикуется с v0.2 (release_assets.sh); в v0.1.0 его не было.
+    optional = ["SECURITY.md"]
     paths = {name: directory / name for name in required}
+    paths.update({name: directory / name for name in optional if (directory / name).exists()})
     if deb is not None:
         paths[deb.name] = deb
     snapshots: dict[str, bytes] = {}
     missing: list[str] = []
     invalid: list[str] = []
     for name, path in paths.items():
+        limit = ARTIFACT_LIMIT if name.endswith((".deb", ".AppImage")) else ASSET_LIMIT
         try:
-            snapshots[name] = release_read(path, 512 << 20 if name.endswith(".deb") else 16 << 20)
+            snapshots[name] = release_read(path, limit)
         except FileNotFoundError:
             missing.append(name)
         except ReleaseCriterionError as exc:
@@ -165,11 +268,15 @@ def release(args: argparse.Namespace) -> int:
         except OSError as exc:
             record(name, False, f"не удалось прочитать: {exc.strerror or exc}")
             return finish(2)
+    stray = sorted(
+        path.name for path in directory.glob("Astra_Voice-*.AppImage") if path.name != image_name
+    )
+    invalid += [f"{name}: чужая версия AppImage" for name in stray]
     if keyring == (directory / "release.gpg").absolute() and "release.gpg" in snapshots:
         key_bytes = snapshots["release.gpg"]
     else:
         try:
-            key_bytes = release_read(keyring, 16 << 20)
+            key_bytes = release_read(keyring, ASSET_LIMIT)
         except FileNotFoundError:
             record(keyring.name, False, f"отсутствует: {keyring}")
             return finish(2)
@@ -244,8 +351,9 @@ def release(args: argparse.Namespace) -> int:
                         break
                 else:
                     expected = {"sbom.cdx.json", "INSTALL-ADMIN.md", "latest.json", "release.gpg"}
-                    if deb is not None:
-                        expected.add(deb.name)
+                    expected |= {
+                        name for name in paths if name not in {"SHA256SUMS", "SHA256SUMS.asc"}
+                    }
                     uncovered = sorted(expected - seen)
                     sums_detail = (
                         f"не покрыты: {', '.join(uncovered)}"
@@ -281,33 +389,38 @@ def release(args: argparse.Namespace) -> int:
         "поля пакета верны" if package_ok else "Package или Version неверны",
     )
 
+    if with_appimage:
+        image = snapshots.get(image_name)
+        image_ok = (
+            image is not None
+            and image[:4] == b"\x7fELF"
+            and image[8:11] == b"AI\x02"
+            and len(image) > APPIMAGE_MIN_SIZE
+        )
+        record(
+            "appimage",
+            image_ok,
+            "образ AppImage type 2" if image_ok else "нет файла, не type 2 или меньше 50 МиБ",
+        )
+
     latest_ok = False
+    latest_detail = "указатель неверен"
     if "latest.json" in snapshots and deb is not None and deb.name in snapshots:
         try:
             latest = json.loads(snapshots["latest.json"])
-            published = latest.get("published_at") if isinstance(latest, dict) else None
-            date_ok = isinstance(published, str) and bool(
-                re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", published)
-            )
-            if date_ok:
-                datetime.strptime(published, "%Y-%m-%dT%H:%M:%SZ")
-            latest_ok = (
-                isinstance(latest, dict)
-                and set(latest) == {"version", "deb", "sha256", "published_at", "min_astra"}
-                and latest["version"] == version
-                and latest["deb"] == deb.name
-                and latest["sha256"] == hashlib.sha256(snapshots[deb.name]).hexdigest()
-                and date_ok
-                and isinstance(latest["min_astra"], str)
-                and bool(latest["min_astra"])
+            latest_ok, latest_detail = check_latest(
+                latest,
+                version=version,
+                artifacts={
+                    kind: (name, snapshots[name])
+                    for kind, name in (("deb", deb.name), ("appimage", image_name))
+                    if name in snapshots and (kind == "deb" or with_appimage)
+                },
+                with_appimage=with_appimage,
             )
         except (UnicodeError, ValueError, TypeError, KeyError):
             pass
-    record(
-        "latest.json",
-        latest_ok,
-        "указатель верен" if latest_ok else "указатель неверен",
-    )
+    record("latest.json", latest_ok, latest_detail)
     return finish(int(not all(item["ok"] for item in checks)))
 
 
@@ -417,8 +530,10 @@ def stats(args: argparse.Namespace) -> int:
         print(f"Диктовок: {len(dictations)}; ошибок микрофона: {facts['mic_errors']}.")
         print(f"Прогретых диктовок, вставленных в окно: {total['n']} из {args.min_n}.")
         measured = "нет данных" if p95 is None else f"p95 {p95:g} мс, max {total['max']:g} мс"
-        print(f"Полное время (t_total_ms): {measured}; цель p95 ≤ {args.target_ms:g} мс; "
-              f"вердикт: {verdict}.")
+        print(
+            f"Полное время (t_total_ms): {measured}; цель p95 ≤ {args.target_ms:g} мс; "
+            f"вердикт: {verdict}."
+        )
         old_measured = (
             "нет данных" if old["p95"] is None else f"p95 {old['p95']:g} мс, max {old['max']:g} мс"
         )
@@ -2088,7 +2203,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     summary.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
     summary.add_argument(
-        "--min-n", type=nonnegative_int, default=0,
+        "--min-n",
+        type=nonnegative_int,
+        default=0,
         help="минимум прогретых диктовок, вставленных в окно (по умолчанию 0)",
     )
     summary.add_argument(
@@ -2156,6 +2273,12 @@ def main(argv: list[str] | None = None) -> int:
     release_check.add_argument("--dir", type=Path, default=ROOT / "dist")
     release_check.add_argument("--keyring", type=Path, default=ROOT / "data/keys/release.gpg")
     release_check.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    release_check.add_argument(
+        "--expect-appimage",
+        choices=("auto", "yes", "no"),
+        default="auto",
+        help="AppImage обязателен: auto — при packaging/appimage/ENABLED (по умолчанию)",
+    )
     probe = commands.add_parser("_catalog-probe", help=argparse.SUPPRESS)
     probe.add_argument("--model-dir", type=Path, required=True)
     probe.add_argument("--layout", required=True)
