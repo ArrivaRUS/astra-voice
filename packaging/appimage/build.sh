@@ -28,6 +28,9 @@
 # переменная — ошибка; в workflow её имя запрещает scripts/ci_lint.py; release_build.sh и
 # release_assets.sh при ENABLED не пропускают lock с TODO-HASH вовсе.
 set -euo pipefail
+# Вывод readelf/objdump разбирается sed/grep: под ru_RU readelf пишет «Совм. исп. библиотека»
+# вместо «Shared library» и расчёт DT_NEEDED Qt молча пропускал зависимости (ревью P3-8).
+export LC_ALL=C
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 HERE=$ROOT/packaging/appimage
