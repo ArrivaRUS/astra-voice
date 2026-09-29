@@ -236,6 +236,33 @@ def test_thread_wakeups_are_coalesced(
     assert invoke.call_count == 2
 
 
+def test_failed_wakeup_does_not_block_next_post(
+    monkeypatch: pytest.MonkeyPatch,
+    delivered: list[tuple[str, int]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """invokeMethod вернул False — флаг пробуждения сброшен, следующий пост будит снова."""
+    notifications.install_dispatcher()
+    receiver = notifications._receiver
+    assert receiver is not None
+    invoke = Mock(side_effect=[False, True])
+    monkeypatch.setattr(QMetaObject, "invokeMethod", invoke)
+
+    def post(summary: str) -> None:
+        notifications.notify(summary, retry=False)
+
+    with caplog.at_level("DEBUG", logger=notifications.__name__):
+        for summary in ("первое", "второе"):
+            worker = threading.Thread(target=post, args=(summary,), name=_WORKER)
+            worker.start()
+            worker.join(2)
+    assert invoke.call_count == 2
+    assert notifications._wake_pending is True
+    assert "Не удалось разбудить получатель уведомлений из потока" in caplog.text
+    receiver._drain()
+    assert [summary for summary, _ in delivered] == ["первое", "второе"]
+
+
 def test_gui_thread_notify_submits_directly(
     monkeypatch: pytest.MonkeyPatch, delivered: list[tuple[str, int]]
 ) -> None:
