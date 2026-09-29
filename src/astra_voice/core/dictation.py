@@ -52,6 +52,9 @@ LEVEL_FAILED = "Не удалось проверить микрофон. Поп�
 DEVICE_CHANGE_MIN_AUDIO_MS = 300
 DEVICE_SWITCHED = "switched"
 DEVICE_LOST = "device-lost"
+# Тексты проверки микрофона в настройках и мастере (уровень и тестовая фраза).
+MICROPHONE_LOST_MESSAGE = "Микрофон отключился. Подключите его или выберите другой."
+MICROPHONE_CHANGED_MESSAGE = "Микрофон сменился. Выберите микрофон в списке."
 # Пилюлю о смене микрофона эти состояния не перебивают, пока она на экране (S5-A5 D3).
 _DEVICE_PILL_KEEPS_OVER = frozenset(
     (PillState.PROCESSING, PillState.DONE, PillState.EMPTY, PillState.CANCELLED)
@@ -406,6 +409,10 @@ class DictationOrchestrator:
             self._error(event.get("code"))
         elif kind == "audio.ready":
             self._audio_ready(event)
+        elif kind == "audio.device.changed":
+            device_kind, _ = self._device_change_fields(event)
+            if device_kind is not None:
+                self._end_level(self._device_change_message(device_kind))
         elif kind == "level":
             peak = event.get("peak_dbfs")
             if isinstance(peak, (int, float)) and not isinstance(peak, bool):
@@ -769,8 +776,8 @@ class DictationOrchestrator:
                     self._pill.show_state(PillState.LIMIT)
                 self._stop(recording_stopped=True)
 
-    def _device_change(self, event: dict[str, Any]) -> None:
-        """Воркер сам остановил запись из-за смены микрофона (S5-A5, IPC v3)."""
+    def _device_change_fields(self, event: dict[str, Any]) -> tuple[str | None, str]:
+        """Вид смены и подпись; None — событие не распознано."""
         kind = event.get("kind")
         label = event.get("label")
         label = label.strip() if isinstance(label, str) else ""
@@ -779,11 +786,25 @@ class DictationOrchestrator:
             kind = DEVICE_LOST
         if kind not in (DEVICE_SWITCHED, DEVICE_LOST):
             self._log.debug("диктовка: некорректное поле kind")
+            return None, ""
+        return str(kind), label
+
+    @staticmethod
+    def _device_change_message(kind: str) -> str:
+        return MICROPHONE_LOST_MESSAGE if kind == DEVICE_LOST else MICROPHONE_CHANGED_MESSAGE
+
+    def _device_change(self, event: dict[str, Any]) -> None:
+        """Воркер сам остановил запись из-за смены микрофона (S5-A5, IPC v3)."""
+        kind, label = self._device_change_fields(event)
+        if kind is None:
             return
         if self._device_change_kind is not None:
             self._log.debug("диктовка: повторная смена микрофона отброшена")
             return
         if self.test_active:
+            if self._phase == DictationPhase.RECORDING:
+                self._device_change_test(kind)
+            # После «Стоп» записанное распознаётся как обычно.
             return
         self._device_change_kind = kind
         # Только вид события: подпись устройства и текст в журнал не идут.
@@ -806,6 +827,15 @@ class DictationOrchestrator:
         self._end_finish(
             PillState.ERROR, tray=TrayState.ERROR if kind == DEVICE_LOST else TrayState.IDLE
         )
+
+    def _device_change_test(self, kind: str) -> None:
+        """Тестовая фраза: запись уже остановлена воркером, результата не будет."""
+        self._device_change_kind = kind
+        self._cancel_requested = True
+        self._cancel_pending = True
+        self._finish_test(MicrophoneTestUpdate("error", message=self._device_change_message(kind)))
+        self._later(CANCEL_TIMEOUT_MS, self._cancel_timeout)
+        self._send_cancel()
 
     def _announce_device_change(self, kind: str, label: str) -> None:
         switched = kind == DEVICE_SWITCHED
