@@ -346,3 +346,26 @@ def test_thread_start_failure_resets_and_queue_continues(
             assert downloads.modelState == "installed"
     finally:
         downloads.shutdown()
+
+
+@pytest.mark.parametrize("stage", ("verify_files", "smoke"))
+def test_recheck_job_reports_finished_even_on_base_exception(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """Итог перепроверки уходит в finally, как у _ModelJob: без него GUI узнаёт об
+    исходе только по признаку выхода потока, а не от самого задания."""
+
+    class Abort(BaseException):
+        pass
+
+    port = FakeModelPort()
+    monkeypatch.setattr(port, "verify_files", lambda entry: (True, ""))
+    monkeypatch.setattr(port, "smoke", lambda entry: (True, ""))
+    monkeypatch.setattr(port, stage, Mock(side_effect=Abort()))
+    events: list[tuple[str, tuple[Any, ...]]] = []
+    job = model_downloads._RecheckJob(
+        port, port.entry, threading.Event(), lambda kind, args: events.append((kind, args))
+    )
+    with pytest.raises(Abort):
+        job.run()
+    assert events == [("finished", ("cancelled", ""))]
