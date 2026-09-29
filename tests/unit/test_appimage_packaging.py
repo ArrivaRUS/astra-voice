@@ -414,3 +414,30 @@ def test_build_refuses_allow_todo_in_ci(ci_env: dict[str, str], tmp_path: Path) 
     assert result.returncode == 1
     assert "в CI запрещена" in result.stderr
     assert not (tmp_path / "work").exists()
+
+
+@pytest.mark.skipif(
+    any(shutil.which(tool) is None for tool in ("gpg", "gpgconf")), reason="нет gpg"
+)
+def test_runtime_key_matches_lock(tmp_path: Path) -> None:
+    """Ключ подписи runtime в репозитории — тот, чей отпечаток закреплён строкой runtime-key."""
+    home = tmp_path / "gnupg"
+    home.mkdir(mode=0o700)
+    listing = subprocess.run(
+        [
+            "gpg",
+            "--homedir",
+            str(home),
+            "--batch",
+            "--with-colons",
+            "--show-keys",
+            str(ROOT / "packaging/appimage/keys/appimage-runtime.gpg"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    ).stdout
+    fingerprints = [line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")]
+    subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "all"], check=False, timeout=10)
+    assert fingerprints[0] == lockfile.load(LOCK).runtime_key

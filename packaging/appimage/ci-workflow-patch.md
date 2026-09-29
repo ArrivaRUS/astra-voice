@@ -70,11 +70,10 @@
 
 ## Что должно быть готово в репозитории до правки (делает команда, не вы)
 
-- В `packaging/appimage.lock` закреплены хэши `jsonschema`/`attrs`/`pyrsistent` (строки
-  `# TODO-HASH` заменены требованиями с `--hash`) — иначе job `appimage` красный намеренно.
-- Ключ подписи runtime AppImage `packaging/appimage/keys/appimage-runtime.gpg` (отпечаток
-  `570C77ACEA40C0F1B758902CBF96CCA56490F695`, строка `# runtime-key:` в lock) — без него
-  `build.sh --fetch` останавливается.
+- Готово 29.09: хэши `jsonschema`/`attrs`/`pyrsistent` закреплены в `packaging/appimage.lock`
+  (сверены с PyPI), ключ подписи runtime AppImage `packaging/appimage/keys/appimage-runtime.gpg`
+  взят из репозитория проекта AppImage, отпечаток `570C77ACEA40C0F1B758902CBF96CCA56490F695`
+  совпал со строкой `# runtime-key:` в lock.
 - Ветка проверена локально: `scripts/ci_lint.py` на `ci.yml.proposed`, юнит-тесты, локальная
   сборка образа. **Первый прогон нового job в GitHub Actions будет у вас, сразу после правки:**
   у токена команды нет права Workflows, запустить новый job до вашей правки мы не можем. Если
