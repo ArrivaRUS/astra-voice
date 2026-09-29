@@ -27,7 +27,7 @@ FocusScope {
             "subtitle": qsTr("Куда попадает текст и что происходит с буфером обмена"),
             "icon": "out", "counter": "" },
         { "key": "network", "title": qsTr("Сеть и обновления"),
-            "subtitle": qsTr("Четыре сетевых действия — и ни одного больше"),
+            "subtitle": qsTr("Сеть нужна только для скачивания модели и проверки новой версии"),
             "icon": "refresh", "counter": "" },
         { "key": "advanced", "title": qsTr("Продвинутые"),
             "subtitle": qsTr("То, что почти никому не нужно менять"),

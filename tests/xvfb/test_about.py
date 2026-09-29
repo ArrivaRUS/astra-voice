@@ -326,6 +326,9 @@ def test_about_section_snapshot(app: Any, case: str, dark: bool) -> None:
         # Скрыто до своих вех: «Обновить из файла…» (M8), «Пройти настройку заново» (US-1.8).
         assert "Обновить из файла…" not in texts
         assert "Пройти настройку заново" not in texts
+        # Кнопки документов — простым языком, без имён файлов.
+        assert {"Лицензия программы", "Лицензии компонентов", "Приватность"} <= texts
+        assert not {"Открыть LICENSE", "NOTICE", "PRIVACY"} & texts
         if height == TALL:
             assert {
                 "Данные на диске",

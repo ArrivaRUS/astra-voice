@@ -194,7 +194,7 @@ Column {
                 objectName: "aboutOpenLicense"
                 small: true
                 iconName: "file"
-                text: qsTr("Открыть LICENSE")
+                text: qsTr("Лицензия программы")
                 enabled: root.about !== null && root.about.licenseAvailable
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: { if (root.about) root.about.openLicense(); }
@@ -211,7 +211,7 @@ Column {
                 objectName: "aboutOpenNotice"
                 small: true
                 iconName: "file"
-                text: qsTr("NOTICE")
+                text: qsTr("Лицензии компонентов")
                 enabled: root.about !== null && root.about.noticeAvailable
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: { if (root.about) root.about.openNotice(); }
@@ -228,7 +228,7 @@ Column {
                 objectName: "aboutOpenPrivacy"
                 small: true
                 iconName: "shield"
-                text: qsTr("PRIVACY")
+                text: qsTr("Приватность")
                 enabled: root.about !== null && root.about.privacyAvailable
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: { if (root.about) root.about.openPrivacy(); }
