@@ -877,7 +877,9 @@ def main(argv: list[str] | None = None) -> int:
         model = None
         try:
             model = ModelService(settings, policy)
-        except Exception:  # noqa: BLE001 — каталог не должен мешать запуску окна
+        except Exception as exc:  # noqa: BLE001 — каталог не должен мешать запуску окна
+            if getattr(exc, "code", None) == "clock-behind":  # У92/T-116
+                log.warning("Каталог моделей не принят: часы компьютера отстают")
             log.warning("Не удалось подготовить каталог моделей, настройка продолжится без него")
         revoked_check = _revoked_check(model)
         try:

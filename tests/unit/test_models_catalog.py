@@ -24,7 +24,7 @@ import requests
 
 from astra_voice.models import catalog as catalog_module
 from astra_voice.models.catalog import CatalogError, load_builtin
-from astra_voice.security.verify import Verifier, VerifyResult
+from astra_voice.security.verify import CLOCK_BEHIND, Verifier, VerifyResult
 
 pytestmark = pytest.mark.unit
 
@@ -512,6 +512,16 @@ def test_signature_checked_before_json(
 
 def test_verifier_refusal(catalog_root: Path) -> None:
     assert_rejected(catalog_root, "bad-signature", StubVerifier(ok=False))
+
+
+def test_clock_behind_reason_passed(catalog_root: Path) -> None:
+    """T-116 (У92): причина «часы отстают» не теряется в общем отказе подписи."""
+    verifier = StubVerifier(ok=False)
+    verifier.result = VerifyResult(ok=False, reason="часы отстают", code=CLOCK_BEHIND)
+    with pytest.raises(CatalogError) as error:
+        load_builtin(verifier, root=catalog_root)
+    assert error.value.code == "clock-behind"
+    assert "часы компьютера отстают" in error.value.message
 
 
 def test_too_large_before_json(catalog_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:

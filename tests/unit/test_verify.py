@@ -10,6 +10,8 @@ import hashlib
 import os
 import shutil
 import subprocess
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import Mock, call
 
@@ -288,3 +290,155 @@ def test_sha256sums_path_in_name_rejected(env: dict[str, object], tmp_path: Path
 def test_bad_purpose_rejected(env: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         Verifier("whatever", Path(str(env["keyring"])), frozenset(), frozenset())  # type: ignore[arg-type]
+
+
+# -- T-116 (У92): часы компьютера раньше даты создания ключа --------------------
+
+_FUTURE_S = 400 * 86400
+
+
+@pytest.fixture(scope="module")
+def future(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, object]]:
+    """Ключ и подпись «из будущего»: `--faked-system-time` во временном GNUPGHOME."""
+    root = tmp_path_factory.mktemp("future")
+    gpg = _Gpg(root / "gnupg")
+    faked = f"{int(time.time()) + _FUTURE_S}!"
+    uid = "Astra Voice Future Key <future@test.invalid>"
+    gpg._run("--faked-system-time", faked, "--quick-gen-key", uid, "ed25519", "sign", "never")
+    out = gpg._run("--list-keys", "--with-colons", uid).stdout
+    fpr = next(line.split(":")[9] for line in out.splitlines() if line.startswith("fpr:"))
+    data = root / "catalog.json"
+    data.write_text("{}\n", encoding="utf-8")
+    sig = root / "catalog.json.sig"
+    gpg._run(
+        "--faked-system-time",
+        faked,
+        "--detach-sign",
+        "--local-user",
+        fpr + "!",
+        "--output",
+        str(sig),
+        str(data),
+    )
+    yield {
+        "root": root,
+        "fpr": fpr,
+        "data": data,
+        "sig": sig,
+        "keyring": gpg.export(uid, root / "future.gpg"),
+    }
+    # Агент, поднятый gpg для временного каталога, не должен пережить тесты.
+    subprocess.run(
+        ["gpgconf", "--homedir", str(gpg.home), "--kill", "gpg-agent"],
+        capture_output=True,
+        check=False,
+    )
+
+
+def _spy_argv(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    calls: list[list[str]] = []
+    original = subprocess.run
+
+    def spy(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        return original(argv, **kwargs)  # type: ignore[call-overload,no-any-return]
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    return calls
+
+
+def test_key_from_future_reports_clock_behind(
+    future: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _spy_argv(monkeypatch)
+    verifier = Verifier(
+        "catalog", keyring=Path(str(future["keyring"])), pinned=frozenset({str(future["fpr"])})
+    )
+    res = verifier.verify_detached(Path(str(future["data"])), Path(str(future["sig"])))
+    assert not res.ok
+    assert res.code == verify.CLOCK_BEHIND
+    assert "часы отстают" in res.reason
+    assert any(line.startswith("ERRSIG ") for line in res.status)
+    assert len(calls) == 1
+    assert calls[0][0] == str(verify.GPGV_PATH)
+    assert "--ignore-time-conflict" not in calls[0]
+    assert not any(arg.startswith("--ignore") or "faked" in arg for arg in calls[0])
+
+
+def test_future_signature_is_compared_with_clock(future: dict[str, object]) -> None:
+    """Если часы проверяльщика впереди подписи, причина — обычный отказ gpgv."""
+    verifier = Verifier(
+        "catalog",
+        keyring=Path(str(future["keyring"])),
+        pinned=frozenset({str(future["fpr"])}),
+        clock=lambda: time.time() + 2 * _FUTURE_S,
+    )
+    res = verifier.verify_detached(Path(str(future["data"])), Path(str(future["sig"])))
+    assert not res.ok
+    assert res.code == ""
+    assert "часы" not in res.reason
+
+
+def test_unknown_future_key_is_not_clock_behind(
+    env: dict[str, object], future: dict[str, object]
+) -> None:
+    """Ключа нет в связке (ERRSIG с кодом 9): дата подписи о часах не говорит."""
+    res = _verifier(env).verify_detached(Path(str(future["data"])), Path(str(future["sig"])))
+    assert not res.ok
+    assert res.code == ""
+
+
+@pytest.mark.parametrize(
+    ("line", "clock_behind"),
+    [
+        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 {future} 6 {fpr}", True),
+        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 {future} 6", True),
+        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 {past} 6 {fpr}", False),
+        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 {future} 9 -", False),
+        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 {future} 4 -", False),
+        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00 20271103T094325 6 {fpr}", False),
+        ("[GNUPG:] ERRSIG 99806982213FFEC7 22 8 00", False),
+        ("[GNUPG:] BADSIG 99806982213FFEC7 {future}", False),
+    ],
+)
+def test_errsig_status_parsing(
+    env: dict[str, object], tmp_path: Path, line: str, clock_behind: bool
+) -> None:
+    now = int(time.time())
+    text = line.format(future=now + 86400, past=now - 86400, fpr="A" * 40)
+    fake = tmp_path / "fake-gpgv-errsig"
+    fake.write_text(f"#!/bin/sh\necho '{text}'\nexit 2\n", encoding="utf-8")
+    fake.chmod(0o755)
+    res = _verifier(env, gpgv_path=fake).verify_detached(
+        Path(str(env["data"])), Path(str(env["sig_release"]))
+    )
+    assert not res.ok
+    assert (res.code == verify.CLOCK_BEHIND) is clock_behind
+
+
+def test_errsig_with_zero_exit_is_not_accepted(env: dict[str, object], tmp_path: Path) -> None:
+    fake = tmp_path / "fake-gpgv-errsig-0"
+    fake.write_text(
+        f"#!/bin/sh\necho '[GNUPG:] ERRSIG 1 22 8 00 {int(time.time()) + 86400} 6'\nexit 0\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    res = _verifier(env, gpgv_path=fake).verify_detached(
+        Path(str(env["data"])), Path(str(env["sig_release"]))
+    )
+    assert not res.ok and "VALIDSIG" in res.reason
+
+
+def test_load_builtin_passes_clock_behind(future: dict[str, object], tmp_path: Path) -> None:
+    """Встроенный каталог: причина «часы отстают» доходит до CatalogError."""
+    from astra_voice.models.catalog import CatalogError, load_builtin
+
+    (tmp_path / "catalog.json").write_bytes(Path(str(future["data"])).read_bytes())
+    (tmp_path / "catalog.json.sig").write_bytes(Path(str(future["sig"])).read_bytes())
+    verifier = Verifier(
+        "catalog", keyring=Path(str(future["keyring"])), pinned=frozenset({str(future["fpr"])})
+    )
+    with pytest.raises(CatalogError) as error:
+        load_builtin(verifier, root=tmp_path)
+    assert error.value.code == "clock-behind"
+    assert "часы компьютера отстают" in error.value.message

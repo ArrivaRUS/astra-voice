@@ -15,7 +15,10 @@
   позволяет плановую ротацию подключей без правки кода (`docs/SECURITY.md`);
 * `--homedir` — на пустой временный каталог: у `gpgv` не должно быть доступа
   ни к какому состоянию пользователя;
-* `subprocess` без `shell=True`, argv фиксирован, окружение обнулено.
+* `subprocess` без `shell=True`, argv фиксирован, окружение обнулено;
+* `--ignore-time-conflict` не передаётся никогда (У92): ключ «из будущего»
+  относительно часов компьютера — отказ, но с понятной причиной
+  :data:`CLOCK_BEHIND` («часы отстают») вместо безымянного отказа подписи.
 """
 
 from __future__ import annotations
@@ -26,12 +29,15 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, Literal
 
 __all__ = [
+    "CLOCK_BEHIND",
     "GPGV_PATH",
     "PINNED_FINGERPRINTS",
     "REVOKED_FINGERPRINTS",
@@ -58,8 +64,15 @@ PINNED_FINGERPRINTS: Final[frozenset[str]] = frozenset(
 #: Отозванные отпечатки. Проверяются раньше пина: пересечение = отказ.
 REVOKED_FINGERPRINTS: Final[frozenset[str]] = frozenset()
 
+#: Код отказа: подпись датирована позже часов компьютера (У92, T-116).
+CLOCK_BEHIND: Final = "clock-behind"
+
 _STATUS_PREFIX: Final = "[GNUPG:] "
 _VALIDSIG: Final = "VALIDSIG"
+_ERRSIG: Final = "ERRSIG"
+#: Коды ERRSIG, при которых дата подписи ничего не говорит о часах:
+#: неизвестный алгоритм (4) и отсутствующий ключ (9).
+_ERRSIG_UNRELATED_RC: Final = frozenset({"4", "9"})
 _FPR_RE: Final = re.compile(r"\A[0-9A-F]{40}\Z")
 _SUMS_LINE_RE: Final = re.compile(r"\A(?P<hex>[0-9a-f]{64}) [ *](?P<name>[^\n]+)\Z")
 
@@ -76,6 +89,8 @@ class VerifyResult:
     ok: bool
     reason: str = ""
     purpose: Purpose | None = None
+    #: Стабильный код причины для интерфейса; пустой — обычный отказ.
+    code: str = ""
     #: Отпечаток подписавшего (под)ключа из `VALIDSIG`.
     fingerprint: str | None = None
     #: Отпечаток первичного ключа (последнее поле `VALIDSIG`).
@@ -122,6 +137,7 @@ class Verifier:
         revoked: frozenset[str] = REVOKED_FINGERPRINTS,
         *,
         gpgv_path: Path = GPGV_PATH,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if purpose not in ("release", "catalog"):
             raise ValueError(f"неизвестная цель проверки: {purpose!r}")
@@ -130,6 +146,7 @@ class Verifier:
         self.pinned = frozenset(f.upper() for f in pinned)
         self.revoked = frozenset(f.upper() for f in revoked)
         self.gpgv_path = Path(gpgv_path)
+        self._clock = clock
         bad = {f for f in self.pinned | self.revoked if not _FPR_RE.match(f)}
         if bad:
             raise ValueError(f"отпечаток не в формате 40 hex: {sorted(bad)}")
@@ -186,6 +203,15 @@ class Verifier:
         valid = [line.split() for line in status if line.split()[:1] == [_VALIDSIG]]
 
         if proc.returncode != 0:
+            signed_at = self._future_signature(status)
+            if signed_at is not None:
+                moment = datetime.fromtimestamp(signed_at, UTC).strftime("%Y-%m-%d %H:%M")
+                return self._fail(
+                    f"часы отстают: подпись датирована {moment} UTC, это позже времени "
+                    "компьютера — проверьте дату и время",
+                    status,
+                    code=CLOCK_BEHIND,
+                )
             return self._fail(f"gpgv отверг подпись (код {proc.returncode})", status)
         if not valid:
             # Сюда попадает и «GOODSIG без VALIDSIG»: доверяем только VALIDSIG.
@@ -269,6 +295,27 @@ class Verifier:
 
     # -- служебное --------------------------------------------------------
 
+    def _future_signature(self, status: tuple[str, ...]) -> int | None:
+        """Дата подписи из ERRSIG, если она позже часов компьютера.
+
+        gpgv 2.2 на ключе, созданном позже текущего времени, отдаёт `ERRSIG`
+        и код 2. Подпись не бывает старше своего ключа, поэтому её дата позже
+        часов — признак отстающих часов (У92). Отказ остаётся отказом, меняется
+        только причина.
+        """
+        now = self._clock()
+        for line in status:
+            fields = line.split()
+            # ERRSIG <keyid> <pkalgo> <hashalgo> <class> <time> <rc> [<fpr>]
+            if fields[:1] != [_ERRSIG] or len(fields) < 7:
+                continue
+            signed, rc = fields[5], fields[6]
+            if rc in _ERRSIG_UNRELATED_RC or not signed.isdigit() or len(signed) > 12:
+                continue
+            if int(signed) > now:
+                return int(signed)
+        return None
+
     def _fail(
         self,
         reason: str,
@@ -276,11 +323,13 @@ class Verifier:
         *,
         fpr: str | None = None,
         primary: str | None = None,
+        code: str = "",
     ) -> VerifyResult:
         return VerifyResult(
             ok=False,
             reason=reason,
             purpose=self.purpose,
+            code=code,
             fingerprint=fpr,
             primary_fingerprint=primary,
             status=status,
