@@ -291,7 +291,9 @@ def release(args: argparse.Namespace) -> int:
         if name == sources_name:
             release_sources = _release_sources_module()
             try:
-                streamed[name], count = release_sources.check(path)
+                streamed[name], count = release_sources.check(
+                    path, top=f"astra-voice-{version}-sources"
+                )
                 sources_detail = f"{count} файлов по манифесту"
             except FileNotFoundError:
                 missing.append(name)

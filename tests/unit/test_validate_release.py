@@ -601,7 +601,7 @@ def test_appimage_release_valid(
     assert checks["sha256"]["detail"] == "суммы и покрытие верны"
 
 
-@pytest.mark.parametrize("case", ["missing", "tampered", "sums"])
+@pytest.mark.parametrize("case", ["missing", "tampered", "sums", "garbage", "bad-manifest"])
 def test_appimage_release_needs_sources_archive(
     assets: ReleaseAssets,
     validate: Callable[[list[str]], int],
@@ -616,6 +616,15 @@ def test_appimage_release_needs_sources_archive(
         rewrite_sums(assets)
     elif case == "tampered":
         write_sources(dist / SOURCES, tamper=True)
+        rewrite_sums(assets)
+    elif case == "garbage":
+        (dist / SOURCES).write_bytes(b"\xff\xfe not xz")
+        rewrite_sums(assets)
+    elif case == "bad-manifest":
+        with tarfile.open(dist / SOURCES, "w:xz") as tar:
+            info = tarfile.TarInfo("astra-voice-0.1.0-sources/MANIFEST.txt")
+            info.size = 3
+            tar.addfile(info, io.BytesIO(b"\xff\xfe\n"))
         rewrite_sums(assets)
     else:
         sums = (
@@ -635,6 +644,8 @@ def test_appimage_release_needs_sources_archive(
         assert SOURCES in str(checks["assets"]["detail"])
     if case == "tampered":
         assert checks["sources"]["detail"] == "не совпал с манифестом: README.txt"
+    if case == "bad-manifest":
+        assert checks["sources"]["detail"] == "MANIFEST.txt не в UTF-8"
 
 
 def test_appimage_expected_but_missing(

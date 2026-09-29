@@ -100,6 +100,12 @@ def test_build_is_complete_reproducible_and_checked(
     assert "astra-voice-0.2.0-sources/upstream/qtbase-5.15.19/qtbase-5.15.19.tar.gz" in names
     assert "https://example.invalid/libfuse-3.15.0.tar.gz" in manifest
     assert (member.uid, member.mtime, member.mode) == (0, 1790000000, 0o644)
+    assert rs.check(out, top="astra-voice-0.2.0-sources")[1] == 4
+    with pytest.raises(rs.SourcesError, match="вне каталога astra-voice-0.3.0-sources"):
+        rs.check(out, top="astra-voice-0.3.0-sources")
+    with tarfile.open(out) as tar:
+        readme = tar.extractfile("astra-voice-0.2.0-sources/README.txt").read().decode()  # type: ignore[union-attr]
+    assert "qtbase-5.15.19: https://example.invalid/qtbase-5.15.19.tar.gz" in readme
     code = next(n for n in names if "/astra-voice/" in n)
     with tarfile.open(out) as tar:
         inner = tarfile.open(fileobj=tar.extractfile(code))
@@ -168,6 +174,46 @@ def test_check_rejects(
     path = _archive(tmp_path / "a.tar.xz", members)
     with pytest.raises(rs.SourcesError, match=message):
         rs.check(path)
+
+
+@pytest.mark.parametrize(
+    ("manifest", "message"),
+    [
+        (b"\xff\xfe\n", "MANIFEST.txt не в UTF-8"),
+        (f"{SHA}\t\u00b2\tREADME.txt\tx\n".encode(), "неверная строка манифеста"),
+        (f"{'A' * 64}\t1\tREADME.txt\tx\n".encode(), "неверная строка манифеста"),
+    ],
+)
+def test_check_rejects_malformed_manifest(tmp_path: Path, manifest: bytes, message: str) -> None:
+    """Ревью А: неверные байты и «²» в манифесте — SourcesError, а не трейсбек."""
+    path = _archive(tmp_path / "a.tar.xz", [("t/MANIFEST.txt", manifest), ("t/README.txt", b"r")])
+    with pytest.raises(rs.SourcesError, match=message):
+        rs.check(path)
+
+
+def test_check_rejects_hardlink_and_huge_header(tmp_path: Path) -> None:
+    good = [("t/MANIFEST.txt", _manifest(GOOD))] + [(f"t/{p}", d) for p, d in GOOD.items()]
+    path = tmp_path / "hard.tar.xz"
+    with tarfile.open(path, "w:xz") as tar:
+        for name, data in good:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        link = tarfile.TarInfo("t/link")
+        link.type = tarfile.LNKTYPE
+        link.linkname = "t/README.txt"
+        tar.addfile(link)
+    with pytest.raises(rs.SourcesError, match="не обычный файл: t/link"):
+        rs.check(path)
+    huge = tmp_path / "huge.tar.xz"
+    with tarfile.open(huge, "w:xz", format=tarfile.PAX_FORMAT) as tar:
+        info = tarfile.TarInfo("t/MANIFEST.txt")
+        info.pax_headers = {"comment": "x" * (100 << 10)}
+        manifest = _manifest(GOOD)
+        info.size = len(manifest)
+        tar.addfile(info, io.BytesIO(manifest))
+    with pytest.raises(rs.SourcesError, match="служебный заголовок tar"):
+        rs.check(huge)
 
 
 def test_check_limits_and_symlink(tmp_path: Path) -> None:

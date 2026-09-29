@@ -27,4 +27,4 @@ export SOURCE_DATE_EPOCH
 OUT=$DIST/astra-voice-$VERSION-sources.tar.xz
 python3 "$ROOT/scripts/release_sources.py" build --lock "$ROOT/packaging/appimage.lock" \
     --cache "$CACHE" --root "$ROOT" --version "$VERSION" --out "$OUT"
-python3 "$ROOT/scripts/release_sources.py" check "$OUT"
+python3 "$ROOT/scripts/release_sources.py" check --top "astra-voice-$VERSION-sources" "$OUT"

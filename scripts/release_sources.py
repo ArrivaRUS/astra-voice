@@ -25,6 +25,7 @@ import importlib.util
 import io
 import lzma
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -40,6 +41,18 @@ README = "README.txt"
 #: Предел архива исходников: отдельный от обычных ассетов (16 МиБ) и образов (512 МиБ).
 SOURCES_LIMIT = 1 << 30
 XZ_PRESET: Literal[6] = 6
+#: Предел служебных заголовков tar (pax, длинные имена GNU): больше — отказ до чтения (ревью Г).
+HEADER_LIMIT = 64 << 10
+MANIFEST_LIMIT = 16 << 20
+_SHA_RE = re.compile(r"[0-9a-f]{64}")
+_SIZE_RE = re.compile(r"[0-9]+")
+_HEADER_TYPES = (
+    tarfile.XHDTYPE,
+    tarfile.XGLTYPE,
+    tarfile.SOLARIS_XHDTYPE,
+    tarfile.GNUTYPE_LONGNAME,
+    tarfile.GNUTYPE_LONGLINK,
+)
 
 _README = """Исходный код выпуска Astra Voice {version} (AppImage)
 ====================================================
@@ -49,11 +62,10 @@ astra-voice/   исходники программы — git archive комми�
                (сборщик AppImage, appimage.lock со всеми пинами, ключи проверки
                поставщиков), vendor/patches, инструкции (packaging/appimage/, arch/).
 upstream/      исходники поставляемых сторонних компонентов ровно тех версий, что в
-               образе (закреплены в packaging/appimage.lock, проверены по sha256 и,
-               где есть, по подписи): Python 3.11 (Debian .dsc, orig, debian), Qt
-               5.15.19 (qtbase, qtdeclarative, qtquickcontrols2, qtsvg), PyQt5 5.15.11,
-               загрузчик AppImage type2-runtime и libfuse 3.15.0.
-
+               образе (закреплены в packaging/appimage.lock, проверены по sha256, дереву
+               git или подписи индекса Debian):
+{upstream}
+{pending}
 Сборка образа: packaging/appimage/build.sh --fetch (сеть), затем packaging/appimage/build.sh.
 """
 
@@ -91,8 +103,12 @@ def _digest(path: Path) -> tuple[str, int]:
 
 
 def _git(root: Path, *args: str) -> bytes:
+    options: list[str] = []
+    while args and args[0] == "-c":
+        options += list(args[:2])
+        args = args[2:]
     return subprocess.run(
-        ["git", "-c", f"safe.directory={root}", "-C", str(root), *args],
+        ["git", "-c", f"safe.directory={root}", *options, "-C", str(root), *args],
         capture_output=True,
         check=True,
     ).stdout
@@ -121,10 +137,33 @@ def build(lock_path: Path, cache: Path, root: Path, version: str, out: Path, epo
     if _git(root, "status", "--porcelain", "--untracked-files=no").strip():
         raise SourcesError("рабочее дерево не чистое: архив собирается только из коммита")
     commit = _git(root, "rev-parse", "HEAD").decode().strip()
-    code = _git(root, "archive", "--format=tar", f"--prefix=astra-voice-{version}/", commit)
+    # umask явно: права в архиве не зависят от настроек git машины сборки (ревью, nit).
+    code = _git(
+        root,
+        "-c",
+        "tar.umask=0022",
+        "archive",
+        "--format=tar",
+        f"--prefix=astra-voice-{version}/",
+        commit,
+    )
 
     top = f"astra-voice-{version}-sources"
-    readme = _README.format(version=version, commit=commit).encode()
+    upstream = "\n".join(
+        f"                 {s.id}: {s.url}" for s in sorted(lock.sources, key=lambda s: s.id)
+    )
+    pending = ""
+    if lock.pending_sources:
+        pending = (
+            "\nИсходники НЕ приложены (открытый пункт, packaging/appimage.lock — pending-source):\n"
+        )
+        pending += "\n".join(
+            f"  {p.component} — {p.version}; {p.note}" for p in lock.pending_sources
+        )
+        pending += "\n"
+    readme = _README.format(
+        version=version, commit=commit, upstream=upstream, pending=pending
+    ).encode()
     files: list[tuple[Entry, Path | bytes]] = [
         (Entry(README, hashlib.sha256(readme).hexdigest(), len(readme), "astra-voice"), readme),
         (
@@ -199,8 +238,19 @@ def _members(tar: tarfile.TarFile) -> Iterator[tarfile.TarInfo]:
         yield member
 
 
-def check(path: Path, limit: int = SOURCES_LIMIT) -> tuple[str, int]:
-    """Потоковая проверка архива; вернуть (sha256 архива, число файлов)."""
+class _LimitedTarInfo(tarfile.TarInfo):
+    """Служебные заголовки (pax, длинные имена) больше HEADER_LIMIT — отказ до их чтения."""
+
+    def _proc_member(self, tar: tarfile.TarFile) -> tarfile.TarInfo:
+        if self.type in _HEADER_TYPES and self.size > HEADER_LIMIT:
+            raise SourcesError(f"служебный заголовок tar {self.size} байт больше предела")
+        return super()._proc_member(tar)  # type: ignore[misc,no-any-return]
+
+
+def check(path: Path, limit: int = SOURCES_LIMIT, top: str | None = None) -> tuple[str, int]:
+    """Потоковая проверка архива; вернуть (sha256 архива, число файлов).
+
+    `top` — ожидаемый верхний каталог (`astra-voice-<версия>-sources`)."""
     with _open_regular(path) as raw:
         if os.fstat(raw.fileno()).st_size > limit:
             raise SourcesError("архив больше предела")
@@ -210,20 +260,21 @@ def check(path: Path, limit: int = SOURCES_LIMIT) -> tuple[str, int]:
             # Распаковка своим LZMAFile: tarfile в режиме «r|xz» не замечает обрезанный
             # конец потока xz, а LZMAFile при дочитывании бросает EOFError.
             with lzma.LZMAFile(stream) as unpacked:
-                with tarfile.open(fileobj=unpacked, mode="r|") as tar:
-                    count = _check_members(tar)
+                with tarfile.open(fileobj=unpacked, mode="r|", tarinfo=_LimitedTarInfo) as tar:
+                    count = _check_members(tar, top)
                 while unpacked.read(1 << 20):
                     pass
-        except (tarfile.TarError, EOFError, OSError, lzma.LZMAError) as exc:
+        except (tarfile.TarError, EOFError, OSError, lzma.LZMAError, ValueError) as exc:
+            # ValueError — в том числе UnicodeDecodeError имён: отчёт, а не трейсбек.
             raise SourcesError(f"архив повреждён: {exc}") from None
         while stream.read(1 << 20):  # хвост после конца tar — тоже в sha256
             pass
     return reader.sha.hexdigest(), count
 
 
-def _check_members(tar: tarfile.TarFile) -> int:
+def _check_members(tar: tarfile.TarFile, expected_top: str | None = None) -> int:
     manifest: dict[str, tuple[str, int]] | None = None
-    top: str | None = None
+    top: str | None = expected_top
     seen: set[str] = set()
     for member in _members(tar):
         name = PurePosixPath(member.name)
@@ -241,7 +292,13 @@ def _check_members(tar: tarfile.TarFile) -> int:
         if manifest is None:
             if rel != MANIFEST:
                 raise SourcesError("первым в архиве должен идти MANIFEST.txt")
-            manifest = _parse_manifest(fh.read(16 << 20).decode("utf-8"))
+            if member.size > MANIFEST_LIMIT:
+                raise SourcesError("MANIFEST.txt больше предела")
+            try:
+                text = fh.read(MANIFEST_LIMIT).decode("utf-8")
+            except UnicodeDecodeError:
+                raise SourcesError("MANIFEST.txt не в UTF-8") from None
+            manifest = _parse_manifest(text)
             continue
         if rel in seen:
             raise SourcesError(f"повтор файла: {rel}")
@@ -249,6 +306,8 @@ def _check_members(tar: tarfile.TarFile) -> int:
         expected = manifest.get(rel)
         if expected is None:
             raise SourcesError(f"файла нет в манифесте: {rel}")
+        if member.size != expected[1]:  # до чтения содержимого (ревью Г)
+            raise SourcesError(f"не совпал с манифестом: {rel}")
         h = hashlib.sha256()
         while chunk := fh.read(1 << 20):
             h.update(chunk)
@@ -270,7 +329,8 @@ def _parse_manifest(text: str) -> dict[str, tuple[str, int]]:
     entries: dict[str, tuple[str, int]] = {}
     for line in text.splitlines():
         parts = line.split("\t")
-        if len(parts) != 4 or len(parts[0]) != 64 or not parts[1].isdigit():
+        # Не isdigit(): он пропускает «²» и прочие цифры Unicode (ревью А).
+        if len(parts) != 4 or not _SHA_RE.fullmatch(parts[0]) or not _SIZE_RE.fullmatch(parts[1]):
             raise SourcesError(f"неверная строка манифеста: {line[:80]}")
         if parts[2] in entries:
             raise SourcesError(f"повтор в манифесте: {parts[2]}")
@@ -291,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--out", type=Path, required=True)
     c = sub.add_parser("check")
     c.add_argument("archive", type=Path)
+    c.add_argument("--top", help="ожидаемый верхний каталог (astra-voice-<версия>-sources)")
     args = parser.parse_args(argv)
     try:
         if args.command == "build":
@@ -298,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
             sha = build(args.lock, args.cache, args.root, args.version, args.out, epoch)
             print(f"исходники: {args.out} ({args.out.stat().st_size} байт, sha256 {sha})")
         else:
-            sha, count = check(args.archive)
+            sha, count = check(args.archive, top=args.top)
             print(f"исходники: {count} файлов по манифесту, sha256 {sha}")
     # ValueError — в том числе LockError из lockfile.py.
     except (OSError, ValueError, SourcesError, subprocess.CalledProcessError) as exc:
