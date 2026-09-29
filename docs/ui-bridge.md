@@ -1047,6 +1047,7 @@ AppImage (`$APPDIR`) — задача ветки AppImage. Без моста р�
 | `toggleModel(model_id)` | `string` | Переключить выбор `available` или `failed` без бейджа, в том числе во время очереди |
 | `startSelectedDownloads()` | — | Запустить выбранные записи или добавить новые в конец работающей очереди в порядке каталога |
 | `retryModel(model_id)` | `string` | `failed` добавить в очередь; `paused-no-space` продолжить после проверки места |
+| `retryFailedDownloads()` | — | «Повторить» в полосе загрузки мастера (`downloadState == "failed"`): `retryModel(id)` для каждой записи с `state == "failed"` и `canRetry == true` в порядке каталога; `startSelectedDownloads()` не годится — после неудачи запись выходит из выбора. Тот же слот есть у `settingsBridge` (раздел 3.6) |
 | `cancelModel(model_id)` | `string` | Отменить одну активную модель: в разделе «Модели» удалить её staging, в онбординге сохранить; затем запустить следующую. Для ожидающей равен `dequeueModel` |
 | `dequeueModel(model_id)` | `string` | Убрать ожидающую модель, вернуть `available`, пересчитать счётчики и объём |
 | `cancelDownloads()` | — | Отменить общую очередь или перепроверку, включая проверку/установку; подробности в разделе 4.3 |

@@ -18,7 +18,7 @@ from PyQt5.QtCore import QCoreApplication, QEvent
 
 from astra_voice.core import settings as settings_mod
 from astra_voice.models.downloader import DownloadError
-from astra_voice.ui.bridges import SettingsBridge
+from astra_voice.ui.bridges import OnboardingController, SettingsBridge
 from astra_voice.ui.model_downloads import ModelDownloads
 from helpers.scripted_model_port import FIRST, SECOND, ScriptedModelPort, pump_until
 
@@ -247,3 +247,34 @@ def test_cancel_queued_and_active_cards(live: Live) -> None:
     assert live.bridge.downloadProgress == 0
     assert live.bridge.speed == live.bridge.eta == ""
     assert_gui_thread_only(live)
+
+
+def test_onboarding_strip_retry_repeats_failed_card(live: Live) -> None:
+    """Мастер (шаг 2–5) делит ту же очередь; «Повторить» его полосы — тот же повтор."""
+    settings = settings_mod.Settings(extra={"onboarding_language_set": True})
+    controller = OnboardingController(
+        live.bridge,
+        settings=settings,
+        downloads=live.downloads,
+        device_provider=lambda: [],
+        dialog_factory=lambda: "",
+    )
+    try:
+        live.port.failures[FIRST.id] = DownloadError("timeout")
+        live.port.open_gates()
+        controller.toggleModel(FIRST.id)
+        controller.startSelectedDownloads()
+        pump_until(lambda: controller.downloadState == "failed" and live.idle(), "ошибка в мастере")
+        assert live.card(FIRST.id)["message"] == "Не удалось загрузить модель — сервер не отвечает"
+        # Прежняя кнопка полосы мастера звала «Скачать выбранное» — вхолостую.
+        controller.startSelectedDownloads()
+        assert controller.downloadState == "failed"
+
+        controller.retryFailedDownloads()
+        assert live.state(FIRST.id) == "downloading"
+        pump_until(lambda: controller.downloadState == "done" and live.idle(), "повтор в мастере")
+        assert controller.modelReady
+        assert live.port.download_calls == [FIRST.id, FIRST.id]
+        assert_gui_thread_only(live)
+    finally:
+        controller.shutdown()

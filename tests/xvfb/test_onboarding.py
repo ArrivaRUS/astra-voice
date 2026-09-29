@@ -665,6 +665,10 @@ class FakeOnboarding(QObject):
         self.calls.append("retryModel")
         self.retried_model_ids.append(model_id)
 
+    @pyqtSlot()
+    def retryFailedDownloads(self) -> None:
+        self.calls.append("retryFailedDownloads")
+
     @pyqtSlot(str)
     def cancelModel(self, model_id: str) -> None:
         self.calls.append("cancelModel")

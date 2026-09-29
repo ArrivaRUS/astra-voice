@@ -37,13 +37,13 @@ from PyQt5.QtCore import (
     qInstallMessageHandler,
 )
 from PyQt5.QtQml import QQmlApplicationEngine
-from PyQt5.QtQuick import QQuickWindow
+from PyQt5.QtQuick import QQuickView, QQuickWindow
 from PyQt5.QtTest import QTest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.core import settings as settings_mod
 from astra_voice.models.downloader import DownloadError
-from astra_voice.ui.bridges import SettingsBridge
+from astra_voice.ui.bridges import OnboardingController, SettingsBridge
 from astra_voice.ui.icons import install_icon_provider
 from astra_voice.ui.model_downloads import ModelDownloads
 from helpers.qt_app import get_qapplication  # noqa: E402
@@ -423,3 +423,90 @@ def test_live_cancel_queued_then_active(models_app: Any) -> None:
         assert live.port.discarded == [FIRST.id]
         assert live.port.download_calls == [FIRST.id]
     assert_no_messages(live, "отмена очереди")
+
+
+@contextmanager
+def live_onboarding_window(app: Any) -> Iterator[LiveWindow]:
+    """Настоящий Onboarding.qml на шаге 2 над настоящим контроллером и живой очередью."""
+    port = ScriptedModelPort()
+    downloads = ModelDownloads(port)
+    settings = settings_mod.Settings(extra={"onboarding_language_set": True, "onboarding_step": 2})
+    bridge = SettingsBridge(settings, downloads=downloads, save=Mock(), device_provider=lambda: [])
+    controller = OnboardingController(
+        bridge,
+        settings=settings,
+        downloads=downloads,
+        device_provider=lambda: [],
+        dialog_factory=lambda: "",
+        open_url=lambda _url: False,
+    )
+    live = LiveWindow(port, downloads, bridge)
+
+    def handler(_mode: Any, _context: Any, message: str) -> None:
+        live.messages.append(message)
+
+    previous = qInstallMessageHandler(handler)
+    view = QQuickView()
+    install_icon_provider(view.engine())
+    theme = FakeTheme()
+    try:
+        view.rootContext().setContextProperty("onboarding", controller)
+        view.rootContext().setContextProperty("themeSource", theme)
+        view.setResizeMode(QQuickView.SizeRootObjectToView)
+        view.resize(WIDTH, HEIGHT)
+        view.setSource(QUrl.fromLocalFile(str(REPO / "qml/onboarding/Onboarding.qml")))
+        assert view.status() == QQuickView.Ready, [error.toString() for error in view.errors()]
+        root = view.rootObject()
+        assert root is not None
+        assert root.setProperty("freezeAnimations", True)
+        view.show()
+        QTest.qWait(180)
+        app.processEvents()
+        assert root.property("step") == 2
+        live.window = view
+        QTest.mouseMove(view, QPoint(1, HEIGHT - 2))
+        app.processEvents()
+        yield live
+    finally:
+        port.open_gates()
+        downloads.shutdown()
+        try:
+            live.window = None
+            sip.delete(view)
+            app.processEvents()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            controller.shutdown()
+            sip.delete(controller)
+            sip.delete(bridge)
+            sip.delete(downloads)
+            sip.delete(theme)
+            app.processEvents()
+        finally:
+            qInstallMessageHandler(previous)
+
+
+def test_live_onboarding_strip_retry(models_app: Any) -> None:
+    """Шаг 2 мастера: «Повторить» полосы после ошибки снова качает модель (§10.3, 4)."""
+    with live_onboarding_window(models_app) as live:
+        live.port.failures[FIRST.id] = DownloadError("no-network")
+        live.port.open_gates()
+        click_item(card_item(live, FIRST.id))
+        settle(
+            live,
+            lambda: card_item(live, FIRST.id).property("selected") is True,
+            "отметка карточки в мастере",
+        )
+        # «Продолжить» вдобавок сменил бы шаг; очередь запускаем тем же слотом, что и он.
+        live.downloads.startSelectedDownloads()
+        settle(live, lambda: strip_state(live) == "failed", "ошибка в полосе мастера")
+        strip = strip_item(live)
+        assert strip.property("title") == "Не удалось загрузить модель"
+        assert "Не удалось загрузить модель — нет связи с сервером" in visible_texts(
+            card_item(live, FIRST.id)
+        )
+
+        press(visible_button(strip, "Повторить"))
+        settle(live, lambda: strip_state(live) == "done", "повтор в мастере до готовности")
+        assert strip_item(live).property("title") == "Модель готова"
+        assert live.port.download_calls == [FIRST.id, FIRST.id]
+    assert_no_messages(live, "повтор из полосы мастера")

@@ -219,7 +219,9 @@ Item {
         eta: root.bridge ? root.bridge.eta : ""
         detail: root.bridge ? root.bridge.downloadDetail : ""
         freezeAnimations: root.freezeAnimations
-        onRetryRequested: { if (root.bridge) root.bridge.startSelectedDownloads(); }
+        // После неудачи запись выходит из выбора: «Продолжить» её уже не скачает,
+        // поэтому полоса повторяет именно записи с ошибкой (§10.3, состояние 4).
+        onRetryRequested: { if (root.bridge) root.bridge.retryFailedDownloads(); }
         onOpenFolderRequested: { if (root.bridge) root.bridge.openModelsFolder(); }
     }
 
