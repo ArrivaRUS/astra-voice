@@ -8,6 +8,7 @@
     tools/validate catalog --all --json
     tools/validate catalog --switch --from ID@REV --to ID@REV
     tools/validate release --version 0.1.0 --dir dist/ --json
+    tools/validate autostart [--check-installed] --json
 
 Коды возврата: 0 — уложились, 1 — нарушен критерий, 2 — прогон невозможен.
 Проверяется интервал record.cancel → cancelled, а не остановка всех вызовов ORT.
@@ -19,6 +20,7 @@ import argparse
 import errno
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -34,6 +36,7 @@ import wave
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -932,8 +935,9 @@ def network_report(
             print(note)
         for check in checks:
             result = "совпало" if check["passed"] else "НЕ СОВПАЛО"
+            title = f" ({check['title']})" if check.get("title") else ""
             print(
-                f"{check['name']}: ожидание — {check['expected']}; "
+                f"{check['name']}{title}: ожидание — {check['expected']}; "
                 f"факт — {check['actual']}; вердикт — {result}."
             )
         print(f"Итог: {passed}/{len(checks)}; {verdict}; код {code}.")
@@ -942,22 +946,267 @@ def network_report(
     return code
 
 
+DOWNLOAD_CORP_HOST = "corp.validate.test"
+DOWNLOAD_CORP_BASE = f"https://{DOWNLOAD_CORP_HOST}"
+# Хост источника → префикс пути на локальном сервере. Имена хостов настоящие, чтобы
+# Downloader сам определил вид источника (hf/github/corp); наружу запрос не уходит.
+DOWNLOAD_PREFIXES = {"huggingface.co": "hf", "github.com": "gh", DOWNLOAD_CORP_HOST: "corp"}
+DOWNLOAD_PUBLIC_HOSTS = {"hf": "huggingface.co", "gh": "github.com"}
+DOWNLOAD_429_RETRY_AFTER_S = 30
+DOWNLOAD_429_LIMIT_S = 5.0
+# Второй файл допустимой раскладки onnx-asr-t-one/t-one-ctc: установщик доходит
+# до сверки байт model.onnx, а не отказывает из-за раскладки.
+DOWNLOAD_CONFIG = b'{"model_type": "t-one"}\n'
+
+
+@dataclass(frozen=True)
+class DownloadScenario:
+    """Сценарий сервера-вредителя: поведение источников в порядке каталога и ожидания.
+
+    Поведения источника: ok (Range → 206), cut (всегда обрыв на половине), cut-once
+    (обрыв только в первом ответе), no-range-once (обрыв, затем 200 без учёта Range),
+    bad-range-once (обрыв, затем на Range — 206 с чужим Content-Range и всем файлом),
+    cut-tampered-once (обрыв на половине чужих байт, затем как ok), tampered (те же
+    размер и Range, другие байты), oversize (лишний байт), 404, 503, 429 (с Retry-After),
+    redirect-evil (302 на чужой хост). tone — запись в раскладке onnx-asr-t-one:
+    config.json (всегда верный) и model.onnx вместо одного model.bin.
+    """
+
+    name: str
+    title: str
+    sources: tuple[tuple[str, str], ...]
+    code: str
+    requests: tuple[tuple[str, str | None, int], ...]
+    kinds: tuple[str, ...]
+    first_code: str = ""
+    disk: str = ""
+    keep_part: bool = False
+    drop_part: bool = False
+    install_refused: bool = False
+    tone: bool = False
+    part_source: str = "body"
+
+
+def _half_range(half: int) -> str:
+    return f"bytes={half}-"
+
+
+def download_scenarios(half: int) -> tuple[DownloadScenario, ...]:
+    """Сценарии полного прогона; half — размер части до обрыва."""
+    cut = _half_range(half)
+    return (
+        DownloadScenario(
+            "ok", "обычная загрузка", (("hf", "ok"),), "ok", (("hf", None, 200),), ("hf",)
+        ),
+        DownloadScenario(
+            "fallback-hf-github",
+            "hf не отвечает (503) → github",
+            (("hf", "503"), ("gh", "ok")),
+            "ok",
+            (("hf", None, 503), ("gh", None, 200)),
+            ("hf", "github"),
+        ),
+        DownloadScenario(
+            "fallback-corp-hf-github",
+            "задан corp_base: corp (503) → hf (503) → github",
+            (("corp", "503"), ("hf", "503"), ("gh", "ok")),
+            "ok",
+            (("corp", None, 503), ("hf", None, 503), ("gh", None, 200)),
+            ("corp", "hf", "github"),
+        ),
+        DownloadScenario(
+            "http-429",
+            f"hf 429 с Retry-After {DOWNLOAD_429_RETRY_AFTER_S} с → github без ожидания и повтора",
+            (("hf", "429"), ("gh", "ok")),
+            "ok",
+            (("hf", None, 429), ("gh", None, 200)),
+            ("hf", "github"),
+        ),
+        DownloadScenario(
+            "http-404",
+            "hf 404 → github",
+            (("hf", "404"), ("gh", "ok")),
+            "ok",
+            (("hf", None, 404), ("gh", None, 200)),
+            ("hf", "github"),
+        ),
+        DownloadScenario(
+            "all-sources-fail",
+            "hf 404 и github 429 → отказ, файл не появился",
+            (("hf", "404"), ("gh", "429")),
+            "bad-status",
+            (("hf", None, 404), ("gh", None, 429)),
+            ("hf", "github"),
+        ),
+        DownloadScenario(
+            "size-plus-one",
+            "размер+1: сервер прислал лишний байт",
+            (("hf", "oversize"),),
+            "too-large",
+            (("hf", None, 200),),
+            ("hf",),
+            drop_part=True,
+        ),
+        DownloadScenario(
+            "resume-range",
+            "обрыв на половине, повтор докачивает Range → 206",
+            (("hf", "cut-once"),),
+            "ok",
+            (("hf", None, 200), ("hf", cut, 206)),
+            ("hf", "hf"),
+            first_code="short-read",
+            keep_part=True,
+        ),
+        DownloadScenario(
+            "resume-mirror",
+            "обрыв hf на половине → github докачивает Range → 206",
+            (("hf", "cut"), ("gh", "ok")),
+            "ok",
+            (("hf", None, 200), ("gh", cut, 206)),
+            ("hf", "github"),
+        ),
+        DownloadScenario(
+            "no-range-200",
+            "обрыв, сервер не умеет Range (200) → загрузка с начала",
+            (("hf", "no-range-once"),),
+            "ok",
+            (("hf", None, 200), ("hf", cut, 200)),
+            ("hf", "hf"),
+            first_code="short-read",
+            keep_part=True,
+        ),
+        DownloadScenario(
+            "range-foreign",
+            "обрыв, затем 206 с чужим Content-Range → докачка отвергнута, загрузка с начала",
+            (("hf", "bad-range-once"),),
+            "ok",
+            (("hf", None, 200), ("hf", cut, 206), ("hf", None, 200)),
+            ("hf", "hf"),
+            first_code="short-read",
+            keep_part=True,
+        ),
+        DownloadScenario(
+            "resume-bad-sum",
+            "после докачки сумма неверна → один повтор того же источника с нуля",
+            (("hf", "cut-tampered-once"),),
+            "ok",
+            (("hf", None, 200), ("hf", cut, 206), ("hf", None, 200)),
+            ("hf", "hf"),
+            first_code="short-read",
+            keep_part=True,
+            part_source="tampered",
+        ),
+        DownloadScenario(
+            "truncated",
+            "обрыв у единственного источника",
+            (("hf", "cut"),),
+            "short-read",
+            (("hf", None, 200),),
+            ("hf",),
+            keep_part=True,
+        ),
+        DownloadScenario(
+            "mirror-bytes-differ",
+            "оба зеркала отдают другие байты того же размера → отказ sha256 и установки",
+            (("hf", "tampered"), ("gh", "tampered")),
+            "bad-checksum",
+            (("hf", None, 200), ("gh", None, 200)),
+            ("hf", "hf", "github"),
+            drop_part=True,
+            install_refused=True,
+            tone=True,
+        ),
+        DownloadScenario(
+            "mirror-bytes-recover",
+            "hf отдаёт другие байты → github отдаёт верные",
+            (("hf", "tampered"), ("gh", "ok")),
+            "ok",
+            (("hf", None, 200), ("gh", None, 200)),
+            ("hf", "github"),
+        ),
+        DownloadScenario(
+            "no-space-before",
+            "нет места до начала: ни одного запроса",
+            (("hf", "ok"), ("gh", "ok")),
+            "disk-full",
+            (),
+            (),
+            disk="before",
+        ),
+        DownloadScenario(
+            "no-space-during",
+            "место кончилось во время загрузки → пауза, «Повторить» докачивает",
+            (("hf", "ok"), ("gh", "ok")),
+            "ok",
+            (("hf", None, 200), ("hf", None, 200)),
+            ("hf", "hf"),
+            first_code="disk-full",
+            disk="during",
+        ),
+        DownloadScenario(
+            "no-space-enospc",
+            "запись вернула ENOSPC → пауза с .part, «Повторить» докачивает Range",
+            (("hf", "ok"), ("gh", "ok")),
+            "ok",
+            (("hf", None, 200), ("hf", cut, 206)),
+            ("hf", "hf"),
+            first_code="disk-full",
+            disk="enospc",
+            keep_part=True,
+        ),
+        DownloadScenario(
+            "redirect-evil",
+            "302 на чужой хост → отказ без обращения к нему",
+            (("hf", "redirect-evil"),),
+            "bad-status",
+            (("hf", None, 302),),
+            ("hf",),
+        ),
+    )
+
+
+class NoSpaceStream:
+    """Файл .part, у которого после budget байт запись отвечает ENOSPC."""
+
+    def __init__(self, stream: Any, budget: int) -> None:
+        self._stream = stream
+        self._left = budget
+
+    def write(self, data: bytes) -> int:
+        if len(data) > self._left:
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        self._left -= len(data)
+        return int(self._stream.write(data))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+    def __enter__(self) -> NoSpaceStream:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stream.close()
+
+
 def downloads(args: argparse.Namespace) -> int:
-    """Проверяет настоящий Downloader на локальном сервере с повреждёнными ответами."""
+    """Проверяет настоящий Downloader на локальном сервере-вредителе с несколькими источниками."""
     checks: list[Message] = []
     notes = [
-        "Способ: настоящий Downloader и TCP-сервер на 127.0.0.1, случайный порт.",
-        "Байты считаются на выходе настоящего StreamResponse.iter_chunks; "
-        "внешний транспорт перехватывается до DNS и соединения.",
+        "Способ: настоящий Downloader и HTTP-сервер на 127.0.0.1, случайный порт.",
+        "Источники huggingface.co, github.com и corp переводятся на пути этого сервера; "
+        "любой другой адрес перехватывается до DNS и соединения.",
+        "Байты считаются на выходе настоящего StreamResponse.iter_chunks.",
+        "«Нет места» эмулируется подменой проверки места и ENOSPC при записи, диск не заполняется.",
     ]
     try:
         import requests
 
         from astra_voice.models.catalog import CatalogEntry, FileSpec
         from astra_voice.models.downloader import Downloader, DownloadError
+        from astra_voice.models.installer import Installer, SmokeResult
         from astra_voice.models.store import ModelStore
         from astra_voice.net import http
-        from astra_voice.net.gate import NetworkGate, NetworkKind
+        from astra_voice.net.gate import NetworkGate
         from astra_voice.net.http import HttpClient, NetworkError, StreamResponse
     except ImportError as exc:
         return network_report(args, checks, notes, f"Не удалось загрузить зависимости: {exc}")
@@ -965,48 +1214,86 @@ def downloads(args: argparse.Namespace) -> int:
     # Половина кратна блоку Downloader: обрыв оставляет уже прочитанные данные на диске.
     body = bytes(range(256)) * 512
     size, half = len(body), len(body) // 2
+    tampered = bytes(byte ^ 255 for byte in body)
     digest = hashlib.sha256(body).hexdigest()
-    seen: list[tuple[str, str | None, int]] = []
+    scenarios = download_scenarios(half)
+    behaviours = {
+        (prefix, scenario.name): behaviour
+        for scenario in scenarios
+        for prefix, behaviour in scenario.sources
+    }
+    seen: list[tuple[str, str, str | None, int]] = []
+    seen_lock = threading.Lock()
     bytes_read = 0
     foreign_attempts = 0
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            mode = self.path.removeprefix("/")
+            # /<источник>/<сценарий>/<файл> или /corp/<сценарий>/<ревизия>/<файл>
+            parts = self.path.split("/")
+            prefix, name = (parts[1], parts[2]) if len(parts) > 3 else ("", "")
+            if parts[-1] == "config.json":
+                # Служебный файл раскладки t-one всегда верный и в журнал не идёт.
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(DOWNLOAD_CONFIG)))
+                self.end_headers()
+                self.wfile.write(DOWNLOAD_CONFIG)
+                return
+            behaviour = behaviours.get((prefix, name), "404")
             range_header = self.headers.get("Range")
-            first = not any(path == self.path for path, _, _ in seen)
-            interrupted = mode == "truncated" or (mode in {"resume-206", "no-range-200"} and first)
-            payload, status = body, 200
+            with seen_lock:
+                first = not any(item[:2] == (prefix, name) for item in seen)
+            interrupted = behaviour == "cut" or (
+                behaviour in {"cut-once", "no-range-once", "bad-range-once", "cut-tampered-once"}
+                and first
+            )
+            source = (
+                tampered
+                if behaviour == "tampered" or (behaviour == "cut-tampered-once" and first)
+                else body
+            )
+            payload, status = source, 200
             headers: dict[str, str] = {}
-            if mode == "redirect-evil":
+            if behaviour in {"404", "503", "429"}:
+                payload, status = b"", int(behaviour)
+                if behaviour == "429":
+                    headers["Retry-After"] = str(DOWNLOAD_429_RETRY_AFTER_S)
+            elif behaviour == "redirect-evil":
                 payload, status = b"", 302
                 headers["Location"] = "https://evil.example/model.bin"
-            elif mode == "tampered":
-                payload = bytes(byte ^ 255 for byte in body)
-            elif mode == "oversize":
+            elif behaviour == "oversize":
                 payload = body + b"!"
-            elif mode == "resume-206" and range_header is not None:
+            elif behaviour == "bad-range-once" and range_header is not None and not interrupted:
+                # Чужой диапазон: весь файл с начала вместо запрошенного хвоста.
+                status = 206
+                headers["Content-Range"] = f"bytes 0-{size - 1}/{size}"
+            elif (
+                behaviour in {"ok", "cut-once", "tampered", "cut-tampered-once"}
+                and range_header is not None
+                and not interrupted
+            ):
                 offset = int(range_header.removeprefix("bytes=").removesuffix("-"))
-                payload, status = body[offset:], 206
+                payload, status = source[offset:], 206
                 headers["Content-Range"] = f"bytes {offset}-{size - 1}/{size}"
-            seen.append((self.path, range_header, status))
+            with seen_lock:
+                seen.append((prefix, name, range_header, status))
             try:
                 self.send_response(status)
                 self.send_header(
-                    "Content-Length", str(size if mode == "oversize" else len(payload))
+                    "Content-Length", str(size if behaviour == "oversize" else len(payload))
                 )
-                if interrupted or mode == "oversize":
+                if interrupted or behaviour == "oversize":
                     self.send_header("Transfer-Encoding", "chunked")
-                for name, value in headers.items():
-                    self.send_header(name, value)
+                for key, value in headers.items():
+                    self.send_header(key, value)
                 self.end_headers()
                 if interrupted:
-                    prefix = payload[:half]
-                    self.wfile.write(f"{len(prefix):x}\r\n".encode() + prefix + b"\r\n")
+                    prefix_bytes = payload[:half]
+                    self.wfile.write(f"{len(prefix_bytes):x}\r\n".encode() + prefix_bytes + b"\r\n")
                     self.wfile.flush()
                     # Нет завершающего chunk: urllib3 1.26 тоже видит обрыв.
                     self.close_connection = True
-                elif mode == "oversize":
+                elif behaviour == "oversize":
                     self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n")
                 else:
                     self.wfile.write(payload)
@@ -1018,6 +1305,7 @@ def downloads(args: argparse.Namespace) -> int:
 
     original_send = requests.adapters.HTTPAdapter.send
     original_chunks = StreamResponse.iter_chunks
+    original_open = Path.open
 
     def local_send(
         self: requests.adapters.HTTPAdapter, request: requests.PreparedRequest, **kwargs: Any
@@ -1037,26 +1325,17 @@ def downloads(args: argparse.Namespace) -> int:
             yield block
 
     class LocalHttpClient(HttpClient):
-        def get_stream(
-            self,
-            url: str,
-            *,
-            range_from: int | None = None,
-            deadline_s: float,
-            cancel: threading.Event,
-            kind: NetworkKind = "download",
-        ) -> StreamResponse:
-            # Downloader собирает HTTPS; только адрес этого сервера переводим в HTTP.
-            prefix = f"https://{local_host}/"
-            if url.startswith(prefix):
-                url = "http://" + url.removeprefix("https://")
-            return super().get_stream(
-                url,
-                range_from=range_from,
-                deadline_s=min(deadline_s, 5),
-                cancel=cancel,
-                kind=kind,
-            )
+        def get_stream(self, url: str, **kwargs: Any) -> StreamResponse:
+            # Downloader собирает HTTPS-адреса настоящих источников; переводим их на
+            # пути локального сервера, остальные параметры передаём как есть.
+            parts = urlsplit(url)
+            prefix = DOWNLOAD_PREFIXES.get(parts.netloc)
+            if prefix is not None:
+                url = f"http://{local_host}/{prefix}{parts.path}"
+            kwargs["deadline_s"] = min(float(kwargs["deadline_s"]), 5.0)
+            if kwargs.get("idle_timeout_s") is not None:
+                kwargs["idle_timeout_s"] = min(float(kwargs["idle_timeout_s"]), 5.0)
+            return super().get_stream(url, **kwargs)
 
     server: ThreadingHTTPServer | None = None
     thread: threading.Thread | None = None
@@ -1084,96 +1363,192 @@ def downloads(args: argparse.Namespace) -> int:
             patch.object(StreamResponse, "iter_chunks", counted_chunks),
         ):
             store = ModelStore(Path(directory) / "models")
-            if not store.disk_ok(size):
+            if not store.disk_ok(size * 4):
                 raise RuntimeError("Недостаточно свободного места для прогона.")
             client = LocalHttpClient(
-                NetworkGate(settings.Settings(), policy.Policy()), user_agent="Astra-Voice/validate"
+                NetworkGate(settings.Settings(), policy.Policy()),
+                user_agent="Astra-Voice/validate",
+                extra_hosts=(local_host,),
             )
-            loader = Downloader(client, store)
 
-            def attempt(entry: CatalogEntry) -> str:
+            def attempt(
+                loader: Downloader, entry: CatalogEntry, part: Path, kinds: list[str], fault: str
+            ) -> str:
+                disk_answers = iter([True])
+
+                def open_part(path: Path, mode: str = "r", *rest: Any, **kw: Any) -> Any:
+                    stream = original_open(path, mode, *rest, **kw)
+                    if path == part and "+" in mode:
+                        return NoSpaceStream(stream, half)
+                    return stream
+
+                faults: list[Any] = []
+                if fault == "before":
+                    faults.append(patch.object(store, "disk_ok", lambda size: False))
+                elif fault == "during":
+                    # Первая проверка — до запроса, вторая — перед записью первого блока.
+                    faults.append(
+                        patch.object(store, "disk_ok", lambda size: next(disk_answers, False))
+                    )
+                elif fault == "enospc":
+                    faults.append(patch.object(Path, "open", open_part))
+                for item in faults:
+                    item.start()
                 try:
-                    loader.download(entry, progress=lambda state: None, cancel=threading.Event())
+                    loader.download(
+                        entry,
+                        progress=lambda state: None,
+                        cancel=threading.Event(),
+                        source=kinds.append,
+                    )
                 except DownloadError as exc:
                     return exc.code
+                finally:
+                    for item in reversed(faults):
+                        item.stop()
                 return "ok"
 
-            for mode in (
-                "ok",
-                "resume-206",
-                "no-range-200",
-                "truncated",
-                "tampered",
-                "oversize",
-                "redirect-evil",
-            ):
+            for scenario in scenarios:
+                prefixes = [prefix for prefix, _ in scenario.sources]
+                public = [DOWNLOAD_PUBLIC_HOSTS[prefix] for prefix in prefixes if prefix != "corp"]
+                model_name = "model.onnx" if scenario.tone else "model.bin"
+                files = (FileSpec(model_name, digest, size, f"/{scenario.name}/{model_name}"),)
+                if scenario.tone:
+                    config = FileSpec(
+                        "config.json",
+                        hashlib.sha256(DOWNLOAD_CONFIG).hexdigest(),
+                        len(DOWNLOAD_CONFIG),
+                        f"/{scenario.name}/config.json",
+                    )
+                    files = (config, *files)
                 entry = CatalogEntry(
-                    id=mode,
+                    id=scenario.name,
                     revision="rev-1",
                     name="Проверка загрузки",
                     description="Синтетический файл локального прогона",
-                    size_bytes=size,
+                    size_bytes=sum(file.size for file in files),
                     min_ram_mb=1,
-                    layout="gigaam-rnnt",
-                    variant="int8",
+                    layout="onnx-asr-t-one" if scenario.tone else "gigaam-rnnt",
+                    variant="t-one-ctc" if scenario.tone else "int8",
                     recommended=False,
-                    host=local_host,
-                    files=(FileSpec("model.bin", digest, size, f"/{mode}"),),
+                    host=public[0],
+                    files=files,
+                    mirrors=tuple(public[1:]),
+                )
+                loader = Downloader(
+                    client, store, corp_base=DOWNLOAD_CORP_BASE if "corp" in prefixes else None
                 )
                 staging = store.staging_dir(entry.id, entry.revision)
-                target, part = staging / "model.bin", staging / "model.bin.part"
+                target, part = staging / model_name, staging / f"{model_name}.part"
                 bytes_read, foreign_attempts = 0, 0
+                kinds: list[str] = []
 
-                first_code = attempt(entry)
-                prefix_ok = part.is_file() and part.read_bytes() == body[:half]
+                started = time.monotonic()
+                first_code = attempt(loader, entry, part, kinds, scenario.disk)
+                part_size = part.stat().st_size if part.is_file() else 0
+                head = tampered if scenario.part_source == "tampered" else body
+                part_head_ok = part_size > 0 and part.read_bytes() == head[:part_size]
                 code = first_code
-                resumed = mode in {"resume-206", "no-range-200"}
-                if resumed:
-                    code = attempt(entry)
-                requests_seen = [
-                    (header, status) for path, header, status in seen if path == f"/{mode}"
-                ]
+                if scenario.first_code:
+                    code = attempt(loader, entry, part, kinds, "")
+                elapsed = time.monotonic() - started
+                with seen_lock:
+                    requests_seen = [
+                        (prefix, header, status)
+                        for prefix, name, header, status in seen
+                        if name == scenario.name
+                    ]
+                expected_requests = list(scenario.requests)
+                if scenario.disk == "enospc":
+                    # Сколько байт успело записаться до ENOSPC, решает размер блока ответа.
+                    expected_requests = [
+                        (prefix, f"bytes={part_size}-" if header else None, status)
+                        for prefix, header, status in expected_requests
+                    ]
                 file_ok = (
                     target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() == digest
                 )
-                expected_code = {
-                    "truncated": "host-unreachable",
-                    "tampered": "bad-checksum",
-                    "oversize": "too-large",
-                    "redirect-evil": "not-allowed",
-                }.get(mode, "ok")
-                expected = expected_code
-                actual = f"код {code}"
-                matched = code == expected_code and foreign_attempts == 0
-                if expected_code == "ok":
-                    expected += ", верный файл и SHA-256, без .part"
-                    actual += (
-                        f", файл и SHA-256 {'верны' if file_ok else 'неверны'}, "
-                        f".part={part.exists()}"
+                expected = [f"код {scenario.code}"]
+                actual = [f"код {code}"]
+                passed = code == scenario.code and foreign_attempts == 0
+                if scenario.first_code:
+                    expected.append(f"первая попытка {scenario.first_code}")
+                    actual.append(f"первая попытка {first_code}")
+                    passed &= first_code == scenario.first_code
+                if scenario.code == "ok":
+                    expected.append("файл и SHA-256 верны, .part нет")
+                    actual.append(
+                        f"файл и SHA-256 {'верны' if file_ok else 'неверны'}, .part={part.exists()}"
                     )
-                    matched &= file_ok and not part.exists()
-                if resumed:
-                    status = 206 if mode == "resume-206" else 200
-                    expected += f", сначала обрыв с половиной в .part, затем Range и {status}"
-                    actual += f", первый код {first_code}, половина сохранена={prefix_ok}"
-                    matched &= first_code == "host-unreachable" and prefix_ok
-                    matched &= requests_seen == [(None, 200), (f"bytes={half}-", status)]
+                    passed &= file_ok and not part.exists()
                 else:
-                    matched &= requests_seen == [(None, 302 if mode == "redirect-evil" else 200)]
-                if mode == "truncated":
-                    expected += ", половина файла сохранена в .part"
-                    actual += f", половина сохранена={prefix_ok}"
-                    matched &= prefix_ok and not target.exists()
-                if mode == "oversize":
-                    expected += f", прочитано не больше {size + 1} байт"
-                    actual += f", прочитано {bytes_read} байт"
-                    matched &= 0 < bytes_read <= size + 1
-                if mode == "redirect-evil":
-                    expected += ", попыток к чужому хосту 0"
-                    actual += f", попыток к чужому хосту {foreign_attempts}"
-                actual += f", запросы (Range, статус): {requests_seen}"
+                    expected.append("готового файла нет")
+                    actual.append(f"готовый файл есть={target.exists()}")
+                    passed &= not target.exists()
+                if scenario.keep_part:
+                    limit = half if scenario.disk == "enospc" else None
+                    expected.append(
+                        "после сбоя в .part сохранено начало файла"
+                        + (f" (не больше {half} байт)" if limit else f" ({half} байт)")
+                    )
+                    actual.append(f"в .part {part_size} байт, начало верно={part_head_ok}")
+                    passed &= part_head_ok and (part_size <= half if limit else part_size == half)
+                if scenario.drop_part:
+                    expected.append(".part удалён")
+                    actual.append(f".part={part.exists()}")
+                    passed &= not part.exists()
+                if scenario.name == "size-plus-one":
+                    expected.append(f"прочитано не больше {size + 1} байт")
+                    actual.append(f"прочитано {bytes_read} байт")
+                    passed &= 0 < bytes_read <= size + 1
+                if scenario.name == "http-429":
+                    expected.append(f"без ожидания Retry-After: ≤ {DOWNLOAD_429_LIMIT_S:g} с")
+                    actual.append(f"{elapsed:.2f} с")
+                    passed &= elapsed <= DOWNLOAD_429_LIMIT_S
+                if scenario.install_refused:
+                    # Подкладываем ровно те байты, что отдали зеркала, в допустимой раскладке
+                    # рядом с верным config.json: установщик обязан отказать по sha256.
+                    target.write_bytes(tampered)
+                    installer = Installer(store, lambda directory, entry: SmokeResult(True))
+                    # Отказ здесь ожидаем: его трассировка в журнале установщика только мешает.
+                    installer_log = logging.getLogger("astra_voice.models.installer")
+                    installer_log.disabled = True
+                    try:
+                        result = installer.install_from_staging(entry)
+                    finally:
+                        installer_log.disabled = False
+                    installed = [record.id for record in store.records()]
+                    current = store.current()
+                    expected.append(
+                        "подложенные байты зеркал: установка отказана по checksum, "
+                        "модель не установлена и не активна"
+                    )
+                    actual.append(
+                        f"установка {result.state}, причина {result.reason_code or '—'}, "
+                        f"установленных {len(installed)}, активна={current is not None}"
+                    )
+                    passed &= (
+                        result.state == "error"
+                        and result.reason_code == "checksum"
+                        and scenario.name not in installed
+                        and current is None
+                    )
+                expected.append(f"источники {list(scenario.kinds)}")
+                actual.append(f"источники {kinds}")
+                passed &= kinds == list(scenario.kinds)
+                expected.append(f"запросы (источник, Range, статус) {expected_requests}")
+                actual.append(f"запросы {requests_seen}")
+                passed &= requests_seen == expected_requests
+                expected.append("попыток к чужому хосту 0")
+                actual.append(f"попыток к чужому хосту {foreign_attempts}")
                 checks.append(
-                    {"name": mode, "expected": expected, "actual": actual, "passed": matched}
+                    {
+                        "name": scenario.name,
+                        "title": scenario.title,
+                        "expected": "; ".join(expected),
+                        "actual": "; ".join(actual),
+                        "passed": passed,
+                    }
                 )
     except (OSError, RuntimeError, ValueError) as exc:
         error = f"Не удалось выполнить прогон: {exc}"
@@ -2095,6 +2470,223 @@ def catalog_report(args: argparse.Namespace, code: int, facts: dict[str, Any]) -
     return code
 
 
+AUTOSTART_NAME = "astra-voice.desktop"
+# Канон spec §9.1 / plans M9 задан здесь независимо от модуля: расхождение модуля
+# с каноном должно проваливать проверку, а не переопределять ожидание.
+AUTOSTART_CANON = {
+    b"Type": b"Application",
+    b"Exec": b"/usr/bin/astra-voice --hidden",
+    b"Icon": b"astravoice",
+    b"X-KDE-autostart-after": b"panel",
+    b"X-AstraVoice-Managed": b"true",
+}
+AUTOSTART_FOREIGN = {
+    "handy.desktop": (
+        b"[Desktop Entry]\nType=Application\nName=Handy\nExec=/usr/bin/handy\n"
+        b"X-GNOME-Autostart-enabled=true\n"
+    ),
+    "other-hidden.desktop": (
+        b"[Desktop Entry]\nType=Application\nName=Other\nExec=/usr/bin/other\nHidden=true\n"
+    ),
+}
+
+
+def autostart_fields(data: bytes) -> list[str]:
+    """Расхождения записи с каноном; пустой список — запись каноническая."""
+    from astra_voice.platform import autostart as module
+
+    properties = module._properties(data)
+    problems = [
+        f"{key.decode()}="
+        + (
+            found.decode(errors="replace")
+            if (found := properties.get(key)) is not None
+            else "<нет>"
+        )
+        for key, value in AUTOSTART_CANON.items()
+        if properties.get(key) != value
+    ]
+    if b"OnlyShowIn" in properties:
+        problems.append("есть OnlyShowIn")
+    if module._true(properties, b"Hidden"):
+        problems.append("Hidden=true")
+    return problems
+
+
+def autostart_snapshot(path: Path) -> tuple[bytes, int, int, int] | None:
+    """Байты, права, inode и mtime: «не тронут» — все четыре совпали."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    return path.read_bytes(), stat.S_IMODE(info.st_mode), info.st_ino, info.st_mtime_ns
+
+
+def autostart_check_installed(args: argparse.Namespace) -> int:
+    """Только читает ~/.config/autostart/astra-voice.desktop и сверяет поля с каноном."""
+    from astra_voice.platform import autostart as module
+
+    checks: list[Message] = []
+    notes = ["Способ: только чтение записи автозапуска пользователя; ничего не пишется."]
+    path = module._paths()[0]
+    notes.append(f"Файл: {path}.")
+    if path.is_symlink():
+        # Программа такую запись не меняет (set_enabled отказывает), и её поля
+        # принадлежат чужому файлу: сверять их с каноном бессмысленно.
+        checks.append(
+            {
+                "name": "symlink",
+                "title": "запись — обычный файл, не символическая ссылка",
+                "expected": "обычный файл",
+                "actual": "символическая ссылка — программа такую запись не меняет",
+                "passed": False,
+            }
+        )
+        return network_report(args, checks, notes)
+    try:
+        data = module._read(path)
+    except OSError as exc:
+        return network_report(args, checks, notes, f"Не удалось прочитать запись: {exc}")
+    checks.append(
+        {
+            "name": "file",
+            "title": "запись автозапуска есть",
+            "expected": "обычный файл",
+            "actual": "нет файла — автозапуск выключен" if data is None else "есть",
+            "passed": data is not None,
+        }
+    )
+    if data is not None:
+        problems = autostart_fields(data)
+        checks.append(
+            {
+                "name": "fields",
+                "title": "поля канонические, без OnlyShowIn и Hidden",
+                "expected": ", ".join(
+                    f"{key.decode()}={value.decode()}" for key, value in AUTOSTART_CANON.items()
+                ),
+                "actual": "совпадают" if not problems else "; ".join(problems),
+                "passed": not problems,
+            }
+        )
+    return network_report(args, checks, notes)
+
+
+def autostart_check(args: argparse.Namespace) -> int:
+    """Включение и выключение настоящим модулем во временном XDG_CONFIG_HOME."""
+    if args.check_installed:
+        return autostart_check_installed(args)
+    from astra_voice.platform import autostart as module
+
+    checks: list[Message] = []
+    notes = [
+        "Способ: настоящий platform/autostart.py во временных XDG_CONFIG_HOME и "
+        "XDG_CONFIG_DIRS; настоящий ~/.config не читается и не меняется.",
+    ]
+    names = ("XDG_CONFIG_HOME", "XDG_CONFIG_DIRS")
+    saved = {name: os.environ.get(name) for name in names}
+    error = ""
+
+    def record(name: str, title: str, expected: str, actual: str, passed: bool) -> None:
+        checks.append(
+            {"name": name, "title": title, "expected": expected, "actual": actual, "passed": passed}
+        )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="astra-autostart-") as directory:
+            home, system = Path(directory) / "config", Path(directory) / "xdg"
+            os.environ["XDG_CONFIG_HOME"] = str(home)
+            os.environ["XDG_CONFIG_DIRS"] = str(system)
+            ours = home / "autostart" / AUTOSTART_NAME
+            if module._paths()[0] != ours:
+                raise RuntimeError("Модуль не использует временный XDG_CONFIG_HOME.")
+            ours.parent.mkdir(parents=True, mode=0o755)
+            foreign = {name: ours.parent / name for name in AUTOSTART_FOREIGN}
+            for name, path in foreign.items():
+                path.write_bytes(AUTOSTART_FOREIGN[name])
+            before = {name: autostart_snapshot(path) for name, path in foreign.items()}
+
+            initial = module.state()
+            record(
+                "initial",
+                "до включения",
+                "выключен, нашего файла нет",
+                f"включён={initial.enabled}, файл={ours.exists()}",
+                not initial.enabled and not ours.exists(),
+            )
+
+            module.set_enabled(True)
+            enabled = module.state()
+            first = autostart_snapshot(ours)
+            problems = autostart_fields(first[0]) if first else ["файла нет"]
+            record(
+                "enable",
+                "включение создаёт наш файл",
+                "файл есть, включён, опознан как наш; "
+                + ", ".join(f"{k.decode()}={v.decode()}" for k, v in AUTOSTART_CANON.items())
+                + "; без OnlyShowIn и Hidden; права 0644",
+                f"файл={first is not None}, включён={enabled.enabled}, опознан={enabled.user}, "
+                f"права={oct(first[1]) if first else '—'}, "
+                f"расхождения: {'; '.join(problems) or 'нет'}",
+                first is not None
+                and enabled.enabled
+                and enabled.user == "ours"
+                and not problems
+                and first[1] == 0o644,
+            )
+
+            module.set_enabled(True)
+            again = autostart_snapshot(ours)
+            record(
+                "enable-again",
+                "повторное включение идемпотентно",
+                "файл не переписан: те же байты, inode и mtime",
+                "не переписан" if again == first and again is not None else "переписан или исчез",
+                again == first and again is not None,
+            )
+
+            module.set_enabled(False)
+            disabled = module.state()
+            record(
+                "disable",
+                "выключение удаляет только наш файл",
+                "нашего файла нет, выключен",
+                f"файл={ours.exists()}, включён={disabled.enabled}",
+                not ours.exists() and not disabled.enabled,
+            )
+
+            module.set_enabled(False)
+            record(
+                "disable-again",
+                "повторное выключение ничего не создаёт",
+                "нашего файла нет",
+                f"файл={ours.exists()}",
+                not ours.exists(),
+            )
+
+            after = {name: autostart_snapshot(path) for name, path in foreign.items()}
+            untouched = [name for name in foreign if before[name] == after[name]]
+            hidden_ok = after["other-hidden.desktop"] is not None and module._true(
+                module._properties(after["other-hidden.desktop"][0]), b"Hidden"
+            )
+            record(
+                "foreign",
+                "чужие handy.desktop и файл с Hidden=true не тронуты",
+                "байты, права, inode и mtime совпадают; Hidden=true на месте",
+                f"не тронуты: {untouched}; Hidden=true на месте={hidden_ok}",
+                len(untouched) == len(foreign) and hidden_ok,
+            )
+    except (OSError, RuntimeError) as exc:
+        error = f"Не удалось выполнить прогон: {exc}"
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    return network_report(args, checks, notes, error)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Разбирает подкоманды; новые проверки добавляются отдельными обработчиками."""
     parser = argparse.ArgumentParser(description="Проверки Astra Voice без GUI")
@@ -2167,6 +2759,15 @@ def main(argv: list[str] | None = None) -> int:
     models.add_argument("--from", dest="from_ref", type=parse_model_ref, metavar="ID@REV")
     models.add_argument("--to", dest="to_ref", type=parse_model_ref, metavar="ID@REV")
     models.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    autostart_parser = commands.add_parser(
+        "autostart", help="проверить запись автозапуска во временном XDG_CONFIG_HOME"
+    )
+    autostart_parser.add_argument(
+        "--check-installed",
+        action="store_true",
+        help="только прочитать ~/.config/autostart/astra-voice.desktop и сверить поля",
+    )
+    autostart_parser.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
     release_check = commands.add_parser("release", help="проверить ассеты релиза без сети")
     release_check.add_argument("--version", required=True, help="версия X.Y.Z или vX.Y.Z")
     release_check.add_argument("--dir", type=Path, default=ROOT / "dist")
@@ -2188,6 +2789,7 @@ def main(argv: list[str] | None = None) -> int:
         "privacy": privacy,
         "catalog": catalog,
         "release": release,
+        "autostart": autostart_check,
         "_catalog-probe": catalog_probe,
     }
     return handlers[args.command](args)
