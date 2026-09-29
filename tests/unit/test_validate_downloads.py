@@ -6,6 +6,7 @@ import json
 import os
 import runpy
 import sys
+import types
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -28,6 +29,8 @@ REQUIRED = {
     "no-space-during",
     "no-space-enospc",
     "mirror-bytes-differ",
+    "range-foreign",
+    "resume-bad-sum",
     "redirect-evil",
 }
 
@@ -73,6 +76,8 @@ def test_scenario_table_covers_plan(validate: dict[str, Any]) -> None:
         assert by_name[name].requests[0][0] == "hf"
         assert [prefix for prefix, _, _ in by_name[name].requests].count("hf") == 1
     assert by_name["mirror-bytes-differ"].install_refused
+    # Допустимая раскладка: установщик доходит до сверки байт, а не отказывает по составу.
+    assert by_name["mirror-bytes-differ"].tone
     assert {by_name[name].disk for name in by_name if name.startswith("no-space")} == {
         "before",
         "during",
@@ -108,3 +113,59 @@ def test_plain_output_has_titles_and_verdict(
     assert code == 0
     assert "http-429 (hf 429 с Retry-After" in out
     assert out.rstrip().endswith("ожидания совпали; код 0.")
+
+
+def failed_names(report: Any) -> set[str]:
+    return {check["name"] for check in report["checks"] if not check["passed"]}
+
+
+def test_install_refusal_is_by_checksum(
+    validate: dict[str, Any],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import astra_voice.models.installer as installer
+
+    # Мутация: установщик перестал сверять sha256. Загрузчик не тронут, поэтому
+    # сценарий обязан упасть именно на проверке установки.
+    monkeypatch.setattr(
+        installer, "hmac", types.SimpleNamespace(compare_digest=lambda left, right: True)
+    )
+
+    code, report = run_json(validate, capsys)
+
+    assert code == 1
+    assert failed_names(report) == {"mirror-bytes-differ"}
+    check = next(item for item in report["checks"] if item["name"] == "mirror-bytes-differ")
+    assert "код bad-checksum" in check["actual"]
+    assert "установка ok" in check["actual"]
+
+
+def test_foreign_content_range_mutation_is_caught(
+    validate: dict[str, Any],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import astra_voice.models.downloader as downloader
+
+    monkeypatch.setattr(downloader, "_range_matches", lambda value, offset, size: True)
+
+    code, report = run_json(validate, capsys)
+
+    assert code == 1
+    assert "range-foreign" in failed_names(report)
+
+
+def test_server_failure_gives_exit_2(
+    validate: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken_server(*args: object, **kwargs: object) -> None:
+        raise OSError("порт занят")
+
+    validate["ThreadingHTTPServer"] = broken_server
+
+    code, report = run_json(validate, capsys)
+
+    assert code == report["exit_code"] == 2
+    assert report["checks"] == []
+    assert "порт занят" in report["explanation"]

@@ -952,8 +952,11 @@ DOWNLOAD_CORP_BASE = f"https://{DOWNLOAD_CORP_HOST}"
 # Downloader сам определил вид источника (hf/github/corp); наружу запрос не уходит.
 DOWNLOAD_PREFIXES = {"huggingface.co": "hf", "github.com": "gh", DOWNLOAD_CORP_HOST: "corp"}
 DOWNLOAD_PUBLIC_HOSTS = {"hf": "huggingface.co", "gh": "github.com"}
-DOWNLOAD_429_RETRY_AFTER_S = 3600
+DOWNLOAD_429_RETRY_AFTER_S = 30
 DOWNLOAD_429_LIMIT_S = 5.0
+# Второй файл допустимой раскладки onnx-asr-t-one/t-one-ctc: установщик доходит
+# до сверки байт model.onnx, а не отказывает из-за раскладки.
+DOWNLOAD_CONFIG = b'{"model_type": "t-one"}\n'
 
 
 @dataclass(frozen=True)
@@ -962,8 +965,11 @@ class DownloadScenario:
 
     Поведения источника: ok (Range → 206), cut (всегда обрыв на половине), cut-once
     (обрыв только в первом ответе), no-range-once (обрыв, затем 200 без учёта Range),
-    tampered (те же размер и Range, другие байты), oversize (лишний байт), 404, 503,
-    429 (с Retry-After), redirect-evil (302 на чужой хост).
+    bad-range-once (обрыв, затем на Range — 206 с чужим Content-Range и всем файлом),
+    cut-tampered-once (обрыв на половине чужих байт, затем как ok), tampered (те же
+    размер и Range, другие байты), oversize (лишний байт), 404, 503, 429 (с Retry-After),
+    redirect-evil (302 на чужой хост). tone — запись в раскладке onnx-asr-t-one:
+    config.json (всегда верный) и model.onnx вместо одного model.bin.
     """
 
     name: str
@@ -977,6 +983,8 @@ class DownloadScenario:
     keep_part: bool = False
     drop_part: bool = False
     install_refused: bool = False
+    tone: bool = False
+    part_source: str = "body"
 
 
 def _half_range(half: int) -> str:
@@ -1068,6 +1076,27 @@ def download_scenarios(half: int) -> tuple[DownloadScenario, ...]:
             keep_part=True,
         ),
         DownloadScenario(
+            "range-foreign",
+            "обрыв, затем 206 с чужим Content-Range → докачка отвергнута, загрузка с начала",
+            (("hf", "bad-range-once"),),
+            "ok",
+            (("hf", None, 200), ("hf", cut, 206), ("hf", None, 200)),
+            ("hf", "hf"),
+            first_code="short-read",
+            keep_part=True,
+        ),
+        DownloadScenario(
+            "resume-bad-sum",
+            "после докачки сумма неверна → один повтор того же источника с нуля",
+            (("hf", "cut-tampered-once"),),
+            "ok",
+            (("hf", None, 200), ("hf", cut, 206), ("hf", None, 200)),
+            ("hf", "hf"),
+            first_code="short-read",
+            keep_part=True,
+            part_source="tampered",
+        ),
+        DownloadScenario(
             "truncated",
             "обрыв у единственного источника",
             (("hf", "cut"),),
@@ -1078,13 +1107,14 @@ def download_scenarios(half: int) -> tuple[DownloadScenario, ...]:
         ),
         DownloadScenario(
             "mirror-bytes-differ",
-            "оба зеркала отдают другие байты того же размера → отказ sha256",
+            "оба зеркала отдают другие байты того же размера → отказ sha256 и установки",
             (("hf", "tampered"), ("gh", "tampered")),
             "bad-checksum",
             (("hf", None, 200), ("gh", None, 200)),
-            ("hf", "github"),
+            ("hf", "hf", "github"),
             drop_part=True,
             install_refused=True,
+            tone=True,
         ),
         DownloadScenario(
             "mirror-bytes-recover",
@@ -1199,17 +1229,29 @@ def downloads(args: argparse.Namespace) -> int:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            # /<источник>/<сценарий>/model.bin или /corp/<сценарий>/<ревизия>/model.bin
+            # /<источник>/<сценарий>/<файл> или /corp/<сценарий>/<ревизия>/<файл>
             parts = self.path.split("/")
             prefix, name = (parts[1], parts[2]) if len(parts) > 3 else ("", "")
+            if parts[-1] == "config.json":
+                # Служебный файл раскладки t-one всегда верный и в журнал не идёт.
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(DOWNLOAD_CONFIG)))
+                self.end_headers()
+                self.wfile.write(DOWNLOAD_CONFIG)
+                return
             behaviour = behaviours.get((prefix, name), "404")
             range_header = self.headers.get("Range")
             with seen_lock:
                 first = not any(item[:2] == (prefix, name) for item in seen)
             interrupted = behaviour == "cut" or (
-                behaviour in {"cut-once", "no-range-once"} and first
+                behaviour in {"cut-once", "no-range-once", "bad-range-once", "cut-tampered-once"}
+                and first
             )
-            source = tampered if behaviour == "tampered" else body
+            source = (
+                tampered
+                if behaviour == "tampered" or (behaviour == "cut-tampered-once" and first)
+                else body
+            )
             payload, status = source, 200
             headers: dict[str, str] = {}
             if behaviour in {"404", "503", "429"}:
@@ -1221,8 +1263,12 @@ def downloads(args: argparse.Namespace) -> int:
                 headers["Location"] = "https://evil.example/model.bin"
             elif behaviour == "oversize":
                 payload = body + b"!"
+            elif behaviour == "bad-range-once" and range_header is not None and not interrupted:
+                # Чужой диапазон: весь файл с начала вместо запрошенного хвоста.
+                status = 206
+                headers["Content-Range"] = f"bytes 0-{size - 1}/{size}"
             elif (
-                behaviour in {"ok", "cut-once", "tampered"}
+                behaviour in {"ok", "cut-once", "tampered", "cut-tampered-once"}
                 and range_header is not None
                 and not interrupted
             ):
@@ -1365,32 +1411,43 @@ def downloads(args: argparse.Namespace) -> int:
             for scenario in scenarios:
                 prefixes = [prefix for prefix, _ in scenario.sources]
                 public = [DOWNLOAD_PUBLIC_HOSTS[prefix] for prefix in prefixes if prefix != "corp"]
+                model_name = "model.onnx" if scenario.tone else "model.bin"
+                files = (FileSpec(model_name, digest, size, f"/{scenario.name}/{model_name}"),)
+                if scenario.tone:
+                    config = FileSpec(
+                        "config.json",
+                        hashlib.sha256(DOWNLOAD_CONFIG).hexdigest(),
+                        len(DOWNLOAD_CONFIG),
+                        f"/{scenario.name}/config.json",
+                    )
+                    files = (config, *files)
                 entry = CatalogEntry(
                     id=scenario.name,
                     revision="rev-1",
                     name="Проверка загрузки",
                     description="Синтетический файл локального прогона",
-                    size_bytes=size,
+                    size_bytes=sum(file.size for file in files),
                     min_ram_mb=1,
-                    layout="gigaam-rnnt",
-                    variant="int8",
+                    layout="onnx-asr-t-one" if scenario.tone else "gigaam-rnnt",
+                    variant="t-one-ctc" if scenario.tone else "int8",
                     recommended=False,
                     host=public[0],
-                    files=(FileSpec("model.bin", digest, size, f"/{scenario.name}/model.bin"),),
+                    files=files,
                     mirrors=tuple(public[1:]),
                 )
                 loader = Downloader(
                     client, store, corp_base=DOWNLOAD_CORP_BASE if "corp" in prefixes else None
                 )
                 staging = store.staging_dir(entry.id, entry.revision)
-                target, part = staging / "model.bin", staging / "model.bin.part"
+                target, part = staging / model_name, staging / f"{model_name}.part"
                 bytes_read, foreign_attempts = 0, 0
                 kinds: list[str] = []
 
                 started = time.monotonic()
                 first_code = attempt(loader, entry, part, kinds, scenario.disk)
                 part_size = part.stat().st_size if part.is_file() else 0
-                part_head_ok = part_size > 0 and part.read_bytes() == body[:part_size]
+                head = tampered if scenario.part_source == "tampered" else body
+                part_head_ok = part_size > 0 and part.read_bytes() == head[:part_size]
                 code = first_code
                 if scenario.first_code:
                     code = attempt(loader, entry, part, kinds, "")
@@ -1449,6 +1506,9 @@ def downloads(args: argparse.Namespace) -> int:
                     actual.append(f"{elapsed:.2f} с")
                     passed &= elapsed <= DOWNLOAD_429_LIMIT_S
                 if scenario.install_refused:
+                    # Подкладываем ровно те байты, что отдали зеркала, в допустимой раскладке
+                    # рядом с верным config.json: установщик обязан отказать по sha256.
+                    target.write_bytes(tampered)
                     installer = Installer(store, lambda directory, entry: SmokeResult(True))
                     # Отказ здесь ожидаем: его трассировка в журнале установщика только мешает.
                     installer_log = logging.getLogger("astra_voice.models.installer")
@@ -1459,13 +1519,17 @@ def downloads(args: argparse.Namespace) -> int:
                         installer_log.disabled = False
                     installed = [record.id for record in store.records()]
                     current = store.current()
-                    expected.append("установка отказана, модель не установлена и не активна")
+                    expected.append(
+                        "подложенные байты зеркал: установка отказана по checksum, "
+                        "модель не установлена и не активна"
+                    )
                     actual.append(
-                        f"установка {result.state}, установленных {len(installed)}, "
-                        f"активна={current is not None}"
+                        f"установка {result.state}, причина {result.reason_code or '—'}, "
+                        f"установленных {len(installed)}, активна={current is not None}"
                     )
                     passed &= (
                         result.state == "error"
+                        and result.reason_code == "checksum"
                         and scenario.name not in installed
                         and current is None
                     )
