@@ -42,6 +42,7 @@ from astra_voice.core.settings import Settings, is_valid_combo
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
 from astra_voice.platform.hotkey import (
     DEFAULT_CANDIDATES,
+    MAPPING_REGRAB_PREFIX,
     RECORD_LIMIT_S,
     GrabResult,
     HotkeyManager,
@@ -1075,6 +1076,8 @@ class DictationRuntime(QObject):
 
     def _on_hotkey_state(self, state: HotkeyState, reason: str) -> None:
         """Откладывает диктовку, пока воркер загружает модель."""
+        if reason.startswith(MAPPING_REGRAB_PREFIX):
+            self._on_mapping_regrab(reason)
         if self._pending_test is not None:
             if state in (HotkeyState.RECORDING, HotkeyState.PROCESSING):
                 self.hotkey.fsm.escape(monotonic())
@@ -1204,6 +1207,35 @@ class DictationRuntime(QObject):
             log.warning("hotkey=%r недопустим, беру значение по умолчанию", self.settings.hotkey)
             self.settings.hotkey = Settings.hotkey
         return self.hotkey.grab(self.settings.hotkey, HotkeyMode(self.settings.hotkey_mode))
+
+    def _on_mapping_regrab(self, reason: str) -> None:
+        """Итог перезахвата после смены раскладки: отказ не должен пройти молча.
+
+        Неудача → WARNING, трей «нет клавиши», уведомление и штатный повтор
+        захвата по таймеру. Успех, пока таймер ждёт, — восстановление.
+        """
+        if self._closed:
+            return
+        code = reason.split(";", 1)[0].removeprefix(MAPPING_REGRAB_PREFIX)
+        if code != "ok":
+            already = self._regrab_timer is not None
+            log.warning(
+                "Горячая клавиша потеряна после смены раскладки (%s), повтор каждые %d с",
+                code,
+                REGRAB_INTERVAL_MS // 1000,
+            )
+            self.tray.set_state(TrayState.NOKEY)
+            self._start_regrab(code)
+            if not already:
+                notify.notify_hotkey_not_grabbed(self.settings.hotkey)
+            return
+        if self._regrab_timer is None:
+            return
+        self._stop_regrab()
+        if self.orchestrator.phase == DictationPhase.IDLE and self._selfcheck != "failed":
+            self.tray.set_state(TrayState.IDLE)
+        notify.notify_hotkey_regrabbed(self.settings.hotkey)
+        log.info("Горячая клавиша снова захвачена после смены раскладки: %s", self.settings.hotkey)
 
     def _start_regrab(self, code: str) -> None:
         """Повторяет захват; новая настройка начинает собственный отсчёт попыток."""

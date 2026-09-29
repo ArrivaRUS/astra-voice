@@ -26,6 +26,8 @@ LOOKAHEAD_S = 0.002
 DEFAULT_CANDIDATES = ("Ctrl+Shift+Space", "Ctrl+Alt+D")
 BUSY_MESSAGE = "Комбинация занята другой программой (возможно Handy или переключатель ввода)"
 ResultCode = Literal["ok", "busy", "bad-combo", "duplicate", "not-grabbed"]
+# Причина on_state после смены карты: ``mapping-regrab:<код>[;escape:<код>]``.
+MAPPING_REGRAB_PREFIX = "mapping-regrab:"
 
 
 class HotkeyMode(Enum):
@@ -443,6 +445,8 @@ class HotkeyManager:
     код последней операции, включая ``not-grabbed``, доступен в ``last_result``.
     После смены карты ``on_state`` получает причину ``mapping-regrab:<код>``
     и результат Escape, если он был захвачен; состояние автомата сохраняется.
+    Если перезахват не удался, повторный ``grab()`` того же сочетания
+    восстанавливает захват, не сбрасывая автомат (повтор ведёт runtime).
     """
 
     def __init__(
@@ -466,8 +470,20 @@ class HotkeyManager:
         self._escape_grabbed = False
         self._escape_keycode: int | None = None
         self._key_down = False
+        # Перезахват после смены карты не удался; grab() того же сочетания восстановит.
+        self._lost = False
 
     def grab(self, combo: str, mode: HotkeyMode) -> GrabResult:
+        if combo == self._combo and self._lost:
+            # Захват потерян после смены карты: восстанавливаем, автомат не трогаем.
+            result = self.backend.grab_combo(combo)
+            if result.ok:
+                self._lost = False
+                self._keycode = result.keycode
+                self._mods = result.mods
+                self._key_down = False
+            self.last_result = result
+            return result
         if combo == self._combo:
             self.last_result = GrabResult("duplicate")
             return self.last_result
@@ -491,6 +507,7 @@ class HotkeyManager:
         self._combo = None
         self._keycode = None
         self._key_down = False
+        self._lost = False
         # События старого захвата не должны запустить следующую запись.
         self.backend.poll_events()
 
@@ -558,7 +575,8 @@ class HotkeyManager:
             self._key_down = False
         self._keycode = self.last_result.keycode
         self._mods = self.last_result.mods
-        reason = f"mapping-regrab:{self.last_result.code}"
+        self._lost = not self.last_result.ok
+        reason = f"{MAPPING_REGRAB_PREFIX}{self.last_result.code}"
         if event.escape is not None:
             self.escape_result = event.escape
             self._escape_grabbed = event.escape.ok
