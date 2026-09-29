@@ -890,3 +890,11 @@ T-163…T-174 перенести из arch/appimage.md в test-plan; текст�
 - `wip/fix-tray-bus` `396734a` (GPT-6 Astra): на ревью code-reviewer → затем черновой PR + CI.
 - `wip/r2-ci` `6e8590a`: на ревью; ждёт «да» заказчика на скачивание 3 колёс (jsonschema 4.10.3, attrs 22.2.0,
   pyrsistent 0.19.3) и ключа подписи runtime AppImage (<1 МБ) для закрепления хэшей.
+
+## 2026-09-29 ~13:30 — r2-ci одобрен
+- `wip/r2-ci` `a8e4b34`: ревью APPROVE. Колёса jsonschema/attrs/pyrsistent и ключ runtime `570C77AC…6490F695` закреплены
+  (скачаны с «да» заказчика 29.09, сверены с PyPI JSON и lock); две сборки одного коммита — одинаковый sha256 `6546da01…6e18`.
+  Два P3 (`split_allowed`, узкая вычистка RECORD) — в работе у того же developer. Ветка стоит на ma-foundation → сливать
+  после неё (четверг). До отправки ci-workflow-patch заказчику: прогон root→nobody в `debian:12` — в T3.
+  После вливания M7 checker убрать `--if-exists` для tests/net, tests/updates в `ci.yml.proposed`.
+- Нагрузка 13:15 (вопрос заказчика): WebKitWebProcess DesktopX ~89 % 74 мин (его приложение), pytest Cowork (другая сессия).
