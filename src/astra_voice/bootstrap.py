@@ -42,6 +42,8 @@ SOFTWARE_RENDER_ENV = {
 # Запрет appimage=deny (arch/appimage.md §5). Снять себя из меню и автозапуска
 # можно всегда: эти флаги запрет не блокирует.
 UNREGISTER_FLAGS = frozenset({"--unregister", "--uninstall"})
+# Служебные флаги трека AppImage (ставит AppRun): системная версия их не знает.
+APPIMAGE_INTERNAL_FLAGS = frozenset({"--register"})
 EXIT_POLICY_DENIED = 3
 # Защита от петли: системная версия, которая сама оказалась AppImage под запретом,
 # не передаёт запуск дальше. Внешним программам не достаётся (clean_env снимает ASTRA_VOICE_*).
@@ -155,7 +157,8 @@ def _appimage_policy_gate(command: str, rest: list[str]) -> int | None:
     env = clean_env()
     env[HANDOFF_ENV] = "1"
     _journal(HANDOFF_MESSAGE)
-    os.execve(system, [system, *user_args], env)
+    argv = [arg for arg in user_args if arg not in APPIMAGE_INTERNAL_FLAGS]
+    os.execve(system, [system, *argv], env)
     return EXIT_POLICY_DENIED  # сюда execve не возвращается; для тестов с подменой
 
 

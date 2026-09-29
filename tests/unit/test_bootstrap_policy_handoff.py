@@ -331,3 +331,18 @@ def test_unregister_under_denial_removes_entries(
     assert not list(icons.rglob("astravoice.*"))
     assert not startup.exists()
     assert (paths.appimage_app_dir() / KEY).is_dir()  # программа на месте: только снятие
+
+
+def test_appimage_internal_flags_not_passed_to_system_version(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entries: dict[str, Mock]
+) -> None:
+    """Повторный запуск .AppImage: AppRun добавляет --register, .deb его не знает (код 2)."""
+    monkeypatch.setattr(paths, "install_kind", lambda: paths.InstallKind.APPIMAGE_INSTALLED)
+    policy.POLICY_PATH.write_text(DENY, encoding="utf-8")
+    system = _system(tmp_path)
+    monkeypatch.setattr(paths, "SYSTEM_EXECUTABLE", system)
+    execve = Mock()
+    monkeypatch.setattr(os, "execve", execve)
+    bootstrap.main(["app", "--register", "--hidden"])
+    execve.assert_called_once()
+    assert execve.call_args.args[1] == [str(system), "--hidden"]

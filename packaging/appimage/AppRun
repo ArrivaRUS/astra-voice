@@ -165,6 +165,9 @@ run_installed() {
 }
 
 INSTALL=0
+# Режим В без установки (запрет политикой, запуск уходит в системную версию):
+# app — дочерним процессом, чтобы после него убрать распаковку из $TMPDIR.
+CHILD=0
 case $MODE in
     Б | В) INSTALL=1 ;;
 esac
@@ -187,7 +190,9 @@ if [ "$INSTALL" = 1 ]; then
         # завершаем работу в любом режиме, без запуска из монтирования.
         3 | 4) exit "$rc" ;;
     esac
-    if [ "$rc" != "$SKIPPED" ]; then
+    if [ "$rc" = "$SKIPPED" ] && [ "$MODE" = В ]; then
+        CHILD=1
+    elif [ "$rc" != "$SKIPPED" ]; then
         if [ "$MODE" = В ]; then
             # Распаковка временная: работать из неё нельзя, сообщение уже напечатано.
             [ "$rc" = 0 ] && die 'Установленная копия Astra Voice повреждена.'
@@ -206,4 +211,10 @@ fi
 ASTRA_VOICE_RESOURCES=$HERE/usr/share/astra-voice
 ASTRA_VOICE_APPIMAGE_DIR=$HERE
 export SSL_CERT_FILE ASTRA_VOICE_RESOURCES ASTRA_VOICE_APPIMAGE_DIR
+if [ "$CHILD" = 1 ]; then
+    rc=0
+    "$PY" -I "$BOOTSTRAP" app "$@" || rc=$?
+    drop_extracted
+    exit "$rc"
+fi
 exec "$PY" -I "$BOOTSTRAP" app "$@"

@@ -485,3 +485,21 @@ def test_policy_denial_with_system_version_hands_over_to_app(
         f"app|--hidden|HERE={bundle}|EAR=|PP=",
     ]
     assert not _app(env).exists()
+    # Режим В: распаковку в $TMPDIR убираем после работы app (ревью P3); монтирование — не наше.
+    assert bundle.exists() is (mode_dir == ".mount_Ab12Cd")
+
+
+def test_extract_mode_handoff_keeps_app_exit_code(tmp_path: Path, env: dict[str, str]) -> None:
+    """Режим В, код 10: app — дочерним процессом, его код выхода — код AppRun."""
+    extracted = _bundle(tmp_path / "appimage_extracted_1")
+    python = extracted / "opt" / "python3.11" / "bin" / "python3.11"
+    python.write_text(
+        python.read_text(encoding="utf-8").replace(
+            "        exit 0 ;;\nesac", "        exit 5 ;;\nesac"
+        ),
+        encoding="utf-8",
+    )
+    proc = _run(extracted / "AppRun", ["--hidden"], {**env, "APPRUN_TEST_SELFINSTALL_RC": "10"})
+    assert proc.returncode == 5
+    assert [call.split("|")[0] for call in _calls(env)] == ["selfinstall", "app"]
+    assert not extracted.exists()

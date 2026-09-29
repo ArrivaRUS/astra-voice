@@ -159,21 +159,17 @@ def _runtime_dir_candidates(*, reading: bool = False) -> tuple[Path, ...]:
     return (fallback,)
 
 
-def existing_runtime_dir() -> Path | None:
-    """Каталог, куда могла писать работающая копия, — только чтение, без mkdir/chmod.
-
-    Первый кандидат, уже существующий как наш каталог (не symlink); ``None`` — ни
-    одного нет, значит, в runtime ещё ничего не записано. Без ``XDG_RUNTIME_DIR``
-    сначала проверяется каталог сеанса ``/run/user/<uid>/astra-voice``.
-    """
+def existing_runtime_dirs() -> tuple[Path, ...]:
+    """Все кандидаты для чтения, уже существующие как наш каталог (не symlink), по порядку."""
+    found: list[Path] = []
     for candidate in _runtime_dir_candidates(reading=True):
         try:
             info = candidate.lstat()
         except OSError:
             continue
         if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
-            return candidate
-    return None
+            found.append(candidate)
+    return tuple(found)
 
 
 def log_dir() -> Path:

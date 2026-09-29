@@ -278,11 +278,16 @@ def check_free_space(path: Path, required: int = MIN_FREE_BYTES) -> None:
 def running_key_path() -> Path | None:
     """Путь для чтения без создания каталогов (в том числе из status()).
 
-    Каталог выбирается тем же правилом, что и при записи (``paths.runtime_dir()``);
-    без ``XDG_RUNTIME_DIR`` сначала — каталог сеанса ``/run/user/<uid>/astra-voice``.
+    Файл ищется во всех существующих кандидатах по порядку записи
+    (``paths.runtime_dir()``): без ``XDG_RUNTIME_DIR`` — сначала каталог сеанса
+    ``/run/user/<uid>/astra-voice``, затем запасной ``/tmp/astra-voice-<uid>`` (туда
+    пишет копия, запущенная без ``XDG_RUNTIME_DIR``).
     """
-    directory = paths.existing_runtime_dir()
-    return None if directory is None else directory / RUNNING_KEY_NAME
+    for directory in paths.existing_runtime_dirs():
+        path = directory / RUNNING_KEY_NAME
+        if os.path.lexists(path):
+            return path
+    return None
 
 
 def read_running_key() -> str | None:

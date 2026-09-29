@@ -579,3 +579,18 @@ def test_running_key_session_dir_ignored_with_xdg(
     session.mkdir(parents=True, mode=0o700)
     put(session / "running-key", (KEY + "\n").encode())
     assert userinstall.read_running_key() is None
+
+
+def test_running_key_found_in_fallback_when_session_dir_has_none(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ревью P3: /run/user/<uid>/astra-voice есть, но без отметки — ищем дальше, в /tmp."""
+    root = tmp_path / "run-user"
+    monkeypatch.setattr(paths, "USER_RUNTIME_ROOT", root)
+    (root / str(os.getuid()) / "astra-voice").mkdir(parents=True, mode=0o700)
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+    userinstall.write_running_key(KEY)  # копия без XDG_RUNTIME_DIR пишет в запасной каталог
+    fallback = tmp_path / f"astra-voice-{os.getuid()}" / "running-key"
+    assert fallback.is_file()
+    assert userinstall.running_key_path() == fallback
+    assert userinstall.read_running_key() == KEY
