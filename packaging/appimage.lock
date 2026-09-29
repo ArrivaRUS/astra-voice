@@ -134,8 +134,12 @@
 # libfuse 3.15.0 — статически в runtime (LGPL-2.1), github.com/libfuse/libfuse, релиз fuse-3.15.0.
 # Это загруженный ассет релиза (не архив, генерируемый GitHub): байты стабильны.
 # sha256 архива совпал с пином scripts/common/install-dependencies.sh type2-runtime (коммит dd6cebed).
-# Подпись .asc: издатель ED31791B2C5C1613AF388B8AD113FCAC3C4E599F (Nikolaus Rath); открытого ключа в
-# разрешённых источниках нет — подпись ещё НЕ проверена (нужен ключ, см. отчёт 29.09).
+# Подпись .asc проверена 29.09 во временном GNUPGHOME: VALIDSIG от 2023-06-09 ключом
+# ED31791B2C5C1613AF388B8AD113FCAC3C4E599F (Nikolaus Rath; отпечаток совпал в github.com/Nikratio.gpg
+# и keys.openpgp.org, отзыва нет), но срок ключа истёк 2024-03-11 — статус EXPKEYSIG. Исключений
+# для EXPKEYSIG не вводим, ключ в репозиторий не кладём (решение Юрки 29.09, вариант (б)):
+# целостность держат sha256 ниже и независимый пин в scripts/common/install-dependencies.sh
+# type2-runtime (коммит dd6cebed).
 # source: {"id":"libfuse-3.15.0","file":"fuse-3.15.0.tar.xz","size":4589124,"sha256":"70589cfd5e1cff7ccd6ac91c86c01be340b227285c5e200baa284e401eea2ca0","url":"https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz"}
 # source: {"id":"libfuse-3.15.0-sig","file":"fuse-3.15.0.tar.xz.asc","size":1012,"sha256":"087dfd45c7a1768c5d5cf7068eefd3cacc302f4ff8db5a6828668bc08725339f","url":"https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz.asc"}
 # Прочее, вшитое в runtime статически (сборка в Alpine 3.21): squashfuse 0.5.2 (BSD-2), musl, zstd,
