@@ -1785,6 +1785,20 @@ class ModelDownloads(QObject):
             else:
                 self._begin_queue((entry,))
 
+    def retryFailed(self) -> None:  # noqa: N802
+        """«Повторить» полосы загрузки: ``retryModel`` для каждой записи с ошибкой.
+
+        После неудачи запись выходит из выбора, поэтому ``startSelectedDownloads``
+        её не видит. Порядок — каталога, не порядка ошибок: первая запись начинает
+        очередь, остальные встают за ней; во время загрузки — в конец очереди.
+        Отозванные и снятые с каталога записи ``retryModel`` пропускает сам.
+        """
+        failed = [
+            entry.id for entry in self._entries if self._card_states.get(entry.id) == "failed"
+        ]
+        for model_id in failed:
+            self.retryModel(model_id)
+
     def _idle(self) -> bool:
         """Во время паузы без потока установленными моделями можно управлять."""
         return not (

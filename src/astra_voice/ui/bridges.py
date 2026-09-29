@@ -79,21 +79,6 @@ _SAFE_MODEL_MESSAGES = frozenset(
 )
 
 
-def retry_failed_downloads(downloads: ModelDownloads) -> None:
-    """«Повторить» полосы загрузки: ``retryModel`` для каждой записи с ошибкой.
-
-    Общий для окна настроек и мастера. Порядок — каталога: первая запись
-    начинает очередь, остальные встают за ней.
-    """
-    failed = [
-        str(row["id"])
-        for row in downloads.models
-        if row.get("state") == "failed" and row.get("canRetry") is True
-    ]
-    for model_id in failed:
-        downloads.retryModel(model_id)
-
-
 class SettingsApply(Protocol):
     """Живое применение настроек; захват клавиши проверяется до записи."""
 
@@ -375,7 +360,7 @@ class SettingsBridge(QObject):
         каталога: первая начинает очередь, остальные встают за ней.
         """
         if self._downloads is not None:
-            retry_failed_downloads(self._downloads)
+            self._downloads.retryFailed()
 
     @pyqtSlot(str)
     def cancelModel(self, model_id: str) -> None:  # noqa: N802
@@ -1249,7 +1234,7 @@ class OnboardingController(QObject):
     @pyqtSlot()
     def retryFailedDownloads(self) -> None:  # noqa: N802
         """«Повторить» полосы мастера: после неудачи запись уже вне выбора (§10.3, 4)."""
-        retry_failed_downloads(self._downloads)
+        self._downloads.retryFailed()
 
     @pyqtSlot(str)
     def cancelModel(self, model_id: str) -> None:  # noqa: N802
