@@ -449,3 +449,14 @@ def test_one_shared_cache_per_process() -> None:
     checker = checker_module.create_app_checker(Settings(), Policy())
     assert checker._cache is shared_cache()
     assert checker.status.state == "disabled"
+
+
+def test_manual_result_does_not_override_offline(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    rig.settings = Settings(check_app_updates=False)
+    checker = rig.start()
+    rig.wait(lambda s: s.state == "disabled")
+    checker.check_now()
+    rig.wait(lambda s: s.state == "available" and s.manual)
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    checker.remind_later()  # любой пересчёт без refresh()
+    rig.wait(lambda s: s.state == "disabled")

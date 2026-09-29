@@ -323,12 +323,13 @@ class UpdateChecker:
             last_attempt_at=state.last_attempt_at,
             last_success_at=state.last_success_at,
         )
-        if not self._manual_view:
-            refusal = self._gate.refusal("check_app")
-            if refusal in ("admin", "policy"):
-                return replace(base, state="policy-locked")
-            if refusal:
-                return replace(base, state="disabled")
+        # Результат ручной проверки перекрывает только выключенный тумблер,
+        # но не офлайн и не запрет администратора.
+        refusal = self._gate.refusal("check_app")
+        if refusal in ("admin", "policy"):
+            return replace(base, state="policy-locked")
+        if refusal and (refusal != "settings" or not self._manual_view):
+            return replace(base, state="disabled")
         failed = failed_now or (
             state.last_attempt_at is not None
             and (state.last_success_at is None or state.last_attempt_at > state.last_success_at)
