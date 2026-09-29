@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from astra_voice.core import childenv, paths
+from astra_voice.core import childenv, paths, policy
 from astra_voice.platform import userinstall
 from helpers.appimage_bundle import KEY, VERSION, make_bundle
 
@@ -128,7 +128,7 @@ def test_extract_and_run_installs_and_starts_copy(
         rf"app\|--version\|HERE={re.escape(str(app))}/\.tmp-{re.escape(KEY)}\.[^|]+\|EAR=\|PP=",
         calls[1],
     )
-    assert calls[2:] == [f"app|--hidden|HERE={target}|EAR=|PP="]
+    assert calls[2:] == [f"app|--register --hidden|HERE={target}|EAR=|PP="]
 
 
 def test_second_run_takes_fast_path(tmp_path: Path, env: dict[str, str]) -> None:
@@ -138,7 +138,7 @@ def test_second_run_takes_fast_path(tmp_path: Path, env: dict[str, str]) -> None
     second = _bundle(tmp_path / "b" / "appimage_extracted_2")
     proc = _run(second / "AppRun", ["--hidden"], env)
     assert proc.returncode == 0, proc.stderr
-    assert _calls(env) == [f"app|--hidden|HERE={_app(env) / KEY}|EAR=|PP="]
+    assert _calls(env) == [f"app|--register --hidden|HERE={_app(env) / KEY}|EAR=|PP="]
     assert not second.exists()
 
 
@@ -272,7 +272,7 @@ def test_fuse_mode_installs_and_starts_copy(
     assert proc.returncode == 0, proc.stderr
     assert os.readlink(_app(env) / "current") == KEY
     assert bundle.exists()  # монтирование не удаляется
-    assert _calls(env)[-1] == f"app|--hidden|HERE={_app(env) / KEY}|EAR=|PP="
+    assert _calls(env)[-1] == f"app|--register --hidden|HERE={_app(env) / KEY}|EAR=|PP="
 
 
 @pytest.mark.parametrize("shell", SHELLS)
@@ -347,3 +347,78 @@ def test_xdg_data_home_same_as_python(
     monkeypatch.setenv("HOME", env["HOME"])
     monkeypatch.setenv("XDG_DATA_HOME", value)
     assert f"ROOT={paths.appimage_app_dir()}" in status.stdout.splitlines()
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("value", ["deny", "DENY", " no ", "false", "0", "off"])
+def test_policy_denial_stops_before_copy(
+    tmp_path: Path, env: dict[str, str], shell: str | None, value: str
+) -> None:
+    """T-180: режим В отказывает до Python и создания app/ (arch/appimage.md §5)."""
+    extracted = _bundle(tmp_path / "appimage_extracted_1")
+    config = tmp_path / "policy.conf"
+    config.write_text(f"[astra-voice]\nappimage = {value}\n", encoding="utf-8")
+    run_env = {**env, "ASTRA_VOICE_POLICY_FILE": str(config)}
+    proc = _run(extracted / "AppRun", [], run_env, shell)
+    assert proc.returncode == 3
+    assert proc.stderr == policy.APPIMAGE_DENIED_MESSAGE + "\n"
+    assert not _app(env).exists()
+    assert _calls(env) == []
+    assert extracted.exists()
+    status = _run(extracted / "AppRun", ["--selfinstall-status"], run_env, shell)
+    assert status.returncode == 0
+    assert status.stdout.startswith("MODE=В\n")
+
+
+@pytest.mark.parametrize("value", ["allow", "deny-extra", "profile-secure"])
+def test_policy_allows_install_and_is_removed_from_environment(
+    tmp_path: Path, env: dict[str, str], value: str
+) -> None:
+    extracted = _bundle(tmp_path / "appimage_extracted_1")
+    config = tmp_path / "policy.conf"
+    text = "profile = secure" if value == "profile-secure" else f"appimage = {value}"
+    config.write_text(f"[astra-voice]\n{text}\n", encoding="utf-8")
+    run_env = {**env, "ASTRA_VOICE_POLICY_FILE": str(config)}
+    proc = _run(extracted / "AppRun", ["--hidden"], run_env)
+    assert proc.returncode == 0, proc.stderr
+    assert os.readlink(_app(env) / "current") == KEY
+    assert not extracted.exists()
+    assert _calls(env)[-1] == f"app|--register --hidden|HERE={_app(env) / KEY}|EAR=|PP="
+    final_env = Path(env["APPRUN_TEST_LOG"] + ".env").read_text(encoding="utf-8")
+    assert "ASTRA_VOICE_POLICY_FILE=" not in final_env
+
+
+@pytest.mark.parametrize("mode_dir", [".mount_Ab12Cd", "appimage_extracted_1"])
+def test_python_policy_denial_stops_without_fallback(
+    tmp_path: Path, env: dict[str, str], mode_dir: str
+) -> None:
+    """Код 3 реального bootstrap selfinstall не разрешает запуск из монтирования."""
+    bundle = _bundle(tmp_path / mode_dir)
+    config = tmp_path / "policy.conf"
+    config.write_text("[astra-voice]\nappimage = deny\n", encoding="utf-8")
+    preliminary = tmp_path / "allow.conf"
+    preliminary.write_text("[astra-voice]\nappimage = allow\n", encoding="utf-8")
+    # Путь политики и трек внедряем в тестовый bootstrap, не через окружение Python.
+    boot = bundle / "usr" / "lib" / "astra-voice" / "bootstrap.py"
+    boot.unlink()
+    boot.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(REPO_ROOT / 'src')!r})\n"
+        "from pathlib import Path\n"
+        "from astra_voice import bootstrap\n"
+        "from astra_voice.core import paths, policy\n"
+        f"policy.POLICY_PATH = Path({str(config)!r})\n"
+        "paths.install_kind = lambda: paths.InstallKind.APPIMAGE_PORTABLE\n"
+        "raise SystemExit(bootstrap.main())\n",
+        encoding="utf-8",
+    )
+    run_env = {
+        **_fuse_env(tmp_path, env, bundle),
+        "ASTRA_VOICE_POLICY_FILE": str(preliminary),
+    }
+    proc = _run(bundle / "AppRun", ["--hidden"], run_env)
+    assert proc.returncode == 3
+    assert proc.stderr == policy.APPIMAGE_DENIED_MESSAGE + "\n"
+    assert [call.split("|")[0] for call in _calls(env)] == ["selfinstall"]
+    assert not _app(env).exists()
+    assert bundle.exists()

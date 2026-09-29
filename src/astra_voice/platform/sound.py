@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -25,6 +24,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
+from astra_voice.core import childenv
 from astra_voice.platform.session import SessionKind
 
 log = logging.getLogger(__name__)
@@ -103,16 +103,17 @@ class MicrophoneState:
         return self.known and (self.muted or 0 <= self.percent < FULL_VOLUME_PERCENT)
 
 
-def _spawn(command: Sequence[str]) -> bool:
+def _spawn(command: Sequence[str], *, popen: Callable[..., object] = subprocess.Popen) -> bool:
     """Запускает окно настроек и сразу отпускает его: GUI не ждёт выхода."""
     try:
-        subprocess.Popen(  # noqa: S603 — команда из закрытого списка модуля
+        popen(
             list(command),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             shell=False,
+            env=childenv.clean_env(),
         )
     except OSError:
         log.warning("Не удалось открыть системные настройки звука")
@@ -180,7 +181,7 @@ class SoundControl:
                 capture_output=True,
                 text=True,
                 timeout=COMMAND_TIMEOUT_S,
-                env={**os.environ, "LC_ALL": "C"},
+                env={**childenv.clean_env(keep_pulse_config=True), "LC_ALL": "C"},
                 shell=False,
                 check=False,
             )
@@ -240,6 +241,7 @@ class SoundControl:
                     capture_output=True,
                     text=True,
                     timeout=COMMAND_TIMEOUT_S,
+                    env=childenv.clean_env(),
                     shell=False,
                     check=False,
                 )

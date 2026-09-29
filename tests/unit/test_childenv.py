@@ -82,6 +82,45 @@ def test_keep_pulse_config_for_pactl() -> None:
     assert kept["PULSE_CLIENTCONFIG"] == "/home/u/.cache/astra-voice/pulse-client.conf"
 
 
+@pytest.mark.parametrize("keep_pulse_config", [False, True])
+def test_deb_unmodified_environment_is_identity(tmp_path: Path, keep_pulse_config: bool) -> None:
+    """Без переменных запуска программы окружение .deb сохраняется целиком (§10.4)."""
+    user = {
+        "HOME": str(tmp_path),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
+        "PATH": "/usr/bin:/bin",
+        "LANG": "ru_RU.UTF-8",
+        "LC_ALL": "ru_RU.UTF-8",
+        "TMPDIR": str(tmp_path / "tmp"),
+        **{name: f"user-{name}" for name in childenv.RESTORABLE},
+    }
+    before = user.copy()
+    result = childenv.clean_env(user, keep_pulse_config=keep_pulse_config)
+    assert result == before
+    assert result is not user
+    assert user == before
+    assert {**result, "LC_ALL": "C"} == {**before, "LC_ALL": "C"}
+
+
+def test_deb_bootstrap_environment_restored(tmp_path: Path) -> None:
+    """pactl сохраняет запрет autospawn, программы пользователя — исходное окружение."""
+    user = {"HOME": str(tmp_path), "TMPDIR": str(tmp_path / "tmp")}
+    launched = {
+        **user,
+        "QT_QUICK_BACKEND": "software",
+        "QT_XCB_GL_INTEGRATION": "none",
+        "PULSE_CLIENTCONFIG": str(tmp_path / "pulse-client.conf"),
+        "ASTRA_VOICE_ORIG_UNSET": "QT_QUICK_BACKEND QT_XCB_GL_INTEGRATION PULSE_CLIENTCONFIG",
+    }
+    assert childenv.clean_env(launched) == user
+    assert childenv.clean_env(launched, keep_pulse_config=True) == {
+        **user,
+        "PULSE_CLIENTCONFIG": launched["PULSE_CLIENTCONFIG"],
+    }
+
+
 def test_save_is_first_write_only() -> None:
     env = {"SSL_CERT_FILE": "/corp.pem"}
     childenv.save_originals(["SSL_CERT_FILE", "PYTHONHOME"], env)

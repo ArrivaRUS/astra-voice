@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -87,6 +88,9 @@ class AutostartState:
     user: Literal["none", "ours", "foreign"]
     system: bool
     system_hidden: bool
+    target: Literal["ours-this", "ours-other", "foreign", "system", "none"] = field(
+        default="none", compare=False
+    )
 
 
 def _paths() -> tuple[Path, list[Path]]:
@@ -124,6 +128,45 @@ def _true(properties: dict[bytes, bytes], key: bytes) -> bool:
     return properties.get(key, b"").strip().lower() in (b"true", b"1", b"yes", b"on")
 
 
+def _exec_program(value: bytes) -> str | None:
+    """Первое слово Exec: строковые escape, затем кавычки и %% (Desktop Entry §7)."""
+    try:
+        command = value.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    escapes = {"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\"}
+    command = re.sub(r"\\([sntr\\])", lambda match: escapes[match[1]], command).lstrip()
+    quoted = command.startswith('"')
+    index = 1 if quoted else 0
+    program: list[str] = []
+    while index < len(command):
+        char = command[index]
+        if quoted and char == '"':
+            index += 1
+            if index < len(command) and command[index] not in " \t\r\n":
+                return None
+            break
+        if not quoted and char in " \t\r\n":
+            break
+        if quoted and char == "\\":
+            index += 1
+            if index == len(command) or command[index] not in '"`$\\':
+                return None
+            char = command[index]
+        elif (not quoted and char in _EXEC_RESERVED) or (quoted and char in "`$"):
+            return None
+        if char == "%":
+            index += 1
+            if index == len(command) or command[index] != "%":
+                return None
+        program.append(char)
+        index += 1
+    else:
+        if quoted:
+            return None
+    return "".join(program) or None
+
+
 def _read(path: Path) -> bytes | None:
     try:
         mode = os.lstat(path).st_mode
@@ -153,16 +196,25 @@ def _inspect() -> tuple[AutostartState, Path, bytes | None]:
     system_data = next((data for path in system_paths if (data := _read(path)) is not None), None)
     system_hidden = system_data is not None and _true(_properties(system_data), b"Hidden")
     user: Literal["none", "ours", "foreign"]
+    target: Literal["ours-this", "ours-other", "foreign", "system", "none"]
     if user_data is None:
         user = "none"
+        target = "system" if system_data is not None else "none"
     elif _true(_properties(user_data), b"X-AstraVoice-Managed"):
         user = "ours"
+        target = "ours-other"
+        try:
+            if _exec_program(_properties(user_data).get(b"Exec", b"")) == executable():
+                target = "ours-this"
+        except AutostartUnavailableError:
+            pass
     else:
         user = "foreign"
+        target = "foreign"
     selected = user_data if user_data is not None else system_data
     enabled = selected is not None and not _true(_properties(selected), b"Hidden")
     return (
-        AutostartState(enabled, user, system_data is not None, system_hidden),
+        AutostartState(enabled, user, system_data is not None, system_hidden, target),
         user_path,
         user_data,
     )
@@ -251,6 +303,99 @@ def _sync_directory(directory: Path) -> None:
 def _unlink(path: Path) -> None:
     path.unlink()
     _sync_directory(path.parent)
+
+
+def remove_ours() -> bool:
+    """Удаляет только нашу обычную запись при снятии регистрации (§4)."""
+    path = _paths()[0]
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return False
+    except FileNotFoundError:
+        return False
+    data = _read(path)
+    if data is None or not _true(_properties(data), b"X-AstraVoice-Managed"):
+        return False
+    _unlink(path)
+    return True
+
+
+def _line_ending(line: bytes) -> bytes:
+    return (
+        b"\r\n" if line.endswith(b"\r\n") else line[-1:] if line.endswith((b"\n", b"\r")) else b""
+    )
+
+
+def _retarget_lines(data: bytes, path: str) -> bytes:
+    """Меняем только Exec/TryExec в основной секции, сохраняя оформление (§3)."""
+    exec_line = f"Exec={_exec_argument(path)} --hidden".encode()
+    try_line = (
+        f"TryExec={path}".encode()
+        if path != DEB_EXECUTABLE and not _EXEC_RESERVED.intersection(path) and "%" not in path
+        else None
+    )
+    lines = data.splitlines(keepends=True)
+    exec_indices: set[int] = set()
+    try_indices: set[int] = set()
+    in_entry = False
+    for index, line in enumerate(lines):
+        stripped = _group_line(line)
+        if stripped.startswith(b"[") and stripped.endswith(b"]"):
+            in_entry = stripped == b"[Desktop Entry]"
+        elif in_entry and b"=" in line and not stripped.startswith(b"#"):
+            key = line.split(b"=", 1)[0].strip()
+            if key == b"Exec":
+                exec_indices.add(index)
+            elif key == b"TryExec":
+                try_indices.add(index)
+    if not exec_indices:
+        raise AutostartError("В записи автозапуска не указана программа")
+    newline = b"\r\n" if b"\r\n" in data else b"\n"
+    result: list[bytes] = []
+    for index, line in enumerate(lines):
+        ending = _line_ending(line)
+        if index in exec_indices:
+            result.append(exec_line + ending)
+            if try_line is not None and not try_indices:
+                if not ending:
+                    result[-1] += newline
+                result.append(try_line + ending)
+        elif index in try_indices:
+            if try_line is not None:
+                result.append(try_line + ending)
+        else:
+            result.append(line)
+    updated = b"".join(result)
+    if not _line_ending(data):
+        # Удалённый последний TryExec не должен добавлять финальный перевод строки.
+        updated = updated.removesuffix(_line_ending(updated))
+    return updated
+
+
+def retarget(executable_path: str | None = None) -> bool:
+    """Перенацелить нашу запись при register/unregister, никогда при старте (§3)."""
+    path = _paths()[0]
+    try:
+        target = executable() if executable_path is None else executable_path
+        if target != DEB_EXECUTABLE and target != str(
+            paths.check_appimage_launcher(paths.appimage_current_apprun())
+        ):
+            raise AutostartError("Недопустимая программа для автозапуска")
+        _exec_argument(target)
+        if path.is_symlink():
+            raise AutostartError(f"Запись автозапуска является симлинком: {path}")
+        data = _read(path)
+        if data is None or not _true(_properties(data), b"X-AstraVoice-Managed"):
+            return False
+        updated = _retarget_lines(data, target)
+        if updated == data:
+            return False
+        _write(path, updated)
+        return True
+    except OSError as exc:
+        if isinstance(exc, AutostartError):
+            raise
+        raise AutostartError(f"Не удалось изменить запись автозапуска {path}: {exc}") from exc
 
 
 def set_enabled(enabled: bool) -> None:

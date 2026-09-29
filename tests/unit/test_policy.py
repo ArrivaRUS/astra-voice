@@ -132,3 +132,59 @@ def test_effective_does_not_mutate_source(tmp_path: Path) -> None:
 def test_absent_policy_changes_nothing() -> None:
     original = Settings(hotkey="Ctrl+J")
     assert pol.effective(original, pol.Policy()) == original
+
+
+@pytest.mark.parametrize("value", ["deny", "DENY", " no ", "false", "0", "off"])
+def test_appimage_denied_values(tmp_path: Path, value: str) -> None:
+    policy = pol.load(_write(tmp_path, f"[astra-voice]\n APPIMAGE = {value}\n"))
+    assert policy.status is pol.PolicyStatus.OK
+    assert pol.appimage_denied(policy)
+
+
+@pytest.mark.parametrize("value", ["allow", " ALLOW ", "yes", "true", "1", "on"])
+def test_appimage_allowed_values(tmp_path: Path, value: str) -> None:
+    policy = pol.load(_write(tmp_path, f"[astra-voice]\nappimage = {value}\n"))
+    assert not pol.appimage_denied(policy)
+
+
+@pytest.mark.parametrize("value", ["мусор", "", "deny-extra"])
+def test_unknown_appimage_value_warns_and_allows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, value: str
+) -> None:
+    policy = pol.load(_write(tmp_path, f"[astra-voice]\nappimage = {value}\n"))
+    with caplog.at_level("WARNING", logger=pol.__name__):
+        assert not pol.appimage_denied(policy)
+    assert any(
+        record.name == pol.__name__
+        and record.levelname == "WARNING"
+        and "appimage" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[astra-voice]\nlanguage = ru\n",
+        "[astra-voice]\nprofile = secure\n",
+        "[astra-voice]\nlanguage = ru\n[other]\nappimage = deny\n",
+    ],
+)
+def test_appimage_without_key_is_allowed(tmp_path: Path, text: str) -> None:
+    """T-180: secure без appimage=deny не запрещает трек (arch/appimage.md §5)."""
+    policy = pol.load(_write(tmp_path, text))
+    assert policy.status is pol.PolicyStatus.OK
+    assert not pol.appimage_denied(policy)
+
+
+def test_appimage_absent_policy_is_allowed(tmp_path: Path) -> None:
+    assert not pol.appimage_denied(pol.load(tmp_path / "absent.conf"))
+
+
+def test_appimage_invalid_policy_is_allowed(tmp_path: Path) -> None:
+    policy = pol.load(_write(tmp_path, "[astra-voice]\nappimage = deny\n[сломано\n"))
+    assert policy.status is pol.PolicyStatus.INVALID
+    assert not pol.appimage_denied(policy)
+    assert not pol.appimage_denied(
+        pol.Policy(values={"appimage": "deny"}, status=pol.PolicyStatus.INVALID)
+    )

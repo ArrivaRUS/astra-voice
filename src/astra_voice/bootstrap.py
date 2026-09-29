@@ -109,6 +109,14 @@ def main(argv: list[str] | None = None) -> int:
     if refused is not None:
         return refused
 
+    if command in ("app", "selfinstall"):
+        from astra_voice.core import paths, policy
+
+        # Совещательный запрет трека до любых действий (arch/appimage.md §5).
+        if paths.install_kind().is_appimage and policy.appimage_denied(policy.load()):
+            sys.stderr.write(policy.APPIMAGE_DENIED_MESSAGE + "\n")
+            return 3
+
     if command == "selfinstall":
         # Самоустановка AppImage (arch/appimage.md §1): без Qt, без аудио.
         from astra_voice.platform.userinstall import selfinstall_main

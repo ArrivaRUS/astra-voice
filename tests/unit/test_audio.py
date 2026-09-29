@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import json
 import logging
+import os
 import struct
 import subprocess
 import sys
@@ -190,7 +191,7 @@ def test_default_device_command_and_deadline(
     assert kwargs["check"] is False
     assert kwargs["timeout"] == min(5, OPEN_TOTAL_DEADLINE_S - now)
     assert kwargs["env"]["LC_ALL"] == "C"
-    assert kwargs["env"]["ASTRA_VOICE_TEST_ENV"] == "preserved"
+    assert "ASTRA_VOICE_TEST_ENV" not in kwargs["env"]
 
 
 def test_default_device_expired_deadline_never_runs_command() -> None:
@@ -2824,3 +2825,101 @@ def test_list_devices_null_descriptions_come_from_pipewire(short_sources: str) -
     assert all("(null)" not in device.label for device in devices)
     devices = list_devices(run=pactl_run(short_sources, null_details))
     assert [device.description for device in devices] == ["Микрофон", "Звук системы"]
+
+
+@pytest.fixture
+def child_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> dict[str, str]:
+    """Окружение .deb после bootstrap; все пользовательские каталоги временные."""
+    for name in tuple(os.environ):
+        monkeypatch.delenv(name)
+    user = {
+        # pytest добавляет эту переменную заново перед телом теста.
+        "PYTEST_CURRENT_TEST": f"{request.node.nodeid} (call)",
+        "HOME": str(tmp_path),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        "TMPDIR": str(tmp_path / "tmp"),
+        "PATH": "/usr/bin:/bin",
+        "LANG": "ru_RU.UTF-8",
+        "LC_ALL": "ru_RU.UTF-8",
+    }
+    launched = {
+        **user,
+        "QT_QUICK_BACKEND": "software",
+        "QT_XCB_GL_INTEGRATION": "none",
+        "PULSE_CLIENTCONFIG": str(tmp_path / "pulse-client.conf"),
+        "ASTRA_VOICE_ORIG_UNSET": "QT_QUICK_BACKEND QT_XCB_GL_INTEGRATION PULSE_CLIENTCONFIG",
+    }
+    for name, value in launched.items():
+        monkeypatch.setenv(name, value)
+    return user
+
+
+@pytest.mark.parametrize("appimage", [False, True])
+@pytest.mark.parametrize("pactl_available", [False, True])
+def test_device_commands_receive_clean_environment(
+    child_environment: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    appimage: bool,
+    pactl_available: bool,
+) -> None:
+    """§10.4: pactl, pw-dump и wpctl получают очищенное окружение воркера."""
+    if appimage:
+        for name in (
+            "ASTRA_VOICE_APPIMAGE_DIR",
+            "APPIMAGE",
+            "APPIMAGE_EXTRACT_AND_RUN",
+            "APPDIR",
+            "ARGV0",
+            "OWD",
+        ):
+            monkeypatch.setenv(name, "bundle-value")
+    before = dict(os.environ)
+    pw_dump = json.dumps(
+        [
+            {
+                "id": 1,
+                "info": {
+                    "props": {
+                        "media.class": "Audio/Source",
+                        "node.name": "mic",
+                        "node.description": "Микрофон",
+                    }
+                },
+            }
+        ]
+    )
+    listing = Mock(
+        wraps=pactl_run("1\tmic\tmodule\n", short_code=0 if pactl_available else 1, pw_dump=pw_dump)
+    )
+    default = Mock(
+        wraps=default_source_run(
+            "mic\n", code=0 if pactl_available else 1, wpctl='node.name = "mic"'
+        )
+    )
+    devices = list_devices(run=listing)
+    assert len(devices) == 1
+    assert default_device(devices, run=default) is devices[0]
+    expected = {
+        **child_environment,
+        "LC_ALL": "C",
+        "PULSE_CLIENTCONFIG": str(tmp_path / "pulse-client.conf"),
+    }
+    calls = listing.call_args_list + default.call_args_list
+    expected_commands = [["pactl", "list", "short", "sources"]]
+    if pactl_available:
+        expected_commands.append(["pactl", "-f", "json", "list", "sources"])
+    expected_commands.extend([["pw-dump"], ["pactl", "get-default-source"]])
+    if not pactl_available:
+        expected_commands.append(["wpctl", "inspect", "@DEFAULT_AUDIO_SOURCE@"])
+    assert [call.args[0] for call in calls] == expected_commands
+    for call in calls:
+        assert call.kwargs["env"] == expected
+        assert call.kwargs["shell"] is False
+    assert dict(os.environ) == before
+    assert not (tmp_path / "cache").exists()

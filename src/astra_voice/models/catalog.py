@@ -438,14 +438,18 @@ def load_builtin(
     verifier: Verifier,
     *,
     root: Path | None = None,
-    require_schema: bool = False,
+    require_schema: bool | None = None,
     state_path: Path | None = None,
 ) -> Catalog:
     """Читает каталог: лимит → подпись → JSON → SHA-256 схемы → схема → поля.
 
     `state_path` включает защиту от отката: каталог со старшей парой
     (`trust_epoch`, `serial`) отвергается, принятый — запоминается.
+    При `require_schema=None` схема обязательна для обоих режимов AppImage
+    (arch/appimage.md §10.11, §11 п.2); явное значение имеет приоритет.
     """
+    if require_schema is None:
+        require_schema = paths.install_kind().is_appimage
     directory = (paths.data_dir_static() if root is None else root).resolve()
     catalog_path = (directory / "catalog.json").resolve()
     sig_path = (directory / "catalog.json.sig").resolve()

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Sequence
+from functools import partial
+from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -15,6 +19,7 @@ from astra_voice.platform.sound import (
     MicrophoneProblem,
     MicrophoneState,
     SoundControl,
+    _spawn,
 )
 
 pytestmark = pytest.mark.unit
@@ -199,3 +204,89 @@ def test_restart_sound_service_without_systemctl_runs_nothing() -> None:
     assert not sound.has_sound_service
     assert not sound.restart_sound_service()
     assert runner.calls == []
+
+
+@pytest.fixture
+def child_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> dict[str, str]:
+    """Окружение .deb после bootstrap; все пользовательские каталоги временные."""
+    for name in tuple(os.environ):
+        monkeypatch.delenv(name)
+    user = {
+        # pytest добавляет эту переменную заново перед телом теста.
+        "PYTEST_CURRENT_TEST": f"{request.node.nodeid} (call)",
+        "HOME": str(tmp_path),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "XDG_RUNTIME_DIR": str(tmp_path / "runtime"),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        "TMPDIR": str(tmp_path / "tmp"),
+        "PATH": "/usr/bin:/bin",
+        "LANG": "ru_RU.UTF-8",
+        "LC_ALL": "ru_RU.UTF-8",
+    }
+    launched = {
+        **user,
+        "QT_QUICK_BACKEND": "software",
+        "QT_XCB_GL_INTEGRATION": "none",
+        "PULSE_CLIENTCONFIG": str(tmp_path / "pulse-client.conf"),
+        "ASTRA_VOICE_ORIG_UNSET": "QT_QUICK_BACKEND QT_XCB_GL_INTEGRATION PULSE_CLIENTCONFIG",
+    }
+    for name, value in launched.items():
+        monkeypatch.setenv(name, value)
+    return user
+
+
+@pytest.mark.parametrize("appimage", [False, True])
+def test_external_sound_commands_receive_clean_environment(
+    child_environment: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    appimage: bool,
+) -> None:
+    """§10.4: только pactl получает наш запрет autospawn; обе команды systemctl очищены."""
+    if appimage:
+        for name in (
+            "ASTRA_VOICE_APPIMAGE_DIR",
+            "APPIMAGE",
+            "APPIMAGE_EXTRACT_AND_RUN",
+            "APPDIR",
+            "ARGV0",
+            "OWD",
+        ):
+            monkeypatch.setenv(name, "bundle-value")
+    before = dict(os.environ)
+    run = Mock(wraps=FakeRunner(fails=("pipewire-pulse.socket",)))
+    popen = Mock()
+    sound = SoundControl(
+        which=lambda name: f"/usr/bin/{name}",
+        run=run,
+        spawn=partial(_spawn, popen=popen),
+    )
+    assert sound.raise_microphone("mic")
+    assert sound.restart_sound_service()
+    assert sound.open_sound_settings()
+    assert len(run.call_args_list) == 6
+    for call in run.call_args_list:
+        expected = child_environment.copy()
+        if call.args[0][0] == "pactl":
+            expected.update(LC_ALL="C", PULSE_CLIENTCONFIG=str(tmp_path / "pulse-client.conf"))
+        assert call.kwargs["env"] == expected
+    popen.assert_called_once_with(
+        ["kcmshell5", "kcm_pulseaudio"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        shell=False,
+        env=child_environment,
+    )
+    assert dict(os.environ) == before
+    assert not (tmp_path / "cache").exists()
+
+
+def test_spawn_oserror_returns_false(child_environment: dict[str, str]) -> None:
+    popen = Mock(side_effect=OSError("недоступно"))
+    assert _spawn(["pavucontrol"], popen=popen) is False
+    popen.assert_called_once()

@@ -30,8 +30,10 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from astra_voice.core import childenv, paths
+from astra_voice.platform import autostart
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +118,41 @@ class InstallResult:
     target: Path
     copied: bool
     previous: str | None
+
+
+@dataclass(frozen=True)
+class RegisterResult:
+    """Меню: записано, совпало или чужое; значки: записаны/пропущены."""
+
+    menu: Literal["written", "unchanged", "foreign"]
+    icons_written: tuple[Path, ...]
+    icons_skipped: tuple[Path, ...]
+    autostart: bool
+
+
+@dataclass(frozen=True)
+class UnregisterResult:
+    menu: bool
+    icons: tuple[Path, ...]
+    autostart: bool
+
+
+@dataclass(frozen=True)
+class RemoveResult:
+    unregistered: UnregisterResult
+    removed: tuple[str, ...]
+    kept: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class InstallStatus:
+    current: str | None
+    previous: str | None
+    running: str | None
+    installed: tuple[str, ...]
+    menu: Literal["ours", "foreign", "none"]
+    icons: bool
+    autostart: str
 
 
 Smoke = Callable[[Path, BuildInfo], None]
@@ -236,7 +273,20 @@ def check_free_space(path: Path, required: int = MIN_FREE_BYTES) -> None:
 
 
 def running_key_path() -> Path:
-    return paths.runtime_dir() / RUNNING_KEY_NAME
+    """Путь для чтения без создания каталогов (в том числе из status())."""
+    raw = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if raw.startswith("/"):
+        directory = Path(raw) / paths.APP_NAME
+        try:
+            info = directory.lstat()
+        except FileNotFoundError:
+            return directory / RUNNING_KEY_NAME
+        except OSError:
+            pass
+        else:
+            if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
+                return directory / RUNNING_KEY_NAME
+    return paths.FALLBACK_TMP_DIR / f"{paths.APP_NAME}-{os.getuid()}" / RUNNING_KEY_NAME
 
 
 def read_running_key() -> str | None:
@@ -257,7 +307,7 @@ def write_running_key(key: str) -> None:
     """Отмечает работающую копию, чтобы чистка её не удалила (Р5)."""
     if not is_key(key):
         raise ValueError(f"не KEY копии: {key!r}")
-    path = running_key_path()
+    path = paths.runtime_dir() / RUNNING_KEY_NAME
     temporary = path.with_name(f".{RUNNING_KEY_NAME}.{secrets.token_hex(6)}")
     temporary.write_text(key + "\n", encoding="ascii")
     os.replace(temporary, path)
@@ -425,12 +475,12 @@ def _switch_current(app: Path, key: str) -> str | None:
 
 
 def _remove_entry(path: Path) -> bool:
-    """Удаляет каталог (``rmtree`` не идёт по ссылкам) или ссылку; остальное не трогает."""
+    """Удаляет каталог копии или свою временную запись; по ссылкам не идёт."""
     try:
         mode = os.lstat(path).st_mode
         if stat.S_ISDIR(mode):
             shutil.rmtree(path)
-        elif stat.S_ISLNK(mode) and path.name.startswith(TMP_PREFIX):
+        elif path.name.startswith(TMP_PREFIX) and (stat.S_ISLNK(mode) or stat.S_ISREG(mode)):
             os.unlink(path)
         else:
             log.warning("Не удаляю %s: это не каталог копии", path.name)
@@ -528,6 +578,231 @@ def install_from_dir(
     if removed:
         log.info("Удалены старые копии: %s", ", ".join(removed))
     return InstallResult(info.key, target, copied, previous)
+
+
+_MENU_TEMPLATE = """[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Astra Voice
+Name[en]=Astra Voice
+GenericName=Голосовой ввод
+GenericName[en]=Voice input
+Comment=Офлайн-распознавание речи: сказали — текст появился в активном окне
+Comment[en]=Offline speech to text: speak, and the text lands in the active window
+{command}Icon=astravoice
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=диктовка;речь;распознавание;микрофон;voice;dictation;speech;
+StartupNotify=true
+StartupWMClass=astra-voice
+X-GNOME-UsesNotifications=true
+X-AstraVoice-Managed=true
+X-AppImage-Version={version}
+"""
+
+
+def menu_entry_bytes(launcher: Path, version: str) -> bytes:
+    """Шаблон data/astra-voice.desktop с установленным launcher (§4)."""
+    path = str(launcher)
+    command = f"Exec={autostart._exec_argument(path)}\n"
+    if not autostart._EXEC_RESERVED.intersection(path) and "%" not in path:
+        command += f"TryExec={path}\n"
+    return _MENU_TEMPLATE.format(command=command, version=version).encode("utf-8")
+
+
+def _desktop_paths() -> tuple[Path, Path]:
+    data = paths.appimage_app_dir().parent.parent
+    return data / "applications/astra-voice.desktop", data / "icons/hicolor"
+
+
+def _menu_state(path: Path) -> Literal["ours", "foreign", "none"]:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return "none"
+    if stat.S_ISREG(mode):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as file:
+            if stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                data = file.read()
+                if autostart._properties(data).get(b"X-AstraVoice-Managed") == b"true":
+                    return "ours"
+    return "foreign"
+
+
+def _icon_files(root: Path, *, links: bool = False) -> Iterator[Path]:
+    """Только hicolor/*/apps/astravoice.{png,svg}; не идём по ссылкам каталогов."""
+    if not _is_real_dir(root):
+        return
+    for size in sorted(root.iterdir()):
+        apps = size / "apps"
+        if not _is_real_dir(size) or not _is_real_dir(apps):
+            continue
+        for name in ("astravoice.png", "astravoice.svg"):
+            icon = apps / name
+            try:
+                mode = icon.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(mode) or (links and stat.S_ISLNK(mode)):
+                yield icon
+
+
+def _public_directory(path: Path) -> None:
+    """Создаёт каталоги меню/значков 0755, не меняя права существующих."""
+    if os.path.lexists(path):
+        if not _is_real_dir(path):
+            raise UserInstallError(f"Не удалось добавить запись: {tilde(path)} — не папка.")
+        return
+    _public_directory(path.parent)
+    path.mkdir(mode=0o755, exist_ok=True)
+    path.chmod(0o755)
+
+
+def _write_desktop_file(path: Path, data: bytes) -> bool:
+    """Атомарная запись рядом с целью; совпавшие байты сохраняют mtime (§4)."""
+    _public_directory(path.parent)
+    if os.path.lexists(path):
+        if not stat.S_ISREG(path.lstat().st_mode):
+            log.warning("Пропущен необычный файл %s", tilde(path))
+            return False
+        if path.read_bytes() == data:
+            return False
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as file:
+            temporary = file.name
+            file.write(data)
+            file.flush()
+            os.fchmod(file.fileno(), 0o644)
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+        _sync_directory(path.parent)
+    finally:
+        if temporary is not None and os.path.lexists(temporary):
+            os.unlink(temporary)
+    return True
+
+
+def register() -> RegisterResult:
+    """Добавляет установленную копию в меню, перенацеливает наш автозапуск (§2–4)."""
+    refuse_root()
+    app = paths.appimage_app_dir()
+    try:
+        key = _link_key(app / paths.APPIMAGE_CURRENT) if _is_real_dir(app) else None
+        valid = key is not None and _is_real_dir(app / key)
+        if valid and key is not None:
+            valid = stat.S_ISREG((app / key / paths.INSTALLED_MARKER).lstat().st_mode)
+    except (OSError, UserInstallError):
+        valid = False
+    if not valid or key is None:
+        raise UserInstallError("Программа ещё не установлена в домашнюю папку.")
+    launcher = paths.check_appimage_launcher(paths.appimage_current_apprun())
+    copy = app / key
+    info = read_build_info(copy)
+    data = menu_entry_bytes(launcher, info.version)
+    menu, icons = _desktop_paths()
+    menu_result: Literal["written", "unchanged", "foreign"]
+    if _menu_state(menu) == "foreign":
+        log.warning("Чужая запись меню сохранена: %s", tilde(menu))
+        menu_result = "foreign"
+    else:
+        menu_result = "written" if _write_desktop_file(menu, data) else "unchanged"
+    written: list[Path] = []
+    skipped: list[Path] = []
+    source = copy
+    for part in ("usr", "share", "icons", "hicolor"):
+        source /= part
+        if not _is_real_dir(source):
+            break
+    else:
+        for icon in _icon_files(source):
+            destination = icons / icon.relative_to(source)
+            fd = os.open(icon, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            with os.fdopen(fd, "rb") as file:
+                if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+                    continue
+                changed = _write_desktop_file(destination, file.read())
+            (written if changed else skipped).append(destination)
+    retargeted = autostart.retarget()
+    return RegisterResult(menu_result, tuple(written), tuple(skipped), retargeted)
+
+
+def unregister(*, deb_executable: Path = Path("/usr/bin/astra-voice")) -> UnregisterResult:
+    """Снимает только нашу регистрацию, возвращая автозапуск пакету при наличии (§4)."""
+    menu, icons = _desktop_paths()
+    removed_menu = _menu_state(menu) == "ours"
+    if removed_menu:
+        menu.unlink()
+        _sync_directory(menu.parent)
+    removed_icons: list[Path] = []
+    if _is_real_dir(icons.parent):
+        for icon in _icon_files(icons, links=True):
+            icon.unlink()
+            _sync_directory(icon.parent)
+            removed_icons.append(icon)
+    changed = (
+        autostart.retarget(autostart.DEB_EXECUTABLE)
+        if deb_executable.exists() and os.access(deb_executable, os.X_OK)
+        else autostart.remove_ours()
+    )
+    return UnregisterResult(removed_menu, tuple(removed_icons), changed)
+
+
+def remove_program(*, keep: str | None = None) -> RemoveResult:
+    """Удаляет только копии в app/ под замком; keep удалит вызывающий при выходе (§4)."""
+    unregistered = unregister()
+    app = paths.appimage_app_dir()
+    if not _is_real_dir(app):
+        return RemoveResult(unregistered, (), ())
+    with _install_lock(app, LOCK_TIMEOUT_S):
+        kept = (keep,) if keep is not None and is_key(keep) and _is_real_dir(app / keep) else ()
+        removed = _cleanup(app, kept)
+        for name in (paths.APPIMAGE_CURRENT, paths.APPIMAGE_PREVIOUS):
+            link = app / name
+            if link.is_symlink():
+                link.unlink()
+                removed.append(name)
+        _sync_directory(app)
+    for name in removed:
+        log.info("Удалено: %s", tilde(app / name))
+    return RemoveResult(unregistered, tuple(removed), kept)
+
+
+def status() -> InstallStatus:
+    """Состояние установки без создания файлов и каталогов (§4)."""
+    app = paths.appimage_app_dir()
+    current = previous = None
+    installed: tuple[str, ...] = ()
+    menu_state: Literal["ours", "foreign", "none"] = "none"
+    icons_present = False
+    try:
+        if _is_real_dir(app):
+            installed = tuple(
+                sorted(p.name for p in app.iterdir() if is_key(p.name) and _is_real_dir(p))
+            )
+            current = _link_key(app / paths.APPIMAGE_CURRENT)
+            previous = _link_key(app / paths.APPIMAGE_PREVIOUS)
+    except (OSError, UserInstallError) as exc:
+        log.warning("Не удалось проверить копии программы: %s", tilde(exc))
+    menu, icons = _desktop_paths()
+    try:
+        menu_state = _menu_state(menu)
+        icons_present = (
+            _is_real_dir(icons.parent) and next(_icon_files(icons, links=True), None) is not None
+        )
+    except OSError as exc:
+        log.warning("Не удалось проверить меню и значки: %s", tilde(exc))
+    try:
+        target = autostart.state().target
+    except (OSError, paths.PathError) as exc:
+        log.warning("Не удалось проверить автозапуск: %s", tilde(exc))
+        target = "none"
+    return InstallStatus(
+        current, previous, read_running_key(), installed, menu_state, icons_present, target
+    )
 
 
 def selfinstall_main(argv: Sequence[str], env: Mapping[str, str] | None = None) -> int:

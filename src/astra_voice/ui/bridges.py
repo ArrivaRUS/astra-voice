@@ -18,7 +18,6 @@ from PyQt5.QtCore import (
     pyqtSignal,
     pyqtSlot,
 )
-from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import QFileDialog
 
 from astra_voice.core.dictation import (
@@ -33,6 +32,7 @@ from astra_voice.core.dictation import (
 from astra_voice.core.settings import Settings, is_valid_combo
 from astra_voice.core.settings import save as settings_save
 from astra_voice.platform.autostart import AutostartState
+from astra_voice.platform.external import open_external
 from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui import notify
 from astra_voice.ui.formatting import (
@@ -208,7 +208,11 @@ class SettingsBridge(QObject):
         self._model_selfcheck = "idle"
         self._microphone = MicrophoneState()
         self._downloads = downloads
-        self._open_url = open_url if open_url is not None else QDesktopServices.openUrl
+        self._open_url = (
+            open_url
+            if open_url is not None
+            else lambda url: open_external(url.toString(QUrl.FullyEncoded))
+        )
         self._dialog_factory = dialog_factory
         if downloads is not None:
             for name in (
@@ -958,7 +962,11 @@ class OnboardingController(QObject):
         self._host = host
         self._resolved_device = ""
         self._dialog_factory = dialog_factory
-        self._open_url = open_url if open_url is not None else QDesktopServices.openUrl
+        self._open_url = (
+            open_url
+            if open_url is not None
+            else lambda url: open_external(url.toString(QUrl.FullyEncoded))
+        )
         self._devices = [_DEFAULT_DEVICE.copy()]
         try:
             self._devices.extend(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import overload
 
 VERSION = "0.2.0"
 BUILD_ID = "1c866c1789f7"
@@ -14,12 +15,34 @@ echo "astra-voice {VERSION}"
 """
 
 
+@overload
 def make_bundle(
     root: Path,
     *,
     version: str = VERSION,
     build_id: str = BUILD_ID,
     apprun: str | None = None,
+) -> Path: ...
+
+
+@overload
+def make_bundle(
+    root: Path,
+    *,
+    version: str = VERSION,
+    build_id: str = BUILD_ID,
+    apprun: str | None = None,
+    icons: bool,
+) -> Path: ...
+
+
+def make_bundle(
+    root: Path,
+    *,
+    version: str = VERSION,
+    build_id: str = BUILD_ID,
+    apprun: str | None = None,
+    icons: bool = False,
 ) -> Path:
     """Создаёт минимальную раскладку AppDir, которую принимает ``userinstall``.
 
@@ -46,6 +69,15 @@ def make_bundle(
     share = root / "usr" / "share" / "astra-voice"
     share.mkdir(parents=True, exist_ok=True)
     (share / "resource.txt").write_text("data\n", encoding="ascii")
+    if icons:
+        for name in (
+            "48x48/apps/astravoice.png",
+            "scalable/apps/astravoice.svg",
+            "22x22/status/astravoice-tray-idle.svg",
+        ):
+            icon = root / "usr/share/icons/hicolor" / name
+            icon.parent.mkdir(parents=True, exist_ok=True)
+            icon.write_bytes(f"icon: {name}\n".encode())
     return root
 
 
