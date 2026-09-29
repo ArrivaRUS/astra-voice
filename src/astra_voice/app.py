@@ -720,8 +720,12 @@ def _start_update_checker(
     policy: policy_mod.Policy,
     gui_calls: _GuiCalls,
     runtime: DictationRuntime | None,
+    bind: Callable[[UpdateChecker], None] | None = None,
 ) -> UpdateChecker | None:
-    """Фоновая проверка обновлений программы (M7-ядро); строка в окне — позже."""
+    """Фоновая проверка обновлений программы (M7-ядро).
+
+    ``bind`` подключает окно до старта потока, чтобы первый снимок не потерялся.
+    """
     try:
         from astra_voice.updates.checker import create_app_checker
 
@@ -729,6 +733,11 @@ def _start_update_checker(
     except Exception:  # noqa: BLE001 — без проверки обновлений приложение работает
         log.warning("Проверка обновлений недоступна", exc_info=True)
         return None
+    if bind is not None:
+        try:
+            bind(checker)
+        except Exception:  # noqa: BLE001 — строка в окне не должна мешать проверке
+            log.warning("Не удалось подключить строку обновлений к окну", exc_info=True)
     if runtime is not None:
         stats = runtime.stats
 
@@ -739,6 +748,52 @@ def _start_update_checker(
         checker.on_event = record
     checker.start()
     return checker
+
+
+def _bind_updates_bridge(
+    checker: UpdateChecker,
+    settings: settings_mod.Settings,
+    policy: policy_mod.Policy,
+    gui_calls: _GuiCalls,
+    settings_bridge: Any,
+) -> Any:
+    """Мост строки обновлений для QML; снимки проверки идут в GUI-поток очередью."""
+    from astra_voice.net.gate import NetworkGate
+    from astra_voice.ui.updates_bridge import UpdatesBridge
+
+    # open_external из platform/external появится отдельной веткой; до неё
+    # кнопка «Страница выпуска» скрыта, QDesktopServices и Qt.openUrlExternally
+    # для адресов из сети не используем.
+    bridge = UpdatesBridge(checker, refusal=NetworkGate(settings, policy).refusal)
+
+    def post_status(status: Any) -> None:
+        # Рабочий поток проверки: мост трогаем только в GUI-потоке (урок 025).
+        gui_calls.post(partial(bridge.set_status, status))
+
+    checker.on_status = post_status
+    if settings_bridge is not None:
+        settings_bridge.checkAppUpdatesChanged.connect(bridge.refresh)
+        settings_bridge.offlineChanged.connect(bridge.refresh)
+    return bridge
+
+
+def _wire_tray_updates(tray: Any, bridge: Any, show_network: Callable[[], None]) -> None:
+    """Пункт трея «Проверить обновления» (Р9): активен всегда, кроме офлайна и запрета.
+
+    Меню живёт в GUI-потоке, мост — тоже: проверка уходит в поток проверки через
+    ``checkNow()``, окно открывается на разделе «Сеть», где видна панель результата.
+    """
+
+    def sync() -> None:
+        tray.set_updates_enabled(bool(bridge.canCheckNow))
+
+    def check() -> None:
+        show_network()
+        bridge.checkNow()
+
+    tray.on_check_updates = check
+    bridge.networkChanged.connect(sync)
+    sync()
 
 
 def _wire_close(
@@ -916,6 +971,7 @@ def main(argv: list[str] | None = None) -> int:
     onboarding = None
     downloads = None
     update_checker: UpdateChecker | None = None
+    updates_bridge: Any = None  # держим Python-обёртку живой до выхода из main
     gui_calls = _GuiCalls()
     model_store: ModelStore | None = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
@@ -1023,6 +1079,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         QQmlEngine.setObjectOwnership(settings_bridge, QQmlEngine.CppOwnership)
         _set_context_property(shell, "settingsBridge", settings_bridge)
+        # Офлайн-режим скрывает «Скачать» и отменяет загрузку из сети (PRD F14.2).
+        settings_bridge.offlineChanged.connect(downloads.network_changed)
         root = _root_window(shell)
         if root is not None:
             capture.attach_window(root)
@@ -1055,8 +1113,24 @@ def main(argv: list[str] | None = None) -> int:
             downloads.downloadProgressChanged.connect(update_download_status)
             downloads.downloadStateChanged.connect(update_download_status)
         _set_context_property(shell, "showOnboarding", show_onboarding)
+
+        def bind_updates(checker: UpdateChecker) -> None:
+            nonlocal updates_bridge
+            updates_bridge = _bind_updates_bridge(
+                checker, settings, policy, gui_calls, settings_bridge
+            )
+            QQmlEngine.setObjectOwnership(updates_bridge, QQmlEngine.CppOwnership)
+            _set_context_property(shell, "updatesBridge", updates_bridge)
+            if runtime_ready and runtime is not None:
+
+                def show_network() -> None:
+                    focuser.focus_shell()
+                    app_info.show_section(SECTION_NETWORK)
+
+                _wire_tray_updates(runtime.tray, updates_bridge, show_network)
+
         update_checker = _start_update_checker(
-            settings, policy, gui_calls, runtime if runtime_ready else None
+            settings, policy, gui_calls, runtime if runtime_ready else None, bind_updates
         )
         if not args.hidden:
             focuser.focus_shell()

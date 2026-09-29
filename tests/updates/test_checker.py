@@ -26,6 +26,7 @@ from astra_voice.net import github
 from astra_voice.net.gate import NetworkGate
 from astra_voice.net.http import HttpClient
 from astra_voice.net.update_cache import CacheEntry, UpdateCache, shared_cache
+from astra_voice.ui.updates_bridge import UpdatesBridge
 from astra_voice.updates import checker as checker_module
 from astra_voice.updates.checker import (
     CHECK_INTERVAL_S,
@@ -499,3 +500,76 @@ def test_blocked_manual_check_keeps_schedule(rig: Rig) -> None:
     checker.refresh()
     rig.wait(lambda s: s.last_attempt_at == rig.clock.now)
     assert rig.requests() == 1
+
+
+# -- связка с мостом строки (ревью 29.09, P1) --------------------------------
+
+
+def _bridge_for(rig: Rig, checker: UpdateChecker) -> UpdatesBridge:
+    assert rig.gate_settings is not None
+    return UpdatesBridge(checker, refusal=NetworkGate(rig.gate_settings, rig.policy).refusal)
+
+
+def test_manual_uptodate_survives_next_round_in_bridge(rig: Rig) -> None:
+    """После check_now следующий круг не превращает итог в фоновый (строка держит 3000 мс)."""
+    checker = rig.start(version="0.2.1")
+    rig.settle(checker)
+    bridge = _bridge_for(rig, checker)
+    checker.check_now()
+    rig.wait(lambda s: s.state == "uptodate" and s.manual)
+    time.sleep(0.2)
+    rig.settle(checker)
+    assert rig.statuses[-1].manual, [(s.state, s.manual) for s in rig.statuses]
+    bridge.set_status(checker.status)  # в приложении — очередью GUI-потока
+    assert (bridge.state, bridge.manual, bridge.restState) == ("uptodate", True, "idle")
+    checker.refresh()
+    rig.settle(checker)
+    bridge.set_status(checker.status)
+    assert bridge.state == "idle"
+
+
+def test_manual_check_with_toggle_off_returns_to_disabled(rig: Rig) -> None:
+    """Тумблер выключен: итог ручной проверки виден, затем строка — «отключена»."""
+    rig.settings = Settings(check_app_updates=False)
+    checker = rig.start(version="0.2.1")
+    rig.wait(lambda s: s.state == "disabled")
+    bridge = _bridge_for(rig, checker)
+    assert bridge.restState == "disabled"
+    checker.check_now()
+    rig.wait(lambda s: s.state == "uptodate" and s.manual)
+    rig.settle(checker)
+    bridge.set_status(checker.status)
+    assert (bridge.state, bridge.manual, bridge.restState) == ("uptodate", True, "disabled")
+    checker.refresh()
+    rig.settle(checker)
+    bridge.set_status(checker.status)
+    assert bridge.state == "disabled"
+
+
+def test_remind_later_after_manual_check_removes_accent(rig: Rig) -> None:
+    checker = rig.start()
+    rig.settle(checker)
+    checker.check_now()
+    rig.wait(lambda s: s.state == "available" and s.manual)
+    checker.remind_later()
+    status = rig.wait(lambda s: s.state == "available" and s.reminder_until is not None)
+    assert not status.manual
+
+
+def test_scheduled_result_replaces_manual_view(rig: Rig) -> None:
+    """Повторное ревью P2: плановая проверка через сутки вытесняет итог ручной."""
+    checker = rig.start(version="0.2.1")
+    rig.settle(checker)
+    checker.check_now()
+    rig.wait(lambda s: s.state == "uptodate" and s.manual)
+    rig.settle(checker)
+    count = len(rig.statuses)
+    requests = rig.requests()
+    rig.clock.now += CHECK_INTERVAL_S + 10
+    rig.settle(checker)
+    time.sleep(0.3)
+    rig.settle(checker)
+    assert rig.requests() > requests, "плановая проверка не состоялась"
+    after = [(s.state, s.manual) for s in rig.statuses[count:]]
+    assert ("uptodate", True) not in after, after
+    assert rig.statuses[-1].manual is False

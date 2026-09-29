@@ -927,6 +927,7 @@ class ModelDownloads(QObject):
         self._queue_entries: tuple[Any, ...] = ()
         self._active_entry: Any | None = None
         self._queue_running = False
+        self._queue_from_file = False
         self._queue_cancelled = False
         self._cancelled_entry: Any | None = None
         self._cancelled_discard = True
@@ -1081,8 +1082,43 @@ class ModelDownloads(QObject):
                 log.debug("Не удалось проверить отзыв версии модели по снимку", exc_info=True)
             return False
 
+    def _user_offline(self) -> bool:
+        """Сейчас действует офлайн-режим (пользователь или окружение запуска)."""
+        refusal = getattr(self._model, "refusal", None)
+        if not callable(refusal):
+            return False
+        try:
+            return bool(refusal() == "offline")
+        except Exception:  # noqa: BLE001 — сбой гейта не должен ронять карточки
+            log.warning("Не удалось прочитать разрешение сети для моделей")
+            return False
+
+    def network_changed(self) -> None:
+        """Сменился офлайн-режим (GUI-поток): «Скачать» скрывается, загрузка из сети отменяется.
+
+        Отмена — тот же путь, что у кнопки «Отмена» (``cancelDownloads``); установку
+        из файла и перепроверку записей офлайн не прерывает.
+        """
+        if (
+            self._user_offline()
+            and self._queue_running
+            and not self._queue_from_file
+            and not self._rechecking
+        ):
+            log.info("Офлайн-режим: загрузка модели отменена")
+            self.cancelDownloads(discard=True)
+        self._notify("modelsChanged")
+        self._notify("selectionChanged")
+
     def _card_state(self, entry: Any, installed: tuple[tuple[str, str], ...] | None = None) -> str:
         state = self._card_states.get(entry.id)
+        # Офлайн-режим: карточку без установленной модели скачать нельзя (PRD F14.2).
+        if (
+            state in (None, "available")
+            and self._user_offline()
+            and not self._badge(entry, installed)
+        ):
+            return "offline-user"
         if state is not None and state != "removed-from-catalog":
             return state
         if self._is_revoked(entry):
@@ -2032,6 +2068,7 @@ class ModelDownloads(QObject):
             ):
                 return
             self._queue_running = True
+            self._queue_from_file = source is not None
             self._queue_cancelled = False
             self._cancelled_entry = None
             self._cancelled_discard = True

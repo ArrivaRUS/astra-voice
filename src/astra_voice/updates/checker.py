@@ -179,6 +179,8 @@ class UpdateChecker:
                 lambda state: replace(state, remind_until=self._clock() + REMIND_LATER_S),
             )
         )
+        # Итог ручной проверки игнорирует срок напоминания — снимаем его вид.
+        self._request(action=self._reset_manual_view)
 
     def stop(self, timeout_s: float = 5.0) -> None:
         """Останавливает поток; идущий запрос прерывается бюджетом 3 с."""
@@ -239,7 +241,10 @@ class UpdateChecker:
         if self._clock() >= self._next_due and self._gate.refusal("check_app") == "":
             self._check(manual=False)
         else:
-            self._publish(self._compose())
+            # Итог ручной проверки держится до refresh(): иначе следующий круг
+            # публиковал бы тот же результат как фоновый, и строка теряла бы
+            # «Установлена последняя версия» раньше 3000 мс.
+            self._publish(self._compose(manual=self._manual_view))
         self._wake.wait(self._sleep_s())
 
     def _sleep_s(self) -> float:
@@ -290,6 +295,10 @@ class UpdateChecker:
         attempted = result.requests_made > 0
         if not manual:
             self._next_due = max(now + CHECK_INTERVAL_S, result.retry_at or 0.0)
+            if attempted:
+                # Плановый результат вытесняет ручной: иначе через сутки строка
+                # снова показала бы «Установлена последняя версия» и панель.
+                self._manual_view = False
         elif attempted:
             # Ручная проверка ушла в сеть — плановая в эти сутки уже не нужна.
             self._next_due = max(self._next_due, now + CHECK_INTERVAL_S)

@@ -493,7 +493,7 @@ QtObject {
     readonly property color toggleKnobBg: "#FFFFFF"
     readonly property real toggleKnobInset: 2
     readonly property real toggleKnobOnX: 19
-    readonly property color toggleLockedOffBg: border
+    readonly property color toggleLockedOffBg: fgFaint
     readonly property color toggleLockedOnBg: primary
     readonly property int toggleLockedOpacity: 1
     readonly property color toggleOffBg: fgFaint

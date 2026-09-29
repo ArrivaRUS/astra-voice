@@ -761,6 +761,7 @@ class FakeSettings(QObject):
         self._language: str = "ru"
         self._checkAppUpdates: bool = False
         self._checkModelUpdates: bool = False
+        self._offline: bool = False
         self._autostart: bool = True
         self._device: str = "Системный по умолчанию"
         self._hotkeyStatus: str = "ok"
@@ -969,6 +970,15 @@ class FakeSettings(QObject):
     checkModelUpdates = pyqtProperty(
         bool, _get_checkModelUpdates, _set_checkModelUpdates, notify=changed
     )
+
+    def _get_offline(self) -> bool:
+        return self._offline
+
+    def _set_offline(self, value: bool) -> None:
+        self._offline = value
+        self.changed.emit()
+
+    offline = pyqtProperty(bool, _get_offline, _set_offline, notify=changed)
 
     def _get_autostart(self) -> bool:
         return self._autostart

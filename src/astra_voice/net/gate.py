@@ -72,6 +72,9 @@ class NetworkGate:
             return "admin"
         if os.environ.get("HF_HUB_OFFLINE", "").lower() in ("1", "true", "yes", "on"):
             return "offline"
+        # Офлайн-режим из «Сеть и обновления» запрещает и ручные действия.
+        if self._settings.offline is True:
+            return "offline"
         if (
             kind in ("check_app", "check_app_manual")
             and self._policy.is_locked("check_app_updates")
