@@ -20,6 +20,8 @@ APP_NAME = "astra-voice"
 LOCK_TIMEOUT_MS = 100
 INSTALL_LIB_DIR = Path("/usr/lib/astra-voice")
 INSTALL_SHARE_DIR = Path("/usr/share/astra-voice")
+# Лаунчер пакета .deb (scripts/astra-voice). Тесты подменяют: настоящий не запускать.
+SYSTEM_EXECUTABLE = Path("/usr/bin/astra-voice")
 RESOURCES_ENV = "ASTRA_VOICE_RESOURCES"
 # Запасной корень runtime-каталога (тесты подменяют).
 FALLBACK_TMP_DIR = Path("/tmp")

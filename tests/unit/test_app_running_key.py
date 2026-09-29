@@ -214,3 +214,42 @@ def test_register_failure_warns_and_continues_without_qt(
     assert "Не удалось добавить Astra Voice в меню: ~/bad" in output.err
     assert str(isolated_home) not in output.err
     assert output.out.startswith("astra-voice ")
+
+
+def test_unregister_is_service_flag_only_for_appimage(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--unregister снимает регистрацию без GUI; в треке .deb и исходниках — отказ."""
+    assert app._parse_args(["--unregister"]).unregister
+    assert "--unregister" in userinstall.SERVICE_FLAGS
+    unregister = Mock()
+    monkeypatch.setattr(userinstall, "unregister", unregister)
+    for kind in (paths.InstallKind.DEB, paths.InstallKind.SOURCE):
+        monkeypatch.setattr(paths, "install_kind", lambda kind=kind: kind)
+        assert app.main(["--unregister"]) == 2
+    unregister.assert_not_called()
+    for kind in (paths.InstallKind.APPIMAGE_INSTALLED, paths.InstallKind.APPIMAGE_PORTABLE):
+        monkeypatch.setattr(paths, "install_kind", lambda kind=kind: kind)
+        assert app.main(["--unregister", "--hidden"]) == 0
+    assert unregister.call_count == 2
+    assert capsys.readouterr().out.count("убран из меню и автозапуска") == 2
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [userinstall.UserInstallError, OSError, paths.PathError, autostart.AutostartError, ValueError],
+)
+def test_unregister_failure_is_reported(
+    error_type: type[Exception],
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(paths, "install_kind", lambda: paths.InstallKind.APPIMAGE_INSTALLED)
+    monkeypatch.setattr(
+        userinstall, "unregister", Mock(side_effect=error_type(str(isolated_home / "bad")))
+    )
+    assert app.main(["--unregister"]) == 1
+    output = capsys.readouterr()
+    assert "Не удалось убрать Astra Voice из меню и автозапуска: ~/bad" in output.err
+    assert output.out == ""

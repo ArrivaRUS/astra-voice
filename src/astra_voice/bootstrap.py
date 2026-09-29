@@ -39,6 +39,15 @@ SOFTWARE_RENDER_ENV = {
     "QT_XCB_GL_INTEGRATION": "none",
 }
 
+# Запрет appimage=deny (arch/appimage.md §5). Снять себя из меню и автозапуска
+# можно всегда: эти флаги запрет не блокирует.
+UNREGISTER_FLAGS = frozenset({"--unregister", "--uninstall"})
+EXIT_POLICY_DENIED = 3
+# Защита от петли: системная версия, которая сама оказалась AppImage под запретом,
+# не передаёт запуск дальше. Внешним программам не достаётся (clean_env снимает ASTRA_VOICE_*).
+HANDOFF_ENV = "ASTRA_VOICE_POLICY_HANDOFF"
+HANDOFF_MESSAGE = "AppImage запрещён политикой, запускаю системную версию"
+
 
 def _setup_sys_path(here: Path) -> None:
     """Вставляет vendor и корень пакета в начало ``sys.path``."""
@@ -96,6 +105,60 @@ def _refuse_root_in_bundle() -> int | None:
     return None
 
 
+def _system_version() -> str | None:
+    """Лаунчер пакета .deb, если он стоит и исполняемый; иначе ``None``."""
+    from astra_voice.core import paths
+
+    path = paths.SYSTEM_EXECUTABLE
+    if path.is_file() and os.access(path, os.X_OK):
+        return str(path)
+    return None
+
+
+def _journal(message: str) -> None:
+    """Одна строка в журнал программы; сбой журнала не мешает запуску."""
+    try:
+        import logging
+
+        from astra_voice.core.logging import setup_logging
+
+        setup_logging()
+        logging.getLogger("astra_voice.bootstrap").info("%s", message)
+    except Exception:  # noqa: BLE001 — без журнала запуск всё равно важнее
+        pass
+
+
+def _appimage_policy_gate(command: str, rest: list[str]) -> int | None:
+    """Совещательный запрет трека AppImage (arch/appimage.md §5); ``None`` — продолжать.
+
+    Решает только ``core/policy.py``. При запрете: снятие регистрации проходит;
+    если стоит пакет .deb — запуск переходит к нему (``selfinstall`` ничего не
+    копирует и отдаёт запуск команде ``app``, та делает ``exec``); иначе — код 3.
+    """
+    from astra_voice.core import paths, policy
+
+    if not paths.install_kind().is_appimage or not policy.appimage_denied(policy.load()):
+        return None
+    user_args = rest[1:] if command == "selfinstall" else rest
+    if UNREGISTER_FLAGS.intersection(user_args):
+        return None
+    system = None if os.environ.get(HANDOFF_ENV) == "1" else _system_version()
+    if system is None:
+        sys.stderr.write(policy.APPIMAGE_DENIED_MESSAGE + "\n")
+        return EXIT_POLICY_DENIED
+    if command == "selfinstall":
+        from astra_voice.platform.userinstall import EXIT_SKIPPED
+
+        return EXIT_SKIPPED
+    from astra_voice.core.childenv import clean_env
+
+    env = clean_env()
+    env[HANDOFF_ENV] = "1"
+    _journal(HANDOFF_MESSAGE)
+    os.execve(system, [system, *user_args], env)
+    return EXIT_POLICY_DENIED  # сюда execve не возвращается; для тестов с подменой
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] not in COMMANDS:
@@ -110,12 +173,10 @@ def main(argv: list[str] | None = None) -> int:
         return refused
 
     if command in ("app", "selfinstall"):
-        from astra_voice.core import paths, policy
-
         # Совещательный запрет трека до любых действий (arch/appimage.md §5).
-        if paths.install_kind().is_appimage and policy.appimage_denied(policy.load()):
-            sys.stderr.write(policy.APPIMAGE_DENIED_MESSAGE + "\n")
-            return 3
+        denied = _appimage_policy_gate(command, rest)
+        if denied is not None:
+            return denied
 
     if command == "selfinstall":
         # Самоустановка AppImage (arch/appimage.md §1): без Qt, без аудио.

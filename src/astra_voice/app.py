@@ -163,6 +163,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="служебный: добавить в меню и автозапуск установленную копию",
     )
+    parser.add_argument(
+        "--unregister",
+        action="store_true",
+        help="служебный: убрать версию AppImage из меню и автозапуска и выйти",
+    )
     parser.add_argument("--debug", action="store_true", help="подробный журнал")
     parser.add_argument(
         "--debug-transcribe",
@@ -799,8 +804,31 @@ def _cleanup(server: Any, lock: Any) -> None:
         lock.unlock()
 
 
+def _unregister() -> int:
+    """``--unregister``: снять меню, значки и наш автозапуск без GUI (arch/appimage.md §4).
+
+    Запрет ``appimage=deny`` эту команду не блокирует (bootstrap).
+    """
+    from astra_voice.platform import userinstall
+
+    if not paths.install_kind().is_appimage:
+        sys.stderr.write("Команда --unregister нужна только версии AppImage.\n")
+        return 2
+    try:
+        userinstall.unregister()
+    except (userinstall.UserInstallError, OSError, paths.PathError, ValueError) as error:
+        sys.stderr.write(
+            f"Не удалось убрать Astra Voice из меню и автозапуска: {userinstall.tilde(error)}\n"
+        )
+        return 1
+    sys.stdout.write("Astra Voice убран из меню и автозапуска.\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.unregister:
+        return _unregister()
     if args.register:
         from astra_voice.platform import autostart, userinstall
 

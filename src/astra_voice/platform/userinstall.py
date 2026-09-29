@@ -59,7 +59,10 @@ REQUIRED_FILES = (
 )
 EXECUTABLE_FILES = (paths.APPIMAGE_LAUNCHER, "opt/python3.11/bin/python3.11")
 # Служебные флаги не устанавливают программу (спайк §7.10). Тот же список — в AppRun.
-SERVICE_FLAGS = frozenset({"--version", "--help", "-h", "--stats", "--selfinstall-status"})
+# Снятие регистрации тоже не устанавливает: сначала поставить, чтобы тут же снять, — нелепо.
+SERVICE_FLAGS = frozenset(
+    {"--version", "--help", "-h", "--stats", "--selfinstall-status", "--unregister", "--uninstall"}
+)
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -725,8 +728,10 @@ def register() -> RegisterResult:
     return RegisterResult(menu_result, tuple(written), tuple(skipped), retargeted)
 
 
-def unregister(*, deb_executable: Path = Path("/usr/bin/astra-voice")) -> UnregisterResult:
+def unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
     """Снимает только нашу регистрацию, возвращая автозапуск пакету при наличии (§4)."""
+    if deb_executable is None:
+        deb_executable = paths.SYSTEM_EXECUTABLE
     menu, icons = _desktop_paths()
     removed_menu = _menu_state(menu) == "ours"
     if removed_menu:
