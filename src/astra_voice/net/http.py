@@ -4,23 +4,29 @@ from __future__ import annotations
 
 import logging
 import os
+import random
+import re
 import socket
 import threading
 import time
 import urllib.request
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, replace
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from types import TracebackType
-from typing import Literal
+from typing import Literal, cast
 from urllib.parse import urljoin, urlsplit
 
 import requests
 from urllib3 import HTTPConnectionPool, HTTPSConnectionPool, ProxyManager
 from urllib3.connection import HTTPConnection
-from urllib3.exceptions import ReadTimeoutError
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError, ReadTimeoutError
+from urllib3.util.connection import _set_socket_options, allowed_gai_family
 
 from astra_voice.net.gate import NetworkGate, NetworkKind
 from astra_voice.net.hosts import ALLOWED_HOSTS, host_allowed
+from astra_voice.net.update_cache import CacheEntry, UpdateCache, valid_etag
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +40,14 @@ _SYSTEM_CA_BUNDLE = Path("/etc/ssl/certs/ca-certificates.crt")
 _MIN_SPEED_BYTES_PER_SECOND = 128
 _MIN_SPEED_GRACE_S = 30.0
 _WATCHDOG_INTERVAL_S = 0.05
+RATE_LIMIT_MAX_S = 24 * 3600
+RATE_LIMIT_MIN_S = 60.0
+BACKOFF_BASE_S = 300.0
+BACKOFF_MAX_S = 24 * 3600.0
+CHECK_CONNECT_TIMEOUT_S = 2.0
+CHECK_TOTAL_TIMEOUT_S = 3.0
+APP_CHECK_JITTER_MAX_S = 600.0
+MODEL_CHECK_JITTER_MAX_S = 1800.0
 
 
 class NetworkError(Exception):
@@ -42,12 +56,84 @@ class NetworkError(Exception):
     code: str
     message: str
     status: int | None
+    retry_after_s: float | None
+    proxy_error: bool
 
-    def __init__(self, code: str, message: str, *, status: int | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status: int | None = None,
+        retry_after_s: float | None = None,
+        proxy_error: bool = False,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        self.retry_after_s = retry_after_s
+        self.proxy_error = proxy_error
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    """Итог одной проверки источника обновлений."""
+
+    state: Literal["fresh", "not-modified", "rate-limited", "backoff", "unavailable"]
+    body: bytes | None = None
+    http_status: int | None = None
+    retry_at: float | None = None
+    requests_made: int = 0
+
+
+def parse_retry_after(value: str | None, now: float) -> float | None:
+    """Разбирает Retry-After в секунды ожидания."""
+    if value is None:
+        return None
+    value = value.strip()
+    if re.fullmatch(r"[0-9]+", value):
+        return min(float(value), RATE_LIMIT_MAX_S)
+    try:
+        moment = parsedate_to_datetime(value)
+        if moment.tzinfo is None:
+            return None
+        return min(max(0.0, moment.timestamp() - now), RATE_LIMIT_MAX_S)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def parse_rate_limit(headers: Mapping[str, str], now: float) -> float | None:
+    """Находит окно GitHub, IETF или Retry-After в заголовках ответа."""
+    normalized = {key.lower(): value for key, value in headers.items()}
+    windows: list[float] = []
+    retry = parse_retry_after(normalized.get("retry-after"), now)
+    if retry is not None:
+        windows.append(retry)
+    if normalized.get("x-ratelimit-remaining", "").strip() == "0":
+        reset = normalized.get("x-ratelimit-reset", "").strip()
+        if re.fullmatch(r"[0-9]+", reset):
+            windows.append(min(max(0.0, float(reset) - now), RATE_LIMIT_MAX_S))
+    rate_limit = normalized.get("ratelimit", "")
+    # Старый синтаксис limit=60, remaining=0, reset=30 и новый
+    # структурированный формат "api";r=0;t=55.
+    old_remaining = re.search(r"(?:^|,)\s*remaining\s*=\s*0\s*(?:,|$)", rate_limit, re.I)
+    if old_remaining:
+        match = re.search(r"(?:^|,)\s*reset\s*=\s*([0-9]+)\s*(?:,|$)", rate_limit, re.I)
+        if match:
+            windows.append(min(float(match.group(1)), RATE_LIMIT_MAX_S))
+    else:
+        for policy in rate_limit.split(","):
+            if re.search(r"(?:^|;)\s*r\s*=\s*0\s*(?:;|$)", policy, re.I):
+                match = re.search(r"(?:^|;)\s*t\s*=\s*([0-9]+)\s*(?:;|$)", policy, re.I)
+                if match:
+                    windows.append(min(float(match.group(1)), RATE_LIMIT_MAX_S))
+    return max(windows) if windows else None
+
+
+def backoff_seconds(failures: int) -> float:
+    """Вычисляет паузу после failures последовательных неудач."""
+    return min(BACKOFF_BASE_S * float(2 ** min(max(failures - 1, 0), 20)), BACKOFF_MAX_S)
 
 
 def _check_url_text(url: str) -> None:
@@ -120,9 +206,10 @@ def _verify_bundle(ca_bundle: Path | None) -> str | bool:
         return str(ca_bundle)
     if _SYSTEM_CA_BUNDLE.is_file():
         return str(_SYSTEM_CA_BUNDLE)
-    environment_bundle = os.environ.get("SSL_CERT_FILE")
-    if environment_bundle and Path(environment_bundle).is_file():
-        return environment_bundle
+    for name in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
+        candidate = os.environ.get(name)
+        if candidate and Path(candidate).is_file():
+            return candidate
     return True
 
 
@@ -138,7 +225,11 @@ def _request_error(error: requests.exceptions.RequestException, host: str) -> Ne
         (requests.exceptions.InvalidURL, requests.exceptions.InvalidSchema),
     ):
         return NetworkError("not-allowed", "Источник не разрешён: некорректный адрес.")
-    return NetworkError("host-unreachable", f"Не удалось связаться с {host}.")
+    return NetworkError(
+        "host-unreachable",
+        f"Не удалось связаться с {host}.",
+        proxy_error=isinstance(error, requests.exceptions.ProxyError),
+    )
 
 
 def _shutdown_socket(sock: socket.socket | None) -> None:
@@ -222,11 +313,64 @@ class _RequestWatchdog:
             )
 
 
+def _bounded_connection(connection: HTTPConnection, deadline_at: float) -> socket.socket:
+    """Ограничивает DNS и все адреса одним бюджетом, сохраняя имя для TLS."""
+    resolved: list[object] = []
+    ready = threading.Event()
+
+    def resolve() -> None:
+        try:
+            resolved.append(
+                socket.getaddrinfo(
+                    connection._dns_host, connection.port, allowed_gai_family(), socket.SOCK_STREAM
+                )
+            )
+        except OSError as error:
+            resolved.append(error)
+        finally:
+            ready.set()
+
+    threading.Thread(target=resolve, name="http-check-dns", daemon=True).start()
+    if not ready.wait(max(0.0, deadline_at - time.monotonic())):
+        raise TimeoutError("DNS timeout")
+    answer = resolved[0]
+    if isinstance(answer, OSError):
+        raise answer
+    addresses = cast(
+        list[tuple[int, int, int, str, tuple[str, int] | tuple[str, int, int, int]]], answer
+    )
+    # timeout бывает None или сигнальным объектом urllib3 — тогда хватает общего дедлайна.
+    connect_timeout = connection.timeout
+    connect_deadline = deadline_at
+    if isinstance(connect_timeout, (int, float)) and not isinstance(connect_timeout, bool):
+        connect_deadline = min(deadline_at, time.monotonic() + float(connect_timeout))
+    last_error: OSError | None = None
+    for family, socktype, proto, _, address in addresses:
+        remaining = connect_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Connect timeout")
+        sock = socket.socket(family, socktype, proto)
+        try:
+            _set_socket_options(sock, connection.socket_options)
+            sock.settimeout(remaining)
+            if connection.source_address:
+                sock.bind(connection.source_address)
+            sock.connect(address)
+            return sock
+        except OSError as error:
+            last_error = error
+            sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError("DNS returned no addresses")
+
+
 class _RequestAdapter(requests.adapters.HTTPAdapter):
     """Регистрирует соединения до connect/request/getresponse, включая прокси."""
 
-    def __init__(self, watchdog: _RequestWatchdog) -> None:
+    def __init__(self, watchdog: _RequestWatchdog, deadline_at: float | None = None) -> None:
         self._watchdog = watchdog
+        self._deadline_at = deadline_at
         self._registering_classes: dict[type[HTTPConnectionPool], type[HTTPConnectionPool]] = {}
         super().__init__()
         # Меняем словарь только этого менеджера, не глобальный словарь urllib3.
@@ -244,9 +388,24 @@ class _RequestAdapter(requests.adapters.HTTPAdapter):
         class RegisteringPool(cls):
             def _new_conn(self) -> HTTPConnection:
                 connection: HTTPConnection = super()._new_conn()
+                if self_deadline is not None:
+                    bounded_deadline = float(self_deadline)
+
+                    def bounded_new_conn() -> socket.socket:
+                        try:
+                            return _bounded_connection(connection, bounded_deadline)
+                        except TimeoutError:
+                            raise ConnectTimeoutError(
+                                connection, "Время соединения истекло"
+                            ) from None
+                        except OSError as error:
+                            raise NewConnectionError(connection, str(error)) from None
+
+                    connection._new_conn = bounded_new_conn
                 watchdog.register(connection)
                 return connection
 
+        self_deadline = self._deadline_at
         self._registering_classes[cls] = RegisteringPool
         # Менеджер может повторно вернуть уже обёрнутый класс.
         self._registering_classes[RegisteringPool] = RegisteringPool
@@ -472,6 +631,11 @@ class HttpClient:
         kind: NetworkKind = "download",
         idle_timeout_s: float | None = None,
         scope: Literal["public", "corp"] = "public",
+        connect_timeout_s: float | None = None,
+        extra_headers: Mapping[str, str] | None = None,
+        raise_for_status: bool = True,
+        _on_request: Callable[[], None] | None = None,
+        _bounded_connect: bool = False,
     ) -> StreamResponse:
         """Проверяет гейт, открывает поток и вручную проходит до пяти перенаправлений."""
         started_at = time.monotonic()
@@ -481,6 +645,18 @@ class HttpClient:
         deadline_at = started_at + deadline_s
         _remaining(deadline_at, cancel)
         _validate_url(url, self._extra_hosts, scope=scope)
+        if connect_timeout_s is not None and connect_timeout_s <= 0:
+            raise ValueError("Таймаут соединения должен быть положительным")
+        if extra_headers is not None:
+            for name, value in extra_headers.items():
+                if name not in ("If-None-Match", "Accept"):
+                    raise ValueError("Недопустимый заголовок запроса")
+                if (
+                    len(value) > 256
+                    or not value.isascii()
+                    or any(ord(char) < 32 or ord(char) == 127 for char in value)
+                ):
+                    raise ValueError("Недопустимое значение заголовка")
         verify = _verify_bundle(self._ca_bundle)
         session = _Session()
         session.trust_env = False
@@ -490,7 +666,9 @@ class HttpClient:
         try:
             watchdog = _RequestWatchdog(deadline_at, cancel, idle_timeout_s)
             for scheme in ("http://", "https://"):
-                session.mount(scheme, _RequestAdapter(watchdog))
+                session.mount(
+                    scheme, _RequestAdapter(watchdog, deadline_at if _bounded_connect else None)
+                )
             while True:
                 host = _validate_url(url, self._extra_hosts, scope=scope)
                 proxies = urllib.request.getproxies()
@@ -504,19 +682,28 @@ class HttpClient:
                 }
                 if range_from is not None:
                     headers["Range"] = f"bytes={range_from}-"
+                if extra_headers is not None:
+                    headers.update(extra_headers)
                 # Включая тот же origin: полученные от сервера cookies не отправляются.
                 session.cookies.clear()
                 remaining = _remaining(deadline_at, cancel)
                 watchdog.reset_idle(idle_timeout_s)
-                log.debug("Запрос к %s", host)
+                if kind == "download":
+                    log.debug("Запрос к %s", host)
                 try:
+                    if _on_request is not None:
+                        _on_request()
                     response = session.get(
                         url,
                         headers=headers,
                         proxies=proxies,
                         verify=verify,
                         timeout=(
-                            min(3.0, idle_timeout_s or 3.0, remaining),
+                            min(
+                                connect_timeout_s if connect_timeout_s is not None else 3.0,
+                                idle_timeout_s or 3.0,
+                                remaining,
+                            ),
                             min(idle_timeout_s or 30.0, remaining),
                         ),
                         stream=True,
@@ -587,7 +774,7 @@ class HttpClient:
                         _remaining(deadline_at, cancel)
                         url = target
                         redirects += 1
-                    elif response.status_code >= 400:
+                    elif response.status_code >= 400 and raise_for_status:
                         raise NetworkError(
                             "bad-status",
                             f"Сервер {host} отклонил запрос (код {response.status_code}).",
@@ -613,3 +800,226 @@ class HttpClient:
         finally:
             if watchdog is not None:
                 watchdog.close()
+
+    def get_check(
+        self,
+        url: str,
+        *,
+        cache_key: str,
+        cache: UpdateCache,
+        cancel: threading.Event,
+        kind: NetworkKind = "check_app",
+        scope: Literal["public", "corp"] = "public",
+        jitter_max_s: float = 0.0,
+        ignore_backoff: bool = False,
+        accept: str | None = None,
+        max_body_bytes: int = 256 * 1024,
+        now: Callable[[], float] = time.time,
+        rng: random.Random | None = None,
+        wait: Callable[[float], bool] | None = None,
+    ) -> CheckResult:
+        """Выполняет одну ограниченную по времени проверку с кэшем и паузами."""
+        started = time.monotonic()
+        host = ""
+        status: int | None = None
+        error_code: str | None = None
+        requests_made = 0
+        outcome = "unavailable"
+
+        def finish(result: CheckResult) -> CheckResult:
+            nonlocal outcome
+            outcome = result.state
+            log.info(
+                "Проверка %s: %s, %d мс",
+                host,
+                status if status is not None else error_code or outcome,
+                int((time.monotonic() - started) * 1000),
+            )
+            return result
+
+        if max_body_bytes < 0 or jitter_max_s < 0:
+            raise ValueError("Лимиты проверки должны быть неотрицательными")
+        allowed, reason = self._gate.allowed(kind)
+        if not allowed:
+            raise NetworkError("no-network", reason)
+        host = _validate_url(url, self._extra_hosts, scope=scope)
+
+        def current_entry() -> tuple[CacheEntry, CheckResult | None]:
+            item = cache.get(cache_key)
+            if item.url != url:
+                item = CacheEntry(url=url)
+            original = item
+            current = now()
+            limit = current + RATE_LIMIT_MAX_S
+            item = replace(
+                item,
+                rate_limited_until=(
+                    min(item.rate_limited_until, limit)
+                    if item.rate_limited_until is not None
+                    else None
+                ),
+                backoff_until=(
+                    min(item.backoff_until, limit) if item.backoff_until is not None else None
+                ),
+            )
+            if (
+                item.rate_limited_until != original.rate_limited_until
+                or item.backoff_until != original.backoff_until
+            ):
+                cache.set(cache_key, item)
+            if item.rate_limited_until is not None and item.rate_limited_until > current:
+                return item, CheckResult("rate-limited", retry_at=item.rate_limited_until)
+            if (
+                not ignore_backoff
+                and item.backoff_until is not None
+                and item.backoff_until > current
+            ):
+                return item, CheckResult("backoff", retry_at=item.backoff_until)
+            return item, None
+
+        entry, blocked = current_entry()
+        if blocked is not None:
+            return finish(blocked)
+        if cancel.is_set():
+            raise NetworkError("cancelled", "Проверка отменена.")
+        delay = (rng or random.Random()).uniform(0, jitter_max_s)
+        if (wait or cancel.wait)(delay) or cancel.is_set():
+            raise NetworkError("cancelled", "Проверка отменена.")
+        allowed, reason = self._gate.allowed(kind)
+        if not allowed:
+            raise NetworkError("no-network", reason)
+        entry, blocked = current_entry()
+        if blocked is not None:
+            return finish(blocked)
+        deadline = time.monotonic() + CHECK_TOTAL_TIMEOUT_S
+
+        def count_request() -> None:
+            nonlocal requests_made
+            requests_made += 1
+
+        def failure(
+            state: Literal["rate-limited", "unavailable"], window: float | None = None
+        ) -> CheckResult:
+            nonlocal entry
+            current_time = now()
+            failures = entry.failures + 1
+            if window is None:
+                until = current_time + backoff_seconds(failures)
+                entry = replace(entry, failures=failures, backoff_until=until, url=url)
+            else:
+                until = current_time + window
+                entry = replace(
+                    entry, failures=failures, rate_limited_until=until, backoff_until=None, url=url
+                )
+            cache.set(cache_key, entry)
+            return finish(
+                CheckResult(state, http_status=status, retry_at=until, requests_made=requests_made)
+            )
+
+        headers: dict[str, str] = {}
+        if accept is not None:
+            headers["Accept"] = accept
+        if entry.body is not None and entry.etag is not None:
+            headers["If-None-Match"] = entry.etag
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                with self.get_stream(
+                    url,
+                    deadline_s=remaining,
+                    cancel=cancel,
+                    kind=kind,
+                    scope=scope,
+                    connect_timeout_s=CHECK_CONNECT_TIMEOUT_S,
+                    extra_headers=headers,
+                    raise_for_status=False,
+                    _on_request=count_request,
+                    _bounded_connect=True,
+                ) as response:
+                    status = response.status
+                    if status == 200:
+                        declared_length = response.headers.get("Content-Length")
+                        expected_length: int | None = None
+                        if declared_length is not None:
+                            if re.fullmatch(r"[0-9]+", declared_length) is None:
+                                break
+                            try:
+                                expected_length = int(declared_length)
+                            except ValueError:
+                                break
+                            if expected_length > max_body_bytes:
+                                break
+                        try:
+                            body = b"".join(response.iter_chunks(limit=max_body_bytes + 1))
+                        except NetworkError as error:
+                            if error.code == "cancelled":
+                                raise NetworkError("cancelled", "Проверка отменена.") from None
+                            break
+                        if len(body) > max_body_bytes or (
+                            expected_length is not None and len(body) != expected_length
+                        ):
+                            break
+                        try:
+                            decoded = body.decode("utf-8")
+                        except UnicodeError:
+                            break
+                        etag = response.headers.get("ETag")
+                        entry = CacheEntry(
+                            etag=etag if valid_etag(etag) else None,
+                            body=decoded,
+                            stored_at=now(),
+                            url=url,
+                        )
+                        cache.set(cache_key, entry)
+                        return finish(
+                            CheckResult("fresh", body, status, requests_made=requests_made)
+                        )
+                    if status == 304:
+                        if "If-None-Match" not in headers or entry.body is None:
+                            break
+                        cache.set(
+                            cache_key,
+                            replace(
+                                entry,
+                                stored_at=now(),
+                                failures=0,
+                                rate_limited_until=None,
+                                backoff_until=None,
+                            ),
+                        )
+                        return finish(
+                            CheckResult(
+                                "not-modified",
+                                entry.body.encode("utf-8"),
+                                status,
+                                requests_made=requests_made,
+                            )
+                        )
+                    if status in (403, 429):
+                        window = parse_rate_limit(response.headers, now())
+                        if window is not None:
+                            return failure(
+                                "rate-limited",
+                                max(window, backoff_seconds(entry.failures + 1), RATE_LIMIT_MIN_S),
+                            )
+                        if status == 429:
+                            return failure("rate-limited", backoff_seconds(entry.failures + 1))
+                        break
+                    if (
+                        status in (502, 503, 504)
+                        and response.headers.get("Retry-After") is None
+                        and attempt == 0
+                    ):
+                        continue
+                    break
+            except NetworkError as error:
+                if error.code == "cancelled":
+                    raise NetworkError("cancelled", "Проверка отменена.") from None
+                error_code = error.code
+                status = error.status
+                if error.code == "host-unreachable" and not error.proxy_error and attempt == 0:
+                    continue
+                break
+        return failure("unavailable")
