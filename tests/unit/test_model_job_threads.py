@@ -285,3 +285,64 @@ def test_exit_while_download_blocked() -> None:
     """
     for attempt in range(6):
         assert_exit_scenario(_run_exit_scenario(attempt * 0.02))
+
+
+def test_shutdown_closes_gate_even_if_cancel_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    port = FakeModelPort()
+    port.block = True
+    downloads = ModelDownloads(port)
+    downloads.download()
+    thread, channel = downloads._model_thread, downloads._model_channel
+    assert thread is not None and channel is not None
+    monkeypatch.setattr(downloads, "_cancel_queue", Mock(side_effect=RuntimeError("сбой")))
+    with pytest.raises(RuntimeError):
+        downloads.shutdown()
+    # Затвор закрыт, хотя отмена очереди упала: поток не постит в Qt до ~QApplication.
+    assert channel.closed
+    downloads._model_cancel.set()
+    thread.join(2)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("scenario", ["download", "recheck"])
+def test_thread_start_failure_resets_and_queue_continues(
+    monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    port = FakeModelPort()
+    if scenario == "recheck":
+        monkeypatch.setattr(port, "recheck_entries", lambda: (port.entry,))
+        monkeypatch.setattr(port, "verify_files", lambda entry: (True, ""))
+        monkeypatch.setattr(port, "smoke", lambda entry: (True, ""))
+        monkeypatch.setattr(port, "mark_ok", lambda model_id, revision: None)
+    downloads = ModelDownloads(port)
+    original_start = threading.Thread.start
+
+    def start(self: threading.Thread) -> None:
+        if self.name == model_downloads._JOB_THREAD_NAME:
+            raise RuntimeError("can't start new thread")
+        original_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    try:
+        before = downloads.models[0]
+        if scenario == "download":
+            downloads.download()
+        else:
+            downloads.start_recheck()
+        assert downloads._model_thread is None
+        assert downloads._model_job is None and downloads._model_channel is None
+        assert not downloads._queue_running and not downloads._rechecking
+        if scenario == "download":
+            assert downloads.models[0]["state"] == "failed"
+            assert downloads.downloadState == "failed"
+        else:
+            assert downloads.models[0] == before
+            assert downloads.downloadState == "idle"
+        monkeypatch.setattr(threading.Thread, "start", original_start)
+        # Следующая попытка запускается как обычно.
+        if scenario == "download":
+            downloads.retryModel(port.entry.id)
+            _wait_idle(downloads)
+            assert downloads.modelState == "installed"
+    finally:
+        downloads.shutdown()

@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import TracebackType
 
@@ -88,7 +89,9 @@ class FaultServer:
                 elif path == "/retry-date":
                     status = 429
                     date = datetime.now(UTC) + timedelta(seconds=80)
-                    headers["Retry-After"] = date.strftime("%a, %d %b %Y %H:%M:%S GMT")
+                    # Не strftime: QApplication ставит локаль окружения, и дни/месяцы
+                    # в заголовке вышли бы не латиницей.
+                    headers["Retry-After"] = format_datetime(date, usegmt=True)
                 elif path == "/407":
                     status = 407
                 elif path == "/503":

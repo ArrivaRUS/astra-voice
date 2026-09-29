@@ -299,9 +299,12 @@ def catalog_best(entries: Iterable[Any]) -> float:
 _JOB_THREAD_NAME = "astra-voice-model-job"
 # Сколько shutdown() ждёт рабочий поток после отмены.
 _SHUTDOWN_JOIN_S = 5.0
-# Ограниченное ожидание выхода потока после его последнего сообщения.
+# Ограниченное ожидание выхода потока после его последнего сообщения: полное — один
+# раз, затем повторные проверки каждые 100 мс без блокировки GUI.
 _FINISH_JOIN_S = 5.0
+_FINISH_RETRY_JOIN_S = 0.0
 _FINISH_RETRY_MS = 100
+_START_FAILED_MESSAGE = "Не удалось установить модель. Попробуйте ещё раз."
 
 _JobEvent = tuple[str, tuple[Any, ...]]
 _JobSink = Callable[[str, tuple[Any, ...]], None]
@@ -2392,19 +2395,20 @@ class ModelDownloads(QObject):
     def _retry_thread_finished(self) -> None:
         thread, self._joining_thread = self._joining_thread, None
         if thread is not None and self._model_thread is thread:
-            self._model_thread_finished()
+            self._model_thread_finished(_FINISH_RETRY_JOIN_S)
 
-    def _model_thread_finished(self) -> None:
+    def _model_thread_finished(self, wait_s: float = _FINISH_JOIN_S) -> None:
         # Последнее сообщение задания приходит перед выходом run(). Ссылки на поток
         # и задание держим до полного выхода потока и только потом запускаем
         # следующую работу: задание отпускается в GUI, а не в рабочем потоке.
         thread = self._model_thread
         if thread is not None:
-            thread.join(_FINISH_JOIN_S)
+            thread.join(wait_s)
             if thread.is_alive():
-                log.warning("Поток установки модели не завершился за 5 секунд; ожидаем очистку")
-                # Не запускаем следующую работу до выхода run(). GUI между
-                # ограниченными ожиданиями свободен.
+                if wait_s == _FINISH_JOIN_S:
+                    log.warning("Поток установки модели не завершился за 5 секунд; ожидаем очистку")
+                # Не запускаем следующую работу до выхода run(). Полное ожидание — только
+                # первое; повторы раз в 100 мс лишь проверяют поток и GUI не блокируют.
                 self._joining_thread = thread
                 QTimer.singleShot(_FINISH_RETRY_MS, self._retry_thread_finished)
                 return
@@ -2576,7 +2580,23 @@ class ModelDownloads(QObject):
             return
         self._start_next_recheck()
 
+    def _start_thread(self, thread: threading.Thread) -> bool:
+        try:
+            thread.start()
+        except RuntimeError:
+            log.warning("Не удалось запустить поток установки модели")
+            return False
+        return True
+
+    def _thread_start_failed(self, state: str, reason: str) -> None:
+        """Поток не запустился: итог без потока, очередь продолжается как после отказа."""
+        # Ждать нечего: поток не стартовал, а канал никто не наполнит.
+        self._model_thread = None
+        self._model_finished(state, reason)
+        self._model_thread_finished()
+
     def _start_next_recheck(self) -> None:
+        started = True
         with self._update():
             if (
                 self._shutting_down
@@ -2611,7 +2631,9 @@ class ModelDownloads(QObject):
             self._set_download_progress(0)
             self._set_estimates("", "")
             self._set_download_state("verifying")
-            thread.start()
+            started = self._start_thread(thread)
+        if not started:
+            self._thread_start_failed("cancelled", "")
 
     def _finish_recheck(self) -> None:
         with self._update():
@@ -2674,6 +2696,7 @@ class ModelDownloads(QObject):
         self._start_next_recheck()
 
     def _start_model_job(self, source: Path | None = None) -> None:
+        started = True
         with self._update():
             if (
                 self._shutting_down
@@ -2700,7 +2723,9 @@ class ModelDownloads(QObject):
             self._model_thread, self._model_job, self._model_channel = thread, job, channel
             self._model_staged("downloading" if source is None else "verifying")
             self._model_progressed(0.0, 0.0, -1.0)
-            thread.start()
+            started = self._start_thread(thread)
+        if not started:
+            self._thread_start_failed("error", _START_FAILED_MESSAGE)
 
     def download(self) -> None:
         with self._update():
@@ -2744,6 +2769,17 @@ class ModelDownloads(QObject):
         if self._shutting_down:
             return
         self._shutting_down = True
+        # Затвор — первым действием: даже если дальше что-то бросит исключение,
+        # к ~QApplication поток уже не постит в Qt (урок 026).
+        if self._model_channel is not None:
+            self._model_channel.close()
+        try:
+            self._stop_work()
+        finally:
+            if self._model_channel is not None:
+                self._model_channel.close()
+
+    def _stop_work(self) -> None:
         if (
             self._switcher is not None
             and self._switcher.on_switch_finished == self._switch_finished
@@ -2755,8 +2791,8 @@ class ModelDownloads(QObject):
         thread, channel = self._model_thread, self._model_channel
         if thread is None or channel is None:
             return
-        # Затвор закрывается до join: даже если поток переживёт ожидание, в Qt он
-        # больше не постит. Итог после join разбираем сами, не дожидаясь пробуждения.
+        # Затвор закрыт до join: даже если поток переживёт ожидание, в Qt он больше
+        # не постит. Итог после join разбираем сами, не дожидаясь пробуждения.
         channel.close()
         thread.join(_SHUTDOWN_JOIN_S)
         if thread.is_alive():

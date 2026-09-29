@@ -6239,7 +6239,8 @@ def test_model_thread_finished_wait_is_bounded_and_keeps_job_until_cleanup(
     delay, callback = retry.call_args.args
     assert delay == 100
     callback()
-    assert join.call_args_list == [call(5.0), call(5.0)]
+    # Повтор только проверяет поток, не блокируя GUI повторным пятисекундным ожиданием.
+    assert join.call_args_list == [call(5.0), call(0.0)]
     assert downloads._model_thread is None and downloads._model_job is None
     assert not downloads._queue_running
     assert downloads.downloadState == "done"
