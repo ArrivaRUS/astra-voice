@@ -67,6 +67,10 @@ class ScriptedModelPort:
         self.source_kind = "hf"
         #: Одноразовые отказы загрузки: идентификатор → ошибка.
         self.failures: dict[str, DownloadError] = {}
+        #: Отозванные в каталоге модели (все их ревизии).
+        self.revoked: set[str] = set()
+        #: Какие модели ворота загрузки держат; None — все.
+        self.hold_ids: set[str] | None = None
         # Закрытые ворота держат рабочий поток на загрузке и на установке.
         self.download_gate = threading.Event()
         self.install_gate = threading.Event()
@@ -89,10 +93,10 @@ class ScriptedModelPort:
         return self.catalog
 
     def is_revoked(self, entry: Any) -> bool:
-        return False
+        return entry.id in self.revoked
 
     def revoked_revision(self, model_id: str, revision: str) -> bool:
-        return False
+        return model_id in self.revoked
 
     def catalog_rtfx(self, model_id: str) -> float | None:
         return None
@@ -178,7 +182,8 @@ class ScriptedModelPort:
         half = entry.size_bytes // 2
         progress(Progress(half, entry.size_bytes, 5_200_000.0, 22.0, 1, 1))
         self.downloading.set()
-        _wait_gate(self.download_gate, cancel)
+        if self.hold_ids is None or entry.id in self.hold_ids:
+            _wait_gate(self.download_gate, cancel)
         failure = self.failures.pop(entry.id, None)
         if failure is not None:
             raise failure

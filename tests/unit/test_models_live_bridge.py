@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from unittest.mock import Mock
 
@@ -173,6 +173,48 @@ def test_strip_retry_repeats_every_failed_card_in_catalog_order(live: Live) -> N
     live.port.download_gate.set()
     pump_until(lambda: live.bridge.downloadState == "done" and live.idle(), "обе модели готовы")
     assert live.port.download_calls == [FIRST.id, SECOND.id, FIRST.id, SECOND.id]
+
+
+def test_revoked_card_is_not_redownloaded() -> None:
+    """Сценарий ревью: отозванная установленная версия не уходит в «Повторить» полосы."""
+    third = replace(FIRST, id="live-third", name="Третья модель", recommended=False)
+    port = ScriptedModelPort((FIRST, SECOND, third))
+    port.revoked = {SECOND.id}
+    port.records[(FIRST.id, FIRST.revision)] = "ok"
+    port.records[(SECOND.id, SECOND.revision)] = "ok"
+    port.current = (FIRST.id, FIRST.revision)
+    downloads = ModelDownloads(port)
+    bridge = SettingsBridge(settings_mod.from_dict({}), save=Mock(), downloads=downloads)
+    try:
+        # Сделать отозванную рабочей нельзя: карточка — ошибка с текстом об отзыве.
+        bridge.makeModelCurrent(SECOND.id)
+        second = next(row for row in bridge.models if row["id"] == SECOND.id)
+        assert second["state"] == "failed"
+        assert second["message"]
+        # P3-1: «Повторить» у неё не показывается, а прямой вызов ничего не качает.
+        assert second["canRetry"] is False
+        bridge.retryModel(SECOND.id)
+        assert downloads._model_thread is None
+        assert bridge.downloadState == "idle"
+
+        port.failures[third.id] = DownloadError("no-network")
+        port.open_gates()
+        bridge.toggleModel(third.id)
+        bridge.startSelectedDownloads()
+        pump_until(
+            lambda: bridge.downloadState == "failed" and downloads._model_thread is None,
+            "ошибка третьей модели",
+        )
+        bridge.retryFailedDownloads()
+        pump_until(
+            lambda: bridge.downloadState == "done" and downloads._model_thread is None,
+            "повтор третьей модели",
+        )
+        assert port.download_calls == [third.id, third.id]
+        assert SECOND.id not in port.download_calls
+    finally:
+        port.open_gates()
+        downloads.shutdown()
 
 
 def test_strip_retry_without_failed_cards_does_nothing(live: Live) -> None:
