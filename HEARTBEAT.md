@@ -870,8 +870,8 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
 UpdateCache на процесс, jitter 600 с), `core/policy.py` полный (У16/У37, T-19), UI «Сеть и обновления»/строка/трей, T-116.
 **Четверг 01.10:** T1-проверки (BL-1, MJ-1, MJ-3, MN-1/keylib.sh, MN-8; тесты T-175/177/179/181) + один T2 по дифу
 ma-foundation → слияние ma-foundation → rebase r2-ci. **05–06.10:** правка workflow заказчиком в браузере по ci-workflow-patch.md.
-**Беклог правок:** P2 — докачка моделей M6 на urllib3 2.8 (бандл AppImage: обрыв → host-unreachable вместо short-read);
-P2 — moveToThread в model_downloads (теоретически); P3 из #12 (край: _selfcheck не failed при невозможном откате);
+**Беклог правок:** ~~P2 — докачка моделей M6 на urllib3 2.8~~ (закрыто #20 `f901f7d` + PR #28);
+~~P2 — moveToThread в model_downloads~~ (закрыто #20); ~~P3 из #12~~ (PR #28) (край: _selfcheck не failed при невозможном откате);
 T-163…T-174 перенести из arch/appimage.md в test-plan; тексты S5-A5 «Сейчас используется» (вопрос PM, не блокирует).
 
 ## 2026-09-29 ~14:30 — M7 слит, AppImage на правках
@@ -978,3 +978,4 @@ legal-analyst); правообладатель — ГК «Астра» (NOTICE, 
 - **Ц6 закрыт:** whisper-small-int8 скачан в dev-хранилище (250 МБ, разрешение заказчика). Замер (`--runs 5 --threads 2`): gigaam 22,8× p95 201 мс 427 МБ; t-one 13,1× 401 мс 653 МБ; whisper-small 3,5× 1504 мс 1083 МБ. RTFx gigaam плавает 23–30×.
 - Заказчик: автозапуск — ручную запись оставить до v1.0 (`validate autostart --check-installed` у него = код 1, ожидаемо).
 - Беклог nit: зонд benchmark — проверка `getppid()` после PDEATHSIG, `PR_SET_DUMPABLE=0`/`oom_score_adj` как у воркера.
+- PR #28 `wip/dl-robust` (short-read по Content-Length в urllib3 1.26/2.8, `_RecheckJob` finally, `_selfcheck` failed при невозможном откате, тесты M7) — ревью/CI. Беклог: на urllib3 2.x при обрыве теряется ≤64 КиБ хвоста блока (`read1` вместо `iter_content`, nit); общий модуль схемы урока 026 (трей/notify/model_downloads) — v1.0, решение Юрки 29.09.
