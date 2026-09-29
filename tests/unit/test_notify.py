@@ -693,6 +693,19 @@ def test_hotkey_messages_name_combo_and_actions(
     assert args[6]["urgency"].value() == b"\x01"
 
 
+def test_hotkey_lost_message_is_plain_and_offers_choice(transport: Mock) -> None:
+    """Потеря захвата не по вине другой программы: без кодов и технических слов."""
+    notifications.notify_hotkey_lost()
+    transport.bus.asyncCall.assert_called_once()
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
+    assert args[3:5] == [
+        "Горячая клавиша перестала работать",
+        "Программа попробует вернуть её сама.",
+    ]
+    assert args[5].value() == ["choose-hotkey", "Выбрать другую"]
+    assert args[6]["urgency"].value() == b"\x01"
+
+
 @pytest.mark.parametrize(
     "wrapper", [notifications.notify_hotkey_not_grabbed, notifications.notify_hotkey_regrabbed]
 )
