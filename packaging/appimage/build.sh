@@ -252,6 +252,8 @@ case $BASE in
         mkdir -p "$PREFIX/bin" "$PREFIX/lib/python3"
         mv "$STAGE/usr/bin/python3.11" "$PY"
         mv "$STAGE/usr/lib/python3.11" "$STDLIB"
+        # copyright пакетов — в документы образа (collect_licenses.py), из тех же .deb.
+        mv "$STAGE/usr/share/doc" "$BUILD/debian-doc"
         rm -rf "$STAGE"
         # Хостовый sitecustomize (абсолютная ссылка на /etc/python3.11 — apport) не переносим:
         # иначе код хоста исполнялся бы до bootstrap. -I его не отключает.
@@ -438,6 +440,13 @@ install -m 755 "$HERE/AppRun" "$APPDIR/AppRun"
 install -m 644 "$HERE/astra-voice.desktop" "$APPDIR/astra-voice.desktop"
 install -m 644 "$APPDIR/usr/share/icons/hicolor/256x256/apps/astravoice.png" "$APPDIR/astravoice.png"
 ln -s astravoice.png "$APPDIR/.DirIcon"
+
+say 'документы лицензий (usr/share/doc/astra-voice)'
+debian_doc=()
+[ "$BASE" = debian12 ] && debian_doc=(--debian-doc "$BUILD/debian-doc")
+# shellcheck disable=SC2046
+python3 "$HERE/collect_licenses.py" --appdir "$APPDIR" --root "$ROOT" "${debian_doc[@]}" \
+    $(lockq debs | awk '{print "--deb", $1}')
 
 # Воспроизводимость: байт-код и кэши не попадают в образ, время файлов — из changelog.
 find "$APPDIR" -type d -name __pycache__ -prune -exec rm -rf {} +
