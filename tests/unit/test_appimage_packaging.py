@@ -74,6 +74,13 @@ def test_real_lock_parses_with_pins_from_t1() -> None:
     assert ("jsonschema", "4.10.3") in lock.todo or any(
         req.name == "jsonschema" and req.version == "4.10.3" for req in lock.requirements
     )
+    # Манифест хоста (R3.2): OpenSSL и базовые библиотеки Python — с хоста; удалённые
+    # модулями readline/gdbm/dbm/curses библиотеки в нём не значатся.
+    assert {"libssl.so.3", "libcrypto.so.3", "libz.so.1", "libexpat.so.1", "libffi.so.8"} <= set(
+        lock.host_libs
+    )
+    for soname in ("libreadline.so.8", "libgdbm.so.6", "libdb-5.3.so", "libncursesw.so.6"):
+        assert soname not in lock.host_libs
     # Колёса прежние (R3: меняется только интерпретатор).
     pins = {req.name: req.version for req in lock.requirements}
     assert pins["PyQt5"] == "5.15.11"
@@ -205,10 +212,14 @@ def system_checks_off(monkeypatch: pytest.MonkeyPatch) -> None:
     интерпретатор тестов вне фальшивого AppDir. Их покрывает test_appimage_bundle_gate.py."""
     monkeypatch.setattr(check_bundle, "check_prefixes", lambda appdir: [])
     monkeypatch.setattr(check_bundle, "check_openssl", lambda *args, **kw: [])
-    monkeypatch.setattr(check_bundle, "check_needed", lambda appdir: (0, []))
+    monkeypatch.setattr(check_bundle, "check_needed", lambda appdir, host: (0, []))
 
 
-OPENSSL_ARGS = ["--openssl-major", "3", "--openssl-origin", "host"]
+def gate_args(where: Path) -> list[str]:
+    """Параметры из lock: OpenSSL и манифест хоста (файл, как пишет build.sh)."""
+    host_libs = where / "host-libs.txt"
+    host_libs.write_text("libssl.so.3 libssl3\nlibcrypto.so.3 libssl3\n", encoding="utf-8")
+    return ["--openssl-major", "3", "--openssl-origin", "host", "--host-libs", str(host_libs)]
 
 
 def test_check_imports_on_fixture(fake_bundle: Path) -> None:
@@ -245,14 +256,14 @@ def test_warning_records_fail_the_gate(fake_bundle: Path, monkeypatch: pytest.Mo
 
     monkeypatch.setattr(check_bundle, "check_catalog", catalog)
     monkeypatch.setattr(sys, "path", [p for p in sys.path if str(fake_bundle) in p])
-    args = ["--appdir", str(fake_bundle), "--control", str(control), *OPENSSL_ARGS]
+    args = ["--appdir", str(fake_bundle), "--control", str(control), *gate_args(fake_bundle)]
     assert check_bundle.main(args) == 1
     monkeypatch.setattr(check_bundle, "check_catalog", lambda: [])
     assert check_bundle.main(args) == 0
 
 
 def test_check_bundle_requires_marker(tmp_path: Path) -> None:
-    args = ["--appdir", str(tmp_path), "--control", str(CONTROL), *OPENSSL_ARGS]
+    args = ["--appdir", str(tmp_path), "--control", str(CONTROL), *gate_args(tmp_path)]
     assert check_bundle.main(args) == 2
 
 
@@ -430,7 +441,7 @@ def test_check_bundle_allow_missing_exit_code(
         lambda: ["jsonschema: SchemaUnavailable: Модуль jsonschema недоступен."],
     )
     monkeypatch.setattr(sys, "path", [p for p in sys.path if str(fake_bundle) in p])
-    args = ["--appdir", str(fake_bundle), "--control", str(control), *OPENSSL_ARGS]
+    args = ["--appdir", str(fake_bundle), "--control", str(control), *gate_args(fake_bundle)]
     assert check_bundle.main(args) == 1
     assert check_bundle.main([*args, "--allow-missing", "jsonschema"]) == 0
     monkeypatch.setattr(check_bundle, "EXTRA_MODULES", ("bundled_fixture_mod", "json"))

@@ -767,7 +767,7 @@ AppDir/
 | `python3.11-minimal` | Настоящий `usr/bin/python3.11` → `opt/python3.11/bin/python3.11` | Не симлинк на хостовый интерпретатор |
 | `libpython3.11-minimal` | Минимальная stdlib, необходимые файлы конфигурации, `_ssl`/`_hashlib`, если их расположение совпадает с проверенной ALSE | Проверить список именно выбранного Debian `.deb` |
 | `libpython3.11-stdlib` | Остальная stdlib и нужные расширения `lib-dynload` | Все три пакета — одной точной binary version |
-| Debian-библиотеки | Начальный список: `libexpat1`, `zlib1g`, `libbz2-1.0`, `libffi8`, `liblzma5`, `libsqlite3-0`, `libcrypt1`; `libuuid1`, если оставлен `_uuid` | Это список для проверки, не установленная замкнутая зависимость. Окончательный состав — по оставленным ELF и функциональным импортам |
+| Debian-библиотеки | **Решение 29.09 (реализация, принято Юркой): в бандл не кладутся — с хоста**, как OpenSSL: `libexpat1`, `zlib1g`, `libbz2-1.0`, `libffi8`, `liblzma5`, `libsqlite3-0`, `libcrypt1`, `libuuid1` | Базовые библиотеки любой ALSE 1.8 (dpkg/apt/KDE); без `patchelf` и лишних пакетов. Состав измерен по ELF сборки debian12 и закреплён записями `# host-lib:` в lock |
 | Прежний `appimage.lock` | PyQt5, Qt, SIP, NumPy, ORT, onnx-asr, requests-стек, Xlib, jsonschema и остальные закреплённые колёса | Не обновлять одновременно версии колёс |
 | Хост | glibc/загрузчик, `libstdc++`, `libgcc_s`, графические/звуковые библиотеки по прежнему контракту; **`libssl.so.3`, `libcrypto.so.3`**, настройки/providers OpenSSL, CA, `/usr/bin/gpgv` | OpenSSL и его providers в образ не копировать. Точные требования фиксировать в манифесте внешних зависимостей |
 
@@ -779,6 +779,8 @@ AppDir/
 - `_ssl` зависит от `libssl.so.3`/`libcrypto.so.3`, `_hashlib` — от `libcrypto.so.3`.
 - Хостовые расширения требуют соответственно символы `OPENSSL_3.3.0` и `OPENSSL_3.4.0`. **Копирование Python с ALSE 1.8.5 в сборку, проверяемую на Debian 12, не является равноценной заменой Debian-пакетам.**
 - `_dbm` зависит от `libdb-5.3.so`. В copyright хостового `libdb5.3` указаны Sleepycat/BSD; называть его просто GPL-библиотекой неверно.
+
+**Манифест хоста (29.09, реализация R3).** Всё, что ELF бандла берут вне AppDir, перечислено в `packaging/appimage.lock` записями `# host-lib: <SONAME> <пакет>` — 44 SONAME: glibc, C++-рантайм, восемь библиотек интерпретатора выше, `libssl.so.3`/`libcrypto.so.3` и прежний графический/шинный контракт Qt. Статус каждого — **origin=host, not-bundled**, как у OpenSSL; так же они отражаются в SBOM. `check_bundle.py` валит сборку, если DT_NEEDED вне AppDir не из манифеста, если запись манифеста не нужна ни одному ELF или отсутствует на машине проверки.
 
 **Удаляем до расчёта зависимостей:**
 

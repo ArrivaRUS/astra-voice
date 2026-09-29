@@ -49,6 +49,8 @@ HEAD = f"""# base: debian12
 # expect-elf: 100
 # max-glibc: 2.36
 # runtime-key: 570C77ACEA40C0F1B758902CBF96CCA56490F695
+# host-lib: libssl.so.3 libssl3
+# host-lib: libcrypto.so.3 libssl3
 # tool: runtime-x86_64 {SHA} 1 https://example.invalid/runtime-x86_64
 # tool: runtime-x86_64.sig {SHA} 2 https://example.invalid/runtime-x86_64.sig
 # tool: appimagetool-x86_64.AppImage {SHA} 3 https://example.invalid/appimagetool
@@ -311,6 +313,18 @@ def test_base_and_tools_must_agree() -> None:
         lockfile.parse(lock_text(records(), head=legacy))
     with pytest.raises(lockfile.LockError, match="неверное значение base"):
         lockfile.parse(lock_text(records(), head=HEAD.replace("debian12", "debian13")))
+
+
+def test_host_lib_manifest() -> None:
+    lock = lockfile.parse(lock_text(records()))
+    assert lock.host_libs == {"libssl.so.3": "libssl3", "libcrypto.so.3": "libssl3"}
+    no_crypto = HEAD.replace("# host-lib: libcrypto.so.3 libssl3\n", "")
+    with pytest.raises(lockfile.LockError, match="нет host-lib: libcrypto.so.3"):
+        lockfile.parse(lock_text(records(), head=no_crypto))
+    with pytest.raises(lockfile.LockError, match="host-lib libssl.so.3 повторяется"):
+        lockfile.parse(lock_text(records(), extra="# host-lib: libssl.so.3 libssl3\n"))
+    with pytest.raises(lockfile.LockError, match="неверная строка host-lib"):
+        lockfile.parse(lock_text(records(), extra="# host-lib: libz.so.1\n"))
 
 
 def test_todo_pin_passes_format_but_is_listed(

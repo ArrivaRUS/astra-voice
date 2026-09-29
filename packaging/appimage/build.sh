@@ -460,9 +460,11 @@ allow_missing=()
 for package in $(printf '%s\n' "$TODO" | sed 's/==.*//'); do
     allow_missing+=(--allow-missing "$package")
 done
+lockq host-libs > "$BUILD/host-libs.txt"
 as_user "$PY" -I -B "$HERE/check_bundle.py" --appdir "$APPDIR" \
     --control "$ROOT/packaging/debian/control" "${allow_missing[@]}" \
-    --openssl-major "$(lockq get openssl-major)" --openssl-origin "$(lockq get openssl-origin)"
+    --openssl-major "$(lockq get openssl-major)" --openssl-origin "$(lockq get openssl-origin)" \
+    --host-libs "$BUILD/host-libs.txt"
 say 'гейт: AppRun --version в изоляции, stderr пуст'
 version_err=$WORK/tmp/version.stderr
 version_output=$(as_user "$APPDIR/AppRun" --version 2>"$version_err") || {

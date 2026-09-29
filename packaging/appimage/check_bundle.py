@@ -5,7 +5,7 @@
 
     <AppDir>/opt/python3.11/bin/python3.11 -I check_bundle.py \\
         --appdir <AppDir> --control packaging/debian/control \\
-        --openssl-major 3 --openssl-origin host
+        --openssl-major 3 --openssl-origin host --host-libs <файл из lockfile.py host-libs>
 
 Проверяет:
 
@@ -24,7 +24,8 @@
 7. в AppDir нет readline/gdbm/`_dbm`/libdb, а при OpenSSL с хоста — своих libssl/libcrypto;
    нет абсолютных и выходящих из AppDir ссылок;
 8. каждый DT_NEEDED каждого ELF разрешается внутри AppDir по RUNPATH/RPATH или относится к
-   манифесту хостовых библиотек `HOST_SONAMES` и есть на машине проверки.
+   манифесту хоста (`--host-libs`, записи `# host-lib:` lock); каждая запись манифеста
+   нужна хотя бы одному ELF и есть на машине проверки.
 
 `--allow-missing <пакет>` (только `build.sh` при локальной сборке с
 `ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH=1`): нарушения про модуль незакреплённого колеса
@@ -181,63 +182,6 @@ def read_dynamic(path: Path) -> Dynamic | None:
     return Dynamic(tuple(string(offset) for offset in needed), paths(15), paths(29))
 
 
-#: Библиотеки, которые AppImage берёт с хоста (R3.2, «манифест внешних зависимостей»): SONAME →
-#: пакет ALSE 1.8/Debian 12. Всё прочее из DT_NEEDED обязано найтись внутри AppDir. В списке
-#: намеренно нет readline/gdbm/libdb/ncurses/nsl/tirpc: модули, которым они нужны, удалены.
-HOST_SONAMES: dict[str, str] = {
-    # glibc и загрузчик
-    "ld-linux-x86-64.so.2": "libc6",
-    "libc.so.6": "libc6",
-    "libm.so.6": "libc6",
-    "libpthread.so.0": "libc6",
-    "libdl.so.2": "libc6",
-    "librt.so.1": "libc6",
-    "libutil.so.1": "libc6",
-    # рантайм C++
-    "libstdc++.so.6": "libstdc++6",
-    "libgcc_s.so.1": "libgcc-s1",
-    # интерпретатор Debian и его модули (R3.2): базовые библиотеки любой ALSE 1.8
-    "libz.so.1": "zlib1g",
-    "libexpat.so.1": "libexpat1",
-    "libbz2.so.1.0": "libbz2-1.0",
-    "liblzma.so.5": "liblzma5",
-    "libffi.so.8": "libffi8",
-    "libsqlite3.so.0": "libsqlite3-0",
-    "libcrypt.so.1": "libcrypt1",
-    "libuuid.so.1": "libuuid1",
-    # OpenSSL — только с хоста (R3: в образ не кладётся, TLS обновляет ОС)
-    "libssl.so.3": "libssl3",
-    "libcrypto.so.3": "libssl3",
-    # графика, шрифты, шина — прежний контракт Qt из PyQt5-Qt5
-    "libGL.so.1": "libgl1",
-    "libX11.so.6": "libx11-6",
-    "libX11-xcb.so.1": "libx11-xcb1",
-    "libXext.so.6": "libxext6",
-    "libxcb.so.1": "libxcb1",
-    "libxcb-glx.so.0": "libxcb-glx0",
-    "libxcb-icccm.so.4": "libxcb-icccm4",
-    "libxcb-image.so.0": "libxcb-image0",
-    "libxcb-keysyms.so.1": "libxcb-keysyms1",
-    "libxcb-randr.so.0": "libxcb-randr0",
-    "libxcb-render.so.0": "libxcb-render0",
-    "libxcb-render-util.so.0": "libxcb-render-util0",
-    "libxcb-shape.so.0": "libxcb-shape0",
-    "libxcb-shm.so.0": "libxcb-shm0",
-    "libxcb-sync.so.1": "libxcb-sync1",
-    "libxcb-xfixes.so.0": "libxcb-xfixes0",
-    "libxcb-xinerama.so.0": "libxcb-xinerama0",
-    "libxcb-xkb.so.1": "libxcb-xkb1",
-    "libxkbcommon.so.0": "libxkbcommon0",
-    "libxkbcommon-x11.so.0": "libxkbcommon-x11-0",
-    "libfontconfig.so.1": "libfontconfig1",
-    "libfreetype.so.6": "libfreetype6",
-    "libglib-2.0.so.0": "libglib2.0-0",
-    "libgthread-2.0.so.0": "libglib2.0-0",
-    "libdbus-1.so.3": "libdbus-1-3",
-    "libgssapi_krb5.so.2": "libgssapi-krb5-2",
-}
-
-
 def _expand(entries: Iterable[str], origin: Path) -> tuple[Path, ...] | None:
     """Пути поиска с подстановкой $ORIGIN; None — неподдерживаемая подстановка ($LIB…)."""
     result: list[Path] = []
@@ -249,9 +193,22 @@ def _expand(entries: Iterable[str], origin: Path) -> tuple[Path, ...] | None:
     return tuple(result)
 
 
+def read_host_libs(path: Path) -> dict[str, str]:
+    """Манифест хоста из `lockfile.py … host-libs`: строки «SONAME пакет»."""
+    result: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            raise ValueError(f"{path}: неверная строка манифеста: {line!r}")
+        result[parts[0]] = parts[1]
+    if not result:
+        raise ValueError(f"{path}: пустой манифест библиотек хоста")
+    return result
+
+
 def check_needed(
     appdir: Path,
-    host_sonames: Mapping[str, str] = HOST_SONAMES,
+    host_sonames: Mapping[str, str],
     host_dirs: Sequence[str] = HOST_LIB_DIRS,
 ) -> tuple[int, list[str]]:
     """Каждый DT_NEEDED каждого ELF в AppDir разрешается (T-186).
@@ -260,7 +217,8 @@ def check_needed(
     объекта и цепочки загрузивших его объектов (так numpy.libs находит libgfortran). Обход —
     от корней: ELF, чьё имя не значится ничьим DT_NEEDED.
     Найденное по путям поиска обязано лежать внутри AppDir; не найденное — SONAME из
-    `host_sonames`, присутствующий на хосте проверки. Иначе — висячая зависимость.
+    манифеста `host_sonames` (lock, `# host-lib:`). Иначе — висячая зависимость. Каждая
+    запись манифеста кому-то нужна и есть на хосте проверки: манифест не устаревает молча.
     """
     appdir = appdir.resolve()
     infos: dict[Path, Dynamic] = {}
@@ -276,12 +234,7 @@ def check_needed(
         if info is not None:
             infos[path] = info
     seen: set[tuple[Path, tuple[Path, ...]]] = set()
-    host_cache: dict[str, bool] = {}
-
-    def on_host(soname: str) -> bool:
-        if soname not in host_cache:
-            host_cache[soname] = any(os.path.exists(os.path.join(d, soname)) for d in host_dirs)
-        return host_cache[soname]
+    used: set[str] = set()
 
     def visit(path: Path, inherited: tuple[Path, ...]) -> None:
         if (path, inherited) in seen:
@@ -305,8 +258,7 @@ def check_needed(
                 elif target in infos:
                     visit(target, chain)
             elif soname in host_sonames:
-                if not on_host(soname):
-                    problems.append(f"{rel}: хостовая {soname} не найдена на машине проверки")
+                used.add(soname)
             else:
                 problems.append(f"{rel}: висячий DT_NEEDED {soname}")
 
@@ -316,6 +268,11 @@ def check_needed(
     for path in infos:
         if path.name not in wanted:
             visit(path, ())
+    for soname in sorted(host_sonames):
+        if not any(os.path.exists(os.path.join(d, soname)) for d in host_dirs):
+            problems.append(f"host-lib {soname} не найдена на машине проверки")
+        if soname not in used:
+            problems.append(f"host-lib {soname} не нужна ни одному ELF — убрать из lock")
     return len(infos), sorted(set(problems))
 
 
@@ -590,6 +547,7 @@ def run(
     allow_missing: Iterable[str] = (),
     openssl_major: int = 3,
     openssl_origin: str = "host",
+    host_libs: Mapping[str, str] | None = None,
 ) -> int:
     appdir = appdir.resolve()
     lib = appdir / "usr" / "lib" / "astra-voice"
@@ -622,14 +580,14 @@ def run(
     )
     problems += check_forbidden(appdir, openssl_origin)
     problems += check_symlinks(appdir)
-    elf_count, needed = check_needed(appdir)
+    elf_count, needed = check_needed(appdir, host_libs or {})
     problems += needed
 
     print(f"OpenSSL: {ssl.OPENSSL_VERSION} ({openssl_origin})")
     for name, paths in sorted(loaded_openssl(maps).items()):
         print(f"  {name}: {', '.join(sorted(paths))}")
     print(f"Модули зависимостей: {len(modules) + len(EXTRA_MODULES)}, astra_voice: {checked}")
-    print(f"ELF: {elf_count}, DT_NEEDED проверены")
+    print(f"ELF: {elf_count}, DT_NEEDED проверены; с хоста {len(host_libs or {})} SONAME")
     root_logger.removeHandler(collector)
     for record in collector.records:
         problems.append(f"журнал {record.levelname}: {record.name}: {record.getMessage()}")
@@ -657,12 +615,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--openssl-origin", choices=("host", "bundled"), required=True, help="из lock"
     )
+    parser.add_argument(
+        "--host-libs", type=Path, required=True, help="манифест: lockfile.py … host-libs"
+    )
     args = parser.parse_args(argv)
     if not (args.appdir / ".astra-voice-build").is_file():
         print(f"нет маркера сборки в {args.appdir}", file=sys.stderr)
         return 2
+    try:
+        host_libs = read_host_libs(args.host_libs)
+    except (OSError, ValueError) as exc:
+        print(f"манифест хоста: {exc}", file=sys.stderr)
+        return 2
     return run(
-        args.appdir, args.control, args.allow_missing, args.openssl_major, args.openssl_origin
+        args.appdir,
+        args.control,
+        args.allow_missing,
+        args.openssl_major,
+        args.openssl_origin,
+        host_libs,
     )
 
 

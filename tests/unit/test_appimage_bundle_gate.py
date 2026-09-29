@@ -124,11 +124,13 @@ def test_needed_resolves_inside_and_on_host(tree: tuple[Path, Path]) -> None:
 
 def test_dangling_and_missing_host_library(tree: tuple[Path, Path]) -> None:
     appdir, host = tree
-    make_elf(appdir / "ext.so", ("libreadline.so.8", "libssl.so.3"))
-    problems = needed(appdir, host, ("libc.so.6", "libssl.so.3"))
+    make_elf(appdir / "ext.so", ("libreadline.so.8", "libssl.so.3", "libc.so.6"))
+    problems = needed(appdir, host, ("libc.so.6", "libssl.so.3", "libunused.so.1"))
     assert problems == [
         "ext.so: висячий DT_NEEDED libreadline.so.8",
-        "ext.so: хостовая libssl.so.3 не найдена на машине проверки",
+        "host-lib libssl.so.3 не найдена на машине проверки",
+        "host-lib libunused.so.1 не найдена на машине проверки",
+        "host-lib libunused.so.1 не нужна ни одному ELF — убрать из lock",
     ]
 
 
@@ -140,7 +142,10 @@ def test_rpath_is_inherited_runpath_is_not(tree: tuple[Path, Path]) -> None:
     make_elf(appdir / "libs" / "libb.so", ("libc.so.6",))
     assert needed(appdir, host) == []
     make_elf(appdir / "pkg" / "ext.so", ("liba.so",), runpath="$ORIGIN/../libs")
-    assert needed(appdir, host) == ["libs/liba.so: висячий DT_NEEDED libb.so"]
+    assert needed(appdir, host) == [
+        "host-lib libc.so.6 не нужна ни одному ELF — убрать из lock",
+        "libs/liba.so: висячий DT_NEEDED libb.so",
+    ]
 
 
 def test_runpath_outside_appdir_and_unknown_token(tree: tuple[Path, Path]) -> None:
@@ -150,14 +155,21 @@ def test_runpath_outside_appdir_and_unknown_token(tree: tuple[Path, Path]) -> No
     make_elf(appdir / "other.so", ("libc.so.6",), runpath="$LIB/x")
     assert needed(appdir, host) == [
         f"ext.so: libevil.so.1 найден вне AppDir: {host / 'libevil.so.1'}",
+        "host-lib libc.so.6 не нужна ни одному ELF — убрать из lock",
         "other.so: неподдерживаемая подстановка в RPATH/RUNPATH",
     ]
 
 
-def test_host_manifest_excludes_removed_libraries() -> None:
-    for soname in ("libreadline.so.8", "libgdbm.so.6", "libdb-5.3.so", "libncursesw.so.6"):
-        assert soname not in gate.HOST_SONAMES
-    assert {"libssl.so.3", "libcrypto.so.3", "libz.so.1", "libexpat.so.1"} <= set(gate.HOST_SONAMES)
+def test_read_host_libs(tmp_path: Path) -> None:
+    path = tmp_path / "host-libs.txt"
+    path.write_text("libz.so.1 zlib1g\nlibssl.so.3 libssl3\n", "utf-8")
+    assert gate.read_host_libs(path) == {"libz.so.1": "zlib1g", "libssl.so.3": "libssl3"}
+    path.write_text("libz.so.1\n", "utf-8")
+    with pytest.raises(ValueError, match="неверная строка"):
+        gate.read_host_libs(path)
+    path.write_text("", "utf-8")
+    with pytest.raises(ValueError, match="пустой манифест"):
+        gate.read_host_libs(path)
 
 
 # --- запрещённые файлы и ссылки --------------------------------------------------------

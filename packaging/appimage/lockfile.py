@@ -21,6 +21,9 @@
     "source_version","dsc"}` — бинарный пакет из индекса `Packages`;
   - `# source: {"id","file","size","sha256","url"[,"index"|"dsc"]}` — исходник: `.dsc`
     из индекса `Sources` (`index`), архив из `.dsc` (`dsc`) или самостоятельный файл;
+* `# host-lib: <SONAME> <пакет Debian/ALSE>` — манифест внешних зависимостей (R3.2): библиотека
+  берётся с хоста и в образ не кладётся. Читают check_bundle.py (каждый DT_NEEDED вне AppDir —
+  только из манифеста, каждая запись нужна и есть на хосте) и sbom.py (origin=host, not-bundled);
 * `# TODO-HASH: <имя>==<версия> …` — колесо решено добавить, но хэш ещё не закреплён.
   Сборка с такой строкой — только локальная проверка;
 * `# TODO-PIN: <что> …` — вход Debian/исходника ещё не закреплён. Формат проходит, но
@@ -31,6 +34,7 @@
     lockfile.py packaging/appimage.lock tools          # строки «файл sha256 размер url»
     lockfile.py packaging/appimage.lock fetch          # «путь-в-кэше sha256 размер url» всех входов
     lockfile.py packaging/appimage.lock debs           # «пакет путь-в-кэше» бинарных пакетов
+    lockfile.py packaging/appimage.lock host-libs      # «SONAME пакет» манифеста хоста
     lockfile.py packaging/appimage.lock todo           # незакреплённые колёса, по строке
     lockfile.py packaging/appimage.lock todo-pin       # незакреплённые входы, по строке
 """
@@ -71,6 +75,10 @@ _TOOL_RE = re.compile(
 _DIRECTIVE_RE = re.compile(r"#\s*(?P<key>[a-z-]+):\s*(?P<value>\S+)\s*")
 _RECORD_RE = re.compile(r"#\s*(?P<kind>archive|index|deb|source):\s*(?P<json>\S.*)")
 _TODO_RE = re.compile(r"#\s*TODO-HASH:\s*(?P<name>[A-Za-z0-9._-]+)==(?P<version>[^\s]+)(?:\s.*)?")
+_HOST_LIB_RE = re.compile(
+    r"#\s*host-lib:\s+(?P<soname>[A-Za-z0-9._+-]+\.so[A-Za-z0-9._+-]*)"
+    r"\s+(?P<package>[a-z0-9][a-z0-9.+-]+)\s*"
+)
 _TODO_PIN_RE = re.compile(r"#\s*TODO-PIN:\s*(?P<what>\S.*)")
 _REQ_RE = re.compile(r"(?P<name>[A-Za-z0-9._-]+)==(?P<version>[^\s\\]+)")
 _HASH_RE = re.compile(r"--hash=sha256:(?P<sha>[0-9a-f]{64})")
@@ -206,6 +214,7 @@ class Lock:
     indexes: list[Index] = field(default_factory=list)
     debs: list[Deb] = field(default_factory=list)
     sources: list[Source] = field(default_factory=list)
+    host_libs: dict[str, str] = field(default_factory=dict)
 
     @property
     def base(self) -> str:
@@ -477,6 +486,11 @@ def parse(text: str) -> Lock:
     if lock.directives["openssl-origin"] != origin:
         raise LockError(f"base {lock.base}: openssl-origin должен быть {origin}")
     _check_debian(lock)
+    if lock.directives["openssl-origin"] == "host":
+        wanted = [f"libssl.so.{lock.openssl_major}", f"libcrypto.so.{lock.openssl_major}"]
+        missing = [name for name in wanted if name not in lock.host_libs]
+        if missing:
+            raise LockError(f"OpenSSL с хоста, но нет host-lib: {', '.join(missing)}")
     seen: set[str] = set()
     for item in [(r.name, r.version) for r in lock.requirements] + lock.todo:
         key = _normalize(item[0])
@@ -495,6 +509,12 @@ def _parse_comment(lock: Lock, line: str) -> None:
         _add_record(lock, match["kind"], match["json"])
     elif re.match(r"#\s*(archive|index|deb|source):", line):
         raise LockError(f"неверная запись: {line}")
+    elif match := _HOST_LIB_RE.fullmatch(line):
+        if match["soname"] in lock.host_libs:
+            raise LockError(f"host-lib {match['soname']} повторяется")
+        lock.host_libs[match["soname"]] = match["package"]
+    elif re.match(r"#\s*host-lib:", line):
+        raise LockError(f"неверная строка host-lib: {line}")
     elif match := _TODO_PIN_RE.fullmatch(line):
         lock.todo_pin.append(match["what"].strip())
     elif "TODO-PIN" in line:
@@ -534,7 +554,17 @@ def load(path: Path) -> Lock:
     return parse(path.read_text(encoding="utf-8"))
 
 
-COMMANDS = ("check", "get", "tools", "fetch", "debs", "todo", "todo-pin", "requirements")
+COMMANDS = (
+    "check",
+    "get",
+    "tools",
+    "fetch",
+    "debs",
+    "host-libs",
+    "todo",
+    "todo-pin",
+    "requirements",
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -562,6 +592,9 @@ def main(argv: list[str] | None = None) -> int:
     elif command == "debs":
         for deb in lock.debs:
             print(deb.package, deb.cache_path)
+    elif command == "host-libs":
+        for soname, package in lock.host_libs.items():
+            print(soname, package)
     elif command == "todo":
         for name, version in lock.todo:
             print(f"{name}=={version}")
@@ -575,6 +608,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"lock: база {lock.base}, {len(lock.tools)} инструмента, "
             f"{len(lock.debs)} пакетов Debian, {len(lock.sources)} исходников, "
+            f"{len(lock.host_libs)} библиотек хоста, "
             f"{len(lock.requirements)} колёс, ELF {lock.expect_elf}, "
             f"glibc ≤ {lock.directives['max-glibc']}, OpenSSL {lock.openssl_major} "
             f"({lock.directives['openssl-origin']}), незакреплено: {len(lock.todo)} колёс, "

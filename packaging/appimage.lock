@@ -18,6 +18,59 @@
 # expect-elf: 98
 # max-glibc: 2.36
 #
+# Манифест внешних зависимостей (R3.2): SONAME с хоста, в образ НЕ кладутся (origin=host,
+# not-bundled). Ровно то, что требуют ELF бандла вне AppDir (измерено 29.09 на сборке debian12):
+# check_bundle.py валит сборку и при лишней записи, и при отсутствии библиотеки на хосте.
+# — glibc и загрузчик
+# host-lib: ld-linux-x86-64.so.2 libc6
+# host-lib: libc.so.6 libc6
+# host-lib: libm.so.6 libc6
+# host-lib: libpthread.so.0 libc6
+# host-lib: libdl.so.2 libc6
+# host-lib: librt.so.1 libc6
+# — рантайм C++
+# host-lib: libstdc++.so.6 libstdc++6
+# host-lib: libgcc_s.so.1 libgcc-s1
+# — интерпретатор Debian и его модули (R3.2: не в бандле — базовые библиотеки любой ALSE 1.8)
+# host-lib: libz.so.1 zlib1g
+# host-lib: libexpat.so.1 libexpat1
+# host-lib: libbz2.so.1.0 libbz2-1.0
+# host-lib: liblzma.so.5 liblzma5
+# host-lib: libffi.so.8 libffi8
+# host-lib: libsqlite3.so.0 libsqlite3-0
+# host-lib: libcrypt.so.1 libcrypt1
+# host-lib: libuuid.so.1 libuuid1
+# — OpenSSL — только с хоста (R3), TLS обновляет ОС
+# host-lib: libssl.so.3 libssl3
+# host-lib: libcrypto.so.3 libssl3
+# — графика, шрифты, шина, Kerberos — прежний контракт Qt из PyQt5-Qt5
+# host-lib: libGL.so.1 libgl1
+# host-lib: libX11.so.6 libx11-6
+# host-lib: libX11-xcb.so.1 libx11-xcb1
+# host-lib: libXext.so.6 libxext6
+# host-lib: libxcb.so.1 libxcb1
+# host-lib: libxcb-glx.so.0 libxcb-glx0
+# host-lib: libxcb-icccm.so.4 libxcb-icccm4
+# host-lib: libxcb-image.so.0 libxcb-image0
+# host-lib: libxcb-keysyms.so.1 libxcb-keysyms1
+# host-lib: libxcb-randr.so.0 libxcb-randr0
+# host-lib: libxcb-render.so.0 libxcb-render0
+# host-lib: libxcb-render-util.so.0 libxcb-render-util0
+# host-lib: libxcb-shape.so.0 libxcb-shape0
+# host-lib: libxcb-shm.so.0 libxcb-shm0
+# host-lib: libxcb-sync.so.1 libxcb-sync1
+# host-lib: libxcb-xfixes.so.0 libxcb-xfixes0
+# host-lib: libxcb-xinerama.so.0 libxcb-xinerama0
+# host-lib: libxcb-xkb.so.1 libxcb-xkb1
+# host-lib: libxkbcommon.so.0 libxkbcommon0
+# host-lib: libxkbcommon-x11.so.0 libxkbcommon-x11-0
+# host-lib: libfontconfig.so.1 libfontconfig1
+# host-lib: libfreetype.so.6 libfreetype6
+# host-lib: libglib-2.0.so.0 libglib2.0-0
+# host-lib: libgthread-2.0.so.0 libglib2.0-0
+# host-lib: libdbus-1.so.3 libdbus-1-3
+# host-lib: libgssapi_krb5.so.2 libgssapi-krb5-2
+#
 # Подпись runtime-x86_64.sig проверяет build.sh (при --fetch и при сборке из кэша) хостовым gpgv
 # по ключу из packaging/appimage/keys/appimage-runtime.gpg; отпечаток (primary или подключ)
 # должен совпасть. Ключ — signing-pubkey.asc из github.com/AppImage/type2-runtime (README, раздел
