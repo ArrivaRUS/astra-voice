@@ -171,6 +171,12 @@ def test_release_url_and_notes_are_limited() -> None:
         "https://github.com.evil.example/x",
         "https://github.com/a b",
         "javascript:alert(1)",
+        "https://github.com/Other/repo/releases/tag/0.2.1",
+        "https://github.com/ArrivaRUS/astra-voice/issues/1",
+        "https://github.com/ArrivaRUS/astra-voice/releases/../../evil",
+        "https://github.com/ArrivaRUS/astra-voice/releases/tag/0.2.1?next=evil",
+        "https://github.com/ArrivaRUS/astra-voice/releases/tag/%2e%2e",
+        "https://github.com/ArrivaRUS/astra-voice-evil/releases/tag/0.2.1",
     ):
         parsed = github.evaluate(release(html_url=url), "0.0.1").release
         assert parsed is not None and parsed.release_url is None, url
@@ -308,3 +314,18 @@ def test_gate_is_not_bypassed(server: FaultServer, tmp_path: Path) -> None:
 def test_default_url_is_allowlisted() -> None:
     parts = urlsplit(github.RELEASES_LATEST_URL)
     assert parts.scheme == "https" and parts.hostname in ALLOWED_HOSTS
+
+
+def test_notes_control_and_bidi_removed() -> None:
+    body = release(
+        body="Строка\r\n\u202eнавыворот\u202c \u2066изоляция\u2069\u200b\x1b[31m\x00\tтаб\nконец"
+    )
+    notes = github.evaluate(body, "0.0.1").release
+    assert notes is not None
+    assert notes.notes == "Строка\nнавыворот изоляция[31m\tтаб\nконец"
+
+
+def test_installed_version_all_tildes() -> None:
+    version = github.installed_version("0.2.0~rc1~2")
+    assert version is not None and version.prerelease == ("rc1-2",)
+    assert github.evaluate(fixture("plain"), "0.2.1~rc1~2").state == "available"

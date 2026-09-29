@@ -16,10 +16,10 @@ import random
 import re
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
-from urllib.parse import urlsplit
 
 from astra_voice.net.update_cache import MAX_BODY_BYTES, UpdateCache
 
@@ -39,7 +39,8 @@ MAX_RELEASE_BYTES = MAX_BODY_BYTES
 MAX_NOTES_CHARS = 20_000
 _MAX_VERSION_CHARS = 64
 _MAX_NUMBER_DIGITS = 9
-_RELEASE_HOSTS = ("github.com",)
+#: Ссылка «Подробнее» — только на страницы выпусков нашего репозитория.
+RELEASE_URL_PREFIX = "https://github.com/ArrivaRUS/astra-voice/releases/"
 
 _IDENT = r"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
 _SEMVER_RE = re.compile(
@@ -102,7 +103,7 @@ def normalize_tag(tag: object) -> SemVer | None:
 
 def installed_version(version: str) -> SemVer | None:
     """Версия пакета: debian-тильда (``0.1.0~m1``) читается как пре-релиз SemVer."""
-    return parse_semver(version.replace("~", "-", 1))
+    return parse_semver(version.replace("~", "-"))
 
 
 @dataclass(frozen=True)
@@ -135,23 +136,25 @@ def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _release_url(value: object) -> str | None:
-    if not isinstance(value, str) or len(value) > 512 or not value.isascii():
-        return None
-    try:
-        parts = urlsplit(value)
-        port = parts.port
-    except ValueError:
-        return None
     if (
-        parts.scheme != "https"
-        or parts.hostname not in _RELEASE_HOSTS
-        or port not in (None, 443)
-        or parts.username is not None
-        or parts.password is not None
-        or any(char in value for char in "\\ \t\r\n")
+        not isinstance(value, str)
+        or len(value) > 512
+        or not value.startswith(RELEASE_URL_PREFIX)
+        or not value.isascii()
+        or any(char in value for char in "\\ \t\r\n?#%@")
+        or any(part in (".", "..") for part in value[len(RELEASE_URL_PREFIX) :].split("/"))
     ):
         return None
     return value
+
+
+def clean_notes(text: str) -> str:
+    """Убирает управляющие (кроме перевода строки и табуляции) и форматирующие
+    символы, в том числе bidi U+202A–202E и U+2066–2069: текст выпуска не
+    должен переставлять или прятать строки в панели «Что нового»."""
+    return "".join(
+        char for char in text if char in "\n\t" or unicodedata.category(char) not in ("Cc", "Cf")
+    )
 
 
 def parse_release(body: bytes) -> tuple[SemVer, Release] | None:
@@ -172,7 +175,9 @@ def parse_release(body: bytes) -> tuple[SemVer, Release] | None:
     notes = data.get("body")
     return version, Release(
         version=version.text,
-        notes=notes[:MAX_NOTES_CHARS] if isinstance(notes, str) else "",
+        notes=clean_notes(notes[: MAX_NOTES_CHARS * 2])[:MAX_NOTES_CHARS]
+        if isinstance(notes, str)
+        else "",
         release_url=_release_url(data.get("html_url")),
     )
 
