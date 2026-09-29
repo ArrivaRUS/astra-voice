@@ -511,7 +511,8 @@ class PulseStreamSource:
             self.close()
         except BaseException as exc:
             self.close()
-            if isinstance(exc, AudioError):
+            # Отказ API не говорит о смене устройств: кэш нужен запасному simple.
+            if isinstance(exc, AudioError) and not isinstance(exc, AudioApiUnavailable):
                 invalidate_device_cache()
             raise
 
@@ -957,9 +958,12 @@ class StreamWithFallback:
         self,
         primary: ManagedSource | None = None,
         fallback: Callable[[], ManagedSource] = PulseSimpleSource,
+        *,
+        on_fallback: Callable[[], None] | None = None,
     ) -> None:
         self._active: ManagedSource = primary if primary is not None else PulseStreamSource()
         self._fallback: Callable[[], ManagedSource] | None = fallback
+        self._on_fallback = on_fallback
 
     def open(
         self,
@@ -975,11 +979,15 @@ class StreamWithFallback:
             if fallback is None:
                 raise
             self._fallback = None
+            # Без libpulse.so.0 simple тоже не откроется и сообщит audio-failed; откат
+            # полезен, когда в libpulse нет символа, нужного только pa_stream.
             logger.warning(
-                "Бэкенд записи stream недоступен (нет libpulse или символа); выбран simple."
+                "Бэкенд записи stream недоступен (нет libpulse или символа); пробуем simple."
             )
             self._active.close()
             self._active = fallback()
+            if self._on_fallback is not None:
+                self._on_fallback()
             self._active.open(device, deadline=deadline, running=running)
 
     def read_chunk(self) -> bytes | None:

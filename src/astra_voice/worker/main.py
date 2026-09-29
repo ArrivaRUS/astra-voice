@@ -39,13 +39,18 @@ def audio_backend(env: Mapping[str, str]) -> tuple[str, bool]:
     return "stream", value not in (None, "stream")
 
 
+def _log_backend_fallback() -> None:
+    """По журналу видно, какой бэкенд записи работает на самом деле."""
+    logger.info("Бэкенд записи: simple (откат)")
+
+
 def select_audio_source(env: Mapping[str, str]) -> AudioSource:
     """Выбирает источник только по переданному окружению, не открывая устройство."""
     if audio_backend(env)[0] == "simple":
         return PulseSimpleSource()
     from astra_voice.worker.pulse_stream import StreamWithFallback
 
-    return StreamWithFallback()
+    return StreamWithFallback(on_fallback=_log_backend_fallback)
 
 
 def _prctl(option: int, value: int) -> None:

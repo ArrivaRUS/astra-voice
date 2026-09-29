@@ -882,17 +882,47 @@ def test_select_stream_by_default_does_not_load_libpulse(
     value: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """По умолчанию и при неизвестном значении — stream; конструктор не грузит libpulse."""
+    import astra_voice.worker as worker_pkg
+    from astra_voice.worker import pulse_stream as original
     from astra_voice.worker.audio import ManagedSource
-    from astra_voice.worker.pulse_stream import PulseStreamSource, StreamWithFallback
 
+    name = "astra_voice.worker.pulse_stream"
+    # Прежний модуль вернётся после теста; импорт идёт заново уже под подменённым CDLL.
+    monkeypatch.setattr(worker_pkg, "pulse_stream", original)
+    monkeypatch.delitem(sys.modules, name)
     monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=AssertionError("libpulse")))
     monkeypatch.setenv("ASTRA_VOICE_AUDIO_BACKEND", "simple")
     env = {} if value is None else {"ASTRA_VOICE_AUDIO_BACKEND": value}
     source = worker_main.select_audio_source(env)
-    assert isinstance(source, StreamWithFallback)
+    fresh = sys.modules[name]
+    assert fresh is not original
+    assert isinstance(source, fresh.StreamWithFallback)
+    assert isinstance(source._active, fresh.PulseStreamSource)
     assert isinstance(source, ManagedSource)
-    assert isinstance(source._active, PulseStreamSource)
     assert not source.is_open
+
+
+def test_fallback_logs_actual_backend(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """После отката журнал говорит, какой бэкенд работает на самом деле."""
+    from astra_voice.worker import pulse_stream
+    from astra_voice.worker.audio import AudioApiUnavailable, PulseSimpleSource
+
+    monkeypatch.setattr(ctypes, "CDLL", Mock(side_effect=AssertionError("libpulse")))
+    source = worker_main.select_audio_source({})
+    assert isinstance(source, pulse_stream.StreamWithFallback)
+    primary = Mock(spec=pulse_stream.PulseStreamSource)
+    primary.open.side_effect = AudioApiUnavailable("audio-failed", "нет")
+    simple = Mock(spec=PulseSimpleSource)
+    source._active = primary
+    source._fallback = lambda: simple
+    with caplog.at_level(logging.INFO, logger=worker_main.__name__):
+        source.open("mic.test")
+    assert [r.message for r in caplog.records if r.name == worker_main.__name__] == [
+        "Бэкенд записи: simple (откат)"
+    ]
+    simple.open.assert_called_once_with("mic.test", deadline=None, running=None)
 
 
 @pytest.mark.parametrize(
