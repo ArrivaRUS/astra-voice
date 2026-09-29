@@ -664,9 +664,11 @@ def test_fixed_messages(
     wrapper()
     args = _arguments(transport.bus.asyncCall.call_args.args[0])
     assert args[3:5] == [summary, body]
-    assert args[5].value() == (
-        ["show-details", "Подробности"] if wrapper is notifications.notify_selfcheck_failed else []
-    )
+    actions = {
+        notifications.notify_selfcheck_failed: ["show-details", "Подробности"],
+        notifications.notify_microphone_lost: ["choose-microphone", "Выбрать микрофон"],
+    }
+    assert args[5].value() == actions.get(wrapper, [])
     assert args[6]["urgency"].value() == priority
 
 
@@ -718,6 +720,20 @@ def test_microphone_messages_use_system_description_and_actions(
     assert args[3:5] == expected
     assert args[5].value() == ([] if selected else ["choose-microphone", "Выбрать микрофон"])
     assert args[6]["urgency"].value() == b"\x01"
+
+
+@pytest.mark.parametrize("lost", [False, True])
+def test_microphone_change_button_opens_microphone_choice(transport: Mock, lost: bool) -> None:
+    """S5-A5 D1: обе вести о смене микрофона ведут к выбору микрофона в настройках."""
+    handler = Mock()
+    notifications.set_action_handler(notifications.ACTION_CHOOSE_MICROPHONE, handler)
+    transport.reply.arguments.return_value = [77]
+    if lost:
+        notifications.notify_microphone_lost()
+    else:
+        notifications.notify_microphone_changed("Встроенный микрофон")
+    _invoke_action(transport, 77, notifications.ACTION_CHOOSE_MICROPHONE)
+    handler.assert_called_once_with()
 
 
 def test_microphone_changed_escapes_markup_in_body(transport: Mock) -> None:

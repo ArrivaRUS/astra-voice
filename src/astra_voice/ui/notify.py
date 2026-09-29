@@ -564,11 +564,12 @@ def notify_microphone_changed(name: str) -> None:
 
 
 def notify_microphone_lost() -> None:
-    """Сообщить о пропаже явно выбранного микрофона."""
+    """Сообщить о пропаже микрофона; кнопка ведёт к выбору другого в настройках."""
     notify(
         "Микрофон отключился",
         "Проверьте подключение или выберите микрофон в настройках.",
         urgency="critical",
+        actions=[(ACTION_CHOOSE_MICROPHONE, "Выбрать микрофон")],
     )
 
 
