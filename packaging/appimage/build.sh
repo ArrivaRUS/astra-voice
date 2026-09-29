@@ -164,11 +164,9 @@ fi
 while read -r name sha size _url; do
     input_ok "downloads/$name" "$sha" "$size" || die "инструмент отсутствует или не совпал с lock: $name"
 done < <(lockq tools)
-# Попадание в кэш ничего не доказывает (R3.3): подпись и цепочка — до распаковки.
+# Попадание в кэш ничего не доказывает (R3.3): подпись и цепочка — до распаковки
+# (пакеты Debian проверяются на копии в каталоге сборки — ниже, при раскладке).
 verify_runtime
-if [ "$BASE" = debian12 ]; then
-    debverify debs || die 'пакеты Debian не прошли проверку происхождения — сборка остановлена'
-fi
 TOOL=$DOWNLOADS/appimagetool-x86_64.AppImage
 RUNTIME=$DOWNLOADS/runtime-x86_64
 chmod 755 "$TOOL"
@@ -242,9 +240,16 @@ case $BASE in
         # R3.2: три проверенных .deb → префикс opt/python3.11 (контракт AppRun/userinstall).
         say 'раскладываю Python из пакетов Debian 12'
         STAGE=$BUILD/debian
-        mkdir -p "$STAGE"
+        mkdir -p "$STAGE" "$BUILD/debs"
+        # Копия → проверка копии → распаковка копии: подмена файла в кэше между проверкой
+        # и распаковкой ничего не даёт (ревью P3-3).
         while read -r package rel; do
-            dpkg-deb -x "$CACHE/$rel" "$STAGE" || die "не распаковался $package"
+            cp -- "$CACHE/$rel" "$BUILD/debs/" || die "нет $package в кэше — нужен build.sh --fetch"
+        done < <(lockq debs)
+        debverify --deb-dir "$BUILD/debs" debs ||
+            die 'пакеты Debian не прошли проверку происхождения — сборка остановлена'
+        while read -r package rel; do
+            dpkg-deb -x "$BUILD/debs/$(basename "$rel")" "$STAGE" || die "не распаковался $package"
         done < <(lockq debs)
         [ -f "$STAGE/usr/bin/python3.11" ] && [ -f "$STAGE/usr/lib/python3.11/os.py" ] &&
             [ -d "$STAGE/usr/lib/python3.11/lib-dynload" ] ||

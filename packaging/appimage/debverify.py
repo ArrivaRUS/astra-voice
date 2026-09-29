@@ -280,9 +280,13 @@ class Verifier:
         root: Path,
         gpgv: str = "gpgv",
         dpkg_deb: str = "dpkg-deb",
+        deb_dir: Path | None = None,
     ) -> None:
         self.lock = lock
         self.cache = cache
+        #: Где лежат проверяемые .deb: по умолчанию кэш; build.sh передаёт свою копию,
+        #: чтобы распаковать ровно проверенные байты (ревью P3-3, TOCTOU).
+        self.deb_dir = deb_dir
         self.root = root
         self.gpgv = gpgv
         self.dpkg_deb = dpkg_deb
@@ -350,7 +354,7 @@ class Verifier:
                 f"{what}: исходник в индексе {source_of(stanza)}, "
                 f"в lock {(deb.source, deb.source_version)}"
             )
-        path = self.cache / deb.cache_path
+        path = (self.deb_dir / deb.file) if self.deb_dir else (self.cache / deb.cache_path)
         check_file(path, deb.sha256, deb.size, what)
         control = deb_control(path, self.dpkg_deb)
         got = (control.get("Package"), control.get("Version"), control.get("Architecture"))
@@ -434,11 +438,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--root", type=Path, default=Path(__file__).resolve().parents[2], help="корень репозитория"
     )
+    parser.add_argument("--deb-dir", type=Path, help="каталог с копиями .deb (сборка) вместо кэша")
     parser.add_argument("command", choices=("debs", "sources"))
     args = parser.parse_args(argv)
     try:
         lock = lockfile.load(args.lock)
-        verifier = Verifier(lock, args.cache, args.root)
+        verifier = Verifier(lock, args.cache, args.root, deb_dir=args.deb_dir)
         if args.command == "debs":
             paths = verifier.verify_debs()
             for deb in lock.debs:

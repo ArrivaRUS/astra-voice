@@ -1037,3 +1037,18 @@ def test_codename_and_suite_must_match_lock(archive: Archive, field: str, value:
     archive.item("debian-bookworm")[field] = value
     with pytest.raises(debverify.VerifyError, match="Codename/Suite"):
         verify(archive)
+
+
+@needs_tools
+def test_deb_dir_copy_is_what_gets_verified(archive: Archive, tmp_path: Path) -> None:
+    """Ревью P3-3: сборка проверяет свою копию .deb; подмена копии ловится, кэш не при чём."""
+    copies = tmp_path / "debs"
+    copies.mkdir()
+    for path in (archive.cache / "debs").glob("*.deb"):
+        shutil.copy2(path, copies / path.name)
+    lock = archive.write_lock()
+    paths = debverify.Verifier(lock, archive.cache, archive.root, deb_dir=copies).verify_debs()
+    assert all(path.parent == copies for path in paths)
+    (copies / f"python3.11-minimal_{VERSION}_amd64.deb").write_bytes(b"swapped")
+    with pytest.raises(debverify.VerifyError, match="deb python3.11-minimal: размер"):
+        debverify.Verifier(lock, archive.cache, archive.root, deb_dir=copies).verify_debs()
