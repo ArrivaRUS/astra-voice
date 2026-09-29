@@ -2530,6 +2530,19 @@ def autostart_check_installed(args: argparse.Namespace) -> int:
     notes = ["Способ: только чтение записи автозапуска пользователя; ничего не пишется."]
     path = module._paths()[0]
     notes.append(f"Файл: {path}.")
+    if path.is_symlink():
+        # Программа такую запись не меняет (set_enabled отказывает), и её поля
+        # принадлежат чужому файлу: сверять их с каноном бессмысленно.
+        checks.append(
+            {
+                "name": "symlink",
+                "title": "запись — обычный файл, не символическая ссылка",
+                "expected": "обычный файл",
+                "actual": "символическая ссылка — программа такую запись не меняет",
+                "passed": False,
+            }
+        )
+        return network_report(args, checks, notes)
     try:
         data = module._read(path)
     except OSError as exc:

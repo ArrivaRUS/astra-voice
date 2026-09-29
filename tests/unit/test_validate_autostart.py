@@ -153,3 +153,40 @@ def test_check_installed_reads_only(
     assert [path.name for path in entry.parent.iterdir()] == (
         [] if content is None else ["astra-voice.desktop"]
     )
+
+
+def test_check_installed_symlink_is_separate_error(
+    validate: Callable[[list[str]], Any],
+    config: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    real = tmp_path / "real.desktop"
+    real.write_bytes(CANONICAL)
+    entry = config / "autostart" / "astra-voice.desktop"
+    entry.parent.mkdir(parents=True)
+    entry.symlink_to(real)
+
+    code, facts = report(validate, ["--check-installed"], capsys)
+
+    assert code == 1
+    assert [check["name"] for check in facts["checks"]] == ["symlink"]
+    assert "символическая ссылка" in facts["checks"][0]["actual"]
+    assert entry.is_symlink() and real.read_bytes() == CANONICAL
+
+
+def test_sandbox_path_not_substituted_gives_exit_2(
+    validate: Callable[[list[str]], Any],
+    config: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = config / "autostart" / "astra-voice.desktop"
+    monkeypatch.setattr(autostart, "_paths", lambda: (real, []))
+
+    code, facts = report(validate, [], capsys)
+
+    assert code == 2
+    assert facts["checks"] == []
+    assert "временный XDG_CONFIG_HOME" in facts["explanation"]
+    assert not real.exists()
