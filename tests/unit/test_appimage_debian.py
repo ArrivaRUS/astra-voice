@@ -747,3 +747,181 @@ def test_release_and_deb822_parsers() -> None:
         "-----BEGIN PGP SIGNATURE-----\nabc\n-----END PGP SIGNATURE-----\n"
     )
     assert debverify.strip_pgp(signed) == "Source: x\n-dash"
+
+
+# --- SBOM базы debian12 (R3.4) --------------------------------------------------------------
+
+ELF = b"\x7fELF" + bytes(60)
+SITE = "opt/python3.11/lib/python3.11/site-packages"
+SBOM_SOURCES = "\n".join(
+    rec("source", {"id": ident, "file": file, "size": 1, "sha256": SHA, "url": url})
+    for ident, file, url in (
+        ("qtbase-5.15.19", "c1.tar.gz", "https://github.com/qt/qtbase/archive/c1.tar.gz"),
+        ("type2-runtime-src", "c2.tar.gz", "https://github.com/AppImage/x/archive/c2.tar.gz"),
+        ("libfuse-3.15.0", "fuse.tar.xz", "https://github.com/libfuse/libfuse/fuse.tar.xz"),
+    )
+)
+
+
+def _sbom_tree(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """AppDir, кэш и lock: два .deb интерпретатора, колёса numpy и PyQt5-Qt5 с RECORD."""
+    cache = tmp_path / "cache"
+    (cache / "debs").mkdir(parents=True)
+    appdir = tmp_path / "AppDir"
+    trees = {
+        "python3.11-minimal": {"usr/bin/python3.11": ELF},
+        "libpython3.11-minimal": {"usr/lib/python3.11/os.py": b"#\n"},
+        "libpython3.11-stdlib": {
+            "usr/lib/python3.11/lib-dynload/_ssl.cpython-311-x86_64-linux-gnu.so": ELF,
+            "usr/lib/python3.11/lib-dynload/readline.cpython-311-x86_64-linux-gnu.so": ELF,
+        },
+    }
+    override: dict[str, dict[str, Any]] = {}
+    for package, files in trees.items():
+        tree = tmp_path / f"tree-{package}"
+        (tree / "DEBIAN").mkdir(parents=True)
+        (tree / "DEBIAN" / "control").write_text(
+            f"Package: {package}\nVersion: {VERSION}\nArchitecture: amd64\n"
+            "Maintainer: T <t@test.invalid>\nDescription: t\n",
+            "utf-8",
+        )
+        for rel, data in files.items():
+            (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+            (tree / rel).write_bytes(data)
+            if "readline" in rel:
+                continue  # урезано сборкой
+            target = appdir / (
+                "opt/python3.11/bin/python3.11"
+                if rel == "usr/bin/python3.11"
+                else "opt/python3.11/" + rel.removeprefix("usr/")
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        deb = cache / "debs" / f"{package}_{VERSION}_amd64.deb"
+        subprocess.run(
+            ["dpkg-deb", "--root-owner-group", "-b", str(tree), str(deb)],
+            capture_output=True,
+            check=True,
+        )
+        sha, size = digest(deb)
+        override[package] = {"sha256": sha, "size": size}
+    site = appdir / SITE
+    wheels: dict[str, dict[str, bytes | None]] = {
+        "numpy-1.24.2": {
+            "numpy/core/_multiarray.cpython-311-x86_64-linux-gnu.so": ELF,
+            "numpy.libs/libgfortran-040039e1.so.5.0.0": ELF,
+            "numpy/__init__.py": b"",
+        },
+        "pyqt5_qt5-5.15.19": {
+            "PyQt5/Qt5/lib/libQt5Core.so.5": ELF,
+            "PyQt5/Qt5/lib/libicuuc.so.56": ELF,
+            "PyQt5/Qt5/plugins/platforms/libqxcb.so": ELF,
+            "PyQt5/Qt5/lib/libQt5Designer.so.5": None,  # в RECORD, но вырезано сборкой
+        },
+    }
+    for dist, content in wheels.items():
+        info = site / f"{dist}.dist-info"
+        info.mkdir(parents=True)
+        rows = []
+        for rel, blob in content.items():
+            rows.append(f"{rel},sha256=x,1")
+            if blob is not None:
+                (site / rel).parent.mkdir(parents=True, exist_ok=True)
+                (site / rel).write_bytes(blob)
+        (info / "RECORD").write_text("\n".join(rows) + "\n", "utf-8")
+    (appdir / ".astra-voice-build").write_text("VERSION=0.2.0\nBUILD_ID=0123456789ab\n", "ascii")
+    head = HEAD.replace(
+        f"numpy==1.24.2 \\\n    --hash=sha256:{SHA}\n",
+        f"numpy==1.24.2 \\\n    --hash=sha256:{SHA}\n"
+        f"PyQt5-Qt5==5.15.19 \\\n    --hash=sha256:{SHA}\n",
+    ).replace(
+        "# host-lib: libcrypto.so.3 libssl3",
+        "# host-lib: libcrypto.so.3 libssl3\n# host-lib: libz.so.1 zlib1g",
+    )
+    lock = tmp_path / "appimage.lock"
+    lock.write_text(lock_text(records(**override), head=head, extra=SBOM_SOURCES + "\n"), "utf-8")
+    return appdir, cache, lock
+
+
+def _sbom(appdir: Path, cache: Path, lock: Path, out: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "sbom.py"),
+            "--appdir",
+            str(appdir),
+            "--lock",
+            str(lock),
+            "--cache",
+            str(cache),
+            "--out",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+        env={"PATH": "/usr/bin:/bin", "SOURCE_DATE_EPOCH": "1790000000"},
+    )
+
+
+@pytest.mark.skipif(shutil.which("dpkg-deb") is None, reason="нужен dpkg-deb")
+def test_sbom_debian12(tmp_path: Path) -> None:
+    appdir, cache, lock = _sbom_tree(tmp_path)
+    out = tmp_path / "sbom.json"
+    proc = _sbom(appdir, cache, lock, out)
+    assert proc.returncode == 0, proc.stderr
+    bom = json.loads(out.read_text("utf-8"))
+    comps = {c["bom-ref"]: c for c in bom["components"]}
+    stdlib = comps[f"pkg:deb/debian/libpython3.11-stdlib@{VERSION}?arch=amd64"]
+    props = {p["name"]: p["value"] for p in stdlib["properties"]}
+    assert props["astra-voice:files-retained"] == "1"  # readline урезан
+    assert props["astra-voice:source-package"] == f"python3.11 {VERSION}"
+    assert (
+        stdlib["hashes"][0]["content"]
+        == digest(cache / "debs" / f"libpython3.11-stdlib_{VERSION}_amd64.deb")[0]
+    )
+    ssl_host = comps["host:libssl3"]
+    host_props = {p["name"]: p["value"] for p in ssl_host["properties"]}
+    assert ssl_host["name"] == "openssl"
+    assert host_props["astra-voice:origin"] == "host"
+    assert host_props["astra-voice:not-bundled"] == "true"
+    assert host_props["astra-voice:sonames"] == "libcrypto.so.3 libssl.so.3"
+    assert "host:zlib1g" in comps
+    runtime = next(c for c in bom["components"] if c["name"] == "type2-runtime")
+    assert runtime["scope"] == "required"
+    assert [p["name"] for p in runtime["components"]][:2] == ["libfuse", "squashfuse"]
+    assert comps["tool:appimagetool-x86_64.AppImage"]["scope"] == "excluded"
+    qt = next(
+        c for c in comps["pkg:pypi/PyQt5-Qt5@5.15.19"]["components"] if c["name"] == "qt5-qtbase"
+    )
+    assert qt["licenses"] == [{"expression": "LGPL-3.0-only"}]
+    assert qt["externalReferences"][0]["url"].endswith("qtbase/archive/c1.tar.gz")
+    numpy_libs = comps["pkg:pypi/numpy@1.24.2"]["components"]
+    assert numpy_libs[0]["licenses"] == [{"expression": "GPL-3.0-or-later WITH GCC-exception-3.1"}]
+    origins = {
+        c["name"]: next(p["value"] for p in c["properties"] if p["name"] == "astra-voice:from")
+        for c in bom["components"]
+        if c["bom-ref"].startswith("file:")
+    }
+    assert origins["/opt/python3.11/bin/python3.11"].startswith("pkg:deb/debian/python3.11-min")
+    assert origins[f"/{SITE}/PyQt5/Qt5/lib/libicuuc.so.56"] == "pkg:generic/icu@56"
+    assert origins[f"/{SITE}/numpy.libs/libgfortran-040039e1.so.5.0.0"] == "pkg:pypi/numpy@1.24.2"
+    assert len(origins) == 7
+
+
+@pytest.mark.skipif(shutil.which("dpkg-deb") is None, reason="нужен dpkg-deb")
+def test_sbom_debian12_refuses_unattributed_elf(tmp_path: Path) -> None:
+    appdir, cache, lock = _sbom_tree(tmp_path)
+    (appdir / "usr" / "lib").mkdir(parents=True)
+    (appdir / "usr" / "lib" / "libstray.so.1").write_bytes(ELF)
+    proc = _sbom(appdir, cache, lock, tmp_path / "sbom.json")
+    assert proc.returncode == 1
+    assert "ELF без происхождения: /usr/lib/libstray.so.1" in proc.stderr
+    (appdir / "usr" / "lib" / "libstray.so.1").unlink()
+    qt_extra = appdir / SITE / "PyQt5" / "Qt5" / "lib" / "libQt5Designer.so.5"
+    qt_extra.write_bytes(ELF)
+    proc = _sbom(appdir, cache, lock, tmp_path / "sbom.json")
+    assert proc.returncode == 1
+    assert "ELF Qt без модуля в карте sbom.py: PyQt5/Qt5/lib/libQt5Designer.so.5" in proc.stderr
+    assert not (tmp_path / "sbom.json").exists()

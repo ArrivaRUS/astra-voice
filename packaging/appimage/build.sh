@@ -483,13 +483,9 @@ say 'гейт: ELF (T1 MN-9 — число и glibc из lock)'
 python3 "$ROOT/tools/elf-audit" --strict --expect "$(lockq get expect-elf)" \
     --max-glibc "$(lockq get max-glibc)" "$APPDIR" | tail -n 3
 
-if [ "$BASE" = debian12 ]; then
-    # R3.4: нынешний sbom.py требует бандловый libssl и не знает Debian-компонентов —
-    # образ без честного SBOM не выпускаем. Переделка SBOM — следующий шаг R3.
-    die 'SBOM для базы debian12 ещё не реализован (R3: sbom.py) — AppDir собран и прошёл гейты, образ не упакован'
-fi
 say 'SBOM AppImage'
-python3 "$ROOT/scripts/sbom.py" --appdir "$APPDIR" --lock "$LOCK" --out "$OUT/sbom-appimage.cdx.json"
+python3 "$ROOT/scripts/sbom.py" --appdir "$APPDIR" --lock "$LOCK" --cache "$CACHE" \
+    --out "$OUT/sbom-appimage.cdx.json"
 
 # --- упаковка ------------------------------------------------------------------
 find "$APPDIR" -print0 | xargs -0 -r touch -h --date="@$SOURCE_DATE_EPOCH"
