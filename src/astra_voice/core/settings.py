@@ -46,6 +46,9 @@ class Settings:
     # синтез-план §6.5): ни одного соединения без явного действия пользователя.
     check_app_updates: bool = False
     check_model_updates: bool = False
+    # Офлайн-режим пользователя (PRD F14.2): перекрывает оба тумблера и скачивание
+    # моделей. Имя совпадает с ключом ``offline`` в policy.conf — политика его блокирует.
+    offline: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
