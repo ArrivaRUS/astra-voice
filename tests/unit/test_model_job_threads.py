@@ -22,11 +22,11 @@ from unittest.mock import Mock
 import pytest
 from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEvent, QMetaObject, QObject
-from test_bridges import FakeModelPort
 
 from astra_voice.models.installer import InstallResult
 from astra_voice.ui import model_downloads
 from astra_voice.ui.model_downloads import ModelDownloads, _JobChannel
+from helpers.model_rig import FakeModelPort
 from helpers.qt_app import get_qapplication
 
 pytestmark = pytest.mark.unit

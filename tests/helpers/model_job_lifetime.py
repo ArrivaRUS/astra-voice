@@ -16,7 +16,6 @@ import resource
 import sys
 import threading
 from collections.abc import Callable
-from pathlib import Path
 from time import monotonic, sleep
 from typing import Any
 
@@ -27,9 +26,7 @@ from astra_voice.models.catalog import CatalogEntry
 from astra_voice.models.downloader import Progress
 from astra_voice.ui import model_downloads
 from astra_voice.ui.model_downloads import ModelDownloads
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unit"))
-from test_bridges import FakeModelPort  # noqa: E402
+from helpers.model_rig import FakeModelPort
 
 MARKER = "MODEL_JOB_OK:exit_while_download_blocked"
 
