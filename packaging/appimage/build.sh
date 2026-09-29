@@ -237,6 +237,13 @@ case $BASE in
             --target "$SITE" -r "$LOCK"
         ;;
     debian12)
+        # Колёса ставит pip машины сборки: версии закреплены в lock (ревью P3-6).
+        have_py=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+        [ "$have_py" = "$(lockq get build-python)" ] ||
+            die "сборочный Python $have_py, в lock build-python $(lockq get build-python)"
+        have_pip=$(python3 -m pip --version | awk '{print $2}')
+        [ "$have_pip" = "$(lockq get build-pip)" ] ||
+            die "сборочный pip $have_pip, в lock build-pip $(lockq get build-pip)"
         # R3.2: три проверенных .deb → префикс opt/python3.11 (контракт AppRun/userinstall).
         say 'раскладываю Python из пакетов Debian 12'
         STAGE=$BUILD/debian

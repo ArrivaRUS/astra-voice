@@ -12,6 +12,8 @@
   - `openssl-major` — ожидаемая старшая версия OpenSSL (гейт `check_bundle.py`);
   - `expect-elf`, `max-glibc` — гейт `tools/elf-audit` (MN-9);
   - `runtime-key` — отпечаток ключа подписи `runtime-x86_64.sig`;
+  - `build-python`, `build-pip` (обязательны при debian12) — версии Python и pip машины
+    сборки, которыми ставятся колёса (`pip --target`); иная версия — отказ сборки;
 * однострочные JSON-записи Debian-входов (R3.3), только при `base: debian12`:
   - `# archive: {"id","keyring","signer","release","sha256","size","codename","suite"}` —
     подписанный `InRelease`; `keyring` — путь в репозитории, `signer` — отпечаток основного
@@ -66,6 +68,8 @@ DIRECTIVES = (
     "max-glibc",
     "runtime-key",
 )
+#: Сборочные Python и pip (base debian12: колёса ставит pip машины сборки — ревью P3-6).
+BUILD_DIRECTIVES = ("build-python", "build-pip")
 #: Каталоги кэша (R3.3): инструменты, подписанные индексы, пакеты, исходники.
 CACHE_DIRS = {"tool": "downloads", "metadata": "metadata", "deb": "debs", "source": "sources"}
 
@@ -90,6 +94,8 @@ _VALUE_RE = {
     "expect-elf": re.compile(r"[0-9]+"),
     "max-glibc": re.compile(r"[0-9]+\.[0-9]+"),
     "runtime-key": re.compile(r"[0-9A-F]{40}"),
+    "build-python": re.compile(r"[0-9]+\.[0-9]+"),
+    "build-pip": re.compile(r"[0-9]+\.[0-9]+(\.[0-9]+)?"),
 }
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _FPR_RE = re.compile(r"[0-9A-F]{40}")
@@ -485,6 +491,10 @@ def parse(text: str) -> Lock:
     if missing:
         raise LockError(f"нет директив: {', '.join(missing)}")
     _check_tools(lock)
+    if lock.base == "debian12":
+        absent = [key for key in BUILD_DIRECTIVES if key not in lock.directives]
+        if absent:
+            raise LockError(f"base debian12: нет директив {', '.join(absent)}")
     origin = {"debian12": "host", "python-appimage": "bundled"}[lock.base]
     if lock.directives["openssl-origin"] != origin:
         raise LockError(f"base {lock.base}: openssl-origin должен быть {origin}")
@@ -522,14 +532,14 @@ def _parse_comment(lock: Lock, line: str) -> None:
         lock.todo_pin.append(match["what"].strip())
     elif "TODO-PIN" in line:
         raise LockError(f"неверная строка TODO-PIN: {line}")
-    elif (match := _DIRECTIVE_RE.fullmatch(line)) and match["key"] in DIRECTIVES:
+    elif (match := _DIRECTIVE_RE.fullmatch(line)) and match["key"] in DIRECTIVES + BUILD_DIRECTIVES:
         key, value = match["key"], match["value"]
         if key in lock.directives:
             raise LockError(f"директива {key} повторяется")
         if not _VALUE_RE[key].fullmatch(value):
             raise LockError(f"неверное значение {key}: {value}")
         lock.directives[key] = value
-    elif any(line.startswith(f"# {key}") for key in DIRECTIVES):
+    elif any(line.startswith(f"# {key}") for key in DIRECTIVES + BUILD_DIRECTIVES):
         raise LockError(f"неверная директива: {line}")
     elif match := _TODO_RE.fullmatch(line):
         lock.todo.append((match["name"], match["version"]))
@@ -582,9 +592,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     command = args[1]
     if command == "get":
-        if len(args) != 3 or args[2] not in DIRECTIVES:
-            sys.stderr.write(f"get: одна из {', '.join(DIRECTIVES)}\n")
+        known = DIRECTIVES + BUILD_DIRECTIVES
+        if len(args) != 3 or args[2] not in known:
+            sys.stderr.write(f"get: одна из {', '.join(known)}\n")
             return 2
+        if args[2] not in lock.directives:
+            sys.stderr.write(f"get: в lock нет {args[2]}\n")
+            return 1
         print(lock.directives[args[2]])
     elif command == "tools":
         for tool in lock.tools:

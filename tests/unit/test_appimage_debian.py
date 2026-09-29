@@ -46,6 +46,8 @@ BASE_URL = "https://snapshot.invalid/archive/debian/20260929T000000Z"
 HEAD = f"""# base: debian12
 # openssl-origin: host
 # openssl-major: 3
+# build-python: 3.11
+# build-pip: 23.0.1
 # expect-elf: 100
 # max-glibc: 2.36
 # runtime-key: 570C77ACEA40C0F1B758902CBF96CCA56490F695
@@ -315,6 +317,15 @@ def test_base_and_tools_must_agree() -> None:
         lockfile.parse(lock_text(records(), head=legacy))
     with pytest.raises(lockfile.LockError, match="неверное значение base"):
         lockfile.parse(lock_text(records(), head=HEAD.replace("debian12", "debian13")))
+
+
+def test_build_tool_pins_required_for_debian12() -> None:
+    lock = lockfile.parse(lock_text(records()))
+    assert (lock.directives["build-python"], lock.directives["build-pip"]) == ("3.11", "23.0.1")
+    with pytest.raises(lockfile.LockError, match="нет директив build-pip"):
+        lockfile.parse(lock_text(records(), head=HEAD.replace("# build-pip: 23.0.1\n", "")))
+    with pytest.raises(lockfile.LockError, match="неверное значение build-python"):
+        lockfile.parse(lock_text(records(), head=HEAD.replace("3.11\n", "3\n", 1)))
 
 
 def test_host_lib_manifest() -> None:

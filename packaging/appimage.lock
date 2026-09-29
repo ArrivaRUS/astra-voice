@@ -11,6 +11,9 @@
 # base: debian12
 # openssl-origin: host
 # openssl-major: 3
+# Колёса ставит pip машины сборки (debian:12: python3 3.11, python3-pip 23.0.1) — ревью P3-6.
+# build-python: 3.11
+# build-pip: 23.0.1
 #
 # Гейт tools/elf-audit (T1 MN-9, У112): новый ELF из обновлённого колеса или символ glibc новее
 # закреплённого роняет сборку. Меняются только осознанно, вместе с колесом или базой.
