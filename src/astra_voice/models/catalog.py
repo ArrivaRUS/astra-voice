@@ -21,7 +21,7 @@ from astra_voice.core import paths
 from astra_voice.models import catalog_state
 from astra_voice.models import schema as schema_module
 from astra_voice.net.hosts import host_allowed
-from astra_voice.security.verify import Verifier
+from astra_voice.security.verify import CLOCK_BEHIND, Verifier
 
 log = logging.getLogger(__name__)
 
@@ -458,7 +458,17 @@ def load_builtin(
     sig_path = (directory / "catalog.json.sig").resolve()
     raw = _read_limited(catalog_path, "Каталог")
     try:
-        if not sig_path.is_file() or not verifier.verify_detached(catalog_path, sig_path):
+        if not sig_path.is_file():
+            raise CatalogError("bad-signature", "Не удалось подтвердить подпись каталога.")
+        verdict = verifier.verify_detached(catalog_path, sig_path)
+        if not verdict.ok and verdict.code == CLOCK_BEHIND:
+            # У92/T-116: понятная причина вместо безымянного отказа подписи.
+            raise CatalogError(
+                "clock-behind",
+                "Не удалось подтвердить подпись каталога: часы компьютера отстают. "
+                "Проверьте дату и время.",
+            )
+        if not verdict.ok:
             raise CatalogError("bad-signature", "Не удалось подтвердить подпись каталога.")
     except (OSError, UnicodeError):
         raise CatalogError("bad-signature", "Не удалось проверить подпись каталога.") from None

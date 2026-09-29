@@ -17,6 +17,45 @@ MAX_CACHE_BYTES = 1024 * 1024
 MAX_BODY_BYTES = 256 * 1024
 
 
+def read_private(path: Path, limit: int) -> bytes:
+    """Читает обычный файл без перехода по ссылке; больше ``limit`` — ValueError."""
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise ValueError("тип файла")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("тип файла")
+        raw = os.read(descriptor, limit + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) > limit:
+        raise ValueError("размер")
+    return raw
+
+
+def write_private(path: Path, raw: bytes) -> None:
+    """Атомарно заменяет файл 0600: временный файл, fsync, rename, fsync каталога."""
+    temporary: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, name = tempfile.mkstemp(prefix=f".{path.stem}-", dir=path.parent)
+        temporary = Path(name)
+        with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def valid_etag(value: str | None) -> bool:
     """Разрешает только короткие видимые ASCII-значения ETag."""
     return value is not None and 0 < len(value) <= 256 and all(33 <= ord(c) <= 126 for c in value)
@@ -80,18 +119,7 @@ class UpdateCache:
 
     def _read(self) -> dict[str, CacheEntry]:
         try:
-            path = self.path
-            if not stat.S_ISREG(path.lstat().st_mode):
-                raise ValueError("тип файла")
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-            try:
-                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                    raise ValueError("тип файла")
-                raw = os.read(descriptor, MAX_CACHE_BYTES + 1)
-            finally:
-                os.close(descriptor)
-            if len(raw) > MAX_CACHE_BYTES:
-                raise ValueError("размер")
+            raw = read_private(self.path, MAX_CACHE_BYTES)
             parsed: object = json.loads(raw.decode("utf-8"))
             if not isinstance(parsed, dict) or not all(isinstance(key, str) for key in parsed):
                 raise ValueError("формат")
@@ -132,25 +160,20 @@ class UpdateCache:
             if len(raw) > MAX_CACHE_BYTES:
                 log.warning("Кэш проверок превышает допустимый размер")
                 return
-            temporary: Path | None = None
             try:
-                path = self.path
-                path.parent.mkdir(parents=True, exist_ok=True)
-                descriptor, name = tempfile.mkstemp(prefix=".update-cache-", dir=path.parent)
-                temporary = Path(name)
-                with os.fdopen(descriptor, "wb") as handle:
-                    os.fchmod(handle.fileno(), 0o600)
-                    handle.write(raw)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary, path)
-                directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
+                write_private(self.path, raw)
             except OSError:
                 log.warning("Не удалось сохранить кэш проверок")
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
+
+
+_shared: UpdateCache | None = None
+_shared_lock = threading.Lock()
+
+
+def shared_cache() -> UpdateCache:
+    """Единственный кэш процесса: все проверки делят один замок файла (ревью M7)."""
+    global _shared
+    with _shared_lock:
+        if _shared is None:
+            _shared = UpdateCache()
+        return _shared

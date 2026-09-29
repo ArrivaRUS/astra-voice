@@ -290,3 +290,32 @@ def test_policy_profile_values(value: object, expected_allowed: bool) -> None:
         expected_allowed,
         expected_reason,
     )
+
+
+@pytest.mark.parametrize(
+    ("policy", "check_app", "scheduled", "manual"),
+    [
+        ("absent", False, "settings", ""),
+        ("absent", True, "", ""),
+        ("app-check-disabled", True, "policy", "policy"),
+        ("checks-disabled", False, "policy", "policy"),
+        ("offline", True, "admin", "admin"),
+        ("invalid", True, "admin", "admin"),
+    ],
+    indirect=["policy"],
+)
+def test_manual_app_check(policy: Policy, check_app: bool, scheduled: str, manual: str) -> None:
+    """«Проверить сейчас» не требует тумблера, но уважает офлайн и запрет администратора."""
+    gate = NetworkGate(effective(Settings(check_app_updates=check_app), policy), policy)
+    assert gate.refusal("check_app") == scheduled
+    assert gate.refusal("check_app_manual") == manual
+    if manual == "policy":
+        assert gate.allowed("check_app_manual") == (
+            False,
+            "Проверка обновлений отключена администратором",
+        )
+
+
+def test_manual_app_check_respects_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert NetworkGate(Settings(), Policy()).refusal("check_app_manual") == "offline"

@@ -16,11 +16,12 @@ import signal
 import sys
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PyQt5.QtCore import QObject, Qt, pyqtSlot
+from PyQt5.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
 
 from astra_voice.core import paths
 from astra_voice.core import policy as policy_mod
@@ -48,6 +49,7 @@ from astra_voice.ui.tray import shutdown_bus_threads
 if TYPE_CHECKING:
     from astra_voice.core.dictation import LevelCallback, TestCallback
     from astra_voice.runtime import DictationRuntime
+    from astra_voice.updates.checker import UpdateChecker
 
 log = logging.getLogger(__name__)
 
@@ -687,6 +689,58 @@ class _WindowFocuser(QObject):
             root.activateWindow()
 
 
+class _GuiCalls(QObject):
+    """Передаёт вызовы рабочих потоков в GUI-поток очередью Qt.
+
+    Живёт и удаляется в GUI-потоке; рабочий поток только испускает сигнал
+    (урок 025: никаких Python-QObject в рабочих потоках).
+    """
+
+    _call = pyqtSignal(object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._call.connect(self._run, Qt.QueuedConnection)
+
+    def post(self, call: Callable[[], None]) -> None:
+        self._call.emit(call)
+
+    @pyqtSlot(object)
+    def _run(self, call: object) -> None:
+        if not callable(call):
+            return
+        try:
+            call()
+        except Exception:  # noqa: BLE001 — сбой одного вызова не ломает цикл событий
+            log.warning("Не удалось выполнить отложенный вызов", exc_info=True)
+
+
+def _start_update_checker(
+    settings: settings_mod.Settings,
+    policy: policy_mod.Policy,
+    gui_calls: _GuiCalls,
+    runtime: DictationRuntime | None,
+) -> UpdateChecker | None:
+    """Фоновая проверка обновлений программы (M7-ядро); строка в окне — позже."""
+    try:
+        from astra_voice.updates.checker import create_app_checker
+
+        checker = create_app_checker(settings, policy)
+    except Exception:  # noqa: BLE001 — без проверки обновлений приложение работает
+        log.warning("Проверка обновлений недоступна", exc_info=True)
+        return None
+    if runtime is not None:
+        stats = runtime.stats
+
+        def record(kind: str, fields: Mapping[str, str]) -> None:
+            # Статистика однопоточная: запись — только в GUI-потоке.
+            gui_calls.post(partial(stats.append, kind, **fields))
+
+        checker.on_event = record
+    checker.start()
+    return checker
+
+
 def _wire_close(
     app: Any, shell: Any, is_tray_ready: Callable[[], bool] | None = None
 ) -> Any | None:
@@ -861,6 +915,8 @@ def main(argv: list[str] | None = None) -> int:
     settings_bridge = None  # держим Python-обёртку живой до выхода из main
     onboarding = None
     downloads = None
+    update_checker: UpdateChecker | None = None
+    gui_calls = _GuiCalls()
     model_store: ModelStore | None = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
     close_watcher = _wire_close(  # держим ссылку на фильтр
@@ -877,7 +933,9 @@ def main(argv: list[str] | None = None) -> int:
         model = None
         try:
             model = ModelService(settings, policy)
-        except Exception:  # noqa: BLE001 — каталог не должен мешать запуску окна
+        except Exception as exc:  # noqa: BLE001 — каталог не должен мешать запуску окна
+            if getattr(exc, "code", None) == "clock-behind":  # У92/T-116
+                log.warning("Каталог моделей не принят: часы компьютера отстают")
             log.warning("Не удалось подготовить каталог моделей, настройка продолжится без него")
         revoked_check = _revoked_check(model)
         try:
@@ -997,11 +1055,23 @@ def main(argv: list[str] | None = None) -> int:
             downloads.downloadProgressChanged.connect(update_download_status)
             downloads.downloadStateChanged.connect(update_download_status)
         _set_context_property(shell, "showOnboarding", show_onboarding)
+        update_checker = _start_update_checker(
+            settings, policy, gui_calls, runtime if runtime_ready else None
+        )
         if not args.hidden:
             focuser.focus_shell()
         return int(app.exec_())
     finally:
         focuser.stop()
+        if update_checker is not None:
+            try:
+                update_checker.stop()
+            except Exception:  # noqa: BLE001 — остальные ресурсы тоже нужно освободить
+                log.warning("Не удалось остановить проверку обновлений")
+            # Замыкание держит _GuiCalls: последняя ссылка на QObject отпускается
+            # здесь, в GUI-потоке, а не в рабочем (урок 025).
+            update_checker.on_event = None
+            update_checker.on_status = None
         # US-8.4: выход из трея и SIGTERM/SIGINT вызывают app.quit() и приходят
         # сюда. После отмены фокуса освобождаем воркер и захваты, затем lock/ipc и UI.
         if onboarding is not None:
