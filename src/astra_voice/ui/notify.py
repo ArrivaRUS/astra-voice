@@ -13,6 +13,7 @@ import threading
 from collections import OrderedDict, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from html import escape
 from time import monotonic
 from typing import Any, cast
 
@@ -556,7 +557,7 @@ def notify_microphone_changed(name: str) -> None:
     """Сообщить о смене микрофона, используя его человекочитаемое описание."""
     notify(
         "Микрофон сменился",
-        f"Сейчас используется: {name}. Выбрать другой можно в настройках.",
+        f"Сейчас используется: {escape(name, quote=False)}. Выбрать другой можно в настройках.",
         actions=[(ACTION_CHOOSE_MICROPHONE, "Выбрать микрофон")],
         retry=False,
     )

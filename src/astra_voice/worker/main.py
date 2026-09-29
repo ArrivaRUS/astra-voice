@@ -10,7 +10,7 @@ import select
 import signal
 import socket
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from queue import Empty, SimpleQueue
 from typing import NoReturn
@@ -18,7 +18,7 @@ from typing import NoReturn
 from astra_voice.core.audio_env import deny_pulse_autospawn
 from astra_voice.core.logging import setup_logging
 from astra_voice.worker import ipc
-from astra_voice.worker.audio import CaptureStopTimeout
+from astra_voice.worker.audio import AudioSource, CaptureStopTimeout, PulseSimpleSource
 from astra_voice.worker.state import Message, WorkerState
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,16 @@ MIN_ADDRESS_SPACE = 3 * 1024 * 1024 * 1024
 # Запас к дедлайну в секунду на отправку и освобождение устройства.
 POLL_INTERVAL = 0.25
 MAX_SEND_BUFFER = 4 * 1024 * 1024
+
+
+def select_audio_source(env: Mapping[str, str]) -> AudioSource:
+    """Выбирает источник только по переданному окружению, не открывая устройство."""
+    # Умолчание сменим на stream только после стенда и мини-Ц2 (решение Юрки).
+    if env.get("ASTRA_VOICE_AUDIO_BACKEND") == "stream":
+        from astra_voice.worker.pulse_stream import PulseStreamSource
+
+        return PulseStreamSource()
+    return PulseSimpleSource()
 
 
 def _prctl(option: int, value: int) -> None:
@@ -107,14 +117,22 @@ class WorkerLoop:
         self._wake_w.setblocking(False)
         self.worker = WorkerState(on_event=self._put_event)
         if capture:
-            from astra_voice.worker.audio import AudioCapture, PulseSimpleSource
+            from astra_voice.worker.audio import AudioCapture
+
+            source = select_audio_source(os.environ)
+            backend = os.environ.get("ASTRA_VOICE_AUDIO_BACKEND")
+            if backend is not None and backend not in ("simple", "stream"):
+                # Значение не пишем: оно может быть длинным или содержать управляющие символы.
+                logger.warning("Неизвестный ASTRA_VOICE_AUDIO_BACKEND; выбран simple.")
+            logger.info("Бэкенд записи: %s", "stream" if backend == "stream" else "simple")
 
             self.worker.set_capture(
                 AudioCapture(
-                    source=PulseSimpleSource(),
+                    source=source,
                     on_samples=self.worker.on_samples,
                     on_event=self._put_event,
                     on_error=self.worker.on_error,
+                    on_device_change=self.worker.on_device_change,
                 )
             )
         self._reader = ipc.FrameReader()

@@ -7,6 +7,7 @@ import math
 import platform
 import re
 import struct
+import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
@@ -14,9 +15,10 @@ from typing import Any
 
 from astra_voice.core.version import __version__
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_FRAME_BYTES = 64 * 1024
 MAX_TEXT_BYTES = 32 * 1024
+MAX_DEVICE_LABEL = 120
 
 FRAME_TOO_LARGE = "frame-too-large"
 BAD_FRAME = "bad-frame"
@@ -66,6 +68,9 @@ _SCHEMAS = {
     "record.start": _Schema({"utterance_id": _STR}, optional={"device": _STR, "limit_s": _NUMBER}),
     "record.stop": _UTTERANCE,
     "record.limit": _UTTERANCE,
+    "audio.device.changed": _Schema(
+        {"utterance_id": _STR, "kind": _STR}, optional={"label": _STR, "audio_ms": _INT}
+    ),
     "record.cancel": _UTTERANCE,
     "recognize": _UTTERANCE,
     "transcribe.file": _Schema({"path": _STR}),
@@ -139,6 +144,17 @@ def _validate(msg: dict[str, Any]) -> dict[str, Any]:
     result = {"type": kind, **_fields(msg, _SCHEMAS[kind])}
     if "utterance_id" in result and not _UTTERANCE_ID.fullmatch(result["utterance_id"]):
         raise FrameError(BAD_FIELD, "Неверный формат utterance_id.")
+    if kind == "audio.device.changed":
+        if result["kind"] not in {"switched", "device-lost"}:
+            raise FrameError(BAD_FIELD, "Неверное значение kind.")
+        label = result.get("label")
+        if label is not None and (
+            len(label) > MAX_DEVICE_LABEL
+            or any(unicodedata.category(char) in {"Cc", "Cf"} for char in label)
+        ):
+            raise FrameError(BAD_FIELD, "Неверная подпись устройства.")
+        if "audio_ms" in result and result["audio_ms"] < 0:
+            raise FrameError(BAD_FIELD, "Поле audio_ms должно быть неотрицательным.")
     if "text" in result:
         text = result["text"]
         # Сначала число символов: для строки в 50 МБ не создаём ещё одну копию.

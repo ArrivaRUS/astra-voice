@@ -40,7 +40,7 @@ _MESSAGES: list[dict[str, Any]] = [
     {"type": "audio.close"},
     {
         "type": "hello",
-        "protocol": 2,
+        "protocol": 3,
         "build": "0.1.0",
         "runtime": {"python": "3.11.0", "onnxruntime": None},
     },
@@ -65,6 +65,7 @@ _MESSAGES: list[dict[str, Any]] = [
     {"type": "pong"},
     {"type": "measured", "vm_hwm_kb": 1200, "pss_kb": 800},
     {"type": "audio.ready"},
+    {"type": "audio.device.changed", "utterance_id": "a-B_09", "kind": "switched"},
     {"type": "audio.closed"},
 ]
 
@@ -238,6 +239,41 @@ def test_valid_utterance_id_boundaries(utterance_id: str) -> None:
     assert ipc.FrameReader().feed(ipc.encode(msg)) == [msg]
 
 
+def test_audio_device_changed_optional_fields() -> None:
+    msg = {
+        "type": "audio.device.changed",
+        "utterance_id": "u1",
+        "kind": "switched",
+        "label": "USB микрофон",
+        "audio_ms": 1250,
+    }
+    assert ipc.decode(ipc.encode(msg)[4:]) == msg
+    assert ipc.decode(ipc.encode({**msg, "label": "x" * 120})[4:]) == {**msg, "label": "x" * 120}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"kind": "other"},
+        {"audio_ms": True},
+        {"audio_ms": -1},
+        {"label": 123},
+        {"label": "USB\nмикрофон"},
+        {"label": "USB\u200bмикрофон"},
+        {"label": "x" * 121},
+        {"utterance_id": "invalid uid"},
+    ],
+)
+def test_audio_device_changed_rejects_bad_fields(change: dict[str, Any]) -> None:
+    msg = {"type": "audio.device.changed", "utterance_id": "u1", "kind": "switched", **change}
+    with pytest.raises(ipc.FrameError) as caught:
+        ipc.encode(msg)
+    assert caught.value.code == ipc.BAD_FIELD
+    with pytest.raises(ipc.FrameError) as caught:
+        ipc.decode(_payload(msg))
+    assert caught.value.code == ipc.BAD_FIELD
+
+
 @pytest.mark.parametrize("msg", _MESSAGES, ids=lambda msg: msg["type"])
 def test_required_fields_and_types(msg: dict[str, Any]) -> None:
     for name in msg:
@@ -270,10 +306,11 @@ def test_invalid_hello(changes: dict[str, Any]) -> None:
 
 def test_protocol_versions_reject_both_directions(monkeypatch: pytest.MonkeyPatch) -> None:
     new_hello = ipc.make_hello()
-    old_hello = {**new_hello, "protocol": 1}
-    with pytest.raises(ipc.FrameError, match="Программа обновлена"):
+    old_hello = {**new_hello, "protocol": 2}
+    with pytest.raises(ipc.FrameError, match="Программа обновлена") as caught:
         ipc.decode(_payload(old_hello))
-    monkeypatch.setattr(ipc, "PROTOCOL_VERSION", 1)
+    assert caught.value.code == ipc.PROTOCOL_MISMATCH
+    monkeypatch.setattr(ipc, "PROTOCOL_VERSION", 2)
     with pytest.raises(ipc.FrameError, match="Программа обновлена"):
         ipc.decode(_payload(new_hello))
 
@@ -352,7 +389,7 @@ def test_hello_without_onnxruntime(monkeypatch: pytest.MonkeyPatch) -> None:
     assert type(hello["protocol"]) is int
     assert hello == {
         "type": "hello",
-        "protocol": 2,
+        "protocol": 3,
         "build": __version__,
         "runtime": {"python": platform.python_version(), "onnxruntime": None},
     }

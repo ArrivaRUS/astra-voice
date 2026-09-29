@@ -258,6 +258,7 @@ class WorkerState:
         self._stopped_ttl_s = stopped_ttl_s
         self._clock = clock
         self._stopped: dict[str, float] = {}
+        self._device_changed: set[str] = set()
         self._cancelled: set[str] = set()
         self._cancelled_order: deque[str] = deque(maxlen=CANCELLED_HISTORY_LIMIT)
         self.min_ram_mb = 0
@@ -342,6 +343,7 @@ class WorkerState:
                 self._stopped.pop(uid)
                 logger.info("Остановленный буфер вытеснен новой записью: %s.", uid)
             self._forget_cancelled(uid)
+            self._device_changed.discard(uid)
             self.buffers[uid] = array("f")
             self._recording = uid
             self._update_state()
@@ -378,6 +380,36 @@ class WorkerState:
             self.feed_audio(utterance_id, samples)
             return not self._closed and self._recording == utterance_id
 
+    def on_device_change(self, utterance_id: str, kind: str, label: str | None = None) -> None:
+        """Останавливает запись при смене устройства и сохраняет PCM для распознавания."""
+        with self._lock:
+            if self._closed or utterance_id in self._device_changed:
+                return
+            self._expire_stopped()
+            if self._recording == utterance_id:
+                buffer = self.buffers[utterance_id]
+                del buffer[max(0, len(buffer) - SAMPLE_RATE // 10) :]
+                self._stop_recording()
+            elif utterance_id not in self._stopped:
+                return
+            audio_ms = len(self.buffers[utterance_id]) * 1000 // SAMPLE_RATE
+            event: Message = {
+                "type": "audio.device.changed",
+                "utterance_id": utterance_id,
+                "kind": kind,
+                "audio_ms": audio_ms,
+            }
+            if kind == "switched" and label is not None:
+                event["label"] = label
+            self._device_changed.add(utterance_id)
+            logger.info(
+                "Смена устройства записи: kind=%s, audio_ms=%s, подпись=%s.",
+                kind,
+                audio_ms,
+                event.get("label"),
+            )
+            self._emit(event)
+
     def on_error(self, utterance_id: str, code: str, message: str) -> None:
         """Удаляет неудавшуюся запись и передаёт ошибку захвата событием."""
         with self._lock:
@@ -389,10 +421,18 @@ class WorkerState:
             self._update_state()
             self._emit({**error(code, message), "utterance_id": utterance_id})
 
-    def _stop_capture(self, deferred: list[Callable[[], None]] | None = None) -> None:
-        """Под блокировкой только просит остановку; callback-и не ждут свой поток."""
+    def _stop_capture(
+        self, deferred: list[Callable[[], None]] | None = None, *, cancel: bool = False
+    ) -> None:
+        """Под блокировкой только просит остановку; callback-и не ждут свой поток.
+
+        ``cancel`` — записанное больше не нужно: захват не тратит время на смену устройства.
+        """
         if self._capture is not None:
-            self._capture.request_stop()
+            if cancel:
+                self._capture.request_stop(cancel=True)
+            else:
+                self._capture.request_stop()
             if deferred is not None:
                 deferred.append(self._capture.stop)
 
@@ -414,6 +454,7 @@ class WorkerState:
             if now - stopped_at >= self._stopped_ttl_s:
                 self._stopped.pop(uid)
                 self.buffers.pop(uid, None)
+                self._device_changed.discard(uid)
                 logger.info("Истёк срок хранения остановленного буфера: %s.", uid)
 
     @staticmethod
@@ -633,6 +674,7 @@ class WorkerState:
                 msg = {"type": "cancelled", "utterance_id": job.utterance_id}
             if msg["type"] in {"result", "cancelled"}:
                 self.buffers.pop(job.utterance_id, None)
+                self._device_changed.discard(job.utterance_id)
                 if msg["type"] == "cancelled":
                     self._remember_cancelled(job.utterance_id)
             elif job.utterance_id in self.buffers:
@@ -686,10 +728,11 @@ class WorkerState:
                 if job is self._pending:
                     self._pending = None
         if self._recording == uid:
-            self._stop_capture(deferred)
+            self._stop_capture(deferred, cancel=True)
             self._recording = None
         self.buffers.pop(uid, None)
         self._stopped.pop(uid, None)
+        self._device_changed.discard(uid)
         self._remember_cancelled(uid)
         self._update_state()
         return [{"type": "cancelled", "utterance_id": uid}]
@@ -703,7 +746,7 @@ class WorkerState:
                 logger.warning("Ошибка выгрузки движка.")
 
     def _unload(self, deferred: list[Callable[[], None]] | None = None) -> None:
-        self._stop_capture(deferred)
+        self._stop_capture(deferred, cancel=True)
         running = self._active is not None
         for job in (self._active, self._pending):
             if job is not None:
@@ -712,6 +755,7 @@ class WorkerState:
         self._recording = None
         self.buffers.clear()
         self._stopped.clear()
+        self._device_changed.clear()
         self._cancelled.clear()
         self._cancelled_order.clear()
         self._update_state()
