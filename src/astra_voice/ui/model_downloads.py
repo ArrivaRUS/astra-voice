@@ -1483,7 +1483,8 @@ class ModelDownloads(QObject):
                 "state": (state := self._card_state(entry, installed)),
                 "message": self._card_message(entry, state),
                 "canCancel": state in {"downloading", "paused-no-space"},
-                "canRetry": state in {"failed", "paused-no-space"},
+                # Отозванную версию не перекачиваем: «Повторить» у неё не показывается.
+                "canRetry": state in {"failed", "paused-no-space"} and not self._is_revoked(entry),
                 "canDequeue": state == "queued",
                 **self._card_extras(entry, installed, total),
                 "progress": self._card_progress.get(entry.id, 0.0),
@@ -1766,6 +1767,7 @@ class ModelDownloads(QObject):
             entry is not None
             and not entry.removed_from_catalog
             and self._card_states.get(model_id) in {"failed", "paused-no-space"}
+            and not self._is_revoked(entry, entry.revision)
         ):
             if self._card_states.get(model_id) == "paused-no-space":
                 if self._model is None or not self._model.disk_ok(
@@ -1782,6 +1784,20 @@ class ModelDownloads(QObject):
                 self._append_queue((entry,))
             else:
                 self._begin_queue((entry,))
+
+    def retryFailed(self) -> None:  # noqa: N802
+        """«Повторить» полосы загрузки: ``retryModel`` для каждой записи с ошибкой.
+
+        После неудачи запись выходит из выбора, поэтому ``startSelectedDownloads``
+        её не видит. Порядок — каталога, не порядка ошибок: первая запись начинает
+        очередь, остальные встают за ней; во время загрузки — в конец очереди.
+        Отозванные и снятые с каталога записи ``retryModel`` пропускает сам.
+        """
+        failed = [
+            entry.id for entry in self._entries if self._card_states.get(entry.id) == "failed"
+        ]
+        for model_id in failed:
+            self.retryModel(model_id)
 
     def _idle(self) -> bool:
         """Во время паузы без потока установленными моделями можно управлять."""
