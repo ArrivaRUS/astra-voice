@@ -80,6 +80,7 @@ if (lib / "vendor").is_dir():
 from astra_voice.core import paths
 from astra_voice.core.model_source import smoke_wav_path
 from astra_voice.platform.session import SessionKind
+from astra_voice.ui.about_bridge import doc_paths
 from astra_voice.ui.tray_icons import TrayIconProvider, TrayState, find_tray_icon_path
 
 checked = 0
@@ -101,6 +102,7 @@ for path in (
     paths.data_dir_static() / "catalog.json.sig",
     paths.data_dir_static() / "catalog.schema.json",
     smoke_wav_path(),
+    *doc_paths().values(),
 ):
     checked += 1
     if not path.is_file():
@@ -111,6 +113,13 @@ for error in failures:
     print(error, file=sys.stderr)
 sys.exit(1 if failures else 0)
 ' "$LIB" || die "смоук ресурсов установленного дерева завершился с ошибкой: $ASTRA_VOICE_RESOURCES"
+
+say "смоук документов: NOTICE и PRIVACY.md несжатые в обоих местах"
+for f in NOTICE PRIVACY.md; do
+	for dir in "$ROOTDIR/usr/share/astra-voice/docs" "$ROOTDIR/usr/share/doc/astra-voice"; do
+		test -f "$dir/$f" || die "нет несжатого документа $dir/$f"
+	done
+done
 
 say "смоук app --version"
 python3 -I "$LIB/bootstrap.py" app --version ||

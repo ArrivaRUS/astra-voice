@@ -4539,15 +4539,15 @@ def test_settings_hide_debug_section_without_flag(onboarding_app: Any, dark: boo
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_settings_about_shows_version_and_privacy(onboarding_app: Any, dark: bool) -> None:
-    """Раздел «О программе» без appInfo показывает запасную версию и две строки."""
+    """Раздел «О программе» без appInfo и aboutBridge открывается с запасной версией."""
 
     def inspect(window: Any) -> None:
         texts = visible_texts(window.contentItem())
         assert {
             "Astra Voice",
             "0.1.0",
-            "Программа не выходит в сеть без вашего действия",
-            "Исходный код открыт",
+            "Лицензия программы",
+            "Исходный код открыт: github.com/ArrivaRUS/astra-voice",
         } <= texts
 
     _, messages = render_settings(onboarding_app, dark, section="about", inspect=inspect)

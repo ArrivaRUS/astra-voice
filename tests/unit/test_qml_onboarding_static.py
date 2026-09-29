@@ -103,11 +103,13 @@ def test_steps_declare_bar_contract(path: Path) -> None:
     [(path, "onboarding") for path in UI_FILES]
     + [(MAIN, "settingsBridge"), (GENERAL, "settingsBridge"), (MODELS, "settingsBridge")]
     + [(ABOUT, "appInfo"), (MAIN, "showOnboarding"), (MAIN, "updatesBridge")]
-    + [(NETWORK, "settingsBridge"), (NETWORK, "updatesBridge"), (MODELS, "updatesBridge")],
+    + [(NETWORK, "settingsBridge"), (NETWORK, "updatesBridge"), (MODELS, "updatesBridge")]
+    + [(ABOUT, "aboutBridge"), (ABOUT, "settingsBridge"), (ABOUT, "updatesBridge")],
     ids=[f"{path.name}-onboarding" for path in UI_FILES]
     + ["Main-settingsBridge", "General-settingsBridge", "Models-settingsBridge"]
     + ["About-appInfo", "Main-showOnboarding", "Main-updatesBridge"]
-    + ["Network-settingsBridge", "Network-updatesBridge", "Models-updatesBridge"],
+    + ["Network-settingsBridge", "Network-updatesBridge", "Models-updatesBridge"]
+    + ["About-aboutBridge", "About-settingsBridge", "About-updatesBridge"],
 )
 def test_context_identifiers_are_guarded(path: Path, identifier: str) -> None:
     guard = f'typeof {identifier} !== "undefined"'

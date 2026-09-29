@@ -486,6 +486,21 @@ def _load_qml(app_info: Any, theme_bridge: Any | None) -> Any | None:
     return engine
 
 
+def _make_about_bridge(runtime: DictationRuntime | None) -> Any | None:
+    """Мост раздела «О программе»; без него раздел показывает только версию."""
+    try:
+        from astra_voice.ui.about_bridge import AboutBridge
+
+        bridge = AboutBridge(stats=runtime.stats if runtime is not None else None)
+        if runtime is not None:
+            # Статистика и мост живут в GUI-потоке: слушатель вызывается там же.
+            runtime.stats.on_append = bridge.on_stats_event
+        return bridge
+    except Exception:  # noqa: BLE001 — сведения о программе не должны мешать окну
+        log.warning("Не удалось подготовить раздел «О программе»", exc_info=True)
+        return None
+
+
 def _set_context_property(shell: Any, name: str, obj: Any) -> None:
     """Добавляет объект в контекст QML; для виджета-заглушки ничего не делает."""
     root_context = getattr(shell, "rootContext", None)
@@ -995,6 +1010,7 @@ def main(argv: list[str] | None = None) -> int:
     downloads = None
     update_checker: UpdateChecker | None = None
     updates_bridge: Any = None  # держим Python-обёртку живой до выхода из main
+    about_bridge: Any = None  # держим Python-обёртку живой до выхода из main
     gui_calls = _GuiCalls()
     model_store: ModelStore | None = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
@@ -1104,6 +1120,10 @@ def main(argv: list[str] | None = None) -> int:
         _set_context_property(shell, "settingsBridge", settings_bridge)
         # Офлайн-режим скрывает «Скачать» и отменяет загрузку из сети (PRD F14.2).
         settings_bridge.offlineChanged.connect(downloads.network_changed)
+        about_bridge = _make_about_bridge(runtime if runtime_ready else None)
+        if about_bridge is not None:
+            QQmlEngine.setObjectOwnership(about_bridge, QQmlEngine.CppOwnership)
+            _set_context_property(shell, "aboutBridge", about_bridge)
         root = _root_window(shell)
         if root is not None:
             capture.attach_window(root)
@@ -1144,6 +1164,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             QQmlEngine.setObjectOwnership(updates_bridge, QQmlEngine.CppOwnership)
             _set_context_property(shell, "updatesBridge", updates_bridge)
+            if about_bridge is not None:
+                # Даты попытки и успеха в «О программе» перечитываются после каждого
+                # снимка проверки — и при повторной неудаче, когда строка-статус не
+                # меняется. Снимок приходит из рабочего потока: в GUI — очередью.
+                forward = checker.on_status
+
+                def post_status_and_dates(status: Any) -> None:
+                    if forward is not None:
+                        forward(status)
+                    gui_calls.post(about_bridge.refresh_updates)
+
+                checker.on_status = post_status_and_dates
             if runtime_ready and runtime is not None:
 
                 def show_network() -> None:
@@ -1169,6 +1201,11 @@ def main(argv: list[str] | None = None) -> int:
             # здесь, в GUI-потоке, а не в рабочем (урок 025).
             update_checker.on_event = None
             update_checker.on_status = None
+        # Цикл aboutBridge → stats → on_append → aboutBridge разрываем здесь же,
+        # в GUI-потоке (урок 025).
+        runtime_stats = getattr(runtime, "stats", None) if runtime is not None else None
+        if runtime_stats is not None:
+            runtime_stats.on_append = None
         # US-8.4: выход из трея и SIGTERM/SIGINT вызывают app.quit() и приходят
         # сюда. После отмены фокуса освобождаем воркер и захваты, затем lock/ipc и UI.
         if onboarding is not None:

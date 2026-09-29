@@ -426,6 +426,9 @@ def test_network_section_snapshot(app: Any, case: str, dark: bool) -> None:
         sip.delete(settings)
     assert not messages, "\n".join(messages)
     assert {"Сетевые проверки", "Проверять обновления утилиты", "Офлайн-режим"} <= texts
+    # Подзаголовок раздела: в 0.2 сеть нужна ровно для двух действий.
+    assert "Сеть нужна только для скачивания модели и проверки новой версии" in texts
+    assert "Четыре сетевых действия — и ни одного больше" not in texts
     # Скрыто до своих вех: тумблер моделей (v1.0), «Обновить из файла…» и ключи (M8).
     assert "Проверять обновления моделей" not in texts
     assert "Обновить из файла…" not in texts

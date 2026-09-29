@@ -211,6 +211,31 @@ def test_update_checker_started_and_stopped_before_runtime(
     assert checker.on_event is None and checker.on_status is None
 
 
+def test_about_bridge_stats_listener_released_on_exit(rig: Rig) -> None:
+    """«О программе» слушает статистику, а при выходе слушатель снят (урок 025)."""
+    seen: dict[str, object] = {}
+
+    class Stats:
+        on_append: object = None
+
+        def summary(self) -> dict[str, object]:
+            return {"dictations": 0, "p50_ms": None, "p95_ms": None}
+
+        def clear(self) -> None:
+            pass
+
+    stats = Stats()
+    rig.runtime.stats = stats
+    rig.app.exec_.side_effect = lambda: seen.setdefault("listener", stats.on_append) and 7
+    assert app_mod.main([]) == 7
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    about = properties["aboutBridge"]
+    assert seen["listener"] == about.on_stats_event, "пока окно работает, слушатель подключён"
+    assert stats.on_append is None
+
+
 def test_updates_bridge_bound_before_start_and_refreshed_by_settings(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
