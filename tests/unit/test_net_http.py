@@ -26,7 +26,13 @@ from urllib.parse import urlsplit
 import requests
 from requests.packages.urllib3.connection import HTTPSConnection
 from requests.packages.urllib3.response import HTTPResponse
-from urllib3.exceptions import ReadTimeoutError
+from urllib3.exceptions import (
+    DecodeError,
+    IncompleteRead,
+    InvalidChunkLength,
+    ProtocolError,
+    ReadTimeoutError,
+)
 
 from astra_voice.core.policy import Policy, PolicyStatus
 from astra_voice.core.settings import Settings
@@ -1703,6 +1709,38 @@ def test_minimum_speed_budget_recovers_and_excludes_consumer_pauses(
         (requests.exceptions.SSLError("секрет"), "host-unreachable"),
         (requests.exceptions.ReadTimeout("секрет"), "timeout"),
         (ReadTimeoutError(None, "/file", "секрет"), "timeout"),
+        # Обрыв посреди тела — short-read в обеих версиях urllib3 (докачка по .part).
+        # 2.x: укороченное тело с Content-Length (enforce_content_length).
+        (
+            ProtocolError(
+                "Connection broken: IncompleteRead(4 bytes read, 12 more expected)",
+                IncompleteRead(4, 12),
+            ),
+            "short-read",
+        ),
+        # 1.26 и 2.x: chunked-ответ без завершающего блока.
+        (
+            ProtocolError(
+                "Connection broken: InvalidChunkLength(got length b'', 0 bytes read)",
+                InvalidChunkLength(SimpleNamespace(tell=lambda: 4, length_remaining=None), b""),
+            ),
+            "short-read",
+        ),
+        # 1.26 и 2.x: сброс соединения посреди тела.
+        (
+            ProtocolError(
+                "Connection broken: ConnectionResetError(104, 'секрет')",
+                ConnectionResetError(104, "секрет"),
+            ),
+            "short-read",
+        ),
+        (requests.exceptions.ChunkedEncodingError("секрет"), "short-read"),
+        (
+            requests.exceptions.ConnectionError(ProtocolError("секрет", IncompleteRead(4, 12))),
+            "short-read",
+        ),
+        # Порча сжатого тела — не обрыв.
+        (DecodeError("секрет"), "host-unreachable"),
     ),
 )
 def test_stream_errors_close_connection(

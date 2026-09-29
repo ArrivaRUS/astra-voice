@@ -309,12 +309,17 @@ def _send_show() -> int:
     return 0
 
 
-class ShowServer:
-    """``QLocalServer``, принимающий единственную команду ``show [<ts>]``."""
+class ShowServer(QObject):
+    """``QLocalServer``, принимающий единственную команду ``show [<ts>]``.
+
+    Сигналы соединений подключены к слотам самого сервера (живого владельца), а не
+    к лямбдам с замыканием на соединение (урок 021); соединение — ``sender()``.
+    """
 
     def __init__(self, on_show: Any) -> None:
         from PyQt5.QtNetwork import QLocalServer
 
+        super().__init__()
         self._on_show = on_show
         self._connections: list[Any] = []
         path = str(ipc_socket_path())
@@ -325,13 +330,31 @@ class ShowServer:
             log.warning("не удалось открыть сокет %s: %s", path, self._server.errorString())
         self._server.newConnection.connect(self._on_new_connection)
 
+    @pyqtSlot()
     def _on_new_connection(self) -> None:
         connection = self._server.nextPendingConnection()
         if connection is None:
             return
         self._connections.append(connection)
-        connection.readyRead.connect(lambda: self._on_ready_read(connection))
-        connection.disconnected.connect(lambda: self._drop(connection))
+        connection.readyRead.connect(self._connection_ready_read)
+        connection.disconnected.connect(self._connection_disconnected)
+
+    def _sender_connection(self) -> Any | None:
+        connection = self.sender()
+        # Обрабатываем только свои живые соединения: это те же обёртки, что в списке.
+        return connection if connection in self._connections else None
+
+    @pyqtSlot()
+    def _connection_ready_read(self) -> None:
+        connection = self._sender_connection()
+        if connection is not None:
+            self._on_ready_read(connection)
+
+    @pyqtSlot()
+    def _connection_disconnected(self) -> None:
+        connection = self._sender_connection()
+        if connection is not None:
+            self._drop(connection)
 
     def _drop(self, connection: Any) -> None:
         if connection in self._connections:
