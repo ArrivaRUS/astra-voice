@@ -249,7 +249,9 @@ ApplicationWindow {
         speed: window.bridge ? window.bridge.speed : ""
         eta: window.bridge ? window.bridge.eta : ""
         detail: window.bridge ? window.bridge.downloadDetail : ""
-        onRetryRequested: { if (window.bridge) window.bridge.startSelectedDownloads(); }
+        // После неудачи запись выходит из выбора: «Скачать выбранное» её уже не
+        // увидит, поэтому полоса повторяет именно записи с ошибкой (§10.3, состояние 4).
+        onRetryRequested: { if (window.bridge) window.bridge.retryFailedDownloads(); }
         onOpenFolderRequested: { if (window.bridge) window.bridge.openModelsFolder(); }
     }
 

@@ -351,6 +351,24 @@ class SettingsBridge(QObject):
         if self._downloads is not None:
             self._downloads.retryModel(model_id)
 
+    @pyqtSlot()
+    def retryFailedDownloads(self) -> None:  # noqa: N802
+        """«Повторить» полосы загрузки: то же, что «Повторить» у каждой карточки с ошибкой.
+
+        После неудачи запись выходит из выбора, поэтому ``startSelectedDownloads``
+        её уже не видит и кнопка полосы молчала бы. Повторяем записи в порядке
+        каталога: первая начинает очередь, остальные встают за ней.
+        """
+        if self._downloads is None:
+            return
+        failed = [
+            str(row["id"])
+            for row in self._downloads.models
+            if row.get("state") == "failed" and row.get("canRetry") is True
+        ]
+        for model_id in failed:
+            self._downloads.retryModel(model_id)
+
     @pyqtSlot(str)
     def cancelModel(self, model_id: str) -> None:  # noqa: N802
         if self._downloads is not None:

@@ -1406,6 +1406,10 @@ class FakeSettings(QObject):
         self.retried_model_ids.append(model_id)
 
     @pyqtSlot()
+    def retryFailedDownloads(self) -> None:
+        self.calls.append("retryFailedDownloads")
+
+    @pyqtSlot()
     def pickInstallPath(self) -> None:
         self.calls.append("pickInstallPath")
 
