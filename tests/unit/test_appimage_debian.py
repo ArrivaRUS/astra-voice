@@ -352,6 +352,20 @@ def test_host_lib_manifest() -> None:
         lockfile.parse(lock_text(records(), extra="# host-lib: libz.so.1\n"))
 
 
+def test_pending_source_records() -> None:
+    lock = lockfile.parse(lock_text(records(), extra=SBOM_PENDING + "\n"))
+    assert [p.id for p in lock.pending_sources] == ["gcc-libgfortran"]
+    with pytest.raises(lockfile.LockError, match="pending-source gcc-libgfortran повторяется"):
+        lockfile.parse(lock_text(records(), extra=f"{SBOM_PENDING}\n{SBOM_PENDING}\n"))
+    with pytest.raises(lockfile.LockError, match="pending-source: нет полей note"):
+        lockfile.parse(lock_text(records(), extra=SBOM_PENDING.replace(',"note"', ',"x"') + "\n"))
+
+
+def test_real_lock_names_gcc_runtime_as_open_item() -> None:
+    lock = lockfile.load(ROOT / "packaging" / "appimage.lock")
+    assert {p.id for p in lock.pending_sources} == {"gcc-libquadmath", "gcc-libgfortran"}
+
+
 def test_todo_pin_passes_format_but_is_listed(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -778,6 +792,17 @@ def test_release_and_deb822_parsers() -> None:
 
 ELF = b"\x7fELF" + bytes(60)
 SITE = "opt/python3.11/lib/python3.11/site-packages"
+SBOM_PENDING = rec(
+    "pending-source",
+    {
+        "id": "gcc-libgfortran",
+        "component": "libgfortran",
+        "version": "GCC 8.x",
+        "license": "GPL-3.0-or-later WITH GCC-exception-3.1",
+        "match": "libgfortran-*.so*",
+        "note": "исходники не приложены — открытый пункт",
+    },
+)
 SBOM_SOURCES = "\n".join(
     rec("source", {"id": ident, "file": file, "size": 1, "sha256": SHA, "url": url})
     for ident, file, url in (
@@ -864,7 +889,8 @@ def _sbom_tree(tmp_path: Path) -> tuple[Path, Path, Path]:
         "# host-lib: libcrypto.so.3 libssl3\n# host-lib: libz.so.1 zlib1g",
     )
     lock = tmp_path / "appimage.lock"
-    lock.write_text(lock_text(records(**override), head=head, extra=SBOM_SOURCES + "\n"), "utf-8")
+    extra = SBOM_SOURCES + "\n" + SBOM_PENDING + "\n"
+    lock.write_text(lock_text(records(**override), head=head, extra=extra), "utf-8")
     return appdir, cache, lock
 
 
@@ -924,6 +950,9 @@ def test_sbom_debian12(tmp_path: Path) -> None:
     assert qt["externalReferences"][0]["url"].endswith("qtbase/archive/c1.tar.gz")
     numpy_libs = comps["pkg:pypi/numpy@1.24.2"]["components"]
     assert numpy_libs[0]["licenses"] == [{"expression": "GPL-3.0-or-later WITH GCC-exception-3.1"}]
+    gfortran_props = {p["name"]: p["value"] for p in numpy_libs[0]["properties"]}
+    assert gfortran_props["astra-voice:sources"] == "not-attached"
+    assert gfortran_props["astra-voice:open-item"] == "исходники не приложены — открытый пункт"
     origins = {
         c["name"]: next(p["value"] for p in c["properties"] if p["name"] == "astra-voice:from")
         for c in bom["components"]
@@ -933,6 +962,15 @@ def test_sbom_debian12(tmp_path: Path) -> None:
     assert origins[f"/{SITE}/PyQt5/Qt5/lib/libicuuc.so.56"] == "pkg:generic/icu@56"
     assert origins[f"/{SITE}/numpy.libs/libgfortran-040039e1.so.5.0.0"] == "pkg:pypi/numpy@1.24.2"
     assert len(origins) == 7
+
+
+@pytest.mark.skipif(shutil.which("dpkg-deb") is None, reason="нужен dpkg-deb")
+def test_sbom_refuses_stale_pending_source(tmp_path: Path) -> None:
+    appdir, cache, lock = _sbom_tree(tmp_path)
+    (appdir / SITE / "numpy.libs" / "libgfortran-040039e1.so.5.0.0").unlink()
+    proc = _sbom(appdir, cache, lock, tmp_path / "sbom.json")
+    assert proc.returncode == 1
+    assert "pending-source без файла в образе: gcc-libgfortran" in proc.stderr
 
 
 @pytest.mark.skipif(shutil.which("dpkg-deb") is None, reason="нужен dpkg-deb")

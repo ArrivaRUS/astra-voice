@@ -22,10 +22,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import re
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 DOC = Path("usr/share/doc/astra-voice")
 SITE = Path("opt/python3.11/lib/python3.11/site-packages")
@@ -59,6 +61,23 @@ def _resolve_in(base: Path, rel: Path) -> Path:
     if not target.is_relative_to(base):
         raise LicenseError(f"{rel}: ссылка выходит из {base}")
     return target
+
+
+def pending_sources(root: Path) -> list[Any]:
+    """Записи `# pending-source:` lock (тот же разбор, что у сборщика)."""
+    lock_path = root / "packaging" / "appimage.lock"
+    if not lock_path.is_file():
+        return []
+    name = "collect_licenses_lockfile"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            name, root / "packaging" / "appimage" / "lockfile.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return list(sys.modules[name].load(lock_path).pending_sources)
 
 
 def dist_name(dist_info: Path) -> str:
@@ -130,6 +149,13 @@ def collect(
 
     lines = ["# Компонент → файл лицензии (относительно usr/share/doc/astra-voice/)"]
     lines += [f"{component}\t{path}" for component, path in index]
+    pending = pending_sources(root)
+    if pending:
+        lines += [
+            "",
+            "# ИСХОДНИКИ НЕ ПРИЛОЖЕНЫ — открытый пункт (packaging/appimage.lock, pending-source)",
+        ]
+        lines += [f"{p.component}\t{p.version}\t{p.license}\t{p.note}" for p in pending]
     (doc / "licenses" / "INDEX.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return index
 

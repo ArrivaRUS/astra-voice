@@ -26,6 +26,9 @@
     [,"git_delta"]]}` — исходник: `.dsc` из индекса `Sources` (`index`), архив из `.dsc`
     (`dsc`) или самостоятельный файл; архив GitHub по коммиту — ещё и дерево git (байты
     архивов GitHub не стабильны, дерево — стабильно; `git_delta` — export-ignore/subst);
+* `# pending-source: {"id","component","version","license","match","note"}` — компонент
+  образа, исходники которого ещё НЕ приложены (открытый пункт комплаенса): сборку не роняет,
+  но SBOM и INDEX.txt лицензий помечают его явно; `match` — шаблон имени файла в образе;
 * `# host-lib: <SONAME> <пакет Debian/ALSE>` — манифест внешних зависимостей (R3.2): библиотека
   берётся с хоста и в образ не кладётся. Читают check_bundle.py (каждый DT_NEEDED вне AppDir —
   только из манифеста, каждая запись нужна и есть на хосте) и sbom.py (origin=host, not-bundled);
@@ -80,7 +83,7 @@ _TOOL_RE = re.compile(
     r"\s+(?P<url>https://\S+)\s*"
 )
 _DIRECTIVE_RE = re.compile(r"#\s*(?P<key>[a-z-]+):\s*(?P<value>\S+)\s*")
-_RECORD_RE = re.compile(r"#\s*(?P<kind>archive|index|deb|source):\s*(?P<json>\S.*)")
+_RECORD_RE = re.compile(r"#\s*(?P<kind>archive|index|deb|source|pending-source):\s*(?P<json>\S.*)")
 _TODO_RE = re.compile(r"#\s*TODO-HASH:\s*(?P<name>[A-Za-z0-9._-]+)==(?P<version>[^\s]+)(?:\s.*)?")
 _HOST_LIB_RE = re.compile(
     r"#\s*host-lib:\s+(?P<soname>[A-Za-z0-9._+-]+\.so[A-Za-z0-9._+-]*)"
@@ -130,6 +133,7 @@ _FIELDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ("id", "file", "size", "sha256", "url"),
         ("index", "dsc", "git_commit", "git_tree", "git_delta"),
     ),
+    "pending-source": (("id", "component", "version", "license", "match", "note"), ()),
 }
 
 
@@ -220,6 +224,18 @@ class Source:
         return f"{CACHE_DIRS['source']}/{self.file}"
 
 
+@dataclass(frozen=True)
+class PendingSource:
+    """Поставляемый компонент, исходники которого ещё не приложены (открытый пункт)."""
+
+    id: str
+    component: str
+    version: str
+    license: str
+    match: str  # шаблон имени файла в образе (fnmatch)
+    note: str
+
+
 @dataclass
 class Lock:
     tools: list[Tool] = field(default_factory=list)
@@ -232,6 +248,7 @@ class Lock:
     debs: list[Deb] = field(default_factory=list)
     sources: list[Source] = field(default_factory=list)
     host_libs: dict[str, str] = field(default_factory=dict)
+    pending_sources: list[PendingSource] = field(default_factory=list)
 
     @property
     def base(self) -> str:
@@ -351,7 +368,14 @@ def _record(kind: str, raw: str) -> dict[str, Any]:
 
 def _add_record(lock: Lock, kind: str, raw: str) -> None:
     data = _record(kind, raw)
-    if kind == "archive":
+    if kind == "pending-source":
+        pending = PendingSource(**data)
+        if not _ID_RE.fullmatch(pending.id):
+            raise LockError(f"pending-source: неверный id {pending.id}")
+        if any(item.id == pending.id for item in lock.pending_sources):
+            raise LockError(f"pending-source {pending.id} повторяется")
+        lock.pending_sources.append(pending)
+    elif kind == "archive":
         archive = Archive(**data)
         if not _ID_RE.fullmatch(archive.id):
             raise LockError(f"archive: неверный id {archive.id}")
@@ -540,7 +564,7 @@ def _parse_comment(lock: Lock, line: str) -> None:
         raise LockError(f"неверная строка инструмента: {line}")
     elif match := _RECORD_RE.fullmatch(line):
         _add_record(lock, match["kind"], match["json"])
-    elif re.match(r"#\s*(archive|index|deb|source):", line):
+    elif re.match(r"#\s*(archive|index|deb|source|pending-source):", line):
         raise LockError(f"неверная запись: {line}")
     elif match := _HOST_LIB_RE.fullmatch(line):
         if match["soname"] in lock.host_libs:

@@ -82,6 +82,9 @@ def test_collects_all_documents(tree: tuple[Path, Path]) -> None:
     )
     text = (out / "licenses" / "INDEX.txt").read_text("utf-8")
     assert "колесо PyQt5-5.15.11\tlicenses/PyQt5/LICENSE" in text
+    # Открытый пункт из lock (pending-source) виден в документах образа.
+    assert "# ИСХОДНИКИ НЕ ПРИЛОЖЕНЫ" in text
+    assert "libquadmath (GCC runtime, numpy.libs)" in text
 
 
 def test_wheel_without_license_fails(tree: tuple[Path, Path]) -> None:

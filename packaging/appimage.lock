@@ -147,6 +147,16 @@
 # версии пакетов Alpine в скриптах type2-runtime НЕ закреплены (apk add без версий) — точный состав
 # musl/zstd/zlib/mimalloc внутри закреплённого runtime-x86_64 неизвестен.
 #
+# ОТКРЫТЫЙ ПУНКТ к 15.10 (R3.6; заказчик 29.09: «пока не качать»): в колесе numpy (numpy.libs) лежат
+# библиотеки рантайма GCC, исходники которых не приложены. Версии определены по символам (.comment
+# вырезан): libquadmath — только QUADMATH_1.0 и ссылка _Jv_RegisterClasses → системный libquadmath
+# CentOS 7 (GCC 4.8.5, libquadmath-4.8.5-44.el7); libgfortran — только GFORTRAN_8 → GCC 8.x
+# (libgfortran5 8.3.1 CentOS 7). Кандидаты: vault.centos.org (src.rpm, точное соответствие) или
+# ftp.gnu.org gcc-4.8.5 / gcc-8.3.0 (официально, но без патчей Red Hat). .deb это не касается (numpy
+# там системный). Сборку не роняет; SBOM и INDEX.txt лицензий помечают «исходники не приложены».
+# pending-source: {"id":"gcc-libquadmath","component":"libquadmath (GCC runtime, numpy.libs)","version":"GCC 4.8.5 (CentOS 7 libquadmath-4.8.5-44.el7), определено по символам","license":"LGPL-2.1-or-later","match":"libquadmath-*.so*","note":"исходники не приложены — открытый пункт R3.6 к 15.10; кандидаты: vault.centos.org gcc-4.8.5-44.el7.src.rpm или ftp.gnu.org/gnu/gcc/gcc-4.8.5"}
+# pending-source: {"id":"gcc-libgfortran","component":"libgfortran (GCC runtime, numpy.libs)","version":"GCC 8.x (CentOS 7 libgfortran5 8.3.1), определено по символам","license":"GPL-3.0-or-later WITH GCC-exception-3.1","match":"libgfortran-*.so*","note":"исходники не приложены — открытый пункт R3.6 к 15.10; кандидаты: src.rpm libgfortran5 8.3.1 на vault.centos.org или ftp.gnu.org/gnu/gcc/gcc-8.3.0"}
+#
 # Колёса PyPI (кэш: ~/.cache/astra-voice-dev/appimage/wheels).
 # numpy 1.24.2 — та же версия, что python3-numpy на ALSE 1.8 (с ней уже живёт .deb + ORT 1.24.4).
 # requests 2.32.5 — как python3-requests на ALSE; urllib3/idna/charset-normalizer/certifi/six/PyQt5-sip — свежие совместимые.

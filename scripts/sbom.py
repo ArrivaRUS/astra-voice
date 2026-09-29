@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fnmatch
 import hashlib
 import importlib.util
 import io
@@ -427,8 +428,23 @@ def _qt_module(rel: str) -> str | None:
     return None
 
 
+def _pending_props(lock: Any, name: str, used: set[str]) -> list[dict[str, str]]:
+    """Свойства «исходники не приложены» для файла из записей `# pending-source:` lock."""
+    props: list[dict[str, str]] = []
+    for pending in lock.pending_sources:
+        if fnmatch.fnmatchcase(name, pending.match):
+            used.add(pending.id)
+            props += [
+                _prop("sources", "not-attached"),
+                _prop("open-item", pending.note),
+                _prop("component-version", pending.version),
+            ]
+    return props
+
+
 def _wheel_components_r3(appdir: Path, lock: Any, origin: dict[str, str]) -> list[dict[str, Any]]:
     records = _wheel_records(appdir)
+    pending_used: set[str] = set()
     site = appdir / SITE
     out: list[dict[str, Any]] = []
     for req in lock.requirements:
@@ -464,7 +480,10 @@ def _wheel_components_r3(appdir: Path, lock: Any, origin: dict[str, str]) -> lis
                         "bom-ref": f"file:/{target}",
                         "name": path.name,
                         "hashes": [{"alg": "SHA-256", "content": _sha256(path)}],
-                        "properties": [_prop("vendored-by", ref)],
+                        "properties": [
+                            _prop("vendored-by", ref),
+                            *_pending_props(lock, path.name, pending_used),
+                        ],
                     }
                     if license_id:
                         comp["licenses"] = [{"expression": license_id}]
@@ -502,6 +521,9 @@ def _wheel_components_r3(appdir: Path, lock: Any, origin: dict[str, str]) -> lis
         if nested:
             comp["components"] = nested
         out.append(comp)
+    stale = sorted(p.id for p in lock.pending_sources if p.id not in pending_used)
+    if stale:
+        raise ValueError(f"pending-source без файла в образе: {', '.join(stale)}")
     return out
 
 
