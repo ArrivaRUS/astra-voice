@@ -359,12 +359,17 @@ def test_allow_missing_forgives_only_todo_modules() -> None:
     """P2-2(г): при ALLOW прощаются только нарушения про модули незакреплённых колёс."""
     problems = [
         "jsonschema: не импортируется: ModuleNotFoundError: No module named 'jsonschema'",
-        "jsonschema: Модуль jsonschema недоступен.",
-        "attr: не импортируется: ModuleNotFoundError",
+        "jsonschema: SchemaUnavailable: Модуль jsonschema недоступен.",
+        "attr: не импортируется: ModuleNotFoundError: No module named 'attr'",
         "numpy: загружен не из бандла: /usr/lib/python3/dist-packages/numpy/__init__.py",
+        "jsonschema: загружен не из бандла: /usr/lib/python3/dist-packages/jsonschema/__init__.py",
+        "jsonschema: не импортируется: ImportError: libfoo.so",
+        "jsonschema: SchemaUnavailable: Несовместимая версия jsonschema.",
         "журнал WARNING: astra_voice.models.catalog: Проверка по схеме пропущена",
     ]
     rest, allowed = check_bundle.split_allowed(problems, ["jsonschema", "attrs", "pyrsistent"])
+    # Прощается только отсутствие модуля; «не из бандла», сбой импорта при наличии модуля
+    # и несовместимая версия валят сборку и в локальном режиме.
     assert allowed == problems[:3]
     assert rest == problems[3:]
     assert check_bundle.split_allowed(problems, []) == (problems, [])
@@ -379,7 +384,9 @@ def test_check_bundle_allow_missing_exit_code(
     monkeypatch.setattr(check_bundle, "EXTRA_MODULES", ("bundled_fixture_mod",))
     monkeypatch.setattr(check_bundle, "check_package_tree", lambda lib: (0, []))
     monkeypatch.setattr(
-        check_bundle, "check_catalog", lambda: ["jsonschema: Модуль jsonschema недоступен."]
+        check_bundle,
+        "check_catalog",
+        lambda: ["jsonschema: SchemaUnavailable: Модуль jsonschema недоступен."],
     )
     monkeypatch.setattr(sys, "path", [p for p in sys.path if str(fake_bundle) in p])
     args = ["--appdir", str(fake_bundle), "--control", str(control)]
@@ -441,3 +448,27 @@ def test_runtime_key_matches_lock(tmp_path: Path) -> None:
     fingerprints = [line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")]
     subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "all"], check=False, timeout=10)
     assert fingerprints[0] == lockfile.load(LOCK).runtime_key
+
+
+strip_record = load("appimage_strip_record", ROOT / "packaging" / "appimage" / "strip_record.py")
+
+
+def test_strip_record_drops_only_bin_wrappers(tmp_path: Path) -> None:
+    text = (
+        "../../bin/idna,sha256=abc,231\n"
+        "idna/__init__.py,sha256=def,849\n"
+        "idna-3.20.dist-info/RECORD,,\n"
+    )
+    assert strip_record.strip_record(text) == (
+        "idna/__init__.py,sha256=def,849\nidna-3.20.dist-info/RECORD,,\n"
+    )
+    with pytest.raises(strip_record.RecordError, match="не обёртка bin/: ../../share/man/x.1"):
+        strip_record.strip_record(text + "../../share/man/x.1,sha256=x,1\n")
+    site = tmp_path / "site-packages"
+    record = site / "idna-3.20.dist-info" / "RECORD"
+    record.parent.mkdir(parents=True)
+    record.write_text(text, encoding="utf-8")
+    assert strip_record.main([str(site)]) == 0
+    assert "../../bin/" not in record.read_text(encoding="utf-8")
+    record.write_text("../etc/conf,sha256=x,1\n", encoding="utf-8")
+    assert strip_record.main([str(site)]) == 1

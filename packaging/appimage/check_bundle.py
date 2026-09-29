@@ -200,7 +200,7 @@ def check_catalog() -> list[str]:
     try:
         schema.require_available()
     except schema.SchemaUnavailable as exc:
-        problems.append(f"jsonschema: {exc}")
+        problems.append(f"jsonschema: SchemaUnavailable: {exc}")
         return problems
     if not paths.install_kind().is_appimage:
         problems.append(f"install_kind() = {paths.install_kind().name}, ожидался трек AppImage")
@@ -223,12 +223,21 @@ def check_catalog() -> list[str]:
 PACKAGE_MODULES = {"attrs": "attr"}
 
 
+#: Какие нарушения про модуль незакреплённого колеса прощаются: его отсутствие и
+#: вытекающая из него недоступность проверки схемы. «Загружен не из бандла» и прочее — нет.
+ALLOWED_KINDS = (
+    "не импортируется: ModuleNotFoundError",
+    "SchemaUnavailable: Модуль jsonschema недоступен.",
+)
+
+
 def split_allowed(problems: list[str], packages: Iterable[str]) -> tuple[list[str], list[str]]:
-    """Отделить нарушения про модули незакреплённых колёс (`модуль: …`) от остальных."""
+    """Отделить отсутствие модулей незакреплённых колёс от остальных нарушений."""
     modules = {
         PACKAGE_MODULES.get(name.lower(), name.lower().replace("-", "_")) for name in packages
     }
-    allowed = [p for p in problems if p.split(":", 1)[0] in modules]
+    prefixes = tuple(f"{module}: {kind}" for module in modules for kind in ALLOWED_KINDS)
+    allowed = [p for p in problems if p.startswith(prefixes)]
     return [p for p in problems if p not in allowed], allowed
 
 

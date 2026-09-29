@@ -211,9 +211,9 @@ rm -rf "$SITE/pip" "$SITE"/pip-*.dist-info "$SITE/bin" \
     "$APPDIR/opt/python3.11/include" "$APPDIR/usr/share/tcltk" "$APPDIR/usr/bin"
 # Обёртки консольных скриптов (bin/) не входят в образ, а их строки в RECORD несут хэш
 # файла с абсолютным путём интерпретатора в shebang — путь рабочего каталога попадал
-# бы в образ и BUILD_ID (две сборки в разных каталогах давали разные образы). Убираем
-# строки файлов вне site-packages: RECORD описывает ровно то, что лежит в образе.
-sed -i '/^\.\.\//d' "$SITE"/*.dist-info/RECORD
+# бы в образ и BUILD_ID. Убираем только строки ../../bin/; иной файл вне site-packages —
+# ошибка сборки.
+python3 "$HERE/strip_record.py" "$SITE"
 
 # Состав site-packages = колёса lock, ни больше ни меньше (иначе SBOM врёт).
 # shellcheck disable=SC2046
