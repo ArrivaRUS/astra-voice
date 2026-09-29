@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("requests")
+
+# Импорт зависимости должен предшествовать импорту проверяемого модуля.
+# ruff: noqa: E402
 import logging
 import os
 import socket
@@ -12,7 +18,6 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
 
-import pytest
 import requests
 
 from astra_voice.core.policy import Policy, PolicyStatus
@@ -459,6 +464,8 @@ def test_dns_budget(
         return cast(Callable[..., object], original)(*args, **kwargs)
 
     monkeypatch.setattr(socket, "getaddrinfo", slow_dns)
+    # Тест про бюджет DNS, а не про скорость диска: fsync кэша вне замера.
+    monkeypatch.setattr(os, "fsync", lambda descriptor: None)
     started = time.monotonic()
     try:
         result = client.get_check(
@@ -468,9 +475,41 @@ def test_dns_budget(
             cancel=threading.Event(),
         )
         assert result.state == "unavailable"
-        assert time.monotonic() - started <= 3.1
+        assert time.monotonic() - started <= http.CHECK_TOTAL_TIMEOUT_S + 0.3
     finally:
         release.set()
+
+
+@pytest.mark.parametrize("timeout", ["none", "urllib3-default"])
+def test_bounded_connection_without_connect_timeout(server: FaultServer, timeout: str) -> None:
+    """Без таймаута соединения ограничивает общий дедлайн, а не TypeError."""
+    from urllib3.connection import HTTPConnection
+
+    port = urlsplit(server.url).port
+    assert port is not None
+    connection = HTTPConnection("127.0.0.1", port)
+    if timeout == "none":
+        connection.timeout = None
+    sock = http._bounded_connection(connection, time.monotonic() + 2.0)
+    try:
+        assert sock.getpeername()[1] == port
+    finally:
+        sock.close()
+
+
+def test_urllib3_internals_for_bounded_connection() -> None:
+    """Сторож: обновление urllib3 в бандле не должно молча снять ограничение DNS."""
+    import inspect
+
+    from urllib3.connection import HTTPConnection, HTTPSConnection
+    from urllib3.util import connection as util_connection
+
+    assert callable(util_connection._set_socket_options)
+    assert callable(util_connection.allowed_gai_family)
+    assert HTTPConnection("example.test", 80)._dns_host == "example.test"
+    assert HTTPSConnection("example.test", 443)._dns_host == "example.test"
+    for cls in (HTTPConnection, HTTPSConnection):
+        assert "self._new_conn()" in inspect.getsource(cls.connect), cls.__name__
 
 
 def test_last_retry_status_in_log(

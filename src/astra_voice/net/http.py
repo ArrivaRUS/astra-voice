@@ -339,7 +339,11 @@ def _bounded_connection(connection: HTTPConnection, deadline_at: float) -> socke
     addresses = cast(
         list[tuple[int, int, int, str, tuple[str, int] | tuple[str, int, int, int]]], answer
     )
-    connect_deadline = min(deadline_at, time.monotonic() + float(connection.timeout))
+    # timeout бывает None или сигнальным объектом urllib3 — тогда хватает общего дедлайна.
+    connect_timeout = connection.timeout
+    connect_deadline = deadline_at
+    if isinstance(connect_timeout, (int, float)) and not isinstance(connect_timeout, bool):
+        connect_deadline = min(deadline_at, time.monotonic() + float(connect_timeout))
     last_error: OSError | None = None
     for family, socktype, proto, _, address in addresses:
         remaining = connect_deadline - time.monotonic()

@@ -2,6 +2,10 @@
 
 import pytest
 
+pytest.importorskip("requests")
+
+# Импорт зависимости должен предшествовать импорту проверяемого модуля.
+# ruff: noqa: E402
 from astra_voice.net.http import backoff_seconds, parse_rate_limit, parse_retry_after
 
 pytestmark = pytest.mark.unit
