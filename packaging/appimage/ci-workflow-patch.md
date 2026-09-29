@@ -25,7 +25,7 @@
   с теми же длинными SHA, что уже стоят в файле. Новых действий из интернета нет.
 - **Везде `persist-credentials: false`** — после скачивания кода токен GitHub не остаётся на
   диске сборочной машины (находка ИБ T3 P2-2).
-- **Новый job `appimage`** только вызывает три скрипта из репозитория: `build.sh --fetch`
+- **Новый job `appimage`** ставит `git` (как уже делает job `release`) и дальше только вызывает три скрипта из репозитория: `build.sh --fetch`
   (скачать закреплённые по хэшу входы), `build.sh` (собрать и проверить), `smoke.sh`
   (проверить готовый файл). Если в репозитории нет файла `packaging/appimage/ENABLED`,
   скрипты ничего не делают и job зелёный.
@@ -33,6 +33,8 @@
   **поставить именно этот пакет** и проверить — находка ИБ T3 P2-6; собрать AppImage при
   `ENABLED`) и `scripts/release_assets.sh` (список файлов, суммы, `latest.json` — без ключа
   подписи). Публикует ровно список из `dist/assets.txt`.
+- **Послаблений сборки нет:** слова `ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH` в файле быть не
+  должно (это режим только для локальной проверки; `ci_lint.py` краснеет, если оно появится).
 - **Не запускать CI на правках документов:** добавлены `arch/**` и `spikes/**` — это
   архитектурные заметки и черновики, в пакеты они не попадают.
 
@@ -43,7 +45,7 @@
 
 | §9.4 | Что | В правке |
 |---|---|---|
-| п.1 | job `appimage`: `debian:12`, 30 мин, без `needs`, checkout без токена, apt, кэш по `hashFiles('packaging/appimage.lock')`, `build.sh --fetch` → `build.sh` → `smoke.sh`, выгрузка образа и SBOM | job `appimage`; к списку apt добавлены `curl ca-certificates gpgv util-linux python3-pip` (скачивание, проверка подписи runtime, запуск не от root, `pip download`) и хостовые библиотеки Qt по замеру спайка; выгрузка — только при `ENABLED` (`if: hashFiles(...)`), иначе `if-no-files-found: error` ронял бы выключенный job |
+| п.1 | job `appimage`: `debian:12`, 30 мин, без `needs`, git до checkout (сборка берёт только файлы под Git), checkout без токена, apt, кэш по `hashFiles('packaging/appimage.lock')`, `build.sh --fetch` → `build.sh` → `smoke.sh`, выгрузка образа и SBOM | job `appimage`; к списку apt добавлены `curl ca-certificates gpgv util-linux python3-pip` (скачивание, проверка подписи runtime, запуск не от root, `pip download`) и хостовые библиотеки Qt по замеру спайка; выгрузка — только при `ENABLED` (`if: hashFiles(...)`), иначе `if-no-files-found: error` ронял бы выключенный job |
 | п.2 | job `release`: `needs` + `appimage`, 35 мин, checkout без токена, apt из п.1, `scripts/release_build.sh`, `scripts/release_assets.sh dist` без `env`, подпись отдельно, `gh release create … $(cat dist/assets.txt)` | job `release` |
 | п.3 | `paths-ignore`: `arch/**`, `spikes/**` | `on.push.paths-ignore`; белый список `scripts/ci_lint.py` расширен в этой же ветке |
 | п.4 | больше ничего: `permissions`, пины SHA, `environment: release`, запрет `pull_request_target` | без изменений; `ci_lint.py` зелёный на `ci.yml.proposed` (тест `test_proposed_workflow_passes`) |
@@ -71,7 +73,11 @@
 - Ключ подписи runtime AppImage `packaging/appimage/keys/appimage-runtime.gpg` (отпечаток
   `570C77ACEA40C0F1B758902CBF96CCA56490F695`, строка `# runtime-key:` в lock) — без него
   `build.sh --fetch` останавливается.
-- Первый прогон нового job на ветке — зелёный (агенты проверяют до отправки вам).
+- Ветка проверена локально: `scripts/ci_lint.py` на `ci.yml.proposed`, юнит-тесты, локальная
+  сборка образа. **Первый прогон нового job в GitHub Actions будет у вас, сразу после правки:**
+  у токена команды нет права Workflows, запустить новый job до вашей правки мы не можем. Если
+  job `appimage` покраснеет — пришлите ссылку на прогон, чинится правкой `packaging/appimage/*`
+  без повторной правки workflow.
 
 ## Разница с текущим `ci.yml`
 
@@ -142,7 +148,7 @@
        - name: Инструменты сборки
          run: |
            apt-get update
-@@ -273,12 +288,54 @@
+@@ -273,12 +288,60 @@
              dist/sbom.cdx.json
            if-no-files-found: error
  
@@ -155,6 +161,12 @@
 +    timeout-minutes: 30
 +    container: debian:12
 +    steps:
++      # build.sh берёт в образ только файлы под Git: без git в контейнере checkout
++      # скачал бы архив без .git.
++      - name: Git для checkout с историей файлов
++        run: |
++          apt-get update
++          apt-get install -y --no-install-recommends git ca-certificates
 +      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
 +        with:
 +          persist-credentials: false
@@ -199,7 +211,7 @@
      container: debian:12
      # Секрет подписи живёт только здесь: Environment с required reviewer.
      environment: release
-@@ -292,6 +349,7 @@
+@@ -292,6 +355,7 @@
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
          with:
            fetch-depth: 0
@@ -207,7 +219,7 @@
        - name: Версия тега и changelog
          run: |
            version="${GITHUB_REF_NAME#v}"
-@@ -306,9 +364,14 @@
+@@ -306,9 +370,14 @@
            # Для гейта смоука установленного дерева: модули UI импортируют PyQt5 на уровне модуля.
            apt-get install -y --no-install-recommends \
              build-essential debhelper dh-python devscripts dpkg-dev fakeroot \
@@ -224,7 +236,7 @@
        - name: Тег стоит на коммите из main
          run: |
            test -d .git || { echo "::error::Checkout без истории Git"; exit 1; }
-@@ -316,21 +379,18 @@
+@@ -316,21 +385,18 @@
            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::Тег не на коммите из main"; exit 1; }
        - name: Связка ключей в белом списке
          run: python3 scripts/check_keyring.py data/keys/release.gpg
@@ -253,7 +265,7 @@
            export GNUPGHOME="$(mktemp -d)"
            chmod 700 "$GNUPGHOME"
            printf '%s' "$GPG_SIGNING_KEY" | gpg --batch --quiet --import
-@@ -348,6 +408,6 @@
+@@ -348,6 +414,6 @@
            echo "deb [signed-by=/usr/share/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" \
              > /etc/apt/sources.list.d/github-cli.list
            apt-get update && apt-get install -y --no-install-recommends gh

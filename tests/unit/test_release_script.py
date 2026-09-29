@@ -421,13 +421,32 @@ def test_push_failure(repo: tuple[Path, dict[str, str]]) -> None:
     )
 
 
-def commit_appimage(repo: tuple[Path, dict[str, str]], *, lock: bool) -> None:
+SHA = "a" * 64
+APPIMAGE_LOCK = f"""# expect-elf: 157
+# max-glibc: 2.28
+# runtime-key: 570C77ACEA40C0F1B758902CBF96CCA56490F695
+# tool: runtime-x86_64 {SHA} 1 https://example.invalid/runtime-x86_64
+# tool: runtime-x86_64.sig {SHA} 2 https://example.invalid/runtime-x86_64.sig
+# tool: appimagetool-x86_64.AppImage {SHA} 3 https://example.invalid/appimagetool
+# tool: python3.11.16-cp311-cp311-manylinux_2_28_x86_64.AppImage {SHA} 4 https://example.invalid/py
+numpy==1.24.2 \\
+    --hash=sha256:{SHA}
+"""
+
+
+def commit_appimage(
+    repo: tuple[Path, dict[str, str]], *, lock: str | None = APPIMAGE_LOCK, key: bool = True
+) -> None:
     work, env = repo
-    flag = work / "packaging/appimage/ENABLED"
-    flag.parent.mkdir(parents=True)
-    flag.write_text("# флаг\n", encoding="utf-8")
-    if lock:
-        (work / "packaging/appimage.lock").write_text("# lock\n", encoding="utf-8")
+    appimage = work / "packaging/appimage"
+    appimage.mkdir(parents=True)
+    (appimage / "ENABLED").write_text("# флаг\n", encoding="utf-8")
+    shutil.copy2(ROOT / "packaging/appimage/lockfile.py", appimage / "lockfile.py")
+    if lock is not None:
+        (work / "packaging/appimage.lock").write_text(lock, encoding="utf-8")
+    if key:
+        (appimage / "keys").mkdir()
+        (appimage / "keys/appimage-runtime.gpg").write_bytes(b"key")
     git(work, env, "add", ".")
     git(work, env, "commit", "-m", "appimage")
     git(work, env, "push", "origin", "main")
@@ -435,17 +454,43 @@ def commit_appimage(repo: tuple[Path, dict[str, str]], *, lock: bool) -> None:
 
 
 def test_dry_run_with_appimage(repo: tuple[Path, dict[str, str]]) -> None:
-    """arch/appimage.md §9.3: при ENABLED в списке — образ и его SBOM, lock в Git."""
-    commit_appimage(repo, lock=True)
+    """arch/appimage.md §9.3: при ENABLED в списке — образ и его SBOM, lock и ключ в Git."""
+    commit_appimage(repo)
     result = run(repo, "v0.1.0", "--skip-ci-check")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Astra_Voice-0.1.0-x86_64.AppImage (packaging/appimage/ENABLED)" in result.stdout
     assert "sbom-appimage.cdx.json" in result.stdout
     assert "OK: packaging/appimage.lock существует и отслеживается Git" in result.stdout
+    assert "OK: packaging/appimage.lock: все колёса закреплены по хэшу" in result.stdout
 
 
-def test_appimage_enabled_without_lock_fails(repo: tuple[Path, dict[str, str]]) -> None:
-    commit_appimage(repo, lock=False)
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        ("no-lock", "ОШИБКА: packaging/appimage.lock отсутствует или не отслеживается Git"),
+        (
+            "todo",
+            "ОШИБКА: packaging/appimage.lock: колёса без хэша (TODO-HASH): jsonschema==4.10.3",
+        ),
+        ("bad-lock", "ОШИБКА: packaging/appimage.lock не прошёл проверку формата"),
+        (
+            "no-key",
+            "ОШИБКА: packaging/appimage/keys/appimage-runtime.gpg отсутствует "
+            "или не отслеживается Git",
+        ),
+    ],
+)
+def test_appimage_release_preconditions(
+    repo: tuple[Path, dict[str, str]], change: str, error: str
+) -> None:
+    lock: str | None = APPIMAGE_LOCK
+    if change == "no-lock":
+        lock = None
+    elif change == "todo":
+        lock = APPIMAGE_LOCK + "# TODO-HASH: jsonschema==4.10.3 py3-none-any\n"
+    elif change == "bad-lock":
+        lock = "# lock\n"
+    commit_appimage(repo, lock=lock, key=change != "no-key")
     result = run(repo, "v0.1.0", "--skip-ci-check")
     assert result.returncode == 1
-    assert "ОШИБКА: packaging/appimage.lock отсутствует или не отслеживается Git" in result.stdout
+    assert error in result.stdout

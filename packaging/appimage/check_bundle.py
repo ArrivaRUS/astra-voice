@@ -19,6 +19,10 @@
 5. за всё время проверки — ни одной записи журнала уровня WARNING и выше;
 6. печатает версию OpenSSL (для SBOM, принятый риск П16).
 
+`--allow-missing <пакет>` (только `build.sh` при локальной сборке с
+`ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH=1`): нарушения про модуль незакреплённого колеса
+(строка `# TODO-HASH` в lock) печатаются как «пропущено», любые другие валят гейт.
+
 Код возврата 0 — всё прошло, 1 — нарушение, 2 — неверный вызов.
 """
 
@@ -215,7 +219,20 @@ def check_catalog() -> list[str]:
     return problems
 
 
-def run(appdir: Path, control: Path) -> int:
+#: Пакет PyPI → модуль, если имена различаются.
+PACKAGE_MODULES = {"attrs": "attr"}
+
+
+def split_allowed(problems: list[str], packages: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Отделить нарушения про модули незакреплённых колёс (`модуль: …`) от остальных."""
+    modules = {
+        PACKAGE_MODULES.get(name.lower(), name.lower().replace("-", "_")) for name in packages
+    }
+    allowed = [p for p in problems if p.split(":", 1)[0] in modules]
+    return [p for p in problems if p not in allowed], allowed
+
+
+def run(appdir: Path, control: Path, allow_missing: Iterable[str] = ()) -> int:
     appdir = appdir.resolve()
     lib = appdir / "usr" / "lib" / "astra-voice"
     collector = Collector()
@@ -239,6 +256,9 @@ def run(appdir: Path, control: Path) -> int:
     root_logger.removeHandler(collector)
     for record in collector.records:
         problems.append(f"журнал {record.levelname}: {record.name}: {record.getMessage()}")
+    problems, skipped = split_allowed(problems, allow_missing)
+    for problem in skipped:
+        print(f"ПРОПУЩЕНО (TODO-HASH, образ не для выпуска): {problem}", file=sys.stderr)
     for problem in problems:
         print(f"ОШИБКА: {problem}", file=sys.stderr)
     print(f"check_bundle: {'OK' if not problems else f'{len(problems)} нарушений'}")
@@ -249,11 +269,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="гейт состава бандла AppImage")
     parser.add_argument("--appdir", type=Path, required=True)
     parser.add_argument("--control", type=Path, required=True)
+    parser.add_argument(
+        "--allow-missing",
+        action="append",
+        default=[],
+        metavar="ПАКЕТ",
+        help="только локально: колесо из строки TODO-HASH lock",
+    )
     args = parser.parse_args(argv)
     if not (args.appdir / ".astra-voice-build").is_file():
         print(f"нет маркера сборки в {args.appdir}", file=sys.stderr)
         return 2
-    return run(args.appdir, args.control)
+    return run(args.appdir, args.control, args.allow_missing)
 
 
 if __name__ == "__main__":

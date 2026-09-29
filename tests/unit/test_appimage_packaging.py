@@ -302,8 +302,8 @@ def proposed_jobs() -> dict[str, Any]:
 def test_proposed_workflow_only_calls_repo_scripts() -> None:
     jobs = proposed_jobs()
     runs = [step["run"] for step in jobs["appimage"]["steps"] if "run" in step]
-    assert runs[0].startswith("apt-get update")
-    assert runs[1:] == [
+    assert all(run.startswith("apt-get update") for run in runs[:2])
+    assert runs[2:] == [
         "packaging/appimage/build.sh --fetch",
         "packaging/appimage/build.sh",
         "packaging/appimage/smoke.sh dist/Astra_Voice-*-x86_64.AppImage",
@@ -353,3 +353,64 @@ def test_patch_doc_matches_proposed_file() -> None:
     ]
     assert added
     assert all(line in proposed.splitlines() for line in added)
+
+
+def test_allow_missing_forgives_only_todo_modules() -> None:
+    """P2-2(г): при ALLOW прощаются только нарушения про модули незакреплённых колёс."""
+    problems = [
+        "jsonschema: не импортируется: ModuleNotFoundError: No module named 'jsonschema'",
+        "jsonschema: Модуль jsonschema недоступен.",
+        "attr: не импортируется: ModuleNotFoundError",
+        "numpy: загружен не из бандла: /usr/lib/python3/dist-packages/numpy/__init__.py",
+        "журнал WARNING: astra_voice.models.catalog: Проверка по схеме пропущена",
+    ]
+    rest, allowed = check_bundle.split_allowed(problems, ["jsonschema", "attrs", "pyrsistent"])
+    assert allowed == problems[:3]
+    assert rest == problems[3:]
+    assert check_bundle.split_allowed(problems, []) == (problems, [])
+
+
+def test_check_bundle_allow_missing_exit_code(
+    fake_bundle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (fake_bundle / ".astra-voice-build").write_text("VERSION=0.2.0\nBUILD_ID=0\n", "ascii")
+    control = fake_bundle / "control"
+    control.write_text("Depends: python3\n", encoding="utf-8")
+    monkeypatch.setattr(check_bundle, "EXTRA_MODULES", ("bundled_fixture_mod",))
+    monkeypatch.setattr(check_bundle, "check_package_tree", lambda lib: (0, []))
+    monkeypatch.setattr(
+        check_bundle, "check_catalog", lambda: ["jsonschema: Модуль jsonschema недоступен."]
+    )
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if str(fake_bundle) in p])
+    args = ["--appdir", str(fake_bundle), "--control", str(control)]
+    assert check_bundle.main(args) == 1
+    assert check_bundle.main([*args, "--allow-missing", "jsonschema"]) == 0
+    monkeypatch.setattr(check_bundle, "EXTRA_MODULES", ("bundled_fixture_mod", "json"))
+    assert check_bundle.main([*args, "--allow-missing", "jsonschema"]) == 1
+
+
+@pytest.mark.skipif(
+    any(shutil.which(tool) is None for tool in ("git", "readelf", "objdump", "patch")),
+    reason="нет инструментов сборки",
+)
+@pytest.mark.parametrize("ci_env", [{"GITHUB_ACTIONS": "true"}, {"CI": "1"}])
+def test_build_refuses_allow_todo_in_ci(ci_env: dict[str, str], tmp_path: Path) -> None:
+    """P2-2(а): послабление локальной сборки в CI — ошибка до любой работы."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH": "1",
+        "ASTRA_VOICE_APPIMAGE_WORK": str(tmp_path / "work"),
+        **ci_env,
+    }
+    result = subprocess.run(
+        ["bash", str(ROOT / "packaging/appimage/build.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "в CI запрещена" in result.stderr
+    assert not (tmp_path / "work").exists()

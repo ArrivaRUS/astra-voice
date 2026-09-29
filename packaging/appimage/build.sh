@@ -18,7 +18,9 @@
 # с временным HOME. От root (контейнер CI) запуск программы идёт под nobody через
 # setpriv: программа в бандле от root не работает (T1 MJ-3).
 # ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH=1 — только локальная проверка при незакреплённых
-# колёсах (строки `# TODO-HASH:` в lock): образ НЕ для выпуска; в CI не ставится.
+# колёсах (строки `# TODO-HASH:` в lock): образ НЕ для выпуска. В CI (GITHUB_ACTIONS/CI)
+# переменная — ошибка; в workflow её имя запрещает scripts/ci_lint.py; release_build.sh и
+# release_assets.sh при ENABLED не пропускают lock с TODO-HASH вовсе.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -49,12 +51,16 @@ if [ ! -f "$HERE/ENABLED" ]; then
     exit 0
 fi
 
-for tool in python3 sha256sum readelf objdump patch find xargs stat; do
+for tool in python3 git sha256sum readelf objdump patch find xargs stat; do
     command -v "$tool" >/dev/null 2>&1 || die "нет $tool на машине сборки"
 done
 lockq() { python3 "$HERE/lockfile.py" "$LOCK" "$@"; }
 lockq check || die "packaging/appimage.lock не прошёл проверку формата"
 TODO=$(lockq todo)
+if [ -n "${ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH:-}" ] &&
+    { [ "${GITHUB_ACTIONS:-}" = true ] || [ -n "${CI:-}" ]; }; then
+    die 'ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH — только для локальной проверки, в CI запрещена'
+fi
 if [ -n "$TODO" ]; then
     if [ "${ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH:-}" = 1 ]; then
         printf 'ПРЕДУПРЕЖДЕНИЕ: колёса без хэша пропущены — образ НЕ для выпуска:\n%s\n' "$TODO" >&2
@@ -187,7 +193,7 @@ find "$SITE" -mindepth 1 -maxdepth 1 ! -name pip ! -name 'pip-*.dist-info' -exec
 say 'ставлю колёса бандловым Python по lock'
 find_links=(--find-links "$WHEELS")
 [ -d "$ORT_WHEELS" ] && find_links+=(--find-links "$ORT_WHEELS")
-isolated "$PY" -I -m pip install --no-deps --no-index --require-hashes \
+isolated "$PY" -I -m pip install --isolated --no-deps --no-index --require-hashes \
     "${find_links[@]}" --no-cache-dir --no-compile --disable-pip-version-check \
     --target "$SITE" -r "$LOCK"
 
@@ -313,12 +319,21 @@ done
 say 'копирую код и ресурсы'
 LIB=$APPDIR/usr/lib/astra-voice
 SHARE=$APPDIR/usr/share/astra-voice
-mkdir -p "$LIB" "$SHARE"
-cp -a "$ROOT/src/astra_voice" "$LIB/astra_voice"
+mkdir -p "$LIB" "$SHARE" "$BUILD/src"
+# Только файлы под Git (содержимое рабочего дерева): неотслеживаемое — сгенерированный
+# _version.py, __pycache__, локальные заметки — в образ не попадает. safe.directory —
+# в контейнере CI владелец checkout другой (root против uid раннера).
+git -c safe.directory="$ROOT" -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+    die "$ROOT — не рабочее дерево Git (checkout без .git?): сборка берёт только файлы под Git"
+(cd "$ROOT" && git -c safe.directory="$ROOT" ls-files -z -- src/astra_voice qml data |
+    xargs -0 -r cp -a --parents -t "$BUILD/src" --)
+mv "$BUILD/src/src/astra_voice" "$LIB/astra_voice"
 rm -f "$LIB/astra_voice/_version.py"
 mv "$LIB/astra_voice/bootstrap.py" "$LIB/bootstrap.py"
-cp -a "$ROOT/qml" "$SHARE/qml"
-cp -a "$ROOT/data" "$SHARE/data"
+mv "$BUILD/src/qml" "$SHARE/qml"
+mv "$BUILD/src/data" "$SHARE/data"
+mkdir -p "$BUILD/icons"
+mv "$SHARE/data/icons/hicolor" "$BUILD/icons/hicolor"
 rm -rf "$SHARE/data/icons" "$SHARE/data/astra-voice.desktop" \
     "$SHARE/data/keys/README.md" "$SHARE/data/test" \
     "$SHARE/data/vad/README.md" "$SHARE/data/catalog-source.json" \
@@ -327,14 +342,14 @@ rm -rf "$SHARE/data/icons" "$SHARE/data/astra-voice.desktop" \
 # paths.icon_theme_dir() = <ресурсы>/../icons/hicolor. Свои usr/share/{icons,
 # applications,metainfo} у python-appimage (значок Python) убираем.
 rm -rf "$APPDIR/usr/share/icons" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/metainfo"
-mkdir -p "$APPDIR/usr/share/icons/hicolor"
-cp -a "$ROOT/data/icons/hicolor/." "$APPDIR/usr/share/icons/hicolor/"
+mkdir -p "$APPDIR/usr/share/icons"
+mv "$BUILD/icons/hicolor" "$APPDIR/usr/share/icons/hicolor"
 printf '# Сгенерировано packaging/appimage/build.sh из packaging/debian/changelog.\n__version__ = "%s"\n' \
     "$VERSION" > "$LIB/astra_voice/_version.py"
 
 install -m 755 "$HERE/AppRun" "$APPDIR/AppRun"
 install -m 644 "$HERE/astra-voice.desktop" "$APPDIR/astra-voice.desktop"
-install -m 644 "$ROOT/data/icons/hicolor/256x256/apps/astravoice.png" "$APPDIR/astravoice.png"
+install -m 644 "$APPDIR/usr/share/icons/hicolor/256x256/apps/astravoice.png" "$APPDIR/astravoice.png"
 ln -s astravoice.png "$APPDIR/.DirIcon"
 
 # Воспроизводимость: байт-код и кэши не попадают в образ, время файлов — из changelog.
@@ -351,20 +366,18 @@ say "BUILD_ID=$BUILD_ID"
 
 # --- гейты AppDir --------------------------------------------------------------
 say 'гейт: QML-импорты'
-isolated "$PY" -I -B "$HERE/check_qml.py" "$SHARE/qml"
+as_user "$PY" -I -B "$HERE/check_qml.py" "$SHARE/qml"
 say 'гейт: ресурсы'
-isolated "$PY" -I -B "$HERE/check_resources.py" "$LIB"
+as_user "$PY" -I -B "$HERE/check_resources.py" "$LIB"
 say 'гейт: состав бандла (check_bundle.py)'
-if [ -n "$TODO" ]; then
-    # Локальная проверка без закреплённых колёс: гейт печатает нарушения, но не
-    # останавливает сборку (ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH=1, образ не для выпуска).
-    isolated "$PY" -I -B "$HERE/check_bundle.py" --appdir "$APPDIR" \
-        --control "$ROOT/packaging/debian/control" ||
-        printf 'ПРЕДУПРЕЖДЕНИЕ: check_bundle.py не прошёл (ожидаемо без %s)\n' "$(echo "$TODO" | tr '\n' ' ')" >&2
-else
-    isolated "$PY" -I -B "$HERE/check_bundle.py" --appdir "$APPDIR" \
-        --control "$ROOT/packaging/debian/control"
-fi
+# Локально без закреплённых колёс (ALLOW_TODO_HASH=1) гейт прощает только нарушения
+# про модули из строк TODO-HASH; всё остальное валит сборку, как в CI.
+allow_missing=()
+for package in $(printf '%s\n' "$TODO" | sed 's/==.*//'); do
+    allow_missing+=(--allow-missing "$package")
+done
+as_user "$PY" -I -B "$HERE/check_bundle.py" --appdir "$APPDIR" \
+    --control "$ROOT/packaging/debian/control" "${allow_missing[@]}"
 say 'гейт: AppRun --version в изоляции, stderr пуст'
 version_err=$WORK/tmp/version.stderr
 version_output=$(as_user "$APPDIR/AppRun" --version 2>"$version_err") || {
@@ -392,7 +405,7 @@ IMAGE=$OUT/Astra_Voice-$VERSION-x86_64.AppImage
 rm -f "$IMAGE"
 say 'упаковываю AppImage'
 ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$TOOL" --no-appstream \
-    --runtime-file "$RUNTIME" -n "$APPDIR" "$IMAGE" >"$WORK/appimagetool.log" 2>&1 || {
+    --runtime-file "$RUNTIME" "$APPDIR" "$IMAGE" >"$WORK/appimagetool.log" 2>&1 || {
     tail -n 40 "$WORK/appimagetool.log" >&2
     die 'appimagetool завершился с ошибкой'
 }

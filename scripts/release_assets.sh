@@ -29,6 +29,10 @@ IMAGE=Astra_Voice-$VERSION-x86_64.AppImage
 files=("$DEB" sbom.cdx.json)
 latest_args=()
 if [ -f "$ROOT/packaging/appimage/ENABLED" ]; then
+    # Образ из lock с незакреплёнными колёсами не публикуется — без оглядки на переменные.
+    todo=$(python3 "$ROOT/packaging/appimage/lockfile.py" "$ROOT/packaging/appimage.lock" todo) ||
+        die 'packaging/appimage.lock не прошёл проверку формата'
+    [ -z "$todo" ] || die "в packaging/appimage.lock колёса без хэша (TODO-HASH): $(echo "$todo" | tr '\n' ' ')"
     files+=("$IMAGE" sbom-appimage.cdx.json)
     latest_args+=(--appimage)
     say "AppImage включён: $IMAGE"

@@ -16,10 +16,17 @@ say() { printf '==> %s\n' "$*"; }
 die() { printf 'ОШИБКА: %s\n' "$*" >&2; exit 1; }
 
 [ -z "${GPG_SIGNING_KEY:-}" ] || die 'секрет подписи не должен быть в окружении сборки (T3 P2-1)'
-[ "$(id -u)" = 0 ] || die 'скрипт ставит пакет в систему: только в контейнере CI от root'
 cd "$ROOT"
 VERSION=$(sed -n '1s/.*(\([^)]*\)).*/\1/p' packaging/debian/changelog)
 DEB=dist/astra-voice_${VERSION}_amd64.deb
+if [ -f packaging/appimage/ENABLED ]; then
+    # Выпуск не собирается из lock с незакреплёнными колёсами — без оглядки на переменные;
+    # проверка до сборки .deb, чтобы не тратить на неё время.
+    todo=$(python3 packaging/appimage/lockfile.py packaging/appimage.lock todo) ||
+        die 'packaging/appimage.lock не прошёл проверку формата'
+    [ -z "$todo" ] || die "в packaging/appimage.lock колёса без хэша (TODO-HASH): $(echo "$todo" | tr '\n' ' ')"
+fi
+[ "$(id -u)" = 0 ] || die 'скрипт ставит пакет в систему: только в контейнере CI от root'
 
 say '.deb: колёса по wheels.lock'
 packaging/build-deb.sh --fetch-wheels

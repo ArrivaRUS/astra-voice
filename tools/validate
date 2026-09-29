@@ -75,7 +75,6 @@ CATALOG_SWITCH_TIMEOUT_S = 180.0
 
 
 RELEASE_REPOSITORY = "ArrivaRUS/astra-voice"
-APPIMAGE_ENABLED = ROOT / "packaging" / "appimage" / "ENABLED"
 APPIMAGE_MIN_SIZE = 50 << 20
 ASSET_LIMIT = 16 << 20
 ARTIFACT_LIMIT = 512 << 20
@@ -113,14 +112,27 @@ def release_read(path: Path, limit: int) -> bytes:
         os.close(fd)
 
 
-def tree_version() -> str | None:
-    """Версия исходного дерева — первая запись packaging/debian/changelog."""
+def announced_appimage(directory: Path, image_name: str) -> bool:
+    """Набор выпуска сам заявляет AppImage: имя в SHA256SUMS или `artifacts.appimage`.
+
+    Решение — по подписываемым файлам набора, а не по флагу дерева
+    `packaging/appimage/ENABLED` (он для `release.sh` и CI): так проверка старого
+    выпуска без AppImage (v0.1.0) не зависит от того, из какого коммита её запускают.
+    Файлы читаются ещё раз со всеми проверками ниже; здесь сбой чтения — «не заявлен».
+    """
     try:
-        first = (ROOT / "packaging" / "debian" / "changelog").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    match = re.match(r"\S+ \(([^)]*)\)", first)
-    return match.group(1) if match else None
+        sums = release_read(directory / "SHA256SUMS", ASSET_LIMIT).decode("utf-8")
+        listed = {line.split(maxsplit=1)[-1].lstrip("*") for line in sums.splitlines() if line}
+    except (OSError, ReleaseCriterionError, UnicodeError):
+        listed = set()
+    if image_name in listed or "sbom-appimage.cdx.json" in listed:
+        return True
+    try:
+        latest = json.loads(release_read(directory / "latest.json", ASSET_LIMIT))
+    except (OSError, ReleaseCriterionError, ValueError):
+        return False
+    artifacts = latest.get("artifacts") if isinstance(latest, dict) else None
+    return isinstance(artifacts, dict) and "appimage" in artifacts
 
 
 def _published_ok(published: object) -> bool:
@@ -228,13 +240,12 @@ def release(args: argparse.Namespace) -> int:
     deb = debs[0] if len(debs) == 1 else None
     image_name = f"Astra_Voice-{version}-x86_64.AppImage"
     # Второй артефакт (arch/appimage.md §9.3): обязателен при --expect-appimage yes
-    # или (auto) при packaging/appimage/ENABLED для версии этого дерева (changelog) —
-    # старые выпуски без AppImage (v0.1.0) проверяются как раньше. Найденный в
-    # каталоге AppImage проверяется всегда.
+    # или (auto) когда его заявляет сам набор — SHA256SUMS или latest.json. Найденный
+    # в каталоге AppImage проверяется всегда.
     expect = args.expect_appimage
     with_appimage = (
         expect == "yes"
-        or (expect == "auto" and APPIMAGE_ENABLED.is_file() and version == tree_version())
+        or (expect == "auto" and announced_appimage(directory, image_name))
         or (directory / image_name).exists()
         or (directory / "sbom-appimage.cdx.json").exists()
     )
@@ -2277,7 +2288,7 @@ def main(argv: list[str] | None = None) -> int:
         "--expect-appimage",
         choices=("auto", "yes", "no"),
         default="auto",
-        help="AppImage обязателен: auto — при packaging/appimage/ENABLED (по умолчанию)",
+        help="AppImage обязателен: auto — если его заявляет SHA256SUMS или latest.json",
     )
     probe = commands.add_parser("_catalog-probe", help=argparse.SUPPRESS)
     probe.add_argument("--model-dir", type=Path, required=True)

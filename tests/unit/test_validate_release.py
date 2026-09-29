@@ -36,13 +36,10 @@ class ReleaseAssets:
 
 
 @pytest.fixture
-def validate_globals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, object]:
+def validate_globals(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     monkeypatch.setattr(sys, "path", sys.path.copy())
     namespace = runpy.run_path(str(ROOT / "tools/validate"))
-    module_globals = cast(dict[str, object], namespace["main"].__globals__)
-    # Флаг AppImage настоящего дерева не влияет на тесты: включаем его явно.
-    module_globals["APPIMAGE_ENABLED"] = tmp_path / "no-ENABLED"
-    return module_globals
+    return cast(dict[str, object], namespace["main"].__globals__)
 
 
 @pytest.fixture
@@ -591,21 +588,64 @@ def test_appimage_expected_but_missing(
     assert checks["appimage"]["ok"] is False
 
 
-def test_appimage_required_by_enabled_flag_for_tree_version(
+@pytest.mark.parametrize("announced_by", ["sums", "latest"])
+def test_appimage_required_when_set_announces_it(
     assets: ReleaseAssets,
     validate: Callable[[list[str]], int],
-    validate_globals: dict[str, object],
-    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    announced_by: str,
 ) -> None:
-    flag = tmp_path / "ENABLED"
-    flag.write_text("", encoding="utf-8")
-    validate_globals["APPIMAGE_ENABLED"] = flag
-    validate_globals["tree_version"] = lambda: "0.1.0"
-    assert invoke(validate, *assets) == 1
-    # Старый выпуск (не версия дерева) флагом не затрагивается.
-    validate_globals["tree_version"] = lambda: "0.2.0"
-    assert invoke(validate, *assets) == 0
-    assert invoke(validate, *assets, "--expect-appimage", "no") == 0
+    """auto: AppImage обязателен, если его заявляет сам набор (SHA256SUMS или latest.json)."""
+    add_appimage(assets)
+    dist = assets.dist
+    image = (dist / IMAGE).read_bytes()
+    (dist / IMAGE).unlink()
+    (dist / "sbom-appimage.cdx.json").unlink()
+    if announced_by == "sums":
+        with (dist / "SHA256SUMS").open("a", encoding="utf-8") as sums:
+            sums.write(f"{hashlib.sha256(image).hexdigest()}  {IMAGE}\n")
+        latest = json.loads((dist / "latest.json").read_text(encoding="utf-8"))
+        del latest["artifacts"]["appimage"]
+        (dist / "latest.json").write_text(json.dumps(latest), encoding="utf-8")
+    if announced_by == "latest":
+        rewrite_sums(assets)
+    else:
+        resign(assets, assets.fingerprint)
+    checks = release_checks(validate, assets, capsys)
+    assert checks["assets"]["ok"] is False
+    assert IMAGE in str(checks["assets"]["detail"])
+    assert checks["appimage"]["ok"] is False
+
+
+def test_published_v010_set_passes_with_tree_flag(
+    assets: ReleaseAssets,
+    validate: Callable[[list[str]], int],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """README: `tools/validate release --version 0.1.0 --dir <ассеты v0.1.0>` проходит.
+
+    Набор v0.1.0 — deb, SBOM, INSTALL-ADMIN.md, latest.json схемы 1, release.gpg,
+    SHA256SUMS(.asc) — без AppImage; флаг ENABLED дерева на решение не влияет.
+    """
+    assert (ROOT / "packaging/appimage/ENABLED").is_file()
+    dist = assets.dist
+    deb = next(dist.glob("*.deb"))
+    legacy = {
+        "version": "0.1.0",
+        "deb": deb.name,
+        "sha256": hashlib.sha256(deb.read_bytes()).hexdigest(),
+        "published_at": "2026-09-28T12:00:00Z",
+        "min_astra": "1.8",
+    }
+    (dist / "latest.json").write_text(json.dumps(legacy), encoding="utf-8")
+    rewrite_sums(assets)
+    assert sorted(path.name for path in dist.iterdir()) == sorted(
+        [deb.name, "sbom.cdx.json", "INSTALL-ADMIN.md", "latest.json", "release.gpg"]
+        + ["SHA256SUMS", "SHA256SUMS.asc"]
+    )
+    checks = release_checks(validate, assets, capsys, expected_code=0)
+    assert "appimage" not in checks
+    assert checks["latest.json"]["detail"] == "указатель верен (схема 1)"
 
 
 @pytest.mark.parametrize(

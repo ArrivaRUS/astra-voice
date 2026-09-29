@@ -297,6 +297,12 @@ jobs:
     timeout-minutes: 30
     container: debian:12
     steps:
+      # build.sh берёт в образ только файлы под Git: без git в контейнере checkout
+      # скачал бы архив без .git.
+      - name: Git для checkout с историей файлов
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
         with:
           persist-credentials: false
