@@ -26,8 +26,11 @@ from astra_voice.worker.audio import (
     AudioDevice,
     AudioError,
     DeviceChange,
+    FreshDevices,
     _clean_device_description,
     classify_change,
+    invalidate_device_cache,
+    select_device,
 )
 
 pytestmark = pytest.mark.unit
@@ -259,3 +262,112 @@ def test_change_without_handler_preserves_audio_error() -> None:
     capture.start("uid", ORIGINAL.name, limit_s=10)
     _wait(capture)
     errors.assert_called_once_with("uid", ERROR_FAILED, "Запись звука прервалась.")
+
+
+@pytest.mark.parametrize("reported", [True, False])
+def test_change_invalidates_device_cache(reported: bool) -> None:
+    """P3: смена в пределах TTL кэша — следующий старт выбирает новое умолчание."""
+    invalidate_device_cache()
+    now = [0.0]
+
+    def clock() -> float:
+        return now[0]
+
+    try:
+        first, cached = select_device(
+            None,
+            devices_fn=lambda **_: [ORIGINAL, NEXT],
+            default_fn=lambda *_a, **_kw: ORIGINAL,
+            clock=clock,
+        )
+        assert (first, cached) == (ORIGINAL, False)
+        now[0] = 1.0
+        if reported:
+            capture = _capture(
+                ControlledSource(),
+                changed=Mock(),
+                events=Mock(),
+                errors=Mock(),
+                samples=Mock(),
+                clock=clock,
+            )
+            capture._report_device_change("uid", DeviceChange(REASON_REMOVED, ORIGINAL, True))
+        second, cached = select_device(
+            None,
+            devices_fn=lambda **_: [NEXT],
+            default_fn=lambda *_a, **_kw: NEXT,
+            clock=clock,
+        )
+        assert (second, cached) == ((NEXT, False) if reported else (ORIGINAL, True))
+    finally:
+        invalidate_device_cache()
+
+
+@pytest.mark.parametrize(
+    ("fresh", "expected"),
+    [
+        (FreshDevices((NEXT,), NEXT), (KIND_SWITCHED, NEXT.label)),
+        (FreshDevices(None), (KIND_DEVICE_LOST, None)),
+    ],
+)
+def test_fresh_devices_are_not_requested_again(
+    fresh: FreshDevices, expected: tuple[str, str | None]
+) -> None:
+    """P3: список, уже прочитанный источником, классифицируется без второго запроса."""
+    devices = Mock(side_effect=AssertionError("повторный запрос списка"))
+    default = Mock(side_effect=AssertionError("повторный запрос умолчания"))
+    changed = Mock()
+    capture = _capture(
+        ControlledSource(),
+        changed=changed,
+        events=Mock(),
+        errors=Mock(),
+        samples=Mock(),
+        devices_fn=devices,
+        default_fn=default,
+    )
+    capture._report_device_change("uid", DeviceChange(REASON_KILLED, ORIGINAL, True, fresh=fresh))
+    changed.assert_called_once_with("uid", *expected)
+    devices.assert_not_called()
+    default.assert_not_called()
+
+
+def test_cancelled_change_skips_classification() -> None:
+    """P3: после record.cancel захват не держит IPC опросом звуковой службы."""
+    devices = Mock(side_effect=AssertionError("опрос после отмены"))
+    changed = Mock()
+    capture = _capture(
+        ControlledSource(),
+        changed=changed,
+        events=Mock(),
+        errors=Mock(),
+        samples=Mock(),
+        devices_fn=devices,
+    )
+    cancelled = threading.Event()
+    cancelled.set()
+    capture._report_device_change("uid", DeviceChange(REASON_KILLED, ORIGINAL, True), cancelled)
+    changed.assert_not_called()
+    devices.assert_not_called()
+
+
+def test_change_after_last_chunk_and_stop_still_reports() -> None:
+    """P3: смена, найденная вместе с последней порцией, сообщается и после остановки."""
+    source = ControlledSource()
+    source.chunks.put(b"\x01\x00" * 320)
+    events, errors, changed = Mock(), Mock(), Mock()
+    samples = Mock(return_value=True)
+    capture = _capture(source, changed=changed, events=events, errors=errors, samples=samples)
+    original_read = source.read_chunk
+
+    def read() -> bytes | None:
+        chunk = original_read()
+        source.device_change = DeviceChange(REASON_REMOVED, ORIGINAL, False)
+        capture.request_stop()
+        return chunk
+
+    source.read_chunk = read  # type: ignore[method-assign]
+    capture.start("uid", ORIGINAL.name, limit_s=10)
+    _wait(capture)
+    changed.assert_called_once_with("uid", KIND_DEVICE_LOST, None)
+    errors.assert_not_called()

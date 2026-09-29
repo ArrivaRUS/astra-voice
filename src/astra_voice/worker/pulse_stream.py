@@ -36,6 +36,7 @@ from astra_voice.worker.audio import (
     AudioDevice,
     AudioError,
     DeviceChange,
+    FreshDevices,
     _OpenDeadline,
     _PaBufferAttr,
     _PaSampleSpec,
@@ -83,6 +84,8 @@ SIZE_MAX = ctypes.c_size_t(-1).value
 POLL_US = 50_000
 KILLED_WAIT_S = 0.250
 SERVER_WAIT_S = 0.200
+# В очередь попадают только REMOVE источников и moved; SERVER CHANGE хранится флагом.
+EVENT_QUEUE_LIMIT = 64
 
 SubscribeCallback = ctypes.CFUNCTYPE(
     None, ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p
@@ -102,11 +105,16 @@ class _PulseAsync:
     """Явный ABI libpulse и небольшие помощники однопоточного цикла."""
 
     def __init__(self) -> None:
+        self.mainloop: int | None = None
         try:
             self.lib = ctypes.CDLL("libpulse.so.0", use_errno=True)
-        except OSError as exc:
+            self._declare()
+        except (OSError, AttributeError) as exc:
+            # AttributeError — в библиотеке нет нужного символа (старая или чужая сборка).
             raise AudioError(ERROR_FAILED, "Звуковая подсистема недоступна.") from exc
-        self.mainloop: int | None = None
+
+    def _declare(self) -> None:
+        """Объявляет argtypes/restype; отсутствие символа даёт AttributeError."""
         self.lib.pa_mainloop_new.argtypes = []
         self.lib.pa_mainloop_new.restype = ctypes.c_void_p
         self.lib.pa_mainloop_free.argtypes = [ctypes.c_void_p]
@@ -369,7 +377,10 @@ class PulseStreamSource:
         self._context: int | None = None
         self._stream: int | None = None
         self._running: threading.Event | None = None
-        self._events: deque[_Event] = deque(maxlen=64)
+        self._events: deque[_Event] = deque()
+        # Очередь переполнилась (или REMOVE не приписать): сверяем устройство и список.
+        self._overflow = False
+        self._overflow_cutoff = 0
         self._subscribe_callback = SubscribeCallback(self._on_subscribe)
         self._moved_callback = MovedCallback(self._on_moved)
         self._buffer = bytearray()
@@ -548,7 +559,11 @@ class PulseStreamSource:
         idx = pulse.stream_get_device_index(self._stream)
         name = self._stream_name()
         self._baseline_known = idx != PA_INVALID_INDEX
-        self._index = idx if self._baseline_known else selected.index
+        if self._baseline_known:
+            self._index = idx
+        else:
+            # Запасной индекс годится, только если он из той же нумерации, что события.
+            self._index = selected.index if selected.index_exact else PA_INVALID_INDEX
         self._trace_device = (idx, name)
         if self._probe_logging:
             logger.debug(
@@ -595,14 +610,20 @@ class PulseStreamSource:
                 size = 0
         return self._received + size
 
+    def _enqueue(self, event: _Event) -> None:
+        """Ограниченная очередь не вытесняет старые факты: лишнее отмечается переполнением."""
+        if len(self._events) < EVENT_QUEUE_LIMIT:
+            self._events.append(event)
+        elif not self._overflow:
+            self._overflow = True
+            self._overflow_cutoff = event.cutoff
+
     def _on_subscribe(self, context: int, event: int, idx: int, userdata: int) -> None:
         try:
+            facility = event & PA_SUBSCRIPTION_EVENT_FACILITY_MASK
+            kind = event & PA_SUBSCRIPTION_EVENT_TYPE_MASK
             if self._probe_logging:
-                facility = event & PA_SUBSCRIPTION_EVENT_FACILITY_MASK
-                kind = event & PA_SUBSCRIPTION_EVENT_TYPE_MASK
                 own_index = self._index
-                if own_index == PA_INVALID_INDEX and self.selected_device is not None:
-                    own_index = self.selected_device.index
                 logger.debug(
                     "Подписка: object=%s kind=%s index=%s %s",
                     {
@@ -615,7 +636,11 @@ class PulseStreamSource:
                     if facility == PA_SUBSCRIPTION_EVENT_SOURCE and idx == own_index
                     else "чужой",
                 )
-            self._events.append(_Event(False, event, idx, None, self._event_cutoff()))
+            if facility == PA_SUBSCRIPTION_EVENT_SERVER and kind == PA_SUBSCRIPTION_EVENT_CHANGE:
+                self._server_changed = True
+            elif facility == PA_SUBSCRIPTION_EVENT_SOURCE and kind == PA_SUBSCRIPTION_EVENT_REMOVE:
+                # NEW/CHANGE источников не нужны: их шторм не должен вытеснять наш REMOVE.
+                self._enqueue(_Event(False, event, idx, None, self._event_cutoff()))
         except Exception:
             logger.debug("Не удалось сохранить событие подписки pa_stream", exc_info=True)
 
@@ -632,11 +657,18 @@ class PulseStreamSource:
                     name,
                 )
                 self._trace_device = (idx, name)
-            self._events.append(_Event(True, 0, idx, name, self._event_cutoff()))
+            self._enqueue(_Event(True, 0, idx, name, self._event_cutoff()))
         except Exception:
             logger.debug("Не удалось сохранить событие moved pa_stream", exc_info=True)
 
-    def _change(self, reason: str, cutoff: int, name: str | None = None) -> None:
+    def _change(
+        self,
+        reason: str,
+        cutoff: int,
+        name: str | None = None,
+        *,
+        fresh: FreshDevices | None = None,
+    ) -> None:
         if self.device_change is not None:
             return
         self._cutoff = cutoff
@@ -646,37 +678,90 @@ class PulseStreamSource:
             self._default_mode,
             moved_to_name=name,
             server_changed=self._server_changed,
+            fresh=fresh,
         )
         logger.info("Смена источника записи: %s", reason)
         if name is not None:
             logger.debug("Новое имя источника: %s", name)
 
+    def _process_moved(self, event: _Event) -> None:
+        if self._baseline_known:
+            if event.index != self._index:
+                self._change(REASON_MOVED, event.cutoff, event.name)
+        elif event.name is not None:
+            if event.name != self.device_name:
+                self._change(REASON_MOVED, event.cutoff, event.name)
+            elif event.index != PA_INVALID_INDEX:
+                self._index = event.index
+                self._baseline_known = True
+
     def _process_events(self, *, killed: bool = False) -> None:
         while self._events:
             event = self._events.popleft()
             if event.moved:
-                if self._baseline_known:
-                    if event.index != self._index:
-                        self._change(REASON_MOVED, event.cutoff, event.name)
-                elif event.name is not None:
-                    if event.name != self.device_name:
-                        self._change(REASON_MOVED, event.cutoff, event.name)
-                    elif event.index != PA_INVALID_INDEX:
-                        self._index = event.index
-                        self._baseline_known = True
-                continue
-            facility = event.event & PA_SUBSCRIPTION_EVENT_FACILITY_MASK
-            kind = event.event & PA_SUBSCRIPTION_EVENT_TYPE_MASK
-            if facility == PA_SUBSCRIPTION_EVENT_SERVER and kind == PA_SUBSCRIPTION_EVENT_CHANGE:
-                self._server_changed = True
-                if self.device_change is not None:
-                    self.device_change = replace(self.device_change, server_changed=True)
-            elif (
-                facility == PA_SUBSCRIPTION_EVENT_SOURCE
-                and kind == PA_SUBSCRIPTION_EVENT_REMOVE
-                and event.index == self._index
-            ):
+                self._process_moved(event)
+            elif self._index != PA_INVALID_INDEX and event.index == self._index:
                 self._change(REASON_KILLED if killed else REASON_REMOVED, event.cutoff)
+            elif self._index == PA_INVALID_INDEX and not self._overflow:
+                # Свой индекс неизвестен: REMOVE не приписать, проверяем по имени.
+                self._overflow = True
+                self._overflow_cutoff = event.cutoff
+        if self._overflow and self.device_change is None and not killed and self._keep_running():
+            self._overflow = False
+            self._recheck(self._overflow_cutoff)
+        if (
+            self._server_changed
+            and self.device_change is not None
+            and not self.device_change.server_changed
+        ):
+            self.device_change = replace(self.device_change, server_changed=True)
+
+    def _recheck(self, cutoff: int) -> None:
+        """Часть фактов потеряна: сверяем устройство потока и ищем наше имя в списке."""
+        assert self._pulse is not None and self._stream is not None
+        logger.debug("События pa_stream потеряны или не приписаны: сверка устройства")
+        self._process_moved(
+            _Event(
+                True,
+                0,
+                self._pulse.stream_get_device_index(self._stream),
+                self._stream_name(),
+                cutoff,
+            )
+        )
+        if self.device_change is None:
+            # Сбой списка при живом потоке — не повод обрывать запись.
+            self._check_list(REASON_REMOVED, cutoff, error_missing=False)
+
+    def _check_list(self, reason: str, cutoff: int, *, error_missing: bool) -> bool:
+        """Ищет наше имя в свежем списке; при пропаже фиксирует смену вместе со списком.
+
+        Список и умолчание читаются в одном бюджете и передаются дальше в DeviceChange,
+        чтобы классификация не спрашивала службу второй раз.
+        """
+        budget = _OpenDeadline(self._clock, DEVICE_CHANGE_BUDGET_S)
+        devices: list[AudioDevice] | None
+        try:
+            devices = list_devices(deadline=budget) if self._devices is None else self._devices()
+            budget.remaining(DEVICE_CHANGE_BUDGET_S)
+        except AudioError:
+            devices = None
+        if devices is None:
+            missing = error_missing
+        else:
+            missing = all(item.name != self.device_name for item in devices)
+        if not missing:
+            return False
+        default: AudioDevice | None = None
+        if devices is not None and self._default_mode:
+            try:
+                default = self._default(devices, deadline=budget)
+                budget.remaining(DEVICE_CHANGE_BUDGET_S)
+            except AudioError:
+                default = None
+        fresh = FreshDevices(tuple(devices) if devices is not None else None, default)
+        self._change(reason, cutoff, fresh=fresh)
+        return True
 
     def _keep_running(self) -> bool:
         return self._running is None or self._running.is_set()
@@ -715,17 +800,10 @@ class PulseStreamSource:
             if self.device_change is not None:
                 return True
         if not self._keep_running():
+            # Запись уже остановлена или отменена: классифицировать нечего и некому.
             return False
-        budget = _OpenDeadline(self._clock, DEVICE_CHANGE_BUDGET_S)
-        try:
-            devices = list_devices(deadline=budget) if self._devices is None else self._devices()
-            budget.remaining(DEVICE_CHANGE_BUDGET_S)
-            missing = all(item.name != self.device_name for item in devices)
-        except AudioError:
-            missing = True
-        if missing:
-            self._change(REASON_KILLED, self._received)
-        return missing
+        # Поток мёртв: сбой списка считаем пропажей, иначе запись оборвётся без объяснения.
+        return self._check_list(REASON_KILLED, self._received, error_missing=True)
 
     def _finish_change(self) -> None:
         """Даёт серверу короткое окно для обновления умолчания после пропажи."""
@@ -734,6 +812,7 @@ class PulseStreamSource:
             self._default_mode
             and not self._server_changed
             and not self._server_waited
+            and self.device_change.fresh is None
             and self.device_change.reason in (REASON_REMOVED, REASON_KILLED)
         ):
             self._server_waited = True
@@ -804,7 +883,8 @@ class PulseStreamSource:
         self._buffer.clear()
         self._received = self._delivered = 0
         # Факты, поступившие во время flush, сохраняем, но сброшенного PCM уже нет.
-        self._events = deque((replace(event, cutoff=0) for event in self._events), maxlen=64)
+        self._events = deque(replace(event, cutoff=0) for event in self._events)
+        self._overflow_cutoff = 0
         if self._cutoff is not None:
             self._cutoff = 0
 
@@ -840,6 +920,8 @@ class PulseStreamSource:
                 self._pulse.mainloop_free(mainloop)
             self._pulse.mainloop = None
         self._events.clear()
+        self._overflow = False
+        self._overflow_cutoff = 0
         self._buffer.clear()
         self._received = self._delivered = 0
         self._cutoff = None

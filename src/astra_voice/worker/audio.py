@@ -15,7 +15,7 @@ import unicodedata
 import wave
 from array import array
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -124,6 +124,9 @@ class AudioDevice:
     name: str
     description: str
     monitor: bool
+    # Индекс совпадает с индексом звуковой службы (pactl или object.serial из pw-dump).
+    # Иначе это номер узла или порядковый номер, и сверять по нему события нельзя.
+    index_exact: bool = field(default=True, compare=False)
 
     @property
     def label(self) -> str:
@@ -132,14 +135,32 @@ class AudioDevice:
 
 
 @dataclass(frozen=True)
+class FreshDevices:
+    """Список и умолчание, уже прочитанные источником при обнаружении смены.
+
+    ``devices`` равно None, если список прочитать не удалось; повторно его не спрашиваем.
+    """
+
+    devices: tuple[AudioDevice, ...] | None
+    default: AudioDevice | None = None
+
+
+@dataclass(frozen=True)
 class DeviceChange:
-    """Факт смены источника, установленный потоком записи."""
+    """Факт смены источника, установленный потоком записи.
+
+    ``server_changed`` — служба успела сообщить о смене умолчания (SERVER CHANGE) до
+    окончания чтения. Это только диагностика для журнала и пробы: в ``classify_change``
+    не участвует, умолчание всегда читается заново. ``fresh`` — список, который источник
+    уже прочитал сам (путь KILLED без REMOVE, переполнение очереди событий); None — не читал.
+    """
 
     reason: str
     original: AudioDevice | None
     default_mode: bool
     moved_to_name: str | None = None
     server_changed: bool = False
+    fresh: FreshDevices | None = None
 
 
 def classify_change(
@@ -366,7 +387,11 @@ def _pipewire_devices(
             continue
         seen.add(name)
         serial = props.get("object.serial")
-        if not isinstance(serial, int) or isinstance(serial, bool) or serial < 0:
+        # В pipewire-pulse индекс источника равен object.serial; номер узла — другой счётчик.
+        index_exact = False
+        if isinstance(serial, int) and not isinstance(serial, bool) and serial >= 0:
+            index_exact = True
+        else:
             node_id = item.get("id")
             serial = node_id if isinstance(node_id, int) and not isinstance(node_id, bool) else -1
         index = serial if serial >= 0 else len(devices)
@@ -381,7 +406,13 @@ def _pipewire_devices(
             fallback_counts[fallback] = count
             description = fallback if count == 1 else f"{fallback} {count}"
         devices.append(
-            AudioDevice(index=index, name=name, description=description, monitor=monitor)
+            AudioDevice(
+                index=index,
+                name=name,
+                description=description,
+                monitor=monitor,
+                index_exact=index_exact,
+            )
         )
     return devices
 
@@ -668,6 +699,7 @@ class AudioCapture:
         self._clock = clock
         self._sleep = sleep
         self._running = threading.Event()
+        self._cancelled = threading.Event()
         self._thread: threading.Thread | None = None
         self._watchdog_lock = threading.Lock()
         self._stop_deadlines: dict[threading.Thread, float] = {}
@@ -688,13 +720,15 @@ class AudioCapture:
         previous = self._thread
         running = threading.Event()
         running.set()
+        cancelled = threading.Event()
         self._running = running
+        self._cancelled = cancelled
         deadline = self._clock() + limit_s + RECORD_DEADLINE_GRACE_S
         with self._watchdog_lock:
             self._record_deadline = deadline
         self._thread = threading.Thread(
             target=self._run,
-            args=(utterance_id, device, running, previous, deadline),
+            args=(utterance_id, device, running, previous, deadline, cancelled),
             name="audio-capture",
             daemon=True,
         )
@@ -745,6 +779,7 @@ class AudioCapture:
         running: threading.Event,
         previous: threading.Thread | None,
         deadline: float,
+        cancelled: threading.Event | None = None,
     ) -> None:
         """Владеет циклом чтения; лимит и хранение отсчётов остаются у автомата."""
         try:
@@ -756,7 +791,7 @@ class AudioCapture:
                 return
             change = getattr(self._source, "device_change", None)
             if change is not None:
-                self._report_device_change(uid, change)
+                self._report_device_change(uid, change, cancelled)
                 return
             if opened_now:
                 current = (
@@ -785,7 +820,7 @@ class AudioCapture:
                 if self._source.live and running is self._running:
                     self._first_chunk_deadline = self._clock() + FIRST_CHUNK_TIMEOUT_S
                     self._silent_uid = uid
-            self._read(uid, running, deadline)
+            self._read(uid, running, deadline, cancelled)
         except AudioError as err:
             if running.is_set():
                 self._on_error(uid, err.code, err.message)
@@ -794,7 +829,22 @@ class AudioCapture:
             self._mark_stopping(threading.current_thread(), running)
             self._source.close()
 
-    def _read(self, uid: str, running: threading.Event, deadline: float) -> None:
+    def _read(
+        self,
+        uid: str,
+        running: threading.Event,
+        deadline: float,
+        cancelled: threading.Event | None = None,
+    ) -> None:
+        """Читает до конца записи; о смене устройства сообщает при любом выходе."""
+        self._read_chunks(uid, running, deadline)
+        # Смена могла быть зафиксирована, пока владелец снимал running (отпускание клавиши,
+        # лимит): сообщаем о ней и тогда, иначе GUI не узнает, почему фраза оборвалась.
+        change = getattr(self._source, "device_change", None)
+        if change is not None:
+            self._report_device_change(uid, change, cancelled)
+
+    def _read_chunks(self, uid: str, running: threading.Event, deadline: float) -> None:
         """Передаёт PCM, прореживает уровни по часам и один раз сообщает о тишине."""
         silence_since = self._clock()
         zero_since: float | None = self._clock()
@@ -804,9 +854,7 @@ class AudioCapture:
             if self._clock() >= deadline:
                 return
             chunk = self._source.read_chunk()
-            change = getattr(self._source, "device_change", None) if chunk is None else None
-            if change is not None:
-                self._report_device_change(uid, change)
+            if chunk is None and getattr(self._source, "device_change", None) is not None:
                 return
             if not running.is_set() or self._clock() >= deadline:
                 return
@@ -860,23 +908,37 @@ class AudioCapture:
                 self._on_event({"type": "silent", "utterance_id": uid})
                 silent_sent = True
 
-    def _report_device_change(self, uid: str, change: DeviceChange) -> None:
+    def _report_device_change(
+        self, uid: str, change: DeviceChange, cancelled: threading.Event | None = None
+    ) -> None:
         """Классифицирует смену в отдельном бюджете и передаёт её автомату."""
+        # Снимок кэша сделан до смены: следующий старт в пределах TTL выбрал бы старое умолчание.
+        invalidate_device_cache()
         with self._watchdog_lock:
             self._first_chunk_deadline = None
             self._silent_uid = None
+        if cancelled is not None and cancelled.is_set():
+            # После отмены автомат событие отбросит; не держим record.cancel опросом службы.
+            logger.info("Смена устройства записи после отмены: reason=%s", change.reason)
+            return
         if self._on_device_change is None:
             raise AudioError(ERROR_FAILED, "Запись звука прервалась.")
         started = self._clock()
         budget = _OpenDeadline(self._clock, DEVICE_CHANGE_BUDGET_S)
         devices: list[AudioDevice] | None = None
         default: AudioDevice | None = None
-        try:
-            devices = self._list_devices_fn(deadline=budget)
-            budget.remaining(DEVICE_CHANGE_BUDGET_S)
-        except AudioError:
-            devices = None
-        if devices is not None and change.default_mode:
+        if change.fresh is not None:
+            # Источник уже прочитал список в своём бюджете: второй запрос удвоил бы задержку.
+            fresh = change.fresh.devices
+            devices = list(fresh) if fresh is not None else None
+            default = change.fresh.default
+        else:
+            try:
+                devices = self._list_devices_fn(deadline=budget)
+                budget.remaining(DEVICE_CHANGE_BUDGET_S)
+            except AudioError:
+                devices = None
+        if change.fresh is None and devices is not None and change.default_mode:
             try:
                 default = self._default_device_fn(devices, deadline=budget)
                 budget.remaining(DEVICE_CHANGE_BUDGET_S)
@@ -894,8 +956,13 @@ class AudioCapture:
         logger.debug("Смена устройства записи: moved_to_name=%r", change.moved_to_name)
         self._on_device_change(uid, kind, label)
 
-    def request_stop(self) -> None:
-        """Снимает флаг работы без ожидания потока и обращения к источнику."""
+    def request_stop(self, *, cancel: bool = False) -> None:
+        """Снимает флаг работы без ожидания потока и обращения к источнику.
+
+        ``cancel`` — запись отменена: о смене устройства после этого не сообщаем.
+        """
+        if cancel:
+            self._cancelled.set()
         self._mark_stopping(self._thread, self._running)
 
     def _mark_stopping(self, thread: threading.Thread | None, running: threading.Event) -> None:

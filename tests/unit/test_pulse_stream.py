@@ -5,22 +5,26 @@ from __future__ import annotations
 import ctypes
 import subprocess
 import threading
-from collections import deque
-from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any, NoReturn, cast
+from typing import NoReturn
 from unittest.mock import Mock
 
 import pytest
 
 from astra_voice.worker import audio
 from astra_voice.worker import pulse_stream as ps
+from helpers.pulse_fakes import (
+    MIC,
+    OTHER,
+    REMOVE,
+    SERVER,
+    FakeLibrary,
+    FakePulse,
+    Step,
+    opened,
+    source_for,
+)
 
 pytestmark = pytest.mark.unit
-MIC = audio.AudioDevice(7, "mic.test", "Тестовый микрофон", False)
-OTHER = audio.AudioDevice(8, "mic.other", "Другой микрофон", False)
-REMOVE = ps.PA_SUBSCRIPTION_EVENT_SOURCE | ps.PA_SUBSCRIPTION_EVENT_REMOVE
-SERVER = ps.PA_SUBSCRIPTION_EVENT_SERVER | ps.PA_SUBSCRIPTION_EVENT_CHANGE
 
 
 @pytest.fixture(autouse=True)
@@ -35,222 +39,6 @@ def no_native_audio(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ps, "list_devices", forbidden)
     monkeypatch.setattr(audio, "list_devices", forbidden)
     audio.invalidate_device_cache()
-
-
-class FakeFunction:
-    """Запоминает явные присваивания ABI и передаёт вызовы сценарию."""
-
-    def __init__(self, callback: Callable[..., Any]) -> None:
-        self.assigned: dict[str, object] = {}
-        self.callback = callback
-
-    def __setattr__(self, name: str, value: object) -> None:
-        if name in {"argtypes", "restype"}:
-            self.assigned[name] = value
-        object.__setattr__(self, name, value)
-
-    def __call__(self, *args: Any) -> Any:
-        return self.callback(*args)
-
-
-class FakeLibrary:
-    """Библиотека целиком на Python, без открытия CDLL."""
-
-    def __init__(self, call: Callable[..., Any] = lambda *_: 0) -> None:
-        self.functions: dict[str, FakeFunction] = {}
-        self.call = call
-
-    def __getattr__(self, name: str) -> FakeFunction:
-        if name not in self.functions:
-            self.functions[name] = FakeFunction(lambda *args: self.call(name, *args))
-        return self.functions[name]
-
-
-class Clock:
-    """Время движется только при poll и инъецированной паузе."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:
-        self.now = round(self.now + seconds, 9)
-
-
-@dataclass
-class Step:
-    """Один dispatch: состояние, PCM, колбэки и данные после их снимков."""
-
-    context: int | None = None
-    stream: int | None = None
-    error: int | None = None
-    fragments: list[bytes | int] = field(default_factory=list)
-    after: list[bytes | int] = field(default_factory=list)
-    events: list[tuple[int, int]] = field(default_factory=list)
-    moved: list[tuple[int, bytes | None]] = field(default_factory=list)
-    readable: int | None = None
-    action: Callable[[], None] | None = None
-
-
-class FakePulse(ps._PulseAsync):
-    """Настоящие тонкие обёртки и помощники работают поверх сценарного ABI."""
-
-    def __init__(self) -> None:
-        # lib у родителя аннотирована как CDLL; нативный объект здесь не создаётся.
-        self.lib = cast(Any, FakeLibrary(self.call))
-        self.mainloop: int | None = None
-        self.clock = Clock()
-        self.calls: list[tuple[str, tuple[Any, ...]]] = []
-        self.threads: set[int] = set()
-        self.steps: deque[Step] = deque()
-        self.fragments: deque[bytes | int] = deque()
-        self.context_state = ps.PA_CONTEXT_UNCONNECTED
-        self.stream_state = ps.PA_STREAM_UNCONNECTED
-        self.index = MIC.index
-        self.name: bytes | None = MIC.name.encode()
-        self.error = 0
-        self.readable: int | None = None
-        self.subscribe_callback: Any = None
-        self.moved_callback: Any = None
-        self.fail: dict[str, Any] = {}
-        self.op_state = ps.PA_OPERATION_DONE
-        self.latency = 1234
-        self.negative = 0
-        self.timeout_us = 0
-        self.hold_context = False
-        self.hold_stream = False
-        self.native_buffer: Any = None
-        self.buffer_attr: tuple[int, ...] | None = None
-        self.spec: tuple[int, ...] | None = None
-
-    def call(self, symbol: str, *args: Any) -> Any:
-        """Все вызовы, включая освобождение и колбэки, отмечают поток-владелец."""
-        name = symbol.removeprefix("pa_")
-        self.calls.append((name, args))
-        self.threads.add(threading.get_ident())
-        if name in self.fail:
-            result = self.fail[name]
-            if isinstance(result, Exception):
-                raise result
-            return result
-        if name == "mainloop_new":
-            return 0x100000001
-        if name == "mainloop_get_api":
-            return 0x100000002
-        if name == "context_new":
-            self.context_state = ps.PA_CONTEXT_CONNECTING
-            return 0x100000003
-        if name == "stream_new":
-            self.stream_state = ps.PA_STREAM_CREATING
-            spec = ctypes.cast(args[2], ctypes.POINTER(audio._PaSampleSpec)).contents
-            self.spec = (spec.format, spec.rate, spec.channels)
-            return 0x100000004
-        if name in {"context_subscribe", "stream_flush"}:
-            return 0x100000005
-        if name == "context_set_subscribe_callback":
-            self.subscribe_callback = args[1]
-        elif name == "stream_set_moved_callback":
-            self.moved_callback = args[1]
-        elif name == "stream_connect_record":
-            attr = ctypes.cast(args[2], ctypes.POINTER(audio._PaBufferAttr)).contents
-            self.buffer_attr = (
-                attr.maxlength,
-                attr.tlength,
-                attr.prebuf,
-                attr.minreq,
-                attr.fragsize,
-            )
-        elif name == "mainloop_prepare":
-            self.timeout_us = args[1]
-        elif name == "mainloop_poll":
-            self.clock.sleep(self.timeout_us / 1_000_000)
-        elif name == "mainloop_dispatch":
-            self.dispatch()
-        elif name == "context_get_state":
-            return self.context_state
-        elif name == "stream_get_state":
-            return self.stream_state
-        elif name == "context_errno":
-            return self.error
-        elif name == "stream_get_device_index":
-            return self.index
-        elif name == "stream_get_device_name":
-            return self.name
-        elif name == "stream_readable_size":
-            return (
-                self.readable
-                if self.readable is not None
-                else sum(len(part) if isinstance(part, bytes) else part for part in self.fragments)
-            )
-        elif name == "stream_peek":
-            part = self.fragments[0] if self.fragments else 0
-            if isinstance(part, bytes):
-                self.native_buffer = ctypes.create_string_buffer(part)
-                args[1]._obj.value = ctypes.addressof(self.native_buffer)
-                args[2]._obj.value = len(part)
-            else:
-                args[1]._obj.value = None
-                args[2]._obj.value = part
-        elif name == "stream_drop":
-            self.fragments.popleft()
-        elif name == "operation_get_state":
-            return self.op_state
-        elif name == "operation_cancel":
-            self.op_state = ps.PA_OPERATION_CANCELLED
-        elif name == "stream_get_latency":
-            args[1]._obj.value = self.latency
-            args[2]._obj.value = self.negative
-        return 0
-
-    def dispatch(self) -> None:
-        """Порядок внутри шага позволяет проверить точку обрезки в колбэке."""
-        if self.context_state == ps.PA_CONTEXT_CONNECTING and not self.hold_context:
-            self.context_state = ps.PA_CONTEXT_READY
-        if self.stream_state == ps.PA_STREAM_CREATING and not self.hold_stream:
-            self.stream_state = ps.PA_STREAM_READY
-        step = self.steps.popleft() if self.steps else Step()
-        if step.context is not None:
-            self.context_state = step.context
-        if step.stream is not None:
-            self.stream_state = step.stream
-        if step.error is not None:
-            self.error = step.error
-        self.readable = step.readable
-        self.fragments.extend(step.fragments)
-        for event, idx in step.events:
-            assert self.subscribe_callback is not None
-            self.subscribe_callback(0x100000003, event, idx, None)
-        for idx, name in step.moved:
-            self.index, self.name = idx, name
-            assert self.moved_callback is not None
-            self.moved_callback(0x100000004, None)
-        self.fragments.extend(step.after)
-        if step.action is not None:
-            step.action()
-
-    def names(self) -> list[str]:
-        return [name for name, _ in self.calls]
-
-
-def source_for(
-    pulse: FakePulse, *, devices: Callable[[], list[audio.AudioDevice]] | None = None
-) -> ps.PulseStreamSource:
-    """Все пути выбора устройства инъецированы, включая режим умолчания."""
-    return ps.PulseStreamSource(
-        pulse_factory=lambda: pulse,
-        devices=devices or (lambda: [MIC]),
-        default=lambda *_args, **_kwargs: MIC,
-        clock=pulse.clock,
-        sleep=pulse.clock.sleep,
-    )
-
-
-def opened(pulse: FakePulse, *, default: bool = False) -> ps.PulseStreamSource:
-    source = source_for(pulse)
-    source.open(None if default else MIC.name)
-    return source
 
 
 def test_abi(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1151,3 +939,287 @@ def test_probe_default_removed_classifies_new_default(
         assert "classify_change: kind=device-lost label=None" in output
     else:
         assert "classify_change: kind=switched label='Другой микрофон'" in output
+
+
+SOURCE_CHANGE = ps.PA_SUBSCRIPTION_EVENT_SOURCE | ps.PA_SUBSCRIPTION_EVENT_CHANGE
+SOURCE_NEW = ps.PA_SUBSCRIPTION_EVENT_SOURCE | ps.PA_SUBSCRIPTION_EVENT_NEW
+
+
+def test_own_remove_survives_source_change_storm() -> None:
+    """P2-1: шторм NEW/CHANGE после нашего REMOVE не вытесняет его из очереди."""
+    pulse = FakePulse()
+    devices = Mock(return_value=[MIC])
+    source = source_for(pulse, devices=devices)
+    source.open(MIC.name)
+    pulse.steps.append(Step(events=[(REMOVE, MIC.index)] + [(SOURCE_CHANGE, OTHER.index)] * 64))
+    pulse.iterate(ps.POLL_US)
+    # В очереди только сам REMOVE: NEW/CHANGE источников туда не попадают.
+    assert len(source._events) == 1 and not source._overflow
+    assert source.read_chunk() is None
+    assert source.device_change is not None and source.device_change.reason == audio.REASON_REMOVED
+    assert devices.call_count == 1
+    source.close()
+
+
+def test_foreign_storm_is_not_a_change() -> None:
+    """Шторм чужих событий (включая переполнение очереди) не даёт ложной смены."""
+    pulse = FakePulse()
+    devices = Mock(return_value=[MIC, OTHER])
+    source = source_for(pulse, devices=devices)
+    source.open(MIC.name)
+    pulse.steps.append(
+        Step(
+            fragments=[b"a" * 640],
+            events=[(SOURCE_CHANGE, OTHER.index)] * 200
+            + [(SOURCE_NEW, OTHER.index)] * 200
+            + [(SERVER, 0)] * 200
+            + [(REMOVE, OTHER.index)] * 200,
+        )
+    )
+    assert source.read_chunk() == b"a" * 640
+    assert source.device_change is None
+    assert not source._overflow and not source._events
+    # Переполнение проверено ровно одной сверкой списка; наше имя в нём есть.
+    assert devices.call_count == 2
+    pulse.steps.append(Step(fragments=[b"b" * 640]))
+    assert source.read_chunk() == b"b" * 640
+    assert devices.call_count == 2
+    source.close()
+
+
+@pytest.mark.parametrize("fresh", ["absent", "present", "error"])
+def test_overflow_checks_device_list(fresh: str) -> None:
+    """Наш REMOVE потерян при переполнении: смену находит сверка по списку."""
+    pulse = FakePulse()
+    devices = Mock(return_value=[MIC])
+    source = source_for(pulse, devices=devices)
+    source.open(MIC.name)
+    if fresh == "error":
+        devices.side_effect = audio.AudioError(audio.ERROR_FAILED, "нет списка")
+    else:
+        devices.return_value = [OTHER] if fresh == "absent" else [MIC, OTHER]
+    pulse.steps.append(
+        Step(
+            fragments=[b"a" * 640],
+            events=[(REMOVE, OTHER.index)] * ps.EVENT_QUEUE_LIMIT + [(REMOVE, MIC.index)],
+            after=[b"Z" * 640],
+        )
+    )
+    first = source.read_chunk()
+    if fresh == "absent":
+        # Точка обрезки — момент переполнения: звук после неё не выдаётся.
+        assert first == b"a" * 640
+        assert source.read_chunk() is None
+        change = source.device_change
+        assert change is not None and change.reason == audio.REASON_REMOVED
+        assert change.fresh == audio.FreshDevices((OTHER,), None)
+    else:
+        # Сбой списка при живом потоке запись не обрывает.
+        assert first == b"a" * 640
+        assert source.device_change is None
+        assert source.read_chunk() == b"Z" * 640
+    assert devices.call_count == 2
+    source.close()
+
+
+def test_overflow_detects_lost_moved() -> None:
+    """moved, не поместившийся в очередь, находится сверкой устройства потока."""
+    pulse = FakePulse()
+    devices = Mock(return_value=[MIC, OTHER])
+    source = source_for(pulse, devices=devices)
+    source.open(MIC.name)
+    pulse.steps.append(
+        Step(
+            events=[(REMOVE, 99)] * ps.EVENT_QUEUE_LIMIT,
+            moved=[(OTHER.index, OTHER.name.encode())],
+        )
+    )
+    assert source.read_chunk() is None
+    change = source.device_change
+    assert change is not None and change.reason == audio.REASON_MOVED
+    assert change.moved_to_name == OTHER.name
+    # Смену нашли по самому потоку; список не понадобился.
+    assert devices.call_count == 1
+    source.close()
+
+
+def test_server_change_is_a_flag_not_a_queue_entry() -> None:
+    """SERVER CHANGE не занимает очередь и всё равно отмечается в смене."""
+    pulse = FakePulse()
+    source = opened(pulse, default=True)
+    pulse.steps.append(Step(events=[(SERVER, 0)] * 500 + [(REMOVE, MIC.index)]))
+    pulse.iterate(ps.POLL_US)
+    assert len(source._events) == 1 and not source._overflow
+    before = pulse.clock.now
+    assert source.read_chunk() is None
+    # Умолчание уже сменилось: окно ожидания SERVER CHANGE не открывается.
+    assert pulse.clock.now - before < ps.SERVER_WAIT_S
+    change = source.device_change
+    assert change is not None and change.reason == audio.REASON_REMOVED and change.server_changed
+    source.close()
+
+
+def test_killed_default_reads_devices_once_within_budget() -> None:
+    """P3: на пути KILLED без REMOVE список читается один раз, итог ≤ 1 с (T-g)."""
+    pulse = FakePulse()
+    other_default = audio.AudioDevice(9, "mic.next", "Новый микрофон", False)
+    lists = 0
+
+    def devices() -> list[audio.AudioDevice]:
+        nonlocal lists
+        lists += 1
+        if lists > 1:
+            pulse.clock.sleep(0.600)
+            return [other_default]
+        return [MIC]
+
+    def default(found: list[audio.AudioDevice], **_kwargs: object) -> audio.AudioDevice:
+        if lists > 1:
+            pulse.clock.sleep(0.050)
+            return other_default
+        return MIC
+
+    source = ps.PulseStreamSource(
+        pulse_factory=lambda: pulse,
+        devices=devices,
+        default=default,
+        clock=pulse.clock,
+        sleep=pulse.clock.sleep,
+    )
+    marks: list[float] = []
+    changed = Mock(side_effect=lambda *_: marks.append(pulse.clock.now))
+    capture_lists = Mock(side_effect=AssertionError("повторный запрос списка"))
+    capture_default = Mock(side_effect=AssertionError("повторный запрос умолчания"))
+    pulse.steps.extend(
+        [
+            Step(),
+            Step(),
+            Step(
+                stream=ps.PA_STREAM_FAILED,
+                error=ps.PA_ERR_KILLED,
+                action=lambda: marks.append(pulse.clock.now),
+            ),
+        ]
+    )
+    capture = audio.AudioCapture(
+        source=source,
+        on_samples=Mock(return_value=True),
+        on_event=Mock(),
+        on_error=Mock(),
+        on_device_change=changed,
+        list_devices_fn=capture_lists,
+        default_device_fn=capture_default,
+        clock=pulse.clock,
+        sleep=pulse.clock.sleep,
+    )
+    capture.start("killed", None, limit_s=30)
+    thread = capture._thread
+    assert thread is not None
+    thread.join(5)
+    assert not thread.is_alive()
+    changed.assert_called_once_with("killed", audio.KIND_SWITCHED, other_default.label)
+    capture_lists.assert_not_called()
+    capture_default.assert_not_called()
+    assert lists == 2
+    killed_at, reported_at = marks
+    assert reported_at - killed_at <= 1.0
+
+
+def test_killed_wait_skips_list_after_stop() -> None:
+    """Запись остановлена во время ожидания REMOVE: список не читается."""
+    pulse = FakePulse()
+    devices = Mock(return_value=[MIC])
+    running = threading.Event()
+    running.set()
+    source = source_for(pulse, devices=devices)
+    source.open(MIC.name, running=running)
+    pulse.steps.extend(
+        [
+            Step(stream=ps.PA_STREAM_FAILED, error=ps.PA_ERR_KILLED),
+            Step(action=running.clear),
+        ]
+    )
+    assert source.read_chunk() is None
+    assert source.device_change is None
+    assert devices.call_count == 1
+    source.close()
+
+
+@pytest.mark.parametrize("exact", [True, False])
+def test_fallback_index_only_when_exact(exact: bool) -> None:
+    """P3: номер узла из pw-dump не годится для сверки REMOVE; ищем по имени."""
+    mic = audio.AudioDevice(MIC.index, MIC.name, MIC.description, False, index_exact=exact)
+    pulse = FakePulse()
+    pulse.index = ps.PA_INVALID_INDEX
+    devices = Mock(return_value=[mic])
+    source = source_for(pulse, devices=devices)
+    source.open(mic.name)
+    assert source._index == (MIC.index if exact else ps.PA_INVALID_INDEX)
+    # При неточном индексе чужой REMOVE с тем же номером узла запись не обрывает.
+    pulse.steps.append(Step(fragments=[b"a" * 640], events=[(REMOVE, MIC.index)]))
+    assert source.read_chunk() == b"a" * 640
+    if exact:
+        assert source.read_chunk() is None
+        assert source.device_change is not None
+        assert devices.call_count == 1
+        source.close()
+        return
+    assert source.device_change is None
+    assert source.read_chunk() == b""
+    # Настоящая пропажа при неизвестном индексе находится по имени в списке.
+    devices.return_value = [OTHER]
+    pulse.steps.append(Step(events=[(REMOVE, 12345)]))
+    assert source.read_chunk() is None
+    assert source.device_change is not None
+    assert source.device_change.reason == audio.REASON_REMOVED
+    source.close()
+
+
+def test_missing_symbol_is_audio_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P3: в libpulse нет символа — понятная ошибка записи, а не AttributeError."""
+    monkeypatch.setattr(ctypes, "CDLL", Mock(return_value=Mock(spec=[])))
+    with pytest.raises(audio.AudioError, match="Звуковая подсистема недоступна") as exc:
+        ps._PulseAsync()
+    assert exc.value.code == audio.ERROR_FAILED
+    assert isinstance(exc.value.__cause__, AttributeError)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_change_reported_when_stop_races_remove(cancel: bool) -> None:
+    """P3: REMOVE и отпускание клавиши в одной итерации — смена всё равно сообщается."""
+    pulse = FakePulse()
+    source = source_for(pulse)
+    changed, lists = Mock(), Mock(return_value=[MIC, OTHER])
+    capture = audio.AudioCapture(
+        source=source,
+        on_samples=Mock(return_value=True),
+        on_event=Mock(),
+        on_error=Mock(),
+        on_device_change=changed,
+        list_devices_fn=lists,
+        default_device_fn=lambda *_a, **_kw: OTHER,
+        clock=pulse.clock,
+        sleep=pulse.clock.sleep,
+    )
+    pulse.steps.extend(
+        [
+            Step(),
+            Step(),
+            Step(
+                fragments=[b"a" * 640],
+                events=[(REMOVE, MIC.index)],
+                action=lambda: capture.request_stop(cancel=cancel),
+            ),
+        ]
+    )
+    capture.start("race", MIC.name, limit_s=30)
+    thread = capture._thread
+    assert thread is not None
+    thread.join(5)
+    assert not thread.is_alive()
+    if cancel:
+        changed.assert_not_called()
+        lists.assert_not_called()
+    else:
+        changed.assert_called_once_with("race", audio.KIND_DEVICE_LOST, None)
+    assert not source.is_open

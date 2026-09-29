@@ -7,7 +7,6 @@ import json
 import logging
 import struct
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -71,11 +70,9 @@ from astra_voice.worker.audio import (
 from astra_voice.worker.ipc import FrameError, decode, encode
 from astra_voice.worker.state import LIMIT_S_DEFAULT, Message, State, WorkerState
 
-# tests не пакет; подключаем общие фейки так же, как test_worker_state.py.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from test_pulse_stream import MIC, FakePulse  # noqa: E402
-
-from fakes import FakeCancelToken, FakeEngine  # noqa: E402
+# tests не пакет: каталог tests/ уже в sys.path через корневой conftest.py.
+from fakes import FakeCancelToken, FakeEngine
+from helpers.pulse_fakes import MIC, FakePulse
 
 pytestmark = pytest.mark.unit
 TIMEOUT = 5.0
@@ -352,6 +349,23 @@ def test_list_devices_falls_back_to_pipewire_without_pactl() -> None:
         AudioDevice(58, "alsa_output.pci.stereo.monitor", "Звук системы", True),
     ]
     assert devices[2].label == "Звук системы (звук системы)"
+    # object.serial совпадает с индексом pipewire-pulse, по нему можно сверять события.
+    assert [device.index_exact for device in devices] == [True, True, True]
+
+
+def test_pipewire_node_id_is_not_an_exact_index() -> None:
+    """Без object.serial номер узла — другой счётчик: сверять по нему REMOVE нельзя."""
+    payload = json.dumps(
+        [
+            {
+                "id": 41,
+                "info": {"props": {"media.class": "Audio/Source", "node.name": "mic.node"}},
+            },
+            {"info": {"props": {"media.class": "Audio/Source", "node.name": "mic.none"}}},
+        ]
+    )
+    devices = list_devices(run=_pipewire_only(payload))
+    assert [(device.index, device.index_exact) for device in devices] == [(41, False), (1, False)]
 
 
 def test_list_devices_without_both_utilities_keeps_the_old_error() -> None:

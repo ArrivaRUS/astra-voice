@@ -745,6 +745,20 @@ def test_record_limit_stops_and_discards_extra(
     assert worker.buffers == {}
 
 
+@pytest.mark.parametrize(
+    ("kind", "stop_kwargs"), [("record.stop", {}), ("record.cancel", {"cancel": True})]
+)
+def test_only_cancel_marks_capture_stop_as_cancel(
+    factory: Factory, kind: str, stop_kwargs: dict[str, bool]
+) -> None:
+    """S5-A5: после отмены захват не классифицирует смену — событие всё равно отброшено."""
+    capture = Mock(spec=AudioCapture)
+    worker, _engine, _events = factory(capture=capture)
+    assert command(worker, "record.start") == []
+    command(worker, kind)
+    capture.request_stop.assert_called_once_with(**stop_kwargs)
+
+
 def test_device_change_stops_trims_and_recognizes_remaining_pcm(factory: Factory) -> None:
     capture = Mock(spec=AudioCapture)
     worker, engine, events = factory(capture=capture)

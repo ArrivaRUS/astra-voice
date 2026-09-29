@@ -421,10 +421,18 @@ class WorkerState:
             self._update_state()
             self._emit({**error(code, message), "utterance_id": utterance_id})
 
-    def _stop_capture(self, deferred: list[Callable[[], None]] | None = None) -> None:
-        """Под блокировкой только просит остановку; callback-и не ждут свой поток."""
+    def _stop_capture(
+        self, deferred: list[Callable[[], None]] | None = None, *, cancel: bool = False
+    ) -> None:
+        """Под блокировкой только просит остановку; callback-и не ждут свой поток.
+
+        ``cancel`` — записанное больше не нужно: захват не тратит время на смену устройства.
+        """
         if self._capture is not None:
-            self._capture.request_stop()
+            if cancel:
+                self._capture.request_stop(cancel=True)
+            else:
+                self._capture.request_stop()
             if deferred is not None:
                 deferred.append(self._capture.stop)
 
@@ -720,7 +728,7 @@ class WorkerState:
                 if job is self._pending:
                     self._pending = None
         if self._recording == uid:
-            self._stop_capture(deferred)
+            self._stop_capture(deferred, cancel=True)
             self._recording = None
         self.buffers.pop(uid, None)
         self._stopped.pop(uid, None)
@@ -738,7 +746,7 @@ class WorkerState:
                 logger.warning("Ошибка выгрузки движка.")
 
     def _unload(self, deferred: list[Callable[[], None]] | None = None) -> None:
-        self._stop_capture(deferred)
+        self._stop_capture(deferred, cancel=True)
         running = self._active is not None
         for job in (self._active, self._pending):
             if job is not None:
