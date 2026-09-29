@@ -142,6 +142,15 @@ def local_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[LocalServer]:
                 status = int(self.path.rsplit("/", 1)[1])
                 body = gzip.compress(b"x" * (1024 * 1024))
                 headers = {"Content-Encoding": "gzip", "Location": "/ok"}
+            if self.path == "/huge-length":
+                # Content-Length длиннее предела int() для строк (4300 цифр).
+                self.close_connection = True
+                self.wfile.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: "
+                    + b"9" * 5000
+                    + b"\r\nConnection: close\r\n\r\nhello"
+                )
+                return
             try:
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(body)))
@@ -451,6 +460,20 @@ def test_truncated_body_is_short_read_in_any_urllib3(
     assert b"".join(received) == expected[: len(b"".join(received))]
     assert len(b"".join(received)) <= len(expected) // 2
     assert not response._watchdog.is_alive()
+
+
+def test_huge_content_length_is_network_error_not_value_error(
+    client: HttpClient, local_server: LocalServer
+) -> None:
+    """5000 цифр в Content-Length: int() падает на пределе 4300 цифр. Наружу — только
+    NetworkError (перебор зеркал и backoff проверки это понимают), не ValueError."""
+    try:
+        with client.get_stream(
+            local_server.url + "/huge-length", deadline_s=2, cancel=threading.Event()
+        ) as response:
+            b"".join(response.iter_chunks(16))
+    except NetworkError as error:
+        assert error.code in ("short-read", "host-unreachable")
 
 
 def test_limit_before_truncation_is_not_short_read(

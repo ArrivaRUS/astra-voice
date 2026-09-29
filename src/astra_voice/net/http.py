@@ -269,13 +269,18 @@ def _declared_length(status: int, headers: Mapping[str, str]) -> int | None:
 
     Transfer-Encoding главнее Content-Length (RFC 9112 §6.3); у 1xx/204/304 тела нет.
     Несколько значений requests склеивает через запятую — такое не сверяем.
+    Больше 18 цифр — не сверяем тоже: таких файлов нет, а int() на строке длиннее
+    4300 цифр бросает ValueError, который прошёл бы мимо NetworkError.
     """
     if status < 200 or status in (204, 304) or "Transfer-Encoding" in headers:
         return None
     value = headers.get("Content-Length", "").strip()
-    if re.fullmatch(r"[0-9]+", value) is None:
+    if len(value) > 18 or re.fullmatch(r"[0-9]+", value) is None:
         return None
-    return int(value)
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _shutdown_socket(sock: socket.socket | None) -> None:

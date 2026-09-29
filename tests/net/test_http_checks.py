@@ -499,7 +499,12 @@ def test_bounded_connection_without_connect_timeout(server: FaultServer, timeout
 
 @pytest.fixture
 def blackhole(monkeypatch: pytest.MonkeyPatch) -> Iterator[int]:
-    """Порт на loopback, где connect висит: очередь accept переполнена, SYN отбрасываются."""
+    """Порт на loopback, где connect висит: очередь accept переполнена, SYN отбрасываются.
+
+    Рассчитано на поведение Linux при net.ipv4.tcp_abort_on_overflow=0 (по умолчанию):
+    при переполненной очереди SYN молча отбрасывается. При 1 ядро ответит RST, и
+    connect упадёт сразу, а не по таймауту — тогда тесты с этой фикстурой не годятся.
+    """
     listener = socket.socket()
     fillers: list[socket.socket] = []
     try:
