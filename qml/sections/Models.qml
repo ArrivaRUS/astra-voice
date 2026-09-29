@@ -344,6 +344,8 @@ Item {
                 iconName: "down"
                 // Пока ничего не отмечено или выбор не помещается — качать нечего (§5.6).
                 enabled: root.hasSelection && root.settings.selectionFits
+                // Офлайн-режим скрывает «Скачать»; установка из файла остаётся (PRD F14.2).
+                visible: !(root.settings && root.settings.offline)
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: { if (root.settings) root.settings.startSelectedDownloads(); }
             }

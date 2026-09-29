@@ -1971,3 +1971,62 @@ def test_gate_refusal_blocks_card_actions(
     downloads.download()
     assert started == [GIGAAM.id]
     assert card(downloads, GIGAAM.id)["state"] == state
+
+
+def test_user_offline_hides_download_and_cancels_network_queue() -> None:
+    """Офлайн-режим: карточки без модели — offline-user, идущая загрузка отменяется как «Отмена»."""
+    port = FakeManagedPort()
+    downloads, started = manual_queue(port)
+    spy = QSignalSpy(downloads.modelsChanged)
+    try:
+        downloads.toggleModel(GIGAAM.id)
+        downloads.toggleModel(TONE.id)
+        downloads.startSelectedDownloads()
+        assert started == [GIGAAM.id]
+        port.refusal = lambda: "offline"  # type: ignore[method-assign]
+        downloads.network_changed()
+        assert len(spy) >= 1
+        downloads._model_finished("cancelled", "")
+        downloads._model_thread_finished()
+        assert port.discarded == [GIGAAM.id]
+        assert started == [GIGAAM.id], "очередь после офлайна не продолжается"
+        assert downloads.downloadState == "idle"
+        for model_id in (GIGAAM.id, TONE.id):
+            row = card(downloads, model_id)
+            assert row["state"] == "offline-user"
+            assert row["message"] == ""
+        assert downloads._selected_new() == ()
+        port.refusal = lambda: ""  # type: ignore[method-assign]
+        downloads.network_changed()
+        assert card(downloads, GIGAAM.id)["state"] == "available"
+    finally:
+        downloads.shutdown()
+
+
+def test_user_offline_keeps_installed_cards_and_file_install() -> None:
+    port = FakeManagedPort()
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    downloads, started = manual_queue(port)
+    try:
+        port.refusal = lambda: "offline"  # type: ignore[method-assign]
+        assert card(downloads, GIGAAM.id)["state"] == "installed"
+        assert card(downloads, TONE.id)["state"] == "offline-user"
+        # Установка из файла офлайн не прерывает.
+        downloads._begin_queue((TONE,), Path("/нет/такой/папки"))
+        assert started == [TONE.id]
+        downloads.network_changed()
+        assert downloads._queue_running
+        assert downloads.downloadState == "downloading"
+    finally:
+        downloads.shutdown()
+
+
+def test_admin_refusal_does_not_mark_cards_proactively() -> None:
+    """Проактивно скрываем «Скачать» только в офлайн-режиме; политика — прежним путём."""
+    port = FakeManagedPort()
+    port.refusal = lambda: "admin"  # type: ignore[method-assign]
+    downloads, _ = manual_queue(port)
+    try:
+        assert card(downloads, GIGAAM.id)["state"] == "available"
+    finally:
+        downloads.shutdown()

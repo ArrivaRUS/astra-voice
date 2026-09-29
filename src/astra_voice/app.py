@@ -1079,6 +1079,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         QQmlEngine.setObjectOwnership(settings_bridge, QQmlEngine.CppOwnership)
         _set_context_property(shell, "settingsBridge", settings_bridge)
+        # Офлайн-режим скрывает «Скачать» и отменяет загрузку из сети (PRD F14.2).
+        settings_bridge.offlineChanged.connect(downloads.network_changed)
         root = _root_window(shell)
         if root is not None:
             capture.attach_window(root)
