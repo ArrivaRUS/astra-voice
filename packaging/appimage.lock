@@ -105,10 +105,34 @@
 # Исходники поставляемых компонентов вне Debian (R3.6), скачано 29.09 с «да» заказчика:
 # PyQt5 5.15.11 sdist — sha256 и размер совпали с digests PyPI JSON API (pypi.org/pypi/PyQt5/5.15.11/json);
 # type2-runtime — коммит dd6cebed тега 20251108 (GitHub API git/ref/tags/20251108), архив GitHub по
-# коммиту; sha256 снят при скачивании (у GitHub нет опубликованного хэша архива). Исходники Qt 5.15.19
-# и libfuse 3.15.0 (статически в runtime) ещё не получены — см. arch/appimage.md R3.6.
+# коммиту; sha256 снят при скачивании (у GitHub нет опубликованного хэша архива).
 # source: {"id":"pyqt5-sdist","file":"PyQt5-5.15.11.tar.gz","size":3216775,"sha256":"fda45743ebb4a27b4b1a51c6d8ef455c4c1b5d610c90d2934c7802b5c1557c52","url":"https://files.pythonhosted.org/packages/0e/07/c9ed0bd428df6f87183fca565a79fee19fa7c88c7f00a7f011ab4379e77a/PyQt5-5.15.11.tar.gz"}
 # source: {"id":"type2-runtime-src","file":"dd6cebedcbddde9c82f89b011e8e1d40b6e43868.tar.gz","size":31069,"sha256":"f5fec23be76e50e2445ed2d018bac49b367490fc483c62c4637e99ec705d27ba","url":"https://github.com/AppImage/type2-runtime/archive/dd6cebedcbddde9c82f89b011e8e1d40b6e43868.tar.gz"}
+#
+# Qt 5.15.19 — только модули, которые уходят в образ (qtbase, qtdeclarative, qtquickcontrols2, qtsvg).
+# download.qt.io с машины недоступен; источник — официальные зеркала github.com/qt/<модуль>, тег
+# v5.15.19-lts-lgpl (аннотированный, без подписи; tagger 2026-01-09), архив GitHub по коммиту тега;
+# MODULE_VERSION = 5.15.19 в .qmake.conf каждого архива. Колесо PyQt5-Qt5 5.15.19 собирает Riverbank —
+# совпадение версии не доказывает тождество сборки (R3.6, открытый вопрос рецепта).
+# qtbase: тег-объект ce39a16355f577db7d6d2cca9bd9548b3dc7d91a → коммит c68297f66533200c9ff626b056d096c78b4b94db
+# qtdeclarative: тег-объект dd8c4221ff5b98715ae1f5787f5f209cee025020 → коммит dbb2e3b6bc9b51f76f241c7d108c466d78ef5695
+# qtquickcontrols2: тег-объект dec05f7839cd3cb2e49b3e56c081619acf2c0a93 → коммит 00c621488d674eccbb5e4d628a0489f6e70516bc
+# qtsvg: тег-объект 2898e5f4f0dd9af0c76dd45faa0f52445bf7e985 → коммит 62c4a8da3114174ea5b2c4ea46d2ab848066d534
+# source: {"id":"qtbase-5.15.19","file":"c68297f66533200c9ff626b056d096c78b4b94db.tar.gz","size":69988792,"sha256":"fc47819ccda5ebdf337272ef433c9522af09f1f3e4b6a6564506b59b83c52e0a","url":"https://github.com/qt/qtbase/archive/c68297f66533200c9ff626b056d096c78b4b94db.tar.gz"}
+# source: {"id":"qtdeclarative-5.15.19","file":"dbb2e3b6bc9b51f76f241c7d108c466d78ef5695.tar.gz","size":24427412,"sha256":"71988711dccd0d2ef1c0a2cb51e1a89c6f2663675d0fd4f3777c2c5b56927927","url":"https://github.com/qt/qtdeclarative/archive/dbb2e3b6bc9b51f76f241c7d108c466d78ef5695.tar.gz"}
+# source: {"id":"qtquickcontrols2-5.15.19","file":"00c621488d674eccbb5e4d628a0489f6e70516bc.tar.gz","size":9257198,"sha256":"3dc099d8625d741de8a6937d1280be7cb9020c5e9559101b4bf75c16eb906b49","url":"https://github.com/qt/qtquickcontrols2/archive/00c621488d674eccbb5e4d628a0489f6e70516bc.tar.gz"}
+# source: {"id":"qtsvg-5.15.19","file":"62c4a8da3114174ea5b2c4ea46d2ab848066d534.tar.gz","size":2780106,"sha256":"2e3ce2648dc382e304b0fa9de24ba9d8248b597de9779f2f145e68f25d82c0d0","url":"https://github.com/qt/qtsvg/archive/62c4a8da3114174ea5b2c4ea46d2ab848066d534.tar.gz"}
+#
+# libfuse 3.15.0 — статически в runtime (LGPL-2.1), github.com/libfuse/libfuse, релиз fuse-3.15.0.
+# sha256 архива совпал с пином scripts/common/install-dependencies.sh type2-runtime (коммит dd6cebed).
+# Подпись .asc: издатель ED31791B2C5C1613AF388B8AD113FCAC3C4E599F (Nikolaus Rath); открытого ключа в
+# разрешённых источниках нет — подпись ещё НЕ проверена (нужен ключ, см. отчёт 29.09).
+# source: {"id":"libfuse-3.15.0","file":"fuse-3.15.0.tar.xz","size":4589124,"sha256":"70589cfd5e1cff7ccd6ac91c86c01be340b227285c5e200baa284e401eea2ca0","url":"https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz"}
+# source: {"id":"libfuse-3.15.0-sig","file":"fuse-3.15.0.tar.xz.asc","size":1012,"sha256":"087dfd45c7a1768c5d5cf7068eefd3cacc302f4ff8db5a6828668bc08725339f","url":"https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz.asc"}
+# Прочее, вшитое в runtime статически (сборка в Alpine 3.21): squashfuse 0.5.2 (BSD-2), musl, zstd,
+# zlib, mimalloc (MIT/BSD/zlib) — обязательства по исходникам нет, нужны тексты лицензий. РИСК R3:
+# версии пакетов Alpine в скриптах type2-runtime НЕ закреплены (apk add без версий) — точный состав
+# musl/zstd/zlib/mimalloc внутри закреплённого runtime-x86_64 неизвестен.
 #
 # Колёса PyPI (кэш: ~/.cache/astra-voice-dev/appimage/wheels).
 # numpy 1.24.2 — та же версия, что python3-numpy на ALSE 1.8 (с ней уже живёт .deb + ORT 1.24.4).
