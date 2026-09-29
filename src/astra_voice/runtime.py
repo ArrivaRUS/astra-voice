@@ -1274,7 +1274,7 @@ class DictationRuntime(QObject):
             notify.notify_hotkey_regrabbed(self.settings.hotkey)
         log.info("Горячая клавиша снова захвачена после смены раскладки: %s", self.settings.hotkey)
 
-    def _schedule_lost_notice(self) -> None:
+    def _schedule_lost_notice(self, delay_ms: int = HOTKEY_LOST_NOTICE_DELAY_MS) -> None:
         """Однократный таймер GUI-потока перед уведомлением о потере захвата."""
         if self._closed or self._lost_notice_timer is not None:
             return
@@ -1282,7 +1282,7 @@ class DictationRuntime(QObject):
         self._lost_notice_timer = timer
         timer.setSingleShot(True)
         timer.timeout.connect(self._announce_hotkey_lost)
-        timer.start(HOTKEY_LOST_NOTICE_DELAY_MS)
+        timer.start(delay_ms)
 
     def _cancel_lost_notice(self) -> None:
         timer, self._lost_notice_timer = self._lost_notice_timer, None
@@ -1291,13 +1291,20 @@ class DictationRuntime(QObject):
             self._cleanup("удаление таймера уведомления о хоткее", timer.deleteLater)
 
     def _announce_hotkey_lost(self) -> None:
-        """Захват не вернулся за 5 с: «потеряна», но не чаще раза в минуту."""
+        """Захват не вернулся за 5 с: «потеряна», но не чаще раза в минуту.
+
+        Подавленное лимитом объявление откладывается на остаток минуты: долгую
+        потерю всё равно объявят. Возврат захвата, shutdown и apply_hotkey
+        гасят отложенный таймер через _stop_regrab.
+        """
         self._cancel_lost_notice()
         if self._closed or self._hotkey_lost_at is None:
             return
         now = monotonic()
         last = self._hotkey_lost_notified_at
         if last is not None and now - last < HOTKEY_LOST_NOTIFY_INTERVAL_S:
+            remaining_s = HOTKEY_LOST_NOTIFY_INTERVAL_S - (now - last)
+            self._schedule_lost_notice(max(1, math.ceil(remaining_s * 1000)))
             return
         self._hotkey_lost_notified_at = now
         self._hotkey_lost_announced = True
