@@ -922,3 +922,33 @@ T-163…T-174 перенести из arch/appimage.md в test-plan; текст�
   `debian/copyright` — `silero_vad.onnx`, `smoke-ru.wav`; AppImage `build.sh` — класть NOTICE/PRIVACY в бандл;
   `appimage.lock` — проверить отсутствие protobuf/flatbuffers/sympy/packaging (объявлены onnxruntime).
 - Мини-Ц2 S5-A5 (20 диктовок, ~5 мин клавиатура/буфер/микрофон заказчика) — ждёт удобного времени от заказчика.
+
+## 2026-09-29 ~21:30 — ПЕРЕД СЖАТИЕМ: состояние вечера
+**У заказчика:** `.deb` 0.1.1~dev1 (main `5a7fb53`) — проверено вживую: Enter в форме Cowork ок (урок 027), «Сеть и обновления» ок.
+Программа запущена в обычном режиме (бэкенд `simple`).
+**Слито сегодня в main (до `f901f7d`):** #13–#20: M7 бэкенд+UI, трей (урок 026), S5-A5 A/B/D, проба захвата (урок 027),
+загрузчик на threading (уроки 025/026) + short-read на urllib3 2.x. Уроки 026, 027 записаны.
+**Решения заказчика 29.09 (в `decisions/log.md`):** AppImage 0.2 — на базе Debian 12 с OpenSSL 3 (лицензии, заключение
+legal-analyst); правообладатель — ГК «Астра» (NOTICE, debian/copyright); вопросы юристу ГК — юрлицо и передача
+прав, ПП № 313, код с ИИ.
+
+**Ветки и агенты в работе:**
+- `wip/m9a-about` (`52921d6`, wt-about) — раздел «О программе»: ревью APPROVE, макет PASS; черновой **PR #21**, CI run
+  36569458279; на короткой сверке `52921d6`. → слить, затем **`wip/m9a-docs`** (`28fc513`, wt-docs, NOTICE/PRIVACY/
+  INSTALL-ADMIN, ревью PASS) — PR и слить ПОСЛЕ About (документы ссылаются на «О программе»).
+- `wip/hotkey-regrab` (wt-hotkey, Claude developer) — фикс потери хоткея при MappingNotify (`_refresh_mapping` без
+  ungrab при неизменной карте, grab-before-ungrab; WARNING+NOKEY+перезахват в runtime), журнал нажатий/record.start/
+  воркера, `dictate50.sh` ранняя диагностика. → ревью → PR/CI → сборка dev2 → повторная мини-проба с заказчиком
+  (10 диктовок `stream`, между 5 и 6 — физический Shift; если отказ без Shift — тот же прогон на `simple`).
+- `wip/notify-dispatch` (wt-notify, Claude developer) — `ui/notify.py _Dispatcher` на схему урока 026. → ревью → PR.
+- `wip/appimage-rev3` (wt-arch3, architect-codex) — план базы Debian 12 + OpenSSL 3, оценка «успеваем к 15.10?»;
+  изменения в `arch/appimage.md` НЕ закоммичены — закоммитить Юрке после отчёта. Если не успеваем — вернуться к заказчику
+  с откатом (г): принять риск + убрать readline/gdbm.
+- Ждут четверга 01.10 (T1+T2 одним проходом): `wip/ma-foundation` (`c7a267b`), `wip/r2-ci` (`67f7479`) — обе APPROVE.
+  После слияния: `platform/external` → кнопка «Страница выпуска»; `--if-exists` в ci.yml.proposed убрать; NOTICE/PRIVACY
+  внутрь AppImage; путь документов AppImage (`$APPDIR`) в `about_bridge`; `sbom.py` vendor → ГК «Астра».
+- S5-A5: мини-Ц2 15:03 — 3/20, 4-я не началась (разбор debugger: хоткей, не `stream`); `stream` в умолчание — только
+  после повторной пробы. Сверка подписи switched vs audio.ready (P3) — на пробе.
+**Комплаенс AppImage к 15.10:** тексты лицензий внутрь бандла, NOTICE §7 — точные ссылки на исходники GPL/LGPL, архив
+исходников в Release, type2-runtime/libfuse (LGPL-2.1) — закрыть «уточняется».
+**Правила:** Codex — только архитектура до сб 03.10; агентам — уникальные имена скриптов в scratchpad.
