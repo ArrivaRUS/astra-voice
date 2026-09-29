@@ -23,6 +23,7 @@ from astra_voice.ui.pill import (
     CLIPBOARD_NOT_FETCHED,
     CLIPBOARD_WINDOW_CHANGED,
     ERROR_BUFFER_CLEARED,
+    ERROR_MICROPHONE_CHANGED,
     ERROR_MICROPHONE_LOST,
     ERROR_MICROPHONE_SILENT,
     ERROR_MICROPHONE_UNAVAILABLE,
@@ -47,6 +48,10 @@ LEVEL_RECORD_LIMIT_S = 60.0
 LEVEL_TOTAL_LIMIT_S = 180.0
 LEVEL_LIMIT_MESSAGE = "Проверка микрофона остановлена. Нажмите, чтобы продолжить"
 LEVEL_FAILED = "Не удалось проверить микрофон. Попробуйте ещё раз."
+# S5-A5: столько звука до смены микрофона уже стоит распознать; короче — отмена.
+DEVICE_CHANGE_MIN_AUDIO_MS = 300
+DEVICE_SWITCHED = "switched"
+DEVICE_LOST = "device-lost"
 
 
 @dataclass(frozen=True)
@@ -219,6 +224,8 @@ class DictationOrchestrator:
         self._level_failed = False
         self._level_idle_message = ""
         self._level_awaiting_audio_closed = False
+        # Смена микрофона посреди записи (audio.device.changed): не больше одной на диктовку.
+        self._device_change_kind: str | None = None
 
     @property
     def level_active(self) -> bool:
@@ -545,6 +552,7 @@ class DictationOrchestrator:
         self._result_audio_ms = None
         self._result_infer_ms = None
         self._retries = 0
+        self._device_change_kind = None
         try:
             self._device_selected = False
             params: dict[str, Any] = (
@@ -695,10 +703,20 @@ class DictationOrchestrator:
             self._cancelled()
         elif self._cancel_pending:
             return
+        elif (
+            kind == "error"
+            and event.get("code") == "bad-state"
+            and event.get("request_type") == "record.stop"
+        ):
+            # Воркер сам остановил запись раньше нашего stop (record.limit или смена
+            # микрофона). Буфер цел: исход скажет уже отправленный recognize.
+            self._log.debug("диктовка: запись уже остановлена воркером")
         elif kind == "error":
             self._error(event.get("code"))
         elif self._cancel_requested:
             return
+        elif kind == "audio.device.changed":
+            self._device_change(event)
         elif kind == "result" and self._phase == DictationPhase.PROCESSING:
             text = event.get("text")
             if not isinstance(text, str):
@@ -744,6 +762,74 @@ class DictationOrchestrator:
                 if not self.test_active:
                     self._pill.show_state(PillState.LIMIT)
                 self._stop(recording_stopped=True)
+
+    def _device_change(self, event: dict[str, Any]) -> None:
+        """Воркер сам остановил запись из-за смены микрофона (S5-A5, IPC v3)."""
+        kind = event.get("kind")
+        label = event.get("label")
+        label = label.strip() if isinstance(label, str) else ""
+        if kind == DEVICE_SWITCHED and not label:
+            # Без подписи сказать «сейчас используется» нечего — как у воркера по бюджету.
+            kind = DEVICE_LOST
+        if kind not in (DEVICE_SWITCHED, DEVICE_LOST):
+            self._log.debug("диктовка: некорректное поле kind")
+            return
+        if self._device_change_kind is not None:
+            self._log.debug("диктовка: повторная смена микрофона отброшена")
+            return
+        if self.test_active:
+            return
+        self._device_change_kind = kind
+        # Только вид события: подпись устройства и текст в журнал не идут.
+        self._log.info("диктовка: смена микрофона посреди записи (%s)", kind)
+        self._announce_device_change(kind, label)
+        if self._phase != DictationPhase.RECORDING:
+            # Клавишу уже отпустили: распознавание записанного идёт своим ходом.
+            return
+        audio_ms = event.get("audio_ms")
+        if (
+            isinstance(audio_ms, int)
+            and not isinstance(audio_ms, bool)
+            and audio_ms >= DEVICE_CHANGE_MIN_AUDIO_MS
+        ):
+            # Как после record.limit: воркер уже остановил запись, stop не нужен.
+            self._stop(recording_stopped=True)
+            return
+        self._begin_finish()
+        self._send_cancel()
+        self._end_finish(
+            PillState.ERROR, tray=TrayState.ERROR if kind == DEVICE_LOST else TrayState.IDLE
+        )
+
+    def _announce_device_change(self, kind: str, label: str) -> None:
+        switched = kind == DEVICE_SWITCHED
+        self._append_stat(
+            "mic_error", kind="device-changed" if switched else DEVICE_LOST, recovered_by="none"
+        )
+        self._safe_ui(
+            lambda: self._pill.show_state(
+                PillState.ERROR,
+                text=ERROR_MICROPHONE_CHANGED if switched else ERROR_MICROPHONE_LOST,
+            ),
+            "диктовка: не удалось обновить пилюлю",
+        )
+        if switched:
+            # Следующая запись с этого микрофона не объявит «Микрофон: X» ещё раз.
+            self._announced_selected_device = label
+            if label != self._resolved_device:
+                self._resolved_device = label
+                on_resolved = self._on_device_resolved
+                if on_resolved is not None:
+                    self._safe_ui(
+                        lambda: on_resolved(label), "диктовка: не удалось обновить микрофон"
+                    )
+            on_changed = self._on_device_changed
+            if on_changed is not None:
+                self._safe_ui(
+                    lambda: on_changed(label), "диктовка: не удалось сообщить о смене микрофона"
+                )
+        elif self._on_device_lost is not None:
+            self._safe_ui(self._on_device_lost, "диктовка: не удалось сообщить о смене микрофона")
 
     def _announce_silent(self) -> None:
         """Сообщает наружу о тишине; причину выясняет рантайм, не автомат."""

@@ -451,6 +451,22 @@ def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_k
             ]
 
 
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_microphone_change_during_recording_wiring(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """S5-A5 D2: смена микрофона посреди записи доходит до штатных уведомлений."""
+    rig = Rig(monkeypatch)
+    rig.runtime.start()
+    rig.hotkey.fsm.press(rig.now)
+    fields = {"label": "Встроенный микрофон"} if kind == "switched" else {}
+    rig.event(type="audio.device.changed", kind=kind, audio_ms=2000, **fields)
+    if kind == "switched":
+        assert rig.notify.mock_calls == [call.notify_microphone_changed("Встроенный микрофон")]
+    else:
+        assert rig.notify.mock_calls == [call.notify_microphone_lost()]
+
+
 @pytest.mark.parametrize(
     ("state", "problem", "wrapper"),
     [
