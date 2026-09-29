@@ -898,3 +898,15 @@ T-163…T-174 перенести из arch/appimage.md в test-plan; текст�
   после неё (четверг). До отправки ci-workflow-patch заказчику: прогон root→nobody в `debian:12` — в T3.
   После вливания M7 checker убрать `--if-exists` для tests/net, tests/updates в `ci.yml.proposed`.
 - Нагрузка 13:15 (вопрос заказчика): WebKitWebProcess DesktopX ~89 % 74 мин (его приложение), pytest Cowork (другая сессия).
+
+## 2026-09-29 ~18:00 — день: слито и сборка на проверку
+- Слито в main: #13 M7 net/http, #14 M7 checker+T-116, #15 трей (урок 026), #16 S5-A5 A/B, #17 S5-A5 линия D,
+  #18 проба захвата на своём окне (Enter в форме Cowork, найдено сессией Cowork), #19 M7 UI. Спайк C S5-A5 — `arch/spikes/S5A5.md`.
+- Сборка `astra-voice_0.1.1~dev1_amd64.deb` (main `5a7fb53`, --host, elf-audit ok) на `~/Desktop`,
+  sha256 `c1706db4…25f7`; changelog-запись dev1 только в срезе сборки. Ждёт установки заказчиком (sudo) → я перезапускаю
+  программу по pid → проверка: Enter в форме Cowork (KDE), вставка в Kate/fly-term (Fly), раздел «Сеть и обновления».
+- Ждут четверга 01.10: `wip/ma-foundation` (`c7a267b`, APPROVE), `wip/r2-ci` (`67f7479`, APPROVE, на ma-foundation) — T1+T2
+  одним проходом → слить → `platform/external` → кнопка «Страница выпуска» в M7 UI.
+- Дальше S5-A5: E3 мини-Ц2 на 20 диктовок со `stream` на стенде virtual_mic (предупредить заказчика), сверка подписи
+  switched vs audio.ready (P3), затем PR на бэкенд по умолчанию, живая проверка ~03.10.
+- Порядок: агентам — уникальные имена скриптов в scratchpad (общий t.sh перезаписывался).
