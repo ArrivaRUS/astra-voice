@@ -1,12 +1,19 @@
-"""Проба захвата перед XTest не шевелит фокус мишени (фикс 22.09, P0 «текст в буфере»).
+"""Проба захвата перед XTest не снимает активацию с окна фокуса (P0 22.09, Enter 29.09).
 
-Правило Xlib: захват клавиатуры на **самом окне фокуса** не порождает FocusIn/FocusOut —
-сервер генерирует события только для перехода фокуса F→G, а при F == G перехода нет.
-На этом держится вставка: приложение, в которое вставляем (Kate, Electron, fly-wm),
-на FocusOut теряет выделение, закрывает всплывашки и перехватывает Ctrl+V себе.
+Проба «клавиатура занята чужим захватом?» идёт на своём override-redirect окне
+(``X11Display.probe_window``). Правило X11 для захвата на окне G при фокусе F:
+при захвате F получает FocusOut/NotifyGrab, при отпускании — FocusIn/NotifyUngrab.
+Оба режима KWin 5.27 пропускает (``focusOutEvent`` отбрасывает Grab,
+``focusInEvent`` — Ungrab). Прежние места захвата отвергнуты:
 
-Контрольный кейс — проба на другом окне: события обязаны появиться. Без него тест
-не отличил бы «правило соблюдается» от «стенд вообще не видит Focus-событий».
+* корень — корень получает FocusIn, fly-wm отвечает перезахватом (22.09);
+* само окно фокуса (F == G) — сервер всё равно шлёт пары событий, и отпускание
+  даёт F **FocusOut/NotifyUngrab**: KWin принимает его за потерю фокуса,
+  ``_NET_ACTIVE_WINDOW`` обнуляется при живом X-фокусе, утилиты неактивного
+  приложения прячутся (Enter в форме быстрого ввода Cowork, 29.09).
+
+Контрольный кейс — старая проба на окне фокуса: FocusOut/NotifyUngrab обязан
+появиться, иначе тест не отличил бы «правило соблюдается» от «стенд не видит событий».
 """
 
 from __future__ import annotations
@@ -45,8 +52,9 @@ POLL_MS = 5
 
 #: Режимы Focus-событий по протоколу X11 (X.NotifyNormal … X.NotifyWhileGrabbed).
 _MODE_NAMES = {0: "NotifyNormal", 1: "NotifyGrab", 2: "NotifyUngrab", 3: "NotifyWhileGrabbed"}
-#: Режимы, которые приложение (Qt xcb, GTK) не считает сменой фокуса.
-_GRAB_MODES = {"NotifyGrab", "NotifyUngrab"}
+#: Единственные Focus-события окна фокуса, допустимые за пробу: KWin 5.27 их
+#: пропускает, а Qt xcb останавливает таймер деактивации на FocusIn.
+_ALLOWED = {"FocusOut/NotifyGrab", "FocusIn/NotifyUngrab"}
 
 
 def _window_id(event: Any) -> int:
@@ -114,7 +122,7 @@ class FocusWatcher:
     def foreign_grab_status(self) -> str:
         """Захват клавиатуры чужим клиентом: имя статуса сервера; успешный сразу снимается.
 
-        Захват здесь — на окне фокуса, поэтому сама проверка Focus-событий не порождает.
+        Зовётся после сбора событий: сама проверка тоже порождает Focus-события мишени.
         """
         from Xlib import X
 
@@ -176,28 +184,127 @@ def watcher() -> Iterator[FocusWatcher]:
             conn.close()
 
 
-def test_probe_on_focus_window_is_silent(watcher: FocusWatcher, xdisplay: X11Display) -> None:
-    """Проба на окне фокуса: только события захвата (NotifyGrab/NotifyUngrab), фокус на месте.
+@dataclass
+class FakeWm:
+    """Клиент с SubstructureRedirect на корне — так корень слушает оконный менеджер.
 
-    Обычной смены фокуса (NotifyNormal/NotifyWhileGrabbed) приложение видеть не должно.
+    Окно без override-redirect при map() дало бы ему MapRequest; окно пробы не должно.
+    """
+
+    conn: Any
+
+    def events(self) -> list[tuple[str, int, Any]]:
+        """Все события очереди как (вид, окно, флаг override-redirect)."""
+        out: list[tuple[str, int, Any]] = []
+        self.conn.sync()
+        while self.conn.pending_events():
+            event = self.conn.next_event()
+            out.append((type(event).__name__, _window_id(event), getattr(event, "override", None)))
+        return out
+
+
+@pytest.fixture
+def fake_wm(watcher: FocusWatcher) -> Iterator[FakeWm]:
+    """После отображения окон стенда: иначе их map() тоже ушёл бы в MapRequest."""
+    from Xlib import X, error
+    from Xlib import display as xlib_display
+
+    conn = xlib_display.Display()
+    try:
+        catcher = error.CatchError(error.BadAccess)
+        conn.screen().root.change_attributes(
+            event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask, onerror=catcher
+        )
+        conn.sync()
+        assert catcher.get_error() is None, "на стенде уже есть оконный менеджер"
+        yield FakeWm(conn)
+    finally:
+        conn.close()
+
+
+def test_probe_leaves_focus_window_active(watcher: FocusWatcher, xdisplay: X11Display) -> None:
+    """За пробу окно фокуса не получает FocusOut с NotifyUngrab/NotifyNormal, фокус на месте."""
+    watcher.settle()
+    assert _keyboard_busy(xdisplay) == "", "проба обязана была захватить"
+    assert xdisplay.keyboard_grab_deadline is None
+    events = watcher.collect(WATCH_MS)
+    unexpected = [name for name in events if name not in _ALLOWED]
+    assert unexpected == [], f"KWin снял бы активацию: {unexpected} (все события: {events})"
+    # Стенд видит события захвата, а последним окну фокуса пришёл FocusIn.
+    assert "FocusOut/NotifyGrab" in events, f"стенд не увидел захвата: {events}"
+    assert events[-1] == "FocusIn/NotifyUngrab", f"фокус не вернулся: {events}"
+    assert watcher.focus_id() == watcher.target_id()
+    assert watcher.foreign_grab_status() == "GrabSuccess"
+
+
+def test_grab_on_focus_window_sends_ungrab_focus_out(
+    watcher: FocusWatcher, xdisplay: X11Display
+) -> None:
+    """Контроль: прежняя проба на самом окне фокуса даёт ему FocusOut/NotifyUngrab.
+
+    Именно это событие KWin 5.27 (``events.cpp``, ``focusOutEvent``) считает
+    потерей фокуса. Без контроля первый тест прошёл бы и на глухом стенде.
     """
     watcher.settle()
-    assert _keyboard_busy(xdisplay, watcher.target_id()) == "", "проба обязана была захватить"
+    assert xdisplay.grab_keyboard(watcher.target_id()), "захват на окне фокуса не удался"
+    xdisplay.ungrab_keyboard()
     assert xdisplay.keyboard_grab_deadline is None
     events = watcher.collect(WATCH_MS)
-    unexpected = [name for name in events if name.split("/")[1] not in _GRAB_MODES]
-    assert unexpected == [], f"смена фокуса вне захвата: {unexpected} (все события: {events})"
+    assert "FocusOut/NotifyUngrab" in events, f"стенд не воспроизвёл триггер KWin: {events}"
     assert watcher.focus_id() == watcher.target_id()
-    assert watcher.foreign_grab_status() == "GrabSuccess"
 
 
-def test_probe_on_other_window_moves_focus(watcher: FocusWatcher, xdisplay: X11Display) -> None:
-    """Контроль: проба на чужом окне — мишень получает и FocusOut, и FocusIn."""
-    watcher.settle()
-    assert _keyboard_busy(xdisplay, watcher.other_id()) == "", "проба обязана была захватить"
+def test_foreign_grab_refuses_probe(watcher: FocusWatcher, xdisplay: X11Display) -> None:
+    """Чужой активный захват (меню, блокировщик, зажатый хоткей) → grab-refused."""
+    from Xlib import X
+
+    status = watcher.other.grab_keyboard(False, X.GrabModeAsync, X.GrabModeAsync, X.CurrentTime)
+    assert status == X.GrabSuccess, "стенд не смог захватить клавиатуру чужим клиентом"
+    try:
+        watcher.conn.sync()
+        assert _keyboard_busy(xdisplay) == "grab-refused"
+        assert xdisplay.keyboard_grab_deadline is None
+    finally:
+        watcher.conn.ungrab_keyboard(X.CurrentTime)
+        watcher.conn.sync()
+    # Чужой захват снят — проба снова проходит, на том же окне.
+    assert _keyboard_busy(xdisplay) == ""
     assert xdisplay.keyboard_grab_deadline is None
-    events = watcher.collect(WATCH_MS)
-    kinds = {name.split("/")[0] for name in events}
-    assert {"FocusOut", "FocusIn"} <= kinds, f"стенд не увидел смены фокуса: {events}"
+
+
+def test_probe_window_is_invisible_to_window_manager(
+    watcher: FocusWatcher, fake_wm: FakeWm, xdisplay: X11Display
+) -> None:
+    """Окно пробы: override-redirect InputOnly вне экрана, WM не получает MapRequest.
+
+    В CI оконного менеджера нет, поэтому ``_NET_CLIENT_LIST`` обычно отсутствует;
+    главное доказательство — отсутствие MapRequest у держателя SubstructureRedirect:
+    без него WM окно не ведёт и в список клиентов не вносит.
+    """
+    from Xlib import X, Xatom
+
+    fake_wm.events()
+    assert _keyboard_busy(xdisplay) == ""
+    probe = xdisplay.probe_window()
+    assert probe is not None
+    assert _keyboard_busy(xdisplay) == ""
+    assert xdisplay.probe_window() == probe, "окно пробы должно жить с соединением"
+    events = fake_wm.events()
+    assert [e for e in events if e[0] == "MapRequest"] == [], f"WM увидел окно: {events}"
+    created = [e for e in events if e[0] == "CreateNotify" and e[1] == probe]
+    assert len(created) == 1, f"окно пробы создано не один раз: {events}"
+    assert all(bool(e[2]) for e in events if e[1] == probe), events
+
+    window = watcher.conn.create_resource_object("window", probe)
+    attrs = window.get_attributes()
+    assert attrs.override_redirect
+    assert attrs.win_class == X.InputOnly
+    assert attrs.map_state == X.IsViewable
+    geometry = window.get_geometry()
+    assert geometry.x + geometry.width <= 0 and geometry.y + geometry.height <= 0
+
+    root = watcher.conn.screen().root
+    clients = root.get_full_property(watcher.conn.intern_atom("_NET_CLIENT_LIST"), Xatom.WINDOW)
+    assert clients is None or probe not in [int(w) for w in clients.value]
+    # Корень не получил фокус: проба его не трогает.
     assert watcher.focus_id() == watcher.target_id()
-    assert watcher.foreign_grab_status() == "GrabSuccess"

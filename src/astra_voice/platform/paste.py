@@ -373,16 +373,25 @@ def _focus_matches(
     return not _focus_mismatch(x, target_window, wm_class)[0]
 
 
-def _keyboard_busy(x: X11Display, focus_window: int | None) -> str:
-    """Проба захвата клавиатуры на окне фокуса, снимаемая сразу же.
+def _keyboard_busy(x: X11Display) -> str:
+    """Проба «клавиатура занята чужим захватом?» на собственном окне, снимаемая сразу.
 
-    Захват на самом окне фокуса даёт приложению только FocusOut/FocusIn с
-    режимом NotifyGrab/NotifyUngrab (X11: захват — не смена фокуса), и тулкиты
-    их не считают потерей фокуса; проверено N-30 на Xvfb. Захват на корне —
-    другое дело: fly-wm на фокус корня отвечает собственным перезахватом.
     Чужой активный захват — меню, блокировщик, зажатый хоткей — даёт отказ.
+    Окно пробы — своё override-redirect InputOnly (:meth:`X11Display.probe_window`):
+    окну фокуса достаются только FocusOut/NotifyGrab и FocusIn/NotifyUngrab.
+    Два прежних места захвата отвергнуты:
+
+    * корень — корень получает FocusIn, и fly-wm отвечает собственным
+      перезахватом (фикс 22.09, P0 «текст только в буфере»);
+    * окно фокуса — отпускание шлёт ему FocusOut/NotifyUngrab, KWin 5.27
+      считает это потерей фокуса и снимает активацию (``_NET_ACTIVE_WINDOW=0``
+      при живом фокусе; утилиты неактивного приложения прячутся, Enter уходит
+      не туда).
     """
-    if not x.grab_keyboard(focus_window):
+    window = x.probe_window()
+    if window is None:
+        return "grab-no-window"
+    if not x.grab_keyboard(window):
         return "grab-refused"
     x.ungrab_keyboard()
     return "" if x.keyboard_grab_deadline is None else "grab-stuck"
@@ -550,10 +559,10 @@ class PasteFlow:
     остаётся для ручной вставки. restore_pending позволяет вернуть его раньше
     при завершении. PRIMARY возвращается по правилам владения/секрета.
     Порядок: публикация → ожидание отпускания клавиш → пауза → проверка фокуса
-    → проба XGrabKeyboard на окне фокуса со снятием захвата → XTest → забор
-    → пауза → возврат. Проба на
-    окне фокуса не порождает FocusIn/FocusOut и не трогает оконный менеджер
-    (проба на корне давала fly-wm повод считать корень в фокусе). Принят
+    → проба XGrabKeyboard на собственном окне со снятием захвата → XTest
+    → забор → пауза → возврат. Проба не трогает ни корень (fly-wm отвечал
+    перезахватом), ни окно фокуса (FocusOut/NotifyUngrab снимал активацию
+    в KWin), см. :func:`_keyboard_busy`. Принят
     остаточный риск гонки между пробой и XTest: атомарности в X11 нет (У12/У46).
     """
 
@@ -664,9 +673,9 @@ class PasteFlow:
                 elif not released:
                     kind, reason = PasteOutcomeKind.WINDOW_CHANGED, "keys-held"
                 else:
-                    reason, focus = _focus_mismatch(x, target_window, wm_class)
+                    reason, _focus = _focus_mismatch(x, target_window, wm_class)
                     if not reason:
-                        reason = _keyboard_busy(x, focus)
+                        reason = _keyboard_busy(x)
                     if reason:
                         kind = PasteOutcomeKind.WINDOW_CHANGED
                     else:

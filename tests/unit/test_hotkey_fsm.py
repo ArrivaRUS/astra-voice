@@ -540,6 +540,7 @@ def test_keyboard_context_reports_refusal(mocked_x11: X11Display) -> None:
         ("pending_events", ()),
         ("next_event", ()),
         ("fileno", ()),
+        ("probe_window", ()),
     ],
 )
 def test_keyboard_deadline_enforced_by_public_operations(
