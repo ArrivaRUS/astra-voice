@@ -8,7 +8,7 @@ import os
 import subprocess
 import sys
 import weakref
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -376,7 +376,11 @@ class FakeDisplay(X11Display):
         super().__init__()
         self.report = GrabReport(True, [(4, None)], False)
         self.calls: list[tuple[str, int, int]] = []
+        # Полные вызовы с набором масок и keep: (операция, keycode, masks, keep).
+        self.mask_calls: list[tuple[str, int, tuple[int, ...], tuple[int, ...]]] = []
         self.available = True
+        self.keycodes = {"Escape": 9, "space": 65}
+        self.next_lock_masks: dict[str, int] | None = None
 
     def open(self, display_name: str | None = None) -> bool:
         return self.available
@@ -384,14 +388,34 @@ class FakeDisplay(X11Display):
     def parse_combo(self, combo: str) -> ParsedCombo:
         if combo == "bad":
             raise BadCombo
-        return ParsedCombo(0, 9, "Escape") if combo == "Escape" else ParsedCombo(4, 65, "space")
+        if combo == "Escape":
+            return ParsedCombo(0, self.keycodes["Escape"], "Escape")
+        return ParsedCombo(4, self.keycodes["space"], "space")
 
-    def grab_key(self, keycode: int, base_mask: int, **_kwargs: Any) -> GrabReport:
+    def refresh_keyboard_mapping(self, event: Any) -> bool:
+        if self.next_lock_masks is not None:
+            self.lock_masks = self.next_lock_masks
+        return True
+
+    def grab_key(
+        self,
+        keycode: int,
+        base_mask: int,
+        *,
+        masks: Sequence[int] | None = None,
+        keep: Collection[int] = (),
+    ) -> GrabReport:
         self.calls.append(("grab", keycode, base_mask))
+        variants = tuple(masks) if masks is not None else tuple(self.mask_variants(base_mask))
+        self.mask_calls.append(("grab", keycode, variants, tuple(keep)))
         return self.report
 
-    def ungrab_key(self, keycode: int, base_mask: int, **_kwargs: Any) -> None:
+    def ungrab_key(
+        self, keycode: int, base_mask: int, *, masks: Sequence[int] | None = None
+    ) -> None:
         self.calls.append(("ungrab", keycode, base_mask))
+        variants = tuple(masks) if masks is not None else tuple(self.mask_variants(base_mask))
+        self.mask_calls.append(("ungrab", keycode, variants, ()))
 
 
 @pytest.mark.parametrize(
@@ -427,6 +451,67 @@ def test_x11_canonical_duplicate_and_cleanup() -> None:
     backend.close()
     assert display.calls == [("grab", 65, 4), ("grab", 9, 0), ("ungrab", 9, 0), ("ungrab", 65, 4)]
     assert backend.ungrab_combo("Ctrl+Space").code == "not-grabbed"
+
+
+NO_LOCKS = {"Lock": 0, "Num_Lock": 0, "Scroll_Lock": 0}
+
+
+def mapping_notify() -> Any:
+    from Xlib import X
+
+    return SimpleNamespace(
+        type=X.MappingNotify, request=X.MappingModifier, first_keycode=0, count=0
+    )
+
+
+def test_x11_backend_passes_masks_and_keep_on_lock_change() -> None:
+    """Смена масок блокировок: новые маски с keep=прежние, затем только лишние старые."""
+    pytest.importorskip("Xlib")
+    display = FakeDisplay()
+    display.lock_masks = {"Lock": 2, "Num_Lock": 16, "Scroll_Lock": 0}
+    backend = X11HotkeyBackend(display)
+    assert backend.grab_combo("Ctrl+Space").ok
+    assert display.mask_calls == [("grab", 65, (4, 6, 20, 22), ())]
+    display.mask_calls.clear()
+    display.next_lock_masks = {"Lock": 2, "Num_Lock": 8, "Scroll_Lock": 0}
+    event = backend._refresh_mapping(mapping_notify())
+    assert event.combos["Ctrl+Space"].ok
+    assert event.masks_changed and not event.keycode_changed and event.regrabbed
+    assert display.mask_calls == [
+        ("grab", 65, (4, 6, 12, 14), (4, 6, 20, 22)),
+        ("ungrab", 65, (20, 22), ()),
+    ]
+    # Та же карта ещё раз — ни одного вызова.
+    display.mask_calls.clear()
+    event = backend._refresh_mapping(mapping_notify())
+    assert display.mask_calls == [] and not event.regrabbed
+    backend.close()
+    assert display.mask_calls == [("ungrab", 65, (4, 6, 12, 14), ())]
+
+
+def test_x11_backend_shared_escape_follows_combo_without_own_grab() -> None:
+    """Escape — сам хоткей: при смене keycode захват один, у Escape своего нет."""
+    pytest.importorskip("Xlib")
+    display = FakeDisplay()
+    display.report = GrabReport(True, [(0, None)], False)
+    display.lock_masks = dict(NO_LOCKS)
+    backend = X11HotkeyBackend(display)
+    assert backend.grab_combo("Escape").ok
+    assert backend.grab_escape().ok
+    assert display.mask_calls == [("grab", 9, (0,), ())]
+    display.mask_calls.clear()
+    display.keycodes["Escape"] = 10
+    event = backend._refresh_mapping(mapping_notify())
+    assert event.combos["Escape"] == GrabResult("ok", keycode=10, mods=0)
+    assert event.escape == GrabResult("ok", keycode=10)
+    assert event.keycode_changed and event.regrabbed
+    assert display.mask_calls == [("grab", 10, (0,), ()), ("ungrab", 9, (0,), ())]
+    # Снятие Escape не трогает общий захват; его снимает только хоткей.
+    display.mask_calls.clear()
+    backend.ungrab_escape()
+    assert display.mask_calls == []
+    backend.ungrab_combo("Escape")
+    assert display.mask_calls == [("ungrab", 10, (0,), ())]
 
 
 def test_no_display_and_evdev_stub() -> None:
@@ -1007,10 +1092,11 @@ class QueueBackend:
         return GrabResult("ok")
 
     def grab_escape(self) -> GrabResult:
+        self.calls.append(("grab", "Escape"))
         return GrabResult("ok", keycode=9)
 
     def ungrab_escape(self) -> None:
-        pass
+        self.calls.append(("ungrab", "Escape"))
 
     def poll_events(self, timeout: float = 0.0) -> list[HotkeyEvent | MappingEvent]:
         return [] if timeout or not self.batches else self.batches.pop(0)
@@ -1052,6 +1138,29 @@ def test_failed_regrab_after_mapping_notify_is_reported_and_restorable(
     backend.batches.append([HotkeyEvent("KeyPress", 65, 1000, False, 4)])
     manager.process_pending(1.0)
     assert manager.fsm.state is HotkeyState.RECORDING
+
+
+def test_restore_after_lost_mapping_also_restores_lost_escape() -> None:
+    backend = QueueBackend()
+    manager = HotkeyManager(backend, clock=lambda: 0.0)
+    cancelled: list[bool] = []
+    manager.on_escape = lambda: cancelled.append(True)
+    assert manager.grab("Ctrl+Space", HotkeyMode.TOGGLE).ok
+    backend.batches.append([HotkeyEvent("KeyPress", 65, 1000, False, 4)])
+    manager.process_pending(0.0)
+    assert manager.fsm.state is HotkeyState.RECORDING
+    lost = GrabResult("not-grabbed")
+    backend.batches.append([MappingEvent({"Ctrl+Space": lost}, lost)])
+    manager.process_pending(1.0)
+    assert not manager._escape_grabbed
+    backend.calls.clear()
+    assert manager.grab("Ctrl+Space", HotkeyMode.TOGGLE).ok
+    assert backend.calls == [("grab", "Ctrl+Space"), ("grab", "Escape")]
+    assert manager.escape_result.ok
+    backend.batches.append([HotkeyEvent("KeyPress", 9, 1100, True, 0)])
+    manager.process_pending(2.0)
+    assert cancelled == [True]
+    assert manager.fsm.state.value == HotkeyState.IDLE.value
 
 
 def test_hotkey_log_explains_press_release_and_skipped_press(

@@ -284,6 +284,9 @@ class X11HotkeyBackend:
             return GrabResult("ok", keycode=parsed.keycode, mods=parsed.mods), False, False
         keep = old_masks if old_key == new_key else ()
         result = self._grab(parsed, keep=keep)
+        # При отказе старый захват тоже снимается: он поставлен по прежней карте, и его
+        # keycode/маски могут уже означать другую клавишу. Держать его — значит ловить
+        # чужие нажатия; хоткей честно считается потерянным, повтор ведёт runtime.
         if old is not None:
             if result.ok and old_key == new_key:
                 stale = tuple(mask for mask in old_masks if mask not in masks)
@@ -485,6 +488,12 @@ class HotkeyManager:
                 self._keycode = result.keycode
                 self._mods = result.mods
                 self._key_down = False
+                # Escape нужен, пока автомат не в IDLE; если он пропал вместе с хоткеем —
+                # возвращаем и его.
+                if self.fsm.state != HotkeyState.IDLE and not self._escape_grabbed:
+                    self.escape_result = self.backend.grab_escape()
+                    self._escape_grabbed = self.escape_result.ok
+                    self._escape_keycode = self.escape_result.keycode
             self.last_result = result
             return result
         if combo == self._combo:
