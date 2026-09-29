@@ -373,7 +373,7 @@ def _focus_matches(
     return not _focus_mismatch(x, target_window, wm_class)[0]
 
 
-def _keyboard_busy(x: X11Display) -> str:
+def _keyboard_busy(x: X11Display, window: int | None) -> str:
     """Проба «клавиатура занята чужим захватом?» на собственном окне, снимаемая сразу.
 
     Чужой активный захват — меню, блокировщик, зажатый хоткей — даёт отказ.
@@ -387,8 +387,10 @@ def _keyboard_busy(x: X11Display) -> str:
       считает это потерей фокуса и снимает активацию (``_NET_ACTIVE_WINDOW=0``
       при живом фокусе; утилиты неактивного приложения прячутся, Enter уходит
       не туда).
+
+    ``window`` — :meth:`X11Display.probe_window`, созданное заранее, до паузы:
+    между проверкой фокуса и XTest остаются только захват и его снятие.
     """
-    window = x.probe_window()
     if window is None:
         return "grab-no-window"
     if not x.grab_keyboard(window):
@@ -664,6 +666,11 @@ class PasteFlow:
                     pending.primary_touched = True
                 cb.put(out, True, tracker)
             released = x is None or _wait_keys_released(x, KEYS_RELEASE_TIMEOUT_MS)
+            # Окно пробы — до паузы: его создание (map + sync) не должно расширять
+            # гонку между проверкой фокуса и XTest (У12/У46). Нет окна — нет и пробы.
+            probe: int | None = None
+            if x is not None and x.d is not None and released:
+                probe = x.probe_window()
             _wait_ms(self.delay_before_ms)
             if pending is not None and pending.consumed:
                 kind, reason = PasteOutcomeKind.WINDOW_CHANGED, "restored-early"
@@ -672,10 +679,12 @@ class PasteFlow:
                     kind, reason = PasteOutcomeKind.WINDOW_CHANGED, "x-unavailable"
                 elif not released:
                     kind, reason = PasteOutcomeKind.WINDOW_CHANGED, "keys-held"
+                elif probe is None:
+                    kind, reason = PasteOutcomeKind.WINDOW_CHANGED, "grab-no-window"
                 else:
-                    reason, _focus = _focus_mismatch(x, target_window, wm_class)
+                    reason = _focus_mismatch(x, target_window, wm_class)[0]
                     if not reason:
-                        reason = _keyboard_busy(x)
+                        reason = _keyboard_busy(x, probe)
                     if reason:
                         kind = PasteOutcomeKind.WINDOW_CHANGED
                     else:

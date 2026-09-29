@@ -1008,10 +1008,16 @@ def test_keyboard_probe_never_grabs_focus_window_or_root(
 def test_keyboard_probe_without_own_window_keeps_phrase(
     harness: tuple[FakeClipboard, Mock, list[int]],
 ) -> None:
-    """Нет своего окна — нет и запасного захвата на окне фокуса: фраза в буфере."""
-    cb, x, _ = harness
+    """Нет своего окна — нет и запасного захвата на окне фокуса: фраза в буфере.
+
+    Решение принимается по окну, созданному до паузы; фокус уже не проверяется.
+    """
+    cb, x, delays = harness
     x.probe_window.return_value = None
     outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    x.probe_window.assert_called_once_with()
+    x.d.get_input_focus.assert_not_called()
+    assert delays == [50, 100]
     assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
     assert outcome.reason == "grab-no-window"
     assert outcome.restore == PasteRestore.KEPT_OURS
@@ -1771,6 +1777,19 @@ def test_keys_held_before_probe_waits_on_qt_loop(
 
     x.grab_keyboard.side_effect = grab
 
+    def probe() -> int:
+        order.append("probe-window")
+        return PROBE_WINDOW
+
+    x.probe_window.side_effect = probe
+    reply = x.d.get_input_focus.return_value
+
+    def get_input_focus() -> object:
+        order.append("focus")
+        return reply
+
+    x.d.get_input_focus.side_effect = get_input_focus
+
     def wait(ms: int) -> None:
         delays.append(ms)
         order.append(f"wait{ms}")
@@ -1780,8 +1799,11 @@ def test_keys_held_before_probe_waits_on_qt_loop(
     assert outcome.kind == PasteOutcomeKind.PASTED
     assert outcome.reason == ""
     assert delays == [paste.KEYS_POLL_MS] * held_polls + [50, 100]
+    # Окно пробы создаётся до паузы: между проверкой фокуса и XTest — только захват.
     assert order == [f"wait{paste.KEYS_POLL_MS}"] * held_polls + [
+        "probe-window",
         "wait50",
+        "focus",
         f"grab({PROBE_WINDOW},)",
         "wait100",
     ]
