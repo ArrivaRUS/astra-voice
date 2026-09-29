@@ -952,3 +952,8 @@ legal-analyst); правообладатель — ГК «Астра» (NOTICE, 
 **Комплаенс AppImage к 15.10:** тексты лицензий внутрь бандла, NOTICE §7 — точные ссылки на исходники GPL/LGPL, архив
 исходников в Release, type2-runtime/libfuse (LGPL-2.1) — закрыть «уточняется».
 **Правила:** Codex — только архитектура до сб 03.10; агентам — уникальные имена скриптов в scratchpad.
+
+### 2026-09-29 вечер — после сжатия
+- Слито: #21 «О программе» (`5c404b1`), #22 NOTICE/PRIVACY/INSTALL-ADMIN (`a46b399`), #23 уведомления по уроку 026 (`66c93f0`). Ревизия 3 AppImage в `arch/appimage.md` (`ca3f84c`), решение и разрешение на скачивание — `decisions/log.md` (`d69319e`).
+- В работе: `wip/hotkey-regrab` (5 коммитов до `12d8c8c`) на ревью → dev2 → повторная мини-проба; `wip/appimage-debian3` (`wt-deb3`, от r2-ci) — Claude developer, шаг 1 R3 + спайк после скачивания, рубеж 02.10 18:00.
+- Беклог: nit `notify._post_from_thread` — при `invokeMethod`=False сбрасывать `_wake_pending`; PRIVACY — у загрузки моделей указать и запасной github.com; уведомление о потере хоткея для кодов ≠ busy — свой текст; `dictate50.sh` — убрать старый `pgrep -f`.
