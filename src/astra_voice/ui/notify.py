@@ -620,6 +620,15 @@ def notify_hotkey_not_grabbed(combo: str) -> None:
     )
 
 
+def notify_hotkey_lost() -> None:
+    """Сообщить, что захват горячей клавиши пропал не из-за другой программы."""
+    notify(
+        "Горячая клавиша перестала работать",
+        "Программа попробует вернуть её сама.",
+        actions=[(ACTION_CHOOSE_HOTKEY, "Выбрать другую")],
+    )
+
+
 def notify_hotkey_regrabbed(combo: str) -> None:
     """Сообщить об автоматическом восстановлении горячей клавиши."""
     notify(f"Горячая клавиша снова работает: {combo}", urgency="normal", retry=False)

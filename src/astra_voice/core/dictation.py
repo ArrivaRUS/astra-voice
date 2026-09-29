@@ -523,13 +523,18 @@ class DictationOrchestrator:
         """Принимает состояния HotkeyFsm, включая IDLE с escape-cancel."""
         if self._closed:
             return
+        if state == HotkeyState.RECORDING and reason == "press":
+            self._log.info("диктовка: нажатие, фаза=%s", self._phase.value)
         if self.test_active or self._level_callback is not None:
             # Сброс FSM вызывает вложенный IDLE/escape-cancel: его тоже игнорируем.
             # Отмена самой проверки идёт через stop_test/cancel_test, а не хоткей.
             if state in (HotkeyState.RECORDING, HotkeyState.PROCESSING):
+                self._log.info("диктовка: хоткей проигнорирован — идёт проверка/уровень микрофона")
                 self._hotkey_cancel()
             return
         if self._suspended:
+            if state == HotkeyState.RECORDING and reason == "press":
+                self._log.info("диктовка: нажатие отложено — идёт вставка (suspended)")
             self._queue.append(lambda: self.on_hotkey_state(state, reason))
             return
         if state == HotkeyState.RECORDING:
@@ -538,6 +543,9 @@ class DictationOrchestrator:
             elif reason == "press":
                 # Только новое нажатие: tap→toggle и mapping-regrab сообщают
                 # о продолжающейся записи и не должны её отменять.
+                self._log.info(
+                    "диктовка: нажатие проигнорировано — занята фаза %s", self._phase.value
+                )
                 self._hotkey_cancel()
         elif state == HotkeyState.PROCESSING:
             # Предел длительности фразы — не отпускание клавиши: хвост не нужен.
@@ -547,6 +555,9 @@ class DictationOrchestrator:
 
     def _start(self, *, test_device: str | None = None) -> None:
         if self._cancel_pending and self._generation() == self._worker_generation:
+            self._log.info(
+                "диктовка: нажатие проигнорировано — ждём завершения отмены (cancel_pending)"
+            )
             self._hotkey_cancel()
             return
         self._cancel_pending = False
@@ -597,6 +608,7 @@ class DictationOrchestrator:
         if not self._command(message, timeout=timeout):
             self._hotkey_cancel()
             return
+        self._log.info("диктовка: record.start отправлен, поколение=%d", self._worker_generation)
         if self._phase != DictationPhase.RECORDING or self._cancel_requested:
             return
         if self._test_callback is not None:

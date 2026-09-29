@@ -332,6 +332,8 @@ class WorkerState:
         if kind == "transcribe.file":
             return self._recognize("file", Path(msg["path"]))
         uid = str(msg.get("utterance_id", ""))
+        if kind in ("record.start", "record.stop", "recognize"):
+            logger.info("Принят %s: %s.", kind, uid)
         if kind == "record.start":
             if self._recording is not None or self._has_job(uid):
                 return [error("bad-state", "Запись уже существует.")]

@@ -18,7 +18,7 @@ import math
 import os
 import time
 import weakref
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import TracebackType
@@ -243,11 +243,24 @@ class X11Display:
             log.debug("не удалось разобрать комбинацию X11: %s", exc)
             raise X11Unavailable("недоступна раскладка X11") from exc
 
-    def grab_key(self, keycode: int, base_mask: int) -> GrabReport:
-        """Захватывает все маски; любая ошибка вызывает полный откат."""
+    def grab_key(
+        self,
+        keycode: int,
+        base_mask: int,
+        *,
+        masks: Sequence[int] | None = None,
+        keep: Collection[int] = (),
+    ) -> GrabReport:
+        """Захватывает все маски; любая ошибка вызывает откат, кроме масок ``keep``.
+
+        ``masks`` — готовый набор вариантов (по умолчанию ``mask_variants``).
+        ``keep`` — маски этой клавиши, уже захваченные раньше: повторный
+        GrabKey своего же сочетания не ошибка, а откат не должен их снимать.
+        """
         self._enforce_keyboard_deadline()
         results: list[tuple[int, str | None]] = []
-        for mask in self.mask_variants(base_mask):
+        variants = list(masks) if masks is not None else self.mask_variants(base_mask)
+        for mask in variants:
             name: str | None = None
             try:
                 from Xlib import X, error
@@ -274,15 +287,17 @@ class X11Display:
             results.append((mask, name))
         ok = all(name is None for _, name in results)
         if not ok:
-            self.ungrab_key(keycode, base_mask)
+            self.ungrab_key(keycode, base_mask, masks=[m for m in variants if m not in keep])
         return GrabReport(ok, results, any(name == "BadAccess" for _, name in results))
 
-    def ungrab_key(self, keycode: int, base_mask: int) -> None:
-        """Снимает все варианты захвата, продолжая после ошибок X11."""
+    def ungrab_key(
+        self, keycode: int, base_mask: int, *, masks: Sequence[int] | None = None
+    ) -> None:
+        """Снимает варианты захвата (все или ``masks``), продолжая после ошибок X11."""
         self._enforce_keyboard_deadline()
         if not 8 <= keycode <= 255:
             return
-        for mask in self.mask_variants(base_mask):
+        for mask in masks if masks is not None else self.mask_variants(base_mask):
             if not 0 <= mask <= 255:
                 continue
             try:
