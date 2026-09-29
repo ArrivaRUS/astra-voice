@@ -432,7 +432,7 @@ pytest -m unit tests/models -q && pytest -m engine -q
 python3 scripts/build_manifest.py --check                       # регенерация чистая: 12 записей, 7 layout, serial монотонен
 tools/validate catalog --all                                     # смоук каждой раскладки на машине
 tools/validate catalog --switch                                  # Р5: temp-worker / отказ / «с паузой»
-tools/validate downloads --faults                                # hf→github→corp, 429/404, size+1, нет места, зеркала ≠ байты
+tools/validate downloads --faults                                # corp (если задан) → hf → github, 429/404, size+1, нет места, зеркала ≠ байты
 tools/benchmark --catalog --minimum-models 3
 xvfb-run -a pytest -m xvfb tests/ui/test_model_card_states.py -q   # 20 × 2 → tests/_screens/ для DesignReviewer
 ```
