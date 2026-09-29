@@ -2,7 +2,7 @@
   "title": "Тестовые векторы контракта Astra Voice ↔ Astra Cowork (ru.astralinux.Cowork.Command1)",
   "contract": 1,
   "fixed": "2026-09-24",
-  "document": "1.6",
+  "document": "1.7",
   "bus_name": "ru.astralinux.Cowork",
   "object_path": "/ru/astralinux/Cowork",
   "interface": "ru.astralinux.Cowork.Command1",
