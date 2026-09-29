@@ -191,6 +191,7 @@ class Verifier:
                     argv,
                     capture_output=True,
                     text=True,
+                    errors="replace",
                     timeout=_GPGV_TIMEOUT_S,
                     check=False,
                     env={"LC_ALL": "C", "GNUPGHOME": home},
@@ -356,6 +357,7 @@ class Verifier:
                     argv,
                     capture_output=True,
                     text=True,
+                    errors="replace",
                     timeout=_GPGV_TIMEOUT_S,
                     check=False,
                     env={"LC_ALL": "C", "GNUPGHOME": home},
@@ -366,23 +368,35 @@ class Verifier:
         if proc.returncode != 0:
             return {}
         keys: dict[str, tuple[str, int]] = {}
-        primary = ""
-        created: int | None = None
+        # None — у текущего первичного ключа нет годной даты или отпечатка:
+        # его подключи не принимаются (иначе подключ стал бы «первичным»).
+        primary: str | None = None
+        pending: tuple[str, int | None] | None = None
         for line in proc.stdout.splitlines():
             fields = line.split(":")
-            if fields[0] in ("pub", "sub") and len(fields) > 5:
-                created = int(fields[5]) if fields[5].isdigit() and len(fields[5]) <= 12 else None
-                if fields[0] == "pub":
-                    primary = ""
+            kind = fields[0]
+            if kind in ("pub", "sub"):
+                raw = fields[5] if len(fields) > 5 else ""
+                created = int(raw) if raw.isdecimal() and raw.isascii() and len(raw) <= 12 else None
+                if kind == "pub":
+                    primary = None
+                pending = (kind, created)
                 continue
-            if fields[0] == "fpr" and len(fields) > 9 and created is not None:
-                fpr = fields[9].upper()
-                if _FPR_RE.match(fpr):
-                    primary = primary or fpr
-                    keys[fpr] = (primary, created)
-                created = None
-            elif fields[0] != "fpr":
-                created = None
+            if kind != "fpr":
+                pending = None
+                continue
+            if pending is None:
+                continue
+            record, created = pending
+            pending = None
+            fpr = fields[9].upper() if len(fields) > 9 else ""
+            if created is None or not _FPR_RE.match(fpr):
+                continue
+            if record == "pub":
+                primary = fpr
+                keys[fpr] = (fpr, created)
+            elif primary is not None:
+                keys[fpr] = (primary, created)
         return keys
 
     def _fail(

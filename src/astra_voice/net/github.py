@@ -149,11 +149,13 @@ def _release_url(value: object) -> str | None:
 
 
 def clean_notes(text: str) -> str:
-    """Убирает управляющие (кроме перевода строки и табуляции) и форматирующие
-    символы, в том числе bidi U+202A–202E и U+2066–2069: текст выпуска не
-    должен переставлять или прятать строки в панели «Что нового»."""
+    """Убирает управляющие (кроме перевода строки и табуляции), форматирующие
+    символы, в том числе bidi U+202A–202E и U+2066–2069, и одиночные суррогаты:
+    текст выпуска не должен переставлять или прятать строки в «Что нового»."""
     return "".join(
-        char for char in text if char in "\n\t" or unicodedata.category(char) not in ("Cc", "Cf")
+        char
+        for char in text
+        if char in "\n\t" or unicodedata.category(char) not in ("Cc", "Cf", "Cs")
     )
 
 

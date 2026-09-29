@@ -518,3 +518,60 @@ def test_load_builtin_passes_clock_behind(future: dict[str, object], tmp_path: P
         load_builtin(verifier, root=tmp_path)
     assert error.value.code == "clock-behind"
     assert "часы компьютера отстают" in error.value.message
+
+
+def _script(path: Path, body: str) -> Path:
+    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_non_utf8_output_is_plain_refusal(env: dict[str, object], tmp_path: Path) -> None:
+    """Не-UTF-8 в выводе gpgv и gpg — обычный отказ, а не исключение."""
+    fpr = str(env["release_fpr"])
+    gpgv = _script(
+        tmp_path / "gpgv",
+        f"printf '[GNUPG:] NEWSIG \\377\\376\\n[GNUPG:] ERRSIG 1 22 8 00 1 6 {fpr}\\n'\nexit 2\n",
+    )
+    gpg = _script(tmp_path / "gpg", "printf 'pub:-:255:22:X:\\377\\376:::\\n'\nexit 0\n")
+    res = _verifier(
+        env, gpgv_path=gpgv, gpg_path=gpg, clock=lambda: time.time() - _BACK
+    ).verify_detached(Path(str(env["data"])), Path(str(env["sig_release"])))
+    assert not res.ok and res.code == ""
+    assert any("\ufffd" in line for line in res.status)
+
+
+@pytest.mark.parametrize(
+    ("listing", "expected"),
+    [
+        # Битая дата у pub: следующий sub не становится «первичным».
+        ("pub:-:255:22:K:bad:::\nfpr:::::::::{p}:\nsub:-:255:22:S:{t}:::\nfpr:::::::::{s}:\n", {}),
+        (
+            "pub:-:255:22:K:１２３:::\nfpr:::::::::{p}:\nsub:-:255:22:S:{t}:::\nfpr:::::::::{s}:\n",
+            {},
+        ),
+        # Битый отпечаток pub — тоже.
+        ("pub:-:255:22:K:{t}:::\nfpr:::::::::XYZ:\nsub:-:255:22:S:{t}:::\nfpr:::::::::{s}:\n", {}),
+        # Битая дата у sub — выпадает только он.
+        (
+            "pub:-:255:22:K:{t}:::\nfpr:::::::::{p}:\nsub:-:255:22:S:bad:::\nfpr:::::::::{s}:\n",
+            {"{p}": ("{p}", "{t}")},
+        ),
+        (
+            "pub:-:255:22:K:{t}:::\nfpr:::::::::{p}:\nsub:-:255:22:S:{t}:::\nfpr:::::::::{s}:\n",
+            {"{p}": ("{p}", "{t}"), "{s}": ("{p}", "{t}")},
+        ),
+    ],
+)
+def test_keyring_listing_parsing(
+    env: dict[str, object], tmp_path: Path, listing: str, expected: dict[str, tuple[str, str]]
+) -> None:
+    values = {"p": "A" * 40, "s": "B" * 40, "t": "1790442594"}
+    text = listing.format(**values)
+    listing_file = tmp_path / "listing.txt"
+    listing_file.write_text(text, encoding="utf-8")
+    gpg = _script(tmp_path / "gpg", f"cat '{listing_file}'\nexit 0\n")
+    keys = _verifier(env, gpg_path=gpg)._keyring_keys(Path(str(env["keyring"])))
+    fill = {"{p}": values["p"], "{s}": values["s"], "{t}": values["t"]}
+    want = {fill[k]: (fill[v[0]], int(fill[v[1]])) for k, v in expected.items()}
+    assert keys == want

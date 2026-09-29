@@ -329,3 +329,12 @@ def test_installed_version_all_tildes() -> None:
     version = github.installed_version("0.2.0~rc1~2")
     assert version is not None and version.prerelease == ("rc1-2",)
     assert github.evaluate(fixture("plain"), "0.2.1~rc1~2").state == "available"
+
+
+def test_notes_lone_surrogates_removed() -> None:
+    body = (
+        b'{"tag_name": "0.2.1", "draft": false, "prerelease": false, "body": "a\\ud800b\\udfffc"}'
+    )
+    notes = github.evaluate(body, "0.0.1").release
+    assert notes is not None and notes.notes == "abc"
+    notes.notes.encode("utf-8")
