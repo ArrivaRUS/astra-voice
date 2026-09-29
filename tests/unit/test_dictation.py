@@ -3035,3 +3035,123 @@ def test_device_change_ignored_outside_own_recording(rig: Rig, when: str) -> Non
     rig.device_lost.assert_not_called()
     assert not mic_errors(rig)
     assert all(state != PillState.ERROR for state, _, _ in rig.pill.calls)
+
+
+def pill_states_after_device_error(rig: Rig, kind: str) -> list[PillState]:
+    index = rig.pill.calls.index((PillState.ERROR, DEVICE_TEXT[kind], None))
+    return [state for state, _, _ in rig.pill.calls[index + 1 :]]
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+@pytest.mark.parametrize("text", [MARKER, ""])
+def test_device_pill_is_not_replaced_by_processing_done_or_empty(
+    rig: Rig, kind: str, text: str
+) -> None:
+    """D3: пока видна пилюля о смене, PROCESSING/DONE/EMPTY её не перебивают."""
+    rig.start()
+    rig.now += 2.0
+    device_changed(rig, kind)
+    rig.result(text)
+    assert pill_states_after_device_error(rig, kind) == []
+    state = PillState.DONE if text else PillState.EMPTY
+    if kind == "switched":
+        assert rig.tray.state == (TrayState.DONE if text else TrayState.IDLE)
+        tail = STATE_DURATION_MS[state]
+    else:
+        # Трей в ошибке столько же, сколько видна пилюля «Микрофон отключился».
+        assert rig.tray.state == TrayState.ERROR
+        tail = STATE_DURATION_MS[PillState.ERROR] - 250 - (125 if text else 0)
+    assert rig.pasted == ([(MARKER, 42, PasteMode.AUTO)] if text else [])
+    rig.timer(tail).fire()
+    assert_phase(rig, DictationPhase.IDLE)
+    assert rig.tray.state == TrayState.IDLE
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_device_pill_hold_expires(rig: Rig, kind: str) -> None:
+    rig.start()
+    device_changed(rig, kind)
+    rig.now += STATE_DURATION_MS[PillState.ERROR] / 1000
+    rig.result()
+    assert pill_states_after_device_error(rig, kind) == [PillState.DONE]
+    assert rig.tray.state == TrayState.DONE
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_device_pill_hold_starts_in_processing_after_limit(rig: Rig, kind: str) -> None:
+    rig.start()
+    rig.now += 120
+    rig.event("record.limit")
+    device_changed(rig, kind)
+    rig.result("")
+    assert pill_states_after_device_error(rig, kind) == []
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+@pytest.mark.parametrize(
+    ("outcome", "pill"),
+    [
+        (PasteOutcomeKind.CLIPBOARD_ONLY, (PillState.CLIPBOARD_ONLY, None, None)),
+        (
+            PasteOutcomeKind.WINDOW_CHANGED,
+            (PillState.CLIPBOARD_ONLY, CLIPBOARD_WINDOW_CHANGED, None),
+        ),
+        (PasteOutcomeKind.FAILED, (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)),
+    ],
+)
+def test_clipboard_and_failures_replace_device_pill(
+    rig: Rig, kind: str, outcome: PasteOutcomeKind, pill: tuple[Any, ...]
+) -> None:
+    rig.start()
+    device_changed(rig, kind)
+    rig.outcomes.append(outcome)
+    rig.result()
+    assert rig.pill.calls[-1] == pill
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_recognition_error_replaces_device_pill(rig: Rig, kind: str) -> None:
+    rig.start()
+    device_changed(rig, kind)
+    rig.event("error", code="engine-failed")
+    assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_cancel_after_device_change_keeps_device_pill(rig: Rig, kind: str) -> None:
+    rig.start()
+    device_changed(rig, kind)
+    rig.core.cancel("tray")
+    rig.event("cancelled")
+    assert pill_states_after_device_error(rig, kind) == []
+    assert rig.stats.events[-1]["result"] == "cancelled"
+
+
+@pytest.mark.parametrize("mode", list(HotkeyMode))
+@pytest.mark.parametrize("released", [False, True])
+@pytest.mark.parametrize("audio_ms", [100, 2000])
+def test_hotkey_after_device_change_behaves_as_after_limit(
+    mode: HotkeyMode, released: bool, audio_ms: int
+) -> None:
+    """D3, T-56: клавиша не залипает; повторное нажатие в распознавании не стартует запись."""
+    if mode == HotkeyMode.TOGGLE and released and audio_ms < DEVICE_CHANGE_MIN_AUDIO_MS:
+        pytest.skip("в переключателе после завершения второе нажатие — новая запись")
+    rig = Rig(mode)
+    rig.start()
+    if mode == HotkeyMode.TOGGLE:
+        rig.fsm.release(rig.now)
+    rig.now += 1.0
+    device_changed(rig, "device-lost", audio_ms=audio_ms)
+    if released:
+        rig.stop(tail=False)
+        rig.fire_tail()
+    commands = rig.commands()
+    assert commands == ["record.start", "recognize" if audio_ms >= 300 else "record.cancel"]
+    if audio_ms >= 300:
+        rig.result()
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    assert rig.commands() == commands
+    rig.now += 1.0
+    rig.start()
+    assert rig.commands() == [*commands, "record.start"]
+    assert_phase(rig, DictationPhase.RECORDING)

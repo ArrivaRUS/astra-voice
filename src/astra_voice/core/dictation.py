@@ -52,6 +52,10 @@ LEVEL_FAILED = "Не удалось проверить микрофон. Поп�
 DEVICE_CHANGE_MIN_AUDIO_MS = 300
 DEVICE_SWITCHED = "switched"
 DEVICE_LOST = "device-lost"
+# Пилюлю о смене микрофона эти состояния не перебивают, пока она на экране (S5-A5 D3).
+_DEVICE_PILL_KEEPS_OVER = frozenset(
+    (PillState.PROCESSING, PillState.DONE, PillState.EMPTY, PillState.CANCELLED)
+)
 
 
 @dataclass(frozen=True)
@@ -226,6 +230,7 @@ class DictationOrchestrator:
         self._level_awaiting_audio_closed = False
         # Смена микрофона посреди записи (audio.device.changed): не больше одной на диктовку.
         self._device_change_kind: str | None = None
+        self._device_pill_until: float | None = None
 
     @property
     def level_active(self) -> bool:
@@ -553,6 +558,7 @@ class DictationOrchestrator:
         self._result_infer_ms = None
         self._retries = 0
         self._device_change_kind = None
+        self._device_pill_until = None
         try:
             self._device_selected = False
             params: dict[str, Any] = (
@@ -652,7 +658,7 @@ class DictationOrchestrator:
         self._safe_ui(
             lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
         )
-        if not self.test_active:
+        if not self.test_active and not self._device_pill_held(PillState.PROCESSING):
             self._safe_ui(
                 lambda: self._pill.show_state(PillState.PROCESSING),
                 "диктовка: не удалось обновить пилюлю",
@@ -803,6 +809,7 @@ class DictationOrchestrator:
 
     def _announce_device_change(self, kind: str, label: str) -> None:
         switched = kind == DEVICE_SWITCHED
+        self._device_pill_until = self._clock() + STATE_DURATION_MS[PillState.ERROR] / 1000
         self._append_stat(
             "mic_error", kind="device-changed" if switched else DEVICE_LOST, recovered_by="none"
         )
@@ -1140,8 +1147,15 @@ class DictationOrchestrator:
 
     def _finish(self, state: PillState, *, tray: TrayState = TrayState.IDLE) -> None:
         self._begin_finish()
-        self._pill.show_state(state)
+        if not self._device_pill_held(state):
+            self._pill.show_state(state)
         self._end_finish(state, tray=tray)
+
+    def _device_pill_held(self, state: PillState) -> bool:
+        """Пилюля «Микрофон сменился/отключился» ещё видна и важнее этого состояния."""
+        if self._device_pill_until is None or state not in _DEVICE_PILL_KEEPS_OVER:
+            return False
+        return self._clock() < self._device_pill_until
 
     def _begin_finish(self) -> None:
         self._cancel_pending = False
@@ -1151,8 +1165,15 @@ class DictationOrchestrator:
         self._set_recording(False)
 
     def _end_finish(self, state: PillState, *, tray: TrayState) -> None:
+        duration = STATE_DURATION_MS[state]
+        if self._device_change_kind == DEVICE_LOST and self._device_pill_held(state):
+            # Трей горит ошибкой, пока видна пилюля «Микрофон отключился».
+            assert self._device_pill_until is not None
+            tray = TrayState.ERROR
+            remaining = math.ceil((self._device_pill_until - self._clock()) * 1000)
+            duration = max(duration, remaining)
         self._tray.set_state(tray)
-        self._later(STATE_DURATION_MS[state], self._tail_done)
+        self._later(duration, self._tail_done)
         self._hotkey_done()
         # done завершает только PROCESSING; терминальный исход возможен и из RECORDING.
         if not self._hotkey_idle():
