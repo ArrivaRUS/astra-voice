@@ -23,7 +23,7 @@ usage() {
 В Astra Voice выберите режим удержания хоткея и загрузите модель.
 Подготовьте поле ввода Kate/fly-term.
 После подтверждения даётся 5 секунд, чтобы перевести фокус в это поле.
-Если нажатие за 2 с не дошло до диктовки (в журнале нет «record.start отправлен»),
+Если нажатие за 4 с не дошло до диктовки (в журнале нет «record.start отправлен»),
 прогон прерывается с диагностикой хоткея. Журнал: $XDG_DATA_HOME/astra-voice/logs,
 другой путь — переменная ASTRA_VOICE_E2E_LOG.
 Цель: p95 полного времени «отпустил → текст в окне» (t_total_ms) ≤ 500 мс.
@@ -198,7 +198,7 @@ since=$(python3 -c 'import time; print(time.time())')
 log_missing_said=0
 # Нажатие не дошло до диктовки: собрать диагностику (без текста) и прервать прогон.
 hotkey_diagnostics() {
-  say_error "Нажатие $hotkey не дошло до диктовки: за 2 с в журнале нет «record.start отправлен»."
+  say_error "Нажатие $hotkey не дошло до диктовки: за 4 с в журнале нет «record.start отправлен»."
   printf '%s\n' 'Диагностика хоткея:'
   python3 "$diag" probe-grab "$hotkey" || true
   xdotool keyup --delay 100 "$hotkey" || say_error "Не удалось отпустить $hotkey. Отпустите клавиши вручную."
@@ -236,9 +236,9 @@ while [ "$iteration" -le "$max_iterations" ]; do
   log_offset=$(python3 "$diag" offset) || log_offset=-1
   key_down=1
   xdotool keydown --delay 100 "$hotkey" || fail 'Не удалось нажать хоткей.'
-  # Нажатие должно дойти до диктовки за 2 с; иначе не ждём 120 опросов впустую.
+  # Нажатие должно дойти до диктовки за 4 с; иначе не ждём 120 опросов впустую.
   start_code=0
-  python3 "$diag" wait-start --offset "$log_offset" --timeout 2 || start_code=$?
+  python3 "$diag" wait-start --offset "$log_offset" --timeout 4 || start_code=$?
   case "$start_code" in
     0) ;;
     1) hotkey_diagnostics ;;

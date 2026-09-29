@@ -13,7 +13,8 @@ astra_voice. Печатает только имена клавиш, коды и 
                                   0 — есть, 1 — нет за S секунд, 3 — журнала нет
   hotkey-lines --offset N         строки журнала «хоткей:» после смещения N
   probe-grab СОЧЕТАНИЕ            XGrabKey на всех масках блокировок:
-                                  BadAccess — захват жив, успех — потерян (сразу снят)
+                                  BadAccess — захват занят (вероятно, Astra Voice),
+                                  успех — потерян (проба сразу снята)
   probe-keyboard                  XGrabKeyboard на своём окне: AlreadyGrabbed —
                                   клавиатуру держит чужой клиент
   keymap СОЧЕТАНИЕ                query_keymap: зажатые модификаторы и клавиша хоткея
@@ -206,27 +207,33 @@ def cmd_probe_grab(args: argparse.Namespace) -> int:
     from Xlib import X, error
 
     conn = open_display()
-    root = conn.screen().root
-    keycode, mods, key = parse_combo(conn, args.combo)
-    variants = [mods]
-    for lock in lock_masks(conn):
-        variants = list(dict.fromkeys(variants + [value | lock for value in variants]))
     busy: list[int] = []
     free: list[int] = []
-    for mask in variants:
-        catcher = error.CatchError(error.BadAccess)
-        root.grab_key(keycode, mask, True, X.GrabModeAsync, X.GrabModeAsync, onerror=catcher)
-        conn.sync()
-        if catcher.get_error() is not None:
-            busy.append(mask)
-        else:
-            free.append(mask)
-            root.ungrab_key(keycode, mask)
+    try:
+        root = conn.screen().root
+        keycode, mods, key = parse_combo(conn, args.combo)
+        variants = [mods]
+        for lock in lock_masks(conn):
+            variants = list(dict.fromkeys(variants + [value | lock for value in variants]))
+        for mask in variants:
+            catcher = error.CatchError(error.BadAccess)
+            root.grab_key(keycode, mask, True, X.GrabModeAsync, X.GrabModeAsync, onerror=catcher)
             conn.sync()
-    conn.close()
+            if catcher.get_error() is not None:
+                busy.append(mask)
+            else:
+                # Проба не должна перехватывать клавишу: снимаем сразу.
+                free.append(mask)
+                root.ungrab_key(keycode, mask)
+                conn.sync()
+    finally:
+        conn.close()
     label = f"{args.combo} (keycode={keycode}, mods={mods:#x}, клавиша {key})"
     if not free:
-        print(f"(а) XGrabKey {label}: BadAccess на всех {len(variants)} масках — захват жив.")
+        print(
+            f"(а) XGrabKey {label}: BadAccess на всех {len(variants)} масках — "
+            "захват занят (вероятно, Astra Voice)."
+        )
     elif not busy:
         print(
             f"(а) XGrabKey {label}: успех на всех {len(variants)} масках — "
@@ -234,7 +241,8 @@ def cmd_probe_grab(args: argparse.Namespace) -> int:
         )
     else:
         print(
-            f"(а) XGrabKey {label}: захват жив на масках {[hex(m) for m in busy]}, "
+            f"(а) XGrabKey {label}: захват занят (вероятно, Astra Voice) на масках "
+            f"{[hex(m) for m in busy]}, "
             f"потерян на {[hex(m) for m in free]} (проба сразу снята)."
         )
     return 0
@@ -276,12 +284,14 @@ def cmd_keymap(args: argparse.Namespace) -> int:
     from Xlib import XK
 
     conn = open_display()
-    keycode, _mods, key = parse_combo(conn, args.combo)
-    names = {int(conn.keysym_to_keycode(XK.string_to_keysym(n))): n for n in MODIFIER_NAMES}
-    names.pop(0, None)
-    names[keycode] = key
-    keymap = conn.query_keymap()
-    conn.close()
+    try:
+        keycode, _mods, key = parse_combo(conn, args.combo)
+        names = {int(conn.keysym_to_keycode(XK.string_to_keysym(n))): n for n in MODIFIER_NAMES}
+        names.pop(0, None)
+        names[keycode] = key
+        keymap = conn.query_keymap()
+    finally:
+        conn.close()
     held = [code for code in range(8, 256) if keymap[code // 8] & (1 << (code % 8))]
     known = sorted({names[code] for code in held if code in names})
     others = len([code for code in held if code not in names])
