@@ -199,6 +199,18 @@ def fake_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return appdir
 
 
+@pytest.fixture
+def system_checks_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Проверки процесса и дерева (префиксы, OpenSSL, ELF) — для настоящего бандла; здесь
+    интерпретатор тестов вне фальшивого AppDir. Их покрывает test_appimage_bundle_gate.py."""
+    monkeypatch.setattr(check_bundle, "check_prefixes", lambda appdir: [])
+    monkeypatch.setattr(check_bundle, "check_openssl", lambda *args, **kw: [])
+    monkeypatch.setattr(check_bundle, "check_needed", lambda appdir: (0, []))
+
+
+OPENSSL_ARGS = ["--openssl-major", "3", "--openssl-origin", "host"]
+
+
 def test_check_imports_on_fixture(fake_bundle: Path) -> None:
     problems = check_bundle.check_imports(
         ["bundled_fixture_mod", "json", "broken_fixture_mod", "absent_fixture_mod"],
@@ -216,6 +228,7 @@ def test_check_sys_path_on_fixture(fake_bundle: Path) -> None:
     assert problems == ["sys.path вне бандла: /usr/lib/python3"]
 
 
+@pytest.mark.usefixtures("system_checks_off")
 def test_warning_records_fail_the_gate(fake_bundle: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Любая запись WARNING за время проверки — нарушение (arch §11 п.3в)."""
     import logging
@@ -232,13 +245,15 @@ def test_warning_records_fail_the_gate(fake_bundle: Path, monkeypatch: pytest.Mo
 
     monkeypatch.setattr(check_bundle, "check_catalog", catalog)
     monkeypatch.setattr(sys, "path", [p for p in sys.path if str(fake_bundle) in p])
-    assert check_bundle.main(["--appdir", str(fake_bundle), "--control", str(control)]) == 1
+    args = ["--appdir", str(fake_bundle), "--control", str(control), *OPENSSL_ARGS]
+    assert check_bundle.main(args) == 1
     monkeypatch.setattr(check_bundle, "check_catalog", lambda: [])
-    assert check_bundle.main(["--appdir", str(fake_bundle), "--control", str(control)]) == 0
+    assert check_bundle.main(args) == 0
 
 
 def test_check_bundle_requires_marker(tmp_path: Path) -> None:
-    assert check_bundle.main(["--appdir", str(tmp_path), "--control", str(CONTROL)]) == 2
+    args = ["--appdir", str(tmp_path), "--control", str(CONTROL), *OPENSSL_ARGS]
+    assert check_bundle.main(args) == 2
 
 
 # --- SBOM AppImage (MN-5) ---------------------------------------------------------
@@ -400,6 +415,7 @@ def test_allow_missing_forgives_only_todo_modules() -> None:
     assert check_bundle.split_allowed(problems, []) == (problems, [])
 
 
+@pytest.mark.usefixtures("system_checks_off")
 def test_check_bundle_allow_missing_exit_code(
     fake_bundle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -414,7 +430,7 @@ def test_check_bundle_allow_missing_exit_code(
         lambda: ["jsonschema: SchemaUnavailable: Модуль jsonschema недоступен."],
     )
     monkeypatch.setattr(sys, "path", [p for p in sys.path if str(fake_bundle) in p])
-    args = ["--appdir", str(fake_bundle), "--control", str(control)]
+    args = ["--appdir", str(fake_bundle), "--control", str(control), *OPENSSL_ARGS]
     assert check_bundle.main(args) == 1
     assert check_bundle.main([*args, "--allow-missing", "jsonschema"]) == 0
     monkeypatch.setattr(check_bundle, "EXTRA_MODULES", ("bundled_fixture_mod", "json"))
