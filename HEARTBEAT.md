@@ -844,3 +844,32 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
 - Беклог: US-2.12 (команда Cowork удержанием средней кнопки мыши, Д44), US-6.7 (реальная скорость моделей: замер на машине
   заказчика −10 % как ориентир, Д45).
 - `wip/ma-foundation` (фундамент AppImage, 7 коммитов до ba5a8ee) на GitHub, в main — после проверок T1 в четверг 01.10.
+
+## 2026-09-29 ~13:00 — ПЕРЕД СЖАТИЕМ: состояние дня
+**Правило до сб 03.10:** лимиты Codex на исходе — новый код пишет `developer` (Claude Opus), Codex только architect-codex;
+начатые developer-codex доделываются (decisions f9a6994, память feedback_codex_limits_architecture_only).
+
+**Агенты в работе (фон):**
+- developer-codex (GPT-6 Astra) — трей без разборки объектов шины (регрессия #11, вариант Б отладчика), `wt-tray` /
+  `wip/fix-tray-bus`. Дальше: ревью → черновой PR → CI → слияние; урок 026 (получатель хуков QtDBus бессмертен; поправка к 025).
+  Пока не слит — `test_tray_dbus_lifetime[plasma_reply]` флейкает в CI любой ветки (не блокер других PR, повторять job).
+- developer-codex (Sol/Astra) — S5-A5 линии A (IPC v3, classify_change, state) и B (`worker/pulse_stream.py`, DONT_MOVE,
+  новый бэкенд за переменной окружения), `wt-mic` / `wip/s5a5-mic-change` (arch/s5a5-mic-change.md). Дальше: ревью →
+  **спайк C на стенде virtual_mic (Юрка; заказчик разрешил 29.09 — предупредить ДО и ПОСЛЕ, на время не диктовать)** → линия
+  D (GUI) → мини-Ц2 20 диктовок → живая проверка заказчиком ~03.10 (гарнитура/USB/BT, 5–10 мин).
+- code-reviewer — остаток шага 1 AppImage `ba5a8ee..82ba474` (`wt-ma`, ветка на GitHub). Ветка НЕ сливается до 01.10.
+- developer (Claude) — перенос сборки AppImage в `packaging/appimage/` + `scripts/release_*.sh` + `ci-workflow-patch.md`
+  (workflow только вызывает скрипты, флаг ENABLED), `wt-ci` / `wip/r2-ci` (от ma-foundation). Одна локальная сборка.
+- developer (Claude) — починка CI PR #13 (`wip/m7-http`, `wt-m7`): importorskip requests в tests/net для engine-job,
+  порог test_dns_budget, P3 (timeout None, тест-сторож внутренностей urllib3). После зелёного CI — слить #13.
+
+**Слито сегодня:** docs T1 → threat-model/test-plan (a152e2b); Command1 1.7 зеркало (e6d9a37). Решения: регрессия #11
+(5f36f5a), CA policy→системный→env (c476675), S5-A5 в 0.2 за счёт резерва 3–4.10 + стенд разрешён (8962939).
+
+**Дальше по M7 (Claude developer):** `net/github.py` (releases/latest → SemVer), `updates/checker.py` (раз в 24 ч, ОДИН общий
+UpdateCache на процесс, jitter 600 с), `core/policy.py` полный (У16/У37, T-19), UI «Сеть и обновления»/строка/трей, T-116.
+**Четверг 01.10:** T1-проверки (BL-1, MJ-1, MJ-3, MN-1/keylib.sh, MN-8; тесты T-175/177/179/181) + один T2 по дифу
+ma-foundation → слияние ma-foundation → rebase r2-ci. **05–06.10:** правка workflow заказчиком в браузере по ci-workflow-patch.md.
+**Беклог правок:** P2 — докачка моделей M6 на urllib3 2.8 (бандл AppImage: обрыв → host-unreachable вместо short-read);
+P2 — moveToThread в model_downloads (теоретически); P3 из #12 (край: _selfcheck не failed при невозможном откате);
+T-163…T-174 перенести из arch/appimage.md в test-plan; тексты S5-A5 «Сейчас используется» (вопрос PM, не блокирует).
