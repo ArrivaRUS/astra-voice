@@ -40,7 +40,6 @@ import json
 import math
 import os
 import queue
-import signal
 import statistics
 import subprocess
 import sys
@@ -144,13 +143,6 @@ def apply_probe_limits(min_ram_mb: int) -> None:
 
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     apply_address_space_limit(min_ram_mb)
-
-
-def set_parent_death_signal() -> None:
-    """Ставит только сигнал смерти родителя; используется проверкой пределов зонда."""
-    from astra_voice.worker.main import PR_SET_PDEATHSIG, _prctl
-
-    _prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
 
 
 def expect(replies: list[Message], kind: str) -> Message:
@@ -260,7 +252,11 @@ def run_probe(
 
 
 def probe_main(argv: list[str]) -> int:
-    """Дочерний процесс: JSON в одной строке или тихий выход при смерти родителя."""
+    """Дочерний процесс: JSON в одной строке или тихий выход при смерти родителя.
+
+    Если tools/benchmark — PID 1 (контейнер без init), harden_process вернёт False:
+    зонд выйдет молча, все модели получат «неверный ответ процесса».
+    """
     parser = argparse.ArgumentParser(prog="tools/benchmark _probe")
     for name in ("--id", "--revision", "--layout", "--variant"):
         parser.add_argument(name, required=True)

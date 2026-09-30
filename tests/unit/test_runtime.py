@@ -2339,6 +2339,25 @@ def test_mapping_second_long_loss_is_announced_after_interval(
     ]
 
 
+@pytest.mark.parametrize(
+    ("code", "expected_call"),
+    [
+        ("bad-combo", call.notify_hotkey_lost("bad-combo")),
+        ("busy", call.notify_hotkey_not_grabbed("Ctrl+Space")),
+    ],
+)
+def test_mapping_deferred_lost_notice_uses_latest_regrab_code(
+    monkeypatch: pytest.MonkeyPatch, code: ResultCode, expected_call: Any
+) -> None:
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    deferred = lose_again_within_interval(rig, batches)
+    backend.grab_combo.return_value = GrabResult(code)
+    runtime_timer(rig, rig.runtime._regrab_timer).fire()
+    rig.now += 40
+    deferred.fire()
+    assert rig.notify.mock_calls == [expected_call]
+
+
 @pytest.mark.parametrize("stop", ["regrab", "shutdown", "apply_hotkey"])
 def test_mapping_deferred_lost_notice_is_cancelled(
     monkeypatch: pytest.MonkeyPatch, stop: str

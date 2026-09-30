@@ -699,28 +699,28 @@ def test_hotkey_messages_name_combo_and_actions(
         (
             "bad-combo",
             "В текущей раскладке клавиатуры нет такого сочетания. Верните прежнюю раскладку "
-            "или назначьте другое сочетание в настройках. Программа продолжит пробовать "
-            "вернуть клавишу сама.",
+            "или назначьте другое сочетание в настройках. Программа продолжит пробовать вернуть "
+            "сочетание сама.",
         ),
         (
             "duplicate",
-            "Сочетание совпало с другой клавишей программы. Назначьте другое сочетание "
-            "в настройках. Программа продолжит пробовать вернуть клавишу сама.",
+            "Программа продолжит пробовать вернуть сочетание сама. Если не получится, откройте настройки "
+            "и назначьте сочетание снова.",
         ),
         (
             "not-grabbed",
-            "Сочетание клавиш перестало работать. Программа продолжит пробовать вернуть его сама. "
-            "Если не получится, откройте настройки и назначьте его снова.",
+            "Программа продолжит пробовать вернуть сочетание сама. Если не получится, откройте настройки "
+            "и назначьте сочетание снова.",
         ),
         (
             "неизвестная-причина",
-            "Сочетание клавиш перестало работать. Программа продолжит пробовать вернуть его сама. "
-            "Если не получится, откройте настройки и назначьте его снова.",
+            "Программа продолжит пробовать вернуть сочетание сама. Если не получится, откройте настройки "
+            "и назначьте сочетание снова.",
         ),
         (
             "",
-            "Сочетание клавиш перестало работать. Программа продолжит пробовать вернуть его сама. "
-            "Если не получится, откройте настройки и назначьте его снова.",
+            "Программа продолжит пробовать вернуть сочетание сама. Если не получится, откройте настройки "
+            "и назначьте сочетание снова.",
         ),
     ],
 )
@@ -1279,15 +1279,6 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
         for statement in function.body
         if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
     }
-    allowed_lost_body = {
-        statement.value: ast.dump(
-            ast.parse("_HOTKEY_LOST_BODIES.get(code, _HOTKEY_LOST_DEFAULT_BODY)", mode="eval").body
-        )
-        for function in tree.body
-        if isinstance(function, ast.FunctionDef) and function.name == "notify_hotkey_lost"
-        for statement in function.body
-        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
-    }
     # У онбординга два типизированных перехода: контроллер → host → обёртка.
     # Разрешены только точные вызовы в соответствующих методах этих классов.
     onboarding_calls = {
@@ -1362,13 +1353,6 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
                 and ast.dump(argument) == allowed_templates[node]
             ):
                 continue
-            if (
-                implementation
-                and leaf == "notify"
-                and node in allowed_lost_body
-                and ast.dump(argument) == allowed_lost_body[node]
-            ):
-                continue
             if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
                 continue
             if isinstance(argument, ast.Name) and argument.id in constants:
@@ -1425,6 +1409,15 @@ def test_project_notifications_contain_no_dictation() -> None:
         'def notify_microphone_selected(name):\n    notify(f"Микрофон: {text}")',
         'def notify_hotkey_regrabbed(combo):\n    notify(f"Запись: {text}")',
         'def notify_hotkey_lost(code):\n    notify("Потеря", text)',
+        'BODY = "x"\ndef notify_hotkey_lost(code=""):\n    BODY = code\n    notify("T", BODY)',
+        (
+            'BODIES = {"a": text}\ndef notify_hotkey_lost(code=""):\n'
+            '    notify("T", BODIES.get(code, "x"))'
+        ),
+        (
+            'BODIES = {}\ndef notify_hotkey_lost(code=""):\n'
+            '    BODIES[code] = code\n    notify("T", BODIES.get(code, "x"))'
+        ),
         'notify("Запись", actions=text)',
         'notify("Запись", actions=[("details", text)])',
         'notify("Запись", actions=[(text, "Подробности")])',

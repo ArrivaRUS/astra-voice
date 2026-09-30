@@ -1527,6 +1527,28 @@ def test_removed_catalog_broken_card_only_offers_removal(rig: Rig) -> None:
     assert queued == []
 
 
+def test_removed_catalog_failed_card_cannot_retry(rig: Rig) -> None:
+    port, downloads, queued = rig
+    removed = replace(TONE, id="old-model", revision="r1", removed_from_catalog=True)
+    port.catalog = (*port.catalog, removed)
+    downloads._entries = port.catalog
+    port.records[(removed.id, removed.revision)] = "ok"
+    downloads._card_states[removed.id] = "failed"
+
+    item = card(downloads, removed.id)
+    assert item["state"] == "failed"
+    assert item["canRetry"] is False
+    downloads.retryModel(removed.id)
+    assert queued == []
+
+    available = replace(removed, removed_from_catalog=False)
+    port.catalog = (*port.catalog[:-1], available)
+    downloads._entries = port.catalog
+    item = card(downloads, available.id)
+    assert item["state"] == "failed"
+    assert item["canRetry"] is True
+
+
 def test_removed_catalog_pause_hint_takes_priority() -> None:
     port = FakeManagedPort()
     removed = replace(TONE, id="old-model", revision="r1", removed_from_catalog=True)

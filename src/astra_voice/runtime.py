@@ -1377,6 +1377,8 @@ class DictationRuntime(QObject):
             self._record_hotkey_grab("regrabbed", self._regrab_attempts)
         elif result.code != self._regrab_code:
             log.info("Повторный захват горячей клавиши: %s → %s", self._regrab_code, result.code)
+        if not result.ok:
+            self._hotkey_lost_code = result.code
         self._regrab_code = result.code
 
     def _record_hotkey_grab(self, result: str, attempts: int) -> None:
