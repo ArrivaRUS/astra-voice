@@ -439,7 +439,7 @@ def test_remove_program_keep_adds_to_running_copy(
     assert copy.is_dir() and second.is_dir() and not third.exists()
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root пишет в каталог 0o500 — запасной путь не сработает")
+@pytest.mark.skipif(os.geteuid() == 0, reason="root пишет и в каталог 0o500")
 def test_running_key_read_follows_write_fallback(
     home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
