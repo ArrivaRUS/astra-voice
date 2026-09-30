@@ -40,7 +40,6 @@ def executable() -> str:
     """
     kind = paths.install_kind()
     if kind is paths.InstallKind.APPIMAGE_INSTALLED:
-        # T1-01.10: MJ-1 — строгая проверка пути в paths.check_appimage_launcher().
         return str(paths.check_appimage_launcher(paths.appimage_current_apprun()))
     if kind is paths.InstallKind.APPIMAGE_PORTABLE:
         raise AutostartUnavailableError("Автозапуск доступен после установки программы")

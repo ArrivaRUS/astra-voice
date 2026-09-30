@@ -40,9 +40,7 @@ APPIMAGE_PREVIOUS = "previous"
 APPIMAGE_LAUNCHER = "AppRun"
 # <AppDir>/usr/lib/astra-voice/astra_voice/core/paths.py → parents[5] = <AppDir>
 _BUNDLE_DEPTH = 5
-# T1-01.10: MN-1 — APPIMAGE_KEY_RE станет единственной грамматикой KEY: та же маска в
-# packaging/appimage/keylib.sh (key_ok) и общий набор векторов
-# tests/fixtures/appimage/keys.txt для sh и Python (T-181).
+# Та же грамматика в packaging/appimage/keylib.sh; совпадение проверяет T-181.
 APPIMAGE_KEY_RE = re.compile(r"\d+\.\d+\.\d+(?:~[A-Za-z0-9.]+)?-[0-9a-f]{12}", re.ASCII)
 
 # src/astra_voice/core/paths.py → src/astra_voice/core → src/astra_voice → src → корень
@@ -289,10 +287,38 @@ def appimage_current_apprun() -> Path:
 def check_appimage_launcher(path: Path) -> Path:
     """Проверка пути, который попадёт в ``Exec`` меню и автозапуска.
 
-    Сейчас пропускает любой путь; строгая проверка — в четверг 01.10.
+    Возвращает исходный путь через ``current``, проверив установленную копию.
     """
-    # T1-01.10: MJ-1 — путь обязан быть is_relative_to(appimage_app_dir()), app/current —
-    # наш симлинк с целью-KEY внутри app/ (не /tmp/.mount_*, не распаковка); иначе PathError.
+    error = "Не удалось найти установленную программу. Переустановите Astra Voice."
+    app = appimage_app_dir().absolute()
+    launcher = path.absolute()
+    current = app / APPIMAGE_CURRENT
+    if (
+        ".." in path.parts
+        or not launcher.is_relative_to(app)
+        or launcher != current / APPIMAGE_LAUNCHER
+    ):
+        raise PathError(error)
+    try:
+        # readlink также отклоняет обычный каталог вместо ссылки current.
+        target = Path(os.readlink(current))
+        resolved_app = app.resolve(strict=True)
+        resolved_target = (app / target).resolve(strict=True)
+        resolved_launcher = launcher.resolve(strict=True)
+        valid = (
+            ".." not in target.parts
+            and is_appimage_key(target.name)
+            and is_appimage_key(resolved_target.name)
+            and resolved_target.is_relative_to(resolved_app)
+            and resolved_target.parent == resolved_app
+            and resolved_target.is_dir()
+            and resolved_launcher.is_relative_to(resolved_app)
+            and resolved_launcher.is_file()
+        )
+    except (OSError, RuntimeError, ValueError):
+        raise PathError(error) from None
+    if not valid:
+        raise PathError(error)
     return path
 
 

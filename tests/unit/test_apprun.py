@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import shutil
@@ -18,12 +19,14 @@ import pytest
 
 from astra_voice.core import childenv, paths, policy
 from astra_voice.platform import userinstall
-from helpers.appimage_bundle import KEY, VERSION, make_bundle
+from helpers.appimage_bundle import KEY, VERSION, make_bundle, tree_snapshot
 
 pytestmark = pytest.mark.unit
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 APPRUN = REPO_ROOT / "packaging" / "appimage" / "AppRun"
+KEYLIB = APPRUN.with_name("keylib.sh")
+KEY_CASES = REPO_ROOT / "tests" / "fixtures" / "appimage" / "keys.txt"
 DEV_BOOTSTRAP = REPO_ROOT / "src" / "astra_voice" / "bootstrap.py"
 
 FAKE_PYTHON = """#!/bin/sh
@@ -70,6 +73,7 @@ def env(tmp_path: Path) -> dict[str, str]:
 
 def _bundle(root: Path) -> Path:
     bundle = make_bundle(root, apprun=APPRUN.read_text(encoding="utf-8"))
+    shutil.copyfile(KEYLIB, bundle / "keylib.sh")
     python = bundle / "opt" / "python3.11" / "bin" / "python3.11"
     python.write_text(
         FAKE_PYTHON.replace("@REAL_PY@", sys.executable).replace("@VERSION@", VERSION),
@@ -225,11 +229,136 @@ def test_service_flags_match_python() -> None:
     assert flags == userinstall.SERVICE_FLAGS
 
 
-def test_t1_markers_present() -> None:
-    """Точки расширения на 01.10 в AppRun помечены (MJ-3, MN-1)."""
+def test_apprun_uses_keylib() -> None:
+    """MN-1: AppRun подключает общую проверку вместо собственной заглушки."""
     text = APPRUN.read_text(encoding="utf-8")
-    assert "# T1-01.10: MJ-3" in text
-    assert "# T1-01.10: MN-1" in text
+    assert "T1-01.10" not in text
+    assert '. "$HERE/keylib.sh"' in text
+    assert re.search(r"\bkey_ok\s*\(\s*\)", text) is None
+
+
+def _key_cases() -> list[tuple[bool, str]]:
+    cases = []
+    for line in KEY_CASES.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        verdict, literal = line.split("\t", 1)
+        assert verdict in {"ok", "bad"}
+        name = ast.literal_eval(literal)
+        assert isinstance(name, str)
+        cases.append((verdict == "ok", name))
+    assert cases
+    return cases
+
+
+@pytest.mark.parametrize(("expected", "name"), _key_cases())
+def test_t181_key_grammar(expected: bool, name: str) -> None:
+    """T-181: общие примеры для Python и настоящей POSIX sh."""
+    proc = subprocess.run(
+        ["sh", "-c", '. "$1"; key_ok "$2"', "sh", str(KEYLIB), name],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        stdin=subprocess.DEVNULL,
+    )
+    assert proc.returncode in (0, 1), proc.stderr
+    assert proc.stdout == proc.stderr == ""
+    assert (
+        (paths.APPIMAGE_KEY_RE.fullmatch(name) is not None)
+        == paths.is_appimage_key(name)
+        == userinstall.is_key(name)
+        == expected
+        == (proc.returncode == 0)
+    )
+    assert userinstall.KEY_RE is paths.APPIMAGE_KEY_RE
+
+
+def test_t181_key_directory_symlink_rejected(tmp_path: Path) -> None:
+    """Правильное имя не разрешает установке и чистке следовать по ссылке."""
+    bundle = _bundle(tmp_path / "outside")
+    (bundle / paths.INSTALLED_MARKER).touch()
+    info = userinstall.read_build_info(bundle)
+    assert userinstall.installed_ok(bundle, info)
+    app = tmp_path / "app"
+    app.mkdir()
+    target = app / KEY
+    target.symlink_to(bundle, target_is_directory=True)
+    before = tree_snapshot(tmp_path)
+    assert paths.is_appimage_key(target.name)
+    assert userinstall.is_key(target.name)
+    assert not userinstall.installed_ok(target, info)
+    assert userinstall._cleanup(app, ()) == []
+    assert tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("state", ["missing", "unreadable", "directory"])
+def test_unavailable_keylib_refused(tmp_path: Path, env: dict[str, str], state: str) -> None:
+    root = _bundle(tmp_path / "appimage_extracted_1")
+    keylib = root / "keylib.sh"
+    if state == "unreadable":
+        keylib.chmod(0)
+    else:
+        keylib.unlink()
+        if state == "directory":
+            keylib.mkdir()
+    proc = _run(root / "AppRun", [], env, "sh")
+    assert proc.returncode == 1
+    assert proc.stderr == "Повреждены сведения о сборке Astra Voice.\n"
+    assert proc.stdout == ""
+    assert _calls(env) == []
+
+
+def _id_shim(tmp_path: Path, env: dict[str, str], uid: int) -> dict[str, str]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    script = bin_dir / "id"
+    script.write_text(f'#!/bin/sh\n[ "$1" = -u ] || exit 99\nprintf "%s\\n" {uid}\n')
+    script.chmod(0o755)
+    return {**env, "PATH": f"{bin_dir}:{env['PATH']}"}
+
+
+@pytest.mark.parametrize("colon", [False, True])
+@pytest.mark.parametrize("args", [[], ["--version"], ["--uninstall"], ["--selfinstall-status"]])
+def test_root_refused_before_cleanup_or_launch(
+    tmp_path: Path, env: dict[str, str], colon: bool, args: list[str]
+) -> None:
+    """T-179: отказ root сохраняет даже распаковку с двоеточием в пути."""
+    bundle = _bundle(tmp_path / ("a:b" if colon else "tmp") / "appimage_extracted_root")
+    env = _id_shim(tmp_path, env, 0)
+    # Любая внешняя команда после id означает, что ранний отказ был обойдён.
+    for name in ("dirname", "readlink", "rm", "sed", "awk"):
+        command = tmp_path / "bin" / name
+        command.write_text('#!/bin/sh\nprintf "%s\\n" unexpected >&2\nexit 99\n')
+        command.chmod(0o755)
+    before = tree_snapshot(tmp_path)
+    proc = _run(bundle / "AppRun", args, env, "sh")
+    assert proc.returncode == 3
+    assert proc.stderr == userinstall.ROOT_REFUSED_MESSAGE + "\n"
+    assert proc.stdout == ""
+    assert bundle.is_dir()
+    assert _calls(env) == []
+    assert tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("colon", [False, True])
+def test_nonroot_shim_keeps_existing_behavior(
+    tmp_path: Path, env: dict[str, str], colon: bool
+) -> None:
+    bundle = _bundle(tmp_path / ("a:b" if colon else "tmp") / "appimage_extracted_user")
+    env = _id_shim(tmp_path, env, 1000)
+    proc = _run(bundle / "AppRun", ["--version"], env, "sh")
+    if colon:
+        assert proc.returncode == 1
+        assert "двоеточие «:»" in proc.stderr
+        assert not bundle.exists()
+        assert _calls(env) == []
+    else:
+        assert proc.returncode == 0
+        assert proc.stderr == ""
+        assert proc.stdout == f"astra-voice {VERSION}\n"
+        assert bundle.is_dir()
+        assert _calls(env) == [f"app|--version|HERE={bundle}|EAR=|PP="]
+    assert not _app(env).exists()
 
 
 def _mount(tmp_path: Path, bundle: Path) -> Path:
@@ -461,15 +590,18 @@ def _policy_boot(bundle: Path, config: Path, system: Path) -> None:
     )
 
 
-def test_apprun_does_not_parse_policy() -> None:
+@pytest.mark.parametrize("script", [APPRUN, KEYLIB])
+def test_apprun_does_not_parse_policy(script: Path) -> None:
     """P2-2: одна точка правды для appimage=deny — core/policy.py, в AppRun разбора нет."""
     code = "\n".join(
         line
-        for line in APPRUN.read_text(encoding="utf-8").splitlines()
+        for line in script.read_text(encoding="utf-8").splitlines()
         if not line.lstrip().startswith("#")
     )
     assert "policy" not in code.lower()
     assert "appimage[" not in code and "grep" not in code
+    if script == KEYLIB:
+        assert re.search(r"\b(?:sed|awk|expr)\b", code) is None
 
 
 @pytest.mark.parametrize("shell", SHELLS)

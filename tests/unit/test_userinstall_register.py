@@ -373,6 +373,22 @@ def test_register_guards_run_before_any_write(
     assert tree_snapshot(home) == before
 
 
+def test_register_rejects_external_launcher_before_any_write(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-177: настоящая проверка запрещает меню и автозапуск для внешнего AppRun."""
+    copy = installed(monkeypatch)
+    apprun = copy / "AppRun"
+    apprun.unlink()
+    apprun.symlink_to(make_bundle(tmp_path / "outside") / "AppRun")
+    before = tree_snapshot(tmp_path)
+    with pytest.raises(paths.PathError, match="Переустановите Astra Voice"):
+        userinstall.register()
+    assert not menu_path(home).exists()
+    assert not (home / "config/autostart/astra-voice.desktop").exists()
+    assert tree_snapshot(tmp_path) == before
+
+
 def test_remove_program_uses_install_lock_and_never_follows_copy_links(
     home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

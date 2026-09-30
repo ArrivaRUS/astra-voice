@@ -449,6 +449,7 @@ printf '# Сгенерировано packaging/appimage/build.sh из packaging/
     "$VERSION" > "$LIB/astra_voice/_version.py"
 
 install -m 755 "$HERE/AppRun" "$APPDIR/AppRun"
+install -m 644 "$HERE/keylib.sh" "$APPDIR/keylib.sh"
 install -m 644 "$HERE/astra-voice.desktop" "$APPDIR/astra-voice.desktop"
 install -m 644 "$APPDIR/usr/share/icons/hicolor/256x256/apps/astravoice.png" "$APPDIR/astravoice.png"
 ln -s astravoice.png "$APPDIR/.DirIcon"

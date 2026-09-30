@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from astra_voice.core import paths
-from astra_voice.platform import userinstall
+from astra_voice.platform import autostart, userinstall
 from helpers.appimage_bundle import BUILD_ID, KEY, VERSION, make_bundle, tree_snapshot
 
 pytestmark = pytest.mark.unit
@@ -172,6 +172,105 @@ def test_running_key_protects_copy(tmp_path: Path, home: Path) -> None:
     (paths.runtime_dir() / "running-key").write_text("../../outside\n", encoding="ascii")
     assert userinstall.cleanup() == [KEY]
     assert sorted(p for p in os.listdir(app) if userinstall.is_key(p)) == [KEY2, KEY3]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["symlink", "fifo", "directory", "foreign", "garbage", "path", "nonascii", "large", "missing"],
+)
+def test_running_key_rejects_unsafe_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """T-199: опасная метка отвергается, следующий кандидат всё равно читается."""
+    runtime = tmp_path / "runtime"
+    fallback = tmp_path / "fallback"
+    runtime.mkdir()
+    fallback.mkdir()
+    monkeypatch.setattr(paths, "existing_runtime_dirs", lambda: (runtime, fallback))
+    marker = runtime / "running-key"
+    if kind == "symlink":
+        target = tmp_path / "valid-key"
+        target.write_text(KEY, encoding="ascii")
+        marker.symlink_to(target)
+    elif kind == "fifo":
+        os.mkfifo(marker)
+        original_open = os.open
+
+        def nonblocking_open(path: Path, flags: int) -> int:
+            # Проверка до настоящего open: регрессия не повесит процесс тестов.
+            assert flags & os.O_NONBLOCK
+            return original_open(path, flags)
+
+        monkeypatch.setattr(os, "open", nonblocking_open)
+    elif kind == "directory":
+        marker.mkdir()
+    elif kind != "missing":
+        content = {
+            "foreign": KEY.encode("ascii"),
+            "garbage": b"not a key",
+            "path": b"../../outside",
+            "nonascii": KEY.encode("ascii") + b"\xff",
+            "large": KEY.encode("ascii") + b" " * userinstall.RUNNING_KEY_LIMIT,
+        }[kind]
+        marker.write_bytes(content)
+        if kind == "foreign":
+            foreign_uid = os.getuid() + 1
+            monkeypatch.setattr(os, "getuid", lambda: foreign_uid)
+    assert userinstall.read_running_key() is None
+    assert userinstall.read_running_keys() == frozenset()
+    if kind == "foreign":
+        return
+    (fallback / "running-key").write_text(KEY2 + "\n", encoding="ascii")
+    assert userinstall.read_running_key() == KEY2
+    assert userinstall.read_running_keys() == frozenset({KEY2})
+
+
+@pytest.mark.parametrize("size", [len(KEY) + 2, userinstall.RUNNING_KEY_LIMIT])
+def test_running_key_accepts_valid_ascii_at_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
+    monkeypatch.setattr(paths, "existing_runtime_dirs", lambda: (tmp_path,))
+    (tmp_path / "running-key").write_bytes(
+        b"\n" + KEY.encode("ascii") + b" " * (size - len(KEY) - 1)
+    )
+    assert userinstall.read_running_key() == KEY
+    assert userinstall.read_running_keys() == frozenset({KEY})
+
+
+@pytest.mark.parametrize("operation", ["install", "cleanup", "remove"])
+def test_all_running_keys_protect_copies(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """T-199: актуальная и устаревшая метки защищают обе копии при любой чистке."""
+    monkeypatch.setattr(paths, "FALLBACK_TMP_DIR", tmp_path)
+    userinstall.write_running_key(KEY)
+    fallback = tmp_path / f"astra-voice-{os.getuid()}"
+    fallback.mkdir(mode=0o700)
+    (fallback / "running-key").write_text(KEY2 + "\n", encoding="ascii")
+    assert userinstall.read_running_key() == KEY
+    assert userinstall.read_running_keys() == frozenset({KEY, KEY2})
+    assert userinstall.status().running == KEY
+
+    app = _app(home)
+    app.mkdir(parents=True)
+    obsolete = "0.1.0-cccccccccccc"
+    for key in (KEY, KEY2, obsolete):
+        (app / key).mkdir()
+    if operation == "install":
+        userinstall.install_from_dir(_bundle(tmp_path, KEY3))
+    else:
+        (app / KEY3).mkdir()
+        (app / "current").symlink_to(KEY3)
+        if operation == "cleanup":
+            assert userinstall.cleanup() == [obsolete]
+        else:
+            result = userinstall.remove_program(keep=KEY3)
+            assert result.kept == tuple(sorted((KEY, KEY2, KEY3)))
+            assert obsolete in result.removed
+    assert (app / KEY).is_dir()
+    assert (app / KEY2).is_dir()
+    assert (app / KEY3).is_dir()
+    assert not (app / obsolete).exists()
 
 
 def test_not_enough_space_creates_nothing(tmp_path: Path, home: Path) -> None:
@@ -379,10 +478,98 @@ def test_error_messages_hide_home(tmp_path: Path, home: Path) -> None:
     assert userinstall.tilde("/usr/bin/x") == "/usr/bin/x"
 
 
-def test_t1_extension_points_pass_until_thursday(tmp_path: Path) -> None:
-    """Метки T1-01.10: BL-1 и MJ-3 пока пропускают (решение заказчика 28.09)."""
-    userinstall.refuse_root()
+def test_check_source_hygiene_creates_nothing(tmp_path: Path) -> None:
+    """Гигиена без отказов и новых файлов: решение 30.09, BL-1a, вариант б."""
+    before = tree_snapshot(tmp_path)
     userinstall.check_source(tmp_path)
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_source_and_launchers_have_no_t1_reminders() -> None:
+    root = Path(__file__).resolve().parents[2]
+    files = sorted((root / "src/astra_voice").rglob("*.py"))
+    assert files
+    files.extend(root / "packaging/appimage" / name for name in ("AppRun", "keylib.sh"))
+    marker = "T1-" + "01.10"
+    remaining = [
+        str(path.relative_to(root)) for path in files if marker in path.read_text(encoding="utf-8")
+    ]
+    assert not remaining, remaining
+
+
+@pytest.mark.parametrize("kind", list(paths.InstallKind))
+@pytest.mark.parametrize("euid", [0, 1000])
+def test_refuse_root_only_in_appimage(
+    monkeypatch: pytest.MonkeyPatch, kind: paths.InstallKind, euid: int
+) -> None:
+    monkeypatch.setattr(paths, "install_kind", lambda: kind)
+    monkeypatch.setattr(os, "geteuid", lambda: euid)
+    if kind.is_appimage and euid == 0:
+        with pytest.raises(userinstall.RootRefusedError) as caught:
+            userinstall.refuse_root()
+        assert caught.value.exit_code == 3
+        assert str(caught.value) == userinstall.ROOT_REFUSED_MESSAGE
+    else:
+        userinstall.refuse_root()
+
+
+@pytest.mark.parametrize(
+    "kind", [paths.InstallKind.APPIMAGE_PORTABLE, paths.InstallKind.APPIMAGE_INSTALLED]
+)
+@pytest.mark.parametrize("installed", [False, True])
+@pytest.mark.parametrize("operation", ["install", "register", "unregister", "remove"])
+def test_root_refusal_changes_no_files(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: paths.InstallKind,
+    installed: bool,
+    operation: str,
+) -> None:
+    """T-179: отказ до копирования, записи меню, автозапуска и удаления."""
+    src = make_bundle(tmp_path / "bundle", icons=True)
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    if installed:
+        userinstall.install_from_dir(src)
+        userinstall.register()
+        startup = home / ".config/autostart/astra-voice.desktop"
+        startup.parent.mkdir(parents=True)
+        startup.write_bytes(autostart.entry_bytes(str(paths.appimage_current_apprun())))
+    monkeypatch.setattr(paths, "install_kind", lambda: kind)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    before = tree_snapshot(tmp_path)
+    metadata = {p: (p.lstat().st_mtime_ns, p.lstat().st_ctime_ns) for p in tmp_path.rglob("*")}
+    actions = {
+        "install": lambda: userinstall.install_from_dir(src),
+        "register": userinstall.register,
+        "unregister": userinstall.unregister,
+        "remove": userinstall.remove_program,
+    }
+    with pytest.raises(userinstall.RootRefusedError) as caught:
+        actions[operation]()
+    assert caught.value.exit_code == 3
+    assert str(caught.value) == userinstall.ROOT_REFUSED_MESSAGE
+    assert tree_snapshot(tmp_path) == before
+    assert {p: (p.lstat().st_mtime_ns, p.lstat().st_ctime_ns) for p in metadata} == metadata
+
+
+@pytest.mark.parametrize(
+    "kind", [paths.InstallKind.APPIMAGE_PORTABLE, paths.InstallKind.APPIMAGE_INSTALLED]
+)
+@pytest.mark.parametrize("flag", ["--hidden", *sorted(userinstall.SERVICE_FLAGS)])
+def test_selfinstall_root_refusal_before_service_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    kind: paths.InstallKind,
+    flag: str,
+) -> None:
+    monkeypatch.setattr(paths, "install_kind", lambda: kind)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    before = tree_snapshot(tmp_path)
+    assert userinstall.selfinstall_main([str(tmp_path / "missing"), flag], {}) == 3
+    assert capsys.readouterr().err == userinstall.ROOT_REFUSED_MESSAGE + "\n"
+    assert tree_snapshot(tmp_path) == before
 
 
 def test_sync_before_smoke_and_rename(tmp_path: Path, home: Path, synced: list[Path]) -> None:

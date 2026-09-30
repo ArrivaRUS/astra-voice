@@ -14,6 +14,15 @@
 # и ASTRA_VOICE_PORTABLE=1 не устанавливают ничего.
 set -eu
 
+refuse_root() {
+    if [ "$(id -u)" = 0 ]; then
+        printf '%s\n' 'Версия AppImage не работает от имени администратора. Запустите её от обычного пользователя' >&2
+        exit 3
+    fi
+}
+
+refuse_root
+
 HERE=$(dirname "$(readlink -f "$0")")
 PY=$HERE/opt/python3.11/bin/python3.11
 BOOTSTRAP=$HERE/usr/lib/astra-voice/bootstrap.py
@@ -25,6 +34,9 @@ die() {
     printf '%s\n' "$1" >&2
     exit "${2:-1}"
 }
+
+[ -f "$HERE/keylib.sh" ] && [ -r "$HERE/keylib.sh" ] || die 'Повреждены сведения о сборке Astra Voice.'
+. "$HERE/keylib.sh"
 
 # «:» в пути ломает списки путей (QT_PLUGIN_PATH, QML2_IMPORT_PATH): отказ сразу и понятно.
 # Своя временная распаковка (appimage_extracted_*, наш владелец, маркер сборки, не ссылка)
@@ -42,22 +54,6 @@ case $HERE in
         ;;
 esac
 
-# T1-01.10: MJ-3 — при `id -u` = 0 отказ до любых действий: «Версия AppImage не
-# запускается от имени root. Управляйте ею под учётной записью пользователя», код 3 (T-179).
-refuse_root() {
-    :
-}
-
-# T1-01.10: MN-1 — заменить на key_ok из packaging/appimage/keylib.sh: та же грамматика,
-# что userinstall.KEY_RE, общий набор векторов tests/fixtures/appimage/keys.txt (T-181).
-# Пока — проверка спайка: непустой, без «/», пробелов и управляющих символов.
-key_ok() {
-    case $1 in
-        '' | *[!A-Za-z0-9._~+-]*) return 1 ;;
-    esac
-    return 0
-}
-
 # Служебные флаги не устанавливают программу (спайк §7.10).
 # Тот же список — userinstall.SERVICE_FLAGS (сверяет test_apprun.py).
 is_service() {
@@ -68,8 +64,6 @@ is_service() {
     done
     return 1
 }
-
-refuse_root
 
 [ -r "$BUILD_FILE" ] || die 'Не найдены сведения о сборке Astra Voice.'
 VERSION=$(sed -n 's/^VERSION=//p' "$BUILD_FILE" | head -n 1)
