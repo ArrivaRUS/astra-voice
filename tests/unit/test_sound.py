@@ -14,8 +14,8 @@ import pytest
 
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.sound import (
-    FULL_VOLUME_PERCENT,
     LOW_VOLUME_PERCENT,
+    RAISE_TARGET_PERCENT,
     MicrophoneProblem,
     MicrophoneState,
     SoundControl,
@@ -127,7 +127,7 @@ def test_default_source_is_used_without_explicit_choice() -> None:
     assert [call[-1] for call in runner.calls] == ["@DEFAULT_SOURCE@", "@DEFAULT_SOURCE@"]
 
 
-def test_raise_microphone_unmutes_and_sets_full_volume() -> None:
+def test_raise_microphone_unmutes_and_sets_target_volume() -> None:
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: yes\n"),
@@ -137,12 +137,12 @@ def test_raise_microphone_unmutes_and_sets_full_volume() -> None:
     assert sound.raise_microphone("mic")
     assert runner.calls[-2:] == [
         ["pactl", "set-source-mute", "mic", "0"],
-        ["pactl", "set-source-volume", "mic", f"{FULL_VOLUME_PERCENT}%"],
+        ["pactl", "set-source-volume", "mic", f"{RAISE_TARGET_PERCENT}%"],
     ]
 
 
 def test_raise_microphone_keeps_volume_above_full() -> None:
-    """Громкость выше 100 % не трогаем: только включаем звук (PRD F6.7 (б))."""
+    """Громкость 130 % не трогаем: только включаем звук."""
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: yes\n"),
@@ -150,14 +150,236 @@ def test_raise_microphone_keeps_volume_above_full() -> None:
         }
     )
     assert sound.raise_microphone("mic")
-    assert ["pactl", "set-source-volume", "mic", "100%"] not in runner.calls
+    assert not any(call[1] == "set-source-volume" for call in runner.calls)
     assert runner.calls[-1] == ["pactl", "set-source-mute", "mic", "0"]
+
+
+@pytest.mark.parametrize("percent", [60, 80])
+def test_raise_microphone_unmutes_without_lowering_volume(percent: int) -> None:
+    sound, runner = control(
+        replies={
+            "get-source-mute": (0, "Mute: yes\n"),
+            "get-source-volume": (0, f"Volume: front-left: 1 / {percent}% / -6 dB\n"),
+        }
+    )
+    assert sound.raise_microphone("mic") is True
+    assert not any(call[1] == "set-source-volume" for call in runner.calls)
+    assert runner.calls[-1] == ["pactl", "set-source-mute", "mic", "0"]
+
+
+def test_raise_microphone_sets_target_when_current_volume_unknown() -> None:
+    sound, runner = control(
+        replies={
+            "get-source-mute": (0, "Mute: yes\n"),
+            "get-source-volume": (1, ""),
+        }
+    )
+    assert sound.raise_microphone("mic") is True
+    assert runner.calls[-2:] == [
+        ["pactl", "set-source-mute", "mic", "0"],
+        ["pactl", "set-source-volume", "mic", f"{RAISE_TARGET_PERCENT}%"],
+    ]
 
 
 def test_raise_microphone_reports_failure_without_pactl() -> None:
     sound, runner = control(present=("systemctl",))
     assert not sound.raise_microphone("mic")
     assert runner.calls == []
+
+
+def test_restore_microphone_returns_first_known_volume_and_unmute_state() -> None:
+    sound, runner = control(
+        replies={
+            "get-source-mute": (0, "Mute: no\n"),
+            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+        }
+    )
+    assert sound.raise_microphone("mic")
+    assert sound.can_restore_microphone("mic")
+    runner.replies["get-source-volume"] = (
+        0,
+        f"Volume: front-left: 1 / {RAISE_TARGET_PERCENT}% / -8 dB\n",
+    )
+    assert sound.raise_microphone("mic")
+    assert sound.restore_microphone("mic")
+    assert runner.calls[-2:] == [
+        ["pactl", "set-source-volume", "mic", "25%"],
+        ["pactl", "set-source-mute", "mic", "0"],
+    ]
+    assert not sound.can_restore_microphone("mic")
+
+
+def test_restore_microphone_returns_original_mute_state() -> None:
+    sound, runner = control(
+        replies={
+            "get-source-mute": (0, "Mute: yes\n"),
+            "get-source-volume": (0, "Volume: front-left: 1 / 80% / -6 dB\n"),
+        }
+    )
+    assert sound.raise_microphone("mic")
+    assert sound.restore_microphone("mic")
+    assert runner.calls[-2:] == [
+        ["pactl", "set-source-volume", "mic", "80%"],
+        ["pactl", "set-source-mute", "mic", "1"],
+    ]
+
+
+def test_raise_microphone_without_change_does_not_remember() -> None:
+    sound, _ = control(
+        replies={
+            "get-source-mute": (0, "Mute: no\n"),
+            "get-source-volume": (0, "Volume: front-left: 1 / 80% / -6 dB\n"),
+        }
+    )
+    assert sound.raise_microphone("mic")
+    assert not sound.can_restore_microphone("mic")
+
+
+def test_raise_microphone_remembers_when_only_one_command_succeeds() -> None:
+    sound, runner = control(
+        replies={
+            "get-source-mute": (0, "Mute: no\n"),
+            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+        },
+        fails=("set-source-volume",),
+    )
+    assert not sound.raise_microphone("mic")
+    assert sound.can_restore_microphone("mic")
+    runner.fails = ("set-source-mute", "set-source-volume")
+    sound.forget_microphone_changes()
+    assert not sound.raise_microphone("mic")
+    assert not sound.can_restore_microphone("mic")
+
+
+def test_failed_restore_keeps_snapshot_for_retry() -> None:
+    sound, runner = control(
+        replies={
+            "get-source-mute": (0, "Mute: no\n"),
+            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+        }
+    )
+    assert sound.raise_microphone("mic")
+    runner.fails = ("set-source-mute",)
+    assert not sound.restore_microphone("mic")
+    assert sound.can_restore_microphone("mic")
+    runner.fails = ()
+    assert sound.restore_microphone("mic")
+    assert not sound.can_restore_microphone("mic")
+
+
+def test_restore_without_snapshot_does_not_call_pactl() -> None:
+    sound, runner = control()
+    assert not sound.restore_microphone("mic")
+    assert runner.calls == []
+
+
+def test_forget_microphone_changes_clears_all_sources() -> None:
+    sound, _ = control(
+        replies={
+            "get-source-mute": (0, "Mute: no\n"),
+            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+        }
+    )
+    assert sound.raise_microphone("mic")
+    assert sound.raise_microphone(None)
+    assert sound.can_restore_microphone("mic")
+    assert sound.can_restore_microphone(None)
+    sound.forget_microphone_changes()
+    assert not sound.can_restore_microphone("mic")
+    assert not sound.can_restore_microphone(None)
+
+
+def test_set_microphone_volume_remembers_volume_and_mute_for_restore() -> None:
+    sound, runner = control(
+        replies={
+            "get-source-mute": (0, "Mute: yes\n"),
+            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+        }
+    )
+    assert sound.set_microphone_volume(35, "mic")
+    assert runner.calls[-1] == ["pactl", "set-source-volume", "mic", "35%"]
+    assert not any(call[1] == "set-source-mute" for call in runner.calls)
+    assert sound.can_restore_microphone("mic")
+    assert sound.restore_microphone("mic")
+    assert runner.calls[-2:] == [
+        ["pactl", "set-source-volume", "mic", "25%"],
+        ["pactl", "set-source-mute", "mic", "1"],
+    ]
+
+
+@pytest.mark.parametrize(("requested", "expected"), [(150, "100%"), (-5, "0%")])
+def test_set_microphone_volume_clamps_to_full_range(requested: int, expected: str) -> None:
+    sound, runner = control()
+    assert sound.set_microphone_volume(requested, "mic")
+    assert runner.calls[-1] == ["pactl", "set-source-volume", "mic", expected]
+    assert not any(call[1] == "set-source-mute" for call in runner.calls)
+
+
+def test_set_microphone_volume_remembers_only_first_change() -> None:
+    sound, runner = control(
+        replies={
+            "get-source-mute": (0, "Mute: no\n"),
+            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+        }
+    )
+    assert sound.set_microphone_volume(40, "mic")
+    runner.replies["get-source-volume"] = (0, "Volume: front-left: 1 / 40% / -15 dB\n")
+    assert sound.set_microphone_volume(60, "mic")
+    assert sound.restore_microphone("mic")
+    assert runner.calls[-2:] == [
+        ["pactl", "set-source-volume", "mic", "25%"],
+        ["pactl", "set-source-mute", "mic", "0"],
+    ]
+
+
+def test_set_microphone_volume_after_raise_keeps_original_state() -> None:
+    sound, runner = control(
+        replies={
+            "get-source-mute": (0, "Mute: yes\n"),
+            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+        }
+    )
+    assert sound.raise_microphone("mic")
+    runner.replies["get-source-mute"] = (0, "Mute: no\n")
+    runner.replies["get-source-volume"] = (
+        0,
+        f"Volume: front-left: 1 / {RAISE_TARGET_PERCENT}% / -8 dB\n",
+    )
+    assert sound.set_microphone_volume(60, "mic")
+    assert sound.restore_microphone("mic")
+    assert runner.calls[-2:] == [
+        ["pactl", "set-source-volume", "mic", "25%"],
+        ["pactl", "set-source-mute", "mic", "1"],
+    ]
+
+
+def test_set_microphone_volume_failure_does_not_remember() -> None:
+    sound, _ = control(
+        replies={
+            "get-source-mute": (0, "Mute: no\n"),
+            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+        },
+        fails=("set-source-volume",),
+    )
+    assert not sound.set_microphone_volume(35, "mic")
+    assert not sound.can_restore_microphone("mic")
+
+
+def test_set_microphone_volume_without_pactl_runs_nothing() -> None:
+    sound, runner = control(present=())
+    assert not sound.set_microphone_volume(35, "mic")
+    assert runner.calls == []
+
+
+def test_set_microphone_volume_without_change_does_not_remember() -> None:
+    sound, _ = control(
+        replies={
+            "get-source-mute": (0, "Mute: no\n"),
+            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+        }
+    )
+    assert sound.set_microphone_volume(25, "mic")
+    assert not sound.can_restore_microphone("mic")
 
 
 @pytest.mark.parametrize(

@@ -530,6 +530,27 @@ def test_failed_raise_does_not_record_recovery(rig: Rig) -> None:
     assert all(item.args[0] != "mic_error" for item in rig.stats.append.call_args_list)
 
 
+def test_restore_microphone_volume_uses_selected_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, from_dict({"device": "alsa_input.usb-headset"}))
+    rig.sound.can_restore_microphone.return_value = True
+    assert rig.runtime.can_restore_microphone_volume
+    rig.sound.can_restore_microphone.assert_called_once_with("alsa_input.usb-headset")
+    assert rig.runtime.restore_microphone_volume()
+    rig.sound.restore_microphone.assert_called_once_with("alsa_input.usb-headset")
+
+
+def test_set_microphone_volume_uses_selected_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, from_dict({"device": "alsa_input.usb-headset"}))
+    rig.sound.set_microphone_volume.return_value = True
+    assert rig.runtime.set_microphone_volume(40)
+    rig.sound.set_microphone_volume.assert_called_once_with(40, "alsa_input.usb-headset")
+
+
+def test_apply_device_forgets_microphone_changes(rig: Rig) -> None:
+    rig.runtime.apply_device("new mic")
+    rig.sound.forget_microphone_changes.assert_called_once_with()
+
+
 def test_device_resolved_subscription_returns_current_and_replaces_subscriber(rig: Rig) -> None:
     host = _RuntimeOnboardingHost(rig.runtime, Mock())
     first, second = Mock(), Mock()

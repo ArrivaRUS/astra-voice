@@ -757,6 +757,7 @@ class FakeSettings(QObject):
         self._microphoneVolume: int = 80
         self._microphoneMuted: bool = False
         self._canRaiseMicrophone: bool = True
+        self._canRestoreMicrophoneVolume: bool = False
         self._devices: list[dict[str, str]] = [
             {"id": "", "name": "Системный по умолчанию"},
             {"id": "alsa_input.mic", "name": "Микрофон гарнитуры"},
@@ -1316,6 +1317,17 @@ class FakeSettings(QObject):
         bool, _get_canRaiseMicrophone, _set_canRaiseMicrophone, notify=changed
     )
 
+    def _get_canRestoreMicrophoneVolume(self) -> bool:
+        return self._canRestoreMicrophoneVolume
+
+    def _set_canRestoreMicrophoneVolume(self, value: bool) -> None:
+        self._canRestoreMicrophoneVolume = value
+        self.changed.emit()
+
+    canRestoreMicrophoneVolume = pyqtProperty(
+        bool, _get_canRestoreMicrophoneVolume, _set_canRestoreMicrophoneVolume, notify=changed
+    )
+
     def _get_canOpenSoundSettings(self) -> bool:
         return True
 
@@ -1342,6 +1354,14 @@ class FakeSettings(QObject):
     @pyqtSlot()
     def raiseMicrophoneVolume(self) -> None:
         self.calls.append("raiseMicrophoneVolume")
+
+    @pyqtSlot()
+    def restoreMicrophoneVolume(self) -> None:
+        self.calls.append("restoreMicrophoneVolume")
+
+    @pyqtSlot(int)
+    def setMicrophoneVolume(self, percent: int) -> None:
+        self.calls.append("setMicrophoneVolume")
 
     @pyqtSlot()
     def openSoundSettings(self) -> None:

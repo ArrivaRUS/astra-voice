@@ -14,9 +14,11 @@ Column {
     readonly property string saveError: root.settings ? root.settings.saveError : ""
     readonly property string modelSelfcheck: root.settings ? root.settings.modelSelfcheck : ""
 
-    // Громкость микрофона (PRD 0.9 F6.6/F6.7, ступени 1–2): читаем по открытию
-    // раздела и после нажатия — сама программа системную громкость не крутит.
+    // Громкость микрофона (PRD 0.9 F6.6/F6.7, ревизия 19): читаем по открытию
+    // раздела и после действия; ползунок меняет громкость, кнопка возвращает прежнюю.
     readonly property bool canRaiseMic: root.settings ? root.settings.canRaiseMicrophone : false
+    readonly property bool canRestoreMic: root.settings ? root.settings.canRestoreMicrophoneVolume : false
+    readonly property bool canOpenSoundSettings: root.settings ? root.settings.canOpenSoundSettings : false
     readonly property bool micMuted: root.settings ? root.settings.microphoneMuted : false
     readonly property int micVolume: root.settings ? root.settings.microphoneVolume : -1
 
@@ -251,36 +253,80 @@ Column {
             }
         }
 
-        // Строка только при проблеме (выключен или тише 30 %): в норме «Общие»
-        // помещаются без прокрутки (решение заказчика 22.09, как «Переустановить»).
+        // Строка видна всегда, когда громкость можно менять: после «Поднять»
+        // заказчик не мог вернуть её как было (ошибка 30.09).
         SettingRow {
             width: parent.width
             label: qsTr("Громкость микрофона")
             sub: root.micMuted
                 ? qsTr("Звук микрофона выключен в системе — вас не слышно")
-                : qsTr("Громкость слишком низкая — вас плохо слышно")
-            visible: root.canRaiseMic && (root.micMuted || (root.micVolume >= 0 && root.micVolume < 30))
+                : root.micVolume >= 0
+                    ? qsTr("Громкость микрофона в системе: %1 %").arg(root.micVolume)
+                    : qsTr("Не удалось узнать громкость микрофона")
+            visible: root.canRaiseMic
             height: visible ? implicitHeight : 0
 
-            Text {
-                textFormat: Text.PlainText
-                text: root.micMuted ? qsTr("Выключен")
-                    : root.micVolume >= 0 ? qsTr("Сейчас %1 %").arg(root.micVolume)
-                    : qsTr("Не удалось узнать")
-                color: Theme.fgMuted
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontSettingSubSize
-                renderType: Text.NativeRendering
+            AvSlider {
+                id: micSlider
+                property real draggedValue: value
+                visible: root.micVolume >= 0 && !root.micMuted
                 Layout.alignment: Qt.AlignVCenter
+                Accessible.name: qsTr("Громкость микрофона")
+
+                Binding {
+                    target: micSlider
+                    property: "value"
+                    value: root.micVolume
+                    when: !micSlider.pressed
+                    restoreMode: Binding.RestoreNone
+                }
+
+                onValueChanged: {
+                    if (pressed)
+                        draggedValue = value
+                }
+                onPressedChanged: {
+                    if (pressed)
+                        draggedValue = value
+                    else if (root.settings && Math.round(draggedValue) !== root.micVolume)
+                        root.settings.setMicrophoneVolume(Math.round(draggedValue))
+                }
+                onMoved: {
+                    if (!pressed && root.settings && Math.round(value) !== root.micVolume)
+                        root.settings.setMicrophoneVolume(Math.round(value))
+                }
             }
 
             AvButton {
                 text: qsTr("Поднять")
                 small: true
+                visible: root.micMuted || (root.micVolume >= 0 && root.micVolume < 30)
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: {
                     if (root.settings)
                         root.settings.raiseMicrophoneVolume()
+                }
+            }
+
+            AvButton {
+                text: qsTr("Вернуть как было")
+                small: true
+                visible: root.canRestoreMic
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: {
+                    if (root.settings)
+                        root.settings.restoreMicrophoneVolume()
+                }
+            }
+
+            AvButton {
+                text: qsTr("Настройки звука…")
+                small: true
+                visible: root.canOpenSoundSettings
+                Layout.alignment: Qt.AlignVCenter
+                onClicked: {
+                    if (root.settings)
+                        root.settings.openSoundSettings()
                 }
             }
         }

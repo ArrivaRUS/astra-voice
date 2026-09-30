@@ -96,6 +96,13 @@ class SettingsApply(Protocol):
 
     def raise_microphone_volume(self) -> bool: ...
 
+    def set_microphone_volume(self, percent: int) -> bool: ...
+
+    def restore_microphone_volume(self) -> bool: ...
+
+    @property
+    def can_restore_microphone_volume(self) -> bool: ...
+
     def open_sound_settings(self) -> bool: ...
 
     def restart_sound_service(self) -> bool: ...
@@ -626,6 +633,7 @@ class SettingsBridge(QObject):
             elif name == "device":
                 self._apply.device(self.device or None)
                 self.refreshMicrophone()
+                self.microphoneChanged.emit()
         getattr(self, name + "Changed").emit()
 
     @pyqtProperty("QStringList", constant=True)
@@ -793,6 +801,17 @@ class SettingsBridge(QObject):
         return self._apply is not None and self._apply.has_volume_control
 
     @pyqtProperty(bool, notify=microphoneChanged)
+    def canRestoreMicrophoneVolume(self) -> bool:  # noqa: N802
+        try:
+            return bool(
+                self._apply is not None
+                and self._apply.has_volume_control
+                and self._apply.can_restore_microphone_volume
+            )
+        except Exception:
+            return False
+
+    @pyqtProperty(bool, notify=microphoneChanged)
     def canOpenSoundSettings(self) -> bool:  # noqa: N802
         return self._apply is not None and self._apply.has_sound_settings
 
@@ -815,13 +834,60 @@ class SettingsBridge(QObject):
 
     @pyqtSlot()
     def raiseMicrophoneVolume(self) -> None:  # noqa: N802
-        """Нажатие «Поднять»: звук включается, громкость выставляется на 100 %."""
+        """Нажатие «Поднять»: звук включается, громкость — до целевой (50 %)."""
         if self._apply is not None:
             try:
                 self._apply.raise_microphone_volume()
             except Exception:
                 log.warning("Не удалось поднять громкость микрофона")
         self.refreshMicrophone()
+        self.microphoneChanged.emit()
+
+    @pyqtSlot(int)
+    def setMicrophoneVolume(self, percent: int) -> None:  # noqa: N802
+        """Ручная установка громкости выбранного микрофона."""
+        try:
+            if self._apply is None or not self._apply.has_volume_control:
+                return
+            changed = self._apply.set_microphone_volume(int(percent))
+        except Exception:
+            changed = False
+        error = "Не удалось изменить громкость микрофона"
+        if not changed:
+            log.warning(error)
+            self._save_error = error
+            self.saveErrorChanged.emit()
+        elif self._save_error == error:
+            self._save_error = ""
+            self.saveErrorChanged.emit()
+        try:
+            self.refreshMicrophone()
+        except Exception:
+            log.warning("Не удалось узнать громкость микрофона")
+        self.microphoneChanged.emit()
+
+    @pyqtSlot()
+    def restoreMicrophoneVolume(self) -> None:  # noqa: N802
+        """Нажатие «Вернуть как было»: вернуть состояние до первого изменения."""
+        if self._apply is None:
+            return
+        error = "Не удалось вернуть громкость микрофона"
+        try:
+            restored = self._apply.restore_microphone_volume()
+        except Exception:
+            restored = False
+        if not restored:
+            log.warning(error)
+            self._save_error = error
+            self.saveErrorChanged.emit()
+        elif self._save_error == error:
+            self._save_error = ""
+            self.saveErrorChanged.emit()
+        try:
+            self.refreshMicrophone()
+        except Exception:
+            log.warning("Не удалось узнать громкость микрофона")
+        self.microphoneChanged.emit()
 
     @pyqtSlot()
     def openSoundSettings(self) -> None:  # noqa: N802
