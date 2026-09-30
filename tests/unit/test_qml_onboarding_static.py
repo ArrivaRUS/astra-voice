@@ -29,6 +29,7 @@ COMPONENTS = [
         "DownloadStrip",
         "LevelMeter",
         "AvDialog",
+        "UpdatePanel",
     )
 ]
 UI_FILES = ONBOARDING_FILES + COMPONENTS
@@ -36,7 +37,9 @@ MAIN = REPO / "qml/Main.qml"
 GENERAL = REPO / "qml/sections/General.qml"
 MODELS = REPO / "qml/sections/Models.qml"
 ABOUT = REPO / "qml/sections/About.qml"
-SECTIONS = [GENERAL, MODELS, ABOUT]
+NETWORK = REPO / "qml/sections/Network.qml"
+STATUSBAR = REPO / "qml/StatusBar.qml"
+SECTIONS = [GENERAL, MODELS, ABOUT, NETWORK, STATUSBAR]
 QSTR = re.compile(r'\bqsTr\s*\(\s*"((?:\\.|[^"\\])*)"', re.DOTALL)
 STRINGS_OR_COMMENT = re.compile(r""""(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|//[^\n]*""")
 FORBIDDEN = (
@@ -77,7 +80,7 @@ def test_onboarding_files_exist_and_are_not_empty(name: str) -> None:
     assert path.read_text(encoding="utf-8").strip(), f"{path}: пустой файл"
 
 
-@pytest.mark.parametrize("path", UI_FILES, ids=lambda path: path.name)
+@pytest.mark.parametrize("path", UI_FILES + [NETWORK, STATUSBAR], ids=lambda path: path.name)
 def test_user_text_has_no_technical_words(path: Path) -> None:
     failures = [
         f"{path}: {literal!r} содержит {word!r}"
@@ -99,10 +102,14 @@ def test_steps_declare_bar_contract(path: Path) -> None:
     ("path", "identifier"),
     [(path, "onboarding") for path in UI_FILES]
     + [(MAIN, "settingsBridge"), (GENERAL, "settingsBridge"), (MODELS, "settingsBridge")]
-    + [(ABOUT, "appInfo"), (MAIN, "showOnboarding")],
+    + [(ABOUT, "appInfo"), (MAIN, "showOnboarding"), (MAIN, "updatesBridge")]
+    + [(NETWORK, "settingsBridge"), (NETWORK, "updatesBridge"), (MODELS, "updatesBridge")]
+    + [(ABOUT, "aboutBridge"), (ABOUT, "settingsBridge"), (ABOUT, "updatesBridge")],
     ids=[f"{path.name}-onboarding" for path in UI_FILES]
     + ["Main-settingsBridge", "General-settingsBridge", "Models-settingsBridge"]
-    + ["About-appInfo", "Main-showOnboarding"],
+    + ["About-appInfo", "Main-showOnboarding", "Main-updatesBridge"]
+    + ["Network-settingsBridge", "Network-updatesBridge", "Models-updatesBridge"]
+    + ["About-aboutBridge", "About-settingsBridge", "About-updatesBridge"],
 )
 def test_context_identifiers_are_guarded(path: Path, identifier: str) -> None:
     guard = f'typeof {identifier} !== "undefined"'

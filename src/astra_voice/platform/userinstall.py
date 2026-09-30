@@ -59,7 +59,10 @@ REQUIRED_FILES = (
 )
 EXECUTABLE_FILES = (paths.APPIMAGE_LAUNCHER, "opt/python3.11/bin/python3.11")
 # Служебные флаги не устанавливают программу (спайк §7.10). Тот же список — в AppRun.
-SERVICE_FLAGS = frozenset({"--version", "--help", "-h", "--stats", "--selfinstall-status"})
+# Снятие регистрации тоже не устанавливает: сначала поставить, чтобы тут же снять, — нелепо.
+SERVICE_FLAGS = frozenset(
+    {"--version", "--help", "-h", "--stats", "--selfinstall-status", "--unregister", "--uninstall"}
+)
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -275,10 +278,16 @@ def check_free_space(path: Path, required: int = MIN_FREE_BYTES) -> None:
 def running_key_path() -> Path | None:
     """Путь для чтения без создания каталогов (в том числе из status()).
 
-    Каталог выбирается тем же правилом, что и при записи (``paths.runtime_dir()``).
+    Файл ищется во всех существующих кандидатах по порядку записи
+    (``paths.runtime_dir()``): без ``XDG_RUNTIME_DIR`` — сначала каталог сеанса
+    ``/run/user/<uid>/astra-voice``, затем запасной ``/tmp/astra-voice-<uid>`` (туда
+    пишет копия, запущенная без ``XDG_RUNTIME_DIR``).
     """
-    directory = paths.existing_runtime_dir()
-    return None if directory is None else directory / RUNNING_KEY_NAME
+    for directory in paths.existing_runtime_dirs():
+        path = directory / RUNNING_KEY_NAME
+        if os.path.lexists(path):
+            return path
+    return None
 
 
 def read_running_key() -> str | None:
@@ -707,26 +716,40 @@ def register() -> RegisterResult:
         menu_result = "written" if _write_desktop_file(menu, data) else "unchanged"
     written: list[Path] = []
     skipped: list[Path] = []
+    try:
+        _copy_icons(copy, icons, written, skipped)
+    except (OSError, UserInstallError) as exc:
+        log.warning("Значки программы не добавлены: %s", tilde(exc))
+    # Автозапуск перенацеливается независимо от значков.
+    retargeted = autostart.retarget()
+    return RegisterResult(menu_result, tuple(written), tuple(skipped), retargeted)
+
+
+def _copy_icons(copy: Path, icons: Path, written: list[Path], skipped: list[Path]) -> None:
+    """Значки приложения — по возможности: сбой одного значка не мешает остальным."""
     source = copy
     for part in ("usr", "share", "icons", "hicolor"):
         source /= part
         if not _is_real_dir(source):
-            break
-    else:
-        for icon in _icon_files(source):
-            destination = icons / icon.relative_to(source)
+            return
+    for icon in _icon_files(source):
+        destination = icons / icon.relative_to(source)
+        try:
             fd = os.open(icon, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
             with os.fdopen(fd, "rb") as file:
                 if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
                     continue
                 changed = _write_desktop_file(destination, file.read())
-            (written if changed else skipped).append(destination)
-    retargeted = autostart.retarget()
-    return RegisterResult(menu_result, tuple(written), tuple(skipped), retargeted)
+        except (OSError, UserInstallError) as exc:
+            log.warning("Значок %s не добавлен: %s", destination.name, tilde(exc))
+            continue
+        (written if changed else skipped).append(destination)
 
 
-def unregister(*, deb_executable: Path = Path("/usr/bin/astra-voice")) -> UnregisterResult:
+def unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
     """Снимает только нашу регистрацию, возвращая автозапуск пакету при наличии (§4)."""
+    if deb_executable is None:
+        deb_executable = paths.SYSTEM_EXECUTABLE
     menu, icons = _desktop_paths()
     removed_menu = _menu_state(menu) == "ours"
     if removed_menu:

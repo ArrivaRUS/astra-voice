@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import faulthandler
+import gc
 import os
 import resource
 import select
+import signal
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from time import monotonic, sleep
 
+from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEvent, QTimer
+from PyQt5.QtDBus import QDBusConnection, QDBusMessage
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication
 
@@ -44,53 +49,63 @@ def pump_until(predicate: Callable[[], bool], deadline: float) -> None:
         sleep(0.005)
 
 
-def plasma_reply() -> None:
+def wait_for_subscriptions(tray: Tray, deadline: float) -> None:
+    pump_until(lambda: tray._subscriptions_ready, deadline)
+
+
+def start_plasma_owner() -> subprocess.Popen[str]:
     owner = subprocess.Popen(
         [sys.executable, str(Path(__file__).with_name("tray_dbus_owner.py")), str(os.getpid())],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
+    assert owner.stdout is not None
+    ready, _, _ = select.select([owner.stdout], [], [], 5)
+    assert ready and owner.stdout.readline().strip() == "PLASMA_OWNER_READY"
+    return owner
+
+
+def plasma_reply() -> None:
+    owner = start_plasma_owner()
     try:
-        assert owner.stdout is not None
-        ready, _, _ = select.select([owner.stdout], [], [], 5)
-        assert ready and owner.stdout.readline().strip() == "PLASMA_OWNER_READY"
+        global _exit_app
         app = QApplication([])
+        _exit_app = app
         tray = Tray(IconProvider())  # type: ignore[arg-type]
-        deadline = monotonic() + 20
+        target_cycles = int(os.environ.get("ASTRA_VOICE_TRAY_CYCLES", "300"))
+        deadline = monotonic() + max(20, target_cycles * 0.08)
         cycles = 0
-        waiting_for_close = False
+        timer = QTimer()
+        timer.setInterval(5)
 
         def poll() -> None:
-            nonlocal cycles, waiting_for_close
+            nonlocal cycles
             if monotonic() >= deadline:
                 app.exit(2)
-                return
-            if waiting_for_close:
-                if tray._worker is None and not tray_module._bus_threads:
-                    waiting_for_close = False
-                    cycles += 1
-                    if cycles == 7:
-                        app.quit()
-                    else:
-                        tray.start()
             elif tray._plasma_known:
                 assert tray._plasma_alive
                 tray.stop()
-                waiting_for_close = True
+                cycles += 1
+                faulthandler.dump_traceback_later(25, exit=True)
+                if cycles % 100 == 0:
+                    print(f"plasma_reply: {cycles}/{target_cycles}", flush=True)
+                if cycles == target_cycles:
+                    app.quit()
+                else:
+                    tray.start()
 
-        timer = QTimer()
-        timer.setInterval(5)
         timer.timeout.connect(poll)
-        tray.start()
-        timer.start()
         try:
+            faulthandler.dump_traceback_later(25, exit=True)
+            tray.start()
+            timer.start()
             assert app.exec_() == 0, "не дождались ответа plasmashell"
-            assert cycles == 7
+            assert cycles == target_cycles
         finally:
             timer.stop()
             tray.stop()
-        pump_until(lambda: not tray_module._bus_threads, monotonic() + 2)
+            tray_module.shutdown_bus_threads()
     finally:
         owner.terminate()
         try:
@@ -100,39 +115,86 @@ def plasma_reply() -> None:
             owner.communicate(timeout=3)
 
 
+def tray_threads() -> list[threading.Thread]:
+    return [thread for thread in threading.enumerate() if thread.name == "astra-voice-tray-dbus"]
+
+
 def thread_cleanup() -> None:
-    app = QApplication([])
-    deadline = monotonic() + 20
-    cycles = 0
-    tray: Tray | None = None
+    global _exit_app
+    _exit_app = QApplication([])
+    receiver = None
+    for _ in range(20):
+        faulthandler.dump_traceback_later(25, exit=True)
+        tray = Tray(IconProvider())  # type: ignore[arg-type]
+        tray.start()
+        wait_for_subscriptions(tray, monotonic() + 5)
+        if receiver is None:
+            receiver = tray_module._bus_receiver
+        assert receiver is tray_module._bus_receiver
+        tray.stop()
+        tray.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert len(tray_threads()) == 1
+    assert receiver is not None and not sip.isdeleted(receiver)
+    tray_module.shutdown_bus_threads()
+    assert not tray_threads()
 
-    def step() -> None:
-        nonlocal cycles, tray
-        if monotonic() >= deadline:
-            app.exit(2)
-            return
-        if tray is not None:
-            tray.stop()
-            tray.deleteLater()
-            tray = None
-            QTimer.singleShot(100, step)
-        elif cycles < 20:
-            cycles += 1
-            tray = Tray(IconProvider())  # type: ignore[arg-type]
+
+def invariants() -> None:
+    global _exit_app
+    _exit_app = QApplication([])
+    original = QDBusConnection
+    connects = 0
+    disconnects = 0
+
+    class CountingConnection:
+        SessionBus = original.SessionBus
+
+        @staticmethod
+        def connectToBus(bus_type: QDBusConnection.BusType, name: str) -> QDBusConnection:
+            nonlocal connects
+            connects += 1
+            return original.connectToBus(bus_type, name)
+
+        @staticmethod
+        def disconnectFromBus(name: str) -> None:
+            nonlocal disconnects
+            disconnects += 1
+            original.disconnectFromBus(name)
+
+    tray_module.QDBusConnection = CountingConnection  # type: ignore[attr-defined]
+    tray = Tray(IconProvider())  # type: ignore[arg-type]
+    receiver = None
+    baseline_python = baseline_native = 0
+    cycles = int(os.environ.get("ASTRA_VOICE_TRAY_CYCLES", "200"))
+    deadline = monotonic() + max(20, cycles * 0.08)
+    try:
+        for cycle in range(cycles + 5):
+            faulthandler.dump_traceback_later(25, exit=True)
+            if cycle >= cycles:
+                tray.deleteLater()
+                tray = Tray(IconProvider())  # type: ignore[arg-type]
             tray.start()
-            QTimer.singleShot(300, step)
-        elif not tray_module._bus_threads:
-            app.quit()
-        else:
-            QTimer.singleShot(10, step)
-
-    QTimer.singleShot(0, step)
-    result = app.exec_()
-    assert result == 0, (
-        f"thread_cleanup: истёк срок ожидания после {cycles} циклов; "
-        f"осталось потоков: {len(tray_module._bus_threads)}"
-    )
-    assert cycles == 20 and not tray_module._bus_threads
+            wait_for_subscriptions(tray, deadline)
+            tray.stop()
+            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            if receiver is None:
+                receiver = tray_module._bus_receiver
+                baseline_python = len(threading.enumerate())
+                baseline_native = len(os.listdir("/proc/self/task"))
+            assert receiver is tray_module._bus_receiver
+            assert receiver is not None and not sip.isdeleted(receiver)
+            assert len(tray_threads()) == 1
+            assert len(threading.enumerate()) <= baseline_python
+            assert len(os.listdir("/proc/self/task")) <= baseline_native
+            assert connects == 1 and disconnects == 0
+            if (cycle + 1) % 100 == 0:
+                print(f"invariants: {cycle + 1}/{cycles + 5}", flush=True)
+    finally:
+        tray.stop()
+        tray_module.shutdown_bus_threads()
+        tray_module.QDBusConnection = original  # type: ignore[attr-defined]
+    assert connects == 1 and disconnects == 0
 
 
 def exit_after_stop() -> None:
@@ -151,21 +213,66 @@ def exit_after_stop() -> None:
     sys.exit(0)
 
 
+def exit_while_call_blocked() -> None:
+    """Выход с живым QApplication, пока демон висит в вызове к остановленному владельцу."""
+    global _exit_app
+    owner = start_plasma_owner()
+    stopped = False
+    try:
+        _exit_app = QApplication([])
+        # Останавливаем только своего потомка по точному pid: Ping не получит ответа.
+        os.kill(owner.pid, signal.SIGSTOP)
+        stopped = True
+        generation = 1
+        tray_module._send_bus_command(generation, "setup", None)
+        ping = QDBusMessage.createMethodCall(
+            "org.kde.plasmashell", "/", "org.freedesktop.DBus.Peer", "Ping"
+        )
+        for serial in range(6):
+            tray_module._send_bus_command(generation, "request", (serial, ping))
+        sleep(0.2)
+        # join короче вызова (0,5 с): демон гарантированно переживает shutdown.
+        tray_module.shutdown_bus_threads(100)
+        transport = tray_module._bus_transport
+        assert transport is not None and transport.thread.is_alive(), "демон не висел в вызове"
+        # Сдвиг выхода относительно запоздалых ответов демона (0,5 с на вызов).
+        sleep(float(os.environ.get("ASTRA_VOICE_TRAY_EXIT_DELAY", "0")))
+    finally:
+        if stopped:
+            os.kill(owner.pid, signal.SIGCONT)
+        owner.kill()
+        owner.communicate(timeout=3)
+    # Разрушение QApplication при выходе интерпретатора — под сторожем.
+    faulthandler.dump_traceback_later(10, exit=True)
+
+
 def main() -> int:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     faulthandler.enable()
+    faulthandler.dump_traceback_later(25, exit=True)
+    if interval := os.environ.get("ASTRA_VOICE_TRAY_SWITCH"):
+        sys.setswitchinterval(float(interval))
+    if threshold := os.environ.get("ASTRA_VOICE_TRAY_GC"):
+        gc.set_threshold(int(threshold), 2, 2)
     address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
     assert address and address != "unix:path=/nonexistent", "нужна изолированная сессионная шина"
     scenario = sys.argv[1]
-    if scenario == "plasma_reply":
-        plasma_reply()
-    elif scenario == "thread_cleanup":
-        thread_cleanup()
-    elif scenario == "exit_after_stop":
-        exit_after_stop()
-    else:
-        raise ValueError(scenario)
+    scenarios: dict[str, Callable[[], None]] = {
+        "plasma_reply": plasma_reply,
+        "invariants": invariants,
+        "thread_cleanup": thread_cleanup,
+        "exit_after_stop": exit_after_stop,
+        "exit_while_call_blocked": exit_while_call_blocked,
+    }
+    try:
+        scenarios[scenario]()
+    except BaseException:
+        faulthandler.cancel_dump_traceback_later()
+        raise
     print(f"TRAY_DBUS_OK:{scenario}", flush=True)
+    # Сценарий выхода оставляет сторож взведённым до конца разрушения QApplication.
+    if scenario != "exit_while_call_blocked":
+        faulthandler.cancel_dump_traceback_later()
     return 0
 
 

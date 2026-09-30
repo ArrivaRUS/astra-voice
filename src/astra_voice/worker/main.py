@@ -10,7 +10,7 @@ import select
 import signal
 import socket
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from queue import Empty, SimpleQueue
 from typing import NoReturn
@@ -18,7 +18,7 @@ from typing import NoReturn
 from astra_voice.core.audio_env import deny_pulse_autospawn
 from astra_voice.core.logging import setup_logging
 from astra_voice.worker import ipc
-from astra_voice.worker.audio import CaptureStopTimeout
+from astra_voice.worker.audio import AudioSource, CaptureStopTimeout, PulseSimpleSource
 from astra_voice.worker.state import Message, WorkerState
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,29 @@ MIN_ADDRESS_SPACE = 3 * 1024 * 1024 * 1024
 # Запас к дедлайну в секунду на отправку и освобождение устройства.
 POLL_INTERVAL = 0.25
 MAX_SEND_BUFFER = 4 * 1024 * 1024
+
+
+def audio_backend(env: Mapping[str, str]) -> tuple[str, bool]:
+    """Имя бэкенда записи и признак неизвестного значения переменной."""
+    # С 29.09 по умолчанию stream (живой прогон 11/11); simple — запасной путь через env.
+    value = env.get("ASTRA_VOICE_AUDIO_BACKEND")
+    if value == "simple":
+        return "simple", False
+    return "stream", value not in (None, "stream")
+
+
+def _log_backend_fallback() -> None:
+    """По журналу видно, какой бэкенд записи работает на самом деле."""
+    logger.info("Бэкенд записи: simple (откат)")
+
+
+def select_audio_source(env: Mapping[str, str]) -> AudioSource:
+    """Выбирает источник только по переданному окружению, не открывая устройство."""
+    if audio_backend(env)[0] == "simple":
+        return PulseSimpleSource()
+    from astra_voice.worker.pulse_stream import StreamWithFallback
+
+    return StreamWithFallback(on_fallback=_log_backend_fallback)
 
 
 def _prctl(option: int, value: int) -> None:
@@ -107,14 +130,22 @@ class WorkerLoop:
         self._wake_w.setblocking(False)
         self.worker = WorkerState(on_event=self._put_event)
         if capture:
-            from astra_voice.worker.audio import AudioCapture, PulseSimpleSource
+            from astra_voice.worker.audio import AudioCapture
+
+            source = select_audio_source(os.environ)
+            backend, unknown = audio_backend(os.environ)
+            if unknown:
+                # Значение не пишем: оно может быть длинным или содержать управляющие символы.
+                logger.warning("Неизвестный ASTRA_VOICE_AUDIO_BACKEND; выбран stream.")
+            logger.info("Бэкенд записи: %s", backend)
 
             self.worker.set_capture(
                 AudioCapture(
-                    source=PulseSimpleSource(),
+                    source=source,
                     on_samples=self.worker.on_samples,
                     on_event=self._put_event,
                     on_error=self.worker.on_error,
+                    on_device_change=self.worker.on_device_change,
                 )
             )
         self._reader = ipc.FrameReader()

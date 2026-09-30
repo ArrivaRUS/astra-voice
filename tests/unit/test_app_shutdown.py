@@ -47,6 +47,8 @@ class Rig:
         self.focuser = Mock()
         self.cleanup = Mock()
         self.bus_shutdown = Mock()
+        self.notify_install = Mock()
+        self.notify_shutdown = Mock()
         self.runtime = Mock()
         self.runtime.on_quit_requested = None
         self.runtime.tray.on_quit = lambda: DictationRuntime._quit_requested(self.runtime)
@@ -59,6 +61,8 @@ class Rig:
         self.calls.attach_mock(self.app.quit, "quit")
         self.calls.attach_mock(self.runtime.shutdown, "shutdown")
         self.calls.attach_mock(self.bus_shutdown, "bus_shutdown")
+        self.calls.attach_mock(self.notify_install, "notify_install")
+        self.calls.attach_mock(self.notify_shutdown, "notify_shutdown")
         self.calls.attach_mock(self.focuser.stop, "focuser_stop")
         self.calls.attach_mock(self.timer.stop, "timer_stop")
         self.calls.attach_mock(self.theme.source.stop, "theme_stop")
@@ -88,6 +92,8 @@ class Rig:
         monkeypatch.setattr(app_mod, "_WindowFocuser", self.focuser_factory)
         monkeypatch.setattr(app_mod, "_cleanup", self.cleanup)
         monkeypatch.setattr(app_mod, "shutdown_bus_threads", self.bus_shutdown)
+        monkeypatch.setattr(app_mod, "install_notify_dispatcher", self.notify_install)
+        monkeypatch.setattr(app_mod, "shutdown_notify_dispatch", self.notify_shutdown)
         monkeypatch.setattr(runtime_mod, "DictationRuntime", self.factory)
 
 
@@ -178,15 +184,125 @@ def test_shutdown_once_before_other_cleanup(rig: Rig) -> None:
     )
     rig.app.setQuitOnLastWindowClosed.assert_called_once_with(False)
     assert rig.calls.mock_calls == [
+        call.notify_install(),
         call.start(),
         call.exec(),
         call.focuser_stop(),
         call.shutdown(),
+        call.notify_shutdown(),
         call.bus_shutdown(),
         call.timer_stop(),
         call.theme_stop(),
         call.cleanup(rig.server, rig.lock),
     ]
+
+
+def test_update_checker_started_and_stopped_before_runtime(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M7: проверка обновлений стартует после окна и останавливается до диктовки."""
+    pytest.importorskip("requests")
+    from astra_voice.updates import checker as checker_mod
+
+    checker = Mock()
+    factory = Mock(return_value=checker)
+    monkeypatch.setattr(checker_mod, "create_app_checker", factory)
+    rig.calls.attach_mock(checker.start, "checker_start")
+    rig.calls.attach_mock(checker.stop, "checker_stop")
+    assert app_mod.main([]) == 7
+    factory.assert_called_once()
+    assert factory.call_args.args[1] == Policy()
+    names = [entry[0] for entry in rig.calls.mock_calls]
+    assert names.index("checker_start") < names.index("exec")
+    assert names.index("focuser_stop") < names.index("checker_stop") < names.index("shutdown")
+    # После stop() колбэк со ссылкой на QObject отпущен в GUI-потоке (урок 025).
+    assert checker.on_event is None and checker.on_status is None
+
+
+def test_about_bridge_stats_listener_released_on_exit(rig: Rig) -> None:
+    """«О программе» слушает статистику, а при выходе слушатель снят (урок 025)."""
+    seen: dict[str, object] = {}
+
+    class Stats:
+        on_append: object = None
+
+        def summary(self) -> dict[str, object]:
+            return {"dictations": 0, "p50_ms": None, "p95_ms": None}
+
+        def clear(self) -> None:
+            pass
+
+    stats = Stats()
+    rig.runtime.stats = stats
+    rig.app.exec_.side_effect = lambda: seen.setdefault("listener", stats.on_append) and 7
+    assert app_mod.main([]) == 7
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    about = properties["aboutBridge"]
+    assert seen["listener"] == about.on_stats_event, "пока окно работает, слушатель подключён"
+    assert stats.on_append is None
+
+
+def test_updates_bridge_bound_before_start_and_refreshed_by_settings(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Строка обновлений подключена до старта потока; тумблер и офлайн зовут refresh()."""
+    pytest.importorskip("requests")
+    from astra_voice.updates import checker as checker_mod
+
+    checker = Mock()
+    seen: dict[str, object] = {}
+    checker.start.side_effect = lambda: seen.setdefault("on_status", checker.on_status)
+    monkeypatch.setattr(checker_mod, "create_app_checker", Mock(return_value=checker))
+    posted: list[object] = []
+
+    def post(_self: object, call_: object) -> None:
+        posted.append(call_)
+        assert callable(call_)
+        call_()
+
+    monkeypatch.setattr(app_mod._GuiCalls, "post", post)
+    assert app_mod.main([]) == 7
+
+    on_status = seen["on_status"]
+    assert callable(on_status)
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    bridge = properties["updatesBridge"]
+    on_status(checker_mod.UpdateStatus("available", version="0.2.1"))
+    assert posted, "снимок проверки обязан идти через очередь GUI-потока"
+    assert bridge.state == "available"
+    assert bridge.version == "0.2.1"
+    # Кнопки «Страница выпуска» нет, пока нет platform/external.open_external.
+    assert bridge.releasePageAvailable is False
+
+    # Пункт трея «Проверить обновления» (Р9) следует за гейтом.
+    tray = rig.runtime.tray
+    tray.set_updates_enabled.assert_called_with(True)
+    assert callable(tray.on_check_updates)
+
+    settings_bridge = properties["settingsBridge"]
+    checker.refresh.reset_mock()
+    settings_bridge.offline = True
+    checker.refresh.assert_called_once_with()
+    assert bridge.checkRefusal == "offline"
+    assert bridge.canCheckNow is False
+    tray.set_updates_enabled.assert_called_with(False)
+    settings_bridge.checkAppUpdates = True
+    assert checker.refresh.call_count == 2
+
+
+def test_update_checker_failure_does_not_stop_app(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("requests")
+    from astra_voice.updates import checker as checker_mod
+
+    monkeypatch.setattr(checker_mod, "create_app_checker", Mock(side_effect=OSError("нет")))
+    assert app_mod.main([]) == 7
+    rig.runtime.shutdown.assert_called_once()
 
 
 @pytest.mark.parametrize("error", [StoreError("broken-store"), OSError("Хранилище недоступно")])
@@ -502,6 +618,8 @@ def test_event_loop_failure_still_shuts_down(rig: Rig) -> None:
         app_mod.main([])
 
     rig.runtime.shutdown.assert_called_once_with()
+    # Затвор уведомлений закрыт и при выходе по исключению (урок 026).
+    rig.notify_shutdown.assert_called_once_with()
     rig.cleanup.assert_called_once_with(rig.server, rig.lock)
 
 
@@ -520,6 +638,33 @@ def test_shutdown_failure_does_not_skip_cleanup(rig: Rig) -> None:
     rig.timer.stop.assert_called_once_with()
     rig.theme.source.stop.assert_called_once_with()
     rig.cleanup.assert_called_once_with(rig.server, rig.lock)
+
+
+def test_focuser_stop_failure_does_not_skip_cleanup(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.focuser.stop.side_effect = RuntimeError("Ошибка фокуса")
+
+    with caplog.at_level(logging.WARNING, logger=app_mod.__name__):
+        assert app_mod.main([]) == 7
+
+    # Сбой фокуса не отменяет ни затвор уведомлений, ни остальную очистку.
+    assert rig.calls.mock_calls == [
+        call.notify_install(),
+        call.start(),
+        call.exec(),
+        call.focuser_stop(),
+        call.shutdown(),
+        call.notify_shutdown(),
+        call.bus_shutdown(),
+        call.timer_stop(),
+        call.theme_stop(),
+        call.cleanup(rig.server, rig.lock),
+    ]
+    rig.cleanup.assert_called_once_with(rig.server, rig.lock)
+    assert any(
+        "Не удалось остановить фокусировку окна" in record.getMessage() for record in caplog.records
+    )
 
 
 def test_bus_thread_shutdown_failure_does_not_skip_cleanup(

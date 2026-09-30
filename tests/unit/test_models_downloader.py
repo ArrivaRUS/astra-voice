@@ -7,7 +7,9 @@ pytest.importorskip("requests")
 import errno
 import hashlib
 import os
+import socket
 import stat
+import struct
 import threading
 import time
 from collections.abc import Iterator
@@ -157,7 +159,17 @@ def local_server(
                 for name, value in headers.items():
                     self.send_header(name, value)
                 self.end_headers()
-                if fault.mode in {"disconnect", "slow-body"}:
+                if fault.mode == "reset":
+                    # Половина тела при полном Content-Length, затем RST: обрыв
+                    # посреди тела, который urllib3 1.26 и 2.x видят как ProtocolError.
+                    self.wfile.write(body[: len(body) // 2])
+                    self.wfile.flush()
+                    self.connection.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                    )
+                    self.connection.close()
+                    self.close_connection = True
+                elif fault.mode in {"disconnect", "slow-body"}:
                     prefix = body[:4] if fault.mode == "slow-body" else body[: len(body) // 2]
                     self.wfile.write(f"{len(prefix):x}\r\n".encode() + prefix + b"\r\n")
                     self.wfile.flush()
@@ -387,7 +399,8 @@ def test_disconnect_keeps_part_and_next_call_resumes(
     file = single_entry.files[0]
     fault = local_server.faults[file.url_path]
     fault.mode = "disconnect"
-    _assert_error(loader, single_entry, "host-unreachable")
+    # Обрыв chunked-тела — short-read, как и укороченный ответ с Content-Length.
+    _assert_error(loader, single_entry, "short-read")
     part = store.staging_dir(single_entry.id, single_entry.revision) / (file.path + ".part")
     assert part.read_bytes() == fault.body[:8]
     assert local_server.responses[-1]._response.raw.closed
@@ -395,6 +408,25 @@ def test_disconnect_keeps_part_and_next_call_resumes(
     result = _download(loader, single_entry)
     assert (result / file.path).read_bytes() == fault.body
     assert local_server.requests[-1][1]["Range"] == "bytes=8-"
+
+
+def test_reset_mid_body_is_short_read_and_next_call_resumes(
+    loader: Downloader, store: ModelStore, single_entry: CatalogEntry, local_server: LocalServer
+) -> None:
+    """Сброс соединения посреди тела: short-read в urllib3 1.26 и 2.x, докачка по .part."""
+    file = single_entry.files[0]
+    fault = local_server.faults[file.url_path]
+    fault.mode = "reset"
+    _assert_error(loader, single_entry, "short-read")
+    part = store.staging_dir(single_entry.id, single_entry.revision) / (file.path + ".part")
+    # Сколько байт успело прийти до RST, решает ядро; всё полученное — верный префикс.
+    saved = part.read_bytes()
+    assert len(saved) <= file.size // 2
+    assert saved == fault.body[: len(saved)]
+    fault.mode = "normal"
+    result = _download(loader, single_entry)
+    assert (result / file.path).read_bytes() == fault.body
+    assert local_server.requests[-1][1].get("Range") == (f"bytes={len(saved)}-" if saved else None)
 
 
 def test_truncate_moves_to_next_source_with_range(

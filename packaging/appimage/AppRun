@@ -47,7 +47,7 @@ key_ok() {
 is_service() {
     for arg do
         case $arg in
-            --version | --help | -h | --stats | --selfinstall-status) return 0 ;;
+            --version | --help | -h | --stats | --selfinstall-status | --unregister | --uninstall) return 0 ;;
         esac
     done
     return 1
@@ -104,13 +104,9 @@ if [ "${1:-}" = --selfinstall-status ]; then
     exit 0
 fi
 
-# Совещательный запрет до копирования (arch/appimage.md §5); секции разбирает Python.
-# ASTRA_VOICE_POLICY_FILE — только для тестов и smoke.
-POLICY_FILE=${ASTRA_VOICE_POLICY_FILE:-/etc/astra-voice/policy.conf}
-if [ -r "$POLICY_FILE" ] &&
-    grep -Eiq '^[[:space:]]*appimage[[:space:]]*=[[:space:]]*(deny|no|false|0|off)[[:space:]]*$' "$POLICY_FILE"; then
-    die 'Администратор запретил эту версию программы на компьютере. Используйте системную версию.' 3
-fi
+# Совещательный запрет appimage=deny (arch/appimage.md §5) решает только Python
+# (core/policy.py): bootstrap.py проверяет его в selfinstall до копирования и в app.
+# Своего разбора policy.conf здесь нет — одна точка правды.
 
 # Исходные значения переменных, которые AppRun снимает или ставит, — для
 # внешних программ (childenv.clean_env). Только первый раз: вложенный AppRun
@@ -140,8 +136,7 @@ save_originals
 # Python и Qt (arch/appimage.md §10.4). LD_LIBRARY_PATH не ставим: RUNPATH.
 # shellcheck disable=SC2086
 unset APPIMAGE APPDIR ARGV0 OWD APPIMAGE_EXTRACT_AND_RUN $MANAGED \
-    ASTRA_VOICE_APPIMAGE_DIR ASTRA_VOICE_RESOURCES ASTRA_VOICE_TEST_MOUNTINFO \
-    ASTRA_VOICE_POLICY_FILE
+    ASTRA_VOICE_APPIMAGE_DIR ASTRA_VOICE_RESOURCES ASTRA_VOICE_TEST_MOUNTINFO
 
 installed_ok() {
     [ -d "$TARGET" ] && [ ! -L "$TARGET" ] && [ -f "$TARGET/.installed-ok" ] &&
@@ -170,6 +165,9 @@ run_installed() {
 }
 
 INSTALL=0
+# Режим В без установки (запрет политикой, запуск уходит в системную версию):
+# app — дочерним процессом, чтобы после него убрать распаковку из $TMPDIR.
+CHILD=0
 case $MODE in
     Б | В) INSTALL=1 ;;
 esac
@@ -192,7 +190,9 @@ if [ "$INSTALL" = 1 ]; then
         # завершаем работу в любом режиме, без запуска из монтирования.
         3 | 4) exit "$rc" ;;
     esac
-    if [ "$rc" != "$SKIPPED" ]; then
+    if [ "$rc" = "$SKIPPED" ] && [ "$MODE" = В ]; then
+        CHILD=1
+    elif [ "$rc" != "$SKIPPED" ]; then
         if [ "$MODE" = В ]; then
             # Распаковка временная: работать из неё нельзя, сообщение уже напечатано.
             [ "$rc" = 0 ] && die 'Установленная копия Astra Voice повреждена.'
@@ -211,4 +211,10 @@ fi
 ASTRA_VOICE_RESOURCES=$HERE/usr/share/astra-voice
 ASTRA_VOICE_APPIMAGE_DIR=$HERE
 export SSL_CERT_FILE ASTRA_VOICE_RESOURCES ASTRA_VOICE_APPIMAGE_DIR
+if [ "$CHILD" = 1 ]; then
+    rc=0
+    "$PY" -I "$BOOTSTRAP" app "$@" || rc=$?
+    drop_extracted
+    exit "$rc"
+fi
 exec "$PY" -I "$BOOTSTRAP" app "$@"

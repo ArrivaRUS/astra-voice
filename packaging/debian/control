@@ -42,7 +42,8 @@ Recommends: python3-jsonschema (<< 5),
             fonts-pt-mono,
             polkit-kde-agent-1,
             pipewire-pulse | pulseaudio,
-            wireplumber
+            wireplumber,
+            xdg-utils
 Description: Голосовой ввод для Astra Linux (офлайн-распознавание речи)
  Зажали горячую клавишу, сказали фразу — текст появился в активном окне.
  Распознавание идёт полностью на месте, на процессоре: ни аудио, ни текст

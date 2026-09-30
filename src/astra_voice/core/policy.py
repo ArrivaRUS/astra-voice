@@ -69,6 +69,20 @@ def _coerce(key: str, raw: str) -> Any:
     return text
 
 
+OFFLINE_KEY = "offline"
+
+
+def _offline_value(raw: str, target: Path) -> bool:
+    """offline= из политики: непонятное значение — офлайн (безопасная сторона), не ошибка файла."""
+    text = raw.strip().lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    log.warning("политика %s: непонятное значение offline, включаю работу без сети", target)
+    return True
+
+
 def load(path: Path | None = None) -> Policy:
     """Читает политику. Ошибка разбора → статус ``invalid`` и пустые значения."""
     target = POLICY_PATH if path is None else path
@@ -94,6 +108,13 @@ def load(path: Path | None = None) -> Policy:
     explicit = {k.strip() for k in raw.pop(LOCKED_KEY, "").replace(",", " ").split() if k.strip()}
     values: dict[str, Any] = {}
     for key, value in raw.items():
+        if key == OFFLINE_KEY:
+            if _offline_value(value, target):
+                values[key] = True
+            else:
+                # offline=false — не запрет: уйти в офлайн пользователь может сам.
+                explicit.discard(key)
+            continue
         try:
             values[key] = _coerce(key, value)
         except ValueError as exc:

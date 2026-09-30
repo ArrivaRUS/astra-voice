@@ -19,7 +19,7 @@ from PyQt5.QtTest import QSignalSpy
 
 from astra_voice.core import settings as settings_mod
 from astra_voice.core.model_source import RevocationUnknown
-from astra_voice.models.catalog import CatalogEntry, FileSpec
+from astra_voice.models.catalog import CatalogEntry, FileSpec, Metric, Metrics
 from astra_voice.models.downloader import Progress, remaining_bytes
 from astra_voice.models.store import ModelRecord, ModelState, ModelStore, StoreError
 from astra_voice.ui import model_downloads
@@ -1121,6 +1121,35 @@ def test_failed_switch_with_enough_available_memory_keeps_general_error() -> Non
         downloads.shutdown()
 
 
+def test_too_slow_switch_says_so_without_reinstall_advice() -> None:
+    port, downloads, switcher = switched_rig(True)
+    switcher.available_mb = TONE.min_ram_mb
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        switcher.finish("too-slow")
+        item = card(downloads, TONE.id)
+        assert port.current == (GIGAAM.id, GIGAAM.revision)
+        assert item["message"] == "Модель слишком медленная для этого компьютера"
+        assert "переустанов" not in item["message"].lower()
+        assert item["hint"] == ""
+    finally:
+        downloads.shutdown()
+
+
+def test_too_slow_switch_ignores_memory_of_failed_model() -> None:
+    port, downloads, switcher = switched_rig(True)
+    switcher.available_mb = TONE.min_ram_mb - 1
+    try:
+        downloads.makeModelCurrent(TONE.id)
+        switcher.finish("too-slow")
+        item = card(downloads, TONE.id)
+        assert item["message"] == "Модель слишком медленная для этого компьютера"
+        assert item["hint"] == ""
+        assert item["hintKind"] == ""
+    finally:
+        downloads.shutdown()
+
+
 def test_failed_switch_without_lighter_model_has_no_hint() -> None:
     port = FakeManagedPort()
     port.catalog = (GIGAAM,)
@@ -1498,6 +1527,28 @@ def test_removed_catalog_broken_card_only_offers_removal(rig: Rig) -> None:
     assert queued == []
 
 
+def test_removed_catalog_failed_card_cannot_retry(rig: Rig) -> None:
+    port, downloads, queued = rig
+    removed = replace(TONE, id="old-model", revision="r1", removed_from_catalog=True)
+    port.catalog = (*port.catalog, removed)
+    downloads._entries = port.catalog
+    port.records[(removed.id, removed.revision)] = "ok"
+    downloads._card_states[removed.id] = "failed"
+
+    item = card(downloads, removed.id)
+    assert item["state"] == "failed"
+    assert item["canRetry"] is False
+    downloads.retryModel(removed.id)
+    assert queued == []
+
+    available = replace(removed, removed_from_catalog=False)
+    port.catalog = (*port.catalog[:-1], available)
+    downloads._entries = port.catalog
+    item = card(downloads, available.id)
+    assert item["state"] == "failed"
+    assert item["canRetry"] is True
+
+
 def test_removed_catalog_pause_hint_takes_priority() -> None:
     port = FakeManagedPort()
     removed = replace(TONE, id="old-model", revision="r1", removed_from_catalog=True)
@@ -1701,6 +1752,20 @@ def test_model_service_reads_installed_revision_size() -> None:
     service._store = store
 
     assert service.record_size_bytes("t-one", "r1") == 91_000_000
+
+
+def test_model_service_reads_catalog_rtfx() -> None:
+    service = ModelService.__new__(ModelService)
+    service._catalog = Mock(
+        entries=(
+            replace(GIGAAM, id="gigaam", metrics=Metrics(rtfx=Metric(42.5, "https://example.org"))),
+            TONE,
+        )
+    )
+
+    assert service.catalog_rtfx("gigaam") == 42.5
+    assert service.catalog_rtfx("t-one") is None
+    assert service.catalog_rtfx("missing") is None
 
 
 def test_model_service_reads_total_memory_from_store() -> None:
@@ -1928,3 +1993,62 @@ def test_gate_refusal_blocks_card_actions(
     downloads.download()
     assert started == [GIGAAM.id]
     assert card(downloads, GIGAAM.id)["state"] == state
+
+
+def test_user_offline_hides_download_and_cancels_network_queue() -> None:
+    """Офлайн-режим: карточки без модели — offline-user, идущая загрузка отменяется как «Отмена»."""
+    port = FakeManagedPort()
+    downloads, started = manual_queue(port)
+    spy = QSignalSpy(downloads.modelsChanged)
+    try:
+        downloads.toggleModel(GIGAAM.id)
+        downloads.toggleModel(TONE.id)
+        downloads.startSelectedDownloads()
+        assert started == [GIGAAM.id]
+        port.refusal = lambda: "offline"  # type: ignore[method-assign]
+        downloads.network_changed()
+        assert len(spy) >= 1
+        downloads._model_finished("cancelled", "")
+        downloads._model_thread_finished()
+        assert port.discarded == [GIGAAM.id]
+        assert started == [GIGAAM.id], "очередь после офлайна не продолжается"
+        assert downloads.downloadState == "idle"
+        for model_id in (GIGAAM.id, TONE.id):
+            row = card(downloads, model_id)
+            assert row["state"] == "offline-user"
+            assert row["message"] == ""
+        assert downloads._selected_new() == ()
+        port.refusal = lambda: ""  # type: ignore[method-assign]
+        downloads.network_changed()
+        assert card(downloads, GIGAAM.id)["state"] == "available"
+    finally:
+        downloads.shutdown()
+
+
+def test_user_offline_keeps_installed_cards_and_file_install() -> None:
+    port = FakeManagedPort()
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    downloads, started = manual_queue(port)
+    try:
+        port.refusal = lambda: "offline"  # type: ignore[method-assign]
+        assert card(downloads, GIGAAM.id)["state"] == "installed"
+        assert card(downloads, TONE.id)["state"] == "offline-user"
+        # Установка из файла офлайн не прерывает.
+        downloads._begin_queue((TONE,), Path("/нет/такой/папки"))
+        assert started == [TONE.id]
+        downloads.network_changed()
+        assert downloads._queue_running
+        assert downloads.downloadState == "downloading"
+    finally:
+        downloads.shutdown()
+
+
+def test_admin_refusal_does_not_mark_cards_proactively() -> None:
+    """Проактивно скрываем «Скачать» только в офлайн-режиме; политика — прежним путём."""
+    port = FakeManagedPort()
+    port.refusal = lambda: "admin"  # type: ignore[method-assign]
+    downloads, _ = manual_queue(port)
+    try:
+        assert card(downloads, GIGAAM.id)["state"] == "available"
+    finally:
+        downloads.shutdown()

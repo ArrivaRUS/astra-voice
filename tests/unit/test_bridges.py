@@ -18,7 +18,7 @@ from dataclasses import replace
 from functools import partial
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, cast
 from unittest.mock import Mock, call
 
 import pytest
@@ -74,6 +74,7 @@ from astra_voice.ui.pill import PillState
 from astra_voice.ui.tray_icons import TrayState
 from astra_voice.worker import ipc
 from astra_voice.worker.audio import AudioDevice, AudioError
+from helpers.model_rig import FakeModelPort, ModelRig, model_rig_session
 
 pytestmark = pytest.mark.unit
 
@@ -409,7 +410,7 @@ def test_each_property_saves_and_notifies_once(name: str, with_mirror: bool) -> 
     if name in ("hotkey", "hotkeyMode"):
         apply.hotkey.assert_called_once_with(settings.hotkey, settings.hotkey_mode)
 
-    if name in ("language", "autostart", "checkAppUpdates", "checkModelUpdates"):
+    if name in ("language", "autostart", "checkAppUpdates", "checkModelUpdates", "offline"):
         assert apply.mock_calls == []
     save.reset_mock()
     apply.reset_mock()
@@ -2008,146 +2009,17 @@ def test_onboarding_leaving_capture_releases_keyboard(
     assert controller.captureState == "idle"
 
 
-class FakeModelPort:
-    """Ни сети, ни файлов; ожидание отмены будится непосредственно Event."""
+class JobEvents:
+    """Приёмник событий задания: (вид, аргументы) в порядке поступления."""
 
     def __init__(self) -> None:
-        self.entry = CatalogEntry(
-            id="test-model",
-            revision="test-revision",
-            name="Тестовая модель",
-            description="",
-            size_bytes=226_000_000,
-            min_ram_mb=768,
-            layout="test-layout",
-            variant="test-variant",
-            recommended=True,
-            host="models.example",
-            files=(),
-        )
-        self.ready = False
-        self.damaged = False
-        self.revoked: set[tuple[str, str]] = set()
-        self.network = True
-        self.space = True
-        self.available_bytes = 42_100_000_000
-        self.ram = True
-        self.download_calls = 0
-        self.discarded: list[str] = []
-        self.sources: list[Path] = []
-        self.result = InstallResult("ok")
-        self.error: Exception | None = None
-        self.block = False
-        self.download_thread: int | None = None
+        self.events: list[tuple[str, tuple[Any, ...]]] = []
 
-    def recommended(self) -> CatalogEntry:
-        return self.entry
+    def __call__(self, kind: str, args: tuple[Any, ...]) -> None:
+        self.events.append((kind, args))
 
-    def entries(self) -> tuple[CatalogEntry, ...]:
-        return (self.entry,)
-
-    def is_revoked(self, entry: Any) -> bool:
-        return (entry.id, entry.revision) in self.revoked
-
-    def revoked_revision(self, model_id: str, revision: str) -> bool:
-        return (model_id, revision) in self.revoked
-
-    def recheck_entries(self) -> tuple[CatalogEntry, ...]:
-        return ()
-
-    def verify_files(self, entry: Any) -> tuple[bool, str]:
-        raise AssertionError("У тестового порта нет файлов для перепроверки")
-
-    def smoke(self, entry: Any) -> tuple[bool, str]:
-        raise AssertionError("У тестового порта нет модели для перепроверки")
-
-    def mark_ok(self, model_id: str, revision: str) -> None:
-        raise AssertionError("У тестового порта нет записи для перепроверки")
-
-    def mark_broken(self, model_id: str, revision: str, reason: str) -> None:
-        raise AssertionError("У тестового порта нет записи для перепроверки")
-
-    def record_state(self, model_id: str, revision: str) -> str:
-        if (model_id, revision) != (self.entry.id, self.entry.revision):
-            return ""
-        return "ok" if self.ready else "broken" if self.damaged else ""
-
-    def record_size_bytes(self, model_id: str, revision: str) -> int:
-        return self.entry.size_bytes
-
-    def current_ids(self) -> tuple[str, str] | None:
-        return (self.entry.id, self.entry.revision) if self.ready else None
-
-    def installed_ids(self) -> tuple[tuple[str, str], ...]:
-        return ((self.entry.id, self.entry.revision),) if self.ready or self.damaged else ()
-
-    def set_current(self, model_id: str, revision: str) -> None:
-        assert (model_id, revision) == (self.entry.id, self.entry.revision)
-
-    def remove(self, model_id: str, revision: str) -> None:
-        raise AssertionError("У тестового порта нечего удалять")
-
-    def installed_ok(self) -> bool:
-        return self.ready
-
-    def broken(self) -> bool:
-        return self.damaged
-
-    def allowed(self) -> tuple[bool, str]:
-        return self.network, "Задано администратором: работа без сети" if not self.network else ""
-
-    def refusal(self) -> str:
-        return "" if self.network else "admin"
-
-    def disk_ok(self, size_bytes: int) -> bool:
-        assert size_bytes == self.entry.size_bytes
-        return self.space
-
-    def remaining_bytes(self, entry: CatalogEntry) -> int:
-        return entry.size_bytes
-
-    def disk_missing_bytes(self, size_bytes: int) -> int:
-        return 12_500_000
-
-    def free_bytes(self) -> int:
-        return self.available_bytes
-
-    def ram_ok(self, min_ram_mb: int) -> bool:
-        assert min_ram_mb == self.entry.min_ram_mb
-        return self.ram
-
-    def mem_total_mb(self) -> float | None:
-        return None
-
-    def download(
-        self,
-        entry: CatalogEntry,
-        *,
-        progress: Callable[[Progress], None],
-        cancel: threading.Event,
-        source: Callable[[str], None] | None = None,
-    ) -> Path:
-        self.download_calls += 1
-        self.download_thread = threading.get_ident()
-        progress(Progress(113_000_000, 226_000_000, 5_200_000, 25, 1, 1))
-        if self.block:
-            assert cancel.wait(1), "GUI не передал отмену"
-        if cancel.is_set():
-            raise DownloadError("cancelled")
-        if self.error:
-            raise self.error
-        return Path("/fake/staging")
-
-    def discard_staging(self, entry: CatalogEntry) -> None:
-        self.discarded.append(entry.id)
-
-    def install_from_staging(self, entry: CatalogEntry) -> InstallResult:
-        self.ready = self.result.state == "ok"
-        return self.result
-
-    def install_from_path(self, source: Path, entry: CatalogEntry) -> InstallResult:
-        self.sources.append(source)
-        return self.install_from_staging(entry)
+    def of(self, kind: str) -> list[list[Any]]:
+        return [list(args) for event, args in self.events if event == kind]
 
 
 class ModelPortWithMockedAllowed(FakeModelPort):
@@ -2158,49 +2030,9 @@ class ModelPortWithMockedInstall(FakeModelPort):
     install_from_staging: Mock
 
 
-class ModelFactory(Protocol):
-    def __call__(
-        self,
-        model: ModelPort | None = ...,
-        *,
-        dialog_factory: Callable[[], str] = ...,
-        clock: Callable[[], float] = ...,
-        **settings_extra: object,
-    ) -> OnboardingController: ...
-
-
-ModelRig = tuple[FakeModelPort, ModelFactory]
-
-
 @pytest.fixture
 def model_rig() -> Iterator[ModelRig]:
-    port = FakeModelPort()
-    controllers: list[OnboardingController] = []
-
-    def create(
-        model: ModelPort | None = port,
-        *,
-        dialog_factory: Callable[[], str] = lambda: "",
-        clock: Callable[[], float] = time.monotonic,
-        **settings_extra: object,
-    ) -> OnboardingController:
-        settings = Settings(extra={"onboarding_language_set": True, **settings_extra})
-        controller = OnboardingController(
-            SettingsBridge(settings, save=Mock()),
-            settings=settings,
-            model=model,
-            dialog_factory=dialog_factory,
-            clock=clock,
-            device_provider=lambda: [],
-        )
-        controllers.append(controller)
-        return controller
-
-    yield port, create
-    for controller in controllers:
-        controller.shutdown()
-    QCoreApplication.sendPostedEvents(None, QEvent.MetaCall)
-    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    yield from model_rig_session()
 
 
 @pytest.mark.parametrize(
@@ -2562,11 +2394,11 @@ def test_model_install_revoked_or_cancelled(
 
 
 @pytest.mark.parametrize("scenario", ["download", "local", "recheck"])
-def test_model_job_is_destroyed_in_gui_thread(
+def test_model_job_is_released_in_gui_thread(
     model_rig: ModelRig, monkeypatch: pytest.MonkeyPatch, scenario: str
 ) -> None:
-    # ~QObject задания в рабочем потоке берёт GIL под мьютексом сигналов Qt,
-    # а GUI под GIL ждёт тот же мьютекс: взаимная блокировка. Удалять — только в GUI.
+    # Урок 025/026: задание — не QObject, а последняя ссылка на него (и всё, что оно
+    # держит) отпускается в GUI после выхода рабочего потока.
     port, create = model_rig
     gate = threading.Event()
 
@@ -2597,12 +2429,13 @@ def test_model_job_is_destroyed_in_gui_thread(
         downloads.start_recheck()
     job = downloads._model_job
     assert job is not None
+    assert not isinstance(job, QObject)
     destroyed_in: list[int] = []
 
-    def record(*args: object) -> None:
+    def record() -> None:
         destroyed_in.append(threading.get_ident())
 
-    job.destroyed.connect(record, Qt.DirectConnection)
+    weakref.finalize(job, record)
     del job
     gate.set()
     deadline = time.monotonic() + 2
@@ -2620,11 +2453,11 @@ def test_model_job_unexpected_exception_does_not_log_private_details(
 ) -> None:
     port = FakeModelPort()
     port.error = RuntimeError("Installation failed")
-    job = _ModelJob(port, port.entry, threading.Event())
-    finished = QSignalSpy(job.finished)
+    events = JobEvents()
+    job = _ModelJob(port, port.entry, threading.Event(), sink=events)
     with caplog.at_level(logging.WARNING):
         job.run()
-    assert finished[0][0] == "error"
+    assert events.of("finished")[0][0] == "error"
     assert len(caplog.records) == 1
     assert caplog.records[0].exc_info is None
     assert "Installation failed" not in caplog.text
@@ -2765,10 +2598,11 @@ def test_model_shutdown_times_out_and_logs_warning(
 
     monkeypatch.setattr(port, "install_from_staging", install)
     controller.download()
-    thread = controller._downloads._model_thread
-    assert thread is not None
-    assert controller._downloads._model_job is not None
-    job_ref = weakref.ref(controller._downloads._model_job)
+    downloads = controller._downloads
+    thread, channel = downloads._model_thread, downloads._model_channel
+    assert thread is not None and channel is not None
+    assert downloads._model_job is not None
+    job_ref = weakref.ref(downloads._model_job)
     try:
         assert started.wait(1)
         before = time.monotonic()
@@ -2776,31 +2610,33 @@ def test_model_shutdown_times_out_and_logs_warning(
             controller.shutdown()
         elapsed = time.monotonic() - before
         assert 4.9 <= elapsed < 5.5
-        assert controller._downloads._model_cancel.is_set()
-        assert thread.isRunning()
-        assert thread.parent() is None
+        assert downloads._model_cancel.is_set()
+        assert thread.is_alive() and thread.daemon
+        assert channel.closed
+        woken = list(model_downloads._woken_channels.queue).count(channel)
         assert "не завершилась за 5 секунд" in caplog.text
         assert "выход из приложения продолжается" in caplog.text
-        assert (thread, job_ref()) in model_downloads._finishing_model_threads
-        assert controller._downloads._model_job is None
-        assert controller._downloads._model_thread is None
+        assert downloads._model_job is None
+        assert downloads._model_thread is None
+        assert downloads._model_channel is None
         controller.shutdown()
         sip.delete(controller)
         gc.collect()
         assert sip.isdeleted(controller)
-        assert not sip.isdeleted(thread)
-        assert thread.isRunning()
+        assert thread.is_alive()
+        # Задание держит только рабочий поток; ссылок на QObject у него нет.
         job = job_ref()
-        assert job is not None
-        assert not sip.isdeleted(job)
-        assert job.thread() is thread
+        assert job is not None and not isinstance(job, QObject)
+        del job
     finally:
         release.set()
-        assert thread.wait(1000)
-        controller._downloads._model_thread = None
-        QCoreApplication.sendPostedEvents(None, QEvent.MetaCall)
-        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-    assert (thread, job) not in model_downloads._finishing_model_threads
+        thread.join(1)
+    assert not thread.is_alive()
+    # Затвор закрыт до join: запоздалый итог остался в канале и не будил Qt.
+    assert list(model_downloads._woken_channels.queue).count(channel) == woken
+    events = [kind for kind, _args in list(channel.events.queue)]
+    assert events[-2:] == ["finished", "exit"]
+    QCoreApplication.sendPostedEvents(None, QEvent.MetaCall)
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
@@ -2809,13 +2645,14 @@ def test_model_job_can_run_synchronously_without_event_polling(cancelled: bool) 
     cancel = threading.Event()
     if cancelled:
         cancel.set()
-    job = _ModelJob(port, port.entry, cancel)
-    finished, staged, progressed = (
-        QSignalSpy(job.finished),
-        QSignalSpy(job.staged),
-        QSignalSpy(job.progressed),
-    )
+    events = JobEvents()
+    job = _ModelJob(port, port.entry, cancel, sink=events)
     job.run()
+    finished, staged, progressed = (
+        events.of("finished"),
+        events.of("stage"),
+        events.of("progress"),
+    )
     assert len(finished) == 1
     assert finished[0][0] == ("cancelled" if cancelled else "installed")
     if not cancelled:
@@ -3120,10 +2957,10 @@ def test_model_job_rechecks_permissions_before_network(monkeypatch: pytest.Monke
     monkeypatch.delattr(FakeModelPort, "refusal")
     port = FakeModelPort()
     port.network = False
-    job = _ModelJob(port, port.entry, threading.Event())
-    finished = QSignalSpy(job.finished)
+    events = JobEvents()
+    job = _ModelJob(port, port.entry, threading.Event(), sink=events)
     job.run()
-    assert list(finished) == [["failed:admin", ""]]
+    assert events.of("finished") == [["failed:admin", ""]]
     assert port.download_calls == 0
 
 
@@ -3133,10 +2970,10 @@ def test_model_job_reports_gate_refusal_without_network(
 ) -> None:
     port = FakeModelPort()
     monkeypatch.setattr(port, "refusal", lambda: refusal)
-    job = _ModelJob(port, port.entry, threading.Event())
-    finished = QSignalSpy(job.finished)
+    events = JobEvents()
+    job = _ModelJob(port, port.entry, threading.Event(), sink=events)
     job.run()
-    assert list(finished) == [[f"failed:{refusal}", ""]]
+    assert events.of("finished") == [[f"failed:{refusal}", ""]]
     assert port.download_calls == 0
 
 
@@ -3166,16 +3003,20 @@ def test_model_job_unknown_progress_and_cancel_before_install(
 ) -> None:
     port = FakeModelPort()
     cancel = threading.Event()
-    job = _ModelJob(port, port.entry, cancel)
+    events = JobEvents()
+
+    def sink(kind: str, args: tuple[Any, ...]) -> None:
+        events(kind, args)
+        if (kind, args) == ("stage", ("verifying",)):
+            cancel.set()
+
+    job = _ModelJob(port, port.entry, cancel, sink=sink)
     install_from_staging = Mock()
     monkeypatch.setattr(port, "install_from_staging", install_from_staging)
-    progress = QSignalSpy(job.progressed)
-    finished = QSignalSpy(job.finished)
     job._progress(Progress(0, 0, 0, None, 1, 1))
-    assert progress[0] == [0.0]
-    job.staged.connect(lambda stage: cancel.set() if stage == "verifying" else None)
+    assert events.of("progress")[0] == [0.0]
     job.run()
-    assert finished[0][0] == "cancelled"
+    assert events.of("finished")[0][0] == "cancelled"
     port = cast(ModelPortWithMockedInstall, port)
     port.install_from_staging.assert_not_called()
 
@@ -3253,8 +3094,8 @@ def test_model_shutdown_cancels_active_smoke_check(
     assert started.wait(1)
     controller.shutdown()
     assert stopped.is_set()
-    assert controller._downloads._model_thread is not None
-    assert not controller._downloads._model_thread.isRunning()
+    # Поток вышел за время shutdown(), итог разобран сразу, без опроса очереди GUI.
+    assert controller._downloads._model_thread is None
     if not done:
         assert done.wait(1000)
     assert controller.modelState == "cancelled"
@@ -4340,7 +4181,7 @@ def test_model_queue_serial_bytes_titles_and_first_current(model_rig: ModelRig) 
     assert controller.selectionLine == "Идёт загрузка"
     port.releases[port.entry.id].set()
     assert finished.wait(1000)
-    assert not first_thread.isRunning()
+    assert not first_thread.is_alive()
     assert (
         controller._downloads._model_thread is not None
         and controller._downloads._model_thread is not first_thread
@@ -5792,8 +5633,7 @@ def test_recheck_unavailable_preserves_record_and_card(
         rig.downloads.cancelDownloads()
     elif failure == "shutdown":
         rig.downloads.shutdown()
-        assert rig.downloads._model_thread is not None
-        assert not rig.downloads._model_thread.isRunning()
+        assert rig.downloads._model_thread is None
     elif failure == "exception":
         rig.error = RuntimeError("PRIVATE SPEECH /private/model")
     else:
@@ -5854,8 +5694,10 @@ def test_recheck_shutdown_discards_result_waiting_for_gui(recheck_rig: RecheckRi
     rig.release.set()
     rig.downloads.start_recheck()
     thread = rig.downloads._model_thread
-    assert thread is not None and thread.wait(1000)
-    # Поток уже проверил модель, но его сигналы ещё не обработаны GUI.
+    assert thread is not None
+    thread.join(1)
+    assert not thread.is_alive()
+    # Поток уже проверил модель, но его сообщения ещё не разобраны GUI.
     rig.downloads.shutdown()
     rig.finish()
     assert rig.ok.mock_calls == rig.broken.mock_calls == rig.current.mock_calls == []
@@ -6193,26 +6035,28 @@ def test_model_thread_finished_wait_is_bounded_and_keeps_job_until_cleanup(
     downloads.download()
     thread, job = downloads._model_thread, downloads._model_job
     assert thread is not None and job is not None
-    assert thread.wait(1000)
-    wait = Mock(side_effect=[False, True])
-    monkeypatch.setattr(thread, "wait", wait)
+    thread.join(1)
+    assert not thread.is_alive()
+    join = Mock()
+    monkeypatch.setattr(thread, "join", join)
+    monkeypatch.setattr(thread, "is_alive", Mock(side_effect=[True, False]))
     retry = Mock()
     monkeypatch.setattr(QTimer, "singleShot", retry)
     QCoreApplication.sendPostedEvents(None, QEvent.MetaCall)
-    assert wait.call_args_list == [call(5000)]
+    assert join.call_args_list == [call(5.0)]
     assert "не завершился за 5 секунд" in caplog.text
     assert all(record.exc_info is None for record in caplog.records)
     assert downloads._model_thread is thread and downloads._model_job is job
     assert downloads._queue_running
     downloads.startSelectedDownloads()
     assert downloads._model_thread is thread
-    assert not sip.isdeleted(thread)
     assert retry.call_count == 1
     delay, callback = retry.call_args.args
     assert delay == 100
     callback()
-    assert wait.call_args_list == [call(5000), call(5000)]
-    assert downloads._model_thread is downloads._model_job is None
+    # Повтор только проверяет поток, не блокируя GUI повторным пятисекундным ожиданием.
+    assert join.call_args_list == [call(5.0), call(0.0)]
+    assert downloads._model_thread is None and downloads._model_job is None
     assert not downloads._queue_running
     assert downloads.downloadState == "done"
 

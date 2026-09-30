@@ -8,7 +8,9 @@ from typing import Literal
 from astra_voice.core.policy import Policy, PolicyStatus
 from astra_voice.core.settings import Settings
 
-NetworkKind = Literal["download", "check_app", "check_models"]
+# check_app_manual — «Проверить сейчас»: явное действие пользователя, тумблер не
+# требуется (PRD S9-A5), но офлайн и запрет администратора действуют.
+NetworkKind = Literal["download", "check_app", "check_app_manual", "check_models"]
 
 
 def _policy_offline(value: object) -> bool:
@@ -49,6 +51,8 @@ class NetworkGate:
             if self._policy.status == PolicyStatus.INVALID:
                 return False, "Не удалось проверить правила администратора: работа без сети"
             return False, "Задано администратором: работа без сети"
+        if refusal == "policy":
+            return False, "Проверка обновлений отключена администратором"
         if refusal == "offline":
             return False, "Включена работа без сети"
         if refusal == "settings":
@@ -57,7 +61,7 @@ class NetworkGate:
 
     def refusal(self, kind: NetworkKind) -> str:
         """Возвращает закрытый код причины отказа или пустую строку."""
-        if kind not in ("download", "check_app", "check_models"):
+        if kind not in ("download", "check_app", "check_app_manual", "check_models"):
             raise ValueError("Неизвестный вид сетевого действия")
 
         if self._policy.status == PolicyStatus.INVALID:
@@ -68,6 +72,15 @@ class NetworkGate:
             return "admin"
         if os.environ.get("HF_HUB_OFFLINE", "").lower() in ("1", "true", "yes", "on"):
             return "offline"
+        # Офлайн-режим из «Сеть и обновления» запрещает и ручные действия.
+        if self._settings.offline is True:
+            return "offline"
+        if (
+            kind in ("check_app", "check_app_manual")
+            and self._policy.is_locked("check_app_updates")
+            and self._settings.check_app_updates is not True
+        ):
+            return "policy"
         if (kind == "check_app" and self._settings.check_app_updates is not True) or (
             kind == "check_models" and self._settings.check_model_updates is not True
         ):

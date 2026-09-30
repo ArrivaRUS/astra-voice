@@ -332,6 +332,18 @@ def audio_isolation(pytestconfig: pytest.Config) -> Iterator[None]:
         )
 
 
+@pytest.fixture(autouse=True)
+def no_system_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Стоящий на машине .deb (/usr/bin/astra-voice) тесты не запускают и не учитывают.
+
+    bootstrap при запрете AppImage делает exec системной версии, userinstall.unregister()
+    перенацеливает на неё автозапуск; тест, которому нужна «системная версия», подменяет путь сам.
+    """
+    from astra_voice.core import paths
+
+    monkeypatch.setattr(paths, "SYSTEM_EXECUTABLE", Path("/nonexistent/astra-voice"))
+
+
 def qt_environment_error(
     returncode: int | None,
     stdout: str | bytes | None,

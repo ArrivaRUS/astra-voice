@@ -4,6 +4,8 @@
 #   /usr/lib/astra-voice/astra_voice/      код (bootstrap.py лежит РЯДОМ, не внутри)
 #   /usr/lib/astra-voice/vendor/           onnxruntime + onnx_asr (готовит build-deb.sh)
 #   /usr/share/astra-voice/{qml,data}      ресурсы
+#   /usr/share/astra-voice/docs/           NOTICE и PRIVACY.md для «О программе» (не из
+#                                          /usr/share/doc: Debian Policy 12.3, dh_compress)
 #   /usr/bin/astra-voice                   лаунчер (sh + exec python3 -I)
 #   /var/lib/astra-voice/staging           root:root 0700, под обновлятор M8
 
@@ -54,6 +56,14 @@ override_dh_auto_install:
 	for f in NOTICE docs/PRIVACY.md docs/INSTALL-ADMIN.md docs/SECURITY.md; do \
 		[ -f "$$f" ] && install -m 0644 "$$f" $(DOCDIR)/ || true; \
 	done
+	# Раздел «О программе» открывает свои копии: программа не должна зависеть от
+	# /usr/share/doc (Debian Policy 12.3), а там dh_compress сжал бы файлы в .gz.
+	install -d $(SHAREDIR)/docs
+	install -m 0644 NOTICE docs/PRIVACY.md $(SHAREDIR)/docs/
+
+# Страховка: документы для людей в /usr/share/doc тоже остаются несжатыми.
+override_dh_compress:
+	dh_compress -XNOTICE -XPRIVACY.md
 
 # Каталог staging обязан быть 0700 (T1 M8): dh_fixperms сбрасывает каталоги в 0755,
 # поэтому право ставится после него.

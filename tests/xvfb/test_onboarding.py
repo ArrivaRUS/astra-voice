@@ -665,6 +665,10 @@ class FakeOnboarding(QObject):
         self.calls.append("retryModel")
         self.retried_model_ids.append(model_id)
 
+    @pyqtSlot()
+    def retryFailedDownloads(self) -> None:
+        self.calls.append("retryFailedDownloads")
+
     @pyqtSlot(str)
     def cancelModel(self, model_id: str) -> None:
         self.calls.append("cancelModel")
@@ -761,6 +765,7 @@ class FakeSettings(QObject):
         self._language: str = "ru"
         self._checkAppUpdates: bool = False
         self._checkModelUpdates: bool = False
+        self._offline: bool = False
         self._autostart: bool = True
         self._device: str = "Системный по умолчанию"
         self._hotkeyStatus: str = "ok"
@@ -969,6 +974,15 @@ class FakeSettings(QObject):
     checkModelUpdates = pyqtProperty(
         bool, _get_checkModelUpdates, _set_checkModelUpdates, notify=changed
     )
+
+    def _get_offline(self) -> bool:
+        return self._offline
+
+    def _set_offline(self, value: bool) -> None:
+        self._offline = value
+        self.changed.emit()
+
+    offline = pyqtProperty(bool, _get_offline, _set_offline, notify=changed)
 
     def _get_autostart(self) -> bool:
         return self._autostart
@@ -1394,6 +1408,10 @@ class FakeSettings(QObject):
     def retryModel(self, model_id: str) -> None:
         self.calls.append("retryModel")
         self.retried_model_ids.append(model_id)
+
+    @pyqtSlot()
+    def retryFailedDownloads(self) -> None:
+        self.calls.append("retryFailedDownloads")
 
     @pyqtSlot()
     def pickInstallPath(self) -> None:
@@ -2857,6 +2875,7 @@ def test_download_card_state_frames(onboarding_app: Any) -> None:
         "Не удалось удалить модель. Попробуйте ещё раз.",
         "Модель установлена. Сделать её рабочей не удалось — попробуйте переустановить.",
         "Не удалось загрузить модель. Рабочая модель не изменилась.",
+        "Модель слишком медленная для этого компьютера",
         "Модель не прошла проверку. Попробуйте скачать или установить её заново.",
         "Издатель больше не рекомендует эту версию модели.",
     ],
@@ -4528,15 +4547,15 @@ def test_settings_hide_debug_section_without_flag(onboarding_app: Any, dark: boo
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_settings_about_shows_version_and_privacy(onboarding_app: Any, dark: bool) -> None:
-    """Раздел «О программе» без appInfo показывает запасную версию и две строки."""
+    """Раздел «О программе» без appInfo и aboutBridge открывается с запасной версией."""
 
     def inspect(window: Any) -> None:
         texts = visible_texts(window.contentItem())
         assert {
             "Astra Voice",
             "0.1.0",
-            "Программа не выходит в сеть без вашего действия",
-            "Исходный код открыт",
+            "Лицензия программы",
+            "Исходный код открыт: github.com/ArrivaRUS/astra-voice",
         } <= texts
 
     _, messages = render_settings(onboarding_app, dark, section="about", inspect=inspect)

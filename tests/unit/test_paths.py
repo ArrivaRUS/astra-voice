@@ -93,3 +93,12 @@ def test_resource_root_dev_is_repo_root(monkeypatch: pytest.MonkeyPatch) -> None
     root = paths.resource_root()
     assert (root / "src" / "astra_voice").is_dir()
     assert (root / "pyproject.toml").is_file()
+
+
+def test_system_executable_is_deb_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """conftest подменяет путь во всех тестах — здесь сверяем настоящее значение."""
+    from astra_voice.platform import autostart
+
+    monkeypatch.undo()
+    assert Path("/usr/bin/astra-voice") == paths.SYSTEM_EXECUTABLE
+    assert str(paths.SYSTEM_EXECUTABLE) == autostart.DEB_EXECUTABLE

@@ -18,6 +18,7 @@ ApplicationWindow {
     // ── контекст из app.py (может отсутствовать при запуске через qmlscene) ──
     readonly property var info: (typeof appInfo !== "undefined" && appInfo !== null) ? appInfo : null
     readonly property var bridge: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
+    readonly property var updates: (typeof updatesBridge !== "undefined" && updatesBridge !== null) ? updatesBridge : null
     readonly property string appVersion: (info && info.version) ? info.version : "0.1.0"
     readonly property string sessionKind: (info && info.sessionKind) ? info.sessionKind : "OTHER"
     readonly property bool debugVisible: (info && info.debug === true)
@@ -248,7 +249,9 @@ ApplicationWindow {
         speed: window.bridge ? window.bridge.speed : ""
         eta: window.bridge ? window.bridge.eta : ""
         detail: window.bridge ? window.bridge.downloadDetail : ""
-        onRetryRequested: { if (window.bridge) window.bridge.startSelectedDownloads(); }
+        // После неудачи запись выходит из выбора: «Скачать выбранное» её уже не
+        // увидит, поэтому полоса повторяет именно записи с ошибкой (§10.3, состояние 4).
+        onRetryRequested: { if (window.bridge) window.bridge.retryFailedDownloads(); }
         onOpenFolderRequested: { if (window.bridge) window.bridge.openModelsFolder(); }
     }
 
@@ -260,6 +263,21 @@ ApplicationWindow {
         anchors.bottom: parent.bottom
         height: Theme.statusbarH
         revocationUnknown: window.bridge ? window.bridge.revocationUnknown : false
+        updateState: window.updates ? window.updates.state : "disabled"
+        updateVersion: window.updates ? window.updates.version : ""
+        updateSnoozed: window.updates ? window.updates.snoozed : false
+        updateRestState: window.updates ? window.updates.restState : "idle"
         version: "v" + window.appVersion
+
+        // §6.2: клик по «Доступна версия» открывает панель «Что нового» в разделе «Сеть».
+        onUpdateActivated: function(kind) {
+            if (kind === "skipped" && window.updates) {
+                window.updates.clearSkip()
+            } else if (kind === "unavailable" && window.updates && window.updates.canCheckNow) {
+                window.updates.checkNow()
+            }
+            if (window.sectionIndices.hasOwnProperty("network"))
+                sidebar.currentIndex = window.sectionIndices["network"]
+        }
     }
 }

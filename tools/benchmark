@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""Замеры моделей Astra Voice без GUI и микрофона (Ц6, полоски карточек).
+
+    tools/benchmark --catalog --minimum-models 3
+    tools/benchmark --catalog --store DIR --runs 5 --threads 2 --out measurements.json --json
+
+Каждая исправная установленная модель хранилища замеряется в собственном процессе
+(чистый VmHWM). Внутри — настоящий `WorkerState` воркера, запросы `model.load`,
+`transcribe.file` на `data/test/test-ru-6s.wav` и `measure`: тот же путь, что у диктовки
+(движок, обрезка тишины VAD, `infer_ms`/`audio_ms` из `result`, VmHWM/PSS процесса).
+Перед `model.load` зонд привязывается к родителю (PR_SET_PDEATHSIG и проверка PID),
+запрещает дампы (RLIMIT_CORE = 0 и PR_SET_DUMPABLE = 0), выставляет
+oom_score_adj = 500 и ограничивает RLIMIT_AS по `min_ram_mb` из каталога.
+
+Правила близки к полоскам карточки (`core/measurements.py`), с тремя оговорками:
+- первый прогон после загрузки холодный и не учитывается; RTFx — медиана
+  `audio_ms / infer_ms` по всем тёплым прогонам. Программа берёт медиану последних 20,
+  поэтому числа совпадают при `--runs` ≤ 20;
+- p95 считается по `infer_ms` (время движка), а не по `t_ms` программы (полное время
+  фразы с очередью и IPC), — это время распознавания, не задержка вставки;
+- ОЗУ — VmHWM процесса зонда после прогонов, МБ = round(КиБ × 1024 / 10⁶), как у
+  программы; в него входят и импорты самого инструмента, поэтому число может быть
+  немного больше, чем у воркера. PSS — справочно.
+
+Результат — в формате `measurements.json`, который читают `models/catalog.py` и
+`core/measurements.py`; по умолчанию во временный файл, иначе в `--out`. Файл замеров
+самой программы не перезаписывается. Распознанный текст проверяется только на пустоту
+и никуда не выводится.
+
+Коды возврата: 0 — замерены все исправные модели и их не меньше --minimum-models;
+1 — замер хотя бы одной модели не удался; 2 — прогон невозможен или замерено меньше
+--minimum-models.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import math
+import os
+import queue
+import statistics
+import subprocess
+import sys
+import tempfile
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+from astra_voice.core import paths  # noqa: E402
+from astra_voice.core.measurements import read_measurements, saved_rtfx  # noqa: E402
+from astra_voice.core.stats import percentile  # noqa: E402
+from astra_voice.core.version import __version__  # noqa: E402
+from astra_voice.models.catalog import CatalogEntry, load_builtin, merge_measurement  # noqa: E402
+from astra_voice.models.store import ModelRecord, ModelStore  # noqa: E402
+from astra_voice.security.verify import Verifier  # noqa: E402
+
+Message = dict[str, Any]
+DEFAULT_WAV = ROOT / "data/test/test-ru-6s.wav"
+MIN_WARM_RUNS = 5
+DEFAULT_THREADS = 2
+DEFAULT_MIN_RAM_MB = 768
+RUN_TIMEOUT_S = 60.0
+MODEL_TIMEOUT_S = 300.0
+# Все раскладки каталога идут через OnnxAsrEngine (worker/engine.py).
+ENGINE_MODULES = ("numpy", "onnxruntime", "onnx_asr")
+ENGINE_MISSING = "в этом Python нет onnxruntime/onnx-asr"
+# Причины отказа, которые зонд может сообщить; остальное сводится к «сбой движка».
+PROBE_REASONS = frozenset(
+    {
+        "пустой текст",
+        "распознавание отменено",
+        "нет результата распознавания",
+        "неконечное время прогона",
+        "нулевое время прогона",
+        "нет ответа воркера",
+        ENGINE_MISSING,
+    }
+)
+
+
+class BenchmarkError(RuntimeError):
+    """Понятная причина отказа замера одной модели, без текста и путей."""
+
+
+def warm_runs(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError("ожидается целое число") from None
+    if value < MIN_WARM_RUNS:
+        raise argparse.ArgumentTypeError(f"нужно не меньше {MIN_WARM_RUNS} тёплых прогонов")
+    return value
+
+
+def positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError("ожидается целое число") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("ожидается положительное целое число")
+    return value
+
+
+def nonnegative_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError("ожидается целое число") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("ожидается неотрицательное целое число")
+    return value
+
+
+def megabytes(kib: int) -> int:
+    """Тот же перевод, что у MeasurementTracker.measured: десятичные мегабайты."""
+    return round(kib * 1024 / 1_000_000)
+
+
+def catalog_entries() -> tuple[dict[tuple[str, str], CatalogEntry], str]:
+    """Встроенный подписанный каталог и причина, если его прочитать не удалось."""
+    keyring = paths.data_dir_static() / "keys" / "release.gpg"
+    try:
+        catalog = load_builtin(Verifier("catalog", keyring=keyring))
+    except Exception as exc:
+        # Подпись или схема не прошли: наружу — только тип отказа, без путей.
+        return {}, type(exc).__name__
+    return {(entry.id, entry.revision): entry for entry in catalog.entries}, ""
+
+
+def apply_probe_limits(min_ram_mb: int) -> None:
+    """Пределы настоящего воркера перед model.load: без core dump и RLIMIT_AS."""
+    import resource
+
+    from astra_voice.worker.main import apply_address_space_limit
+
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    apply_address_space_limit(min_ram_mb)
+
+
+def expect(replies: list[Message], kind: str) -> Message:
+    """Синхронный ответ WorkerState: ошибка → только её код."""
+    for reply in replies:
+        if reply["type"] == "error":
+            raise BenchmarkError(f"воркер сообщил ошибку {reply['code']}")
+        if reply["type"] == kind:
+            return reply
+    raise BenchmarkError("нет ответа воркера")
+
+
+def run_probe(
+    *,
+    model_id: str,
+    revision: str,
+    model_dir: Path,
+    layout: str,
+    variant: str,
+    wav: Path,
+    runs: int,
+    threads: int,
+    min_ram_mb: int,
+    engine_factory: Any = None,
+    limits: Callable[[int], None] = apply_probe_limits,
+) -> dict[str, Any]:
+    """Замер в текущем процессе через WorkerState; возвращает только числа."""
+    from astra_voice.worker.state import WorkerState
+
+    if engine_factory is None and any(
+        importlib.util.find_spec(name) is None for name in ENGINE_MODULES
+    ):
+        raise BenchmarkError(ENGINE_MISSING)
+    events: queue.Queue[Message] = queue.Queue()
+    options: dict[str, Any] = {} if engine_factory is None else {"engine_factory": engine_factory}
+    with tempfile.TemporaryDirectory(prefix="astra-voice-bench-") as scratch:
+        state = WorkerState(on_event=events.put, data_dir_factory=lambda: Path(scratch), **options)
+
+        def recognize() -> tuple[float, float]:
+            for reply in state.handle({"type": "transcribe.file", "path": str(wav)}):
+                if reply["type"] == "error":
+                    raise BenchmarkError(f"воркер сообщил ошибку {reply['code']}")
+            while True:
+                try:
+                    event = events.get(timeout=RUN_TIMEOUT_S)
+                except queue.Empty:
+                    raise BenchmarkError("нет результата распознавания") from None
+                if event.get("utterance_id") != "file":
+                    continue
+                if event["type"] == "error":
+                    raise BenchmarkError(f"воркер сообщил ошибку {event['code']}")
+                if event["type"] == "cancelled":
+                    raise BenchmarkError("распознавание отменено")
+                if event["type"] == "result":
+                    break
+            # Текст проверяется на пустоту и сразу отбрасывается.
+            if not str(event["text"]).strip():
+                raise BenchmarkError("пустой текст")
+            infer_ms, audio_ms = float(event["infer_ms"]), float(event["audio_ms"])
+            if not (math.isfinite(infer_ms) and math.isfinite(audio_ms)):
+                raise BenchmarkError("неконечное время прогона")
+            if infer_ms <= 0 or audio_ms <= 0:
+                raise BenchmarkError("нулевое время прогона")
+            return infer_ms, audio_ms
+
+        try:
+            limits(min_ram_mb)
+            loaded = expect(
+                state.handle(
+                    {
+                        "type": "model.load",
+                        "id": model_id,
+                        "revision": revision,
+                        "dir": str(model_dir),
+                        "layout": layout,
+                        "variant": variant,
+                        "threads": threads,
+                        "min_ram_mb": min_ram_mb,
+                    }
+                ),
+                "model.loaded",
+            )
+            cold_ms, audio_ms = recognize()
+            infer: list[float] = []
+            rtfx: list[float] = []
+            for _ in range(runs):
+                infer_ms, audio_ms = recognize()
+                infer.append(infer_ms)
+                rtfx.append(audio_ms / infer_ms)
+            memory = expect(state.handle({"type": "measure"}), "measured")
+        finally:
+            state.close()
+    p95 = percentile(infer, 95)
+    pss_kb = memory["pss_kb"]
+    return {
+        "load_ms": round(float(loaded["load_ms"]), 1),
+        "cold_ms": round(cold_ms, 1),
+        "audio_ms": round(audio_ms, 1),
+        "runs": len(infer),
+        "rtfx": round(statistics.median(rtfx), 2),
+        "p50_ms": round(statistics.median(infer), 1),
+        "p95_ms": None if p95 is None else round(p95, 1),
+        "vm_hwm_kb": memory["vm_hwm_kb"],
+        "ram_mb": megabytes(memory["vm_hwm_kb"]),
+        "pss_mb": None if pss_kb is None else megabytes(pss_kb),
+    }
+
+
+def probe_main(argv: list[str]) -> int:
+    """Дочерний процесс: JSON в одной строке или тихий выход при смерти родителя.
+
+    Если tools/benchmark — PID 1 (контейнер без init), harden_process вернёт False:
+    зонд выйдет молча, все модели получат «неверный ответ процесса».
+    """
+    parser = argparse.ArgumentParser(prog="tools/benchmark _probe")
+    for name in ("--id", "--revision", "--layout", "--variant"):
+        parser.add_argument(name, required=True)
+    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--wav", type=Path, required=True)
+    parser.add_argument("--runs", type=warm_runs, required=True)
+    parser.add_argument("--threads", type=positive_int, required=True)
+    parser.add_argument("--min-ram-mb", type=positive_int, required=True)
+    args = parser.parse_args(argv)
+    parent_pid = os.getppid()
+    from astra_voice.worker.main import harden_process
+
+    if not harden_process(parent_pid):
+        return 0
+    try:
+        result: dict[str, Any] = run_probe(
+            model_id=args.id,
+            revision=args.revision,
+            model_dir=args.model_dir,
+            layout=args.layout,
+            variant=args.variant,
+            wav=args.wav,
+            runs=args.runs,
+            threads=args.threads,
+            min_ram_mb=args.min_ram_mb,
+        )
+        result["ok"] = True
+    except BenchmarkError as exc:
+        result = {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        # Исключения движка могут содержать путь и фрагмент входа: наружу — только тип.
+        result = {"ok": False, "error": type(exc).__name__}
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+    return 0
+
+
+def probe_process(
+    record: ModelRecord, *, min_ram_mb: int, wav: Path, runs: int, threads: int, timeout: float
+) -> dict[str, Any]:
+    """Запускает зонд в отдельном процессе и принимает от него только проверенные числа."""
+    command = [
+        sys.executable,
+        str(ROOT / "tools/benchmark"),
+        "_probe",
+        "--id",
+        record.id,
+        "--revision",
+        record.revision,
+        "--model-dir",
+        str(record.dir),
+        "--layout",
+        record.layout,
+        "--variant",
+        record.variant,
+        "--wav",
+        str(wav),
+        "--runs",
+        str(runs),
+        "--threads",
+        str(threads),
+        "--min-ram-mb",
+        str(min_ram_mb),
+    ]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired:
+        raise BenchmarkError("таймаут") from None
+    except (OSError, subprocess.SubprocessError):
+        raise BenchmarkError("не удалось запустить процесс") from None
+    if completed.returncode:
+        raise BenchmarkError(f"код процесса {completed.returncode}")
+    try:
+        lines = completed.stdout.splitlines()
+        if len(lines) != 1:
+            raise ValueError
+        value = json.loads(lines[0])
+        if not isinstance(value, dict) or type(value.get("ok")) is not bool:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise BenchmarkError("неверный ответ процесса") from None
+    if not value["ok"]:
+        reason = str(value.get("error", ""))
+        code = reason.removeprefix("воркер сообщил ошибку ")
+        if reason not in PROBE_REASONS and not (
+            code != reason and code.replace("-", "").isalnum() and code.isascii()
+        ):
+            reason = "сбой движка"
+        raise BenchmarkError(reason)
+    numbers: dict[str, Any] = {}
+    for field in ("load_ms", "cold_ms", "audio_ms", "rtfx", "p50_ms", "p95_ms"):
+        item = value.get(field)
+        if type(item) not in (int, float) or not math.isfinite(item) or item < 0:
+            raise BenchmarkError("неверный ответ процесса")
+        numbers[field] = item
+    for field in ("runs", "vm_hwm_kb", "ram_mb"):
+        item = value.get(field)
+        if type(item) is not int or item < 0:
+            raise BenchmarkError("неверный ответ процесса")
+        numbers[field] = item
+    pss = value.get("pss_mb")
+    numbers["pss_mb"] = pss if type(pss) is int and pss >= 0 else None
+    if numbers["runs"] < MIN_WARM_RUNS or numbers["rtfx"] <= 0:
+        raise BenchmarkError("неверный ответ процесса")
+    return numbers
+
+
+def app_measurements_path() -> Path:
+    """Файл замеров программы — без создания каталогов."""
+    return paths.data_dir_path() / "measurements.json"
+
+
+def write_measurements(rows: list[dict[str, Any]], threads: int, out: Path | None) -> Path:
+    """Пишет замеренные модели в формате measurements.json атомарно, права 0600."""
+    measured_at = datetime.now(UTC).isoformat()
+    entries = {
+        row["model"]: {
+            "ram_mb": row["ram_mb"],
+            "rtfx": row["rtfx"],
+            "measured_at": measured_at,
+            "threads": threads,
+            "build": __version__,
+        }
+        for row in rows
+        if row["status"] == "замерена"
+    }
+    if out is None:
+        descriptor, name = tempfile.mkstemp(prefix="astra-voice-measurements-", suffix=".json")
+        os.close(descriptor)
+        out = Path(name)
+    directory = out.parent
+    descriptor, temp_name = tempfile.mkstemp(prefix=".measurements-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(entries, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, out)
+    except BaseException:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
+    return out
+
+
+def readable_by_app(
+    out: Path,
+    rows: list[dict[str, Any]],
+    threads: int,
+    entries: dict[tuple[str, str], CatalogEntry],
+) -> bool:
+    """Читает файл теми же функциями, что пилюля и карточка каталога."""
+    data = read_measurements(out)
+    for row in rows:
+        if row["status"] != "замерена":
+            continue
+        model_id, revision = row["model"].split("@", 1)
+        if saved_rtfx(out, model_id, revision, threads) != row["rtfx"]:
+            return False
+        entry = entries.get((model_id, revision))
+        if entry is not None:
+            merged = merge_measurement(entry, data, threads)
+            if merged["ramMb"] != row["ram_mb"] or merged["measuredRtfx"] != row["rtfx"]:
+                return False
+    return True
+
+
+def benchmark_catalog(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    facts: dict[str, Any] = {
+        "command": "benchmark",
+        "mode": "catalog",
+        "threads": args.threads,
+        "runs": args.runs,
+        "minimum_models": args.minimum_models,
+        "rows": [],
+        "measured": 0,
+        "out": None,
+        "readable_by_app": None,
+    }
+    wav: Path = args.wav.expanduser()
+    if not wav.is_file():
+        facts["explanation"] = "Эталонный WAV не найден. Проверьте --wav."
+        return 2, facts
+    facts["wav"] = wav.name
+    if args.out is not None:
+        out = args.out.expanduser().absolute()
+        if out.resolve() == app_measurements_path().resolve():
+            facts["explanation"] = (
+                "Файл замеров программы не перезаписывается. Укажите другой --out."
+            )
+            return 2, facts
+        if out.is_symlink():
+            facts["explanation"] = "--out не должен быть символической ссылкой. Укажите файл."
+            return 2, facts
+        if out.is_dir():
+            facts["explanation"] = "--out указывает на каталог. Укажите путь к файлу."
+            return 2, facts
+        if not out.parent.is_dir():
+            facts["explanation"] = "Каталог для --out не найден."
+            return 2, facts
+    else:
+        out = None
+    store = ModelStore(args.store.expanduser() if args.store else paths.model_store_dir_path())
+    try:
+        records = store.records()
+    except Exception as exc:
+        facts["explanation"] = f"Не удалось прочитать хранилище моделей: {type(exc).__name__}."
+        return 2, facts
+    entries, catalog_error = catalog_entries()
+    facts["catalog_error"] = catalog_error or None
+    rows: list[dict[str, Any]] = []
+    for record in sorted(records, key=lambda item: (item.id, item.revision)):
+        row: dict[str, Any] = {
+            "model": f"{record.id}@{record.revision}",
+            "layout": record.layout,
+            "variant": record.variant,
+            "status": "повреждена",
+        }
+        if record.state == "ok":
+            entry = entries.get((record.id, record.revision))
+            try:
+                row.update(
+                    probe_process(
+                        record,
+                        min_ram_mb=entry.min_ram_mb if entry else DEFAULT_MIN_RAM_MB,
+                        wav=wav.absolute(),
+                        runs=args.runs,
+                        threads=args.threads,
+                        timeout=args.timeout,
+                    )
+                )
+                row["status"] = "замерена"
+            except BenchmarkError as exc:
+                row["status"] = f"ошибка: {exc}"
+            except (OSError, ValueError) as exc:
+                row["status"] = f"ошибка: {type(exc).__name__}"
+        rows.append(row)
+    facts["rows"] = rows
+    measured = sum(row["status"] == "замерена" for row in rows)
+    facts["measured"] = measured
+    if measured:
+        try:
+            written = write_measurements(rows, args.threads, out)
+        except OSError as exc:
+            facts["explanation"] = (
+                f"Не удалось записать замеры: {exc.strerror or type(exc).__name__}."
+            )
+            return 2, facts
+        facts["out"] = str(written)
+        facts["readable_by_app"] = readable_by_app(written, rows, args.threads, entries)
+    failed = any(row["status"] != "замерена" for row in rows if row["status"] != "повреждена")
+    if measured < args.minimum_models:
+        missing = args.minimum_models - measured
+        facts["explanation"] = (
+            f"Недостаточно моделей: замерено {measured}, нужно не меньше "
+            f"{args.minimum_models}. Установите ещё {missing} и повторите замер."
+        )
+        return 2, facts
+    if failed or facts["readable_by_app"] is False:
+        facts["explanation"] = (
+            "Замер части моделей не удался."
+            if failed
+            else "Записанный файл не читается программой как замеры."
+        )
+        return 1, facts
+    facts["explanation"] = ""
+    return 0, facts
+
+
+def number(value: Any, suffix: str = "") -> str:
+    return "—" if value is None else f"{value:g}{suffix}"
+
+
+def report(args: argparse.Namespace, code: int, facts: dict[str, Any]) -> int:
+    verdict = {0: "ок", 1: "есть ошибки замера", 2: "прогон невозможен или мало моделей"}[code]
+    facts.update(exit_code=code, verdict=verdict)
+    if args.json:
+        print(json.dumps(facts, ensure_ascii=False), flush=True)
+        return code
+    print(
+        "Способ: процесс на модель, WorkerState воркера, transcribe.file, "
+        f"{facts.get('wav', 'WAV')}, потоки {args.threads}, тёплых прогонов {args.runs} "
+        "(+1 холодный не учитывается)."
+    )
+    header = ("Модель", "Статус", "RTFx", "p95, мс", "ОЗУ, МБ", "PSS, МБ")
+    table = [header] + [
+        (
+            row["model"],
+            row["status"],
+            number(row.get("rtfx"), "×"),
+            number(row.get("p95_ms")),
+            number(row.get("ram_mb")),
+            number(row.get("pss_mb")),
+        )
+        for row in facts["rows"]
+    ]
+    widths = [max(len(line[index]) for line in table) for index in range(len(header))]
+    for line in table:
+        print("  ".join(cell.ljust(width) for cell, width in zip(line, widths, strict=True)))
+    if not facts["rows"]:
+        print("В хранилище нет установленных моделей.")
+    print(f"Замерено моделей: {facts['measured']}; требуется не меньше {args.minimum_models}.")
+    if facts.get("catalog_error"):
+        print(
+            f"Каталог не прочитан ({facts['catalog_error']}): для предела памяти взят "
+            f"min_ram_mb по умолчанию {DEFAULT_MIN_RAM_MB} МБ, сверка с карточкой каталога "
+            "пропущена."
+        )
+    if facts["out"]:
+        readable = "да" if facts["readable_by_app"] else "НЕТ"
+        print(f"Замеры записаны: {facts['out']} (формат measurements.json; читается: {readable}).")
+    if facts.get("explanation"):
+        print(facts["explanation"])
+    print(f"Итог: {verdict}; код {code}.")
+    return code
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["_probe"]:
+        return probe_main(argv[1:])
+    parser = argparse.ArgumentParser(description="Замеры моделей Astra Voice без GUI")
+    parser.add_argument(
+        "--catalog", action="store_true", required=True, help="замерить модели хранилища"
+    )
+    parser.add_argument("--store", type=Path, metavar="DIR", help="хранилище моделей")
+    parser.add_argument("--wav", type=Path, default=DEFAULT_WAV, help="WAV 16 кГц моно")
+    parser.add_argument(
+        "--runs",
+        type=warm_runs,
+        default=MIN_WARM_RUNS,
+        help=f"тёплых прогонов на модель (не меньше {MIN_WARM_RUNS})",
+    )
+    parser.add_argument(
+        "--threads", type=positive_int, default=DEFAULT_THREADS, help="потоки ORT (обычно 2)"
+    )
+    parser.add_argument(
+        "--minimum-models",
+        type=nonnegative_int,
+        default=1,
+        metavar="N",
+        help="код 2, если замерено меньше N моделей",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=positive_int,
+        default=int(MODEL_TIMEOUT_S),
+        help="таймаут замера одной модели, с",
+    )
+    parser.add_argument("--out", type=Path, help="куда записать measurements.json")
+    parser.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
+    args = parser.parse_args(argv)
+    code, facts = benchmark_catalog(args)
+    return report(args, code, facts)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
