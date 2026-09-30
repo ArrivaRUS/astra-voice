@@ -1,0 +1,4 @@
+# Файл-флаг: AppImage — второй артефакт выпуска (arch/appimage.md §9.1).
+# Есть файл → job appimage собирает и проверяет образ, release кладёт его в ассеты,
+# latest.json (artifacts.appimage) и SHA256SUMS. Снять AppImage с выпуска — удалить файл;
+# правка .github/workflows для этого не нужна.

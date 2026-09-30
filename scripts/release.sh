@@ -50,13 +50,33 @@ else
 fi
 branch=$(git branch --show-current)
 if [[ $branch == main ]]; then check 'текущая ветка main' true; else check "текущая ветка $branch, требуется main" false; fi
-for asset in docs/INSTALL-ADMIN.md data/keys/release.gpg; do
+appimage=false
+if [[ -f packaging/appimage/ENABLED ]]; then appimage=true; fi
+tracked=(docs/INSTALL-ADMIN.md docs/SECURITY.md data/keys/release.gpg)
+# AppImage в выпуске (arch/appimage.md §9.3): флаг и lock обязаны быть в Git — CI
+# соберёт ровно то, что закреплено в коммите тега.
+if $appimage; then
+    tracked+=(packaging/appimage/ENABLED packaging/appimage.lock packaging/appimage/keys/appimage-runtime.gpg)
+fi
+for asset in "${tracked[@]}"; do
     if [[ -f $asset ]] && git ls-files --error-unmatch -- "$asset" >/dev/null 2>&1; then
         check "$asset существует и отслеживается Git" true
     else
         check "$asset отсутствует или не отслеживается Git" false
     fi
 done
+if $appimage; then
+    # Выпуск AppImage — только из lock без незакреплённых колёс (строк # TODO-HASH).
+    if todo=$(python3 packaging/appimage/lockfile.py packaging/appimage.lock todo 2>/dev/null); then
+        if [[ -z $todo ]]; then
+            check 'packaging/appimage.lock: все колёса закреплены по хэшу' true
+        else
+            check "packaging/appimage.lock: колёса без хэша (TODO-HASH): $(echo "$todo" | tr '\n' ' ')" false
+        fi
+    else
+        check 'packaging/appimage.lock не прошёл проверку формата' false
+    fi
+fi
 if python3 scripts/check_keyring.py data/keys/release.gpg >/dev/null; then
     check 'связка ключей в белом списке' true
 else
@@ -124,13 +144,20 @@ if $push; then
 fi
 if ((failed)); then exit 1; fi
 
+echo 'Ассеты, которые опубликует job release (scripts/release_assets.sh):'
+echo "  astra-voice_${version}_amd64.deb"
+echo '  sbom.cdx.json'
+if $appimage; then
+    echo "  Astra_Voice-${version}-x86_64.AppImage (packaging/appimage/ENABLED)"
+    echo '  sbom-appimage.cdx.json'
+else
+    echo '  (AppImage выключен: нет packaging/appimage/ENABLED)'
+fi
 cat <<'ASSETS'
-Ассеты, которые опубликует job release:
-  astra-voice_*.deb
-  sbom.cdx.json
   SHA256SUMS
   SHA256SUMS.asc
   INSTALL-ADMIN.md (из docs/INSTALL-ADMIN.md)
+  SECURITY.md (из docs/SECURITY.md)
   latest.json
   release.gpg (из data/keys/release.gpg)
 ASSETS

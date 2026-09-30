@@ -1,0 +1,67 @@
+# Закреплённые входы AppImage Astra Voice (arch/appimage.md §9.1–§9.2; был spikes/appimage/lock.txt).
+# Читают: packaging/appimage/build.sh (через lockfile.py), scripts/sbom.py --appdir, ключ кэша CI.
+# Формат колёс — pip-требования с --hash (pip install --no-deps --no-index --require-hashes -r).
+# Хэш инструментов сверен с полем digest GitHub Release API, колёс — с digests PyPI JSON API (28.09).
+#
+# Гейт tools/elf-audit (T1 MN-9, У112): новый ELF из обновлённого колеса или символ glibc новее
+# закреплённого роняет сборку. Меняются только осознанно, вместе с колесом.
+# expect-elf: 157
+# max-glibc: 2.28
+#
+# Подпись runtime-x86_64.sig проверяет build.sh --fetch хостовым gpgv по ключу из
+# packaging/appimage/keys/appimage-runtime.gpg; отпечаток (primary или подключ) должен совпасть.
+# Ключ — signing-pubkey.asc из github.com/AppImage/type2-runtime (README, раздел Signing;
+# коммит 177b3204a237 от 2024-05-05), в двоичном виде (gpg --dearmor); gpgv по нему подтвердил
+# подпись закреплённого runtime-x86_64 (VALIDSIG 570C77AC…6490F695, 29.09).
+# runtime-key: 570C77ACEA40C0F1B758902CBF96CCA56490F695
+#
+# tool: runtime-x86_64 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d 944632 https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+# tool: runtime-x86_64.sig de8262d60b5f82bcff11b77598aedef86d2c375fc246d6a675f6cac68b6dfda7 119 https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64.sig
+# tool: appimagetool-x86_64.AppImage ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 15092216 https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+# tool: python3.11.16-cp311-cp311-manylinux_2_28_x86_64.AppImage ea788bd339c7d8f832e246b210cb7bb27a37064aa5082f7e0963244765240c99 17783288 https://github.com/niess/python-appimage/releases/download/python3.11/python3.11.16-cp311-cp311-manylinux_2_28_x86_64.AppImage
+#
+# Колёса PyPI (кэш: ~/.cache/astra-voice-dev/appimage/wheels).
+# numpy 1.24.2 — та же версия, что python3-numpy на ALSE 1.8 (с ней уже живёт .deb + ORT 1.24.4).
+# requests 2.32.5 — как python3-requests на ALSE; urllib3/idna/charset-normalizer/certifi/six/PyQt5-sip — свежие совместимые.
+#
+# jsonschema для обязательной проверки каталога по схеме в AppImage (arch/appimage.md §11 п.1):
+# jsonschema 4.10.3 — как python3-jsonschema 4.10.3-1+b5 в ALSE 1.8 (не выше 4.x, как «<< 5» в control);
+# attrs 22.2.0 — как python3-attr; pyrsistent 0.19.3 в варианте py3-none-any (у 0.18.1 из ALSE нет колеса
+# под cp311; 0.19.3 удовлетворяет jsonschema 4.10.3 и не добавляет ELF — expect-elf не меняется).
+# Хэши закреплены 29.09 (скачивание — с «да» заказчика): sha256 и размер локальных файлов
+# совпали с digests PyPI JSON API (pypi.org/pypi/<имя>/<версия>/json, files.pythonhosted.org).
+jsonschema==4.10.3 \
+    --hash=sha256:443442f9ac2fdfde7bc99079f0ba08e5d167fc67749e9fc706a393bc8857ca48
+attrs==22.2.0 \
+    --hash=sha256:29e95c7f6778868dbd49170f98f8818f78f3dc5e0e37c0b1f474e3561b240836
+pyrsistent==0.19.3 \
+    --hash=sha256:ccf0d6bd208f8111179f0c26fdf84ed7c3891982f2edaeae7422575f47e66b64
+
+PyQt5==5.15.11 \
+    --hash=sha256:cd672a6738d1ae33ef7d9efa8e6cb0a1525ecf53ec86da80a9e1b6ec38c8d0f1
+PyQt5-Qt5==5.15.19 \
+    --hash=sha256:31421d9c31fb29a8faee4b8b3c32658fb51a9e8c4c708075121162fa44faf80e
+PyQt5-sip==12.19.0 \
+    --hash=sha256:40ed8341b7c6681d102708b65acbccf0c26908189bfa2e05e180a3b515296a87
+numpy==1.24.2 \
+    --hash=sha256:9a23f8440561a633204a67fb44617ce2a299beecf3295f0d13c495518908e910
+python-xlib==0.33 \
+    --hash=sha256:c3534038d42e0df2f1392a1b30a15a4ff5fdc2b86cfa94f072bf11b10a164398
+six==1.17.0 \
+    --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274
+requests==2.32.5 \
+    --hash=sha256:2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3
+idna==3.20 \
+    --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
+charset-normalizer==3.5.1 \
+    --hash=sha256:c7b742bf31c88566b4bb6335a7f393bb322e580b6bb98df7bd0c25e6e3519ce8
+certifi==2026.7.22 \
+    --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
+
+# Как в packaging/wheels.lock (тот же пин, что у .deb).
+onnxruntime==1.24.4 \
+    --hash=sha256:e54ad52e61d2d4618dcff8fa1480ac66b24ee2eab73331322db1049f11ccf330
+onnx-asr==0.12.0 \
+    --hash=sha256:5e7ceca454609819ea7833f61e2302e0c8f6ece4f8a78b66c5daba53cb51de4a

@@ -14,7 +14,9 @@
 * **`${{ … }}` внутри `run:`** — подстановка идёт до запуска shell, поэтому
   заголовок PR вида `"; rm -rf /` исполняется. Значения передаются через `env:`;
 * **широкий `paths-ignore`** — позволяет вывести код из-под проверок;
-* **релиз без `needs: engine`** — позволяет выпустить пакет без проверки движка.
+* **релиз без `needs: engine`** — позволяет выпустить пакет без проверки движка;
+* **локальные послабления сборки** (`ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH`) — пускают в
+  образ незакреплённые колёса; в workflow их имени быть не должно (arch/appimage.md §9.2).
 
     scripts/ci_lint.py .github/workflows/*.yml
 """
@@ -42,8 +44,14 @@ ALLOWED_PATHS_IGNORE = frozenset(
         "docs/status.md",
         "docs/plans.md",
         "docs/test-plan.md",
+        # Архитектура и спайки не попадают ни в .deb, ни в AppImage (arch/appimage.md §9.4 п.3).
+        "arch/**",
+        "spikes/**",
     }
 )
+
+#: Переменные окружения только для локальной проверки: в CI запрещены.
+LOCAL_ONLY_ENV = ("ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH",)
 
 _SHA_RE = re.compile(r"^[^@\s]+/[^@\s]+@[0-9a-f]{40}(\s|$)")
 _LOCAL_RE = re.compile(r"^\./")
@@ -89,14 +97,18 @@ def _perm_problems(where: str, perms: Any, job_id: str | None) -> list[str]:
 def check_workflow(path: Path) -> list[str]:
     """Вернуть список нарушений в одном файле workflow (пустой = чисто)."""
     problems: list[str] = []
+    text = path.read_text(encoding="utf-8")
     try:
-        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        doc = yaml.safe_load(text)
     except yaml.YAMLError as exc:
         return [f"{path}: не разобрался YAML: {exc}"]
     if not isinstance(doc, dict):
         return [f"{path}: ожидался словарь на верхнем уровне"]
 
     name = path.name
+    for variable in LOCAL_ONLY_ENV:
+        if variable in text:
+            problems.append(f"{name}: {variable} — только для локальной сборки, в CI запрещена")
 
     triggers = _triggers(doc)
     trigger_names = (

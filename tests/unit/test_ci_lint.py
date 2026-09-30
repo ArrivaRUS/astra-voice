@@ -81,6 +81,8 @@ def test_paths_ignore_allowlist_passes(tmp_path: Path) -> None:
         "docs/status.md",
         "docs/plans.md",
         "docs/test-plan.md",
+        "arch/**",
+        "spikes/**",
     )
     text = GOOD.replace(
         "    branches: [main]",
@@ -177,3 +179,29 @@ def test_expression_injection_in_run_rejected(tmp_path: Path) -> None:
     )
     problems = ci_lint.check_workflow(_write(tmp_path, text))
     assert any("инъекция в shell" in p for p in problems)
+
+
+def test_proposed_workflow_passes() -> None:
+    """Пакет правки ci.yml для заказчика (packaging/appimage/ci-workflow-patch.md) чист.
+
+    Заказчик вносит его в браузере один раз; гейт T-06 обязан пройти до отправки.
+    """
+    proposed = Path(__file__).resolve().parents[2] / "packaging/appimage/ci.yml.proposed"
+    assert ci_lint.check_workflow(proposed) == []
+
+
+def test_local_only_build_variable_rejected(tmp_path: Path) -> None:
+    """P2-2: послабление локальной сборки AppImage в workflow запрещено."""
+    proposed = Path(__file__).resolve().parents[2] / "packaging/appimage/ci.yml.proposed"
+    text = proposed.read_text(encoding="utf-8").replace(
+        "        run: packaging/appimage/build.sh\n",
+        "        run: packaging/appimage/build.sh\n"
+        "        env:\n          ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH: '1'\n",
+        1,
+    )
+    path = tmp_path / "ci.yml"
+    path.write_text(text, encoding="utf-8")
+    problems = ci_lint.check_workflow(path)
+    assert problems == [
+        "ci.yml: ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH — только для локальной сборки, в CI запрещена"
+    ]

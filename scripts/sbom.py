@@ -13,6 +13,12 @@
 объектов, который заказчик подписывает по ГОСТ в контуре с ЗПС (v1.1).
 
     scripts/sbom.py --deb dist/astra-voice_0.1.0~m1_amd64.deb --out dist/sbom.cdx.json
+
+Режим AppImage (arch/appimage.md §9.2, T1 MN-5): состав — колёса и инструменты из
+`packaging/appimage.lock`, интерпретатор python-appimage, OpenSSL из `libssl` бандла
+(принятый риск П16 назван явно), ELF AppDir со sha256:
+
+    scripts/sbom.py --appdir AppDir --lock packaging/appimage.lock --out dist/sbom-appimage.cdx.json
 """
 
 from __future__ import annotations
@@ -48,10 +54,10 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _wheel_components() -> list[dict[str, Any]]:
-    if not LOCK.is_file():
+def _wheel_components(lock: Path = LOCK) -> list[dict[str, Any]]:
+    if not lock.is_file():
         return []
-    text = LOCK.read_text(encoding="utf-8")
+    text = lock.read_text(encoding="utf-8")
     text = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
     out: list[dict[str, Any]] = []
     for m in _LOCK_RE.finditer(text):
@@ -122,37 +128,169 @@ def _dep_components(deb: Path) -> list[dict[str, Any]]:
     return out
 
 
-def _elf_components(deb: Path) -> list[dict[str, Any]]:
+def _tree_elf_components(root: Path) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        with open(path, "rb") as fh:
+            if fh.read(4) != b"\x7fELF":
+                continue
+        rel = "/" + str(path.relative_to(root))
+        out.append(
+            {
+                "type": "file",
+                "bom-ref": f"file:{rel}",
+                "name": rel,
+                "hashes": [{"alg": "SHA-256", "content": _sha256(path)}],
+                "properties": [
+                    {"name": "astra-voice:gost-signing-object", "value": "true"},
+                ],
+            }
+        )
+    return out
+
+
+def _elf_components(deb: Path) -> list[dict[str, Any]]:
     with tempfile.TemporaryDirectory(prefix="sbom-") as tmp:
         root = Path(tmp)
         subprocess.run(["dpkg-deb", "-x", str(deb), str(root)], check=True)
-        for path in sorted(root.rglob("*")):
-            if not path.is_file() or path.is_symlink():
-                continue
-            with open(path, "rb") as fh:
-                if fh.read(4) != b"\x7fELF":
-                    continue
-            rel = "/" + str(path.relative_to(root))
-            out.append(
+        return _tree_elf_components(root)
+
+
+_TOOL_RE = re.compile(
+    r"^#\s*tool:\s+(?P<name>\S+)\s+(?P<sha>[0-9a-f]{64})\s+(?P<size>\d+)\s+(?P<url>\S+)\s*$",
+    re.MULTILINE,
+)
+_OPENSSL_RE = re.compile(rb"OpenSSL (\d+\.\d+\.\d+[a-z]*) ")
+_PYTHON_TOOL_RE = re.compile(r"python(\d+\.\d+\.\d+)-")
+
+
+def _tool_components(lock: Path) -> list[dict[str, Any]]:
+    """Инструменты сборки и база интерпретатора из строк `# tool:` lock-файла."""
+    out: list[dict[str, Any]] = []
+    for m in _TOOL_RE.finditer(lock.read_text(encoding="utf-8")):
+        name, url = m.group("name"), m.group("url")
+        python = _PYTHON_TOOL_RE.match(name)
+        comp: dict[str, Any] = {
+            # Интерпретатор python-appimage попадает в образ; остальные — только сборка.
+            "type": "application" if python else "file",
+            "bom-ref": f"tool:{name}",
+            "name": "cpython (python-appimage)" if python else name,
+            "hashes": [{"alg": "SHA-256", "content": m.group("sha")}],
+            "externalReferences": [{"type": "distribution", "url": url}],
+            "scope": "required" if python else "excluded",
+            "properties": [
                 {
-                    "type": "file",
-                    "bom-ref": f"file:{rel}",
-                    "name": rel,
-                    "hashes": [{"alg": "SHA-256", "content": _sha256(path)}],
-                    "properties": [
-                        {"name": "astra-voice:gost-signing-object", "value": "true"},
-                    ],
+                    "name": "astra-voice:origin",
+                    "value": "bundled interpreter" if python else "build tool",
                 }
-            )
+            ],
+        }
+        if python:
+            comp["version"] = python.group(1)
+            comp["purl"] = f"pkg:generic/cpython@{python.group(1)}"
+        out.append(comp)
     return out
+
+
+def _openssl_components(appdir: Path) -> list[dict[str, Any]]:
+    """OpenSSL из `libssl` бандла — явная строка SBOM для принятого риска П16 (T1 MN-5)."""
+    versions: dict[str, list[str]] = {}
+    for path in sorted(appdir.rglob("libssl.so*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        found = _OPENSSL_RE.search(path.read_bytes())
+        if found:
+            version = found.group(1).decode("ascii")
+            versions.setdefault(version, []).append("/" + str(path.relative_to(appdir)))
+    return [
+        {
+            "type": "library",
+            "bom-ref": f"pkg:generic/openssl@{version}",
+            "name": "openssl",
+            "version": version,
+            "purl": f"pkg:generic/openssl@{version}",
+            "scope": "required",
+            "properties": [
+                {"name": "astra-voice:origin", "value": "bundled with python-appimage"},
+                {"name": "astra-voice:files", "value": " ".join(files)},
+                {"name": "astra-voice:accepted-risk", "value": "П16 (decisions/log.md 28.09)"},
+            ],
+        }
+        for version, files in versions.items()
+    ]
+
+
+def _build_info(appdir: Path) -> dict[str, str]:
+    info: dict[str, str] = {}
+    for line in (appdir / ".astra-voice-build").read_text(encoding="ascii").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            info[key] = value
+    return info
+
+
+def appimage_bom(appdir: Path, lock: Path, epoch: int) -> dict[str, Any]:
+    """SBOM AppDir до упаковки (тот же состав, что внутри .AppImage)."""
+    info = _build_info(appdir)
+    version, build_id = info["VERSION"], info["BUILD_ID"]
+    openssl = _openssl_components(appdir)
+    if not openssl:
+        raise ValueError("в AppDir не найден libssl с версией OpenSSL")
+    components = (
+        _wheel_components(lock) + _tool_components(lock) + openssl + _tree_elf_components(appdir)
+    )
+    ts = datetime.fromtimestamp(epoch, tz=UTC)
+    return {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "serialNumber": "urn:uuid:"
+        + str(uuid.uuid5(uuid.NAMESPACE_URL, f"astra-voice-appimage/{version}/{build_id}")),
+        "version": 1,
+        "metadata": {
+            "timestamp": ts.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "tools": [{"vendor": "ArrivaRUS", "name": "astra-voice sbom.py", "version": "1"}],
+            "component": {
+                "type": "application",
+                "bom-ref": f"pkg:generic/astra-voice-appimage@{version}",
+                "name": "astra-voice",
+                "version": version,
+                "purl": f"pkg:generic/astra-voice-appimage@{version}?arch=x86_64",
+                "licenses": [{"license": {"id": "GPL-3.0-or-later"}}],
+                "properties": [{"name": "astra-voice:build-id", "value": build_id}],
+            },
+        },
+        "components": components,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--deb", type=Path, required=True)
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--deb", type=Path)
+    source.add_argument("--appdir", type=Path, help="AppDir AppImage (вместе с --lock)")
+    ap.add_argument("--lock", type=Path, help="packaging/appimage.lock для --appdir")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args(argv)
+
+    if args.appdir is not None:
+        if args.lock is None or not args.lock.is_file():
+            print("для --appdir нужен существующий --lock", file=sys.stderr)
+            return 2
+        if not (args.appdir / ".astra-voice-build").is_file():
+            print(f"нет маркера сборки в {args.appdir}", file=sys.stderr)
+            return 2
+        epoch = int(os.environ.get("SOURCE_DATE_EPOCH") or 0)
+        try:
+            bom = appimage_bom(args.appdir, args.lock, epoch)
+        except (OSError, KeyError, ValueError) as exc:
+            print(f"SBOM AppImage: {exc}", file=sys.stderr)
+            return 1
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(bom, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"SBOM: {args.out} ({len(bom['components'])} компонентов)")
+        return 0
 
     if not args.deb.is_file():
         print(f"нет пакета: {args.deb}", file=sys.stderr)

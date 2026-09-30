@@ -98,3 +98,22 @@ def test_marker_excludes_only_marked_file(tmp_path: Path) -> None:
 def test_whole_test_tree_is_green() -> None:
     """Полный прогон гейта по репозиторию — 0 (как в CI)."""
     assert guard.main([str(ROOT / "tests" / "unit"), str(ROOT / "tests" / "xvfb")]) == 0
+
+
+def test_if_exists_skips_absent_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Каталог из --if-exists, которого ещё нет (ветка не влита), не ошибка; есть — сканируется."""
+    unit = tmp_path / "unit"
+    unit.mkdir()
+    (unit / "test_a.py").write_text('pytest.importorskip("json")\n', encoding="utf-8")
+    absent = tmp_path / "updates"
+    assert guard.main([str(unit), "--if-exists", str(absent)]) == 0
+    assert "каталога ещё нет — пропуск" in capsys.readouterr().out
+    net = tmp_path / "net"
+    net.mkdir()
+    (net / "test_n.py").write_text('pytest.importorskip("no_such_module_xyz")\n', "utf-8")
+    assert guard.main([str(unit), "--if-exists", str(net), str(absent)]) == 1
+
+
+def test_absent_positional_path_is_error(tmp_path: Path) -> None:
+    """Опечатка в обязательном пути не должна молча выключать гейт."""
+    assert guard.main([str(tmp_path / "typo")]) == 2

@@ -15,6 +15,7 @@
     tools/elf-audit --strict dist/astra-voice_*.deb
     tools/elf-audit --strict --expect 0 dist/astra-voice_*.deb   # сборка --no-vendor
     tools/elf-audit /путь/к/каталогу                             # распакованное дерево
+    tools/elf-audit --strict --expect 157 --max-glibc 2.28 AppDir  # AppImage: оба из lock (MN-9)
 """
 
 from __future__ import annotations
@@ -43,6 +44,12 @@ class Elf:
     size: int
     max_glibc: tuple[int, ...]
     isoc23: list[str]
+
+
+def _glibc_version(raw: str) -> tuple[int, ...]:
+    if not re.fullmatch(r"[0-9]+\.[0-9]+", raw):
+        raise argparse.ArgumentTypeError("нужна версия вида X.Y, например 2.28")
+    return tuple(int(part) for part in raw.split("."))
 
 
 def _is_elf(path: Path) -> bool:
@@ -78,6 +85,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="аудит ELF в .deb или в дереве")
     ap.add_argument("target", type=Path, help=".deb или распакованный каталог")
     ap.add_argument("--expect", type=int, default=DEFAULT_EXPECT, help="ожидаемое число ELF")
+    ap.add_argument(
+        "--max-glibc",
+        type=_glibc_version,
+        default=MAX_GLIBC,
+        help="наибольшая допустимая версия GLIBC_ (по умолчанию 2.36 — ALSE 1.8)",
+    )
     ap.add_argument("--strict", action="store_true", help="расхождение → код возврата 1")
     args = ap.parse_args(argv)
 
@@ -102,13 +115,15 @@ def main(argv: list[str] | None = None) -> int:
         if tmp is not None:
             tmp.cleanup()
 
-    print(f"ELF найдено: {len(elves)} (ожидалось {args.expect})")
+    max_glibc: tuple[int, ...] = args.max_glibc
+    limit = ".".join(str(p) for p in max_glibc)
+    print(f"ELF найдено: {len(elves)} (ожидалось {args.expect}), GLIBC не новее {limit}")
     problems: list[str] = []
     for elf in elves:
         glibc = ".".join(str(p) for p in elf.max_glibc)
         mark = "ok"
-        if elf.max_glibc > MAX_GLIBC:
-            mark = f"GLIBC {glibc} > {'.'.join(str(p) for p in MAX_GLIBC)}"
+        if elf.max_glibc > max_glibc:
+            mark = f"GLIBC {glibc} > {limit}"
             problems.append(f"{elf.path}: {mark}")
         if elf.isoc23:
             problems.append(f"{elf.path}: {len(elf.isoc23)} символов __isoc23_*")

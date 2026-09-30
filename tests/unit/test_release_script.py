@@ -102,6 +102,7 @@ def repo(tmp_path: Path, generated_key: tuple[Path, str]) -> tuple[Path, dict[st
     )
     (work / "docs").mkdir()
     (work / "docs/INSTALL-ADMIN.md").write_text("# Test\n", encoding="utf-8")
+    (work / "docs/SECURITY.md").write_text("# Security\n", encoding="utf-8")
     (work / "data/keys").mkdir(parents=True)
     shutil.copy2(generated_key[0], work / "data/keys/release.gpg")
     git(work, env, "add", ".")
@@ -137,15 +138,18 @@ def test_dry_run(repo: tuple[Path, dict[str, str]]) -> None:
     assert "dry-run: ничего не создано" in result.stdout
     assert result.stdout.count("связка ключей в белом списке") == 1
     for asset in (
-        "astra-voice_*.deb",
+        "astra-voice_0.1.0_amd64.deb",
         "sbom.cdx.json",
+        "(AppImage выключен: нет packaging/appimage/ENABLED)",
         "SHA256SUMS",
         "SHA256SUMS.asc",
         "INSTALL-ADMIN.md (из docs/INSTALL-ADMIN.md)",
+        "SECURITY.md (из docs/SECURITY.md)",
         "latest.json",
         "release.gpg (из data/keys/release.gpg)",
     ):
         assert asset in result.stdout
+    assert "OK: docs/SECURITY.md существует и отслеживается Git" in result.stdout
     assert (
         subprocess.run(
             ["git", "tag", "-l", "v0.1.0"],
@@ -191,6 +195,7 @@ def test_t130_generated_version_does_not_stop_release(
     shutil.copy2(ROOT / "scripts/check_keyring.py", work / "scripts/check_keyring.py")
     (work / "docs").mkdir()
     (work / "docs/INSTALL-ADMIN.md").write_text("# Test\n", encoding="utf-8")
+    (work / "docs/SECURITY.md").write_text("# Security\n", encoding="utf-8")
     (work / "data/keys").mkdir(parents=True)
     shutil.copy2(ROOT / "data/keys/release.gpg", work / "data/keys/release.gpg")
     security = work / "src/astra_voice/security"
@@ -414,3 +419,78 @@ def test_push_failure(repo: tuple[Path, dict[str, str]]) -> None:
         ).stdout.strip()
         == "v0.1.0"
     )
+
+
+SHA = "a" * 64
+APPIMAGE_LOCK = f"""# expect-elf: 157
+# max-glibc: 2.28
+# runtime-key: 570C77ACEA40C0F1B758902CBF96CCA56490F695
+# tool: runtime-x86_64 {SHA} 1 https://example.invalid/runtime-x86_64
+# tool: runtime-x86_64.sig {SHA} 2 https://example.invalid/runtime-x86_64.sig
+# tool: appimagetool-x86_64.AppImage {SHA} 3 https://example.invalid/appimagetool
+# tool: python3.11.16-cp311-cp311-manylinux_2_28_x86_64.AppImage {SHA} 4 https://example.invalid/py
+numpy==1.24.2 \\
+    --hash=sha256:{SHA}
+"""
+
+
+def commit_appimage(
+    repo: tuple[Path, dict[str, str]], *, lock: str | None = APPIMAGE_LOCK, key: bool = True
+) -> None:
+    work, env = repo
+    appimage = work / "packaging/appimage"
+    appimage.mkdir(parents=True)
+    (appimage / "ENABLED").write_text("# флаг\n", encoding="utf-8")
+    shutil.copy2(ROOT / "packaging/appimage/lockfile.py", appimage / "lockfile.py")
+    if lock is not None:
+        (work / "packaging/appimage.lock").write_text(lock, encoding="utf-8")
+    if key:
+        (appimage / "keys").mkdir()
+        (appimage / "keys/appimage-runtime.gpg").write_bytes(b"key")
+    git(work, env, "add", ".")
+    git(work, env, "commit", "-m", "appimage")
+    git(work, env, "push", "origin", "main")
+    git(work, env, "fetch", "origin")
+
+
+def test_dry_run_with_appimage(repo: tuple[Path, dict[str, str]]) -> None:
+    """arch/appimage.md §9.3: при ENABLED в списке — образ и его SBOM, lock и ключ в Git."""
+    commit_appimage(repo)
+    result = run(repo, "v0.1.0", "--skip-ci-check")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Astra_Voice-0.1.0-x86_64.AppImage (packaging/appimage/ENABLED)" in result.stdout
+    assert "sbom-appimage.cdx.json" in result.stdout
+    assert "OK: packaging/appimage.lock существует и отслеживается Git" in result.stdout
+    assert "OK: packaging/appimage.lock: все колёса закреплены по хэшу" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        ("no-lock", "ОШИБКА: packaging/appimage.lock отсутствует или не отслеживается Git"),
+        (
+            "todo",
+            "ОШИБКА: packaging/appimage.lock: колёса без хэша (TODO-HASH): jsonschema==4.10.3",
+        ),
+        ("bad-lock", "ОШИБКА: packaging/appimage.lock не прошёл проверку формата"),
+        (
+            "no-key",
+            "ОШИБКА: packaging/appimage/keys/appimage-runtime.gpg отсутствует "
+            "или не отслеживается Git",
+        ),
+    ],
+)
+def test_appimage_release_preconditions(
+    repo: tuple[Path, dict[str, str]], change: str, error: str
+) -> None:
+    lock: str | None = APPIMAGE_LOCK
+    if change == "no-lock":
+        lock = None
+    elif change == "todo":
+        lock = APPIMAGE_LOCK + "# TODO-HASH: jsonschema==4.10.3 py3-none-any\n"
+    elif change == "bad-lock":
+        lock = "# lock\n"
+    commit_appimage(repo, lock=lock, key=change != "no-key")
+    result = run(repo, "v0.1.0", "--skip-ci-check")
+    assert result.returncode == 1
+    assert error in result.stdout
