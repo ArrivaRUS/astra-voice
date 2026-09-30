@@ -86,7 +86,12 @@ def test_sandbox_fails_on_non_canonical_entry(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(autostart, "_ENTRY", CANONICAL + b"OnlyShowIn=KDE;\n")
+    # В треке ma-foundation запись строится entry_bytes(); подменяем её, а не константу.
+    monkeypatch.setattr(
+        autostart,
+        "entry_bytes",
+        lambda executable_path=None: CANONICAL + b"OnlyShowIn=KDE;\n",
+    )
 
     code, facts = report(validate, [], capsys)
 
