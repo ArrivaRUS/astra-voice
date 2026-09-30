@@ -53,6 +53,7 @@ RUNNING_KEY_LIMIT = 256
 # То же, что проверяет installed_ok() в AppRun.
 REQUIRED_FILES = (
     paths.APPIMAGE_LAUNCHER,
+    "keylib.sh",
     "opt/python3.11/bin/python3.11",
     "usr/lib/astra-voice/bootstrap.py",
     paths.BUILD_MARKER,
@@ -272,21 +273,6 @@ def check_free_space(path: Path, required: int = MIN_FREE_BYTES) -> None:
     if free < required:
         need = max(1, math.ceil((required - free) / MIB))
         raise NotEnoughSpaceError(f"Недостаточно места в домашней папке: нужно ещё {need} МБ.")
-
-
-def running_key_path() -> Path | None:
-    """Путь для чтения без создания каталогов (в том числе из status()).
-
-    Файл ищется во всех существующих кандидатах по порядку записи
-    (``paths.runtime_dir()``): без ``XDG_RUNTIME_DIR`` — сначала каталог сеанса
-    ``/run/user/<uid>/astra-voice``, затем запасной ``/tmp/astra-voice-<uid>`` (туда
-    пишет копия, запущенная без ``XDG_RUNTIME_DIR``).
-    """
-    for directory in paths.existing_runtime_dirs():
-        path = directory / RUNNING_KEY_NAME
-        if os.path.lexists(path):
-            return path
-    return None
 
 
 def _read_running_key(path: Path) -> str | None:

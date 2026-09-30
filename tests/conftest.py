@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import os
 
+REAL_GETEUID = os.geteuid
+
 _DBUS_ORIGINAL_ENV = {
     name: os.environ.get(name)
     for name in ("DBUS_SESSION_BUS_ADDRESS", "QT_ACCESSIBILITY", "AT_SPI_BUS_ADDRESS")
@@ -330,6 +332,12 @@ def audio_isolation(pytestconfig: pytest.Config) -> Iterator[None]:
         check_pulseaudio_processes(
             pytestconfig.stash.get(_PULSE_PROCESSES, None), pulseaudio_processes()
         )
+
+
+@pytest.fixture(autouse=True)
+def nonroot_euid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Обычный пользователь по умолчанию; root-тесты явно ставят 0 после setup."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
 
 
 @pytest.fixture(autouse=True)

@@ -32,8 +32,13 @@ def isolated_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _run(script: Path, args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    # Подмена pytest не наследуется процессом; root-скрипт ниже сам ставит 0.
+    runner = (
+        "import os, runpy, sys; os.geteuid = lambda: 1000; "
+        "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')"
+    )
     return subprocess.run(
-        [sys.executable, "-I", str(script), *args],
+        [sys.executable, "-I", "-c", runner, str(script), *args],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -66,6 +71,7 @@ def test_worker_bootstrap_sets_pulse_clientconfig(tmp_path: Path) -> None:
     script = tmp_path / "check_bootstrap.py"
     script.write_text(
         "import os, runpy\n"
+        "os.geteuid = lambda: 1000\n"
         "from pathlib import Path\n"
         f"bootstrap = runpy.run_path({str(DEV_BOOTSTRAP)!r})\n"
         "assert bootstrap['main'](['worker']) == 2\n"

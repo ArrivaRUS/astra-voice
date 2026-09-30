@@ -19,7 +19,8 @@ import pytest
 
 from astra_voice.core import childenv, paths, policy
 from astra_voice.platform import userinstall
-from helpers.appimage_bundle import KEY, VERSION, make_bundle, tree_snapshot
+from conftest import REAL_GETEUID
+from helpers.appimage_bundle import KEY, VERSION, id_shim, make_bundle, tree_snapshot
 
 pytestmark = pytest.mark.unit
 
@@ -62,13 +63,16 @@ def env(tmp_path: Path) -> dict[str, str]:
     home.mkdir()
     runtime = tmp_path / "run"
     runtime.mkdir(mode=0o700)
-    return {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": str(home),
-        "XDG_RUNTIME_DIR": str(runtime),
-        "APPRUN_TEST_LOG": str(tmp_path / "calls.log"),
-        "LANG": "C.UTF-8",
-    }
+    return id_shim(
+        tmp_path,
+        {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(home),
+            "XDG_RUNTIME_DIR": str(runtime),
+            "APPRUN_TEST_LOG": str(tmp_path / "calls.log"),
+            "LANG": "C.UTF-8",
+        },
+    )
 
 
 def _bundle(root: Path) -> Path:
@@ -82,7 +86,13 @@ def _bundle(root: Path) -> Path:
     python.chmod(0o755)
     boot = bundle / "usr" / "lib" / "astra-voice" / "bootstrap.py"
     boot.unlink()
-    boot.symlink_to(DEV_BOOTSTRAP)
+    # -I не читает sitecustomize из PYTHONPATH: подмена нужна в самом потомке.
+    boot.write_text(
+        "import os, runpy\n"
+        "os.geteuid = lambda: 1000\n"
+        f"runpy.run_path({str(DEV_BOOTSTRAP)!r}, run_name='__main__')\n",
+        encoding="utf-8",
+    )
     return bundle
 
 
@@ -144,6 +154,29 @@ def test_second_run_takes_fast_path(tmp_path: Path, env: dict[str, str]) -> None
     assert proc.returncode == 0, proc.stderr
     assert _calls(env) == [f"app|--register --hidden|HERE={_app(env) / KEY}|EAR=|PP="]
     assert not second.exists()
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("state", ["missing", "directory"])
+def test_incomplete_keylib_requires_reinstallation(
+    tmp_path: Path, env: dict[str, str], shell: str | None, state: str
+) -> None:
+    target = _bundle(_app(env) / KEY)
+    (target / paths.INSTALLED_MARKER).touch()
+    (_app(env) / "current").symlink_to(KEY)
+    info = userinstall.read_build_info(target)
+    assert userinstall.installed_ok(target, info)
+    (target / "keylib.sh").unlink()
+    if state == "directory":
+        (target / "keylib.sh").mkdir()
+    assert not userinstall.installed_ok(target, info)
+    extracted = _bundle(tmp_path / "appimage_extracted_repair")
+    proc = _run(extracted / "AppRun", [], env, shell)
+    assert proc.returncode == 0, proc.stderr
+    assert _calls(env)[0] == f"selfinstall|{extracted}|HERE=|EAR=|PP="
+    assert userinstall.installed_ok(target, info)
+    assert (target / "keylib.sh").read_bytes() == KEYLIB.read_bytes()
+    assert not extracted.exists()
 
 
 def test_installed_copy_runs_in_place(tmp_path: Path, env: dict[str, str]) -> None:
@@ -252,10 +285,11 @@ def _key_cases() -> list[tuple[bool, str]]:
 
 
 @pytest.mark.parametrize(("expected", "name"), _key_cases())
-def test_t181_key_grammar(expected: bool, name: str) -> None:
+@pytest.mark.parametrize("shell", SHELLS)
+def test_t181_key_grammar(expected: bool, name: str, shell: str | None) -> None:
     """T-181: общие примеры для Python и настоящей POSIX sh."""
     proc = subprocess.run(
-        ["sh", "-c", '. "$1"; key_ok "$2"', "sh", str(KEYLIB), name],
+        [shell or "sh", "-c", '. "$1"; key_ok "$2"', "sh", str(KEYLIB), name],
         capture_output=True,
         text=True,
         timeout=10,
@@ -293,6 +327,8 @@ def test_t181_key_directory_symlink_rejected(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("state", ["missing", "unreadable", "directory"])
 def test_unavailable_keylib_refused(tmp_path: Path, env: dict[str, str], state: str) -> None:
+    if state == "unreadable" and REAL_GETEUID() == 0:
+        pytest.skip("root читает файл даже после chmod 0")
     root = _bundle(tmp_path / "appimage_extracted_1")
     keylib = root / "keylib.sh"
     if state == "unreadable":
@@ -308,13 +344,19 @@ def test_unavailable_keylib_refused(tmp_path: Path, env: dict[str, str], state: 
     assert _calls(env) == []
 
 
-def _id_shim(tmp_path: Path, env: dict[str, str], uid: int) -> dict[str, str]:
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    script = bin_dir / "id"
-    script.write_text(f'#!/bin/sh\n[ "$1" = -u ] || exit 99\nprintf "%s\\n" {uid}\n')
-    script.chmod(0o755)
-    return {**env, "PATH": f"{bin_dir}:{env['PATH']}"}
+@pytest.mark.parametrize("shell", SHELLS)
+def test_failed_id_refused_before_launch(
+    tmp_path: Path, env: dict[str, str], shell: str | None
+) -> None:
+    bundle = _bundle(tmp_path / "appimage_extracted_user")
+    (tmp_path / "bin/id").write_text("#!/bin/sh\nexit 1\n", encoding="ascii")
+    before = tree_snapshot(tmp_path)
+    proc = _run(bundle / "AppRun", [], env, shell)
+    assert proc.returncode == 1
+    assert proc.stderr == "Не удалось определить пользователя. Запуск остановлен.\n"
+    assert proc.stdout == ""
+    assert _calls(env) == []
+    assert tree_snapshot(tmp_path) == before
 
 
 @pytest.mark.parametrize("colon", [False, True])
@@ -324,7 +366,7 @@ def test_root_refused_before_cleanup_or_launch(
 ) -> None:
     """T-179: отказ root сохраняет даже распаковку с двоеточием в пути."""
     bundle = _bundle(tmp_path / ("a:b" if colon else "tmp") / "appimage_extracted_root")
-    env = _id_shim(tmp_path, env, 0)
+    env = id_shim(tmp_path, env, 0)
     # Любая внешняя команда после id означает, что ранний отказ был обойдён.
     for name in ("dirname", "readlink", "rm", "sed", "awk"):
         command = tmp_path / "bin" / name
@@ -345,7 +387,7 @@ def test_nonroot_shim_keeps_existing_behavior(
     tmp_path: Path, env: dict[str, str], colon: bool
 ) -> None:
     bundle = _bundle(tmp_path / ("a:b" if colon else "tmp") / "appimage_extracted_user")
-    env = _id_shim(tmp_path, env, 1000)
+    env = id_shim(tmp_path, env)
     proc = _run(bundle / "AppRun", ["--version"], env, "sh")
     if colon:
         assert proc.returncode == 1
@@ -577,7 +619,8 @@ def _policy_boot(bundle: Path, config: Path, system: Path) -> None:
     boot = bundle / "usr" / "lib" / "astra-voice" / "bootstrap.py"
     boot.unlink()
     boot.write_text(
-        "import sys\n"
+        "import os, sys\n"
+        "os.geteuid = lambda: 1000\n"
         f"sys.path.insert(0, {str(REPO_ROOT / 'src')!r})\n"
         "from pathlib import Path\n"
         "from astra_voice import bootstrap\n"

@@ -165,16 +165,18 @@ def runtime_dir() -> Path:
 def _runtime_dir_candidates(*, reading: bool = False) -> tuple[Path, ...]:
     """Кандидаты ``runtime_dir()`` по порядку; последний — запасной в ``/tmp``.
 
-    ``reading`` — для чтения чужих отметок: без ``XDG_RUNTIME_DIR`` (терминал через
-    ``runuser``, cron) программа сеанса всё равно могла писать в ``/run/user/<uid>``.
+    ``reading`` — для чтения отметок: ``XDG_RUNTIME_DIR`` может отсутствовать или
+    остаться от другого пользователя после ``runuser``; проверяем и каталог сеанса.
     """
     raw = os.environ.get("XDG_RUNTIME_DIR", "").strip()
     fallback = FALLBACK_TMP_DIR / f"{APP_NAME}-{os.getuid()}"
+    candidates = []
     if raw.startswith("/"):
-        return (Path(raw) / APP_NAME, fallback)
+        candidates.append(Path(raw) / APP_NAME)
     if reading:
-        return (USER_RUNTIME_ROOT / str(os.getuid()) / APP_NAME, fallback)
-    return (fallback,)
+        candidates.append(USER_RUNTIME_ROOT / str(os.getuid()) / APP_NAME)
+    candidates.append(fallback)
+    return tuple(dict.fromkeys(candidates))
 
 
 def existing_runtime_dirs() -> tuple[Path, ...]:
@@ -300,20 +302,24 @@ def check_appimage_launcher(path: Path) -> Path:
     ):
         raise PathError(error)
     try:
+        app_mode = os.lstat(app).st_mode
         # readlink также отклоняет обычный каталог вместо ссылки current.
         target = Path(os.readlink(current))
         resolved_app = app.resolve(strict=True)
         resolved_target = (app / target).resolve(strict=True)
         resolved_launcher = launcher.resolve(strict=True)
         valid = (
-            ".." not in target.parts
+            stat.S_ISDIR(app_mode)
+            and not stat.S_ISLNK(app_mode)
+            and ".." not in target.parts
             and is_appimage_key(target.name)
             and is_appimage_key(resolved_target.name)
             and resolved_target.is_relative_to(resolved_app)
             and resolved_target.parent == resolved_app
             and resolved_target.is_dir()
-            and resolved_launcher.is_relative_to(resolved_app)
+            and resolved_launcher.parent == resolved_target
             and resolved_launcher.is_file()
+            and os.access(resolved_launcher, os.X_OK)
         )
     except (OSError, RuntimeError, ValueError):
         raise PathError(error) from None

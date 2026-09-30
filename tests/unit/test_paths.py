@@ -55,6 +55,25 @@ def test_runtime_dir_fallback_to_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert stat.S_IMODE(rt.stat().st_mode) == 0o700
 
 
+@pytest.mark.parametrize("same_session", [False, True])
+def test_read_runtime_candidates_include_session_without_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, same_session: bool
+) -> None:
+    root = tmp_path / "run-user"
+    session = root / str(os.getuid()) / "astra-voice"
+    xdg = session if same_session else tmp_path / "other-user/astra-voice"
+    fallback = tmp_path / f"astra-voice-{os.getuid()}"
+    monkeypatch.setattr(paths, "USER_RUNTIME_ROOT", root)
+    monkeypatch.setattr(paths, "FALLBACK_TMP_DIR", tmp_path)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg.parent))
+    expected = (session, fallback) if same_session else (xdg, session, fallback)
+    assert paths._runtime_dir_candidates(reading=True) == expected
+    assert paths._runtime_dir_candidates() == (xdg, fallback)
+    for candidate in expected:
+        candidate.mkdir(parents=True, mode=0o700)
+    assert paths.existing_runtime_dirs() == expected
+
+
 def test_runtime_dir_symlink_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     monkeypatch.setattr(paths, "FALLBACK_TMP_DIR", tmp_path)

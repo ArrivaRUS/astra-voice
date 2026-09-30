@@ -237,7 +237,8 @@ def _wrapper(tmp_path: Path, system: Path) -> Path:
     """bootstrap в дочернем процессе: путь политики, трек и «системная версия» внедрены в код."""
     wrapper = tmp_path / "boot.py"
     wrapper.write_text(
-        "import sys\n"
+        "import os, sys\n"
+        "os.geteuid = lambda: 1000\n"
         f"sys.path.insert(0, {str(REPO_ROOT / 'src')!r})\n"
         "from pathlib import Path\n"
         "from astra_voice import bootstrap\n"

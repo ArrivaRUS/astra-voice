@@ -20,6 +20,7 @@ from typing import cast
 import pytest
 
 import astra_voice.security.verify as verify_module
+from conftest import REAL_GETEUID
 
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]
@@ -500,7 +501,7 @@ def test_unreadable_deb(
     validate: Callable[[list[str]], int],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    if os.geteuid() == 0:
+    if REAL_GETEUID() == 0:
         pytest.skip("root может читать файлы с правами 000")
     deb = next(assets.dist.glob("*.deb"))
     deb.chmod(0)

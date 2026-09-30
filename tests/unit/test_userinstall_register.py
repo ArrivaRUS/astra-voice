@@ -13,6 +13,7 @@ import pytest
 
 from astra_voice.core import paths
 from astra_voice.platform import autostart, userinstall
+from conftest import REAL_GETEUID
 from helpers.appimage_bundle import KEY, VERSION, make_bundle, module_path, tree_snapshot
 
 pytestmark = pytest.mark.unit
@@ -455,7 +456,7 @@ def test_remove_program_keep_adds_to_running_copy(
     assert copy.is_dir() and second.is_dir() and not third.exists()
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root пишет и в каталог 0o500")
+@pytest.mark.skipif(REAL_GETEUID() == 0, reason="root пишет и в каталог 0o500")
 def test_running_key_read_follows_write_fallback(
     home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -468,7 +469,7 @@ def test_running_key_read_follows_write_fallback(
         userinstall.write_running_key(KEY)
         fallback = tmp_path / f"astra-voice-{os.getuid()}"
         assert paths.runtime_dir() == fallback
-        assert userinstall.running_key_path() == fallback / "running-key"
+        assert userinstall.read_running_keys() == frozenset({KEY})
         assert userinstall.read_running_key() == KEY
         assert not (readonly / "run").exists()
     finally:
@@ -581,13 +582,13 @@ def test_running_key_read_without_xdg_checks_session_dir(
         monkeypatch.delenv("XDG_RUNTIME_DIR")
     else:
         monkeypatch.setenv("XDG_RUNTIME_DIR", xdg)
-    assert userinstall.running_key_path() == session / "running-key"
+    assert userinstall.read_running_keys() == frozenset({KEY})
     assert userinstall.read_running_key() == KEY
     # Запись по-прежнему — в запасной каталог: /run/user без XDG не создаём и не трогаем.
     assert paths.runtime_dir() == tmp_path / f"astra-voice-{os.getuid()}"
 
 
-def test_running_key_session_dir_ignored_with_xdg(
+def test_running_keys_include_session_dir_with_inherited_xdg(
     home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "run-user"
@@ -595,7 +596,14 @@ def test_running_key_session_dir_ignored_with_xdg(
     session = root / str(os.getuid()) / "astra-voice"
     session.mkdir(parents=True, mode=0o700)
     put(session / "running-key", (KEY + "\n").encode())
-    assert userinstall.read_running_key() is None
+    inherited = tmp_path / "other-user"
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(inherited))
+    other_key = "0.3.0-aaaaaaaaaaaa"
+    put(inherited / "astra-voice/running-key", (other_key + "\n").encode())
+    assert userinstall.read_running_key() == other_key
+    assert userinstall.read_running_keys() == frozenset({other_key, KEY})
+    (inherited / "astra-voice/running-key").unlink()
+    assert userinstall.read_running_keys() == frozenset({KEY})
 
 
 def test_running_key_found_in_fallback_when_session_dir_has_none(
@@ -609,5 +617,5 @@ def test_running_key_found_in_fallback_when_session_dir_has_none(
     userinstall.write_running_key(KEY)  # копия без XDG_RUNTIME_DIR пишет в запасной каталог
     fallback = tmp_path / f"astra-voice-{os.getuid()}" / "running-key"
     assert fallback.is_file()
-    assert userinstall.running_key_path() == fallback
+    assert userinstall.read_running_keys() == frozenset({KEY})
     assert userinstall.read_running_key() == KEY

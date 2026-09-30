@@ -40,7 +40,10 @@ def executable() -> str:
     """
     kind = paths.install_kind()
     if kind is paths.InstallKind.APPIMAGE_INSTALLED:
-        return str(paths.check_appimage_launcher(paths.appimage_current_apprun()))
+        try:
+            return str(paths.check_appimage_launcher(paths.appimage_current_apprun()))
+        except paths.PathError as exc:
+            raise AutostartError(str(exc)) from exc
     if kind is paths.InstallKind.APPIMAGE_PORTABLE:
         raise AutostartUnavailableError("Автозапуск доступен после установки программы")
     return DEB_EXECUTABLE
@@ -207,7 +210,7 @@ def _inspect() -> tuple[AutostartState, Path, bytes | None]:
                 target = "ours-this"
         except AutostartUnavailableError:
             pass
-        except paths.PathError as exc:
+        except AutostartError as exc:
             # Строгая проверка пути программы отказала: запись наша, но на эту копию
             # не указывает достоверно — «ours-other», чтение состояния не падает.
             log.warning("Не удалось проверить путь программы для автозапуска: %s", exc)

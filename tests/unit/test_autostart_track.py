@@ -95,11 +95,12 @@ def test_invalid_launcher_writes_no_autostart(
     apprun = paths.appimage_app_dir() / KEY / "AppRun"
     apprun.unlink()
     apprun.symlink_to(make_bundle(tmp_path / "outside") / "AppRun")
-    with pytest.raises(paths.PathError, match="Переустановите Astra Voice"):
+    with pytest.raises(autostart.AutostartError, match="Переустановите Astra Voice") as exc:
         if operation == "enable":
             autostart.set_enabled(True)
         else:
             autostart.retarget()
+    assert isinstance(exc.value.__cause__, paths.PathError)
     assert not user_entry.exists()
     assert not user_entry.parent.exists()
 

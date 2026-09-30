@@ -162,6 +162,8 @@ def test_check_launcher_absolutizes_for_comparison(
         "outside-key",
         "extracted-key",
         "parent-target",
+        "lock-apprun",
+        "nonexecutable-apprun",
     ],
 )
 def test_check_launcher_rejects_invalid_installation(
@@ -199,6 +201,8 @@ def test_check_launcher_rejects_invalid_installation(
     elif bad == "parent-target":
         current.unlink()
         current.symlink_to(Path("..") / "app" / KEY)
+    elif bad == "nonexecutable-apprun":
+        launcher.chmod(0o644)
     else:
         apprun = app / KEY / "AppRun"
         apprun.unlink()
@@ -208,6 +212,10 @@ def test_check_launcher_rejects_invalid_installation(
             apprun.mkdir()
         elif bad == "loop-apprun":
             apprun.symlink_to("AppRun")
+        elif bad == "lock-apprun":
+            lock = app / ".install.lock"
+            lock.touch(mode=0o755)
+            apprun.symlink_to(lock)
     with pytest.raises(paths.PathError) as exc:
         paths.check_appimage_launcher(launcher)
     assert str(exc.value) == (
@@ -222,12 +230,13 @@ def test_check_launcher_allows_apprun_link_inside_app(installed_launcher: Path) 
     assert paths.check_appimage_launcher(installed_launcher) is installed_launcher
 
 
-def test_check_launcher_compares_resolved_app(installed_launcher: Path, tmp_path: Path) -> None:
+def test_check_launcher_rejects_symlink_app(installed_launcher: Path, tmp_path: Path) -> None:
     app = paths.appimage_app_dir()
     relocated = tmp_path / "relocated-app"
     app.rename(relocated)
     app.symlink_to(relocated)
-    assert paths.check_appimage_launcher(installed_launcher) is installed_launcher
+    with pytest.raises(paths.PathError, match="Переустановите Astra Voice"):
+        paths.check_appimage_launcher(installed_launcher)
 
 
 def test_tmp_copy_is_not_installed(monkeypatch: pytest.MonkeyPatch, isolated_home: Path) -> None:
