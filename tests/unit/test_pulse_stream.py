@@ -1439,3 +1439,28 @@ def test_device_change_through_wrapper_in_capture() -> None:
     assert not thread.is_alive()
     changed.assert_called_once_with("moved", audio.KIND_DEVICE_LOST, None)
     assert not source.is_open
+
+
+@pytest.mark.parametrize("fail", [None, "context_connect"])
+def test_warm_up_never_creates_stream(fail: str | None, caplog: pytest.LogCaptureFixture) -> None:
+    """Холодный старт (жалоба 30.09): прогрев без микрофона — только опрос и контекст (PRD §9.5)."""
+    pulse = FakePulse()
+    if fail is not None:
+        pulse.fail[fail] = -1
+    source = source_for(pulse)
+    with caplog.at_level("INFO", logger="astra_voice.worker.pulse_stream"):
+        source.warm_up(None)
+    names = pulse.names()
+    assert "stream_new" not in names and "stream_connect_record" not in names
+    assert names.count("context_connect") == 1
+    assert names.count("context_unref") == 1 and names.count("mainloop_free") == 1
+    assert not source.is_open and source.selected_device is None
+    lines = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert len(lines) == 1 and lines[0].startswith("Прогрев пути записи без микрофона: t_ms=")
+    assert lines[0].endswith("итог=" + ("ok" if fail is None else audio.ERROR_FAILED))
+    assert MIC.name not in lines[0]
+    # Прогрев не мешает настоящему открытию тем же источником.
+    pulse.fail.clear()
+    source.open(MIC.name)
+    assert source.is_open
+    source.close()
