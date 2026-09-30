@@ -466,6 +466,84 @@ def test_dry_run_with_appimage(repo: tuple[Path, dict[str, str]]) -> None:
     assert "astra-voice-0.1.0-sources.tar.xz" in result.stdout
     assert "OK: packaging/appimage.lock существует и отслеживается Git" in result.stdout
     assert "OK: packaging/appimage.lock: все колёса закреплены по хэшу" in result.stdout
+    assert "OK: трек AppImage: открытых маркеров T1-01.10/MN-10 нет" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("path", "marker"),
+    [("src/astra_voice/x.py", "T1-01.10"), ("packaging/appimage/build.sh", "MN-10")],
+)
+@pytest.mark.parametrize("push", [False, True])
+def test_appimage_open_markers_block_release(
+    repo: tuple[Path, dict[str, str]], path: str, marker: str, push: bool
+) -> None:
+    commit_appimage(repo)
+    work, env = repo
+    (work / path).write_text(f"# {marker}: долг\n", encoding="utf-8")
+    git(work, env, "add", ".")
+    git(work, env, "commit", "-m", "open appimage marker")
+    git(work, env, "push", "origin", "main")
+    git(work, env, "fetch", "origin")
+
+    args = ("--push",) if push else ()
+    result = run(repo, "v0.1.0", "--skip-ci-check", *args)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert (
+        f"ОШИБКА: трек AppImage не готов к тегу: остались маркеры T1-01.10/MN-10 в: {path}"
+        in result.stdout
+    )
+    for command in (
+        ["git", "tag", "-l", "v0.1.0"],
+        ["git", "ls-remote", "--tags", "origin", "refs/tags/v0.1.0"],
+    ):
+        assert (
+            subprocess.run(
+                command, cwd=work, env=env, capture_output=True, text=True, check=True
+            ).stdout
+            == ""
+        )
+
+
+def test_appimage_unreadable_directory_blocks_release(repo: tuple[Path, dict[str, str]]) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root может читать каталог с chmod 000")
+    work, _ = repo
+    path = work / "src/astra_voice/locked"
+    path.mkdir()
+    (path / ".gitkeep").write_text("", encoding="utf-8")
+    commit_appimage(repo)
+    try:
+        path.chmod(0o000)
+        result = run(repo, "v0.1.0", "--skip-ci-check")
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert "OK: рабочее дерево чистое" in result.stdout
+        assert "ОШИБКА: трек AppImage: не удалось проверить маркеры" in result.stdout
+    finally:
+        path.chmod(0o755)
+
+
+@pytest.mark.parametrize("marker", ["MN-100", "MN-101", "XMN-10", "MN-10_suffix"])
+def test_appimage_marker_requires_whole_token(
+    repo: tuple[Path, dict[str, str]], marker: str
+) -> None:
+    work, _ = repo
+    (work / "src/astra_voice/x.py").write_text(f"# {marker}: другой долг\n", encoding="utf-8")
+    commit_appimage(repo)
+    result = run(repo, "v0.1.0", "--skip-ci-check")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OK: трек AppImage: открытых маркеров T1-01.10/MN-10 нет" in result.stdout
+
+
+def test_appimage_marker_ignored_without_enabled(repo: tuple[Path, dict[str, str]]) -> None:
+    work, env = repo
+    (work / "src/astra_voice/x.py").write_text("# T1-01.10: долг\n", encoding="utf-8")
+    git(work, env, "add", ".")
+    git(work, env, "commit", "-m", "appimage marker without enabled")
+    git(work, env, "push", "origin", "main")
+    git(work, env, "fetch", "origin")
+    result = run(repo, "v0.1.0", "--skip-ci-check")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "трек AppImage" not in result.stdout
 
 
 @pytest.mark.parametrize(

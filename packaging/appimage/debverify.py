@@ -40,7 +40,8 @@ from typing import Any
 import lockfile
 
 #: Статусы gpgv, которые допускаются (белый список, ревью P3-1). ERRSIG/NO_PUBKEY — подписи
-#: ключами, которых намеренно нет в нашем keyring; всё остальное (BADSIG, EXPSIG,
+#: ключами, которых намеренно нет в нашем keyring (только rc=9 и пара по keyid);
+#: всё остальное (BADSIG, EXPSIG,
 #: EXPKEYSIG, REVKEYSIG, ERROR, FAILURE, NODATA, BADARMOR …) — отказ целиком.
 _ALLOWED_STATUS = frozenset(
     {
@@ -125,10 +126,76 @@ def check_clearsigned(raw: bytes, what: str) -> None:
         raise VerifyError(f"{what}: данные после подписи")
 
 
+def check_gpgv_status(
+    stdout: str, signer: str, *, what: str, plaintext: bool, returncode: int
+) -> None:
+    """Общий белый список статусов; для clearsign нужен основной ключ и один текст."""
+    if returncode < 0 or returncode >= 128:
+        raise VerifyError(f"{what}: gpgv аварийно завершился с кодом {returncode}")
+    status = [line.split() for line in stdout.splitlines()]
+    status = [tokens[1:] for tokens in status if tokens[:1] == ["[GNUPG:]"] and tokens[1:]]
+    bad = sorted({tokens[0] for tokens in status if tokens[0] not in _ALLOWED_STATUS})
+    if bad:
+        raise VerifyError(f"{what}: плохая подпись ({', '.join(bad)})")
+    errors = [tokens for tokens in status if tokens[0] == "ERRSIG"]
+    missing = [tokens for tokens in status if tokens[0] == "NO_PUBKEY"]
+    if any(len(tokens) not in (7, 8) or tokens[6] != "9" for tokens in errors):
+        raise VerifyError(f"{what}: ERRSIG допускается только с причиной 9 (нет ключа)")
+    for tokens in errors:
+        if len(tokens) == 8 and tokens[7] != "-":
+            fingerprint = tokens[7]
+            if (
+                re.fullmatch(r"(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})", fingerprint) is None
+                or fingerprint[-16:].upper() != tokens[1].upper()
+            ):
+                raise VerifyError(f"{what}: ERRSIG: неверный отпечаток или несовпадение с keyid")
+    if any(len(tokens) != 2 for tokens in missing) or {tokens[1] for tokens in errors} != {
+        tokens[1] for tokens in missing
+    }:
+        raise VerifyError(f"{what}: ERRSIG и NO_PUBKEY должны иметь парный статус того же keyid")
+    valid = [tokens for tokens in status if tokens[0] == "VALIDSIG"]
+    fingerprints = [tokens[-1] for tokens in valid]
+    if not plaintext:
+        fingerprints += [tokens[1] for tokens in valid if len(tokens) > 1]
+    if signer not in fingerprints:
+        found = ", ".join(fingerprints) or "нет"
+        raise VerifyError(f"{what}: нет подписи ключом {signer} (VALIDSIG: {found})")
+    expected = {"GOODSIG": 1, "VALIDSIG": 1}
+    if plaintext:
+        expected["PLAINTEXT"] = 1
+    counts = {name: sum(1 for tokens in status if tokens[0] == name) for name in expected}
+    if counts != expected:
+        text = " и один текст" if plaintext else ""
+        raise VerifyError(f"{what}: ожидалась ровно одна подпись{text} {counts}")
+
+
+def verify_detached(sig: Path, data: Path, keyring: Path, signer: str, gpgv: str = "gpgv") -> None:
+    """Проверить detached-подпись тем же белым списком, что и InRelease."""
+    if not keyring.is_file():
+        raise VerifyError(f"нет ключа подписи {keyring}")
+    for path in (sig, data):
+        if not path.is_file():
+            raise VerifyError(f"нет файла {path}")
+    try:
+        proc = subprocess.run(
+            [gpgv, "--status-fd", "1", "--keyring", str(keyring), str(sig), str(data)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise VerifyError(f"не запускается {gpgv}: {exc}") from None
+    check_gpgv_status(
+        proc.stdout, signer, what=data.name, plaintext=False, returncode=proc.returncode
+    )
+    if proc.returncode != 0:
+        raise VerifyError(f"{data.name}: gpgv завершился с кодом {proc.returncode}")
+
+
 def gpgv_verify(inrelease: Path, keyring: Path, signer: str, gpgv: str = "gpgv") -> str:
     """Проверить подпись InRelease; вернуть только подписанный текст.
 
-    Код выхода gpgv не решает: у Debian несколько подписей, ключи прочих подписантов в
+    Неаварийный код выхода gpgv не решает: у Debian несколько подписей, ключи прочих подписантов в
     нашем keyring намеренно отсутствуют (NO_PUBKEY). Решает статус по белому списку:
     ровно один GOODSIG и ровно один VALIDSIG — с основным ключом `signer`, ровно один
     PLAINTEXT, остальные статусы — только из `_ALLOWED_STATUS`.
@@ -148,23 +215,9 @@ def gpgv_verify(inrelease: Path, keyring: Path, signer: str, gpgv: str = "gpgv")
             )
         except OSError as exc:
             raise VerifyError(f"не запускается {gpgv}: {exc}") from None
-        status = [line.split() for line in proc.stdout.splitlines()]
-        status = [tokens[1:] for tokens in status if tokens[:1] == ["[GNUPG:]"] and tokens[1:]]
-        bad = sorted({tokens[0] for tokens in status if tokens[0] not in _ALLOWED_STATUS})
-        if bad:
-            raise VerifyError(f"{inrelease.name}: плохая подпись ({', '.join(bad)})")
-        primaries = [tokens[-1] for tokens in status if tokens[0] == "VALIDSIG"]
-        if signer not in primaries:
-            found = ", ".join(primaries) or "нет"
-            raise VerifyError(f"{inrelease.name}: нет подписи ключом {signer} (VALIDSIG: {found})")
-        counts = {
-            name: sum(1 for tokens in status if tokens[0] == name)
-            for name in ("GOODSIG", "VALIDSIG", "PLAINTEXT")
-        }
-        if counts != {"GOODSIG": 1, "VALIDSIG": 1, "PLAINTEXT": 1}:
-            raise VerifyError(
-                f"{inrelease.name}: ожидалась ровно одна подпись и один текст {counts}"
-            )
+        check_gpgv_status(
+            proc.stdout, signer, what=inrelease.name, plaintext=True, returncode=proc.returncode
+        )
         if not plain.is_file():
             raise VerifyError(f"{inrelease.name}: gpgv не выдал подписанный текст")
         return plain.read_text(encoding="utf-8")
@@ -555,14 +608,32 @@ def strip_pgp(text: str) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="проверка происхождения Debian-входов AppImage")
-    parser.add_argument("--lock", type=Path, required=True)
-    parser.add_argument("--cache", type=Path, required=True)
+    parser.add_argument("--lock", type=Path)
+    parser.add_argument("--cache", type=Path)
     parser.add_argument(
         "--root", type=Path, default=Path(__file__).resolve().parents[2], help="корень репозитория"
     )
     parser.add_argument("--deb-dir", type=Path, help="каталог с копиями .deb (сборка) вместо кэша")
-    parser.add_argument("command", choices=("debs", "sources"))
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("debs")
+    commands.add_parser("sources")
+    sig_parser = commands.add_parser("verify-sig", help="проверка detached-подписи")
+    sig_parser.add_argument("--keyring", type=Path, required=True)
+    sig_parser.add_argument("--want-fpr", required=True)
+    sig_parser.add_argument("sig", type=Path)
+    sig_parser.add_argument("file", type=Path)
     args = parser.parse_args(argv)
+    if args.command == "verify-sig":
+        try:
+            verify_detached(args.sig, args.file, args.keyring, args.want_fpr)
+        except VerifyError as exc:
+            print(f"ОШИБКА: {exc}", file=sys.stderr)
+            return 1
+        print(f"подпись: ключ {args.want_fpr} — OK")
+        return 0
+    missing = [name for name in ("--lock", "--cache") if getattr(args, name[2:]) is None]
+    if missing:
+        parser.error(f"для {args.command} обязательны: {', '.join(missing)}")
     try:
         lock = lockfile.load(args.lock)
         verifier = Verifier(lock, args.cache, args.root, deb_dir=args.deb_dir)
