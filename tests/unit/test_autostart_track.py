@@ -16,6 +16,7 @@ import pytest
 
 from astra_voice.core import paths
 from astra_voice.platform import autostart
+from helpers.appimage_bundle import KEY, make_bundle
 
 pytestmark = pytest.mark.unit
 
@@ -37,6 +38,11 @@ def user_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _track(monkeypatch: pytest.MonkeyPatch, kind: paths.InstallKind) -> None:
     monkeypatch.setattr(paths, "install_kind", lambda: kind)
+
+
+def _install_appimage() -> None:
+    make_bundle(paths.appimage_app_dir() / KEY)
+    paths.appimage_current_link().symlink_to(KEY)
 
 
 @pytest.mark.parametrize("kind", [paths.InstallKind.DEB, paths.InstallKind.SOURCE])
@@ -76,6 +82,25 @@ def test_portable_appimage_writes_nothing(
     _track(monkeypatch, paths.InstallKind.APPIMAGE_PORTABLE)
     with pytest.raises(autostart.AutostartUnavailableError, match="после установки"):
         autostart.set_enabled(True)
+    assert not user_entry.exists()
+    assert not user_entry.parent.exists()
+
+
+@pytest.mark.parametrize("operation", ["enable", "retarget"])
+def test_invalid_launcher_writes_no_autostart(
+    monkeypatch: pytest.MonkeyPatch, user_entry: Path, tmp_path: Path, operation: str
+) -> None:
+    """T-177: реальная проверка AppRun останавливает запись автозапуска."""
+    _track(monkeypatch, paths.InstallKind.APPIMAGE_INSTALLED)
+    apprun = paths.appimage_app_dir() / KEY / "AppRun"
+    apprun.unlink()
+    apprun.symlink_to(make_bundle(tmp_path / "outside") / "AppRun")
+    with pytest.raises(autostart.AutostartError, match="Переустановите Astra Voice") as exc:
+        if operation == "enable":
+            autostart.set_enabled(True)
+        else:
+            autostart.retarget()
+    assert isinstance(exc.value.__cause__, paths.PathError)
     assert not user_entry.exists()
     assert not user_entry.parent.exists()
 
@@ -127,6 +152,7 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         ("XDG_RUNTIME_DIR", "runtime"),
     ):
         monkeypatch.setenv(variable, str(tmp_path / directory))
+    _install_appimage()
 
 
 @pytest.mark.parametrize(
@@ -205,6 +231,7 @@ def test_target_decodes_desktop_exec(
 ) -> None:
     """MN-2: два уровня escape и %% читаются обратно, аргументы не часть пути."""
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / directory))
+    _install_appimage()
     _track(monkeypatch, paths.InstallKind.APPIMAGE_INSTALLED)
     user_entry.parent.mkdir(parents=True)
     user_entry.write_bytes(autostart.entry_bytes())
@@ -296,6 +323,7 @@ def test_retarget_existing_tryexec(
     user_entry: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory: str
 ) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / directory))
+    _install_appimage()
     original = DEB_ENTRY.replace(b"Name=Astra Voice\n", b"TryExec=old\nName=Astra Voice\n")
     user_entry.parent.mkdir(parents=True)
     user_entry.write_bytes(original)
@@ -353,6 +381,7 @@ def test_retarget_rejects_control_characters(
     user_entry: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control: str
 ) -> None:
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / f"bad{control}path"))
+    _install_appimage()
     user_entry.parent.mkdir(parents=True)
     user_entry.write_bytes(DEB_ENTRY)
     with pytest.raises(autostart.AutostartError, match="управляющие"):

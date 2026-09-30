@@ -24,7 +24,7 @@ from unittest.mock import Mock, call
 import pytest
 import requests
 from PyQt5 import sip
-from PyQt5.QtCore import QCoreApplication, QEvent, QObject, Qt, QTimer, QUrl
+from PyQt5.QtCore import QCoreApplication, QEvent, QObject, Qt, QThread, QTimer, QUrl
 from PyQt5.QtTest import QSignalSpy
 
 from astra_voice.app import _make_app_info
@@ -197,6 +197,37 @@ def real_autostart_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tup
     monkeypatch.setenv("XDG_CONFIG_HOME", str(user))
     monkeypatch.setenv("XDG_CONFIG_DIRS", str(system))
     return user / "autostart/astra-voice.desktop", system / "autostart/astra-voice.desktop"
+
+
+@pytest.mark.parametrize("onboarding", [False, True])
+def test_missing_appimage_current_reports_autostart_error(
+    real_autostart_paths: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    qcore_app: QCoreApplication,
+    onboarding: bool,
+) -> None:
+    """После удаления current Qt-сеттер и finish сообщают об ошибке без падения."""
+    assert QThread.currentThread() == qcore_app.thread()
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setattr(paths, "install_kind", lambda: paths.InstallKind.APPIMAGE_INSTALLED)
+    assert not paths.appimage_current_link().exists()
+    settings = Settings(
+        autostart=onboarding,
+        extra={"onboarding_language_set": True, "onboarding_model_ready": True},
+    )
+    bridge = SettingsBridge(settings, autostart=autostart_mod, save=Mock())
+    errors = QSignalSpy(bridge.saveErrorChanged)
+    if onboarding:
+        controller = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
+        controller.finish()
+        assert controller.done is True
+    else:
+        assert bridge.setProperty("autostart", True)
+    assert bridge.saveError == "Не удалось изменить автозапуск"
+    assert bridge.autostart is settings.autostart is False
+    assert len(errors) == 1
+    assert not real_autostart_paths[0].exists()
 
 
 @pytest.mark.parametrize("with_system", [False, True])

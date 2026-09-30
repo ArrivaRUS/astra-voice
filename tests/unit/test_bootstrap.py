@@ -32,8 +32,13 @@ def isolated_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _run(script: Path, args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    # Подмена pytest не наследуется процессом; root-скрипт ниже сам ставит 0.
+    runner = (
+        "import os, runpy, sys; os.geteuid = lambda: 1000; "
+        "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')"
+    )
     return subprocess.run(
-        [sys.executable, "-I", str(script), *args],
+        [sys.executable, "-I", "-c", runner, str(script), *args],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -66,6 +71,7 @@ def test_worker_bootstrap_sets_pulse_clientconfig(tmp_path: Path) -> None:
     script = tmp_path / "check_bootstrap.py"
     script.write_text(
         "import os, runpy\n"
+        "os.geteuid = lambda: 1000\n"
         "from pathlib import Path\n"
         f"bootstrap = runpy.run_path({str(DEV_BOOTSTRAP)!r})\n"
         "assert bootstrap['main'](['worker']) == 2\n"
@@ -107,6 +113,81 @@ def test_unknown_command_and_no_args(tmp_path: Path) -> None:
         proc = _run(DEV_BOOTSTRAP, args, cwd=tmp_path)
         assert proc.returncode == 2
         assert "usage" in proc.stderr
+
+
+@pytest.mark.parametrize(
+    "kind", [paths.InstallKind.APPIMAGE_PORTABLE, paths.InstallKind.APPIMAGE_INSTALLED]
+)
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],
+        ["--version"],
+        ["--uninstall"],
+        ["app", "--version"],
+        ["app", "--uninstall"],
+        ["selfinstall", "/missing"],
+        ["worker"],
+        ["helper"],
+    ],
+)
+def test_root_refused_before_any_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    policy_entries: dict[str, Mock],
+    kind: paths.InstallKind,
+    args: list[str],
+) -> None:
+    """T-179: даже служебная или неверная команда не обходит отказ."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(paths, "install_kind", lambda: kind)
+    gate = Mock(side_effect=AssertionError("политика до отказа root"))
+    monkeypatch.setattr(bootstrap, "_appimage_policy_gate", gate)
+    assert bootstrap.main(args) == 3
+    assert capsys.readouterr().err == userinstall.ROOT_REFUSED_MESSAGE + "\n"
+    gate.assert_not_called()
+    for entry in policy_entries.values():
+        entry.assert_not_called()
+    assert isinstance(audio_env.deny_pulse_autospawn, Mock)
+    audio_env.deny_pulse_autospawn.assert_not_called()
+    assert "QT_QUICK_CONTROLS_STYLE" not in os.environ
+
+
+@pytest.mark.parametrize("kind", [paths.InstallKind.DEB, paths.InstallKind.SOURCE])
+def test_root_outside_bundle_keeps_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    policy_entries: dict[str, Mock],
+    kind: paths.InstallKind,
+) -> None:
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(paths, "install_kind", lambda: kind)
+    assert bootstrap.main(["--version"]) == 2
+    assert capsys.readouterr().err == bootstrap.USAGE
+    assert bootstrap.main(["app", "--version"]) == 17
+    policy_entries["app"].assert_called_once_with(["--version"])
+    assert capsys.readouterr().err == ""
+
+
+def test_root_refusal_does_not_import_qt(tmp_path: Path) -> None:
+    """Проверяем чистый интерпретатор: Qt не загружен даже косвенно."""
+    script = tmp_path / "root_bootstrap.py"
+    script.write_text(
+        "import os, sys\n"
+        f"sys.path.insert(0, {str(REPO_ROOT / 'src')!r})\n"
+        "from astra_voice import bootstrap\n"
+        "from astra_voice.core import paths\n"
+        "os.geteuid = lambda: 0\n"
+        "paths.install_kind = lambda: paths.InstallKind.APPIMAGE_PORTABLE\n"
+        "result = bootstrap.main(['--version'])\n"
+        "assert not any(n == 'PyQt5' or n.startswith('PyQt5.') for n in sys.modules)\n"
+        "raise SystemExit(result)\n",
+        encoding="utf-8",
+    )
+    proc = _run(script, [], tmp_path)
+    assert proc.returncode == 3
+    assert proc.stdout == ""
+    assert proc.stderr == userinstall.ROOT_REFUSED_MESSAGE + "\n"
 
 
 def test_setup_sys_path_installed_prefers_vendor(tmp_path: Path) -> None:
