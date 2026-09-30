@@ -277,8 +277,6 @@ Column {
                     target: micSlider
                     property: "value"
                     value: root.micVolume
-                    when: !micSlider.pressed
-                    restoreMode: Binding.RestoreNone
                 }
 
                 onValueChanged: {
@@ -288,12 +286,22 @@ Column {
                 onPressedChanged: {
                     if (pressed)
                         draggedValue = value
-                    else if (root.settings && Math.round(draggedValue) !== root.micVolume)
-                        root.settings.setMicrophoneVolume(Math.round(draggedValue))
+                    else {
+                        var previousVolume = root.micVolume
+                        if (root.settings && Math.round(draggedValue) !== previousVolume)
+                            root.settings.setMicrophoneVolume(Math.round(draggedValue))
+                        if (root.micVolume === previousVolume)
+                            micSlider.value = root.micVolume
+                    }
                 }
                 onMoved: {
-                    if (!pressed && root.settings && Math.round(value) !== root.micVolume)
-                        root.settings.setMicrophoneVolume(Math.round(value))
+                    if (!pressed) {
+                        var previousVolume = root.micVolume
+                        if (root.settings && Math.round(value) !== previousVolume)
+                            root.settings.setMicrophoneVolume(Math.round(value))
+                        if (root.micVolume === previousVolume)
+                            micSlider.value = root.micVolume
+                    }
                 }
             }
 
