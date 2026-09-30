@@ -981,3 +981,8 @@ legal-analyst); правообладатель — ГК «Астра» (NOTICE, 
 - PR #28 СЛИТ (short-read по Content-Length в urllib3 1.26/2.8, `_RecheckJob` finally, `_selfcheck` failed при невозможном откате, тесты M7) . Беклог: тест огромного Content-Length — проверять тело `hello`; на urllib3 2.x при обрыве теряется ≤64 КиБ хвоста блока (`read1` вместо `iter_content`, nit); общий модуль схемы урока 026 (трей/notify/model_downloads) — v1.0, решение Юрки 29.09.
 - PR #29 СЛИТ — M6 хвост: состояния загрузчика на живом мосте (12 unit + 7 xvfb), «Повторить» в полосе после ошибки снова работает (окно настроек и мастер), отозванные модели не повторяются (`ModelDownloads.retryFailed()`). Беклог P3-7: единая проверка `_can_retry(entry)` для canRetry/retryModel/retryFailed (сейчас установленная vs каталожная ревизия расходятся; безвредно).
 - Хвост M6 v0.2 открыт: зеркало весов `models-2026.10` в GitHub Releases (публикация — с «ок» заказчика), живые T-74…T-76, T-86 у заказчика.
+
+### 2026-09-30 ~11:30 — Codex вернулся, штатные роли
+- Заказчик: лимиты Codex сброшены — код снова пишет `developer-codex` (GPT-6 Sol @high), ревью — Claude `code-reviewer`; режим «Codex только архитектура» снят.
+- В работе параллельно: `wip/backlog-nits` (wt-nits, Sol) — беклог P3/nit одним PR (зонд benchmark getppid/DUMPABLE/oom_score_adj, тест огромного Content-Length с телом, `_can_retry(entry)` P3-7, тексты «потеряна» для кодов ≠ busy, `dictate50.sh` без `pgrep -f`, usage `hotkey_diag app-pid`, INFO «simple (откат)»); `wt-arch18` (architect-codex, только чтение) — план US-1.8 «Пройти настройку заново» → `scratchpad/us18/plan.md`.
+- План четверга 01.10 без изменений: T1 AppImage + T2 одним проходом → ma-foundation → r2-ci → перенос deb3 на main.
