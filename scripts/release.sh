@@ -76,14 +76,14 @@ if $appimage; then
     else
         check 'packaging/appimage.lock не прошёл проверку формата' false
     fi
-    marker_dirs=()
-    for directory in src/ packaging/appimage/; do
-        if [[ -d $directory ]]; then marker_dirs+=("$directory"); fi
-    done
     marker_status=0
-    markers=$(grep -rIlE 'T1-01\.10|(^|[^[:alnum:]_])MN-10([^[:alnum:]_]|$)' "${marker_dirs[@]}") || marker_status=$?
+    markers=$(LC_ALL=C git grep -lE '(T1-01\.10|\bMN-10\b)' HEAD -- src packaging/appimage) || marker_status=$?
     case $marker_status in
-        0) check "трек AppImage не готов к тегу: остались маркеры T1-01.10/MN-10 в: ${markers//$'\n'/ }" false ;;
+        0)
+            markers=${markers#HEAD:}
+            markers=${markers//$'\n'HEAD:/$'\n'}
+            check "трек AppImage не готов к тегу: остались маркеры T1-01.10/MN-10 в: ${markers//$'\n'/ }" false
+            ;;
         1) check 'трек AppImage: открытых маркеров T1-01.10/MN-10 нет' true ;;
         *) check 'трек AppImage: не удалось проверить маркеры T1-01.10/MN-10' false ;;
     esac

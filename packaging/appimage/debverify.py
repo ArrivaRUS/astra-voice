@@ -145,7 +145,7 @@ def check_gpgv_status(
         if len(tokens) == 8 and tokens[7] != "-":
             fingerprint = tokens[7]
             if (
-                re.fullmatch(r"(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})", fingerprint) is None
+                re.fullmatch(r"[0-9A-Fa-f]{40}", fingerprint) is None
                 or fingerprint[-16:].upper() != tokens[1].upper()
             ):
                 raise VerifyError(f"{what}: ERRSIG: неверный отпечаток или несовпадение с keyid")
@@ -189,7 +189,9 @@ def verify_detached(sig: Path, data: Path, keyring: Path, signer: str, gpgv: str
         proc.stdout, signer, what=data.name, plaintext=False, returncode=proc.returncode
     )
     if proc.returncode != 0:
-        raise VerifyError(f"{data.name}: gpgv завершился с кодом {proc.returncode}")
+        raise VerifyError(
+            f"{data.name}: gpgv завершился с кодом {proc.returncode}: {proc.stderr[-200:].strip()}"
+        )
 
 
 def gpgv_verify(inrelease: Path, keyring: Path, signer: str, gpgv: str = "gpgv") -> str:

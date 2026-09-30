@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import subprocess
 from collections.abc import Iterator
@@ -504,22 +505,55 @@ def test_appimage_open_markers_block_release(
         )
 
 
-def test_appimage_unreadable_directory_blocks_release(repo: tuple[Path, dict[str, str]]) -> None:
-    if os.geteuid() == 0:
-        pytest.skip("root может читать каталог с chmod 000")
-    work, _ = repo
-    path = work / "src/astra_voice/locked"
-    path.mkdir()
-    (path / ".gitkeep").write_text("", encoding="utf-8")
+def test_appimage_git_grep_error_blocks_release(
+    repo: tuple[Path, dict[str, str]], tmp_path: Path
+) -> None:
     commit_appimage(repo)
-    try:
-        path.chmod(0o000)
-        result = run(repo, "v0.1.0", "--skip-ci-check")
-        assert result.returncode == 1, result.stdout + result.stderr
-        assert "OK: рабочее дерево чистое" in result.stdout
-        assert "ОШИБКА: трек AppImage: не удалось проверить маркеры" in result.stdout
-    finally:
-        path.chmod(0o755)
+    work, env = repo
+    real_git = shutil.which("git")
+    assert real_git is not None
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "git"
+    shim.write_text(
+        f'#!/bin/sh\nif [ "$1" = grep ]; then exit 2; fi\nexec {shlex.quote(real_git)} "$@"\n',
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    result = run((work, {**env, "PATH": f"{shim_dir}:{env['PATH']}"}), "v0.1.0", "--skip-ci-check")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "OK: рабочее дерево чистое" in result.stdout
+    assert "OK: HEAD совпадает с локальным origin/main" in result.stdout
+    assert result.stdout.count("ОШИБКА:") == 1
+    assert (
+        "ОШИБКА: трек AppImage: не удалось проверить маркеры T1-01.10/MN-10"
+        in result.stdout.splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "marker"),
+    [("src/astra_voice/x.py", "T1-01.10"), ("packaging/appimage/build.sh", "MN-10")],
+)
+def test_appimage_committed_marker_removed_from_worktree_blocks_release(
+    repo: tuple[Path, dict[str, str]], path: str, marker: str
+) -> None:
+    commit_appimage(repo)
+    work, env = repo
+    (work / path).write_text(f"# {marker}: долг\n", encoding="utf-8")
+    git(work, env, "add", ".")
+    git(work, env, "commit", "-m", "committed appimage marker")
+    git(work, env, "push", "origin", "main")
+    git(work, env, "fetch", "origin")
+    (work / path).write_text("# долг закрыт только в рабочем дереве\n", encoding="utf-8")
+
+    result = run(repo, "v0.1.0", "--skip-ci-check")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "ОШИБКА: рабочее дерево не чистое" in result.stdout
+    assert (
+        f"ОШИБКА: трек AppImage не готов к тегу: остались маркеры T1-01.10/MN-10 в: {path}"
+        in result.stdout.splitlines()
+    )
 
 
 @pytest.mark.parametrize("marker", ["MN-100", "MN-101", "XMN-10", "MN-10_suffix"])

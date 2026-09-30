@@ -44,6 +44,15 @@ def statuses() -> dict[str, str]:
         + "[GNUPG:] KEYEXPIRED 1577923200\n"
         + f"[GNUPG:] EXPKEYSIG {SUBKEY[-16:]} Test\n"
         + valid,
+        "keyexpired": "[GNUPG:] KEYEXPIRED 1577923200\n"
+        + prefix
+        + f"[GNUPG:] GOODSIG {SUBKEY[-16:]} Test\n"
+        + valid,
+        "keyrevoked": "[GNUPG:] KEYREVOKED\n"
+        + prefix
+        + f"[GNUPG:] GOODSIG {SUBKEY[-16:]} Test\n"
+        + valid,
+        "expkeysig": prefix + f"[GNUPG:] EXPKEYSIG {SUBKEY[-16:]} Test\n" + valid,
         "revoked": prefix + f"[GNUPG:] REVKEYSIG {SUBKEY[-16:]} Test\n" + valid,
         "expsig": prefix + f"[GNUPG:] EXPSIG {SUBKEY[-16:]} Test\n" + valid,
         "badsig": prefix + f"[GNUPG:] BADSIG {SUBKEY[-16:]} Test\n" + valid,
@@ -79,7 +88,7 @@ def test_real_gpgv_status(real_gpgv_status: str, plaintext: bool) -> None:
     )
 
 
-@pytest.mark.parametrize("suffix", ["", " -", " " + "A" * 48 + REAL_FOREIGN[-16:]])
+@pytest.mark.parametrize("suffix", ["", " -"])
 @pytest.mark.parametrize("plaintext", [False, True])
 def test_real_errsig_optional_fingerprint(
     real_gpgv_status: str, suffix: str, plaintext: bool
@@ -101,6 +110,7 @@ def test_real_errsig_optional_fingerprint(
         ("9 " + REAL_FOREIGN[1:], "неверный отпечаток"),
         ("9 " + "A" + REAL_FOREIGN, "неверный отпечаток"),
         ("9 " + "A" * 47 + REAL_FOREIGN[-16:], "неверный отпечаток"),
+        ("9 " + "A" * 48 + REAL_FOREIGN[-16:], "неверный отпечаток"),
         ("9 " + "A" * 49 + REAL_FOREIGN[-16:], "неверный отпечаток"),
         ("9 - extra", "только с причиной 9"),
         ("9 " + REAL_FOREIGN + " 9", "только с причиной 9"),
@@ -121,6 +131,9 @@ def test_real_errsig_invalid_fields_rejected(
 
 REJECTED = [
     ("expired", r"плохая подпись \(EXPKEYSIG, KEYEXPIRED\)"),
+    ("keyexpired", r"плохая подпись \(KEYEXPIRED\)"),
+    ("keyrevoked", r"плохая подпись \(KEYREVOKED\)"),
+    ("expkeysig", r"плохая подпись \(EXPKEYSIG\)"),
     ("revoked", r"плохая подпись \(REVKEYSIG\)"),
     ("expsig", r"плохая подпись \(EXPSIG\)"),
     ("badsig", r"плохая подпись \(BADSIG\)"),
@@ -253,7 +266,7 @@ def inputs(tmp_path: Path) -> tuple[Path, Path, Path]:
     return sig, data, keyring
 
 
-def fake_gpgv(tmp_path: Path, stdout: str, args: list[str], rc: int = 0) -> str:
+def fake_gpgv(tmp_path: Path, stdout: str, args: list[str], rc: int = 0, stderr: str = "") -> str:
     script = tmp_path / "gpgv"
     script.write_text(
         f"#!{sys.executable}\n"
@@ -266,6 +279,7 @@ def fake_gpgv(tmp_path: Path, stdout: str, args: list[str], rc: int = 0) -> str:
         "    del args[index:index + 2]\n"
         f"assert args == {args!r}, args\n"
         f"sys.stdout.write({stdout!r})\n"
+        f"sys.stderr.write({stderr!r})\n"
         "sys.stdout.flush()\n"
         f"if {rc} < 0:\n"
         "    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
@@ -314,6 +328,17 @@ def test_verify_detached_nonzero_rc(
     gpgv = fake_gpgv(tmp_path, stdout, detached_args(inputs), rc=rc)
     with pytest.raises(debverify.VerifyError, match=f"gpgv завершился с кодом {rc}"):
         debverify.verify_detached(*inputs, FPR, gpgv=gpgv)
+
+
+@pytest.mark.parametrize("rc", [1, 2])
+def test_verify_detached_nonzero_rc_includes_stderr_tail(
+    tmp_path: Path, inputs: tuple[Path, Path, Path], statuses: dict[str, str], rc: int
+) -> None:
+    stderr = "discarded diagnostic\n" * 30 + "last diagnostic\n  "
+    gpgv = fake_gpgv(tmp_path, statuses["good"], detached_args(inputs), rc=rc, stderr=stderr)
+    with pytest.raises(debverify.VerifyError) as error:
+        debverify.verify_detached(*inputs, FPR, gpgv=gpgv)
+    assert str(error.value) == (f"runtime: gpgv завершился с кодом {rc}: {stderr[-200:].strip()}")
 
 
 @pytest.mark.parametrize("rc", [0, 1, 2, 128, 134, 139, -6])

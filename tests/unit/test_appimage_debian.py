@@ -1061,6 +1061,65 @@ def test_expired_key_rejected(archive: Archive, tmp_path: Path) -> None:
         verify(archive)
 
 
+@needs_tools
+def test_verify_detached_expired_key_rejected(tmp_path: Path) -> None:
+    """T-190: подпись действовала в 2020 году, но ключ к моменту проверки истёк."""
+    gpg = Gpg(tmp_path / "gnupg-detached-expired")
+    past = ["--faked-system-time", "20200101T000000!"]
+    gpg.run(*past, "--quick-gen-key", "Expired <e@test.invalid>", "ed25519", "sign", "1d")
+    out = gpg.run("--list-keys", "--with-colons").stdout.decode()
+    fpr = next(line.split(":")[9] for line in out.splitlines() if line.startswith("fpr:"))
+    data, sig = tmp_path / "runtime", tmp_path / "runtime.sig"
+    data.write_bytes(b"runtime\n")
+    gpg.run(*past, "--detach-sign", "--local-user", fpr + "!", "--output", str(sig), str(data))
+    keyring = gpg.export(fpr, tmp_path / "keyring.gpg")
+    with pytest.raises(debverify.VerifyError, match=r"плохая подпись \(.*EXPKEYSIG"):
+        debverify.verify_detached(sig, data, keyring, fpr)
+
+
+@needs_tools
+@pytest.mark.parametrize(
+    "with_valid_signature", [False, True], ids=["revoked", "valid-and-revoked"]
+)
+def test_verify_detached_revoked_key_rejected(tmp_path: Path, with_valid_signature: bool) -> None:
+    """T-190: отзыв запрещает подпись, в том числе рядом с подписью ожидаемого ключа."""
+    gpg = Gpg(tmp_path / "gnupg-detached-revoked")
+    revoked = gpg.gen("Revoked <revoked@test.invalid>")
+    data, sig = tmp_path / "runtime", tmp_path / "runtime.sig"
+    data.write_bytes(b"runtime\n")
+    gpg.run("--detach-sign", "--local-user", revoked + "!", "--output", str(sig), str(data))
+    certificate = gpg.home / "openpgp-revocs.d" / f"{revoked}.rev"
+    revocation = tmp_path / "revocation.asc"
+    text = certificate.read_text(encoding="utf-8")
+    revocation.write_text(
+        text[text.index(":-----BEGIN PGP PUBLIC KEY BLOCK-----") + 1 :],
+        encoding="utf-8",
+    )
+    gpg.run("--import", str(revocation))
+    keyring = gpg.export(revoked, tmp_path / "keyring.gpg")
+    signer = revoked
+    if with_valid_signature:
+        signer = gpg.gen("Valid <valid@test.invalid>")
+        good_sig = tmp_path / "valid.sig"
+        gpg.run("--detach-sign", "--local-user", signer + "!", "--output", str(good_sig), str(data))
+        sig.write_bytes(good_sig.read_bytes() + sig.read_bytes())
+        keyring.write_bytes(keyring.read_bytes() + gpg.run("--export", signer).stdout)
+    with pytest.raises(debverify.VerifyError, match=r"плохая подпись \(.*REVKEYSIG"):
+        debverify.verify_detached(sig, data, keyring, signer)
+
+
+@needs_tools
+def test_verify_detached_valid_key_accepted(tmp_path: Path) -> None:
+    """T-190: контроль с настоящей detached-подписью и действующим ключом."""
+    gpg = Gpg(tmp_path / "gnupg-detached-valid")
+    signer = gpg.gen("Valid <valid@test.invalid>")
+    data, sig = tmp_path / "runtime", tmp_path / "runtime.sig"
+    data.write_bytes(b"runtime\n")
+    gpg.run("--detach-sign", "--local-user", signer + "!", "--output", str(sig), str(data))
+    keyring = gpg.export(signer, tmp_path / "keyring.gpg")
+    debverify.verify_detached(sig, data, keyring, signer)
+
+
 def _fake_gpgv(tmp_path: Path, statuses: list[str]) -> str:
     script = tmp_path / "fake-gpgv"
     lines = "\n".join(f"echo '[GNUPG:] {s}'" for s in statuses)
