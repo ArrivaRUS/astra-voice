@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # Сборка AppImage Astra Voice (arch/appimage.md §9; перенос спайка 28.09).
 #
-#   packaging/appimage/build.sh --fetch   # СЕТЬ: инструменты и колёса по packaging/appimage.lock в кэш
+#   packaging/appimage/build.sh --fetch   # СЕТЬ: все входы packaging/appimage.lock в кэш + проверка
 #   packaging/appimage/build.sh           # без сети: AppDir → гейты → dist/Astra_Voice-<версия>-x86_64.AppImage
+#
+# База интерпретатора — директива `base` lock («Ревизия 3» arch/appimage.md): `debian12` —
+# CPython 3.11 из трёх пакетов Debian 12 (libssl/libcrypto с хоста), `python-appimage` —
+# откат (г). Происхождение Debian-входов (ключ → InRelease → Packages → .deb) и подпись
+# runtime проверяются при --fetch и при КАЖДОЙ сборке из кэша, до распаковки.
 #
 # Включение артефакта — файл packaging/appimage/ENABLED: без него скрипт ничего не
 # делает и завершается успешно («AppImage выключен»). Workflow вызывает только этот
 # скрипт и smoke.sh, поэтому правки сборки не требуют правки .github/workflows.
 #
 # Каталоги (переопределяются окружением):
-#   ASTRA_VOICE_APPIMAGE_CACHE  входы: downloads/, wheels/  (~/.cache/astra-voice-dev/appimage; кэш CI)
+#   ASTRA_VOICE_APPIMAGE_CACHE  входы: downloads/ (инструменты), wheels/, metadata/ (InRelease и
+#                               индексы), debs/, sources/  (~/.cache/astra-voice-dev/appimage; кэш CI)
 #   ASTRA_VOICE_WHEEL_CACHE     колёса onnxruntime/onnx-asr от .deb (~/.cache/astra-voice-dev/wheels)
 #   ASTRA_VOICE_APPIMAGE_WORK   рабочий: AppDir, tmp, временный HOME (<репо>/.build/appimage)
 #   ASTRA_VOICE_APPIMAGE_OUT    результат: .AppImage и sbom-appimage.cdx.json (<репо>/dist)
@@ -22,6 +28,9 @@
 # переменная — ошибка; в workflow её имя запрещает scripts/ci_lint.py; release_build.sh и
 # release_assets.sh при ENABLED не пропускают lock с TODO-HASH вовсе.
 set -euo pipefail
+# Вывод readelf/objdump разбирается sed/grep: под ru_RU readelf пишет «Совм. исп. библиотека»
+# вместо «Shared library» и расчёт DT_NEEDED Qt молча пропускал зависимости (ревью P3-8).
+export LC_ALL=C
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 HERE=$ROOT/packaging/appimage
@@ -41,7 +50,7 @@ FETCH=0
 for arg in "$@"; do
     case $arg in
         --fetch) FETCH=1 ;;
-        -h | --help) sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h | --help) sed -n '2,28p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "неизвестный аргумент: $arg" >&2; exit 2 ;;
     esac
 done
@@ -51,11 +60,20 @@ if [ ! -f "$HERE/ENABLED" ]; then
     exit 0
 fi
 
-for tool in python3 git sha256sum readelf objdump patch find xargs stat; do
+for tool in python3 git sha256sum readelf objdump patch find xargs stat gpgv; do
     command -v "$tool" >/dev/null 2>&1 || die "нет $tool на машине сборки"
 done
 lockq() { python3 "$HERE/lockfile.py" "$LOCK" "$@"; }
 lockq check || die "packaging/appimage.lock не прошёл проверку формата"
+BASE=$(lockq get base)
+if [ "$BASE" = debian12 ]; then
+    command -v dpkg-deb >/dev/null 2>&1 || die 'нет dpkg-deb (пакет dpkg) для базы debian12'
+fi
+PINS=$(lockq todo-pin)
+[ -z "$PINS" ] || die "в lock есть незакреплённые входы (# TODO-PIN): $(echo "$PINS" | tr '\n' ';') — закрепите (нужна сеть)"
+debverify() {
+    python3 "$HERE/debverify.py" --lock "$LOCK" --cache "$CACHE" --root "$ROOT" "$@"
+}
 TODO=$(lockq todo)
 if [ -n "${ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH:-}" ] &&
     { [ "${GITHUB_ACTIONS:-}" = true ] || [ -n "${CI:-}" ]; }; then
@@ -77,35 +95,18 @@ if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
 fi
 export SOURCE_DATE_EPOCH
 
-# Инструмент: файл есть, размер и sha256 совпадают с lock.
-tool_ok() {
-    local file=$DOWNLOADS/$1
+# Вход (путь относительно кэша): файл есть, размер и sha256 совпадают с lock.
+input_ok() {
+    local file=$CACHE/$1
     [ -f "$file" ] && [ "$(stat -c %s "$file")" = "$3" ] &&
         [ "$(sha256sum "$file" | cut -d' ' -f1)" = "$2" ]
 }
 
-# --- --fetch: единственный шаг с сетью ---------------------------------------
-if [ "$FETCH" = 1 ]; then
-    for tool in curl gpgv; do
-        command -v "$tool" >/dev/null 2>&1 || die "для --fetch нужен $tool"
-    done
+# Подпись runtime (T1 §2.2 п.10; R3.3 — и при сборке из кэша): хостовый gpgv, ключ из
+# репозитория, отпечаток из lock.
+verify_runtime() {
     [ -f "$RUNTIME_KEYRING" ] || die "нет ключа подписи runtime: $RUNTIME_KEYRING"
-    mkdir -p "$DOWNLOADS" "$WHEELS"
-    while read -r name sha size url; do
-        if tool_ok "$name" "$sha" "$size"; then
-            say "инструмент в кэше: $name"
-            continue
-        fi
-        say "качаю $name"
-        part=$DOWNLOADS/.$name.part
-        curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --max-filesize $((size + 1)) \
-            -o "$part" "$url" || { rm -f "$part"; die "не скачался $name"; }
-        mv -f "$part" "$DOWNLOADS/$name"
-        tool_ok "$name" "$sha" "$size" || { rm -f "$DOWNLOADS/$name"; die "sha256 или размер не совпал: $name"; }
-    done < <(lockq tools)
-
-    # Подпись runtime (T1 §2.2 п.10): хостовый gpgv, ключ из репозитория, отпечаток из lock.
-    say 'проверяю подпись runtime-x86_64.sig'
+    local want status validsig
     want=$(lockq get runtime-key)
     status=$(gpgv --status-fd 1 --keyring "$RUNTIME_KEYRING" \
         "$DOWNLOADS/runtime-x86_64.sig" "$DOWNLOADS/runtime-x86_64" 2>/dev/null) ||
@@ -115,13 +116,44 @@ if [ "$FETCH" = 1 ]; then
         *" $want "*) say "подпись runtime: ключ $want" ;;
         *) die "runtime-x86_64 подписан не ключом $want (VALIDSIG: ${validsig:-нет})" ;;
     esac
+}
+
+# Теги колёс целевого интерпретатора: CPython 3.11 x86_64 (и для download, и для --target).
+PIP_TAGS=(--implementation cp --python-version 3.11 --abi cp311 --abi abi3 --abi none
+    --platform manylinux_2_28_x86_64 --platform manylinux_2_27_x86_64
+    --platform manylinux_2_17_x86_64 --platform manylinux2014_x86_64
+    --platform manylinux_2_5_x86_64 --platform manylinux1_x86_64 --platform any)
+
+# --- --fetch: единственный шаг с сетью ---------------------------------------
+if [ "$FETCH" = 1 ]; then
+    command -v curl >/dev/null 2>&1 || die 'для --fetch нужен curl'
+    mkdir -p "$DOWNLOADS" "$WHEELS"
+    # Все входы lock: инструменты, InRelease и индексы Debian, .deb, исходники. Адреса
+    # snapshot.debian.org отвечают перенаправлением — следуем только по https.
+    while read -r rel sha size url; do
+        if input_ok "$rel" "$sha" "$size"; then
+            say "в кэше: $rel"
+            continue
+        fi
+        say "качаю $rel"
+        mkdir -p "$(dirname "$CACHE/$rel")"
+        part=$CACHE/$rel.part
+        curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 \
+            --max-filesize $((size + 1)) -o "$part" "$url" || { rm -f "$part"; die "не скачался $rel"; }
+        mv -f "$part" "$CACHE/$rel"
+        input_ok "$rel" "$sha" "$size" || { rm -f "$CACHE/$rel"; die "sha256 или размер не совпал: $rel"; }
+    done < <(lockq fetch)
+
+    say 'проверяю подпись runtime-x86_64.sig'
+    verify_runtime
+    if [ "$BASE" = debian12 ]; then
+        say 'проверяю происхождение пакетов Debian и исходников'
+        debverify debs || die 'пакеты Debian не прошли проверку происхождения'
+        debverify sources || die 'исходники не прошли проверку происхождения'
+    fi
 
     say 'качаю колёса по lock (--require-hashes)'
-    python3 -m pip download --no-deps --only-binary=:all: --require-hashes \
-        --implementation cp --python-version 3.11 --abi cp311 --abi abi3 --abi none \
-        --platform manylinux_2_28_x86_64 --platform manylinux_2_27_x86_64 \
-        --platform manylinux_2_17_x86_64 --platform manylinux2014_x86_64 \
-        --platform manylinux_2_5_x86_64 --platform manylinux1_x86_64 --platform any \
+    python3 -m pip download --no-deps --only-binary=:all: --require-hashes "${PIP_TAGS[@]}" \
         --dest "$WHEELS" -r "$LOCK"
     say 'готово; дальше сеть не нужна'
     exit 0
@@ -130,12 +162,14 @@ fi
 # --- сборка ------------------------------------------------------------------
 [ -d "$DOWNLOADS" ] && [ -d "$WHEELS" ] || die "нет кэша входов $CACHE — сначала build.sh --fetch (нужна сеть)"
 while read -r name sha size _url; do
-    tool_ok "$name" "$sha" "$size" || die "инструмент отсутствует или не совпал с lock: $name"
+    input_ok "downloads/$name" "$sha" "$size" || die "инструмент отсутствует или не совпал с lock: $name"
 done < <(lockq tools)
-PY_IMAGE=$DOWNLOADS/$(lockq tools | awk '$1 ~ /^python3\.11/ {print $1}')
+# Попадание в кэш ничего не доказывает (R3.3): подпись и цепочка — до распаковки
+# (пакеты Debian проверяются на копии в каталоге сборки — ниже, при раскладке).
+verify_runtime
 TOOL=$DOWNLOADS/appimagetool-x86_64.AppImage
 RUNTIME=$DOWNLOADS/runtime-x86_64
-chmod 755 "$PY_IMAGE" "$TOOL"
+chmod 755 "$TOOL"
 
 START=$(date +%s)
 APPDIR=$WORK/AppDir
@@ -177,25 +211,77 @@ as_user() {
     fi
 }
 
-say "версия $VERSION, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
-say 'распаковываю Python AppImage'
-(cd "$BUILD/extract" && "$PY_IMAGE" --appimage-extract >/dev/null)
-mv "$BUILD/extract/squashfs-root/opt" "$APPDIR/opt"
-mv "$BUILD/extract/squashfs-root/usr" "$APPDIR/usr"
-rm -rf "$BUILD/extract"
-PY=$APPDIR/opt/python3.11/bin/python3.11
-SITE=$APPDIR/opt/python3.11/lib/python3.11/site-packages
-STDLIB=$APPDIR/opt/python3.11/lib/python3.11
-
-# База python-appimage приносит свои пакеты (certifi, packaging): их нет в lock и в SBOM,
-# а pip --target не заменяет существующие каталоги. Оставляем только pip на время установки.
-find "$SITE" -mindepth 1 -maxdepth 1 ! -name pip ! -name 'pip-*.dist-info' -exec rm -rf {} +
-say 'ставлю колёса бандловым Python по lock'
+say "версия $VERSION, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH, база $BASE"
+PREFIX=$APPDIR/opt/python3.11
+PY=$PREFIX/bin/python3.11
+STDLIB=$PREFIX/lib/python3.11
+SITE=$STDLIB/site-packages
 find_links=(--find-links "$WHEELS")
 [ -d "$ORT_WHEELS" ] && find_links+=(--find-links "$ORT_WHEELS")
-isolated "$PY" -I -m pip install --isolated --no-deps --no-index --require-hashes \
-    "${find_links[@]}" --no-cache-dir --no-compile --disable-pip-version-check \
-    --target "$SITE" -r "$LOCK"
+case $BASE in
+    python-appimage)
+        # Откат (г) R3.9: прежняя база с бандловым OpenSSL 1.1 и pip внутри.
+        PY_IMAGE=$DOWNLOADS/$(lockq tools | awk '$1 ~ /^python3\.11/ {print $1}')
+        chmod 755 "$PY_IMAGE"
+        say 'распаковываю Python AppImage'
+        (cd "$BUILD/extract" && "$PY_IMAGE" --appimage-extract >/dev/null)
+        mv "$BUILD/extract/squashfs-root/opt" "$APPDIR/opt"
+        mv "$BUILD/extract/squashfs-root/usr" "$APPDIR/usr"
+        rm -rf "$BUILD/extract"
+        # База python-appimage приносит свои пакеты (certifi, packaging): их нет в lock и в
+        # SBOM, а pip --target не заменяет существующие каталоги. Оставляем только pip.
+        find "$SITE" -mindepth 1 -maxdepth 1 ! -name pip ! -name 'pip-*.dist-info' -exec rm -rf {} +
+        say 'ставлю колёса бандловым Python по lock'
+        isolated "$PY" -I -m pip install --isolated --no-deps --no-index --require-hashes \
+            "${find_links[@]}" --no-cache-dir --no-compile --disable-pip-version-check \
+            --target "$SITE" -r "$LOCK"
+        ;;
+    debian12)
+        # Колёса ставит pip машины сборки: версии закреплены в lock (ревью P3-6).
+        have_py=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+        [ "$have_py" = "$(lockq get build-python)" ] ||
+            die "сборочный Python $have_py, в lock build-python $(lockq get build-python)"
+        have_pip=$(python3 -m pip --version | awk '{print $2}')
+        [ "$have_pip" = "$(lockq get build-pip)" ] ||
+            die "сборочный pip $have_pip, в lock build-pip $(lockq get build-pip)"
+        # R3.2: три проверенных .deb → префикс opt/python3.11 (контракт AppRun/userinstall).
+        say 'раскладываю Python из пакетов Debian 12'
+        STAGE=$BUILD/debian
+        mkdir -p "$STAGE" "$BUILD/debs"
+        # Копия → проверка копии → распаковка копии: подмена файла в кэше между проверкой
+        # и распаковкой ничего не даёт (ревью P3-3).
+        while read -r package rel; do
+            cp -- "$CACHE/$rel" "$BUILD/debs/" || die "нет $package в кэше — нужен build.sh --fetch"
+        done < <(lockq debs)
+        debverify --deb-dir "$BUILD/debs" debs ||
+            die 'пакеты Debian не прошли проверку происхождения — сборка остановлена'
+        while read -r package rel; do
+            dpkg-deb -x "$BUILD/debs/$(basename "$rel")" "$STAGE" || die "не распаковался $package"
+        done < <(lockq debs)
+        [ -f "$STAGE/usr/bin/python3.11" ] && [ -f "$STAGE/usr/lib/python3.11/os.py" ] &&
+            [ -d "$STAGE/usr/lib/python3.11/lib-dynload" ] ||
+            die 'в пакетах Debian нет python3.11, os.py или lib-dynload'
+        mkdir -p "$PREFIX/bin" "$PREFIX/lib/python3"
+        mv "$STAGE/usr/bin/python3.11" "$PY"
+        mv "$STAGE/usr/lib/python3.11" "$STDLIB"
+        # copyright пакетов — в документы образа (collect_licenses.py), из тех же .deb.
+        mv "$STAGE/usr/share/doc" "$BUILD/debian-doc"
+        rm -rf "$STAGE"
+        # Хостовый sitecustomize (абсолютная ссылка на /etc/python3.11 — apport) не переносим:
+        # иначе код хоста исполнялся бы до bootstrap. -I его не отключает.
+        rm -f "$STDLIB/sitecustomize.py" "$STDLIB/usercustomize.py"
+        # Debian site.py ищет <prefix>/lib/python3/dist-packages (схема posix_local), а не
+        # site-packages: относительный адаптер сохраняет прежние пути Qt, certifi и проверок.
+        mkdir -p "$SITE"
+        ln -s ../python3.11/site-packages "$PREFIX/lib/python3/dist-packages"
+        # pip в бандле не нужен: колёса ставит сборочный pip, теги — целевого CPython 3.11.
+        say 'ставлю колёса сборочным pip по lock (--target, теги cp311)'
+        isolated python3 -m pip install --isolated --no-deps --no-index --require-hashes \
+            --only-binary=:all: "${PIP_TAGS[@]}" "${find_links[@]}" --no-cache-dir --no-compile \
+            --disable-pip-version-check --target "$SITE" -r "$LOCK"
+        ;;
+    *) die "неизвестная база $BASE" ;;
+esac
 
 for vendor_patch in "$ROOT"/vendor/patches/*.patch; do
     [ -f "$vendor_patch" ] || continue
@@ -208,7 +294,16 @@ say 'удаляю ненужные модули Python и Qt'
 rm -rf "$SITE/pip" "$SITE"/pip-*.dist-info "$SITE/bin" \
     "$STDLIB/ensurepip" "$STDLIB/idlelib" "$STDLIB/tkinter" \
     "$STDLIB/turtledemo" "$STDLIB/test" "$STDLIB/lib2to3/tests" \
+    "$STDLIB/curses" "$STDLIB/dbm/gnu.py" "$STDLIB/dbm/ndbm.py" \
     "$APPDIR/opt/python3.11/include" "$APPDIR/usr/share/tcltk" "$APPDIR/usr/bin"
+# R3.2 — до расчёта зависимостей: readline, gdbm/dbm (libdb), curses, nis, Tk и тестовые
+# расширения. Их библиотеки (Debian — хостовые) тогда не нужны вовсе; гейт check_bundle.py
+# проверяет и отсутствие файлов, и что никто не ссылается на удалённые SONAME.
+for module in readline _gdbm _dbm _curses _curses_panel nis _tkinter \
+    _testbuffer _testcapi _testclinic _testimportmultiple _testinternalcapi _testmultiphase \
+    _ctypes_test _xxtestfuzz xxlimited xxlimited_35; do
+    rm -f "$STDLIB/lib-dynload/$module".cpython-*.so
+done
 # Обёртки консольных скриптов (bin/) не входят в образ, а их строки в RECORD несут хэш
 # файла с абсолютным путём интерпретатора в shebang — путь рабочего каталога попадал
 # бы в образ и BUILD_ID. Убираем только строки ../../bin/; иной файл вне site-packages —
@@ -305,10 +400,11 @@ done
 for name in "${!KEEP_LIB[@]}"; do [ -f "$QT/lib/$name" ] || die "отсутствует DT_NEEDED $name"; done
 say "Qt: оставлено ${#KEEP_LIB[@]} библиотек по DT_NEEDED"
 
-# Tcl/Tk нужен только удалённому tkinter; его C-модуль держит libtk/libtcl — убираем
-# и его, затем проверяем, что остальные ELF не ссылаются на удаляемые библиотеки.
-rm -f "$STDLIB"/lib-dynload/_tkinter.cpython-*.so
-for old in libtk8.6.so libtcl8.6.so libXft.so.2 libXrender.so.1; do
+# Библиотеки базы python-appimage в usr/lib, нужные только удалённым модулям (Tk, readline,
+# gdbm, curses): удаляем, если на них больше никто не ссылается. Порядок — сначала зависимые.
+# У базы debian12 своих библиотек в usr/lib нет.
+for old in libtk8.6.so libtcl8.6.so libXft.so.2 libXrender.so.1 libreadline.so.7 \
+    libgdbm_compat.so.4 libgdbm.so.6 libpanelw.so.6 libncursesw.so.6 libtinfo.so.6; do
     [ -e "$APPDIR/usr/lib/$old" ] || continue
     needed_by=''
     while IFS= read -r -d '' elf; do
@@ -357,6 +453,13 @@ install -m 644 "$HERE/astra-voice.desktop" "$APPDIR/astra-voice.desktop"
 install -m 644 "$APPDIR/usr/share/icons/hicolor/256x256/apps/astravoice.png" "$APPDIR/astravoice.png"
 ln -s astravoice.png "$APPDIR/.DirIcon"
 
+say 'документы лицензий (usr/share/doc/astra-voice)'
+debian_doc=()
+[ "$BASE" = debian12 ] && debian_doc=(--debian-doc "$BUILD/debian-doc")
+# shellcheck disable=SC2046
+python3 "$HERE/collect_licenses.py" --appdir "$APPDIR" --root "$ROOT" "${debian_doc[@]}" \
+    $(lockq debs | awk '{print "--deb", $1}')
+
 # Воспроизводимость: байт-код и кэши не попадают в образ, время файлов — из changelog.
 find "$APPDIR" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$APPDIR" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
@@ -381,8 +484,11 @@ allow_missing=()
 for package in $(printf '%s\n' "$TODO" | sed 's/==.*//'); do
     allow_missing+=(--allow-missing "$package")
 done
+lockq host-libs > "$BUILD/host-libs.txt"
 as_user "$PY" -I -B "$HERE/check_bundle.py" --appdir "$APPDIR" \
-    --control "$ROOT/packaging/debian/control" "${allow_missing[@]}"
+    --control "$ROOT/packaging/debian/control" "${allow_missing[@]}" \
+    --openssl-major "$(lockq get openssl-major)" --openssl-origin "$(lockq get openssl-origin)" \
+    --host-libs "$BUILD/host-libs.txt"
 say 'гейт: AppRun --version в изоляции, stderr пуст'
 version_err=$WORK/tmp/version.stderr
 version_output=$(as_user "$APPDIR/AppRun" --version 2>"$version_err") || {
@@ -402,7 +508,8 @@ python3 "$ROOT/tools/elf-audit" --strict --expect "$(lockq get expect-elf)" \
     --max-glibc "$(lockq get max-glibc)" "$APPDIR" | tail -n 3
 
 say 'SBOM AppImage'
-python3 "$ROOT/scripts/sbom.py" --appdir "$APPDIR" --lock "$LOCK" --out "$OUT/sbom-appimage.cdx.json"
+python3 "$ROOT/scripts/sbom.py" --appdir "$APPDIR" --lock "$LOCK" --cache "$CACHE" \
+    --out "$OUT/sbom-appimage.cdx.json"
 
 # --- упаковка ------------------------------------------------------------------
 find "$APPDIR" -print0 | xargs -0 -r touch -h --date="@$SOURCE_DATE_EPOCH"

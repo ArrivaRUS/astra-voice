@@ -17,7 +17,10 @@ VERSION = "0.2.0"
 DEB = f"astra-voice_{VERSION}_amd64.deb"
 IMAGE = f"Astra_Voice-{VERSION}-x86_64.AppImage"
 SHA = "a" * 64
-LOCK = f"""# expect-elf: 157
+LOCK = f"""# base: python-appimage
+# openssl-origin: bundled
+# openssl-major: 1
+# expect-elf: 157
 # max-glibc: 2.28
 # runtime-key: 570C77ACEA40C0F1B758902CBF96CCA56490F695
 # tool: runtime-x86_64 {SHA} 1 https://example.invalid/runtime-x86_64
@@ -61,6 +64,7 @@ def make_repo(tmp_path: Path, *, enabled: bool) -> Path:
     if enabled:
         (dist / IMAGE).write_bytes(b"\x7fELF\x02\x01\x01\x00AI\x02" + b"\0" * 100)
         (dist / "sbom-appimage.cdx.json").write_text("{}\n", encoding="utf-8")
+        (dist / f"astra-voice-{VERSION}-sources.tar.xz").write_bytes(b"xz")
     return repo
 
 
@@ -105,6 +109,7 @@ def test_with_appimage(tmp_path: Path) -> None:
         "sbom.cdx.json",
         IMAGE,
         "sbom-appimage.cdx.json",
+        f"astra-voice-{VERSION}-sources.tar.xz",
         "INSTALL-ADMIN.md",
         "SECURITY.md",
         "release.gpg",
@@ -154,6 +159,16 @@ def test_enabled_requires_appimage(tmp_path: Path) -> None:
     result = run(repo)
     assert result.returncode == 1
     assert f"нет артефакта {repo / 'dist' / IMAGE}" in result.stderr
+
+
+def test_enabled_requires_sources_archive(tmp_path: Path) -> None:
+    """R3.6: без архива исходников поставляемых версий образ не публикуется."""
+    repo = make_repo(tmp_path, enabled=True)
+    sources = repo / "dist" / f"astra-voice-{VERSION}-sources.tar.xz"
+    sources.unlink()
+    result = run(repo)
+    assert result.returncode == 1
+    assert f"нет артефакта {sources}" in result.stderr
 
 
 def test_stray_artifact_rejected(tmp_path: Path) -> None:

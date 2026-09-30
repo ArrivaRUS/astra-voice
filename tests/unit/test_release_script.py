@@ -422,7 +422,10 @@ def test_push_failure(repo: tuple[Path, dict[str, str]]) -> None:
 
 
 SHA = "a" * 64
-APPIMAGE_LOCK = f"""# expect-elf: 157
+APPIMAGE_LOCK = f"""# base: python-appimage
+# openssl-origin: bundled
+# openssl-major: 1
+# expect-elf: 157
 # max-glibc: 2.28
 # runtime-key: 570C77ACEA40C0F1B758902CBF96CCA56490F695
 # tool: runtime-x86_64 {SHA} 1 https://example.invalid/runtime-x86_64
@@ -460,6 +463,7 @@ def test_dry_run_with_appimage(repo: tuple[Path, dict[str, str]]) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Astra_Voice-0.1.0-x86_64.AppImage (packaging/appimage/ENABLED)" in result.stdout
     assert "sbom-appimage.cdx.json" in result.stdout
+    assert "astra-voice-0.1.0-sources.tar.xz" in result.stdout
     assert "OK: packaging/appimage.lock существует и отслеживается Git" in result.stdout
     assert "OK: packaging/appimage.lock: все колёса закреплены по хэшу" in result.stdout
 

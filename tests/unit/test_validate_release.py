@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import runpy
 import shutil
 import subprocess
 import sys
+import tarfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -531,6 +533,23 @@ def test_latest_symlink(
 
 IMAGE = "Astra_Voice-0.1.0-x86_64.AppImage"
 IMAGE_SIZE = (50 << 20) + 4096
+SOURCES = "astra-voice-0.1.0-sources.tar.xz"
+
+
+def write_sources(path: Path, tamper: bool = False) -> None:
+    """Архив исходников в формате release_sources.py: MANIFEST.txt первым."""
+    files = {"README.txt": b"r", "astra-voice/a.tar": b"code", "upstream/q/q.tar.gz": b"q"}
+    manifest = "".join(
+        f"{hashlib.sha256(d).hexdigest()}\t{len(d)}\t{p}\thttps://x.invalid\n"
+        for p, d in files.items()
+    ).encode()
+    with tarfile.open(path, "w:xz") as tar:
+        for name, data in [("MANIFEST.txt", manifest), *files.items()]:
+            if tamper and name == "README.txt":
+                data = b"R"
+            info = tarfile.TarInfo(f"astra-voice-0.1.0-sources/{name}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
 
 
 def add_appimage(
@@ -543,6 +562,7 @@ def add_appimage(
         output.truncate(size)
     (dist / "sbom-appimage.cdx.json").write_text("{}\n", encoding="utf-8")
     (dist / "SECURITY.md").write_text("# security\n", encoding="utf-8")
+    write_sources(dist / SOURCES)
     generator = runpy.run_path(str(ROOT / "scripts/release_latest_json.py"))["generate"]
     generator(dist, "0.1.0", "2026-09-30T12:00:00Z", appimage=True)
     rewrite_sums(assets)
@@ -572,8 +592,60 @@ def test_appimage_release_valid(
     add_appimage(assets)
     checks = release_checks(validate, assets, capsys, expected_code=0)
     assert checks["appimage"]["ok"] is True
+    assert checks["sources"] == {
+        "name": "sources",
+        "ok": True,
+        "detail": "3 файлов по манифесту",
+    }
     assert checks["latest.json"]["detail"] == "указатель верен (схема 2: appimage, deb)"
     assert checks["sha256"]["detail"] == "суммы и покрытие верны"
+
+
+@pytest.mark.parametrize("case", ["missing", "tampered", "sums", "garbage", "bad-manifest"])
+def test_appimage_release_needs_sources_archive(
+    assets: ReleaseAssets,
+    validate: Callable[[list[str]], int],
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+) -> None:
+    """R3.6: архив исходников обязателен с AppImage, проверяется потоком по манифесту."""
+    add_appimage(assets)
+    dist = assets.dist
+    if case == "missing":
+        (dist / SOURCES).unlink()
+        rewrite_sums(assets)
+    elif case == "tampered":
+        write_sources(dist / SOURCES, tamper=True)
+        rewrite_sums(assets)
+    elif case == "garbage":
+        (dist / SOURCES).write_bytes(b"\xff\xfe not xz")
+        rewrite_sums(assets)
+    elif case == "bad-manifest":
+        with tarfile.open(dist / SOURCES, "w:xz") as tar:
+            info = tarfile.TarInfo("astra-voice-0.1.0-sources/MANIFEST.txt")
+            info.size = 3
+            tar.addfile(info, io.BytesIO(b"\xff\xfe\n"))
+        rewrite_sums(assets)
+    else:
+        sums = (
+            (dist / "SHA256SUMS")
+            .read_text("utf-8")
+            .replace(hashlib.sha256((dist / SOURCES).read_bytes()).hexdigest(), "0" * 64)
+        )
+        (dist / "SHA256SUMS").write_text(sums, "utf-8")
+        resign(assets, assets.fingerprint)
+    checks = release_checks(validate, assets, capsys)
+    if case == "sums":
+        assert checks["sources"]["ok"] is True
+        assert checks["sha256"]["detail"] == f"неверная сумма: {SOURCES}"
+    else:
+        assert checks["sources"]["ok"] is False
+        assert checks["assets"]["ok"] is False
+        assert SOURCES in str(checks["assets"]["detail"])
+    if case == "tampered":
+        assert checks["sources"]["detail"] == "не совпал с манифестом: README.txt"
+    if case == "bad-manifest":
+        assert checks["sources"]["detail"] == "MANIFEST.txt не в UTF-8"
 
 
 def test_appimage_expected_but_missing(

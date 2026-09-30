@@ -9,6 +9,8 @@
 # Этапы:
 #   1. `--version` из файла — без установки, stderr пуст;
 #   2. `--selfinstall-status` — режим В (распаковка), KEY = <версия>-<BUILD_ID>, app/ не создан;
+#      2b. пути распаковки: с «:» — понятный отказ; с кириллицей при LC_ALL=C — программа
+#      (переносной режим, offscreen) поднимает IPC: Qt не зацикливается (находка 29.09);
 #   3. (GUI, под xvfb-run) первый запуск файла: самоустановка в app/<KEY>, current → KEY,
 #      запись меню ведёт в app/current, временная распаковка удалена; IPC-сокет
 #      появился; `--show` из установленной копии; выход;
@@ -92,6 +94,33 @@ if [ "$STAGE" = inner ]; then
     # Служебные флаги работают из распаковки и не удаляют её (установки нет) — уборка
     # здесь, в собственном TMPDIR смоука.
     rm -rf "$TMPDIR"/appimage_extracted_*
+
+    say "2b/5 путь распаковки с «:» — отказ; с кириллицей при LC_ALL=C — запуск"
+    colon="$TMPDIR/путь:с двоеточием"
+    mkdir -p "$colon"
+    if TMPDIR=$colon APPIMAGE_EXTRACT_AND_RUN=1 "$IMAGE" --version >/dev/null 2>"$HOME/err"; then
+        die 'путь распаковки с «:» не отвергнут'
+    fi
+    grep -q 'двоеточие «:»' "$HOME/err" || { cat "$HOME/err" >&2; die 'нет понятной ошибки про «:»'; }
+    rm -rf "$colon"
+    cyr="$TMPDIR/Мои программы"
+    mkdir -p "$cyr"
+    SOCKET=$XDG_RUNTIME_DIR/astra-voice/ipc
+    TMPDIR=$cyr LC_ALL=C ASTRA_VOICE_PORTABLE=1 APPIMAGE_EXTRACT_AND_RUN=1 \
+        setsid "$IMAGE" --hidden >"$HOME/cyr.log" 2>&1 &
+    pid=$!
+    ready=0
+    for _ in $(seq 1 600); do
+        [ -S "$SOCKET" ] && { ready=1; break; }
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    for _ in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    [ "$ready" = 1 ] || { cat "$HOME/cyr.log" >&2; die 'кириллица в пути при LC_ALL=C: программа не поднялась за 60 с'; }
+    rm -rf "$cyr" "$SOCKET"
 
     if [ "$GUI" = 0 ]; then
         say '3–4/5 пропущены (--no-gui)'

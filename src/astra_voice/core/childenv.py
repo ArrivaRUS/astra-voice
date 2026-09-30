@@ -38,6 +38,8 @@ APPRUN_MANAGED = (
     "LD_PRELOAD",
     "SSL_CERT_FILE",
 )
+# Что AppRun меняет только по условию (кириллица в пути при однобайтовой локали), не снимая.
+APPRUN_CONDITIONAL = ("LC_ALL", "LC_CTYPE")
 # Что ставит bootstrap.py (стиль и рендер Qt Quick, запрет autospawn PulseAudio).
 BOOTSTRAP_MANAGED = (
     "QT_QUICK_CONTROLS_STYLE",
@@ -45,7 +47,7 @@ BOOTSTRAP_MANAGED = (
     "QT_XCB_GL_INTEGRATION",
     "PULSE_CLIENTCONFIG",
 )
-RESTORABLE = frozenset(APPRUN_MANAGED + BOOTSTRAP_MANAGED)
+RESTORABLE = frozenset(APPRUN_MANAGED + APPRUN_CONDITIONAL + BOOTSTRAP_MANAGED)
 
 # Переменные runtime AppImage: снимаются всегда (APPIMAGE* — по префиксу, включая
 # APPIMAGE_EXTRACT_AND_RUN, иначе новый файл снова распакуется в общий /tmp, BL-1 п.2).

@@ -1,24 +1,161 @@
-# Закреплённые входы AppImage Astra Voice (arch/appimage.md §9.1–§9.2; был spikes/appimage/lock.txt).
-# Читают: packaging/appimage/build.sh (через lockfile.py), scripts/sbom.py --appdir, ключ кэша CI.
-# Формат колёс — pip-требования с --hash (pip install --no-deps --no-index --require-hashes -r).
-# Хэш инструментов сверен с полем digest GitHub Release API, колёс — с digests PyPI JSON API (28.09).
+# Закреплённые входы AppImage Astra Voice (arch/appimage.md §9.1–§9.2, «Ревизия 3» R3.3).
+# Читают: packaging/appimage/build.sh (через lockfile.py и debverify.py), scripts/sbom.py --appdir,
+# ключ кэша CI. Формат колёс — pip-требования с --hash (pip install --no-deps --no-index
+# --require-hashes -r). Хэш инструментов сверен с полем digest GitHub Release API, колёс — с digests
+# PyPI JSON API (28.09).
+#
+# База — вариант (а′) R3: CPython 3.11 из трёх пакетов Debian 12 одной версии, прежние колёса,
+# libssl.so.3/libcrypto.so.3 — с хоста (в образ не кладутся; гейт check_bundle.py).
+# Откат (г) R3.9 — base: python-appimage, openssl-origin: bundled, openssl-major: 1 и строка
+# `# tool: python3.11.16-cp311-cp311-manylinux_2_28_x86_64.AppImage …` из коммита 67f7479.
+# base: debian12
+# openssl-origin: host
+# openssl-major: 3
+# Колёса ставит pip машины сборки (debian:12: python3 3.11, python3-pip 23.0.1) — ревью P3-6.
+# build-python: 3.11
+# build-pip: 23.0.1
 #
 # Гейт tools/elf-audit (T1 MN-9, У112): новый ELF из обновлённого колеса или символ glibc новее
-# закреплённого роняет сборку. Меняются только осознанно, вместе с колесом.
-# expect-elf: 157
-# max-glibc: 2.28
+# закреплённого роняет сборку. Меняются только осознанно, вместе с колесом или базой.
+# Порог glibc 2.36 — для гибрида (R3.1: ALSE 1.8 = Debian 12 = glibc 2.36; 1.7 не обещаем).
+# expect-elf: 98
+# max-glibc: 2.36
 #
-# Подпись runtime-x86_64.sig проверяет build.sh --fetch хостовым gpgv по ключу из
-# packaging/appimage/keys/appimage-runtime.gpg; отпечаток (primary или подключ) должен совпасть.
-# Ключ — signing-pubkey.asc из github.com/AppImage/type2-runtime (README, раздел Signing;
-# коммит 177b3204a237 от 2024-05-05), в двоичном виде (gpg --dearmor); gpgv по нему подтвердил
-# подпись закреплённого runtime-x86_64 (VALIDSIG 570C77AC…6490F695, 29.09).
+# Манифест внешних зависимостей (R3.2): SONAME с хоста, в образ НЕ кладутся (origin=host,
+# not-bundled). Ровно то, что требуют ELF бандла вне AppDir (измерено 29.09 на сборке debian12):
+# check_bundle.py валит сборку и при лишней записи, и при отсутствии библиотеки на хосте.
+# — glibc и загрузчик
+# host-lib: ld-linux-x86-64.so.2 libc6
+# host-lib: libc.so.6 libc6
+# host-lib: libm.so.6 libc6
+# host-lib: libpthread.so.0 libc6
+# host-lib: libdl.so.2 libc6
+# host-lib: librt.so.1 libc6
+# — рантайм C++
+# host-lib: libstdc++.so.6 libstdc++6
+# host-lib: libgcc_s.so.1 libgcc-s1
+# — интерпретатор Debian и его модули (R3.2: не в бандле — базовые библиотеки любой ALSE 1.8)
+# host-lib: libz.so.1 zlib1g
+# host-lib: libexpat.so.1 libexpat1
+# host-lib: libbz2.so.1.0 libbz2-1.0
+# host-lib: liblzma.so.5 liblzma5
+# host-lib: libffi.so.8 libffi8
+# host-lib: libsqlite3.so.0 libsqlite3-0
+# host-lib: libcrypt.so.1 libcrypt1
+# host-lib: libuuid.so.1 libuuid1
+# — OpenSSL — только с хоста (R3), TLS обновляет ОС
+# host-lib: libssl.so.3 libssl3
+# host-lib: libcrypto.so.3 libssl3
+# — графика, шрифты, шина, Kerberos — прежний контракт Qt из PyQt5-Qt5
+# host-lib: libGL.so.1 libgl1
+# host-lib: libX11.so.6 libx11-6
+# host-lib: libX11-xcb.so.1 libx11-xcb1
+# host-lib: libXext.so.6 libxext6
+# host-lib: libxcb.so.1 libxcb1
+# host-lib: libxcb-glx.so.0 libxcb-glx0
+# host-lib: libxcb-icccm.so.4 libxcb-icccm4
+# host-lib: libxcb-image.so.0 libxcb-image0
+# host-lib: libxcb-keysyms.so.1 libxcb-keysyms1
+# host-lib: libxcb-randr.so.0 libxcb-randr0
+# host-lib: libxcb-render.so.0 libxcb-render0
+# host-lib: libxcb-render-util.so.0 libxcb-render-util0
+# host-lib: libxcb-shape.so.0 libxcb-shape0
+# host-lib: libxcb-shm.so.0 libxcb-shm0
+# host-lib: libxcb-sync.so.1 libxcb-sync1
+# host-lib: libxcb-xfixes.so.0 libxcb-xfixes0
+# host-lib: libxcb-xinerama.so.0 libxcb-xinerama0
+# host-lib: libxcb-xkb.so.1 libxcb-xkb1
+# host-lib: libxkbcommon.so.0 libxkbcommon0
+# host-lib: libxkbcommon-x11.so.0 libxkbcommon-x11-0
+# host-lib: libfontconfig.so.1 libfontconfig1
+# host-lib: libfreetype.so.6 libfreetype6
+# host-lib: libglib-2.0.so.0 libglib2.0-0
+# host-lib: libgthread-2.0.so.0 libglib2.0-0
+# host-lib: libdbus-1.so.3 libdbus-1-3
+# host-lib: libgssapi_krb5.so.2 libgssapi-krb5-2
+#
+# Подпись runtime-x86_64.sig проверяет build.sh (при --fetch и при сборке из кэша) хостовым gpgv
+# по ключу из packaging/appimage/keys/appimage-runtime.gpg; отпечаток (primary или подключ)
+# должен совпасть. Ключ — signing-pubkey.asc из github.com/AppImage/type2-runtime (README, раздел
+# Signing; коммит 177b3204a237 от 2024-05-05), в двоичном виде (gpg --dearmor); gpgv по нему
+# подтвердил подпись закреплённого runtime-x86_64 (VALIDSIG 570C77AC…6490F695, 29.09).
 # runtime-key: 570C77ACEA40C0F1B758902CBF96CCA56490F695
 #
 # tool: runtime-x86_64 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d 944632 https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
 # tool: runtime-x86_64.sig de8262d60b5f82bcff11b77598aedef86d2c375fc246d6a675f6cac68b6dfda7 119 https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64.sig
 # tool: appimagetool-x86_64.AppImage ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 15092216 https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
-# tool: python3.11.16-cp311-cp311-manylinux_2_28_x86_64.AppImage ea788bd339c7d8f832e246b210cb7bb27a37064aa5082f7e0963244765240c99 17783288 https://github.com/niess/python-appimage/releases/download/python3.11/python3.11.16-cp311-cp311-manylinux_2_28_x86_64.AppImage
+#
+# Debian 12 (bookworm, с 2026 — oldstable), скачано 29.09 с «да» заказчика; проверяет
+# packaging/appimage/debverify.py при --fetch и при каждой сборке из кэша (T-185).
+# Снимок snapshot.debian.org 20260929T083940Z — неизменяемый адрес набора. Версия 3.11.2-6+deb12u8
+# из bookworm main новее, чем в bookworm-security (3.11.2-6+deb12u3), поэтому security не нужен.
+# Ключ архива — /usr/share/keyrings/debian-archive-bookworm-automatic.gpg из пакета
+# debian-archive-keyring 2023.3+deb12u2+b2 ALSE 1.8 (md5 совпал с dpkg), скопирован в
+# packaging/appimage/keys/; отпечаток B8B80B5B…350947F8 «Debian Archive Automatic Signing Key
+# (12/bookworm)» совпадает с опубликованным ftp-master.debian.org/keys.html. InRelease подписан ещё
+# ключами 13/trixie и Stable Release 12 — их в keyring нет намеренно, решает VALIDSIG signer.
+# Срок ключа истекает 2031-01-19 11:44:21 UTC (создан 2023-01-21): до этой даты перепинить снимок.
+# Исходники (source) сборка не читает — их проверяет debverify.py sources (выпуск, R3.6).
+# archive: {"id":"debian-bookworm","keyring":"packaging/appimage/keys/debian-archive-bookworm-automatic.gpg","signer":"B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8","release":"https://snapshot.debian.org/archive/debian/20260929T083940Z/dists/bookworm/InRelease","sha256":"77737fa4b34f2693e982cc9ee35736816c35a7778fc2d326cc1bbf5b301fe1aa","size":151075,"codename":"bookworm","suite":"oldstable"}
+# index: {"id":"bookworm-main-amd64","archive":"debian-bookworm","kind":"Packages","file":"main/binary-amd64/Packages.xz","size":8790396,"sha256":"9e0b5aabb2465b3d2e7a7fe27f9913846277833f7a2826e7767acccff5b588c5","url":"https://snapshot.debian.org/archive/debian/20260929T083940Z/dists/bookworm/main/binary-amd64/Packages.xz"}
+# index: {"id":"bookworm-main-sources","archive":"debian-bookworm","kind":"Sources","file":"main/source/Sources.xz","size":9491888,"sha256":"92d11a035571df011f06f28c61cb9825130ef1d92abb2f2e0525e8674dc44af8","url":"https://snapshot.debian.org/archive/debian/20260929T083940Z/dists/bookworm/main/source/Sources.xz"}
+# deb: {"package":"python3.11-minimal","version":"3.11.2-6+deb12u8","arch":"amd64","file":"python3.11-minimal_3.11.2-6+deb12u8_amd64.deb","size":2064968,"sha256":"4aba533f7cc5e7b93b7ff24482840e96813f5bcde9cce028395b65a0d799ccee","url":"https://snapshot.debian.org/archive/debian/20260929T083940Z/pool/main/p/python3.11/python3.11-minimal_3.11.2-6%2Bdeb12u8_amd64.deb","index":"bookworm-main-amd64","source":"python3.11","source_version":"3.11.2-6+deb12u8","dsc":"python3.11-dsc"}
+# deb: {"package":"libpython3.11-minimal","version":"3.11.2-6+deb12u8","arch":"amd64","file":"libpython3.11-minimal_3.11.2-6+deb12u8_amd64.deb","size":817740,"sha256":"f3beaa03994ffedacf73c43a0843d53b062d347115d8af65bee2034552a4e6f9","url":"https://snapshot.debian.org/archive/debian/20260929T083940Z/pool/main/p/python3.11/libpython3.11-minimal_3.11.2-6%2Bdeb12u8_amd64.deb","index":"bookworm-main-amd64","source":"python3.11","source_version":"3.11.2-6+deb12u8","dsc":"python3.11-dsc"}
+# deb: {"package":"libpython3.11-stdlib","version":"3.11.2-6+deb12u8","arch":"amd64","file":"libpython3.11-stdlib_3.11.2-6+deb12u8_amd64.deb","size":1798560,"sha256":"890b3540dad8a1ccc0deeca025db735bcc82629a76adacbe3b50fcc06ed528ca","url":"https://snapshot.debian.org/archive/debian/20260929T083940Z/pool/main/p/python3.11/libpython3.11-stdlib_3.11.2-6%2Bdeb12u8_amd64.deb","index":"bookworm-main-amd64","source":"python3.11","source_version":"3.11.2-6+deb12u8","dsc":"python3.11-dsc"}
+# source: {"id":"python3.11-dsc","file":"python3.11_3.11.2-6+deb12u8.dsc","size":3805,"sha256":"197fa19ab45f41c820f40f6d9ead671c2ea29ddc53ba9424b36f1bf58458a10e","url":"https://snapshot.debian.org/archive/debian/20260929T083940Z/pool/main/p/python3.11/python3.11_3.11.2-6%2Bdeb12u8.dsc","index":"bookworm-main-sources"}
+# source: {"id":"python3.11-orig","file":"python3.11_3.11.2.orig.tar.gz","size":26437858,"sha256":"2411c74bda5bbcfcddaf4531f66d1adc73f247f529aee981b029513aefdbf849","url":"https://snapshot.debian.org/archive/debian/20260929T083940Z/pool/main/p/python3.11/python3.11_3.11.2.orig.tar.gz","dsc":"python3.11-dsc"}
+# source: {"id":"python3.11-debian","file":"python3.11_3.11.2-6+deb12u8.debian.tar.xz","size":279556,"sha256":"ece2d63c70ac0b7a401fbe6b51b0103be997c294a01a3865549be1862794ba97","url":"https://snapshot.debian.org/archive/debian/20260929T083940Z/pool/main/p/python3.11/python3.11_3.11.2-6%2Bdeb12u8.debian.tar.xz","dsc":"python3.11-dsc"}
+#
+# Исходники поставляемых компонентов вне Debian (R3.6), скачано 29.09 с «да» заказчика:
+# PyQt5 5.15.11 sdist — sha256 и размер совпали с digests PyPI JSON API (pypi.org/pypi/PyQt5/5.15.11/json);
+# type2-runtime — коммит dd6cebed тега 20251108 (GitHub API git/ref/tags/20251108), архив GitHub по
+# коммиту; sha256 снят при скачивании (у GitHub нет опубликованного хэша архива).
+# source: {"id":"pyqt5-sdist","file":"PyQt5-5.15.11.tar.gz","size":3216775,"sha256":"fda45743ebb4a27b4b1a51c6d8ef455c4c1b5d610c90d2934c7802b5c1557c52","url":"https://files.pythonhosted.org/packages/0e/07/c9ed0bd428df6f87183fca565a79fee19fa7c88c7f00a7f011ab4379e77a/PyQt5-5.15.11.tar.gz"}
+# source: {"id":"type2-runtime-src","file":"dd6cebedcbddde9c82f89b011e8e1d40b6e43868.tar.gz","size":31069,"sha256":"f5fec23be76e50e2445ed2d018bac49b367490fc483c62c4637e99ec705d27ba","url":"https://github.com/AppImage/type2-runtime/archive/dd6cebedcbddde9c82f89b011e8e1d40b6e43868.tar.gz","git_commit":"dd6cebedcbddde9c82f89b011e8e1d40b6e43868","git_tree":"c7cdda89406bda7e04456dd5df8801e42d811ccb"}
+#
+# Qt 5.15.19 — только модули, которые уходят в образ (qtbase, qtdeclarative, qtquickcontrols2, qtsvg).
+# download.qt.io с машины недоступен; источник — официальные зеркала github.com/qt/<модуль>, тег
+# v5.15.19-lts-lgpl (аннотированный, без подписи; tagger 2026-01-09), архив GitHub по коммиту тега;
+# MODULE_VERSION = 5.15.19 в .qmake.conf каждого архива. Байты архивов GitHub не гарантированы
+# (ревью P3-5): каждый архив ещё сверяется с деревом git коммита тега (git_tree — из GitHub API
+# git/commits); законные отличия git archive (export-ignore .gitignore/.gitattributes, export-subst
+# .tag, eol=crlf, подмодуль test262 в тестах qtdeclarative) — в packaging/appimage/git-trees/<id>.json,
+# debverify.py воспроизводит каждое. То же для type2-runtime (без отличий). Колесо PyQt5-Qt5 5.15.19 собирает Riverbank —
+# совпадение версии не доказывает тождество сборки (R3.6, открытый вопрос рецепта).
+# qtbase: тег-объект ce39a16355f577db7d6d2cca9bd9548b3dc7d91a → коммит c68297f66533200c9ff626b056d096c78b4b94db
+# qtdeclarative: тег-объект dd8c4221ff5b98715ae1f5787f5f209cee025020 → коммит dbb2e3b6bc9b51f76f241c7d108c466d78ef5695
+# qtquickcontrols2: тег-объект dec05f7839cd3cb2e49b3e56c081619acf2c0a93 → коммит 00c621488d674eccbb5e4d628a0489f6e70516bc
+# qtsvg: тег-объект 2898e5f4f0dd9af0c76dd45faa0f52445bf7e985 → коммит 62c4a8da3114174ea5b2c4ea46d2ab848066d534
+# source: {"id":"qtbase-5.15.19","file":"c68297f66533200c9ff626b056d096c78b4b94db.tar.gz","size":69988792,"sha256":"fc47819ccda5ebdf337272ef433c9522af09f1f3e4b6a6564506b59b83c52e0a","url":"https://github.com/qt/qtbase/archive/c68297f66533200c9ff626b056d096c78b4b94db.tar.gz","git_commit":"c68297f66533200c9ff626b056d096c78b4b94db","git_tree":"19a10eb0e9bf5e9c7a9aedff03ac1e03f85352f3","git_delta":"packaging/appimage/git-trees/qtbase-5.15.19.json"}
+# source: {"id":"qtdeclarative-5.15.19","file":"dbb2e3b6bc9b51f76f241c7d108c466d78ef5695.tar.gz","size":24427412,"sha256":"71988711dccd0d2ef1c0a2cb51e1a89c6f2663675d0fd4f3777c2c5b56927927","url":"https://github.com/qt/qtdeclarative/archive/dbb2e3b6bc9b51f76f241c7d108c466d78ef5695.tar.gz","git_commit":"dbb2e3b6bc9b51f76f241c7d108c466d78ef5695","git_tree":"1fa3393e75dfda78114c2f225422f6348b45df27","git_delta":"packaging/appimage/git-trees/qtdeclarative-5.15.19.json"}
+# source: {"id":"qtquickcontrols2-5.15.19","file":"00c621488d674eccbb5e4d628a0489f6e70516bc.tar.gz","size":9257198,"sha256":"3dc099d8625d741de8a6937d1280be7cb9020c5e9559101b4bf75c16eb906b49","url":"https://github.com/qt/qtquickcontrols2/archive/00c621488d674eccbb5e4d628a0489f6e70516bc.tar.gz","git_commit":"00c621488d674eccbb5e4d628a0489f6e70516bc","git_tree":"b8631e52862715da1b84c390b0bc369020df5853","git_delta":"packaging/appimage/git-trees/qtquickcontrols2-5.15.19.json"}
+# source: {"id":"qtsvg-5.15.19","file":"62c4a8da3114174ea5b2c4ea46d2ab848066d534.tar.gz","size":2780106,"sha256":"2e3ce2648dc382e304b0fa9de24ba9d8248b597de9779f2f145e68f25d82c0d0","url":"https://github.com/qt/qtsvg/archive/62c4a8da3114174ea5b2c4ea46d2ab848066d534.tar.gz","git_commit":"62c4a8da3114174ea5b2c4ea46d2ab848066d534","git_tree":"56bc505c59477f882b1539976c781a0fd426306e","git_delta":"packaging/appimage/git-trees/qtsvg-5.15.19.json"}
+#
+# libfuse 3.15.0 — статически в runtime (LGPL-2.1), github.com/libfuse/libfuse, релиз fuse-3.15.0.
+# Это загруженный ассет релиза (не архив, генерируемый GitHub): байты стабильны.
+# sha256 архива совпал с пином scripts/common/install-dependencies.sh type2-runtime (коммит dd6cebed).
+# Подпись .asc проверена 29.09 во временном GNUPGHOME: VALIDSIG от 2023-06-09 ключом
+# ED31791B2C5C1613AF388B8AD113FCAC3C4E599F (Nikolaus Rath; отпечаток совпал в github.com/Nikratio.gpg
+# и keys.openpgp.org, отзыва нет), но срок ключа истёк 2024-03-11 — статус EXPKEYSIG. Исключений
+# для EXPKEYSIG не вводим, ключ в репозиторий не кладём (решение Юрки 29.09, вариант (б)):
+# целостность держат sha256 ниже и независимый пин в scripts/common/install-dependencies.sh
+# type2-runtime (коммит dd6cebed).
+# source: {"id":"libfuse-3.15.0","file":"fuse-3.15.0.tar.xz","size":4589124,"sha256":"70589cfd5e1cff7ccd6ac91c86c01be340b227285c5e200baa284e401eea2ca0","url":"https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz"}
+# source: {"id":"libfuse-3.15.0-sig","file":"fuse-3.15.0.tar.xz.asc","size":1012,"sha256":"087dfd45c7a1768c5d5cf7068eefd3cacc302f4ff8db5a6828668bc08725339f","url":"https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz.asc"}
+# Прочее, вшитое в runtime статически (сборка в Alpine 3.21): squashfuse 0.5.2 (BSD-2), musl, zstd,
+# zlib, mimalloc (MIT/BSD/zlib) — обязательства по исходникам нет, нужны тексты лицензий. РИСК R3:
+# версии пакетов Alpine в скриптах type2-runtime НЕ закреплены (apk add без версий) — точный состав
+# musl/zstd/zlib/mimalloc внутри закреплённого runtime-x86_64 неизвестен.
+#
+# ОТКРЫТЫЙ ПУНКТ к 15.10 (R3.6; заказчик 29.09: «пока не качать»): в колесе numpy (numpy.libs) лежат
+# библиотеки рантайма GCC, исходники которых не приложены. Версии определены по символам (.comment
+# вырезан): libquadmath — только QUADMATH_1.0 и ссылка _Jv_RegisterClasses → системный libquadmath
+# CentOS 7 (GCC 4.8.5, libquadmath-4.8.5-44.el7); libgfortran — только GFORTRAN_8 → GCC 8.x
+# (libgfortran5 8.3.1 CentOS 7). Кандидаты: vault.centos.org (src.rpm, точное соответствие) или
+# ftp.gnu.org gcc-4.8.5 / gcc-8.3.0 (официально, но без патчей Red Hat). .deb это не касается (numpy
+# там системный). Сборку не роняет; SBOM и INDEX.txt лицензий помечают «исходники не приложены».
+# pending-source: {"id":"gcc-libquadmath","component":"libquadmath (GCC runtime, numpy.libs)","version":"GCC 4.8.5 (CentOS 7 libquadmath-4.8.5-44.el7), определено по символам","license":"LGPL-2.1-or-later","match":"libquadmath-*.so*","note":"исходники не приложены — открытый пункт R3.6 к 15.10; кандидаты: vault.centos.org gcc-4.8.5-44.el7.src.rpm или ftp.gnu.org/gnu/gcc/gcc-4.8.5"}
+# pending-source: {"id":"gcc-libgfortran","component":"libgfortran (GCC runtime, numpy.libs)","version":"GCC 8.x (CentOS 7 libgfortran5 8.3.1), определено по символам","license":"GPL-3.0-or-later WITH GCC-exception-3.1","match":"libgfortran-*.so*","note":"исходники не приложены — открытый пункт R3.6 к 15.10; кандидаты: src.rpm libgfortran5 8.3.1 на vault.centos.org или ftp.gnu.org/gnu/gcc/gcc-8.3.0"}
 #
 # Колёса PyPI (кэш: ~/.cache/astra-voice-dev/appimage/wheels).
 # numpy 1.24.2 — та же версия, что python3-numpy на ALSE 1.8 (с ней уже живёт .deb + ORT 1.24.4).

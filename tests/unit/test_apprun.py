@@ -330,6 +330,96 @@ def test_originals_saved_once_and_restorable(tmp_path: Path, env: dict[str, str]
     assert not [name for name in child if name.startswith(("ASTRA_VOICE_", "APPIMAGE"))]
 
 
+def test_qt_paths_point_into_bundle_even_with_cyrillic_path(
+    tmp_path: Path, env: dict[str, str]
+) -> None:
+    """R3: qt.conf PyQt5 ломается на не-ASCII пути — AppRun задаёт пути Qt явно, от своей копии."""
+    bundle = _bundle(tmp_path / "Мои программы" / "Astra Voice")
+    run_env = {**env, "ASTRA_VOICE_PORTABLE": "1", "QT_PLUGIN_PATH": "/home/u/qtplugins"}
+    assert _run(bundle / "AppRun", ["--hidden"], run_env).returncode == 0
+    lines = Path(env["APPRUN_TEST_LOG"] + ".env").read_text(encoding="utf-8").splitlines()
+    final = dict(line.split("=", 1) for line in lines if "=" in line)
+    qt5 = bundle / "opt" / "python3.11" / "lib" / "python3.11" / "site-packages" / "PyQt5" / "Qt5"
+    assert final["QT_PLUGIN_PATH"] == str(qt5 / "plugins")
+    assert final["QML2_IMPORT_PATH"] == str(qt5 / "qml")
+    child = childenv.clean_env(final)
+    assert child["QT_PLUGIN_PATH"] == "/home/u/qtplugins"
+    assert "QML2_IMPORT_PATH" not in child
+
+
+def _final_env(env: dict[str, str]) -> dict[str, str]:
+    lines = Path(env["APPRUN_TEST_LOG"] + ".env").read_text(encoding="utf-8").splitlines()
+    return dict(line.split("=", 1) for line in lines if "=" in line)
+
+
+def test_empty_managed_variable_restored_as_empty(tmp_path: Path, env: dict[str, str]) -> None:
+    """Пустая, но заданная переменная — не то же, что отсутствующая: детям — снова пустая."""
+    bundle = _bundle(tmp_path / "Astra Voice")
+    run_env = {**env, "ASTRA_VOICE_PORTABLE": "1", "QT_PLUGIN_PATH": ""}
+    assert _run(bundle / "AppRun", ["--hidden"], run_env).returncode == 0
+    final = _final_env(env)
+    assert final["QT_PLUGIN_PATH"].endswith("/PyQt5/Qt5/plugins")
+    assert final["ASTRA_VOICE_ORIG_QT_PLUGIN_PATH"] == ""
+    assert childenv.clean_env(final)["QT_PLUGIN_PATH"] == ""
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_colon_in_path_refused(tmp_path: Path, env: dict[str, str], shell: str | None) -> None:
+    """«:» ломает списки путей Qt — отказ с понятной ошибкой до любого запуска."""
+    bundle = _bundle(tmp_path / "a:b")
+    proc = _run(bundle / "AppRun", ["--hidden"], {**env, "ASTRA_VOICE_PORTABLE": "1"}, shell)
+    assert proc.returncode == 1
+    assert "двоеточие «:»" in proc.stderr
+    assert _calls(env) == []
+
+
+@pytest.mark.parametrize(
+    ("where", "locale_env", "expected"),
+    [
+        ("Мои программы", {"LC_ALL": "C"}, {"LC_ALL": "C.UTF-8"}),
+        ("Мои программы", {"LANG": "C.UTF-8"}, {"LANG": "C.UTF-8"}),
+        ("programs", {"LC_ALL": "C"}, {"LC_ALL": "C"}),
+        # Ревью: язык сообщений не трогаем — только кодировка (LC_CTYPE).
+        (
+            "Мои программы",
+            {"LANG": "ru_RU.UTF-8", "LC_CTYPE": "C"},
+            {"LANG": "ru_RU.UTF-8", "LC_CTYPE": "C.UTF-8"},
+        ),
+        ("Мои программы", {"LANG": "C"}, {"LANG": "C", "LC_CTYPE": "C.UTF-8"}),
+    ],
+)
+def test_cyrillic_path_with_single_byte_locale(
+    tmp_path: Path,
+    env: dict[str, str],
+    where: str,
+    locale_env: dict[str, str],
+    expected: dict[str, str],
+) -> None:
+    """Qt 5 зацикливается на кириллице в пути при однобайтовой кодировке: процессу — UTF-8
+    (LC_ALL, если он задан, иначе только LC_CTYPE), детям — исходные значения."""
+    bundle = _bundle(tmp_path / where / "Astra Voice")
+    run_env = {k: v for k, v in env.items() if k != "LANG"}
+    run_env.update(locale_env, ASTRA_VOICE_PORTABLE="1")
+    assert _run(bundle / "AppRun", ["--hidden"], run_env).returncode == 0
+    final = _final_env(env)
+    names = ("LC_ALL", "LC_CTYPE", "LANG")
+    assert {n: final[n] for n in names if n in final} == expected
+    child = childenv.clean_env(final)
+    assert {n: child[n] for n in names if n in child} == locale_env
+
+
+def test_colon_refusal_drops_own_extraction(tmp_path: Path, env: dict[str, str]) -> None:
+    """Ревью, nit: отказ при «:» в режиме распаковки убирает свою распаковку, чужое — нет."""
+    bundle = _bundle(tmp_path / "a:b" / "appimage_extracted_0123abcd")
+    proc = _run(bundle / "AppRun", ["--hidden"], env)
+    assert proc.returncode == 1
+    assert "двоеточие «:»" in proc.stderr
+    assert not bundle.exists()
+    foreign = _bundle(tmp_path / "c:d" / "Astra Voice")
+    assert _run(foreign / "AppRun", ["--hidden"], env).returncode == 1
+    assert foreign.exists()
+
+
 def test_managed_list_matches_python() -> None:
     text = APPRUN.read_text(encoding="utf-8")
     match = re.search(r"^MANAGED='([^']*)'$", text, re.MULTILINE)

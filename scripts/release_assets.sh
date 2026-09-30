@@ -33,7 +33,8 @@ if [ -f "$ROOT/packaging/appimage/ENABLED" ]; then
     todo=$(python3 "$ROOT/packaging/appimage/lockfile.py" "$ROOT/packaging/appimage.lock" todo) ||
         die 'packaging/appimage.lock не прошёл проверку формата'
     [ -z "$todo" ] || die "в packaging/appimage.lock колёса без хэша (TODO-HASH): $(echo "$todo" | tr '\n' ' ')"
-    files+=("$IMAGE" sbom-appimage.cdx.json)
+    # Архив исходников поставляемых версий (R3.6) публикуется вместе с образом.
+    files+=("$IMAGE" sbom-appimage.cdx.json "astra-voice-$VERSION-sources.tar.xz")
     latest_args+=(--appimage)
     say "AppImage включён: $IMAGE"
 else
