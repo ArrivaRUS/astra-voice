@@ -76,6 +76,17 @@ if $appimage; then
     else
         check 'packaging/appimage.lock не прошёл проверку формата' false
     fi
+    marker_status=0
+    markers=$(LC_ALL=C git grep -lE '(T1-01\.10|\bMN-10\b)' HEAD -- src packaging/appimage) || marker_status=$?
+    case $marker_status in
+        0)
+            markers=${markers#HEAD:}
+            markers=${markers//$'\n'HEAD:/$'\n'}
+            check "трек AppImage не готов к тегу: остались маркеры T1-01.10/MN-10 в: ${markers//$'\n'/ }" false
+            ;;
+        1) check 'трек AppImage: открытых маркеров T1-01.10/MN-10 нет' true ;;
+        *) check 'трек AppImage: не удалось проверить маркеры T1-01.10/MN-10' false ;;
+    esac
 fi
 if python3 scripts/check_keyring.py data/keys/release.gpg >/dev/null; then
     check 'связка ключей в белом списке' true
