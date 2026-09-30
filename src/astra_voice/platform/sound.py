@@ -10,7 +10,7 @@
 По кнопке громкость поднимается до целевой громкости (50 %); если громкость
 уже выше, её не трогаем, только включаем звук. Громкость можно задать вручную.
 Прежнее состояние запоминается на сеанс один раз, до первого изменения,
-и возвращается по кнопке «Вернуть как было».
+и возвращается по кнопке «Вернуть».
 
 Ни имена устройств ALSA, ни пути, ни имена служб наружу не отдаём: сообщения
 для человека собираются выше, из значений `MicrophoneState`.
@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 
 #: Ниже этой системной громкости считаем микрофон слишком тихим (PRD A20).
 LOW_VOLUME_PERCENT = 30
-#: Полная громкость: потолок для признака MicrophoneState.can_raise.
+#: Полная громкость: потолок для ручной установки громкости микрофона.
 FULL_VOLUME_PERCENT = 100
 #: Цель кнопки «Поднять»: выше на ноутбуках с усилением микрофона — перегруз;
 #: перегруз хуже тихой записи (заказчик, 30.09).
@@ -101,11 +101,6 @@ class MicrophoneState:
         if 0 <= self.percent < LOW_VOLUME_PERCENT:
             return MicrophoneProblem.TOO_QUIET
         return None
-
-    @property
-    def can_raise(self) -> bool:
-        """Поднимать есть куда: звук выключен или громкость ниже полной."""
-        return self.known and (self.muted or 0 <= self.percent < FULL_VOLUME_PERCENT)
 
 
 def _spawn(command: Sequence[str], *, popen: Callable[..., object] = subprocess.Popen) -> bool:
@@ -203,6 +198,15 @@ class SoundControl:
     def _source(device: str | None) -> str:
         return device if device else DEFAULT_SOURCE
 
+    def _resolved_source(self, device: str | None) -> str | None:
+        """Имя текущего источника, включая выбранный системный по умолчанию."""
+        if device:
+            return device
+        answer = self._pactl("get-default-source")
+        if answer is None:
+            return None
+        return answer.strip() or None
+
     def microphone_state(self, device: str | None = None) -> MicrophoneState:
         """Читает признак «звук выключен» и громкость БЕЗ открытия микрофона."""
         source = self._source(device)
@@ -227,18 +231,21 @@ class SoundControl:
 
     def raise_microphone(self, device: str | None = None) -> bool:
         """Включает звук выбранного источника и поднимает до целевой громкости (50 %)."""
-        source = self._source(device)
-        state = self.microphone_state(device)
+        resolved = self._resolved_source(device)
+        source = resolved or self._source(device)
+        state = self.microphone_state(source)
+        if not state.known:
+            return False
         unmuted = self._pactl("set-source-mute", source, "0") is not None
         raised = True
         if state.percent < RAISE_TARGET_PERCENT:
             raised = (
                 self._pactl("set-source-volume", source, f"{RAISE_TARGET_PERCENT}%") is not None
             )
-        if (state.muted or state.percent < RAISE_TARGET_PERCENT) and (
-            unmuted or (state.percent < RAISE_TARGET_PERCENT and raised)
+        if resolved is not None and (
+            (state.muted and unmuted) or (state.percent < RAISE_TARGET_PERCENT and raised)
         ):
-            self._remember(source, state)
+            self._remember(resolved, state)
         log.info(
             "Громкость микрофона по кнопке: звук %s, громкость %s",
             "включён" if unmuted else "включить не удалось",
@@ -249,11 +256,14 @@ class SoundControl:
     def set_microphone_volume(self, percent: int, device: str | None = None) -> bool:
         """Задаёт громкость источника вручную, сохраняя исходное состояние для отката."""
         percent = max(0, min(int(percent), FULL_VOLUME_PERCENT))
-        source = self._source(device)
-        state = self.microphone_state(device)
+        resolved = self._resolved_source(device)
+        source = resolved or self._source(device)
+        state = self.microphone_state(source)
+        if not state.known:
+            return False
         changed = self._pactl("set-source-volume", source, f"{percent}%") is not None
-        if changed and state.known and state.percent != percent:
-            self._remember(source, state)
+        if changed and state.percent != percent and resolved is not None:
+            self._remember(resolved, state)
         if changed:
             log.info("Громкость микрофона задана вручную: %d %%", percent)
         else:
@@ -262,11 +272,17 @@ class SoundControl:
 
     def can_restore_microphone(self, device: str | None = None) -> bool:
         """Есть ли состояние источника до первого изменения громкости."""
-        return self._source(device) in self._before_change
+        if not self._before_change:
+            return False
+        return self._resolved_source(device) in self._before_change
 
     def restore_microphone(self, device: str | None = None) -> bool:
         """Возвращает прежние громкость и выключение звука выбранного источника."""
-        source = self._source(device)
+        if not self._before_change:
+            return False
+        source = self._resolved_source(device)
+        if source is None:
+            return False
         state = self._before_change.get(source)
         if state is None:
             return False

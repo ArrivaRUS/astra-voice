@@ -147,6 +147,7 @@ class SettingsBridge(QObject):
     pendingComboChanged = pyqtSignal()
     freeCandidatesChanged = pyqtSignal()
     saveErrorChanged = pyqtSignal()
+    microphoneErrorChanged = pyqtSignal()
     modelSelfcheckChanged = pyqtSignal()
     microphoneChanged = pyqtSignal()
     extraChanged = pyqtSignal(str)
@@ -214,6 +215,7 @@ class SettingsBridge(QObject):
         self._sync_autostart()
         self._hotkey_status = "ok"
         self._save_error = ""
+        self._microphone_error = ""
         self._model_selfcheck = "idle"
         self._microphone = MicrophoneState()
         self._downloads = downloads
@@ -837,11 +839,27 @@ class SettingsBridge(QObject):
         """Нажатие «Поднять»: звук включается, громкость — до целевой (50 %)."""
         if self._apply is not None:
             try:
-                self._apply.raise_microphone_volume()
+                raised = self._apply.raise_microphone_volume()
             except Exception:
+                raised = False
+            if not raised:
                 log.warning("Не удалось поднять громкость микрофона")
-        self.refreshMicrophone()
+            self._set_microphone_error(not raised)
+        try:
+            self.refreshMicrophone()
+        except Exception:
+            log.warning("Не удалось узнать громкость микрофона")
         self.microphoneChanged.emit()
+
+    def _set_microphone_error(self, failed: bool) -> None:
+        error = (
+            "Не удалось изменить громкость: звуковая служба не отвечает. Попробуйте ещё раз."
+            if failed
+            else ""
+        )
+        if error != self._microphone_error:
+            self._microphone_error = error
+            self.microphoneErrorChanged.emit()
 
     @pyqtSlot(int)
     def setMicrophoneVolume(self, percent: int) -> None:  # noqa: N802
@@ -852,14 +870,9 @@ class SettingsBridge(QObject):
             changed = self._apply.set_microphone_volume(int(percent))
         except Exception:
             changed = False
-        error = "Не удалось изменить громкость микрофона"
         if not changed:
-            log.warning(error)
-            self._save_error = error
-            self.saveErrorChanged.emit()
-        elif self._save_error == error:
-            self._save_error = ""
-            self.saveErrorChanged.emit()
+            log.warning("Не удалось изменить громкость микрофона")
+        self._set_microphone_error(not changed)
         try:
             self.refreshMicrophone()
         except Exception:
@@ -868,21 +881,16 @@ class SettingsBridge(QObject):
 
     @pyqtSlot()
     def restoreMicrophoneVolume(self) -> None:  # noqa: N802
-        """Нажатие «Вернуть как было»: вернуть состояние до первого изменения."""
+        """Нажатие «Вернуть»: вернуть состояние до первого изменения."""
         if self._apply is None:
             return
-        error = "Не удалось вернуть громкость микрофона"
         try:
             restored = self._apply.restore_microphone_volume()
         except Exception:
             restored = False
         if not restored:
-            log.warning(error)
-            self._save_error = error
-            self.saveErrorChanged.emit()
-        elif self._save_error == error:
-            self._save_error = ""
-            self.saveErrorChanged.emit()
+            log.warning("Не удалось вернуть громкость микрофона")
+        self._set_microphone_error(not restored)
         try:
             self.refreshMicrophone()
         except Exception:
@@ -915,6 +923,10 @@ class SettingsBridge(QObject):
     @pyqtProperty(str, notify=saveErrorChanged)
     def saveError(self) -> str:  # noqa: N802
         return self._save_error
+
+    @pyqtProperty(str, notify=microphoneErrorChanged)
+    def microphoneError(self) -> str:  # noqa: N802
+        return self._microphone_error
 
     @pyqtProperty(str, notify=modelSelfcheckChanged)
     def modelSelfcheck(self) -> str:  # noqa: N802

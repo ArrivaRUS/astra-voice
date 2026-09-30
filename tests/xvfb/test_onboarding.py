@@ -772,6 +772,7 @@ class FakeSettings(QObject):
         self._hotkeyStatus: str = "ok"
         self._lockedSettings: list[str] = []
         self._saveError: str = ""
+        self._microphoneError: str = ""
         self._modelSelfcheck: str = "idle"
         self._activeModelName: str = "GigaAM v3 RNN-T"
         self._activeModelSize: str = "226 МБ"
@@ -1027,6 +1028,15 @@ class FakeSettings(QObject):
         return self._saveError
 
     saveError = pyqtProperty(str, _get_saveError, notify=changed)
+
+    def _get_microphoneError(self) -> str:
+        return self._microphoneError
+
+    def _set_microphoneError(self, value: str) -> None:
+        self._microphoneError = value
+        self.changed.emit()
+
+    microphoneError = pyqtProperty(str, _get_microphoneError, _set_microphoneError, notify=changed)
 
     def _get_modelSelfcheck(self) -> str:
         return self._modelSelfcheck
@@ -3831,6 +3841,32 @@ def test_settings_change_hotkey_shows_capture_field(onboarding_app: Any) -> None
 
     _, messages = render_settings(onboarding_app, False, fake=fake, inspect=inspect)
     assert_no_messages(messages, "settings capture")
+
+
+def test_settings_general_fits_minimum_window_height(onboarding_app: Any, monkeypatch: Any) -> None:
+    # Минимальная высота окна задана темой; проверяем доступность строки громкости без прокрутки.
+    minimum_height = int(theme_number("sizeWindowMinH"))
+    monkeypatch.setattr(sys.modules[__name__], "HEIGHT", minimum_height)
+    fake = FakeSettings()
+    assert fake.microphoneVolume == 80
+    assert not fake.microphoneMuted
+    assert fake.canRaiseMicrophone
+    assert fake.canOpenSoundSettings
+
+    def inspect(window: Any) -> None:
+        assert window.height() == minimum_height
+        body = next(
+            item
+            for item in visual_tree(window.contentItem())
+            if item.metaObject().className() == "QQuickFlickable" and item.isVisible()
+        )
+        assert body.property("contentHeight") <= body.height()
+        texts = visible_texts(window.contentItem())
+        assert {"80 %", "Громкость микрофона"} <= texts
+        assert not any(text.startswith("Громкость микрофона в системе") for text in texts)
+
+    _, messages = render_settings(onboarding_app, False, fake=fake, inspect=inspect)
+    assert_no_messages(messages, "general settings at minimum height")
 
 
 def test_policy_locked_step1(onboarding_app: Any) -> None:

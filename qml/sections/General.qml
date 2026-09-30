@@ -12,6 +12,7 @@ Column {
     readonly property var settings: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
     readonly property string hotkeyStatus: settings ? settings.hotkeyStatus : "ok"
     readonly property string saveError: root.settings ? root.settings.saveError : ""
+    readonly property string micError: root.settings ? root.settings.microphoneError : ""
     readonly property string modelSelfcheck: root.settings ? root.settings.modelSelfcheck : ""
 
     // Громкость микрофона (PRD 0.9 F6.6/F6.7, ревизия 19): читаем по открытию
@@ -82,6 +83,15 @@ Column {
         title: root.saveError
         body: qsTr("Проверьте, что файл настроек доступен для записи, и попробуйте ещё раз.")
         visible: root.saveError !== ""
+        height: visible ? implicitHeight : 0
+    }
+
+    NoteBanner {
+        width: root.width
+        variant: "error"
+        iconName: "alert"
+        title: root.micError
+        visible: root.micError !== ""
         height: visible ? implicitHeight : 0
     }
 
@@ -261,7 +271,7 @@ Column {
             sub: root.micMuted
                 ? qsTr("Звук микрофона выключен в системе — вас не слышно")
                 : root.micVolume >= 0
-                    ? qsTr("Громкость микрофона в системе: %1 %").arg(root.micVolume)
+                    ? ""
                     : qsTr("Не удалось узнать громкость микрофона")
             visible: root.canRaiseMic
             height: visible ? implicitHeight : 0
@@ -269,6 +279,7 @@ Column {
             AvSlider {
                 id: micSlider
                 property real draggedValue: value
+                property bool userMoved: false
                 visible: root.micVolume >= 0 && !root.micMuted
                 Layout.alignment: Qt.AlignVCenter
                 Accessible.name: qsTr("Громкость микрофона")
@@ -284,25 +295,41 @@ Column {
                         draggedValue = value
                 }
                 onPressedChanged: {
-                    if (pressed)
+                    if (pressed) {
+                        userMoved = false
                         draggedValue = value
-                    else {
+                    } else {
                         var previousVolume = root.micVolume
-                        if (root.settings && Math.round(draggedValue) !== previousVolume)
+                        if (userMoved && root.settings && Math.round(draggedValue) !== previousVolume)
                             root.settings.setMicrophoneVolume(Math.round(draggedValue))
                         if (root.micVolume === previousVolume)
                             micSlider.value = root.micVolume
+                        userMoved = false
                     }
                 }
                 onMoved: {
+                    userMoved = true
                     if (!pressed) {
                         var previousVolume = root.micVolume
                         if (root.settings && Math.round(value) !== previousVolume)
                             root.settings.setMicrophoneVolume(Math.round(value))
                         if (root.micVolume === previousVolume)
                             micSlider.value = root.micVolume
+                        userMoved = false
                     }
                 }
+            }
+
+            Text {
+                text: qsTr("%1 %").arg(micSlider.pressed
+                    ? Math.round(micSlider.value) : root.micVolume)
+                visible: micSlider.visible
+                textFormat: Text.PlainText
+                color: Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                renderType: Text.NativeRendering
+                Layout.alignment: Qt.AlignVCenter
             }
 
             AvButton {
@@ -317,7 +344,7 @@ Column {
             }
 
             AvButton {
-                text: qsTr("Вернуть как было")
+                text: qsTr("Вернуть")
                 small: true
                 visible: root.canRestoreMic
                 Layout.alignment: Qt.AlignVCenter
