@@ -1,7 +1,7 @@
 """Точка входа GUI: single-instance, порядок старта, загрузка QML.
 
 Порядок (синтез-план §5.5): блокировка → политика → настройки → **тема** → QML.
-``QLockFile`` берётся **первым действием** (решение О5); проигравший процесс
+После явной регистрации ``QLockFile`` берётся до запуска GUI (решение О5); проигравший процесс
 отправляет строку ``show`` по ``QLocalSocket`` и выходит с кодом 0.
 Сервер принимает единственную команду ``show`` — с необязательной меткой
 времени X: ``show`` либо ``show <ts>`` (требование У17, всё иное — отбой).
@@ -54,6 +54,22 @@ if TYPE_CHECKING:
     from astra_voice.updates.checker import UpdateChecker
 
 log = logging.getLogger(__name__)
+
+
+def _mark_running_copy() -> None:
+    """Защищает работающую копию от чистки (arch/appimage.md §1, §4; Р5)."""
+    from astra_voice.platform import userinstall
+
+    try:
+        if paths.install_kind() is not paths.InstallKind.APPIMAGE_INSTALLED:
+            return
+        bundle = paths.bundle_root()
+        if bundle is not None:
+            userinstall.write_running_key(bundle.name)
+    except (OSError, paths.PathError, ValueError) as error:
+        log.warning(
+            "Не удалось защитить работающую копию от удаления: %s", userinstall.tilde(error)
+        )
 
 
 def _revoked_check(model: Any | None) -> Callable[[str, str], bool]:
@@ -139,11 +155,23 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             raise argparse.ArgumentTypeError("число потоков должно быть целым и не меньше 1")
         return count
 
-    parser = argparse.ArgumentParser(prog=APP_NAME, add_help=True)
+    # Без сокращений: «--vers» не должен означать --version — AppRun и userinstall
+    # сверяют служебные флаги по точному совпадению.
+    parser = argparse.ArgumentParser(prog=APP_NAME, add_help=True, allow_abbrev=False)
     parser.add_argument("--version", action="store_true", help="напечатать версию и выйти")
     parser.add_argument("--stats", action="store_true", help="напечатать статистику и выйти")
     parser.add_argument("--hidden", action="store_true", help="запуск без окна, только в трее")
     parser.add_argument("--show", action="store_true", help="показать окно работающей копии")
+    parser.add_argument(
+        "--register",
+        action="store_true",
+        help="служебный: добавить в меню и автозапуск установленную копию",
+    )
+    parser.add_argument(
+        "--unregister",
+        action="store_true",
+        help="служебный: убрать версию AppImage из меню и автозапуска и выйти",
+    )
     parser.add_argument("--debug", action="store_true", help="подробный журнал")
     parser.add_argument(
         "--debug-transcribe",
@@ -925,8 +953,48 @@ def _cleanup(server: Any, lock: Any) -> None:
         lock.unlock()
 
 
+def _unregister() -> int:
+    """``--unregister``: снять меню, значки и наш автозапуск без GUI (arch/appimage.md §4).
+
+    Запрет ``appimage=deny`` эту команду не блокирует (bootstrap).
+    """
+    from astra_voice.platform import userinstall
+
+    if not paths.install_kind().is_appimage:
+        sys.stderr.write("Команда --unregister нужна только версии AppImage.\n")
+        return 2
+    try:
+        userinstall.unregister()
+    except (userinstall.UserInstallError, OSError, paths.PathError, ValueError) as error:
+        sys.stderr.write(
+            f"Не удалось убрать Astra Voice из меню и автозапуска: {userinstall.tilde(error)}\n"
+        )
+        return 1
+    sys.stdout.write("Astra Voice убран из меню и автозапуска.\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.unregister:
+        return _unregister()
+    if args.register:
+        from astra_voice.platform import autostart, userinstall
+
+        try:
+            if paths.install_kind() is paths.InstallKind.APPIMAGE_INSTALLED:
+                userinstall.register()
+        except (
+            userinstall.UserInstallError,
+            OSError,
+            paths.PathError,
+            autostart.AutostartError,
+            # UnicodeEncodeError: путь с байтами не в UTF-8 не кодируется в запись меню.
+            ValueError,
+        ) as error:
+            sys.stderr.write(
+                f"Не удалось добавить Astra Voice в меню: {userinstall.tilde(error)}\n"
+            )
     if args.version:
         sys.stdout.write(f"{APP_NAME} {__version__}\n")
         return 0
@@ -969,6 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
 
     session_kind = detect()
     setup_logging(session_kind.value, debug=args.debug)
+    _mark_running_copy()
     try:
         deny_pulse_autospawn()
     except Exception:

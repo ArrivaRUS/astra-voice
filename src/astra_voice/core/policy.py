@@ -25,6 +25,9 @@ from astra_voice.core.settings import Settings, is_valid_combo
 log = logging.getLogger(__name__)
 
 POLICY_PATH = Path("/etc/astra-voice/policy.conf")
+APPIMAGE_DENIED_MESSAGE = (
+    "Администратор запретил эту версию программы на компьютере. Используйте системную версию."
+)
 SECTION = "astra-voice"
 LOCKED_KEY = "locked"
 _TRUE = {"1", "true", "yes", "on"}
@@ -122,6 +125,23 @@ def load(path: Path | None = None) -> Policy:
         locked_keys=frozenset(values) | explicit,
         status=PolicyStatus.OK,
     )
+
+
+def appimage_denied(policy: Policy) -> bool:
+    """Совещательный запрет AppImage (arch/appimage.md §5, T1/MJ-4).
+
+    INVALID и profile=secure сами по себе не запрещают запуск: это не сеть.
+    """
+    if policy.status is PolicyStatus.INVALID or "appimage" not in policy.values:
+        return False
+    raw = policy.values["appimage"]
+    value = str(raw).strip().lower()
+    if value in _FALSE or value == "deny":
+        return True
+    if value in _TRUE or value == "allow":
+        return False
+    log.warning("appimage=%r из политики недопустим, разрешаю запуск", raw)
+    return False
 
 
 def effective(settings: Settings, policy: Policy) -> Settings:

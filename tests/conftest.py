@@ -332,6 +332,41 @@ def audio_isolation(pytestconfig: pytest.Config) -> Iterator[None]:
         )
 
 
+@pytest.fixture(autouse=True)
+def restore_root_logger() -> Iterator[None]:
+    """Тест, вызвавший setup_logging (напрямую или через bootstrap), не меняет журнал соседям.
+
+    setup_logging ставит корню уровень INFO и вешает свои обработчики; без отката
+    caplog следующих тестов ловит лишние INFO-записи — падение зависит от порядка файлов.
+    """
+    import logging
+
+    root = logging.getLogger()
+    level = root.level
+    yield
+    for handler in list(root.handlers):
+        if getattr(handler, "_astra_voice", False):
+            root.removeHandler(handler)
+            handler.close()
+    root.setLevel(level)
+
+
+@pytest.fixture(autouse=True)
+def no_system_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Стоящий на машине .deb (/usr/bin/astra-voice) тесты не запускают и не учитывают.
+
+    bootstrap при запрете AppImage делает exec системной версии, userinstall.unregister()
+    перенацеливает на неё автозапуск; тест, которому нужна «системная версия», подменяет путь сам.
+    """
+    try:
+        from astra_voice.core import paths
+    except ImportError:
+        # Сторож сбора (test_collection_guard) копирует conftest в песочницу без пакета.
+        return
+
+    monkeypatch.setattr(paths, "SYSTEM_EXECUTABLE", Path("/nonexistent/astra-voice"))
+
+
 def qt_environment_error(
     returncode: int | None,
     stdout: str | bytes | None,

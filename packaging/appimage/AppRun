@@ -1,0 +1,220 @@
+#!/bin/sh
+# Astra Voice — вход AppImage (arch/appimage.md §1, §8, §12).
+#
+# Тонкий слой до Python: определяет режим запуска, решает, нужна ли
+# самоустановка, и передаёт управление bootstrap.py. Копирование, блокировка,
+# переключение current/previous и чистка — в astra_voice/platform/userinstall.py.
+#
+# Режимы:
+#   А — работает установленная копия <data>/astra-voice/app/<KEY> (в т. ч. через app/current);
+#   Б — FUSE-монтирование файла .AppImage;
+#   В — распаковка --appimage-extract-and-run ($TMPDIR/appimage_extracted_*);
+#   Г — любой другой каталог (ручная распаковка, временная копия при смоуке).
+# Б и В устанавливают копию в домашнюю папку и запускают её; служебные флаги
+# и ASTRA_VOICE_PORTABLE=1 не устанавливают ничего.
+set -eu
+
+HERE=$(dirname "$(readlink -f "$0")")
+PY=$HERE/opt/python3.11/bin/python3.11
+BOOTSTRAP=$HERE/usr/lib/astra-voice/bootstrap.py
+BUILD_FILE=$HERE/.astra-voice-build
+# Код bootstrap.py selfinstall «установка не нужна» (userinstall.EXIT_SKIPPED).
+SKIPPED=10
+
+die() {
+    printf '%s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+# T1-01.10: MJ-3 — при `id -u` = 0 отказ до любых действий: «Версия AppImage не
+# запускается от имени root. Управляйте ею под учётной записью пользователя», код 3 (T-179).
+refuse_root() {
+    :
+}
+
+# T1-01.10: MN-1 — заменить на key_ok из packaging/appimage/keylib.sh: та же грамматика,
+# что userinstall.KEY_RE, общий набор векторов tests/fixtures/appimage/keys.txt (T-181).
+# Пока — проверка спайка: непустой, без «/», пробелов и управляющих символов.
+key_ok() {
+    case $1 in
+        '' | *[!A-Za-z0-9._~+-]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Служебные флаги не устанавливают программу (спайк §7.10).
+# Тот же список — userinstall.SERVICE_FLAGS (сверяет test_apprun.py).
+is_service() {
+    for arg do
+        case $arg in
+            --version | --help | -h | --stats | --selfinstall-status | --unregister | --uninstall) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+refuse_root
+
+[ -r "$BUILD_FILE" ] || die 'Не найдены сведения о сборке Astra Voice.'
+VERSION=$(sed -n 's/^VERSION=//p' "$BUILD_FILE" | head -n 1)
+BUILD_ID=$(sed -n 's/^BUILD_ID=//p' "$BUILD_FILE" | head -n 1)
+if [ -z "$VERSION" ] || [ -z "$BUILD_ID" ] || ! key_ok "$VERSION-$BUILD_ID"; then
+    die 'Повреждены сведения о сборке Astra Voice.'
+fi
+KEY=$VERSION-$BUILD_ID
+# Как paths.appimage_app_dir(): относительный XDG_DATA_HOME не признаётся.
+case ${XDG_DATA_HOME:-} in
+    /*) DATA=$XDG_DATA_HOME ;;
+    *) DATA=${HOME:?}/.local/share ;;
+esac
+ROOT=$DATA/astra-voice/app
+TARGET=$ROOT/$KEY
+
+# Самая длинная точка монтирования-префикс HERE имеет тип fuse*.
+# ASTRA_VOICE_TEST_MOUNTINFO — только для тестов (подмена /proc/self/mountinfo).
+on_fuse() {
+    awk -v path="$1" '
+        {
+            point=$5; gsub(/\\040/, " ", point)
+            if (path == point || index(path, point "/") == 1 || point == "/") {
+                for (i=6; i<=NF; i++) if ($i == "-") {
+                    if (length(point) > best) { best=length(point); kind=$(i+1) }
+                    break
+                }
+            }
+        }
+        END { exit !(kind ~ /^fuse/) }
+    ' "${ASTRA_VOICE_TEST_MOUNTINFO:-/proc/self/mountinfo}"
+}
+
+MODE=Г
+if [ "$HERE" = "$(readlink -m "$TARGET")" ]; then
+    MODE=А
+elif [ -n "${APPIMAGE:-}" ] && on_fuse "$HERE"; then
+    MODE=Б
+fi
+case ${HERE##*/} in
+    appimage_extracted_*) MODE=В ;;
+esac
+
+# Служебный флаг для замеров и smoke.sh. Имя без префикса --appimage-: такие
+# аргументы runtime AppImage перехватывает сам, до AppRun они не доходят.
+if [ "${1:-}" = --selfinstall-status ]; then
+    printf 'MODE=%s\nHERE=%s\nKEY=%s\nROOT=%s\n' "$MODE" "$HERE" "$KEY" "$ROOT"
+    exit 0
+fi
+
+# Совещательный запрет appimage=deny (arch/appimage.md §5) решает только Python
+# (core/policy.py): bootstrap.py проверяет его в selfinstall до копирования и в app.
+# Своего разбора policy.conf здесь нет — одна точка правды.
+
+# Исходные значения переменных, которые AppRun снимает или ставит, — для
+# внешних программ (childenv.clean_env). Только первый раз: вложенный AppRun
+# (exec установленной копии) видит уже изменённое окружение и ничего не пишет.
+# Тот же список — childenv.APPRUN_MANAGED (сверяет test_apprun.py).
+MANAGED='PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE QT_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH QT_QPA_PLATFORMTHEME LD_PRELOAD SSL_CERT_FILE'
+save_originals() {
+    for name in $MANAGED; do
+        case " ${ASTRA_VOICE_ORIG_UNSET-} " in
+            *" $name "*) continue ;;
+        esac
+        eval "saved=\${ASTRA_VOICE_ORIG_$name+x}"
+        [ -z "$saved" ] || continue
+        eval "present=\${$name+x}"
+        if [ -n "$present" ]; then
+            eval "ASTRA_VOICE_ORIG_$name=\$$name"
+            export "ASTRA_VOICE_ORIG_$name"
+        else
+            ASTRA_VOICE_ORIG_UNSET=${ASTRA_VOICE_ORIG_UNSET:+$ASTRA_VOICE_ORIG_UNSET }$name
+            export ASTRA_VOICE_ORIG_UNSET
+        fi
+    done
+}
+save_originals
+
+# Переменные runtime AppImage и хоста, которые не должны влиять на бандловый
+# Python и Qt (arch/appimage.md §10.4). LD_LIBRARY_PATH не ставим: RUNPATH.
+# shellcheck disable=SC2086
+unset APPIMAGE APPDIR ARGV0 OWD APPIMAGE_EXTRACT_AND_RUN $MANAGED \
+    ASTRA_VOICE_APPIMAGE_DIR ASTRA_VOICE_RESOURCES ASTRA_VOICE_TEST_MOUNTINFO
+
+installed_ok() {
+    [ -d "$TARGET" ] && [ ! -L "$TARGET" ] && [ -f "$TARGET/.installed-ok" ] &&
+        [ -x "$TARGET/AppRun" ] && [ -x "$TARGET/opt/python3.11/bin/python3.11" ] &&
+        [ -f "$TARGET/usr/lib/astra-voice/bootstrap.py" ] &&
+        cmp -s "$BUILD_FILE" "$TARGET/.astra-voice-build"
+}
+
+is_current() {
+    [ "$(readlink "$ROOT/current" 2>/dev/null || :)" = "$KEY" ]
+}
+
+# Runtime после --appimage-extract-and-run свою распаковку не удаляет (спайк §4):
+# копия уже установлена — убираем её. Оболочка держит открытый дескриптор этого
+# скрипта, поэтому удалить исполняемый сейчас файл безопасно.
+drop_extracted() {
+    if [ "$MODE" = В ] && [ -f "$HERE/.astra-voice-build" ]; then
+        rm -rf "$HERE" || :
+    fi
+}
+
+# Явный запуск файла передаёт меню установленной копии (arch/appimage.md §2, §4).
+run_installed() {
+    drop_extracted
+    exec "$TARGET/AppRun" --register "$@"
+}
+
+INSTALL=0
+# Режим В без установки (запрет политикой, запуск уходит в системную версию):
+# app — дочерним процессом, чтобы после него убрать распаковку из $TMPDIR.
+CHILD=0
+case $MODE in
+    Б | В) INSTALL=1 ;;
+esac
+if [ "${ASTRA_VOICE_PORTABLE:-}" = 1 ] || is_service "$@"; then
+    INSTALL=0
+fi
+
+if [ "$INSTALL" = 1 ]; then
+    # Быстрый путь: эта сборка уже установлена и текущая (повторный запуск файла).
+    if installed_ok && is_current; then
+        run_installed "$@"
+    fi
+    rc=0
+    "$PY" -I "$BOOTSTRAP" selfinstall "$HERE" "$@" || rc=$?
+    if [ "$rc" = 0 ] && installed_ok; then
+        run_installed "$@"
+    fi
+    case $rc in
+        # Отказ политики (§5), от root (MJ-3) и небезопасный источник (BL-1):
+        # завершаем работу в любом режиме, без запуска из монтирования.
+        3 | 4) exit "$rc" ;;
+    esac
+    if [ "$rc" = "$SKIPPED" ] && [ "$MODE" = В ]; then
+        CHILD=1
+    elif [ "$rc" != "$SKIPPED" ]; then
+        if [ "$MODE" = В ]; then
+            # Распаковка временная: работать из неё нельзя, сообщение уже напечатано.
+            [ "$rc" = 0 ] && die 'Установленная копия Astra Voice повреждена.'
+            exit "$rc"
+        fi
+        # Режим Б: работаем прямо из монтирования (arch/appimage.md §8).
+        printf '%s\n' 'Astra Voice работает без установки в домашнюю папку.' >&2
+    fi
+fi
+
+if [ -r /etc/ssl/certs/ca-certificates.crt ]; then
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+else
+    SSL_CERT_FILE=$HERE/opt/python3.11/lib/python3.11/site-packages/certifi/cacert.pem
+fi
+ASTRA_VOICE_RESOURCES=$HERE/usr/share/astra-voice
+ASTRA_VOICE_APPIMAGE_DIR=$HERE
+export SSL_CERT_FILE ASTRA_VOICE_RESOURCES ASTRA_VOICE_APPIMAGE_DIR
+if [ "$CHILD" = 1 ]; then
+    rc=0
+    "$PY" -I "$BOOTSTRAP" app "$@" || rc=$?
+    drop_extracted
+    exit "$rc"
+fi
+exec "$PY" -I "$BOOTSTRAP" app "$@"

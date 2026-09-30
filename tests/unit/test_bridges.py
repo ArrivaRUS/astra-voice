@@ -25,7 +25,6 @@ import pytest
 import requests
 from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEvent, QObject, Qt, QTimer, QUrl
-from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtTest import QSignalSpy
 
 from astra_voice.app import _make_app_info
@@ -288,7 +287,7 @@ def qcore_app() -> QCoreApplication:
 def desktop_opener(monkeypatch: pytest.MonkeyPatch) -> Mock:
     """Ни один тест мостов не может запустить настоящий файловый менеджер."""
     opener = Mock(return_value=True)
-    monkeypatch.setattr(QDesktopServices, "openUrl", opener)
+    monkeypatch.setattr("astra_voice.ui.bridges.open_external", opener)
     return opener
 
 
@@ -6308,7 +6307,9 @@ def test_open_models_folder_default_opener_is_replaceable(
     rig.downloads._store = ModelStore(tmp_path)
     target = rig.bridge if via_settings else rig.controller
     target.openModelsFolder()
-    desktop_opener.assert_called_once_with(QUrl.fromLocalFile(str(tmp_path)))
+    desktop_opener.assert_called_once_with(
+        QUrl.fromLocalFile(str(tmp_path)).toString(QUrl.FullyEncoded)
+    )
 
 
 @pytest.mark.parametrize("via_settings", [False, True])

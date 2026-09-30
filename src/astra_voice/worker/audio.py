@@ -6,7 +6,6 @@ import ctypes
 import json
 import logging
 import math
-import os
 import subprocess
 import sys
 import threading
@@ -19,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from astra_voice.core import childenv
 from astra_voice.worker.state import WorkerState
 
 RATE = 16_000
@@ -445,7 +445,7 @@ def list_devices(
     deadline: _OpenDeadline | None = None,
 ) -> list[AudioDevice]:
     """Возвращает источники из краткого списка, по возможности дополняя описаниями."""
-    env = {**os.environ, "LC_ALL": "C"}
+    env = {**childenv.clean_env(keep_pulse_config=True), "LC_ALL": "C"}
     message = "Не удалось получить список устройств записи."
     output = _run_text(run, ["pactl", "list", "short", "sources"], env, deadline)
     if output is None:
@@ -501,7 +501,7 @@ def default_device(
 ) -> AudioDevice:
     """Проверяет фактическое умолчание, запрещая неявную запись звука системы."""
     message = "Микрофон не найден. Выберите устройство записи в настройках."
-    env = {**os.environ, "LC_ALL": "C"}
+    env = {**childenv.clean_env(keep_pulse_config=True), "LC_ALL": "C"}
     output = _run_text(run, ["pactl", "get-default-source"], env, deadline)
     if output is None:
         output = _pipewire_default_name(run, env, deadline)

@@ -7,10 +7,15 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from astra_voice import bootstrap
+from astra_voice.core import audio_env, paths, policy
+from astra_voice.platform import userinstall
+from helpers.appimage_bundle import KEY, make_bundle
 
 pytestmark = pytest.mark.unit
 
@@ -20,6 +25,7 @@ DEV_BOOTSTRAP = REPO_ROOT / "src" / "astra_voice" / "bootstrap.py"
 
 @pytest.fixture(autouse=True)
 def isolated_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     for name in ("CACHE", "CONFIG", "DATA", "STATE"):
         monkeypatch.setenv(f"XDG_{name}_HOME", str(tmp_path / name.lower()))
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
@@ -182,3 +188,130 @@ def test_worker_command_leaves_render_env_alone(monkeypatch: pytest.MonkeyPatch)
     assert "QT_QUICK_BACKEND" not in os.environ
     assert "QT_XCB_GL_INTEGRATION" not in os.environ
     assert "QT_QUICK_CONTROLS_STYLE" not in os.environ
+
+
+def test_selfinstall_command_installs_bundle(tmp_path: Path) -> None:
+    """T-170 (unit-часть): bootstrap selfinstall ставит бандл без Qt и GUI."""
+    bundle = make_bundle(tmp_path / "appimage_extracted_1c866c1789f7")
+    proc = _run(DEV_BOOTSTRAP, ["selfinstall", str(bundle), "--hidden"], cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    app = tmp_path / "data" / "astra-voice" / "app"
+    assert os.readlink(app / "current") == KEY
+    assert (app / KEY / ".installed-ok").is_file()
+
+
+def test_selfinstall_service_flag_creates_nothing(tmp_path: Path) -> None:
+    bundle = make_bundle(tmp_path / "bundle")
+    proc = _run(DEV_BOOTSTRAP, ["selfinstall", str(bundle), "--version"], cwd=tmp_path)
+    assert proc.returncode == 10
+    assert not (tmp_path / "data").exists()
+
+
+def test_selfinstall_without_source_is_usage(tmp_path: Path) -> None:
+    proc = _run(DEV_BOOTSTRAP, ["selfinstall"], cwd=tmp_path)
+    assert proc.returncode == 2
+    assert "usage" in proc.stderr
+
+
+@pytest.fixture
+def policy_entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Mock]:
+    """Подменяем точки входа и подготовку процессов: без Qt, GUI и установки."""
+    monkeypatch.setattr(policy, "POLICY_PATH", tmp_path / "policy.conf")
+    entries = {name: Mock(return_value=17) for name in bootstrap.COMMANDS}
+    for name, module in (
+        ("app", "astra_voice.app"),
+        ("worker", "astra_voice.worker.main"),
+        ("helper", "astra_voice.helper.main"),
+    ):
+        monkeypatch.setitem(sys.modules, module, SimpleNamespace(main=entries[name]))
+    monkeypatch.setattr(userinstall, "selfinstall_main", entries["selfinstall"])
+    for name in ("_setup_sys_path", "_harden", "_setup_render_env"):
+        monkeypatch.setattr(bootstrap, name, Mock())
+    monkeypatch.setattr(audio_env, "deny_pulse_autospawn", Mock())
+    # Системной версии нет; exec в процессе pytest недопустим в любом случае.
+    monkeypatch.setattr(paths, "SYSTEM_EXECUTABLE", tmp_path / "no-deb" / "astra-voice")
+    monkeypatch.setattr(os, "execve", Mock(side_effect=AssertionError("execve в тесте")))
+    for name in (*bootstrap.SOFTWARE_RENDER_ENV, "QT_QUICK_CONTROLS_STYLE"):
+        monkeypatch.delenv(name, raising=False)
+    return entries
+
+
+@pytest.mark.parametrize("kind", list(paths.InstallKind))
+@pytest.mark.parametrize("args", [["app"], ["selfinstall", "/x"]])
+def test_appimage_policy_denial_before_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    policy_entries: dict[str, Mock],
+    kind: paths.InstallKind,
+    args: list[str],
+) -> None:
+    """T-180: запрет действует только в бандле, до подготовки и точек входа."""
+    policy.POLICY_PATH.write_text("[astra-voice]\nappimage = deny\n", encoding="utf-8")
+    monkeypatch.setattr(paths, "install_kind", lambda: kind)
+    load = Mock(wraps=policy.load)
+    monkeypatch.setattr(policy, "load", load)
+
+    assert bootstrap.main(args) == (3 if kind.is_appimage else 17)
+    if kind.is_appimage:
+        assert capsys.readouterr().err == (
+            "Администратор запретил эту версию программы на компьютере. "
+            "Используйте системную версию.\n"
+        )
+        load.assert_called_once_with()
+        for entry in policy_entries.values():
+            entry.assert_not_called()
+        assert isinstance(audio_env.deny_pulse_autospawn, Mock)
+        audio_env.deny_pulse_autospawn.assert_not_called()
+        assert "QT_QUICK_CONTROLS_STYLE" not in os.environ
+    else:
+        assert capsys.readouterr().err == ""
+        load.assert_not_called()
+        policy_entries[args[0]].assert_called_once_with(args[1:])
+
+
+@pytest.mark.parametrize(
+    "kind", [paths.InstallKind.APPIMAGE_PORTABLE, paths.InstallKind.APPIMAGE_INSTALLED]
+)
+@pytest.mark.parametrize("args", [["app"], ["selfinstall", "/x"]])
+@pytest.mark.parametrize("text", ["[сломано\n", "[astra-voice]\nprofile = secure\n"])
+def test_appimage_invalid_or_secure_policy_allows_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    policy_entries: dict[str, Mock],
+    kind: paths.InstallKind,
+    args: list[str],
+    text: str,
+) -> None:
+    policy.POLICY_PATH.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(paths, "install_kind", lambda: kind)
+    assert bootstrap.main(args) == 17
+    policy_entries[args[0]].assert_called_once_with(args[1:])
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("command", ["worker", "helper"])
+def test_internal_commands_do_not_check_appimage_policy(
+    monkeypatch: pytest.MonkeyPatch, policy_entries: dict[str, Mock], command: str
+) -> None:
+    policy.POLICY_PATH.write_text("[astra-voice]\nappimage = deny\n", encoding="utf-8")
+    kind = Mock(return_value=paths.InstallKind.APPIMAGE_PORTABLE)
+    load = Mock(wraps=policy.load)
+    monkeypatch.setattr(paths, "install_kind", kind)
+    monkeypatch.setattr(policy, "load", load)
+    assert bootstrap.main([command]) == 17
+    policy_entries[command].assert_called_once_with([])
+    kind.assert_not_called()
+    load.assert_not_called()
+
+
+def test_python_policy_path_ignores_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy_entries: dict[str, Mock]
+) -> None:
+    policy.POLICY_PATH.write_text("[astra-voice]\nappimage = deny\n", encoding="utf-8")
+    other = tmp_path / "allow.conf"
+    other.write_text("[astra-voice]\nappimage = allow\n", encoding="utf-8")
+    monkeypatch.setenv("ASTRA_VOICE_POLICY_FILE", str(other))
+    monkeypatch.setenv("POLICY_PATH", str(other))
+    monkeypatch.setattr(paths, "install_kind", lambda: paths.InstallKind.APPIMAGE_PORTABLE)
+    assert bootstrap.main(["app"]) == 3
+    policy_entries["app"].assert_not_called()

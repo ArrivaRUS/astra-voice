@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import urllib.request
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
@@ -22,7 +23,9 @@ from unittest.mock import Mock
 
 import requests
 
+from astra_voice.core import paths
 from astra_voice.models import catalog as catalog_module
+from astra_voice.models import schema as schema_module
 from astra_voice.models.catalog import CatalogError, load_builtin
 from astra_voice.security.verify import CLOCK_BEHIND, Verifier, VerifyResult
 
@@ -752,3 +755,91 @@ def test_bad_mirrors_are_rejected(
     document["models"][0]["mirrors"] = mirrors
     write_document(catalog_root, document)
     assert_rejected_without_side_effects(catalog_root, "bad-schema", monkeypatch)
+
+
+@pytest.fixture
+def schema_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Проверки треков используют только временные домашние каталоги."""
+    for name in ("HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"):
+        directory = tmp_path / name.lower()
+        directory.mkdir(mode=0o700)
+        monkeypatch.setenv(name, str(directory))
+
+
+@pytest.mark.usefixtures("schema_environment")
+@pytest.mark.parametrize("kind", list(paths.InstallKind))
+@pytest.mark.parametrize("require_schema", [None, True, False])
+@pytest.mark.parametrize("reason", ["missing", "incompatible"])
+def test_catalog_schema_requirement_by_install_kind(
+    catalog_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    kind: paths.InstallKind,
+    require_schema: bool | None,
+    reason: str,
+) -> None:
+    """T-169: бандл требует схему; явный выбор важнее трека (§11 п.2)."""
+    monkeypatch.setattr(paths, "install_kind", lambda: kind)
+    replacement = None if reason == "missing" else ModuleType("jsonschema")
+    monkeypatch.setitem(sys.modules, "jsonschema", replacement)
+    required = kind.is_appimage if require_schema is None else require_schema
+
+    def load_catalog() -> catalog_module.Catalog:
+        if require_schema is None:
+            return load_builtin(StubVerifier(), root=catalog_root)
+        return load_builtin(StubVerifier(), root=catalog_root, require_schema=require_schema)
+
+    with caplog.at_level(logging.WARNING, logger="astra_voice.models.catalog"):
+        if required:
+            with pytest.raises(CatalogError) as error:
+                load_catalog()
+            assert error.value.code == "bad-schema"
+            assert error.value.message == (
+                "Не удалось проверить каталог: недоступен модуль jsonschema."
+            )
+        else:
+            result = load_catalog()
+            assert result.entry(MODEL_ID) is not None
+
+    skipped = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "схеме пропущена" in record.getMessage()
+    ]
+    assert len(skipped) == (0 if required else 1)
+
+
+@pytest.mark.usefixtures("schema_environment")
+def test_schema_require_available() -> None:
+    check: Callable[[], object] = schema_module.require_available
+    assert check() is None
+
+
+@pytest.mark.usefixtures("schema_environment")
+@pytest.mark.parametrize("reason", ["missing", "incompatible"])
+def test_schema_require_available_rejects_unavailable(
+    monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    replacement = None if reason == "missing" else ModuleType("jsonschema")
+    monkeypatch.setitem(sys.modules, "jsonschema", replacement)
+
+    with pytest.raises(schema_module.SchemaUnavailable):
+        schema_module.require_available()
+
+
+@pytest.mark.usefixtures("schema_environment")
+@pytest.mark.parametrize("has_resolver", [False, True], ids=["missing", "unusable"])
+def test_schema_require_available_rejects_incompatible_resolver(
+    monkeypatch: pytest.MonkeyPatch, has_resolver: bool
+) -> None:
+    import jsonschema
+
+    replacement = ModuleType("jsonschema")
+    for name in ("exceptions", "Draft202012Validator", "ValidationError", "SchemaError"):
+        setattr(replacement, name, getattr(jsonschema, name))
+    if has_resolver:
+        monkeypatch.setattr(replacement, "RefResolver", None, raising=False)
+    monkeypatch.setitem(sys.modules, "jsonschema", replacement)
+
+    with pytest.raises(schema_module.SchemaUnavailable):
+        schema_module.require_available()

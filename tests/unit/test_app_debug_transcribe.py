@@ -113,3 +113,10 @@ def test_help_describes_model_options(capsys: pytest.CaptureFixture[str]) -> Non
     help_text = capsys.readouterr().out
     for option in ("--model-dir PATH", "--variant NAME", "--threads N"):
         assert option in help_text
+
+
+def test_parse_args_rejects_abbreviations() -> None:
+    """Служебные флаги — только точным совпадением (AppRun и userinstall сверяют так же)."""
+    with pytest.raises(SystemExit):
+        _parse_args(["--vers"])
+    assert _parse_args(["--version"]).version
