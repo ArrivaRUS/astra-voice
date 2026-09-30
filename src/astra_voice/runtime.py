@@ -1328,7 +1328,7 @@ class DictationRuntime(QObject):
         if self._hotkey_lost_code == "busy":
             notify.notify_hotkey_not_grabbed(self.settings.hotkey)
         else:
-            notify.notify_hotkey_lost()
+            notify.notify_hotkey_lost(self._hotkey_lost_code)
 
     def _start_regrab(self, code: str) -> None:
         """Повторяет захват; новая настройка начинает собственный отсчёт попыток."""

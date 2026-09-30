@@ -8,8 +8,9 @@
 (чистый VmHWM). Внутри — настоящий `WorkerState` воркера, запросы `model.load`,
 `transcribe.file` на `data/test/test-ru-6s.wav` и `measure`: тот же путь, что у диктовки
 (движок, обрезка тишины VAD, `infer_ms`/`audio_ms` из `result`, VmHWM/PSS процесса).
-Перед `model.load` зонд ставит те же пределы, что настоящий воркер (RLIMIT_CORE = 0,
-RLIMIT_AS по `min_ram_mb` из каталога), и умирает вместе с родителем (PR_SET_PDEATHSIG).
+Перед `model.load` зонд привязывается к родителю (PR_SET_PDEATHSIG и проверка PID),
+запрещает дампы (RLIMIT_CORE = 0 и PR_SET_DUMPABLE = 0), выставляет
+oom_score_adj = 500 и ограничивает RLIMIT_AS по `min_ram_mb` из каталога.
 
 Правила близки к полоскам карточки (`core/measurements.py`), с тремя оговорками:
 - первый прогон после загрузки холодный и не учитывается; RTFx — медиана
@@ -146,7 +147,7 @@ def apply_probe_limits(min_ram_mb: int) -> None:
 
 
 def set_parent_death_signal() -> None:
-    """Зонд получает SIGTERM, если родитель умер (prctl через ctypes, как у воркера)."""
+    """Ставит только сигнал смерти родителя; используется проверкой пределов зонда."""
     from astra_voice.worker.main import PR_SET_PDEATHSIG, _prctl
 
     _prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
@@ -259,7 +260,7 @@ def run_probe(
 
 
 def probe_main(argv: list[str]) -> int:
-    """Дочерний процесс: одна строка JSON с числами или с кодом причины."""
+    """Дочерний процесс: JSON в одной строке или тихий выход при смерти родителя."""
     parser = argparse.ArgumentParser(prog="tools/benchmark _probe")
     for name in ("--id", "--revision", "--layout", "--variant"):
         parser.add_argument(name, required=True)
@@ -269,11 +270,11 @@ def probe_main(argv: list[str]) -> int:
     parser.add_argument("--threads", type=positive_int, required=True)
     parser.add_argument("--min-ram-mb", type=positive_int, required=True)
     args = parser.parse_args(argv)
-    try:
-        set_parent_death_signal()
-    except OSError:
-        # Как у воркера: без сигнала смерти родителя замер всё равно возможен.
-        pass
+    parent_pid = os.getppid()
+    from astra_voice.worker.main import harden_process
+
+    if not harden_process(parent_pid):
+        return 0
     try:
         result: dict[str, Any] = run_probe(
             model_id=args.id,

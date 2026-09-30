@@ -693,15 +693,47 @@ def test_hotkey_messages_name_combo_and_actions(
     assert args[6]["urgency"].value() == b"\x01"
 
 
-def test_hotkey_lost_message_is_plain_and_offers_choice(transport: Mock) -> None:
-    """Потеря захвата не по вине другой программы: без кодов и технических слов."""
-    notifications.notify_hotkey_lost()
+@pytest.mark.parametrize(
+    ("code", "body"),
+    [
+        (
+            "bad-combo",
+            "В текущей раскладке клавиатуры нет такого сочетания. Верните прежнюю раскладку "
+            "или назначьте другое сочетание в настройках. Программа продолжит пробовать "
+            "вернуть клавишу сама.",
+        ),
+        (
+            "duplicate",
+            "Сочетание совпало с другой клавишей программы. Назначьте другое сочетание "
+            "в настройках. Программа продолжит пробовать вернуть клавишу сама.",
+        ),
+        (
+            "not-grabbed",
+            "Сочетание клавиш перестало работать. Программа продолжит пробовать вернуть его сама. "
+            "Если не получится, откройте настройки и назначьте его снова.",
+        ),
+        (
+            "неизвестная-причина",
+            "Сочетание клавиш перестало работать. Программа продолжит пробовать вернуть его сама. "
+            "Если не получится, откройте настройки и назначьте его снова.",
+        ),
+        (
+            "",
+            "Сочетание клавиш перестало работать. Программа продолжит пробовать вернуть его сама. "
+            "Если не получится, откройте настройки и назначьте его снова.",
+        ),
+    ],
+)
+def test_hotkey_lost_message_is_plain_and_offers_choice(
+    transport: Mock, code: str, body: str
+) -> None:
+    """Причина понятна человеку; служебный код не попадает в уведомление."""
+    notifications.notify_hotkey_lost(code)
     transport.bus.asyncCall.assert_called_once()
     args = _arguments(transport.bus.asyncCall.call_args.args[0])
-    assert args[3:5] == [
-        "Горячая клавиша перестала работать",
-        "Программа попробует вернуть её сама.",
-    ]
+    assert args[3:5] == ["Горячая клавиша перестала работать", body]
+    if code:
+        assert code not in " ".join(args[3:5])
     assert args[5].value() == ["choose-hotkey", "Выбрать другую"]
     assert args[6]["urgency"].value() == b"\x01"
 
@@ -1176,7 +1208,8 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
     """Проверить все вызовы, включая вложенные функции и псевдонимы импортов.
 
     Прямой notify разрешён только в модуле уведомлений. Для двух обёрток
-    горячей клавиши разрешены settings.hotkey снаружи и шаблон с combo внутри.
+    горячей клавиши разрешены settings.hotkey снаружи и шаблон с combo внутри;
+    для потери клавиши — сохранённый код причины и выбор из постоянных текстов.
     Описание микрофона разрешено внутри двух фиксированных шаблонов; runtime
     передаёт обёртки как колбэки. Остальные тексты — строковые константы.
     """
@@ -1246,6 +1279,15 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
         for statement in function.body
         if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
     }
+    allowed_lost_body = {
+        statement.value: ast.dump(
+            ast.parse("_HOTKEY_LOST_BODIES.get(code, _HOTKEY_LOST_DEFAULT_BODY)", mode="eval").body
+        )
+        for function in tree.body
+        if isinstance(function, ast.FunctionDef) and function.name == "notify_hotkey_lost"
+        for statement in function.body
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+    }
     # У онбординга два типизированных перехода: контроллер → host → обёртка.
     # Разрешены только точные вызовы в соответствующих методах этих классов.
     onboarding_calls = {
@@ -1282,6 +1324,15 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
             == ast.dump(ast.parse("self.settings.hotkey", mode="eval").body)
         ):
             continue
+        if (
+            not implementation
+            and leaf == "notify_hotkey_lost"
+            and len(node.args) == 1
+            and not node.keywords
+            and ast.dump(node.args[0])
+            == ast.dump(ast.parse("self._hotkey_lost_code", mode="eval").body)
+        ):
+            continue
         if not implementation and (leaf == "notify" or node.args or node.keywords):
             problems.append(f"{node.lineno}: снаружи допустима только обёртка без аргументов")
         arguments = [
@@ -1309,6 +1360,13 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
                 and leaf == "notify"
                 and node in allowed_templates
                 and ast.dump(argument) == allowed_templates[node]
+            ):
+                continue
+            if (
+                implementation
+                and leaf == "notify"
+                and node in allowed_lost_body
+                and ast.dump(argument) == allowed_lost_body[node]
             ):
                 continue
             if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
@@ -1360,11 +1418,13 @@ def test_project_notifications_contain_no_dictation() -> None:
         "n.notify_tray_depends_on_panel(text)",
         "n.notify_hotkey_not_grabbed(text)",
         "n.notify_hotkey_regrabbed(text)",
+        "n.notify_hotkey_lost(text)",
         "n.notify_microphone_changed(text)",
         "n.notify_microphone_selected(text)",
         'def notify_microphone_changed(name):\n    notify(f"Запись: {text}")',
         'def notify_microphone_selected(name):\n    notify(f"Микрофон: {text}")',
         'def notify_hotkey_regrabbed(combo):\n    notify(f"Запись: {text}")',
+        'def notify_hotkey_lost(code):\n    notify("Потеря", text)',
         'notify("Запись", actions=text)',
         'notify("Запись", actions=[("details", text)])',
         'notify("Запись", actions=[(text, "Подробности")])',

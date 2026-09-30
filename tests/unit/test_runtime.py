@@ -2213,7 +2213,7 @@ def test_mapping_regrab_failure_warns_sets_nokey_and_retries(
     if code == "busy":
         assert rig.notify.mock_calls == [call.notify_hotkey_not_grabbed("Ctrl+Space")]
     else:
-        assert rig.notify.mock_calls == [call.notify_hotkey_lost()]
+        assert rig.notify.mock_calls == [call.notify_hotkey_lost(code)]
     # Тик таймера восстанавливает захват тем же grab(), без duplicate.
     backend.grab_combo.reset_mock()
     rig.now += 25
@@ -2255,7 +2255,7 @@ def test_mapping_regrab_ok_while_waiting_restores_and_stops_timer(
         assert not rig.notify.mock_calls
     else:
         assert rig.notify.mock_calls == [
-            call.notify_hotkey_lost(),
+            call.notify_hotkey_lost("not-grabbed"),
             call.notify_hotkey_regrabbed("Ctrl+Space"),
         ]
     assert [r.getMessage() for r in caplog.records if r.name == module.__name__] == [
@@ -2283,7 +2283,7 @@ def test_mapping_lost_notification_is_rate_limited(monkeypatch: pytest.MonkeyPat
     rig.now += 1
     feed(rig, batches, mapping_ok())
     assert rig.notify.mock_calls == [
-        call.notify_hotkey_lost(),
+        call.notify_hotkey_lost("not-grabbed"),
         call.notify_hotkey_regrabbed("Ctrl+Space"),
     ]
     rig.notify.reset_mock()
@@ -2305,7 +2305,7 @@ def lose_again_within_interval(rig: Rig, batches: list[Any]) -> FakeTimer:
     rig.now += 1
     feed(rig, batches, mapping_ok())
     assert rig.notify.mock_calls == [
-        call.notify_hotkey_lost(),
+        call.notify_hotkey_lost("not-grabbed"),
         call.notify_hotkey_regrabbed("Ctrl+Space"),
     ]
     rig.notify.reset_mock()
@@ -2329,12 +2329,12 @@ def test_mapping_second_long_loss_is_announced_after_interval(
     deferred = lose_again_within_interval(rig, batches)
     rig.now += 40
     deferred.fire()
-    assert rig.notify.mock_calls == [call.notify_hotkey_lost()]
+    assert rig.notify.mock_calls == [call.notify_hotkey_lost("not-grabbed")]
     assert deferred.deleted and rig.runtime._lost_notice_timer is None
     # Объявленная потеря — при возврате «снова работает».
     feed(rig, batches, mapping_ok())
     assert rig.notify.mock_calls == [
-        call.notify_hotkey_lost(),
+        call.notify_hotkey_lost("not-grabbed"),
         call.notify_hotkey_regrabbed("Ctrl+Space"),
     ]
 
