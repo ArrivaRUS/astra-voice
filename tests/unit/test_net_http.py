@@ -462,18 +462,14 @@ def test_truncated_body_is_short_read_in_any_urllib3(
     assert not response._watchdog.is_alive()
 
 
-def test_huge_content_length_is_network_error_not_value_error(
+def test_huge_content_length_reads_body_until_close(
     client: HttpClient, local_server: LocalServer
 ) -> None:
-    """5000 цифр в Content-Length: int() падает на пределе 4300 цифр. Наружу — только
-    NetworkError (перебор зеркал и backoff проверки это понимают), не ValueError."""
-    try:
-        with client.get_stream(
-            local_server.url + "/huge-length", deadline_s=2, cancel=threading.Event()
-        ) as response:
-            b"".join(response.iter_chunks(16))
-    except NetworkError as error:
-        assert error.code in ("short-read", "host-unreachable")
+    """5000 цифр в Content-Length не роняют int(): тело читается до закрытия."""
+    with client.get_stream(
+        local_server.url + "/huge-length", deadline_s=2, cancel=threading.Event()
+    ) as response:
+        assert b"".join(response.iter_chunks(16)) == b"hello"
 
 
 def test_limit_before_truncation_is_not_short_read(

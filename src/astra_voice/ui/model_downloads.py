@@ -1160,6 +1160,18 @@ class ModelDownloads(QObject):
                 log.debug("Не удалось проверить отзыв версии модели по снимку", exc_info=True)
             return False
 
+    def _can_retry(
+        self, entry: Any, state: str | None = None, *, installed_revision: bool = False
+    ) -> bool:
+        """Проверяет доступность повтора; карточка учитывает установленную ревизию."""
+        if state is None:
+            state = self._card_states.get(entry.id)
+        return (
+            not entry.removed_from_catalog
+            and state in {"failed", "paused-no-space"}
+            and not self._is_revoked(entry, None if installed_revision else entry.revision)
+        )
+
     def _user_offline(self) -> bool:
         """Сейчас действует офлайн-режим (пользователь или окружение запуска)."""
         refusal = getattr(self._model, "refusal", None)
@@ -1483,8 +1495,8 @@ class ModelDownloads(QObject):
                 "state": (state := self._card_state(entry, installed)),
                 "message": self._card_message(entry, state),
                 "canCancel": state in {"downloading", "paused-no-space"},
-                # Отозванную версию не перекачиваем: «Повторить» у неё не показывается.
-                "canRetry": state in {"failed", "paused-no-space"} and not self._is_revoked(entry),
+                # Карточка сохраняет проверку отзыва установленной ревизии.
+                "canRetry": self._can_retry(entry, state, installed_revision=True),
                 "canDequeue": state == "queued",
                 **self._card_extras(entry, installed, total),
                 "progress": self._card_progress.get(entry.id, 0.0),
@@ -1763,12 +1775,7 @@ class ModelDownloads(QObject):
         if self._switching_entry is not None or self._rechecking:
             return
         entry = next((entry for entry in self._entries if entry.id == model_id), None)
-        if (
-            entry is not None
-            and not entry.removed_from_catalog
-            and self._card_states.get(model_id) in {"failed", "paused-no-space"}
-            and not self._is_revoked(entry, entry.revision)
-        ):
+        if entry is not None and self._can_retry(entry):
             if self._card_states.get(model_id) == "paused-no-space":
                 if self._model is None or not self._model.disk_ok(
                     _remaining_download_bytes(self._model, entry)
@@ -1791,10 +1798,12 @@ class ModelDownloads(QObject):
         После неудачи запись выходит из выбора, поэтому ``startSelectedDownloads``
         её не видит. Порядок — каталога, не порядка ошибок: первая запись начинает
         очередь, остальные встают за ней; во время загрузки — в конец очереди.
-        Отозванные и снятые с каталога записи ``retryModel`` пропускает сам.
+        Отозванные и снятые с каталога записи не попадают в список повтора.
         """
         failed = [
-            entry.id for entry in self._entries if self._card_states.get(entry.id) == "failed"
+            entry.id
+            for entry in self._entries
+            if self._card_states.get(entry.id) == "failed" and self._can_retry(entry)
         ]
         for model_id in failed:
             self.retryModel(model_id)

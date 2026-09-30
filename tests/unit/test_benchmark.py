@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import pytest
 
+import astra_voice.worker.main as worker_main
 import astra_voice.worker.state as worker_state
 from astra_voice.core.measurements import read_measurements, saved_rtfx
 from astra_voice.core.version import __version__
@@ -172,6 +173,50 @@ def test_probe_rejects_empty_text(bench: dict[str, Any], monkeypatch: pytest.Mon
         bench["run_probe"](
             **probe_options(engine_factory=lambda layout: BenchEngine(" "), limits=lambda mb: None)
         )
+
+
+def test_probe_main_exits_quietly_when_hardening_fails(
+    bench: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_probe(**options: Any) -> dict[str, Any]:
+        calls.append(options)
+        return {}
+
+    monkeypatch.setattr(worker_main, "harden_process", lambda parent_pid: False)
+    bench["run_probe"] = fake_run_probe
+    probe_main = cast(Callable[[list[str]], int], bench["probe_main"])
+
+    code = probe_main(
+        [
+            "--id",
+            "a-model",
+            "--revision",
+            "r1",
+            "--layout",
+            "onnx-asr-gigaam-v3",
+            "--variant",
+            "v",
+            "--model-dir",
+            str(tmp_path / "model"),
+            "--wav",
+            str(tmp_path / "sample.wav"),
+            "--runs",
+            "5",
+            "--threads",
+            "1",
+            "--min-ram-mb",
+            "768",
+        ]
+    )
+
+    assert code == 0
+    assert capsys.readouterr().out == ""
+    assert calls == []
 
 
 def test_measures_models_and_writes_app_format(
@@ -354,18 +399,24 @@ def test_runs_below_five_rejected(bench: dict[str, Any], runs: str) -> None:
 
 
 LIMITS_SCRIPT = """
-import ctypes, json, resource, runpy, sys
+import ctypes, json, os, resource, runpy, sys
 namespace = runpy.run_path(sys.argv[1])
+from astra_voice.worker.main import harden_process
 globals_ = namespace["main"].__globals__
 globals_["apply_probe_limits"](2048)
-globals_["set_parent_death_signal"]()
+hardened = harden_process(os.getppid())
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 signal_number = ctypes.c_int(0)
 libc.prctl(2, ctypes.byref(signal_number), 0, 0, 0)  # PR_GET_PDEATHSIG
+with open("/proc/self/oom_score_adj", encoding="ascii") as oom_score_file:
+    oom_score_adj = oom_score_file.read().strip()
 print(json.dumps({
+    "hardened": hardened,
     "core": resource.getrlimit(resource.RLIMIT_CORE),
     "address_space": resource.getrlimit(resource.RLIMIT_AS),
     "pdeathsig": signal_number.value,
+    "dumpable": libc.prctl(3, 0, 0, 0, 0),  # PR_GET_DUMPABLE
+    "oom_score_adj": oom_score_adj,
 }))
 """
 
@@ -389,9 +440,12 @@ def test_probe_limits_match_worker(tmp_path: Path) -> None:
     requested = max(2048 * 3 * 1024 * 1024, MIN_ADDRESS_SPACE)
     expected = requested if hard == resource.RLIM_INFINITY else min(requested, hard)
 
+    assert facts["hardened"] is True
     assert facts["core"] == [0, 0]
     assert facts["address_space"][0] == expected
     assert facts["pdeathsig"] == signal.SIGTERM
+    assert facts["dumpable"] == 0
+    assert facts["oom_score_adj"] == "500"
 
 
 def test_missing_wav_exit_2(

@@ -7,6 +7,9 @@ astra_voice. Печатает только имена клавиш, коды и 
 Команды:
   app-pid                         pid своего процесса Astra Voice по точному argv
                                   из /proc/*/cmdline (0 — найден, 1 — нет)
+                                  только пакетная программа
+                                  /usr/lib/astra-voice/bootstrap.py;
+                                  запуск из исходников (venv) не видит
   offset                          размер журнала приложения (-1 — журнала нет)
   wait-start --offset N --timeout S
                                   ждёт «record.start отправлен» после смещения N:
@@ -305,7 +308,13 @@ def cmd_keymap(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("app-pid").set_defaults(run=cmd_app_pid)
+    commands.add_parser(
+        "app-pid",
+        help=(
+            "ищет только пакетную программу /usr/lib/astra-voice/bootstrap.py; "
+            "запуск из исходников (venv) не видит"
+        ),
+    ).set_defaults(run=cmd_app_pid)
     commands.add_parser("offset").set_defaults(run=cmd_offset)
     wait = commands.add_parser("wait-start")
     wait.add_argument("--offset", type=int, required=True)
