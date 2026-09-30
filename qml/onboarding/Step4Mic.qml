@@ -1,12 +1,14 @@
 // design/spec.md §4.5, §8.3, §10.4; макет шага 4.
 import QtQuick 2.15
 import QtQuick.Layouts 1.15
+import QtQuick.Window 2.15
 import ".."
 import "../components"
 
 Item {
     id: root
 
+    readonly property bool shown: root.visible && root.Window.window !== null && root.Window.window.visible
     readonly property var bridge: (typeof onboarding !== "undefined" && onboarding !== null) ? onboarding : null
     property string barHint: ""
     property bool skipEnabled: true
@@ -48,8 +50,8 @@ Item {
     // раз» считала бы, что измерение уже идёт, и молчала бы.
     onLevelStateChanged: if (root.levelState === "idle") root.levelMonitorRequested = false
 
-    Component.onCompleted: root.setLevelMonitoring(root.visible)
-    onVisibleChanged: root.setLevelMonitoring(root.visible)
+    Component.onCompleted: root.setLevelMonitoring(root.shown)
+    onShownChanged: root.setLevelMonitoring(root.shown)
     Component.onDestruction: root.setLevelMonitoring(false)
 
     function workingModelName() {
