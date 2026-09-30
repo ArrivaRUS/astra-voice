@@ -165,22 +165,24 @@ export QT_PLUGIN_PATH QML2_IMPORT_PATH
 # при создании приложения (проверено 29.09, offscreen). Меняем только кодировку: задан
 # LC_ALL — его на C.UTF-8; иначе только LC_CTYPE=C.UTF-8, чтобы язык сообщений (LC_MESSAGES,
 # LANG) остался прежним. Внешним программам childenv вернёт исходные значения.
-if printf '%s' "$HERE" | LC_ALL=C grep -q '[^ -~]'; then
-    case $(locale charmap 2>/dev/null) in
-        UTF-8 | utf8) ;;
-        *)
-            if [ -n "${LC_ALL:-}" ]; then
-                save_originals LC_ALL
-                LC_ALL=C.UTF-8
-                export LC_ALL
-            else
-                save_originals LC_CTYPE
-                LC_CTYPE=C.UTF-8
-                export LC_CTYPE
-            fi
-            ;;
-    esac
-fi
+case $HERE in
+    *[!\ -~]*)
+        case $(locale charmap 2>/dev/null) in
+            UTF-8 | utf8) ;;
+            *)
+                if [ -n "${LC_ALL:-}" ]; then
+                    save_originals LC_ALL
+                    LC_ALL=C.UTF-8
+                    export LC_ALL
+                else
+                    save_originals LC_CTYPE
+                    LC_CTYPE=C.UTF-8
+                    export LC_CTYPE
+                fi
+                ;;
+        esac
+        ;;
+esac
 
 installed_ok() {
     [ -d "$TARGET" ] && [ ! -L "$TARGET" ] && [ -f "$TARGET/.installed-ok" ] &&
