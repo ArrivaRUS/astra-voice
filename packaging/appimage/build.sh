@@ -106,16 +106,11 @@ input_ok() {
 # репозитория, отпечаток из lock.
 verify_runtime() {
     [ -f "$RUNTIME_KEYRING" ] || die "нет ключа подписи runtime: $RUNTIME_KEYRING"
-    local want status validsig
+    local want
     want=$(lockq get runtime-key)
-    status=$(gpgv --status-fd 1 --keyring "$RUNTIME_KEYRING" \
-        "$DOWNLOADS/runtime-x86_64.sig" "$DOWNLOADS/runtime-x86_64" 2>/dev/null) ||
+    python3 "$HERE/debverify.py" verify-sig --keyring "$RUNTIME_KEYRING" --want-fpr "$want" \
+        "$DOWNLOADS/runtime-x86_64.sig" "$DOWNLOADS/runtime-x86_64" ||
         die 'подпись runtime-x86_64 не прошла проверку gpgv'
-    validsig=$(printf '%s\n' "$status" | awk '$2 == "VALIDSIG" {print $3, $NF}')
-    case " $validsig " in
-        *" $want "*) say "подпись runtime: ключ $want" ;;
-        *) die "runtime-x86_64 подписан не ключом $want (VALIDSIG: ${validsig:-нет})" ;;
-    esac
 }
 
 # Теги колёс целевого интерпретатора: CPython 3.11 x86_64 (и для download, и для --target).

@@ -54,6 +54,20 @@ numpy==1.24.2 \\
 # --- lock ---------------------------------------------------------------------
 
 
+def test_runtime_signature_uses_debverify() -> None:
+    """T-190: runtime использует общий разбор статусов, без собственного awk."""
+    build = (ROOT / "packaging/appimage/build.sh").read_text(encoding="utf-8")
+    runtime = build.split("verify_runtime() {", 1)[1].split("\n}", 1)[0]
+    assert '[ -f "$RUNTIME_KEYRING" ] || die' in runtime
+    assert "want=$(lockq get runtime-key)" in runtime
+    assert 'python3 "$HERE/debverify.py" verify-sig' in runtime
+    assert '--keyring "$RUNTIME_KEYRING" --want-fpr "$want"' in runtime
+    assert '"$DOWNLOADS/runtime-x86_64.sig" "$DOWNLOADS/runtime-x86_64" ||' in runtime
+    assert "die 'подпись runtime-x86_64" in runtime
+    assert "awk" not in runtime
+    assert "VALIDSIG" not in runtime
+
+
 def test_real_lock_parses_with_pins_from_t1() -> None:
     lock = lockfile.load(LOCK)
     # «Ревизия 3»: база Debian 12, OpenSSL 3 с хоста, порог glibc гибрида.
