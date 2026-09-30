@@ -1880,7 +1880,8 @@ def test_capture_bounds_label_in_event_and_log(
     prefix = "Источник записи готов: "
     suffix = " t_ms=0"
     assert caplog.messages == [
-        prefix + "М" * (MAX_DEVICE_LABEL - len(prefix) - len(suffix) - 1) + "…" + suffix
+        prefix + "М" * (MAX_DEVICE_LABEL - len(prefix) - len(suffix) - 1) + "…" + suffix,
+        "Первый звук после готовности источника не пришёл: нулевых порций=0",
     ]
     assert len(caplog.messages[0]) == MAX_DEVICE_LABEL
     assert label not in caplog.text
@@ -3348,6 +3349,23 @@ def test_first_sound_after_ready_is_logged_without_content(
     assert len(probe.samples) == 13
 
 
+def test_first_sound_never_arrives_is_logged_once(
+    wait_capture: Callable[[], None],
+    probes: list[CaptureProbe],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = _ColdSource(lambda: None, zeros=0)
+    source._chunks = [bytes(CHUNK_BYTES)] * 3
+    probe = CaptureProbe(source)
+    probes.append(probe)
+    with caplog.at_level(logging.INFO, logger="astra_voice.worker.audio"):
+        probe.capture.start("silent", None, limit_s=5)
+        wait_capture()
+    lines = [r.getMessage() for r in caplog.records if "Первый звук" in r.getMessage()]
+    assert lines == ["Первый звук после готовности источника не пришёл: нулевых порций=3"]
+    assert len(probe.samples) == 3
+
+
 def test_warm_up_runs_once_and_not_during_recording(
     wait_capture: Callable[[], None], probes: list[CaptureProbe]
 ) -> None:
@@ -3358,3 +3376,25 @@ def test_warm_up_runs_once_and_not_during_recording(
     assert probe.capture.warm_up("mic") is False
     wait_capture()
     assert source.warmed == ["mic"]
+
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockingColdSource(_ColdSource):
+        def read_chunk(self) -> bytes | None:
+            entered.set()
+            assert release.wait(TIMEOUT)
+            return None
+
+    recording_source = BlockingColdSource(lambda: None, zeros=0)
+    recording_probe = CaptureProbe(recording_source)
+    probes.append(recording_probe)
+    recording_probe.capture.start("recording", None, limit_s=5)
+    try:
+        assert entered.wait(TIMEOUT)
+        assert recording_probe.capture.warm_up("mic") is False
+        assert recording_probe.capture._warmed is False
+        assert recording_source.warmed == []
+    finally:
+        recording_probe.capture.request_stop()
+        release.set()
+        wait_capture()

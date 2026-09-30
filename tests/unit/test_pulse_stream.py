@@ -1464,3 +1464,81 @@ def test_warm_up_never_creates_stream(fail: str | None, caplog: pytest.LogCaptur
     source.open(MIC.name)
     assert source.is_open
     source.close()
+
+
+def test_warm_up_api_unavailable_does_not_start_fallback() -> None:
+    primary = Mock(spec=ps.PulseStreamSource)
+    primary.warm_up.side_effect = audio.AudioApiUnavailable(audio.ERROR_FAILED, "secret")
+    simple = Mock()
+    fallback = Mock(return_value=simple)
+    source = ps.StreamWithFallback(primary, fallback=fallback)
+    with pytest.raises(audio.AudioApiUnavailable):
+        source.warm_up(None)
+    primary.warm_up.assert_called_once_with(None)
+    fallback.assert_not_called()
+    primary.open.assert_not_called()
+    simple.warm_up.assert_not_called()
+    simple.open.assert_not_called()
+
+
+def test_warm_up_factory_api_unavailable_keeps_its_code(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = ps.PulseStreamSource(
+        pulse_factory=Mock(side_effect=audio.AudioApiUnavailable("api-unavailable", "private")),
+        devices=lambda: [MIC],
+        default=lambda *_args, **_kwargs: MIC,
+    )
+    with caplog.at_level("INFO", logger=ps.__name__):
+        source.warm_up(None)
+    lines = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert len(lines) == 1 and lines[0].endswith("итог=api-unavailable")
+    assert "private" not in lines[0]
+
+
+def test_warm_up_context_timeout_releases_resources(caplog: pytest.LogCaptureFixture) -> None:
+    pulse = FakePulse()
+    pulse.hold_context = True
+    with caplog.at_level("INFO", logger=ps.__name__):
+        source_for(pulse).warm_up(None)
+    assert pulse.clock.now == pytest.approx(audio.OPEN_DEADLINE_S)
+    names = pulse.names()
+    assert names.count("context_disconnect") == 1
+    assert names.count("context_unref") == 1
+    assert names.count("mainloop_free") == 1
+    assert [r.getMessage() for r in caplog.records if r.levelname == "INFO"] == [
+        "Прогрев пути записи без микрофона: t_ms=2000 итог=audio-failed"
+    ]
+
+
+def test_warm_up_context_new_exception_does_not_leak_to_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    pulse = FakePulse()
+    pulse.fail["context_new"] = RuntimeError("private context failure")
+    with caplog.at_level("INFO", logger=ps.__name__):
+        source_for(pulse).warm_up(None)
+    assert pulse.names().count("mainloop_free") == 1
+    lines = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert len(lines) == 1 and lines[0].endswith("итог=audio-failed")
+    assert all("private context failure" not in line for line in lines)
+
+
+@pytest.mark.parametrize("service_fail", [False, True])
+def test_warm_up_select_error_still_connects_service(
+    service_fail: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    pulse = FakePulse()
+    if service_fail:
+        pulse.fail["context_connect"] = -1
+    with caplog.at_level("INFO", logger=ps.__name__):
+        source_for(pulse, devices=lambda: []).warm_up(MIC.name)
+    names = pulse.names()
+    assert names.count("context_connect") == 1
+    if not service_fail:
+        assert ps.PA_CONTEXT_READY == pulse.context_state
+    assert "stream_new" not in names
+    lines = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    result = "audio-failed" if service_fail else "ok"
+    assert len(lines) == 1 and lines[0].endswith(f"итог=device-audio-no-device,service-{result}")
+    assert all("Выбранный микрофон" not in line for line in lines)

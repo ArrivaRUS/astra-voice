@@ -1,4 +1,4 @@
-"""Запись через собственный pa_stream; всем соединением владеет поток захвата."""
+"""Запись через pa_stream; прогрев в audio-warmup создаёт отдельное соединение."""
 
 from __future__ import annotations
 
@@ -359,7 +359,11 @@ class _Event:
 
 
 class PulseStreamSource:
-    """Управляемый источник PCM16 без собственных потоков и фоновых соединений."""
+    """Управляемый источник PCM16 без собственных потоков и фоновых соединений.
+
+    warm_up вызывается из audio-warmup: он читает только неизменяемые после __init__
+    _factory, _devices, _default и _clock и создаёт своё соединение локально.
+    """
 
     def __init__(
         self,
@@ -491,7 +495,8 @@ class PulseStreamSource:
                 self._default_mode = device is None
                 try:
                     self._connect(selected, budget)
-                    # Этапы холодного пути (жалоба 30.09): опрос устройств и соединение.
+                    # Подключение включает создание _PulseAsync (загрузку libpulse)
+                    # и паузы повторов.
                     logger.info(
                         "Источник записи открыт: %s выбор_ms=%d подключение_ms=%d попытка=%d",
                         selected.label,
@@ -530,25 +535,31 @@ class PulseStreamSource:
 
         pa_stream не создаётся (PRD §9.5 — микрофон только по действию человека).
         Состояние источника не трогает: свои mainloop и контекст, ошибки не выходят наружу.
+        Итог: ok; при ошибке устройства — device-<код>,service-<код или ok>;
+        при одной ошибке службы — её код. Текст исключений в INFO не пишется.
         """
         started = self._clock()
         budget = _OpenDeadline(self._clock, OPEN_DEADLINE_S)
         pulse: _PulseAsync | None = None
         mainloop = context = None
-        result = "ok"
+        device_result = "ok"
+        service_result = "ok"
         try:
 
             def devices_fn(*, deadline: _OpenDeadline | None) -> list[AudioDevice]:
                 return list_devices(deadline=deadline) if self._devices is None else self._devices()
 
-            select_device(
-                device,
-                devices_fn=devices_fn,
-                default_fn=self._default,
-                clock=self._clock,
-                deadline=budget,
-                use_cache=self._devices is None,
-            )
+            try:
+                select_device(
+                    device,
+                    devices_fn=devices_fn,
+                    default_fn=self._default,
+                    clock=self._clock,
+                    deadline=budget,
+                    use_cache=self._devices is None,
+                )
+            except AudioError as exc:
+                device_result = exc.code
             pulse = self._factory()
             mainloop = pulse.mainloop_new()
             if not mainloop:
@@ -565,12 +576,12 @@ class PulseStreamSource:
                     raise _PulseFailure
                 pulse.iterate(max(1, int(budget.remaining(0.050) * 1_000_000)))
         except AudioError as exc:
-            result = exc.code
+            service_result = exc.code
         except _PulseFailure:
-            result = ERROR_FAILED
+            service_result = ERROR_FAILED
         except Exception:  # noqa: BLE001 — прогрев никогда не роняет воркер
             logger.debug("Прогрев пути записи: сбой", exc_info=True)
-            result = ERROR_FAILED
+            service_result = ERROR_FAILED
         finally:
             if pulse is not None:
                 if context:
@@ -579,9 +590,14 @@ class PulseStreamSource:
                 if mainloop:
                     pulse.mainloop_free(mainloop)
                 pulse.mainloop = None
+        result = (
+            f"device-{device_result},service-{service_result}"
+            if device_result != "ok"
+            else service_result
+        )
         logger.info(
             "Прогрев пути записи без микрофона: t_ms=%d итог=%s",
-            int((self._clock() - started) * 1000),
+            round((self._clock() - started) * 1000),
             result,
         )
 

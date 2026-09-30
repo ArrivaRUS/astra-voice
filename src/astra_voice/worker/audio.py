@@ -873,74 +873,82 @@ class AudioCapture:
         zero_since: float | None = self._clock()
         silent_sent = False
         last_level: float | None = None
-        while running.is_set():
-            if self._clock() >= deadline:
-                return
-            chunk = self._source.read_chunk()
-            if chunk is None and getattr(self._source, "device_change", None) is not None:
-                return
-            if not running.is_set() or self._clock() >= deadline:
-                return
-            if chunk == b"":
-                continue
-            if chunk is None:
-                if self._source.ended:
+        try:
+            while running.is_set():
+                if self._clock() >= deadline:
                     return
-                self._source.close()
-                raise AudioError(ERROR_FAILED, "Запись звука прервалась.")
-            with self._watchdog_lock:
-                # Порция пришла: сторож «ни одного отсчёта» больше не нужен.
-                self._first_chunk_deadline = None
-            samples = array("h")
-            samples.frombytes(chunk)
-            if sys.byteorder != "little":
-                samples.byteswap()
-            peak = max((abs(sample) for sample in samples), default=0)
-            if not first_logged:
-                if peak == 0:
-                    zero_chunks += 1
-                else:
-                    first_logged = True
-                    assert ready_at is not None
-                    logger.info(
-                        "Первый звук после готовности источника: t_ms=%d, нулевых порций=%d",
-                        round((self._clock() - ready_at) * 1000),
-                        zero_chunks,
-                    )
-            rms = (
-                math.sqrt(sum(sample * sample for sample in samples) / len(samples))
-                if samples
-                else 0.0
-            )
-            if not self._on_samples(uid, normalize(chunk)) or not running.is_set():
-                return
-            now = self._clock()
-            peak_dbfs = dbfs(peak)
-            if last_level is None or now - last_level >= 1 / LEVEL_RATE_HZ:
-                self._on_event(
-                    {
-                        "type": "level",
-                        "utterance_id": uid,
-                        "rms_dbfs": dbfs(rms),
-                        "peak_dbfs": peak_dbfs,
-                    }
+                chunk = self._source.read_chunk()
+                if chunk is None and getattr(self._source, "device_change", None) is not None:
+                    return
+                if not running.is_set() or self._clock() >= deadline:
+                    return
+                if chunk == b"":
+                    continue
+                if chunk is None:
+                    if self._source.ended:
+                        return
+                    self._source.close()
+                    raise AudioError(ERROR_FAILED, "Запись звука прервалась.")
+                with self._watchdog_lock:
+                    # Порция пришла: сторож «ни одного отсчёта» больше не нужен.
+                    self._first_chunk_deadline = None
+                samples = array("h")
+                samples.frombytes(chunk)
+                if sys.byteorder != "little":
+                    samples.byteswap()
+                peak = max((abs(sample) for sample in samples), default=0)
+                if not first_logged:
+                    if peak == 0:
+                        zero_chunks += 1
+                    else:
+                        first_logged = True
+                        assert ready_at is not None
+                        logger.info(
+                            "Первый звук после готовности источника: t_ms=%d, нулевых порций=%d",
+                            round((self._clock() - ready_at) * 1000),
+                            zero_chunks,
+                        )
+                rms = (
+                    math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+                    if samples
+                    else 0.0
                 )
-                last_level = now
-            if peak > 0 or not samples or not self._source.live:
-                zero_since = None
-            else:
-                if zero_since is None:
-                    zero_since = now
-                if now - zero_since >= ZERO_SAMPLES_HOLD_S:
-                    # Ровные нули столько времени даёт только заглушённый источник;
-                    # у живого микрофона всегда есть собственный шум.
-                    invalidate_device_cache()
-                    raise AudioError(ERROR_SILENT, SILENT_MESSAGE)
-            if peak_dbfs >= SILENCE_DBFS:
-                silence_since = now
-            elif not silent_sent and now - silence_since >= SILENCE_HOLD_S:
-                self._on_event({"type": "silent", "utterance_id": uid})
-                silent_sent = True
+                if not self._on_samples(uid, normalize(chunk)) or not running.is_set():
+                    return
+                now = self._clock()
+                peak_dbfs = dbfs(peak)
+                if last_level is None or now - last_level >= 1 / LEVEL_RATE_HZ:
+                    self._on_event(
+                        {
+                            "type": "level",
+                            "utterance_id": uid,
+                            "rms_dbfs": dbfs(rms),
+                            "peak_dbfs": peak_dbfs,
+                        }
+                    )
+                    last_level = now
+                if peak > 0 or not samples or not self._source.live:
+                    zero_since = None
+                else:
+                    if zero_since is None:
+                        zero_since = now
+                    if now - zero_since >= ZERO_SAMPLES_HOLD_S:
+                        # Ровные нули столько времени даёт только заглушённый источник;
+                        # у живого микрофона всегда есть собственный шум.
+                        invalidate_device_cache()
+                        raise AudioError(ERROR_SILENT, SILENT_MESSAGE)
+                if peak_dbfs >= SILENCE_DBFS:
+                    silence_since = now
+                elif not silent_sent and now - silence_since >= SILENCE_HOLD_S:
+                    self._on_event({"type": "silent", "utterance_id": uid})
+                    silent_sent = True
+
+        finally:
+            if not first_logged:
+                logger.info(
+                    "Первый звук после готовности источника не пришёл: нулевых порций=%d",
+                    zero_chunks,
+                )
 
     def _report_device_change(
         self, uid: str, change: DeviceChange, cancelled: threading.Event | None = None
