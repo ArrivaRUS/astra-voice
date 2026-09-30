@@ -77,6 +77,10 @@ from astra_voice.worker.audio import AudioDevice, AudioError
 from helpers.model_rig import FakeModelPort, ModelRig, model_rig_session
 
 pytestmark = pytest.mark.unit
+MICROPHONE_ERROR = (
+    "Не удалось изменить громкость: звуковая служба не отвечает. "
+    "Попробуйте ещё раз или обратитесь к администратору."
+)
 
 
 def _autostart_state(enabled: bool) -> AutostartState:
@@ -1063,9 +1067,7 @@ def test_raise_microphone_volume_failure_and_recovery(raises: bool) -> None:
     errors = QSignalSpy(bridge.microphoneErrorChanged)
     save_errors = QSignalSpy(bridge.saveErrorChanged)
     bridge.raiseMicrophoneVolume()
-    assert bridge.microphoneError == (
-        "Не удалось изменить громкость: звуковая служба не отвечает. Попробуйте ещё раз."
-    )
+    assert bridge.microphoneError == MICROPHONE_ERROR
     assert bridge.saveError == "" and len(save_errors) == 0
     assert len(errors) == 1
     apply.raise_microphone_volume.side_effect = None
@@ -1104,9 +1106,7 @@ def test_set_microphone_volume_failure_and_recovery(raises: bool) -> None:
     save_errors = QSignalSpy(bridge.saveErrorChanged)
     microphone = QSignalSpy(bridge.microphoneChanged)
     bridge.setMicrophoneVolume(40)
-    assert bridge.microphoneError == (
-        "Не удалось изменить громкость: звуковая служба не отвечает. Попробуйте ещё раз."
-    )
+    assert bridge.microphoneError == MICROPHONE_ERROR
     assert bridge.saveError == "" and len(save_errors) == 0
     assert len(errors) == 1
     assert len(microphone) == 1
@@ -1165,6 +1165,39 @@ def test_device_change_notifies_when_restore_is_cleared() -> None:
     assert len(spy) == 1
 
 
+def test_device_change_clears_microphone_error() -> None:
+    apply = Mock(spec=SettingsApply)
+    apply.has_volume_control = True
+    apply.microphone_state.return_value = MicrophoneState()
+    apply.set_microphone_volume.return_value = False
+    bridge = SettingsBridge(Settings(), apply=apply, save=Mock())
+    bridge.setMicrophoneVolume(40)
+    assert bridge.microphoneError == MICROPHONE_ERROR
+    errors = QSignalSpy(bridge.microphoneErrorChanged)
+    set_qt_property(bridge, "device", "mic")
+    assert bridge.microphoneError == ""
+    assert len(errors) == 1
+
+
+@pytest.mark.parametrize("previous_error", [False, True])
+def test_microphone_restore_unavailable_does_not_set_error(previous_error: bool) -> None:
+    apply = Mock(spec=SettingsApply)
+    apply.has_volume_control = True
+    apply.can_restore_microphone_volume = False
+    apply.microphone_state.return_value = MicrophoneState()
+    apply.set_microphone_volume.return_value = False
+    apply.restore_microphone_volume.return_value = False
+    bridge = SettingsBridge(Settings(), apply=apply, save=Mock())
+    if previous_error:
+        bridge.setMicrophoneVolume(40)
+    errors = QSignalSpy(bridge.microphoneErrorChanged)
+    microphone = QSignalSpy(bridge.microphoneChanged)
+    bridge.restoreMicrophoneVolume()
+    assert bridge.microphoneError == (MICROPHONE_ERROR if previous_error else "")
+    assert len(errors) == 0
+    assert len(microphone) == 1
+
+
 @pytest.mark.parametrize("raises", [False, True])
 def test_microphone_restore_failure_sets_microphone_error(raises: bool) -> None:
     apply = Mock(spec=SettingsApply)
@@ -1178,9 +1211,7 @@ def test_microphone_restore_failure_sets_microphone_error(raises: bool) -> None:
     save_errors = QSignalSpy(bridge.saveErrorChanged)
     microphone = QSignalSpy(bridge.microphoneChanged)
     bridge.restoreMicrophoneVolume()
-    assert bridge.microphoneError == (
-        "Не удалось изменить громкость: звуковая служба не отвечает. Попробуйте ещё раз."
-    )
+    assert bridge.microphoneError == MICROPHONE_ERROR
     assert bridge.saveError == "" and len(save_errors) == 0
     assert len(errors) == 1
     assert len(microphone) == 1
@@ -1190,6 +1221,21 @@ def test_microphone_restore_failure_sets_microphone_error(raises: bool) -> None:
     assert bridge.microphoneError == ""
     assert bridge.saveError == "" and len(save_errors) == 0
     assert len(errors) == 2
+
+
+def test_microphone_restore_reports_error_when_availability_check_raises() -> None:
+    apply = Mock(spec=SettingsApply)
+    apply.has_volume_control = True
+    type(apply).can_restore_microphone_volume = property(
+        lambda _: (_ for _ in ()).throw(RuntimeError("private"))
+    )
+    apply.microphone_state.return_value = MicrophoneState()
+    apply.restore_microphone_volume.return_value = False
+    bridge = SettingsBridge(Settings(), apply=apply, save=Mock())
+    errors = QSignalSpy(bridge.microphoneErrorChanged)
+    bridge.restoreMicrophoneVolume()
+    assert bridge.microphoneError == MICROPHONE_ERROR
+    assert len(errors) == 1
 
 
 def test_microphone_restore_without_apply_is_noop() -> None:

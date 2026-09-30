@@ -634,6 +634,7 @@ class SettingsBridge(QObject):
                 )
             elif name == "device":
                 self._apply.device(self.device or None)
+                self._set_microphone_error(False)
                 self.refreshMicrophone()
                 self.microphoneChanged.emit()
         getattr(self, name + "Changed").emit()
@@ -853,7 +854,8 @@ class SettingsBridge(QObject):
 
     def _set_microphone_error(self, failed: bool) -> None:
         error = (
-            "Не удалось изменить громкость: звуковая служба не отвечает. Попробуйте ещё раз."
+            "Не удалось изменить громкость: звуковая служба не отвечает. "
+            "Попробуйте ещё раз или обратитесь к администратору."
             if failed
             else ""
         )
@@ -890,7 +892,14 @@ class SettingsBridge(QObject):
             restored = False
         if not restored:
             log.warning("Не удалось вернуть громкость микрофона")
-        self._set_microphone_error(not restored)
+            try:
+                can_restore = bool(self._apply.can_restore_microphone_volume)
+            except Exception:
+                can_restore = True
+            if can_restore:
+                self._set_microphone_error(True)
+        else:
+            self._set_microphone_error(False)
         try:
             self.refreshMicrophone()
         except Exception:
