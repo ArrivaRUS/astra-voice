@@ -51,6 +51,7 @@ from astra_voice.platform.hotkey import (
     HotkeyManager,
     HotkeyMode,
     HotkeyState,
+    MappingEvent,
     ResultCode,
 )
 from astra_voice.platform.paste import PasteMode, PasteOutcomeKind, normalize
@@ -72,6 +73,10 @@ from astra_voice.worker.supervisor import WorkerSupervisor
 
 pytestmark = pytest.mark.unit
 MARKER = "ГЕЛИОТРОП-7"
+GIGAAM_RTFX = 42.5
+# Сторож рантайма 3 с, супервизор ждёт на полсекунды дольше.
+SELFCHECK_SUPERVISOR_S = 3.5
+WHISPER_TURBO_RTFX = 3.9
 
 
 def test_measure_send_failure_still_saves_five_warm_runs(
@@ -325,6 +330,8 @@ class Rig:
             capture_watchdog_factory=self.capture_watchdog_factory,
             sound_factory=lambda kind: self.sound,
         )
+        # Скорость GigaAM из каталога: дедлайн самопроверки — нижняя граница.
+        self.runtime.set_catalog_rtfx(lambda model_id: GIGAAM_RTFX)
 
     def create_capture_watchdog(self) -> Mock:
         watchdog = Mock(active=False)
@@ -439,10 +446,27 @@ def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_k
                 device="USB-гарнитура",
                 changed="Источник звука изменился: USB-гарнитура",
             )
+            # A6: смена между диктовками объявляется как выбор, не «Микрофон сменился».
             assert rig.notify.mock_calls == [
                 call.notify_microphone_selected("Встроенный микрофон"),
-                call.notify_microphone_changed("USB-гарнитура"),
+                call.notify_microphone_selected("USB-гарнитура"),
             ]
+
+
+@pytest.mark.parametrize("kind", ["switched", "device-lost"])
+def test_microphone_change_during_recording_wiring(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """S5-A5 D2: смена микрофона посреди записи доходит до штатных уведомлений."""
+    rig = Rig(monkeypatch)
+    rig.runtime.start()
+    rig.hotkey.fsm.press(rig.now)
+    fields = {"label": "Встроенный микрофон"} if kind == "switched" else {}
+    rig.event(type="audio.device.changed", kind=kind, audio_ms=2000, **fields)
+    if kind == "switched":
+        assert rig.notify.mock_calls == [call.notify_microphone_changed("Встроенный микрофон")]
+    else:
+        assert rig.notify.mock_calls == [call.notify_microphone_lost(during_recording=True)]
 
 
 @pytest.mark.parametrize(
@@ -797,8 +821,11 @@ def test_seamless_switch_candidate_outcome(
         old.stop.assert_called_once_with()
         finished.assert_not_called()
         assert rig.runtime._switch_active()
-        assert rig.runtime._switch_timer is switch_timer
-        assert switch_timer is not None and switch_timer.active and not switch_timer.deleted
+        # Продвижение взводит сторож заново на полный срок обеих самопроверок.
+        rearmed = rig.runtime._switch_timer
+        assert rearmed is not None and rearmed is not switch_timer
+        assert switch_timer is not None and switch_timer.deleted
+        assert rearmed.active and rearmed.interval == module.SWITCH_TIMEOUT_S * 1000
         finished.assert_not_called()
         callback(
             {
@@ -822,7 +849,7 @@ def test_seamless_switch_candidate_outcome(
     rig.runtime.shutdown()
 
 
-def test_promoted_switch_watchdog_accepts_silent_selfcheck(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_promoted_switch_watchdog_rejects_silent_selfcheck(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
     rig.runtime.start()
     old = rig.supervisor
@@ -844,11 +871,57 @@ def test_promoted_switch_watchdog_accepts_silent_selfcheck(monkeypatch: pytest.M
     old.stop.assert_called_once_with()
 
     timer.fire()
-    finished.assert_called_once_with("ok")
+    assert rig.runtime._switch_timer is not None and rig.runtime._switch_timer is not timer
+    rig.runtime._switch_timer.fire()
+    # Молчащая самопроверка не делает модель рабочей. Здесь откат не меняет модель
+    # (она задана в настройках), поэтому перезапуска нет, а ошибка видна.
+    finished.assert_called_once_with("failed")
     assert not rig.runtime._switch_active()
     assert rig.runtime.supervisor is candidate
-    candidate.stop.assert_not_called()
     assert rig.supervisor_factory.call_count == 2
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("mode", ("paused", "promoted"))
+def test_switch_watchdog_without_rollback_allows_tray_recheck(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """P3 из #12: откат невозможен (current.json не записался), старт воркера завис.
+
+    Ошибка видна, и самопроверка переводится в failed: иначе «Проверить модель ещё
+    раз» в трее ничего не делает, а сторож самопроверки продвинутого кандидата
+    позже сам перезапускает воркер уже после показанной ошибки.
+    """
+    rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+    rig.runtime.start()
+    replacement = Mock(state="running", generation=1)
+    rig.supervisor_factory.return_value = replacement
+    finished = Mock()
+    rig.runtime.on_switch_finished = finished
+    if mode == "paused":
+        rig.runtime.switch_model(min_ram_mb=100, pause=True)
+    else:
+        monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
+        rig.runtime.switch_model(min_ram_mb=100)
+        callback = rig.supervisor_factory.call_args.kwargs["on_event"]
+        callback({"type": "hello", "generation": replacement.generation})
+        callback({"type": "model.loaded", "generation": replacement.generation})
+        assert rig.runtime.supervisor is replacement
+        assert rig.runtime._selfcheck == "running"
+    timer = rig.runtime._switch_timer
+    assert timer is not None
+    # Для продвинутого кандидата это уже сторож, взведённый заново при продвижении.
+    timer.fire()
+    finished.assert_called_once_with("failed")
+    assert not rig.runtime._switch_active()
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    assert rig.runtime._selfcheck == "failed"
+    assert rig.runtime._selfcheck_timer is None
+    rig.tray.set_model_recheck_enabled.assert_called_with(True)
+    starts = rig.supervisor_factory.call_count
+    rig.runtime._recheck_model()
+    assert rig.supervisor_factory.call_count == starts + 1
     rig.runtime.shutdown()
 
 
@@ -906,12 +979,15 @@ def test_paused_switch_watchdog_stops_unresponsive_worker(monkeypatch: pytest.Mo
     replacement = Mock(state="running", generation=1)
     rig.supervisor_factory.return_value = replacement
     recovered = Mock(state="running", generation=1)
+    current = ["whisper"]
+    monkeypatch.setattr(rig.runtime, "_resolve_model_request", lambda: _switch_request(current[0]))
 
     def rolled_back(result: str) -> None:
         assert result == "failed"
         assert rig.runtime.supervisor is replacement
         assert rig.supervisor_factory.call_count == 2
         rig.supervisor_factory.return_value = recovered
+        current[0] = "gigaam"
 
     finished = Mock(side_effect=rolled_back)
     rig.runtime.on_switch_finished = finished
@@ -2069,6 +2145,310 @@ def test_regrab_restores_real_hotkey_manager(
     rig.stats.append.assert_any_call("hotkey_grab", key_role="text", result="regrabbed", attempts=2)
 
 
+def mapping_rig(
+    monkeypatch: pytest.MonkeyPatch, mode: HotkeyMode = HotkeyMode.PTT
+) -> tuple[Rig, HotkeyManager, Mock, list[Any]]:
+    """Настоящий HotkeyManager: очередь бэкенда отдаёт пакеты MappingNotify и клавиш."""
+    backend = Mock(spec=HotkeyBackend)
+    backend.grab_combo.return_value = GrabResult("ok", keycode=65, mods=4)
+    backend.grab_escape.return_value = GrabResult("ok", keycode=9)
+    backend.ungrab_combo.return_value = GrabResult("ok")
+    backend.fileno.return_value = 17
+    batches: list[Any] = []
+    backend.poll_events.side_effect = lambda timeout=0.0: (
+        [] if timeout or not batches else batches.pop(0)
+    )
+    hotkey = HotkeyManager(backend)
+    rig = Rig(monkeypatch, Settings(hotkey_mode=mode.value), hotkey_factory=lambda: hotkey)
+    rig.runtime.start()
+    assert rig.runtime._regrab_timer is None
+    rig.tray.set_state.reset_mock()
+    return rig, hotkey, backend, batches
+
+
+def mapping(code: ResultCode) -> MappingEvent:
+    return MappingEvent({"Ctrl+Space": GrabResult(code)}, None, "keyboard", 8, 248, True)
+
+
+def mapping_ok() -> MappingEvent:
+    ok = GrabResult("ok", keycode=65, mods=4)
+    return MappingEvent({"Ctrl+Space": ok}, None, "keyboard", 8, 248, False, False, True)
+
+
+def feed(rig: Rig, batches: list[Any], *events: object) -> None:
+    batches.append(list(events))
+    rig.runtime._process_hotkey()
+
+
+def runtime_timer(rig: Rig, timer: object) -> FakeTimer:
+    """FakeTimer, который runtime хранит под типом QTimer."""
+    return next(fake for fake in rig.timers if fake is timer)
+
+
+@pytest.mark.parametrize("code", ["not-grabbed", "busy", "bad-combo"])
+def test_mapping_regrab_failure_warns_sets_nokey_and_retries(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, code: ResultCode
+) -> None:
+    """Регресс Мини-Ц2: отказ перезахвата после MappingNotify больше не молчит."""
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger=module.__name__):
+        feed(rig, batches, mapping(code))
+        # Повторный отказ той же потери: тот же таймер, DEBUG.
+        feed(rig, batches, mapping(code))
+    message = f"Горячая клавиша потеряна после смены раскладки ({code}), повтор каждые 30 с"
+    levels = [r.levelno for r in caplog.records if r.getMessage() == message]
+    assert levels == [logging.WARNING, logging.DEBUG]
+    rig.tray.set_state.assert_called_with(TrayState.NOKEY)
+    timer = runtime_timer(rig, rig.runtime._regrab_timer)
+    assert timer.active and timer.interval == module.REGRAB_INTERVAL_MS
+    # Всплывающее уведомление ждёт 5 с; одно на потерю.
+    notice = runtime_timer(rig, rig.runtime._lost_notice_timer)
+    assert notice.single_shot and notice.interval == module.HOTKEY_LOST_NOTICE_DELAY_MS
+    assert notice.timer_type is None
+    assert not rig.notify.mock_calls
+    rig.now += 5
+    notice.fire()
+    assert notice.deleted and rig.runtime._lost_notice_timer is None
+    # busy — «занята другой программой», прочие коды — простой текст без кодов.
+    if code == "busy":
+        assert rig.notify.mock_calls == [call.notify_hotkey_not_grabbed("Ctrl+Space")]
+    else:
+        assert rig.notify.mock_calls == [call.notify_hotkey_lost(code)]
+    # Тик таймера восстанавливает захват тем же grab(), без duplicate.
+    backend.grab_combo.reset_mock()
+    rig.now += 25
+    timer.fire()
+    backend.grab_combo.assert_called_once_with("Ctrl+Space")
+    assert rig.runtime._regrab_timer is None
+    rig.tray.set_state.assert_called_with(TrayState.IDLE)
+    rig.notify.notify_hotkey_regrabbed.assert_called_once_with("Ctrl+Space")
+    feed(rig, batches, HotkeyEvent("KeyPress", 65, 1000, mods=4))
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    assert "record.start" in rig.trace
+
+
+@pytest.mark.parametrize("lost_s", [2.0, 6.0])
+def test_mapping_regrab_ok_while_waiting_restores_and_stops_timer(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, lost_s: float
+) -> None:
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    feed(rig, batches, mapping("not-grabbed"))
+    timer = runtime_timer(rig, rig.runtime._regrab_timer)
+    notice = runtime_timer(rig, rig.runtime._lost_notice_timer)
+    if lost_s >= 5:
+        rig.now += 5
+        notice.fire()
+        rig.now += lost_s - 5
+    else:
+        rig.now += lost_s
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        caplog.clear()
+        feed(rig, batches, mapping_ok())
+    assert rig.runtime._regrab_timer is None
+    assert timer.deleted and not timer.active
+    assert notice.deleted and not notice.active and rig.runtime._lost_notice_timer is None
+    rig.tray.set_state.assert_called_with(TrayState.IDLE)
+    if lost_s < 5:
+        # Вернулся за 2 с — ни «потеряна», ни «снова работает».
+        assert not rig.notify.mock_calls
+        notice.fire()
+        assert not rig.notify.mock_calls
+    else:
+        assert rig.notify.mock_calls == [
+            call.notify_hotkey_lost("not-grabbed"),
+            call.notify_hotkey_regrabbed("Ctrl+Space"),
+        ]
+    assert [r.getMessage() for r in caplog.records if r.name == module.__name__] == [
+        "Горячая клавиша снова захвачена после смены раскладки: Ctrl+Space"
+    ]
+    # Обычный MappingNotify без изменений при живом захвате — ни таймера, ни уведомлений.
+    rig.notify.reset_mock()
+    feed(rig, batches, MappingEvent({"Ctrl+Space": mapping_ok().combos["Ctrl+Space"]}, None))
+    assert rig.runtime._regrab_timer is None
+    assert not rig.notify.mock_calls
+    feed(rig, batches, HotkeyEvent("KeyPress", 65, 1000, mods=4))
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+
+
+def lose_and_wait(rig: Rig, batches: list[Any], code: ResultCode = "not-grabbed") -> None:
+    feed(rig, batches, mapping(code))
+    rig.now += 5
+    runtime_timer(rig, rig.runtime._lost_notice_timer).fire()
+
+
+def test_mapping_lost_notification_is_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:
+    """«Потеряна» — не чаще раза в 60 с; «снова работает» — только для объявленной потери."""
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    lose_and_wait(rig, batches)
+    rig.now += 1
+    feed(rig, batches, mapping_ok())
+    assert rig.notify.mock_calls == [
+        call.notify_hotkey_lost("not-grabbed"),
+        call.notify_hotkey_regrabbed("Ctrl+Space"),
+    ]
+    rig.notify.reset_mock()
+    rig.now += 10
+    lose_and_wait(rig, batches)
+    rig.now += 10
+    feed(rig, batches, mapping_ok())
+    assert not rig.notify.mock_calls
+    assert rig.runtime._regrab_timer is None
+    rig.now += 60
+    lose_and_wait(rig, batches, "busy")
+    assert rig.notify.mock_calls == [call.notify_hotkey_not_grabbed("Ctrl+Space")]
+
+
+def lose_again_within_interval(rig: Rig, batches: list[Any]) -> FakeTimer:
+    """Потеря 1 объявлена и вернулась; потеря 2 через 20 с после объявления — отложена."""
+    lose_and_wait(rig, batches)
+    announced_at = rig.now
+    rig.now += 1
+    feed(rig, batches, mapping_ok())
+    assert rig.notify.mock_calls == [
+        call.notify_hotkey_lost("not-grabbed"),
+        call.notify_hotkey_regrabbed("Ctrl+Space"),
+    ]
+    rig.notify.reset_mock()
+    rig.now = announced_at + 15
+    lose_and_wait(rig, batches)
+    assert rig.now == announced_at + 20
+    # Лимит «раз в 60 с» не глушит потерю: таймер ждёт оставшиеся 40 с.
+    assert not rig.notify.mock_calls
+    deferred = runtime_timer(rig, rig.runtime._lost_notice_timer)
+    assert deferred.single_shot and deferred.active
+    assert deferred.interval == 40_000
+    # Точный таймер: грубый (±5 %) сработал бы раньше и перевзвёлся бы каскадом.
+    assert deferred.timer_type == Qt.TimerType.PreciseTimer
+    return deferred
+
+
+def test_mapping_second_long_loss_is_announced_after_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    deferred = lose_again_within_interval(rig, batches)
+    rig.now += 40
+    deferred.fire()
+    assert rig.notify.mock_calls == [call.notify_hotkey_lost("not-grabbed")]
+    assert deferred.deleted and rig.runtime._lost_notice_timer is None
+    # Объявленная потеря — при возврате «снова работает».
+    feed(rig, batches, mapping_ok())
+    assert rig.notify.mock_calls == [
+        call.notify_hotkey_lost("not-grabbed"),
+        call.notify_hotkey_regrabbed("Ctrl+Space"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_call"),
+    [
+        ("bad-combo", call.notify_hotkey_lost("bad-combo")),
+        ("busy", call.notify_hotkey_not_grabbed("Ctrl+Space")),
+    ],
+)
+def test_mapping_deferred_lost_notice_uses_latest_regrab_code(
+    monkeypatch: pytest.MonkeyPatch, code: ResultCode, expected_call: Any
+) -> None:
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    deferred = lose_again_within_interval(rig, batches)
+    backend.grab_combo.return_value = GrabResult(code)
+    runtime_timer(rig, rig.runtime._regrab_timer).fire()
+    rig.now += 40
+    deferred.fire()
+    assert rig.notify.mock_calls == [expected_call]
+
+
+@pytest.mark.parametrize("stop", ["regrab", "shutdown", "apply_hotkey"])
+def test_mapping_deferred_lost_notice_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    deferred = lose_again_within_interval(rig, batches)
+    rig.now += 10
+    if stop == "regrab":
+        feed(rig, batches, mapping_ok())
+    elif stop == "shutdown":
+        rig.runtime.shutdown()
+    else:
+        rig.runtime.apply_hotkey("Ctrl+Shift+Space", "ptt")
+    assert deferred.deleted and not deferred.active
+    assert rig.runtime._lost_notice_timer is None
+    rig.now += 30
+    deferred.fire()
+    rig.runtime._announce_hotkey_lost()  # Уже доставленный сигнал после удаления безопасен.
+    # Клавиша вернулась до конца интервала — ни «потеряна», ни «снова работает».
+    assert not rig.notify.notify_hotkey_lost.called
+    assert not rig.notify.notify_hotkey_not_grabbed.called
+    assert not rig.notify.notify_hotkey_regrabbed.called
+
+
+@pytest.mark.parametrize("stop", ["shutdown", "apply_hotkey"])
+def test_mapping_lost_notice_is_cancelled_by_shutdown_or_new_hotkey(
+    monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    feed(rig, batches, mapping("not-grabbed"))
+    notice = runtime_timer(rig, rig.runtime._lost_notice_timer)
+    rig.now += 2
+    if stop == "shutdown":
+        rig.runtime.shutdown()
+    else:
+        rig.runtime.apply_hotkey("Ctrl+Shift+Space", "ptt")
+    assert notice.deleted and not notice.active
+    assert rig.runtime._lost_notice_timer is None
+    rig.now += 10
+    notice.fire()
+    rig.runtime._announce_hotkey_lost()  # Уже доставленный сигнал после удаления безопасен.
+    rig.notify.notify_hotkey_lost.assert_not_called()
+    rig.notify.notify_hotkey_not_grabbed.assert_not_called()
+
+
+def test_mapping_lost_during_ptt_recording_stops_and_recognizes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Отпускания после потери захвата не будет: запись останавливается с хвостом."""
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch)
+    feed(rig, batches, HotkeyEvent("KeyPress", 65, 1000, mods=4))
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    rig.now += 2
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        feed(rig, batches, mapping("busy"))
+    assert "хоткей: запись остановлена: горячая клавиша потеряна" in [
+        r.getMessage() for r in caplog.records
+    ]
+    assert hotkey.fsm.state is HotkeyState.PROCESSING
+    rig.fire_tail()
+    assert "record.stop" in rig.trace
+    assert_phase(rig.runtime, DictationPhase.PROCESSING)
+    rig.tray.set_state.assert_any_call(TrayState.NOKEY)
+    assert rig.runtime._regrab_timer is not None
+    rig.event(type="result", text=MARKER)
+    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+
+
+def test_mapping_lost_during_toggle_recording_ends_with_next_press(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Переключение: запись идёт дальше, после восстановления её завершает нажатие."""
+    rig, hotkey, backend, batches = mapping_rig(monkeypatch, HotkeyMode.TOGGLE)
+    feed(rig, batches, HotkeyEvent("KeyPress", 65, 1000, mods=4))
+    feed(rig, batches, HotkeyEvent("KeyRelease", 65, 1100, mods=4))
+    rig.now += 2
+    feed(rig, batches, mapping("busy"))
+    assert hotkey.fsm.state is HotkeyState.RECORDING
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    assert "record.stop" not in rig.trace
+    rig.now += 30
+    runtime_timer(rig, rig.runtime._regrab_timer).fire()
+    assert rig.runtime._regrab_timer is None
+    assert hotkey.fsm.state is HotkeyState.RECORDING
+    feed(rig, batches, HotkeyEvent("KeyPress", 65, 2000, mods=4))
+    assert hotkey.fsm.state.value == HotkeyState.PROCESSING.value
+    rig.fire_tail()
+    assert "record.stop" in rig.trace
+    assert_phase(rig.runtime, DictationPhase.PROCESSING)
+
+
 @pytest.mark.parametrize("combo", ["Space", "Return", "A", "Shift+Space", "Ctrl", "Ctrl+A+B"])
 @pytest.mark.parametrize("code", ["ok", "busy"])
 @pytest.mark.parametrize("mode", list(HotkeyMode))
@@ -2892,17 +3272,16 @@ def test_selfcheck_waits_for_match_before_ready(
     checking_rig: Rig, smoke_wav: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     rig = checking_rig
-    assert module.SELFCHECK_TIMEOUT_S == 3.0
-    assert module.SELFCHECK_WATCHDOG_MS == 3000
+    assert module.SELFCHECK_MIN_S == 3.0
     rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
     rig.tray.set_model_recheck_enabled.assert_called_with(False)
     assert rig.runtime._loading_model
     assert rig.runtime._model_load_failures == 1
     rig.supervisor.send.assert_called_with(
-        {"type": "transcribe.file", "path": str(smoke_wav)}, timeout=module.SELFCHECK_TIMEOUT_S
+        {"type": "transcribe.file", "path": str(smoke_wav)}, timeout=SELFCHECK_SUPERVISOR_S
     )
     timer = rig.timers[-1]
-    assert timer.interval == module.SELFCHECK_WATCHDOG_MS
+    assert timer.interval == 3000
     rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
     rig.pill.hide.assert_not_called()
     rig.tray.set_state.assert_not_called()
@@ -3326,7 +3705,7 @@ def test_selfcheck_retry_uses_real_supervisor_correlation(
     else:
         if outcome == "timeout":
             first._accept({"type": "pong"}, 1)  # Живой воркер: timeout без рестарта.
-        rig.now += 3
+        rig.now += SELFCHECK_SUPERVISOR_S
         first._expire()
     second = rig.runtime.supervisor
     assert second.generation == 2
@@ -3715,7 +4094,7 @@ def test_selfcheck_tray_recheck_recovers_or_blocks_again(
     rig.pill.show_state.assert_called_with(PillState.LOADING_MODEL)
     rig.tray.set_model_recheck_enabled.assert_called_with(False)
     rig.supervisor.send.assert_called_with(
-        {"type": "transcribe.file", "path": str(smoke_wav)}, timeout=module.SELFCHECK_TIMEOUT_S
+        {"type": "transcribe.file", "path": str(smoke_wav)}, timeout=SELFCHECK_SUPERVISOR_S
     )
     assert [entry.args[0]["type"] for entry in rig.supervisor.send.call_args_list] == [
         "model.load",
@@ -4675,3 +5054,417 @@ def test_revoked_revision_blocks_microphone_test(monkeypatch: pytest.MonkeyPatch
 
     assert rig.runtime.start_test("alsa_input.usb", callback) is False
     assert callback.call_args.args[0].message == TEST_MODEL_UNAVAILABLE
+
+
+# --- Откат неудачного переключения к прежней модели ---
+
+
+def _switch_request(model_id: str) -> dict[str, Any]:
+    layout = "onnx-community-whisper" if model_id == "whisper" else "onnx-asr-gigaam-v3"
+    return {
+        "type": "model.load",
+        "id": model_id,
+        "revision": "r1",
+        "dir": f"/tmp/models/{model_id}/r1",
+        "layout": layout,
+        "variant": model_id,
+        "threads": 2,
+        "min_ram_mb": 500,
+    }
+
+
+class SwitchRig:
+    """Прежняя GigaAM проверена; подписчик при провале возвращает её в current.json."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, pause: bool = False) -> None:
+        self.rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
+        self.pause = pause
+        self.current = "gigaam"
+        runtime = self.rig.runtime
+        monkeypatch.setattr(runtime, "_resolve_model_request", self.request)
+        monkeypatch.setattr(runtime, "can_switch_without_pause", lambda minimum: True)
+        runtime.set_catalog_rtfx({"gigaam": GIGAAM_RTFX, "whisper": WHISPER_TURBO_RTFX}.get)
+        runtime.start()
+        self.rig.event(type="hello")
+        self.rig.event(type="model.loaded", id="gigaam")
+        self.rig.event(type="result", utterance_id="file", text="проверка связи")
+        assert runtime._selfcheck == "ok"
+        self.old = self.rig.supervisor
+        self.workers: list[Mock] = []
+        runtime._supervisor_factory = self.factory
+        self.finished = Mock(side_effect=self.switch_finished)
+        runtime.on_switch_finished = self.finished
+
+    def request(self) -> dict[str, Any]:
+        return _switch_request(self.current)
+
+    def factory(self, **kwargs: Any) -> Mock:
+        worker = Mock(state="running", generation=0)
+        worker.on_event = kwargs["on_event"]
+        self.workers.append(worker)
+        return worker
+
+    def switch_finished(self, result: str) -> None:
+        if result != "ok":
+            self.current = "gigaam"
+
+    def switch(self) -> None:
+        self.current = "whisper"
+        self.rig.runtime.switch_model(min_ram_mb=2007, pause=self.pause)
+
+    @staticmethod
+    def emit(worker: Mock, **event: Any) -> None:
+        worker.on_event({"generation": worker.generation, **event})
+
+    @staticmethod
+    def loads(worker: Mock) -> list[str]:
+        return [
+            entry.args[0]["id"]
+            for entry in worker.send.call_args_list
+            if entry.args[0]["type"] == "model.load"
+        ]
+
+    def load_new_model(self) -> Mock:
+        """Новая модель загружена и её самопроверка запущена."""
+        worker = self.workers[-1]
+        self.emit(worker, type="hello")
+        assert self.loads(worker) == ["whisper"]
+        self.emit(worker, type="model.loaded", id="whisper")
+        assert self.rig.runtime.supervisor is worker
+        assert self.rig.runtime._selfcheck in ("running", "retrying")
+        return worker
+
+    def fire_selfcheck(self) -> None:
+        timer = self.rig.runtime._selfcheck_timer
+        assert timer is not None
+        timer.fire()
+
+    def assert_rolled_back(self, failed: Mock) -> Mock:
+        """Прежняя модель снова загружается без ошибки и совета переустановить."""
+        runtime = self.rig.runtime
+        self.finished.assert_called_once()
+        assert self.finished.call_args.args[0] != "ok"
+        assert not runtime._switch_active()
+        restored = self.workers[-1]
+        assert restored is not failed
+        assert runtime.supervisor is restored
+        restored.start.assert_called_once_with()
+        assert runtime._loading_model
+        self.emit(restored, type="hello")
+        assert self.loads(restored) == ["gigaam"]
+        self.rig.notify.notify_engine_failed.assert_not_called()
+        self.rig.notify.notify_selfcheck_failed.assert_not_called()
+        assert (
+            call(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
+            not in self.rig.pill.show_state.call_args_list
+        )
+        assert TrayState.ERROR not in [c.args[0] for c in self.rig.tray.set_state.call_args_list]
+        return restored
+
+    def finish_restore(self, restored: Mock) -> None:
+        self.emit(restored, type="model.loaded", id="gigaam")
+        self.emit(restored, type="result", utterance_id="file", text="проверка связи")
+        assert self.rig.runtime._selfcheck == "ok"
+        assert not self.rig.runtime._loading_model
+        self.finished.assert_called_once()
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_switch_selfcheck_timeouts_restore_previous_model(
+    monkeypatch: pytest.MonkeyPatch, pause: bool
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=pause)
+    bench.switch()
+    first = bench.load_new_model()
+    if not pause:
+        bench.old.stop.assert_called_once_with()
+    bench.fire_selfcheck()
+    bench.finished.assert_not_called()
+    second = bench.load_new_model()
+    assert second is not first
+    bench.fire_selfcheck()
+    restored = bench.assert_rolled_back(second)
+    second.stop.assert_called_once_with()
+    bench.finish_restore(restored)
+    bench.rig.runtime.shutdown()
+
+
+def test_paused_switch_load_error_restores_previous_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=True)
+    bench.switch()
+    worker = bench.workers[-1]
+    bench.emit(worker, type="hello")
+    assert bench.loads(worker) == ["whisper"]
+    bench.emit(
+        worker, type="error", code="model-load", request_type="model.load", message="нет файла"
+    )
+    restored = bench.assert_rolled_back(worker)
+    bench.finish_restore(restored)
+    bench.rig.runtime.shutdown()
+
+
+def test_switch_failure_after_supervisor_restart_loads_previous_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    bench.switch()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    second = bench.load_new_model()
+    # Супервизор сам убил процесс по дедлайну распознавания эталона и поднял новый.
+    stale = second.generation
+    second.generation += 1
+    second.on_event(
+        {
+            "type": "error",
+            "generation": stale,
+            "code": "load-timeout",
+            "request_type": "transcribe.file",
+            "utterance_id": "file",
+        }
+    )
+    restored = bench.assert_rolled_back(second)
+    bench.finished.assert_called_once_with("too-slow")
+    # hello перезапущенного супервизором процесса после отката ничего не грузит.
+    second.send.reset_mock()
+    SwitchRig.emit(second, type="hello")
+    assert bench.loads(second) == []
+    # Перезапуск процесса до model.loaded снова отправляет прежнюю модель.
+    restored.generation += 1
+    restored.send.reset_mock()
+    SwitchRig.emit(restored, type="hello")
+    assert bench.loads(restored) == ["gigaam"]
+    bench.finish_restore(restored)
+    bench.rig.runtime.shutdown()
+
+
+def test_switch_selfcheck_timeout_reports_slow_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = SwitchRig(monkeypatch)
+    bench.switch()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    bench.finished.assert_called_once_with("too-slow")
+    bench.rig.notify.notify_engine_failed.assert_not_called()
+    bench.rig.runtime.shutdown()
+
+
+def test_switch_selfcheck_worker_error_reports_general_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    bench.switch()
+    worker = bench.load_new_model()
+    SwitchRig.emit(
+        worker,
+        type="error",
+        code="engine",
+        request_type="transcribe.file",
+        utterance_id="file",
+    )
+    bench.assert_rolled_back(worker)
+    bench.finished.assert_called_once_with("failed")
+    bench.rig.runtime.shutdown()
+
+
+def test_selfcheck_deadline_follows_model_speed() -> None:
+    whisper = module.selfcheck_deadline_s("onnx-community-whisper", WHISPER_TURBO_RTFX)
+    assert whisper >= 3 * 30.0 / WHISPER_TURBO_RTFX + 1.0
+    assert whisper <= module.SELFCHECK_MAX_S == 30.0
+    assert module.selfcheck_deadline_s("onnx-asr-gigaam-v3", GIGAAM_RTFX) == 3.0
+    assert module.selfcheck_deadline_s("onnx-community-whisper", None) == 30.0
+    assert module.selfcheck_deadline_s("onnx-asr-gigaam-v3", 0.0) == 30.0
+    assert module.selfcheck_deadline_s("onnx-asr-gigaam-v3", float("nan")) == 30.0
+    # Эталон 1,6 с без окна раскладки: 3 × 1,6 / 0,5 + 1 = 10,6 с.
+    assert module.selfcheck_deadline_s("onnx-asr-t-one", 0.5) == pytest.approx(10.6)
+    assert module.selfcheck_deadline_s("onnx-asr-t-one", 0.01) == 30.0
+
+
+@pytest.mark.parametrize(
+    "model_id,watchdog_ms",
+    [("gigaam", 3000), ("whisper", round((3 * 30.0 / WHISPER_TURBO_RTFX + 1.0) * 1000))],
+)
+def test_selfcheck_watchdog_and_supervisor_share_deadline(
+    monkeypatch: pytest.MonkeyPatch, model_id: str, watchdog_ms: int
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    worker = bench.old
+    if model_id == "whisper":
+        bench.switch()
+        worker = bench.load_new_model()
+    else:
+        bench.rig.runtime.restart_worker()
+        worker = bench.workers[-1]
+        SwitchRig.emit(worker, type="hello")
+        SwitchRig.emit(worker, type="model.loaded", id="gigaam")
+    timer = bench.rig.runtime._selfcheck_timer
+    assert timer is not None and timer.interval == watchdog_ms
+    sent = worker.send.call_args
+    assert sent.args[0]["type"] == "transcribe.file"
+    assert sent.kwargs["timeout"] == pytest.approx(
+        watchdog_ms / 1000 + module.SELFCHECK_SUPERVISOR_MARGIN_S, abs=1e-3
+    )
+    assert sent.kwargs["timeout"] > timer.interval / 1000
+    bench.rig.runtime.shutdown()
+
+
+def test_selfcheck_deadline_prefers_own_measurement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from astra_voice.core.version import __version__
+
+    measurements = tmp_path / "measurements.json"
+    measurements.write_text(
+        json.dumps({"gigaam@r1": {"rtfx": 0.5, "threads": 2, "build": __version__}}),
+        encoding="utf-8",
+    )
+    bench = SwitchRig(monkeypatch)
+    bench.rig.runtime.measurements.path = measurements
+    bench.rig.runtime.restart_worker()
+    worker = bench.workers[-1]
+    SwitchRig.emit(worker, type="hello")
+    SwitchRig.emit(worker, type="model.loaded", id="gigaam")
+    timer = bench.rig.runtime._selfcheck_timer
+    assert timer is not None and timer.interval == 10_600
+    # Замер при другом числе потоков не годится: берётся скорость из каталога.
+    measurements.write_text(
+        json.dumps({"gigaam@r1": {"rtfx": 0.5, "threads": 4, "build": __version__}}),
+        encoding="utf-8",
+    )
+    bench.rig.runtime.restart_worker()
+    worker = bench.workers[-1]
+    SwitchRig.emit(worker, type="hello")
+    SwitchRig.emit(worker, type="model.loaded", id="gigaam")
+    timer = bench.rig.runtime._selfcheck_timer
+    assert timer is not None and timer.interval == 3000
+    bench.rig.runtime.shutdown()
+
+
+def test_switch_too_slow_through_supervisor_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = SwitchRig(monkeypatch)
+    bench.switch()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    second = bench.load_new_model()
+    SwitchRig.emit(
+        second,
+        type="error",
+        code="timeout",
+        request_type="transcribe.file",
+        utterance_id="file",
+    )
+    restored = bench.assert_rolled_back(second)
+    bench.finished.assert_called_once_with("too-slow")
+    bench.finish_restore(restored)
+    bench.rig.runtime.shutdown()
+
+
+def test_delayed_promotion_rearms_switch_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = SwitchRig(monkeypatch)
+    rig = bench.rig
+    runtime = rig.runtime
+    bench.switch()
+    before = runtime._switch_timer
+    assert before is not None
+    candidate = bench.workers[-1]
+    SwitchRig.emit(candidate, type="hello")
+    # Диктовка откладывает продвижение загруженного кандидата.
+    rig.hotkey.fsm.press(rig.now)
+    SwitchRig.emit(candidate, type="model.loaded", id="whisper")
+    assert runtime.supervisor is bench.old
+    rig.release(rig.now + 1)
+    rig.event(type="result", text=MARKER)
+    rig.timers[-1].fire()
+    assert runtime.supervisor is candidate
+    after = runtime._switch_timer
+    assert after is not None and after is not before
+    assert before.deleted and not before.active
+    assert after.active and after.interval == module.SWITCH_TIMEOUT_S * 1000
+    before.fire()
+    bench.finished.assert_not_called()
+    bench.fire_selfcheck()
+    second = bench.load_new_model()
+    bench.fire_selfcheck()
+    bench.finished.assert_called_once_with("too-slow")
+    assert bench.current == "gigaam"
+    restored = bench.assert_rolled_back(second)
+    bench.finish_restore(restored)
+    runtime.shutdown()
+
+
+def test_switch_watchdog_between_selfchecks_never_reports_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    bench.switch()
+    first = bench.load_new_model()
+    bench.fire_selfcheck()
+    timer = runtime._switch_timer
+    assert timer is not None
+    timer.fire()
+    assert call("ok") not in bench.finished.call_args_list
+    assert bench.current == "gigaam"
+    restored = bench.assert_rolled_back(first)
+    bench.finish_restore(restored)
+    runtime.shutdown()
+
+
+def test_switch_without_restored_model_fails_quietly_for_slow_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    # Подписчик не смог вернуть прежнюю модель: current.json остался на новой.
+    bench.finished.side_effect = None
+    bench.switch()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    second = bench.load_new_model()
+    workers = len(bench.workers)
+    bench.fire_selfcheck()
+    bench.finished.assert_called_once_with("too-slow")
+    assert len(bench.workers) == workers
+    assert bench.rig.runtime.supervisor is second
+    assert bench.rig.runtime._selfcheck == "failed"
+    bench.rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
+    bench.rig.notify.notify_engine_failed.assert_not_called()
+    bench.rig.runtime.shutdown()
+
+
+def test_first_switch_without_previous_model_does_not_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    bench.finished.side_effect = lambda result: setattr(bench, "current", None)
+    monkeypatch.setattr(
+        bench.rig.runtime,
+        "_resolve_model_request",
+        lambda: None if bench.current is None else _switch_request(bench.current),
+    )
+    bench.switch()
+    bench.load_new_model()
+    bench.fire_selfcheck()
+    bench.load_new_model()
+    workers = len(bench.workers)
+    bench.fire_selfcheck()
+    assert len(bench.workers) == workers
+    bench.rig.runtime.shutdown()
+
+
+def test_paused_switch_restart_error_shows_load_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = SwitchRig(monkeypatch, pause=True)
+    runtime = bench.rig.runtime
+
+    def broken(**kwargs: Any) -> Mock:
+        raise OSError("нет воркера")
+
+    runtime._supervisor_factory = broken
+    bench.switch()
+    bench.finished.assert_called_once_with("failed")
+    assert not runtime._switch_active()
+    bench.rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    bench.rig.tray.set_state.assert_called_with(TrayState.ERROR)
+    runtime.shutdown()

@@ -99,6 +99,26 @@ def ensure_private_dir(path: Path) -> Path:
     return _ensure_private_dir(path)
 
 
+def config_dir_path() -> Path:
+    """Путь каталога настроек без создания (для показа в «О программе»)."""
+    return _xdg("XDG_CONFIG_HOME", Path.home() / ".config")
+
+
+def data_dir_path() -> Path:
+    """Путь каталога данных без создания."""
+    return _xdg("XDG_DATA_HOME", Path.home() / ".local" / "share")
+
+
+def log_dir_path() -> Path:
+    """Путь каталога журналов без создания."""
+    return data_dir_path() / "logs"
+
+
+def model_store_dir_path() -> Path:
+    """Путь каталога моделей без создания."""
+    return data_dir_path() / "models"
+
+
 def config_dir() -> Path:
     """``$XDG_CONFIG_HOME/astra-voice`` (по умолчанию ``~/.config/astra-voice``)."""
     return _ensure_private_dir(_xdg("XDG_CONFIG_HOME", Path.home() / ".config"))

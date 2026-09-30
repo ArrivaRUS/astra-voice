@@ -629,6 +629,51 @@ def test_uncorrelated_error_keeps_recording_cancellable(stop_first: bool) -> Non
 
 
 @pytest.mark.parametrize("timeout", [None, 1.0])
+def test_device_changed_keeps_pending_until_result(timeout: float | None) -> None:
+    """S5-A5: смена микрофона — автоостановка; stop и recognize той же фразы ещё впереди."""
+    supervisor, events = detached(Clock())
+    sent: list[Message] = []
+    reader = ipc.FrameReader()
+    connection = Mock(spec=socket.socket)
+
+    def send(data: bytearray) -> int:
+        """Фиксирует команды, действительно переданные транспорту воркера."""
+        sent.extend(reader.feed(bytes(data)))
+        return len(data)
+
+    connection.send.side_effect = send
+    supervisor._socket = connection
+    supervisor.send({"type": "record.start", "utterance_id": "one"}, timeout=timeout)
+    key = ("utterance", "one")
+    changed: Message = {
+        "type": "audio.device.changed",
+        "utterance_id": "one",
+        "kind": "switched",
+        "label": "Микрофон",
+        "audio_ms": 900,
+    }
+    supervisor._receive(ipc.encode(changed), 1)
+    assert key in supervisor._pending
+    assert key not in supervisor._finished
+    supervisor.send({"type": "record.stop", "utterance_id": "one"})
+    supervisor.send({"type": "recognize", "utterance_id": "one"})
+    assert [message["type"] for message in sent] == ["record.start", "record.stop", "recognize"]
+    result: Message = {
+        "type": "result",
+        "utterance_id": "one",
+        "text": "Тест",
+        "t_ms": 1,
+        "infer_ms": 5.0,
+        "audio_ms": 900.0,
+    }
+    supervisor._receive(ipc.encode(result), 1)
+    assert not supervisor._pending
+    assert key in supervisor._finished
+    assert events == [{**changed, "generation": 1}, {**result, "generation": 1}]
+    assert supervisor.dropped_late == 0
+
+
+@pytest.mark.parametrize("timeout", [None, 1.0])
 def test_record_notifications_keep_pending_until_result(timeout: float | None) -> None:
     """Индикация записи доходит до callback, а ожидание снимает только result."""
     supervisor, events = detached(Clock())

@@ -47,6 +47,22 @@ def read_measurements(path: Path | None) -> dict[str, Any]:
         return {}
 
 
+def saved_rtfx(path: Path | None, model_id: str, revision: str, threads: object) -> float | None:
+    """Собственный замер скорости модели на этой машине при том же числе потоков."""
+    entry = read_measurements(path).get(f"{model_id}@{revision}")
+    if not isinstance(entry, dict) or entry.get("threads") != threads:
+        return None
+    value = entry.get("rtfx")
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    ):
+        return float(value)
+    return None
+
+
 class MeasurementTracker:
     """Замеры текущей модели и ограниченное окно тёплых прогонов."""
 

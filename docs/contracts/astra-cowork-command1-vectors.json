@@ -2,7 +2,7 @@
   "title": "Тестовые векторы контракта Astra Voice ↔ Astra Cowork (ru.astralinux.Cowork.Command1)",
   "contract": 1,
   "fixed": "2026-09-24",
-  "document": "1.5",
+  "document": "1.7",
   "bus_name": "ru.astralinux.Cowork",
   "object_path": "/ru/astralinux/Cowork",
   "interface": "ru.astralinux.Cowork.Command1",
@@ -11,8 +11,8 @@
     "typed_value": "объект {\"$dbus\": <сигнатура>, \"value\": …} задаёт тип D-Bus явно (n/q/i/u/x/t/y/d/b/s/o/g); обычное число JSON — целое, тип по умолчанию у биндинга (сервер обязан принять любую целочисленную сигнатуру n/q/i/u/x/t); true/false — тип b; строка — s",
     "text_gen": "{\"repeat\": <строка>, \"count\": N} — строка, повторённая N раз; {\"concat\": [<элементы>]} — конкатенация элементов (строка или repeat); используется для длинных текстов",
     "length": "длина текста — число кодовых точек Unicode (Python len(str)); не байты и не единицы UTF-16",
-    "forbidden_chars": "U+0000–U+001F, U+007F–U+009F (включая U+0085), U+2028, U+2029; с 1.3 (У77) также bidi-управление U+202A–U+202E и U+2066–U+2069 и невидимые U+200B, U+FEFF; ZWJ U+200D и ZWNJ U+200C допустимы; пустота после strip; длина 1…4000",
-    "defaults": "если в векторе нет text — берётся base.text; если нет now_mono_ms — base.now_mono_ms; если нет boot_now_ms — base.boot_now_ms; options_vectors проверяются с валидным текстом, text_vectors — с валидными options; отправитель — тот же UID; сервер готов, сеанс разблокирован и известен (и на момент исхода тоже), модель из хранилища, сна не было, окно rate limit закрыто, незавершённых допусков 0",
+    "forbidden_chars": "U+0000–U+001F, U+007F–U+009F (включая U+0085), U+2028, U+2029; с 1.3 (У77) также bidi-управление U+202A–U+202E и U+2066–U+2069 и невидимые U+200B, U+FEFF; с 1.6 (Ф2) — весь список text_forbidden_ranges: Default_Ignorable_Code_Point по Unicode 15.1 ∪ Cf по Unicode 15.1 ∪ невидимые заполнители U+115F, U+1160, U+3164, U+FFA0, U+2800 ∪ управляющие (C0, C1, U+2028, U+2029), кроме ZWNJ U+200C, ZWJ U+200D и одиночного U+FE00–U+FE0F; U+FE00–U+FE0F — не более одного подряд (text_variation_selectors); ZWJ U+200D и ZWNJ U+200C допустимы; пустой текст — после strip нет ни одного символа, кроме пробельных, U+200C, U+200D и U+FE00–U+FE0F (1.6, T-40); длина 1…4000",
+    "defaults": "если в векторе нет text — берётся base.text; если нет now_mono_ms — base.now_mono_ms; если нет boot_now_ms — base.boot_now_ms; options_vectors проверяются с валидным текстом, text_vectors — с валидными options; отправитель — тот же UID; сервер готов, сеанс разблокирован и известен (и на момент исхода тоже), модель из хранилища, сна не было, окно rate limit закрыто, незавершённых допусков 0, рабочий стол не Fly (1.6)",
     "admission_state": "поля state описывают предусловие на стороне сервера (для заглушки исполнителя и тестов C1/S9); значения — по описанию §7 спецификации",
     "deadline_margin": "сервер допускает новый request_id, пока now ≤ deadline_mono_ms − margin, margin = max((deadline − sent) · 5 // 100, 30) мс (при бюджете 300 — 30 мс, т.е. не позже sent + 270); причина — таймаут QtDBus у клиента срабатывает до 5 % раньше срока (S9: NoReply за 286,7 мс); вектора O-33, O-46…O-49",
     "error_names": "клиент сопоставляет ошибки D-Bus по полному имени QDBusError.name() (org.freedesktop.DBus.Error.*), не по суффиксу и не по одному type(); callWithCallback вернул False → sent=False → исход сразу без ожидания (C-31, C-33)",
@@ -22,7 +22,125 @@
     "options_gen": "{\"unknown_keys\": N} — к базовым options добавляются N незнакомых ключей k000001… со значением \"x\"; {\"long_string\": {\"key\": K, \"length\": L}} — строка из L символов \"x\" в ключе K; у вектора с cases каждый случай проверяется отдельно с общим expect, если у случая нет своего",
     "sent_boot_ms": "необязательный ключ 1.3 (У88): целое i/u/x/t ≥ 0, Voice шлёт явным x; при наличии сервер требует 0 ≤ boot_now − sent_boot_ms ≤ (deadline − sent) + margin, иначе expired/suspended; boot_now_ms в векторе — CLOCK_BOOTTIME сервера, по умолчанию base.boot_now_ms",
     "error_allowlist": "доказанный отказ у клиента — только имена, которые порождают шина/Qt до слота: NameHasNoOwner, ServiceUnknown (not_running); UnknownInterface, UnknownMethod, UnknownObject (no_contract); InvalidArgs, InvalidSignature, AccessDenied, LimitsExceeded (refused); NoReply/Timeout/TimedOut → unknown/timeout; Disconnected после отправки → unknown/disconnected; любое другое имя → unknown/bad_reply, в журнал код remote_error (У89, У74)",
-    "session_gate": "с 1.3 (У87): session_at_outcome ∈ {locked, unknown, suspending} → никакой публикации (буфер, пилюля, уведомление, «Скопировать последнее»), фраза только в памяти — для любого исхода"
+    "session_gate": "с 1.3 (У87): session_at_outcome ∈ {locked, unknown, suspending} → никакой публикации (буфер, пилюля, уведомление, «Скопировать последнее»), фраза только в памяти — для любого исхода",
+    "text_forbidden_ranges": [
+      [
+        "U+0000",
+        "U+001F"
+      ],
+      [
+        "U+007F",
+        "U+009F"
+      ],
+      [
+        "U+00AD",
+        "U+00AD"
+      ],
+      [
+        "U+034F",
+        "U+034F"
+      ],
+      [
+        "U+0600",
+        "U+0605"
+      ],
+      [
+        "U+061C",
+        "U+061C"
+      ],
+      [
+        "U+06DD",
+        "U+06DD"
+      ],
+      [
+        "U+070F",
+        "U+070F"
+      ],
+      [
+        "U+0890",
+        "U+0891"
+      ],
+      [
+        "U+08E2",
+        "U+08E2"
+      ],
+      [
+        "U+115F",
+        "U+1160"
+      ],
+      [
+        "U+17B4",
+        "U+17B5"
+      ],
+      [
+        "U+180B",
+        "U+180F"
+      ],
+      [
+        "U+200B",
+        "U+200B"
+      ],
+      [
+        "U+200E",
+        "U+200F"
+      ],
+      [
+        "U+2028",
+        "U+202E"
+      ],
+      [
+        "U+2060",
+        "U+206F"
+      ],
+      [
+        "U+2800",
+        "U+2800"
+      ],
+      [
+        "U+3164",
+        "U+3164"
+      ],
+      [
+        "U+FEFF",
+        "U+FEFF"
+      ],
+      [
+        "U+FFA0",
+        "U+FFA0"
+      ],
+      [
+        "U+FFF0",
+        "U+FFFB"
+      ],
+      [
+        "U+110BD",
+        "U+110BD"
+      ],
+      [
+        "U+110CD",
+        "U+110CD"
+      ],
+      [
+        "U+13430",
+        "U+1343F"
+      ],
+      [
+        "U+1BCA0",
+        "U+1BCA3"
+      ],
+      [
+        "U+1D173",
+        "U+1D17A"
+      ],
+      [
+        "U+E0000",
+        "U+E0FFF"
+      ]
+    ],
+    "text_forbidden_rule": "с 1.6 (Ф2): список диапазонов text_forbidden_ranges (включительно) — канон для обеих сторон: Default_Ignorable_Code_Point по Unicode 15.1 (DerivedCoreProperties-15.1.0.txt) ∪ Cf по Unicode 15.1 ∪ заполнители U+115F, U+1160, U+3164, U+FFA0, U+2800 ∪ управляющие C0, C1, U+2028, U+2029, кроме U+200C, U+200D и U+FE00–U+FE0F; задан явно и НЕ выводится из unicodedata: у Voice Python 3.11 (Unicode 14, нет U+13439…U+1343F), по категории стороны разошлись бы; зарезервированные DI (U+2065, U+FFF0–U+FFF8, U+E0000, U+E0002–U+E001F, U+E0080–U+E00FF, U+E01F0–U+E0FFF) входят намеренно; флаги подразделений (U+1F3F4 + теги, например флаг Англии) отклоняются — Voice при нормализации вычищает теги и оставляет U+1F3F4. Voice вычищает эти символы при нормализации до отправки, Cowork проверяет и отказывает refused/invalid_text (§7 шаг 1, там же, где прочие правила текста)",
+    "text_variation_selectors": "с 1.6: селекторы вариантов U+FE00–U+FE0F допустимы, но не более одного подряд (два подряд → invalid_text; Voice схлопывает серию до одного); U+E0100–U+E01EF запрещены всегда (в text_forbidden_ranges, в составе U+E0000–U+E0FFF)",
+    "desktop_state": "с 1.6: state.desktop = \"fly\" — сеанс Fly (хотя бы один источник детекта сервера: окружение, Session.Desktop login1, процесс fly-wm своего uid); state.allow_fly — настройка Cowork [voice] allow_fly (по умолчанию false); без state.desktop — не Fly",
+    "state_reason": "с 1.6: необязательный ключ Status.state_reason (s) — только при state=disabled по причине session_unsupported; в остальных случаях ключа нет; в status_vectors expect.state_reason = null означает «ключа нет»"
   },
   "base": {
     "now_mono_ms": 5000000,
@@ -283,6 +401,408 @@
       "text": "семья 👨‍👩‍👧 и می‌خواهم",
       "expect": {
         "status": "accepted"
+      }
+    },
+    {
+      "id": "T-27",
+      "name": "SOFT HYPHEN U+00AD — невидимый Cf, запрещён (1.6, Ф2, SEC-V2)",
+      "text": "открой­папку",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-28",
+      "name": "LRM U+200E и RLM U+200F — запрещены (1.6, Ф2, SEC-V2)",
+      "cases": [
+        {
+          "name": "U+200E LEFT-TO-RIGHT MARK",
+          "text": "открой‎папку"
+        },
+        {
+          "name": "U+200F RIGHT-TO-LEFT MARK",
+          "text": "открой‏папку"
+        }
+      ],
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-29",
+      "name": "ARABIC LETTER MARK U+061C — запрещён (1.6, Ф2, SEC-V2)",
+      "text": "открой؜папку",
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-30",
+      "name": "WORD JOINER U+2060 и границы диапазона U+2060–U+206F (включая зарезервированный U+2065) — запрещены (1.6, Ф2, SEC-V2)",
+      "cases": [
+        {
+          "name": "U+2060 WORD JOINER",
+          "text": "открой⁠папку"
+        },
+        {
+          "name": "U+2064 INVISIBLE PLUS",
+          "text": "открой⁤папку"
+        },
+        {
+          "name": "U+2065 зарезервирован, входит в диапазон",
+          "text": "открой⁥папку"
+        },
+        {
+          "name": "U+206A INHIBIT SYMMETRIC SWAPPING",
+          "text": "открой⁪папку"
+        },
+        {
+          "name": "U+206F NOMINAL DIGIT SHAPES",
+          "text": "открой⁯папку"
+        }
+      ],
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-31",
+      "name": "теги U+E0001, U+E0020–U+E007F — запрещены, в т. ч. в последовательности флага (1.6, Ф2, SEC-V2)",
+      "cases": [
+        {
+          "name": "U+E0001 LANGUAGE TAG",
+          "text": "открой󠀁папку"
+        },
+        {
+          "name": "U+E0020 TAG SPACE",
+          "text": "открой󠀠папку"
+        },
+        {
+          "name": "U+E007F CANCEL TAG",
+          "text": "открой󠁿папку"
+        },
+        {
+          "name": "флаг Англии: U+1F3F4 + теги gbeng + U+E007F",
+          "text": "флаг 🏴󠁧󠁢󠁥󠁮󠁧󠁿"
+        }
+      ],
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-32",
+      "name": "прочие Cf по Unicode 15.1 — границы диапазонов, в т. ч. U+13439…U+1343F (нет в Unicode 14) (1.6, Ф2)",
+      "cases": [
+        {
+          "name": "U+0600",
+          "text": "открой؀папку"
+        },
+        {
+          "name": "U+0605",
+          "text": "открой؅папку"
+        },
+        {
+          "name": "U+06DD",
+          "text": "открой۝папку"
+        },
+        {
+          "name": "U+070F",
+          "text": "открой܏папку"
+        },
+        {
+          "name": "U+0890",
+          "text": "открой࢐папку"
+        },
+        {
+          "name": "U+0891",
+          "text": "открой࢑папку"
+        },
+        {
+          "name": "U+08E2",
+          "text": "открой࣢папку"
+        },
+        {
+          "name": "U+180E",
+          "text": "открой᠎папку"
+        },
+        {
+          "name": "U+FFF9",
+          "text": "открой￹папку"
+        },
+        {
+          "name": "U+FFFB",
+          "text": "открой￻папку"
+        },
+        {
+          "name": "U+110BD",
+          "text": "открой𑂽папку"
+        },
+        {
+          "name": "U+110CD",
+          "text": "открой𑃍папку"
+        },
+        {
+          "name": "U+13430",
+          "text": "открой𓐰папку"
+        },
+        {
+          "name": "U+13439",
+          "text": "открой𓐹папку"
+        },
+        {
+          "name": "U+1343F",
+          "text": "открой𓐿папку"
+        },
+        {
+          "name": "U+1BCA0",
+          "text": "открой𛲠папку"
+        },
+        {
+          "name": "U+1BCA3",
+          "text": "открой𛲣папку"
+        },
+        {
+          "name": "U+1D173",
+          "text": "открой𝅳папку"
+        },
+        {
+          "name": "U+1D17A",
+          "text": "открой𝅺папку"
+        }
+      ],
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-33",
+      "name": "невидимые заполнители U+115F, U+1160, U+3164, U+FFA0, U+2800 — запрещены (1.6, Ф2)",
+      "cases": [
+        {
+          "name": "U+115F",
+          "text": "откройᅟпапку"
+        },
+        {
+          "name": "U+1160",
+          "text": "откройᅠпапку"
+        },
+        {
+          "name": "U+3164",
+          "text": "откройㅤпапку"
+        },
+        {
+          "name": "U+FFA0",
+          "text": "откройﾠпапку"
+        },
+        {
+          "name": "U+2800",
+          "text": "открой⠀папку"
+        }
+      ],
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-34",
+      "name": "селекторы вариантов U+E0100–U+E01EF — запрещены всегда (1.6, Ф2)",
+      "cases": [
+        {
+          "name": "U+E0100 после буквы",
+          "text": "открой 葛󠄀 папку"
+        },
+        {
+          "name": "U+E01EF",
+          "text": "открой󠇯папку"
+        }
+      ],
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-35",
+      "name": "два селектора U+FE00–U+FE0F подряд — запрещены (1.6, Ф2)",
+      "cases": [
+        {
+          "name": "U+FE0F U+FE0F после сердца",
+          "text": "открой ❤️️ папку"
+        },
+        {
+          "name": "U+FE00 U+FE0F",
+          "text": "открой ❤︀️ папку"
+        }
+      ],
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-36",
+      "name": "один U+FE0F допустим, в т. ч. в ZWJ-эмодзи (как T-26) (1.6)",
+      "cases": [
+        {
+          "name": "сердце U+2764 U+FE0F",
+          "text": "открой ❤️ папку"
+        },
+        {
+          "name": "радужный флаг U+1F3F3 U+FE0F U+200D U+1F308",
+          "text": "флаг 🏳️‍🌈 и ещё"
+        },
+        {
+          "name": "два эмодзи, в каждом по одному U+FE0F",
+          "text": "❤️❤️ открой"
+        }
+      ],
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "T-37",
+      "name": "ZWNJ U+200C внутри слова — допустим (1.6)",
+      "text": "نامه‌ها открой",
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "T-38",
+      "name": "соседи запрещённых диапазонов — допустимы (1.6): U+200C/U+200D, U+0606, U+2801, U+FFA1, U+2070",
+      "cases": [
+        {
+          "name": "U+200C",
+          "text": "открой‌папку"
+        },
+        {
+          "name": "U+200D",
+          "text": "открой‍папку"
+        },
+        {
+          "name": "U+0606",
+          "text": "открой؆папку"
+        },
+        {
+          "name": "U+2801",
+          "text": "открой⠁папку"
+        },
+        {
+          "name": "U+FFA1",
+          "text": "откройﾡпапку"
+        },
+        {
+          "name": "U+2070",
+          "text": "открой⁰папку"
+        }
+      ],
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "T-39",
+      "name": "Default_Ignorable_Code_Point вне Cf по Unicode 15.1 — запрещены (1.6): U+034F, U+17B4–U+17B5, U+180B–U+180D, U+180F, U+FFF0–U+FFF8, U+E0000–U+E0FFF",
+      "cases": [
+        {
+          "name": "U+034F COMBINING GRAPHEME JOINER",
+          "text": "открой͏папку"
+        },
+        {
+          "name": "U+17B4",
+          "text": "открой឴папку"
+        },
+        {
+          "name": "U+17B5",
+          "text": "открой឵папку"
+        },
+        {
+          "name": "U+180B MONGOLIAN FREE VARIATION SELECTOR ONE",
+          "text": "открой᠋папку"
+        },
+        {
+          "name": "U+180D",
+          "text": "открой᠍папку"
+        },
+        {
+          "name": "U+180F",
+          "text": "открой᠏папку"
+        },
+        {
+          "name": "U+FFF0 зарезервирован",
+          "text": "открой￰папку"
+        },
+        {
+          "name": "U+FFF8 зарезервирован",
+          "text": "открой￸папку"
+        },
+        {
+          "name": "U+E0000 зарезервирован",
+          "text": "открой󠀀папку"
+        },
+        {
+          "name": "U+E0002 зарезервирован",
+          "text": "открой󠀂папку"
+        },
+        {
+          "name": "U+E0080 зарезервирован",
+          "text": "открой󠂀папку"
+        },
+        {
+          "name": "U+E01F0 зарезервирован",
+          "text": "открой󠇰папку"
+        },
+        {
+          "name": "U+E0FFF зарезервирован",
+          "text": "открой󠿿папку"
+        }
+      ],
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
+      }
+    },
+    {
+      "id": "T-40",
+      "name": "текст только из допустимых невидимых (U+200C, U+200D, U+FE00–U+FE0F) и пробелов — пустой по смыслу, отказ как у пустого (1.6)",
+      "cases": [
+        {
+          "name": "U+200D",
+          "text": "‍"
+        },
+        {
+          "name": "U+200C",
+          "text": "‌"
+        },
+        {
+          "name": "U+FE0F",
+          "text": "️"
+        },
+        {
+          "name": "пробелы вокруг U+200D",
+          "text": " ‍ "
+        },
+        {
+          "name": "U+200D пробел U+200C",
+          "text": "‍ ‌"
+        },
+        {
+          "name": "U+200C U+FE0F",
+          "text": "‌️"
+        }
+      ],
+      "expect": {
+        "status": "refused",
+        "reason": "invalid_text"
       }
     }
   ],
@@ -1837,6 +2357,52 @@
         "external_events": 0,
         "steady_state_reads": 0
       }
+    },
+    {
+      "id": "A-37",
+      "name": "Fly до приёмки K5 без [voice] allow_fly — сеанс не поддерживается (1.6, Б)",
+      "state": {
+        "desktop": "fly"
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "session_unsupported"
+      }
+    },
+    {
+      "id": "A-38",
+      "name": "Fly с [voice] allow_fly = true — обычный путь (1.6, Б)",
+      "state": {
+        "desktop": "fly",
+        "allow_fly": true
+      },
+      "expect": {
+        "status": "accepted"
+      }
+    },
+    {
+      "id": "A-39",
+      "name": "старшинство (1.6): Fly без allow_fly при выключенном приёме — session_unsupported раньше policy_disabled",
+      "state": {
+        "desktop": "fly",
+        "accept_voice": false
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "session_unsupported"
+      }
+    },
+    {
+      "id": "A-40",
+      "name": "старшинство (1.6): Fly без allow_fly и оркестратора нет — not_ready раньше session_unsupported",
+      "state": {
+        "desktop": "fly",
+        "orchestrator": null
+      },
+      "expect": {
+        "status": "refused",
+        "reason": "not_ready"
+      }
     }
   ],
   "client_outcome_vectors": [
@@ -2530,6 +3096,52 @@
       "state": {},
       "expect": {
         "reply_within_ms": 50
+      }
+    },
+    {
+      "id": "S-11",
+      "name": "Fly до K5 без allow_fly — disabled с state_reason=session_unsupported (1.6)",
+      "state": {
+        "desktop": "fly"
+      },
+      "expect": {
+        "state": "disabled",
+        "state_reason": "session_unsupported"
+      }
+    },
+    {
+      "id": "S-12",
+      "name": "Fly с allow_fly — ready, ключа state_reason нет (1.6)",
+      "state": {
+        "desktop": "fly",
+        "allow_fly": true
+      },
+      "expect": {
+        "state": "ready",
+        "state_reason": null
+      }
+    },
+    {
+      "id": "S-13",
+      "name": "приём выключен настройкой — disabled без state_reason (1.6)",
+      "state": {
+        "accept_voice": false
+      },
+      "expect": {
+        "state": "disabled",
+        "state_reason": null
+      }
+    },
+    {
+      "id": "S-14",
+      "name": "Fly без allow_fly и экран заблокирован — locked старше disabled, ключа state_reason нет (1.6)",
+      "state": {
+        "desktop": "fly",
+        "session": "locked"
+      },
+      "expect": {
+        "state": "locked",
+        "state_reason": null
       }
     }
   ],

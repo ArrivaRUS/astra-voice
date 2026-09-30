@@ -1,0 +1,54 @@
+{
+  "url": "https://api.github.com/repos/ArrivaRUS/astra-voice/releases/254000001",
+  "assets_url": "https://api.github.com/repos/ArrivaRUS/astra-voice/releases/254000001/assets",
+  "upload_url": "https://uploads.github.com/repos/ArrivaRUS/astra-voice/releases/254000001/assets{?name,label}",
+  "html_url": "https://github.com/ArrivaRUS/astra-voice/releases/tag/v0.2.1",
+  "id": 254000001,
+  "author": {
+    "login": "github-actions[bot]",
+    "id": 41898282,
+    "type": "Bot",
+    "site_admin": false
+  },
+  "node_id": "RE_kwDOPtest01",
+  "tag_name": "v0.2.1",
+  "target_commitish": "main",
+  "name": "Astra Voice 0.2.1",
+  "draft": false,
+  "immutable": false,
+  "prerelease": false,
+  "created_at": "2026-10-14T09:12:40Z",
+  "updated_at": "2026-10-14T09:20:02Z",
+  "published_at": "2026-10-14T09:20:02Z",
+  "assets": [
+    {
+      "url": "https://api.github.com/repos/ArrivaRUS/astra-voice/releases/assets/300000001",
+      "id": 300000001,
+      "name": "astra-voice_0.2.1_amd64.deb",
+      "label": "",
+      "content_type": "application/vnd.debian.binary-package",
+      "state": "uploaded",
+      "size": 15728640,
+      "download_count": 3,
+      "created_at": "2026-10-14T09:19:10Z",
+      "updated_at": "2026-10-14T09:19:12Z",
+      "browser_download_url": "https://github.com/ArrivaRUS/astra-voice/releases/download/0.2.1/astra-voice_0.2.1_amd64.deb"
+    },
+    {
+      "url": "https://api.github.com/repos/ArrivaRUS/astra-voice/releases/assets/300000002",
+      "id": 300000002,
+      "name": "SHA256SUMS",
+      "label": "",
+      "content_type": "text/plain",
+      "state": "uploaded",
+      "size": 512,
+      "download_count": 3,
+      "created_at": "2026-10-14T09:19:13Z",
+      "updated_at": "2026-10-14T09:19:13Z",
+      "browser_download_url": "https://github.com/ArrivaRUS/astra-voice/releases/download/0.2.1/SHA256SUMS"
+    }
+  ],
+  "tarball_url": "https://api.github.com/repos/ArrivaRUS/astra-voice/tarball/0.2.1",
+  "zipball_url": "https://api.github.com/repos/ArrivaRUS/astra-voice/zipball/0.2.1",
+  "body": "## Что нового\r\n\r\n- Проверка обновлений программы.\r\n- Исправлена смена микрофона посреди фразы.\r\n"
+}

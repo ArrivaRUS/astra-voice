@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.unit
 REPO = Path(__file__).resolve().parents[2]
 QML_FILES = sorted((REPO / "qml").rglob("*.qml"))
-CONTEXTS = ("onboarding", "settingsBridge", "appInfo")
+CONTEXTS = ("onboarding", "settingsBridge", "appInfo", "updatesBridge", "aboutBridge")
 IDENTIFIER = r"[A-Za-z_$][\w$]*"
 ALIAS = re.compile(
     rf"\breadonly\s+property\s+var\s+(?P<alias>{IDENTIFIER})\s*:\s*\(\s*"
@@ -218,7 +218,9 @@ def real_contracts(monkeypatch: pytest.MonkeyPatch) -> dict[str, MetaContract]:
     from astra_voice.app import _make_app_info
     from astra_voice.core.policy import PolicyStatus
     from astra_voice.platform.session import SessionKind
+    from astra_voice.ui.about_bridge import AboutBridge
     from astra_voice.ui.bridges import OnboardingController, SettingsBridge
+    from astra_voice.ui.updates_bridge import UpdatesBridge
 
     # QApplication и экземпляры мостов не нужны; AppInfo объявлен внутри фабрики.
     app_info = _make_app_info(SessionKind.OTHER, PolicyStatus.ABSENT.value)
@@ -226,6 +228,8 @@ def real_contracts(monkeypatch: pytest.MonkeyPatch) -> dict[str, MetaContract]:
         "onboarding": meta_contract(OnboardingController.staticMetaObject),
         "settingsBridge": meta_contract(SettingsBridge.staticMetaObject),
         "appInfo": meta_contract(app_info.metaObject()),
+        "updatesBridge": meta_contract(UpdatesBridge.staticMetaObject),
+        "aboutBridge": meta_contract(AboutBridge.staticMetaObject),
     }
 
 
@@ -484,7 +488,7 @@ def test_bridge_members_are_documented(real_contracts: dict[str, MetaContract]) 
     """Добавленный в мост член обязан попасть в документ — иначе он не контракт."""
     text = DOC_PATH.read_text(encoding="utf-8")
     undocumented: list[str] = []
-    for key in ("onboarding", "settingsBridge"):
+    for key in ("onboarding", "settingsBridge", "updatesBridge", "aboutBridge"):
         contract = real_contracts[key]
         for name in sorted(contract.properties):
             if name in DOC_UNLISTED or name.startswith("_") or f"`{name}`" in text:

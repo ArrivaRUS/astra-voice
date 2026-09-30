@@ -16,11 +16,12 @@ import signal
 import sys
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PyQt5.QtCore import QObject, Qt, pyqtSlot
+from PyQt5.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
 
 from astra_voice.core import paths
 from astra_voice.core import policy as policy_mod
@@ -43,11 +44,14 @@ from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui.hotkey_capture import HotkeyCapture
 from astra_voice.ui.icons import install_icon_provider
+from astra_voice.ui.notify import install_dispatcher as install_notify_dispatcher
+from astra_voice.ui.notify import shutdown_dispatch as shutdown_notify_dispatch
 from astra_voice.ui.tray import shutdown_bus_threads
 
 if TYPE_CHECKING:
     from astra_voice.core.dictation import LevelCallback, TestCallback
     from astra_voice.runtime import DictationRuntime
+    from astra_voice.updates.checker import UpdateChecker
 
 log = logging.getLogger(__name__)
 
@@ -335,12 +339,17 @@ def _send_show() -> int:
     return 0
 
 
-class ShowServer:
-    """``QLocalServer``, принимающий единственную команду ``show [<ts>]``."""
+class ShowServer(QObject):
+    """``QLocalServer``, принимающий единственную команду ``show [<ts>]``.
+
+    Сигналы соединений подключены к слотам самого сервера (живого владельца), а не
+    к лямбдам с замыканием на соединение (урок 021); соединение — ``sender()``.
+    """
 
     def __init__(self, on_show: Any) -> None:
         from PyQt5.QtNetwork import QLocalServer
 
+        super().__init__()
         self._on_show = on_show
         self._connections: list[Any] = []
         path = str(ipc_socket_path())
@@ -351,13 +360,31 @@ class ShowServer:
             log.warning("не удалось открыть сокет %s: %s", path, self._server.errorString())
         self._server.newConnection.connect(self._on_new_connection)
 
+    @pyqtSlot()
     def _on_new_connection(self) -> None:
         connection = self._server.nextPendingConnection()
         if connection is None:
             return
         self._connections.append(connection)
-        connection.readyRead.connect(lambda: self._on_ready_read(connection))
-        connection.disconnected.connect(lambda: self._drop(connection))
+        connection.readyRead.connect(self._connection_ready_read)
+        connection.disconnected.connect(self._connection_disconnected)
+
+    def _sender_connection(self) -> Any | None:
+        connection = self.sender()
+        # Обрабатываем только свои живые соединения: это те же обёртки, что в списке.
+        return connection if connection in self._connections else None
+
+    @pyqtSlot()
+    def _connection_ready_read(self) -> None:
+        connection = self._sender_connection()
+        if connection is not None:
+            self._on_ready_read(connection)
+
+    @pyqtSlot()
+    def _connection_disconnected(self) -> None:
+        connection = self._sender_connection()
+        if connection is not None:
+            self._drop(connection)
 
     def _drop(self, connection: Any) -> None:
         if connection in self._connections:
@@ -487,6 +514,21 @@ def _load_qml(app_info: Any, theme_bridge: Any | None) -> Any | None:
         log.error("QML не загрузился, показываю заглушку")
         return None
     return engine
+
+
+def _make_about_bridge(runtime: DictationRuntime | None) -> Any | None:
+    """Мост раздела «О программе»; без него раздел показывает только версию."""
+    try:
+        from astra_voice.ui.about_bridge import AboutBridge
+
+        bridge = AboutBridge(stats=runtime.stats if runtime is not None else None)
+        if runtime is not None:
+            # Статистика и мост живут в GUI-потоке: слушатель вызывается там же.
+            runtime.stats.on_append = bridge.on_stats_event
+        return bridge
+    except Exception:  # noqa: BLE001 — сведения о программе не должны мешать окну
+        log.warning("Не удалось подготовить раздел «О программе»", exc_info=True)
+        return None
 
 
 def _set_context_property(shell: Any, name: str, obj: Any) -> None:
@@ -715,6 +757,113 @@ class _WindowFocuser(QObject):
             root.activateWindow()
 
 
+class _GuiCalls(QObject):
+    """Передаёт вызовы рабочих потоков в GUI-поток очередью Qt.
+
+    Живёт и удаляется в GUI-потоке; рабочий поток только испускает сигнал
+    (урок 025: никаких Python-QObject в рабочих потоках).
+    """
+
+    _call = pyqtSignal(object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._call.connect(self._run, Qt.QueuedConnection)
+
+    def post(self, call: Callable[[], None]) -> None:
+        self._call.emit(call)
+
+    @pyqtSlot(object)
+    def _run(self, call: object) -> None:
+        if not callable(call):
+            return
+        try:
+            call()
+        except Exception:  # noqa: BLE001 — сбой одного вызова не ломает цикл событий
+            log.warning("Не удалось выполнить отложенный вызов", exc_info=True)
+
+
+def _start_update_checker(
+    settings: settings_mod.Settings,
+    policy: policy_mod.Policy,
+    gui_calls: _GuiCalls,
+    runtime: DictationRuntime | None,
+    bind: Callable[[UpdateChecker], None] | None = None,
+) -> UpdateChecker | None:
+    """Фоновая проверка обновлений программы (M7-ядро).
+
+    ``bind`` подключает окно до старта потока, чтобы первый снимок не потерялся.
+    """
+    try:
+        from astra_voice.updates.checker import create_app_checker
+
+        checker = create_app_checker(settings, policy)
+    except Exception:  # noqa: BLE001 — без проверки обновлений приложение работает
+        log.warning("Проверка обновлений недоступна", exc_info=True)
+        return None
+    if bind is not None:
+        try:
+            bind(checker)
+        except Exception:  # noqa: BLE001 — строка в окне не должна мешать проверке
+            log.warning("Не удалось подключить строку обновлений к окну", exc_info=True)
+    if runtime is not None:
+        stats = runtime.stats
+
+        def record(kind: str, fields: Mapping[str, str]) -> None:
+            # Статистика однопоточная: запись — только в GUI-потоке.
+            gui_calls.post(partial(stats.append, kind, **fields))
+
+        checker.on_event = record
+    checker.start()
+    return checker
+
+
+def _bind_updates_bridge(
+    checker: UpdateChecker,
+    settings: settings_mod.Settings,
+    policy: policy_mod.Policy,
+    gui_calls: _GuiCalls,
+    settings_bridge: Any,
+) -> Any:
+    """Мост строки обновлений для QML; снимки проверки идут в GUI-поток очередью."""
+    from astra_voice.net.gate import NetworkGate
+    from astra_voice.ui.updates_bridge import UpdatesBridge
+
+    # open_external из platform/external появится отдельной веткой; до неё
+    # кнопка «Страница выпуска» скрыта, QDesktopServices и Qt.openUrlExternally
+    # для адресов из сети не используем.
+    bridge = UpdatesBridge(checker, refusal=NetworkGate(settings, policy).refusal)
+
+    def post_status(status: Any) -> None:
+        # Рабочий поток проверки: мост трогаем только в GUI-потоке (урок 025).
+        gui_calls.post(partial(bridge.set_status, status))
+
+    checker.on_status = post_status
+    if settings_bridge is not None:
+        settings_bridge.checkAppUpdatesChanged.connect(bridge.refresh)
+        settings_bridge.offlineChanged.connect(bridge.refresh)
+    return bridge
+
+
+def _wire_tray_updates(tray: Any, bridge: Any, show_network: Callable[[], None]) -> None:
+    """Пункт трея «Проверить обновления» (Р9): активен всегда, кроме офлайна и запрета.
+
+    Меню живёт в GUI-потоке, мост — тоже: проверка уходит в поток проверки через
+    ``checkNow()``, окно открывается на разделе «Сеть», где видна панель результата.
+    """
+
+    def sync() -> None:
+        tray.set_updates_enabled(bool(bridge.canCheckNow))
+
+    def check() -> None:
+        show_network()
+        bridge.checkNow()
+
+    tray.on_check_updates = check
+    bridge.networkChanged.connect(sync)
+    sync()
+
+
 def _wire_close(
     app: Any, shell: Any, is_tray_ready: Callable[[], bool] | None = None
 ) -> Any | None:
@@ -919,6 +1068,8 @@ def main(argv: list[str] | None = None) -> int:
     app.setOrganizationDomain(ORGANIZATION_DOMAIN)
     app.setDesktopFileName(DESKTOP_FILE_NAME)
     app.setQuitOnLastWindowClosed(not CLOSE_TO_TRAY)
+    # Получатель уведомлений из рабочих потоков — в GUI до их запуска (урок 026).
+    install_notify_dispatcher()
 
     app_info = _make_app_info(session_kind, policy.status.value, debug=args.debug)
     theme_bridge = _make_theme_bridge(session_kind)
@@ -930,6 +1081,10 @@ def main(argv: list[str] | None = None) -> int:
     settings_bridge = None  # держим Python-обёртку живой до выхода из main
     onboarding = None
     downloads = None
+    update_checker: UpdateChecker | None = None
+    updates_bridge: Any = None  # держим Python-обёртку живой до выхода из main
+    about_bridge: Any = None  # держим Python-обёртку живой до выхода из main
+    gui_calls = _GuiCalls()
     model_store: ModelStore | None = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
     close_watcher = _wire_close(  # держим ссылку на фильтр
@@ -946,7 +1101,9 @@ def main(argv: list[str] | None = None) -> int:
         model = None
         try:
             model = ModelService(settings, policy)
-        except Exception:  # noqa: BLE001 — каталог не должен мешать запуску окна
+        except Exception as exc:  # noqa: BLE001 — каталог не должен мешать запуску окна
+            if getattr(exc, "code", None) == "clock-behind":  # У92/T-116
+                log.warning("Каталог моделей не принят: часы компьютера отстают")
             log.warning("Не удалось подготовить каталог моделей, настройка продолжится без него")
         revoked_check = _revoked_check(model)
         try:
@@ -972,6 +1129,8 @@ def main(argv: list[str] | None = None) -> int:
                 settings=settings, session_kind=session_kind, model_store=model_store
             )
             runtime.set_revoked_check(revoked_check)
+            if model is not None:
+                runtime.set_catalog_rtfx(model.catalog_rtfx)
             runtime.on_quit_requested = app.quit
             runtime.on_show_requested = focuser.focus_shell
             runtime.tray.on_open = focuser.focus_shell
@@ -1032,6 +1191,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         QQmlEngine.setObjectOwnership(settings_bridge, QQmlEngine.CppOwnership)
         _set_context_property(shell, "settingsBridge", settings_bridge)
+        # Офлайн-режим скрывает «Скачать» и отменяет загрузку из сети (PRD F14.2).
+        settings_bridge.offlineChanged.connect(downloads.network_changed)
+        about_bridge = _make_about_bridge(runtime if runtime_ready else None)
+        if about_bridge is not None:
+            QQmlEngine.setObjectOwnership(about_bridge, QQmlEngine.CppOwnership)
+            _set_context_property(shell, "aboutBridge", about_bridge)
         root = _root_window(shell)
         if root is not None:
             capture.attach_window(root)
@@ -1064,11 +1229,59 @@ def main(argv: list[str] | None = None) -> int:
             downloads.downloadProgressChanged.connect(update_download_status)
             downloads.downloadStateChanged.connect(update_download_status)
         _set_context_property(shell, "showOnboarding", show_onboarding)
+
+        def bind_updates(checker: UpdateChecker) -> None:
+            nonlocal updates_bridge
+            updates_bridge = _bind_updates_bridge(
+                checker, settings, policy, gui_calls, settings_bridge
+            )
+            QQmlEngine.setObjectOwnership(updates_bridge, QQmlEngine.CppOwnership)
+            _set_context_property(shell, "updatesBridge", updates_bridge)
+            if about_bridge is not None:
+                # Даты попытки и успеха в «О программе» перечитываются после каждого
+                # снимка проверки — и при повторной неудаче, когда строка-статус не
+                # меняется. Снимок приходит из рабочего потока: в GUI — очередью.
+                forward = checker.on_status
+
+                def post_status_and_dates(status: Any) -> None:
+                    if forward is not None:
+                        forward(status)
+                    gui_calls.post(about_bridge.refresh_updates)
+
+                checker.on_status = post_status_and_dates
+            if runtime_ready and runtime is not None:
+
+                def show_network() -> None:
+                    focuser.focus_shell()
+                    app_info.show_section(SECTION_NETWORK)
+
+                _wire_tray_updates(runtime.tray, updates_bridge, show_network)
+
+        update_checker = _start_update_checker(
+            settings, policy, gui_calls, runtime if runtime_ready else None, bind_updates
+        )
         if not args.hidden:
             focuser.focus_shell()
         return int(app.exec_())
     finally:
-        focuser.stop()
+        try:
+            focuser.stop()
+        except Exception:  # noqa: BLE001 — остальная очистка должна выполниться
+            log.warning("Не удалось остановить фокусировку окна")
+        if update_checker is not None:
+            try:
+                update_checker.stop()
+            except Exception:  # noqa: BLE001 — остальные ресурсы тоже нужно освободить
+                log.warning("Не удалось остановить проверку обновлений")
+            # Замыкание держит _GuiCalls: последняя ссылка на QObject отпускается
+            # здесь, в GUI-потоке, а не в рабочем (урок 025).
+            update_checker.on_event = None
+            update_checker.on_status = None
+        # Цикл aboutBridge → stats → on_append → aboutBridge разрываем здесь же,
+        # в GUI-потоке (урок 025).
+        runtime_stats = getattr(runtime, "stats", None) if runtime is not None else None
+        if runtime_stats is not None:
+            runtime_stats.on_append = None
         # US-8.4: выход из трея и SIGTERM/SIGINT вызывают app.quit() и приходят
         # сюда. После отмены фокуса освобождаем воркер и захваты, затем lock/ipc и UI.
         if onboarding is not None:
@@ -1086,6 +1299,8 @@ def main(argv: list[str] | None = None) -> int:
                 runtime.shutdown()
             except Exception:  # noqa: BLE001 — ошибка диктовки не должна оставить lock/ipc
                 log.warning("Не удалось завершить диктовку")
+        # Затворы постов в Qt закрываются до разрушения QApplication (урок 026).
+        shutdown_notify_dispatch()
         try:
             shutdown_bus_threads()
         except Exception:  # noqa: BLE001 — ошибка D-Bus не должна оставить lock/ipc

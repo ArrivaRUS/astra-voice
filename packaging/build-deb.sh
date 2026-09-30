@@ -108,9 +108,12 @@ fi
 
 # --- версия для кода ----------------------------------------------------------
 say "версия $VERSION (SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH, режим $MODE)"
+BUILD_DATE="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%d)"
 cat >"$ROOT/src/astra_voice/_version.py" <<EOF
 # Сгенерировано packaging/build-deb.sh из packaging/debian/changelog. Не править.
 __version__ = "$VERSION"
+# Дата сборки (из SOURCE_DATE_EPOCH) — для раздела «О программе».
+__build_date__ = "$BUILD_DATE"
 EOF
 
 # --- vendor -------------------------------------------------------------------

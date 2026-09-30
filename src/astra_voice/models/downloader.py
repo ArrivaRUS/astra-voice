@@ -32,7 +32,8 @@ _CONTENT_RANGE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)", re.IGNORECASE)
 # к следующему источнику с сохранённым .part. bad-checksum полного файла и too-large
 # удаляют .part и переходят дальше; после неверной суммы при докачке сначала один
 # повтор того же источника с нуля. not-allowed, no-network, cancelled и disk-full
-# не запускают перебор источников.
+# не запускают перебор источников. short-read бывает и от HTTP-слоя: обрыв посреди тела
+# (IncompleteRead urllib3 2.x, оборванный chunked, сброс соединения) — см. net.http._body_error.
 _MIRROR_CODES = frozenset({"host-unreachable", "timeout", "bad-status", "short-read"})
 
 

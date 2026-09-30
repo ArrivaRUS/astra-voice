@@ -20,6 +20,8 @@ from astra_voice.worker.supervisor import WorkerSupervisor
 log = logging.getLogger(__name__)
 
 SMOKE_WAV_NAME = "smoke-ru.wav"
+# Длина эталона smoke-ru.wav в секундах: основа дедлайна самопроверки.
+SMOKE_REFERENCE_S = 1.6
 SMOKE_EXPECT_ANY: tuple[str, ...] = ("проверка", "связи")
 
 

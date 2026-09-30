@@ -26,6 +26,8 @@ LOOKAHEAD_S = 0.002
 DEFAULT_CANDIDATES = ("Ctrl+Shift+Space", "Ctrl+Alt+D")
 BUSY_MESSAGE = "Комбинация занята другой программой (возможно Handy или переключатель ввода)"
 ResultCode = Literal["ok", "busy", "bad-combo", "duplicate", "not-grabbed"]
+# Причина on_state после смены карты: ``mapping-regrab:<код>[;escape:<код>]``.
+MAPPING_REGRAB_PREFIX = "mapping-regrab:"
 
 
 class HotkeyMode(Enum):
@@ -71,10 +73,21 @@ class HotkeyEvent:
 
 @dataclass(frozen=True)
 class MappingEvent:
-    """Результаты перезахвата в порядке очереди, перед клавишами новой карты."""
+    """Результаты перезахвата в порядке очереди, перед клавишами новой карты.
+
+    Поля после ``escape`` — диагностика для журнала: вид MappingNotify, диапазон
+    keycode, изменились ли коды/маски блокировок, трогались ли захваты и время.
+    """
 
     combos: dict[str, GrabResult]
     escape: GrabResult | None
+    request: str = ""
+    first: int = 0
+    count: int = 0
+    keycode_changed: bool = False
+    masks_changed: bool = False
+    regrabbed: bool = False
+    elapsed_ms: float = 0.0
 
 
 class HotkeyFsm:
@@ -164,6 +177,11 @@ class X11HotkeyBackend:
         self._requested_combos: dict[str, None] = {}
         self._escape: ParsedCombo | None = None
         self._escape_requested = False
+        # Escape совпал с хоткеем: своего захвата у него нет.
+        self._escape_shared = False
+        # Фактически захваченные маски по (keycode, mods): снимать нужно именно их,
+        # даже если маски блокировок с тех пор сменились.
+        self._masks: dict[tuple[int, int], tuple[int, ...]] = {}
 
     def grab_combo(self, combo: str) -> GrabResult:
         if not self._x.open():
@@ -185,21 +203,33 @@ class X11HotkeyBackend:
             self._requested_combos[combo] = None
         return result
 
-    def _grab(self, parsed: ParsedCombo) -> GrabResult:
-        report = self._x.grab_key(parsed.keycode, parsed.mods)
+    def _grab(self, parsed: ParsedCombo, *, keep: tuple[int, ...] = ()) -> GrabResult:
+        masks = tuple(self._x.mask_variants(parsed.mods))
+        report = self._x.grab_key(parsed.keycode, parsed.mods, masks=masks, keep=keep)
         if report.ok:
+            self._masks[(parsed.keycode, parsed.mods)] = masks
             return GrabResult("ok", keycode=parsed.keycode, mods=parsed.mods)
         if report.bad_access:
             return GrabResult("busy", owner_hint=BUSY_MESSAGE)
         log.debug("захват X11 не выполнен: %s", report.per_mask)
         return GrabResult("not-grabbed")
 
+    def _release(self, parsed: ParsedCombo, masks: tuple[int, ...] | None = None) -> None:
+        """Снимает сохранённые маски клавиши (или только ``masks``)."""
+        key = (parsed.keycode, parsed.mods)
+        if masks is None:
+            masks = self._masks.pop(key, None)
+        if masks is None:
+            self._x.ungrab_key(parsed.keycode, parsed.mods)
+        elif masks:
+            self._x.ungrab_key(parsed.keycode, parsed.mods, masks=masks)
+
     def ungrab_combo(self, combo: str) -> GrabResult:
         self._requested_combos.pop(combo, None)
         parsed = self._combos.pop(combo, None)
         if parsed is None:
             return GrabResult("not-grabbed")
-        self._x.ungrab_key(parsed.keycode, parsed.mods)
+        self._release(parsed)
         return GrabResult("ok")
 
     def grab_escape(self) -> GrabResult:
@@ -214,42 +244,156 @@ class X11HotkeyBackend:
         except X11Unavailable:
             return GrabResult("not-grabbed")
         # Escape может быть самим хоткеем: его основной захват не снимаем.
-        if any((p.mods, p.keycode) == (parsed.mods, parsed.keycode) for p in self._combos.values()):
+        if self._shares_combo(parsed):
             self._escape = parsed
             self._escape_requested = True
+            self._escape_shared = True
             return GrabResult("ok", keycode=parsed.keycode)
         result = self._grab(parsed)
         if result.ok:
             self._escape = parsed
             self._escape_requested = True
+            self._escape_shared = False
         return result
+
+    def _shares_combo(self, parsed: ParsedCombo) -> bool:
+        return any(
+            (p.mods, p.keycode) == (parsed.mods, parsed.keycode) for p in self._combos.values()
+        )
 
     def ungrab_escape(self) -> None:
         self._escape_requested = False
         parsed, self._escape = self._escape, None
-        if parsed is not None and not any(
-            (p.mods, p.keycode) == (parsed.mods, parsed.keycode) for p in self._combos.values()
-        ):
-            self._x.ungrab_key(parsed.keycode, parsed.mods)
+        shared, self._escape_shared = self._escape_shared, False
+        if parsed is not None and not shared and not self._shares_combo(parsed):
+            self._release(parsed)
+
+    def _move(self, old: ParsedCombo | None, parsed: ParsedCombo) -> tuple[GrabResult, bool, bool]:
+        """Переносит захват на новую карту без окна, когда клавиша не захвачена.
+
+        Возвращает результат, изменился ли keycode и трогались ли захваты.
+        Сначала захватываются новые маски, потом снимаются лишние старые;
+        при неудаче старый захват тоже снимается: он относится к прежней карте.
+        """
+        masks = tuple(self._x.mask_variants(parsed.mods))
+        new_key = (parsed.keycode, parsed.mods)
+        old_key = (old.keycode, old.mods) if old is not None else None
+        old_masks = self._masks.get(old_key, ()) if old_key is not None else ()
+        keycode_changed = old is not None and old.keycode != parsed.keycode
+        if old_key == new_key and old_masks == masks:
+            return GrabResult("ok", keycode=parsed.keycode, mods=parsed.mods), False, False
+        keep = old_masks if old_key == new_key else ()
+        result = self._grab(parsed, keep=keep)
+        # При отказе старый захват тоже снимается: он поставлен по прежней карте, и его
+        # keycode/маски могут уже означать другую клавишу. Держать его — значит ловить
+        # чужие нажатия; хоткей честно считается потерянным, повтор ведёт runtime.
+        if old is not None:
+            if result.ok and old_key == new_key:
+                stale = tuple(mask for mask in old_masks if mask not in masks)
+                self._release(old, stale)
+            else:
+                self._release(old)
+        return result, keycode_changed, True
+
+    def _remap_combo(self, combo: str) -> tuple[GrabResult, bool, bool]:
+        old = self._combos.pop(combo, None)
+        try:
+            parsed = self._x.parse_combo(combo)
+        except (BadCombo, X11Unavailable) as exc:
+            if old is not None:
+                self._release(old)
+            code: ResultCode = "bad-combo" if isinstance(exc, BadCombo) else "not-grabbed"
+            return GrabResult(code), old is not None, old is not None
+        result, keycode_changed, touched = self._move(old, parsed)
+        if result.ok:
+            self._combos[combo] = parsed
+        return result, keycode_changed, touched
+
+    def _remap_escape(self) -> tuple[GrabResult, bool, bool]:
+        old = None if self._escape_shared else self._escape
+        old_keycode = self._escape.keycode if self._escape is not None else None
+        self._escape = None
+        self._escape_shared = False
+        try:
+            parsed = self._x.parse_combo("Escape")
+        except (BadCombo, X11Unavailable) as exc:
+            if old is not None:
+                self._release(old)
+            code: ResultCode = "bad-combo" if isinstance(exc, BadCombo) else "not-grabbed"
+            return GrabResult(code), old is not None, old is not None
+        changed = old_keycode is not None and old_keycode != parsed.keycode
+        if self._shares_combo(parsed):
+            if old is not None:
+                self._release(old)
+            self._escape = parsed
+            self._escape_shared = True
+            return GrabResult("ok", keycode=parsed.keycode), changed, old is not None
+        result, _, touched = self._move(old, parsed)
+        if result.ok:
+            self._escape = parsed
+        return result, changed, touched
+
+    def _drop_all(self) -> None:
+        """Карта неизвестна: снимаем прежние захваты по сохранённым маскам."""
+        if self._escape is not None and not self._escape_shared:
+            self._release(self._escape)
+        self._escape = None
+        self._escape_shared = False
+        for parsed in self._combos.values():
+            self._release(parsed)
+        self._combos.clear()
 
     def _refresh_mapping(self, event: Any) -> MappingEvent:
-        """Снимает старые маски до обновления карты, затем захватывает новые."""
+        """Пересчитывает карту и перезахватывает только изменившееся.
+
+        Xorg шлёт MappingNotify при каждой смене источника клавиш (физическая
+        клавиатура ↔ XTest). Если keycode и маски блокировок те же, захват не
+        трогается вовсе: снятие и повторный захват оставляли окно, в котором
+        нажатие уходило в окно фокуса, а неудача убивала хоткей до следующей
+        нотификации.
+        """
+        from Xlib import X
+
+        started = time.monotonic()
         combos = list(self._requested_combos)
         escape = self._escape_requested
-        self.ungrab_escape()
-        for combo in combos:
-            self.ungrab_combo(combo)
+        old_locks = dict(self._x.lock_masks)
+        keycode_changed = masks_changed = touched = False
         if not self._x.refresh_keyboard_mapping(event):
+            touched = bool(self._combos) or self._escape is not None
+            self._drop_all()
             failed = GrabResult("not-grabbed")
             results = dict.fromkeys(combos, failed)
             escape_result = failed if escape else None
         else:
-            results = {combo: self.grab_combo(combo) for combo in combos}
-            escape_result = self.grab_escape() if escape else None
+            masks_changed = old_locks != self._x.lock_masks
+            results = {}
+            for combo in combos:
+                results[combo], changed, moved = self._remap_combo(combo)
+                keycode_changed |= changed
+                touched |= moved
+            escape_result = None
+            if escape:
+                escape_result, changed, moved = self._remap_escape()
+                keycode_changed |= changed
+                touched |= moved
         # Промежуточная карта может быть неполной; следующая нотификация повторит попытку.
         self._requested_combos = dict.fromkeys(combos)
         self._escape_requested = escape
-        return MappingEvent(results, escape_result)
+        request = int(getattr(event, "request", -1))
+        return MappingEvent(
+            results,
+            escape_result,
+            request={X.MappingModifier: "modifier", X.MappingKeyboard: "keyboard"}.get(
+                request, str(request)
+            ),
+            first=int(getattr(event, "first_keycode", 0)),
+            count=int(getattr(event, "count", 0)),
+            keycode_changed=keycode_changed,
+            masks_changed=masks_changed,
+            regrabbed=touched,
+            elapsed_ms=(time.monotonic() - started) * 1000,
+        )
 
     def poll_events(self, timeout: float = 0.0) -> list[HotkeyEvent | MappingEvent]:
         pending = self._x.pending_events()
@@ -304,6 +448,8 @@ class HotkeyManager:
     код последней операции, включая ``not-grabbed``, доступен в ``last_result``.
     После смены карты ``on_state`` получает причину ``mapping-regrab:<код>``
     и результат Escape, если он был захвачен; состояние автомата сохраняется.
+    Если перезахват не удался, повторный ``grab()`` того же сочетания
+    восстанавливает захват, не сбрасывая автомат (повтор ведёт runtime).
     """
 
     def __init__(
@@ -327,8 +473,29 @@ class HotkeyManager:
         self._escape_grabbed = False
         self._escape_keycode: int | None = None
         self._key_down = False
+        # Перезахват после смены карты не удался; grab() того же сочетания восстановит.
+        self._lost = False
+        # Диагностика журнала: пары автоповтора за удержание и пропуски нажатий подряд.
+        self._repeat_pairs = 0
+        self._skipped_presses = 0
 
     def grab(self, combo: str, mode: HotkeyMode) -> GrabResult:
+        if combo == self._combo and self._lost:
+            # Захват потерян после смены карты: восстанавливаем, автомат не трогаем.
+            result = self.backend.grab_combo(combo)
+            if result.ok:
+                self._lost = False
+                self._keycode = result.keycode
+                self._mods = result.mods
+                self._key_down = False
+                # Escape нужен, пока автомат не в IDLE; если он пропал вместе с хоткеем —
+                # возвращаем и его.
+                if self.fsm.state != HotkeyState.IDLE and not self._escape_grabbed:
+                    self.escape_result = self.backend.grab_escape()
+                    self._escape_grabbed = self.escape_result.ok
+                    self._escape_keycode = self.escape_result.keycode
+            self.last_result = result
+            return result
         if combo == self._combo:
             self.last_result = GrabResult("duplicate")
             return self.last_result
@@ -352,6 +519,7 @@ class HotkeyManager:
         self._combo = None
         self._keycode = None
         self._key_down = False
+        self._lost = False
         # События старого захвата не должны запустить следующую запись.
         self.backend.poll_events()
 
@@ -394,17 +562,52 @@ class HotkeyManager:
             and self._escape_grabbed
             and event.kind == "KeyPress"
         ):
+            before = self.fsm.state
             self.fsm.escape(now)
             callback = self.on_escape
+            log.info("хоткей: Escape, автомат %s→%s", before.value, self.fsm.state.value)
         elif event.keycode == self._keycode:
+            before = self.fsm.state
             if event.kind == "KeyPress" and matches_combo and not self._key_down:
                 self._key_down = True
+                self._repeat_pairs = 0
+                self._skipped_presses = 0
                 self.fsm.press(now)
                 callback = self.on_press
+                log.info(
+                    "хоткей: нажатие keycode=%d mods=%#x key_down=1, автомат %s→%s",
+                    event.keycode,
+                    event.mods,
+                    before.value,
+                    self.fsm.state.value,
+                )
             elif event.kind == "KeyRelease" and self._key_down:
                 self._key_down = False
+                self._skipped_presses = 0
                 self.fsm.release(now)
                 callback = self.on_release
+                log.info(
+                    "хоткей: отпускание keycode=%d mods=%#x key_down=0, автомат %s→%s, "
+                    "отфильтровано пар автоповтора: %d",
+                    event.keycode,
+                    event.mods,
+                    before.value,
+                    self.fsm.state.value,
+                    self._repeat_pairs,
+                )
+            elif event.kind == "KeyPress":
+                # Первый пропуск подряд — INFO, остальные до следующего нажатия — DEBUG.
+                self._skipped_presses += 1
+                log.log(
+                    logging.INFO if self._skipped_presses == 1 else logging.DEBUG,
+                    "хоткей: нажатие пропущено: fsm=%s key_down=%d mods=%#x, ожидались %#x",
+                    self.fsm.state.value,
+                    self._key_down,
+                    event.mods,
+                    self._mods,
+                )
+            else:
+                log.debug("хоткей: отпускание без нажатия пропущено, mods=%#x", event.mods)
         if callback is not None:
             callback()
         self.last_result = GrabResult("ok")
@@ -412,6 +615,7 @@ class HotkeyManager:
 
     def _handle_mapping(self, event: MappingEvent) -> None:
         """Обновляет коды и сообщает наружу как успех, так и отказ перезахвата."""
+        self._log_mapping(event)
         if self._combo is None or self._combo not in event.combos:
             return
         self.last_result = event.combos[self._combo]
@@ -419,7 +623,8 @@ class HotkeyManager:
             self._key_down = False
         self._keycode = self.last_result.keycode
         self._mods = self.last_result.mods
-        reason = f"mapping-regrab:{self.last_result.code}"
+        self._lost = not self.last_result.ok
+        reason = f"{MAPPING_REGRAB_PREFIX}{self.last_result.code}"
         if event.escape is not None:
             self.escape_result = event.escape
             self._escape_grabbed = event.escape.ok
@@ -427,6 +632,29 @@ class HotkeyManager:
             reason += f";escape:{event.escape.code}"
         if self.on_state is not None:
             self.on_state(self.fsm.state, reason)
+
+    def _log_mapping(self, event: MappingEvent) -> None:
+        """Одна строка на MappingNotify: что пришло, что изменилось, что с захватом."""
+        if event.regrabbed:
+            parts = []
+            if self._combo is not None and self._combo in event.combos:
+                parts.append(f"хоткей={event.combos[self._combo].code}")
+            if event.escape is not None:
+                parts.append(f"escape={event.escape.code}")
+            outcome = ", ".join(parts) or "нечего перезахватывать"
+        else:
+            outcome = "не нужен"
+        log.info(
+            "хоткей: MappingNotify request=%s first=%d count=%d, keycode изменился: %s, "
+            "маски изменились: %s, перезахват: %s, %.1f мс",
+            event.request or "?",
+            event.first,
+            event.count,
+            "да" if event.keycode_changed else "нет",
+            "да" if event.masks_changed else "нет",
+            outcome,
+            event.elapsed_ms,
+        )
 
     def process_pending(self, now: float | None = None) -> GrabResult:
         """Разбирает очередь и убирает пары повтора, включая соседний read."""
@@ -451,6 +679,8 @@ class HotkeyManager:
                 and event.time == following.time
                 and event.mods == following.mods
             ):
+                if event.keycode == self._keycode:
+                    self._repeat_pairs += 1
                 index += 2
                 continue
             self.handle_event(event, self._clock() if now is None else now)

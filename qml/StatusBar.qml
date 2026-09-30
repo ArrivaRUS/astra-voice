@@ -1,6 +1,8 @@
 // Строка-статус — design/spec.md §2. Высота 36, фон bg-app, граница сверху 1 px.
 // Слева: иконка состояния + активная модель. Справа: состояние обновления · точка · версия (PT Mono).
-// В M1 живёт одно состояние справа — `disabled` (проверка обновлений отключена), серым, без клика.
+// Справа — подмножество v0.2 спеки §2.2 (M7-ядро): disabled · policy-locked · checking ·
+// uptodate (3000 мс, только после ручной проверки) · available · unavailable · error-net ·
+// skipped; плюс idle — только версия. Состояния установки — с M8.
 import QtQuick 2.15
 import QtQuick.Layouts 1.15
 import "components"
@@ -12,9 +14,37 @@ Item {
     property string modelState: "active"
     property string modelName: "GigaAM v3 RNN-T"
     property bool revocationUnknown: false
-    // Правая часть (§2.2). В M1 реализовано состояние 1 — `disabled`.
+    // Правая часть (§2.2): значения — как у updatesBridge.state (docs/ui-bridge.md §3.8).
     property string updateState: "disabled"
+    property string updateVersion: ""
+    // «Напомнить позже»: версия доступна, но без акцента.
+    property bool updateSnoozed: false
+    // Что показать после 3000 мс uptodate: idle (только версия) или disabled (тумблер выключен).
+    property string updateRestState: "idle"
     property string version: "v0.2.0"
+
+    // Клик или Enter/Space по кликабельному состоянию (§2.3: 5, 12, 15, 17).
+    signal updateActivated(string kind)
+
+    // «Установлена последняя версия» держится 3000 мс (token motion.duration.uptodate-message).
+    property bool uptodateShown: false
+    onUpdateStateChanged: {
+        uptodateShown = updateState === "uptodate"
+        if (uptodateShown)
+            uptodateTimer.restart()
+    }
+    Component.onCompleted: {
+        uptodateShown = updateState === "uptodate"
+        if (uptodateShown)
+            uptodateTimer.restart()
+    }
+
+    Timer {
+        id: uptodateTimer
+        interval: Theme.durationUptodateMessage
+        repeat: false
+        onTriggered: root.uptodateShown = false
+    }
 
     readonly property string modelText: {
         switch (modelState) {
@@ -31,9 +61,31 @@ Item {
 
     readonly property string updateText: {
         switch (updateState) {
+        case "idle": return "";
+        case "policy-locked": return qsTr("Проверка обновлений отключена (задано администратором)");
         case "checking": return qsTr("Проверяю обновления…");
+        case "uptodate": return uptodateShown ? qsTr("Установлена последняя версия")
+            : updateRestState === "disabled" ? qsTr("Проверка обновлений отключена") : "";
+        case "available": return qsTr("Доступна версия %1 · Подробнее").arg(updateVersion);
+        case "unavailable": return qsTr("Источник обновлений недоступен · Повторить");
+        case "error-net": return qsTr("Не удалось скачать обновление · Повторить");
+        case "skipped": return qsTr("Версия %1 пропущена · Показать").arg(updateVersion);
         default: return qsTr("Проверка обновлений отключена");
         }
+    }
+    readonly property string updateIcon: updateState === "policy-locked" ? "lock"
+        : updateState === "uptodate" && uptodateShown ? "check"
+        : updateState === "error-net" ? "alert" : ""
+    // available — единственный цветовой акцент внизу окна (§2.2).
+    readonly property bool updateAccent: updateState === "available" && !updateSnoozed
+    readonly property color updateColor: updateState === "error-net" ? Theme.dangerInk
+        : updateAccent ? Theme.statusbarAccentFg : Theme.statusbarFg
+    readonly property bool updateClickable: ["available", "unavailable", "error-net", "skipped"]
+        .indexOf(updateState) >= 0
+    // Строка перестала быть кликабельной — фокус с неё снимается, иначе он «висит» на тексте.
+    onUpdateClickableChanged: {
+        if (!updateClickable && updateItem.activeFocus)
+            updateItem.focus = false
     }
 
     implicitHeight: Theme.statusbarH
@@ -54,6 +106,8 @@ Item {
     Item {
         id: content
         anchors.fill: parent
+        // Центрируем по 35 px под верхней границей 1 px, а не по всей высоте 36.
+        anchors.topMargin: Theme.borderHairline
         anchors.leftMargin: Theme.cardRowPaddingX
         anchors.rightMargin: Theme.cardRowPaddingX
 
@@ -118,20 +172,82 @@ Item {
             id: updateRow
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            spacing: Theme.statusbarGap
+            spacing: 0
 
-            Text {
-                textFormat: Text.PlainText
-                text: root.updateText
-                color: Theme.statusbarFg
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontStatusbarSize
-                renderType: Text.NativeRendering
+            // Состояние обновления: иконка 12 + текст, зазор 5 (_shell.py:298).
+            Item {
+                id: updateItem
+                objectName: "statusUpdate"
+                visible: root.updateText !== ""
+                Layout.preferredWidth: updateLine.implicitWidth
+                Layout.preferredHeight: updateLine.implicitHeight
                 Layout.alignment: Qt.AlignVCenter
+                activeFocusOnTab: root.updateClickable
+                Accessible.role: root.updateClickable ? Accessible.Button : Accessible.StaticText
+                Accessible.name: root.updateText
+                Accessible.onPressAction: {
+                    if (root.updateClickable)
+                        root.updateActivated(root.updateState)
+                }
+
+                Keys.onPressed: {
+                    if (root.updateClickable && (event.key === Qt.Key_Return
+                            || event.key === Qt.Key_Enter || event.key === Qt.Key_Space)) {
+                        root.updateActivated(root.updateState)
+                        event.accepted = true
+                    }
+                }
+
+                RowLayout {
+                    id: updateLine
+                    anchors.fill: parent
+                    spacing: 5
+
+                    Icon {
+                        name: root.updateIcon
+                        size: 12
+                        color: root.updateColor
+                        visible: root.updateIcon !== ""
+                        Layout.alignment: Qt.AlignVCenter
+                    }
+
+                    Text {
+                        objectName: "statusUpdateText"
+                        textFormat: Text.PlainText
+                        text: root.updateText
+                        color: root.updateColor
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fontStatusbarSize
+                        font.weight: root.updateAccent ? Font.Medium : Font.Normal
+                        renderType: Text.NativeRendering
+                        Layout.alignment: Qt.AlignVCenter
+                    }
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    enabled: root.updateClickable
+                    cursorShape: root.updateClickable ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: root.updateActivated(root.updateState)
+                }
+
+                // Кольцо фокуса по общему правилу (§2.3): 2 px, зазор 2, радиус 8.
+                Rectangle {
+                    anchors.fill: parent
+                    anchors.margins: -(Theme.focusOffset + Theme.focusWidth)
+                    radius: Theme.focusRadius
+                    color: "transparent"
+                    border.width: Theme.focusWidth
+                    border.color: Theme.stateFocusRing
+                    antialiasing: true
+                    visible: updateItem.activeFocus
+                }
             }
 
             // Точка-разделитель 4 px с полями 8 (§2).
             Item {
+                Layout.leftMargin: updateItem.visible ? Theme.statusbarGap : 0
+                Layout.rightMargin: Theme.statusbarGap
                 Layout.preferredWidth: Theme.statusbarSeparatorDot + Theme.titlebarGap * 2
                 Layout.preferredHeight: Theme.statusbarSeparatorDot
                 Layout.alignment: Qt.AlignVCenter
