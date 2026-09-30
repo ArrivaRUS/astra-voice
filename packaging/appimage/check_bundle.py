@@ -77,6 +77,7 @@ HOST_PACKAGES: dict[str, str] = {
     "pipewire-pulse": "звуковой сервер хоста",
     "pulseaudio": "звуковой сервер хоста",
     "wireplumber": "звуковой сервер хоста",
+    "xdg-utils": "xdg-open хоста",
 }
 #: Модули бандла сверх `control`, без которых AppImage не работает.
 EXTRA_MODULES = ("onnxruntime", "onnx_asr", "ssl", "certifi")
