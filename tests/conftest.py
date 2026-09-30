@@ -358,7 +358,11 @@ def no_system_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
     bootstrap при запрете AppImage делает exec системной версии, userinstall.unregister()
     перенацеливает на неё автозапуск; тест, которому нужна «системная версия», подменяет путь сам.
     """
-    from astra_voice.core import paths
+    try:
+        from astra_voice.core import paths
+    except ImportError:
+        # Сторож сбора (test_collection_guard) копирует conftest в песочницу без пакета.
+        return
 
     monkeypatch.setattr(paths, "SYSTEM_EXECUTABLE", Path("/nonexistent/astra-voice"))
 
