@@ -514,6 +514,11 @@ class WorkerState:
             return [error("engine-failed", "Не удалось загрузить движок.")]
         self._engine = engine
         self._sessions = result.sessions
+        warm_up = getattr(self._capture, "warm_up", None)
+        if callable(warm_up):
+            # После загрузки модели, до первого нажатия: холодный путь записи без микрофона.
+            # Устройство из настроек приходит только с record.start; первый прогрев — по умолчанию.
+            warm_up(self._device)
         self._loaded = {
             "type": "model.loaded",
             "id": identity[0],

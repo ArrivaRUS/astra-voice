@@ -1880,7 +1880,8 @@ def test_capture_bounds_label_in_event_and_log(
     prefix = "Источник записи готов: "
     suffix = " t_ms=0"
     assert caplog.messages == [
-        prefix + "М" * (MAX_DEVICE_LABEL - len(prefix) - len(suffix) - 1) + "…" + suffix
+        prefix + "М" * (MAX_DEVICE_LABEL - len(prefix) - len(suffix) - 1) + "…" + suffix,
+        "Первый звук после готовности источника не пришёл: нулевых порций=0",
     ]
     assert len(caplog.messages[0]) == MAX_DEVICE_LABEL
     assert label not in caplog.text
@@ -1963,7 +1964,17 @@ def test_record_start_rejects_unsafe_default_before_libpulse(
     )
     assert encode(event)
     assert "alsa_" not in str(event)
-    assert all(record.levelno == logging.DEBUG for record in caplog.records)
+    # Выше DEBUG — только счётчик повторов первого открытия, без имён устройств.
+    assert all(
+        record.levelno == logging.DEBUG
+        or record.getMessage().startswith("Повтор открытия записи после старта программы")
+        for record in caplog.records
+    )
+    assert not any(
+        "alsa_" in record.getMessage()
+        for record in caplog.records
+        if record.levelno > logging.DEBUG
+    )
     assert events.empty()
     assert probe.errors.get_nowait()[1] == ERROR_NO_DEVICE
     assert probe.errors.empty()
@@ -3285,3 +3296,105 @@ def test_pulse_record_deadline_while_native_read_is_blocked(
     assert probe.errors.empty()
     source_backend.assert_released(1)
     source_backend.assert_owner(owner.ident)
+
+
+class _ColdSource:
+    """Источник, чьи первые порции — нули: устройство оживает не сразу после готовности."""
+
+    def __init__(self, probe_clock: Callable[[], None], zeros: int) -> None:
+        self._open = False
+        self._tick = probe_clock
+        self._chunks = [bytes(CHUNK_BYTES)] * zeros + [b"\x10\x00" * (CHUNK_BYTES // 2)] * 3
+        self.warmed: list[str | None] = []
+
+    def open(self, device: str | None) -> None:
+        self._open = True
+
+    def read_chunk(self) -> bytes | None:
+        self._tick()
+        return self._chunks.pop(0) if self._chunks else None
+
+    def warm_up(self, device: str | None) -> None:
+        self.warmed.append(device)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self._open = False
+
+    is_open = property(lambda self: self._open)
+    ended = property(lambda self: not self._chunks)
+    live = property(lambda self: True)
+    device_name = property(lambda self: None)
+
+
+def test_first_sound_after_ready_is_logged_without_content(
+    wait_capture: Callable[[], None],
+    probes: list[CaptureProbe],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Жалоба 30.09 «съедено начало первой фразы»: журнал называет задержку до звука."""
+    holder: list[CaptureProbe] = []
+    source = _ColdSource(lambda: setattr(holder[0], "now", holder[0].now + 0.02), zeros=10)
+    probe = CaptureProbe(source)
+    holder.append(probe)
+    probes.append(probe)
+    with caplog.at_level(logging.INFO, logger="astra_voice.worker.audio"):
+        probe.capture.start("u1", None, limit_s=5)
+        wait_capture()
+    lines = [r.getMessage() for r in caplog.records if "Первый звук" in r.getMessage()]
+    assert lines == ["Первый звук после готовности источника: t_ms=220, нулевых порций=10"]
+    # Все порции, включая нулевые, дошли до автомата: замер ничего не отбрасывает.
+    assert len(probe.samples) == 13
+
+
+def test_first_sound_never_arrives_is_logged_once(
+    wait_capture: Callable[[], None],
+    probes: list[CaptureProbe],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = _ColdSource(lambda: None, zeros=0)
+    source._chunks = [bytes(CHUNK_BYTES)] * 3
+    probe = CaptureProbe(source)
+    probes.append(probe)
+    with caplog.at_level(logging.INFO, logger="astra_voice.worker.audio"):
+        probe.capture.start("silent", None, limit_s=5)
+        wait_capture()
+    lines = [r.getMessage() for r in caplog.records if "Первый звук" in r.getMessage()]
+    assert lines == ["Первый звук после готовности источника не пришёл: нулевых порций=3"]
+    assert len(probe.samples) == 3
+
+
+def test_warm_up_runs_once_and_not_during_recording(
+    wait_capture: Callable[[], None], probes: list[CaptureProbe]
+) -> None:
+    source = _ColdSource(lambda: None, zeros=0)
+    probe = CaptureProbe(source)
+    probes.append(probe)
+    assert probe.capture.warm_up("mic") is True
+    assert probe.capture.warm_up("mic") is False
+    wait_capture()
+    assert source.warmed == ["mic"]
+
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockingColdSource(_ColdSource):
+        def read_chunk(self) -> bytes | None:
+            entered.set()
+            assert release.wait(TIMEOUT)
+            return None
+
+    recording_source = BlockingColdSource(lambda: None, zeros=0)
+    recording_probe = CaptureProbe(recording_source)
+    probes.append(recording_probe)
+    recording_probe.capture.start("recording", None, limit_s=5)
+    try:
+        assert entered.wait(TIMEOUT)
+        assert recording_probe.capture.warm_up("mic") is False
+        assert recording_probe.capture._warmed is False
+        assert recording_source.warmed == []
+    finally:
+        recording_probe.capture.request_stop()
+        release.set()
+        wait_capture()
