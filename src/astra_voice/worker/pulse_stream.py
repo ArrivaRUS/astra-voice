@@ -1,10 +1,20 @@
-"""Запись через pa_stream; прогрев в audio-warmup создаёт отдельное соединение."""
+"""Запись через pa_stream на постоянном контексте, без собственного потока mainloop.
+
+Контекст создаёт audio-warmup либо первый open в потоке захвата. Вызывающий
+крутит mainloop только под замком источника; в простое цикл не работает.
+shutdown освобождает контекст при выходе, open пересоздаёт его после FAILED.
+Интроспекция и провайдер устройств работают только под тем же RLock; провайдер
+может вызываться любым потоком воркера с ограниченным ожиданием замка. Кэш
+обновляется по подписке; без контекста и для simple остаётся pactl/pw-dump.
+Микрофон (pa_stream) живёт только от open до close, согласно PRD §9.5.
+"""
 
 from __future__ import annotations
 
 import argparse
 import ctypes
 import logging
+import subprocess
 import threading
 import time
 from collections import deque
@@ -40,6 +50,9 @@ from astra_voice.worker.audio import (
     FreshDevices,
     ManagedSource,
     PulseSimpleSource,
+    _build_devices,
+    _clear_device_introspection,
+    _default_from_name,
     _OpenDeadline,
     _PaBufferAttr,
     _PaSampleSpec,
@@ -48,6 +61,7 @@ from astra_voice.worker.audio import (
     invalidate_device_cache,
     list_devices,
     select_device,
+    set_device_introspection,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,6 +103,40 @@ KILLED_WAIT_S = 0.250
 SERVER_WAIT_S = 0.200
 # В очередь попадают только REMOVE источников и moved; SERVER CHANGE хранится флагом.
 EVENT_QUEUE_LIMIT = 64
+IDLE_DISPATCH_LIMIT = 64
+
+
+class _PaSourceInfoPrefix(ctypes.Structure):
+    """Только читаемый префикс pa_source_info из introspect.h."""
+
+    _fields_ = [
+        ("name", ctypes.c_char_p),
+        ("index", ctypes.c_uint32),
+        ("description", ctypes.c_char_p),
+    ]
+
+
+class _PaServerInfoPrefix(ctypes.Structure):
+    """Префикс pa_server_info до cookie; channel_map расположен после cookie."""
+
+    _fields_ = [
+        ("user_name", ctypes.c_char_p),
+        ("host_name", ctypes.c_char_p),
+        ("server_version", ctypes.c_char_p),
+        ("server_name", ctypes.c_char_p),
+        ("sample_spec", _PaSampleSpec),
+        ("default_sink_name", ctypes.c_char_p),
+        ("default_source_name", ctypes.c_char_p),
+    ]
+
+
+SourceInfoCallback = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.POINTER(_PaSourceInfoPrefix), ctypes.c_int, ctypes.c_void_p
+)
+ServerInfoCallback = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.POINTER(_PaServerInfoPrefix), ctypes.c_void_p
+)
+
 
 SubscribeCallback = ctypes.CFUNCTYPE(
     None, ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p
@@ -105,7 +153,7 @@ class _OpenCancelled(Exception):
 
 
 class _PulseAsync:
-    """Явный ABI libpulse и небольшие помощники однопоточного цикла."""
+    """Явный ABI libpulse; вызывающий сериализует mainloop замком источника."""
 
     def __init__(self) -> None:
         self.mainloop: int | None = None
@@ -213,6 +261,32 @@ class _PulseAsync:
         self.lib.pa_strerror.argtypes = [ctypes.c_int]
         self.lib.pa_strerror.restype = ctypes.c_char_p
 
+        # Необязательный ABI: старый libpulse по-прежнему может записывать звук.
+        self.has_introspection = False
+        try:
+            self.lib.pa_context_get_source_info_list.argtypes = [
+                ctypes.c_void_p,
+                SourceInfoCallback,
+                ctypes.c_void_p,
+            ]
+            self.lib.pa_context_get_source_info_list.restype = ctypes.c_void_p
+            self.lib.pa_context_get_server_info.argtypes = [
+                ctypes.c_void_p,
+                ServerInfoCallback,
+                ctypes.c_void_p,
+            ]
+            self.lib.pa_context_get_server_info.restype = ctypes.c_void_p
+        except AttributeError:
+            logger.debug("Интроспекция libpulse недоступна.")
+        else:
+            self.has_introspection = True
+
+    def context_get_source_info_list(self, ctx: int, callback: Any) -> int | None:
+        return cast(int | None, self.lib.pa_context_get_source_info_list(ctx, callback, None))
+
+    def context_get_server_info(self, ctx: int, callback: Any) -> int | None:
+        return cast(int | None, self.lib.pa_context_get_server_info(ctx, callback, None))
+
     def mainloop_new(self) -> int | None:
         return cast(int | None, self.lib.pa_mainloop_new())
 
@@ -306,15 +380,17 @@ class _PulseAsync:
     def strerror(self, error: int) -> bytes | None:
         return cast(bytes | None, self.lib.pa_strerror(error))
 
-    def iterate(self, timeout_us: int) -> None:
-        """Одна итерация; timeout у prepare измеряется в микросекундах."""
+    def iterate(self, timeout_us: int) -> int:
+        """Число обработанных событий; timeout у prepare измеряется в микросекундах."""
         assert self.mainloop is not None
         if self.mainloop_prepare(self.mainloop, timeout_us) < 0:
             raise _PulseFailure
         if self.mainloop_poll(self.mainloop) < 0:
             raise _PulseFailure
-        if self.mainloop_dispatch(self.mainloop) < 0:
+        dispatched = self.mainloop_dispatch(self.mainloop)
+        if dispatched < 0:
             raise _PulseFailure
+        return dispatched
 
     def peek(self, stream: int) -> bytes | int | None:
         """Копирует данные до drop; int означает дыру, None — пустой буфер."""
@@ -359,10 +435,16 @@ class _Event:
 
 
 class PulseStreamSource:
-    """Управляемый источник PCM16 без собственных потоков и фоновых соединений.
+    """PCM16 с постоянными _PulseAsync, pa_mainloop и pa_context под одним RLock.
 
-    warm_up вызывается из audio-warmup: он читает только неизменяемые после __init__
-    _factory, _devices, _default и _clock и создаёт своё соединение локально.
+    Контекст создаёт warm_up в audio-warmup либо первый open в потоке захвата.
+    Только вызывающий под _ctx_lock крутит mainloop: warm_up при подготовке,
+    open/read_chunk (и flush) при захвате; между записями цикл никто не крутит.
+    Провайдер вызывается любым потоком воркера с таймаутом замка; интроспекция
+    только под замком, кэш обновляется по SOURCE/SERVER, без TTL.
+    shutdown при выходе воркера освобождает тройку; open пересоздаёт её после
+    FAILED/TERMINATED. pa_stream создаётся только в open и освобождается
+    в close/_release: вне записи микрофон закрыт (PRD §9.5).
     """
 
     def __init__(
@@ -379,6 +461,19 @@ class PulseStreamSource:
         self._default = default
         self._clock = clock
         self._sleep = sleep
+        self._ctx_lock = threading.RLock()
+        self._context_dead = False
+        self._devices_changed = False
+        self._introspection_stale = True
+        self._introspection_cache: tuple[list[AudioDevice], str | None] | None = None
+        self._info_rows: list[tuple[int, str, str | None]] | None = None
+        self._info_eol = 0
+        self._info_default: str | None = None
+        self._info_server_seen = False
+        self._info_failed = False
+        self._source_info_callback = SourceInfoCallback(self._on_source_info)
+        self._server_info_callback = ServerInfoCallback(self._on_server_info)
+        self._device_provider = self._provide_devices
         self._pulse: _PulseAsync | None = None
         self._mainloop: int | None = None
         self._context: int | None = None
@@ -408,6 +503,169 @@ class PulseStreamSource:
         self._probe_logging = False
         self._trace_states: dict[str, int] = {}
         self._trace_device: tuple[int, str | None] = (PA_INVALID_INDEX, None)
+
+    def _on_source_info(self, context: int, info: Any, eol: int, userdata: int) -> None:
+        """Копирует память libpulse до возврата из dispatch; решений здесь нет."""
+        try:
+            if self._info_rows is None:
+                return
+            if eol:
+                self._info_eol = eol
+            else:
+                item = info.contents
+                name = item.name.decode("utf-8", errors="replace")
+                description = (
+                    item.description.decode("utf-8", errors="replace")
+                    if item.description is not None
+                    else None
+                )
+                self._info_rows.append((item.index, name, description))
+        except Exception:
+            self._info_failed = True
+            logger.debug("Не удалось скопировать сведения об источнике записи.")
+
+    def _on_server_info(self, context: int, info: Any, userdata: int) -> None:
+        try:
+            if self._info_rows is None:
+                return
+            name = info.contents.default_source_name
+            self._info_default = (
+                name.decode("utf-8", errors="replace") if name is not None else None
+            )
+            self._info_server_seen = True
+        except Exception:
+            self._info_failed = True
+            logger.debug("Не удалось скопировать сведения о звуковой службе.")
+
+    def _introspect(self, deadline: _OpenDeadline) -> tuple[list[AudioDevice], str | None]:
+        """Под _ctx_lock читает оба снимка; wait_op ограничивает и освобождает операции."""
+        assert self._pulse is not None and self._context is not None
+        self._info_rows = []
+        self._info_eol = 0
+        self._info_default = None
+        self._info_server_seen = self._info_failed = False
+        # Событие во время ожидания операции должно оставить новый снимок stale.
+        self._introspection_stale = False
+        try:
+            deadline.remaining(OPEN_TOTAL_DEADLINE_S)
+            op = self._pulse.context_get_source_info_list(self._context, self._source_info_callback)
+            if not op:
+                raise _PulseFailure
+            self._pulse.wait_op(op, deadline)
+            if self._info_eol <= 0 or self._info_failed:
+                raise _PulseFailure
+            deadline.remaining(OPEN_TOTAL_DEADLINE_S)
+            op = self._pulse.context_get_server_info(self._context, self._server_info_callback)
+            if not op:
+                raise _PulseFailure
+            self._pulse.wait_op(op, deadline)
+            if not self._info_server_seen or self._info_failed or not self._context_ok():
+                raise _PulseFailure
+            devices = _build_devices(self._info_rows, deadline=deadline)
+            deadline.remaining(OPEN_TOTAL_DEADLINE_S)
+            self._introspection_cache = (devices, self._info_default)
+            return list(devices), self._info_default
+        except BaseException:
+            self._introspection_stale = True
+            raise
+        finally:
+            self._info_rows = None
+
+    def _cached_introspection(
+        self, deadline: _OpenDeadline
+    ) -> tuple[list[AudioDevice], str | None]:
+        if self._introspection_stale or self._introspection_cache is None:
+            return self._introspect(deadline)
+        devices, default = self._introspection_cache
+        return list(devices), default
+
+    def _provide_devices(
+        self, deadline: _OpenDeadline | None
+    ) -> tuple[list[AudioDevice], str | None] | None:
+        """Любой поток воркера: готовый контекст либо None, без создания pa_stream.
+
+        RLock допускает вызов из _check_list после dispatch в read_chunk. Колбэки
+        libpulse только сохраняют факты и никогда не вызывают этот провайдер.
+        """
+        budget = deadline or _OpenDeadline(self._clock)
+        acquired = False
+        try:
+            acquired = self._ctx_lock.acquire(timeout=budget.remaining(0.2))
+            if not acquired:
+                return None
+            if (
+                self._context is None
+                or self._pulse is None
+                or self._context_dead
+                or not self._pulse.has_introspection
+                or self._pulse.context_get_state(self._context) != PA_CONTEXT_READY
+            ):
+                return None
+            budget.remaining(OPEN_TOTAL_DEADLINE_S)
+            if self._stream is None and not self._dispatch_idle(budget):
+                return None
+            return self._cached_introspection(budget)
+        except Exception:
+            if acquired:
+                self._introspection_stale = True
+            logger.debug("Не удалось получить снимок устройств через libpulse.")
+            return None
+        finally:
+            if acquired:
+                self._ctx_lock.release()
+
+    def _select_device(self, device: str | None, budget: _OpenDeadline) -> AudioDevice:
+        """Боевой путь вызывается под замком после подготовки и idle dispatch."""
+        snapshot = None
+        introspection_failed = False
+        if (
+            self._devices is None
+            and self._pulse is not None
+            and self._context is not None
+            and not self._context_dead
+            and self._pulse.has_introspection
+        ):
+            try:
+                snapshot = self._cached_introspection(budget)
+            except (AudioError, _PulseFailure):
+                introspection_failed = True
+                logger.debug("Интроспекция выбора устройства недоступна.")
+        if snapshot is not None:
+            devices, name = snapshot
+            selected, _ = select_device(
+                device,
+                devices_fn=lambda **_: devices,
+                default_fn=lambda items, **_: _default_from_name(name, items),
+                clock=self._clock,
+                deadline=budget,
+                use_cache=False,
+            )
+        else:
+
+            def devices_fn(*, deadline: _OpenDeadline | None) -> list[AudioDevice]:
+                if self._devices is not None:
+                    return self._devices()
+                if introspection_failed:
+                    return list_devices(run=fallback_run, deadline=deadline)
+                return list_devices(deadline=deadline)
+
+            def fallback_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(*args, **kwargs)
+
+            def default_fn(items: list[AudioDevice], **kwargs: Any) -> AudioDevice:
+                if introspection_failed and self._default is default_device:
+                    return default_device(items, run=fallback_run, **kwargs)
+                return self._default(items, **kwargs)
+
+            selected, _ = select_device(
+                device,
+                devices_fn=devices_fn,
+                default_fn=default_fn,
+                clock=self._clock,
+                deadline=budget,
+                use_cache=self._devices is None,
+            )
+        return selected
 
     def _trace_state(self, object_name: str, state: int) -> None:
         """Отмечает наблюдаемые переходы, не добавляя вызовов libpulse."""
@@ -465,7 +723,7 @@ class PulseStreamSource:
         deadline: _OpenDeadline | None = None,
         running: threading.Event | None = None,
     ) -> None:
-        """Выбирает устройство до libpulse, подписывается и создаёт закреплённый поток."""
+        """Готовит контекст, выбирает устройство и создаёт закреплённый поток захвата."""
         self.close()
         self._running = running
         budget = deadline or _OpenDeadline(self._clock)
@@ -473,58 +731,118 @@ class PulseStreamSource:
         try:
             self._check_open(budget)
 
-            def devices_fn(*, deadline: _OpenDeadline | None) -> list[AudioDevice]:
-                return list_devices(deadline=deadline) if self._devices is None else self._devices()
-
-            selected, _ = select_device(
-                device,
-                devices_fn=devices_fn,
-                default_fn=self._default,
-                clock=self._clock,
-                deadline=budget,
-                use_cache=self._devices is None,
-            )
+            selected = self._select_device(device, budget) if self._devices is not None else None
             self._check_open(budget)
-            selected_at = self._clock()
-            self._pulse = self._factory()
-            for attempt in range(OPEN_RETRIES):
-                self._check_open(budget)
-                self._selected_device = selected
-                self._device_name = selected.name
-                self.device_label = selected.label
-                self._default_mode = device is None
-                try:
-                    self._connect(selected, budget)
-                    # Подключение включает создание _PulseAsync (загрузку libpulse)
-                    # и паузы повторов.
-                    logger.info(
-                        "Источник записи открыт: %s выбор_ms=%d подключение_ms=%d попытка=%d",
-                        selected.label,
-                        round((selected_at - started) * 1000),
-                        round((self._clock() - selected_at) * 1000),
-                        attempt + 1,
-                    )
-                    logger.debug("Открыт pa_stream для %s", selected.name)
-                    return
-                except _PulseFailure:
-                    error = self._open_error()
-                except AudioError as exc:
-                    error = exc
-                self._release()
-                invalidate_device_cache()
-                if attempt + 1 == OPEN_RETRIES:
-                    raise error
-                # Сохраняем паузу повтора, но замечаем отмену и внутри неё.
-                pause = OPEN_RETRY_MS / 1000
-                while pause > 0:
+            selection_s = self._clock() - started
+            with self._ctx_lock:
+                for attempt in range(OPEN_RETRIES):
                     self._check_open(budget)
-                    duration = budget.remaining(min(0.050, pause))
-                    self._sleep(duration)
-                    pause -= duration
+                    selecting = False
+                    try:
+                        attempt_budget = _OpenDeadline(
+                            self._clock, budget.remaining(OPEN_DEADLINE_S)
+                        )
+                        warm = self._prepare_context(attempt_budget)
+                        if selected is None:
+                            selecting = True
+                            selecting_at = self._clock()
+                            selected = self._select_device(device, budget)
+                            selection_s += self._clock() - selecting_at
+                            selecting = False
+                        assert selected is not None
+                        self._selected_device = selected
+                        self._device_name = selected.name
+                        self.device_label = selected.label
+                        self._default_mode = device is None
+                        self._check_open(attempt_budget)
+                        assert self._pulse is not None and self._context is not None
+                        pulse = self._pulse
+                        spec = _PaSampleSpec(PA_SAMPLE_S16LE, RATE, CHANNELS)
+                        self._stream = pulse.stream_new(
+                            self._context, b"dictation", ctypes.byref(spec), None
+                        )
+                        if not self._stream:
+                            raise _PulseFailure
+                        pulse.stream_set_moved_callback(self._stream, self._moved_callback, None)
+                        attr = _PaBufferAttr(U32_MAX, U32_MAX, U32_MAX, U32_MAX, CHUNK_BYTES)
+                        flags = (
+                            PA_STREAM_INTERPOLATE_TIMING
+                            | PA_STREAM_ADJUST_LATENCY
+                            | PA_STREAM_AUTO_TIMING_UPDATE
+                            | PA_STREAM_DONT_MOVE
+                        )
+                        if (
+                            pulse.stream_connect_record(
+                                self._stream, selected.name.encode(), ctypes.byref(attr), flags
+                            )
+                            < 0
+                        ):
+                            raise _PulseFailure
+                        self._wait_ready(attempt_budget, stream=True)
+                        idx = pulse.stream_get_device_index(self._stream)
+                        name = self._stream_name()
+                        self._baseline_known = idx != PA_INVALID_INDEX
+                        if self._baseline_known:
+                            self._index = idx
+                        else:
+                            # Запасной индекс годится лишь при общей нумерации с событиями.
+                            self._index = (
+                                selected.index if selected.index_exact else PA_INVALID_INDEX
+                            )
+                        self._trace_device = (idx, name)
+                        if self._probe_logging:
+                            logger.debug(
+                                "Базовая линия READY: index=%s name=%r known=%s "
+                                "comparison_index=%s",
+                                idx,
+                                name,
+                                self._baseline_known,
+                                self._index,
+                            )
+                        self._opened = True
+                        if name is not None and name != selected.name:
+                            self._change(REASON_MISMATCH, 0, name)
+                        # Подключение включает создание _PulseAsync (загрузку libpulse)
+                        # и паузы повторов.
+                        logger.info(
+                            "Источник записи открыт: %s выбор_ms=%d подключение_ms=%d "
+                            "попытка=%d контекст=%s",
+                            selected.label,
+                            round(selection_s * 1000),
+                            round((self._clock() - started - selection_s) * 1000),
+                            attempt + 1,
+                            "тёплый" if warm else "холодный",
+                        )
+                        logger.debug("Открыт pa_stream для %s", selected.name)
+                        return
+                    except AudioApiUnavailable:
+                        raise
+                    except _PulseFailure:
+                        error = self._open_error()
+                    except AudioError as exc:
+                        if selecting:
+                            # Ошибка выбора не является ошибкой подключения libpulse.
+                            raise
+                        error = exc
+                    self._release()
+                    if self._context is not None and not self._context_ok():
+                        self._release_context()
+                    invalidate_device_cache()
+                    if attempt + 1 == OPEN_RETRIES:
+                        raise error
+                    # Сохраняем паузу повтора, но замечаем отмену и внутри неё.
+                    pause = OPEN_RETRY_MS / 1000
+                    while pause > 0:
+                        self._check_open(budget)
+                        duration = budget.remaining(min(0.050, pause))
+                        self._sleep(duration)
+                        pause -= duration
         except _OpenCancelled:
             self.close()
         except BaseException as exc:
             self.close()
+            if self._context_dead:
+                logger.info("Соединение со звуковой службой потеряно")
             # Отказ API не говорит о смене устройств: кэш нужен запасному simple.
             if isinstance(exc, AudioError) and not isinstance(exc, AudioApiUnavailable):
                 invalidate_device_cache()
@@ -534,62 +852,50 @@ class PulseStreamSource:
         """Прогрев холодного пути без микрофона: опрос устройств, libpulse, клиент службы.
 
         pa_stream не создаётся (PRD §9.5 — микрофон только по действию человека).
-        Состояние источника не трогает: свои mainloop и контекст, ошибки не выходят наружу.
+        Сохраняет готовый контекст под _ctx_lock; ошибки не выходят наружу.
+        Занятый источник пропускается, мёртвое соединение восстанавливает только open.
         Итог: ok; при ошибке устройства — device-<код>,service-<код или ok>;
         при одной ошибке службы — её код. Текст исключений в INFO не пишется.
         """
         started = self._clock()
         budget = _OpenDeadline(self._clock, OPEN_DEADLINE_S)
-        pulse: _PulseAsync | None = None
-        mainloop = context = None
         device_result = "ok"
         service_result = "ok"
-        try:
 
-            def devices_fn(*, deadline: _OpenDeadline | None) -> list[AudioDevice]:
-                return list_devices(deadline=deadline) if self._devices is None else self._devices()
-
+        def select() -> None:
+            nonlocal device_result
             try:
-                select_device(
-                    device,
-                    devices_fn=devices_fn,
-                    default_fn=self._default,
-                    clock=self._clock,
-                    deadline=budget,
-                    use_cache=self._devices is None,
-                )
+                self._select_device(device, budget)
             except AudioError as exc:
                 device_result = exc.code
-            pulse = self._factory()
-            mainloop = pulse.mainloop_new()
-            if not mainloop:
-                raise _PulseFailure
-            pulse.mainloop = mainloop
-            api = pulse.mainloop_get_api(mainloop)
-            context = pulse.context_new(api, b"astra-voice") if api else None
-            if not context:
-                raise _PulseFailure
-            if pulse.context_connect(context, None, PA_CONTEXT_NOAUTOSPAWN, None) < 0:
-                raise _PulseFailure
-            while (state := pulse.context_get_state(context)) != PA_CONTEXT_READY:
-                if state in (PA_CONTEXT_FAILED, PA_CONTEXT_TERMINATED):
-                    raise _PulseFailure
-                pulse.iterate(max(1, int(budget.remaining(0.050) * 1_000_000)))
-        except AudioError as exc:
-            service_result = exc.code
-        except _PulseFailure:
-            service_result = ERROR_FAILED
+
+        try:
+            # Инъекция сохраняет прежний порядок и не требует замка/контекста.
+            if self._devices is not None:
+                select()
+            if self._ctx_lock.acquire(blocking=False):
+                try:
+                    if self._stream is None:
+                        try:
+                            if self._context is None and not self._context_dead:
+                                self._create_context(budget, warming=True)
+                            elif self._context is not None and not self._context_ok():
+                                raise _PulseFailure
+                        except AudioError as exc:
+                            service_result = exc.code
+                        except _PulseFailure:
+                            service_result = ERROR_FAILED
+                        if self._devices is None:
+                            # При сбое контекста выбор сохраняет запасной путь pactl.
+                            if service_result == "ok" and self._context is not None:
+                                if not self._dispatch_idle(budget):
+                                    service_result = ERROR_FAILED
+                            select()
+                finally:
+                    self._ctx_lock.release()
         except Exception:  # noqa: BLE001 — прогрев никогда не роняет воркер
-            logger.debug("Прогрев пути записи: сбой", exc_info=True)
+            logger.debug("Прогрев пути записи: сбой")
             service_result = ERROR_FAILED
-        finally:
-            if pulse is not None:
-                if context:
-                    pulse.context_disconnect(context)
-                    pulse.context_unref(context)
-                if mainloop:
-                    pulse.mainloop_free(mainloop)
-                pulse.mainloop = None
         result = (
             f"device-{device_result},service-{service_result}"
             if device_result != "ok"
@@ -601,75 +907,97 @@ class PulseStreamSource:
             result,
         )
 
-    def _connect(self, selected: AudioDevice, budget: _OpenDeadline) -> None:
+    def _dispatch_idle(self, deadline: _OpenDeadline) -> bool:
+        """Под замком выбирает накопленные события без ожидания и без создания ресурсов."""
         assert self._pulse is not None
-        pulse = self._pulse
-        attempt = _OpenDeadline(self._clock, budget.remaining(OPEN_DEADLINE_S))
-        self._mainloop = pulse.mainloop_new()
-        if not self._mainloop:
-            raise _PulseFailure
-        pulse.mainloop = self._mainloop
-        api = pulse.mainloop_get_api(self._mainloop)
-        if not api:
-            raise _PulseFailure
-        self._context = pulse.context_new(api, b"astra-voice")
-        if not self._context:
-            raise _PulseFailure
-        pulse.context_set_subscribe_callback(self._context, self._subscribe_callback, None)
-        if pulse.context_connect(self._context, None, PA_CONTEXT_NOAUTOSPAWN, None) < 0:
-            raise _PulseFailure
-        self._wait_ready(attempt, stream=False)
-        op = pulse.context_subscribe(
-            self._context, PA_SUBSCRIPTION_MASK_SOURCE | PA_SUBSCRIPTION_MASK_SERVER, None, None
-        )
-        if not op:
-            raise _PulseFailure
-        pulse.operation_unref(op)
-        spec = _PaSampleSpec(PA_SAMPLE_S16LE, RATE, CHANNELS)
-        self._stream = pulse.stream_new(self._context, b"dictation", ctypes.byref(spec), None)
-        if not self._stream:
-            raise _PulseFailure
-        pulse.stream_set_moved_callback(self._stream, self._moved_callback, None)
-        attr = _PaBufferAttr(U32_MAX, U32_MAX, U32_MAX, U32_MAX, CHUNK_BYTES)
-        flags = (
-            PA_STREAM_INTERPOLATE_TIMING
-            | PA_STREAM_ADJUST_LATENCY
-            | PA_STREAM_AUTO_TIMING_UPDATE
-            | PA_STREAM_DONT_MOVE
-        )
-        if (
-            pulse.stream_connect_record(
-                self._stream, selected.name.encode(), ctypes.byref(attr), flags
-            )
-            < 0
-        ):
-            raise _PulseFailure
-        self._wait_ready(attempt, stream=True)
-        idx = pulse.stream_get_device_index(self._stream)
-        name = self._stream_name()
-        self._baseline_known = idx != PA_INVALID_INDEX
-        if self._baseline_known:
-            self._index = idx
-        else:
-            # Запасной индекс годится, только если он из той же нумерации, что события.
-            self._index = selected.index if selected.index_exact else PA_INVALID_INDEX
-        self._trace_device = (idx, name)
-        if self._probe_logging:
-            logger.debug(
-                "Базовая линия READY: index=%s name=%r known=%s comparison_index=%s",
-                idx,
-                name,
-                self._baseline_known,
-                self._index,
-            )
-        self._opened = True
-        if name is not None and name != selected.name:
-            self._change(REASON_MISMATCH, 0, name)
+        for _ in range(IDLE_DISPATCH_LIMIT):
+            deadline.remaining(OPEN_TOTAL_DEADLINE_S)
+            dispatched = self._pulse.iterate(0)
+            if not self._context_ok():
+                return False
+            if dispatched == 0:
+                break
+        return True
 
-    def _wait_ready(self, deadline: _OpenDeadline, *, stream: bool) -> None:
+    def _prepare_context(self, deadline: _OpenDeadline) -> bool:
+        """Под замком проверяет контекст и выбирает события простоя до stream_new."""
+        warm = self._context is not None and not self._context_dead
+        if self._context is not None:
+            assert self._pulse is not None
+            if self._pulse.context_get_state(self._context) != PA_CONTEXT_READY:
+                self._context_dead = True
+            if self._context_dead:
+                self._release_context()
+                warm = False
+        if self._context is None:
+            self._create_context(deadline)
+        assert self._pulse is not None
+        for _ in range(IDLE_DISPATCH_LIMIT):
+            self._check_open(deadline)
+            dispatched = self._pulse.iterate(0)
+            if not self._context_ok():
+                self._release_context()
+                self._create_context(deadline)
+                warm = False
+                break
+            if dispatched == 0:
+                break
+        # События простоя не описывают будущую запись; микрофон ещё не открыт.
+        self._release()
+        return warm
+
+    def _create_context(self, deadline: _OpenDeadline, *, warming: bool = False) -> None:
+        """Создаёт тройку и подписку под замком; частичный сбой не оставляет ресурсов."""
+        try:
+            deadline.remaining(OPEN_DEADLINE_S)
+            self._pulse = self._factory()
+            pulse = self._pulse
+            self._mainloop = pulse.mainloop_new()
+            if not self._mainloop:
+                raise _PulseFailure
+            pulse.mainloop = self._mainloop
+            api = pulse.mainloop_get_api(self._mainloop)
+            self._context = pulse.context_new(api, b"astra-voice") if api else None
+            if not self._context:
+                raise _PulseFailure
+            if pulse.context_connect(self._context, None, PA_CONTEXT_NOAUTOSPAWN, None) < 0:
+                raise _PulseFailure
+            self._wait_ready(deadline, stream=False, check_running=not warming)
+            pulse.context_set_subscribe_callback(self._context, self._subscribe_callback, None)
+            op = pulse.context_subscribe(
+                self._context, PA_SUBSCRIPTION_MASK_SOURCE | PA_SUBSCRIPTION_MASK_SERVER, None, None
+            )
+            if not op:
+                raise _PulseFailure
+            pulse.operation_unref(op)
+        except _PulseFailure:
+            if warming:
+                # Прежний итог прогрева для любого нативного отказа — audio-failed.
+                self._release_context()
+                raise
+            # errno нужно прочитать до context_unref.
+            error = self._open_error()
+            self._release_context()
+            raise error from None
+        except BaseException:
+            self._release_context()
+            raise
+        if self._context_dead:
+            logger.info("Соединение со звуковой службой восстановлено")
+        self._context_dead = False
+        self._introspection_stale = True
+        if self._devices is None and pulse.has_introspection:
+            set_device_introspection(self._device_provider)
+
+    def _wait_ready(
+        self, deadline: _OpenDeadline, *, stream: bool, check_running: bool = True
+    ) -> None:
         assert self._pulse is not None and self._context is not None
         while True:
-            self._check_open(deadline)
+            if check_running:
+                self._check_open(deadline)
+            else:
+                deadline.remaining(OPEN_DEADLINE_S)
             context_state = self._pulse.context_get_state(self._context)
             self._trace_state("context", context_state)
             if context_state in (PA_CONTEXT_FAILED, PA_CONTEXT_TERMINATED):
@@ -709,6 +1037,13 @@ class PulseStreamSource:
 
     def _on_subscribe(self, context: int, event: int, idx: int, userdata: int) -> None:
         try:
+            facility = event & PA_SUBSCRIPTION_EVENT_FACILITY_MASK
+            if facility in (PA_SUBSCRIPTION_EVENT_SOURCE, PA_SUBSCRIPTION_EVENT_SERVER):
+                self._introspection_stale = True
+            if self._stream is None:
+                self._devices_changed = True
+                invalidate_device_cache()
+                return
             facility = event & PA_SUBSCRIPTION_EVENT_FACILITY_MASK
             kind = event & PA_SUBSCRIPTION_EVENT_TYPE_MASK
             if self._probe_logging:
@@ -826,7 +1161,8 @@ class PulseStreamSource:
         """Ищет наше имя в свежем списке; при пропаже фиксирует смену вместе со списком.
 
         Список и умолчание читаются в одном бюджете и передаются дальше в DeviceChange,
-        чтобы классификация не спрашивала службу второй раз.
+        чтобы классификация не спрашивала службу второй раз. Вызывается под RLock
+        из read_chunk после возврата dispatch, никогда из колбэка libpulse.
         """
         budget = _OpenDeadline(self._clock, DEVICE_CHANGE_BUDGET_S)
         devices: list[AudioDevice] | None
@@ -859,10 +1195,10 @@ class PulseStreamSource:
         assert self._pulse is not None and self._context is not None
         state = self._pulse.context_get_state(self._context)
         self._trace_state("context", state)
-        return state not in (
-            PA_CONTEXT_FAILED,
-            PA_CONTEXT_TERMINATED,
-        )
+        if state in (PA_CONTEXT_FAILED, PA_CONTEXT_TERMINATED):
+            self._context_dead = True
+            return False
+        return True
 
     def _check_state(self) -> bool:
         """Отделяет сбой службы и убийство из микшера от пропажи устройства."""
@@ -915,99 +1251,95 @@ class PulseStreamSource:
 
     def read_chunk(self) -> bytes | None:
         """Возвращает ровную порцию, пустой опрос или окончание с фактом смены."""
-        if not self.is_open or self._failed:
-            return None
-        assert self._pulse is not None and self._stream is not None
-        try:
-            if not self._check_state():
-                raise _PulseFailure
-            if len(self._buffer) < CHUNK_BYTES:
-                if self.device_change is None:
-                    self._pulse.iterate(POLL_US)
-                    if not self._check_state():
-                        raise _PulseFailure
-                if self._pulse.stream_get_state(self._stream) == PA_STREAM_READY:
-                    while self._cutoff is None or self._received < self._cutoff:
-                        fragment = self._pulse.peek(self._stream)
-                        if fragment is None:
-                            break
-                        if isinstance(fragment, bytes):
-                            allowed = (
-                                len(fragment)
-                                if self._cutoff is None
-                                else self._cutoff - self._received
-                            )
-                            self._buffer.extend(fragment[:allowed])
-                            self._received += len(fragment)
-            available = len(self._buffer)
-            if self._cutoff is not None:
-                available = min(available, self._cutoff - self._delivered)
-            if available >= CHUNK_BYTES:
-                chunk = bytes(self._buffer[:CHUNK_BYTES])
-                del self._buffer[:CHUNK_BYTES]
-                self._delivered += CHUNK_BYTES
-                return chunk
-            if self.device_change is not None:
-                self._finish_change()
+        with self._ctx_lock:
+            if not self.is_open or self._failed:
                 return None
-            return b""
-        except _PulseFailure:
-            self._failed = True
-            self.device_change = None
-            self._buffer.clear()
-            return None
+            assert self._pulse is not None and self._stream is not None
+            try:
+                if not self._check_state():
+                    raise _PulseFailure
+                if len(self._buffer) < CHUNK_BYTES:
+                    if self.device_change is None:
+                        self._pulse.iterate(POLL_US)
+                        if not self._check_state():
+                            raise _PulseFailure
+                    if self._pulse.stream_get_state(self._stream) == PA_STREAM_READY:
+                        while self._cutoff is None or self._received < self._cutoff:
+                            fragment = self._pulse.peek(self._stream)
+                            if fragment is None:
+                                break
+                            if isinstance(fragment, bytes):
+                                allowed = (
+                                    len(fragment)
+                                    if self._cutoff is None
+                                    else self._cutoff - self._received
+                                )
+                                self._buffer.extend(fragment[:allowed])
+                                self._received += len(fragment)
+                available = len(self._buffer)
+                if self._cutoff is not None:
+                    available = min(available, self._cutoff - self._delivered)
+                if available >= CHUNK_BYTES:
+                    chunk = bytes(self._buffer[:CHUNK_BYTES])
+                    del self._buffer[:CHUNK_BYTES]
+                    self._delivered += CHUNK_BYTES
+                    return chunk
+                if self.device_change is not None:
+                    self._finish_change()
+                    return None
+                return b""
+            except _PulseFailure:
+                self._failed = True
+                self.device_change = None
+                self._buffer.clear()
+                return None
 
     def flush(self) -> None:
         """Сбрасывает серверный и внутренний буферы в пределах срока подготовки."""
-        if not self.is_open:
-            return
-        assert self._pulse is not None and self._stream is not None
-        try:
-            op = self._pulse.stream_flush(self._stream, None, None)
-            if not op:
-                raise _PulseFailure
-            self._pulse.wait_op(op, _OpenDeadline(self._clock, OPEN_DEADLINE_S))
-        except (AudioError, _PulseFailure) as exc:
-            raise AudioError(ERROR_FAILED, "Не удалось подготовить запись звука.") from exc
-        self._buffer.clear()
-        self._received = self._delivered = 0
-        # Факты, поступившие во время flush, сохраняем, но сброшенного PCM уже нет.
-        self._events = deque(replace(event, cutoff=0) for event in self._events)
-        self._overflow_cutoff = 0
-        if self._cutoff is not None:
-            self._cutoff = 0
+        with self._ctx_lock:
+            if not self.is_open:
+                return
+            assert self._pulse is not None and self._stream is not None
+            try:
+                op = self._pulse.stream_flush(self._stream, None, None)
+                if not op:
+                    raise _PulseFailure
+                self._pulse.wait_op(op, _OpenDeadline(self._clock, OPEN_DEADLINE_S))
+            except (AudioError, _PulseFailure) as exc:
+                raise AudioError(ERROR_FAILED, "Не удалось подготовить запись звука.") from exc
+            self._buffer.clear()
+            self._received = self._delivered = 0
+            # Факты, поступившие во время flush, сохраняем, но сброшенного PCM уже нет.
+            self._events = deque(replace(event, cutoff=0) for event in self._events)
+            self._overflow_cutoff = 0
+            if self._cutoff is not None:
+                self._cutoff = 0
 
     def latency_us(self) -> int | None:
         """Отрицательная задержка округляется к нулю; ошибка не является значением."""
-        if not self.is_open:
-            return None
-        assert self._pulse is not None and self._stream is not None
-        usec, negative = ctypes.c_uint64(), ctypes.c_int()
-        if (
-            self._pulse.stream_get_latency(self._stream, ctypes.byref(usec), ctypes.byref(negative))
-            < 0
-        ):
-            return None
-        return 0 if negative.value else usec.value
+        with self._ctx_lock:
+            if not self.is_open:
+                return None
+            assert self._pulse is not None and self._stream is not None
+            usec, negative = ctypes.c_uint64(), ctypes.c_int()
+            if (
+                self._pulse.stream_get_latency(
+                    self._stream, ctypes.byref(usec), ctypes.byref(negative)
+                )
+                < 0
+            ):
+                return None
+            return 0 if negative.value else usec.value
 
     def _release(self) -> None:
-        """Снимает колбэки до unref; используется и между попытками открытия."""
+        """Под замком закрывает только поток; сбрасывает факты и буферы записи."""
         stream, self._stream = self._stream, None
-        context, self._context = self._context, None
-        mainloop, self._mainloop = self._mainloop, None
         self._opened = False
         if self._pulse is not None:
             if stream is not None:
                 self._pulse.stream_set_moved_callback(stream, None, None)
                 self._pulse.stream_disconnect(stream)
                 self._pulse.stream_unref(stream)
-            if context is not None:
-                self._pulse.context_set_subscribe_callback(context, None, None)
-                self._pulse.context_disconnect(context)
-                self._pulse.context_unref(context)
-            if mainloop is not None:
-                self._pulse.mainloop_free(mainloop)
-            self._pulse.mainloop = None
         self._events.clear()
         self._overflow = False
         self._overflow_cutoff = 0
@@ -1021,15 +1353,44 @@ class PulseStreamSource:
         self._server_changed = self._server_waited = self._failed = False
         self.device_change = None
 
-    def close(self) -> None:
-        """Идемпотентно освобождает соединение и забывает выбор устройства."""
+    def _release_context(self) -> None:
+        """Под замком снимает подписку и освобождает тройку без открытого потока."""
+        assert self._stream is None
+        _clear_device_introspection(self._device_provider)
+        self._introspection_stale = True
+        self._introspection_cache = None
+        pulse, self._pulse = self._pulse, None
+        context, self._context = self._context, None
+        mainloop, self._mainloop = self._mainloop, None
+        if pulse is not None:
+            if context is not None:
+                pulse.context_set_subscribe_callback(context, None, None)
+                pulse.context_disconnect(context)
+                pulse.context_unref(context)
+            if mainloop is not None:
+                pulse.mainloop_free(mainloop)
+            pulse.mainloop = None
+
+    def _close(self) -> None:
         self._release()
-        self._pulse = None
         self._running = None
         self._device_name = None
         self._selected_device = None
         self.device_label = None
         self._default_mode = False
+
+    def close(self) -> None:
+        """Закрывает микрофон и забывает выбор; соединение и подписка остаются."""
+        with self._ctx_lock:
+            self._close()
+
+    def shutdown(self) -> None:
+        """После остановки захвата идемпотентно освобождает поток и контекст."""
+        with self._ctx_lock:
+            self._close()
+            self._release_context()
+            self._context_dead = False
+            self._devices_changed = False
 
 
 class StreamWithFallback:
@@ -1047,6 +1408,7 @@ class StreamWithFallback:
         on_fallback: Callable[[], None] | None = None,
     ) -> None:
         self._active: ManagedSource = primary if primary is not None else PulseStreamSource()
+        self._primary = self._active
         self._fallback: Callable[[], ManagedSource] | None = fallback
         # Сообщаем об откате только после первого успешного открытия simple:
         # без libpulse.so.0 simple тоже не откроется, и «simple работает» было бы неправдой.
@@ -1096,6 +1458,16 @@ class StreamWithFallback:
 
     def close(self) -> None:
         self._active.close()
+
+    def shutdown(self) -> None:
+        """Освобождает постоянное соединение основного и ресурсы запасного источника."""
+        sources = (
+            (self._primary,) if self._active is self._primary else (self._primary, self._active)
+        )
+        for source in sources:
+            shutdown = getattr(source, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
 
     @property
     def is_open(self) -> bool:
@@ -1231,6 +1603,7 @@ def main(
             logger.debug("Получено: bytes=%s chunks=%s", byte_count, chunks)
             if source is not None:
                 source.close()
+                source.shutdown()
         finally:
             if source is not None:
                 source._probe_logging = old_probe_logging

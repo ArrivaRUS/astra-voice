@@ -1005,3 +1005,29 @@ def test_capture_logs_backend_once(
             loop._wake_w.close()
         connection.close()
         peer.close()
+
+
+def test_worker_exit_shuts_down_warmed_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Выход из run освобождает прогретый контекст через WorkerState/AudioCapture."""
+    from helpers.pulse_fakes import FakePulse, source_for
+
+    pulse = FakePulse()
+    source = source_for(pulse)
+    monkeypatch.setattr(worker_main, "select_audio_source", lambda _env: source)
+    # Родитель уже исчез: run проходит настоящий finally без обмена по IPC.
+    connection = Mock(spec=socket.socket)
+    loop = worker_main.WorkerLoop(connection, parent_pid=-1)
+    capture = loop.worker._capture
+    assert isinstance(capture, AudioCapture)
+    assert capture.warm_up(None)
+    assert capture._warmup_thread is not None
+    capture._warmup_thread.join(2)
+    assert not capture._warmup_thread.is_alive()
+    assert pulse.names().count("context_new") == 1
+    assert "context_unref" not in pulse.names()
+    assert loop.run() == 0
+    assert pulse.names().count("context_disconnect") == 1
+    assert pulse.names().count("context_unref") == pulse.names().count("mainloop_free") == 1
+    assert not any(name.startswith("stream_") for name in pulse.names())
+    connection.close.assert_called_once_with()
+    assert loop._wake_r.fileno() == loop._wake_w.fileno() == -1

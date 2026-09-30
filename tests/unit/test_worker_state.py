@@ -1670,3 +1670,21 @@ def test_model_loaded_warms_capture_path_once(factory: Factory) -> None:
     # Повторный model.load с той же моделью не прогревает снова (ответ из кэша).
     worker.handle(load_message())
     capture.warm_up.assert_called_once()
+
+
+@pytest.mark.parametrize("with_capture", [False, True])
+def test_close_shuts_down_source_after_capture_stops(with_capture: bool) -> None:
+    source = Mock(spec=["close", "shutdown"])
+    worker = WorkerState(audio_source=None if with_capture else source, runtime="none")
+    order: list[str] = []
+    source.close.side_effect = lambda: order.append("close")
+    source.shutdown.side_effect = lambda: order.append("shutdown")
+    if with_capture:
+        capture = AudioCapture(source=source, on_samples=Mock(), on_event=Mock(), on_error=Mock())
+        worker.set_capture(capture)
+    worker.close()
+    assert order[-1] == "shutdown"
+    assert order.index("close") < order.index("shutdown")
+    source.shutdown.assert_called_once_with()
+    worker.close()
+    source.shutdown.assert_called_once_with()

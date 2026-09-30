@@ -23,6 +23,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from astra_voice.worker import audio
 from astra_voice.worker import pulse_stream as ps
 from astra_voice.worker.audio import (
     CHANNELS,
@@ -73,12 +74,19 @@ from astra_voice.worker.state import LIMIT_S_DEFAULT, Message, State, WorkerStat
 
 # tests не пакет: каталог tests/ уже в sys.path через корневой conftest.py.
 from fakes import FakeCancelToken, FakeEngine
-from helpers.pulse_fakes import MIC, FakePulse
+from helpers.pulse_fakes import MIC, FakePulse, Step
 
 pytestmark = pytest.mark.unit
 TIMEOUT = 5.0
 WavFactory = Callable[[int, int], Path]
 Run = Callable[..., subprocess.CompletedProcess[str]]
+
+
+@pytest.fixture(autouse=True)
+def reset_device_provider() -> Iterator[None]:
+    audio.set_device_introspection(None)
+    yield
+    audio.set_device_introspection(None)
 
 
 @pytest.fixture(autouse=True)
@@ -572,16 +580,17 @@ class PulseCaptureRig:
                 "stream_new",
                 "stream_disconnect",
                 "stream_unref",
-                "context_unref",
-                "mainloop_free",
             ):
                 assert names.count(name) == count
+            # Обычный stop закрывает микрофон, контекст живёт до shutdown.
+            assert names.count("context_unref") == 0
+            assert names.count("mainloop_free") == 0
 
     def assert_owner(self, owner: int | None) -> None:
         owners = (
             self.threads
             if self.backend == "simple"
-            else set().union(*(p.threads for p in self.pulses))
+            else set().union(*(p.stream_threads for p in self.pulses))
         )
         assert owners == {owner}
         assert threading.get_ident() not in owners
@@ -628,7 +637,12 @@ def _cached_source_factory(
 
     def source() -> PulseSimpleSource | ps.PulseStreamSource:
         factory = PulseSimpleSource if backend is None else backend.make_source
-        return factory(default=partial(default_device, run=run), clock=lambda: now[0])
+        result = factory(default=partial(default_device, run=run), clock=lambda: now[0])
+        if backend is not None and backend.backend == "stream":
+            # TTL относится к запасному пути: часть B обычно выбирает через libpulse.
+            # Сохраняем все прежние проверки команд на старом ABI без интроспекции.
+            backend.pulses[-1].has_introspection = False
+        return result
 
     return source, commands
 
@@ -2606,10 +2620,12 @@ def test_capture_watchdog_never_frees_during_libpulse_call(
         # stream дополнительно закрывает отменённое открытие; ABI остаётся идемпотентным.
         assert close_threads == [owner] * (3 if blocked_call == "second_new" else 2)
         assert pulse.names().count("stream_unref") == 1
-        attempts = 2 if blocked_call == "second_new" else 1
-        assert pulse.names().count("context_unref") == attempts
-        assert pulse.names().count("mainloop_free") == attempts
-        assert pulse.threads == {owner.ident}
+        # Ретрай stream сохраняет контекст; его освобождает Worker.close после join.
+        assert pulse.names().count("context_new") == 1
+        assert pulse.names().count("context_unref") == 1
+        assert pulse.names().count("mainloop_free") == 1
+        assert pulse.stream_threads == {owner.ident}
+        assert pulse.threads == {owner.ident, threading.get_ident()}
     worker.check_capture_watchdog()
 
 
@@ -3164,7 +3180,7 @@ def test_pulse_capture_lifetime_contract(
     probes: list[CaptureProbe],
     wait_capture: Callable[[], None],
 ) -> None:
-    """T-40/T-43: две записи, один владелец ABI, между записями нет соединения."""
+    """T-40/T-43: две записи, один владелец stream ABI, в простое микрофон закрыт."""
     source = source_backend.source
     probe = CaptureProbe(source, sink=lambda _uid, _samples: False)
     probes.append(probe)
@@ -3176,6 +3192,7 @@ def test_pulse_capture_lifetime_contract(
         source_backend.threads.clear()
         for pulse in source_backend.pulses:
             pulse.threads.clear()
+            pulse.stream_threads.clear()
 
         def read(
             entered: threading.Event = entered, release: threading.Event = release
@@ -3398,3 +3415,185 @@ def test_warm_up_runs_once_and_not_during_recording(
         recording_probe.capture.request_stop()
         release.set()
         wait_capture()
+
+
+def test_capture_shutdown_waits_for_warmup_before_releasing_context() -> None:
+    """Поздний прогрев не оставляет новый контекст после выхода воркера."""
+    pulse = FakePulse()
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def devices() -> list[AudioDevice]:
+        entered.set()
+        assert release.wait(TIMEOUT)
+        return [MIC]
+
+    source = ps.PulseStreamSource(pulse_factory=lambda: pulse, devices=devices)
+    capture = AudioCapture(source=source, on_samples=Mock(), on_event=Mock(), on_error=Mock())
+    assert capture.warm_up(MIC.name)
+    assert entered.wait(TIMEOUT)
+
+    def shutdown() -> None:
+        capture.shutdown()
+        finished.set()
+
+    closing = threading.Thread(target=shutdown)
+    closing.start()
+    try:
+        assert not finished.wait(0.05)
+        assert "context_unref" not in pulse.names()
+    finally:
+        release.set()
+        closing.join(TIMEOUT)
+    assert finished.is_set() and not closing.is_alive()
+    assert pulse.names().count("context_new") == pulse.names().count("context_unref") == 1
+    assert pulse.names().count("mainloop_free") == 1
+    assert not any(name.startswith("stream_") for name in pulse.names())
+    assert capture.warm_up(MIC.name) is False
+    before = list(pulse.calls)
+    capture.shutdown()
+    assert before == pulse.calls
+
+
+@pytest.mark.parametrize("pw_available", [False, True])
+def test_introspection_matches_pactl_devices_and_description_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    pw_available: bool,
+) -> None:
+    pulse = FakePulse()
+    pulse.sources = [
+        (30, b"speakers.monitor", b"(null)"),
+        (12, b"mic.two", b""),
+        (11, b"mic.one", b"(null)"),
+        (4, b"mic.described", " USB\u200b  Микрофон\n".encode()),
+    ]
+    dump = (
+        json.dumps(
+            [
+                {"info": {"props": {"node.name": "mic.one", "node.description": " PipeWire USB "}}},
+                {
+                    "info": {
+                        "props": {"node.name": "speakers.monitor", "node.description": "Monitor"}
+                    }
+                },
+            ]
+        )
+        if pw_available
+        else None
+    )
+    short = "\n".join(f"{index}\t{name.decode()}" for index, name, _ in pulse.sources if name)
+    details = json.dumps(
+        [
+            {"name": name.decode(), "description": description.decode()}
+            for _, name, description in pulse.sources
+            if name and description is not None
+        ]
+    )
+    fallback = pactl_run(short, details, pw_dump=dump)
+    expected = list_devices(run=fallback)
+    commands = Mock(wraps=fallback)
+    monkeypatch.setattr(subprocess, "run", commands)
+    source = ps.PulseStreamSource(pulse_factory=lambda: pulse, clock=pulse.clock)
+    source.warm_up("mic.one")
+    for _ in range(3):
+        devices = list_devices()
+        assert devices == expected
+        assert all(device.index_exact for device in devices)
+    assert [d.index for d in devices] == [4, 11, 12, 30]
+    assert [d.description for d in devices] == (
+        ["USB Микрофон", "PipeWire USB", "Микрофон", "Monitor"]
+        if pw_available
+        else ["USB Микрофон", "Микрофон", "Микрофон 2", "Звук системы"]
+    )
+    assert commands.call_count == 1
+    assert commands.call_args.args[0] == ["pw-dump"]
+    pulse.idle_steps.append(
+        Step(events=[(ps.PA_SUBSCRIPTION_EVENT_SOURCE | ps.PA_SUBSCRIPTION_EVENT_CHANGE, 11)])
+    )
+    assert list_devices() == expected
+    assert commands.call_count == 2
+    assert pulse.names().count("context_get_source_info_list") == 2
+    source.shutdown()
+
+
+@pytest.mark.parametrize("stage", ["before", "failed", "dead", "shutdown", "old-abi"])
+def test_device_provider_unavailable_uses_original_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    pulse = FakePulse()
+    source = ps.PulseStreamSource(pulse_factory=lambda: pulse, clock=pulse.clock)
+    listing = pactl_run(
+        f"{MIC.index}\t{MIC.name}",
+        json.dumps([{"name": MIC.name, "description": MIC.description}]),
+    )
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args == ["pactl", "get-default-source"]:
+            return subprocess.CompletedProcess(args, 0, MIC.name, "")
+        return listing(args, **kwargs)
+
+    run = Mock(wraps=fake_run)
+    monkeypatch.setattr(subprocess, "run", run)
+    if stage == "failed":
+        pulse.fail["context_connect"] = -1
+        source.warm_up(None)
+    elif stage != "before":
+        if stage == "old-abi":
+            pulse.has_introspection = False
+        source.warm_up(None)
+        if stage == "dead":
+            pulse.context_state = ps.PA_CONTEXT_FAILED
+        elif stage == "shutdown":
+            source.shutdown()
+    run.reset_mock()
+    devices = list_devices()
+    assert devices == [MIC]
+    assert default_device(devices) == MIC
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["pactl", "list", "short", "sources"],
+        ["pactl", "-f", "json", "list", "sources"],
+        ["pactl", "get-default-source"],
+    ]
+    assert not any(name.startswith("stream_") for name in pulse.names())
+    if stage == "old-abi":
+        source.open(None)
+        assert source.is_open  # Нет интроспекции — запись через pa_stream всё ещё работает.
+    source.shutdown()
+    assert audio._device_introspection is None
+
+
+@pytest.mark.parametrize(
+    "name", [None, "", "@DEFAULT_SOURCE@", "@NONE@", "missing", "sound.monitor"]
+)
+def test_introspection_default_errors_match_pactl(name: str | None) -> None:
+    devices = [MIC, AudioDevice(9, "sound.monitor", "Sound", True)]
+    audio.set_device_introspection(lambda _: (devices, name))
+    with pytest.raises(AudioError) as provided:
+        default_device(devices)
+    with pytest.raises(AudioError) as fallback:
+        default_device(devices, run=default_source_run(name or ""))
+    assert provided.value.code == fallback.value.code == ERROR_NO_DEVICE
+    assert provided.value.message == fallback.value.message
+
+
+def test_injected_run_bypasses_provider() -> None:
+    provider = Mock(side_effect=AssertionError("Инъецированный run не использует провайдер"))
+    audio.set_device_introspection(provider)
+    devices = list_devices(run=pactl_run(f"{MIC.index}\t{MIC.name}"))
+    assert default_device(devices, run=default_source_run(MIC.name)).name == MIC.name
+    provider.assert_not_called()
+
+
+def test_capture_shutdown_bounds_stuck_warmup(caplog: pytest.LogCaptureFixture) -> None:
+    source = Mock(spec=["close", "shutdown"])
+    capture = AudioCapture(source=source, on_samples=Mock(), on_event=Mock(), on_error=Mock())
+    warmup = Mock(spec=threading.Thread)
+    warmup.is_alive.return_value = True
+    capture._warmup_thread = warmup
+    with caplog.at_level("DEBUG", logger=audio.__name__):
+        capture.shutdown()
+    warmup.join.assert_called_once_with(timeout=OPEN_TOTAL_DEADLINE_S + 1.0)
+    source.close.assert_not_called()  # close тоже ожидал бы занятый прогревом замок.
+    source.shutdown.assert_not_called()
+    assert caplog.messages == ["Прогрев звука не завершился к сроку выхода."]
+    assert capture._shutdown

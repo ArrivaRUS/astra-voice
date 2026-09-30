@@ -85,10 +85,23 @@ class FakePulse(ps._PulseAsync):
         # lib у родителя аннотирована как CDLL; нативный объект здесь не создаётся.
         self.lib = cast(Any, FakeLibrary(self.call))
         self.mainloop: int | None = None
+        self.has_introspection = True
+        self.sources: list[tuple[int, bytes | None, bytes | None]] = [
+            (MIC.index, MIC.name.encode(), MIC.description.encode())
+        ]
+        self.default_source: bytes | None = MIC.name.encode()
+        self.source_eol = 1
+        self.server_info_null = False
+        self.hold_introspection = False
+        self.info_pending: deque[tuple[str, tuple[Any, ...]]] = deque()
+        self.info_op_state = ps.PA_OPERATION_DONE
         self.clock = Clock()
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
         self.threads: set[int] = set()
+        self.stream_threads: set[int] = set()
         self.steps: deque[Step] = deque()
+        # Уже накопленные события доступны poll(0); steps приходят при ожидании.
+        self.idle_steps: deque[Step] = deque()
         self.fragments: deque[bytes | int] = deque()
         self.context_state = ps.PA_CONTEXT_UNCONNECTED
         self.stream_state = ps.PA_STREAM_UNCONNECTED
@@ -114,11 +127,17 @@ class FakePulse(ps._PulseAsync):
         name = symbol.removeprefix("pa_")
         self.calls.append((name, args))
         self.threads.add(threading.get_ident())
+        if name.startswith("stream_"):
+            self.stream_threads.add(threading.get_ident())
         if name in self.fail:
             result = self.fail[name]
             if isinstance(result, Exception):
                 raise result
             return result
+        if name in {"context_get_source_info_list", "context_get_server_info"}:
+            self.info_pending.append((name, args))
+            self.info_op_state = ps.PA_OPERATION_RUNNING
+            return 0x100000006
         if name == "mainloop_new":
             return 0x100000001
         if name == "mainloop_get_api":
@@ -151,7 +170,10 @@ class FakePulse(ps._PulseAsync):
         elif name == "mainloop_poll":
             self.clock.sleep(self.timeout_us / 1_000_000)
         elif name == "mainloop_dispatch":
+            queued = self.idle_steps if self.timeout_us == 0 else self.steps
+            dispatched = bool(queued) or self.context_state == ps.PA_CONTEXT_CONNECTING
             self.dispatch()
+            return int(dispatched)
         elif name == "context_get_state":
             return self.context_state
         elif name == "stream_get_state":
@@ -180,9 +202,13 @@ class FakePulse(ps._PulseAsync):
         elif name == "stream_drop":
             self.fragments.popleft()
         elif name == "operation_get_state":
-            return self.op_state
+            return self.info_op_state if args[0] == 0x100000006 else self.op_state
         elif name == "operation_cancel":
-            self.op_state = ps.PA_OPERATION_CANCELLED
+            if args[0] == 0x100000006:
+                self.info_op_state = ps.PA_OPERATION_CANCELLED
+                self.info_pending.clear()
+            else:
+                self.op_state = ps.PA_OPERATION_CANCELLED
         elif name == "stream_get_latency":
             args[1]._obj.value = self.latency
             args[2]._obj.value = self.negative
@@ -194,7 +220,20 @@ class FakePulse(ps._PulseAsync):
             self.context_state = ps.PA_CONTEXT_READY
         if self.stream_state == ps.PA_STREAM_CREATING and not self.hold_stream:
             self.stream_state = ps.PA_STREAM_READY
-        step = self.steps.popleft() if self.steps else Step()
+        if self.info_pending and not self.hold_introspection:
+            operation_name, args = self.info_pending.popleft()
+            if operation_name == "context_get_source_info_list":
+                for index, source, description in self.sources:
+                    info = ps._PaSourceInfoPrefix(source, index, description)
+                    args[1](args[0], ctypes.pointer(info), 0, args[2])
+                args[1](args[0], None, self.source_eol, args[2])
+            else:
+                server = ps._PaServerInfoPrefix()
+                server.default_source_name = self.default_source
+                args[1](args[0], None if self.server_info_null else ctypes.pointer(server), args[2])
+            self.info_op_state = ps.PA_OPERATION_DONE
+        queued = self.idle_steps if self.timeout_us == 0 else self.steps
+        step = queued.popleft() if queued else Step()
         if step.context is not None:
             self.context_state = step.context
         if step.stream is not None:
