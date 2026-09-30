@@ -20,9 +20,13 @@ APP_NAME = "astra-voice"
 LOCK_TIMEOUT_MS = 100
 INSTALL_LIB_DIR = Path("/usr/lib/astra-voice")
 INSTALL_SHARE_DIR = Path("/usr/share/astra-voice")
+# Лаунчер пакета .deb (scripts/astra-voice). Тесты подменяют: настоящий не запускать.
+SYSTEM_EXECUTABLE = Path("/usr/bin/astra-voice")
 RESOURCES_ENV = "ASTRA_VOICE_RESOURCES"
 # Запасной корень runtime-каталога (тесты подменяют).
 FALLBACK_TMP_DIR = Path("/tmp")
+# Корень каталогов сеанса logind (/run/user/<uid>) — только для чтения без XDG_RUNTIME_DIR.
+USER_RUNTIME_ROOT = Path("/run/user")
 
 # AppImage (arch/appimage.md §1). Каталог бандла ставит AppRun.
 APPIMAGE_DIR_ENV = "ASTRA_VOICE_APPIMAGE_DIR"
@@ -95,6 +99,26 @@ def ensure_private_dir(path: Path) -> Path:
     return _ensure_private_dir(path)
 
 
+def config_dir_path() -> Path:
+    """Путь каталога настроек без создания (для показа в «О программе»)."""
+    return _xdg("XDG_CONFIG_HOME", Path.home() / ".config")
+
+
+def data_dir_path() -> Path:
+    """Путь каталога данных без создания."""
+    return _xdg("XDG_DATA_HOME", Path.home() / ".local" / "share")
+
+
+def log_dir_path() -> Path:
+    """Путь каталога журналов без создания."""
+    return data_dir_path() / "logs"
+
+
+def model_store_dir_path() -> Path:
+    """Путь каталога моделей без создания."""
+    return data_dir_path() / "models"
+
+
 def config_dir() -> Path:
     """``$XDG_CONFIG_HOME/astra-voice`` (по умолчанию ``~/.config/astra-voice``)."""
     return _ensure_private_dir(_xdg("XDG_CONFIG_HOME", Path.home() / ".config"))
@@ -140,27 +164,32 @@ def runtime_dir() -> Path:
     return _ensure_private_dir(fallback)
 
 
-def _runtime_dir_candidates() -> tuple[Path, ...]:
-    """Кандидаты ``runtime_dir()`` по порядку; последний — запасной в ``/tmp``."""
+def _runtime_dir_candidates(*, reading: bool = False) -> tuple[Path, ...]:
+    """Кандидаты ``runtime_dir()`` по порядку; последний — запасной в ``/tmp``.
+
+    ``reading`` — для чтения чужих отметок: без ``XDG_RUNTIME_DIR`` (терминал через
+    ``runuser``, cron) программа сеанса всё равно могла писать в ``/run/user/<uid>``.
+    """
     raw = os.environ.get("XDG_RUNTIME_DIR", "").strip()
     fallback = FALLBACK_TMP_DIR / f"{APP_NAME}-{os.getuid()}"
-    return (Path(raw) / APP_NAME, fallback) if raw.startswith("/") else (fallback,)
+    if raw.startswith("/"):
+        return (Path(raw) / APP_NAME, fallback)
+    if reading:
+        return (USER_RUNTIME_ROOT / str(os.getuid()) / APP_NAME, fallback)
+    return (fallback,)
 
 
-def existing_runtime_dir() -> Path | None:
-    """Каталог, который выбрал бы ``runtime_dir()``, — только чтение, без mkdir/chmod.
-
-    Первый кандидат, уже существующий как наш каталог (не symlink); ``None`` — ни
-    одного нет, значит, в runtime ещё ничего не записано.
-    """
-    for candidate in _runtime_dir_candidates():
+def existing_runtime_dirs() -> tuple[Path, ...]:
+    """Все кандидаты для чтения, уже существующие как наш каталог (не symlink), по порядку."""
+    found: list[Path] = []
+    for candidate in _runtime_dir_candidates(reading=True):
         try:
             info = candidate.lstat()
         except OSError:
             continue
         if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid():
-            return candidate
-    return None
+            found.append(candidate)
+    return tuple(found)
 
 
 def log_dir() -> Path:

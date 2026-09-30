@@ -26,7 +26,13 @@ from urllib.parse import urlsplit
 import requests
 from requests.packages.urllib3.connection import HTTPSConnection
 from requests.packages.urllib3.response import HTTPResponse
-from urllib3.exceptions import ReadTimeoutError
+from urllib3.exceptions import (
+    DecodeError,
+    IncompleteRead,
+    InvalidChunkLength,
+    ProtocolError,
+    ReadTimeoutError,
+)
 
 from astra_voice.core.policy import Policy, PolicyStatus
 from astra_voice.core.settings import Settings
@@ -124,10 +130,27 @@ def local_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[LocalServer]:
                 headers["Location"] = "/ok"
             elif self.path == "/drip":
                 body = b"x" * (2 * 65536)
+            elif self.path in ("/short", "/short-range"):
+                # Полный Content-Length, половина тела и закрытие соединения.
+                if self.path == "/short-range" and "Range" in self.headers:
+                    offset = int(self.headers["Range"].removeprefix("bytes=").removesuffix("-"))
+                    body = body[offset:]
+                    status = 206
+                    headers["Content-Range"] = f"bytes {offset}-{len(_BODY) - 1}/{len(_BODY)}"
+                self.close_connection = True
             elif self.path.startswith("/gzip/"):
                 status = int(self.path.rsplit("/", 1)[1])
                 body = gzip.compress(b"x" * (1024 * 1024))
                 headers = {"Content-Encoding": "gzip", "Location": "/ok"}
+            if self.path == "/huge-length":
+                # Content-Length длиннее предела int() для строк (4300 цифр).
+                self.close_connection = True
+                self.wfile.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: "
+                    + b"9" * 5000
+                    + b"\r\nConnection: close\r\n\r\nhello"
+                )
+                return
             try:
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(body)))
@@ -148,6 +171,8 @@ def local_server(monkeypatch: pytest.MonkeyPatch) -> Iterator[LocalServer]:
                     body = body[4:]
                 elif self.path == "/slow-redirect":
                     release.wait(2)
+                elif self.path in ("/short", "/short-range"):
+                    body = body[: len(body) // 2]
                 self.wfile.write(body)
             except (BrokenPipeError, ConnectionResetError):
                 # Клиент закрыл соединение при отмене, дедлайне или перенаправлении.
@@ -411,6 +436,50 @@ def test_range_response_is_preserved(
             assert response.headers["Content-Range"] == f"bytes 11-{len(_BODY) - 1}/{len(_BODY)}"
         assert b"".join(response.iter_chunks()) == (_BODY[11:] if status == 206 else _BODY)
     assert local_server.requests[0][1]["Range"] == "bytes=11-"
+
+
+@pytest.mark.parametrize(("path", "range_from"), [("/short", None), ("/short-range", 11)])
+def test_truncated_body_is_short_read_in_any_urllib3(
+    client: HttpClient, local_server: LocalServer, path: str, range_from: int | None
+) -> None:
+    """Тело короче Content-Length — short-read и в urllib3 1.26, и в 2.x.
+
+    2.x сам бросает IncompleteRead (enforce_content_length), 1.26 молча заканчивает
+    поток: без своей сверки длины один и тот же обрыв выглядел бы по-разному.
+    """
+    with client.get_stream(
+        local_server.url + path, range_from=range_from, deadline_s=2, cancel=threading.Event()
+    ) as response:
+        received: list[bytes] = []
+        with pytest.raises(NetworkError) as caught:
+            for chunk in response.iter_chunks(16):
+                received.append(chunk)
+    assert caught.value.code == "short-read"
+    expected = _BODY[range_from or 0 :]
+    # Всё отданное до обрыва — верный префикс: его можно сохранить в .part.
+    assert b"".join(received) == expected[: len(b"".join(received))]
+    assert len(b"".join(received)) <= len(expected) // 2
+    assert not response._watchdog.is_alive()
+
+
+def test_huge_content_length_reads_body_until_close(
+    client: HttpClient, local_server: LocalServer
+) -> None:
+    """5000 цифр в Content-Length не роняют int(): тело читается до закрытия."""
+    with client.get_stream(
+        local_server.url + "/huge-length", deadline_s=2, cancel=threading.Event()
+    ) as response:
+        assert b"".join(response.iter_chunks(16)) == b"hello"
+
+
+def test_limit_before_truncation_is_not_short_read(
+    client: HttpClient, local_server: LocalServer
+) -> None:
+    """Потребитель сам остановился на limit раньше обрыва — это не ошибка потока."""
+    with client.get_stream(
+        local_server.url + "/short", deadline_s=2, cancel=threading.Event()
+    ) as response:
+        assert b"".join(response.iter_chunks(16, limit=32)) == _BODY[:32]
 
 
 @pytest.mark.parametrize("status", (301, 302, 303, 307, 308))
@@ -755,6 +824,7 @@ def test_idle_timeout_resets_after_each_chunk_without_socket(transport: Mock) ->
     body = b"abcdefghij"
     reply = _response()
     reply.raw = DrippingBody(body)
+    reply.headers["Content-Length"] = str(len(body))
     transport.side_effect = None
     transport.return_value = reply
     client = HttpClient(NetworkGate(Settings(), Policy()), user_agent=_USER_AGENT)
@@ -1703,6 +1773,38 @@ def test_minimum_speed_budget_recovers_and_excludes_consumer_pauses(
         (requests.exceptions.SSLError("секрет"), "host-unreachable"),
         (requests.exceptions.ReadTimeout("секрет"), "timeout"),
         (ReadTimeoutError(None, "/file", "секрет"), "timeout"),
+        # Обрыв посреди тела — short-read в обеих версиях urllib3 (докачка по .part).
+        # 2.x: укороченное тело с Content-Length (enforce_content_length).
+        (
+            ProtocolError(
+                "Connection broken: IncompleteRead(4 bytes read, 12 more expected)",
+                IncompleteRead(4, 12),
+            ),
+            "short-read",
+        ),
+        # 1.26 и 2.x: chunked-ответ без завершающего блока.
+        (
+            ProtocolError(
+                "Connection broken: InvalidChunkLength(got length b'', 0 bytes read)",
+                InvalidChunkLength(SimpleNamespace(tell=lambda: 4, length_remaining=None), b""),
+            ),
+            "short-read",
+        ),
+        # 1.26 и 2.x: сброс соединения посреди тела.
+        (
+            ProtocolError(
+                "Connection broken: ConnectionResetError(104, 'секрет')",
+                ConnectionResetError(104, "секрет"),
+            ),
+            "short-read",
+        ),
+        (requests.exceptions.ChunkedEncodingError("секрет"), "short-read"),
+        (
+            requests.exceptions.ConnectionError(ProtocolError("секрет", IncompleteRead(4, 12))),
+            "short-read",
+        ),
+        # Порча сжатого тела — не обрыв.
+        (DecodeError("секрет"), "host-unreachable"),
     ),
 )
 def test_stream_errors_close_connection(

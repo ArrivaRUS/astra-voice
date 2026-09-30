@@ -387,7 +387,9 @@ def retarget(executable_path: str | None = None) -> bool:
             raise AutostartError("Недопустимая программа для автозапуска")
         _exec_argument(target)
         if path.is_symlink():
-            raise AutostartError(f"Запись автозапуска является симлинком: {path}")
+            # Как remove_ours(): ссылку пользователя не трогаем, регистрация идёт дальше.
+            log.warning("Запись автозапуска — симлинк, оставляю как есть: %s", path.name)
+            return False
         data = _read(path)
         if data is None or not _true(_properties(data), b"X-AstraVoice-Managed"):
             return False

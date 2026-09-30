@@ -4,12 +4,14 @@
     env QT_QPA_PLATFORM=offscreen pytest -m stress tests/stress
 Длительность — ASTRA_VOICE_STRESS_SECONDS (по умолчанию 180).
 
-Раньше задание установки удалялось в рабочем потоке (deleteLater в
-QThreadPrivate::finish): ~QObject брал GIL под мьютексом сигналов Qt, а GUI под
-GIL ждал тот же мьютекс при уничтожении другого QObject — процесс замирал.
-Частое переключение потоков и частая сборка мусора поднимают вероятность
-пересечения; сторож faulthandler на зависшей итерации печатает стеки всех
-потоков и завершает процесс, чтобы прогон не висел молча.
+Раньше задание установки было QObject в рабочем QThread и удалялось там
+(deleteLater в QThreadPrivate::finish): ~QObject брал GIL под мьютексом сигналов
+Qt, а GUI под GIL ждал тот же мьютекс при уничтожении другого QObject — процесс
+замирал (урок 025). Теперь задания — threading.Thread без Python-QObject (урок
+026), а прогон сторожит, что класс зависания не вернулся. Частое переключение
+потоков и частая сборка мусора поднимают вероятность пересечения; сторож
+faulthandler на зависшей итерации печатает стеки всех потоков и завершает
+процесс, чтобы прогон не висел молча.
 """
 
 from __future__ import annotations
@@ -32,8 +34,9 @@ from astra_voice.models.installer import InstallResult, ReasonCode
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unit"))
-from test_bridges import model_rig  # noqa: E402
+from test_model_job_threads import _run_exit_scenario, assert_exit_scenario  # noqa: E402
 
+from helpers.model_rig import model_rig_session  # noqa: E402
 from helpers.qt_app import get_qapplication  # noqa: E402
 
 pytestmark = pytest.mark.stress
@@ -65,7 +68,6 @@ def _capture_messages(controller: Any, displayed: list[str]) -> None:
 
 def test_model_install_cycle_does_not_deadlock(stress_runtime: None) -> None:
     duration = float(os.environ.get("ASTRA_VOICE_STRESS_SECONDS", "180"))
-    rig = model_rig.__wrapped__  # type: ignore[attr-defined]
     params = itertools.cycle(
         itertools.product((False, True), _REASON_CODES, ("SECRET /path/service", ""))
     )
@@ -74,14 +76,14 @@ def test_model_install_cycle_does_not_deadlock(stress_runtime: None) -> None:
     while time.monotonic() < deadline:
         faulthandler.dump_traceback_later(_WATCHDOG_S, exit=True)
         local, reason_code, reason = next(params)
-        fixture = rig()
+        fixture = model_rig_session()
         port, create = next(fixture)
         port.result = InstallResult("broken", reason, reason_code=reason_code)
         controller = create()
         displayed: list[str] = []
         # Замыкание на сигналах замыкает цикл ссылок: контроллер уходит не по
         # счётчику ссылок, а сборщиком мусора в случайный момент, в том числе
-        # пока рабочий поток следующей итерации ещё в QThreadPrivate::finish.
+        # пока рабочий поток следующей итерации ещё сообщает о ходе установки.
         capture = partial(_capture_messages, controller, displayed)
         for signal in (
             controller.modelMessageChanged,
@@ -102,3 +104,14 @@ def test_model_install_cycle_does_not_deadlock(stress_runtime: None) -> None:
     faulthandler.cancel_dump_traceback_later()
     print(f"stress: {iterations} итераций за {duration:.0f} с, зависаний нет")
     assert iterations > 0
+
+
+def test_model_exit_while_download_blocked(request: pytest.FixtureRequest) -> None:
+    """Выход, пока поток загрузки висит в запросе: 20 повторов (в unit — 6)."""
+    if "stress" not in (request.config.option.markexpr or ""):
+        pytest.skip("только по явному -m stress")
+    for attempt in range(20):
+        # Выход в разные моменты относительно постов потока; половина — с частым
+        # переключением потоков.
+        switch = "1e-5" if attempt % 2 else ""
+        assert_exit_scenario(_run_exit_scenario((attempt // 2) * 0.01, switch=switch))

@@ -7,7 +7,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
@@ -160,6 +160,9 @@ class Stats:
         self._path = state_dir() / "stats.json"
         pending = _pending.get(self._path)
         self._buffer = pending if pending is not None else _Buffer(self._load(), time.monotonic())
+        # Слушатель новых событий (вид события) — тот же поток, что и append;
+        # его ошибка не мешает записи статистики.
+        self.on_append: Callable[[str], None] | None = None
 
     def _load(self) -> list[Event]:
         try:
@@ -245,6 +248,12 @@ class Stats:
         _pending[self._path] = self._buffer
         if time.monotonic() - self._buffer.last_save >= SAVE_INTERVAL_S:
             self.flush()
+        listener = self.on_append
+        if listener is not None:
+            try:
+                listener(event_type)
+            except Exception:  # noqa: BLE001 — сбой слушателя не ломает статистику
+                log.warning("Слушатель статистики завершился с ошибкой")
 
     def events(self) -> list[Event]:
         """Возвращает копии событий от старых к новым."""

@@ -228,6 +228,9 @@ def policy_entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str,
     for name in ("_setup_sys_path", "_harden", "_setup_render_env"):
         monkeypatch.setattr(bootstrap, name, Mock())
     monkeypatch.setattr(audio_env, "deny_pulse_autospawn", Mock())
+    # Системной версии нет; exec в процессе pytest недопустим в любом случае.
+    monkeypatch.setattr(paths, "SYSTEM_EXECUTABLE", tmp_path / "no-deb" / "astra-voice")
+    monkeypatch.setattr(os, "execve", Mock(side_effect=AssertionError("execve в тесте")))
     for name in (*bootstrap.SOFTWARE_RENDER_ENV, "QT_QUICK_CONTROLS_STYLE"):
         monkeypatch.delenv(name, raising=False)
     return entries

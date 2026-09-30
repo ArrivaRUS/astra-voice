@@ -290,3 +290,92 @@ def test_policy_profile_values(value: object, expected_allowed: bool) -> None:
         expected_allowed,
         expected_reason,
     )
+
+
+@pytest.mark.parametrize(
+    ("policy", "check_app", "scheduled", "manual"),
+    [
+        ("absent", False, "settings", ""),
+        ("absent", True, "", ""),
+        ("app-check-disabled", True, "policy", "policy"),
+        ("checks-disabled", False, "policy", "policy"),
+        ("offline", True, "admin", "admin"),
+        ("invalid", True, "admin", "admin"),
+    ],
+    indirect=["policy"],
+)
+def test_manual_app_check(policy: Policy, check_app: bool, scheduled: str, manual: str) -> None:
+    """«Проверить сейчас» не требует тумблера, но уважает офлайн и запрет администратора."""
+    gate = NetworkGate(effective(Settings(check_app_updates=check_app), policy), policy)
+    assert gate.refusal("check_app") == scheduled
+    assert gate.refusal("check_app_manual") == manual
+    if manual == "policy":
+        assert gate.allowed("check_app_manual") == (
+            False,
+            "Проверка обновлений отключена администратором",
+        )
+
+
+def test_manual_app_check_respects_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert NetworkGate(Settings(), Policy()).refusal("check_app_manual") == "offline"
+
+
+@pytest.mark.parametrize("kind", [*KINDS, "check_app_manual"])
+def test_user_offline_blocks_all_including_manual(kind: NetworkKind, policy: Policy) -> None:
+    """Офлайн-режим пользователя перекрывает тумблеры, скачивание и ручную проверку."""
+    settings = Settings(check_app_updates=True, check_model_updates=True, offline=True)
+    gate = NetworkGate(settings, policy)
+    assert gate.refusal(kind) == "offline"
+    assert_denied(gate.allowed(kind))
+    settings.offline = False
+    assert gate.refusal(kind) == ""
+
+
+def test_admin_refusal_wins_over_user_offline(tmp_path: Path) -> None:
+    path = tmp_path / "policy.conf"
+    path.write_text("[astra-voice]\nprofile = secure\n", encoding="utf-8")
+    policy = load(path)
+    gate = NetworkGate(effective(Settings(offline=True), policy), policy)
+    assert gate.refusal("download") == "admin"
+
+
+def test_policy_offline_true_locks_user_setting(tmp_path: Path) -> None:
+    path = tmp_path / "policy.conf"
+    path.write_text("[astra-voice]\noffline = true\n", encoding="utf-8")
+    policy = load(path)
+    assert policy.status is PolicyStatus.OK
+    assert policy.is_locked("offline")
+    assert effective(Settings(offline=False), policy).offline is True
+
+
+@pytest.mark.parametrize("extra", ["", "locked = offline\n"])
+def test_policy_offline_false_is_not_a_lock(tmp_path: Path, extra: str) -> None:
+    """Ревью P3-а: offline=false не блокирует — пользователь может уйти в офлайн сам."""
+    path = tmp_path / "policy.conf"
+    path.write_text(f"[astra-voice]\noffline = false\n{extra}", encoding="utf-8")
+    policy = load(path)
+    assert policy.status is PolicyStatus.OK
+    assert not policy.is_locked("offline")
+    assert effective(Settings(offline=True), policy).offline is True
+    assert (
+        NetworkGate(effective(Settings(offline=True), policy), policy).refusal("download")
+        == "offline"
+    )
+    assert NetworkGate(Settings(), policy).refusal("download") == ""
+
+
+def test_policy_offline_garbage_means_offline_and_keeps_other_locks(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ревью P2-а: непонятное offline= — офлайн с предупреждением, статус OK, блокировки целы."""
+    path = tmp_path / "policy.conf"
+    path.write_text("[astra-voice]\noffline = мусор\nautostart = false\n", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        policy = load(path)
+    assert policy.status is PolicyStatus.OK
+    assert policy.is_locked("offline") and policy.is_locked("autostart")
+    settings = effective(Settings(offline=False, autostart=True), policy)
+    assert settings.offline is True and settings.autostart is False
+    assert NetworkGate(settings, policy).refusal("download") == "admin"
+    assert "offline" in caplog.text

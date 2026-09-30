@@ -11,7 +11,7 @@ import posixpath
 import re
 import stat
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -21,7 +21,7 @@ from astra_voice.core import paths
 from astra_voice.models import catalog_state
 from astra_voice.models import schema as schema_module
 from astra_voice.net.hosts import host_allowed
-from astra_voice.security.verify import Verifier
+from astra_voice.security.verify import CLOCK_BEHIND, Verifier
 
 log = logging.getLogger(__name__)
 
@@ -83,7 +83,7 @@ class CatalogEntry:
     recommended: bool
     host: str
     files: tuple[FileSpec, ...]
-    # Запасные источники тех же путей в порядке каталога: hf → github → корпоративный.
+    # Запасные источники тех же путей в порядке каталога; загрузка: корпоративный → hf → github.
     mirrors: tuple[str, ...] = ()
     # Поля ниже появились в манифесте 12 записей и необязательны:
     # каталог из одной записи без них остаётся валидным.
@@ -127,6 +127,13 @@ class Catalog:
         return any(
             entry.model_id == model_id and entry.revision == revision for entry in self.revoked
         )
+
+
+def catalog_rtfx(entries: Iterable[CatalogEntry], model_id: str) -> float | None:
+    """Опубликованная скорость модели (RTFx) или None, если её нет в каталоге."""
+    entry = next((item for item in entries if item.id == model_id), None)
+    metric = None if entry is None else entry.metrics.rtfx
+    return None if metric is None else metric.value
 
 
 def measured_rtfx(local: Mapping[str, Any]) -> float | None:
@@ -455,7 +462,17 @@ def load_builtin(
     sig_path = (directory / "catalog.json.sig").resolve()
     raw = _read_limited(catalog_path, "Каталог")
     try:
-        if not sig_path.is_file() or not verifier.verify_detached(catalog_path, sig_path):
+        if not sig_path.is_file():
+            raise CatalogError("bad-signature", "Не удалось подтвердить подпись каталога.")
+        verdict = verifier.verify_detached(catalog_path, sig_path)
+        if not verdict.ok and verdict.code == CLOCK_BEHIND:
+            # У92/T-116: понятная причина вместо безымянного отказа подписи.
+            raise CatalogError(
+                "clock-behind",
+                "Не удалось подтвердить подпись каталога: часы компьютера отстают. "
+                "Проверьте дату и время.",
+            )
+        if not verdict.ok:
             raise CatalogError("bad-signature", "Не удалось подтвердить подпись каталога.")
     except (OSError, UnicodeError):
         raise CatalogError("bad-signature", "Не удалось проверить подпись каталога.") from None

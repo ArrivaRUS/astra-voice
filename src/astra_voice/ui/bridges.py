@@ -130,6 +130,7 @@ class SettingsBridge(QObject):
     languageChanged = pyqtSignal()
     checkAppUpdatesChanged = pyqtSignal()
     checkModelUpdatesChanged = pyqtSignal()
+    offlineChanged = pyqtSignal()
     autostartChanged = pyqtSignal()
     deviceChanged = pyqtSignal()
     devicesChanged = pyqtSignal()
@@ -165,6 +166,7 @@ class SettingsBridge(QObject):
         "language": "language",
         "checkAppUpdates": "check_app_updates",
         "checkModelUpdates": "check_model_updates",
+        "offline": "offline",
         "autostart": "autostart",
         "device": "device",
     }
@@ -352,6 +354,17 @@ class SettingsBridge(QObject):
     def retryModel(self, model_id: str) -> None:  # noqa: N802
         if self._downloads is not None:
             self._downloads.retryModel(model_id)
+
+    @pyqtSlot()
+    def retryFailedDownloads(self) -> None:  # noqa: N802
+        """«Повторить» полосы загрузки: то же, что «Повторить» у каждой карточки с ошибкой.
+
+        После неудачи запись выходит из выбора, поэтому ``startSelectedDownloads``
+        её уже не видит и кнопка полосы молчала бы. Повторяем записи в порядке
+        каталога: первая начинает очередь, остальные встают за ней.
+        """
+        if self._downloads is not None:
+            self._downloads.retryFailed()
 
     @pyqtSlot(str)
     def cancelModel(self, model_id: str) -> None:  # noqa: N802
@@ -719,6 +732,14 @@ class SettingsBridge(QObject):
     @checkModelUpdates.setter  # type: ignore[no-redef]
     def checkModelUpdates(self, value: bool) -> None:  # noqa: N802
         self._set_value("checkModelUpdates", value)
+
+    @pyqtProperty(bool, notify=offlineChanged)
+    def offline(self) -> bool:
+        return cast(bool, self._values["offline"])
+
+    @offline.setter  # type: ignore[no-redef]
+    def offline(self, value: bool) -> None:
+        self._set_value("offline", value)
 
     @pyqtProperty(bool, notify=autostartChanged)
     def autostart(self) -> bool:
@@ -1217,6 +1238,11 @@ class OnboardingController(QObject):
     @pyqtSlot(str)
     def retryModel(self, model_id: str) -> None:  # noqa: N802
         self._downloads.retryModel(model_id)
+
+    @pyqtSlot()
+    def retryFailedDownloads(self) -> None:  # noqa: N802
+        """«Повторить» полосы мастера: после неудачи запись уже вне выбора (§10.3, 4)."""
+        self._downloads.retryFailed()
 
     @pyqtSlot(str)
     def cancelModel(self, model_id: str) -> None:  # noqa: N802

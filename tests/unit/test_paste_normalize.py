@@ -21,6 +21,9 @@ from astra_voice.platform.paste import PasteMethod, PasteMode, PasteOutcomeKind,
 
 pytestmark = pytest.mark.unit
 
+#: Своё окно пробы захвата (X11Display.probe_window) — не окно фокуса 42 и не корень 2.
+PROBE_WINDOW = 7
+
 
 @pytest.mark.parametrize(
     ("source", "expected"),
@@ -153,6 +156,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeClipboard, Mock, list[
     x.send_combo.side_effect = send_combo
     x.grab_keyboard.return_value = True
     x.keyboard_grab_deadline = None
+    x.probe_window.return_value = PROBE_WINDOW
     x.keys_held.return_value = False
     x.root.id = 2
     focus = x.d.get_input_focus.return_value.focus
@@ -598,8 +602,9 @@ def test_chain_and_both_snapshots(
             x.grab_keyboard.assert_not_called()
             x.send_combo.assert_not_called()
         else:
-            # Проба захвата идёт на окне фокуса (42) после паузы, прямо перед XTest.
-            x.grab_keyboard.assert_called_once_with(42)
+            # Проба захвата идёт на своём окне (не на окне фокуса 42) после паузы,
+            # прямо перед XTest.
+            x.grab_keyboard.assert_called_once_with(PROBE_WINDOW)
             x.ungrab_keyboard.assert_called_once_with()
             x.send_combo.assert_called_once_with(mods, key)
 
@@ -971,7 +976,7 @@ def test_keyboard_probe_failure_keeps_phrase(
         if ms == 50:
             x.grab_keyboard.assert_not_called()
         else:
-            x.grab_keyboard.assert_called_once_with(42)
+            x.grab_keyboard.assert_called_once_with(PROBE_WINDOW)
             if grabbed:
                 x.ungrab_keyboard.assert_called_once_with()
             else:
@@ -985,6 +990,40 @@ def test_keyboard_probe_failure_keeps_phrase(
     assert outcome.restore == PasteRestore.KEPT_OURS
     assert cb.data[False]["text/plain"] == "фраза".encode()
     assert delays == [50, 100]
+
+
+def test_keyboard_probe_never_grabs_focus_window_or_root(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+) -> None:
+    """Захват на окне фокуса шлёт ему FocusOut/NotifyUngrab (KWin снимает активацию),
+    на корне — FocusIn корню (fly-wm перезахватывает). Проба — только на своём окне."""
+    _, x, _ = harness
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    assert outcome.kind == PasteOutcomeKind.PASTED
+    x.probe_window.assert_called_once_with()
+    assert x.grab_keyboard.call_args_list == [((PROBE_WINDOW,),)]
+    x.ungrab_keyboard.assert_called_once_with()
+
+
+def test_keyboard_probe_without_own_window_keeps_phrase(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+) -> None:
+    """Нет своего окна — нет и запасного захвата на окне фокуса: фраза в буфере.
+
+    Решение принимается по окну, созданному до паузы; фокус уже не проверяется.
+    """
+    cb, x, delays = harness
+    x.probe_window.return_value = None
+    outcome = paste.paste_text("фраза", 42, PasteMode.AUTO)
+    x.probe_window.assert_called_once_with()
+    x.d.get_input_focus.assert_not_called()
+    assert delays == [50, 100]
+    assert outcome.kind == PasteOutcomeKind.WINDOW_CHANGED
+    assert outcome.reason == "grab-no-window"
+    assert outcome.restore == PasteRestore.KEPT_OURS
+    assert cb.data[False]["text/plain"] == "фраза".encode()
+    x.grab_keyboard.assert_not_called()
+    x.send_combo.assert_not_called()
 
 
 @pytest.mark.parametrize("first_mode", [PasteMode.AUTO, PasteMode.CLIPBOARD_ONLY])
@@ -1738,6 +1777,19 @@ def test_keys_held_before_probe_waits_on_qt_loop(
 
     x.grab_keyboard.side_effect = grab
 
+    def probe() -> int:
+        order.append("probe-window")
+        return PROBE_WINDOW
+
+    x.probe_window.side_effect = probe
+    reply = x.d.get_input_focus.return_value
+
+    def get_input_focus() -> object:
+        order.append("focus")
+        return reply
+
+    x.d.get_input_focus.side_effect = get_input_focus
+
     def wait(ms: int) -> None:
         delays.append(ms)
         order.append(f"wait{ms}")
@@ -1747,7 +1799,14 @@ def test_keys_held_before_probe_waits_on_qt_loop(
     assert outcome.kind == PasteOutcomeKind.PASTED
     assert outcome.reason == ""
     assert delays == [paste.KEYS_POLL_MS] * held_polls + [50, 100]
-    assert order == [f"wait{paste.KEYS_POLL_MS}"] * held_polls + ["wait50", "grab(42,)", "wait100"]
+    # Окно пробы создаётся до паузы: между проверкой фокуса и XTest — только захват.
+    assert order == [f"wait{paste.KEYS_POLL_MS}"] * held_polls + [
+        "probe-window",
+        "wait50",
+        "focus",
+        f"grab({PROBE_WINDOW},)",
+        "wait100",
+    ]
     x.ungrab_keyboard.assert_called_once_with()
     x.send_combo.assert_called_once_with(["Control_L"], "v")
 
@@ -1795,6 +1854,7 @@ def test_keys_held_beyond_timeout_keeps_phrase(
         ("x-unavailable", PasteOutcomeKind.WINDOW_CHANGED, "x-unavailable"),
         ("grab-refused", PasteOutcomeKind.WINDOW_CHANGED, "grab-refused"),
         ("grab-stuck", PasteOutcomeKind.WINDOW_CHANGED, "grab-stuck"),
+        ("grab-no-window", PasteOutcomeKind.WINDOW_CHANGED, "grab-no-window"),
         ("xtest-refused", PasteOutcomeKind.WINDOW_CHANGED, "xtest-refused"),
         ("restored-early", PasteOutcomeKind.WINDOW_CHANGED, "restored-early"),
         ("publish-failed", PasteOutcomeKind.FAILED, "publish-failed"),
@@ -1837,6 +1897,8 @@ def test_outcome_reason_names_the_branch(
         x.grab_keyboard.return_value = False
     elif scenario == "grab-stuck":
         x.keyboard_grab_deadline = 30.0
+    elif scenario == "grab-no-window":
+        x.probe_window.return_value = None
     elif scenario == "xtest-refused":
         x.send_combo.return_value = False
     elif scenario == "restored-early":

@@ -8,7 +8,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from time import perf_counter, sleep
+from time import perf_counter
 from typing import Any, cast
 from unittest.mock import Mock
 
@@ -664,9 +664,11 @@ def test_fixed_messages(
     wrapper()
     args = _arguments(transport.bus.asyncCall.call_args.args[0])
     assert args[3:5] == [summary, body]
-    assert args[5].value() == (
-        ["show-details", "Подробности"] if wrapper is notifications.notify_selfcheck_failed else []
-    )
+    actions = {
+        notifications.notify_selfcheck_failed: ["show-details", "Подробности"],
+        notifications.notify_microphone_lost: ["choose-microphone", "Выбрать микрофон"],
+    }
+    assert args[5].value() == actions.get(wrapper, [])
     assert args[6]["urgency"].value() == priority
 
 
@@ -688,6 +690,51 @@ def test_hotkey_messages_name_combo_and_actions(
     args = _arguments(transport.bus.asyncCall.call_args.args[0])
     assert args[3:5] == expected
     assert args[5].value() == ([] if regrabbed else ["choose-hotkey", "Выбрать другую"])
+    assert args[6]["urgency"].value() == b"\x01"
+
+
+@pytest.mark.parametrize(
+    ("code", "body"),
+    [
+        (
+            "bad-combo",
+            "В текущей раскладке клавиатуры нет такого сочетания. Верните прежнюю раскладку "
+            "или назначьте другое сочетание в настройках. Программа продолжит пробовать вернуть "
+            "сочетание сама.",
+        ),
+        (
+            "duplicate",
+            "Программа продолжит пробовать вернуть сочетание сама. Если не получится, откройте "
+            "настройки и назначьте сочетание снова.",
+        ),
+        (
+            "not-grabbed",
+            "Программа продолжит пробовать вернуть сочетание сама. Если не получится, откройте "
+            "настройки и назначьте сочетание снова.",
+        ),
+        (
+            "неизвестная-причина",
+            "Программа продолжит пробовать вернуть сочетание сама. Если не получится, откройте "
+            "настройки и назначьте сочетание снова.",
+        ),
+        (
+            "",
+            "Программа продолжит пробовать вернуть сочетание сама. Если не получится, откройте "
+            "настройки и назначьте сочетание снова.",
+        ),
+    ],
+)
+def test_hotkey_lost_message_is_plain_and_offers_choice(
+    transport: Mock, code: str, body: str
+) -> None:
+    """Причина понятна человеку; служебный код не попадает в уведомление."""
+    notifications.notify_hotkey_lost(code)
+    transport.bus.asyncCall.assert_called_once()
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
+    assert args[3:5] == ["Горячая клавиша перестала работать", body]
+    if code:
+        assert code not in " ".join(args[3:5])
+    assert args[5].value() == ["choose-hotkey", "Выбрать другую"]
     assert args[6]["urgency"].value() == b"\x01"
 
 
@@ -718,6 +765,49 @@ def test_microphone_messages_use_system_description_and_actions(
     assert args[3:5] == expected
     assert args[5].value() == ([] if selected else ["choose-microphone", "Выбрать микрофон"])
     assert args[6]["urgency"].value() == b"\x01"
+
+
+@pytest.mark.parametrize("lost", [False, True])
+def test_microphone_change_button_opens_microphone_choice(transport: Mock, lost: bool) -> None:
+    """S5-A5 D1: обе вести о смене микрофона ведут к выбору микрофона в настройках."""
+    handler = Mock()
+    notifications.set_action_handler(notifications.ACTION_CHOOSE_MICROPHONE, handler)
+    transport.reply.arguments.return_value = [77]
+    if lost:
+        notifications.notify_microphone_lost()
+    else:
+        notifications.notify_microphone_changed("Встроенный микрофон")
+    _invoke_action(transport, 77, notifications.ACTION_CHOOSE_MICROPHONE)
+    handler.assert_called_once_with()
+
+
+@pytest.mark.parametrize("during_recording", [False, True])
+def test_microphone_lost_urgency_and_retry_depend_on_moment(
+    transport: Mock, during_recording: bool
+) -> None:
+    """Ревью S5-A5: посреди записи — обычное и без повтора; на старте — как было."""
+    transport.bus.isConnected.return_value = False
+    notifications.notify_microphone_lost(during_recording=during_recording)
+    notifications.notify_microphone_lost(during_recording=during_recording)
+    assert notifications.pending_count() == (0 if during_recording else 1)
+    transport.bus.isConnected.return_value = True
+    notifications.notify_microphone_lost(during_recording=during_recording)
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
+    assert args[3] == "Микрофон отключился"
+    assert args[5].value() == ["choose-microphone", "Выбрать микрофон"]
+    assert args[6]["urgency"].value() == (b"\x01" if during_recording else b"\x02")
+
+
+def test_microphone_changed_escapes_markup_in_body(transport: Mock) -> None:
+    name = '<img src="http://127.0.0.1:1/x">'
+    notifications.notify_microphone_changed(name)
+    transport.bus.asyncCall.assert_called_once()
+    args = _arguments(transport.bus.asyncCall.call_args.args[0])
+    assert args[3] == "Микрофон сменился"
+    assert args[4] == (
+        'Сейчас используется: &lt;img src="http://127.0.0.1:1/x"&gt;.'
+        " Выбрать другой можно в настройках."
+    )
 
 
 def _reply_with_id(notification_id: int) -> Mock:
@@ -1035,25 +1125,22 @@ def test_reset_disposes_in_flight_watcher(transport: Mock) -> None:
     assert notifications._watchers == {}
 
 
-def test_concurrent_notify_creates_one_gui_dispatcher(
+def test_concurrent_notify_uses_one_gui_receiver(
     transport: Mock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = QCoreApplication.instance() or QCoreApplication([])
-    received: list[str] = []
-    monkeypatch.setattr(notifications, "_submit", lambda notice: received.append(notice.summary))
-    original_init = notifications._Dispatcher.__init__
-    created: list[notifications._Dispatcher] = []
-
-    def slow_init(dispatcher: notifications._Dispatcher) -> None:
-        original_init(dispatcher)
-        created.append(dispatcher)
-        sleep(0.005)
-
-    monkeypatch.setattr(notifications._Dispatcher, "__init__", slow_init)
+    received: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        notifications,
+        "_submit",
+        lambda notice: received.append((notice.summary, threading.get_ident())),
+    )
+    notifications.install_dispatcher()
+    receiver = notifications._receiver
+    assert receiver is not None
     for round_number in range(5):
         notifications.reset_state()
         received.clear()
-        created.clear()
         barrier = threading.Barrier(6)
         errors: list[BaseException] = []
 
@@ -1076,14 +1163,17 @@ def test_concurrent_notify_creates_one_gui_dispatcher(
             thread.join(timeout=3)
         assert all(not thread.is_alive() for thread in threads)
         assert not errors
-        assert len(created) == 1
-        assert notifications._dispatcher is created[0]
-        assert created[0].thread() is app.thread()
+        # Один бессмертный получатель в GUI; рабочие потоки его не создают.
+        assert notifications._receiver is receiver
+        assert receiver.thread() is app.thread()
         for _ in range(50):
             app.processEvents()
             if len(received) == 6:
                 break
-        assert set(received) == {f"{round_number}-{index}" for index in range(6)}
+        assert {summary for summary, _ in received} == {
+            f"{round_number}-{index}" for index in range(6)
+        }
+        assert {thread for _, thread in received} == {threading.get_ident()}
 
 
 def _qualified_name(node: ast.AST, aliases: dict[str, str]) -> str:
@@ -1118,7 +1208,8 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
     """Проверить все вызовы, включая вложенные функции и псевдонимы импортов.
 
     Прямой notify разрешён только в модуле уведомлений. Для двух обёрток
-    горячей клавиши разрешены settings.hotkey снаружи и шаблон с combo внутри.
+    горячей клавиши разрешены settings.hotkey снаружи и шаблон с combo внутри;
+    для потери клавиши — сохранённый код причины и выбор из постоянных текстов.
     Описание микрофона разрешено внутри двух фиксированных шаблонов; runtime
     передаёт обёртки как колбэки. Остальные тексты — строковые константы.
     """
@@ -1176,7 +1267,8 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
         **hotkey_templates,
         "notify_onboarding_ready": 'f"Зажмите {combo} и говорите."',
         "notify_microphone_changed": (
-            'f"Сейчас используется: {name}. Выбрать другой можно в настройках."'
+            'f"Сейчас используется: {escape(name, quote=False)}. '
+            'Выбрать другой можно в настройках."'
         ),
         "notify_microphone_selected": 'f"Микрофон: {name}"',
     }
@@ -1221,6 +1313,15 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
             and not node.keywords
             and ast.dump(node.args[0])
             == ast.dump(ast.parse("self.settings.hotkey", mode="eval").body)
+        ):
+            continue
+        if (
+            not implementation
+            and leaf == "notify_hotkey_lost"
+            and len(node.args) == 1
+            and not node.keywords
+            and ast.dump(node.args[0])
+            == ast.dump(ast.parse("self._hotkey_lost_code", mode="eval").body)
         ):
             continue
         if not implementation and (leaf == "notify" or node.args or node.keywords):
@@ -1301,11 +1402,22 @@ def test_project_notifications_contain_no_dictation() -> None:
         "n.notify_tray_depends_on_panel(text)",
         "n.notify_hotkey_not_grabbed(text)",
         "n.notify_hotkey_regrabbed(text)",
+        "n.notify_hotkey_lost(text)",
         "n.notify_microphone_changed(text)",
         "n.notify_microphone_selected(text)",
         'def notify_microphone_changed(name):\n    notify(f"Запись: {text}")',
         'def notify_microphone_selected(name):\n    notify(f"Микрофон: {text}")',
         'def notify_hotkey_regrabbed(combo):\n    notify(f"Запись: {text}")',
+        'def notify_hotkey_lost(code):\n    notify("Потеря", text)',
+        'BODY = "x"\ndef notify_hotkey_lost(code=""):\n    BODY = code\n    notify("T", BODY)',
+        (
+            'BODIES = {"a": text}\ndef notify_hotkey_lost(code=""):\n'
+            '    notify("T", BODIES.get(code, "x"))'
+        ),
+        (
+            'BODIES = {}\ndef notify_hotkey_lost(code=""):\n'
+            '    BODIES[code] = code\n    notify("T", BODIES.get(code, "x"))'
+        ),
         'notify("Запись", actions=text)',
         'notify("Запись", actions=[("details", text)])',
         'notify("Запись", actions=[(text, "Подробности")])',

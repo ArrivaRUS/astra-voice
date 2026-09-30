@@ -4,7 +4,7 @@ Upstream-Contact: ArrivaRUS <arrivarus@gmail.com>
 Source: https://github.com/ArrivaRUS/astra-voice
 
 Files: *
-Copyright: 2026 ArrivaRUS
+Copyright: 2026 ГК «Астра»
 License: GPL-3.0-or-later
 
 Files: usr/lib/astra-voice/vendor/onnxruntime/*

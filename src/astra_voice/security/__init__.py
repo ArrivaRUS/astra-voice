@@ -1,6 +1,7 @@
 """Проверка подлинности: подписи GPG и контрольные суммы."""
 
 from astra_voice.security.verify import (
+    CLOCK_BEHIND,
     PINNED_FINGERPRINTS,
     REVOKED_FINGERPRINTS,
     Verifier,
@@ -8,6 +9,7 @@ from astra_voice.security.verify import (
 )
 
 __all__ = [
+    "CLOCK_BEHIND",
     "PINNED_FINGERPRINTS",
     "REVOKED_FINGERPRINTS",
     "VerifyResult",

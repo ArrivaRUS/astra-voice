@@ -1,105 +1,461 @@
 Astra Voice
-Copyright (c) 2026 ArrivaRUS
+Copyright (c) 2026 ГК «Астра»
 
 Эта программа распространяется на условиях GNU General Public License версии 3
-или любой более поздней (GPL-3.0-or-later). Полный текст — в файле LICENSE.
+или любой более поздней (GPL-3.0-or-later). Полный текст — в файле LICENSE
+(в установленном пакете — /usr/share/common-licenses/GPL-3).
 Причина выбора GPL: интерфейс построен на PyQt5, доступной только под GPL v3
 либо по коммерческой лицензии Riverbank (research/legal.md §1.2).
 
-Ниже перечислены сторонние компоненты, их правообладатели и лицензии.
-Машиночитаемый состав поставки — в sbom.cdx.json (CycloneDX) рядом с пакетом.
+Ниже перечислены сторонние компоненты: имя, версия, лицензия (идентификатор
+SPDX), правообладатель и источник. Каждый компонент остаётся под своей
+лицензией. Машиночитаемый состав поставки — в SBOM формата CycloneDX, который
+публикуется рядом с каждой сборкой: sbom.cdx.json для пакета .deb и
+sbom-appimage.cdx.json для AppImage.
+
+Разделы:
+  1. Что входит в пакет .deb
+  2. Что пакет .deb берёт из репозиториев операционной системы
+  3. Что входит в файл AppImage
+  4. Модели распознавания (скачиваются отдельно)
+  5. Шрифты
+  6. Что не используется
+  7. Исходные тексты компонентов под GPL и LGPL
+  8. Товарные знаки
 
 ================================================================================
-1. Компоненты в составе пакета
+1. Что входит в пакет .deb
 ================================================================================
 
-onnxruntime 1.24.4 — MIT License
+Каталог /usr/lib/astra-voice/vendor (колёса PyPI по packaging/wheels.lock,
+устанавливаются с проверкой sha256):
+
+onnxruntime 1.24.4 — MIT
     Copyright (c) Microsoft Corporation
     https://github.com/microsoft/onnxruntime
-    Поставляется три библиотеки: libonnxruntime.so, libonnxruntime_providers_shared.so,
-    onnxruntime_pybind11_state...so — байт-в-байт из официального колеса PyPI,
-    их sha256 указаны в SBOM.
+    Три библиотеки (libonnxruntime.so.1.24.4, libonnxruntime_providers_shared.so,
+    onnxruntime_pybind11_state.cpython-311-x86_64-linux-gnu.so) — байт-в-байт
+    из официального колеса PyPI, их sha256 указаны в SBOM.
+    Лицензии компонентов, собранных внутрь onnxruntime, перечислены
+    правообладателем в файле vendor/onnxruntime/ThirdPartyNotices.txt,
+    который поставляется в пакете вместе с vendor/onnxruntime/LICENSE.
 
-onnx-asr 0.12.0 — MIT License
-    Copyright (c) Ilya Stupakov
+onnx-asr 0.12.0 — MIT
+    Copyright (c) 2025 Ilya Stupakov
     https://github.com/istupakov/onnx-asr
+    Изменён: при сборке к колесу применяется патч
+    vendor/patches/onnx-asr-cancellable.patch (прерывание распознавания
+    по запросу пользователя). Остальной код не менялся.
 
-Эти библиотеки поставляются в каталоге /usr/lib/astra-voice/vendor.
+Каталог /usr/share/astra-voice/data:
 
-Silero VAD — MIT License
+Silero VAD v6.2.1 — MIT
     Copyright (c) 2020-present Silero Team
     https://github.com/snakers4/silero-vad
-    Файл silero_vad.onnx ревизии v6.2.1 (2026-02-24), коммит
-    7e30209a3e901f9842f81b225f3e93d8199902b1,
-    входит в состав пакета как data/vad/silero_vad.onnx.
-    sha256: 1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3
-    (не путать с silero-models — тот под CC BY-NC-SA и здесь не используется)
+    Файл data/vad/silero_vad.onnx, коммит
+    7e30209a3e901f9842f81b225f3e93d8199902b1 (2026-02-24),
+    sha256 1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3.
+    Не путать с silero-models: те распространяются под CC BY-NC-SA
+    и здесь не используются.
 
-Тестовые звуковые сэмплы data/test/test-ru-6s.wav и data/test/test-ru-20s.wav получены из transcribe-rs
-    (MIT, Copyright (c) 2025 Ilya Stupakov).
+Пробная запись data/smoke/smoke-ru.wav — MIT
+    Первые 1,60 с записи test-ru-6s.wav, собранной из samples/russian.wav
+    репозитория transcribe-rs 0.3.11 (MIT, https://github.com/cjpais/transcribe-rs;
+    строка Copyright в файле LICENSE использованной копии —
+    «Copyright (c) 2025 Ilya Stupakov»).
+    Нужна для самопроверки модели после установки.
+
+Только в репозитории, в пакет не входят: тестовые записи data/test/test-ru-6s.wav
+и data/test/test-ru-20s.wav (то же происхождение и та же лицензия).
 
 ================================================================================
-2. Компоненты из репозиториев операционной системы (зависимости пакета)
+2. Что пакет .deb берёт из репозиториев операционной системы
 ================================================================================
 
-PyQt5 — GNU General Public License v3
+Эти пакеты не входят в состав .deb: их ставит apt из репозиториев Astra Linux
+как зависимости (Depends/Recommends). Версии указаны для Astra Linux SE 1.8
+справочно; лицензии — по файлам /usr/share/doc/<пакет>/copyright.
+
+Python 3.11 (python3, 3.11.2) — PSF-2.0
+    Copyright (c) Python Software Foundation
+    https://www.python.org/
+
+PyQt5 (python3-pyqt5, python3-pyqt5.qtquick, 5.15.9) — GPL-3.0-only
     Copyright (c) Riverbank Computing Limited
     https://www.riverbankcomputing.com/software/pyqt/
 
-Qt 5 (QtQuick, QtQuick Controls 2, QtGraphicalEffects) — LGPL-3.0
+Qt 5 (5.15.8: QtQuick, QtQuick Controls 2, QtQuick Layouts, QtQuick Window,
+QtQuick Shapes, QtGraphicalEffects, QtSvg) — LGPL-3.0-only OR GPL-2.0-only
     Copyright (c) The Qt Company Ltd. и участники проекта
     https://www.qt.io/
+    Пакеты qml-module-qtquick2, qml-module-qtquick-controls2,
+    qml-module-qtquick-layouts, qml-module-qtquick-window2,
+    qml-module-qtquick-shapes, qml-module-qtgraphicaleffects, libqt5svg5.
 
-python-xlib — GNU Lesser General Public License v2.1 или новее
-    Copyright (c) участники проекта python-xlib
+python-xlib (python3-xlib, 0.33) — LGPL-2.1-or-later
+    Copyright (c) 2000-2013 Peter Liljenberg и участники проекта
     https://github.com/python-xlib/python-xlib
 
-NumPy — BSD 3-Clause; Requests — Apache-2.0; jsonschema — MIT;
-protobuf — BSD 3-Clause; flatbuffers — Apache-2.0; SymPy — BSD 3-Clause;
-packaging — Apache-2.0 или BSD 2-Clause.
-Эти пакеты не входят в состав .deb: они устанавливаются из репозиториев
-операционной системы и остаются под своими лицензиями.
+NumPy (python3-numpy, 1.24.2) — BSD-3-Clause
+    Copyright (c) 2005-2022 NumPy Developers
+    https://numpy.org/
+
+protobuf (python3-protobuf, 3.21.12) — BSD-3-Clause
+    Copyright (c) 2008-2021 Google Inc.
+    https://github.com/protocolbuffers/protobuf
+
+FlatBuffers (python3-flatbuffers, 2.0.8) — Apache-2.0
+    Copyright (c) Google Inc.
+    https://github.com/google/flatbuffers
+
+SymPy (python3-sympy, 1.11.1) — BSD-3-Clause
+    Copyright (c) 2006-2014 SymPy Development Team
+    https://www.sympy.org/
+    и её зависимость mpmath (python3-mpmath, 1.2.1) — BSD-3-Clause,
+    Copyright (c) 2005-2021 Fredrik Johansson and mpmath contributors.
+
+packaging (python3-packaging, 23.0) — Apache-2.0 OR BSD-2-Clause
+    Copyright (c) Donald Stufft и участники проекта
+    https://github.com/pypa/packaging
+
+Requests (python3-requests, 2.32.5) — Apache-2.0
+    Copyright (c) Kenneth Reitz
+    https://requests.readthedocs.io/
+    и его зависимости:
+      urllib3 (1.26.12) — MIT, Copyright (c) 2008-2020 Andrey Petrov and contributors;
+      idna (3.3) — BSD-3-Clause, Copyright (c) 2013-2017 Kim Davies;
+      certifi (2022.9.24) — MPL-2.0, Copyright (c) Kenneth Reitz;
+      charset-normalizer (3.0.1) — MIT, Copyright (c) 2019-2022 TAHRI Ahmed R.;
+      chardet (5.1.0) — LGPL-2.1-or-later, Copyright (c) Netscape Communications
+      Corporation и участники проекта.
+
+jsonschema (python3-jsonschema, 4.10.3, Recommends) — MIT
+    Copyright (c) 2013 Julian Berman
+    https://github.com/python-jsonschema/jsonschema
+
+pactl (pulseaudio-utils, 16.1) — LGPL-2.1-or-later
+    Copyright (c) Lennart Poettering и участники проекта PulseAudio
+    https://www.freedesktop.org/wiki/Software/PulseAudio/
+
+gpgv (2.2.40) — GPL-3.0-or-later
+    Copyright (c) Free Software Foundation, Inc.
+    https://gnupg.org/
+
+Системные службы из Recommends (ставятся apt по умолчанию, программой
+не изменяются): polkit-kde-agent-1 (GPL-2.0-or-later),
+pipewire-pulse (MIT — Expat по copyright-файлу пакета) или, как альтернатива,
+pulseaudio (LGPL-2.1-or-later), wireplumber (MIT).
 
 ================================================================================
-3. Модели распознавания (скачиваются отдельно, в пакет не входят)
+3. Что входит в файл AppImage (для сборки AppImage, версия 0.2)
 ================================================================================
 
-GigaAM v3 — MIT License
-    Copyright (c) 2024 GigaChat Team, СберДевайсы
-    https://github.com/salute-developers/GigaAM
-    ONNX-экспорт: https://huggingface.co/istupakov/gigaam-v3-onnx (MIT)
+Внимание: по решению 29.09.2026 база AppImage в версии 0.2 меняется на пакеты
+Debian 12 с OpenSSL 3 вместо python-appimage на AlmaLinux 8. Ниже — состав
+текущей сборки; раздел будет обновлён после пересборки по новому SBOM.
 
-Whisper — MIT License (репозиторий OpenAI) / Apache-2.0 (метаданные карточек
-    на Hugging Face; расхождение источников указано намеренно)
-    Copyright (c) 2022 OpenAI
-    https://github.com/openai/whisper
+AppImage — отдельный вариант поставки для установки в домашнюю папку
+пользователя. В отличие от .deb, всё перечисленное ниже лежит внутри файла
+.AppImage. Состав закреплён в packaging/appimage.lock; sha256 каждого
+исполняемого файла — в sbom-appimage.cdx.json. В AppImage входят также
+Silero VAD и пробная запись из раздела 1.
 
-Лицензия каждого репозитория, откуда скачиваются файлы, фиксируется в каталоге
-моделей и показывается на карточке модели.
+3.1. Интерпретатор
+
+CPython 3.11.16 — PSF-2.0
+    Copyright (c) Python Software Foundation
+    https://www.python.org/
+    Сборка python-appimage (python3.11.16-cp311-cp311-manylinux_2_28_x86_64),
+    https://github.com/niess/python-appimage. Полный текст лицензии
+    и перечень кода под другими лицензиями — в файле
+    opt/python3.11/lib/python3.11/LICENSE.txt внутри AppImage.
+
+3.2. Системные библиотеки, приложенные к интерпретатору
+
+Библиотеки приложены к интерпретатору сборкой python-appimage. Все, кроме
+SQLite, взяты из пакетов AlmaLinux 8 (manylinux_2_28); версия пакета указана
+в скобках. Лицензии — по лицензиям этих проектов.
+
+OpenSSL 1.1.1k (openssl-libs 1.1.1k-17.el8_6) — OpenSSL
+    (OpenSSL License и оригинальная SSLeay License)
+    Copyright (c) 1998-2021 The OpenSSL Project; Copyright (c) 1995-1998
+    Eric Young
+    https://www.openssl.org/
+    Файлы usr/lib/libssl.so.1.1 и usr/lib/libcrypto.so.1.1.
+    Ветка 1.1.1 не получает публичных исправлений безопасности. Относится
+    только к текущей сборке AppImage: принятый риск П16 от 28.09.2026
+    заменён решением от 29.09.2026 — AppImage версии 0.2 выходит на базе
+    Debian 12 с OpenSSL 3 (decisions/log.md); в SBOM компонент назван явно.
+    This product includes software developed by the OpenSSL Project
+    for use in the OpenSSL Toolkit (http://www.openssl.org/).
+    This product includes cryptographic software written by Eric Young
+    (eay@cryptsoft.com).
+
+GNU Readline 7.0 (readline 7.0-10.el8) — GPL-3.0-or-later
+    Copyright (c) Free Software Foundation, Inc.
+    https://tiswww.case.edu/php/chet/readline/rltop.html
+
+GNU dbm 1.18 (gdbm 1.18-2.el8: libgdbm, libgdbm_compat) — GPL-3.0-or-later
+    Copyright (c) Free Software Foundation, Inc.
+    https://www.gnu.org.ua/software/gdbm/
+
+ncurses 6.1 (ncurses 6.1-10.20180224.el8: libncursesw, libpanelw, libtinfo)
+— X11
+    Copyright (c) 1998-2018 Free Software Foundation, Inc.; Thomas E. Dickey
+    https://invisible-island.net/ncurses/
+
+bzip2 1.0.6 (bzip2 1.0.6-28.el8_10) — bzip2-1.0.6
+    Copyright (c) 1996-2010 Julian R Seward
+    https://sourceware.org/bzip2/
+
+XZ Utils / liblzma 5.2.4 (xz 5.2.4-4.el8_6) — общественное достояние
+    (public domain)
+    https://tukaani.org/xz/
+
+libffi 3.1 (libffi 3.1-24.el8) — MIT
+    Copyright (c) Anthony Green, Red Hat, Inc. и участники проекта
+    https://sourceware.org/libffi/
+
+libxcrypt 4.1.1 (libxcrypt 4.1.1-6.el8) — LGPL-2.1-or-later
+    Copyright (c) Thorsten Kukuk, Björn Esser, Zack Weinberg и участники проекта
+    https://github.com/besser82/libxcrypt
+
+SQLite 3.53.4 — blessing (общественное достояние)
+    https://www.sqlite.org/
+    Не из AlmaLinux: библиотека собрана из исходников SQLite и приложена
+    сборкой python-appimage (в библиотеке — дата исходников 2026-07-24).
+
+3.3. Колёса PyPI
+
+PyQt5 5.15.11 — GPL-3.0-only
+    Copyright (c) Riverbank Computing Limited
+    https://www.riverbankcomputing.com/software/pyqt/
+
+PyQt5-Qt5 5.15.19 — LGPL-3.0-only
+    Copyright (c) The Qt Company Ltd. и участники проекта
+    https://www.qt.io/
+    Библиотеки Qt 5.15.19 (Core, Gui, Widgets, DBus, Network, Qml,
+    QmlModels, QmlWorkerScript, Quick, QuickControls2, QuickTemplates2, Svg,
+    XcbQpa), их модули QML и подключаемые модули, а также ICU 56
+    (libicudata, libicui18n, libicuuc) — ICU, Copyright (c) International
+    Business Machines Corporation и участники проекта, https://icu.unicode.org/.
+    Условия LGPL-3.0 для этих библиотек: их можно заменить своими —
+    распаковать AppImage (ключ --appimage-extract) и подложить
+    совместимые версии.
+
+PyQt5-sip 12.19.0 — BSD-2-Clause
+    Copyright (c) 2025 Phil Thompson (Riverbank Computing Limited)
+    https://www.riverbankcomputing.com/software/sip/
+
+NumPy 1.24.2 — BSD-3-Clause
+    Copyright (c) 2005-2022 NumPy Developers
+    https://numpy.org/
+    Колесо содержит (numpy.libs):
+      OpenBLAS 0.3.21 — BSD-3-Clause, Copyright (c) 2011-2014 The OpenBLAS
+      Project, https://github.com/xianyi/OpenBLAS;
+      libgfortran — GPL-3.0-or-later WITH GCC-exception-3.1,
+      Copyright (c) 2002-2017 Free Software Foundation, Inc.;
+      libquadmath — LGPL-2.1-or-later, из состава GCC,
+      Copyright (c) Free Software Foundation, Inc.
+    Перечень лицензий этих библиотек — в файлах numpy-1.24.2.dist-info/LICENSE.txt
+    и LICENSES_bundled.txt внутри AppImage.
+
+onnxruntime 1.24.4 — MIT
+    Copyright (c) Microsoft Corporation
+    https://github.com/microsoft/onnxruntime
+    (то же колесо, что в .deb; ThirdPartyNotices.txt — рядом с библиотекой)
+
+onnx-asr 0.12.0 — MIT
+    Copyright (c) 2025 Ilya Stupakov
+    https://github.com/istupakov/onnx-asr
+    (с тем же патчем, что в .deb)
+
+python-xlib 0.33 — LGPL-2.1-or-later
+    Copyright (c) 2000-2013 Peter Liljenberg и участники проекта
+    https://github.com/python-xlib/python-xlib
+
+six 1.17.0 — MIT
+    Copyright (c) 2010-2024 Benjamin Peterson
+    https://github.com/benjaminp/six
+
+Requests 2.32.5 — Apache-2.0
+    Copyright (c) Kenneth Reitz
+    https://requests.readthedocs.io/
+
+urllib3 2.8.0 — MIT
+    Copyright (c) 2008-2020 Andrey Petrov and contributors
+    https://github.com/urllib3/urllib3
+
+idna 3.20 — BSD-3-Clause
+    Copyright (c) 2013-2026 Kim Davies and contributors
+    https://github.com/kjd/idna
+
+charset-normalizer 3.5.1 — MIT
+    Copyright (c) 2025 TAHRI Ahmed R.
+    https://github.com/jawah/charset_normalizer
+
+certifi 2026.7.22 — MPL-2.0
+    Copyright (c) Kenneth Reitz
+    https://github.com/certifi/python-certifi
+    Исходный код certifi (MPL-2.0) доступен по ссылке выше.
+
+jsonschema 4.10.3 — MIT
+    Copyright (c) 2013 Julian Berman
+    https://github.com/python-jsonschema/jsonschema
+
+attrs 22.2.0 — MIT
+    Copyright (c) 2015 Hynek Schlawack and the attrs contributors
+    https://github.com/python-attrs/attrs
+
+pyrsistent 0.19.3 — MIT
+    Copyright (c) 2022 Tobias Gustafsson
+    https://github.com/tobgu/pyrsistent
+
+3.4. Загрузчик AppImage
+
+type2-runtime (выпуск 20251108) — начальная часть файла .AppImage, которая
+    монтирует и запускает остальное содержимое.
+    https://github.com/AppImage/type2-runtime
+    Лицензия и состав статически собранных библиотек — по данным проекта
+    (уточняется).
+
+Инструмент сборки appimagetool 1.9.1 в AppImage не входит.
 
 ================================================================================
-4. Шрифты
+4. Модели распознавания (скачиваются отдельно, в пакеты не входят)
 ================================================================================
 
-PT Root UI — SIL Open Font License 1.1
-    Правообладатель — Paratype. Поставляется пакетом операционной системы
-    fonts-pt-root-ui, в состав .deb не входит.
+Модели не входят ни в .deb, ни в AppImage. Пользователь скачивает их сам
+своим действием (мастер первого запуска или раздел «Модели») — прямо из
+указанного репозитория Hugging Face (или с корпоративного зеркала), либо ставит
+из локального файла или папки. Лицензия каждой
+модели записана во встроенном каталоге моделей и показывается на её карточке.
+Ниже — все 12 моделей каталога с закреплёнными ревизиями.
 
-PT Mono — ParaType
-    Поставляется пакетом операционной системы fonts-pt-mono,
-    в состав .deb не входит. Условия использования — у ParaType,
+4.1. GigaAM (Сбер) — MIT
+
+Исходные модели: GigaAM, Copyright (c) 2024 GigaChat Team (Сбер),
+https://github.com/salute-developers/GigaAM,
+https://huggingface.co/ai-sage/GigaAM-v3 (карточка: license: mit).
+Преобразование в ONNX и квантование int8 — Ilya Stupakov (istupakov),
+лицензия репозиториев экспорта — MIT.
+
+    GigaAM v3 RNN-T (gigaam-v3-e2e-rnnt-int8, модель по умолчанию)
+    GigaAM v3 CTC (gigaam-v3-e2e-ctc-int8)
+    GigaAM v3 RNN-T без пунктуации (gigaam-v3-rnnt-int8)
+    GigaAM v3 CTC без пунктуации (gigaam-v3-ctc-int8)
+        https://huggingface.co/istupakov/gigaam-v3-onnx
+        ревизия 322c3b29492673eb7d0b434bfa9dfb8653e34d02
+
+    GigaAM Multilingual CTC (gigaam-multilingual-ctc-int8)
+        https://huggingface.co/istupakov/gigaam-multilingual-ctc-onnx
+        ревизия 458860e1983aef670dd9795fb6af603c82767d5d
+
+    GigaAM Multilingual Large CTC (gigaam-multilingual-large-ctc-int8)
+        https://huggingface.co/istupakov/gigaam-multilingual-large-ctc-onnx
+        ревизия 07665ab5e54371dd1ac7b8b10f06478003723573
+
+4.2. T-one (Т-Банк) — Apache-2.0
+
+    T-one (t-one-fp32)
+        Правообладатель — АО «ТБанк» (T-Tech)
+        https://huggingface.co/t-tech/T-one
+        ревизия 106f3b0b32a9e107eb613312e4ebc61ff3d53926
+        Лицензия: Apache License 2.0, https://www.apache.org/licenses/LICENSE-2.0
+
+4.3. Vosk (Alpha Cephei) — Apache-2.0
+
+    Vosk ru (vosk-ru-int8)
+        https://huggingface.co/alphacep/vosk-model-ru
+        ревизия df6a54a4d8e5d43e82675e4f5dba2d507731a0d1
+    Vosk small ru (vosk-small-ru-int8)
+        https://huggingface.co/alphacep/vosk-model-small-ru
+        ревизия 4d68c4017bcfa44e2a79581f7933339e916a35da
+    Правообладатель — Alpha Cephei Inc.
+    Лицензия: Apache License 2.0, https://www.apache.org/licenses/LICENSE-2.0
+
+4.4. Whisper (OpenAI) — лицензия указана по каждой модели
+
+Код и веса Whisper, Copyright (c) 2022 OpenAI, https://github.com/openai/whisper.
+Источники расходятся: репозиторий OpenAI указывает MIT для кода и весов,
+карточки openai/whisper-* на Hugging Face — свою лицензию для каждой модели.
+В каталоге записана лицензия карточки модели; расхождение указано намеренно.
+Преобразование в ONNX и квантование int8 — сообщество onnx-community.
+
+    Whisper large-v3-turbo (whisper-large-v3-turbo-int8) — MIT
+        по карточке https://huggingface.co/openai/whisper-large-v3-turbo
+        файлы: https://huggingface.co/onnx-community/whisper-large-v3-turbo
+        ревизия 360ebcde2559d60bb474678be3c1de9ef347d01a
+
+    Whisper small (whisper-small-int8) — Apache-2.0
+        по карточке https://huggingface.co/openai/whisper-small
+        файлы: https://huggingface.co/onnx-community/whisper-small
+        ревизия 36050c46d777d46dc4b5f43f6d90574fc38f8732
+        Лицензия: Apache License 2.0, https://www.apache.org/licenses/LICENSE-2.0
+
+4.5. NeMo FastConformer (NVIDIA) — CC-BY-4.0
+
+    NeMo FastConformer ru (nemo-fastconformer-ru-pc-ctc-int8)
+        Атрибуция (CC BY 4.0):
+        «stt_ru_fastconformer_hybrid_large_pc» — NVIDIA,
+        https://huggingface.co/nvidia/stt_ru_fastconformer_hybrid_large_pc,
+        лицензия Creative Commons Attribution 4.0 International,
+        https://creativecommons.org/licenses/by/4.0/.
+        Изменения: модель преобразована в ONNX и квантована в int8
+        (Ilya Stupakov, https://huggingface.co/istupakov/stt_ru_fastconformer_hybrid_large_pc_onnx,
+        ревизия fb6753736c56de3259d78a26a488548c84b9dccb); используется
+        CTC-декодер. Astra Voice веса не изменяет.
+
+================================================================================
+5. Шрифты
+================================================================================
+
+Шрифты не входят ни в .deb, ни в AppImage: программа берёт их из пакетов
+операционной системы (Recommends). Если их нет, интерфейс переходит на
+установленные в системе PT Astra Sans, Open Sans или Roboto, а моноширинный
+текст — на DejaVu Sans Mono или Liberation Mono (qml/Theme.qml).
+
+PT Root UI (fonts-pt-root-ui) — OFL-1.1
+    Copyright (c) 2018 Paratype Inc, Paratype Ltd,
+    с зарезервированным названием «PT Root UI»
     https://www.paratype.ru/
 
-Шрифты PT Root UI в tests/fixtures/fonts — копии только для тестов CI, в пакет не входят; лицензия SIL OFL 1.1.
+PT Mono (fonts-pt-mono) — ParaType Free Font Licensing Agreement
+    Copyright (c) 2009 ParaType Ltd.
+    https://www.paratype.ru/
+
+Копии PT Root UI в tests/fixtures/fonts нужны только тестам CI и в поставку
+не входят; лицензия — OFL-1.1.
 
 ================================================================================
-5. Товарные знаки
+6. Что не используется
+================================================================================
+
+sherpa-onnx (Apache-2.0, k2-fsa) — не используется: адаптер SherpaEngine не
+включён, программа работает только через onnx-asr (спайк S3). Условие
+Apache-2.0 §4(d) к поставке не применяется.
+
+silero-models (CC BY-NC-SA) — не используется; из проекта Silero берётся только
+Silero VAD (MIT, раздел 1).
+
+================================================================================
+7. Исходные тексты компонентов под GPL и LGPL
+================================================================================
+
+Исходный код Astra Voice: https://github.com/ArrivaRUS/astra-voice
+(тег, совпадающий с версией сборки).
+
+Исходные тексты сторонних компонентов под GPL и LGPL (PyQt5, Qt, python-xlib,
+GNU Readline, GNU dbm, libxcrypt, библиотеки GCC) — по ссылкам проектов выше;
+для пакетов раздела 2 — в репозиториях исходных текстов Astra Linux, для
+библиотек раздела 3.2 — в исходных пакетах AlmaLinux 8 указанных версий.
+
+================================================================================
+8. Товарные знаки
 ================================================================================
 
 Astra Linux — товарный знак ПАО «Группа Астра». GigaAM — обозначение
-СберДевайсы. Whisper — обозначение OpenAI. Продукт не аффилирован с указанными
-компаниями и не одобрен ими; названия используются исключительно для указания
-совместимости и происхождения компонентов.
-
-Рабочее имя продукта — временное; вопрос согласования имени открыт
-(research/legal.md §5, гейт G5).
+СберДевайсы. Whisper — обозначение OpenAI. Vosk — обозначение Alpha Cephei.
+T-one — обозначение АО «ТБанк». NeMo — обозначение NVIDIA. Продукт не
+аффилирован с указанными компаниями и не одобрен ими; названия используются
+только для указания совместимости и происхождения компонентов.

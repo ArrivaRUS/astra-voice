@@ -833,3 +833,156 @@ data/smoke/smoke-ru.wav` — интеграционного теста нет, �
   3. поток 2 — `net/http.py` + fault-сервер (M7); поток 3 — S5-A5 (живая проверка заказчиком ~30.09).
   4. tech-writer: строки T1 §6 (B20–B23, У101–У113, П15–П19) → `docs/threat-model.md`, §7 (T-175…T-182) → `docs/test-plan.md`.
 - Ждём от Cowork суммы Command1 1.6 → зеркало в тот же день. V1 отложен до клиента Voice (решение заказчика).
+
+## 2026-09-28 вечер — сбой смены модели исправлен; беклог
+- Сбой переключения на Whisper large у заказчика (19:10): диктовка мертва после отката. Исправлено PR #12 (откат перезапускает
+  воркер с прежней моделью, дедлайн самопроверки по модели, «Модель слишком медленная…», сторож не даёт ложный «ok»);
+  ревью APPROVE после одного цикла, CI зелёный. Остаток P3 (край: неудачная запись current.json + зависший старт воркера —
+  `_selfcheck` не переводится в failed) и nit — в беклог правок.
+- Выпуск фиксов #11 и #12 — в составе 0.2 (0.1.1 не делаем, решение заказчика). До 0.2 у заказчика обход: не выбирать
+  Whisper large; если диктовка замолчала — трей «Проверить модель ещё раз».
+- Беклог: US-2.12 (команда Cowork удержанием средней кнопки мыши, Д44), US-6.7 (реальная скорость моделей: замер на машине
+  заказчика −10 % как ориентир, Д45).
+- `wip/ma-foundation` (фундамент AppImage, 7 коммитов до ba5a8ee) на GitHub, в main — после проверок T1 в четверг 01.10.
+
+## 2026-09-29 ~13:00 — ПЕРЕД СЖАТИЕМ: состояние дня
+**Правило до сб 03.10:** лимиты Codex на исходе — новый код пишет `developer` (Claude Opus), Codex только architect-codex;
+начатые developer-codex доделываются (decisions f9a6994, память feedback_codex_limits_architecture_only).
+
+**Агенты в работе (фон):**
+- developer-codex (GPT-6 Astra) — трей без разборки объектов шины (регрессия #11, вариант Б отладчика), `wt-tray` /
+  `wip/fix-tray-bus`. Дальше: ревью → черновой PR → CI → слияние; урок 026 (получатель хуков QtDBus бессмертен; поправка к 025).
+  Пока не слит — `test_tray_dbus_lifetime[plasma_reply]` флейкает в CI любой ветки (не блокер других PR, повторять job).
+- developer-codex (Sol/Astra) — S5-A5 линии A (IPC v3, classify_change, state) и B (`worker/pulse_stream.py`, DONT_MOVE,
+  новый бэкенд за переменной окружения), `wt-mic` / `wip/s5a5-mic-change` (arch/s5a5-mic-change.md). Дальше: ревью →
+  **спайк C на стенде virtual_mic (Юрка; заказчик разрешил 29.09 — предупредить ДО и ПОСЛЕ, на время не диктовать)** → линия
+  D (GUI) → мини-Ц2 20 диктовок → живая проверка заказчиком ~03.10 (гарнитура/USB/BT, 5–10 мин).
+- code-reviewer — остаток шага 1 AppImage `ba5a8ee..82ba474` (`wt-ma`, ветка на GitHub). Ветка НЕ сливается до 01.10.
+- developer (Claude) — перенос сборки AppImage в `packaging/appimage/` + `scripts/release_*.sh` + `ci-workflow-patch.md`
+  (workflow только вызывает скрипты, флаг ENABLED), `wt-ci` / `wip/r2-ci` (от ma-foundation). Одна локальная сборка.
+- developer (Claude) — починка CI PR #13 (`wip/m7-http`, `wt-m7`): importorskip requests в tests/net для engine-job,
+  порог test_dns_budget, P3 (timeout None, тест-сторож внутренностей urllib3). После зелёного CI — слить #13.
+
+**Слито сегодня:** docs T1 → threat-model/test-plan (a152e2b); Command1 1.7 зеркало (e6d9a37). Решения: регрессия #11
+(5f36f5a), CA policy→системный→env (c476675), S5-A5 в 0.2 за счёт резерва 3–4.10 + стенд разрешён (8962939).
+
+**Дальше по M7 (Claude developer):** `net/github.py` (releases/latest → SemVer), `updates/checker.py` (раз в 24 ч, ОДИН общий
+UpdateCache на процесс, jitter 600 с), `core/policy.py` полный (У16/У37, T-19), UI «Сеть и обновления»/строка/трей, T-116.
+**Четверг 01.10:** T1-проверки (BL-1, MJ-1, MJ-3, MN-1/keylib.sh, MN-8; тесты T-175/177/179/181) + один T2 по дифу
+ma-foundation → слияние ma-foundation → rebase r2-ci. **05–06.10:** правка workflow заказчиком в браузере по ci-workflow-patch.md.
+**Беклог правок:** ~~P2 — докачка моделей M6 на urllib3 2.8~~ (закрыто #20 `f901f7d` + PR #28);
+~~P2 — moveToThread в model_downloads~~ (закрыто #20); ~~P3 из #12~~ (PR #28) (край: _selfcheck не failed при невозможном откате);
+T-163…T-174 перенести из arch/appimage.md в test-plan; тексты S5-A5 «Сейчас используется» (вопрос PM, не блокирует).
+
+## 2026-09-29 ~14:30 — M7 слит, AppImage на правках
+- PR #13 (M7 net/http) слит squash `c95c1f5`; worktree `wt-m7` убран, ветка удалена.
+- Следующий шаг M7 (Claude developer, `wt-m7b`, `wip/m7-checker`): `net/github.py`, `updates/checker.py` (только программа,
+  один UpdateCache на процесс), T-116. `core/policy.py` полный — ПОСЛЕ слияния ma-foundation (четверг), чтобы не конфликтовать.
+- AppImage шаг 1: ревью REQUEST CHANGES (P2 запрет appimage=deny), решение в `decisions/log.md`; правки — Claude developer в `wt-ma`.
+- Беклог мелочей: тест «None-timeout ограничен общим дедлайном» и тест на CHECK_CONNECT_TIMEOUT_S (ревью bdbf82c, minor);
+  AppImage — TryExec дважды при нескольких Exec, лимит чтения `_menu_state`, `AutostartState.target compare=False`,
+  `require_available()` не подключён (гейт `check_bundle.py`), текст кнопки «Использовать системную версию» про повторный запуск файла.
+
+## 2026-09-29 ~16:00 — AppImage шаг 1 одобрен, трей и перенос сборки на ревью
+- `wip/ma-foundation` до `c7a267b`: ревью APPROVE (P2 deny/--register закрыты). Не сливаем до T1+T2 в четверг 01.10.
+  Беклог P3: `read_running_keys()` — множество KEY из всех кандидатов runtime-каталога (или удалять метку при выходе);
+  nit — распаковка режима В остаётся при гибели AppRun от сигнала.
+- `wip/fix-tray-bus` `396734a` (GPT-6 Astra): на ревью code-reviewer → затем черновой PR + CI.
+- `wip/r2-ci` `6e8590a`: на ревью; ждёт «да» заказчика на скачивание 3 колёс (jsonschema 4.10.3, attrs 22.2.0,
+  pyrsistent 0.19.3) и ключа подписи runtime AppImage (<1 МБ) для закрепления хэшей.
+
+## 2026-09-29 ~13:30 — r2-ci одобрен
+- `wip/r2-ci` `a8e4b34`: ревью APPROVE. Колёса jsonschema/attrs/pyrsistent и ключ runtime `570C77AC…6490F695` закреплены
+  (скачаны с «да» заказчика 29.09, сверены с PyPI JSON и lock); две сборки одного коммита — одинаковый sha256 `6546da01…6e18`.
+  Два P3 (`split_allowed`, узкая вычистка RECORD) — в работе у того же developer. Ветка стоит на ma-foundation → сливать
+  после неё (четверг). До отправки ci-workflow-patch заказчику: прогон root→nobody в `debian:12` — в T3.
+  После вливания M7 checker убрать `--if-exists` для tests/net, tests/updates в `ci.yml.proposed`.
+- Нагрузка 13:15 (вопрос заказчика): WebKitWebProcess DesktopX ~89 % 74 мин (его приложение), pytest Cowork (другая сессия).
+
+## 2026-09-29 ~18:00 — день: слито и сборка на проверку
+- Слито в main: #13 M7 net/http, #14 M7 checker+T-116, #15 трей (урок 026), #16 S5-A5 A/B, #17 S5-A5 линия D,
+  #18 проба захвата на своём окне (Enter в форме Cowork, найдено сессией Cowork), #19 M7 UI. Спайк C S5-A5 — `arch/spikes/S5A5.md`.
+- Сборка `astra-voice_0.1.1~dev1_amd64.deb` (main `5a7fb53`, --host, elf-audit ok) на `~/Desktop`,
+  sha256 `c1706db4…25f7`; changelog-запись dev1 только в срезе сборки. Ждёт установки заказчиком (sudo) → я перезапускаю
+  программу по pid → проверка: Enter в форме Cowork (KDE), вставка в Kate/fly-term (Fly), раздел «Сеть и обновления».
+- Ждут четверга 01.10: `wip/ma-foundation` (`c7a267b`, APPROVE), `wip/r2-ci` (`67f7479`, APPROVE, на ma-foundation) — T1+T2
+  одним проходом → слить → `platform/external` → кнопка «Страница выпуска» в M7 UI.
+- Дальше S5-A5: E3 мини-Ц2 на 20 диктовок со `stream` на стенде virtual_mic (предупредить заказчика), сверка подписи
+  switched vs audio.ready (P3), затем PR на бэкенд по умолчанию, живая проверка ~03.10.
+- Порядок: агентам — уникальные имена скриптов в scratchpad (общий t.sh перезаписывался).
+
+## 2026-09-29 ~19:30 — M9-а и загрузчик в работе; лицензии
+- Заказчик проверил 0.1.1~dev1: Enter в форме Cowork ок, «Сеть и обновления» ок. Урок 027.
+- В работе (Claude developer): `wip/m9a-about` (раздел «О программе»), `wip/dl-threads` (загрузчик на threading + очередь
+  по уроку 026; лямбды на сигналах; флейк `test_model_install_failure_message_uses_reason_code`; докачка на urllib3 2.x).
+- `wip/m9a-docs` `23e34a7` (tech-writer): NOTICE и PRIVACY заново по коду; на сверке code-reviewer; + правка INSTALL-ADMIN.
+- **Лицензии (к legal-analyst):** OpenSSL 1.1.1k (OpenSSL/SSLeay) в бандле AppImage с GPL-3.0 (PyQt5 GPL-3.0) —
+  известная несовместимость; Qt LGPL — предложение исходников; нужно ли письменное предложение исходников GPL.
+- Упаковка (после четверга, в r2-ci/developer): `debian/rules` — цикл доков без `|| true` (падать на отсутствии);
+  `debian/copyright` — `silero_vad.onnx`, `smoke-ru.wav`; AppImage `build.sh` — класть NOTICE/PRIVACY в бандл;
+  `appimage.lock` — проверить отсутствие protobuf/flatbuffers/sympy/packaging (объявлены onnxruntime).
+- Мини-Ц2 S5-A5 (20 диктовок, ~5 мин клавиатура/буфер/микрофон заказчика) — ждёт удобного времени от заказчика.
+
+## 2026-09-29 ~21:30 — ПЕРЕД СЖАТИЕМ: состояние вечера
+**У заказчика:** `.deb` 0.1.1~dev1 (main `5a7fb53`) — проверено вживую: Enter в форме Cowork ок (урок 027), «Сеть и обновления» ок.
+Программа запущена в обычном режиме (бэкенд `simple`).
+**Слито сегодня в main (до `f901f7d`):** #13–#20: M7 бэкенд+UI, трей (урок 026), S5-A5 A/B/D, проба захвата (урок 027),
+загрузчик на threading (уроки 025/026) + short-read на urllib3 2.x. Уроки 026, 027 записаны.
+**Решения заказчика 29.09 (в `decisions/log.md`):** AppImage 0.2 — на базе Debian 12 с OpenSSL 3 (лицензии, заключение
+legal-analyst); правообладатель — ГК «Астра» (NOTICE, debian/copyright); вопросы юристу ГК — юрлицо и передача
+прав, ПП № 313, код с ИИ.
+
+**Ветки и агенты в работе:**
+- `wip/m9a-about` (`52921d6`, wt-about) — раздел «О программе»: ревью APPROVE, макет PASS; черновой **PR #21**, CI run
+  36569458279; на короткой сверке `52921d6`. → слить, затем **`wip/m9a-docs`** (`28fc513`, wt-docs, NOTICE/PRIVACY/
+  INSTALL-ADMIN, ревью PASS) — PR и слить ПОСЛЕ About (документы ссылаются на «О программе»).
+- `wip/hotkey-regrab` (wt-hotkey, Claude developer) — фикс потери хоткея при MappingNotify (`_refresh_mapping` без
+  ungrab при неизменной карте, grab-before-ungrab; WARNING+NOKEY+перезахват в runtime), журнал нажатий/record.start/
+  воркера, `dictate50.sh` ранняя диагностика. → ревью → PR/CI → сборка dev2 → повторная мини-проба с заказчиком
+  (10 диктовок `stream`, между 5 и 6 — физический Shift; если отказ без Shift — тот же прогон на `simple`).
+- `wip/notify-dispatch` (wt-notify, Claude developer) — `ui/notify.py _Dispatcher` на схему урока 026. → ревью → PR.
+- `wip/appimage-rev3` (wt-arch3, architect-codex) — план базы Debian 12 + OpenSSL 3, оценка «успеваем к 15.10?»;
+  изменения в `arch/appimage.md` НЕ закоммичены — закоммитить Юрке после отчёта. Если не успеваем — вернуться к заказчику
+  с откатом (г): принять риск + убрать readline/gdbm.
+- Ждут четверга 01.10 (T1+T2 одним проходом): `wip/ma-foundation` (`c7a267b`), `wip/r2-ci` (`67f7479`) — обе APPROVE.
+  После слияния: `platform/external` → кнопка «Страница выпуска»; `--if-exists` в ci.yml.proposed убрать; NOTICE/PRIVACY
+  внутрь AppImage; путь документов AppImage (`$APPDIR`) в `about_bridge`; `sbom.py` vendor → ГК «Астра».
+- S5-A5: мини-Ц2 15:03 — 3/20, 4-я не началась (разбор debugger: хоткей, не `stream`); `stream` в умолчание — только
+  после повторной пробы. Сверка подписи switched vs audio.ready (P3) — на пробе.
+**Комплаенс AppImage к 15.10:** тексты лицензий внутрь бандла, NOTICE §7 — точные ссылки на исходники GPL/LGPL, архив
+исходников в Release, type2-runtime/libfuse (LGPL-2.1) — закрыть «уточняется».
+**Правила:** Codex — только архитектура до сб 03.10; агентам — уникальные имена скриптов в scratchpad.
+
+### 2026-09-29 вечер — после сжатия
+- Слито: #21 «О программе» (`5c404b1`), #22 NOTICE/PRIVACY/INSTALL-ADMIN (`a46b399`), #23 уведомления по уроку 026 (`66c93f0`). Ревизия 3 AppImage в `arch/appimage.md` (`ca3f84c`), решение и разрешение на скачивание — `decisions/log.md` (`d69319e`).
+- В работе: `wip/hotkey-regrab` (5 коммитов до `12d8c8c`) на ревью → dev2 → повторная мини-проба; `wip/appimage-debian3` (`wt-deb3`, от r2-ci) — Claude developer, шаг 1 R3 + спайк после скачивания, рубеж 02.10 18:00.
+- Беклог: nit `notify._post_from_thread` — при `invokeMethod`=False сбрасывать `_wake_pending`; PRIVACY — у загрузки моделей указать и запасной github.com; уведомление о потере хоткея для кодов ≠ busy — свой текст; `dictate50.sh` — убрать старый `pgrep -f`.
+
+### 2026-09-29 ~16:30 — dev2 у заказчика, повторная мини-проба
+- #24 хоткей слит (`39c0ce9`), сборка `0.1.1~dev2` (--host, elf-audit ok, sha256 `b5e9222f…`) установлена заказчиком, программа перезапущена.
+- Повторная мини-проба на `stream` (стенд virtual_mic, «ок» заказчика): 11/11 нажатий → `record.start`, 11/11 распознано, 10 вставлено; 1 — `window-changed` (фокус ушёл в окно Claude, программа правильно не вставила). p95 полного времени ≈362 мс. MappingNotify за прогон — только 2 в начале, `перезахват: не нужен`; физический Shift MappingNotify не дал. Уборка чистая (av_test=0, устройства прежние; зависшую на «Закрыть документ» тестовую Kate закрыл kill -9).
+- Урок 028. Дальше: `wip/stream-default` (Claude developer) — `stream` по умолчанию; `wip/appimage-debian3` — шаг 1 R3 готов (Python 3.11.2-6+deb12u8, OpenSSL 3.4 с хоста, check_bundle ok), на ревью; исходники Qt 5.15.19 — download.qt.io недоступен, разрешены зеркала github.com/qt и libfuse.
+- Беклог хоткея (P3 сверки): при подавлении «потеряна» лимитом 60 с перезапускать таймер на остаток; `app-pid` в `hotkey_diag.py` видит только пакетную установку — написать в usage.
+- ~17:30: #25 слит (`1e4196c`) — запись `stream` по умолчанию, `simple` — запасной через `ASTRA_VOICE_AUDIO_BACKEND=simple` (строка в INSTALL-ADMIN), откат только при отсутствии символа libpulse. У заказчика пока dev2 (`simple` по умолчанию) — попадёт со следующей сборкой. Беклог nit: INFO «simple (откат)» пишется до `simple.open`.
+
+### 2026-09-29 вечер — AppImage R3 к 01.10
+- `wip/appimage-debian3` (Claude developer, `wt-deb3`, от r2-ci): до `271fbd0` — Python 3.11.2-6+deb12u8 из Debian 12, OpenSSL 3 и 44 host-lib с хоста, SBOM 157 компонентов, лицензии в образе (33 файла), архив исходников ~156 МБ (Qt 5.15.19 `v5.15.19-lts-lgpl` с github.com/qt, libfuse 3.15.0), `tools/validate` с архивом, AppRun: кириллица/«:»/LC_ALL=C. Образ 74,99 МБ, воспроизводим. Ревью ×4 APPROVE, последний `aa78398` (LC_CTYPE вместо LC_ALL, уборка распаковки при «:»). Беклог nit: тест на appimage_extracted_* без маркера.
+- Открыто к 15.10: исходники GCC-рантайма numpy (libquadmath, libgfortran) — заказчик «пока не качать»; тексты лицензий musl/squashfuse/zstd/zlib/mimalloc — ссылками; qt_attribution; NOTICE под AppImage.
+- **В общий ИБ-проход 01.10 (T2) одним списком:** модель статусов gpgv и clearsign; корень доверия (ключ Debian из пакета ALSE, отпечаток, срок 2031-01-19); TOCTOU/отравление кэша CI; OpenSSL и host-lib с хоста (`LD_LIBRARY_PATH`, dlopen OpenSSL 1.1 из Qt); привязка git_tree↔commit только через GitHub API; теги Qt неподписаны; libfuse без действующей подписи (вариант б); Alpine в type2-runtime не закреплён; память/CPU проверки архива и внутренний `tarfile._proc_member`; AppRun и локаль; исходники GCC не приложены. Плюс ma-foundation и r2-ci.
+- Порядок 01.10: T1 AppImage + T2 одним проходом → слить ma-foundation → r2-ci → перенести deb3 на main (конфликты AppRun/bootstrap) → PR/CI.
+- После слияния ma-foundation: `platform/userinstall.py` `running_key_path()` — удалять метку при штатном выходе, если в ней наш KEY (P3, решение Юрки 29.09: минимальный вариант).
+- Зеркало моделей `models-2026.10` на GitHub: при появлении `mirrors` в каталоге переписать раздел PRIVACY — тест `test_privacy_doc.py` упадёт.
+
+### 2026-09-29 поздний вечер — «продолжай кодить»
+- Слиты #26 мелкие правки по ревью (`9c9999f`) и #27 инструменты v0.2 (слияние ниже): `validate downloads --faults` 19/19 (мутации compare_digest/_range_matches ловятся), `tools/benchmark --catalog --minimum-models 3` (пределы воркера в зонде), `validate autostart` 6/6.
+- **Ц6 закрыт:** whisper-small-int8 скачан в dev-хранилище (250 МБ, разрешение заказчика). Замер (`--runs 5 --threads 2`): gigaam 22,8× p95 201 мс 427 МБ; t-one 13,1× 401 мс 653 МБ; whisper-small 3,5× 1504 мс 1083 МБ. RTFx gigaam плавает 23–30×.
+- Заказчик: автозапуск — ручную запись оставить до v1.0 (`validate autostart --check-installed` у него = код 1, ожидаемо).
+- Беклог nit: зонд benchmark — проверка `getppid()` после PDEATHSIG, `PR_SET_DUMPABLE=0`/`oom_score_adj` как у воркера.
+- PR #28 СЛИТ (short-read по Content-Length в urllib3 1.26/2.8, `_RecheckJob` finally, `_selfcheck` failed при невозможном откате, тесты M7) . Беклог: тест огромного Content-Length — проверять тело `hello`; на urllib3 2.x при обрыве теряется ≤64 КиБ хвоста блока (`read1` вместо `iter_content`, nit); общий модуль схемы урока 026 (трей/notify/model_downloads) — v1.0, решение Юрки 29.09.
+- PR #29 СЛИТ — M6 хвост: состояния загрузчика на живом мосте (12 unit + 7 xvfb), «Повторить» в полосе после ошибки снова работает (окно настроек и мастер), отозванные модели не повторяются (`ModelDownloads.retryFailed()`). Беклог P3-7: единая проверка `_can_retry(entry)` для canRetry/retryModel/retryFailed (сейчас установленная vs каталожная ревизия расходятся; безвредно).
+- Хвост M6 v0.2 открыт: зеркало весов `models-2026.10` в GitHub Releases (публикация — с «ок» заказчика), живые T-74…T-76, T-86 у заказчика.
+
+### 2026-09-30 ~11:30 — Codex вернулся, штатные роли
+- Заказчик: лимиты Codex сброшены — код снова пишет `developer-codex` (GPT-6 Sol @high), ревью — Claude `code-reviewer`; режим «Codex только архитектура» снят.
+- В работе параллельно: `wip/backlog-nits` (wt-nits, Sol) — беклог P3/nit одним PR (зонд benchmark getppid/DUMPABLE/oom_score_adj, тест огромного Content-Length с телом, `_can_retry(entry)` P3-7, тексты «потеряна» для кодов ≠ busy, `dictate50.sh` без `pgrep -f`, usage `hotkey_diag app-pid`, INFO «simple (откат)»); `wt-arch18` (architect-codex, только чтение) — план US-1.8 «Пройти настройку заново» → `scratchpad/us18/plan.md`.
+- План четверга 01.10 без изменений: T1 AppImage + T2 одним проходом → ma-foundation → r2-ci → перенос deb3 на main.
