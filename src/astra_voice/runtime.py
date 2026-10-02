@@ -1403,7 +1403,7 @@ class DictationRuntime(QObject):
 
     def apply_device(self, value: str | None) -> None:
         """value не нужен: record_params возьмёт устройство из настроек перед следующей записью.
-        Сброс объявления: следующее открытие снова скажет «Микрофон: имя», даже если имя то же.
+        Сбрасываем имя для интерфейса; уведомление будет только при смене фактического источника.
         """
         self.sound.forget_microphone_changes()
         self.orchestrator.reset_device_announcement()

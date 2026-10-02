@@ -131,13 +131,13 @@ def test_raise_microphone_unmutes_and_sets_target_volume() -> None:
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: yes\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 10% / -30 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 6554 / 10% / -30 dB\n"),
         }
     )
     assert sound.raise_microphone("mic")
     assert runner.calls[-2:] == [
         ["pactl", "set-source-mute", "mic", "0"],
-        ["pactl", "set-source-volume", "mic", f"{RAISE_TARGET_PERCENT}%"],
+        ["pactl", "set-source-volume", "mic", "50%"],
     ]
 
 
@@ -146,7 +146,7 @@ def test_raise_microphone_keeps_volume_above_full() -> None:
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: yes\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 130% / 6 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 85197 / 130% / 6 dB\n"),
         }
     )
     assert sound.raise_microphone("mic")
@@ -188,7 +188,7 @@ def test_restore_microphone_returns_first_known_volume_and_unmute_state() -> Non
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: no\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 16384 / 25% / -20 dB\n"),
         }
     )
     assert sound.raise_microphone("mic")
@@ -200,7 +200,7 @@ def test_restore_microphone_returns_first_known_volume_and_unmute_state() -> Non
     assert sound.raise_microphone("mic")
     assert sound.restore_microphone("mic")
     assert runner.calls[-2:] == [
-        ["pactl", "set-source-volume", "mic", "25%"],
+        ["pactl", "set-source-volume", "mic", "16384"],
         ["pactl", "set-source-mute", "mic", "0"],
     ]
     assert not sound.can_restore_microphone("mic")
@@ -210,22 +210,44 @@ def test_restore_microphone_returns_original_mute_state() -> None:
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: yes\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 80% / -6 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 52428 / 80% / -6 dB\n"),
         }
     )
     assert sound.raise_microphone("mic")
     assert sound.restore_microphone("mic")
     assert runner.calls[-2:] == [
-        ["pactl", "set-source-volume", "mic", "80%"],
+        ["pactl", "set-source-volume", "mic", "52428"],
         ["pactl", "set-source-mute", "mic", "1"],
     ]
+
+
+def test_raise_then_restore_preserves_stereo_levels_and_mute() -> None:
+    sound, runner = control(
+        replies={
+            "get-source-mute": (0, "Mute: yes\n"),
+            "get-source-volume": (
+                0,
+                "Volume: front-left: 45875 / 70% / -9.29 dB, "
+                "front-right: 13107 / 20% / -41.94 dB\n",
+            ),
+        }
+    )
+    assert sound.raise_microphone("mic")
+    assert not any(call[1] == "set-source-volume" for call in runner.calls)
+    assert sound.can_restore_microphone("mic")
+    assert sound.restore_microphone("mic")
+    assert runner.calls[-2:] == [
+        ["pactl", "set-source-volume", "mic", "45875", "13107"],
+        ["pactl", "set-source-mute", "mic", "1"],
+    ]
+    assert not sound.can_restore_microphone("mic")
 
 
 def test_raise_microphone_without_change_does_not_remember() -> None:
     sound, _ = control(
         replies={
             "get-source-mute": (0, "Mute: no\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 80% / -6 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 52428 / 80% / -6 dB\n"),
         }
     )
     assert sound.raise_microphone("mic")
@@ -236,7 +258,7 @@ def test_raise_microphone_remembers_when_only_one_command_succeeds() -> None:
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: yes\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 16384 / 25% / -20 dB\n"),
         },
         fails=("set-source-volume",),
     )
@@ -252,7 +274,7 @@ def test_raise_microphone_does_not_remember_successful_noop() -> None:
     sound, _ = control(
         replies={
             "get-source-mute": (0, "Mute: no\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 16384 / 25% / -20 dB\n"),
         },
         fails=("set-source-volume",),
     )
@@ -264,7 +286,7 @@ def test_failed_restore_keeps_snapshot_for_retry() -> None:
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: no\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 16384 / 25% / -20 dB\n"),
         }
     )
     assert sound.raise_microphone("mic")
@@ -289,7 +311,7 @@ def test_default_source_change_prevents_restore_to_another_microphone() -> None:
         replies={
             "get-default-source": (0, "alsa_input.a\n"),
             "get-source-mute": (0, "Mute: yes\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 20% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 13107 / 20% / -20 dB\n"),
         }
     )
     assert sound.raise_microphone(None)
@@ -311,14 +333,14 @@ def test_default_source_restore_targets_resolved_microphone() -> None:
         replies={
             "get-default-source": (0, "alsa_input.a\n"),
             "get-source-mute": (0, "Mute: yes\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 20% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 13107 / 20% / -20 dB\n"),
         }
     )
     assert sound.raise_microphone("")
     assert sound.can_restore_microphone(None)
     assert sound.restore_microphone(None)
     assert runner.calls[-2:] == [
-        ["pactl", "set-source-volume", "alsa_input.a", "20%"],
+        ["pactl", "set-source-volume", "alsa_input.a", "13107"],
         ["pactl", "set-source-mute", "alsa_input.a", "1"],
     ]
     assert not sound.can_restore_microphone(None)
@@ -329,7 +351,7 @@ def test_default_source_manual_change_remembers_resolved_microphone() -> None:
         replies={
             "get-default-source": (0, "alsa_input.a\n"),
             "get-source-mute": (0, "Mute: no\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 20% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 13107 / 20% / -20 dB\n"),
         }
     )
     assert sound.set_microphone_volume(35, None)
@@ -337,7 +359,7 @@ def test_default_source_manual_change_remembers_resolved_microphone() -> None:
     assert sound.can_restore_microphone("alsa_input.a")
     assert sound.restore_microphone(None)
     assert runner.calls[-2:] == [
-        ["pactl", "set-source-volume", "alsa_input.a", "20%"],
+        ["pactl", "set-source-volume", "alsa_input.a", "13107"],
         ["pactl", "set-source-mute", "alsa_input.a", "0"],
     ]
 
@@ -348,7 +370,7 @@ def test_unresolved_default_source_does_not_remember(answer: tuple[int, str]) ->
         replies={
             "get-default-source": answer,
             "get-source-mute": (0, "Mute: yes\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 20% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 13107 / 20% / -20 dB\n"),
         }
     )
     assert sound.raise_microphone(None)
@@ -363,7 +385,7 @@ def test_forget_microphone_changes_clears_all_sources() -> None:
     sound, _ = control(
         replies={
             "get-source-mute": (0, "Mute: no\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 16384 / 25% / -20 dB\n"),
             "get-default-source": (0, "default-mic\n"),
         }
     )
@@ -380,7 +402,7 @@ def test_set_microphone_volume_remembers_volume_and_mute_for_restore() -> None:
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: yes\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 16384 / 25% / -20 dB\n"),
         }
     )
     assert sound.set_microphone_volume(35, "mic")
@@ -389,9 +411,40 @@ def test_set_microphone_volume_remembers_volume_and_mute_for_restore() -> None:
     assert sound.can_restore_microphone("mic")
     assert sound.restore_microphone("mic")
     assert runner.calls[-2:] == [
-        ["pactl", "set-source-volume", "mic", "25%"],
+        ["pactl", "set-source-volume", "mic", "16384"],
         ["pactl", "set-source-mute", "mic", "1"],
     ]
+
+
+@pytest.mark.parametrize(("left_raw", "left_percent"), [(45875, 70), (32768, 50), (32790, 50)])
+def test_set_microphone_volume_preserves_first_stereo_baseline(
+    left_raw: int, left_percent: int
+) -> None:
+    sound, runner = control(
+        replies={
+            "get-source-mute": (0, "Mute: no\n"),
+            "get-source-volume": (
+                0,
+                f"Volume: front-left: {left_raw} / {left_percent}% / -9 dB, "
+                "front-right: 13107 / 20% / -41.94 dB\n",
+            ),
+        }
+    )
+    # Даже если первый канал уже 50 %, второй изменится с 20 до 50 %.
+    assert sound.set_microphone_volume(50, "mic")
+    assert runner.calls[-1] == ["pactl", "set-source-volume", "mic", "50%"]
+    assert sound.can_restore_microphone("mic")
+    runner.replies["get-source-volume"] = (
+        0,
+        "Volume: front-left: 32768 / 50% / -18.06 dB, front-right: 32768 / 50% / -18.06 dB\n",
+    )
+    assert sound.set_microphone_volume(60, "mic")
+    assert sound.restore_microphone("mic")
+    assert runner.calls[-2:] == [
+        ["pactl", "set-source-volume", "mic", str(left_raw), "13107"],
+        ["pactl", "set-source-mute", "mic", "0"],
+    ]
+    assert not sound.can_restore_microphone("mic")
 
 
 @pytest.mark.parametrize(("requested", "expected"), [(150, "100%"), (-5, "0%")])
@@ -399,7 +452,7 @@ def test_set_microphone_volume_clamps_to_full_range(requested: int, expected: st
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: no\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 16384 / 25% / -20 dB\n"),
         }
     )
     assert sound.set_microphone_volume(requested, "mic")
@@ -411,15 +464,15 @@ def test_set_microphone_volume_remembers_only_first_change() -> None:
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: no\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 16384 / 25% / -20 dB\n"),
         }
     )
     assert sound.set_microphone_volume(40, "mic")
-    runner.replies["get-source-volume"] = (0, "Volume: front-left: 1 / 40% / -15 dB\n")
+    runner.replies["get-source-volume"] = (0, "Volume: front-left: 26214 / 40% / -15 dB\n")
     assert sound.set_microphone_volume(60, "mic")
     assert sound.restore_microphone("mic")
     assert runner.calls[-2:] == [
-        ["pactl", "set-source-volume", "mic", "25%"],
+        ["pactl", "set-source-volume", "mic", "16384"],
         ["pactl", "set-source-mute", "mic", "0"],
     ]
 
@@ -428,7 +481,7 @@ def test_set_microphone_volume_after_raise_keeps_original_state() -> None:
     sound, runner = control(
         replies={
             "get-source-mute": (0, "Mute: yes\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 16384 / 25% / -20 dB\n"),
         }
     )
     assert sound.raise_microphone("mic")
@@ -440,7 +493,7 @@ def test_set_microphone_volume_after_raise_keeps_original_state() -> None:
     assert sound.set_microphone_volume(60, "mic")
     assert sound.restore_microphone("mic")
     assert runner.calls[-2:] == [
-        ["pactl", "set-source-volume", "mic", "25%"],
+        ["pactl", "set-source-volume", "mic", "16384"],
         ["pactl", "set-source-mute", "mic", "1"],
     ]
 
@@ -449,7 +502,7 @@ def test_set_microphone_volume_failure_does_not_remember() -> None:
     sound, _ = control(
         replies={
             "get-source-mute": (0, "Mute: no\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 16384 / 25% / -20 dB\n"),
         },
         fails=("set-source-volume",),
     )
@@ -475,7 +528,7 @@ def test_set_microphone_volume_without_change_does_not_remember() -> None:
     sound, _ = control(
         replies={
             "get-source-mute": (0, "Mute: no\n"),
-            "get-source-volume": (0, "Volume: front-left: 1 / 25% / -20 dB\n"),
+            "get-source-volume": (0, "Volume: front-left: 16384 / 25% / -20 dB\n"),
         }
     )
     assert sound.set_microphone_volume(25, "mic")
@@ -583,7 +636,7 @@ def test_external_sound_commands_receive_clean_environment(
         wraps=FakeRunner(
             replies={
                 "get-source-mute": (0, "Mute: yes\n"),
-                "get-source-volume": (0, "Volume: front-left: 1 / 20% / -20 dB\n"),
+                "get-source-volume": (0, "Volume: front-left: 13107 / 20% / -20 dB\n"),
             },
             fails=("pipewire-pulse.socket",),
         )

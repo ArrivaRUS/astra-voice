@@ -744,6 +744,8 @@ class FakeSettings(QObject):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[str] = []
+        self.microphone_volume_requests: list[int] = []
+        self.apply_microphone_volume = False
         self.toggled_model_ids: list[str] = []
         self.cancelled_model_ids: list[str] = []
         self.dequeued_model_ids: list[str] = []
@@ -1372,6 +1374,9 @@ class FakeSettings(QObject):
     @pyqtSlot(int)
     def setMicrophoneVolume(self, percent: int) -> None:
         self.calls.append("setMicrophoneVolume")
+        self.microphone_volume_requests.append(percent)
+        if self.apply_microphone_volume:
+            self.microphoneVolume = percent
 
     @pyqtSlot()
     def openSoundSettings(self) -> None:
@@ -3843,30 +3848,188 @@ def test_settings_change_hotkey_shows_capture_field(onboarding_app: Any) -> None
     assert_no_messages(messages, "settings capture")
 
 
-def test_settings_general_fits_minimum_window_height(onboarding_app: Any, monkeypatch: Any) -> None:
-    # Минимальная высота окна задана темой; проверяем доступность строки громкости без прокрутки.
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize(
+    ("volume", "muted", "can_restore", "error", "locked"),
+    [
+        (80, False, False, "", False),
+        (25, False, False, "", False),
+        (80, True, False, "", False),
+        (50, False, True, "", False),
+        (-1, False, False, "", False),
+        (25, False, True, "Не удалось изменить громкость микрофона", False),
+        (25, False, True, "", True),
+    ],
+    ids=["normal", "quiet", "muted", "restore", "unknown", "error", "policy"],
+)
+def test_settings_general_fits_minimum_window_height(
+    onboarding_app: Any,
+    monkeypatch: Any,
+    dark: bool,
+    volume: int,
+    muted: bool,
+    can_restore: bool,
+    error: str,
+    locked: bool,
+) -> None:
+    # Требование относится к минимальному окну и доступности действий,
+    # независимо от того, в каких строках разработчик расположит контролы.
     minimum_height = int(theme_number("sizeWindowMinH"))
+    minimum_width = int(theme_number("sizeWindowMinW"))
     monkeypatch.setattr(sys.modules[__name__], "HEIGHT", minimum_height)
+    monkeypatch.setattr(sys.modules[__name__], "WIDTH", minimum_width)
     fake = FakeSettings()
-    assert fake.microphoneVolume == 80
-    assert not fake.microphoneMuted
-    assert fake.canRaiseMicrophone
-    assert fake.canOpenSoundSettings
+    fake.microphoneVolume = volume
+    fake.microphoneMuted = muted
+    fake.canRestoreMicrophoneVolume = can_restore
+    fake.microphoneError = error
+    if locked:
+        fake.lockedSettings = ["device", "mic_volume_on_start"]
 
     def inspect(window: Any) -> None:
-        assert window.height() == minimum_height
+        assert (window.width(), window.height()) == (minimum_width, minimum_height)
+        root = window.contentItem()
         body = next(
             item
-            for item in visual_tree(window.contentItem())
+            for item in visual_tree(root)
             if item.metaObject().className() == "QQuickFlickable" and item.isVisible()
         )
-        assert body.property("contentHeight") <= body.height()
-        texts = visible_texts(window.contentItem())
-        assert {"80 %", "Громкость микрофона"} <= texts
+        # Баннер ошибки может вытеснить нижние настройки; основные состояния
+        # должны целиком помещаться без прокрутки.
+        if not error:
+            assert body.property("contentHeight") <= body.height()
+        assert body.property("contentY") == 0
+        texts = visible_texts(root)
         assert not any(text.startswith("Громкость микрофона в системе") for text in texts)
+        if error:
+            assert error in texts
+        if locked:
+            assert "Задано администратором" in texts
+
+        # Выбор устройства нужен и при неизвестной громкости; политика
+        # блокирует выбор, но ручные действия с громкостью не запрещает.
+        device_row = next(
+            item for item in visual_tree(root) if item.property("label") == "Микрофон"
+        )
+        selectors = [
+            item
+            for item in visual_tree(device_row)
+            if item.isVisible() and item.metaObject().indexOfProperty("currentIndex") >= 0
+        ]
+        assert len(selectors) == 1
+        assert selectors[0].isEnabled() == (not locked)
+        controls = [selectors[0]]
+
+        sliders = [
+            item
+            for item in visual_tree(root)
+            if item.isVisible() and item.metaObject().indexOfSignal(b"moved()") >= 0
+        ]
+        assert len(sliders) == int(volume >= 0 and not muted)
+        if sliders:
+            slider = sliders[0]
+            assert slider.isEnabled()
+            assert slider.property("from") == 0
+            assert slider.property("to") == 100
+            assert slider.property("stepSize") == 5
+            assert slider.property("value") == volume
+            assert f"{volume} %" in texts
+            controls.append(slider)
+
+        actions = [("Настройки звука…", "openSoundSettings")]
+        if muted or 0 <= volume < 30:
+            actions.append(("Поднять", "raiseMicrophoneVolume"))
+        if can_restore:
+            actions.append(("Вернуть", "restoreMicrophoneVolume"))
+        for title, _method in actions:
+            button = visible_button(root, title)
+            assert button.isEnabled(), title
+            controls.append(button)
+        assert not any(
+            item.isVisible()
+            and item.property("text") == title
+            and item.metaObject().indexOfSignal(b"clicked()") >= 0
+            for item in visual_tree(root)
+            for title in ({"Поднять", "Вернуть"} - {title for title, _ in actions})
+        )
+
+        rectangles = []
+        for control in controls:
+            top_left = control.mapToItem(body, QPointF(0, 0))
+            bottom_right = control.mapToItem(body, QPointF(control.width(), control.height()))
+            label = control.property("text") or control.metaObject().className()
+            assert control.width() > 0 and control.height() > 0, label
+            assert top_left.x() >= 0 and top_left.y() >= 0, label
+            assert bottom_right.x() <= body.width(), label
+            assert bottom_right.y() <= body.height(), label
+            rectangles.append(
+                (top_left.x(), top_left.y(), bottom_right.x(), bottom_right.y(), label)
+            )
+        for index, first in enumerate(rectangles):
+            for second in rectangles[index + 1 :]:
+                overlap_x = min(first[2], second[2]) - max(first[0], second[0])
+                overlap_y = min(first[3], second[3]) - max(first[1], second[1])
+                assert overlap_x <= 0 or overlap_y <= 0, (first[4], second[4])
+
+        assert not {
+            "setMicrophoneVolume",
+            "raiseMicrophoneVolume",
+            "restoreMicrophoneVolume",
+        } & set(fake.calls)
+        fake.calls.clear()
+        for title, method in actions:
+            QMetaObject.invokeMethod(visible_button(root, title), "clicked", Qt.DirectConnection)
+            onboarding_app.processEvents()
+            assert fake.calls == [method]
+            fake.calls.clear()
+
+    _, messages = render_settings(onboarding_app, dark, fake=fake, inspect=inspect)
+    assert_no_messages(messages, "general settings at minimum size")
+
+
+@pytest.mark.parametrize("accepted", [False, True], ids=["rejected", "accepted"])
+def test_settings_microphone_slider_keyboard_applies_once_and_refresh_is_read_only(
+    onboarding_app: Any, accepted: bool
+) -> None:
+    fake = FakeSettings()
+    fake.microphoneVolume = 50
+    fake.apply_microphone_volume = accepted
+
+    def inspect(window: Any) -> None:
+        root = window.contentItem()
+        slider = next(
+            item
+            for item in visual_tree(root)
+            if item.isVisible() and item.metaObject().indexOfSignal(b"moved()") >= 0
+        )
+        assert fake.microphone_volume_requests == []
+        assert "setMicrophoneVolume" not in fake.calls
+        fake.calls.clear()
+        slider.forceActiveFocus()
+        onboarding_app.processEvents()
+        assert slider.hasActiveFocus()
+        QTest.keyClick(window, Qt.Key_Right, Qt.NoModifier)
+        onboarding_app.processEvents()
+        assert fake.calls == ["setMicrophoneVolume"]
+        assert fake.microphone_volume_requests == [55]
+        expected = 55 if accepted else 50
+        assert fake.microphoneVolume == expected
+        assert slider.property("value") == expected
+        assert f"{expected} %" in visible_texts(root)
+
+        fake.calls.clear()
+        fake.refreshMicrophone()
+        # Ответ звуковой службы меняет значение через notify настоящего
+        # контракта: это обновление не должно снова писать громкость.
+        fake.microphoneVolume = 40
+        onboarding_app.processEvents()
+        assert slider.property("value") == 40
+        assert "40 %" in visible_texts(root)
+        assert fake.calls == ["refreshMicrophone"]
+        assert fake.microphone_volume_requests == [55]
 
     _, messages = render_settings(onboarding_app, False, fake=fake, inspect=inspect)
-    assert_no_messages(messages, "general settings at minimum height")
+    assert_no_messages(messages, "microphone slider keyboard and refresh")
 
 
 def test_policy_locked_step1(onboarding_app: Any) -> None:

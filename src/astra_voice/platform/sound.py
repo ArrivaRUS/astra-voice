@@ -73,7 +73,8 @@ SOUND_SERVICE_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("systemctl", "--user", "restart", "wireplumber"),
 )
 
-_VOLUME_PERCENT = re.compile(r"(\d{1,4})\s*%")
+_VOLUME_CHANNEL = re.compile(r":\s*(\d+)\s*/\s*(\d{1,4})\s*%")
+_VOLUME_NORM = 65536
 
 
 class MicrophoneProblem(Enum):
@@ -101,6 +102,14 @@ class MicrophoneState:
         if 0 <= self.percent < LOW_VOLUME_PERCENT:
             return MicrophoneProblem.TOO_QUIET
         return None
+
+
+@dataclass(frozen=True)
+class _MicrophoneSnapshot:
+    """Состояние и точные громкости каналов для возврата без потери баланса."""
+
+    state: MicrophoneState
+    volumes: tuple[int, ...]
 
 
 def _spawn(command: Sequence[str], *, popen: Callable[..., object] = subprocess.Popen) -> bool:
@@ -136,7 +145,7 @@ class SoundControl:
         self._which = which
         self._run = run
         self._spawn = spawn
-        self._before_change: dict[str, MicrophoneState] = {}
+        self._before_change: dict[str, _MicrophoneSnapshot] = {}
 
     @property
     def has_volume_control(self) -> bool:
@@ -209,33 +218,38 @@ class SoundControl:
 
     def microphone_state(self, device: str | None = None) -> MicrophoneState:
         """Читает признак «звук выключен» и громкость БЕЗ открытия микрофона."""
+        snapshot = self._microphone_snapshot(device)
+        return snapshot.state if snapshot is not None else MicrophoneState()
+
+    def _microphone_snapshot(self, device: str | None) -> _MicrophoneSnapshot | None:
+        """Читает все каналы в порядке pactl, сохраняя целые значения PulseAudio."""
         source = self._source(device)
         muted = self._pactl("get-source-mute", source)
         volume = self._pactl("get-source-volume", source)
         if muted is None or volume is None:
-            return MicrophoneState()
-        match = _VOLUME_PERCENT.search(volume)
-        if match is None:
+            return None
+        channels = _VOLUME_CHANNEL.findall(volume)
+        if not channels:
             log.debug("Не удалось разобрать ответ звуковой службы о громкости")
-            return MicrophoneState()
-        try:
-            percent = int(match.group(1))
-        except ValueError:
-            return MicrophoneState()
-        return MicrophoneState(known=True, muted="yes" in muted.lower(), percent=percent)
+            return None
+        state = MicrophoneState(
+            known=True, muted="yes" in muted.lower(), percent=int(channels[0][1])
+        )
+        return _MicrophoneSnapshot(state, tuple(int(raw) for raw, _percent in channels))
 
-    def _remember(self, source: str, state: MicrophoneState) -> None:
+    def _remember(self, source: str, snapshot: _MicrophoneSnapshot) -> None:
         """Сохраняет известное состояние до первого изменения источника за сеанс."""
-        if state.known and source not in self._before_change:
-            self._before_change[source] = state
+        if source not in self._before_change:
+            self._before_change[source] = snapshot
 
     def raise_microphone(self, device: str | None = None) -> bool:
         """Включает звук выбранного источника и поднимает до целевой громкости (50 %)."""
         resolved = self._resolved_source(device)
         source = resolved or self._source(device)
-        state = self.microphone_state(source)
-        if not state.known:
+        snapshot = self._microphone_snapshot(source)
+        if snapshot is None:
             return False
+        state = snapshot.state
         unmuted = self._pactl("set-source-mute", source, "0") is not None
         raised = True
         if state.percent < RAISE_TARGET_PERCENT:
@@ -245,7 +259,7 @@ class SoundControl:
         if resolved is not None and (
             (state.muted and unmuted) or (state.percent < RAISE_TARGET_PERCENT and raised)
         ):
-            self._remember(resolved, state)
+            self._remember(resolved, snapshot)
         log.info(
             "Громкость микрофона по кнопке: звук %s, громкость %s",
             "включён" if unmuted else "включить не удалось",
@@ -258,12 +272,18 @@ class SoundControl:
         percent = max(0, min(int(percent), FULL_VOLUME_PERCENT))
         resolved = self._resolved_source(device)
         source = resolved or self._source(device)
-        state = self.microphone_state(source)
-        if not state.known:
+        snapshot = self._microphone_snapshot(source)
+        if snapshot is None:
             return False
         changed = self._pactl("set-source-volume", source, f"{percent}%") is not None
-        if changed and state.percent != percent and resolved is not None:
-            self._remember(resolved, state)
+        # pactl переводит проценты в целое pa_volume_t с усечением.
+        target_volume = percent * _VOLUME_NORM // 100
+        if (
+            changed
+            and resolved is not None
+            and any(volume != target_volume for volume in snapshot.volumes)
+        ):
+            self._remember(resolved, snapshot)
         if changed:
             log.info("Громкость микрофона задана вручную: %d %%", percent)
         else:
@@ -283,12 +303,15 @@ class SoundControl:
         source = self._resolved_source(device)
         if source is None:
             return False
-        state = self._before_change.get(source)
-        if state is None:
+        snapshot = self._before_change.get(source)
+        if snapshot is None:
             return False
-        volume_restored = self._pactl("set-source-volume", source, f"{state.percent}%") is not None
+        volume_restored = (
+            self._pactl("set-source-volume", source, *(str(raw) for raw in snapshot.volumes))
+            is not None
+        )
         mute_restored = (
-            self._pactl("set-source-mute", source, "1" if state.muted else "0") is not None
+            self._pactl("set-source-mute", source, "1" if snapshot.state.muted else "0") is not None
         )
         restored = volume_restored and mute_restored
         if restored:

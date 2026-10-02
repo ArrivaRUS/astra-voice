@@ -239,129 +239,146 @@ Column {
             label: qsTr("Микрофон")
             locked: root.isLocked("device")
 
-            AvSelect {
-                id: deviceSelector
-                // Длинные названия микрофонов: список раскрывается на ширину строки.
-                popupMaxWidth: deviceRow.width - Theme.cardRowPaddingX * 2
-                Layout.preferredWidth: 236  // §4.4: типовая ширина списка в строке настройки
+            // Выбор и громкость принадлежат одному микрофону. Дополнительные
+            // действия остаются в этой строке, без отдельной строки настройки.
+            ColumnLayout {
+                spacing: Theme.spaceStep
                 Layout.alignment: Qt.AlignVCenter
-                enabled: !root.isLocked("device")
-                model: root.deviceNames()
 
-                Binding {
-                    target: deviceSelector
-                    property: "currentIndex"
-                    value: Math.max(0, root.deviceIndex(root.settings ? root.settings.device : ""))
-                }
+                RowLayout {
+                    spacing: Theme.fieldGap
+                    AvSelect {
+                        id: deviceSelector
+                        // Длинные названия микрофонов: список раскрывается на ширину строки.
+                        popupMaxWidth: deviceRow.width - Theme.cardRowPaddingX * 2
+                        // Бейдж политики занимает часть строки, поэтому
+                        // заблокированный селектор показывается компактно.
+                        Layout.preferredWidth: deviceRow.locked ? Theme.progressStatusbarW : 236
+                        Layout.alignment: Qt.AlignVCenter
+                        enabled: !root.isLocked("device")
+                        model: root.deviceNames()
 
-                onCurrentIndexChanged: {
-                    if (root.settings && !root.isLocked("device")
-                            && currentIndex >= 0 && currentIndex < root.devices.length
-                            && root.settings.device !== root.deviceIdAt(currentIndex))
-                        root.settings.device = root.deviceIdAt(currentIndex)
-                }
-            }
-        }
+                        Binding {
+                            target: deviceSelector
+                            property: "currentIndex"
+                            value: Math.max(0, root.deviceIndex(root.settings ? root.settings.device : ""))
+                        }
 
-        // Строка видна всегда, когда громкость можно менять: после «Поднять»
-        // заказчик не мог вернуть её как было (ошибка 30.09).
-        SettingRow {
-            width: parent.width
-            label: qsTr("Громкость микрофона")
-            sub: root.micMuted
-                ? qsTr("Звук микрофона выключен в системе — вас не слышно")
-                : root.micVolume >= 0
-                    ? ""
-                    : qsTr("Не удалось узнать громкость микрофона")
-            visible: root.canRaiseMic
-            height: visible ? implicitHeight : 0
+                        onCurrentIndexChanged: {
+                            if (root.settings && !root.isLocked("device")
+                                    && currentIndex >= 0 && currentIndex < root.devices.length
+                                    && root.settings.device !== root.deviceIdAt(currentIndex))
+                                root.settings.device = root.deviceIdAt(currentIndex)
+                        }
+                    }
+                    AvSlider {
+                        id: micSlider
+                        property real draggedValue: value
+                        property bool userMoved: false
+                        visible: root.canRaiseMic && root.micVolume >= 0 && !root.micMuted
+                        Layout.alignment: Qt.AlignVCenter
+                        Accessible.name: qsTr("Громкость микрофона")
 
-            AvSlider {
-                id: micSlider
-                property real draggedValue: value
-                property bool userMoved: false
-                visible: root.micVolume >= 0 && !root.micMuted
-                Layout.alignment: Qt.AlignVCenter
-                Accessible.name: qsTr("Громкость микрофона")
+                        Binding {
+                            target: micSlider
+                            property: "value"
+                            value: root.micVolume
+                        }
 
-                Binding {
-                    target: micSlider
-                    property: "value"
-                    value: root.micVolume
-                }
+                        onValueChanged: {
+                            if (pressed)
+                                draggedValue = value
+                        }
+                        onPressedChanged: {
+                            if (pressed) {
+                                userMoved = false
+                                draggedValue = value
+                            } else {
+                                var previousVolume = root.micVolume
+                                if (userMoved && root.settings && Math.round(draggedValue) !== previousVolume)
+                                    root.settings.setMicrophoneVolume(Math.round(draggedValue))
+                                if (root.micVolume === previousVolume)
+                                    micSlider.value = root.micVolume
+                                userMoved = false
+                            }
+                        }
+                        onMoved: {
+                            userMoved = true
+                            if (!pressed) {
+                                var previousVolume = root.micVolume
+                                if (root.settings && Math.round(value) !== previousVolume)
+                                    root.settings.setMicrophoneVolume(Math.round(value))
+                                if (root.micVolume === previousVolume)
+                                    micSlider.value = root.micVolume
+                                userMoved = false
+                            }
+                        }
+                    }
 
-                onValueChanged: {
-                    if (pressed)
-                        draggedValue = value
-                }
-                onPressedChanged: {
-                    if (pressed) {
-                        userMoved = false
-                        draggedValue = value
-                    } else {
-                        var previousVolume = root.micVolume
-                        if (userMoved && root.settings && Math.round(draggedValue) !== previousVolume)
-                            root.settings.setMicrophoneVolume(Math.round(draggedValue))
-                        if (root.micVolume === previousVolume)
-                            micSlider.value = root.micVolume
-                        userMoved = false
+                    Text {
+                        id: volumeText
+                        text: qsTr("%1 %").arg(micSlider.pressed
+                            ? Math.round(micSlider.value) : root.micVolume)
+                        visible: micSlider.visible
+                        textFormat: Text.PlainText
+                        color: Theme.fgMuted
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fontSettingSubSize
+                        renderType: Text.NativeRendering
+                        Layout.alignment: Qt.AlignVCenter
+                    }
+                    Text {
+                        visible: root.canRaiseMic && !micSlider.visible
+                        text: root.micMuted
+                            ? qsTr("Звук микрофона выключен в системе — вас не слышно")
+                            : qsTr("Не удалось узнать громкость микрофона")
+                        textFormat: Text.PlainText
+                        color: Theme.fgMuted
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fontSettingSubSize
+                        renderType: Text.NativeRendering
+                        wrapMode: Text.WordWrap
+                        Layout.preferredWidth: Theme.progressStatusbarW + volumeText.implicitWidth + Theme.fieldGap
+                        Layout.alignment: Qt.AlignVCenter
                     }
                 }
-                onMoved: {
-                    userMoved = true
-                    if (!pressed) {
-                        var previousVolume = root.micVolume
-                        if (root.settings && Math.round(value) !== previousVolume)
-                            root.settings.setMicrophoneVolume(Math.round(value))
-                        if (root.micVolume === previousVolume)
-                            micSlider.value = root.micVolume
-                        userMoved = false
+
+                RowLayout {
+                    visible: root.canRaiseMic
+                    spacing: Theme.fieldGap
+                    Layout.alignment: Qt.AlignRight
+                    AvButton {
+                        text: qsTr("Поднять")
+                        small: true
+                        visible: root.micMuted || (root.micVolume >= 0 && root.micVolume < 30)
+                        Layout.alignment: Qt.AlignVCenter
+                        onClicked: {
+                            if (root.settings)
+                                root.settings.raiseMicrophoneVolume()
+                        }
                     }
-                }
-            }
 
-            Text {
-                text: qsTr("%1 %").arg(micSlider.pressed
-                    ? Math.round(micSlider.value) : root.micVolume)
-                visible: micSlider.visible
-                textFormat: Text.PlainText
-                color: Theme.fgMuted
-                font.family: Theme.fontUi
-                font.pixelSize: Theme.fontSettingSubSize
-                renderType: Text.NativeRendering
-                Layout.alignment: Qt.AlignVCenter
-            }
+                    AvButton {
+                        text: qsTr("Вернуть")
+                        small: true
+                        visible: root.canRestoreMic
+                        Layout.alignment: Qt.AlignVCenter
+                        onClicked: {
+                            if (root.settings)
+                                root.settings.restoreMicrophoneVolume()
+                        }
+                    }
 
-            AvButton {
-                text: qsTr("Поднять")
-                small: true
-                visible: root.micMuted || (root.micVolume >= 0 && root.micVolume < 30)
-                Layout.alignment: Qt.AlignVCenter
-                onClicked: {
-                    if (root.settings)
-                        root.settings.raiseMicrophoneVolume()
-                }
-            }
-
-            AvButton {
-                text: qsTr("Вернуть")
-                small: true
-                visible: root.canRestoreMic
-                Layout.alignment: Qt.AlignVCenter
-                onClicked: {
-                    if (root.settings)
-                        root.settings.restoreMicrophoneVolume()
-                }
-            }
-
-            AvButton {
-                text: qsTr("Настройки звука…")
-                small: true
-                visible: root.canOpenSoundSettings
-                Layout.alignment: Qt.AlignVCenter
-                onClicked: {
-                    if (root.settings)
-                        root.settings.openSoundSettings()
+                    AvButton {
+                        text: qsTr("Настройки звука…")
+                        small: true
+                        visible: root.canOpenSoundSettings
+                        Layout.alignment: Qt.AlignVCenter
+                        onClicked: {
+                            if (root.settings)
+                                root.settings.openSoundSettings()
+                        }
+                    }
                 }
             }
         }
