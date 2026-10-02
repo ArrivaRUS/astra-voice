@@ -1158,12 +1158,25 @@ class DictationRuntime(QObject):
         return self.sound.microphone_state(self.settings.extra.get("device"))
 
     def raise_microphone_volume(self) -> bool:
-        """Действие человека: включить звук микрофона и поднять громкость до полной."""
+        """Действие человека: включить звук и поднять до целевой громкости (50 %)."""
         raised = self.sound.raise_microphone(self.settings.extra.get("device"))
         if raised:
             self._mic_error_stat(recovered_by="raise_volume")
             self._announced_mic_problems.clear()
         return raised
+
+    def set_microphone_volume(self, percent: int) -> bool:
+        """Действие человека: задать громкость выбранного микрофона вручную."""
+        return self.sound.set_microphone_volume(percent, self.settings.extra.get("device"))
+
+    @property
+    def can_restore_microphone_volume(self) -> bool:
+        """Есть ли прежнее состояние выбранного микрофона для возврата."""
+        return self.sound.can_restore_microphone(self.settings.extra.get("device"))
+
+    def restore_microphone_volume(self) -> bool:
+        """Действие человека: вернуть прежнее состояние выбранного микрофона."""
+        return self.sound.restore_microphone(self.settings.extra.get("device"))
 
     def open_sound_settings(self) -> bool:
         """Действие человека: открыть системную панель звука; ничего не меняет."""
@@ -1390,8 +1403,9 @@ class DictationRuntime(QObject):
 
     def apply_device(self, value: str | None) -> None:
         """value не нужен: record_params возьмёт устройство из настроек перед следующей записью.
-        Сброс объявления: следующее открытие снова скажет «Микрофон: имя», даже если имя то же.
+        Сбрасываем имя для интерфейса; уведомление будет только при смене фактического источника.
         """
+        self.sound.forget_microphone_changes()
         self.orchestrator.reset_device_announcement()
         log.info("Устройство записи изменено; применяется со следующей записи")
 

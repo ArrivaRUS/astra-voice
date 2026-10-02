@@ -720,8 +720,12 @@ def notify_microphone_too_quiet() -> None:
 
 
 def notify_microphone_selected(name: str) -> None:
-    """Объявить системное описание нового микрофона перед диктовкой."""
-    notify(f"Микрофон: {name}", retry=False)
+    """Сообщить о реальном выборе другого микрофона между диктовками."""
+    notify(
+        f"Микрофон: {name}",
+        f"Сейчас используется: {escape(name, quote=False)}. Выбрать другой можно в настройках.",
+        retry=False,
+    )
 
 
 def notify_tray_unavailable() -> None:

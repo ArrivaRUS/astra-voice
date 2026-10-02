@@ -1083,7 +1083,7 @@ def test_late_first_audio_ready_keeps_recording_and_success_releases_hotkey(
     assert rig.core.phase.value == "recording" and rig.recording
     rig.assert_hotkey_state(HotkeyState.RECORDING)
     rig.backend.ungrab_escape.assert_not_called()
-    rig.device_selected.assert_called_once_with("Встроенный микрофон")
+    rig.device_selected.assert_not_called()
     rig.device_changed.assert_not_called()
     rig.device_lost.assert_not_called()
     assert not rig.stats.events and rig.done == 0
@@ -1140,13 +1140,13 @@ def test_late_first_audio_ready_keeps_recording_and_success_releases_hotkey(
         {"changed": "Источник звука изменился: старое: USB-гарнитура"},
     ],
 )
-def test_microphone_selected_at_start_once(
+def test_initial_microphone_is_silent_and_actual_change_announced_once(
     rig: Rig, elapsed: float, fields: dict[str, object]
 ) -> None:
     rig.start()
     rig.now += elapsed
     rig.event("audio.ready", **fields)
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_selected.assert_not_called()
     rig.device_changed.assert_not_called()
     assert rig.commands() == ["record.start"]
     assert rig.recording and rig.core.phase == DictationPhase.RECORDING
@@ -1157,7 +1157,7 @@ def test_microphone_selected_at_start_once(
     # При повторном открытии того же устройства воркер не присылает changed.
     rig.now += elapsed
     rig.event("audio.ready", device="USB-гарнитура")
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_selected.assert_not_called()
     rig.device_changed.assert_not_called()
     assert rig.recording and rig.core.phase == DictationPhase.RECORDING
     rig.stop()
@@ -1166,7 +1166,6 @@ def test_microphone_selected_at_start_once(
     rig.event("audio.ready", changed="Источник звука изменился: Встроенный микрофон")
     # A6: другой микрофон между диктовками — снова выбор, не «Микрофон сменился».
     assert rig.device_selected.call_args_list == [
-        call("USB-гарнитура"),
         call("Встроенный микрофон"),
     ]
     rig.device_changed.assert_not_called()
@@ -1176,7 +1175,7 @@ def test_microphone_selected_at_start_once(
 
 
 @pytest.mark.parametrize("elapsed", [0.1, 2.0])
-def test_default_microphone_without_changed_is_selected_once(
+def test_default_microphone_initial_open_is_silent_and_change_announced(
     rig: Rig, elapsed: float, caplog: pytest.LogCaptureFixture
 ) -> None:
     rig.params["device"] = None
@@ -1189,20 +1188,19 @@ def test_default_microphone_without_changed_is_selected_once(
     assert rig.recording
     assert not rig.stats.events
     rig.device_changed.assert_not_called()
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_selected.assert_not_called()
     rig.stop()
     rig.result()
     assert rig.stats.events[-1]["open_ms"] == pytest.approx(elapsed * 1000)
     rig.start()
     rig.event("audio.ready", device="USB-гарнитура")
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_selected.assert_not_called()
     rig.device_changed.assert_not_called()
     rig.stop()
     rig.result()
     rig.start()
     rig.event("audio.ready", device="Встроенный микрофон", changed="смена")
     assert rig.device_selected.call_args_list == [
-        call("USB-гарнитура"),
         call("Встроенный микрофон"),
     ]
     rig.device_changed.assert_not_called()
@@ -1210,9 +1208,7 @@ def test_default_microphone_without_changed_is_selected_once(
 
 
 @pytest.mark.parametrize("hello_before_start", [False, True])
-def test_new_generation_announces_same_microphone_as_selected(
-    rig: Rig, hello_before_start: bool
-) -> None:
+def test_new_generation_keeps_same_microphone_silent(rig: Rig, hello_before_start: bool) -> None:
     for generation in (1, 2, 3):
         rig.worker_generation = generation
         if hello_before_start:
@@ -1221,11 +1217,32 @@ def test_new_generation_announces_same_microphone_as_selected(
         rig.event("audio.ready", device="USB-гарнитура", changed="смена")
         rig.stop()
         rig.result()
-    assert rig.device_selected.call_args_list == [call("USB-гарнитура")] * 3
+    rig.device_selected.assert_not_called()
     rig.device_changed.assert_not_called()
 
 
-def test_explicit_device_selection_resets_announcement(rig: Rig) -> None:
+@pytest.mark.parametrize("hello_before_start", [False, True])
+def test_new_generation_announces_actual_microphone_change_once(
+    rig: Rig, hello_before_start: bool
+) -> None:
+    rig.start()
+    rig.event("audio.ready", device="Встроенный микрофон")
+    rig.device_selected.assert_not_called()
+    rig.stop()
+    rig.result()
+    rig.worker_generation += 1
+    if hello_before_start:
+        rig.core.on_worker_event({"type": "hello", "generation": rig.worker_generation})
+    for _ in range(2):
+        rig.start()
+        rig.event("audio.ready", device="USB-гарнитура")
+        rig.stop()
+        rig.result()
+    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_changed.assert_not_called()
+
+
+def test_explicit_device_selection_announces_actual_microphone_change(rig: Rig) -> None:
     rig.start()
     rig.event("audio.ready", device="Встроенный микрофон")
     rig.stop()
@@ -1235,7 +1252,6 @@ def test_explicit_device_selection_resets_announcement(rig: Rig) -> None:
     rig.start()
     rig.event("audio.ready", device="USB-гарнитура", changed="смена")
     assert rig.device_selected.call_args_list == [
-        call("Встроенный микрофон"),
         call("USB-гарнитура"),
     ]
     rig.device_changed.assert_not_called()
@@ -1255,7 +1271,6 @@ def test_microphone_between_dictations_is_announced_once_per_change(rig: Rig) ->
         rig.stop()
         rig.result()
     assert rig.device_selected.call_args_list == [
-        call("Встроенный микрофон"),
         call("USB-гарнитура"),
         call("Встроенный микрофон"),
     ]
@@ -1301,11 +1316,10 @@ def test_microphone_notification_preserves_result(
     rig.now += 1
     rig.event("audio.ready", device="Встроенный микрофон", changed="смена")
     if first_open:
-        rig.device_selected.assert_called_once_with("Встроенный микрофон")
+        rig.device_selected.assert_not_called()
         rig.device_changed.assert_not_called()
     else:
         assert rig.device_selected.call_args_list == [
-            call("USB-гарнитура"),
             call("Встроенный микрофон"),
         ]
         rig.device_changed.assert_not_called()
@@ -1363,7 +1377,7 @@ def test_selected_notification_deduplicates_announced_names(rig: Rig) -> None:
         "Встроенный микрофон",
         "USB-гарнитура",
     ]
-    announced = ["USB-гарнитура", "Встроенный микрофон", "USB-гарнитура"]
+    announced = ["Встроенный микрофон", "USB-гарнитура"]
 
     def notified(name: str) -> None:
         assert rig.commands()[-1] == "record.start"
@@ -1374,7 +1388,7 @@ def test_selected_notification_deduplicates_announced_names(rig: Rig) -> None:
         rig.start()
         rig.event("audio.ready", device=name, changed=f"Источник звука изменился: {name}")
         assert rig.device_selected.call_args_list == [
-            call(value) for value in announced[: max(1, index - 1)]
+            call(value) for value in announced[: max(0, index - 2)]
         ]
         assert rig.recording and rig.core.phase == DictationPhase.RECORDING
         rig.stop()
@@ -1422,7 +1436,7 @@ def test_open_ms_resets_for_each_recording(rig: Rig, elapsed: float | None) -> N
     rig.result()
     assert rig.stats.events[-1].get("open_ms") == (None if elapsed is None else elapsed * 1000)
     assert rig.stats.events[-1]["audio_ms"] == (2 + (elapsed or 0)) * 1000
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_selected.assert_not_called()
     rig.device_changed.assert_not_called()
 
 
@@ -1466,10 +1480,7 @@ def test_audio_ready_resolves_device_and_reset_clears_it(
     rig.device_resolved.assert_called_once_with("USB-гарнитура")
     rig.event("audio.ready")
     assert rig.core.resolved_device == "USB-гарнитура"
-    if microphone_test:
-        rig.device_selected.assert_not_called()
-    else:
-        rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_selected.assert_not_called()
     rig.device_changed.assert_not_called()
     rig.core.reset_device_announcement()
     rig.core.reset_device_announcement()
@@ -1508,7 +1519,7 @@ def test_foreign_audio_ready_does_not_consume_first_open(
     rig.device_changed.assert_not_called()
     rig.now += 1.0
     rig.event("audio.ready", device="USB-гарнитура", changed="смена")
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_selected.assert_not_called()
     rig.device_changed.assert_not_called()
     assert rig.recording and rig.commands() == ["record.start"]
     rig.stop()
@@ -1542,7 +1553,7 @@ def test_synchronous_audio_ready_records_open_ms(rig: Rig, elapsed: float) -> No
 
     rig.during_send = opened
     rig.start()
-    rig.device_selected.assert_called_once_with("USB-гарнитура")
+    rig.device_selected.assert_not_called()
     rig.device_changed.assert_not_called()
     assert rig.recording and rig.commands() == ["record.start"]
     rig.stop()
