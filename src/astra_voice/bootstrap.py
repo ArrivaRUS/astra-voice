@@ -100,10 +100,15 @@ def _setup_render_env() -> None:
 
 
 def _refuse_root_in_bundle() -> int | None:
-    """Отказ работы от root в бандле AppImage — точка расширения; до 01.10 пропускает."""
-    # T1-01.10: MJ-3 — в бандле (paths.install_kind().is_appimage) при os.geteuid() == 0
-    # любая команда (app, selfinstall, --uninstall, даже --version) → сообщение «Версия
-    # AppImage не запускается от имени root…» и код 3 до импорта Qt; трек .deb не затронут (T-179).
+    """Отклоняет любую команду AppImage от root до импорта Qt."""
+    if os.geteuid() == 0:
+        from astra_voice.platform.userinstall import RootRefusedError, refuse_root
+
+        try:
+            refuse_root()
+        except RootRefusedError as exc:
+            sys.stderr.write(f"{exc}\n")
+            return exc.exit_code
     return None
 
 
@@ -164,16 +169,16 @@ def _appimage_policy_gate(command: str, rest: list[str]) -> int | None:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if not args or args[0] not in COMMANDS:
-        sys.stderr.write(USAGE)
-        return 2
-    command, rest = args[0], args[1:]
-
     _setup_sys_path(Path(__file__).resolve().parent)
 
     refused = _refuse_root_in_bundle()
     if refused is not None:
         return refused
+
+    if not args or args[0] not in COMMANDS:
+        sys.stderr.write(USAGE)
+        return 2
+    command, rest = args[0], args[1:]
 
     if command in ("app", "selfinstall"):
         # Совещательный запрет трека до любых действий (arch/appimage.md §5).

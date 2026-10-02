@@ -65,7 +65,8 @@ ApplicationWindow {
     // области по высоте — size.window-min-h = 588.
     minimumWidth: Theme.sizeWindowMinW
     minimumHeight: Theme.sizeWindowMinH
-    visible: true
+    // Окно показывает только Python (focus_shell): при --hidden оно не должно появиться.
+    visible: false
     title: window.onboardingVisible ? qsTr("Astra Voice — первый запуск") : qsTr("Astra Voice")
     color: Theme.bgApp
     font.family: Theme.fontUi

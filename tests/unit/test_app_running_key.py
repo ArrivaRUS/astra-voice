@@ -125,9 +125,14 @@ def test_main_marks_only_after_lock_and_logging_before_qapplication() -> None:
     assert len(lock_guard.body) == 1
     second_instance = lock_guard.body[0]
     assert isinstance(second_instance, ast.Return)
-    assert isinstance(second_instance.value, ast.Call)
-    assert isinstance(second_instance.value.func, ast.Name)
-    assert second_instance.value.func.id == "_send_show"
+    # Второй экземпляр: с --hidden молча выходит, иначе просит показать окно.
+    choice = second_instance.value
+    assert isinstance(choice, ast.IfExp)
+    assert ast.unparse(choice.test) == "args.hidden"
+    assert isinstance(choice.body, ast.Constant) and choice.body.value == 0
+    assert isinstance(choice.orelse, ast.Call)
+    assert isinstance(choice.orelse.func, ast.Name)
+    assert choice.orelse.func.id == "_send_show"
     calls = {
         node.func.id: node
         for node in ast.walk(main)
@@ -272,3 +277,24 @@ def test_menu_entry_for_unencodable_path_raises_value_error() -> None:
     """Откуда берётся ValueError: запись меню кодируется в UTF-8 строго."""
     with pytest.raises(ValueError):
         userinstall.menu_entry_bytes(Path("/home/u/\udcff/AppRun"), "0.2.0")
+
+
+@pytest.mark.parametrize(("argv", "shown"), [(["--hidden"], False), ([], True)])
+def test_second_instance_hidden_does_not_show_window(
+    argv: list[str], shown: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Автозапуск (--hidden) при уже работающей копии не выводит окно во фронт."""
+    from PyQt5 import QtCore
+
+    class Lock:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def tryLock(self, _timeout: int) -> bool:
+            return False
+
+    show = Mock(return_value=0)
+    monkeypatch.setattr(QtCore, "QLockFile", Lock)
+    monkeypatch.setattr(app, "_send_show", show)
+    assert app.main(argv) == 0
+    assert show.called is shown

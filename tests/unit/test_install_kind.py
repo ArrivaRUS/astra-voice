@@ -115,10 +115,128 @@ def test_resource_env_still_wins(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     assert paths.resource_root() == tmp_path / "res"
 
 
-def test_check_launcher_is_passthrough_until_t1() -> None:
-    """Точка расширения MJ-1: до 01.10 путь возвращается как есть."""
-    target = paths.appimage_current_apprun()
-    assert paths.check_appimage_launcher(target) == target
+@pytest.fixture
+def installed_launcher() -> Path:
+    make_bundle(paths.appimage_app_dir() / KEY)
+    paths.appimage_current_link().symlink_to(KEY)
+    return paths.appimage_current_apprun()
+
+
+@pytest.mark.parametrize("absolute_target", [False, True])
+def test_check_launcher_preserves_current_path(
+    installed_launcher: Path, absolute_target: bool
+) -> None:
+    """T-177: Exec сохраняет current, а не разрешённый путь к версии."""
+    if absolute_target:
+        current = paths.appimage_current_link()
+        current.unlink()
+        current.symlink_to(paths.appimage_app_dir() / KEY)
+    assert paths.check_appimage_launcher(installed_launcher) is installed_launcher
+    assert installed_launcher != installed_launcher.resolve()
+
+
+def test_check_launcher_absolutizes_for_comparison(
+    installed_launcher: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(paths.appimage_app_dir())
+    launcher = Path("current/AppRun")
+    assert paths.check_appimage_launcher(launcher) is launcher
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "mount",
+        "extracted",
+        "temporary",
+        "missing-current",
+        "directory-current",
+        "dangling-current",
+        "outside-path",
+        "parent-component",
+        "outside-apprun",
+        "missing-apprun",
+        "directory-apprun",
+        "loop-current",
+        "loop-apprun",
+        "outside-key",
+        "extracted-key",
+        "parent-target",
+        "lock-apprun",
+        "nonexecutable-apprun",
+    ],
+)
+def test_check_launcher_rejects_invalid_installation(
+    installed_launcher: Path, tmp_path: Path, bad: str
+) -> None:
+    """T-177: неверная установка отклоняется без раскрытия путей в сообщении."""
+    app = paths.appimage_app_dir()
+    current = paths.appimage_current_link()
+    launcher = installed_launcher
+    if bad in ("mount", "extracted", "temporary"):
+        target = {
+            "mount": tmp_path / ".mount_xxx",
+            "extracted": app / "appimage_extracted_xxx",
+            "temporary": app / f".tmp-{KEY}.xxx",
+        }[bad]
+        make_bundle(target)
+        current.unlink()
+        current.symlink_to(target)
+    elif bad in ("missing-current", "directory-current", "dangling-current", "loop-current"):
+        current.unlink()
+        if bad == "directory-current":
+            make_bundle(current)
+        elif bad == "dangling-current":
+            current.symlink_to("0.3.0-aaaaaaaaaaaa")
+        elif bad == "loop-current":
+            current.symlink_to("current")
+    elif bad == "outside-path":
+        launcher = make_bundle(tmp_path / "outside") / "AppRun"
+    elif bad == "parent-component":
+        launcher = app / "current" / ".." / "current" / "AppRun"
+    elif bad in ("outside-key", "extracted-key"):
+        target = tmp_path / KEY if bad == "outside-key" else app / "appimage_extracted_xxx"
+        (app / KEY).rename(target)
+        (app / KEY).symlink_to(target)
+    elif bad == "parent-target":
+        current.unlink()
+        current.symlink_to(Path("..") / "app" / KEY)
+    elif bad == "nonexecutable-apprun":
+        launcher.chmod(0o644)
+    else:
+        apprun = app / KEY / "AppRun"
+        apprun.unlink()
+        if bad == "outside-apprun":
+            apprun.symlink_to(make_bundle(tmp_path / "outside") / "AppRun")
+        elif bad == "directory-apprun":
+            apprun.mkdir()
+        elif bad == "loop-apprun":
+            apprun.symlink_to("AppRun")
+        elif bad == "lock-apprun":
+            lock = app / ".install.lock"
+            lock.touch(mode=0o755)
+            apprun.symlink_to(lock)
+    with pytest.raises(paths.PathError) as exc:
+        paths.check_appimage_launcher(launcher)
+    assert str(exc.value) == (
+        "Не удалось найти установленную программу. Переустановите Astra Voice."
+    )
+
+
+def test_check_launcher_allows_apprun_link_inside_app(installed_launcher: Path) -> None:
+    apprun = installed_launcher.resolve()
+    apprun.rename(apprun.with_name("launcher"))
+    apprun.symlink_to("launcher")
+    assert paths.check_appimage_launcher(installed_launcher) is installed_launcher
+
+
+def test_check_launcher_rejects_symlink_app(installed_launcher: Path, tmp_path: Path) -> None:
+    app = paths.appimage_app_dir()
+    relocated = tmp_path / "relocated-app"
+    app.rename(relocated)
+    app.symlink_to(relocated)
+    with pytest.raises(paths.PathError, match="Переустановите Astra Voice"):
+        paths.check_appimage_launcher(installed_launcher)
 
 
 def test_tmp_copy_is_not_installed(monkeypatch: pytest.MonkeyPatch, isolated_home: Path) -> None:

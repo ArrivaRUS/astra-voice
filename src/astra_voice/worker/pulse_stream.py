@@ -1,4 +1,4 @@
-"""Запись через собственный pa_stream; всем соединением владеет поток захвата."""
+"""Запись через pa_stream; прогрев в audio-warmup создаёт отдельное соединение."""
 
 from __future__ import annotations
 
@@ -359,7 +359,11 @@ class _Event:
 
 
 class PulseStreamSource:
-    """Управляемый источник PCM16 без собственных потоков и фоновых соединений."""
+    """Управляемый источник PCM16 без собственных потоков и фоновых соединений.
+
+    warm_up вызывается из audio-warmup: он читает только неизменяемые после __init__
+    _factory, _devices, _default и _clock и создаёт своё соединение локально.
+    """
 
     def __init__(
         self,
@@ -465,6 +469,7 @@ class PulseStreamSource:
         self.close()
         self._running = running
         budget = deadline or _OpenDeadline(self._clock)
+        started = self._clock()
         try:
             self._check_open(budget)
 
@@ -480,6 +485,7 @@ class PulseStreamSource:
                 use_cache=self._devices is None,
             )
             self._check_open(budget)
+            selected_at = self._clock()
             self._pulse = self._factory()
             for attempt in range(OPEN_RETRIES):
                 self._check_open(budget)
@@ -489,7 +495,15 @@ class PulseStreamSource:
                 self._default_mode = device is None
                 try:
                     self._connect(selected, budget)
-                    logger.info("Источник записи открыт: %s", selected.label)
+                    # Подключение включает создание _PulseAsync (загрузку libpulse)
+                    # и паузы повторов.
+                    logger.info(
+                        "Источник записи открыт: %s выбор_ms=%d подключение_ms=%d попытка=%d",
+                        selected.label,
+                        round((selected_at - started) * 1000),
+                        round((self._clock() - selected_at) * 1000),
+                        attempt + 1,
+                    )
                     logger.debug("Открыт pa_stream для %s", selected.name)
                     return
                 except _PulseFailure:
@@ -515,6 +529,77 @@ class PulseStreamSource:
             if isinstance(exc, AudioError) and not isinstance(exc, AudioApiUnavailable):
                 invalidate_device_cache()
             raise
+
+    def warm_up(self, device: str | None) -> None:
+        """Прогрев холодного пути без микрофона: опрос устройств, libpulse, клиент службы.
+
+        pa_stream не создаётся (PRD §9.5 — микрофон только по действию человека).
+        Состояние источника не трогает: свои mainloop и контекст, ошибки не выходят наружу.
+        Итог: ok; при ошибке устройства — device-<код>,service-<код или ok>;
+        при одной ошибке службы — её код. Текст исключений в INFO не пишется.
+        """
+        started = self._clock()
+        budget = _OpenDeadline(self._clock, OPEN_DEADLINE_S)
+        pulse: _PulseAsync | None = None
+        mainloop = context = None
+        device_result = "ok"
+        service_result = "ok"
+        try:
+
+            def devices_fn(*, deadline: _OpenDeadline | None) -> list[AudioDevice]:
+                return list_devices(deadline=deadline) if self._devices is None else self._devices()
+
+            try:
+                select_device(
+                    device,
+                    devices_fn=devices_fn,
+                    default_fn=self._default,
+                    clock=self._clock,
+                    deadline=budget,
+                    use_cache=self._devices is None,
+                )
+            except AudioError as exc:
+                device_result = exc.code
+            pulse = self._factory()
+            mainloop = pulse.mainloop_new()
+            if not mainloop:
+                raise _PulseFailure
+            pulse.mainloop = mainloop
+            api = pulse.mainloop_get_api(mainloop)
+            context = pulse.context_new(api, b"astra-voice") if api else None
+            if not context:
+                raise _PulseFailure
+            if pulse.context_connect(context, None, PA_CONTEXT_NOAUTOSPAWN, None) < 0:
+                raise _PulseFailure
+            while (state := pulse.context_get_state(context)) != PA_CONTEXT_READY:
+                if state in (PA_CONTEXT_FAILED, PA_CONTEXT_TERMINATED):
+                    raise _PulseFailure
+                pulse.iterate(max(1, int(budget.remaining(0.050) * 1_000_000)))
+        except AudioError as exc:
+            service_result = exc.code
+        except _PulseFailure:
+            service_result = ERROR_FAILED
+        except Exception:  # noqa: BLE001 — прогрев никогда не роняет воркер
+            logger.debug("Прогрев пути записи: сбой", exc_info=True)
+            service_result = ERROR_FAILED
+        finally:
+            if pulse is not None:
+                if context:
+                    pulse.context_disconnect(context)
+                    pulse.context_unref(context)
+                if mainloop:
+                    pulse.mainloop_free(mainloop)
+                pulse.mainloop = None
+        result = (
+            f"device-{device_result},service-{service_result}"
+            if device_result != "ok"
+            else service_result
+        )
+        logger.info(
+            "Прогрев пути записи без микрофона: t_ms=%d итог=%s",
+            round((self._clock() - started) * 1000),
+            result,
+        )
 
     def _connect(self, selected: AudioDevice, budget: _OpenDeadline) -> None:
         assert self._pulse is not None
@@ -997,6 +1082,11 @@ class StreamWithFallback:
             return
         on_fallback, self._on_fallback = self._on_fallback, None
         on_fallback()
+
+    def warm_up(self, device: str | None) -> None:
+        warm = getattr(self._active, "warm_up", None)
+        if callable(warm):
+            warm(device)
 
     def read_chunk(self) -> bytes | None:
         return self._active.read_chunk()

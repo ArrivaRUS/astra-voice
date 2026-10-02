@@ -316,6 +316,13 @@ def parse_command(line: bytes) -> int | None:
     return timestamp if timestamp >= 0 else None
 
 
+def _never_restart(manager: Any) -> None:
+    """Просит менеджер сеанса не перезапускать копию при восстановлении сеанса."""
+    from PyQt5.QtGui import QSessionManager
+
+    manager.setRestartHint(QSessionManager.RestartNever)
+
+
 def _send_show() -> int:
     """Просит уже работающую копию показать окно. Всегда возвращает 0."""
     from PyQt5.QtCore import QCoreApplication
@@ -1043,7 +1050,9 @@ def main(argv: list[str] | None = None) -> int:
     lock_file = Path(lock_path())
     lock = QLockFile(str(lock_file))
     if not lock.tryLock(LOCK_TIMEOUT_MS):
-        return _send_show()
+        # Повторный запуск из автозапуска (--hidden) окно не показывает: иначе
+        # второй ярлык автозапуска (например, deb и AppImage) выводит окно во фронт.
+        return 0 if args.hidden else _send_show()
 
     session_kind = detect()
     setup_logging(session_kind.value, debug=args.debug)
@@ -1078,6 +1087,9 @@ def main(argv: list[str] | None = None) -> int:
     app.setOrganizationDomain(ORGANIZATION_DOMAIN)
     app.setDesktopFileName(DESKTOP_FILE_NAME)
     app.setQuitOnLastWindowClosed(not CLOSE_TO_TRAY)
+    # XSMP оставляем ради штатного выхода по Die при завершении сеанса, но KDE не должен
+    # восстанавливать копию: фоновый старт даёт только автозапуск с --hidden.
+    app.saveStateRequest.connect(_never_restart)
     # Получатель уведомлений из рабочих потоков — в GUI до их запуска (урок 026).
     install_notify_dispatcher()
 

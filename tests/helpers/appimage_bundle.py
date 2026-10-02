@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import overload
 
@@ -13,6 +14,22 @@ KEY = f"{VERSION}-{BUILD_ID}"
 APPRUN_VERSION = f"""#!/bin/sh
 echo "astra-voice {VERSION}"
 """
+
+
+def id_shim(tmp_path: Path, env: dict[str, str], uid: int = 1000) -> dict[str, str]:
+    """AppRun видит заданный uid; неожиданные вызовы id завершаются ошибкой."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    script = bin_dir / "id"
+    script.write_text(
+        f'#!/bin/sh\n[ "$#" = 1 ] && [ "$1" = -u ] || exit 99\nprintf "%s\\n" {uid}\n',
+        encoding="ascii",
+    )
+    script.chmod(0o755)
+    search_path = env["PATH"].split(os.pathsep)
+    if str(bin_dir) not in search_path:
+        search_path.insert(0, str(bin_dir))
+    return {**env, "PATH": os.pathsep.join(search_path)}
 
 
 @overload
@@ -50,6 +67,9 @@ def make_bundle(
     ``AppRun --version``; интерпретатор и ``bootstrap.py`` — пустые заглушки.
     """
     root.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(
+        Path(__file__).resolve().parents[2] / "packaging/appimage/keylib.sh", root / "keylib.sh"
+    )
     (root / ".astra-voice-build").write_text(
         f"VERSION={version}\nBUILD_ID={build_id}\n", encoding="ascii"
     )

@@ -711,6 +711,7 @@ class AudioCapture:
         self._first_chunk_deadline: float | None = None
         self._silent_uid: str | None = None
         self._first_open = True
+        self._warmed = False
         self._previous_device: AudioDevice | None = None
 
     def start(self, utterance_id: str, device: str | None, *, limit_s: float) -> None:
@@ -763,6 +764,11 @@ class AudioCapture:
                 deadline.remaining(OPEN_TOTAL_DEADLINE_S)
                 if attempt == retries:
                     raise
+                logger.info(
+                    "Повтор открытия записи после старта программы: попытка %d из %d",
+                    attempt + 2,
+                    retries + 1,
+                )
                 # S5-R1/У39: при ERROR_NO_DEVICE ждём появления выбранного имени
                 # после перезапуска службы; устройство по умолчанию не подставляем.
                 self._sleep(deadline.remaining(OPEN_FIRST_PAUSE_S))
@@ -824,7 +830,7 @@ class AudioCapture:
                 if self._source.live and running is self._running:
                     self._first_chunk_deadline = self._clock() + FIRST_CHUNK_TIMEOUT_S
                     self._silent_uid = uid
-            self._read(uid, running, deadline, cancelled)
+            self._read(uid, running, deadline, cancelled, ready_at=self._clock())
         except AudioError as err:
             if running.is_set():
                 self._on_error(uid, err.code, err.message)
@@ -839,78 +845,110 @@ class AudioCapture:
         running: threading.Event,
         deadline: float,
         cancelled: threading.Event | None = None,
+        *,
+        ready_at: float | None = None,
     ) -> None:
         """Читает до конца записи; о смене устройства сообщает при любом выходе."""
-        self._read_chunks(uid, running, deadline)
+        self._read_chunks(uid, running, deadline, ready_at=ready_at)
         # Смена могла быть зафиксирована, пока владелец снимал running (отпускание клавиши,
         # лимит): сообщаем о ней и тогда, иначе GUI не узнает, почему фраза оборвалась.
         change = getattr(self._source, "device_change", None)
         if change is not None:
             self._report_device_change(uid, change, cancelled)
 
-    def _read_chunks(self, uid: str, running: threading.Event, deadline: float) -> None:
+    def _read_chunks(
+        self,
+        uid: str,
+        running: threading.Event,
+        deadline: float,
+        *,
+        ready_at: float | None = None,
+    ) -> None:
         """Передаёт PCM, прореживает уровни по часам и один раз сообщает о тишине."""
+        # Замер пути «источник готов → первый звук» (без содержимого): холодный старт
+        # после перезагрузки теряет начало фразы, если устройство оживает не сразу.
+        first_logged = ready_at is None
+        zero_chunks = 0
         silence_since = self._clock()
         zero_since: float | None = self._clock()
         silent_sent = False
         last_level: float | None = None
-        while running.is_set():
-            if self._clock() >= deadline:
-                return
-            chunk = self._source.read_chunk()
-            if chunk is None and getattr(self._source, "device_change", None) is not None:
-                return
-            if not running.is_set() or self._clock() >= deadline:
-                return
-            if chunk == b"":
-                continue
-            if chunk is None:
-                if self._source.ended:
+        try:
+            while running.is_set():
+                if self._clock() >= deadline:
                     return
-                self._source.close()
-                raise AudioError(ERROR_FAILED, "Запись звука прервалась.")
-            with self._watchdog_lock:
-                # Порция пришла: сторож «ни одного отсчёта» больше не нужен.
-                self._first_chunk_deadline = None
-            samples = array("h")
-            samples.frombytes(chunk)
-            if sys.byteorder != "little":
-                samples.byteswap()
-            peak = max((abs(sample) for sample in samples), default=0)
-            rms = (
-                math.sqrt(sum(sample * sample for sample in samples) / len(samples))
-                if samples
-                else 0.0
-            )
-            if not self._on_samples(uid, normalize(chunk)) or not running.is_set():
-                return
-            now = self._clock()
-            peak_dbfs = dbfs(peak)
-            if last_level is None or now - last_level >= 1 / LEVEL_RATE_HZ:
-                self._on_event(
-                    {
-                        "type": "level",
-                        "utterance_id": uid,
-                        "rms_dbfs": dbfs(rms),
-                        "peak_dbfs": peak_dbfs,
-                    }
+                chunk = self._source.read_chunk()
+                if chunk is None and getattr(self._source, "device_change", None) is not None:
+                    return
+                if not running.is_set() or self._clock() >= deadline:
+                    return
+                if chunk == b"":
+                    continue
+                if chunk is None:
+                    if self._source.ended:
+                        return
+                    self._source.close()
+                    raise AudioError(ERROR_FAILED, "Запись звука прервалась.")
+                with self._watchdog_lock:
+                    # Порция пришла: сторож «ни одного отсчёта» больше не нужен.
+                    self._first_chunk_deadline = None
+                samples = array("h")
+                samples.frombytes(chunk)
+                if sys.byteorder != "little":
+                    samples.byteswap()
+                peak = max((abs(sample) for sample in samples), default=0)
+                if not first_logged:
+                    if peak == 0:
+                        zero_chunks += 1
+                    else:
+                        first_logged = True
+                        assert ready_at is not None
+                        logger.info(
+                            "Первый звук после готовности источника: t_ms=%d, нулевых порций=%d",
+                            round((self._clock() - ready_at) * 1000),
+                            zero_chunks,
+                        )
+                rms = (
+                    math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+                    if samples
+                    else 0.0
                 )
-                last_level = now
-            if peak > 0 or not samples or not self._source.live:
-                zero_since = None
-            else:
-                if zero_since is None:
-                    zero_since = now
-                if now - zero_since >= ZERO_SAMPLES_HOLD_S:
-                    # Ровные нули столько времени даёт только заглушённый источник;
-                    # у живого микрофона всегда есть собственный шум.
-                    invalidate_device_cache()
-                    raise AudioError(ERROR_SILENT, SILENT_MESSAGE)
-            if peak_dbfs >= SILENCE_DBFS:
-                silence_since = now
-            elif not silent_sent and now - silence_since >= SILENCE_HOLD_S:
-                self._on_event({"type": "silent", "utterance_id": uid})
-                silent_sent = True
+                if not self._on_samples(uid, normalize(chunk)) or not running.is_set():
+                    return
+                now = self._clock()
+                peak_dbfs = dbfs(peak)
+                if last_level is None or now - last_level >= 1 / LEVEL_RATE_HZ:
+                    self._on_event(
+                        {
+                            "type": "level",
+                            "utterance_id": uid,
+                            "rms_dbfs": dbfs(rms),
+                            "peak_dbfs": peak_dbfs,
+                        }
+                    )
+                    last_level = now
+                if peak > 0 or not samples or not self._source.live:
+                    zero_since = None
+                else:
+                    if zero_since is None:
+                        zero_since = now
+                    if now - zero_since >= ZERO_SAMPLES_HOLD_S:
+                        # Ровные нули столько времени даёт только заглушённый источник;
+                        # у живого микрофона всегда есть собственный шум.
+                        invalidate_device_cache()
+                        raise AudioError(ERROR_SILENT, SILENT_MESSAGE)
+                if peak_dbfs >= SILENCE_DBFS:
+                    silence_since = now
+                elif not silent_sent and now - silence_since >= SILENCE_HOLD_S:
+                    self._on_event({"type": "silent", "utterance_id": uid})
+                    silent_sent = True
+
+        finally:
+            if not first_logged:
+                logger.info(
+                    "Первый звук после готовности источника не пришёл: нулевых порций=%d",
+                    zero_chunks,
+                )
 
     def _report_device_change(
         self, uid: str, change: DeviceChange, cancelled: threading.Event | None = None
@@ -959,6 +997,19 @@ class AudioCapture:
         )
         logger.debug("Смена устройства записи: moved_to_name=%r", change.moved_to_name)
         self._on_device_change(uid, kind, label)
+
+    def warm_up(self, device: str | None = None) -> bool:
+        """Однократно прогревает путь открытия без микрофона (PRD §9.5).
+
+        Поток записи не создаётся: только опрос устройств и соединение со службой.
+        Возвращает, запущен ли прогрев.
+        """
+        warm = getattr(self._source, "warm_up", None)
+        if self._warmed or not callable(warm) or self._running.is_set():
+            return False
+        self._warmed = True
+        threading.Thread(target=warm, args=(device,), name="audio-warmup", daemon=True).start()
+        return True
 
     def request_stop(self, *, cancel: bool = False) -> None:
         """Снимает флаг работы без ожидания потока и обращения к источнику.

@@ -1657,3 +1657,16 @@ def test_late_record_stop_through_supervisor_keeps_dictation(factory: Factory, c
     else:
         assert states[-1] == PillState.DONE
     assert replies == []
+
+
+def test_model_loaded_warms_capture_path_once(factory: Factory) -> None:
+    """Холодный старт (жалоба 30.09): после model.loaded — прогрев пути записи без микрофона."""
+    worker, _, _ = factory(loaded=False)
+    capture = Mock(spec=["warm_up", "request_stop", "stop", "check_stop_watchdog", "start"])
+    worker.set_capture(capture)
+    assert worker.handle(load_message())[0]["type"] == "model.loaded"
+    capture.warm_up.assert_called_once_with(None)
+    capture.start.assert_not_called()
+    # Повторный model.load с той же моделью не прогревает снова (ответ из кэша).
+    worker.handle(load_message())
+    capture.warm_up.assert_called_once()

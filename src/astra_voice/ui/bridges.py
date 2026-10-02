@@ -999,6 +999,17 @@ class OnboardingHost(CaptureHost, Protocol):
     def hide_window(self) -> None: ...
 
 
+class _WritableSettings(Protocol):
+    """Типы записываемых Qt-свойств: mypy не распознаёт pyqtProperty.setter."""
+
+    device: str
+    language: str
+    checkAppUpdates: bool
+    checkModelUpdates: bool
+    hotkey: str
+    hotkeyMode: str
+
+
 class OnboardingController(QObject):
     """Пять шагов онбординга; все записи проходят через SettingsBridge."""
 
@@ -1435,7 +1446,7 @@ class OnboardingController(QObject):
 
     @device.setter  # type: ignore[no-redef]
     def device(self, value: str) -> None:
-        self._bridge.device = value
+        cast(_WritableSettings, self._bridge).device = value
 
     @pyqtProperty(str, notify=deviceResolvedChanged)
     def deviceResolved(self) -> str:  # noqa: N802
@@ -1685,7 +1696,7 @@ class OnboardingController(QObject):
     def language(self, value: str) -> None:
         if value not in ("ru", "en") or self._bridge.is_locked("language"):
             return
-        self._bridge.language = value
+        cast(_WritableSettings, self._bridge).language = value
         if self._bridge.language == value:
             self._bridge.set_extra("onboarding_language_set", True)
 
@@ -1695,7 +1706,7 @@ class OnboardingController(QObject):
 
     @checkAppUpdates.setter  # type: ignore[no-redef]
     def checkAppUpdates(self, value: bool) -> None:  # noqa: N802
-        self._bridge.checkAppUpdates = value
+        cast(_WritableSettings, self._bridge).checkAppUpdates = value
 
     @pyqtProperty(bool, notify=checkModelUpdatesChanged)
     def checkModelUpdates(self) -> bool:  # noqa: N802
@@ -1703,7 +1714,7 @@ class OnboardingController(QObject):
 
     @checkModelUpdates.setter  # type: ignore[no-redef]
     def checkModelUpdates(self, value: bool) -> None:  # noqa: N802
-        self._bridge.checkModelUpdates = value
+        cast(_WritableSettings, self._bridge).checkModelUpdates = value
 
     @pyqtProperty(bool, notify=policyLockedChanged)
     def policyLocked(self) -> bool:  # noqa: N802
@@ -1722,7 +1733,7 @@ class OnboardingController(QObject):
 
     @hotkey.setter  # type: ignore[no-redef]
     def hotkey(self, value: str) -> None:
-        self._bridge.hotkey = value
+        cast(_WritableSettings, self._bridge).hotkey = value
 
     @pyqtProperty(str, notify=hotkeyModeChanged)
     def hotkeyMode(self) -> str:  # noqa: N802
@@ -1730,7 +1741,7 @@ class OnboardingController(QObject):
 
     @hotkeyMode.setter  # type: ignore[no-redef]
     def hotkeyMode(self, value: str) -> None:  # noqa: N802
-        self._bridge.hotkeyMode = value
+        cast(_WritableSettings, self._bridge).hotkeyMode = value
 
     @pyqtProperty(str, notify=captureStateChanged)
     def captureState(self) -> str:  # noqa: N802

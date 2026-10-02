@@ -53,6 +53,7 @@ RUNNING_KEY_LIMIT = 256
 # То же, что проверяет installed_ok() в AppRun.
 REQUIRED_FILES = (
     paths.APPIMAGE_LAUNCHER,
+    "keylib.sh",
     "opt/python3.11/bin/python3.11",
     "usr/lib/astra-voice/bootstrap.py",
     paths.BUILD_MARKER,
@@ -67,13 +68,16 @@ SERVICE_FLAGS = frozenset(
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
-# Коды отказов T1 (arch/appimage.md §1); задействуются 01.10.
+# Коды отказов T1 (arch/appimage.md §1).
 EXIT_ROOT = 3
 EXIT_UNSAFE_SOURCE = 4
 # Установка не выполнялась (служебный флаг или ASTRA_VOICE_PORTABLE=1).
 EXIT_SKIPPED = 10
 
 USAGE = "usage: bootstrap.py selfinstall <каталог-бандла> [аргументы программы]\n"
+ROOT_REFUSED_MESSAGE = (
+    "Версия AppImage не работает от имени администратора. Запустите её от обычного пользователя"
+)
 
 
 class UserInstallError(RuntimeError):
@@ -176,23 +180,19 @@ def tilde(text: object) -> str:
 
 
 def refuse_root() -> None:
-    """Отказ работы от root — точка расширения; до 01.10 пропускает."""
-    # T1-01.10: MJ-3 — при os.geteuid() == 0 RootRefusedError: «Версия AppImage не
-    # запускается от имени root. Управляйте ею под учётной записью пользователя»,
-    # код 3, ни одного файла не меняем (T-179).
-    return None
+    """Запрещает работу AppImage от root до изменения файлов."""
+    if paths.install_kind().is_appimage and os.geteuid() == 0:
+        raise RootRefusedError(ROOT_REFUSED_MESSAGE)
 
 
 def check_source(src: Path) -> None:
-    """Проверка каталога-источника до копирования — точка расширения; до 01.10 пропускает.
+    """Гигиена режима В (распаковка), без отказов и изменений файлов.
 
-    Вызывается до создания ``app/``, чтобы отказ не оставлял следов (T-175).
+    Вызывается до создания ``app/`` (T-175). Защита от чужой распаковки — вне
+    бандла, см. decisions/log.md 30.09 (BL-1a, вариант б).
     """
-    # T1-01.10: BL-1 — режим В (appimage_extracted_*): HERE и родители до $TMPDIR/$HOME
-    # по os.lstat — не ссылка, каталог, владелец текущий uid, нет записи группе/миру
-    # (mode & 0o022); режим Б — корень монтирования fuse* с ro,nosuid,nodev по
-    # /proc/self/mountinfo. Иначе UnsafeSourceError («Небезопасная временная папка…
-    # TMPDIR="$HOME/.cache" …»), код 4, app/ не создаётся (T-175).
+    # Гигиена режима В (распаковка); защита от чужой распаковки — вне бандла,
+    # см. decisions/log.md 30.09 (BL-1a, вариант б).
     return None
 
 
@@ -275,36 +275,43 @@ def check_free_space(path: Path, required: int = MIN_FREE_BYTES) -> None:
         raise NotEnoughSpaceError(f"Недостаточно места в домашней папке: нужно ещё {need} МБ.")
 
 
-def running_key_path() -> Path | None:
-    """Путь для чтения без создания каталогов (в том числе из status()).
-
-    Файл ищется во всех существующих кандидатах по порядку записи
-    (``paths.runtime_dir()``): без ``XDG_RUNTIME_DIR`` — сначала каталог сеанса
-    ``/run/user/<uid>/astra-voice``, затем запасной ``/tmp/astra-voice-<uid>`` (туда
-    пишет копия, запущенная без ``XDG_RUNTIME_DIR``).
-    """
-    for directory in paths.existing_runtime_dirs():
-        path = directory / RUNNING_KEY_NAME
-        if os.path.lexists(path):
-            return path
-    return None
+def _read_running_key(path: Path) -> str | None:
+    """Проверяет открытый файл; содержимое используется только как строка KEY."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_size > RUNNING_KEY_LIMIT
+            ):
+                return None
+            data = os.read(fd, RUNNING_KEY_LIMIT)
+        finally:
+            os.close(fd)
+        value = data.decode("ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return value if is_key(value) else None
 
 
 def read_running_key() -> str | None:
-    """KEY работающей копии (пишет программа при старте) — только как строка."""
-    # T1-01.10: MN-8 — чтение с O_NOFOLLOW и лимитом, значение принимается только по
-    # KEY_RE; сравнивается как строка с именами app/<KEY>, путь из содержимого не
-    # строится никогда (unit в наборе userinstall).
-    path = running_key_path()
-    if path is None:
-        return None
-    try:
-        with path.open("rb") as file:
-            data = file.read(RUNNING_KEY_LIMIT)
-    except (OSError, paths.PathError):
-        return None
-    value = data.decode("ascii", "replace").strip()
-    return value or None
+    """Первый валидный KEY работающей копии по порядку runtime-каталогов."""
+    for directory in paths.existing_runtime_dirs():
+        key = _read_running_key(directory / RUNNING_KEY_NAME)
+        if key is not None:
+            return key
+    return None
+
+
+def read_running_keys() -> frozenset[str]:
+    """Все валидные KEY работающих копий, включая метки в запасном каталоге."""
+    return frozenset(
+        key
+        for directory in paths.existing_runtime_dirs()
+        if (key := _read_running_key(directory / RUNNING_KEY_NAME)) is not None
+    )
 
 
 def write_running_key(key: str) -> None:
@@ -528,7 +535,7 @@ def switch_current(key: str) -> str | None:
 
 
 def cleanup() -> list[str]:
-    """Удаляет копии, кроме ``current``, ``previous`` и работающей; возвращает имена."""
+    """Удаляет копии, кроме ``current``, ``previous`` и работающих; возвращает имена."""
     app = paths.appimage_app_dir()
     with _install_lock(app, LOCK_TIMEOUT_S):
         return _cleanup(app, _keep_names(app))
@@ -538,7 +545,7 @@ def _keep_names(app: Path) -> set[str | None]:
     return {
         _link_key(app / paths.APPIMAGE_CURRENT),
         _link_key(app / paths.APPIMAGE_PREVIOUS),
-        read_running_key(),
+        *read_running_keys(),
     }
 
 
@@ -578,7 +585,7 @@ def install_from_dir(
             _copy_verified(src, app, target, info, smoke if smoke is not None else smoke_test)
             copied = True
         previous = _switch_current(app, info.key)
-        removed = _cleanup(app, {info.key, previous, read_running_key()})
+        removed = _cleanup(app, {info.key, previous, *read_running_keys()})
     if removed:
         log.info("Удалены старые копии: %s", ", ".join(removed))
     return InstallResult(info.key, target, copied, previous)
@@ -748,6 +755,7 @@ def _copy_icons(copy: Path, icons: Path, written: list[Path], skipped: list[Path
 
 def unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
     """Снимает только нашу регистрацию, возвращая автозапуск пакету при наличии (§4)."""
+    refuse_root()
     if deb_executable is None:
         deb_executable = paths.SYSTEM_EXECUTABLE
     menu, icons = _desktop_paths()
@@ -772,8 +780,8 @@ def unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
 def remove_program(*, keep: str | None = None) -> RemoveResult:
     """Удаляет только копии в app/ под замком (§4).
 
-    Работающая копия (``running-key``) не удаляется никогда (Р5); ``keep`` добавляет
-    к ней ещё одну копию, а не заменяет защиту. Оставленные копии удаляет вызывающий
+    Работающие копии (``running-key``) не удаляются никогда (Р5); ``keep`` добавляет
+    к ним ещё одну копию, а не заменяет защиту. Оставленные копии удаляет вызывающий
     при выходе.
     """
     unregistered = unregister()
@@ -781,12 +789,12 @@ def remove_program(*, keep: str | None = None) -> RemoveResult:
     if not _is_real_dir(app):
         return RemoveResult(unregistered, (), ())
     with _install_lock(app, LOCK_TIMEOUT_S):
-        protected = {read_running_key(), keep}
+        protected = {*read_running_keys(), keep}
         kept = tuple(
             sorted(
-                name
-                for name in protected
-                if name is not None and is_key(name) and _is_real_dir(app / name)
+                entry.name
+                for entry in app.iterdir()
+                if entry.name in protected and is_key(entry.name) and _is_real_dir(entry)
             )
         )
         removed = _cleanup(app, kept)
