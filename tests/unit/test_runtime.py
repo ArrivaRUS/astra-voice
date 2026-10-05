@@ -420,6 +420,28 @@ def rig(monkeypatch: pytest.MonkeyPatch) -> Rig:
     return Rig(monkeypatch)
 
 
+@pytest.mark.parametrize("device", ["", "alsa_input.usb-headset"])
+def test_initial_microphone_detection_and_repeated_open_are_silent(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    rig = Rig(monkeypatch, from_dict({"device": device}))
+    resolved = Mock()
+    assert rig.runtime.subscribe_device_resolved(resolved) == ""
+    rig.runtime.start()
+    try:
+        for _ in range(2):
+            rig.now += 2
+            rig.hotkey.fsm.press(rig.now)
+            rig.event(type="audio.ready", device="USB-гарнитура", changed="Источник: USB-гарнитура")
+            assert rig.notify.mock_calls == []
+            assert rig.runtime.subscribe_device_resolved(resolved) == "USB-гарнитура"
+            rig.release(rig.now + 1)
+            rig.event(type="result", text=MARKER)
+        resolved.assert_called_once_with("USB-гарнитура")
+    finally:
+        rig.runtime.shutdown()
+
+
 @pytest.mark.parametrize("event_kind", ["selected", "changed", "lost"])
 def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_kind: str) -> None:
     rig = Rig(monkeypatch, from_dict({"device": "alsa_input.usb-headset"}))
@@ -429,14 +451,14 @@ def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_k
         rig.event(type="error", code="audio-no-device")
         assert rig.notify.mock_calls == [call.notify_microphone_lost()]
     else:
-        # Даже позднее первое открытие означает выбор микрофона.
+        # Даже позднее первое определение микрофона остаётся без уведомления.
         rig.now += 1.0
         rig.event(
             type="audio.ready",
             device="Встроенный микрофон",
             changed="Источник звука изменился: Встроенный микрофон",
         )
-        assert rig.notify.mock_calls == [call.notify_microphone_selected("Встроенный микрофон")]
+        assert rig.notify.mock_calls == []
         if event_kind == "changed":
             rig.release(rig.now + 1)
             rig.event(type="result", text=MARKER)
@@ -448,7 +470,6 @@ def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_k
             )
             # A6: смена между диктовками объявляется как выбор, не «Микрофон сменился».
             assert rig.notify.mock_calls == [
-                call.notify_microphone_selected("Встроенный микрофон"),
                 call.notify_microphone_selected("USB-гарнитура"),
             ]
 
@@ -530,6 +551,27 @@ def test_failed_raise_does_not_record_recovery(rig: Rig) -> None:
     assert all(item.args[0] != "mic_error" for item in rig.stats.append.call_args_list)
 
 
+def test_restore_microphone_volume_uses_selected_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, from_dict({"device": "alsa_input.usb-headset"}))
+    rig.sound.can_restore_microphone.return_value = True
+    assert rig.runtime.can_restore_microphone_volume
+    rig.sound.can_restore_microphone.assert_called_once_with("alsa_input.usb-headset")
+    assert rig.runtime.restore_microphone_volume()
+    rig.sound.restore_microphone.assert_called_once_with("alsa_input.usb-headset")
+
+
+def test_set_microphone_volume_uses_selected_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    rig = Rig(monkeypatch, from_dict({"device": "alsa_input.usb-headset"}))
+    rig.sound.set_microphone_volume.return_value = True
+    assert rig.runtime.set_microphone_volume(40)
+    rig.sound.set_microphone_volume.assert_called_once_with(40, "alsa_input.usb-headset")
+
+
+def test_apply_device_forgets_microphone_changes(rig: Rig) -> None:
+    rig.runtime.apply_device("new mic")
+    rig.sound.forget_microphone_changes.assert_called_once_with()
+
+
 def test_device_resolved_subscription_returns_current_and_replaces_subscriber(rig: Rig) -> None:
     host = _RuntimeOnboardingHost(rig.runtime, Mock())
     first, second = Mock(), Mock()
@@ -604,7 +646,7 @@ def test_microphone_announcement_follows_worker_generations(
                         "audio_ms": 1000.0,
                     }
                 )
-                assert rig.notify.notify_microphone_selected.call_count == cycle + 1
+                rig.notify.notify_microphone_selected.assert_not_called()
                 rig.notify.notify_microphone_changed.assert_not_called()
                 assert rig.runtime.subscribe_device_resolved(resolved) == "USB-гарнитура"
                 assert resolved.call_args_list == [call("USB-гарнитура")] + [
@@ -615,7 +657,7 @@ def test_microphone_announcement_follows_worker_generations(
 
 
 @pytest.mark.parametrize("value", ["", "alsa_input.usb-headset"])
-def test_apply_device_announces_next_open_as_selected(
+def test_apply_device_announces_only_actual_source_change(
     monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
     settings = from_dict({"device": "alsa_input.internal"})
@@ -640,10 +682,9 @@ def test_apply_device_announces_next_open_as_selected(
             rig.event(type="audio.ready", device=name, **({"changed": "смена"} if value else {}))
             rig.release(rig.now + 1)
             rig.event(type="result", text=MARKER)
-        assert rig.notify.notify_microphone_selected.call_args_list == [
-            call("Встроенный микрофон"),
-            call(name),
-        ]
+        assert rig.notify.notify_microphone_selected.call_args_list == (
+            [call(name)] if value else []
+        )
         rig.notify.notify_microphone_changed.assert_not_called()
     finally:
         rig.runtime.shutdown()

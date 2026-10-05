@@ -96,6 +96,13 @@ class SettingsApply(Protocol):
 
     def raise_microphone_volume(self) -> bool: ...
 
+    def set_microphone_volume(self, percent: int) -> bool: ...
+
+    def restore_microphone_volume(self) -> bool: ...
+
+    @property
+    def can_restore_microphone_volume(self) -> bool: ...
+
     def open_sound_settings(self) -> bool: ...
 
     def restart_sound_service(self) -> bool: ...
@@ -140,6 +147,7 @@ class SettingsBridge(QObject):
     pendingComboChanged = pyqtSignal()
     freeCandidatesChanged = pyqtSignal()
     saveErrorChanged = pyqtSignal()
+    microphoneErrorChanged = pyqtSignal()
     modelSelfcheckChanged = pyqtSignal()
     microphoneChanged = pyqtSignal()
     extraChanged = pyqtSignal(str)
@@ -207,6 +215,7 @@ class SettingsBridge(QObject):
         self._sync_autostart()
         self._hotkey_status = "ok"
         self._save_error = ""
+        self._microphone_error = ""
         self._model_selfcheck = "idle"
         self._microphone = MicrophoneState()
         self._downloads = downloads
@@ -625,7 +634,9 @@ class SettingsBridge(QObject):
                 )
             elif name == "device":
                 self._apply.device(self.device or None)
+                self._set_microphone_error(False)
                 self.refreshMicrophone()
+                self.microphoneChanged.emit()
         getattr(self, name + "Changed").emit()
 
     @pyqtProperty("QStringList", constant=True)
@@ -793,6 +804,17 @@ class SettingsBridge(QObject):
         return self._apply is not None and self._apply.has_volume_control
 
     @pyqtProperty(bool, notify=microphoneChanged)
+    def canRestoreMicrophoneVolume(self) -> bool:  # noqa: N802
+        try:
+            return bool(
+                self._apply is not None
+                and self._apply.has_volume_control
+                and self._apply.can_restore_microphone_volume
+            )
+        except Exception:
+            return False
+
+    @pyqtProperty(bool, notify=microphoneChanged)
     def canOpenSoundSettings(self) -> bool:  # noqa: N802
         return self._apply is not None and self._apply.has_sound_settings
 
@@ -815,13 +837,74 @@ class SettingsBridge(QObject):
 
     @pyqtSlot()
     def raiseMicrophoneVolume(self) -> None:  # noqa: N802
-        """Нажатие «Поднять»: звук включается, громкость выставляется на 100 %."""
+        """Нажатие «Поднять»: звук включается, громкость — до целевой (50 %)."""
         if self._apply is not None:
             try:
-                self._apply.raise_microphone_volume()
+                raised = self._apply.raise_microphone_volume()
             except Exception:
+                raised = False
+            if not raised:
                 log.warning("Не удалось поднять громкость микрофона")
-        self.refreshMicrophone()
+            self._set_microphone_error(not raised)
+        try:
+            self.refreshMicrophone()
+        except Exception:
+            log.warning("Не удалось узнать громкость микрофона")
+        self.microphoneChanged.emit()
+
+    def _set_microphone_error(self, failed: bool) -> None:
+        error = (
+            "Не удалось изменить громкость: звуковая служба не отвечает. "
+            "Попробуйте ещё раз или обратитесь к администратору."
+            if failed
+            else ""
+        )
+        if error != self._microphone_error:
+            self._microphone_error = error
+            self.microphoneErrorChanged.emit()
+
+    @pyqtSlot(int)
+    def setMicrophoneVolume(self, percent: int) -> None:  # noqa: N802
+        """Ручная установка громкости выбранного микрофона."""
+        try:
+            if self._apply is None or not self._apply.has_volume_control:
+                return
+            changed = self._apply.set_microphone_volume(int(percent))
+        except Exception:
+            changed = False
+        if not changed:
+            log.warning("Не удалось изменить громкость микрофона")
+        self._set_microphone_error(not changed)
+        try:
+            self.refreshMicrophone()
+        except Exception:
+            log.warning("Не удалось узнать громкость микрофона")
+        self.microphoneChanged.emit()
+
+    @pyqtSlot()
+    def restoreMicrophoneVolume(self) -> None:  # noqa: N802
+        """Нажатие «Вернуть»: вернуть состояние до первого изменения."""
+        if self._apply is None:
+            return
+        try:
+            restored = self._apply.restore_microphone_volume()
+        except Exception:
+            restored = False
+        if not restored:
+            log.warning("Не удалось вернуть громкость микрофона")
+            try:
+                can_restore = bool(self._apply.can_restore_microphone_volume)
+            except Exception:
+                can_restore = True
+            if can_restore:
+                self._set_microphone_error(True)
+        else:
+            self._set_microphone_error(False)
+        try:
+            self.refreshMicrophone()
+        except Exception:
+            log.warning("Не удалось узнать громкость микрофона")
+        self.microphoneChanged.emit()
 
     @pyqtSlot()
     def openSoundSettings(self) -> None:  # noqa: N802
@@ -849,6 +932,10 @@ class SettingsBridge(QObject):
     @pyqtProperty(str, notify=saveErrorChanged)
     def saveError(self) -> str:  # noqa: N802
         return self._save_error
+
+    @pyqtProperty(str, notify=microphoneErrorChanged)
+    def microphoneError(self) -> str:  # noqa: N802
+        return self._microphone_error
 
     @pyqtProperty(str, notify=modelSelfcheckChanged)
     def modelSelfcheck(self) -> str:  # noqa: N802
@@ -910,6 +997,17 @@ class OnboardingHost(CaptureHost, Protocol):
     def notify_ready(self, combo: str) -> None: ...
 
     def hide_window(self) -> None: ...
+
+
+class _WritableSettings(Protocol):
+    """Типы записываемых Qt-свойств: mypy не распознаёт pyqtProperty.setter."""
+
+    device: str
+    language: str
+    checkAppUpdates: bool
+    checkModelUpdates: bool
+    hotkey: str
+    hotkeyMode: str
 
 
 class OnboardingController(QObject):
@@ -1348,7 +1446,7 @@ class OnboardingController(QObject):
 
     @device.setter  # type: ignore[no-redef]
     def device(self, value: str) -> None:
-        self._bridge.device = value
+        cast(_WritableSettings, self._bridge).device = value
 
     @pyqtProperty(str, notify=deviceResolvedChanged)
     def deviceResolved(self) -> str:  # noqa: N802
@@ -1598,7 +1696,7 @@ class OnboardingController(QObject):
     def language(self, value: str) -> None:
         if value not in ("ru", "en") or self._bridge.is_locked("language"):
             return
-        self._bridge.language = value
+        cast(_WritableSettings, self._bridge).language = value
         if self._bridge.language == value:
             self._bridge.set_extra("onboarding_language_set", True)
 
@@ -1608,7 +1706,7 @@ class OnboardingController(QObject):
 
     @checkAppUpdates.setter  # type: ignore[no-redef]
     def checkAppUpdates(self, value: bool) -> None:  # noqa: N802
-        self._bridge.checkAppUpdates = value
+        cast(_WritableSettings, self._bridge).checkAppUpdates = value
 
     @pyqtProperty(bool, notify=checkModelUpdatesChanged)
     def checkModelUpdates(self) -> bool:  # noqa: N802
@@ -1616,7 +1714,7 @@ class OnboardingController(QObject):
 
     @checkModelUpdates.setter  # type: ignore[no-redef]
     def checkModelUpdates(self, value: bool) -> None:  # noqa: N802
-        self._bridge.checkModelUpdates = value
+        cast(_WritableSettings, self._bridge).checkModelUpdates = value
 
     @pyqtProperty(bool, notify=policyLockedChanged)
     def policyLocked(self) -> bool:  # noqa: N802
@@ -1635,7 +1733,7 @@ class OnboardingController(QObject):
 
     @hotkey.setter  # type: ignore[no-redef]
     def hotkey(self, value: str) -> None:
-        self._bridge.hotkey = value
+        cast(_WritableSettings, self._bridge).hotkey = value
 
     @pyqtProperty(str, notify=hotkeyModeChanged)
     def hotkeyMode(self) -> str:  # noqa: N802
@@ -1643,7 +1741,7 @@ class OnboardingController(QObject):
 
     @hotkeyMode.setter  # type: ignore[no-redef]
     def hotkeyMode(self, value: str) -> None:  # noqa: N802
-        self._bridge.hotkeyMode = value
+        cast(_WritableSettings, self._bridge).hotkeyMode = value
 
     @pyqtProperty(str, notify=captureStateChanged)
     def captureState(self) -> str:  # noqa: N802

@@ -507,8 +507,7 @@ class DictationOrchestrator:
         return self._resolved_device
 
     def reset_device_announcement(self) -> None:
-        """Сбрасывает объявление при выборе в настройках или новом поколении воркера."""
-        self._announced_selected_device = None
+        """Сбрасывает имя для UI, сохраняя источник для сравнения между записями."""
         self._announcement_generation = self._generation()
         if self._resolved_device:
             self._resolved_device = ""
@@ -924,12 +923,14 @@ class DictationOrchestrator:
         if not name:
             return
         # audio.ready приходит только при открытии, в том числе после долгих повторов.
-        # Другой микрофон между диктовками — это выбор («Микрофон: X», A6): «Микрофон
-        # сменился» остаётся только за сменой посреди записи (audio.device.changed).
-        if name == self._announced_selected_device:
+        # Первое обнаружение лишь задаёт исходный микрофон. Последующая реальная
+        # смена между записями даёт «Микрофон: X» (A6), даже после выбора устройства
+        # или перезапуска воркера; «Микрофон сменился» остаётся за audio.device.changed.
+        previous_name = self._announced_selected_device
+        if name == previous_name:
             return
         self._announced_selected_device = name
-        if self._on_device_selected is not None:
+        if previous_name is not None and self._on_device_selected is not None:
             self._on_device_selected(name)
 
     def _result(self, text: str, *, duration_s: float | None = None) -> None:

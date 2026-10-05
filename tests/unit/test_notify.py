@@ -753,7 +753,10 @@ def test_microphone_messages_use_system_description_and_actions(
     name = "Встроенный микрофон"
     if selected:
         notifications.notify_microphone_selected(name)
-        expected = [f"Микрофон: {name}", ""]
+        expected = [
+            f"Микрофон: {name}",
+            f"Сейчас используется: {name}. Выбрать другой можно в настройках.",
+        ]
     else:
         notifications.notify_microphone_changed(name)
         expected = [
@@ -798,12 +801,16 @@ def test_microphone_lost_urgency_and_retry_depend_on_moment(
     assert args[6]["urgency"].value() == (b"\x01" if during_recording else b"\x02")
 
 
-def test_microphone_changed_escapes_markup_in_body(transport: Mock) -> None:
+@pytest.mark.parametrize("selected", [False, True])
+def test_microphone_messages_escape_markup_in_body(transport: Mock, selected: bool) -> None:
     name = '<img src="http://127.0.0.1:1/x">'
-    notifications.notify_microphone_changed(name)
+    if selected:
+        notifications.notify_microphone_selected(name)
+    else:
+        notifications.notify_microphone_changed(name)
     transport.bus.asyncCall.assert_called_once()
     args = _arguments(transport.bus.asyncCall.call_args.args[0])
-    assert args[3] == "Микрофон сменился"
+    assert args[3] == (f"Микрофон: {name}" if selected else "Микрофон сменился")
     assert args[4] == (
         'Сейчас используется: &lt;img src="http://127.0.0.1:1/x"&gt;.'
         " Выбрать другой можно в настройках."
@@ -1263,17 +1270,19 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
         "notify_hotkey_not_grabbed": 'f"Горячая клавиша {combo} занята другой программой"',
         "notify_hotkey_regrabbed": 'f"Горячая клавиша снова работает: {combo}"',
     }
+    microphone_body = (
+        'f"Сейчас используется: {escape(name, quote=False)}. Выбрать другой можно в настройках."'
+    )
     templates = {
-        **hotkey_templates,
-        "notify_onboarding_ready": 'f"Зажмите {combo} и говорите."',
-        "notify_microphone_changed": (
-            'f"Сейчас используется: {escape(name, quote=False)}. '
-            'Выбрать другой можно в настройках."'
-        ),
-        "notify_microphone_selected": 'f"Микрофон: {name}"',
+        **{name: (template,) for name, template in hotkey_templates.items()},
+        "notify_onboarding_ready": ('f"Зажмите {combo} и говорите."',),
+        "notify_microphone_changed": (microphone_body,),
+        "notify_microphone_selected": ('f"Микрофон: {name}"', microphone_body),
     }
     allowed_templates = {
-        statement.value: ast.dump(ast.parse(templates[function.name], mode="eval").body)
+        statement.value: tuple(
+            ast.dump(ast.parse(template, mode="eval").body) for template in templates[function.name]
+        )
         for function in tree.body
         if isinstance(function, ast.FunctionDef) and function.name in templates
         for statement in function.body
@@ -1350,7 +1359,7 @@ def _notification_violations(source: str, *, implementation: bool = False) -> li
                 implementation
                 and leaf == "notify"
                 and node in allowed_templates
-                and ast.dump(argument) == allowed_templates[node]
+                and ast.dump(argument) in allowed_templates[node]
             ):
                 continue
             if isinstance(argument, ast.Constant) and isinstance(argument.value, str):

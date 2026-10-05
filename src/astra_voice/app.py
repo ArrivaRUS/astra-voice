@@ -566,6 +566,16 @@ class _RuntimeSettingsApply:
     def raise_microphone_volume(self) -> bool:
         return self._runtime.raise_microphone_volume()
 
+    def set_microphone_volume(self, percent: int) -> bool:
+        return self._runtime.set_microphone_volume(percent)
+
+    def restore_microphone_volume(self) -> bool:
+        return self._runtime.restore_microphone_volume()
+
+    @property
+    def can_restore_microphone_volume(self) -> bool:
+        return self._runtime.can_restore_microphone_volume
+
     def open_sound_settings(self) -> bool:
         return self._runtime.open_sound_settings()
 
