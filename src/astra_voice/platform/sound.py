@@ -7,8 +7,10 @@
 
 Меняется только выбранный в программе источник записи: громкость
 воспроизведения, источники-«мониторы», профиль и порты карты не затрагиваются.
-Громкость поднимается ровно до 100 % — выше libpulse усиливает сигнал и он
-начинает хрипеть; если громкость уже выше, её не трогаем, только включаем звук.
+По кнопке громкость поднимается до целевой громкости (50 %); если громкость
+уже выше, её не трогаем, только включаем звук. Громкость можно задать вручную.
+Прежнее состояние запоминается на сеанс один раз, до первого изменения,
+и возвращается по кнопке «Вернуть».
 
 Ни имена устройств ALSA, ни пути, ни имена служб наружу не отдаём: сообщения
 для человека собираются выше, из значений `MicrophoneState`.
@@ -31,8 +33,11 @@ log = logging.getLogger(__name__)
 
 #: Ниже этой системной громкости считаем микрофон слишком тихим (PRD A20).
 LOW_VOLUME_PERCENT = 30
-#: Полная громкость: выше не поднимаем даже по кнопке (PRD F6.7 (б)).
+#: Полная громкость: потолок для ручной установки громкости микрофона.
 FULL_VOLUME_PERCENT = 100
+#: Цель кнопки «Поднять»: выше на ноутбуках с усилением микрофона — перегруз;
+#: перегруз хуже тихой записи (заказчик, 30.09).
+RAISE_TARGET_PERCENT = 50
 #: Имя источника по умолчанию в командах звуковой службы.
 DEFAULT_SOURCE = "@DEFAULT_SOURCE@"
 #: Команда должна отвечать быстро: человек ждёт результата нажатия.
@@ -68,7 +73,8 @@ SOUND_SERVICE_COMMANDS: tuple[tuple[str, ...], ...] = (
     ("systemctl", "--user", "restart", "wireplumber"),
 )
 
-_VOLUME_PERCENT = re.compile(r"(\d{1,4})\s*%")
+_VOLUME_CHANNEL = re.compile(r":\s*(\d+)\s*/\s*(\d{1,4})\s*%")
+_VOLUME_NORM = 65536
 
 
 class MicrophoneProblem(Enum):
@@ -97,10 +103,13 @@ class MicrophoneState:
             return MicrophoneProblem.TOO_QUIET
         return None
 
-    @property
-    def can_raise(self) -> bool:
-        """Поднимать есть куда: звук выключен или громкость ниже полной."""
-        return self.known and (self.muted or 0 <= self.percent < FULL_VOLUME_PERCENT)
+
+@dataclass(frozen=True)
+class _MicrophoneSnapshot:
+    """Состояние и точные громкости каналов для возврата без потери баланса."""
+
+    state: MicrophoneState
+    volumes: tuple[int, ...]
 
 
 def _spawn(command: Sequence[str], *, popen: Callable[..., object] = subprocess.Popen) -> bool:
@@ -136,6 +145,7 @@ class SoundControl:
         self._which = which
         self._run = run
         self._spawn = spawn
+        self._before_change: dict[str, _MicrophoneSnapshot] = {}
 
     @property
     def has_volume_control(self) -> bool:
@@ -197,37 +207,121 @@ class SoundControl:
     def _source(device: str | None) -> str:
         return device if device else DEFAULT_SOURCE
 
+    def _resolved_source(self, device: str | None) -> str | None:
+        """Имя текущего источника, включая выбранный системный по умолчанию."""
+        if device:
+            return device
+        answer = self._pactl("get-default-source")
+        if answer is None:
+            return None
+        return answer.strip() or None
+
     def microphone_state(self, device: str | None = None) -> MicrophoneState:
         """Читает признак «звук выключен» и громкость БЕЗ открытия микрофона."""
+        snapshot = self._microphone_snapshot(device)
+        return snapshot.state if snapshot is not None else MicrophoneState()
+
+    def _microphone_snapshot(self, device: str | None) -> _MicrophoneSnapshot | None:
+        """Читает все каналы в порядке pactl, сохраняя целые значения PulseAudio."""
         source = self._source(device)
         muted = self._pactl("get-source-mute", source)
         volume = self._pactl("get-source-volume", source)
         if muted is None or volume is None:
-            return MicrophoneState()
-        match = _VOLUME_PERCENT.search(volume)
-        if match is None:
+            return None
+        channels = _VOLUME_CHANNEL.findall(volume)
+        if not channels:
             log.debug("Не удалось разобрать ответ звуковой службы о громкости")
-            return MicrophoneState()
-        try:
-            percent = int(match.group(1))
-        except ValueError:
-            return MicrophoneState()
-        return MicrophoneState(known=True, muted="yes" in muted.lower(), percent=percent)
+            return None
+        state = MicrophoneState(
+            known=True, muted="yes" in muted.lower(), percent=int(channels[0][1])
+        )
+        return _MicrophoneSnapshot(state, tuple(int(raw) for raw, _percent in channels))
+
+    def _remember(self, source: str, snapshot: _MicrophoneSnapshot) -> None:
+        """Сохраняет известное состояние до первого изменения источника за сеанс."""
+        if source not in self._before_change:
+            self._before_change[source] = snapshot
 
     def raise_microphone(self, device: str | None = None) -> bool:
-        """Включает звук выбранного источника и поднимает громкость до 100 %."""
-        source = self._source(device)
-        state = self.microphone_state(device)
+        """Включает звук выбранного источника и поднимает до целевой громкости (50 %)."""
+        resolved = self._resolved_source(device)
+        source = resolved or self._source(device)
+        snapshot = self._microphone_snapshot(source)
+        if snapshot is None:
+            return False
+        state = snapshot.state
         unmuted = self._pactl("set-source-mute", source, "0") is not None
         raised = True
-        if state.percent < 0 or state.percent < FULL_VOLUME_PERCENT:
-            raised = self._pactl("set-source-volume", source, f"{FULL_VOLUME_PERCENT}%") is not None
+        if state.percent < RAISE_TARGET_PERCENT:
+            raised = (
+                self._pactl("set-source-volume", source, f"{RAISE_TARGET_PERCENT}%") is not None
+            )
+        if resolved is not None and (
+            (state.muted and unmuted) or (state.percent < RAISE_TARGET_PERCENT and raised)
+        ):
+            self._remember(resolved, snapshot)
         log.info(
             "Громкость микрофона по кнопке: звук %s, громкость %s",
             "включён" if unmuted else "включить не удалось",
             "поднята" if raised else "не изменена",
         )
         return unmuted and raised
+
+    def set_microphone_volume(self, percent: int, device: str | None = None) -> bool:
+        """Задаёт громкость источника вручную, сохраняя исходное состояние для отката."""
+        percent = max(0, min(int(percent), FULL_VOLUME_PERCENT))
+        resolved = self._resolved_source(device)
+        source = resolved or self._source(device)
+        snapshot = self._microphone_snapshot(source)
+        if snapshot is None:
+            return False
+        changed = self._pactl("set-source-volume", source, f"{percent}%") is not None
+        # pactl переводит проценты в целое pa_volume_t с усечением.
+        target_volume = percent * _VOLUME_NORM // 100
+        if (
+            changed
+            and resolved is not None
+            and any(volume != target_volume for volume in snapshot.volumes)
+        ):
+            self._remember(resolved, snapshot)
+        if changed:
+            log.info("Громкость микрофона задана вручную: %d %%", percent)
+        else:
+            log.info("Не удалось задать громкость микрофона вручную: %d %%", percent)
+        return changed
+
+    def can_restore_microphone(self, device: str | None = None) -> bool:
+        """Есть ли состояние источника до первого изменения громкости."""
+        if not self._before_change:
+            return False
+        return self._resolved_source(device) in self._before_change
+
+    def restore_microphone(self, device: str | None = None) -> bool:
+        """Возвращает прежние громкость и выключение звука выбранного источника."""
+        if not self._before_change:
+            return False
+        source = self._resolved_source(device)
+        if source is None:
+            return False
+        snapshot = self._before_change.get(source)
+        if snapshot is None:
+            return False
+        volume_restored = (
+            self._pactl("set-source-volume", source, *(str(raw) for raw in snapshot.volumes))
+            is not None
+        )
+        mute_restored = (
+            self._pactl("set-source-mute", source, "1" if snapshot.state.muted else "0") is not None
+        )
+        restored = volume_restored and mute_restored
+        if restored:
+            del self._before_change[source]
+        log.info("Громкость микрофона по кнопке возвращена: %s", "да" if restored else "нет")
+        return restored
+
+    def forget_microphone_changes(self) -> None:
+        """Забывает состояния микрофонов, сохранённые за этот сеанс."""
+        self._before_change.clear()
 
     def restart_sound_service(self) -> bool:
         """Перезапускает звуковую службу пользователя; службу сама не поднимает."""
