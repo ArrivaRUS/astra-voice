@@ -569,7 +569,7 @@ class PulseCaptureRig:
         self.pulses.append(pulse)
         return source
 
-    def assert_released(self, count: int) -> None:
+    def assert_released(self, count: int, *, failed_streams: int = 0) -> None:
         """Считаем реальные вызовы освобождения ABI, а не идемпотентные close()."""
         if self.backend == "simple":
             assert self.simple.pa_simple_new.call_count == count
@@ -578,13 +578,14 @@ class PulseCaptureRig:
             names = [name for pulse in self.pulses for name in pulse.names()]
             for name in (
                 "stream_new",
-                "stream_disconnect",
                 "stream_unref",
             ):
                 assert names.count(name) == count
-            # Обычный stop закрывает микрофон, контекст живёт до shutdown.
-            assert names.count("context_unref") == 0
-            assert names.count("mainloop_free") == 0
+            assert names.count("stream_disconnect") == count - failed_streams
+            # READY получает ACK, FAILED закрывается вместе с контекстом.
+            assert names.count("context_unref") == failed_streams
+            assert names.count("mainloop_free") == failed_streams
+            assert not any(pulse.server_recording for pulse in self.pulses)
 
     def assert_owner(self, owner: int | None) -> None:
         owners = (
@@ -2617,15 +2618,17 @@ def test_capture_watchdog_never_frees_during_libpulse_call(
             owner,
         ]  # open сбрасывает пустой источник, finally закрывает.
     else:
-        # stream дополнительно закрывает отменённое открытие; ABI остаётся идемпотентным.
-        assert close_threads == [owner] * (3 if blocked_call == "second_new" else 2)
+        # Число внутренних close не является контрактом; ABI освобождает владелец.
+        assert close_threads and set(close_threads) == {owner}
         assert pulse.names().count("stream_unref") == 1
-        # Ретрай stream сохраняет контекст; его освобождает Worker.close после join.
+        # Отмена CREATING разрывает context в потоке захвата, READY — при shutdown.
         assert pulse.names().count("context_new") == 1
         assert pulse.names().count("context_unref") == 1
         assert pulse.names().count("mainloop_free") == 1
         assert pulse.stream_threads == {owner.ident}
-        assert pulse.threads == {owner.ident, threading.get_ident()}
+        assert pulse.threads == (
+            {owner.ident} if blocked_call == "second_new" else {owner.ident, threading.get_ident()}
+        )
     worker.check_capture_watchdog()
 
 
@@ -3216,11 +3219,11 @@ def test_pulse_capture_lifetime_contract(
             wait_capture()
         assert not probe.capture.active
         assert not source.is_open
-        source_backend.assert_released(index)
+        source_backend.assert_released(index, failed_streams=index if finish == "error" else 0)
         source_backend.assert_owner(owner.ident)
         # Повторная остановка не вызывает второе освобождение нативных ресурсов.
         probe.capture.stop()
-        source_backend.assert_released(index)
+        source_backend.assert_released(index, failed_streams=index if finish == "error" else 0)
         if finish == "error":
             assert probe.errors.get_nowait() == (
                 str(index),
@@ -3229,6 +3232,56 @@ def test_pulse_capture_lifetime_contract(
             )
         assert probe.errors.empty()
     assert len(probe.samples) == (2 if finish == "stop" else 0)
+
+
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("cancel", [False, True])
+def test_capture_cancel_before_open_finishes_while_context_lock_is_held(
+    monkeypatch: pytest.MonkeyPatch, warm: bool, cancel: bool
+) -> None:
+    """Отмена до stream_new завершает весь захват, включая finally.close (§9.5/T-40)."""
+    pulse = FakePulse()
+    source = ps.PulseStreamSource(
+        pulse_factory=lambda: pulse, devices=lambda: [MIC], default=lambda *_a, **_kw: MIC
+    )
+    if warm:
+        source.warm_up(MIC.name)
+        assert "stream_new" not in pulse.names()
+    pulse.calls.clear()
+    entered = threading.Event()
+    original_open = source.open
+
+    def observed_open(
+        device: str | None,
+        *,
+        deadline: _OpenDeadline | None = None,
+        running: threading.Event | None = None,
+    ) -> None:
+        entered.set()
+        original_open(device, deadline=deadline, running=running)
+
+    monkeypatch.setattr(source, "open", observed_open)
+    events, errors, samples = Mock(), Mock(), Mock()
+    capture = AudioCapture(source=source, on_samples=samples, on_event=events, on_error=errors)
+    try:
+        # Замок принадлежит другому потоку: например, текущему прогреву/интроспекции.
+        with source._ctx_lock:
+            capture.start("cancel-before-open", MIC.name, limit_s=30)
+            assert entered.wait(1)
+            owner = capture._thread
+            assert owner is not None
+            capture.request_stop(cancel=cancel)
+            owner.join(0.400)
+            assert not owner.is_alive(), "AudioCapture.finally ждёт чужой замок после отмены open"
+            assert not pulse.calls, "отменённый до открытия захват не меняет нативные ресурсы"
+            assert not source.is_open and not pulse.server_recording
+            capture.stop()
+            events.assert_not_called()
+            errors.assert_not_called()
+            samples.assert_not_called()
+    finally:
+        capture.stop()
+        capture.shutdown()
 
 
 def test_pulse_first_chunk_cancels_watchdog(
@@ -3264,7 +3317,7 @@ def test_pulse_first_chunk_cancels_watchdog(
         release.set()
         wait_capture()
     assert probe.errors.empty()
-    source_backend.assert_released(1)
+    source_backend.assert_released(1, failed_streams=1)
 
 
 def test_pulse_record_deadline_while_native_read_is_blocked(
@@ -3311,7 +3364,7 @@ def test_pulse_record_deadline_while_native_read_is_blocked(
         wait_capture()
     assert not source.is_open
     assert probe.errors.empty()
-    source_backend.assert_released(1)
+    source_backend.assert_released(1, failed_streams=1)
     source_backend.assert_owner(owner.ident)
 
 

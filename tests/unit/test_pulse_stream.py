@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ctypes
+import gc
 import subprocess
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from typing import Any, NoReturn, cast
 from unittest.mock import Mock
@@ -175,8 +177,12 @@ def test_open_and_close() -> None:
         setter = (
             "stream_set_moved_callback" if kind == "stream" else "context_set_subscribe_callback"
         )
-        assert pulse.calls[unref - 2][0] == setter
-        assert pulse.calls[unref - 2][1][1] is None
+        detached = [
+            i
+            for i, (name, args) in enumerate(pulse.calls[:unref])
+            if name == setter and args[1] is None
+        ]
+        assert detached
         assert names.count(kind + "_unref") == 1
     assert names.count("mainloop_free") == 1
     calls = list(pulse.calls)
@@ -218,11 +224,12 @@ def test_open_errors(
         source.open(MIC.name)
     assert (exc.value.code, exc.value.message) == (expected, message)
     assert invalidated.called
-    # Повторы stream READY используют тот же контекст и не ждут его READY заново.
+    # FAILED stream нельзя безопасно закрыть: повтор начинается с нового context.
     assert pulse.names().count("stream_unref") == audio.OPEN_RETRIES
-    assert pulse.names().count("context_new") == 1
-    assert "context_unref" not in pulse.names() and "mainloop_free" not in pulse.names()
-    assert pulse.clock.now == pytest.approx(0.650)
+    assert pulse.names().count("context_new") == audio.OPEN_RETRIES
+    assert pulse.names().count("context_unref") == audio.OPEN_RETRIES
+    assert pulse.names().count("mainloop_free") == audio.OPEN_RETRIES
+    assert pulse.clock.now == pytest.approx(0.750)
     calls = list(pulse.calls)
     source.close()
     assert pulse.calls == calls
@@ -257,16 +264,14 @@ def test_partial_open_cleanup(
         ("context_unref", contexts),
         ("stream_unref", streams),
     ):
-        # Ошибки stream не уничтожают готовый контекст; частичный context — уничтожают.
+        # NULL stream не оставляет server stream; CREATING требует fail-closed.
         expected = (
-            0
-            if failed.startswith("stream_") and name != "stream_unref"
-            else count * audio.OPEN_RETRIES
+            0 if failed == "stream_new" and name != "stream_unref" else count * audio.OPEN_RETRIES
         )
         assert pulse.names().count(name) == expected
     source.shutdown()
     for name, count in (("context_unref", contexts), ("mainloop_free", mainloops)):
-        expected = count if failed.startswith("stream_") else count * audio.OPEN_RETRIES
+        expected = count if failed == "stream_new" else count * audio.OPEN_RETRIES
         assert pulse.names().count(name) == expected
     assert not source.is_open
 
@@ -279,9 +284,9 @@ def test_deadline(stage: str) -> None:
     with pytest.raises(audio.AudioError):
         source.open(MIC.name, deadline=audio._OpenDeadline(pulse.clock, 0.12))
     assert pulse.clock.now == pytest.approx(0.12, abs=0.000002)
-    # Истёкший бюджет stream не делает готовое соединение непригодным.
-    assert pulse.names().count("mainloop_free") == (stage == "context")
-    assert pulse.names().count("context_unref") == (stage == "context")
+    # CREATING после дедлайна тоже не должен ожить на сервере позднее.
+    assert pulse.names().count("mainloop_free") == 1
+    assert pulse.names().count("context_unref") == 1
     assert pulse.names().count("stream_unref") == (stage == "stream")
     source.shutdown()
     assert pulse.names().count("mainloop_free") == 1
@@ -1720,20 +1725,20 @@ def test_idle_dispatch_is_bounded() -> None:
     source.shutdown()
 
 
-def test_stream_ready_retry_keeps_context() -> None:
+def test_failed_stream_ready_retry_recreates_context() -> None:
     pulse = FakePulse()
     pulse.steps.extend([Step(), Step(stream=ps.PA_STREAM_FAILED), Step()])
     source = source_for(pulse)
     source.open(MIC.name)
     assert source.is_open
     names = pulse.names()
-    assert names.count("context_new") == names.count("mainloop_new") == 1
-    assert names.count("context_connect") == names.count("context_subscribe") == 1
+    assert names.count("context_new") == names.count("mainloop_new") == 2
+    assert names.count("context_connect") == names.count("context_subscribe") == 2
     assert names.count("stream_new") == 2 and names.count("stream_unref") == 1
-    assert "context_unref" not in names and "mainloop_free" not in names
+    assert names.count("context_unref") == names.count("mainloop_free") == 1
     source.shutdown()
     assert pulse.names().count("stream_unref") == 2
-    assert pulse.names().count("context_unref") == pulse.names().count("mainloop_free") == 1
+    assert pulse.names().count("context_unref") == pulse.names().count("mainloop_free") == 2
 
 
 @pytest.mark.parametrize("open_stream", [False, True])
@@ -1764,6 +1769,131 @@ def test_shutdown_idempotent_and_allows_reopen(open_stream: bool) -> None:
     source.open(MIC.name)
     assert source.is_open
     assert pulse.names().count("context_new") == 2
+    source.shutdown()
+
+
+@pytest.mark.parametrize("ack_polls", [0, 3])
+def test_close_waits_for_server_disconnect_ack(ack_polls: int) -> None:
+    """Постоянный context не оставляет серверный микрофон между записями (§9.5)."""
+    pulse = FakePulse()
+    pulse.async_disconnect = True
+    pulse.disconnect_ack_polls = ack_polls
+    source = opened(pulse)
+    assert pulse.server_recording
+    before = len(pulse.calls)
+    source.close()
+    assert not source.is_open
+    assert not pulse.server_recording, "close вернул управление до закрытия микрофона сервером"
+    assert pulse.stream_state == ps.PA_STREAM_TERMINATED
+    assert "context_disconnect" not in pulse.names()[before:]
+    assert pulse.names().count("context_new") == 1
+    calls = pulse.names()[before:]
+    assert calls.index("mainloop_dispatch") < calls.index("stream_unref")
+    source.open(MIC.name)
+    assert source.is_open and pulse.server_recording
+    assert pulse.names().count("context_new") == 1
+    source.shutdown()
+    assert not pulse.server_recording
+
+
+@pytest.mark.parametrize("failure", ["timeout", "poll", "disconnect"])
+def test_close_disconnect_failure_drops_context_and_can_reopen(failure: str) -> None:
+    """Неотвечающая служба не удерживает микрофон и не блокирует будущую запись."""
+    pulse = FakePulse()
+    pulse.async_disconnect = True
+    source = opened(pulse)
+    if failure == "timeout":
+        pulse.hold_disconnect = True
+    elif failure == "poll":
+        pulse.fail["mainloop_poll"] = -1
+    else:
+        pulse.fail["stream_disconnect"] = -1
+    started = pulse.clock.now
+    source.close()
+    assert not source.is_open and not pulse.server_recording
+    assert 0 <= pulse.clock.now - started <= 0.250
+    assert pulse.names().count("context_disconnect") == 1
+    assert pulse.names().count("context_unref") == pulse.names().count("mainloop_free") == 1
+    assert pulse.names().count("stream_unref") == 1
+    pulse.fail.clear()
+    pulse.hold_disconnect = False
+    source.open(MIC.name)
+    assert source.is_open and pulse.server_recording
+    assert pulse.names().count("context_new") == 2
+    source.shutdown()
+    assert not pulse.server_recording
+
+
+def test_concurrent_close_waits_for_inflight_server_disconnect_ack() -> None:
+    """Нулевой Python stream после начала close ещё не означает закрытый микрофон."""
+    pulse = FakePulse()
+    pulse.async_disconnect = True
+    source = opened(pulse)
+    entered, release = threading.Event(), threading.Event()
+    second_started, second_finished = threading.Event(), threading.Event()
+    failures: list[BaseException] = []
+    library = cast(FakeLibrary, pulse.lib)
+    native_call = library.call
+
+    def hold_ack(symbol: str, *args: object) -> object:
+        if symbol == "pa_mainloop_dispatch" and pulse.disconnect_pending:
+            entered.set()
+            assert release.wait(2)
+        return native_call(symbol, *args)
+
+    def close_source(*, second: bool = False) -> None:
+        if second:
+            second_started.set()
+        try:
+            source.close()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            if second:
+                second_finished.set()
+
+    library.call = hold_ack
+    first = threading.Thread(target=close_source)
+    second = threading.Thread(target=lambda: close_source(second=True))
+    first.start()
+    try:
+        assert entered.wait(1)
+        assert pulse.server_recording
+        assert "stream_unref" not in pulse.names()
+        second.start()
+        assert second_started.wait(1)
+        assert not second_finished.wait(0.100), (
+            "второй close вернулся при открытом серверном потоке"
+        )
+    finally:
+        release.set()
+        first.join(2)
+        if second.ident is not None:
+            second.join(2)
+    assert not first.is_alive() and not second.is_alive() and not failures
+    assert second_finished.is_set()
+    assert not pulse.server_recording and not source.is_open
+    assert pulse.names().count("stream_disconnect") == pulse.names().count("stream_unref") == 1
+    assert "context_disconnect" not in pulse.names()
+    source.shutdown()
+
+
+def test_cancel_pending_stream_creation_drops_context_on_disconnect_failure() -> None:
+    """Отмена CREATING не оставляет серверу поздний запрос на открытие записи."""
+    pulse = FakePulse()
+    pulse.async_disconnect = True
+    source = source_for(pulse)
+    source.warm_up(MIC.name)
+    running = threading.Event()
+    running.set()
+    pulse.hold_stream = True
+    pulse.fail["stream_disconnect"] = -1
+    pulse.steps.append(Step(action=running.clear))
+    source.open(MIC.name, running=running)
+    assert not source.is_open and not pulse.server_recording
+    assert pulse.names().count("context_disconnect") == 1
+    assert pulse.names().count("context_unref") == 1
+    assert pulse.names().count("stream_unref") == 1
     source.shutdown()
 
 
@@ -1823,6 +1953,54 @@ def test_warmup_and_capture_serialize_native_calls() -> None:
     assert pulse.names().count("context_new") == 1
     assert pulse.stream_threads == {owner.ident}
     assert pulse.threads == {owner.ident, warm.ident}
+    source.shutdown()
+
+
+@pytest.mark.parametrize("finish", ["deadline", "cancel"])
+def test_open_waiting_for_context_lock_honors_deadline_and_cancel(finish: str) -> None:
+    """Занятый прогрев не растягивает бюджет и не оставляет отменённое open ждать."""
+    pulse = FakePulse()
+    source = ps.PulseStreamSource(
+        pulse_factory=lambda: pulse,
+        devices=lambda: [MIC],
+        default=lambda *_a, **_kw: MIC,
+    )
+    running = threading.Event()
+    running.set()
+    entered, finished = threading.Event(), threading.Event()
+    failures: list[BaseException] = []
+
+    def open_source() -> None:
+        entered.set()
+        try:
+            source.open(
+                MIC.name,
+                running=running,
+                deadline=audio._OpenDeadline(time.monotonic, 0.050 if finish == "deadline" else 2),
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=open_source)
+    with source._ctx_lock:
+        thread.start()
+        try:
+            assert entered.wait(1)
+            if finish == "cancel":
+                running.clear()
+            assert finished.wait(0.400), "open игнорирует отмену/дедлайн, ожидая чужой context lock"
+            assert not pulse.calls, "неполученный lock не разрешает менять нативные ресурсы"
+        finally:
+            running.clear()
+    thread.join(2)
+    assert not thread.is_alive()
+    if finish == "deadline":
+        assert len(failures) == 1 and isinstance(failures[0], audio.AudioError)
+    else:
+        assert not failures
+    assert not source.is_open
     source.shutdown()
 
 
@@ -1935,15 +2113,14 @@ def test_production_retry_reuses_selected_device(
         source.open(MIC.name)
     select.assert_called_once()
     assert source.is_open and source.selected_device == MIC
-    assert pulse.names().count("context_new") == 1 + recreate_context
+    assert pulse.names().count("context_new") == 2
     assert pulse.names().count("stream_new") == 2
     assert pulse.names().count("context_get_source_info_list") == 1
     selection_ms = round(2 * ps.POLL_US / 1000)
     connection_ms = round(pulse.clock.now * 1000) - selection_ms
-    context = "холодный" if recreate_context else "тёплый"
     assert caplog.messages[-1] == (
         f"Источник записи открыт: {MIC.label} выбор_ms={selection_ms} "
-        f"подключение_ms={connection_ms} попытка=2 контекст={context}"
+        f"подключение_ms={connection_ms} попытка=2 контекст=холодный"
     )
     source.shutdown()
 
@@ -2327,4 +2504,59 @@ def test_event_during_introspection_keeps_cache_stale(
     assert list_devices() == [MIC]
     assert not source._introspection_stale
     assert pulse.names().count("context_get_source_info_list") == 3
+    source.shutdown()
+
+
+@pytest.mark.parametrize("state", [ps.PA_CONTEXT_FAILED, ps.PA_CONTEXT_TERMINATED])
+def test_reconnected_context_refreshes_default_without_subscription_event(
+    introspection: tuple[ps.PulseStreamSource, FakePulse], state: int
+) -> None:
+    """После обрыва прежние имя/индекс не переживают новый снимок службы."""
+    source, pulse = introspection
+    source.open(None)
+    source.close()
+    pulse.context_state = state
+    pulse.sources = [(OTHER.index, OTHER.name.encode(), OTHER.description.encode())]
+    pulse.default_source = pulse.name = OTHER.name.encode()
+    pulse.index = OTHER.index
+    source.open(None)
+    assert source.selected_device == OTHER
+    assert pulse.names().count("context_new") == 2
+    assert pulse.names().count("context_get_source_info_list") == 2
+    assert pulse.names().count("context_get_server_info") == 2
+    assert source.device_change is None
+    source.shutdown()
+
+
+def test_subscribe_callback_survives_gc_between_recordings(
+    introspection: tuple[ps.PulseStreamSource, FakePulse],
+) -> None:
+    """Python-владелец сохраняет callback, когда libpulse держит лишь адрес."""
+    source, pulse = introspection
+    source.warm_up(None)
+    callback = pulse.subscribe_callback
+    assert callback is not None
+    callback_ref = weakref.ref(callback)
+    pulse.subscribe_callback = weakref.proxy(callback)
+    # История фейка также не должна случайно удерживать Python callback.
+    pulse.calls.clear()
+    del callback
+    gc.collect()
+    assert callback_ref() is not None
+    pulse.sources = [(OTHER.index, OTHER.name.encode(), OTHER.description.encode())]
+    pulse.default_source = pulse.name = OTHER.name.encode()
+    pulse.index = OTHER.index
+    pulse.idle_steps.append(Step(events=[(SERVER, 0)]))
+    source.open(None)
+    assert source.selected_device == OTHER
+    source.close()
+    pulse.calls.clear()
+    gc.collect()
+    assert callback_ref() is not None
+    pulse.sources = [(MIC.index, MIC.name.encode(), MIC.description.encode())]
+    pulse.default_source = pulse.name = MIC.name.encode()
+    pulse.index = MIC.index
+    pulse.idle_steps.append(Step(events=[(SERVER, 0)]))
+    source.open(None)
+    assert source.selected_device == MIC
     source.shutdown()

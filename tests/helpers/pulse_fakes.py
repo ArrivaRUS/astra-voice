@@ -118,6 +118,12 @@ class FakePulse(ps._PulseAsync):
         self.timeout_us = 0
         self.hold_context = False
         self.hold_stream = False
+        # В асинхронном ABI успешный disconnect лишь ставит запрос в очередь.
+        self.async_disconnect = False
+        self.disconnect_pending = False
+        self.disconnect_ack_polls = 0
+        self.hold_disconnect = False
+        self.server_recording = False
         self.native_buffer: Any = None
         self.buffer_attr: tuple[int, ...] | None = None
         self.spec: tuple[int, ...] | None = None
@@ -157,6 +163,7 @@ class FakePulse(ps._PulseAsync):
         elif name == "stream_set_moved_callback":
             self.moved_callback = args[1]
         elif name == "stream_connect_record":
+            self.server_recording = True
             attr = ctypes.cast(args[2], ctypes.POINTER(audio._PaBufferAttr)).contents
             self.buffer_attr = (
                 attr.maxlength,
@@ -165,6 +172,16 @@ class FakePulse(ps._PulseAsync):
                 attr.minreq,
                 attr.fragsize,
             )
+        elif name == "stream_disconnect":
+            if self.async_disconnect:
+                self.disconnect_pending = True
+            else:
+                self.server_recording = False
+                self.stream_state = ps.PA_STREAM_TERMINATED
+        elif name == "context_disconnect":
+            # Закрытие сокета освобождает также поток, ещё создаваемый сервером.
+            self.server_recording = False
+            self.disconnect_pending = False
         elif name == "mainloop_prepare":
             self.timeout_us = args[1]
         elif name == "mainloop_poll":
@@ -216,6 +233,13 @@ class FakePulse(ps._PulseAsync):
 
     def dispatch(self) -> None:
         """Порядок внутри шага позволяет проверить точку обрезки в колбэке."""
+        if self.disconnect_pending and not self.hold_disconnect:
+            if self.disconnect_ack_polls:
+                self.disconnect_ack_polls -= 1
+            else:
+                self.disconnect_pending = False
+                self.server_recording = False
+                self.stream_state = ps.PA_STREAM_TERMINATED
         if self.context_state == ps.PA_CONTEXT_CONNECTING and not self.hold_context:
             self.context_state = ps.PA_CONTEXT_READY
         if self.stream_state == ps.PA_STREAM_CREATING and not self.hold_stream:

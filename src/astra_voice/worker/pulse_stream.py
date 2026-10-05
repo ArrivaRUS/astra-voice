@@ -99,6 +99,7 @@ PA_ERR_KILLED = 12
 PA_INVALID_INDEX = U32_MAX
 SIZE_MAX = ctypes.c_size_t(-1).value
 POLL_US = 50_000
+CLOSE_DEADLINE_S = 0.250
 KILLED_WAIT_S = 0.250
 SERVER_WAIT_S = 0.200
 # В очередь попадают только REMOVE источников и moved; SERVER CHANGE хранится флагом.
@@ -439,7 +440,8 @@ class PulseStreamSource:
 
     Контекст создаёт warm_up в audio-warmup либо первый open в потоке захвата.
     Только вызывающий под _ctx_lock крутит mainloop: warm_up при подготовке,
-    open/read_chunk (и flush) при захвате; между записями цикл никто не крутит.
+    open/read_chunk (и flush) при захвате; close ждёт подтверждения закрытия
+    потока, после чего между записями цикл никто не крутит.
     Провайдер вызывается любым потоком воркера с таймаутом замка; интроспекция
     только под замком, кэш обновляется по SOURCE/SERVER, без TTL.
     shutdown при выходе воркера освобождает тройку; open пересоздаёт её после
@@ -462,6 +464,9 @@ class PulseStreamSource:
         self._clock = clock
         self._sleep = sleep
         self._ctx_lock = threading.RLock()
+        # Под замком: от начала open до конца close, включая ожидание server ACK.
+        # Одно атомарное чтение позволяет close пропустить чужой прогрев без записи.
+        self._capture_active = False
         self._context_dead = False
         self._devices_changed = False
         self._introspection_stale = True
@@ -724,16 +729,38 @@ class PulseStreamSource:
         running: threading.Event | None = None,
     ) -> None:
         """Готовит контекст, выбирает устройство и создаёт закреплённый поток захвата."""
-        self.close()
-        self._running = running
         budget = deadline or _OpenDeadline(self._clock)
         started = self._clock()
+        # Прогрев/интроспекция могут владеть контекстом. До получения замка нельзя
+        # ни закрывать их ресурсы, ни менять _running; ожидание входит в open budget.
+        while True:
+            if running is not None and not running.is_set():
+                return
+            if self._ctx_lock.acquire(timeout=budget.remaining(POLL_US / 1_000_000)):
+                break
+        try:
+            self._open_locked(device, budget, running, started)
+        finally:
+            self._ctx_lock.release()
+
+    def _open_locked(
+        self,
+        device: str | None,
+        budget: _OpenDeadline,
+        running: threading.Event | None,
+        started: float,
+    ) -> None:
+        """Открывает поток и очищает частичный результат только под _ctx_lock."""
+        self._close()
+        self._capture_active = True
+        self._running = running
         try:
             self._check_open(budget)
 
+            selecting_at = self._clock()
             selected = self._select_device(device, budget) if self._devices is not None else None
             self._check_open(budget)
-            selection_s = self._clock() - started
+            selection_s = self._clock() - selecting_at
             with self._ctx_lock:
                 for attempt in range(OPEN_RETRIES):
                     self._check_open(budget)
@@ -1332,14 +1359,47 @@ class PulseStreamSource:
             return 0 if negative.value else usec.value
 
     def _release(self) -> None:
-        """Под замком закрывает только поток; сбрасывает факты и буферы записи."""
+        """Под замком закрывает поток; без подтверждения разрывает весь контекст.
+
+        stream_disconnect только ставит DELETE_RECORD_STREAM в очередь libpulse.
+        Держим ссылку и крутим цикл до серверного ответа, иначе микрофон останется
+        открытым в простое. Незавершённый CREATE также требует разрыва контекста:
+        у такого потока ещё нет канала для отправки DELETE_RECORD_STREAM.
+        """
         stream, self._stream = self._stream, None
         self._opened = False
-        if self._pulse is not None:
-            if stream is not None:
-                self._pulse.stream_set_moved_callback(stream, None, None)
-                self._pulse.stream_disconnect(stream)
-                self._pulse.stream_unref(stream)
+        pulse = self._pulse
+        if pulse is not None and stream is not None:
+            closed = False
+            try:
+                pulse.stream_set_moved_callback(stream, None, None)
+                state = pulse.stream_get_state(stream)
+                if state != PA_STREAM_TERMINATED:
+                    if (
+                        state != PA_STREAM_READY
+                        or self._context is None
+                        or pulse.context_get_state(self._context) != PA_CONTEXT_READY
+                        or pulse.stream_disconnect(stream) < 0
+                    ):
+                        raise _PulseFailure
+                    budget = _OpenDeadline(self._clock, CLOSE_DEADLINE_S)
+                    while pulse.stream_get_state(stream) != PA_STREAM_TERMINATED:
+                        if (
+                            pulse.stream_get_state(stream) != PA_STREAM_READY
+                            or not self._context_ok()
+                        ):
+                            raise _PulseFailure
+                        pulse.iterate(
+                            max(1, int(budget.remaining(POLL_US / 1_000_000) * 1_000_000))
+                        )
+                closed = True
+            except (AudioError, _PulseFailure):
+                logger.debug("Закрытие потока записи не подтверждено: разрыв соединения.")
+            finally:
+                pulse.stream_unref(stream)
+                if not closed:
+                    self._context_dead = True
+                    self._release_context()
         self._events.clear()
         self._overflow = False
         self._overflow_cutoff = 0
@@ -1372,17 +1432,30 @@ class PulseStreamSource:
             pulse.mainloop = None
 
     def _close(self) -> None:
-        self._release()
-        self._running = None
-        self._device_name = None
-        self._selected_device = None
-        self.device_label = None
-        self._default_mode = False
+        self._capture_active = True
+        try:
+            self._release()
+            self._running = None
+            self._device_name = None
+            self._selected_device = None
+            self.device_label = None
+            self._default_mode = False
+        finally:
+            self._capture_active = False
 
     def close(self) -> None:
-        """Закрывает микрофон и забывает выбор; соединение и подписка остаются."""
-        with self._ctx_lock:
+        """Закрывает микрофон; сохраняет соединение только после подтверждения сервера."""
+        if not self._ctx_lock.acquire(blocking=False):
+            # Прогрев/опрос без записи не требуют cleanup. В частности, finally
+            # захвата после отмены open до получения замка не должен ждать их снова.
+            # True держится и во время закрытия: второй close тоже дождётся ACK.
+            if not self._capture_active:
+                return
+            self._ctx_lock.acquire()
+        try:
             self._close()
+        finally:
+            self._ctx_lock.release()
 
     def shutdown(self) -> None:
         """После остановки захвата идемпотентно освобождает поток и контекст."""
