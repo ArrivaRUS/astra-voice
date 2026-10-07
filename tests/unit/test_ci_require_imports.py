@@ -117,3 +117,41 @@ def test_if_exists_skips_absent_dir(tmp_path: Path, capsys: pytest.CaptureFixtur
 def test_absent_positional_path_is_error(tmp_path: Path) -> None:
     """Опечатка в обязательном пути не должна молча выключать гейт."""
     assert guard.main([str(tmp_path / "typo")]) == 2
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "raise RuntimeError('broken dependency')",
+        "import nonexistent_nested_dependency",
+        "raise SystemExit(0)",
+    ],
+)
+def test_module_found_but_import_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
+    (tmp_path / "broken_dependency.py").write_text(body, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    assert importlib.util.find_spec("broken_dependency") is not None
+    errors = guard.import_errors(["broken_dependency"])
+    assert "broken_dependency" in errors
+    assert "код 1" in errors["broken_dependency"]
+    assert "broken_dependency" not in sys.modules
+
+
+def test_import_timeout_is_controlled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "slow_dependency.py").write_text("import time; time.sleep(30)", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(guard, "IMPORT_TIMEOUT", 0.1)
+    errors = guard.import_errors(["slow_dependency", "sys"])
+    assert list(errors) == ["slow_dependency"]
+    assert "не завершился" in errors["slow_dependency"]
+
+
+def test_import_failure_is_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "bad_module.py").write_text("raise ValueError('library ABI mismatch')", "utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    assert guard.main([str(tmp_path), "--also", "bad_module"]) == 1
+    assert "ValueError: library ABI mismatch" in capsys.readouterr().err

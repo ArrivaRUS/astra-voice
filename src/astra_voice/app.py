@@ -423,7 +423,13 @@ SECTION_ABOUT = "about"
 SECTION_DEBUG = "debug"
 
 
-def _make_app_info(session_kind: SessionKind, policy_status: str, *, debug: bool = False) -> Any:
+def _make_app_info(
+    session_kind: SessionKind,
+    policy_status: str,
+    *,
+    debug: bool = False,
+    policy_warning: str = "",
+) -> Any:
     from PyQt5.QtCore import QObject, pyqtProperty, pyqtSignal
 
     class AppInfo(QObject):
@@ -462,6 +468,10 @@ def _make_app_info(session_kind: SessionKind, policy_status: str, *, debug: bool
         @pyqtProperty(str, constant=True)
         def policyStatus(self) -> str:  # noqa: N802 — имя свойства для QML
             return policy_status
+
+        @pyqtProperty(str, constant=True)
+        def policyWarning(self) -> str:  # noqa: N802
+            return policy_warning
 
     return AppInfo()
 
@@ -1093,7 +1103,12 @@ def main(argv: list[str] | None = None) -> int:
     # Получатель уведомлений из рабочих потоков — в GUI до их запуска (урок 026).
     install_notify_dispatcher()
 
-    app_info = _make_app_info(session_kind, policy.status.value, debug=args.debug)
+    app_info = _make_app_info(
+        session_kind,
+        policy.status.value,
+        debug=args.debug,
+        policy_warning=policy.permissions_warning,
+    )
     theme_bridge = _make_theme_bridge(session_kind)
     shell = _load_qml(app_info, theme_bridge) or _fallback_widget()
     if theme_bridge is not None:

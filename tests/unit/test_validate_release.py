@@ -15,7 +15,8 @@ import tarfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
+from unittest.mock import Mock
 
 import pytest
 
@@ -608,6 +609,8 @@ def test_appimage_release_needs_sources_archive(
     validate: Callable[[list[str]], int],
     capsys: pytest.CaptureFixture[str],
     case: str,
+    validate_globals: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """R3.6: архив исходников обязателен с AppImage, проверяется потоком по манифесту."""
     add_appimage(assets)
@@ -635,9 +638,16 @@ def test_appimage_release_needs_sources_archive(
         )
         (dist / "SHA256SUMS").write_text(sums, "utf-8")
         resign(assets, assets.fingerprint)
+    parser = None
+    if case == "sums":
+        sources = cast(Callable[[], Any], validate_globals["_release_sources_module"])()
+        parser = Mock(wraps=sources._check_members)
+        monkeypatch.setattr(sources, "_check_members", parser)
     checks = release_checks(validate, assets, capsys)
     if case == "sums":
-        assert checks["sources"]["ok"] is True
+        assert checks["sources"]["ok"] is False
+        assert parser is not None
+        parser.assert_not_called()
         assert checks["sha256"]["detail"] == f"неверная сумма: {SOURCES}"
     else:
         assert checks["sources"]["ok"] is False

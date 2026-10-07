@@ -141,7 +141,7 @@ def test_unknown_orig_names_ignored() -> None:
     """В окружении могли оказаться чужие ASTRA_VOICE_ORIG_*: восстанавливаем только свои."""
     env = childenv.clean_env(
         {
-            "ASTRA_VOICE_ORIG_LD_LIBRARY_PATH": "/evil",
+            "ASTRA_VOICE_ORIG_UNKNOWN_LOADER": "/evil",
             "ASTRA_VOICE_ORIG_UNSET": "HOME",
             "HOME": "/h",
         }

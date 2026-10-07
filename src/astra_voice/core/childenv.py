@@ -36,6 +36,8 @@ APPRUN_MANAGED = (
     "QML_IMPORT_PATH",
     "QT_QPA_PLATFORMTHEME",
     "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
     "SSL_CERT_FILE",
 )
 # Что AppRun меняет только по условию (кириллица в пути при однобайтовой локали), не снимая.
