@@ -14,6 +14,8 @@ from __future__ import annotations
 import configparser
 import dataclasses
 import logging
+import os
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from enum import StrEnum
@@ -45,6 +47,8 @@ class Policy:
     values: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     locked_keys: frozenset[str] = frozenset()
     status: PolicyStatus = PolicyStatus.ABSENT
+    # Только диагностика раскладки: не меняет статус, значения и блокировки.
+    permissions_warning: str = ""
 
     def is_locked(self, key: str) -> bool:
         return key in self.locked_keys
@@ -83,18 +87,41 @@ def _offline_value(raw: str, target: Path) -> bool:
     return True
 
 
+def _permissions_warning(fd: int, target: Path) -> str:
+    """Проверить владельца и права того же файла, из которого читается политика."""
+    try:
+        info = os.fstat(fd)
+    except OSError as exc:
+        # Сбой диагностики не отменяет политику, если её содержимое читается.
+        log.warning("политика %s: не удалось проверить владельца и права (%s)", target, exc)
+        return "Не удалось проверить владельца и права файла правил."
+    if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        log.warning(
+            "политика %s: небезопасные права (uid=%d, mode=%04o); "
+            "ожидается владелец root и запрет записи группе и остальным",
+            target,
+            info.st_uid,
+            stat.S_IMODE(info.st_mode),
+        )
+        return "Небезопасные права файла правил: обратитесь к администратору."
+    return ""
+
+
 def load(path: Path | None = None) -> Policy:
     """Читает политику. Ошибка разбора → статус ``invalid`` и пустые значения."""
     target = POLICY_PATH if path is None else path
     if not target.exists():
         return Policy(status=PolicyStatus.ABSENT)
     parser = configparser.ConfigParser(interpolation=None)
+    permissions_warning = ""
     try:
-        text = target.read_text(encoding="utf-8")
+        with target.open(encoding="utf-8") as stream:
+            permissions_warning = _permissions_warning(stream.fileno(), target)
+            text = stream.read()
         parser.read_string(text, source=str(target))
     except (OSError, UnicodeDecodeError, configparser.Error) as exc:
         log.warning("политика %s не разобрана (%s), считаю её отсутствующей", target, exc)
-        return Policy(status=PolicyStatus.INVALID)
+        return Policy(status=PolicyStatus.INVALID, permissions_warning=permissions_warning)
 
     raw: dict[str, str] = {}
     if parser.has_section(SECTION):
@@ -103,7 +130,7 @@ def load(path: Path | None = None) -> Policy:
         raw.update(parser.defaults())
     if not raw:
         log.warning("политика %s без секции [%s], считаю её отсутствующей", target, SECTION)
-        return Policy(status=PolicyStatus.INVALID)
+        return Policy(status=PolicyStatus.INVALID, permissions_warning=permissions_warning)
 
     explicit = {k.strip() for k in raw.pop(LOCKED_KEY, "").replace(",", " ").split() if k.strip()}
     values: dict[str, Any] = {}
@@ -119,11 +146,12 @@ def load(path: Path | None = None) -> Policy:
             values[key] = _coerce(key, value)
         except ValueError as exc:
             log.warning("политика %s: %s, считаю её невалидной", target, exc)
-            return Policy(status=PolicyStatus.INVALID)
+            return Policy(status=PolicyStatus.INVALID, permissions_warning=permissions_warning)
     return Policy(
         values=values,
         locked_keys=frozenset(values) | explicit,
         status=PolicyStatus.OK,
+        permissions_warning=permissions_warning,
     )
 
 

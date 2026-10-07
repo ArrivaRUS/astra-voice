@@ -22,6 +22,7 @@ Column {
         : (root.info && root.info.version) ? root.info.version : "0.1.0"
     readonly property string sessionKind: (root.info && root.info.sessionKind) ? root.info.sessionKind : ""
     readonly property string policyStatus: (root.info && root.info.policyStatus) ? root.info.policyStatus : ""
+    readonly property string policyWarning: (root.info && root.info.policyWarning) ? root.info.policyWarning : ""
 
     function buildLine() {
         if (!root.about)
@@ -68,18 +69,24 @@ Column {
     }
 
     function policyLine() {
+        var line
         switch (root.policyStatus) {
         case "absent":
-            return qsTr("Не заданы — все настройки в ваших руках")
+            line = qsTr("Не заданы — все настройки в ваших руках")
+            break
         case "ok":
-            return qsTr("Применены: строки с замком задал администратор")
+            line = qsTr("Применены: строки с замком задал администратор")
+            break
         case "ignored":
-            return qsTr("Не применены: файл правил небезопасен, программа работает без него")
+            line = qsTr("Не применены: файл правил небезопасен, программа работает без него")
+            break
         case "invalid":
-            return qsTr("Не применены: файл правил не удалось прочитать, программа работает без него")
+            line = qsTr("Не применены: файл правил не удалось прочитать, программа работает без него")
+            break
         default:
-            return qsTr("Нет сведений")
+            line = qsTr("Нет сведений")
         }
+        return root.policyWarning !== "" ? line + ". " + root.policyWarning : line
     }
 
     function updatesLine() {
