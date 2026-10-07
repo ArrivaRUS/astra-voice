@@ -29,6 +29,13 @@ refuse_root() {
 
 refuse_root
 
+# Сохраняем исходный путь: readlink -f ниже скрывает ссылки в родителях,
+# а для удаления распаковки нужна проверка всей исходной цепочки.
+case $0 in
+    /*) LAUNCHER=$0 ;;
+    *) LAUNCHER=$PWD/$0 ;;
+esac
+LAUNCH_DIR=$(dirname "$LAUNCHER")
 HERE=$(dirname "$(readlink -f "$0")")
 PY=$HERE/opt/python3.11/bin/python3.11
 BOOTSTRAP=$HERE/usr/lib/astra-voice/bootstrap.py
@@ -39,18 +46,57 @@ SKIPPED=10
 [ -f "$HERE/keylib.sh" ] && [ -r "$HERE/keylib.sh" ] || die 'Повреждены сведения о сборке Astra Voice.'
 . "$HERE/keylib.sh"
 
-# «:» в пути ломает списки путей (QT_PLUGIN_PATH, QML2_IMPORT_PATH): отказ сразу и понятно.
-# Своя временная распаковка (appimage_extracted_*, наш владелец, маркер сборки, не ссылка)
-# перед отказом удаляется: runtime её не убирает.
+# Разрешаем удалять только нашу распаковку в защищённой цепочке каталогов.
+# Общий sticky /tmp допустим выше личного каталога, но не как непосредственный
+# родитель распаковки. Сомнительные пути сохраняем; это гигиена удаления,
+# не защита BL-1a от кода, уже исполненного небезопасным runtime.
+own_extraction() (
+    case ${HERE##*/} in
+        appimage_extracted_*) ;;
+        *) return 1 ;;
+    esac
+    [ ! -L "$LAUNCHER" ] && [ -d "$HERE" ] && [ -O "$HERE" ] || return 1
+    [ -f "$BUILD_FILE" ] && [ ! -L "$BUILD_FILE" ] && [ -O "$BUILD_FILE" ] || return 1
+    # stat без -L: ссылки в исходном пути не превращаются в доверенные каталоги.
+    directory=$LAUNCH_DIR
+    protected_parent=0
+    while :; do
+        [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+        owner=$(stat -c %u -- "$directory") || return 1
+        mode=$(stat -c %a -- "$directory") || return 1
+        case $mode in '' | *[!01234567]*) return 1 ;; esac
+        [ -O "$directory" ] || [ "$owner" = 0 ] || return 1
+        if [ "$((0$mode & 0022))" != 0 ]; then
+            # root-owned sticky ancestors cannot rename entries owned by us.
+            [ "$owner" = 0 ] && [ "$((0$mode & 01000))" != 0 ] &&
+                [ "$protected_parent" = 1 ] || return 1
+        elif [ -O "$directory" ]; then
+            # «.»/«..» и повторные / могут повторно привести к самой
+            # распаковке или её потомку. Защищает только настоящий предок HERE.
+            # Исходную цепочку всё равно обходим выше: ссылки не скрываем.
+            canonical=$(readlink -f -- "$directory") || return 1
+            case $HERE in
+                "$canonical"/*) protected_parent=1 ;;
+            esac
+        fi
+        [ "$directory" != / ] || break
+        directory=$(dirname "$directory")
+    done
+    version=$(sed -n 's/^VERSION=//p' "$BUILD_FILE") || return 1
+    build_id=$(sed -n 's/^BUILD_ID=//p' "$BUILD_FILE") || return 1
+    key_ok "$version-$build_id"
+)
+
+drop_extracted() {
+    if own_extraction; then
+        rm -rf -- "$HERE" || :
+    fi
+}
+
+# «:» в пути ломает списки путей (QT_PLUGIN_PATH, QML2_IMPORT_PATH).
 case $HERE in
     *:*)
-        case ${HERE##*/} in
-            appimage_extracted_*)
-                if [ -O "$HERE" ] && [ ! -L "$HERE" ] && [ -f "$HERE/.astra-voice-build" ]; then
-                    rm -rf "$HERE" || :
-                fi
-                ;;
-        esac
+        drop_extracted
         die 'Astra Voice не запускается из папки, в пути к которой есть двоеточие «:». Переместите файл программы в другую папку.'
         ;;
 esac
@@ -123,7 +169,7 @@ fi
 # внешних программ (childenv.clean_env). Только первый раз: вложенный AppRun
 # (exec установленной копии) видит уже изменённое окружение и ничего не пишет.
 # Тот же список — childenv.APPRUN_MANAGED (сверяет test_apprun.py).
-MANAGED='PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE QT_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH QT_QPA_PLATFORMTHEME LD_PRELOAD SSL_CERT_FILE'
+MANAGED='PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONUSERBASE QT_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH QT_QPA_PLATFORMTHEME LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT SSL_CERT_FILE'
 save_originals() {
     for name in "$@"; do
         case " ${ASTRA_VOICE_ORIG_UNSET-} " in
@@ -144,7 +190,7 @@ save_originals() {
 save_originals $MANAGED
 
 # Переменные runtime AppImage и хоста, которые не должны влиять на бандловый
-# Python и Qt (arch/appimage.md §10.4). LD_LIBRARY_PATH не ставим: RUNPATH.
+# Python и Qt (arch/appimage.md §10.4). Библиотеки ищутся через RUNPATH.
 # shellcheck disable=SC2086
 unset APPIMAGE APPDIR ARGV0 OWD APPIMAGE_EXTRACT_AND_RUN $MANAGED \
     ASTRA_VOICE_APPIMAGE_DIR ASTRA_VOICE_RESOURCES ASTRA_VOICE_TEST_MOUNTINFO
@@ -189,15 +235,6 @@ installed_ok() {
 
 is_current() {
     [ "$(readlink "$ROOT/current" 2>/dev/null || :)" = "$KEY" ]
-}
-
-# Runtime после --appimage-extract-and-run свою распаковку не удаляет (спайк §4):
-# копия уже установлена — убираем её. Оболочка держит открытый дескриптор этого
-# скрипта, поэтому удалить исполняемый сейчас файл безопасно.
-drop_extracted() {
-    if [ "$MODE" = В ] && [ -f "$HERE/.astra-voice-build" ]; then
-        rm -rf "$HERE" || :
-    fi
 }
 
 # Явный запуск файла передаёт меню установленной копии (arch/appimage.md §2, §4).
