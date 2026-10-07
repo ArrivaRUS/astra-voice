@@ -163,6 +163,7 @@ class TrayIconProvider:
         self._theme = theme
         self._panel_dark = fly_panel_dark if panel_dark is None else panel_dark
         self._cache: dict[TrayState, QIcon] = {}
+        self._command_cache: dict[TrayState, QIcon] = {}
 
     def _file_icon_dark(self) -> bool:
         """Цвет знака из файла: во Fly — по панели, иначе по теме окон."""
@@ -206,6 +207,52 @@ class TrayIconProvider:
         self._cache[state] = icon
         return icon
 
+    def command_icon(self, state: TrayState) -> QIcon:
+        """Метка реплики отличает команду формой, сохраняя цвет статуса.
+
+        Верхние три точки исходного знака остаются нетронутыми. Небольшая
+        реплика в нижнем правом углу перекрывает только край нижней полосы;
+        её контур имеет тот же цвет, что знак на текущей панели.
+        """
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen
+
+        if state in self._command_cache:
+            return self._command_cache[state]
+        base = self.icon(state)
+        result = QIcon()
+        if not base.isNull():
+            dark = self._file_icon_dark()
+            foreground = QColor("#eff0f1" if dark else "#232629")
+            background = QColor("#232629" if dark else "#eff0f1")
+            for size in (16, 22):
+                pixmap = base.pixmap(size, size).copy()
+                if pixmap.isNull():
+                    continue
+                ratio = pixmap.devicePixelRatio()
+                pixmap.setDevicePixelRatio(1.0)
+                painter = QPainter(pixmap)
+                painter.setRenderHint(QPainter.Antialiasing)
+                # Геометрия в viewBox 22; размеры 16/22 получают одинаковый знак.
+                painter.scale(pixmap.width() / 22, pixmap.height() / 22)
+                badge = QPainterPath()
+                badge.moveTo(14, 13.5)
+                badge.lineTo(21, 13.5)
+                badge.lineTo(21, 19)
+                badge.lineTo(17.5, 19)
+                badge.lineTo(15.5, 21)
+                badge.lineTo(15.5, 19)
+                badge.lineTo(14, 19)
+                badge.closeSubpath()
+                painter.setPen(QPen(foreground, 1.3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                painter.setBrush(background)
+                painter.drawPath(badge)
+                painter.end()
+                pixmap.setDevicePixelRatio(ratio)
+                result.addPixmap(pixmap)
+        self._command_cache[state] = result
+        return result
+
     def has_icon(self, state: TrayState) -> bool:
         """Есть ли непустой значок; неудачная загрузка тоже кэшируется до refresh()."""
         return not self.icon(state).isNull()
@@ -216,3 +263,4 @@ class TrayIconProvider:
     def refresh(self) -> None:
         """Сбросить иконки, чтобы следующий запрос учитывал новую тему панели."""
         self._cache.clear()
+        self._command_cache.clear()

@@ -334,6 +334,10 @@ class Tray(QObject):
         self.on_open: Callable[[], None] | None = None
         self.on_settings: Callable[[], None] | None = None
         self.on_copy_last: Callable[[], None] | None = None
+        self.on_command_details: Callable[[], None] | None = None
+        self.on_launch_cowork: Callable[[], None] | None = None
+        self._command_status = ""
+        self._command_mode = False
         self.on_check_updates: Callable[[], None] | None = None
         self.on_model_recheck: Callable[[], None] | None = None
         self.on_about: Callable[[], None] | None = None
@@ -398,6 +402,13 @@ class Tray(QObject):
         self._copy_action = self._add_action(
             "Скопировать последний текст", lambda: self._invoke(self.on_copy_last)
         )
+        self._command_details_action = self._add_action(
+            "Что случилось с командой", lambda: self._invoke(self.on_command_details)
+        )
+        self._command_launch_action = self._add_action(
+            "Запустить Astra Cowork", lambda: self._invoke(self.on_launch_cowork)
+        )
+        self.set_command_feedback("")
         self._menu.addSeparator()
         settings = self._add_action("Настройки…", lambda: self._invoke(self.on_settings))
         settings.setShortcut("Ctrl+,")
@@ -431,9 +442,15 @@ class Tray(QObject):
     def set_state(self, state: TrayState, tooltip: str | None = None) -> None:
         self._done_timer.stop()
         self._state = state
+        self._command_status = (
+            tooltip
+            if tooltip
+            in ("Слушаю команду", "Слушаю команду…", "Отправляю помощнику…", "Передано помощнику")
+            else ""
+        )
         has_icon = self._has_icon()
         if has_icon:
-            self._tray.setIcon(self._provider.icon(state))
+            self._tray.setIcon(self._display_icon())
         else:
             self._invalidate_registration()
         self._update_tooltip(tooltip)
@@ -445,6 +462,40 @@ class Tray(QObject):
                 self._begin_retry()
             if has_icon:
                 self._try_register()
+
+    def _display_icon(self) -> Any:
+        if self._command_mode:
+            return self._provider.command_icon(self._state)
+        return self._provider.icon(self._state)
+
+    def set_command_mode(self, active: bool) -> None:
+        """Роль принадлежит runtime и сохраняется до новой текстовой записи.
+
+        Её смена не меняет статус записи, состояние последнего текста или меню
+        восстановления. Поэтому обработка, доставка и восстановление не теряют
+        командную метку при переходе базового состояния в IDLE/ERROR.
+        """
+        active = bool(active)
+        if active == self._command_mode:
+            return
+        self._command_mode = active
+        if self._has_icon():
+            self._tray.setIcon(self._display_icon())
+        else:
+            self._invalidate_registration()
+
+    def set_command_feedback(self, text: str, *, can_launch: bool = False) -> None:
+        """Действия восстановления доступны даже без службы уведомлений."""
+        self._menu.removeAction(self._command_details_action)
+        self._menu.removeAction(self._command_launch_action)
+        self._command_details_action.setVisible(bool(text))
+        self._command_launch_action.setVisible(bool(text) and can_launch)
+        if text:
+            actions = self._menu.actions()
+            after_copy = actions[actions.index(self._copy_action) + 1]
+            self._menu.insertAction(after_copy, self._command_details_action)
+            if can_launch:
+                self._menu.insertAction(after_copy, self._command_launch_action)
 
     def set_download_status(self, text: str) -> None:
         """Показывает прогресс сразу под состоянием, пока есть текст загрузки."""
@@ -472,7 +523,8 @@ class Tray(QObject):
 
     def _update_menu(self) -> None:
         self._status_action.setText(
-            {
+            self._command_status
+            or {
                 TrayState.LISTENING: "Слушаю…",
                 TrayState.PROCESSING: "Распознаю…",
                 TrayState.ERROR: "Микрофон недоступен",
@@ -554,7 +606,11 @@ class Tray(QObject):
         )
 
     def _has_icon(self) -> bool:
-        if self._provider.has_icon(self._state):
+        if (
+            not self._display_icon().isNull()
+            if self._command_mode
+            else self._provider.has_icon(self._state)
+        ):
             return True
         _logger.warning(
             "Пустой значок трея для состояния %s; регистрация отложена", self._state.value
@@ -725,7 +781,7 @@ class Tray(QObject):
             self._invalidate_registration()
         else:
             # После refresh() провайдера прежняя иконка могла остаться пустой.
-            self._tray.setIcon(self._provider.icon(self._state))
+            self._tray.setIcon(self._display_icon())
             self._tray.show()
             self._registered = bool(self._tray.isVisible())
             if self._registered:

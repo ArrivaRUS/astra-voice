@@ -1,0 +1,28 @@
+{
+  "base_head": "a23095f264beaa87a2ffe3d42954fb3541152001",
+  "tracked_production_diff_sha256": "95003e836a868ed3ce65ee5b775519174d8a2c90eb924ca649e46f1ba4474bbd",
+  "new_production": {
+    "src/astra_voice/platform/cowork.py": "de667c642efe0b57242aa68e97f65967b21c911bcc90ac92865c1eb9e9c4d2ac",
+    "src/astra_voice/platform/session_state.py": "e2f044d434353739478cf328ddfa389195611db2cca177987a83dc383300380c",
+    "src/astra_voice/core/command_mode.py": "6a16c14e674a728bbb32e2b6676c5686a8dae33bdbe7075ec5b158fd687c2645"
+  },
+  "acceptance_files": {
+    "tests/command_acceptance/README.md": "9e276e1e0243580fe00d40743c3a925194025b80ab50649e02980e3ba78638f1",
+    "tests/command_acceptance/__init__.py": "8f2afc79f570f1f0719849da14e18c53d24b5a97ede879bb296d92949a7922ee",
+    "tests/command_acceptance/bus_scenarios.py": "348d06449a70cc0a23215452462bbcacf1b700873c1b96ef093c59ce1a226351",
+    "tests/command_acceptance/conftest.py": "36d37869bbbad70047c9f7df23fe4ded78093fa1f47e2f055f93128c8c7064fc",
+    "tests/command_acceptance/fake_login1.py": "0b063de841af2533ee4d0b813a7a665a445c4abb67929fb049b2fb9f7eab0a94",
+    "tests/command_acceptance/fake_server.py": "83596280adda8e5cdf846d430c4c541c3deeb1a2a64a52cc42baf69a07429bfe",
+    "tests/command_acceptance/login1_scenario.py": "63504d9f99e53e1e7bedd90edcfd37582dd860280df82a44daedb7320aa8d0a3",
+    "tests/command_acceptance/test_login1_wire.py": "f8321a0debe69659b593663e38b13b36d7a24ca8508b39ade42a335adf637782",
+    "tests/command_acceptance/test_model_trust.py": "ca1aa46e7606266c8348f2c8000db94c0fa3e04eb5f4ac2444fc77f2a5de5429",
+    "tests/command_acceptance/test_orchestration.py": "ec65e26ab4bee80f7da676c7ca6afaeee7da5fb838cb5f84200da863d0997279",
+    "tests/command_acceptance/test_payload.py": "8cd7147e82fba7567f4947fbcd27279b6c07537bb77cdc56d82c588c6f3a3658",
+    "tests/command_acceptance/test_private_bus.py": "c767159a099d6215162fbc2c40e5bdfe414ba731aff9b50592761c8e0e67a73f",
+    "tests/command_acceptance/test_publication.py": "5e93af775b87db9862351244d83d7eabf2d3b7cc14fc62c6e69b97f52b474126",
+    "tests/command_acceptance/test_runtime_routing.py": "a44efd3b9c6336bf52fb2b86695c21ea51e331a3c3651463247160c20508c3fc",
+    "tests/command_acceptance/test_session_cache.py": "54cae016a7cc0d0c291106271203cc2798ae09405f06d5f93ee3818e42ba2bd0"
+  },
+  "acceptance_manifest_sha256": "4d9ed2a018c7498e835af66f059219f6c83752d88f4007472f50254852aa4679",
+  "result": "150 passed in 7.14s; ruff check/format PASS; MYPYPATH=src mypy acceptance PASS"
+}

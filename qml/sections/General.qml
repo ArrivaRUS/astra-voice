@@ -27,6 +27,7 @@ Column {
         if (root.settings) {
             root.settings.refreshDevices()
             root.settings.refreshMicrophone()
+            root.settings.refreshCommandStatus()
         }
     }
     Component.onDestruction: {
@@ -164,7 +165,7 @@ Column {
             visible: state7 !== "idle"
             height: visible ? implicitHeight : 0
             showIdleRow: false
-            state7: root.settings ? root.settings.captureState : "idle"
+            state7: root.settings && root.settings.captureRole === "text" ? root.settings.captureState : "idle"
             hotkey: root.settings ? root.settings.hotkey : qsTr("Ctrl + Space")
             captureMessage: root.settings ? root.settings.captureMessage : ""
             pendingCombo: root.settings ? root.settings.pendingCombo : ""
@@ -380,6 +381,35 @@ Column {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    SettingGroup {
+        width: root.width
+        title: qsTr("Команда помощнику")
+
+        CommandHotkeySettings { bridge: root.settings }
+        SettingRow {
+            width: parent.width
+            label: qsTr("Голосовые команды")
+            sub: qsTr("Передавать команды в Astra Cowork")
+            AvToggle {
+                id: commandEnabledToggle
+                enabled: root.settings ? root.settings.commandInstalled : false
+                Binding { target: commandEnabledToggle; property: "checked"; value: root.settings ? root.settings.commandEnabled : true }
+                onToggled: if (root.settings) root.settings.commandEnabled = checked
+            }
+        }
+        SettingRow {
+            width: parent.width
+            label: qsTr("Показывать команду перед отправкой")
+            sub: qsTr("Три секунды для отмены. Esc — не отправлять")
+            AvToggle {
+                id: commandPreviewToggle
+                enabled: root.settings ? root.settings.commandInstalled : false
+                Binding { target: commandPreviewToggle; property: "checked"; value: root.settings ? root.settings.commandPreview : false }
+                onToggled: if (root.settings) root.settings.commandPreview = checked
             }
         }
     }

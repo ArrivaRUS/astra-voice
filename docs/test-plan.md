@@ -5,6 +5,30 @@
 > Статусы: `[ ]` не прогонялся · `[~]` частично · `[x]` зелёный (дата, сессия).
 > «CI 27.09» — прогон `36344334416` на `3663d69` (код сборки `0.1.0~m6.22`): все 6 задач зелёные (инварианты workflow, ruff+mypy, unit, engine, xvfb, сборка .deb и гейты). Отметка по автотесту значит: тест найден в `tests/` по номеру строки или по содержанию и зелёный в этом прогоне. `[~]` у автотеста — тест покрывает строку не целиком (что не сверено — написано в статусе).
 
+## S18 · проверка клиента Command1, 2026-10-07
+
+Автоматизированный набор новой рабочей ветки отделён от исторической приёмки:
+
+| Группа | Проверка | Доказательство |
+| --- | --- | --- |
+| Транспорт | нормализация/типы, 300 мс вместе с очередью, одна попытка, late reply, отсутствие активации | `tests/command_acceptance/test_payload.py`, `test_private_bus.py` |
+| Допуск | lock/unknown/sleep, login1 wire types, текущая проверенная модель хранилища | `test_session_cache.py`, `test_login1_wire.py`, `test_model_trust.py` |
+| Доставка | отсутствие вставки/active_window, три исхода, stats/recovery, отдельный маршрут текста | `test_orchestration.py`, `test_publication.py`, `test_runtime_routing.py` |
+| Интерфейс | неверная сохранённая клавиша, разные роли, preview Send/Cancel, состояния пилюли | `tests/unit/test_command_ui_settings.py`, `tests/xvfb/test_command_ui_qml.py` |
+| Runtime | отложенное подключение notifier, hardware Escape, gate terminal errors/notifications | `tests/unit/test_command_runtime.py`, `test_command_notifications.py` |
+| Межпроектная шина | настоящий Qt5 CoworkClient ↔ Qt6 CommandService, accepted/disabled/locked/absent | Cowork `tests/integration/test_voice_command1_smoke.py`: 4 PASS, фиктивный sink |
+
+Первый независимый прогон acceptance: 150 PASS; snapshot той ревизии сохранён
+в `tests/command_acceptance/snapshot.json`. Финальные результаты после ревью
+сверять с актуальным HEARTBEAT/отчётом, не переносить автоматически со старого diff.
+Частные AF_UNIX шины могут требовать разрешённого запуска вне sandbox; системная
+и пользовательская шины в этих тестах не используются.
+
+Открыты реальные S7/K5: короткий Win/меню и системные сочетания KDE/Fly,
+восстановление захватов после краха/зависания, аппаратные блокировка/сон,
+микрофон/ASR, история буфера, 20 команд и проверка журналов установленных программ.
+Offscreen QML, подменный login1 и fake X11 backend их не заменяют.
+
 ## Test levels
 | Уровень | Среда | Маркер / команда | Что покрывает |
 | --- | --- | --- | --- |

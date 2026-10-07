@@ -1,5 +1,56 @@
 # HEARTBEAT — где мы сейчас
 
+## Сохранено перед перезагрузкой · 2026-10-07
+
+- Владелец: «мне надо перезагрузить ноут. сохрани все работы». Работа и проверки
+  остановлены; перезагрузку выполняет пользователь. Установленная dev5 не менялась.
+- Ветка `codex/cowork-command`, worktree `/home/astra/Документы/Astra Cowork/worktrees/voice-command`.
+  Вся реализация, тесты и документы сохраняются локальным WIP-коммитом.
+  Публикация этой Voice-ветки ещё не согласована; PR для неё не создан.
+- **Сначала при продолжении:** исправить подтверждённый reviewer P2:
+  `runtime.py` обработчик `_on_command_hotkey_state`, `mapping-regrab:busy`
+  при разных signatures оставляет PTT recording: `_lost=True`, `_keycode=None`,
+  отпускание Win теряется, запись продолжается до120с. Нужен stop/cancel и retry
+  аналогично текстовому режиму + regression. Код в этой остановке не исправлялся.
+- Остальные review findings закрыты; T2 trust/session/notification — без открытых
+  находок на snapshot отчёта `docs/security/T2-2026-10-07-command-client.md`.
+  Runtime SHA256 `2771d1847da40ded2b3b4b7d531f18aa8cbad3f15826d5f52799e56c89f616a1`.
+- Проверки: make lint PASS266; V6 XML+191 tests PASS; targeted1220PASS1skip;
+  runtime441PASS; UI1559PASS1skip, badge349PASS; native Qt5↔Qt6 smoke4PASS.
+  Первый полный unit8106PASS10skip9fail; причины исправлены. Финальный полный
+  unit прерван по просьбе владельца:3472PASS9skip458deselected, exit130; **полного PASS ещё нет**, повторить.
+- Native S7/K5 (меню Win, ранние Win-сочетания, KDE/Fly, микрофон/буфер) открыты.
+  Passive grab без replay ещё не выполняет ранние системные Win-сочетания целиком.
+  Не устанавливать/принимать F17 по текущим автотестам.
+- Cowork PDF готов в GitHub: `65fa15e`, draft https://github.com/ArrivaRUS/astra-cowork/pull/79.
+  CI Cowork отключён вручную; локальные744 + roundtrip6 + wire4 PASS.
+  Только синтетика по выбору владельца; OnlyOffice и независимый T2 #74 открыты.
+- Отчёт/точка продолжения: `docs/reports/2026-10-07-command-checkpoint.md`.
+  Локальные логи сохранены в `dist/command-check-2026-10-07/` (gitignored).
+
+
+## Рабочая ветка Command1 · 2026-10-07
+
+- Владелец поручил в первую очередь реализовать Voice → Cowork вместе с PDF → PPTX
+  в проекте Cowork. Ветка `codex/cowork-command`, worktree `voice-command`, база
+  `a23095f`. Это отдельное поручение от прежних пунктов 1/2/3 по libpulse ниже.
+- Реализованы клиент Command1 (Qt5, 300 мс, одна отправка), контроль состояния
+  сеанса и текущей модели, отдельная клавиша команды, DELIVERING без вставки,
+  предпросмотр 3 с (по умолчанию выключен), recovery/статистика и интерфейс.
+- Профили Codex: developer_complex Astra/high, UI developer Sol6.1/high,
+  независимые tester Sol6.1/high, code_reviewer Astra/high, security_analyst
+  Astra/high. Первые 150 acceptance PASS; найденные ревью гонки исправляются,
+  итоговый проверенный commit/диф и финальные команды — в отчёте после завершения.
+- Native межпроектный smoke Qt5 Voice ↔ Qt6 Cowork: 4 PASS (accepted,
+  policy_disabled, locked, absent), частная шина и фиктивный исполнитель.
+  В Cowork опубликован черновой PR #79; Voice пока в локальной рабочей ветке.
+- S7/K5 на настоящих KDE/Fly, микрофоне и installed dev5 не выполнены. Fly command
+  закрыт до подтверждения источника состояния сеанса. Полную приёмку F17 и выпуск
+  по unit/privatebus/offscreen не заявлять. Установка этой ветки не выполнялась.
+- Параллельная работа AppImage/PR #42 находится в другом worktree. Её исходники,
+  установленная dev5, пользовательские настройки и службы не изменялись.
+
+
 ## Актуальное состояние · 2026-10-07
 
 - Владелец поручил продолжить пункты 1/2/3. Пункты 1/2 завершены ранее (PR #39 слит); активен пункт 3, PR #41. AppImage вне текущего поручения.

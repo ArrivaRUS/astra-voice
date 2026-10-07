@@ -69,10 +69,18 @@ class PillState(Enum):
     CANCELLED = "cancelled"
     ERROR = "error"
     DISABLED = "disabled"
+    COMMAND_LISTENING = "command-listening"
+    COMMAND_DELIVERING = "command-delivering"
+    COMMAND_DONE = "command-done"
+    COMMAND_FAILED = "command-failed"
+    COMMAND_UNKNOWN = "command-unknown"
 
 
 STATE_DURATION_MS: dict[PillState, int] = {
     PillState.DONE: 500,
+    PillState.COMMAND_DONE: 800,
+    PillState.COMMAND_FAILED: 3000,
+    PillState.COMMAND_UNKNOWN: 3000,
     PillState.CLIPBOARD_ONLY: 1200,
     PillState.EMPTY: 1000,
     PillState.CANCELLED: 800,
@@ -81,7 +89,25 @@ STATE_DURATION_MS: dict[PillState, int] = {
     PillState.LOADING_MODEL: 10000,
 }
 
-_LISTENING_STATES = (PillState.LISTENING, PillState.LISTENING_SILENT)
+COMMAND_FAILED_TEXTS: Final = frozenset(
+    (
+        "Помощник недоступен — текст в буфере",
+        "Помощник недоступен — не удалось скопировать текст",
+        "Команда помощнику недоступна для модели, заданной вручную",
+    )
+)
+COMMAND_UNKNOWN_TEXTS: Final = frozenset(
+    (
+        "Не удалось узнать, принята ли команда — текст в буфере",
+        "Не удалось узнать, принята ли команда — не удалось скопировать текст",
+    )
+)
+_COMMAND_LABEL_STATES = (PillState.COMMAND_FAILED, PillState.COMMAND_UNKNOWN)
+_LISTENING_STATES = (
+    PillState.LISTENING,
+    PillState.LISTENING_SILENT,
+    PillState.COMMAND_LISTENING,
+)
 _INVISIBLE_STATES = (PillState.HIDDEN, PillState.DISABLED)
 _HISTORY_SIZE = 9
 # §8.2: тень 0 6px 18px; QML рисует её за границами корневого Item.
@@ -119,6 +145,7 @@ class Pill(QObject):
         super().__init__(parent)
         self.on_cancel_clicked: Callable[[], None] | None = None
         self.on_details_clicked: Callable[[], None] | None = None
+        self.on_copy_clicked: Callable[[], None] | None = None
         self._session = session
         self._enabled = True
         self._forced = False
@@ -167,6 +194,9 @@ class Pill(QObject):
             raise RuntimeError("Не удалось загрузить QML пилюли")
         self._root.cancelClicked.connect(self._cancel_clicked)
         self._root.detailsClicked.connect(self._details_clicked)
+        copy_signal = getattr(self._root, "copyClicked", None)
+        if copy_signal is not None:
+            copy_signal.connect(self._copy_clicked)
         self._root.setProperty("x", _SHADOW_MARGIN)
         self._root.setProperty("y", _SHADOW_MARGIN)
         # Запасной путь для изменений контента/экрана вне show_state. Каждый show()
@@ -198,6 +228,14 @@ class Pill(QObject):
             elif text is not None:
                 # Чужая строка не должна попасть ни в QML, ни в журнал.
                 log.warning("Пилюля: причина вне реестра")
+        if state in _COMMAND_LABEL_STATES and text is not None:
+            allowed = (
+                COMMAND_FAILED_TEXTS if state is PillState.COMMAND_FAILED else COMMAND_UNKNOWN_TEXTS
+            )
+            if text in allowed:
+                self._label = text
+            else:
+                log.warning("Пилюля: причина команды вне реестра")
         if state not in _LISTENING_STATES:
             self._clear_levels()
         elif level is not None:
@@ -265,7 +303,10 @@ class Pill(QObject):
         log.debug("Пилюля: %s", state.name)
         # Обе подписи очищаются и при скрытии, и при пользовательском выключении.
         self._root.setProperty(
-            "label", self._label if state in (PillState.ERROR, PillState.CLIPBOARD_ONLY) else ""
+            "label",
+            self._label
+            if state in (PillState.ERROR, PillState.CLIPBOARD_ONLY, *_COMMAND_LABEL_STATES)
+            else "",
         )
         self._root.setProperty("levels", list(self._levels))
         self._root.setProperty("avState", state.value)
@@ -645,6 +686,10 @@ class Pill(QObject):
     def _cancel_clicked(self) -> None:
         if self.on_cancel_clicked is not None:
             self.on_cancel_clicked()
+
+    def _copy_clicked(self) -> None:
+        if self._state in _COMMAND_LABEL_STATES and self.on_copy_clicked is not None:
+            self.on_copy_clicked()
 
     def _details_clicked(self) -> None:
         if self.on_details_clicked is not None:

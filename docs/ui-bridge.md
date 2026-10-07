@@ -1285,3 +1285,38 @@ AppImage (`$APPDIR`) — задача ветки AppImage. Без моста р�
 6. **Цвета — только из `Theme`.** Шестнадцатеричные литералы и `Qt.rgba(...)` в
    файлах интерфейса запрещены тестом: страница обязана одинаково выглядеть в
    светлой и тёмной теме.
+
+
+## Команды Astra Cowork (Command1, документ 1.7)
+
+`SettingsBridge` хранит пользовательские `commandHotkey` (по умолчанию `Super_L`),
+`commandEnabled` (включено) и `commandPreview` (выключено). Ключ политики
+`command_hotkey` отменён; запрет администратора приходит от Astra Cowork.
+`commandInstalled` показывает наличие артефактов установки, `commandAvailable` —
+готовность передачи; `commandStatus` — фиксированное объяснение готовности.
+`refreshCommandStatus()` запускает явную проверку, без фонового опроса в простое.
+
+`captureRole` (`text` / `command`) принадлежит общей машине назначения клавиш.
+`beginCommandCapture()` выбирает командную роль; `endCapture(combo)`,
+`cancelCapture()`, `keepCombo()` и `refreshCandidates()` работают с этой ролью.
+`useCommandWin()` выбирает левую Win. Одиночная правая Win (`Super_R`) также
+допустима. Коллизии ролей проверяются по реальному keycode и modifiers текущей
+карты X11, а не написанию сочетания. Захвата всей клавиатуры при записи нет.
+
+`OnboardingController` проксирует `commandHotkey`, `commandInstalled`,
+`commandStatus`, `captureRole`, `beginCommandCapture()`, `refreshCommandStatus()`
+и `useCommandWin()`. При отсутствии Cowork командной строки в мастере нет;
+в «Общих» видна причина и «Проверить снова».
+
+`commandFeedbackText` и `commandDetail` содержат только фиксированные объяснения
+исходов; распознанная речь в них не входит. `showCommandDetails()` испускает
+`commandDetailsRequested` для диалога «Что случилось»; при заблокированном или
+неизвестном состоянии сеанса подробности скрываются.
+
+Только при явно включённом предпросмотре runtime публикует `commandPreviewText`
+через `commandPreviewTextChanged`. После фактического открытия диалога
+`commandPreviewShown()` запускает трёхсекундное окно отмены. `confirmCommand()`
+отправляет раньше срока, `rejectCommand()` отменяет и очищает текст.
+Блокировка, сон и скрытие/сворачивание окна очищают предпросмотр; после
+пробуждения он не восстанавливается. Пилюля принимает только фиксированные
+строки; действия копирования и подробностей доступны также через трей.

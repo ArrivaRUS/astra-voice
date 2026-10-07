@@ -215,7 +215,17 @@ class X11Display:
                 "super": X.Mod4Mask,
                 "win": X.Mod4Mask,
             }
-            key_aliases = {"space": "space", "esc": "Escape", "escape": "Escape"}
+            key_aliases = {
+                "space": "space",
+                "esc": "Escape",
+                "escape": "Escape",
+                "super_l": "Super_L",
+                "super_r": "Super_R",
+            }
+            # Одиночная Win — основная клавиша с mods=0. Пассивный GrabKey
+            # заканчивается после её отпускания; XGrabKeyboard при записи нет.
+            if combo.strip().lower() in ("win", "super"):
+                combo = "Super_L"
             mods = 0
             key: str | None = None
             for part in combo.split("+"):

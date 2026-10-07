@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import logging
 import math
+import os
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -16,6 +17,7 @@ from PyQt5.QtCore import QCoreApplication, QEventLoop, QObject, QSocketNotifier,
 
 from astra_voice.core import paths
 from astra_voice.core.capture_watchdog import CaptureFieldWatchdog
+from astra_voice.core.command_mode import CommandFeedback, CommandMode, SessionSnapshot
 from astra_voice.core.dictation import (
     LEVEL_FAILED,
     TEST_BUSY,
@@ -40,6 +42,12 @@ from astra_voice.core.model_source import (
 )
 from astra_voice.core.settings import Settings, is_valid_combo
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
+from astra_voice.platform.cowork import (
+    CoworkClient,
+    is_installed,
+    launcher_arguments,
+    resolve_bus_address,
+)
 from astra_voice.platform.hotkey import (
     DEFAULT_CANDIDATES,
     MAPPING_REGRAB_PREFIX,
@@ -57,6 +65,7 @@ from astra_voice.platform.paste import (
     restore_pending,
 )
 from astra_voice.platform.session import SessionKind
+from astra_voice.platform.session_state import SessionMonitor
 from astra_voice.platform.sound import MicrophoneProblem, MicrophoneState, SoundControl
 from astra_voice.platform.x11 import X11Display
 from astra_voice.ui import notify
@@ -161,6 +170,29 @@ class DictationRuntime(QObject):
         ),
     ) -> None:
         super().__init__(parent)
+        self.command_installed = is_installed()
+        self.command_available = self.command_installed
+        self.command_status = (
+            "Astra Cowork найден · не запущен"
+            if self.command_installed
+            else "Astra Cowork не установлен"
+        )
+        self.command_feedback: CommandFeedback | None = None
+        self.on_command_changed: Callable[[], None] | None = None
+        self.on_command_preview: Callable[[str], None] | None = None
+        self.command_hotkey: HotkeyManager | None = None
+        self._command_client: CoworkClient | None = None
+        self._command_session: SessionMonitor | None = None
+        self._command_mode: CommandMode | None = None
+        self._command_notifier: QSocketNotifier | None = None
+        self._command_handlers_registered = False
+        self._command_owner = False
+        self._command_suspended = False
+        self._command_capture_model: tuple[int, object] | None = None
+        self._command_capture_epoch = 0
+        self._preview_send: Callable[[], None] | None = None
+        self._preview_timer: QTimer | None = None
+        self._command_hotkey_factory = hotkey_factory
         self.settings = settings
         self.model_store = model_store
         self.session_kind = session_kind
@@ -264,9 +296,9 @@ class DictationRuntime(QObject):
                 active_window=self.x11.target_window,
                 schedule=self.schedule,
                 cancel_timer=self.cancel_timer,
-                hotkey_done=lambda: self.hotkey.fsm.done(monotonic()),
-                hotkey_cancel=lambda: self.hotkey.fsm.escape(monotonic()),
-                hotkey_idle=lambda: self.hotkey.fsm.state is HotkeyState.IDLE,
+                hotkey_done=lambda: self._active_hotkey().fsm.done(monotonic()),
+                hotkey_cancel=lambda: self._active_hotkey().fsm.escape(monotonic()),
+                hotkey_idle=lambda: self._active_hotkey().fsm.state is HotkeyState.IDLE,
                 set_recording=self.guard.set_recording,
                 paste_mode=self.paste_mode,
                 record_params=self.record_params,
@@ -296,6 +328,403 @@ class DictationRuntime(QObject):
             for step, action in reversed(rollback):
                 self._cleanup(step, action)
             raise
+
+    def _command_publication_allowed(self) -> bool:
+        return self.orchestrator.mode != "command" or (
+            self._command_snapshot().allowed
+            and self._command_snapshot().blocked_epoch == self._command_capture_epoch
+        )
+
+    def _active_hotkey(self) -> HotkeyManager:
+        if self.orchestrator.mode == "command" and self.command_hotkey is not None:
+            return self.command_hotkey
+        return self.hotkey
+
+    def start_command_mode(self) -> None:
+        """Explicit app boundary: read-only buses and passive command-key registration."""
+        if self._closed or not self.command_installed or self._command_client is not None:
+            return
+        self._command_client = CoworkClient(self)
+        self._command_session = SessionMonitor(self)
+        self._command_mode = CommandMode(
+            client=self._command_client,
+            session=self._command_snapshot,
+            model_trusted=self._command_model_trusted,
+            publish=lambda text: publish_clipboard(text, session_kind=self.session_kind),
+            present=self._present_command,
+        )
+        self.orchestrator.command_mode = self._command_mode
+        self.orchestrator._command_preview = self._preview_command
+        self._command_client.set_admission_guard(
+            lambda: (
+                self.settings.command_enabled
+                and self._command_snapshot().allowed
+                and self._command_snapshot().blocked_epoch == self._command_capture_epoch
+            )
+        )
+        self._command_client.set_model_guard(self._command_model_trusted)
+        self._command_client.owner_changed.connect(self._command_owner_changed)
+        self._command_client.status_changed.connect(self._command_status_changed)
+        self._command_session.changed.connect(self._command_session_changed)
+        self.command_hotkey = self._command_hotkey_factory()
+        self.command_hotkey.on_state = self._on_command_hotkey_state
+        self.tray.on_command_details = self.show_command_details
+        self.tray.on_launch_cowork = self.launch_cowork
+        notify.set_command_guard(
+            lambda: not self._closed and self._command_snapshot().allowed,
+            epoch=lambda: self._command_snapshot().blocked_epoch,
+        )
+        self._command_handlers_registered = True
+        notify.set_action_handler("command-copy", self._recover_command)
+        notify.set_action_handler("command-details", self.show_command_details)
+        notify.set_action_handler("command-launch", self.launch_cowork)
+        self._command_client.start()
+        self._command_session.start()
+        # Unknown startup state keeps command key ungrabbed until login1 is verified.
+        self.reload_command_hotkey()
+
+    def _command_snapshot(self) -> SessionSnapshot:
+        if self._command_session is None or self.session_kind != SessionKind.KDE:
+            return SessionSnapshot()
+        return self._command_session.snapshot()
+
+    def _command_owner_changed(self, present: bool) -> None:
+        self._command_owner = present
+        self.command_status = (
+            "Astra Cowork найден · доступен" if present else "Astra Cowork найден · не запущен"
+        )
+        self._command_changed()
+
+    def _command_changed(self) -> None:
+        if self.on_command_changed is not None:
+            self.on_command_changed()
+
+    def refresh_command_status(self) -> None:
+        self.command_installed = is_installed()
+        self.command_available = self.command_installed and self.session_kind == SessionKind.KDE
+        if self.command_installed:
+            self.start_command_mode()
+        else:
+            self.command_status = "Astra Cowork не установлен"
+        self._command_changed()
+        if self._command_client is not None:
+            self._command_client.status()
+
+    def _command_status_changed(self, status: object) -> None:
+        if isinstance(status, dict):
+            state = status.get("state")
+            if status.get("state_reason") == "session_unsupported":
+                self.command_status = "Во Fly приём голосовых команд пока не поддерживается"
+            elif state == "disabled":
+                self.command_status = "Приём голосовых команд выключен в Astra Cowork"
+            elif state == "ready":
+                self.command_status = "Astra Cowork найден · доступен"
+            elif state == "locked":
+                self.command_status = "Экран заблокирован или состояние блокировки неизвестно"
+            else:
+                self.command_status = "Помощник ещё не готов принимать команды"
+        else:
+            self.command_status = (
+                "Помощник не поддерживает голосовые команды — обновите Astra Cowork"
+                if self._command_owner
+                else "Astra Cowork найден · не запущен"
+            )
+        self._command_changed()
+
+    def _command_session_changed(self, transition: SessionSnapshot | None = None) -> None:
+        snapshot = (
+            transition
+            if transition is not None
+            else (self._command_session.snapshot() if self._command_session else SessionSnapshot())
+        )
+        if not snapshot.allowed or not self._command_snapshot().allowed:
+            self.reject_command()
+            self.end_hotkey_capture()
+            self.orchestrator.command_session_changed(snapshot)
+            if self.command_hotkey is not None:
+                self.command_hotkey.ungrab()
+            if (
+                snapshot.preparing_for_sleep
+                or snapshot.lock_requested
+                or (snapshot.known and snapshot.locked)
+            ):
+                self._command_suspended = True
+                # Lock must never contend with another passive/capture grab.
+                self.hotkey.ungrab()
+                self.pill.hide()
+        else:
+            self.reload_command_hotkey()
+        if self._command_suspended and snapshot.allowed:
+            self._command_suspended = False
+            self._grab_hotkey()
+        self._command_changed()
+
+    def check_command_hotkey(self, combo: str) -> str:
+        manager = self.command_hotkey
+        if manager is None:
+            return "not-grabbed"
+        signature = manager.signature(combo)
+        if signature is None:
+            return "not-grabbed"
+        if signature == self.hotkey.signature(self.settings.hotkey):
+            return "duplicate"
+        if signature == manager.signature(self.settings.command_hotkey):
+            return "ok"
+        return manager.probe(combo).code
+
+    def reload_command_hotkey(self) -> bool:
+        manager = self.command_hotkey
+        if manager is None:
+            return False
+        manager.ungrab()
+        if not self.settings.command_hotkey:
+            self.command_status = "Клавиша команды не распознана — выберите заново"
+            self.reject_command()
+            self._command_changed()
+            return False
+        if not self.settings.command_enabled:
+            self.reject_command()
+            return False
+        if not self._command_snapshot().allowed:
+            return False
+        command_signature = manager.signature(self.settings.command_hotkey)
+        text_signature = self.hotkey.signature(self.settings.hotkey)
+        if command_signature is None or command_signature == text_signature:
+            self.command_status = (
+                "Клавиша команды совпадает с клавишей «Текст» — выберите другую"
+                if command_signature is not None
+                else "Клавиша команды не распознана — выберите заново"
+            )
+            self._command_changed()
+            return False
+        manager.defer_single_super = True
+        manager.on_deferred_press = lambda: QTimer.singleShot(300, manager.tick)
+        result = manager.grab(self.settings.command_hotkey, HotkeyMode(self.settings.hotkey_mode))
+        # X11 backend is lazy: the fd may only exist after the first allowed grab.
+        # Initial login1 state is unknown, so startup cannot install this observer.
+        fd = manager.fileno()
+        if fd >= 0 and self._command_notifier is None:
+            self._command_notifier = self._create_notifier(fd)
+            self._command_notifier.activated.connect(self._process_command_hotkey)
+        if not result.ok:
+            self.command_status = "Клавиша команды занята — выберите другую"
+        self._command_changed()
+        return result.ok
+
+    def _validate_command_mapping(self) -> bool:
+        manager = self.command_hotkey
+        if manager is None:
+            return True
+        command = manager.signature(self.settings.command_hotkey)
+        text = self.hotkey.signature(self.settings.hotkey)
+        if command is None or text is None or command == text:
+            manager.ungrab()
+            self.command_status = (
+                "Клавиша команды недоступна после смены раскладки — выберите заново"
+            )
+            self._command_changed()
+            return False
+        return True
+
+    def _process_command_hotkey(self, *args: object) -> None:
+        if not self._closed and self.command_hotkey is not None:
+            self.command_hotkey.process_pending()
+
+    def _on_command_hotkey_state(self, state: HotkeyState, reason: str) -> None:
+        manager = self.command_hotkey
+        if self._closed or manager is None:
+            return
+        if reason.startswith(MAPPING_REGRAB_PREFIX) and not self._validate_command_mapping():
+            return
+        if (
+            state == HotkeyState.IDLE
+            and reason == "escape-cancel"
+            and self._preview_send is not None
+        ):
+            self.reject_command()
+            return
+        if state == HotkeyState.RECORDING:
+            if (
+                not self._command_snapshot().allowed
+                or self._loading_model
+                or self._selfcheck != "ok"
+                or self._pending_test is not None
+            ):
+                manager.fsm.escape(monotonic())
+                return
+            if self.orchestrator.phase not in (DictationPhase.IDLE, DictationPhase.FINISHING):
+                if self.orchestrator.mode != "command":
+                    manager.fsm.escape(monotonic())
+                return
+            self._command_capture_epoch = self._command_snapshot().blocked_epoch
+            if self._command_mode is not None:
+                self._command_mode.begin()
+            self._command_capture_model = (
+                self.supervisor.generation,
+                dict(self._model_load_request or {}),
+            )
+        if self.orchestrator.mode != "command" and state != HotkeyState.RECORDING:
+            return
+        self.orchestrator.on_hotkey_state(state, reason, mode="command")
+
+    def _command_model_trusted(self) -> bool:
+        # Snapshot scalar identity before file I/O, then verify it again afterwards:
+        # the worker can be replaced or a manual path selected while current() reads.
+        request = dict(self._model_load_request or {})
+        generation = self.supervisor.generation
+        store = self.model_store
+        revoked = self._revoked_check
+
+        def unchanged() -> bool:
+            return bool(
+                request
+                and not getattr(self, "_loading_model", False)
+                and self.settings.to_dict().get("model_dir") is None
+                and self.model_store is store
+                and store is not None
+                and not self.revocation_unknown
+                and self._revoked_check is revoked
+                and self._model_load_request == request
+                and self._model_load_generation == generation
+                and self.supervisor.generation == generation
+                and self._command_capture_model == (generation, request)
+            )
+
+        if not unchanged() or store is None or revoked is None:
+            return False
+        try:
+            record = store.current()
+            if (
+                record is None
+                or record.state != "ok"
+                or record.recheck
+                or not record.metadata_ok
+                or record.id != request.get("id")
+                or record.revision != request.get("revision")
+                or Path(record.dir).resolve() != Path(str(request.get("dir", ""))).resolve()
+            ):
+                return False
+            return not revoked(record.id, record.revision) and unchanged()
+        except Exception:
+            return False
+
+    def _present_command(self, feedback: CommandFeedback) -> None:
+        if not self._command_snapshot().allowed:
+            return
+        self.command_feedback = feedback
+        state = (
+            PillState.COMMAND_DONE
+            if feedback.result.outcome == "delivered"
+            else PillState.COMMAND_UNKNOWN
+            if feedback.result.outcome == "unknown"
+            else PillState.COMMAND_FAILED
+        )
+        if feedback.result.reason == "model_untrusted":
+            if self._command_publication_allowed():
+                self.pill.show_state(
+                    state, text="Команда помощнику недоступна для модели, заданной вручную"
+                )
+        elif feedback.result.outcome == "delivered":
+            if self._command_publication_allowed():
+                self.pill.show_state(state)
+        elif feedback.result.outcome == "unknown":
+            if feedback.copied:
+                if self._command_publication_allowed():
+                    self.pill.show_state(
+                        state, text="Не удалось узнать, принята ли команда — текст в буфере"
+                    )
+            else:
+                if self._command_publication_allowed():
+                    self.pill.show_state(
+                        state,
+                        text="Не удалось узнать, принята ли команда — не удалось скопировать текст",
+                    )
+        elif feedback.copied:
+            if self._command_publication_allowed():
+                self.pill.show_state(state, text="Помощник недоступен — текст в буфере")
+        else:
+            if self._command_publication_allowed():
+                self.pill.show_state(
+                    state, text="Помощник недоступен — не удалось скопировать текст"
+                )
+        can_launch = not self._command_owner and launcher_arguments() is not None
+        self.tray.set_command_feedback(feedback.detail, can_launch=can_launch)
+        # The existing notification service uses Qt's default session connection.
+        # Never let a command fallback trigger libdbus autolaunch on a missing address.
+        if (
+            feedback.result.outcome != "delivered"
+            and os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+            and resolve_bus_address() is not None
+        ):
+            if feedback.result.outcome == "unknown":
+                notify.notify_command_unknown()
+            else:
+                notify.notify_command_failed()
+        self._command_changed()
+
+    def _recover_command(self) -> None:
+        if self._command_mode is not None:
+            self._command_mode.recover()
+
+    def show_command_details(self) -> None:
+        if self._command_snapshot().allowed and self.command_feedback is not None:
+            self._show_requested()
+            self._command_changed()
+
+    def _preview_command(self, text: str, send: Callable[[], None]) -> bool:
+        if not self.settings.command_preview or self.on_command_preview is None:
+            return False
+        if not self._command_snapshot().allowed:
+            return False
+        self._preview_send = send
+        self.on_command_preview(text)
+        return True
+
+    def command_preview_shown(self) -> None:
+        if self._preview_send is None or self._preview_timer is not None:
+            return
+        if not self._command_snapshot().allowed:
+            self.reject_command()
+            return
+        self._preview_timer = self._create_timer()
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self.confirm_command)
+        self._preview_timer.start(3000)
+
+    def _clear_preview(self) -> Callable[[], None] | None:
+        send, self._preview_send = self._preview_send, None
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+            self._preview_timer.deleteLater()
+            self._preview_timer = None
+        if self.on_command_preview is not None:
+            self.on_command_preview("")
+        return send
+
+    def confirm_command(self) -> None:
+        send = self._clear_preview()
+        if send is not None:
+            if self.settings.command_enabled and self._command_snapshot().allowed:
+                send()
+            else:
+                self._finish_command_preview()
+
+    def _finish_command_preview(self) -> None:
+        # Preview was not submitted; retain its phrase but finish without a bus call.
+        self.orchestrator._dictation_stat("cancelled")
+        self.orchestrator._begin_finish()
+        self.orchestrator._end_finish(PillState.CANCELLED, tray=TrayState.IDLE)
+
+    def reject_command(self) -> None:
+        if self._clear_preview() is not None:
+            self._finish_command_preview()
+
+    def launch_cowork(self) -> None:
+        if self._command_owner or not self._command_snapshot().allowed:
+            return
+        from astra_voice.platform.cowork import launch_cowork
+
+        launch_cowork()
 
     def _delete_build_children(self) -> None:
         """Удаляет и те QObject, чьи конструкторы не успели вернуть результат."""
@@ -550,7 +979,8 @@ class DictationRuntime(QObject):
         self._fail_pending_test()
         self.tray.set_model_recheck_enabled(True)
         if self.orchestrator.phase == DictationPhase.IDLE:
-            self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+            if self._command_publication_allowed():
+                self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
         self.tray.set_state(TrayState.ERROR)
 
     def _fail_switch(self, result: str = "failed") -> bool:
@@ -705,7 +1135,8 @@ class DictationRuntime(QObject):
         if self._closed or self._selfcheck != "failed":
             return
         self.hotkey.fsm.escape(monotonic())
-        self.pill.show_state(PillState.LOADING_MODEL)
+        if self._command_publication_allowed():
+            self.pill.show_state(PillState.LOADING_MODEL)
         self.tray.set_state(TrayState.NOKEY if self._regrab_timer else TrayState.IDLE)
         try:
             self.restart_worker()
@@ -750,7 +1181,8 @@ class DictationRuntime(QObject):
             self._finish_selfcheck("load-failed")
             return
         if self.orchestrator.phase == DictationPhase.IDLE:
-            self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_REVOKED)
+            if self._command_publication_allowed():
+                self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_REVOKED)
         self.tray.set_state(TrayState.ERROR)
         if not self._revoked_notified:
             self._revoked_notified = True
@@ -772,7 +1204,8 @@ class DictationRuntime(QObject):
                 return
             self._fail_pending_test()
             log.warning("Загрузка модели остановлена после двух неудачных попыток подряд")
-            self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+            if self._command_publication_allowed():
+                self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
             self.tray.set_state(TrayState.ERROR)
             return
         try:
@@ -804,7 +1237,8 @@ class DictationRuntime(QObject):
                 self._finish_selfcheck("load-failed")
                 return
             log.warning("параметры модели заданы неверно")
-            self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+            if self._command_publication_allowed():
+                self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
             self.tray.set_state(TrayState.ERROR)
             return
         self._loading_model = True
@@ -818,7 +1252,8 @@ class DictationRuntime(QObject):
             self.orchestrator.model_changed()
         self._measurements_changed()
         if self.orchestrator.phase == DictationPhase.IDLE:
-            self.pill.show_state(PillState.LOADING_MODEL)
+            if self._command_publication_allowed():
+                self.pill.show_state(PillState.LOADING_MODEL)
         try:
             self.supervisor.send(request, timeout=10.0)
             if self._switch_paused:
@@ -833,7 +1268,8 @@ class DictationRuntime(QObject):
                 self._finish_selfcheck("load-failed")
                 return
             log.warning("Не удалось отправить запрос загрузки модели")
-            self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+            if self._command_publication_allowed():
+                self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
             self.tray.set_state(TrayState.ERROR)
 
     def _reset_selfcheck(self, *, retry: bool = False) -> None:
@@ -963,7 +1399,8 @@ class DictationRuntime(QObject):
             if reason == "cancelled":
                 return
             self.tray.set_state(TrayState.ERROR)
-            self.pill.show_state(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
+            if self._command_publication_allowed():
+                self.pill.show_state(PillState.ERROR, text=ERROR_SELFCHECK_FAILED)
             if too_slow:
                 # Движок исправен, модель медленная: совет переустановить неверен.
                 pass
@@ -1016,7 +1453,8 @@ class DictationRuntime(QObject):
         ):
             self._loading_model = False
             self._fail_pending_test()
-            self.pill.show_state(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
+            if self._command_publication_allowed():
+                self.pill.show_state(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
             self.tray.set_state(TrayState.ERROR)
             return
         if (
@@ -1089,13 +1527,22 @@ class DictationRuntime(QObject):
                         return
                     log.warning("Не удалось загрузить модель")
                     if self.orchestrator.phase == DictationPhase.IDLE:
-                        self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+                        if self._command_publication_allowed():
+                            self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
                         self.tray.set_state(TrayState.ERROR)
         self.orchestrator.on_worker_event(event)
 
     def _on_hotkey_state(self, state: HotkeyState, reason: str) -> None:
         """Откладывает диктовку, пока воркер загружает модель."""
+        if self.orchestrator.mode == "command" and self.orchestrator.phase not in (
+            DictationPhase.IDLE,
+            DictationPhase.FINISHING,
+        ):
+            if state == HotkeyState.RECORDING:
+                self.hotkey.fsm.escape(monotonic())
+            return
         if reason.startswith(MAPPING_REGRAB_PREFIX):
+            self._validate_command_mapping()
             self._on_mapping_regrab(reason)
             if self.hotkey.fsm.state != state:
                 # Запись с удержанием уже остановлена (mapping-lost): состояние устарело.
@@ -1109,7 +1556,8 @@ class DictationRuntime(QObject):
         if not self._closed and self._selfcheck == "failed" and state == HotkeyState.RECORDING:
             log.info("хоткей: нажатие не передано диктовке — самопроверка модели не пройдена")
             if self.orchestrator.phase == DictationPhase.IDLE:
-                self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
+                if self._command_publication_allowed():
+                    self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
             return
         if (
             not self._closed
@@ -1134,7 +1582,8 @@ class DictationRuntime(QObject):
                 "модель загружается" if self._loading_model else "повтор самопроверки",
             )
             if self.orchestrator.phase == DictationPhase.IDLE:
-                self.pill.show_state(PillState.LOADING_MODEL)
+                if self._command_publication_allowed():
+                    self.pill.show_state(PillState.LOADING_MODEL)
             return
         self.orchestrator.on_hotkey_state(state, reason)
 
@@ -1246,6 +1695,8 @@ class DictationRuntime(QObject):
 
     def _grab_hotkey(self) -> GrabResult:
         """Проверяет сочетание перед каждым захватом, включая старт и повторы."""
+        if self._command_suspended:
+            return GrabResult("not-grabbed")
         if not is_valid_combo(self.settings.hotkey):
             log.warning("hotkey=%r недопустим, беру значение по умолчанию", self.settings.hotkey)
             self.settings.hotkey = Settings.hotkey
@@ -1513,14 +1964,25 @@ class DictationRuntime(QObject):
             except Exception:
                 log.warning("Не удалось сохранить статистику")
 
-    def begin_hotkey_capture(self, own_window: int | None = None) -> bool:
+    def begin_hotkey_capture(self, own_window: int | None = None, *, role: str = "text") -> bool:
         """Захватывает клавиатуру; сторож читает клавиши со своего X-соединения.
 
         Сторож создаёт отдельное X-соединение в своём потоке. GUI получает
         события через колбэк, который должен ставить их в очередь Qt.
         Повторный вызов при активном захвате не продлевает его срок.
         """
-        if self._closed:
+        snapshot = self._command_session.snapshot() if self._command_session else None
+        locked = snapshot is not None and (
+            snapshot.lock_requested
+            or snapshot.preparing_for_sleep
+            or (snapshot.known and snapshot.locked)
+        )
+        if (
+            self._closed
+            or self._command_suspended
+            or locked
+            or (role == "command" and not self._command_snapshot().allowed)
+        ):
             return False
         if self._capture_watchdog is not None:
             if self._capture_watchdog.active:
@@ -1559,9 +2021,14 @@ class DictationRuntime(QObject):
         """Даёт готовому автомату проверить предел длительности фразы."""
         if not self._closed:
             self.hotkey.fsm.tick(monotonic())
+            if self.command_hotkey is not None:
+                self.command_hotkey.tick(monotonic())
 
     def _copy_last(self) -> None:
         """Копирует нормализованную фразу в буфер Qt с пометкой secret (У59)."""
+        if self.orchestrator.last_text_is_command and self._command_mode is not None:
+            self._command_mode.recover()
+            return
         text = self.last_text
         if text is not None and not publish_clipboard(text, session_kind=self.session_kind):
             log.warning("Не удалось скопировать последний текст в буфер обмена")
@@ -1622,6 +2089,25 @@ class DictationRuntime(QObject):
                 notify.set_action_handler(key, None)
             notify.set_action_handler(ACTION_OPEN_SOUND_SETTINGS, None)
         self.on_show_requested = None
+        if self._command_handlers_registered:
+            notify.set_command_guard(None)
+            for action in ("command-copy", "command-details", "command-launch"):
+                notify.set_action_handler(action, None)
+            self._command_handlers_registered = False
+        self.reject_command()
+        if self._command_notifier is not None:
+            self._command_notifier.setEnabled(False)
+            self._command_notifier.deleteLater()
+        if self.command_hotkey is not None:
+            self._cleanup("клавиша команды", self.command_hotkey.ungrab)
+            self._cleanup(
+                "соединение клавиши команды",
+                getattr(self.command_hotkey.backend, "close", lambda: None),
+            )
+        if self._command_client is not None:
+            self._cleanup("доставка помощнику", self._command_client.close)
+        if self._command_session is not None:
+            self._cleanup("сеанс команды", self._command_session.close)
         self._cleanup("оркестратор", self.orchestrator.shutdown)
         self._cleanup("страж индикаторов", self.guard.stop)
         notifier = self.notifier

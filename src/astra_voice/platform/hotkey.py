@@ -183,6 +183,16 @@ class X11HotkeyBackend:
         # даже если маски блокировок с тех пор сменились.
         self._masks: dict[tuple[int, int], tuple[int, ...]] = {}
 
+    def combo_signature(self, combo: str) -> tuple[int, int] | None:
+        """Реальная пара keycode/modifiers для сравнения ролей и алиасов."""
+        if not self._x.open():
+            return None
+        try:
+            parsed = self._x.parse_combo(combo)
+        except (BadCombo, X11Unavailable):
+            return None
+        return parsed.keycode, parsed.mods
+
     def grab_combo(self, combo: str) -> GrabResult:
         if not self._x.open():
             return GrabResult("not-grabbed")
@@ -460,6 +470,9 @@ class HotkeyManager:
     ) -> None:
         self.backend = backend if backend is not None else X11HotkeyBackend()
         self._clock = clock
+        self.defer_single_super = False
+        self.on_deferred_press: Callable[[], None] | None = None
+        self._deferred_press: float | None = None
         self.on_press: Callable[[], None] | None = None
         self.on_release: Callable[[], None] | None = None
         self.on_escape: Callable[[], None] | None = None
@@ -478,6 +491,14 @@ class HotkeyManager:
         # Диагностика журнала: пары автоповтора за удержание и пропуски нажатий подряд.
         self._repeat_pairs = 0
         self._skipped_presses = 0
+
+    def signature(self, combo: str) -> tuple[int, int] | None:
+        """Без захвата сравнивает сочетания по текущей карте X11."""
+        resolve = getattr(self.backend, "combo_signature", None)
+        if resolve is None:
+            return None
+        result = resolve(combo)
+        return result if isinstance(result, tuple) and len(result) == 2 else None
 
     def grab(self, combo: str, mode: HotkeyMode) -> GrabResult:
         if combo == self._combo and self._lost:
@@ -511,6 +532,7 @@ class HotkeyManager:
         return result
 
     def ungrab(self) -> None:
+        self._deferred_press = None
         if self._combo is None:
             self.last_result = GrabResult("not-grabbed")
             return
@@ -555,6 +577,8 @@ class HotkeyManager:
             self.last_result = GrabResult("not-grabbed")
             return self.last_result
         callback: Callable[[], None] | None = None
+        if event.kind == "KeyPress" and event.keycode != self._keycode:
+            self._deferred_press = None
         matches_combo = event.keycode == self._keycode and event.mods == self._mods
         if (
             not matches_combo
@@ -572,8 +596,18 @@ class HotkeyManager:
                 self._key_down = True
                 self._repeat_pairs = 0
                 self._skipped_presses = 0
-                self.fsm.press(now)
-                callback = self.on_press
+                if (
+                    self.defer_single_super
+                    and self._combo.lower() in ("super_l", "super_r", "super", "win")
+                    and self.fsm._configured_mode == HotkeyMode.PTT
+                    and self.fsm.state == HotkeyState.IDLE
+                ):
+                    self._deferred_press = now
+                    if self.on_deferred_press is not None:
+                        self.on_deferred_press()
+                else:
+                    self.fsm.press(now)
+                    callback = self.on_press
                 log.info(
                     "хоткей: нажатие keycode=%d mods=%#x key_down=1, автомат %s→%s",
                     event.keycode,
@@ -582,10 +616,15 @@ class HotkeyManager:
                     self.fsm.state.value,
                 )
             elif event.kind == "KeyRelease" and self._key_down:
+                # A short single-Win tap never enters recording/toggle. If the
+                # timer was delayed, discard the gesture rather than record after release.
+                pending = self._deferred_press is not None
+                self._deferred_press = None
                 self._key_down = False
                 self._skipped_presses = 0
-                self.fsm.release(now)
-                callback = self.on_release
+                if not pending:
+                    self.fsm.release(now)
+                    callback = self.on_release
                 log.info(
                     "хоткей: отпускание keycode=%d mods=%#x key_down=0, автомат %s→%s, "
                     "отфильтровано пар автоповтора: %d",
@@ -613,8 +652,20 @@ class HotkeyManager:
         self.last_result = GrabResult("ok")
         return self.last_result
 
+    def tick(self, now: float | None = None) -> None:
+        now = self._clock() if now is None else now
+        pending = self._deferred_press
+        if pending is not None and now - pending >= PTT_THRESHOLD_S:
+            self._deferred_press = None
+            if self._key_down and self._combo is not None and not self._lost:
+                self.fsm.press(pending)
+                if self.on_press is not None:
+                    self.on_press()
+        self.fsm.tick(now)
+
     def _handle_mapping(self, event: MappingEvent) -> None:
         """Обновляет коды и сообщает наружу как успех, так и отказ перезахвата."""
+        self._deferred_press = None
         self._log_mapping(event)
         if self._combo is None or self._combo not in event.combos:
             return

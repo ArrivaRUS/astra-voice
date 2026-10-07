@@ -17,6 +17,8 @@ from enum import Enum
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
+from astra_voice.core.command_mode import CommandMode, SessionSnapshot
+from astra_voice.platform.cowork import DeliveryResult
 from astra_voice.platform.hotkey import HotkeyState
 from astra_voice.platform.paste import PasteMode, PasteOutcome, PasteOutcomeKind, normalize
 from astra_voice.ui.pill import (
@@ -98,6 +100,7 @@ class DictationPhase(Enum):
     RECORDING = "recording"
     PROCESSING = "processing"
     PASTING = "pasting"
+    DELIVERING = "delivering"
     FINISHING = "finishing"
 
 
@@ -174,7 +177,14 @@ class DictationOrchestrator:
         on_silent: Callable[[], None] | None = None,
         on_success: Callable[[float | None, float | None, bool], None] | None = None,
         on_idle: Callable[[], None] | None = None,
+        command_mode: CommandMode | None = None,
+        command_preview: Callable[[str, Callable[[], None]], bool] | None = None,
     ) -> None:
+        self.command_mode = command_mode
+        self._command_preview = command_preview
+        self.mode = "text"
+        self._deliver_t0 = 0.0
+        self._deliver_reason = "none"
         self._send = send
         self._generation = generation
         self._restart_worker = restart_worker
@@ -209,6 +219,7 @@ class DictationOrchestrator:
         self._utterance_id = ""
         self._worker_generation = 0
         self._last_text: str | None = None
+        self.last_text_is_command = False
         self._started = False
         self._cold = True
         self._t0 = 0.0
@@ -279,7 +290,8 @@ class DictationOrchestrator:
 
     def _start_level_recording(self) -> None:
         # Индикация включается до открытия: ошибка индикатора запрещает запись.
-        self._pill.show_state(PillState.LISTENING)
+        if self._publication_allowed():
+            self._pill.show_state(PillState.LISTENING)
         if not self.level_active:
             return
         self._tray.set_state(TrayState.LISTENING)
@@ -421,7 +433,8 @@ class DictationOrchestrator:
         elif kind == "level":
             peak = event.get("peak_dbfs")
             if isinstance(peak, (int, float)) and not isinstance(peak, bool):
-                self._pill.show_state(PillState.LISTENING, level=level_from_dbfs(float(peak)))
+                if self._publication_allowed():
+                    self._pill.show_state(PillState.LISTENING, level=level_from_dbfs(float(peak)))
                 if self.level_active and self._level_callback is not None:
                     self._level_callback(MicrophoneLevelUpdate("listening", peak_dbfs=float(peak)))
         elif kind == "record.limit" and self.level_active:
@@ -518,7 +531,7 @@ class DictationOrchestrator:
         if self._announcement_generation != self._generation():
             self.reset_device_announcement()
 
-    def on_hotkey_state(self, state: HotkeyState, reason: str) -> None:
+    def on_hotkey_state(self, state: HotkeyState, reason: str, *, mode: str = "text") -> None:
         """Принимает состояния HotkeyFsm, включая IDLE с escape-cancel."""
         if self._closed:
             return
@@ -534,10 +547,14 @@ class DictationOrchestrator:
         if self._suspended:
             if state == HotkeyState.RECORDING and reason == "press":
                 self._log.info("диктовка: нажатие отложено — идёт вставка (suspended)")
-            self._queue.append(lambda: self.on_hotkey_state(state, reason))
+            self._queue.append(lambda: self.on_hotkey_state(state, reason, mode=mode))
             return
         if state == HotkeyState.RECORDING:
             if self._phase in (DictationPhase.IDLE, DictationPhase.FINISHING):
+                self.mode = mode
+                set_command_mode = getattr(self._tray, "set_command_mode", None)
+                if set_command_mode is not None:
+                    set_command_mode(mode == "command")
                 self._start()
             elif reason == "press":
                 # Только новое нажатие: tap→toggle и mapping-regrab сообщают
@@ -553,6 +570,9 @@ class DictationOrchestrator:
             self.cancel("escape")
 
     def _start(self, *, test_device: str | None = None) -> None:
+        if self.mode == "command" and (self.command_mode is None or not self.command_mode.allowed):
+            self._hotkey_cancel()
+            return
         if self._cancel_pending and self._generation() == self._worker_generation:
             self._log.info(
                 "диктовка: нажатие проигнорировано — ждём завершения отмены (cancel_pending)"
@@ -560,7 +580,9 @@ class DictationOrchestrator:
             self._hotkey_cancel()
             return
         self._cancel_pending = False
-        self._target_window = None if self.test_active else self._active_window()
+        self._target_window = (
+            None if self.test_active or self.mode == "command" else self._active_window()
+        )
         self._utterance_id = uuid4().hex
         self._sync_device_generation()
         self._worker_generation = self._generation()
@@ -573,6 +595,8 @@ class DictationOrchestrator:
         self._t_ready = None
         self._t_stop = None
         self._t_release = None
+        self._deliver_t0 = 0.0
+        self._deliver_reason = "none"
         self._t_ms = self._paste_ms = 0.0
         self._t_total_ms = None
         self._result_audio_ms = None
@@ -613,8 +637,14 @@ class DictationOrchestrator:
         if self._test_callback is not None:
             self._later(TEST_RECORD_LIMIT_MS, self.stop_test)
         if not self.test_active:
-            self._pill.show_state(PillState.LISTENING)
-        self._tray.set_state(TrayState.LISTENING)
+            if self._publication_allowed():
+                self._pill.show_state(
+                    PillState.COMMAND_LISTENING if self.mode == "command" else PillState.LISTENING
+                )
+        if self.mode == "command":
+            self._tray.set_state(TrayState.LISTENING, tooltip="Слушаю команду")
+        else:
+            self._tray.set_state(TrayState.LISTENING)
         self._set_recording(True)
         if self._test_callback is not None:
             self._test_callback(MicrophoneTestUpdate("recording"))
@@ -680,7 +710,11 @@ class DictationOrchestrator:
         self._safe_ui(
             lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
         )
-        if not self.test_active and not self._device_pill_held(PillState.PROCESSING):
+        if (
+            not self.test_active
+            and self._publication_allowed()
+            and not self._device_pill_held(PillState.PROCESSING)
+        ):
             self._safe_ui(
                 lambda: self._pill.show_state(PillState.PROCESSING),
                 "диктовка: не удалось обновить пилюлю",
@@ -727,6 +761,10 @@ class DictationOrchestrator:
         if event.get("utterance_id", self._utterance_id) != self._utterance_id:
             return
         kind = event.get("type")
+        if self.mode == "command" and not self._publication_allowed():
+            self.command_session_changed()
+            if kind != "cancelled":
+                return
         if kind == "cancelled":
             self._cancelled()
         elif self._cancel_pending:
@@ -779,16 +817,28 @@ class DictationOrchestrator:
                 if self._test_callback is not None:
                     self._test_callback(MicrophoneTestUpdate("recording", peak_dbfs=float(peak)))
                 else:
-                    self._pill.show_state(PillState.LISTENING, level=level)
+                    if self._publication_allowed():
+                        self._pill.show_state(
+                            PillState.COMMAND_LISTENING
+                            if self.mode == "command"
+                            else PillState.LISTENING,
+                            level=level,
+                        )
             elif kind == "silent":
                 if self.test_active:
                     self._stop()
                 else:
-                    self._pill.show_state(PillState.LISTENING_SILENT)
+                    if self._publication_allowed():
+                        self._pill.show_state(
+                            PillState.COMMAND_LISTENING
+                            if self.mode == "command"
+                            else PillState.LISTENING_SILENT
+                        )
                     self._announce_silent()
             elif kind == "record.limit":
                 if not self.test_active:
-                    self._pill.show_state(PillState.LIMIT)
+                    if self._publication_allowed():
+                        self._pill.show_state(PillState.LIMIT)
                 self._stop(recording_stopped=True)
 
     def _device_change_fields(self, event: dict[str, Any]) -> tuple[str | None, str]:
@@ -897,7 +947,7 @@ class DictationOrchestrator:
 
     def _announce_silent(self) -> None:
         """Сообщает наружу о тишине; причину выясняет рантайм, не автомат."""
-        if self._on_silent is None:
+        if self._on_silent is None or not self._publication_allowed():
             return
         self._safe_ui(self._on_silent, "диктовка: не удалось назвать причину тишины")
 
@@ -951,8 +1001,62 @@ class DictationOrchestrator:
             self._dictation_stat("empty")
             self._finish(PillState.EMPTY)
             return
+        if self.mode == "command" and self.command_mode is not None:
+            self._last_text = self.command_mode.remember(text)
+            self.last_text_is_command = True
+            self._tray.set_has_last_text(True)
+            self._change_phase(DictationPhase.DELIVERING)
+            self._deliver_t0 = self._clock()
+            if self._command_preview is not None and self._command_preview(
+                text, lambda: self._deliver_command(text)
+            ):
+                return
+            self._deliver_command(text)
+            return
         self._change_phase(DictationPhase.PASTING)
         self._attempt_paste(text)
+
+    def _deliver_command(self, text: str) -> None:
+        if self._closed or self._phase != DictationPhase.DELIVERING or self.command_mode is None:
+            return
+        self._deliver_t0 = self._clock()
+        if self.command_mode.allowed:
+            if self._publication_allowed():
+                self._pill.show_state(PillState.COMMAND_DELIVERING)
+        self.command_mode.deliver(text, self._command_finished)
+        self._last_text = self.command_mode.last_text
+
+    def _command_finished(self, result: DeliveryResult) -> None:
+        if self._closed or self._phase != DictationPhase.DELIVERING:
+            return
+        self._deliver_reason = result.reason
+        self._dictation_stat(result.outcome)
+        state = (
+            PillState.COMMAND_DONE
+            if result.outcome == "delivered"
+            else PillState.COMMAND_UNKNOWN
+            if result.outcome == "unknown"
+            else PillState.COMMAND_FAILED
+        )
+        self._begin_finish()
+        # CommandMode has already published through the current-session gate.
+        if not self._publication_allowed():
+            self._pill.hide()
+        self._end_finish(state, tray=TrayState.IDLE)
+
+    def _publication_allowed(self) -> bool:
+        return self.mode != "command" or (
+            self.command_mode is not None and self.command_mode.publication_allowed
+        )
+
+    def command_session_changed(self, transition: SessionSnapshot | None = None) -> None:
+        if self.command_mode is None or self.mode != "command":
+            return
+        self.command_mode.session_changed(transition)
+        if not self.command_mode.allowed or (transition is not None and not transition.allowed):
+            self._pill.hide()
+            if self._phase in (DictationPhase.RECORDING, DictationPhase.PROCESSING):
+                self.cancel("session")
 
     def _attempt_paste(self, text: str) -> None:
         if self._closed or self._cancel_requested or self._phase != DictationPhase.PASTING:
@@ -1007,6 +1111,7 @@ class DictationOrchestrator:
             self._retries += 1
             self._later(BUSY_RETRY_MS, lambda: self._attempt_paste(text))
             return
+        self.last_text_is_command = False
         self._last_text = normalize(text)
         self._tray.set_has_last_text(True)
         if kind == PasteOutcomeKind.PASTED:
@@ -1016,9 +1121,11 @@ class DictationOrchestrator:
             self._dictation_stat("ok")
             self._begin_finish()
             if not_fetched:
-                self._pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_NOT_FETCHED)
+                if self._publication_allowed():
+                    self._pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_NOT_FETCHED)
             else:
-                self._pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED)
+                if self._publication_allowed():
+                    self._pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED)
             self._end_finish(PillState.CLIPBOARD_ONLY, tray=TrayState.IDLE)
         elif kind in (PasteOutcomeKind.CLIPBOARD_ONLY, PasteOutcomeKind.BUSY):
             self._dictation_stat("ok")
@@ -1038,6 +1145,8 @@ class DictationOrchestrator:
             return
         if self._suspended:
             self._queue.append(lambda: self.cancel(source))
+            return
+        if self._phase == DictationPhase.DELIVERING:
             return
         if self._delivered:
             self._log.debug("диктовка: поздняя отмена после доставки")
@@ -1137,15 +1246,17 @@ class DictationOrchestrator:
         elif code == "audio-no-device" and self._device_selected:
             self._append_stat("mic_error", kind="device-lost", recovered_by="none")
             self._begin_finish()
-            self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_LOST)
+            if self._publication_allowed():
+                self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_LOST)
             self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
-            if self._on_device_lost is not None:
+            if self._on_device_lost is not None and self._publication_allowed():
                 self._on_device_lost()
         elif code == "audio-silent":
             # Источник открыт, но звука не даёт. Статистику и причину пишет
             # обработчик тишины: у него есть состояние источника (kind=muted/…).
             self._begin_finish()
-            self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_SILENT)
+            if self._publication_allowed():
+                self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_SILENT)
             self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
             self._announce_silent()
         elif code in ("audio-no-device", "audio-busy", "audio-failed"):
@@ -1167,12 +1278,14 @@ class DictationOrchestrator:
             self._finish_test(MicrophoneTestUpdate("error", message=TEST_FAILED))
             return
         self._begin_finish()
-        self._pill.show_state(PillState.ERROR, text=ERROR_RECOGNITION_RESTARTED)
+        if self._publication_allowed():
+            self._pill.show_state(PillState.ERROR, text=ERROR_RECOGNITION_RESTARTED)
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _fail_microphone(self) -> None:
         self._begin_finish()
-        self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_UNAVAILABLE)
+        if self._publication_allowed():
+            self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_UNAVAILABLE)
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _fail_recognition(self, *, cancel_worker: bool = False) -> None:
@@ -1187,23 +1300,29 @@ class DictationOrchestrator:
         self._begin_finish()
         if cancel_worker:
             self._send_cancel()
-        self._pill.show_state(PillState.ERROR, text=ERROR_RECOGNITION_FAILED)
+        if self._publication_allowed():
+            self._pill.show_state(PillState.ERROR, text=ERROR_RECOGNITION_FAILED)
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _fail_model_not_loaded(self) -> None:
         self._begin_finish()
-        self._pill.show_state(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
+        if self._publication_allowed():
+            self._pill.show_state(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _fail_secret(self) -> None:
         self._begin_finish()
-        self._pill.show_state(PillState.ERROR, text=ERROR_BUFFER_CLEARED)
+        if self._publication_allowed():
+            self._pill.show_state(PillState.ERROR, text=ERROR_BUFFER_CLEARED)
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _finish(self, state: PillState, *, tray: TrayState = TrayState.IDLE) -> None:
         self._begin_finish()
-        if not self._device_pill_held(state):
-            self._pill.show_state(state)
+        if self._publication_allowed() and not self._device_pill_held(state):
+            if self._publication_allowed():
+                self._pill.show_state(state)
+        elif not self._publication_allowed():
+            self._pill.hide()
         self._end_finish(state, tray=tray)
 
     def _device_pill_held(self, state: PillState) -> bool:
@@ -1218,6 +1337,8 @@ class DictationOrchestrator:
         self._cancel_timers()
         self._change_phase(DictationPhase.FINISHING)
         self._set_recording(False)
+        if not self._publication_allowed():
+            self._pill.hide()
 
     def _end_finish(self, state: PillState, *, tray: TrayState) -> None:
         duration = STATE_DURATION_MS[state]
@@ -1227,7 +1348,7 @@ class DictationOrchestrator:
             tray = TrayState.ERROR
             remaining = math.ceil((self._device_pill_until - self._clock()) * 1000)
             duration = max(duration, remaining)
-        self._tray.set_state(tray)
+        self._tray.set_state(tray if self._publication_allowed() else TrayState.IDLE)
         self._later(duration, self._tail_done)
         self._hotkey_done()
         # done завершает только PROCESSING; терминальный исход возможен и из RECORDING.
@@ -1266,6 +1387,14 @@ class DictationOrchestrator:
             paste_ms=self._paste_ms,
             cold=self._cold,
         )
+        if self.mode == "command":
+            fields.update(
+                mode="command",
+                deliver_reason=self._deliver_reason,
+                deliver_ms=max(0.0, (self._clock() - self._deliver_t0) * 1000)
+                if self._deliver_t0
+                else 0.0,
+            )
         if self._delivered and self._t_total_ms is not None:
             fields["t_total_ms"] = self._t_total_ms
         self._append_stat("dictation", **fields)

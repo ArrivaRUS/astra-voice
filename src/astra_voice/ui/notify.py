@@ -131,6 +131,7 @@ class _Notice:
     actions: tuple[tuple[str, str], ...]
     created_at: float
     retry: bool
+    allowed: Callable[[], bool] | None = None
 
 
 _pending: deque[_Notice] = deque(maxlen=_MAX_NOTIFICATIONS)
@@ -452,6 +453,9 @@ def _send(
             -1,
         ]
     )
+    if notice.allowed is not None and not notice.allowed():
+        _on_reply(seq, None, _INVALID_REPLY)
+        return
     call = bus.asyncCall(message, _CALL_TIMEOUT_MS)
     watcher = QDBusPendingCallWatcher(call)
     _watchers[seq] = watcher
@@ -565,6 +569,14 @@ def _drain() -> None:
         notice, _slot = _slot, None
     else:
         return
+    if notice.allowed is not None:
+        try:
+            allowed = notice.allowed()
+        except Exception:
+            allowed = False
+        if not allowed:
+            _drain()
+            return
     for pending in tuple(_pending):
         if _same_notice(notice, pending):
             _pending.remove(pending)
@@ -605,7 +617,8 @@ def notify(
     """
     if urgency not in _URGENCY:
         raise ValueError("Неизвестная срочность уведомления")
-    notice = _Notice(summary, body, _URGENCY[urgency], tuple(actions), monotonic(), retry)
+    allowed = _command_notice_guard() if summary in _COMMAND_SUMMARIES else None
+    notice = _Notice(summary, body, _URGENCY[urgency], tuple(actions), monotonic(), retry, allowed)
     # Штатные вызовы из runtime, tray, bridges и app идут через Qt GUI thread;
     # вызов из другого потока передаём туда до работы с QtDBus.
     if threading.get_ident() == _gui_ident:
@@ -786,3 +799,50 @@ def notify_model_revoked() -> None:
 def notify_model_installed() -> None:
     """Сообщить о готовности модели после фоновой установки."""
     notify("Модель установлена", "Можно диктовать.", urgency="normal")
+
+
+_COMMAND_SUMMARIES = frozenset(
+    ("Помощник не принял команду", "Результат передачи команды неизвестен")
+)
+_command_guard: Callable[[], bool] | None = None
+_command_epoch: Callable[[], object] | None = None
+
+
+def set_command_guard(
+    guard: Callable[[], bool] | None, *, epoch: Callable[[], object] | None = None
+) -> None:
+    """Publication gate for the two fixed command wrappers; absence is fail-closed."""
+    global _command_guard, _command_epoch
+    _command_guard = guard
+    _command_epoch = epoch
+
+
+def _command_notice_guard() -> Callable[[], bool]:
+    # Bind the session epoch to this queued notice. A later unlocked session or
+    # new recording cannot revive a pre-lock notification.
+    guard, epoch = _command_guard, _command_epoch
+    token = epoch() if epoch is not None else None
+    return lambda: bool(
+        guard is not None
+        and guard is _command_guard
+        and guard()
+        and (epoch is None or epoch() == token)
+    )
+
+
+def notify_command_failed() -> None:
+    notify(
+        "Помощник не принял команду",
+        "Фраза сохранена в программе. Подробности и повторное копирование доступны в меню Voice.",
+        actions=[("command-copy", "Скопировать ещё раз"), ("command-details", "Что случилось")],
+        retry=False,
+    )
+
+
+def notify_command_unknown() -> None:
+    notify(
+        "Результат передачи команды неизвестен",
+        "Возможно, команда принята. Проверьте в Astra Cowork, прежде чем повторять.",
+        actions=[("command-copy", "Скопировать ещё раз"), ("command-details", "Что случилось")],
+        retry=False,
+    )

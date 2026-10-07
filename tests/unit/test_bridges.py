@@ -391,6 +391,7 @@ def changed_value(bridge: SettingsBridge, name: str) -> str | bool:
     # Новый строковый контрол требует явного тестового значения, иначе тест падает.
     return {
         "hotkey": "Ctrl+Shift+Space",
+        "commandHotkey": "Super_R",
         "hotkeyMode": "toggle",
         "language": "en",
         "device": "mic",

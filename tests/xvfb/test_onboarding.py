@@ -152,6 +152,42 @@ class FakeOnboarding(QObject):
     changed = pyqtSignal()
     deviceResolvedChanged = pyqtSignal()
 
+    def _get_commandHotkey(self) -> str:
+        return getattr(self, "_commandHotkey", "Super_L")
+
+    def _set_commandHotkey(self, value: str) -> None:
+        self._commandHotkey = value
+        self.changed.emit()
+
+    commandHotkey = pyqtProperty(str, _get_commandHotkey, _set_commandHotkey, notify=changed)
+
+    def _get_commandInstalled(self) -> bool:
+        return getattr(self, "_commandInstalled", False)
+
+    commandInstalled = pyqtProperty(bool, _get_commandInstalled, notify=changed)
+
+    def _get_commandStatus(self) -> str:
+        return getattr(self, "_commandStatus", "Astra Cowork не установлен")
+
+    commandStatus = pyqtProperty(str, _get_commandStatus, notify=changed)
+
+    def _get_captureRole(self) -> str:
+        return getattr(self, "_captureRole", "text")
+
+    captureRole = pyqtProperty(str, _get_captureRole, notify=changed)
+
+    @pyqtSlot()
+    def beginCommandCapture(self) -> None:
+        self.calls.append("beginCommandCapture")
+
+    @pyqtSlot()
+    def refreshCommandStatus(self) -> None:
+        self.calls.append("refreshCommandStatus")
+
+    @pyqtSlot()
+    def useCommandWin(self) -> None:
+        self.calls.append("useCommandWin")
+
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[str] = []
@@ -740,6 +776,96 @@ class FakeSettings(QObject):
     """Изменяемый контракт настроек без системных побочных действий."""
 
     changed = pyqtSignal()
+
+    def _get_commandHotkey(self) -> str:
+        return getattr(self, "_commandHotkey", "Super_L")
+
+    def _set_commandHotkey(self, value: str) -> None:
+        self._commandHotkey = value
+        self.changed.emit()
+
+    commandHotkey = pyqtProperty(str, _get_commandHotkey, _set_commandHotkey, notify=changed)
+
+    def _get_commandEnabled(self) -> bool:
+        return getattr(self, "_commandEnabled", True)
+
+    def _set_commandEnabled(self, value: bool) -> None:
+        self._commandEnabled = value
+        self.changed.emit()
+
+    commandEnabled = pyqtProperty(bool, _get_commandEnabled, _set_commandEnabled, notify=changed)
+
+    def _get_commandPreview(self) -> bool:
+        return getattr(self, "_commandPreview", False)
+
+    def _set_commandPreview(self, value: bool) -> None:
+        self._commandPreview = value
+        self.changed.emit()
+
+    commandPreview = pyqtProperty(bool, _get_commandPreview, _set_commandPreview, notify=changed)
+
+    def _get_commandInstalled(self) -> bool:
+        return getattr(self, "_commandInstalled", False)
+
+    commandInstalled = pyqtProperty(bool, _get_commandInstalled, notify=changed)
+
+    def _get_commandAvailable(self) -> bool:
+        return getattr(self, "_commandAvailable", False)
+
+    commandAvailable = pyqtProperty(bool, _get_commandAvailable, notify=changed)
+
+    def _get_commandStatus(self) -> str:
+        return getattr(self, "_commandStatus", "Astra Cowork не установлен")
+
+    commandStatus = pyqtProperty(str, _get_commandStatus, notify=changed)
+
+    def _get_commandDetail(self) -> str:
+        return getattr(self, "_commandDetail", "")
+
+    commandDetail = pyqtProperty(str, _get_commandDetail, notify=changed)
+
+    def _get_commandFeedbackText(self) -> str:
+        return getattr(self, "_commandFeedbackText", "")
+
+    commandFeedbackText = pyqtProperty(str, _get_commandFeedbackText, notify=changed)
+
+    def _get_commandPreviewText(self) -> str:
+        return getattr(self, "_commandPreviewText", "")
+
+    commandPreviewText = pyqtProperty(str, _get_commandPreviewText, notify=changed)
+
+    def _get_captureRole(self) -> str:
+        return getattr(self, "_captureRole", "text")
+
+    captureRole = pyqtProperty(str, _get_captureRole, notify=changed)
+
+    @pyqtSlot()
+    def beginCommandCapture(self) -> None:
+        self.calls.append("beginCommandCapture")
+
+    @pyqtSlot()
+    def commandPreviewShown(self) -> None:
+        self.calls.append("commandPreviewShown")
+
+    @pyqtSlot()
+    def confirmCommand(self) -> None:
+        self.calls.append("confirmCommand")
+
+    @pyqtSlot()
+    def refreshCommandStatus(self) -> None:
+        self.calls.append("refreshCommandStatus")
+
+    @pyqtSlot()
+    def rejectCommand(self) -> None:
+        self.calls.append("rejectCommand")
+
+    @pyqtSlot()
+    def showCommandDetails(self) -> None:
+        self.calls.append("showCommandDetails")
+
+    @pyqtSlot()
+    def useCommandWin(self) -> None:
+        self.calls.append("useCommandWin")
 
     def __init__(self) -> None:
         super().__init__()

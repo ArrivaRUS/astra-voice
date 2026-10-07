@@ -26,8 +26,8 @@ import math
 import os
 import re
 import shutil
-import stat
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -49,6 +49,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
+import astra_voice.security.verify as verify_module  # noqa: E402
 from astra_voice.core import (  # noqa: E402
     paths,  # noqa: E402
     policy,
@@ -70,7 +71,6 @@ from astra_voice.platform.hotkey import (  # noqa: E402
     HotkeyMode,
     HotkeyState,
 )
-import astra_voice.security.verify as verify_module  # noqa: E402
 from astra_voice.security.verify import Verifier  # noqa: E402
 from astra_voice.worker import ipc  # noqa: E402
 from astra_voice.worker.supervisor import Message, WorkerSupervisor  # noqa: E402
@@ -2854,10 +2854,126 @@ def autostart_check(args: argparse.Namespace) -> int:
     return network_report(args, checks, notes, error)
 
 
+def cowork_check(args: argparse.Namespace) -> int:
+    """Contract checks on synthetic text and private, activation-free buses only."""
+    import importlib.util
+    import xml.etree.ElementTree as ET
+
+    from astra_voice.platform.cowork import INTERFACE, is_installed, resolve_bus_address
+
+    checks: list[Message] = []
+    notes = [
+        "Детект установки и адреса — только чтение файлов/окружения, "
+        "без Status/Submit живому демону.",
+        "Submit вызывается только тестами на отдельных приватных шинах без активации служб.",
+        "Микрофон, хоткеи, системные настройки и установленная программа не изменяются.",
+        "Это контрактная проверка; живая приёмка KDE/Fly, S7 и K5 ею не заменяется.",
+    ]
+
+    def record(name: str, expected: str, actual: str, passed: bool) -> None:
+        checks.append({"name": name, "expected": expected, "actual": actual, "passed": passed})
+
+    installed = is_installed()
+    address_valid = resolve_bus_address() is not None
+    notes.append(
+        f"Статический детект: установлен={installed}; адрес unix доступен={address_valid}."
+    )
+    suite = ROOT / "tests/command_acceptance"
+    if not suite.is_dir():
+        return network_report(args, checks, notes, "Нужны исходники tests/command_acceptance.")
+    missing = [name for name in ("pytest", "dbus", "gi") if importlib.util.find_spec(name) is None]
+    if shutil.which("dbus-run-session") is None:
+        missing.append("dbus-run-session")
+    if missing:
+        return network_report(
+            args, checks, notes, "Нет тестовых зависимостей: " + ", ".join(missing)
+        )
+    try:
+        root = ET.parse(ROOT / "docs/contracts/ru.astralinux.Cowork.Command1.xml").getroot()
+        interface = root.find(f"interface[@name='{INTERFACE}']")
+        methods = (
+            {}
+            if interface is None
+            else {
+                method.attrib["name"]: [
+                    (a.attrib.get("direction", "in"), a.attrib["type"])
+                    for a in method.findall("arg")
+                ]
+                for method in interface.findall("method")
+            }
+        )
+        expected = {
+            "Status": [("out", "a{sv}")],
+            "Submit": [("in", "s"), ("in", "a{sv}"), ("out", "a{sv}")],
+        }
+        record("xml", "Status/Submit contract1", "XML проверен", methods == expected)
+        with tempfile.TemporaryDirectory(prefix="astra-cowork-validate-") as temporary:
+            env = dict(os.environ)
+            for name in (
+                "DBUS_SESSION_BUS_ADDRESS",
+                "DBUS_SYSTEM_BUS_ADDRESS",
+                "DISPLAY",
+                "WAYLAND_DISPLAY",
+            ):
+                env.pop(name, None)
+            for name, suffix in (
+                ("HOME", "home"),
+                ("XDG_CONFIG_HOME", "config"),
+                ("XDG_STATE_HOME", "state"),
+                ("XDG_CACHE_HOME", "cache"),
+                ("XDG_DATA_HOME", "data"),
+                ("XDG_RUNTIME_DIR", "runtime"),
+            ):
+                directory = Path(temporary) / suffix
+                directory.mkdir(mode=0o700)
+                env[name] = str(directory)
+            env["QT_QPA_PLATFORM"] = "offscreen"
+            env["ASTRA_VOICE_REQUIRE_QT"] = "1"
+            command = [
+                sys.executable,
+                "-m",
+                "pytest",
+                str(suite),
+                str(ROOT / "tests/unit/test_command_orchestration.py"),
+                str(ROOT / "tests/unit/test_command_runtime.py"),
+                str(ROOT / "tests/unit/test_command_notifications.py"),
+                str(ROOT / "tests/unit/test_command_edges.py"),
+                "-o",
+                "addopts=",
+                "-q",
+            ]
+            result = subprocess.run(
+                command, cwd=ROOT, env=env, capture_output=True, text=True, timeout=60, check=False
+            )
+            summary = next(
+                (
+                    line
+                    for line in reversed(result.stdout.splitlines())
+                    if re.fullmatch(r"[0-9a-zA-Z ,.]+ in [0-9.]+s", line.strip())
+                ),
+                f"pytest exit={result.returncode}",
+            )
+            record(
+                "private-contract",
+                "Все контрактные/публикационные тесты проходят",
+                summary,
+                result.returncode == 0,
+            )
+    except (OSError, ValueError, ET.ParseError, subprocess.TimeoutExpired) as exc:
+        return network_report(
+            args, checks, notes, "Не удалось выполнить проверку: " + type(exc).__name__
+        )
+    return network_report(args, checks, notes)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Разбирает подкоманды; новые проверки добавляются отдельными обработчиками."""
     parser = argparse.ArgumentParser(description="Проверки Astra Voice без GUI")
     commands = parser.add_subparsers(dest="command", required=True)
+    cowork_parser = commands.add_parser(
+        "cowork", help="контракт Command1 на приватных тестовых шинах"
+    )
+    cowork_parser.add_argument("--json", action="store_true", help="один JSON-объект в stdout")
     summary = commands.add_parser(
         "stats", help="проверить p95 полного времени t_total_ms по прогретым диктовкам"
     )
@@ -2957,6 +3073,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "catalog" and args.all and (args.from_ref or args.to_ref):
         parser.error("--from/--to применимы только с --switch")
     handlers = {
+        "cowork": cowork_check,
         "worker-cancel": worker_cancel,
         "dictation": dictation,
         "stats": stats,
