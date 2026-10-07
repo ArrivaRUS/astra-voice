@@ -28,8 +28,9 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -64,17 +65,48 @@ def required_modules(paths: list[Path]) -> list[str]:
     return sorted(found)
 
 
-def missing(modules: list[str]) -> list[str]:
-    """Те из модулей, которые сейчас не импортируются."""
-    out: list[str] = []
+IMPORT_TIMEOUT = 30
+_IMPORT_OK = "ASTRA_VOICE_IMPORT_OK"
+_IMPORT_PROBE = """import importlib, json, sys, traceback
+sys.path = json.loads(sys.argv[2])
+try:
+    importlib.import_module(sys.argv[1])
+except BaseException:
+    traceback.print_exc()
+    sys.exit(1)
+print("ASTRA_VOICE_IMPORT_OK")
+"""
+
+
+def import_errors(modules: list[str]) -> dict[str, str]:
+    """Настоящий импорт отдельно от гейта: ошибка, exit или зависание дают отказ."""
+    errors: dict[str, str] = {}
     for name in modules:
         try:
-            if importlib.util.find_spec(name) is None:
-                out.append(name)
-        except (ImportError, ValueError):
-            # find_spec подмодуля бросает ImportError, если нет родителя.
-            out.append(name)
-    return out
+            result = subprocess.run(
+                [sys.executable, "-B", "-c", _IMPORT_PROBE, name, json.dumps(sys.path)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=IMPORT_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            errors[name] = f"импорт не завершился за {IMPORT_TIMEOUT} с"
+        except OSError as exc:
+            errors[name] = f"не удалось запустить проверку: {exc}"
+        else:
+            if result.returncode != 0 or result.stdout.splitlines()[-1:] != [_IMPORT_OK]:
+                detail = result.stderr.strip()[-2000:]
+                errors[name] = f"код {result.returncode}: {detail or 'импорт не завершён'}"
+    return errors
+
+
+def missing(modules: list[str]) -> list[str]:
+    """Совместимый список модулей, которые не удалось импортировать."""
+    return list(import_errors(modules))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -105,18 +137,19 @@ def main(argv: list[str] | None = None) -> int:
         print("зависимостей через importorskip не найдено — проверять нечего")
         return 0
 
-    gone = missing(modules)
+    gone = import_errors(modules)
     for name in modules:
         mark = "НЕТ" if name in gone else "ok"
         print(f"  {name}: {mark}")
 
     if gone:
         print(
-            "\nэти модули нужны тестам, но не установлены — в CI тесты будут\n"
-            "молча пропущены, а задача позеленеет. Поставьте пакеты:",
+            "\nэти модули нужны тестам, но не импортируются — в CI тесты будут\n"
+            "пропущены или упадут. Проверьте установку и ошибки импорта:",
             file=sys.stderr,
         )
         for name in gone:
+            print(f"  {name}: {gone[name]}", file=sys.stderr)
             print(
                 f"  - {name} → {APT_HINT.get(name, '<пакет неизвестен, дополните APT_HINT>')}",
                 file=sys.stderr,
