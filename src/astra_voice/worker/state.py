@@ -825,7 +825,13 @@ class WorkerState:
             return
         self._closed = True
         self._unload(deferred)
+        shutdown = getattr(self._capture, "shutdown", None)
+        if callable(shutdown):
+            deferred.append(shutdown)
         if self._source is not None:
             deferred.append(self._source.close)
+            source_shutdown = getattr(self._source, "shutdown", None)
+            if callable(source_shutdown):
+                deferred.append(source_shutdown)
         if self._owns_executor:
             deferred.append(lambda: self._executor.shutdown(wait=True))

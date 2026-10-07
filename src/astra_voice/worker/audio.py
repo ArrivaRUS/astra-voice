@@ -1,4 +1,8 @@
-"""Выбор устройств записи и источники PCM16: PulseAudio и WAV-файл."""
+"""Выбор устройств записи и источники PCM16: PulseAudio и WAV-файл.
+
+Провайдер pa_context сериализует интроспекцию своим замком и обновляет кэш по
+подписке. Без готового контекста и для simple остаётся путь pactl/pw-dump.
+"""
 
 from __future__ import annotations
 
@@ -136,6 +140,35 @@ class AudioDevice:
     def label(self) -> str:
         """Возвращает подпись с явным предупреждением о записи звука колонок."""
         return _device_label(self.description, " (звук системы)" if self.monitor else "")
+
+
+DeviceIntrospection = Callable[[_OpenDeadline | None], tuple[list[AudioDevice], str | None] | None]
+_device_introspection: DeviceIntrospection | None = None
+_introspection_lock = threading.Lock()
+
+
+def set_device_introspection(provider: DeviceIntrospection | None) -> None:
+    """Устанавливает провайдер готового контекста; сам контекст здесь не создаётся."""
+    global _device_introspection
+    with _introspection_lock:
+        _device_introspection = provider
+
+
+def _clear_device_introspection(provider: DeviceIntrospection) -> None:
+    """Снимает только своего владельца, не затрагивая более новый источник."""
+    global _device_introspection
+    with _introspection_lock:
+        if _device_introspection is provider:
+            _device_introspection = None
+
+
+def _provided_devices(
+    deadline: _OpenDeadline | None,
+) -> tuple[list[AudioDevice], str | None] | None:
+    with _introspection_lock:
+        provider = _device_introspection
+    # Не держим замок реестра при входе под замок источника.
+    return provider(deadline) if provider is not None else None
 
 
 @dataclass(frozen=True)
@@ -439,31 +472,61 @@ def _pipewire_default_name(
     return None
 
 
-def list_devices(
+def _build_devices(
+    rows: list[tuple[int, str, str | None]],
     *,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     deadline: _OpenDeadline | None = None,
 ) -> list[AudioDevice]:
-    """Возвращает источники из краткого списка, по возможности дополняя описаниями."""
+    """Единые порядок, описания и запасные подписи для pactl и интроспекции."""
+    rows = sorted(rows, key=lambda row: row[0])
+    descriptions = {}
+    for _, name, raw in rows:
+        description = _clean_device_description(raw or "")
+        if description and description.lower() not in _EMPTY_DESCRIPTIONS:
+            descriptions[name] = description
+    if any(name not in descriptions for _, name, _ in rows):
+        env = {**childenv.clean_env(keep_pulse_config=True), "LC_ALL": "C"}
+        for name, description in _pipewire_descriptions(
+            subprocess.run if run is None else run, env, deadline
+        ).items():
+            descriptions.setdefault(name, description)
+    devices: list[AudioDevice] = []
+    fallback_counts: dict[str, int] = {}
+    for index, name, _ in rows:
+        monitor = name.endswith(".monitor")
+        label = descriptions.get(name)
+        if label is None:
+            fallback = "Звук системы" if monitor else "Микрофон"
+            count = fallback_counts.get(fallback, 0) + 1
+            fallback_counts[fallback] = count
+            label = fallback if count == 1 else f"{fallback} {count}"
+        devices.append(AudioDevice(index, name, label, monitor, index_exact=True))
+    return devices
+
+
+def list_devices(
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    deadline: _OpenDeadline | None = None,
+) -> list[AudioDevice]:
+    """Читает провайдер готового контекста либо прежний список pactl/pw-dump."""
+    run = subprocess.run if run is None else run
+    if run is subprocess.run:
+        provided = _provided_devices(deadline)
+        if provided is not None:
+            return provided[0]
     env = {**childenv.clean_env(keep_pulse_config=True), "LC_ALL": "C"}
     message = "Не удалось получить список устройств записи."
     output = _run_text(run, ["pactl", "list", "short", "sources"], env, deadline)
     if output is None:
-        # Без pulseaudio-utils спрашиваем саму звуковую службу (находка на Fly).
         fallback_devices = _pipewire_devices(run, env, deadline)
         if fallback_devices is None:
             raise AudioError(ERROR_FAILED, message)
         return fallback_devices
     logger.debug("pactl list short sources: строк %d", len(output.splitlines()))
-
     descriptions = _device_descriptions(run, env, deadline)
-    rows = [line.split("\t") for line in output.splitlines()]
-    if any(len(fields) >= 2 and fields[1] not in descriptions for fields in rows):
-        # У pactl нет описаний (Astra: «(null)») — спрашиваем саму звуковую службу.
-        for pw_name, pw_description in _pipewire_descriptions(run, env, deadline).items():
-            descriptions.setdefault(pw_name, pw_description)
-    devices: list[AudioDevice] = []
-    fallback_counts: dict[str, int] = {}
+    rows = []
     for line in output.splitlines():
         fields = line.split("\t")
         if len(fields) < 2 or any(not field.strip() for field in fields[:2]):
@@ -472,44 +535,34 @@ def list_devices(
             index = int(fields[0])
         except ValueError:
             continue
-        if index < 0:
-            continue
-        name = fields[1]
-        monitor = name.endswith(".monitor")
-        description = descriptions.get(name)
-        if description is None:
-            fallback = "Звук системы" if monitor else "Микрофон"
-            count = fallback_counts.get(fallback, 0) + 1
-            fallback_counts[fallback] = count
-            description = fallback if count == 1 else f"{fallback} {count}"
-        devices.append(
-            AudioDevice(
-                index=index,
-                name=name,
-                description=description,
-                monitor=monitor,
-            )
-        )
-    return devices
+        if index >= 0:
+            rows.append((index, fields[1], descriptions.get(fields[1])))
+    return _build_devices(rows, run=run, deadline=deadline)
 
 
 def default_device(
     devices: list[AudioDevice],
     *,
-    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     deadline: _OpenDeadline | None = None,
 ) -> AudioDevice:
     """Проверяет фактическое умолчание, запрещая неявную запись звука системы."""
-    message = "Микрофон не найден. Выберите устройство записи в настройках."
+    run = subprocess.run if run is None else run
+    if run is subprocess.run:
+        provided = _provided_devices(deadline)
+        if provided is not None:
+            return _default_from_name(provided[1], provided[0])
     env = {**childenv.clean_env(keep_pulse_config=True), "LC_ALL": "C"}
     output = _run_text(run, ["pactl", "get-default-source"], env, deadline)
     if output is None:
         output = _pipewire_default_name(run, env, deadline)
-    if output is None:
-        logger.debug("Не удалось узнать устройство записи по умолчанию.")
-        raise AudioError(ERROR_NO_DEVICE, message)
+    return _default_from_name(output, devices)
 
-    name = output.strip()
+
+def _default_from_name(name: str | None, devices: list[AudioDevice]) -> AudioDevice:
+    """Проверяет имя умолчания одинаково для libpulse и запасного пути."""
+    message = "Микрофон не найден. Выберите устройство записи в настройках."
+    name = name.strip() if name is not None else ""
     if not name or name in ("@DEFAULT_SOURCE@", "@NONE@"):
         logger.debug("Не задано устройство записи по умолчанию: %r", name)
         raise AudioError(ERROR_NO_DEVICE, message)
@@ -712,6 +765,8 @@ class AudioCapture:
         self._silent_uid: str | None = None
         self._first_open = True
         self._warmed = False
+        self._warmup_thread: threading.Thread | None = None
+        self._shutdown = False
         self._previous_device: AudioDevice | None = None
 
     def start(self, utterance_id: str, device: str | None, *, limit_s: float) -> None:
@@ -1001,15 +1056,33 @@ class AudioCapture:
     def warm_up(self, device: str | None = None) -> bool:
         """Однократно прогревает путь открытия без микрофона (PRD §9.5).
 
-        Поток записи не создаётся: только опрос устройств и соединение со службой.
+        audio-warmup сохраняет контекст для open; pa_stream не создаётся.
         Возвращает, запущен ли прогрев.
         """
         warm = getattr(self._source, "warm_up", None)
-        if self._warmed or not callable(warm) or self._running.is_set():
+        if self._shutdown or self._warmed or not callable(warm) or self._running.is_set():
             return False
         self._warmed = True
-        threading.Thread(target=warm, args=(device,), name="audio-warmup", daemon=True).start()
+        self._warmup_thread = threading.Thread(
+            target=warm, args=(device,), name="audio-warmup", daemon=True
+        )
+        self._warmup_thread.start()
         return True
+
+    def shutdown(self) -> None:
+        """Останавливает захват и прогрев до освобождения постоянного контекста."""
+        self._shutdown = True
+        self.request_stop()
+        if self._warmup_thread is not None:
+            self._warmup_thread.join(timeout=OPEN_TOTAL_DEADLINE_S + 1.0)
+            if self._warmup_thread.is_alive():
+                logger.debug("Прогрев звука не завершился к сроку выхода.")
+                return
+        # close тоже берёт замок контекста, поэтому stop идёт после join прогрева.
+        self.stop()
+        shutdown = getattr(self._source, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
 
     def request_stop(self, *, cancel: bool = False) -> None:
         """Снимает флаг работы без ожидания потока и обращения к источнику.
