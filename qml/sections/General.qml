@@ -23,11 +23,25 @@ Column {
     readonly property bool micMuted: root.settings ? root.settings.microphoneMuted : false
     readonly property int micVolume: root.settings ? root.settings.microphoneVolume : -1
 
-    Component.onCompleted: {
+    // SettingsBridge подключается и после engine.load(): первый показ должен
+    // прочитать состояние, а ранний мост — сделать это только один раз.
+    property bool settingsReady: false
+    property var refreshedSettings: null
+
+    function refreshSettings() {
+        if (!root.settingsReady || root.settings === root.refreshedSettings)
+            return
+        root.refreshedSettings = root.settings
         if (root.settings) {
             root.settings.refreshDevices()
             root.settings.refreshMicrophone()
         }
+    }
+
+    onSettingsChanged: root.refreshSettings()
+    Component.onCompleted: {
+        root.settingsReady = true
+        root.refreshSettings()
     }
     Component.onDestruction: {
         if (root.settings)
