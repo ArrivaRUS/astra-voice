@@ -185,6 +185,7 @@ class DictationRuntime(QObject):
         self._command_session: SessionMonitor | None = None
         self._command_mode: CommandMode | None = None
         self._command_notifier: QSocketNotifier | None = None
+        self._command_regrab_timer: QTimer | None = None
         self._command_handlers_registered = False
         self._command_owner = False
         self._command_suspended = False
@@ -438,6 +439,7 @@ class DictationRuntime(QObject):
             else (self._command_session.snapshot() if self._command_session else SessionSnapshot())
         )
         if not snapshot.allowed or not self._command_snapshot().allowed:
+            self._stop_command_regrab()
             self.reject_command()
             self.end_hotkey_capture()
             self.orchestrator.command_session_changed(snapshot)
@@ -474,25 +476,34 @@ class DictationRuntime(QObject):
 
     def reload_command_hotkey(self) -> bool:
         manager = self.command_hotkey
-        if manager is None:
+        if self._closed or manager is None:
+            self._stop_command_regrab()
             return False
         manager.ungrab()
         if not self.settings.command_hotkey:
+            self._stop_command_regrab()
             self.command_status = "Клавиша команды не распознана — выберите заново"
             self.reject_command()
             self._command_changed()
             return False
         if not self.settings.command_enabled:
+            self._stop_command_regrab()
             self.reject_command()
             return False
         if not self._command_snapshot().allowed:
+            self._stop_command_regrab()
             return False
         command_signature = manager.signature(self.settings.command_hotkey)
         text_signature = self.hotkey.signature(self.settings.hotkey)
-        if command_signature is None or command_signature == text_signature:
+        if (
+            command_signature is None
+            or text_signature is None
+            or command_signature == text_signature
+        ):
+            self._stop_command_regrab()
             self.command_status = (
                 "Клавиша команды совпадает с клавишей «Текст» — выберите другую"
-                if command_signature is not None
+                if command_signature is not None and command_signature == text_signature
                 else "Клавиша команды не распознана — выберите заново"
             )
             self._command_changed()
@@ -508,8 +519,63 @@ class DictationRuntime(QObject):
             self._command_notifier.activated.connect(self._process_command_hotkey)
         if not result.ok:
             self.command_status = "Клавиша команды занята — выберите другую"
+            self._start_command_regrab()
+        else:
+            self._stop_command_regrab()
+            self.command_status = (
+                "Astra Cowork найден · доступен"
+                if self._command_owner
+                else "Astra Cowork найден · не запущен"
+            )
         self._command_changed()
         return result.ok
+
+    def _start_command_regrab(self) -> None:
+        if (
+            self._closed
+            or not self.settings.command_enabled
+            or not self._command_snapshot().allowed
+            or self._command_regrab_timer is not None
+        ):
+            return
+        timer = self._create_timer()
+        self._command_regrab_timer = timer
+        timer.setSingleShot(False)
+        timer.timeout.connect(self.reload_command_hotkey)
+        timer.start(REGRAB_INTERVAL_MS)
+
+    def _stop_command_regrab(self) -> None:
+        timer, self._command_regrab_timer = self._command_regrab_timer, None
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+
+    def _command_mapping_changed(self, reason: str) -> None:
+        # Treat mapping reports as control events, not fresh recording states.
+        # Losing either cancellation or release must not leave the microphone on.
+        if not self._command_snapshot().allowed:
+            self._command_session_changed()
+            return
+        if not self._validate_command_mapping():
+            return
+        manager = self.command_hotkey
+        if manager is None:
+            return
+        code, _, escape = reason.removeprefix(MAPPING_REGRAB_PREFIX).partition(";")
+        lost = (
+            code != "ok"
+            or (escape.startswith("escape:") and escape != "escape:ok")
+            or manager.mapping_release_lost
+        )
+        if not lost:
+            self._stop_command_regrab()
+            return
+        # ungrab cancels pending 300ms and emits Escape for recording/processing.
+        # Preview is cancelled; actual Submit remains pending in the orchestrator.
+        manager.ungrab()
+        self.command_status = "Клавиша команды потеряна после смены раскладки — повторяем захват"
+        self._start_command_regrab()
+        self._command_changed()
 
     def _validate_command_mapping(self) -> bool:
         manager = self.command_hotkey
@@ -518,6 +584,7 @@ class DictationRuntime(QObject):
         command = manager.signature(self.settings.command_hotkey)
         text = self.hotkey.signature(self.settings.hotkey)
         if command is None or text is None or command == text:
+            self._stop_command_regrab()
             manager.ungrab()
             self.command_status = (
                 "Клавиша команды недоступна после смены раскладки — выберите заново"
@@ -534,7 +601,8 @@ class DictationRuntime(QObject):
         manager = self.command_hotkey
         if self._closed or manager is None:
             return
-        if reason.startswith(MAPPING_REGRAB_PREFIX) and not self._validate_command_mapping():
+        if reason.startswith(MAPPING_REGRAB_PREFIX):
+            self._command_mapping_changed(reason)
             return
         if (
             state == HotkeyState.IDLE
@@ -2094,6 +2162,7 @@ class DictationRuntime(QObject):
             for action in ("command-copy", "command-details", "command-launch"):
                 notify.set_action_handler(action, None)
             self._command_handlers_registered = False
+        self._stop_command_regrab()
         self.reject_command()
         if self._command_notifier is not None:
             self._command_notifier.setEnabled(False)

@@ -486,6 +486,7 @@ class HotkeyManager:
         self._escape_grabbed = False
         self._escape_keycode: int | None = None
         self._key_down = False
+        self.mapping_release_lost = False
         # Перезахват после смены карты не удался; grab() того же сочетания восстановит.
         self._lost = False
         # Диагностика журнала: пары автоповтора за удержание и пропуски нажатий подряд.
@@ -532,6 +533,7 @@ class HotkeyManager:
         return result
 
     def ungrab(self) -> None:
+        self.mapping_release_lost = False
         self._deferred_press = None
         if self._combo is None:
             self.last_result = GrabResult("not-grabbed")
@@ -670,6 +672,14 @@ class HotkeyManager:
         if self._combo is None or self._combo not in event.combos:
             return
         self.last_result = event.combos[self._combo]
+        # A successful new grab cannot deliver release of the old physical key.
+        # Expose the lost PTT stop edge without changing ordinary text policy.
+        self.mapping_release_lost = (
+            self._key_down
+            and self.fsm.state == HotkeyState.RECORDING
+            and self.fsm.mode == HotkeyMode.PTT
+            and self._keycode != self.last_result.keycode
+        )
         if self._keycode != self.last_result.keycode:
             self._key_down = False
         self._keycode = self.last_result.keycode

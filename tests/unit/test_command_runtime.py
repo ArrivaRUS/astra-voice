@@ -134,6 +134,7 @@ def test_mapping_change_revokes_command_grab_if_roles_become_ambiguous(
 
     rig = Rig(monkeypatch, session_kind=SessionKind.KDE)
     runtime = rig.runtime
+    runtime._command_session = Mock(snapshot=lambda: SessionSnapshot(known=True, locked=False))
     runtime.command_hotkey = Mock()
     runtime.command_hotkey.signature.return_value = command_signature
     rig.hotkey.signature.return_value = (65, 4)
