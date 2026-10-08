@@ -1,0 +1,85 @@
+{
+  "verified_head": "12f632cdf96481b8adabcc345471cd4f3002142c",
+  "production_files_sha256": {
+    "src/astra_voice/runtime.py": "0208efdfab3f1b09880a48a61947fbda476a6c661c801732782579dfc23e554d",
+    "src/astra_voice/platform/hotkey.py": "6ad36e88455282b3c8e20f82785f2e063e96ee8647faed251268d011c1afe77c",
+    "src/astra_voice/core/dictation.py": "f617e8c04c221663be5b44b5f3ab8e9ae9c80ec737fedd9e8135b0dfe4cb75ae",
+    "src/astra_voice/platform/cowork.py": "a5a680a3b212f87f1ee37b5b5177737a448f2a6118571f3a64ee5e900080dd02",
+    "src/astra_voice/core/command_mode.py": "b98041a6018e99441372a2006fe0279bdc5f4fd1716acd5d96f7666b095c0bbc",
+    "src/astra_voice/platform/session_state.py": "7adff86840cd03284fd1275809c6d9aeb38e91351debabacd65020359ff451ab",
+    "src/astra_voice/app.py": "b7ebb52aa37679801357b746b06682294647a759c44cd2aa60e9085fb6d6387a"
+  },
+  "production_unchanged_during_acceptance": true,
+  "acceptance_manifest_sha256": "7ae4e50e28e5fb34a6ea36e39c731531d48656be5928728769db617390bb0236",
+  "acceptance_files_sha256": {
+    "tests/command_acceptance/README.md": "efd360ed8d2d18c739fa48a450f229682cf339b29444c03b58144b38b3ed9a51",
+    "tests/command_acceptance/__init__.py": "8f2afc79f570f1f0719849da14e18c53d24b5a97ede879bb296d92949a7922ee",
+    "tests/command_acceptance/bus_scenarios.py": "348d06449a70cc0a23215452462bbcacf1b700873c1b96ef093c59ce1a226351",
+    "tests/command_acceptance/conftest.py": "52f5f067252efbb6ced03cb5c567d3a2ce0ca50d71bb1e8ee4786a27376c2108",
+    "tests/command_acceptance/fake_login1.py": "0b063de841af2533ee4d0b813a7a665a445c4abb67929fb049b2fb9f7eab0a94",
+    "tests/command_acceptance/fake_server.py": "83596280adda8e5cdf846d430c4c541c3deeb1a2a64a52cc42baf69a07429bfe",
+    "tests/command_acceptance/login1_scenario.py": "63504d9f99e53e1e7bedd90edcfd37582dd860280df82a44daedb7320aa8d0a3",
+    "tests/command_acceptance/test_login1_wire.py": "d9cc2be0b49ef358c2feeab896efb68b3696a5fdad27edaa6a0f5087891b8b41",
+    "tests/command_acceptance/test_mapping_loss.py": "9f1f93d1b229ccd7ab3ba5a04556f0ec22f456a8681772076a2a716b3deb6ba5",
+    "tests/command_acceptance/test_model_trust.py": "ca1aa46e7606266c8348f2c8000db94c0fa3e04eb5f4ac2444fc77f2a5de5429",
+    "tests/command_acceptance/test_orchestration.py": "4ce9294a4d7ef40a166a68c7e8d570f596c49fd079b040caa0a5976effc5dfb2",
+    "tests/command_acceptance/test_payload.py": "8cd7147e82fba7567f4947fbcd27279b6c07537bb77cdc56d82c588c6f3a3658",
+    "tests/command_acceptance/test_private_bus.py": "23d35cd57bfa42a7c4838ba119b04d1ce59b9f2d6aada4aeca80f40e373b4453",
+    "tests/command_acceptance/test_publication.py": "5e93af775b87db9862351244d83d7eabf2d3b7cc14fc62c6e69b97f52b474126",
+    "tests/command_acceptance/test_runtime_routing.py": "e0eb698d32b8d01f523efdeea4a0a0b7b7f2d014b71076deb5daf6dd554a86fd",
+    "tests/command_acceptance/test_session_cache.py": "72a3bcb0471d23656e2ae844c33fcc8bc239866e3a20df842857dd0e7578bd0b"
+  },
+  "pytest": {
+    "argv": [
+      "/home/astra/.cache/astra-voice-dev/venv-a/bin/pytest",
+      "tests/command_acceptance",
+      "-m",
+      "unit"
+    ],
+    "returncode": 0,
+    "output": "........................................................................ [ 42%]\n........................................................................ [ 85%]\n........................                                                 [100%]\n168 passed in 6.81s\n"
+  },
+  "checks": {
+    "ruff": {
+      "argv": [
+        "/home/astra/.cache/astra-voice-dev/venv-a/bin/ruff",
+        "check",
+        "tests/command_acceptance"
+      ],
+      "returncode": 0,
+      "output": "All checks passed!\n"
+    },
+    "format": {
+      "argv": [
+        "/home/astra/.cache/astra-voice-dev/venv-a/bin/ruff",
+        "format",
+        "--check",
+        "tests/command_acceptance"
+      ],
+      "returncode": 0,
+      "output": "16 files already formatted\n"
+    },
+    "mypy": {
+      "argv": [
+        "/home/astra/.cache/astra-voice-dev/venv-a/bin/mypy",
+        "tests/command_acceptance"
+      ],
+      "returncode": 0,
+      "output": "Success: no issues found in 15 source files\n"
+    }
+  },
+  "historical_snapshot": "snapshot.json preserves 2026-10-07 base a23095f (not current evidence)",
+  "counterfactual": {
+    "source_commit": "0bae9dad0f4ade493840369bdd682860f94aee3e",
+    "replacement": "only DictationRuntime._on_command_hotkey_state replaced in process memory from AST; no file changes",
+    "result": "10 failed, 8 passed in 0.21s"
+  },
+  "isolation": {
+    "QT_QPA_PLATFORM": "offscreen",
+    "DISPLAY": "unset",
+    "WAYLAND_DISPLAY": "unset",
+    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent",
+    "DBUS_SYSTEM_BUS_ADDRESS": "unix:path=/nonexistent",
+    "IPC": "own activation-free session bus, no user/system service calls"
+  }
+}

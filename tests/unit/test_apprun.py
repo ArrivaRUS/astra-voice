@@ -11,6 +11,7 @@ import ast
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -633,6 +634,23 @@ def _policy_boot(bundle: Path, config: Path, system: Path) -> None:
     )
 
 
+def _policy_denied_stderr(config: Path) -> str:
+    """Exact diagnostics for the real temporary file, under either root or ordinary UID.
+
+    The bootstrap's geteuid shim does not change file ownership. Do not silence
+    the permission warning or make the test policy pretend to be root-owned.
+    """
+    info = config.stat()
+    mode = stat.S_IMODE(info.st_mode)
+    warning = ""
+    if info.st_uid != 0 or mode & 0o022:
+        warning = (
+            f"политика {config}: небезопасные права (uid={info.st_uid}, mode={mode:04o}); "
+            "ожидается владелец root и запрет записи группе и остальным\n"
+        )
+    return warning + policy.APPIMAGE_DENIED_MESSAGE + "\n"
+
+
 @pytest.mark.parametrize("script", [APPRUN, KEYLIB])
 def test_apprun_does_not_parse_policy(script: Path) -> None:
     """P2-2: одна точка правды для appimage=deny — core/policy.py, в AppRun разбора нет."""
@@ -659,7 +677,7 @@ def test_policy_denial_stops_before_copy(
     _policy_boot(extracted, config, tmp_path / "no-deb" / "astra-voice")
     proc = _run(extracted / "AppRun", [], env, shell)
     assert proc.returncode == 3
-    assert proc.stderr == policy.APPIMAGE_DENIED_MESSAGE + "\n"
+    assert proc.stderr == _policy_denied_stderr(config)
     assert not _app(env).exists()
     assert [call.split("|")[0] for call in _calls(env)] == ["selfinstall"]
     assert extracted.exists()
@@ -705,8 +723,10 @@ def test_policy_table_matches_python(tmp_path: Path, env: dict[str, str], case: 
     proc = _run(extracted / "AppRun", ["--hidden"], env)
     if denied:
         assert proc.returncode == 3
-        assert proc.stderr == policy.APPIMAGE_DENIED_MESSAGE + "\n"
+        assert proc.stderr == _policy_denied_stderr(config)
         assert not _app(env).exists()
+        assert [call.split("|")[0] for call in _calls(env)] == ["selfinstall"]
+        assert extracted.exists()
     else:
         assert proc.returncode == 0, proc.stderr
         assert os.readlink(_app(env) / "current") == KEY
@@ -723,7 +743,7 @@ def test_python_policy_denial_stops_without_fallback(
     _policy_boot(bundle, config, tmp_path / "no-deb" / "astra-voice")
     proc = _run(bundle / "AppRun", ["--hidden"], _fuse_env(tmp_path, env, bundle))
     assert proc.returncode == 3
-    assert proc.stderr == policy.APPIMAGE_DENIED_MESSAGE + "\n"
+    assert proc.stderr == _policy_denied_stderr(config)
     assert [call.split("|")[0] for call in _calls(env)] == ["selfinstall"]
     assert not _app(env).exists()
     assert bundle.exists()
