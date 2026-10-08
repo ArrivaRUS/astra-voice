@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import fnmatch
 import hashlib
 import importlib
@@ -374,6 +375,8 @@ def check_openssl(
             problems.append(f"{name} не загружена в процесс (нет в /proc/self/maps)")
     allowed = {os.path.realpath(d) for d in host_dirs}
     for name, paths in sorted(loaded.items()):
+        if origin == "host" and name not in wanted:
+            problems.append(f"{name}: загружена лишняя версия OpenSSL, ожидалась {major}")
         for path in sorted(paths):
             inside = not outside(path, appdir)
             if origin == "host" and inside:
@@ -382,6 +385,36 @@ def check_openssl(
                 problems.append(f"{name} загружена не из системного каталога: {path}")
             elif origin == "bundled" and not inside:
                 problems.append(f"{name} загружена не из бандла: {path}")
+    return problems
+
+
+# QtNetwork нужен для QLocalSocket/QLocalServer; TLS остаётся в Python net/http.py.
+QT_TLS_CLASSES = frozenset({"QSslSocket", "QNetworkAccessManager", "QNetworkRequest"})
+
+
+def check_qt_tls(root: Path) -> list[str]:
+    """Не допустить прямого использования Qt TLS/HTTP в коде программы (T-194)."""
+    problems: list[str] = []
+    for source in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        except (OSError, UnicodeError, SyntaxError) as exc:
+            problems.append(f"{source}: не разобран Python для проверки Qt TLS: {exc}")
+            continue
+        for node in ast.walk(tree):
+            name = (
+                node.id
+                if isinstance(node, ast.Name)
+                else node.attr
+                if isinstance(node, ast.Attribute)
+                else node.name
+                if isinstance(node, ast.alias)
+                else ""
+            )
+            if name in QT_TLS_CLASSES:
+                problems.append(
+                    f"{source}:{getattr(node, 'lineno', 0)}: запрещён Qt TLS/HTTP ({name})"
+                )
     return problems
 
 
@@ -582,6 +615,7 @@ def run(
     checked, tree = check_package_tree(lib)
     problems += tree
     problems += check_catalog()
+    problems += check_qt_tls(lib)
 
     # Настоящая работа с OpenSSL до чтения карты памяти: хэш через _hashlib и TLS-контекст.
     hashlib.new("sha256", b"astra-voice").hexdigest()

@@ -1,101 +1,92 @@
-# Правка `.github/workflows/ci.yml` для AppImage — один раз, 05–06.10
+# Предложение CI для AppImage
 
-> Для заказчика. Подготовлено агентом 29.09 в ветке `wip/r2-ci` (arch/appimage.md §9.4, T1 MN-9,
-> T3 P2-2/P2-6). Токен агента не может менять `.github/workflows`, поэтому правку вносите вы
-> в веб-редакторе GitHub. Полный готовый файл — `packaging/appimage/ci.yml.proposed`
-> (проверен тем же гейтом `scripts/ci_lint.py`, что и настоящий workflow); ниже — разница с
-> текущим `ci.yml`.
+Актуализировано относительно `.github/workflows/ci.yml` из коммита
+`5c0e56e9efd95334d972aea3752fd65b348da430` (2026-10-07).
+Полный файл для применения: [ci.yml.proposed](ci.yml.proposed).
+Действующий workflow этим пакетом не изменяется. По принятому порядку владелец
+применяет подготовленный файл в браузере: у токена команды нет права Workflows.
+Пакет сначала проходит независимое ревью и проверку тестировщиком; применение
+и выпуск координируются отдельно.
 
-## Как внести
+## Что изменится
 
-1. Откройте на GitHub `.github/workflows/ci.yml` в ветке `main` → карандаш «Edit».
-2. Замените содержимое файла целиком текстом из `packaging/appimage/ci.yml.proposed` (кнопка
-   «Raw» → выделить всё → скопировать).
-3. «Commit changes» прямо в `main` с сообщением `ci: job appimage и выпуск через скрипты (§9.4)`.
-4. Дождитесь зелёного CI на этом коммите (все job, включая новый «сборка AppImage и гейты»).
+- Добавится job `appimage` в `debian:12`, с лимитом 30 минут. Git устанавливается
+  до checkout; входы кэшируются по `packaging/appimage.lock`. Затем выполняются
+  `build.sh --fetch`, `build.sh` и `smoke.sh`; образ и SBOM выгружаются как артефакт.
+  Без `packaging/appimage/ENABLED` скрипты пропускают сборку и смоук, выгрузка отключена.
+- Job `release` дождётся также `appimage`. `scripts/release_build.sh` заново
+  собирает оба артефакта, устанавливает и проверяет именно выпускаемый `.deb`,
+  проверяет AppImage и создаёт архив исходников. `scripts/release_assets.sh dist`
+  без секрета формирует `latest.json`, `SHA256SUMS` и `assets.txt`.
+- Секрет остаётся только в inline-шаге подписи внутри Environment `release`.
+  Существующие проверки ключа и полученной подписи сохранены. Временная связка
+  ключей удаляется через `EXIT` trap также при отказе; после импорта переменная
+  секрета снимается. Репозиторные скрипты сборки и подготовки ассетов секрета не получают.
+- `gh` устанавливается обычным `apt-get install` из репозиториев контейнера
+  Debian bookworm на этапе инструментов, до подписи. Внешний apt-репозиторий
+  GitHub CLI не добавляется. `GH_TOKEN` передаётся только шагу публикации;
+  он публикует список `dist/assets.txt` и ничего не устанавливает (П25/MN-19).
+- Каждый checkout получает `persist-credentials: false`. Глобальное
+  `contents: read`, единственное `contents: write` у `release`, Environment,
+  tag gate, проверка принадлежности тега `main` и пины Actions сохраняются.
 
-## Что сверить глазами (простым языком)
+Все прежние jobs, их команды, таймауты, окружение, фильтры запуска, шрифтовый гейт
+и проверки движка сохранены; в шести jobs вне выпуска меняется только сохранение
+credentials после checkout. Старые дополнительные правки `paths-ignore` и unit
+import gate сюда не переносятся. Лимит job `release` остаётся текущим — 20 минут.
+Достаточность этого лимита с полной сборкой AppImage ещё не измерена в GitHub CI.
+Локальное послабление для незакреплённых хэшей в workflow не включено.
 
-- **Новых секретов нет.** Ключ подписи по-прежнему виден только шагу «Отсоединённая подпись
-  SHA256SUMS» в job `release`, и этот шаг не запускает скриптов репозитория, кроме прежней
-  проверки ключа `check_signing_secret.py`.
-- **Права не расширены.** Наверху файла, как и раньше, `contents: read`; право записи — только
-  у job `release`; `environment: release` (ваше одобрение перед выпуском) на месте.
-- **Сторонние действия — те же и по тем же отпечаткам**: `checkout`, `cache`, `upload-artifact`
-  с теми же длинными SHA, что уже стоят в файле. Новых действий из интернета нет.
-- **Везде `persist-credentials: false`** — после скачивания кода токен GitHub не остаётся на
-  диске сборочной машины (находка ИБ T3 P2-2).
-- **Новый job `appimage`** ставит `git` (как уже делает job `release`) и дальше только вызывает три скрипта из репозитория: `build.sh --fetch`
-  (скачать закреплённые по хэшу входы), `build.sh` (собрать и проверить), `smoke.sh`
-  (проверить готовый файл). Если в репозитории нет файла `packaging/appimage/ENABLED`,
-  скрипты ничего не делают и job зелёный.
-- **Job `release`** вместо россыпи команд вызывает `scripts/release_build.sh` (собрать `.deb`,
-  **поставить именно этот пакет** и проверить — находка ИБ T3 P2-6; собрать AppImage при
-  `ENABLED`) и `scripts/release_assets.sh` (список файлов, суммы, `latest.json` — без ключа
-  подписи). Публикует ровно список из `dist/assets.txt`.
-- **Послаблений сборки нет:** слова `ASTRA_VOICE_APPIMAGE_ALLOW_TODO_HASH` в файле быть не
-  должно (это режим только для локальной проверки; `ci_lint.py` краснеет, если оно появится).
-- **Не запускать CI на правках документов:** добавлены `arch/**` и `spikes/**` — это
-  архитектурные заметки и черновики, в пакеты они не попадают.
+## Как применить
 
-После этой правки менять workflow ради AppImage больше не нужно: снять AppImage с выпуска —
-удалить `packaging/appimage/ENABLED`; поменять сборку — правка в `packaging/appimage/*`.
+1. После ревью выбрать согласованный коммит с этим пакетом. Перед заменой
+   сравнить его `.github/workflows/ci.yml` с текущим файлом целевой ветки.
+   SHA256 исходного файла для этого предложения:
+   `fa521606fba1aed81bcd896b3002174a2f73e09100ba7eecfc375d86c238f56d`.
+   Если workflow изменился, сначала обновить предложение, сохранив новые правки.
+2. Открыть `packaging/appimage/ci.yml.proposed` **из выбранного коммита** через
+   Raw и скопировать весь файл. Открыть `.github/workflows/ci.yml` целевой ветки
+   в редакторе GitHub и заменить содержимое.
+3. Сохранить правку в отдельной ветке и открыть PR в `main`. Сверить diff с
+   приведённым ниже и дождаться семи проверок: `lint`, `unit`, `xvfb`, `ci-lint`,
+   `engine`, `deb`, `appimage`. Job `release` на обычном PR пропускается по tag gate.
+4. После зелёного CI и ревью согласовать слияние с координатором. Для исправления
+   красного job передать ссылку на прогон; повторные изменения workflow могут
+   потребоваться, если проблема окажется в его командах или окружении.
 
-## Пункты §9.4 и где они в правке
+Тег ради проверки этого пакета создавать не нужно. Проверка job `release`
+потребует отдельно разрешённого выпуска и одобрения Environment. Этот пакет
+не снимает оставшиеся условия выпуска AppImage, включая вопрос исходников GCC;
+запрет их скачивания сохраняется.
 
-| §9.4 | Что | В правке |
-|---|---|---|
-| п.1 | job `appimage`: `debian:12`, 30 мин, без `needs`, git до checkout (сборка берёт только файлы под Git), checkout без токена, apt, кэш по `hashFiles('packaging/appimage.lock')`, `build.sh --fetch` → `build.sh` → `smoke.sh`, выгрузка образа и SBOM | job `appimage`; к списку apt добавлены `curl ca-certificates gpgv util-linux python3-pip` (скачивание, проверка подписи runtime, запуск не от root, `pip download`) и хостовые библиотеки Qt по замеру спайка; выгрузка — только при `ENABLED` (`if: hashFiles(...)`), иначе `if-no-files-found: error` ронял бы выключенный job |
-| п.2 | job `release`: `needs` + `appimage`, 35 мин, checkout без токена, apt из п.1, `scripts/release_build.sh`, `scripts/release_assets.sh dist` без `env`, подпись отдельно, `gh release create … $(cat dist/assets.txt)` | job `release` |
-| п.3 | `paths-ignore`: `arch/**`, `spikes/**` | `on.push.paths-ignore`; белый список `scripts/ci_lint.py` расширен в этой же ветке |
-| п.4 | больше ничего: `permissions`, пины SHA, `environment: release`, запрет `pull_request_target` | без изменений; `ci_lint.py` зелёный на `ci.yml.proposed` (тест `test_proposed_workflow_passes`) |
-| п.5 | отдельный job подписи (T-121) | не входит, v1.0 |
+## Проверки и ограничения
 
-Сверх §9.4: в job `unit` гейт `ci_require_imports.py` проверяет и `tests/net`, `tests/updates`
-(сетевые проверки M7 не должны молча пропускаться без `requests`; каталога ещё нет — пропуск).
-Сверх §9.4: `persist-credentials: false` добавлен и в остальные job (`lint`, `unit`, `xvfb`,
-`ci-lint`, `engine`, `deb`) — так требует T-131 (T3 P2-2: «во всех checkout»); на сборку не влияет.
+Офлайн-команды для подготовленного файла:
 
-## Находки ИБ, которые закрывает правка
+```sh
+python3 scripts/ci_lint.py .github/workflows/ci.yml packaging/appimage/ci.yml.proposed
+python3 -m pytest tests/unit/test_appimage_workflow_proposal.py tests/unit/test_ci_lint.py -q
+python3 -m pytest tests/unit/test_appimage_packaging.py -k 'proposed or patch_doc' -q
+```
 
-- **T3 P2-2** — `actions/checkout` оставлял токен GitHub с правом записи в `.git/config`, и любой
-  следующий шаг мог им воспользоваться. Теперь `persist-credentials: false` везде; публикация
-  идёт явным `GH_TOKEN` только в шаге «Публикация». Суммы и `latest.json` собираются в шаге
-  **без** секрета подписи (`release_assets.sh` сам проверяет, что секрета в окружении нет).
-- **T3 P2-6** — раньше подписывался `.deb`, пересобранный в job `release`, а проверку установки
-  проходил другой, из job `deb`. Теперь `release_build.sh` ставит в систему ровно подписываемый
-  файл, запускает `astra-voice --version` и смоук и сверяет, что sha256 пакета не изменился.
-- **T1 MN-9** — число ELF и предельная glibc для AppImage берутся из `packaging/appimage.lock`
-  (`# expect-elf:`, `# max-glibc:`); новый ELF из обновлённого колеса роняет job `appimage`.
+Новый тест сопоставляет существующие jobs и настройки с действующим CI,
+проверяет область секретов, установку `gh` до публикации, точность diff ниже
+и синтаксис всех `run` через `bash -n` без исполнения команд. Существующие тесты
+проверяют пины, permissions, tag gate, checkout без credentials и разделение
+сборки/ассетов/подписи. Команды pytest выполняются в проектном venv с изоляцией
+Qt/D-Bus, принятой в регламенте команды.
 
-## Что должно быть готово в репозитории до правки (делает команда, не вы)
+Эти проверки не запускают GitHub Actions, сеть, установку пакетов, GUI,
+сборку образа или публикацию. Доступность пакетов в контейнере, фактическое время
+сборки и первый прогон нового job остаются непроверенными. Исторические результаты
+сборки не считаются результатами этого предложения.
 
-- Готово 29.09: хэши `jsonschema`/`attrs`/`pyrsistent` закреплены в `packaging/appimage.lock`
-  (сверены с PyPI), ключ подписи runtime AppImage `packaging/appimage/keys/appimage-runtime.gpg`
-  взят из репозитория проекта AppImage, отпечаток `570C77ACEA40C0F1B758902CBF96CCA56490F695`
-  совпал со строкой `# runtime-key:` в lock.
-- Ветка проверена локально: `scripts/ci_lint.py` на `ci.yml.proposed`, юнит-тесты, локальная
-  сборка образа. **Первый прогон нового job в GitHub Actions будет у вас, сразу после правки:**
-  у токена команды нет права Workflows, запустить новый job до вашей правки мы не можем. Если
-  job `appimage` покраснеет — пришлите ссылку на прогон, чинится правкой `packaging/appimage/*`
-  без повторной правки workflow.
-
-## Разница с текущим `ci.yml`
+## Точный diff относительно действующего workflow
 
 ```diff
 --- .github/workflows/ci.yml
 +++ .github/workflows/ci.yml
-@@ -21,6 +21,9 @@
-       - 'docs/status.md'
-       - 'docs/plans.md'
-       - 'docs/test-plan.md'
-+      # Архитектура и спайки не входят ни в .deb, ни в AppImage (arch/appimage.md §9.4 п.3).
-+      - 'arch/**'
-+      - 'spikes/**'
-   pull_request:
-     branches: [main]
- 
-@@ -44,6 +47,8 @@
+@@ -44,6 +44,8 @@
      container: debian:12
      steps:
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
@@ -104,7 +95,7 @@
        - name: Системные пакеты
          run: |
            apt-get update
-@@ -62,6 +67,8 @@
+@@ -62,6 +64,8 @@
      container: debian:12
      steps:
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
@@ -113,19 +104,7 @@
        - name: Системные пакеты
          # test_real_qml_* грузит настоящий qml/Pill.qml; нужны QML-модули.
          # Трей рендерит SVG плагином Qt из libqt5svg5.
-@@ -86,7 +93,10 @@
-         run: |
-           # --also yaml: test_ci_lint.py пропускает себя без PyYAML не через
-           # importorskip, а вручную — гейт об этом сам не узнает.
--          "$VENV/bin/python" scripts/ci_require_imports.py tests/unit --also yaml
-+          # tests/net и tests/updates (M7) — тоже unit и тоже на requests; пока
-+          # каталога нет в дереве, --if-exists его пропускает.
-+          "$VENV/bin/python" scripts/ci_require_imports.py tests/unit \
-+            --if-exists tests/net tests/updates --also yaml
-       - run: make test VENV=$VENV
-         env:
-           ASTRA_VOICE_REQUIRE_QT: "1"
-@@ -100,6 +110,8 @@
+@@ -100,6 +104,8 @@
      container: debian:12
      steps:
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
@@ -134,7 +113,7 @@
        - name: Системные пакеты (Qt + виртуальный дисплей)
          # Трей рендерит SVG плагином Qt; libqt5svg5 нужен явно.
          run: |
-@@ -147,6 +159,8 @@
+@@ -147,6 +153,8 @@
      container: debian:12
      steps:
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
@@ -143,7 +122,7 @@
        - run: |
            apt-get update
            apt-get install -y --no-install-recommends python3 python3-yaml
-@@ -160,6 +174,8 @@
+@@ -160,6 +168,8 @@
      container: debian:12
      steps:
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
@@ -152,7 +131,7 @@
        - name: Системные пакеты
          run: |
            apt-get update
-@@ -236,6 +252,8 @@
+@@ -236,6 +246,8 @@
      container: debian:12
      steps:
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
@@ -161,7 +140,7 @@
        - name: Инструменты сборки
          run: |
            apt-get update
-@@ -273,12 +291,60 @@
+@@ -273,10 +285,58 @@
              dist/sbom.cdx.json
            if-no-files-found: error
  
@@ -219,12 +198,9 @@
 -    needs: [lint, unit, xvfb, engine, ci-lint, deb]
 +    needs: [lint, unit, xvfb, engine, ci-lint, deb, appimage]
      runs-on: ubuntu-latest
--    timeout-minutes: 20
-+    timeout-minutes: 35
+     timeout-minutes: 20
      container: debian:12
-     # Секрет подписи живёт только здесь: Environment с required reviewer.
-     environment: release
-@@ -292,6 +358,7 @@
+@@ -292,6 +352,7 @@
        - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.0.0
          with:
            fetch-depth: 0
@@ -232,12 +208,12 @@
        - name: Версия тега и changelog
          run: |
            version="${GITHUB_REF_NAME#v}"
-@@ -306,9 +373,14 @@
+@@ -306,9 +367,14 @@
            # Для гейта смоука установленного дерева: модули UI импортируют PyQt5 на уровне модуля.
            apt-get install -y --no-install-recommends \
              build-essential debhelper dh-python devscripts dpkg-dev fakeroot \
 -            lintian file binutils git make gnupg gpgv curl jq \
-+            lintian file binutils git make gnupg gpgv curl jq patch ca-certificates util-linux \
++            lintian file binutils git make gnupg gpgv curl jq patch ca-certificates util-linux gh \
              python3 python3-venv python3-pip python3-pyqt5 python3-pyqt5.qtquick \
 -            python3-requests python3-jsonschema
 +            python3-requests python3-jsonschema \
@@ -249,7 +225,7 @@
        - name: Тег стоит на коммите из main
          run: |
            test -d .git || { echo "::error::Checkout без истории Git"; exit 1; }
-@@ -316,21 +388,18 @@
+@@ -316,38 +382,33 @@
            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::Тег не на коммите из main"; exit 1; }
        - name: Связка ключей в белом списке
          run: python3 scripts/check_keyring.py data/keys/release.gpg
@@ -266,6 +242,7 @@
 +      - name: Ассеты выпуска
 +        run: scripts/release_assets.sh dist
 +      - name: Отсоединённая подпись SHA256SUMS
++        shell: bash
          env:
            GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
          run: |
@@ -275,13 +252,27 @@
 -          cp ../data/keys/release.gpg release.gpg
 -          python3 ../scripts/release_latest_json.py --dist . --version "${GITHUB_REF_NAME#v}"
 -          sha256sum astra-voice_*.deb sbom.cdx.json INSTALL-ADMIN.md latest.json release.gpg > SHA256SUMS
-           export GNUPGHOME="$(mktemp -d)"
+-          export GNUPGHOME="$(mktemp -d)"
++          GNUPGHOME=$(mktemp -d)
++          export GNUPGHOME
++          trap 'gpgconf --kill gpg-agent || :; rm -rf -- "$GNUPGHOME"' EXIT
            chmod 700 "$GNUPGHOME"
            printf '%s' "$GPG_SIGNING_KEY" | gpg --batch --quiet --import
-@@ -348,6 +417,6 @@
-           echo "deb [signed-by=/usr/share/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" \
-             > /etc/apt/sources.list.d/github-cli.list
-           apt-get update && apt-get install -y --no-install-recommends gh
++          unset GPG_SIGNING_KEY
+           SIGNING_FPR="$(python3 ../scripts/check_signing_secret.py secret --homedir "$GNUPGHOME" --keyring ../data/keys/release.gpg)" || { echo '::error::Секрет подписи не прошёл проверку состава'; exit 1; }
+           gpg --batch --yes --local-user "${SIGNING_FPR}!" --detach-sign --armor --output SHA256SUMS.asc SHA256SUMS
+           gpgv --keyring ../data/keys/release.gpg SHA256SUMS.asc SHA256SUMS
+           python3 ../scripts/check_signing_secret.py signature --keyring ../data/keys/release.gpg --subkey "$SIGNING_FPR" SHA256SUMS.asc SHA256SUMS
+-          rm -rf "$GNUPGHOME"
+       - name: Публикация
+         env:
+           GH_TOKEN: ${{ github.token }}
+         run: |
+-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+-            -o /usr/share/keyrings/githubcli.gpg
+-          echo "deb [signed-by=/usr/share/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" \
+-            > /etc/apt/sources.list.d/github-cli.list
+-          apt-get update && apt-get install -y --no-install-recommends gh
 -          gh release create "${GITHUB_REF_NAME}" --generate-notes \
 -            dist/astra-voice_*.deb dist/sbom.cdx.json dist/SHA256SUMS dist/SHA256SUMS.asc \
 -            dist/INSTALL-ADMIN.md dist/latest.json dist/release.gpg

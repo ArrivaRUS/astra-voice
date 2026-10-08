@@ -96,11 +96,12 @@ fi
 export SOURCE_DATE_EPOCH
 
 # Вход (путь относительно кэша): файл есть, размер и sha256 совпадают с lock.
-input_ok() {
-    local file=$CACHE/$1
+file_ok() {
+    local file=$1
     [ -f "$file" ] && [ "$(stat -c %s "$file")" = "$3" ] &&
         [ "$(sha256sum "$file" | cut -d' ' -f1)" = "$2" ]
 }
+input_ok() { file_ok "$CACHE/$1" "$2" "$3"; }
 
 # Подпись runtime (T1 §2.2 п.10; R3.3 — и при сборке из кэша): хостовый gpgv, ключ из
 # репозитория, отпечаток из lock.
@@ -111,6 +112,24 @@ verify_runtime() {
     python3 "$HERE/debverify.py" verify-sig --keyring "$RUNTIME_KEYRING" --want-fpr "$want" \
         "$DOWNLOADS/runtime-x86_64.sig" "$DOWNLOADS/runtime-x86_64" ||
         die 'подпись runtime-x86_64 не прошла проверку gpgv'
+}
+
+# Проверяем и используем одни и те же копии: кэш может меняться во время сборки.
+stage_tools() {
+    local source=$DOWNLOADS
+    local DOWNLOADS=$BUILD/tools
+    local name sha size url
+    mkdir -m 700 "$DOWNLOADS"
+    while read -r name sha size url; do
+        cp -- "$source/$name" "$DOWNLOADS/$name" || die "нет инструмента в кэше: $name"
+        file_ok "$DOWNLOADS/$name" "$sha" "$size" ||
+            die "копия инструмента не совпала с lock: $name"
+    done < <(lockq tools)
+    # Bash dynamic scope: verify_runtime видит DOWNLOADS с проверенными копиями.
+    verify_runtime
+    TOOL=$DOWNLOADS/appimagetool-x86_64.AppImage
+    RUNTIME=$DOWNLOADS/runtime-x86_64
+    chmod 755 "$TOOL"
 }
 
 # Теги колёс целевого интерпретатора: CPython 3.11 x86_64 (и для download, и для --target).
@@ -156,16 +175,6 @@ fi
 
 # --- сборка ------------------------------------------------------------------
 [ -d "$DOWNLOADS" ] && [ -d "$WHEELS" ] || die "нет кэша входов $CACHE — сначала build.sh --fetch (нужна сеть)"
-while read -r name sha size _url; do
-    input_ok "downloads/$name" "$sha" "$size" || die "инструмент отсутствует или не совпал с lock: $name"
-done < <(lockq tools)
-# Попадание в кэш ничего не доказывает (R3.3): подпись и цепочка — до распаковки
-# (пакеты Debian проверяются на копии в каталоге сборки — ниже, при раскладке).
-verify_runtime
-TOOL=$DOWNLOADS/appimagetool-x86_64.AppImage
-RUNTIME=$DOWNLOADS/runtime-x86_64
-chmod 755 "$TOOL"
-
 START=$(date +%s)
 APPDIR=$WORK/AppDir
 BUILD=$WORK/build
@@ -184,6 +193,8 @@ rm -rf "$APPDIR" "$BUILD" "$WORK/tmp" "$ISOHOME"
 mkdir -p "$APPDIR" "$BUILD/extract" "$OUT" "$WORK/tmp" "$ISOHOME/run" "$ISOHOME/tmp"
 chmod 700 "$ISOHOME" "$ISOHOME/run" "$ISOHOME/tmp"
 touch "$STAMP"
+# Попадание в кэш ничего не доказывает: подпись и хэши — до исполнения инструментов.
+stage_tools
 
 # Изолированный запуск: без дисплея, D-Bus сессии, звука; HOME временный.
 isolated() {
@@ -216,7 +227,7 @@ find_links=(--find-links "$WHEELS")
 case $BASE in
     python-appimage)
         # Откат (г) R3.9: прежняя база с бандловым OpenSSL 1.1 и pip внутри.
-        PY_IMAGE=$DOWNLOADS/$(lockq tools | awk '$1 ~ /^python3\.11/ {print $1}')
+        PY_IMAGE=$BUILD/tools/$(lockq tools | awk '$1 ~ /^python3\.11/ {print $1}')
         chmod 755 "$PY_IMAGE"
         say 'распаковываю Python AppImage'
         (cd "$BUILD/extract" && "$PY_IMAGE" --appimage-extract >/dev/null)

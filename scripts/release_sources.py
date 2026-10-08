@@ -30,7 +30,9 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 from collections.abc import Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO, Any, Literal
@@ -40,9 +42,15 @@ MANIFEST = "MANIFEST.txt"
 README = "README.txt"
 #: Предел архива исходников: отдельный от обычных ассетов (16 МиБ) и образов (512 МиБ).
 SOURCES_LIMIT = 1 << 30
+#: Весь выход XZ, включая tar-заголовки, padding и данные после конца tar.
+UNPACKED_LIMIT = 4 << 30
+#: preset=6 использует словарь 8 МиБ; запас допускает обычные XZ до preset=9.
+LZMA_MEMLIMIT = 128 << 20
 XZ_PRESET: Literal[6] = 6
 #: Предел служебных заголовков tar (pax, длинные имена GNU): больше — отказ до чтения (ревью Г).
 HEADER_LIMIT = 64 << 10
+#: Общий бюджет также ограничивает рекурсивные цепочки заголовков в tarfile.
+HEADER_COUNT_LIMIT = 128
 MANIFEST_LIMIT = 16 << 20
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _SIZE_RE = re.compile(r"[0-9]+")
@@ -82,6 +90,10 @@ def _load(name: str, path: Path) -> Any:
 
 class SourcesError(RuntimeError):
     """Архив исходников неполон или не совпадает с манифестом."""
+
+
+class SourcesDigestError(SourcesError):
+    """Сжатый архив не совпадает с доверенной суммой; разбор не начинался."""
 
 
 @dataclass(frozen=True)
@@ -213,7 +225,7 @@ class _HashingReader(io.RawIOBase):
         return True
 
     def readinto(self, buffer: Any) -> int:
-        data = self._fh.read(len(buffer))
+        data = self._fh.read(min(len(buffer), self._limit + 1 - self.size))
         self.size += len(data)
         if self.size > self._limit:
             raise SourcesError("архив больше предела")
@@ -222,11 +234,64 @@ class _HashingReader(io.RawIOBase):
         return len(data)
 
 
+class _LimitedXZReader(io.RawIOBase):
+    """XZ с пределами памяти декодера и всего выхода (также для concatenated XZ)."""
+
+    def __init__(self, stream: IO[bytes]) -> None:
+        self._stream = stream
+        self._decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=LZMA_MEMLIMIT)
+        self._finished = False
+        self.size = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        if not buffer or self._finished:
+            return 0
+        while True:
+            if self._decoder.eof:
+                data = self._decoder.unused_data
+                padding = 0
+                # XZ допускает padding между потоками и в конце, кратный четырём.
+                while True:
+                    if not data:
+                        data = self._stream.read(1 << 20)
+                    stripped = data.lstrip(b"\0")
+                    padding += len(data) - len(stripped)
+                    if stripped or not data:
+                        data = stripped
+                        break
+                    data = b""
+                if padding % 4:
+                    raise SourcesError("архив повреждён: неверный padding XZ")
+                if not data:
+                    self._finished = True
+                    return 0
+                self._decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=LZMA_MEMLIMIT)
+            elif self._decoder.needs_input:
+                data = self._stream.read(1 << 20)
+                if not data:
+                    raise EOFError("неполный поток XZ")
+            else:
+                data = b""
+            # max_length ограничивает выделение памяти ещё внутри декодера.
+            output = self._decoder.decompress(
+                data, max_length=min(len(buffer), UNPACKED_LIMIT + 1 - self.size)
+            )
+            self.size += len(output)
+            if self.size > UNPACKED_LIMIT:
+                raise SourcesError("распакованный архив больше предела")
+            if output:
+                buffer[: len(output)] = output
+                return len(output)
+
+
 def _open_regular(path: Path) -> IO[bytes]:
     """Открыть обычный файл без следования за ссылкой."""
     if stat.S_ISLNK(path.lstat().st_mode):
         raise SourcesError("не обычный файл")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
         raise SourcesError("не обычный файл")
@@ -239,30 +304,63 @@ def _members(tar: tarfile.TarFile) -> Iterator[tarfile.TarInfo]:
 
 
 class _LimitedTarInfo(tarfile.TarInfo):
-    """Служебные заголовки (pax, длинные имена) больше HEADER_LIMIT — отказ до их чтения."""
+    """Ограничить заголовки и отвергнуть sparse до чтения карт или содержимого."""
 
     # ВНИМАНИЕ: `_proc_member` — внутренний API tarfile (проверено на Python 3.11). При смене
     # версии Python первым смотреть test_check_rejects_hardlink_and_huge_header.
 
     def _proc_member(self, tar: tarfile.TarFile) -> tarfile.TarInfo:
-        if self.type in _HEADER_TYPES and self.size > HEADER_LIMIT:
-            raise SourcesError(f"служебный заголовок tar {self.size} байт больше предела")
+        if self.type in _HEADER_TYPES:
+            count = getattr(tar, "_sources_header_count", 0) + 1
+            if count > HEADER_COUNT_LIMIT:
+                raise SourcesError("число служебных заголовков tar больше предела")
+            tar._sources_header_count = count  # type: ignore[attr-defined]
+            if self.size > HEADER_LIMIT:
+                raise SourcesError(f"служебный заголовок tar {self.size} байт больше предела")
+        elif self.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
+            raise SourcesError(f"не обычный файл: {self.name}")
         return super()._proc_member(tar)  # type: ignore[misc,no-any-return]
 
+    # PAX sparse использует REGTYPE. Эти внутренние hooks вызываются до построения
+    # карты дыр (GNU sparse 1.0 читает её из тела члена) и до extractfile.
+    def _reject_sparse(self, *args: Any) -> None:
+        raise SourcesError("не обычный файл: sparse tar")
 
-def check(path: Path, limit: int = SOURCES_LIMIT, top: str | None = None) -> tuple[str, int]:
+    _proc_gnusparse_00 = _reject_sparse
+    _proc_gnusparse_01 = _reject_sparse
+    _proc_gnusparse_10 = _reject_sparse
+
+
+def check(
+    path: Path,
+    limit: int = SOURCES_LIMIT,
+    top: str | None = None,
+    *,
+    expected_sha256: str | None = None,
+) -> tuple[str, int]:
     """Потоковая проверка архива; вернуть (sha256 архива, число файлов).
 
-    `top` — ожидаемый верхний каталог (`astra-voice-<версия>-sources`)."""
-    with _open_regular(path) as raw:
+    `top` — ожидаемый верхний каталог (`astra-voice-<версия>-sources`).
+    `expected_sha256` — доверенная сумма: сначала проверить ограниченный снимок
+    сжатого файла, затем разбирать только его (без гонки между хэшем и разбором).
+    """
+    with ExitStack() as stack:
+        raw = stack.enter_context(_open_regular(path))
         if os.fstat(raw.fileno()).st_size > limit:
             raise SourcesError("архив больше предела")
         reader = _HashingReader(raw, limit)
-        stream = io.BufferedReader(reader, 1 << 20)
+        stream = stack.enter_context(io.BufferedReader(reader, 1 << 20))
+        archive: IO[bytes] = stream
+        if expected_sha256 is not None:
+            archive = stack.enter_context(tempfile.TemporaryFile())
+            while chunk := stream.read(1 << 20):
+                archive.write(chunk)
+            if reader.sha.hexdigest() != expected_sha256:
+                raise SourcesDigestError("неверная сумма архива")
+            archive.seek(0)
         try:
-            # Распаковка своим LZMAFile: tarfile в режиме «r|xz» не замечает обрезанный
-            # конец потока xz, а LZMAFile при дочитывании бросает EOFError.
-            with lzma.LZMAFile(stream) as unpacked:
+            # Дочитать XZ после конца tar: проверить footer/CRC, хвост и общий бюджет.
+            with io.BufferedReader(_LimitedXZReader(archive), 1 << 20) as unpacked:
                 with tarfile.open(fileobj=unpacked, mode="r|", tarinfo=_LimitedTarInfo) as tar:
                     count = _check_members(tar, top)
                 while unpacked.read(1 << 20):
@@ -270,8 +368,6 @@ def check(path: Path, limit: int = SOURCES_LIMIT, top: str | None = None) -> tup
         except (tarfile.TarError, EOFError, OSError, lzma.LZMAError, ValueError) as exc:
             # ValueError — в том числе UnicodeDecodeError имён: отчёт, а не трейсбек.
             raise SourcesError(f"архив повреждён: {exc}") from None
-        while stream.read(1 << 20):  # хвост после конца tar — тоже в sha256
-            pass
     return reader.sha.hexdigest(), count
 
 
@@ -283,8 +379,10 @@ def _check_members(tar: tarfile.TarFile, expected_top: str | None = None) -> int
         name = PurePosixPath(member.name)
         if name.is_absolute() or ".." in name.parts or len(name.parts) < 2:
             raise SourcesError(f"недопустимый путь: {member.name}")
-        if not member.isreg():
+        if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE) or member.sparse is not None:
             raise SourcesError(f"не обычный файл: {member.name}")
+        if not 0 <= member.size <= UNPACKED_LIMIT:
+            raise SourcesError(f"размер файла вне предела: {member.name}")
         if top is None:
             top = name.parts[0]
         if name.parts[0] != top:

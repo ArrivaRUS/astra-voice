@@ -283,7 +283,7 @@ def release(args: argparse.Namespace) -> int:
         "release.gpg",
     ]
     # Архив исходников (R3.6) обязателен вместе с AppImage; он больше обычных ассетов,
-    # поэтому хэшируется и проверяется потоком (release_sources.check), без снимка в памяти.
+    # поэтому проверяется потоком после подписи/сумм, без снимка в памяти.
     sources_name = f"astra-voice-{version}-sources.tar.xz"
     if with_appimage:
         required += [image_name, "sbom-appimage.cdx.json", sources_name]
@@ -300,20 +300,7 @@ def release(args: argparse.Namespace) -> int:
     sources_detail = ""
     for name, path in paths.items():
         if name == sources_name:
-            release_sources = _release_sources_module()
-            try:
-                streamed[name], count = release_sources.check(
-                    path, top=f"astra-voice-{version}-sources"
-                )
-                sources_detail = f"{count} файлов по манифесту"
-            except FileNotFoundError:
-                missing.append(name)
-            except release_sources.SourcesError as exc:
-                invalid.append(f"{name}: {exc}")
-                sources_detail = str(exc)
-            except OSError as exc:
-                record(name, False, f"не удалось прочитать: {exc.strerror or exc}")
-                return finish(2)
+            # Даже сжатый архив не читаем до успешной проверки подписи SHA256SUMS.
             continue
         limit = ARTIFACT_LIMIT if name.endswith((".deb", ".AppImage")) else ASSET_LIMIT
         try:
@@ -343,13 +330,6 @@ def release(args: argparse.Namespace) -> int:
         except OSError as exc:
             record(keyring.name, False, f"не удалось прочитать: {exc.strerror or exc}")
             return finish(2)
-    assets_ok = deb is not None and not missing and not invalid
-    record(
-        "assets",
-        assets_ok,
-        f"deb: {len(debs)}; отсутствуют: {', '.join(missing) or 'нет'}; "
-        f"недопустимы: {', '.join(invalid) or 'нет'}",
-    )
     match_keyring = snapshots.get("release.gpg") == key_bytes
     record(
         "release.gpg",
@@ -379,6 +359,7 @@ def release(args: argparse.Namespace) -> int:
     record("signature", signature_ok, signature_detail)
 
     sums_detail = "SHA256SUMS отсутствует"
+    sources_digest: str | None = None
     if "SHA256SUMS" in snapshots:
         try:
             lines = snapshots["SHA256SUMS"].decode("utf-8").splitlines()
@@ -399,12 +380,10 @@ def release(args: argparse.Namespace) -> int:
                         sums_detail = f"повтор имени: {filename}"
                         break
                     seen.add(filename)
-                    content = snapshots.get(filename)
-                    if content is None and filename in streamed:
-                        if streamed[filename] != digest:
-                            sums_detail = f"неверная сумма: {filename}"
-                            break
+                    if with_appimage and filename == sources_name:
+                        sources_digest = digest
                         continue
+                    content = snapshots.get(filename)
                     if content is None:
                         sums_detail = f"нет файла для строки: {filename}"
                         break
@@ -424,7 +403,45 @@ def release(args: argparse.Namespace) -> int:
                     )
         except UnicodeError:
             sums_detail = "неверный формат строки"
+
+    if with_appimage:
+        sources_detail = "архив не проверен: подпись или SHA256SUMS не прошли проверку"
+        if signature_ok and sums_detail == "суммы и покрытие верны" and sources_digest:
+            release_sources = _release_sources_module()
+            try:
+                # check хэширует частный снимок сжатого файла ДО запуска LZMA/tar.
+                # Замена/изменение исходного пути затем не меняет проверяемые байты.
+                streamed[sources_name], count = release_sources.check(
+                    paths[sources_name],
+                    top=f"astra-voice-{version}-sources",
+                    expected_sha256=sources_digest,
+                )
+                sources_detail = f"{count} файлов по манифесту"
+            except FileNotFoundError:
+                missing.append(sources_name)
+                sources_detail = "архива исходников нет"
+                sums_detail = f"нет файла для строки: {sources_name}"
+            except release_sources.SourcesDigestError as exc:
+                sources_detail = str(exc)
+                sums_detail = f"неверная сумма: {sources_name}"
+            except release_sources.SourcesError as exc:
+                sources_detail = str(exc)
+                sums_detail = "архив исходников не прошёл проверку"
+            except OSError as exc:
+                record(sources_name, False, f"не удалось прочитать: {exc.strerror or exc}")
+                return finish(2)
+        elif sums_detail == "суммы и покрытие верны":
+            sums_detail = "сумма архива не проверена: подпись не прошла проверку"
+        if sources_name not in streamed:
+            invalid.append(f"{sources_name}: {sources_detail}")
     record("sha256", sums_detail == "суммы и покрытие верны", sums_detail)
+    assets_ok = deb is not None and not missing and not invalid
+    record(
+        "assets",
+        assets_ok,
+        f"deb: {len(debs)}; отсутствуют: {', '.join(missing) or 'нет'}; "
+        f"недопустимы: {', '.join(invalid) or 'нет'}",
+    )
 
     package_ok = False
     if deb is not None and deb.name in snapshots:
