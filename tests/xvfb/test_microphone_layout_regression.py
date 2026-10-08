@@ -55,11 +55,18 @@ class Rendered:
     messages: list[str]
     apply: Any
     state: list[MicrophoneState]
+    reads: list[MicrophoneState]
+    engine: QQmlApplicationEngine
 
 
 @contextmanager
 def render(
-    width: int, state: str, *, can_raise: bool = True, late_bridge: bool = False
+    width: int,
+    state: str,
+    *,
+    can_raise: bool = True,
+    late_bridge: bool = False,
+    microphone: MicrophoneState | None = None,
 ) -> Iterator[Rendered]:
     app = get_qapplication()
     messages: list[str] = []
@@ -69,13 +76,19 @@ def render(
 
     previous = qInstallMessageHandler(handler)
     # Это только контракт SettingsApply: ни SoundControl, ни системных команд.
-    mic_state = [STATES[state]]
+    mic_state = [microphone if microphone is not None else STATES[state]]
+    reads: list[MicrophoneState] = []
+
+    def microphone_state() -> MicrophoneState:
+        reads.append(mic_state[0])
+        return mic_state[0]
+
     apply = SimpleNamespace(
         has_volume_control=can_raise,
         has_sound_settings=True,
         has_sound_service=False,
         can_restore_microphone_volume=False,
-        microphone_state=lambda: mic_state[0],
+        microphone_state=microphone_state,
     )
     bridge = SettingsBridge(
         Settings(),
@@ -84,8 +97,6 @@ def render(
         device_provider=lambda: [],
         save=lambda settings: None,
     )
-    bridge.refreshDevices()
-    bridge.refreshMicrophone()
     engine = QQmlApplicationEngine()
     install_icon_provider(engine)
     if not late_bridge:
@@ -112,7 +123,7 @@ def render(
         ]
         assert len(rows) == 1, messages
         assert bridge.canRaiseMicrophone == can_raise
-        yield Rendered(window, rows[0], bridge, messages, apply, mic_state)
+        yield Rendered(window, rows[0], bridge, messages, apply, mic_state, reads, engine)
     finally:
         for root in engine.rootObjects():
             if isinstance(root, QQuickWindow):
@@ -192,7 +203,7 @@ def assert_layout(rendered: Rendered, state: str) -> None:
         assert "Звук микрофона выключен в системе — вас не слышно" in texts
         assert "slider" not in items and "Поднять" in items
     else:
-        assert "slider" in items and "60 %" in texts
+        assert "slider" in items and f"{rendered.bridge.microphoneVolume} %" in texts
     if state.startswith("locked"):
         assert "Задано администратором" in texts
     assert not rendered.messages, rendered.messages
@@ -236,3 +247,64 @@ def test_late_settings_bridge_first_show_preserves_microphone_row(width: int, st
     # не давая последующим state changes случайно восстановить сломанную строку.
     with render(width, state, late_bridge=True) as rendered:
         assert_layout(rendered, state)
+
+
+@pytest.mark.parametrize("width", [900, 1035], ids=["minimum", "screenshot"])
+@pytest.mark.parametrize("late_bridge", [False, True], ids=["early", "late"])
+def test_first_show_reads_current_microphone_without_prepopulation(
+    width: int, late_bridge: bool
+) -> None:
+    known = MicrophoneState(known=True, muted=False, percent=100)
+    with render(width, "normal", late_bridge=late_bridge, microphone=known) as rendered:
+        assert rendered.reads == [known], (
+            "First show must read current microphone state exactly once"
+        )
+        assert rendered.bridge.microphoneVolume == 100
+        assert not rendered.bridge.microphoneMuted
+        assert_layout(rendered, "normal")
+        assert foreground(rendered.row)["slider"].property("value") == 100
+        rendered.engine.rootContext().setContextProperty("settingsBridge", rendered.bridge)
+        QTest.qWait(80)
+        get_qapplication().processEvents()
+        assert rendered.reads == [known], "Assigning the same bridge must not refresh it again"
+        assert_layout(rendered, "normal")
+
+
+@pytest.mark.parametrize("width", [900, 1035], ids=["minimum", "screenshot"])
+def test_replaced_settings_bridge_reads_its_microphone_state(width: int) -> None:
+    reads: list[MicrophoneState] = []
+    known = MicrophoneState(known=True, muted=False, percent=100)
+
+    def microphone_state() -> MicrophoneState:
+        reads.append(known)
+        return known
+
+    replacement_apply = SimpleNamespace(
+        has_volume_control=True,
+        has_sound_settings=True,
+        has_sound_service=False,
+        can_restore_microphone_volume=False,
+        microphone_state=microphone_state,
+    )
+    replacement = SettingsBridge(
+        Settings(),
+        apply=cast(SettingsApply, replacement_apply),
+        device_provider=lambda: [],
+        save=lambda settings: None,
+    )
+    try:
+        with render(width, "unknown") as rendered:
+            assert rendered.bridge.microphoneVolume == -1
+            rendered.engine.rootContext().setContextProperty("settingsBridge", replacement)
+            QTest.qWait(80)
+            get_qapplication().processEvents()
+            assert reads == [known], (
+                "A replacement bridge must read its current microphone state once"
+            )
+            assert replacement.microphoneVolume == 100
+            assert not replacement.microphoneMuted
+            rendered.bridge = replacement
+            assert_layout(rendered, "normal")
+            assert foreground(rendered.row)["slider"].property("value") == 100
+    finally:
+        sip.delete(replacement)
