@@ -56,20 +56,113 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def _mark_running_copy() -> None:
+def _installed_code_key() -> str | None:
+    """Путь исполняемого кода, даже если удаление уже убрало маркеры бандла."""
+    here = paths._code_file()
+    if len(here.parents) <= paths._BUNDLE_DEPTH:
+        return None
+    bundle = here.parents[paths._BUNDLE_DEPTH]
+    if bundle.parent == paths.appimage_app_dir().resolve() and paths.is_appimage_key(bundle.name):
+        return bundle.name
+    return None
+
+
+def _mark_running_copy() -> bool:
     """Защищает работающую копию от чистки (arch/appimage.md §1, §4; Р5)."""
     from astra_voice.platform import userinstall
 
     try:
-        if paths.install_kind() is not paths.InstallKind.APPIMAGE_INSTALLED:
-            return
-        bundle = paths.bundle_root()
-        if bundle is not None:
-            userinstall.write_running_key(bundle.name)
-    except (OSError, paths.PathError, ValueError) as error:
+        key = _installed_code_key()
+        if key is None:
+            return True
+        userinstall.begin_running_copy(key)
+        return True
+    except (userinstall.UserInstallError, OSError, paths.PathError, ValueError) as error:
         log.warning(
             "Не удалось защитить работающую копию от удаления: %s", userinstall.tilde(error)
         )
+    return False
+
+
+def _copy_shutdown_resources(
+    runtime: Any, downloads: Any, update_checker: Any
+) -> tuple[list[Any], list[Any]]:
+    """Сохраняем ссылки ДО shutdown: тот может забыть не завершившиеся ресурсы."""
+    from astra_voice.ui import tray
+
+    processes: list[Any] = []
+    if runtime is not None:
+        for supervisor in (runtime.supervisor, runtime._switch_candidate):
+            if supervisor is not None:
+                processes.extend(supervisor._retired)
+                if supervisor.process is not None:
+                    processes.append(supervisor.process)
+    threads = [getattr(downloads, "_model_thread", None), getattr(update_checker, "_thread", None)]
+    if tray._bus_transport is not None:
+        threads.append(tray._bus_transport.thread)
+    return processes, [thread for thread in threads if thread is not None]
+
+
+def _children_stopped() -> bool:
+    """Linux: последний барьер для прямых детей, забытых при неудачном switch.
+
+    Не ищем процессы по имени и не посылаем сигналы. Исчезнувшие PID и zombie
+    завершены; исчезнувший task мог передать детей другому task — это неизвестность.
+    Недоступный procfs или непонятные данные запрещают удаление.
+    Демонизированные потомки, уже переподчинённые другому родителю, сюда не входят.
+    """
+    try:
+        pids: set[int] = set()
+        for task in Path("/proc/self/task").iterdir():
+            try:
+                children = (task / "children").read_text(encoding="ascii")
+            except FileNotFoundError:
+                return False
+            for value in children.split():
+                if not value.isascii() or not value.isdecimal() or int(value) <= 0:
+                    return False
+                pids.add(int(value))
+        for pid in pids:
+            try:
+                record = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+            except FileNotFoundError:
+                continue
+            _, separator, fields = record.rpartition(") ")
+            values = fields.split()
+            if (
+                not record.startswith(f"{pid} (")
+                or not separator
+                or len(values) < 2
+                or values[0] != "Z"
+                or not values[1].isdecimal()
+            ):
+                return False
+        return True
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def _finish_running_copy(
+    key: str, processes: list[Any], threads: list[Any], *, stopped: bool
+) -> None:
+    from astra_voice.platform import userinstall
+
+    try:
+        complete = stopped and all(p.poll() is not None for p in processes)
+        complete = complete and all(not thread.is_alive() for thread in threads)
+        complete = complete and _children_stopped()
+    except Exception:  # noqa: BLE001 — неизвестное состояние не разрешает удаление
+        complete = False
+    try:
+        if complete:
+            userinstall.finish_running_copy(key)
+        else:
+            userinstall.preserve_incomplete_shutdown(key)
+            log.warning(
+                "Остановка ресурсов не подтверждена; копия программы сохранена для проверки"
+            )
+    except (userinstall.UserInstallError, OSError, paths.PathError, ValueError):
+        log.warning("Не удалось завершить удаление копии; файлы сохранены для повторной проверки")
 
 
 def _revoked_check(model: Any | None) -> Callable[[str, str], bool]:
@@ -171,6 +264,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--unregister",
         action="store_true",
         help="служебный: убрать версию AppImage из меню и автозапуска и выйти",
+    )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="удалить программу AppImage из домашней папки, сохранив модели и настройки",
     )
     parser.add_argument("--debug", action="store_true", help="подробный журнал")
     parser.add_argument(
@@ -980,6 +1078,82 @@ def _cleanup(server: Any, lock: Any) -> None:
         lock.unlock()
 
 
+def _uninstall() -> int:
+    """Без QApplication, настроек, звука и нового IPC-протокола."""
+    from PyQt5.QtCore import QLockFile
+
+    from astra_voice.platform import autostart, userinstall
+
+    if not paths.install_kind().is_appimage:
+        sys.stderr.write("Команда --uninstall нужна только версии AppImage.\n")
+        return 2
+    locks: list[Any] = []
+    try:
+        userinstall.refuse_root()
+        # Резервируем и ещё не созданные runtime: старая копия не должна начать
+        # запуск в новом каталоге посреди удаления. Ничего не создаём без установки.
+        directories = (
+            paths._runtime_dir_candidates(reading=True) if paths.appimage_app_dir().exists() else ()
+        )
+        userinstall.validate_remove_paths(directories)
+
+        def reserve_runtimes() -> list[Path]:
+            # Под install-lock; QLockFile берём только без ожидания, обратный
+            # порядок блокировок у старта GUI поэтому не образует deadlock.
+            stopped: list[Path] = []
+            for directory in directories:
+                try:
+                    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+                except PermissionError:
+                    # runuser без logind-сеанса: /run/user/<uid> недоступен для
+                    # создания и обычному GUI; его runtime — запасной /tmp.
+                    if not directory.exists():
+                        continue
+                    raise
+                lock = QLockFile(str(directory / "lock"))
+                lock.setStaleLockTime(0)
+                if lock.tryLock(0):
+                    locks.append(lock)
+                    stopped.append(directory)
+                elif (
+                    lock.error() != QLockFile.LockFailedError
+                    or userinstall._read_running_key(directory / userinstall.RUNNING_KEY_NAME)
+                    is None
+                ):
+                    raise userinstall.UserInstallError(
+                        "Не удалось определить работающую копию. Завершите Astra Voice "
+                        "и повторите команду из файла .AppImage."
+                    )
+            return stopped
+
+        result = userinstall.remove_program(prepare=reserve_runtimes)
+    except userinstall.RootRefusedError as error:
+        sys.stderr.write(f"{error}\n")
+        return error.exit_code
+    except (
+        userinstall.UserInstallError,
+        OSError,
+        paths.PathError,
+        autostart.AutostartError,
+        ValueError,
+    ) as error:
+        sys.stderr.write(f"Не удалось удалить Astra Voice: {userinstall.tilde(error)}\n")
+        return 1
+    finally:
+        for lock in reversed(locks):
+            lock.unlock()
+    if result.kept:
+        sys.stdout.write(
+            "Регистрация AppImage снята. Работающие копии сохранены до выхода.\n"
+            "Если после завершения старой копии файлы остались, повторите --uninstall "
+            "из исходного файла .AppImage.\n"
+        )
+    else:
+        sys.stdout.write("Программа Astra Voice удалена из домашней папки.\n")
+    sys.stdout.write("Модели, настройки и журналы сохранены.\n")
+    return 0
+
+
 def _unregister() -> int:
     """``--unregister``: снять меню, значки и наш автозапуск без GUI (arch/appimage.md §4).
 
@@ -1003,6 +1177,8 @@ def _unregister() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.uninstall:
+        return _uninstall()
     if args.unregister:
         return _unregister()
     if args.register:
@@ -1066,7 +1242,9 @@ def main(argv: list[str] | None = None) -> int:
 
     session_kind = detect()
     setup_logging(session_kind.value, debug=args.debug)
-    _mark_running_copy()
+    if not _mark_running_copy():
+        lock.unlock()
+        return 1
     try:
         deny_pulse_autospawn()
     except Exception:
@@ -1301,14 +1479,28 @@ def main(argv: list[str] | None = None) -> int:
             focuser.focus_shell()
         return int(app.exec_())
     finally:
+        copy_key = _installed_code_key()
+        resources_stopped = True
+        try:
+            processes, threads = (
+                _copy_shutdown_resources(runtime, downloads, update_checker)
+                if copy_key is not None
+                else ([], [])
+            )
+        except Exception:  # noqa: BLE001 — неясное состояние не разрешает удалить код
+            processes, threads = [], []
+            resources_stopped = False
+            log.warning("Не удалось проверить ресурсы работающей копии")
         try:
             focuser.stop()
         except Exception:  # noqa: BLE001 — остальная очистка должна выполниться
+            resources_stopped = False
             log.warning("Не удалось остановить фокусировку окна")
         if update_checker is not None:
             try:
                 update_checker.stop()
             except Exception:  # noqa: BLE001 — остальные ресурсы тоже нужно освободить
+                resources_stopped = False
                 log.warning("Не удалось остановить проверку обновлений")
             # Замыкание держит _GuiCalls: последняя ссылка на QObject отпускается
             # здесь, в GUI-потоке, а не в рабочем (урок 025).
@@ -1325,25 +1517,39 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 onboarding.shutdown()
             except Exception:  # noqa: BLE001 — остальные ресурсы тоже нужно освободить
+                resources_stopped = False
                 log.warning("Не удалось завершить установку модели")
         if downloads is not None:
             try:
                 downloads.shutdown()
             except Exception:  # noqa: BLE001 — остальные ресурсы тоже нужно освободить
+                resources_stopped = False
                 log.warning("Не удалось завершить очередь установки моделей")
         if runtime is not None:
             try:
                 runtime.shutdown()
             except Exception:  # noqa: BLE001 — ошибка диктовки не должна оставить lock/ipc
+                resources_stopped = False
                 log.warning("Не удалось завершить диктовку")
         # Затворы постов в Qt закрываются до разрушения QApplication (урок 026).
-        shutdown_notify_dispatch()
+        try:
+            shutdown_notify_dispatch()
+        except Exception:  # noqa: BLE001 — остальные ресурсы тоже нужно освободить
+            resources_stopped = False
+            log.warning("Не удалось завершить доставку уведомлений")
         try:
             shutdown_bus_threads()
         except Exception:  # noqa: BLE001 — ошибка D-Bus не должна оставить lock/ipc
+            resources_stopped = False
             log.warning("Не удалось завершить потоки D-Bus")
         del close_watcher
-        timer.stop()
-        if theme_bridge is not None:
-            theme_bridge.source.stop()
+        try:
+            timer.stop()
+            if theme_bridge is not None:
+                theme_bridge.source.stop()
+        except Exception:  # noqa: BLE001 — lock и защита кода завершаются независимо
+            resources_stopped = False
+            log.warning("Не удалось завершить наблюдение интерфейса")
+        if copy_key is not None:
+            _finish_running_copy(copy_key, processes, threads, stopped=resources_stopped)
         _cleanup(server, lock)

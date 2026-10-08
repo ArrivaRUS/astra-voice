@@ -152,8 +152,13 @@ def test_main_marks_only_after_lock_and_logging_before_qapplication() -> None:
     ]
     assert marks == [mark]
     statement = next(
-        node for node in main.body if isinstance(node, ast.Expr) and node.value is mark
+        node
+        for node in main.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and node.test.operand is mark
     )
+    assert any(isinstance(node, ast.Return) for node in statement.body)
     previous = main.body[main.body.index(statement) - 1]
     assert isinstance(previous, ast.Expr)
     assert previous.value is calls["setup_logging"]

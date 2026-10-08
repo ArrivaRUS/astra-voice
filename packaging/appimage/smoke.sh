@@ -14,7 +14,8 @@
 #   3. (GUI, под xvfb-run) первый запуск файла: самоустановка в app/<KEY>, current → KEY,
 #      запись меню ведёт в app/current, временная распаковка удалена; IPC-сокет
 #      появился; `--show` из установленной копии; выход;
-#   4. установленная копия: режим А; `--uninstall` — когда появится в программе (шаг 4 §12);
+#   4. установленная копия: режим А; обязательный `--uninstall`, данные сохранены;
+#      повторная установка, удаление при работающей копии, чужие регистрации сохранены;
 #   5. в TMPDIR не осталось appimage_extracted_*.
 # От root (контейнер CI) смоук перезапускает себя под nobody (setpriv): программа в
 # бандле от root не работает (T1 MJ-3). Без packaging/appimage/ENABLED — пропуск.
@@ -34,6 +35,7 @@ for arg in "$@"; do
         --no-gui) GUI=0 ;;
         --inner) STAGE=inner ;;
         --gui-stage) STAGE=gui ;;
+        --uninstall-stage) STAGE=uninstall ;;
         -h | --help) sed -n '2,19p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*) echo "неизвестный аргумент: $arg" >&2; exit 2 ;;
         *) [ -z "$IMAGE" ] || { echo 'нужен ровно один файл' >&2; exit 2; }; IMAGE=$arg ;;
@@ -41,7 +43,7 @@ for arg in "$@"; do
 done
 
 # --- этап GUI: внутри xvfb-run, окружение уже изолировано ----------------------
-if [ "$STAGE" = gui ]; then
+if [ "$STAGE" = gui ] || [ "$STAGE" = uninstall ]; then
     DATA=$HOME/.local/share/astra-voice
     SOCKET=$XDG_RUNTIME_DIR/astra-voice/ipc
     LOG=$HOME/app.log
@@ -65,7 +67,30 @@ if [ "$STAGE" = gui ]; then
     say 'IPC-сокет готов'
     "$DATA/app/current/AppRun" --show || die '--show из установленной копии завершился с ошибкой'
     say '--show передан работающей копии'
+    if [ "$STAGE" = uninstall ]; then
+        key=$(readlink "$DATA/app/current")
+        desktop=$HOME/.local/share/applications/astra-voice.desktop
+        startup=$HOME/.config/autostart/astra-voice.desktop
+        icon=$HOME/.local/share/icons/hicolor/scalable/apps/astravoice.svg
+        mkdir -p "$(dirname "$startup")" "$(dirname "$icon")"
+        printf '[Desktop Entry]\nType=Application\nExec=/bin/true\n' >"$desktop"
+        cp "$desktop" "$startup"
+        printf 'foreign icon\n' >"$icon"
+        cp "$desktop" "$HOME/foreign.desktop"
+        cp "$icon" "$HOME/foreign.icon"
+        "$DATA/app/current/AppRun" --uninstall || die 'удаление работающей копии не принято'
+        [ -f "$DATA/app/$key/AppRun" ] || die 'код работающей копии удалён до выхода'
+        [ -f "$DATA/app/$key/.remove-on-exit" ] || die 'нет отложенного удаления'
+        [ ! -L "$DATA/app/current" ] || die 'после удаления оставлена ссылка current'
+        cmp -s "$desktop" "$HOME/foreign.desktop" || die 'удаление изменило чужое меню'
+        cmp -s "$startup" "$HOME/foreign.desktop" || die 'удаление изменило чужой автозапуск'
+        cmp -s "$icon" "$HOME/foreign.icon" || die 'удаление изменило чужой значок'
+    fi
     stop_app
+    wait "$pid" 2>/dev/null || true
+    if [ "$STAGE" = uninstall ]; then
+        [ ! -e "$DATA/app/$key" ] || { cat "$LOG" >&2; die 'работающая копия не удалена после выхода'; }
+    fi
     trap - EXIT
     exit 0
 fi
@@ -139,12 +164,50 @@ if [ "$STAGE" = inner ]; then
         say "4/5 установленная копия: режим А"
         status=$("$DATA/app/current/AppRun" --selfinstall-status)
         printf '%s\n' "$status" | grep -qx 'MODE=А' || die "ожидался режим А: $status"
-        if "$DATA/app/current/AppRun" --help 2>/dev/null | grep -q -- '--uninstall'; then
-            "$DATA/app/current/AppRun" --uninstall || die '--uninstall завершился с ошибкой'
-            [ ! -e "$desktop" ] || die '--uninstall оставил запись меню'
+        mkdir -p "$DATA/models" "$DATA/logs" "$HOME/.config/autostart"
+        printf 'model control\n' >"$DATA/models/uninstall-control"
+        printf 'log control\n' >"$DATA/logs/uninstall-control"
+        settings=$HOME/.config/astra-voice/settings.json
+        [ -f "$settings" ] || die 'нет настроек после первого запуска'
+        cp "$settings" "$HOME/settings.control"
+        cp "$DATA/models/uninstall-control" "$HOME/model.control"
+        cp "$DATA/logs/uninstall-control" "$HOME/log.control"
+        startup=$HOME/.config/autostart/astra-voice.desktop
+        printf '[Desktop Entry]\nType=Application\nExec="%s" --hidden\nX-AstraVoice-Managed=true\n' \
+            "$DATA/app/current/AppRun" >"$startup"
+        "$DATA/app/current/AppRun" --uninstall || die '--uninstall завершился с ошибкой'
+        [ ! -e "$desktop" ] || die '--uninstall оставил нашу запись меню'
+        [ ! -e "$DATA/app/$KEY" ] || die '--uninstall оставил остановленную копию'
+        [ ! -L "$DATA/app/current" ] && [ ! -L "$DATA/app/previous" ] || die 'остались ссылки версий'
+        if [ -x /usr/bin/astra-voice ]; then
+            grep -q '^Exec=/usr/bin/astra-voice' "$startup" || die 'автозапуск не возвращён пакету'
         else
-            say '   --uninstall в программе ещё нет — этап пропущен'
+            [ ! -e "$startup" ] || die '--uninstall оставил наш автозапуск'
         fi
+        [ -z "$(find "$HOME/.local/share/icons/hicolor" -type f -name 'astravoice.*' -print)" ] ||
+            die '--uninstall оставил наши значки'
+        cmp -s "$settings" "$HOME/settings.control" || die 'изменены настройки'
+        cmp -s "$DATA/models/uninstall-control" "$HOME/model.control" || die 'изменена модель'
+        cmp -s "$DATA/logs/uninstall-control" "$HOME/log.control" || die 'изменён журнал'
+
+        say '4b/5 повторная установка, удаление при работающей копии, чужие регистрации'
+        xvfb-run -a -s '-screen 0 1280x800x24 -nolisten tcp' \
+            env QT_QPA_PLATFORM=xcb "$SELF" --uninstall-stage "$IMAGE" ||
+            die 'смоук отложенного удаления не прошёл'
+        [ -z "$(extracted)" ] || die 'после самоустановки остались временные распаковки'
+        # Служебная команда из носителя не устанавливает и не убирает распаковку.
+        # Её изолируем отдельно, не скрывая мусор предыдущих установок от этапа 5.
+        service_tmp=$(mktemp -d "$HOME/service-uninstall.XXXXXX")
+        TMPDIR="$service_tmp" APPIMAGE_EXTRACT_AND_RUN=1 "$IMAGE" --uninstall ||
+            die 'повторное удаление не идемпотентно'
+        rm -rf "$service_tmp"
+        cmp -s "$desktop" "$HOME/foreign.desktop" || die 'повторное удаление изменило чужое меню'
+        cmp -s "$startup" "$HOME/foreign.desktop" || die 'повторное удаление изменило чужой автозапуск'
+        cmp -s "$HOME/.local/share/icons/hicolor/scalable/apps/astravoice.svg" "$HOME/foreign.icon" ||
+            die 'повторное удаление изменило чужой значок'
+        cmp -s "$settings" "$HOME/settings.control" || die 'изменены настройки'
+        cmp -s "$DATA/models/uninstall-control" "$HOME/model.control" || die 'изменена модель'
+        cmp -s "$DATA/logs/uninstall-control" "$HOME/log.control" || die 'изменён журнал'
     fi
 
     say "5/5 мусор распаковок"
