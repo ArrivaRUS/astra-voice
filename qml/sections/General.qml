@@ -236,17 +236,28 @@ Column {
 
         SettingRow {
             id: deviceRow
+            // Мост появляется после создания QML. Высота зависит от естественного
+            // размера контролов, без повторного запроса вложенных Qt5 Layout
+            // во время смены их видимости (иначе подпись схлопывается до 0 px).
+            implicitHeight: Math.max(Theme.cardRowMinH,
+                microphoneControls.implicitHeight + Theme.cardRowPaddingY * 2)
+                + (divider ? Theme.spaceCardRowDivider : 0)
             width: parent.width
             label: qsTr("Микрофон")
             locked: root.isLocked("device")
 
             // Выбор и громкость принадлежат одному микрофону. Дополнительные
             // действия остаются в этой строке, без отдельной строки настройки.
-            ColumnLayout {
-                spacing: Theme.spaceStep
+            Item {
+                id: microphoneControls
+                implicitWidth: Math.max(micControls.implicitWidth, micActions.implicitWidth)
+                implicitHeight: micControls.implicitHeight + (micActions.visible ? Theme.spaceStep + micActions.implicitHeight : 0)
                 Layout.alignment: Qt.AlignVCenter
 
-                RowLayout {
+                Row {
+                    id: micControls
+                    width: implicitWidth
+                    height: implicitHeight
                     spacing: Theme.fieldGap
                     AvSelect {
                         id: deviceSelector
@@ -254,8 +265,8 @@ Column {
                         popupMaxWidth: deviceRow.width - Theme.cardRowPaddingX * 2
                         // Бейдж политики занимает часть строки, поэтому
                         // заблокированный селектор показывается компактно.
-                        Layout.preferredWidth: deviceRow.locked ? Theme.progressStatusbarW : 236
-                        Layout.alignment: Qt.AlignVCenter
+                        width: deviceRow.locked ? Theme.progressStatusbarW : 236
+                        anchors.verticalCenter: parent.verticalCenter
                         enabled: !root.isLocked("device")
                         model: root.deviceNames()
 
@@ -277,7 +288,7 @@ Column {
                         property real draggedValue: value
                         property bool userMoved: false
                         visible: root.canRaiseMic && root.micVolume >= 0 && !root.micMuted
-                        Layout.alignment: Qt.AlignVCenter
+                        anchors.verticalCenter: parent.verticalCenter
                         Accessible.name: qsTr("Громкость микрофона")
 
                         Binding {
@@ -326,7 +337,7 @@ Column {
                         font.family: Theme.fontUi
                         font.pixelSize: Theme.fontSettingSubSize
                         renderType: Text.NativeRendering
-                        Layout.alignment: Qt.AlignVCenter
+                        anchors.verticalCenter: parent.verticalCenter
                     }
                     Text {
                         visible: root.canRaiseMic && !micSlider.visible
@@ -339,20 +350,24 @@ Column {
                         font.pixelSize: Theme.fontSettingSubSize
                         renderType: Text.NativeRendering
                         wrapMode: Text.WordWrap
-                        Layout.preferredWidth: Theme.progressStatusbarW + volumeText.implicitWidth + Theme.fieldGap
-                        Layout.alignment: Qt.AlignVCenter
+                        width: Theme.progressStatusbarW + volumeText.implicitWidth + Theme.fieldGap
+                        anchors.verticalCenter: parent.verticalCenter
                     }
                 }
 
-                RowLayout {
+                Row {
+                    id: micActions
+                    anchors.right: parent.right
+                    y: micControls.height + Theme.spaceStep
+                    width: implicitWidth
+                    height: implicitHeight
                     visible: root.canRaiseMic
                     spacing: Theme.fieldGap
-                    Layout.alignment: Qt.AlignRight
                     AvButton {
                         text: qsTr("Поднять")
                         small: true
                         visible: root.micMuted || (root.micVolume >= 0 && root.micVolume < 30)
-                        Layout.alignment: Qt.AlignVCenter
+                        anchors.verticalCenter: parent.verticalCenter
                         onClicked: {
                             if (root.settings)
                                 root.settings.raiseMicrophoneVolume()
@@ -363,7 +378,7 @@ Column {
                         text: qsTr("Вернуть")
                         small: true
                         visible: root.canRestoreMic
-                        Layout.alignment: Qt.AlignVCenter
+                        anchors.verticalCenter: parent.verticalCenter
                         onClicked: {
                             if (root.settings)
                                 root.settings.restoreMicrophoneVolume()
@@ -374,7 +389,7 @@ Column {
                         text: qsTr("Настройки звука…")
                         small: true
                         visible: root.canOpenSoundSettings
-                        Layout.alignment: Qt.AlignVCenter
+                        anchors.verticalCenter: parent.verticalCenter
                         onClicked: {
                             if (root.settings)
                                 root.settings.openSoundSettings()
