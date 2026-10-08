@@ -9,7 +9,7 @@ Column {
     property bool wizard: false
     readonly property bool installed: bridge ? bridge.commandInstalled : false
     width: parent ? parent.width : 580
-    spacing: 8
+    spacing: Theme.fieldGap
 
     function escPressed() { return commandCapture.escPressed() }
     function chooseWin(key) { if (bridge) bridge.commandHotkey = key }
@@ -33,57 +33,74 @@ Column {
         }
     }
 
-    Text {
+    // SettingRow owns its padding; only the body shares the card content inset.
+    Item {
         width: parent.width
-        text: qsTr("Win запускает запись команды вместо меню приложений. Для команд рекомендуем «Удерживать»: пока Win зажата, сочетания с ней не работают. После выхода меню снова доступно.")
-        visible: root.installed
+        visible: root.installed || !root.wizard || commandCapture.visible
+        implicitHeight: content.height + Theme.cardRowPaddingY
         height: visible ? implicitHeight : 0
-        textFormat: Text.PlainText
-        font.family: Theme.fontUi
-        font.pixelSize: Theme.fontSettingSubSize
-        color: Theme.fgMuted
-        wrapMode: Text.WordWrap
-        renderType: Text.NativeRendering
-    }
 
-    RowLayout {
-        visible: root.installed
-        height: visible ? implicitHeight : 0
-        spacing: 8
-        AvButton { text: qsTr("Левая Win"); small: true; variant: "secondary"; onClicked: root.chooseWin("Super_L") }
-        AvButton { text: qsTr("Правая Win"); small: true; variant: "secondary"; onClicked: root.chooseWin("Super_R") }
-        AvButton { text: qsTr("Проверить снова"); small: true; variant: "ghost"; onClicked: if (root.bridge) root.bridge.refreshCommandStatus() }
-    }
+        Column {
+            id: content
+            x: Theme.cardRowPaddingX
+            width: parent.width - Theme.cardRowPaddingX * 2
+            spacing: Theme.fieldGap
 
-    AvButton {
-        visible: !root.installed && !root.wizard
-        text: qsTr("Проверить снова")
-        small: true
-        variant: "ghost"
-        onClicked: if (root.bridge) root.bridge.refreshCommandStatus()
-    }
+            Text {
+                width: parent.width
+                text: qsTr("Win запускает запись команды вместо меню приложений. Для команд рекомендуем «Удерживать»: пока Win зажата, сочетания с ней не работают.")
+                visible: root.installed
+                height: visible ? implicitHeight : 0
+                textFormat: Text.PlainText
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+                lineHeightMode: Text.FixedHeight
+                color: Theme.fgMuted
+                wrapMode: Text.WordWrap
+                renderType: Text.NativeRendering
+            }
 
-    CaptureField {
-        id: commandCapture
-        width: parent.width
-        visible: state7 !== "idle"
-        height: visible ? implicitHeight : 0
-        showIdleRow: false
-        state7: root.bridge && root.bridge.captureRole === "command" ? root.bridge.captureState : "idle"
-        hotkey: root.bridge ? root.bridge.commandHotkey : "Super_L"
-        captureMessage: root.bridge ? root.bridge.captureMessage : ""
-        pendingCombo: root.bridge ? root.bridge.pendingCombo : ""
-        freeCandidates: root.bridge ? root.bridge.freeCandidates : []
-        roleLabel: qsTr("Команда помощнику")
-        onChangeRequested: if (root.bridge) root.bridge.beginCommandCapture()
-        onChooseAnotherRequested: if (root.bridge) root.bridge.beginCommandCapture()
-        onRetryRequested: if (root.bridge) root.bridge.beginCommandCapture()
-        onCancelRequested: if (root.bridge) root.bridge.cancelCapture()
-        onComboCaptured: if (root.bridge) root.bridge.endCapture(combo)
-        onKeepRequested: if (root.bridge) root.bridge.keepCombo()
-        onState7Changed: {
-            if ((state7 === "conflict" || state7 === "duplicate" || state7 === "not-grabbed") && root.bridge)
-                root.bridge.refreshCandidates()
+            RowLayout {
+                visible: root.installed
+                height: visible ? implicitHeight : 0
+                spacing: Theme.fieldGap
+                AvButton { text: qsTr("Левая Win"); small: true; variant: "secondary"; onClicked: root.chooseWin("Super_L") }
+                AvButton { text: qsTr("Правая Win"); small: true; variant: "secondary"; onClicked: root.chooseWin("Super_R") }
+                AvButton { text: qsTr("Проверить снова"); small: true; variant: "ghost"; onClicked: if (root.bridge) root.bridge.refreshCommandStatus() }
+            }
+
+            AvButton {
+                visible: !root.installed && !root.wizard
+                text: qsTr("Проверить снова")
+                small: true
+                variant: "ghost"
+                onClicked: if (root.bridge) root.bridge.refreshCommandStatus()
+            }
+
+            CaptureField {
+                id: commandCapture
+                width: parent.width
+                visible: state7 !== "idle"
+                height: visible ? implicitHeight : 0
+                showIdleRow: false
+                state7: root.bridge && root.bridge.captureRole === "command" ? root.bridge.captureState : "idle"
+                hotkey: root.bridge ? root.bridge.commandHotkey : "Super_L"
+                captureMessage: root.bridge ? root.bridge.captureMessage : ""
+                pendingCombo: root.bridge ? root.bridge.pendingCombo : ""
+                freeCandidates: root.bridge ? root.bridge.freeCandidates : []
+                roleLabel: qsTr("Команда помощнику")
+                onChangeRequested: if (root.bridge) root.bridge.beginCommandCapture()
+                onChooseAnotherRequested: if (root.bridge) root.bridge.beginCommandCapture()
+                onRetryRequested: if (root.bridge) root.bridge.beginCommandCapture()
+                onCancelRequested: if (root.bridge) root.bridge.cancelCapture()
+                onComboCaptured: if (root.bridge) root.bridge.endCapture(combo)
+                onKeepRequested: if (root.bridge) root.bridge.keepCombo()
+                onState7Changed: {
+                    if ((state7 === "conflict" || state7 === "duplicate" || state7 === "not-grabbed") && root.bridge)
+                        root.bridge.refreshCandidates()
+                }
+            }
         }
     }
 }
