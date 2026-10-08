@@ -106,14 +106,25 @@ def _copy_shutdown_resources(
 def _children_stopped() -> bool:
     """Linux: последний барьер для прямых детей, забытых при неудачном switch.
 
+    WorkerSupervisor оставляет воркеров в нашей session; окна хоста sound/external
+    запускают с start_new_session=True. Только доказанно иная session освобождает
+    неизвестного ребёнка от этой проверки. Известные ресурсы проверяются отдельно.
     Не ищем процессы по имени и не посылаем сигналы. Исчезнувшие PID и zombie
     завершены; исчезнувший task мог передать детей другому task — это неизвестность.
     Недоступный procfs или непонятные данные запрещают удаление.
     Демонизированные потомки, уже переподчинённые другому родителю, сюда не входят.
     """
     try:
+        session = os.getsid(0)
+        if session <= 0:
+            return False
         pids: set[int] = set()
-        for task in Path("/proc/self/task").iterdir():
+        tasks = tuple(Path("/proc/self/task").iterdir())
+        if not tasks:
+            return False
+        for task in tasks:
+            if not task.name.isascii() or not task.name.isdecimal() or int(task.name) <= 0:
+                return False
             try:
                 children = (task / "children").read_text(encoding="ascii")
             except FileNotFoundError:
@@ -132,10 +143,15 @@ def _children_stopped() -> bool:
             if (
                 not record.startswith(f"{pid} (")
                 or not separator
-                or len(values) < 2
-                or values[0] != "Z"
-                or not values[1].isdecimal()
+                or len(values) < 4
+                or values[0] not in {"R", "S", "D", "Z", "T", "t", "X", "x", "K", "W", "P", "I"}
+                or any(
+                    not value.isascii() or not value.isdecimal() or int(value) <= 0
+                    for value in values[1:4]
+                )
             ):
+                return False
+            if values[0] != "Z" and int(values[3]) == session:
                 return False
         return True
     except (OSError, UnicodeError, ValueError):

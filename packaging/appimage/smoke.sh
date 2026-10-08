@@ -50,14 +50,32 @@ if [ "$STAGE" = gui ] || [ "$STAGE" = uninstall ]; then
     APPIMAGE_EXTRACT_AND_RUN=1 setsid "$IMAGE" --hidden >"$LOG" 2>&1 &
     pid=$!
     stop_app() {
-        kill -TERM -- "-$pid" 2>/dev/null || true
-        for _ in $(seq 1 100); do
-            kill -0 "$pid" 2>/dev/null || return 0
+        # TERM группе убивает runtime-обёртку AppImage раньше GUI. Адресуем только
+        # GUI из собственного QLockFile, проверяя его принадлежность нашей группе.
+        # Wrapper остаётся жив до выхода GUI и всех его штатных shutdown-действий.
+        local gui_pid
+        gui_pid=$(head -n 1 "$XDG_RUNTIME_DIR/astra-voice/lock" 2>/dev/null || true)
+        case $gui_pid in '' | *[!0-9]*) return 1 ;; esac
+        python3 -I -c '
+import os, sys
+try:
+    pid, group = map(int, sys.argv[1:])
+    valid = pid > 0 and group > 0 and os.getpgid(pid) == group
+except (OSError, ValueError, OverflowError):
+    valid = False
+raise SystemExit(0 if valid else 1)
+' "$gui_pid" "$pid" || return 1
+        kill -TERM -- "$gui_pid" 2>/dev/null || return 1
+        for _ in $(seq 1 150); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                wait "$pid" 2>/dev/null || true
+                return 0
+            fi
             sleep 0.1
         done
-        kill -KILL -- "-$pid" 2>/dev/null || true
+        return 1
     }
-    trap stop_app EXIT
+    trap 'stop_app || kill -KILL -- "-$pid" 2>/dev/null || true' EXIT
     for _ in $(seq 1 600); do
         [ -S "$SOCKET" ] && break
         kill -0 "$pid" 2>/dev/null || { cat "$LOG" >&2; die 'программа завершилась до готовности IPC'; }
@@ -65,8 +83,20 @@ if [ "$STAGE" = gui ] || [ "$STAGE" = uninstall ]; then
     done
     [ -S "$SOCKET" ] || { cat "$LOG" >&2; die 'IPC-сокет не появился за 60 с'; }
     say 'IPC-сокет готов'
+    app_log=$DATA/logs/astra-voice.log
+    shows_before=$(grep -c 'получена команда show' "$app_log" 2>/dev/null || true)
+    shows_before=${shows_before:-0}
     "$DATA/app/current/AppRun" --show || die '--show из установленной копии завершился с ошибкой'
-    say '--show передан работающей копии'
+    # listen() появляется до завершения инициализации GUI. Принятые байты ещё
+    # не доказывают обработку команды; журнал сервера подтверждает вход в event loop.
+    shown=0
+    for _ in $(seq 1 100); do
+        shows_now=$(grep -c 'получена команда show' "$app_log" 2>/dev/null || true)
+        if [ "${shows_now:-0}" -gt "$shows_before" ]; then shown=1; break; fi
+        sleep 0.1
+    done
+    [ "$shown" = 1 ] || { cat "$LOG" >&2; die '--show не обработан работающей копией за 10 с'; }
+    say '--show обработан работающей копией'
     if [ "$STAGE" = uninstall ]; then
         key=$(readlink "$DATA/app/current")
         desktop=$HOME/.local/share/applications/astra-voice.desktop
@@ -86,7 +116,7 @@ if [ "$STAGE" = gui ] || [ "$STAGE" = uninstall ]; then
         cmp -s "$startup" "$HOME/foreign.desktop" || die 'удаление изменило чужой автозапуск'
         cmp -s "$icon" "$HOME/foreign.icon" || die 'удаление изменило чужой значок'
     fi
-    stop_app
+    stop_app || { cat "$LOG" >&2; die 'не удалось подтвердить штатное завершение GUI за 15 с'; }
     wait "$pid" 2>/dev/null || true
     if [ "$STAGE" = uninstall ]; then
         [ ! -e "$DATA/app/$key" ] || { cat "$LOG" >&2; die 'работающая копия не удалена после выхода'; }
@@ -186,7 +216,10 @@ if [ "$STAGE" = inner ]; then
         fi
         [ -z "$(find "$HOME/.local/share/icons/hicolor" -type f -name 'astravoice.*' -print)" ] ||
             die '--uninstall оставил наши значки'
-        cmp -s "$settings" "$HOME/settings.control" || die 'изменены настройки'
+        cmp -s "$settings" "$HOME/settings.control" || {
+            diff -u "$HOME/settings.control" "$settings" >&2 || true
+            die 'изменены настройки во временном HOME после --uninstall'
+        }
         cmp -s "$DATA/models/uninstall-control" "$HOME/model.control" || die 'изменена модель'
         cmp -s "$DATA/logs/uninstall-control" "$HOME/log.control" || die 'изменён журнал'
 
@@ -205,7 +238,10 @@ if [ "$STAGE" = inner ]; then
         cmp -s "$startup" "$HOME/foreign.desktop" || die 'повторное удаление изменило чужой автозапуск'
         cmp -s "$HOME/.local/share/icons/hicolor/scalable/apps/astravoice.svg" "$HOME/foreign.icon" ||
             die 'повторное удаление изменило чужой значок'
-        cmp -s "$settings" "$HOME/settings.control" || die 'изменены настройки'
+        cmp -s "$settings" "$HOME/settings.control" || {
+            diff -u "$HOME/settings.control" "$settings" >&2 || true
+            die 'изменены настройки во временном HOME после повторной установки/удаления'
+        }
         cmp -s "$DATA/models/uninstall-control" "$HOME/model.control" || die 'изменена модель'
         cmp -s "$DATA/logs/uninstall-control" "$HOME/log.control" || die 'изменён журнал'
     fi

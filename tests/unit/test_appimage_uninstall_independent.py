@@ -22,6 +22,7 @@ from PyQt5.QtCore import QLockFile
 from astra_voice import app, bootstrap
 from astra_voice.core import paths
 from astra_voice.platform import autostart, userinstall
+from conftest import REAL_GETEUID
 from helpers.appimage_bundle import KEY, make_bundle, module_path, tree_snapshot
 
 pytestmark = pytest.mark.unit
@@ -430,20 +431,40 @@ def test_cli_refuses_to_mutate_registration_while_install_lock_is_held(
         assert tree_snapshot(tmp_path) == before
 
 
+@pytest.mark.parametrize("failure_mode", ["permission_error", "real_readonly"])
 def test_cli_uses_fallback_when_session_runtime_parent_is_not_writable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
 ) -> None:
     current, old = installation(monkeypatch)
+    if failure_mode == "real_readonly" and REAL_GETEUID() == 0:
+        pytest.skip("root может создавать каталоги под 0555; PermissionError проверяется отдельно")
     session_root = tmp_path / "readonly-run-user"
     session_root.mkdir(mode=0o555)
     monkeypatch.setattr(paths, "USER_RUNTIME_ROOT", session_root)
     before = tree_snapshot(session_root)
+    denied: list[Path] = []
+    unavailable = session_root / str(os.getuid()) / "astra-voice"
+    original_mkdir = Path.mkdir
+
+    def runtime_mkdir(
+        directory: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        if directory == unavailable:
+            denied.append(directory)
+            raise PermissionError("temporary session runtime is unavailable")
+        original_mkdir(directory, mode=mode, parents=parents, exist_ok=exist_ok)
+
+    if failure_mode == "permission_error":
+        monkeypatch.setattr(Path, "mkdir", runtime_mkdir)
     try:
         assert app.main(["--uninstall"]) == 0
         assert not current.exists() and not old.exists()
         assert tree_snapshot(session_root) == before
         assert session_root.stat().st_mode & 0o777 == 0o555
+        if failure_mode == "permission_error":
+            assert denied == [unavailable]
     finally:
         # Только свой temporary fixture: вернуть права для уборки pytest.
         session_root.chmod(0o700)
@@ -517,3 +538,259 @@ def test_exit_preserves_code_if_captured_worker_process_is_still_alive(
         if child.stdin is not None:
             child.stdin.close()
         child.wait(timeout=2)
+
+
+@contextmanager
+def waiting_child(*, separate_session: bool) -> Iterator[subprocess.Popen[bytes]]:
+    """Собственный безвредный ребёнок жив до EOF; всегда завершается и reap-ится."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=separate_session,
+    )
+    try:
+        assert child.poll() is None
+        assert (os.getsid(child.pid) != os.getsid(0)) == separate_session
+        yield child
+    finally:
+        if child.stdin is not None:
+            child.stdin.close()
+        try:
+            child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=2)
+
+
+@pytest.mark.parametrize("separate_session", [False, True])
+@pytest.mark.parametrize("pending", [False, True])
+def test_exit_distinguishes_external_session_from_untracked_own_child(
+    monkeypatch: pytest.MonkeyPatch, separate_session: bool, pending: bool
+) -> None:
+    current, _ = installation(monkeypatch)
+    userinstall.write_running_key(KEY)
+    if pending:
+        userinstall.remove_program(keep=KEY)
+    with waiting_child(separate_session=separate_session) as child:
+        # Нет capture-списка: ресурс потерян runtime либо создан внешним launcher.
+        app._finish_running_copy(KEY, [], [], stopped=True)
+        assert child.poll() is None  # Cleanup приложения не останавливает внешние процессы.
+        if separate_session:
+            assert userinstall.read_running_key() is None
+            if pending:
+                assert not current.exists()
+            else:
+                assert current.is_dir()
+                assert not (current / userinstall.SHUTDOWN_INCOMPLETE).exists()
+        else:
+            assert current.is_dir() and userinstall.read_running_key() == KEY
+            assert (current / userinstall.SHUTDOWN_INCOMPLETE).is_file()
+            assert (current / userinstall.REMOVE_ON_EXIT).is_file() == pending
+
+
+def test_failed_switch_lost_supervisor_still_protects_pending_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current, _ = installation(monkeypatch)
+    userinstall.write_running_key(KEY)
+    userinstall.remove_program(keep=KEY)
+    with waiting_child(separate_session=False) as child:
+        old_supervisor = SimpleNamespace(process=child, _retired=[])
+        replacement = SimpleNamespace(process=None, _retired=[])
+        runtime = SimpleNamespace(supervisor=old_supervisor, _switch_candidate=replacement)
+        # Failed stop после публикации replacement теряет старый supervisor.
+        runtime.supervisor = replacement
+        runtime._switch_candidate = None
+        del old_supervisor
+        processes, threads = app._copy_shutdown_resources(runtime, None, None)
+        assert child not in processes
+
+        app._finish_running_copy(KEY, processes, threads, stopped=True)
+
+        assert child.poll() is None and current.is_dir()
+        assert (current / userinstall.REMOVE_ON_EXIT).is_file()
+        assert (current / userinstall.SHUTDOWN_INCOMPLETE).is_file()
+        assert userinstall.read_running_key() == KEY
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing-proc",
+        "denied-proc",
+        "vanished-task",
+        "invalid-children",
+        "denied-stat",
+        "malformed-stat",
+        "invalid-state",
+        "invalid-ppid",
+        "invalid-pgrp",
+        "invalid-session",
+        "truncated-stat",
+        "nonascii-stat",
+    ],
+)
+def test_unknown_proc_state_protects_pending_copy(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    current, _ = installation(monkeypatch)
+    userinstall.write_running_key(KEY)
+    userinstall.remove_program(keep=KEY)
+    task_root = Path("/proc/self/task")
+    original_iterdir = Path.iterdir
+    original_read_text = Path.read_text
+    with waiting_child(separate_session=True) as child:
+        stat_path = Path(f"/proc/{child.pid}/stat")
+        record = original_read_text(stat_path, encoding="ascii")
+
+        def proc_iterdir(directory: Path) -> Iterator[Path]:
+            if directory == task_root:
+                if fault == "missing-proc":
+                    raise FileNotFoundError("temporary unavailable procfs")
+                if fault == "denied-proc":
+                    raise PermissionError("temporary denied procfs")
+            return original_iterdir(directory)
+
+        def proc_read_text(
+            path: Path, encoding: str | None = None, errors: str | None = None
+        ) -> str:
+            if path.parent.parent == task_root and path.name == "children":
+                if fault == "vanished-task":
+                    raise FileNotFoundError("task vanished after enumeration")
+                if fault == "invalid-children":
+                    return "not-a-pid\n"
+            if path == stat_path:
+                if fault == "denied-stat":
+                    raise PermissionError("temporary denied process stat")
+                if fault == "malformed-stat":
+                    return "not a Linux stat record"
+                if fault == "nonascii-stat":
+                    raise UnicodeDecodeError("ascii", b"\xff", 0, 1, "invalid proc stat")
+                prefix, separator, tail = record.rpartition(") ")
+                values = tail.split()
+                # Поля Linux proc_pid_stat: state, ppid, pgrp, session.
+                corrupt_index = {
+                    "invalid-state": 0,
+                    "invalid-ppid": 1,
+                    "invalid-pgrp": 2,
+                    "invalid-session": 3,
+                }.get(fault)
+                if corrupt_index is not None:
+                    values[corrupt_index] = "?"
+                    return prefix + separator + " ".join(values)
+                if fault == "truncated-stat":
+                    return prefix + separator + " ".join(values[:2])
+            return original_read_text(path, encoding=encoding, errors=errors)
+
+        monkeypatch.setattr(Path, "iterdir", proc_iterdir)
+        monkeypatch.setattr(Path, "read_text", proc_read_text)
+
+        app._finish_running_copy(KEY, [], [], stopped=True)
+
+        assert child.poll() is None and current.is_dir()
+        assert (current / userinstall.REMOVE_ON_EXIT).is_file()
+        assert (current / userinstall.SHUTDOWN_INCOMPLETE).is_file()
+        assert userinstall.read_running_key() == KEY
+
+
+def test_vanished_child_pid_is_finished_even_if_children_list_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current, _ = installation(monkeypatch)
+    userinstall.write_running_key(KEY)
+    userinstall.remove_program(keep=KEY)
+    original_read_text = Path.read_text
+    with waiting_child(separate_session=False) as child:
+        stat_path = Path(f"/proc/{child.pid}/stat")
+
+        def vanished_stat(
+            path: Path, encoding: str | None = None, errors: str | None = None
+        ) -> str:
+            if path == stat_path:
+                raise FileNotFoundError("child exited after reading task children")
+            return original_read_text(path, encoding=encoding, errors=errors)
+
+        monkeypatch.setattr(Path, "read_text", vanished_stat)
+        app._finish_running_copy(KEY, [], [], stopped=True)
+        assert not current.exists() and userinstall.read_running_key() is None
+
+
+def test_real_zombie_child_is_finished_before_reaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current, _ = installation(monkeypatch)
+    userinstall.write_running_key(KEY)
+    userinstall.remove_program(keep=KEY)
+    with waiting_child(separate_session=False) as child:
+        assert child.stdin is not None
+        child.stdin.close()
+        info = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+        assert info is not None and info.si_pid == child.pid
+        record = Path(f"/proc/{child.pid}/stat").read_text(encoding="ascii")
+        assert record.rpartition(") ")[2].split()[0] == "Z"
+
+        app._finish_running_copy(KEY, [], [], stopped=True)
+
+        assert not current.exists() and userinstall.read_running_key() is None
+
+
+def test_captured_own_child_in_separate_session_still_blocks_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current, _ = installation(monkeypatch)
+    userinstall.write_running_key(KEY)
+    userinstall.remove_program(keep=KEY)
+    with waiting_child(separate_session=True) as child:
+        app._finish_running_copy(KEY, [child], [], stopped=True)
+        assert child.poll() is None and current.is_dir()
+        assert (current / userinstall.SHUTDOWN_INCOMPLETE).is_file()
+        assert (current / userinstall.REMOVE_ON_EXIT).is_file()
+        assert userinstall.read_running_key() == KEY
+
+
+def test_real_supervisor_launch_keeps_own_child_in_parent_session() -> None:
+    from astra_voice.worker.supervisor import WorkerSupervisor
+
+    supervisor = WorkerSupervisor(
+        on_event=lambda event: None,
+        command_factory=lambda fd: [
+            sys.executable,
+            "-c",
+            "import os,sys; os.read(int(sys.argv[1]), 1)",
+            str(fd),
+        ],
+        use_qt=False,
+    )
+    try:
+        supervisor.start()
+        child = supervisor.process
+        assert child is not None and child.poll() is None
+        assert os.getsid(child.pid) == os.getsid(0)
+        assert not app._children_stopped()
+    finally:
+        # Завершает только своего Python ребёнка и закрывает свою socketpair.
+        supervisor.stop()
+    assert child.poll() is not None
+
+
+@pytest.mark.parametrize("launcher", ["sound", "external"])
+def test_external_launchers_request_a_separate_session_without_starting_gui(
+    launcher: str,
+) -> None:
+    from astra_voice.platform import external, sound
+
+    calls: list[dict[str, object]] = []
+
+    def capture(command: list[str], **kwargs: object) -> object:
+        calls.append(kwargs)
+        return object()
+
+    if launcher == "sound":
+        assert sound._spawn(["uninstall-test-do-not-execute"], popen=capture)
+    else:
+        assert external.open_external("file:///nonexistent/uninstall-test", popen=capture)
+    assert len(calls) == 1
+    assert calls[0]["start_new_session"] is True
+    assert calls[0]["shell"] is False
