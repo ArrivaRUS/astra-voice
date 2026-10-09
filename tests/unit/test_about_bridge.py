@@ -247,6 +247,16 @@ def test_package_version_missing() -> None:
     assert about_bridge.package_version("astra-voice-нет-такого-пакета") == ""
 
 
+@pytest.mark.parametrize("kind", list(paths.InstallKind))
+def test_actual_install_kind_does_not_follow_resource_directory(
+    kind: paths.InstallKind, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(paths, "install_kind", lambda: kind)
+    monkeypatch.setattr(paths, "resource_root", lambda: paths.INSTALL_SHARE_DIR)
+    bridge, _ = make(tmp_path, installed=None)
+    assert bridge.installKind == kind.value
+
+
 def test_documents_and_folders_open_only_when_present(tmp_path: Path) -> None:
     bridge, opened = make(tmp_path)
     assert bridge.licenseAvailable and bridge.noticeAvailable and bridge.privacyAvailable

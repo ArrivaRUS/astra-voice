@@ -34,7 +34,7 @@ def test_late_unlock_installs_notifier_after_lazy_backend_open(
         manager.fileno.return_value = 23
         return GrabResult("ok")
 
-    manager.grab.side_effect = grab
+    manager.rearm.side_effect = grab
     session.snapshot.return_value = SessionSnapshot(known=True, locked=False)
     runtime._command_session_changed()
     rig.create_notifier.assert_called_once_with(23)

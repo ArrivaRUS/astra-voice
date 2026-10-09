@@ -504,6 +504,7 @@ class HotkeyManager:
         self.last_result = GrabResult("not-grabbed")
         self.escape_result = GrabResult("not-grabbed")
         self._combo: str | None = None
+        self._suspended_combo: str | None = None
         self._keycode: int | None = None
         self._mods = 0
         self._escape_grabbed = False
@@ -577,8 +578,72 @@ class HotkeyManager:
         result = resolve(combo)
         return result if isinstance(result, tuple) and len(result) == 2 else None
 
+    def rearm(self, combo: str, mode: HotkeyMode) -> GrabResult:
+        """Keep an unchanged registration; resume an idle input handoff if needed."""
+        previous = self._combo or self._suspended_combo
+        if previous is not None and (previous != combo or self.fsm._configured_mode != mode):
+            self.ungrab()
+        if combo == self._combo and not self._lost:
+            if self.fsm.state == HotkeyState.IDLE:
+                # Complete an operation at an input-generation boundary. The
+                # broker may still have a pre-threshold Win hold or queued keys.
+                self._event_generation += 1
+                self._deferred_press = None
+                self._cancel_keyboard_grab()
+                for event in self.backend.poll_events():
+                    if isinstance(event, MappingEvent):
+                        self._handle_mapping(event)
+                held = getattr(self.backend, "key_is_down", None)
+                if (
+                    self._combo != combo
+                    or self._lost
+                    or (
+                        self.defer_single_super
+                        and self._keycode is not None
+                        and held is not None
+                        and held(self._keycode)
+                    )
+                ):
+                    self.ungrab()
+                    self.last_result = GrabResult("not-grabbed")
+                    return self.last_result
+                self._key_down = False
+            self.last_result = GrabResult("ok", keycode=self._keycode, mods=self._mods)
+            return self.last_result
+        return self.grab(combo, mode)
+
+    def suspend(self, combo: str | None = None, mode: HotkeyMode | None = None) -> None:
+        """Pause an idle command key without releasing its supervised menu lease."""
+        previous = self._combo or self._suspended_combo
+        if (
+            (combo is not None and previous != combo)
+            or (mode is not None and self.fsm._configured_mode != mode)
+            or self.fsm.state != HotkeyState.IDLE
+        ):
+            self.ungrab()
+            return
+        if self._combo is None:
+            return
+        pause = getattr(self.backend, "suspend_combo", None)
+        if pause is None or not pause(self._combo):
+            self.ungrab()
+            return
+        self._revoke_external_escape()
+        self._event_generation += 1
+        self._deferred_press = None
+        self.mapping_release_lost = False
+        self._suspended_combo, self._combo = self._combo, None
+        self._keycode = None
+        self._key_down = self._lost = False
+        self.last_result = GrabResult("not-grabbed")
+        self.backend.poll_events()
+
     def grab(self, combo: str, mode: HotkeyMode) -> GrabResult:
         self._revoke_external_escape()
+        if self._suspended_combo is not None and (
+            self._suspended_combo != combo or self.fsm._configured_mode != mode
+        ):
+            self.ungrab()
         configure = getattr(self.backend, "configure", None)
         if configure is not None:
             configure(defer_super=self.defer_single_super and mode == HotkeyMode.PTT)
@@ -608,6 +673,7 @@ class HotkeyManager:
                 self.ungrab()
             self._event_generation += 1
             self._combo = combo
+            self._suspended_combo = None
             self._keycode = result.keycode
             self._mods = result.mods
             self.fsm = HotkeyFsm(mode, self._on_state)
@@ -642,13 +708,14 @@ class HotkeyManager:
         self._event_generation += 1
         self.mapping_release_lost = False
         self._deferred_press = None
-        if self._combo is None:
+        combo = self._combo or self._suspended_combo
+        if combo is None:
             self.last_result = GrabResult("not-grabbed")
             return
         self.fsm.escape(self._clock())
-        self.last_result = self.backend.ungrab_combo(self._combo)
+        self.last_result = self.backend.ungrab_combo(combo)
         self._cancel_keyboard_grab()
-        self._combo = None
+        self._combo = self._suspended_combo = None
         self._keycode = None
         self._key_down = False
         self._lost = False

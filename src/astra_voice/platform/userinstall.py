@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ctypes
 import fcntl
+import hashlib
 import logging
 import math
 import os
@@ -27,7 +28,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -43,6 +44,8 @@ KEY_RE = paths.APPIMAGE_KEY_RE
 TMP_PREFIX = ".tmp-"
 LOCK_NAME = ".install.lock"
 RUNNING_KEY_NAME = "running-key"
+REMOVE_ON_EXIT = ".remove-on-exit"
+SHUTDOWN_INCOMPLETE = ".shutdown-incomplete"
 MIB = 1024 * 1024
 MIN_FREE_BYTES = 350 * MIB
 LOCK_TIMEOUT_S = 180.0
@@ -324,6 +327,87 @@ def write_running_key(key: str) -> None:
     os.replace(temporary, path)
 
 
+def begin_running_copy(key: str) -> None:
+    """До GUI/worker: проверка копии и публикация защиты атомарны с удалением."""
+    if not is_key(key):
+        raise ValueError(f"не KEY копии: {key!r}")
+    app = paths.appimage_app_dir()
+    with _install_lock(app, LOCK_TIMEOUT_S):
+        copy = app / key
+        info = read_build_info(copy)
+        if info.key != key or not installed_ok(copy, info):
+            raise UserInstallError(
+                "Копия Astra Voice удалена или повреждена. Запустите файл .AppImage."
+            )
+        write_running_key(key)
+
+
+def preserve_incomplete_shutdown(key: str) -> None:
+    """Код с неподтверждённой остановкой не удаляем даже после выхода владельца lock."""
+    if not is_key(key):
+        raise ValueError(f"не KEY копии: {key!r}")
+    app = paths.appimage_app_dir()
+    with _install_lock(app, LOCK_TIMEOUT_S):
+        copy = app / key
+        if not _is_real_dir(copy):
+            raise UserInstallError("Не найдена копия с незавершённой остановкой.")
+        _removal_marker(copy, SHUTDOWN_INCOMPLETE)
+
+
+def _removal_marker(copy: Path, name: str) -> None:
+    """Атомарная пустая метка; существующий необычный файл не заменяем."""
+    marker = copy / name
+    if os.path.lexists(marker):
+        if not stat.S_ISREG(marker.lstat().st_mode):
+            raise UserInstallError("Не удалось отложить удаление работающей копии.")
+        return
+    temporary = copy / f"{TMP_PREFIX}remove-{secrets.token_hex(6)}"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(temporary, marker)
+    _sync_directory(copy)
+
+
+def finish_running_copy(key: str) -> None:
+    """После остановки всех ресурсов, пока single-instance lock ещё удерживается.
+
+    Снимает только собственную метку; другой runtime с тем же KEY всё ещё защищает
+    каталог. Переустановка отменяет отложенное удаление под тем же install-lock.
+    """
+    if not is_key(key):
+        raise ValueError(f"не KEY копии: {key!r}")
+    app = paths.appimage_app_dir()
+    if not _is_real_dir(app):
+        return
+    with _install_lock(app, LOCK_TIMEOUT_S):
+        marker = paths.runtime_dir() / RUNNING_KEY_NAME
+        if _read_running_key(marker) != key:
+            return
+        marker.unlink()
+        copy = app / key
+        if (
+            not _is_real_dir(copy)
+            or key in read_running_keys()
+            or os.path.lexists(copy / SHUTDOWN_INCOMPLETE)
+        ):
+            return
+        pending = copy / REMOVE_ON_EXIT
+        try:
+            mode = pending.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(mode):
+            return
+        if key in {_link_key(app / name) for name in ("current", "previous")}:
+            return
+        if not _remove_entry(copy):
+            raise UserInstallError("Не удалось удалить завершённую копию Astra Voice.")
+        _sync_directory(app)
+
+
 def _sync_filesystem(path: Path) -> None:
     """Сбрасывает на диск данные и метаданные тома, где лежит ``path`` (``syncfs(2)``).
 
@@ -363,8 +447,15 @@ def _sync_directory(directory: Path) -> None:
 @contextmanager
 def _install_lock(app: Path, timeout: float) -> Iterator[None]:
     """``flock`` на ``app/.install.lock``: снимается вместе с процессом, зависших нет."""
-    fd = os.open(app / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    fd = os.open(
+        app / LOCK_NAME,
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+        0o600,
+    )
     try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise UserInstallError("Небезопасный файл блокировки установки.")
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -481,6 +572,9 @@ def _switch_current(app: Path, key: str) -> str | None:
         _replace_link(app, paths.APPIMAGE_PREVIOUS, old)
         previous = old
     _replace_link(app, paths.APPIMAGE_CURRENT, key)
+    # Повторный запуск установщика — новый выбор пользователя. Старый процесс
+    # с этим KEY при выходе не должен удалить вновь выбранную установку.
+    (app / key / REMOVE_ON_EXIT).unlink(missing_ok=True)
     _sync_directory(app)
     return previous
 
@@ -514,6 +608,8 @@ def _cleanup(app: Path, keep: Iterable[str | None], *, only_tmp: bool = False) -
         names = sorted(entry.name for entry in entries)
     for name in names:
         if name in keep_names:
+            continue
+        if is_key(name) and os.path.lexists(app / name / SHUTDOWN_INCOMPLETE):
             continue
         if not (name.startswith(TMP_PREFIX) or (is_key(name) and not only_tmp)):
             continue
@@ -578,6 +674,8 @@ def install_from_dir(
     paths.data_dir()
     paths.ensure_private_dir(app)
     with _install_lock(app, lock_timeout):
+        if os.path.lexists(target / SHUTDOWN_INCOMPLETE):
+            raise UserInstallError("Остановка этой копии не подтверждена. Требуется проверка.")
         copied = False
         if not installed_ok(target, info):
             _drop_abandoned_tmp(app)
@@ -697,9 +795,7 @@ def _write_desktop_file(path: Path, data: bytes) -> bool:
     return True
 
 
-def register() -> RegisterResult:
-    """Добавляет установленную копию в меню, перенацеливает наш автозапуск (§2–4)."""
-    refuse_root()
+def _registration_source() -> tuple[Path, Path, BuildInfo]:
     app = paths.appimage_app_dir()
     try:
         key = _link_key(app / paths.APPIMAGE_CURRENT) if _is_real_dir(app) else None
@@ -713,6 +809,11 @@ def register() -> RegisterResult:
     launcher = paths.check_appimage_launcher(paths.appimage_current_apprun())
     copy = app / key
     info = read_build_info(copy)
+    return copy, launcher, info
+
+
+def _register() -> RegisterResult:
+    copy, launcher, info = _registration_source()
     data = menu_entry_bytes(launcher, info.version)
     menu, icons = _desktop_paths()
     menu_result: Literal["written", "unchanged", "foreign"]
@@ -730,6 +831,17 @@ def register() -> RegisterResult:
     # Автозапуск перенацеливается независимо от значков.
     retargeted = autostart.retarget()
     return RegisterResult(menu_result, tuple(written), tuple(skipped), retargeted)
+
+
+def register() -> RegisterResult:
+    """Добавляет установленную копию в меню, перенацеливает наш автозапуск (§2–4)."""
+    refuse_root()
+    # Ошибочная регистрация остаётся read-only, включая отсутствие .install.lock.
+    # После получения lock повторяем проверку против конкурентного удаления.
+    _registration_source()
+    app = paths.appimage_app_dir()
+    with _install_lock(app, LOCK_TIMEOUT_S):
+        return _register()
 
 
 def _copy_icons(copy: Path, icons: Path, written: list[Path], skipped: list[Path]) -> None:
@@ -753,9 +865,73 @@ def _copy_icons(copy: Path, icons: Path, written: list[Path], skipped: list[Path
         (written if changed else skipped).append(destination)
 
 
-def unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
-    """Снимает только нашу регистрацию, возвращая автозапуск пакету при наличии (§4)."""
-    refuse_root()
+def _owned_icons(icons: Path, *, strict: bool = False) -> Iterator[Path]:
+    """Наши копии значков: обычные файлы с байтами из установленного бандла.
+
+    Старые установки не вели реестр значков. Сравниваем с их исходниками до
+    удаления версий; изменённые пользователем файлы и ссылки сохраняются.
+    """
+    app = paths.appimage_app_dir()
+    if not _is_real_dir(app):
+        return
+    sources: dict[Path, set[bytes]] = {}
+    for copy in app.iterdir():
+        if not is_key(copy.name) or not _is_real_dir(copy):
+            continue
+        try:
+            info = read_build_info(copy)
+            if info.key != copy.name or not installed_ok(copy, info):
+                continue
+            source = copy
+            for part in ("usr", "share", "icons", "hicolor"):
+                source /= part
+                if not _is_real_dir(source):
+                    break
+            else:
+                for icon in _icon_files(source):
+                    sources.setdefault(icon.relative_to(source), set()).add(icon.read_bytes())
+        except (OSError, UserInstallError):
+            if strict:
+                raise
+            continue
+    for icon in _icon_files(icons):
+        candidates = sources.get(icon.relative_to(icons))
+        if candidates is not None and icon.read_bytes() in candidates:
+            yield icon
+
+
+def validate_remove_paths(runtime_dirs: Iterable[Path] = ()) -> None:
+    """Проверяет существующих предков до изменений; ссылки/чужая запись — отказ.
+
+    Приватные каталоги при удалении не исправляем chmod. Общие системные предки
+    допустимы (включая root-owned sticky /tmp), но не подменяемые чужим UID.
+    """
+    menu, icons = _desktop_paths()
+    targets = [paths.appimage_app_dir(), menu.parent, icons, paths.config_dir_path().parent]
+    targets.append(paths.config_dir_path().parent / "autostart")
+    runtimes = tuple(runtime_dirs)
+    targets.extend(runtimes)
+    for target in targets:
+        for directory in (target, *target.parents):
+            try:
+                info = directory.lstat()
+            except FileNotFoundError:
+                continue
+            sticky_root = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid not in (0, os.getuid())
+                or (directory == target and info.st_uid != os.getuid())
+                or (info.st_mode & 0o022 and not sticky_root)
+            ):
+                raise UserInstallError(
+                    f"Небезопасный каталог: {tilde(directory)}. Удаление остановлено."
+                )
+            if directory == target and target in runtimes and stat.S_IMODE(info.st_mode) != 0o700:
+                raise UserInstallError(f"Небезопасные права runtime: {tilde(directory)}.")
+
+
+def _unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
     if deb_executable is None:
         deb_executable = paths.SYSTEM_EXECUTABLE
     menu, icons = _desktop_paths()
@@ -765,7 +941,7 @@ def unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
         _sync_directory(menu.parent)
     removed_icons: list[Path] = []
     if _is_real_dir(icons.parent):
-        for icon in _icon_files(icons, links=True):
+        for icon in _owned_icons(icons):
             icon.unlink()
             _sync_directory(icon.parent)
             removed_icons.append(icon)
@@ -777,18 +953,68 @@ def unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
     return UnregisterResult(removed_menu, tuple(removed_icons), changed)
 
 
-def remove_program(*, keep: str | None = None) -> RemoveResult:
+def unregister(
+    *,
+    deb_executable: Path | None = None,
+    validate: Callable[[], None] | None = None,
+    lock_timeout: float | None = None,
+) -> UnregisterResult:
+    """Снимает только нашу регистрацию, возвращая автозапуск пакету при наличии (§4)."""
+    refuse_root()
+    validate_remove_paths()
+    app = paths.appimage_app_dir()
+    with (
+        _install_lock(app, LOCK_TIMEOUT_S if lock_timeout is None else lock_timeout)
+        if _is_real_dir(app)
+        else nullcontext()
+    ):
+        validate_remove_paths()
+        if validate is not None:
+            validate()
+        return _unregister(deb_executable=deb_executable)
+
+
+def remove_program(
+    *,
+    keep: str | None = None,
+    stopped_runtimes: Iterable[Path] = (),
+    prepare: Callable[[], Iterable[Path]] | None = None,
+    validate: Callable[[], None] | None = None,
+    lock_timeout: float | None = None,
+) -> RemoveResult:
     """Удаляет только копии в app/ под замком (§4).
 
     Работающие копии (``running-key``) не удаляются никогда (Р5); ``keep`` добавляет
     к ним ещё одну копию, а не заменяет защиту. Оставленные копии удаляет вызывающий
     при выходе.
     """
-    unregistered = unregister()
+    refuse_root()
+    validate_remove_paths(stopped_runtimes)
     app = paths.appimage_app_dir()
-    if not _is_real_dir(app):
-        return RemoveResult(unregistered, (), ())
-    with _install_lock(app, LOCK_TIMEOUT_S):
+    with (
+        _install_lock(app, LOCK_TIMEOUT_S if lock_timeout is None else lock_timeout)
+        if _is_real_dir(app)
+        else nullcontext()
+    ):
+        validate_remove_paths(stopped_runtimes)
+        if validate is not None:
+            validate()
+        if not _is_real_dir(app):
+            if prepare is not None:
+                prepare()
+            return RemoveResult(_unregister(), (), ())
+        if any(os.path.lexists(p / SHUTDOWN_INCOMPLETE) for p in app.iterdir() if is_key(p.name)):
+            raise UserInstallError(
+                "Остановка одной из копий не подтверждена. Файлы сохранены; требуется проверка."
+            )
+        if prepare is not None:
+            stopped_runtimes = tuple(prepare())
+        validate_remove_paths(stopped_runtimes)
+        # Вызывающий удерживает QLockFile этих runtime до завершения удаления.
+        # Только это позволяет признать оставшийся после сбоя running-key устаревшим.
+        for directory in stopped_runtimes:
+            (directory / RUNNING_KEY_NAME).unlink(missing_ok=True)
+        unregistered = _unregister()
         protected = {*read_running_keys(), keep}
         kept = tuple(
             sorted(
@@ -797,16 +1023,130 @@ def remove_program(*, keep: str | None = None) -> RemoveResult:
                 if entry.name in protected and is_key(entry.name) and _is_real_dir(entry)
             )
         )
+        for key in kept:
+            _removal_marker(app / key, REMOVE_ON_EXIT)
         removed = _cleanup(app, kept)
         for name in (paths.APPIMAGE_CURRENT, paths.APPIMAGE_PREVIOUS):
             link = app / name
-            if link.is_symlink():
+            if link.is_symlink() and _link_key(link) is not None:
                 link.unlink()
                 removed.append(name)
         _sync_directory(app)
+        if any(
+            is_key(entry.name) and _is_real_dir(entry) and entry.name not in kept
+            for entry in app.iterdir()
+        ):
+            raise UserInstallError("Не удалось удалить все копии Astra Voice. Повторите команду.")
     for name in removed:
         log.info("Удалено: %s", tilde(app / name))
     return RemoveResult(unregistered, tuple(removed), kept)
+
+
+@dataclass(frozen=True)
+class ManagementSnapshot:
+    """Strict consent facts; no tolerant CLI status defaults or UI-supplied paths."""
+
+    app_path: Path
+    models_path: Path
+    settings_path: Path
+    installed: tuple[str, ...]
+    menu: str
+    icons: tuple[Path, ...]
+    autostart_owned: bool
+    autostart_program: str | None
+    deb_available: bool
+    identities: tuple[tuple[str, tuple[object, ...]], ...]
+
+    @property
+    def can_unregister(self) -> bool:
+        return bool(
+            self.menu == "ours"
+            or self.icons
+            or (self.autostart_owned and self.autostart_program != autostart.DEB_EXECUTABLE)
+        )
+
+
+def _management_identity(path: Path) -> tuple[object, ...]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return ()
+    base = (info.st_dev, info.st_ino, info.st_mode, info.st_uid)
+    if stat.S_ISLNK(info.st_mode):
+        return (*base, os.readlink(path))
+    if stat.S_ISREG(info.st_mode):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise UserInstallError("Состояние установки изменилось. Повторите проверку.")
+            if not stat.S_ISREG(opened.st_mode):
+                raise UserInstallError("Небезопасный файл установки.")
+            return (*base, hashlib.file_digest(stream, "sha256").digest())
+    return base
+
+
+def management_snapshot() -> ManagementSnapshot:
+    """Read strict facts; caller holds the install lock for mutation revalidation.
+
+    IO/ownership failures propagate. Ancestor identities cover path replacement.
+    Lock file and directory mtime deliberately are not consent facts.
+    """
+    validate_remove_paths()
+    app = paths.appimage_app_dir()
+    menu, icons = _desktop_paths()
+    auto = autostart._paths()[0]
+    candidates: list[Path] = [menu, auto]
+    for target in (app, icons, menu.parent, auto.parent):
+        candidates.extend((target, *target.parents))
+    copies = []
+    if _is_real_dir(app):
+        for entry in sorted(app.iterdir()):
+            if is_key(entry.name) or entry.name in (
+                paths.APPIMAGE_CURRENT,
+                paths.APPIMAGE_PREVIOUS,
+            ):
+                candidates.append(entry)
+                if is_key(entry.name) and _is_real_dir(entry):
+                    copies.append(entry.name)
+                    candidates.extend((entry / REMOVE_ON_EXIT, entry / SHUTDOWN_INCOMPLETE))
+    owned_icons = tuple(sorted(_owned_icons(icons, strict=True)))
+    candidates.extend(_icon_files(icons, links=True))
+    # Symlink autostart belongs to the user; never promise to change it.
+    auto_identity = _management_identity(auto)
+    auto_mode = auto_identity[2] if auto_identity else None
+    auto_data = (
+        autostart._read(auto) if isinstance(auto_mode, int) and stat.S_ISREG(auto_mode) else None
+    )
+    properties = autostart._properties(auto_data or b"")
+    owned = autostart._true(properties, b"X-AstraVoice-Managed")
+    program = autostart._exec_program(properties.get(b"Exec", b"")) if owned else None
+    deb = paths.SYSTEM_EXECUTABLE
+    try:
+        info = deb.stat()
+        deb_identity: tuple[object, ...] = (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_size,
+            info.st_mtime_ns,
+        )
+        deb_available = stat.S_ISREG(info.st_mode) and os.access(deb, os.X_OK)
+    except FileNotFoundError:
+        deb_identity, deb_available = (), False
+    identities = tuple((str(p), _management_identity(p)) for p in dict.fromkeys(candidates))
+    return ManagementSnapshot(
+        app,
+        paths.model_store_dir_path(),
+        paths.config_dir_path(),
+        tuple(copies),
+        _menu_state(menu),
+        owned_icons,
+        owned,
+        program,
+        deb_available,
+        (*identities, (str(deb), deb_identity)),
+    )
 
 
 def status() -> InstallStatus:

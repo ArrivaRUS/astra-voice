@@ -468,6 +468,8 @@ Rectangle {
             objectName: "footerActions"
             visible: root.busy || root.hasMessage || root.showHint || root.manageVisible
                 || (root.cardState === "updating" && root.updateActionsAvailable)
+            // Nested layouts otherwise expand and separate right-aligned buttons.
+            Layout.fillWidth: false
             Layout.maximumWidth: footer.width * Theme.modelCardFooterActionsMaxShare
             Layout.preferredWidth: implicitWidth
             Layout.alignment: Qt.AlignRight | Qt.AlignTop
@@ -620,7 +622,7 @@ Rectangle {
                 visible: root.manageVisible
                 enabled: root.cardState !== "switching" && root.badge !== "active"
                 Layout.minimumWidth: visible ? implicitWidth : 0
-                Layout.alignment: Qt.AlignRight | Qt.AlignTop
+                Layout.alignment: Qt.AlignRight
                 Layout.rightMargin: Theme.cardBorder
                 small: true
                 text: qsTr("Удалить")

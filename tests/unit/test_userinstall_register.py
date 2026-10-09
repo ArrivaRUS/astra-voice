@@ -239,13 +239,13 @@ def test_unregister_removes_ours_and_restores_deb(
         executable.chmod(0o755 if deb == "executable" else 0o644)
     result = userinstall.unregister(deb_executable=executable)
     assert result.menu and result.autostart
-    assert len(result.icons) == 3
+    assert len(result.icons) == 2
     assert not menu_path(home).exists()
     assert directory.is_dir() and directory.parent.is_dir()
     assert foreign.read_bytes() == b"other"
     assert tray.read_bytes() == b"tray"
     assert target.read_bytes() == b"target"
-    assert not link.is_symlink()
+    assert link.is_symlink()
     if deb == "executable":
         assert startup.read_bytes() == autostart.entry_bytes(autostart.DEB_EXECUTABLE)
     else:

@@ -17,6 +17,75 @@ Column {
     readonly property var about: (typeof aboutBridge !== "undefined" && aboutBridge !== null) ? aboutBridge : null
     readonly property var settings: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
     readonly property var updates: (typeof updatesBridge !== "undefined" && updatesBridge !== null) ? updatesBridge : null
+    readonly property var management: (typeof appImageManagement !== "undefined" && appImageManagement !== null) ? appImageManagement : null
+    readonly property bool isAppImage: root.about !== null
+        && (root.about.installKind === "appimage-installed" || root.about.installKind === "appimage-portable")
+    readonly property string managementState: root.management ? root.management.state : "unavailable"
+    property Item managementOpener: null
+    property bool managementViewReady: false
+
+    function refreshManagement() {
+        if (!root.managementViewReady || !root.visible || !root.isAppImage || !root.management)
+            return
+        // Consent and operations own their snapshot. Keep failures visible until Retry.
+        if (root.management.confirmationId !== "") return
+        if (root.managementState === "ready" || root.managementState === "absent"
+                || root.managementState === "busy")
+            root.management.refresh()
+    }
+
+    function managementStatus() {
+        if (!root.management)
+            return qsTr("Не удалось проверить установку. Управление программой недоступно.")
+        if (root.management.errorText !== "") return root.management.errorText
+        switch (root.managementState) {
+        case "checking": return qsTr("Проверяем установку…")
+        case "unregistering": return qsTr("Убираем регистрацию…")
+        case "removing": return qsTr("Готовим удаление…")
+        case "busy": return root.management.busyReason
+        }
+        return root.management.resultText
+    }
+
+    function requestManagement(action, opener) {
+        if (!root.management || !root.isAppImage) return
+        root.managementOpener = opener
+        root.management.requestAction(action)
+    }
+
+    function syncConfirmation() {
+        if (!managementDialog) return
+        if (root.isAppImage && root.management && root.managementState === "confirming"
+                && root.management.confirmationId !== "") {
+            if (managementDialog.token === root.management.confirmationId && managementDialog.visible) return
+            if (managementDialog.visible) managementDialog.close()
+            managementDialog.token = root.management.confirmationId
+            managementDialog.owner = root.management
+            managementDialog.heading = root.management.confirmationAction === "remove"
+                ? qsTr("Удалить программу из домашней папки?")
+                : qsTr("Убрать AppImage из меню и автозапуска?")
+            managementDialog.confirmText = root.management.confirmationAction === "remove"
+                ? qsTr("Удалить программу и выйти") : qsTr("Убрать регистрацию")
+            managementDialog.message = root.management.confirmationMessage
+            managementDialog.open()
+        } else if (managementDialog.visible) {
+            managementDialog.close()
+        }
+    }
+
+    onManagementChanged: {
+        // Context replacement invalidates several bindings together; wait for their values.
+        Qt.callLater(root.syncConfirmation)
+        Qt.callLater(root.refreshManagement)
+    }
+    onVisibleChanged: if (visible) {
+        Qt.callLater(root.syncConfirmation)
+        Qt.callLater(root.refreshManagement)
+    }
+    Connections {
+        target: root.management
+        function onChanged() { root.syncConfirmation() }
+    }
 
     readonly property string appVersion: (root.about && root.about.version) ? root.about.version
         : (root.info && root.info.version) ? root.info.version : "0.1.0"
@@ -30,8 +99,13 @@ Column {
         var parts = []
         if (root.about.buildDate !== "")
             parts.push(qsTr("Сборка от %1").arg(root.about.buildDate))
-        parts.push(root.about.installKind === "deb" ? qsTr("пакет deb")
-            : qsTr("запуск из исходного кода"))
+        switch (root.about.installKind) {
+        case "appimage-installed": parts.push(qsTr("AppImage · установлена в домашнюю папку")); break
+        case "appimage-portable": parts.push(qsTr("AppImage · переносной запуск")); break
+        case "deb": parts.push(qsTr("пакет deb")); break
+        case "source": parts.push(qsTr("запуск из исходного кода")); break
+        default: parts.push(qsTr("Тип установки не определён"))
+        }
         var line = parts.join(" · ")
         return line.charAt(0).toUpperCase() + line.slice(1)
     }
@@ -104,19 +178,108 @@ Column {
     // Перечитываем при открытии раздела и при каждой активации окна: статистика,
     // размеры и даты проверок могли измениться, пока окно было скрыто.
     Component.onCompleted: {
+        root.managementViewReady = true
         if (root.about)
             root.about.refresh()
+        root.syncConfirmation()
+        root.refreshManagement()
     }
 
     Connections {
         target: root.Window.window
         function onActiveChanged() {
-            if (root.Window.window && root.Window.window.active && root.about)
-                root.about.refresh()
+            if (root.Window.window && root.Window.window.active) {
+                if (root.about) root.about.refresh()
+                root.refreshManagement()
+            }
         }
     }
 
     spacing: Theme.spaceGroupGap
+
+    component ManagementButton: AvButton {
+        id: control
+        small: true
+        implicitWidth: buttonLabel.implicitWidth + leftPadding + rightPadding
+        implicitHeight: Math.max(Theme.buttonHeightSm,
+            buttonLabel.implicitHeight + topPadding + bottomPadding)
+        contentItem: Text {
+            id: buttonLabel
+            text: control.text
+            textFormat: Text.PlainText
+            font: control.font
+            color: control.fgColor
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+            wrapMode: Text.Wrap
+            renderType: Text.NativeRendering
+        }
+    }
+
+    component ManagementRow: Item {
+        id: row
+        property string label: ""
+        property string description: ""
+        property string actionText: ""
+        property string actionName: ""
+        property bool actionEnabled: false
+        property bool divider: true
+        signal triggered(var button)
+        readonly property real available: Math.max(0, width - 28)
+        readonly property bool stacked: copyLabel.implicitWidth + action.implicitWidth + 10 > available
+            || copySub.implicitWidth + action.implicitWidth + 10 > available
+        implicitHeight: Math.max(55, 14 + (stacked
+            ? copyBlock.height + 10 + action.height : Math.max(copyBlock.height, action.height)))
+        height: implicitHeight
+        Rectangle {
+            visible: row.divider
+            width: parent.width
+            height: Theme.borderHairline
+            color: Theme.borderSoft
+        }
+        Column {
+            id: copyBlock
+            x: 14
+            y: row.stacked ? 7 : (row.height - height) / 2
+            width: row.stacked ? row.available : Math.max(0, row.available - action.width - 10)
+            spacing: 2
+            Text {
+                id: copyLabel
+                width: parent.width
+                text: row.label
+                textFormat: Text.PlainText
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingLabelSize
+                color: Theme.fg
+                wrapMode: Text.Wrap
+                renderType: Text.NativeRendering
+            }
+            Text {
+                id: copySub
+                width: parent.width
+                text: row.description
+                textFormat: Text.PlainText
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                color: Theme.fgMuted
+                wrapMode: Text.Wrap
+                renderType: Text.NativeRendering
+            }
+        }
+        ManagementButton {
+            id: action
+            objectName: row.actionName
+            text: row.actionText
+            Accessible.name: row.actionText
+            Accessible.description: row.description + (row.actionName === "aboutRemoveAppImage"
+                ? qsTr(" После подтверждения программа завершит работу.") : "")
+            enabled: row.actionEnabled
+            width: Math.min(implicitWidth, row.available)
+            x: row.stacked ? 14 : row.width - 14 - width
+            y: row.stacked ? copyBlock.y + copyBlock.height + 10 : (row.height - height) / 2
+            onClicked: row.triggered(action)
+        }
+    }
 
     // Значение справа в строке: моноширинное (сквозное правило 5), приглушённое.
     component ValueText: Text {
@@ -376,6 +539,169 @@ Column {
         }
     }
 
+    Column {
+        id: managementGroup
+        objectName: "aboutAppImageManagement"
+        width: root.width
+        visible: root.isAppImage
+        height: visible ? implicitHeight : 0
+        spacing: Theme.spaceGroupCaptionGap
+        Text {
+            width: parent.width
+            text: qsTr("Программа в домашней папке")
+            textFormat: Text.PlainText
+            color: Theme.fgMuted
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.fontGroupCapsSize
+            font.weight: Font.Medium
+            font.capitalization: Font.AllUppercase
+            font.letterSpacing: Theme.fontGroupCapsTracking * Theme.fontGroupCapsSize
+            wrapMode: Text.Wrap
+            leftPadding: 2
+            renderType: Text.NativeRendering
+        }
+        Rectangle {
+            width: parent.width
+            height: managementRows.height + Theme.cardBorder * 2
+            radius: Theme.cardRadius
+            color: Theme.bgSurface
+            border.width: Theme.cardBorder
+            border.color: Theme.border
+            Column {
+                id: managementRows
+                x: Theme.cardBorder
+                y: Theme.cardBorder
+                width: parent.width - 2 * Theme.cardBorder
+                ManagementRow {
+                    width: parent.width
+                    divider: false
+                    label: qsTr("Меню и автозапуск")
+                    description: root.management && root.managementState === "ready" && !root.management.canUnregister
+                        ? qsTr("Регистрация AppImage уже убрана") : qsTr("Копии программы и ваши данные останутся.")
+                    actionName: "aboutUnregisterAppImage"
+                    actionText: qsTr("Убрать из меню и автозапуска")
+                    actionEnabled: root.management !== null && root.management.canUnregister
+                    onTriggered: root.requestManagement("unregister", button)
+                }
+                ManagementRow {
+                    width: parent.width
+                    label: qsTr("Копии программы")
+                    description: qsTr("Модели, настройки и журналы останутся.")
+                    actionName: "aboutRemoveAppImage"
+                    actionText: qsTr("Удалить программу из домашней папки")
+                    actionEnabled: root.management !== null && root.management.canRemove
+                    onTriggered: root.requestManagement("remove", button)
+                }
+                Item {
+                    width: parent.width
+                    height: pathColumn.height + 14
+                    Rectangle {
+                        width: parent.width
+                        height: Theme.borderHairline
+                        color: Theme.borderSoft
+                    }
+                    Column {
+                        id: pathColumn
+                        x: 14
+                        y: 7
+                        width: parent.width - 28
+                        spacing: 2
+                        Text {
+                            width: parent.width
+                            text: qsTr("Папка программы")
+                            textFormat: Text.PlainText
+                            color: Theme.fg
+                            font.family: Theme.fontUi
+                            font.pixelSize: Theme.fontSettingLabelSize
+                            wrapMode: Text.Wrap
+                            renderType: Text.NativeRendering
+                        }
+                        TextEdit {
+                            id: managementPath
+                            objectName: "aboutAppImagePath"
+                            width: parent.width
+                            height: implicitHeight
+                            text: root.managementState === "absent"
+                                ? qsTr("В домашней папке нет установленных копий программы")
+                                : root.management && root.management.appPath !== "" ? root.management.appPath : qsTr("Нет сведений")
+                            textFormat: TextEdit.PlainText
+                            readOnly: true
+                            selectByMouse: true
+                            activeFocusOnTab: true
+                            wrapMode: TextEdit.Wrap
+                            font.family: Theme.fontMono
+                            font.pixelSize: Theme.fontSettingSubSize
+                            color: Theme.fgMuted
+                            selectedTextColor: Theme.selectionFg
+                            selectionColor: Theme.selectionBg
+                            renderType: Text.NativeRendering
+                            Accessible.name: qsTr("Папка программы")
+                            Rectangle {
+                                anchors.fill: parent
+                                anchors.margins: -2
+                                color: "transparent"
+                                border.width: 2
+                                border.color: Theme.stateFocusRing
+                                visible: managementPath.activeFocus
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Rectangle {
+            width: parent.width
+            visible: root.managementStatus() !== ""
+            height: visible ? statusColumn.height + 24 : 0
+            radius: Theme.cardRadius
+            color: root.managementState === "error" ? Theme.dangerBg : Theme.bgSurface2
+            Column {
+                id: statusColumn
+                x: 14
+                y: 12
+                width: parent.width - 28
+                spacing: 8
+                RowLayout {
+                    width: parent.width
+                    spacing: 8
+                    BusyIndicator {
+                        visible: root.managementState === "checking" || root.managementState === "unregistering"
+                            || root.managementState === "removing"
+                        running: visible
+                        implicitWidth: 18
+                        implicitHeight: 18
+                        Layout.alignment: Qt.AlignTop
+                    }
+                    Text {
+                        objectName: "aboutAppImageStatus"
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: text
+                        text: root.managementState === "error" ? qsTr("Ошибка: %1").arg(root.managementStatus()) : root.managementStatus()
+                        textFormat: Text.PlainText
+                        Layout.fillWidth: true
+                        color: root.managementState === "error" ? Theme.dangerInk : Theme.fgSecondary
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.fontSmallSize
+                        wrapMode: Text.Wrap
+                        renderType: Text.NativeRendering
+                    }
+                }
+                ManagementButton {
+                    objectName: "aboutRetryAppImage"
+                    visible: root.managementState === "error"
+                    text: qsTr("Повторить")
+                    width: Math.min(implicitWidth, parent.width)
+                    onClicked: {
+                        if (root.management) {
+                            root.managementOpener = this
+                            root.management.retry()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     SettingGroup {
         width: root.width
         title: qsTr("Окружение")
@@ -407,6 +733,27 @@ Column {
             showHint: false
             label: qsTr("Проверка обновлений")
             sub: root.updatesLine()
+        }
+    }
+
+    AvDialog {
+        id: managementDialog
+        objectName: "aboutAppImageDialog"
+        property string token: ""
+        property var owner: null
+        parent: root.Overlay.overlay ? root.Overlay.overlay : root
+        safeConfirmation: true
+        returnFocusItem: root.managementOpener
+        fallbackFocusItem: managementPath
+        iconName: "trash"
+        cancelText: qsTr("Отмена")
+        confirmEnabled: root.management !== null && owner === root.management
+            && token !== "" && token === root.management.confirmationId
+        onConfirmed: {
+            if (owner && owner === root.management) owner.confirmAction(token)
+        }
+        onCancelled: {
+            if (owner && owner === root.management) owner.cancelConfirmation(token)
         }
     }
 

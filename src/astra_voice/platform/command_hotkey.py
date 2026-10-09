@@ -149,6 +149,7 @@ class CommandHotkeyBackend:
         self._last_reply = self._last_ping = 0.0
         self._combo: str | None = None
         self._defer_super = False
+        self._suspended = False
         self._closed = False
         self._notifier: Any = None
         self._timer: Any = None
@@ -301,6 +302,7 @@ class CommandHotkeyBackend:
             pass
 
     def _fail(self) -> None:
+        self._suspended = False
         connection, self._connection = self._connection, None
         if self._notifier is not None:
             self._notifier.setEnabled(False)
@@ -408,7 +410,12 @@ class CommandHotkeyBackend:
 
     def grab_combo(self, combo: str) -> GrabResult:
         needs_menu = self._manage_menu and combo.lower() in ("super_l", "super_r", "super", "win")
-        if needs_menu:
+        # A temporary input handoff leaves the broker and its watchdog alive.
+        # Never reuse a lease after IPC/heartbeat loss or for another key.
+        if self._suspended:
+            self._pump()
+        resume = self._suspended and self._combo == combo and self._connection is not None
+        if needs_menu and not (resume and self._menu_token is not None):
             if not self._acquire_menu():
                 return GrabResult(
                     "not-grabbed", owner_hint="Не удалось настроить клавишу меню — повторяем"
@@ -419,11 +426,24 @@ class CommandHotkeyBackend:
         result = GrabResult(**value) if isinstance(value, dict) else GrabResult("not-grabbed")
         if result.ok:
             self._combo = combo
-        elif needs_menu:
+            self._suspended = False
+        elif needs_menu or resume:
             self._fail()
         return result
 
+    def suspend_combo(self, combo: str) -> bool:
+        """Drop X/Raw grabs, retaining the watched menu lease and IPC endpoint."""
+        if self._combo != combo or self._connection is None:
+            self._fail()
+            return False
+        if not self._request("ungrab", combo=combo):
+            return False
+        self._events.clear()
+        self._suspended = True
+        return True
+
     def ungrab_combo(self, combo: str) -> GrabResult:
+        self._suspended = False
         if self._combo == combo:
             self._combo = None
         if self._connection is not None:

@@ -204,6 +204,103 @@ def test_shutdown_once_before_other_cleanup(rig: Rig) -> None:
     ]
 
 
+def test_qml_load_defines_nullable_appimage_management_before_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PyQt5 import QtQml
+
+    (tmp_path / "Main.qml").write_text("", encoding="utf-8")
+    monkeypatch.setattr(app_mod, "qml_dir", lambda: tmp_path)
+    monkeypatch.setattr(app_mod, "install_icon_provider", Mock())
+    engine = Mock()
+    monkeypatch.setattr(QtQml, "QQmlApplicationEngine", Mock(return_value=engine))
+
+    def load(_url: object) -> None:
+        properties = dict(
+            item.args for item in engine.rootContext().setContextProperty.call_args_list
+        )
+        assert "appImageManagement" in properties
+        assert properties["appImageManagement"] is None
+
+    engine.load.side_effect = load
+    assert app_mod._load_qml(object(), None) is engine
+    engine.load.assert_called_once()
+
+
+@pytest.mark.parametrize("runtime_ready", [False, True])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        paths_mod.InstallKind.APPIMAGE_INSTALLED,
+        paths_mod.InstallKind.APPIMAGE_PORTABLE,
+        paths_mod.InstallKind.DEB,
+        paths_mod.InstallKind.SOURCE,
+    ],
+)
+def test_main_owns_appimage_management_only_with_ready_appimage_runtime(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    runtime_ready: bool,
+    kind: paths_mod.InstallKind,
+) -> None:
+    from astra_voice.ui import appimage_management
+
+    created: list[Controller] = []
+    key = "0.2.0-aaaaaaaaaaaa" if kind is paths_mod.InstallKind.APPIMAGE_INSTALLED else None
+
+    class Controller(QtCore.QObject):
+        quitRequested = QtCore.pyqtSignal()
+        worker_threads: tuple[object, ...] = ()
+
+        def __init__(
+            self, runtime: object, *, own_lock_path: Path, running_key: str | None
+        ) -> None:
+            super().__init__()
+            assert runtime is rig.runtime
+            assert own_lock_path == tmp_path / "lock"
+            assert running_key == key
+            rig.runtime.start.assert_called_once()
+            rig.runtime.start_command_mode.assert_called_once()
+            created.append(self)
+
+        def close(self) -> bool:
+            rig.calls.management_close()
+            return True
+
+    monkeypatch.setattr(appimage_management, "AppImageManagement", Controller)
+    monkeypatch.setattr(paths_mod, "install_kind", lambda: kind)
+    monkeypatch.setattr(app_mod, "_mark_running_copy", lambda: True)
+    monkeypatch.setattr(app_mod, "_installed_code_key", lambda: key)
+    monkeypatch.setattr(app_mod, "_copy_shutdown_resources", lambda *args: ([], []))
+    monkeypatch.setattr(app_mod, "_finish_running_copy", Mock())
+    monkeypatch.setattr(app_mod, "_make_about_bridge", lambda runtime: None)
+    if not runtime_ready:
+        rig.runtime.start.side_effect = RuntimeError("runtime unavailable")
+
+    def event_loop() -> int:
+        if created:
+            created[0].quitRequested.emit()
+        return 7
+
+    rig.app.exec_.side_effect = event_loop
+    assert app_mod.main([]) == 7
+    should_create = runtime_ready and kind.is_appimage
+    assert bool(created) is should_create
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    if should_create:
+        assert properties["appImageManagement"] is created[0]
+        rig.app.quit.assert_called_once_with()
+        calls = rig.calls.mock_calls
+        assert calls.index(call.management_close()) < calls.index(call.shutdown())
+        assert calls.index(call.shutdown()) < calls.index(call.cleanup(rig.server, rig.lock))
+    else:
+        assert "appImageManagement" not in properties
+        rig.app.quit.assert_not_called()
+
+
 def test_update_checker_started_and_stopped_before_runtime(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

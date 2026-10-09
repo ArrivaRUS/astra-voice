@@ -257,6 +257,7 @@ class DictationRuntime(QObject):
         self._announced_mic_problems: set[MicrophoneProblem] = set()
         self._started = False
         self._closed = False
+        self._appimage_removal_reserved = False
         self._loading_model = False
         self._model_load_generation: int | None = None
         self._model_load_request: dict[str, Any] | None = None
@@ -362,6 +363,63 @@ class DictationRuntime(QObject):
                 self._cleanup(step, action)
             raise
 
+    def appimage_remove_busy_reason(self) -> str:
+        """GUI-thread-only, fail-closed check including delayed input and paste."""
+        try:
+            busy = (
+                self._closed
+                or self._appimage_removal_reserved
+                or self.phase is not DictationPhase.IDLE
+                or self._input_owner is not None
+                or self._capture_watchdog is not None
+                or self._mouse_capture_token is not None
+                or self._preview_send is not None
+                or self._pending_test is not None
+                or self.orchestrator.test_active
+                or self.orchestrator.level_active
+                or self.orchestrator._cancel_pending
+                or self.orchestrator._tail_pending
+                or self._pending_switch is not None
+                or self._switch_active()
+                or self._loading_model
+                or self._selfcheck not in ("idle", "ok", "failed")
+                or self.hotkey.has_pending_press is not False
+                or self.hotkey.fsm.state is not HotkeyState.IDLE
+                or (
+                    self.command_hotkey is not None
+                    and (
+                        self.command_hotkey.has_pending_press is not False
+                        or self.command_hotkey.fsm.state is not HotkeyState.IDLE
+                    )
+                )
+                or (
+                    self.command_mouse is not None
+                    and self.command_mouse.state is not MouseHoldState.IDLE
+                )
+            )
+        except (AttributeError, RuntimeError):
+            return "Не удалось проверить готовность программы. Повторите проверку."
+        return (
+            "Завершите диктовку и дождитесь вставки текста, затем повторите удаление"
+            if busy
+            else ""
+        )
+
+    def reserve_appimage_removal(self) -> bool:
+        """Atomically reserve an idle runtime on its GUI thread; never cancel work."""
+        if self.appimage_remove_busy_reason():
+            return False
+        self._appimage_removal_reserved = True
+        self._input_owner = "appimage-removal"
+        self._input_epoch += 1
+        return True
+
+    def release_appimage_removal(self) -> None:
+        """Release after a failed preparation; successful removal holds until exit."""
+        if self._appimage_removal_reserved:
+            self._appimage_removal_reserved = False
+            self._release_input("appimage-removal")
+
     def _command_publication_allowed(self) -> bool:
         return self.orchestrator.mode != "command" or (
             self._command_snapshot().allowed
@@ -436,11 +494,14 @@ class DictationRuntime(QObject):
         else:
             self._stop_command_regrab()
             if self.command_hotkey is not None:
-                self.command_hotkey.ungrab()
+                self.command_hotkey.suspend()
         self._mouse_changed()
         return self._input_owner == source
 
     def _release_input(self, source: str) -> None:
+        # Generic idle/cancel callbacks cannot release the removal reservation.
+        if source == "appimage-removal" and self._appimage_removal_reserved:
+            return
         if self._input_owner != source:
             return
         self._input_owner = None
@@ -985,26 +1046,35 @@ class DictationRuntime(QObject):
         self.reload_command_mouse()
         manager = self.command_hotkey
         if self._closed or manager is None:
-            self._stop_command_regrab()
-            return False
-        manager.ungrab()
-        if self._input_owner in ("mouse", "mouse-capture", "keyboard-capture"):
+            if manager is not None:
+                manager.ungrab()
             self._stop_command_regrab()
             return False
         if not self.command_installed:
+            manager.ungrab()
             self._stop_command_regrab()
             return False
         if not self.settings.command_hotkey:
+            manager.ungrab()
             self._stop_command_regrab()
             self.command_status = "Клавиша команды не распознана — выберите заново"
             self.reject_command()
             self._command_changed()
             return False
         if not self.settings.command_enabled:
+            manager.ungrab()
             self._stop_command_regrab()
             self.reject_command()
             return False
         if not self._command_snapshot().allowed:
+            manager.ungrab()
+            self._stop_command_regrab()
+            return False
+        if self._input_owner in ("mouse", "mouse-capture", "keyboard-capture"):
+            if self._input_owner == "mouse":
+                manager.suspend(self.settings.command_hotkey, HotkeyMode(self.settings.hotkey_mode))
+            else:
+                manager.ungrab()
             self._stop_command_regrab()
             return False
         command_signature = manager.signature(self.settings.command_hotkey)
@@ -1014,6 +1084,7 @@ class DictationRuntime(QObject):
             or text_signature is None
             or command_signature == text_signature
         ):
+            manager.ungrab()
             self._stop_command_regrab()
             self.command_status = (
                 "Клавиша команды совпадает с клавишей «Текст» — выберите другую"
@@ -1026,9 +1097,10 @@ class DictationRuntime(QObject):
         manager.on_deferred_press = partial(self._schedule_command_hold, manager)
         admission = self._command_snapshot()
         if not admission.allowed:
+            manager.ungrab()
             self._stop_command_regrab()
             return False
-        result = manager.grab(self.settings.command_hotkey, HotkeyMode(self.settings.hotkey_mode))
+        result = manager.rearm(self.settings.command_hotkey, HotkeyMode(self.settings.hotkey_mode))
         current = self._command_snapshot()
         if not current.allowed or current.blocked_epoch != admission.blocked_epoch:
             manager.ungrab()
@@ -1517,6 +1589,8 @@ class DictationRuntime(QObject):
 
     def reload_model(self) -> None:
         """Перезапускает воркер, если текущая модель ещё не загружена и проверена."""
+        if self._appimage_removal_reserved:
+            return
         try:
             request = self._resolve_model_request()
         except Exception:
@@ -1544,7 +1618,12 @@ class DictationRuntime(QObject):
 
     def switch_model(self, *, min_ram_mb: int, pause: bool = False) -> None:
         """Меняет выбранную модель после завершения текущей диктовки."""
-        if self._closed or self._pending_switch is not None or self._switch_active():
+        if (
+            self._closed
+            or self._appimage_removal_reserved
+            or self._pending_switch is not None
+            or self._switch_active()
+        ):
             return
         if self.phase != DictationPhase.IDLE:
             self._pending_switch = (min_ram_mb, pause)
@@ -1768,6 +1847,8 @@ class DictationRuntime(QObject):
 
     def _recheck_model(self) -> None:
         """Жест пользователя начинает новую серию проверок после запрета."""
+        if self._appimage_removal_reserved:
+            return
         if self._closed or self._selfcheck != "failed":
             return
         self.hotkey.fsm.escape(monotonic())
@@ -1794,7 +1875,7 @@ class DictationRuntime(QObject):
         Пользовательский перезапуск сбрасывает ошибки загрузки и самопроверки;
         retry_selfcheck сохраняет бюджет автоматической повторной попытки.
         """
-        if self._closed:
+        if self._closed or self._appimage_removal_reserved:
             return
         self._stop_mouse("model")
         self._invalidate_mouse_capture()
@@ -1828,6 +1909,8 @@ class DictationRuntime(QObject):
 
     def _load_model(self) -> None:
         """Загружает настроенную модель при каждом запуске нового воркера."""
+        if self._appimage_removal_reserved:
+            return
         if self._model_load_generation == self.supervisor.generation:
             self._fail_switch()
             return

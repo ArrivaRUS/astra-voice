@@ -222,6 +222,9 @@ def test_keyboard_conflict_does_not_disable_mouse_and_escape_failure_refuses_rec
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bench = MouseRuntimeRig(monkeypatch)
+    # A conflict is observable on a new registration, not an unchanged live grab.
+    assert bench.runtime.command_hotkey is not None
+    bench.runtime.command_hotkey.ungrab()
     bench.command_backend.grab_combo.return_value = GrabResult("busy")
     assert not bench.runtime.reload_command_hotkey()
     assert bench.runtime.command_mouse_status == "ready"

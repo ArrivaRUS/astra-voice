@@ -116,7 +116,7 @@ def test_retry_cannot_regrab_after_uninstall() -> None:
     runtime._create_timer.assert_not_called()
     assert not DictationRuntime.reload_command_hotkey(runtime)
     runtime.command_hotkey.ungrab.assert_called_once_with()
-    runtime.command_hotkey.grab.assert_not_called()
+    runtime.command_hotkey.rearm.assert_not_called()
 
 
 @pytest.fixture
@@ -444,10 +444,10 @@ def test_lock_unlock_inside_grab_rpc_cannot_rebind_old_gesture_to_new_epoch() ->
         snapshots[0] = SessionSnapshot(known=True, locked=False, blocked_epoch=2)
         return GrabResult("ok", keycode=133)
 
-    runtime.command_hotkey.grab.side_effect = grab
+    runtime.command_hotkey.rearm.side_effect = grab
     assert not DictationRuntime.reload_command_hotkey(runtime)
     assert runtime._command_grab_epoch is None
-    assert runtime.command_hotkey.ungrab.call_count == 2
+    runtime.command_hotkey.ungrab.assert_called_once_with()
 
 
 @pytest.mark.unit
@@ -596,7 +596,7 @@ def test_startup_recovers_menu_with_cowork_absent_or_command_disabled(
     DictationRuntime.start_command_mode(runtime)
     lease.recover.assert_called_once_with()
     assert not runtime._recover_command_menu
-    runtime.command_hotkey.grab.assert_not_called()
+    runtime.command_hotkey.rearm.assert_not_called()
 
 
 @pytest.mark.unit
