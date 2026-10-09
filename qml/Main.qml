@@ -55,6 +55,7 @@ ApplicationWindow {
     // загрузке анимировать нечего, а снимок обязан быть одинаковым в любой момент.
     property bool sectionFadeReady: false
     property bool focusModeOnLoad: false
+    property bool focusUpdateOnLoad: false
 
     function showKeyboardMode() {
         focusModeOnLoad = true
@@ -181,7 +182,9 @@ ApplicationWindow {
 
                 Text {
                     textFormat: Text.PlainText
-                    text: window.currentSection.key === "advanced" ? qsTr("Голосовые команды Astra Cowork") : window.currentSection.subtitle
+                    text: window.currentSection.key === "advanced" ? qsTr("Голосовые команды Astra Cowork")
+                        : window.currentSection.key === "network" ? qsTr("Сетевые проверки и обновления программы")
+                        : window.currentSection.subtitle
                     color: Theme.fgMuted
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontSmallSize
@@ -251,6 +254,12 @@ ApplicationWindow {
                 source: window.sectionPages[window.currentSection.key]
 
                 onLoaded: {
+                    if (window.focusUpdateOnLoad && window.currentSection.key === "network") {
+                        window.focusUpdateOnLoad = false;
+                        Qt.callLater(function() {
+                            if (page.item && typeof page.item.focusUpdatePanel === "function") window.revealPageItem(page.item.focusUpdatePanel());
+                        });
+                    }
                     if (window.focusModeOnLoad && window.currentSection.key === "general") {
                         window.focusModeOnLoad = false
                         Qt.callLater(function() {
@@ -323,6 +332,9 @@ ApplicationWindow {
         height: Theme.statusbarH
         revocationUnknown: window.bridge ? window.bridge.revocationUnknown : false
         updateState: window.updates ? window.updates.state : "disabled"
+        updateNetworkRefusal: window.updates && typeof window.updates.networkRefusal !== "undefined" ? window.updates.networkRefusal : ""
+        updateDownloadPhase: window.updates && typeof window.updates.downloadPhase !== "undefined" ? window.updates.downloadPhase : "idle"
+        updateDownloadPercent: window.updates && typeof window.updates.downloadPercent !== "undefined" ? window.updates.downloadPercent : 0
         updateVersion: window.updates ? window.updates.version : ""
         updateSnoozed: window.updates ? window.updates.snoozed : false
         updateRestState: window.updates ? window.updates.restState : "idle"
@@ -330,13 +342,13 @@ ApplicationWindow {
 
         // §6.2: клик по «Доступна версия» открывает панель «Что нового» в разделе «Сеть».
         onUpdateActivated: function(kind) {
-            if (kind === "skipped" && window.updates) {
-                window.updates.clearSkip()
-            } else if (kind === "unavailable" && window.updates && window.updates.canCheckNow) {
-                window.updates.checkNow()
+            if (kind === "skipped" && window.updates) window.updates.clearSkip();
+            window.focusUpdateOnLoad = true;
+            if (window.sectionIndices.hasOwnProperty("network")) sidebar.currentIndex = window.sectionIndices["network"];
+            if (window.currentSection.key === "network" && page.item && typeof page.item.focusUpdatePanel === "function") {
+                window.focusUpdateOnLoad = false;
+                window.revealPageItem(page.item.focusUpdatePanel());
             }
-            if (window.sectionIndices.hasOwnProperty("network"))
-                sidebar.currentIndex = window.sectionIndices["network"]
         }
     }
     onVisibilityChanged: {

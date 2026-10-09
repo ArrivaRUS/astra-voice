@@ -108,11 +108,12 @@ def installed_version(version: str) -> SemVer | None:
 
 @dataclass(frozen=True)
 class Release:
-    """Проверенные поля выпуска для строки состояния и панели «Что нового»."""
+    """Поля discovery; доверие к выпуску устанавливает updates.release."""
 
     version: str
     notes: str = ""
     release_url: str | None = None
+    raw_tag: str | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +182,7 @@ def parse_release(body: bytes) -> tuple[SemVer, Release] | None:
         if isinstance(notes, str)
         else "",
         release_url=_release_url(data.get("html_url")),
+        raw_tag=data["tag_name"],
     )
 
 

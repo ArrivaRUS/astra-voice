@@ -16,6 +16,9 @@ Item {
     property bool revocationUnknown: false
     // Правая часть (§2.2): значения — как у updatesBridge.state (docs/ui-bridge.md §3.8).
     property string updateState: "disabled"
+    property string updateNetworkRefusal: ""
+    property string updateDownloadPhase: "idle"
+    property int updateDownloadPercent: 0
     property string updateVersion: ""
     // «Напомнить позже»: версия доступна, но без акцента.
     property bool updateSnoozed: false
@@ -60,6 +63,17 @@ Item {
         ? qsTr("Проверить отозванные версии сейчас нельзя") : ""
 
     readonly property string updateText: {
+        switch (updateDownloadPhase) {
+        case "metadata": return qsTr("Проверяю сведения об обновлении…");
+        case "downloading": return qsTr("Скачиваю обновление · %1 %").arg(updateDownloadPercent);
+        case "verifying": return qsTr("Проверяю обновление…");
+        case "readydeb": return qsTr("Пакет проверен · Открыть обновления");
+        case "readyappimage": return qsTr("Обновление готово · Открыть обновления");
+        case "installing": return qsTr("Устанавливаю обновление…");
+        case "error": return qsTr("Обновление не выполнено · Подробнее");
+        }
+        if (updateNetworkRefusal === "offline" && updateState === "available")
+            return qsTr("Офлайн-режим · Подробнее");
         switch (updateState) {
         case "idle": return "";
         case "policy-locked": return qsTr("Проверка обновлений отключена (задано администратором)");
@@ -75,12 +89,12 @@ Item {
     }
     readonly property string updateIcon: updateState === "policy-locked" ? "lock"
         : updateState === "uptodate" && uptodateShown ? "check"
-        : updateState === "error-net" ? "alert" : ""
+        : updateState === "error-net" || updateDownloadPhase === "error" ? "alert" : ""
     // available — единственный цветовой акцент внизу окна (§2.2).
-    readonly property bool updateAccent: updateState === "available" && !updateSnoozed
-    readonly property color updateColor: updateState === "error-net" ? Theme.dangerInk
+    readonly property bool updateAccent: updateState === "available" && updateDownloadPhase === "idle" && updateNetworkRefusal === "" && !updateSnoozed
+    readonly property color updateColor: updateState === "error-net" || updateDownloadPhase === "error" ? Theme.dangerInk
         : updateAccent ? Theme.statusbarAccentFg : Theme.statusbarFg
-    readonly property bool updateClickable: ["available", "unavailable", "error-net", "skipped"]
+    readonly property bool updateClickable: updateDownloadPhase !== "idle" || ["available", "unavailable", "error-net", "skipped"]
         .indexOf(updateState) >= 0
     // Строка перестала быть кликабельной — фокус с неё снимается, иначе он «висит» на тексте.
     onUpdateClickableChanged: {
@@ -139,7 +153,7 @@ Item {
                     ? Math.max(0, content.width - updateRow.width - Theme.statusbarGap
                                - statusMark.width - modelRow.spacing * 3
                                - warningSeparator.implicitWidth - warningLabel.implicitWidth)
-                    : implicitWidth
+                    : Math.max(0, content.width - updateRow.width - Theme.statusbarGap - statusMark.width - modelRow.spacing)
             }
 
             Text {
@@ -179,8 +193,8 @@ Item {
                 id: updateItem
                 objectName: "statusUpdate"
                 visible: root.updateText !== ""
-                Layout.preferredWidth: updateLine.implicitWidth
-                Layout.preferredHeight: updateLine.implicitHeight
+                Layout.preferredWidth: Math.min(updateLabel.implicitWidth + (root.updateIcon !== "" ? 17 : 0), Math.max(0, content.width * 0.72 - 90))
+                Layout.preferredHeight: updateLabel.implicitHeight
                 Layout.alignment: Qt.AlignVCenter
                 activeFocusOnTab: root.updateClickable
                 Accessible.role: root.updateClickable ? Accessible.Button : Accessible.StaticText
@@ -212,9 +226,12 @@ Item {
                     }
 
                     Text {
+                        id: updateLabel
                         objectName: "statusUpdateText"
                         textFormat: Text.PlainText
                         text: root.updateText
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
                         color: root.updateColor
                         font.family: Theme.fontUi
                         font.pixelSize: Theme.fontStatusbarSize

@@ -27,6 +27,7 @@ import hashlib
 import hmac
 import os
 import re
+import selectors
 import subprocess
 import tempfile
 import time
@@ -83,6 +84,9 @@ _SUMS_LINE_RE: Final = re.compile(r"\A(?P<hex>[0-9a-f]{64}) [ *](?P<name>[^\n]+)
 #: Верхняя граница разбора `SHA256SUMS` (У19: лимиты на всё, что читаем).
 _SUMS_MAX_BYTES: Final = 1 << 20
 _GPGV_TIMEOUT_S: Final = 30.0
+_GPG_OUTPUT_MAX_BYTES: Final = 1 << 20
+_GPG_POLL_S: Final = 0.05
+_GPG_TERMINATE_GRACE_S: Final = 0.2
 _HASH_CHUNK: Final = 1 << 20
 
 
@@ -125,6 +129,91 @@ def sha256_file(
     return digest.hexdigest()
 
 
+class _VerificationCancelled(Exception):
+    """Internal control flow; never a signature failure needing diagnosis."""
+
+
+class _OutputLimitExceeded(Exception):
+    """Do not parse a truncated status stream, even if it contains VALIDSIG."""
+
+
+def _check_cancel(cancel: Callable[[], bool] | None) -> None:
+    if cancel is not None and cancel():
+        raise _VerificationCancelled
+
+
+def _stop_and_reap(proc: subprocess.Popen[bytes]) -> None:
+    """Only our direct child: TERM, short grace, KILL if needed, always wait."""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=_GPG_TERMINATE_GRACE_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    proc.wait()
+
+
+def _run_cancellable(
+    argv: list[str], home: str, cancel: Callable[[], bool]
+) -> subprocess.CompletedProcess[str]:
+    """Bound both pipes together; no reader threads or unbounded communicate.
+
+    Timeout applies to execution and draining output. Cleanup adds at most the
+    TERM grace before KILL and reaping (subject to OS process-exit scheduling).
+    """
+    _check_cancel(cancel)
+    deadline = time.monotonic() + _GPGV_TIMEOUT_S
+    proc = subprocess.Popen(  # noqa: S603 — fixed argv, never a shell
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"LC_ALL": "C", "GNUPGHOME": home},
+        cwd=home,
+    )
+    try:
+        assert proc.stdout is not None and proc.stderr is not None
+        buffers = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
+        total = 0
+        with selectors.DefaultSelector() as selector:
+            for pipe in (proc.stdout, proc.stderr):
+                os.set_blocking(pipe.fileno(), False)
+                selector.register(pipe, selectors.EVENT_READ)
+            while selector.get_map() or proc.poll() is None:
+                _check_cancel(cancel)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, _GPGV_TIMEOUT_S)
+                for key, _ in selector.select(min(_GPG_POLL_S, remaining)):
+                    _check_cancel(cancel)
+                    try:
+                        block = os.read(key.fd, min(65536, _GPG_OUTPUT_MAX_BYTES - total + 1))
+                    except BlockingIOError:
+                        continue
+                    if not block:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total += len(block)
+                    if total > _GPG_OUTPUT_MAX_BYTES:
+                        raise _OutputLimitExceeded
+                    buffers[key.fd].extend(block)
+        _check_cancel(cancel)
+        return subprocess.CompletedProcess(
+            argv,
+            proc.wait(),
+            buffers[proc.stdout.fileno()].decode("utf-8", errors="replace"),
+            buffers[proc.stderr.fileno()].decode("utf-8", errors="replace"),
+        )
+    finally:
+        try:
+            _stop_and_reap(proc)
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.stderr is not None:
+                proc.stderr.close()
+
+
 class Verifier:
     """Проверяльщик подписей для одной цели (`release` или `catalog`).
 
@@ -159,8 +248,16 @@ class Verifier:
 
     # -- подписи ---------------------------------------------------------
 
-    def verify_detached(self, data: Path, sig: Path) -> VerifyResult:
-        """Проверить отсоединённую подпись `sig` для файла `data`."""
+    def verify_detached(
+        self, data: Path, sig: Path, *, cancel: Callable[[], bool] | None = None
+    ) -> VerifyResult:
+        """Проверить подпись; cancel завершает и собирает собственный GPG-процесс.
+
+        При переданном cancel stdout+stderr ограничены суммарно 1 МиБ. Без
+        callback сохранён прежний subprocess.run для совместимости вызовов.
+        """
+        if cancel is not None and cancel():
+            return self._fail("Проверка подписи отменена", code="cancelled")
         data, sig = Path(data), Path(sig)
         keyring = self.keyring
         if not keyring.is_absolute():
@@ -187,16 +284,24 @@ class Verifier:
                 str(data),
             ]
             try:
-                proc = subprocess.run(  # noqa: S603 - argv фиксирован, shell не используется
-                    argv,
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=_GPGV_TIMEOUT_S,
-                    check=False,
-                    env={"LC_ALL": "C", "GNUPGHOME": home},
-                    cwd=home,
-                )
+                if cancel is None:
+                    proc = subprocess.run(  # noqa: S603 - argv фиксирован, shell не используется
+                        argv,
+                        capture_output=True,
+                        text=True,
+                        errors="replace",
+                        timeout=_GPGV_TIMEOUT_S,
+                        check=False,
+                        env={"LC_ALL": "C", "GNUPGHOME": home},
+                        cwd=home,
+                    )
+                else:
+                    proc = _run_cancellable(argv, home, cancel)
+                _check_cancel(cancel)
+            except _VerificationCancelled:
+                return self._fail("Проверка подписи отменена", code="cancelled")
+            except _OutputLimitExceeded:
+                return self._fail("gpgv превысил лимит вывода", code="output-limit")
             except FileNotFoundError:
                 return self._fail(f"gpgv не найден: {self.gpgv_path}")
             except subprocess.TimeoutExpired:
@@ -210,7 +315,11 @@ class Verifier:
         valid = [line.split() for line in status if line.split()[:1] == [_VALIDSIG]]
 
         if proc.returncode != 0:
-            created_at = self._future_key(status, keyring)
+            try:
+                created_at = self._future_key(status, keyring, cancel=cancel)
+                _check_cancel(cancel)
+            except _VerificationCancelled:
+                return self._fail("Проверка подписи отменена", code="cancelled")
             if created_at is not None:
                 moment = datetime.fromtimestamp(created_at, UTC).strftime("%Y-%m-%d %H:%M")
                 return self._fail(
@@ -246,6 +355,8 @@ class Verifier:
                 fpr=fpr,
                 primary=primary,
             )
+        if cancel is not None and cancel():
+            return self._fail("Проверка подписи отменена", code="cancelled")
         return VerifyResult(
             ok=True,
             reason="",
@@ -302,7 +413,9 @@ class Verifier:
 
     # -- служебное --------------------------------------------------------
 
-    def _future_key(self, status: tuple[str, ...], keyring: Path) -> int | None:
+    def _future_key(
+        self, status: tuple[str, ...], keyring: Path, *, cancel: Callable[[], bool] | None = None
+    ) -> int | None:
         """Дата создания нашего ключа, если она позже часов компьютера (У92).
 
         Всё в строке ERRSIG, кроме кода, выбирает автор подписи: дата и issuer
@@ -314,6 +427,7 @@ class Verifier:
         """
         keys: dict[str, tuple[str, int]] | None = None
         for line in status:
+            _check_cancel(cancel)
             fields = line.split()
             # ERRSIG <keyid> <pkalgo> <hashalgo> <class> <time> <rc> <fpr>
             if fields[:1] != [_ERRSIG] or len(fields) < 8:
@@ -322,7 +436,7 @@ class Verifier:
             if fields[6] != _ERRSIG_TIME_CONFLICT_RC or not _FPR_RE.match(fpr):
                 continue
             if keys is None:
-                keys = self._keyring_keys(keyring)
+                keys = self._keyring_keys(keyring, cancel=cancel)
             found = keys.get(fpr)
             if found is None:
                 continue
@@ -333,12 +447,15 @@ class Verifier:
                 return created
         return None
 
-    def _keyring_keys(self, keyring: Path) -> dict[str, tuple[str, int]]:
+    def _keyring_keys(
+        self, keyring: Path, *, cancel: Callable[[], bool] | None = None
+    ) -> dict[str, tuple[str, int]]:
         """Отпечаток → (первичный отпечаток, дата создания) по нашей связке.
 
         `gpg --show-keys` во временном пустом GNUPGHOME: связка не импортируется,
         состояние пользователя не читается. Любой сбой — пустой результат.
         """
+        _check_cancel(cancel)
         with tempfile.TemporaryDirectory(prefix="astra-voice-gpg-") as home:
             os.chmod(home, 0o700)
             argv = [
@@ -353,17 +470,21 @@ class Verifier:
                 str(keyring),
             ]
             try:
-                proc = subprocess.run(  # noqa: S603 - argv фиксирован, shell не используется
-                    argv,
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=_GPGV_TIMEOUT_S,
-                    check=False,
-                    env={"LC_ALL": "C", "GNUPGHOME": home},
-                    cwd=home,
-                )
-            except (OSError, subprocess.TimeoutExpired):
+                if cancel is None:
+                    proc = subprocess.run(  # noqa: S603 - argv фиксирован, shell не используется
+                        argv,
+                        capture_output=True,
+                        text=True,
+                        errors="replace",
+                        timeout=_GPGV_TIMEOUT_S,
+                        check=False,
+                        env={"LC_ALL": "C", "GNUPGHOME": home},
+                        cwd=home,
+                    )
+                else:
+                    proc = _run_cancellable(argv, home, cancel)
+                _check_cancel(cancel)
+            except (OSError, subprocess.TimeoutExpired, _OutputLimitExceeded):
                 return {}
         if proc.returncode != 0:
             return {}
@@ -373,6 +494,7 @@ class Verifier:
         primary: str | None = None
         pending: tuple[str, int | None] | None = None
         for line in proc.stdout.splitlines():
+            _check_cancel(cancel)
             fields = line.split(":")
             kind = fields[0]
             if kind in ("pub", "sub"):

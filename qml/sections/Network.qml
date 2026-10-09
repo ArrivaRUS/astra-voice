@@ -14,6 +14,16 @@ Column {
 
     readonly property var settings: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
     readonly property var updates: (typeof updatesBridge !== "undefined" && updatesBridge !== null) ? updatesBridge : null
+    function updateValue(name, fallback) {
+        return root.updates && typeof root.updates[name] !== "undefined" ? root.updates[name] : fallback;
+    }
+    function updateCall(name) {
+        if (root.updates && typeof root.updates[name] === "function") root.updates[name]();
+    }
+    function focusUpdatePanel() { return updatePanel.focusHeading(); }
+    Component.onCompleted: root.updateCall("refreshCapabilities")
+    onUpdatesChanged: Qt.callLater(function() { root.updateCall("refreshCapabilities"); })
+    readonly property string downloadPhase: root.updateValue("downloadPhase", "idle")
     readonly property string saveError: root.settings ? root.settings.saveError : ""
 
     readonly property string updateState: root.updates ? root.updates.state : "disabled"
@@ -30,11 +40,13 @@ Column {
     // Панель показывает результат: ручная проверка идёт или закончилась, есть версия,
     // источник недоступен или версия пропущена (§6.1, подмножество v0.2).
     readonly property string panelState: {
+        if (root.downloadPhase !== "idle" && root.updateState !== "skipped") return "available";
         switch (root.updateState) {
         case "checking":
         case "uptodate":
             return root.manualResult ? root.updateState : "";
         case "available":
+        case "error-net":
         case "unavailable":
         case "skipped":
             return root.updateState;
@@ -78,6 +90,34 @@ Column {
             checkedText: root.updates ? root.updates.checkedText : ""
             releasePageAvailable: root.updates ? root.updates.releasePageAvailable : false
             canCheckNow: root.canCheckNow
+            downloadPhase: root.downloadPhase
+            artifactTrack: root.updateValue("artifactTrack", "")
+            artifactSizeText: root.updateValue("artifactSizeText", "")
+            downloadPercent: root.updateValue("downloadPercent", 0)
+            downloadReceived: root.updateValue("downloadReceived", 0)
+            downloadTotal: root.updateValue("downloadTotal", 0)
+            downloadBusy: root.updateValue("downloadBusy", false)
+            downloadCancelling: root.updateValue("downloadCancelling", false)
+            canDownload: root.updateValue("canDownload", false)
+            canRetryDownload: root.updateValue("canRetryDownload", false)
+            canCancelDownload: root.updateValue("canCancelDownload", false)
+            canOpenFolder: root.updateValue("canOpenFolder", false)
+            canInstallAndRestart: root.updateValue("canInstallAndRestart", false)
+            canSkipVersion: root.updateValue("canSkipVersion", root.updateState === "available")
+            canRemindLater: root.updateValue("canRemindLater", root.updateState === "available")
+            downloadError: root.updateValue("downloadError", "")
+            downloadErrorText: root.updateValue("downloadErrorText", "")
+            downloadRetryText: root.updateValue("downloadRetryText", "")
+            folderPath: root.updateValue("folderPath", "")
+            adminInstruction: root.updateValue("adminInstruction", "")
+            installRefusal: root.updateValue("installRefusal", "")
+            installRefusalText: root.updateValue("installRefusalText", "")
+            networkRefusal: root.networkRefusal
+            onDownloadRequested: root.updateCall("download")
+            onCancelRequested: root.updateCall("cancelDownload")
+            onRetryRequested: root.updateCall("retryDownload")
+            onOpenFolderRequested: root.updateCall("openFolder")
+            onInstallRequested: root.updateCall("installAndRestart")
             autoCheck: root.settings ? root.settings.checkAppUpdates && !root.offlineOn : false
             onReleasePageRequested: { if (root.updates) root.updates.openReleasePage(); }
             onSkipRequested: { if (root.updates) root.updates.skipVersion(); }
@@ -96,7 +136,7 @@ Column {
             width: parent.width
             divider: false
             label: qsTr("Проверять обновления утилиты")
-            sub: locked ? qsTr("Задано администратором") : qsTr("Раз в сутки")
+            sub: locked ? qsTr("Задано администратором") : qsTr("Раз в сутки. Скачивание — по вашему нажатию.")
             toggle: appUpdates
             locked: root.isLocked("check_app_updates") || root.networkRefusal === "admin"
             rowEnabled: !locked && !root.offlineOn
@@ -177,6 +217,7 @@ Column {
             sub: root.checkRefusal === "offline" ? qsTr("Недоступно: включён офлайн-режим")
                 : root.checkRefusal === "admin" || root.checkRefusal === "policy"
                     ? qsTr("Недоступно: задано администратором")
+                    : root.updates === null ? qsTr("Проверка пока недоступна")
                     : qsTr("Ручная проверка работает и при выключенных тумблерах — это ваше явное действие")
             rowEnabled: root.canCheckNow || root.updates === null
 
@@ -185,7 +226,7 @@ Column {
                 small: true
                 iconName: "refresh"
                 text: qsTr("Проверить сейчас")
-                enabled: root.canCheckNow && root.updateState !== "checking"
+                enabled: root.canCheckNow && root.updateState !== "checking" && !root.updateValue("downloadBusy", false) && root.downloadPhase !== "installing"
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: { if (root.updates) root.updates.checkNow(); }
             }

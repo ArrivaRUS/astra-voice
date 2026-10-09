@@ -477,7 +477,7 @@ IPC v3; схема — `arch/s5a5-mic-change.md` §4). Воркер к этом�
 | `skipVersion()` | слот | — | «Пропустить эту версию» для текущей `version` | — |
 | `clearSkip()` | слот | — | «Показать» у пропущенной версии | — |
 | `remindLater()` | слот | — | «Напомнить позже» — сутки без акцента | — |
-| `openReleasePage()` | слот | — | Открывает страницу выпуска через переданный `open_external`; адрес в QML не попадает. Пока `platform/external.open_external` нет в main, `app.py` мост без него не собирает — кнопка скрыта | — |
+| `openReleasePage()` | слот | — | Открывает страницу выпуска через переданный `open_external`; адрес в QML не попадает. `app.py` передаёт `platform.external.open_external`; без переданного opener кнопка скрыта | — |
 
 Методы для Python: `set_status(status)` — только из GUI-потока; `refresh()` —
 пересчитать `checkRefusal`/`networkRefusal` и вызвать `checker.refresh()`.
@@ -489,6 +489,43 @@ IPC v3; схема — `arch/s5a5-mic-change.md` §4). Воркер к этом�
 доступность — `canCheckNow` (пересчёт по `networkChanged`), нажатие открывает окно
 на разделе `network` и вызывает `checkNow()`. Всё в GUI-потоке; логика шины трея
 не затрагивается.
+
+#### 3.8.1 Загрузка и установка программы (2026-10-09)
+
+Проверка выпуска подтверждает подписанные metadata до `available`; пакет
+скачивается только отдельным нажатием. Полный контракт доверия и завершения
+старой копии: [arch/program-updates.md](../arch/program-updates.md).
+
+Состояние загрузки отделено от `state` проверки. Новые свойства уведомляются
+сигналом `downloadChanged`; `version` и `notes` закрепляются за начатой операцией.
+Фоновый результат новой проверки не подменяет выбранный для скачивания выпуск.
+
+| Свойства | Тип | Назначение |
+|---|---|---|
+| `downloadPhase` | string | `idle`, `metadata`, `downloading`, `verifying`, `readydeb`, `readyappimage`, `error`, `cancelled`, `installing` |
+| `artifactTrack`, `artifactSizeText` | string | Трек и размер из проверенных сведений |
+| `artifactSize`, `downloadReceived`, `downloadTotal` | qlonglong | Размеры в байтах; `downloadPercent` — int |
+| `downloadBusy`, `downloadCancelling` | bool | Операция выполняется / ожидается подтверждение отмены |
+| `canDownload`, `canRetryDownload`, `canCancelDownload` | bool | Допуски сетевых действий |
+| `canOpenFolder`, `canInstallAndRestart` | bool | Локальные действия с готовым, неизменённым файлом; офлайн сам по себе их не запрещает |
+| `canSkipVersion`, `canRemindLater` | bool | Действия с выпуском недоступны во время операции |
+| `downloadError`, `downloadErrorText`, `downloadRetryText` | string | Закрытый код, безопасное пояснение и срок повторной попытки; `downloadRetryAt` — float, 0 если срока нет |
+| `folderPath`, `adminInstruction` | string | Проверенная папка и текстовая инструкция для администратора; QML не исполняет команду |
+| `installRefusal`, `installRefusalText` | string | Причина недоступности установки: `admin`, `appimage-denied`, `busy`, `unsupported`, `policy` либо пусто |
+
+Слоты: `download()`, `cancelDownload()`, `retryDownload()`, `openFolder()`,
+`installAndRestart()`, `refreshCapabilities()`. Публичные слоты не принимают
+пути, URL или команды из QML. Повтор установки разрешён только при явном
+`canInstallAndRestart`; для остальных ошибок применяется допуск скачивания.
+
+Python передаёт `DownloadStatus` через GUI-очередь в `set_download_status()`.
+Устаревшие operation_id и поздний ready после отмены не публикуют готовый файл.
+HTTP, GPG и полный хэш выполняются в worker. В GUI проверяется только идентичность
+файла; перед установкой worker перепроверяет содержимое и подпись.
+`set_install_error(code, retryable=False)` сообщает ошибку подготовки;
+`restore_install_error(version, code)` показывает диагностическую запись прошлого
+запуска без разрешения что-либо исполнить. Успешный запуск дочернего процесса
+не означает успешную установку. Скрытый старт не открывает окно с этой записью.
 
 ### 3.9 О программе — `aboutBridge` (M9-а v0.2, PRD F13)
 

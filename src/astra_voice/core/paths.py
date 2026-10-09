@@ -137,6 +137,11 @@ def model_store_dir() -> Path:
     return data_dir() / "models"
 
 
+def cache_dir_path() -> Path:
+    """Путь к кэшу без создания каталогов или изменения прав."""
+    return _xdg("XDG_CACHE_HOME", Path.home() / ".cache")
+
+
 def cache_dir() -> Path:
     """``$XDG_CACHE_HOME/astra-voice`` (по умолчанию ``~/.cache/astra-voice``)."""
     return _ensure_private_dir(_xdg("XDG_CACHE_HOME", Path.home() / ".cache"))
