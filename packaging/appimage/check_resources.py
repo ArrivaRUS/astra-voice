@@ -44,6 +44,8 @@ for path in (
     paths.data_dir_static() / "catalog.json.sig",
     paths.data_dir_static() / "catalog.schema.json",
     smoke_wav_path(),
+    paths.resource_root() / "docs" / "NOTICE",
+    paths.resource_root() / "docs" / "PRIVACY.md",
 ):
     checked += 1
     if not path.is_file():

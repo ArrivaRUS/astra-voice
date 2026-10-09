@@ -439,6 +439,8 @@ rm -f "$LIB/astra_voice/_version.py"
 mv "$LIB/astra_voice/bootstrap.py" "$LIB/bootstrap.py"
 mv "$BUILD/src/qml" "$SHARE/qml"
 mv "$BUILD/src/data" "$SHARE/data"
+install -d "$SHARE/docs"
+install -m 644 "$ROOT/NOTICE" "$ROOT/docs/PRIVACY.md" "$SHARE/docs/"
 mkdir -p "$BUILD/icons"
 mv "$SHARE/data/icons/hicolor" "$BUILD/icons/hicolor"
 rm -rf "$SHARE/data/icons" "$SHARE/data/astra-voice.desktop" \

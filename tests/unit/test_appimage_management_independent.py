@@ -608,8 +608,11 @@ def test_actual_finalizer_keeps_session_lock_until_worker_finished(
     tree = ast.parse(inspect.getsource(composition.main))
     function = tree.body[0]
     assert isinstance(function, ast.FunctionDef)
-    final_try = function.body[-1]
-    assert isinstance(final_try, ast.Try) and final_try.finalbody
+    # main may perform the explicitly requested update launch after cleanup.
+    # Select the actual outer finalizer rather than assuming it is the last statement.
+    finalizers = [node for node in function.body if isinstance(node, ast.Try) and node.finalbody]
+    assert len(finalizers) == 1, "expected one outer shutdown finalizer"
+    final_try = finalizers[0]
     finalizer = compile(
         ast.Module(body=final_try.finalbody, type_ignores=[]), "<actual-finalizer>", "exec"
     )
@@ -670,6 +673,7 @@ def test_actual_finalizer_keeps_session_lock_until_worker_finished(
         appimage_management=SimpleNamespace(worker_threads=(worker,), close=close),
         downloads=None,
         update_checker=None,
+        program_updates=None,
         focuser=Mock(),
         onboarding=None,
         timer=Mock(),

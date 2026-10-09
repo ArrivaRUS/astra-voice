@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import stat
@@ -12,6 +13,7 @@ import threading
 from collections.abc import Callable, Iterator
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -744,3 +746,39 @@ def test_offline_before_local_verification_still_blocks_http(tmp_path: Path, pha
         rig.downloader.download(rig.release, progress=progress)
     rig.no_partial()
     assert not rig.client.calls
+
+
+@pytest.mark.parametrize(
+    "expression", ["engine", "unit", "", "engine or unit", "engine and not unit"]
+)
+@pytest.mark.parametrize(
+    ("source", "unit_only"),
+    [
+        ("pytestmark = pytest.mark.unit", True),
+        ("pytestmark = [pytest.mark.unit, pytest.mark.skipif(False)]", True),
+        ("pytestmark = (pytest.mark.unit, pytest.mark.skipif(False))", True),
+        ("pytestmark = [pytest.mark.unit, pytest.mark.engine]", False),
+        ("pytestmark = pytest.mark.unit\n@pytest.mark.engine\ndef test_engine(): pass", False),
+        ("pytestmark = pytest.mark.unit\npytestmark = pytest.mark.engine", False),
+        ("pytestmark = custom_marks()", False),
+        ("def test_plain(): pass", False),
+        ("this is invalid Python", False),
+    ],
+)
+def test_engine_only_update_collection_guard(
+    tmp_path: Path, expression: str, source: str, unit_only: bool
+) -> None:
+    """Only the exact engine selection can bypass clearly unit-only update imports."""
+    guard_path = Path(__file__).resolve().parents[1] / "conftest.py"
+    spec = importlib.util.spec_from_file_location("update_collection_guard", guard_path)
+    assert spec and spec.loader
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    config = SimpleNamespace(rootpath=tmp_path, option=SimpleNamespace(markexpr=expression))
+    for directory in ("updates", "integration"):
+        path = tmp_path / "tests" / directory / "test_example.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+        assert guard.engine_only_unit_update(path, config) is (
+            expression == "engine" and unit_only and directory == "updates"
+        )

@@ -20,6 +20,12 @@
   25 авторских PASS; финальное code review PASS. Общий lint PASS
   (Ruff: 438 файлов, mypy: 328). Далее: полный CI и package QA точного коммита;
   до этого dev10 не готова к выдаче.
+- Первый CI PR48 (37960494601): packaging/lint PASS; unit9437 PASS/4 FAIL,
+  Xvfb929 PASS/2 FAIL и engine collection error. Исправлены узкие причины:
+  сбор unit-only модулей в engine env, AST-оснастка finalizer, metadata subtitle.
+  Независимый QA нашёл отсутствие About docs в прежнем AppImage: документы
+  добавлены с обязательным resource gate; security review PASS.
+  Повторный общий CI и проверка окончательного образа предстоят.
 - Установленный профиль, звук и живые хоткеи не менялись. Публичный тег/релиз,
   M8/polkit, обновления моделей и живая запись ВКС вне текущего шага.
 
