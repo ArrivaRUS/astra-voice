@@ -252,168 +252,263 @@ Column {
             }
         }
 
-        SettingRow {
+        // Local microphone row: one fixed control axis, secondary messages below it.
+        // Other SettingRow instances keep their existing layout.
+        Item {
             id: deviceRow
-            // Мост появляется после создания QML. Высота зависит от естественного
-            // размера контролов, без повторного запроса вложенных Qt5 Layout
-            // во время смены их видимости (иначе подпись схлопывается до 0 px).
-            implicitHeight: Math.max(Theme.cardRowMinH,
-                microphoneControls.implicitHeight + Theme.cardRowPaddingY * 2)
-                + (divider ? Theme.spaceCardRowDivider : 0)
+            readonly property string label: qsTr("Микрофон")
+            readonly property bool locked: root.isLocked("device")
             width: parent.width
-            label: qsTr("Микрофон")
-            locked: root.isLocked("device")
+            implicitHeight: Theme.spaceCardRowDivider + Theme.cardRowPaddingY * 2
+                + micAxis.height + (policyBadge.visible ? 4 + policyBadge.height : 0)
+                + (micStatus.visible ? 4 + micStatus.implicitHeight : 0)
+            height: implicitHeight
 
-            // Выбор и громкость принадлежат одному микрофону. Дополнительные
-            // действия остаются в этой строке, без отдельной строки настройки.
+            Rectangle {
+                width: parent.width
+                height: Theme.spaceCardRowDivider
+                color: Theme.borderSoft
+            }
+
             Item {
-                id: microphoneControls
-                implicitWidth: Math.max(micControls.implicitWidth, micActions.implicitWidth)
-                implicitHeight: micControls.implicitHeight + (micActions.visible ? Theme.spaceStep + micActions.implicitHeight : 0)
-                Layout.alignment: Qt.AlignVCenter
+                id: micAxis
+                x: Theme.cardRowPaddingX
+                y: Theme.spaceCardRowDivider + Theme.cardRowPaddingY
+                width: parent.width - Theme.cardRowPaddingX * 2
+                height: deviceSelector.implicitHeight
+                readonly property int controlCount: 3 + (micSlider.visible ? 2 : 0)
+                    + (raiseMic.visible ? 1 : 0) + (restoreMic.visible ? 1 : 0)
+                    + (soundSettings.visible ? 1 : 0)
+                readonly property real fixedWidth: micLabel.width + micHint.width
+                    + (volumeText.visible ? volumeText.width : 0)
+                    + (raiseMic.visible ? raiseMic.width : 0)
+                    + (restoreMic.visible ? restoreMic.width : 0)
+                    + (soundSettings.visible ? soundSettings.width : 0)
+                    + (controlCount - 1) * Theme.fieldGap
+                readonly property real available: Math.max(0, width - fixedWidth)
+                readonly property real selectorWidth: Math.min(236,
+                    Math.max(120, available - (micSlider.visible ? 80 : 0)))
+                readonly property real sliderWidth: Math.min(120, Math.max(80, available - selectorWidth))
+                readonly property real stretch: Math.max(0, available - selectorWidth
+                    - (micSlider.visible ? sliderWidth : 0))
+                function after(item) { return item.x + item.width + Theme.fieldGap }
+                readonly property real volumeEnd: micSlider.visible
+                    ? after(volumeText) : after(deviceSelector)
 
-                Row {
-                    id: micControls
-                    width: implicitWidth
-                    height: implicitHeight
-                    spacing: Theme.fieldGap
-                    AvSelect {
-                        id: deviceSelector
-                        // Длинные названия микрофонов: список раскрывается на ширину строки.
-                        popupMaxWidth: deviceRow.width - Theme.cardRowPaddingX * 2
-                        // Бейдж политики занимает часть строки, поэтому
-                        // заблокированный селектор показывается компактно.
-                        width: deviceRow.locked ? Theme.progressStatusbarW : 236
-                        anchors.verticalCenter: parent.verticalCenter
-                        enabled: !root.isLocked("device")
-                        model: root.deviceNames()
-
-                        Binding {
-                            target: deviceSelector
-                            property: "currentIndex"
-                            value: Math.max(0, root.deviceIndex(root.settings ? root.settings.device : ""))
-                        }
-
-                        onCurrentIndexChanged: {
-                            if (root.settings && !root.isLocked("device")
-                                    && currentIndex >= 0 && currentIndex < root.devices.length
-                                    && root.settings.device !== root.deviceIdAt(currentIndex))
-                                root.settings.device = root.deviceIdAt(currentIndex)
-                        }
-                    }
-                    AvSlider {
-                        id: micSlider
-                        property real draggedValue: value
-                        property bool userMoved: false
-                        visible: root.canRaiseMic && root.micVolume >= 0 && !root.micMuted
-                        anchors.verticalCenter: parent.verticalCenter
-                        Accessible.name: qsTr("Громкость микрофона")
-
-                        Binding {
-                            target: micSlider
-                            property: "value"
-                            value: root.micVolume
-                        }
-
-                        onValueChanged: {
-                            if (pressed)
-                                draggedValue = value
-                        }
-                        onPressedChanged: {
-                            if (pressed) {
-                                userMoved = false
-                                draggedValue = value
-                            } else {
-                                var previousVolume = root.micVolume
-                                if (userMoved && root.settings && Math.round(draggedValue) !== previousVolume)
-                                    root.settings.setMicrophoneVolume(Math.round(draggedValue))
-                                if (root.micVolume === previousVolume)
-                                    micSlider.value = root.micVolume
-                                userMoved = false
-                            }
-                        }
-                        onMoved: {
-                            userMoved = true
-                            if (!pressed) {
-                                var previousVolume = root.micVolume
-                                if (root.settings && Math.round(value) !== previousVolume)
-                                    root.settings.setMicrophoneVolume(Math.round(value))
-                                if (root.micVolume === previousVolume)
-                                    micSlider.value = root.micVolume
-                                userMoved = false
-                            }
-                        }
-                    }
-
+                Text {
+                    id: micLabel
+                    width: Math.ceil(implicitWidth)
+                    text: deviceRow.label
+                    textFormat: Text.PlainText
+                    color: Theme.fg
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontSettingLabelSize
+                    lineHeight: Math.round(Theme.fontSettingLabelSize * Theme.fontSettingLabelLineHeight)
+                    lineHeightMode: Text.FixedHeight
+                    renderType: Text.NativeRendering
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                Rectangle {
+                    id: micHint
+                    x: micAxis.after(micLabel) + micAxis.stretch
+                    width: Theme.hintSize
+                    height: Theme.hintSize
+                    radius: Theme.hintSize / 2
+                    color: "transparent"
+                    antialiasing: true
+                    border.width: Theme.borderHairline
+                    border.color: Theme.fgFaint
+                    anchors.verticalCenter: parent.verticalCenter
                     Text {
-                        id: volumeText
-                        text: qsTr("%1 %").arg(micSlider.pressed
-                            ? Math.round(micSlider.value) : root.micVolume)
-                        visible: micSlider.visible
-                        textFormat: Text.PlainText
+                        anchors.centerIn: parent
+                        text: "?"
                         color: Theme.fgMuted
                         font.family: Theme.fontUi
-                        font.pixelSize: Theme.fontSettingSubSize
+                        font.pixelSize: 10
+                        font.weight: Font.Medium
                         renderType: Text.NativeRendering
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                    Text {
-                        visible: root.canRaiseMic && !micSlider.visible
-                        text: root.micMuted
-                            ? qsTr("Звук микрофона выключен в системе — вас не слышно")
-                            : qsTr("Не удалось узнать громкость микрофона")
-                        textFormat: Text.PlainText
-                        color: Theme.fgMuted
-                        font.family: Theme.fontUi
-                        font.pixelSize: Theme.fontSettingSubSize
-                        renderType: Text.NativeRendering
-                        wrapMode: Text.WordWrap
-                        width: Theme.progressStatusbarW + volumeText.implicitWidth + Theme.fieldGap
-                        anchors.verticalCenter: parent.verticalCenter
                     }
                 }
-
-                Row {
-                    id: micActions
-                    anchors.right: parent.right
-                    y: micControls.height + Theme.spaceStep
-                    width: implicitWidth
-                    height: implicitHeight
-                    visible: root.canRaiseMic
-                    spacing: Theme.fieldGap
-                    AvButton {
-                        text: qsTr("Поднять")
-                        small: true
-                        visible: root.micMuted || (root.micVolume >= 0 && root.micVolume < 30)
-                        anchors.verticalCenter: parent.verticalCenter
-                        onClicked: {
-                            if (root.settings)
-                                root.settings.raiseMicrophoneVolume()
-                        }
+                AvSelect {
+                    id: deviceSelector
+                    x: micAxis.after(micHint)
+                    width: micAxis.selectorWidth
+                    popupMaxWidth: micAxis.width
+                    // The selector shares its row with actions on the right. Keep a
+                    // wide popup inside the whole microphone area, not its own edge.
+                    popup.x: Math.max(-deviceSelector.x,
+                        Math.min(deviceSelector.width - deviceSelector.popup.width,
+                            micAxis.width - deviceSelector.x - deviceSelector.popup.width))
+                    anchors.verticalCenter: parent.verticalCenter
+                    enabled: !deviceRow.locked
+                    model: root.deviceNames()
+                    // Apply the saved index after ComboBox's model reset; this is
+                    // programmatic reconciliation, never a setting write.
+                    onModelChanged: Qt.callLater(function() {
+                        deviceSelector.currentIndex = Math.max(0,
+                            root.deviceIndex(root.settings ? root.settings.device : ""))
+                    })
+                    Binding {
+                        target: deviceSelector
+                        property: "currentIndex"
+                        value: Math.max(0, root.deviceIndex(root.settings ? root.settings.device : ""))
                     }
 
-                    AvButton {
-                        text: qsTr("Вернуть")
-                        small: true
-                        visible: root.canRestoreMic
-                        anchors.verticalCenter: parent.verticalCenter
-                        onClicked: {
-                            if (root.settings)
-                                root.settings.restoreMicrophoneVolume()
-                        }
+                    onActivated: {
+                        if (root.settings && !root.isLocked("device")
+                                && currentIndex >= 0 && currentIndex < root.devices.length
+                                && root.settings.device !== root.deviceIdAt(currentIndex))
+                            root.settings.device = root.deviceIdAt(currentIndex)
+                    }
+                }
+                AvSlider {
+                    id: micSlider
+                    x: micAxis.after(deviceSelector)
+                    width: micAxis.sliderWidth
+                    property real draggedValue: value
+                    property bool userMoved: false
+                    visible: root.canRaiseMic && root.micVolume >= 0 && !root.micMuted
+                    anchors.verticalCenter: parent.verticalCenter
+                    Accessible.name: qsTr("Громкость микрофона")
+                    Binding {
+                        target: micSlider
+                        property: "value"
+                        value: root.micVolume
                     }
 
-                    AvButton {
-                        text: qsTr("Настройки звука…")
-                        small: true
-                        visible: root.canOpenSoundSettings
-                        anchors.verticalCenter: parent.verticalCenter
-                        onClicked: {
-                            if (root.settings)
-                                root.settings.openSoundSettings()
+                    onValueChanged: {
+                        if (pressed)
+                            draggedValue = value
+                    }
+                    onPressedChanged: {
+                        if (pressed) {
+                            userMoved = false
+                            draggedValue = value
+                        } else {
+                            var previousVolume = root.micVolume
+                            if (userMoved && root.settings && Math.round(draggedValue) !== previousVolume)
+                                root.settings.setMicrophoneVolume(Math.round(draggedValue))
+                            if (root.micVolume === previousVolume)
+                                micSlider.value = root.micVolume
+                            userMoved = false
+                        }
+                    }
+                    onMoved: {
+                        userMoved = true
+                        if (!pressed) {
+                            var previousVolume = root.micVolume
+                            if (root.settings && Math.round(value) !== previousVolume)
+                                root.settings.setMicrophoneVolume(Math.round(value))
+                            if (root.micVolume === previousVolume)
+                                micSlider.value = root.micVolume
+                            userMoved = false
                         }
                     }
                 }
+                Text {
+                    id: volumeText
+                    x: micAxis.after(micSlider)
+                    width: Math.ceil(percentMeasure.implicitWidth)
+                    text: qsTr("%1 %").arg(micSlider.pressed
+                        ? Math.round(micSlider.value) : root.micVolume)
+                    visible: micSlider.visible
+                    textFormat: Text.PlainText
+                    color: Theme.fgMuted
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontSettingSubSize
+                    renderType: Text.NativeRendering
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                Text {
+                    id: percentMeasure
+                    visible: false
+                    text: qsTr("100 %")
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontSettingSubSize
+                    renderType: Text.NativeRendering
+                }
+                AvButton {
+                    id: raiseMic
+                    x: micAxis.volumeEnd
+                    width: implicitWidth
+                    text: qsTr("Поднять")
+                    small: true
+                    visible: root.canRaiseMic && (root.micMuted
+                        || (root.micVolume >= 0 && root.micVolume < 30))
+                    anchors.verticalCenter: parent.verticalCenter
+                    onClicked: if (root.settings) root.settings.raiseMicrophoneVolume()
+                }
+                AvButton {
+                    id: restoreMic
+                    x: raiseMic.visible ? micAxis.after(raiseMic) : micAxis.volumeEnd
+                    width: implicitWidth
+                    text: qsTr("Вернуть")
+                    small: true
+                    visible: root.canRaiseMic && root.canRestoreMic
+                    anchors.verticalCenter: parent.verticalCenter
+                    onClicked: if (root.settings) root.settings.restoreMicrophoneVolume()
+                }
+                AvButton {
+                    id: soundSettings
+                    x: restoreMic.visible ? micAxis.after(restoreMic)
+                        : raiseMic.visible ? micAxis.after(raiseMic) : micAxis.volumeEnd
+                    width: implicitWidth
+                    text: qsTr("Настройки звука…")
+                    small: true
+                    visible: root.canOpenSoundSettings
+                    anchors.verticalCenter: parent.verticalCenter
+                    onClicked: if (root.settings) root.settings.openSoundSettings()
+                }
+            }
+            Rectangle {
+                id: policyBadge
+                x: Theme.cardRowPaddingX
+                y: micAxis.y + micAxis.height + 4
+                width: policyContent.implicitWidth + Theme.lockBadgePaddingX * 2
+                height: Theme.badgeHeight
+                radius: Theme.lockBadgeRadius
+                antialiasing: true
+                color: Theme.lockBadgeBg
+                visible: deviceRow.locked
+                RowLayout {
+                    id: policyContent
+                    anchors.centerIn: parent
+                    spacing: Theme.badgeGap
+                    Icon {
+                        name: "lock"
+                        size: Theme.lockBadgeIcon
+                        color: Theme.lockBadgeFg
+                        Layout.alignment: Qt.AlignVCenter
+                    }
+                    Text {
+                        text: qsTr("Задано администратором")
+                        textFormat: Text.PlainText
+                        color: Theme.lockBadgeFg
+                        font.family: Theme.fontUi
+                        font.pixelSize: Theme.badgeSize
+                        renderType: Text.NativeRendering
+                        Layout.alignment: Qt.AlignVCenter
+                    }
+                }
+            }
+            Text {
+                id: micStatus
+                x: Theme.cardRowPaddingX
+                y: (policyBadge.visible ? policyBadge.y + policyBadge.height
+                    : micAxis.y + micAxis.height) + 4
+                width: micAxis.width
+                visible: root.canRaiseMic && !micSlider.visible
+                text: root.micMuted
+                    ? qsTr("Звук микрофона выключен в системе — вас не слышно")
+                    : qsTr("Не удалось узнать громкость микрофона")
+                textFormat: Text.PlainText
+                color: Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+                lineHeightMode: Text.FixedHeight
+                renderType: Text.NativeRendering
+                wrapMode: Text.WordWrap
             }
         }
     }

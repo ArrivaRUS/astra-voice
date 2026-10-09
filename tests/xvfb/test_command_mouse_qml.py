@@ -172,7 +172,7 @@ def test_tab_to_preview_reveals_entire_row_explanation_and_focus_ring(width: int
             item for item in items if item.property("label") == "Показывать команду перед отправкой"
         )
         toggle = cast(QQuickItem, row.property("toggle"))
-        first = next(item for item in items if item.property("text") == "Левая Win")
+        first = next(item for item in items if item.property("text") == "Проверить снова")
         first.forceActiveFocus(Qt.TabFocusReason)
         for _ in range(20):
             QTest.keyClick(window, Qt.Key_Tab)

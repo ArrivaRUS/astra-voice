@@ -184,9 +184,8 @@ def test_command_editor_content_padding_and_neighbor_rows(
         ]
         padded.extend(lower_buttons)
         if state != "absent":
-            win_buttons = [
-                action_buttons[text] for text in ("Левая Win", "Правая Win", "Проверить снова")
-            ]
+            win_buttons = [action_buttons["Проверить снова"]]
+            assert not {"Левая Win", "Правая Win"} & action_buttons.keys()
             assert box(win_buttons[0], editor).top() - box(
                 intro.parentItem(), editor
             ).bottom() == pytest.approx(8, abs=1)
@@ -240,11 +239,9 @@ def test_command_editor_content_padding_and_neighbor_rows(
 def test_command_editor_buttons_keep_real_bridge_contract(wizard: bool) -> None:
     with render(1035, "installed", wizard) as (editor, bridge, host, capture, messages):
         controls = buttons(editor)
-        QMetaObject.invokeMethod(controls["Правая Win"], "clicked", Qt.DirectConnection)
-        assert bridge.commandHotkey == "Super_R"
-        QMetaObject.invokeMethod(controls["Левая Win"], "clicked", Qt.DirectConnection)
+        assert not {"Левая Win", "Правая Win"} & controls.keys()
         assert bridge.commandHotkey == "Super_L"
-        assert host.reload_command_hotkey.call_count == 2
+        host.reload_command_hotkey.assert_not_called()
         # First show has already refreshed status through the late settings bridge.
         refreshes_before_click = host.refresh_command_status.call_count
         QMetaObject.invokeMethod(controls["Проверить снова"], "clicked", Qt.DirectConnection)
