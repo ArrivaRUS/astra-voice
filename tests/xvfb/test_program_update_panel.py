@@ -534,3 +534,140 @@ def test_offline_preserves_local_phase_and_action(app: Any, dark: bool, phase: s
         states.WIDTH, states.HEIGHT = original_size
         sip.delete(updates)
         sip.delete(settings)
+
+
+@pytest.mark.parametrize("scenario", ["available", "busy", "disabled-and-hidden"])
+def test_panel_forward_reverse_focus_actions(app: Any, scenario: str) -> None:
+    bridge_values = values("metadata" if scenario == "busy" else "idle")
+    order = ["updatePrimary", "updateReleasePage", "updateSkip", "updateRemindLater"]
+    if scenario == "busy":
+        bridge_values.update(canSkipVersion=False, canRemindLater=False)
+        order = ["updateCancel", "updateReleasePage"]
+    elif scenario == "disabled-and-hidden":
+        bridge_values.update(canDownload=False, releasePageAvailable=False)
+        order = ["updateSkip", "updateRemindLater"]
+    updates = states.FakeUpdates(**bridge_values)
+    settings = states.make_settings({})
+
+    def inspect(window: Any) -> None:
+        window.requestActivate()
+        first = states.find_object(window, order[0])
+        first.forceActiveFocus(Qt.TabFocusReason)
+        QTest.qWait(40)
+        for name in order[1:]:
+            QTest.keyClick(window, Qt.Key_Tab)
+            QTest.qWait(30)
+            assert states.find_object(window, name).hasActiveFocus(), name
+        for name in reversed(order[:-1]):
+            QTest.keyClick(window, Qt.Key_Backtab, Qt.ShiftModifier)
+            QTest.qWait(30)
+            assert states.find_object(window, name).hasActiveFocus(), name
+        heading = states.find_object(window, "updatePanelHeading")
+        heading.forceActiveFocus(Qt.TabFocusReason)
+        QTest.keyClick(window, Qt.Key_Tab)
+        QTest.qWait(30)
+        assert first.hasActiveFocus()
+        assert updates.calls == []
+
+    try:
+        _, _, messages = states.render_network(app, False, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+
+
+@pytest.mark.parametrize("key", [Qt.Key_Return, Qt.Key_Enter], ids=["return", "enter"])
+@pytest.mark.parametrize(
+    ("phase", "button", "action", "checker_state"),
+    [
+        ("idle", "updatePrimary", "download", "available"),
+        ("readyappimage", "updatePrimary", "installAndRestart", "available"),
+        ("metadata", "updateCancel", "cancelDownload", "available"),
+        ("idle", "updateReleasePage", "openReleasePage", "available"),
+        ("idle", "updateSkip", "skipVersion", "available"),
+        ("idle", "updateRemindLater", "remindLater", "available"),
+        ("idle", "updateCheckAgain", "checkNow", "uptodate"),
+        ("idle", "updateShowSkipped", "clearSkip", "skipped"),
+    ],
+)
+def test_enter_gesture_executes_only_focused_panel_action(
+    app: Any, key: int, phase: str, button: str, action: str, checker_state: str
+) -> None:
+    updates = states.FakeUpdates(**{**values(phase), "state": checker_state, "manual": True})
+    settings = states.make_settings({})
+
+    def inspect(window: Any) -> None:
+        window.requestActivate()
+        control = states.find_object(window, button)
+        control.forceActiveFocus(Qt.TabFocusReason)
+        QTest.qWait(40)
+        QTest.keyClick(window, key)
+        QTest.qWait(30)
+        assert updates.calls == [action]
+
+    try:
+        _, _, messages = states.render_network(app, False, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+
+
+@pytest.mark.parametrize("key", [Qt.Key_Return, Qt.Key_Enter], ids=["return", "enter"])
+def test_enter_repeat_orphan_release_and_ready_transition_are_safe(app: Any, key: int) -> None:
+    from PyQt5.QtCore import QEvent
+    from PyQt5.QtGui import QGuiApplication, QKeyEvent
+
+    class DownloadFake(states.FakeUpdates):
+        @states.pyqtSlot()
+        def download(self) -> None:
+            # Real UpdatesBridge publishes metadata before download() returns.
+            self.calls.append("download")
+            self.update(**values("metadata"))
+
+    updates = DownloadFake(**values("idle"))
+    settings = states.make_settings({})
+
+    def repeat(window: Any) -> None:
+        for kind in (QEvent.KeyPress, QEvent.KeyRelease):
+            QGuiApplication.sendEvent(window, QKeyEvent(kind, key, Qt.NoModifier, "\r", True, 1))
+        app.processEvents()
+
+    def inspect(window: Any) -> None:
+        window.requestActivate()
+        primary = states.find_object(window, "updatePrimary")
+        primary.forceActiveFocus(Qt.TabFocusReason)
+        QTest.qWait(40)
+        QTest.keyRelease(window, key)
+        repeat(window)
+        assert updates.calls == []
+        QTest.keyPress(window, key)
+        states.find_object(window, "updateReleasePage").forceActiveFocus(Qt.TabFocusReason)
+        QTest.keyRelease(window, key)
+        assert updates.calls == []
+        primary.forceActiveFocus(Qt.TabFocusReason)
+        QTest.keyClick(window, key)
+        QTest.qWait(30)
+        assert updates.calls == ["download"]
+        assert states.find_object(window, "updateCancel").hasActiveFocus()
+        repeat(window)
+        updates.update(**values("readyappimage"))
+        QTest.qWait(30)
+        assert states.find_object(window, "updatePanelHeading").hasActiveFocus()
+        repeat(window)
+        QTest.keyRelease(window, key)
+        assert updates.calls == ["download"]
+        QTest.keyClick(window, Qt.Key_Tab)
+        QTest.keyClick(window, key)
+        QTest.qWait(30)
+        assert updates.calls == ["download", "installAndRestart"]
+        QTest.keyRelease(window, key)
+        assert updates.calls == ["download", "installAndRestart"]
+
+    try:
+        _, _, messages = states.render_network(app, False, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)

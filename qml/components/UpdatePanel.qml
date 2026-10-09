@@ -117,6 +117,23 @@ Rectangle {
                 : qsTr("Установка и перезапуск — отдельным нажатием после проверки.");
         }
     }
+    function panelActions() {
+        return [primaryButton, cancelButton, releaseButton, skipButton, remindButton,
+            checkAgainButton, showSkippedButton];
+    }
+    function focusPanelAction(current, direction) {
+        var actions = panelActions();
+        var start = current ? actions.indexOf(current) + direction : 0;
+        if (current && actions.indexOf(current) < 0) return false;
+        for (var i = start; i >= 0 && i < actions.length; i += direction) {
+            if (actions[i].visible && actions[i].enabled) {
+                actions[i].forceActiveFocus(direction > 0 ? Qt.TabFocusReason : Qt.BacktabFocusReason);
+                return true;
+            }
+        }
+        // At the panel boundary Qt continues its normal focus chain into the section.
+        return false;
+    }
     function focusHeading() { heading.forceActiveFocus(Qt.TabFocusReason); return heading; }
     function megabytes(value) { return (value / 1000000).toFixed(value < 10000000 ? 1 : 0) + " МБ"; }
     function ownsFocus() {
@@ -145,6 +162,44 @@ Rectangle {
     border.width: Theme.cardBorder
     border.color: failed ? Theme.dangerInk : accent ? Theme.primary : Theme.border
 
+    component PanelButton: AvButton {
+        id: control
+        property bool enterArmed: false
+        property int enterKey: 0
+        property string enterPhase: ""
+        property string enterPanelState: ""
+        property string enterText: ""
+        onActiveFocusChanged: { if (!activeFocus) enterArmed = false; }
+        onEnabledChanged: { if (!enabled) enterArmed = false; }
+        onVisibleChanged: { if (!visible) enterArmed = false; }
+        onTextChanged: enterArmed = false
+        Keys.onPressed: {
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                event.accepted = true;
+                if (!event.isAutoRepeat && !enterArmed && enabled && visible && activeFocus) {
+                    enterArmed = true;
+                    enterKey = event.key;
+                    enterPhase = root.downloadPhase;
+                    enterPanelState = root.panelState;
+                    enterText = text;
+                }
+            } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
+                enterArmed = false;
+                var backward = event.key === Qt.Key_Backtab || (event.modifiers & Qt.ShiftModifier);
+                event.accepted = root.focusPanelAction(control, backward ? -1 : 1);
+            }
+        }
+        Keys.onReleased: {
+            if (event.key !== Qt.Key_Return && event.key !== Qt.Key_Enter) return;
+            event.accepted = true;
+            if (event.isAutoRepeat) return;
+            var activate = enterArmed && enterKey === event.key && enabled && visible && activeFocus
+                && enterPhase === root.downloadPhase && enterPanelState === root.panelState
+                && enterText === text;
+            enterArmed = false;
+            if (activate) clicked();
+        }
+    }
     component SmallText: Text {
         textFormat: Text.PlainText
         color: Theme.fgMuted
@@ -199,7 +254,8 @@ Rectangle {
             activeFocusOnTab: false
             Accessible.role: Accessible.Heading
             Accessible.name: title.text + " " + releaseVersion.text
-            KeyNavigation.tab: primaryButton.visible && primaryButton.enabled ? primaryButton : releaseButton
+            // One-way entry keeps programmatic heading focus out of the reverse Tab chain.
+            Keys.onTabPressed: event.accepted = root.focusPanelAction(null, 1)
             SmallText {
                 id: title
                 objectName: "updatePanelTitle"
@@ -351,14 +407,13 @@ Rectangle {
             width: parent.width
             spacing: 8
             visible: root.operationVisible
-            AvButton {
+            PanelButton {
                 id: primaryButton
                 objectName: "updatePrimary"
                 width: body.width < 364 ? Math.min(body.width, Math.max(264, implicitWidth)) : Math.max(264, implicitWidth)
                 text: root.primaryText
                 variant: "primary"
                 enabled: root.primaryEnabled
-                Keys.onPressed: { if (event.isAutoRepeat) event.accepted = true; }
                 onClicked: {
                     if (root.folderAction) root.openFolderRequested();
                     else if (root.installAction) root.installRequested();
@@ -370,9 +425,9 @@ Rectangle {
             Item {
                 width: Math.max(92, cancelButton.implicitWidth)
                 height: primaryButton.height
-                AvButton { id: cancelButton; objectName: "updateCancel"; width: parent.width; text: qsTr("Отмена"); visible: root.downloadBusy; enabled: root.canCancelDownload; onClicked: root.cancelRequested() }
+                PanelButton { id: cancelButton; objectName: "updateCancel"; width: parent.width; text: qsTr("Отмена"); visible: root.downloadBusy; enabled: root.canCancelDownload; onClicked: root.cancelRequested() }
             }
-            AvButton { id: releaseButton; objectName: "updateReleasePage"; visible: root.releasePageAvailable; enabled: root.networkRefusal === ""; text: qsTr("Страница выпуска"); iconName: "out"; onClicked: root.releasePageRequested() }
+            PanelButton { id: releaseButton; objectName: "updateReleasePage"; visible: root.releasePageAvailable; enabled: root.networkRefusal === ""; text: qsTr("Страница выпуска"); iconName: "out"; onClicked: root.releasePageRequested() }
         }
         Item { width: 1; height: 8; visible: deferrals.visible }
         Flow {
@@ -380,15 +435,15 @@ Rectangle {
             width: parent.width
             spacing: 8
             visible: root.operationVisible
-            AvButton { objectName: "updateSkip"; text: qsTr("Пропустить эту версию"); enabled: root.canSkipVersion && !root.downloadBusy && !root.installing; onClicked: root.skipRequested() }
-            AvButton { objectName: "updateRemindLater"; variant: "ghost"; text: qsTr("Напомнить позже"); enabled: root.canRemindLater && !root.downloadBusy && !root.installing; onClicked: root.remindLaterRequested() }
+            PanelButton { id: skipButton; objectName: "updateSkip"; text: qsTr("Пропустить эту версию"); enabled: root.canSkipVersion && !root.downloadBusy && !root.installing; onClicked: root.skipRequested() }
+            PanelButton { id: remindButton; objectName: "updateRemindLater"; variant: "ghost"; text: qsTr("Напомнить позже"); enabled: root.canRemindLater && !root.downloadBusy && !root.installing; onClicked: root.remindLaterRequested() }
         }
         Flow {
             width: parent.width
             spacing: 8
             visible: !root.operationVisible && root.panelState !== "checking"
-            AvButton { objectName: "updateCheckAgain"; visible: root.panelState === "uptodate" || root.panelState === "error-net" || root.panelState === "unavailable"; text: root.panelState === "error-net" ? qsTr("Повторить проверку") : qsTr("Проверить ещё раз"); enabled: root.canCheckNow; onClicked: root.checkRequested() }
-            AvButton { objectName: "updateShowSkipped"; visible: root.panelState === "skipped"; text: qsTr("Показать %1").arg(root.version); onClicked: root.showSkippedRequested() }
+            PanelButton { id: checkAgainButton; objectName: "updateCheckAgain"; visible: root.panelState === "uptodate" || root.panelState === "error-net" || root.panelState === "unavailable"; text: root.panelState === "error-net" ? qsTr("Повторить проверку") : qsTr("Проверить ещё раз"); enabled: root.canCheckNow; onClicked: root.checkRequested() }
+            PanelButton { id: showSkippedButton; objectName: "updateShowSkipped"; visible: root.panelState === "skipped"; text: qsTr("Показать %1").arg(root.version); onClicked: root.showSkippedRequested() }
         }
     }
 }
