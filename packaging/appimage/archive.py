@@ -33,26 +33,31 @@ def digest(stream: IO[bytes]) -> str:
 
 def check(archive: Path, image: Path) -> None:
     """Сверить единственный обычный файл, его имя, права и байты с raw AppImage."""
-    with image.open("rb") as source, tarfile.open(archive, "r|gz") as bundle:
-        member = bundle.next()
-        if (
-            member is None
-            or not member.isfile()
-            or member.name != image.name
-            or member.mode != 0o755
-            or member.size != os.fstat(source.fileno()).st_size
-            or member.uid != 0
-            or member.gid != 0
-        ):
-            raise ValueError("архив должен содержать один AppImage basename с режимом 0755")
-        payload = bundle.extractfile(member)
-        if payload is None:
-            raise ValueError("в архиве нет содержимого AppImage")
-        with payload:
-            if digest(payload) != digest(source):
-                raise ValueError("байты AppImage в архиве не совпадают с исходным файлом")
-        if bundle.next() is not None:
-            raise ValueError("в архиве есть посторонние файлы")
+    with image.open("rb") as source, gzip.open(archive, "rb") as decompressed:
+        with tarfile.open(fileobj=decompressed, mode="r|") as bundle:
+            member = bundle.next()
+            if (
+                member is None
+                or not member.isfile()
+                or member.name != image.name
+                or member.mode != 0o755
+                or member.size != os.fstat(source.fileno()).st_size
+                or member.uid != 0
+                or member.gid != 0
+            ):
+                raise ValueError("архив должен содержать один AppImage basename с режимом 0755")
+            payload = bundle.extractfile(member)
+            if payload is None:
+                raise ValueError("в архиве нет содержимого AppImage")
+            with payload:
+                if digest(payload) != digest(source):
+                    raise ValueError("байты AppImage в архиве не совпадают с исходным файлом")
+            if bundle.next() is not None:
+                raise ValueError("в архиве есть посторонние файлы")
+        # Tar EOF наступает раньше gzip EOF: дочитываем поток для проверки CRC,
+        # размера и наличия trailer. Закрытие GzipFile само по себе этого не делает.
+        while decompressed.read(BLOCK_SIZE):
+            pass
 
 
 def create(image: Path, epoch: int) -> Path:

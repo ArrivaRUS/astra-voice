@@ -134,3 +134,32 @@ def test_invalid_epoch_keeps_previous_archive(tmp_path: Path) -> None:
     previous = archive.read_bytes()
     assert run(image, epoch="-1").returncode == 1
     assert archive.read_bytes() == previous
+
+
+@pytest.mark.parametrize("damage", ["truncated-footer", "bad-crc", "bad-size"])
+def test_check_rejects_invalid_gzip_trailer(tmp_path: Path, damage: str) -> None:
+    if shutil.which("tar") is None:
+        pytest.skip("нужен GNU tar")
+    image = make_image(tmp_path)
+    assert run(image).returncode == 0
+    archive = image.with_name(NAME + ".tar.gz")
+    damaged = bytearray(archive.read_bytes())
+    if damage == "truncated-footer":
+        del damaged[-8:]
+    elif damage == "bad-crc":
+        damaged[-8] ^= 1
+    else:
+        damaged[-4] ^= 1
+    archive.write_bytes(damaged)
+    checked = run(image, "--check")
+    listed = subprocess.run(
+        ["tar", "-tzf", str(archive)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert listed.returncode != 0, "GNU tar должен отклонить повреждённый gzip trailer"
+    assert checked.returncode == 1, checked.stdout + checked.stderr
+    assert "ОШИБКА" in checked.stderr
+    assert not (tmp_path / "SHOULD_NOT_RUN").exists()
