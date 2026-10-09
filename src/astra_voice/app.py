@@ -1278,6 +1278,7 @@ def main(argv: list[str] | None = None) -> int:
         root = _root_window(shell)
         if root is not None:
             capture.attach_window(root)
+            settings_bridge.attach_window(root)
         show_onboarding = stored.extra.get("onboarding_done") is not True
         if show_onboarding:
             onboarding = OnboardingController(

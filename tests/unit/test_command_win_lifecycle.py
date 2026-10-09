@@ -59,6 +59,13 @@ def host(installed: bool) -> Any:
         reject_command=Mock(),
         command_hotkey=Mock(),
         _command_changed=Mock(),
+        # Mouse integration ports: this fixture isolates the existing Win lifecycle.
+        reload_command_mouse=Mock(),
+        _stop_mouse=Mock(),
+        _invalidate_mouse_capture=Mock(),
+        _command_hold_epoch=0,
+        _input_owner=None,
+        _schedule_command_hold=Mock(),
     )
 
 

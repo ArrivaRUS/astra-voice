@@ -776,6 +776,116 @@ class FakeSettings(QObject):
     """Изменяемый контракт настроек без системных побочных действий."""
 
     changed = pyqtSignal()
+    commandMouseEnabledChanged = pyqtSignal()
+    commandMouseButtonChanged = pyqtSignal()
+    commandMouseStateChanged = pyqtSignal()
+    commandMouseCaptureChanged = pyqtSignal()
+
+    def _get_commandMouseEnabled(self) -> bool:
+        return getattr(self, "_commandMouseEnabled", False)
+
+    def _set_commandMouseEnabled(self, value: bool) -> None:
+        if not value:
+            self._commandMouseEnabled = False
+        self.commandMouseEnabledChanged.emit()
+
+    commandMouseEnabled = pyqtProperty(
+        bool,
+        _get_commandMouseEnabled,
+        _set_commandMouseEnabled,
+        notify=commandMouseEnabledChanged,
+    )
+
+    def _get_commandMouseButton(self) -> int:
+        return getattr(self, "_commandMouseButton", 2)
+
+    commandMouseButton = pyqtProperty(
+        int, _get_commandMouseButton, notify=commandMouseButtonChanged
+    )
+
+    def _get_commandMouseButtonLabel(self) -> str:
+        return getattr(self, "_commandMouseButtonLabel", "Средняя кнопка")
+
+    commandMouseButtonLabel = pyqtProperty(
+        str, _get_commandMouseButtonLabel, notify=commandMouseButtonChanged
+    )
+
+    def _get_commandMouseStatus(self) -> str:
+        return getattr(self, "_commandMouseStatus", "disabled")
+
+    commandMouseStatus = pyqtProperty(str, _get_commandMouseStatus, notify=commandMouseStateChanged)
+
+    def _get_commandMouseStatusMessage(self) -> str:
+        return getattr(
+            self, "_commandMouseStatusMessage", "Управление кнопкой мыши пока недоступно"
+        )
+
+    commandMouseStatusMessage = pyqtProperty(
+        str, _get_commandMouseStatusMessage, notify=commandMouseStateChanged
+    )
+
+    def _get_commandMouseCanEdit(self) -> bool:
+        return getattr(self, "_commandMouseCanEdit", False)
+
+    commandMouseCanEdit = pyqtProperty(
+        bool, _get_commandMouseCanEdit, notify=commandMouseStateChanged
+    )
+
+    def _get_commandMouseCaptureState(self) -> str:
+        return getattr(self, "_commandMouseCaptureState", "idle")
+
+    commandMouseCaptureState = pyqtProperty(
+        str, _get_commandMouseCaptureState, notify=commandMouseCaptureChanged
+    )
+
+    def _get_commandMousePendingButton(self) -> int:
+        return getattr(self, "_commandMousePendingButton", 0)
+
+    commandMousePendingButton = pyqtProperty(
+        int, _get_commandMousePendingButton, notify=commandMouseCaptureChanged
+    )
+
+    def _get_commandMousePendingButtonLabel(self) -> str:
+        return getattr(self, "_commandMousePendingButtonLabel", "")
+
+    commandMousePendingButtonLabel = pyqtProperty(
+        str, _get_commandMousePendingButtonLabel, notify=commandMouseCaptureChanged
+    )
+
+    def _get_commandMouseCaptureMessage(self) -> str:
+        return getattr(self, "_commandMouseCaptureMessage", "")
+
+    commandMouseCaptureMessage = pyqtProperty(
+        str, _get_commandMouseCaptureMessage, notify=commandMouseCaptureChanged
+    )
+
+    @pyqtSlot(result=bool)
+    def beginCommandMouseCapture(self) -> bool:
+        self.calls.append("beginCommandMouseCapture")
+        return False
+
+    @pyqtSlot(int)
+    def commandMouseCapturePressed(self, qt_button: int) -> None:
+        self.calls.append(f"commandMouseCapturePressed:{qt_button}")
+
+    @pyqtSlot(int, int)
+    def commandMouseCaptureReleased(self, qt_button: int, qt_buttons_remaining: int) -> None:
+        self.calls.append(f"commandMouseCaptureReleased:{qt_button}:{qt_buttons_remaining}")
+
+    @pyqtSlot(int, result=bool)
+    def selectCommandMouseButton(self, button: int) -> bool:
+        self.calls.append(f"selectCommandMouseButton:{button}")
+        return False
+
+    @pyqtSlot(result=bool)
+    def applyCommandMouseButton(self) -> bool:
+        self.calls.append("applyCommandMouseButton")
+        return False
+
+    @pyqtSlot()
+    def cancelCommandMouseCapture(self) -> None:
+        self.calls.append("cancelCommandMouseCapture")
+
     commandStateChanged = pyqtSignal()
     commandDetailsRequested = pyqtSignal()
 
@@ -2277,8 +2387,18 @@ def test_menu_and_show_section_switch_real_sections(onboarding_app: Any, dark: b
             assert select_section(onboarding_app, window, description["key"]) == description
             assert sidebar.property("currentIndex") == index
             texts = visible_texts(window.contentItem())
-            # Заголовок и подзаголовок шапки — из описания раздела; чужих нет.
-            assert {description["title"], description["subtitle"]} <= texts
+            # Advanced uses the accepted Cowork header, keeping the sidebar entry.
+            title = (
+                "Продвинутые настройки"
+                if description["key"] == "advanced"
+                else description["title"]
+            )
+            subtitle = (
+                "Голосовые команды Astra Cowork"
+                if description["key"] == "advanced"
+                else description["subtitle"]
+            )
+            assert {title, subtitle} <= texts
             assert not (subtitles - {description["subtitle"]}) & texts
 
         def show_section(section: str, expected_index: int) -> set[str]:
@@ -4618,14 +4738,9 @@ def test_settings_models_section_calls_bridge(onboarding_app: Any, dark: bool) -
             if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
         ]
         assert len(cards) == 1, f"ожидалась одна карточка, найдено {len(cards)}"
-        # Первичный раздел «Общие» читает устройства, громкость и статус
-        # помощника — это не вызовы раздела «Модели».
-        assert fake.calls == [
-            "refreshDevices",
-            "refreshMicrophone",
-            "refreshCommandStatus",
-            "cancelCapture",
-        ]
+        # Первичный раздел «Общие» читает устройства и громкость; уход закрывает
+        # редактор клавиши. Статус Cowork теперь читает только «Продвинутые».
+        assert fake.calls == ["refreshDevices", "refreshMicrophone", "cancelCapture"]
         fake.calls.clear()
         assert fake.toggled_model_ids == []
         click_item(cards[0])

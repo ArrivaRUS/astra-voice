@@ -508,6 +508,9 @@ class HotkeyManager:
         self._mods = 0
         self._escape_grabbed = False
         self._escape_keycode: int | None = None
+        self._external_escape_token: object | None = None
+        self._external_escape_callback: Callable[[], None] | None = None
+        self._external_escape_revoking = False
         self._key_down = False
         self._event_generation = 0
         self.mapping_release_lost = False
@@ -516,6 +519,55 @@ class HotkeyManager:
         # Диагностика журнала: пары автоповтора за удержание и пропуски нажатий подряд.
         self._repeat_pairs = 0
         self._skipped_presses = 0
+
+    @property
+    def has_pending_press(self) -> bool:
+        return self._deferred_press is not None
+
+    def acquire_external_escape(self, token: object, callback: Callable[[], None]) -> GrabResult:
+        """Lease passive Escape on this existing reader without changing its FSM."""
+        if self._external_escape_revoking or self.fsm.state != HotkeyState.IDLE:
+            return GrabResult("busy")
+        if self._external_escape_token is not None:
+            return (
+                self.escape_result if token is self._external_escape_token else GrabResult("busy")
+            )
+        try:
+            self.escape_result = self.backend.grab_escape()
+        except Exception:
+            self.escape_result = GrabResult("not-grabbed")
+            log.warning("Клавиша отмены недоступна")
+        if self.escape_result.ok:
+            self._escape_grabbed = True
+            self._escape_keycode = self.escape_result.keycode
+            self._external_escape_token = token
+            self._external_escape_callback = callback
+        return self.escape_result
+
+    def release_external_escape(self, token: object) -> None:
+        """Only the matching owner can release a lease; never call its callback."""
+        if token is not self._external_escape_token:
+            return
+        self._external_escape_token = None
+        self._external_escape_callback = None
+        if self.fsm.state == HotkeyState.IDLE:
+            self.backend.ungrab_escape()
+            self._escape_grabbed = False
+            self._escape_keycode = None
+
+    def _revoke_external_escape(self) -> None:
+        token = self._external_escape_token
+        if token is None or self._external_escape_revoking:
+            return
+        self._external_escape_revoking = True
+        callback = self._external_escape_callback
+        try:
+            # Cancel the owner's operation before taking its cancellation key away.
+            if callback is not None:
+                callback()
+        finally:
+            self.release_external_escape(token)
+            self._external_escape_revoking = False
 
     def signature(self, combo: str) -> tuple[int, int] | None:
         """Без захвата сравнивает сочетания по текущей карте X11."""
@@ -526,6 +578,7 @@ class HotkeyManager:
         return result if isinstance(result, tuple) and len(result) == 2 else None
 
     def grab(self, combo: str, mode: HotkeyMode) -> GrabResult:
+        self._revoke_external_escape()
         configure = getattr(self.backend, "configure", None)
         if configure is not None:
             configure(defer_super=self.defer_single_super and mode == HotkeyMode.PTT)
@@ -585,6 +638,7 @@ class HotkeyManager:
             cancel()
 
     def ungrab(self) -> None:
+        self._revoke_external_escape()
         self._event_generation += 1
         self.mapping_release_lost = False
         self._deferred_press = None
@@ -624,7 +678,7 @@ class HotkeyManager:
             self.escape_result = self.backend.grab_escape()
             self._escape_grabbed = self.escape_result.ok
             self._escape_keycode = self.escape_result.keycode
-        elif state == HotkeyState.IDLE:
+        elif state == HotkeyState.IDLE and self._external_escape_token is None:
             self.backend.ungrab_escape()
             self._escape_grabbed = False
             self._escape_keycode = None
@@ -633,6 +687,16 @@ class HotkeyManager:
 
     def handle_event(self, event: HotkeyEvent, now: float) -> GrabResult:
         """Передаёт одну клавишу автомату; пары автоповтора убирает очередь."""
+        if (
+            self._external_escape_token is not None
+            and self._escape_grabbed
+            and event.kind == "KeyPress"
+            and (event.escape or event.keycode == self._escape_keycode)
+        ):
+            external_callback = self._external_escape_callback
+            if external_callback is not None:
+                external_callback()
+            return GrabResult("ok")
         if self._combo is None:
             self.last_result = GrabResult("not-grabbed")
             return self.last_result
@@ -728,6 +792,12 @@ class HotkeyManager:
         """Обновляет коды и сообщает наружу как успех, так и отказ перезахвата."""
         self._deferred_press = None
         self._log_mapping(event)
+        if self._external_escape_token is not None and event.escape is not None:
+            self.escape_result = event.escape
+            self._escape_grabbed = event.escape.ok
+            self._escape_keycode = event.escape.keycode
+            if not event.escape.ok:
+                self._revoke_external_escape()
         if self._combo is None or self._combo not in event.combos:
             return
         self.last_result = event.combos[self._combo]

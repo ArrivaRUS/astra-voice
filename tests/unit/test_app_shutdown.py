@@ -50,6 +50,7 @@ class Rig:
         self.notify_install = Mock()
         self.notify_shutdown = Mock()
         self.runtime = Mock()
+        self.runtime.stats.summary.return_value = {"dictations": 0, "p50_ms": None, "p95_ms": None}
         self.runtime.on_quit_requested = None
         self.runtime.tray.on_quit = lambda: DictationRuntime._quit_requested(self.runtime)
         self.factory = Mock(return_value=self.runtime)
@@ -736,12 +737,15 @@ def test_onboarding_attaches_window_before_show(rig: Rig, hidden: bool) -> None:
     capture = properties["settingsBridge"].capture
     assert controller._window is root
     assert controller._window_visible is False
-    # Один фильтр снимает захват и передаёт мастеру события для очистки пробы.
-    assert root.installEventFilter.call_args_list == [call(capture)]
+    mouse_capture = properties["settingsBridge"]._mouse_capture
+    assert mouse_capture._window is root and not mouse_capture.active
+    # Оба редактора получают lifecycle окна до чтения видимости и первого show.
+    assert root.installEventFilter.call_args_list == [call(capture), call(mouse_capture)]
     calls = rig.calls.mock_calls
     capture_attached = calls.index(call.attach_filter(capture))
+    mouse_attached = calls.index(call.attach_filter(mouse_capture))
     read = calls.index(call.read_visibility())
-    assert capture_attached < read < calls.index(call.exec())
+    assert capture_attached < mouse_attached < read < calls.index(call.exec())
     if hidden:
         rig.focuser.focus_shell.assert_not_called()
     else:

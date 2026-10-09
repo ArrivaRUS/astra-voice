@@ -111,6 +111,13 @@ def render(width: int, state: str, wizard: bool) -> Iterator[tuple[Any, ...]]:
         QTest.qWait(80)
         assert window.width() == width
         if not wizard:
+            sidebar = next(
+                item
+                for item in tree(window.contentItem())
+                if item.metaObject().indexOfProperty("sections") >= 0
+            )
+            sidebar.setProperty("currentIndex", 4)  # existing Advanced navigation entry
+            QTest.qWait(40)
             editor = next(
                 item
                 for item in tree(window.contentItem())
@@ -152,8 +159,9 @@ def test_command_editor_content_padding_and_neighbor_rows(
             assert not messages, messages
             return
         content = [item for item in tree(editor) if item.isVisible()]
-        row = next(item for item in content if item.property("label") == "Команда помощнику")
-        label = next(item for item in content if item.property("text") == "Команда помощнику")
+        row_label = "Команда помощнику" if wizard else "Клавиша команды"
+        row = next(item for item in content if item.property("label") == row_label)
+        label = next(item for item in content if item.property("text") == row_label)
         assert box(label, editor).left() == pytest.approx(14, abs=1), (
             "Header must not get double padding"
         )
@@ -162,7 +170,7 @@ def test_command_editor_content_padding_and_neighbor_rows(
             intro = next(
                 item
                 for item in content
-                if str(item.property("text")).startswith("Win запускает запись")
+                if str(item.property("text")).startswith("Win используется для записи")
             )
             padded.append(intro)
             assert box(intro, editor).left() == pytest.approx(14, abs=1)
@@ -179,9 +187,9 @@ def test_command_editor_content_padding_and_neighbor_rows(
             win_buttons = [
                 action_buttons[text] for text in ("Левая Win", "Правая Win", "Проверить снова")
             ]
-            assert box(win_buttons[0], editor).top() - box(intro, editor).bottom() == pytest.approx(
-                8, abs=1
-            )
+            assert box(win_buttons[0], editor).top() - box(
+                intro.parentItem(), editor
+            ).bottom() == pytest.approx(8, abs=1)
             for left, right in zip(win_buttons, win_buttons[1:], strict=False):
                 assert box(right, editor).left() - box(left, editor).right() == pytest.approx(
                     8, abs=1
@@ -247,7 +255,9 @@ def test_command_editor_buttons_keep_real_bridge_contract(wizard: bool) -> None:
         assert bridge.captureRole == "command" and bridge.captureState == "capturing"
         capture.begin_capture.assert_called_once_with()
         field = next(item for item in tree(editor) if item.property("state7") == "capturing")
+        ends_before_cancel = capture.end_capture.call_count
         QMetaObject.invokeMethod(field, "cancelRequested", Qt.DirectConnection)
         assert bridge.captureState == "idle"
-        capture.end_capture.assert_called_once_with()
+        assert capture.end_capture.call_count == ends_before_cancel + 1
+        capture.end_capture.assert_called_with()
         assert not messages, messages

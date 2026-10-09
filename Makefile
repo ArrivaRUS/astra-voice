@@ -17,7 +17,7 @@ test:
 	$(PYTEST) -m unit
 
 test-xvfb:
-	QT_QPA_PLATFORM=xcb xvfb-run -a timeout -s ABRT -k 30 600 $(PYTEST) -m xvfb
+	QT_QPA_PLATFORM=xcb xvfb-run -a env ASTRA_VOICE_TEST_X11_ISOLATED=1 timeout -s ABRT -k 30 600 $(PYTEST) -m xvfb
 
 test-engine:
 	$(PYTEST) -m engine

@@ -37,6 +37,11 @@ def is_valid_command_combo(combo: str) -> bool:
     return combo.strip().lower() in {"super_l", "super_r", "win", "super"} or is_valid_combo(combo)
 
 
+def is_valid_command_mouse_button(button: object) -> bool:
+    """Только логическая средняя или дополнительная кнопка; bool не номер."""
+    return type(button) is int and (button == 2 or 8 <= button <= 31)
+
+
 @dataclass
 class Settings:
     """Значения настроек. Незнакомые ключи сохраняются в ``extra``."""
@@ -47,6 +52,8 @@ class Settings:
     command_hotkey: str = "Super_L"
     command_enabled: bool = True
     command_preview: bool = False
+    command_mouse_enabled: bool = False
+    command_mouse_button: int = 2
     pill_enabled: bool = True
     autostart: bool = True  # PRD, экран 5 онбординга (решение заказчика)
     model_id: str | None = None
@@ -130,6 +137,14 @@ def from_dict(data: dict[str, Any]) -> Settings:
         settings.command_enabled = False
     if "command_enabled" in values and not isinstance(values["command_enabled"], bool):
         settings.command_enabled = False
+    if "command_mouse_button" in values and not is_valid_command_mouse_button(
+        values["command_mouse_button"]
+    ):
+        log.warning("command_mouse_button недопустим, управление мышью выключено")
+        settings.command_mouse_button = Settings.command_mouse_button
+        settings.command_mouse_enabled = False
+    if "command_mouse_enabled" in values and type(values["command_mouse_enabled"]) is not bool:
+        settings.command_mouse_enabled = False
     if settings.hotkey_mode not in HOTKEY_MODES:
         log.warning("hotkey_mode=%r неизвестен, беру 'ptt'", settings.hotkey_mode)
         settings.hotkey_mode = "ptt"
