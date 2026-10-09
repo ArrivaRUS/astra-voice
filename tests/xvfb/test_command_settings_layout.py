@@ -237,8 +237,11 @@ def test_command_editor_buttons_keep_real_bridge_contract(wizard: bool) -> None:
         QMetaObject.invokeMethod(controls["Левая Win"], "clicked", Qt.DirectConnection)
         assert bridge.commandHotkey == "Super_L"
         assert host.reload_command_hotkey.call_count == 2
+        # First show has already refreshed status through the late settings bridge.
+        refreshes_before_click = host.refresh_command_status.call_count
         QMetaObject.invokeMethod(controls["Проверить снова"], "clicked", Qt.DirectConnection)
-        host.refresh_command_status.assert_called_once_with()
+        assert host.refresh_command_status.call_count == refreshes_before_click + 1
+        host.refresh_command_status.assert_called_with()
         QMetaObject.invokeMethod(controls["Выбрать другую"], "clicked", Qt.DirectConnection)
         QTest.qWait(30)
         assert bridge.captureRole == "command" and bridge.captureState == "capturing"
