@@ -330,6 +330,7 @@ jobs:
           name: astra-voice-appimage
           path: |
             dist/Astra_Voice-*.AppImage
+            dist/Astra_Voice-*.AppImage.tar.gz
             dist/sbom-appimage.cdx.json
           if-no-files-found: error
 

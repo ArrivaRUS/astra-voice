@@ -177,9 +177,12 @@ class DictationOrchestrator:
         on_silent: Callable[[], None] | None = None,
         on_success: Callable[[float | None, float | None, bool], None] | None = None,
         on_idle: Callable[[], None] | None = None,
+        recording_cue: Callable[[str, tuple[int, str]], None] | None = None,
         command_mode: CommandMode | None = None,
         command_preview: Callable[[str, Callable[[], None]], bool] | None = None,
     ) -> None:
+        self._recording_cue = recording_cue
+        self._cue_sessions: dict[tuple[int, str], bool] = {}
         self.command_mode = command_mode
         self._command_preview = command_preview
         self.mode = "text"
@@ -628,6 +631,11 @@ class DictationOrchestrator:
             return
         self._t0 = self._clock()
         self._change_phase(DictationPhase.RECORDING)
+        if not self.test_active and self._recording_cue is not None:
+            # Ограниченное ожидание позднего закрытия источника после result/error.
+            if len(self._cue_sessions) >= 8:
+                self._cue_sessions.pop(next(iter(self._cue_sessions)))
+            self._cue_sessions[(self._worker_generation, self._utterance_id)] = False
         if not self._command(message, timeout=timeout):
             self._hotkey_cancel()
             return
@@ -724,9 +732,35 @@ class DictationOrchestrator:
         )
         self._later(PROCESSING_WATCHDOG_MS, self._watchdog)
 
+    def _recording_boundary(self, event: dict[str, Any]) -> None:
+        generation, uid = event.get("generation"), event.get("utterance_id")
+        if type(generation) is not int or not isinstance(uid, str):
+            return
+        key = (generation, uid)
+        if generation != self._generation() or key not in self._cue_sessions:
+            return
+        callback = self._recording_cue
+        if event["type"] == "record.stopped":
+            started = self._cue_sessions.pop(key)
+            if started and callback is not None:
+                self._safe_ui(lambda: callback("stop", key), "звук остановки недоступен")
+        elif not self._cue_sessions[key]:
+            if (
+                key != (self._worker_generation, self._utterance_id)
+                or self._phase != DictationPhase.RECORDING
+                or self._cancel_requested
+            ):
+                return
+            self._cue_sessions[key] = True
+            if callback is not None:
+                self._safe_ui(lambda: callback("start", key), "звук начала недоступен")
+
     def on_worker_event(self, event: dict[str, Any]) -> None:
         """Отбрасывает чужие результаты до чтения содержимого распознанной речи."""
         if self._closed:
+            return
+        if event.get("type") in ("record.started", "record.stopped"):
+            self._recording_boundary(event)
             return
         if self._level_callback is not None:
             try:

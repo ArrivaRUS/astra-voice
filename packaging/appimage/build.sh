@@ -18,7 +18,7 @@
 #                               индексы), debs/, sources/  (~/.cache/astra-voice-dev/appimage; кэш CI)
 #   ASTRA_VOICE_WHEEL_CACHE     колёса onnxruntime/onnx-asr от .deb (~/.cache/astra-voice-dev/wheels)
 #   ASTRA_VOICE_APPIMAGE_WORK   рабочий: AppDir, tmp, временный HOME (<репо>/.build/appimage)
-#   ASTRA_VOICE_APPIMAGE_OUT    результат: .AppImage и sbom-appimage.cdx.json (<репо>/dist)
+#   ASTRA_VOICE_APPIMAGE_OUT    результат: .AppImage, .AppImage.tar.gz и sbom-appimage.cdx.json (<репо>/dist)
 #
 # Бандловый Python запускается только в изоляции: без дисплея, шины сессии, звука и
 # с временным HOME. От root (контейнер CI) запуск программы идёт под nobody через
@@ -553,6 +553,10 @@ leftovers=$(find "$WORK/tmp" -mindepth 1 -maxdepth 1 -print)
 [ -z "$leftovers" ] || die "в рабочем TMPDIR остались файлы: $leftovers"
 host_leftovers=$(find "$HOST_TMP" -maxdepth 1 -name 'appimage_extracted_*' -newer "$STAMP" -print 2>/dev/null || true)
 [ -z "$host_leftovers" ] || die "в $HOST_TMP появились распаковки AppImage: $host_leftovers"
+
+chmod 755 "$IMAGE"
+say 'архив для передачи AppImage с исполняемыми правами'
+python3 "$HERE/archive.py" "$IMAGE"
 
 size=$(stat -c %s "$IMAGE")
 digest=$(sha256sum "$IMAGE" | cut -d' ' -f1)

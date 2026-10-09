@@ -160,6 +160,7 @@ echo "  astra-voice_${version}_amd64.deb"
 echo '  sbom.cdx.json'
 if $appimage; then
     echo "  Astra_Voice-${version}-x86_64.AppImage (packaging/appimage/ENABLED)"
+    echo "  Astra_Voice-${version}-x86_64.AppImage.tar.gz (один AppImage, права 0755)"
     echo '  sbom-appimage.cdx.json'
     echo "  astra-voice-${version}-sources.tar.xz (исходники поставляемых версий, R3.6)"
 else

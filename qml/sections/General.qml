@@ -12,6 +12,7 @@ Column {
     readonly property var settings: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
     readonly property string hotkeyStatus: settings ? settings.hotkeyStatus : "ok"
     readonly property string saveError: root.settings ? root.settings.saveError : ""
+    readonly property string soundCuesStatus: root.settings ? root.settings.soundCuesStatus : ""
     readonly property string micError: root.settings ? root.settings.microphoneError : ""
     readonly property string modelSelfcheck: root.settings ? root.settings.modelSelfcheck : ""
 
@@ -527,14 +528,33 @@ Column {
         }
 
         SettingRow {
+            objectName: "soundCuesRow"
             width: parent.width
             label: qsTr("Звук начала и конца записи")
+            sub: root.soundCuesStatus
             toggle: soundToggle
+            rowEnabled: soundToggle.enabled
 
             AvToggle {
                 id: soundToggle
-                checked: false
+                objectName: "soundCuesToggle"
+                enabled: root.settings !== null
+                Accessible.name: qsTr("Звук начала и конца записи")
+                Accessible.description: root.soundCuesStatus
                 Layout.alignment: Qt.AlignVCenter
+
+                Binding {
+                    target: soundToggle
+                    property: "checked"
+                    value: root.settings ? root.settings.soundCuesEnabled : false
+                }
+
+                onCheckedChanged: {
+                    if (root.settings && root.settings.soundCuesEnabled !== checked)
+                        root.settings.soundCuesEnabled = checked
+                    // Сохранение может откатиться; показываем подтверждённое значение.
+                    checked = root.settings ? root.settings.soundCuesEnabled : false
+                }
             }
         }
 

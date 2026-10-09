@@ -34,7 +34,7 @@ if [ -f "$ROOT/packaging/appimage/ENABLED" ]; then
         die 'packaging/appimage.lock не прошёл проверку формата'
     [ -z "$todo" ] || die "в packaging/appimage.lock колёса без хэша (TODO-HASH): $(echo "$todo" | tr '\n' ' ')"
     # Архив исходников поставляемых версий (R3.6) публикуется вместе с образом.
-    files+=("$IMAGE" sbom-appimage.cdx.json "astra-voice-$VERSION-sources.tar.xz")
+    files+=("$IMAGE" "$IMAGE.tar.gz" sbom-appimage.cdx.json "astra-voice-$VERSION-sources.tar.xz")
     latest_args+=(--appimage)
     say "AppImage включён: $IMAGE"
 else
@@ -45,13 +45,17 @@ for name in "${files[@]}"; do
 done
 # Посторонние пакеты и образы в каталоге выпуска — признак грязной сборки.
 shopt -s nullglob
-for path in "$DIST"/*.deb "$DIST"/*.AppImage; do
+for path in "$DIST"/*.deb "$DIST"/*.AppImage "$DIST"/*.AppImage.tar.gz; do
     name=$(basename "$path")
     [ "$name" = "$DEB" ] && continue
-    [ "$name" = "$IMAGE" ] && [ ${#latest_args[@]} -gt 0 ] && continue
+    { [ "$name" = "$IMAGE" ] || [ "$name" = "$IMAGE.tar.gz" ]; } &&
+        [ ${#latest_args[@]} -gt 0 ] && continue
     die "посторонний артефакт в $DIST: $name"
 done
 shopt -u nullglob
+if [ ${#latest_args[@]} -gt 0 ]; then
+    python3 "$ROOT/packaging/appimage/archive.py" --check "$DIST/$IMAGE"
+fi
 
 for source in docs/INSTALL-ADMIN.md docs/SECURITY.md data/keys/release.gpg; do
     [ -f "$ROOT/$source" ] || die "нет $source"

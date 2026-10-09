@@ -36,6 +36,7 @@ class FakeLogin:
                 "Seat": ["seat0", "/org/freedesktop/login1/seat/seat0"],
                 "Display": ":99",
                 "LockedHint": False,
+                "Active": True,
             }
         }
         self.sleeping = False
@@ -248,3 +249,139 @@ def test_stop_unsubscribes_and_ignores_pending_response(
     assert not cache.is_admissible()
     assert not cache.known
     assert fake.closed == 1
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_login1_active_is_published_by_worker_and_command_guard(
+    session: tuple[SessionState, FakeLogin], monkeypatch: pytest.MonkeyPatch, active: bool
+) -> None:
+    from astra_voice.platform import session_state as module
+
+    cache, fake = session
+    monkeypatch.setattr(module, "_fly_process_present", lambda: False)
+    worker = module._SessionWorker()
+    worker._fly_environment = False
+    worker.state = cache
+    cache.changed.connect(worker._changed)
+    fake.props[SESSION_PATH]["Active"] = active
+    cache.start()
+    fake.complete()
+    assert cache.known and cache.active is active
+    assert worker.snapshot.active is active
+    assert worker.snapshot.allowed is active  # Existing command guard, real producer.
+
+
+@pytest.mark.parametrize("invalidated", [False, True])
+def test_active_changed_invalidates_then_rereads_before_admission(
+    session: tuple[SessionState, FakeLogin], monkeypatch: pytest.MonkeyPatch, invalidated: bool
+) -> None:
+    from astra_voice.platform import session_state as module
+
+    cache, fake = session
+    monkeypatch.setattr(module, "_fly_process_present", lambda: False)
+    worker = module._SessionWorker()
+    worker._fly_environment = False
+    worker.state = cache
+    cache.changed.connect(worker._changed)
+    cache.start()
+    fake.complete()
+    before = worker.snapshot.cue_epoch
+    assert worker.snapshot.allowed
+    fake.props[SESSION_PATH]["Active"] = False
+    fake.signal(
+        SESSION_PATH,
+        "PropertiesChanged",
+        SESSION,
+        {} if invalidated else {"Active": False},
+        ["Active"] if invalidated else [],
+    )
+    assert not cache.known and not worker.snapshot.active and not worker.snapshot.allowed
+    assert worker.snapshot.cue_epoch > before
+    fake.complete()
+    assert cache.known and not worker.snapshot.active and not worker.snapshot.allowed
+    fake.props[SESSION_PATH]["Active"] = True
+    fake.signal(SESSION_PATH, "PropertiesChanged", SESSION, {"Active": True}, [])
+    assert not cache.known
+    fake.complete()
+    assert worker.snapshot.active and worker.snapshot.allowed
+
+
+@pytest.mark.parametrize("value", [None, "true", 1, 0, [], {}])
+def test_active_missing_or_nonbool_keeps_session_unknown(
+    session: tuple[SessionState, FakeLogin], value: object
+) -> None:
+    cache, fake = session
+    if value is None:
+        fake.props[SESSION_PATH].pop("Active")
+    else:
+        fake.props[SESSION_PATH]["Active"] = value
+    cache.start()
+    fake.complete()
+    assert not cache.known and not cache.active and not cache.is_admissible()
+
+
+@pytest.mark.parametrize("fly", [False, True])
+def test_real_producer_epoch_rejects_old_cue_before_queued_gui_delivery(
+    session: tuple[SessionState, FakeLogin], monkeypatch: pytest.MonkeyPatch, fly: bool
+) -> None:
+    from types import SimpleNamespace
+    from typing import cast
+    from unittest.mock import Mock
+
+    from PyQt5.QtCore import Qt
+
+    from astra_voice.core.recording_cues import RecordingCues
+    from astra_voice.platform import session_state as module
+    from astra_voice.runtime import DictationRuntime
+
+    cache, fake = session
+    monkeypatch.setattr(module, "_fly_process_present", lambda: fly)
+    worker = module._SessionWorker()
+    worker._fly_environment = fly
+    worker.state = cache
+    cache.changed.connect(worker._changed)
+    # No QCoreApplication.processEvents: simulate delayed GUI dispatch while
+    # the real producer keeps publishing immutable snapshots in its own thread.
+    gui_callbacks: list[object] = []
+    worker.updated.connect(gui_callbacks.append, Qt.QueuedConnection)
+    cache.start()
+    fake.complete()
+    assert worker.snapshot.known and worker.snapshot.active
+    assert worker.snapshot.supported is not fly
+    host = cast(
+        DictationRuntime,
+        SimpleNamespace(
+            _closed=False, _command_session=SimpleNamespace(snapshot=lambda: worker.snapshot)
+        ),
+    )
+
+    def admission() -> tuple[bool, int, int]:
+        return DictationRuntime._cue_admission(host)
+
+    spawn = Mock(side_effect=AssertionError("Must not spawn old cue"))
+    player = RecordingCues(enabled=True, available=lambda: True, popen=spawn, admission=admission)
+    # Keep the queue pending; all readiness/epoch checks use production methods.
+    monkeypatch.setattr(player, "_run", lambda: None)
+    try:
+        player.play("start", (1, "u"))
+        cue = player._queue[0]
+        assert player._valid(cue)
+        old_cue_epoch, old_command_epoch = worker.snapshot.cue_epoch, worker.snapshot.blocked_epoch
+        cache.refresh()  # known→unknown, including on Fly where supported=False
+        assert not worker.snapshot.known
+        fake.complete()  # known again, still no GUI dispatch
+        assert admission()[0] is True
+        assert worker.snapshot.cue_epoch > old_cue_epoch
+        if fly:
+            assert worker.snapshot.blocked_epoch == old_command_epoch
+        else:
+            assert worker.snapshot.blocked_epoch > old_command_epoch
+        assert gui_callbacks == []
+        assert not player._valid(cue)
+        player._play(cue, {}, 0)
+        spawn.assert_not_called()
+        player._queue.clear()
+        player.play("stop", (1, "u"))
+        assert not player._queue  # Old session's stop is rejected as well.
+    finally:
+        player.shutdown()

@@ -28,9 +28,9 @@ LOGIN_PATH_PREFIX = "/org/freedesktop/login1/session/"
 #: Name of the private system-bus connection opened by :class:`QtLogin1Transport`.
 CONNECTION_NAME = "astra-voice-login1"
 # Properties that decide admission (§9): a change to any of them forces a
-# re-read; other Session properties (IdleHint, Active, …) do not churn the cache.
+# re-read; other Session properties (IdleHint, …) do not churn the cache.
 _CHECKED_PROPERTIES = frozenset(
-    {"LockedHint", "User", "Class", "Type", "Remote", "Seat", "Display", "Desktop"}
+    {"LockedHint", "Active", "User", "Class", "Type", "Remote", "Seat", "Display", "Desktop"}
 )
 ReadCallback = Callable[[Any, bool], None]
 # Unknown is not sticky (Voice answer 28.09, п. 8б): after a read error/timeout or
@@ -200,6 +200,7 @@ class SessionState(QObject):
         self.now_mono_ms = now_mono_ms
         self.locked = True
         self.known = False
+        self.active = False
         self.suspending = False
         self.sleep_start_mono_ms: int | None = None
         self.generation = 0
@@ -226,7 +227,7 @@ class SessionState(QObject):
         self._retry_timer.timeout.connect(self._retry)
 
     def is_admissible(self) -> bool:
-        return self.known and not self.locked and not self.suspending
+        return self.known and self.active and not self.locked and not self.suspending
 
     def lock_unconfirmed(self) -> bool:
         """Lock latch holds without confirmation (review minor-4, ИБ T2 Ф1).
@@ -239,6 +240,7 @@ class SessionState(QObject):
 
     def _unknown(self) -> None:
         self.known = False
+        self.active = False
         self.changed.emit()
 
     def _invalidate(self) -> None:
@@ -485,6 +487,7 @@ class SessionState(QObject):
             or not isinstance(props["Display"], str)
             or not props["Display"]
             or type(props["LockedHint"]) is not bool
+            or type(props.get("Active")) is not bool
         ):
             raise ValueError
         hint = props["LockedHint"]
@@ -499,6 +502,7 @@ class SessionState(QObject):
                 self._unlock_requested = False
                 self._hint_true_seen = False
         self.locked = hint or self.lock_requested
+        self.active = props["Active"]
         self.known = True
         self._retry_ms = RETRY_FIRST_MS
         self._retry_timer.stop()
@@ -604,6 +608,7 @@ class _SessionWorker(QObject):
         self._fly_process = True
         self._fly_checked = 0.0
         self._blocked_epoch = 0
+        self._cue_epoch = 0
         self._sleep_epoch = 0
 
     @pyqtSlot()
@@ -643,6 +648,18 @@ class _SessionWorker(QObject):
             or self._fly_process
             or "fly" in (self.state.desktop or "").lower()
         )
+        cue_allowed = self.state.is_admissible() and not self.state.lock_requested
+        previous_cue_allowed = (
+            self.snapshot.known
+            and self.snapshot.active
+            and not self.snapshot.locked
+            and not self.snapshot.lock_requested
+            and not self.snapshot.preparing_for_sleep
+        )
+        # Fly may always be unsupported for Cowork. Cue invalidation must still
+        # latch known→unknown/inactive/locked until queued GUI callbacks arrive.
+        if previous_cue_allowed and not cue_allowed:
+            self._cue_epoch += 1
         allowed = self.state.is_admissible() and not unsupported
         if (
             (self.snapshot.allowed and not allowed)
@@ -655,11 +672,12 @@ class _SessionWorker(QObject):
         self.snapshot = SessionSnapshot(
             known=self.state.known,
             locked=self.state.locked,
-            active=True,
+            active=self.state.active,
             preparing_for_sleep=self.state.suspending,
             lock_requested=self.state.lock_requested,
             supported=not unsupported,
             blocked_epoch=self._blocked_epoch,
+            cue_epoch=self._cue_epoch,
             sleep_epoch=self._sleep_epoch,
         )
         self.updated.emit(self.snapshot)

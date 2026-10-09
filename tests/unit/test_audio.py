@@ -1169,6 +1169,7 @@ class CaptureProbe:
         self.sink = sink
         self.error_sink = on_error
         self.events: Queue[tuple[float, Message]] = Queue()
+        self.boundaries: Queue[tuple[float, Message]] = Queue()
         self.errors: Queue[tuple[str, str, str]] = Queue()
         self.samples: list[array[float]] = []
         self.accepted: list[bool] = []
@@ -1197,7 +1198,10 @@ class CaptureProbe:
     def on_event(self, event: Message) -> None:
         """Сохраняет событие вместе с показанием виртуальных часов."""
         assert decode(encode(event)[4:]) == event
-        self.events.put((self.now, event))
+        if event["type"] in ("record.started", "record.stopped"):
+            self.boundaries.put((self.now, event))
+        else:
+            self.events.put((self.now, event))
 
     def on_error(self, uid: str, code: str, message: str) -> None:
         """Сохраняет ошибку и при необходимости передаёт её автомату."""
@@ -2744,7 +2748,10 @@ def test_record_deadline_stops_blocked_capture_without_samples(
         assert entered.wait(0.5)
         owner = capture._thread
         assert owner is not None and owner.daemon
-        on_event.assert_called_once_with({"type": "audio.ready"})
+        assert [call.args[0] for call in on_event.call_args_list] == [
+            {"type": "audio.ready"},
+            {"type": "record.started", "utterance_id": "blocked"},
+        ]
         request_stop = Mock(wraps=capture.request_stop)
         monkeypatch.setattr(capture, "request_stop", request_stop)
 

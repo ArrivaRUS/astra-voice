@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,7 @@ def make_repo(tmp_path: Path, *, enabled: bool) -> Path:
         flag.parent.mkdir(parents=True)
         flag.write_text("# флаг\n", encoding="utf-8")
         shutil.copy2(ROOT / "packaging/appimage/lockfile.py", flag.parent / "lockfile.py")
+        shutil.copy2(ROOT / "packaging/appimage/archive.py", flag.parent / "archive.py")
         (repo / "packaging" / "appimage.lock").write_text(LOCK, encoding="utf-8")
     dist = repo / "dist"
     dist.mkdir()
@@ -63,6 +65,11 @@ def make_repo(tmp_path: Path, *, enabled: bool) -> Path:
     (dist / "sbom.cdx.json").write_text("{}\n", encoding="utf-8")
     if enabled:
         (dist / IMAGE).write_bytes(b"\x7fELF\x02\x01\x01\x00AI\x02" + b"\0" * 100)
+        subprocess.run(
+            [sys.executable, str(flag.parent / "archive.py"), str(dist / IMAGE)],
+            check=True,
+            capture_output=True,
+        )
         (dist / "sbom-appimage.cdx.json").write_text("{}\n", encoding="utf-8")
         (dist / f"astra-voice-{VERSION}-sources.tar.xz").write_bytes(b"xz")
     return repo
@@ -108,6 +115,7 @@ def test_with_appimage(tmp_path: Path) -> None:
         DEB,
         "sbom.cdx.json",
         IMAGE,
+        IMAGE + ".tar.gz",
         "sbom-appimage.cdx.json",
         f"astra-voice-{VERSION}-sources.tar.xz",
         "INSTALL-ADMIN.md",
@@ -196,3 +204,31 @@ def test_enabled_refuses_unpinned_wheels(tmp_path: Path, script: str) -> None:
     assert result.returncode == 1
     assert "колёса без хэша (TODO-HASH): jsonschema==4.10.3" in result.stderr
     assert not (repo / "dist" / "SHA256SUMS").exists()
+
+
+def test_enabled_requires_transport_archive(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, enabled=True)
+    archive = repo / "dist" / (IMAGE + ".tar.gz")
+    archive.unlink()
+    result = run(repo)
+    assert result.returncode == 1
+    assert f"нет артефакта {archive}" in result.stderr
+
+
+def test_transport_archive_must_match_raw_appimage(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, enabled=True)
+    (repo / "dist" / IMAGE).write_bytes(b"new build")
+    result = run(repo)
+    assert result.returncode == 1
+    assert "архив должен содержать один AppImage" in result.stderr
+    assert not (repo / "dist" / "SHA256SUMS").exists()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_stray_transport_archive_rejected(tmp_path: Path, enabled: bool) -> None:
+    repo = make_repo(tmp_path, enabled=enabled)
+    name = "Astra_Voice-0.0.9-x86_64.AppImage.tar.gz"
+    (repo / "dist" / name).write_bytes(b"stale")
+    result = run(repo)
+    assert result.returncode == 1
+    assert f"посторонний артефакт в {repo / 'dist'}: {name}" in result.stderr

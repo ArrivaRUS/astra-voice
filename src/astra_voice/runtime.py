@@ -40,6 +40,7 @@ from astra_voice.core.model_source import (
     smoke_matches,
     smoke_wav_path,
 )
+from astra_voice.core.recording_cues import RecordingCues
 from astra_voice.core.settings import Settings, is_valid_combo, is_valid_command_mouse_button
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
 from astra_voice.platform.cowork import (
@@ -167,6 +168,7 @@ class DictationRuntime(QObject):
         guard_factory: Callable[..., IndicatorGuard] = IndicatorGuard,
         provider_factory: Callable[[SessionKind], TrayIconProvider] = TrayIconProvider,
         capture_watchdog_factory: Callable[[], CaptureFieldWatchdog] = CaptureFieldWatchdog,
+        cues_factory: Callable[..., RecordingCues] = RecordingCues,
         sound_factory: Callable[[SessionKind], SoundControl] = lambda kind: SoundControl(
             session=kind
         ),
@@ -257,6 +259,11 @@ class DictationRuntime(QObject):
         self._announced_mic_problems: set[MicrophoneProblem] = set()
         self._started = False
         self._closed = False
+        self.recording_cues = cues_factory(
+            enabled=settings.sound_cues_enabled, admission=self._cue_admission
+        )
+        self.on_sound_cues_changed: Callable[[], None] | None = None
+        self._last_cues_status = self.recording_cues.status
         self._appimage_removal_reserved = False
         self._loading_model = False
         self._model_load_generation: int | None = None
@@ -297,6 +304,7 @@ class DictationRuntime(QObject):
         self.timers: set[QTimer] = set()
         rollback: list[tuple[str, Callable[[], object]]] = [
             ("объекты Qt", self._delete_build_children),
+            ("звуковые сигналы", self.recording_cues.shutdown),
         ]
         try:
             self.x11 = x11_factory()
@@ -334,6 +342,7 @@ class DictationRuntime(QObject):
                 hotkey_cancel=self._input_cancel,
                 hotkey_idle=self._input_idle,
                 set_recording=self.guard.set_recording,
+                recording_cue=self._recording_cue,
                 paste_mode=self.paste_mode,
                 record_params=self.record_params,
                 stats=self.stats,
@@ -896,7 +905,7 @@ class DictationRuntime(QObject):
         if not self.command_installed or self._command_client is not None:
             return
         self._command_client = CoworkClient(self)
-        self._command_session = SessionMonitor(self)
+        self._ensure_session_monitor()
         self._command_mode = CommandMode(
             client=self._command_client,
             session=self._command_snapshot,
@@ -917,7 +926,6 @@ class DictationRuntime(QObject):
         self._command_client.set_model_guard(self._command_model_trusted)
         self._command_client.owner_changed.connect(self._command_owner_changed)
         self._command_client.status_changed.connect(self._command_status_changed)
-        self._command_session.changed.connect(self._command_session_changed)
         self.command_hotkey = self._command_hotkey_factory()
         self.command_hotkey.on_state = self._on_command_hotkey_state
         self.tray.on_command_details = self.show_command_details
@@ -931,9 +939,58 @@ class DictationRuntime(QObject):
         notify.set_action_handler("command-details", self.show_command_details)
         notify.set_action_handler("command-launch", self.launch_cowork)
         self._command_client.start()
-        self._command_session.start()
         # Unknown startup state keeps command key ungrabbed until login1 is verified.
         self.reload_command_hotkey()
+
+    def _ensure_session_monitor(self) -> None:
+        # Один monitor/connection для Cowork и звуков, включая установку Cowork
+        # после включения звуков. Конструктор runtime не соединяется с D-Bus.
+        if self._command_session is None and not self._closed:
+            self._command_session = SessionMonitor(self)
+            self._command_session.changed.connect(self._session_changed)
+            self._command_session.start()
+
+    def _ensure_cues_session(self) -> None:
+        try:
+            self._ensure_session_monitor()
+        except Exception:
+            # Звук опционален: даже отказ инфраструктуры сеанса не отменяет
+            # запись, сохранение настройки или запуск обычной диктовки.
+            log.warning("Не удалось проверить состояние сеанса для звуковых сигналов")
+
+    def _cue_admission(self) -> tuple[bool, int, int]:
+        # Только чтение опубликованного immutable snapshot; допускается в playback
+        # thread, без вызовов Qt/D-Bus. supported ограничивает Cowork, но не Fly cues.
+        monitor = self._command_session
+        if self._closed or monitor is None:
+            return False, -1, -1
+        snapshot = monitor.snapshot()
+        allowed = (
+            snapshot.known
+            and snapshot.active
+            and not snapshot.locked
+            and not snapshot.lock_requested
+            and not snapshot.preparing_for_sleep
+        )
+        return allowed, snapshot.cue_epoch, snapshot.sleep_epoch
+
+    def _configure_cues_session(self, snapshot: SessionSnapshot) -> None:
+        allowed = (
+            snapshot.known
+            and snapshot.active
+            and not snapshot.locked
+            and not snapshot.lock_requested
+            and not snapshot.preparing_for_sleep
+        )
+        self.recording_cues.configure(enabled=self.settings.sound_cues_enabled, allowed=allowed)
+        self._publish_cues_status()
+
+    def _session_changed(self, snapshot: SessionSnapshot) -> None:
+        if self._closed:
+            return
+        self._configure_cues_session(snapshot)
+        if self._command_client is not None:
+            self._command_session_changed(snapshot)
 
     def _command_snapshot(self) -> SessionSnapshot:
         if self._command_session is None or self.session_kind != SessionKind.KDE:
@@ -1002,6 +1059,7 @@ class DictationRuntime(QObject):
             if transition is not None
             else (self._command_session.snapshot() if self._command_session else SessionSnapshot())
         )
+        self._configure_cues_session(snapshot)
         if not snapshot.allowed or not self._command_snapshot().allowed:
             self._stop_mouse("session")
             self._invalidate_mouse_capture()
@@ -2399,6 +2457,39 @@ class DictationRuntime(QObject):
         self._on_device_resolved = callback
         return self._resolved_device
 
+    @property
+    def sound_cues_status(self) -> str:
+        if self.settings.sound_cues_enabled and not self._cue_admission()[0]:
+            return (
+                "Звуковые сигналы приостановлены: сеанс заблокирован или его состояние неизвестно"
+            )
+        return self.recording_cues.status
+
+    def apply_sound_cues_enabled(self, value: bool) -> None:
+        self.settings.sound_cues_enabled = value is True
+        if value:
+            self._ensure_cues_session()
+        self.recording_cues.configure(enabled=value, allowed=self._cue_admission()[0])
+        self._publish_cues_status()
+
+    def _recording_cue(self, kind: str, key: tuple[int, str]) -> None:
+        if self._closed:
+            return
+        if self.settings.sound_cues_enabled:
+            self._ensure_cues_session()
+        self.recording_cues.configure(
+            enabled=self.settings.sound_cues_enabled, allowed=self._cue_admission()[0]
+        )
+        self.recording_cues.play(kind, key)
+        self._publish_cues_status()
+
+    def _publish_cues_status(self) -> None:
+        status = self.sound_cues_status
+        if status != self._last_cues_status:
+            self._last_cues_status = status
+            if self.on_sound_cues_changed is not None:
+                self.on_sound_cues_changed()
+
     def apply_pill_enabled(self, value: bool) -> None:
         """Меняет видимость индикатора и соответствующее состояние трея."""
         self.pill.set_enabled(value)
@@ -2673,6 +2764,8 @@ class DictationRuntime(QObject):
         """Поднимает ресурсы один раз; недоступный хоткей не мешает работе UI."""
         if self._started or self._closed:
             return
+        if self.settings.sound_cues_enabled:
+            self._ensure_cues_session()
         self._started = True
         for key in _NOTIFICATION_ACTIONS:
             notify.set_action_handler(key, self._show_requested)
@@ -2796,6 +2889,7 @@ class DictationRuntime(QObject):
     def _tick_hotkey(self) -> None:
         """Даёт готовому автомату проверить предел длительности фразы."""
         if not self._closed:
+            self._publish_cues_status()
             self.hotkey.fsm.tick(monotonic())
             if self.command_hotkey is not None and self._input_owner in (None, "keyboard"):
                 self.command_hotkey.tick(monotonic())
@@ -2851,6 +2945,8 @@ class DictationRuntime(QObject):
         if self._closed:
             return
         self._closed = True
+        self.on_sound_cues_changed = None
+        self._cleanup("звуковые сигналы", self.recording_cues.shutdown)
         self._cleanup("выбор кнопки мыши", self._invalidate_mouse_capture)
         self._cleanup("жест мыши", partial(self._stop_mouse, "closed"))
         mouse_notifier, self._mouse_notifier = self._mouse_notifier, None

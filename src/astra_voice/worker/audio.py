@@ -847,6 +847,7 @@ class AudioCapture:
         cancelled: threading.Event | None = None,
     ) -> None:
         """Владеет циклом чтения; лимит и хранение отсчётов остаются у автомата."""
+        started = False
         try:
             if previous is not None:
                 previous.join()
@@ -885,6 +886,10 @@ class AudioCapture:
                 if self._source.live and running is self._running:
                     self._first_chunk_deadline = self._clock() + FIRST_CHUNK_TIMEOUT_S
                     self._silent_uid = uid
+            if not running.is_set():
+                return
+            started = True
+            self._on_event({"type": "record.started", "utterance_id": uid})
             self._read(uid, running, deadline, cancelled, ready_at=self._clock())
         except AudioError as err:
             if running.is_set():
@@ -893,6 +898,10 @@ class AudioCapture:
             # Даже pa_simple_free может зависнуть: сторож действует до выхода потока.
             self._mark_stopping(threading.current_thread(), running)
             self._source.close()
+            # Не подтверждаем остановку, если close упал или завис. Событие может
+            # прийти позже результата/ошибки распознавания и не завершает запрос IPC.
+            if started:
+                self._on_event({"type": "record.stopped", "utterance_id": uid})
 
     def _read(
         self,

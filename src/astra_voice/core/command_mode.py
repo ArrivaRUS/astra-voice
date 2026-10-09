@@ -23,6 +23,7 @@ class SessionSnapshot:
     supported: bool = True
     blocked_epoch: int = 0
     sleep_epoch: int = 0
+    cue_epoch: int = 0  # Independent of Cowork desktop support.
 
     @property
     def allowed(self) -> bool:
