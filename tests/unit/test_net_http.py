@@ -583,6 +583,7 @@ def test_production_url_policy_denies_without_network(
         "github.com",
         "api.github.com",
         "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
         "huggingface.co",
         "cdn-lfs.huggingface.co",
         "a.b.huggingface.co",
@@ -594,6 +595,70 @@ def test_production_url_policy_denies_without_network(
 def test_production_hosts_allowed_without_network(host: str) -> None:
     assert http._validate_url(f"https://{host}/file") == host
     assert http._validate_url(f"HTTPS://{host.upper()}:443/file") == host
+
+
+@pytest.mark.parametrize("kind", ("check_app_manual", "download"))
+def test_github_release_asset_redirect_is_allowed(
+    client: HttpClient, transport: Mock, kind: NetworkKind
+) -> None:
+    asset = "SHA256SUMS" if kind == "check_app_manual" else "Astra_Voice-0.1.1-x86_64.AppImage"
+    origin = f"https://github.com/ArrivaRUS/astra-voice/releases/download/v0.1.1/{asset}"
+    destination = f"https://release-assets.githubusercontent.com/release-asset/{asset}?token=test"
+    redirected, payload = _response(302, destination), _response()
+    transport.side_effect = [redirected, payload]
+    with client.get_stream(origin, deadline_s=2, cancel=threading.Event(), kind=kind) as response:
+        assert response.status == 200 and response.url == destination
+        assert b"".join(response.iter_chunks()) == _BODY
+    assert [call.args[0].url for call in transport.call_args_list] == [origin, destination]
+
+
+@pytest.mark.parametrize("kind", ("check_app_manual", "download"))
+@pytest.mark.parametrize(
+    "destination",
+    (
+        "https://release-assets.githubusercontent.com.evil.example/file",
+        "https://evil-release-assets.githubusercontent.com/file",
+        "https://cdn.release-assets.githubusercontent.com/file",
+        "https://githubusercontent.com/file",
+        "http://release-assets.githubusercontent.com/file",
+        "ftp://release-assets.githubusercontent.com/file",
+        "https://release-assets.githubusercontent.com:8443/file",
+        "https://private-user:private-password@release-assets.githubusercontent.com/file",
+    ),
+)
+def test_github_release_redirect_rejects_untrusted_destination(
+    client: HttpClient, transport: Mock, kind: NetworkKind, destination: str
+) -> None:
+    redirected = _response(302, destination)
+    transport.side_effect = [redirected]
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream(
+            "https://github.com/ArrivaRUS/astra-voice/releases/download/v0.1.1/SHA256SUMS",
+            deadline_s=2,
+            cancel=threading.Event(),
+            kind=kind,
+        )
+    assert caught.value.code == "bad-status"
+    assert "private-user" not in caught.value.message
+    assert "private-password" not in caught.value.message
+    transport.assert_called_once()
+    assert redirected.raw.closed
+
+
+@pytest.mark.parametrize("kind", ("check_app_manual", "download"))
+def test_release_asset_host_does_not_bypass_offline_gate(
+    transport: Mock, kind: NetworkKind
+) -> None:
+    client = HttpClient(NetworkGate(Settings(offline=True), Policy()), user_agent=_USER_AGENT)
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream(
+            "https://release-assets.githubusercontent.com/release-asset/file",
+            deadline_s=2,
+            cancel=threading.Event(),
+            kind=kind,
+        )
+    assert caught.value.code == "no-network"
+    transport.assert_not_called()
 
 
 @pytest.mark.parametrize("status", (404, 503))
