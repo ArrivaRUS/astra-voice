@@ -147,83 +147,48 @@ pipewire-pulse (MIT — Expat по copyright-файлу пакета) или, к
 pulseaudio (LGPL-2.1-or-later), wireplumber (MIT).
 
 ================================================================================
-3. Что входит в файл AppImage (для сборки AppImage, версия 0.2)
+3. Что входит в файл AppImage (сборка 0.1.1~dev9)
 ================================================================================
 
-Внимание: по решению 29.09.2026 база AppImage в версии 0.2 меняется на пакеты
-Debian 12 с OpenSSL 3 вместо python-appimage на AlmaLinux 8. Ниже — состав
-текущей сборки; раздел будет обновлён после пересборки по новому SBOM.
-
 AppImage — отдельный вариант поставки для установки в домашнюю папку
-пользователя. В отличие от .deb, всё перечисленное ниже лежит внутри файла
-.AppImage. Состав закреплён в packaging/appimage.lock; sha256 каждого
-исполняемого файла — в sbom-appimage.cdx.json. В AppImage входят также
-Silero VAD и пробная запись из раздела 1.
+пользователя. В сборке dev9 интерпретатор и стандартная библиотека взяты
+из пакетов Debian 12; колёса PyPI и загрузчик перечислены в разделах 3.3–3.4.
+В AppImage входят также Silero VAD и пробная запись из раздела 1.
+Состав закреплён в packaging/appimage.lock; перечень компонентов и sha256
+ELF-файлов — в sbom-appimage.cdx.json рядом с образом. Системные зависимости, которые
+не включены в образ, описаны отдельно в разделе 3.2 и отмечены в SBOM.
 
 3.1. Интерпретатор
 
-CPython 3.11.16 — PSF-2.0
+CPython 3.11.2 — PSF-2.0 и другие лицензии включённого кода
     Copyright (c) Python Software Foundation
     https://www.python.org/
-    Сборка python-appimage (python3.11.16-cp311-cp311-manylinux_2_28_x86_64),
-    https://github.com/niess/python-appimage. Полный текст лицензии
-    и перечень кода под другими лицензиями — в файле
-    opt/python3.11/lib/python3.11/LICENSE.txt внутри AppImage.
+    Из пакетов Debian 12 для amd64: python3.11-minimal,
+    libpython3.11-minimal и libpython3.11-stdlib, каждый версии
+    3.11.2-6+deb12u8. Интерпретатор — opt/python3.11/bin/python3.11,
+    стандартная библиотека — opt/python3.11/lib/python3.11/ внутри AppImage.
+    Полные тексты лицензий и уведомления о правообладателях включённого
+    кода сохранены в opt/python3.11/lib/python3.11/LICENSE.txt и в файлах:
+      usr/share/doc/astra-voice/licenses/debian/python3.11-minimal/copyright;
+      usr/share/doc/astra-voice/licenses/debian/libpython3.11-minimal/copyright;
+      usr/share/doc/astra-voice/licenses/debian/libpython3.11-stdlib/copyright.
+    Эти copyright-файлы скопированы из закреплённых пакетов Debian.
 
-3.2. Системные библиотеки, приложенные к интерпретатору
+3.2. Системные зависимости, не включённые в AppImage
 
-Библиотеки приложены к интерпретатору сборкой python-appimage. Все, кроме
-SQLite, взяты из пакетов AlmaLinux 8 (manylinux_2_28); версия пакета указана
-в скобках. Лицензии — по лицензиям этих проектов.
+Динамические системные библиотеки для интерпретатора и колёс используются
+из операционной системы пользователя. В частности, OpenSSL требуется
+с ABI версии 3 (libssl.so.3 и libcrypto.so.3); эти библиотеки не входят
+в AppImage. Их версии определяются установленными пакетами системы.
 
-OpenSSL 1.1.1k (openssl-libs 1.1.1k-17.el8_6) — OpenSSL
-    (OpenSSL License и оригинальная SSLeay License)
-    Copyright (c) 1998-2021 The OpenSSL Project; Copyright (c) 1995-1998
-    Eric Young
-    https://www.openssl.org/
-    Файлы usr/lib/libssl.so.1.1 и usr/lib/libcrypto.so.1.1.
-    Ветка 1.1.1 не получает публичных исправлений безопасности. Относится
-    только к текущей сборке AppImage: принятый риск П16 от 28.09.2026
-    заменён решением от 29.09.2026 — AppImage версии 0.2 выходит на базе
-    Debian 12 с OpenSSL 3 (decisions/log.md); в SBOM компонент назван явно.
-    This product includes software developed by the OpenSSL Project
-    for use in the OpenSSL Toolkit (http://www.openssl.org/).
-    This product includes cryptographic software written by Eric Young
-    (eay@cryptsoft.com).
-
-GNU Readline 7.0 (readline 7.0-10.el8) — GPL-3.0-or-later
-    Copyright (c) Free Software Foundation, Inc.
-    https://tiswww.case.edu/php/chet/readline/rltop.html
-
-GNU dbm 1.18 (gdbm 1.18-2.el8: libgdbm, libgdbm_compat) — GPL-3.0-or-later
-    Copyright (c) Free Software Foundation, Inc.
-    https://www.gnu.org.ua/software/gdbm/
-
-ncurses 6.1 (ncurses 6.1-10.20180224.el8: libncursesw, libpanelw, libtinfo)
-— X11
-    Copyright (c) 1998-2018 Free Software Foundation, Inc.; Thomas E. Dickey
-    https://invisible-island.net/ncurses/
-
-bzip2 1.0.6 (bzip2 1.0.6-28.el8_10) — bzip2-1.0.6
-    Copyright (c) 1996-2010 Julian R Seward
-    https://sourceware.org/bzip2/
-
-XZ Utils / liblzma 5.2.4 (xz 5.2.4-4.el8_6) — общественное достояние
-    (public domain)
-    https://tukaani.org/xz/
-
-libffi 3.1 (libffi 3.1-24.el8) — MIT
-    Copyright (c) Anthony Green, Red Hat, Inc. и участники проекта
-    https://sourceware.org/libffi/
-
-libxcrypt 4.1.1 (libxcrypt 4.1.1-6.el8) — LGPL-2.1-or-later
-    Copyright (c) Thorsten Kukuk, Björn Esser, Zack Weinberg и участники проекта
-    https://github.com/besser82/libxcrypt
-
-SQLite 3.53.4 — blessing (общественное достояние)
-    https://www.sqlite.org/
-    Не из AlmaLinux: библиотека собрана из исходников SQLite и приложена
-    сборкой python-appimage (в библиотеке — дата исходников 2026-07-24).
+Другие внешние зависимости включают bzip2 (libbz2.so.1.0), XZ/liblzma
+(liblzma.so.5), libffi (libffi.so.8), libxcrypt (libcrypt.so.1), SQLite
+(libsqlite3.so.0), Expat (libexpat.so.1) и zlib (libz.so.1).
+Полный перечень внешних зависимостей и SONAME — в sbom-appimage.cdx.json:
+компоненты с astra-voice:origin=host и astra-voice:not-bundled=true.
+Лицензии и уведомления о правообладателях системных библиотек следует
+смотреть в copyright-файлах соответствующих пакетов операционной системы
+(/usr/share/doc/<пакет>/copyright).
 
 3.3. Колёса PyPI
 

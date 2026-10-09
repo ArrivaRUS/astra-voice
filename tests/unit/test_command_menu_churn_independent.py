@@ -6,6 +6,7 @@ journals and configuration are real temporary files; no host settings change.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -26,6 +27,7 @@ from astra_voice.ui.pill import STATE_DURATION_MS, PillState
 from helpers.qt_app import get_qapplication
 
 pytestmark = pytest.mark.unit
+_REAL_GETEUID = os.geteuid
 
 
 class MenuBench:
@@ -164,7 +166,13 @@ class MenuBench:
 
 
 @pytest.fixture
-def bench(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[MenuBench]:
+def bench(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nonroot_euid: None
+) -> Iterator[MenuBench]:
+    # The shared fixture fakes1000 even on root CI. These real temporary lease
+    # files must use the kernel identity that owns them; keep all guards real.
+    monkeypatch.setattr(os, "geteuid", _REAL_GETEUID)
+    assert tmp_path.stat().st_uid == os.geteuid()
     candidate = MenuBench(tmp_path, monkeypatch)
     try:
         yield candidate
