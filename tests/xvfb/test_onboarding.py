@@ -776,6 +776,8 @@ class FakeSettings(QObject):
     """Изменяемый контракт настроек без системных побочных действий."""
 
     changed = pyqtSignal()
+    commandStateChanged = pyqtSignal()
+    commandDetailsRequested = pyqtSignal()
 
     def _get_commandHotkey(self) -> str:
         return getattr(self, "_commandHotkey", "Super_L")
@@ -3939,6 +3941,37 @@ def test_capture_caps_lock_is_silent(onboarding_app: Any) -> None:
     assert_no_messages(messages, "Caps Lock")
 
 
+def ensure_control_in_viewport(app: Any, body: Any, control: Any) -> tuple[float, ...]:
+    """Every control is reachable by vertical scroll, without horizontal clipping."""
+    label = control.property("text") or control.metaObject().className()
+    # Newly visible CaptureField needs a frame to acquire its implicit height.
+    for _ in range(30):
+        if control.width() > 0 and control.height() > 0:
+            break
+        QTest.qWait(16)
+        app.processEvents()
+    assert control.width() > 0 and 0 < control.height() <= body.height(), label
+    assert body.property("contentWidth") <= body.width() + 1
+    assert body.property("contentX") == 0
+    before = control.mapToItem(body, QPointF(0, 0))
+    content_top = float(body.property("contentY")) + before.y()
+    content_bottom = content_top + control.height()
+    content_height = float(body.property("contentHeight"))
+    assert 0 <= content_top and content_bottom <= content_height + 1, label
+    maximum = max(0.0, content_height - body.height())
+    body.setProperty("contentY", min(maximum, max(0.0, content_top)))
+    app.processEvents()
+    top_left = control.mapToItem(body, QPointF(0, 0))
+    bottom_right = control.mapToItem(body, QPointF(control.width(), control.height()))
+    assert top_left.x() >= -1 and top_left.y() >= -1, label
+    assert bottom_right.x() <= body.width() + 1, label
+    assert bottom_right.y() <= body.height() + 1, label
+    assert control.isVisible(), label
+    assert body.property("contentX") == 0
+    # Compare overlapping controls in content coordinates, independent of scroll.
+    return (top_left.x(), content_top, bottom_right.x(), content_bottom)
+
+
 def test_settings_change_hotkey_shows_capture_field(onboarding_app: Any) -> None:
     fake = FakeSettings()
 
@@ -3948,8 +3981,8 @@ def test_settings_change_hotkey_shows_capture_field(onboarding_app: Any) -> None
             for item in visual_tree(window.contentItem())
             if item.metaObject().className() == "QQuickFlickable" and item.isVisible()
         )
-        assert body.property("contentHeight") <= body.height()
         button = visible_button(window.contentItem(), "Изменить")
+        ensure_control_in_viewport(onboarding_app, body, button)
         QMetaObject.invokeMethod(button, "clicked", Qt.DirectConnection)
         onboarding_app.processEvents()
         assert "beginCapture" in fake.calls
@@ -3958,12 +3991,14 @@ def test_settings_change_hotkey_shows_capture_field(onboarding_app: Any) -> None
             for item in visual_tree(window.contentItem())
             if item.property("state7") == "capturing" and item.isVisible()
         )
+        ensure_control_in_viewport(onboarding_app, body, capture)
         QTest.keyClick(window, Qt.Key_D, Qt.ControlModifier | Qt.AltModifier)
         onboarding_app.processEvents()
         assert "endCapture" in fake.calls
         assert fake.captureState == capture.property("state7") == "captured"
         fake.captureState = "conflict"
         onboarding_app.processEvents()
+        ensure_control_in_viewport(onboarding_app, body, capture)
         assert capture.hasActiveFocus()
         QTest.keyClick(window, Qt.Key_Escape, Qt.NoModifier)
         onboarding_app.processEvents()
@@ -3988,7 +4023,7 @@ def test_settings_change_hotkey_shows_capture_field(onboarding_app: Any) -> None
     ],
     ids=["normal", "quiet", "muted", "restore", "unknown", "error", "policy"],
 )
-def test_settings_general_fits_minimum_window_height(
+def test_settings_general_controls_are_reachable_at_minimum_window_size(
     onboarding_app: Any,
     monkeypatch: Any,
     dark: bool,
@@ -4020,10 +4055,8 @@ def test_settings_general_fits_minimum_window_height(
             for item in visual_tree(root)
             if item.metaObject().className() == "QQuickFlickable" and item.isVisible()
         )
-        # Баннер ошибки может вытеснить нижние настройки; основные состояния
-        # должны целиком помещаться без прокрутки.
-        if not error:
-            assert body.property("contentHeight") <= body.height()
+        # The reviewed command card uses the existing page scroll when needed
+        # (design/command-settings-layout.md); all controls must remain reachable.
         assert body.property("contentY") == 0
         texts = visible_texts(root)
         assert not any(text.startswith("Громкость микрофона в системе") for text in texts)
@@ -4081,22 +4114,42 @@ def test_settings_general_fits_minimum_window_height(
 
         rectangles = []
         for control in controls:
-            top_left = control.mapToItem(body, QPointF(0, 0))
-            bottom_right = control.mapToItem(body, QPointF(control.width(), control.height()))
             label = control.property("text") or control.metaObject().className()
-            assert control.width() > 0 and control.height() > 0, label
-            assert top_left.x() >= 0 and top_left.y() >= 0, label
-            assert bottom_right.x() <= body.width(), label
-            assert bottom_right.y() <= body.height(), label
-            rectangles.append(
-                (top_left.x(), top_left.y(), bottom_right.x(), bottom_right.y(), label)
-            )
+            rectangles.append((*ensure_control_in_viewport(onboarding_app, body, control), label))
         for index, first in enumerate(rectangles):
             for second in rectangles[index + 1 :]:
                 overlap_x = min(first[2], second[2]) - max(first[0], second[0])
                 overlap_y = min(first[3], second[3]) - max(first[1], second[1])
                 assert overlap_x <= 0 or overlap_y <= 0, (first[4], second[4])
 
+        # Include the lower settings and the no-Cowork command card. Scrolling
+        # must expose each selector/toggle and must not change saved values.
+        calls_before_scroll = list(fake.calls)
+        saved_keys = (
+            "hotkey",
+            "hotkeyMode",
+            "device",
+            "pillEnabled",
+            "language",
+            "autostart",
+            "commandHotkey",
+            "commandEnabled",
+            "commandPreview",
+        )
+        settings_before_scroll = {key: fake.property(key) for key in saved_keys}
+        for control in visual_tree(body):
+            if (
+                control.isVisible()
+                and control.width() > 0
+                and control.height() > 0
+                and (
+                    control.metaObject().indexOfProperty("checked") >= 0
+                    or control.metaObject().indexOfProperty("currentIndex") >= 0
+                )
+            ):
+                ensure_control_in_viewport(onboarding_app, body, control)
+        assert fake.calls == calls_before_scroll
+        assert {key: fake.property(key) for key in saved_keys} == settings_before_scroll
         assert not {
             "setMicrophoneVolume",
             "raiseMicrophoneVolume",
@@ -4104,7 +4157,9 @@ def test_settings_general_fits_minimum_window_height(
         } & set(fake.calls)
         fake.calls.clear()
         for title, method in actions:
-            QMetaObject.invokeMethod(visible_button(root, title), "clicked", Qt.DirectConnection)
+            button = visible_button(root, title)
+            ensure_control_in_viewport(onboarding_app, body, button)
+            QMetaObject.invokeMethod(button, "clicked", Qt.DirectConnection)
             onboarding_app.processEvents()
             assert fake.calls == [method]
             fake.calls.clear()
@@ -4563,9 +4618,14 @@ def test_settings_models_section_calls_bridge(onboarding_app: Any, dark: bool) -
             if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
         ]
         assert len(cards) == 1, f"ожидалась одна карточка, найдено {len(cards)}"
-        # Раздел «Общие» грузится первым и при открытии читает список микрофонов
-        # и состояние громкости — это не вызовы раздела «Модели».
-        assert fake.calls == ["refreshDevices", "refreshMicrophone", "cancelCapture"]
+        # Первичный раздел «Общие» читает устройства, громкость и статус
+        # помощника — это не вызовы раздела «Модели».
+        assert fake.calls == [
+            "refreshDevices",
+            "refreshMicrophone",
+            "refreshCommandStatus",
+            "cancelCapture",
+        ]
         fake.calls.clear()
         assert fake.toggled_model_ids == []
         click_item(cards[0])
@@ -4600,7 +4660,12 @@ def test_settings_model_removal_requires_confirmation(onboarding_app: Any, dark:
             for item in visual_tree(root)
             if item.isVisible() and item.property("modelId") == fake.models[0]["id"]
         )
-        assert set(fake.calls) <= {"refreshDevices", "refreshMicrophone", "cancelCapture"}
+        assert set(fake.calls) <= {
+            "refreshDevices",
+            "refreshMicrophone",
+            "refreshCommandStatus",
+            "cancelCapture",
+        }
         fake.calls.clear()
 
         def open_dialog() -> Any:
