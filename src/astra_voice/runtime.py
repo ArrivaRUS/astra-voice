@@ -191,9 +191,18 @@ class DictationRuntime(QObject):
         self._command_suspended = False
         self._command_capture_model: tuple[int, object] | None = None
         self._command_capture_epoch = 0
+        self._command_grab_epoch: int | None = None
         self._preview_send: Callable[[], None] | None = None
         self._preview_timer: QTimer | None = None
-        self._command_hotkey_factory = hotkey_factory
+        self._recover_command_menu = hotkey_factory is HotkeyManager
+        if hotkey_factory is HotkeyManager:
+            from astra_voice.platform.command_hotkey import CommandHotkeyBackend
+
+            self._command_hotkey_factory: Callable[[], HotkeyManager] = lambda: HotkeyManager(
+                CommandHotkeyBackend(manage_menu=True)
+            )
+        else:
+            self._command_hotkey_factory = hotkey_factory
         self.settings = settings
         self.model_store = model_store
         self.session_kind = session_kind
@@ -343,7 +352,20 @@ class DictationRuntime(QObject):
 
     def start_command_mode(self) -> None:
         """Explicit app boundary: read-only buses and passive command-key registration."""
-        if self._closed or not self.command_installed or self._command_client is not None:
+        if self._closed:
+            return
+        if self._recover_command_menu:
+            from astra_voice.platform.kwin_command_lease import KWinCommandLease, KWinLeaseError
+
+            try:
+                # app.main has already acquired the single-instance lock. Recover
+                # even if Cowork was removed or command mode is now disabled.
+                KWinCommandLease().recover()
+            except KWinLeaseError:
+                QTimer.singleShot(3000, self.start_command_mode)
+                return
+            self._recover_command_menu = False
+        if not self.command_installed or self._command_client is not None:
             return
         self._command_client = CoworkClient(self)
         self._command_session = SessionMonitor(self)
@@ -358,7 +380,8 @@ class DictationRuntime(QObject):
         self.orchestrator._command_preview = self._preview_command
         self._command_client.set_admission_guard(
             lambda: (
-                self.settings.command_enabled
+                self.command_installed
+                and self.settings.command_enabled
                 and self._command_snapshot().allowed
                 and self._command_snapshot().blocked_epoch == self._command_capture_epoch
             )
@@ -391,6 +414,8 @@ class DictationRuntime(QObject):
 
     def _command_owner_changed(self, present: bool) -> None:
         self._command_owner = present
+        if not self.command_installed:
+            return
         self.command_status = (
             "Astra Cowork найден · доступен" if present else "Astra Cowork найден · не запущен"
         )
@@ -401,17 +426,26 @@ class DictationRuntime(QObject):
             self.on_command_changed()
 
     def refresh_command_status(self) -> None:
+        was_installed = self.command_installed
         self.command_installed = is_installed()
         self.command_available = self.command_installed and self.session_kind == SessionKind.KDE
         if self.command_installed:
             self.start_command_mode()
+            if not was_installed and self._command_client is not None:
+                self.reload_command_hotkey()
         else:
+            self._stop_command_regrab()
+            self.reject_command()
+            if self.command_hotkey is not None:
+                self.command_hotkey.ungrab()
             self.command_status = "Astra Cowork не установлен"
         self._command_changed()
-        if self._command_client is not None:
+        if self.command_installed and self._command_client is not None:
             self._command_client.status()
 
     def _command_status_changed(self, status: object) -> None:
+        if not self.command_installed:
+            return
         if isinstance(status, dict):
             state = status.get("state")
             if status.get("state_reason") == "session_unsupported":
@@ -480,6 +514,9 @@ class DictationRuntime(QObject):
             self._stop_command_regrab()
             return False
         manager.ungrab()
+        if not self.command_installed:
+            self._stop_command_regrab()
+            return False
         if not self.settings.command_hotkey:
             self._stop_command_regrab()
             self.command_status = "Клавиша команды не распознана — выберите заново"
@@ -510,7 +547,16 @@ class DictationRuntime(QObject):
             return False
         manager.defer_single_super = True
         manager.on_deferred_press = lambda: QTimer.singleShot(300, manager.tick)
+        admission = self._command_snapshot()
+        if not admission.allowed:
+            self._stop_command_regrab()
+            return False
         result = manager.grab(self.settings.command_hotkey, HotkeyMode(self.settings.hotkey_mode))
+        current = self._command_snapshot()
+        if not current.allowed or current.blocked_epoch != admission.blocked_epoch:
+            manager.ungrab()
+            result = GrabResult("not-grabbed")
+        self._command_grab_epoch = admission.blocked_epoch if result.ok else None
         # X11 backend is lazy: the fd may only exist after the first allowed grab.
         # Initial login1 state is unknown, so startup cannot install this observer.
         fd = manager.fileno()
@@ -518,7 +564,7 @@ class DictationRuntime(QObject):
             self._command_notifier = self._create_notifier(fd)
             self._command_notifier.activated.connect(self._process_command_hotkey)
         if not result.ok:
-            self.command_status = "Клавиша команды занята — выберите другую"
+            self.command_status = result.owner_hint or "Клавиша команды занята — выберите другую"
             self._start_command_regrab()
         else:
             self._stop_command_regrab()
@@ -533,6 +579,7 @@ class DictationRuntime(QObject):
     def _start_command_regrab(self) -> None:
         if (
             self._closed
+            or not self.command_installed
             or not self.settings.command_enabled
             or not self._command_snapshot().allowed
             or self._command_regrab_timer is not None
@@ -595,6 +642,13 @@ class DictationRuntime(QObject):
 
     def _process_command_hotkey(self, *args: object) -> None:
         if not self._closed and self.command_hotkey is not None:
+            snapshot = self._command_snapshot()
+            if not snapshot.allowed or snapshot.blocked_epoch != self._command_grab_epoch:
+                self.command_hotkey.ungrab()
+                self._command_grab_epoch = None
+                if snapshot.allowed:
+                    self.reload_command_hotkey()
+                return
             self.command_hotkey.process_pending()
 
     def _on_command_hotkey_state(self, state: HotkeyState, reason: str) -> None:
@@ -612,8 +666,10 @@ class DictationRuntime(QObject):
             self.reject_command()
             return
         if state == HotkeyState.RECORDING:
+            snapshot = self._command_snapshot()
             if (
-                not self._command_snapshot().allowed
+                not snapshot.allowed
+                or snapshot.blocked_epoch != self._command_grab_epoch
                 or self._loading_model
                 or self._selfcheck != "ok"
                 or self._pending_test is not None
@@ -624,7 +680,7 @@ class DictationRuntime(QObject):
                 if self.orchestrator.mode != "command":
                     manager.fsm.escape(monotonic())
                 return
-            self._command_capture_epoch = self._command_snapshot().blocked_epoch
+            self._command_capture_epoch = snapshot.blocked_epoch
             if self._command_mode is not None:
                 self._command_mode.begin()
             self._command_capture_model = (

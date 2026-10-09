@@ -69,6 +69,7 @@ class HotkeyEvent:
     time: int
     escape: bool = False
     mods: int = 0
+    confirmed_hold: bool = False
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,7 @@ class X11HotkeyBackend:
         # Фактически захваченные маски по (keycode, mods): снимать нужно именно их,
         # даже если маски блокировок с тех пор сменились.
         self._masks: dict[tuple[int, int], tuple[int, ...]] = {}
+        self.synchronous_super = False
 
     def combo_signature(self, combo: str) -> tuple[int, int] | None:
         """Реальная пара keycode/modifiers для сравнения ролей и алиасов."""
@@ -220,7 +222,10 @@ class X11HotkeyBackend:
 
     def _grab(self, parsed: ParsedCombo, *, keep: tuple[int, ...] = ()) -> GrabResult:
         masks = tuple(self._x.mask_variants(parsed.mods))
-        report = self._x.grab_key(parsed.keycode, parsed.mods, masks=masks, keep=keep)
+        options = {}
+        if self.synchronous_super and parsed.keysym_name in ("Super_L", "Super_R"):
+            options["keyboard_sync"] = True
+        report = self._x.grab_key(parsed.keycode, parsed.mods, masks=masks, keep=keep, **options)
         if report.ok:
             self._masks[(parsed.keycode, parsed.mods)] = masks
             return GrabResult("ok", keycode=parsed.keycode, mods=parsed.mods)
@@ -521,6 +526,9 @@ class HotkeyManager:
         return result if isinstance(result, tuple) and len(result) == 2 else None
 
     def grab(self, combo: str, mode: HotkeyMode) -> GrabResult:
+        configure = getattr(self.backend, "configure", None)
+        if configure is not None:
+            configure(defer_super=self.defer_single_super and mode == HotkeyMode.PTT)
         if combo == self._combo and self._lost:
             # Захват потерян после смены карты: восстанавливаем, автомат не трогаем.
             result = self._grab_released_combo(combo)
@@ -596,6 +604,10 @@ class HotkeyManager:
     def probe(self, combo: str) -> ProbeResult:
         if combo == self._combo:
             return ProbeResult("duplicate")
+        probe = getattr(self.backend, "probe_combo", None)
+        if probe is not None:
+            result = probe(combo)
+            return ProbeResult(result.code, result.owner_hint, result.keycode, result.mods)
         result = self.backend.grab_combo(combo)
         if result.ok:
             self.backend.ungrab_combo(combo)
@@ -646,6 +658,7 @@ class HotkeyManager:
                 self._skipped_presses = 0
                 if (
                     self.defer_single_super
+                    and not event.confirmed_hold
                     and self._combo.lower() in ("super_l", "super_r", "super", "win")
                     and self.fsm._configured_mode == HotkeyMode.PTT
                     and self.fsm.state == HotkeyState.IDLE
@@ -654,7 +667,7 @@ class HotkeyManager:
                     if self.on_deferred_press is not None:
                         self.on_deferred_press()
                 else:
-                    self.fsm.press(now)
+                    self.fsm.press(now - PTT_THRESHOLD_S if event.confirmed_hold else now)
                     callback = self.on_press
                 log.info(
                     "хоткей: нажатие keycode=%d mods=%#x key_down=1, автомат %s→%s",
