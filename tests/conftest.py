@@ -596,13 +596,56 @@ def pytest_collection(session: pytest.Session) -> None:
         raise pytest.UsageError(error)
 
 
+def engine_only_unit_update(collection_path: Path, config: pytest.Config) -> bool:
+    """Engine-only CI не импортирует явно unit-only update-модули.
+
+    pytest применяет -m после импорта: иначе необязательный для движка requests
+    ломает сбор. Пустой, unit и смешанные запросы сохраняют обычные ошибки
+    обязательных зависимостей. Неоднозначные/engine-marked модули не исключаем.
+    """
+    if config.option.markexpr.strip() != "engine" or not collection_path.is_relative_to(
+        config.rootpath / "tests" / "updates"
+    ):
+        return False
+    try:
+        tree = ast.parse(collection_path.read_text(encoding="utf-8"))
+    except SyntaxError:
+        return False
+    marks = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark" for target in node.targets
+        )
+    ]
+    if len(marks) != 1:
+        return False
+    entries = marks[0].elts if isinstance(marks[0], (ast.List, ast.Tuple)) else [marks[0]]
+    return (
+        any(ast.unparse(entry) == "pytest.mark.unit" for entry in entries)
+        and all(
+            ast.unparse(entry) == "pytest.mark.unit"
+            or (isinstance(entry, ast.Call) and ast.unparse(entry.func) == "pytest.mark.skipif")
+            for entry in entries
+        )
+        and not any(
+            isinstance(node, ast.Attribute) and ast.unparse(node) == "pytest.mark.engine"
+            for node in ast.walk(tree)
+        )
+    )
+
+
 def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
-    if config.stash[_QT_AVAILABLE]:
-        return None
     if collection_path.suffix != ".py" or not collection_path.is_file():
         return None
     patterns = config.getini("python_files")
     if not any(collection_path.match(pattern) for pattern in patterns):
+        return None
+    if engine_only_unit_update(collection_path, config):
+        config.stash[_IGNORED][collection_path] = "unit-only update-модуль; выбран только -m engine"
+        return True
+    if config.stash[_QT_AVAILABLE]:
         return None
     cache = config.stash[_TEST_NEEDS_QT]
     if collection_path not in cache:
@@ -655,7 +698,11 @@ def pytest_terminal_summary(terminalreporter: TerminalReporter, config: pytest.C
         terminalreporter.write_sep(
             "=",
             f"Исключено из сбора модулей: {len(ignored)} — "
-            f"{_QT_REASON}; Qt не обязателен в этом запуске",
+            + (
+                f"{_QT_REASON}; Qt не обязателен в этом запуске"
+                if all(reason.startswith(_QT_REASON) for reason in ignored.values())
+                else "см. причины ниже"
+            ),
         )
         for path, reason in sorted(ignored.items()):
             terminalreporter.write_line(f"{os.path.relpath(path, config.rootpath)}: {reason}")

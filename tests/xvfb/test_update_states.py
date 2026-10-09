@@ -70,6 +70,7 @@ class FakeUpdates(QObject):
 
     statusChanged = pyqtSignal()
     networkChanged = pyqtSignal()
+    downloadChanged = pyqtSignal()
 
     def __init__(self, **values: Any) -> None:
         super().__init__()
@@ -88,6 +89,34 @@ class FakeUpdates(QObject):
             "canCheckNow": True,
             "restState": "idle",
         }
+        self._values.update(
+            {
+                "downloadPhase": "idle",
+                "artifactTrack": "appimage",
+                "artifactSizeText": "100 МБ",
+                "artifactSize": 100000000,
+                "downloadReceived": 0,
+                "downloadTotal": 100000000,
+                "downloadPercent": 0,
+                "downloadRetryAt": 0.0,
+                "downloadError": "",
+                "downloadErrorText": "",
+                "downloadRetryText": "",
+                "folderPath": "",
+                "adminInstruction": "",
+                "installRefusal": "",
+                "installRefusalText": "",
+                "downloadBusy": False,
+                "downloadCancelling": False,
+                "canDownload": True,
+                "canRetryDownload": False,
+                "canCancelDownload": False,
+                "canOpenFolder": False,
+                "canInstallAndRestart": False,
+                "canSkipVersion": True,
+                "canRemindLater": True,
+            }
+        )
         self._values.update(values)
 
     state = pyqtProperty(str, _value("state"), notify=statusChanged)
@@ -103,10 +132,38 @@ class FakeUpdates(QObject):
     canCheckNow = pyqtProperty(bool, _value("canCheckNow"), notify=networkChanged)
     restState = pyqtProperty(str, _value("restState"), notify=networkChanged)
 
+    downloadPhase = pyqtProperty(str, _value("downloadPhase"), notify=downloadChanged)
+    artifactTrack = pyqtProperty(str, _value("artifactTrack"), notify=downloadChanged)
+    artifactSizeText = pyqtProperty(str, _value("artifactSizeText"), notify=downloadChanged)
+    downloadError = pyqtProperty(str, _value("downloadError"), notify=downloadChanged)
+    downloadErrorText = pyqtProperty(str, _value("downloadErrorText"), notify=downloadChanged)
+    downloadRetryText = pyqtProperty(str, _value("downloadRetryText"), notify=downloadChanged)
+    folderPath = pyqtProperty(str, _value("folderPath"), notify=downloadChanged)
+    adminInstruction = pyqtProperty(str, _value("adminInstruction"), notify=downloadChanged)
+    installRefusal = pyqtProperty(str, _value("installRefusal"), notify=downloadChanged)
+    installRefusalText = pyqtProperty(str, _value("installRefusalText"), notify=downloadChanged)
+    downloadBusy = pyqtProperty(bool, _value("downloadBusy"), notify=downloadChanged)
+    downloadCancelling = pyqtProperty(bool, _value("downloadCancelling"), notify=downloadChanged)
+    canDownload = pyqtProperty(bool, _value("canDownload"), notify=downloadChanged)
+    canRetryDownload = pyqtProperty(bool, _value("canRetryDownload"), notify=downloadChanged)
+    canCancelDownload = pyqtProperty(bool, _value("canCancelDownload"), notify=downloadChanged)
+    canOpenFolder = pyqtProperty(bool, _value("canOpenFolder"), notify=downloadChanged)
+    canInstallAndRestart = pyqtProperty(
+        bool, _value("canInstallAndRestart"), notify=downloadChanged
+    )
+    canSkipVersion = pyqtProperty(bool, _value("canSkipVersion"), notify=downloadChanged)
+    canRemindLater = pyqtProperty(bool, _value("canRemindLater"), notify=downloadChanged)
+    artifactSize = pyqtProperty("qlonglong", _value("artifactSize"), notify=downloadChanged)
+    downloadReceived = pyqtProperty("qlonglong", _value("downloadReceived"), notify=downloadChanged)
+    downloadTotal = pyqtProperty("qlonglong", _value("downloadTotal"), notify=downloadChanged)
+    downloadPercent = pyqtProperty(int, _value("downloadPercent"), notify=downloadChanged)
+    downloadRetryAt = pyqtProperty(float, _value("downloadRetryAt"), notify=downloadChanged)
+
     def update(self, **values: Any) -> None:
         self._values.update(values)
         self.statusChanged.emit()
         self.networkChanged.emit()
+        self.downloadChanged.emit()
 
     @pyqtSlot()
     def checkNow(self) -> None:  # noqa: N802
@@ -127,6 +184,30 @@ class FakeUpdates(QObject):
     @pyqtSlot()
     def openReleasePage(self) -> None:  # noqa: N802
         self.calls.append("openReleasePage")
+
+    @pyqtSlot()
+    def download(self) -> None:  # noqa: N802
+        self.calls.append("download")
+
+    @pyqtSlot()
+    def cancelDownload(self) -> None:  # noqa: N802
+        self.calls.append("cancelDownload")
+
+    @pyqtSlot()
+    def retryDownload(self) -> None:  # noqa: N802
+        self.calls.append("retryDownload")
+
+    @pyqtSlot()
+    def openFolder(self) -> None:  # noqa: N802
+        self.calls.append("openFolder")
+
+    @pyqtSlot()
+    def installAndRestart(self) -> None:  # noqa: N802
+        self.calls.append("installAndRestart")
+
+    @pyqtSlot()
+    def refreshCapabilities(self) -> None:  # noqa: N802
+        pass
 
 
 AVAILABLE = {"state": "available", "version": "0.2.1", "notes": NOTES, "releasePageAvailable": True}
@@ -426,18 +507,18 @@ def test_network_section_snapshot(app: Any, case: str, dark: bool) -> None:
         sip.delete(settings)
     assert not messages, "\n".join(messages)
     assert {"Сетевые проверки", "Проверять обновления утилиты", "Офлайн-режим"} <= texts
-    # Подзаголовок раздела: в 0.2 сеть нужна ровно для двух действий.
-    assert "Сеть нужна только для скачивания модели и проверки новой версии" in texts
+    # Подзаголовок target M7/action2b учитывает и скачивание программы.
+    assert "Сетевые проверки и обновления программы" in texts
     assert "Четыре сетевых действия — и ни одного больше" not in texts
     # Скрыто до своих вех: тумблер моделей (v1.0), «Обновить из файла…» и ключи (M8).
     assert "Проверять обновления моделей" not in texts
     assert "Обновить из файла…" not in texts
     assert not {text for text in texts if "trust" in text.lower()}
     panel_title = {
-        "panel-available": "Доступна версия 0.2.1",
+        "panel-available": "Доступна версия",
         "panel-checking": "Проверяю обновления…",
         "panel-uptodate": "Установлена последняя версия",
-        "panel-skipped": "Версия 0.2.1 пропущена",
+        "panel-skipped": "Версия",
         "panel-unavailable": "Источник обновлений недоступен",
     }.get(case)
     if panel_title is not None:

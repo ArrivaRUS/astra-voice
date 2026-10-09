@@ -353,8 +353,11 @@ def test_updates_bridge_bound_before_start_and_refreshed_by_settings(
 ) -> None:
     """Строка обновлений подключена до старта потока; тумблер и офлайн зовут refresh()."""
     pytest.importorskip("requests")
+    from astra_voice.platform import external
     from astra_voice.updates import checker as checker_mod
 
+    opener = Mock(return_value=True)
+    monkeypatch.setattr(external, "open_external", opener)
     checker = Mock()
     seen: dict[str, object] = {}
     checker.start.side_effect = lambda: seen.setdefault("on_status", checker.on_status)
@@ -379,8 +382,23 @@ def test_updates_bridge_bound_before_start_and_refreshed_by_settings(
     assert posted, "снимок проверки обязан идти через очередь GUI-потока"
     assert bridge.state == "available"
     assert bridge.version == "0.2.1"
-    # Кнопки «Страница выпуска» нет, пока нет platform/external.open_external.
+    # Existing external opener is injected; arbitrary URLs never reach it.
+    assert bridge._open_external is opener
+    bridge.openReleasePage()
+    opener.assert_not_called()
+    on_status(
+        checker_mod.UpdateStatus(
+            "available", version="0.2.1", release_url="https://untrusted.example/release"
+        )
+    )
     assert bridge.releasePageAvailable is False
+    bridge.openReleasePage()
+    opener.assert_not_called()
+    release_url = "https://github.com/ArrivaRUS/astra-voice/releases/tag/v0.2.1"
+    on_status(checker_mod.UpdateStatus("available", version="0.2.1", release_url=release_url))
+    assert bridge.releasePageAvailable is True
+    bridge.openReleasePage()
+    opener.assert_called_once_with(release_url)
 
     # Пункт трея «Проверить обновления» (Р9) следует за гейтом.
     tray = rig.runtime.tray

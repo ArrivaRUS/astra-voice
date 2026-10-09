@@ -18,7 +18,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import random
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -27,11 +29,26 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from astra_voice.core import paths
 from astra_voice.core.version import __version__
 from astra_voice.net import github
 from astra_voice.net.gate import NetworkGate
-from astra_voice.net.http import APP_CHECK_JITTER_MAX_S, HttpClient, NetworkError
-from astra_voice.net.update_cache import UpdateCache, shared_cache
+from astra_voice.net.http import (
+    APP_CHECK_JITTER_MAX_S,
+    RATE_LIMIT_MAX_S,
+    RATE_LIMIT_MIN_S,
+    HttpClient,
+    NetworkError,
+    backoff_seconds,
+)
+from astra_voice.net.update_cache import UpdateCache, shared_cache, write_private
+from astra_voice.security.verify import Verifier
+from astra_voice.updates.release import (
+    ReleaseMetadata,
+    ReleaseMetadataError,
+    Track,
+    VerifiedRelease,
+)
 from astra_voice.updates.state import SourceState, StateStore
 
 if TYPE_CHECKING:
@@ -56,6 +73,7 @@ REMIND_LATER_S = 24 * 3600.0
 STARTUP_DELAY_S = 30.0
 #: Как часто поток перечитывает гейт и срок «напомнить позже» без внешних событий.
 IDLE_WAKE_S = 3600.0
+_RAW_TAG = re.compile(r"v?(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})")
 USER_AGENT = f"astra-voice/{__version__} (+https://github.com/ArrivaRUS/astra-voice)"
 _STATS_RESULT = {
     "available": "ok",
@@ -85,6 +103,8 @@ class UpdateStatus:
     retry_at: float | None = None
     last_attempt_at: float | None = None
     last_success_at: float | None = None
+    raw_tag: str | None = None
+    verified_release: VerifiedRelease | None = None
 
 
 class UpdateChecker:
@@ -98,6 +118,9 @@ class UpdateChecker:
         cache: UpdateCache | None = None,
         store: StateStore | None = None,
         current_version: str = __version__,
+        metadata: ReleaseMetadata | None = None,
+        track: Track = "deb",
+        metadata_cache_dir: Path | None = None,
         url: str = github.RELEASES_LATEST_URL,
         on_status: Callable[[UpdateStatus], None] | None = None,
         on_event: Callable[[str, Mapping[str, str]], None] | None = None,
@@ -109,6 +132,20 @@ class UpdateChecker:
         self._client = client
         self._cache = cache if cache is not None else shared_cache()
         self._store = store if store is not None else StateStore()
+        if track not in ("deb", "appimage"):
+            raise ValueError("Неизвестный трек обновления")
+        self._metadata = (
+            metadata
+            if metadata is not None
+            else ReleaseMetadata(
+                client,
+                Verifier("release", keyring=paths.data_dir_static() / "keys" / "release.gpg"),
+                clock=clock,
+            )
+        )
+        self._track = track
+        self._metadata_cache_dir = metadata_cache_dir
+        self._verified: VerifiedRelease | None = None
         self._version = current_version
         self._url = url
         self.on_status = on_status
@@ -183,7 +220,7 @@ class UpdateChecker:
         self._request(action=self._reset_manual_view)
 
     def stop(self, timeout_s: float = 5.0) -> None:
-        """Останавливает поток; идущий запрос прерывается бюджетом 3 с."""
+        """Запрашивает отмену транспорта/GPG и ждёт поток до timeout_s."""
         with self._lock:
             self._stop.set()
             self._wake.set()
@@ -215,6 +252,7 @@ class UpdateChecker:
         # Часы ушли назад (попытка «в будущем») — такую дату не считаем.
         due = last + CHECK_INTERVAL_S if last is not None and last <= now else now
         self._next_due = max(due, now + self._start_delay_s)
+        self._load_metadata()
         self._publish(self._compose())
         while not self._stop.is_set():
             try:
@@ -268,6 +306,8 @@ class UpdateChecker:
         if manual:
             self._manual_view = True
             self._publish(replace(self._compose(), state="checking", manual=True))
+        previous_entry = self._cache.get(github.CACHE_KEY)
+        failures_before = previous_entry.failures if previous_entry.url == self._url else 0
         try:
             result = github.check(
                 self._client,
@@ -291,6 +331,57 @@ class UpdateChecker:
                 self._publish(self._compose())
                 return
             result = github.ReleaseCheck("unavailable")
+        if self._stop.is_set():
+            return
+        if result.state == "available":
+            release = result.release
+            # A previously verified snapshot survives temporary transport
+            # failure only when the new discovery has exactly the same identity.
+            previous = self._verified
+            self._verified = None
+            try:
+                if release is None or release.raw_tag is None:
+                    raise ReleaseMetadataError("invalid-tag")
+                verified = self._metadata.fetch(
+                    release.raw_tag, self._version, self._track, kind=kind, cancel=self._stop
+                )
+                if self._stop.is_set():
+                    return
+                if self._gate.refusal(kind):
+                    self._publish(self._compose())
+                    return
+                if not self._matches(release, verified):
+                    raise ReleaseMetadataError("metadata-invalid")
+                self._save_metadata(verified)
+                self._verified = verified
+            except (ReleaseMetadataError, NetworkError, OSError, paths.PathError) as error:
+                if self._stop.is_set():
+                    return
+                code = getattr(error, "code", "metadata-io")
+                transport = self._temporary_metadata_failure(error)
+                if transport and release is not None and self._matches(release, previous):
+                    self._verified = previous
+                if code in ("cancelled", "no-network") or self._gate.refusal(kind):
+                    self._publish(self._compose())
+                    return
+                log.warning("Метаданные выпуска не проверены: %s", code)
+                if self._verified is None and release is not None and release.raw_tag is not None:
+                    self._invalidate_metadata(release.raw_tag)
+                retry_at = None
+                if isinstance(error, NetworkError) or (
+                    isinstance(error, ReleaseMetadataError) and transport
+                ):
+                    retry_at = self._remember_metadata_failure(error, failures_before)
+                result = replace(
+                    result,
+                    state="rate-limited" if code == "rate-limited" else "unavailable",
+                    retry_at=retry_at,
+                )
+        if self._stop.is_set():
+            return
+        if self._gate.refusal(kind):
+            self._publish(self._compose())
+            return
         now = self._clock()
         attempted = result.requests_made > 0
         if not manual:
@@ -324,11 +415,125 @@ class UpdateChecker:
             )
         )
 
+    @staticmethod
+    def _temporary_metadata_failure(error: Exception) -> bool:
+        if isinstance(error, ReleaseMetadataError):
+            return error.code in ("rate-limited", "backoff")
+        if isinstance(error, NetworkError):
+            # host-unreachable includes DNS, proxy and TLS refusal in HttpClient.
+            # None authorizes fresh metadata; the already signed snapshot alone
+            # remains usable with its old success date for the same identity.
+            return error.code in ("timeout", "short-read", "host-unreachable") or (
+                error.code in ("http-status", "bad-status") and error.status in (429, 502, 503, 504)
+            )
+        return False
+
+    def _remember_metadata_failure(
+        self, error: ReleaseMetadataError | NetworkError, failures_before: int
+    ) -> float:
+        """Share the app discovery embargo so manual checks/restarts cannot bypass it."""
+        now = self._clock()
+        failures = failures_before + 1
+        delay = backoff_seconds(failures)
+        retry_at = getattr(error, "retry_at", None)
+        if retry_at is not None and math.isfinite(retry_at):
+            delay = max(delay, min(max(0.0, retry_at - now), RATE_LIMIT_MAX_S))
+        limited = error.code == "rate-limited"
+        if limited:
+            delay = max(delay, RATE_LIMIT_MIN_S)
+        until = now + min(delay, RATE_LIMIT_MAX_S)
+        entry = self._cache.get(github.CACHE_KEY)
+        self._cache.set(
+            github.CACHE_KEY,
+            replace(
+                entry,
+                url=self._url,
+                failures=failures,
+                rate_limited_until=until if limited else None,
+                backoff_until=None if limited else until,
+            ),
+        )
+        return until
+
+    def _matches(self, release: github.Release, verified: VerifiedRelease | None) -> bool:
+        return (
+            verified is not None
+            and release.raw_tag == verified.raw_tag
+            and release.version == verified.version
+            and verified.artifact.track == self._track
+        )
+
+    def _metadata_directory(self, raw_tag: str, *, create: bool = False) -> Path:
+        if _RAW_TAG.fullmatch(raw_tag) is None:
+            raise ReleaseMetadataError("invalid-tag")
+        root = self._metadata_cache_dir
+        if root is None:
+            root = paths.cache_dir_path() / "updates" / "metadata"
+        directory = root / self._track / raw_tag
+        if not directory.is_absolute() or ".." in directory.parts:
+            raise ReleaseMetadataError("path-unsafe")
+        if any(part.is_symlink() for part in (directory, *directory.parents)):
+            raise ReleaseMetadataError("path-unsafe")
+        if create:
+            if self._metadata_cache_dir is None:
+                paths.ensure_private_dir(root.parent.parent)
+                paths.ensure_private_dir(root.parent)
+            for part in (root, root / self._track, directory):
+                paths.ensure_private_dir(part)
+        return directory
+
+    def _load_metadata(self) -> None:
+        """Only worker startup revalidates persisted bytes; never HTTP."""
+        verdict = github.cached(self._cache, self._version, url=self._url)
+        if verdict is None or verdict.state != "available" or verdict.release is None:
+            return
+        release = verdict.release
+        if release.raw_tag is None:
+            return
+        try:
+            verified = self._metadata.validate_local(
+                self._metadata_directory(release.raw_tag),
+                release.raw_tag,
+                self._version,
+                self._track,
+                cancel=self._stop,
+            )
+            if not self._stop.is_set() and self._matches(release, verified):
+                self._verified = verified
+        except (ReleaseMetadataError, OSError, paths.PathError):
+            log.info("Нет проверенного локального набора метаданных выпуска")
+
+    def _save_metadata(self, verified: VerifiedRelease) -> None:
+        directory = self._metadata_directory(verified.raw_tag, create=True)
+        for name, raw in (
+            ("SHA256SUMS", verified.sums),
+            ("SHA256SUMS.asc", verified.signature),
+            ("latest.json", verified.latest),
+        ):
+            write_private(directory / name, raw)
+        # Incomplete writes are rejected by validate_local at the next start.
+
+    def _invalidate_metadata(self, raw_tag: str) -> None:
+        try:
+            (self._metadata_directory(raw_tag) / "latest.json").unlink(missing_ok=True)
+        except (ReleaseMetadataError, OSError, paths.PathError):
+            log.warning("Не удалось очистить кэш метаданных выпуска")
+
     def _compose(
         self, *, manual: bool = False, retry_at: float | None = None, failed_now: bool = False
     ) -> UpdateStatus:
         """Строка по гейту, кэшу и сохранённому состоянию — без сети."""
         state = self._store.get(SOURCE)
+        if retry_at is None:
+            entry = self._cache.get(github.CACHE_KEY)
+            if entry.url == self._url:
+                now = self._clock()
+                active = [
+                    min(until, now + RATE_LIMIT_MAX_S)
+                    for until in (entry.rate_limited_until, entry.backoff_until)
+                    if until is not None and until > now
+                ]
+                retry_at = max(active) if active else None
         base = UpdateStatus(
             "uptodate",
             retry_at=retry_at,
@@ -359,9 +564,16 @@ class UpdateChecker:
             version=release.version,
             notes=release.notes,
             release_url=release.release_url,
+            raw_tag=release.raw_tag,
         )
         if verdict.state == "uptodate":
             return found
+        if not self._matches(release, self._verified):
+            return replace(base, state="unavailable", manual=manual)
+        assert self._verified is not None
+        found = replace(
+            found, release_url=self._verified.release_url, verified_release=self._verified
+        )
         if state.skipped_version == release.version:
             return replace(found, state="skipped")
         remind = state.remind_until
@@ -370,6 +582,8 @@ class UpdateChecker:
 
     def _publish(self, status: UpdateStatus) -> None:
         with self._lock:
+            if self._stop.is_set():
+                return
             if self._published and status == self._status:
                 return
             self._status = status
@@ -402,4 +616,8 @@ def create_app_checker(settings: Settings, policy: Policy) -> UpdateChecker:
         ca_bundle=Path(ca_bundle) if isinstance(ca_bundle, str) and ca_bundle else None,
         user_agent=USER_AGENT,
     )
-    return UpdateChecker(gate, client)
+    metadata = ReleaseMetadata(
+        client, Verifier("release", keyring=paths.data_dir_static() / "keys" / "release.gpg")
+    )
+    track: Track = "appimage" if paths.install_kind().is_appimage else "deb"
+    return UpdateChecker(gate, client, metadata=metadata, track=track)

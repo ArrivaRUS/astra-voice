@@ -46,7 +46,9 @@ class StubVerifier(Verifier):
         super().__init__("catalog", keyring=KEYRING)
         self.result = VerifyResult(ok=True) if ok else VerifyResult(ok=False, reason="отказ теста")
 
-    def verify_detached(self, data: Path, sig: Path) -> VerifyResult:
+    def verify_detached(
+        self, data: Path, sig: Path, *, cancel: Callable[[], bool] | None = None
+    ) -> VerifyResult:
         assert data.is_absolute()
         assert sig.is_absolute()
         return self.result

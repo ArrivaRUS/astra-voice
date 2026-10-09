@@ -90,6 +90,7 @@ def test_recorded_release(name: str, installed: str, state: str) -> None:
     result = github.evaluate(fixture(name), installed)
     assert result.state == state
     assert result.release is not None
+    assert result.release.raw_tag == ("v0.2.1" if name == "v-prefix" else "0.2.1")
     assert result.release.version == "0.2.1"
     assert result.release.notes.startswith("## Что нового")
     assert result.release.release_url is not None
@@ -181,7 +182,7 @@ def test_release_url_and_notes_are_limited() -> None:
         parsed = github.evaluate(release(html_url=url), "0.0.1").release
         assert parsed is not None and parsed.release_url is None, url
     assert github.evaluate(release(body=7), "0.0.1").release == github.Release(
-        "0.2.1", "", "https://github.com/ArrivaRUS/astra-voice/releases/tag/0.2.1"
+        "0.2.1", "", "https://github.com/ArrivaRUS/astra-voice/releases/tag/0.2.1", "0.2.1"
     )
 
 

@@ -19,7 +19,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from PyQt5.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
 
@@ -52,6 +52,8 @@ if TYPE_CHECKING:
     from astra_voice.core.dictation import LevelCallback, TestCallback
     from astra_voice.runtime import DictationRuntime
     from astra_voice.updates.checker import UpdateChecker
+    from astra_voice.updates.download import VerifiedDownload
+    from astra_voice.updates.restart import PendingRestart
 
 log = logging.getLogger(__name__)
 
@@ -178,7 +180,7 @@ def _children_stopped() -> bool:
 
 def _finish_running_copy(
     key: str, processes: list[Any], threads: list[Any], *, stopped: bool
-) -> None:
+) -> bool:
     from astra_voice.platform import userinstall
 
     try:
@@ -197,6 +199,8 @@ def _finish_running_copy(
             )
     except (userinstall.UserInstallError, OSError, paths.PathError, ValueError):
         log.warning("Не удалось завершить удаление копии; файлы сохранены для повторной проверки")
+        return False
+    return complete
 
 
 def _revoked_check(model: Any | None) -> Callable[[str, str], bool]:
@@ -543,6 +547,10 @@ class ShowServer(QObject):
 
     def close(self) -> None:
         self._server.close()
+        for connection in tuple(self._connections):
+            connection.close()
+        if self._server.isListening():
+            raise RuntimeError("IPC listener did not close")
 
 
 # Ключи разделов — общий контракт Python → QML для showSection(QString).
@@ -994,21 +1002,184 @@ def _start_update_checker(
     return checker
 
 
+class _ProgramUpdates:
+    """GUI reservation and publication gate; preparation/download own Python workers."""
+
+    def __init__(
+        self,
+        checker: UpdateChecker,
+        settings: settings_mod.Settings,
+        gui_calls: _GuiCalls,
+        runtime: Any,
+        downloads: Any,
+        app: Any,
+    ) -> None:
+        from astra_voice.net.gate import NetworkGate
+        from astra_voice.updates.download import DownloadController, ReleaseDownloader
+        from astra_voice.updates.restart import RestartController, RestartPreparer
+
+        self._gui = gui_calls
+        self._runtime = runtime
+        self._models = downloads
+        self._app = app
+        self._closed = False
+        self._attempt = 0
+        self._last_refresh = 0.0
+        self._retry_notification: tuple[int, float] | None = None
+        self._reserved = False
+        self.bridge: Any = None
+        self.pending: PendingRestart | None = None
+        self.preparer = RestartPreparer(checker._metadata, __version__, policy=policy_mod.load)
+        self.restart = RestartController(self.preparer)
+        self.download = DownloadController(
+            ReleaseDownloader(
+                checker._client,
+                checker._metadata,
+                __version__,
+                refusal=lambda: NetworkGate(settings, policy_mod.load()).refusal("download"),
+            ),
+            on_status=lambda status: self._gui.post(lambda: self._download_status(status)),
+        )
+
+    def _download_status(self, status: Any) -> None:
+        if not self._closed and self.bridge is not None:
+            self.bridge.set_download_status(status)
+
+    def refresh(self) -> None:
+        if self._closed or self.bridge is None:
+            return
+        status = self.download.status
+        retry_key = (status.operation_id, status.retry_at) if status.retry_at is not None else None
+        retry_due = (
+            retry_key is not None
+            and retry_key != self._retry_notification
+            and time.time() >= retry_key[1]
+        )
+        now = time.monotonic()
+        if (status.result is not None or retry_due) and now - self._last_refresh >= 1:
+            self._last_refresh = now
+            self.bridge.refreshCapabilities()
+            if retry_due:
+                self._retry_notification = retry_key
+
+    def _models_busy(self) -> bool:
+        return (
+            getattr(self._models, "_active_entry", None) is not None
+            or getattr(self._models, "downloadState", "idle") in {"downloading", "verifying"}
+            or getattr(self._models, "_model_thread", None) is not None
+        )
+
+    def refusal(self) -> str:
+        from astra_voice.updates.restart import install_refusal
+
+        if self._closed or self._reserved:
+            return "busy"
+        reason = install_refusal(policy_mod.load())
+        if reason:
+            return reason
+        if self._runtime is None:
+            return "busy"
+        if self._runtime.appimage_remove_busy_reason():
+            return "busy"
+        # Preserve active model work: installation never interrupts it.
+        if self._models_busy():
+            return "busy"
+        return ""
+
+    def request_install(self, result: VerifiedDownload) -> bool:
+        reason = self.refusal()
+        if reason:
+            self.bridge.set_install_error(reason)
+            return False
+        if not self._runtime.reserve_appimage_removal():
+            self.bridge.set_install_error("busy")
+            return False
+        self._reserved = True
+        self._attempt += 1
+        attempt = self._attempt
+        self.restart.on_prepared = lambda pending, error: self._gui.post(
+            lambda: self._prepared(attempt, pending, error)
+        )
+        if self.restart.start(result):
+            return True
+        self._release()
+        self.bridge.set_install_error("prepare-failed", retryable=True)
+        return False
+
+    def _release(self) -> None:
+        if self._reserved:
+            self._reserved = False
+            self._runtime.release_appimage_removal()
+
+    def _prepared(self, attempt: int, pending: PendingRestart | None, error: str) -> None:
+        from astra_voice.updates.restart import install_refusal
+
+        if self._closed or attempt != self._attempt:
+            return
+        self._attempt += 1  # A queued duplicate cannot reuse this preparation result.
+        error = error or install_refusal(policy_mod.load())
+        if not error and self._models_busy():
+            error = "busy"
+        if pending is None or error:
+            if pending is not None:
+                self.preparer.fail(pending, error)
+            self._release()
+            self.bridge.set_install_error(error or "prepare-failed", retryable=True)
+            return
+        self.pending = pending
+        try:
+            if self._app.quit() is False:
+                raise RuntimeError("quit refused")
+        except Exception:  # noqa: BLE001 — preserve the running UI after a refused exit
+            self.pending = None
+            self._release()
+            self.preparer.fail(pending, "shutdown-incomplete")
+            self.bridge.set_install_error("shutdown-incomplete", retryable=True)
+
+    @property
+    def worker_threads(self) -> tuple[Any, ...]:
+        return (*self.download.worker_threads, *self.restart.worker_threads)
+
+    def close(self, timeout: float | None = None) -> bool:
+        self._closed = True
+        self._attempt += 1
+        # Evaluate both: short-circuiting must never leave the other worker running.
+        download_done = self.download.close(timeout)
+        restart_done = self.restart.close(timeout)
+        if self.pending is None:
+            self._release()
+        return download_done and restart_done
+
+
 def _bind_updates_bridge(
     checker: UpdateChecker,
     settings: settings_mod.Settings,
     policy: policy_mod.Policy,
     gui_calls: _GuiCalls,
     settings_bridge: Any,
+    *,
+    program_updates: _ProgramUpdates | None = None,
 ) -> Any:
     """Мост строки обновлений для QML; снимки проверки идут в GUI-поток очередью."""
     from astra_voice.net.gate import NetworkGate
+    from astra_voice.platform.external import open_external
     from astra_voice.ui.updates_bridge import UpdatesBridge
 
-    # open_external из platform/external появится отдельной веткой; до неё
-    # кнопка «Страница выпуска» скрыта, QDesktopServices и Qt.openUrlExternally
-    # для адресов из сети не используем.
-    bridge = UpdatesBridge(checker, refusal=NetworkGate(settings, policy).refusal)
+    bridge = UpdatesBridge(
+        checker,
+        refusal=NetworkGate(settings, policy).refusal,
+        open_external=open_external,
+        controller=program_updates.download if program_updates is not None else None,
+        request_install=program_updates.request_install if program_updates is not None else None,
+        install_refusal=program_updates.refusal if program_updates is not None else None,
+    )
+    if program_updates is not None:
+        program_updates.bridge = bridge
+        notice = program_updates.preparer.notice(
+            __version__, is_appimage=paths.install_kind().is_appimage
+        )
+        if notice is not None:
+            bridge.restore_install_error(notice.version, notice.error)
 
     def post_status(status: Any) -> None:
         # Рабочий поток проверки: мост трогаем только в GUI-потоке (урок 025).
@@ -1115,18 +1286,32 @@ def _ensure_settings_file(settings: settings_mod.Settings) -> None:
         log.info("создан %s со значениями по умолчанию", path)
 
 
-def _cleanup(server: Any, lock: Any) -> None:
-    """Убирает сокет и снимает блокировку. Вызывается ровно один раз."""
+def _cleanup(server: Any, lock: Any) -> bool:
+    """Attempt each independent cleanup step; uncertainty never confirms release."""
+    complete = True
     try:
         if server is not None:
             server.close()
-    finally:
-        ipc = ipc_socket_path()
-        try:
-            ipc.unlink(missing_ok=True)
-        except OSError as exc:  # noqa: BLE001
-            log.debug("не удалось убрать %s: %s", ipc, exc)
+    except Exception:  # noqa: BLE001 — IPC failure must not skip instance unlock
+        complete = False
+        log.warning("Не удалось закрыть сервер IPC")
+    try:
+        ipc_socket_path().unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 — path lookup and unlink can fail independently of lock
+        complete = False
+        log.warning("Не удалось убрать сокет IPC")
+    try:
         lock.unlock()
+    except Exception:  # noqa: BLE001 — still inspect ownership; never infer successful unlock
+        complete = False
+        log.warning("Не удалось снять блокировку экземпляра")
+    try:
+        if lock.isLocked() is not False:
+            complete = False
+    except Exception:  # noqa: BLE001 — unreadable lock state is not a successful shutdown
+        complete = False
+        log.warning("Не удалось проверить освобождение блокировки экземпляра")
+    return complete
 
 
 def _uninstall() -> int:
@@ -1351,6 +1536,7 @@ def main(argv: list[str] | None = None) -> int:
     updates_bridge: Any = None  # держим Python-обёртку живой до выхода из main
     about_bridge: Any = None  # держим Python-обёртку живой до выхода из main
     appimage_management: Any = None
+    program_updates: _ProgramUpdates | None = None
     gui_calls = _GuiCalls()
     model_store: ModelStore | None = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
@@ -1535,10 +1721,19 @@ def main(argv: list[str] | None = None) -> int:
         _set_context_property(shell, "showOnboarding", show_onboarding)
 
         def bind_updates(checker: UpdateChecker) -> None:
-            nonlocal updates_bridge
-            updates_bridge = _bind_updates_bridge(
-                checker, settings, policy, gui_calls, settings_bridge
+            nonlocal updates_bridge, program_updates
+            program_updates = _ProgramUpdates(
+                checker, settings, gui_calls, runtime if runtime_ready else None, downloads, app
             )
+            updates_bridge = _bind_updates_bridge(
+                checker,
+                settings,
+                policy,
+                gui_calls,
+                settings_bridge,
+                program_updates=program_updates,
+            )
+            timer.timeout.connect(program_updates.refresh)
             QQmlEngine.setObjectOwnership(updates_bridge, QQmlEngine.CppOwnership)
             _set_context_property(shell, "updatesBridge", updates_bridge)
             if about_bridge is not None:
@@ -1566,8 +1761,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not args.hidden:
             focuser.focus_shell()
-        return int(app.exec_())
+        exit_code = int(app.exec_())
     finally:
+        program_updates = cast(_ProgramUpdates | None, locals().get("program_updates"))
+        program_threads: list[Any] = []
+        if program_updates is not None:
+            program_threads.extend(program_updates.worker_threads)
         copy_key = _installed_code_key()
         resources_stopped = True
         management_threads: list[Any] = []
@@ -1577,13 +1776,19 @@ def main(argv: list[str] | None = None) -> int:
                 management_threads.extend(appimage_management.worker_threads)
             processes, threads = (
                 _copy_shutdown_resources(runtime, downloads, update_checker, appimage_management)
-                if copy_key is not None
+                if copy_key is not None or program_updates is not None
                 else ([], [])
             )
         except Exception:  # noqa: BLE001 — неясное состояние не разрешает удалить код
             processes, threads = [], []
             resources_stopped = False
             log.warning("Не удалось проверить ресурсы работающей копии")
+        if program_updates is not None:
+            try:
+                program_updates.close(0)
+            except Exception:  # noqa: BLE001 — still stop audio and release IPC
+                resources_stopped = False
+                log.warning("Не удалось отменить обновление программы")
         if appimage_management is not None:
             try:
                 closed = appimage_management.close()
@@ -1673,7 +1878,22 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception:  # noqa: BLE001 — ресурсы join-нуты, состояние неизвестно
                     resources_stopped = False
                     log.warning("Не удалось завершить управление установкой AppImage")
-        if copy_key is not None:
+        if program_updates is not None:
+            try:
+                program_threads.extend(program_updates.worker_threads)
+                for thread in program_threads:
+                    thread.join()
+                if program_updates.close() is not True:
+                    resources_stopped = False
+                # stop() has a bounded wait; keep the checker's reference until joined.
+                checker_thread = getattr(update_checker, "_thread", None)
+                if checker_thread is not None:
+                    checker_thread.join()
+            except Exception:  # noqa: BLE001 — uncertain shutdown never launches a new image
+                resources_stopped = False
+                log.warning("Не удалось подтвердить остановку обновлений программы")
+            threads.extend(program_threads)
+        if copy_key is not None or program_updates is not None:
             try:
                 # ungrab/close брокера может впервые запустить восстановление меню.
                 # Старые ссылки сохраняем: shutdown мог забыть живой Popen/QThread.
@@ -1685,5 +1905,28 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:  # noqa: BLE001 — неизвестность запрещает удаление кода
                 resources_stopped = False
                 log.warning("Не удалось проверить ресурсы после остановки копии")
-            _finish_running_copy(copy_key, processes, threads, stopped=resources_stopped)
-        _cleanup(server, lock)
+        if copy_key is not None:
+            resources_stopped = _finish_running_copy(
+                copy_key, processes, threads, stopped=resources_stopped
+            )
+        elif program_updates is not None:
+            try:
+                resources_stopped = (
+                    resources_stopped
+                    and all(p.poll() is not None for p in processes)
+                    and all(_thread_stopped(thread) for thread in threads)
+                    and _children_stopped()
+                )
+            except Exception:  # noqa: BLE001 — fail closed on unknown resources
+                resources_stopped = False
+        try:
+            cleanup_complete = _cleanup(server, lock)
+        except Exception:  # noqa: BLE001 — preserve the diagnostic path even for unexpected failures
+            cleanup_complete = False
+            log.warning("Не удалось подтвердить завершение IPC и блокировки экземпляра")
+    if program_updates is not None and program_updates.pending is not None:
+        return program_updates.preparer.launch(
+            program_updates.pending,
+            shutdown_complete=resources_stopped and cleanup_complete is True,
+        )
+    return exit_code
