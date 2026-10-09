@@ -40,7 +40,7 @@ from astra_voice.core.model_source import (
     smoke_matches,
     smoke_wav_path,
 )
-from astra_voice.core.settings import Settings, is_valid_combo
+from astra_voice.core.settings import Settings, is_valid_combo, is_valid_command_mouse_button
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
 from astra_voice.platform.cowork import (
     CoworkClient,
@@ -57,6 +57,7 @@ from astra_voice.platform.hotkey import (
     HotkeyMode,
     HotkeyState,
 )
+from astra_voice.platform.mouse_button import MouseHoldManager, MouseHoldState
 from astra_voice.platform.paste import (
     PasteMode,
     PasteOutcome,
@@ -158,6 +159,7 @@ class DictationRuntime(QObject):
         pill_factory: Callable[..., Pill] = Pill,
         tray_factory: Callable[..., Tray] = Tray,
         hotkey_factory: Callable[[], HotkeyManager] = HotkeyManager,
+        mouse_factory: Callable[[], MouseHoldManager] = MouseHoldManager,
         stats_factory: Callable[[], Stats] = Stats,
         paste_func: Callable[[str, int | None, PasteMode], PasteOutcome] = paste_text,
         restore_paste: Callable[[], bool] = restore_pending,
@@ -187,13 +189,43 @@ class DictationRuntime(QObject):
         self._command_notifier: QSocketNotifier | None = None
         self._command_regrab_timer: QTimer | None = None
         self._command_handlers_registered = False
+        self._input_owner: str | None = None
+        self._input_epoch = 0
+        self._command_hold_epoch = 0
+        self._mouse_factory = mouse_factory
+        self.command_mouse: MouseHoldManager | None = None
+        self._mouse_notifier: QSocketNotifier | None = None
+        self._mouse_notifier_fd = -1
+        self._text_notifier_fd = -1
+        self._mouse_tick_timer: QTimer | None = None
+        self._mouse_retry_timer: QTimer | None = None
+        self._mouse_retries = 0
+        self._mouse_arming = False
+        self._mouse_operation_generation: int | None = None
+        self._mouse_escape_token: object | None = None
+        self._mouse_arm_identity: tuple[int, tuple[int, object], int] | None = None
+        self._mouse_capture_token: object | None = None
+        self._mouse_capture_epoch = 0
+        self._mouse_capture_config = (False, False)
+        self._mouse_status = "unavailable"
+        self._mouse_message = "Управление кнопкой мыши пока недоступно"
+        self.on_command_mouse_changed: Callable[[], None] | None = None
         self._command_owner = False
         self._command_suspended = False
         self._command_capture_model: tuple[int, object] | None = None
         self._command_capture_epoch = 0
+        self._command_grab_epoch: int | None = None
         self._preview_send: Callable[[], None] | None = None
         self._preview_timer: QTimer | None = None
-        self._command_hotkey_factory = hotkey_factory
+        self._recover_command_menu = hotkey_factory is HotkeyManager
+        if hotkey_factory is HotkeyManager:
+            from astra_voice.platform.command_hotkey import CommandHotkeyBackend
+
+            self._command_hotkey_factory: Callable[[], HotkeyManager] = lambda: HotkeyManager(
+                CommandHotkeyBackend(manage_menu=True)
+            )
+        else:
+            self._command_hotkey_factory = hotkey_factory
         self.settings = settings
         self.model_store = model_store
         self.session_kind = session_kind
@@ -297,9 +329,9 @@ class DictationRuntime(QObject):
                 active_window=self.x11.target_window,
                 schedule=self.schedule,
                 cancel_timer=self.cancel_timer,
-                hotkey_done=lambda: self._active_hotkey().fsm.done(monotonic()),
-                hotkey_cancel=lambda: self._active_hotkey().fsm.escape(monotonic()),
-                hotkey_idle=lambda: self._active_hotkey().fsm.state is HotkeyState.IDLE,
+                hotkey_done=self._input_done,
+                hotkey_cancel=self._input_cancel,
+                hotkey_idle=self._input_idle,
                 set_recording=self.guard.set_recording,
                 paste_mode=self.paste_mode,
                 record_params=self.record_params,
@@ -316,8 +348,8 @@ class DictationRuntime(QObject):
             self.supervisor = supervisor_factory(on_event=self._on_worker_event, use_qt=True)
             rollback.append(("воркер", self.supervisor.stop))
             self.hotkey.on_state = self._on_hotkey_state
-            self.pill.on_cancel_clicked = lambda: self.orchestrator.cancel("pill")
-            self.tray.on_cancel = lambda: self.orchestrator.cancel("tray")
+            self.pill.on_cancel_clicked = partial(self._cancel_input, "pill")
+            self.tray.on_cancel = partial(self._cancel_input, "tray")
             self.tray.on_copy_last = self._copy_last
             self.tray.on_model_recheck = self._recheck_model
             self.tray.on_quit = self._quit_requested
@@ -341,9 +373,466 @@ class DictationRuntime(QObject):
             return self.command_hotkey
         return self.hotkey
 
+    @property
+    def command_mouse_can_edit(self) -> bool:
+        return bool(
+            not self._closed
+            and self.command_installed
+            and self._command_snapshot().allowed
+            and self._input_owner in (None, "mouse-capture")
+            and self._capture_watchdog is None
+            and self._preview_send is None
+            and self.phase in (DictationPhase.IDLE, DictationPhase.FINISHING)
+            and self._pending_test is None
+            and not self.orchestrator.test_active
+            and not self.orchestrator.level_active
+            and self.hotkey.fsm.state is HotkeyState.IDLE
+            and self.hotkey.has_pending_press is not True
+            and (self.command_hotkey is None or self.command_hotkey.has_pending_press is not True)
+            and (self.command_hotkey is None or self.command_hotkey.fsm.state is HotkeyState.IDLE)
+        )
+
+    @property
+    def command_mouse_status(self) -> str:
+        return "disabled" if not self.settings.command_mouse_enabled else self._mouse_status
+
+    @property
+    def command_mouse_status_message(self) -> str:
+        if not self.settings.command_mouse_enabled:
+            return "Управление кнопкой мыши выключено"
+        return self._mouse_message
+
+    def _mouse_changed(self) -> None:
+        if self.on_command_mouse_changed is not None:
+            try:
+                self.on_command_mouse_changed()
+            except Exception:
+                log.warning("Не удалось обновить состояние кнопки мыши")
+
+    def _set_mouse_status(self, status: str, message: str) -> None:
+        self._mouse_status, self._mouse_message = status, message
+        self._mouse_changed()
+
+    def _input_busy(self) -> bool:
+        return bool(
+            self._input_owner is not None
+            or self._capture_watchdog is not None
+            or self._preview_send is not None
+            or self._pending_test is not None
+            or self.orchestrator.test_active
+            or self.orchestrator.level_active
+            or self.phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
+        )
+
+    def _reserve_input(self, source: str) -> bool:
+        if self._input_owner == source:
+            return True
+        if self._input_busy():
+            return False
+        self._input_epoch += 1
+        self._input_owner = source
+        if source != "mouse":
+            self._stop_mouse("other-input")
+        else:
+            self._stop_command_regrab()
+            if self.command_hotkey is not None:
+                self.command_hotkey.ungrab()
+        self._mouse_changed()
+        return self._input_owner == source
+
+    def _release_input(self, source: str) -> None:
+        if self._input_owner != source:
+            return
+        self._input_owner = None
+        self._input_epoch += 1
+        self._release_mouse_escape()
+        self._mouse_operation_generation = None
+        self._mouse_changed()
+        if not self._closed and (self.command_hotkey is not None or self.command_mouse is not None):
+            epoch = self._input_epoch
+            self.schedule(0, partial(self._restore_command_inputs, epoch))
+
+    def _restore_command_inputs(self, epoch: int) -> None:
+        if not self._closed and epoch == self._input_epoch and not self._input_busy():
+            self.reload_command_hotkey()
+
+    def _input_done(self) -> None:
+        owner, epoch = self._input_owner, self._input_epoch
+        if owner == "mouse":
+            if self.command_mouse is not None and self._mouse_operation_generation is not None:
+                self.command_mouse.done(self._mouse_operation_generation)
+            # Ошибка запуска может завершить оркестратор ещё в RECORDING.
+            # done() завершает только PROCESSING; ресурс нужно снять до owner.
+            if self._input_owner == owner and self._input_epoch == epoch:
+                self._stop_mouse("done")
+        else:
+            self._active_hotkey().fsm.done(monotonic())
+        if owner in ("mouse", "keyboard", "text") and self._input_epoch == epoch:
+            self._release_input(owner)
+
+    def _input_cancel(self) -> None:
+        owner = self._input_owner
+        if owner == "mouse":
+            self._stop_mouse("cancel")
+        else:
+            self._active_hotkey().fsm.escape(monotonic())
+        if owner is not None and self.phase in (DictationPhase.IDLE, DictationPhase.FINISHING):
+            self._release_input(owner)
+
+    def _input_idle(self) -> bool:
+        if self._input_owner == "mouse":
+            return self.command_mouse is None or self.command_mouse.state is MouseHoldState.IDLE
+        return bool(self._active_hotkey().fsm.state is HotkeyState.IDLE)
+
+    def _cancel_input(self, reason: str) -> None:
+        if self._input_owner == "mouse":
+            self._stop_mouse(reason)
+        if self._preview_send is not None:
+            self.reject_command()
+        else:
+            self.orchestrator.cancel(reason)
+
+    def _mouse_model_identity(self) -> tuple[int, object]:
+        return self.supervisor.generation, dict(self._model_load_request or {})
+
+    def _mouse_allowed(self) -> bool:
+        snapshot = self._command_snapshot()
+        if (
+            self._closed
+            or not self.command_installed
+            or not self.settings.command_enabled
+            or not self.settings.command_mouse_enabled
+            or not snapshot.allowed
+            or self._command_mode is None
+            or self._loading_model
+            or self._selfcheck != "ok"
+            or self._capture_watchdog is not None
+            or self._mouse_capture_token is not None
+            or self._pending_test is not None
+            or self.orchestrator.test_active
+            or self.orchestrator.level_active
+            or self._input_owner not in (None, "mouse")
+            or not is_valid_command_mouse_button(self.settings.command_mouse_button)
+        ):
+            return False
+        if self._input_owner is None and self.phase not in (
+            DictationPhase.IDLE,
+            DictationPhase.FINISHING,
+        ):
+            return False
+        identity = self._mouse_model_identity()
+        if self._mouse_arm_identity is not None and self._mouse_arm_identity != (
+            snapshot.blocked_epoch,
+            identity,
+            self.settings.command_mouse_button,
+        ):
+            return False
+        epoch = self._input_epoch
+        button = self.settings.command_mouse_button
+        trusted = self._command_model_trusted(capture=identity)
+        current = self._command_snapshot()
+        return bool(
+            trusted
+            and current.allowed
+            and current.blocked_epoch == snapshot.blocked_epoch
+            and epoch == self._input_epoch
+            and identity == self._mouse_model_identity()
+            and button == self.settings.command_mouse_button
+            and self.settings.command_enabled
+            and self.settings.command_mouse_enabled
+            and not self._closed
+            and self.command_installed
+        )
+
+    def _stop_mouse_timer(self, name: str) -> None:
+        timer = getattr(self, name)
+        setattr(self, name, None)
+        if timer is not None:
+            self.cancel_timer(timer)
+
+    def _stop_mouse(self, reason: str) -> None:
+        self._stop_mouse_timer("_mouse_tick_timer")
+        self._stop_mouse_timer("_mouse_retry_timer")
+        if self._mouse_notifier is not None:
+            self._mouse_notifier.setEnabled(False)
+        if self.command_mouse is not None:
+            self.command_mouse.cancel(reason)
+        self._mouse_arm_identity = None
+        self._release_mouse_escape()
+
+    def _release_mouse_escape(self) -> None:
+        token, self._mouse_escape_token = self._mouse_escape_token, None
+        if token is not None:
+            try:
+                self.hotkey.release_external_escape(token)
+            except Exception:
+                log.warning("Не удалось освободить клавишу отмены")
+
+    def _mouse_escape(self, token: object, epoch: int) -> None:
+        if token is not self._mouse_escape_token or epoch != self._input_epoch:
+            return
+        lost = not self.hotkey.escape_result.ok
+        self._cancel_input("escape")
+        if lost:
+            self._set_mouse_status("unavailable", "Клавиша отмены недоступна — повторите попытку")
+
+    def reload_command_mouse(self) -> None:
+        if self._mouse_capture_token is not None:
+            if self.command_mouse_capture_valid(self._mouse_capture_token):
+                self._set_mouse_status("suspended", "Идёт выбор кнопки мыши")
+                return
+            self._invalidate_mouse_capture()
+        self._stop_mouse("settings")
+        self._mouse_retries = 0
+        if not self.settings.command_mouse_enabled:
+            self._set_mouse_status("disabled", "Управление кнопкой мыши выключено")
+            return
+        if self._closed or not self.command_installed or self.session_kind != SessionKind.KDE:
+            self._set_mouse_status("unavailable", "Управление кнопкой мыши недоступно")
+            return
+        if self.command_mouse is None:
+            self.command_mouse = self._mouse_factory()
+            self.command_mouse.allowed = self._mouse_allowed
+            self.command_mouse.on_pending = self._mouse_pending
+            self.command_mouse.on_state = self._mouse_state
+        self._arm_mouse()
+
+    def _arm_mouse(self) -> None:
+        self._mouse_retry_timer = None
+        manager = self.command_mouse
+        if manager is None or not self._mouse_allowed():
+            self._set_mouse_status("suspended", "Голосовые команды сейчас недоступны")
+            return
+        self._mouse_arm_identity = (
+            self._command_snapshot().blocked_epoch,
+            self._mouse_model_identity(),
+            self.settings.command_mouse_button,
+        )
+        admission = self._mouse_arm_identity
+        self._mouse_arming = True
+        try:
+            result = manager.arm(self.settings.command_mouse_button)
+        finally:
+            self._mouse_arming = False
+        if result.ok and (self._mouse_arm_identity != admission or not self._mouse_allowed()):
+            self._stop_mouse("blocked")
+            self._set_mouse_status("suspended", "Голосовые команды сейчас недоступны")
+            return
+        fd = manager.fileno()
+        if self._mouse_notifier is not None and fd != self._mouse_notifier_fd:
+            self._mouse_notifier.setEnabled(False)
+            self._mouse_notifier.deleteLater()
+            self._mouse_notifier = None
+        if fd >= 0 and self._mouse_notifier is None:
+            self._mouse_notifier = self._create_notifier(fd)
+            self._mouse_notifier.activated.connect(self._process_mouse)
+            self._mouse_notifier_fd = fd
+        if self._mouse_notifier is not None:
+            self._mouse_notifier.setEnabled(result.ok)
+        if result.ok:
+            self._mouse_retries = 0
+            self._set_mouse_status("ready", "Удерживайте кнопку и говорите")
+        else:
+            self._set_mouse_status(
+                "busy" if result.code == "busy" else "unavailable",
+                "Кнопка мыши занята другой программой"
+                if result.code == "busy"
+                else "Кнопка мыши недоступна — отпустите её или выберите другую",
+            )
+            self._queue_mouse_retry(REGRAB_INTERVAL_MS)
+
+    def _queue_mouse_retry(self, delay: int = 0) -> None:
+        if (
+            self._closed
+            or self._mouse_retry_timer is not None
+            or self._input_busy()
+            or not self.settings.command_mouse_enabled
+            or self._mouse_retries >= 5
+            or not self._command_snapshot().allowed
+        ):
+            return
+        self._mouse_retries += 1
+        epoch = self._input_epoch
+
+        timer: QTimer | None = None
+
+        def retry() -> None:
+            if self._mouse_retry_timer is not timer:
+                return
+            self._mouse_retry_timer = None
+            if epoch == self._input_epoch:
+                self._arm_mouse()
+
+        timer = self.schedule(delay, retry)
+        self._mouse_retry_timer = timer
+
+    def _process_mouse(self, *args: object) -> None:
+        if self._closed or self.command_mouse is None:
+            return
+        self.command_mouse.process_pending()
+
+    def _schedule_mouse_tick(self) -> None:
+        self._stop_mouse_timer("_mouse_tick_timer")
+        manager = self.command_mouse
+        if manager is None or manager.deadline is None:
+            return
+        generation, epoch = manager.generation, self._input_epoch
+        delay = max(1, math.ceil((manager.deadline - monotonic()) * 1000))
+
+        timer: QTimer | None = None
+
+        def tick() -> None:
+            if (
+                self._mouse_tick_timer is not timer
+                or epoch != self._input_epoch
+                or generation != manager.generation
+                or self._closed
+            ):
+                return
+            self._mouse_tick_timer = None
+            manager.tick(generation=generation)
+            self._schedule_mouse_tick()
+
+        timer = self.schedule(delay, tick)
+        self._mouse_tick_timer = timer
+
+    def _mouse_pending(self, generation: int) -> None:
+        manager = self.command_mouse
+        if manager is None or not self._mouse_allowed() or not self._reserve_input("mouse"):
+            self._stop_mouse("owner-busy")
+            return
+        self._mouse_operation_generation = generation
+        token = object()
+        self._mouse_escape_token = token
+        epoch = self._input_epoch
+        result = self.hotkey.acquire_external_escape(
+            token, partial(self._mouse_escape, token, epoch)
+        )
+        if not result.ok:
+            self._stop_mouse("escape-unavailable")
+            self._set_mouse_status("unavailable", "Клавиша отмены недоступна — повторите попытку")
+            return
+        if (
+            token is not self._mouse_escape_token
+            or epoch != self._input_epoch
+            or generation != manager.generation
+            or not self._mouse_allowed()
+        ):
+            self.hotkey.release_external_escape(token)
+            if epoch == self._input_epoch:
+                self._stop_mouse("blocked")
+            return
+        fd = self.hotkey.fileno()
+        if self.notifier is not None and fd != self._text_notifier_fd:
+            self.notifier.setEnabled(False)
+            self.notifier.deleteLater()
+            self.notifier = None
+        if fd >= 0 and self.notifier is None:
+            self.notifier = self._create_notifier(fd)
+            self.notifier.activated.connect(self._process_hotkey)
+            self._text_notifier_fd = fd
+        self._set_mouse_status("suspended", "Кнопка нажата — ожидаю удержание")
+        self._schedule_mouse_tick()
+
+    def _mouse_state(self, state: MouseHoldState, reason: str) -> None:
+        manager = self.command_mouse
+        if manager is None or self._mouse_arming:
+            return
+        if state == MouseHoldState.IDLE:
+            self._stop_mouse_timer("_mouse_tick_timer")
+            if self._closed:
+                self._release_input("mouse")
+                return
+            if self._input_owner == "mouse":
+                if self.phase in (DictationPhase.IDLE, DictationPhase.FINISHING):
+                    self._release_input("mouse")
+                elif self._preview_send is not None:
+                    self.reject_command()
+                else:
+                    self.orchestrator.cancel("mouse-" + reason)
+                self._release_mouse_escape()
+            if reason not in ("settings", "other-input", "session", "closed", "capture"):
+                self._queue_mouse_retry()
+            return
+        if (
+            self._input_owner != "mouse"
+            or self._mouse_operation_generation != manager.generation
+            or not self._mouse_allowed()
+        ):
+            self._stop_mouse("blocked")
+            return
+        if state == MouseHoldState.RECORDING:
+            self._command_capture_epoch = self._command_snapshot().blocked_epoch
+            self._command_capture_model = self._mouse_model_identity()
+            if self._command_mode is not None:
+                self._command_mode.begin()
+            self.orchestrator.on_hotkey_state(HotkeyState.RECORDING, "mouse-hold", mode="command")
+            self._schedule_mouse_tick()
+        elif state == MouseHoldState.PROCESSING:
+            self._stop_mouse_timer("_mouse_tick_timer")
+            self.orchestrator.on_hotkey_state(HotkeyState.PROCESSING, reason, mode="command")
+        self._mouse_changed()
+
+    def begin_command_mouse_capture(self) -> object | None:
+        if not self.command_mouse_can_edit or self._mouse_capture_token is not None:
+            return None
+        self._input_epoch += 1
+        self._input_owner = "mouse-capture"
+        token = object()
+        self._mouse_capture_token = token
+        self._mouse_capture_epoch = self._command_snapshot().blocked_epoch
+        self._mouse_capture_config = (
+            self.settings.command_enabled,
+            self.settings.command_mouse_enabled,
+        )
+        self._stop_command_regrab()
+        self._stop_mouse("capture")
+        if self.command_hotkey is not None:
+            self.command_hotkey.ungrab()
+        self._set_mouse_status("suspended", "Идёт выбор кнопки мыши")
+        if self.command_mouse_capture_valid(token):
+            return token
+        self.end_command_mouse_capture(token)
+        return None
+
+    def command_mouse_capture_valid(self, token: object) -> bool:
+        return bool(
+            token is self._mouse_capture_token
+            and self._input_owner == "mouse-capture"
+            and self.command_mouse_can_edit
+            and self._mouse_capture_epoch == self._command_snapshot().blocked_epoch
+            and self._mouse_capture_config
+            == (self.settings.command_enabled, self.settings.command_mouse_enabled)
+        )
+
+    def end_command_mouse_capture(self, token: object) -> None:
+        if token is not self._mouse_capture_token:
+            return
+        self._mouse_capture_token = None
+        self._release_input("mouse-capture")
+
+    def _invalidate_mouse_capture(self) -> None:
+        token = self._mouse_capture_token
+        if token is not None:
+            self.end_command_mouse_capture(token)
+        self._mouse_changed()
+
     def start_command_mode(self) -> None:
         """Explicit app boundary: read-only buses and passive command-key registration."""
-        if self._closed or not self.command_installed or self._command_client is not None:
+        if self._closed:
+            return
+        if self._recover_command_menu:
+            from astra_voice.platform.kwin_command_lease import KWinCommandLease, KWinLeaseError
+
+            try:
+                # app.main has already acquired the single-instance lock. Recover
+                # even if Cowork was removed or command mode is now disabled.
+                KWinCommandLease().recover()
+            except KWinLeaseError:
+                QTimer.singleShot(3000, self.start_command_mode)
+                return
+            self._recover_command_menu = False
+        if not self.command_installed or self._command_client is not None:
             return
         self._command_client = CoworkClient(self)
         self._command_session = SessionMonitor(self)
@@ -358,7 +847,8 @@ class DictationRuntime(QObject):
         self.orchestrator._command_preview = self._preview_command
         self._command_client.set_admission_guard(
             lambda: (
-                self.settings.command_enabled
+                self.command_installed
+                and self.settings.command_enabled
                 and self._command_snapshot().allowed
                 and self._command_snapshot().blocked_epoch == self._command_capture_epoch
             )
@@ -391,6 +881,8 @@ class DictationRuntime(QObject):
 
     def _command_owner_changed(self, present: bool) -> None:
         self._command_owner = present
+        if not self.command_installed:
+            return
         self.command_status = (
             "Astra Cowork найден · доступен" if present else "Astra Cowork найден · не запущен"
         )
@@ -401,17 +893,28 @@ class DictationRuntime(QObject):
             self.on_command_changed()
 
     def refresh_command_status(self) -> None:
+        was_installed = self.command_installed
         self.command_installed = is_installed()
         self.command_available = self.command_installed and self.session_kind == SessionKind.KDE
         if self.command_installed:
             self.start_command_mode()
+            if not was_installed and self._command_client is not None:
+                self.reload_command_hotkey()
         else:
+            self._stop_mouse("uninstalled")
+            self._invalidate_mouse_capture()
+            self._stop_command_regrab()
+            self.reject_command()
+            if self.command_hotkey is not None:
+                self.command_hotkey.ungrab()
             self.command_status = "Astra Cowork не установлен"
         self._command_changed()
-        if self._command_client is not None:
+        if self.command_installed and self._command_client is not None:
             self._command_client.status()
 
     def _command_status_changed(self, status: object) -> None:
+        if not self.command_installed:
+            return
         if isinstance(status, dict):
             state = status.get("state")
             if status.get("state_reason") == "session_unsupported":
@@ -439,6 +942,9 @@ class DictationRuntime(QObject):
             else (self._command_session.snapshot() if self._command_session else SessionSnapshot())
         )
         if not snapshot.allowed or not self._command_snapshot().allowed:
+            self._stop_mouse("session")
+            self._invalidate_mouse_capture()
+            self._set_mouse_status("suspended", "Сеанс заблокирован или недоступен")
             self._stop_command_regrab()
             self.reject_command()
             self.end_hotkey_capture()
@@ -475,11 +981,19 @@ class DictationRuntime(QObject):
         return manager.probe(combo).code
 
     def reload_command_hotkey(self) -> bool:
+        self._command_hold_epoch += 1
+        self.reload_command_mouse()
         manager = self.command_hotkey
         if self._closed or manager is None:
             self._stop_command_regrab()
             return False
         manager.ungrab()
+        if self._input_owner in ("mouse", "mouse-capture", "keyboard-capture"):
+            self._stop_command_regrab()
+            return False
+        if not self.command_installed:
+            self._stop_command_regrab()
+            return False
         if not self.settings.command_hotkey:
             self._stop_command_regrab()
             self.command_status = "Клавиша команды не распознана — выберите заново"
@@ -509,8 +1023,17 @@ class DictationRuntime(QObject):
             self._command_changed()
             return False
         manager.defer_single_super = True
-        manager.on_deferred_press = lambda: QTimer.singleShot(300, manager.tick)
+        manager.on_deferred_press = partial(self._schedule_command_hold, manager)
+        admission = self._command_snapshot()
+        if not admission.allowed:
+            self._stop_command_regrab()
+            return False
         result = manager.grab(self.settings.command_hotkey, HotkeyMode(self.settings.hotkey_mode))
+        current = self._command_snapshot()
+        if not current.allowed or current.blocked_epoch != admission.blocked_epoch:
+            manager.ungrab()
+            result = GrabResult("not-grabbed")
+        self._command_grab_epoch = admission.blocked_epoch if result.ok else None
         # X11 backend is lazy: the fd may only exist after the first allowed grab.
         # Initial login1 state is unknown, so startup cannot install this observer.
         fd = manager.fileno()
@@ -518,7 +1041,7 @@ class DictationRuntime(QObject):
             self._command_notifier = self._create_notifier(fd)
             self._command_notifier.activated.connect(self._process_command_hotkey)
         if not result.ok:
-            self.command_status = "Клавиша команды занята — выберите другую"
+            self.command_status = result.owner_hint or "Клавиша команды занята — выберите другую"
             self._start_command_regrab()
         else:
             self._stop_command_regrab()
@@ -530,12 +1053,33 @@ class DictationRuntime(QObject):
         self._command_changed()
         return result.ok
 
+    def _schedule_command_hold(self, manager: HotkeyManager) -> None:
+        self._command_hold_epoch += 1
+        hold_epoch = self._command_hold_epoch
+        epoch = self._input_epoch
+        grab_epoch = self._command_grab_epoch
+
+        def tick() -> None:
+            if (
+                not self._closed
+                and epoch == self._input_epoch
+                and hold_epoch == self._command_hold_epoch
+                and grab_epoch == self._command_grab_epoch
+                and manager is self.command_hotkey
+                and self._input_owner in (None, "keyboard")
+            ):
+                manager.tick()
+
+        self.schedule(300, tick)
+
     def _start_command_regrab(self) -> None:
         if (
             self._closed
+            or not self.command_installed
             or not self.settings.command_enabled
             or not self._command_snapshot().allowed
             or self._command_regrab_timer is not None
+            or self._input_owner in ("mouse", "mouse-capture", "keyboard-capture")
         ):
             return
         timer = self._create_timer()
@@ -595,6 +1139,13 @@ class DictationRuntime(QObject):
 
     def _process_command_hotkey(self, *args: object) -> None:
         if not self._closed and self.command_hotkey is not None:
+            snapshot = self._command_snapshot()
+            if not snapshot.allowed or snapshot.blocked_epoch != self._command_grab_epoch:
+                self.command_hotkey.ungrab()
+                self._command_grab_epoch = None
+                if snapshot.allowed:
+                    self.reload_command_hotkey()
+                return
             self.command_hotkey.process_pending()
 
     def _on_command_hotkey_state(self, state: HotkeyState, reason: str) -> None:
@@ -604,6 +1155,10 @@ class DictationRuntime(QObject):
         if reason.startswith(MAPPING_REGRAB_PREFIX):
             self._command_mapping_changed(reason)
             return
+        if self._input_owner not in (None, "keyboard") or self._capture_watchdog is not None:
+            if state == HotkeyState.RECORDING:
+                manager.fsm.escape(monotonic())
+            return
         if (
             state == HotkeyState.IDLE
             and reason == "escape-cancel"
@@ -612,8 +1167,10 @@ class DictationRuntime(QObject):
             self.reject_command()
             return
         if state == HotkeyState.RECORDING:
+            snapshot = self._command_snapshot()
             if (
-                not self._command_snapshot().allowed
+                not snapshot.allowed
+                or snapshot.blocked_epoch != self._command_grab_epoch
                 or self._loading_model
                 or self._selfcheck != "ok"
                 or self._pending_test is not None
@@ -624,7 +1181,10 @@ class DictationRuntime(QObject):
                 if self.orchestrator.mode != "command":
                     manager.fsm.escape(monotonic())
                 return
-            self._command_capture_epoch = self._command_snapshot().blocked_epoch
+            if not self._reserve_input("keyboard"):
+                manager.fsm.escape(monotonic())
+                return
+            self._command_capture_epoch = snapshot.blocked_epoch
             if self._command_mode is not None:
                 self._command_mode.begin()
             self._command_capture_model = (
@@ -635,11 +1195,12 @@ class DictationRuntime(QObject):
             return
         self.orchestrator.on_hotkey_state(state, reason, mode="command")
 
-    def _command_model_trusted(self) -> bool:
+    def _command_model_trusted(self, *, capture: tuple[int, object] | None = None) -> bool:
         # Snapshot scalar identity before file I/O, then verify it again afterwards:
         # the worker can be replaced or a manual path selected while current() reads.
         request = dict(self._model_load_request or {})
         generation = self.supervisor.generation
+        expected = self._command_capture_model if capture is None else capture
         store = self.model_store
         revoked = self._revoked_check
 
@@ -655,7 +1216,8 @@ class DictationRuntime(QObject):
                 and self._model_load_request == request
                 and self._model_load_generation == generation
                 and self.supervisor.generation == generation
-                and self._command_capture_model == (generation, request)
+                and expected == (generation, request)
+                and (capture is not None or self._command_capture_model == expected)
             )
 
         if not unchanged() or store is None or revoked is None:
@@ -884,7 +1446,11 @@ class DictationRuntime(QObject):
         if self._closed or not self._started or self.supervisor.state != "running":
             callback(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
             return False
-        if self._pending_test is not None:
+        if (
+            self._pending_test is not None
+            or self._input_owner is not None
+            or self._capture_watchdog is not None
+        ):
             callback(MicrophoneLevelUpdate("error", message=TEST_BUSY))
             return False
         return self.orchestrator.start_level_monitor(device, callback)
@@ -897,6 +1463,8 @@ class DictationRuntime(QObject):
         """Запускает частную проверку; новую модель мастера сначала загружает."""
         if (
             self._pending_test is not None
+            or self._input_owner is not None
+            or self._capture_watchdog is not None
             or self.orchestrator.test_active
             or self.orchestrator.level_active
             or self.phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
@@ -1228,6 +1796,8 @@ class DictationRuntime(QObject):
         """
         if self._closed:
             return
+        self._stop_mouse("model")
+        self._invalidate_mouse_capture()
         if self._switch_active() and not (_for_switch or retry_selfcheck):
             self._finish_switch("failed")
         # После пользовательского сброса хоткей закрыт уже до первого hello.
@@ -1479,6 +2049,8 @@ class DictationRuntime(QObject):
 
     def _on_worker_event(self, event: dict[str, Any]) -> None:
         """Обрабатывает загрузку модели и передаёт исходное событие оркестратору."""
+        if self._input_owner == "mouse" and not self._mouse_allowed():
+            self._stop_mouse("model")
         if self._switch_paused and self._switch_request_sent:
             if event.get("type") == "error" and (
                 event.get("request_type") == "model.load"
@@ -1602,6 +2174,16 @@ class DictationRuntime(QObject):
 
     def _on_hotkey_state(self, state: HotkeyState, reason: str) -> None:
         """Откладывает диктовку, пока воркер загружает модель."""
+        if reason.startswith(MAPPING_REGRAB_PREFIX):
+            self._validate_command_mapping()
+            self._on_mapping_regrab(reason)
+            if self.hotkey.fsm.state != state:
+                # Запись с удержанием уже остановлена (mapping-lost): состояние устарело.
+                return
+        if self._input_owner not in (None, "text") or self._capture_watchdog is not None:
+            if state == HotkeyState.RECORDING:
+                self.hotkey.fsm.escape(monotonic())
+            return
         if self.orchestrator.mode == "command" and self.orchestrator.phase not in (
             DictationPhase.IDLE,
             DictationPhase.FINISHING,
@@ -1609,12 +2191,6 @@ class DictationRuntime(QObject):
             if state == HotkeyState.RECORDING:
                 self.hotkey.fsm.escape(monotonic())
             return
-        if reason.startswith(MAPPING_REGRAB_PREFIX):
-            self._validate_command_mapping()
-            self._on_mapping_regrab(reason)
-            if self.hotkey.fsm.state != state:
-                # Запись с удержанием уже остановлена (mapping-lost): состояние устарело.
-                return
         if self._pending_test is not None:
             if state == HotkeyState.RECORDING:
                 log.info("хоткей: нажатие не передано диктовке — идёт проверка микрофона")
@@ -1652,6 +2228,9 @@ class DictationRuntime(QObject):
             if self.orchestrator.phase == DictationPhase.IDLE:
                 if self._command_publication_allowed():
                     self.pill.show_state(PillState.LOADING_MODEL)
+            return
+        if state == HotkeyState.RECORDING and not self._reserve_input("text"):
+            self.hotkey.fsm.escape(monotonic())
             return
         self.orchestrator.on_hotkey_state(state, reason)
 
@@ -1895,6 +2474,14 @@ class DictationRuntime(QObject):
         """Неудачи молчат; журнал отмечает только смену кода результата."""
         if self._closed or self._regrab_timer is None:
             return
+        # grab() отзывает внешний Escape: повтор ждёт завершения чужого ввода.
+        # Таймер сохраняется, чтобы восстановить текстовый хоткей после release.
+        if (
+            self._input_owner not in (None, "text")
+            or self._capture_watchdog is not None
+            or self._mouse_escape_token is not None
+        ):
+            return
         self._regrab_attempts += 1
         result = self._grab_hotkey()
         if result.ok:
@@ -1974,6 +2561,15 @@ class DictationRuntime(QObject):
         return timer
 
     def _run_pending_switch(self) -> None:
+        # Хвост предыдущей диктовки может завершиться во время нового нажатия.
+        # Его IDLE не завершает PENDING: owner и Escape принадлежат новому жесту.
+        pending_mouse = (
+            self._input_owner == "mouse"
+            and self.command_mouse is not None
+            and self.command_mouse.state is MouseHoldState.PENDING
+        )
+        if self._input_owner in ("mouse", "keyboard", "text") and not pending_mouse:
+            self._release_input(self._input_owner)
         self._promote_candidate()
         if not self._closed and self.phase == DictationPhase.IDLE and self._pending_switch:
             min_ram_mb, pause = self._pending_switch
@@ -2017,6 +2613,7 @@ class DictationRuntime(QObject):
         if fd >= 0:
             self.notifier = self._create_notifier(fd)
             self.notifier.activated.connect(self._process_hotkey)
+            self._text_notifier_fd = fd
         self.tick_timer = self._create_timer()
         self.tick_timer.timeout.connect(self._tick_hotkey)
         self.tick_timer.start(200)
@@ -2047,6 +2644,19 @@ class DictationRuntime(QObject):
         )
         if (
             self._closed
+            or self._input_owner not in (None, "keyboard-capture")
+            or self.phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
+            or self._preview_send is not None
+            or self._pending_test is not None
+            or self.orchestrator.test_active
+            or self.orchestrator.level_active
+            or self.hotkey.has_pending_press is True
+            or (self.command_hotkey is not None and self.command_hotkey.has_pending_press is True)
+            or self.hotkey.fsm.state in (HotkeyState.RECORDING, HotkeyState.PROCESSING)
+            or (
+                self.command_hotkey is not None
+                and self.command_hotkey.fsm.state in (HotkeyState.RECORDING, HotkeyState.PROCESSING)
+            )
             or self._command_suspended
             or locked
             or (role == "command" and not self._command_snapshot().allowed)
@@ -2056,17 +2666,25 @@ class DictationRuntime(QObject):
             if self._capture_watchdog.active:
                 return True
             self.end_hotkey_capture()
-        watchdog = self._capture_watchdog_factory()
-        watchdog.on_key_event = self._capture_key_callback
-        watchdog.on_expired = (
-            partial(self._capture_key_callback, "expired", "")
-            if self._capture_key_callback is not None
-            else None
-        )
-        self._capture_watchdog = watchdog
-        opened = watchdog.open(own_window=own_window or None)
-        if opened:
-            return True
+        self._input_epoch += 1
+        self._input_owner = "keyboard-capture"
+        try:
+            self._stop_mouse("capture")
+            self._stop_command_regrab()
+            if self.command_hotkey is not None:
+                self.command_hotkey.ungrab()
+            watchdog = self._capture_watchdog_factory()
+            self._capture_watchdog = watchdog
+            watchdog.on_key_event = self._capture_key_callback
+            watchdog.on_expired = (
+                partial(self._capture_key_callback, "expired", "")
+                if self._capture_key_callback is not None
+                else None
+            )
+            if watchdog.open(own_window=own_window or None):
+                return True
+        except Exception:
+            log.warning("Не удалось начать выбор комбинации")
         self.end_hotkey_capture()
         return False
 
@@ -2076,9 +2694,16 @@ class DictationRuntime(QObject):
 
     def end_hotkey_capture(self) -> None:
         """Завершает выбор комбинации и останавливает его сторож; идемпотентно."""
+        epoch = self._input_epoch
         watchdog, self._capture_watchdog = self._capture_watchdog, None
-        if watchdog is not None:
-            watchdog.close()
+        try:
+            if watchdog is not None:
+                watchdog.close()
+        except Exception:
+            log.warning("Не удалось закрыть сторож выбора комбинации")
+        finally:
+            if self._input_epoch == epoch:
+                self._release_input("keyboard-capture")
 
     def _process_hotkey(self, *args: object) -> None:
         """Передаёт готовность дескриптора менеджеру клавиш."""
@@ -2089,8 +2714,17 @@ class DictationRuntime(QObject):
         """Даёт готовому автомату проверить предел длительности фразы."""
         if not self._closed:
             self.hotkey.fsm.tick(monotonic())
-            if self.command_hotkey is not None:
+            if self.command_hotkey is not None and self._input_owner in (None, "keyboard"):
                 self.command_hotkey.tick(monotonic())
+            if self._mouse_capture_token is not None:
+                if not self.command_mouse_capture_valid(self._mouse_capture_token):
+                    self._invalidate_mouse_capture()
+            elif self.command_mouse is not None and self.settings.command_mouse_enabled:
+                if not self._mouse_allowed():
+                    self._stop_mouse("blocked")
+                    self._set_mouse_status("suspended", "Голосовые команды сейчас недоступны")
+                elif self._mouse_status == "suspended" and not self._input_busy():
+                    self._queue_mouse_retry()
 
     def _copy_last(self) -> None:
         """Копирует нормализованную фразу в буфер Qt с пометкой secret (У59)."""
@@ -2134,6 +2768,14 @@ class DictationRuntime(QObject):
         if self._closed:
             return
         self._closed = True
+        self._cleanup("выбор кнопки мыши", self._invalidate_mouse_capture)
+        self._cleanup("жест мыши", partial(self._stop_mouse, "closed"))
+        mouse_notifier, self._mouse_notifier = self._mouse_notifier, None
+        if mouse_notifier is not None:
+            self._cleanup("отключение наблюдателя мыши", partial(mouse_notifier.setEnabled, False))
+            self._cleanup("удаление наблюдателя мыши", mouse_notifier.deleteLater)
+        if self.command_mouse is not None:
+            self._cleanup("кнопка мыши", self.command_mouse.close)
         self._pending_switch = None
         self._cancel_pending_switch_timer()
         timer, self._switch_timer = self._switch_timer, None

@@ -35,7 +35,6 @@ Column {
         if (root.settings) {
             root.settings.refreshDevices()
             root.settings.refreshMicrophone()
-            root.settings.refreshCommandStatus()
         }
     }
 
@@ -82,6 +81,11 @@ Column {
 
     function deviceIdAt(index) {
         return index >= 0 && index < root.devices.length ? root.devices[index].id : ""
+    }
+
+    function focusKeyboardMode() {
+        modeSelector.forceActiveFocus(Qt.TabFocusReason)
+        return modeSelector
     }
 
     function isLocked(name) {
@@ -410,35 +414,6 @@ Column {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    SettingGroup {
-        width: root.width
-        title: qsTr("Команда помощнику")
-
-        CommandHotkeySettings { bridge: root.settings }
-        SettingRow {
-            width: parent.width
-            label: qsTr("Голосовые команды")
-            sub: qsTr("Передавать команды в Astra Cowork")
-            AvToggle {
-                id: commandEnabledToggle
-                enabled: root.settings ? root.settings.commandInstalled : false
-                Binding { target: commandEnabledToggle; property: "checked"; value: root.settings ? root.settings.commandEnabled : true }
-                onToggled: if (root.settings) root.settings.commandEnabled = checked
-            }
-        }
-        SettingRow {
-            width: parent.width
-            label: qsTr("Показывать команду перед отправкой")
-            sub: qsTr("Три секунды для отмены. Esc — не отправлять")
-            AvToggle {
-                id: commandPreviewToggle
-                enabled: root.settings ? root.settings.commandInstalled : false
-                Binding { target: commandPreviewToggle; property: "checked"; value: root.settings ? root.settings.commandPreview : false }
-                onToggled: if (root.settings) root.settings.commandPreview = checked
             }
         }
     }

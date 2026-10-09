@@ -81,12 +81,13 @@ def test_hardware_escape_cancels_preview_timer_before_submit(
 ) -> None:
     from astra_voice.core.command_mode import CommandMode
     from astra_voice.core.dictation import DictationPhase
-    from astra_voice.platform.hotkey import HotkeyBackend, HotkeyEvent, HotkeyManager, HotkeyMode
+    from astra_voice.platform.hotkey import HotkeyBackend, HotkeyEvent, HotkeyManager
 
     rig = Rig(monkeypatch, session_kind=SessionKind.KDE)
     runtime = rig.runtime
     runtime._command_session = Mock(snapshot=lambda: SessionSnapshot(known=True, locked=False))
     runtime._selfcheck = "ok"
+    runtime.command_installed = True
     runtime.settings.command_preview = True
     runtime.on_command_preview = Mock()
     client = Mock()
@@ -104,12 +105,19 @@ def test_hardware_escape_cancels_preview_timer_before_submit(
     backend.grab_combo.return_value = GrabResult("ok", keycode=133, mods=0)
     backend.grab_escape.return_value = GrabResult("ok", keycode=9)
     backend.poll_events.return_value = []
+    backend.combo_signature = Mock(return_value=(133, 0))
+    backend.fileno.return_value = -1
+    rig.hotkey.signature.return_value = (65, 4)
     manager = HotkeyManager(backend, clock=lambda: rig.now)
     runtime.command_hotkey = manager
     manager.on_state = runtime._on_command_hotkey_state
-    assert manager.grab("Super_L", HotkeyMode.PTT).ok
-    manager.handle_event(HotkeyEvent("KeyPress", 133, 1), 1.0)
-    manager.handle_event(HotkeyEvent("KeyRelease", 133, 2), 2.0)
+    # Register through runtime so the grab belongs to the verified session epoch.
+    assert runtime.reload_command_hotkey()
+    manager.handle_event(HotkeyEvent("KeyPress", 133, 1), rig.now)
+    rig.now += 0.31
+    manager.tick()
+    assert str(runtime.orchestrator.phase.value) == "recording"
+    manager.handle_event(HotkeyEvent("KeyRelease", 133, 2), rig.now)
     rig.fire_tail()
     runtime.orchestrator._result("не отправлять после Escape")
     assert runtime.orchestrator.phase == DictationPhase.DELIVERING

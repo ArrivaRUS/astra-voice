@@ -260,6 +260,7 @@ class X11Display:
         *,
         masks: Sequence[int] | None = None,
         keep: Collection[int] = (),
+        keyboard_sync: bool = False,
     ) -> GrabReport:
         """Захватывает все маски; любая ошибка вызывает откат, кроме масок ``keep``.
 
@@ -282,7 +283,12 @@ class X11Display:
                 catcher = error.CatchError(error.BadAccess)
                 before = self._error_count
                 self.root.grab_key(
-                    keycode, mask, True, X.GrabModeAsync, X.GrabModeAsync, onerror=catcher
+                    keycode,
+                    mask,
+                    True,
+                    X.GrabModeAsync,
+                    X.GrabModeSync if keyboard_sync else X.GrabModeAsync,
+                    onerror=catcher,
                 )
                 conn.sync()
                 caught = catcher.get_error()

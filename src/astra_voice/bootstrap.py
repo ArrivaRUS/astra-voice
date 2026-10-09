@@ -23,9 +23,9 @@ import os
 import sys
 from pathlib import Path
 
-COMMANDS = ("app", "worker", "helper", "selfinstall")
+COMMANDS = ("app", "worker", "helper", "selfinstall", "command-hotkey")
 
-USAGE = "usage: bootstrap.py {app|worker|helper|selfinstall} [аргументы]\n"
+USAGE = "usage: bootstrap.py {app|worker|helper|selfinstall|command-hotkey} [аргументы]\n"
 
 # Рендер Qt Quick. По умолчанию программный: GL-контекст стоит 65 МБ RSS
 # (167 740 → 102 580 кБ, замеры `spikes/m1_live/rss.md`), картинка совпадает.
@@ -204,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
         # Воркер повторит вызов после настройки журнала и запишет возможный сбой.
         deny_pulse_autospawn()
         _harden(command)
+    if command == "command-hotkey":
+        _harden(command)
     if command == "app":
         # Fly навязывает свой стиль через /etc/X11/Xsession.d/06-fly-misc-env,
         # поэтому ставим принудительно и до импорта Qt.
@@ -215,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
         from astra_voice.app import main as entry
     elif command == "worker":
         from astra_voice.worker.main import main as entry
+    elif command == "command-hotkey":
+        from astra_voice.worker.command_hotkey import main as entry
     else:
         from astra_voice.helper.main import main as entry
     return entry(rest)

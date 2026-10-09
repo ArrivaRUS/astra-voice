@@ -29,7 +29,7 @@ Rectangle {
         id: label
         textFormat: Text.PlainText
         text: root.text
-        color: Theme.hotkeyChipFg
+        color: root.enabled ? Theme.hotkeyChipFg : Theme.fgDisabled
         font.family: Theme.fontMono
         font.pixelSize: Theme.fontHotkeyKeySize
         font.letterSpacing: Theme.fontHotkeyKeyTracking * Theme.fontHotkeyKeySize

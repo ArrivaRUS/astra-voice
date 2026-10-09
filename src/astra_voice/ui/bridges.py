@@ -29,12 +29,18 @@ from astra_voice.core.dictation import (
     TestCallback,
     level_from_dbfs,
 )
-from astra_voice.core.settings import Settings, is_valid_combo, is_valid_command_combo
+from astra_voice.core.settings import (
+    Settings,
+    is_valid_combo,
+    is_valid_command_combo,
+    is_valid_command_mouse_button,
+)
 from astra_voice.core.settings import save as settings_save
 from astra_voice.platform.autostart import AutostartState
 from astra_voice.platform.external import open_external
 from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui import notify
+from astra_voice.ui.command_mouse_capture import CommandMouseCapture, mouse_button_label
 from astra_voice.ui.formatting import (
     clean_display_name,
     format_size,
@@ -131,6 +137,10 @@ _DEFAULT_DEVICE = {"id": "", "name": "Системный по умолчанию
 class SettingsBridge(QObject):
     """Публикует настройки и ошибки записи; каждый сеттер сразу пишет файл."""
 
+    commandMouseEnabledChanged = pyqtSignal()
+    commandMouseButtonChanged = pyqtSignal()
+    commandMouseStateChanged = pyqtSignal()
+    commandMouseCaptureChanged = pyqtSignal()
     commandHotkeyChanged = pyqtSignal()
     commandEnabledChanged = pyqtSignal()
     commandPreviewChanged = pyqtSignal()
@@ -175,6 +185,8 @@ class SettingsBridge(QObject):
     etaChanged = pyqtSignal()
 
     _FIELDS = {
+        "commandMouseEnabled": "command_mouse_enabled",
+        "commandMouseButton": "command_mouse_button",
         "commandHotkey": "command_hotkey",
         "commandEnabled": "command_enabled",
         "commandPreview": "command_preview",
@@ -217,6 +229,7 @@ class SettingsBridge(QObject):
         self._locked = frozenset(locked)
         self._apply = apply
         self._command_host: Any = None
+        self._command_capture_cancelling = False
         self._command_preview_text = ""
         self._autostart = autostart
         self._capture = capture if capture is not None else HotkeyCapture(capture_host, self)
@@ -228,6 +241,12 @@ class SettingsBridge(QObject):
             "freeCandidates",
         ):
             getattr(self._capture, name + "Changed").connect(getattr(self, name + "Changed"))
+        self._mouse_capture = CommandMouseCapture(
+            self, keyboard_active=self._keyboard_capture_active
+        )
+        self._mouse_capture.changed.connect(self.commandMouseCaptureChanged)
+        self._mouse_capture.availabilityChanged.connect(self.commandMouseStateChanged)
+        self._capture.captureStateChanged.connect(self._keyboard_capture_changed)
         self._save = save
         self._values = self._read_values()
         self._sync_autostart()
@@ -470,7 +489,7 @@ class SettingsBridge(QObject):
     def eta(self) -> str:  # noqa: N802
         return self._downloads.eta if self._downloads is not None else ""
 
-    def _read_values(self) -> dict[str, str | bool]:
+    def _read_values(self) -> dict[str, str | bool | int]:
         settings = self._mirror if self._mirror is not None else self._settings
         return {
             name: (settings.extra.get("device") or "")
@@ -561,6 +580,9 @@ class SettingsBridge(QObject):
             log.info("%s: настройка задана администратором", field)
             getattr(self, name + "Changed").emit()
             return
+        if name == "commandHotkey" and not self._command_hotkey_editable():
+            self.commandHotkeyChanged.emit()
+            return
         if self._values[name] == value:
             return
         if (
@@ -575,6 +597,9 @@ class SettingsBridge(QObject):
             return
         if name == "commandHotkey" and self._command_host is not None:
             code = self._command_host.check_command_hotkey(cast(str, value))
+            if not self._command_hotkey_editable():
+                self.commandHotkeyChanged.emit()
+                return
             if code != "ok" and not (code == "busy" and self._capture.keep_busy):
                 getattr(self, name + "Changed").emit()
                 self._capture._set_state(
@@ -673,18 +698,190 @@ class SettingsBridge(QObject):
     def bind_command_host(self, host: Any) -> None:
         """Связывается после создания runtime; проверки не открывают микрофон."""
         self._command_host = host
+        self._mouse_capture.bind_host(host)
         host.on_command_changed = self.update_command_state
         host.on_command_preview = self.update_command_preview
         self.update_command_state()
 
+    def _command_hotkey_editable(self) -> bool:
+        if self._command_capture_cancelling:
+            return False
+        if self.commandInstalled:
+            return True
+        if self.captureRole == "command" and (
+            self._capture.state != "idle" or self._capture.pending_combo
+        ):
+            self._command_capture_cancelling = True
+            try:
+                self._capture.cancel()
+            finally:
+                self._command_capture_cancelling = False
+        return False
+
     def update_command_state(self) -> None:
+        if self.captureRole == "command":
+            self._command_hotkey_editable()
         self.commandStateChanged.emit()
+        if self._mouse_capture.active:
+            self._mouse_capture.validate()
+        self.commandMouseStateChanged.emit()
 
     def update_command_preview(self, text: str) -> None:
         # Runtime публикует только при explicit preview и подтверждённом unlock;
         # при lock/sleep очищает тем же callback. Речь не попадает в feedback.
         self._command_preview_text = text if self.commandPreview else ""
         self.commandPreviewTextChanged.emit()
+
+    def attach_window(self, window: QObject) -> None:
+        self._mouse_capture.attach_window(window)
+
+    def _keyboard_capture_active(self) -> bool:
+        return self._capture.state not in ("idle", "success")
+
+    def _keyboard_capture_changed(self) -> None:
+        if self.captureRole == "command":
+            self._command_hotkey_editable()
+        if self._keyboard_capture_active() and self._mouse_capture.active:
+            self._mouse_capture.cancel()
+        self.commandMouseStateChanged.emit()
+
+    def _save_mouse_value(self, name: str, value: bool | int) -> bool:
+        field = self._FIELDS[name]
+        if self.is_locked(field):
+            log.info("%s: настройка задана администратором", field)
+            getattr(self, name + "Changed").emit()
+            return False
+        old = getattr(self._settings, field)
+        setattr(self._settings, field, value)
+        try:
+            self._save(self._settings)
+        except OSError:
+            setattr(self._settings, field, old)
+            self._save_error = "Не удалось сохранить настройки"
+            log.warning("Не удалось сохранить настройки")
+            getattr(self, name + "Changed").emit()
+            self.saveErrorChanged.emit()
+            return False
+        if self._mirror is not None:
+            setattr(self._mirror, field, value)
+        self._values[name] = value
+        if self._save_error:
+            self._save_error = ""
+            self.saveErrorChanged.emit()
+        getattr(self, name + "Changed").emit()
+        return True
+
+    @pyqtProperty(bool, notify=commandMouseEnabledChanged)
+    def commandMouseEnabled(self) -> bool:  # noqa: N802
+        return cast(bool, self._values["commandMouseEnabled"])
+
+    @commandMouseEnabled.setter  # type: ignore[no-redef]
+    def commandMouseEnabled(self, value: bool) -> None:  # noqa: N802
+        if self._mouse_capture.active:
+            self._mouse_capture.validate()
+        if self.is_locked("command_mouse_enabled"):
+            log.info("command_mouse_enabled: настройка задана администратором")
+            self.commandMouseEnabledChanged.emit()
+            return
+        if type(value) is not bool:
+            self.commandMouseEnabledChanged.emit()
+            return
+        if value == self.commandMouseEnabled:
+            return
+        # Disable remains possible while an operation owns input or the host is absent.
+        if value and (
+            not self.commandMouseCanEdit
+            or self._mouse_capture.active
+            or self._mouse_capture.state != "idle"
+            or not is_valid_command_mouse_button(self.commandMouseButton)
+        ):
+            self.commandMouseEnabledChanged.emit()
+            return
+        if self._save_mouse_value("commandMouseEnabled", value):
+            if not value:
+                self._mouse_capture.cancel()
+            self._mouse_capture.reload()
+
+    @pyqtProperty(int, notify=commandMouseButtonChanged)
+    def commandMouseButton(self) -> int:  # noqa: N802
+        return cast(int, self._values["commandMouseButton"])
+
+    @pyqtProperty(str, notify=commandMouseButtonChanged)
+    def commandMouseButtonLabel(self) -> str:  # noqa: N802
+        return mouse_button_label(self.commandMouseButton)
+
+    @pyqtProperty(str, notify=commandMouseStateChanged)
+    def commandMouseStatus(self) -> str:  # noqa: N802
+        return self._mouse_capture.status if self.commandMouseEnabled else "disabled"
+
+    @pyqtProperty(str, notify=commandMouseStateChanged)
+    def commandMouseStatusMessage(self) -> str:  # noqa: N802
+        if self._mouse_capture.host is None:
+            return self._mouse_capture.status_message
+        if not self.commandMouseEnabled:
+            return "Управление кнопкой мыши выключено"
+        return self._mouse_capture.status_message
+
+    @pyqtProperty(bool, notify=commandMouseStateChanged)
+    def commandMouseCanEdit(self) -> bool:  # noqa: N802
+        return not self.is_locked("command_mouse_button") and self._mouse_capture.can_edit
+
+    @pyqtProperty(str, notify=commandMouseCaptureChanged)
+    def commandMouseCaptureState(self) -> str:  # noqa: N802
+        return self._mouse_capture.state
+
+    @pyqtProperty(int, notify=commandMouseCaptureChanged)
+    def commandMousePendingButton(self) -> int:  # noqa: N802
+        return self._mouse_capture.pending_button
+
+    @pyqtProperty(str, notify=commandMouseCaptureChanged)
+    def commandMousePendingButtonLabel(self) -> str:  # noqa: N802
+        return mouse_button_label(self._mouse_capture.pending_button)
+
+    @pyqtProperty(str, notify=commandMouseCaptureChanged)
+    def commandMouseCaptureMessage(self) -> str:  # noqa: N802
+        return self._mouse_capture.message
+
+    @pyqtSlot(result=bool)
+    def beginCommandMouseCapture(self) -> bool:  # noqa: N802
+        if self._mouse_capture.active:
+            self._mouse_capture.validate()
+            return False
+        return bool(self.commandMouseCanEdit and self._mouse_capture.begin())
+
+    @pyqtSlot(int)
+    def commandMouseCapturePressed(self, qt_button: int) -> None:  # noqa: N802
+        self._mouse_capture.press(qt_button)
+
+    @pyqtSlot(int, int)
+    def commandMouseCaptureReleased(self, qt_button: int, qt_buttons_remaining: int) -> None:  # noqa: N802
+        self._mouse_capture.release(qt_button, qt_buttons_remaining)
+
+    @pyqtSlot(int, result=bool)
+    def selectCommandMouseButton(self, button: int) -> bool:  # noqa: N802
+        if self._mouse_capture.active:
+            self._mouse_capture.validate()
+            return False
+        return bool(self.commandMouseCanEdit and self._mouse_capture.select(button))
+
+    @pyqtSlot(result=bool)
+    def applyCommandMouseButton(self) -> bool:  # noqa: N802
+        if not self._mouse_capture.ready() or not self.commandMouseCanEdit:
+            return False
+        generation = self._mouse_capture.generation
+        if not self._save_mouse_value("commandMouseButton", self.commandMousePendingButton):
+            if generation == self._mouse_capture.generation:
+                self._mouse_capture.save_failed()
+            return False
+        # Runtime sees the committed setting before releasing/rearming the lease.
+        self._mouse_capture.reload()
+        if generation == self._mouse_capture.generation:
+            self._mouse_capture.cancel()
+        return True
+
+    @pyqtSlot()
+    def cancelCommandMouseCapture(self) -> None:  # noqa: N802
+        self._mouse_capture.cancel()
 
     @pyqtProperty(str, notify=commandHotkeyChanged)
     def commandHotkey(self) -> str:  # noqa: N802
@@ -776,6 +973,8 @@ class SettingsBridge(QObject):
         self.commandDetailsRequested.emit()
 
     def save_command_capture_combo(self, combo: str, keep: bool) -> str:
+        if not self._command_hotkey_editable():
+            return "not-grabbed"
         self._set_value("commandHotkey", combo)
         if self.saveError or self.commandHotkey != combo:
             return {"duplicate": "duplicate", "conflict": "busy"}.get(
@@ -785,7 +984,8 @@ class SettingsBridge(QObject):
 
     @pyqtSlot()
     def beginCommandCapture(self) -> None:  # noqa: N802
-        self._capture.begin(self.save_command_capture_combo, role="command")
+        if not self._mouse_capture.active and self._command_hotkey_editable():
+            self._capture.begin(self.save_command_capture_combo, role="command")
 
     @pyqtSlot()
     def useCommandWin(self) -> None:  # noqa: N802
@@ -838,10 +1038,13 @@ class SettingsBridge(QObject):
 
     @pyqtSlot()
     def beginCapture(self) -> None:  # noqa: N802
-        self._capture.begin(self.save_capture_combo)
+        if not self._mouse_capture.active:
+            self._capture.begin(self.save_capture_combo)
 
     @pyqtSlot(str)
     def endCapture(self, combo: str) -> None:  # noqa: N802
+        if self.captureRole == "command" and not self._command_hotkey_editable():
+            return
         save = (
             self.save_command_capture_combo
             if self.captureRole == "command"
@@ -855,10 +1058,14 @@ class SettingsBridge(QObject):
 
     @pyqtSlot()
     def keepCombo(self) -> None:  # noqa: N802
+        if self.captureRole == "command" and not self._command_hotkey_editable():
+            return
         self._capture.keep()
 
     @pyqtSlot()
     def refreshCandidates(self) -> None:  # noqa: N802
+        if self.captureRole == "command" and not self._command_hotkey_editable():
+            return
         self._capture.refresh_candidates()
 
     @pyqtProperty(str, notify=hotkeyModeChanged)
@@ -1961,7 +2168,7 @@ class OnboardingController(QObject):
 
     @pyqtSlot()
     def beginCapture(self) -> None:  # noqa: N802
-        self._capture.begin(self._bridge.save_capture_combo)
+        self._bridge.beginCapture()
 
     @pyqtSlot(str)
     def endCapture(self, combo: str) -> None:  # noqa: N802
@@ -1973,11 +2180,11 @@ class OnboardingController(QObject):
 
     @pyqtSlot()
     def keepCombo(self) -> None:  # noqa: N802
-        self._capture.keep()
+        self._bridge.keepCombo()
 
     @pyqtSlot()
     def refreshCandidates(self) -> None:  # noqa: N802
-        self._capture.refresh_candidates()
+        self._bridge.refreshCandidates()
 
     @pyqtProperty(bool, notify=doneChanged)
     def done(self) -> bool:

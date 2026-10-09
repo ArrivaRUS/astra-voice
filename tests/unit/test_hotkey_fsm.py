@@ -404,6 +404,7 @@ class FakeDisplay(X11Display):
         *,
         masks: Sequence[int] | None = None,
         keep: Collection[int] = (),
+        keyboard_sync: bool = False,
     ) -> GrabReport:
         self.calls.append(("grab", keycode, base_mask))
         variants = tuple(masks) if masks is not None else tuple(self.mask_variants(base_mask))
