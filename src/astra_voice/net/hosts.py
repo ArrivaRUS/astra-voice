@@ -4,6 +4,7 @@ ALLOWED_HOSTS = (
     "github.com",
     "api.github.com",
     "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
     "huggingface.co",
     "hf.co",
 )

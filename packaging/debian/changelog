@@ -1,3 +1,11 @@
+astra-voice (0.1.2) unstable; urgency=medium
+
+  * Исправлена загрузка файлов выпуска после перенаправления GitHub
+    на release-assets.githubusercontent.com; проверки адресов и подписанных
+    контрольных сумм сохранены.
+
+ -- ArrivaRUS <arrivarus@gmail.com>  Fri, 09 Oct 2026 22:12:54 +0300
+
 astra-voice (0.1.1) unstable; urgency=medium
 
   * Добавлены проверка подписи обновлений, загрузка по подтверждению
