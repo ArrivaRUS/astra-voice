@@ -169,15 +169,13 @@ def rect(item: QQuickItem, row: QQuickItem) -> QRectF:
 def foreground(row: QQuickItem) -> dict[str, QQuickItem]:
     visible = [item for item in visual_tree(row) if item.isVisible()]
     label = next(item for item in visible if item.property("text") == "Микрофон")
-    hint = next(item for item in visible if item.property("text") == "?").parentItem()
-    assert hint is not None
     selector = next(
         item
         for item in visible
         if item.metaObject().indexOfProperty("popupMaxWidth") >= 0
         and item.metaObject().indexOfProperty("currentIndex") >= 0
     )
-    result = {"label": label, "help": hint, "selector": selector}
+    result = {"label": label, "selector": selector}
     for item in visible:
         text = item.property("text")
         if item.metaObject().indexOfProperty("stepSize") >= 0:
@@ -217,7 +215,7 @@ def assert_layout(rendered: Rendered, state: str) -> None:
                 right_name,
                 details,
             )
-    # All primary controls, including ? and both optional actions, share one axis.
+    # All primary controls and both optional actions share one axis.
     axis_names = [
         name
         for name in boxes

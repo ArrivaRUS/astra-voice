@@ -276,10 +276,10 @@ Column {
                 y: Theme.spaceCardRowDivider + Theme.cardRowPaddingY
                 width: parent.width - Theme.cardRowPaddingX * 2
                 height: deviceSelector.implicitHeight
-                readonly property int controlCount: 3 + (micSlider.visible ? 2 : 0)
+                readonly property int controlCount: 2 + (micSlider.visible ? 2 : 0)
                     + (raiseMic.visible ? 1 : 0) + (restoreMic.visible ? 1 : 0)
                     + (soundSettings.visible ? 1 : 0)
-                readonly property real fixedWidth: micLabel.width + micHint.width
+                readonly property real fixedWidth: micLabel.width
                     + (volumeText.visible ? volumeText.width : 0)
                     + (raiseMic.visible ? raiseMic.width : 0)
                     + (restoreMic.visible ? restoreMic.width : 0)
@@ -308,30 +308,9 @@ Column {
                     renderType: Text.NativeRendering
                     anchors.verticalCenter: parent.verticalCenter
                 }
-                Rectangle {
-                    id: micHint
-                    x: micAxis.after(micLabel) + micAxis.stretch
-                    width: Theme.hintSize
-                    height: Theme.hintSize
-                    radius: Theme.hintSize / 2
-                    color: "transparent"
-                    antialiasing: true
-                    border.width: Theme.borderHairline
-                    border.color: Theme.fgFaint
-                    anchors.verticalCenter: parent.verticalCenter
-                    Text {
-                        anchors.centerIn: parent
-                        text: "?"
-                        color: Theme.fgMuted
-                        font.family: Theme.fontUi
-                        font.pixelSize: 10
-                        font.weight: Font.Medium
-                        renderType: Text.NativeRendering
-                    }
-                }
                 AvSelect {
                     id: deviceSelector
-                    x: micAxis.after(micHint)
+                    x: micAxis.after(micLabel) + micAxis.stretch
                     width: micAxis.selectorWidth
                     popupMaxWidth: micAxis.width
                     // The selector shares its row with actions on the right. Keep a

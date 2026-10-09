@@ -1,5 +1,5 @@
 // Строка настройки — design/spec.md §3.2.
-// Порядок слева направо: подпись и пояснение → «?» → бейдж замка → контрол.
+// Порядок слева направо: подпись и пояснение → бейдж замка → контрол.
 // Строка С ТУМБЛЕРОМ кликабельна целиком и подсвечивается на hover (решение У5);
 // строка со списком, кнопкой или полем реагирует только на сам контрол.
 import QtQuick 2.15
@@ -11,7 +11,8 @@ Item {
 
     property string label: ""
     property string sub: ""
-    property bool showHint: true
+    // Compatibility for existing callers; decorative question marks were removed 09.10.2026.
+    property bool showHint: false
     // Разделитель сверху: ставится у каждой строки, кроме первой в карточке (§3.1).
     property bool divider: true
     // Строка целиком кликабельна и переключает этот тумблер (У5).
@@ -108,29 +109,6 @@ Item {
                 lineHeightMode: Text.FixedHeight
                 renderType: Text.NativeRendering
                 wrapMode: Text.WordWrap
-            }
-        }
-
-        // Значок «?» — 15 × 15, круг, граница 1 px fg-faint, текст 10 / 500 (§3.2).
-        Rectangle {
-            Layout.preferredWidth: Theme.hintSize
-            Layout.preferredHeight: Theme.hintSize
-            Layout.alignment: Qt.AlignVCenter
-            radius: Theme.hintSize / 2
-            antialiasing: true
-            color: "transparent"
-            border.width: Theme.borderHairline
-            border.color: Theme.fgFaint
-            visible: root.showHint
-
-            Text {
-                anchors.centerIn: parent
-                text: "?"
-                color: Theme.fgMuted
-                font.family: Theme.fontUi
-                font.pixelSize: 10  // §3.2: текст значка «?» — 10 / 500
-                font.weight: Font.Medium
-                renderType: Text.NativeRendering
             }
         }
 
