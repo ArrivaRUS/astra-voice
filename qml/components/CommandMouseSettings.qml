@@ -146,7 +146,7 @@ Column {
         width: parent.width
         label: qsTr("Кнопка мыши")
         sub: root.mouseEnabled && root.bridge && root.bridge.commandEnabled && root.status === "ready"
-            ? qsTr("Только удержание, независимо от режима клавиатуры")
+            ? ""
             : root.mouseEnabled ? root.statusMessage
             : qsTr("Выключено — обычные действия кнопки сохранены")
         showHint: false

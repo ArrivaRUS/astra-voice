@@ -150,6 +150,8 @@ class SettingsBridge(QObject):
     captureRoleChanged = pyqtSignal()
     hotkeyChanged = pyqtSignal()
     hotkeyModeChanged = pyqtSignal()
+    soundCuesEnabledChanged = pyqtSignal()
+    soundCuesStatusChanged = pyqtSignal()
     pillEnabledChanged = pyqtSignal()
     languageChanged = pyqtSignal()
     checkAppUpdatesChanged = pyqtSignal()
@@ -192,6 +194,7 @@ class SettingsBridge(QObject):
         "commandPreview": "command_preview",
         "hotkey": "hotkey",
         "hotkeyMode": "hotkey_mode",
+        "soundCuesEnabled": "sound_cues_enabled",
         "pillEnabled": "pill_enabled",
         "language": "language",
         "checkAppUpdates": "check_app_updates",
@@ -229,6 +232,7 @@ class SettingsBridge(QObject):
         self._locked = frozenset(locked)
         self._apply = apply
         self._command_host: Any = None
+        self._sound_cues_host: Any = None
         self._command_capture_cancelling = False
         self._command_preview_text = ""
         self._autostart = autostart
@@ -689,6 +693,10 @@ class SettingsBridge(QObject):
                 self._set_microphone_error(False)
                 self.refreshMicrophone()
                 self.microphoneChanged.emit()
+        if name == "soundCuesEnabled":
+            if self._sound_cues_host is not None:
+                self._sound_cues_host.apply_sound_cues_enabled(self.soundCuesEnabled)
+            self.soundCuesStatusChanged.emit()
         if name in ("commandHotkey", "commandEnabled", "commandPreview", "hotkeyMode"):
             if self._command_host is not None:
                 self._command_host.reload_command_hotkey()
@@ -1075,6 +1083,27 @@ class SettingsBridge(QObject):
     @hotkeyMode.setter  # type: ignore[no-redef]
     def hotkeyMode(self, value: str) -> None:  # noqa: N802
         self._set_value("hotkeyMode", value)
+
+    def bind_sound_cues_host(self, host: Any) -> None:
+        self._sound_cues_host = host
+        host.on_sound_cues_changed = self.soundCuesStatusChanged.emit
+        self.soundCuesStatusChanged.emit()
+
+    @pyqtProperty(bool, notify=soundCuesEnabledChanged)
+    def soundCuesEnabled(self) -> bool:  # noqa: N802
+        return cast(bool, self._values["soundCuesEnabled"])
+
+    @soundCuesEnabled.setter  # type: ignore[no-redef]
+    def soundCuesEnabled(self, value: bool) -> None:  # noqa: N802
+        self._set_value("soundCuesEnabled", value)
+
+    @pyqtProperty(str, notify=soundCuesStatusChanged)
+    def soundCuesStatus(self) -> str:  # noqa: N802
+        if not self.soundCuesEnabled:
+            return ""
+        if self._sound_cues_host is None:
+            return "Звуковые сигналы недоступны: запись не готова"
+        return str(self._sound_cues_host.sound_cues_status)
 
     @pyqtProperty(bool, notify=pillEnabledChanged)
     def pillEnabled(self) -> bool:  # noqa: N802

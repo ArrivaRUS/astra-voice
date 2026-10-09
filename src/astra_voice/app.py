@@ -95,6 +95,11 @@ def _copy_shutdown_resources(
     processes: list[Any] = []
     threads = [getattr(downloads, "_model_thread", None), getattr(update_checker, "_thread", None)]
     if runtime is not None:
+        cues = getattr(runtime, "recording_cues", None)
+        if cues is not None:
+            threads.append(cues.thread)
+            if cues.process is not None:
+                processes.append(cues.process)
         for supervisor in (runtime.supervisor, runtime._switch_candidate):
             if supervisor is not None:
                 processes.extend(supervisor._retired)
@@ -1655,6 +1660,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if runtime_ready and runtime is not None:
             settings_bridge.bind_command_host(runtime)
+            settings_bridge.bind_sound_cues_host(runtime)
             runtime.pill.on_copy_clicked = runtime._copy_last
 
             def show_command_details() -> None:

@@ -48,6 +48,7 @@ class Session(service.Object):  # type: ignore[name-defined]
             "Remote": dbus.Boolean(False),
             "Display": ":99",
             "LockedHint": dbus.Boolean(False),
+            "Active": dbus.Boolean(True),
         }
 
 

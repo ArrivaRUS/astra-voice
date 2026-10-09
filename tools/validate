@@ -289,6 +289,10 @@ def release(args: argparse.Namespace) -> int:
         required += [image_name, "sbom-appimage.cdx.json", sources_name]
     # SECURITY.md публикуется с v0.2 (release_assets.sh); в v0.1.0 его не было.
     optional = ["SECURITY.md"]
+    image_archive_name = image_name + ".tar.gz"
+    # Дополнительный транспортный архив: старые выпуски без него остаются валидны.
+    if with_appimage:
+        optional.append(image_archive_name)
     paths = {name: directory / name for name in required}
     paths.update({name: directory / name for name in optional if (directory / name).exists()})
     if deb is not None:
@@ -302,7 +306,11 @@ def release(args: argparse.Namespace) -> int:
         if name == sources_name:
             # Даже сжатый архив не читаем до успешной проверки подписи SHA256SUMS.
             continue
-        limit = ARTIFACT_LIMIT if name.endswith((".deb", ".AppImage")) else ASSET_LIMIT
+        limit = (
+            ARTIFACT_LIMIT
+            if name.endswith((".deb", ".AppImage")) or name == image_archive_name
+            else ASSET_LIMIT
+        )
         try:
             snapshots[name] = release_read(path, limit)
         except FileNotFoundError:

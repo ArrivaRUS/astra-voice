@@ -16,15 +16,17 @@ from typing import Any, cast
 
 import pytest
 from PyQt5 import sip
-from PyQt5.QtCore import QPointF, QRectF, QSizeF, QUrl, qInstallMessageHandler
-from PyQt5.QtQml import QQmlApplicationEngine
+from PyQt5.QtCore import QPointF, QRectF, QSizeF, Qt, QUrl, qInstallMessageHandler
+from PyQt5.QtQml import QQmlApplicationEngine, QQmlEngine, QQmlExpression
 from PyQt5.QtQuick import QQuickItem, QQuickWindow
 from PyQt5.QtTest import QTest
+from test_onboarding import FakeTheme
 
 from astra_voice.core.settings import Settings
 from astra_voice.platform.sound import MicrophoneState
 from astra_voice.ui.bridges import SettingsApply, SettingsBridge
 from astra_voice.ui.icons import install_icon_provider
+from astra_voice.worker.audio import AudioDevice
 from helpers.qt_app import get_qapplication
 
 pytestmark = pytest.mark.xvfb
@@ -35,6 +37,8 @@ STATES = {
     "unknown": MicrophoneState(),
     "muted": MicrophoneState(known=True, muted=True, percent=60),
     "normal": MicrophoneState(known=True, muted=False, percent=60),
+    "low_restore": MicrophoneState(known=True, muted=False, percent=20),
+    "muted_restore": MicrophoneState(known=True, muted=True, percent=60),
     "locked": MicrophoneState(known=True, muted=False, percent=60),
     "locked_unknown": MicrophoneState(),
     "locked_muted": MicrophoneState(known=True, muted=True, percent=60),
@@ -57,6 +61,8 @@ class Rendered:
     state: list[MicrophoneState]
     reads: list[MicrophoneState]
     engine: QQmlApplicationEngine
+    saved_changes: list[dict[str, Any]]
+    device_changes: list[str | None]
 
 
 @contextmanager
@@ -67,6 +73,10 @@ def render(
     can_raise: bool = True,
     late_bridge: bool = False,
     microphone: MicrophoneState | None = None,
+    can_sound: bool = True,
+    dark: bool = False,
+    device_name: str = "",
+    saved_device: str = "",
 ) -> Iterator[Rendered]:
     app = get_qapplication()
     messages: list[str] = []
@@ -78,6 +88,8 @@ def render(
     # Это только контракт SettingsApply: ни SoundControl, ни системных команд.
     mic_state = [microphone if microphone is not None else STATES[state]]
     reads: list[MicrophoneState] = []
+    saved_changes: list[dict[str, Any]] = []
+    device_changes: list[str | None] = []
 
     def microphone_state() -> MicrophoneState:
         reads.append(mic_state[0])
@@ -85,20 +97,25 @@ def render(
 
     apply = SimpleNamespace(
         has_volume_control=can_raise,
-        has_sound_settings=True,
+        has_sound_settings=can_sound,
         has_sound_service=False,
-        can_restore_microphone_volume=False,
+        can_restore_microphone_volume=state.endswith("_restore"),
         microphone_state=microphone_state,
+        device=device_changes.append,
     )
     bridge = SettingsBridge(
-        Settings(),
+        Settings(extra={"device": saved_device} if saved_device else {}),
         apply=cast(SettingsApply, apply),
         locked=["device", "mic_volume_on_start"] if state.startswith("locked") else [],
-        device_provider=lambda: [],
-        save=lambda settings: None,
+        device_provider=lambda: (
+            [AudioDevice(1, "long-device", device_name, False)] if device_name else []
+        ),
+        save=lambda settings: saved_changes.append(settings.to_dict()),
     )
     engine = QQmlApplicationEngine()
     install_icon_provider(engine)
+    theme = FakeTheme(dark)
+    engine.rootContext().setContextProperty("themeSource", theme)
     if not late_bridge:
         engine.rootContext().setContextProperty("settingsBridge", bridge)
     try:
@@ -123,7 +140,18 @@ def render(
         ]
         assert len(rows) == 1, messages
         assert bridge.canRaiseMicrophone == can_raise
-        yield Rendered(window, rows[0], bridge, messages, apply, mic_state, reads, engine)
+        yield Rendered(
+            window,
+            rows[0],
+            bridge,
+            messages,
+            apply,
+            mic_state,
+            reads,
+            engine,
+            saved_changes,
+            device_changes,
+        )
     finally:
         for root in engine.rootObjects():
             if isinstance(root, QQuickWindow):
@@ -141,15 +169,13 @@ def rect(item: QQuickItem, row: QQuickItem) -> QRectF:
 def foreground(row: QQuickItem) -> dict[str, QQuickItem]:
     visible = [item for item in visual_tree(row) if item.isVisible()]
     label = next(item for item in visible if item.property("text") == "Микрофон")
-    hint = next(item for item in visible if item.property("text") == "?").parentItem()
-    assert hint is not None
     selector = next(
         item
         for item in visible
         if item.metaObject().indexOfProperty("popupMaxWidth") >= 0
         and item.metaObject().indexOfProperty("currentIndex") >= 0
     )
-    result = {"label": label, "help": hint, "selector": selector}
+    result = {"label": label, "selector": selector}
     for item in visible:
         text = item.property("text")
         if item.metaObject().indexOfProperty("stepSize") >= 0:
@@ -189,8 +215,32 @@ def assert_layout(rendered: Rendered, state: str) -> None:
                 right_name,
                 details,
             )
-    # Название настройки остаётся на основной строке выбора устройства.
-    assert boxes["label"].center().y() <= boxes["selector"].bottom() + 1, details
+    # All primary controls and both optional actions share one axis.
+    axis_names = [
+        name
+        for name in boxes
+        if name != "policy"
+        and not (name == "status" and not str(items[name].property("text")).endswith(" %"))
+    ]
+    centers = [boxes[name].center().y() for name in axis_names]
+    assert max(centers) - min(centers) <= 1, details
+    ordered = sorted((boxes[name] for name in axis_names), key=lambda box: box.left())
+    for left, right in zip(ordered, ordered[1:], strict=False):
+        assert right.left() - left.right() >= 7.9, details
+    assert boxes["selector"].width() >= 120, details
+    if "slider" in boxes:
+        assert boxes["slider"].width() >= 80, details
+    if "status" in boxes and "status" not in axis_names:
+        assert boxes["status"].top() >= boxes["selector"].bottom() + 3.9, details
+    if "policy" in boxes:
+        assert boxes["policy"].top() >= boxes["selector"].bottom() + 3.9, details
+    if "Настройки звука…" in boxes:
+        assert boxes["Настройки звука…"].right() == pytest.approx(row.width() - 14, abs=0.1)
+    for name in ("Поднять", "Вернуть", "Настройки звука…"):
+        if name in items:
+            assert boxes[name].width() >= float(items[name].property("implicitWidth")), details
+    if state.endswith("_restore"):
+        assert "Поднять" in items and "Вернуть" in items, details
     assert boxes["label"].width() >= float(items["label"].property("implicitWidth")) - 1, details
     assert items["selector"].isEnabled() == (not state.startswith("locked"))
     assert "Настройки звука…" in items
@@ -308,3 +358,92 @@ def test_replaced_settings_bridge_reads_its_microphone_state(width: int) -> None
             assert foreground(rendered.row)["slider"].property("value") == 100
     finally:
         sip.delete(replacement)
+
+
+@pytest.mark.parametrize("width", [900, 1035])
+@pytest.mark.parametrize("can_sound", [True, False])
+def test_unavailable_volume_keeps_independent_sound_action(width: int, can_sound: bool) -> None:
+    with render(width, "unknown", can_raise=False, can_sound=can_sound) as rendered:
+        items = foreground(rendered.row)
+        assert ("Настройки звука…" in items) is can_sound
+        assert "slider" not in items and "status" not in items
+        centers = [rect(item, rendered.row).center().y() for item in items.values()]
+        assert max(centers) - min(centers) <= 1
+        assert not rendered.messages, rendered.messages
+
+
+@pytest.mark.parametrize("width", [900, 1035])
+def test_percentage_reserve_keeps_sound_action_still(width: int) -> None:
+    with render(width, "normal") as rendered:
+        rendered.apply.can_restore_microphone_volume = True
+        positions = []
+        for percent in (0, 100):
+            rendered.state[0] = MicrophoneState(known=True, muted=False, percent=percent)
+            rendered.bridge.refreshMicrophone()
+            rendered.bridge.microphoneChanged.emit()
+            QTest.qWait(20)
+            items = foreground(rendered.row)
+            positions.append(rect(items["Настройки звука…"], rendered.row))
+            status = items["status"]
+            assert status.width() >= float(status.property("implicitWidth"))
+        assert positions[0] == positions[1]
+        assert not rendered.messages, rendered.messages
+
+
+@pytest.mark.parametrize("width", [900, 1035])
+def test_long_device_popup_stays_inside_microphone_card(width: int) -> None:
+    name = "Внешний микрофон конференции с очень длинным названием устройства и канала записи"
+    with render(width, "low_restore", device_name=name) as rendered:
+        assert_layout(rendered, "low_restore")
+        selector = foreground(rendered.row)["selector"]
+        # Explicit keyboard selection; no initial settings prepopulation.
+        selector.forceActiveFocus(Qt.TabFocusReason)
+        QTest.keyClick(rendered.window, Qt.Key_Down)
+        QTest.qWait(20)
+
+        def popup_value(source: str) -> Any:
+            expression = QQmlExpression(QQmlEngine.contextForObject(selector), selector, source)
+            value, _undefined = expression.evaluate()
+            assert not expression.hasError(), expression.error().toString()
+            return value
+
+        popup_value("popup.open()")
+        QTest.qWait(40)
+        left = rect(selector, rendered.row).left() + float(popup_value("popup.x"))
+        right = left + float(popup_value("popup.width"))
+        assert left >= 13.9 and right <= rendered.row.width() - 13.9
+        assert selector.property("displayText") == AudioDevice(1, "long-device", name, False).label
+        popup_value("popup.close()")
+        assert not rendered.messages, rendered.messages
+
+
+@pytest.mark.parametrize("width", [900, 1035])
+@pytest.mark.parametrize("late_bridge", [False, True])
+def test_saved_device_first_show_and_programmatic_index_do_not_write(
+    width: int, late_bridge: bool
+) -> None:
+    with render(
+        width,
+        "normal",
+        device_name="Внешний микрофон",
+        saved_device="long-device",
+        late_bridge=late_bridge,
+    ) as rendered:
+        selector = foreground(rendered.row)["selector"]
+        assert rendered.bridge.device == "long-device"
+        assert selector.property("currentIndex") == 1
+        assert rendered.saved_changes == []
+        assert rendered.device_changes == []
+        selector.setProperty("currentIndex", 0)
+        selector.setProperty("currentIndex", 1)
+        QTest.qWait(20)
+        assert rendered.bridge.device == "long-device"
+        assert rendered.saved_changes == []
+        assert rendered.device_changes == []
+        selector.forceActiveFocus(Qt.TabFocusReason)
+        QTest.keyClick(rendered.window, Qt.Key_Up)
+        QTest.qWait(20)
+        assert rendered.bridge.device == ""
+        assert rendered.device_changes == [None]
+        assert len(rendered.saved_changes) == 1 and rendered.saved_changes[0]["device"] is None
+        assert not rendered.messages, rendered.messages

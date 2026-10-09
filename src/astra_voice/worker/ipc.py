@@ -66,6 +66,8 @@ _SCHEMAS = {
     ),
     "model.unload": _Schema(),
     "record.start": _Schema({"utterance_id": _STR}, optional={"device": _STR, "limit_s": _NUMBER}),
+    "record.started": _UTTERANCE,
+    "record.stopped": _UTTERANCE,
     "record.stop": _UTTERANCE,
     "record.limit": _UTTERANCE,
     "audio.device.changed": _Schema(

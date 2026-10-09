@@ -1002,6 +1002,8 @@ class FakeSettings(QObject):
             {"id": "", "name": "Системный по умолчанию"},
             {"id": "alsa_input.mic", "name": "Микрофон гарнитуры"},
         ]
+        self._soundCuesEnabled: bool = False
+        self._soundCuesStatus: str = ""
         self._pillEnabled: bool = True
         self._language: str = "ru"
         self._checkAppUpdates: bool = False
@@ -1178,6 +1180,22 @@ class FakeSettings(QObject):
         return self._freeCandidates
 
     freeCandidates = pyqtProperty("QStringList", _get_freeCandidates, notify=changed)
+
+    def _get_soundCuesEnabled(self) -> bool:
+        return self._soundCuesEnabled
+
+    def _set_soundCuesEnabled(self, value: bool) -> None:
+        self._soundCuesEnabled = value
+        self.changed.emit()
+
+    soundCuesEnabled = pyqtProperty(
+        bool, _get_soundCuesEnabled, _set_soundCuesEnabled, notify=changed
+    )
+
+    def _get_soundCuesStatus(self) -> str:
+        return self._soundCuesStatus if self._soundCuesEnabled else ""
+
+    soundCuesStatus = pyqtProperty(str, _get_soundCuesStatus, notify=changed)
 
     def _get_pillEnabled(self) -> bool:
         return self._pillEnabled

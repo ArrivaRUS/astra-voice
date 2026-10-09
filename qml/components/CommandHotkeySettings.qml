@@ -130,8 +130,6 @@ Column {
                 visible: root.installed || !root.wizard
                 height: visible ? implicitHeight : 0
                 spacing: Theme.fieldGap
-                AvButton { text: qsTr("Левая Win"); small: true; variant: "secondary"; enabled: root.installed && root.editingEnabled; onClicked: root.chooseWin("Super_L") }
-                AvButton { text: qsTr("Правая Win"); small: true; variant: "secondary"; enabled: root.installed && root.editingEnabled; onClicked: root.chooseWin("Super_R") }
                 AvButton { text: qsTr("Проверить снова"); small: true; variant: "ghost"; enabled: root.bridge !== null; onClicked: if (root.bridge) root.bridge.refreshCommandStatus() }
             }
 

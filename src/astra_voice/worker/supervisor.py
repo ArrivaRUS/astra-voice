@@ -33,7 +33,15 @@ _CORRELATION: dict[str, RequestKey] = {
 # но распознавание этого utterance_id ещё впереди. audio.ready подтверждает открытие
 # устройства, а не завершение команды; audio.device.changed — автоостановку из-за смены
 # микрофона, после которой GUI ещё распознаёт записанное: эти уведомления не снимают ожидание.
-_NOTIFICATIONS = {"level", "silent", "record.limit", "audio.ready", "audio.device.changed"}
+_NOTIFICATIONS = {
+    "level",
+    "silent",
+    "record.limit",
+    "audio.ready",
+    "audio.device.changed",
+    "record.started",
+    "record.stopped",
+}
 
 
 @dataclass

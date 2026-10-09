@@ -252,6 +252,21 @@ stat -c '%U:%G %a' /var/lib/astra-voice/staging   # root:root 700
 `~/.local/share/astra-voice/app/<версия>-<сборка>/`, переключает на эту копию ссылку `app/current`,
 регистрирует меню и автозапуск на `app/current/AppRun` и дальше работает только из копии.
 
+Для передачи через Telegram и другие каналы, которые не сохраняют исполняемые права,
+используйте `Astra_Voice-<версия>-x86_64.AppImage.tar.gz`. Внутри находится только этот
+AppImage с режимом `0755`; архив входит в `SHA256SUMS` выпуска. Проверьте подпись и
+контрольные суммы по инструкции выше, затем распакуйте в отдельный каталог:
+
+```sh
+mkdir astra-voice-download
+# --same-permissions сохраняет 0755 независимо от umask пользователя.
+tar --extract --gzip --same-permissions --file=Astra_Voice-<версия>-x86_64.AppImage.tar.gz --directory=astra-voice-download
+cd astra-voice-download
+```
+
+При распаковке архиватором проверьте, что он сохранил разрешение на запуск. Для
+напрямую скачанного raw AppImage используйте `chmod +x`, как показано ниже.
+
 **Первый запуск — через FUSE** (штатный путь; libfuse в Astra Linux SE 1.8 есть):
 
 ```sh

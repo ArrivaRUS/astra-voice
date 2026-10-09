@@ -96,7 +96,7 @@ def controls(window: QQuickWindow) -> dict[str, QQuickItem]:
     items = list(tree(window.contentItem()))
     result = {
         text: next(item for item in tree(keyboard) if item.property("text") == text)
-        for text in ("Выбрать другую", "Левая Win", "Правая Win", "Проверить снова")
+        for text in ("Выбрать другую", "Проверить снова")
     }
     result["keyboard mode"] = next(
         item.parentItem()
@@ -362,7 +362,7 @@ def test_late_bridge_is_checking_and_cannot_edit_or_refresh() -> None:
         assert keyboard.property("bridge") is None
         setting_row = next(item for item in tree(keyboard) if item.property("label"))
         assert setting_row.property("sub") == "Проверяю Astra Cowork…"
-        for text in ("Выбрать другую", "Левая Win", "Правая Win", "Проверить снова"):
+        for text in ("Выбрать другую", "Проверить снова"):
             button = next(item for item in tree(keyboard) if item.property("text") == text)
             assert button.isVisible() and not button.isEnabled(), text
     finally:

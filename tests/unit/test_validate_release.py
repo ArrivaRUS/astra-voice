@@ -815,3 +815,47 @@ def test_latest_generator_appimage(tmp_path: Path) -> None:
     (tmp_path / "Astra_Voice-0.1.9-x86_64.AppImage").write_bytes(b"old")
     with pytest.raises(ValueError, match="найдено: 2"):
         generator(tmp_path, "0.2.0", appimage=True)
+
+
+def test_appimage_transport_archive_uses_artifact_limit(
+    assets: ReleaseAssets,
+    validate: Callable[[list[str]], int],
+    validate_globals: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    add_appimage(assets)
+    subprocess.run(
+        [sys.executable, str(ROOT / "packaging/appimage/archive.py"), str(assets.dist / IMAGE)],
+        check=True,
+        capture_output=True,
+    )
+    archive = assets.dist / (IMAGE + ".tar.gz")
+    # Сниженный обычный лимит отличает этот ассет от документов без большого fixture.
+    monkeypatch.setitem(validate_globals, "ASSET_LIMIT", 32 << 10)
+    assert archive.stat().st_size > (32 << 10)
+    rewrite_sums(assets)
+    checks = release_checks(validate, assets, capsys, expected_code=0)
+    assert checks["sha256"]["ok"] is True
+    assert checks["latest.json"]["detail"] == "указатель верен (схема 2: appimage, deb)"
+
+
+@pytest.mark.parametrize("case", ["tampered", "uncovered", "other-version"])
+def test_appimage_transport_archive_requires_exact_signed_asset(
+    assets: ReleaseAssets,
+    validate: Callable[[list[str]], int],
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+) -> None:
+    add_appimage(assets)
+    name = IMAGE + ".tar.gz"
+    if case == "other-version":
+        name = "Astra_Voice-0.0.9-x86_64.AppImage.tar.gz"
+    archive = assets.dist / name
+    archive.write_bytes(b"transport archive fixture")
+    rewrite_sums(assets, skip=name if case == "uncovered" else None)
+    if case == "tampered":
+        archive.write_bytes(b"substituted archive")
+    checks = release_checks(validate, assets, capsys, expected_code=1)
+    assert checks["sha256"]["ok"] is False
+    assert name in str(checks["sha256"]["detail"])
