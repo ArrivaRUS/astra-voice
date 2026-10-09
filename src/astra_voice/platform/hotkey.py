@@ -158,7 +158,12 @@ class HotkeyFsm:
 
 
 class HotkeyBackend(Protocol):
-    """Захваты и очередь клавиш; ожидание пары автоповтора ограничено S4."""
+    """Захваты и очередь клавиш; ожидание пары автоповтора ограничено S4.
+
+    Бэкенд с захватом всей клавиатуры дополнительно реализует
+    cancel_keyboard_grab(); key_is_down(keycode) защищает новый жест от
+    физически удержанной клавиши при восстановлении команды.
+    """
 
     def grab_combo(self, combo: str) -> GrabResult: ...
     def ungrab_combo(self, combo: str) -> GrabResult: ...
@@ -241,6 +246,19 @@ class X11HotkeyBackend:
             return GrabResult("not-grabbed")
         self._release(parsed)
         return GrabResult("ok")
+
+    def cancel_keyboard_grab(self) -> None:
+        """Отмена операции, не probe/MappingNotify: отпустить и активный grab."""
+        self._x.cancel_keyboard_grab()
+
+    def key_is_down(self, keycode: int) -> bool:
+        """После нового grab требуем отпускания уже зажатой клавиши."""
+        try:
+            keymap = self._x._require_display().query_keymap()
+            return bool(keymap[keycode // 8] & (1 << (keycode % 8)))
+        except Exception:
+            # Неизвестное состояние не разрешает начать команду автоповтором.
+            return True
 
     def grab_escape(self) -> GrabResult:
         if self._escape is not None:
@@ -486,6 +504,7 @@ class HotkeyManager:
         self._escape_grabbed = False
         self._escape_keycode: int | None = None
         self._key_down = False
+        self._event_generation = 0
         self.mapping_release_lost = False
         # Перезахват после смены карты не удался; grab() того же сочетания восстановит.
         self._lost = False
@@ -504,8 +523,9 @@ class HotkeyManager:
     def grab(self, combo: str, mode: HotkeyMode) -> GrabResult:
         if combo == self._combo and self._lost:
             # Захват потерян после смены карты: восстанавливаем, автомат не трогаем.
-            result = self.backend.grab_combo(combo)
+            result = self._grab_released_combo(combo)
             if result.ok:
+                self._event_generation += 1
                 self._lost = False
                 self._keycode = result.keycode
                 self._mods = result.mods
@@ -521,10 +541,11 @@ class HotkeyManager:
         if combo == self._combo:
             self.last_result = GrabResult("duplicate")
             return self.last_result
-        result = self.backend.grab_combo(combo)
+        result = self._grab_released_combo(combo)
         if result.ok:
             if self._combo is not None:
                 self.ungrab()
+            self._event_generation += 1
             self._combo = combo
             self._keycode = result.keycode
             self._mods = result.mods
@@ -532,7 +553,31 @@ class HotkeyManager:
         self.last_result = result
         return result
 
+    def _grab_released_combo(self, combo: str) -> GrabResult:
+        result = self.backend.grab_combo(combo)
+        held = getattr(self.backend, "key_is_down", None)
+        if (
+            result.ok
+            and self.defer_single_super
+            and result.keycode is not None
+            and held is not None
+            and held(result.keycode)
+        ):
+            # После force-ungrab отпускание может уйти окну фокуса. Не ждём
+            # KeyRelease на нашем соединении: штатный retry проверит keymap снова.
+            self.backend.ungrab_combo(combo)
+            self._cancel_keyboard_grab()
+            self.backend.poll_events()
+            return GrabResult("not-grabbed")
+        return result
+
+    def _cancel_keyboard_grab(self) -> None:
+        cancel = getattr(self.backend, "cancel_keyboard_grab", None)
+        if cancel is not None:
+            cancel()
+
     def ungrab(self) -> None:
+        self._event_generation += 1
         self.mapping_release_lost = False
         self._deferred_press = None
         if self._combo is None:
@@ -540,6 +585,7 @@ class HotkeyManager:
             return
         self.fsm.escape(self._clock())
         self.last_result = self.backend.ungrab_combo(self._combo)
+        self._cancel_keyboard_grab()
         self._combo = None
         self._keycode = None
         self._key_down = False
@@ -720,9 +766,13 @@ class HotkeyManager:
     def process_pending(self, now: float | None = None) -> GrabResult:
         """Разбирает очередь и убирает пары повтора, включая соседний read."""
         events = list(self.backend.poll_events())
+        generation = self._event_generation
         self.last_result = GrabResult("ok" if self._combo is not None else "not-grabbed")
         index = 0
         while index < len(events):
+            # A callback can cancel/rearm while this batch still contains old keys.
+            if generation != self._event_generation:
+                break
             event = events[index]
             if isinstance(event, MappingEvent):
                 self._handle_mapping(event)

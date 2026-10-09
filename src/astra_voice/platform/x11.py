@@ -511,8 +511,17 @@ class X11Display:
 
     def ungrab_keyboard(self) -> None:
         """Снимает захват идемпотентно; при ошибке сохраняет срок для повтора."""
-        if self.keyboard_grab_deadline is None:
-            return
+        if self.keyboard_grab_deadline is not None:
+            self.cancel_keyboard_grab()
+
+    def cancel_keyboard_grab(self) -> None:
+        """Безусловно снимает захват, включая активированный XGrabKey.
+
+        Пассивный захват после нажатия активирует захват всей клавиатуры без
+        нашего дедлайна. XUngrabKey его не снимает, поэтому отмене хоткея нужен
+        явный XUngrabKeyboard на том же соединении. При ошибке сохраняет
+        дедлайн поля захвата для повтора.
+        """
         try:
             from Xlib import X
 
