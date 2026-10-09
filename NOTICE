@@ -257,8 +257,16 @@ NumPy 1.24.2 — BSD-3-Clause
       Copyright (c) 2002-2017 Free Software Foundation, Inc.;
       libquadmath — LGPL-2.1-or-later, из состава GCC,
       Copyright (c) Free Software Foundation, Inc.
-    Перечень лицензий этих библиотек — в файлах numpy-1.24.2.dist-info/LICENSE.txt
-    и LICENSES_bundled.txt внутри AppImage.
+    Сведения об OpenBLAS и libgfortran — в LICENSE.txt и LICENSES_bundled.txt
+    каталога numpy-1.24.2.dist-info внутри AppImage. Эти файлы не перечисляют
+    libquadmath; её полный текст LGPL-2.1 включён отдельно в
+    usr/share/doc/astra-voice/licenses/common/LGPL-2.1.txt.
+    Соответствующие исходные пакеты CentOS закреплены в packaging/appimage.lock:
+      libquadmath: gcc-4.8.5-44.el7.src.rpm;
+      libgfortran: gcc-libraries-8.3.1-2.1.1.el7.src.rpm.
+    Они включают исходные архивы, патчи и spec сборки и входят в комплект
+    исходников выпуска через scripts/release_sources.py. Происхождение и границы
+    проверки описаны в docs/reports/2026-10-09-appimage-gcc-sources.md.
 
 onnxruntime 1.24.4 — MIT
     Copyright (c) Microsoft Corporation

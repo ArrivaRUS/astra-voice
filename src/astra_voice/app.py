@@ -85,22 +85,40 @@ def _mark_running_copy() -> bool:
 
 
 def _copy_shutdown_resources(
-    runtime: Any, downloads: Any, update_checker: Any
+    runtime: Any, downloads: Any, update_checker: Any, appimage_management: Any = None
 ) -> tuple[list[Any], list[Any]]:
-    """Сохраняем ссылки ДО shutdown: тот может забыть не завершившиеся ресурсы."""
+    """Снимок до/после shutdown: он может забыть ресурсы или запустить восстановление."""
     from astra_voice.ui import tray
 
     processes: list[Any] = []
+    threads = [getattr(downloads, "_model_thread", None), getattr(update_checker, "_thread", None)]
     if runtime is not None:
         for supervisor in (runtime.supervisor, runtime._switch_candidate):
             if supervisor is not None:
                 processes.extend(supervisor._retired)
                 if supervisor.process is not None:
                     processes.append(supervisor.process)
-    threads = [getattr(downloads, "_model_thread", None), getattr(update_checker, "_thread", None)]
+        manager = getattr(runtime, "command_hotkey", None)
+        backend = getattr(manager, "backend", None)
+        process = getattr(backend, "process", None)
+        if process is not None:
+            processes.append(process)
+        threads.append(getattr(backend, "_menu_thread", None))
+        for owner in ("_command_client", "_command_session"):
+            threads.append(getattr(getattr(runtime, owner, None), "_thread", None))
     if tray._bus_transport is not None:
         threads.append(tray._bus_transport.thread)
+    if appimage_management is not None:
+        threads.extend(appimage_management.worker_threads)
     return processes, [thread for thread in threads if thread is not None]
+
+
+def _thread_stopped(thread: Any) -> bool:
+    """QThread завершён лишь после join: finished/isRunning ещё допускают очистку."""
+    query = getattr(thread, "is_alive", None)
+    if query is None:
+        return thread.wait(0) is True
+    return query() is False
 
 
 def _children_stopped() -> bool:
@@ -165,7 +183,7 @@ def _finish_running_copy(
 
     try:
         complete = stopped and all(p.poll() is not None for p in processes)
-        complete = complete and all(not thread.is_alive() for thread in threads)
+        complete = complete and all(_thread_stopped(thread) for thread in threads)
         complete = complete and _children_stopped()
     except Exception:  # noqa: BLE001 — неизвестное состояние не разрешает удаление
         complete = False
@@ -630,6 +648,8 @@ def _load_qml(app_info: Any, theme_bridge: Any | None) -> Any | None:
     context = engine.rootContext()
     context.setContextProperty("appInfo", app_info)
     context.setContextProperty("showOnboarding", False)
+    # Runtime создаётся после shell; до подключения контроллера действия недоступны.
+    context.setContextProperty("appImageManagement", None)
     # themeSource обязан быть виден ДО load(): Theme.qml читает его в биндинге
     # `dark` при создании корневого объекта. Theme.qml — `pragma Singleton`, а
     # синглтоны не видят контекстных свойств, поэтому объект кладётся ещё и в
@@ -725,6 +745,10 @@ class _RuntimeOnboardingHost:
     def __init__(self, runtime: DictationRuntime, shell: Any) -> None:
         self._runtime = runtime
         self._shell = shell
+        self._capture_role = "text"
+
+    def set_capture_role(self, role: str) -> None:
+        self._capture_role = role
 
     def begin_capture(self) -> bool:
         try:
@@ -732,7 +756,9 @@ class _RuntimeOnboardingHost:
             own_window = int(root.winId()) if root is not None else None
         except Exception:
             own_window = None
-        return self._runtime.begin_hotkey_capture(own_window=own_window or None)
+        return self._runtime.begin_hotkey_capture(
+            own_window=own_window or None, role=self._capture_role
+        )
 
     def set_capture_callback(self, callback: Callable[[str, str], None]) -> None:
         self._runtime.set_hotkey_capture_callback(callback)
@@ -741,10 +767,19 @@ class _RuntimeOnboardingHost:
         self._runtime.end_hotkey_capture()
 
     def probe(self, combo: str) -> str:
-        return self._runtime.hotkey.probe(combo).code
+        if self._capture_role == "command":
+            return self._runtime.check_command_hotkey(combo)
+        manager = self._runtime.hotkey
+        candidate = manager.signature(combo)
+        other = manager.signature(self._runtime.settings.command_hotkey)
+        if candidate is None or other is None:
+            return "not-grabbed"
+        if candidate == other:
+            return "duplicate"
+        return manager.probe(combo).code
 
     def free_candidates(self, prefer: list[str]) -> list[str]:
-        return self._runtime.hotkey.free_candidates(prefer)
+        return [combo for combo in prefer if self.probe(combo) == "ok"]
 
     def start_level_monitor(self, device: str, callback: LevelCallback) -> bool:
         return self._runtime.start_level_monitor(device, callback)
@@ -1315,6 +1350,7 @@ def main(argv: list[str] | None = None) -> int:
     update_checker: UpdateChecker | None = None
     updates_bridge: Any = None  # держим Python-обёртку живой до выхода из main
     about_bridge: Any = None  # держим Python-обёртку живой до выхода из main
+    appimage_management: Any = None
     gui_calls = _GuiCalls()
     model_store: ModelStore | None = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
@@ -1369,6 +1405,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime.tray.on_about = focuser.focus_shell
             runtime.pill.on_details_clicked = show_details
             runtime.start()
+            runtime.start_command_mode()
             # start() регистрирует общий показ окна для всех действий уведомлений.
             notify.set_action_handler(notify.ACTION_SHOW_DETAILS, show_details)
             notify.set_action_handler(notify.ACTION_CHOOSE_MICROPHONE, show_general)
@@ -1382,6 +1419,16 @@ def main(argv: list[str] | None = None) -> int:
 
         from astra_voice.platform import autostart
         from astra_voice.ui.bridges import OnboardingController, SettingsBridge
+
+        if runtime_ready and runtime is not None and paths.install_kind().is_appimage:
+            from astra_voice.ui.appimage_management import AppImageManagement
+
+            appimage_management = AppImageManagement(
+                runtime, own_lock_path=lock_file, running_key=_installed_code_key()
+            )
+            appimage_management.quitRequested.connect(app.quit)
+            QQmlEngine.setObjectOwnership(appimage_management, QQmlEngine.CppOwnership)
+            _set_context_property(shell, "appImageManagement", appimage_management)
 
         if (
             runtime_ready
@@ -1420,6 +1467,31 @@ def main(argv: list[str] | None = None) -> int:
             locked=policy.locked_keys,
             autostart=autostart,
         )
+        if runtime_ready and runtime is not None:
+            settings_bridge.bind_command_host(runtime)
+            runtime.pill.on_copy_clicked = runtime._copy_last
+
+            def show_command_details() -> None:
+                runtime.show_command_details()
+                # Runtime checks unlock before requesting the actual window.
+                if runtime.command_feedback is not None and runtime._command_snapshot().allowed:
+                    settings_bridge.showCommandDetails()
+
+            runtime.tray.on_command_details = show_command_details
+            notify.set_action_handler("command-details", show_command_details)
+
+            def show_pill_details() -> None:
+                from astra_voice.ui.pill import PillState
+
+                if runtime.pill.state in (PillState.COMMAND_FAILED, PillState.COMMAND_UNKNOWN):
+                    show_command_details()
+                else:
+                    show_details()
+
+            runtime.pill.on_details_clicked = show_pill_details
+            settings_bridge.commandPreviewTextChanged.connect(
+                lambda: focuser.focus_shell() if settings_bridge.commandPreviewText else None
+            )
         QQmlEngine.setObjectOwnership(settings_bridge, QQmlEngine.CppOwnership)
         _set_context_property(shell, "settingsBridge", settings_bridge)
         # Офлайн-режим скрывает «Скачать» и отменяет загрузку из сети (PRD F14.2).
@@ -1431,6 +1503,7 @@ def main(argv: list[str] | None = None) -> int:
         root = _root_window(shell)
         if root is not None:
             capture.attach_window(root)
+            settings_bridge.attach_window(root)
         show_onboarding = stored.extra.get("onboarding_done") is not True
         if show_onboarding:
             onboarding = OnboardingController(
@@ -1497,9 +1570,13 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         copy_key = _installed_code_key()
         resources_stopped = True
+        management_threads: list[Any] = []
+        management_pending = False
         try:
+            if appimage_management is not None:
+                management_threads.extend(appimage_management.worker_threads)
             processes, threads = (
-                _copy_shutdown_resources(runtime, downloads, update_checker)
+                _copy_shutdown_resources(runtime, downloads, update_checker, appimage_management)
                 if copy_key is not None
                 else ([], [])
             )
@@ -1507,6 +1584,17 @@ def main(argv: list[str] | None = None) -> int:
             processes, threads = [], []
             resources_stopped = False
             log.warning("Не удалось проверить ресурсы работающей копии")
+        if appimage_management is not None:
+            try:
+                closed = appimage_management.close()
+                if closed is False:
+                    management_pending = True
+                elif closed is not True:
+                    resources_stopped = False
+                    log.warning("Не удалось проверить остановку управления AppImage")
+            except Exception:  # noqa: BLE001 — неопределённая остановка сохраняет код
+                resources_stopped = False
+                log.warning("Не удалось завершить управление установкой AppImage")
         try:
             focuser.stop()
         except Exception:  # noqa: BLE001 — остальная очистка должна выполниться
@@ -1566,6 +1654,36 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001 — lock и защита кода завершаются независимо
             resources_stopped = False
             log.warning("Не удалось завершить наблюдение интерфейса")
+        if appimage_management is not None:
+            # Non-daemon worker всё равно удержит процесс. Дожидаемся его здесь,
+            # после остановки аудио/ввода, но пока running-key и instance lock живы.
+            # Иначе другой --uninstall может удалить код до конца файловой операции.
+            try:
+                management_threads.extend(appimage_management.worker_threads)
+            finally:
+                for thread in management_threads:
+                    if thread.is_alive():
+                        thread.join()
+            if management_pending:
+                # Timeout первого close — ещё не ошибка остановки. После join
+                # завершаем контроллер; ошибки остальных ресурсов не сбрасываем.
+                try:
+                    if appimage_management.close() is not True:
+                        resources_stopped = False
+                except Exception:  # noqa: BLE001 — ресурсы join-нуты, состояние неизвестно
+                    resources_stopped = False
+                    log.warning("Не удалось завершить управление установкой AppImage")
         if copy_key is not None:
+            try:
+                # ungrab/close брокера может впервые запустить восстановление меню.
+                # Старые ссылки сохраняем: shutdown мог забыть живой Popen/QThread.
+                final_processes, final_threads = _copy_shutdown_resources(
+                    runtime, downloads, update_checker, appimage_management
+                )
+                processes.extend(final_processes)
+                threads.extend(final_threads)
+            except Exception:  # noqa: BLE001 — неизвестность запрещает удаление кода
+                resources_stopped = False
+                log.warning("Не удалось проверить ресурсы после остановки копии")
             _finish_running_copy(copy_key, processes, threads, stopped=resources_stopped)
         _cleanup(server, lock)

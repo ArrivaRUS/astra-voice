@@ -39,23 +39,27 @@ Item {
 
     signal cancelClicked()
     signal detailsClicked()
+    signal copyClicked()
 
+    readonly property bool commandResult: presentation.name === "command-failed" || presentation.name === "command-unknown"
     readonly property real pillWidth: Math.max(PillTheme.pillMinW,
-        Math.min(PillTheme.pillMaxW, content.width + paddingX * 2))
-    readonly property real pillHeight: PillTheme.pillH
+        Math.min(commandResult ? 520 : PillTheme.pillMaxW, content.width + paddingX * 2))
+    readonly property real pillHeight: commandResult ? Math.max(PillTheme.pillH, caption.height + paddingY * 2) : PillTheme.pillH
     readonly property bool active: avState !== "hidden" && avState !== "disabled"
-    readonly property bool showBars: presentation.name === "listening"
+    readonly property bool showBars: presentation.name === "listening" || presentation.name === "command-listening"
         || presentation.name === "listening-silent" || presentation.name === "limit"
     readonly property bool silent: presentation.name === "listening-silent"
-    readonly property bool processing: presentation.name === "processing"
+    readonly property bool processing: presentation.name === "processing" || presentation.name === "command-delivering"
     readonly property bool loading: presentation.name === "loading-model"
-    readonly property bool error: presentation.name === "error"
+    readonly property bool error: presentation.name === "error" || presentation.name === "command-failed" || presentation.name === "command-unknown"
     readonly property string iconName: {
         switch (presentation.name) {
         case "loading-model": return "refresh";
         case "listening-silent": return "alert";
         case "limit": return "clock";
-        case "done": return "check";
+        case "done": case "command-done": return "check";
+        case "command-listening": return "out";
+        case "command-failed": case "command-unknown": return "alert";
         case "clipboard-only": return "file";
         case "cancelled": return "x";
         case "error": return "alert";
@@ -66,6 +70,11 @@ Item {
         switch (presentation.name) {
         case "loading-model": return qsTr("Загружаю модель…");
         case "listening": return qsTr("Слушаю");
+        case "command-listening": return qsTr("Слушаю команду…");
+        case "command-delivering": return qsTr("Отправляю помощнику…");
+        case "command-done": return qsTr("Передано помощнику");
+        case "command-failed": return qsTr("Помощник недоступен — текст в буфере");
+        case "command-unknown": return qsTr("Не удалось узнать, принята ли команда — текст в буфере");
         case "listening-silent": return qsTr("Микрофон молчит");
         case "limit": return qsTr("Достигнут лимит записи");
         case "processing": return qsTr("Распознаю…");
@@ -176,6 +185,7 @@ Item {
     // Дети Row центрируются через y: позиционер управляет только их x.
     Row {
         id: content
+        objectName: "commandPillContent"
         x: (root.pillWidth - width) / 2
         y: root.paddingY
         height: root.pillHeight - root.paddingY * 2
@@ -260,12 +270,12 @@ Item {
             id: glyph
             visible: root.iconName !== ""
             name: root.iconName
-            size: root.loading || root.error || presentation.name === "done"
+            size: root.loading || root.error || (presentation.name === "done" || presentation.name === "command-done")
                 ? root.iconLarge : root.iconSmall
             y: (content.height - height) / 2
             color: root.error ? PillTheme.pillError
                 : root.silent ? PillTheme.pillWarning
-                : presentation.name === "done" ? PillTheme.pillDone
+                : presentation.name === "done" || presentation.name === "command-done" ? PillTheme.pillDone
                 : presentation.name === "cancelled" ? PillTheme.pillIconNeutral
                 : PillTheme.pillIconMuted
 
@@ -294,9 +304,11 @@ Item {
 
         Text {
             id: caption
+            objectName: "commandPillCaption"
             text: presentation.label !== "" ? presentation.label : root.defaultLabel
             textFormat: Text.PlainText
-            width: contentWidth
+            width: root.commandResult ? Math.min(implicitWidth, 420) : contentWidth
+            wrapMode: root.commandResult ? Text.WordWrap : Text.NoWrap
             y: (content.height - height) / 2
             font.family: root.textFamily
             font.pixelSize: root.textSize
@@ -307,7 +319,7 @@ Item {
         }
 
         Rectangle {
-            visible: presentation.name === "listening" || presentation.name === "listening-silent"
+            visible: presentation.name === "listening" || presentation.name === "listening-silent" || presentation.name === "command-listening"
             width: root.closeSize
             height: root.closeSize
             y: (content.height - height) / 2
@@ -351,6 +363,21 @@ Item {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.detailsClicked()
+            }
+        }
+
+        Rectangle {
+            visible: presentation.name === "command-failed" || presentation.name === "command-unknown"
+            width: root.closeSize
+            height: root.closeSize
+            y: (content.height - height) / 2
+            radius: width / 2
+            color: PillTheme.pillCloseBg
+            Icon { anchors.centerIn: parent; name: "file"; size: root.iconSmall; color: PillTheme.pillCloseFg }
+            MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.copyClicked()
             }
         }
     }

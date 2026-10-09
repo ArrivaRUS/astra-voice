@@ -11,6 +11,8 @@ Switch {
 
     // Заблокирован политикой: рядом обязателен бейдж с замком — цвет не единственный носитель.
     property bool locked: false
+    // Opt-in unavailable-feature appearance; preserve the saved knob position.
+    property bool muted: false
 
     padding: 0
     implicitWidth: Theme.toggleW
@@ -25,6 +27,8 @@ Switch {
         antialiasing: true
         opacity: control.locked ? Theme.toggleLockedOpacity : 1
         color: {
+            if (control.muted)
+                return Theme.toggleOffBg;
             if (control.locked)
                 return control.checked ? Theme.toggleLockedOnBg : Theme.toggleLockedOffBg;
             return control.checked ? Theme.toggleOnBg : Theme.toggleOffBg;

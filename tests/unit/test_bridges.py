@@ -18,6 +18,7 @@ from dataclasses import replace
 from functools import partial
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, cast
 from unittest.mock import Mock, call
 
@@ -391,6 +392,7 @@ def changed_value(bridge: SettingsBridge, name: str) -> str | bool:
     # Новый строковый контрол требует явного тестового значения, иначе тест падает.
     return {
         "hotkey": "Ctrl+Shift+Space",
+        "commandHotkey": "Super_R",
         "hotkeyMode": "toggle",
         "language": "en",
         "device": "mic",
@@ -414,6 +416,22 @@ def stored_value(settings: Settings, name: str) -> str | bool | None:
     return cast(str | bool | None, getattr(settings, field_name(name)))
 
 
+def allow_mouse_setting(bridge: SettingsBridge, name: str) -> None:
+    if name == "commandMouseEnabled":
+        from test_command_mouse_capture import MouseHost
+
+        # Only the new guarded setting needs a runtime port; keep other cases unchanged.
+        bridge._mouse_capture.bind_host(MouseHost())
+    elif name == "commandHotkey":
+        bridge.bind_command_host(
+            SimpleNamespace(
+                command_installed=True,
+                check_command_hotkey=Mock(return_value="ok"),
+                reload_command_hotkey=Mock(),
+            )
+        )
+
+
 @pytest.mark.parametrize("name", writable_properties())
 @pytest.mark.parametrize("with_mirror", [False, True])
 def test_each_property_saves_and_notifies_once(name: str, with_mirror: bool) -> None:
@@ -423,6 +441,7 @@ def test_each_property_saves_and_notifies_once(name: str, with_mirror: bool) -> 
     apply = Mock(spec=SettingsApply)
     apply.hotkey.return_value = "ok"
     bridge = SettingsBridge(settings, mirror=mirror, save=save, apply=apply)
+    allow_mouse_setting(bridge, name)
     spy = QSignalSpy(getattr(bridge, name + "Changed"))
     value = changed_value(bridge, name)
 
@@ -583,6 +602,7 @@ def test_s19_a5_all_writable_properties_reach_file(tmp_path: Path) -> None:
     bridge = SettingsBridge(settings, save=partial(settings_mod.save, path=path))
     changed: dict[str, str | bool] = {}
     for name in writable_properties():
+        allow_mouse_setting(bridge, name)
         value = changed_value(bridge, name)
         changed[name] = value
         assert bridge.setProperty(name, value)
@@ -607,6 +627,7 @@ def test_save_error_rolls_back_value_and_runtime(
     apply = Mock(spec=SettingsApply)
     apply.hotkey.return_value = "ok"
     bridge = SettingsBridge(settings, mirror=mirror, save=save, apply=apply)
+    allow_mouse_setting(bridge, name)
     old = getattr(bridge, name)
     value = changed_value(bridge, name)
     spy = QSignalSpy(getattr(bridge, name + "Changed"))

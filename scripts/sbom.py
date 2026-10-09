@@ -429,6 +429,21 @@ def _qt_module(rel: str) -> str | None:
     return None
 
 
+# Provenance of the pinned NumPy runtime libraries; generic pending-source still applies
+# to other/unresolved inputs. IDs refer to complete CentOS SRPMs in appimage.lock.
+GCC_RUNTIME_SOURCES = (
+    ("libquadmath-*.so*", "gcc-libquadmath"),
+    ("libgfortran-*.so*", "gcc-libgfortran"),
+)
+
+
+def _gcc_source(lock: Any, name: str) -> Any:
+    for pattern, ident in GCC_RUNTIME_SOURCES:
+        if fnmatch.fnmatchcase(name, pattern):
+            return next((source for source in lock.sources if source.id == ident), None)
+    return None
+
+
 def _pending_props(lock: Any, name: str, used: set[str]) -> list[dict[str, str]]:
     """Свойства «исходники не приложены» для файла из записей `# pending-source:` lock."""
     props: list[dict[str, str]] = []
@@ -491,6 +506,14 @@ def _wheel_components_r3(appdir: Path, lock: Any, origin: dict[str, str]) -> lis
                     }
                     if license_id:
                         comp["licenses"] = [{"expression": license_id}]
+                    source = _gcc_source(lock, path.name)
+                    if source is not None:
+                        comp["externalReferences"] = _source_refs(lock, source.id)
+                        comp["properties"] += [
+                            _prop("sources", "pinned"),
+                            _prop("source-file", source.file),
+                            _prop("source-sha256", source.sha256),
+                        ]
                     nested.append(comp)
         icu_refs = sorted(r for r in qt_files if r.startswith("pkg:generic/icu@"))
         if len(icu_refs) > 1:

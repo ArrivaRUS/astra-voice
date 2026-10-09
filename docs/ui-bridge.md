@@ -1285,3 +1285,74 @@ AppImage (`$APPDIR`) — задача ветки AppImage. Без моста р�
 6. **Цвета — только из `Theme`.** Шестнадцатеричные литералы и `Qt.rgba(...)` в
    файлах интерфейса запрещены тестом: страница обязана одинаково выглядеть в
    светлой и тёмной теме.
+
+
+## Команды Astra Cowork (Command1, документ 1.7)
+
+`SettingsBridge` хранит пользовательские `commandHotkey` (по умолчанию `Super_L`),
+`commandEnabled` (включено) и `commandPreview` (выключено). Ключ политики
+`command_hotkey` отменён; запрет администратора приходит от Astra Cowork.
+`commandInstalled` показывает наличие артефактов установки, `commandAvailable` —
+готовность передачи; `commandStatus` — фиксированное объяснение готовности.
+`refreshCommandStatus()` запускает явную проверку, без фонового опроса в простое.
+
+`captureRole` (`text` / `command`) принадлежит общей машине назначения клавиш.
+`beginCommandCapture()` выбирает командную роль; `endCapture(combo)`,
+`cancelCapture()`, `keepCombo()` и `refreshCandidates()` работают с этой ролью.
+`useCommandWin()` выбирает левую Win. Одиночная правая Win (`Super_R`) также
+допустима. Коллизии ролей проверяются по реальному keycode и modifiers текущей
+карты X11, а не написанию сочетания. Захвата всей клавиатуры при записи нет.
+
+`OnboardingController` проксирует `commandHotkey`, `commandInstalled`,
+`commandStatus`, `captureRole`, `beginCommandCapture()`, `refreshCommandStatus()`
+и `useCommandWin()`. При отсутствии Cowork командной строки в мастере нет;
+в «Общих» видна причина и «Проверить снова».
+
+`commandFeedbackText` и `commandDetail` содержат только фиксированные объяснения
+исходов; распознанная речь в них не входит. `showCommandDetails()` испускает
+`commandDetailsRequested` для диалога «Что случилось»; при заблокированном или
+неизвестном состоянии сеанса подробности скрываются.
+
+Только при явно включённом предпросмотре runtime публикует `commandPreviewText`
+через `commandPreviewTextChanged`. После фактического открытия диалога
+`commandPreviewShown()` запускает трёхсекундное окно отмены. `confirmCommand()`
+отправляет раньше срока, `rejectCommand()` отменяет и очищает текст.
+Блокировка, сон и скрытие/сворачивание окна очищают предпросмотр; после
+пробуждения он не восстанавливается. Пилюля принимает только фиксированные
+строки; действия копирования и подробностей доступны также через трей.
+
+
+## Дополнение 2026-10-09: локальный выбор кнопки мыши
+
+`SettingsBridge` предоставляет следующий контракт. Порт подключён к runtime;
+его отсутствие закрывает редактор и включение. Точные обязательства
+runtime и жизненный цикл lease: [command-mouse.md](arch/command-mouse.md#мост-настроек-и-локальный-редактор-отдельный-контракт-2026-10-09).
+
+| Свойство | Тип/запись | Уведомление | Значение |
+| --- | --- | --- | --- |
+| `commandMouseEnabled` | bool, rw | `commandMouseEnabledChanged` | По умолчанию false. Включение требует доступного порта и отсутствия capture. Выключение допустимо при собственной операции; административный замок сохраняется. |
+| `commandMouseButton` | int, ro | `commandMouseButtonChanged` | Сохранённая логическая кнопка: 2 или 8…31. |
+| `commandMouseButtonLabel` | str, ro | `commandMouseButtonChanged` | Средняя / Дополнительная кнопка 1 или 2 / Кнопка мыши N. |
+| `commandMouseStatus` | str, ro | `commandMouseStateChanged` | disabled / ready / busy / unavailable / suspended; ready отражает состояние runtime, а не успешное сохранение. |
+| `commandMouseStatusMessage` | str, ro | `commandMouseStateChanged` | Объяснение состояния для пользователя. |
+| `commandMouseCanEdit` | bool, ro | `commandMouseStateChanged` | Отдельный допуск редактирования; busy чужого захвата не запрещает выбор. |
+| `commandMouseCaptureState` | str, ro | `commandMouseCaptureChanged` | idle / capturing / pressed / ready / error. |
+| `commandMousePendingButton` | int, ro | `commandMouseCaptureChanged` | Несохранённый кандидат: 0 или допустимый логический номер. |
+| `commandMousePendingButtonLabel` | str, ro | `commandMouseCaptureChanged` | Подпись кандидата, пустая для 0. |
+| `commandMouseCaptureMessage` | str, ro | `commandMouseCaptureChanged` | Подсказка/ошибка локального редактора. |
+
+| Слот | Результат и действие |
+| --- | --- |
+| `beginCommandMouseCapture()` | bool: получить runtime lease и открыть локальный выбор, без глобальных grabs. |
+| `commandMouseCapturePressed(qtButton)` | Передать исходный Qt MouseButton; MiddleButton=4 преобразуется в logical=2. |
+| `commandMouseCaptureReleased(qtButton, qtButtonsRemaining)` | Готовность только после совпадающего отпускания и нулевого остатка нажатых кнопок. |
+| `selectCommandMouseButton(logical)` | bool: получить lease и стадировать пресет; не сохраняет и не включает мышь. |
+| `applyCommandMouseButton()` | bool: только готовый кандидат с действительным lease сохраняется, затем reload. OSError откатывает настройку и оставляет кандидат для повтора. Мышь автоматически не включается. |
+| `cancelCommandMouseCapture()` | Идемпотентная очистка кандидата и освобождение lease. |
+
+Редакторы клавиатуры (обе роли, включая мастер) и мыши взаимно исключены.
+Отмена выполняется при уходе с экрана, Esc, hide/close/deactivate/minimize,
+уничтожении окна/родителя, истечении 30 секунд, отзыве lease и смене host.
+`command_mouse_enabled` и `command_mouse_button` учитывают `lockedSettings`.
+В отличие от непосредственной записи rw-свойств, выбор кнопки — транзакция
+редактора с отдельным Apply. Сохранение и реальная готовность runtime разделены.

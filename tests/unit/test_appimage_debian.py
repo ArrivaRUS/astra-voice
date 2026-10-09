@@ -361,9 +361,26 @@ def test_pending_source_records() -> None:
         lockfile.parse(lock_text(records(), extra=SBOM_PENDING.replace(',"note"', ',"x"') + "\n"))
 
 
-def test_real_lock_names_gcc_runtime_as_open_item() -> None:
+def test_real_lock_pins_complete_gcc_source_packages() -> None:
     lock = lockfile.load(ROOT / "packaging" / "appimage.lock")
-    assert {p.id for p in lock.pending_sources} == {"gcc-libquadmath", "gcc-libgfortran"}
+    assert not {p.id for p in lock.pending_sources} & {"gcc-libquadmath", "gcc-libgfortran"}
+    expected = {
+        "gcc-libquadmath": (
+            "gcc-4.8.5-44.el7.src.rpm",
+            79314655,
+            "642c4085f6af9565e39583e54a9d7a5d9e6b93dd8c8e9474aec8a892d6c7aa36",
+        ),
+        "gcc-libgfortran": (
+            "gcc-libraries-8.3.1-2.1.1.el7.src.rpm",
+            137336608,
+            "cf2a1d2c2e5a56eb2e495c2638e64769b73db07555e1f7ce34cbd9feff6891f5",
+        ),
+    }
+    for ident, values in expected.items():
+        source = lock.source(ident)
+        assert (source.file, source.size, source.sha256) == values
+        assert source.cache_path == f"sources/{source.file}"
+        assert source.url == "https://vault.centos.org/7.9.2009/os/Source/SPackages/" + source.file
 
 
 def test_todo_pin_passes_format_but_is_listed(
@@ -1337,3 +1354,51 @@ def test_verifier_checks_git_tree_of_source(
     (archive.root / delta_rel).write_text(json.dumps(delta), "utf-8")
     with pytest.raises(debverify.VerifyError, match="дерево git [0-9a-f]{40}, в lock f{40}"):
         verify(archive, "sources")
+
+
+@pytest.mark.skipif(shutil.which("dpkg-deb") is None, reason="нужен dpkg-deb")
+@pytest.mark.parametrize(
+    ("library", "source_id"),
+    [
+        ("libgfortran-040039e1.so.5.0.0", "gcc-libgfortran"),
+        ("libquadmath-96973f99.so.0.0.0", "gcc-libquadmath"),
+    ],
+)
+def test_sbom_gcc_runtime_links_pinned_srpm(
+    tmp_path: Path,
+    library: str,
+    source_id: str,
+) -> None:
+    appdir, cache, lock_path = _sbom_tree(tmp_path)
+    source = lockfile.load(ROOT / "packaging/appimage.lock").source(source_id)
+    source_record = rec(
+        "source",
+        {
+            "id": source.id,
+            "file": source.file,
+            "size": source.size,
+            "sha256": source.sha256,
+            "url": source.url,
+        },
+    )
+    lock_path.write_text(lock_path.read_text().replace(SBOM_PENDING, source_record))
+    if library.startswith("libquadmath"):
+        site = appdir / SITE
+        old = site / "numpy.libs/libgfortran-040039e1.so.5.0.0"
+        old.rename(old.with_name(library))
+        record = site / "numpy-1.24.2.dist-info/RECORD"
+        record.write_text(record.read_text().replace(old.name, library))
+    out = tmp_path / "sbom.json"
+    proc = _sbom(appdir, cache, lock_path, out)
+    assert proc.returncode == 0, proc.stderr
+    bom = json.loads(out.read_text())
+    numpy = next(c for c in bom["components"] if c["name"] == "numpy")
+    component = next(c for c in numpy["components"] if c["name"] == library)
+    props = {p["name"]: p["value"] for p in component["properties"]}
+    assert props["astra-voice:sources"] == "pinned"
+    assert props["astra-voice:source-file"] == source.file
+    assert props["astra-voice:source-sha256"] == source.sha256
+    assert "astra-voice:open-item" not in props
+    assert component["externalReferences"] == [
+        {"type": "source-distribution", "url": source.url},
+    ]

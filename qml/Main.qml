@@ -6,6 +6,7 @@
 // appInfo, settingsBridge и themeSource могут отсутствовать — тогда работают дефолты.
 import QtQuick 2.15
 import QtQuick.Controls 2.15
+import QtQuick.Window 2.15
 import QtQuick.Layouts 1.15
 import "."
 import "." as Av
@@ -53,6 +54,47 @@ ApplicationWindow {
     // Плавное появление раздела включается только после сборки окна: при первой
     // загрузке анимировать нечего, а снимок обязан быть одинаковым в любой момент.
     property bool sectionFadeReady: false
+    property bool focusModeOnLoad: false
+
+    function showKeyboardMode() {
+        focusModeOnLoad = true
+        sidebar.currentIndex = window.sectionIndices.general
+    }
+
+    function revealPageItem(item) {
+        if (!item || !page.item || !body.visible)
+            return
+        var ancestor = item
+        var target = item
+        var foundRow = false
+        while (ancestor && ancestor !== page.item) {
+            // A focused setting control needs its label and explanation in view.
+            // SettingRow's public properties identify the nearest containing row.
+            if (!foundRow && typeof ancestor.label === "string"
+                    && typeof ancestor.sub === "string"
+                    && typeof ancestor.divider === "boolean"
+                    && typeof ancestor.toggle !== "undefined") {
+                target = ancestor
+                foundRow = true
+            }
+            ancestor = ancestor.parent
+        }
+        if (ancestor !== page.item)
+            return
+        var margin = Theme.focusOffset + Theme.focusWidth
+        // A row taller than the viewport cannot be revealed in full; keep its
+        // active control reachable rather than repeatedly jumping between edges.
+        if (target.height + margin * 2 > body.height)
+            target = item
+        var position = target.mapToItem(page, 0, 0)
+        if (position.y - margin < body.contentY)
+            body.contentY = Math.max(0, position.y - margin)
+        else if (position.y + target.height + margin > body.contentY + body.height)
+            body.contentY = Math.min(Math.max(0, body.contentHeight - body.height),
+                position.y + target.height + margin - body.height)
+    }
+
+    onActiveFocusItemChanged: Qt.callLater(function() { window.revealPageItem(window.activeFocusItem) })
 
     // Снимки экрана обязаны совпадать в любой момент времени: тест выставляет
     // freezeAnimations, и всё, что зависит от хода времени, встаёт на конечную
@@ -127,7 +169,7 @@ ApplicationWindow {
 
                 Text {
                     textFormat: Text.PlainText
-                    text: window.currentSection.title
+                    text: window.currentSection.key === "advanced" ? qsTr("Продвинутые настройки") : window.currentSection.title
                     color: Theme.fg
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontH2SectionSize
@@ -139,7 +181,7 @@ ApplicationWindow {
 
                 Text {
                     textFormat: Text.PlainText
-                    text: window.currentSection.subtitle
+                    text: window.currentSection.key === "advanced" ? qsTr("Голосовые команды Astra Cowork") : window.currentSection.subtitle
                     color: Theme.fgMuted
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontSmallSize
@@ -207,6 +249,22 @@ ApplicationWindow {
                 id: page
                 width: body.width
                 source: window.sectionPages[window.currentSection.key]
+
+                onLoaded: {
+                    if (window.focusModeOnLoad && window.currentSection.key === "general") {
+                        window.focusModeOnLoad = false
+                        Qt.callLater(function() {
+                            if (window.currentSection.key === "general" && page.item)
+                                window.revealPageItem(page.item.focusKeyboardMode())
+                        })
+                    }
+                }
+
+                Connections {
+                    target: page.item
+                    ignoreUnknownSignals: true
+                    function onKeyboardModeRequested() { window.showKeyboardMode() }
+                }
 
                 onSourceChanged: {
                     // Новый раздел всегда открывается сверху, а не там, где бросили прошлый.
@@ -279,6 +337,52 @@ ApplicationWindow {
             }
             if (window.sectionIndices.hasOwnProperty("network"))
                 sidebar.currentIndex = window.sectionIndices["network"]
+        }
+    }
+    onVisibilityChanged: {
+        if (window.bridge && window.bridge.commandPreviewText !== ""
+                && (visibility === Window.Hidden || visibility === Window.Minimized))
+            window.bridge.rejectCommand()
+    }
+
+    AvDialog {
+        id: commandPreviewDialog
+        heading: qsTr("Команда помощнику")
+        message: window.bridge ? window.bridge.commandPreviewText : ""
+        note: qsTr("Отправится через 3 секунды. Esc — отмена")
+        confirmText: qsTr("Отправить")
+        cancelText: qsTr("Не отправлять")
+        onOpened: if (window.bridge) window.bridge.commandPreviewShown()
+        onConfirmed: if (window.bridge) window.bridge.confirmCommand()
+        onCancelled: if (window.bridge) window.bridge.rejectCommand()
+    }
+
+    AvDialog {
+        id: commandDetailsDialog
+        heading: qsTr("Команда помощнику")
+        message: window.bridge ? window.bridge.commandDetail : ""
+        confirmText: qsTr("Понятно")
+        cancelText: ""
+    }
+
+    Connections {
+        target: window.bridge
+        function onCommandPreviewTextChanged() {
+            if (window.bridge.commandPreviewText !== "")
+                commandPreviewDialog.open()
+            else
+                commandPreviewDialog.close()
+        }
+        function onCommandDetailsRequested() {
+            sidebar.currentIndex = window.sectionIndices.advanced
+            window.show()
+            window.raise()
+            window.requestActivate()
+            commandDetailsDialog.open()
+        }
+        function onCommandStateChanged() {
+            if (!window.bridge.commandDetail)
+                commandDetailsDialog.close()
         }
     }
 }

@@ -40,6 +40,7 @@ from astra_voice.models import store as store_module
 from astra_voice.models.catalog import CatalogEntry, FileSpec
 from astra_voice.models.installer import Installer, SmokeResult
 from astra_voice.models.store import ModelRecord, ModelState, ModelStore
+from astra_voice.platform import cowork as cowork_module
 from astra_voice.platform import paste as paste_module
 from astra_voice.platform.hotkey import (
     DEFAULT_CANDIDATES,
@@ -222,6 +223,16 @@ class FakeTimer:
             self.timeout.emit()
 
 
+class _CoworkInstallation:
+    """Deterministic installation probe owned by Rig, distinct from caller patches."""
+
+    def __init__(self, installed: bool) -> None:
+        self.installed = installed
+
+    def __call__(self) -> bool:
+        return self.installed
+
+
 class Rig:
     """Общий журнал порядка действий и управляемые отказы каждого ресурса."""
 
@@ -234,7 +245,13 @@ class Rig:
         hotkey_factory: Callable[[], HotkeyManager] | None = None,
         supervisor_factory: Callable[..., WorkerSupervisor] | None = None,
         session_kind: SessionKind = SessionKind.FLY,
+        cowork_installed: bool = True,
     ) -> None:
+        installation_probe = vars(module)["is_installed"]
+        if installation_probe is cowork_module.is_installed or isinstance(
+            installation_probe, _CoworkInstallation
+        ):
+            monkeypatch.setattr(module, "is_installed", _CoworkInstallation(cowork_installed))
         self.trace: list[str] = []
         self.fail_at: str | None = None
         self.timers: list[FakeTimer] = []
@@ -5509,3 +5526,32 @@ def test_paused_switch_restart_error_shows_load_failure(monkeypatch: pytest.Monk
     bench.rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
     bench.rig.tray.set_state.assert_called_with(TrayState.ERROR)
     runtime.shutdown()
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_rig_cowork_installation_is_explicit(
+    monkeypatch: pytest.MonkeyPatch, installed: bool
+) -> None:
+    rig = Rig(monkeypatch, session_kind=SessionKind.KDE, cowork_installed=installed)
+    assert rig.runtime.command_installed is installed
+    assert rig.runtime.command_available is installed
+    rig.runtime._command_client = Mock()
+    rig.runtime.refresh_command_status()
+    assert rig.runtime.command_installed is installed
+    rig.runtime.shutdown()
+
+
+def test_rig_preserves_explicit_missing_cowork_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = Mock(return_value=False)
+    monkeypatch.setattr(module, "is_installed", probe)
+    rig = Rig(monkeypatch, session_kind=SessionKind.KDE)
+    assert vars(module)["is_installed"] is probe
+    assert not rig.runtime.command_installed
+    rig.runtime.shutdown()
+
+
+def test_rig_can_change_installation_between_instances(monkeypatch: pytest.MonkeyPatch) -> None:
+    for installed in (True, False, True):
+        rig = Rig(monkeypatch, session_kind=SessionKind.KDE, cowork_installed=installed)
+        assert rig.runtime.command_installed is installed
+        rig.runtime.shutdown()

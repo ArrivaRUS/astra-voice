@@ -6,6 +6,7 @@ import ".."
 Item {
     id: root
 
+    property string roleLabel: qsTr("Диктовка")
     property string state7: "idle"
     property string hotkey: qsTr("Ctrl + Space")
     property string conflictOwner: ""
@@ -224,7 +225,7 @@ Item {
             variant: "ok"
             iconName: "check"
             title: qsTr("Комбинация назначена")
-            body: qsTr("Теперь диктовка работает по %1.").arg(root.hotkey)
+            body: qsTr("%1: комбинация %2.").arg(root.roleLabel).arg(root.hotkey)
         }
 
         NoteBanner {

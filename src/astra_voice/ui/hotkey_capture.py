@@ -9,7 +9,7 @@ from typing import Protocol, cast
 from PyQt5.QtCore import QEvent, QObject, Qt, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QGuiApplication
 
-from astra_voice.core.settings import is_valid_combo
+from astra_voice.core.settings import is_valid_combo, is_valid_command_combo
 from astra_voice.platform.hotkey import DEFAULT_CANDIDATES
 
 log = logging.getLogger(__name__)
@@ -32,6 +32,7 @@ class CaptureHost(Protocol):
 class HotkeyCapture(QObject):
     """Одна машина состояний; X11-события принимает только через очередь Qt."""
 
+    captureRoleChanged = pyqtSignal()
     captureStateChanged = pyqtSignal()
     captureMessageChanged = pyqtSignal()
     pendingComboChanged = pyqtSignal()
@@ -50,6 +51,7 @@ class HotkeyCapture(QObject):
         super().__init__(parent)
         self.host = host
         self.state = "idle"
+        self.role = "text"
         self.hint = ""
         self.pending_combo = ""
         self.free_candidates: list[str] = []
@@ -140,7 +142,16 @@ class HotkeyCapture(QObject):
             except Exception:
                 log.warning("Не удалось завершить захват клавиатуры", exc_info=True)
 
-    def begin(self, save: Callable[[str, bool], str]) -> None:
+    def begin(self, save: Callable[[str, bool], str], *, role: str = "text") -> None:
+        if self.state == "capturing":
+            self.cancel()
+        if role != self.role:
+            self.role = role
+            self.captureRoleChanged.emit()
+        if self.host is not None:
+            set_role = getattr(self.host, "set_capture_role", None)
+            if set_role is not None:
+                set_role(role)
         self._save = save
         self._set_hint("")
         self._set_pending("")
@@ -168,7 +179,8 @@ class HotkeyCapture(QObject):
         if not combo:
             self._set_state("idle")
             return
-        if not is_valid_combo(combo):
+        valid = is_valid_command_combo if self.role == "command" else is_valid_combo
+        if not valid(combo):
             self._set_state("capturing")
             self._set_hint("Добавьте к клавише Ctrl, Alt или Win")
             self.refresh_candidates()

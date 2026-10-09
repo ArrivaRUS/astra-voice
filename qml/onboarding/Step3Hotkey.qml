@@ -15,11 +15,11 @@ Item {
     readonly property string hotkeyMode: bridge ? bridge.hotkeyMode : "ptt"
 
     function escPressed() {
-        return capture.escPressed()
+        return capture.escPressed() || commandKeys.escPressed()
     }
 
     implicitWidth: 580 // Макет 08-onboarding-3-hotkey.html: ширина содержимого.
-    implicitHeight: capture.visible ? capture.y + capture.height : card.y + card.height
+    implicitHeight: commandKeys.visible ? commandKeys.y + commandKeys.height : capture.visible ? capture.y + capture.height : card.y + card.height
     width: implicitWidth
     height: implicitHeight
 
@@ -71,7 +71,7 @@ Item {
                 width: parent.width
                 divider: false
                 showHint: false
-                label: qsTr("Текущая комбинация")
+                label: qsTr("Текст")
 
                 RowLayout {
                     spacing: 8 // design/spec.md §7: чип + «Изменить».
@@ -159,7 +159,7 @@ Item {
         width: root.width
         visible: state7 !== "idle"
         height: visible ? implicitHeight : 0
-        state7: root.bridge ? root.bridge.captureState : "capturing"
+        state7: root.bridge && root.bridge.captureRole === "text" ? root.bridge.captureState : "idle"
         hotkey: root.hotkey
         captureMessage: root.bridge ? root.bridge.captureMessage : ""
         pendingCombo: root.bridge ? root.bridge.pendingCombo : ""
@@ -201,5 +201,14 @@ Item {
             if (root.bridge)
                 root.bridge.hotkeyMode = "toggle"
         }
+    }
+    CommandHotkeySettings {
+        id: commandKeys
+        y: capture.visible ? capture.y + capture.height + 16 : card.y + card.height + 16
+        width: root.width
+        bridge: root.bridge
+        wizard: true
+        visible: root.bridge ? root.bridge.commandInstalled : false
+        height: visible ? implicitHeight : 0
     }
 }

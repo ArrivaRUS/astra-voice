@@ -5,7 +5,12 @@ from __future__ import annotations
 import ast
 import inspect
 import logging
+import subprocess
+import sys
+import threading
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -16,6 +21,333 @@ from astra_voice.platform import autostart, userinstall
 from helpers.appimage_bundle import KEY, make_bundle, module_path, tree_snapshot
 
 pytestmark = pytest.mark.unit
+
+
+def _command_runtime() -> SimpleNamespace:
+    return SimpleNamespace(
+        supervisor=None,
+        _switch_candidate=None,
+        command_hotkey=SimpleNamespace(backend=SimpleNamespace(process=None, _menu_thread=None)),
+        _command_client=None,
+        _command_session=None,
+        shutdown=lambda: None,
+    )
+
+
+def _run_exit(runtime: Any, monkeypatch: pytest.MonkeyPatch, management: Any = None) -> list[str]:
+    """Execute main's actual finalizer without starting GUI, buses or services."""
+    from astra_voice.ui import tray
+
+    events: list[str] = []
+    monkeypatch.setattr(tray, "_bus_transport", None)
+    monkeypatch.setattr(app, "_installed_code_key", lambda: KEY)
+    monkeypatch.setattr(app, "_children_stopped", lambda: True)
+    monkeypatch.setattr(userinstall, "finish_running_copy", lambda key: events.append("finish"))
+    monkeypatch.setattr(
+        userinstall, "preserve_incomplete_shutdown", lambda key: events.append("preserve")
+    )
+    namespace = dict(vars(app))
+    namespace.update(
+        runtime=runtime,
+        downloads=None,
+        update_checker=None,
+        onboarding=None,
+        appimage_management=management,
+        focuser=Mock(),
+        timer=Mock(),
+        theme_bridge=None,
+        close_watcher=None,
+        server=None,
+        lock=None,
+        shutdown_notify_dispatch=lambda: events.append("notify-stop"),
+        shutdown_bus_threads=lambda: events.append("bus-stop"),
+        _cleanup=lambda server, lock: events.append("unlock"),
+    )
+    main = ast.parse(inspect.getsource(app.main)).body[0]
+    assert isinstance(main, ast.FunctionDef)
+    finalizer = next(node for node in reversed(main.body) if isinstance(node, ast.Try))
+    code = ast.Module(body=finalizer.finalbody, type_ignores=[])
+    exec(compile(code, inspect.getfile(app), "exec"), namespace)
+    return events
+
+
+@pytest.mark.parametrize("slot", ["_command_client", "_command_session"])
+@pytest.mark.parametrize("alive", [False, True])
+def test_cowork_qthread_exit_barrier(
+    slot: str, alive: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PyQt5.QtCore import QThread
+
+    done = threading.Event()
+    entered = threading.Event()
+
+    class WaitingThread(QThread):
+        def run(self) -> None:
+            entered.set()
+            done.wait(5)
+
+    thread = WaitingThread()
+    runtime = _command_runtime()
+    setattr(runtime, slot, SimpleNamespace(_thread=thread))
+    thread.start()
+    assert entered.wait(2)
+    if not alive:
+        done.set()
+        assert thread.wait(2000)
+    try:
+        # Simulate timeout followed by owner forgetting its QThread reference.
+        runtime.shutdown = lambda: setattr(runtime, slot, None)
+        assert _run_exit(runtime, monkeypatch) == [
+            "notify-stop",
+            "bus-stop",
+            "preserve" if alive else "finish",
+            "unlock",
+        ]
+    finally:
+        done.set()
+        assert thread.wait(2000)
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_menu_restore_thread_exit_barrier(late: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    done = threading.Event()
+    thread = threading.Thread(target=done.wait, args=(5,))
+    runtime = _command_runtime()
+    backend = runtime.command_hotkey.backend
+
+    def launch() -> None:
+        backend._menu_thread = thread
+        thread.start()
+
+    if late:
+        runtime.shutdown = launch
+    else:
+        launch()
+        runtime.shutdown = lambda: setattr(backend, "_menu_thread", None)
+    try:
+        assert _run_exit(runtime, monkeypatch) == ["notify-stop", "bus-stop", "preserve", "unlock"]
+    finally:
+        done.set()
+        thread.join(2)
+        assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("slot", ["_command_client", "_command_session"])
+def test_qthread_finished_signal_is_not_joined(slot: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from PyQt5.QtCore import Qt, QThread
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class FinishingThread(QThread):
+        def run(self) -> None:
+            pass
+
+    def hold_finished() -> None:
+        entered.set()
+        release.wait(5)
+
+    thread = FinishingThread()
+    thread.finished.connect(hold_finished, Qt.DirectConnection)
+    runtime = _command_runtime()
+    setattr(runtime, slot, SimpleNamespace(_thread=thread))
+    thread.start()
+    try:
+        assert entered.wait(2)
+        assert thread.isRunning() is False
+        assert thread.wait(0) is False
+        assert _run_exit(runtime, monkeypatch) == ["notify-stop", "bus-stop", "preserve", "unlock"]
+    finally:
+        release.set()
+        assert thread.wait(2000)
+    assert _run_exit(runtime, monkeypatch) == ["notify-stop", "bus-stop", "finish", "unlock"]
+
+
+def test_broker_reference_survives_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = _command_runtime()
+    # An owned process remains owned even if it uses a separate session.
+    with subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    ) as child:
+        runtime.command_hotkey.backend.process = child
+        runtime.shutdown = lambda: setattr(runtime.command_hotkey.backend, "process", None)
+        try:
+            assert _run_exit(runtime, monkeypatch) == [
+                "notify-stop",
+                "bus-stop",
+                "preserve",
+                "unlock",
+            ]
+            assert child.poll() is None
+        finally:
+            assert child.stdin is not None
+            child.stdin.close()
+            child.wait(timeout=2)
+
+
+@pytest.mark.parametrize("fault", ["unknown", "raises", "non-bool"])
+def test_unproved_thread_stop_preserves_copy(fault: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = _command_runtime()
+    query = (
+        Mock(side_effect=RuntimeError("unavailable")) if fault == "raises" else Mock(return_value=1)
+    )
+    thread = object() if fault == "unknown" else SimpleNamespace(wait=query)
+    runtime._command_client = SimpleNamespace(_thread=thread)
+    assert _run_exit(runtime, monkeypatch) == ["notify-stop", "bus-stop", "preserve", "unlock"]
+    if fault != "unknown":
+        query.assert_called_once_with(0)
+
+
+@pytest.mark.parametrize("failed_snapshot", [1, 2])
+def test_unreadable_resource_snapshot_preserves_copy(
+    failed_snapshot: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = app._copy_shutdown_resources
+    count = 0
+
+    def capture(*args: Any) -> tuple[list[Any], list[Any]]:
+        nonlocal count
+        count += 1
+        if count == failed_snapshot:
+            raise RuntimeError("resource owner unavailable")
+        return snapshot(*args)
+
+    monkeypatch.setattr(app, "_copy_shutdown_resources", capture)
+    assert _run_exit(_command_runtime(), monkeypatch) == [
+        "notify-stop",
+        "bus-stop",
+        "preserve",
+        "unlock",
+    ]
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_management_worker_survives_controller_close(
+    late: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    done = threading.Event()
+    runtime = _command_runtime()
+
+    class Worker(threading.Thread):
+        def join(self, timeout: float | None = None) -> None:
+            assert runtime.stopped
+            done.set()
+            super().join(timeout)
+
+    thread = Worker(target=done.wait, args=(5,))
+    runtime.stopped = False
+    runtime.shutdown = lambda: setattr(runtime, "stopped", True)
+    management = SimpleNamespace(worker_threads=(), close=lambda: True)
+
+    def close() -> bool:
+        if late:
+            management.worker_threads = (thread,)
+            thread.start()
+        else:
+            management.worker_threads = ()
+        return True  # Snapshot must independently detect a faulty close contract.
+
+    management.close = close
+    if not late:
+        management.worker_threads = (thread,)
+        thread.start()
+    try:
+        assert _run_exit(runtime, monkeypatch, management) == [
+            "notify-stop",
+            "bus-stop",
+            "finish",
+            "unlock",
+        ]
+    finally:
+        done.set()
+        thread.join(2)
+        assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("close_raises", [False, True])
+@pytest.mark.parametrize("runtime_raises", [False, True])
+def test_management_join_holds_lock_after_audio_stop(
+    close_raises: bool, runtime_raises: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = threading.Event()
+    entered = threading.Event()
+    order: list[str] = []
+
+    def work() -> None:
+        entered.set()
+        release.wait(5)
+        order.append("worker-finished")
+
+    class Worker(threading.Thread):
+        def join(self, timeout: float | None = None) -> None:
+            assert "runtime-stopped" in order
+            assert timeout is None
+            order.append("join")
+            release.set()
+            super().join(timeout)
+            order.append("joined")
+
+    def close() -> bool:
+        was_pending = "close" in order
+        order.append("close")
+        if close_raises:
+            raise RuntimeError("close failed")
+        return was_pending
+
+    def stop_runtime() -> None:
+        order.append("runtime-stopped")
+        if runtime_raises:
+            raise RuntimeError("runtime failed")
+
+    worker = Worker(target=work)
+    management = SimpleNamespace(worker_threads=(worker,), close=close)
+    runtime = _command_runtime()
+    runtime.shutdown = stop_runtime
+    worker.start()
+    assert entered.wait(2)
+    try:
+        events = _run_exit(runtime, monkeypatch, management)
+        assert order[:2] == ["close", "runtime-stopped"]
+        assert "joined" in order
+        assert order.index("join") < order.index("worker-finished") < order.index("joined")
+        assert events == [
+            "notify-stop",
+            "bus-stop",
+            "preserve" if close_raises or runtime_raises else "finish",
+            "unlock",
+        ]
+        assert not worker.is_alive()
+    finally:
+        release.set()
+        threading.Thread.join(worker, timeout=2)
+
+
+@pytest.mark.parametrize("result", [True, False, None, RuntimeError("close failed")])
+def test_management_close_precedes_runtime_and_controls_barrier(
+    result: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+
+    def close() -> object:
+        order.append("management")
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    management = SimpleNamespace(worker_threads=(), close=close)
+    runtime = _command_runtime()
+    runtime.shutdown = lambda: order.append("runtime")
+    assert _run_exit(runtime, monkeypatch, management) == [
+        "notify-stop",
+        "bus-stop",
+        "finish" if result is True else "preserve",
+        "unlock",
+    ]
+    assert order == ["management", "runtime"] + (["management"] if result is False else [])
 
 
 @pytest.fixture(autouse=True)

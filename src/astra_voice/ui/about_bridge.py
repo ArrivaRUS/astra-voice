@@ -215,8 +215,10 @@ class AboutBridge(QObject):
         self._settings_dir = settings_dir if settings_dir is not None else paths.config_dir_path()
         self._models_dir = models_dir if models_dir is not None else paths.model_store_dir_path()
         self._logs_dir = logs_dir if logs_dir is not None else paths.log_dir_path()
-        self._installed = (
-            installed if installed is not None else paths.resource_root() == paths.INSTALL_SHARE_DIR
+        # installed остаётся совместимым параметром тестового/встроенного хоста.
+        # В обычном запуске трек определяется исполняемым кодом, а не ресурсами.
+        self._install_kind = (
+            paths.install_kind().value if installed is None else ("deb" if installed else "source")
         )
         self._clock = clock
         self._build_date = build_date()
@@ -243,7 +245,7 @@ class AboutBridge(QObject):
 
     @pyqtProperty(str, constant=True)
     def installKind(self) -> str:  # noqa: N802
-        return "deb" if self._installed else "source"
+        return self._install_kind
 
     @pyqtProperty(str, constant=True)
     def pythonVersion(self) -> str:  # noqa: N802
