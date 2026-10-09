@@ -229,6 +229,7 @@ class SettingsBridge(QObject):
         self._locked = frozenset(locked)
         self._apply = apply
         self._command_host: Any = None
+        self._command_capture_cancelling = False
         self._command_preview_text = ""
         self._autostart = autostart
         self._capture = capture if capture is not None else HotkeyCapture(capture_host, self)
@@ -579,6 +580,9 @@ class SettingsBridge(QObject):
             log.info("%s: настройка задана администратором", field)
             getattr(self, name + "Changed").emit()
             return
+        if name == "commandHotkey" and not self._command_hotkey_editable():
+            self.commandHotkeyChanged.emit()
+            return
         if self._values[name] == value:
             return
         if (
@@ -593,6 +597,9 @@ class SettingsBridge(QObject):
             return
         if name == "commandHotkey" and self._command_host is not None:
             code = self._command_host.check_command_hotkey(cast(str, value))
+            if not self._command_hotkey_editable():
+                self.commandHotkeyChanged.emit()
+                return
             if code != "ok" and not (code == "busy" and self._capture.keep_busy):
                 getattr(self, name + "Changed").emit()
                 self._capture._set_state(
@@ -696,7 +703,24 @@ class SettingsBridge(QObject):
         host.on_command_preview = self.update_command_preview
         self.update_command_state()
 
+    def _command_hotkey_editable(self) -> bool:
+        if self._command_capture_cancelling:
+            return False
+        if self.commandInstalled:
+            return True
+        if self.captureRole == "command" and (
+            self._capture.state != "idle" or self._capture.pending_combo
+        ):
+            self._command_capture_cancelling = True
+            try:
+                self._capture.cancel()
+            finally:
+                self._command_capture_cancelling = False
+        return False
+
     def update_command_state(self) -> None:
+        if self.captureRole == "command":
+            self._command_hotkey_editable()
         self.commandStateChanged.emit()
         if self._mouse_capture.active:
             self._mouse_capture.validate()
@@ -715,6 +739,8 @@ class SettingsBridge(QObject):
         return self._capture.state not in ("idle", "success")
 
     def _keyboard_capture_changed(self) -> None:
+        if self.captureRole == "command":
+            self._command_hotkey_editable()
         if self._keyboard_capture_active() and self._mouse_capture.active:
             self._mouse_capture.cancel()
         self.commandMouseStateChanged.emit()
@@ -947,6 +973,8 @@ class SettingsBridge(QObject):
         self.commandDetailsRequested.emit()
 
     def save_command_capture_combo(self, combo: str, keep: bool) -> str:
+        if not self._command_hotkey_editable():
+            return "not-grabbed"
         self._set_value("commandHotkey", combo)
         if self.saveError or self.commandHotkey != combo:
             return {"duplicate": "duplicate", "conflict": "busy"}.get(
@@ -956,7 +984,7 @@ class SettingsBridge(QObject):
 
     @pyqtSlot()
     def beginCommandCapture(self) -> None:  # noqa: N802
-        if not self._mouse_capture.active:
+        if not self._mouse_capture.active and self._command_hotkey_editable():
             self._capture.begin(self.save_command_capture_combo, role="command")
 
     @pyqtSlot()
@@ -1015,6 +1043,8 @@ class SettingsBridge(QObject):
 
     @pyqtSlot(str)
     def endCapture(self, combo: str) -> None:  # noqa: N802
+        if self.captureRole == "command" and not self._command_hotkey_editable():
+            return
         save = (
             self.save_command_capture_combo
             if self.captureRole == "command"
@@ -1028,10 +1058,14 @@ class SettingsBridge(QObject):
 
     @pyqtSlot()
     def keepCombo(self) -> None:  # noqa: N802
+        if self.captureRole == "command" and not self._command_hotkey_editable():
+            return
         self._capture.keep()
 
     @pyqtSlot()
     def refreshCandidates(self) -> None:  # noqa: N802
+        if self.captureRole == "command" and not self._command_hotkey_editable():
+            return
         self._capture.refresh_candidates()
 
     @pyqtProperty(str, notify=hotkeyModeChanged)
@@ -2146,11 +2180,11 @@ class OnboardingController(QObject):
 
     @pyqtSlot()
     def keepCombo(self) -> None:  # noqa: N802
-        self._capture.keep()
+        self._bridge.keepCombo()
 
     @pyqtSlot()
     def refreshCandidates(self) -> None:  # noqa: N802
-        self._capture.refresh_candidates()
+        self._bridge.refreshCandidates()
 
     @pyqtProperty(bool, notify=doneChanged)
     def done(self) -> bool:

@@ -127,6 +127,7 @@ Column {
         AvToggle {
             id: mouseToggle
             objectName: "commandMouseToggle"
+            muted: !root.installed
             // Turning off stays available while a command owns the input.
             enabled: root.supported && root.installed && (root.mouseEnabled || root.canChoose)
             Accessible.name: checked ? qsTr("Команда кнопкой мыши, включено") : qsTr("Команда кнопкой мыши, выключено")
@@ -328,7 +329,7 @@ Column {
 
             NoteBanner {
                 width: parent.width
-                visible: !root.captureActive && (root.status === "busy" || (root.status === "unavailable" && root.supported))
+                visible: root.installed && !root.captureActive && (root.status === "busy" || (root.status === "unavailable" && root.supported))
                 height: visible ? implicitHeight : 0
                 variant: root.status === "busy" ? "warn" : "error"
                 title: root.status === "busy" ? qsTr("Кнопка мыши занята другой программой") : qsTr("Кнопка мыши недоступна — выберите другую")
@@ -344,11 +345,11 @@ Column {
             Text {
                 width: parent.width
                 visible: !root.captureActive && root.statusMessage !== ""
-                    && root.status !== "busy" && !(root.status === "unavailable" && root.supported)
+                    && (!root.installed || (root.status !== "busy" && !(root.status === "unavailable" && root.supported)))
                 height: visible ? implicitHeight : 0
                 text: root.statusMessage
                 textFormat: Text.PlainText
-                color: Theme.fgMuted
+                color: root.installed ? Theme.fgMuted : Theme.fgDisabled
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSettingSubSize
                 lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
@@ -367,7 +368,7 @@ Column {
                         ? qsTr("Выбранная кнопка занята голосовыми командами во всех приложениях. Её обычное действие, например переход назад или вперёд, недоступно. Чтобы вернуть его, выключите эту опцию.")
                         : qsTr("Если включить, выбранная кнопка будет занята голосовыми командами во всех приложениях. Её обычное действие, например переход назад или вперёд, станет недоступно.")
                 textFormat: Text.PlainText
-                color: Theme.warningInk
+                color: root.installed ? Theme.warningInk : Theme.fgDisabled
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSettingSubSize
                 lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)

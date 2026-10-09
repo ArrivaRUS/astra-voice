@@ -30,10 +30,14 @@ from astra_voice.platform.kwin_command_lease import (
 pytestmark = pytest.mark.unit
 GENERATION = "a" * 32
 TOKEN = lease_token(":1.123", GENERATION)
+_REAL_GETEUID = os.geteuid
 
 
 @pytest.fixture(autouse=True)
-def namespace_root_owners(monkeypatch: pytest.MonkeyPatch) -> None:
+def namespace_root_owners(monkeypatch: pytest.MonkeyPatch, nonroot_euid: None) -> None:
+    # Lease checks real filesystem ownership; the shared nonroot_euid fixture
+    # fakes UID 1000 for application root guards, even when CI runs as root.
+    monkeypatch.setattr(os, "geteuid", _REAL_GETEUID)
     # Codex's user namespace maps host root to overflow uid 65534. Normalize
     # only these trusted system ancestor inodes for tests; production remains
     # fail-closed for directories owned by any other user.

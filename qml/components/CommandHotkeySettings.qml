@@ -18,17 +18,19 @@ Column {
     spacing: Theme.fieldGap
 
     function escPressed() { return commandCapture.escPressed() }
-    function chooseWin(key) { if (bridge && editingEnabled) bridge.commandHotkey = key }
+    function chooseWin(key) { if (bridge && installed && editingEnabled) bridge.commandHotkey = key }
 
     SettingRow {
         width: parent.width
         divider: false
         label: root.rowLabel
-        sub: root.bridge ? root.bridge.commandStatus : qsTr("Проверяю Astra Cowork…")
+        sub: !root.bridge ? qsTr("Проверяю Astra Cowork…")
+            : !root.installed ? qsTr("Astra Cowork не установлен") : root.bridge.commandStatus
         showHint: false
         rowEnabled: root.installed && root.editingEnabled
 
         KeyChip {
+            enabled: root.installed
             text: root.keyLabel
             Accessible.name: qsTr("Клавиша команды, %1").arg(root.keyLabel)
             Layout.alignment: Qt.AlignVCenter
@@ -57,27 +59,28 @@ Column {
 
             Column {
                 width: parent.width
-                visible: root.installed
+                visible: root.installed || !root.wizard
                 spacing: 0
                 Text {
                     width: parent.width
                     text: root.bridge && root.bridge.commandHotkey !== "Super_L" && root.bridge.commandHotkey !== "Super_R"
                         ? qsTr("Эта клавиша запускает голосовую команду в Astra Cowork.")
                         : qsTr("Win используется для записи вместо меню приложений. Сочетания с Win работают до начала записи; во время записи с удерживаемой Win они недоступны. Рекомендуем «Удерживать».")
-                    visible: root.installed
+                    visible: root.installed || !root.wizard
                     height: visible ? implicitHeight : 0
                     textFormat: Text.PlainText
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontSettingSubSize
                     lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
                     lineHeightMode: Text.FixedHeight
-                    color: Theme.fgMuted
+                    color: root.installed ? Theme.fgMuted : Theme.fgDisabled
                     wrapMode: Text.WordWrap
                     renderType: Text.NativeRendering
                 }
 
                 AbstractButton {
-                    visible: root.installed && !root.wizard
+                    visible: !root.wizard
+                    enabled: root.installed
                     height: visible ? implicitHeight : 0
                     width: parent.width
                     padding: 0
@@ -93,7 +96,7 @@ Column {
                         font.pixelSize: Theme.fontSettingSubSize
                         lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
                         lineHeightMode: Text.FixedHeight
-                        color: Theme.primary
+                        color: root.installed ? Theme.primary : Theme.fgDisabled
                         wrapMode: Text.WordWrap
                         renderType: Text.NativeRendering
                     }
@@ -110,43 +113,36 @@ Column {
                 }
             }
 
-            RowLayout {
-                visible: root.installed
-                height: visible ? implicitHeight : 0
-                spacing: Theme.fieldGap
-                AvButton { text: qsTr("Левая Win"); small: true; variant: "secondary"; enabled: root.editingEnabled; onClicked: root.chooseWin("Super_L") }
-                AvButton { text: qsTr("Правая Win"); small: true; variant: "secondary"; enabled: root.editingEnabled; onClicked: root.chooseWin("Super_R") }
-                AvButton { text: qsTr("Проверить снова"); small: true; variant: "ghost"; onClicked: if (root.bridge) root.bridge.refreshCommandStatus() }
-            }
-
             Text {
                 width: parent.width
                 visible: !root.installed && !root.wizard && root.bridge !== null
                 height: visible ? implicitHeight : 0
                 text: qsTr("Голосовые команды доступны после установки Astra Cowork")
                 textFormat: Text.PlainText
-                color: Theme.fgMuted
+                color: root.installed ? Theme.fgMuted : Theme.fgDisabled
                 font.family: Theme.fontUi
                 font.pixelSize: Theme.fontSettingSubSize
                 wrapMode: Text.WordWrap
                 renderType: Text.NativeRendering
             }
 
-            AvButton {
-                visible: !root.installed && !root.wizard
-                text: qsTr("Проверить снова")
-                small: true
-                variant: "ghost"
-                onClicked: if (root.bridge) root.bridge.refreshCommandStatus()
+            RowLayout {
+                visible: root.installed || !root.wizard
+                height: visible ? implicitHeight : 0
+                spacing: Theme.fieldGap
+                AvButton { text: qsTr("Левая Win"); small: true; variant: "secondary"; enabled: root.installed && root.editingEnabled; onClicked: root.chooseWin("Super_L") }
+                AvButton { text: qsTr("Правая Win"); small: true; variant: "secondary"; enabled: root.installed && root.editingEnabled; onClicked: root.chooseWin("Super_R") }
+                AvButton { text: qsTr("Проверить снова"); small: true; variant: "ghost"; enabled: root.bridge !== null; onClicked: if (root.bridge) root.bridge.refreshCommandStatus() }
             }
 
             CaptureField {
                 id: commandCapture
+                enabled: root.installed && root.editingEnabled
                 width: parent.width
                 visible: state7 !== "idle"
                 height: visible ? implicitHeight : 0
                 showIdleRow: false
-                state7: root.bridge && root.bridge.captureRole === "command" ? root.bridge.captureState : "idle"
+                state7: root.bridge && root.installed && root.bridge.captureRole === "command" ? root.bridge.captureState : "idle"
                 hotkey: root.bridge ? root.bridge.commandHotkey : "Super_L"
                 captureMessage: root.bridge ? root.bridge.captureMessage : ""
                 pendingCombo: root.bridge ? root.bridge.pendingCombo : ""

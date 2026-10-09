@@ -72,6 +72,7 @@ Column {
             AvToggle {
                 id: commandEnabledToggle
                 enabled: root.settings ? root.settings.commandInstalled : false
+                muted: !enabled
                 Accessible.name: qsTr("Голосовые команды")
                 Binding { target: commandEnabledToggle; property: "checked"; value: root.settings ? root.settings.commandEnabled : true }
                 onToggled: if (root.settings) root.settings.commandEnabled = checked
@@ -91,6 +92,7 @@ Column {
             AvToggle {
                 id: commandPreviewToggle
                 enabled: root.settings ? root.settings.commandInstalled : false
+                muted: !enabled
                 Accessible.name: qsTr("Показывать команду перед отправкой")
                 Binding { target: commandPreviewToggle; property: "checked"; value: root.settings ? root.settings.commandPreview : false }
                 onToggled: if (root.settings) root.settings.commandPreview = checked

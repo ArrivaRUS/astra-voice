@@ -18,6 +18,7 @@ from dataclasses import replace
 from functools import partial
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, cast
 from unittest.mock import Mock, call
 
@@ -421,6 +422,14 @@ def allow_mouse_setting(bridge: SettingsBridge, name: str) -> None:
 
         # Only the new guarded setting needs a runtime port; keep other cases unchanged.
         bridge._mouse_capture.bind_host(MouseHost())
+    elif name == "commandHotkey":
+        bridge.bind_command_host(
+            SimpleNamespace(
+                command_installed=True,
+                check_command_hotkey=Mock(return_value="ok"),
+                reload_command_hotkey=Mock(),
+            )
+        )
 
 
 @pytest.mark.parametrize("name", writable_properties())
