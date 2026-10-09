@@ -55,6 +55,12 @@ class Rig:
         self.factory = Mock(return_value=self.runtime)
         self.signals = Mock()
         self.settings = Settings(hotkey="Alt+Space")
+        self.runtime.settings = self.settings
+        self.runtime.command_installed = False
+        self.runtime.command_available = False
+        self.runtime.command_status = "Astra Cowork не установлен"
+        self.runtime.command_feedback = None
+        self.runtime.hotkey.signature.side_effect = lambda combo: (sum(map(ord, combo)), 0)
         self.autostart_enabled = self.settings.autostart
         self.calls.attach_mock(self.runtime.start, "start")
         self.calls.attach_mock(self.app.exec_, "exec")
@@ -782,13 +788,14 @@ def test_onboarding_host_delegates_and_hides_root(
     assert host.begin_capture() is True
     host.end_capture()
     assert host.probe("Ctrl+Space") == "busy"
+    rig.runtime.hotkey.probe.return_value.code = "ok"
     assert host.free_candidates(["Ctrl+Alt+D"]) == ["Ctrl+Alt+D"]
     host.notify_ready("Ctrl+Alt+D")
     host.hide_window()
-    rig.runtime.begin_hotkey_capture.assert_called_once_with(own_window=271)
+    rig.runtime.begin_hotkey_capture.assert_called_once_with(own_window=271, role="text")
     rig.runtime.end_hotkey_capture.assert_called_once_with()
-    rig.runtime.hotkey.probe.assert_called_once_with("Ctrl+Space")
-    rig.runtime.hotkey.free_candidates.assert_called_once_with(["Ctrl+Alt+D"])
+    assert rig.runtime.hotkey.probe.call_args_list == [call("Ctrl+Space"), call("Ctrl+Alt+D")]
+    rig.runtime.hotkey.free_candidates.assert_not_called()
     notification.assert_called_once_with("Ctrl+Alt+D")
     root.hide.assert_called_once_with()
     rig.shell.rootObjects.return_value = []
@@ -805,7 +812,7 @@ def test_onboarding_host_ignores_unavailable_window_id(rig: Rig, window_id: obje
     rig.shell.rootObjects.return_value = [root]
     host = app_mod._RuntimeOnboardingHost(rig.runtime, rig.shell)
     host.begin_capture()
-    rig.runtime.begin_hotkey_capture.assert_called_once_with(own_window=None)
+    rig.runtime.begin_hotkey_capture.assert_called_once_with(own_window=None, role="text")
 
 
 def test_finishing_onboarding_updates_context(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:

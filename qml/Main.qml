@@ -6,6 +6,7 @@
 // appInfo, settingsBridge и themeSource могут отсутствовать — тогда работают дефолты.
 import QtQuick 2.15
 import QtQuick.Controls 2.15
+import QtQuick.Window 2.15
 import QtQuick.Layouts 1.15
 import "."
 import "." as Av
@@ -279,6 +280,46 @@ ApplicationWindow {
             }
             if (window.sectionIndices.hasOwnProperty("network"))
                 sidebar.currentIndex = window.sectionIndices["network"]
+        }
+    }
+    onVisibilityChanged: {
+        if (window.bridge && window.bridge.commandPreviewText !== ""
+                && (visibility === Window.Hidden || visibility === Window.Minimized))
+            window.bridge.rejectCommand()
+    }
+
+    AvDialog {
+        id: commandPreviewDialog
+        heading: qsTr("Команда помощнику")
+        message: window.bridge ? window.bridge.commandPreviewText : ""
+        note: qsTr("Отправится через 3 секунды. Esc — отмена")
+        confirmText: qsTr("Отправить")
+        cancelText: qsTr("Не отправлять")
+        onOpened: if (window.bridge) window.bridge.commandPreviewShown()
+        onConfirmed: if (window.bridge) window.bridge.confirmCommand()
+        onCancelled: if (window.bridge) window.bridge.rejectCommand()
+    }
+
+    AvDialog {
+        id: commandDetailsDialog
+        heading: qsTr("Команда помощнику")
+        message: window.bridge ? window.bridge.commandDetail : ""
+        confirmText: qsTr("Понятно")
+        cancelText: ""
+    }
+
+    Connections {
+        target: window.bridge
+        function onCommandPreviewTextChanged() {
+            if (window.bridge.commandPreviewText !== "")
+                commandPreviewDialog.open()
+            else
+                commandPreviewDialog.close()
+        }
+        function onCommandDetailsRequested() { commandDetailsDialog.open() }
+        function onCommandStateChanged() {
+            if (!window.bridge.commandDetail)
+                commandDetailsDialog.close()
         }
     }
 }

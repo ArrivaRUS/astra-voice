@@ -29,7 +29,7 @@ from astra_voice.core.dictation import (
     TestCallback,
     level_from_dbfs,
 )
-from astra_voice.core.settings import Settings, is_valid_combo
+from astra_voice.core.settings import Settings, is_valid_combo, is_valid_command_combo
 from astra_voice.core.settings import save as settings_save
 from astra_voice.platform.autostart import AutostartState
 from astra_voice.platform.external import open_external
@@ -131,6 +131,13 @@ _DEFAULT_DEVICE = {"id": "", "name": "Системный по умолчанию
 class SettingsBridge(QObject):
     """Публикует настройки и ошибки записи; каждый сеттер сразу пишет файл."""
 
+    commandHotkeyChanged = pyqtSignal()
+    commandEnabledChanged = pyqtSignal()
+    commandPreviewChanged = pyqtSignal()
+    commandStateChanged = pyqtSignal()
+    commandPreviewTextChanged = pyqtSignal()
+    commandDetailsRequested = pyqtSignal()
+    captureRoleChanged = pyqtSignal()
     hotkeyChanged = pyqtSignal()
     hotkeyModeChanged = pyqtSignal()
     pillEnabledChanged = pyqtSignal()
@@ -168,6 +175,9 @@ class SettingsBridge(QObject):
     etaChanged = pyqtSignal()
 
     _FIELDS = {
+        "commandHotkey": "command_hotkey",
+        "commandEnabled": "command_enabled",
+        "commandPreview": "command_preview",
         "hotkey": "hotkey",
         "hotkeyMode": "hotkey_mode",
         "pillEnabled": "pill_enabled",
@@ -206,9 +216,17 @@ class SettingsBridge(QObject):
         self._devices: list[dict[str, str]] = [_DEFAULT_DEVICE.copy()]
         self._locked = frozenset(locked)
         self._apply = apply
+        self._command_host: Any = None
+        self._command_preview_text = ""
         self._autostart = autostart
         self._capture = capture if capture is not None else HotkeyCapture(capture_host, self)
-        for name in ("captureState", "captureMessage", "pendingCombo", "freeCandidates"):
+        for name in (
+            "captureRole",
+            "captureState",
+            "captureMessage",
+            "pendingCombo",
+            "freeCandidates",
+        ):
             getattr(self._capture, name + "Changed").connect(getattr(self, name + "Changed"))
         self._save = save
         self._values = self._read_values()
@@ -549,11 +567,20 @@ class SettingsBridge(QObject):
             (name == "hotkeyMode" and value not in ("ptt", "toggle"))
             or (name == "language" and value not in ("ru", "en"))
             or (name == "hotkey" and not is_valid_combo(cast(str, value)))
+            or (name == "commandHotkey" and not is_valid_command_combo(cast(str, value)))
         ):
             log.warning("Недопустимое значение настройки %s", name)
             if name == "hotkey":
                 self.hotkeyChanged.emit()
             return
+        if name == "commandHotkey" and self._command_host is not None:
+            code = self._command_host.check_command_hotkey(cast(str, value))
+            if code != "ok" and not (code == "busy" and self._capture.keep_busy):
+                getattr(self, name + "Changed").emit()
+                self._capture._set_state(
+                    {"duplicate": "duplicate", "busy": "conflict"}.get(code, "not-grabbed")
+                )
+                return
         if name == "hotkeyMode" and not is_valid_combo(self.hotkey):
             log.warning("hotkey=%r недопустим, смена режима отменена", self.hotkey)
             self.hotkeyModeChanged.emit()
@@ -637,7 +664,132 @@ class SettingsBridge(QObject):
                 self._set_microphone_error(False)
                 self.refreshMicrophone()
                 self.microphoneChanged.emit()
+        if name in ("commandHotkey", "commandEnabled", "commandPreview", "hotkeyMode"):
+            if self._command_host is not None:
+                self._command_host.reload_command_hotkey()
+                self.update_command_state()
         getattr(self, name + "Changed").emit()
+
+    def bind_command_host(self, host: Any) -> None:
+        """Связывается после создания runtime; проверки не открывают микрофон."""
+        self._command_host = host
+        host.on_command_changed = self.update_command_state
+        host.on_command_preview = self.update_command_preview
+        self.update_command_state()
+
+    def update_command_state(self) -> None:
+        self.commandStateChanged.emit()
+
+    def update_command_preview(self, text: str) -> None:
+        # Runtime публикует только при explicit preview и подтверждённом unlock;
+        # при lock/sleep очищает тем же callback. Речь не попадает в feedback.
+        self._command_preview_text = text if self.commandPreview else ""
+        self.commandPreviewTextChanged.emit()
+
+    @pyqtProperty(str, notify=commandHotkeyChanged)
+    def commandHotkey(self) -> str:  # noqa: N802
+        return cast(str, self._values["commandHotkey"])
+
+    @commandHotkey.setter  # type: ignore[no-redef]
+    def commandHotkey(self, value: str) -> None:  # noqa: N802
+        self._set_value("commandHotkey", value)
+
+    @pyqtProperty(bool, notify=commandEnabledChanged)
+    def commandEnabled(self) -> bool:  # noqa: N802
+        return cast(bool, self._values["commandEnabled"])
+
+    @commandEnabled.setter  # type: ignore[no-redef]
+    def commandEnabled(self, value: bool) -> None:  # noqa: N802
+        self._set_value("commandEnabled", value)
+
+    @pyqtProperty(bool, notify=commandPreviewChanged)
+    def commandPreview(self) -> bool:  # noqa: N802
+        return cast(bool, self._values["commandPreview"])
+
+    @commandPreview.setter  # type: ignore[no-redef]
+    def commandPreview(self, value: bool) -> None:  # noqa: N802
+        self._set_value("commandPreview", value)
+        if not self.commandPreview:
+            self.update_command_preview("")
+
+    @pyqtProperty(bool, notify=commandStateChanged)
+    def commandInstalled(self) -> bool:  # noqa: N802
+        return bool(self._command_host is not None and self._command_host.command_installed)
+
+    @pyqtProperty(bool, notify=commandStateChanged)
+    def commandAvailable(self) -> bool:  # noqa: N802
+        return bool(self._command_host is not None and self._command_host.command_available)
+
+    @pyqtProperty(str, notify=commandStateChanged)
+    def commandStatus(self) -> str:  # noqa: N802
+        if not is_valid_command_combo(self.commandHotkey):
+            return "Клавиша команды не распознана — выберите другую"
+        return (
+            str(self._command_host.command_status)
+            if self._command_host
+            else "Astra Cowork не установлен"
+        )
+
+    @pyqtProperty(str, notify=commandStateChanged)
+    def commandDetail(self) -> str:  # noqa: N802
+        feedback = self._command_host.command_feedback if self._command_host else None
+        allowed = self._command_host is not None and self._command_host._command_snapshot().allowed
+        return feedback.detail if feedback and allowed else ""
+
+    @pyqtProperty(str, notify=commandStateChanged)
+    def commandFeedbackText(self) -> str:  # noqa: N802
+        feedback = self._command_host.command_feedback if self._command_host else None
+        return feedback.text if feedback else ""
+
+    @pyqtProperty(str, notify=commandPreviewTextChanged)
+    def commandPreviewText(self) -> str:  # noqa: N802
+        return self._command_preview_text
+
+    @pyqtProperty(str, notify=captureRoleChanged)
+    def captureRole(self) -> str:  # noqa: N802
+        return self._capture.role
+
+    @pyqtSlot()
+    def refreshCommandStatus(self) -> None:  # noqa: N802
+        if self._command_host is not None:
+            self._command_host.refresh_command_status()
+
+    @pyqtSlot()
+    def commandPreviewShown(self) -> None:  # noqa: N802
+        if self._command_host is not None and self._command_preview_text:
+            self._command_host.command_preview_shown()
+
+    @pyqtSlot()
+    def confirmCommand(self) -> None:  # noqa: N802
+        self.update_command_preview("")
+        if self._command_host is not None:
+            self._command_host.confirm_command()
+
+    @pyqtSlot()
+    def rejectCommand(self) -> None:  # noqa: N802
+        self.update_command_preview("")
+        if self._command_host is not None:
+            self._command_host.reject_command()
+
+    @pyqtSlot()
+    def showCommandDetails(self) -> None:  # noqa: N802
+        self.commandDetailsRequested.emit()
+
+    def save_command_capture_combo(self, combo: str, keep: bool) -> str:
+        self._set_value("commandHotkey", combo)
+        if self.saveError or self.commandHotkey != combo:
+            return {"duplicate": "duplicate", "conflict": "busy"}.get(
+                self._capture.state, "not-grabbed"
+            )
+        return "ok"
+
+    @pyqtSlot()
+    def beginCommandCapture(self) -> None:  # noqa: N802
+        self._capture.begin(self.save_command_capture_combo, role="command")
+
+    @pyqtSlot()
+    def useCommandWin(self) -> None:  # noqa: N802
+        self._set_value("commandHotkey", "Super_L")
 
     @pyqtProperty("QStringList", constant=True)
     def lockedSettings(self) -> list[str]:  # noqa: N802 — имя свойства для QML
@@ -690,7 +842,12 @@ class SettingsBridge(QObject):
 
     @pyqtSlot(str)
     def endCapture(self, combo: str) -> None:  # noqa: N802
-        self._capture.end(combo, self.save_capture_combo)
+        save = (
+            self.save_command_capture_combo
+            if self.captureRole == "command"
+            else self.save_capture_combo
+        )
+        self._capture.end(combo, save)
 
     @pyqtSlot()
     def cancelCapture(self) -> None:  # noqa: N802
@@ -1020,6 +1177,9 @@ class OnboardingController(QObject):
     checkAppUpdatesChanged = pyqtSignal()
     checkModelUpdatesChanged = pyqtSignal()
     policyLockedChanged = pyqtSignal()
+    commandHotkeyChanged = pyqtSignal()
+    commandStateChanged = pyqtSignal()
+    captureRoleChanged = pyqtSignal()
     hotkeyChanged = pyqtSignal()
     hotkeyModeChanged = pyqtSignal()
     captureStateChanged = pyqtSignal()
@@ -1148,13 +1308,21 @@ class OnboardingController(QObject):
         self._capture.windowEvent.connect(self.eventFilter, Qt.DirectConnection)
         if host is not None:
             self._capture.host = host
-        for name in ("captureState", "captureMessage", "pendingCombo", "freeCandidates"):
+        for name in (
+            "captureRole",
+            "captureState",
+            "captureMessage",
+            "pendingCombo",
+            "freeCandidates",
+        ):
             getattr(self._capture, name + "Changed").connect(getattr(self, name + "Changed"))
         for name in (
             "language",
             "checkAppUpdates",
             "checkModelUpdates",
             "hotkey",
+            "commandHotkey",
+            "commandState",
             "hotkeyMode",
             "device",
         ):
@@ -1743,6 +1911,38 @@ class OnboardingController(QObject):
     def hotkeyMode(self, value: str) -> None:  # noqa: N802
         cast(_WritableSettings, self._bridge).hotkeyMode = value
 
+    @pyqtProperty(str, notify=commandHotkeyChanged)
+    def commandHotkey(self) -> str:  # noqa: N802
+        return cast(str, self._bridge.commandHotkey)
+
+    @commandHotkey.setter  # type: ignore[no-redef]
+    def commandHotkey(self, value: str) -> None:  # noqa: N802
+        self._bridge.setProperty("commandHotkey", value)
+
+    @pyqtProperty(str, notify=commandStateChanged)
+    def commandStatus(self) -> str:  # noqa: N802
+        return cast(str, self._bridge.commandStatus)
+
+    @pyqtProperty(bool, notify=commandStateChanged)
+    def commandInstalled(self) -> bool:  # noqa: N802
+        return bool(self._bridge.commandInstalled)
+
+    @pyqtProperty(str, notify=captureRoleChanged)
+    def captureRole(self) -> str:  # noqa: N802
+        return self._capture.role
+
+    @pyqtSlot()
+    def beginCommandCapture(self) -> None:  # noqa: N802
+        self._bridge.beginCommandCapture()
+
+    @pyqtSlot()
+    def refreshCommandStatus(self) -> None:  # noqa: N802
+        self._bridge.refreshCommandStatus()
+
+    @pyqtSlot()
+    def useCommandWin(self) -> None:  # noqa: N802
+        self._bridge.useCommandWin()
+
     @pyqtProperty(str, notify=captureStateChanged)
     def captureState(self) -> str:  # noqa: N802
         return self._capture.state
@@ -1765,7 +1965,7 @@ class OnboardingController(QObject):
 
     @pyqtSlot(str)
     def endCapture(self, combo: str) -> None:  # noqa: N802
-        self._capture.end(combo, self._bridge.save_capture_combo)
+        self._bridge.endCapture(combo)
 
     @pyqtSlot()
     def cancelCapture(self) -> None:  # noqa: N802

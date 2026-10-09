@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from astra_voice.core.paths import state_dir
+from astra_voice.platform.cowork import DELIVERY_REASONS
 
 log = logging.getLogger(__name__)
 
@@ -23,7 +24,19 @@ Event = dict[str, str | int | float | bool]
 
 _FIELDS: dict[str, frozenset[str]] = {
     "dictation": frozenset(
-        {"model_id", "audio_ms", "open_ms", "t_ms", "t_total_ms", "paste_ms", "cold", "result"}
+        {
+            "model_id",
+            "audio_ms",
+            "open_ms",
+            "t_ms",
+            "t_total_ms",
+            "paste_ms",
+            "cold",
+            "result",
+            "mode",
+            "deliver_ms",
+            "deliver_reason",
+        }
     ),
     "model_measure": frozenset({"model_id", "revision", "peak_rss_mb", "threads", "cpu"}),
     "model_selfcheck": frozenset({"model_id", "revision", "result", "engine_version", "cpu_model"}),
@@ -34,7 +47,9 @@ _FIELDS: dict[str, frozenset[str]] = {
     "onboarding": frozenset({"step_reached", "duration_s"}),
 }
 _CHOICES = {
-    ("dictation", "result"): ("ok", "empty", "cancelled"),
+    ("dictation", "result"): ("ok", "empty", "cancelled", "delivered", "undelivered", "unknown"),
+    ("dictation", "mode"): ("text", "command"),
+    ("dictation", "deliver_reason"): DELIVERY_REASONS,
     ("model_selfcheck", "result"): ("ok", "fail"),
     ("hotkey_grab", "key_role"): ("text", "command"),
     ("hotkey_grab", "result"): ("ok", "busy", "regrabbed"),
@@ -61,6 +76,7 @@ _NUMBERS = frozenset(
         "t_ms",
         "t_total_ms",
         "paste_ms",
+        "deliver_ms",
         "peak_rss_mb",
         "duration_s",
         "attempts",
@@ -280,7 +296,9 @@ class Stats:
         ]
         results = {
             result: sum(event.get("result") == result for event in dictations)
-            for result in ("ok", "empty", "cancelled")
+            for result in _CHOICES[("dictation", "result")]
+            if result in ("ok", "empty", "cancelled")
+            or any(event.get("result") == result for event in dictations)
         }
         return {
             "dictations": len(dictations),

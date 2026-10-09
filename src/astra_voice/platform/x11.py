@@ -215,7 +215,17 @@ class X11Display:
                 "super": X.Mod4Mask,
                 "win": X.Mod4Mask,
             }
-            key_aliases = {"space": "space", "esc": "Escape", "escape": "Escape"}
+            key_aliases = {
+                "space": "space",
+                "esc": "Escape",
+                "escape": "Escape",
+                "super_l": "Super_L",
+                "super_r": "Super_R",
+            }
+            # Одиночная Win — основная клавиша с mods=0. Пассивный GrabKey
+            # заканчивается после её отпускания; XGrabKeyboard при записи нет.
+            if combo.strip().lower() in ("win", "super"):
+                combo = "Super_L"
             mods = 0
             key: str | None = None
             for part in combo.split("+"):
@@ -501,8 +511,17 @@ class X11Display:
 
     def ungrab_keyboard(self) -> None:
         """Снимает захват идемпотентно; при ошибке сохраняет срок для повтора."""
-        if self.keyboard_grab_deadline is None:
-            return
+        if self.keyboard_grab_deadline is not None:
+            self.cancel_keyboard_grab()
+
+    def cancel_keyboard_grab(self) -> None:
+        """Безусловно снимает захват, включая активированный XGrabKey.
+
+        Пассивный захват после нажатия активирует захват всей клавиатуры без
+        нашего дедлайна. XUngrabKey его не снимает, поэтому отмене хоткея нужен
+        явный XUngrabKeyboard на том же соединении. При ошибке сохраняет
+        дедлайн поля захвата для повтора.
+        """
         try:
             from Xlib import X
 

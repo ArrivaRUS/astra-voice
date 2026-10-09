@@ -388,6 +388,19 @@ def test_xvfb_fakes_match_real_bridges(real_contracts: dict[str, MetaContract]) 
                 f"{real.class_name}.{name} — нет свойства в {declared.class_name}"
                 for name in sorted(real.properties - declared.properties - DOC_UNLISTED)
             )
+            fake_signals = {method.name for method in declared.methods if method.is_signal}
+            for reference in (ref for path in QML_FILES for ref in qml_signal_handlers(path)):
+                if reference.context != context or reference.member in fake_signals:
+                    continue
+                # QML also accepts property change handlers through a property's
+                # notify signal, even when that signal has a different name.
+                property_name = reference.member.removesuffix("Changed")
+                if reference.member.endswith("Changed") and property_name in declared.properties:
+                    continue
+                failures.append(
+                    f"{reference.path}:{reference.line}: {declared.class_name}"
+                    f" — нет сигнала {reference.member} для Connections"
+                )
         real_methods = {method.signature for method in real.methods if not method.is_signal}
         if context == "settingsBridge":
             fake_methods = {method.signature for method in declared.methods if not method.is_signal}

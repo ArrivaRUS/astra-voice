@@ -55,6 +55,9 @@ pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]
 
 EXPECTED_DURATIONS = {
+    PillState.COMMAND_DONE: 800,
+    PillState.COMMAND_FAILED: 3000,
+    PillState.COMMAND_UNKNOWN: 3000,
     PillState.DONE: 500,
     PillState.CLIPBOARD_ONLY: 1200,
     PillState.EMPTY: 1000,
@@ -284,6 +287,11 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
 # Фейковые результаты Text/Row: короткие, длинные и дробные размеры, без зависимости
 # от установленного шрифта. HIDDEN/DISABLED сохраняют последнее содержимое QML.
 LAYOUT_SIZES = {
+    PillState.COMMAND_LISTENING: (237.4, 36.0),
+    PillState.COMMAND_DELIVERING: (291.5, 36.0),
+    PillState.COMMAND_DONE: (241.3, 36.0),
+    PillState.COMMAND_FAILED: (496.8, 52.0),
+    PillState.COMMAND_UNKNOWN: (508.4, 52.0),
     PillState.LOADING_MODEL: (216.0, 36.0),
     PillState.LISTENING: (187.6, 36.0),
     PillState.LISTENING_SILENT: (276.4, 36.0),
@@ -470,6 +478,11 @@ def test_exact_enum_and_durations() -> None:
         "CANCELLED": "cancelled",
         "ERROR": "error",
         "DISABLED": "disabled",
+        "COMMAND_LISTENING": "command-listening",
+        "COMMAND_DELIVERING": "command-delivering",
+        "COMMAND_DONE": "command-done",
+        "COMMAND_FAILED": "command-failed",
+        "COMMAND_UNKNOWN": "command-unknown",
     }
     assert STATE_DURATION_MS == EXPECTED_DURATIONS
 
@@ -729,7 +742,12 @@ def test_level_history_shift_and_listening_transitions(harness: Harness) -> None
 
 
 @pytest.mark.parametrize(
-    "state", [s for s in PillState if s not in (PillState.LISTENING, PillState.LISTENING_SILENT)]
+    "state",
+    [
+        s
+        for s in PillState
+        if s not in (PillState.LISTENING, PillState.LISTENING_SILENT, PillState.COMMAND_LISTENING)
+    ],
 )
 def test_non_listening_states_clear_history(harness: Harness, state: PillState) -> None:
     harness.pill.show_state(PillState.LISTENING, level=0.9)
@@ -830,6 +848,8 @@ def test_unregistered_text_never_reaches_qml_or_logs(
     assert [record.message for record in warnings] == (
         ["Пилюля: причина вне реестра"]
         if state in (PillState.ERROR, PillState.CLIPBOARD_ONLY)
+        else ["Пилюля: причина команды вне реестра"]
+        if state in (PillState.COMMAND_FAILED, PillState.COMMAND_UNKNOWN)
         else []
     )
     state_records = [r for r in caplog.records if r.msg == "Пилюля: %s"]

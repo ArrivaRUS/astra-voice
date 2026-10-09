@@ -611,6 +611,10 @@ class _RuntimeOnboardingHost:
     def __init__(self, runtime: DictationRuntime, shell: Any) -> None:
         self._runtime = runtime
         self._shell = shell
+        self._capture_role = "text"
+
+    def set_capture_role(self, role: str) -> None:
+        self._capture_role = role
 
     def begin_capture(self) -> bool:
         try:
@@ -618,7 +622,9 @@ class _RuntimeOnboardingHost:
             own_window = int(root.winId()) if root is not None else None
         except Exception:
             own_window = None
-        return self._runtime.begin_hotkey_capture(own_window=own_window or None)
+        return self._runtime.begin_hotkey_capture(
+            own_window=own_window or None, role=self._capture_role
+        )
 
     def set_capture_callback(self, callback: Callable[[str, str], None]) -> None:
         self._runtime.set_hotkey_capture_callback(callback)
@@ -627,10 +633,19 @@ class _RuntimeOnboardingHost:
         self._runtime.end_hotkey_capture()
 
     def probe(self, combo: str) -> str:
-        return self._runtime.hotkey.probe(combo).code
+        if self._capture_role == "command":
+            return self._runtime.check_command_hotkey(combo)
+        manager = self._runtime.hotkey
+        candidate = manager.signature(combo)
+        other = manager.signature(self._runtime.settings.command_hotkey)
+        if candidate is None or other is None:
+            return "not-grabbed"
+        if candidate == other:
+            return "duplicate"
+        return manager.probe(combo).code
 
     def free_candidates(self, prefer: list[str]) -> list[str]:
-        return self._runtime.hotkey.free_candidates(prefer)
+        return [combo for combo in prefer if self.probe(combo) == "ok"]
 
     def start_level_monitor(self, device: str, callback: LevelCallback) -> bool:
         return self._runtime.start_level_monitor(device, callback)
@@ -1175,6 +1190,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime.tray.on_about = focuser.focus_shell
             runtime.pill.on_details_clicked = show_details
             runtime.start()
+            runtime.start_command_mode()
             # start() регистрирует общий показ окна для всех действий уведомлений.
             notify.set_action_handler(notify.ACTION_SHOW_DETAILS, show_details)
             notify.set_action_handler(notify.ACTION_CHOOSE_MICROPHONE, show_general)
@@ -1226,6 +1242,31 @@ def main(argv: list[str] | None = None) -> int:
             locked=policy.locked_keys,
             autostart=autostart,
         )
+        if runtime_ready and runtime is not None:
+            settings_bridge.bind_command_host(runtime)
+            runtime.pill.on_copy_clicked = runtime._copy_last
+
+            def show_command_details() -> None:
+                runtime.show_command_details()
+                # Runtime checks unlock before requesting the actual window.
+                if runtime.command_feedback is not None and runtime._command_snapshot().allowed:
+                    settings_bridge.showCommandDetails()
+
+            runtime.tray.on_command_details = show_command_details
+            notify.set_action_handler("command-details", show_command_details)
+
+            def show_pill_details() -> None:
+                from astra_voice.ui.pill import PillState
+
+                if runtime.pill.state in (PillState.COMMAND_FAILED, PillState.COMMAND_UNKNOWN):
+                    show_command_details()
+                else:
+                    show_details()
+
+            runtime.pill.on_details_clicked = show_pill_details
+            settings_bridge.commandPreviewTextChanged.connect(
+                lambda: focuser.focus_shell() if settings_bridge.commandPreviewText else None
+            )
         QQmlEngine.setObjectOwnership(settings_bridge, QQmlEngine.CppOwnership)
         _set_context_property(shell, "settingsBridge", settings_bridge)
         # Офлайн-режим скрывает «Скачать» и отменяет загрузку из сети (PRD F14.2).
