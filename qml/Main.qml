@@ -87,7 +87,7 @@ ApplicationWindow {
         // active control reachable rather than repeatedly jumping between edges.
         if (target.height + margin * 2 > body.height)
             target = item
-        var position = target.mapToItem(page, 0, 0)
+        var position = target.mapToItem(body.contentItem, 0, 0)
         if (position.y - margin < body.contentY)
             body.contentY = Math.max(0, position.y - margin)
         else if (position.y + target.height + margin > body.contentY + body.height)
@@ -147,6 +147,9 @@ ApplicationWindow {
 
     Item {
         id: content
+        // Кольцо фокуса рисуется снаружи элемента на focusOffset + focusWidth: клип расширен на это поле,
+        // содержимое сдвинуто обратно — на экране всё на месте.
+        readonly property real ringOutset: Theme.focusOffset + Theme.focusWidth
         visible: !window.onboardingVisible
         anchors.left: sidebar.right
         anchors.right: parent.right
@@ -210,15 +213,15 @@ ApplicationWindow {
         Flickable {
             id: body
             anchors.top: header.bottom
-            anchors.topMargin: Theme.spaceHeadGap
+            anchors.topMargin: Theme.spaceHeadGap - content.ringOutset
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.bottom: parent.bottom
             width: Math.min(Theme.sizeContentColMax,
-                content.width - 2 * Theme.spaceWindowContentX)
-            anchors.bottomMargin: Theme.spaceWindowContentBottom
+                content.width - 2 * Theme.spaceWindowContentX) + 2 * content.ringOutset
+            anchors.bottomMargin: Theme.spaceWindowContentBottom - content.ringOutset
             clip: true
             contentWidth: width
-            contentHeight: page.implicitHeight
+            contentHeight: page.implicitHeight + 2 * content.ringOutset
             boundsBehavior: Flickable.StopAtBounds
 
             // Полоса поверх содержимого: ширины у колонки не отнимает, появляется только
@@ -227,8 +230,10 @@ ApplicationWindow {
                 id: bodyScroll
                 policy: ScrollBar.AsNeeded
                 visible: !window.onboardingVisible && size < 1.0
-                width: Theme.scrollbarW
-                rightPadding: Theme.scrollbarRight
+                width: Theme.scrollbarW + content.ringOutset
+                rightPadding: Theme.scrollbarRight + content.ringOutset
+                topPadding: padding + content.ringOutset
+                bottomPadding: padding + content.ringOutset
 
                 contentItem: Rectangle {
                     implicitWidth: Theme.scrollbarW
@@ -250,7 +255,9 @@ ApplicationWindow {
 
             Loader {
                 id: page
-                width: body.width
+                x: content.ringOutset
+                y: content.ringOutset
+                width: body.width - 2 * content.ringOutset
                 source: window.sectionPages[window.currentSection.key]
 
                 onLoaded: {
