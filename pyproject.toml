@@ -11,7 +11,7 @@ license = { text = "GPL-3.0-or-later" }
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
-extend-exclude = ["spikes", "design"]
+extend-exclude = ["spikes", "design", "knowledge"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
