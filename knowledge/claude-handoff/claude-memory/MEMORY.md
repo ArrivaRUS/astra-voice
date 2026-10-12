@@ -1,0 +1,27 @@
+# Память Claude по проекту Astra Voice
+
+Отобрано из общей памяти Claude Code. Записи относятся к периоду до 30 сентября 2026 года; актуальность сверять с [передачей проекта](../01_PROJECT_STATE.md). Записи о роли пользователя и обратной связи — исторический контекст предпочтений, не новые поручения.
+
+- [agent_worktree_needs_repo_cwd.md](agent_worktree_needs_repo_cwd.md)
+- [astra_kde_fly_notifications_kills_plasmashell.md](astra_kde_fly_notifications_kills_plasmashell.md)
+- [astra_voice_autostart.md](astra_voice_autostart.md)
+- [codex_cli_astra_machine.md](codex_cli_astra_machine.md)
+- [environment/astra-linux-environment.md](environment/astra-linux-environment.md)
+- [environment/astra-linux-plasma-environment.md](environment/astra-linux-plasma-environment.md)
+- [environment/kde-icon-name-dash-fallback.md](environment/kde-icon-name-dash-fallback.md)
+- [feedback_codex_limits_architecture_only.md](feedback_codex_limits_architecture_only.md)
+- [feedback_fewer_security_reviews.md](feedback_fewer_security_reviews.md)
+- [feedback_no_repeat_security_nags.md](feedback_no_repeat_security_nags.md)
+- [feedback_no_security_nagging_beta.md](feedback_no_security_nagging_beta.md)
+- [feedback_no_ui_text_for_timing.md](feedback_no_ui_text_for_timing.md)
+- [feedback_respond_in_russian.md](feedback_respond_in_russian.md)
+- [feedback_security_reviews_sparingly.md](feedback_security_reviews_sparingly.md)
+- [feedback_ui_copy_plain_language.md](feedback_ui_copy_plain_language.md)
+- [handy_custom_build.md](handy_custom_build.md)
+- [needrestart_user_session_dialog.md](needrestart_user_session_dialog.md)
+- [project_astra_voice.md](project_astra_voice.md)
+- [project_astra_voice_dev_docs.md](project_astra_voice_dev_docs.md)
+- [repo_handy_gigaam.md](repo_handy_gigaam.md)
+- [stt_engine_gigaam.md](stt_engine_gigaam.md)
+- [target_environment_astra_1_8.md](target_environment_astra_1_8.md)
+- [user_role_astra_cpo.md](user_role_astra_cpo.md)
