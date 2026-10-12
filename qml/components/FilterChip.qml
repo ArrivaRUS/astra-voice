@@ -46,8 +46,8 @@ Rectangle {
         anchors.fill: parent
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
+        // Фокус мышью не берём: кольцо фокуса — только для клавиатуры (§1.3).
         onClicked: {
-            root.forceActiveFocus(Qt.MouseFocusReason);
             root.clicked();
         }
     }
