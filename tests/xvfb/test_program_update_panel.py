@@ -28,7 +28,9 @@ NOTES = [
 
 @pytest.fixture(scope="module")
 def app() -> Any:
-    return states.get_qapplication()
+    app = states.get_qapplication()
+    states.onboarding.register_ui_fonts()
+    return app
 
 
 def values(phase: str, track: str = "appimage") -> dict[str, Any]:
@@ -501,7 +503,11 @@ def test_bridge_missing_then_connected_does_not_start_download(app: Any) -> None
         window.show()
         QTest.qWait(150)
         states.onboarding.select_section(app, window, "network")
+        assert states.find_object(window, "updatePanel").isVisible()
+        assert states.find_object(window, "checkNowButton").isVisible()
         assert states.find_object(window, "checkNowButton").property("enabled") is False
+        assert "Обновление программы" in states.onboarding.visible_texts(window.contentItem())
+        assert "Проверка пока недоступна" in states.onboarding.visible_texts(window.contentItem())
         context.setContextProperty("updatesBridge", updates)
         QTest.qWait(50)
         app.processEvents()
@@ -734,7 +740,7 @@ def test_panel_forward_reverse_focus_actions(app: Any, scenario: str) -> None:
         ("readyappimage", "updatePrimary", "installAndRestart", "available"),
         ("metadata", "updateCancel", "cancelDownload", "available"),
         ("idle", "updateSkip", "skipVersion", "available"),
-        ("idle", "updateCheckAgain", "checkNow", "uptodate"),
+        ("idle", "checkNowButton", "checkNow", "uptodate"),
         ("idle", "updateShowSkipped", "clearSkip", "skipped"),
     ],
 )

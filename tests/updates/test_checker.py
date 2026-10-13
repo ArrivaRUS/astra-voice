@@ -198,9 +198,16 @@ class Rig:
         self.checkers.append(checker)
         return checker
 
-    def start(self, *, version: str = "0.2.0", jitter_max_s: float = 0.0) -> UpdateChecker:
+    def start(
+        self,
+        *,
+        version: str = "0.2.0",
+        jitter_max_s: float = 0.0,
+        scheduled: bool = True,
+        delay_s: float = 0.0,
+    ) -> UpdateChecker:
         checker = self.make(version=version, jitter_max_s=jitter_max_s)
-        checker.start(delay_s=0.0)
+        checker.start(delay_s=delay_s, scheduled=scheduled)
         return checker
 
     def _on_status(self, status: UpdateStatus) -> None:
@@ -544,6 +551,7 @@ def test_one_shared_cache_per_process() -> None:
     checker = checker_module.create_app_checker(Settings(), Policy())
     assert checker._cache is shared_cache()
     assert checker.status.state == "disabled"
+    assert NetworkGate(Settings(), Policy()).refusal("check_app") == "settings"
 
 
 def test_manual_result_does_not_override_offline(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1245,3 +1253,53 @@ def test_tls_refusal_keeps_only_old_verified_snapshot_and_old_success_date(
     preserved = rig.wait(lambda s: s.last_attempt_at == rig.clock.now and s.state != "checking")
     assert preserved.state == "available" and preserved.verified_release == first.verified_release
     assert preserved.last_success_at == T0
+
+
+def test_onboarding_gate_blocks_schedule_but_allows_manual_check(rig: Rig) -> None:
+    checker = rig.start(scheduled=False)
+    rig.settle(checker)
+    assert rig.requests() == 0
+    rig.clock.now += CHECK_INTERVAL_S * 2
+    checker.refresh()
+    rig.settle(checker)
+    assert rig.requests() == 0
+    checker.check_now()
+    rig.wait(lambda status: status.manual and status.last_success_at == rig.clock.now)
+    rig.settle(checker)
+    assert rig.requests() == 1
+    rig.clock.now += CHECK_INTERVAL_S + 1
+    checker.refresh()
+    rig.settle(checker)
+    assert rig.requests() == 1, "manual action must not implicitly authorize scheduled checks"
+    checker.enable_scheduled_checks()
+    rig.wait(lambda status: not status.manual and status.last_success_at == rig.clock.now)
+    assert rig.requests() == 2
+
+
+def test_onboarding_gate_opens_once_and_preserves_startup_delay(rig: Rig) -> None:
+    checker = rig.start(scheduled=False, delay_s=10.0)
+    rig.clock.now += 100
+    rig.settle(checker)
+    assert rig.requests() == 0
+    checker.enable_scheduled_checks()
+    rig.settle(checker)
+    assert rig.requests() == 0
+    rig.clock.now += 9
+    checker.enable_scheduled_checks()  # A duplicate step notification must not postpone the check.
+    rig.settle(checker)
+    assert rig.requests() == 0
+    rig.clock.now += 1
+    checker.refresh()
+    rig.wait(lambda status: status.last_success_at == rig.clock.now)
+    assert rig.requests() == 1
+
+
+def test_onboarding_gate_keeps_disabled_user_choice(rig: Rig) -> None:
+    rig.settings.check_app_updates = False
+    checker = rig.start(scheduled=False)
+    checker.enable_scheduled_checks()
+    rig.settle(checker)
+    assert rig.requests() == 0 and checker.status.state == "disabled"
+    checker.check_now()
+    rig.wait(lambda status: status.manual and status.state == "available")
+    assert rig.requests() == 1

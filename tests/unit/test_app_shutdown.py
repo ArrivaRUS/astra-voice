@@ -20,6 +20,7 @@ from astra_voice.core import settings as settings_mod
 from astra_voice.core.policy import Policy
 from astra_voice.core.policy import load as load_policy
 from astra_voice.core.settings import Settings
+from astra_voice.core.settings import load as _real_settings_load
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform import autostart
 from astra_voice.platform.session import SessionKind
@@ -84,7 +85,7 @@ class Rig:
         monkeypatch.setattr(app_mod, "setup_logging", Mock())
         monkeypatch.setattr(app_mod, "_install_qt_message_handler", Mock())
         monkeypatch.setattr(policy_mod, "load", lambda: Policy())
-        monkeypatch.setattr(settings_mod, "load", lambda: self.settings)
+        monkeypatch.setattr(settings_mod, "load", lambda **_kwargs: self.settings)
         monkeypatch.setattr(paths_mod, "data_dir", lambda: tmp_path / "data")
         monkeypatch.setattr(paths_mod, "settings_path", lambda: tmp_path / "settings.json")
         monkeypatch.setattr(app_mod, "_ensure_settings_file", Mock())
@@ -360,7 +361,7 @@ def test_updates_bridge_bound_before_start_and_refreshed_by_settings(
     monkeypatch.setattr(external, "open_external", opener)
     checker = Mock()
     seen: dict[str, object] = {}
-    checker.start.side_effect = lambda: seen.setdefault("on_status", checker.on_status)
+    checker.start.side_effect = lambda **_kwargs: seen.setdefault("on_status", checker.on_status)
     monkeypatch.setattr(checker_mod, "create_app_checker", Mock(return_value=checker))
     posted: list[object] = []
 
@@ -373,6 +374,7 @@ def test_updates_bridge_bound_before_start_and_refreshed_by_settings(
     assert app_mod.main([]) == 7
 
     on_status = seen["on_status"]
+    checker.start.assert_called_once_with(scheduled=False)
     assert callable(on_status)
     properties = dict(
         item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
@@ -558,6 +560,9 @@ def test_model_service_receives_effective_settings_and_onboarding_receives_store
     rig.settings.extra.update(offline="no", onboarding_language_set=True)
     original = rig.settings.to_dict()
     expected = policy_mod.effective(rig.settings, policy)
+    if "offline = yes" in policy_text:
+        # Общий admin-запрет показывает off/замки, не изменяя stored для мастера.
+        expected.check_app_updates = expected.check_model_updates = False
     model_factory = Mock(return_value=None)
     onboarding_factory = Mock(wraps=bridges.OnboardingController)
     monkeypatch.setattr(model_downloads, "ModelService", model_factory)
@@ -574,9 +579,76 @@ def test_model_service_receives_effective_settings_and_onboarding_receives_store
     )
     assert properties["settingsBridge"].checkAppUpdates == effective.check_app_updates
     assert properties["settingsBridge"].checkModelUpdates == effective.check_model_updates
+    assert properties["settingsBridge"].lockedSettings == sorted(
+        policy.locked_keys | {"check_app_updates", "check_model_updates"}
+    )
     onboarding_factory.assert_called_once()
     assert onboarding_factory.call_args.kwargs["settings"] is rig.settings
     assert rig.settings.to_dict() == original
+
+
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["fresh", "legacy"])
+@pytest.mark.parametrize(
+    "policy_text,app_on,models_on",
+    [
+        ("", None, None),
+        ("locked = check_app_updates", False, None),
+        ("check_app_updates = no", False, None),
+        ("check_app_updates = yes", True, None),
+        ("offline = yes", False, False),
+        ("profile = secure", False, False),
+    ],
+)
+def test_install_track_and_policy_defaults_reach_runtime_and_onboarding(
+    rig: Rig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    appimage: bool,
+    legacy: bool,
+    policy_text: str,
+    app_on: bool | None,
+    models_on: bool | None,
+) -> None:
+    from astra_voice.ui import bridges
+
+    policy_path = tmp_path / "policy.conf"
+    if policy_text:
+        policy_path.write_text("[astra-voice]\n" + policy_text + "\n", encoding="utf-8")
+    policy = load_policy(policy_path)
+    monkeypatch.setattr(policy_mod, "load", lambda: policy)
+    settings_path = paths_mod.settings_path()
+    if legacy:
+        settings_path.write_text(
+            json.dumps(
+                {"schema_version": 1, "check_app_updates": False, "check_model_updates": False}
+            ),
+            encoding="utf-8",
+        )
+    controller_factory = Mock(wraps=bridges.OnboardingController)
+    monkeypatch.setattr(bridges, "OnboardingController", controller_factory)
+    # Rig обычно подменяет чтение; здесь main использует настоящий load.
+    monkeypatch.setattr(
+        settings_mod,
+        "load",
+        lambda **kwargs: _real_settings_load(settings_path, appimage=appimage, **kwargs),
+    )
+    assert app_mod.main([]) == 7
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    bridge = properties["settingsBridge"]
+    assert bridge.checkAppUpdates is (appimage if app_on is None else app_on)
+    assert bridge.checkModelUpdates is (appimage if models_on is None else models_on)
+    stored = controller_factory.call_args.kwargs["settings"]
+    effective = rig.factory.call_args.kwargs["settings"]
+    assert stored is not effective
+    assert stored.check_app_updates is (appimage and app_on is None)
+    assert stored.check_model_updates is (appimage and models_on is None)
+    if legacy:
+        assert (
+            json.loads(settings_path.read_text())["schema_version"] == settings_mod.SCHEMA_VERSION
+        )
 
 
 @pytest.mark.parametrize("failure", ["constructor", "start"])

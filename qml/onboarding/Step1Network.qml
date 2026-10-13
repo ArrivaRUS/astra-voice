@@ -8,6 +8,13 @@ Item {
     id: root
 
     readonly property var bridge: (typeof onboarding !== "undefined" && onboarding !== null) ? onboarding : null
+    readonly property var settings: (typeof settingsBridge !== "undefined" && settingsBridge !== null) ? settingsBridge : null
+    readonly property bool appUpdatesLocked: root.settings && root.settings.lockedSettings
+        ? root.settings.lockedSettings.indexOf("check_app_updates") >= 0
+        : root.bridge ? root.bridge.policyLocked : false
+    readonly property bool modelUpdatesLocked: root.settings && root.settings.lockedSettings
+        ? root.settings.lockedSettings.indexOf("check_model_updates") >= 0
+        : root.bridge ? root.bridge.policyLocked : false
     property string barHint: qsTr("Изменить можно позже в «Сеть и обновления»")
     property bool skipEnabled: true
 
@@ -100,9 +107,10 @@ Item {
                 width: parent.width
                 showHint: false
                 label: qsTr("Проверять обновления утилиты")
-                sub: qsTr("Раз в сутки")
+                sub: locked && !appUpdates.checked ? qsTr("Администратор отключил проверку обновлений на этом компьютере.")
+                    : qsTr("Раз в сутки, github.com. Скачивание — только по вашему нажатию.")
                 toggle: appUpdates
-                locked: root.bridge ? root.bridge.policyLocked : false
+                locked: root.appUpdatesLocked
                 lockedText: root.bridge ? root.bridge.policyLockedText : ""
                 rowEnabled: !locked
 
@@ -110,7 +118,7 @@ Item {
                     id: appUpdates
                     Layout.alignment: Qt.AlignVCenter
                     checked: root.bridge ? root.bridge.checkAppUpdates : false
-                    locked: root.bridge ? root.bridge.policyLocked : false
+                    locked: root.appUpdatesLocked
                     // SettingRow вызывает toggle(): учитываем также клик по всей строке.
                     onCheckedChanged: {
                         if (root.bridge && !locked && root.bridge.checkAppUpdates !== checked)
@@ -123,9 +131,10 @@ Item {
                 width: parent.width
                 showHint: false
                 label: qsTr("Проверять обновления моделей")
-                sub: qsTr("Раз в сутки, huggingface.co")
+                sub: locked && !modelUpdates.checked ? qsTr("Администратор отключил проверку обновлений на этом компьютере.")
+                    : qsTr("Раз в сутки, huggingface.co. Скачивание — только по вашему нажатию.")
                 toggle: modelUpdates
-                locked: root.bridge ? root.bridge.policyLocked : false
+                locked: root.modelUpdatesLocked
                 lockedText: root.bridge ? root.bridge.policyLockedText : ""
                 rowEnabled: !locked
 
@@ -133,7 +142,7 @@ Item {
                     id: modelUpdates
                     Layout.alignment: Qt.AlignVCenter
                     checked: root.bridge ? root.bridge.checkModelUpdates : false
-                    locked: root.bridge ? root.bridge.policyLocked : false
+                    locked: root.modelUpdatesLocked
                     onCheckedChanged: {
                         if (root.bridge && !locked && root.bridge.checkModelUpdates !== checked)
                             root.bridge.checkModelUpdates = checked
@@ -160,7 +169,13 @@ Item {
         width: root.width
         variant: "info"
         iconName: "info" // design/spec.md §7; макет 08-onboarding-1-network.html: информационная иконка.
-        title: qsTr("Пока оба переключателя выключены, программа не выходит в сеть")
-        body: qsTr("Скачать модель на следующем шаге можно и без них — это ваше явное действие. Куда программа ходит в сеть и как это выключить — в «О программе → Приватность».")
+        title: appUpdates.checked || modelUpdates.checked
+            ? qsTr("В сеть программа ходит только проверить обновления")
+            : root.appUpdatesLocked && root.modelUpdatesLocked
+                ? qsTr("Проверку обновлений отключил администратор")
+                : qsTr("Пока оба переключателя выключены, программа не выходит в сеть")
+        body: appUpdates.checked || modelUpdates.checked
+            ? qsTr("Не чаще раза в сутки. Сама ничего не скачивает и не устанавливает: модель на следующем шаге и новые версии скачиваются только по вашему нажатию. Где программа выходит в сеть и как это выключить — в «О программе → Приватность».")
+            : qsTr("Скачать модель на следующем шаге можно и без них — это ваше явное действие. Куда программа ходит в сеть и как это выключить — в «О программе → Приватность».")
     }
 }

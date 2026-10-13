@@ -1949,11 +1949,15 @@ def test_onboarding_delegates_and_forwards_signals(
 
 
 @pytest.mark.parametrize("locked", [(), ("check_app_updates",), ("check_model_updates",)])
-def test_onboarding_network_defaults_and_policy(locked: tuple[str, ...]) -> None:
-    settings = Settings(extra={"onboarding_language_set": True})
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+def test_onboarding_network_defaults_and_policy(locked: tuple[str, ...], appimage: bool) -> None:
+    settings = settings_mod.defaults(appimage=appimage, locked=locked)
+    settings.extra["onboarding_language_set"] = True
     bridge = SettingsBridge(settings, locked=locked, save=Mock())
     controller = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
-    assert controller.checkAppUpdates is controller.checkModelUpdates is False
+    assert controller.checkAppUpdates is (appimage and "check_app_updates" not in locked)
+    assert controller.checkModelUpdates is (appimage and "check_model_updates" not in locked)
+    assert set(bridge.lockedSettings) == set(locked)
     assert controller.policyLocked is bool(locked)
     assert controller.policyLockedText == ("Задано администратором" if locked else "")
     for name, field in [
@@ -6935,3 +6939,28 @@ def test_settings_refresh_devices_failure_keeps_default(caplog: pytest.LogCaptur
         bridge.refreshDevices()
     assert bridge.devices == [{"id": "", "name": "Системный по умолчанию"}]
     assert any("список микрофонов" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "locked_field,editable,locked_name",
+    [
+        ("check_app_updates", "checkModelUpdates", "checkAppUpdates"),
+        ("check_model_updates", "checkAppUpdates", "checkModelUpdates"),
+    ],
+)
+@pytest.mark.parametrize("policy_value", [False, True])
+def test_onboarding_single_policy_lock_does_not_lock_other_preference(
+    locked_field: str, editable: str, locked_name: str, policy_value: bool
+) -> None:
+    settings = Settings(extra={"onboarding_language_set": True})
+    setattr(settings, locked_field, policy_value)
+    save = Mock()
+    bridge = SettingsBridge(settings, locked=(locked_field,), save=save)
+    controller = OnboardingController(bridge, settings=settings, device_provider=lambda: [])
+    assert controller.policyLocked
+    controller.setProperty(editable, True)
+    assert controller.property(editable) is True
+    save.assert_called_once()
+    controller.setProperty(locked_name, not policy_value)
+    assert controller.property(locked_name) is policy_value
+    save.assert_called_once()

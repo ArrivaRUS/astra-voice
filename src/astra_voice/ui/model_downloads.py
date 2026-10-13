@@ -42,7 +42,7 @@ from astra_voice.core.measurements import read_measurements
 from astra_voice.core.model_request import model_threads
 from astra_voice.core.model_source import RevocationUnknown, SmokeRunner
 from astra_voice.core.policy import Policy
-from astra_voice.core.settings import Settings
+from astra_voice.core.settings import Settings, defaults
 from astra_voice.core.version import __version__
 from astra_voice.models import catalog_state
 from astra_voice.models.catalog import (
@@ -979,7 +979,7 @@ class ModelDownloads(QObject):
         super().__init__(parent)
         self._model = model
         self._store = store
-        self._settings = settings or Settings()
+        self._settings = settings if settings is not None else defaults()
         self._revocation_unknown = revocation_unknown
         self._revoked_check = revoked_check
         self._catalog_revocation_warned = False

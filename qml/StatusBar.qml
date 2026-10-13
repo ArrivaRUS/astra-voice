@@ -82,7 +82,7 @@ Item {
             : updateRestState === "disabled" ? qsTr("Проверка обновлений отключена") : "";
         case "available": return qsTr("Доступна версия %1 · Подробнее").arg(updateVersion);
         case "unavailable": return qsTr("Источник обновлений недоступен · Повторить");
-        case "error-net": return qsTr("Не удалось скачать обновление · Повторить");
+        case "error-net": return qsTr("Не удалось проверить обновления · Повторить");
         case "skipped": return qsTr("Версия %1 пропущена · Показать").arg(updateVersion);
         default: return qsTr("Проверка обновлений отключена");
         }

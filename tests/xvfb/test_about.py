@@ -357,9 +357,9 @@ def test_about_section_snapshot(app: Any, case: str, dark: bool) -> None:
                     "2,1 МБ",
                     "KDE Plasma",
                     "Не заданы — все настройки в ваших руках",
-                    "Последняя попытка: сегодня в 14:05 · последний успех: 28.09.2026 в 10:12",
+                    "Автоматически раз в сутки · последняя попытка: сегодня в 14:05 · "
+                    "последний успех: 28.09.2026 в 10:12",
                     "обычно 0,38 с, в худших случаях 0,61 с · 148 диктовок",
-                    "Проверить обновления",
                 } <= texts
             else:
                 assert {
@@ -367,7 +367,7 @@ def test_about_section_snapshot(app: Any, case: str, dark: bool) -> None:
                     "Python 3.11.2 · Qt 5.15.8 · PyQt5 5.15.9 · onnxruntime не найден · "
                     "onnx-asr 0.12.0",
                     "Fly",
-                    "Ещё не проверялись",
+                    "Автоматически раз в сутки · ещё не проверялись",
                     "Пока нет данных",
                     "Появится после первой диктовки",
                 } <= texts
@@ -387,10 +387,13 @@ def test_about_buttons_call_bridge(app: Any) -> None:
             "aboutOpenPrivacy",
             "aboutOpenSettings",
             "aboutOpenLogs",
-            "aboutCheckUpdates",
         ):
             onboarding.click_item(find_object(window, name))
             app.processEvents()
+        assert not any(
+            item.objectName() == "aboutCheckUpdates"
+            for item in onboarding.visual_tree(window.contentItem())
+        )
         onboarding.click_item(find_object(window, "aboutClearStats"))
         QTest.qWait(50)
         app.processEvents()
@@ -441,7 +444,7 @@ def test_about_buttons_call_bridge(app: Any) -> None:
             "openLogsFolder",
             "clearStats",
         ]
-        assert updates.calls == ["checkNow"]
+        assert updates.calls == []
     finally:
         sip.delete(about)
         sip.delete(info)

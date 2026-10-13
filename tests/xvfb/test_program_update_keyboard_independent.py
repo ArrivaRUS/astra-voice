@@ -32,7 +32,9 @@ SNAPSHOTS = Path("/tmp/astra-updater-independent-keyboard")
 @pytest.fixture(scope="module")
 def app() -> Any:
     assert os.environ.get("QT_QPA_PLATFORM") == "xcb", "keyboard acceptance requires real Xvfb/xcb"
-    return states.get_qapplication()
+    app = states.get_qapplication()
+    states.onboarding.register_ui_fonts()
+    return app
 
 
 def settle(app: Any, window: Any) -> None:
@@ -106,14 +108,13 @@ def available(**overrides: Any) -> Any:
 def test_full_forward_and_reverse_tab_order_skips_unavailable_controls(
     app: Any, scenario: str
 ) -> None:
-    common = ["checkAppUpdatesToggle", "offlineToggle"]
+    common = ["checkAppUpdatesToggle", "checkModelUpdatesToggle", "offlineToggle"]
     if scenario == "available":
         updates = available()
         order = [
             "updatePrimary",
             "updateSkip",
             *common,
-            "checkNowButton",
         ]
     elif scenario == "busy":
         updates = available(
@@ -127,7 +128,7 @@ def test_full_forward_and_reverse_tab_order_skips_unavailable_controls(
         order = ["updateCancel", *common]
     else:
         updates = available(canDownload=False, releasePageAvailable=False)
-        order = ["updateSkip", *common, "checkNowButton"]
+        order = ["updateSkip", *common]
 
     def inspect(window: Any) -> None:
         settle(app, window)
@@ -750,5 +751,93 @@ def test_offline_ready_deb_bottom_actions_reachable_by_tab_and_scroll(app: Any) 
         QTest.keyClick(window, Qt.Key_Space)
         settle(app, window)
         assert updates.calls == ["openFolder"]
+
+    render(app, updates, inspect)
+
+
+@pytest.mark.parametrize("scenario", ["idle", "checking", "uptodate", "skipped"])
+def test_compact_forward_reverse_tab_order_includes_model_preference(
+    app: Any, scenario: str
+) -> None:
+    updates = states.FakeUpdates(state=scenario, version="0.2.1", manual=True)
+    toggles = ["checkAppUpdatesToggle", "checkModelUpdatesToggle", "offlineToggle"]
+    order = ["checkNowButton"] if scenario != "checking" else []
+    if scenario == "skipped":
+        order.append("updateShowSkipped")
+    order += toggles
+
+    def inspect(window: Any) -> None:
+        settle(app, window)
+        item(window, "updatePanelHeading").forceActiveFocus(Qt.TabFocusReason)
+        QTest.keyClick(window, Qt.Key_Tab)
+        settle(app, window)
+        assert_focus_visible(window, order[0])
+        for name in order[1:]:
+            QTest.keyClick(window, Qt.Key_Tab)
+            settle(app, window)
+            assert_focus_visible(window, name)
+        for name in reversed(order[:-1]):
+            QTest.keyClick(window, Qt.Key_Backtab, Qt.ShiftModifier)
+            settle(app, window)
+            assert_focus_visible(window, name)
+        assert updates.calls == []
+
+    render(app, updates, inspect)
+
+
+@pytest.mark.parametrize("activation", ["mouse", "return", "enter", "space"])
+@pytest.mark.parametrize("result", ["uptodate", "available", "unavailable", "error-net"])
+def test_manual_check_keeps_heading_focus_and_ring_through_result(
+    app: Any, activation: str, result: str
+) -> None:
+    class CheckingUpdates(states.FakeUpdates):
+        @states.pyqtSlot()
+        def checkNow(self) -> None:
+            self.calls.append("checkNow")
+            self.update(state="checking", manual=True)
+
+    updates = CheckingUpdates(state="idle")
+
+    def inspect(window: Any) -> None:
+        settle(app, window)
+        button = item(window, "checkNowButton")
+        if activation == "mouse":
+            states.onboarding.click_item(button)
+        else:
+            button.forceActiveFocus(Qt.TabFocusReason)
+            settle(app, window)
+            key = {"return": Qt.Key_Return, "enter": Qt.Key_Enter, "space": Qt.Key_Space}[
+                activation
+            ]
+            QTest.keyClick(window, key)
+        settle(app, window)
+        assert updates.calls == ["checkNow"]
+        assert_focus_visible(window, "updatePanelHeading")
+        assert item(window, "updateHeadingFocusRing").isVisible() is (activation != "mouse")
+        assert_heading_ring_follows_visible_content(window)
+        assert button.property("enabled") is False
+        updates.update(
+            state=result,
+            version="0.2.1",
+            notes=states.NOTES,
+            checkedText="Проверено сегодня в 14:02",
+        )
+        settle(app, window)
+        assert_focus_visible(window, "updatePanelHeading")
+        assert item(window, "updateHeadingFocusRing").isVisible() is (activation != "mouse")
+        assert_heading_ring_follows_visible_content(window)
+        QTest.keyClick(window, Qt.Key_Return)
+        settle(app, window)
+        assert updates.calls == ["checkNow"], "result heading must not trigger another action"
+        if result == "uptodate":
+            QTest.qWait(3200)
+            settle(app, window)
+            assert "Установлена последняя версия" in states.onboarding.visible_texts(
+                item(window, "updatePanel")
+            )
+            assert_focus_visible(window, "updatePanelHeading")
+        QTest.keyClick(window, Qt.Key_Tab)
+        settle(app, window)
+        assert_focus_visible(window, "updatePrimary" if result == "available" else "checkNowButton")
 
     render(app, updates, inspect)
