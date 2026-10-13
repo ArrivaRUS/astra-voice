@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 from PyQt5 import sip
 from PyQt5.QtCore import QObject, QUrl, pyqtProperty, pyqtSignal, pyqtSlot, qInstallMessageHandler
-from PyQt5.QtGui import QFontDatabase, QFontInfo, QImage
+from PyQt5.QtGui import QFont, QFontDatabase, QFontInfo, QImage
 from PyQt5.QtQml import QQmlApplicationEngine, QQmlComponent
 from PyQt5.QtQuick import QQuickView, QQuickWindow
 from PyQt5.QtTest import QTest
@@ -261,7 +261,9 @@ def pt_root_ui_fonts(app: Any) -> None:
     assert paths
     for path in paths:
         assert QFontDatabase.addApplicationFont(str(path)) >= 0, path
-    # Keep fonts registered until process exit: Qt text/scene caches retain them.
+    # Registration is process-global and intentionally lasts until process exit.
+    # removeApplicationFont causes SIGSEGV in subsequent renders: Qt text/scene
+    # caches retain these fonts even after the QML engines have been destroyed.
 
 
 def collect_messages() -> tuple[list[str], Any]:
@@ -317,7 +319,12 @@ def add_background(engine: Any, window: Any) -> Any:
     return component, background
 
 
-def render_footer(app: Any, dark: bool, values: dict[str, Any]) -> tuple[QImage, Any, list[str]]:
+def render_footer(
+    app: Any,
+    dark: bool,
+    values: dict[str, Any],
+    inspect: Callable[[Any], None] | None = None,
+) -> tuple[QImage, Any, list[str]]:
     messages, previous = collect_messages()
     view = QQuickView()
     install_icon_provider(view.engine())
@@ -338,6 +345,8 @@ def render_footer(app: Any, dark: bool, values: dict[str, Any]) -> tuple[QImage,
         QTest.qWait(120)
         app.processEvents()
         image = grab(app, view, FOOTER_W, FOOTER_H)
+        if inspect is not None:
+            inspect(view)
         texts = {
             item.property("text")
             for item in onboarding.visual_tree(bar)
@@ -493,12 +502,9 @@ def test_full_window_status_text_is_not_truncated_with_pt_root_ui(
     dark: bool,
     overrides: dict[str, Any],
     expected: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     updates = FakeUpdates(**{**AVAILABLE, "version": "0.1.4", **overrides})
     settings = make_settings({})
-    monkeypatch.setattr(sys.modules[__name__], "WIDTH", 1024)
-    monkeypatch.setattr(sys.modules[__name__], "HEIGHT", 620)
 
     def inspect(window: Any) -> None:
         assert (window.width(), window.height()) == (1024, 620)
@@ -507,6 +513,57 @@ def test_full_window_status_text_is_not_truncated_with_pt_root_ui(
         assert QFontInfo(label.property("font")).family() == "PT Root UI"
         assert label.property("text") == expected
         assert label.property("truncated") is False
+        assert updates.calls == []
+
+    try:
+        _, _, messages = render_network(app, dark, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_narrow_footer_elides_real_policy_message_with_pt_root_ui(
+    app: Any,
+    pt_root_ui_fonts: None,
+    dark: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Main.qml has a 900 px minimum; render its footer independently at 640 px.
+    monkeypatch.setattr(sys.modules[__name__], "FOOTER_W", 640)
+
+    def inspect(window: Any) -> None:
+        assert window.width() == 640
+        label = find_object(window, "statusUpdateText")
+        update = find_object(window, "statusUpdate")
+        content = update.parentItem().parentItem()
+        assert label.isVisible()
+        assert QFontInfo(label.property("font")).family() == "PT Root UI"
+        assert label.property("text") == ("Проверка обновлений отключена (задано администратором)")
+        assert label.property("truncated") is True
+        assert update.width() <= max(0, content.width() * 0.72 - 90) + 1
+
+    _, _, messages = render_footer(app, dark, {"updateState": "policy-locked"}, inspect)
+    assert not messages, "\n".join(messages)
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_available_badge_uses_real_medium_font_with_pt_root_ui(
+    app: Any, pt_root_ui_fonts: None, dark: bool
+) -> None:
+    updates = FakeUpdates(**AVAILABLE)
+    settings = make_settings({})
+
+    def inspect(window: Any) -> None:
+        badge = find_object(window, "updateNewBadgeText")
+        assert badge.isVisible()
+        assert badge.property("text") == "Новая"
+        font = badge.property("font")
+        info = QFontInfo(font)
+        assert info.family() == "PT Root UI"
+        assert font.weight() == QFont.Medium
+        assert info.styleName() == "Medium" or info.weight() == 57
         assert updates.calls == []
 
     try:

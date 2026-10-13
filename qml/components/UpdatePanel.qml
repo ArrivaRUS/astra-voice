@@ -405,7 +405,7 @@ Rectangle {
                     height: Math.ceil(Theme.badgeHeight)
                     radius: Theme.badgeRadius
                     color: Theme.primaryBg
-                    Text { id: badgeText; anchors.centerIn: parent; text: qsTr("Новая"); textFormat: Text.PlainText; color: Theme.primary; font.family: Theme.fontUi; font.pixelSize: Theme.badgeSize; font.weight: Theme.badgeWeight }
+                    Text { id: badgeText; objectName: "updateNewBadgeText"; anchors.centerIn: parent; text: qsTr("Новая"); textFormat: Text.PlainText; color: Theme.primary; font.family: Theme.fontUi; font.pixelSize: Theme.badgeSize; font.weight: Font.Medium }
                 }
             }
         }

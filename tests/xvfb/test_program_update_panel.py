@@ -125,7 +125,27 @@ def test_actual_program_panel(app: Any, dark: bool, size: tuple[int, int], phase
             assert cancel.x() == skip.x() + skip.width() + 8
         names = {item.objectName() for item in states.onboarding.visual_tree(panel)}
         assert not {"updateReleasePage", "updateRemindLater"} & names
-        assert states.find_object(window, "updateReleaseVersion").property("textFormat") == 0
+        release_version = states.find_object(window, "updateReleaseVersion")
+        assert release_version.property("textFormat") == 0
+        assert release_version.property("color") == states.onboarding.theme_color("fg", dark)
+        if phase in {"readyappimage", "readydeb", "downloading", "cancelled"}:
+            operation_body = states.find_object(window, "updateOperationBody")
+            assert operation_body.isVisible()
+            token = "fgSecondary" if phase in {"readyappimage", "readydeb"} else "fgMuted"
+            assert operation_body.property("color") == states.onboarding.theme_color(token, dark)
+        if phase == "readydeb":
+            instruction = states.find_object(window, "updateAdminInstruction")
+            prompts = [
+                item
+                for item in states.onboarding.visual_tree(operation)
+                if item.isVisible()
+                and item.property("text") == "Администратору: в этой папке выполните"
+            ]
+            assert len(prompts) == 1
+            prompt = prompts[0]
+            assert instruction.isVisible()
+            assert instruction.parentItem() == prompt.parentItem()
+            assert instruction.y() - (prompt.y() + prompt.height()) == 7
         if phase == "offline":
             assert states.find_object(window, "updateNewBadge").property("visible") is False
             assert "сохранённые сведения о версии" in states.find_object(
