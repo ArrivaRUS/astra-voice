@@ -27,7 +27,7 @@ Item {
     property string version: "v0.2.0"
 
     // Клик или Enter/Space по кликабельному состоянию (§2.3: 5, 12, 15, 17).
-    signal updateActivated(string kind)
+    signal updateActivated(string kind, bool keyboard)
 
     // «Установлена последняя версия» держится 3000 мс (token motion.duration.uptodate-message).
     property bool uptodateShown: false
@@ -201,13 +201,13 @@ Item {
                 Accessible.name: root.updateText
                 Accessible.onPressAction: {
                     if (root.updateClickable)
-                        root.updateActivated(root.updateState)
+                        root.updateActivated(root.updateState, true)
                 }
 
                 Keys.onPressed: {
                     if (root.updateClickable && (event.key === Qt.Key_Return
                             || event.key === Qt.Key_Enter || event.key === Qt.Key_Space)) {
-                        root.updateActivated(root.updateState)
+                        root.updateActivated(root.updateState, true)
                         event.accepted = true
                     }
                 }
@@ -245,7 +245,7 @@ Item {
                     anchors.fill: parent
                     enabled: root.updateClickable
                     cursorShape: root.updateClickable ? Qt.PointingHandCursor : Qt.ArrowCursor
-                    onClicked: root.updateActivated(root.updateState)
+                    onClicked: root.updateActivated(root.updateState, false)
                 }
 
                 // Кольцо фокуса по общему правилу (§2.3): 2 px, зазор 2, радиус 8.

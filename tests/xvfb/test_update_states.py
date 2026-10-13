@@ -524,7 +524,8 @@ def test_network_section_snapshot(app: Any, case: str, dark: bool) -> None:
     if panel_title is not None:
         assert panel_title in texts
     if case == "panel-available":
-        assert {"Что нового", *NOTE_LINES, "Страница выпуска", "Пропустить эту версию"} <= texts
+        assert {"Что нового", *NOTE_LINES, "Скачать новую версию", "Пропустить эту версию"} <= texts
+        assert not {"Страница выпуска", "Напомнить позже"} & texts
     if case == "panel-uptodate":
         assert {"Версия ", "0.2.0"} <= texts
     if case == "network-offline":
@@ -554,25 +555,35 @@ def test_panel_buttons_call_bridge(app: Any) -> None:
         assert all(line.property("textFormat") == 0 for line in lines)  # Text.PlainText
         # Висячий отступ: текст пункта начинается с x = 17 и переносится там же.
         assert all(line.property("x") == 17 for line in lines)
-        for name in ("updateReleasePage", "updateSkip", "updateRemindLater"):
+        for name in ("updatePrimary", "updateSkip"):
             onboarding.click_item(find_object(window, name))
             app.processEvents()
 
     try:
         render_network(app, False, updates, settings, inspect)
-        assert updates.calls == ["openReleasePage", "skipVersion", "remindLater"]
+        assert updates.calls == ["download", "skipVersion"]
     finally:
         sip.delete(updates)
         sip.delete(settings)
 
 
-def test_release_page_button_hidden_without_opener(app: Any) -> None:
-    updates = FakeUpdates(**{**AVAILABLE, "releasePageAvailable": False})
+@pytest.mark.parametrize("release_available", [False, True])
+def test_removed_panel_actions_absent_even_with_backend_capability(
+    app: Any, release_available: bool
+) -> None:
+    updates = FakeUpdates(**{**AVAILABLE, "releasePageAvailable": release_available})
     settings = make_settings({})
     try:
-        _, texts, _ = render_network(app, False, updates, settings)
-        assert "Страница выпуска" not in texts
+
+        def inspect(window: Any) -> None:
+            names = {item.objectName() for item in onboarding.visual_tree(window.contentItem())}
+            assert not {"updateReleasePage", "updateRemindLater"} & names
+
+        _, texts, messages = render_network(app, False, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+        assert not {"Страница выпуска", "Напомнить позже"} & texts
         assert "Пропустить эту версию" in texts
+        assert updates.calls == []
     finally:
         sip.delete(updates)
         sip.delete(settings)

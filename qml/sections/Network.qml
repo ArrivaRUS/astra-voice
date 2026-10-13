@@ -20,7 +20,7 @@ Column {
     function updateCall(name) {
         if (root.updates && typeof root.updates[name] === "function") root.updates[name]();
     }
-    function focusUpdatePanel() { return updatePanel.focusHeading(); }
+    function focusUpdatePanel(keyboard) { return updatePanel.focusHeading(keyboard); }
     Component.onCompleted: root.updateCall("refreshCapabilities")
     onUpdatesChanged: Qt.callLater(function() { root.updateCall("refreshCapabilities"); })
     readonly property string downloadPhase: root.updateValue("downloadPhase", "idle")
@@ -88,7 +88,6 @@ Column {
             notes: root.updates ? root.updates.notes : []
             currentVersion: root.updates ? root.updates.currentVersion : ""
             checkedText: root.updates ? root.updates.checkedText : ""
-            releasePageAvailable: root.updates ? root.updates.releasePageAvailable : false
             canCheckNow: root.canCheckNow
             downloadPhase: root.downloadPhase
             artifactTrack: root.updateValue("artifactTrack", "")
@@ -104,7 +103,6 @@ Column {
             canOpenFolder: root.updateValue("canOpenFolder", false)
             canInstallAndRestart: root.updateValue("canInstallAndRestart", false)
             canSkipVersion: root.updateValue("canSkipVersion", root.updateState === "available")
-            canRemindLater: root.updateValue("canRemindLater", root.updateState === "available")
             downloadError: root.updateValue("downloadError", "")
             downloadErrorText: root.updateValue("downloadErrorText", "")
             downloadRetryText: root.updateValue("downloadRetryText", "")
@@ -119,9 +117,7 @@ Column {
             onOpenFolderRequested: root.updateCall("openFolder")
             onInstallRequested: root.updateCall("installAndRestart")
             autoCheck: root.settings ? root.settings.checkAppUpdates && !root.offlineOn : false
-            onReleasePageRequested: { if (root.updates) root.updates.openReleasePage(); }
             onSkipRequested: { if (root.updates) root.updates.skipVersion(); }
-            onRemindLaterRequested: { if (root.updates) root.updates.remindLater(); }
             onCheckRequested: { if (root.updates) root.updates.checkNow(); }
             onShowSkippedRequested: { if (root.updates) root.updates.clearSkip(); }
         }

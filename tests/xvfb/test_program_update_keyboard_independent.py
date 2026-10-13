@@ -24,7 +24,7 @@ from astra_voice.updates.checker import UpdateStatus
 from astra_voice.updates.download import DownloadStatus, FileIdentity, VerifiedDownload
 from astra_voice.updates.release import VerifiedArtifact, VerifiedRelease
 
-states = importlib.import_module("xvfb.test_update_states")
+states: Any = importlib.import_module("test_update_states")
 pytestmark = pytest.mark.xvfb
 SNAPSHOTS = Path("/tmp/astra-updater-independent-keyboard")
 
@@ -63,6 +63,26 @@ def snapshot(app: Any, window: Any, name: str) -> None:
     )
 
 
+def assert_heading_ring_follows_visible_content(window: Any, *, compact: bool = True) -> None:
+    content = item(window, "updateHeadingContent")
+    ring = item(window, "updateHeadingFocusRing")
+    # Measure actual visible children independently; Qt childrenRect includes
+    # hidden badge/version items, which must not enlarge a keyboard ring.
+    children = [child for child in content.childItems() if child.isVisible()]
+    assert children
+    points = [child.mapToItem(ring.parentItem(), QPointF(0, 0)) for child in children]
+    left = min(point.x() for point in points)
+    top = min(point.y() for point in points)
+    right = max(point.x() + child.width() for point, child in zip(points, children, strict=True))
+    bottom = max(point.y() + child.height() for point, child in zip(points, children, strict=True))
+    assert ring.x() == pytest.approx(left - 4)
+    assert ring.y() == pytest.approx(top - 4)
+    assert ring.width() == pytest.approx(right - left + 8)
+    assert ring.height() == pytest.approx(bottom - top + 8)
+    if compact:
+        assert ring.width() < item(window, "updatePanel").width() - 100
+
+
 def render(
     app: Any, updates: Any, inspect: Callable[[Any], None], *, section: str = "network"
 ) -> None:
@@ -91,9 +111,7 @@ def test_full_forward_and_reverse_tab_order_skips_unavailable_controls(
         updates = available()
         order = [
             "updatePrimary",
-            "updateReleasePage",
             "updateSkip",
-            "updateRemindLater",
             *common,
             "checkNowButton",
         ]
@@ -106,10 +124,10 @@ def test_full_forward_and_reverse_tab_order_skips_unavailable_controls(
             canSkipVersion=False,
             canRemindLater=False,
         )
-        order = ["updateCancel", "updateReleasePage", *common]
+        order = ["updateCancel", *common]
     else:
         updates = available(canDownload=False, releasePageAvailable=False)
-        order = ["updateSkip", "updateRemindLater", *common, "checkNowButton"]
+        order = ["updateSkip", *common, "checkNowButton"]
 
     def inspect(window: Any) -> None:
         settle(app, window)
@@ -136,9 +154,7 @@ def test_space_executes_only_the_focused_control(app: Any) -> None:
     def inspect(window: Any) -> None:
         settle(app, window)
         for name, action in (
-            ("updateReleasePage", "openReleasePage"),
             ("updateSkip", "skipVersion"),
-            ("updateRemindLater", "remindLater"),
             ("updatePrimary", "download"),
         ):
             item(window, name).forceActiveFocus(Qt.TabFocusReason)
@@ -189,13 +205,16 @@ def test_escape_cancels_busy_only_when_focus_is_inside_panel(app: Any, location:
     render(app, updates, inspect)
 
 
+@pytest.mark.parametrize("phase", ["idle", "readyappimage"])
 @pytest.mark.parametrize("activation", ["mouse", "return", "space"])
-def test_status_bar_activation_only_opens_network_panel(app: Any, activation: str) -> None:
+def test_status_bar_activation_only_opens_network_panel(
+    app: Any, activation: str, phase: str
+) -> None:
     updates = available(
-        downloadPhase="readyappimage",
-        canDownload=False,
-        canOpenFolder=True,
-        canInstallAndRestart=True,
+        downloadPhase=phase,
+        canDownload=phase == "idle",
+        canOpenFolder=phase == "readyappimage",
+        canInstallAndRestart=phase == "readyappimage",
     )
 
     def inspect(window: Any) -> None:
@@ -213,10 +232,42 @@ def test_status_bar_activation_only_opens_network_panel(app: Any, activation: st
         sections = states.onboarding.section_descriptions(window)
         assert sections[sidebar.property("currentIndex")]["key"] == "network"
         assert_focus_visible(window, "updatePanelHeading")
+        assert item(window, "updateHeadingFocusRing").isVisible() is (activation != "mouse")
+        assert_heading_ring_follows_visible_content(window)
         assert updates.calls == []
-        snapshot(app, window, f"status-{activation}")
+        snapshot(app, window, f"status-{phase}-{activation}")
 
     render(app, updates, inspect, section="general")
+
+
+def test_wrapped_heading_keyboard_ring_covers_all_visible_rows(app: Any) -> None:
+    updates = available(version="0.2.1-" + "abcdef" * 30)
+    original_size = states.WIDTH, states.HEIGHT
+    states.WIDTH, states.HEIGHT = 900, 588
+
+    def inspect(window: Any) -> None:
+        settle(app, window)
+        item(window, "statusUpdate").forceActiveFocus(Qt.TabFocusReason)
+        settle(app, window)
+        QTest.keyClick(window, Qt.Key_Return)
+        QTest.qWait(240)
+        settle(app, window)
+        assert_focus_visible(window, "updatePanelHeading")
+        version = item(window, "updateReleaseVersion")
+        title = item(window, "updatePanelTitle")
+        badge = item(window, "updateNewBadge")
+        assert version.height() > title.height(), "fixture must wrap the long version token"
+        assert version.y() >= title.height() + 9
+        assert badge.y() >= version.y() + version.height() + 9
+        assert item(window, "updateHeadingFocusRing").isVisible() is True
+        assert_heading_ring_follows_visible_content(window, compact=False)
+        assert updates.calls == []
+        snapshot(app, window, "wrapped-heading-keyboard-900x588")
+
+    try:
+        render(app, updates, inspect, section="general")
+    finally:
+        states.WIDTH, states.HEIGHT = original_size
 
 
 class Controller:
@@ -270,6 +321,186 @@ def real_bridge(
         )
     )
     return bridge, controller, checker, install, value
+
+
+@pytest.mark.parametrize("activation", ["mouse", "mouse-after-keyboard", "return", "space"])
+def test_download_focus_preserves_mouse_or_keyboard_origin(
+    app: Any, tmp_path: Path, activation: str
+) -> None:
+    bridge, controller, checker, install, value = real_bridge()
+
+    def inspect(window: Any) -> None:
+        settle(app, window)
+        primary = item(window, "updatePrimary")
+        if activation.startswith("mouse"):
+            if activation == "mouse-after-keyboard":
+                primary.forceActiveFocus(Qt.TabFocusReason)
+                settle(app, window)
+                assert primary.property("visualFocus") is True
+            states.onboarding.click_item(primary)
+        else:
+            # A key gesture must establish keyboard modality even after mouse
+            # focus; assigning TabFocusReason here would hide this regression.
+            primary.forceActiveFocus(Qt.OtherFocusReason)
+            settle(app, window)
+            assert primary.property("visualFocus") is False
+            QTest.keyClick(window, Qt.Key_Return if activation == "return" else Qt.Key_Space)
+        settle(app, window)
+        assert controller.starts == [value]
+        assert bridge.downloadPhase == "metadata"
+        assert_focus_visible(window, "updateCancel")
+        keyboard = activation in {"return", "space"}
+        assert item(window, "updateCancel").property("visualFocus") is keyboard
+        assert item(window, "updateHeadingFocusRing").isVisible() is False
+        snapshot(app, window, f"download-{activation}-cancel-focus")
+
+        folder = tmp_path / "verified"
+        folder.mkdir(mode=0o700)
+        path = folder / value.artifact.name
+        path.write_bytes(b"12345678")
+        path.chmod(0o755)
+        result = VerifiedDownload(path, value, FileIdentity.from_stat(path.stat()))
+        bridge.set_download_status(DownloadStatus(1, "ready", result=result))
+        settle(app, window)
+        assert_focus_visible(window, "updatePanelHeading")
+        assert item(window, "updateHeadingFocusRing").isVisible() is keyboard
+        install.assert_not_called()
+        checker.remind_later.assert_not_called()
+        snapshot(app, window, f"download-{activation}-heading-focus")
+
+    render(app, bridge, inspect)
+
+
+@pytest.mark.parametrize("initial_activation", ["mouse", "keyboard"])
+def test_focus_origin_tracks_user_input_during_download(
+    app: Any, tmp_path: Path, initial_activation: str
+) -> None:
+    bridge, controller, checker, install, value = real_bridge()
+
+    def inspect(window: Any) -> None:
+        settle(app, window)
+        primary = item(window, "updatePrimary")
+        if initial_activation == "mouse":
+            states.onboarding.click_item(primary)
+        else:
+            primary.forceActiveFocus(Qt.TabFocusReason)
+            settle(app, window)
+            QTest.keyClick(window, Qt.Key_Return)
+        settle(app, window)
+        assert controller.starts == [value]
+        assert_focus_visible(window, "updateCancel")
+        if initial_activation == "mouse":
+            assert item(window, "updateCancel").property("visualFocus") is False
+            QTest.keyClick(window, Qt.Key_Tab)
+            settle(app, window)
+            assert_focus_visible(window, "checkAppUpdatesToggle")
+            QTest.keyClick(window, Qt.Key_Backtab, Qt.ShiftModifier)
+            settle(app, window)
+            assert_focus_visible(window, "updateCancel")
+            assert item(window, "updateCancel").property("visualFocus") is True
+            folder = tmp_path / "verified"
+            folder.mkdir(mode=0o700)
+            path = folder / value.artifact.name
+            path.write_bytes(b"12345678")
+            path.chmod(0o755)
+            result = VerifiedDownload(path, value, FileIdentity.from_stat(path.stat()))
+            bridge.set_download_status(DownloadStatus(1, "ready", result=result))
+            settle(app, window)
+            assert_focus_visible(window, "updatePanelHeading")
+            assert item(window, "updateHeadingFocusRing").isVisible() is True
+            assert_heading_ring_follows_visible_content(window)
+        else:
+            assert item(window, "updateCancel").property("visualFocus") is True
+            states.onboarding.click_item(item(window, "updateCancel"))
+            settle(app, window)
+            assert controller.cancels == 1
+            assert item(window, "updateCancel").property("visualFocus") is False
+            bridge.set_download_status(DownloadStatus(1, "cancelled"))
+            settle(app, window)
+            assert_focus_visible(window, "updatePrimary")
+            assert item(window, "updatePrimary").property("visualFocus") is False
+            assert item(window, "updateHeadingFocusRing").isVisible() is False
+        install.assert_not_called()
+        checker.remind_later.assert_not_called()
+
+    render(app, bridge, inspect)
+
+
+@pytest.mark.parametrize("departure", ["section", "hide"])
+def test_available_departure_keeps_highlight_without_implicit_reminder(
+    app: Any, departure: str
+) -> None:
+    bridge, controller, checker, install, _ = real_bridge()
+
+    def inspect(window: Any) -> None:
+        settle(app, window)
+        assert bridge.state == "available" and bridge.downloadPhase == "idle"
+        assert bridge.snoozed is False
+        if departure == "section":
+            states.onboarding.select_section(app, window, "general")
+        else:
+            window.hide()
+        QTest.qWait(240)
+        app.processEvents()
+        checker.remind_later.assert_not_called()
+        assert bridge.snoozed is False
+        assert controller.starts == []
+        install.assert_not_called()
+        if departure == "section":
+            states.onboarding.select_section(app, window, "network")
+        else:
+            window.show()
+        settle(app, window)
+        assert item(window, "updatePrimary").property("enabled") is True
+        assert item(window, "statusUpdateText").property("text") == (
+            "Доступна версия 1.5.0 · Подробнее"
+        )
+        assert item(window, "updatePanel").isVisible()
+        checker.remind_later.assert_not_called()
+        assert bridge.snoozed is False
+
+    render(app, bridge, inspect)
+
+
+@pytest.mark.parametrize("destination", ["checkAppUpdatesToggle", "updateReleaseVersion"])
+@pytest.mark.parametrize("selection_timing", ["before-terminal", "after-terminal"])
+def test_pending_cancellation_does_not_steal_newly_selected_focus(
+    app: Any, destination: str, selection_timing: str
+) -> None:
+    bridge, controller, checker, install, value = real_bridge()
+
+    def inspect(window: Any) -> None:
+        settle(app, window)
+        states.onboarding.click_item(item(window, "updatePrimary"))
+        settle(app, window)
+        assert controller.starts == [value]
+        assert_focus_visible(window, "updateCancel")
+        states.onboarding.click_item(item(window, "updateCancel"))
+        settle(app, window)
+        assert controller.cancels == 1
+        assert bridge.downloadPhase == "metadata"
+        assert bridge.downloadCancelling is True and bridge.canCancelDownload is False
+        if selection_timing == "after-terminal":
+            bridge.set_download_status(DownloadStatus(1, "cancelled"))
+            # Select a new target synchronously, before the QML focus callback
+            # scheduled by the terminal phase has had a chance to run.
+            item(window, destination).forceActiveFocus(Qt.TabFocusReason)
+        else:
+            if destination == "checkAppUpdatesToggle":
+                item(window, destination).forceActiveFocus(Qt.TabFocusReason)
+            else:
+                states.onboarding.click_item(item(window, destination))
+            settle(app, window)
+            assert_focus_visible(window, destination)
+            bridge.set_download_status(DownloadStatus(1, "cancelled"))
+        settle(app, window)
+        assert bridge.downloadPhase == "cancelled"
+        assert_focus_visible(window, destination)
+        assert item(window, "updatePrimary").hasActiveFocus() is False
+        install.assert_not_called()
+        checker.remind_later.assert_not_called()
+
+    render(app, bridge, inspect)
 
 
 def test_prior_launch_warning_with_fresh_real_candidate_needs_explicit_download(app: Any) -> None:
@@ -420,7 +651,8 @@ def test_offline_ready_deb_bottom_actions_reachable_by_tab_and_scroll(app: Any) 
         folderPath="/tmp/" + "verified-download-folder/" * 10,
         adminInstruction="sudo apt install ./astra-voice_0.2.1_amd64.deb",
         notes=[
-            {"text": f"Проверенные сведения о выпуске, пункт {i}", "bullet": True} for i in range(8)
+            {"text": f"Проверенные сведения о выпуске, пункт {i}", "bullet": True}
+            for i in range(12)
         ],
     )
 
@@ -431,12 +663,12 @@ def test_offline_ready_deb_bottom_actions_reachable_by_tab_and_scroll(app: Any) 
         assert position.y() > window.height() - 36, "test must exercise actions below the viewport"
         item(window, "updatePanelHeading").forceActiveFocus(Qt.TabFocusReason)
         settle(app, window)
-        for name in ("updatePrimary", "updateSkip", "updateRemindLater"):
+        for name in ("updatePrimary", "updateSkip"):
             QTest.keyClick(window, Qt.Key_Tab)
             settle(app, window)
             assert_focus_visible(window, name)
         snapshot(app, window, "offline-ready-deb-bottom-actions")
-        for name in ("updateSkip", "updatePrimary"):
+        for name in ("updatePrimary",):
             QTest.keyClick(window, Qt.Key_Backtab, Qt.ShiftModifier)
             settle(app, window)
             assert_focus_visible(window, name)

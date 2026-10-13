@@ -11,7 +11,6 @@ Rectangle {
     property var notes: []
     property string currentVersion: ""
     property string checkedText: ""
-    property bool releasePageAvailable: false
     property bool canCheckNow: false
     property bool autoCheck: false
     property string artifactTrack: ""
@@ -28,7 +27,6 @@ Rectangle {
     property bool canOpenFolder: false
     property bool canInstallAndRestart: false
     property bool canSkipVersion: false
-    property bool canRemindLater: false
     property string downloadError: ""
     property string downloadErrorText: ""
     property string downloadRetryText: ""
@@ -37,9 +35,7 @@ Rectangle {
     property string installRefusal: ""
     property string installRefusalText: ""
     property string networkRefusal: ""
-    signal releasePageRequested()
     signal skipRequested()
-    signal remindLaterRequested()
     signal checkRequested()
     signal showSkippedRequested()
     signal downloadRequested()
@@ -48,8 +44,11 @@ Rectangle {
     signal openFolderRequested()
     signal installRequested()
 
-    readonly property bool operationVisible: panelState === "available" && downloadPhase !== "idle"
-        || panelState === "available"
+    readonly property bool operationVisible: panelState === "available"
+    readonly property bool operationBlockVisible: operationVisible
+        && (downloadPhase !== "idle" || !canDownload || networkRefusal !== "")
+    readonly property bool cancellablePhase: ["metadata", "downloading", "verifying"].indexOf(downloadPhase) >= 0
+    readonly property bool progressVisible: cancellablePhase || installing
     readonly property bool deb: artifactTrack === "deb" || downloadPhase === "readydeb"
     readonly property bool ready: downloadPhase === "readydeb" || downloadPhase === "readyappimage"
     readonly property bool failed: downloadPhase === "error" || panelState === "error-net"
@@ -68,7 +67,7 @@ Rectangle {
         && (folderAction ? canOpenFolder : installAction ? canInstallAndRestart
             : failed ? canRetryDownload || canDownload : canDownload)
     readonly property string operationTitle: {
-        if (networkRefusal === "offline" && downloadPhase === "idle") return qsTr("Скачивание недоступно");
+        if (downloadPhase === "idle") return qsTr("Скачивание недоступно");
         switch (downloadPhase) {
         case "metadata": return qsTr("Проверяю сведения перед скачиванием…");
         case "downloading": return qsTr("Скачиваю обновление…");
@@ -88,10 +87,10 @@ Rectangle {
             if (["install-refused", "install-failed", "prepare-failed", "shutdown-incomplete", "launch-failed", "launch-unconfirmed"].indexOf(downloadError) >= 0)
                 return qsTr("Не удалось установить обновление");
             return qsTr("Не удалось скачать обновление");
-        default: return qsTr("Скачивание начнётся по вашему нажатию.");
+        default: return "";
         }
     }
-    readonly property string restartNotice: qsTr("Установка заменит текущую копию программы в домашней папке. Модели и настройки сохранятся. Программа закроется для запуска новой версии. Если она не откроется, запустите Astra Voice из меню.")
+    readonly property string restartNotice: qsTr("Программа закроется и откроется уже новой версией. Модели и настройки сохранятся. Если она не откроется, запустите Astra Voice из меню.")
     readonly property string installingNotice: qsTr("Программа закроется для запуска новой версии. Если она не откроется, запустите Astra Voice из меню. Ошибка после закрытия будет показана при следующем запуске.")
     readonly property string operationBody: {
         if (downloadCancelling) return qsTr("Отменяю скачивание…");
@@ -107,18 +106,31 @@ Rectangle {
         case "readyappimage": return restartNotice;
         case "installing": return installingNotice;
         case "cancelled": return qsTr("Можно скачать эту версию ещё раз.");
-        case "downloading": return "";
+        case "downloading": return downloadPercent + " % · " + megabytes(downloadReceived) + qsTr(" из ") + megabytes(downloadTotal);
         default:
-            if (!canDownload) return networkRefusal === "offline"
+            if (downloadRetryText) return downloadRetryText;
+            if (!canDownload || networkRefusal) return networkRefusal === "offline"
                 ? qsTr("Чтобы скачать обновление, выключите офлайн-режим в настройках ниже.")
                 : networkRefusal ? qsTr("Ограничение задано администратором.")
                 : qsTr("Для этой сборки файл обновления недоступен");
-            return deb ? qsTr("Установку выполняет администратор.")
-                : qsTr("Установка и перезапуск — отдельным нажатием после проверки.");
+            return "";
         }
     }
+    // Measure every label in a track so changing the action never changes its slot.
+    readonly property real primarySlotWidth: Math.ceil(Math.max(downloadMetrics.width,
+        folderMetrics.width, retryDownloadMetrics.width,
+        deb ? 0 : installMetrics.width, deb ? 0 : retryInstallMetrics.width)) + 2 * Theme.buttonPaddingX
+    TextMetrics { id: downloadMetrics; font: primaryButton.font; text: root.downloadLabel }
+    TextMetrics { id: folderMetrics; font: primaryButton.font; text: qsTr("Открыть папку") }
+    TextMetrics { id: retryDownloadMetrics; font: primaryButton.font; text: qsTr("Повторить скачивание") }
+    TextMetrics { id: installMetrics; font: primaryButton.font; text: qsTr("Установить и перезапустить") }
+    TextMetrics { id: retryInstallMetrics; font: primaryButton.font; text: qsTr("Повторить установку") }
+    TextMetrics { id: primaryTextMetrics; font: primaryButton.font; text: root.primaryText }
+    property bool headingKeyboardFocus: false
+    property bool pendingCancelFocus: false
+    property bool pendingCancelKeyboard: false
     function panelActions() {
-        return [primaryButton, cancelButton, releaseButton, skipButton, remindButton,
+        return [primaryButton, skipButton, cancelButton,
             checkAgainButton, showSkippedButton];
     }
     function focusPanelAction(current, direction) {
@@ -134,25 +146,78 @@ Rectangle {
         // At the panel boundary Qt continues its normal focus chain into the section.
         return false;
     }
-    function focusHeading() { heading.forceActiveFocus(Qt.TabFocusReason); return heading; }
+    function focusHeading(keyboard) {
+        headingKeyboardFocus = keyboard === true;
+        heading.forceActiveFocus(headingKeyboardFocus ? Qt.TabFocusReason : Qt.OtherFocusReason);
+        return heading;
+    }
     function megabytes(value) { return (value / 1000000).toFixed(value < 10000000 ? 1 : 0) + " МБ"; }
     function ownsFocus() {
         var item = root.Window.window ? root.Window.window.activeFocusItem : null;
         while (item) { if (item === root) return true; item = item.parent; }
         return false;
     }
+    function keyboardFocus() {
+        var item = root.Window.window ? root.Window.window.activeFocusItem : null;
+        return item === heading ? headingKeyboardFocus
+            : item && typeof item.visualFocus !== "undefined" ? item.visualFocus : false;
+    }
+    function focusCanReturn(source) {
+        var window = root.Window.window;
+        if (!window || !root.visible) return false;
+        var item = window.activeFocusItem;
+        // Qt moves focus from a disabled/hidden button to an enclosing scope.
+        // A newly selected sibling or outside control must keep its focus.
+        while (source) {
+            if (source === item) return true;
+            source = source.parent;
+        }
+        return item === null;
+    }
+    function requestCancel(keyboard) {
+        // Cancellation can disable its button before downloadPhase changes.
+        // Preserve its focus origin before the synchronous bridge mutation.
+        pendingCancelFocus = cancelButton.activeFocus;
+        pendingCancelKeyboard = keyboard === true;
+        cancelRequested();
+    }
+    Connections {
+        target: root.Window.window
+        function onActiveFocusItemChanged() {
+            var window = root.Window.window;
+            var item = window ? window.activeFocusItem : null;
+            // A disabled control falls back to an enclosing focus scope. A real
+            // move to another control takes precedence over the pending return.
+            if (!root.pendingCancelFocus || !item) return;
+            var ancestor = cancelButton;
+            while (ancestor) {
+                if (ancestor === item) return;
+                ancestor = ancestor.parent;
+            }
+            root.pendingCancelFocus = false;
+        }
+    }
+    onVisibleChanged: { if (!visible) pendingCancelFocus = false; }
     onDownloadPhaseChanged: {
-        var hadCancelFocus = cancelButton.activeFocus;
+        var hadCancelFocus = cancelButton.activeFocus || pendingCancelFocus;
         var hadPanelFocus = root.ownsFocus();
+        var focusSource = hadCancelFocus ? cancelButton
+            : root.Window.window ? root.Window.window.activeFocusItem : null;
+        var keyboard = pendingCancelFocus ? pendingCancelKeyboard
+            : focusSource === primaryButton && primaryButton.requestInProgress
+                ? primaryButton.activationKeyboard : root.keyboardFocus();
+        if (!cancellablePhase) pendingCancelFocus = false;
         Qt.callLater(function() {
-            if (downloadPhase === "cancelled" && hadCancelFocus) primaryButton.forceActiveFocus(Qt.TabFocusReason);
-            else if ((downloadPhase === "error" && hadPanelFocus) || (hadCancelFocus && !downloadBusy)) root.focusHeading();
-            else if (downloadBusy && primaryButton.activeFocus && canCancelDownload)
-                cancelButton.forceActiveFocus(Qt.TabFocusReason);
+            if (!root.focusCanReturn(focusSource)) return;
+            var reason = keyboard ? Qt.TabFocusReason : Qt.OtherFocusReason;
+            if (downloadPhase === "cancelled" && hadCancelFocus) primaryButton.forceActiveFocus(reason);
+            else if ((downloadPhase === "error" && hadPanelFocus) || (hadCancelFocus && !cancellablePhase)) root.focusHeading(keyboard);
+            else if (downloadBusy && focusSource === primaryButton && canCancelDownload)
+                cancelButton.forceActiveFocus(reason);
         });
     }
     Keys.onEscapePressed: {
-        if (root.downloadBusy && root.canCancelDownload) { root.cancelRequested(); event.accepted = true; }
+        if (root.downloadBusy && root.canCancelDownload) { root.requestCancel(root.keyboardFocus()); event.accepted = true; }
         else event.accepted = false;
     }
     implicitHeight: body.implicitHeight + (Theme.updatePanelPaddingY + Theme.cardBorder) * 2
@@ -169,10 +234,22 @@ Rectangle {
         property string enterPhase: ""
         property string enterPanelState: ""
         property string enterText: ""
-        onActiveFocusChanged: { if (!activeFocus) enterArmed = false; }
-        onEnabledChanged: { if (!enabled) enterArmed = false; }
-        onVisibleChanged: { if (!visible) enterArmed = false; }
+        property bool activationKeyboard: false
+        property bool spaceArmed: false
+        onActiveFocusChanged: { if (!activeFocus) { enterArmed = false; spaceArmed = false; } }
+        onEnabledChanged: { if (!enabled) { enterArmed = false; spaceArmed = false; } }
+        onVisibleChanged: { if (!visible) { enterArmed = false; spaceArmed = false; } }
         onTextChanged: enterArmed = false
+        // Pointer presses reset an earlier keyboard activation. Space is handled
+        // by Button itself, after Keys has recorded its keyboard origin.
+        onPressed: activationKeyboard = spaceArmed
+        Accessible.onPressAction: {
+            if (!enabled || !visible) return;
+            activationKeyboard = true;
+            forceActiveFocus(Qt.TabFocusReason);
+            clicked();
+            activationKeyboard = false;
+        }
         Keys.onPressed: {
             if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                 event.accepted = true;
@@ -183,6 +260,13 @@ Rectangle {
                     enterPanelState = root.panelState;
                     enterText = text;
                 }
+            } else if (event.key === Qt.Key_Space) {
+                if (!event.isAutoRepeat && enabled && visible && activeFocus) {
+                    spaceArmed = true;
+                    activationKeyboard = true;
+                    forceActiveFocus(Qt.TabFocusReason);
+                }
+                event.accepted = false;
             } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
                 enterArmed = false;
                 var backward = event.key === Qt.Key_Backtab || (event.modifiers & Qt.ShiftModifier);
@@ -190,6 +274,11 @@ Rectangle {
             }
         }
         Keys.onReleased: {
+            if (event.key === Qt.Key_Space) {
+                event.accepted = false;
+                Qt.callLater(function() { spaceArmed = false; });
+                return;
+            }
             if (event.key !== Qt.Key_Return && event.key !== Qt.Key_Enter) return;
             event.accepted = true;
             if (event.isAutoRepeat) return;
@@ -197,7 +286,12 @@ Rectangle {
                 && enterPhase === root.downloadPhase && enterPanelState === root.panelState
                 && enterText === text;
             enterArmed = false;
-            if (activate) clicked();
+            if (activate) {
+                activationKeyboard = true;
+                forceActiveFocus(Qt.TabFocusReason);
+                clicked();
+                activationKeyboard = false;
+            }
         }
     }
     component SmallText: Text {
@@ -222,15 +316,16 @@ Rectangle {
         renderType: Text.NativeRendering
     }
     Rectangle {
-        x: body.x + heading.x - Theme.focusOffset - Theme.focusWidth
-        y: body.y + heading.y - Theme.focusOffset - Theme.focusWidth
-        width: heading.width + 2 * (Theme.focusOffset + Theme.focusWidth)
-        height: heading.height + 2 * (Theme.focusOffset + Theme.focusWidth)
+        objectName: "updateHeadingFocusRing"
+        x: body.x + heading.x + headingContent.x + headingContent.visibleChildrenRect.x - Theme.focusOffset - Theme.focusWidth
+        y: body.y + heading.y + headingContent.y + headingContent.visibleChildrenRect.y - Theme.focusOffset - Theme.focusWidth
+        width: headingContent.visibleChildrenRect.width + 2 * (Theme.focusOffset + Theme.focusWidth)
+        height: headingContent.visibleChildrenRect.height + 2 * (Theme.focusOffset + Theme.focusWidth)
         radius: Theme.focusRadius
         color: "transparent"
         border.width: Theme.focusWidth
         border.color: Theme.stateFocusRing
-        visible: heading.activeFocus
+        visible: heading.activeFocus && root.headingKeyboardFocus
     }
     Column {
         id: body
@@ -245,49 +340,72 @@ Rectangle {
             body: root.networkRefusal === "offline" ? qsTr("Проверка и скачивание обновлений недоступны. Диктовка работает без сети.") : qsTr("Сетевые действия ограничены: задано администратором.")
         }
         Item { height: 12; width: 1; visible: root.networkRefusal !== "" }
-        Flow {
+        Item {
             id: heading
             objectName: "updatePanelHeading"
             width: parent.width
-            height: Math.max(implicitHeight, Math.ceil(Theme.badgeHeight))
-            spacing: 9
+            height: Math.max(headingContent.implicitHeight, Math.ceil(Theme.badgeHeight))
             activeFocusOnTab: false
             Accessible.role: Accessible.Heading
             Accessible.name: title.text + " " + releaseVersion.text
             // One-way entry keeps programmatic heading focus out of the reverse Tab chain.
             Keys.onTabPressed: event.accepted = root.focusPanelAction(null, 1)
-            SmallText {
-                id: title
-                objectName: "updatePanelTitle"
-                width: Math.min(implicitWidth, heading.width)
-                font.pixelSize: Theme.fontH3SubsectionSize
-                lineHeight: Math.round(Theme.fontH3SubsectionSize * Theme.fontH3SubsectionLineHeight)
-                font.weight: Font.Medium
-                color: Theme.fg
-                text: root.panelState === "uptodate" ? qsTr("Установлена последняя версия")
-                    : root.panelState === "checking" ? qsTr("Проверяю обновления…")
-                    : root.panelState === "skipped" ? qsTr("Версия")
-                    : root.panelState === "unavailable" ? qsTr("Источник обновлений недоступен")
-                    : root.panelState === "error-net" ? qsTr("Не удалось проверить сведения об обновлении")
-                    : qsTr("Доступна версия")
-            }
-            Selectable {
-                id: releaseVersion
-                objectName: "updateReleaseVersion"
-                width: Math.min(implicitWidth, heading.width)
-                font.pixelSize: Theme.fontH3SubsectionSize
-                text: root.version
-                visible: root.panelState === "available" || root.panelState === "skipped"
-            }
-            SmallText { text: qsTr("пропущена"); visible: root.panelState === "skipped"; font.pixelSize: 16; color: Theme.fg }
-            Rectangle {
-                objectName: "updateNewBadge"
-                visible: root.panelState === "available" && root.downloadPhase === "idle" && root.networkRefusal === ""
-                width: badgeText.implicitWidth + Theme.badgePaddingX * 2
-                height: Math.ceil(Theme.badgeHeight)
-                radius: Theme.badgeRadius
-                color: Theme.primaryBg
-                Text { id: badgeText; anchors.centerIn: parent; text: qsTr("Новая"); textFormat: Text.PlainText; color: Theme.primary; font.family: Theme.fontUi; font.pixelSize: Theme.badgeSize }
+            Flow {
+                id: headingContent
+                objectName: "updateHeadingContent"
+                width: parent.width
+                spacing: 9
+                // childrenRect also contains hidden items; their old Flow positions
+                // must not enlarge the ring after the badge/version disappears.
+                readonly property rect visibleChildrenRect: {
+                    var bounds = childrenRect;
+                    var left = bounds.x + bounds.width;
+                    var top = bounds.y + bounds.height;
+                    var right = bounds.x;
+                    var bottom = bounds.y;
+                    for (var i = 0; i < children.length; i++) {
+                        var child = children[i];
+                        if (!child.visible || child.width <= 0 || child.height <= 0) continue;
+                        left = Math.min(left, child.x);
+                        top = Math.min(top, child.y);
+                        right = Math.max(right, child.x + child.width);
+                        bottom = Math.max(bottom, child.y + child.height);
+                    }
+                    return Qt.rect(left, top, Math.max(0, right - left), Math.max(0, bottom - top));
+                }
+                SmallText {
+                    id: title
+                    objectName: "updatePanelTitle"
+                    width: Math.min(implicitWidth, headingContent.width)
+                    font.pixelSize: Theme.fontH3SubsectionSize
+                    lineHeight: Math.round(Theme.fontH3SubsectionSize * Theme.fontH3SubsectionLineHeight)
+                    font.weight: Font.Medium
+                    color: Theme.fg
+                    text: root.panelState === "uptodate" ? qsTr("Установлена последняя версия")
+                        : root.panelState === "checking" ? qsTr("Проверяю обновления…")
+                        : root.panelState === "skipped" ? qsTr("Версия")
+                        : root.panelState === "unavailable" ? qsTr("Источник обновлений недоступен")
+                        : root.panelState === "error-net" ? qsTr("Не удалось проверить сведения об обновлении")
+                        : qsTr("Доступна версия")
+                }
+                Selectable {
+                    id: releaseVersion
+                    objectName: "updateReleaseVersion"
+                    width: Math.min(implicitWidth, headingContent.width)
+                    font.pixelSize: Theme.fontH3SubsectionSize
+                    text: root.version
+                    visible: root.panelState === "available" || root.panelState === "skipped"
+                }
+                SmallText { text: qsTr("пропущена"); visible: root.panelState === "skipped"; font.pixelSize: 16; color: Theme.fg }
+                Rectangle {
+                    objectName: "updateNewBadge"
+                    visible: root.panelState === "available" && root.downloadPhase === "idle" && root.networkRefusal === ""
+                    width: badgeText.implicitWidth + Theme.badgePaddingX * 2
+                    height: Math.ceil(Theme.badgeHeight)
+                    radius: Theme.badgeRadius
+                    color: Theme.primaryBg
+                    Text { id: badgeText; anchors.centerIn: parent; text: qsTr("Новая"); textFormat: Text.PlainText; color: Theme.primary; font.family: Theme.fontUi; font.pixelSize: Theme.badgeSize }
+                }
             }
         }
         SmallText {
@@ -355,15 +473,13 @@ Rectangle {
             id: operation
             objectName: "updateOperation"
             width: parent.width
-            height: Math.max(root.deb ? 190 : Math.max(120, Math.max(reservedReadyText.implicitHeight, reservedInstallingText.implicitHeight) + 78), operationContent.implicitHeight + 20)
+            height: visible ? Math.max(root.downloadPhase !== "idle" ? 77 : 0, operationContent.implicitHeight + 20) : 0
             radius: 7
             color: root.failed ? Theme.dangerBg : root.ready ? Theme.successBg : Theme.bgSurface2
-            visible: root.operationVisible
-            // Reserve the ready/restart explanation before downloading: actions stay fixed.
-            SmallText { id: reservedReadyText; width: parent.width - 24; text: root.restartNotice; visible: false; Accessible.ignored: true }
-            SmallText { id: reservedInstallingText; width: parent.width - 24; text: root.installingNotice; visible: false; Accessible.ignored: true }
+            visible: root.operationBlockVisible
             Column {
                 id: operationContent
+                objectName: "updateOperationContent"
                 x: 12; y: 10; width: parent.width - 24
                 SmallText {
                     objectName: "updateOperationTitle"
@@ -383,20 +499,16 @@ Rectangle {
                 Item { width: 1; height: 7; visible: instruction.visible }
                 SmallText { id: instruction; width: parent.width; text: qsTr("Администратору: в этой папке выполните"); color: Theme.fgSecondary; visible: root.downloadPhase === "readydeb" && root.adminInstruction !== "" }
                 Selectable { objectName: "updateAdminInstruction"; width: parent.width; text: root.adminInstruction; visible: instruction.visible }
-                Item { width: 1; height: 6 }
-                Item {
-                    width: parent.width; height: 17
-                    SmallText { objectName: "updateDownloadCounter"; width: parent.width; visible: root.downloadPhase === "downloading"; text: root.downloadPercent + " % · " + root.megabytes(root.downloadReceived) + qsTr(" из ") + root.megabytes(root.downloadTotal) }
-                }
-                Item { width: 1; height: 6 }
+                Item { width: 1; height: 8; visible: root.progressVisible }
                 Rectangle {
                     objectName: "updateProgress"
                     width: parent.width; height: 6; radius: 3
-                    color: root.downloadBusy || root.installing ? Theme.border : "transparent"
-                    Accessible.ignored: !root.downloadBusy && !root.installing
+                    visible: root.progressVisible
+                    color: Theme.border
+                    Accessible.ignored: !visible
                     Accessible.role: Accessible.ProgressBar
                     Accessible.name: root.operationTitle + (root.downloadPhase === "downloading" ? " " + root.downloadPercent + " %" : "")
-                    Rectangle { height: parent.height; radius: 3; color: Theme.primary; visible: root.downloadBusy || root.installing; x: root.downloadPhase === "downloading" ? 0 : parent.width * 0.35; width: parent.width * (root.downloadPhase === "downloading" ? Math.max(0, Math.min(100, root.downloadPercent)) / 100 : 0.3) }
+                    Rectangle { height: parent.height; radius: 3; color: Theme.primary; x: root.downloadPhase === "downloading" ? 0 : parent.width * 0.35; width: parent.width * (root.downloadPhase === "downloading" ? Math.max(0, Math.min(100, root.downloadPercent)) / 100 : 0.3) }
                 }
             }
         }
@@ -410,33 +522,30 @@ Rectangle {
             PanelButton {
                 id: primaryButton
                 objectName: "updatePrimary"
-                width: body.width < 364 ? Math.min(body.width, Math.max(264, implicitWidth)) : Math.max(264, implicitWidth)
+                property bool requestInProgress: false
+                width: root.primarySlotWidth
+                implicitWidth: root.primarySlotWidth
+                leftPadding: Math.max(Theme.buttonPaddingX, (width - primaryTextMetrics.width) / 2)
+                rightPadding: leftPadding
                 text: root.primaryText
                 variant: "primary"
                 enabled: root.primaryEnabled
                 onClicked: {
+                    var keyboard = primaryButton.activationKeyboard;
+                    requestInProgress = true;
                     if (root.folderAction) root.openFolderRequested();
                     else if (root.installAction) root.installRequested();
                     else if (root.failed && root.canRetryDownload) root.retryRequested();
                     else root.downloadRequested();
-                    Qt.callLater(function() { if (root.downloadBusy && root.canCancelDownload) cancelButton.forceActiveFocus(Qt.TabFocusReason); });
+                    requestInProgress = false;
+                    Qt.callLater(function() {
+                        if (root.cancellablePhase && root.canCancelDownload && root.focusCanReturn(primaryButton))
+                            cancelButton.forceActiveFocus(keyboard ? Qt.TabFocusReason : Qt.OtherFocusReason);
+                    });
                 }
             }
-            Item {
-                width: Math.max(92, cancelButton.implicitWidth)
-                height: primaryButton.height
-                PanelButton { id: cancelButton; objectName: "updateCancel"; width: parent.width; text: qsTr("Отмена"); visible: root.downloadBusy; enabled: root.canCancelDownload; onClicked: root.cancelRequested() }
-            }
-            PanelButton { id: releaseButton; objectName: "updateReleasePage"; visible: root.releasePageAvailable; enabled: root.networkRefusal === ""; text: qsTr("Страница выпуска"); iconName: "out"; onClicked: root.releasePageRequested() }
-        }
-        Item { width: 1; height: 8; visible: deferrals.visible }
-        Flow {
-            id: deferrals
-            width: parent.width
-            spacing: 8
-            visible: root.operationVisible
             PanelButton { id: skipButton; objectName: "updateSkip"; text: qsTr("Пропустить эту версию"); enabled: root.canSkipVersion && !root.downloadBusy && !root.installing; onClicked: root.skipRequested() }
-            PanelButton { id: remindButton; objectName: "updateRemindLater"; variant: "ghost"; text: qsTr("Напомнить позже"); enabled: root.canRemindLater && !root.downloadBusy && !root.installing; onClicked: root.remindLaterRequested() }
+            PanelButton { id: cancelButton; objectName: "updateCancel"; text: qsTr("Отмена"); visible: root.cancellablePhase; enabled: root.canCancelDownload; onClicked: root.requestCancel(cancelButton.activationKeyboard) }
         }
         Flow {
             width: parent.width
