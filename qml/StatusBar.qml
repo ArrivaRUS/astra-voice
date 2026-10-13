@@ -193,7 +193,7 @@ Item {
                 id: updateItem
                 objectName: "statusUpdate"
                 visible: root.updateText !== ""
-                Layout.preferredWidth: Math.min(updateLabel.implicitWidth + (root.updateIcon !== "" ? 17 : 0), Math.max(0, content.width * 0.72 - 90))
+                Layout.preferredWidth: Math.min(Math.ceil(updateLabel.implicitWidth) + (root.updateIcon !== "" ? 17 : 0), Math.max(0, content.width * 0.72 - 90))
                 Layout.preferredHeight: updateLabel.implicitHeight
                 Layout.alignment: Qt.AlignVCenter
                 activeFocusOnTab: root.updateClickable

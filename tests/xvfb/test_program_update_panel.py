@@ -176,7 +176,7 @@ def assert_primary_slot_fits_track(primary: Any, track: str) -> None:
     metrics = QFontMetricsF(primary.property("font"))
     expected = math.ceil(max(metrics.boundingRect(label).width() for label in labels)) + 24
     assert primary.width() == pytest.approx(expected, abs=1)
-    assert primary.width() >= primary.implicitWidth()
+    assert metrics.horizontalAdvance(primary.property("text")) + 24 <= primary.width()
 
 
 @pytest.mark.parametrize(
@@ -195,8 +195,31 @@ def assert_primary_slot_fits_track(primary: Any, track: str) -> None:
             {"canDownload": False, "downloadRetryText": "Повторить можно через 5 минут."},
             "Повторить можно через 5 минут.",
         ),
+        (
+            {
+                "canDownload": False,
+                "networkRefusal": "offline",
+                "downloadRetryText": "Повторить можно через 5 минут.",
+            },
+            "Чтобы скачать обновление, выключите офлайн-режим в настройках ниже.",
+        ),
+        (
+            {
+                "canDownload": False,
+                "networkRefusal": "policy",
+                "downloadRetryText": "Повторить можно через 5 минут.",
+            },
+            "Ограничение задано администратором.",
+        ),
     ],
-    ids=["no-artifact", "offline", "policy", "cooldown"],
+    ids=[
+        "no-artifact",
+        "offline",
+        "policy",
+        "cooldown",
+        "offline-and-cooldown",
+        "policy-and-cooldown",
+    ],
 )
 def test_unavailable_download_has_compact_explanation(
     app: Any, overrides: dict[str, Any], detail: str
@@ -561,7 +584,8 @@ def test_artificial_font_stress_150_percent(app: Any, dark: bool) -> None:
         primary.forceActiveFocus()
         QTest.qWait(50)
         assert primary.property("text") == "Установить и перезапустить"
-        assert primary.width() >= primary.implicitWidth()
+        metrics = QFontMetricsF(primary.property("font"))
+        assert metrics.horizontalAdvance(primary.property("text")) + 24 <= primary.width()
         assert primary.width() <= panel.width() - 34
         assert primary.height() >= 51
         assert skip.y() >= primary.height() + 8

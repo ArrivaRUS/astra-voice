@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 from PyQt5 import sip
 from PyQt5.QtCore import QObject, QUrl, pyqtProperty, pyqtSignal, pyqtSlot, qInstallMessageHandler
-from PyQt5.QtGui import QImage
+from PyQt5.QtGui import QFontDatabase, QFontInfo, QImage
 from PyQt5.QtQml import QQmlApplicationEngine, QQmlComponent
 from PyQt5.QtQuick import QQuickView, QQuickWindow
 from PyQt5.QtTest import QTest
@@ -254,6 +254,16 @@ def app() -> Any:
     return get_qapplication()
 
 
+@pytest.fixture(scope="module")
+def pt_root_ui_fonts(app: Any) -> None:
+    # Use the actual font so fallback geometry cannot conceal final-glyph clipping.
+    paths = sorted((REPO / "tests/fixtures/fonts/pt-root-ui").glob("*.ttf"))
+    assert paths
+    for path in paths:
+        assert QFontDatabase.addApplicationFont(str(path)) >= 0, path
+    # Keep fonts registered until process exit: Qt text/scene caches retain them.
+
+
 def collect_messages() -> tuple[list[str], Any]:
     messages: list[str] = []
 
@@ -431,6 +441,80 @@ def test_footer_state_snapshot(app: Any, case: str, dark: bool) -> None:
         assert not {text for text in texts if "бновлен" in text}
     assert "v0.2.0" in texts
     save_snapshot(image, f"footer-{case}-{'dark' if dark else 'light'}.png")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"state": "disabled"}, "Проверка обновлений отключена"),
+        ({"state": "policy-locked"}, "Проверка обновлений отключена (задано администратором)"),
+        ({"state": "checking"}, "Проверяю обновления…"),
+        ({"state": "uptodate"}, "Установлена последняя версия"),
+        ({}, "Доступна версия 0.1.4 · Подробнее"),
+        ({"snoozed": True}, "Доступна версия 0.1.4 · Подробнее"),
+        ({"state": "unavailable"}, "Источник обновлений недоступен · Повторить"),
+        ({"state": "error-net"}, "Не удалось скачать обновление · Повторить"),
+        ({"state": "skipped"}, "Версия 0.1.4 пропущена · Показать"),
+        ({"networkRefusal": "offline"}, "Офлайн-режим · Подробнее"),
+        ({"downloadPhase": "metadata"}, "Проверяю сведения об обновлении…"),
+        ({"downloadPhase": "downloading", "downloadPercent": 42}, "Скачиваю обновление · 42 %"),
+        ({"downloadPhase": "verifying"}, "Проверяю обновление…"),
+        ({"downloadPhase": "readydeb"}, "Пакет проверен · Открыть обновления"),
+        ({"downloadPhase": "readyappimage"}, "Обновление готово · Открыть обновления"),
+        ({"downloadPhase": "installing"}, "Устанавливаю обновление…"),
+        ({"downloadPhase": "error"}, "Обновление не выполнено · Подробнее"),
+        ({"downloadPhase": "cancelled"}, "Доступна версия 0.1.4 · Подробнее"),
+    ],
+    ids=[
+        "disabled",
+        "policy-locked",
+        "checking",
+        "uptodate",
+        "available",
+        "snoozed",
+        "unavailable",
+        "error-net",
+        "skipped",
+        "offline",
+        "metadata",
+        "downloading",
+        "verifying",
+        "readydeb",
+        "readyappimage",
+        "installing",
+        "error",
+        "cancelled",
+    ],
+)
+def test_full_window_status_text_is_not_truncated_with_pt_root_ui(
+    app: Any,
+    pt_root_ui_fonts: None,
+    dark: bool,
+    overrides: dict[str, Any],
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updates = FakeUpdates(**{**AVAILABLE, "version": "0.1.4", **overrides})
+    settings = make_settings({})
+    monkeypatch.setattr(sys.modules[__name__], "WIDTH", 1024)
+    monkeypatch.setattr(sys.modules[__name__], "HEIGHT", 620)
+
+    def inspect(window: Any) -> None:
+        assert (window.width(), window.height()) == (1024, 620)
+        label = find_object(window, "statusUpdateText")
+        assert label.isVisible()
+        assert QFontInfo(label.property("font")).family() == "PT Root UI"
+        assert label.property("text") == expected
+        assert label.property("truncated") is False
+        assert updates.calls == []
+
+    try:
+        _, _, messages = render_network(app, dark, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
 
 
 @pytest.fixture

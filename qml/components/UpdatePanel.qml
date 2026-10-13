@@ -108,11 +108,11 @@ Rectangle {
         case "cancelled": return qsTr("Можно скачать эту версию ещё раз.");
         case "downloading": return downloadPercent + " % · " + megabytes(downloadReceived) + qsTr(" из ") + megabytes(downloadTotal);
         default:
-            if (downloadRetryText) return downloadRetryText;
-            if (!canDownload || networkRefusal) return networkRefusal === "offline"
+            if (networkRefusal) return networkRefusal === "offline"
                 ? qsTr("Чтобы скачать обновление, выключите офлайн-режим в настройках ниже.")
-                : networkRefusal ? qsTr("Ограничение задано администратором.")
-                : qsTr("Для этой сборки файл обновления недоступен");
+                : qsTr("Ограничение задано администратором.");
+            if (downloadRetryText) return downloadRetryText;
+            if (!canDownload) return qsTr("Для этой сборки файл обновления недоступен");
             return "";
         }
     }
@@ -217,7 +217,7 @@ Rectangle {
         });
     }
     Keys.onEscapePressed: {
-        if (root.downloadBusy && root.canCancelDownload) { root.requestCancel(root.keyboardFocus()); event.accepted = true; }
+        if (root.downloadBusy && root.canCancelDownload) { root.requestCancel(true); event.accepted = true; }
         else event.accepted = false;
     }
     implicitHeight: body.implicitHeight + (Theme.updatePanelPaddingY + Theme.cardBorder) * 2
@@ -246,7 +246,7 @@ Rectangle {
         Accessible.onPressAction: {
             if (!enabled || !visible) return;
             activationKeyboard = true;
-            forceActiveFocus(Qt.TabFocusReason);
+            if (!activeFocus) forceActiveFocus(Qt.TabFocusReason);
             clicked();
             activationKeyboard = false;
         }
@@ -264,7 +264,6 @@ Rectangle {
                 if (!event.isAutoRepeat && enabled && visible && activeFocus) {
                     spaceArmed = true;
                     activationKeyboard = true;
-                    forceActiveFocus(Qt.TabFocusReason);
                 }
                 event.accepted = false;
             } else if (event.key === Qt.Key_Tab || event.key === Qt.Key_Backtab) {
@@ -276,7 +275,7 @@ Rectangle {
         Keys.onReleased: {
             if (event.key === Qt.Key_Space) {
                 event.accepted = false;
-                Qt.callLater(function() { spaceArmed = false; });
+                Qt.callLater(function() { spaceArmed = false; activationKeyboard = false; });
                 return;
             }
             if (event.key !== Qt.Key_Return && event.key !== Qt.Key_Enter) return;
@@ -288,7 +287,8 @@ Rectangle {
             enterArmed = false;
             if (activate) {
                 activationKeyboard = true;
-                forceActiveFocus(Qt.TabFocusReason);
+                // Qt 5.15 keeps the focus reason when the control already owns
+                // focus. Pass the activation origin to the destination instead.
                 clicked();
                 activationKeyboard = false;
             }
@@ -393,6 +393,7 @@ Rectangle {
                     objectName: "updateReleaseVersion"
                     width: Math.min(implicitWidth, headingContent.width)
                     font.pixelSize: Theme.fontH3SubsectionSize
+                    color: Theme.fg
                     text: root.version
                     visible: root.panelState === "available" || root.panelState === "skipped"
                 }
@@ -404,7 +405,7 @@ Rectangle {
                     height: Math.ceil(Theme.badgeHeight)
                     radius: Theme.badgeRadius
                     color: Theme.primaryBg
-                    Text { id: badgeText; anchors.centerIn: parent; text: qsTr("Новая"); textFormat: Text.PlainText; color: Theme.primary; font.family: Theme.fontUi; font.pixelSize: Theme.badgeSize }
+                    Text { id: badgeText; anchors.centerIn: parent; text: qsTr("Новая"); textFormat: Text.PlainText; color: Theme.primary; font.family: Theme.fontUi; font.pixelSize: Theme.badgeSize; font.weight: Theme.badgeWeight }
                 }
             }
         }
@@ -493,11 +494,12 @@ Rectangle {
                     Accessible.role: root.failed ? Accessible.AlertMessage : Accessible.StaticText
                 }
                 Item { width: 1; height: 4 }
-                SmallText { objectName: "updateOperationBody"; width: parent.width; text: root.operationBody }
+                SmallText { objectName: "updateOperationBody"; width: parent.width; text: root.operationBody; color: root.ready ? Theme.fgSecondary : Theme.fgMuted }
                 Item { width: 1; height: 7; visible: path.visible }
                 Selectable { id: path; objectName: "updateFolderPath"; width: parent.width; text: root.folderPath; visible: root.canOpenFolder && root.folderPath !== "" && (root.deb || root.folderAction) }
                 Item { width: 1; height: 7; visible: instruction.visible }
                 SmallText { id: instruction; width: parent.width; text: qsTr("Администратору: в этой папке выполните"); color: Theme.fgSecondary; visible: root.downloadPhase === "readydeb" && root.adminInstruction !== "" }
+                Item { width: 1; height: 7; visible: instruction.visible }
                 Selectable { objectName: "updateAdminInstruction"; width: parent.width; text: root.adminInstruction; visible: instruction.visible }
                 Item { width: 1; height: 8; visible: root.progressVisible }
                 Rectangle {

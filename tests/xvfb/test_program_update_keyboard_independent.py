@@ -426,6 +426,81 @@ def test_focus_origin_tracks_user_input_during_download(
     render(app, bridge, inspect)
 
 
+@pytest.mark.parametrize(
+    "key", [Qt.Key_Return, Qt.Key_Space, Qt.Key_Escape], ids=["enter", "space", "escape"]
+)
+def test_keyboard_cancel_returns_focus_with_ring_to_primary(app: Any, key: int) -> None:
+    bridge, controller, checker, install, value = real_bridge()
+
+    def inspect(window: Any) -> None:
+        settle(app, window)
+        states.onboarding.click_item(item(window, "updatePrimary"))
+        settle(app, window)
+        assert controller.starts == [value]
+        assert_focus_visible(window, "updateCancel")
+        # Cancellation itself must establish keyboard origin after mouse input.
+        assert item(window, "updateCancel").property("visualFocus") is False
+        QTest.keyClick(window, key)
+        settle(app, window)
+        assert controller.cancels == 1
+        assert bridge.downloadCancelling is True
+        assert bridge.canCancelDownload is False
+        assert bridge.downloadPhase == "metadata"
+        bridge.set_download_status(DownloadStatus(1, "cancelled"))
+        settle(app, window)
+        assert bridge.downloadPhase == "cancelled"
+        assert_focus_visible(window, "updatePrimary")
+        assert item(window, "updatePrimary").property("visualFocus") is True
+        assert item(window, "updateHeadingFocusRing").isVisible() is False
+        install.assert_not_called()
+        checker.remind_later.assert_not_called()
+
+    render(app, bridge, inspect)
+
+
+@pytest.mark.parametrize(
+    "target", ["updatePrimary", "updateCancel"], ids=["same-button", "other-button"]
+)
+def test_mouse_after_space_does_not_keep_keyboard_focus_ring(app: Any, target: str) -> None:
+    bridge, controller, checker, install, value = real_bridge()
+
+    def inspect(window: Any) -> None:
+        settle(app, window)
+        primary = item(window, "updatePrimary")
+        primary.forceActiveFocus(Qt.OtherFocusReason)
+        settle(app, window)
+        QTest.keyClick(window, Qt.Key_Space)
+        settle(app, window)
+        assert controller.starts == [value]
+        assert_focus_visible(window, "updateCancel")
+        assert item(window, "updateCancel").property("visualFocus") is True
+        assert primary.property("activationKeyboard") is False
+        if target == "updatePrimary":
+            # A later operation on the same button must start with mouse origin.
+            bridge.set_download_status(DownloadStatus(1, "cancelled"))
+            settle(app, window)
+            assert_focus_visible(window, "updatePrimary")
+            assert primary.property("visualFocus") is True
+        states.onboarding.click_item(item(window, target))
+        settle(app, window)
+        if target == "updatePrimary":
+            assert controller.starts == [value, value]
+            assert bridge.downloadPhase == "metadata"
+            assert_focus_visible(window, "updateCancel")
+            assert item(window, "updateCancel").property("visualFocus") is False
+        else:
+            assert controller.cancels == 1
+            bridge.set_download_status(DownloadStatus(1, "cancelled"))
+            settle(app, window)
+            assert_focus_visible(window, "updatePrimary")
+            assert primary.property("visualFocus") is False
+        assert item(window, "updateHeadingFocusRing").isVisible() is False
+        install.assert_not_called()
+        checker.remind_later.assert_not_called()
+
+    render(app, bridge, inspect)
+
+
 @pytest.mark.parametrize("departure", ["section", "hide"])
 def test_available_departure_keeps_highlight_without_implicit_reminder(
     app: Any, departure: str
