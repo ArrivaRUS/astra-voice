@@ -56,6 +56,7 @@ ApplicationWindow {
     property bool sectionFadeReady: false
     property bool focusModeOnLoad: false
     property bool focusUpdateOnLoad: false
+    property bool focusUpdateKeyboard: false
 
     function showKeyboardMode() {
         focusModeOnLoad = true
@@ -264,7 +265,7 @@ ApplicationWindow {
                     if (window.focusUpdateOnLoad && window.currentSection.key === "network") {
                         window.focusUpdateOnLoad = false;
                         Qt.callLater(function() {
-                            if (page.item && typeof page.item.focusUpdatePanel === "function") window.revealPageItem(page.item.focusUpdatePanel());
+                            if (page.item && typeof page.item.focusUpdatePanel === "function") window.revealPageItem(page.item.focusUpdatePanel(window.focusUpdateKeyboard));
                         });
                     }
                     if (window.focusModeOnLoad && window.currentSection.key === "general") {
@@ -348,13 +349,14 @@ ApplicationWindow {
         version: "v" + window.appVersion
 
         // §6.2: клик по «Доступна версия» открывает панель «Что нового» в разделе «Сеть».
-        onUpdateActivated: function(kind) {
+        onUpdateActivated: function(kind, keyboard) {
             if (kind === "skipped" && window.updates) window.updates.clearSkip();
             window.focusUpdateOnLoad = true;
+            window.focusUpdateKeyboard = keyboard;
             if (window.sectionIndices.hasOwnProperty("network")) sidebar.currentIndex = window.sectionIndices["network"];
             if (window.currentSection.key === "network" && page.item && typeof page.item.focusUpdatePanel === "function") {
                 window.focusUpdateOnLoad = false;
-                window.revealPageItem(page.item.focusUpdatePanel());
+                window.revealPageItem(page.item.focusUpdatePanel(keyboard));
             }
         }
     }

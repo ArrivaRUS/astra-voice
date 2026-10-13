@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; font-src 'none'">
+<title>Панель обновления 0.1.4</title>
+<!-- Ревизия 0.1.4 (решения владельца 13.10) — см. spec.md «Ревизия 0.1.4». Старый mockup.html не трогаем.
+     Параметры: ?state=available|metadata|downloading|verifying|readyappimage|installing|readydeb|error|cancelled|offline|noartifact
+                &theme=light|dark  &size=1024|900  &ring=1 (клавиатурный фокус на заголовке)  &chrome=0 (без стенда) -->
+<style>
+:root{--ui:'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif;--mono:'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace;
+--bg:#F7F9FC;--surface:#fff;--surface2:#EDF1F7;--border:#D7DEEA;--fg:#0E1729;--secondary:#243350;--muted:#5A6884;--disabled:#616D83;
+--primary:#1B3A73;--primary-fg:#fff;--primary-bg:#E8EDF7;--success:#1F7D50;--success-bg:#E7F5EE;--danger:#C0322F;--danger-bg:#FBECEB;
+--ring:#0A776A;--canvas:#DDE3EE;--sidebar:#EDF1F7}
+body.dark{--bg:#0B1220;--surface:#151E30;--surface2:#080D18;--border:rgba(255,255,255,.1);--fg:#F2F5FA;--secondary:#C4CDDC;--muted:#8C97AC;
+--disabled:#7E889B;--primary:#6C93E8;--primary-fg:#0B1220;--primary-bg:rgba(108,147,232,.12);--success:#4FBF88;--success-bg:rgba(79,191,136,.13);
+--danger:#F0645F;--danger-bg:rgba(240,100,95,.13);--ring:#2FD9C4;--canvas:#05080F;--sidebar:#080D18}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;color:var(--fg);background:var(--canvas);font:14px/1.5 var(--ui)}
+body.bare{padding:0;background:var(--bg)}
+.stand{max-width:1024px;margin:0 auto 12px;font-size:12px;color:var(--muted);display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.stand select,.stand label{font:inherit;color:var(--fg)}
+.stand select{background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:3px}
+body.bare .stand{display:none}
+.window{width:1024px;height:620px;max-width:100%;margin:auto;background:var(--bg);border:1px solid var(--border);border-radius:8px;overflow:hidden;display:flex;flex-direction:column}
+body.bare .window{border:0;border-radius:0}
+.window.minimum{width:900px;height:588px}
+.workspace{display:flex;flex:1;min-height:0}
+aside{width:184px;flex:none;background:var(--sidebar);border-right:1px solid var(--border);padding:12px 10px;color:var(--secondary)}
+.brand{font-size:15px;font-weight:600;padding:4px 6px 14px;color:var(--fg)}
+.nav{height:34px;display:flex;align-items:center;padding:7px 9px;border-radius:7px;font-size:13px}
+.nav.sel{color:var(--primary-fg);background:var(--primary);font-weight:500}
+main{min-width:0;flex:1;display:flex;flex-direction:column}
+.head{width:calc(100% - 44px);max-width:796px;margin:10px auto 0}
+h1{font-size:20px;line-height:1.25;margin:0;font-weight:700}
+.subtitle{font-size:12px;color:var(--muted);margin:4px 0 0}
+.scroll{overflow:auto;flex:1;min-height:0;padding:0 22px 16px;margin-top:12px;scrollbar-width:none}
+.column{max-width:796px;margin:auto}
+/* Панель */
+.panel{background:var(--surface);border:1px solid var(--primary);padding:14px 16px;border-radius:10px;margin-bottom:16px}
+.panel.err{border-color:var(--danger)}.panel.neutral{border-color:var(--border)}
+.heading{display:inline-flex;gap:9px;align-items:center;flex-wrap:wrap;position:relative;max-width:100%}
+.heading.ring::after{content:"";position:absolute;inset:-4px;border:2px solid var(--ring);border-radius:8px;pointer-events:none}
+.heading h2{font-size:16px;line-height:21px;font-weight:500;margin:0}
+.version{font:16px/21px var(--mono)}
+.badge{font-size:11.5px;font-weight:500;color:var(--primary);background:var(--primary-bg);border-radius:5px;padding:0 7px;height:21.3px;line-height:21.3px}
+.meta{font-size:12px;line-height:17px;color:var(--muted);margin:6px 0 0}
+.whatsnew{font-size:13px;font-weight:700;color:var(--secondary);margin:7px 0 6px}
+.notes{font-size:12.5px;line-height:20px;color:var(--secondary);margin:0;padding-left:17px}
+.notes li::marker{font-size:10px}
+/* Блок-статус: высота по содержимому, min 77 после нажатия «Скачать» */
+.op{margin-top:12px;padding:10px 12px;border-radius:7px;background:var(--surface2)}
+.op.min{min-height:77px}
+.op.ok{background:var(--success-bg)}.op.bad{background:var(--danger-bg)}
+.op h3{font-size:13px;line-height:19px;font-weight:500;margin:0;color:var(--secondary)}
+.op.ok h3{color:var(--success)}.op.bad h3{color:var(--danger)}
+.detail{font-size:12px;line-height:17px;color:var(--muted);margin:4px 0 0;font-variant-numeric:tabular-nums}
+.op.ok .detail{color:var(--secondary)}
+.bar{height:6px;margin-top:8px;border-radius:3px;background:var(--border);overflow:hidden}
+.bar span{display:block;height:100%;background:var(--primary);border-radius:3px;width:42%}
+.bar.ind span{width:30%;margin-left:35%}
+.path{font:12px/16px var(--mono);color:var(--secondary);margin-top:7px;overflow-wrap:anywhere}
+.admin{font-size:12px;line-height:17px;color:var(--secondary);margin-top:7px}
+/* Ряд кнопок */
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+button{font:500 13px/1 var(--ui);height:33.5px;padding:0 12px;border-radius:7px;border:1px solid var(--border);background:var(--surface);color:var(--fg);white-space:nowrap}
+button.primary{background:var(--primary);border-color:var(--primary);color:var(--primary-fg);text-align:center}
+button:disabled{background:var(--surface2);color:var(--disabled);border-color:var(--border)}
+.slot1{min-width:var(--slot1)}
+/* Ниже панели — для контекста */
+.grouptitle{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 2px 8px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px}
+.row{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border)}
+.row:last-child{border-bottom:0}
+.row b{font-weight:400;font-size:14px;display:block}.row small{font-size:12px;color:var(--muted)}
+.toggle{width:38px;height:22px;border-radius:11px;background:var(--disabled);opacity:.55;flex:none}
+footer{height:36px;flex:none;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 14px;font-size:13px;color:var(--muted)}
+footer .upd{color:var(--primary);font-weight:500}
+</style>
+</head>
+<body>
+<div class="stand">
+  <b>Стенд макета 0.1.4</b>
+  <label>Фаза <select id="s-state"></select></label>
+  <label>Тема <select id="s-theme"><option>light</option><option>dark</option></select></label>
+  <label>Окно <select id="s-size"><option>1024</option><option>900</option></select></label>
+  <label><input type="checkbox" id="s-ring"> клавиатурный фокус на заголовке</label>
+</div>
+<div class="window" id="win">
+  <div class="workspace">
+    <aside>
+      <div class="brand">Astra Voice</div>
+      <div class="nav">Общие</div><div class="nav">Модели</div><div class="nav">Вывод</div>
+      <div class="nav sel">Сеть и обновления</div><div class="nav">Продвинутые</div><div class="nav">О программе</div>
+    </aside>
+    <main>
+      <div class="head"><h1>Сеть и обновления</h1><p class="subtitle">Сетевые проверки и обновления программы</p></div>
+      <div class="scroll"><div class="column">
+        <section class="panel" id="panel"></section>
+        <p class="grouptitle">Сетевые проверки</p>
+        <div class="card">
+          <div class="row"><div><b>Проверять обновления утилиты</b><small>Раз в сутки. Скачивание — по вашему нажатию.</small></div><span class="toggle"></span></div>
+          <div class="row"><div><b>Офлайн-режим</b><small>Полностью запрещает сетевые запросы. Установка модели из файла останется.</small></div><span class="toggle"></span></div>
+        </div>
+      </div></div>
+    </main>
+  </div>
+  <footer><span>GigaAM v3 RNN-T</span><span><span class="upd" id="foot">Доступна версия 0.1.4 · Подробнее</span> &nbsp;•&nbsp; v0.1.3</span></footer>
+</div>
+<script>
+const STATES = ["available","metadata","downloading","verifying","readyappimage","installing","readydeb","error","cancelled","offline","noartifact"];
+const q = new URLSearchParams(location.search);
+const opt = {state:q.get("state")||"available", theme:q.get("theme")||"light", size:q.get("size")||"1024", ring:q.get("ring")==="1"};
+if (q.get("chrome")==="0") document.body.classList.add("bare");
+const sel = document.getElementById("s-state");
+STATES.forEach(s=>{const o=document.createElement("option");o.textContent=s;sel.appendChild(o);});
+function el(tag, cls, text){const e=document.createElement(tag); if(cls) e.className=cls; if(text!==undefined) e.textContent=text; return e;}
+// Слот 1 = самая длинная подпись трека + 2×12 (в QML — TextMetrics), подпись по центру.
+function slotWidth(labels){const c=document.createElement("canvas").getContext("2d");c.font="500 13px "+getComputedStyle(document.body).getPropertyValue("--ui");return Math.ceil(Math.max(...labels.map(t=>c.measureText(t).width))+24+2);}
+const APP_LABELS=["Скачать новую версию","Установить и перезапустить","Открыть папку","Повторить скачивание","Повторить установку"];
+const DEB_LABELS=["Скачать пакет","Открыть папку","Повторить скачивание"];
+const RESTART="Программа закроется и откроется уже новой версией. Модели и настройки сохранятся. Если она не откроется, запустите Astra Voice из меню.";
+function render(){
+  document.body.classList.toggle("dark", opt.theme==="dark");
+  document.getElementById("win").classList.toggle("minimum", opt.size==="900");
+  sel.value=opt.state; document.getElementById("s-theme").value=opt.theme; document.getElementById("s-size").value=opt.size; document.getElementById("s-ring").checked=opt.ring;
+  const s=opt.state, deb=s==="readydeb";
+  const p=document.getElementById("panel"); p.replaceChildren(); p.className="panel"+(s==="error"?" err":(s==="offline"?" neutral":""));
+  const h=el("div","heading"+(opt.ring?" ring":"")); h.append(el("h2",null,"Доступна версия"), el("span","version","0.1.4"));
+  if (["available","noartifact"].includes(s)) h.append(el("span","badge","Новая"));
+  p.append(h);
+  p.append(el("p","meta",(deb?".deb · 61 МБ":"AppImage · 75 МБ")+" · размер из проверенных сведений"+(s==="offline"?" · сохранённые сведения о версии":"")));
+  p.append(el("p","whatsnew","Что нового"));
+  const ul=el("ul","notes");
+  ["Обновление программы прямо из неё: проверка, скачивание и установка в два нажатия","Улучшения интерфейса"].forEach(t=>ul.append(el("li",null,t)));
+  p.append(ul);
+  // Блок-статус
+  const OP={
+    metadata:["Проверяю сведения перед скачиванием…","Размер подтверждён подписью. Повторно проверяю сведения о файле.","ind"],
+    downloading:["Скачиваю обновление…","42 % · 32 МБ из 75 МБ","det"],
+    verifying:["Проверяю подпись и целостность…","Файл скачан. Пока проверка не закончена, использовать его нельзя.","ind"],
+    readyappimage:["Новая версия готова. Подпись и целостность проверены.",RESTART,null,"ok"],
+    installing:["Устанавливаю новую версию…","Программа закроется для запуска новой версии. Если она не откроется, запустите Astra Voice из меню. Ошибка после закрытия будет показана при следующем запуске.","ind"],
+    readydeb:["Пакет готов. Подпись и целостность проверены.","Установку выполняет администратор. Передайте ему пакет и файлы проверки из этой папки.",null,"ok"],
+    error:["Не удалось скачать обновление","Проверьте соединение и повторите скачивание.",null,"bad"],
+    cancelled:["Скачивание отменено. Обновление не установлено.","Можно скачать эту версию ещё раз."],
+    offline:["Скачивание недоступно","Чтобы скачать обновление, выключите офлайн-режим в настройках ниже."],
+    noartifact:["Скачивание недоступно","Для этой сборки файл обновления недоступен."]
+  }[s];
+  if (OP){
+    const afterClick=!["offline","noartifact"].includes(s);
+    const op=el("div","op"+(afterClick?" min":"")+(OP[3]?" "+OP[3]:""));
+    op.append(el("h3",null,OP[0]), el("p","detail",OP[1]));
+    if (OP[2]){const b=el("div","bar"+(OP[2]==="ind"?" ind":""));b.append(el("span"));op.append(b);}
+    if (deb){op.append(el("div","path","/home/user/.cache/astra-voice/updates/0.1.4/"));op.append(el("div","admin","Администратору: в этой папке выполните"));op.append(el("div","path","sudo apt install ./astra-voice_0.1.4_amd64.deb"));}
+    p.append(op);
+  }
+  // Ряд кнопок
+  const busy=["metadata","downloading","verifying"].includes(s);
+  const labels=deb?DEB_LABELS:APP_LABELS; p.style.setProperty("--slot1", slotWidth(labels)+"px");
+  const primaryText={readyappimage:"Установить и перезапустить",installing:"Установить и перезапустить",readydeb:"Открыть папку",error:"Повторить скачивание"}[s]||"Скачать новую версию";
+  const row=el("div","actions");
+  const b1=el("button","primary slot1",primaryText); b1.disabled=busy||s==="installing"||s==="offline"||s==="noartifact";
+  const b2=el("button",null,"Пропустить эту версию"); b2.disabled=busy||s==="installing";
+  row.append(b1,b2);
+  if (busy) row.append(el("button",null,"Отмена"));
+  p.append(row);
+  const foot=document.getElementById("foot");
+  foot.textContent={metadata:"Проверяю сведения об обновлении…",downloading:"Скачиваю обновление · 42 %",verifying:"Проверяю обновление…",readyappimage:"Обновление готово · Открыть обновления",readydeb:"Пакет проверен · Открыть обновления",installing:"Устанавливаю обновление…",error:"Обновление не выполнено · Подробнее",offline:"Офлайн-режим · Подробнее"}[s]||"Доступна версия 0.1.4 · Подробнее";
+}
+sel.onchange=e=>{opt.state=e.target.value;render();};
+document.getElementById("s-theme").onchange=e=>{opt.theme=e.target.value;render();};
+document.getElementById("s-size").onchange=e=>{opt.size=e.target.value;render();};
+document.getElementById("s-ring").onchange=e=>{opt.ring=e.target.checked;render();};
+render();
+</script>
+</body>
+</html>

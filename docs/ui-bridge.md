@@ -467,10 +467,10 @@ IPC v3; схема — `arch/s5a5-mic-change.md` §4). Воркер к этом�
 | `version` | `string` | только чтение | Найденная (или пропущенная) версия без префикса `v`; иначе пусто | `statusChanged` |
 | `notes` | `QVariantList` | только чтение | «Что нового» из выпуска — строки `{text, bullet}`, **недоверенный простой текст**: пункт markdown-списка (`- `/`* `/`+ `) → `bullet: true` без маркера (маркер с висячим отступом рисует QML), заголовок `# ` — строка без решёток, «Что нового» пропускается, «#123 …» остаётся как есть; всего не больше 2000 символов, дальше «…». QML рисует каждую строку только `Text.PlainText` | `statusChanged` |
 | `currentVersion` | `string` | только чтение, неизменно | Установленная версия программы — для «Установлена версия 0.2.0.» в панели | — |
-| `snoozed` | `bool` | только чтение | «Напомнить позже» действует: `available` без акцента | `statusChanged` |
+| `snoozed` | `bool` | только чтение | Срок «Напомнить позже» не истёк: `available` без акцента. В 0.1.4 кнопки нет; отметку мог оставить 0.1.3 в `update-state.json` (срок — сутки). Читает только `Main.qml` → `StatusBar.updateSnoozed` | `statusChanged` |
 | `manual` | `bool` | только чтение | Снимок — итог ручной проверки | `statusChanged` |
 | `checkedText` | `string` | только чтение | «Проверено сегодня в 14:02» по дате последней удачной проверки; нет даты — пусто | `statusChanged` |
-| `releasePageAvailable` | `bool` | только чтение | Есть чем и что открыть: адрес выпуска с префиксом наших выпусков и переданный `open_external` | `statusChanged` |
+| `releasePageAvailable` | `bool` | только чтение | Есть чем и что открыть: адрес выпуска с префиксом наших выпусков, переданный `open_external` и нет сетевого отказа. **QML 0.1.4 его не читает** — кнопки «Страница выпуска» в панели нет | `statusChanged` |
 | `checkRefusal` | `string` | только чтение | Отказ гейта для ручной проверки: пусто, `offline`, `admin`, `policy` | `networkChanged` |
 | `networkRefusal` | `string` | только чтение | Отказ гейта для скачивания — общий признак «сеть закрыта»: пусто, `offline` (офлайн-режим или окружение), `admin` | `networkChanged` |
 | `restState` | `string` | только чтение | Что строка показывает, когда 3000 мс «Установлена последняя версия» истекли: `idle` (фоновая проверка включена) или `disabled` (тумблер выключен, офлайн или нет проверки) | `networkChanged` |
@@ -478,8 +478,12 @@ IPC v3; схема — `arch/s5a5-mic-change.md` §4). Воркер к этом�
 | `checkNow()` | слот | — | Ручная проверка; при отказе гейта ничего не делает | — |
 | `skipVersion()` | слот | — | «Пропустить эту версию» для текущей `version` | — |
 | `clearSkip()` | слот | — | «Показать» у пропущенной версии | — |
-| `remindLater()` | слот | — | «Напомнить позже» — сутки без акцента | — |
-| `openReleasePage()` | слот | — | Открывает страницу выпуска через переданный `open_external`; адрес в QML не попадает. `app.py` передаёт `platform.external.open_external`; без переданного opener кнопка скрыта | — |
+| `remindLater()` | слот | — | «Напомнить позже» — сутки без акцента; во время загрузки ничего не делает. **Из QML 0.1.4 не вызывается**: кнопки нет, уход из панели отметку не ставит (тест `test_available_departure_keeps_highlight_without_implicit_reminder`) | — |
+| `openReleasePage()` | слот | — | Перечитывает сетевой отказ и открывает страницу выпуска через переданный `open_external` только по адресу с префиксом `https://github.com/ArrivaRUS/astra-voice/releases/`; адрес в QML не попадает. **Из QML 0.1.4 не вызывается**: кнопки «Страница выпуска» нет, внешних переходов из панели нет | — |
+
+Слоты `remindLater()` и `openReleasePage()` и свойства `releasePageAvailable`, `canRemindLater`
+оставлены в мосте со своими проверками; вызвать их может только QML, загруженный самим приложением.
+Удалить их или оставить для меню значка — открытый вопрос беклога. Трей и Python их не вызывают.
 
 Методы для Python: `set_status(status)` — только из GUI-потока; `refresh()` —
 пересчитать `checkRefusal`/`networkRefusal` и вызвать `checker.refresh()`.
@@ -510,13 +514,17 @@ IPC v3; схема — `arch/s5a5-mic-change.md` §4). Воркер к этом�
 | `downloadBusy`, `downloadCancelling` | bool | Операция выполняется / ожидается подтверждение отмены |
 | `canDownload`, `canRetryDownload`, `canCancelDownload` | bool | Допуски сетевых действий |
 | `canOpenFolder`, `canInstallAndRestart` | bool | Локальные действия с готовым, неизменённым файлом; офлайн сам по себе их не запрещает |
-| `canSkipVersion`, `canRemindLater` | bool | Действия с выпуском недоступны во время операции |
+| `canSkipVersion`, `canRemindLater` | bool | Действия с выпуском недоступны во время операции. `canRemindLater` QML 0.1.4 не читает |
 | `downloadError`, `downloadErrorText`, `downloadRetryText` | string | Закрытый код, безопасное пояснение и срок повторной попытки; `downloadRetryAt` — float, 0 если срока нет |
 | `folderPath`, `adminInstruction` | string | Проверенная папка и текстовая инструкция для администратора; QML не исполняет команду |
 | `installRefusal`, `installRefusalText` | string | Причина недоступности установки: `admin`, `appimage-denied`, `busy`, `unsupported`, `policy` либо пусто |
 
 Слоты: `download()`, `cancelDownload()`, `retryDownload()`, `openFolder()`,
-`installAndRestart()`, `refreshCapabilities()`. Публичные слоты не принимают
+`installAndRestart()`, `refreshCapabilities()` — все вызывает `sections/Network.qml` (через
+`updateCall`); кнопки панели (`components/UpdatePanel.qml`): «Скачать новую версию» / «Скачать
+пакет», «Пропустить эту версию», «Отмена» (только на время скачивания и проверки файла), «Повторить скачивание»,
+«Открыть папку», «Установить и перезапустить», «Повторить установку», «Проверить ещё раз» / «Повторить проверку»,
+«Показать <версия>». `downloadRetryAt` и `artifactSize` QML 0.1.4 не читает. Публичные слоты не принимают
 пути, URL или команды из QML. Повтор установки разрешён только при явном
 `canInstallAndRestart`; для остальных ошибок применяется допуск скачивания.
 

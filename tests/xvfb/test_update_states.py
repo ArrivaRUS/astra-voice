@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 from PyQt5 import sip
 from PyQt5.QtCore import QObject, QUrl, pyqtProperty, pyqtSignal, pyqtSlot, qInstallMessageHandler
-from PyQt5.QtGui import QImage
+from PyQt5.QtGui import QFont, QFontDatabase, QFontInfo, QImage
 from PyQt5.QtQml import QQmlApplicationEngine, QQmlComponent
 from PyQt5.QtQuick import QQuickView, QQuickWindow
 from PyQt5.QtTest import QTest
@@ -254,6 +254,18 @@ def app() -> Any:
     return get_qapplication()
 
 
+@pytest.fixture(scope="module")
+def pt_root_ui_fonts(app: Any) -> None:
+    # Use the actual font so fallback geometry cannot conceal final-glyph clipping.
+    paths = sorted((REPO / "tests/fixtures/fonts/pt-root-ui").glob("*.ttf"))
+    assert paths
+    for path in paths:
+        assert QFontDatabase.addApplicationFont(str(path)) >= 0, path
+    # Registration is process-global and intentionally lasts until process exit.
+    # removeApplicationFont causes SIGSEGV in subsequent renders: Qt text/scene
+    # caches retain these fonts even after the QML engines have been destroyed.
+
+
 def collect_messages() -> tuple[list[str], Any]:
     messages: list[str] = []
 
@@ -307,7 +319,12 @@ def add_background(engine: Any, window: Any) -> Any:
     return component, background
 
 
-def render_footer(app: Any, dark: bool, values: dict[str, Any]) -> tuple[QImage, Any, list[str]]:
+def render_footer(
+    app: Any,
+    dark: bool,
+    values: dict[str, Any],
+    inspect: Callable[[Any], None] | None = None,
+) -> tuple[QImage, Any, list[str]]:
     messages, previous = collect_messages()
     view = QQuickView()
     install_icon_provider(view.engine())
@@ -328,6 +345,8 @@ def render_footer(app: Any, dark: bool, values: dict[str, Any]) -> tuple[QImage,
         QTest.qWait(120)
         app.processEvents()
         image = grab(app, view, FOOTER_W, FOOTER_H)
+        if inspect is not None:
+            inspect(view)
         texts = {
             item.property("text")
             for item in onboarding.visual_tree(bar)
@@ -433,6 +452,128 @@ def test_footer_state_snapshot(app: Any, case: str, dark: bool) -> None:
     save_snapshot(image, f"footer-{case}-{'dark' if dark else 'light'}.png")
 
 
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"state": "disabled"}, "Проверка обновлений отключена"),
+        ({"state": "policy-locked"}, "Проверка обновлений отключена (задано администратором)"),
+        ({"state": "checking"}, "Проверяю обновления…"),
+        ({"state": "uptodate"}, "Установлена последняя версия"),
+        ({}, "Доступна версия 0.1.4 · Подробнее"),
+        ({"snoozed": True}, "Доступна версия 0.1.4 · Подробнее"),
+        ({"state": "unavailable"}, "Источник обновлений недоступен · Повторить"),
+        ({"state": "error-net"}, "Не удалось скачать обновление · Повторить"),
+        ({"state": "skipped"}, "Версия 0.1.4 пропущена · Показать"),
+        ({"networkRefusal": "offline"}, "Офлайн-режим · Подробнее"),
+        ({"downloadPhase": "metadata"}, "Проверяю сведения об обновлении…"),
+        ({"downloadPhase": "downloading", "downloadPercent": 42}, "Скачиваю обновление · 42 %"),
+        ({"downloadPhase": "verifying"}, "Проверяю обновление…"),
+        ({"downloadPhase": "readydeb"}, "Пакет проверен · Открыть обновления"),
+        ({"downloadPhase": "readyappimage"}, "Обновление готово · Открыть обновления"),
+        ({"downloadPhase": "installing"}, "Устанавливаю обновление…"),
+        ({"downloadPhase": "error"}, "Обновление не выполнено · Подробнее"),
+        ({"downloadPhase": "cancelled"}, "Доступна версия 0.1.4 · Подробнее"),
+    ],
+    ids=[
+        "disabled",
+        "policy-locked",
+        "checking",
+        "uptodate",
+        "available",
+        "snoozed",
+        "unavailable",
+        "error-net",
+        "skipped",
+        "offline",
+        "metadata",
+        "downloading",
+        "verifying",
+        "readydeb",
+        "readyappimage",
+        "installing",
+        "error",
+        "cancelled",
+    ],
+)
+def test_full_window_status_text_is_not_truncated_with_pt_root_ui(
+    app: Any,
+    pt_root_ui_fonts: None,
+    dark: bool,
+    overrides: dict[str, Any],
+    expected: str,
+) -> None:
+    updates = FakeUpdates(**{**AVAILABLE, "version": "0.1.4", **overrides})
+    settings = make_settings({})
+
+    def inspect(window: Any) -> None:
+        assert (window.width(), window.height()) == (1024, 620)
+        label = find_object(window, "statusUpdateText")
+        assert label.isVisible()
+        assert QFontInfo(label.property("font")).family() == "PT Root UI"
+        assert label.property("text") == expected
+        assert label.property("truncated") is False
+        assert updates.calls == []
+
+    try:
+        _, _, messages = render_network(app, dark, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_narrow_footer_elides_real_policy_message_with_pt_root_ui(
+    app: Any,
+    pt_root_ui_fonts: None,
+    dark: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Main.qml has a 900 px minimum; render its footer independently at 640 px.
+    monkeypatch.setattr(sys.modules[__name__], "FOOTER_W", 640)
+
+    def inspect(window: Any) -> None:
+        assert window.width() == 640
+        label = find_object(window, "statusUpdateText")
+        update = find_object(window, "statusUpdate")
+        content = update.parentItem().parentItem()
+        assert label.isVisible()
+        assert QFontInfo(label.property("font")).family() == "PT Root UI"
+        assert label.property("text") == ("Проверка обновлений отключена (задано администратором)")
+        assert label.property("truncated") is True
+        assert update.width() <= max(0, content.width() * 0.72 - 90) + 1
+
+    _, _, messages = render_footer(app, dark, {"updateState": "policy-locked"}, inspect)
+    assert not messages, "\n".join(messages)
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_available_badge_uses_real_medium_font_with_pt_root_ui(
+    app: Any, pt_root_ui_fonts: None, dark: bool
+) -> None:
+    updates = FakeUpdates(**AVAILABLE)
+    settings = make_settings({})
+
+    def inspect(window: Any) -> None:
+        badge = find_object(window, "updateNewBadgeText")
+        assert badge.isVisible()
+        assert badge.property("text") == "Новая"
+        font = badge.property("font")
+        info = QFontInfo(font)
+        assert info.family() == "PT Root UI"
+        assert font.weight() == QFont.Medium
+        assert info.styleName() == "Medium" or info.weight() == 57
+        assert updates.calls == []
+
+    try:
+        _, _, messages = render_network(app, dark, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+
+
 @pytest.fixture
 def status_bar(app: Any) -> Iterator[Any]:
     engine = QQmlApplicationEngine()
@@ -524,7 +665,8 @@ def test_network_section_snapshot(app: Any, case: str, dark: bool) -> None:
     if panel_title is not None:
         assert panel_title in texts
     if case == "panel-available":
-        assert {"Что нового", *NOTE_LINES, "Страница выпуска", "Пропустить эту версию"} <= texts
+        assert {"Что нового", *NOTE_LINES, "Скачать новую версию", "Пропустить эту версию"} <= texts
+        assert not {"Страница выпуска", "Напомнить позже"} & texts
     if case == "panel-uptodate":
         assert {"Версия ", "0.2.0"} <= texts
     if case == "network-offline":
@@ -554,25 +696,35 @@ def test_panel_buttons_call_bridge(app: Any) -> None:
         assert all(line.property("textFormat") == 0 for line in lines)  # Text.PlainText
         # Висячий отступ: текст пункта начинается с x = 17 и переносится там же.
         assert all(line.property("x") == 17 for line in lines)
-        for name in ("updateReleasePage", "updateSkip", "updateRemindLater"):
+        for name in ("updatePrimary", "updateSkip"):
             onboarding.click_item(find_object(window, name))
             app.processEvents()
 
     try:
         render_network(app, False, updates, settings, inspect)
-        assert updates.calls == ["openReleasePage", "skipVersion", "remindLater"]
+        assert updates.calls == ["download", "skipVersion"]
     finally:
         sip.delete(updates)
         sip.delete(settings)
 
 
-def test_release_page_button_hidden_without_opener(app: Any) -> None:
-    updates = FakeUpdates(**{**AVAILABLE, "releasePageAvailable": False})
+@pytest.mark.parametrize("release_available", [False, True])
+def test_removed_panel_actions_absent_even_with_backend_capability(
+    app: Any, release_available: bool
+) -> None:
+    updates = FakeUpdates(**{**AVAILABLE, "releasePageAvailable": release_available})
     settings = make_settings({})
     try:
-        _, texts, _ = render_network(app, False, updates, settings)
-        assert "Страница выпуска" not in texts
+
+        def inspect(window: Any) -> None:
+            names = {item.objectName() for item in onboarding.visual_tree(window.contentItem())}
+            assert not {"updateReleasePage", "updateRemindLater"} & names
+
+        _, texts, messages = render_network(app, False, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+        assert not {"Страница выпуска", "Напомнить позже"} & texts
         assert "Пропустить эту версию" in texts
+        assert updates.calls == []
     finally:
         sip.delete(updates)
         sip.delete(settings)
