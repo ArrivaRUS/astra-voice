@@ -82,7 +82,9 @@ def native_device(info: ps._PaSourceInfo) -> audio.AudioDevice:
 @pytest.mark.parametrize("monitor", [False, True])
 @pytest.mark.parametrize("available,expected", [(0, "unknown"), (1, "no"), (2, "yes")])
 @pytest.mark.parametrize("state", [-1, 0, 1, 2])
-def test_native_metadata(monitor: bool, available: int, expected: str, state: int) -> None:
+def test_native_metadata(
+    monitor: bool, available: int, expected: str, state: int, caplog: pytest.LogCaptureFixture
+) -> None:
     port = ps._PaSourcePortInfo(b"mic", b"Microphone", 100, available)
     info = ps._PaSourceInfo(b"custom-name", 42, b"Readable device")
     info.monitor_of_sink = 7 if monitor else ps.PA_INVALID_INDEX
@@ -91,6 +93,7 @@ def test_native_metadata(monitor: bool, available: int, expected: str, state: in
     info.active_port = ctypes.pointer(port)
     device = native_device(info)
     assert (device.monitor, device.available, device.state) == (monitor, expected, state)
+    assert not caplog.records
 
 
 def test_native_null_active_port_is_unknown() -> None:

@@ -84,6 +84,7 @@ def open_selector(view: QQuickView, max_width: float) -> tuple[QQuickItem, QObje
     root = render(view, SELECT)
     selector = root.findChild(QObject, "selector")
     assert selector is not None
+    selector.forceActiveFocus(Qt.TabFocusReason)
     QMetaObject.invokeMethod(selector, "openPopup")
     QTest.qWait(100)
     # Корень возвращаем вместе с элементом: без ссылки Python удалит дерево QML.
@@ -133,3 +134,22 @@ def test_plain_option_click_preserves_native_index_and_activation(popup_view: QQ
     assert selector.property("currentIndex") == 2
     assert selector.property("currentText") == LONG_NAMES[2]
     assert activations == [2]
+
+
+def test_plain_option_hover_then_enter_selects_hovered_item(popup_view: QQuickView) -> None:
+    _root, selector = open_selector(popup_view, 700)
+    query = QQmlExpression(
+        QQmlEngine.contextForObject(selector), selector, "popup.contentItem.itemAtIndex(1)"
+    )
+    option, _undefined = query.evaluate()
+    assert not query.hasError(), query.error().toString()
+    activations: list[int] = []
+    selector.activated.connect(activations.append)
+    position = option.mapToScene(QPointF(option.width() / 2, option.height() / 2))
+    QTest.mouseMove(popup_view, pos=position.toPoint())
+    QTest.qWait(30)
+    assert selector.property("highlightedIndex") == 1
+    QTest.keyClick(popup_view, Qt.Key_Return)
+    assert selector.property("currentIndex") == 1
+    assert selector.property("currentText") == LONG_NAMES[1]
+    assert activations == [1]

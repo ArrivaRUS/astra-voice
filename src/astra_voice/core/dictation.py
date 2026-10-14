@@ -1017,8 +1017,10 @@ class DictationOrchestrator:
         if name == previous_name:
             return
         self._announced_selected_device = name
+        mics = event.get("mics")
         if self._on_device_selected is not None and (
-            previous_name is not None or self.microphone_count() >= 2
+            previous_name is not None
+            or (mics if type(mics) is int else self.microphone_count()) >= 2
         ):
             self._on_device_selected(name)
 

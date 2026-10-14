@@ -545,13 +545,32 @@ def test_legacy_locked_update_preferences_are_not_enabled(
 def test_device_label_is_optional_without_schema_or_migration_change() -> None:
     legacy = st.from_dict({"schema_version": 2, "device": "legacy-mic"})
     assert legacy.device_label is None and legacy.extra["device"] == "legacy-mic"
-    labelled = st.from_dict({"schema_version": 2, "device": "usb", "device_label": "USB-гарнитура"})
+    assert legacy.device_label_id is None
+    labelled = st.from_dict(
+        {
+            "schema_version": 2,
+            "device": "usb",
+            "device_label": "USB-гарнитура",
+            "device_label_id": "usb",
+        }
+    )
     assert labelled.device_label == "USB-гарнитура"
+    assert labelled.device_label_id == "usb"
     assert labelled.to_dict()["device_label"] == "USB-гарнитура"
+    assert labelled.to_dict()["device_label_id"] == "usb"
     assert labelled.to_dict()["schema_version"] == st.SCHEMA_VERSION == 2
     assert st.from_dict(labelled.to_dict()).to_dict() == labelled.to_dict()
 
 
 @pytest.mark.parametrize("value", [False, 1, [], {}])
-def test_device_label_rejects_non_string(value: object) -> None:
-    assert st.from_dict({"device_label": value}).device_label is None
+@pytest.mark.parametrize("field", ["device_label", "device_label_id"])
+def test_device_label_rejects_non_string(value: object, field: str) -> None:
+    assert getattr(st.from_dict({field: value}), field) is None
+
+
+def test_device_label_and_id_roundtrip_through_file(path: Path) -> None:
+    settings = st.Settings(device_label="USB", device_label_id="usb", extra={"device": "usb"})
+    st.save(settings, path)
+    loaded = st.load(path)
+    assert loaded.device_label == "USB" and loaded.device_label_id == "usb"
+    assert loaded.extra["device"] == "usb"

@@ -77,7 +77,9 @@ Column {
     readonly property bool deviceMissing: selectedDevice && selectedDevice.id !== ""
         && selectedDevice.available === "no"
     readonly property string deviceSubtitle: deviceMissing
-        ? qsTr("Подключите его или выберите другой микрофон")
+        ? selectedDevice.missing === true
+            ? qsTr("Подключите его или выберите другой микрофон. Пока у него нет подключения, диктовка не начнётся: «Микрофон отключился».")
+            : qsTr("Подключите его или выберите другой микрофон")
         : selectedDevice && selectedDevice.id === "" ? selectedDevice.subtitle || "" : ""
 
     function deviceIndex(deviceId) {

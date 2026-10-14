@@ -47,6 +47,15 @@ ComboBox {
         font.weight: Font.Medium
     }
 
+    FontMetrics {
+        id: groupMetrics
+        font.family: Theme.fontUi
+        font.pixelSize: Theme.fontGroupCapsSize
+        font.weight: Font.Medium
+        font.capitalization: Font.AllUppercase
+        font.letterSpacing: Theme.fontGroupCapsTracking * Theme.fontGroupCapsSize
+    }
+
     function measureItems() {
         var widest = 0
         for (var i = 0; i < control.count; ++i) {
@@ -55,7 +64,7 @@ ComboBox {
             if (item && item.subtitle)
                 widest = Math.max(widest, itemMetrics.advanceWidth(item.subtitle))
             if (item && item.group)
-                widest = Math.max(widest, itemMetrics.advanceWidth(item.group))
+                widest = Math.max(widest, groupMetrics.advanceWidth(item.group.toUpperCase()))
         }
         return Math.ceil(widest + Theme.popoverItemPaddingX * 2 + Theme.popoverPadding * 2
                          + Theme.scrollbarW)
@@ -129,13 +138,15 @@ ComboBox {
         }
     }
 
-    // The heading is a sibling of the clickable option, outside its hit area.
-    // The delegate model still contains devices only, so keyboard indices stay native.
-    delegate: Item {
+    // ComboBox tracks hovering/activation on the root ItemDelegate.
+    // Headings remain outside the device model and consume their pointer events.
+    delegate: ItemDelegate {
         id: row
+        objectName: "selectOption"
         required property int index
         required property string modelData
 
+        readonly property int deviceIndex: index
         readonly property var details: control.detailsAt(index)
         readonly property bool groupStart: details && details.group
             && (index === 0 || !control.detailsAt(index - 1)
@@ -145,12 +156,20 @@ ComboBox {
         readonly property real groupHeight: groupStart ? Theme.popoverItemH : 0
         width: control.popup.width - Theme.popoverPadding * 2
         height: groupHeight + Theme.popoverItemH + subtitleHeight
+        padding: 0
+        topInset: groupHeight
+        topPadding: groupHeight
+        leftPadding: Theme.popoverItemPaddingX
+        rightPadding: Theme.popoverItemPaddingX
+        Accessible.name: control.accessibleLabel(index)
+        hoverEnabled: true
 
         Item {
             id: groupHeading
             visible: row.groupStart
             width: parent.width
             height: row.groupHeight
+            z: 2
 
             Rectangle {
                 objectName: "selectGroupDivider"
@@ -179,7 +198,15 @@ ComboBox {
                 Accessible.focusable: false
             }
             MouseArea {
-                anchors.fill: parent
+                // A visual sibling intercepts hover before Qt walks delegate ancestors.
+                parent: row.parent
+                x: row.x
+                y: row.y
+                width: row.width
+                height: row.groupHeight
+                visible: row.groupStart && row.visible
+                z: row.z + 1
+                hoverEnabled: true
                 // Consume pointer events without activating or focusing a device.
                 onPressed: mouse.accepted = true
                 onReleased: mouse.accepted = true
@@ -187,63 +214,44 @@ ComboBox {
             }
         }
 
-        ItemDelegate {
-            id: option
-            objectName: "selectOption"
-            readonly property int deviceIndex: row.index
-            y: row.groupHeight
-            width: parent.width
-            height: Theme.popoverItemH + row.subtitleHeight
-            padding: 0
-            leftPadding: Theme.popoverItemPaddingX
-            rightPadding: Theme.popoverItemPaddingX
-            focusPolicy: Qt.NoFocus
-            Accessible.name: control.accessibleLabel(row.index)
-            onClicked: {
-                control.currentIndex = row.index
-                control.activated(row.index)
-                control.popup.close()
+        contentItem: Column {
+            Text {
+                objectName: "selectItemLabel"
+                width: parent.width
+                height: Theme.popoverItemH
+                textFormat: Text.PlainText
+                text: control.popupLabel(row.index)
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontMenuItemSize
+                font.weight: row.index === control.currentIndex ? Font.Medium : Font.Normal
+                renderType: Text.NativeRendering
+                color: row.details && row.details.muted ? Theme.fgMuted
+                    : row.index === control.currentIndex ? Theme.selectionFg : Theme.fg
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
             }
+            Text {
+                objectName: "selectItemSubtitle"
+                width: parent.width
+                height: row.subtitleHeight
+                visible: height > 0
+                text: row.details && row.details.subtitle || ""
+                textFormat: Text.PlainText
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                lineHeight: Math.ceil(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+                lineHeightMode: Text.FixedHeight
+                renderType: Text.NativeRendering
+                color: Theme.fgMuted
+                elide: Text.ElideRight
+            }
+        }
 
-            contentItem: Column {
-                Text {
-                    objectName: "selectItemLabel"
-                    width: parent.width
-                    height: Theme.popoverItemH
-                    textFormat: Text.PlainText
-                    text: control.popupLabel(row.index)
-                    font.family: Theme.fontUi
-                    font.pixelSize: Theme.fontMenuItemSize
-                    font.weight: row.index === control.currentIndex ? Font.Medium : Font.Normal
-                    renderType: Text.NativeRendering
-                    color: row.details && row.details.muted ? Theme.fgMuted
-                        : row.index === control.currentIndex ? Theme.selectionFg : Theme.fg
-                    verticalAlignment: Text.AlignVCenter
-                    elide: Text.ElideRight
-                }
-                Text {
-                    objectName: "selectItemSubtitle"
-                    width: parent.width
-                    height: row.subtitleHeight
-                    visible: height > 0
-                    text: row.details && row.details.subtitle || ""
-                    textFormat: Text.PlainText
-                    font.family: Theme.fontUi
-                    font.pixelSize: Theme.fontSettingSubSize
-                    lineHeight: Math.ceil(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
-                    lineHeightMode: Text.FixedHeight
-                    renderType: Text.NativeRendering
-                    color: Theme.fgMuted
-                    elide: Text.ElideRight
-                }
-            }
-
-            background: Rectangle {
-                radius: Theme.popoverItemRadius
-                antialiasing: true
-                color: row.index === control.currentIndex ? Theme.selectionBg
-                     : (option.hovered ? Theme.stateHoverOnSurface : "transparent")
-            }
+        background: Rectangle {
+            radius: Theme.popoverItemRadius
+            antialiasing: true
+            color: row.index === control.currentIndex ? Theme.selectionBg
+                 : (row.hovered ? Theme.stateHoverOnSurface : "transparent")
         }
     }
 

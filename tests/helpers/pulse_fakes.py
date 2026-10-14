@@ -15,8 +15,8 @@ from typing import Any, cast
 from astra_voice.worker import audio
 from astra_voice.worker import pulse_stream as ps
 
-MIC = audio.AudioDevice(7, "mic.test", "Тестовый микрофон", False)
-OTHER = audio.AudioDevice(8, "mic.other", "Другой микрофон", False)
+MIC = audio.AudioDevice(7, "mic.test", "Тестовый микрофон", False, available="yes", state=2)
+OTHER = audio.AudioDevice(8, "mic.other", "Другой микрофон", False, available="yes", state=2)
 REMOVE = ps.PA_SUBSCRIPTION_EVENT_SOURCE | ps.PA_SUBSCRIPTION_EVENT_REMOVE
 SERVER = ps.PA_SUBSCRIPTION_EVENT_SERVER | ps.PA_SUBSCRIPTION_EVENT_CHANGE
 
@@ -249,6 +249,12 @@ class FakePulse(ps._PulseAsync):
             if operation_name == "context_get_source_info_list":
                 for index, source, description in self.sources:
                     info = ps._PaSourceInfoPrefix(source, index, description)
+                    monitor = source is not None and source.endswith(b".monitor")
+                    info.monitor_of_sink = index if monitor else ps.PA_INVALID_INDEX
+                    info.monitor_of_sink_name = b"test.sink" if monitor else None
+                    info.state = 2
+                    port = ps._PaSourcePortInfo(b"test.port", b"Test port", 100, 2)
+                    info.active_port = ctypes.pointer(port)
                     args[1](args[0], ctypes.pointer(info), 0, args[2])
                 args[1](args[0], None, self.source_eol, args[2])
             else:

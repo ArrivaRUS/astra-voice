@@ -1309,14 +1309,19 @@ def test_audio_close_ready(factory: Factory) -> None:
 
 @pytest.mark.parametrize("device", [None, "Микрофон"])
 @pytest.mark.parametrize("changed", [None, "Источник звука изменился: Микрофон"])
-def test_audio_ready_optional_fields(device: str | None, changed: str | None) -> None:
+@pytest.mark.parametrize("mics", [None, 0, 1, 2])
+def test_audio_ready_optional_fields(
+    device: str | None, changed: str | None, mics: int | None
+) -> None:
     """Единый конструктор опускает отсутствующие поля и сохраняет готовый текст пилюли."""
     expected: Message = {"type": "audio.ready"}
     if device is not None:
         expected["device"] = device
     if changed is not None:
         expected["changed"] = changed
-    event = WorkerState.audio_ready(device=device, changed=changed)
+    if mics is not None:
+        expected["mics"] = mics
+    event = WorkerState.audio_ready(device=device, changed=changed, mics=mics)
     assert event == expected
     assert decode(encode(event)[4:]) == expected
 

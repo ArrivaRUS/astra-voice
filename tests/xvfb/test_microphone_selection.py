@@ -134,8 +134,9 @@ def test_microphone_popup_groups_gray_items_and_keyboard_selection(dark: bool) -
         assert evaluate(selector, "accessibleLabel(5)") == "Звук системы: HDMI"
         evaluate(selector, "popup.contentItem.positionViewAtIndex(4, ListView.Beginning)")
         QTest.qWait(20)
-        monitor = labels["Колонки"].parentItem().parentItem()
-        position = monitor.mapToScene(QPointF(monitor.width() / 2, monitor.height() / 2))
+        position = labels["Колонки"].mapToScene(
+            QPointF(labels["Колонки"].width() / 2, labels["Колонки"].height() / 2)
+        )
         QTest.mouseClick(rendered.window, Qt.LeftButton, pos=position.toPoint())
         QTest.qWait(20)
         assert selector.property("currentIndex") == 4
@@ -154,6 +155,45 @@ def test_microphone_popup_groups_gray_items_and_keyboard_selection(dark: bool) -
         assert selector.property("currentText") == "Гарнитура — нет подключения"
         assert evaluate(selector, "contentItem.color") == evaluate(selector, "Theme.fgMuted")
         assert explanation.property("text") == "Подключите его или выберите другой микрофон"
+        assert not rendered.messages, rendered.messages
+
+
+@pytest.mark.parametrize(
+    "index, header", [(1, False), (4, False), (4, True)], ids=["second", "monitor", "heading"]
+)
+def test_microphone_hover_then_enter_selects_only_a_device(index: int, header: bool) -> None:
+    with render(1035, "normal") as rendered:
+        devices = sources()
+        rendered.bridge._device_provider = lambda: devices
+        rendered.bridge.refreshDevices()
+        QTest.qWait(30)
+        selector = selector_in(rendered.row)
+        selector.forceActiveFocus(Qt.TabFocusReason)
+        evaluate(selector, "popup.open()")
+        QTest.qWait(30)
+        if index == 4:
+            # Keep both the group heading and its first monitor inside the viewport.
+            evaluate(selector, "popup.contentItem.positionViewAtIndex(4, ListView.Beginning)")
+            QTest.qWait(30)
+        option = cast(QQuickItem, evaluate(selector, f"popup.contentItem.itemAtIndex({index})"))
+        target_name = "selectGroupHeader" if header else "selectItemLabel"
+        target = next(
+            item
+            for item in visual_tree(option)
+            if item.objectName() == target_name and item.isVisible()
+        )
+        before = selector.property("highlightedIndex")
+        position = target.mapToScene(QPointF(target.width() / 2, target.height() / 2))
+        QTest.mouseMove(rendered.window, pos=position.toPoint())
+        QTest.qWait(30)
+        expected_index = before if header else index
+        assert selector.property("highlightedIndex") == expected_index
+        QTest.keyClick(rendered.window, Qt.Key_Return)
+        QTest.qWait(30)
+        assert selector.property("currentIndex") == expected_index
+        assert rendered.bridge.device == rendered.bridge.devices[expected_index]["id"]
+        assert selector.property("currentText") == rendered.bridge.devices[expected_index]["label"]
+        assert evaluate(selector, "popup.visible") is False
         assert not rendered.messages, rendered.messages
 
 
@@ -226,6 +266,7 @@ def test_microphone_navigation_keys_only_address_devices(opened: bool, key: int)
 def test_missing_saved_microphone_stays_selected_and_respects_policy(locked: bool) -> None:
     with render(1035, "locked" if locked else "normal", saved_device="missing") as rendered:
         rendered.bridge._settings.device_label = "USB-гарнитура"
+        rendered.bridge._settings.device_label_id = "missing"
         rendered.bridge.refreshDevices()
         QTest.qWait(30)
         selector = selector_in(rendered.row)
@@ -235,7 +276,10 @@ def test_missing_saved_microphone_stays_selected_and_respects_policy(locked: boo
         assert selector.property("enabled") is (not locked)
         explanation = rendered.row.findChild(QQuickItem, "microphoneExplanation")
         assert explanation is not None and explanation.isVisible()
-        assert explanation.property("text") == "Подключите его или выберите другой микрофон"
+        assert explanation.property("text") == (
+            "Подключите его или выберите другой микрофон. Пока у него нет подключения, "
+            "диктовка не начнётся: «Микрофон отключился»."
+        )
         assert rendered.device_changes == []
         assert rendered.saved_changes == []
         # A forged activation cannot bypass policy; keyboard naturally skips disabled control.
@@ -256,6 +300,7 @@ def wizard(
     devices = [AudioDevice(1, "unplugged", "Гарнитура", False, available="no")] if source_no else []
     settings = Settings(
         device_label="USB-гарнитура",
+        device_label_id="unplugged" if source_no else "missing",
         extra={
             "device": "unplugged" if source_no else "missing",
             "onboarding_language_set": True,

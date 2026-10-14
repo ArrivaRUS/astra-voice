@@ -6908,6 +6908,28 @@ def test_settings_devices_default_until_refresh() -> None:
     provider.assert_not_called()
 
 
+def test_settings_initial_devices_respect_device_policy() -> None:
+    settings = Settings(
+        device_label="Пользовательская гарнитура",
+        device_label_id="user-mic",
+        extra={"device": "user-mic"},
+    )
+    policy = policy_mod.Policy(values={"device": "policy-mic"}, locked_keys=frozenset({"device"}))
+    mirror = policy_mod.effective(settings, policy)
+    provider = Mock()
+    save = Mock()
+    bridge = SettingsBridge(
+        settings, mirror=mirror, locked=policy.locked_keys, device_provider=provider, save=save
+    )
+    assert bridge.device == "policy-mic" and bridge.is_locked("device")
+    assert [item["id"] for item in bridge.devices] == ["", "policy-mic"]
+    assert bridge.devices[1]["label"] == "policy-mic — нет подключения"
+    bridge.setProperty("device", "user-mic")
+    assert bridge.device == "policy-mic"
+    provider.assert_not_called()
+    save.assert_not_called()
+
+
 def test_settings_refresh_devices_lists_microphones() -> None:
     """2026-09-22: в «Общих» нельзя было выбрать микрофон — список берётся из моста."""
     devices = [
@@ -6932,6 +6954,38 @@ def test_settings_refresh_devices_failure_keeps_default(caplog: pytest.LogCaptur
         bridge.refreshDevices()
     assert bridge.devices == microphone_device_model([])
     assert any("список микрофонов" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.parametrize("error", [AudioError("failed", "unavailable"), OSError("unavailable")])
+def test_settings_refresh_devices_failure_keeps_successful_model(error: Exception) -> None:
+    sources = [AudioDevice(1, "usb", "USB-гарнитура", False, available="yes")]
+    provider = Mock(return_value=sources)
+    default_provider = Mock(return_value=sources[0])
+    save = Mock()
+    settings = Settings(extra={"device": "usb"})
+    bridge = SettingsBridge(
+        settings,
+        device_provider=provider,
+        default_device_provider=default_provider,
+        save=save,
+    )
+    bridge.refreshDevices()
+    previous = bridge.devices
+    changed = QSignalSpy(bridge.devicesChanged)
+    sources.clear()
+    provider.side_effect = error
+    save.reset_mock()
+    bridge.refreshDevices()
+    assert bridge.devices == previous
+    assert bridge.microphone_count() == 1
+    assert len(changed) == 0
+    default_provider.assert_called_once()
+    save.assert_not_called()
+    provider.side_effect = None
+    bridge.refreshDevices()
+    assert [item["id"] for item in bridge.devices] == ["", "usb"]
+    assert bridge.devices[1]["missing"]
+    assert bridge.microphone_count() == 0 and len(changed) == 1
 
 
 @pytest.mark.parametrize(
@@ -7012,9 +7066,14 @@ def test_microphone_count_retains_last_successful_source_snapshot() -> None:
 
 
 def test_microphone_saved_missing_item_uses_last_label_or_legacy_id() -> None:
-    for saved, expected in (("USB-гарнитура", "USB-гарнитура"), (None, "legacy-mic")):
+    for saved, label_id, expected in (
+        ("USB-гарнитура", "legacy-mic", "USB-гарнитура"),
+        (None, None, "legacy-mic"),
+        ("Чужая гарнитура", "other-mic", "legacy-mic"),
+        ("Старая метка без id", None, "legacy-mic"),
+    ):
         bridge = SettingsBridge(
-            Settings(device_label=saved, extra={"device": "legacy-mic"}),
+            Settings(device_label=saved, device_label_id=label_id, extra={"device": "legacy-mic"}),
             device_provider=lambda: [],
             save=Mock(),
         )
@@ -7043,6 +7102,7 @@ def test_microphone_label_updates_on_choice_visibility_and_reconnect() -> None:
     assert not save.called
     bridge.setProperty("device", "usb")
     assert settings.device_label == mirror.device_label == "USB-гарнитура"
+    assert settings.device_label_id == mirror.device_label_id == "usb"
     assert save.call_count == 1
     sources.clear()
     bridge.refreshDevices()
@@ -7051,11 +7111,13 @@ def test_microphone_label_updates_on_choice_visibility_and_reconnect() -> None:
     sources.append(AudioDevice(1, "usb", "Новое имя гарнитуры", False, available="yes"))
     bridge.refreshDevices()
     assert settings.device_label == mirror.device_label == "Новое имя гарнитуры"
+    assert settings.device_label_id == mirror.device_label_id == "usb"
     assert bridge.devices[1]["label"] == "Новое имя гарнитуры" and save.call_count == 2
     bridge.refreshDevices()
     assert save.call_count == 2
     bridge.setProperty("device", "")
     assert settings.device_label is mirror.device_label is None
+    assert settings.device_label_id is mirror.device_label_id is None
     assert len(bridge.devices) == 2
 
 
@@ -7113,8 +7175,11 @@ def test_microphone_default_monitor_description_is_available_to_ui(
     assert bridge.devices[1]["group"] == "Звук системы"
 
 
-def test_microphone_label_save_failure_rolls_back_choice_and_refresh() -> None:
-    settings = Settings(device_label="Старое имя", extra={"device": "old"})
+@pytest.mark.parametrize("label_id", ["old", None])
+def test_microphone_label_save_failure_rolls_back_choice_and_refresh(label_id: str | None) -> None:
+    settings = Settings(
+        device_label="Старое имя", device_label_id=label_id, extra={"device": "old"}
+    )
     source = AudioDevice(1, "usb", "USB", False, available="yes")
     save = Mock(side_effect=OSError("write failed"))
     bridge = SettingsBridge(settings, device_provider=lambda: [source], save=save)
@@ -7122,9 +7187,49 @@ def test_microphone_label_save_failure_rolls_back_choice_and_refresh() -> None:
     bridge.setProperty("device", "usb")
     assert settings.extra["device"] == bridge.device == "old"
     assert settings.device_label == "Старое имя"
+    assert settings.device_label_id == label_id
     source_old = AudioDevice(1, "old", "Новое имя", False, available="yes")
     bridge._device_provider = lambda: [source_old]
     bridge.refreshDevices()
     assert settings.device_label == "Старое имя"
+    assert settings.device_label_id == label_id
     assert bridge.devices[1]["label"] == "Новое имя"
     assert bridge.saveError == "Не удалось сохранить настройки"
+
+
+def test_microphone_policy_refresh_preserves_user_device_label() -> None:
+    settings = Settings(
+        device_label="Пользовательская гарнитура",
+        device_label_id="user-mic",
+        extra={"device": "user-mic"},
+    )
+    policy = policy_mod.Policy(values={"device": "policy-mic"}, locked_keys=frozenset({"device"}))
+    mirror = policy_mod.effective(settings, policy)
+    save = Mock()
+    source = AudioDevice(1, "policy-mic", "Микрофон администратора", False)
+    provider = Mock(return_value=[source])
+    bridge = SettingsBridge(
+        settings, mirror=mirror, locked=policy.locked_keys, device_provider=provider, save=save
+    )
+    bridge.refreshDevices()
+    assert bridge.devices[1]["label"] == "Микрофон администратора"
+    assert settings.extra["device"] == "user-mic"
+    assert settings.device_label == mirror.device_label == "Пользовательская гарнитура"
+    assert settings.device_label_id == mirror.device_label_id == "user-mic"
+    provider.return_value = []
+    bridge.refreshDevices()
+    assert bridge.devices[1]["id"] == "policy-mic"
+    assert bridge.devices[1]["label"] == "policy-mic — нет подключения"
+    save.assert_not_called()
+
+
+def test_microphone_refresh_associates_unchanged_legacy_label_with_device() -> None:
+    settings = Settings(device_label="USB", extra={"device": "usb"})
+    mirror = policy_mod.effective(settings, policy_mod.Policy())
+    save = Mock()
+    source = AudioDevice(1, "usb", "USB", False)
+    bridge = SettingsBridge(settings, mirror=mirror, device_provider=lambda: [source], save=save)
+    bridge.refreshDevices()
+    assert settings.device_label == mirror.device_label == "USB"
+    assert settings.device_label_id == mirror.device_label_id == "usb"
+    save.assert_called_once_with(settings)

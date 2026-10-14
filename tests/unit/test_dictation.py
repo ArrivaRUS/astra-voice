@@ -1425,6 +1425,27 @@ def test_first_recording_names_microphone_once_with_multiple_sources(
     assert rig.device_selected.call_count == int(microphones >= 2)
 
 
+@pytest.mark.parametrize("mics", [0, 1, 2, 3])
+def test_first_recording_uses_worker_microphone_count_without_bridge(rig: Rig, mics: int) -> None:
+    count = Mock(side_effect=AssertionError("worker count must avoid GUI fallback"))
+    rig.core.microphone_count = count
+    rig.start()
+    rig.event("audio.ready", device="USB-микрофон", mics=mics)
+    assert rig.device_selected.call_args_list == ([call("USB-микрофон")] if mics >= 2 else [])
+    count.assert_not_called()
+
+
+@pytest.mark.parametrize("mics", [None, "2", True, False, 2.0])
+def test_audio_ready_invalid_worker_count_uses_fallback(rig: Rig, mics: object) -> None:
+    count = Mock(return_value=2)
+    rig.core.microphone_count = count
+    rig.start()
+    # Некорректные поля обходят IPC только для проверки защитной ветки GUI.
+    rig.event("audio.ready", device="USB-микрофон", mics=mics)
+    count.assert_called_once_with()
+    rig.device_selected.assert_called_once_with("USB-микрофон")
+
+
 @pytest.mark.parametrize("microphones", [None, 0, 1, 2, 3])
 def test_first_recording_uses_bridge_cache_without_enumerating(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, microphones: int | None

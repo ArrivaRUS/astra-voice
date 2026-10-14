@@ -685,6 +685,7 @@ def select_device(
     clock: Callable[[], float],
     deadline: _OpenDeadline | None = None,
     use_cache: bool = True,
+    on_devices: Callable[[list[AudioDevice]], None] | None = None,
 ) -> tuple[AudioDevice, bool]:
     """Выбирает проверенный источник с коротким кэшем перед загрузкой libpulse."""
     cached_devices, cached_default = _device_cache.get(clock) if use_cache else (None, None)
@@ -695,6 +696,8 @@ def select_device(
             else next((item for item in cached_devices if item.name == device), None)
         )
         if selected is not None:
+            if on_devices is not None:
+                on_devices(cached_devices)
             return selected, True
     try:
         devices = devices_fn(deadline=deadline)
@@ -706,6 +709,8 @@ def select_device(
             else resolve_device(device, devices)
         )
         assert selected is not None
+        if on_devices is not None:
+            on_devices(devices)
         if use_cache:
             if device is None:
                 _device_cache.put(devices, selected, clock)
@@ -961,7 +966,13 @@ class AudioCapture:
                     )
                 else:
                     label = None
-                self._on_event(WorkerState.audio_ready(device=label, changed=changed))
+                self._on_event(
+                    WorkerState.audio_ready(
+                        device=label,
+                        changed=changed,
+                        mics=getattr(self._source, "microphone_count", None),
+                    )
+                )
             else:
                 self._source.flush()
             # Источник открыт: с этого мига ждём первую порцию звука (P0 на Fly).
@@ -1366,6 +1377,11 @@ class PulseSimpleSource:
         self._device_name: str | None = None
         self._selected_device: AudioDevice | None = None
         self.device_label: str | None = None
+        self.microphone_count: int | None = None
+
+    def _remember_devices(self, devices: list[AudioDevice]) -> None:
+        """Сохраняет число микрофонов из снимка, проверенного при открытии."""
+        self.microphone_count = sum(not item.monitor for item in devices)
 
     def open(
         self,
@@ -1391,6 +1407,7 @@ class PulseSimpleSource:
                 clock=self._clock,
                 deadline=deadline,
                 use_cache=self._devices is None,
+                on_devices=self._remember_devices,
             )
             if deadline is not None:
                 deadline.remaining(OPEN_TOTAL_DEADLINE_S)
@@ -1464,6 +1481,7 @@ class PulseSimpleSource:
         self._device_name = None
         self._selected_device = None
         self.device_label = None
+        self.microphone_count = None
         if handle is not None and self._pulse is not None:
             self._pulse.lib.pa_simple_free(handle)
 

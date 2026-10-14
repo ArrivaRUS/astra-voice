@@ -148,6 +148,8 @@ def microphone_device_model(
     selected: str = "",
     saved_label: str | None = None,
     default_label: str = "",
+    *,
+    saved_label_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Готовые пункты выбора; отсутствующий выбор остаётся явным и доступным."""
     default = {**_DEFAULT_DEVICE, "subtitle": f"Сейчас: {default_label}" if default_label else ""}
@@ -173,7 +175,8 @@ def microphone_device_model(
             }
         )
     if selected and not any(item["id"] == selected for item in result):
-        label = (saved_label or selected) + " — нет подключения"
+        label = saved_label if saved_label_id == selected and saved_label else selected
+        label += " — нет подключения"
         missing = {
             "id": selected,
             "label": label,
@@ -287,9 +290,6 @@ class SettingsBridge(QObject):
         self._default_device_provider = default_device_provider
         self._sources: list[AudioDevice] = []
         self._default_device_label = ""
-        self._devices = microphone_device_model(
-            [], settings.extra.get("device") or "", settings.device_label
-        )
         self._locked = frozenset(locked)
         self._apply = apply
         self._command_host: Any = None
@@ -314,6 +314,9 @@ class SettingsBridge(QObject):
         self._capture.captureStateChanged.connect(self._keyboard_capture_changed)
         self._save = save
         self._values = self._read_values()
+        self._devices = microphone_device_model(
+            [], self.device, settings.device_label, saved_label_id=settings.device_label_id
+        )
         self._sync_autostart()
         self._hotkey_status = "ok"
         self._save_error = ""
@@ -686,6 +689,7 @@ class SettingsBridge(QObject):
                 return
         device_present = "device" in self._settings.extra
         old_device_label = self._settings.device_label
+        old_device_label_id = self._settings.device_label_id
         old = (
             self._settings.extra.get("device")
             if name == "device"
@@ -708,6 +712,7 @@ class SettingsBridge(QObject):
         if name == "device":
             self._settings.extra["device"] = value or None
             self._settings.device_label = self._visible_device_label(cast(str, value))
+            self._settings.device_label_id = cast(str, value) or None
         else:
             setattr(self._settings, field, value)
         try:
@@ -718,6 +723,7 @@ class SettingsBridge(QObject):
                 self.set_hotkey_status(hotkey_apply.hotkey(self.hotkey, self.hotkeyMode) or "ok")
             if name == "device":
                 self._settings.device_label = old_device_label
+                self._settings.device_label_id = old_device_label_id
                 if device_present:
                     self._settings.extra["device"] = old
                 else:
@@ -738,6 +744,7 @@ class SettingsBridge(QObject):
             if name == "device":
                 self._mirror.extra["device"] = value or None
                 self._mirror.device_label = self._settings.device_label
+                self._mirror.device_label_id = self._settings.device_label_id
             else:
                 setattr(self._mirror, field, value)
         self._values[name] = value
@@ -768,7 +775,11 @@ class SettingsBridge(QObject):
                 self.update_command_state()
         if name == "device":
             self._devices = microphone_device_model(
-                self._sources, self.device, self._settings.device_label, self._default_device_label
+                self._sources,
+                self.device,
+                self._settings.device_label,
+                self._default_device_label,
+                saved_label_id=self._settings.device_label_id,
             )
             self.devicesChanged.emit()
         getattr(self, name + "Changed").emit()
@@ -1241,7 +1252,7 @@ class SettingsBridge(QObject):
         source = next((source for source in self._sources if source.name == selected), None)
         if source is not None:
             return source.label
-        return self._settings.device_label if selected == self.device else None
+        return self._settings.device_label if selected == self._settings.device_label_id else None
 
     def microphone_count(self) -> int:
         """Число микрофонов из последнего успешного перечисления, без I/O."""
@@ -1253,41 +1264,57 @@ class SettingsBridge(QObject):
         self._refresh_devices(self._device_provider)
 
     def _refresh_devices(self, provider: Callable[[], list[AudioDevice]]) -> None:
-        sources: list[AudioDevice] = []
-        default_label = ""
+        sources = self._sources
+        default_label = self._default_device_label
         try:
             sources = provider()
         except (AudioError, OSError):
-            log.warning("Не удалось получить список микрофонов. Доступен системный по умолчанию.")
+            log.warning("Не удалось получить список микрофонов. Сохраняю предыдущий список.")
         else:
             self._sources = list(sources)
-        # Custom providers are fully isolated test/embedding sources.
-        if sources and (self._default_device_provider is not None or provider is list_devices):
-            try:
-                source = (
-                    self._default_device_provider(sources)
-                    if self._default_device_provider is not None
-                    else default_device(sources, allow_monitor=True)
-                )
-                default_label = source.label
-            except (AudioError, OSError):
-                log.debug("Не удалось узнать системный микрофон по умолчанию")
+            default_label = ""
+            # Custom providers are fully isolated test/embedding sources.
+            if sources and (self._default_device_provider is not None or provider is list_devices):
+                try:
+                    source = (
+                        self._default_device_provider(sources)
+                        if self._default_device_provider is not None
+                        else default_device(sources, allow_monitor=True)
+                    )
+                    default_label = source.label
+                except (AudioError, OSError):
+                    log.debug("Не удалось узнать системный микрофон по умолчанию")
         selected_source = next((source for source in sources if source.name == self.device), None)
-        if selected_source is not None and selected_source.label != self._settings.device_label:
+        if (
+            selected_source is not None
+            and self._settings.extra.get("device") == selected_source.name
+            and (
+                selected_source.label != self._settings.device_label
+                or selected_source.name != self._settings.device_label_id
+            )
+        ):
             old_label = self._settings.device_label
+            old_label_id = self._settings.device_label_id
             self._settings.device_label = selected_source.label
+            self._settings.device_label_id = selected_source.name
             try:
                 self._save(self._settings)
             except OSError:
                 self._settings.device_label = old_label
+                self._settings.device_label_id = old_label_id
                 self._save_error = "Не удалось сохранить настройки"
                 self.saveErrorChanged.emit()
             else:
                 if self._mirror is not None:
                     self._mirror.device_label = selected_source.label
+                    self._mirror.device_label_id = selected_source.name
         self._default_device_label = default_label
         devices = microphone_device_model(
-            sources, self.device, self._settings.device_label, default_label
+            sources,
+            self.device,
+            self._settings.device_label,
+            default_label,
+            saved_label_id=self._settings.device_label_id,
         )
         log.info("Список микрофонов: найдено %d", len(sources))
         if devices != self._devices:

@@ -574,6 +574,7 @@ class PulseStreamSource:
         self._opened = False
         self.device_label: str | None = None
         self._selected_device: AudioDevice | None = None
+        self.microphone_count: int | None = None
         self._device_name: str | None = None
         self.device_change: DeviceChange | None = None
         self._probe_logging = False
@@ -720,6 +721,7 @@ class PulseStreamSource:
                 clock=self._clock,
                 deadline=budget,
                 use_cache=False,
+                on_devices=self._remember_devices,
             )
         else:
 
@@ -745,8 +747,13 @@ class PulseStreamSource:
                 clock=self._clock,
                 deadline=budget,
                 use_cache=self._devices is None,
+                on_devices=self._remember_devices,
             )
         return selected
+
+    def _remember_devices(self, devices: list[AudioDevice]) -> None:
+        """Сохраняет число микрофонов из снимка, проверенного при открытии."""
+        self.microphone_count = sum(not item.monitor for item in devices)
 
     def _trace_state(self, object_name: str, state: int) -> None:
         """Отмечает наблюдаемые переходы, не добавляя вызовов libpulse."""
@@ -1515,6 +1522,7 @@ class PulseStreamSource:
             self._device_name = None
             self._selected_device = None
             self.device_label = None
+            self.microphone_count = None
             self._default_mode = False
         finally:
             self._capture_active = False
@@ -1637,6 +1645,11 @@ class StreamWithFallback:
     @property
     def selected_device(self) -> AudioDevice | None:
         return self._active.selected_device
+
+    @property
+    def microphone_count(self) -> int | None:
+        count = getattr(self._active, "microphone_count", None)
+        return count if isinstance(count, int) and not isinstance(count, bool) else None
 
     @property
     def device_label(self) -> str | None:
