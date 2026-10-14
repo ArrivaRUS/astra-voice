@@ -187,6 +187,7 @@ Item {
             height: visible ? implicitHeight : 0
             bottomPadding: Theme.cardRowPaddingY
             objectName: "microphoneExplanation"
+            textFormat: Text.PlainText
             text: root.deviceMissing
                 ? qsTr("Подключите его или выберите другой микрофон. Пока у него нет подключения, диктовка не начнётся: «Микрофон отключился».")
                 : qsTr("Подключите его или выберите другой микрофон")
