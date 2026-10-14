@@ -963,7 +963,9 @@ def test_network_check_toggles_visible_and_follow_effective_settings(
         assert control.property("enabled") is (mode == "ordinary")
         texts = onboarding.visible_texts(window.contentItem())
         hint = (
-            "Раз в сутки, " + host + ". Скачивание — только по вашему нажатию."
+            ("Раз в сутки, " if field == "checkAppUpdates" else "")
+            + host
+            + ". Скачивание — только по вашему нажатию."
             if mode == "ordinary"
             else "Не работает, пока включён офлайн-режим."
             if mode == "offline"

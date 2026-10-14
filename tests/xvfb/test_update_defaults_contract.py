@@ -235,7 +235,7 @@ def test_onboarding_step1_disclosure_and_snapshots(
             assert "Задано администратором" in texts
         else:
             assert "Раз в сутки, github.com. Скачивание — только по вашему нажатию." in texts
-            assert "Раз в сутки, huggingface.co. Скачивание — только по вашему нажатию." in texts
+            assert "huggingface.co. Скачивание — только по вашему нажатию." in texts
         image = states.grab(app, window, 900, 588)
         path = states.save_snapshot(
             image, f"onboarding-015-{mode}-{'dark' if dark else 'light'}.png"
@@ -327,7 +327,9 @@ def test_step1_single_policy_lock_allows_other_preference_to_be_disabled(
     assert not editable_row.property("locked") and editable_row.property("rowEnabled")
     assert locked_row.property("locked") and not locked_row.property("rowEnabled")
     expected_sub = (
-        "Раз в сутки, " + host + ". Скачивание — только по вашему нажатию."
+        ("Раз в сутки, " if locked_field == "check_app_updates" else "")
+        + host
+        + ". Скачивание — только по вашему нажатию."
         if policy_value
         else "Администратор отключил проверку обновлений на этом компьютере."
     )

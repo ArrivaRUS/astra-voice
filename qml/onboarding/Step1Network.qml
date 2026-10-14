@@ -132,7 +132,7 @@ Item {
                 showHint: false
                 label: qsTr("Проверять обновления моделей")
                 sub: locked && !modelUpdates.checked ? qsTr("Администратор отключил проверку обновлений на этом компьютере.")
-                    : qsTr("Раз в сутки, huggingface.co. Скачивание — только по вашему нажатию.")
+                    : qsTr("huggingface.co. Скачивание — только по вашему нажатию.")
                 toggle: modelUpdates
                 locked: root.modelUpdatesLocked
                 lockedText: root.bridge ? root.bridge.policyLockedText : ""

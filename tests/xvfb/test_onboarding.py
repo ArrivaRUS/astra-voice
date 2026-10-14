@@ -5143,7 +5143,7 @@ def test_step1_network_disclosure_matches_actual_choices(
             assert hint in texts and "Задано администратором" in texts
         else:
             assert "Раз в сутки, github.com. Скачивание — только по вашему нажатию." in texts
-            assert "Раз в сутки, huggingface.co. Скачивание — только по вашему нажатию." in texts
+            assert "huggingface.co. Скачивание — только по вашему нажатию." in texts
         if app_on or model_on:
             assert any("Не чаще раза в сутки. Сама ничего не скачивает" in text for text in texts)
         rows = [

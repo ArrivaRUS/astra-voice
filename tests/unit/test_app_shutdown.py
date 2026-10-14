@@ -324,6 +324,80 @@ def test_update_checker_started_and_stopped_before_runtime(
     assert checker.on_event is None and checker.on_status is None
 
 
+def test_onboarding_network_step_enables_scheduled_checks_once(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """main связывает реальные сигналы мастера с однократным разрешением расписания."""
+    pytest.importorskip("requests")
+    from astra_voice.net.gate import NetworkGate
+    from astra_voice.updates import checker as checker_mod
+    from astra_voice.updates.state import StateStore
+
+    now = 100.0
+    checker = checker_mod.UpdateChecker(
+        NetworkGate(rig.settings, Policy()),
+        Mock(),
+        store=StateStore(tmp_path / "update-state.json"),
+        metadata=Mock(),
+        clock=lambda: now,
+    )
+    # start() настраивает настоящее расписание; рабочий цикл запускаем вручную,
+    # чтобы проверить срок без ожидания, файлов метаданных и сетевых запросов.
+    monkeypatch.setattr(checker, "_run", Mock())
+    monkeypatch.setattr(checker._wake, "wait", Mock())
+    start = Mock(wraps=checker.start)
+    enable = Mock(wraps=checker.enable_scheduled_checks)
+    monkeypatch.setattr(checker, "start", start)
+    monkeypatch.setattr(checker, "enable_scheduled_checks", enable)
+    monkeypatch.setattr(checker_mod, "create_app_checker", Mock(return_value=checker))
+    monkeypatch.setattr(notify, "notify_onboarding_ready", Mock())
+    model = Mock(
+        spec_set=model_downloads.ModelPort,
+        recommended=Mock(return_value=None),
+        installed_ok=Mock(return_value=True),
+        broken=Mock(return_value=False),
+        allowed=Mock(return_value=(False, "Сеть отключена в тесте")),
+        disk_ok=Mock(return_value=True),
+        ram_ok=Mock(return_value=True),
+        download=Mock(side_effect=AssertionError("Неожиданная загрузка модели")),
+        install_from_staging=Mock(side_effect=AssertionError("Неожиданная установка модели")),
+        install_from_path=Mock(side_effect=AssertionError("Неожиданная установка модели")),
+    )
+    monkeypatch.setattr(model_downloads, "ModelService", Mock(return_value=model))
+
+    def exec_loop() -> int:
+        nonlocal now
+        properties = dict(
+            item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+        )
+        onboarding = properties["onboarding"]
+        assert onboarding.step == 1 and not onboarding.done
+        start.assert_called_once_with(scheduled=False)
+        enable.assert_not_called()
+        assert not checker._scheduled_enabled
+
+        onboarding.next()
+        assert onboarding.step == 2
+        enable.assert_called_once_with()
+        checker._round()
+        due = checker._next_due
+        assert checker._scheduled_enabled
+        assert due == now + checker_mod.STARTUP_DELAY_S
+
+        now += 10.0
+        onboarding.finish()
+        assert onboarding.done
+        assert enable.call_count == 2
+        checker._round()
+        assert checker._next_due == due
+        onboarding.finish()
+        assert enable.call_count == 2
+        return 0
+
+    rig.app.exec_.side_effect = exec_loop
+    assert app_mod.main([]) == 0
+
+
 def test_about_bridge_stats_listener_released_on_exit(rig: Rig) -> None:
     """«О программе» слушает статистику, а при выходе слушатель снят (урок 025)."""
     seen: dict[str, object] = {}

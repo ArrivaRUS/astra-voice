@@ -170,7 +170,7 @@ Column {
             label: qsTr("Проверять обновления моделей")
             sub: locked && !modelUpdates.checked ? qsTr("Администратор отключил проверку обновлений на этом компьютере.")
                 : root.offlineOn ? qsTr("Не работает, пока включён офлайн-режим.")
-                : qsTr("Раз в сутки, huggingface.co. Скачивание — только по вашему нажатию.")
+                : qsTr("huggingface.co. Скачивание — только по вашему нажатию.")
             toggle: modelUpdates
             locked: root.isLocked("check_model_updates") || root.networkRefusal === "admin"
             rowEnabled: !locked && !root.offlineOn

@@ -94,13 +94,22 @@ def defaults(*, appimage: bool | None = None, locked: Iterable[str] = ()) -> Set
     return Settings(
         check_app_updates=enabled and "check_app_updates" not in locked,
         check_model_updates=enabled and "check_model_updates" not in locked,
+        extra={"update_defaults_migrated": True} if enabled else {},
     )
 
 
-def _enable_update_checks(data: dict[str, Any]) -> dict[str, Any]:
+def _enable_update_checks(
+    data: dict[str, Any], *, appimage: bool, locked: Iterable[str] = ()
+) -> dict[str, Any]:
     # До 0.1.5 сохранялись все дефолты, поэтому старое false не позволяет
     # отличить выбор пользователя. В AppImage включаем оба один раз; deb не меняем.
-    return {**data, "check_app_updates": True, "check_model_updates": True}
+    if not appimage or data.get("update_defaults_migrated") is True:
+        return data
+    data = {**data, "update_defaults_migrated": True}
+    for key in ("check_app_updates", "check_model_updates"):
+        if key not in locked:
+            data[key] = True
+    return data
 
 
 # Миграции вперёд: ключ — версия, из которой мигрируем; значение — функция в версию+1.
@@ -110,31 +119,18 @@ MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
 }
 
 
-def _migrate(
-    data: dict[str, Any], *, appimage: bool = False, locked: Iterable[str] = ()
-) -> dict[str, Any]:
+def _migrate(data: dict[str, Any]) -> dict[str, Any]:
     raw = data.get("schema_version", 0)
     current = raw if type(raw) is int and raw >= 0 else 0
-    # locked без значения политики фиксирует прежнюю пользовательскую настройку,
-    # включая прежний дефолт false у отсутствующего ключа.
-    locked = frozenset(locked)
-    preserved: dict[str, Any] = {
-        key: data.get(key) is True
-        for key in ("check_app_updates", "check_model_updates")
-        if current < 2 and key in locked
-    }
     while current < SCHEMA_VERSION:
         step = MIGRATIONS.get(current)
         if step is None:
             log.warning("нет миграции settings.json с версии %s, беру как есть", current)
             break
         data = step(data)
-        if current == 1 and appimage:
-            data = _enable_update_checks(data)
         current += 1
     if current > SCHEMA_VERSION:
         log.warning("settings.json версии %s новее приложения (%s)", current, SCHEMA_VERSION)
-    data.update(preserved)
     data["schema_version"] = current
     return data
 
@@ -214,7 +210,11 @@ def load(
     locked: Iterable[str] = (),
     appimage: bool | None = None,
 ) -> Settings:
-    """Читает и сохраняет миграцию; ``quarantine=False`` оставляет файл нетронутым."""
+    """Читает настройки и сохраняет миграцию схемы и AppImage-маркер.
+
+    ``quarantine=False`` отключает переименование повреждённого файла и запись
+    миграции/маркера: файл остаётся нетронутым.
+    """
     appimage = update_checks_default(appimage)
     locked = frozenset(locked)
     if path is None:
@@ -239,12 +239,12 @@ def load(
             _quarantine(path)
         return defaults(appimage=appimage, locked=locked)
     previous_schema = data.get("schema_version")
-    migrated = _migrate(data, appimage=appimage, locked=locked)
+    previous_marker = data.get("update_defaults_migrated")
+    migrated = _enable_update_checks(_migrate(data), appimage=appimage, locked=locked)
     settings = from_dict(migrated, appimage=appimage, locked=locked)
-    if (
-        quarantine
-        and previous_schema != SCHEMA_VERSION
-        and migrated["schema_version"] == SCHEMA_VERSION
+    if quarantine and (
+        (previous_schema != SCHEMA_VERSION and migrated["schema_version"] == SCHEMA_VERSION)
+        or (previous_marker is not True and migrated.get("update_defaults_migrated") is True)
     ):
         try:
             save(settings, path)

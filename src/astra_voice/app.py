@@ -58,14 +58,17 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def _settings_migration_locks(policy: policy_mod.Policy) -> frozenset[str]:
+def _settings_migration_locks(policy: policy_mod.Policy) -> tuple[frozenset[str], bool]:
     """Запрет сети сохраняет legacy-флаги, как и явные значения/замки политики."""
     from astra_voice.net.gate import NetworkGate
 
     locked = policy.locked_keys
-    if NetworkGate(settings_mod.Settings(), policy).refusal("check_app_manual") == "admin":
+    admin_offline = (
+        NetworkGate(settings_mod.Settings(), policy).refusal("check_app_manual") == "admin"
+    )
+    if admin_offline:
         locked |= {"check_app_updates", "check_model_updates"}
-    return locked
+    return locked, admin_offline
 
 
 def _installed_code_key() -> str | None:
@@ -395,8 +398,9 @@ def _debug_transcribe(path: str, args: argparse.Namespace) -> int:
         if not wav.is_file():
             return fail(1, "Звуковой файл не найден или недоступен.")
         policy = policy_mod.load()
+        migration_locked, _ = _settings_migration_locks(policy)
         settings = policy_mod.effective(
-            settings_mod.load(quarantine=False, locked=_settings_migration_locks(policy)), policy
+            settings_mod.load(quarantine=False, locked=migration_locked), policy
         ).to_dict()
 
         try:
@@ -1510,19 +1514,16 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("Не удалось запретить автозапуск звукового сервера.", exc_info=True)
     _install_qt_message_handler()  # до создания QApplication: GL-жалобы идут оттуда
     policy = policy_mod.load()
-    from astra_voice.net.gate import NetworkGate
-
-    migration_locked = _settings_migration_locks(policy)
-    stored = settings_mod.load(locked=migration_locked) if migration_locked else settings_mod.load()
+    migration_locked, admin_offline = _settings_migration_locks(policy)
+    stored = settings_mod.load(locked=migration_locked)
     settings = policy_mod.effective(stored, policy)
 
-    locked_settings = policy.locked_keys
-    if NetworkGate(settings, policy).refusal("check_app_manual") == "admin":
+    locked_settings = migration_locked
+    if admin_offline:
         # Для общего запрета сети интерфейс показывает фактическое off + замок.
         # Пользовательские значения stored сохраняются независимо от политики.
         settings.check_app_updates = False
         settings.check_model_updates = False
-        locked_settings |= {"check_app_updates", "check_model_updates"}
     log.info(
         "старт: версия=%s сеанс=%s политика=%s",
         __version__,
