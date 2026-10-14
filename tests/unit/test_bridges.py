@@ -61,6 +61,7 @@ from astra_voice.ui.bridges import (
     OnboardingHost,
     SettingsApply,
     SettingsBridge,
+    microphone_device_model,
 )
 from astra_voice.ui.hotkey_capture import CaptureHost, HotkeyCapture
 from astra_voice.ui.icons import install_icon_provider
@@ -1453,11 +1454,7 @@ def test_onboarding_devices_use_audio_labels() -> None:
         SettingsBridge(settings, save=Mock()), settings=settings, device_provider=provider
     )
 
-    assert controller.devices == [
-        {"id": "", "name": "Системный по умолчанию"},
-        {"id": devices[0].name, "name": devices[0].label},
-        {"id": devices[1].name, "name": "Колонки (звук системы)"},
-    ]
+    assert controller.devices == microphone_device_model(devices)
     provider.assert_called_once_with()
     meta = controller.metaObject()
     prop = meta.property(meta.indexOfProperty("devices"))
@@ -1484,7 +1481,7 @@ def test_onboarding_devices_enumeration_failure(
             device_provider=Mock(side_effect=error),
         )
 
-    assert controller.devices == [{"id": "", "name": "Системный по умолчанию"}]
+    assert controller.devices == microphone_device_model([])
     assert controller.device == ""
     controller.next()
     assert controller.step == 2
@@ -6907,7 +6904,7 @@ def test_settings_devices_default_until_refresh() -> None:
     """До refreshDevices() в «Общих» только системный по умолчанию; поставщик не зовётся."""
     provider = Mock(return_value=[AudioDevice(1, "alsa_input.mic", "Микрофон", False)])
     bridge = SettingsBridge(Settings(), save=Mock(), device_provider=provider)
-    assert bridge.devices == [{"id": "", "name": "Системный по умолчанию"}]
+    assert bridge.devices == microphone_device_model([])
     provider.assert_not_called()
 
 
@@ -6922,11 +6919,7 @@ def test_settings_refresh_devices_lists_microphones() -> None:
     changed = Mock()
     bridge.devicesChanged.connect(changed)
     bridge.refreshDevices()
-    assert bridge.devices == [
-        {"id": "", "name": "Системный по умолчанию"},
-        {"id": "alsa_input.mic", "name": "Микрофон гарнитуры"},
-        {"id": "alsa_output.monitor", "name": "Колонки (звук системы)"},
-    ]
+    assert bridge.devices == microphone_device_model(devices)
     changed.assert_called_once()
     bridge.refreshDevices()
     changed.assert_called_once()  # без изменений сигнала нет
@@ -6937,7 +6930,7 @@ def test_settings_refresh_devices_failure_keeps_default(caplog: pytest.LogCaptur
     bridge = SettingsBridge(Settings(), save=Mock(), device_provider=provider)
     with caplog.at_level("WARNING", logger="astra_voice.ui"):
         bridge.refreshDevices()
-    assert bridge.devices == [{"id": "", "name": "Системный по умолчанию"}]
+    assert bridge.devices == microphone_device_model([])
     assert any("список микрофонов" in record.getMessage() for record in caplog.records)
 
 
@@ -6964,3 +6957,174 @@ def test_onboarding_single_policy_lock_does_not_lock_other_preference(
     controller.setProperty(locked_name, not policy_value)
     assert controller.property(locked_name) is policy_value
     save.assert_called_once()
+
+
+def test_microphone_model_orders_availability_and_keeps_monitor_group() -> None:
+    sources = [
+        AudioDevice(1, "monitor-a", "Динамики", True, available="yes"),
+        AudioDevice(2, "unplugged", "Гарнитура", False, available="no"),
+        AudioDevice(3, "builtin", "Микрофон", False, available="yes"),
+        AudioDevice(4, "usb", "Микрофон", False, available="unknown"),
+        AudioDevice(5, "monitor-b", "HDMI", True, available="unknown"),
+    ]
+    items = microphone_device_model(sources, default_label="Микрофон")
+    assert [item["id"] for item in items] == [
+        "",
+        "builtin",
+        "usb",
+        "unplugged",
+        "monitor-a",
+        "monitor-b",
+    ]
+    assert items[0]["label"] == "Системный по умолчанию"
+    assert items[0]["subtitle"] == "Сейчас: Микрофон"
+    assert [item["group"] for item in items] == ["", "", "", "", "Звук системы", "Звук системы"]
+    assert items[3]["label"] == "Гарнитура — нет подключения"
+    assert items[3]["muted"] is True and items[3]["available"] == "no"
+    assert all(item["muted"] is False for item in items if item["id"] != "unplugged")
+    assert items[1]["label"] == items[2]["label"]  # identity remains the technical id
+    assert items[4]["popupLabel"] == "Динамики"
+    assert items[4]["name"] == "Динамики (звук системы)"
+    assert items[5]["popupLabel"] == "HDMI"
+
+
+def test_microphone_count_retains_last_successful_source_snapshot() -> None:
+    sources = [
+        AudioDevice(1, "builtin", "Микрофон", False),
+        AudioDevice(2, "usb", "USB", False, available="no"),
+        AudioDevice(3, "monitor", "Колонки", True),
+    ]
+    provider = Mock(return_value=sources)
+    bridge = SettingsBridge(Settings(), device_provider=provider, save=Mock())
+    assert bridge.microphone_count() == 0
+    provider.assert_not_called()
+    bridge.refreshDevices()
+    assert bridge.microphone_count() == 2
+    # The provider's mutable result must not change the last successful snapshot.
+    sources.clear()
+    assert bridge.microphone_count() == 2
+    provider.side_effect = AudioError("failed", "unavailable")
+    bridge.refreshDevices()
+    assert bridge.microphone_count() == 2
+    provider.side_effect = None
+    bridge.refreshDevices()
+    assert bridge.microphone_count() == 0
+
+
+def test_microphone_saved_missing_item_uses_last_label_or_legacy_id() -> None:
+    for saved, expected in (("USB-гарнитура", "USB-гарнитура"), (None, "legacy-mic")):
+        bridge = SettingsBridge(
+            Settings(device_label=saved, extra={"device": "legacy-mic"}),
+            device_provider=lambda: [],
+            save=Mock(),
+        )
+        bridge.refreshDevices()
+        assert bridge.device == "legacy-mic"
+        assert bridge.devices[1] == {
+            "id": "legacy-mic",
+            "label": expected + " — нет подключения",
+            "name": expected + " — нет подключения",
+            "group": "",
+            "available": "no",
+            "muted": True,
+            "subtitle": "",
+            "missing": True,
+        }
+        bridge._save.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_microphone_label_updates_on_choice_visibility_and_reconnect() -> None:
+    sources = [AudioDevice(1, "usb", "USB-гарнитура", False, available="yes")]
+    settings = Settings()
+    mirror = Settings()
+    save = Mock()
+    bridge = SettingsBridge(settings, mirror=mirror, device_provider=lambda: sources, save=save)
+    bridge.refreshDevices()
+    assert not save.called
+    bridge.setProperty("device", "usb")
+    assert settings.device_label == mirror.device_label == "USB-гарнитура"
+    assert save.call_count == 1
+    sources.clear()
+    bridge.refreshDevices()
+    assert bridge.device == "usb" and bridge.devices[1]["available"] == "no"
+    assert settings.device_label == "USB-гарнитура" and save.call_count == 1
+    sources.append(AudioDevice(1, "usb", "Новое имя гарнитуры", False, available="yes"))
+    bridge.refreshDevices()
+    assert settings.device_label == mirror.device_label == "Новое имя гарнитуры"
+    assert bridge.devices[1]["label"] == "Новое имя гарнитуры" and save.call_count == 2
+    bridge.refreshDevices()
+    assert save.call_count == 2
+    bridge.setProperty("device", "")
+    assert settings.device_label is mirror.device_label is None
+    assert len(bridge.devices) == 2
+
+
+def test_microphone_no_port_is_selectable_but_device_policy_lock_wins() -> None:
+    source = AudioDevice(1, "headset", "Гарнитура", False, available="no")
+    settings = Settings()
+    save = Mock()
+    bridge = SettingsBridge(settings, device_provider=lambda: [source], save=save)
+    bridge.refreshDevices()
+    bridge.setProperty("device", "headset")
+    assert bridge.device == "headset" and settings.device_label == "Гарнитура"
+    locked = SettingsBridge(
+        settings, locked=["device"], device_provider=lambda: [source], save=save
+    )
+    locked.refreshDevices()
+    save.reset_mock()
+    locked.setProperty("device", "")
+    assert locked.device == "headset" and settings.device_label == "Гарнитура"
+    save.assert_not_called()
+
+
+def test_microphone_default_description_and_shared_wizard_refresh() -> None:
+    sources = [AudioDevice(1, "builtin", "Встроенный микрофон", False, available="yes")]
+    settings = Settings(extra={"onboarding_language_set": True})
+    bridge = SettingsBridge(
+        settings,
+        device_provider=lambda: sources,
+        save=Mock(),
+        default_device_provider=lambda devices: devices[0],
+    )
+    controller = OnboardingController(bridge, settings=settings, device_provider=lambda: sources)
+    assert controller.devices == bridge.devices
+    assert bridge.devices[0]["subtitle"] == "Сейчас: Встроенный микрофон"
+    spy = QSignalSpy(controller.devicesChanged)
+    sources.append(AudioDevice(2, "headset", "Гарнитура", False, available="no"))
+    controller.refreshDevices()
+    assert controller.devices == bridge.devices and len(spy) == 1
+    assert controller.lockedSettings == bridge.lockedSettings
+    controller.shutdown()
+
+
+def test_microphone_default_monitor_description_is_available_to_ui(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from astra_voice.ui import bridges
+    from astra_voice.worker import audio
+
+    sources = [AudioDevice(1, "monitor", "Колонки", True)]
+    provider = lambda: sources  # noqa: E731
+    monkeypatch.setattr(bridges, "list_devices", provider)
+    monkeypatch.setattr(audio, "_device_introspection", lambda _: (sources, "monitor"))
+    bridge = SettingsBridge(Settings(), device_provider=provider, save=Mock())
+    bridge.refreshDevices()
+    assert bridge.devices[0]["subtitle"] == "Сейчас: Колонки (звук системы)"
+    assert bridge.devices[1]["group"] == "Звук системы"
+
+
+def test_microphone_label_save_failure_rolls_back_choice_and_refresh() -> None:
+    settings = Settings(device_label="Старое имя", extra={"device": "old"})
+    source = AudioDevice(1, "usb", "USB", False, available="yes")
+    save = Mock(side_effect=OSError("write failed"))
+    bridge = SettingsBridge(settings, device_provider=lambda: [source], save=save)
+    bridge.refreshDevices()
+    bridge.setProperty("device", "usb")
+    assert settings.extra["device"] == bridge.device == "old"
+    assert settings.device_label == "Старое имя"
+    source_old = AudioDevice(1, "old", "Новое имя", False, available="yes")
+    bridge._device_provider = lambda: [source_old]
+    bridge.refreshDevices()
+    assert settings.device_label == "Старое имя"
+    assert bridge.devices[1]["label"] == "Новое имя"
+    assert bridge.saveError == "Не удалось сохранить настройки"

@@ -540,3 +540,18 @@ def test_legacy_locked_update_preferences_are_not_enabled(
         loaded.check_app_updates,
         loaded.check_model_updates,
     )
+
+
+def test_device_label_is_optional_without_schema_or_migration_change() -> None:
+    legacy = st.from_dict({"schema_version": 2, "device": "legacy-mic"})
+    assert legacy.device_label is None and legacy.extra["device"] == "legacy-mic"
+    labelled = st.from_dict({"schema_version": 2, "device": "usb", "device_label": "USB-гарнитура"})
+    assert labelled.device_label == "USB-гарнитура"
+    assert labelled.to_dict()["device_label"] == "USB-гарнитура"
+    assert labelled.to_dict()["schema_version"] == st.SCHEMA_VERSION == 2
+    assert st.from_dict(labelled.to_dict()).to_dict() == labelled.to_dict()
+
+
+@pytest.mark.parametrize("value", [False, 1, [], {}])
+def test_device_label_rejects_non_string(value: object) -> None:
+    assert st.from_dict({"device_label": value}).device_label is None

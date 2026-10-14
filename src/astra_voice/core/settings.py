@@ -58,6 +58,7 @@ class Settings:
     pill_enabled: bool = True
     autostart: bool = True  # PRD, экран 5 онбординга (решение заказчика)
     model_id: str | None = None
+    device_label: str | None = None
     language: str = "ru"
     # AppImage: включены по умолчанию; deb: выключены. load() применяет трек.
     # Сам Settings() не разрешает плановые проверки; политика и офлайн главнее.
@@ -137,7 +138,7 @@ def _migrate(data: dict[str, Any]) -> dict[str, Any]:
 
 def _type_ok(name: str, value: Any, default: Any) -> bool:
     """Тип значения совпадает с типом дефолта (bool и int не путаются)."""
-    if name == "model_id":
+    if name in ("model_id", "device_label"):
         return value is None or isinstance(value, str)
     if isinstance(default, bool):
         return isinstance(value, bool)

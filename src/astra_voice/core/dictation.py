@@ -180,6 +180,7 @@ class DictationOrchestrator:
         recording_cue: Callable[[str, tuple[int, str]], None] | None = None,
         command_mode: CommandMode | None = None,
         command_preview: Callable[[str, Callable[[], None]], bool] | None = None,
+        microphone_count: Callable[[], int] = lambda: 0,
     ) -> None:
         self._recording_cue = recording_cue
         self._cue_sessions: dict[tuple[int, str], bool] = {}
@@ -208,6 +209,8 @@ class DictationOrchestrator:
         self._on_device_changed = on_device_changed
         self._on_device_lost = on_device_lost
         self._on_device_selected = on_device_selected
+        # Мост подключается при сборке приложения, после создания runtime.
+        self.microphone_count = microphone_count
         self._on_device_resolved = on_device_resolved
         self._on_silent = on_silent
         self._on_success = on_success
@@ -1007,14 +1010,16 @@ class DictationOrchestrator:
         if not name:
             return
         # audio.ready приходит только при открытии, в том числе после долгих повторов.
-        # Первое обнаружение лишь задаёт исходный микрофон. Последующая реальная
-        # смена между записями даёт «Микрофон: X» (A6), даже после выбора устройства
+        # Первый источник называем при нескольких микрофонах, один раз за сеанс.
+        # Последующая смена между записями даёт «Микрофон: X» (A6), даже после выбора
         # или перезапуска воркера; «Микрофон сменился» остаётся за audio.device.changed.
         previous_name = self._announced_selected_device
         if name == previous_name:
             return
         self._announced_selected_device = name
-        if previous_name is not None and self._on_device_selected is not None:
+        if self._on_device_selected is not None and (
+            previous_name is not None or self.microphone_count() >= 2
+        ):
             self._on_device_selected(name)
 
     def _result(self, text: str, *, duration_s: float | None = None) -> None:

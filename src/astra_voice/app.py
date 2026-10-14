@@ -1689,6 +1689,7 @@ def main(argv: list[str] | None = None) -> int:
             autostart=autostart,
         )
         if runtime_ready and runtime is not None:
+            runtime.orchestrator.microphone_count = settings_bridge.microphone_count
             settings_bridge.bind_command_host(runtime)
             settings_bridge.bind_sound_cues_host(runtime)
             runtime.pill.on_copy_clicked = runtime._copy_last

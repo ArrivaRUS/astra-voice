@@ -28,9 +28,12 @@ Item {
     readonly property string testMessage: root.bridge ? root.bridge.testMessage : ""
     readonly property bool silent: level <= 0.02 // Порог «тишина» по заданию шага 4.
     readonly property bool testing: testState === "preparing" || testState === "recording" || testState === "processing"
-    readonly property bool deviceMissing: device !== "" && deviceIndex(device) === -1
-    readonly property int selectedDeviceIndex: deviceIndex(device) >= 0 ? deviceIndex(device)
-        : deviceIndex("") >= 0 ? deviceIndex("") : 0
+    readonly property int selectedDeviceIndex: deviceIndex(device)
+    readonly property var selectedDevice: selectedDeviceIndex >= 0 ? devices[selectedDeviceIndex] : null
+    readonly property bool deviceMissing: device !== "" && (!selectedDevice || selectedDevice.missing === true)
+    readonly property bool deviceUnavailable: selectedDevice && selectedDevice.available === "no"
+    readonly property bool deviceLocked: bridge && bridge.lockedSettings
+        ? bridge.lockedSettings.indexOf("device") >= 0 : false
     property bool levelMonitorRequested: false
     // Мост сам останавливает проверку по общему потолку эпизода (ИБ, У62):
     // тогда он возвращает idle с пояснением, и продолжить может только человек.
@@ -40,8 +43,11 @@ Item {
         if (!root.bridge || root.levelMonitorRequested === requested)
             return
         root.levelMonitorRequested = requested
-        if (requested)
+        if (requested) {
+            if (typeof root.bridge.refreshDevices === "function")
+                root.bridge.refreshDevices()
             root.bridge.startLevelMonitor()
+        }
         else
             root.bridge.stopLevelMonitor()
     }
@@ -82,7 +88,7 @@ Item {
     function deviceNames() {
         var names = []
         for (var i = 0; i < root.devices.length; ++i)
-            names.push(root.devices[i].name)
+            names.push(root.devices[i].label || root.devices[i].name)
         return names
     }
 
@@ -146,7 +152,8 @@ Item {
             showHint: false
             label: qsTr("Микрофон")
             // Для системного выбора поясняем, какой микрофон фактически используется.
-            sub: root.device === "" && root.bridge ? root.bridge.deviceResolved : ""
+            sub: root.device === "" && root.bridge
+                ? (root.devices[0].subtitle || (root.bridge.deviceResolved ? qsTr("Сейчас: %1").arg(root.bridge.deviceResolved) : "")) : ""
 
             AvSelect {
                 id: deviceSelector
@@ -155,6 +162,9 @@ Item {
                 Layout.preferredWidth: 236 // Макет: ширина списка микрофонов.
                 Layout.alignment: Qt.AlignVCenter
                 model: root.deviceNames()
+                itemDetails: root.devices
+                objectName: "microphoneSelector"
+                enabled: !root.deviceLocked
 
                 // Binding сохраняет синхронизацию после ручного выбора.
                 Binding {
@@ -164,7 +174,7 @@ Item {
                 }
 
                 onActivated: {
-                    if (root.bridge)
+                    if (root.bridge && !root.deviceLocked && currentIndex >= 0)
                         root.bridge.device = root.deviceIdAt(currentIndex)
                 }
             }
@@ -173,10 +183,13 @@ Item {
         Text {
             x: Theme.cardRowPaddingX
             width: parent.width - Theme.cardRowPaddingX * 2
-            visible: root.deviceMissing
+            visible: root.deviceMissing || root.deviceUnavailable
             height: visible ? implicitHeight : 0
             bottomPadding: Theme.cardRowPaddingY
-            text: qsTr("Выбранный раньше микрофон не найден — включён системный по умолчанию")
+            objectName: "microphoneExplanation"
+            text: root.deviceMissing
+                ? qsTr("Подключите его или выберите другой микрофон. Пока у него нет подключения, диктовка не начнётся: «Микрофон отключился».")
+                : qsTr("Подключите его или выберите другой микрофон")
             color: Theme.fgMuted
             font.family: Theme.fontUi
             font.pixelSize: Theme.fontSettingSubSize

@@ -50,7 +50,7 @@ from astra_voice.ui.model_downloads import (
     ModelDownloads,
     ModelPort,
 )
-from astra_voice.worker.audio import AudioDevice, AudioError, list_devices
+from astra_voice.worker.audio import AudioDevice, AudioError, default_device, list_devices
 
 log = logging.getLogger(__name__)
 
@@ -131,7 +131,62 @@ class AutostartControl(Protocol):
     def set_enabled(self, enabled: bool) -> None: ...
 
 
-_DEFAULT_DEVICE = {"id": "", "name": "Системный по умолчанию"}
+_DEFAULT_DEVICE: dict[str, Any] = {
+    "id": "",
+    "label": "Системный по умолчанию",
+    "name": "Системный по умолчанию",
+    "group": "",
+    "available": "unknown",
+    "muted": False,
+    "subtitle": "",
+    "missing": False,
+}
+
+
+def microphone_device_model(
+    devices: list[AudioDevice],
+    selected: str = "",
+    saved_label: str | None = None,
+    default_label: str = "",
+) -> list[dict[str, Any]]:
+    """Готовые пункты выбора; отсутствующий выбор остаётся явным и доступным."""
+    default = {**_DEFAULT_DEVICE, "subtitle": f"Сейчас: {default_label}" if default_label else ""}
+    ordered = sorted(devices, key=lambda device: (device.monitor, device.available == "no"))
+    result = [default]
+    for device in ordered:
+        unavailable = device.available == "no"
+        label = device.label + (" — нет подключения" if unavailable else "")
+        result.append(
+            {
+                "id": device.name,
+                "label": label,
+                "name": label,
+                "popupLabel": (
+                    device.label.removesuffix(" (звук системы)") if device.monitor else label
+                )
+                + (" — нет подключения" if device.monitor and unavailable else ""),
+                "group": "Звук системы" if device.monitor else "",
+                "available": device.available,
+                "muted": unavailable,
+                "subtitle": "",
+                "missing": False,
+            }
+        )
+    if selected and not any(item["id"] == selected for item in result):
+        label = (saved_label or selected) + " — нет подключения"
+        missing = {
+            "id": selected,
+            "label": label,
+            "name": label,
+            "group": "",
+            "available": "no",
+            "muted": True,
+            "subtitle": "",
+            "missing": True,
+        }
+        first_monitor = next((i for i, item in enumerate(result) if item["group"]), len(result))
+        result.insert(first_monitor, missing)
+    return result
 
 
 class SettingsBridge(QObject):
@@ -219,6 +274,7 @@ class SettingsBridge(QObject):
         open_url: Callable[[QUrl], bool] | None = None,
         dialog_factory: Callable[[], str] = QFileDialog.getExistingDirectory,
         device_provider: Callable[[], list[AudioDevice]] = list_devices,
+        default_device_provider: Callable[[list[AudioDevice]], AudioDevice] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -228,7 +284,12 @@ class SettingsBridge(QObject):
         # старте: звуковая служба может подняться позже программы, а устройства —
         # подключаться позже (2026-09-22: в «Общих» нельзя было выбрать микрофон).
         self._device_provider = device_provider
-        self._devices: list[dict[str, str]] = [_DEFAULT_DEVICE.copy()]
+        self._default_device_provider = default_device_provider
+        self._sources: list[AudioDevice] = []
+        self._default_device_label = ""
+        self._devices = microphone_device_model(
+            [], settings.extra.get("device") or "", settings.device_label
+        )
         self._locked = frozenset(locked)
         self._apply = apply
         self._command_host: Any = None
@@ -624,6 +685,7 @@ class SettingsBridge(QObject):
                 self.saveErrorChanged.emit()
                 return
         device_present = "device" in self._settings.extra
+        old_device_label = self._settings.device_label
         old = (
             self._settings.extra.get("device")
             if name == "device"
@@ -645,6 +707,7 @@ class SettingsBridge(QObject):
                 return
         if name == "device":
             self._settings.extra["device"] = value or None
+            self._settings.device_label = self._visible_device_label(cast(str, value))
         else:
             setattr(self._settings, field, value)
         try:
@@ -654,6 +717,7 @@ class SettingsBridge(QObject):
             if hotkey_apply is not None:
                 self.set_hotkey_status(hotkey_apply.hotkey(self.hotkey, self.hotkeyMode) or "ok")
             if name == "device":
+                self._settings.device_label = old_device_label
                 if device_present:
                     self._settings.extra["device"] = old
                 else:
@@ -673,6 +737,7 @@ class SettingsBridge(QObject):
         if self._mirror is not None:
             if name == "device":
                 self._mirror.extra["device"] = value or None
+                self._mirror.device_label = self._settings.device_label
             else:
                 setattr(self._mirror, field, value)
         self._values[name] = value
@@ -701,6 +766,11 @@ class SettingsBridge(QObject):
             if self._command_host is not None:
                 self._command_host.reload_command_hotkey()
                 self.update_command_state()
+        if name == "device":
+            self._devices = microphone_device_model(
+                self._sources, self.device, self._settings.device_label, self._default_device_label
+            )
+            self.devicesChanged.emit()
         getattr(self, name + "Changed").emit()
 
     def bind_command_host(self, host: Any) -> None:
@@ -1162,22 +1232,64 @@ class SettingsBridge(QObject):
         self._set_value("device", value)
 
     @pyqtProperty("QVariantList", notify=devicesChanged)
-    def devices(self) -> list[dict[str, str]]:
-        """Микрофоны для выбора: первый — системный по умолчанию, далее из списка службы."""
+    def devices(self) -> list[dict[str, Any]]:
         return [dict(device) for device in self._devices]
+
+    def _visible_device_label(self, selected: str) -> str | None:
+        if not selected:
+            return None
+        source = next((source for source in self._sources if source.name == selected), None)
+        if source is not None:
+            return source.label
+        return self._settings.device_label if selected == self.device else None
+
+    def microphone_count(self) -> int:
+        """Число микрофонов из последнего успешного перечисления, без I/O."""
+        return sum(not source.monitor for source in self._sources)
 
     @pyqtSlot()
     def refreshDevices(self) -> None:  # noqa: N802
-        """Перечитывает список микрофонов (только список, микрофон не открывается)."""
-        devices = [_DEFAULT_DEVICE.copy()]
+        """Перечитывает метаданные, не открывая микрофон."""
+        self._refresh_devices(self._device_provider)
+
+    def _refresh_devices(self, provider: Callable[[], list[AudioDevice]]) -> None:
+        sources: list[AudioDevice] = []
+        default_label = ""
         try:
-            devices.extend(
-                {"id": device.name, "name": device.label} for device in self._device_provider()
-            )
+            sources = provider()
         except (AudioError, OSError):
             log.warning("Не удалось получить список микрофонов. Доступен системный по умолчанию.")
-        # Число, не имена: имена устройств в журнал не пишем.
-        log.info("Список микрофонов: найдено %d", len(devices) - 1)
+        else:
+            self._sources = list(sources)
+        # Custom providers are fully isolated test/embedding sources.
+        if sources and (self._default_device_provider is not None or provider is list_devices):
+            try:
+                source = (
+                    self._default_device_provider(sources)
+                    if self._default_device_provider is not None
+                    else default_device(sources, allow_monitor=True)
+                )
+                default_label = source.label
+            except (AudioError, OSError):
+                log.debug("Не удалось узнать системный микрофон по умолчанию")
+        selected_source = next((source for source in sources if source.name == self.device), None)
+        if selected_source is not None and selected_source.label != self._settings.device_label:
+            old_label = self._settings.device_label
+            self._settings.device_label = selected_source.label
+            try:
+                self._save(self._settings)
+            except OSError:
+                self._settings.device_label = old_label
+                self._save_error = "Не удалось сохранить настройки"
+                self.saveErrorChanged.emit()
+            else:
+                if self._mirror is not None:
+                    self._mirror.device_label = selected_source.label
+        self._default_device_label = default_label
+        devices = microphone_device_model(
+            sources, self.device, self._settings.device_label, default_label
+        )
+        log.info("Список микрофонов: найдено %d", len(sources))
         if devices != self._devices:
             self._devices = devices
             self.devicesChanged.emit()
@@ -1482,13 +1594,8 @@ class OnboardingController(QObject):
             if open_url is not None
             else lambda url: open_external(url.toString(QUrl.FullyEncoded))
         )
-        self._devices = [_DEFAULT_DEVICE.copy()]
-        try:
-            self._devices.extend(
-                {"id": device.name, "name": device.label} for device in device_provider()
-            )
-        except (AudioError, OSError):
-            log.warning("Не удалось получить список микрофонов. Доступен системный по умолчанию.")
+        self._device_provider = device_provider
+        bridge._refresh_devices(device_provider)
         self._owns_downloads = downloads is None
         self._downloads = downloads if downloads is not None else ModelDownloads(model, clock=clock)
         self._shutting_down = False
@@ -1563,6 +1670,7 @@ class OnboardingController(QObject):
             "device",
         ):
             getattr(bridge, name + "Changed").connect(getattr(self, name + "Changed").emit)
+        bridge.devicesChanged.connect(self.devicesChanged.emit)
         bridge.extraChanged.connect(self._extra_changed)
         self.deviceChanged.connect(self._clear_test)
         if host is not None:
@@ -1841,8 +1949,16 @@ class OnboardingController(QObject):
             self._downloads.shutdown()
 
     @pyqtProperty("QVariantList", notify=devicesChanged)
-    def devices(self) -> list[dict[str, str]]:
-        return [dict(device) for device in self._devices]
+    def devices(self) -> list[dict[str, Any]]:
+        return cast(list[dict[str, Any]], self._bridge.devices)
+
+    @pyqtSlot()
+    def refreshDevices(self) -> None:  # noqa: N802
+        self._bridge._refresh_devices(self._device_provider)
+
+    @pyqtProperty("QStringList", constant=True)
+    def lockedSettings(self) -> list[str]:  # noqa: N802
+        return cast(list[str], self._bridge.lockedSettings)
 
     @pyqtProperty(str, notify=deviceChanged)
     def device(self) -> str:

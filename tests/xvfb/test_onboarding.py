@@ -4420,7 +4420,7 @@ def test_mic_card_with_resolved_default_device_is_57px(onboarding_app: Any, dark
 
     def inspect(root: Any) -> None:
         row = next(item for item in visual_tree(root) if item.property("label") == "Микрофон")
-        assert row.property("sub") == "Встроенный микрофон"
+        assert row.property("sub") == "Сейчас: Встроенный микрофон"
         assert row.height() == 55
         card = microphone_card(root)
         assert row in list(visual_tree(card))
@@ -4447,10 +4447,10 @@ def test_mic_explanation_only_shows_resolved_default_device(
             if item.metaObject().indexOfProperty("currentText") >= 0
         )
         for device, resolved, selected, explanation in (
-            ("", builtin, system_default, builtin),
+            ("", builtin, system_default, "Сейчас: " + builtin),
             ("builtin", builtin, builtin, ""),
             ("", "", system_default, ""),
-            ("", builtin, system_default, builtin),
+            ("", builtin, system_default, "Сейчас: " + builtin),
         ):
             fake.device = device
             fake._deviceResolved = resolved
@@ -4464,7 +4464,9 @@ def test_mic_explanation_only_shows_resolved_default_device(
                 if item.isVisible() and isinstance(item.property("text"), str)
             ]
             assert texts.count(system_default) == int(device == "")
-            assert texts.count(builtin) == int(bool(explanation) or device == "builtin")
+            assert texts.count(builtin) == int(device == "builtin")
+            if explanation:
+                assert texts.count(explanation) == 1
             assert any(
                 item.isVisible() and item.property("text") == selected
                 for item in visual_tree(selector)
@@ -4476,17 +4478,32 @@ def test_mic_explanation_only_shows_resolved_default_device(
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 @pytest.mark.parametrize("default_index", [0, 1, None], ids=["first", "second", "absent"])
-def test_mic_missing_device_displays_fallback_without_writing_bridge(
+def test_mic_missing_device_stays_selected_without_writing_bridge(
     onboarding_app: Any, dark: bool, default_index: int | None
 ) -> None:
     fake = FakeOnboarding()
     fake.step = 4
-    devices = [{"id": "builtin", "name": "Встроенный микрофон"}]
+    devices: list[dict[str, Any]] = [{"id": "builtin", "name": "Встроенный микрофон"}]
     if default_index is not None:
         devices.insert(default_index, {"id": "", "name": "Системный по умолчанию"})
+    missing_label = "USB-гарнитура — нет подключения"
+    devices.append(
+        {
+            "id": "ghost-id",
+            "name": missing_label,
+            "label": missing_label,
+            "available": "no",
+            "muted": True,
+            "group": "",
+            "missing": True,
+        }
+    )
     fake.devices = devices
     fake.device = "ghost-id"
-    explanation = "Выбранный раньше микрофон не найден — включён системный по умолчанию"
+    explanation = (
+        "Подключите его или выберите другой микрофон. Пока у него нет подключения, "
+        "диктовка не начнётся: «Микрофон отключился»."
+    )
 
     def inspect(root: Any) -> None:
         selector = next(
@@ -4494,7 +4511,7 @@ def test_mic_missing_device_displays_fallback_without_writing_bridge(
             for item in visual_tree(root)
             if item.isVisible() and item.metaObject().indexOfProperty("currentText") >= 0
         )
-        expected_index = default_index if default_index is not None else 0
+        expected_index = len(devices) - 1
         assert selector.property("currentIndex") == expected_index
         assert selector.property("currentText") == devices[expected_index]["name"]
         assert any(

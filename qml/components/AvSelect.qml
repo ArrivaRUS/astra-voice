@@ -24,6 +24,21 @@ ComboBox {
     property real popupMaxWidth: 0
     // Ширина самого длинного пункта с паддингами; считается при раскрытии.
     property real itemsWidth: 0
+    // Optional rich rows keep the native ComboBox keyboard/selection behavior.
+    property var itemDetails: []
+
+    function detailsAt(index) {
+        return index >= 0 && index < itemDetails.length ? itemDetails[index] : null
+    }
+    function popupLabel(index) {
+        var item = detailsAt(index)
+        return item ? (item.popupLabel || item.label || item.name) : textAt(index)
+    }
+    function accessibleLabel(index) {
+        var item = detailsAt(index)
+        return item ? (item.group ? item.group + ": " : "") + popupLabel(index) : textAt(index)
+    }
+    Accessible.name: displayText
 
     FontMetrics {
         id: itemMetrics
@@ -34,8 +49,14 @@ ComboBox {
 
     function measureItems() {
         var widest = 0
-        for (var i = 0; i < control.count; ++i)
-            widest = Math.max(widest, itemMetrics.advanceWidth(control.textAt(i)))
+        for (var i = 0; i < control.count; ++i) {
+            widest = Math.max(widest, itemMetrics.advanceWidth(control.popupLabel(i)))
+            var item = detailsAt(i)
+            if (item && item.subtitle)
+                widest = Math.max(widest, itemMetrics.advanceWidth(item.subtitle))
+            if (item && item.group)
+                widest = Math.max(widest, itemMetrics.advanceWidth(item.group))
+        }
         return Math.ceil(widest + Theme.popoverItemPaddingX * 2 + Theme.popoverPadding * 2
                          + Theme.scrollbarW)
     }
@@ -73,7 +94,9 @@ ComboBox {
         text: control.displayText
         font: control.font
         renderType: Text.NativeRendering
-        color: control.enabled ? Theme.fg : Theme.fgDisabled
+        color: !control.enabled ? Theme.fgDisabled
+            : control.detailsAt(control.currentIndex) && control.detailsAt(control.currentIndex).muted
+                ? Theme.fgMuted : Theme.fg
         verticalAlignment: Text.AlignVCenter
         elide: Text.ElideRight
         rightPadding: Theme.selectChevron + Theme.selectGap
@@ -106,33 +129,121 @@ ComboBox {
         }
     }
 
-    delegate: ItemDelegate {
+    // The heading is a sibling of the clickable option, outside its hit area.
+    // The delegate model still contains devices only, so keyboard indices stay native.
+    delegate: Item {
+        id: row
         required property int index
         required property string modelData
 
+        readonly property var details: control.detailsAt(index)
+        readonly property bool groupStart: details && details.group
+            && (index === 0 || !control.detailsAt(index - 1)
+                || control.detailsAt(index - 1).group !== details.group)
+        readonly property real subtitleHeight: details && details.subtitle
+            ? Math.ceil(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight) : 0
+        readonly property real groupHeight: groupStart ? Theme.popoverItemH : 0
         width: control.popup.width - Theme.popoverPadding * 2
-        height: Theme.popoverItemH
-        padding: 0
-        leftPadding: Theme.popoverItemPaddingX
-        rightPadding: Theme.popoverItemPaddingX
+        height: groupHeight + Theme.popoverItemH + subtitleHeight
 
-        contentItem: Text {
-            textFormat: Text.PlainText
-            text: parent.modelData
-            font.family: Theme.fontUi
-            font.pixelSize: Theme.fontMenuItemSize
-            font.weight: parent.index === control.currentIndex ? Font.Medium : Font.Normal
-            renderType: Text.NativeRendering
-            color: parent.index === control.currentIndex ? Theme.selectionFg : Theme.fg
-            verticalAlignment: Text.AlignVCenter
-            elide: Text.ElideRight
+        Item {
+            id: groupHeading
+            visible: row.groupStart
+            width: parent.width
+            height: row.groupHeight
+
+            Rectangle {
+                objectName: "selectGroupDivider"
+                width: parent.width
+                height: 1
+                color: Theme.border
+            }
+            Text {
+                objectName: "selectGroupHeader"
+                x: Theme.popoverItemPaddingX
+                width: parent.width - Theme.popoverItemPaddingX * 2
+                height: parent.height
+                text: row.details && row.details.group ? row.details.group.toUpperCase() : ""
+                textFormat: Text.PlainText
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontGroupCapsSize
+                font.weight: Font.Medium
+                font.capitalization: Font.AllUppercase
+                font.letterSpacing: Theme.fontGroupCapsTracking * Theme.fontGroupCapsSize
+                renderType: Text.NativeRendering
+                color: Theme.fgMuted
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+                Accessible.focusable: false
+            }
+            MouseArea {
+                anchors.fill: parent
+                // Consume pointer events without activating or focusing a device.
+                onPressed: mouse.accepted = true
+                onReleased: mouse.accepted = true
+                onClicked: mouse.accepted = true
+            }
         }
 
-        background: Rectangle {
-            radius: Theme.popoverItemRadius
-            antialiasing: true
-            color: parent.index === control.currentIndex ? Theme.selectionBg
-                 : (parent.hovered ? Theme.stateHoverOnSurface : "transparent")
+        ItemDelegate {
+            id: option
+            objectName: "selectOption"
+            readonly property int deviceIndex: row.index
+            y: row.groupHeight
+            width: parent.width
+            height: Theme.popoverItemH + row.subtitleHeight
+            padding: 0
+            leftPadding: Theme.popoverItemPaddingX
+            rightPadding: Theme.popoverItemPaddingX
+            focusPolicy: Qt.NoFocus
+            Accessible.name: control.accessibleLabel(row.index)
+            onClicked: {
+                control.currentIndex = row.index
+                control.activated(row.index)
+                control.popup.close()
+            }
+
+            contentItem: Column {
+                Text {
+                    objectName: "selectItemLabel"
+                    width: parent.width
+                    height: Theme.popoverItemH
+                    textFormat: Text.PlainText
+                    text: control.popupLabel(row.index)
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontMenuItemSize
+                    font.weight: row.index === control.currentIndex ? Font.Medium : Font.Normal
+                    renderType: Text.NativeRendering
+                    color: row.details && row.details.muted ? Theme.fgMuted
+                        : row.index === control.currentIndex ? Theme.selectionFg : Theme.fg
+                    verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
+                }
+                Text {
+                    objectName: "selectItemSubtitle"
+                    width: parent.width
+                    height: row.subtitleHeight
+                    visible: height > 0
+                    text: row.details && row.details.subtitle || ""
+                    textFormat: Text.PlainText
+                    font.family: Theme.fontUi
+                    font.pixelSize: Theme.fontSettingSubSize
+                    lineHeight: Math.ceil(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+                    lineHeightMode: Text.FixedHeight
+                    renderType: Text.NativeRendering
+                    color: Theme.fgMuted
+                    elide: Text.ElideRight
+                }
+            }
+
+            background: Rectangle {
+                radius: Theme.popoverItemRadius
+                antialiasing: true
+                color: row.index === control.currentIndex ? Theme.selectionBg
+                     : (option.hovered ? Theme.stateHoverOnSurface : "transparent")
+            }
         }
     }
 

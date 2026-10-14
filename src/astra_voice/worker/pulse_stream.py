@@ -56,6 +56,7 @@ from astra_voice.worker.audio import (
     _OpenDeadline,
     _PaBufferAttr,
     _PaSampleSpec,
+    _SourceMetadata,
     classify_change,
     default_device,
     invalidate_device_cache,
@@ -107,14 +108,83 @@ EVENT_QUEUE_LIMIT = 64
 IDLE_DISPATCH_LIMIT = 64
 
 
-class _PaSourceInfoPrefix(ctypes.Structure):
-    """Только читаемый префикс pa_source_info из introspect.h."""
+class _PaChannelMap(ctypes.Structure):
+    _fields_ = [("channels", ctypes.c_uint8), ("map", ctypes.c_int * 32)]
+
+
+class _PaCVolume(ctypes.Structure):
+    _fields_ = [("channels", ctypes.c_uint8), ("values", ctypes.c_uint32 * 32)]
+
+
+class _PaSourcePortInfo(ctypes.Structure):
+    """Стабильный префикс pa_source_port_info до available включительно."""
+
+    _fields_ = [
+        ("name", ctypes.c_char_p),
+        ("description", ctypes.c_char_p),
+        ("priority", ctypes.c_uint32),
+        ("available", ctypes.c_int),
+    ]
+
+
+class _PaSourceInfo(ctypes.Structure):
+    """Полный стабильный ABI pa_source_info из pulse/introspect.h, без packing."""
 
     _fields_ = [
         ("name", ctypes.c_char_p),
         ("index", ctypes.c_uint32),
         ("description", ctypes.c_char_p),
+        ("sample_spec", _PaSampleSpec),
+        ("channel_map", _PaChannelMap),
+        ("owner_module", ctypes.c_uint32),
+        ("volume", _PaCVolume),
+        ("mute", ctypes.c_int),
+        ("monitor_of_sink", ctypes.c_uint32),
+        ("monitor_of_sink_name", ctypes.c_char_p),
+        ("latency", ctypes.c_uint64),
+        ("driver", ctypes.c_char_p),
+        ("flags", ctypes.c_int),
+        ("proplist", ctypes.c_void_p),
+        ("configured_latency", ctypes.c_uint64),
+        ("base_volume", ctypes.c_uint32),
+        ("state", ctypes.c_int),
+        ("n_volume_steps", ctypes.c_uint32),
+        ("card", ctypes.c_uint32),
+        ("n_ports", ctypes.c_uint32),
+        ("ports", ctypes.POINTER(ctypes.POINTER(_PaSourcePortInfo))),
+        ("active_port", ctypes.POINTER(_PaSourcePortInfo)),
+        ("n_formats", ctypes.c_uint8),
+        ("formats", ctypes.POINTER(ctypes.c_void_p)),
     ]
+
+
+# Старое внутреннее имя сохранено для существующих фикстур и ABI-потребителей.
+_PaSourceInfoPrefix = _PaSourceInfo
+_source_metadata_warned = False
+
+
+def _source_metadata(item: _PaSourceInfo, name: str) -> _SourceMetadata:
+    """Копирует скаляры до выхода из callback; при неверном ABI отдаёт запасные значения."""
+    global _source_metadata_warned
+    monitor = item.monitor_of_sink != PA_INVALID_INDEX
+    # c_char_p автоматически читает строку при доступе к атрибуту. Здесь нужен
+    # только NULL/non-NULL: проверяем само значение указателя, не память по нему.
+    monitor_name = ctypes.cast(
+        ctypes.byref(item, _PaSourceInfo.monitor_of_sink_name.offset),
+        ctypes.POINTER(ctypes.c_void_p),
+    ).contents.value
+    valid = item.state in (-1, 0, 1, 2) and monitor == bool(monitor_name)
+    available = 0
+    # Не разыменовываем active_port, если предшествующие поля уже неправдоподобны.
+    if valid and item.active_port:
+        available = item.active_port.contents.available
+        valid = available in (0, 1, 2)
+    if valid:
+        return _SourceMetadata(monitor, {0: "unknown", 1: "no", 2: "yes"}[available], item.state)
+    if not _source_metadata_warned:
+        _source_metadata_warned = True
+        logger.warning("Некорректные метаданные источника PulseAudio; доступность неизвестна.")
+    return _SourceMetadata(name.endswith(".monitor"))
 
 
 class _PaServerInfoPrefix(ctypes.Structure):
@@ -472,6 +542,7 @@ class PulseStreamSource:
         self._introspection_stale = True
         self._introspection_cache: tuple[list[AudioDevice], str | None] | None = None
         self._info_rows: list[tuple[int, str, str | None]] | None = None
+        self._info_metadata: dict[str, _SourceMetadata] = {}
         self._info_eol = 0
         self._info_default: str | None = None
         self._info_server_seen = False
@@ -525,6 +596,7 @@ class PulseStreamSource:
                     else None
                 )
                 self._info_rows.append((item.index, name, description))
+                self._info_metadata[name] = _source_metadata(item, name)
         except Exception:
             self._info_failed = True
             logger.debug("Не удалось скопировать сведения об источнике записи.")
@@ -546,6 +618,7 @@ class PulseStreamSource:
         """Под _ctx_lock читает оба снимка; wait_op ограничивает и освобождает операции."""
         assert self._pulse is not None and self._context is not None
         self._info_rows = []
+        self._info_metadata = {}
         self._info_eol = 0
         self._info_default = None
         self._info_server_seen = self._info_failed = False
@@ -566,7 +639,9 @@ class PulseStreamSource:
             self._pulse.wait_op(op, deadline)
             if not self._info_server_seen or self._info_failed or not self._context_ok():
                 raise _PulseFailure
-            devices = _build_devices(self._info_rows, deadline=deadline)
+            devices = _build_devices(
+                self._info_rows, deadline=deadline, metadata=self._info_metadata
+            )
             deadline.remaining(OPEN_TOTAL_DEADLINE_S)
             self._introspection_cache = (devices, self._info_default)
             return list(devices), self._info_default
@@ -575,6 +650,7 @@ class PulseStreamSource:
             raise
         finally:
             self._info_rows = None
+            self._info_metadata = {}
 
     def _cached_introspection(
         self, deadline: _OpenDeadline
@@ -1067,9 +1143,9 @@ class PulseStreamSource:
             facility = event & PA_SUBSCRIPTION_EVENT_FACILITY_MASK
             if facility in (PA_SUBSCRIPTION_EVENT_SOURCE, PA_SUBSCRIPTION_EVENT_SERVER):
                 self._introspection_stale = True
+                invalidate_device_cache()
             if self._stream is None:
                 self._devices_changed = True
-                invalidate_device_cache()
                 return
             facility = event & PA_SUBSCRIPTION_EVENT_FACILITY_MASK
             kind = event & PA_SUBSCRIPTION_EVENT_TYPE_MASK

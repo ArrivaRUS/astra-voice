@@ -969,6 +969,11 @@ def test_onboarding_context(rig: Rig, done: int | None, runtime_available: bool)
     )
     assert properties["showOnboarding"] is (done is not True)
     assert "settingsBridge" in properties
+    if runtime_available:
+        assert (
+            rig.runtime.orchestrator.microphone_count
+            == properties["settingsBridge"].microphone_count
+        )
     if done is True:
         assert "onboarding" not in properties
     else:

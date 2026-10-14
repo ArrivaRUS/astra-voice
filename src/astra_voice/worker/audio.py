@@ -135,6 +135,9 @@ class AudioDevice:
     # Индекс совпадает с индексом звуковой службы (pactl или object.serial из pw-dump).
     # Иначе это номер узла или порядковый номер, и сверять по нему события нельзя.
     index_exact: bool = field(default=True, compare=False)
+    # Доступность активного порта; SUSPENDED сам по себе не означает отключение.
+    available: str = "unknown"
+    state: int | None = None
 
     @property
     def label(self) -> str:
@@ -143,6 +146,66 @@ class AudioDevice:
 
 
 DeviceIntrospection = Callable[[_OpenDeadline | None], tuple[list[AudioDevice], str | None] | None]
+
+
+@dataclass(frozen=True)
+class _SourceMetadata:
+    monitor: bool
+    available: str = "unknown"
+    state: int | None = None
+
+
+def _port_availability(value: object) -> str:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return {0: "unknown", 1: "no", 2: "yes"}.get(value, "unknown")
+    if isinstance(value, str):
+        return {
+            "unknown": "unknown",
+            "no": "no",
+            "not available": "no",
+            "yes": "yes",
+            "available": "yes",
+        }.get(value.strip().lower(), "unknown")
+    return "unknown"
+
+
+def _monitor_reference(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return 0 <= value < U32_MAX
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "n/a", "null", "none", "-1", str(U32_MAX)}
+    return False
+
+
+def _pactl_source_metadata(item: dict[str, Any], name: str) -> _SourceMetadata:
+    monitor = name.endswith(".monitor") or any(
+        _monitor_reference(item.get(key)) for key in ("monitor_of_sink", "monitor_source")
+    )
+    active = item.get("active_port")
+    active_name = active.get("name") if isinstance(active, dict) else active
+    ports = item.get("ports")
+    port: object = None
+    if isinstance(active_name, str):
+        if isinstance(ports, dict):
+            port = ports.get(active_name)
+        elif isinstance(ports, list):
+            port = next(
+                (p for p in ports if isinstance(p, dict) and p.get("name") == active_name), None
+            )
+    available = (
+        _port_availability(port.get("availability", port.get("available")))
+        if isinstance(port, dict)
+        else "unknown"
+    )
+    raw_state = item.get("state")
+    state = {"RUNNING": 0, "IDLE": 1, "SUSPENDED": 2, "INVALID": -1}.get(
+        raw_state.upper() if isinstance(raw_state, str) else ""
+    )
+    return _SourceMetadata(monitor, available, state)
+
+
 _device_introspection: DeviceIntrospection | None = None
 _introspection_lock = threading.Lock()
 
@@ -289,6 +352,8 @@ def _device_descriptions(
     run: Callable[..., subprocess.CompletedProcess[str]],
     env: dict[str, str],
     deadline: _OpenDeadline | None = None,
+    *,
+    metadata: dict[str, _SourceMetadata] | None = None,
 ) -> dict[str, str]:
     """Дополняет список описаниями, сохраняя работоспособность без поддержки JSON."""
     try:
@@ -320,6 +385,8 @@ def _device_descriptions(
             continue
         name = item.get("name")
         description = item.get("description")
+        if isinstance(name, str) and metadata is not None:
+            metadata[name] = _pactl_source_metadata(item, name)
         if isinstance(name, str) and isinstance(description, str):
             description = _clean_device_description(description)
             # pactl на Astra 1.8 (Fly, 22.09) печатает «(null)» вместо описания —
@@ -477,6 +544,7 @@ def _build_devices(
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     deadline: _OpenDeadline | None = None,
+    metadata: dict[str, _SourceMetadata] | None = None,
 ) -> list[AudioDevice]:
     """Единые порядок, описания и запасные подписи для pactl и интроспекции."""
     rows = sorted(rows, key=lambda row: row[0])
@@ -494,14 +562,25 @@ def _build_devices(
     devices: list[AudioDevice] = []
     fallback_counts: dict[str, int] = {}
     for index, name, _ in rows:
-        monitor = name.endswith(".monitor")
+        details = (metadata or {}).get(name, _SourceMetadata(name.endswith(".monitor")))
+        monitor = details.monitor
         label = descriptions.get(name)
         if label is None:
             fallback = "Звук системы" if monitor else "Микрофон"
             count = fallback_counts.get(fallback, 0) + 1
             fallback_counts[fallback] = count
             label = fallback if count == 1 else f"{fallback} {count}"
-        devices.append(AudioDevice(index, name, label, monitor, index_exact=True))
+        devices.append(
+            AudioDevice(
+                index,
+                name,
+                label,
+                monitor,
+                index_exact=True,
+                available=details.available,
+                state=details.state,
+            )
+        )
     return devices
 
 
@@ -525,7 +604,8 @@ def list_devices(
             raise AudioError(ERROR_FAILED, message)
         return fallback_devices
     logger.debug("pactl list short sources: строк %d", len(output.splitlines()))
-    descriptions = _device_descriptions(run, env, deadline)
+    metadata: dict[str, _SourceMetadata] = {}
+    descriptions = _device_descriptions(run, env, deadline, metadata=metadata)
     rows = []
     for line in output.splitlines():
         fields = line.split("\t")
@@ -537,7 +617,7 @@ def list_devices(
             continue
         if index >= 0:
             rows.append((index, fields[1], descriptions.get(fields[1])))
-    return _build_devices(rows, run=run, deadline=deadline)
+    return _build_devices(rows, run=run, deadline=deadline, metadata=metadata)
 
 
 def default_device(
@@ -545,21 +625,24 @@ def default_device(
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] | None = None,
     deadline: _OpenDeadline | None = None,
+    allow_monitor: bool = False,
 ) -> AudioDevice:
-    """Проверяет фактическое умолчание, запрещая неявную запись звука системы."""
+    """Проверяет умолчание; интерфейс может прочитать монитор только для подписи."""
     run = subprocess.run if run is None else run
     if run is subprocess.run:
         provided = _provided_devices(deadline)
         if provided is not None:
-            return _default_from_name(provided[1], provided[0])
+            return _default_from_name(provided[1], provided[0], allow_monitor=allow_monitor)
     env = {**childenv.clean_env(keep_pulse_config=True), "LC_ALL": "C"}
     output = _run_text(run, ["pactl", "get-default-source"], env, deadline)
     if output is None:
         output = _pipewire_default_name(run, env, deadline)
-    return _default_from_name(output, devices)
+    return _default_from_name(output, devices, allow_monitor=allow_monitor)
 
 
-def _default_from_name(name: str | None, devices: list[AudioDevice]) -> AudioDevice:
+def _default_from_name(
+    name: str | None, devices: list[AudioDevice], *, allow_monitor: bool = False
+) -> AudioDevice:
     """Проверяет имя умолчания одинаково для libpulse и запасного пути."""
     message = "Микрофон не найден. Выберите устройство записи в настройках."
     name = name.strip() if name is not None else ""
@@ -568,7 +651,7 @@ def _default_from_name(name: str | None, devices: list[AudioDevice]) -> AudioDev
         raise AudioError(ERROR_NO_DEVICE, message)
     for device in devices:
         if device.name == name:
-            if device.monitor:
+            if device.monitor and not allow_monitor:
                 logger.debug("Устройство записи по умолчанию — монитор: %r", name)
                 raise AudioError(
                     ERROR_NO_DEVICE,
