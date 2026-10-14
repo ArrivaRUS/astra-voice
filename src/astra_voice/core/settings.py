@@ -11,14 +11,14 @@ import json
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HOTKEY_MODES = ("ptt", "toggle")
 
 
@@ -58,9 +58,12 @@ class Settings:
     pill_enabled: bool = True
     autostart: bool = True  # PRD, экран 5 онбординга (решение заказчика)
     model_id: str | None = None
+    device_label: str | None = None
+    device_label_id: str | None = None
     language: str = "ru"
-    # Сеть по умолчанию выключена во всех профилях (PRD §«Сеть по умолчанию»,
-    # синтез-план §6.5): ни одного соединения без явного действия пользователя.
+    # AppImage: включены по умолчанию; deb: выключены. load() применяет трек.
+    # Сам Settings() не разрешает плановые проверки; политика и офлайн главнее.
+    # До прохождения экрана 1 онбординга плановая проверка не запускается.
     check_app_updates: bool = False
     check_model_updates: bool = False
     # Офлайн-режим пользователя (PRD F14.2): перекрывает оба тумблера и скачивание
@@ -77,13 +80,50 @@ class Settings:
         return data
 
 
+def update_checks_default(appimage: bool | None = None) -> bool:
+    """Трек проверяется при вызове, без чтения файловой системы при импорте."""
+    if appimage is None:
+        from astra_voice.core import paths
+
+        appimage = paths.install_kind().is_appimage
+    return appimage
+
+
+def defaults(*, appimage: bool | None = None, locked: Iterable[str] = ()) -> Settings:
+    """Свежие настройки трека; замок без значения сохраняет старое off."""
+    enabled = update_checks_default(appimage)
+    locked = frozenset(locked)
+    return Settings(
+        check_app_updates=enabled and "check_app_updates" not in locked,
+        check_model_updates=enabled and "check_model_updates" not in locked,
+        extra={"update_defaults_migrated": True} if enabled else {},
+    )
+
+
+def _enable_update_checks(
+    data: dict[str, Any], *, appimage: bool, locked: Iterable[str] = ()
+) -> dict[str, Any]:
+    # До 0.1.5 сохранялись все дефолты, поэтому старое false не позволяет
+    # отличить выбор пользователя. В AppImage включаем оба один раз; deb не меняем.
+    if not appimage or data.get("update_defaults_migrated") is True:
+        return data
+    data = {**data, "update_defaults_migrated": True}
+    for key in ("check_app_updates", "check_model_updates"):
+        if key not in locked:
+            data[key] = True
+    return data
+
+
 # Миграции вперёд: ключ — версия, из которой мигрируем; значение — функция в версию+1.
-MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {}
+MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    0: dict,
+    1: dict,
+}
 
 
 def _migrate(data: dict[str, Any]) -> dict[str, Any]:
     raw = data.get("schema_version", 0)
-    current = raw if isinstance(raw, int) else 0
+    current = raw if type(raw) is int and raw >= 0 else 0
     while current < SCHEMA_VERSION:
         step = MIGRATIONS.get(current)
         if step is None:
@@ -99,14 +139,16 @@ def _migrate(data: dict[str, Any]) -> dict[str, Any]:
 
 def _type_ok(name: str, value: Any, default: Any) -> bool:
     """Тип значения совпадает с типом дефолта (bool и int не путаются)."""
-    if name == "model_id":
+    if name in ("model_id", "device_label", "device_label_id"):
         return value is None or isinstance(value, str)
     if isinstance(default, bool):
         return isinstance(value, bool)
     return isinstance(value, type(default)) and not isinstance(value, bool)
 
 
-def from_dict(data: dict[str, Any]) -> Settings:
+def from_dict(
+    data: dict[str, Any], *, appimage: bool = False, locked: Iterable[str] = ()
+) -> Settings:
     """Строит :class:`Settings`, подставляя дефолты вместо негодных значений."""
     known = {f.name: f for f in fields(Settings) if f.name != "extra"}
     values: dict[str, Any] = {}
@@ -118,7 +160,8 @@ def from_dict(data: dict[str, Any]) -> Settings:
             extra[key] = value
             continue
         values[key] = value
-    settings = Settings(extra=extra)
+    settings = defaults(appimage=appimage, locked=locked)
+    settings.extra = extra
     for name, value in values.items():
         if _type_ok(name, value, getattr(settings, name)):
             setattr(settings, name, value)
@@ -162,8 +205,20 @@ def _quarantine(path: Path) -> None:
         log.warning("%s испорчен, переименован в %s, беру значения по умолчанию", path, backup)
 
 
-def load(path: Path | None = None, *, quarantine: bool = True) -> Settings:
-    """Читает настройки; при порче возвращает дефолты, при необходимости сохраняя файл."""
+def load(
+    path: Path | None = None,
+    *,
+    quarantine: bool = True,
+    locked: Iterable[str] = (),
+    appimage: bool | None = None,
+) -> Settings:
+    """Читает настройки и сохраняет миграцию схемы и AppImage-маркер.
+
+    ``quarantine=False`` отключает переименование повреждённого файла и запись
+    миграции/маркера: файл остаётся нетронутым.
+    """
+    appimage = update_checks_default(appimage)
+    locked = frozenset(locked)
     if path is None:
         from astra_voice.core.paths import settings_path
 
@@ -171,21 +226,33 @@ def load(path: Path | None = None, *, quarantine: bool = True) -> Settings:
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return Settings()
+        return defaults(appimage=appimage, locked=locked)
     except OSError as exc:  # noqa: BLE001
         log.warning("не удалось прочитать %s: %s", path, exc)
-        return Settings()
+        return defaults(appimage=appimage, locked=locked)
     try:
         data = json.loads(raw)
     except ValueError:
         if quarantine:
             _quarantine(path)
-        return Settings()
+        return defaults(appimage=appimage, locked=locked)
     if not isinstance(data, dict):
         if quarantine:
             _quarantine(path)
-        return Settings()
-    return from_dict(_migrate(data))
+        return defaults(appimage=appimage, locked=locked)
+    previous_schema = data.get("schema_version")
+    previous_marker = data.get("update_defaults_migrated")
+    migrated = _enable_update_checks(_migrate(data), appimage=appimage, locked=locked)
+    settings = from_dict(migrated, appimage=appimage, locked=locked)
+    if quarantine and (
+        (previous_schema != SCHEMA_VERSION and migrated["schema_version"] == SCHEMA_VERSION)
+        or (previous_marker is not True and migrated.get("update_defaults_migrated") is True)
+    ):
+        try:
+            save(settings, path)
+        except OSError as exc:
+            log.warning("не удалось сохранить миграцию %s: %s", path, exc)
+    return settings
 
 
 def save(settings: Settings, path: Path | None = None) -> None:

@@ -68,9 +68,19 @@ Column {
     function deviceNames() {
         var names = []
         for (var i = 0; i < root.devices.length; ++i)
-            names.push(root.devices[i].name)
+            names.push(root.devices[i].label || root.devices[i].name)
         return names
     }
+
+    readonly property int selectedDeviceIndex: deviceIndex(root.settings ? root.settings.device : "")
+    readonly property var selectedDevice: selectedDeviceIndex >= 0 ? devices[selectedDeviceIndex] : null
+    readonly property bool deviceMissing: selectedDevice && selectedDevice.id !== ""
+        && selectedDevice.available === "no"
+    readonly property string deviceSubtitle: deviceMissing
+        ? selectedDevice.missing === true
+            ? qsTr("Подключите его или выберите другой микрофон. Пока у него нет подключения, диктовка не начнётся: «Микрофон отключился».")
+            : qsTr("Подключите его или выберите другой микрофон")
+        : selectedDevice && selectedDevice.id === "" ? selectedDevice.subtitle || "" : ""
 
     function deviceIndex(deviceId) {
         for (var i = 0; i < root.devices.length; ++i) {
@@ -261,7 +271,8 @@ Column {
             readonly property bool locked: root.isLocked("device")
             width: parent.width
             implicitHeight: Theme.spaceCardRowDivider + Theme.cardRowPaddingY * 2
-                + micAxis.height + (policyBadge.visible ? 4 + policyBadge.height : 0)
+                + micAxis.height + (deviceExplanation.visible ? 4 + deviceExplanation.height : 0)
+                + (policyBadge.visible ? 4 + policyBadge.height : 0)
                 + (micStatus.visible ? 4 + micStatus.implicitHeight : 0)
             height: implicitHeight
 
@@ -322,16 +333,17 @@ Column {
                     anchors.verticalCenter: parent.verticalCenter
                     enabled: !deviceRow.locked
                     model: root.deviceNames()
+                    itemDetails: root.devices
+                    objectName: "microphoneSelector"
                     // Apply the saved index after ComboBox's model reset; this is
                     // programmatic reconciliation, never a setting write.
                     onModelChanged: Qt.callLater(function() {
-                        deviceSelector.currentIndex = Math.max(0,
-                            root.deviceIndex(root.settings ? root.settings.device : ""))
+                        deviceSelector.currentIndex = root.selectedDeviceIndex
                     })
                     Binding {
                         target: deviceSelector
                         property: "currentIndex"
-                        value: Math.max(0, root.deviceIndex(root.settings ? root.settings.device : ""))
+                        value: root.selectedDeviceIndex
                     }
 
                     onActivated: {
@@ -440,10 +452,29 @@ Column {
                     onClicked: if (root.settings) root.settings.openSoundSettings()
                 }
             }
+            Text {
+                id: deviceExplanation
+                objectName: "microphoneExplanation"
+                x: Theme.cardRowPaddingX
+                y: micAxis.y + micAxis.height + 4
+                width: micAxis.width
+                visible: root.deviceSubtitle !== ""
+                height: visible ? implicitHeight : 0
+                text: root.deviceSubtitle
+                textFormat: Text.PlainText
+                color: Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontSettingSubSize
+                lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+                lineHeightMode: Text.FixedHeight
+                renderType: Text.NativeRendering
+                wrapMode: Text.WordWrap
+            }
             Rectangle {
                 id: policyBadge
                 x: Theme.cardRowPaddingX
-                y: micAxis.y + micAxis.height + 4
+                y: (deviceExplanation.visible ? deviceExplanation.y + deviceExplanation.height
+                    : micAxis.y + micAxis.height) + 4
                 width: policyContent.implicitWidth + Theme.lockBadgePaddingX * 2
                 height: Theme.badgeHeight
                 radius: Theme.lockBadgeRadius
@@ -475,6 +506,7 @@ Column {
                 id: micStatus
                 x: Theme.cardRowPaddingX
                 y: (policyBadge.visible ? policyBadge.y + policyBadge.height
+                    : deviceExplanation.visible ? deviceExplanation.y + deviceExplanation.height
                     : micAxis.y + micAxis.height) + 4
                 width: micAxis.width
                 visible: root.canRaiseMic && !micSlider.visible

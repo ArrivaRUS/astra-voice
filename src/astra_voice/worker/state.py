@@ -467,13 +467,17 @@ class WorkerState:
                 logger.info("Истёк срок хранения остановленного буфера: %s.", uid)
 
     @staticmethod
-    def audio_ready(device: str | None = None, changed: str | None = None) -> Message:
+    def audio_ready(
+        device: str | None = None, changed: str | None = None, mics: int | None = None
+    ) -> Message:
         """Формирует событие после успешного открытия устройства в M3."""
         ready: Message = {"type": "audio.ready"}
         if device is not None:
             ready["device"] = device
         if changed is not None:
             ready["changed"] = changed
+        if mics is not None:
+            ready["mics"] = mics
         return ready
 
     def _has_job(self, uid: str) -> bool:

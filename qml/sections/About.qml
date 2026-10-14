@@ -164,13 +164,25 @@ Column {
     }
 
     function updatesLine() {
-        if (!root.about)
+        var refusal = root.updates ? root.updates.checkRefusal : ""
+        if (!root.settings && !refusal)
             return qsTr("Нет сведений")
+        var locked = root.settings && root.settings.lockedSettings
+            && root.settings.lockedSettings.indexOf("check_app_updates") >= 0
+        var state = refusal === "admin" || refusal === "policy"
+            || (locked && !root.settings.checkAppUpdates)
+            ? qsTr("Отключена администратором")
+            : refusal === "offline" || (root.settings && root.settings.offline)
+                ? qsTr("Отключена: офлайн-режим")
+                : root.settings && root.settings.checkAppUpdates
+                    ? qsTr("Автоматически раз в сутки") : qsTr("Только вручную")
+        if (!root.about)
+            return state + " · " + qsTr("нет сведений")
         var attempt = root.about.lastAttemptText
         var success = root.about.lastSuccessText
         if (attempt === "" && success === "")
-            return qsTr("Ещё не проверялись")
-        return qsTr("Последняя попытка: %1 · последний успех: %2")
+            return state + " · " + qsTr("ещё не проверялись")
+        return state + " · " + qsTr("последняя попытка: %1 · последний успех: %2")
             .arg(attempt !== "" ? attempt : qsTr("не было"))
             .arg(success !== "" ? success : qsTr("не было"))
     }
@@ -315,18 +327,6 @@ Column {
                 renderType: Text.NativeRendering
                 Layout.alignment: Qt.AlignVCenter
             }
-
-            AvButton {
-                objectName: "aboutCheckUpdates"
-                small: true
-                iconName: "refresh"
-                text: qsTr("Проверить обновления")
-                visible: root.updates !== null
-                enabled: root.updates !== null && root.updates.canCheckNow
-                    && root.updates.state !== "checking"
-                Layout.alignment: Qt.AlignVCenter
-                onClicked: { if (root.updates) root.updates.checkNow(); }
-            }
         }
 
         SettingRow {
@@ -411,7 +411,7 @@ Column {
             width: parent.width
             showHint: false
             label: qsTr("Приватность и сетевые хосты")
-            sub: qsTr("Звук и текст не покидают компьютер и не сохраняются на диск. Сеть нужна только для скачивания моделей с huggingface.co (или с зеркала администратора) и проверки новой версии на github.com — по кнопке или раз в сутки, если вы это включили.")
+            sub: qsTr("Звук и текст не покидают компьютер и не сохраняются на диск. Сеть нужна только для скачивания моделей с huggingface.co (или с зеркала администратора) и проверки новых версий на github.com — по кнопке и раз в сутки, если автопроверка включена (в «Сеть и обновления»; в AppImage включена по умолчанию).")
 
             AvButton {
                 objectName: "aboutOpenPrivacy"

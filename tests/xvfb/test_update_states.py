@@ -254,7 +254,7 @@ def app() -> Any:
     return get_qapplication()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="module", autouse=True)
 def pt_root_ui_fonts(app: Any) -> None:
     # Use the actual font so fallback geometry cannot conceal final-glyph clipping.
     paths = sorted((REPO / "tests/fixtures/fonts/pt-root-ui").glob("*.ttf"))
@@ -440,7 +440,7 @@ def test_footer_state_snapshot(app: Any, case: str, dark: bool) -> None:
         "available": "Доступна версия 0.2.1 · Подробнее",
         "available-snoozed": "Доступна версия 0.2.1 · Подробнее",
         "unavailable": "Источник обновлений недоступен · Повторить",
-        "error-net": "Не удалось скачать обновление · Повторить",
+        "error-net": "Не удалось проверить обновления · Повторить",
         "skipped": "Версия 0.2.1 пропущена · Показать",
         "idle": None,
     }[case]
@@ -463,7 +463,7 @@ def test_footer_state_snapshot(app: Any, case: str, dark: bool) -> None:
         ({}, "Доступна версия 0.1.4 · Подробнее"),
         ({"snoozed": True}, "Доступна версия 0.1.4 · Подробнее"),
         ({"state": "unavailable"}, "Источник обновлений недоступен · Повторить"),
-        ({"state": "error-net"}, "Не удалось скачать обновление · Повторить"),
+        ({"state": "error-net"}, "Не удалось проверить обновления · Повторить"),
         ({"state": "skipped"}, "Версия 0.1.4 пропущена · Показать"),
         ({"networkRefusal": "offline"}, "Офлайн-режим · Подробнее"),
         ({"downloadPhase": "metadata"}, "Проверяю сведения об обновлении…"),
@@ -651,11 +651,14 @@ def test_network_section_snapshot(app: Any, case: str, dark: bool) -> None:
     # Подзаголовок target M7/action2b учитывает и скачивание программы.
     assert "Сетевые проверки и обновления программы" in texts
     assert "Четыре сетевых действия — и ни одного больше" not in texts
-    # Скрыто до своих вех: тумблер моделей (v1.0), «Обновить из файла…» и ключи (M8).
-    assert "Проверять обновления моделей" not in texts
+    # Тумблер моделей виден и сохраняет выбор; ручная проверка каталога ещё не реализована.
+    assert "Проверять обновления моделей" in texts
     assert "Обновить из файла…" not in texts
     assert not {text for text in texts if "trust" in text.lower()}
     panel_title = {
+        "network-base": "Установлена версия",
+        "network-offline": "Установлена версия",
+        "network-policy": "Установлена версия",
         "panel-available": "Доступна версия",
         "panel-checking": "Проверяю обновления…",
         "panel-uptodate": "Установлена последняя версия",
@@ -668,9 +671,9 @@ def test_network_section_snapshot(app: Any, case: str, dark: bool) -> None:
         assert {"Что нового", *NOTE_LINES, "Скачать новую версию", "Пропустить эту версию"} <= texts
         assert not {"Страница выпуска", "Напомнить позже"} & texts
     if case == "panel-uptodate":
-        assert {"Версия ", "0.2.0"} <= texts
+        assert {"Установлена последняя версия", "0.2.0"} <= texts
     if case == "network-offline":
-        assert "Недоступно: включён офлайн-режим" in texts
+        assert "Проверить сейчас нельзя: включён офлайн-режим." in texts
     save_snapshot(image, f"{case}-{'dark' if dark else 'light'}.png")
 
 
@@ -747,6 +750,12 @@ def test_check_now_button(
 
     def inspect(window: Any) -> None:
         button = find_object(window, "checkNowButton")
+        assert button.isVisible()
+        panel = find_object(window, "updatePanel")
+        parent = button.parentItem()
+        while parent is not None and parent is not panel:
+            parent = parent.parentItem()
+        assert parent is panel, "check action must be inside the result panel"
         assert button.property("enabled") is enabled
         if enabled:
             onboarding.click_item(button)
@@ -918,7 +927,115 @@ def test_panel_marker_and_mono_version(app: Any) -> None:
 
     try:
         _, texts, _ = render_network(app, False, updates, settings, inspect_version)
-        assert "Версия " in texts
+        assert "Установлена последняя версия" in texts
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+
+
+@pytest.mark.parametrize(
+    "field,name,host",
+    [
+        ("checkAppUpdates", "checkAppUpdatesToggle", "github.com"),
+        ("checkModelUpdates", "checkModelUpdatesToggle", "huggingface.co"),
+    ],
+)
+@pytest.mark.parametrize("mode", ["ordinary", "offline", "policy"])
+def test_network_check_toggles_visible_and_follow_effective_settings(
+    app: Any, field: str, name: str, host: str, mode: str
+) -> None:
+    changes: dict[str, Any] = {}
+    values: dict[str, Any] = {}
+    if mode == "offline":
+        changes["_offline"] = True
+        values = {"networkRefusal": "offline", "checkRefusal": "offline", "canCheckNow": False}
+    elif mode == "policy":
+        changes["_lockedSettings"] = ["check_app_updates", "check_model_updates"]
+        changes["_checkAppUpdates"] = changes["_checkModelUpdates"] = False
+        values = {"networkRefusal": "admin", "checkRefusal": "admin", "canCheckNow": False}
+    updates = FakeUpdates(**values)
+    settings = make_settings(changes)
+
+    def inspect(window: Any) -> None:
+        control = find_object(window, name)
+        assert control.isVisible()
+        assert control.property("checked") is (mode != "policy")
+        assert control.property("enabled") is (mode == "ordinary")
+        texts = onboarding.visible_texts(window.contentItem())
+        hint = (
+            ("Раз в сутки, " if field == "checkAppUpdates" else "")
+            + host
+            + ". Скачивание — только по вашему нажатию."
+            if mode == "ordinary"
+            else "Не работает, пока включён офлайн-режим."
+            if mode == "offline"
+            else "Администратор отключил проверку обновлений на этом компьютере."
+        )
+        assert hint in texts
+        before = settings.property(field)
+        onboarding.click_item(control)
+        app.processEvents()
+        assert settings.property(field) is (not before if mode == "ordinary" else before)
+        assert updates.calls == []
+
+    try:
+        _, _, messages = render_network(app, False, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+
+
+@pytest.mark.parametrize("manual", [False, True], ids=["scheduled", "manual"])
+def test_checking_is_visible_in_result_panel_and_retains_manual_result(
+    app: Any, manual: bool
+) -> None:
+    updates = FakeUpdates(state="checking", manual=manual)
+    settings = make_settings({})
+
+    def inspect(window: Any) -> None:
+        panel = find_object(window, "updatePanel")
+        button = find_object(window, "checkNowButton")
+        assert panel.isVisible() and button.isVisible()
+        assert button.property("enabled") is False
+        texts = onboarding.visible_texts(panel)
+        assert "Проверяю обновления…" in texts
+        assert "Ищу новую версию и проверяю подпись сведений о ней." in texts
+        updates.update(state="uptodate", manual=True, checkedText="Проверено сегодня в 14:02")
+        app.processEvents()
+        assert button.property("enabled") is True
+        assert "Установлена последняя версия" in onboarding.visible_texts(panel)
+        QTest.qWait(3200)
+        app.processEvents()
+        assert "Установлена последняя версия" in onboarding.visible_texts(panel)
+        assert "0.2.0" in onboarding.visible_texts(panel)
+        assert updates.calls == []
+
+    try:
+        _, _, messages = render_network(app, False, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+
+
+@pytest.mark.parametrize("state", ["idle", "disabled", "unavailable", "error-net", "skipped"])
+def test_compact_panel_is_always_visible_with_manual_check(app: Any, state: str) -> None:
+    updates = FakeUpdates(state=state, version="0.2.1" if state == "skipped" else "")
+    settings = make_settings({"_checkAppUpdates": state != "disabled"})
+
+    def inspect(window: Any) -> None:
+        panel = find_object(window, "updatePanel")
+        button = find_object(window, "checkNowButton")
+        assert panel.isVisible() and button.isVisible() and button.property("enabled")
+        assert "Вручную" not in onboarding.visible_texts(window.contentItem())
+        assert "Проверить сейчас" in onboarding.visible_texts(panel)
+        onboarding.click_item(button)
+        assert updates.calls == ["checkNow"]
+
+    try:
+        _, _, messages = render_network(app, False, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
     finally:
         sip.delete(updates)
         sip.delete(settings)

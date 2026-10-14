@@ -380,5 +380,8 @@ def test_settings_file_created_on_first_start(
     import json
 
     data = json.loads(settings.read_text(encoding="utf-8"))
-    assert data["schema_version"] == 1
-    assert data["check_app_updates"] is False
+    from astra_voice.core.settings import SCHEMA_VERSION
+
+    assert data["schema_version"] == SCHEMA_VERSION
+    assert data["check_app_updates"] is False  # Запуск из исходников, не AppImage.
+    assert data["check_model_updates"] is False

@@ -166,6 +166,7 @@ class UpdateChecker:
         self._manual_view = False
         self._next_due = 0.0
         self._start_delay_s = 0.0
+        self._scheduled_enabled = True
 
     # -- публичное API (любой поток) -------------------------------------
 
@@ -174,18 +175,28 @@ class UpdateChecker:
         with self._lock:
             return self._status
 
-    def start(self, *, delay_s: float = STARTUP_DELAY_S) -> None:
-        """Запускает поток; плановая проверка — не раньше чем через ``delay_s``."""
+    def start(self, *, delay_s: float = STARTUP_DELAY_S, scheduled: bool = True) -> None:
+        """Запускает поток; ``scheduled=False`` ждёт прохождения экрана 1."""
         with self._lock:
             if self._thread is not None or self._stop.is_set():
                 return
             self._start_delay_s = max(0.0, delay_s)
+            self._scheduled_enabled = scheduled
             self._thread = threading.Thread(target=self._run, name="update-checker", daemon=True)
             self._thread.start()
 
     def check_now(self) -> None:
         """«Проверить сейчас»: без лимита частоты, окно 429 уважается."""
         self._request(manual=True)
+
+    def enable_scheduled_checks(self) -> None:
+        """Экран 1 пройден: однократно разрешить плановые проверки с задержкой."""
+        self._request(action=self._enable_scheduled_checks)
+
+    def _enable_scheduled_checks(self) -> None:
+        if not self._scheduled_enabled:
+            self._next_due = max(self._next_due, self._clock() + self._start_delay_s)
+            self._scheduled_enabled = True
 
     def refresh(self) -> None:
         """Настройки или политика изменились: пересчитать строку без сети."""
@@ -276,7 +287,11 @@ class UpdateChecker:
         if manual:
             self._check(manual=True)
             return  # срок плановой проверки оценивается следующим кругом
-        if self._clock() >= self._next_due and self._gate.refusal("check_app") == "":
+        if (
+            self._scheduled_enabled
+            and self._clock() >= self._next_due
+            and self._gate.refusal("check_app") == ""
+        ):
             self._check(manual=False)
         else:
             # Итог ручной проверки держится до refresh(): иначе следующий круг
@@ -297,6 +312,8 @@ class UpdateChecker:
         return max(0.05, min(wake))
 
     def _check(self, *, manual: bool) -> None:
+        if not manual and not self._scheduled_enabled:
+            return
         kind: Literal["check_app", "check_app_manual"] = (
             "check_app_manual" if manual else "check_app"
         )
@@ -305,7 +322,7 @@ class UpdateChecker:
             return
         if manual:
             self._manual_view = True
-            self._publish(replace(self._compose(), state="checking", manual=True))
+        self._publish(replace(self._compose(), state="checking", manual=manual))
         previous_entry = self._cache.get(github.CACHE_KEY)
         failures_before = previous_entry.failures if previous_entry.url == self._url else 0
         try:

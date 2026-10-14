@@ -15,6 +15,7 @@ import unicodedata
 import wave
 from array import array
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from queue import Empty, Queue
@@ -662,11 +663,13 @@ def test_device_cache_second_default_open_skips_commands(
     first = source_factory()
     with caplog.at_level(logging.INFO, logger="astra_voice.worker.audio"):
         first.open(None)
+        assert first.microphone_count == 1
         first.close()
         assert [command[0] for command in commands] == ["pactl", "pactl", "pactl", "wpctl"]
         second = source_factory()
         now[0] += DEVICE_CACHE_TTL_S - 0.001
         second.open(None)
+        assert second.microphone_count == 1
         second.close()
     assert len(commands) == 4
     if source_backend.backend == "simple":
@@ -2045,7 +2048,7 @@ def test_record_start_resolves_default_and_reports_changes(
             assert worker.handle({"type": "record.start", "utterance_id": str(index)}) == []
             wait_capture()
         ready = [event for _, event in probe.drain() if event["type"] == "audio.ready"]
-        expected: Message = {"type": "audio.ready", "device": microphone.label}
+        expected: Message = {"type": "audio.ready", "device": microphone.label, "mics": 2}
         if index < 2:
             expected["changed"] = f"Источник звука изменился: {microphone.label}"
         assert ready == [expected]
@@ -2103,7 +2106,11 @@ def test_capture_reports_device_changes_between_recordings(
             str(index), device.name if device is not None else None, limit_s=LIMIT_S_DEFAULT
         )
         wait_capture()
-        expected: Message = {"type": "audio.ready", "device": selected.label}
+        expected: Message = {
+            "type": "audio.ready",
+            "device": selected.label,
+            "mics": int(not selected.monitor),
+        }
         if changed_label is not None:
             expected["changed"] = f"Источник звука изменился: {changed_label}"
         assert [event for _, event in probe.drain()] == [expected]
@@ -2146,6 +2153,7 @@ def test_capture_bounds_change_notification(
     assert event == {
         "type": "audio.ready",
         "device": device.label,
+        "mics": int(not monitor),
         "changed": prefix + "Ё" * (MAX_DEVICE_LABEL - len(prefix) - 1) + "…",
     }
     assert len(event["changed"]) == len(event["device"]) == MAX_DEVICE_LABEL
@@ -3543,7 +3551,13 @@ def test_introspection_matches_pactl_devices_and_description_fallback(
     short = "\n".join(f"{index}\t{name.decode()}" for index, name, _ in pulse.sources if name)
     details = json.dumps(
         [
-            {"name": name.decode(), "description": description.decode()}
+            {
+                "name": name.decode(),
+                "description": description.decode(),
+                "state": "SUSPENDED",
+                "active_port": "test.port",
+                "ports": [{"name": "test.port", "availability": "available"}],
+            }
             for _, name, description in pulse.sources
             if name and description is not None
         ]
@@ -3607,8 +3621,9 @@ def test_device_provider_unavailable_uses_original_commands(
             source.shutdown()
     run.reset_mock()
     devices = list_devices()
-    assert devices == [MIC]
-    assert default_device(devices) == MIC
+    expected = replace(MIC, available="unknown", state=None)
+    assert devices == [expected]
+    assert default_device(devices) == expected
     assert [call.args[0] for call in run.call_args_list] == [
         ["pactl", "list", "short", "sources"],
         ["pactl", "-f", "json", "list", "sources"],

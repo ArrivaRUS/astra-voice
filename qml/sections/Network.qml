@@ -1,9 +1,6 @@
-// Раздел «Сеть и обновления» — design/spec.md §6; референсы design/refs/04-network.png и
-// 04-update-panel.png (+ -dark). M7-ядро v0.2: тумблер проверки обновлений утилиты,
-// офлайн-режим (перекрывает тумблер и скачивание), «Проверить сейчас» и панель «Что нового».
-// Не показываем до своих вех: тумблер обновлений моделей (v1.0), «Источники» (M10),
-// «Обновить из файла…» и доверенные ключи (M8).
-// Без мостов раздел открывается с дефолтами: тумблеры выключены, панели нет.
+// «Сеть и обновления»: проверка и результат в одном постоянно видимом блоке.
+// AppImage: обе проверки включены по умолчанию; deb: выключены. Политика главнее.
+// Тумблер моделей сохраняет выбор для будущей проверки каталога.
 import QtQuick 2.15
 import QtQuick.Layouts 1.15
 import ".."
@@ -37,21 +34,21 @@ Column {
     readonly property bool offlineForced: root.networkRefusal !== "" && !root.userOffline
     readonly property bool canCheckNow: root.updates ? root.updates.canCheckNow : false
 
-    // Панель показывает результат: ручная проверка идёт или закончилась, есть версия,
-    // источник недоступен или версия пропущена (§6.1, подмножество v0.2).
+    // Плановая и ручная проверки используют тот же постоянно видимый блок.
     readonly property string panelState: {
         if (root.downloadPhase !== "idle" && root.updateState !== "skipped") return "available";
         switch (root.updateState) {
         case "checking":
+            return "checking";
         case "uptodate":
-            return root.manualResult ? root.updateState : "";
+            return root.manualResult ? "uptodate" : "idle";
         case "available":
         case "error-net":
         case "unavailable":
         case "skipped":
             return root.updateState;
         default:
-            return "";
+            return "idle";
         }
     }
 
@@ -76,19 +73,21 @@ Column {
     // (Column пропускает распорки нулевой высоты).
     Item {
         width: root.width
-        visible: root.panelState !== ""
-        height: visible ? updatePanel.height + Theme.spaceGroupGap : 0
+        height: updatePanel.height + Theme.spaceGroupGap
 
         UpdatePanel {
             id: updatePanel
             objectName: "updatePanel"
             width: root.width
-            panelState: root.panelState !== "" ? root.panelState : "available"
+            panelState: root.panelState
             version: root.updates ? root.updates.version : ""
             notes: root.updates ? root.updates.notes : []
             currentVersion: root.updates ? root.updates.currentVersion : ""
             checkedText: root.updates ? root.updates.checkedText : ""
             canCheckNow: root.canCheckNow
+            bridgeAvailable: root.updates !== null
+            checkRefusal: root.checkRefusal
+            checkBlocked: root.updateValue("downloadBusy", false) || root.downloadPhase === "installing"
             downloadPhase: root.downloadPhase
             artifactTrack: root.updateValue("artifactTrack", "")
             artifactSizeText: root.updateValue("artifactSizeText", "")
@@ -132,7 +131,9 @@ Column {
             width: parent.width
             divider: false
             label: qsTr("Проверять обновления утилиты")
-            sub: locked ? qsTr("Задано администратором") : qsTr("Раз в сутки. Скачивание — по вашему нажатию.")
+            sub: locked && !appUpdates.checked ? qsTr("Администратор отключил проверку обновлений на этом компьютере.")
+                : root.offlineOn ? qsTr("Не работает, пока включён офлайн-режим.")
+                : qsTr("Раз в сутки, github.com. Скачивание — только по вашему нажатию.")
             toggle: appUpdates
             locked: root.isLocked("check_app_updates") || root.networkRefusal === "admin"
             rowEnabled: !locked && !root.offlineOn
@@ -159,6 +160,38 @@ Column {
                     // Запись не удалась (saveError) — вернуть положение из моста.
                     if (root.settings.checkAppUpdates !== checked)
                         checked = root.settings.checkAppUpdates
+                }
+            }
+        }
+
+        SettingRow {
+            id: modelRow
+            width: parent.width
+            label: qsTr("Проверять обновления моделей")
+            sub: locked && !modelUpdates.checked ? qsTr("Администратор отключил проверку обновлений на этом компьютере.")
+                : root.offlineOn ? qsTr("Не работает, пока включён офлайн-режим.")
+                : qsTr("huggingface.co. Скачивание — только по вашему нажатию.")
+            toggle: modelUpdates
+            locked: root.isLocked("check_model_updates") || root.networkRefusal === "admin"
+            rowEnabled: !locked && !root.offlineOn
+
+            AvToggle {
+                id: modelUpdates
+                objectName: "checkModelUpdatesToggle"
+                Layout.alignment: Qt.AlignVCenter
+                locked: modelRow.locked
+                enabled: !locked && !root.offlineOn
+                Binding {
+                    target: modelUpdates
+                    property: "checked"
+                    value: root.settings ? root.settings.checkModelUpdates : false
+                }
+                onCheckedChanged: {
+                    if (!root.settings || !enabled || root.settings.checkModelUpdates === checked)
+                        return
+                    root.settings.checkModelUpdates = checked
+                    if (root.settings.checkModelUpdates !== checked)
+                        checked = root.settings.checkModelUpdates
                 }
             }
         }
@@ -201,31 +234,4 @@ Column {
         }
     }
 
-    SettingGroup {
-        width: root.width
-        title: qsTr("Вручную")
-
-        SettingRow {
-            width: parent.width
-            divider: false
-            showHint: false
-            label: qsTr("Проверить обновления сейчас")
-            sub: root.checkRefusal === "offline" ? qsTr("Недоступно: включён офлайн-режим")
-                : root.checkRefusal === "admin" || root.checkRefusal === "policy"
-                    ? qsTr("Недоступно: задано администратором")
-                    : root.updates === null ? qsTr("Проверка пока недоступна")
-                    : qsTr("Ручная проверка работает и при выключенных тумблерах — это ваше явное действие")
-            rowEnabled: root.canCheckNow || root.updates === null
-
-            AvButton {
-                objectName: "checkNowButton"
-                small: true
-                iconName: "refresh"
-                text: qsTr("Проверить сейчас")
-                enabled: root.canCheckNow && root.updateState !== "checking" && !root.updateValue("downloadBusy", false) && root.downloadPhase !== "installing"
-                Layout.alignment: Qt.AlignVCenter
-                onClicked: { if (root.updates) root.updates.checkNow(); }
-            }
-        }
-    }
 }

@@ -1400,6 +1400,88 @@ def test_selected_notification_deduplicates_announced_names(rig: Rig) -> None:
     assert all(state != PillState.ERROR for state, _, _ in rig.pill.calls)
 
 
+@pytest.mark.parametrize("microphones", [0, 1, 2, 3])
+def test_first_recording_names_microphone_once_with_multiple_sources(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, microphones: int
+) -> None:
+    count = Mock(return_value=microphones)
+    monkeypatch.setattr(rig.core, "microphone_count", count)
+    for _ in range(2):
+        rig.start()
+        rig.event("audio.ready", device="USB-микрофон")
+        rig.event("audio.ready", device="USB-микрофон")
+        rig.stop()
+        rig.result()
+    assert rig.device_selected.call_args_list == (
+        [call("USB-микрофон")] if microphones >= 2 else []
+    )
+    count.assert_called_once_with()
+    # Смена поколения воркера и выбор в настройках не создают новый сеанс программы.
+    rig.worker_generation += 1
+    rig.core.reset_device_announcement()
+    rig.start()
+    rig.event("audio.ready", device="USB-микрофон")
+    count.assert_called_once_with()
+    assert rig.device_selected.call_count == int(microphones >= 2)
+
+
+@pytest.mark.parametrize("mics", [0, 1, 2, 3])
+def test_first_recording_uses_worker_microphone_count_without_bridge(rig: Rig, mics: int) -> None:
+    count = Mock(side_effect=AssertionError("worker count must avoid GUI fallback"))
+    rig.core.microphone_count = count
+    rig.start()
+    rig.event("audio.ready", device="USB-микрофон", mics=mics)
+    assert rig.device_selected.call_args_list == ([call("USB-микрофон")] if mics >= 2 else [])
+    count.assert_not_called()
+
+
+@pytest.mark.parametrize("mics", [None, "2", True, False, 2.0])
+def test_audio_ready_invalid_worker_count_uses_fallback(rig: Rig, mics: object) -> None:
+    count = Mock(return_value=2)
+    rig.core.microphone_count = count
+    rig.start()
+    # Некорректные поля обходят IPC только для проверки защитной ветки GUI.
+    rig.event("audio.ready", device="USB-микрофон", mics=mics)
+    count.assert_called_once_with()
+    rig.device_selected.assert_called_once_with("USB-микрофон")
+
+
+@pytest.mark.parametrize("microphones", [None, 0, 1, 2, 3])
+def test_first_recording_uses_bridge_cache_without_enumerating(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, microphones: int | None
+) -> None:
+    from astra_voice.core.settings import Settings
+    from astra_voice.ui.bridges import SettingsBridge
+    from astra_voice.worker import audio
+    from astra_voice.worker.audio import AudioDevice
+
+    sources = [AudioDevice(1, "monitor", "Колонки", True)] + [
+        AudioDevice(index + 2, f"mic-{index}", "Микрофон", False)
+        for index in range(microphones or 0)
+    ]
+    provider = Mock(return_value=sources)
+    bridge = SettingsBridge(Settings(), device_provider=provider, save=Mock())
+    if microphones is not None:
+        bridge.refreshDevices()
+    provider.reset_mock()
+    enumerate_devices = Mock(side_effect=AssertionError("recording must use cached sources"))
+    monkeypatch.setattr(audio, "list_devices", enumerate_devices)
+    monkeypatch.setattr("astra_voice.ui.bridges.list_devices", enumerate_devices)
+    rig.core.microphone_count = bridge.microphone_count
+    rig.start()
+    rig.event("audio.ready", device="USB-микрофон")
+    assert rig.device_selected.call_args_list == (
+        [call("USB-микрофон")] if (microphones or 0) >= 2 else []
+    )
+    rig.stop()
+    rig.result()
+    rig.start()
+    rig.event("audio.ready", device="Другой микрофон")
+    assert rig.device_selected.call_args_list[-1] == call("Другой микрофон")
+    enumerate_devices.assert_not_called()
+    provider.assert_not_called()
+
+
 def test_audio_ready_without_notification_callbacks_keeps_recording(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:

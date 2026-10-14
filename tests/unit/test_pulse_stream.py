@@ -9,6 +9,7 @@ import threading
 import time
 import weakref
 from collections.abc import Iterator
+from dataclasses import replace
 from typing import Any, NoReturn, cast
 from unittest.mock import Mock
 
@@ -2309,8 +2310,8 @@ def test_introspection_decodes_and_sorts(
     source.warm_up(None)
     devices = list_devices()
     assert devices == [
-        audio.AudioDevice(2, "mic.�", "USB � mic", False),
-        audio.AudioDevice(9, "speaker.monitor", "Sound system", True),
+        audio.AudioDevice(2, "mic.�", "USB � mic", False, available="yes", state=2),
+        audio.AudioDevice(9, "speaker.monitor", "Sound system", True, available="yes", state=2),
     ]
     assert all(device.index_exact for device in devices)
     assert default_device(devices) == devices[0]
@@ -2411,12 +2412,17 @@ def test_production_warmup_selection_errors_keep_result_codes(
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("microphones", [1, 2])
 def test_capture_introspection_ready_and_report_log_labels_without_names(
     introspection: tuple[ps.PulseStreamSource, FakePulse],
     wrapped: bool,
+    microphones: int,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     source, pulse = introspection
+    pulse.sources.append((9, b"output.test.monitor", b"Test speaker"))
+    if microphones == 2:
+        pulse.sources.append((OTHER.index, OTHER.name.encode(), OTHER.description.encode()))
     active = ps.StreamWithFallback(source) if wrapped else source
     events, errors, changed = Mock(), Mock(), Mock()
     capture = audio.AudioCapture(
@@ -2438,6 +2444,7 @@ def test_capture_introspection_ready_and_report_log_labels_without_names(
             call.args[0] for call in events.call_args_list if call.args[0]["type"] == "audio.ready"
         )
         assert ready["device"] == MIC.label
+        assert ready["mics"] == microphones
         pulse.sources = [(OTHER.index, OTHER.name.encode(), OTHER.description.encode())]
         pulse.default_source = OTHER.name.encode()
         pulse.idle_steps.append(Step(events=[(REMOVE, MIC.index), (SERVER, 0)]))
@@ -2446,6 +2453,7 @@ def test_capture_introspection_ready_and_report_log_labels_without_names(
             "private", audio.DeviceChange(audio.REASON_REMOVED, MIC, True), threading.Event()
         )
     errors.assert_not_called()
+    assert "Некорректные метаданные источника" not in caplog.text
     changed.assert_called_once_with("private", audio.KIND_SWITCHED, OTHER.label)
     assert pulse.names().count("context_get_source_info_list") == 2
     assert pulse.names().count("context_get_server_info") == 2
@@ -2485,7 +2493,7 @@ def test_failed_introspection_uses_pactl_without_retrying_provider(
     commands = Mock(wraps=run)
     monkeypatch.setattr(subprocess, "run", commands)
     source.open(None)
-    assert source.selected_device == MIC
+    assert source.selected_device == replace(MIC, available="unknown", state=None)
     assert commands.call_count == 3
     assert pulse.names().count("context_get_source_info_list") == 1
     assert pulse.names().count("context_get_server_info") == int(stage == "server")

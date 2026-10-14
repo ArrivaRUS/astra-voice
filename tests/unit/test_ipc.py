@@ -88,6 +88,23 @@ def test_round_trip(msg: dict[str, Any]) -> None:
     assert ipc.FrameReader().feed(frame) == [msg]
 
 
+@pytest.mark.parametrize("mics", [0, 1, 2])
+def test_audio_ready_round_trip_with_microphone_count(mics: int) -> None:
+    message = {"type": "audio.ready", "mics": mics}
+    assert ipc.decode(ipc.encode(message)[4:]) == message
+
+
+@pytest.mark.parametrize("mics", ["2", True, False, 2.0])
+def test_audio_ready_rejects_non_integer_mics(mics: object) -> None:
+    message = {"type": "audio.ready", "mics": mics}
+    with pytest.raises(ipc.FrameError) as encoded:
+        ipc.encode(message)
+    assert encoded.value.code == ipc.BAD_FIELD
+    with pytest.raises(ipc.FrameError) as decoded:
+        ipc.decode(_payload(message))
+    assert decoded.value.code == ipc.BAD_FIELD
+
+
 @pytest.mark.parametrize("split", [1, 2, 3, 4, 9, 12])
 def test_partial_frame(split: int) -> None:
     msg = {"type": "ping"}

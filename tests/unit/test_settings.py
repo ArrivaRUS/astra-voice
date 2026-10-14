@@ -6,6 +6,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, Mock, call
 
@@ -21,17 +22,64 @@ def path(tmp_path: Path) -> Path:
     return tmp_path / "settings.json"
 
 
-def test_defaults_when_file_absent(path: Path) -> None:
-    s = st.load(path)
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+def test_defaults_when_file_absent(path: Path, appimage: bool) -> None:
+    s = st.load(path, appimage=appimage)
     assert s.hotkey == "Ctrl+Space"
     assert s.hotkey_mode == "ptt"
     assert s.pill_enabled is True
     assert s.autostart is True
     assert s.model_id is None
     assert s.language == "ru"
-    assert s.check_app_updates is False
-    assert s.check_model_updates is False
+    assert s.check_app_updates is appimage
+    assert s.check_model_updates is appimage
+    assert s.extra == ({"update_defaults_migrated": True} if appimage else {})
     assert not path.exists()
+
+
+def test_dataclass_defaults_do_not_enable_network() -> None:
+    assert st.Settings().check_app_updates is st.Settings().check_model_updates is False
+
+
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+def test_load_uses_existing_install_kind(
+    path: Path, appimage: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from astra_voice.core import paths
+
+    detect = Mock(return_value=SimpleNamespace(is_appimage=appimage))
+    monkeypatch.setattr(paths, "install_kind", detect)
+    loaded = st.load(path)
+    assert loaded.check_app_updates is loaded.check_model_updates is appimage
+    detect.assert_called_once_with()
+    st.load(path, appimage=not appimage)
+    detect.assert_called_once_with()  # Внедрённый трек не читает файловую систему.
+
+
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+@pytest.mark.parametrize("contents", ["{", "[]", '{"schema_version": 2}'])
+def test_fallback_defaults_follow_track(path: Path, appimage: bool, contents: str) -> None:
+    path.write_text(contents, encoding="utf-8")
+    loaded = st.load(path, appimage=appimage)
+    assert loaded.check_app_updates is loaded.check_model_updates is appimage
+    assert loaded.extra == ({"update_defaults_migrated": True} if appimage else {})
+
+
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+def test_unreadable_file_defaults_follow_track(path: Path, appimage: bool) -> None:
+    path.mkdir()
+    loaded = st.load(path, appimage=appimage)
+    assert loaded.check_app_updates is loaded.check_model_updates is appimage
+
+
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+@pytest.mark.parametrize("locked", [("check_app_updates",), ("check_model_updates",)])
+def test_fresh_defaults_respect_explicit_policy_locks(
+    path: Path, appimage: bool, locked: tuple[str, ...]
+) -> None:
+    loaded = st.load(path, appimage=appimage, locked=locked)
+    for key in ("check_app_updates", "check_model_updates"):
+        assert getattr(loaded, key) is (appimage and key not in locked)
 
 
 def test_save_creates_0600_and_roundtrips(path: Path) -> None:
@@ -143,9 +191,12 @@ def test_broken_json_is_quarantined(path: Path) -> None:
 
 
 @pytest.mark.parametrize("raw", ["{это не json", "[1, 2, 3]"])
-def test_broken_settings_are_not_quarantined_when_disabled(path: Path, raw: str) -> None:
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+def test_broken_settings_are_not_quarantined_when_disabled(
+    path: Path, raw: str, appimage: bool
+) -> None:
     path.write_text(raw, encoding="utf-8")
-    assert st.load(path, quarantine=False) == st.Settings()
+    assert st.load(path, quarantine=False, appimage=appimage) == st.defaults(appimage=appimage)
     assert path.read_text(encoding="utf-8") == raw
     assert not list(path.parent.glob("settings.json.bak-*"))
 
@@ -275,3 +326,251 @@ def test_missing_schema_version_is_zero(path: Path, monkeypatch: pytest.MonkeyPa
 def test_future_schema_version_kept(path: Path) -> None:
     path.write_text(json.dumps({"schema_version": 99, "hotkey": "Ctrl+J"}), encoding="utf-8")
     assert st.load(path).hotkey == "Ctrl+J"
+
+
+@pytest.mark.parametrize("schema", [None, 0, 1, 2])
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+def test_legacy_update_preferences_migrate_once(
+    path: Path, schema: int | None, appimage: bool
+) -> None:
+    """Только AppImage включает старое off; маркер сохраняет следующий выбор."""
+    data = {"check_app_updates": False, "check_model_updates": False, "device": "microphone"}
+    if schema is not None:
+        data["schema_version"] = schema
+    path.write_text(json.dumps(data), encoding="utf-8")
+    migrated = st.load(path, appimage=appimage)
+    assert migrated.check_app_updates is migrated.check_model_updates is appimage
+    assert migrated.extra["device"] == "microphone"
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] > 1
+    st.save(migrated, path)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["schema_version"] > 1
+    assert saved.get("update_defaults_migrated") is (True if appimage else None)
+    migrated.check_app_updates = migrated.check_model_updates = False
+    st.save(migrated, path)
+    again = st.load(path, appimage=appimage)
+    assert again.check_app_updates is again.check_model_updates is False
+    assert again.extra["device"] == "microphone"
+
+
+@pytest.mark.parametrize("schema", [1, 2])
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+def test_marker_preserves_disabled_updates_after_schema_roundtrip(
+    path: Path, schema: int, appimage: bool
+) -> None:
+    st.save(
+        st.Settings(
+            check_app_updates=False,
+            check_model_updates=False,
+            extra={"update_defaults_migrated": True, "future_key": {"value": 5}},
+        ),
+        path,
+    )
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["schema_version"] = schema
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    loaded = st.load(path, appimage=appimage)
+
+    assert loaded.check_app_updates is loaded.check_model_updates is False
+    assert loaded.extra["update_defaults_migrated"] is True
+    assert loaded.extra["future_key"] == {"value": 5}
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["update_defaults_migrated"] is True
+    assert saved["check_app_updates"] is saved["check_model_updates"] is False
+
+
+def test_fresh_deb_then_appimage_migrates_and_saves_marker(path: Path) -> None:
+    deb = st.load(path, appimage=False)
+    st.save(deb, path)
+    saved_deb = json.loads(path.read_text(encoding="utf-8"))
+    assert saved_deb["schema_version"] == 2
+    assert "update_defaults_migrated" not in saved_deb
+    assert saved_deb["check_app_updates"] is saved_deb["check_model_updates"] is False
+
+    appimage = st.load(path, appimage=True)
+    assert appimage.check_app_updates is appimage.check_model_updates is True
+    saved_appimage = json.loads(path.read_text(encoding="utf-8"))
+    assert saved_appimage["update_defaults_migrated"] is True
+    assert saved_appimage["check_app_updates"] is saved_appimage["check_model_updates"] is True
+    appimage.check_app_updates = appimage.check_model_updates = False
+    st.save(appimage, path)
+
+    assert st.load(path, appimage=True).check_app_updates is False
+    assert st.load(path, appimage=True).check_model_updates is False
+
+
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+def test_marker_and_unknown_keys_roundtrip(path: Path, appimage: bool) -> None:
+    data = {
+        "update_defaults_migrated": True,
+        "future_key": ["value", {"nested": False}],
+        "check_app_updates": False,
+        "check_model_updates": False,
+    }
+    settings = st.from_dict(data, appimage=appimage)
+    assert settings.extra == {
+        "update_defaults_migrated": True,
+        "future_key": ["value", {"nested": False}],
+    }
+    for key, value in data.items():
+        assert settings.to_dict()[key] == value
+    st.save(settings, path)
+    assert st.load(path, appimage=appimage) == settings
+
+
+@pytest.mark.parametrize("schema", [1, 2])
+def test_read_only_load_does_not_save_schema_or_marker(path: Path, schema: int) -> None:
+    raw = json.dumps(
+        {"schema_version": schema, "check_app_updates": False, "check_model_updates": False}
+    )
+    path.write_text(raw, encoding="utf-8")
+    loaded = st.load(path, appimage=True, quarantine=False)
+    assert loaded.check_app_updates is loaded.check_model_updates is True
+    assert loaded.extra["update_defaults_migrated"] is True
+    assert path.read_text(encoding="utf-8") == raw
+    assert list(path.parent.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("schema", [1, 2])
+@pytest.mark.parametrize("stored", [None, False, True], ids=["absent", "off", "on"])
+def test_appimage_migration_preserves_locked_value(
+    path: Path, schema: int, stored: bool | None
+) -> None:
+    data: dict[str, Any] = {"schema_version": schema, "check_model_updates": False}
+    if stored is not None:
+        data["check_app_updates"] = stored
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    loaded = st.load(path, appimage=True, locked=("check_app_updates",))
+
+    assert loaded.check_app_updates is (stored is True)
+    assert loaded.check_model_updates is True
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["update_defaults_migrated"] is True
+    assert saved["check_app_updates"] is (stored is True)
+
+
+@pytest.mark.parametrize("app,models", [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+def test_legacy_individual_update_choices_migrate_to_enabled(
+    path: Path, app: bool, models: bool, appimage: bool
+) -> None:
+    path.write_text(
+        json.dumps({"schema_version": 1, "check_app_updates": app, "check_model_updates": models}),
+        encoding="utf-8",
+    )
+    loaded = st.load(path, appimage=appimage)
+    assert loaded.check_app_updates is (appimage or app)
+    assert loaded.check_model_updates is (appimage or models)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"check_app_updates": False, "check_model_updates": False},
+        {"offline": True},
+        {"profile": "secure"},
+    ],
+)
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+def test_migrated_defaults_respect_administrator_network_limits(
+    path: Path, values: dict[str, Any], monkeypatch: pytest.MonkeyPatch, appimage: bool
+) -> None:
+    from astra_voice.core.policy import Policy, effective
+    from astra_voice.net.gate import NetworkGate
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    path.write_text(
+        json.dumps({"schema_version": 1, "check_app_updates": False, "check_model_updates": False}),
+        encoding="utf-8",
+    )
+    policy = Policy(values=values, locked_keys=frozenset(values))
+    locked = policy.locked_keys
+    if NetworkGate(st.Settings(), policy).refusal("check_app_manual") == "admin":
+        locked |= {"check_app_updates", "check_model_updates"}
+    loaded = st.load(path, appimage=appimage, locked=locked)
+    assert loaded.check_app_updates is loaded.check_model_updates is False
+    configured = effective(loaded, policy)
+    gate = NetworkGate(configured, policy)
+    for kind in ("check_app", "check_app_manual", "check_models"):
+        assert gate.allowed(kind)[0] is False
+    assert loaded.check_app_updates is loaded.check_model_updates is False
+
+
+@pytest.mark.parametrize(
+    "locked",
+    [
+        ("check_app_updates",),
+        ("check_model_updates",),
+        ("check_app_updates", "check_model_updates"),
+    ],
+)
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+@pytest.mark.parametrize("schema", [1, 2])
+def test_legacy_locked_update_preferences_are_not_enabled(
+    path: Path,
+    locked: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    appimage: bool,
+    schema: int,
+) -> None:
+    from astra_voice.core.policy import Policy, effective
+    from astra_voice.net.gate import NetworkGate
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    path.write_text(
+        json.dumps(
+            {"schema_version": schema, "check_app_updates": False, "check_model_updates": False}
+        ),
+        encoding="utf-8",
+    )
+    policy = Policy(locked_keys=frozenset(locked))
+    loaded = st.load(path, appimage=appimage, locked=policy.locked_keys)
+    for field in ("check_app_updates", "check_model_updates"):
+        assert getattr(loaded, field) is (appimage and field not in locked)
+    gate = NetworkGate(effective(loaded, policy), policy)
+    if "check_app_updates" in locked:
+        assert gate.refusal("check_app") == gate.refusal("check_app_manual") == "policy"
+    if "check_model_updates" in locked:
+        assert gate.allowed("check_models")[0] is False
+    st.save(loaded, path)
+    again = st.load(path, appimage=appimage, locked=policy.locked_keys)
+    assert (again.check_app_updates, again.check_model_updates) == (
+        loaded.check_app_updates,
+        loaded.check_model_updates,
+    )
+
+
+def test_device_label_is_optional_without_schema_or_migration_change() -> None:
+    legacy = st.from_dict({"schema_version": 2, "device": "legacy-mic"})
+    assert legacy.device_label is None and legacy.extra["device"] == "legacy-mic"
+    assert legacy.device_label_id is None
+    labelled = st.from_dict(
+        {
+            "schema_version": 2,
+            "device": "usb",
+            "device_label": "USB-гарнитура",
+            "device_label_id": "usb",
+        }
+    )
+    assert labelled.device_label == "USB-гарнитура"
+    assert labelled.device_label_id == "usb"
+    assert labelled.to_dict()["device_label"] == "USB-гарнитура"
+    assert labelled.to_dict()["device_label_id"] == "usb"
+    assert labelled.to_dict()["schema_version"] == st.SCHEMA_VERSION == 2
+    assert st.from_dict(labelled.to_dict()).to_dict() == labelled.to_dict()
+
+
+@pytest.mark.parametrize("value", [False, 1, [], {}])
+@pytest.mark.parametrize("field", ["device_label", "device_label_id"])
+def test_device_label_rejects_non_string(value: object, field: str) -> None:
+    assert getattr(st.from_dict({field: value}), field) is None
+
+
+def test_device_label_and_id_roundtrip_through_file(path: Path) -> None:
+    settings = st.Settings(device_label="USB", device_label_id="usb", extra={"device": "usb"})
+    st.save(settings, path)
+    loaded = st.load(path)
+    assert loaded.device_label == "USB" and loaded.device_label_id == "usb"
+    assert loaded.extra["device"] == "usb"

@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; font-src 'none'">
+<title>Обновления 0.1.5</title>
+<!-- Ревизия 0.1.5 (замечания владельца 13.10 после 0.1.4) — см. spec.md «Ревизия 0.1.5». mockup-0.1.4.html не трогаем.
+     Параметры:
+       ?view=network|about|onboarding
+       &state=idle|never|autooff|checking|uptodate|unavailable|errornet|skipped|offline|policy|nobridge|available|downloading|readyappimage
+       &ob=on|off|policy            (только view=onboarding; on = умолчание 0.1.5: оба тумблера включены)
+       &theme=light|dark  &size=1024|900|narrow  &ring=none|heading|check  &chrome=0 (без стенда)
+     Панель available/downloading/readyappimage — ровно 0.1.4 (R1–R6), отличие только в том, что над ней больше нет пустоты,
+     а под тумблерами больше нет группы «Вручную». -->
+<style>
+:root{--ui:'PT Root UI','PT Astra Sans','Open Sans','Roboto',sans-serif;--mono:'PT Mono','DejaVu Sans Mono','Liberation Mono',monospace;
+--bg:#F7F9FC;--surface:#fff;--surface2:#EDF1F7;--border:#D7DEEA;--fg:#0E1729;--secondary:#243350;--muted:#5A6884;--disabled:#616D83;--faint:#AAB4C7;
+--primary:#1B3A73;--primary-fg:#fff;--primary-bg:#E8EDF7;--success:#1F7D50;--success-bg:#E7F5EE;--danger:#C0322F;--danger-bg:#FBECEB;
+--ring:#0A776A;--canvas:#DDE3EE;--sidebar:#EDF1F7}
+body.dark{--bg:#0B1220;--surface:#151E30;--surface2:#080D18;--border:rgba(255,255,255,.1);--fg:#F2F5FA;--secondary:#C4CDDC;--muted:#8C97AC;
+--disabled:#7E889B;--faint:#5A6884;--primary:#6C93E8;--primary-fg:#0B1220;--primary-bg:rgba(108,147,232,.12);--success:#4FBF88;--success-bg:rgba(79,191,136,.13);
+--danger:#F0645F;--danger-bg:rgba(240,100,95,.13);--ring:#2FD9C4;--canvas:#05080F;--sidebar:#080D18}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;color:var(--fg);background:var(--canvas);font:14px/1.5 var(--ui)}
+body.bare{padding:0;background:var(--bg)}
+.stand{max-width:1024px;margin:0 auto 12px;font-size:12px;color:var(--muted);display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.stand select,.stand label{font:inherit;color:var(--fg)}
+.stand select{background:var(--surface);border:1px solid var(--border);border-radius:5px;padding:3px}
+body.bare .stand{display:none}
+.window{width:1024px;height:620px;max-width:100%;margin:auto;background:var(--bg);border:1px solid var(--border);border-radius:8px;overflow:hidden;display:flex;flex-direction:column}
+body.bare .window{border:0;border-radius:0}
+.window.minimum{width:900px;height:588px}
+.workspace{display:flex;flex:1;min-height:0}
+aside{width:184px;flex:none;background:var(--sidebar);border-right:1px solid var(--border);padding:12px 10px;color:var(--secondary)}
+.brand{font-size:15px;font-weight:600;padding:4px 6px 14px;color:var(--fg)}
+.nav{height:34px;display:flex;align-items:center;padding:7px 9px;border-radius:7px;font-size:13px}
+.nav.sel{color:var(--primary-fg);background:var(--primary);font-weight:500}
+main{min-width:0;flex:1;display:flex;flex-direction:column}
+.head{width:calc(100% - 44px);max-width:796px;margin:10px auto 0}
+.narrow .head,.narrow .column{max-width:480px}
+h1{font-size:20px;line-height:1.25;margin:0;font-weight:700}
+.subtitle{font-size:12px;color:var(--muted);margin:4px 0 0}
+.scroll{overflow:auto;flex:1;min-height:0;padding:0 22px 16px;margin-top:12px;scrollbar-width:none}
+.column{max-width:796px;margin:auto}
+/* ── Блок «Обновление программы» (UpdatePanel): всегда виден ── */
+.panel{background:var(--surface);border:1px solid var(--primary);padding:14px 16px;border-radius:10px;margin-bottom:16px}
+.panel.err{border-color:var(--danger)}.panel.neutral{border-color:var(--border)}
+/* Верхний ряд компактных состояний: текст слева, «Проверить сейчас» справа; при нехватке ширины кнопка уходит вниз. */
+.top{display:flex;align-items:center;flex-wrap:wrap;column-gap:16px;row-gap:12px}
+.txt{flex:1 1 240px;min-width:0}
+.heading{display:inline-flex;gap:9px;align-items:center;flex-wrap:wrap;position:relative;max-width:100%}
+.heading.ring::after{content:"";position:absolute;inset:-4px;border:2px solid var(--ring);border-radius:8px;pointer-events:none}
+.heading h2{font-size:16px;line-height:21px;font-weight:500;margin:0}
+.version{font:16px/21px var(--mono)}
+.word{font-size:16px;line-height:21px}
+.badge{font-size:11.5px;font-weight:500;color:var(--primary);background:var(--primary-bg);border-radius:5px;padding:0 7px;height:21.3px;line-height:21.3px}
+.meta{font-size:12px;line-height:17px;color:var(--muted);margin:6px 0 0}
+.reason{font-size:12px;line-height:17px;color:var(--muted);margin:0}
+.whatsnew{font-size:13px;font-weight:700;color:var(--secondary);margin:7px 0 6px}
+.notes{font-size:12.5px;line-height:20px;color:var(--secondary);margin:0;padding-left:17px}
+.notes li::marker{font-size:10px}
+.op{margin-top:12px;padding:10px 12px;border-radius:7px;background:var(--surface2)}
+.op.min{min-height:77px}
+.op.ok{background:var(--success-bg)}
+.op h3{font-size:13px;line-height:19px;font-weight:500;margin:0;color:var(--secondary)}
+.op.ok h3{color:var(--success)}
+.detail{font-size:12px;line-height:17px;color:var(--muted);margin:4px 0 0;font-variant-numeric:tabular-nums}
+.op.ok .detail{color:var(--secondary)}
+.bar{height:6px;margin-top:8px;border-radius:3px;background:var(--border);overflow:hidden}
+.bar span{display:block;height:100%;background:var(--primary);border-radius:3px;width:42%}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+button{font:500 13px/1 var(--ui);height:33.5px;padding:0 12px;border-radius:7px;border:1px solid var(--border);background:var(--surface);color:var(--fg);white-space:nowrap;display:inline-flex;align-items:center;justify-content:center;gap:6px;position:relative;flex:none}
+button.primary{background:var(--primary);border-color:var(--primary);color:var(--primary-fg)}
+button:disabled{background:var(--surface2);color:var(--disabled);border-color:var(--border)}
+button.ring::after{content:"";position:absolute;inset:-4px;border:2px solid var(--ring);border-radius:9px}
+button svg{width:13px;height:13px;flex:none}
+.slot1{min-width:var(--slot1)}
+/* ── Ниже блока ── */
+.grouptitle{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 2px 8px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:16px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:10px 14px;border-bottom:1px solid var(--border)}
+.row:last-child{border-bottom:0}
+.row .l{min-width:0}
+.row b{font-weight:400;font-size:14px;line-height:19px;display:block}.row small{display:block;font-size:12px;line-height:17px;color:var(--muted)}
+.row.off b,.row.off small{color:var(--disabled)}
+.row .r{display:flex;align-items:center;gap:10px;flex:none}
+.mono{font:14px var(--mono)}
+.toggle{width:38px;height:21px;border-radius:11px;background:var(--faint);position:relative;flex:none}
+.toggle::after{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;background:#fff}
+.toggle.on{background:var(--primary)}.toggle.on::after{left:19px}
+.toggle.dis{opacity:.45}
+.lock{display:inline-flex;align-items:center;gap:4px;height:21.3px;padding:0 6px;border-radius:5px;background:var(--surface2);color:var(--muted);font-size:11.5px}
+.lock svg{width:11px;height:11px}
+footer{height:36px;flex:none;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 14px;font-size:13px;color:var(--muted)}
+footer .upd{color:var(--primary);font-weight:500}
+footer .err{color:var(--danger)}
+/* ── Онбординг ── */
+.ob{flex:1;display:flex;justify-content:center;overflow:auto;padding:36px 22px}
+.ob .inner{width:580px;max-width:100%}
+.ob .hd{display:flex;gap:14px;align-items:center}
+.tile{width:52px;height:52px;border-radius:12px;background:#1B3A73;flex:none;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:20px}
+.ob h1{font-size:24px}
+.ob .sub{font-size:12px;line-height:17px;color:var(--muted);margin-top:5px;white-space:pre-line}
+.ob .card{margin:18px 0 14px}
+.note{background:var(--surface2);border-radius:9px;padding:10px 12px;display:flex;gap:9px;font-size:12.5px;line-height:18px;color:var(--secondary)}
+.note svg{width:15px;height:15px;flex:none;color:var(--muted);margin-top:1px}
+.note b{display:block}
+.select{width:200px;height:32px;border:1px solid var(--border);border-radius:7px;background:var(--surface);font-size:13px;display:flex;align-items:center;padding:0 10px}
+.obbar{height:56px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 22px;font-size:12px;color:var(--muted);flex:none}
+</style>
+</head>
+<body>
+<div class="stand">
+  <b>Стенд макета 0.1.5</b>
+  <label>Экран <select id="s-view"><option>network</option><option>about</option><option>onboarding</option></select></label>
+  <label>Состояние <select id="s-state"></select></label>
+  <label>Онбординг <select id="s-ob"><option>on</option><option>off</option><option>policy</option></select></label>
+  <label>Тема <select id="s-theme"><option>light</option><option>dark</option></select></label>
+  <label>Окно <select id="s-size"><option>1024</option><option>900</option><option>narrow</option></select></label>
+  <label>Клавиатурный фокус <select id="s-ring"><option>none</option><option>heading</option><option>check</option></select></label>
+</div>
+<div class="window" id="win"></div>
+<script>
+const STATES=["idle","never","autooff","checking","uptodate","unavailable","errornet","skipped","offline","policy","nobridge","available","downloading","readyappimage"];
+const q=new URLSearchParams(location.search);
+const opt={view:q.get("view")||"network",state:q.get("state")||"idle",ob:q.get("ob")||"on",theme:q.get("theme")||"light",size:q.get("size")||"1024",ring:q.get("ring")||"none"};
+if(q.get("chrome")==="0")document.body.classList.add("bare");
+const CUR="0.1.5", NEXT="0.1.6";
+const SVG={
+ refresh:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2.5v3h-3"/></svg>',
+ lock:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></svg>',
+ info:'<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.5"/><path d="M8 7v4M8 4.8v.2" stroke-linecap="round"/></svg>'};
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;}
+function svg(name){const s=el("span");s.style.display="inline-flex";s.innerHTML=SVG[name];return s;}
+function slotWidth(labels){const c=document.createElement("canvas").getContext("2d");c.font="500 13px "+getComputedStyle(document.body).getPropertyValue("--ui");return Math.ceil(Math.max(...labels.map(t=>c.measureText(t).width))+24+2);}
+const APP_LABELS=["Скачать новую версию","Установить и перезапустить","Открыть папку","Повторить скачивание","Повторить установку"];
+const RESTART="Программа закроется и откроется уже новой версией. Модели и настройки сохранятся. Если она не откроется, запустите Astra Voice из меню.";
+
+function shell(sel){
+  const w=document.getElementById("win"); w.replaceChildren();
+  const ws=el("div","workspace"); const a=el("aside"); a.append(el("div","brand","Astra Voice"));
+  ["Общие","Модели","Вывод","Сеть и обновления","Продвинутые","О программе"].forEach(t=>a.append(el("div","nav"+(t===sel?" sel":""),t)));
+  const m=el("main"); ws.append(a,m); w.append(ws); return {w,m};
+}
+function heading(parts){
+  const h=el("div","heading"+(opt.ring==="heading"?" ring":""));
+  parts.forEach(([kind,t])=>h.append(kind==="h2"?el("h2",null,t):kind==="ver"?el("span","version",t):kind==="badge"?el("span","badge",t):el("span","word",t)));
+  return h;
+}
+function checkButton(enabled){
+  const b=el("button",opt.ring==="check"?"ring":null); b.append(svg("refresh"),document.createTextNode("Проверить сейчас"));
+  b.disabled=!enabled; b.title="objectName: checkNowButton"; return b;
+}
+function compactPanel(s){
+  // Компактные состояния: заголовок + мета (+ причина) слева, «Проверить сейчас» справа.
+  const C={
+    idle:{h:[["h2","Установлена версия"],["ver",CUR]],meta:"Проверено сегодня в 14:02",can:true},
+    never:{h:[["h2","Установлена версия"],["ver",CUR]],meta:"Обновления ещё не проверялись",can:true},
+    autooff:{h:[["h2","Установлена версия"],["ver",CUR]],meta:"Проверено 07.10.2026 в 10:12 · автоматическая проверка выключена",can:true},
+    checking:{h:[["h2","Проверяю обновления…"]],meta:"Ищу новую версию и проверяю подпись сведений о ней.",can:false},
+    uptodate:{h:[["h2","Установлена последняя версия"],["ver",CUR]],meta:"Проверено сегодня в 14:05",can:true},
+    unavailable:{h:[["h2","Источник обновлений недоступен"]],meta:"Проверено 07.10.2026 в 10:12",can:true},
+    errornet:{h:[["h2","Не удалось проверить сведения об обновлении"]],meta:"Проверено 07.10.2026 в 10:12",can:true,err:true},
+    skipped:{h:[["h2","Версия"],["ver",NEXT],["word","пропущена"]],meta:"Напомним о следующей версии. Обновиться до этой всё ещё можно.",can:true,show:true},
+    offline:{h:[["h2","Установлена версия"],["ver",CUR]],meta:"Проверено 07.10.2026 в 10:12",reason:"Проверить сейчас нельзя: включён офлайн-режим.",can:false},
+    policy:{h:[["h2","Установлена версия"],["ver",CUR]],meta:"Обновления ещё не проверялись",reason:"Проверить сейчас нельзя: задано администратором.",can:false},
+    nobridge:{h:[["h2","Обновление программы"]],meta:"Проверка пока недоступна",can:false}
+  }[s];
+  const p=el("section","panel "+(C.err?"err":"neutral")); p.title="objectName: updatePanel";
+  const top=el("div","top"); const txt=el("div","txt");
+  txt.append(heading(C.h), el("p","meta",C.meta)); if(C.reason) txt.append(el("p","reason",C.reason));
+  top.append(txt, checkButton(C.can)); p.append(top);
+  if(C.show){const r=el("div","actions"); r.append(el("button",null,"Показать "+NEXT)); p.append(r);}
+  return p;
+}
+function availablePanel(s){
+  // Ровно панель 0.1.4 (R1–R6). «Проверить сейчас» в ней нет — R4: в «Доступна версия» других команд нет.
+  const p=el("section","panel"); p.title="objectName: updatePanel";
+  const parts=[["h2","Доступна версия"],["ver",NEXT]]; if(s==="available")parts.push(["badge","Новая"]);
+  p.append(heading(parts), el("p","meta","AppImage · 75 МБ · размер из проверенных сведений"), el("p","whatsnew","Что нового"));
+  const ul=el("ul","notes"); ["Проверка обновлений и её результат — в одном блоке","Улучшения интерфейса"].forEach(t=>ul.append(el("li",null,t))); p.append(ul);
+  if(s!=="available"){
+    const OP={downloading:["Скачиваю обновление…","42 % · 32 МБ из 75 МБ",true],readyappimage:["Новая версия готова. Подпись и целостность проверены.",RESTART,false,"ok"]}[s];
+    const op=el("div","op min"+(OP[3]?" "+OP[3]:"")); op.append(el("h3",null,OP[0]),el("p","detail",OP[1]));
+    if(OP[2]){const b=el("div","bar");b.append(el("span"));op.append(b);} p.append(op);
+  }
+  p.style.setProperty("--slot1",slotWidth(APP_LABELS)+"px");
+  const row=el("div","actions"); const busy=s==="downloading";
+  const b1=el("button","primary slot1",s==="readyappimage"?"Установить и перезапустить":"Скачать новую версию"); b1.disabled=busy;
+  const b2=el("button",null,"Пропустить эту версию"); b2.disabled=busy; row.append(b1,b2); if(busy)row.append(el("button",null,"Отмена"));
+  p.append(row); return p;
+}
+function toggleRow(label,sub,{on=false,dis=false,locked=false}={}){
+  const r=el("div","row"+(dis?" off":"")); const l=el("div","l"); l.append(el("b",null,label),el("small",null,sub));
+  const right=el("div","r"); if(locked){const lb=el("span","lock");lb.append(svg("lock"),document.createTextNode("Задано администратором"));right.append(lb);}
+  right.append(el("span","toggle"+(on?" on":"")+(dis&&!locked?" dis":""))); r.append(l,right); return r;
+}
+function footer(text,cls){const f=el("footer");const L=el("span",null,"GigaAM v3 RNN-T");const R=el("span");if(text){const u=el("span",cls||null,text);R.append(u,document.createTextNode("  •  "));}R.append(document.createTextNode("v"+CUR));f.append(L,R);return f;}
+
+function renderNetwork(){
+  const s=opt.state; const {w,m}=shell("Сеть и обновления");
+  const head=el("div","head"); head.append(el("h1",null,"Сеть и обновления"),el("p","subtitle","Сетевые проверки и обновления программы")); m.append(head);
+  const sc=el("div","scroll"); const col=el("div","column"); sc.append(col); m.append(sc);
+  col.append(["available","downloading","readyappimage"].includes(s)?availablePanel(s):compactPanel(s));
+  col.append(el("p","grouptitle","Сетевые проверки"));
+  const card=el("div","card");
+  const offline=s==="offline", policy=s==="policy", autoOff=s==="autooff";
+  const SUB="Раз в сутки, github.com. Скачивание — только по вашему нажатию.";
+  card.append(policy?toggleRow("Проверять обновления утилиты","Администратор отключил проверку обновлений на этом компьютере.",{on:false,dis:true,locked:true})
+    :offline?toggleRow("Проверять обновления утилиты","Не работает, пока включён офлайн-режим.",{on:true,dis:true})
+    :toggleRow("Проверять обновления утилиты",SUB,{on:!autoOff}));
+  card.append(toggleRow("Офлайн-режим",offline?"Сетевые кнопки скрыты. Работает установка модели из файла.":"Полностью запрещает сетевые запросы. Установка модели из файла останется.",{on:offline}));
+  col.append(card);
+  const F={checking:["Проверяю обновления…"],uptodate:["Установлена последняя версия"],unavailable:["Источник обновлений недоступен · Повторить"],
+    errornet:["Не удалось проверить обновления · Повторить","err"],skipped:["Версия "+NEXT+" пропущена · Показать"],autooff:["Проверка обновлений отключена"],
+    offline:["Проверка обновлений отключена"],policy:["Проверка обновлений отключена (задано администратором)"],nobridge:["Проверка обновлений отключена"],
+    available:["Доступна версия "+NEXT+" · Подробнее","upd"],downloading:["Скачиваю обновление · 42 %"],readyappimage:["Обновление готово · Открыть обновления"]}[s]||[""];
+  w.append(footer(F[0],F[1]));
+}
+function renderAbout(){
+  const {w,m}=shell("О программе");
+  const head=el("div","head"); head.append(el("h1",null,"О программе"),el("p","subtitle","Версии, лицензии, данные на диске")); m.append(head);
+  const sc=el("div","scroll"); const col=el("div","column"); sc.append(col); m.append(sc);
+  col.append(el("p","grouptitle","Версии"));
+  const c1=el("div","card");
+  const r1=el("div","row"); const l1=el("div","l"); l1.append(el("b",null,"Astra Voice"),el("small",null,"Сборка от 14.10.2026 · AppImage · установлена в домашнюю папку"));
+  const v=el("div","r"); v.append(el("span","mono",CUR)); r1.append(l1,v); c1.append(r1);
+  const r2=el("div","row"); const l2=el("div","l"); l2.append(el("b",null,"Активная модель")); const v2=el("div","r"); v2.append(el("span",null,"GigaAM v3 RNN-T")); r2.append(l2,v2); c1.append(r2);
+  const r3=el("div","row"); const l3=el("div","l"); l3.append(el("b",null,"Компоненты"),el("small",null,"Python 3.11.2 · Qt 5.15.8 · PyQt5 5.15.9 · onnxruntime 1.24.4 · onnx-asr 0.12.0")); r3.append(l3); c1.append(r3);
+  col.append(c1);
+  col.append(el("p","grouptitle","Окружение"));
+  const c2=el("div","card");
+  [["Рабочий стол","KDE Plasma"],["Правила администратора","Не заданы — все настройки в ваших руках"],
+   ["Проверка обновлений","Автоматически раз в сутки · последняя попытка: сегодня в 14:05 · последний успех: сегодня в 14:05"]]
+   .forEach(([a,b])=>{const r=el("div","row");const l=el("div","l");l.append(el("b",null,a),el("small",null,b));r.append(l);c2.append(r);});
+  col.append(c2);
+  w.append(footer(""));
+}
+function renderOnboarding(){
+  const w=document.getElementById("win"); w.replaceChildren();
+  const box=el("div","ob"); const inner=el("div","inner"); box.append(inner);
+  const hd=el("div","hd"); hd.append(el("div","tile","AV")); const t=el("div"); t.append(el("h1",null,"Astra Voice"),el("div","sub","Голосовой ввод для Astra Linux.\nРаспознавание работает локально на этом компьютере —\nзаписи никуда не отправляются.")); hd.append(t); inner.append(hd);
+  const card=el("div","card");
+  const lang=el("div","row"); const ll=el("div","l"); ll.append(el("b",null,"Язык интерфейса"),el("small",null,"Определён по системной локали ru_RU")); const lr=el("div","r"); lr.append(el("div","select","Русский")); lang.append(ll,lr); card.append(lang);
+  const pol=opt.ob==="policy", on=opt.ob==="on";
+  card.append(toggleRow("Проверять обновления утилиты","Раз в сутки, github.com. Скачивание — только по вашему нажатию.",{on:pol?false:on,dis:pol,locked:pol}));
+  card.append(toggleRow("Проверять обновления моделей","Раз в сутки, huggingface.co. Скачивание — только по вашему нажатию.",{on:pol?false:on,dis:pol,locked:pol}));
+  inner.append(card);
+  const n=el("div","note"); n.append(svg("info")); const nt=el("div");
+  // Баннер A — хотя бы один тумблер включён; баннер B (текст 0.1.4) — оба выключены (пользователем или политикой).
+  if(on){nt.append(el("b",null,"В сеть программа ходит только проверить обновления"),document.createTextNode("Не чаще раза в сутки. Сама ничего не скачивает и не устанавливает: модель на следующем шаге и новые версии скачиваются только по вашему нажатию. Где программа выходит в сеть и как это выключить — в «О программе → Приватность»."));}
+  else{nt.append(el("b",null,pol?"Проверку обновлений отключил администратор":"Пока оба переключателя выключены, программа не выходит в сеть"),document.createTextNode("Скачать модель на следующем шаге можно и без них — это ваше явное действие. Куда программа ходит в сеть и как это выключить — в «О программе → Приватность»."));}
+  n.append(nt); inner.append(n);
+  const bar=el("div","obbar"); bar.append(el("span",null,"Изменить можно позже в «Сеть и обновления»")); const btns=el("span"); btns.style.display="flex"; btns.style.gap="8px"; btns.append(el("button",null,"Пропустить"),el("button","primary","Далее")); bar.append(btns);
+  w.append(box,bar);
+}
+const sel=document.getElementById("s-state"); STATES.forEach(s=>{const o=el("option",null,s);sel.append(o);});
+function render(){
+  document.body.classList.toggle("dark",opt.theme==="dark");
+  const win=document.getElementById("win"); win.classList.toggle("minimum",opt.size!=="1024"); win.classList.toggle("narrow",opt.size==="narrow");
+  ["view","state","ob","theme","size","ring"].forEach(k=>{document.getElementById("s-"+k).value=opt[k];});
+  ({network:renderNetwork,about:renderAbout,onboarding:renderOnboarding}[opt.view]||renderNetwork)();
+}
+["view","state","ob","theme","size","ring"].forEach(k=>{document.getElementById("s-"+k).onchange=e=>{opt[k]=e.target.value;render();};});
+render();
+</script>
+</body>
+</html>

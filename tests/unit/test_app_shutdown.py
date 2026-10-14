@@ -20,6 +20,7 @@ from astra_voice.core import settings as settings_mod
 from astra_voice.core.policy import Policy
 from astra_voice.core.policy import load as load_policy
 from astra_voice.core.settings import Settings
+from astra_voice.core.settings import load as _real_settings_load
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform import autostart
 from astra_voice.platform.session import SessionKind
@@ -84,7 +85,7 @@ class Rig:
         monkeypatch.setattr(app_mod, "setup_logging", Mock())
         monkeypatch.setattr(app_mod, "_install_qt_message_handler", Mock())
         monkeypatch.setattr(policy_mod, "load", lambda: Policy())
-        monkeypatch.setattr(settings_mod, "load", lambda: self.settings)
+        monkeypatch.setattr(settings_mod, "load", lambda **_kwargs: self.settings)
         monkeypatch.setattr(paths_mod, "data_dir", lambda: tmp_path / "data")
         monkeypatch.setattr(paths_mod, "settings_path", lambda: tmp_path / "settings.json")
         monkeypatch.setattr(app_mod, "_ensure_settings_file", Mock())
@@ -323,6 +324,80 @@ def test_update_checker_started_and_stopped_before_runtime(
     assert checker.on_event is None and checker.on_status is None
 
 
+def test_onboarding_network_step_enables_scheduled_checks_once(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """main связывает реальные сигналы мастера с однократным разрешением расписания."""
+    pytest.importorskip("requests")
+    from astra_voice.net.gate import NetworkGate
+    from astra_voice.updates import checker as checker_mod
+    from astra_voice.updates.state import StateStore
+
+    now = 100.0
+    checker = checker_mod.UpdateChecker(
+        NetworkGate(rig.settings, Policy()),
+        Mock(),
+        store=StateStore(tmp_path / "update-state.json"),
+        metadata=Mock(),
+        clock=lambda: now,
+    )
+    # start() настраивает настоящее расписание; рабочий цикл запускаем вручную,
+    # чтобы проверить срок без ожидания, файлов метаданных и сетевых запросов.
+    monkeypatch.setattr(checker, "_run", Mock())
+    monkeypatch.setattr(checker._wake, "wait", Mock())
+    start = Mock(wraps=checker.start)
+    enable = Mock(wraps=checker.enable_scheduled_checks)
+    monkeypatch.setattr(checker, "start", start)
+    monkeypatch.setattr(checker, "enable_scheduled_checks", enable)
+    monkeypatch.setattr(checker_mod, "create_app_checker", Mock(return_value=checker))
+    monkeypatch.setattr(notify, "notify_onboarding_ready", Mock())
+    model = Mock(
+        spec_set=model_downloads.ModelPort,
+        recommended=Mock(return_value=None),
+        installed_ok=Mock(return_value=True),
+        broken=Mock(return_value=False),
+        allowed=Mock(return_value=(False, "Сеть отключена в тесте")),
+        disk_ok=Mock(return_value=True),
+        ram_ok=Mock(return_value=True),
+        download=Mock(side_effect=AssertionError("Неожиданная загрузка модели")),
+        install_from_staging=Mock(side_effect=AssertionError("Неожиданная установка модели")),
+        install_from_path=Mock(side_effect=AssertionError("Неожиданная установка модели")),
+    )
+    monkeypatch.setattr(model_downloads, "ModelService", Mock(return_value=model))
+
+    def exec_loop() -> int:
+        nonlocal now
+        properties = dict(
+            item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+        )
+        onboarding = properties["onboarding"]
+        assert onboarding.step == 1 and not onboarding.done
+        start.assert_called_once_with(scheduled=False)
+        enable.assert_not_called()
+        assert not checker._scheduled_enabled
+
+        onboarding.next()
+        assert onboarding.step == 2
+        enable.assert_called_once_with()
+        checker._round()
+        due = checker._next_due
+        assert checker._scheduled_enabled
+        assert due == now + checker_mod.STARTUP_DELAY_S
+
+        now += 10.0
+        onboarding.finish()
+        assert onboarding.done
+        assert enable.call_count == 2
+        checker._round()
+        assert checker._next_due == due
+        onboarding.finish()
+        assert enable.call_count == 2
+        return 0
+
+    rig.app.exec_.side_effect = exec_loop
+    assert app_mod.main([]) == 0
+
+
 def test_about_bridge_stats_listener_released_on_exit(rig: Rig) -> None:
     """«О программе» слушает статистику, а при выходе слушатель снят (урок 025)."""
     seen: dict[str, object] = {}
@@ -360,7 +435,7 @@ def test_updates_bridge_bound_before_start_and_refreshed_by_settings(
     monkeypatch.setattr(external, "open_external", opener)
     checker = Mock()
     seen: dict[str, object] = {}
-    checker.start.side_effect = lambda: seen.setdefault("on_status", checker.on_status)
+    checker.start.side_effect = lambda **_kwargs: seen.setdefault("on_status", checker.on_status)
     monkeypatch.setattr(checker_mod, "create_app_checker", Mock(return_value=checker))
     posted: list[object] = []
 
@@ -373,6 +448,7 @@ def test_updates_bridge_bound_before_start_and_refreshed_by_settings(
     assert app_mod.main([]) == 7
 
     on_status = seen["on_status"]
+    checker.start.assert_called_once_with(scheduled=False)
     assert callable(on_status)
     properties = dict(
         item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
@@ -558,6 +634,9 @@ def test_model_service_receives_effective_settings_and_onboarding_receives_store
     rig.settings.extra.update(offline="no", onboarding_language_set=True)
     original = rig.settings.to_dict()
     expected = policy_mod.effective(rig.settings, policy)
+    if "offline = yes" in policy_text:
+        # Общий admin-запрет показывает off/замки, не изменяя stored для мастера.
+        expected.check_app_updates = expected.check_model_updates = False
     model_factory = Mock(return_value=None)
     onboarding_factory = Mock(wraps=bridges.OnboardingController)
     monkeypatch.setattr(model_downloads, "ModelService", model_factory)
@@ -574,9 +653,76 @@ def test_model_service_receives_effective_settings_and_onboarding_receives_store
     )
     assert properties["settingsBridge"].checkAppUpdates == effective.check_app_updates
     assert properties["settingsBridge"].checkModelUpdates == effective.check_model_updates
+    assert properties["settingsBridge"].lockedSettings == sorted(
+        policy.locked_keys | {"check_app_updates", "check_model_updates"}
+    )
     onboarding_factory.assert_called_once()
     assert onboarding_factory.call_args.kwargs["settings"] is rig.settings
     assert rig.settings.to_dict() == original
+
+
+@pytest.mark.parametrize("appimage", [False, True], ids=["deb", "appimage"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["fresh", "legacy"])
+@pytest.mark.parametrize(
+    "policy_text,app_on,models_on",
+    [
+        ("", None, None),
+        ("locked = check_app_updates", False, None),
+        ("check_app_updates = no", False, None),
+        ("check_app_updates = yes", True, None),
+        ("offline = yes", False, False),
+        ("profile = secure", False, False),
+    ],
+)
+def test_install_track_and_policy_defaults_reach_runtime_and_onboarding(
+    rig: Rig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    appimage: bool,
+    legacy: bool,
+    policy_text: str,
+    app_on: bool | None,
+    models_on: bool | None,
+) -> None:
+    from astra_voice.ui import bridges
+
+    policy_path = tmp_path / "policy.conf"
+    if policy_text:
+        policy_path.write_text("[astra-voice]\n" + policy_text + "\n", encoding="utf-8")
+    policy = load_policy(policy_path)
+    monkeypatch.setattr(policy_mod, "load", lambda: policy)
+    settings_path = paths_mod.settings_path()
+    if legacy:
+        settings_path.write_text(
+            json.dumps(
+                {"schema_version": 1, "check_app_updates": False, "check_model_updates": False}
+            ),
+            encoding="utf-8",
+        )
+    controller_factory = Mock(wraps=bridges.OnboardingController)
+    monkeypatch.setattr(bridges, "OnboardingController", controller_factory)
+    # Rig обычно подменяет чтение; здесь main использует настоящий load.
+    monkeypatch.setattr(
+        settings_mod,
+        "load",
+        lambda **kwargs: _real_settings_load(settings_path, appimage=appimage, **kwargs),
+    )
+    assert app_mod.main([]) == 7
+    properties = dict(
+        item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
+    )
+    bridge = properties["settingsBridge"]
+    assert bridge.checkAppUpdates is (appimage if app_on is None else app_on)
+    assert bridge.checkModelUpdates is (appimage if models_on is None else models_on)
+    stored = controller_factory.call_args.kwargs["settings"]
+    effective = rig.factory.call_args.kwargs["settings"]
+    assert stored is not effective
+    assert stored.check_app_updates is (appimage and app_on is None)
+    assert stored.check_model_updates is (appimage and models_on is None)
+    if legacy:
+        assert (
+            json.loads(settings_path.read_text())["schema_version"] == settings_mod.SCHEMA_VERSION
+        )
 
 
 @pytest.mark.parametrize("failure", ["constructor", "start"])
@@ -823,6 +969,11 @@ def test_onboarding_context(rig: Rig, done: int | None, runtime_available: bool)
     )
     assert properties["showOnboarding"] is (done is not True)
     assert "settingsBridge" in properties
+    if runtime_available:
+        assert (
+            rig.runtime.orchestrator.microphone_count
+            == properties["settingsBridge"].microphone_count
+        )
     if done is True:
         assert "onboarding" not in properties
     else:

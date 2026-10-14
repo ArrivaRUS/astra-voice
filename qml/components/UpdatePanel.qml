@@ -12,6 +12,9 @@ Rectangle {
     property string currentVersion: ""
     property string checkedText: ""
     property bool canCheckNow: false
+    property string checkRefusal: ""
+    property bool checkBlocked: false
+    property bool bridgeAvailable: true
     property bool autoCheck: false
     property string artifactTrack: ""
     property string artifactSizeText: ""
@@ -44,6 +47,11 @@ Rectangle {
     signal openFolderRequested()
     signal installRequested()
 
+    readonly property string checkDisabledReason: !bridgeAvailable ? qsTr("Проверка пока недоступна")
+        : panelState === "checking" ? qsTr("Проверяю обновления…")
+        : checkRefusal === "offline" ? qsTr("Проверить сейчас нельзя: включён офлайн-режим.")
+        : checkRefusal === "admin" || checkRefusal === "policy"
+            ? qsTr("Проверить сейчас нельзя: задано администратором.") : ""
     readonly property bool operationVisible: panelState === "available"
     readonly property bool operationBlockVisible: operationVisible
         && (downloadPhase !== "idle" || !canDownload || networkRefusal !== "")
@@ -130,8 +138,7 @@ Rectangle {
     property bool pendingCancelFocus: false
     property bool pendingCancelKeyboard: false
     function panelActions() {
-        return [primaryButton, skipButton, cancelButton,
-            checkAgainButton, showSkippedButton];
+        return [checkNowButton, primaryButton, skipButton, cancelButton, showSkippedButton];
     }
     function focusPanelAction(current, direction) {
         var actions = panelActions();
@@ -150,6 +157,21 @@ Rectangle {
         headingKeyboardFocus = keyboard === true;
         heading.forceActiveFocus(headingKeyboardFocus ? Qt.TabFocusReason : Qt.OtherFocusReason);
         return heading;
+    }
+    function focusAfterPanel() {
+        // The heading is outside the Tab chain. Continue from the panel boundary
+        // explicitly when it has no enabled actions, skipping unavailable controls.
+        var item = root.nextItemInFocusChain(true);
+        while (item && item !== root) {
+            var ancestor = item;
+            while (ancestor && ancestor !== root) ancestor = ancestor.parent;
+            if (!ancestor && item.activeFocusOnTab && item.visible && item.enabled) {
+                item.forceActiveFocus(Qt.TabFocusReason);
+                return true;
+            }
+            item = item.nextItemInFocusChain(true);
+        }
+        return false;
     }
     function megabytes(value) { return (value / 1000000).toFixed(value < 10000000 ? 1 : 0) + " МБ"; }
     function ownsFocus() {
@@ -317,8 +339,8 @@ Rectangle {
     }
     Rectangle {
         objectName: "updateHeadingFocusRing"
-        x: body.x + heading.x + headingContent.x + headingContent.visibleChildrenRect.x - Theme.focusOffset - Theme.focusWidth
-        y: body.y + heading.y + headingContent.y + headingContent.visibleChildrenRect.y - Theme.focusOffset - Theme.focusWidth
+        x: body.x + topRow.x + textColumn.x + heading.x + headingContent.x + headingContent.visibleChildrenRect.x - Theme.focusOffset - Theme.focusWidth
+        y: body.y + topRow.y + textColumn.y + heading.y + headingContent.y + headingContent.visibleChildrenRect.y - Theme.focusOffset - Theme.focusWidth
         width: headingContent.visibleChildrenRect.width + 2 * (Theme.focusOffset + Theme.focusWidth)
         height: headingContent.visibleChildrenRect.height + 2 * (Theme.focusOffset + Theme.focusWidth)
         radius: Theme.focusRadius
@@ -334,99 +356,140 @@ Rectangle {
         width: root.width - x * 2
         NoteBanner {
             width: parent.width
-            visible: root.networkRefusal !== ""
+            visible: root.operationVisible && root.networkRefusal !== ""
             height: visible ? implicitHeight : 0
             title: root.networkRefusal === "offline" ? qsTr("Включён офлайн-режим") : qsTr("Обновления ограничены администратором")
             body: root.networkRefusal === "offline" ? qsTr("Проверка и скачивание обновлений недоступны. Диктовка работает без сети.") : qsTr("Сетевые действия ограничены: задано администратором.")
         }
-        Item { height: 12; width: 1; visible: root.networkRefusal !== "" }
+        Item { height: 12; width: 1; visible: root.operationVisible && root.networkRefusal !== "" }
         Item {
-            id: heading
-            objectName: "updatePanelHeading"
+            id: topRow
             width: parent.width
-            height: Math.max(headingContent.implicitHeight, Math.ceil(Theme.badgeHeight))
-            activeFocusOnTab: false
-            Accessible.role: Accessible.Heading
-            Accessible.name: title.text + " " + releaseVersion.text
-            // One-way entry keeps programmatic heading focus out of the reverse Tab chain.
-            Keys.onTabPressed: event.accepted = root.focusPanelAction(null, 1)
-            Flow {
-                id: headingContent
-                objectName: "updateHeadingContent"
-                width: parent.width
-                spacing: 9
-                // childrenRect also contains hidden items; their old Flow positions
-                // must not enlarge the ring after the badge/version disappears.
-                readonly property rect visibleChildrenRect: {
-                    var bounds = childrenRect;
-                    var left = bounds.x + bounds.width;
-                    var top = bounds.y + bounds.height;
-                    var right = bounds.x;
-                    var bottom = bounds.y;
-                    for (var i = 0; i < children.length; i++) {
-                        var child = children[i];
-                        if (!child.visible || child.width <= 0 || child.height <= 0) continue;
-                        left = Math.min(left, child.x);
-                        top = Math.min(top, child.y);
-                        right = Math.max(right, child.x + child.width);
-                        bottom = Math.max(bottom, child.y + child.height);
+            readonly property bool stacked: !root.operationVisible
+                && width - checkNowButton.implicitWidth - Theme.updatePanelPaddingX < 240
+            height: root.operationVisible ? textColumn.height
+                : stacked ? textColumn.height + 12 + checkNowButton.height
+                : Math.max(textColumn.height, checkNowButton.height)
+            Column {
+                id: textColumn
+                width: root.operationVisible || topRow.stacked ? topRow.width
+                    : topRow.width - checkNowButton.width - Theme.updatePanelPaddingX
+                Item {
+                    id: heading
+                    objectName: "updatePanelHeading"
+                    width: parent.width
+                    height: root.operationVisible ? Math.max(headingContent.implicitHeight, Math.ceil(Theme.badgeHeight))
+                        : headingContent.implicitHeight
+                    activeFocusOnTab: false
+                    Accessible.role: Accessible.Heading
+                    Accessible.name: title.text + (releaseVersion.visible ? " " + releaseVersion.text : installedVersion.visible ? " " + installedVersion.text : "")
+                    // One-way entry keeps programmatic heading focus out of the reverse Tab chain.
+                    Keys.onTabPressed: event.accepted = root.focusPanelAction(null, 1) || root.focusAfterPanel()
+                    Flow {
+                        id: headingContent
+                        objectName: "updateHeadingContent"
+                        width: parent.width
+                        spacing: 9
+                        // childrenRect also contains hidden items; their old Flow positions
+                        // must not enlarge the ring after the badge/version disappears.
+                        readonly property rect visibleChildrenRect: {
+                            var bounds = childrenRect;
+                            var left = bounds.x + bounds.width;
+                            var top = bounds.y + bounds.height;
+                            var right = bounds.x;
+                            var bottom = bounds.y;
+                            for (var i = 0; i < children.length; i++) {
+                                var child = children[i];
+                                if (!child.visible || child.width <= 0 || child.height <= 0) continue;
+                                left = Math.min(left, child.x);
+                                top = Math.min(top, child.y);
+                                right = Math.max(right, child.x + child.width);
+                                bottom = Math.max(bottom, child.y + child.height);
+                            }
+                            return Qt.rect(left, top, Math.max(0, right - left), Math.max(0, bottom - top));
+                        }
+                        SmallText {
+                            id: title
+                            objectName: "updatePanelTitle"
+                            width: Math.min(implicitWidth, headingContent.width)
+                            font.pixelSize: Theme.fontH3SubsectionSize
+                            lineHeight: Math.round(Theme.fontH3SubsectionSize * Theme.fontH3SubsectionLineHeight)
+                            font.weight: Font.Medium
+                            color: Theme.fg
+                            text: !root.bridgeAvailable ? qsTr("Обновление программы")
+                                : root.panelState === "idle" ? qsTr("Установлена версия")
+                                : root.panelState === "uptodate" ? qsTr("Установлена последняя версия")
+                                : root.panelState === "checking" ? qsTr("Проверяю обновления…")
+                                : root.panelState === "skipped" ? qsTr("Версия")
+                                : root.panelState === "unavailable" ? qsTr("Источник обновлений недоступен")
+                                : root.panelState === "error-net" ? qsTr("Не удалось проверить сведения об обновлении")
+                                : qsTr("Доступна версия")
+                        }
+                        Selectable {
+                            id: releaseVersion
+                            objectName: "updateReleaseVersion"
+                            width: Math.min(implicitWidth, headingContent.width)
+                            font.pixelSize: Theme.fontH3SubsectionSize
+                            color: Theme.fg
+                            text: root.version
+                            visible: root.panelState === "available" || root.panelState === "skipped"
+                        }
+                        Selectable {
+                            id: installedVersion
+                            objectName: "updateInstalledVersion"
+                            width: Math.min(implicitWidth, headingContent.width)
+                            font.pixelSize: Theme.fontH3SubsectionSize
+                            color: Theme.fg
+                            text: root.currentVersion
+                            visible: root.bridgeAvailable && (root.panelState === "idle" || root.panelState === "uptodate") && text !== ""
+                        }
+                        SmallText { text: qsTr("пропущена"); visible: root.panelState === "skipped"; font.pixelSize: 16; color: Theme.fg }
+                        Rectangle {
+                            objectName: "updateNewBadge"
+                            visible: root.panelState === "available" && root.downloadPhase === "idle" && root.networkRefusal === ""
+                            width: badgeText.implicitWidth + Theme.badgePaddingX * 2
+                            height: Math.ceil(Theme.badgeHeight)
+                            radius: Theme.badgeRadius
+                            color: Theme.primaryBg
+                            Text { id: badgeText; objectName: "updateNewBadgeText"; anchors.centerIn: parent; text: qsTr("Новая"); textFormat: Text.PlainText; color: Theme.primary; font.family: Theme.fontUi; font.pixelSize: Theme.badgeSize; font.weight: Font.Medium }
+                        }
                     }
-                    return Qt.rect(left, top, Math.max(0, right - left), Math.max(0, bottom - top));
                 }
                 SmallText {
-                    id: title
-                    objectName: "updatePanelTitle"
-                    width: Math.min(implicitWidth, headingContent.width)
-                    font.pixelSize: Theme.fontH3SubsectionSize
-                    lineHeight: Math.round(Theme.fontH3SubsectionSize * Theme.fontH3SubsectionLineHeight)
-                    font.weight: Font.Medium
-                    color: Theme.fg
-                    text: root.panelState === "uptodate" ? qsTr("Установлена последняя версия")
-                        : root.panelState === "checking" ? qsTr("Проверяю обновления…")
-                        : root.panelState === "skipped" ? qsTr("Версия")
-                        : root.panelState === "unavailable" ? qsTr("Источник обновлений недоступен")
-                        : root.panelState === "error-net" ? qsTr("Не удалось проверить сведения об обновлении")
-                        : qsTr("Доступна версия")
+                    objectName: "updateArtifactMetadata"
+                    width: parent.width
+                    text: !root.bridgeAvailable ? qsTr("Проверка пока недоступна")
+                        : root.panelState === "checking" ? qsTr("Ищу новую версию и проверяю подпись сведений о ней.")
+                        : root.panelState === "skipped" ? qsTr("Напомним о следующей версии. Обновиться до этой всё ещё можно.")
+                        : root.operationVisible && root.artifactSizeText ? (root.deb ? ".deb" : "AppImage") + " · " + root.artifactSizeText + qsTr(" · размер из проверенных сведений") + (root.networkRefusal === "offline" ? qsTr(" · сохранённые сведения о версии") : "") : root.operationVisible ? root.checkedText
+                        : (root.checkedText || qsTr("Обновления ещё не проверялись"))
+                            + (root.panelState === "idle" && !root.autoCheck && root.checkRefusal === ""
+                                ? qsTr(" · автоматическая проверка выключена") : "")
+                    visible: text !== ""
+                    topPadding: 6
                 }
-                Selectable {
-                    id: releaseVersion
-                    objectName: "updateReleaseVersion"
-                    width: Math.min(implicitWidth, headingContent.width)
-                    font.pixelSize: Theme.fontH3SubsectionSize
-                    color: Theme.fg
-                    text: root.version
-                    visible: root.panelState === "available" || root.panelState === "skipped"
-                }
-                SmallText { text: qsTr("пропущена"); visible: root.panelState === "skipped"; font.pixelSize: 16; color: Theme.fg }
-                Rectangle {
-                    objectName: "updateNewBadge"
-                    visible: root.panelState === "available" && root.downloadPhase === "idle" && root.networkRefusal === ""
-                    width: badgeText.implicitWidth + Theme.badgePaddingX * 2
-                    height: Math.ceil(Theme.badgeHeight)
-                    radius: Theme.badgeRadius
-                    color: Theme.primaryBg
-                    Text { id: badgeText; objectName: "updateNewBadgeText"; anchors.centerIn: parent; text: qsTr("Новая"); textFormat: Text.PlainText; color: Theme.primary; font.family: Theme.fontUi; font.pixelSize: Theme.badgeSize; font.weight: Font.Medium }
+                SmallText {
+                    objectName: "updateCheckRefusal"
+                    width: parent.width
+                    text: root.checkDisabledReason
+                    visible: !root.operationVisible && root.bridgeAvailable && root.panelState !== "checking" && text !== ""
                 }
             }
-        }
-        SmallText {
-            objectName: "updateArtifactMetadata"
-            width: parent.width
-            text: root.panelState === "checking" ? qsTr("Ищу новую версию и проверяю подпись сведений о ней.")
-                : root.panelState === "skipped" ? qsTr("Напомним о следующей версии. Обновиться до этой всё ещё можно.")
-                : root.operationVisible && root.artifactSizeText ? (root.deb ? ".deb" : "AppImage") + " · " + root.artifactSizeText + qsTr(" · размер из проверенных сведений") + (root.networkRefusal === "offline" ? qsTr(" · сохранённые сведения о версии") : "") : root.checkedText
-            visible: text !== ""
-            topPadding: 6
-        }
-        Flow {
-            objectName: "updateInstalledLine"
-            width: parent.width
-            visible: root.panelState === "uptodate"
-            SmallText { text: qsTr("Версия") + " "; visible: root.currentVersion !== "" }
-            SmallText { objectName: "updateInstalledVersion"; text: root.currentVersion; font.family: Theme.fontMono }
-            SmallText {
-                width: Math.min(implicitWidth, body.width)
-                text: ". " + (root.autoCheck ? qsTr("Следующая автоматическая проверка — не раньше чем через сутки.") : qsTr("Автоматическая проверка выключена — проверяйте вручную, когда удобно."))
+            PanelButton {
+                id: checkNowButton
+                objectName: "checkNowButton"
+                x: topRow.stacked ? 0 : topRow.width - width
+                y: topRow.stacked ? textColumn.height + 12 : (topRow.height - height) / 2
+                text: qsTr("Проверить сейчас")
+                iconName: "refresh"
+                visible: !root.operationVisible
+                enabled: root.bridgeAvailable && root.canCheckNow && root.panelState !== "checking" && !root.checkBlocked
+                Accessible.description: root.checkDisabledReason
+                onClicked: {
+                    var keyboard = activationKeyboard;
+                    root.checkRequested();
+                    root.focusHeading(keyboard);
+                }
             }
         }
         Item { width: 1; height: 7; visible: root.operationVisible }
@@ -549,12 +612,13 @@ Rectangle {
             PanelButton { id: skipButton; objectName: "updateSkip"; text: qsTr("Пропустить эту версию"); enabled: root.canSkipVersion && !root.downloadBusy && !root.installing; onClicked: root.skipRequested() }
             PanelButton { id: cancelButton; objectName: "updateCancel"; text: qsTr("Отмена"); visible: root.cancellablePhase; enabled: root.canCancelDownload; onClicked: root.requestCancel(cancelButton.activationKeyboard) }
         }
+        Item { width: 1; height: 12; visible: skippedActions.visible }
         Flow {
+            id: skippedActions
             width: parent.width
-            spacing: 8
-            visible: !root.operationVisible && root.panelState !== "checking"
-            PanelButton { id: checkAgainButton; objectName: "updateCheckAgain"; visible: root.panelState === "uptodate" || root.panelState === "error-net" || root.panelState === "unavailable"; text: root.panelState === "error-net" ? qsTr("Повторить проверку") : qsTr("Проверить ещё раз"); enabled: root.canCheckNow; onClicked: root.checkRequested() }
-            PanelButton { id: showSkippedButton; objectName: "updateShowSkipped"; visible: root.panelState === "skipped"; text: qsTr("Показать %1").arg(root.version); onClicked: root.showSkippedRequested() }
+            spacing: 12
+            visible: root.panelState === "skipped"
+            PanelButton { id: showSkippedButton; objectName: "updateShowSkipped"; text: qsTr("Показать %1").arg(root.version); onClicked: root.showSkippedRequested() }
         }
     }
 }

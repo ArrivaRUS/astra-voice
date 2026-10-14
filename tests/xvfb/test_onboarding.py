@@ -37,7 +37,7 @@ from PyQt5.QtCore import (
     pyqtSlot,
     qInstallMessageHandler,
 )
-from PyQt5.QtGui import QColor, QGuiApplication, QImage, QWheelEvent
+from PyQt5.QtGui import QColor, QFontDatabase, QGuiApplication, QImage, QWheelEvent
 from PyQt5.QtQml import QQmlApplicationEngine, QQmlComponent
 from PyQt5.QtQuick import QQuickView, QQuickWindow
 from PyQt5.QtTest import QSignalSpy, QTest
@@ -284,8 +284,8 @@ class FakeOnboarding(QObject):
         self._testMessage: str = ""
         self._canFinish: bool = True
         self._language: str = "ru"
-        self._checkAppUpdates: bool = False
-        self._checkModelUpdates: bool = False
+        self._checkAppUpdates: bool = True  # Стенд AppImage; deb задаётся явно.
+        self._checkModelUpdates: bool = True
 
     def _get_step(self) -> int:
         return self._step
@@ -1006,8 +1006,8 @@ class FakeSettings(QObject):
         self._soundCuesStatus: str = ""
         self._pillEnabled: bool = True
         self._language: str = "ru"
-        self._checkAppUpdates: bool = False
-        self._checkModelUpdates: bool = False
+        self._checkAppUpdates: bool = True  # Стенд AppImage; deb задаётся явно.
+        self._checkModelUpdates: bool = True
         self._offline: bool = False
         self._autostart: bool = True
         self._device: str = "Системный по умолчанию"
@@ -1785,9 +1785,20 @@ SNAPSHOT_SECTIONS = {"07-settings-models": "models", "08-settings-about": "about
 CASES = [(name, dark) for name in SNAPSHOT_SETUPS for dark in (False, True)]
 
 
+def register_ui_fonts() -> None:
+    """Use the checked-in production UI fonts for real QML geometry."""
+    paths = sorted((REPO / "tests/fixtures/fonts/pt-root-ui").glob("*.ttf"))
+    assert paths
+    for path in paths:
+        assert QFontDatabase.addApplicationFont(str(path)) >= 0, path
+    # Fonts remain registered for this Qt process; removing live cached fonts can crash Qt.
+
+
 @pytest.fixture(scope="session")
 def onboarding_app() -> Any:
-    return get_qapplication()
+    app = get_qapplication()
+    register_ui_fonts()
+    return app
 
 
 def visual_tree(root: Any) -> Iterator[Any]:
@@ -4409,7 +4420,7 @@ def test_mic_card_with_resolved_default_device_is_57px(onboarding_app: Any, dark
 
     def inspect(root: Any) -> None:
         row = next(item for item in visual_tree(root) if item.property("label") == "Микрофон")
-        assert row.property("sub") == "Встроенный микрофон"
+        assert row.property("sub") == "Сейчас: Встроенный микрофон"
         assert row.height() == 55
         card = microphone_card(root)
         assert row in list(visual_tree(card))
@@ -4436,10 +4447,10 @@ def test_mic_explanation_only_shows_resolved_default_device(
             if item.metaObject().indexOfProperty("currentText") >= 0
         )
         for device, resolved, selected, explanation in (
-            ("", builtin, system_default, builtin),
+            ("", builtin, system_default, "Сейчас: " + builtin),
             ("builtin", builtin, builtin, ""),
             ("", "", system_default, ""),
-            ("", builtin, system_default, builtin),
+            ("", builtin, system_default, "Сейчас: " + builtin),
         ):
             fake.device = device
             fake._deviceResolved = resolved
@@ -4453,7 +4464,9 @@ def test_mic_explanation_only_shows_resolved_default_device(
                 if item.isVisible() and isinstance(item.property("text"), str)
             ]
             assert texts.count(system_default) == int(device == "")
-            assert texts.count(builtin) == int(bool(explanation) or device == "builtin")
+            assert texts.count(builtin) == int(device == "builtin")
+            if explanation:
+                assert texts.count(explanation) == 1
             assert any(
                 item.isVisible() and item.property("text") == selected
                 for item in visual_tree(selector)
@@ -4465,17 +4478,32 @@ def test_mic_explanation_only_shows_resolved_default_device(
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 @pytest.mark.parametrize("default_index", [0, 1, None], ids=["first", "second", "absent"])
-def test_mic_missing_device_displays_fallback_without_writing_bridge(
+def test_mic_missing_device_stays_selected_without_writing_bridge(
     onboarding_app: Any, dark: bool, default_index: int | None
 ) -> None:
     fake = FakeOnboarding()
     fake.step = 4
-    devices = [{"id": "builtin", "name": "Встроенный микрофон"}]
+    devices: list[dict[str, Any]] = [{"id": "builtin", "name": "Встроенный микрофон"}]
     if default_index is not None:
         devices.insert(default_index, {"id": "", "name": "Системный по умолчанию"})
+    missing_label = "USB-гарнитура — нет подключения"
+    devices.append(
+        {
+            "id": "ghost-id",
+            "name": missing_label,
+            "label": missing_label,
+            "available": "no",
+            "muted": True,
+            "group": "",
+            "missing": True,
+        }
+    )
     fake.devices = devices
     fake.device = "ghost-id"
-    explanation = "Выбранный раньше микрофон не найден — включён системный по умолчанию"
+    explanation = (
+        "Подключите его или выберите другой микрофон. Пока у него нет подключения, "
+        "диктовка не начнётся: «Микрофон отключился»."
+    )
 
     def inspect(root: Any) -> None:
         selector = next(
@@ -4483,7 +4511,7 @@ def test_mic_missing_device_displays_fallback_without_writing_bridge(
             for item in visual_tree(root)
             if item.isVisible() and item.metaObject().indexOfProperty("currentText") >= 0
         )
-        expected_index = default_index if default_index is not None else 0
+        expected_index = len(devices) - 1
         assert selector.property("currentIndex") == expected_index
         assert selector.property("currentText") == devices[expected_index]["name"]
         assert any(
@@ -5103,3 +5131,50 @@ def test_settings_about_shows_version_and_privacy(onboarding_app: Any, dark: boo
 
     _, messages = render_settings(onboarding_app, dark, section="about", inspect=inspect)
     assert_no_messages(messages, "about section")
+
+
+@pytest.mark.parametrize(
+    "app_on,model_on,locked,title",
+    [
+        (True, True, False, "В сеть программа ходит только проверить обновления"),
+        (True, False, False, "В сеть программа ходит только проверить обновления"),
+        (False, True, False, "В сеть программа ходит только проверить обновления"),
+        (False, False, False, "Пока оба переключателя выключены, программа не выходит в сеть"),
+        (False, False, True, "Проверку обновлений отключил администратор"),
+    ],
+)
+def test_step1_network_disclosure_matches_actual_choices(
+    onboarding_app: Any, app_on: bool, model_on: bool, locked: bool, title: str
+) -> None:
+    fake = FakeOnboarding()
+    fake.step = 1
+    fake.checkAppUpdates, fake.checkModelUpdates = app_on, model_on
+    fake.policyLocked = locked
+
+    def inspect(root: Any) -> None:
+        texts = visible_texts(root)
+        assert title in texts
+        assert "Изменить можно позже в «Сеть и обновления»" in texts
+        hint = "Администратор отключил проверку обновлений на этом компьютере."
+        if locked:
+            assert hint in texts and "Задано администратором" in texts
+        else:
+            assert "Раз в сутки, github.com. Скачивание — только по вашему нажатию." in texts
+            assert "huggingface.co. Скачивание — только по вашему нажатию." in texts
+        if app_on or model_on:
+            assert any("Не чаще раза в сутки. Сама ничего не скачивает" in text for text in texts)
+        rows = [
+            item
+            for item in visual_tree(root)
+            if item.property("label")
+            in ("Проверять обновления утилиты", "Проверять обновления моделей")
+        ]
+        assert len(rows) == 2
+        for row, expected in zip(rows, (app_on, model_on), strict=True):
+            control = row.property("toggle")
+            assert control.property("checked") is expected
+            assert control.property("locked") is locked
+        assert fake.calls == []
+
+    _, messages = render_onboarding(onboarding_app, fake, False, inspect=inspect)
+    assert_no_messages(messages, "step1 network disclosure")

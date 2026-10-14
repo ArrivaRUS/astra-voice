@@ -58,6 +58,19 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def _settings_migration_locks(policy: policy_mod.Policy) -> tuple[frozenset[str], bool]:
+    """Запрет сети сохраняет legacy-флаги, как и явные значения/замки политики."""
+    from astra_voice.net.gate import NetworkGate
+
+    locked = policy.locked_keys
+    admin_offline = (
+        NetworkGate(settings_mod.Settings(), policy).refusal("check_app_manual") == "admin"
+    )
+    if admin_offline:
+        locked |= {"check_app_updates", "check_model_updates"}
+    return locked, admin_offline
+
+
 def _installed_code_key() -> str | None:
     """Путь исполняемого кода, даже если удаление уже убрало маркеры бандла."""
     here = paths._code_file()
@@ -384,7 +397,11 @@ def _debug_transcribe(path: str, args: argparse.Namespace) -> int:
         wav = Path(path).expanduser().resolve()
         if not wav.is_file():
             return fail(1, "Звуковой файл не найден или недоступен.")
-        settings = policy_mod.effective(settings_mod.load(), policy_mod.load()).to_dict()
+        policy = policy_mod.load()
+        migration_locked, _ = _settings_migration_locks(policy)
+        settings = policy_mod.effective(
+            settings_mod.load(quarantine=False, locked=migration_locked), policy
+        ).to_dict()
 
         try:
             request = _debug_model_request(settings, args, paths.model_store_dir())
@@ -978,6 +995,8 @@ def _start_update_checker(
     gui_calls: _GuiCalls,
     runtime: DictationRuntime | None,
     bind: Callable[[UpdateChecker], None] | None = None,
+    *,
+    scheduled: bool = True,
 ) -> UpdateChecker | None:
     """Фоновая проверка обновлений программы (M7-ядро).
 
@@ -1003,7 +1022,10 @@ def _start_update_checker(
             gui_calls.post(partial(stats.append, kind, **fields))
 
         checker.on_event = record
-    checker.start()
+    if scheduled:
+        checker.start()
+    else:
+        checker.start(scheduled=False)
     return checker
 
 
@@ -1492,8 +1514,16 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("Не удалось запретить автозапуск звукового сервера.", exc_info=True)
     _install_qt_message_handler()  # до создания QApplication: GL-жалобы идут оттуда
     policy = policy_mod.load()
-    stored = settings_mod.load()
+    migration_locked, admin_offline = _settings_migration_locks(policy)
+    stored = settings_mod.load(locked=migration_locked)
     settings = policy_mod.effective(stored, policy)
+
+    locked_settings = migration_locked
+    if admin_offline:
+        # Для общего запрета сети интерфейс показывает фактическое off + замок.
+        # Пользовательские значения stored сохраняются независимо от политики.
+        settings.check_app_updates = False
+        settings.check_model_updates = False
     log.info(
         "старт: версия=%s сеанс=%s политика=%s",
         __version__,
@@ -1655,10 +1685,11 @@ def main(argv: list[str] | None = None) -> int:
             downloads=downloads,
             apply=_RuntimeSettingsApply(runtime) if runtime_ready and runtime is not None else None,
             capture=capture,
-            locked=policy.locked_keys,
+            locked=locked_settings,
             autostart=autostart,
         )
         if runtime_ready and runtime is not None:
+            runtime.orchestrator.microphone_count = settings_bridge.microphone_count
             settings_bridge.bind_command_host(runtime)
             settings_bridge.bind_sound_cues_host(runtime)
             runtime.pill.on_copy_clicked = runtime._copy_last
@@ -1728,6 +1759,14 @@ def main(argv: list[str] | None = None) -> int:
 
         def bind_updates(checker: UpdateChecker) -> None:
             nonlocal updates_bridge, program_updates
+            if onboarding is not None:
+
+                def enable_after_network_step() -> None:
+                    if onboarding.done or onboarding.step > 1:
+                        checker.enable_scheduled_checks()
+
+                onboarding.stepChanged.connect(enable_after_network_step)
+                onboarding.doneChanged.connect(enable_after_network_step)
             program_updates = _ProgramUpdates(
                 checker, settings, gui_calls, runtime if runtime_ready else None, downloads, app
             )
@@ -1763,7 +1802,12 @@ def main(argv: list[str] | None = None) -> int:
                 _wire_tray_updates(runtime.tray, updates_bridge, show_network)
 
         update_checker = _start_update_checker(
-            settings, policy, gui_calls, runtime if runtime_ready else None, bind_updates
+            settings,
+            policy,
+            gui_calls,
+            runtime if runtime_ready else None,
+            bind_updates,
+            scheduled=onboarding is None or onboarding.done or onboarding.step > 1,
         )
         if not args.hidden:
             focuser.focus_shell()

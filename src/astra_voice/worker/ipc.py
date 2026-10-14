@@ -109,7 +109,7 @@ _SCHEMAS = {
     ),
     "level": _Schema({"utterance_id": _STR, "rms_dbfs": _NUMBER, "peak_dbfs": _NUMBER}),
     "silent": _UTTERANCE,
-    "audio.ready": _Schema(optional={"device": _STR, "changed": _STR}),
+    "audio.ready": _Schema(optional={"device": _STR, "changed": _STR, "mics": _INT}),
     "audio.closed": _Schema(),
 }
 _RUNTIME = _Schema({"python": _STR, "onnxruntime": (str, type(None))})

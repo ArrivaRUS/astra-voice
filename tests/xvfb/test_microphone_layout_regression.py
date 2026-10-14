@@ -432,18 +432,23 @@ def test_saved_device_first_show_and_programmatic_index_do_not_write(
         selector = foreground(rendered.row)["selector"]
         assert rendered.bridge.device == "long-device"
         assert selector.property("currentIndex") == 1
-        assert rendered.saved_changes == []
+        assert len(rendered.saved_changes) == 1
+        assert rendered.saved_changes[0]["device"] == "long-device"
+        assert rendered.saved_changes[0]["device_label"] == "Внешний микрофон"
         assert rendered.device_changes == []
         selector.setProperty("currentIndex", 0)
         selector.setProperty("currentIndex", 1)
         QTest.qWait(20)
         assert rendered.bridge.device == "long-device"
-        assert rendered.saved_changes == []
+        assert len(rendered.saved_changes) == 1
+        assert rendered.saved_changes[0]["device"] == "long-device"
+        assert rendered.saved_changes[0]["device_label"] == "Внешний микрофон"
         assert rendered.device_changes == []
         selector.forceActiveFocus(Qt.TabFocusReason)
         QTest.keyClick(rendered.window, Qt.Key_Up)
         QTest.qWait(20)
         assert rendered.bridge.device == ""
         assert rendered.device_changes == [None]
-        assert len(rendered.saved_changes) == 1 and rendered.saved_changes[0]["device"] is None
+        assert len(rendered.saved_changes) == 2 and rendered.saved_changes[-1]["device"] is None
+        assert rendered.saved_changes[-1]["device_label"] is None
         assert not rendered.messages, rendered.messages
