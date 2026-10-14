@@ -158,6 +158,21 @@ Rectangle {
         heading.forceActiveFocus(headingKeyboardFocus ? Qt.TabFocusReason : Qt.OtherFocusReason);
         return heading;
     }
+    function focusAfterPanel() {
+        // The heading is outside the Tab chain. Continue from the panel boundary
+        // explicitly when it has no enabled actions, skipping unavailable controls.
+        var item = root.nextItemInFocusChain(true);
+        while (item && item !== root) {
+            var ancestor = item;
+            while (ancestor && ancestor !== root) ancestor = ancestor.parent;
+            if (!ancestor && item.activeFocusOnTab && item.visible && item.enabled) {
+                item.forceActiveFocus(Qt.TabFocusReason);
+                return true;
+            }
+            item = item.nextItemInFocusChain(true);
+        }
+        return false;
+    }
     function megabytes(value) { return (value / 1000000).toFixed(value < 10000000 ? 1 : 0) + " МБ"; }
     function ownsFocus() {
         var item = root.Window.window ? root.Window.window.activeFocusItem : null;
@@ -369,7 +384,7 @@ Rectangle {
                     Accessible.role: Accessible.Heading
                     Accessible.name: title.text + (releaseVersion.visible ? " " + releaseVersion.text : installedVersion.visible ? " " + installedVersion.text : "")
                     // One-way entry keeps programmatic heading focus out of the reverse Tab chain.
-                    Keys.onTabPressed: event.accepted = root.focusPanelAction(null, 1)
+                    Keys.onTabPressed: event.accepted = root.focusPanelAction(null, 1) || root.focusAfterPanel()
                     Flow {
                         id: headingContent
                         objectName: "updateHeadingContent"

@@ -482,7 +482,12 @@ def test_about_without_bridges_shows_version(app: Any) -> None:
     try:
         _, texts, messages = render_about(app, True, None, info, height=TALL, inspect=inspect)
         assert not messages, "\n".join(messages)
-        assert {"Astra Voice", "0.2.0", "Другое окружение", "Нет сведений"} <= texts
+        assert {
+            "Astra Voice",
+            "0.2.0",
+            "Другое окружение",
+            "Автоматически раз в сутки · нет сведений",
+        } <= texts
         assert "Компоненты" not in texts
     finally:
         sip.delete(info)

@@ -81,6 +81,55 @@ def component(app: Any, request: pytest.FixtureRequest) -> Iterator[Any]:
         assert not messages, "\n".join(messages)
 
 
+@pytest.mark.parametrize(
+    "automatic,expected",
+    [(True, "Автоматически раз в сутки"), (False, "Только вручную")],
+)
+def test_about_with_only_settings_reports_known_update_mode(
+    app: Any, component: Any, automatic: bool, expected: str
+) -> None:
+    window, updates, settings, _, context = component
+    previous_automatic = settings.checkAppUpdates
+    previous_view = window.property("activeView")
+    try:
+        settings.checkAppUpdates = automatic
+        context.setContextProperty("updatesBridge", None)
+        window.setProperty("activeView", "about")
+        app.processEvents()
+        about = states.find_object(window, "aboutContractSection")
+        assert about.property("about") is None
+        assert about.property("updates") is None
+        assert about.updatesLine() == expected + " · нет сведений"
+        assert expected + " · нет сведений" in states.onboarding.visible_texts(about)
+    finally:
+        settings.checkAppUpdates = previous_automatic
+        context.setContextProperty("updatesBridge", updates)
+        window.setProperty("activeView", previous_view)
+        app.processEvents()
+
+
+@pytest.mark.parametrize("updates_present", [False, True])
+def test_about_without_settings_or_refusal_reports_unknown_update_mode(
+    app: Any, component: Any, updates_present: bool
+) -> None:
+    window, updates, settings, _, context = component
+    previous_view = window.property("activeView")
+    try:
+        context.setContextProperty("settingsBridge", None)
+        if not updates_present:
+            context.setContextProperty("updatesBridge", None)
+        window.setProperty("activeView", "about")
+        app.processEvents()
+        about = states.find_object(window, "aboutContractSection")
+        assert about.updatesLine() == "Нет сведений"
+        assert "Нет сведений" in states.onboarding.visible_texts(about)
+    finally:
+        context.setContextProperty("settingsBridge", settings)
+        context.setContextProperty("updatesBridge", updates)
+        window.setProperty("activeView", previous_view)
+        app.processEvents()
+
+
 def test_compact_states_keep_action_inside_panel_and_wrap_at_narrow_width(
     app: Any, component: Any
 ) -> None:

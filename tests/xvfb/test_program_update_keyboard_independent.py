@@ -785,6 +785,45 @@ def test_compact_forward_reverse_tab_order_includes_model_preference(
     render(app, updates, inspect)
 
 
+@pytest.mark.parametrize(
+    "settings_values,expected",
+    [
+        ({}, "checkAppUpdatesToggle"),
+        ({"_offline": True}, "offlineToggle"),
+        ({"_lockedSettings": ["check_app_updates"]}, "checkModelUpdatesToggle"),
+    ],
+    ids=["online", "offline", "first-toggle-locked"],
+)
+def test_checking_heading_tab_skips_disabled_toggles_and_shows_focus_ring(
+    app: Any, settings_values: dict[str, Any], expected: str
+) -> None:
+    updates = states.FakeUpdates(state="checking", manual=True)
+    settings = states.make_settings(settings_values)
+
+    def inspect(window: Any) -> None:
+        settle(app, window)
+        assert item(window, "checkNowButton").property("enabled") is False
+        if expected != "checkAppUpdatesToggle":
+            assert item(window, "checkAppUpdatesToggle").property("enabled") is False
+        if expected == "offlineToggle":
+            assert item(window, "checkModelUpdatesToggle").property("enabled") is False
+        item(window, "updatePanelHeading").forceActiveFocus(Qt.TabFocusReason)
+        QTest.keyClick(window, Qt.Key_Tab)
+        settle(app, window)
+        assert_focus_visible(window, expected)
+        assert item(window, expected).property("focusReason") == Qt.TabFocusReason
+        assert item(window, expected).property("visualFocus") is True
+        assert updates.calls == []
+
+    try:
+        _, _, messages = states.render_network(app, False, updates, settings, inspect)
+        assert not messages, "\n".join(messages)
+    finally:
+        sip.delete(updates)
+        sip.delete(settings)
+        app.processEvents()
+
+
 @pytest.mark.parametrize("activation", ["mouse", "return", "enter", "space"])
 @pytest.mark.parametrize("result", ["uptodate", "available", "unavailable", "error-net"])
 def test_manual_check_keeps_heading_focus_and_ring_through_result(

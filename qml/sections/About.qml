@@ -165,6 +165,8 @@ Column {
 
     function updatesLine() {
         var refusal = root.updates ? root.updates.checkRefusal : ""
+        if (!root.settings && !refusal)
+            return qsTr("Нет сведений")
         var locked = root.settings && root.settings.lockedSettings
             && root.settings.lockedSettings.indexOf("check_app_updates") >= 0
         var state = refusal === "admin" || refusal === "policy"
