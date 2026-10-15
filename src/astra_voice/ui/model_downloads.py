@@ -42,6 +42,7 @@ from astra_voice.core.measurements import read_measurements
 from astra_voice.core.model_request import model_threads
 from astra_voice.core.model_source import RevocationUnknown, SmokeRunner
 from astra_voice.core.policy import Policy
+from astra_voice.core.release_identity import RELEASES_REPO
 from astra_voice.core.settings import Settings, defaults
 from astra_voice.core.version import __version__
 from astra_voice.models import catalog_state
@@ -123,6 +124,7 @@ _REVISION_FAILURE_REASONS = {
     "checksum": "Файлы скачались с ошибкой",
     "selfcheck": "Модель не прошла самопроверку на этом компьютере",
     "download": "Не удалось скачать",
+    "no-previous": "Предыдущей версии нет",
     "cancelled": "Обновление отменено",
     "revoked": "Эта версия отозвана авторами каталога",
     "revert": REVERT_FAILED_MESSAGE,
@@ -551,7 +553,7 @@ class ModelService:
         http = HttpClient(
             self._gate,
             ca_bundle=Path(ca_bundle) if ca_bundle else None,
-            user_agent=f"astra-voice/{__version__} (+https://github.com/ArrivaRUS/astra-voice)",
+            user_agent=f"astra-voice/{__version__} (+https://github.com/{RELEASES_REPO})",
             extra_hosts=(corp_host,) if corp_host else (),
         )
         self._downloader = Downloader(http, self._store, corp_base=corp_base)

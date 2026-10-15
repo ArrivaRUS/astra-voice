@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Literal
 
 from astra_voice.core.paths import PathError, cache_dir_path, ensure_private_dir
+from astra_voice.core.release_identity import RELEASES_REPO
 from astra_voice.net.github import installed_version, parse_semver
 from astra_voice.net.http import (
     RATE_LIMIT_MIN_S,
@@ -35,7 +36,7 @@ from astra_voice.net.http import (
 )
 from astra_voice.security.verify import Verifier
 
-REPOSITORY_URL = "https://github.com/ArrivaRUS/astra-voice"
+REPOSITORY_URL = f"https://github.com/{RELEASES_REPO}"
 MAX_SUMS_BYTES = 1 << 20
 MAX_SIGNATURE_BYTES = 64 << 10
 MAX_LATEST_BYTES = 64 << 10

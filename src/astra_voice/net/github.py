@@ -21,6 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from astra_voice.core.release_identity import RELEASES_REPO
 from astra_voice.net.update_cache import MAX_BODY_BYTES, UpdateCache
 
 if TYPE_CHECKING:
@@ -30,7 +31,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-RELEASES_LATEST_URL = "https://api.github.com/repos/ArrivaRUS/astra-voice/releases/latest"
+RELEASES_LATEST_URL = f"https://api.github.com/repos/{RELEASES_REPO}/releases/latest"
 CACHE_KEY = "app:github"
 ACCEPT = "application/vnd.github+json"
 #: Предел тела ответа. Больше не сохранит и кэш (`update_cache.MAX_BODY_BYTES`).
@@ -40,7 +41,7 @@ MAX_NOTES_CHARS = 20_000
 _MAX_VERSION_CHARS = 64
 _MAX_NUMBER_DIGITS = 9
 #: Ссылка «Подробнее» — только на страницы выпусков нашего репозитория.
-RELEASE_URL_PREFIX = "https://github.com/ArrivaRUS/astra-voice/releases/"
+RELEASE_URL_PREFIX = f"https://github.com/{RELEASES_REPO}/releases/"
 
 _IDENT = r"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
 _SEMVER_RE = re.compile(

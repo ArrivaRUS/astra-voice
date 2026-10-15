@@ -37,6 +37,9 @@ from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+from astra_voice.core.release_identity import schema_id  # noqa: E402
+
 DATA = REPO / "data"
 SOURCE_PATH = DATA / "catalog-source.json"
 CACHE_PATH = DATA / "catalog-hf-cache.json"
@@ -309,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--sign требует --homedir с каталогом GnuPG.")
 
     try:
+        print(f"ассет каталога: catalog-{schema_id(SCHEMA_PATH.read_bytes())}.json")
         source = _read_json(SOURCE_PATH)
         if args.refresh:
             CACHE_PATH.write_bytes(_dump(refresh_cache(source)))

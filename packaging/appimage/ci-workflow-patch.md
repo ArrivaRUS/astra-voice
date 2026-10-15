@@ -26,6 +26,7 @@
   Debian bookworm на этапе инструментов, до подписи. Внешний apt-репозиторий
   GitHub CLI не добавляется. `GH_TOKEN` передаётся только шагу публикации;
   он публикует список `dist/assets.txt` и ничего не устанавливает (П25/MN-19).
+  В M7 (гейт каталога) добавлен `--repo` для явного указания репозитория выпусков.
 - Каждый checkout получает `persist-credentials: false`. Глобальное
   `contents: read`, единственное `contents: write` у `release`, Environment,
   tag gate, проверка принадлежности тега `main` и пины Actions сохраняются.
@@ -278,5 +279,5 @@ Qt/D-Bus, принятой в регламенте команды.
 -            dist/INSTALL-ADMIN.md dist/latest.json dist/release.gpg
 +          # Список ассетов пишет scripts/release_assets.sh (в т. ч. AppImage при ENABLED).
 +          # shellcheck disable=SC2046
-+          gh release create "${GITHUB_REF_NAME}" --generate-notes $(cat dist/assets.txt)
++          gh release create "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" --generate-notes $(cat dist/assets.txt)
 ```

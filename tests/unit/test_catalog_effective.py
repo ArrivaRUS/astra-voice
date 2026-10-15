@@ -240,7 +240,9 @@ def test_missing_or_bad_snapshot_cannot_erase_remote_watermark(
     assert scenario.state.read_bytes() == before
 
 
-def test_equal_pair_conflict_does_not_override_accepted_sha(scenario: Scenario) -> None:
+def test_equal_pair_conflict_does_not_override_accepted_sha(
+    scenario: Scenario, caplog: pytest.LogCaptureFixture
+) -> None:
     remote = scenario.remote()
     scenario.snapshot(remote)
     scenario.load()
@@ -248,10 +250,111 @@ def test_equal_pair_conflict_does_not_override_accepted_sha(scenario: Scenario) 
     builtin = scenario.remote()
     builtin["models"][0]["description"] = "Новый встроенный с занятой парой"
     scenario.builtin(builtin)
+    with caplog.at_level(logging.WARNING, logger=catalog_effective.__name__):
+        selected = scenario.load()
+    assert selected.entries[0].description == remote["models"][0]["description"]
+    assert scenario.state.read_bytes() == before
+    assert "другой SHA256" in caplog.text
+
+
+def test_equal_pair_conflict_keeps_accepted_builtin(
+    scenario: Scenario, caplog: pytest.LogCaptureFixture
+) -> None:
+    builtin = scenario.load()
+    before = scenario.state.read_bytes()
+    remote = scenario.remote(serial=builtin.serial)
+    remote["models"][0]["description"] = "Иной SHA при принятом встроенном"
+    scenario.snapshot(remote)
+    with caplog.at_level(logging.WARNING, logger=catalog_effective.__name__):
+        assert scenario.load() == builtin
+    assert scenario.state.read_bytes() == before
+    assert "другой SHA256" in caplog.text
+
+
+def test_equal_pair_conflict_with_neither_sha_accepted_is_closed(scenario: Scenario) -> None:
+    scenario.load()
+    before = scenario.state.read_bytes()
+    builtin = scenario.remote(serial=4)
+    builtin["models"][0]["description"] = "Второй SHA"
+    scenario.builtin(builtin)
+    remote = scenario.remote(serial=4)
+    remote["models"][0]["description"] = "Третий SHA"
+    scenario.snapshot(remote)
     with pytest.raises(CatalogError) as refused:
         scenario.load()
     assert refused.value.code == "stale-catalog"
     assert scenario.state.read_bytes() == before
+
+
+@pytest.mark.parametrize("builtin_serial", [4, 5, 6], ids=["older", "equal", "newer"])
+def test_schema_upgrade_preserves_watermark_and_revocations(
+    scenario: Scenario, builtin_serial: int
+) -> None:
+    remote = scenario.remote(serial=5)
+    remote["revoked"] = [
+        {"model_id": MODEL_ID, "revision": remote["models"][0]["revision"], "reason": "отзыв"}
+    ]
+    scenario.snapshot(remote)
+    scenario.load()
+    before = scenario.state.read_bytes()
+    old_marker = catalog_state.read_state(scenario.state)
+    assert old_marker is not None
+    schema_path = scenario.root / "catalog.schema.json"
+    new_schema = schema_path.read_bytes() + b"\n"
+    schema_path.write_bytes(new_schema)
+    builtin = scenario.remote(serial=builtin_serial)
+    builtin["schema_sha256"] = hashlib.sha256(new_schema).hexdigest()
+    scenario.builtin(builtin)
+    if builtin_serial <= 5:
+        # Старый snapshot не проходит новую схему; смена S не даёт принять
+        # каталог без отзыва со старой/равной парой и новыми байтами.
+        with pytest.raises(CatalogError) as refused:
+            scenario.load()
+        assert refused.value.code == "stale-catalog"
+        assert scenario.state.read_bytes() == before
+        assert catalog_state.read_state(scenario.state) == old_marker
+    else:
+        accepted = scenario.load()
+        marker = catalog_state.read_state(scenario.state)
+        assert marker is not None
+        assert (marker.trust_epoch, marker.serial) == (1, 6)
+        assert marker.schema_id == hashlib.sha256(new_schema).hexdigest()[:16]
+        assert marker.schema_id != old_marker.schema_id
+        assert not accepted.revoked and marker.revoked == ()
+        # Снятие отзыва разрешено только старшей паре; обратный ход закрыт.
+        scenario.builtin(scenario.remote(serial=4))
+        with pytest.raises(CatalogError):
+            scenario.load()
+        assert catalog_state.read_state(scenario.state) == marker
+
+
+@pytest.mark.parametrize("builtin_serial", [5, 6, 7], ids=["older", "equal", "newer"])
+def test_schema_id_change_does_not_affect_candidate_order(
+    scenario: Scenario, builtin_serial: int
+) -> None:
+    remote = scenario.remote(serial=5)
+    scenario.snapshot(remote)
+    scenario.load()
+    old_marker = catalog_state.read_state(scenario.state)
+    assert old_marker is not None
+    schema_path = scenario.root / "catalog.schema.json"
+    new_schema = schema_path.read_bytes() + b"\n"
+    schema_path.write_bytes(new_schema)
+    # Оба кандидата подписаны заново и совместимы с новой схемой. Watermark
+    # прошлого клиента (1, 5, SHA) не сбрасывается и не делится по schema_id.
+    remote = scenario.remote(serial=6)
+    remote["schema_sha256"] = hashlib.sha256(new_schema).hexdigest()
+    raw = scenario.snapshot(remote)
+    builtin = copy.deepcopy(remote)
+    builtin["serial"] = builtin_serial
+    builtin_raw = scenario.builtin(builtin)
+    selected = scenario.load()
+    assert selected.serial == max(6, builtin_serial)
+    marker = catalog_state.read_state(scenario.state)
+    assert marker is not None
+    assert marker.schema_id == hashlib.sha256(new_schema).hexdigest()[:16]
+    assert marker.schema_id != old_marker.schema_id
+    assert marker.sha256 == hashlib.sha256(raw if builtin_serial < 6 else builtin_raw).hexdigest()
 
 
 def test_snapshot_is_validated_against_current_builtin_schema(scenario: Scenario) -> None:

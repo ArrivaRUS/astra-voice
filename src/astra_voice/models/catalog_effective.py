@@ -32,6 +32,8 @@ def state_of(catalog: Catalog, raw: bytes) -> catalog_state.CatalogState:
         serial=catalog.serial,
         sha256=hashlib.sha256(raw).hexdigest(),
         revoked=tuple((entry.model_id, entry.revision) for entry in catalog.revoked),
+        # load_builtin уже связал этот SHA256 с точными байтами схемы клиента.
+        schema_id=json.loads(raw)["schema_sha256"][:16],
     )
 
 
@@ -115,8 +117,8 @@ def _load_effective(
     Кандидаты проверяются без изменения state: старый встроенный каталог
     не должен мешать восстановлению нового удалённого после перезапуска.
     Повреждённый snapshot игнорируется, но watermark при этом не сбрасывается.
-    Равная пара с разными байтами отдаёт предпочтение встроенному кандидату;
-    уже принятый другой SHA всё равно запрещает его через apply_state.
+    Равная пара с разными байтами сохраняет уже принятый SHA; без отметки
+    выбирается встроенный. apply_state запрещает конфликт с третьим SHA.
     """
     root = paths.data_dir_static() if builtin_root is None else builtin_root
     directory = (
@@ -151,9 +153,16 @@ def _load_effective(
             if remote_pair > builtin_pair:
                 chosen, candidate = remote, remote_state
             elif remote_pair == builtin_pair and remote_state.sha256 != candidate.sha256:
+                marker = catalog_state.read_state(state)
+                if (
+                    marker is not None
+                    and (marker.trust_epoch, marker.serial) == remote_pair
+                    and marker.sha256 == remote_state.sha256
+                ):
+                    chosen, candidate = remote, remote_state
                 log.warning(
                     "Снимок каталога имеет ту же пару эпохи и номера, но другой SHA256; "
-                    "выбран встроенный каталог."
+                    "выбор ограничен глобальной отметкой принятого каталога."
                 )
     try:
         state.parent.mkdir(parents=True, exist_ok=True)

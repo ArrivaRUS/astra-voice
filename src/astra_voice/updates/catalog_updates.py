@@ -13,7 +13,6 @@ from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
 
 from astra_voice.models import catalog_state
 from astra_voice.models.catalog import CATALOG_MAX_BYTES, Catalog, CatalogError
@@ -27,6 +26,8 @@ from astra_voice.models.catalog_effective import (
 )
 from astra_voice.models.store import ModelRecord
 from astra_voice.net import http, update_cache
+from astra_voice.net.catalog_url import _catalog_urls
+from astra_voice.net.catalog_url import catalog_urls as catalog_urls
 from astra_voice.net.gate import NetworkKind
 from astra_voice.net.http import (
     CHECK_CONNECT_TIMEOUT_S,
@@ -42,34 +43,8 @@ from astra_voice.security.verify import Verifier
 
 log = logging.getLogger(__name__)
 NEW_BADGE_WINDOW_S = 30 * 24 * 3600.0
+CATALOG_NOT_FOUND_RETRY_S = 24 * 3600.0
 _TRACKER_MAX_BYTES = 1024 * 1024
-
-
-def _urls(catalog_url: str, schemes: tuple[str, ...]) -> tuple[str, str]:
-    if (
-        not catalog_url
-        or not catalog_url.isascii()
-        or any(ord(char) <= 32 or ord(char) == 127 or char in "\\%?#" for char in catalog_url)
-    ):
-        raise ValueError("Неверный адрес каталога")
-    parsed = urlsplit(catalog_url)
-    if (
-        parsed.scheme not in schemes
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or re.fullmatch(r"[A-Za-z0-9.-]+", parsed.hostname) is None
-        or any(part in (".", "..") for part in parsed.path.split("/"))
-        or parsed.port is not None
-        and not 0 < parsed.port <= 65535
-    ):
-        raise ValueError("Неверный адрес каталога")
-    return catalog_url, catalog_url + ".sig"
-
-
-def catalog_urls(catalog_url: str) -> tuple[str, str]:
-    """Production URL: HTTPS, без credentials, параметров и обхода пути."""
-    return _urls(catalog_url, ("https",))
 
 
 def fetch(
@@ -85,7 +60,7 @@ def fetch(
     Допустимые схемы транспорта также позволяют локальный HTTP test harness.
     В рабочем транспорте разрешена только HTTPS.
     """
-    urls = _urls(catalog_url, http.ALLOWED_SCHEMES)
+    urls = _catalog_urls(catalog_url, http.ALLOWED_SCHEMES)
     bodies: list[bytes] = []
     for url, limit in zip(urls, (CATALOG_MAX_BYTES, SIGNATURE_MAX_BYTES), strict=True):
         with client.get_stream(
@@ -276,6 +251,14 @@ class CatalogUpdateSource:
                 return
             catalog_urls(url)
             try:
+                missing_key = "models:catalog:not-found"
+                missing = self._cache.get(missing_key)
+                if (
+                    missing.url == url
+                    and missing.backoff_until is not None
+                    and missing.backoff_until > self._clock()
+                ):
+                    return
                 with CATALOG_LOCK:
                     self._prepare()
                     marker = self._read_watermark(self._watermark)
@@ -298,6 +281,16 @@ class CatalogUpdateSource:
                         self._client, catalog_url=url, cancel=cancel, scope=self._scope
                     )
                 except NetworkError as error:
+                    if error.status == 404:
+                        self._cache.set(
+                            missing_key,
+                            CacheEntry(
+                                url=url,
+                                backoff_until=self._clock() + CATALOG_NOT_FOUND_RETRY_S,
+                            ),
+                        )
+                        log.info("catalog state=unavailable http_status=404 retry=24h")
+                        return
                     if error.status in (403, 429):
                         delay = min(
                             RATE_LIMIT_MAX_S,
@@ -344,6 +337,7 @@ class CatalogUpdateSource:
                     self._blocked = False
                 self._tracker.observe(catalog, self._clock())
                 self._cache.set(key, CacheEntry())
+                self._cache.set(missing_key, CacheEntry())
             except OSError:
                 raise CatalogError("state-write", "Не удалось сохранить каталог.") from None
             except ValueError:

@@ -30,8 +30,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from astra_voice.core import paths
+from astra_voice.core.release_identity import RELEASES_REPO, catalog_default_url
 from astra_voice.core.version import __version__
 from astra_voice.net import github
+from astra_voice.net.catalog_url import catalog_urls
 from astra_voice.net.gate import NetworkGate
 from astra_voice.net.http import (
     APP_CHECK_JITTER_MAX_S,
@@ -77,7 +79,7 @@ STARTUP_DELAY_S = 30.0
 #: Как часто поток перечитывает гейт и срок «напомнить позже» без внешних событий.
 IDLE_WAKE_S = 3600.0
 _RAW_TAG = re.compile(r"v?(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})")
-USER_AGENT = f"astra-voice/{__version__} (+https://github.com/ArrivaRUS/astra-voice)"
+USER_AGENT = f"astra-voice/{__version__} (+https://github.com/{RELEASES_REPO})"
 _STATS_RESULT = {
     "available": "ok",
     "uptodate": "none",
@@ -699,8 +701,22 @@ def create_app_checker(
         refresh_catalog: Callable[[threading.Event], None] | None = None
 
         def configured_catalog_url() -> str:
-            value = policy.values.get("catalog_url", settings.extra.get("catalog_url", ""))
-            return value if isinstance(value, str) else ""
+            policy_url = policy.values.get("catalog_url")
+            if isinstance(policy_url, str) and policy_url:
+                return policy_url
+            settings_url = settings.extra.get("catalog_url", "")
+            if settings_url != "":
+                try:
+                    if not isinstance(settings_url, str):
+                        raise ValueError("Адрес каталога должен быть строкой")
+                    catalog_urls(settings_url)
+                except ValueError:
+                    log.warning(
+                        "Неверный catalog_url в настройках; используется адрес по умолчанию."
+                    )
+                else:
+                    return settings_url
+            return catalog_default_url()
 
         configured_url = configured_catalog_url()
         catalog_state_dir = paths.state_dir() / "model-catalog-updates"
