@@ -881,7 +881,7 @@ def test_checksum_mismatch_keeps_current(
     ).apply(new_entry.id, cancel=threading.Event())
     assert result.state == "update-failed"
     assert result.message == mu.FAILED_MESSAGE
-    assert result.message == "Новая ревизия не прошла проверку, оставлена текущая"
+    assert result.message == "Новая версия модели не прошла проверку, оставлена текущая"
     assert result.reason_code == "checksum"
     assert result.active_revision == OLD
     current = installed.current()

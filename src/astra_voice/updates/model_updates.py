@@ -30,7 +30,7 @@ from astra_voice.net.update_cache import UpdateCache, read_private, write_privat
 log = logging.getLogger(__name__)
 SOURCE = "models"
 CHECK_INTERVAL_S = 24 * 3600.0
-FAILED_MESSAGE = "Новая ревизия не прошла проверку, оставлена текущая"
+FAILED_MESSAGE = "Новая версия модели не прошла проверку, оставлена текущая"
 REVERT_FAILED_MESSAGE = "Не удалось вернуть предыдущую версию модели"
 _MAX_STATE_BYTES = 256 * 1024
 

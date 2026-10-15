@@ -1546,6 +1546,14 @@ class FakeSettings(QObject):
         self.calls.append("updateModel")
 
     @pyqtSlot()
+    def cancelModelUpdate(self) -> None:
+        self.calls.append("cancelModelUpdate")
+
+    @pyqtSlot(str)
+    def revertModelPrevious(self, model_id: str) -> None:
+        self.calls.append("revertModelPrevious")
+
+    @pyqtSlot()
     def reinstallActiveModel(self) -> None:
         self.calls.append("reinstallActiveModel")
 

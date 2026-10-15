@@ -148,10 +148,12 @@ def rig() -> Iterator[RevisionRig]:
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
 
 
-def test_update_is_offered_only_for_active_model(rig: RevisionRig) -> None:
+def test_revision_update_state_is_offered_only_for_active_model(rig: RevisionRig) -> None:
     assert rig.card()["state"] == "update-available"
     assert rig.card()["updateAvailable"] is True
-    assert rig.card(SECOND.id)["updateAvailable"] is False
+    assert rig.card(SECOND.id)["updateAvailable"] is True
+    assert rig.card(SECOND.id)["state"] == "installed"
+    assert rig.card(SECOND.id)["badge"] == "installed"
     for bridge in (rig.downloads, rig.bridge):
         for signature in (
             "updateModel(QString)",
@@ -159,11 +161,41 @@ def test_update_is_offered_only_for_active_model(rig: RevisionRig) -> None:
             "revertModelPrevious(QString)",
         ):
             assert bridge.metaObject().indexOfSlot(signature.encode()) >= 0
-    rig.bridge.updateModel(SECOND.id)
     rig.bridge.revertModelPrevious(SECOND.id)
     rig.bridge.updateModel("unknown-model")
     assert rig.idle()
     assert rig.port.revision_calls == []
+
+
+def test_active_update_and_inactive_update_use_different_paths(rig: RevisionRig) -> None:
+    assert rig.card()["state"] == "update-available"
+    assert rig.card()["badge"] == "active"
+    assert rig.card(SECOND.id)["state"] == "installed"
+    assert rig.card(SECOND.id)["badge"] == "installed"
+    assert rig.card(SECOND.id)["updateAvailable"] is True
+
+    rig.bridge.updateModel(FIRST.id)
+    pump_until(rig.port.revision_started.is_set, "обновление активной модели")
+    assert rig.port.revision_calls == [("update", FIRST.id)]
+    assert rig.downloads._queue == []
+    assert rig.downloads._active_entry is None
+    assert rig.port.download_calls == []
+    rig.port.revision_gate.set()
+    pump_until(rig.idle, "завершение обновления активной модели")
+
+    rig.bridge.updateModel(SECOND.id)
+    pump_until(rig.port.downloading.is_set, "обычная очередь для неактивной модели")
+    assert rig.downloads._queue_running is True
+    assert rig.downloads._active_entry == SECOND
+    assert rig.port.download_calls == [SECOND.id]
+    assert rig.port.revision_calls == [("update", FIRST.id)]
+    assert rig.port.current == (FIRST.id, FIRST.revision)
+    assert rig.card(SECOND.id)["state"] == "downloading"
+    assert rig.card(SECOND.id)["badge"] == "installed"
+    rig.port.open_gates()
+    pump_until(rig.idle, "завершение обновления неактивной модели")
+    assert rig.port.records[(SECOND.id, SECOND.revision)] == "ok"
+    assert rig.port.current == (FIRST.id, FIRST.revision)
 
 
 def test_update_success_refreshes_revision_previous_and_gui_signals(rig: RevisionRig) -> None:
@@ -198,7 +230,7 @@ def test_failed_update_keeps_current_and_can_be_retried(rig: RevisionRig) -> Non
     assert rig.port.current == (FIRST.id, "r0")
     assert rig.card()["state"] == "update-failed"
     assert rig.card()["message"] == FAILED_MESSAGE
-    assert rig.card()["reason"] == "selfcheck"
+    assert rig.card()["reason"] == "Модель не прошла самопроверку на этом компьютере"
     assert rig.card()["updateAvailable"] is True
     assert rig.downloads.active_state() == "ok"
     rig.bridge.updateModel(FIRST.id)
@@ -215,7 +247,7 @@ def test_cancel_reaches_real_worker_event_and_keeps_current(rig: RevisionRig) ->
     assert rig.port.cancel_seen.is_set()
     assert rig.port.current == (FIRST.id, "r0")
     assert rig.card()["state"] == "update-failed"
-    assert rig.card()["reason"] == "cancelled"
+    assert rig.card()["reason"] == "Обновление отменено"
     rig.bridge.cancelModelUpdate()  # отсутствие задания допустимо
 
 
@@ -237,18 +269,56 @@ def test_revert_is_background_and_previous_only_on_active(rig: RevisionRig) -> N
     assert threading.get_ident() not in rig.port.worker_threads
 
 
-@pytest.mark.parametrize("reason", ["revoked", "no-previous", "revert"])
-def test_revert_refusal_is_visible_without_changing_current(rig: RevisionRig, reason: str) -> None:
+@pytest.mark.parametrize(
+    ("reason", "message", "details"),
+    [
+        (
+            "revoked",
+            "Предыдущая версия отозвана издателем",
+            "Эта версия отозвана авторами каталога",
+        ),
+        ("no-previous", "Предыдущая версия модели недоступна", "Не удалось скачать"),
+        ("not-installed", "Обновлять можно только рабочую модель", "Не удалось скачать"),
+        ("no-update", "Новая версия модели недоступна", "Не удалось скачать"),
+        ("revert", REVERT_FAILED_MESSAGE, "Не удалось вернуть предыдущую версию модели"),
+    ],
+)
+def test_revert_refusal_is_visible_without_changing_current(
+    rig: RevisionRig, reason: str, message: str, details: str
+) -> None:
     rig.port.previous = "r-1"
     rig.port.revert_failure = reason
     rig.bridge.revertModelPrevious(FIRST.id)
     pump_until(rig.idle, "отказ возврата")
     assert rig.port.current == (FIRST.id, "r0")
     assert rig.card()["state"] == "update-failed"
-    assert rig.card()["message"]
-    assert rig.card()["reason"] == reason
-    if reason == "revert":
-        assert rig.card()["message"] == REVERT_FAILED_MESSAGE
+    assert rig.card()["message"] == message
+    assert rig.card()["reason"] == details
+
+
+@pytest.mark.parametrize(
+    ("code", "details"),
+    [
+        ("checksum", "Файлы скачались с ошибкой"),
+        ("selfcheck", "Модель не прошла самопроверку на этом компьютере"),
+        ("download", "Не удалось скачать"),
+        ("cancelled", "Обновление отменено"),
+        ("revoked", "Эта версия отозвана авторами каталога"),
+        ("revert", "Не удалось вернуть предыдущую версию модели"),
+        ("unknown", "Не удалось скачать"),
+    ],
+)
+def test_update_failure_details_are_translated(
+    rig: RevisionRig, caplog: pytest.LogCaptureFixture, code: str, details: str
+) -> None:
+    rig.port.next_failure = code
+    rig.port.revision_gate.set()
+    with caplog.at_level("INFO", logger="astra_voice.ui.model_downloads"):
+        rig.bridge.updateModel(FIRST.id)
+        pump_until(rig.idle, "русская причина отказа")
+    assert rig.card()["message"] == FAILED_MESSAGE
+    assert rig.card()["reason"] == details
+    assert ("download" if code == "unknown" else code) in caplog.text
 
 
 def test_new_and_removed_come_from_catalog_snapshot(rig: RevisionRig) -> None:

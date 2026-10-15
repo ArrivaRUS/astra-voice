@@ -49,10 +49,10 @@ from astra_voice.models.catalog import (
     Catalog,
     CatalogEntry,
     CatalogError,
-    load_builtin,
     merge_measurement,
 )
 from astra_voice.models.catalog import catalog_rtfx as _catalog_rtfx
+from astra_voice.models.catalog_effective import load_effective
 from astra_voice.models.downloader import (
     Downloader,
     DownloadError,
@@ -119,6 +119,14 @@ _CURRENT_FAILED_MESSAGE = (
 _REMOVE_FAILED_MESSAGE = "Не удалось удалить модель. Попробуйте ещё раз."
 _SWITCH_FAILED_MESSAGE = "Не удалось загрузить модель. Рабочая модель не изменилась."
 _FIRST_SWITCH_FAILED_MESSAGE = "Не удалось загрузить модель. Попробуйте ещё раз."
+_REVISION_FAILURE_REASONS = {
+    "checksum": "Файлы скачались с ошибкой",
+    "selfcheck": "Модель не прошла самопроверку на этом компьютере",
+    "download": "Не удалось скачать",
+    "cancelled": "Обновление отменено",
+    "revoked": "Эта версия отозвана авторами каталога",
+    "revert": REVERT_FAILED_MESSAGE,
+}
 # Самопроверка верной модели не уложилась в срок; секунды — только в журнале.
 _SWITCH_TOO_SLOW_MESSAGE = "Модель слишком медленная для этого компьютера"
 _REMOVED_HINT = "Снята с каталога — обновлений не будет"
@@ -526,8 +534,10 @@ class ModelService:
 
     def __init__(self, settings: Settings, policy: Policy) -> None:
         keyring = paths.data_dir_static() / "keys" / "release.gpg"
-        self._catalog = load_builtin(
+        self._catalog = load_effective(
             Verifier("catalog", keyring=keyring),
+            builtin_root=paths.data_dir_static(),
+            snapshot_dir=paths.state_dir() / "model-catalog-updates",
             state_path=catalog_state.state_path(paths.state_dir()),
         )
         self._store = ModelStore()
@@ -736,6 +746,8 @@ class ModelService:
         return tuple((record.id, record.revision) for record in self._store.records())
 
     def set_current(self, model_id: str, revision: str) -> None:
+        if self._catalog.is_revoked(model_id, revision):
+            raise StoreError("revoked", _REVOKED_MESSAGE)
         self._store.set_current(model_id, revision)
 
     def remove(self, model_id: str, revision: str) -> None:
@@ -1068,6 +1080,13 @@ class ModelDownloads(QObject):
         self._card_progress: dict[str, float] = {}
         self._card_reasons: dict[str, str] = {}
         self._new_ids: frozenset[str] = frozenset()
+        # Читаем трекер один раз при старте; новые снимки приходят в accept_catalog.
+        new_ids = getattr(model, "new_ids", None)
+        new_models = new_ids() if callable(new_ids) else None
+        if isinstance(new_models, (frozenset, set)) and all(
+            isinstance(model_id, str) for model_id in new_models
+        ):
+            self._new_ids = frozenset(new_models)
         self._pending_catalog: tuple[Catalog, frozenset[str]] | None = None
         self._revision_entry: Any | None = None
         self._revision_result: RevisionUpdateResult | None = None
@@ -1562,8 +1581,6 @@ class ModelDownloads(QObject):
         measurements = self._measurements_cache
         threads = model_threads(self._settings.to_dict())
         installed = self._installed_ids()
-        new_ids = getattr(self._model, "new_ids", None)
-        new_models = new_ids() if callable(new_ids) else self._new_ids
         try:
             total = self._model.mem_total_mb() if self._model is not None else None
         except (OSError, StoreError):
@@ -1592,10 +1609,9 @@ class ModelDownloads(QObject):
                 "vendorShort": _vendor_short(entry),
                 "domestic": bool(getattr(entry, "domestic", False)),
                 "updateAvailable": not entry.removed_from_catalog
-                and self._badge(entry, installed) == "active"
                 and self._update_available(entry, installed),
                 "previousAvailable": self._previous_available(entry, installed),
-                "isNew": entry.id in new_models,
+                "isNew": entry.id in self._new_ids,
                 "reason": self._card_reasons.get(entry.id, ""),
                 "canReinstall": not entry.removed_from_catalog,
                 "tags": entry_tags(entry),
@@ -2124,7 +2140,7 @@ class ModelDownloads(QObject):
             return (
                 self._badge(entry, installed) == "active"
                 and callable(previous)
-                and previous() is not None
+                and isinstance(previous(), str)
             )
         except (OSError, StoreError):
             return False
@@ -2152,7 +2168,13 @@ class ModelDownloads(QObject):
 
     @pyqtSlot(str)
     def updateModel(self, model_id: str) -> None:  # noqa: N802
-        self._start_revision(model_id, revert=False)
+        entry = self._managed_entry(model_id)
+        if entry is None or entry.removed_from_catalog or not self._update_available(entry):
+            return
+        if self._badge(entry) == "active":
+            self._start_revision(model_id, revert=False)
+        else:
+            self._begin_queue((entry,))
 
     @pyqtSlot()
     def cancelModelUpdate(self) -> None:  # noqa: N802
@@ -2205,8 +2227,8 @@ class ModelDownloads(QObject):
         if entry is None or result is None:
             return
         with self._update():
-            self._card_reasons[entry.id] = result.reason_code
             if result.state == "updated":
+                self._card_reasons.pop(entry.id, None)
                 self._set_card(entry, "ok", "")
                 self._notify("modelRevisionChanged", entry.id)
                 self._notify("modelReadyChanged")
@@ -2216,8 +2238,19 @@ class ModelDownloads(QObject):
                     "revoked": "Предыдущая версия отозвана издателем",
                     "no-previous": "Предыдущая версия модели недоступна",
                     "not-installed": "Обновлять можно только рабочую модель",
-                    "no-update": "Новая ревизия модели недоступна",
+                    "no-update": "Новая версия модели недоступна",
                 }
+                reason_code = result.reason_code
+                if reason_code not in _REVISION_FAILURE_REASONS and reason_code not in {
+                    *refusals,
+                    "thread-start",
+                    "update",
+                }:
+                    reason_code = "download"
+                log.info("models state=update-failed reason=%s", reason_code)
+                self._card_reasons[entry.id] = _REVISION_FAILURE_REASONS.get(
+                    reason_code, _REVISION_FAILURE_REASONS["download"]
+                )
                 self._set_card(
                     entry,
                     "update-failed",

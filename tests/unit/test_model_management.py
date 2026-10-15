@@ -1940,22 +1940,21 @@ def test_install_after_switch_keeps_user_choice() -> None:
     assert port.current == (TONE.id, TONE.revision)
 
 
-def test_inactive_old_revision_cannot_be_updated() -> None:
+def test_remove_paused_update_keeps_previous_revision() -> None:
     port = FakeManagedPort()
     old_revision = "r1"
     port.records[(GIGAAM.id, old_revision)] = "ok"
-    port.records[(TONE.id, TONE.revision)] = "ok"
-    port.current = (TONE.id, TONE.revision)
-    before = dict(port.records)
     downloads, started = manual_queue(port)
     downloads.updateModel(GIGAAM.id)
-    assert started == []
+    assert started == [GIGAAM.id]
+    port.space = False
+    downloads._model_finished("no-space", "")
+    downloads._model_thread_finished()
     row = card(downloads, GIGAAM.id)
-    assert (row["state"], row["badge"]) == ("installed", "installed")
-    assert row["updateAvailable"] is False
-    assert port.current == (TONE.id, TONE.revision)
-    assert port.records == before
+    assert (row["state"], row["badge"]) == ("paused-no-space", "installed")
+    downloads.removeModel(GIGAAM.id)
     assert port.removed == []
+    assert port.records[(GIGAAM.id, old_revision)] == "ok"
 
 
 @pytest.mark.parametrize(

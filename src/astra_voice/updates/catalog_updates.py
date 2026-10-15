@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import base64
-import binascii
-import hashlib
 import json
 import logging
 import math
 import re
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -19,7 +16,15 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from astra_voice.models import catalog_state
-from astra_voice.models.catalog import CATALOG_MAX_BYTES, Catalog, CatalogError, load_builtin
+from astra_voice.models.catalog import CATALOG_MAX_BYTES, Catalog, CatalogError
+from astra_voice.models.catalog_effective import (
+    CATALOG_LOCK,
+    SIGNATURE_MAX_BYTES,
+    SNAPSHOT_FILE_NAME,
+    load_effective,
+    state_of,
+    verify_catalog,
+)
 from astra_voice.models.store import ModelRecord
 from astra_voice.net import http, update_cache
 from astra_voice.net.gate import NetworkKind
@@ -38,8 +43,6 @@ from astra_voice.security.verify import Verifier
 log = logging.getLogger(__name__)
 NEW_BADGE_WINDOW_S = 30 * 24 * 3600.0
 _TRACKER_MAX_BYTES = 1024 * 1024
-_SIGNATURE_MAX_BYTES = 64 * 1024
-_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _urls(catalog_url: str, schemes: tuple[str, ...]) -> tuple[str, str]:
@@ -84,7 +87,7 @@ def fetch(
     """
     urls = _urls(catalog_url, http.ALLOWED_SCHEMES)
     bodies: list[bytes] = []
-    for url, limit in zip(urls, (CATALOG_MAX_BYTES, _SIGNATURE_MAX_BYTES), strict=True):
+    for url, limit in zip(urls, (CATALOG_MAX_BYTES, SIGNATURE_MAX_BYTES), strict=True):
         with client.get_stream(
             url,
             deadline_s=CHECK_TOTAL_TIMEOUT_S,
@@ -130,30 +133,13 @@ def apply_remote(
     Файлы проверки приватны и удаляются при любом исходе. Состояние меняется
     только после успешной подписи, схемы и строгого разбора всех полей.
     """
-    if len(raw) > CATALOG_MAX_BYTES or len(signature) > _SIGNATURE_MAX_BYTES:
-        raise CatalogError("too-large", "Каталог или подпись слишком велики.")
     try:
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="catalog-check-", dir=state_path.parent) as name:
-            root = Path(name).resolve()
-            update_cache.write_private(root / "catalog.json", raw)
-            update_cache.write_private(root / "catalog.json.sig", signature)
-            try:
-                schema = read_private(schema_root / "catalog.schema.json", CATALOG_MAX_BYTES)
-            except (OSError, ValueError):
-                # Пустая схема гарантированно не пройдёт загрузчик, но её отказ
-                # должен следовать за проверкой подписи и JSON каталога.
-                schema = b""
-            update_cache.write_private(root / "catalog.schema.json", schema)
-            catalog = load_builtin(verifier, root=root, require_schema=require_schema)
-        candidate = catalog_state.CatalogState(
-            trust_epoch=catalog.trust_epoch,
-            serial=catalog.serial,
-            sha256=hashlib.sha256(raw).hexdigest(),
-            revoked=tuple((item.model_id, item.revision) for item in catalog.revoked),
+        catalog = verify_catalog(
+            raw, signature, verifier, schema_root=schema_root, require_schema=require_schema
         )
         try:
-            catalog_state.apply_state(state_path, candidate)
+            catalog_state.apply_state(state_path, state_of(catalog, raw))
         except ValueError:
             raise CatalogError("stale-catalog", "Каталог старее текущего.") from None
     except OSError:
@@ -162,12 +148,11 @@ def apply_remote(
 
 
 class CatalogUpdateSource:
-    """Отдельный подписанный каталог проверок, без изменения ModelService.
+    """Подписанный удалённый каталог с единым глобальным состоянием.
 
     Snapshot содержит одну пару raw/signature и публикуется атомарно прежде
-    watermark. После сбоя между записями проверенный snapshot восстанавливает
-    watermark. Повреждённый watermark не сбрасывается; устаревшая база при
-    отсутствии годного snapshot не выдаётся проверяющему модели.
+    глобального watermark. После сбоя между записями load_effective заново
+    проверяет snapshot и восстанавливает watermark. Другого барьера нет.
     """
 
     def __init__(
@@ -190,9 +175,12 @@ class CatalogUpdateSource:
         self._verifier = verifier
         self._schema_root = schema_root
         self._directory = state_dir
-        self._snapshot = state_dir / "catalog-snapshot.json"
-        self._watermark = state_dir / "catalog-state.json"
-        self._global_state_path = global_state_path
+        self._snapshot = state_dir / SNAPSHOT_FILE_NAME
+        self._watermark = (
+            global_state_path
+            if global_state_path is not None
+            else catalog_state.state_path(state_dir.parent)
+        )
         self._cache = cache if cache is not None else UpdateCache(state_dir / "http-state.json")
         self._scope = scope
         self._clock = clock
@@ -200,7 +188,6 @@ class CatalogUpdateSource:
         self._catalog: Catalog | None = None
         self._accepted: catalog_state.CatalogState | None = None
         self._baseline_seen: Catalog | None = None
-        self._baseline_marker: catalog_state.CatalogState | None = None
         self._tracker = NewModelTracker(state_dir / "new-models.json")
         self._initialized = False
         self._blocked = False
@@ -210,25 +197,6 @@ class CatalogUpdateSource:
 
     def _catalog_url(self) -> str:
         return self._url() if callable(self._url) else self._url
-
-    @staticmethod
-    def _present(path: Path) -> bool:
-        try:
-            path.lstat()
-            return True
-        except FileNotFoundError:
-            return False
-        except OSError:
-            raise CatalogError("state-unavailable", "Состояние каталога недоступно.") from None
-
-    @staticmethod
-    def _state(catalog: Catalog, raw: bytes) -> catalog_state.CatalogState:
-        return catalog_state.CatalogState(
-            catalog.trust_epoch,
-            catalog.serial,
-            hashlib.sha256(raw).hexdigest(),
-            tuple((entry.model_id, entry.revision) for entry in catalog.revoked),
-        )
 
     @staticmethod
     def _read_watermark(path: Path) -> catalog_state.CatalogState | None:
@@ -246,114 +214,41 @@ class CatalogUpdateSource:
             raise CatalogError("state-invalid", "Состояние каталога повреждено.")
         return result
 
-    def _baseline_state(self, baseline: Catalog) -> catalog_state.CatalogState:
-        global_state = (
-            self._read_watermark(self._global_state_path)
-            if self._global_state_path is not None
-            else None
-        )
-        # Без глобального отпечатка нужен подтверждённый исходный файл, а не
-        # сериализация Catalog: подпись и равная пара относятся к точным байтам.
-        if self._baseline_seen != baseline:
-            self._baseline_marker = None
-            try:
-                raw = read_private(self._schema_root / "catalog.json", CATALOG_MAX_BYTES)
-                builtin = load_builtin(self._verifier, root=self._schema_root, require_schema=True)
-                if (
-                    builtin == baseline
-                    and read_private(self._schema_root / "catalog.json", CATALOG_MAX_BYTES) == raw
-                ):
-                    self._baseline_marker = self._state(baseline, raw)
-            except (OSError, ValueError, CatalogError):
-                pass
-            self._baseline_seen = baseline
-        if global_state is not None and (global_state.trust_epoch, global_state.serial) >= (
-            baseline.trust_epoch,
-            baseline.serial,
-        ):
-            # baseline/provider по контракту уже проверен владельцем. Для
-            # сетевого baseline точные байты известны canonical marker с той
-            # же парой; marker строго новее не удостоверяет старую базу.
-            if self._baseline_marker is None and (
-                global_state.trust_epoch,
-                global_state.serial,
-            ) == (baseline.trust_epoch, baseline.serial):
-                self._baseline_marker = global_state
-            if (
-                self._baseline_marker is not None
-                and (global_state.trust_epoch, global_state.serial)
-                == (baseline.trust_epoch, baseline.serial)
-                and global_state.sha256 != self._baseline_marker.sha256
-            ):
-                raise CatalogError("stale-catalog", "Отпечаток исходного каталога не совпадает.")
-            return global_state
-        if self._baseline_marker is None:
-            raise CatalogError("baseline-unavailable", "Исходный каталог недоступен.")
-        return self._baseline_marker
-
     def _prepare(self) -> None:
         baseline = self._baseline_catalog()
-        seed = self._baseline_state(baseline)
         marker = self._read_watermark(self._watermark)
         if marker is None and self._initialized:
             raise CatalogError("state-invalid", "Состояние каталога отсутствует.")
-        self._directory.mkdir(parents=True, exist_ok=True)
-        if marker is None or (seed.trust_epoch, seed.serial) > (marker.trust_epoch, marker.serial):
-            catalog_state.apply_state(self._watermark, seed)
-            marker = seed
-        elif (seed.trust_epoch, seed.serial) == (marker.trust_epoch, marker.serial):
-            if seed.sha256 != marker.sha256:
-                raise CatalogError("stale-catalog", "Отпечаток каталога не совпадает.")
         if (
             self._initialized
+            and self._baseline_seen == baseline
             and self._accepted is not None
+            and marker is not None
             and (marker.trust_epoch, marker.serial, marker.sha256)
             == (self._accepted.trust_epoch, self._accepted.serial, self._accepted.sha256)
         ):
             return
+        self._directory.mkdir(parents=True, exist_ok=True)
+        # Единственное место выбора между встроенным и сохранённым удалённым
+        # каталогом; один и тот же путь используется ModelService при запуске.
+        catalog = load_effective(
+            self._verifier,
+            builtin_root=self._schema_root,
+            snapshot_dir=self._directory,
+            state_path=self._watermark,
+            require_schema=True,
+        )
+        accepted = self._read_watermark(self._watermark)
+        if accepted is None:
+            raise CatalogError("state-invalid", "Состояние каталога отсутствует.")
+        self._catalog = catalog
+        self._accepted = accepted
+        self._baseline_seen = baseline
         self._initialized = True
-        try:
-            snapshot = json.loads(read_private(self._snapshot, _SNAPSHOT_MAX_BYTES).decode())
-            if not isinstance(snapshot, dict) or set(snapshot) != {"raw", "signature"}:
-                raise ValueError("snapshot")
-            raw = base64.b64decode(snapshot["raw"], validate=True)
-            signature = base64.b64decode(snapshot["signature"], validate=True)
-            catalog = apply_remote(
-                raw,
-                signature,
-                self._verifier,
-                schema_root=self._schema_root,
-                state_path=self._watermark,
-            )
-            self._catalog = catalog
-            self._accepted = self._state(catalog, raw)
-            self._tracker.observe(catalog, self._clock())
-        except (OSError, ValueError, TypeError, binascii.Error, CatalogError, RecursionError):
-            # При равном baseline допустимо игнорировать испорченный snapshot,
-            # но watermark новее/с другим отпечатком не позволяет откатиться.
-            if (
-                (marker.trust_epoch, marker.serial)
-                == (
-                    baseline.trust_epoch,
-                    baseline.serial,
-                )
-                and self._baseline_marker is not None
-                and marker.sha256 == self._baseline_marker.sha256
-            ):
-                self._catalog = baseline
-                self._accepted = self._baseline_marker
-                self._tracker.observe(baseline, self._clock())
-            else:
-                self._catalog = None
+        self._tracker.observe(catalog, self._clock())
 
     def current(self) -> Catalog:
-        with self._lock:
-            if (
-                not self._catalog_url()
-                and not self._present(self._watermark)
-                and not self._present(self._snapshot)
-            ):
-                return self._baseline_catalog()
+        with self._lock, CATALOG_LOCK:
             try:
                 self._prepare()
                 marker = self._read_watermark(self._watermark)
@@ -381,8 +276,9 @@ class CatalogUpdateSource:
                 return
             catalog_urls(url)
             try:
-                self._prepare()
-                marker = self._read_watermark(self._watermark)
+                with CATALOG_LOCK:
+                    self._prepare()
+                    marker = self._read_watermark(self._watermark)
                 if marker is None:
                     raise CatalogError("state-invalid", "Состояние каталога отсутствует.")
                 key = "models:catalog:rate-limit"
@@ -409,43 +305,43 @@ class CatalogUpdateSource:
                         )
                         self._cache.set(key, CacheEntry(rate_limited_until=self._clock() + delay))
                     raise
-                # Проверяем с копией watermark; настоящий маркер двигаем лишь
-                # после атомарной публикации восстанавливаемого snapshot.
-                with tempfile.TemporaryDirectory(
-                    prefix="catalog-accept-", dir=self._directory
-                ) as name:
-                    provisional = Path(name) / "catalog-state.json"
-                    catalog_state.write_state(provisional, marker)
-                    catalog = apply_remote(
-                        raw,
-                        signature,
-                        self._verifier,
-                        schema_root=self._schema_root,
-                        state_path=provisional,
-                    )
+                # Проверка без записи состояния: глобальный watermark
+                # продвигается только вместе с восстанавливаемым snapshot.
+                catalog = verify_catalog(
+                    raw,
+                    signature,
+                    self._verifier,
+                    schema_root=self._schema_root,
+                    require_schema=True,
+                )
+                candidate = state_of(catalog, raw)
+                if not catalog_state.is_newer(candidate, marker):
+                    raise CatalogError("stale-catalog", "Каталог старее текущего.")
                 if cancel.is_set():
                     raise NetworkError("cancelled", "Проверка отменена.")
                 if self._client._gate.refusal("check_models"):
                     raise NetworkError("no-network", "Проверка каталога запрещена.")
-                candidate = self._state(catalog, raw)
-                # Источник базового каталога мог измениться за время запроса.
-                self._prepare()
-                latest_marker = self._read_watermark(self._watermark)
-                if latest_marker is None or not catalog_state.is_newer(candidate, latest_marker):
-                    raise CatalogError("stale-catalog", "Каталог старее текущего.")
-                snapshot = json.dumps(
-                    {
-                        "raw": base64.b64encode(raw).decode("ascii"),
-                        "signature": base64.b64encode(signature).decode("ascii"),
-                    },
-                    separators=(",", ":"),
-                ).encode()
-                self._blocked = True
-                update_cache.write_private(self._snapshot, snapshot)
-                catalog_state.apply_state(self._watermark, candidate)
-                self._catalog = catalog
-                self._accepted = candidate
-                self._blocked = False
+                with CATALOG_LOCK:
+                    # Источник базового каталога мог измениться за время запроса.
+                    self._prepare()
+                    latest_marker = self._read_watermark(self._watermark)
+                    if latest_marker is None or not catalog_state.is_newer(
+                        candidate, latest_marker
+                    ):
+                        raise CatalogError("stale-catalog", "Каталог старее текущего.")
+                    snapshot = json.dumps(
+                        {
+                            "raw": base64.b64encode(raw).decode("ascii"),
+                            "signature": base64.b64encode(signature).decode("ascii"),
+                        },
+                        separators=(",", ":"),
+                    ).encode()
+                    self._blocked = True
+                    update_cache.write_private(self._snapshot, snapshot)
+                    catalog_state.apply_state(self._watermark, candidate)
+                    self._catalog = catalog
+                    self._accepted = candidate
+                    self._blocked = False
                 self._tracker.observe(catalog, self._clock())
                 self._cache.set(key, CacheEntry())
             except OSError:

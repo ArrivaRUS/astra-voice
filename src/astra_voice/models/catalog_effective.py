@@ -1,0 +1,165 @@
+"""Единый проверенный каталог и watermark для всех потребителей моделей."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import logging
+import tempfile
+import threading
+from pathlib import Path
+
+from astra_voice.core import paths
+from astra_voice.models import catalog_state
+from astra_voice.models.catalog import CATALOG_MAX_BYTES, Catalog, CatalogError, load_builtin
+from astra_voice.net.update_cache import read_private, write_private
+from astra_voice.security.verify import Verifier
+
+log = logging.getLogger(__name__)
+SNAPSHOT_FILE_NAME = "catalog-snapshot.json"
+SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024
+SIGNATURE_MAX_BYTES = 64 * 1024
+# Общий для загрузчика и публикации source: сравнение и запись watermark
+# не могут перемежаться внутри процесса с принятием другого каталога.
+CATALOG_LOCK = threading.RLock()
+
+
+def state_of(catalog: Catalog, raw: bytes) -> catalog_state.CatalogState:
+    """Связывает проверенный каталог с точными подписанными байтами."""
+    return catalog_state.CatalogState(
+        trust_epoch=catalog.trust_epoch,
+        serial=catalog.serial,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        revoked=tuple((entry.model_id, entry.revision) for entry in catalog.revoked),
+    )
+
+
+def verify_catalog(
+    raw: bytes,
+    signature: bytes,
+    verifier: Verifier,
+    *,
+    schema_root: Path,
+    require_schema: bool | None = None,
+) -> Catalog:
+    """Проверяет пару тем же загрузчиком и текущей схемой, не меняя state.
+
+    Приватная временная копия связывает проверку подписи и строгий разбор
+    с одними байтами; исходный snapshot может атомарно заменяться параллельно.
+    """
+    if len(raw) > CATALOG_MAX_BYTES or len(signature) > SIGNATURE_MAX_BYTES:
+        raise CatalogError("too-large", "Каталог или подпись слишком велики.")
+    try:
+        with tempfile.TemporaryDirectory(prefix="catalog-check-") as name:
+            root = Path(name).resolve()
+            write_private(root / "catalog.json", raw)
+            write_private(root / "catalog.json.sig", signature)
+            try:
+                schema = read_private(schema_root / "catalog.schema.json", CATALOG_MAX_BYTES)
+            except (OSError, ValueError):
+                # Порядок отказов загрузчика: подпись, JSON, затем схема.
+                schema = b""
+            write_private(root / "catalog.schema.json", schema)
+            return load_builtin(verifier, root=root, require_schema=require_schema)
+    except OSError:
+        raise CatalogError("io", "Не удалось проверить сохранённый каталог.") from None
+
+
+def read_snapshot(snapshot_dir: Path) -> tuple[bytes, bytes]:
+    """Читает одну атомарную пару raw/signature с ограничением размера."""
+    document = json.loads(read_private(snapshot_dir / SNAPSHOT_FILE_NAME, SNAPSHOT_MAX_BYTES))
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"raw", "signature"}
+        or not isinstance(document["raw"], str)
+        or not isinstance(document["signature"], str)
+    ):
+        raise ValueError("Неверный формат снимка каталога.")
+    raw = base64.b64decode(document["raw"], validate=True)
+    signature = base64.b64decode(document["signature"], validate=True)
+    if len(raw) > CATALOG_MAX_BYTES or len(signature) > SIGNATURE_MAX_BYTES:
+        raise CatalogError("too-large", "Каталог или подпись слишком велики.")
+    return raw, signature
+
+
+def load_effective(
+    verifier: Verifier,
+    *,
+    builtin_root: Path | None = None,
+    snapshot_dir: Path | None = None,
+    state_path: Path | None = None,
+    require_schema: bool | None = None,
+) -> Catalog:
+    """Загружает действующий каталог, сериализуя принятие с remote source."""
+    with CATALOG_LOCK:
+        return _load_effective(
+            verifier,
+            builtin_root=builtin_root,
+            snapshot_dir=snapshot_dir,
+            state_path=state_path,
+            require_schema=require_schema,
+        )
+
+
+def _load_effective(
+    verifier: Verifier,
+    *,
+    builtin_root: Path | None,
+    snapshot_dir: Path | None,
+    state_path: Path | None,
+    require_schema: bool | None,
+) -> Catalog:
+    """Выбирает старший проверенный каталог и применяет глобальный анти-откат.
+
+    Кандидаты проверяются без изменения state: старый встроенный каталог
+    не должен мешать восстановлению нового удалённого после перезапуска.
+    Повреждённый snapshot игнорируется, но watermark при этом не сбрасывается.
+    Равная пара с разными байтами отдаёт предпочтение встроенному кандидату;
+    уже принятый другой SHA всё равно запрещает его через apply_state.
+    """
+    root = paths.data_dir_static() if builtin_root is None else builtin_root
+    directory = (
+        paths.state_dir() / "model-catalog-updates" if snapshot_dir is None else snapshot_dir
+    )
+    state = catalog_state.state_path(paths.state_dir()) if state_path is None else state_path
+    try:
+        raw = read_private(root / "catalog.json", CATALOG_MAX_BYTES)
+        chosen = load_builtin(verifier, root=root, require_schema=require_schema)
+        if read_private(root / "catalog.json", CATALOG_MAX_BYTES) != raw:
+            raise CatalogError("bad-signature", "Каталог изменился во время проверки подписи.")
+    except (OSError, ValueError):
+        raise CatalogError("io", "Не удалось прочитать встроенный каталог.") from None
+    candidate = state_of(chosen, raw)
+    try:
+        remote_raw, signature = read_snapshot(directory)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError, RecursionError, CatalogError):
+        log.warning("Сохранённый снимок каталога повреждён или недоступен и пропущен.")
+    else:
+        try:
+            remote = verify_catalog(
+                remote_raw, signature, verifier, schema_root=root, require_schema=require_schema
+            )
+        except CatalogError:
+            log.warning("Сохранённый снимок каталога не прошёл проверку и пропущен.")
+        else:
+            remote_state = state_of(remote, remote_raw)
+            builtin_pair = (candidate.trust_epoch, candidate.serial)
+            remote_pair = (remote_state.trust_epoch, remote_state.serial)
+            if remote_pair > builtin_pair:
+                chosen, candidate = remote, remote_state
+            elif remote_pair == builtin_pair and remote_state.sha256 != candidate.sha256:
+                log.warning(
+                    "Снимок каталога имеет ту же пару эпохи и номера, но другой SHA256; "
+                    "выбран встроенный каталог."
+                )
+    try:
+        state.parent.mkdir(parents=True, exist_ok=True)
+        catalog_state.apply_state(state, candidate)
+    except ValueError as error:
+        raise CatalogError("stale-catalog", str(error)) from None
+    except OSError:
+        raise CatalogError("io", "Не удалось сохранить принятый каталог.") from None
+    return chosen

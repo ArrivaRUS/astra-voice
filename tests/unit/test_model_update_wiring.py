@@ -445,22 +445,36 @@ def catalog_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> CatalogSo
     return CatalogSourceRig(tmp_path, monkeypatch)
 
 
-def test_catalog_source_restores_verified_snapshot_without_changing_global_state(
+def test_catalog_source_advances_global_state_and_reverifies_snapshot_on_restart(
     catalog_source: CatalogSourceRig,
 ) -> None:
     source = catalog_source.source()
     source.refresh(threading.Event())
     accepted = source.current()
     assert accepted.serial == catalog_source.baseline.serial + 1
-    assert catalog_source.global_path.read_bytes() == catalog_source.global_before
-    for name in ("catalog-snapshot.json", "catalog-state.json"):
-        assert stat.S_IMODE((catalog_source.state_dir / name).stat().st_mode) == 0o600
+    applied = catalog_state.read_state(catalog_source.global_path)
+    assert applied is not None
+    assert (applied.trust_epoch, applied.serial, applied.sha256) == (
+        accepted.trust_epoch,
+        accepted.serial,
+        hashlib.sha256(catalog_source.remote_raw).hexdigest(),
+    )
+    assert catalog_source.global_path.read_bytes() != catalog_source.global_before
+    assert not (catalog_source.state_dir / "catalog-state.json").exists()
+    for path in (
+        catalog_source.state_dir / "catalog-snapshot.json",
+        catalog_source.global_path,
+    ):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    global_accepted = catalog_source.global_path.read_bytes()
 
     verifications = catalog_source.verifier.calls
     restored = catalog_source.source().current()
     assert restored == accepted
-    assert catalog_source.verifier.calls > verifications, "снимок должен повторно проверить подпись"
-    assert catalog_source.global_path.read_bytes() == catalog_source.global_before
+    assert catalog_source.verifier.calls >= verifications + 2, (
+        "встроенный каталог и снимок должны повторно проверить подписи"
+    )
+    assert catalog_source.global_path.read_bytes() == global_accepted
 
 
 def test_corrupt_catalog_highwater_cannot_be_reset_to_baseline(
@@ -468,26 +482,27 @@ def test_corrupt_catalog_highwater_cannot_be_reset_to_baseline(
 ) -> None:
     source = catalog_source.source()
     source.refresh(threading.Event())
-    watermark = catalog_source.state_dir / "catalog-state.json"
+    watermark = catalog_source.global_path
     watermark.write_bytes(b"{")
 
     with pytest.raises(CatalogError):
         catalog_source.source().current()
 
     assert watermark.read_bytes() == b"{", "повреждённый барьер нельзя молча пересоздать"
-    assert catalog_source.global_path.read_bytes() == catalog_source.global_before
+    assert not (catalog_source.state_dir / "catalog-state.json").exists()
 
 
 def test_catalog_source_rejects_rollback_after_restart(catalog_source: CatalogSourceRig) -> None:
     source = catalog_source.source()
     source.refresh(threading.Event())
     accepted = source.current()
+    global_accepted = catalog_source.global_path.read_bytes()
     catalog_source.remote_raw = catalog_source.raw
     restarted = catalog_source.source()
     with pytest.raises(CatalogError):
         restarted.refresh(threading.Event())
     assert restarted.current() == accepted
-    assert catalog_source.global_path.read_bytes() == catalog_source.global_before
+    assert catalog_source.global_path.read_bytes() == global_accepted
 
 
 def test_catalog_source_rebuilds_corrupt_new_model_tracker_from_accepted_snapshot(
@@ -512,24 +527,20 @@ def test_catalog_source_rebuilds_corrupt_new_model_tracker_from_accepted_snapsho
     assert tracker.new_ids(restored, T0) == frozenset()
 
 
-def test_catalog_source_observes_updated_provider_and_canonical_marker_without_fetch(
+def test_catalog_source_observes_catalog_persisted_by_another_source(
     catalog_source: CatalogSourceRig,
 ) -> None:
     source = catalog_source.source()
     source.refresh(threading.Event())
     previous = source.current()
-    newer_raw = catalog_source.with_serial(previous.serial + 1)
-    catalog_source.baseline = catalog_module.apply_remote(
-        newer_raw,
-        b"validated newer catalog signature",
-        catalog_source.verifier,
-        schema_root=DATA_ROOT,
-        state_path=catalog_source.global_path,
-    )
+    catalog_source.remote_raw = catalog_source.with_serial(previous.serial + 1)
+    another = catalog_source.source()
+    another.refresh(threading.Event())
+    catalog_source.baseline = another.current()
 
     assert source.current() == catalog_source.baseline
     assert catalog_source.baseline.serial == previous.serial + 1
-    assert catalog_source.fetch_calls == 1
+    assert catalog_source.fetch_calls == 2
 
 
 @pytest.mark.parametrize("damage", ["missing", "corrupt"])
@@ -554,7 +565,7 @@ def test_catalog_write_failure_blocks_publication_and_preserves_recoverable_stat
 ) -> None:
     source = catalog_source.source()
     baseline = source.current()
-    marker = catalog_source.state_dir / "catalog-state.json"
+    marker = catalog_source.global_path
     before = marker.read_bytes()
     snapshot = catalog_source.state_dir / "catalog-snapshot.json"
     original_snapshot_write = update_cache.write_private

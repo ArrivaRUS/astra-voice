@@ -533,7 +533,8 @@ Rectangle {
                 visible: root.hasMessage && (!root.expandedFooter || root.cardState === "update-failed")
                 Layout.fillWidth: true
                 Layout.minimumWidth: 0
-                text: root.message !== "" ? root.message
+                text: root.cardState === "update-failed" ? root.message
+                    : root.message !== "" ? root.message
                     : root.cardState === "no-network"
                         ? qsTr("Нет доступа к источнику модели")
                     : root.cardState === "offline-user"
@@ -546,8 +547,6 @@ Rectangle {
                         ? qsTr("Файл не прошёл проверку — загруженное удалено")
                     : root.cardState === "broken" || root.cardState === "corrupted"
                         ? qsTr("Файлы модели не читаются")
-                    : root.cardState === "update-failed"
-                        ? qsTr("Новая ревизия не прошла проверку, оставлена текущая")
                     : qsTr("Не удалось загрузить модель")
                 color: root.messageError ? Theme.dangerInk : Theme.fgMuted
             }
@@ -630,9 +629,10 @@ Rectangle {
 
             // Кнопки установленной модели (§5.4, состояния 19–20, 25).
             AvButton {
-                visible: root.manageVisible && root.updateActionsAvailable
-                    && root.badge === "active" && root.updateAvailable
-                    && ["updating", "update-failed", "switching", "broken"].indexOf(root.cardState) < 0
+                visible: root.manageVisible && root.updateAvailable
+                    && ["updating", "switching", "broken"].indexOf(root.cardState) < 0
+                    && (root.badge !== "active" || (root.updateActionsAvailable
+                        && root.cardState !== "update-failed"))
                 Layout.minimumWidth: visible ? implicitWidth : 0
                 small: true
                 iconName: "down"

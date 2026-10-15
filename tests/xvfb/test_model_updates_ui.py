@@ -270,31 +270,47 @@ def screenshot(app: Any, live: LiveWindow, tmp_path: Path, name: str) -> Path:
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 @pytest.mark.parametrize(
-    "scene", ["update-available", "updating", "update-failed", "new", "removed", "model-update"]
+    "scene",
+    [
+        "update-available",
+        "updating",
+        "update-failed",
+        "update-failed-details",
+        "new",
+        "removed",
+        "model-update",
+    ],
 )
 def test_model_update_states_and_snapshots(
     app: Any, tmp_path: Path, dark: bool, scene: str
 ) -> None:
+    state = "update-failed" if scene == "update-failed-details" else scene
     with model_window(app, dark=dark, scene=scene) as (live, updates):
-        if scene in {"update-available", "updating", "update-failed"}:
+        if state in {"update-available", "updating", "update-failed"}:
             assert card_state(live, FIRST.id) == "update-available"
             assert "Обновление доступно" in visible_texts(card_item(live, FIRST.id))
             update = visible_button(card_item(live, FIRST.id), "Обновить")
-            if scene != "update-available":
-                if scene == "update-failed":
+            if state != "update-available":
+                if state == "update-failed":
                     live.port.next_failure = "selfcheck"
                     live.port.revision_gate.set()
                 press(update)
-                settle(live, lambda: card_state(live, FIRST.id) == scene, scene)
+                settle(live, lambda: card_state(live, FIRST.id) == state, scene)
                 texts = visible_texts(card_item(live, FIRST.id))
-                if scene == "updating":
+                if state == "updating":
                     assert "Обновляю…" in texts
                     assert visible_button(card_item(live, FIRST.id), "Отмена").isEnabled()
                 else:
                     assert FAILED_MESSAGE in texts
                     assert visible_button(card_item(live, FIRST.id), "Повторить").isEnabled()
-                    press(visible_button(card_item(live, FIRST.id), "Подробнее"))
-                    assert "selfcheck" in visible_texts(card_item(live, FIRST.id))
+                    assert "selfcheck" not in "\n".join(texts)
+                    details = "Модель не прошла самопроверку на этом компьютере"
+                    assert details not in texts
+                    if scene == "update-failed-details":
+                        press(visible_button(card_item(live, FIRST.id), "Подробнее"))
+                        texts = visible_texts(card_item(live, FIRST.id))
+                        assert details in texts
+                        assert "selfcheck" not in "\n".join(texts)
         elif scene == "new":
             assert "Новое" in visible_texts(card_item(live, FIRST.id))
         elif scene == "removed":
@@ -332,11 +348,11 @@ def test_model_update_states_and_snapshots(
             assert footer(live).property("updateColor") == theme_value(card, "fgMuted")
         path = screenshot(app, live, tmp_path, f"{scene}-{'dark' if dark else 'light'}.png")
         assert path.is_file()
-        if scene in {"update-available", "updating", "update-failed"}:
-            if scene == "update-available":
+        if state in {"update-available", "updating", "update-failed"}:
+            if state == "update-available":
                 press(visible_button(card_item(live, FIRST.id), "Обновить"))
                 settle(live, live.port.revision_started.is_set, "начало обновления")
-            elif scene == "update-failed":
+            elif state == "update-failed":
                 press(visible_button(card_item(live, FIRST.id), "Повторить"))
             live.port.revision_gate.set()
             settle(live, lambda: card_state(live, FIRST.id) == "ok", "успешное обновление")
@@ -405,7 +421,7 @@ def test_success_and_revert_clear_model_notice(app: Any) -> None:
         assert updates.modelUpdateText == ""
 
 
-def test_failed_update_actions_hide_when_model_becomes_inactive(app: Any) -> None:
+def test_failed_update_offers_legacy_update_when_model_becomes_inactive(app: Any) -> None:
     with model_window(app, previous=True) as (live, _updates):
         live.port.next_failure = "selfcheck"
         live.port.revision_gate.set()
@@ -417,5 +433,6 @@ def test_failed_update_actions_hide_when_model_becomes_inactive(app: Any) -> Non
         app.processEvents()
         texts = visible_texts(card_item(live, FIRST.id))
         assert FAILED_MESSAGE in texts
-        assert not {"Повторить", "Обновить", "Вернуть предыдущую версию"} & texts
+        assert not {"Повторить", "Вернуть предыдущую версию"} & texts
+        assert visible_button(card_item(live, FIRST.id), "Обновить").isEnabled()
         assert visible_button(card_item(live, FIRST.id), "Сделать рабочей").isEnabled()
