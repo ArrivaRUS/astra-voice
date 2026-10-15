@@ -181,6 +181,13 @@ class UpdateChecker:
         with self._lock:
             return self._status
 
+    def configure_model_checker(self, model_checker: ModelUpdateChecker) -> None:
+        """Подключает проверку моделей до start(), без гонки с рабочим потоком."""
+        with self._lock:
+            if self._thread is not None or self._stop.is_set():
+                raise RuntimeError("Проверку моделей нужно подключить до запуска планировщика")
+            self._model_checker = model_checker
+
     def start(self, *, delay_s: float = STARTUP_DELAY_S, scheduled: bool = True) -> None:
         """Запускает поток; ``scheduled=False`` ждёт прохождения экрана 1."""
         with self._lock:
@@ -711,13 +718,15 @@ def create_app_checker(
             )
             model_catalog = source.current
             refresh_catalog = source.refresh
-        checker._model_checker = ModelUpdateChecker(
-            client,
-            store=model_store,
-            catalog=model_catalog,
-            cache=cache,
-            state_path=paths.state_dir() / "model-update-state.json",
-            wait=checker._wake.wait,
-            refresh_catalog=refresh_catalog,
+        checker.configure_model_checker(
+            ModelUpdateChecker(
+                client,
+                store=model_store,
+                catalog=model_catalog,
+                cache=cache,
+                state_path=paths.state_dir() / "model-update-state.json",
+                wait=checker._wake.wait,
+                refresh_catalog=refresh_catalog,
+            )
         )
     return checker

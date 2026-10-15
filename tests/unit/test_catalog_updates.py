@@ -315,7 +315,7 @@ def test_path_traversal_rejected(
 ) -> None:
     changed = with_serial(document, 5)
     changed["models"][0]["files"][0]["path"] = "../../evil.onnx"
-    assert_refused(cu, encode(changed), state_file, "bad-schema")
+    assert_refused(cu, encode(changed), state_file, "bad-path")
 
 
 def test_revoked_active_revision_recorded(

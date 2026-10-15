@@ -46,6 +46,7 @@ from astra_voice.core.settings import Settings, defaults
 from astra_voice.core.version import __version__
 from astra_voice.models import catalog_state
 from astra_voice.models.catalog import (
+    Catalog,
     CatalogEntry,
     CatalogError,
     load_builtin,
@@ -548,6 +549,11 @@ class ModelService:
     def set_cancel(self, cancel: threading.Event) -> None:
         """Связывает пробное распознавание с отменой текущей попытки установки."""
         self._cancel = cancel
+
+    @property
+    def catalog(self) -> Catalog:
+        """Проверенный каталог для фоновой проверки обновлений; только чтение."""
+        return self._catalog
 
     def recommended(self) -> CatalogEntry | None:
         return next(

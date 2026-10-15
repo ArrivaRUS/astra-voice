@@ -1815,7 +1815,7 @@ def main(argv: list[str] | None = None) -> int:
             bind_updates,
             scheduled=onboarding is None or onboarding.done or onboarding.step > 1,
             model_store=model_store,
-            catalog=(lambda: model._catalog) if model is not None else None,
+            catalog=(lambda: model.catalog) if model is not None else None,
         )
         if not args.hidden:
             focuser.focus_shell()

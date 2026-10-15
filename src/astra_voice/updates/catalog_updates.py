@@ -145,14 +145,7 @@ def apply_remote(
                 # должен следовать за проверкой подписи и JSON каталога.
                 schema = b""
             update_cache.write_private(root / "catalog.schema.json", schema)
-            try:
-                catalog = load_builtin(verifier, root=root, require_schema=require_schema)
-            except CatalogError as error:
-                if error.code != "bad-path":
-                    raise
-                # Схема оставляет проверку путей разборщику полей. Для удалённого
-                # каталога ошибки схемы и путей имеют единый код bad-schema.
-                raise CatalogError("bad-schema", error.message) from None
+            catalog = load_builtin(verifier, root=root, require_schema=require_schema)
         candidate = catalog_state.CatalogState(
             trust_epoch=catalog.trust_epoch,
             serial=catalog.serial,

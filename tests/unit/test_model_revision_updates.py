@@ -843,7 +843,6 @@ def updater(
     )
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_apply_installs_signed_revision(
     mu: ModuleType,
     installed: ModelStore,
@@ -867,7 +866,6 @@ def test_apply_installs_signed_revision(
     assert states[0] == (new_entry.id, "updating")
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_checksum_mismatch_keeps_current(
     mu: ModuleType,
     installed: ModelStore,
@@ -892,7 +890,6 @@ def test_checksum_mismatch_keeps_current(
     assert states[-1] == (new_entry.id, "update-failed")
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_smoke_failure_rolls_back(
     mu: ModuleType,
     installed: ModelStore,
@@ -931,7 +928,6 @@ def test_smoke_failure_rolls_back(
     ],
     ids=["обрыв-на-size+1", "sha256-у-загрузчика", "сеть", "нет-места"],
 )
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_download_failure_keeps_current(
     mu: ModuleType,
     installed: ModelStore,
@@ -958,7 +954,6 @@ def test_download_failure_keeps_current(
     smoke.assert_not_called()
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_cancel_keeps_current(
     mu: ModuleType,
     installed: ModelStore,
@@ -977,7 +972,6 @@ def test_cancel_keeps_current(
     assert current is not None and current.revision == OLD
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_no_signed_new_revision_is_refused(
     mu: ModuleType,
     installed: ModelStore,
@@ -995,7 +989,6 @@ def test_no_signed_new_revision_is_refused(
     assert current is not None and current.revision == OLD
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_revoked_target_is_refused_before_download(
     mu: ModuleType,
     installed: ModelStore,
@@ -1013,7 +1006,6 @@ def test_revoked_target_is_refused_before_download(
     assert current is not None and current.revision == OLD
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_not_installed_model_is_refused(
     mu: ModuleType, store: ModelStore, new_entry: CatalogEntry, contents: dict[str, bytes]
 ) -> None:
@@ -1025,7 +1017,6 @@ def test_not_installed_model_is_refused(
     assert downloader.calls == []
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_unknown_model_is_refused(
     mu: ModuleType, installed: ModelStore, new_entry: CatalogEntry, contents: dict[str, bytes]
 ) -> None:
@@ -1050,7 +1041,6 @@ def updated_store(
     return installed
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_revert_previous(
     mu: ModuleType, installed: ModelStore, new_entry: CatalogEntry, contents: dict[str, bytes]
 ) -> None:
@@ -1063,7 +1053,6 @@ def test_revert_previous(
     assert current is not None and current.revision == OLD
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_revert_to_revoked_revision_is_refused(
     mu: ModuleType, installed: ModelStore, new_entry: CatalogEntry, contents: dict[str, bytes]
 ) -> None:
@@ -1078,7 +1067,6 @@ def test_revert_to_revoked_revision_is_refused(
     assert current is not None and current.revision == NEW
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_revert_without_previous_is_refused(
     mu: ModuleType, installed: ModelStore, old_entry: CatalogEntry, contents: dict[str, bytes]
 ) -> None:
@@ -1090,7 +1078,6 @@ def test_revert_without_previous_is_refused(
     assert current is not None and current.revision == OLD
 
 
-@pytest.mark.xfail(reason="M7 шаг 2", strict=False)
 def test_revert_skips_broken_previous(
     mu: ModuleType, installed: ModelStore, new_entry: CatalogEntry, contents: dict[str, bytes]
 ) -> None:

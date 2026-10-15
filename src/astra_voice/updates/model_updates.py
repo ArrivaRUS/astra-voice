@@ -1,7 +1,8 @@
-"""Проверка активной модели: HF discovery плюс актуальный подписанный каталог.
+"""Проверка и явное обновление активной модели по подписанному каталогу.
 
-Модуль не загружает и не применяет модели. Колбэк notify вызывается из потока
-проверки; вызывающая сторона отвечает за передачу уведомления в GUI.
+ModelUpdateChecker ничего не устанавливает. ModelRevisionUpdater вызывается
+отдельно по запросу пользователя. Колбэки работают в потоке вызывающей стороны;
+доставку уведомлений и состояний в GUI организует владелец.
 """
 
 from __future__ import annotations
@@ -16,9 +17,11 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
-from astra_voice.models.catalog import Catalog, CatalogEntry, CatalogError
+from astra_voice.models.catalog import ID_RE, Catalog, CatalogEntry, CatalogError
+from astra_voice.models.downloader import DownloadError, Progress
+from astra_voice.models.installer import Installer
 from astra_voice.models.store import ModelStore
 from astra_voice.net import hf
 from astra_voice.net.http import MODEL_CHECK_JITTER_MAX_S, HttpClient, NetworkError
@@ -65,6 +68,177 @@ class ModelCheckSummary:
     notices: tuple[ModelUpdateNotice, ...] = ()
     requests_made: int = 0
     retry_at: float | None = None
+
+
+class DownloaderLike(Protocol):
+    def download(
+        self,
+        entry: CatalogEntry,
+        *,
+        progress: Callable[[Progress], None],
+        cancel: threading.Event,
+        source: Callable[[str], None] | None = None,
+    ) -> Path: ...
+
+
+@dataclass(frozen=True)
+class RevisionUpdateResult:
+    state: Literal["updated", "update-failed", "refused"]
+    model_id: str
+    active_revision: str | None
+    message: str = ""
+    reason_code: str = ""
+
+
+class ModelRevisionUpdater:
+    """Обновляет только current(), используя уже проверенный Catalog.
+
+    Методы одного экземпляра сериализованы. Владелец должен исключить другие
+    установки и смену current во время операции: общего lock у ModelStore нет.
+    Отмена передаётся Installer и после начала установки подчиняется его
+    контракту (проверка отмены при чтении контрольных сумм).
+    """
+
+    def __init__(
+        self,
+        store: ModelStore,
+        downloader: DownloaderLike,
+        installer: Installer,
+        catalog: Catalog,
+        *,
+        on_state: Callable[[str, str], None] | None = None,
+    ) -> None:
+        self._store = store
+        self._downloader = downloader
+        self._installer = installer
+        self._catalog = catalog
+        self._on_state = on_state
+        self._lock = threading.Lock()
+
+    def _result(
+        self,
+        state: Literal["updated", "update-failed", "refused"],
+        model_id: str,
+        reason_code: str = "",
+    ) -> RevisionUpdateResult:
+        current = self._store.current()
+        return RevisionUpdateResult(
+            state,
+            model_id,
+            current.revision if current is not None else None,
+            FAILED_MESSAGE if state == "update-failed" else "",
+            reason_code,
+        )
+
+    def _state(self, model_id: str, state: str) -> None:
+        if self._on_state is not None:
+            try:
+                self._on_state(model_id, state)
+            except Exception:  # noqa: BLE001 — уведомление не меняет итог установки
+                log.warning("models state=notification-failed")
+
+    def _failed(self, model_id: str, reason_code: str) -> RevisionUpdateResult:
+        self._state(model_id, "update-failed")
+        return self._result("update-failed", model_id, reason_code)
+
+    def apply(self, model_id: str, *, cancel: threading.Event) -> RevisionUpdateResult:
+        with self._lock:
+            return self._apply(model_id, cancel=cancel)
+
+    def _apply(self, model_id: str, *, cancel: threading.Event) -> RevisionUpdateResult:
+        entry = self._catalog.entry(model_id)
+        current = self._store.current()
+        if (
+            ID_RE.fullmatch(model_id) is None
+            or entry is None
+            or entry.removed_from_catalog
+            or current is None
+            or current.id != model_id
+        ):
+            return self._result("refused", model_id, "not-installed")
+        if self._catalog.is_revoked(model_id, entry.revision):
+            return self._result("refused", model_id, "revoked")
+        if current.revision == entry.revision:
+            return self._result("refused", model_id, "no-update")
+        if cancel.is_set():
+            return self._failed(model_id, "cancelled")
+
+        self._state(model_id, "updating")
+        try:
+            self._downloader.download(entry, progress=lambda progress: None, cancel=cancel)
+        except Exception as error:  # noqa: BLE001 — загрузчик не должен прервать протокол
+            self._store.discard_staging(entry.id, entry.revision)
+            reason = "download"
+            if isinstance(error, DownloadError):
+                reason = {
+                    "bad-checksum": "checksum",
+                    "cancelled": "cancelled",
+                }.get(error.code, reason)
+            return self._failed(model_id, reason)
+
+        # Не применять загруженное обновление, если за время сети выбрана другая модель.
+        active = self._store.current()
+        if (
+            cancel.is_set()
+            or active is None
+            or (active.id, active.revision)
+            != (
+                current.id,
+                current.revision,
+            )
+        ):
+            self._store.discard_staging(entry.id, entry.revision)
+            return self._failed(model_id, "cancelled" if cancel.is_set() else "not-installed")
+        try:
+            result = self._installer.install_from_staging(entry, cancel=cancel.is_set)
+        except Exception:  # noqa: BLE001 — неожиданный отказ установщика остаётся отказом
+            self._store.discard_staging(entry.id, entry.revision)
+            return self._failed(model_id, "download")
+        if result.state != "ok":
+            self._store.discard_staging(entry.id, entry.revision)
+            reason = {
+                "checksum": "checksum",
+                "selfcheck": "selfcheck",
+                "cancelled": "cancelled",
+                "revoked": "revoked",
+                "sha256": "checksum",
+                "smoke": "selfcheck",
+            }.get(result.reason_code, "download")
+            return self._failed(model_id, reason)
+        return self._result("updated", model_id)
+
+    def revert_previous(self, model_id: str) -> RevisionUpdateResult:
+        """Выбирает последнюю лексикографически пригодную ревизию, кроме current.
+
+        ModelStore/ModelRecord не предоставляют время установки. Поэтому здесь
+        детерминированный порядок revision, а не предположение о хронологии SHA.
+        Отозванный кандидат означает отказ, без поиска ещё более старой ревизии.
+        """
+        with self._lock:
+            current = self._store.current()
+            if ID_RE.fullmatch(model_id) is None or current is None or current.id != model_id:
+                return self._result("refused", model_id, "not-installed")
+            try:
+                candidates = [
+                    record
+                    for record in self._store.records()
+                    if record.id == model_id
+                    and record.revision != current.revision
+                    and record.state == "ok"
+                    and not record.recheck
+                    and record.metadata_ok
+                    and record.layout
+                    and record.variant
+                ]
+                if not candidates:
+                    return self._result("refused", model_id, "no-previous")
+                previous = max(candidates, key=lambda record: record.revision)
+                if self._catalog.is_revoked(model_id, previous.revision):
+                    return self._result("refused", model_id, "revoked")
+                self._store.set_current(model_id, previous.revision)
+            except Exception:  # noqa: BLE001 — отказ хранилища не выдаётся за успешный возврат
+                return self._failed(model_id, "download")
+            return self._result("updated", model_id)
 
 
 class ModelUpdateChecker:
