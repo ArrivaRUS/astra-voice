@@ -3400,8 +3400,14 @@ def test_model_shutdown_cancels_active_smoke_check(
     monkeypatch.setattr(model_downloads, "SmokeRunner", Mock(return_value=runner))
 
     def installer_factory(
-        store: object, smoke: Callable[..., object], catalog: Catalog | None = None
+        store: object,
+        smoke: Callable[..., object],
+        catalog: Catalog | None = None,
+        *,
+        activate: Callable[..., None] | None = None,
     ) -> Mock:
+        assert callable(activate)
+
         def install(*args: object, cancel: Callable[[], bool]) -> InstallResult:
             smoke(Path("/fake/model"), port.entry)
             return InstallResult("broken", reason_code="selfcheck")

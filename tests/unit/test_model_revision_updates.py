@@ -97,7 +97,7 @@ import requests
 
 from astra_voice.core.policy import Policy, PolicyStatus
 from astra_voice.core.settings import Settings
-from astra_voice.models.catalog import Catalog, CatalogEntry, FileSpec, RevokedEntry
+from astra_voice.models.catalog import Catalog, CatalogEntry, CatalogError, FileSpec, RevokedEntry
 from astra_voice.models.downloader import DownloadError
 from astra_voice.models.installer import Installer, SmokeResult
 from astra_voice.models.store import ModelStore, StoreError
@@ -1539,3 +1539,85 @@ def test_live_service_accepts_revocation_during_revision_download(
         downloads.shutdown()
         QCoreApplication.sendPostedEvents(None, QEvent.MetaCall)
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+
+@pytest.mark.parametrize("revert", [False, True])
+@pytest.mark.parametrize("fail_when", ["initial", "activating"])
+def test_revision_update_catalog_provider_failure_preserves_current(
+    mu: ModuleType,
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    revert: bool,
+    fail_when: str,
+) -> None:
+    if revert:
+        updated_store(mu, installed, new_entry, contents)
+    before = (installed.root / "current.json").read_bytes()
+    unavailable = fail_when == "initial"
+
+    def catalog() -> Catalog:
+        if unavailable:
+            raise CatalogError("state-invalid", "Каталог недоступен")
+        return make_catalog(new_entry)
+
+    def state_changed(model_id: str, state: str) -> None:
+        nonlocal unavailable
+        if state == "activating":
+            unavailable = True
+
+    revision_updater = mu.ModelRevisionUpdater(
+        installed,
+        FakeDownloader(installed, contents),
+        Installer(installed, smoke_for()),
+        catalog,
+        on_state=state_changed,
+    )
+    result = (
+        revision_updater.revert_previous(new_entry.id)
+        if revert
+        else revision_updater.apply(new_entry.id, cancel=threading.Event())
+    )
+
+    assert result.state == "update-failed"
+    assert result.reason_code
+    assert (installed.root / "current.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("revert", [False, True])
+def test_revision_updater_cannot_bypass_activation_dependency(
+    mu: ModuleType,
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    revert: bool,
+) -> None:
+    if revert:
+        updated_store(mu, installed, new_entry, contents)
+    before = (installed.root / "current.json").read_bytes()
+    activations: list[tuple[str, str, str | None]] = []
+    target = OLD if revert else NEW
+
+    def activate(model_id: str, revision: str, *, previous_revision: str | None = None) -> None:
+        activations.append((model_id, revision, previous_revision))
+        if revision == target:
+            raise StoreError("revoked", "Отозвана")
+        installed.set_current(model_id, revision, previous_revision=previous_revision)
+
+    revision_updater = mu.ModelRevisionUpdater(
+        installed,
+        FakeDownloader(installed, contents),
+        Installer(installed, smoke_for()),
+        make_catalog(new_entry),
+        activate=activate,
+    )
+    result = (
+        revision_updater.revert_previous(new_entry.id)
+        if revert
+        else revision_updater.apply(new_entry.id, cancel=threading.Event())
+    )
+
+    assert result.state in {"refused", "update-failed"}
+    assert result.reason_code == "revoked"
+    assert activations[0] == (new_entry.id, target, None if revert else OLD)
+    assert (installed.root / "current.json").read_bytes() == before

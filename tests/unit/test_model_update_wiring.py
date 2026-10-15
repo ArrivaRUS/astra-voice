@@ -9,14 +9,18 @@ import random
 import stat
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import requests
 
 from astra_voice.core import paths
-from astra_voice.core.policy import Policy, PolicyStatus
+from astra_voice.core.policy import Policy, PolicyStatus, effective
 from astra_voice.core.policy import load as load_policy
 from astra_voice.core.release_identity import catalog_default_url
 from astra_voice.core.settings import Settings
@@ -27,7 +31,7 @@ from astra_voice.models.store import ModelStore
 from astra_voice.net import github, update_cache
 from astra_voice.net.gate import NetworkGate
 from astra_voice.net.http import MODEL_CHECK_JITTER_MAX_S, CheckResult, HttpClient, NetworkError
-from astra_voice.net.update_cache import UpdateCache
+from astra_voice.net.update_cache import CacheEntry, UpdateCache
 from astra_voice.security.verify import Verifier, VerifyResult
 from astra_voice.updates import catalog_updates as catalog_module
 from astra_voice.updates import checker as checker_module
@@ -256,7 +260,7 @@ def test_manual_check_interrupts_scheduled_model_jitter_from_app_factory(
         def current(self) -> Catalog:
             return catalog
 
-        def refresh(self, cancel: threading.Event) -> None:
+        def refresh(self, cancel: threading.Event, *, manual: bool = False) -> None:
             assert not cancel.is_set()
 
     def discovery(self: HttpClient, url: str, **kwargs: Any) -> CheckResult:
@@ -333,7 +337,7 @@ def test_factory_connects_configured_catalog_source(
         def current(self) -> Catalog:
             return updated
 
-        def refresh(self, cancel: threading.Event) -> None:
+        def refresh(self, cancel: threading.Event, *, manual: bool = False) -> None:
             refreshes.append(cancel)
 
     def make_models(client: HttpClient, **kwargs: Any) -> RecordingModels:
@@ -437,8 +441,9 @@ def test_catalog_refresh_precedes_hf_comparison(
     calls: list[str] = []
     notices: list[model_module.ModelUpdateNotice] = []
 
-    def refresh(cancel: threading.Event) -> None:
+    def refresh(cancel: threading.Event, *, manual: bool = False) -> None:
         assert not cancel.is_set()
+        assert manual is True
         calls.append("catalog")
         current[0] = Catalog(serial=5, trust_epoch=1, entries=(remote,), revoked=())
 
@@ -925,3 +930,197 @@ def test_catalog_404_is_quiet_and_persistently_cached_for_a_day(
     assert len(requests) == 2 * count
     assert not [record for record in caplog.records if record.levelno >= 30]
     assert catalog_source.global_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("failure_at", ["builtin", "source", "model-checker"])
+@pytest.mark.parametrize("code", ["clock-behind", "bad-signature", "io", "invalid-value"])
+def test_factory_model_failure_keeps_manual_app_check_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_at: str,
+    code: str,
+) -> None:
+    from astra_voice.models import catalog as catalog_module_impl
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(checker_module, "shared_cache", lambda: UpdateCache(tmp_path / "cache"))
+    error: Exception = CatalogError(code, f"private path: {tmp_path}")
+    if code == "io":
+        error = OSError(f"private path: {tmp_path}")
+    elif code == "invalid-value":
+        error = ValueError(f"private path: {tmp_path}")
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise error
+
+    if failure_at == "builtin":
+        monkeypatch.setattr(catalog_module_impl, "load_builtin", fail)
+    elif failure_at == "source":
+        monkeypatch.setattr(catalog_module, "CatalogUpdateSource", fail)
+    else:
+        monkeypatch.setattr(model_module, "ModelUpdateChecker", fail)
+    catalog = None if failure_at == "builtin" else Catalog(4, 1, (), ())
+    with caplog.at_level(logging.WARNING):
+        checker = checker_module.create_app_checker(
+            Settings(check_app_updates=False),
+            Policy(),
+            model_store=ModelStore(tmp_path / "models"),
+            catalog=catalog,
+        )
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].getMessage() == f"Проверка моделей недоступна: reason={code}"
+    assert str(tmp_path) not in caplog.text
+    assert warnings[0].exc_info is None
+    assert checker._model_checker is None
+    calls: list[str] = []
+
+    def app_check(*args: Any, **kwargs: Any) -> github.ReleaseCheck:
+        calls.append(kwargs["kind"])
+        return github.ReleaseCheck("uptodate", requests_made=1)
+
+    monkeypatch.setattr(github, "check", app_check)
+    checker.check_now()
+    checker._round()
+    assert calls == ["check_app_manual"]
+    assert checker.status.state == "uptodate"
+    assert checker.status.manual is True
+
+
+@pytest.mark.parametrize("manual", [False, True], ids=["scheduled", "manual"])
+@pytest.mark.parametrize("models_disabled", [False, True], ids=["app-only", "both"])
+def test_t221_app_policy_keeps_catalog_and_hf_checks_independent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manual: bool, models_disabled: bool
+) -> None:
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(paths, "data_dir_static", lambda: DATA_ROOT)
+    monkeypatch.setattr(checker_module, "shared_cache", lambda: UpdateCache(tmp_path / "cache"))
+    policy_path = tmp_path / "policy.conf"
+    policy_path.write_text(
+        "[astra-voice]\ncheck_app_updates = false\n"
+        + ("check_model_updates = false\n" if models_disabled else "")
+    )
+    policy = load_policy(policy_path)
+    settings = effective(Settings(check_model_updates=True), policy)
+    store, entry = tiny_installed_model(tmp_path)
+    verifier = CatalogVerifier()
+    monkeypatch.setattr(
+        checker_module,
+        "Verifier",
+        lambda purpose, **kwargs: verifier if purpose == "catalog" else Verifier(purpose, **kwargs),
+    )
+    requests_made: list[str] = []
+    raw = (DATA_ROOT / "catalog.json").read_bytes()
+    url = catalog_default_url()
+    refs = "https://huggingface.co/api/models/istupakov/gigaam-v3-onnx/refs"
+
+    def transport(
+        self: requests.adapters.HTTPAdapter, request: requests.PreparedRequest, **kwargs: Any
+    ) -> requests.Response:
+        assert request.method == "GET"
+        assert request.url in (url, url + ".sig", refs)
+        requests_made.append(str(request.url))
+        response = requests.Response()
+        response.status_code = 200
+        if request.url == url:
+            body = raw
+        elif request.url == url + ".sig":
+            body = b"recorded catalog signature"
+        else:
+            body = json.dumps(
+                {"branches": [{"name": "main", "targetCommit": entry.revision}]}
+            ).encode()
+        response.raw = BytesIO(body)
+        response.headers["Content-Length"] = str(len(body))
+        response.url = str(request.url)
+        return response
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", transport)
+    checker = checker_module.create_app_checker(settings, policy, model_store=store)
+    assert checker._model_checker is not None
+    checker._model_checker._jitter_max_s = 0.0
+    checker._check_models(manual=manual)
+    assert requests_made == ([] if models_disabled else [url, url + ".sig", refs])
+    assert checker._gate.refusal("check_app") == "policy"
+
+
+@pytest.mark.parametrize("action", ["check_now", "check_models_now"])
+def test_manual_worker_check_bypasses_catalog_404_cache(
+    catalog_source: CatalogSourceRig, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    state_root = catalog_source.global_path.parent
+    monkeypatch.setattr(paths, "state_dir", lambda: state_root)
+    monkeypatch.setattr(checker_module, "shared_cache", lambda: catalog_source.cache)
+    checker = checker_module.create_app_checker(
+        Settings(
+            check_app_updates=False, check_model_updates=True, extra={"catalog_url": CATALOG_URL}
+        ),
+        Policy(),
+        model_store=ModelStore(state_root / "models"),
+        catalog=catalog_source.baseline,
+    )
+    assert checker._model_checker is not None
+    source = cast(Any, checker._model_checker._catalog).__self__
+    source._verifier = catalog_source.verifier
+    source._clock = lambda: T0
+    catalog_source.cache.set(
+        "models:catalog:not-found",
+        CacheEntry(url=CATALOG_URL, backoff_until=T0 + 86400, recorded_at=T0),
+    )
+    monkeypatch.setattr(
+        github, "check", lambda *a, **kw: github.ReleaseCheck("uptodate", requests_made=1)
+    )
+    source.refresh(threading.Event())
+    assert catalog_source.fetch_calls == 0
+    getattr(checker, action)()
+    checker._round()
+    assert catalog_source.fetch_calls == 1
+    assert source.current().serial == catalog_source.baseline.serial + 1
+    assert catalog_source.cache.get("models:catalog:not-found").backoff_until is None
+
+
+@pytest.mark.parametrize("restarted", [False, True], ids=["same-source", "restarted"])
+@pytest.mark.parametrize("timestamp", ["year-ahead", "clock-rollback", "legacy"])
+def test_t224_catalog_404_cache_recovers_after_clock_rollback(
+    catalog_source: CatalogSourceRig,
+    monkeypatch: pytest.MonkeyPatch,
+    restarted: bool,
+    timestamp: str,
+) -> None:
+    now = [T0]
+    source = catalog_source.source()
+    source._clock = lambda: now[0]
+    requests_made: list[str] = []
+
+    @contextmanager
+    def stream(url: str, **kwargs: Any) -> Iterator[Any]:
+        requests_made.append(url)
+        yield SimpleNamespace(status=404, headers={})
+
+    monkeypatch.setattr(catalog_module, "fetch", fetch_catalog)
+    monkeypatch.setattr(catalog_source.client, "get_stream", stream)
+    marker = CacheEntry(
+        url=CATALOG_URL,
+        backoff_until=T0 + (365 * 86400 if timestamp != "clock-rollback" else 3600),
+        recorded_at=T0 + 60 if timestamp == "clock-rollback" else T0,
+    )
+    catalog_source.cache.set("models:catalog:not-found", marker)
+    if timestamp == "legacy":
+        path = catalog_source.cache.path
+        data = json.loads(path.read_bytes())
+        del data["models:catalog:not-found"]["recorded_at"]
+        path.write_text(json.dumps(data))
+    if restarted:
+        catalog_source.cache = UpdateCache(catalog_source.cache.path)
+        source = catalog_source.source()
+        source._clock = lambda: now[0]
+    source.refresh(threading.Event())
+    now[0] += 86400
+    source.refresh(threading.Event())
+    assert requests_made, "GET должен произойти не позже 24 ч по текущим часам"
+    marker = UpdateCache(catalog_source.cache.path).get("models:catalog:not-found")
+    assert marker.recorded_at == now[0]
+    assert marker.backoff_until == now[0] + 86400

@@ -115,7 +115,8 @@ def apply_remote(
             raw, signature, verifier, schema_root=schema_root, require_schema=require_schema
         )
         try:
-            catalog_state.apply_state(state_path, state_of(catalog, raw))
+            with CATALOG_LOCK:
+                catalog_state.apply_state(state_path, state_of(catalog, raw))
         except ValueError:
             raise CatalogError("stale-catalog", "Каталог старее текущего.") from None
     except OSError:
@@ -299,7 +300,7 @@ class CatalogUpdateSource:
                 constraints.append(state_of(snapshot, raw))
         return constraints
 
-    def refresh(self, cancel: threading.Event) -> None:
+    def refresh(self, cancel: threading.Event, *, manual: bool = False) -> None:
         with self._lock:
             if self._client.gate.refusal("check_models"):
                 raise NetworkError("no-network", "Проверка каталога запрещена.")
@@ -312,10 +313,21 @@ class CatalogUpdateSource:
             try:
                 missing_key = "models:catalog:not-found"
                 missing = self._cache.get(missing_key)
+                now = self._clock()
+                if missing.url == url and missing.backoff_until is not None:
+                    backoff_until = min(missing.backoff_until, now + CATALOG_NOT_FOUND_RETRY_S)
+                    if missing.backoff_until > backoff_until or (
+                        missing.recorded_at is not None and now < missing.recorded_at
+                    ):
+                        # Часы ушли назад или старая отметка вышла за суточную
+                        # границу: перепроверяем сразу, сброс сохраняется на диск.
+                        missing = CacheEntry()
+                        self._cache.set(missing_key, missing)
                 if (
-                    missing.url == url
+                    not manual
+                    and missing.url == url
                     and missing.backoff_until is not None
-                    and missing.backoff_until > self._clock()
+                    and missing.backoff_until > now
                 ):
                     return
                 with CATALOG_LOCK:
@@ -338,11 +350,13 @@ class CatalogUpdateSource:
                     )
                 except NetworkError as error:
                     if error.status == 404:
+                        recorded_at = self._clock()
                         self._cache.set(
                             missing_key,
                             CacheEntry(
                                 url=url,
-                                backoff_until=self._clock() + CATALOG_NOT_FOUND_RETRY_S,
+                                backoff_until=recorded_at + CATALOG_NOT_FOUND_RETRY_S,
+                                recorded_at=recorded_at,
                             ),
                         )
                         log.info("catalog state=unavailable http_status=404 retry=24h")

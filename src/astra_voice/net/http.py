@@ -758,6 +758,9 @@ class HttpClient:
                 if kind == "download":
                     log.debug("Запрос к %s", host)
                 try:
+                    allowed, reason = self._gate.allowed(kind)
+                    if not allowed:
+                        raise NetworkError("no-network", reason)
                     if _on_request is not None:
                         _on_request()
                     response = session.get(

@@ -180,3 +180,81 @@ def test_repository_mismatch_rejected(
     assert "не совпадает с RELEASES_REPO" in capsys.readouterr().err
     monkeypatch.setenv("GITHUB_REPOSITORY", RELEASES_REPO)
     assert gate.main([]) == 0
+
+
+@pytest.fixture
+def revoked_release(release: Release) -> Release:
+    release.document["revoked"] = [
+        {"model_id": "withdrawn-model", "revision": "r1", "reason": "unsafe"}
+    ]
+    release.write()
+    release.git("add", "data")
+    release.git("commit", "-m", "catalog with revocation")
+    release.git("tag", "-f", "v0.1.6")
+    release.git("commit", "--allow-empty", "-m", "next release")
+    return release
+
+
+@pytest.mark.parametrize(("epoch", "serial"), [(2, 11), (3, 1)])
+@pytest.mark.parametrize("schema_changed", [False, True], ids=["same-schema", "new-schema"])
+def test_t222_lost_revocation_fails_across_pair_epoch_and_schema(
+    revoked_release: Release,
+    capsys: pytest.CaptureFixture[str],
+    epoch: int,
+    serial: int,
+    schema_changed: bool,
+) -> None:
+    release = revoked_release
+    release.document.update(trust_epoch=epoch, serial=serial, revoked=[])
+    if schema_changed:
+        schema = release.root / "data/catalog.schema.json"
+        schema.write_bytes(schema.read_bytes() + b"\n")
+        release.document["schema_sha256"] = hashlib.sha256(schema.read_bytes()).hexdigest()
+    release.write()
+    assert gate.main([]) == 1
+    assert "потеря отзыва: withdrawn-model@r1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("epoch", "serial"), [(2, 11), (3, 1)])
+def test_t222_revocations_may_grow(revoked_release: Release, epoch: int, serial: int) -> None:
+    release = revoked_release
+    release.document.update(trust_epoch=epoch, serial=serial)
+    release.document["revoked"].append(
+        {"model_id": "withdrawn-model", "revision": "r2", "reason": "also unsafe"}
+    )
+    release.write()
+    assert gate.main([]) == 0
+
+
+def test_t222_explicit_unrevoke_is_printed(
+    revoked_release: Release, capsys: pytest.CaptureFixture[str]
+) -> None:
+    release = revoked_release
+    release.document.update(serial=11, revoked=[])
+    release.write()
+    assert gate.main(["--allow-unrevoke", "withdrawn-model@r1"]) == 0
+    output = capsys.readouterr().out
+    assert "Явно разрешено снятие отзыва: withdrawn-model@r1" in output
+    assert "Гейт каталога пройден" in output
+
+
+def test_each_unrevoke_requires_its_own_flag(
+    revoked_release: Release, capsys: pytest.CaptureFixture[str]
+) -> None:
+    release = revoked_release
+    release.document["revoked"].append(
+        {"model_id": "withdrawn-model", "revision": "r2", "reason": "unsafe"}
+    )
+    release.write()
+    release.git("add", "data")
+    release.git("commit", "-m", "two revoked revisions")
+    release.git("tag", "-f", "v0.1.6")
+    release.document.update(serial=11, revoked=[])
+    release.write()
+    args = ["--previous-tag", "v0.1.6", "--allow-unrevoke", "withdrawn-model@r1"]
+    assert gate.main(args) == 1
+    assert "потеря отзыва: withdrawn-model@r2" in capsys.readouterr().err
+    assert gate.main([*args, "--allow-unrevoke", "withdrawn-model@r2"]) == 0
+    output = capsys.readouterr().out
+    for revision in ("r1", "r2"):
+        assert f"Явно разрешено снятие отзыва: withdrawn-model@{revision}" in output

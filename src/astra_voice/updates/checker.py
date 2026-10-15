@@ -33,6 +33,7 @@ from urllib.parse import urlsplit
 from astra_voice.core import paths
 from astra_voice.core.release_identity import RELEASES_REPO, catalog_default_url
 from astra_voice.core.version import __version__
+from astra_voice.models.catalog import CatalogError
 from astra_voice.net import github
 from astra_voice.net.catalog_url import catalog_urls
 from astra_voice.net.gate import NetworkGate
@@ -60,7 +61,11 @@ if TYPE_CHECKING:
     from astra_voice.core.settings import Settings
     from astra_voice.models.catalog import Catalog
     from astra_voice.models.store import ModelStore
-    from astra_voice.updates.model_updates import ModelUpdateChecker, ModelUpdateNotice
+    from astra_voice.updates.model_updates import (
+        CatalogRefresh,
+        ModelUpdateChecker,
+        ModelUpdateNotice,
+    )
 
 log = logging.getLogger(__name__)
 
@@ -711,111 +716,124 @@ def create_app_checker(
     track: Track = "appimage" if paths.install_kind().is_appimage else "deb"
     cache = shared_cache()
     checker = UpdateChecker(gate, client, cache=cache, metadata=metadata, track=track)
-    # Источник восстановления не зависит от ModelService/load_effective:
-    # старый builtin здесь только нижняя граница для сетевого кандидата.
-    if model_store is None:
-        from astra_voice.models.store import ModelStore
+    try:
+        # Источник восстановления не зависит от ModelService/load_effective:
+        # старый builtin здесь только нижняя граница для сетевого кандидата.
+        if model_store is None:
+            from astra_voice.models.store import ModelStore
 
-        model_store = ModelStore()
-    if catalog is None:
-        from astra_voice.models.catalog import load_builtin
+            model_store = ModelStore()
+        if catalog is None:
+            from astra_voice.models.catalog import load_builtin
 
-        catalog = load_builtin(
-            Verifier("catalog", keyring=paths.data_dir_static() / "keys" / "release.gpg"),
-            root=paths.data_dir_static(),
-            state_path=None,
-        )
-    if model_store is not None and catalog is not None:
-        from astra_voice.updates.catalog_updates import CatalogUpdateSource, NewModelTracker
-        from astra_voice.updates.model_updates import ModelUpdateChecker
+            catalog = load_builtin(
+                Verifier("catalog", keyring=paths.data_dir_static() / "keys" / "release.gpg"),
+                root=paths.data_dir_static(),
+                state_path=None,
+            )
+        if model_store is not None and catalog is not None:
+            from astra_voice.updates.catalog_updates import CatalogUpdateSource, NewModelTracker
+            from astra_voice.updates.model_updates import ModelUpdateChecker
 
-        model_catalog = catalog
-        refresh_catalog: Callable[[threading.Event], None] | None = None
-        catalog_warnings: set[str] = set()
+            model_catalog = catalog
+            refresh_catalog: CatalogRefresh | None = None
+            catalog_warnings: set[str] = set()
 
-        def public_catalog_url(url: str) -> str:
-            # Только диагностика: решение о запросе остаётся за HttpClient.
-            try:
-                catalog_urls(url)
-            except ValueError:
-                return url
-            if not host_allowed(urlsplit(url).hostname or "") and "host" not in catalog_warnings:
-                catalog_warnings.add("host")
-                log.warning(
-                    "catalog_url: хост не разрешён; сервер отсутствует "
-                    "в списке публичных источников (scope=public)."
-                )
-            return url
-
-        def configured_catalog_url() -> str:
-            policy_url = policy.values.get("catalog_url")
-            if isinstance(policy_url, str) and policy_url:
-                return public_catalog_url(policy_url)
-            if (
-                "catalog_url" in policy.values
-                and not isinstance(policy_url, str)
-                and "policy-type" not in catalog_warnings
-            ):
-                catalog_warnings.add("policy-type")
-                log.warning(
-                    "Неверный catalog_url в политике: ожидалась строка; "
-                    "значение считается незаданным."
-                )
-            settings_url = settings.extra.get("catalog_url", "")
-            if settings_url != "":
+            def public_catalog_url(url: str) -> str:
+                # Только диагностика: решение о запросе остаётся за HttpClient.
                 try:
-                    if not isinstance(settings_url, str):
-                        raise ValueError("Адрес каталога должен быть строкой")
-                    catalog_urls(settings_url)
+                    catalog_urls(url)
                 except ValueError:
+                    return url
+                if (
+                    not host_allowed(urlsplit(url).hostname or "")
+                    and "host" not in catalog_warnings
+                ):
+                    catalog_warnings.add("host")
                     log.warning(
-                        "Неверный catalog_url в настройках; используется адрес по умолчанию."
+                        "catalog_url: хост не разрешён; сервер отсутствует "
+                        "в списке публичных источников (scope=public)."
                     )
-                else:
-                    return public_catalog_url(settings_url)
-            return catalog_default_url()
+                return url
 
-        configured_url = configured_catalog_url()
-        catalog_state_dir = paths.state_dir() / "model-catalog-updates"
-        if configured_url or catalog_state_dir.exists() or catalog_state_dir.is_symlink():
-            source = CatalogUpdateSource(
-                client,
-                baseline=catalog,
-                catalog_url=configured_catalog_url,
-                verifier=Verifier(
-                    "catalog", keyring=paths.data_dir_static() / "keys" / "release.gpg"
-                ),
-                schema_root=paths.data_dir_static(),
-                state_dir=catalog_state_dir,
-                global_state_path=paths.state_dir() / "catalog-state.json",
-                cache=cache,
-                scope="public",
+            def configured_catalog_url() -> str:
+                policy_url = policy.values.get("catalog_url")
+                if isinstance(policy_url, str) and policy_url:
+                    return public_catalog_url(policy_url)
+                if (
+                    "catalog_url" in policy.values
+                    and not isinstance(policy_url, str)
+                    and "policy-type" not in catalog_warnings
+                ):
+                    catalog_warnings.add("policy-type")
+                    log.warning(
+                        "Неверный catalog_url в политике: ожидалась строка; "
+                        "значение считается незаданным."
+                    )
+                settings_url = settings.extra.get("catalog_url", "")
+                if settings_url != "":
+                    try:
+                        if not isinstance(settings_url, str):
+                            raise ValueError("Адрес каталога должен быть строкой")
+                        catalog_urls(settings_url)
+                    except ValueError:
+                        log.warning(
+                            "Неверный catalog_url в настройках; используется адрес по умолчанию."
+                        )
+                    else:
+                        return public_catalog_url(settings_url)
+                return catalog_default_url()
+
+            configured_url = configured_catalog_url()
+            catalog_state_dir = paths.state_dir() / "model-catalog-updates"
+            if configured_url or catalog_state_dir.exists() or catalog_state_dir.is_symlink():
+                source = CatalogUpdateSource(
+                    client,
+                    baseline=catalog,
+                    catalog_url=configured_catalog_url,
+                    verifier=Verifier(
+                        "catalog", keyring=paths.data_dir_static() / "keys" / "release.gpg"
+                    ),
+                    schema_root=paths.data_dir_static(),
+                    state_dir=catalog_state_dir,
+                    global_state_path=paths.state_dir() / "catalog-state.json",
+                    cache=cache,
+                    scope="public",
+                )
+                model_catalog = source.current
+                tracker = NewModelTracker(catalog_state_dir / "new-models.json")
+
+                def refresh_catalog_snapshot(
+                    cancel: threading.Event, *, manual: bool = False
+                ) -> None:
+                    source.refresh(cancel, manual=manual)
+                    snapshot = source.current()
+                    if checker.on_model_catalog is not None:
+                        checker.on_model_catalog(snapshot, tracker.new_ids(snapshot, time.time()))
+
+                refresh_catalog = refresh_catalog_snapshot
+
+            def notify_model(notice: ModelUpdateNotice) -> None:
+                if checker.on_model_update is not None:
+                    checker.on_model_update(notice)
+
+            checker.configure_model_checker(
+                ModelUpdateChecker(
+                    client,
+                    store=model_store,
+                    catalog=model_catalog,
+                    cache=cache,
+                    state_path=paths.state_dir() / "model-update-state.json",
+                    wait=checker._wake.wait,
+                    refresh_catalog=refresh_catalog,
+                    notify=notify_model,
+                )
             )
-            model_catalog = source.current
-            tracker = NewModelTracker(catalog_state_dir / "new-models.json")
-
-            def refresh_catalog_snapshot(cancel: threading.Event) -> None:
-                source.refresh(cancel)
-                snapshot = source.current()
-                if checker.on_model_catalog is not None:
-                    checker.on_model_catalog(snapshot, tracker.new_ids(snapshot, time.time()))
-
-            refresh_catalog = refresh_catalog_snapshot
-
-        def notify_model(notice: ModelUpdateNotice) -> None:
-            if checker.on_model_update is not None:
-                checker.on_model_update(notice)
-
-        checker.configure_model_checker(
-            ModelUpdateChecker(
-                client,
-                store=model_store,
-                catalog=model_catalog,
-                cache=cache,
-                state_path=paths.state_dir() / "model-update-state.json",
-                wait=checker._wake.wait,
-                refresh_catalog=refresh_catalog,
-                notify=notify_model,
-            )
+    except (CatalogError, OSError, ValueError) as error:
+        code = (
+            error.code
+            if isinstance(error, CatalogError)
+            else ("io" if isinstance(error, OSError) else "invalid-value")
         )
+        log.warning("Проверка моделей недоступна: reason=%s", code)
     return checker

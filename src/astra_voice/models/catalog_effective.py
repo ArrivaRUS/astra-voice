@@ -9,11 +9,14 @@ import logging
 import re
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
+from typing import Protocol
 
 from astra_voice.core import paths
 from astra_voice.models import catalog_state
 from astra_voice.models.catalog import CATALOG_MAX_BYTES, Catalog, CatalogError, load_builtin
+from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net.update_cache import read_private, write_private
 from astra_voice.security.verify import Verifier
 
@@ -24,6 +27,87 @@ SIGNATURE_MAX_BYTES = 64 * 1024
 # Общий для загрузчика и публикации source: сравнение и запись watermark
 # не могут перемежаться внутри процесса с принятием другого каталога.
 CATALOG_LOCK = threading.RLock()
+
+
+class ModelActivator(Protocol):
+    def __call__(
+        self, model_id: str, revision: str, *, previous_revision: str | None = None
+    ) -> None: ...
+
+
+def check_revoked(model_id: str, revision: str, catalog: Catalog | None) -> None:
+    """Объединяет отзывы памяти, отметки и подписанного снимка; отказ закрытый.
+
+    Снимок публикуется раньше отметки: даже при отказе записи отметки его
+    отзывы уже обязательны. Отсутствие файлов допустимо для автономных
+    установщиков; существующий непроверяемый источник не означает пустой список.
+    Вызывающий активацию удерживает тот же RLock до записи current.json.
+    """
+    with CATALOG_LOCK:
+        revoked = catalog is not None and catalog.is_revoked(model_id, revision)
+        marker_path = catalog_state.state_path(paths.state_dir())
+        try:
+            marker_path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise StoreError("catalog-unavailable", "Состояние каталога недоступно.") from None
+        else:
+            try:
+                marker = catalog_state.read_state(marker_path)
+            except (OSError, ValueError, RecursionError):
+                marker = None
+            if (
+                marker is None
+                or re.fullmatch(r"[0-9a-f]{64}", marker.sha256) is None
+                or marker.revoked is None
+            ):
+                raise StoreError("catalog-unavailable", "Состояние каталога повреждено.")
+            revoked |= (model_id, revision) in marker.revoked
+        directory = paths.state_dir() / "model-catalog-updates"
+        try:
+            (directory / SNAPSHOT_FILE_NAME).lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise StoreError("catalog-unavailable", "Снимок каталога недоступен.") from None
+        else:
+            try:
+                raw, signature = read_snapshot(directory)
+                root = paths.data_dir_static()
+                snapshot = verify_catalog(
+                    raw,
+                    signature,
+                    Verifier("catalog", keyring=root / "keys" / "release.gpg"),
+                    schema_root=root,
+                    require_schema=True,
+                )
+            except (OSError, ValueError, TypeError, RecursionError, CatalogError):
+                raise StoreError("catalog-unavailable", "Снимок каталога не проверен.") from None
+            revoked |= snapshot.is_revoked(model_id, revision)
+        if revoked:
+            raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
+
+
+def activate_revision(
+    store: ModelStore,
+    catalog: Catalog | Callable[[], Catalog] | None,
+    model_id: str,
+    revision: str,
+    *,
+    previous_revision: str | None = None,
+) -> None:
+    """Совместимый барьер для службы и автономных установщиков/обновляторов."""
+    with CATALOG_LOCK:
+        try:
+            current_catalog = catalog() if callable(catalog) else catalog
+        except CatalogError:
+            raise StoreError("catalog-unavailable", "Каталог моделей недоступен.") from None
+        check_revoked(model_id, revision, current_catalog)
+        if previous_revision is None:
+            store.set_current(model_id, revision)
+        else:
+            store.set_current(model_id, revision, previous_revision=previous_revision)
 
 
 def state_of(catalog: Catalog, raw: bytes) -> catalog_state.CatalogState:

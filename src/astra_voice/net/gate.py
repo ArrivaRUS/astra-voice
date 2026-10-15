@@ -77,7 +77,7 @@ class NetworkGate:
             return "offline"
         if kind == "check_models" and (
             self._policy.values.get("check_model_updates") is False
-            or self._policy.values.get("updates") == "offline"
+            or str(self._policy.values.get("updates")).strip().lower() == "offline"
         ):
             return "policy"
         if (

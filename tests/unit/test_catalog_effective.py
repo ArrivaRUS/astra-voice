@@ -662,6 +662,7 @@ def test_remote_revocation_reaches_real_consumers(
     monkeypatch.setattr(paths, "data_dir_static", lambda: scenario.root)
     monkeypatch.setattr(paths, "state_dir", lambda: scenario.state.parent)
     monkeypatch.setattr(model_downloads, "Verifier", lambda *_args, **_kwargs: BoundVerifier())
+    monkeypatch.setattr(catalog_effective, "Verifier", lambda *_args, **_kwargs: BoundVerifier())
     monkeypatch.setattr(model_downloads, "ModelStore", lambda: store)
     service = model_downloads.ModelService(Settings(), Policy())
     entry = service.catalog.entries[0]
@@ -719,3 +720,174 @@ def test_remote_revocation_reaches_real_consumers(
         result = service.revision_updater(on_state=lambda *_args: None).revert_previous(entry.id)
         assert result.state == "refused" and result.reason_code == "revoked"
     assert (store.root / "current.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("operation", ["update", "revert", "set", "restore", "install"])
+@pytest.mark.parametrize("marker_has_revocation", [False, True])
+def test_source_revocation_blocks_activation_before_gui_accepts_catalog(
+    scenario: Scenario,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    marker_has_revocation: bool,
+) -> None:
+    """T-223: source уже принял отзыв, очередь GUI ещё не обработана."""
+    from astra_voice.ui import model_downloads
+
+    store = ModelStore(scenario.state.parent / "models")
+    monkeypatch.setattr(paths, "data_dir_static", lambda: scenario.root)
+    monkeypatch.setattr(paths, "state_dir", lambda: scenario.state.parent)
+    monkeypatch.setattr(model_downloads, "Verifier", lambda *_args, **_kwargs: BoundVerifier())
+    monkeypatch.setattr(model_downloads, "ModelStore", lambda: store)
+    monkeypatch.setattr(catalog_effective, "Verifier", lambda *_args, **_kwargs: BoundVerifier())
+    service = model_downloads.ModelService(Settings(check_model_updates=True), Policy())
+    entry = service.catalog.entries[0]
+    original_catalog = service.catalog
+    install_fixture(store, entry)
+    safe = replace(entry, revision=NEW_REVISION)
+    install_fixture(store, safe)
+    store.set_current(entry.id, safe.revision, previous_revision=entry.revision)
+    remote = scenario.remote()
+    remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    raw = json.dumps(remote).encode()
+    monkeypatch.setattr(catalog_updates, "fetch", lambda *_args, **_kwargs: (raw, signature(raw)))
+    source = catalog_updates.CatalogUpdateSource(
+        service._downloader._http,
+        baseline=original_catalog,
+        catalog_url="https://models.example.ru/catalog.json",
+        verifier=scenario.verifier,
+        schema_root=scenario.root,
+        state_dir=scenario.snapshots,
+        global_state_path=scenario.state,
+    )
+    source.refresh(threading.Event())
+    assert source.current().is_revoked(entry.id, entry.revision)
+    assert service.catalog is original_catalog
+    assert not service.catalog.is_revoked(entry.id, entry.revision)
+    if not marker_has_revocation:
+        # Сохранённый подписанный снимок сам запрещает X: GUI и локальный
+        # необязательный список revoked в отметке не заменяют его проверку.
+        marker = catalog_state.read_state(scenario.state)
+        assert marker is not None
+        catalog_state.write_state(scenario.state, replace(marker, revoked=()))
+    before = (store.root / "current.json").read_bytes()
+
+    if operation in {"update", "revert"}:
+        updater = service.revision_updater(on_state=lambda *_args: None)
+
+        # Локальная staging-загрузка; сетевой транспорт и GUI-очередь здесь не нужны.
+        def download(model: CatalogEntry, **_kwargs: Any) -> Path:
+            staging = store.staging_dir(model.id, model.revision)
+            for name, payload in CONTENTS.items():
+                (staging / name).write_bytes(payload)
+            return staging
+
+        monkeypatch.setattr(service._downloader, "download", download)
+        result = (
+            updater.apply(entry.id, cancel=threading.Event())
+            if operation == "update"
+            else updater.revert_previous(entry.id)
+        )
+        assert result.state in {"refused", "update-failed"}
+        assert result.reason_code == "revoked"
+    elif operation == "install":
+        install_result = service.install_from_staging(entry)
+        assert install_result.state == "error" and install_result.reason_code == "revoked"
+    else:
+        with pytest.raises(StoreError) as refused:
+            if operation == "set":
+                service.set_current(entry.id, entry.revision)
+            else:
+                service.restore_current(entry.id, entry.revision, previous_revision=safe.revision)
+        assert refused.value.code == "revoked"
+    assert (store.root / "current.json").read_bytes() == before
+
+
+def test_source_publishes_snapshot_and_watermark_after_activation_finishes(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Принятие source нельзя вклинить между проверкой отзыва и записью current."""
+    from astra_voice.ui.model_downloads import ModelService
+
+    monkeypatch.setattr(paths, "state_dir", lambda: scenario.state.parent)
+    monkeypatch.setattr(paths, "data_dir_static", lambda: scenario.root)
+    monkeypatch.setattr(catalog_effective, "Verifier", lambda *_args, **_kwargs: BoundVerifier())
+    service = ModelService.__new__(ModelService)
+    service._catalog = source.current()
+    service._catalog_error = None
+    service._store = ModelStore(scenario.state.parent / "models")
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry)
+    install_fixture(service._store, replace(entry, revision=NEW_REVISION))
+    marker_before = scenario.state.read_bytes()
+    remote = scenario.remote()
+    remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    raw = json.dumps(remote).encode()
+    fetching, downloaded = threading.Event(), threading.Event()
+    writing, finish_write = threading.Event(), threading.Event()
+    verified, published = threading.Event(), threading.Event()
+    errors: list[Exception] = []
+    original_write = service._store.set_current
+    original_verify = catalog_effective.verify_catalog
+
+    def fetch(*_args: Any, **_kwargs: Any) -> tuple[bytes, bytes]:
+        fetching.set()
+        assert downloaded.wait(5), "Тест не разрешил завершить получение каталога"
+        return raw, signature(raw)
+
+    def verify(*args: Any, **kwargs: Any) -> Catalog:
+        catalog = original_verify(*args, **kwargs)
+        verified.set()
+        return catalog
+
+    def write(model_id: str, revision: str, *, previous_revision: str | None = None) -> None:
+        writing.set()
+        assert finish_write.wait(5), "Тест не разрешил записать current"
+        original_write(model_id, revision, previous_revision=previous_revision)
+
+    def activate() -> None:
+        try:
+            service.set_current(entry.id, entry.revision)
+        except Exception as error:
+            errors.append(error)
+
+    def publish() -> None:
+        try:
+            source.refresh(threading.Event())
+            published.set()
+        except Exception as error:
+            errors.append(error)
+
+    monkeypatch.setattr(catalog_updates, "fetch", fetch)
+    monkeypatch.setattr(catalog_updates, "verify_catalog", verify)
+    monkeypatch.setattr(service._store, "set_current", write)
+    publication = threading.Thread(target=publish)
+    activation = threading.Thread(target=activate)
+    publication.start()
+    try:
+        assert fetching.wait(5), "Source не начал получение каталога"
+        activation.start()
+        assert writing.wait(5), "Активация не дошла до записи current"
+        downloaded.set()
+        assert verified.wait(5), "Source не проверил полученный каталог"
+        assert not published.wait(0.2), "Source опубликовал отзыв посреди активации"
+        assert scenario.state.read_bytes() == marker_before
+        assert not (scenario.snapshots / "catalog-snapshot.json").exists()
+    finally:
+        downloaded.set()
+        finish_write.set()
+        publication.join(5)
+        if activation.ident is not None:
+            activation.join(5)
+    assert not publication.is_alive() and not activation.is_alive()
+    assert errors == []
+    assert published.is_set()
+    assert source.current().is_revoked(entry.id, entry.revision)
+    assert scenario.state.read_bytes() != marker_before
+    assert (scenario.snapshots / "catalog-snapshot.json").is_file()
+    before = (service._store.root / "current.json").read_bytes()
+    with pytest.raises(StoreError) as refused:
+        service.set_current(entry.id, entry.revision)
+    assert refused.value.code == "revoked"
+    assert (service._store.root / "current.json").read_bytes() == before

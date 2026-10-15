@@ -59,7 +59,30 @@ def _pair(raw: bytes) -> tuple[int, int]:
     return epoch, serial
 
 
-def check(root: Path, *, dist: Path | None = None, previous_tag: str | None = None) -> None:
+def _revocations(raw: bytes) -> set[str]:
+    # Старый каталог разбираем без новой схемы: смена схемы не снимает отзывы.
+    document = json.loads(raw)
+    revoked = document.get("revoked")
+    if not isinstance(revoked, list):
+        raise PublishError("В каталоге прошлого тега неверный список revoked.")
+    pairs: set[str] = set()
+    for item in revoked:
+        if not isinstance(item, dict) or any(
+            not isinstance(item.get(key), str) or not item[key] or "@" in item[key]
+            for key in ("model_id", "revision")
+        ):
+            raise PublishError("В каталоге прошлого тега неверная пара revoked.")
+        pairs.add(f"{item['model_id']}@{item['revision']}")
+    return pairs
+
+
+def check(
+    root: Path,
+    *,
+    dist: Path | None = None,
+    previous_tag: str | None = None,
+    allow_unrevoke: tuple[str, ...] = (),
+) -> None:
     repository = os.environ.get("GITHUB_REPOSITORY")
     if repository is not None and repository != RELEASES_REPO:
         raise PublishError(
@@ -92,6 +115,14 @@ def check(root: Path, *, dist: Path | None = None, previous_tag: str | None = No
                 f"{hashlib.sha256(raw).hexdigest()} != {hashlib.sha256(previous).hexdigest()}."
             )
         raise PublishError(f"Откат каталога: пара {pair} не больше {old_pair} (тег {tag}).")
+    removed = _revocations(previous) - {
+        f"{entry.model_id}@{entry.revision}" for entry in catalog.revoked
+    }
+    forbidden = removed - set(allow_unrevoke)
+    if forbidden:
+        raise PublishError("; ".join(f"потеря отзыва: {entry}" for entry in sorted(forbidden)))
+    for entry in sorted(removed):
+        print(f"Явно разрешено снятие отзыва: {entry} (--allow-unrevoke).")
     print(f"Гейт каталога пройден: {name}; прошлый тег {tag}, {old_pair} → {pair}.")
 
 
@@ -99,9 +130,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist", type=Path, help="каталог ассетов выпуска")
     parser.add_argument("--previous-tag", help="тег сравнения (первый выпуск с гейтом: v0.1.6)")
+    parser.add_argument(
+        "--allow-unrevoke",
+        action="append",
+        default=[],
+        metavar="ID@REV",
+        help="явно разрешить снятие конкретного отзыва (можно повторять; только ручной выпуск)",
+    )
     args = parser.parse_args(argv)
     try:
-        check(ROOT, dist=args.dist, previous_tag=args.previous_tag)
+        check(
+            ROOT,
+            dist=args.dist,
+            previous_tag=args.previous_tag,
+            allow_unrevoke=tuple(args.allow_unrevoke),
+        )
     except (PublishError, CatalogError, OSError, subprocess.SubprocessError) as exc:
         print(f"ОШИБКА: {exc}", file=sys.stderr)
         return 1

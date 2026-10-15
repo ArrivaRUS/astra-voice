@@ -20,9 +20,15 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 from astra_voice.models.catalog import ID_RE, Catalog, CatalogEntry, CatalogError
+from astra_voice.models.catalog_effective import (
+    CATALOG_LOCK,
+    ModelActivator,
+    activate_revision,
+    check_revoked,
+)
 from astra_voice.models.downloader import DownloadError, Progress
 from astra_voice.models.installer import Installer
-from astra_voice.models.store import ModelStore
+from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net import hf
 from astra_voice.net.http import MODEL_CHECK_JITTER_MAX_S, HttpClient, NetworkError
 from astra_voice.net.update_cache import UpdateCache, read_private, write_private
@@ -108,21 +114,38 @@ class ModelRevisionUpdater:
         catalog: Catalog | Callable[[], Catalog],
         *,
         on_state: Callable[[str, str], None] | None = None,
+        activate: ModelActivator | None = None,
     ) -> None:
         self._store = store
         self._downloader = downloader
         self._installer = installer
         self._catalog = catalog
         self._on_state = on_state
+        self._activate = activate if activate is not None else self._activate_default
         self._lock = threading.Lock()
 
     def _current_catalog(self) -> Catalog:
         return self._catalog() if callable(self._catalog) else self._catalog
 
+    def _activate_default(
+        self, model_id: str, revision: str, *, previous_revision: str | None = None
+    ) -> None:
+        activate_revision(
+            self._store,
+            self._current_catalog,
+            model_id,
+            revision,
+            previous_revision=previous_revision,
+        )
+
+    def _check_revoked(self, model_id: str, revision: str) -> None:
+        with CATALOG_LOCK:
+            check_revoked(model_id, revision, self._current_catalog())
+
     def _restore_current(self, model_id: str, revision: str, previous_revision: str | None) -> None:
         # set_current может отказать на fsync каталога уже после os.replace.
         try:
-            self._store.set_current(model_id, revision, previous_revision=previous_revision)
+            self._activate(model_id, revision, previous_revision=previous_revision)
         except Exception:  # noqa: BLE001 — не скрываем первоначальный отказ активации
             log.warning("models state=current-restore-failed")
 
@@ -158,7 +181,12 @@ class ModelRevisionUpdater:
 
     def apply(self, model_id: str, *, cancel: threading.Event) -> RevisionUpdateResult:
         with self._lock:
-            return self._apply(model_id, cancel=cancel)
+            try:
+                return self._apply(model_id, cancel=cancel)
+            except CatalogError:
+                return self._failed(model_id, "catalog-unavailable")
+            except StoreError as error:
+                return self._failed(model_id, error.code)
 
     def _apply(self, model_id: str, *, cancel: threading.Event) -> RevisionUpdateResult:
         catalog = self._current_catalog()
@@ -172,8 +200,12 @@ class ModelRevisionUpdater:
             or current.id != model_id
         ):
             return self._result("refused", model_id, "not-installed")
-        if catalog.is_revoked(model_id, entry.revision):
-            return self._result("refused", model_id, "revoked")
+        try:
+            self._check_revoked(model_id, entry.revision)
+        except StoreError as error:
+            if error.code == "revoked":
+                return self._result("refused", model_id, "revoked")
+            raise
         if current.revision == entry.revision:
             return self._result("refused", model_id, "no-update")
         if cancel.is_set():
@@ -220,17 +252,22 @@ class ModelRevisionUpdater:
                 "selfcheck": "selfcheck",
                 "cancelled": "cancelled",
                 "revoked": "revoked",
+                "catalog-unavailable": "catalog-unavailable",
             }.get(result.reason_code, "download")
             return self._failed(model_id, reason)
         if cancel.is_set():
             return self._failed(model_id, "cancelled")
         self._state(model_id, "activating")
         try:
-            if self._current_catalog().is_revoked(model_id, entry.revision):
-                return self._failed(model_id, "revoked")
-            self._store.set_current(model_id, entry.revision, previous_revision=current.revision)
-        except Exception:  # noqa: BLE001 — восстанавливаем и при отказе после записи
+            self._activate(model_id, entry.revision, previous_revision=current.revision)
+        except Exception as error:  # noqa: BLE001 — восстанавливаем и при отказе после записи
             log.warning("models state=activation-failed")
+            if isinstance(error, CatalogError):
+                return self._failed(model_id, "catalog-unavailable")
+            if isinstance(error, StoreError) and error.code in {"revoked", "catalog-unavailable"}:
+                # Барьер отказал до записи: даже перезапись прежнего указателя
+                # здесь нарушила бы обещание оставить его побайтно неизменным.
+                return self._failed(model_id, error.code)
             self._restore_current(model_id, current.revision, previous_revision)
             return self._failed(model_id, "activation")
         return self._result("updated", model_id)
@@ -262,19 +299,33 @@ class ModelRevisionUpdater:
                     or not previous.variant
                 ):
                     return self._result("refused", model_id, "no-previous")
-                if self._current_catalog().is_revoked(model_id, revision):
-                    return self._result("refused", model_id, "revoked")
+                self._check_revoked(model_id, revision)
                 self._state(model_id, "activating")
-                if self._current_catalog().is_revoked(model_id, revision):
-                    return self._result("refused", model_id, "revoked")
                 try:
-                    self._store.set_current(model_id, revision)
-                except Exception:
-                    self._restore_current(model_id, current.revision, revision)
+                    self._activate(model_id, revision)
+                except Exception as error:
+                    if not isinstance(error, CatalogError) and not (
+                        isinstance(error, StoreError)
+                        and error.code in {"revoked", "catalog-unavailable"}
+                    ):
+                        self._restore_current(model_id, current.revision, revision)
                     raise
+            except StoreError as error:
+                if error.code == "revoked":
+                    return self._result("refused", model_id, "revoked")
+                reason = "catalog-unavailable" if error.code == "catalog-unavailable" else "revert"
+                return self._failed(model_id, reason, failure_message=REVERT_FAILED_MESSAGE)
+            except CatalogError:
+                return self._failed(
+                    model_id, "catalog-unavailable", failure_message=REVERT_FAILED_MESSAGE
+                )
             except Exception:  # noqa: BLE001 — отказ хранилища не выдаётся за успешный возврат
                 return self._failed(model_id, "revert", failure_message=REVERT_FAILED_MESSAGE)
             return self._result("updated", model_id)
+
+
+class CatalogRefresh(Protocol):
+    def __call__(self, cancel: threading.Event, *, manual: bool = False) -> None: ...
 
 
 class ModelUpdateChecker:
@@ -298,7 +349,7 @@ class ModelUpdateChecker:
         jitter_max_s: float = MODEL_CHECK_JITTER_MAX_S,
         wait: Callable[[float], bool] | None = None,
         notify: Callable[[ModelUpdateNotice], None] | None = None,
-        refresh_catalog: Callable[[threading.Event], None] | None = None,
+        refresh_catalog: CatalogRefresh | None = None,
     ) -> None:
         if not math.isfinite(jitter_max_s) or jitter_max_s < 0:
             raise ValueError("Неверная задержка проверки")
@@ -378,7 +429,7 @@ class ModelUpdateChecker:
             if self._client.gate.refusal("check_models"):
                 return ModelCheckSummary("disabled")
             try:
-                self._refresh_catalog(cancel)
+                self._refresh_catalog(cancel, manual=manual)
             except NetworkError as error:
                 if error.code == "no-network":
                     return ModelCheckSummary("disabled")

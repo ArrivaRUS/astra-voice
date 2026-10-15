@@ -11,6 +11,8 @@ RELEASES_REPO = "ArrivaRUS/astra-voice"
 
 def schema_id(schema_bytes: bytes) -> str:
     """Идентификатор точных байтов схемы для имени ассета каталога."""
+    # Публичный контракт имени ассета: смена формата даёт 404 старым клиентам
+    # и лишает их новых отзывов (MN-5); сохраняйте совместимые ассеты.
     return hashlib.sha256(schema_bytes).hexdigest()[:16]
 
 

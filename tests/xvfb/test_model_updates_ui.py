@@ -478,6 +478,7 @@ def test_catalog_unavailable_explains_recovery_and_manual_check_uses_model_gate(
         instruction = "Включите проверку обновлений моделей или переустановите программу"
         texts = visible_texts(live.root)
         assert message in texts
+        assert "Список моделей недоступен. Модель можно поставить из файла или папки." not in texts
         assert (instruction in texts) is (not models_allowed)
         assert live.bridge.catalogUnavailable is True
         assert live.bridge.models == []

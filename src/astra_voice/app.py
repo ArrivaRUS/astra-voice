@@ -39,6 +39,7 @@ from astra_voice.core.paths import (
 )
 from astra_voice.core.version import __version__
 from astra_voice.models import catalog_state
+from astra_voice.models.catalog_effective import CATALOG_LOCK
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.sound import MicrophoneState
@@ -224,21 +225,36 @@ def _finish_running_copy(
 
 def _revoked_check(model: Any | None) -> Callable[[str, str], bool]:
     """Проверяет каталог, а при его отказе — снимок последнего принятого."""
-    try:
-        state = catalog_state.read_state(catalog_state.state_path(paths.state_dir()))
-    except (OSError, paths.PathError):
-        state = None
-    snapshot = None if state is None else state.revoked
 
     def check(model_id: str, revision: str) -> bool:
-        if model is not None:
+        with CATALOG_LOCK:
+            catalog_revoked = None
+            if model is not None:
+                try:
+                    catalog_revoked = bool(model.revoked_revision(model_id, revision))
+                except StoreError as error:
+                    if error.code == "catalog-unavailable":
+                        raise RevocationUnknown from error
+                except Exception:
+                    pass
             try:
-                return bool(model.revoked_revision(model_id, revision))
-            except Exception:
-                pass
-        if snapshot is None:
+                path = catalog_state.state_path(paths.state_dir())
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    exists = False
+                else:
+                    exists = True
+                state = catalog_state.read_state(path)
+            except (OSError, paths.PathError) as error:
+                raise RevocationUnknown from error
+            if exists and state is None:
+                raise RevocationUnknown
+            if state is not None and state.revoked is not None:
+                return bool(catalog_revoked or (model_id, revision) in state.revoked)
+            if catalog_revoked is not None:
+                return catalog_revoked
             raise RevocationUnknown
-        return (model_id, revision) in snapshot
 
     return check
 

@@ -312,6 +312,7 @@ Item {
             Text {
                 id: emptyNote
                 width: parent.width
+                visible: !root.catalogUnavailable
                 textFormat: Text.PlainText
                 text: qsTr("Список моделей недоступен. Модель можно поставить из файла или папки.")
                 color: Theme.fgMuted

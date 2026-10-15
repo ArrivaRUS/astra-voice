@@ -34,10 +34,11 @@ from astra_voice.core.dictation import (
     MicrophoneLevelUpdate,
     MicrophoneTestUpdate,
 )
-from astra_voice.core.model_source import resolve_model_request
+from astra_voice.core.model_source import RevocationUnknown, resolve_model_request
 from astra_voice.core.settings import Settings, from_dict
+from astra_voice.models import catalog_state
 from astra_voice.models import store as store_module
-from astra_voice.models.catalog import CatalogEntry, FileSpec
+from astra_voice.models.catalog import Catalog, CatalogEntry, CatalogError, FileSpec, RevokedEntry
 from astra_voice.models.installer import Installer, SmokeResult
 from astra_voice.models.store import ModelRecord, ModelState, ModelStore
 from astra_voice.platform import cowork as cowork_module
@@ -61,6 +62,7 @@ from astra_voice.platform.sound import MicrophoneState, SoundControl
 from astra_voice.runtime import DictationRuntime
 from astra_voice.ui import notify
 from astra_voice.ui.bridges import OnboardingController, SettingsBridge
+from astra_voice.ui.model_downloads import ModelDownloads, ModelService
 from astra_voice.ui.pill import (
     ERROR_MODEL_LOAD_FAILED,
     ERROR_MODEL_NOT_LOADED,
@@ -5555,3 +5557,225 @@ def test_rig_can_change_installation_between_instances(monkeypatch: pytest.Monke
         rig = Rig(monkeypatch, session_kind=SessionKind.KDE, cowork_installed=installed)
         assert rig.runtime.command_installed is installed
         rig.runtime.shutdown()
+
+
+def revision_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Rig, ModelService, ModelDownloads, CatalogEntry]:
+    """Настоящие current.json, служба и компенсация GUI; воркеры — порт Rig."""
+    from astra_voice.ui import model_downloads
+
+    store = ModelStore(tmp_path / "models")
+    entry = CatalogEntry(
+        id="gigaam",
+        revision="r1",
+        name="GigaAM",
+        description="",
+        size_bytes=0,
+        min_ram_mb=500,
+        layout="onnx-asr-gigaam-v3",
+        variant="gigaam",
+        recommended=True,
+        host="huggingface.co",
+        files=(),
+    )
+    for revision in ("r0", "r1"):
+        staging = store.staging_dir(entry.id, revision)
+        (staging / "state.json").write_text(
+            json.dumps(
+                {
+                    "layout": entry.layout,
+                    "variant": entry.variant,
+                    "size_bytes": 0,
+                }
+            )
+        )
+        store.commit(entry.id, revision)
+    store.set_current(entry.id, "r0")
+    rig = Rig(monkeypatch, model_store=store)
+    (tmp_path / "state").mkdir()
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(model_downloads, "ModelStore", lambda: store)
+    monkeypatch.setattr(
+        model_downloads,
+        "load_effective",
+        lambda *args, **kwargs: Catalog(
+            serial=1,
+            trust_epoch=1,
+            entries=(entry,),
+            revoked=(),
+        ),
+    )
+    service = ModelService(rig.runtime.settings, policy_module.Policy())
+    from astra_voice.app import _revoked_check
+
+    rig.runtime.set_revoked_check(_revoked_check(service))
+    monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
+    downloads = ModelDownloads(
+        service,
+        store=store,
+        settings=rig.runtime.settings,
+        switcher=rig.runtime,
+        revocation_unknown=lambda: rig.runtime.revocation_unknown,
+    )
+    rig.runtime.on_revocation_unknown = downloads.revocation_unknown_changed
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.event(type="model.loaded", id=entry.id)
+    rig.event(type="result", utterance_id="file", text="проверка связи")
+    assert rig.runtime._selfcheck == "ok"
+    return rig, service, downloads, entry
+
+
+@pytest.mark.parametrize("pause", [False, True])
+@pytest.mark.parametrize("gui_delayed", [False, True])
+def test_revoked_candidate_restores_current_before_promotion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pause: bool, gui_delayed: bool
+) -> None:
+    rig, service, downloads, entry = revision_runtime(monkeypatch, tmp_path)
+    old = rig.supervisor
+    assert rig.runtime.supervisor is old
+    before = (service._store.root / "current.json").read_bytes()
+    candidate = Mock(state="running", generation=0)
+    rig.supervisor_factory.return_value = candidate
+    try:
+        service.activate(entry.id, entry.revision, previous_revision="r0")
+        downloads._start_switch(
+            entry,
+            entry.revision,
+            pause=pause,
+            already_current=True,
+            previous_current=(entry.id, "r0"),
+            previous_revision=None,
+        )
+        event = rig.supervisor_factory.call_args.kwargs["on_event"]
+        event({"type": "hello", "generation": candidate.generation})
+        assert candidate.send.call_args.args[0]["revision"] == "r1"
+        revoked = Catalog(
+            serial=2,
+            trust_epoch=1,
+            entries=(entry,),
+            revoked=(RevokedEntry(entry.id, "r1", "test"),),
+        )
+        if gui_delayed:
+            # Публикация отзыва завершилась; очередь accept_catalog ещё не доставлена.
+            catalog_state.apply_state(
+                catalog_state.state_path(paths.state_dir()),
+                catalog_state.CatalogState(1, 2, "a" * 64, ((entry.id, "r1"),)),
+            )
+            assert not service.catalog.is_revoked(entry.id, "r1")
+        else:
+            downloads.accept_catalog(revoked, frozenset())
+        restored = Mock(state="running", generation=0)
+        rig.supervisor_factory.return_value = restored
+        event({"type": "model.loaded", "generation": candidate.generation, "id": entry.id})
+        assert not rig.runtime._switch_active()
+        assert (service._store.root / "current.json").read_bytes() == before
+        candidate.stop.assert_called_once_with()
+        if pause:
+            assert rig.runtime.supervisor is restored
+            restored_event = rig.supervisor_factory.call_args.kwargs["on_event"]
+            restored_event({"type": "hello", "generation": restored.generation})
+            assert restored.send.call_args.args[0]["revision"] == "r0"
+        else:
+            assert rig.runtime.supervisor is old
+            old.stop.assert_not_called()
+            assert rig.runtime._selfcheck == "ok"
+            assert not rig.runtime._loading_model
+        assert not any(
+            call.args[0]["type"] == "transcribe.file" for call in candidate.send.call_args_list
+        )
+    finally:
+        downloads.shutdown()
+        rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_switch_checks_revocation_again_after_selfcheck(
+    monkeypatch: pytest.MonkeyPatch, pause: bool
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=pause)
+    runtime = bench.rig.runtime
+    revoked: set[tuple[str, str]] = set()
+    runtime.set_revoked_check(lambda model_id, revision: (model_id, revision) in revoked)
+    try:
+        bench.switch()
+        candidate = bench.load_new_model()
+        revoked.add(("whisper", "r1"))
+        bench.emit(candidate, type="result", utterance_id="file", text="проверка связи")
+        restored = bench.assert_rolled_back(candidate)
+        bench.finish_restore(restored)
+    finally:
+        runtime.shutdown()
+
+
+def test_catalog_recovery_clears_runtime_revocation_warning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig, service, downloads, entry = revision_runtime(monkeypatch, tmp_path)
+    try:
+        service._catalog_error = CatalogError("state-invalid", "test")
+        service._catalog = Catalog(serial=0, trust_epoch=0, entries=(), revoked=())
+        rig.runtime._mark_revocation_unknown()
+        assert rig.runtime.revocation_unknown
+        assert downloads.revocationUnknown
+        notifications: list[bool] = []
+        downloads.revocationUnknownChanged.connect(
+            lambda: notifications.append(downloads.revocationUnknown)
+        )
+        downloads.accept_catalog(
+            Catalog(serial=2, trust_epoch=1, entries=(entry,), revoked=()),
+            frozenset(),
+        )
+        assert not service.catalog_unavailable
+        assert not rig.runtime.revocation_unknown
+        assert not downloads.revocationUnknown
+        assert notifications == [False]
+        assert rig.runtime._command_model_trusted(
+            capture=(rig.runtime.supervisor.generation, rig.runtime._model_load_request)
+        )
+    finally:
+        downloads.shutdown()
+        rig.runtime.shutdown()
+
+
+def test_unknown_revocation_refuses_candidate_and_preserves_working_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    try:
+        runtime.set_revoked_check(lambda _id, _rev: False)
+        bench.switch()
+        candidate = bench.workers[-1]
+        bench.emit(candidate, type="hello")
+        runtime.set_revoked_check(Mock(side_effect=RevocationUnknown))
+        bench.emit(candidate, type="model.loaded", id="whisper")
+        assert runtime.supervisor is bench.old
+        bench.old.stop.assert_not_called()
+        candidate.stop.assert_called_once_with()
+        bench.finished.assert_called_once_with("failed")
+        assert bench.current == "gigaam"
+        assert runtime.revocation_unknown
+        assert runtime._selfcheck == "ok"
+    finally:
+        runtime.shutdown()
+
+
+def test_revocation_fallback_reads_new_state_and_rejects_corruption(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from astra_voice.app import _revoked_check
+
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    state_path = catalog_state.state_path(tmp_path)
+    catalog_state.write_state(state_path, catalog_state.CatalogState(1, 1, "a" * 64, ()))
+    checker = _revoked_check(None)
+    assert not checker("model", "r1")
+    catalog_state.write_state(
+        state_path, catalog_state.CatalogState(1, 2, "b" * 64, (("model", "r1"),))
+    )
+    assert checker("model", "r1")
+    state_path.write_text("invalid state")
+    with pytest.raises(RevocationUnknown):
+        checker("model", "r1")

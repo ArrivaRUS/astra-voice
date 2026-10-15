@@ -43,6 +43,7 @@ from astra_voice.core.model_source import (
 from astra_voice.core.recording_cues import RecordingCues
 from astra_voice.core.settings import Settings, is_valid_combo, is_valid_command_mouse_button
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
+from astra_voice.models.catalog_effective import CATALOG_LOCK
 from astra_voice.platform.cowork import (
     CoworkClient,
     is_installed,
@@ -1537,6 +1538,13 @@ class DictationRuntime(QObject):
             if self.on_revocation_unknown is not None:
                 self.on_revocation_unknown()
 
+    def catalog_restored(self) -> None:
+        """Снимает предупреждение после принятия проверенного каталога в GUI."""
+        if self.revocation_unknown:
+            self.revocation_unknown = False
+            if self.on_revocation_unknown is not None:
+                self.on_revocation_unknown()
+
     def _resolve_model_request(self) -> dict[str, Any] | None:
         """Запрос загрузки с учётом отзыва; ModelRevoked пробрасывается выше."""
         return resolve_model_request(
@@ -1858,12 +1866,40 @@ class DictationRuntime(QObject):
             # Ошибка загрузки может относиться к поколению до автоматического рестарта.
             self._fail_candidate()
 
+    def _switch_revision_allowed(self, request: dict[str, Any]) -> bool:
+        """Повторная проверка после загрузки: отзыв мог прийти во время ожидания."""
+        if self._revoked_check is None:
+            return True
+        try:
+            revoked = self._revoked_check(str(request["id"]), str(request["revision"]))
+        except Exception:
+            self._mark_revocation_unknown()
+            log.warning("Переключение модели отменено: список отзывов недоступен")
+            return False
+        if revoked:
+            log.warning("Переключение модели отменено: версия отозвана издателем")
+        return not revoked
+
+    def _reject_switch_revision(self) -> None:
+        previous_stopped = self._switch_promoted or self._switch_paused
+        if not self._fail_switch() and previous_stopped:
+            self._cleanup("отозванный воркер", self.supervisor.stop)
+            self._show_load_failed()
+
     def _promote_candidate(self) -> None:
+        # Источник не публикует отзыв между проверкой и сменой рабочего воркера.
+        with CATALOG_LOCK:
+            self._promote_allowed_candidate()
+
+    def _promote_allowed_candidate(self) -> None:
         candidate = self._switch_candidate
         event = self._switch_loaded_event
         if candidate is not None and event is not None and self.phase == DictationPhase.IDLE:
             request = self._switch_request
             assert request is not None
+            if not self._switch_revision_allowed(request):
+                self._reject_switch_revision()
+                return
             old = self.supervisor
             self._switch_candidate = None
             self._switch_request = None
@@ -2162,9 +2198,14 @@ class DictationRuntime(QObject):
             # При load-timeout супервизор уже заменил процесс до доставки ошибки.
             return
         if reason == "ok":
-            self._model_ready()
-            if self._switch_active() and self._switch_candidate is None:
-                self._finish_switch("ok")
+            with CATALOG_LOCK:
+                if self._switch_active() and self._switch_candidate is None:
+                    if not self._switch_revision_allowed(self._model_load_request or {}):
+                        self._reject_switch_revision()
+                        return
+                self._model_ready()
+                if self._switch_active() and self._switch_candidate is None:
+                    self._finish_switch("ok")
         else:
             too_slow = False
             if self._switch_active() and self._switch_candidate is None:
@@ -2294,7 +2335,13 @@ class DictationRuntime(QObject):
                     self._selfcheck in ("idle", "retrying")
                     and event.get("generation") == self.supervisor.generation
                 ):
-                    self._start_selfcheck(event)
+                    with CATALOG_LOCK:
+                        if self._switch_paused and not self._switch_revision_allowed(
+                            self._model_load_request or {}
+                        ):
+                            self._reject_switch_revision()
+                            return
+                        self._start_selfcheck(event)
             elif event.get("type") == "error" and (
                 event.get("request_type") == "model.load"
                 or event.get("response_type") == "model.loaded"

@@ -54,7 +54,12 @@ from astra_voice.models.catalog import (
     merge_measurement,
 )
 from astra_voice.models.catalog import catalog_rtfx as _catalog_rtfx
-from astra_voice.models.catalog_effective import load_effective
+from astra_voice.models.catalog_effective import (
+    CATALOG_LOCK,
+    activate_revision,
+    check_revoked,
+    load_effective,
+)
 from astra_voice.models.downloader import (
     Downloader,
     DownloadError,
@@ -586,6 +591,7 @@ class ModelService:
             self._store,
             make_smoke_check(cancel=lambda: self._cancel.is_set()),
             catalog=lambda: self.catalog,
+            activate=self.activate,
         )
 
     def set_cancel(self, cancel: threading.Event) -> None:
@@ -607,7 +613,12 @@ class ModelService:
     def revision_updater(self, *, on_state: Callable[[str, str], None]) -> ModelRevisionUpdater:
         """Переиспользует загрузчик и установщик службы для явного обновления."""
         return ModelRevisionUpdater(
-            self._store, self._downloader, self._installer, lambda: self.catalog, on_state=on_state
+            self._store,
+            self._downloader,
+            self._installer,
+            lambda: self.catalog,
+            on_state=on_state,
+            activate=self.activate,
         )
 
     def previous_revision(self) -> str | None:
@@ -620,38 +631,50 @@ class ModelService:
             return frozenset()
         return NewModelTracker(
             paths.state_dir() / "model-catalog-updates" / "new-models.json"
-        ).new_ids(self._catalog, time.time())
+        ).new_ids(self.catalog, time.time())
 
     def accept_catalog(self, catalog: Catalog) -> None:
         """GUI принимает только уже проверенный снимок фоновой проверки."""
-        self._catalog = catalog
-        self._catalog_error = None
+        with CATALOG_LOCK:
+            self._catalog = catalog
+            self._catalog_error = None
 
     def recommended(self) -> CatalogEntry | None:
+        if self.catalog_unavailable:
+            return None
+        catalog = self.catalog
         return next(
             (
                 entry
-                for entry in self._catalog.entries
-                if entry.recommended and not self._catalog.is_revoked(entry.id, entry.revision)
+                for entry in catalog.entries
+                if entry.recommended and not catalog.is_revoked(entry.id, entry.revision)
             ),
             None,
         )
 
     def is_revoked(self, entry: Any) -> bool:
         """Издатель отозвал именно эту ревизию модели."""
-        return self._catalog.is_revoked(entry.id, entry.revision)
+        return self.revoked_revision(entry.id, entry.revision)
 
     def revoked_revision(self, model_id: str, revision: str) -> bool:
         """То же по паре «модель, ревизия» — для проверки перед загрузкой моделью."""
-        return self.catalog.is_revoked(model_id, revision)
+        with CATALOG_LOCK:
+            try:
+                check_revoked(model_id, revision, self.catalog)
+            except StoreError as error:
+                if error.code == "revoked":
+                    return True
+                raise
+            return False
 
     def catalog_rtfx(self, model_id: str) -> float | None:
         """Опубликованная скорость модели (RTFx) или None, если её нет в каталоге."""
-        return _catalog_rtfx(self._catalog.entries, model_id)
+        return _catalog_rtfx(self.catalog.entries, model_id)
 
     def entries(self) -> tuple[CatalogEntry, ...]:
         if self.catalog_unavailable:
             return ()
+        catalog = self.catalog
         # Отозванную ревизию не предлагаем, но уже установленную показываем:
         # иначе человек не увидит, почему модель перестала работать.
         try:
@@ -662,14 +685,12 @@ class ModelService:
         installed = {(record.id, record.revision) for record in records}
         entries = tuple(
             entry
-            for entry in self._catalog.entries
-            if not self._catalog.is_revoked(entry.id, entry.revision)
+            for entry in catalog.entries
+            if not catalog.is_revoked(entry.id, entry.revision)
             or (entry.id, entry.revision) in installed
         )
-        catalog_ids = {entry.id for entry in self._catalog.entries}
-        conservative_ram_mb = max(
-            (entry.min_ram_mb for entry in self._catalog.entries), default=768
-        )
+        catalog_ids = {entry.id for entry in catalog.entries}
+        conservative_ram_mb = max((entry.min_ram_mb for entry in catalog.entries), default=768)
         try:
             current = self._store.current()
         except (OSError, StoreError):
@@ -682,7 +703,7 @@ class ModelService:
                 if (
                     not record.state
                     or record.id in catalog_ids
-                    or self._catalog.is_revoked(record.id, record.revision)
+                    or catalog.is_revoked(record.id, record.revision)
                 ):
                     continue
                 previous = chosen.get(record.id)
@@ -781,17 +802,25 @@ class ModelService:
         return tuple((record.id, record.revision) for record in self._store.records())
 
     def set_current(self, model_id: str, revision: str) -> None:
-        if self._catalog.is_revoked(model_id, revision):
-            raise StoreError("revoked", _REVOKED_MESSAGE)
-        self._store.set_current(model_id, revision)
+        self.activate(model_id, revision)
+
+    def activate(
+        self, model_id: str, revision: str, *, previous_revision: str | None = None
+    ) -> None:
+        """Проверка всех источников отзывов и запись current — одна операция."""
+        activate_revision(
+            self._store,
+            lambda: self.catalog,
+            model_id,
+            revision,
+            previous_revision=previous_revision,
+        )
 
     def restore_current(
         self, model_id: str, revision: str, *, previous_revision: str | None
     ) -> None:
         """Компенсирует отказ живого переключения вместе с указателем возврата."""
-        if self._catalog.is_revoked(model_id, revision):
-            raise StoreError("revoked", _REVOKED_MESSAGE)
-        self._store.set_current(model_id, revision, previous_revision=previous_revision)
+        self.activate(model_id, revision, previous_revision=previous_revision)
 
     def remove(self, model_id: str, revision: str) -> None:
         self._store.remove(model_id, revision)
@@ -799,12 +828,15 @@ class ModelService:
     def installed_ok(self) -> bool:
         if self.catalog_unavailable:
             return False
-        return any(
-            record.state == "ok"
-            and record.recheck is not True
-            and not self._catalog.is_revoked(record.id, record.revision)
-            for record in self._store.records()
-        )
+        try:
+            return any(
+                record.state == "ok"
+                and record.recheck is not True
+                and not self.revoked_revision(record.id, record.revision)
+                for record in self._store.records()
+            )
+        except (CatalogError, StoreError):
+            return False
 
     def broken(self) -> bool:
         return any(record.state == "broken" for record in self._store.records())
@@ -2265,6 +2297,9 @@ class ModelDownloads(QObject):
             return
         recovering = self.catalogUnavailable
         accept(catalog)
+        restored = getattr(self._switcher, "catalog_restored", None)
+        if callable(restored):
+            restored()
         if not self._idle():
             self._pending_catalog = (catalog, new_ids)
             self._pending_catalog_recovering |= recovering
