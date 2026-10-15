@@ -519,6 +519,22 @@ def test_gate_open_for_enabled_toggle() -> None:
     assert NetworkGate(Settings(check_model_updates=True), Policy()).refusal("check_models") == ""
 
 
+def test_admin_updates_policy_allows_model_checks() -> None:
+    """Администратор устанавливает программу, но проверки моделей остаются разрешены."""
+    policy = Policy(values={"updates": "admin"}, status=PolicyStatus.OK)
+    assert NetworkGate(Settings(check_model_updates=True), policy).refusal("check_models") == ""
+
+
+def test_admin_updates_policy_allows_hf_request(
+    hf: ModuleType, server: FaultServer, tmp_path: Path
+) -> None:
+    policy = Policy(values={"updates": "admin"}, status=PolicyStatus.OK)
+    server.bodies[REFS_PATH] = fixture("gigaam-v3-onnx")
+    result = run_check(hf, server, tmp_path, client=client(policy=policy))
+    assert result.state == "available"
+    assert [path for path, _ in server.requests] == [REFS_PATH]
+
+
 def test_cancel_propagates(hf: ModuleType, server: FaultServer, tmp_path: Path) -> None:
     cancel = threading.Event()
     cancel.set()

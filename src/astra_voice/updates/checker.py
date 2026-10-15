@@ -1,6 +1,6 @@
 """Проверка обновлений программы (M7-ядро v0.2; PRD F9.1–F9.3, У41, T-36).
 
-Только источник «программа» (GitHub `releases/latest`); обновления моделей — v1.0.
+Источники: программа (GitHub `releases/latest`) и активная модель (HF `refs`).
 
 Порядок: при запуске строка сразу получает результат из кэша, свежая проверка
 идёт в фоне не чаще раза в 24 ч, после паузы старта и случайной задержки
@@ -54,6 +54,9 @@ from astra_voice.updates.state import SourceState, StateStore
 if TYPE_CHECKING:
     from astra_voice.core.policy import Policy
     from astra_voice.core.settings import Settings
+    from astra_voice.models.catalog import Catalog
+    from astra_voice.models.store import ModelStore
+    from astra_voice.updates.model_updates import ModelUpdateChecker
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +111,7 @@ class UpdateStatus:
 
 
 class UpdateChecker:
-    """Фоновая проверка обновлений программы с расписанием и кэшем."""
+    """Общий рабочий поток проверок программы и активной модели."""
 
     def __init__(
         self,
@@ -127,6 +130,7 @@ class UpdateChecker:
         clock: Callable[[], float] = time.time,
         rng: random.Random | None = None,
         jitter_max_s: float = APP_CHECK_JITTER_MAX_S,
+        model_checker: ModelUpdateChecker | None = None,
     ) -> None:
         self._gate = gate
         self._client = client
@@ -153,6 +157,7 @@ class UpdateChecker:
         self._clock = clock
         self._rng = rng
         self._jitter_max_s = jitter_max_s
+        self._model_checker = model_checker
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -165,6 +170,7 @@ class UpdateChecker:
         # до следующего refresh() (смены настроек).
         self._manual_view = False
         self._next_due = 0.0
+        self._next_model_due = 0.0
         self._start_delay_s = 0.0
         self._scheduled_enabled = True
 
@@ -196,6 +202,7 @@ class UpdateChecker:
     def _enable_scheduled_checks(self) -> None:
         if not self._scheduled_enabled:
             self._next_due = max(self._next_due, self._clock() + self._start_delay_s)
+            self._next_model_due = max(self._next_model_due, self._clock() + self._start_delay_s)
             self._scheduled_enabled = True
 
     def refresh(self) -> None:
@@ -263,6 +270,7 @@ class UpdateChecker:
         # Часы ушли назад (попытка «в будущем») — такую дату не считаем.
         due = last + CHECK_INTERVAL_S if last is not None and last <= now else now
         self._next_due = max(due, now + self._start_delay_s)
+        self._next_model_due = now + self._start_delay_s
         self._load_metadata()
         self._publish(self._compose())
         while not self._stop.is_set():
@@ -286,6 +294,7 @@ class UpdateChecker:
                 log.warning("Действие со строкой обновлений не выполнено", exc_info=True)
         if manual:
             self._check(manual=True)
+            self._check_models(manual=True)
             return  # срок плановой проверки оценивается следующим кругом
         if (
             self._scheduled_enabled
@@ -298,6 +307,8 @@ class UpdateChecker:
             # публиковал бы тот же результат как фоновый, и строка теряла бы
             # «Установлена последняя версия» раньше 3000 мс.
             self._publish(self._compose(manual=self._manual_view))
+        if self._scheduled_enabled and self._clock() >= self._next_model_due:
+            self._check_models(manual=False)
         self._wake.wait(self._sleep_s())
 
     def _sleep_s(self) -> float:
@@ -306,10 +317,36 @@ class UpdateChecker:
         wake = [IDLE_WAKE_S]
         if self._next_due > now:
             wake.append(self._next_due - now)
+        if self._model_checker is not None and self._next_model_due > now:
+            wake.append(self._next_model_due - now)
         remind = self._store.get(SOURCE).remind_until
         if remind is not None and remind > now:
             wake.append(remind - now)
         return max(0.05, min(wake))
+
+    def _check_models(self, *, manual: bool) -> None:
+        """Модель имеет свой гейт, суточный срок и сохраняемый backend state."""
+        if (
+            self._model_checker is None
+            or self._stop.is_set()
+            or (not manual and not self._scheduled_enabled)
+            or self._gate.refusal("check_models")
+        ):
+            return
+        try:
+            result = self._model_checker.run_once(self._stop, manual=manual)
+        except NetworkError as error:
+            if error.code not in ("cancelled", "no-network"):
+                log.warning("Проверка моделей: reason=%s", error.code)
+            return
+        except Exception:  # noqa: BLE001 — модель не останавливает общий worker
+            log.warning("Проверка моделей: reason=check-failed")
+            self._next_model_due = self._clock() + IDLE_WAKE_S
+            return
+        if self._stop.is_set() or result.state == "disabled":
+            return
+        delay = IDLE_WAKE_S if result.state == "not-due" else CHECK_INTERVAL_S
+        self._next_model_due = max(self._clock() + delay, result.retry_at or 0.0)
 
     def _check(self, *, manual: bool) -> None:
         if not manual and not self._scheduled_enabled:
@@ -624,8 +661,14 @@ class UpdateChecker:
             log.warning("Не удалось записать событие проверки обновлений", exc_info=True)
 
 
-def create_app_checker(settings: Settings, policy: Policy) -> UpdateChecker:
-    """Проверка программы для приложения: общий кэш процесса и CA из политики."""
+def create_app_checker(
+    settings: Settings,
+    policy: Policy,
+    *,
+    model_store: ModelStore | None = None,
+    catalog: Catalog | Callable[[], Catalog] | None = None,
+) -> UpdateChecker:
+    """Проверки приложения: общий кэш, CA политики и живой провайдер каталога."""
     gate = NetworkGate(settings, policy)
     ca_bundle = policy.values.get("ca_bundle")
     client = HttpClient(
@@ -637,4 +680,44 @@ def create_app_checker(settings: Settings, policy: Policy) -> UpdateChecker:
         client, Verifier("release", keyring=paths.data_dir_static() / "keys" / "release.gpg")
     )
     track: Track = "appimage" if paths.install_kind().is_appimage else "deb"
-    return UpdateChecker(gate, client, metadata=metadata, track=track)
+    cache = shared_cache()
+    checker = UpdateChecker(gate, client, cache=cache, metadata=metadata, track=track)
+    if model_store is not None and catalog is not None:
+        from astra_voice.updates.catalog_updates import CatalogUpdateSource
+        from astra_voice.updates.model_updates import ModelUpdateChecker
+
+        model_catalog = catalog
+        refresh_catalog: Callable[[threading.Event], None] | None = None
+
+        def configured_catalog_url() -> str:
+            value = policy.values.get("catalog_url", settings.extra.get("catalog_url", ""))
+            return value if isinstance(value, str) else ""
+
+        configured_url = configured_catalog_url()
+        catalog_state_dir = paths.state_dir() / "model-catalog-updates"
+        if configured_url or catalog_state_dir.exists() or catalog_state_dir.is_symlink():
+            source = CatalogUpdateSource(
+                client,
+                baseline=catalog,
+                catalog_url=configured_catalog_url,
+                verifier=Verifier(
+                    "catalog", keyring=paths.data_dir_static() / "keys" / "release.gpg"
+                ),
+                schema_root=paths.data_dir_static(),
+                state_dir=catalog_state_dir,
+                global_state_path=paths.state_dir() / "catalog-state.json",
+                cache=cache,
+                scope="public",
+            )
+            model_catalog = source.current
+            refresh_catalog = source.refresh
+        checker._model_checker = ModelUpdateChecker(
+            client,
+            store=model_store,
+            catalog=model_catalog,
+            cache=cache,
+            state_path=paths.state_dir() / "model-update-state.json",
+            wait=checker._wake.wait,
+            refresh_catalog=refresh_catalog,
+        )
+    return checker

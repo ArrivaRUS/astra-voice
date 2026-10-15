@@ -50,6 +50,7 @@ from astra_voice.ui.tray import shutdown_bus_threads
 
 if TYPE_CHECKING:
     from astra_voice.core.dictation import LevelCallback, TestCallback
+    from astra_voice.models.catalog import Catalog
     from astra_voice.runtime import DictationRuntime
     from astra_voice.updates.checker import UpdateChecker
     from astra_voice.updates.download import VerifiedDownload
@@ -997,15 +998,20 @@ def _start_update_checker(
     bind: Callable[[UpdateChecker], None] | None = None,
     *,
     scheduled: bool = True,
+    model_store: ModelStore | None = None,
+    catalog: Catalog | Callable[[], Catalog] | None = None,
 ) -> UpdateChecker | None:
-    """Фоновая проверка обновлений программы (M7-ядро).
+    """Фоновые проверки программы и активной модели (M7).
 
     ``bind`` подключает окно до старта потока, чтобы первый снимок не потерялся.
     """
     try:
         from astra_voice.updates.checker import create_app_checker
 
-        checker = create_app_checker(settings, policy)
+        if model_store is not None and catalog is not None:
+            checker = create_app_checker(settings, policy, model_store=model_store, catalog=catalog)
+        else:
+            checker = create_app_checker(settings, policy)
     except Exception:  # noqa: BLE001 — без проверки обновлений приложение работает
         log.warning("Проверка обновлений недоступна", exc_info=True)
         return None
@@ -1808,6 +1814,8 @@ def main(argv: list[str] | None = None) -> int:
             runtime if runtime_ready else None,
             bind_updates,
             scheduled=onboarding is None or onboarding.done or onboarding.step > 1,
+            model_store=model_store,
+            catalog=(lambda: model._catalog) if model is not None else None,
         )
         if not args.hidden:
             focuser.focus_shell()
