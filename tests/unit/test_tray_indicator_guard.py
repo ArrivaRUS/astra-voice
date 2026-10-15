@@ -170,3 +170,61 @@ def test_unconfirmed_fly_tray_forces_disabled_pill_without_stopping_recording(
     g.stopped.assert_not_called()
     g.lost.assert_not_called()
     assert g.pending == []
+
+
+@pytest.mark.parametrize("kind", [SessionKind.FLY, SessionKind.KDE])
+@pytest.mark.parametrize("late_host", [False, True], ids=["host-ready", "late-host"])
+def test_shown_unconfirmed_host_keeps_forced_pill_past_registration_deadline(
+    harness: Harness, guard_harness: GuardHarness, kind: SessionKind, late_host: bool
+) -> None:
+    h, g = harness, guard_harness
+    h.detect.return_value = kind
+    h.bus.registered_items = []
+    h.bus.host_registered = not late_host
+    h.tray.start()
+    if late_host:
+        h.icon.show.assert_not_called()
+        h.clock.advance(5000)
+        h.bus.host_changed(True)
+    assert h.icon.isVisible()
+    h.icon.hide.reset_mock()
+    assert not h.tray.registered
+    h.tray.set_state(TrayState.LISTENING)
+    g.guard.set_recording(True)
+    assert g.pill.forced
+    assert g.pill.visible
+    h.clock.advance(31_000)
+    g.timer.fire()
+    assert h.icon.isVisible()
+    assert not h.tray.registered
+    assert g.pill.forced
+    assert g.pill.visible
+    assert not g.pill.enabled
+    assert g.guard.ok
+    assert g.guard.recording
+    h.icon.hide.assert_not_called()
+    h.banner.assert_not_called()
+    g.stopped.assert_not_called()
+
+    h.bus.item_registered(OWN_ITEM)
+    assert h.tray.registered
+    g.timer.fire()
+    assert not g.pill.forced
+    assert not g.pill.visible
+    h.bus.item_unregistered(OWN_ITEM)
+    assert not h.tray.registered
+    assert not h.tray.visible_for_close
+    g.timer.fire()
+    assert g.pill.forced
+    assert g.pill.visible
+    g.stopped.assert_not_called()
+    g.lost.assert_not_called()
+    h.clock.advance(31_000)
+    g.timer.fire()
+    assert not h.tray.visible_for_close
+    assert not h.icon.isVisible()
+    assert g.pill.forced
+    assert g.pill.visible
+    h.banner.assert_called_once_with()
+    g.stopped.assert_not_called()
+    g.lost.assert_not_called()

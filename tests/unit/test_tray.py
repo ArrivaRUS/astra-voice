@@ -65,6 +65,8 @@ class Bus:
         self.registered_items: object = [OWN_ITEM]
         self.plasma_owner = ":1.42"
         self.auto_reply = True
+        self.pid_auto_reply = False
+        self.process_ids: dict[str, int] = {}
         self.calls: list[PendingCall] = []
         self.matches: list[PendingCall] = []
         self.signals: dict[str, Callable[..., None]] = {}
@@ -89,6 +91,13 @@ class Bus:
             self.matches.append(pending)
             return message.createReply([])
         self.calls.append(pending)
+        if message.member() == "GetConnectionUnixProcessID":
+            name = message.arguments()[0]
+            if name in self.process_ids:
+                return message.createReply([self.process_ids[name]])
+            return message.createErrorReply(
+                "org.freedesktop.DBus.Error.NameHasNoOwner", "нет соединения"
+            )
         if message.member() == "Get":
             property_name = message.arguments()[1]
             assert property_name in (
@@ -122,7 +131,10 @@ class Bus:
             module._post_bus_result(generation, "reply", (payload[0], plain))
             QCoreApplication.sendPostedEvents(module._bus_receiver, module._bus_wake_event_type)
 
-        if operation == "request" and not self.auto_reply:
+        if operation == "request" and (
+            not self.auto_reply
+            or (payload[1].member() == "GetConnectionUnixProcessID" and not self.pid_auto_reply)
+        ):
             self.calls.append(PendingCall(payload[1], deliver, lambda *args: deliver(None)))
         else:
             self.executor.execute(generation, operation, payload)
@@ -970,6 +982,48 @@ def test_kded_survives_two_plasmashell_crashes(harness: Harness) -> None:
         assert harness.icon.show.call_count == restart + 2
     # Владелец plasmashell запрошен ровно один раз, дальше работают сигналы.
     assert sum(c.message.member() == "GetNameOwner" for c in harness.bus.calls) == 1
+
+
+@pytest.mark.parametrize("foreign_signal", ["registered", "unregistered"])
+def test_only_plasma_return_resumes_expired_kde_polling(
+    harness: Harness, foreign_signal: str
+) -> None:
+    harness.detect.return_value = SessionKind.KDE
+    harness.bus.plasma_owner = ""
+    harness.bus.host_registered = False
+    foreign_item = "org.kde.StatusNotifierItem-999999-1/StatusNotifierItem"
+    if foreign_signal == "unregistered":
+        harness.bus.registered_items = [OWN_ITEM, foreign_item]
+    harness.tray.start()
+    harness.clock.advance(31_000)
+    harness.banner.assert_called_once_with()
+    assert not harness.tray.registered
+    requests = len(harness.bus.calls)
+    timers = len(harness.clock.timers)
+    assert all(timer.due is None for timer in harness.clock.timers)
+
+    if foreign_signal == "registered":
+        harness.bus.item_registered(foreign_item)
+    else:
+        harness.bus.item_unregistered(foreign_item)
+    assert len(harness.bus.calls) == requests
+    assert len(harness.clock.timers) == timers
+    assert all(timer.due is None for timer in harness.clock.timers)
+    harness.clock.advance(60_000)
+    assert not harness.tray.registered
+    assert len(harness.bus.calls) == requests
+    assert all(timer.due is None for timer in harness.clock.timers)
+
+    harness.watcher.serviceOwnerChanged.emit(PLASMA, "", ":1.43")
+    assert len(harness.bus.calls) > requests
+    assert any(timer.due is not None for timer in harness.clock.timers)
+    assert not harness.tray.registered
+    # Host восстановился без сигнала: его обнаружит возобновлённый опрос.
+    harness.bus.host_registered = True
+    harness.clock.advance(1000)
+    assert harness.tray.registered
+    harness.icon.show.assert_called_once_with()
+    harness.banner.assert_called_once_with()
 
 
 @pytest.mark.parametrize("value", [False, None, 1, "true", [], {}])
@@ -1892,6 +1946,8 @@ def test_bus_signal_recovers_after_deadline_without_background_polling(
         harness.bus.host_registered = False
     else:
         harness.bus.registered_items = []
+        # Этот случай проверяет настоящий отказ показа, а не отсутствие SNI proof.
+        harness.icon.show.side_effect = None
     harness.tray.start()
     harness.clock.advance(31_000)
     harness.banner.assert_called_once_with()
@@ -1906,6 +1962,9 @@ def test_bus_signal_recovers_after_deadline_without_background_polling(
     if missing == "host":
         harness.bus.host_changed(True)
     else:
+        harness.icon.show.side_effect = lambda: setattr(
+            harness.icon.isVisible, "return_value", True
+        )
         harness.bus.item_registered(OWN_ITEM)
         harness.clock.advance(1000)
     assert harness.tray.registered

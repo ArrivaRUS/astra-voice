@@ -58,3 +58,50 @@ def test_show_command_is_served_by_server_slots(
 def test_show_server_connects_no_lambdas() -> None:
     source = inspect.getsource(app_mod.ShowServer)
     assert ".connect(lambda" not in source
+
+
+@pytest.mark.parametrize("payload", [b"show\n", b"show 123\n"])
+def test_menu_show_command_reopens_hidden_window_without_starting_another_gui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: bytes
+) -> None:
+    from PyQt5 import QtCore, QtNetwork
+
+    get_qapplication()
+    path = tmp_path / "ipc"
+    monkeypatch.setattr(app_mod, "ipc_socket_path", lambda: path)
+    listener = Mock()
+    listener.isListening.return_value = False
+    monkeypatch.setattr(QtNetwork, "QLocalServer", Mock(return_value=listener))
+    timer = Mock()
+    monkeypatch.setattr(QtCore, "QTimer", Mock(return_value=timer))
+    window = Mock(
+        spec=[
+            "windowStates",
+            "setWindowStates",
+            "isVisible",
+            "setVisible",
+            "raise_",
+            "requestActivate",
+            "winId",
+        ]
+    )
+    window.windowStates.return_value = QtCore.Qt.WindowNoState
+    window.isVisible.return_value = False
+    window.setVisible.side_effect = lambda value: setattr(window.isVisible, "return_value", value)
+    # Нулевой id исключает X11 даже в случае ненулевой метки show.
+    window.winId.return_value = 0
+    focuser = app_mod._WindowFocuser(window)
+    server = app_mod.ShowServer(focuser.focus_shell)
+    connection = Mock()
+    connection.readLine.return_value = payload
+    try:
+        server._on_ready_read(connection)
+        assert window.isVisible()
+        window.setVisible.assert_called_once_with(True)
+        window.raise_.assert_called_once_with()
+        timer.start.assert_called_once_with()
+        connection.disconnectFromServer.assert_called_once_with()
+        connection.close.assert_called_once_with()
+    finally:
+        server.close()
+        focuser.stop()

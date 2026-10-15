@@ -140,6 +140,34 @@ def test_version_needs_no_display(tmp_path: Path) -> None:
     assert proc.stdout.startswith("astra-voice ")
 
 
+@pytest.mark.parametrize("argv", [[], ["--show"], ["--hidden"]])
+def test_second_launch_forwards_show_before_gui_initialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> None:
+    from PyQt5 import QtCore
+
+    from astra_voice import app as app_mod
+    from astra_voice.core.paths import LOCK_TIMEOUT_MS
+
+    monkeypatch.setattr(app_mod, "lock_path", lambda: tmp_path / "lock")
+    lock = Mock(tryLock=Mock(return_value=False))
+    monkeypatch.setattr(QtCore, "QLockFile", Mock(return_value=lock))
+    send_show = Mock(return_value=0)
+    monkeypatch.setattr(app_mod, "_send_show", send_show)
+    initialize = Mock(side_effect=AssertionError("повторный запуск не инициализирует GUI"))
+    monkeypatch.setattr(app_mod, "detect", initialize)
+    monkeypatch.setattr(app_mod, "setup_logging", initialize)
+    monkeypatch.setattr(app_mod, "_install_qt_message_handler", initialize)
+
+    assert app_mod.main(argv) == 0
+    lock.tryLock.assert_called_once_with(LOCK_TIMEOUT_MS)
+    if argv == ["--hidden"]:
+        send_show.assert_not_called()
+    else:
+        send_show.assert_called_once_with()
+    initialize.assert_not_called()
+
+
 @pytest.mark.parametrize("failure", [None, OSError("нет доступа"), RuntimeError("сбой путей")])
 def test_main_repeats_audio_guard_after_logging_without_fatal_error(
     tmp_path: Path,
@@ -296,6 +324,26 @@ def test_close_to_tray_hides_window_without_quitting(monkeypatch: pytest.MonkeyP
     assert not event.isAccepted()
     hide.assert_called_once_with()
     app.quit.assert_not_called()
+
+
+def test_close_hides_with_shown_unconfirmed_tray(monkeypatch: pytest.MonkeyPatch) -> None:
+    from PyQt5.QtCore import QEvent, QObject
+
+    from astra_voice import app as app_mod
+
+    tray = Mock(registered=False, visible_for_close=True)
+    app = Mock()
+    window = QObject()
+    hide = Mock()
+    monkeypatch.setattr(window, "hide", hide, raising=False)
+    watcher = app_mod._wire_close(app, window, is_tray_ready=lambda: tray.visible_for_close)
+    assert watcher is not None
+    event = QEvent(QEvent.Close)
+    assert watcher.eventFilter(window, event)
+    assert not event.isAccepted()
+    hide.assert_called_once_with()
+    app.quit.assert_not_called()
+    assert not tray.registered
 
 
 @pytest.mark.parametrize("tray_state", ["unregistered", "missing", "error"])

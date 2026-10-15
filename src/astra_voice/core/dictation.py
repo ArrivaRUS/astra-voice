@@ -468,24 +468,42 @@ class DictationOrchestrator:
             callback(MicrophoneTestUpdate("error", message=TEST_BUSY))
             return False
 
-        def notify(update: MicrophoneTestUpdate) -> None:
+        previous_mode = self.mode
+        set_command_mode = getattr(self._tray, "set_command_mode", None)
+        test_started = False
+
+        def deliver_test_update(update: MicrophoneTestUpdate) -> None:
+            nonlocal test_started
+            if update.state in ("recording", "processing", "done"):
+                test_started = True
+            elif (
+                not test_started
+                and update.state in ("idle", "error")
+                and self._test_callback is None
+                and self._phase in (DictationPhase.IDLE, DictationPhase.FINISHING)
+            ):
+                # Откатываем до callback: он может сразу начать следующую запись.
+                self.mode = previous_mode
+                if previous_mode == "command" and set_command_mode is not None:
+                    self._safe_ui(
+                        lambda: set_command_mode(True), "диктовка: не удалось обновить режим трея"
+                    )
             callback(update)
 
-        self._test_callback = notify
+        self._test_callback = deliver_test_update
         self.mode = "text"
-        set_command_mode = getattr(self._tray, "set_command_mode", None)
         if set_command_mode is not None:
             self._safe_ui(
                 lambda: set_command_mode(False), "диктовка: не удалось обновить режим трея"
             )
         self._start(test_device=device)
         # Терминальный callback мог уже завершить тест и начать следующий.
-        if self._test_callback is not notify:
+        if self._test_callback is not deliver_test_update:
             return False
         if self._phase not in (DictationPhase.RECORDING, DictationPhase.PROCESSING):
             self._test_callback = None
             self._safe_ui(
-                lambda: callback(MicrophoneTestUpdate("error", message=TEST_FAILED)),
+                lambda: deliver_test_update(MicrophoneTestUpdate("error", message=TEST_FAILED)),
                 "диктовка: не удалось обновить экран проверки микрофона",
             )
             return False

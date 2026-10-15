@@ -375,6 +375,8 @@ class Tray(QObject):
         self._hotkey = hotkey
         factory = tray_factory if tray_factory is not None else lambda: QSystemTrayIcon()
         self._tray = factory()
+        # Qt выбирает бэкенд в конструкторе значка; stop/start его не меняют.
+        self._sni_backend_proven = False
         self._tray.setParent(self)
         self._tray.activated.connect(self._on_activated)
         self._registered = False
@@ -385,10 +387,13 @@ class Tray(QObject):
         self._xembed_probe = xembed_probe if xembed_probe is not None else XEmbedTrayProbe()
         self._xembed_owner_id: int | None = None
         self._xembed_allowed = False
-        self._xembed_shown = False
+        self._shown_unconfirmed = False
         self._xembed_polling = False
         self._xembed_poll_at = 0.0
         self._item_registered = False
+        self._item_names: list[str] = []
+        self._item_pids: dict[str, bool] = {}
+        self._pending_item_signals: dict[str, tuple[str, bool]] = {}
         # QtDBusTrayIcon может иметь отдельное соединение: принимаем только PID.
         self._item_prefix = f"org.kde.StatusNotifierItem-{os.getpid()}-"
         self._path: str | None = None
@@ -499,7 +504,7 @@ class Tray(QObject):
         self._update_menu()
         if state == TrayState.DONE:
             self._done_timer.start(800)
-        if self._running and not self.registered and not self._xembed_shown:
+        if self._running and not self.registered and not self._shown_unconfirmed:
             if self._deadline is None:
                 self._begin_retry()
             if has_icon:
@@ -639,6 +644,15 @@ class Tray(QObject):
             self._invalidate_registration()
         return self._registered
 
+    @property
+    def visible_for_close(self) -> bool:
+        """Локальный показ достаточен для закрытия окна, но не для О4."""
+        if self.registered:
+            return True
+        if self._shown_unconfirmed and (not self._tray.isVisible() or not self._has_icon()):
+            self._invalidate_registration()
+        return self._shown_unconfirmed
+
     def _registration_ready(self) -> bool:
         return self._panel_ready() and self._item_registered
 
@@ -654,13 +668,17 @@ class Tray(QObject):
 
     def _poll_xembed_owner(self) -> None:
         """Редкая сверка SNI и владельца XEmbed, всегда из GUI-потока."""
-        if not self._running or self._retry_expired or not (self._registered or self._xembed_shown):
+        if (
+            not self._running
+            or self._retry_expired
+            or not (self._registered or self._shown_unconfirmed)
+        ):
             self._xembed_polling = False
             self._xembed_timer.stop()
             return
-        if self._xembed_shown and not self._is_kde and self._refresh_xembed_owner():
+        if self._path == "XEmbed" and not self._is_kde and self._refresh_xembed_owner():
             self._show_available_path()
-        if self._subscriptions_ready and (self._registered or self._xembed_shown):
+        if self._subscriptions_ready and (self._registered or self._shown_unconfirmed):
             # _host_reply запрашивает список элементов; один Get на свойство.
             self._query_host()
 
@@ -700,12 +718,19 @@ class Tray(QObject):
         )
         return False
 
-    def _invalidate_registration(self) -> None:
+    def _invalidate_registration(self, *, preserve_shown: bool = False) -> None:
+        keep_shown = (
+            preserve_shown
+            and not self._sni_backend_proven
+            and (self._registered or self._shown_unconfirmed)
+        )
         self._registered = False
         self._item_registered = False
         self._cancel_request(_ITEMS_PROPERTY)
-        self._xembed_shown = False
-        self._tray.hide()
+        self._item_names = []
+        self._shown_unconfirmed = bool(keep_shown and self._tray.isVisible())
+        if not self._shown_unconfirmed:
+            self._tray.hide()
         if self._running and self._deadline is None:
             self._begin_retry()
 
@@ -730,6 +755,8 @@ class Tray(QObject):
         if generation != self._bus_generation or not self._running:
             return
         if event in ("ready", "failed"):
+            # Новое соединение шины может повторно использовать unique names.
+            self._clear_item_pids()
             self._setup_pending = False
             self._subscriptions_ready = event == "ready" and monotonic() < self._setup_deadline
             if not self._subscriptions_ready:
@@ -824,32 +851,72 @@ class Tray(QObject):
             self._cancel_request(_ITEMS_PROPERTY)
         if self._xembed_allowed:
             self._refresh_xembed_owner()
-        if (self._registered and not self._registration_ready()) or (
-            self._xembed_shown and self._panel_ready()
-        ):
+        if self._registered and not self._registration_ready():
             self._invalidate_registration()
-        if not self._registered and not self._xembed_shown:
+        if self._shown_unconfirmed and self._path == "XEmbed" and not self._panel_ready():
+            self._end_retry()
+        elif not self._registered:
             self._begin_retry()
             self._show_available_path()
-        elif self._xembed_shown:
-            # Сигнал мог открыть retry; сохранённому XEmbed он больше не нужен.
-            self._end_retry()
         if self._host_registered:
             self._query_items()
 
-    def _is_our_item(self, item: Any) -> bool:
+    @staticmethod
+    def _item_service(item: Any) -> str | None:
         if not isinstance(item, str):
-            return False
+            return None
         service, separator, path = item.partition("/")
-        return bool(
-            separator
-            and path == "StatusNotifierItem"
-            and service.startswith(self._item_prefix)
-            and service[len(self._item_prefix) :].isdigit()
+        return service if separator and path == "StatusNotifierItem" else None
+
+    @staticmethod
+    def _ascii_decimal(value: str) -> bool:
+        return value.isascii() and value.isdecimal()
+
+    def _unique_item_service(self, item: Any) -> str | None:
+        service = self._item_service(item)
+        if service is not None and service.startswith(":1."):
+            if self._ascii_decimal(service[3:]):
+                return service
+        return None
+
+    def _is_our_item(self, item: Any) -> bool:
+        # Только локальный кэш: чтение registered никогда не вызывает D-Bus.
+        service = self._item_service(item)
+        if service is None:
+            return False
+        if service.startswith(self._item_prefix):
+            return self._ascii_decimal(service[len(self._item_prefix) :])
+        return self._item_pids.get(service, False)
+
+    def _clear_item_pids(self) -> None:
+        for key in tuple(self._requests):
+            if key.startswith("pid:"):
+                self._cancel_request(key)
+        self._item_pids.clear()
+        self._pending_item_signals.clear()
+
+    def _query_item_pid(self, service: str) -> None:
+        if service in self._item_pids:
+            return
+        message = QDBusMessage.createMethodCall(
+            _DBUS_SERVICE, _DBUS_PATH, _DBUS_SERVICE, "GetConnectionUnixProcessID"
         )
+        message.setArguments([service])
+        self._request("pid:" + service, message, partial(self._item_pid_reply, service))
+
+    def _item_pid_reply(self, service: str, reply: _BusReply | None) -> None:
+        args = reply[1] if reply is not None and reply[0] == QDBusMessage.ReplyMessage else []
+        self._item_pids[service] = (
+            len(args) == 1 and type(args[0]) is int and args[0] == os.getpid()
+        )
+        signal = self._pending_item_signals.pop(service, None)
+        if signal is not None and self._item_pids[service]:
+            self._items_changed(signal[0], removed=signal[1])
+        else:
+            self._update_item_registration()
 
     def _query_items(self) -> None:
-        if not self._host_registered:
+        if not self._host_registered or self._retry_expired:
             return
         message = QDBusMessage.createMethodCall(
             _WATCHER_SERVICE, _WATCHER_PATH, _PROPERTIES_INTERFACE, "Get"
@@ -862,26 +929,57 @@ class Tray(QObject):
             return
         args = reply[1] if reply is not None and reply[0] == QDBusMessage.ReplyMessage else []
         items = args[0] if len(args) == 1 else None
-        self._item_registered = (
-            self._tray.isVisible()
-            and isinstance(items, list)
-            and any(self._is_our_item(item) for item in items)
+        self._item_names = (
+            [item for item in items if isinstance(item, str)] if isinstance(items, list) else []
+        )
+        for item in self._item_names:
+            service = self._unique_item_service(item)
+            if service is not None:
+                self._query_item_pid(service)
+        self._update_item_registration()
+
+    def _update_item_registration(self) -> None:
+        if self._retry_expired or not self._host_registered:
+            return
+        if self._deadline is not None and monotonic() >= self._deadline:
+            self._registration_expired()
+            return
+        self._item_registered = self._tray.isVisible() and any(
+            self._is_our_item(item) for item in self._item_names
         )
         if self._registered and not self._item_registered:
-            self._invalidate_registration()
+            self._invalidate_registration(preserve_shown=True)
         if not self._registered:
             self._begin_retry()
             if self._tray.isVisible():
                 self._show_available_path()
 
     def _items_changed(self, item: str | None = None, *, removed: bool = False) -> None:
-        # Сигнал не доказывает регистрацию; отмена serial исключает старый Get.
+        our_item = self._is_our_item(item)
+        service = self._unique_item_service(item)
+        if service is not None and service not in self._item_pids and isinstance(item, str):
+            self._pending_item_signals[service] = (item, removed)
+            self._query_item_pid(service)
+            # Ответ может быть синхронным в тестовом транспорте.
+            our_item = self._is_our_item(item)
+        # Чужой сигнал не открывает новый цикл после окончательного таймаута.
+        if self._retry_expired and not our_item:
+            return
         self._cancel_request(_ITEMS_PROPERTY)
-        if item is None or (removed and self._is_our_item(item)):
+        self._item_names = []
+        if item is None or (removed and our_item):
+            # PropertiesChanged может касаться чужого элемента: сохраняем сам
+            # значок Qt до свежего списка, но не считаем доказанный SNI видимым.
             self._item_registered = False
+            self._shown_unconfirmed = not self._sni_backend_proven and (
+                self._shown_unconfirmed or (self._registered and bool(self._tray.isVisible()))
+            )
             self._registered = False
-        if not self._registered and not self._xembed_shown:
-            self._retry_after_change()
+        if not self._registered:
+            if our_item:
+                self._retry_after_change()
+            elif not self._shown_unconfirmed:
+                self._begin_retry()
         self._query_items()
 
     def _plasma_reply(self, reply: _BusReply | None) -> None:
@@ -901,13 +999,14 @@ class Tray(QObject):
     def _host_changed(self) -> None:
         if not self._running:
             return
+        self._clear_item_pids()
         self._cancel_request(_WATCHER_SERVICE)
         self._cancel_request(_ITEMS_PROPERTY)
         self._item_registered = False
         self._host_registered = False
         self._xembed_allowed = False
         self._retry_after_change()
-        self._invalidate_registration()
+        self._invalidate_registration(preserve_shown=self._shown_unconfirmed)
         self._begin_retry()
         # Сигнал — только повод обновить кэш; разрешение show() даёт ответ Get.
         self._query_host()
@@ -988,9 +1087,12 @@ class Tray(QObject):
             if self._xembed_allowed and self._xembed_owner_id
             else "нет"
         )
+        was_shown = self._shown_unconfirmed
         self._set_path(path)
-        if path == "нет" or not self._has_icon():
+        if not self._has_icon():
             self._invalidate_registration()
+        elif path == "нет":
+            self._invalidate_registration(preserve_shown=True)
         else:
             # После refresh() провайдера прежняя иконка могла остаться пустой.
             self._tray.setIcon(self._display_icon())
@@ -999,14 +1101,17 @@ class Tray(QObject):
                 self._item_registered = False
                 self._cancel_request(_ITEMS_PROPERTY)
                 self._tray.show()
-            self._xembed_shown = path == "XEmbed" and bool(self._tray.isVisible())
             self._registered = bool(self._tray.isVisible() and self._registration_ready())
-            if (self._xembed_shown or self._registered) and not self._xembed_polling:
+            if self._registered:
+                self._sni_backend_proven = True
+            self._shown_unconfirmed = bool(self._tray.isVisible()) and not self._sni_backend_proven
+            if (self._shown_unconfirmed or self._registered) and not self._xembed_polling:
                 self._xembed_polling = True
                 self._xembed_timer.start()
-            if self._xembed_shown:
+            if self._shown_unconfirmed and path == "XEmbed":
                 self._end_retry()
-                notify.drop_pending(_UNAVAILABLE_SUMMARY)
+                if not was_shown:
+                    notify.drop_pending(_UNAVAILABLE_SUMMARY)
             if self._registered:
                 self._end_retry()
                 notify.drop_pending(_UNAVAILABLE_SUMMARY)
@@ -1019,7 +1124,7 @@ class Tray(QObject):
     def _registration_expired(self) -> None:
         if not self._running or self._deadline is None:
             return
-        if self.registered or self._xembed_shown:
+        if self.registered:
             self._end_retry()
             return
         self._retry_expired = True
@@ -1028,9 +1133,13 @@ class Tray(QObject):
         self._item_registered = False
         for service in tuple(self._requests):
             self._cancel_request(service)
-        self._xembed_shown = False
+        self._item_names = []
+        self._pending_item_signals.clear()
         self._xembed_polling = False
         self._xembed_timer.stop()
+        if self.visible_for_close:
+            return
+        self._shown_unconfirmed = False
         self._tray.hide()
         self._set_path("нет")
         if not self._banner_shown:
@@ -1053,6 +1162,7 @@ class Tray(QObject):
         if not self._running:
             return
         if service == _WATCHER_SERVICE:
+            self._clear_item_pids()
             self._cancel_request(service)
             self._cancel_request(_ITEMS_PROPERTY)
             self._item_registered = False
@@ -1074,7 +1184,42 @@ class Tray(QObject):
     def _service_owner_changed(self, service: str, old_owner: str, new_owner: str) -> None:
         if old_owner == new_owner:
             return
+        if service.startswith(":1."):
+            affected = any(self._item_service(item) == service for item in self._item_names)
+            if not (
+                affected
+                or service in self._item_pids
+                or service in self._pending_item_signals
+                or "pid:" + service in self._requests
+            ):
+                return
+            was_ours = self._item_pids.pop(service, False)
+            self._cancel_request("pid:" + service)
+            self._pending_item_signals.pop(service, None)
+            if not new_owner:
+                # Имя уже исчезло: старый snapshot не должен запросить PID снова.
+                self._item_pids[service] = False
+            if affected:
+                self._item_names = [
+                    item for item in self._item_names if self._item_service(item) != service
+                ]
+                self._cancel_request(_ITEMS_PROPERTY)
+            if was_ours and old_owner:
+                self._invalidate_registration(preserve_shown=True)
+                self._retry_after_change()
+                self._query_items()
+            elif affected:
+                self._update_item_registration()
+            return
         if new_owner:
+            if (
+                old_owner
+                and self._sni_backend_proven
+                and self._is_kde
+                and service == _PLASMA_SERVICE
+            ):
+                # Новый shell ещё не подтверждает прежний SNI-элемент.
+                self._invalidate_registration()
             self._service_registered(service)
         else:
             self._service_unregistered(service)
@@ -1090,10 +1235,13 @@ class Tray(QObject):
         self._setup_pending = False
         self._xembed_allowed = False
         self._xembed_owner_id = None
-        self._xembed_shown = False
+        self._shown_unconfirmed = False
         self._xembed_polling = False
         self._xembed_poll_at = 0.0
         self._item_registered = False
+        self._item_names = []
+        self._item_pids.clear()
+        self._pending_item_signals.clear()
         self._xembed_timer.stop()
         self._xembed_probe.close()
         self._end_retry()

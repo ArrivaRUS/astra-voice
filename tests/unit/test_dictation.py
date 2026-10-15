@@ -2394,6 +2394,8 @@ def test_microphone_test_after_command_uses_private_text_mode(
     assert updates[-1] == MicrophoneTestUpdate("done", text=MARKER, duration_s=0.31)
     assert not rig.core.test_active
     assert rig.core.phase is DictationPhase.IDLE
+    assert rig.core.mode == "text"
+    set_command_mode.assert_called_once_with(False)
     assert rig.core.last_text == "Предыдущая команда"
     assert command.last_text == "Предыдущая команда"
     assert rig.core.last_text_is_command
@@ -2405,17 +2407,30 @@ def test_microphone_test_after_command_uses_private_text_mode(
 
 
 @pytest.mark.parametrize("phase", [DictationPhase.IDLE, DictationPhase.FINISHING])
+@pytest.mark.parametrize("previous_mode", ["text", "command"])
 def test_microphone_test_start_early_return_releases_callback(
-    rig: Rig, monkeypatch: pytest.MonkeyPatch, phase: DictationPhase
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, phase: DictationPhase, previous_mode: str
 ) -> None:
     rig.core._change_phase(phase)
+    rig.core.mode = previous_mode
+    set_command_mode = Mock()
+    monkeypatch.setattr(rig.tray, "set_command_mode", set_command_mode, raising=False)
     updates: list[MicrophoneTestUpdate] = []
+    callback_modes: list[str] = []
+
+    def receive(update: MicrophoneTestUpdate) -> None:
+        updates.append(update)
+        callback_modes.append(rig.core.mode)
+
     with monkeypatch.context() as patch:
         start = Mock()
         patch.setattr(rig.core, "_start", start)
-        assert not rig.core.start_test("test-device", updates.append)
+        assert not rig.core.start_test("test-device", receive)
         start.assert_called_once_with(test_device="test-device")
     assert updates == [MicrophoneTestUpdate("error", message=TEST_FAILED)]
+    assert rig.core.mode == previous_mode
+    assert callback_modes == [previous_mode]
+    assert set_command_mode.call_args == call(previous_mode == "command")
     assert not rig.core.test_active
     assert not rig.recording
     assert rig.commands() == []
@@ -2426,10 +2441,14 @@ def test_microphone_test_start_early_return_releases_callback(
 
 
 @pytest.mark.parametrize("phase", [DictationPhase.IDLE, DictationPhase.FINISHING])
+@pytest.mark.parametrize("previous_mode", ["text", "command"])
 def test_microphone_test_start_send_failure_returns_false_once(
-    rig: Rig, phase: DictationPhase
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, phase: DictationPhase, previous_mode: str
 ) -> None:
     rig.core._change_phase(phase)
+    rig.core.mode = previous_mode
+    set_command_mode = Mock()
+    monkeypatch.setattr(rig.tray, "set_command_mode", set_command_mode, raising=False)
 
     def fail_start(message: dict[str, Any]) -> None:
         if message["type"] == "record.start":
@@ -2439,6 +2458,8 @@ def test_microphone_test_start_send_failure_returns_false_once(
     updates: list[MicrophoneTestUpdate] = []
     assert not rig.core.start_test("", updates.append)
     assert updates == [MicrophoneTestUpdate("error", message=TEST_FAILED)]
+    assert rig.core.mode == previous_mode
+    assert set_command_mode.call_args == call(previous_mode == "command")
     assert not rig.core.test_active
     assert not rig.recording
     assert rig.commands() == ["record.start", "record.cancel"]
@@ -2467,6 +2488,29 @@ def test_microphone_test_start_survives_command_indicator_failure(
     assert MARKER not in caplog.text
 
 
+def test_microphone_test_start_failure_restores_mode_despite_indicator_failure(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.core.mode = "command"
+
+    def set_command_mode(enabled: bool) -> None:
+        if enabled:
+            raise RuntimeError(MARKER)
+
+    indicator = Mock(side_effect=set_command_mode)
+    monkeypatch.setattr(rig.tray, "set_command_mode", indicator, raising=False)
+    monkeypatch.setattr(rig.core, "_start", Mock())
+    updates: list[MicrophoneTestUpdate] = []
+    assert not rig.core.start_test("", updates.append)
+    assert rig.core.mode == "command"
+    assert indicator.call_args_list == [call(False), call(True)]
+    assert updates == [MicrophoneTestUpdate("error", message=TEST_FAILED)]
+    assert not rig.core.test_active
+    assert not rig.recording
+    assert any(record.exc_info is not None for record in caplog.records)
+    assert MARKER not in caplog.text
+
+
 def test_microphone_test_start_accepts_stop_in_recording_callback(rig: Rig) -> None:
     updates: list[MicrophoneTestUpdate] = []
 
@@ -2486,14 +2530,19 @@ def test_microphone_test_start_accepts_stop_in_recording_callback(rig: Rig) -> N
 def test_microphone_test_start_failure_can_restart_with_same_callback(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    rig.core.mode = "command"
+    set_command_mode = Mock()
+    monkeypatch.setattr(rig.tray, "set_command_mode", set_command_mode, raising=False)
     updates: list[MicrophoneTestUpdate] = []
     restarted: list[bool] = []
+    failure_modes: list[str] = []
     real_start = rig.core._start
     first_start = True
 
     def receive(update: MicrophoneTestUpdate) -> None:
         updates.append(update)
         if update.state == "error":
+            failure_modes.append(rig.core.mode)
             restarted.append(rig.core.start_test("retry-device", receive))
 
     def start(*, test_device: str | None = None) -> None:
@@ -2507,12 +2556,16 @@ def test_microphone_test_start_failure_can_restart_with_same_callback(
     monkeypatch.setattr(rig.core, "_start", start)
     assert not rig.core.start_test("first-device", receive)
     assert restarted == [True]
+    assert failure_modes == ["command"]
     assert updates == [
         MicrophoneTestUpdate("error", message=TEST_FAILED),
         MicrophoneTestUpdate("recording"),
     ]
     assert rig.core.test_active
     assert rig.core.phase is DictationPhase.RECORDING
+    assert rig.core.mode == "text"
+    assert set_command_mode.call_args_list == [call(False), call(True), call(False)]
+    assert rig.pill.calls[-1] == (PillState.LISTENING, None, None)
     assert rig.recording
     assert rig.commands() == ["record.start"]
     assert rig.sent[0][0]["device"] == "retry-device"
@@ -2520,6 +2573,35 @@ def test_microphone_test_start_failure_can_restart_with_same_callback(
     microphone_event(rig, "result", text=MARKER, t_ms=310)
     assert updates[-1] == MicrophoneTestUpdate("done", text=MARKER, duration_s=0.31)
     assert not rig.core.test_active
+
+
+def test_microphone_test_start_failure_cannot_restore_over_new_dictation(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.core._change_phase(DictationPhase.FINISHING)
+    rig.core.mode = "command"
+    set_command_mode = Mock()
+    monkeypatch.setattr(rig.tray, "set_command_mode", set_command_mode, raising=False)
+    real_start = rig.core._start
+
+    def start(*, test_device: str | None = None) -> None:
+        if test_device is not None:
+            rig.core._finish_test(MicrophoneTestUpdate("error", message=TEST_FAILED))
+        else:
+            real_start()
+
+    monkeypatch.setattr(rig.core, "_start", start)
+    rig.idle.side_effect = rig.start
+    updates: list[MicrophoneTestUpdate] = []
+    assert not rig.core.start_test("test-device", updates.append)
+    assert updates == [MicrophoneTestUpdate("error", message=TEST_FAILED)]
+    assert not rig.core.test_active
+    assert rig.core.phase is DictationPhase.RECORDING
+    assert rig.recording
+    assert rig.core.mode == "text"
+    assert set_command_mode.call_args_list == [call(False), call(False)]
+    assert rig.pill.calls[-1] == (PillState.LISTENING, None, None)
+    assert rig.commands() == ["record.start"]
 
 
 @pytest.mark.parametrize("indicator", ["tray", "set_recording"])

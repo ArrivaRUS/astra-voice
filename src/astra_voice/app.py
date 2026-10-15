@@ -1576,7 +1576,7 @@ def main(argv: list[str] | None = None) -> int:
     model_store: ModelStore | None = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
     close_watcher = _wire_close(  # держим ссылку на фильтр
-        app, shell, is_tray_ready=lambda: runtime is not None and runtime.tray.registered
+        app, shell, is_tray_ready=lambda: runtime is not None and runtime.tray.visible_for_close
     )
     focuser = _WindowFocuser(shell, app if isinstance(app, QObject) else None)
     server = ShowServer(focuser.focus_shell)

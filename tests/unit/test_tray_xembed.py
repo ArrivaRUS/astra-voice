@@ -207,6 +207,9 @@ def test_final_failure_stops_both_ports_until_host_signal(
     h.probe.owner.return_value = None
     h.bus.host_registered = missing != "host"
     h.bus.registered_items = []
+    # host=True без нашего SNI, но при успешном show(), не означает отказ трея.
+    if missing == "item":
+        h.icon.show.side_effect = None
     h.tray.start()
     h.clock.advance(29_999)
     h.banner.assert_not_called()
@@ -232,6 +235,7 @@ def test_final_failure_stops_both_ports_until_host_signal(
     h.banner.assert_called_once_with()
 
     # Сигнал хоста и чужой элемент не подтверждают нашу регистрацию.
+    h.icon.show.side_effect = lambda: setattr(h.icon.isVisible, "return_value", True)
     h.bus.registered_items = ["org.kde.StatusNotifierItem-0-1/StatusNotifierItem"]
     h.bus.host_changed(True)
     assert h.bus.transport.call.call_count > counts[0]
@@ -289,9 +293,13 @@ def test_registered_sni_poll_invalidates_missing_confirmation(
     assert h.tray.registered
     h.clock.advance(1)
     assert not h.tray.registered
+    assert not h.tray.visible_for_close
     h.clock.advance(29_999)
     h.banner.assert_not_called()
     h.clock.advance(1)
+    assert not h.icon.isVisible()
+    assert not h.tray.registered
+    assert not h.tray.visible_for_close
     h.banner.assert_called_once_with()
 
 
@@ -610,17 +618,13 @@ def test_probe_connection_and_cleanup_errors_do_not_escape(
     port.close()
 
 
-@pytest.mark.parametrize("signal", ["duplicate_registration", "owner_replacement"])
-def test_healthy_sni_survives_plasma_registration_signal(harness: Harness, signal: str) -> None:
+def test_healthy_sni_survives_duplicate_plasma_registration_signal(harness: Harness) -> None:
     h = harness
     h.detect.return_value = SessionKind.KDE
     h.tray.start()
     assert h.tray.registered
     h.icon.hide.reset_mock()
-    if signal == "duplicate_registration":
-        h.watcher.serviceRegistered.emit("org.kde.plasmashell")
-    else:
-        h.watcher.serviceOwnerChanged.emit("org.kde.plasmashell", ":1.42", ":1.43")
+    h.watcher.serviceRegistered.emit("org.kde.plasmashell")
     assert h.tray.registered
     h.icon.hide.assert_not_called()
     h.icon.show.assert_called_once_with()
