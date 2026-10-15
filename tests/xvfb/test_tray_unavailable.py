@@ -8,6 +8,7 @@ pytest -m xvfb. Урок .patches/002: offscreen не изолирует сес�
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -107,6 +108,7 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
     forbidden_tray = Mock(side_effect=AssertionError("реальный QSystemTrayIcon запрещён"))
     monkeypatch.setattr(module, "QSystemTrayIcon", forbidden_tray)
     host_registered = False
+    item_registered = False
     plasma_alive = False
     registered_before_host_reply: list[bool] = []
 
@@ -116,12 +118,18 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
         if message.member() == "AddMatch":
             return message.createReply([])
         if message.member() == "Get":
-            assert message.arguments() == [
-                "org.kde.StatusNotifierWatcher",
-                "IsStatusNotifierHostRegistered",
-            ]
-            registered_before_host_reply.append(tray.registered)
-            return message.createReply([QDBusVariant(host_registered)])
+            interface, property_name = message.arguments()
+            assert interface == "org.kde.StatusNotifierWatcher"
+            if property_name == "IsStatusNotifierHostRegistered":
+                registered_before_host_reply.append(tray.registered)
+                return message.createReply([QDBusVariant(host_registered)])
+            assert property_name == "RegisteredStatusNotifierItems"
+            items = (
+                [f"org.kde.StatusNotifierItem-{os.getpid()}-1/StatusNotifierItem"]
+                if host_registered and item_registered
+                else []
+            )
+            return message.createReply([QDBusVariant(items)])
         assert message.member() == "GetNameOwner"
         assert message.arguments() == ["org.kde.plasmashell"]
         if plasma_alive:
@@ -238,7 +246,17 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
         assert isinstance(bus_name, str)
         assert bus_name.startswith("astra-voice-tray-")
         connection.connectToBus.assert_called_once_with(connection.SessionBus, bus_name)
-        assert transport.connect.call_count == 4
+        expected_members = {
+            "NameOwnerChanged",
+            "StatusNotifierHostRegistered",
+            "StatusNotifierHostUnregistered",
+            "StatusNotifierItemRegistered",
+            "StatusNotifierItemUnregistered",
+            "PropertiesChanged",
+        }
+        members = [call.args[3] for call in transport.connect.call_args_list]
+        assert set(members) == expected_members
+        assert len(members) == 6
         assert not tray.registered
         tray_app.processEvents()
         for _ in range(29):
@@ -274,6 +292,14 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
             assert not tray.registered  # KDED есть, plasmashell пока нет.
             plasma_alive = True
             watcher.serviceRegistered.emit("org.kde.plasmashell")
+            tray_app.processEvents()
+        # Хост и панель уже есть, но пустой список SNI не подтверждает наш значок.
+        assert not tray.registered
+        flush.assert_not_called()
+        assert notify.pending_count() == 2
+        item_registered = True
+        clock.advance(1000)
+        tray_app.processEvents()
         assert tray.registered
         assert icon.isVisible()
         icon.show.assert_called_once_with()
@@ -354,6 +380,8 @@ def test_unavailable_tray_recovers_after_timeout_and_two_shell_restarts(
         tray_app.processEvents()
         notify.reset_state()
     connection.connectToBus.assert_called_once_with(connection.SessionBus, bus_name)
-    assert transport.connect.call_count == 4
+    members = [call.args[3] for call in transport.connect.call_args_list]
+    assert set(members) == expected_members
+    assert len(members) == 6
     transport.disconnect.assert_not_called()
     connection.disconnectFromBus.assert_not_called()

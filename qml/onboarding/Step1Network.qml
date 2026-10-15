@@ -108,7 +108,7 @@ Item {
                 showHint: false
                 label: qsTr("Проверять обновления утилиты")
                 sub: locked && !appUpdates.checked ? qsTr("Администратор отключил проверку обновлений на этом компьютере.")
-                    : qsTr("Раз в сутки, github.com. Скачивание — только по вашему нажатию.")
+                    : qsTr("Раз в сутки. Скачивание — только по вашему нажатию.")
                 toggle: appUpdates
                 locked: root.appUpdatesLocked
                 lockedText: root.bridge ? root.bridge.policyLockedText : ""
@@ -132,7 +132,7 @@ Item {
                 showHint: false
                 label: qsTr("Проверять обновления моделей")
                 sub: locked && !modelUpdates.checked ? qsTr("Администратор отключил проверку обновлений на этом компьютере.")
-                    : qsTr("huggingface.co. Скачивание — только по вашему нажатию.")
+                    : qsTr("Скачивание — только по вашему нажатию.")
                 toggle: modelUpdates
                 locked: root.modelUpdatesLocked
                 lockedText: root.bridge ? root.bridge.policyLockedText : ""

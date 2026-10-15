@@ -698,7 +698,7 @@ GenericName=Голосовой ввод
 GenericName[en]=Voice input
 Comment=Офлайн-распознавание речи: сказали — текст появился в активном окне
 Comment[en]=Offline speech to text: speak, and the text lands in the active window
-{command}Icon=astravoice
+{command}Icon={icon}
 Terminal=false
 Categories=Utility;Accessibility;
 Keywords=диктовка;речь;распознавание;микрофон;voice;dictation;speech;
@@ -710,13 +710,25 @@ X-AppImage-Version={version}
 """
 
 
-def menu_entry_bytes(launcher: Path, version: str) -> bytes:
+def menu_entry_bytes(launcher: Path, version: str, icon: Path | None = None) -> bytes:
     """Шаблон data/astra-voice.desktop с установленным launcher (§4)."""
     path = str(launcher)
     command = f"Exec={autostart._exec_argument(path)}\n"
     if not autostart._EXEC_RESERVED.intersection(path) and "%" not in path:
         command += f"TryExec={path}\n"
-    return _MENU_TEMPLATE.format(command=command, version=version).encode("utf-8")
+    icon_name = "astravoice"
+    if icon is not None and icon.is_absolute():
+        value = str(icon)
+        # Icon is a literal Desktop Entry string, not an Exec argument. Avoid
+        # ambiguous escaping and control characters; spaces/$/%/quotes are literal.
+        if "\\" not in value and value.isprintable():
+            icon_name = value
+        else:
+            log.info("Значок меню: Icon=astravoice reason=unsafe_path")
+    elif icon is not None:
+        log.info("Значок меню: Icon=astravoice reason=relative_path")
+    # None is already diagnosed by _menu_icon; do not duplicate that INFO here.
+    return _MENU_TEMPLATE.format(command=command, version=version, icon=icon_name).encode("utf-8")
 
 
 def _desktop_paths() -> tuple[Path, Path]:
@@ -814,20 +826,20 @@ def _registration_source() -> tuple[Path, Path, BuildInfo]:
 
 def _register() -> RegisterResult:
     copy, launcher, info = _registration_source()
-    data = menu_entry_bytes(launcher, info.version)
     menu, icons = _desktop_paths()
-    menu_result: Literal["written", "unchanged", "foreign"]
-    if _menu_state(menu) == "foreign":
-        log.warning("Чужая запись меню сохранена: %s", tilde(menu))
-        menu_result = "foreign"
-    else:
-        menu_result = "written" if _write_desktop_file(menu, data) else "unchanged"
     written: list[Path] = []
     skipped: list[Path] = []
     try:
         _copy_icons(copy, icons, written, skipped)
     except (OSError, UserInstallError) as exc:
         log.warning("Значки программы не добавлены: %s", tilde(exc))
+    data = menu_entry_bytes(launcher, info.version, _menu_icon(icons))
+    menu_result: Literal["written", "unchanged", "foreign"]
+    if _menu_state(menu) == "foreign":
+        log.warning("Чужая запись меню сохранена: %s", tilde(menu))
+        menu_result = "foreign"
+    else:
+        menu_result = "written" if _write_desktop_file(menu, data) else "unchanged"
     # Автозапуск перенацеливается независимо от значков.
     retargeted = autostart.retarget()
     return RegisterResult(menu_result, tuple(written), tuple(skipped), retargeted)
@@ -898,6 +910,28 @@ def _owned_icons(icons: Path, *, strict: bool = False) -> Iterator[Path]:
         candidates = sources.get(icon.relative_to(icons))
         if candidates is not None and icon.read_bytes() in candidates:
             yield icon
+
+
+def _menu_icon(icons: Path) -> Path | None:
+    """Largest owned square PNG; scalable icons and symbolic links are excluded."""
+    largest: Path | None = None
+    largest_size = 0
+    try:
+        for icon in _owned_icons(icons):
+            if icon.name != "astravoice.png" or not icon.is_absolute():
+                continue
+            width, separator, height = icon.parent.parent.name.partition("x")
+            if not separator or width != height or not width.isascii() or not width.isdecimal():
+                continue
+            size = int(width)
+            if size > largest_size and all(_is_real_dir(parent) for parent in icon.parents):
+                largest, largest_size = icon, size
+    except (OSError, UserInstallError):
+        log.info("Значок меню: Icon=astravoice reason=selection_error")
+        return None
+    if largest is None:
+        log.info("Значок меню: Icon=astravoice reason=no_usable_png")
+    return largest
 
 
 def validate_remove_paths(runtime_dirs: Iterable[Path] = ()) -> None:

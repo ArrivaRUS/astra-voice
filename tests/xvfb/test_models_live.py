@@ -513,7 +513,7 @@ def test_live_onboarding_strip_retry(models_app: Any) -> None:
     with live_onboarding_window(models_app) as live:
         live.port.failures[FIRST.id] = DownloadError("no-network")
         live.port.open_gates()
-        click_item(card_item(live, FIRST.id))
+        # рекомендованная отмечена мастером по умолчанию
         settle(
             live,
             lambda: card_property(live, FIRST.id, "selected") is True,

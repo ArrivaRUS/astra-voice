@@ -992,6 +992,7 @@ class ModelDownloads(QObject):
         self._entry = model.recommended() if model is not None else None
         self._entries = model.entries() if model is not None else ()
         self._selected: set[str] = set()
+        self._recommended_preselect_done = False
         self._card_states: dict[str, str] = {}
         self._card_messages: dict[str, str] = {}
         self._card_hints: dict[str, str] = {}
@@ -1726,6 +1727,40 @@ class ModelDownloads(QObject):
         )
         self._notify("modelsChanged")
 
+    def preselect_recommended(self) -> None:
+        """Один раз предлагает выбор мастеру; настройки явно не вызывают этот метод.
+
+        Флаг живёт вместе с общей очередью, чтобы повторный вход в мастер или
+        обновление карточек не восстанавливали снятую человеком галочку.
+        """
+        if self._recommended_preselect_done:
+            return
+        model = self._model
+        if model is None:
+            self._recommended_preselect_done = True
+            return
+        recommended = model.recommended()
+        if recommended is None:
+            self._recommended_preselect_done = True
+            return
+        entry = next((entry for entry in self._entries if entry.id == recommended.id), None)
+        if (
+            entry is None
+            or entry.removed_from_catalog
+            or self._is_revoked(entry, entry.revision)
+            or any(model_id == entry.id for model_id, _ in self._installed_ids())
+        ):
+            self._recommended_preselect_done = True
+            return
+        if entry.id in self._selected:
+            self._recommended_preselect_done = True
+            return
+        # Сеть и занятая очередь могут стать доступны позже. Не тратим
+        # предложение, пока toggleModel не изменит выбор на самом деле.
+        if not model.allowed()[0]:
+            return
+        self.toggleModel(entry.id)
+
     def toggleModel(self, model_id: str) -> None:  # noqa: N802
         if self._rechecking or self._shutting_down or self._switching_entry is not None:
             return
@@ -1734,7 +1769,10 @@ class ModelDownloads(QObject):
             return
         if self._card_state(entry) not in {"available", "failed"}:
             return
+        # Ручной выбор общей очереди важнее первого предложения мастера.
         self._selected.symmetric_difference_update({model_id})
+        # До emit: modelsChanged может синхронно повторить предвыбор мастера.
+        self._recommended_preselect_done = True
         self._notify("modelsChanged")
         self._notify("selectionChanged")
 

@@ -26,7 +26,7 @@ Item {
     readonly property string testText: root.bridge ? root.bridge.testText : ""
     readonly property string testState: root.bridge ? root.bridge.testState : "idle"
     readonly property string testMessage: root.bridge ? root.bridge.testMessage : ""
-    readonly property bool silent: level <= 0.02 // Порог «тишина» по заданию шага 4.
+    readonly property bool levelSilent: root.bridge ? root.bridge.levelSilent : false
     readonly property bool testing: testState === "preparing" || testState === "recording" || testState === "processing"
     readonly property int selectedDeviceIndex: deviceIndex(device)
     readonly property var selectedDevice: selectedDeviceIndex >= 0 ? devices[selectedDeviceIndex] : null
@@ -35,6 +35,7 @@ Item {
     readonly property bool deviceLocked: bridge && bridge.lockedSettings
         ? bridge.lockedSettings.indexOf("device") >= 0 : false
     property bool levelMonitorRequested: false
+    property bool heardSinceStart: false
     // Мост сам останавливает проверку по общему потолку эпизода (ИБ, У62):
     // тогда он возвращает idle с пояснением, и продолжить может только человек.
     readonly property bool levelStopped: root.levelState === "idle" && root.levelMessage !== ""
@@ -54,7 +55,18 @@ Item {
 
     // Проверку мог остановить мост; без сброса отметки кнопка «Проверить ещё
     // раз» считала бы, что измерение уже идёт, и молчала бы.
-    onLevelStateChanged: if (root.levelState === "idle") root.levelMonitorRequested = false
+    onLevelStateChanged: {
+        if (root.levelState !== "listening")
+            root.heardSinceStart = false
+        else if (root.level > 0.02)
+            root.heardSinceStart = true
+        if (root.levelState === "idle")
+            root.levelMonitorRequested = false
+    }
+    onLevelChanged: {
+        if (root.levelState === "listening" && root.level > 0.02)
+            root.heardSinceStart = true
+    }
 
     Component.onCompleted: root.setLevelMonitoring(root.shown)
     onShownChanged: root.setLevelMonitoring(root.shown)
@@ -219,7 +231,7 @@ Item {
 
             LevelMeter {
                 level: root.level
-                silent: root.silent
+                silent: root.level <= 0.02
                 Layout.alignment: Qt.AlignVCenter
             }
 
@@ -232,7 +244,8 @@ Item {
                     width: parent.width
                     textFormat: Text.PlainText
                     text: root.levelState === "error" || root.levelStopped ? root.levelMessage
-                        : root.silent ? qsTr("Пока тишина") : qsTr("Слышим вас")
+                        : !root.heardSinceStart || root.levelSilent
+                            ? qsTr("Пока тишина") : qsTr("Слышим вас")
                     color: root.levelState === "error" ? Theme.dangerInk : Theme.fg
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontSettingLabelSize
@@ -246,7 +259,8 @@ Item {
                     width: parent.width
                     textFormat: Text.PlainText
                     text: root.levelState === "listening" && root.peak !== ""
-                        ? qsTr("Пик %1 · уровень в норме").arg(root.peak) : ""
+                        ? (root.levelSilent ? qsTr("Пик %1")
+                            : qsTr("Пик %1 · уровень в норме")).arg(root.peak) : ""
                     visible: text !== ""
                     height: visible ? implicitHeight : 0
                     color: Theme.fgMuted
@@ -272,10 +286,17 @@ Item {
 
     NoteBanner {
         id: silenceNote
-        visible: root.levelState === "listening" && root.silent
+        visible: root.levelState === "listening" && root.levelSilent
         y: levelBox.y + levelBox.height + (visible ? 11 : 0)
         width: root.width
         height: visible ? implicitHeight : 0
+        clip: true
+        Behavior on height {
+            NumberAnimation { duration: Theme.durationEnter; easing.type: Easing.InOutQuad }
+        }
+        Behavior on y {
+            NumberAnimation { duration: Theme.durationEnter; easing.type: Easing.InOutQuad }
+        }
         variant: "warn"
         iconName: "alert"
         title: qsTr("Микрофон молчит")

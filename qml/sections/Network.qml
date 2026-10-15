@@ -133,7 +133,7 @@ Column {
             label: qsTr("Проверять обновления утилиты")
             sub: locked && !appUpdates.checked ? qsTr("Администратор отключил проверку обновлений на этом компьютере.")
                 : root.offlineOn ? qsTr("Не работает, пока включён офлайн-режим.")
-                : qsTr("Раз в сутки, github.com. Скачивание — только по вашему нажатию.")
+                : qsTr("Раз в сутки. Скачивание — только по вашему нажатию.")
             toggle: appUpdates
             locked: root.isLocked("check_app_updates") || root.networkRefusal === "admin"
             rowEnabled: !locked && !root.offlineOn
@@ -170,7 +170,7 @@ Column {
             label: qsTr("Проверять обновления моделей")
             sub: locked && !modelUpdates.checked ? qsTr("Администратор отключил проверку обновлений на этом компьютере.")
                 : root.offlineOn ? qsTr("Не работает, пока включён офлайн-режим.")
-                : qsTr("huggingface.co. Скачивание — только по вашему нажатию.")
+                : qsTr("Скачивание — только по вашему нажатию.")
             toggle: modelUpdates
             locked: root.isLocked("check_model_updates") || root.networkRefusal === "admin"
             rowEnabled: !locked && !root.offlineOn
