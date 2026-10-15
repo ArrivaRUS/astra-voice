@@ -18,7 +18,9 @@ import pytest
 from PyQt5.QtCore import QCoreApplication, QEvent
 
 from astra_voice.core import settings as settings_mod
+from astra_voice.core.policy import Policy
 from astra_voice.models.catalog import Catalog
+from astra_voice.net.gate import NetworkGate
 from astra_voice.ui.bridges import SettingsBridge
 from astra_voice.ui.model_downloads import ModelDownloads
 from astra_voice.ui.updates_bridge import UpdatesBridge
@@ -39,6 +41,7 @@ class RevisionPort(ScriptedModelPort):
 
     def __init__(self) -> None:
         super().__init__()
+        self.catalog_unavailable = False
         self.records = {(FIRST.id, "r0"): "ok", (SECOND.id, "r0"): "ok"}
         self.current = (FIRST.id, "r0")
         self.previous: str | None = None
@@ -47,7 +50,24 @@ class RevisionPort(ScriptedModelPort):
         self.cancel_seen = threading.Event()
         self.revision_calls: list[tuple[str, str]] = []
         self.next_failure = ""
+        self.next_refusal = ""
         self.revert_failure = ""
+        self.activation_started = threading.Event()
+        self.activation_gate = threading.Event()
+        self.activation_gate.set()
+        self.current_writes: list[tuple[str, str, str | None]] = []
+
+    def set_current(
+        self, model_id: str, revision: str, *, previous_revision: str | None = None
+    ) -> None:
+        self.current_writes.append((model_id, revision, previous_revision))
+        self.current = (model_id, revision)
+        self.previous = previous_revision
+
+    def restore_current(
+        self, model_id: str, revision: str, *, previous_revision: str | None
+    ) -> None:
+        self.set_current(model_id, revision, previous_revision=previous_revision)
 
     def previous_revision(self) -> str | None:
         return self.previous
@@ -57,10 +77,33 @@ class RevisionPort(ScriptedModelPort):
 
     def accept_catalog(self, catalog: Catalog) -> None:
         self.catalog = catalog.entries
+        self.catalog_unavailable = False
 
     def open_gates(self) -> None:
         super().open_gates()
         self.revision_gate.set()
+        self.activation_gate.set()
+
+
+class CatalogUnavailablePort:
+    """Порт восстановления: старые данные не доступны до принятия каталога."""
+
+    def __init__(self, port: RevisionPort) -> None:
+        self._port = port
+        self.catalog_unavailable = True
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._port, name)
+
+    def recommended(self) -> Any | None:
+        return None if self.catalog_unavailable else self._port.recommended()
+
+    def entries(self) -> tuple[Any, ...]:
+        return () if self.catalog_unavailable else self._port.entries()
+
+    def accept_catalog(self, catalog: Catalog) -> None:
+        self._port.accept_catalog(catalog)
+        self.catalog_unavailable = False
 
 
 class ScriptedUpdater:
@@ -82,14 +125,19 @@ class ScriptedUpdater:
                 )
             if time.monotonic() > deadline:
                 raise AssertionError("тест не открыл ворота обновления")
+        if reason := port.next_refusal:
+            return RevisionUpdateResult("refused", model_id, "r0", reason_code=reason)
         if reason := port.next_failure:
             port.next_failure = ""
             self.on_state(model_id, "update-failed")
             return RevisionUpdateResult("update-failed", model_id, "r0", FAILED_MESSAGE, reason)
+        self.on_state(model_id, "activating")
+        port.activation_started.set()
+        assert port.activation_gate.wait(5)
         entry = next(entry for entry in port.catalog if entry.id == model_id)
         assert port.current is not None
-        port.previous = port.current[1]
-        port.current = (model_id, entry.revision)
+        port.set_current(model_id, entry.revision, previous_revision=port.current[1])
+        assert port.current is not None
         port.records[port.current] = "ok"
         return RevisionUpdateResult("updated", model_id, entry.revision)
 
@@ -104,8 +152,8 @@ class ScriptedUpdater:
                 )
             return RevisionUpdateResult("refused", model_id, "r0", reason_code=reason)
         assert port.previous is not None
-        port.current = (model_id, port.previous)
-        port.previous = None
+        port.set_current(model_id, port.previous)
+        assert port.current is not None
         return RevisionUpdateResult("updated", model_id, port.current[1])
 
 
@@ -275,11 +323,15 @@ def test_revert_is_background_and_previous_only_on_active(rig: RevisionRig) -> N
         (
             "revoked",
             "Предыдущая версия отозвана издателем",
-            "Эта версия отозвана авторами каталога",
+            "Предыдущая версия отозвана издателем",
         ),
-        ("no-previous", "Предыдущая версия модели недоступна", "Предыдущей версии нет"),
-        ("not-installed", "Обновлять можно только рабочую модель", "Не удалось скачать"),
-        ("no-update", "Новая версия модели недоступна", "Не удалось скачать"),
+        ("no-previous", "Предыдущей версии нет", "Предыдущей версии нет"),
+        (
+            "not-installed",
+            "Обновлять можно только рабочую модель",
+            "Обновлять можно только рабочую модель",
+        ),
+        ("no-update", "Новая версия модели недоступна", "Новая версия модели недоступна"),
         ("revert", REVERT_FAILED_MESSAGE, "Не удалось вернуть предыдущую версию модели"),
     ],
 )
@@ -304,6 +356,9 @@ def test_revert_refusal_is_visible_without_changing_current(
         ("download", "Не удалось скачать"),
         ("cancelled", "Обновление отменено"),
         ("revoked", "Эта версия отозвана авторами каталога"),
+        ("not-installed", "Обновлять можно только рабочую модель"),
+        ("no-update", "Новая версия модели недоступна"),
+        ("no-previous", "Предыдущей версии нет"),
         ("revert", "Не удалось вернуть предыдущую версию модели"),
         ("unknown", "Не удалось скачать"),
     ],
@@ -341,6 +396,111 @@ def test_model_update_notice_is_plain_data_and_clear_is_targeted() -> None:
     assert bridge.modelUpdateText
     bridge.clear_model_update(FIRST.id)
     assert bridge.modelUpdateText == ""
+
+
+def test_catalog_unavailable_is_not_a_missing_model_and_acceptance_notifies_gui() -> None:
+    port = RevisionPort()
+    accepted = make_catalog(port)
+    downloads = ModelDownloads(CatalogUnavailablePort(port))
+    bridge = SettingsBridge(settings_mod.from_dict({}), downloads=downloads, save=Mock())
+    notifications: list[bool] = []
+    bridge.modelsChanged.connect(lambda: notifications.append(bridge.catalogUnavailable))
+    try:
+        for owner in (downloads, bridge):
+            prop = owner.metaObject().property(
+                owner.metaObject().indexOfProperty("catalogUnavailable")
+            )
+            assert prop.typeName() == "bool"
+            assert bytes(prop.notifySignal().name()) == b"modelsChanged"
+            assert owner.catalogUnavailable is True
+        assert bridge.models == []
+        downloads.accept_catalog(accepted, frozenset())
+        assert bridge.catalogUnavailable is False
+        assert downloads.catalogUnavailable is False
+        assert {row["id"] for row in bridge.models} == {FIRST.id, SECOND.id}
+        assert notifications == [False]
+    finally:
+        port.open_gates()
+        downloads.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("condition", "models_allowed", "app_allowed"),
+    [
+        ("enabled", True, True),
+        ("app-toggle-off", True, True),
+        ("policy-app", True, False),
+        ("model-toggle-off", False, True),
+        ("offline", False, False),
+        ("policy-offline", False, False),
+        ("policy-models", False, True),
+        ("policy-updates", False, True),
+        ("no-checker", False, False),
+    ],
+)
+def test_model_check_capability_uses_model_gate_independently_of_manual_app_check(
+    monkeypatch: pytest.MonkeyPatch, condition: str, models_allowed: bool, app_allowed: bool
+) -> None:
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    settings = settings_mod.from_dict({"check_model_updates": True})
+    policy = Policy()
+    if condition == "app-toggle-off":
+        settings.check_app_updates = False
+    elif condition == "policy-app":
+        settings.check_app_updates = False
+        policy = Policy(locked_keys=frozenset({"check_app_updates"}))
+    elif condition == "model-toggle-off":
+        settings.check_model_updates = False
+    elif condition == "offline":
+        settings.offline = True
+    elif condition == "policy-offline":
+        policy = Policy(values={"offline": True})
+    elif condition == "policy-models":
+        policy = Policy(values={"check_model_updates": False})
+    elif condition == "policy-updates":
+        policy = Policy(values={"updates": "offline"})
+    checker = None if condition == "no-checker" else Mock(spec=["check_now", "check_models_now"])
+    bridge = UpdatesBridge(checker, refusal=NetworkGate(settings, policy).refusal)
+    prop = bridge.metaObject().property(bridge.metaObject().indexOfProperty("canCheckModelsNow"))
+    assert prop.typeName() == "bool"
+    assert bytes(prop.notifySignal().name()) == b"networkChanged"
+    assert bridge.canCheckModelsNow is models_allowed
+    assert bridge.canCheckNow is app_allowed
+    assert bridge.metaObject().indexOfSlot(b"checkModelsNow()") >= 0
+    bridge.checkModelsNow()
+    if checker is not None:
+        if models_allowed:
+            checker.check_models_now.assert_called_once_with()
+        else:
+            checker.check_models_now.assert_not_called()
+        checker.check_now.assert_not_called()
+        checker.reset_mock()
+    bridge.checkNow()
+    if checker is not None:
+        if app_allowed:
+            checker.check_now.assert_called_once_with()
+        else:
+            checker.check_now.assert_not_called()
+        checker.check_models_now.assert_not_called()
+
+
+def test_model_check_capability_notifies_when_only_model_toggle_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    settings = settings_mod.from_dict({"check_model_updates": True})
+    bridge = UpdatesBridge(Mock(), refusal=NetworkGate(settings, Policy()).refusal)
+    notifications: list[bool] = []
+    bridge.networkChanged.connect(lambda: notifications.append(bridge.canCheckModelsNow))
+    assert bridge.canCheckModelsNow is True
+    settings.check_model_updates = False
+    bridge.refresh()
+    assert bridge.canCheckModelsNow is False
+    assert bridge.canCheckNow is True
+    settings.check_model_updates = True
+    bridge.refresh()
+    assert bridge.canCheckModelsNow is True
+    assert notifications == [False, True]
 
 
 def test_checker_notice_is_delivered_through_gui_queue() -> None:
@@ -387,3 +547,141 @@ def test_app_checker_factory_connects_model_notices_to_gui(tmp_path: Path) -> No
     assert bridge.modelUpdateText == ""
     pump_until(lambda: bool(bridge.modelUpdateText), "фабрика → notify → GUI")
     assert bridge.modelUpdateText == "Обновление модели: " + FIRST.name
+
+
+@pytest.mark.parametrize("revert", [False, True])
+@pytest.mark.parametrize("outcome", ["ok", "failed", "raises", "too-slow"])
+def test_revision_switches_once_and_restores_both_pointers_on_failure(
+    rig: RevisionRig, revert: bool, outcome: str
+) -> None:
+    switcher = Mock()
+    switcher.can_switch_without_pause.return_value = True
+    switcher.mem_available_mb.return_value = None
+    rig.downloads._switcher = switcher
+    switcher.on_switch_finished = rig.downloads._switch_finished
+    rig.port.previous = "r-1"
+    rig.port.records[(FIRST.id, "r-1")] = "ok"
+    rig.port.revision_gate.set()
+    if outcome == "raises":
+        switcher.switch_model.side_effect = RuntimeError("switch failed")
+    revisions: list[str] = []
+    rig.downloads.modelRevisionChanged.connect(revisions.append)
+
+    if revert:
+        rig.bridge.revertModelPrevious(FIRST.id)
+    else:
+        rig.bridge.updateModel(FIRST.id)
+    pump_until(rig.idle, "установка ревизии перед переключением распознавателя")
+    switcher.switch_model.assert_called_once_with(min_ram_mb=FIRST.min_ram_mb, pause=False)
+    if outcome != "raises":
+        assert rig.card()["state"] == "switching"
+        assert len(rig.port.current_writes) == 1, "UI не должен заново записывать current"
+        switcher.on_switch_finished(outcome)
+    if outcome == "ok":
+        assert rig.port.current == (FIRST.id, "r-1" if revert else FIRST.revision)
+        assert rig.port.previous == (None if revert else "r0")
+        assert rig.card()["state"] == "ok"
+        assert revisions == [FIRST.id]
+        assert len(rig.port.current_writes) == 1
+    else:
+        assert rig.port.current == (FIRST.id, "r0")
+        assert rig.port.previous == "r-1"
+        assert rig.card()["state"] == "update-failed"
+        assert rig.card()["message"]
+        assert rig.card()["reason"]
+        assert revisions == []
+        assert len(rig.port.current_writes) == 2
+
+
+@pytest.mark.parametrize("revert", [False, True])
+def test_revision_requests_pause_before_activation(rig: RevisionRig, revert: bool) -> None:
+    switcher = Mock()
+    switcher.can_switch_without_pause.return_value = False
+    rig.downloads._switcher = switcher
+    switcher.on_switch_finished = rig.downloads._switch_finished
+    rig.port.previous = "r-1"
+    rig.port.records[(FIRST.id, "r-1")] = "ok"
+    rig.port.revision_gate.set()
+    if revert:
+        rig.bridge.revertModelPrevious(FIRST.id)
+    else:
+        rig.bridge.updateModel(FIRST.id)
+    assert rig.port.revision_calls == []
+    assert rig.port.current == (FIRST.id, "r0")
+    assert rig.card()["canSwitchWithPause"] is True
+    assert rig.card()["hint"]
+    rig.bridge.switchModelWithPause(FIRST.id)
+    pump_until(rig.idle, "переключение с согласованной паузой")
+    switcher.switch_model.assert_called_once_with(min_ram_mb=FIRST.min_ram_mb, pause=True)
+    switcher.on_switch_finished("ok")
+    assert rig.card()["state"] == "ok"
+
+
+def test_activation_boundary_hides_cancel_and_ignores_late_cancel(rig: RevisionRig) -> None:
+    rig.port.activation_gate.clear()
+    rig.port.revision_gate.set()
+    rig.bridge.updateModel(FIRST.id)
+    pump_until(rig.port.activation_started.is_set, "граница активации")
+    assert rig.card()["canCancel"] is False
+    rig.bridge.cancelModelUpdate()
+    assert not rig.downloads._model_cancel.is_set()
+    rig.port.activation_gate.set()
+    pump_until(rig.idle, "активация после границы отмены")
+    assert rig.port.current == (FIRST.id, FIRST.revision)
+
+
+@pytest.mark.parametrize("queue", [False, True])
+def test_catalog_is_accepted_immediately_but_cards_wait_for_job(
+    rig: RevisionRig, queue: bool
+) -> None:
+    if queue:
+        rig.bridge.updateModel(SECOND.id)
+        pump_until(rig.port.downloading.is_set, "очередь загрузки")
+    else:
+        rig.bridge.updateModel(FIRST.id)
+        pump_until(rig.port.revision_started.is_set, "обновление")
+    replacement = replace(SECOND, name="Новое имя из каталога")
+    catalog = Catalog(serial=3, trust_epoch=1, entries=(FIRST, replacement), revoked=())
+    rig.downloads.accept_catalog(catalog, frozenset({SECOND.id}))
+    assert rig.port.catalog == catalog.entries
+    assert rig.card(SECOND.id)["name"] == SECOND.name
+    assert rig.card(SECOND.id)["isNew"] is False
+    assert rig.downloads._pending_catalog is not None
+    rig.port.open_gates()
+    pump_until(rig.idle, "завершение задания с ожидающим каталогом")
+    assert rig.card(SECOND.id)["name"] == replacement.name
+    assert rig.card(SECOND.id)["isNew"] is True
+    assert rig.downloads._pending_catalog is None
+
+
+@pytest.mark.parametrize("revert", [False, True])
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("not-installed", "Обновлять можно только рабочую модель"),
+        ("no-update", "Новая версия модели недоступна"),
+        ("no-previous", "Предыдущей версии нет"),
+        ("revoked", ""),
+    ],
+)
+def test_refusal_text_depends_on_operation_without_download_failure(
+    rig: RevisionRig, revert: bool, code: str, message: str
+) -> None:
+    if code == "revoked":
+        message = (
+            "Предыдущая версия отозвана издателем"
+            if revert
+            else "Эта версия отозвана авторами каталога"
+        )
+    if revert:
+        rig.port.revert_failure = code
+        rig.bridge.revertModelPrevious(FIRST.id)
+    else:
+        rig.port.next_refusal = code
+        rig.port.revision_gate.set()
+        rig.bridge.updateModel(FIRST.id)
+    pump_until(rig.idle, "отказ операции ревизии")
+    assert rig.card()["message"] == message
+    assert rig.card()["reason"] == message
+    assert "Не удалось скачать" not in str(rig.card())
+    assert rig.port.current == (FIRST.id, "r0")

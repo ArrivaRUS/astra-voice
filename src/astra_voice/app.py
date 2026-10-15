@@ -1008,7 +1008,7 @@ def _start_update_checker(
     try:
         from astra_voice.updates.checker import create_app_checker
 
-        if model_store is not None and catalog is not None:
+        if model_store is not None:
             checker = create_app_checker(settings, policy, model_store=model_store, catalog=catalog)
         else:
             checker = create_app_checker(settings, policy)
@@ -1225,6 +1225,7 @@ def _bind_updates_bridge(
     checker.on_status = post_status
     if settings_bridge is not None:
         settings_bridge.checkAppUpdatesChanged.connect(bridge.refresh)
+        settings_bridge.checkModelUpdatesChanged.connect(bridge.refresh)
         settings_bridge.offlineChanged.connect(bridge.refresh)
     return bridge
 
@@ -1598,7 +1599,7 @@ def main(argv: list[str] | None = None) -> int:
 
         model = None
         try:
-            model = ModelService(settings, policy)
+            model = ModelService(settings, policy, allow_catalog_unavailable=True)
         except Exception as exc:  # noqa: BLE001 — каталог не должен мешать запуску окна
             if getattr(exc, "code", None) == "clock-behind":  # У92/T-116
                 log.warning("Каталог моделей не принят: часы компьютера отстают")
@@ -1825,7 +1826,6 @@ def main(argv: list[str] | None = None) -> int:
             bind_updates,
             scheduled=onboarding is None or onboarding.done or onboarding.step > 1,
             model_store=model_store,
-            catalog=(lambda: model.catalog) if model is not None else None,
         )
         if not args.hidden:
             focuser.focus_shell()

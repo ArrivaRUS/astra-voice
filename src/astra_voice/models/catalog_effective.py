@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -126,6 +127,21 @@ def _load_effective(
     )
     state = catalog_state.state_path(paths.state_dir()) if state_path is None else state_path
     try:
+        state.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        raise CatalogError("state-unavailable", "Состояние каталога недоступно.") from None
+    else:
+        try:
+            marker = catalog_state.read_state(state)
+        except (OSError, ValueError, RecursionError):
+            marker = None
+        if marker is None or re.fullmatch(r"[0-9a-f]{64}", marker.sha256) is None:
+            # Повреждение отметки не разрешает локальному каталогу стереть
+            # историю отзывов. Восстановление допускается только через refresh.
+            raise CatalogError("state-invalid", "Состояние каталога повреждено.")
+    try:
         raw = read_private(root / "catalog.json", CATALOG_MAX_BYTES)
         chosen = load_builtin(verifier, root=root, require_schema=require_schema)
         if read_private(root / "catalog.json", CATALOG_MAX_BYTES) != raw:
@@ -142,7 +158,7 @@ def _load_effective(
     else:
         try:
             remote = verify_catalog(
-                remote_raw, signature, verifier, schema_root=root, require_schema=require_schema
+                remote_raw, signature, verifier, schema_root=root, require_schema=True
             )
         except CatalogError:
             log.warning("Сохранённый снимок каталога не прошёл проверку и пропущен.")

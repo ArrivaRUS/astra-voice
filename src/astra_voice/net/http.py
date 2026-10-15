@@ -683,6 +683,11 @@ class HttpClient:
         self._user_agent = user_agent
         self._extra_hosts = extra_hosts
 
+    @property
+    def gate(self) -> NetworkGate:
+        """Текущий сетевой гейт; заменить его через публичное API нельзя."""
+        return self._gate
+
     def get_stream(
         self,
         url: str,

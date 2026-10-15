@@ -46,6 +46,19 @@ _BODY = b"Astra Voice " * 64
 _USER_AGENT = "Astra-Voice/1.0"
 
 
+def test_client_exposes_its_live_gate_read_only() -> None:
+    settings = Settings()
+    gate = NetworkGate(settings, Policy())
+    client = HttpClient(gate, user_agent=_USER_AGENT)
+
+    assert client.gate is gate
+    assert client.gate.refusal("download") == ""
+    settings.offline = True
+    assert client.gate.refusal("download") == "offline"
+    with pytest.raises(AttributeError):
+        client.gate = NetworkGate(Settings(), Policy())  # type: ignore[misc]
+
+
 @dataclass
 class LocalServer:
     """Адрес, журнал запросов и сигнал завершения медленных ответов."""

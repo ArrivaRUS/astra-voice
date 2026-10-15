@@ -19,6 +19,9 @@ Item {
     readonly property bool downloadOffline: (root.updates && root.updates.networkRefusal === "offline")
         || (root.settings !== null && root.settings.offline === true)
     readonly property var entries: root.settings ? root.settings.models : []
+    readonly property bool catalogUnavailable: root.settings !== null && root.settings.catalogUnavailable
+    readonly property bool canRecoverCatalog: root.updates !== null
+        && typeof root.updates.canCheckModelsNow !== "undefined" ? root.updates.canCheckModelsNow : false
     readonly property bool hasSelection: root.settings !== null
         && root.settings.selectionSummary !== ""
 
@@ -159,6 +162,43 @@ Item {
         id: content
         width: root.width
         spacing: Theme.modelCardMarginBottom
+
+        Column {
+            objectName: "catalogUnavailableNotice"
+            width: parent.width
+            spacing: 12
+            visible: root.catalogUnavailable
+
+            Text {
+                objectName: "catalogUnavailableText"
+                width: parent.width
+                textFormat: Text.PlainText
+                text: qsTr("Список моделей повреждён. Программа загрузит его заново при следующей проверке обновлений")
+                wrapMode: Text.WordWrap
+                color: Theme.fg
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontBodySize
+            }
+
+            Text {
+                objectName: "catalogRecoveryHint"
+                width: parent.width
+                visible: !root.canRecoverCatalog
+                textFormat: Text.PlainText
+                text: qsTr("Включите проверку обновлений моделей или переустановите программу")
+                wrapMode: Text.WordWrap
+                color: Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontBodySize
+            }
+
+            AvButton {
+                objectName: "catalogRecoveryButton"
+                visible: root.canRecoverCatalog
+                text: qsTr("Проверить сейчас")
+                onClicked: { if (root.updates) root.updates.checkModelsNow(); }
+            }
+        }
 
         // Шапка списка: фильтр слева, счётчик справа (§5.6).
         RowLayout {

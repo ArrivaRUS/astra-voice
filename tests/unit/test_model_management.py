@@ -25,6 +25,7 @@ from astra_voice.models.store import ModelRecord, ModelState, ModelStore, StoreE
 from astra_voice.ui import model_downloads
 from astra_voice.ui.bridges import SettingsBridge
 from astra_voice.ui.model_downloads import ModelDownloads, ModelService
+from astra_voice.updates.model_updates import RevisionUpdateResult
 
 pytestmark = pytest.mark.unit
 
@@ -77,6 +78,13 @@ class FakeManagedPort:
         self.space = True
         self.missing_bytes = 0
         self.staged_store: ModelStore | None = None
+        self.fake_revision_updater = Mock()
+        self.fake_revision_updater.apply.return_value = RevisionUpdateResult(
+            "refused", GIGAAM.id, "r1", reason_code="no-update"
+        )
+
+    def revision_updater(self, *, on_state: Callable[[str, str], None]) -> Any:
+        return self.fake_revision_updater
 
     # ── то, что спрашивает ModelDownloads ────────────────────────────────
     def recommended(self) -> CatalogEntry:
@@ -976,6 +984,12 @@ def test_old_revision_stays_installed_and_offers_update(rig: Rig) -> None:
 
     downloads.updateModel(GIGAAM.id)
     # Обновление ревизии идёт через updater; обычная очередь установки не используется.
+    from helpers.scripted_model_port import pump_until
+
+    pump_until(lambda: downloads._model_thread is None, "вызов updater активной модели")
+    port.fake_revision_updater.apply.assert_called_once_with(
+        GIGAAM.id, cancel=downloads._model_cancel
+    )
     assert queued == []
     assert port.current == (GIGAAM.id, "r1")
 

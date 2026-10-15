@@ -1371,6 +1371,10 @@ class FakeSettings(QObject):
     def _get_revocationUnknown(self) -> bool:
         return self._revocationUnknown
 
+    @pyqtProperty(bool, notify=changed)
+    def catalogUnavailable(self) -> bool:  # noqa: N802
+        return False
+
     def _set_revocationUnknown(self, value: bool) -> None:
         self._revocationUnknown = value
         self.changed.emit()

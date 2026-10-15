@@ -21,6 +21,7 @@ from astra_voice.models.catalog_effective import (
     SIGNATURE_MAX_BYTES,
     SNAPSHOT_FILE_NAME,
     load_effective,
+    read_snapshot,
     state_of,
     verify_catalog,
 )
@@ -190,12 +191,13 @@ class CatalogUpdateSource:
         return result
 
     def _prepare(self) -> None:
-        baseline = self._baseline_catalog()
         marker = self._read_watermark(self._watermark)
         if marker is None and self._initialized:
             raise CatalogError("state-invalid", "Состояние каталога отсутствует.")
+        baseline = self._baseline_catalog()
         if (
             self._initialized
+            and not self._blocked
             and self._baseline_seen == baseline
             and self._accepted is not None
             and marker is not None
@@ -220,6 +222,7 @@ class CatalogUpdateSource:
         self._accepted = accepted
         self._baseline_seen = baseline
         self._initialized = True
+        self._blocked = False
         self._tracker.observe(catalog, self._clock())
 
     def current(self) -> Catalog:
@@ -240,9 +243,65 @@ class CatalogUpdateSource:
                 raise CatalogError("stale-catalog", "Актуальный каталог недоступен.")
             return self._catalog
 
+    def _refresh_constraints(self) -> list[catalog_state.CatalogState]:
+        """Собирает границы под CATALOG_LOCK, не чиня утраченную отметку.
+
+        Повреждение/утрата state допускает только сетевое восстановление:
+        кандидат должен быть не старше проверенного builtin, сохранившегося
+        подписанного snapshot и принятого в памяти каталога. Равная пара
+        требует прежнего SHA. Утраченную целиком историю после перезапуска
+        вывести из builtin нельзя; граница — все сохранившиеся ограничения.
+        """
+        constraints = [] if self._accepted is None else [self._accepted]
+        invalid = False
+        try:
+            self._prepare()
+        except CatalogError as error:
+            if error.code not in ("stale-catalog", "state-invalid"):
+                raise
+            invalid = error.code == "state-invalid"
+        if self._accepted is not None:
+            constraints.append(self._accepted)
+        try:
+            marker = self._read_watermark(self._watermark)
+        except CatalogError as error:
+            if error.code != "state-invalid":
+                raise
+            marker = None
+            invalid = True
+        if marker is not None:
+            constraints.append(marker)
+        else:
+            invalid = True
+        if invalid:
+            raw = read_private(self._schema_root / "catalog.json", CATALOG_MAX_BYTES)
+            signature = read_private(self._schema_root / "catalog.json.sig", SIGNATURE_MAX_BYTES)
+            builtin = verify_catalog(
+                raw,
+                signature,
+                self._verifier,
+                schema_root=self._schema_root,
+                require_schema=True,
+            )
+            constraints.append(state_of(builtin, raw))
+            try:
+                raw, signature = read_snapshot(self._directory)
+                snapshot = verify_catalog(
+                    raw,
+                    signature,
+                    self._verifier,
+                    schema_root=self._schema_root,
+                    require_schema=True,
+                )
+            except (OSError, ValueError, TypeError, RecursionError, CatalogError):
+                pass
+            else:
+                constraints.append(state_of(snapshot, raw))
+        return constraints
+
     def refresh(self, cancel: threading.Event) -> None:
         with self._lock:
-            if self._client._gate.refusal("check_models"):
+            if self._client.gate.refusal("check_models"):
                 raise NetworkError("no-network", "Проверка каталога запрещена.")
             if cancel.is_set():
                 raise NetworkError("cancelled", "Проверка отменена.")
@@ -260,10 +319,7 @@ class CatalogUpdateSource:
                 ):
                     return
                 with CATALOG_LOCK:
-                    self._prepare()
-                    marker = self._read_watermark(self._watermark)
-                if marker is None:
-                    raise CatalogError("state-invalid", "Состояние каталога отсутствует.")
+                    constraints = self._refresh_constraints()
                 key = "models:catalog:rate-limit"
                 cached = self._cache.get(key)
                 if cached.rate_limited_until is not None:
@@ -308,19 +364,16 @@ class CatalogUpdateSource:
                     require_schema=True,
                 )
                 candidate = state_of(catalog, raw)
-                if not catalog_state.is_newer(candidate, marker):
+                if not all(catalog_state.is_newer(candidate, bound) for bound in constraints):
                     raise CatalogError("stale-catalog", "Каталог старее текущего.")
                 if cancel.is_set():
                     raise NetworkError("cancelled", "Проверка отменена.")
-                if self._client._gate.refusal("check_models"):
+                if self._client.gate.refusal("check_models"):
                     raise NetworkError("no-network", "Проверка каталога запрещена.")
                 with CATALOG_LOCK:
                     # Источник базового каталога мог измениться за время запроса.
-                    self._prepare()
-                    latest_marker = self._read_watermark(self._watermark)
-                    if latest_marker is None or not catalog_state.is_newer(
-                        candidate, latest_marker
-                    ):
+                    constraints.extend(self._refresh_constraints())
+                    if not all(catalog_state.is_newer(candidate, bound) for bound in constraints):
                         raise CatalogError("stale-catalog", "Каталог старее текущего.")
                     snapshot = json.dumps(
                         {
@@ -329,11 +382,15 @@ class CatalogUpdateSource:
                         },
                         separators=(",", ":"),
                     ).encode()
-                    self._blocked = True
+                    # Пока snapshot не записан, watermark и принятый каталог
+                    # остаются пригодны; ошибка записи не блокирует current().
                     update_cache.write_private(self._snapshot, snapshot)
+                    self._blocked = True
+                    self._watermark.parent.mkdir(parents=True, exist_ok=True)
                     catalog_state.apply_state(self._watermark, candidate)
                     self._catalog = catalog
                     self._accepted = candidate
+                    self._initialized = True
                     self._blocked = False
                 self._tracker.observe(catalog, self._clock())
                 self._cache.set(key, CacheEntry())

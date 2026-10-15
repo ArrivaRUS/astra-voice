@@ -393,6 +393,10 @@ class SettingsBridge(QObject):
     def models(self) -> list[dict[str, Any]]:
         return self._downloads.models if self._downloads is not None else []
 
+    @pyqtProperty(bool, notify=modelsChanged)
+    def catalogUnavailable(self) -> bool:  # noqa: N802
+        return self._downloads is None or self._downloads.catalogUnavailable
+
     @pyqtProperty(bool, notify=revocationUnknownChanged)
     def revocationUnknown(self) -> bool:  # noqa: N802
         return self._downloads.revocationUnknown if self._downloads is not None else False

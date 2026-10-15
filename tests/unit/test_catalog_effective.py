@@ -25,8 +25,10 @@ from astra_voice.models.catalog import Catalog, CatalogEntry, CatalogError
 from astra_voice.models.catalog_effective import load_effective, state_of, verify_catalog
 from astra_voice.models.installer import Installer, SmokeResult
 from astra_voice.models.store import ModelStore, StoreError
+from astra_voice.net import update_cache
 from astra_voice.net.update_cache import write_private
 from astra_voice.security.verify import Verifier, VerifyResult
+from astra_voice.updates import catalog_updates
 
 pytestmark = pytest.mark.unit
 DATA_ROOT = Path(__file__).resolve().parents[2] / "data"
@@ -136,6 +138,25 @@ def scenario(tmp_path: Path) -> Scenario:
     return case
 
 
+@pytest.fixture
+def source(scenario: Scenario) -> catalog_updates.CatalogUpdateSource:
+    from astra_voice.net.gate import NetworkGate
+    from astra_voice.net.http import HttpClient
+
+    return catalog_updates.CatalogUpdateSource(
+        HttpClient(
+            NetworkGate(Settings(check_model_updates=True), Policy()),
+            user_agent="catalog-recovery-test",
+        ),
+        baseline=scenario.load,
+        catalog_url="https://models.example.ru/catalog.json",
+        verifier=scenario.verifier,
+        schema_root=scenario.root,
+        state_dir=scenario.snapshots,
+        global_state_path=scenario.state,
+    )
+
+
 def test_newer_remote_is_applied_and_reverified_after_restart(scenario: Scenario) -> None:
     remote = scenario.remote()
     remote["revoked"] = [
@@ -224,8 +245,13 @@ def test_both_catalogs_below_watermark_are_stale(scenario: Scenario) -> None:
 
 
 @pytest.mark.parametrize("bad_signature", [False, True])
+@pytest.mark.parametrize("serial", [4, 5, 6])
 def test_missing_or_bad_snapshot_cannot_erase_remote_watermark(
-    scenario: Scenario, bad_signature: bool
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+    bad_signature: bool,
+    serial: int,
 ) -> None:
     scenario.snapshot(scenario.remote())
     scenario.load()
@@ -238,6 +264,216 @@ def test_missing_or_bad_snapshot_cannot_erase_remote_watermark(
         scenario.load()
     assert refused.value.code == "stale-catalog"
     assert scenario.state.read_bytes() == before
+    raw = json.dumps(scenario.remote(serial=serial)).encode()
+    fetch = Mock(return_value=(raw, signature(raw)))
+    monkeypatch.setattr(catalog_updates, "fetch", fetch)
+    if serial < 5:
+        with pytest.raises(CatalogError) as refused:
+            source.refresh(threading.Event())
+        assert refused.value.code == "stale-catalog"
+        assert scenario.state.read_bytes() == before
+    else:
+        source.refresh(threading.Event())
+        assert scenario.load().serial == serial
+        assert source.current().serial == serial
+    fetch.assert_called_once()
+
+
+@pytest.mark.parametrize("payload", [b"{}", b"{", b"[]"])
+def test_invalid_marker_is_never_repaired_locally(scenario: Scenario, payload: bytes) -> None:
+    scenario.load()
+    scenario.snapshot(scenario.remote())
+    scenario.state.write_bytes(payload)
+    with pytest.raises(CatalogError) as refused:
+        scenario.load()
+    assert refused.value.code == "state-invalid"
+    assert scenario.state.read_bytes() == payload
+
+
+@pytest.mark.parametrize("keep_snapshot", [False, True])
+@pytest.mark.parametrize("serial", [3, 4, 5, 6])
+def test_invalid_marker_recovery_preserves_all_known_bounds(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+    keep_snapshot: bool,
+    serial: int,
+) -> None:
+    remote = scenario.remote()
+    entry = remote["models"][0]
+    remote["revoked"] = [
+        {"model_id": entry["id"], "revision": entry["revision"], "reason": "отзыв"}
+    ]
+    scenario.snapshot(remote)
+    assert source.current().serial == 5
+    scenario.state.write_bytes(b"{}")
+    if not keep_snapshot:
+        (scenario.snapshots / "catalog-snapshot.json").unlink()
+    with pytest.raises(CatalogError) as refused:
+        source.current()
+    assert refused.value.code == "state-invalid"
+    assert scenario.state.read_bytes() == b"{}"
+    remote["serial"] = serial
+    raw = json.dumps(remote).encode()
+    monkeypatch.setattr(catalog_updates, "fetch", Mock(return_value=(raw, signature(raw))))
+    if serial < 5:
+        with pytest.raises(CatalogError) as refused:
+            source.refresh(threading.Event())
+        assert refused.value.code == "stale-catalog"
+        assert scenario.state.read_bytes() == b"{}"
+    else:
+        source.refresh(threading.Event())
+        assert source.current().serial == serial
+        assert source.current().is_revoked(entry["id"], entry["revision"])
+
+
+def test_remote_snapshot_requires_schema_when_builtin_allows_missing_module(
+    scenario: Scenario,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from astra_voice.models import schema
+
+    remote = scenario.remote()
+    remote["manifest_version"] = 999
+    scenario.snapshot(remote)
+    monkeypatch.setattr(schema, "validate", Mock(side_effect=schema.SchemaUnavailable))
+    selected = load_effective(
+        scenario.verifier,
+        builtin_root=scenario.root,
+        snapshot_dir=scenario.snapshots,
+        state_path=scenario.state,
+        require_schema=False,
+    )
+    assert selected.serial == 4
+
+
+def test_snapshot_write_failure_does_not_block_current(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accepted = source.current()
+    before = scenario.state.read_bytes()
+    raw = json.dumps(scenario.remote()).encode()
+    monkeypatch.setattr(catalog_updates, "fetch", Mock(return_value=(raw, signature(raw))))
+    monkeypatch.setattr(
+        update_cache,
+        "write_private",
+        Mock(side_effect=OSError("disk full")),
+    )
+    with pytest.raises(CatalogError) as refused:
+        source.refresh(threading.Event())
+    assert refused.value.code == "state-write"
+    assert scenario.state.read_bytes() == before
+    assert source.current() == accepted
+
+
+def test_snapshot_failure_after_marker_repair_clears_previous_block(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source._baseline = source.current()
+    raw = json.dumps(scenario.remote()).encode()
+    monkeypatch.setattr(catalog_updates, "fetch", Mock(return_value=(raw, signature(raw))))
+    with monkeypatch.context() as failed_marker:
+        failed_marker.setattr(catalog_state, "write_state", Mock(side_effect=OSError("disk full")))
+        with pytest.raises(CatalogError) as refused:
+            source.refresh(threading.Event())
+        assert refused.value.code == "state-write"
+    assert source._blocked
+    raw = json.dumps(scenario.remote(serial=6)).encode()
+    monkeypatch.setattr(catalog_updates, "fetch", Mock(return_value=(raw, signature(raw))))
+    monkeypatch.setattr(update_cache, "write_private", Mock(side_effect=OSError("disk full")))
+    with pytest.raises(CatalogError) as refused:
+        source.refresh(threading.Event())
+    assert refused.value.code == "state-write"
+    assert source.current().serial == 5
+    marker = catalog_state.read_state(scenario.state)
+    assert marker is not None and marker.serial == 5
+    assert not source._blocked
+
+
+@pytest.mark.parametrize("invalid_marker", [False, True])
+@pytest.mark.parametrize("failure", ["offline", "network", "signature", "same-pair-conflict"])
+def test_recovery_failure_keeps_marker_bytes(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_marker: bool,
+    failure: str,
+) -> None:
+    from astra_voice.net.http import NetworkError
+
+    scenario.snapshot(scenario.remote())
+    source.current()
+    (scenario.snapshots / "catalog-snapshot.json").unlink()
+    if invalid_marker:
+        scenario.state.write_bytes(b"{}")
+    before = scenario.state.read_bytes()
+    remote = scenario.remote()
+    if failure == "same-pair-conflict":
+        remote["models"][0]["description"] = "Другой SHA"
+    raw = json.dumps(remote).encode()
+    fetch = Mock(return_value=(raw, b"bad" if failure == "signature" else signature(raw)))
+    monkeypatch.setattr(catalog_updates, "fetch", fetch)
+    if failure == "offline":
+        monkeypatch.setattr(source._client._gate, "refusal", lambda *_args: "offline")
+    if failure == "network":
+        fetch.side_effect = NetworkError("no-network", "Недоступно")
+    with pytest.raises((CatalogError, NetworkError)):
+        source.refresh(threading.Event())
+    assert scenario.state.read_bytes() == before
+    assert not (scenario.snapshots / "catalog-snapshot.json").exists()
+    assert fetch.call_count == (0 if failure == "offline" else 1)
+
+
+@pytest.mark.parametrize("keep_snapshot", [False, True])
+@pytest.mark.parametrize("serial", [3, 4, 5])
+def test_invalid_marker_after_restart_uses_surviving_verified_bounds(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+    keep_snapshot: bool,
+    serial: int,
+) -> None:
+    scenario.snapshot(scenario.remote())
+    scenario.load()
+    scenario.state.write_bytes(b"{}")
+    if not keep_snapshot:
+        (scenario.snapshots / "catalog-snapshot.json").unlink()
+    raw = json.dumps(scenario.remote(serial=serial)).encode()
+    monkeypatch.setattr(catalog_updates, "fetch", Mock(return_value=(raw, signature(raw))))
+    if serial < (5 if keep_snapshot else 4):
+        with pytest.raises(CatalogError) as refused:
+            source.refresh(threading.Event())
+        assert refused.value.code == "stale-catalog"
+        assert scenario.state.read_bytes() == b"{}"
+    else:
+        source.refresh(threading.Event())
+        assert source.current().serial == serial
+
+
+def test_recovery_rechecks_marker_advanced_during_fetch(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario.snapshot(scenario.remote())
+    scenario.load()
+    (scenario.snapshots / "catalog-snapshot.json").unlink()
+
+    def fetch(*_args: Any, **_kwargs: Any) -> tuple[bytes, bytes]:
+        scenario.snapshot(scenario.remote(serial=7))
+        scenario.load()
+        raw = json.dumps(scenario.remote(serial=6)).encode()
+        return raw, signature(raw)
+
+    monkeypatch.setattr(catalog_updates, "fetch", fetch)
+    with pytest.raises(CatalogError) as refused:
+        source.refresh(threading.Event())
+    assert refused.value.code == "stale-catalog"
+    assert scenario.load().serial == 7
 
 
 def test_equal_pair_conflict_does_not_override_accepted_sha(

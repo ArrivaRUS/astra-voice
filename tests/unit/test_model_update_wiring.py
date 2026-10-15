@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import random
 import stat
 import threading
@@ -15,7 +16,8 @@ from typing import Any, cast
 import pytest
 
 from astra_voice.core import paths
-from astra_voice.core.policy import Policy
+from astra_voice.core.policy import Policy, PolicyStatus
+from astra_voice.core.policy import load as load_policy
 from astra_voice.core.release_identity import catalog_default_url
 from astra_voice.core.settings import Settings
 from astra_voice.models import catalog_state
@@ -24,7 +26,7 @@ from astra_voice.models.installer import Installer, SmokeResult
 from astra_voice.models.store import ModelStore
 from astra_voice.net import github, update_cache
 from astra_voice.net.gate import NetworkGate
-from astra_voice.net.http import MODEL_CHECK_JITTER_MAX_S, CheckResult, HttpClient
+from astra_voice.net.http import MODEL_CHECK_JITTER_MAX_S, CheckResult, HttpClient, NetworkError
 from astra_voice.net.update_cache import UpdateCache
 from astra_voice.security.verify import Verifier, VerifyResult
 from astra_voice.updates import catalog_updates as catalog_module
@@ -300,10 +302,19 @@ def test_manual_check_interrupts_scheduled_model_jitter_from_app_factory(
         "empty-both",
         "default",
         "cleared-with-persisted-source",
+        "allowed-host",
+        "non-string-policy-bool",
+        "non-string-policy-int",
+        "non-string-policy-none",
+        "non-string-policy-list",
+        "non-string-policy-no-settings",
     ],
 )
 def test_factory_connects_configured_catalog_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured_by: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    configured_by: str,
 ) -> None:
     model_store = ModelStore(tmp_path / "models")
     cache = UpdateCache(tmp_path / "cache.json")
@@ -317,6 +328,7 @@ def test_factory_connects_configured_catalog_source(
         def __init__(self, client: HttpClient, **kwargs: Any) -> None:
             assert isinstance(client, HttpClient)
             source_args.update(kwargs)
+            source_args["client"] = client
 
         def current(self) -> Catalog:
             return updated
@@ -332,20 +344,40 @@ def test_factory_connects_configured_catalog_source(
     policy = Policy()
     expected_url = CATALOG_URL
     state_root = tmp_path / "state"
+
+    def ini_policy(url: str) -> Policy:
+        policy_path = tmp_path / "policy.conf"
+        policy_path.write_text(f"[astra-voice]\ncatalog_url = {url}\n", encoding="utf-8")
+        parsed = load_policy(policy_path)
+        assert parsed.status is PolicyStatus.OK
+        assert isinstance(parsed.values["catalog_url"], str)
+        return parsed
+
     if configured_by in ("settings", "empty-policy"):
         settings.extra["catalog_url"] = CATALOG_URL
         if configured_by == "empty-policy":
-            policy = Policy(values={"catalog_url": ""})
+            policy = ini_policy("")
     elif configured_by in ("empty-both", "default"):
         expected_url = catalog_default_url()
         if configured_by == "empty-both":
-            policy = Policy(values={"catalog_url": ""})
+            policy = ini_policy("")
             settings.extra["catalog_url"] = ""
     elif configured_by == "cleared-with-persisted-source":
         (state_root / "model-catalog-updates").mkdir(parents=True)
         expected_url = catalog_default_url()
+    elif configured_by == "allowed-host":
+        expected_url = "https://github.com/ArrivaRUS/astra-voice/catalog.json"
+        settings.extra["catalog_url"] = expected_url
+    elif configured_by.startswith("non-string-policy-"):
+        values: dict[str, Any] = {"bool": True, "int": 42, "none": None, "list": [CATALOG_URL]}
+        variant = configured_by.removeprefix("non-string-policy-")
+        policy = Policy(values={"catalog_url": values.get(variant)})
+        if variant == "no-settings":
+            expected_url = catalog_default_url()
+        else:
+            settings.extra["catalog_url"] = CATALOG_URL
     else:
-        policy = Policy(values={"catalog_url": CATALOG_URL})
+        policy = ini_policy(CATALOG_URL)
         if configured_by == "policy-over-settings":
             settings.extra["catalog_url"] = "https://other.example.ru/catalog.json"
     monkeypatch.setattr(checker_module, "shared_cache", lambda: cache)
@@ -353,12 +385,33 @@ def test_factory_connects_configured_catalog_source(
     monkeypatch.setattr(catalog_module, "CatalogUpdateSource", RecordedSource)
     monkeypatch.setattr(model_module, "ModelUpdateChecker", make_models)
 
+    caplog.clear()
+    caplog.set_level(logging.WARNING, logger=checker_module.__name__)
     checker_module.create_app_checker(
         settings, policy, model_store=model_store, catalog=lambda: baseline
     )
 
     configured_url = source_args["catalog_url"]
-    assert (configured_url() if callable(configured_url) else configured_url) == expected_url
+    for _ in range(3):
+        assert configured_url() == expected_url
+    host_warnings = [record for record in caplog.records if "хост не разрешён" in record.message]
+    assert len(host_warnings) == int(expected_url == CATALOG_URL)
+    if host_warnings:
+        assert host_warnings[0].levelno == logging.WARNING
+        assert "списке публичных источников" in host_warnings[0].message
+        assert "models.example.ru" not in host_warnings[0].message
+        assert CATALOG_URL not in host_warnings[0].message
+        with pytest.raises(NetworkError) as denied:
+            source_args["client"].get_stream(
+                configured_url(),
+                deadline_s=1.0,
+                cancel=threading.Event(),
+                kind="check_models",
+                scope=source_args["scope"],
+            )
+        assert denied.value.code == "not-allowed"
+    type_warnings = [record for record in caplog.records if "ожидалась строка" in record.message]
+    assert len(type_warnings) == int(configured_by.startswith("non-string-policy-"))
     assert source_args["cache"] is cache
     assert model_args["catalog"]() is updated
     cancel = threading.Event()
@@ -578,20 +631,141 @@ def test_catalog_source_observes_catalog_persisted_by_another_source(
     assert catalog_source.fetch_calls == 2
 
 
+@pytest.mark.parametrize("remote_offset", [-1, 0, 1], ids=["older", "equal", "newer"])
 @pytest.mark.parametrize("damage", ["missing", "corrupt"])
 def test_newer_catalog_highwater_requires_valid_snapshot(
-    catalog_source: CatalogSourceRig, damage: str
+    catalog_source: CatalogSourceRig, damage: str, remote_offset: int
 ) -> None:
     source = catalog_source.source()
     source.refresh(threading.Event())
+    accepted = source.current()
+    marker = catalog_source.global_path.read_bytes()
     snapshot = catalog_source.state_dir / "catalog-snapshot.json"
     if damage == "missing":
         snapshot.unlink()
     else:
         snapshot.write_bytes(b"{}")
 
-    with pytest.raises(CatalogError):
-        catalog_source.source().current()
+    restarted = catalog_source.source()
+    with pytest.raises(CatalogError) as failure:
+        restarted.current()
+    assert failure.value.code == "stale-catalog"
+    assert catalog_source.global_path.read_bytes() == marker
+
+    catalog_source.remote_raw = catalog_source.with_serial(accepted.serial + remote_offset)
+    if remote_offset < 0:
+        with pytest.raises(CatalogError) as failure:
+            restarted.refresh(threading.Event())
+        assert failure.value.code == "stale-catalog"
+        assert catalog_source.global_path.read_bytes() == marker
+        with pytest.raises(CatalogError):
+            restarted.current()
+    else:
+        restarted.refresh(threading.Event())
+        recovered = restarted.current()
+        assert recovered.serial == accepted.serial + remote_offset
+        assert snapshot.is_file()
+        assert catalog_source.source().current() == recovered
+
+
+@pytest.mark.parametrize("damage", ["missing-snapshot", "empty-marker"])
+def test_app_factory_and_gui_recover_when_model_service_catalog_is_unavailable(
+    catalog_source: CatalogSourceRig, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    from functools import partial
+
+    from astra_voice.app import _GuiCalls
+    from astra_voice.ui import model_downloads as downloads_module
+    from astra_voice.ui.bridges import SettingsBridge
+    from astra_voice.ui.model_downloads import ModelDownloads, ModelService
+    from helpers.qt_app import get_qapplication
+    from helpers.scripted_model_port import pump_until
+
+    app = get_qapplication()
+    state_root = catalog_source.global_path.parent
+    catalog_source.state_dir = state_root / "model-catalog-updates"
+    source = catalog_source.source()
+    source.refresh(threading.Event())
+    accepted = source.current()
+    (catalog_source.state_dir / "catalog-snapshot.json").unlink()
+    expected_error = "stale-catalog"
+    if damage == "empty-marker":
+        catalog_source.global_path.write_bytes(b"{}")
+        expected_error = "state-invalid"
+    before = catalog_source.global_path.read_bytes()
+    monkeypatch.setattr(paths, "state_dir", lambda: state_root)
+    monkeypatch.setattr(paths, "data_dir_static", lambda: DATA_ROOT)
+    monkeypatch.setattr(paths, "data_dir", lambda: state_root / "data")
+    monkeypatch.setattr(checker_module, "shared_cache", lambda: catalog_source.cache)
+    monkeypatch.setattr(downloads_module, "Verifier", lambda *a, **kw: catalog_source.verifier)
+    monkeypatch.setattr(
+        checker_module,
+        "Verifier",
+        lambda purpose, **kwargs: (
+            catalog_source.verifier if purpose == "catalog" else Verifier(purpose, **kwargs)
+        ),
+    )
+    settings = Settings(check_model_updates=True)
+    settings.extra["catalog_url"] = CATALOG_URL
+
+    with pytest.raises(CatalogError) as failure:
+        ModelService(settings, Policy())
+    assert failure.value.code == expected_error
+    assert catalog_source.global_path.read_bytes() == before
+
+    service = ModelService(settings, Policy(), allow_catalog_unavailable=True)
+    assert service.catalog_unavailable is True
+    assert service.entries() == ()
+    assert service.recommended() is None
+    for read in (lambda: service.catalog, lambda: service.revoked_revision("model", "r0")):
+        with pytest.raises(CatalogError):
+            read()
+    assert catalog_source.global_path.read_bytes() == before
+    downloads = ModelDownloads(service)
+    bridge = SettingsBridge(settings, downloads=downloads, save=lambda _settings: None)
+    try:
+        assert downloads.catalogUnavailable is True
+        assert bridge.catalogUnavailable is True
+        assert bridge.models == []
+        checker = checker_module.create_app_checker(settings, Policy())
+        model_checker = checker._model_checker
+        assert model_checker is not None, "ошибка ModelService не отключает обновление каталога"
+        refresh = model_checker._refresh_catalog
+        assert refresh is not None
+        gui_calls = _GuiCalls()
+        signal_threads: list[int] = []
+        bridge.modelsChanged.connect(lambda: signal_threads.append(threading.get_ident()))
+        checker.on_model_catalog = lambda catalog, new_ids: gui_calls.post(
+            partial(downloads.accept_catalog, catalog, new_ids)
+        )
+        errors: list[BaseException] = []
+
+        def recover() -> None:
+            try:
+                refresh(threading.Event())
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=recover)
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert errors == []
+        assert service.catalog_unavailable is True, "публикация службы ждёт GUI-очередь"
+        pump_until(lambda: not bridge.catalogUnavailable, "восстановление каталога в GUI")
+        assert downloads.catalogUnavailable is False
+        assert service.catalog_unavailable is False
+        assert service.catalog.serial == accepted.serial
+        assert service.entries()
+        assert bridge.models
+        assert signal_threads == [threading.get_ident()]
+        assert (catalog_source.state_dir / "catalog-snapshot.json").is_file()
+        marker = catalog_state.read_state(catalog_source.global_path)
+        assert marker is not None and marker.serial == accepted.serial
+        assert ModelService(settings, Policy()).catalog == service.catalog
+    finally:
+        downloads.shutdown()
+        app.processEvents()
 
 
 @pytest.mark.parametrize("failed_write", ["snapshot", "watermark"])
@@ -621,14 +795,19 @@ def test_catalog_write_failure_blocks_publication_and_preserves_recoverable_stat
         failed.setattr(catalog_state, "write_state", write_marker)
         with pytest.raises(CatalogError):
             source.refresh(threading.Event())
-        with pytest.raises(CatalogError):
-            source.current()
+        if failed_write == "snapshot":
+            assert source.current() == baseline
+        else:
+            with pytest.raises(CatalogError):
+                source.current()
 
     assert marker.read_bytes() == before
     assert catalog_source.global_path.read_bytes() == catalog_source.global_before
     restarted = catalog_source.source().current()
     if failed_write == "snapshot":
         assert restarted == baseline
+        source.refresh(threading.Event())
+        assert source.current().serial == baseline.serial + 1
     else:
         # Успешно сохранённая подписанная пара восстанавливает отставший маркер.
         assert restarted.serial == baseline.serial + 1

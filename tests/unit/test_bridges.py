@@ -67,7 +67,6 @@ from astra_voice.ui.hotkey_capture import CaptureHost, HotkeyCapture
 from astra_voice.ui.icons import install_icon_provider
 from astra_voice.ui.model_downloads import (
     ModelDownloads,
-    ModelPort,
     ModelService,
     _ModelJob,
     make_smoke_check,
@@ -3045,7 +3044,7 @@ def test_model_service_uses_existing_modules(
         factories[name] = factory
         monkeypatch.setattr(bridges, name, factory)
     factories["load_effective"].return_value = catalog
-    service: ModelPort = ModelService(settings, policy)
+    service = ModelService(settings, policy)
     assert service.recommended() == entry
     factories["Verifier"].assert_called_once_with(
         "catalog",
@@ -3077,7 +3076,9 @@ def test_model_service_uses_existing_modules(
     assert len(warnings) == int(isinstance(corp_base, str) and not expected_host)
     assert factories["Installer"].call_args.args[0] is store
     assert callable(factories["Installer"].call_args.args[1])
-    assert factories["Installer"].call_args.kwargs == {"catalog": catalog}
+    provider = factories["Installer"].call_args.kwargs["catalog"]
+    assert callable(provider)
+    assert provider() is catalog
     service.allowed()
     gate.allowed.assert_called_once_with("download")
     service.refusal()
@@ -3087,6 +3088,10 @@ def test_model_service_uses_existing_modules(
     assert not service.installed_ok()
     store.records.return_value = [Mock(state="ok")]
     assert service.installed_ok()
+    refreshed = Catalog(serial=2, trust_epoch=1, entries=(), revoked=())
+    service.accept_catalog(refreshed)
+    assert provider() is refreshed
+    assert factories["Installer"].call_count == 1
 
 
 def test_model_service_invalid_corp_base_warns_once_without_address(
@@ -3467,7 +3472,9 @@ def test_model_app_assembly_and_shutdown(
                 app_mod.main([])
         else:
             assert app_mod.main([]) == 7
-    factory.assert_called_once_with(rig.settings, policy_mod.Policy())
+    factory.assert_called_once_with(
+        rig.settings, policy_mod.Policy(), allow_catalog_unavailable=True
+    )
     properties = dict(
         item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
     )

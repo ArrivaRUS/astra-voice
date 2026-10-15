@@ -265,14 +265,18 @@ class Installer:
     """Меняет текущую модель только после успешного пробного распознавания."""
 
     def __init__(
-        self, store: ModelStore, smoke: SmokeCheck, catalog: Catalog | None = None
+        self,
+        store: ModelStore,
+        smoke: SmokeCheck,
+        catalog: Catalog | Callable[[], Catalog] | None = None,
     ) -> None:
         self._store = store
         self._smoke = smoke
         self._catalog = catalog
 
     def _check_revoked(self, entry: CatalogEntry) -> None:
-        if self._catalog is not None and self._catalog.is_revoked(entry.id, entry.revision):
+        catalog = self._catalog() if callable(self._catalog) else self._catalog
+        if catalog is not None and catalog.is_revoked(entry.id, entry.revision):
             raise _InstallError(
                 "Эта версия модели отозвана. Выберите другую версию или модель.", "revoked"
             )
@@ -292,9 +296,13 @@ class Installer:
         return staging
 
     def install_from_staging(
-        self, entry: CatalogEntry, *, cancel: Callable[[], bool] | None = None
+        self,
+        entry: CatalogEntry,
+        *,
+        cancel: Callable[[], bool] | None = None,
+        activate: bool = True,
     ) -> InstallResult:
-        """Проверяет весь набор до переноса, затем выполняет оставшиеся шаги О2."""
+        """Проверяет и устанавливает набор; activate=False оставляет current владельцу."""
         try:
             self._check_revoked(entry)
             staging = self._staging_path(entry)
@@ -356,7 +364,10 @@ class Installer:
                     replace(record, state="broken", reason=reason),
                     reason_code="selfcheck",
                 )
-            self._store.set_current(entry.id, entry.revision)  # О2.6
+            _check_cancel(cancel)
+            self._check_revoked(entry)
+            if activate:
+                self._store.set_current(entry.id, entry.revision)  # О2.6
             return InstallResult("ok", "", record)
         except (_InstallError, StoreError, OSError, ValueError, RuntimeError) as exc:
             return _error_result(exc)

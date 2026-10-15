@@ -90,7 +90,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 from urllib.parse import urlsplit
 
 import requests
@@ -826,7 +826,7 @@ def updater(
     mu: ModuleType,
     store: ModelStore,
     downloader: FakeDownloader,
-    catalog: Catalog,
+    catalog: Catalog | Callable[[], Catalog],
     *,
     smoke: Mock | None = None,
     states: list[tuple[str, str]] | None = None,
@@ -1218,56 +1218,59 @@ def test_revert_set_current_failure_reports_revert_message(
     assert result.message == "Не удалось вернуть предыдущую версию модели"
     assert result.message != mu.FAILED_MESSAGE
     assert result.active_revision == NEW
-    set_current.assert_called_once_with(new_entry.id, OLD)
-    assert states == [(new_entry.id, "update-failed")]
+    assert set_current.call_args_list == [
+        call(new_entry.id, OLD),
+        call(new_entry.id, NEW, previous_revision=OLD),
+    ]
+    assert states == [(new_entry.id, "activating"), (new_entry.id, "update-failed")]
     assert (store.root / "current.json").read_bytes() == before
     current = store.current()
     assert current is not None and current.revision == NEW
 
 
-def test_apply_previous_pointer_failure_still_succeeds(
+@pytest.mark.parametrize("write_before_error", [False, True])
+def test_apply_pointer_failure_restores_current_and_previous(
     mu: ModuleType,
     installed: ModelStore,
     new_entry: CatalogEntry,
     contents: dict[str, bytes],
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+    write_before_error: bool,
 ) -> None:
+    install(installed, make_entry(contents, NEWER), contents)
+    installed.set_current(new_entry.id, OLD, previous_revision=NEWER)
+    before = (installed.root / "current.json").read_bytes()
     original_set_current = installed.set_current
 
-    def fail_previous_pointer(
+    def fail_activation(
         model_id: str, revision: str, *, previous_revision: str | None = None
     ) -> None:
-        if previous_revision is not None:
+        if revision == NEW:
+            if write_before_error:
+                original_set_current(model_id, revision, previous_revision=previous_revision)
             raise StoreError("disk-full")
-        original_set_current(model_id, revision)
+        original_set_current(model_id, revision, previous_revision=previous_revision)
 
-    set_current = Mock(side_effect=fail_previous_pointer)
+    set_current = Mock(side_effect=fail_activation)
     monkeypatch.setattr(installed, "set_current", set_current)
-    downloader = FakeDownloader(installed, contents)
-    smoke = smoke_for()
     states: list[tuple[str, str]] = []
     result = updater(
-        mu, installed, downloader, make_catalog(new_entry), smoke=smoke, states=states
+        mu, installed, FakeDownloader(installed, contents), make_catalog(new_entry), states=states
     ).apply(new_entry.id, cancel=threading.Event())
-    assert result.state == "updated" and result.active_revision == NEW
-    assert result.message == result.reason_code == ""
-    current = installed.current()
-    assert current is not None and current.revision == NEW
-    assert installed.previous_revision() is None
-    assert json.loads((installed.root / "current.json").read_text()) == {
-        "id": new_entry.id,
-        "revision": NEW,
-    }
-    assert downloader.calls == [NEW]
-    assert smoke.call_count == 1
-    assert set_current.call_count == 2
-    assert set_current.call_args.kwargs == {"previous_revision": OLD}
-    assert states == [(new_entry.id, "updating")]
-    assert any(
-        record.levelname == "WARNING" and "previous-revision-save-failed" in record.message
-        for record in caplog.records
-    )
+    assert result.state == "update-failed" and result.active_revision == OLD
+    assert result.reason_code == "activation"
+    assert result.message == mu.FAILED_MESSAGE
+    assert (installed.root / "current.json").read_bytes() == before
+    assert installed.previous_revision() == NEWER
+    assert set_current.call_args_list == [
+        call(new_entry.id, NEW, previous_revision=OLD),
+        call(new_entry.id, OLD, previous_revision=NEWER),
+    ]
+    assert states == [
+        (new_entry.id, "updating"),
+        (new_entry.id, "activating"),
+        (new_entry.id, "update-failed"),
+    ]
 
 
 @pytest.mark.parametrize("problem", ["recheck", "missing-metadata", "layout", "variant"])
@@ -1294,3 +1297,245 @@ def test_revert_refuses_unusable_previous_record(
     assert result.state == "refused" and result.reason_code == "no-previous"
     assert result.active_revision == NEW
     assert (store.root / "current.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("installer_provider", [False, True])
+def test_apply_revocation_during_delayed_download_keeps_current(
+    mu: ModuleType,
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    installer_provider: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    resume = threading.Event()
+    downloader = FakeDownloader(installed, contents)
+    download = downloader.download
+    catalog = make_catalog(new_entry)
+    original_catalog = catalog
+    before = (installed.root / "current.json").read_bytes()
+
+    def delayed_download(*args: Any, **kwargs: Any) -> Path:
+        started.set()
+        assert resume.wait(5), "Тест не разрешил продолжить загрузку"
+        return download(*args, **kwargs)
+
+    monkeypatch.setattr(downloader, "download", Mock(side_effect=delayed_download))
+    provider = lambda: catalog  # noqa: E731
+    installer = Installer(
+        installed, smoke_for(), provider if installer_provider else original_catalog
+    )
+    revision_updater = mu.ModelRevisionUpdater(installed, downloader, installer, provider)
+    results: list[Any] = []
+    worker = threading.Thread(
+        target=lambda: results.append(
+            revision_updater.apply(new_entry.id, cancel=threading.Event())
+        )
+    )
+    worker.start()
+    try:
+        assert started.wait(5), "Загрузка не началась"
+        catalog = make_catalog(new_entry, revoked=(RevokedEntry(new_entry.id, NEW, "отзыв"),))
+    finally:
+        resume.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert len(results) == 1
+    assert results[0].state == "update-failed"
+    assert results[0].reason_code == "revoked"
+    assert results[0].active_revision == OLD
+    assert (installed.root / "current.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("cancel_after_installer", [False, True])
+def test_apply_cancel_after_smoke_keeps_current(
+    mu: ModuleType,
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_after_installer: bool,
+) -> None:
+    cancel = threading.Event()
+    before = (installed.root / "current.json").read_bytes()
+
+    def smoke(directory: Path, entry: CatalogEntry) -> SmokeResult:
+        if not cancel_after_installer:
+            cancel.set()
+        return SmokeResult(True)
+
+    installer = Installer(installed, smoke)
+    install_staged = installer.install_from_staging
+
+    def install_then_cancel(*args: Any, **kwargs: Any) -> Any:
+        result = install_staged(*args, **kwargs)
+        cancel.set()
+        return result
+
+    monkeypatch.setattr(installer, "install_from_staging", install_then_cancel)
+    states: list[tuple[str, str]] = []
+    result = mu.ModelRevisionUpdater(
+        installed,
+        FakeDownloader(installed, contents),
+        installer,
+        make_catalog(new_entry),
+        on_state=lambda model_id, state: states.append((model_id, state)),
+    ).apply(new_entry.id, cancel=cancel)
+    assert result.state == "update-failed" and result.reason_code == "cancelled"
+    assert result.active_revision == OLD
+    assert (installed.root / "current.json").read_bytes() == before
+    assert states == [(new_entry.id, "updating"), (new_entry.id, "update-failed")]
+
+
+def test_apply_activates_once_with_previous_revision(
+    mu: ModuleType,
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    states: list[tuple[str, str]] = []
+    cancel = threading.Event()
+    original_set_current = installed.set_current
+
+    def save(model_id: str, revision: str, *, previous_revision: str | None = None) -> None:
+        assert states[-1] == (model_id, "activating")
+        current = installed.current()
+        assert current is not None and current.revision == OLD
+        original_set_current(model_id, revision, previous_revision=previous_revision)
+
+    set_current = Mock(side_effect=save)
+    monkeypatch.setattr(installed, "set_current", set_current)
+
+    def state_changed(model_id: str, state: str) -> None:
+        states.append((model_id, state))
+        if state == "activating":
+            cancel.set()  # После границы активации отмена уже не принимается.
+
+    result = mu.ModelRevisionUpdater(
+        installed,
+        FakeDownloader(installed, contents),
+        Installer(installed, smoke_for()),
+        make_catalog(new_entry),
+        on_state=state_changed,
+    ).apply(new_entry.id, cancel=cancel)
+    assert result.state == "updated"
+    set_current.assert_called_once_with(new_entry.id, NEW, previous_revision=OLD)
+    assert installed.previous_revision() == OLD
+
+
+@pytest.mark.parametrize("revert", [False, True])
+def test_latest_revocation_is_checked_after_activating_notification(
+    mu: ModuleType,
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    revert: bool,
+) -> None:
+    if revert:
+        updated_store(mu, installed, new_entry, contents)
+    before = (installed.root / "current.json").read_bytes()
+    catalog = make_catalog(new_entry)
+    target = OLD if revert else NEW
+
+    def state_changed(model_id: str, state: str) -> None:
+        nonlocal catalog
+        if state == "activating":
+            catalog = make_catalog(new_entry, revoked=(RevokedEntry(model_id, target, "отзыв"),))
+
+    revision_updater = mu.ModelRevisionUpdater(
+        installed,
+        FakeDownloader(installed, contents),
+        Installer(installed, smoke_for()),
+        lambda: catalog,
+        on_state=state_changed,
+    )
+    result = (
+        revision_updater.revert_previous(new_entry.id)
+        if revert
+        else revision_updater.apply(new_entry.id, cancel=threading.Event())
+    )
+    assert result.reason_code == "revoked"
+    assert result.state == ("refused" if revert else "update-failed")
+    assert (installed.root / "current.json").read_bytes() == before
+
+
+def test_revert_write_then_raise_restores_previous_pointer(
+    mu: ModuleType,
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updated_store(mu, installed, new_entry, contents)
+    before = (installed.root / "current.json").read_bytes()
+    original_set_current = installed.set_current
+
+    def save(model_id: str, revision: str, *, previous_revision: str | None = None) -> None:
+        original_set_current(model_id, revision, previous_revision=previous_revision)
+        if revision == OLD:
+            raise StoreError("broken-store")
+
+    monkeypatch.setattr(installed, "set_current", save)
+    result = updater(
+        mu, installed, FakeDownloader(installed, contents), make_catalog(new_entry)
+    ).revert_previous(new_entry.id)
+    assert result.state == "update-failed" and result.reason_code == "revert"
+    assert result.active_revision == NEW
+    assert (installed.root / "current.json").read_bytes() == before
+
+
+def test_live_service_accepts_revocation_during_revision_download(
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from PyQt5.QtCore import QCoreApplication, QEvent
+
+    from astra_voice.ui.model_downloads import ModelDownloads, ModelService
+    from helpers.qt_app import get_qapplication
+    from helpers.scripted_model_port import pump_until
+
+    app = get_qapplication()
+    assert app is not None
+    started = threading.Event()
+    resume = threading.Event()
+    service = ModelService.__new__(ModelService)
+    service._catalog = make_catalog(new_entry)
+    service._catalog_error = None
+    service._store = installed
+    service._gate = NetworkGate(Settings(), Policy())
+    service._cancel = threading.Event()
+    downloader = FakeDownloader(installed, contents)
+    download = downloader.download
+
+    def delayed_download(*args: Any, **kwargs: Any) -> Path:
+        started.set()
+        assert resume.wait(5), "Тест не разрешил продолжить загрузку"
+        return download(*args, **kwargs)
+
+    monkeypatch.setattr(downloader, "download", Mock(side_effect=delayed_download))
+    service._downloader = downloader  # type: ignore[assignment]
+    service._installer = Installer(installed, smoke_for(), lambda: service.catalog)
+    downloads = ModelDownloads(service, store=installed)
+    before = (installed.root / "current.json").read_bytes()
+    try:
+        downloads.updateModel(new_entry.id)
+        assert started.wait(5), "Обновление не начало загрузку"
+        revoked = make_catalog(new_entry, revoked=(RevokedEntry(new_entry.id, NEW, "отзыв"),))
+        downloads.accept_catalog(revoked, frozenset())
+        assert service.catalog is revoked
+        assert downloads._pending_catalog is not None
+        resume.set()
+        pump_until(lambda: downloads._model_thread is None, "завершение отозванного обновления")
+        assert (installed.root / "current.json").read_bytes() == before
+        current = installed.current()
+        assert current is not None and current.revision == OLD
+        assert downloads._pending_catalog is None
+    finally:
+        resume.set()
+        downloads.shutdown()
+        QCoreApplication.sendPostedEvents(None, QEvent.MetaCall)
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)

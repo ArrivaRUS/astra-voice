@@ -38,7 +38,7 @@ sys.path.insert(0, str(REPO / "tests"))
 sys.path.insert(0, str(REPO / "tests/unit"))
 sys.path.insert(0, str(REPO / "tests/xvfb"))
 
-from test_model_update_ui import RevisionPort, make_catalog  # noqa: E402
+from test_model_update_ui import CatalogUnavailablePort, RevisionPort, make_catalog  # noqa: E402
 from test_models_live import (  # noqa: E402
     HEIGHT,
     WIDTH,
@@ -54,6 +54,8 @@ from test_models_live import (  # noqa: E402
 )
 
 from astra_voice.core import settings as settings_mod  # noqa: E402
+from astra_voice.core.policy import Policy  # noqa: E402
+from astra_voice.net.gate import NetworkGate  # noqa: E402
 from astra_voice.ui.bridges import SettingsBridge  # noqa: E402
 from astra_voice.ui.icons import install_icon_provider  # noqa: E402
 from astra_voice.ui.model_downloads import ModelDownloads  # noqa: E402
@@ -90,7 +92,13 @@ def app() -> Any:
 
 @contextmanager
 def model_window(
-    app: Any, *, dark: bool = False, scene: str = "update-available", previous: bool = False
+    app: Any,
+    *,
+    dark: bool = False,
+    scene: str = "update-available",
+    previous: bool = False,
+    network: str = "enabled",
+    checker: Any = None,
 ) -> Iterator[tuple[RevisionWindow, UpdatesBridge]]:
     port = RevisionPort()
     port.catalog = (FIRST,)
@@ -104,21 +112,33 @@ def model_window(
             replace(FIRST, revision="r0", recommended=False, removed_from_catalog=True),
         )
         port.current = None
+    elif scene == "catalog-unavailable":
+        port.records = {}
+        port.current = None
     if previous:
         port.previous = "r-1"
         port.records[(FIRST.id, "r-1")] = "ok"
-    downloads = ModelDownloads(port)
+    downloads = ModelDownloads(
+        CatalogUnavailablePort(port) if scene == "catalog-unavailable" else port
+    )
     if scene == "new":
         downloads.accept_catalog(make_catalog(port), frozenset({FIRST.id}))
+    settings = settings_mod.from_dict({"check_model_updates": network != "model-toggle-off"})
+    settings.offline = network == "offline"
+    if network == "app-policy":
+        settings.check_app_updates = False
+    policy = Policy(values={"check_model_updates": False}) if network == "policy" else Policy()
+    if network == "app-policy":
+        policy = Policy(locked_keys=frozenset({"check_app_updates"}))
     bridge = SettingsBridge(
-        settings_mod.from_dict({}),
+        settings,
         downloads=downloads,
         save=Mock(),
         device_provider=lambda: [],
         open_url=lambda _url: False,
         dialog_factory=lambda: "",
     )
-    updates = UpdatesBridge()
+    updates = UpdatesBridge(checker, refusal=NetworkGate(settings, policy).refusal)
     updates.set_status(UpdateStatus("uptodate"))
     downloads.modelRevisionChanged.connect(updates.clear_model_update)
     live = RevisionWindow(port, downloads, bridge)
@@ -436,3 +456,61 @@ def test_failed_update_offers_legacy_update_when_model_becomes_inactive(app: Any
         assert not {"Повторить", "Вернуть предыдущую версию"} & texts
         assert visible_button(card_item(live, FIRST.id), "Обновить").isEnabled()
         assert visible_button(card_item(live, FIRST.id), "Сделать рабочей").isEnabled()
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize(
+    "network", ["enabled", "app-policy", "model-toggle-off", "offline", "policy"]
+)
+def test_catalog_unavailable_explains_recovery_and_manual_check_uses_model_gate(
+    app: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dark: bool, network: str
+) -> None:
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    checker = Mock()
+    models_allowed = network in {"enabled", "app-policy"}
+    with model_window(
+        app, dark=dark, scene="catalog-unavailable", network=network, checker=checker
+    ) as (live, updates):
+        message = (
+            "Список моделей повреждён. Программа загрузит его заново при следующей "
+            "проверке обновлений"
+        )
+        instruction = "Включите проверку обновлений моделей или переустановите программу"
+        texts = visible_texts(live.root)
+        assert message in texts
+        assert (instruction in texts) is (not models_allowed)
+        assert live.bridge.catalogUnavailable is True
+        assert live.bridge.models == []
+        buttons = [
+            item
+            for item in visual_tree(live.root)
+            if item.isVisible()
+            and item.property("text") == "Проверить сейчас"
+            and item.metaObject().indexOfSignal(b"clicked()") >= 0
+        ]
+        assert len(buttons) == (1 if models_allowed else 0)
+        for item in visual_tree(live.root):
+            if item.isVisible() and item.property("text") in {message, instruction}:
+                assert item.property("textFormat") == 0
+        assert updates.canCheckModelsNow is models_allowed
+        if network == "app-policy":
+            assert updates.canCheckNow is False
+        if buttons:
+            assert buttons[0].isEnabled()
+            press(buttons[0])
+            checker.check_models_now.assert_called_once_with()
+        else:
+            checker.check_models_now.assert_not_called()
+        checker.check_now.assert_not_called()
+        screenshot(
+            app, live, tmp_path, f"catalog-unavailable-{network}-{'dark' if dark else 'light'}.png"
+        )
+
+        live.port.catalog = (FIRST,)
+        live.downloads.accept_catalog(make_catalog(live.port), frozenset())
+        app.processEvents()
+        assert live.bridge.catalogUnavailable is False
+        texts = visible_texts(live.root)
+        assert message not in texts
+        assert instruction not in texts
+        assert card_item(live, FIRST.id) is not None

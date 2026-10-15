@@ -28,6 +28,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+from urllib.parse import urlsplit
 
 from astra_voice.core import paths
 from astra_voice.core.release_identity import RELEASES_REPO, catalog_default_url
@@ -35,6 +36,7 @@ from astra_voice.core.version import __version__
 from astra_voice.net import github
 from astra_voice.net.catalog_url import catalog_urls
 from astra_voice.net.gate import NetworkGate
+from astra_voice.net.hosts import host_allowed
 from astra_voice.net.http import (
     APP_CHECK_JITTER_MAX_S,
     RATE_LIMIT_MAX_S,
@@ -169,6 +171,7 @@ class UpdateChecker:
         self._status = UpdateStatus("disabled")
         self._published = False
         self._manual_requested = False
+        self._models_manual_requested = False
         self._actions: list[Callable[[], None]] = []
         # Результат ручной проверки показывается и при выключенном тумблере —
         # до следующего refresh() (смены настроек).
@@ -205,6 +208,14 @@ class UpdateChecker:
     def check_now(self) -> None:
         """«Проверить сейчас»: без лимита частоты, окно 429 уважается."""
         self._request(manual=True)
+
+    def check_models_now(self) -> None:
+        """Ручная проверка только моделей; после stop() заявки не принимаются."""
+        with self._lock:
+            if self._stop.is_set():
+                return
+            self._models_manual_requested = True
+            self._wake.set()
 
     def enable_scheduled_checks(self) -> None:
         """Экран 1 пройден: однократно разрешить плановые проверки с задержкой."""
@@ -296,6 +307,8 @@ class UpdateChecker:
         with self._lock:
             manual = self._manual_requested
             self._manual_requested = False
+            models_manual = self._models_manual_requested
+            self._models_manual_requested = False
             actions, self._actions = self._actions, []
             self._wake.clear()
         for action in actions:
@@ -307,6 +320,11 @@ class UpdateChecker:
             self._check(manual=True)
             self._check_models(manual=True)
             return  # срок плановой проверки оценивается следующим кругом
+        if models_manual:
+            # Совпавшая общая заявка выше уже включает модели; новые заявки,
+            # пришедшие во время проверки, остаются следующему кругу.
+            self._check_models(manual=True)
+            return
         if (
             self._scheduled_enabled
             and self._clock() >= self._next_due
@@ -693,17 +711,56 @@ def create_app_checker(
     track: Track = "appimage" if paths.install_kind().is_appimage else "deb"
     cache = shared_cache()
     checker = UpdateChecker(gate, client, cache=cache, metadata=metadata, track=track)
+    # Источник восстановления не зависит от ModelService/load_effective:
+    # старый builtin здесь только нижняя граница для сетевого кандидата.
+    if model_store is None:
+        from astra_voice.models.store import ModelStore
+
+        model_store = ModelStore()
+    if catalog is None:
+        from astra_voice.models.catalog import load_builtin
+
+        catalog = load_builtin(
+            Verifier("catalog", keyring=paths.data_dir_static() / "keys" / "release.gpg"),
+            root=paths.data_dir_static(),
+            state_path=None,
+        )
     if model_store is not None and catalog is not None:
         from astra_voice.updates.catalog_updates import CatalogUpdateSource, NewModelTracker
         from astra_voice.updates.model_updates import ModelUpdateChecker
 
         model_catalog = catalog
         refresh_catalog: Callable[[threading.Event], None] | None = None
+        catalog_warnings: set[str] = set()
+
+        def public_catalog_url(url: str) -> str:
+            # Только диагностика: решение о запросе остаётся за HttpClient.
+            try:
+                catalog_urls(url)
+            except ValueError:
+                return url
+            if not host_allowed(urlsplit(url).hostname or "") and "host" not in catalog_warnings:
+                catalog_warnings.add("host")
+                log.warning(
+                    "catalog_url: хост не разрешён; сервер отсутствует "
+                    "в списке публичных источников (scope=public)."
+                )
+            return url
 
         def configured_catalog_url() -> str:
             policy_url = policy.values.get("catalog_url")
             if isinstance(policy_url, str) and policy_url:
-                return policy_url
+                return public_catalog_url(policy_url)
+            if (
+                "catalog_url" in policy.values
+                and not isinstance(policy_url, str)
+                and "policy-type" not in catalog_warnings
+            ):
+                catalog_warnings.add("policy-type")
+                log.warning(
+                    "Неверный catalog_url в политике: ожидалась строка; "
+                    "значение считается незаданным."
+                )
             settings_url = settings.extra.get("catalog_url", "")
             if settings_url != "":
                 try:
@@ -715,7 +772,7 @@ def create_app_checker(
                         "Неверный catalog_url в настройках; используется адрес по умолчанию."
                     )
                 else:
-                    return settings_url
+                    return public_catalog_url(settings_url)
             return catalog_default_url()
 
         configured_url = configured_catalog_url()

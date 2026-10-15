@@ -1233,3 +1233,56 @@ def test_every_catalog_entry_passes_contents_and_layout(
 
     inst._check_contents(directory, entry, allow_parts=False)
     inst._check_model_layout(directory, entry)
+
+
+def test_install_without_activation_preserves_pointer(
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    smoke: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous = _previous(store, entry, contents)
+    before = _pointer(store)
+    _stage(store, entry, contents)
+    set_current = Mock(wraps=store.set_current)
+    monkeypatch.setattr(store, "set_current", set_current)
+    result = Installer(store, smoke).install_from_staging(entry, activate=False)
+    assert result.state == "ok"
+    assert result.record is not None
+    assert result.record in store.records()
+    smoke.assert_called_once_with(result.record.dir, entry)
+    set_current.assert_not_called()
+    assert store.current() == previous
+    assert _pointer(store) == before
+
+
+@pytest.mark.parametrize("activate", [False, True])
+@pytest.mark.parametrize("interrupt", ["revoked", "cancelled"])
+def test_install_rechecks_after_smoke(
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    activate: bool,
+    interrupt: str,
+) -> None:
+    previous = _previous(store, entry, contents)
+    before = _pointer(store)
+    _stage(store, entry, contents)
+    catalog = Catalog(1, 1, (), (entry,))
+    cancelled = False
+
+    def smoke(directory: Path, model: CatalogEntry) -> SmokeResult:
+        nonlocal catalog, cancelled
+        if interrupt == "revoked":
+            catalog = Catalog(2, 1, (RevokedEntry(entry.id, entry.revision, "отзыв"),), (entry,))
+        else:
+            cancelled = True
+        return SmokeResult(True)
+
+    result = Installer(store, smoke, lambda: catalog).install_from_staging(
+        entry, activate=activate, cancel=lambda: cancelled
+    )
+    assert result.state == "error" and result.reason_code == interrupt
+    assert store.current() == previous
+    assert _pointer(store) == before

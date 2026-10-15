@@ -113,6 +113,8 @@ class UpdateActions(Protocol):
 
     def check_now(self) -> None: ...
 
+    def check_models_now(self) -> None: ...
+
     def refresh(self) -> None: ...
 
     def skip_version(self, version: str) -> None: ...
@@ -218,6 +220,7 @@ class UpdatesBridge(QObject):
         self._check_refusal = ""
         self._network_refusal = ""
         self._scheduled_refusal = ""
+        self._model_check_refusal = ""
         self._read_network()
 
     # -- Python (GUI-поток) -------------------------------------------------
@@ -283,14 +286,25 @@ class UpdatesBridge(QObject):
             self._checker.refresh()
 
     def _read_network(self) -> None:
-        check = download = scheduled = ""
+        check = download = scheduled = models = ""
         if self._refusal is not None:
             check = self._refusal("check_app_manual")
             download = self._refusal("download")
             scheduled = self._refusal("check_app")
-        values = (check, download, scheduled)
-        if values != (self._check_refusal, self._network_refusal, self._scheduled_refusal):
-            self._check_refusal, self._network_refusal, self._scheduled_refusal = values
+            models = self._refusal("check_models")
+        values = (check, download, scheduled, models)
+        if values != (
+            self._check_refusal,
+            self._network_refusal,
+            self._scheduled_refusal,
+            self._model_check_refusal,
+        ):
+            (
+                self._check_refusal,
+                self._network_refusal,
+                self._scheduled_refusal,
+                self._model_check_refusal,
+            ) = values
             self.networkChanged.emit()
             self.statusChanged.emit()
             self.downloadChanged.emit()
@@ -376,6 +390,14 @@ class UpdatesBridge(QObject):
     def canCheckNow(self) -> bool:  # noqa: N802
         return self._checker is not None and self._check_refusal == ""
 
+    @pyqtProperty(bool, notify=networkChanged)
+    def canCheckModelsNow(self) -> bool:  # noqa: N802
+        return (
+            self._checker is not None
+            and self._refusal is not None
+            and self._model_check_refusal == ""
+        )
+
     # -- слоты ---------------------------------------------------------------
 
     @pyqtSlot()
@@ -383,6 +405,12 @@ class UpdatesBridge(QObject):
         self._read_network()
         if self._checker is not None and self._check_refusal == "":
             self._checker.check_now()
+
+    @pyqtSlot()
+    def checkModelsNow(self) -> None:  # noqa: N802
+        self._read_network()
+        if self._checker is not None and self.canCheckModelsNow:
+            self._checker.check_models_now()
 
     @pyqtSlot()
     def skipVersion(self) -> None:  # noqa: N802

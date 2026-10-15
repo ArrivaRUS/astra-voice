@@ -96,8 +96,8 @@ class ModelRevisionUpdater:
 
     Методы одного экземпляра сериализованы. Владелец должен исключить другие
     установки и смену current во время операции: общего lock у ModelStore нет.
-    Отмена передаётся Installer и после начала установки подчиняется его
-    контракту (проверка отмены при чтении контрольных сумм).
+    Отмена проверяется до активации, включая завершение пробного распознавания.
+    Состояние activating обозначает границу, после которой отмена не принимается.
     """
 
     def __init__(
@@ -105,7 +105,7 @@ class ModelRevisionUpdater:
         store: ModelStore,
         downloader: DownloaderLike,
         installer: Installer,
-        catalog: Catalog,
+        catalog: Catalog | Callable[[], Catalog],
         *,
         on_state: Callable[[str, str], None] | None = None,
     ) -> None:
@@ -115,6 +115,16 @@ class ModelRevisionUpdater:
         self._catalog = catalog
         self._on_state = on_state
         self._lock = threading.Lock()
+
+    def _current_catalog(self) -> Catalog:
+        return self._catalog() if callable(self._catalog) else self._catalog
+
+    def _restore_current(self, model_id: str, revision: str, previous_revision: str | None) -> None:
+        # set_current может отказать на fsync каталога уже после os.replace.
+        try:
+            self._store.set_current(model_id, revision, previous_revision=previous_revision)
+        except Exception:  # noqa: BLE001 — не скрываем первоначальный отказ активации
+            log.warning("models state=current-restore-failed")
 
     def _result(
         self,
@@ -151,7 +161,8 @@ class ModelRevisionUpdater:
             return self._apply(model_id, cancel=cancel)
 
     def _apply(self, model_id: str, *, cancel: threading.Event) -> RevisionUpdateResult:
-        entry = self._catalog.entry(model_id)
+        catalog = self._current_catalog()
+        entry = catalog.entry(model_id)
         current = self._store.current()
         if (
             ID_RE.fullmatch(model_id) is None
@@ -161,12 +172,13 @@ class ModelRevisionUpdater:
             or current.id != model_id
         ):
             return self._result("refused", model_id, "not-installed")
-        if self._catalog.is_revoked(model_id, entry.revision):
+        if catalog.is_revoked(model_id, entry.revision):
             return self._result("refused", model_id, "revoked")
         if current.revision == entry.revision:
             return self._result("refused", model_id, "no-update")
         if cancel.is_set():
             return self._failed(model_id, "cancelled")
+        previous_revision = self._store.previous_revision()
 
         self._state(model_id, "updating")
         try:
@@ -195,7 +207,9 @@ class ModelRevisionUpdater:
             self._store.discard_staging(entry.id, entry.revision)
             return self._failed(model_id, "cancelled" if cancel.is_set() else "not-installed")
         try:
-            result = self._installer.install_from_staging(entry, cancel=cancel.is_set)
+            result = self._installer.install_from_staging(
+                entry, cancel=cancel.is_set, activate=False
+            )
         except Exception:  # noqa: BLE001 — неожиданный отказ установщика остаётся отказом
             self._store.discard_staging(entry.id, entry.revision)
             return self._failed(model_id, "download")
@@ -208,10 +222,17 @@ class ModelRevisionUpdater:
                 "revoked": "revoked",
             }.get(result.reason_code, "download")
             return self._failed(model_id, reason)
+        if cancel.is_set():
+            return self._failed(model_id, "cancelled")
+        self._state(model_id, "activating")
         try:
+            if self._current_catalog().is_revoked(model_id, entry.revision):
+                return self._failed(model_id, "revoked")
             self._store.set_current(model_id, entry.revision, previous_revision=current.revision)
-        except Exception:  # noqa: BLE001 — новая ревизия уже активирована установщиком
-            log.warning("models state=previous-revision-save-failed")
+        except Exception:  # noqa: BLE001 — восстанавливаем и при отказе после записи
+            log.warning("models state=activation-failed")
+            self._restore_current(model_id, current.revision, previous_revision)
+            return self._failed(model_id, "activation")
         return self._result("updated", model_id)
 
     def revert_previous(self, model_id: str) -> RevisionUpdateResult:
@@ -241,9 +262,16 @@ class ModelRevisionUpdater:
                     or not previous.variant
                 ):
                     return self._result("refused", model_id, "no-previous")
-                if self._catalog.is_revoked(model_id, revision):
+                if self._current_catalog().is_revoked(model_id, revision):
                     return self._result("refused", model_id, "revoked")
-                self._store.set_current(model_id, revision)
+                self._state(model_id, "activating")
+                if self._current_catalog().is_revoked(model_id, revision):
+                    return self._result("refused", model_id, "revoked")
+                try:
+                    self._store.set_current(model_id, revision)
+                except Exception:
+                    self._restore_current(model_id, current.revision, revision)
+                    raise
             except Exception:  # noqa: BLE001 — отказ хранилища не выдаётся за успешный возврат
                 return self._failed(model_id, "revert", failure_message=REVERT_FAILED_MESSAGE)
             return self._result("updated", model_id)
@@ -334,7 +362,7 @@ class ModelUpdateChecker:
             return self._run_once(cancel, manual=manual)
 
     def _run_once(self, cancel: threading.Event, *, manual: bool) -> ModelCheckSummary:
-        if self._client._gate.refusal("check_models"):
+        if self._client.gate.refusal("check_models"):
             return ModelCheckSummary("disabled")
         if cancel.is_set():
             raise NetworkError("cancelled", "Проверка отменена.")
@@ -347,7 +375,7 @@ class ModelUpdateChecker:
                 delay = (self._rng or random.Random()).uniform(0, self._jitter_max_s)
                 if (self._wait or cancel.wait)(delay) or cancel.is_set():
                     raise NetworkError("cancelled", "Проверка отменена.")
-            if self._client._gate.refusal("check_models"):
+            if self._client.gate.refusal("check_models"):
                 return ModelCheckSummary("disabled")
             try:
                 self._refresh_catalog(cancel)
@@ -366,7 +394,7 @@ class ModelUpdateChecker:
                 log.warning("catalog state=unavailable reason=refresh-failed")
         if cancel.is_set():
             raise NetworkError("cancelled", "Проверка отменена.")
-        if self._client._gate.refusal("check_models"):
+        if self._client.gate.refusal("check_models"):
             return ModelCheckSummary("disabled")
         try:
             catalog = self._current_catalog()
@@ -413,7 +441,7 @@ class ModelUpdateChecker:
             return ModelCheckSummary("unavailable")
         if cancel.is_set():
             raise NetworkError("cancelled", "Проверка отменена.")
-        if self._client._gate.refusal("check_models"):
+        if self._client.gate.refusal("check_models"):
             return ModelCheckSummary("disabled", requests_made=result.requests_made)
         notices: tuple[ModelUpdateNotice, ...] = ()
         state: str = result.state

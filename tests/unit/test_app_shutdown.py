@@ -644,7 +644,7 @@ def test_model_service_receives_effective_settings_and_onboarding_receives_store
 
     assert app_mod.main([]) == 7
 
-    model_factory.assert_called_once_with(expected, policy)
+    model_factory.assert_called_once_with(expected, policy, allow_catalog_unavailable=True)
     effective = model_factory.call_args.args[0]
     assert effective is rig.factory.call_args.kwargs["settings"]
     assert effective is not rig.settings
