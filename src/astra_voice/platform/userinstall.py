@@ -723,6 +723,11 @@ def menu_entry_bytes(launcher: Path, version: str, icon: Path | None = None) -> 
         # ambiguous escaping and control characters; spaces/$/%/quotes are literal.
         if "\\" not in value and value.isprintable():
             icon_name = value
+        else:
+            log.info("Значок меню: Icon=astravoice reason=unsafe_path")
+    elif icon is not None:
+        log.info("Значок меню: Icon=astravoice reason=relative_path")
+    # None is already diagnosed by _menu_icon; do not duplicate that INFO here.
     return _MENU_TEMPLATE.format(command=command, version=version, icon=icon_name).encode("utf-8")
 
 
@@ -921,9 +926,11 @@ def _menu_icon(icons: Path) -> Path | None:
             size = int(width)
             if size > largest_size and all(_is_real_dir(parent) for parent in icon.parents):
                 largest, largest_size = icon, size
-    except (OSError, UserInstallError) as exc:
-        log.warning("Значок меню не выбран: %s", tilde(exc))
+    except (OSError, UserInstallError):
+        log.info("Значок меню: Icon=astravoice reason=selection_error")
         return None
+    if largest is None:
+        log.info("Значок меню: Icon=astravoice reason=no_usable_png")
     return largest
 
 

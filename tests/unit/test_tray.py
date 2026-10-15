@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ pytestmark = pytest.mark.unit
 SERVICE = "org.kde.StatusNotifierWatcher"
 PLASMA = "org.kde.plasmashell"
 UNAVAILABLE = "Значок не появился на панели"
+OWN_ITEM = f"org.kde.StatusNotifierItem-{os.getpid()}-1/StatusNotifierItem"
 
 
 @dataclass
@@ -60,6 +62,7 @@ class Bus:
     def __init__(self) -> None:
         self.executor: _TrayBusTransport
         self.host_registered: object = True
+        self.registered_items: object = [OWN_ITEM]
         self.plasma_owner = ":1.42"
         self.auto_reply = True
         self.calls: list[PendingCall] = []
@@ -87,7 +90,17 @@ class Bus:
             return message.createReply([])
         self.calls.append(pending)
         if message.member() == "Get":
-            return message.createReply([QDBusVariant(self.host_registered)])
+            property_name = message.arguments()[1]
+            assert property_name in (
+                "IsStatusNotifierHostRegistered",
+                "RegisteredStatusNotifierItems",
+            )
+            value = (
+                self.host_registered
+                if property_name == "IsStatusNotifierHostRegistered"
+                else self.registered_items
+            )
+            return message.createReply([QDBusVariant(value)])
         if self.plasma_owner:
             return message.createReply([self.plasma_owner])
         return message.createErrorReply(
@@ -142,6 +155,17 @@ class Bus:
         self.host_registered = value
         member = "StatusNotifierHostRegistered" if value else "StatusNotifierHostUnregistered"
         self.signals[member]()
+
+    def item_registered(self, item: str = OWN_ITEM) -> None:
+        assert isinstance(self.registered_items, list)
+        if item not in self.registered_items:
+            self.registered_items.append(item)
+        self.signals["StatusNotifierItemRegistered"](item)
+
+    def item_unregistered(self, item: str = OWN_ITEM) -> None:
+        assert isinstance(self.registered_items, list)
+        self.registered_items = [value for value in self.registered_items if value != item]
+        self.signals["StatusNotifierItemUnregistered"](item)
 
 
 class Signal:
@@ -224,11 +248,25 @@ class Harness:
     drop: Mock
     panel_warning: Mock
     send_command: Mock
+    probe: Mock
 
     @property
     def menu(self) -> QMenu:
         menu: QMenu = self.icon.setContextMenu.call_args.args[0]
         return menu
+
+
+@pytest.fixture(autouse=True)
+def forbid_real_x(monkeypatch: pytest.MonkeyPatch) -> None:
+    try:
+        from Xlib import display
+    except ImportError:
+        return
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("Real X server access forbidden in tray tests")
+
+    monkeypatch.setattr(display, "Display", forbidden)
 
 
 @pytest.fixture(scope="module")
@@ -245,6 +283,9 @@ def harness(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> Iterator[Har
     monkeypatch.setattr(
         module, "QSystemTrayIcon", Mock(side_effect=AssertionError("Real tray forbidden"))
     )
+    probe = Mock(spec=["owner", "close"])
+    probe.owner.return_value = None
+    monkeypatch.setattr(module, "XEmbedTrayProbe", Mock(return_value=probe))
     connection = Mock()
     bus = Bus()
     connection.sessionBus.return_value = bus.transport
@@ -317,6 +358,7 @@ def harness(qapp: QApplication, monkeypatch: pytest.MonkeyPatch) -> Iterator[Har
         drop,
         panel_warning,
         send_command,
+        probe,
     )
     tray.stop()
     module.shutdown_bus_threads()
@@ -535,11 +577,13 @@ def test_register_immediately_and_stop(harness: Harness) -> None:
     assert harness.tray.registered
     harness.icon.show.assert_called_once_with()
     harness.connection.connectToBus.assert_called_once()
-    assert len(harness.bus.matches) == 4
+    assert len(harness.bus.matches) == 6
     assert set(harness.bus.signals) == {
         "NameOwnerChanged",
         "StatusNotifierHostRegistered",
         "StatusNotifierHostUnregistered",
+        "StatusNotifierItemRegistered",
+        "StatusNotifierItemUnregistered",
         "PropertiesChanged",
     }
     harness.tray.start()
@@ -765,13 +809,23 @@ def test_icon_loss_hides_registered_tray_and_retries(
     assert harness.icon.show.call_count == 2
 
 
-def test_state_change_after_timeout_can_register_restored_icon(harness: Harness) -> None:
+def test_state_change_after_timeout_waits_for_bus_signal_to_register_restored_icon(
+    harness: Harness,
+) -> None:
     harness.provider.has_icon.return_value = False
     harness.tray.start()
     harness.clock.advance(30_000)
     harness.banner.assert_called_once_with()
     harness.provider.has_icon.return_value = True
+    calls = harness.bus.transport.call.call_count
+    probes = harness.probe.owner.call_count
     harness.tray.set_state(TrayState.LISTENING)
+    harness.clock.advance(60_000)
+    assert not harness.tray.registered
+    assert harness.bus.transport.call.call_count == calls
+    assert harness.probe.owner.call_count == probes
+    harness.banner.assert_called_once_with()
+    harness.bus.host_changed(True)
     assert harness.tray.registered
     harness.clock.advance(60_000)
     harness.banner.assert_called_once_with()
@@ -935,6 +989,8 @@ def test_host_requires_boolean_true_reply(harness: Harness, value: object) -> No
     assert request.message.member() == "Get"
     assert request.message.arguments() == [SERVICE, "IsStatusNotifierHostRegistered"]
     request.reply(True)
+    assert not harness.tray.registered
+    harness.bus.calls[-1].reply([OWN_ITEM])
     assert harness.tray.registered
     harness.icon.show.assert_called_once_with()
 
@@ -952,12 +1008,14 @@ def test_host_signal_refreshes_cache_with_get(harness: Harness, member: str) -> 
     assert not harness.tray.registered
     harness.icon.show.assert_not_called()
     harness.bus.calls[-1].reply(True)
+    assert not harness.tray.registered
+    harness.bus.calls[-1].reply([OWN_ITEM])
     assert harness.tray.registered
     harness.bus.host_changed(False)
     assert not harness.tray.registered
 
 
-def test_host_property_invalidation_refreshes_but_item_changes_do_not(harness: Harness) -> None:
+def test_host_and_items_property_invalidation_refreshes_without_reshowing(harness: Harness) -> None:
     harness.tray.start()
     requests = len(harness.bus.calls)
     properties_changed = harness.bus.signals["PropertiesChanged"]
@@ -965,12 +1023,12 @@ def test_host_property_invalidation_refreshes_but_item_changes_do_not(harness: H
     properties_changed(SERVICE, {"RegisteredStatusNotifierItems": ["astra"]}, [])
     properties_changed("unrelated.interface", {"IsStatusNotifierHostRegistered": False}, [])
     assert harness.tray.registered
-    assert len(harness.bus.calls) == requests
+    assert len(harness.bus.calls) == requests + 1
     harness.icon.show.assert_called_once_with()
     harness.bus.host_registered = False
     properties_changed(SERVICE, {}, ["IsStatusNotifierHostRegistered"])
     assert not harness.tray.registered
-    assert len(harness.bus.calls) == requests + 1
+    assert len(harness.bus.calls) == requests + 2
 
 
 @pytest.mark.parametrize("kind", [SessionKind.FLY, SessionKind.OTHER])
@@ -1048,6 +1106,8 @@ def test_owner_replacement_discards_cache_and_stale_reply(harness: Harness) -> N
     previous.reply(True)
     assert not harness.tray.registered
     current.reply(True)
+    assert not harness.tray.registered
+    harness.bus.calls[-1].reply([OWN_ITEM])
     assert harness.tray.registered
     previous.fail()
     assert harness.tray.registered
@@ -1065,6 +1125,8 @@ def test_initial_plasma_reply_cannot_undo_owner_loss(harness: Harness) -> None:
     owner.reply(":1.42")
     assert not harness.tray.registered
     harness.watcher.serviceRegistered.emit(PLASMA)
+    assert not harness.tray.registered
+    harness.bus.calls[-1].reply([OWN_ITEM])
     assert harness.tray.registered
 
 
@@ -1080,6 +1142,8 @@ def test_late_reply_cannot_cross_stop_and_start(harness: Harness) -> None:
     old.reply(True)
     assert not harness.tray.registered
     harness.bus.calls[-1].reply(True)
+    assert not harness.tray.registered
+    harness.bus.calls[-1].reply([OWN_ITEM])
     assert harness.tray.registered
 
 
@@ -1111,8 +1175,8 @@ def test_receiver_survives_cycles_and_different_trays(
     deleted.assert_not_called()
     deferred_delete.assert_not_called()
     harness.connection.connectToBus.assert_called_once()
-    assert harness.bus.transport.connect.call_count == 4
-    assert len(harness.bus.matches) == 4
+    assert harness.bus.transport.connect.call_count == 6
+    assert len(harness.bus.matches) == 6
     harness.connection.disconnectFromBus.assert_not_called()
     harness.bus.transport.disconnect.assert_not_called()
     receiver.destroyed.disconnect(deleted)
@@ -1134,6 +1198,8 @@ def test_late_reply_cannot_reach_another_tray(harness: Harness) -> None:
         old.reply(True)
         assert not tray.registered
         harness.bus.calls[-1].reply(True)
+        assert not tray.registered
+        harness.bus.calls[-1].reply([OWN_ITEM])
         assert tray.registered
     finally:
         tray.stop()
@@ -1165,6 +1231,8 @@ def test_failed_async_request_is_retried_without_blocking(harness: Harness) -> N
     harness.clock.advance(1000)
     assert len(harness.bus.calls) == 2
     harness.bus.calls[-1].reply(True)
+    assert not harness.tray.registered
+    harness.bus.calls[-1].reply([OWN_ITEM])
     assert harness.tray.registered
 
 
@@ -1176,7 +1244,7 @@ def test_send_failure_does_not_leave_request_pending(harness: Harness) -> None:
 
     harness.bus.transport.call.side_effect = failed
     harness.tray.start()
-    assert len(harness.bus.matches) == 4
+    assert len(harness.bus.matches) == 6
     assert not harness.tray.registered
     assert not harness.tray._requests
     harness.bus.transport.call.side_effect = harness.bus.call
@@ -1332,6 +1400,8 @@ def test_public_methods_do_not_wait_for_hung_bus(
         "NameOwnerChanged",
         "StatusNotifierHostRegistered",
         "StatusNotifierHostUnregistered",
+        "StatusNotifierItemRegistered",
+        "StatusNotifierItemUnregistered",
         "PropertiesChanged",
     ],
 )
@@ -1381,8 +1451,8 @@ def test_subscription_failure_is_retained_and_retried(
     harness.bus.transport.call.side_effect = harness.bus.call
     harness.clock.advance(1000)
     assert harness.tray.registered
-    assert harness.bus.transport.connect.call_count - connect_count == 4 - len(connected)
-    assert len(harness.bus.matches) - match_count == 4 - len(confirmed)
+    assert harness.bus.transport.connect.call_count - connect_count == 6 - len(connected)
+    assert len(harness.bus.matches) - match_count == 6 - len(confirmed)
     harness.icon.show.assert_called_once_with()
     harness.connection.connectToBus.assert_called_once()
     harness.connection.disconnectFromBus.assert_not_called()
@@ -1494,7 +1564,7 @@ def test_dead_connection_is_replaced_on_subscription_retry(
     harness.tray.start()
     assert harness.tray.registered is initially_ready
     if initially_ready:
-        assert len(harness.bus.matches) == 4
+        assert len(harness.bus.matches) == 6
         harness.tray.stop()
     replacement = Bus()
     harness.bus.transport.isConnected.return_value = False
@@ -1506,8 +1576,8 @@ def test_dead_connection_is_replaced_on_subscription_retry(
     assert harness.tray.registered
     assert harness.connection.connectToBus.call_count == 2
     names = [call.args[1] for call in harness.connection.connectToBus.call_args_list]
-    assert replacement.transport.connect.call_count == 4
-    assert len(replacement.matches) == 4
+    assert replacement.transport.connect.call_count == 6
+    assert len(replacement.matches) == 6
     if initially_ready:
         # На мёртвом соединении висят хуки получателя: не разбираем, берём новое имя.
         assert len(set(names)) == 2
@@ -1628,7 +1698,7 @@ def test_real_daemon_delivers_to_gui_and_keeps_receiver(
         slot_threads.append(get_ident())
         if event == "reply":
             assert type(payload[1][0]) is int
-            assert payload[1][1] == [True]
+            assert payload[1][1] in ([True], [[OWN_ITEM]])
         original_slot(generation, event, payload)
 
     monkeypatch.setattr(harness.tray, "_bus_event", record_slot)
@@ -1650,15 +1720,15 @@ def test_real_daemon_delivers_to_gui_and_keeps_receiver(
     wait_for(qapp, lambda: harness.tray.registered)
     assert deliveries == [gui_thread]
     assert callers and gui_thread not in callers
-    assert len(harness.bus.matches) == 4
+    assert len(harness.bus.matches) == 6
     harness.tray.stop()
     transport = module._bus_transport
     assert transport is not None and transport.thread.is_alive()
     harness.tray.start()
     wait_for(qapp, lambda: harness.tray.registered)
     assert deliveries == [gui_thread, gui_thread]
-    assert len(slot_threads) == 4 and set(slot_threads) == {gui_thread}
-    assert len(harness.bus.matches) == 4
+    assert len(slot_threads) == 6 and set(slot_threads) == {gui_thread}
+    assert len(harness.bus.matches) == 6
     harness.tray.stop()
     module.shutdown_bus_threads()
     assert not transport.thread.is_alive()
@@ -1705,7 +1775,7 @@ def test_daemon_coalesces_only_adjacent_setups(harness: Harness, qapp: QApplicat
         module.shutdown_bus_threads()
         assert not transport.thread.is_alive()
         assert events == [(103, "setup"), (103, "request"), (105, "setup")]
-        assert len(harness.bus.matches) == 4
+        assert len(harness.bus.matches) == 6
         harness.connection.connectToBus.assert_called_once()
         harness.bus.transport.disconnect.assert_not_called()
         harness.connection.disconnectFromBus.assert_not_called()
@@ -1786,3 +1856,59 @@ def test_download_tooltip_restores_current_state(harness: Harness, state: TraySt
     harness.icon.setToolTip.assert_called_with("Astra Voice — загружается модель")
     harness.tray.set_download_status("")
     harness.icon.setToolTip.assert_called_with(f"tip:{state.value}:Alt+F9")
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        None,
+        True,
+        OWN_ITEM,
+        {},
+        [True],
+        ["other/StatusNotifierItem"],
+        [OWN_ITEM.replace("/StatusNotifierItem", "")],
+        [OWN_ITEM.replace("/StatusNotifierItem", "/other")],
+        [OWN_ITEM.replace("-1/", "-bad/")],
+    ],
+)
+def test_registered_items_must_contain_our_well_formed_service(
+    harness: Harness, items: object
+) -> None:
+    harness.bus.registered_items = items
+    harness.tray.start()
+    assert not harness.tray.registered
+    harness.flush.assert_not_called()
+    harness.bus.registered_items = [OWN_ITEM]
+    harness.bus.item_registered()
+    assert harness.tray.registered
+
+
+@pytest.mark.parametrize("missing", ["host", "item"])
+def test_bus_signal_recovers_after_deadline_without_background_polling(
+    harness: Harness, missing: str
+) -> None:
+    if missing == "host":
+        harness.bus.host_registered = False
+    else:
+        harness.bus.registered_items = []
+    harness.tray.start()
+    harness.clock.advance(31_000)
+    harness.banner.assert_called_once_with()
+    harness.bus.host_registered = True
+    harness.bus.registered_items = [OWN_ITEM]
+    calls = harness.bus.transport.call.call_count
+    probes = harness.probe.owner.call_count
+    harness.clock.advance(60_000)
+    assert harness.bus.transport.call.call_count == calls
+    assert harness.probe.owner.call_count == probes
+    assert not harness.tray.registered
+    if missing == "host":
+        harness.bus.host_changed(True)
+    else:
+        harness.bus.item_registered(OWN_ITEM)
+        harness.clock.advance(1000)
+    assert harness.tray.registered
+    harness.clock.advance(31_000)
+    assert harness.tray.registered
+    harness.banner.assert_called_once_with()

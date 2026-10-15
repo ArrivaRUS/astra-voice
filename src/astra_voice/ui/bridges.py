@@ -1691,6 +1691,7 @@ class OnboardingController(QObject):
                 self._downloads.preselect_recommended()
 
         self.stepChanged.connect(preselect_on_model_step)
+        self.modelsChanged.connect(preselect_on_model_step)
         preselect_on_model_step()
         self._capture = capture if capture is not None else bridge.capture
         # События окна принимает один фильтр; мастер очищает только свою пробу.

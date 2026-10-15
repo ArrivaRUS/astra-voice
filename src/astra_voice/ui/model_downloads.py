@@ -1735,20 +1735,29 @@ class ModelDownloads(QObject):
         """
         if self._recommended_preselect_done:
             return
-        self._recommended_preselect_done = True
         model = self._model
         if model is None:
+            self._recommended_preselect_done = True
             return
         recommended = model.recommended()
         if recommended is None:
+            self._recommended_preselect_done = True
             return
         entry = next((entry for entry in self._entries if entry.id == recommended.id), None)
         if (
             entry is None
+            or entry.removed_from_catalog
             or self._is_revoked(entry, entry.revision)
             or any(model_id == entry.id for model_id, _ in self._installed_ids())
-            or not model.allowed()[0]
         ):
+            self._recommended_preselect_done = True
+            return
+        if entry.id in self._selected:
+            self._recommended_preselect_done = True
+            return
+        # Сеть и занятая очередь могут стать доступны позже. Не тратим
+        # предложение, пока toggleModel не изменит выбор на самом деле.
+        if not model.allowed()[0]:
             return
         self.toggleModel(entry.id)
 
@@ -1761,8 +1770,9 @@ class ModelDownloads(QObject):
         if self._card_state(entry) not in {"available", "failed"}:
             return
         # Ручной выбор общей очереди важнее первого предложения мастера.
-        self._recommended_preselect_done = True
         self._selected.symmetric_difference_update({model_id})
+        # До emit: modelsChanged может синхронно повторить предвыбор мастера.
+        self._recommended_preselect_done = True
         self._notify("modelsChanged")
         self._notify("selectionChanged")
 

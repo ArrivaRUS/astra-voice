@@ -45,7 +45,7 @@ class X11Unavailable(Exception):
 
 
 class XEmbedTrayProbe:
-    """Проверка XEmbed из GUI-потока, на одном ленивом соединении Xlib.
+    """Владелец выделения XEmbed из GUI-потока, на одном ленивом соединении Xlib.
 
     Ошибка ответа или асинхронного запроса закрывает соединение. Следующий
     вызов может подключиться заново; конструктор не импортирует Xlib.
@@ -92,28 +92,6 @@ class XEmbedTrayProbe:
             pass
         self.close()
         return None
-
-    def is_docked(self, window_id: int, owner: int) -> bool:
-        try:
-            display = self._connection()
-            if display is None:
-                return False
-            current_owner = self._owner(display)
-            docked = False
-            if window_id > 0 and owner > 0 and current_owner == owner:
-                window = display.create_resource_object("window", window_id)
-                tree = window.query_tree()
-                root = int(tree.root.id)
-                parent = int(tree.parent.id) if tree.parent else 0
-                # Selection могла смениться во время query_tree().
-                docked = parent != 0 and parent != root and self._owner(display) == owner
-            display.sync()
-            if not self._error:
-                return docked
-        except Exception:
-            pass
-        self.close()
-        return False
 
     def close(self) -> None:
         display, self._display = self._display, None

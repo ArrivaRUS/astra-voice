@@ -4572,6 +4572,7 @@ def test_mic_silence_is_reported_while_listening(onboarding_app: Any, dark: bool
             if item.metaObject().indexOfProperty("level") >= 0
             and item.metaObject().indexOfProperty("silent") >= 0
         )
+        heard = False
         for state, level, level_silent in (
             ("idle", 0, False),
             ("listening", 0, False),
@@ -4583,6 +4584,7 @@ def test_mic_silence_is_reported_while_listening(onboarding_app: Any, dark: bool
             ("error", 0, False),
             ("idle", 0, False),
         ):
+            heard = (heard or level > 0.02) if state == "listening" else False
             fake.levelState = state
             fake.level = level
             fake.levelSilent = level_silent
@@ -4600,8 +4602,11 @@ def test_mic_silence_is_reported_while_listening(onboarding_app: Any, dark: bool
             assert (fake.levelMessage in texts) == (state in ("error", "idle")), (state, level)
             assert (retry in texts) == (state == "idle"), (state, level)
             if state == "listening":
-                assert (silence in texts) == level_silent, (level, level_silent)
-                assert ("Слышим вас" in texts) == (not level_silent), (level, level_silent)
+                assert (silence in texts) == (not heard or level_silent), (level, level_silent)
+                assert ("Слышим вас" in texts) == (heard and not level_silent), (
+                    level,
+                    level_silent,
+                )
                 assert (f"Пик {fake.peak}" in texts) == level_silent
                 assert (f"Пик {fake.peak} · уровень в норме" in texts) == (not level_silent)
             elif state == "error":
@@ -4610,6 +4615,37 @@ def test_mic_silence_is_reported_while_listening(onboarding_app: Any, dark: bool
 
     _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
     assert_no_messages(messages, "microphone silence")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_mic_silence_waits_for_signal_and_resets_on_new_session(
+    onboarding_app: Any, dark: bool
+) -> None:
+    fake = configure_onboarding(4, levelState="listening", level=0, levelSilent=False, testText="")
+
+    def inspect(root: Any) -> None:
+        def expect_hint(expected: str) -> None:
+            onboarding_app.processEvents()
+            texts = visible_texts(root)
+            assert expected in texts
+            other = "Слышим вас" if expected == "Пока тишина" else "Пока тишина"
+            assert other not in texts
+            assert "Микрофон молчит" not in texts
+
+        # levelSilent ещё не накопил окно тишины, но сигнала пока не было.
+        expect_hint("Пока тишина")
+        fake.level = 0.5
+        expect_hint("Слышим вас")
+        fake.level = 0.01
+        expect_hint("Слышим вас")
+        fake.levelState = "idle"
+        onboarding_app.processEvents()
+        fake.level = 0
+        fake.levelState = "listening"
+        expect_hint("Пока тишина")
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "microphone initial silence and new session")
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])

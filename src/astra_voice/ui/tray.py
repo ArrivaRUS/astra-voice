@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from functools import partial
 from itertools import count
@@ -28,7 +29,7 @@ from PyQt5.QtDBus import (
     QDBusMessage,
     QDBusVariant,
 )
-from PyQt5.QtWidgets import QAction, QActionGroup, QApplication, QMenu, QSystemTrayIcon
+from PyQt5.QtWidgets import QAction, QActionGroup, QMenu, QSystemTrayIcon
 
 from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.x11 import XEmbedTrayProbe
@@ -42,11 +43,12 @@ _WATCHER_PATH = "/StatusNotifierWatcher"
 _PLASMA_SERVICE = "org.kde.plasmashell"
 _PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
 _HOST_PROPERTY = "IsStatusNotifierHostRegistered"
+_ITEMS_PROPERTY = "RegisteredStatusNotifierItems"
 _DBUS_SERVICE = "org.freedesktop.DBus"
 _DBUS_PATH = "/org/freedesktop/DBus"
 _UNAVAILABLE_SUMMARY = "Значок не появился на панели"
 _CALL_TIMEOUT_MS = 500
-# Setup последователен: соединение и до 4 AddMatch по _CALL_TIMEOUT_MS каждый, причём
+# Setup последователен: соединение и до 6 AddMatch по _CALL_TIMEOUT_MS каждый, причём
 # за ним в очереди могут стоять запросы. Готовность засчитывается, только если ответ
 # пришёл за _SETUP_FRESH_S (медленная шина = панель не готова, повтор по таймеру 1 с).
 _SETUP_FRESH_S = 0.5
@@ -119,6 +121,14 @@ class _TrayBusReceiver(QObject):
     @pyqtSlot()
     def _host_changed(self) -> None:
         self._hook("host", None)
+
+    @pyqtSlot(str)
+    def _item_registered(self, item: str) -> None:
+        self._hook("item_registered", item)
+
+    @pyqtSlot(str)
+    def _item_unregistered(self, item: str) -> None:
+        self._hook("item_unregistered", item)
 
     @pyqtSlot(str, "QVariantMap", "QStringList")
     def _properties_changed(
@@ -258,6 +268,19 @@ class _TrayBusTransport:
                 )
                 for member in ("StatusNotifierHostRegistered", "StatusNotifierHostUnregistered")
             ],
+            *[
+                (
+                    _WATCHER_SERVICE,
+                    _WATCHER_PATH,
+                    _WATCHER_SERVICE,
+                    member,
+                    slot,
+                )
+                for member, slot in (
+                    ("StatusNotifierItemRegistered", self.receiver._item_registered),
+                    ("StatusNotifierItemUnregistered", self.receiver._item_unregistered),
+                )
+            ],
             (
                 _WATCHER_SERVICE,
                 _WATCHER_PATH,
@@ -319,8 +342,9 @@ def shutdown_bus_threads(timeout_ms: int = 1000) -> None:
 class Tray(QObject):
     """Владеет значком; stop() предназначен для завершения работы приложения.
 
-    Фабрика создаёт единственный значок. Готовность панели проверяется через D-Bus:
-    ранний isSystemTrayAvailable() отравляет кэш generic/Fly-темы Qt.
+    Фабрика создаёт единственный значок; Qt выбирает бэкенд в его конструкторе.
+    Доказательство О4 — наш элемент в списке SNI; XEmbed лишь пытается показать
+    значок. isSystemTrayAvailable() не вызывается: он меняет кэш generic/Fly Qt.
     Тесты подменяют отправку команд транспорта до start().
     """
 
@@ -360,13 +384,13 @@ class Tray(QObject):
         self._retry_expired = False
         self._xembed_probe = xembed_probe if xembed_probe is not None else XEmbedTrayProbe()
         self._xembed_owner_id: int | None = None
-        self._xembed_window_id: int | None = None
-        self._xembed_docked = False
         self._xembed_allowed = False
-        self._xembed_recheck_pending = False
-        # Generic Qt5 может навсегда выбрать XEmbed при первом show().
-        # Даже после появления SNI не снимаем подтверждение фактического dock.
-        self._xembed_confirmation_required = False
+        self._xembed_shown = False
+        self._xembed_polling = False
+        self._xembed_poll_at = 0.0
+        self._item_registered = False
+        # QtDBusTrayIcon может иметь отдельное соединение: принимаем только PID.
+        self._item_prefix = f"org.kde.StatusNotifierItem-{os.getpid()}-"
         self._path: str | None = None
         self._bus_generation = 0
         self._subscriptions_ready = False
@@ -397,7 +421,7 @@ class Tray(QObject):
         self._deadline_timer.setTimerType(Qt.PreciseTimer)
         self._deadline_timer.timeout.connect(self._registration_expired)
         self._xembed_timer = QTimer(self)
-        self._xembed_timer.setInterval(2000)
+        self._xembed_timer.setInterval(10_000)
         self._xembed_timer.timeout.connect(self._poll_xembed_owner)
 
         # Сохраняем QMenu: у него нет QWidget-родителя, а значок им не владеет.
@@ -475,9 +499,8 @@ class Tray(QObject):
         self._update_menu()
         if state == TrayState.DONE:
             self._done_timer.start(800)
-        if self._running and not self.registered:
+        if self._running and not self.registered and not self._xembed_shown:
             if self._deadline is None:
-                self._retry_expired = False
                 self._begin_retry()
             if has_icon:
                 self._try_register()
@@ -617,112 +640,42 @@ class Tray(QObject):
         return self._registered
 
     def _registration_ready(self) -> bool:
-        if self._path == "XEmbed":
-            return self._xembed_allowed and self._xembed_visible()
-        return self._panel_ready() and (
-            not self._xembed_confirmation_required or self._xembed_visible()
-        )
-
-    @staticmethod
-    def _xembed_window() -> Any:
-        # QWidget — внутренний QSystemTrayIconSys generic-темы Qt, не сам
-        # QSystemTrayIcon. Геометрия последнего может пережить потерю dock.
-        try:
-            for widget in QApplication.topLevelWidgets():
-                if (
-                    widget.objectName() == "QSystemTrayIconSys"
-                    or widget.metaObject().className() == "QSystemTrayIconSys"
-                ):
-                    return widget
-        except RuntimeError:
-            # Qt мог удалить native widget при перезапуске панели.
-            pass
-        return None
-
-    def _local_xembed_window_id(self) -> int | None:
-        widget = self._xembed_window()
-        if widget is None:
-            return None
-        try:
-            geometry = widget.geometry()
-            tray_geometry = self._tray.geometry()
-            if (
-                widget.isVisible()
-                and geometry.width() > 0
-                and geometry.height() > 0
-                and self._tray.isVisible()
-                and tray_geometry.width() > 0
-                and tray_geometry.height() > 0
-                and not self._tray.icon().isNull()
-            ):
-                window_id = int(widget.winId())
-                return window_id if window_id > 0 else None
-        except RuntimeError:
-            pass
-        return None
-
-    def _xembed_visible(self) -> bool:
-        # registered не делает запросов Xlib: доказательство принадлежит
-        # конкретному native XID, его видимость и геометрию проверяем локально.
-        return bool(
-            self._xembed_owner_id
-            and self._xembed_docked
-            and not self._xembed_recheck_pending
-            and self._xembed_window_id == self._local_xembed_window_id()
-        )
-
-    def _refresh_xembed_docking(self) -> None:
-        window_id = self._local_xembed_window_id()
-        docked = False
-        if window_id is not None and self._xembed_owner_id and not self._xembed_recheck_pending:
-            try:
-                docked = self._xembed_probe.is_docked(window_id, self._xembed_owner_id)
-            except Exception:
-                self._xembed_probe.close()
-            if not docked:
-                # Ошибка могла закрыть Xlib-соединение. Повторное show() в этом
-                # же callback не должно переподключить порт до следующего тика.
-                self._xembed_recheck_pending = True
-        self._xembed_docked = bool(docked)
-        self._xembed_window_id = window_id if docked else None
-        if self._registered and not self._xembed_visible():
-            self._invalidate_registration()
+        return self._panel_ready() and self._item_registered
 
     def _set_path(self, path: str) -> None:
         if self._path != path:
             self._path = path
-            _logger.info("трей: путь %s", path)
+            suffix = (
+                " (без подтверждения видимости — индикация через пилюлю)"
+                if path == "XEmbed"
+                else ""
+            )
+            _logger.info("трей: путь %s%s", path, suffix)
 
     def _poll_xembed_owner(self) -> None:
-        if not self._running:
+        """Редкая сверка SNI и владельца XEmbed, всегда из GUI-потока."""
+        if not self._running or self._retry_expired or not (self._registered or self._xembed_shown):
+            self._xembed_polling = False
+            self._xembed_timer.stop()
             return
-        self._xembed_recheck_pending = False
-        was_registered = self._registered
-        changed = False
-        if self._xembed_allowed or self._xembed_confirmation_required:
-            changed = self._refresh_xembed_owner()
-            self._refresh_xembed_docking()
-        if self._registered and self._path == "XEmbed":
-            # SNI остаётся предпочтительным, в том числе после запуска панели.
-            if self._subscriptions_ready:
-                self._query_host()
-        if (changed or was_registered) and not self.registered and self._deadline is not None:
-            self._try_register()
+        if self._xembed_shown and not self._is_kde and self._refresh_xembed_owner():
+            self._show_available_path()
+        if self._subscriptions_ready and (self._registered or self._xembed_shown):
+            # _host_reply запрашивает список элементов; один Get на свойство.
+            self._query_host()
 
     def _refresh_xembed_owner(self) -> bool:
+        if self._is_kde or monotonic() < self._xembed_poll_at:
+            return False
+        self._xembed_poll_at = monotonic() + 10.0
         try:
             owner = self._xembed_probe.owner()
         except Exception:
             self._xembed_probe.close()
             owner = None
         if owner != self._xembed_owner_id:
-            if self._xembed_owner_id and self._xembed_confirmation_required:
-                # geometry() может ещё хранить прямоугольник старого dock.
-                # Новый show должен пережить хотя бы один проход очереди GUI.
-                self._xembed_recheck_pending = True
             self._xembed_owner_id = owner
-            if self._path != "SNI" or self._xembed_confirmation_required:
-                self._retry_expired = False
+            if self._path == "XEmbed":
                 self._invalidate_registration()
             return True
         return False
@@ -749,8 +702,9 @@ class Tray(QObject):
 
     def _invalidate_registration(self) -> None:
         self._registered = False
-        self._xembed_docked = False
-        self._xembed_window_id = None
+        self._item_registered = False
+        self._cancel_request(_ITEMS_PROPERTY)
+        self._xembed_shown = False
         self._tray.hide()
         if self._running and self._deadline is None:
             self._begin_retry()
@@ -763,7 +717,6 @@ class Tray(QObject):
         _get_bus_receiver().tray = self
         self._retry_expired = False
         self._begin_retry()
-        self._xembed_timer.start()
         self._try_register()
 
     def _setup_bus(self) -> None:
@@ -781,6 +734,7 @@ class Tray(QObject):
             self._subscriptions_ready = event == "ready" and monotonic() < self._setup_deadline
             if not self._subscriptions_ready:
                 self._host_registered = False
+                self._item_registered = False
                 self._xembed_allowed = False
                 self._plasma_alive = False
                 self._plasma_known = False
@@ -801,6 +755,8 @@ class Tray(QObject):
                     break
         elif event == "host":
             self._host_changed()
+        elif event in ("item_registered", "item_unregistered"):
+            self._items_changed(payload, removed=event == "item_unregistered")
         elif event == "properties":
             self._properties_changed(*payload)
         elif event == "owner":
@@ -850,26 +806,83 @@ class Tray(QObject):
             return
         args = reply[1] if reply is not None and reply[0] == QDBusMessage.ReplyMessage else []
         value = args[0] if len(args) == 1 else None
-        was_allowed = self._xembed_allowed
         self._host_registered = value is True
-        self._xembed_allowed = value is False or bool(
-            reply is not None
-            and reply[0] == QDBusMessage.ErrorMessage
-            and reply[1]
-            in (
-                ["org.freedesktop.DBus.Error.ServiceUnknown"],
-                ["org.freedesktop.DBus.Error.NameHasNoOwner"],
+        self._xembed_allowed = not self._is_kde and (
+            value is False
+            or bool(
+                reply is not None
+                and reply[0] == QDBusMessage.ErrorMessage
+                and reply[1]
+                in (
+                    ["org.freedesktop.DBus.Error.ServiceUnknown"],
+                    ["org.freedesktop.DBus.Error.NameHasNoOwner"],
+                )
             )
         )
-        if self._xembed_allowed and not was_allowed and not self._retry_expired:
+        if not self._host_registered:
+            self._item_registered = False
+            self._cancel_request(_ITEMS_PROPERTY)
+        if self._xembed_allowed:
             self._refresh_xembed_owner()
-        if self._registered and (
-            not self._registration_ready() or (self._path == "XEmbed" and self._panel_ready())
+        if (self._registered and not self._registration_ready()) or (
+            self._xembed_shown and self._panel_ready()
         ):
+            self._invalidate_registration()
+        if not self._registered and not self._xembed_shown:
+            self._begin_retry()
+            self._show_available_path()
+        elif self._xembed_shown:
+            # Сигнал мог открыть retry; сохранённому XEmbed он больше не нужен.
+            self._end_retry()
+        if self._host_registered:
+            self._query_items()
+
+    def _is_our_item(self, item: Any) -> bool:
+        if not isinstance(item, str):
+            return False
+        service, separator, path = item.partition("/")
+        return bool(
+            separator
+            and path == "StatusNotifierItem"
+            and service.startswith(self._item_prefix)
+            and service[len(self._item_prefix) :].isdigit()
+        )
+
+    def _query_items(self) -> None:
+        if not self._host_registered:
+            return
+        message = QDBusMessage.createMethodCall(
+            _WATCHER_SERVICE, _WATCHER_PATH, _PROPERTIES_INTERFACE, "Get"
+        )
+        message.setArguments([_WATCHER_SERVICE, _ITEMS_PROPERTY])
+        self._request(_ITEMS_PROPERTY, message, self._items_reply)
+
+    def _items_reply(self, reply: _BusReply | None) -> None:
+        if self._retry_expired or not self._host_registered:
+            return
+        args = reply[1] if reply is not None and reply[0] == QDBusMessage.ReplyMessage else []
+        items = args[0] if len(args) == 1 else None
+        self._item_registered = (
+            self._tray.isVisible()
+            and isinstance(items, list)
+            and any(self._is_our_item(item) for item in items)
+        )
+        if self._registered and not self._item_registered:
             self._invalidate_registration()
         if not self._registered:
             self._begin_retry()
-            self._show_available_path()
+            if self._tray.isVisible():
+                self._show_available_path()
+
+    def _items_changed(self, item: str | None = None, *, removed: bool = False) -> None:
+        # Сигнал не доказывает регистрацию; отмена serial исключает старый Get.
+        self._cancel_request(_ITEMS_PROPERTY)
+        if item is None or (removed and self._is_our_item(item)):
+            self._item_registered = False
+            self._registered = False
+        if not self._registered and not self._xembed_shown:
+            self._retry_after_change()
+        self._query_items()
 
     def _plasma_reply(self, reply: _BusReply | None) -> None:
         args = reply[1] if reply is not None and reply[0] == QDBusMessage.ReplyMessage else []
@@ -889,6 +902,8 @@ class Tray(QObject):
         if not self._running:
             return
         self._cancel_request(_WATCHER_SERVICE)
+        self._cancel_request(_ITEMS_PROPERTY)
+        self._item_registered = False
         self._host_registered = False
         self._xembed_allowed = False
         self._retry_after_change()
@@ -905,6 +920,10 @@ class Tray(QObject):
             _HOST_PROPERTY in changed or _HOST_PROPERTY in invalidated
         ):
             self._host_changed()
+        elif interface == _WATCHER_SERVICE and (
+            _ITEMS_PROPERTY in changed or _ITEMS_PROPERTY in invalidated
+        ):
+            self._items_changed()
 
     def _begin_retry(self) -> None:
         if self._deadline is not None or self._retry_expired:
@@ -945,6 +964,7 @@ class Tray(QObject):
             self._query_host()
             return
         self._show_available_path()
+        self._query_items()
 
     def _retry_tick(self) -> None:
         if not self._running or self._deadline is None:
@@ -952,10 +972,6 @@ class Tray(QObject):
         if monotonic() >= self._deadline:
             self._registration_expired()
             return
-        self._xembed_recheck_pending = False
-        if self._xembed_allowed or self._xembed_confirmation_required:
-            self._refresh_xembed_owner()
-            self._refresh_xembed_docking()
         self._try_register()
 
     def _show_available_path(self) -> None:
@@ -977,13 +993,20 @@ class Tray(QObject):
             self._invalidate_registration()
         else:
             # После refresh() провайдера прежняя иконка могла остаться пустой.
-            if path == "XEmbed":
-                self._xembed_confirmation_required = True
             self._tray.setIcon(self._display_icon())
-            self._tray.show()
-            if self._xembed_confirmation_required:
-                self._refresh_xembed_docking()
+            if not self._tray.isVisible():
+                # hide() удаляет SNI-сервис Qt; новый show требует нового Get.
+                self._item_registered = False
+                self._cancel_request(_ITEMS_PROPERTY)
+                self._tray.show()
+            self._xembed_shown = path == "XEmbed" and bool(self._tray.isVisible())
             self._registered = bool(self._tray.isVisible() and self._registration_ready())
+            if (self._xembed_shown or self._registered) and not self._xembed_polling:
+                self._xembed_polling = True
+                self._xembed_timer.start()
+            if self._xembed_shown:
+                self._end_retry()
+                notify.drop_pending(_UNAVAILABLE_SUMMARY)
             if self._registered:
                 self._end_retry()
                 notify.drop_pending(_UNAVAILABLE_SUMMARY)
@@ -996,11 +1019,18 @@ class Tray(QObject):
     def _registration_expired(self) -> None:
         if not self._running or self._deadline is None:
             return
+        if self.registered or self._xembed_shown:
+            self._end_retry()
+            return
         self._retry_expired = True
         self._end_retry()
         self._registered = False
-        self._xembed_docked = False
-        self._xembed_window_id = None
+        self._item_registered = False
+        for service in tuple(self._requests):
+            self._cancel_request(service)
+        self._xembed_shown = False
+        self._xembed_polling = False
+        self._xembed_timer.stop()
         self._tray.hide()
         self._set_path("нет")
         if not self._banner_shown:
@@ -1024,13 +1054,18 @@ class Tray(QObject):
             return
         if service == _WATCHER_SERVICE:
             self._cancel_request(service)
+            self._cancel_request(_ITEMS_PROPERTY)
+            self._item_registered = False
             self._host_registered = False
-            self._xembed_allowed = True
+            self._xembed_allowed = not self._is_kde
             self._retry_expired = False
-            self._refresh_xembed_owner()
+            if self._xembed_allowed:
+                self._refresh_xembed_owner()
             self._invalidate_registration()
-            if self._xembed_owner_id:
+            if self._xembed_allowed and self._xembed_owner_id:
                 self._show_available_path()
+            else:
+                self._set_path("нет")
         elif self._is_kde and service == _PLASMA_SERVICE:
             self._cancel_request(service)
             self._plasma_known = True
@@ -1055,9 +1090,10 @@ class Tray(QObject):
         self._setup_pending = False
         self._xembed_allowed = False
         self._xembed_owner_id = None
-        self._xembed_window_id = None
-        self._xembed_docked = False
-        self._xembed_recheck_pending = False
+        self._xembed_shown = False
+        self._xembed_polling = False
+        self._xembed_poll_at = 0.0
+        self._item_registered = False
         self._xembed_timer.stop()
         self._xembed_probe.close()
         self._end_retry()

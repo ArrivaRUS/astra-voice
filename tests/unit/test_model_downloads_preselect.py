@@ -174,6 +174,13 @@ def test_installed_recommendation_is_not_preselected(
     downloads = ModelDownloads(port)
     downloads.preselect_recommended()
     assert not downloads.models[0]["selected"]
+    assert downloads._recommended_preselect_done
+    # Даже удаление прежней установки не возвращает первоначальное предложение.
+    port.ready = port.damaged = False
+    monkeypatch.setattr(port, "installed_ids", lambda: ())
+    downloads._set_card(port.entry, "available")
+    downloads.preselect_recommended()
+    assert not downloads.models[0]["selected"]
 
 
 @pytest.mark.parametrize("state", ["available", "failed"])
@@ -196,12 +203,14 @@ def test_network_gate_denial_blocks_auto_selection_even_for_failed_card(
     downloads._set_card(port.entry, state)
     downloads.preselect_recommended()
     assert not downloads.models[0]["selected"]
-    # Даже снятие запрета и перечитывание карточек не повторяют auto-selection.
+    assert not downloads._recommended_preselect_done
+    # Снятие временного сетевого запрета разрешает первую попытку выбора.
     monkeypatch.setattr(port, "allowed", lambda: (True, ""))
     monkeypatch.setattr(port, "refusal", lambda: "")
     downloads.network_changed()
     downloads.preselect_recommended()
-    assert not downloads.models[0]["selected"]
+    assert downloads.models[0]["selected"]
+    assert downloads._recommended_preselect_done
 
 
 @pytest.mark.parametrize("state", ["available", "failed"])
@@ -213,13 +222,20 @@ def test_selectable_uninstalled_states_are_preselected(state: str) -> None:
     assert downloads.models[0]["selected"]
 
 
-@pytest.mark.parametrize("state", ["queued", "downloading", "policy", "offline-user"])
-def test_unselectable_card_states_are_not_preselected(state: str) -> None:
+@pytest.mark.parametrize(
+    "state", ["queued", "downloading", "verifying", "switching", "policy", "offline-user"]
+)
+def test_unselectable_card_states_do_not_consume_preselection(state: str) -> None:
     port = FakeModelPort()
     downloads = ModelDownloads(port)
     downloads._set_card(port.entry, state)
     downloads.preselect_recommended()
     assert not downloads.models[0]["selected"]
+    assert not downloads._recommended_preselect_done
+    downloads._set_card(port.entry, "available")
+    downloads.preselect_recommended()
+    assert downloads.models[0]["selected"]
+    assert downloads._recommended_preselect_done
 
 
 @pytest.mark.parametrize("guard", ["_rechecking", "_shutting_down", "_switching_entry"])
@@ -228,6 +244,11 @@ def test_toggle_guards_also_block_preselection(guard: str) -> None:
     setattr(downloads, guard, True)
     downloads.preselect_recommended()
     assert not downloads.models[0]["selected"]
+    assert not downloads._recommended_preselect_done
+    setattr(downloads, guard, None if guard == "_switching_entry" else False)
+    downloads.preselect_recommended()
+    assert downloads.models[0]["selected"]
+    assert downloads._recommended_preselect_done
 
 
 def test_missing_recommendation_or_catalog_entry_is_not_preselected(
@@ -239,10 +260,17 @@ def test_missing_recommendation_or_catalog_entry_is_not_preselected(
         patch.setattr(port, "recommended", lambda: None)
         downloads.preselect_recommended()
         assert not downloads.models[0]["selected"]
+        assert downloads._recommended_preselect_done
+    downloads.preselect_recommended()
+    assert not downloads.models[0]["selected"]
     downloads = ModelDownloads(port)
     downloads._entries = ()
     downloads.preselect_recommended()
     assert downloads.models == []
+    assert downloads._recommended_preselect_done
+    downloads._entries = port.entries()
+    downloads.preselect_recommended()
+    assert not downloads.models[0]["selected"]
     ModelDownloads(None).preselect_recommended()
 
 
@@ -252,6 +280,69 @@ def test_revoked_recommendation_is_not_preselected() -> None:
     downloads = ModelDownloads(port)
     downloads.preselect_recommended()
     assert not downloads.models[0]["selected"]
+    assert downloads._recommended_preselect_done
+    port.revoked.clear()
+    downloads.preselect_recommended()
+    assert not downloads.models[0]["selected"]
+
+
+def test_removed_catalog_entry_permanently_finishes_preselection() -> None:
+    port = FakeModelPort()
+    port.entry = replace(port.entry, removed_from_catalog=True)
+    downloads = ModelDownloads(port)
+    downloads.preselect_recommended()
+    assert downloads.models == []
+    assert downloads._recommended_preselect_done
+    port.entry = replace(port.entry, removed_from_catalog=False)
+    downloads._entries = port.entries()
+    downloads.preselect_recommended()
+    assert not downloads.models[0]["selected"]
+
+
+def test_wizard_retries_card_refresh_only_on_model_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    downloads = ModelDownloads(FakeModelPort())
+    downloads._rechecking = True
+    preselect = Mock(wraps=downloads.preselect_recommended)
+    monkeypatch.setattr(downloads, "preselect_recommended", preselect)
+    settings = Settings(extra={"onboarding_language_set": True})
+    bridge = SettingsBridge(settings, downloads=downloads, save=Mock())
+    controller = OnboardingController(
+        bridge, settings=settings, downloads=downloads, device_provider=lambda: []
+    )
+    try:
+        downloads.modelsChanged.emit()
+        preselect.assert_not_called()
+        controller.next()
+        assert controller.step == 2
+        preselect.assert_called_once_with()
+        assert not controller.models[0]["selected"]
+        assert not downloads._recommended_preselect_done
+
+        changed = QSignalSpy(downloads.selectionChanged)
+        downloads._rechecking = False
+        downloads.modelsChanged.emit()
+        assert controller.models[0]["selected"]
+        assert preselect.call_count >= 2
+        assert len(changed) == 1
+        downloads.modelsChanged.emit()
+        assert controller.models[0]["selected"]
+        assert len(changed) == 1
+
+        # После ручного снятия галочки повторный сигнал её не восстанавливает.
+        controller.toggleModel(controller.models[0]["id"])
+        downloads.modelsChanged.emit()
+        assert not controller.models[0]["selected"]
+        assert len(changed) == 2
+        controller.next()
+        assert controller.step == 3
+        preselect.reset_mock()
+        downloads.modelsChanged.emit()
+        preselect.assert_not_called()
+    finally:
+        controller.shutdown()
+        downloads.shutdown()
 
 
 def test_service_recommendation_excludes_revoked_entry(tmp_path: Path) -> None:

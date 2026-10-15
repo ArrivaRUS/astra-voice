@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import stat
@@ -203,7 +204,10 @@ def test_menu_uses_largest_numeric_square_png(
 
 @pytest.mark.parametrize("svg_only", [False, True])
 def test_menu_without_png_uses_icon_name(
-    home: Path, monkeypatch: pytest.MonkeyPatch, svg_only: bool
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    svg_only: bool,
 ) -> None:
     copy = installed(monkeypatch)
     source = copy / "usr/share/icons/hicolor"
@@ -211,8 +215,14 @@ def test_menu_without_png_uses_icon_name(
     if svg_only:
         put(source / "scalable/apps/astravoice.svg", b"svg")
 
-    assert userinstall.register().menu == "written"
+    with caplog.at_level(logging.INFO, logger=userinstall.__name__):
+        assert userinstall.register().menu == "written"
     assert b"\nIcon=astravoice\n" in menu_path(home).read_bytes()
+    fallback = [record for record in caplog.records if "Icon=astravoice" in record.message]
+    assert len(fallback) == 1
+    assert fallback[0].levelno == logging.INFO
+    assert "reason=no_usable_png" in fallback[0].message
+    assert str(home) not in caplog.text
     assert userinstall.register().menu == "unchanged"
 
 
@@ -255,24 +265,102 @@ def test_menu_is_written_after_owned_png_exists(
 
 @pytest.mark.parametrize("unsafe", ["\nIcon=foreign", "\r", "\t", "\x01", "\x7f", "\x85", "\\n"])
 def test_menu_unsafe_icon_path_falls_back(
-    home: Path, monkeypatch: pytest.MonkeyPatch, unsafe: str
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    unsafe: str,
 ) -> None:
     installed(monkeypatch)
     icons = home / f"unsafe{unsafe}" / "icons/hicolor"
     monkeypatch.setattr(userinstall, "_desktop_paths", lambda: (menu_path(home), icons))
 
-    assert userinstall.register().menu == "written"
+    with caplog.at_level(logging.INFO, logger=userinstall.__name__):
+        assert userinstall.register().menu == "written"
     data = menu_path(home).read_bytes()
     assert b"\nIcon=astravoice\n" in data
     assert str(icons).encode() not in data
     assert (icons / "48x48/apps/astravoice.png").is_file()
+    fallback = [record for record in caplog.records if "Icon=astravoice" in record.message]
+    assert len(fallback) == 1
+    assert fallback[0].levelno == logging.INFO
+    assert "reason=unsafe_path" in fallback[0].message
+    assert str(home) not in caplog.text
+
+
+@pytest.mark.parametrize("unsafe", ["\u2028", "\u0085", "\udcff"], ids=["LS", "NEL", "surrogate"])
+def test_menu_icon_unicode_separators_and_surrogate_cannot_inject_exec(
+    caplog: pytest.LogCaptureFixture, unsafe: str
+) -> None:
+    """ИБ-T2-FT-6: Icon остаётся одной строкой Desktop Entry, без второго Exec."""
+    icon = Path(f"/private/user/icon{unsafe}Exec=foreign.png")
+    with caplog.at_level(logging.INFO, logger=userinstall.__name__):
+        data = userinstall.menu_entry_bytes(Path("/installed/AppRun"), VERSION, icon)
+    lines = data.decode("utf-8").splitlines()
+    assert [line for line in lines if line.startswith("Icon=")] == ["Icon=astravoice"]
+    assert [line for line in lines if line.startswith("Exec=")] == ["Exec=/installed/AppRun"]
+    assert "foreign" not in data.decode("utf-8")
+    fallback = [record for record in caplog.records if "Icon=astravoice" in record.message]
+    assert len(fallback) == 1
+    assert fallback[0].levelno == logging.INFO
+    assert "reason=unsafe_path" in fallback[0].message
+    assert "/private/user" not in caplog.text
+
+
+def test_menu_icon_selection_error_logs_reason_without_user_path(
+    home: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    installed(monkeypatch)
+    monkeypatch.setattr(
+        userinstall, "_owned_icons", Mock(side_effect=OSError(str(home / "private/icon.png")))
+    )
+    with caplog.at_level(logging.INFO, logger=userinstall.__name__):
+        assert userinstall.register().menu == "written"
+    assert b"\nIcon=astravoice\n" in menu_path(home).read_bytes()
+    fallback = [record for record in caplog.records if "Icon=astravoice" in record.message]
+    assert len(fallback) == 1
+    assert fallback[0].levelno == logging.INFO
+    assert "reason=selection_error" in fallback[0].message
+    assert str(home) not in caplog.text
 
 
 @pytest.mark.parametrize("path", ["relative/icon.png", "~/icon.png", "$HOME/icon.png"])
-def test_menu_icon_does_not_expand_relative_path(path: str) -> None:
-    assert b"\nIcon=astravoice\n" in userinstall.menu_entry_bytes(
-        Path("/installed/AppRun"), VERSION, Path(path)
+def test_menu_icon_does_not_expand_relative_path(
+    caplog: pytest.LogCaptureFixture, path: str
+) -> None:
+    with caplog.at_level(logging.INFO, logger=userinstall.__name__):
+        data = userinstall.menu_entry_bytes(Path("/installed/AppRun"), VERSION, Path(path))
+    assert b"\nIcon=astravoice\n" in data
+    fallback = [record for record in caplog.records if "Icon=astravoice" in record.message]
+    assert len(fallback) == 1
+    assert fallback[0].levelno == logging.INFO
+    assert "reason=relative_path" in fallback[0].message
+    assert path not in caplog.text
+
+
+@pytest.mark.parametrize("reason", ["no_usable_png", "selection_error"])
+def test_menu_icon_fallback_logs_without_filesystem_registration(
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    reason: str,
+) -> None:
+    # Проверяем read-only выбор независимо от доступа register к lock/UID.
+    owned_icons = (
+        Mock(side_effect=OSError(str(home / "private/icon.png")))
+        if reason == "selection_error"
+        else Mock(return_value=iter(()))
     )
+    monkeypatch.setattr(userinstall, "_owned_icons", owned_icons)
+    with caplog.at_level(logging.INFO, logger=userinstall.__name__):
+        icon = userinstall._menu_icon(home / "data/icons/hicolor")
+        data = userinstall.menu_entry_bytes(Path("/installed/AppRun"), VERSION, icon)
+    assert icon is None
+    assert b"\nIcon=astravoice\n" in data
+    fallback = [record for record in caplog.records if "Icon=astravoice" in record.message]
+    assert len(fallback) == 1
+    assert fallback[0].levelno == logging.INFO
+    assert f"reason={reason}" in fallback[0].message
+    assert str(home) not in caplog.text
 
 
 @pytest.mark.parametrize("kind", ["foreign", "symlink", "directory", "size-link", "apps-link"])
