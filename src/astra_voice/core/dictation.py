@@ -76,6 +76,8 @@ _NOTICE_STATES = frozenset((PillState.ERROR, PillState.CLIPBOARD_ONLY))
 # Отложенные во время вставки события: нажатие хоткея помечается отдельно.
 _QUEUED_PRESS = "press"
 _QUEUED_OTHER = "other"
+# Коды перезапуска воркера относятся ко всей очереди, даже в ответе на чужой запрос.
+_RESTART_CODES = frozenset(("worker-crashed", "restart-limit", "worker-start"))
 
 _T = TypeVar("_T")
 
@@ -424,6 +426,21 @@ class DictationOrchestrator:
         """Число незавершённых фраз (записывается/распознаётся/вставляется)."""
         return len(self._items)
 
+    @staticmethod
+    def _reply_error(event: dict[str, Any]) -> bool:
+        """Ошибка ответа на запрос не по фразе: замер памяти, загрузка модели, audio.close.
+
+        Супервизор помечает такие ошибки ``response_type`` вместо ``utterance_id``.
+        Замер памяти просят сразу после успешной фразы, когда следующая ещё в работе:
+        его ошибка не должна обрывать ни распознаваемую, ни пишущуюся фразу.
+        """
+        return (
+            event.get("type") == "error"
+            and "utterance_id" not in event
+            and "response_type" in event
+            and event.get("code") not in _RESTART_CODES
+        )
+
     def _route(self, event: dict[str, Any]) -> _Utterance:
         """Фраза события: по utterance_id; без id — ошибка движка у распознаваемой."""
         uid = event.get("utterance_id")
@@ -432,7 +449,7 @@ class DictationOrchestrator:
                 if utterance._utterance_id == uid:
                     return utterance
             return self._default()
-        if event.get("type") == "error":
+        if event.get("type") == "error" and "response_type" not in event:
             # engine-failed приходит без id и относится к выполняемому заданию воркера.
             for utterance in self._items:
                 if utterance._phase is DictationPhase.PROCESSING:
@@ -445,7 +462,8 @@ class DictationOrchestrator:
         return (
             mode == "text"
             and self.mode == "text"
-            and len(self._items) < MAX_PENDING_UTTERANCES
+            # Вставленная фраза завершена, хотя её исход ещё не разобран (решение 6).
+            and sum(1 for u in self._items if not u._delivered) < MAX_PENDING_UTTERANCES
             and self._recording_item() is None
             and not self._any_cancel_pending()
             and all(u._worker_generation == generation for u in self._items)
@@ -457,8 +475,15 @@ class DictationOrchestrator:
         Пока фраза пишется, «нажатие» — рассинхрон автомата клавиши: как до US-2.7,
         автомат сбрасывается и запись отменяется (escape-cancel). Иначе автомат
         возвращается к фразам очереди, не отменяя их (``_return_hotkey_to_queue``).
+        Фраза, уже отпущенная и дописывающая хвост (``RELEASE_TAIL_MS``), записана:
+        нажатие в эти миллисекунды (дребезг, быстрый повтор) её не отменяет.
         """
-        if self._recording_item() is not None or not self._items:
+        recording = self._recording_item()
+        if recording is not None and recording._tail_pending:
+            self._log.info("диктовка: нажатие проигнорировано — дописывается хвост записи")
+            self._return_hotkey_to_queue()
+            return
+        if recording is not None or not self._items:
             self._hotkey_cancel()
             return
         self._return_hotkey_to_queue()
@@ -1098,6 +1123,9 @@ class DictationOrchestrator:
             saved = event.copy()
             self._queue.append((_QUEUED_OTHER, lambda: self.on_worker_event(saved)))
             return
+        if self._reply_error(event):
+            self._log.debug("диктовка: ошибка ответа не по фразе пропущена")
+            return
         with self._within(self._route(event)):
             self._worker_event(event)
         self._pump()
@@ -1481,7 +1509,8 @@ class DictationOrchestrator:
         # в своей очереди доставки, нажатие начинает её запись (US-2.7, решение 6).
         while self._queue and not self._closed:
             _, action = self._queue.popleft()
-            action()
+            # Сбой одного события (порт UI) не оставляет фразу навсегда во вставке.
+            self._safe_ui(action, "диктовка: не удалось разобрать отложенное событие")
         if self._closed or self._cancel_requested or self._phase != DictationPhase.PASTING:
             return
         if self._generation() != self._worker_generation:
@@ -1800,6 +1829,7 @@ class DictationOrchestrator:
         return self._clock() < self._device_pill_until
 
     def _begin_finish(self) -> None:
+        was_recording = self._phase is DictationPhase.RECORDING
         self._cancel_pending = False
         self._tail_pending = False
         self._result_pending = None
@@ -1809,6 +1839,12 @@ class DictationOrchestrator:
         if self._recording_item() is None:
             # Пишущаяся новая фраза держит индикацию записи (О4, US-2.7).
             self._set_recording(False)
+        if was_recording and self._items:
+            # Запись оборвалась, пока другие фразы распознаются: автомат клавиши
+            # возвращается к ним, иначе следующее нажатие toggle только «остановит» её.
+            self._safe_ui(
+                self._return_hotkey_to_queue, "диктовка: не удалось сбросить горячую клавишу"
+            )
         if not self._publication_allowed():
             self._pill.hide()
 
@@ -1826,6 +1862,17 @@ class DictationOrchestrator:
                 self._tray.set_state(TrayState.PROCESSING)
             self._later(duration, self._tail_done)
             return
+        # Итог старой фразы, отложенный на запись новой, не переживает очередь: иначе
+        # он всплыл бы на следующей фразе. Пилюля «Микрофон сменился» важнее него.
+        deferred, self._deferred_notice = self._deferred_notice, None
+        if (
+            deferred is not None
+            and self._publication_allowed()
+            and not (
+                self._device_pill_until is not None and self._clock() < self._device_pill_until
+            )
+        ):
+            self._safe_ui(deferred, "диктовка: не удалось обновить пилюлю")
         self._tray.set_state(tray if self._publication_allowed() else TrayState.IDLE)
         self._later(duration, self._tail_done)
         if self._press_queued():

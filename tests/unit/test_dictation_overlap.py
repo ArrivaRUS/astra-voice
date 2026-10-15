@@ -61,6 +61,8 @@ from astra_voice.platform.cowork import DeliveryResult
 from astra_voice.platform.hotkey import HotkeyMode, HotkeyState
 from astra_voice.platform.paste import PasteOutcomeKind
 from astra_voice.ui.pill import (
+    CLIPBOARD_WINDOW_CHANGED,
+    ERROR_MICROPHONE_CHANGED,
     ERROR_RECOGNITION_FAILED,
     ERROR_RECOGNITION_RESTARTED,
     STATE_DURATION_MS,
@@ -658,3 +660,241 @@ def test_ready_first_pastes_after_second_is_cancelled(rig: OverlapRig, confirm: 
         "cancelled",
         "ok",
     ]
+
+
+# Код-ревью US-2.7 (46d3afd): регресс-тесты по пробам p1–p7 и nit маршрутизации ---------
+
+
+@pytest.mark.parametrize("hotkey_mode", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
+def test_press_within_release_tail_keeps_recorded_phrase(hotkey_mode: HotkeyMode) -> None:
+    """MAJOR-1 (p1/p1b): нажатие в первые RELEASE_TAIL_MS после отпускания A (дребезг,
+    быстрый повтор) не отменяет записанную A: A распознаётся и вставляется."""
+    rig = OverlapRig(hotkey_mode=hotkey_mode)
+    rig.start()
+    rig.stop(tail=False)
+    rig.assert_hotkey_state(HotkeyState.PROCESSING)
+    rig.now += 0.01
+    rig.start()
+    assert "record.cancel" not in rig.commands(), "нажатие в хвосте отменило A"
+    assert len(rig.uids) == 1
+    rig.assert_hotkey_state(HotkeyState.PROCESSING)
+    if hotkey_mode == HotkeyMode.PTT:
+        rig.now += 0.03
+        rig.fsm.release(rig.now)
+    rig.fire_tail()
+    assert rig.sent_ids("recognize") == [rig.uids[A]]
+    rig.result_for(A, A_TEXT)
+    assert rig.texts() == [A_TEXT]
+    assert "record.cancel" not in rig.commands()
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+    assert not rig.recording
+    # Следующее нажатие — обычная новая фраза.
+    rig.start()
+    assert len(rig.uids) == 2
+
+
+def test_deferred_first_error_does_not_resurface_on_later_phrase(rig: OverlapRig) -> None:
+    """p2: ошибка A, отложенная на запись B, не всплывает на фразе C через минуту, если B
+    закончилась без распознавания (короткая запись до смены микрофона)."""
+    begin_overlap(rig)
+    rig.event_for(A, "error", code="engine-failed")
+    rig.core.on_worker_event(
+        {
+            "type": "audio.device.changed",
+            "generation": rig.worker_generation,
+            "utterance_id": rig.uids[B],
+            "kind": "switched",
+            "label": "USB",
+            "audio_ms": 100,
+        }
+    )
+    assert rig.pill.calls[-1][:2] == (PillState.ERROR, ERROR_MICROPHONE_CHANGED)
+    fire_finishing_timers(rig)
+    assert phase_of(rig) == DictationPhase.IDLE
+    rig.now += 60
+    mark = len(rig.pill.calls)
+    rig.start()
+    rig.stop()
+    later = rig.pill.calls[mark:]
+    assert (PillState.ERROR, ERROR_RECOGNITION_FAILED, None) not in later
+    assert later[-1][0] == PillState.PROCESSING
+
+
+def test_failing_ui_port_during_paste_queue_does_not_strand_phrase(
+    rig: OverlapRig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """p7: исключение порта UI при разборе отложенного нажатия не оставляет A во вставке:
+    A доходит до исхода, очередь не застревает, фаза возвращается в IDLE."""
+    caplog.set_level(logging.DEBUG)
+    rig.start()
+    rig.stop()
+
+    def press() -> None:
+        rig.now += 0.05
+        rig.fsm.press(rig.now)
+
+    original = rig.tray.set_state
+
+    def failing(state: TrayState, tooltip: str | None = None) -> None:
+        if state == TrayState.LISTENING:
+            raise RuntimeError(A_TEXT)
+        original(state, tooltip)
+
+    rig.during_paste = press
+    monkeypatch.setattr(rig.tray, "set_state", failing)
+    rig.result_for(A, A_TEXT)
+    rig.during_paste = None
+    monkeypatch.setattr(rig.tray, "set_state", original)
+    assert rig.texts() == [A_TEXT]
+    assert [e["result"] for e in rig.stats.events if e["type"] == "dictation"] == ["ok"]
+    assert rig.core.pending_utterances == 1, "A осталась в очереди после сбоя порта"
+    assert any("отложенное событие" in r.getMessage() for r in caplog.records)
+    assert "ГЕЛИОТРОП" not in caplog.text
+    fire_finishing_timers(rig)
+    rig.stop()
+    rig.result_for(B, B_TEXT)
+    assert rig.texts() == [A_TEXT, B_TEXT]
+    fire_finishing_timers(rig)
+    assert phase_of(rig) == DictationPhase.IDLE
+    rig.idle.assert_called_once_with()
+
+
+@pytest.mark.parametrize("hotkey_mode", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
+def test_second_recording_failure_returns_hotkey_to_queue(hotkey_mode: HotkeyMode) -> None:
+    """p4: B падает при записи (audio-failed), пока A распознаётся, — автомат клавиши
+    возвращается к A, и следующее нажатие начинает новую фразу, а не теряется."""
+    rig = OverlapRig(hotkey_mode=hotkey_mode)
+    rig.start()
+    rig.stop()
+    rig.start()
+    assert len(rig.uids) == 2, OVERLAP_MISSING
+    rig.event_for(B, "error", code="audio-failed")
+    rig.assert_hotkey_state(HotkeyState.PROCESSING)
+    assert not rig.recording
+    assert rig.uids[A] not in rig.sent_ids("record.cancel")
+    rig.now += 1
+    if hotkey_mode == HotkeyMode.PTT:
+        rig.fsm.release(rig.now)
+        rig.assert_hotkey_state(HotkeyState.PROCESSING)
+    rig.start()
+    assert len(rig.uids) == 3, "нажатие после сбоя B потеряно"
+    rig.stop()
+    rig.result_for(A, A_TEXT)
+    rig.result_for(C, "третья")
+    assert rig.texts() == [A_TEXT, "третья"]
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+
+
+def test_press_during_first_paste_with_second_in_flight_starts_new_phrase(
+    rig: OverlapRig,
+) -> None:
+    """p6: нажатие во время вставки A, пока B распознаётся, — не «третье»: вставленная A
+    завершена до разбора очереди (решение 6), нажатие начинает фразу C."""
+    begin_overlap(rig, release_b=True)
+
+    def press() -> None:
+        rig.now += 0.05
+        rig.fsm.press(rig.now)
+
+    rig.during_paste = press
+    rig.result_for(A, A_TEXT)
+    rig.during_paste = None
+    assert rig.texts() == [A_TEXT]
+    assert len(rig.uids) == 3, "нажатие во время вставки A отклонено как третье"
+    assert rig.refusals == 0
+    assert rig.core.pending_utterances == 2
+    assert phase_of(rig) == DictationPhase.RECORDING and rig.recording
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    rig.result_for(B, B_TEXT)
+    assert rig.texts() == [A_TEXT], "B вставлена, пока пишется C"
+    rig.stop()
+    assert rig.texts() == [A_TEXT, B_TEXT]
+    rig.result_for(C, "третья")
+    assert rig.texts() == [A_TEXT, B_TEXT, "третья"]
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+
+
+def test_press_during_busy_paste_with_second_in_flight_is_third(rig: OverlapRig) -> None:
+    """p6, граница: A не вставлена (BUSY, ждёт повтора) — нажатие остаётся третьим."""
+    begin_overlap(rig, release_b=True)
+    rig.outcomes.append(PasteOutcomeKind.BUSY)
+
+    def press() -> None:
+        rig.now += 0.05
+        rig.fsm.press(rig.now)
+
+    rig.during_paste = press
+    rig.result_for(A, A_TEXT)
+    rig.during_paste = None
+    assert len(rig.uids) == 2
+    assert "record.cancel" not in rig.commands()
+    rig.assert_hotkey_state(HotkeyState.PROCESSING)
+
+
+@pytest.mark.parametrize("b_outcome", [PasteOutcomeKind.PASTED, PasteOutcomeKind.WINDOW_CHANGED])
+def test_first_in_clipboard_then_second_delivered(
+    rig: OverlapRig, b_outcome: PasteOutcomeKind
+) -> None:
+    """T-216 (уровень оркестратора): A ушла в буфер (окно сменилось), затем B.
+
+    Каждая фраза сообщает свой исход: «в буфере» у A видно, хотя B ещё в работе
+    (решение 3). Если и B ушла в буфер, буфер и «последний текст» — B: текст A
+    остаётся только в буфере до вставки B (возврат снимка буфера — xvfb, T-216).
+    """
+    begin_overlap(rig, release_b=True)
+    rig.outcomes.extend([PasteOutcomeKind.WINDOW_CHANGED, b_outcome])
+    rig.result_for(A, A_TEXT)
+    clipboard = (PillState.CLIPBOARD_ONLY, CLIPBOARD_WINDOW_CHANGED, None)
+    assert rig.pill.calls[-1] == clipboard
+    assert rig.core.last_text == A_TEXT
+    rig.result_for(B, B_TEXT)
+    assert rig.texts() == [A_TEXT, B_TEXT]
+    assert rig.core.last_text == B_TEXT
+    notices = [c for c in rig.pill.calls if c == clipboard]
+    expected = 2 if b_outcome == PasteOutcomeKind.WINDOW_CHANGED else 1
+    assert len(notices) == expected
+    if b_outcome == PasteOutcomeKind.PASTED:
+        assert rig.pill.calls[-1][0] == PillState.DONE
+    assert [e["result"] for e in rig.stats.events if e["type"] == "dictation"] == ["ok", "ok"]
+
+
+@pytest.mark.parametrize("b_state", ["recording", "processing"])
+def test_reply_error_without_phrase_id_fails_no_phrase(rig: OverlapRig, b_state: str) -> None:
+    """nit _route: ошибка ответа на запрос не по фразе (замер памяти после «Готово» A,
+    загрузка модели) не назначается распознаваемой фразе и не обрывает пишущуюся."""
+    begin_overlap(rig, release_b=b_state == "processing")
+    for code, response in (("measure-failed", "measured"), ("timeout", "model.loaded")):
+        rig.core.on_worker_event(
+            {
+                "type": "error",
+                "generation": rig.worker_generation,
+                "code": code,
+                "response_type": response,
+            }
+        )
+    assert all(call[0] != PillState.ERROR for call in rig.pill.calls)
+    assert "record.cancel" not in rig.commands()
+    assert rig.core.pending_utterances == 2
+    if b_state == "recording":
+        assert rig.recording
+        rig.stop()
+    rig.result_for(A, A_TEXT)
+    rig.result_for(B, B_TEXT)
+    assert rig.texts() == [A_TEXT, B_TEXT]
+
+
+def test_restart_reply_error_still_ends_queue(rig: OverlapRig) -> None:
+    """nit _route, граница: перезапуск воркера в ответе на чужой запрос — по-прежнему
+    одна ошибка на всю очередь."""
+    begin_overlap(rig, release_b=True)
+    rig.core.on_worker_event(
+        {
+            "type": "error",
+            "generation": rig.worker_generation,
+            "code": "worker-crashed",
+            "response_type": "measured",
+        }
+    )
+    restarted = [c for c in rig.pill.calls if c[1] == ERROR_RECOGNITION_RESTARTED]
+    assert len(restarted) == 1
+    assert rig.core.pending_utterances == 0

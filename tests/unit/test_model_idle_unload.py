@@ -457,6 +457,74 @@ def test_overlap_queue_blocks_idle_unload_until_last_phrase(
     assert runtime._model_parked
 
 
+def start_overlap(rig: Rig) -> tuple[str, str]:
+    """A отпущена и распознаётся, B нажата и пишется (настоящие автомат и оркестратор)."""
+    rig.hotkey.fsm.press(rig.now)
+    rig.release(rig.now + 1)
+    rig.now += 2
+    rig.hotkey.fsm.press(rig.now)
+    first, second = record_ids(rig)
+    assert rig.runtime.orchestrator.pending_utterances == 2
+    return first, second
+
+
+def fire_phrase_outcome(rig: Rig) -> None:
+    """Только пилюля исхода фразы: сторожа распознавания и смены модели не трогаем."""
+    for timer in list(rig.timers):
+        if timer.name == "scheduled" and timer.active and timer.interval < PROCESSING_WATCHDOG_MS:
+            timer.fire()
+
+
+def test_overlap_queue_defers_model_switch_until_last_phrase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T-218: смена модели при непустой очереди ждёт исхода последней фразы (on_idle);
+    обе фразы вставлены прежней моделью, воркер не заменён посреди очереди."""
+    rig = make_rig(monkeypatch)
+    runtime = rig.runtime
+    first, second = start_overlap(rig)
+    workers = rig.supervisor_factory.call_count
+    runtime.switch_model(min_ram_mb=100, pause=True)
+    assert runtime._pending_switch == (100, True)
+    rig.release(rig.now + 1)
+    rig.event(type="result", utterance_id=first, text=MARKER)
+    fire_phrase_outcome(rig)
+    assert runtime.orchestrator.pending_utterances == 1
+    assert runtime._pending_switch == (100, True), "смена началась посреди очереди"
+    assert rig.supervisor_factory.call_count == workers
+    rig.event(type="result", utterance_id=second, text=MARKER)
+    assert rig.paste.call_count == 2
+    replacement = Mock(state="running", generation=2)
+    rig.supervisor_factory.return_value = replacement
+    fire_phrase_outcome(rig)
+    assert_phase(runtime, DictationPhase.IDLE)
+    assert runtime._pending_switch is None and runtime._switch_paused
+    assert rig.supervisor_factory.call_count == workers + 1
+    assert runtime.supervisor is replacement
+    runtime.shutdown()
+
+
+def test_quit_with_overlap_queue_cancels_both_without_paste(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T-218: «Выход» при непустой очереди — обе фразы отменены, вставок нет, хоткей и
+    индикатор записи освобождены."""
+    rig = make_rig(monkeypatch)
+    runtime = rig.runtime
+    first, second = start_overlap(rig)
+    rig.guard.set_recording.reset_mock()
+    runtime.shutdown()
+    cancelled = [
+        item.args[0]["utterance_id"]
+        for item in rig.supervisor.send.call_args_list
+        if item.args[0]["type"] == "record.cancel"
+    ]
+    assert {first, second} <= set(cancelled)
+    rig.guard.set_recording.assert_called_with(False)
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE
+    rig.paste.assert_not_called()
+
+
 # Код-ревью US-2.6: отказы пробуждения, смена модели, доверие мыши, предел и окно ----------
 
 
