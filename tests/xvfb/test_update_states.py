@@ -77,6 +77,7 @@ class FakeUpdates(QObject):
         self.calls: list[str] = []
         self._values: dict[str, Any] = {
             "state": "disabled",
+            "modelUpdateText": "",
             "version": "",
             "notes": [],
             "currentVersion": "0.2.0",
@@ -119,6 +120,7 @@ class FakeUpdates(QObject):
         )
         self._values.update(values)
 
+    modelUpdateText = pyqtProperty(str, _value("modelUpdateText"), notify=statusChanged)
     state = pyqtProperty(str, _value("state"), notify=statusChanged)
     version = pyqtProperty(str, _value("version"), notify=statusChanged)
     notes = pyqtProperty("QVariantList", _value("notes"), notify=statusChanged)

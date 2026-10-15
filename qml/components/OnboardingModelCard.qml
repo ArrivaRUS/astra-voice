@@ -33,13 +33,22 @@ Rectangle {
     // Управление установленной моделью есть в разделе «Модели» и нет в мастере.
     property bool manageEnabled: false
     property bool updateAvailable: false
+    property bool previousAvailable: false
+    property bool isNew: false
+    property string reason: ""
+    property bool detailsExpanded: false
+    readonly property bool revisionState: ["update-available", "updating", "update-failed"].indexOf(cardState) >= 0
+    readonly property bool removed: cardState === "removed" || cardState === "removed-from-catalog"
+    readonly property bool expandedFooter: revisionState || removed || (badge === "active" && previousAvailable)
+    onReasonChanged: detailsExpanded = false
+    onCardStateChanged: detailsExpanded = false
     property string message: ""
     property string hint: ""
     property string hintKind: ""
     property bool memoryShortage: false
     property bool canSwitchWithPause: false
     property bool canReinstall: true
-    // Вернуть, когда мост выдаёт эти состояния и у действий появятся обработчики.
+    // Мастер оставляет действия обновления выключенными; раздел подключает мост.
     property bool detailsActionAvailable: false
     property bool updateActionsAvailable: false
     property var metrics: []
@@ -53,6 +62,7 @@ Rectangle {
     signal activateRequested()
     signal removeRequested()
     signal updateRequested()
+    signal revertPreviousRequested()
     signal switchWithPauseRequested()
     signal reinstallRequested()
     signal detailsRequested()
@@ -63,7 +73,7 @@ Rectangle {
     readonly property bool highlighted: badge === "" && (selected || cardState === "paused-no-space")
     readonly property bool manageVisible: manageEnabled && badge !== ""
     readonly property bool busy: cardState === "queued" || cardState === "downloading"
-        || cardState === "verifying"
+        || cardState === "verifying" || cardState === "updating"
     readonly property bool hasError: ["failed", "sha-failed", "no-space", "paused-no-space",
         "broken", "corrupted", "update-failed"].indexOf(cardState) >= 0
     // Отказ переключения или удаления приходит сообщением на исправной карточке.
@@ -74,7 +84,8 @@ Rectangle {
     readonly property bool messageError: hasMessage && !neutralMessage
     readonly property bool unavailable: ["no-space", "no-network", "offline-user", "policy"]
         .indexOf(cardState) >= 0
-    readonly property bool showHint: (hint !== "" || ["low-ram", "not-recommended",
+    readonly property bool showHint: (!removed || hint !== qsTr("Снята с каталога — обновлений не будет"))
+        && (hint !== "" || ["low-ram", "not-recommended",
         "no-benchmark"].indexOf(cardState) >= 0) && (!hasMessage || memoryShortage)
     readonly property bool footerHasButtons: cardState === "queued"
         || cardState === "downloading" || cardState === "paused-no-space"
@@ -94,11 +105,16 @@ Rectangle {
         : cardState === "queued" ? qsTr("В очереди")
         : cardState === "verifying" ? qsTr("Проверяю…")
         : cardState === "switching" ? qsTr("Переключаю…")
-        : cardState === "new" ? qsTr("Новое")
         : cardState === "updating" ? qsTr("Обновляю…")
         : cardState === "update-available" ? qsTr("Обновление доступно")
         : badge === "active" ? qsTr("Установлена и активна")
-        : badge === "installed" ? qsTr("Установлена") : ""
+        : badge === "installed" ? qsTr("Установлена")
+        : isNew || cardState === "new" ? qsTr("Новое") : ""
+
+    // Ровно один бейдж состояния; вторая позиция — по приоритету §4.8.
+    readonly property bool updateBadge: cardState === "updating" || cardState === "update-available"
+    readonly property string extraBadgeLabel: updateBadge && badge === "active"
+        ? qsTr("Установлена и активна") : recommended ? qsTr("Рекомендуем") : ""
 
     implicitWidth: Theme.onboardingStep2ContentW
     implicitHeight: footer.y + footer.height + Theme.modelCardPaddingY + Theme.cardBorder
@@ -260,17 +276,22 @@ Rectangle {
                         }
                     }
                     CardBadge {
-                        visible: root.recommended
-                        text: qsTr("Рекомендуем")
-                        color: root.highlighted || root.busy ? Theme.bgSurface : Theme.primaryBg
-                        textColor: Theme.primary
+                        objectName: "modelExtraBadge"
+                        visible: root.extraBadgeLabel !== ""
+                        text: root.extraBadgeLabel
+                        color: root.updateBadge && root.badge === "active" ? Theme.bgSurface
+                            : root.highlighted || root.busy ? Theme.bgSurface : Theme.primaryBg
+                        textColor: root.updateBadge && root.badge === "active" ? Theme.accentInk : Theme.primary
                     }
                     CardBadge {
+                        objectName: "modelStateBadge"
                         visible: root.statusLabel !== ""
                         text: root.statusLabel
-                        color: root.busy || root.cardState === "new" ? Theme.bgSurface2
+                        color: root.cardState === "update-available" ? Theme.warningBg
+                            : root.busy || root.statusLabel === qsTr("Новое") ? Theme.bgSurface2
                             : root.badge === "active" ? Theme.bgSurface : Theme.successBg
-                        textColor: root.busy || root.cardState === "new" ? Theme.fgMuted
+                        textColor: root.cardState === "update-available" ? Theme.warningInk
+                            : root.busy || root.statusLabel === qsTr("Новое") ? Theme.fgMuted
                             : root.badge === "active" ? Theme.accentInk : Theme.successInk
                     }
                 }
@@ -385,13 +406,15 @@ Rectangle {
         }
     }
 
-    RowLayout {
+    GridLayout {
         id: footer
+        columns: root.expandedFooter ? 1 : 2
+        rowSpacing: Theme.modelCardFooterGap
         objectName: "cardFooter"
         x: Theme.cardBorder + Theme.modelCardPaddingX + root.footerIndent
         y: top.y + top.height + Theme.modelCardFooterGap
         width: top.width - root.footerIndent
-        spacing: Theme.modelCardFooterColsGap
+        columnSpacing: Theme.modelCardFooterColsGap
         Flow {
             id: footerFacts
             objectName: "footerFacts"
@@ -464,13 +487,31 @@ Rectangle {
             }
         }
 
+        FooterText {
+            objectName: "revisionMessage"
+            visible: root.expandedFooter && root.hasMessage && root.cardState !== "update-failed"
+            Layout.fillWidth: true
+            Layout.minimumWidth: 0
+            text: messageText.text
+            color: messageText.color
+        }
+
+        FooterText {
+            objectName: "removedModelNote"
+            visible: root.removed
+            Layout.fillWidth: true
+            Layout.minimumWidth: 0
+            text: qsTr("Снята с каталога — обновлений не будет")
+        }
+
         RowLayout {
             objectName: "footerActions"
             visible: root.busy || root.hasMessage || root.showHint || root.manageVisible
                 || (root.cardState === "updating" && root.updateActionsAvailable)
             // Nested layouts otherwise expand and separate right-aligned buttons.
             Layout.fillWidth: false
-            Layout.maximumWidth: footer.width * Theme.modelCardFooterActionsMaxShare
+            Layout.maximumWidth: root.expandedFooter ? footer.width
+                : footer.width * Theme.modelCardFooterActionsMaxShare
             Layout.preferredWidth: implicitWidth
             Layout.alignment: Qt.AlignRight | Qt.AlignTop
             spacing: Theme.modelCardFooterActionsGap
@@ -481,14 +522,15 @@ Rectangle {
             }
             Icon {
                 objectName: "messageAlert"
-                visible: root.messageError
+                visible: root.messageError && (!root.expandedFooter || root.cardState === "update-failed")
                 name: "alert"
                 size: Theme.modelCardFooterMsgIconSize
                 color: Theme.dangerInk
             }
             FooterText {
+                id: messageText
                 objectName: "messageText"
-                visible: root.hasMessage
+                visible: root.hasMessage && (!root.expandedFooter || root.cardState === "update-failed")
                 Layout.fillWidth: true
                 Layout.minimumWidth: 0
                 text: root.message !== "" ? root.message
@@ -505,7 +547,7 @@ Rectangle {
                     : root.cardState === "broken" || root.cardState === "corrupted"
                         ? qsTr("Файлы модели не читаются")
                     : root.cardState === "update-failed"
-                        ? qsTr("Не удалось обновить модель")
+                        ? qsTr("Новая ревизия не прошла проверку, оставлена текущая")
                     : qsTr("Не удалось загрузить модель")
                 color: root.messageError ? Theme.dangerInk : Theme.fgMuted
             }
@@ -567,11 +609,15 @@ Rectangle {
                 }
             }
             AvButton {
-                visible: root.cardState === "sha-failed" && root.detailsActionAvailable
+                visible: (root.cardState === "sha-failed" && root.detailsActionAvailable)
+                    || (root.cardState === "update-failed" && root.updateActionsAvailable)
                 Layout.minimumWidth: visible ? implicitWidth : 0
                 small: true
                 text: qsTr("Подробнее")
-                onClicked: root.detailsRequested()
+                onClicked: {
+                    root.detailsExpanded = !root.detailsExpanded;
+                    root.detailsRequested();
+                }
             }
             AvButton {
                 visible: root.cardState === "no-space" && root.openFolderEnabled
@@ -584,8 +630,9 @@ Rectangle {
 
             // Кнопки установленной модели (§5.4, состояния 19–20, 25).
             AvButton {
-                visible: root.manageVisible && root.updateAvailable
-                    && root.cardState !== "switching" && root.cardState !== "broken"
+                visible: root.manageVisible && root.updateActionsAvailable
+                    && root.badge === "active" && root.updateAvailable
+                    && ["updating", "update-failed", "switching", "broken"].indexOf(root.cardState) < 0
                 Layout.minimumWidth: visible ? implicitWidth : 0
                 small: true
                 iconName: "down"
@@ -619,7 +666,18 @@ Rectangle {
                 onClicked: root.reinstallRequested()
             }
             AvButton {
-                visible: root.manageVisible
+                objectName: "revertModelPreviousButton"
+                visible: root.manageVisible && root.badge === "active" && root.previousAvailable
+                    && root.cardState !== "updating"
+                enabled: root.cardState !== "switching"
+                Layout.minimumWidth: visible ? implicitWidth : 0
+                small: true
+                variant: "ghost"
+                text: qsTr("Вернуть предыдущую версию")
+                onClicked: root.revertPreviousRequested()
+            }
+            AvButton {
+                visible: root.manageVisible && root.cardState !== "updating"
                 enabled: root.cardState !== "switching" && root.badge !== "active"
                 Layout.minimumWidth: visible ? implicitWidth : 0
                 Layout.alignment: Qt.AlignRight
@@ -628,6 +686,15 @@ Rectangle {
                 text: qsTr("Удалить")
                 onClicked: root.removeRequested()
             }
+        }
+
+        FooterText {
+            objectName: "modelErrorDetails"
+            visible: root.detailsExpanded && root.reason !== ""
+            Layout.columnSpan: footer.columns
+            Layout.fillWidth: true
+            Layout.minimumWidth: 0
+            text: root.reason
         }
     }
 

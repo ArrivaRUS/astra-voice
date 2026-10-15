@@ -56,7 +56,7 @@ if TYPE_CHECKING:
     from astra_voice.core.settings import Settings
     from astra_voice.models.catalog import Catalog
     from astra_voice.models.store import ModelStore
-    from astra_voice.updates.model_updates import ModelUpdateChecker
+    from astra_voice.updates.model_updates import ModelUpdateChecker, ModelUpdateNotice
 
 log = logging.getLogger(__name__)
 
@@ -152,6 +152,8 @@ class UpdateChecker:
         self._verified: VerifiedRelease | None = None
         self._version = current_version
         self._url = url
+        self.on_model_update: Callable[[ModelUpdateNotice], None] | None = None
+        self.on_model_catalog: Callable[[Catalog, frozenset[str]], None] | None = None
         self.on_status = on_status
         self.on_event = on_event
         self._clock = clock
@@ -690,7 +692,7 @@ def create_app_checker(
     cache = shared_cache()
     checker = UpdateChecker(gate, client, cache=cache, metadata=metadata, track=track)
     if model_store is not None and catalog is not None:
-        from astra_voice.updates.catalog_updates import CatalogUpdateSource
+        from astra_voice.updates.catalog_updates import CatalogUpdateSource, NewModelTracker
         from astra_voice.updates.model_updates import ModelUpdateChecker
 
         model_catalog = catalog
@@ -717,7 +719,20 @@ def create_app_checker(
                 scope="public",
             )
             model_catalog = source.current
-            refresh_catalog = source.refresh
+            tracker = NewModelTracker(catalog_state_dir / "new-models.json")
+
+            def refresh_catalog_snapshot(cancel: threading.Event) -> None:
+                source.refresh(cancel)
+                snapshot = source.current()
+                if checker.on_model_catalog is not None:
+                    checker.on_model_catalog(snapshot, tracker.new_ids(snapshot, time.time()))
+
+            refresh_catalog = refresh_catalog_snapshot
+
+        def notify_model(notice: ModelUpdateNotice) -> None:
+            if checker.on_model_update is not None:
+                checker.on_model_update(notice)
+
         checker.configure_model_checker(
             ModelUpdateChecker(
                 client,
@@ -727,6 +742,7 @@ def create_app_checker(
                 state_path=paths.state_dir() / "model-update-state.json",
                 wait=checker._wake.wait,
                 refresh_catalog=refresh_catalog,
+                notify=notify_model,
             )
         )
     return checker

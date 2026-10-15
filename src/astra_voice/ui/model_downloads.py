@@ -83,6 +83,12 @@ from astra_voice.ui.formatting import (
     format_space,
     format_speed,
 )
+from astra_voice.updates.model_updates import (
+    FAILED_MESSAGE,
+    REVERT_FAILED_MESSAGE,
+    ModelRevisionUpdater,
+    RevisionUpdateResult,
+)
 
 log = logging.getLogger(__name__)
 
@@ -372,7 +378,7 @@ class _JobChannel:
             self.closed = True
 
 
-def _run_job(job: _ModelJob | _RecheckJob, channel: _JobChannel) -> None:
+def _run_job(job: _ModelJob | _RecheckJob | _RevisionJob, channel: _JobChannel) -> None:
     """Тело рабочего потока: задание, затем признак выхода (как finished у потока)."""
     try:
         job.run()
@@ -554,6 +560,29 @@ class ModelService:
     def catalog(self) -> Catalog:
         """Проверенный каталог для фоновой проверки обновлений; только чтение."""
         return self._catalog
+
+    def revision_updater(self, *, on_state: Callable[[str, str], None]) -> ModelRevisionUpdater:
+        """Переиспользует загрузчик и установщик службы для явного обновления."""
+        return ModelRevisionUpdater(
+            self._store, self._downloader, self._installer, self._catalog, on_state=on_state
+        )
+
+    def previous_revision(self) -> str | None:
+        return self._store.previous_revision()
+
+    def new_ids(self) -> frozenset[str]:
+        from astra_voice.updates.catalog_updates import NewModelTracker
+
+        return NewModelTracker(
+            paths.state_dir() / "model-catalog-updates" / "new-models.json"
+        ).new_ids(self._catalog, time.time())
+
+    def accept_catalog(self, catalog: Catalog) -> None:
+        """GUI принимает только уже проверенный снимок фоновой проверки."""
+        self._catalog = catalog
+        self._installer = Installer(
+            self._store, make_smoke_check(cancel=lambda: self._cancel.is_set()), catalog=catalog
+        )
 
     def recommended(self) -> CatalogEntry | None:
         return next(
@@ -944,10 +973,44 @@ class _RecheckJob:
             self._sink("finished", (state, reason))
 
 
+class _RevisionJob:
+    """Обновлятор не знает о Qt; результаты и состояния — значения в канале."""
+
+    def __init__(
+        self,
+        updater: ModelRevisionUpdater,
+        model_id: str,
+        cancel: threading.Event,
+        revert: bool,
+        emit: _JobSink,
+    ) -> None:
+        self.updater, self.model_id, self.cancel = updater, model_id, cancel
+        self.revert, self.emit = revert, emit
+
+    def run(self) -> None:
+        try:
+            result = (
+                self.updater.revert_previous(self.model_id)
+                if self.revert
+                else self.updater.apply(self.model_id, cancel=self.cancel)
+            )
+        except Exception:
+            log.exception("Не удалось обновить ревизию модели")
+            result = RevisionUpdateResult(
+                "update-failed",
+                self.model_id,
+                None,
+                REVERT_FAILED_MESSAGE if self.revert else FAILED_MESSAGE,
+                "revert" if self.revert else "update",
+            )
+        self.emit("revision-result", (result,))
+
+
 class ModelDownloads(QObject):
     """Общая очередь установки и состояния каталога, независимые от окна."""
 
     modelsChanged = pyqtSignal()
+    modelRevisionChanged = pyqtSignal(str)
     revocationUnknownChanged = pyqtSignal()
     selectionChanged = pyqtSignal()
     freeSpaceTextChanged = pyqtSignal()
@@ -1003,6 +1066,11 @@ class ModelDownloads(QObject):
         self._card_hints: dict[str, str] = {}
         self._card_hint_kinds: dict[str, str] = {}
         self._card_progress: dict[str, float] = {}
+        self._card_reasons: dict[str, str] = {}
+        self._new_ids: frozenset[str] = frozenset()
+        self._pending_catalog: tuple[Catalog, frozenset[str]] | None = None
+        self._revision_entry: Any | None = None
+        self._revision_result: RevisionUpdateResult | None = None
         self._queue: list[Any] = []
         self._queue_entries: tuple[Any, ...] = ()
         self._active_entry: Any | None = None
@@ -1034,7 +1102,7 @@ class ModelDownloads(QObject):
         self._speed = ""
         self._eta = ""
         self._model_thread: threading.Thread | None = None
-        self._model_job: _ModelJob | _RecheckJob | None = None
+        self._model_job: _ModelJob | _RecheckJob | _RevisionJob | None = None
         # Канал текущего задания; сообщения прежних каналов GUI отбрасывает.
         self._model_channel: _JobChannel | None = None
         # Поток, выхода которого ждёт отложенная повторная проверка.
@@ -1056,6 +1124,8 @@ class ModelDownloads(QObject):
         self._refresh_free_space_text()
         # selectionChanged публикуется также после завершения каждой модели в очереди.
         self.selectionChanged.connect(self._refresh_free_space_text)
+        self.selectionChanged.connect(self._accept_pending_catalog)
+        self.modelReadyChanged.connect(self._accept_pending_catalog)
         if switcher is not None:
             switcher.on_switch_finished = self._switch_finished
 
@@ -1230,6 +1300,8 @@ class ModelDownloads(QObject):
             except (OSError, StoreError):
                 log.warning("Не удалось прочитать состояние установленной модели")
                 return "installed" if revision else "available"
+        if self._badge(entry, installed) == "active" and self._update_available(entry, installed):
+            return "update-available"
         return "installed" if self._badge(entry, installed) else "available"
 
     def _card_hint(
@@ -1324,6 +1396,10 @@ class ModelDownloads(QObject):
                 records[0] if records else None,
             )
         current = self._model.current_ids()
+        if current is not None:
+            active = next((entry for entry in self._entries if entry.id == current[0]), None)
+            if active is not None and not self._is_revoked(active, current[1]):
+                return active
         # Отозванная ревизия рабочей быть не может: её место занимает замена.
         usable = tuple(entry for entry in self._entries if not self._is_revoked(entry))
         for entry in usable:
@@ -1344,7 +1420,8 @@ class ModelDownloads(QObject):
         state = self._card_states.get(entry.id, "")
         if state in {"downloading", "verifying", "failed", "paused-no-space"}:
             return state
-        record_state = self._model.record_state(entry.id, entry.revision)
+        revision = self._installed_revision(entry) or entry.revision
+        record_state = self._model.record_state(entry.id, revision)
         return "ok" if record_state == "ok" else "broken" if record_state else "none"
 
     def status_text(self) -> str:
@@ -1427,6 +1504,9 @@ class ModelDownloads(QObject):
         именно на этом держится «Обновить» в карточке.
         """
         known = self._installed_ids() if installed is None else installed
+        current = self._model.current_ids() if self._model is not None else None
+        if current is not None and current[0] == entry.id and current in known:
+            return current[1]
         if (entry.id, entry.revision) in known:
             return str(entry.revision)
         if entry.removed_from_catalog:
@@ -1482,6 +1562,8 @@ class ModelDownloads(QObject):
         measurements = self._measurements_cache
         threads = model_threads(self._settings.to_dict())
         installed = self._installed_ids()
+        new_ids = getattr(self._model, "new_ids", None)
+        new_models = new_ids() if callable(new_ids) else self._new_ids
         try:
             total = self._model.mem_total_mb() if self._model is not None else None
         except (OSError, StoreError):
@@ -1500,7 +1582,7 @@ class ModelDownloads(QObject):
                 "badge": self._badge(entry, installed),
                 "state": (state := self._card_state(entry, installed)),
                 "message": self._card_message(entry, state),
-                "canCancel": state in {"downloading", "paused-no-space"},
+                "canCancel": state in {"downloading", "paused-no-space", "updating"},
                 # Карточка сохраняет проверку отзыва установленной ревизии.
                 "canRetry": self._can_retry(entry, state, installed_revision=True),
                 "canDequeue": state == "queued",
@@ -1510,7 +1592,11 @@ class ModelDownloads(QObject):
                 "vendorShort": _vendor_short(entry),
                 "domestic": bool(getattr(entry, "domestic", False)),
                 "updateAvailable": not entry.removed_from_catalog
+                and self._badge(entry, installed) == "active"
                 and self._update_available(entry, installed),
+                "previousAvailable": self._previous_available(entry, installed),
+                "isNew": entry.id in new_models,
+                "reason": self._card_reasons.get(entry.id, ""),
                 "canReinstall": not entry.removed_from_catalog,
                 "tags": entry_tags(entry),
                 "metrics": _card_metrics(entry, best_rtfx, merged),
@@ -2032,11 +2118,113 @@ class ModelDownloads(QObject):
             self._notify("modelReadyChanged")
             self._notify("selectionChanged")
 
+    def _previous_available(self, entry: Any, installed: tuple[tuple[str, str], ...]) -> bool:
+        previous = getattr(self._model, "previous_revision", None)
+        try:
+            return (
+                self._badge(entry, installed) == "active"
+                and callable(previous)
+                and previous() is not None
+            )
+        except (OSError, StoreError):
+            return False
+
+    def _accept_pending_catalog(self) -> None:
+        if self._pending_catalog is not None and self._idle():
+            catalog, new_ids = self._pending_catalog
+            self._pending_catalog = None
+            self.accept_catalog(catalog, new_ids)
+
+    def accept_catalog(self, catalog: Catalog, new_ids: frozenset[str]) -> None:
+        """Обновляет карточки в GUI; во время задания снимок ждёт его завершения."""
+        if not self._idle():
+            self._pending_catalog = (catalog, new_ids)
+            return
+        accept = getattr(self._model, "accept_catalog", None)
+        if callable(accept):
+            accept(catalog)
+            self._entries = self._model.entries() if self._model is not None else ()
+            self._new_ids = new_ids
+            for entry in self._entries:
+                if self._card_states.get(entry.id) == "ok" and self._update_available(entry):
+                    self._card_states.pop(entry.id, None)
+            self.modelsChanged.emit()
+
+    @pyqtSlot(str)
     def updateModel(self, model_id: str) -> None:  # noqa: N802
-        """Ставит в очередь ревизию из каталога, когда установлена прежняя."""
+        self._start_revision(model_id, revert=False)
+
+    @pyqtSlot()
+    def cancelModelUpdate(self) -> None:  # noqa: N802
+        if self._revision_entry is not None:
+            self._model_cancel.set()
+
+    @pyqtSlot(str)
+    def revertModelPrevious(self, model_id: str) -> None:  # noqa: N802
+        self._start_revision(model_id, revert=True)
+
+    def _start_revision(self, model_id: str, *, revert: bool) -> None:
         entry = self._managed_entry(model_id)
-        if entry is not None and not entry.removed_from_catalog and self._update_available(entry):
-            self._begin_queue((entry,))
+        factory = getattr(self._model, "revision_updater", None)
+        if entry is None or not callable(factory) or self._badge(entry) != "active":
+            return
+        if not revert and (entry.removed_from_catalog or not self._update_available(entry)):
+            return
+        with self._update():
+            self._model_cancel = threading.Event()
+            set_cancel = getattr(self._model, "set_cancel", None)
+            if callable(set_cancel):
+                set_cancel(self._model_cancel)
+            channel = _JobChannel(self)
+            updater = factory(
+                on_state=lambda model_id, state: channel.post("revision-state", (model_id, state))
+            )
+            job = _RevisionJob(updater, model_id, self._model_cancel, revert, channel.post)
+            thread = threading.Thread(
+                target=_run_job, args=(job, channel), name=_JOB_THREAD_NAME, daemon=True
+            )
+            self._revision_entry, self._revision_result = entry, None
+            self._model_thread, self._model_job, self._model_channel = thread, job, channel
+            self._card_reasons.pop(model_id, None)
+            self._set_card(entry, "updating")
+            started = self._start_thread(thread)
+            if not started:
+                self._model_thread = None
+                self._revision_result = RevisionUpdateResult(
+                    "update-failed",
+                    model_id,
+                    None,
+                    REVERT_FAILED_MESSAGE if revert else FAILED_MESSAGE,
+                    "thread-start",
+                )
+                self._model_thread_finished()
+
+    def _finish_revision(self) -> None:
+        entry, result = self._revision_entry, self._revision_result
+        self._revision_entry, self._revision_result = None, None
+        if entry is None or result is None:
+            return
+        with self._update():
+            self._card_reasons[entry.id] = result.reason_code
+            if result.state == "updated":
+                self._set_card(entry, "ok", "")
+                self._notify("modelRevisionChanged", entry.id)
+                self._notify("modelReadyChanged")
+                self._notify("selectionChanged")
+            else:
+                refusals = {
+                    "revoked": "Предыдущая версия отозвана издателем",
+                    "no-previous": "Предыдущая версия модели недоступна",
+                    "not-installed": "Обновлять можно только рабочую модель",
+                    "no-update": "Новая ревизия модели недоступна",
+                }
+                self._set_card(
+                    entry,
+                    "update-failed",
+                    result.message or refusals.get(result.reason_code, REVERT_FAILED_MESSAGE),
+                )
+            self._notify("modelsChanged")
+        self._start_next_recheck()
 
     def reinstallModel(self, model_id: str) -> None:  # noqa: N802
         """Ставит повреждённую установленную модель в общую очередь."""
@@ -2413,7 +2601,13 @@ class ModelDownloads(QObject):
                 kind, args = channel.events.get_nowait()
             except Empty:
                 return
-            if kind == "progress":
+            if kind == "revision-state":
+                model_id, state = args
+                if self._revision_entry is not None and self._revision_entry.id == model_id:
+                    self._set_card(self._revision_entry, state)
+            elif kind == "revision-result":
+                self._revision_result = args[0]
+            elif kind == "progress":
                 self._model_progressed(*args)
             elif kind == "stage":
                 self._model_staged(*args)
@@ -2448,6 +2642,13 @@ class ModelDownloads(QObject):
         self._model_job = None
         self._model_thread = None
         self._model_channel = None
+        if self._revision_entry is not None:
+            self._finish_revision()
+            if self._pending_catalog is not None and self._idle():
+                catalog, new_ids = self._pending_catalog
+                self._pending_catalog = None
+                self.accept_catalog(catalog, new_ids)
+            return
         entry = self._active_entry
         if self._queue_running and (self._model_result is None or entry is None):
             self._reset_broken_queue()

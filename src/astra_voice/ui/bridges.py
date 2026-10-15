@@ -454,6 +454,16 @@ class SettingsBridge(QObject):
         if self._downloads is not None:
             self._downloads.updateModel(model_id)
 
+    @pyqtSlot()
+    def cancelModelUpdate(self) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.cancelModelUpdate()
+
+    @pyqtSlot(str)
+    def revertModelPrevious(self, model_id: str) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.revertModelPrevious(model_id)
+
     @pyqtSlot(str)
     def toggleModel(self, model_id: str) -> None:  # noqa: N802
         if self._downloads is not None:

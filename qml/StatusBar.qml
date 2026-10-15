@@ -20,6 +20,8 @@ Item {
     property string updateDownloadPhase: "idle"
     property int updateDownloadPercent: 0
     property string updateVersion: ""
+    property string modelUpdateText: typeof updatesBridge !== "undefined" && updatesBridge !== null
+        && typeof updatesBridge.modelUpdateText !== "undefined" ? updatesBridge.modelUpdateText : ""
     // «Напомнить позже»: версия доступна, но без акцента.
     property bool updateSnoozed: false
     // Что показать после 3000 мс uptodate: idle (только версия) или disabled (тумблер выключен).
@@ -62,7 +64,12 @@ Item {
     readonly property string warningText: revocationUnknown && modelState === "active"
         ? qsTr("Проверить отозванные версии сейчас нельзя") : ""
 
-    readonly property string updateText: {
+    readonly property bool showingModelUpdate: modelUpdateText !== ""
+        && ["idle", "cancelled"].indexOf(updateDownloadPhase) >= 0
+        && (["idle", "disabled"].indexOf(updateState) >= 0
+            || (updateState === "uptodate" && !uptodateShown))
+    readonly property string updateText: showingModelUpdate ? modelUpdateText : programUpdateText
+    readonly property string programUpdateText: {
         switch (updateDownloadPhase) {
         case "metadata": return qsTr("Проверяю сведения об обновлении…");
         case "downloading": return qsTr("Скачиваю обновление · %1 %").arg(updateDownloadPercent);
@@ -87,15 +94,15 @@ Item {
         default: return qsTr("Проверка обновлений отключена");
         }
     }
-    readonly property string updateIcon: updateState === "policy-locked" ? "lock"
+    readonly property string updateIcon: showingModelUpdate ? "" : updateState === "policy-locked" ? "lock"
         : updateState === "uptodate" && uptodateShown ? "check"
         : updateState === "error-net" || updateDownloadPhase === "error" ? "alert" : ""
     // available — единственный цветовой акцент внизу окна (§2.2).
-    readonly property bool updateAccent: updateState === "available" && updateDownloadPhase === "idle" && updateNetworkRefusal === "" && !updateSnoozed
-    readonly property color updateColor: updateState === "error-net" || updateDownloadPhase === "error" ? Theme.dangerInk
+    readonly property bool updateAccent: !showingModelUpdate && updateState === "available" && updateDownloadPhase === "idle" && updateNetworkRefusal === "" && !updateSnoozed
+    readonly property color updateColor: showingModelUpdate ? Theme.fgMuted : updateState === "error-net" || updateDownloadPhase === "error" ? Theme.dangerInk
         : updateAccent ? Theme.statusbarAccentFg : Theme.statusbarFg
-    readonly property bool updateClickable: updateDownloadPhase !== "idle" || ["available", "unavailable", "error-net", "skipped"]
-        .indexOf(updateState) >= 0
+    readonly property bool updateClickable: !showingModelUpdate
+        && (updateDownloadPhase !== "idle" || ["available", "unavailable", "error-net", "skipped"].indexOf(updateState) >= 0)
     // Строка перестала быть кликабельной — фокус с неё снимается, иначе он «висит» на тексте.
     onUpdateClickableChanged: {
         if (!updateClickable && updateItem.activeFocus)

@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 SOURCE = "models"
 CHECK_INTERVAL_S = 24 * 3600.0
 FAILED_MESSAGE = "Новая ревизия не прошла проверку, оставлена текущая"
+REVERT_FAILED_MESSAGE = "Не удалось вернуть предыдущую версию модели"
 _MAX_STATE_BYTES = 256 * 1024
 
 
@@ -120,13 +121,15 @@ class ModelRevisionUpdater:
         state: Literal["updated", "update-failed", "refused"],
         model_id: str,
         reason_code: str = "",
+        *,
+        failure_message: str = FAILED_MESSAGE,
     ) -> RevisionUpdateResult:
         current = self._store.current()
         return RevisionUpdateResult(
             state,
             model_id,
             current.revision if current is not None else None,
-            FAILED_MESSAGE if state == "update-failed" else "",
+            failure_message if state == "update-failed" else "",
             reason_code,
         )
 
@@ -137,9 +140,11 @@ class ModelRevisionUpdater:
             except Exception:  # noqa: BLE001 — уведомление не меняет итог установки
                 log.warning("models state=notification-failed")
 
-    def _failed(self, model_id: str, reason_code: str) -> RevisionUpdateResult:
+    def _failed(
+        self, model_id: str, reason_code: str, *, failure_message: str = FAILED_MESSAGE
+    ) -> RevisionUpdateResult:
         self._state(model_id, "update-failed")
-        return self._result("update-failed", model_id, reason_code)
+        return self._result("update-failed", model_id, reason_code, failure_message=failure_message)
 
     def apply(self, model_id: str, *, cancel: threading.Event) -> RevisionUpdateResult:
         with self._lock:
@@ -201,43 +206,46 @@ class ModelRevisionUpdater:
                 "selfcheck": "selfcheck",
                 "cancelled": "cancelled",
                 "revoked": "revoked",
-                "sha256": "checksum",
-                "smoke": "selfcheck",
             }.get(result.reason_code, "download")
             return self._failed(model_id, reason)
+        try:
+            self._store.set_current(model_id, entry.revision, previous_revision=current.revision)
+        except Exception:  # noqa: BLE001 — новая ревизия уже активирована установщиком
+            log.warning("models state=previous-revision-save-failed")
         return self._result("updated", model_id)
 
     def revert_previous(self, model_id: str) -> RevisionUpdateResult:
-        """Выбирает последнюю лексикографически пригодную ревизию, кроме current.
-
-        ModelStore/ModelRecord не предоставляют время установки. Поэтому здесь
-        детерминированный порядок revision, а не предположение о хронологии SHA.
-        Отозванный кандидат означает отказ, без поиска ещё более старой ревизии.
-        """
+        """Возвращает ровно ревизию, сохранённую при успешном обновлении."""
         with self._lock:
             current = self._store.current()
             if ID_RE.fullmatch(model_id) is None or current is None or current.id != model_id:
                 return self._result("refused", model_id, "not-installed")
             try:
-                candidates = [
-                    record
-                    for record in self._store.records()
-                    if record.id == model_id
-                    and record.revision != current.revision
-                    and record.state == "ok"
-                    and not record.recheck
-                    and record.metadata_ok
-                    and record.layout
-                    and record.variant
-                ]
-                if not candidates:
+                revision = self._store.previous_revision()
+                if revision is None:
                     return self._result("refused", model_id, "no-previous")
-                previous = max(candidates, key=lambda record: record.revision)
-                if self._catalog.is_revoked(model_id, previous.revision):
+                previous = next(
+                    (
+                        record
+                        for record in self._store.records()
+                        if (record.id, record.revision) == (model_id, revision)
+                    ),
+                    None,
+                )
+                if (
+                    previous is None
+                    or previous.state != "ok"
+                    or previous.recheck
+                    or not previous.metadata_ok
+                    or not previous.layout
+                    or not previous.variant
+                ):
+                    return self._result("refused", model_id, "no-previous")
+                if self._catalog.is_revoked(model_id, revision):
                     return self._result("refused", model_id, "revoked")
-                self._store.set_current(model_id, previous.revision)
+                self._store.set_current(model_id, revision)
             except Exception:  # noqa: BLE001 — отказ хранилища не выдаётся за успешный возврат
-                return self._failed(model_id, "download")
+                return self._failed(model_id, "revert", failure_message=REVERT_FAILED_MESSAGE)
             return self._result("updated", model_id)
 
 

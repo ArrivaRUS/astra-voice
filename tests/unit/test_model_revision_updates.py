@@ -100,7 +100,7 @@ from astra_voice.core.settings import Settings
 from astra_voice.models.catalog import Catalog, CatalogEntry, FileSpec, RevokedEntry
 from astra_voice.models.downloader import DownloadError
 from astra_voice.models.installer import Installer, SmokeResult
-from astra_voice.models.store import ModelStore
+from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net import http
 from astra_voice.net.gate import NetworkGate
 from astra_voice.net.http import MODEL_CHECK_JITTER_MAX_S, CheckResult, HttpClient
@@ -1089,3 +1089,208 @@ def test_revert_skips_broken_previous(
     assert result.state == "refused" and result.reason_code == "no-previous"
     current = store.current()
     assert current is not None and current.revision == NEW
+
+
+# -- M7, шаг 3: явный указатель предыдущей ревизии в current.json -------------
+
+
+def test_apply_saves_previous_revision(
+    mu: ModuleType, installed: ModelStore, new_entry: CatalogEntry, contents: dict[str, bytes]
+) -> None:
+    store = updated_store(mu, installed, new_entry, contents)
+    pointer = json.loads((store.root / "current.json").read_text())
+    assert pointer == {"id": new_entry.id, "revision": NEW, "previous_revision": OLD}
+    assert store.previous_revision() == OLD
+
+
+def test_revert_uses_explicit_previous_among_three_revisions(
+    mu: ModuleType, installed: ModelStore, new_entry: CatalogEntry, contents: dict[str, bytes]
+) -> None:
+    install(installed, new_entry, contents)
+    install(installed, make_entry(contents, NEWER), contents)
+    installed.set_current(new_entry.id, NEWER, previous_revision=OLD)
+    assert {record.revision for record in installed.records() if record.state == "ok"} == {
+        OLD,
+        NEW,
+        NEWER,
+    }
+    assert max(OLD, NEW) == NEW
+    result = updater(
+        mu, installed, FakeDownloader(installed, contents), make_catalog(new_entry)
+    ).revert_previous(new_entry.id)
+    assert result.state == "updated" and result.active_revision == OLD
+    current = installed.current()
+    assert current is not None and current.revision == OLD
+
+
+def test_revert_legacy_pointer_does_not_infer_previous(
+    mu: ModuleType, installed: ModelStore, new_entry: CatalogEntry, contents: dict[str, bytes]
+) -> None:
+    install(installed, new_entry, contents)
+    pointer = installed.root / "current.json"
+    assert json.loads(pointer.read_text()) == {"id": new_entry.id, "revision": NEW}
+    assert installed.previous_revision() is None
+    before = pointer.read_bytes()
+    result = updater(
+        mu, installed, FakeDownloader(installed, contents), make_catalog(new_entry)
+    ).revert_previous(new_entry.id)
+    assert result.state == "refused" and result.reason_code == "no-previous"
+    assert result.active_revision == NEW
+    assert pointer.read_bytes() == before
+
+
+@pytest.mark.parametrize("previous", ["../x", 42, "not-installed"])
+def test_invalid_previous_keeps_current_and_refuses_revert(
+    mu: ModuleType,
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    previous: object,
+) -> None:
+    store = updated_store(mu, installed, new_entry, contents)
+    pointer = store.root / "current.json"
+    data = json.loads(pointer.read_text())
+    data["previous_revision"] = previous
+    pointer.write_text(json.dumps(data))
+    before = pointer.read_bytes()
+    assert store.previous_revision() is None
+    current = store.current()
+    assert current is not None and current.revision == NEW
+    result = updater(
+        mu, store, FakeDownloader(store, contents), make_catalog(new_entry)
+    ).revert_previous(new_entry.id)
+    assert result.state == "refused" and result.reason_code == "no-previous"
+    assert result.active_revision == NEW
+    assert pointer.read_bytes() == before
+    assert not list(store.root.glob("current.json.bak-*"))
+
+
+def test_revert_removes_previous_revision_pointer(
+    mu: ModuleType, installed: ModelStore, new_entry: CatalogEntry, contents: dict[str, bytes]
+) -> None:
+    store = updated_store(mu, installed, new_entry, contents)
+    revision_updater = updater(mu, store, FakeDownloader(store, contents), make_catalog(new_entry))
+    assert store.previous_revision() == OLD
+    result = revision_updater.revert_previous(new_entry.id)
+    assert result.state == "updated" and result.active_revision == OLD
+    assert json.loads((store.root / "current.json").read_text()) == {
+        "id": new_entry.id,
+        "revision": OLD,
+    }
+    assert store.previous_revision() is None
+    again = revision_updater.revert_previous(new_entry.id)
+    assert again.state == "refused" and again.reason_code == "no-previous"
+    assert again.active_revision == OLD
+
+
+def test_ordinary_set_current_clears_previous_revision(
+    mu: ModuleType, installed: ModelStore, new_entry: CatalogEntry, contents: dict[str, bytes]
+) -> None:
+    store = updated_store(mu, installed, new_entry, contents)
+    assert store.previous_revision() == OLD
+    store.set_current(new_entry.id, NEW)
+    assert store.previous_revision() is None
+    assert json.loads((store.root / "current.json").read_text()) == {
+        "id": new_entry.id,
+        "revision": NEW,
+    }
+    current = store.current()
+    assert current is not None and current.revision == NEW
+
+
+def test_revert_set_current_failure_reports_revert_message(
+    mu: ModuleType,
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = updated_store(mu, installed, new_entry, contents)
+    before = (store.root / "current.json").read_bytes()
+    set_current = Mock(side_effect=StoreError("broken-store"))
+    monkeypatch.setattr(store, "set_current", set_current)
+    states: list[tuple[str, str]] = []
+    result = updater(
+        mu, store, FakeDownloader(store, contents), make_catalog(new_entry), states=states
+    ).revert_previous(new_entry.id)
+    assert result.state == "update-failed" and result.reason_code == "revert"
+    assert result.message == mu.REVERT_FAILED_MESSAGE
+    assert result.message == "Не удалось вернуть предыдущую версию модели"
+    assert result.message != mu.FAILED_MESSAGE
+    assert result.active_revision == NEW
+    set_current.assert_called_once_with(new_entry.id, OLD)
+    assert states == [(new_entry.id, "update-failed")]
+    assert (store.root / "current.json").read_bytes() == before
+    current = store.current()
+    assert current is not None and current.revision == NEW
+
+
+def test_apply_previous_pointer_failure_still_succeeds(
+    mu: ModuleType,
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    original_set_current = installed.set_current
+
+    def fail_previous_pointer(
+        model_id: str, revision: str, *, previous_revision: str | None = None
+    ) -> None:
+        if previous_revision is not None:
+            raise StoreError("disk-full")
+        original_set_current(model_id, revision)
+
+    set_current = Mock(side_effect=fail_previous_pointer)
+    monkeypatch.setattr(installed, "set_current", set_current)
+    downloader = FakeDownloader(installed, contents)
+    smoke = smoke_for()
+    states: list[tuple[str, str]] = []
+    result = updater(
+        mu, installed, downloader, make_catalog(new_entry), smoke=smoke, states=states
+    ).apply(new_entry.id, cancel=threading.Event())
+    assert result.state == "updated" and result.active_revision == NEW
+    assert result.message == result.reason_code == ""
+    current = installed.current()
+    assert current is not None and current.revision == NEW
+    assert installed.previous_revision() is None
+    assert json.loads((installed.root / "current.json").read_text()) == {
+        "id": new_entry.id,
+        "revision": NEW,
+    }
+    assert downloader.calls == [NEW]
+    assert smoke.call_count == 1
+    assert set_current.call_count == 2
+    assert set_current.call_args.kwargs == {"previous_revision": OLD}
+    assert states == [(new_entry.id, "updating")]
+    assert any(
+        record.levelname == "WARNING" and "previous-revision-save-failed" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("problem", ["recheck", "missing-metadata", "layout", "variant"])
+def test_revert_refuses_unusable_previous_record(
+    mu: ModuleType,
+    installed: ModelStore,
+    new_entry: CatalogEntry,
+    contents: dict[str, bytes],
+    problem: str,
+) -> None:
+    store = updated_store(mu, installed, new_entry, contents)
+    state_path = store.root / new_entry.id / f"{OLD}.json"
+    if problem == "missing-metadata":
+        state_path.unlink()
+    else:
+        data = json.loads(state_path.read_text())
+        data[problem] = True if problem == "recheck" else ""
+        state_path.write_text(json.dumps(data))
+    assert store.previous_revision() == OLD
+    before = (store.root / "current.json").read_bytes()
+    result = updater(
+        mu, store, FakeDownloader(store, contents), make_catalog(new_entry)
+    ).revert_previous(new_entry.id)
+    assert result.state == "refused" and result.reason_code == "no-previous"
+    assert result.active_revision == NEW
+    assert (store.root / "current.json").read_bytes() == before

@@ -125,11 +125,26 @@ Item {
         metrics: entry.metrics !== undefined ? entry.metrics : []
         tags: entry.tags !== undefined ? entry.tags : []
         updateAvailable: entry.updateAvailable === true
+        previousAvailable: entry.previousAvailable === true
+        isNew: entry.isNew === true
+        reason: entry.reason !== undefined ? entry.reason : ""
+        updateActionsAvailable: bridge !== null && entry.badge === "active"
+        detailsActionAvailable: true
         manageEnabled: bridge !== null
         openFolderEnabled: bridge !== null
         onToggleRequested: { if (bridge) bridge.toggleModel(entry.id); }
-        onRetryRequested: { if (bridge) bridge.retryModel(entry.id); }
-        onCancelRequested: { if (bridge) bridge.cancelModel(entry.id); }
+        onRetryRequested: {
+            if (bridge) {
+                if (cardState === "update-failed") bridge.updateModel(entry.id);
+                else bridge.retryModel(entry.id);
+            }
+        }
+        onCancelRequested: {
+            if (bridge) {
+                if (cardState === "updating") bridge.cancelModelUpdate();
+                else bridge.cancelModel(entry.id);
+            }
+        }
         onDequeueRequested: { if (bridge) bridge.dequeueModel(entry.id); }
         onOpenFolderRequested: { if (bridge) bridge.openModelsFolder(); }
         onActivateRequested: { if (bridge) bridge.makeModelCurrent(entry.id); }
@@ -137,6 +152,7 @@ Item {
         onReinstallRequested: { if (bridge) bridge.reinstallModel(entry.id); }
         onRemoveRequested: { if (removalSection) removalSection.requestRemoval(entry.id); }
         onUpdateRequested: { if (bridge) bridge.updateModel(entry.id); }
+        onRevertPreviousRequested: { if (bridge) bridge.revertModelPrevious(entry.id); }
     }
 
     Column {

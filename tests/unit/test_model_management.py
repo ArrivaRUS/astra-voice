@@ -970,12 +970,14 @@ def test_old_revision_stays_installed_and_offers_update(rig: Rig) -> None:
 
     item = card(downloads, GIGAAM.id)
     assert item["badge"] == "active"
-    assert item["state"] == "installed"
+    assert item["state"] == "update-available"
     assert item["updateAvailable"] is True
     assert downloads.installedSummary == "Установлено 1 из 2 · 226 МБ на диске"
 
     downloads.updateModel(GIGAAM.id)
-    assert queued == [(GIGAAM,)]
+    # Обновление ревизии идёт через updater; обычная очередь установки не используется.
+    assert queued == []
+    assert port.current == (GIGAAM.id, "r1")
 
 
 def test_update_is_not_offered_for_the_catalog_revision(rig: Rig) -> None:
@@ -1938,21 +1940,22 @@ def test_install_after_switch_keeps_user_choice() -> None:
     assert port.current == (TONE.id, TONE.revision)
 
 
-def test_remove_paused_update_keeps_previous_revision() -> None:
+def test_inactive_old_revision_cannot_be_updated() -> None:
     port = FakeManagedPort()
     old_revision = "r1"
     port.records[(GIGAAM.id, old_revision)] = "ok"
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    port.current = (TONE.id, TONE.revision)
+    before = dict(port.records)
     downloads, started = manual_queue(port)
     downloads.updateModel(GIGAAM.id)
-    assert started == [GIGAAM.id]
-    port.space = False
-    downloads._model_finished("no-space", "")
-    downloads._model_thread_finished()
+    assert started == []
     row = card(downloads, GIGAAM.id)
-    assert (row["state"], row["badge"]) == ("paused-no-space", "installed")
-    downloads.removeModel(GIGAAM.id)
+    assert (row["state"], row["badge"]) == ("installed", "installed")
+    assert row["updateAvailable"] is False
+    assert port.current == (TONE.id, TONE.revision)
+    assert port.records == before
     assert port.removed == []
-    assert port.records[(GIGAAM.id, old_revision)] == "ok"
 
 
 @pytest.mark.parametrize(

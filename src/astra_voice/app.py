@@ -1218,6 +1218,10 @@ def _bind_updates_bridge(
         # Рабочий поток проверки: мост трогаем только в GUI-потоке (урок 025).
         gui_calls.post(partial(bridge.set_status, status))
 
+    def post_model_update(notice: Any) -> None:
+        gui_calls.post(partial(bridge.set_model_update, notice))
+
+    checker.on_model_update = post_model_update
     checker.on_status = post_status
     if settings_bridge is not None:
         settings_bridge.checkAppUpdatesChanged.connect(bridge.refresh)
@@ -1785,6 +1789,12 @@ def main(argv: list[str] | None = None) -> int:
                 program_updates=program_updates,
             )
             timer.timeout.connect(program_updates.refresh)
+            downloads.modelRevisionChanged.connect(updates_bridge.clear_model_update)
+
+            def post_model_catalog(catalog: Catalog, new_ids: frozenset[str]) -> None:
+                gui_calls.post(partial(downloads.accept_catalog, catalog, new_ids))
+
+            checker.on_model_catalog = post_model_catalog
             QQmlEngine.setObjectOwnership(updates_bridge, QQmlEngine.CppOwnership)
             _set_context_property(shell, "updatesBridge", updates_bridge)
             if about_bridge is not None:

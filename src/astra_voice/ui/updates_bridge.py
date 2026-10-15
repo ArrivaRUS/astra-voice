@@ -35,6 +35,8 @@ if TYPE_CHECKING:
     from astra_voice.net.gate import NetworkKind
     from astra_voice.updates.checker import UpdateStatus
 
+from astra_voice.updates.model_updates import ModelUpdateNotice, status_line
+
 log = logging.getLogger(__name__)
 
 #: Состояния строки-статуса, которые мост отдаёт QML (подмножество спеки §2.2).
@@ -205,6 +207,7 @@ class UpdatesBridge(QObject):
         self._cancel_reason = ""
         self._starting = False
         self._pending: list[DownloadStatus] = []
+        self._model_notices: dict[str, ModelUpdateNotice] = {}
         self._state = "disabled"
         self._version = ""
         self._notes: list[dict[str, object]] = []
@@ -295,6 +298,19 @@ class UpdatesBridge(QObject):
             self._request_cancel(self._network_refusal)
 
     # -- свойства ------------------------------------------------------------
+
+    def set_model_update(self, notice: ModelUpdateNotice) -> None:
+        """Вызывается владельцем в GUI через gui_calls, как set_status."""
+        self._model_notices[notice.model_id] = notice
+        self.statusChanged.emit()
+
+    def clear_model_update(self, model_id: str) -> None:
+        if self._model_notices.pop(model_id, None) is not None:
+            self.statusChanged.emit()
+
+    @pyqtProperty(str, notify=statusChanged)
+    def modelUpdateText(self) -> str:  # noqa: N802
+        return status_line(tuple(self._model_notices.values())) or ""
 
     @pyqtProperty(str, notify=statusChanged)
     def state(self) -> str:
