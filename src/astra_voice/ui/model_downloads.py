@@ -660,7 +660,11 @@ class ModelService:
         """То же по паре «модель, ревизия» — для проверки перед загрузкой моделью."""
         with CATALOG_LOCK:
             try:
-                check_revoked(model_id, revision, self.catalog)
+                # Даже при недоступном каталоге положительный отзыв из памяти
+                # или отметки остаётся обязательным. GUI не проверяет подписи.
+                check_revoked(model_id, revision, self._catalog, include_snapshot=False)
+                if self.catalog_unavailable:
+                    raise StoreError("catalog-unavailable", "Каталог моделей недоступен.")
             except StoreError as error:
                 if error.code == "revoked":
                     return True
@@ -814,6 +818,7 @@ class ModelService:
             model_id,
             revision,
             previous_revision=previous_revision,
+            catalog_peek=lambda: self._catalog,
         )
 
     def restore_current(

@@ -33,4 +33,5 @@ def test_xdg_utils_recommended_not_required() -> None:
 def test_t226_jsonschema_required_for_remote_catalog() -> None:
     assert "python3-jsonschema" in _field("Depends")
     assert "python3-jsonschema" not in _field("Recommends")
+    assert "python3-jsonschema (>= 4)" in CONTROL.read_text(encoding="utf-8")
     assert "python3-jsonschema (<< 5)" in CONTROL.read_text(encoding="utf-8")

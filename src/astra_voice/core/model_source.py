@@ -13,8 +13,10 @@ from typing import Any
 from astra_voice.core import paths
 from astra_voice.core.model_request import ModelNotConfigured, build_model_load
 from astra_voice.core.settings import Settings
+from astra_voice.models.catalog_effective import check_revoked
 from astra_voice.models.store import ModelRecord as ModelRecord
 from astra_voice.models.store import ModelStore as ModelStore
+from astra_voice.models.store import StoreError
 from astra_voice.worker.supervisor import WorkerSupervisor
 
 log = logging.getLogger(__name__)
@@ -160,15 +162,34 @@ def _not_revoked(
 ) -> dict[str, Any]:
     """Последний рубеж перед загрузкой: настройки каталог сами по себе не видят.
 
-    При ошибке проверки вызывается переданный обработчик. Без обработчика каждый
-    вызов с ошибкой пишет WARNING; ограничение частоты — ответственность вызывающего.
+    При ошибке проверки дочитывает JSON отметки без gpgv: известный отзыв
+    запрещает загрузку. Для неизвестного результата вызывается обработчик;
+    без него каждый вызов пишет WARNING (частоту ограничивает вызывающий).
     """
     if revoked is None:
         return request
     try:
         if not revoked(str(request.get("id", "")), str(request.get("revision", ""))):
             return request
-    except Exception:
+    except ModelRevoked:
+        raise
+    except Exception as error:
+        # Отказ одного источника не отменяет уже известный положительный отзыв.
+        known_revoked = isinstance(error, StoreError) and error.code == "revoked"
+        try:
+            check_revoked(
+                str(request.get("id", "")),
+                str(request.get("revision", "")),
+                None,
+                include_snapshot=False,
+            )
+        except StoreError as fallback_error:
+            known_revoked |= fallback_error.code == "revoked"
+        except Exception:
+            pass
+        if known_revoked:
+            log.warning("Версия модели отозвана издателем: загрузка отменена")
+            raise ModelRevoked("Эта версия модели отозвана.") from None
         if on_revocation_unknown is None:
             log.warning("Не удалось проверить список отозванных версий модели")
         else:

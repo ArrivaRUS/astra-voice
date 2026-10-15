@@ -224,19 +224,23 @@ def _finish_running_copy(
 
 
 def _revoked_check(model: Any | None) -> Callable[[str, str], bool]:
-    """Проверяет каталог, а при его отказе — снимок последнего принятого."""
+    """Проверяет память и JSON отметки без проверки подписи в рантайме."""
 
     def check(model_id: str, revision: str) -> bool:
         with CATALOG_LOCK:
             catalog_revoked = None
+            catalog_unknown = False
             if model is not None:
                 try:
                     catalog_revoked = bool(model.revoked_revision(model_id, revision))
                 except StoreError as error:
-                    if error.code == "catalog-unavailable":
-                        raise RevocationUnknown from error
+                    if error.code == "revoked":
+                        return True
+                    catalog_unknown = error.code == "catalog-unavailable"
                 except Exception:
                     pass
+            if catalog_revoked:
+                return True
             try:
                 path = catalog_state.state_path(paths.state_dir())
                 try:
@@ -246,12 +250,17 @@ def _revoked_check(model: Any | None) -> Callable[[str, str], bool]:
                 else:
                     exists = True
                 state = catalog_state.read_state(path)
-            except (OSError, paths.PathError) as error:
+            except (OSError, paths.PathError, ValueError, RecursionError) as error:
                 raise RevocationUnknown from error
             if exists and state is None:
                 raise RevocationUnknown
             if state is not None and state.revoked is not None:
-                return bool(catalog_revoked or (model_id, revision) in state.revoked)
+                if (model_id, revision) in state.revoked:
+                    return True
+                if not catalog_unknown:
+                    return False
+            if catalog_unknown:
+                raise RevocationUnknown
             if catalog_revoked is not None:
                 return catalog_revoked
             raise RevocationUnknown

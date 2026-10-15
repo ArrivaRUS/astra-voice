@@ -35,23 +35,115 @@ class ModelActivator(Protocol):
     ) -> None: ...
 
 
-def check_revoked(model_id: str, revision: str, catalog: Catalog | None) -> None:
-    """Объединяет отзывы памяти, отметки и подписанного снимка; отказ закрытый.
+# Один последний результат проверки: ограниченная память, ключ связывает точные
+# байты каталога и подписи. Смена схемы сбрасывает результат, даже если raw прежний.
+_snapshot_cache: tuple[tuple[str, str, Path, str], Catalog | None] | None = None
 
-    Снимок публикуется раньше отметки: даже при отказе записи отметки его
-    отзывы уже обязательны. Отсутствие файлов допустимо для автономных
-    установщиков; существующий непроверяемый источник не означает пустой список.
+
+def _pending_snapshot(
+    marker: catalog_state.CatalogState | None,
+) -> tuple[Catalog | None, bool]:
+    """Проверяет только снимок, который нельзя считать старее JSON-отметки.
+
+    Возвращает (проверенный снимок или None, признак «непроверяемый»).
+    Снимок с SHA отметки или с парой не новее неё пропускается без gpgv.
+    При отметке снимок с нечитаемой парой тоже пропускается с WARNING:
+    принятые отзывы уже в отметке. Без отметки или для снимка новее неё
+    неудача проверки означает «отзывы неизвестны»: активация отказывает.
+    """
+    global _snapshot_cache
+    directory = paths.state_dir() / "model-catalog-updates"
+    try:
+        raw, signature = read_snapshot(directory)
+    except FileNotFoundError:
+        return None, False
+    except (OSError, ValueError, TypeError, RecursionError, CatalogError):
+        return _unreadable_pair(marker)
+    digest = hashlib.sha256(raw).hexdigest()
+    if marker is not None and digest == marker.sha256:
+        return None, False
+    try:
+        document = json.loads(raw)
+        if not isinstance(document, dict):
+            raise ValueError("Неверный формат каталога.")
+        epoch, serial = document.get("trust_epoch"), document.get("serial")
+        if type(epoch) is not int or type(serial) is not int or epoch < 1 or serial < 1:
+            raise ValueError("Неверная пара эпохи и номера каталога.")
+    except (ValueError, TypeError, RecursionError):
+        return _unreadable_pair(marker)
+    try:
+        # Непроверенные поля используются только для пропуска кандидата:
+        # отозвать версию может лишь результат полной проверки ниже.
+        if marker is not None and (epoch, serial) <= (marker.trust_epoch, marker.serial):
+            return None, False
+        root = paths.data_dir_static()
+        schema_sha = hashlib.sha256(
+            read_private(root / "catalog.schema.json", CATALOG_MAX_BYTES)
+        ).hexdigest()
+        key = (digest, hashlib.sha256(signature).hexdigest(), root, schema_sha)
+        if _snapshot_cache is not None and _snapshot_cache[0] == key:
+            cached = _snapshot_cache[1]
+            if cached is None:
+                raise CatalogError("bad-signature", "Снимок каталога уже не прошёл проверку.")
+            return cached, False
+        try:
+            snapshot = verify_catalog(
+                raw,
+                signature,
+                Verifier("catalog", keyring=root / "keys" / "release.gpg"),
+                schema_root=root,
+                require_schema=True,
+            )
+        except CatalogError:
+            _snapshot_cache = (key, None)
+            raise
+        _snapshot_cache = (key, snapshot)
+        return snapshot, False
+    except (OSError, ValueError, TypeError, RecursionError, CatalogError):
+        log.warning("Новый снимок каталога не прошёл проверку: отзывы неизвестны.")
+        return None, True
+
+
+def _unreadable_pair(
+    marker: catalog_state.CatalogState | None,
+) -> tuple[Catalog | None, bool]:
+    """Пара снимка не читается: при отметке пропуск, без неё отзывы неизвестны."""
+    if marker is not None:
+        log.warning("Сохранённый снимок каталога повреждён и пропущен: действует отметка.")
+        return None, False
+    log.warning("Сохранённый снимок каталога повреждён, отметки нет: отзывы неизвестны.")
+    return None, True
+
+
+def check_revoked(
+    model_id: str,
+    revision: str,
+    catalog: Catalog | None,
+    *,
+    include_snapshot: bool = False,
+) -> None:
+    """Объединяет отзывы памяти и отметки; активации также учитывают новый снимок.
+
+    По умолчанию только память и JSON, без gpgv, для GUI и предзагрузки:
+    снимок не читается, битая отметка даёт catalog-unavailable.
+    Это не барьер активации: activate_revision явно включает новый snapshot.
+    Известный отзыв сильнее недоступности другого источника. Непроверяемый
+    снимок без отметки или новее неё — catalog-unavailable; старый и (при
+    отметке) снимок с нечитаемой парой пропускаются.
     Вызывающий активацию удерживает тот же RLock до записи current.json.
     """
     with CATALOG_LOCK:
-        revoked = catalog is not None and catalog.is_revoked(model_id, revision)
+        if catalog is not None and catalog.is_revoked(model_id, revision):
+            raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
+        marker = None
+        marker_error = False
         marker_path = catalog_state.state_path(paths.state_dir())
         try:
             marker_path.lstat()
         except FileNotFoundError:
             pass
         except OSError:
-            raise StoreError("catalog-unavailable", "Состояние каталога недоступно.") from None
+            marker_error = True
         else:
             try:
                 marker = catalog_state.read_state(marker_path)
@@ -62,31 +154,19 @@ def check_revoked(model_id: str, revision: str, catalog: Catalog | None) -> None
                 or re.fullmatch(r"[0-9a-f]{64}", marker.sha256) is None
                 or marker.revoked is None
             ):
-                raise StoreError("catalog-unavailable", "Состояние каталога повреждено.")
-            revoked |= (model_id, revision) in marker.revoked
-        directory = paths.state_dir() / "model-catalog-updates"
-        try:
-            (directory / SNAPSHOT_FILE_NAME).lstat()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            raise StoreError("catalog-unavailable", "Снимок каталога недоступен.") from None
-        else:
-            try:
-                raw, signature = read_snapshot(directory)
-                root = paths.data_dir_static()
-                snapshot = verify_catalog(
-                    raw,
-                    signature,
-                    Verifier("catalog", keyring=root / "keys" / "release.gpg"),
-                    schema_root=root,
-                    require_schema=True,
-                )
-            except (OSError, ValueError, TypeError, RecursionError, CatalogError):
-                raise StoreError("catalog-unavailable", "Снимок каталога не проверен.") from None
-            revoked |= snapshot.is_revoked(model_id, revision)
-        if revoked:
-            raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
+                marker = None
+                marker_error = True
+            elif (model_id, revision) in marker.revoked:
+                raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
+        snapshot_error = False
+        if include_snapshot:
+            snapshot, snapshot_error = _pending_snapshot(marker)
+            if snapshot is not None and snapshot.is_revoked(model_id, revision):
+                raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
+        if marker_error:
+            raise StoreError("catalog-unavailable", "Состояние каталога повреждено или недоступно.")
+        if snapshot_error:
+            raise StoreError("catalog-unavailable", "Новый снимок каталога не прошёл проверку.")
 
 
 def activate_revision(
@@ -96,18 +176,31 @@ def activate_revision(
     revision: str,
     *,
     previous_revision: str | None = None,
+    catalog_peek: Callable[[], Catalog | None] | None = None,
 ) -> None:
-    """Совместимый барьер для службы и автономных установщиков/обновляторов."""
-    with CATALOG_LOCK:
+    """Проверяет отзывы и записывает current под общим барьером публикации.
+
+    Provider может выполнять I/O или брать чужие блокировки: всегда вызывается
+    вне CATALOG_LOCK. Для изменяемого источника catalog_peek читает лишь текущую
+    ссылку из памяти (без I/O/других locks); замена ссылки выполняется под
+    CATALOG_LOCK. При смене объекта provider повторяется вне блокировки.
+    Автономным установщикам без peek достаточно глобальных marker/snapshot.
+    """
+    while True:
         try:
             current_catalog = catalog() if callable(catalog) else catalog
         except CatalogError:
+            check_revoked(model_id, revision, None, include_snapshot=True)
             raise StoreError("catalog-unavailable", "Каталог моделей недоступен.") from None
-        check_revoked(model_id, revision, current_catalog)
-        if previous_revision is None:
-            store.set_current(model_id, revision)
-        else:
-            store.set_current(model_id, revision, previous_revision=previous_revision)
+        with CATALOG_LOCK:
+            if catalog_peek is not None and catalog_peek() is not current_catalog:
+                continue
+            check_revoked(model_id, revision, current_catalog, include_snapshot=True)
+            if previous_revision is None:
+                store.set_current(model_id, revision)
+            else:
+                store.set_current(model_id, revision, previous_revision=previous_revision)
+            return
 
 
 def state_of(catalog: Catalog, raw: bytes) -> catalog_state.CatalogState:

@@ -759,16 +759,18 @@ def test_source_revocation_blocks_activation_before_gui_accepts_catalog(
         state_dir=scenario.snapshots,
         global_state_path=scenario.state,
     )
+    # Крошечные fixture-файлы не являются ASR-моделью. Самопроверка здесь
+    # успешна, чтобы тест дошёл до настоящего финального барьера активации.
+    monkeypatch.setattr(service._installer, "_smoke", lambda *_args: SmokeResult(True))
+    previous_marker = scenario.state.read_bytes()
     source.refresh(threading.Event())
     assert source.current().is_revoked(entry.id, entry.revision)
     assert service.catalog is original_catalog
     assert not service.catalog.is_revoked(entry.id, entry.revision)
     if not marker_has_revocation:
-        # Сохранённый подписанный снимок сам запрещает X: GUI и локальный
-        # необязательный список revoked в отметке не заменяют его проверку.
-        marker = catalog_state.read_state(scenario.state)
-        assert marker is not None
-        catalog_state.write_state(scenario.state, replace(marker, revoked=()))
+        # Окно публикации: новый подписанный snapshot уже записан, а JSON-
+        # отметка пока остаётся от прежнего каталога (с прежним SHA и serial).
+        write_private(scenario.state, previous_marker)
     before = (store.root / "current.json").read_bytes()
 
     if operation in {"update", "revert"}:
@@ -790,6 +792,9 @@ def test_source_revocation_blocks_activation_before_gui_accepts_catalog(
         assert result.state in {"refused", "update-failed"}
         assert result.reason_code == "revoked"
     elif operation == "install":
+        staging = store.staging_dir(entry.id, entry.revision)
+        for name, payload in CONTENTS.items():
+            (staging / name).write_bytes(payload)
         install_result = service.install_from_staging(entry)
         assert install_result.state == "error" and install_result.reason_code == "revoked"
     else:
@@ -890,4 +895,427 @@ def test_source_publishes_snapshot_and_watermark_after_activation_finishes(
     with pytest.raises(StoreError) as refused:
         service.set_current(entry.id, entry.revision)
     assert refused.value.code == "revoked"
+    assert (service._store.root / "current.json").read_bytes() == before
+
+
+@pytest.fixture
+def revocation_service(scenario: Scenario, monkeypatch: pytest.MonkeyPatch) -> Any:
+    from astra_voice.ui.model_downloads import ModelService
+
+    monkeypatch.setattr(paths, "state_dir", lambda: scenario.state.parent)
+    monkeypatch.setattr(paths, "data_dir_static", lambda: scenario.root)
+    monkeypatch.setattr(catalog_effective, "Verifier", lambda *_args, **_kwargs: scenario.verifier)
+    monkeypatch.setattr(catalog_effective, "_snapshot_cache", None)
+    service = ModelService.__new__(ModelService)
+    service._catalog = scenario.load()
+    service._catalog_error = None
+    service._store = ModelStore(scenario.state.parent / "models")
+    return service
+
+
+def test_gui_fifty_revocation_reads_never_verify_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Настоящий Verifier обёрнут счётчиком; gpgv/результат не подменяются."""
+    from astra_voice.ui.model_downloads import ModelService
+
+    state = tmp_path / "state"
+    monkeypatch.setattr(paths, "state_dir", lambda: state)
+    monkeypatch.setattr(paths, "data_dir_static", lambda: DATA_ROOT)
+    raw = (DATA_ROOT / "catalog.json").read_bytes()
+    sig = (DATA_ROOT / "catalog.json.sig").read_bytes()
+    calls = []
+    real_verify = Verifier.verify_detached
+
+    def verify(self: Verifier, *args: Any, **kwargs: Any) -> VerifyResult:
+        calls.append(args)
+        return real_verify(self, *args, **kwargs)
+
+    monkeypatch.setattr(Verifier, "verify_detached", verify)
+    catalog = verify_catalog(
+        raw,
+        sig,
+        Verifier("catalog", keyring=DATA_ROOT / "keys" / "release.gpg"),
+        schema_root=DATA_ROOT,
+    )
+    assert len(calls) == 1  # Обёртка действительно вызывает проверку подписи.
+    write_private(
+        state / "model-catalog-updates" / "catalog-snapshot.json",
+        json.dumps(
+            {"raw": base64.b64encode(raw).decode(), "signature": base64.b64encode(sig).decode()}
+        ).encode(),
+    )
+    service = ModelService.__new__(ModelService)
+    service._catalog, service._catalog_error = catalog, None
+    service._store = ModelStore(state / "models")
+    entry = catalog.entries[0]
+    staging = service._store.staging_dir(entry.id, entry.revision)
+    (staging / "state.json").write_text(
+        json.dumps({"layout": entry.layout, "variant": entry.variant, "size_bytes": 1})
+    )
+    service._store.commit(entry.id, entry.revision)
+    for _ in range(50):
+        assert not service.revoked_revision(entry.id, entry.revision)
+        assert service.installed_ok()
+    assert len(calls) == 1
+
+
+def test_new_snapshot_signature_is_verified_once_per_exact_pair(
+    scenario: Scenario, revocation_service: Any
+) -> None:
+    entry = revocation_service.catalog.entries[0]
+    remote = scenario.remote()
+    remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    scenario.snapshot(remote)
+    before = scenario.verifier.calls
+    for _ in range(3):
+        with pytest.raises(StoreError, match="отозвана") as refused:
+            catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+        assert refused.value.code == "revoked"
+    assert scenario.verifier.calls == before + 1
+    # Та же raw, другая подпись: старый положительный результат не переиспользуется.
+    scenario.snapshot(remote, valid_signature=False)
+    for expected_calls in (before + 2, before + 2):  # Отказ проверки тоже кэшируется.
+        with pytest.raises(StoreError) as unknown:
+            catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+        assert unknown.value.code == "catalog-unavailable"
+        assert scenario.verifier.calls == expected_calls
+
+
+@pytest.mark.parametrize("kind", ["json", "signature", "schema"])
+@pytest.mark.parametrize("known", ["memory", "marker"])
+def test_bad_snapshot_cannot_hide_known_revocation(
+    scenario: Scenario,
+    revocation_service: Any,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+    known: str,
+) -> None:
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    remote = scenario.remote()
+    remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    raw = json.dumps(remote).encode()
+    accepted = verify_catalog(raw, signature(raw), scenario.verifier, schema_root=scenario.root)
+    if known == "memory":
+        service.accept_catalog(accepted)
+        write_private(scenario.state, b"{}")
+    else:
+        catalog_state.write_state(scenario.state, state_of(accepted, raw))
+    bad = scenario.remote(serial=6)
+    if kind == "json":
+        write_private(scenario.snapshots / "catalog-snapshot.json", b"{}")
+    elif kind == "signature":
+        scenario.snapshot(bad, valid_signature=False)
+    else:
+        bad["schema_sha256"] = "0" * 64
+        scenario.snapshot(bad)
+    with pytest.raises(StoreError) as refused:
+        service.set_current(entry.id, entry.revision)
+    assert refused.value.code == "revoked"
+    assert service.revoked_revision(entry.id, entry.revision)
+    from astra_voice.app import _revoked_check
+    from astra_voice.core.model_source import ModelRevoked, resolve_model_request
+    from astra_voice.core.settings import from_dict
+
+    with pytest.raises(ModelRevoked):
+        resolve_model_request(
+            from_dict({"model_id": entry.id, "model_revision": entry.revision}),
+            store_dir=service._store.root,
+            revoked=_revoked_check(service),
+        )
+    # Unknown marker остаётся fail-closed; восстанавливаем полноценный marker.
+    catalog_state.write_state(scenario.state, state_of(accepted, raw))
+    if kind == "json":
+        # Пару не прочитать, отметка есть: снимок пропускается с WARNING.
+        safe = replace(entry, revision=NEW_REVISION)
+        install_fixture(service._store, safe)
+        with caplog.at_level(logging.WARNING):
+            service.set_current(safe.id, safe.revision)
+        assert service._store.current().revision == safe.revision
+        assert "снимок каталога" in caplog.text and "пропущен" in caplog.text
+        return
+    # Снимок новее отметки не проверен: отзывы неизвестны, поэтому
+    # активация и неотозванной ревизии отказывает до store.
+    with pytest.raises(StoreError) as unknown:
+        service.set_current(entry.id, NEW_REVISION)
+    assert unknown.value.code == "catalog-unavailable"
+
+
+@pytest.mark.parametrize("pair", [(1, 3), (1, 4)])
+def test_stale_or_equal_pair_snapshot_never_adds_revocations(
+    scenario: Scenario, revocation_service: Any, pair: tuple[int, int]
+) -> None:
+    entry = revocation_service.catalog.entries[0]
+    remote = scenario.remote(epoch=pair[0], serial=pair[1])
+    remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    scenario.snapshot(remote)
+    before = scenario.verifier.calls
+    catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+    assert scenario.verifier.calls == before
+
+
+def test_snapshot_matching_marker_sha_skips_signature(
+    scenario: Scenario, revocation_service: Any
+) -> None:
+    entry = revocation_service.catalog.entries[0]
+    scenario.snapshot(scenario.document, valid_signature=False)
+    before = scenario.verifier.calls
+    catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+    assert scenario.verifier.calls == before
+
+
+def test_cached_snapshot_is_rechecked_after_schema_changes(
+    scenario: Scenario, revocation_service: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    entry = revocation_service.catalog.entries[0]
+    scenario.snapshot(scenario.remote())
+    catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+    before = scenario.verifier.calls
+    schema = scenario.root / "catalog.schema.json"
+    schema.write_bytes(schema.read_bytes() + b"\n")
+    with caplog.at_level(logging.WARNING), pytest.raises(StoreError) as unknown:
+        catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+    assert unknown.value.code == "catalog-unavailable"
+    assert scenario.verifier.calls == before + 1
+    assert "отзывы неизвестны" in caplog.text
+
+
+def test_unavailable_provider_preserves_positive_marker(
+    scenario: Scenario, revocation_service: Any
+) -> None:
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    marker = catalog_state.read_state(scenario.state)
+    assert marker is not None
+    catalog_state.write_state(
+        scenario.state, replace(marker, revoked=((entry.id, entry.revision),))
+    )
+    service._catalog_error = CatalogError("state-invalid", "Каталог недоступен")
+    assert service.revoked_revision(entry.id, entry.revision)
+    with pytest.raises(StoreError) as refused:
+        service.set_current(entry.id, entry.revision)
+    assert refused.value.code == "revoked"
+    with pytest.raises(StoreError) as unknown:
+        service.set_current(entry.id, NEW_REVISION)
+    assert unknown.value.code == "catalog-unavailable"
+
+
+def test_slow_provider_retries_changed_catalog_without_holding_catalog_lock(
+    scenario: Scenario, revocation_service: Any
+) -> None:
+    """accept_catalog получает lock во время provider; устаревший объект не активируется."""
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry)
+    remote = scenario.remote()
+    remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    raw = json.dumps(remote).encode()
+    newer = verify_catalog(raw, signature(raw), scenario.verifier, schema_root=scenario.root)
+    entered, finish = threading.Event(), threading.Event()
+    current_before = (service._store.root / "current.json").read_bytes()
+    provider_lock = threading.Lock()
+    provider_lock.acquire()
+    calls = []
+    failures = []
+
+    def provider() -> Catalog:
+        current: Catalog = service.catalog
+        calls.append(current)
+        entered.set()
+        with provider_lock:
+            assert finish.wait(5), "Не разрешено завершение provider"
+        return current
+
+    def activate() -> None:
+        try:
+            catalog_effective.activate_revision(
+                service._store,
+                provider,
+                entry.id,
+                entry.revision,
+                catalog_peek=lambda: service._catalog,
+            )
+        except Exception as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=activate)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        # Поток держит provider_lock и может публиковать каталог: обратный
+        # порядок locks в активации привёл бы к deadlock.
+        acquired = catalog_effective.CATALOG_LOCK.acquire(blocking=False)
+        assert acquired, "Provider выполняется под CATALOG_LOCK"
+        try:
+            service.accept_catalog(newer)
+        finally:
+            catalog_effective.CATALOG_LOCK.release()
+    finally:
+        finish.set()
+        provider_lock.release()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert len(calls) == 2
+    assert calls[0] is not newer and calls[1] is newer
+    assert len(failures) == 1 and isinstance(failures[0], StoreError)
+    assert failures[0].code == "revoked"
+    assert (service._store.root / "current.json").read_bytes() == current_before
+
+
+def test_newer_builtin_activation_ignores_revoked_old_snapshot(
+    scenario: Scenario, revocation_service: Any
+) -> None:
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    old = scenario.remote(serial=5)
+    old["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    scenario.snapshot(old)
+    scenario.builtin(scenario.remote(serial=6))
+    service.accept_catalog(scenario.load())
+    install_fixture(service._store, entry)
+    before = scenario.verifier.calls
+    service.set_current(entry.id, entry.revision)
+    assert service._store.current().revision == entry.revision
+    assert scenario.verifier.calls == before
+
+
+@pytest.mark.parametrize("newer", [True, False], ids=["newer-than-marker", "not-newer"])
+def test_t230_bad_snapshot_without_known_revocation(
+    scenario: Scenario, revocation_service: Any, newer: bool
+) -> None:
+    """T-230, отрицательная ветка: снимок битый, отзыва нет ни в памяти, ни в отметке.
+
+    Решение Юрки 15.10, отступление от формулировки T2 для быстрого пути:
+    рантайм снимок не читает, поэтому GUI/рантайм отвечают «не отозвано», а не
+    RevocationUnknown. Полный путь (активация): снимок новее отметки —
+    catalog-unavailable, не новее — пропуск без проверки подписи.
+    """
+    from astra_voice.app import _revoked_check
+    from astra_voice.core.model_source import _not_revoked
+
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry)
+    bad = scenario.remote(serial=5 if newer else 3)
+    bad["schema_sha256"] = "0" * 64
+    scenario.snapshot(bad)
+    marker = catalog_state.read_state(scenario.state)
+    assert marker is not None and marker.serial == 4 and marker.revoked == ()
+    calls = scenario.verifier.calls
+
+    assert _revoked_check(service)(entry.id, entry.revision) is False
+    request = {"id": entry.id, "revision": entry.revision}
+    assert _not_revoked(request, _revoked_check(service)) is request
+    assert scenario.verifier.calls == calls
+
+    current = service._store.root / "current.json"
+    before = current.read_bytes()
+    if newer:
+        with pytest.raises(StoreError) as unknown:
+            service.set_current(entry.id, entry.revision)
+        assert unknown.value.code == "catalog-unavailable"
+        assert current.read_bytes() == before
+    else:
+        service.set_current(entry.id, entry.revision)
+        assert service._store.current().revision == entry.revision
+        assert scenario.verifier.calls == calls
+
+
+@pytest.mark.parametrize("operation", ["install", "switch", "update"])
+@pytest.mark.parametrize("revoked", [False, True], ids=["safe", "revoked"])
+def test_t231_schema_upgrade_allows_safe_revision_and_blocks_marker_revocation(
+    scenario: Scenario, revocation_service: Any, operation: str, revoked: bool
+) -> None:
+    """Старый snapshot, новая схема и принятый встроенный каталог старшей пары."""
+    from astra_voice.updates.model_updates import ModelRevisionUpdater
+
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    if operation == "switch":
+        install_fixture(service._store, entry)
+    old = scenario.remote()
+    if revoked:
+        old["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    scenario.snapshot(old)
+    scenario.load()
+    schema = scenario.root / "catalog.schema.json"
+    schema.write_bytes(schema.read_bytes() + b"\n")
+    newer = copy.deepcopy(old)
+    newer["serial"] = 6
+    newer["schema_sha256"] = hashlib.sha256(schema.read_bytes()).hexdigest()
+    scenario.builtin(newer)
+    service.accept_catalog(scenario.load())
+    marker = catalog_state.read_state(scenario.state)
+    assert marker is not None and marker.serial == 6 and marker.revoked is not None
+    assert ((entry.id, entry.revision) in marker.revoked) is revoked
+    assert not service.catalog.is_revoked(entry.id, NEW_REVISION)
+    # Отказ на целевую ревизию должен опираться на отметку, даже до GUI-доставки.
+    service._catalog = replace(service.catalog, revoked=())
+    install_fixture(service._store, replace(entry, revision=NEW_REVISION))
+    service._store.set_current(entry.id, NEW_REVISION)
+    before = (service._store.root / "current.json").read_bytes()
+
+    class StagingDownloader:
+        def download(self, entry: CatalogEntry, **_kwargs: Any) -> Path:
+            staging = service._store.staging_dir(entry.id, entry.revision)
+            for name, payload in CONTENTS.items():
+                (staging / name).write_bytes(payload)
+            return Path(staging)
+
+    downloader = StagingDownloader()
+    installer = Installer(
+        service._store,
+        lambda *_args: SmokeResult(True),
+        catalog=lambda: service.catalog,
+        activate=service.activate,
+    )
+    if operation == "install":
+        downloader.download(entry)
+        result = installer.install_from_staging(entry)
+        assert result.state == ("error" if revoked else "ok")
+        assert result.reason_code == ("revoked" if revoked else "")
+    elif operation == "switch":
+        if revoked:
+            with pytest.raises(StoreError) as refused:
+                service.set_current(entry.id, entry.revision)
+            assert refused.value.code == "revoked"
+        else:
+            service.set_current(entry.id, entry.revision)
+    else:
+        updater = ModelRevisionUpdater(
+            service._store,
+            downloader,
+            installer,
+            lambda: service.catalog,
+            activate=service.activate,
+        )
+        update_result = updater.apply(entry.id, cancel=threading.Event())
+        assert update_result.state == ("refused" if revoked else "updated")
+        assert update_result.reason_code == ("revoked" if revoked else "")
+    if revoked:
+        assert (service._store.root / "current.json").read_bytes() == before
+    else:
+        assert service._store.current().revision == entry.revision
+
+
+@pytest.mark.parametrize("marker_present", [False, True], ids=["no-marker", "newer-than-marker"])
+def test_t231_unverifiable_newer_snapshot_refuses_activation(
+    scenario: Scenario, revocation_service: Any, marker_present: bool
+) -> None:
+    """Повторный T2 требует отказа, если непроверенный snapshot нельзя считать старым."""
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry)
+    if not marker_present:
+        scenario.state.unlink()
+    bad = scenario.remote()
+    bad["schema_sha256"] = "0" * 64
+    scenario.snapshot(bad)
+    before = (service._store.root / "current.json").read_bytes()
+
+    with pytest.raises(StoreError) as refused:
+        service.set_current(entry.id, entry.revision)
+
+    assert refused.value.code == "catalog-unavailable"
     assert (service._store.root / "current.json").read_bytes() == before

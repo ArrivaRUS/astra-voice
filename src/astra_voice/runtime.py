@@ -36,6 +36,7 @@ from astra_voice.core.model_source import (
     ModelRevoked,
     ModelStore,
     RevokedCheck,
+    _not_revoked,
     resolve_model_request,
     smoke_matches,
     smoke_wav_path,
@@ -1886,39 +1887,65 @@ class DictationRuntime(QObject):
             self._cleanup("отозванный воркер", self.supervisor.stop)
             self._show_load_failed()
 
+    def _loaded_revision_allowed(self) -> bool:
+        """Быстро проверяет именно загруженный запрос, без gpgv.
+
+        Обычная загрузка сохраняет политику предзагрузки для RevocationUnknown;
+        переключение сохраняет свой строгий отказ. Проверка и ready выполняются
+        под CATALOG_LOCK. Отзыв после ready действует со следующей загрузки:
+        уже работающую модель при поступлении отзыва не выгружаем.
+        """
+        request = self._model_load_request or {}
+        if self._switch_active():
+            return self._switch_revision_allowed(request)
+        try:
+            _not_revoked(request, self._revoked_check, self._mark_revocation_unknown)
+        except ModelRevoked:
+            return False
+        return True
+
+    def _reject_loaded_revision(self) -> None:
+        if self._switch_active():
+            self._reject_switch_revision()
+            return
+        self._cancel_selfcheck_timer()
+        self._selfcheck = "failed"
+        self._fail_pending_test()
+        self._model_revoked()
+
     def _promote_candidate(self) -> None:
         # Источник не публикует отзыв между проверкой и сменой рабочего воркера.
         with CATALOG_LOCK:
-            self._promote_allowed_candidate()
-
-    def _promote_allowed_candidate(self) -> None:
-        candidate = self._switch_candidate
-        event = self._switch_loaded_event
-        if candidate is not None and event is not None and self.phase == DictationPhase.IDLE:
+            candidate = self._switch_candidate
+            event = self._switch_loaded_event
+            if candidate is None or event is None or self.phase != DictationPhase.IDLE:
+                return
             request = self._switch_request
             assert request is not None
-            if not self._switch_revision_allowed(request):
-                self._reject_switch_revision()
-                return
-            old = self.supervisor
-            self._switch_candidate = None
-            self._switch_request = None
-            self._switch_loaded_event = None
-            self._cleanup("прежний воркер", old.stop)
-            self.supervisor = candidate
-            self._switch_promoted = True
-            # Продвижение могла отложить диктовка: полный срок на обе самопроверки
-            # отсчитывается заново, чтобы сторож не сработал между ними.
-            timer, self._switch_timer = self._switch_timer, None
-            if timer is not None:
-                self.cancel_timer(timer)
-            self._switch_timer = self.schedule(int(SWITCH_TIMEOUT_S * 1000), self._switch_watchdog)
-            self._reset_selfcheck()
-            self._loading_model = True
-            self._model_load_generation = candidate.generation
-            self._model_load_request = request
-            self._model_load_failures = 0
-            self._on_worker_event(event)
+            allowed = self._switch_revision_allowed(request)
+            if allowed:
+                old = self.supervisor
+                self._switch_candidate = None
+                self._switch_request = None
+                self._switch_loaded_event = None
+                self.supervisor = candidate
+                self._switch_promoted = True
+        if not allowed:
+            self._reject_switch_revision()
+            return
+        self._cleanup("прежний воркер", old.stop)
+        # Продвижение могла отложить диктовка: полный срок на обе самопроверки
+        # отсчитывается заново, чтобы сторож не сработал между ними.
+        timer, self._switch_timer = self._switch_timer, None
+        if timer is not None:
+            self.cancel_timer(timer)
+        self._switch_timer = self.schedule(int(SWITCH_TIMEOUT_S * 1000), self._switch_watchdog)
+        self._reset_selfcheck()
+        self._loading_model = True
+        self._model_load_generation = candidate.generation
+        self._model_load_request = request
+        self._model_load_failures = 0
+        self._on_worker_event(event)
 
     def _fail_candidate(self) -> None:
         self._finish_switch("failed")
@@ -2199,13 +2226,14 @@ class DictationRuntime(QObject):
             return
         if reason == "ok":
             with CATALOG_LOCK:
-                if self._switch_active() and self._switch_candidate is None:
-                    if not self._switch_revision_allowed(self._model_load_request or {}):
-                        self._reject_switch_revision()
-                        return
-                self._model_ready()
-                if self._switch_active() and self._switch_candidate is None:
-                    self._finish_switch("ok")
+                rejected = not self._loaded_revision_allowed()
+                if not rejected:
+                    self._model_ready()
+            if rejected:
+                self._reject_loaded_revision()
+                return
+            if self._switch_active() and self._switch_candidate is None:
+                self._finish_switch("ok")
         else:
             too_slow = False
             if self._switch_active() and self._switch_candidate is None:
@@ -2336,12 +2364,12 @@ class DictationRuntime(QObject):
                     and event.get("generation") == self.supervisor.generation
                 ):
                     with CATALOG_LOCK:
-                        if self._switch_paused and not self._switch_revision_allowed(
-                            self._model_load_request or {}
-                        ):
-                            self._reject_switch_revision()
-                            return
-                        self._start_selfcheck(event)
+                        rejected = not self._loaded_revision_allowed()
+                        if not rejected:
+                            self._start_selfcheck(event)
+                    if rejected:
+                        self._reject_loaded_revision()
+                        return
             elif event.get("type") == "error" and (
                 event.get("request_type") == "model.load"
                 or event.get("response_type") == "model.loaded"

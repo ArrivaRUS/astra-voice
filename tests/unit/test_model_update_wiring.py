@@ -27,7 +27,7 @@ from astra_voice.core.settings import Settings
 from astra_voice.models import catalog_state
 from astra_voice.models.catalog import Catalog, CatalogEntry, CatalogError, FileSpec, load_builtin
 from astra_voice.models.installer import Installer, SmokeResult
-from astra_voice.models.store import ModelStore
+from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net import github, update_cache
 from astra_voice.net.gate import NetworkGate
 from astra_voice.net.http import MODEL_CHECK_JITTER_MAX_S, CheckResult, HttpClient, NetworkError
@@ -722,9 +722,12 @@ def test_app_factory_and_gui_recover_when_model_service_catalog_is_unavailable(
     assert service.catalog_unavailable is True
     assert service.entries() == ()
     assert service.recommended() is None
-    for read in (lambda: service.catalog, lambda: service.revoked_revision("model", "r0")):
-        with pytest.raises(CatalogError):
-            read()
+    with pytest.raises(CatalogError):
+        service.catalog  # noqa: B018
+    # Без каталога отзывы неизвестны: закрытый отказ, а не «не отозвано».
+    with pytest.raises(StoreError) as unknown:
+        service.revoked_revision("model", "r0")
+    assert unknown.value.code == "catalog-unavailable"
     assert catalog_source.global_path.read_bytes() == before
     downloads = ModelDownloads(service)
     bridge = SettingsBridge(settings, downloads=downloads, save=lambda _settings: None)

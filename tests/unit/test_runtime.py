@@ -39,6 +39,7 @@ from astra_voice.core.settings import Settings, from_dict
 from astra_voice.models import catalog_state
 from astra_voice.models import store as store_module
 from astra_voice.models.catalog import Catalog, CatalogEntry, CatalogError, FileSpec, RevokedEntry
+from astra_voice.models.catalog_effective import CATALOG_LOCK
 from astra_voice.models.installer import Installer, SmokeResult
 from astra_voice.models.store import ModelRecord, ModelState, ModelStore
 from astra_voice.platform import cowork as cowork_module
@@ -68,6 +69,7 @@ from astra_voice.ui.pill import (
     ERROR_MODEL_NOT_LOADED,
     ERROR_MODEL_REVOKED,
     ERROR_SELFCHECK_FAILED,
+    STATE_DURATION_MS,
     PillState,
 )
 from astra_voice.ui.tray_icons import TrayState
@@ -5116,6 +5118,129 @@ def test_revoked_revision_blocks_microphone_test(monkeypatch: pytest.MonkeyPatch
     assert callback.call_args.args[0].message == TEST_MODEL_UNAVAILABLE
 
 
+def revocation_loading_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, restart: bool
+) -> Rig:
+    """Обычная загрузка с настоящим быстрым checker и отметкой источника."""
+    from astra_voice.app import _revoked_check
+
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    catalog_state.write_state(
+        catalog_state.state_path(tmp_path), catalog_state.CatalogState(1, 1, "a" * 64, ())
+    )
+    rig = Rig(
+        monkeypatch,
+        from_dict({"model_id": "gigaam", "model_revision": "r1", "model_dir": "/tmp/model"}),
+    )
+    rig.runtime.set_revoked_check(_revoked_check(None))
+    rig.runtime.start()
+    if restart:
+        rig.event(type="hello")
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        rig.event(type="result", utterance_id="file", text="проверка связи")
+        assert rig.runtime._selfcheck == "ok"
+        rig.runtime.restart_worker(wait_for_model=True)
+    rig.event(type="hello")
+    assert rig.runtime._model_load_request is not None
+    assert rig.runtime._model_load_request["revision"] == "r1"
+    return rig
+
+
+def publish_runtime_revocation(tmp_path: Path) -> None:
+    """Источник уже принял отзыв; GUI-каталог для проверки не требуется."""
+    with CATALOG_LOCK:
+        catalog_state.write_state(
+            catalog_state.state_path(tmp_path),
+            catalog_state.CatalogState(1, 2, "b" * 64, (("gigaam", "r1"),)),
+        )
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["startup", "restart_worker"])
+@pytest.mark.parametrize("stage", ["model.loaded", "selfcheck"])
+def test_t232_revocation_before_ready_blocks_ordinary_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restart: bool, stage: str
+) -> None:
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=restart)
+    ready = Mock(wraps=rig.runtime._model_ready)
+    monkeypatch.setattr(rig.runtime, "_model_ready", ready)
+    try:
+        if stage == "selfcheck":
+            rig.event(type="model.loaded", id="gigaam", revision="r1")
+            assert rig.runtime._selfcheck == "running"
+        publish_runtime_revocation(tmp_path)
+        rig.supervisor.send.reset_mock()
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        # Поздний успешный результат также не может сделать модель рабочей.
+        rig.event(type="result", utterance_id="file", text="проверка связи")
+
+        ready.assert_not_called()
+        assert rig.runtime._selfcheck == "failed"
+        assert not rig.runtime._loading_model
+        assert rig.runtime._selfcheck_timer is None
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_REVOKED)
+        rig.tray.set_state.assert_called_with(TrayState.ERROR)
+        rig.notify.notify_model_revoked.assert_called_once_with()
+        rig.hotkey.fsm.press(rig.now)
+        rig.supervisor.send.assert_not_called()
+    finally:
+        rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["startup", "restart_worker"])
+def test_t232_revocation_after_ready_applies_on_next_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restart: bool
+) -> None:
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=restart)
+    try:
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        rig.event(type="result", utterance_id="file", text="проверка связи")
+        assert rig.runtime._selfcheck == "ok"
+        rig.supervisor.stop.reset_mock()
+        publish_runtime_revocation(tmp_path)
+
+        rig.recognize()
+
+        assert rig.runtime._selfcheck == "ok"
+        rig.supervisor.stop.assert_not_called()
+        rig.paste.assert_called_once()
+        rig.notify.notify_model_revoked.assert_not_called()
+        # Дождаться штатного завершения индикации результата диктовки.
+        for timer in list(rig.timers):
+            if timer.active and timer.interval == STATE_DURATION_MS[PillState.DONE]:
+                timer.fire()
+        assert rig.runtime.phase == DictationPhase.IDLE
+        rig.runtime.restart_worker(wait_for_model=True)
+        rig.supervisor.send.reset_mock()
+        rig.event(type="hello")
+        rig.supervisor.send.assert_not_called()
+        assert rig.runtime._selfcheck != "ok"
+        assert not rig.runtime._loading_model
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_REVOKED)
+        rig.notify.notify_model_revoked.assert_called_once_with()
+    finally:
+        rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["startup", "restart_worker"])
+def test_t232_unknown_revocation_preserves_ordinary_loading_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restart: bool
+) -> None:
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=restart)
+    checker = Mock(side_effect=RevocationUnknown)
+    rig.runtime.set_revoked_check(checker)
+    try:
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        rig.event(type="result", utterance_id="file", text="проверка связи")
+
+        assert checker.call_args_list == [call("gigaam", "r1"), call("gigaam", "r1")]
+        assert rig.runtime._selfcheck == "ok"
+        assert not rig.runtime._loading_model
+        assert rig.runtime.revocation_unknown
+        rig.notify.notify_model_revoked.assert_not_called()
+    finally:
+        rig.runtime.shutdown()
+
+
 # --- Откат неудачного переключения к прежней модели ---
 
 
@@ -5779,3 +5904,133 @@ def test_revocation_fallback_reads_new_state_and_rejects_corruption(
     state_path.write_text("invalid state")
     with pytest.raises(RevocationUnknown):
         checker("model", "r1")
+
+
+def test_revocation_checker_uses_known_marker_when_catalog_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from astra_voice.app import _revoked_check
+
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    catalog_state.write_state(
+        catalog_state.state_path(tmp_path),
+        catalog_state.CatalogState(1, 1, "a" * 64, (("model", "r1"),)),
+    )
+    service = Mock()
+    service.revoked_revision.side_effect = store_module.StoreError(
+        "catalog-unavailable", "unavailable"
+    )
+    checker = _revoked_check(service)
+
+    assert checker("model", "r1") is True
+    # Отсутствие другой ревизии в отметке не делает недоступный каталог исправным.
+    with pytest.raises(RevocationUnknown):
+        checker("model", "r2")
+    assert service.revoked_revision.call_args_list == [call("model", "r1"), call("model", "r2")]
+
+
+@pytest.mark.parametrize("marker", ["invalid state", '{"trust_epoch": 1}'])
+def test_revocation_checker_preserves_positive_catalog_with_broken_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, marker: str
+) -> None:
+    from astra_voice.app import _revoked_check
+
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    catalog_state.state_path(tmp_path).write_text(marker)
+    service = Mock()
+    service.revoked_revision.return_value = True
+
+    assert _revoked_check(service)("model", "r1") is True
+
+    service.revoked_revision.assert_called_once_with("model", "r1")
+
+
+def observe_stop_catalog_lock(supervisor: Mock) -> list[bool]:
+    """Проверяет lock внутри разрешённого порта stop, сохраняя его поведение."""
+    ownership: list[bool] = []
+    previous_stop = supervisor.stop.side_effect
+
+    def stop() -> None:
+        # CPython даёт этот probe, но в typeshed у RLock его нет.
+        is_owned = getattr(CATALOG_LOCK, "_is_owned")  # noqa: B009
+        ownership.append(bool(is_owned()))
+        if callable(previous_stop):
+            previous_stop()
+
+    supervisor.stop.side_effect = stop
+    return ownership
+
+
+def test_switch_promotion_stops_previous_worker_outside_catalog_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    ownership = observe_stop_catalog_lock(bench.old)
+    try:
+        bench.switch()
+        candidate = bench.load_new_model()
+
+        bench.old.stop.assert_called_once_with()
+        assert ownership == [False]
+        assert bench.rig.runtime.supervisor is candidate
+    finally:
+        bench.rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_revoked_loaded_candidate_stops_outside_catalog_lock(
+    monkeypatch: pytest.MonkeyPatch, pause: bool
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=pause)
+    runtime = bench.rig.runtime
+    revoked: set[tuple[str, str]] = set()
+    runtime.set_revoked_check(lambda model_id, revision: (model_id, revision) in revoked)
+    try:
+        bench.switch()
+        candidate = bench.workers[-1]
+        ownership = observe_stop_catalog_lock(candidate)
+        bench.emit(candidate, type="hello")
+        assert bench.loads(candidate) == ["whisper"]
+        revoked.add(("whisper", "r1"))
+
+        bench.emit(candidate, type="model.loaded", id="whisper")
+
+        candidate.stop.assert_called_once_with()
+        assert ownership == [False]
+        bench.finished.assert_called_once_with("failed")
+        assert not runtime._switch_active()
+        if pause:
+            restored = bench.workers[-1]
+            assert runtime.supervisor is restored
+            bench.emit(restored, type="hello")
+            assert bench.loads(restored) == ["gigaam"]
+        else:
+            assert runtime.supervisor is bench.old
+            bench.old.stop.assert_not_called()
+            assert runtime._selfcheck == "ok"
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_revoked_selfchecked_candidate_stops_outside_catalog_lock(
+    monkeypatch: pytest.MonkeyPatch, pause: bool
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=pause)
+    runtime = bench.rig.runtime
+    revoked: set[tuple[str, str]] = set()
+    runtime.set_revoked_check(lambda model_id, revision: (model_id, revision) in revoked)
+    try:
+        bench.switch()
+        candidate = bench.load_new_model()
+        ownership = observe_stop_catalog_lock(candidate)
+        revoked.add(("whisper", "r1"))
+
+        bench.emit(candidate, type="result", utterance_id="file", text="проверка связи")
+
+        candidate.stop.assert_called_once_with()
+        assert ownership == [False]
+        restored = bench.assert_rolled_back(candidate)
+        bench.finish_restore(restored)
+    finally:
+        runtime.shutdown()
