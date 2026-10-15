@@ -386,18 +386,20 @@ def writable_properties() -> list[str]:
     ]
 
 
-def changed_value(bridge: SettingsBridge, name: str) -> str | bool:
+def changed_value(bridge: SettingsBridge, name: str) -> str | bool | int:
     old = getattr(bridge, name)
     if isinstance(old, bool):
         return not old
     # Новый строковый контрол требует явного тестового значения, иначе тест падает.
-    return {
+    values: dict[str, str | int] = {
         "hotkey": "Ctrl+Shift+Space",
         "commandHotkey": "Super_R",
         "hotkeyMode": "toggle",
         "language": "en",
         "device": "mic",
-    }[name]
+        "modelUnloadMinutes": 5,
+    }
+    return values[name]
 
 
 def field_name(name: str) -> str:
@@ -601,7 +603,7 @@ def test_s19_a5_all_writable_properties_reach_file(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     settings = Settings()
     bridge = SettingsBridge(settings, save=partial(settings_mod.save, path=path))
-    changed: dict[str, str | bool] = {}
+    changed: dict[str, str | bool | int] = {}
     for name in writable_properties():
         allow_mouse_setting(bridge, name)
         value = changed_value(bridge, name)

@@ -20,6 +20,8 @@ log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
 HOTKEY_MODES = ("ptt", "toggle")
+# Выгрузка модели после простоя, минуты; 0 — держать в памяти всегда (заказчик 2026-09-07).
+MODEL_UNLOAD_MINUTES = (0, 5, 15, 60)
 
 
 def is_valid_combo(combo: str) -> bool:
@@ -56,6 +58,7 @@ class Settings:
     command_mouse_button: int = 2
     sound_cues_enabled: bool = False
     pill_enabled: bool = True
+    model_unload_minutes: int = 0
     autostart: bool = True  # PRD, экран 5 онбординга (решение заказчика)
     model_id: str | None = None
     device_label: str | None = None
@@ -189,6 +192,9 @@ def from_dict(
         settings.command_mouse_enabled = False
     if "command_mouse_enabled" in values and type(values["command_mouse_enabled"]) is not bool:
         settings.command_mouse_enabled = False
+    if settings.model_unload_minutes not in MODEL_UNLOAD_MINUTES:
+        log.warning("model_unload_minutes недопустим, модель держится в памяти")
+        settings.model_unload_minutes = Settings.model_unload_minutes
     if settings.hotkey_mode not in HOTKEY_MODES:
         log.warning("hotkey_mode=%r неизвестен, беру 'ptt'", settings.hotkey_mode)
         settings.hotkey_mode = "ptt"

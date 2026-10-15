@@ -41,7 +41,12 @@ from astra_voice.core.model_source import (
     smoke_wav_path,
 )
 from astra_voice.core.recording_cues import RecordingCues
-from astra_voice.core.settings import Settings, is_valid_combo, is_valid_command_mouse_button
+from astra_voice.core.settings import (
+    MODEL_UNLOAD_MINUTES,
+    Settings,
+    is_valid_combo,
+    is_valid_command_mouse_button,
+)
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
 from astra_voice.platform.cowork import (
     CoworkClient,
@@ -274,6 +279,13 @@ class DictationRuntime(QObject):
         self._selfcheck_timer: QTimer | None = None
         self._selfcheck_deadline_s = SELFCHECK_MIN_S
         self._loaded_model: dict[str, str] = {}
+        # US-2.6: выгрузка по простою заменяет воркер новым процессом без модели, так что
+        # память возвращается к уровню только что запущенного воркера. Нажатие хоткея
+        # загружает модель в этот воркер; запись начинается, когда модель готова.
+        self._model_parked = False
+        self._wake_dictation = False
+        self._idle_unload_timer: QTimer | None = None
+        self._last_activity = monotonic()
         try:
             measurements_path = paths.measurements_path()
         except (OSError, paths.PathError):
@@ -375,43 +387,47 @@ class DictationRuntime(QObject):
     def appimage_remove_busy_reason(self) -> str:
         """GUI-thread-only, fail-closed check including delayed input and paste."""
         try:
-            busy = (
-                self._closed
-                or self._appimage_removal_reserved
-                or self.phase is not DictationPhase.IDLE
-                or self._input_owner is not None
-                or self._capture_watchdog is not None
-                or self._mouse_capture_token is not None
-                or self._preview_send is not None
-                or self._pending_test is not None
-                or self.orchestrator.test_active
-                or self.orchestrator.level_active
-                or self.orchestrator._cancel_pending
-                or self.orchestrator._tail_pending
-                or self._pending_switch is not None
-                or self._switch_active()
-                or self._loading_model
-                or self._selfcheck not in ("idle", "ok", "failed")
-                or self.hotkey.has_pending_press is not False
-                or self.hotkey.fsm.state is not HotkeyState.IDLE
-                or (
-                    self.command_hotkey is not None
-                    and (
-                        self.command_hotkey.has_pending_press is not False
-                        or self.command_hotkey.fsm.state is not HotkeyState.IDLE
-                    )
-                )
-                or (
-                    self.command_mouse is not None
-                    and self.command_mouse.state is not MouseHoldState.IDLE
-                )
-            )
+            busy = self._work_pending()
         except (AttributeError, RuntimeError):
             return "Не удалось проверить готовность программы. Повторите проверку."
         return (
             "Завершите диктовку и дождитесь вставки текста, затем повторите удаление"
             if busy
             else ""
+        )
+
+    def _work_pending(self) -> bool:
+        """Идёт или отложена любая работа с вводом, моделью или вставкой."""
+        return bool(
+            self._closed
+            or self._appimage_removal_reserved
+            or self.phase is not DictationPhase.IDLE
+            or self._input_owner is not None
+            or self._capture_watchdog is not None
+            or self._mouse_capture_token is not None
+            or self._preview_send is not None
+            or self._pending_test is not None
+            or self.orchestrator.test_active
+            or self.orchestrator.level_active
+            or self.orchestrator._cancel_pending
+            or self.orchestrator._tail_pending
+            or self._pending_switch is not None
+            or self._switch_active()
+            or self._loading_model
+            or self._selfcheck not in ("idle", "ok", "failed")
+            or self.hotkey.has_pending_press is not False
+            or self.hotkey.fsm.state is not HotkeyState.IDLE
+            or (
+                self.command_hotkey is not None
+                and (
+                    self.command_hotkey.has_pending_press is not False
+                    or self.command_hotkey.fsm.state is not HotkeyState.IDLE
+                )
+            )
+            or (
+                self.command_mouse is not None
+                and self.command_mouse.state is not MouseHoldState.IDLE
+            )
         )
 
     def reserve_appimage_removal(self) -> bool:
@@ -575,7 +591,8 @@ class DictationRuntime(QObject):
             or not snapshot.allowed
             or self._command_mode is None
             or self._loading_model
-            or self._selfcheck != "ok"
+            # Выгруженная по простою модель не мешает держать кнопку: нажатие её загрузит.
+            or (self._selfcheck != "ok" and not self._model_parked)
             or self._capture_watchdog is not None
             or self._mouse_capture_token is not None
             or self._pending_test is not None
@@ -599,7 +616,7 @@ class DictationRuntime(QObject):
             return False
         epoch = self._input_epoch
         button = self.settings.command_mouse_button
-        trusted = self._command_model_trusted(capture=identity)
+        trusted = self._model_parked or self._command_model_trusted(capture=identity)
         current = self._command_snapshot()
         return bool(
             trusted
@@ -767,6 +784,12 @@ class DictationRuntime(QObject):
         self._mouse_tick_timer = timer
 
     def _mouse_pending(self, generation: int) -> None:
+        self._note_activity()
+        if self._model_parked:
+            # Модель выгружена по простою: нажатие загружает её, команду дают после.
+            self._stop_mouse("model")
+            self._wake_model()
+            return
         manager = self.command_mouse
         if manager is None or not self._mouse_allowed() or not self._reserve_input("mouse"):
             self._stop_mouse("owner-busy")
@@ -827,6 +850,7 @@ class DictationRuntime(QObject):
         if (
             self._input_owner != "mouse"
             or self._mouse_operation_generation != manager.generation
+            or self._model_parked
             or not self._mouse_allowed()
         ):
             self._stop_mouse("blocked")
@@ -1296,8 +1320,18 @@ class DictationRuntime(QObject):
         ):
             self.reject_command()
             return
+        self._note_activity()
         if state == HotkeyState.RECORDING:
             snapshot = self._command_snapshot()
+            if (
+                self._model_parked
+                and snapshot.allowed
+                and snapshot.blocked_epoch == self._command_grab_epoch
+                and self._pending_test is None
+                and self.orchestrator.phase == DictationPhase.IDLE
+            ):
+                # Модель выгружена по простою: нажатие загружает её, команду дают после.
+                self._wake_model()
             if (
                 not snapshot.allowed
                 or snapshot.blocked_epoch != self._command_grab_epoch
@@ -1878,6 +1912,7 @@ class DictationRuntime(QObject):
                 self.cancel_timer(timer)
             self._switch_timer = self.schedule(int(SWITCH_TIMEOUT_S * 1000), self._switch_watchdog)
             self._reset_selfcheck()
+            self._model_parked = False
             self._loading_model = True
             self._model_load_generation = candidate.generation
             self._model_load_request = request
@@ -1888,6 +1923,8 @@ class DictationRuntime(QObject):
         self._finish_switch("failed")
 
     def _fail_pending_test(self) -> None:
+        # Загрузка не удалась: запись, ждавшая пробуждения модели, тоже не начнётся.
+        self._wake_dictation = False
         self._cancel_preparing_timer()
         pending, self._pending_test = self._pending_test, None
         if pending is not None:
@@ -1926,15 +1963,23 @@ class DictationRuntime(QObject):
         retry_selfcheck: bool = False,
         wait_for_model: bool = False,
         _for_switch: bool = False,
+        _park: bool = False,
     ) -> None:
         """Заменяет супервизор, сохраняя уникальность поколений между заменами.
 
         wait_for_model закрывает вход в диктовку до hello и загрузки новой модели.
         Пользовательский перезапуск сбрасывает ошибки загрузки и самопроверки;
         retry_selfcheck сохраняет бюджет автоматической повторной попытки.
+        _park — выгрузка по простою: новый воркер не грузит модель до нажатия.
         """
         if self._closed or self._appimage_removal_reserved:
             return
+        self._model_parked = _park
+        if _park:
+            self._cancel_idle_unload()
+        if not retry_selfcheck:
+            # Запись после пробуждения ждёт только автоматический повтор самопроверки.
+            self._wake_dictation = False
         self._stop_mouse("model")
         self._invalidate_mouse_capture()
         if self._switch_active() and not (_for_switch or retry_selfcheck):
@@ -1968,6 +2013,9 @@ class DictationRuntime(QObject):
     def _load_model(self) -> None:
         """Загружает настроенную модель при каждом запуске нового воркера."""
         if self._appimage_removal_reserved:
+            return
+        if self._model_parked:
+            # Модель выгружена по простою: воркер ждёт нажатия, а не грузит её сразу.
             return
         if self._model_load_generation == self.supervisor.generation:
             self._fail_switch()
@@ -2072,6 +2120,15 @@ class DictationRuntime(QObject):
         self.tray.set_model_recheck_enabled(False)
         self._loading_model = False
         self._model_load_failures = 0
+        wake, self._wake_dictation = self._wake_dictation, False
+        if (
+            wake
+            and self.orchestrator.phase == DictationPhase.IDLE
+            and self.hotkey.fsm.state == HotkeyState.RECORDING
+        ):
+            # Нажатие разбудило модель, выгруженную по простою, и запись ещё не
+            # отпущена: она начинается сейчас, без второго нажатия.
+            self._on_hotkey_state(HotkeyState.RECORDING, "press")
         if self.orchestrator.phase == DictationPhase.IDLE:
             # Нажатие во время проверки могло оставить автомат в PROCESSING.
             self.hotkey.fsm.escape(monotonic())
@@ -2085,6 +2142,7 @@ class DictationRuntime(QObject):
         pending, self._pending_test = self._pending_test, None
         if pending is not None:
             self.orchestrator.start_test(*pending)
+        self._note_activity()
 
     def _start_selfcheck(self, event: dict[str, Any]) -> None:
         """Запускает эталон, сохраняя только сведения о модели и времени загрузки."""
@@ -2190,6 +2248,8 @@ class DictationRuntime(QObject):
 
     def _on_worker_event(self, event: dict[str, Any]) -> None:
         """Обрабатывает загрузку модели и передаёт исходное событие оркестратору."""
+        if not self._closed:
+            self._note_activity()
         if self._input_owner == "mouse" and not self._mouse_allowed():
             self._stop_mouse("model")
         if self._switch_paused and self._switch_request_sent:
@@ -2315,6 +2375,8 @@ class DictationRuntime(QObject):
 
     def _on_hotkey_state(self, state: HotkeyState, reason: str) -> None:
         """Откладывает диктовку, пока воркер загружает модель."""
+        if not self._closed:
+            self._note_activity()
         if reason.startswith(MAPPING_REGRAB_PREFIX):
             self._validate_command_mapping()
             self._on_mapping_regrab(reason)
@@ -2356,6 +2418,12 @@ class DictationRuntime(QObject):
             self._model_load_failures = 0
             self._model_load_generation = None
             self._load_model()
+            return
+        if not self._closed and self._model_parked and state == HotkeyState.RECORDING:
+            log.info("хоткей: модель выгружена по простою — загружаю, запись начнётся после")
+            self._wake_model()
+            # Ошибку загрузки показал _load_model; запись ждёт только идущей загрузки.
+            self._wake_dictation = self._loading_model
             return
         if (
             not self._closed
@@ -2494,6 +2562,82 @@ class DictationRuntime(QObject):
         """Меняет видимость индикатора и соответствующее состояние трея."""
         self.pill.set_enabled(value)
         self.tray.set_pill_enabled(value)
+
+    def apply_model_unload_minutes(self, value: int) -> None:
+        """Применяет выгрузку по простою на лету; отсчёт простоя начинается заново."""
+        if type(value) is not int or value not in MODEL_UNLOAD_MINUTES:
+            return
+        self.settings.model_unload_minutes = value
+        self._last_activity = monotonic()
+        if value == 0:
+            self._cancel_idle_unload()
+            # «Всегда» — модель, выгруженная прежним выбором, возвращается в память.
+            self._wake_model()
+            return
+        self._arm_idle_unload()
+
+    def _idle_unload_s(self) -> float | None:
+        minutes = self.settings.model_unload_minutes
+        if type(minutes) is not int or minutes not in MODEL_UNLOAD_MINUTES or minutes <= 0:
+            return None
+        return minutes * 60.0
+
+    def _note_activity(self) -> None:
+        """Отмечает работу с моделью или вводом; простой отсчитывается от неё."""
+        self._last_activity = monotonic()
+        if self._idle_unload_timer is None:
+            self._arm_idle_unload()
+
+    def _arm_idle_unload(self) -> None:
+        """Ставит проверку на момент, когда с последней активности пройдёт срок простоя."""
+        self._cancel_idle_unload()
+        limit = self._idle_unload_s()
+        if limit is None or self._closed or not self._started or self._model_parked:
+            return
+        remaining = limit - (monotonic() - self._last_activity)
+        self._idle_unload_timer = self.schedule(
+            max(1, math.ceil(remaining * 1000)), self._idle_unload_due
+        )
+
+    def _cancel_idle_unload(self) -> None:
+        timer, self._idle_unload_timer = self._idle_unload_timer, None
+        if timer is not None:
+            self.cancel_timer(timer)
+
+    def _idle_unload_due(self) -> None:
+        # schedule уже удалил сработавший таймер из набора и сам освободит его.
+        self._idle_unload_timer = None
+        limit = self._idle_unload_s()
+        if limit is None or self._model_parked or self._selfcheck != "ok":
+            # Выгружать нечего; готовность модели взведёт проверку заново.
+            return
+        try:
+            busy = self._work_pending()
+        except (AttributeError, RuntimeError):
+            busy = True
+        if busy:
+            # Запись, распознавание, проверка, переключение или загрузка — не простой.
+            self._last_activity = monotonic()
+        if monotonic() - self._last_activity < limit:
+            self._arm_idle_unload()
+            return
+        log.info(
+            "модель выгружается из памяти после %d мин простоя",
+            self.settings.model_unload_minutes,
+        )
+        try:
+            self.restart_worker(_park=True)
+        except Exception:
+            log.warning("Не удалось выгрузить модель из памяти")
+
+    def _wake_model(self) -> None:
+        """Загружает модель, выгруженную по простою, в уже запущенный воркер."""
+        if not self._model_parked or self._closed:
+            return
+        self._model_parked = False
+        self._last_activity = monotonic()
+        log.info("загружаю модель после выгрузки по простою")
+        self._load_model()
 
     def apply_hotkey(self, combo: str, mode: str) -> str:
         """Освобождает прежний хоткей и захватывает сохранённый без перезапуска."""
@@ -2971,6 +3115,7 @@ class DictationRuntime(QObject):
         if candidate is not None:
             self._cleanup("временный воркер", candidate.stop)
         self._cancel_preparing_timer()
+        self._cancel_idle_unload()
         if self._pending_test is not None:
             self.stop_test()
         if self._started:
