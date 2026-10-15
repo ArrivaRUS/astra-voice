@@ -28,6 +28,11 @@ BUSY_MESSAGE = "Комбинация занята другой программ�
 ResultCode = Literal["ok", "busy", "bad-combo", "duplicate", "not-grabbed"]
 # Причина on_state после смены карты: ``mapping-regrab:<код>[;escape:<код>]``.
 MAPPING_REGRAB_PREFIX = "mapping-regrab:"
+# US-2.7: короткое (< PTT_THRESHOLD_S) нажатие PTT поверх распознавания — случайное
+# (дребезг сразу после отпускания предыдущей фразы): запись этой фразы отменяется,
+# автомат возвращается к распознаванию. Toggle из такого касания не включается,
+# иначе микрофон остался бы открытым без намерения пользователя.
+OVERLAP_TAP_REASON = "overlap-tap"
 
 
 class HotkeyMode(Enum):
@@ -92,19 +97,33 @@ class MappingEvent:
 
 
 class HotkeyFsm:
-    """Чистый автомат; ровно 0,3 с считается удержанием, как в S4."""
+    """Чистый автомат; ровно 0,3 с считается удержанием, как в S4.
+
+    US-2.7: при ``allow_overlap`` нажатие во время распознавания (PROCESSING)
+    начинает запись следующей фразы. В PTT короткое такое нажатие не включает
+    toggle: автомат возвращается в PROCESSING с причиной ``OVERLAP_TAP_REASON``,
+    и слушатель отменяет только эту запись. Слушатель может отказать нажатию
+    через ``refuse()`` — автомат молча вернётся к распознаванию.
+    Автомат следит за самой новой фразой: IDLE наступает по ``done()`` только
+    после последней фразы очереди (это решает оркестратор).
+    """
 
     def __init__(
         self,
         mode: HotkeyMode = HotkeyMode.PTT,
         on_state: Callable[[HotkeyState, str], None] | None = None,
+        *,
+        allow_overlap: bool = True,
     ) -> None:
         self.state = HotkeyState.IDLE
         self.mode = mode
         self.on_state = on_state
+        self.allow_overlap = allow_overlap
         self._configured_mode = mode
         self._press_ts = 0.0
         self._limit_deadline: float | None = None
+        # Режим распознаваемой фразы, если текущая запись начата поверх неё (US-2.7).
+        self._overlap_mode: HotkeyMode | None = None
 
     @property
     def limit_deadline(self) -> float | None:
@@ -115,7 +134,9 @@ class HotkeyFsm:
             self.on_state(self.state, reason)
 
     def press(self, now: float) -> None:
-        if self.state == HotkeyState.IDLE:
+        overlap = self.state == HotkeyState.PROCESSING and self.allow_overlap
+        if self.state == HotkeyState.IDLE or overlap:
+            self._overlap_mode = self.mode if overlap else None
             self._press_ts = now
             self.mode = self._configured_mode
             self.state = HotkeyState.RECORDING
@@ -124,11 +145,34 @@ class HotkeyFsm:
         elif self.state == HotkeyState.RECORDING and self.mode == HotkeyMode.TOGGLE:
             self.stop(now, "toggle-off")
 
+    def refuse(self, now: float) -> None:
+        """Отказ слушателя последнему нажатию: вернуть состояние до него.
+
+        Нажатие поверх распознавания откатывается в PROCESSING без события —
+        распознавание и Escape предыдущей фразы продолжаются. Нажатие из IDLE
+        откатывается как ``escape``: захват Escape снимается обычным путём.
+        """
+        if self.state != HotkeyState.RECORDING:
+            return
+        if self._overlap_mode is None:
+            self.escape(now)
+            return
+        self.state = HotkeyState.PROCESSING
+        self.mode = self._overlap_mode
+        self._overlap_mode = None
+        self._limit_deadline = None
+
     def release(self, now: float) -> None:
         if self.state != HotkeyState.RECORDING or self.mode == HotkeyMode.TOGGLE:
             return
         held = now - self._press_ts
-        if held < PTT_THRESHOLD_S:
+        if held < PTT_THRESHOLD_S and self._overlap_mode is not None:
+            self.state = HotkeyState.PROCESSING
+            self.mode = self._overlap_mode
+            self._overlap_mode = None
+            self._limit_deadline = None
+            self._emit(OVERLAP_TAP_REASON, now)
+        elif held < PTT_THRESHOLD_S:
             self.mode = HotkeyMode.TOGGLE
             self._emit(f"tap→toggle ({held:.3f} с)", now)
         else:
@@ -138,6 +182,7 @@ class HotkeyFsm:
         if self.state == HotkeyState.RECORDING:
             self.state = HotkeyState.PROCESSING
             self._limit_deadline = None
+            self._overlap_mode = None
             self._emit(reason, now)
 
     def escape(self, now: float) -> None:
@@ -145,12 +190,14 @@ class HotkeyFsm:
             self.state = HotkeyState.IDLE
             self.mode = self._configured_mode
             self._limit_deadline = None
+            self._overlap_mode = None
             self._emit("escape-cancel", now)
 
     def done(self, now: float) -> None:
         if self.state == HotkeyState.PROCESSING:
             self.state = HotkeyState.IDLE
             self.mode = self._configured_mode
+            self._overlap_mode = None
             self._emit("done", now)
 
     def tick(self, now: float) -> None:
@@ -500,6 +547,7 @@ class HotkeyManager:
         self.on_release: Callable[[], None] | None = None
         self.on_escape: Callable[[], None] | None = None
         self.on_state: Callable[[HotkeyState, str], None] | None = None
+        self._allow_overlap = True
         self.fsm = HotkeyFsm(on_state=self._on_state)
         self.last_result = GrabResult("not-grabbed")
         self.escape_result = GrabResult("not-grabbed")
@@ -676,7 +724,7 @@ class HotkeyManager:
             self._suspended_combo = None
             self._keycode = result.keycode
             self._mods = result.mods
-            self.fsm = HotkeyFsm(mode, self._on_state)
+            self.fsm = HotkeyFsm(mode, self._on_state, allow_overlap=self._allow_overlap)
         self.last_result = result
         return result
 
@@ -739,6 +787,17 @@ class HotkeyManager:
 
     def fileno(self) -> int:
         return self.backend.fileno()
+
+    @property
+    def allow_overlap(self) -> bool:
+        """Начинает ли нажатие во время распознавания новую запись (US-2.7)."""
+        return self._allow_overlap
+
+    @allow_overlap.setter
+    def allow_overlap(self, value: bool) -> None:
+        # Сохраняется и для автомата, пересоздаваемого при grab().
+        self._allow_overlap = value
+        self.fsm.allow_overlap = value
 
     def _on_state(self, state: HotkeyState, reason: str) -> None:
         if state == HotkeyState.RECORDING and not self._escape_grabbed:

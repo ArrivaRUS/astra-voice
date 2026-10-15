@@ -21,6 +21,7 @@ from astra_voice.platform.hotkey import (
     BUSY_MESSAGE,
     DEFAULT_CANDIDATES,
     LOOKAHEAD_S,
+    OVERLAP_TAP_REASON,
     EvdevHotkeyBackend,
     GrabResult,
     HotkeyEvent,
@@ -136,7 +137,15 @@ def observed_fsm(
 
 
 def test_ptt_release_and_done() -> None:
-    fsm, states = observed_fsm()
+    """Без перекрытия (клавиша «Команды», US-2.7 решение 4) нажатие в PROCESSING игнорируется.
+
+    До US-2.7 так вёл себя любой автомат; теперь ``allow_overlap=False`` задаёт runtime
+    только клавише «Команды». Перекрытие по умолчанию — test_overlap_press_*.
+    """
+    states: list[tuple[HotkeyState, str]] = []
+    fsm = HotkeyFsm(
+        HotkeyMode.PTT, lambda state, reason: states.append((state, reason)), allow_overlap=False
+    )
     fsm.press(0.0)
     assert fsm.limit_deadline == 120.0
     fsm.release(1.0)
@@ -147,6 +156,102 @@ def test_ptt_release_and_done() -> None:
     assert fsm.state == HotkeyState.PROCESSING
     fsm.done(3.0)
     assert states[-1] == (HotkeyState.IDLE, "done")
+
+
+def test_overlap_press_during_processing_starts_next_recording() -> None:
+    """US-2.7: нажатие во время распознавания — новая запись с собственным пределом."""
+    fsm, states = observed_fsm()
+    fsm.press(0.0)
+    fsm.release(1.0)
+    fsm.press(2.0)
+    assert states[-1] == (HotkeyState.RECORDING, "press")
+    assert fsm.limit_deadline == 122.0
+    fsm.release(3.0)
+    assert states[-1] == (HotkeyState.PROCESSING, "release (1.000 с)")
+    fsm.done(4.0)
+    assert states[-1] == (HotkeyState.IDLE, "done")
+
+
+@pytest.mark.parametrize("previous", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
+def test_overlap_short_tap_does_not_leave_recording_open(previous: HotkeyMode) -> None:
+    """US-2.7, открытый риск PTT: короткое нажатие во время распознавания не включает toggle.
+
+    Касание < 0,3 с поверх распознавания (дребезг после отпускания, случайное нажатие)
+    возвращает автомат в PROCESSING предыдущей фразы с причиной OVERLAP_TAP_REASON —
+    оркестратор отменяет только эту запись. Из IDLE касание по-прежнему toggle.
+    """
+    fsm, states = observed_fsm()
+    fsm.press(0.0)
+    fsm.release(1.0 if previous is HotkeyMode.PTT else 0.1)
+    if previous is HotkeyMode.TOGGLE:
+        fsm.press(2.0)
+    fsm.press(3.0)
+    fsm.release(3.1)
+    assert states[-1] == (HotkeyState.PROCESSING, OVERLAP_TAP_REASON)
+    assert fsm.state == HotkeyState.PROCESSING and fsm.mode == previous
+    assert fsm.limit_deadline is None
+    fsm.tick(200.0)
+    assert states[-1] == (HotkeyState.PROCESSING, OVERLAP_TAP_REASON)
+    # Удержание ≥ 0,3 с поверх распознавания — обычная фраза PTT.
+    fsm.press(4.0)
+    fsm.release(4.5)
+    assert states[-1] == (HotkeyState.PROCESSING, "release (0.500 с)")
+    fsm.done(5.0)
+    assert states[-1] == (HotkeyState.IDLE, "done") and fsm.mode == HotkeyMode.PTT
+
+
+def test_overlap_press_in_configured_toggle_ignores_release() -> None:
+    fsm, states = observed_fsm(HotkeyMode.TOGGLE)
+    fsm.press(0.0)
+    fsm.press(1.0)
+    fsm.press(2.0)
+    fsm.release(2.1)
+    assert states[-1] == (HotkeyState.RECORDING, "press")
+    fsm.press(3.0)
+    assert states[-1] == (HotkeyState.PROCESSING, "toggle-off")
+
+
+@pytest.mark.parametrize("previous", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
+def test_refuse_overlap_press_returns_silently_to_processing(previous: HotkeyMode) -> None:
+    """Отказ третьему нажатию (US-2.7, решение 7): без escape-cancel и без смены режима."""
+    fsm, states = observed_fsm()
+    fsm.press(0.0)
+    fsm.release(1.0 if previous is HotkeyMode.PTT else 0.1)
+    if previous is HotkeyMode.TOGGLE:
+        fsm.press(2.0)
+    assert fsm.state == HotkeyState.PROCESSING and fsm.mode == previous
+    fsm.press(3.0)
+    before = states.copy()
+    fsm.refuse(3.0)
+    assert states == before
+    assert fsm.state == HotkeyState.PROCESSING and fsm.mode == previous
+    assert fsm.limit_deadline is None
+    fsm.refuse(3.5)
+    assert fsm.state == HotkeyState.PROCESSING
+    fsm.done(4.0)
+    assert states[-1] == (HotkeyState.IDLE, "done")
+
+
+def test_refuse_press_from_idle_is_escape() -> None:
+    fsm, states = observed_fsm()
+    fsm.press(0.0)
+    fsm.refuse(0.1)
+    assert states[-1] == (HotkeyState.IDLE, "escape-cancel")
+    fsm.refuse(0.2)
+    assert states[-1] == (HotkeyState.IDLE, "escape-cancel") and len(states) == 2
+
+
+def test_manager_allow_overlap_survives_regrab() -> None:
+    backend = MagicMock()
+    backend.grab_combo.return_value = GrabResult("ok", keycode=65)
+    manager = HotkeyManager(backend)
+    manager.allow_overlap = False
+    assert manager.grab("Ctrl+Alt+D", HotkeyMode.PTT).ok
+    assert manager.fsm.allow_overlap is False
+    manager.fsm.press(0.0)
+    manager.fsm.release(1.0)
+    manager.fsm.press(2.0)
+    assert manager.fsm.state == HotkeyState.PROCESSING
 
 
 def test_record_limit_matches_worker_default() -> None:
@@ -271,8 +376,15 @@ def test_repeat_pair_across_reads_and_repeated_press() -> None:
 
 @pytest.mark.parametrize("same_keycode", [False, True])
 def test_different_time_or_keycode_is_not_repeat(same_keycode: bool) -> None:
+    """Отпускание не склеивается с нажатием другого времени или клавиши в пару автоповтора.
+
+    US-2.7: настоящее повторное нажатие хоткея после отпускания начинает запись
+    следующей фразы (раньше автомат игнорировал нажатие в PROCESSING).
+    """
     backend = FakeBackend()
     manager = HotkeyManager(backend)
+    states: list[tuple[HotkeyState, str]] = []
+    manager.on_state = lambda state, reason: states.append((state, reason))
     manager.grab("Ctrl+Shift+Space", HotkeyMode.PTT)
     manager.handle_event(HotkeyEvent("KeyPress", 65, 1), 0.0)
     backend.events = [
@@ -280,7 +392,13 @@ def test_different_time_or_keycode_is_not_repeat(same_keycode: bool) -> None:
         HotkeyEvent("KeyPress", 65 if same_keycode else 66, 1001 if same_keycode else 1000),
     ]
     manager.process_pending(1.0)
-    assert manager.fsm.state == HotkeyState.PROCESSING
+    assert states[1][0] == HotkeyState.PROCESSING and "release" in states[1][1]
+    if same_keycode:
+        assert states[2:] == [(HotkeyState.RECORDING, "press")]
+        assert manager.fsm.state == HotkeyState.RECORDING
+    else:
+        assert len(states) == 2
+        assert manager.fsm.state == HotkeyState.PROCESSING
 
 
 def test_duplicate_and_not_grabbed() -> None:

@@ -1,8 +1,13 @@
-"""Автомат одной диктовки; ввод, вставка, индикаторы и таймеры внедряются извне.
+"""Автомат диктовки; ввод, вставка, индикаторы и таймеры внедряются извне.
 
 Вложенный цикл вставки складывает входящие события в очередь. Отмена и смена
 поколения запрещают дальнейшую вставку, включая отложенный повтор BUSY.
 Содержимое речи не передаётся ни статистике, ни журналу, ни индикаторам.
+
+US-2.7: пока предыдущая фраза распознаётся, можно записывать следующую. Фразы
+стоят в очереди (не больше ``MAX_PENDING_UTTERANCES``); у каждой свои id,
+поколение воркера, окно-цель, замеры, повтор BUSY и таймеры. Доставка строго
+по порядку нажатий; вставка ждёт, пока пишется более новая фраза.
 """
 
 from __future__ import annotations
@@ -11,15 +16,17 @@ import logging
 import math
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Literal, Protocol
+from functools import partial
+from typing import Any, Generic, Literal, Protocol, TypeVar, overload
 from uuid import uuid4
 
 from astra_voice.core.command_mode import CommandMode, SessionSnapshot
 from astra_voice.platform.cowork import DeliveryResult
-from astra_voice.platform.hotkey import HotkeyState
+from astra_voice.platform.hotkey import OVERLAP_TAP_REASON, HotkeyState
 from astra_voice.platform.paste import PasteMode, PasteOutcome, PasteOutcomeKind, normalize
 from astra_voice.ui.pill import (
     CLIPBOARD_NOT_FETCHED,
@@ -61,6 +68,16 @@ MICROPHONE_CHANGED_MESSAGE = "Микрофон сменился. Выберит�
 _DEVICE_PILL_KEEPS_OVER = frozenset(
     (PillState.PROCESSING, PillState.DONE, PillState.EMPTY, PillState.CANCELLED)
 )
+# US-2.7, решение 7: одна фраза распознаётся и одна ждёт — как очередь воркера.
+MAX_PENDING_UTTERANCES = 2
+# Исходы, о которых сообщаем, даже когда в работе другая фраза (US-2.7, решение 3);
+# «Готово»/«Пусто»/«Отменено» не перебивают индикацию более новой фразы.
+_NOTICE_STATES = frozenset((PillState.ERROR, PillState.CLIPBOARD_ONLY))
+# Отложенные во время вставки события: нажатие хоткея помечается отдельно.
+_QUEUED_PRESS = "press"
+_QUEUED_OTHER = "other"
+
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -141,13 +158,113 @@ def level_from_dbfs(dbfs: float) -> float:
     return min(1.0, max(0.0, (dbfs + 60.0) / 60.0))
 
 
+class _Utterance:
+    """Состояние одной фразы (или проверки микрофона); имена — как у полей автомата."""
+
+    def __init__(self) -> None:
+        self._phase = DictationPhase.IDLE
+        self._target_window: int | None = None
+        self._utterance_id = ""
+        self._worker_generation = 0
+        self._cold = True
+        self._t0 = 0.0
+        self._t_ready: float | None = None
+        self._t_stop: float | None = None
+        self._t_release: float | None = None
+        self._t_ms = 0.0
+        self._paste_ms = 0.0
+        self._t_total_ms: float | None = None
+        self._result_audio_ms: float | None = None
+        self._result_infer_ms: float | None = None
+        self._retries = 0
+        self._cancel_requested = False
+        self._cancel_pending = False
+        self._tail_pending = False
+        self._delivered = False
+        # Смена микрофона посреди записи (audio.device.changed): не больше одной на фразу.
+        self._device_change_kind: str | None = None
+        self._device_pill_until: float | None = None
+        self._device_selected = False
+        self._deliver_t0 = 0.0
+        self._deliver_reason = "none"
+        self._timers: dict[int, tuple[object, Callable[[], None]]] = {}
+        # Результат, ждущий исхода более старой фразы (FIFO доставки, US-2.7).
+        self._result_pending: str | None = None
+        # Текст, ждущий вставки, пока пишется более новая фраза (решение 1).
+        self._paste_text: str | None = None
+
+
+class _PhraseField(Generic[_T]):
+    """Поле фразы контекста: автомат читает и пишет его у ``_current()``.
+
+    Так код автомата одной диктовки работает с любой фразой очереди: события,
+    таймеры и нажатия выполняются в контексте своей фразы (``_within``).
+    """
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self._name = name
+
+    @overload
+    def __get__(self, obj: None, objtype: type | None = None) -> _PhraseField[_T]: ...
+
+    @overload
+    def __get__(self, obj: DictationOrchestrator, objtype: type | None = None) -> _T: ...
+
+    def __get__(
+        self, obj: DictationOrchestrator | None, objtype: type | None = None
+    ) -> _T | _PhraseField[_T]:
+        if obj is None:
+            return self
+        value: _T = getattr(obj._current(), self._name)
+        return value
+
+    def __set__(self, obj: DictationOrchestrator, value: _T) -> None:
+        setattr(obj._current(), self._name, value)
+
+
 class DictationOrchestrator:
-    """Обслуживает одну диктовку в вызывающем потоке, без собственного цикла.
+    """Обслуживает диктовку в вызывающем потоке, без собственного цикла.
 
     schedule должен откладывать вызов, а не выполнять его синхронно. Все его
     ручки принадлежат автомату. Пилюля сама скрывает завершающее состояние;
     таймер FINISHING лишь возвращает фазу и трей в IDLE.
+
+    Очередь фраз (US-2.7): ``_items`` — незавершённые фразы в порядке нажатий,
+    пишется не больше одной. Поля фразы (``_PhraseField``) относятся к фразе
+    контекста: явного (``_within``) или по умолчанию — самой новой незавершённой,
+    а при пустой очереди — последней завершившейся (``_last``). Публичная
+    ``phase`` агрегирована: IDLE/FINISHING только при пустой очереди.
+    ``hotkey_done``/``hotkey_cancel`` вызываются только при пустой очереди;
+    отказ нажатию поверх распознавания идёт через ``hotkey_refuse``.
     """
+
+    _phase = _PhraseField[DictationPhase]()
+    _target_window = _PhraseField[int | None]()
+    _utterance_id = _PhraseField[str]()
+    _worker_generation = _PhraseField[int]()
+    _cold = _PhraseField[bool]()
+    _t0 = _PhraseField[float]()
+    _t_ready = _PhraseField[float | None]()
+    _t_stop = _PhraseField[float | None]()
+    _t_release = _PhraseField[float | None]()
+    _t_ms = _PhraseField[float]()
+    _paste_ms = _PhraseField[float]()
+    _t_total_ms = _PhraseField[float | None]()
+    _result_audio_ms = _PhraseField[float | None]()
+    _result_infer_ms = _PhraseField[float | None]()
+    _retries = _PhraseField[int]()
+    _cancel_requested = _PhraseField[bool]()
+    _cancel_pending = _PhraseField[bool]()
+    _tail_pending = _PhraseField[bool]()
+    _delivered = _PhraseField[bool]()
+    _device_change_kind = _PhraseField[str | None]()
+    _device_pill_until = _PhraseField[float | None]()
+    _device_selected = _PhraseField[bool]()
+    _deliver_t0 = _PhraseField[float]()
+    _deliver_reason = _PhraseField[str]()
+    _timers = _PhraseField[dict[int, tuple[object, Callable[[], None]]]]()
+    _result_pending = _PhraseField[str | None]()
+    _paste_text = _PhraseField[str | None]()
 
     def __init__(
         self,
@@ -181,14 +298,23 @@ class DictationOrchestrator:
         command_mode: CommandMode | None = None,
         command_preview: Callable[[str, Callable[[], None]], bool] | None = None,
         microphone_count: Callable[[], int] = lambda: 0,
+        hotkey_refuse: Callable[[], None] | None = None,
     ) -> None:
+        # Контекст фраз создаётся первым: остальные поля фразы читаются через него.
+        self._ctx: _Utterance | None = None
+        self._last = _Utterance()
+        self._items: list[_Utterance] = []
+        self._contexts: list[_Utterance] = [self._last]
+        self._pumping = False
+        self._refusing = False
+        # Пилюля итога более старой фразы, ждущая конца записи новой (решение 3).
+        self._deferred_notice: Callable[[], None] | None = None
+        self._hotkey_refuse = hotkey_refuse
         self._recording_cue = recording_cue
         self._cue_sessions: dict[tuple[int, str], bool] = {}
         self.command_mode = command_mode
         self._command_preview = command_preview
         self.mode = "text"
-        self._deliver_t0 = 0.0
-        self._deliver_reason = "none"
         self._send = send
         self._generation = generation
         self._restart_worker = restart_worker
@@ -218,44 +344,160 @@ class DictationOrchestrator:
         self._resolved_device: str = ""
         self._announced_selected_device: str | None = None
         self._announcement_generation: int | None = None
-        self._device_selected = False
         self._log = log if log is not None else logging.getLogger(__name__)
-        self._phase = DictationPhase.IDLE
-        self._target_window: int | None = None
-        self._utterance_id = ""
-        self._worker_generation = 0
         self._last_text: str | None = None
         self.last_text_is_command = False
         self._started = False
-        self._cold = True
-        self._t0 = 0.0
-        self._t_ready: float | None = None
-        self._t_stop: float | None = None
-        self._t_release: float | None = None
-        self._t_ms = 0.0
-        self._paste_ms = 0.0
-        self._t_total_ms: float | None = None
-        self._result_audio_ms: float | None = None
-        self._result_infer_ms: float | None = None
-        self._retries = 0
-        self._cancel_requested = False
-        self._cancel_pending = False
-        self._tail_pending = False
-        self._delivered = False
         self._closed = False
         self._suspended = False
-        self._queue: deque[Callable[[], None]] = deque()
+        self._queue: deque[tuple[str, Callable[[], None]]] = deque()
         self._timer_serial = 0
-        self._timers: dict[int, tuple[object, Callable[[], None]]] = {}
         self._test_callback: TestCallback | None = None
         self._level_callback: LevelCallback | None = None
         self._level_device = ""
         self._level_failed = False
         self._level_idle_message = ""
         self._level_awaiting_audio_closed = False
-        # Смена микрофона посреди записи (audio.device.changed): не больше одной на диктовку.
-        self._device_change_kind: str | None = None
-        self._device_pill_until: float | None = None
+
+    # --- Очередь фраз (US-2.7) -------------------------------------------------------
+
+    def _current(self) -> _Utterance:
+        """Фраза, к которой относятся поля автомата в этот момент."""
+        if self._ctx is not None:
+            return self._ctx
+        return self._default()
+
+    def _default(self) -> _Utterance:
+        """Самая новая незавершённая фраза, иначе последняя завершённая."""
+        return self._items[-1] if self._items else self._last
+
+    @contextmanager
+    def _within(self, utterance: _Utterance) -> Iterator[None]:
+        previous, self._ctx = self._ctx, utterance
+        try:
+            yield
+        finally:
+            self._ctx = previous
+
+    def _new_context(self, *, queued: bool) -> _Utterance:
+        """Новая фраза; ``queued`` — диктовка в очереди, иначе измерение уровня."""
+        utterance = _Utterance()
+        # Завершённые фразы без таймеров и отмены больше ничего не ждут.
+        self._contexts = [
+            c
+            for c in self._contexts
+            if c in self._items
+            or c is self._last
+            or c._timers
+            or c._cancel_pending
+            or c._phase is not DictationPhase.IDLE
+        ]
+        self._contexts.append(utterance)
+        if queued:
+            self._items.append(utterance)
+        self._last = utterance
+        return utterance
+
+    def _recording_item(self) -> _Utterance | None:
+        for utterance in self._items:
+            if utterance._phase is DictationPhase.RECORDING:
+                return utterance
+        return None
+
+    def _other_recording(self) -> bool:
+        """Пишется более новая фраза: вставка и итоги текущей ждут (решения 1 и 3)."""
+        recording = self._recording_item()
+        return recording is not None and recording is not self._current()
+
+    def _any_cancel_pending(self) -> bool:
+        return any(c._cancel_pending for c in self._contexts)
+
+    @property
+    def cleanup_pending(self) -> bool:
+        """Отмена ждёт воркера или дописывается хвост записи у любой фразы."""
+        return any(c._cancel_pending or c._tail_pending for c in self._contexts)
+
+    @property
+    def pending_utterances(self) -> int:
+        """Число незавершённых фраз (записывается/распознаётся/вставляется)."""
+        return len(self._items)
+
+    def _route(self, event: dict[str, Any]) -> _Utterance:
+        """Фраза события: по utterance_id; без id — ошибка движка у распознаваемой."""
+        uid = event.get("utterance_id")
+        if isinstance(uid, str):
+            for utterance in reversed(self._contexts):
+                if utterance._utterance_id == uid:
+                    return utterance
+            return self._default()
+        if event.get("type") == "error":
+            # engine-failed приходит без id и относится к выполняемому заданию воркера.
+            for utterance in self._items:
+                if utterance._phase is DictationPhase.PROCESSING:
+                    return utterance
+        return self._recording_item() or self._default()
+
+    def _can_overlap(self, mode: str) -> bool:
+        """Можно ли начать запись, пока предыдущие фразы ещё в работе (US-2.7)."""
+        generation = self._generation()
+        return (
+            mode == "text"
+            and self.mode == "text"
+            and len(self._items) < MAX_PENDING_UTTERANCES
+            and self._recording_item() is None
+            and not self._any_cancel_pending()
+            and all(u._worker_generation == generation for u in self._items)
+        )
+
+    def _refuse_press(self) -> None:
+        """Отказ нажатию.
+
+        Пока фраза пишется, «нажатие» — рассинхрон автомата клавиши: как до US-2.7,
+        автомат сбрасывается и запись отменяется (escape-cancel). Иначе автомат
+        возвращается к фразам очереди, не отменяя их (``_return_hotkey_to_queue``).
+        """
+        if self._recording_item() is not None or not self._items:
+            self._hotkey_cancel()
+            return
+        self._return_hotkey_to_queue()
+
+    def _return_hotkey_to_queue(self) -> None:
+        """Хоткей возвращается к распознаваемым фразам; вложенный escape-cancel
+        (отказ нажатию из IDLE) не отменяет ни одну из них."""
+        refuse = self._hotkey_refuse if self._hotkey_refuse is not None else self._hotkey_cancel
+        self._refusing = True
+        try:
+            refuse()
+        finally:
+            self._refusing = False
+
+    def _press_queued(self) -> bool:
+        return any(kind == _QUEUED_PRESS for kind, _ in self._queue)
+
+    def _pump(self) -> None:
+        """Доставляет результаты по порядку нажатий, когда очередь это позволяет."""
+        if self._pumping or self._suspended or self._closed:
+            return
+        self._pumping = True
+        try:
+            while self._items and not self._suspended and not self._closed:
+                head = self._items[0]
+                if head._result_pending is not None:
+                    text, head._result_pending = head._result_pending, None
+                    with self._within(head):
+                        self._deliver_result(text)
+                elif (
+                    head._phase is DictationPhase.PASTING
+                    and head._paste_text is not None
+                    and self._recording_item() is None
+                ):
+                    text, head._paste_text = head._paste_text, None
+                    with self._within(head):
+                        self._attempt_paste(text)
+                else:
+                    break
+        finally:
+            self._pumping = False
 
     @property
     def level_active(self) -> bool:
@@ -268,8 +510,8 @@ class DictationOrchestrator:
             self._closed
             or self._level_callback is not None
             or self.test_active
-            or self._cancel_pending
-            or self._phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
+            or self._any_cancel_pending()
+            or self.phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
         ):
             callback(MicrophoneLevelUpdate("error", message=TEST_BUSY))
             return False
@@ -278,6 +520,8 @@ class DictationOrchestrator:
         self._level_failed = False
         self._level_idle_message = ""
         self._level_awaiting_audio_closed = False
+        # Измерение не входит в очередь фраз, но становится текущим контекстом.
+        self._new_context(queued=False)
         self._cancel_requested = False
         try:
             self._utterance_id = uuid4().hex
@@ -462,8 +706,8 @@ class DictationOrchestrator:
             self._closed
             or self._level_callback is not None
             or self.test_active
-            or self._cancel_pending
-            or self._phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
+            or self._any_cancel_pending()
+            or self.phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
         ):
             callback(MicrophoneTestUpdate("error", message=TEST_BUSY))
             return False
@@ -512,8 +756,13 @@ class DictationOrchestrator:
 
     @property
     def phase(self) -> DictationPhase:
-        """Текущая фаза, доступная только для чтения."""
-        return self._phase
+        """Агрегированная фаза: запись, если пишется хоть одна фраза; иначе фаза
+        самой старой незавершённой; при пустой очереди — последней завершённой."""
+        if self._recording_item() is not None:
+            return DictationPhase.RECORDING
+        if self._items:
+            return self._items[0]._phase
+        return self._last._phase
 
     @property
     def last_text(self) -> str | None:
@@ -551,12 +800,18 @@ class DictationOrchestrator:
                 self._hotkey_cancel()
             return
         if self._suspended:
-            if state == HotkeyState.RECORDING and reason == "press":
+            press = state == HotkeyState.RECORDING and reason == "press"
+            if press:
                 self._log.info("диктовка: нажатие отложено — идёт вставка (suspended)")
-            self._queue.append(lambda: self.on_hotkey_state(state, reason, mode=mode))
+            self._queue.append(
+                (
+                    _QUEUED_PRESS if press else _QUEUED_OTHER,
+                    lambda: self._replay_hotkey_state(state, reason, mode),
+                )
+            )
             return
         if state == HotkeyState.RECORDING:
-            if self._phase in (DictationPhase.IDLE, DictationPhase.FINISHING):
+            if not self._items:
                 self.mode = mode
                 set_command_mode = getattr(self._tray, "set_command_mode", None)
                 if set_command_mode is not None:
@@ -565,27 +820,68 @@ class DictationOrchestrator:
             elif reason == "press":
                 # Только новое нажатие: tap→toggle и mapping-regrab сообщают
                 # о продолжающейся записи и не должны её отменять.
+                if self._can_overlap(mode):
+                    self._log.info("диктовка: запись во время распознавания предыдущей фразы")
+                    self._start()
+                elif mode != "text":
+                    # Автоматом клавиши «Команды» владеет runtime; очередь текста не трогаем.
+                    self._log.info("диктовка: нажатие «Команды» проигнорировано — идёт диктовка")
+                else:
+                    self._log.info(
+                        "диктовка: нажатие проигнорировано — фаза %s, фраз в работе %d",
+                        self.phase.value,
+                        len(self._items),
+                    )
+                    self._refuse_press()
+        elif state == HotkeyState.PROCESSING and reason == OVERLAP_TAP_REASON:
+            # Случайное касание поверх распознавания: отменяется только его запись.
+            recording = self._recording_item()
+            if recording is not None:
                 self._log.info(
-                    "диктовка: нажатие проигнорировано — занята фаза %s", self._phase.value
+                    "диктовка: короткое нажатие во время распознавания — запись отменена"
                 )
-                self._hotkey_cancel()
+                with self._within(recording):
+                    self._cancel_one("overlap-tap")
         elif state == HotkeyState.PROCESSING:
             # Предел длительности фразы — не отпускание клавиши: хвост не нужен.
-            self._stop(tail=reason != "limit")
+            with self._within(self._recording_item() or self._default()):
+                self._stop(tail=reason != "limit")
         elif state == HotkeyState.IDLE and reason == "escape-cancel":
-            self.cancel("escape")
+            if not self._refusing:
+                self.cancel("escape")
+        self._pump()
+
+    def _replay_hotkey_state(self, state: HotkeyState, reason: str, mode: str) -> None:
+        """Отложенное во время вставки состояние хоткея (US-2.7, решение 6)."""
+        if state == HotkeyState.RECORDING and reason == "press" and self._hotkey_idle():
+            # Нажатие уже отменено самим автоматом клавиши (Escape после него).
+            self._log.debug("диктовка: отложенное нажатие устарело")
+            return
+        self.on_hotkey_state(state, reason, mode=mode)
 
     def _start(self, *, test_device: str | None = None) -> None:
         if self.mode == "command" and (self.command_mode is None or not self.command_mode.allowed):
-            self._hotkey_cancel()
+            self._refuse_press()
             return
-        if self._cancel_pending and self._generation() == self._worker_generation:
+        generation = self._generation()
+        if any(c._cancel_pending and c._worker_generation == generation for c in self._contexts):
             self._log.info(
                 "диктовка: нажатие проигнорировано — ждём завершения отмены (cancel_pending)"
             )
-            self._hotkey_cancel()
+            self._refuse_press()
             return
-        self._cancel_pending = False
+        for context in self._contexts:
+            # Отмена прошлого поколения больше не ждёт ответа: воркер уже другой.
+            context._cancel_pending = False
+            if context not in self._items:
+                # Хвост завершённой фразы больше не нужен: индикацию берёт новая.
+                with self._within(context):
+                    self._cancel_timers()
+                context._phase = DictationPhase.IDLE
+        with self._within(self._new_context(queued=True)):
+            self._start_phrase(test_device)
+
+    def _start_phrase(self, test_device: str | None) -> None:
         self._target_window = (
             None if self.test_active or self.mode == "command" else self._active_window()
         )
@@ -630,7 +926,7 @@ class DictationOrchestrator:
         except Exception:
             self._log.warning("диктовка: параметры записи недоступны")
             self._fail_recognition()
-            self._hotkey_cancel()
+            self._refuse_press()
             return
         self._t0 = self._clock()
         self._change_phase(DictationPhase.RECORDING)
@@ -640,7 +936,7 @@ class DictationOrchestrator:
                 self._cue_sessions.pop(next(iter(self._cue_sessions)))
             self._cue_sessions[(self._worker_generation, self._utterance_id)] = False
         if not self._command(message, timeout=timeout):
-            self._hotkey_cancel()
+            self._refuse_press()
             return
         self._log.info("диктовка: record.start отправлен, поколение=%d", self._worker_generation)
         if self._phase != DictationPhase.RECORDING or self._cancel_requested:
@@ -698,7 +994,7 @@ class DictationOrchestrator:
             {"type": "record.stop", "utterance_id": self._utterance_id}
         ):
             return
-        if self.phase != DictationPhase.PROCESSING or self._cancel_requested:
+        if self._phase != DictationPhase.PROCESSING or self._cancel_requested:
             return
         if self._test_callback is not None:
             callback = self._test_callback
@@ -710,18 +1006,22 @@ class DictationOrchestrator:
                 "диктовка: не удалось обновить экран проверки микрофона",
             )
             # Обработчик состояния вправе сразу отменить распознавание.
-            if self.phase != DictationPhase.PROCESSING or self._cancel_requested:
+            if self._phase != DictationPhase.PROCESSING or self._cancel_requested:
                 return
         if not self._command(
             {"type": "recognize", "utterance_id": self._utterance_id}, timeout=RECOGNIZE_TIMEOUT_S
         ):
             return
-        if self.phase != DictationPhase.PROCESSING or self._cancel_requested:
+        if self._phase != DictationPhase.PROCESSING or self._cancel_requested:
             return
         self._safe_ui(
             lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
         )
-        if (
+        # Итог более старой фразы, отложенный на время записи этой (US-2.7, решение 3).
+        notice, self._deferred_notice = self._deferred_notice, None
+        if notice is not None and self._publication_allowed():
+            self._safe_ui(notice, "диктовка: не удалось обновить пилюлю")
+        elif (
             not self.test_active
             and self._publication_allowed()
             and not self._device_pill_held(PillState.PROCESSING)
@@ -763,7 +1063,8 @@ class DictationOrchestrator:
         if self._closed:
             return
         if event.get("type") in ("record.started", "record.stopped"):
-            self._recording_boundary(event)
+            with self._within(self._route(event)):
+                self._recording_boundary(event)
             return
         if self._level_callback is not None:
             try:
@@ -774,8 +1075,14 @@ class DictationOrchestrator:
             return
         if self._suspended:
             saved = event.copy()
-            self._queue.append(lambda: self.on_worker_event(saved))
+            self._queue.append((_QUEUED_OTHER, lambda: self.on_worker_event(saved)))
             return
+        with self._within(self._route(event)):
+            self._worker_event(event)
+        self._pump()
+
+    def _worker_event(self, event: dict[str, Any]) -> None:
+        """Событие воркера в контексте своей фразы."""
         # hello до первой диктовки тоже начинает новое поколение объявлений.
         self._sync_device_generation()
         if (
@@ -1038,6 +1345,14 @@ class DictationOrchestrator:
             )
             return
         self._cancel_timers()
+        if self._items and self._items[0] is not self._current():
+            # FIFO доставки: результат ждёт исхода более старой фразы (US-2.7).
+            self._result_pending = text
+            return
+        self._deliver_result(text)
+
+    def _deliver_result(self, text: str) -> None:
+        """Исход распознанной фразы, чья очередь доставки подошла."""
         if not text.strip():
             self._dictation_stat("empty")
             self._finish(PillState.EMPTY)
@@ -1105,6 +1420,11 @@ class DictationOrchestrator:
         if self._generation() != self._worker_generation:
             self._fail_restarted()
             return
+        if self._other_recording():
+            # Решение 1 (US-2.7): пока пишется новая фраза, клавиша зажата и вставка
+            # ушла бы только в буфер. Текст ждёт её отпускания (_pump).
+            self._paste_text = text
+            return
         started = self._clock()
         self._suspended = True
         not_fetched = False
@@ -1136,13 +1456,11 @@ class DictationOrchestrator:
             release = self._t_release if self._t_release is not None else self._t_stop
             assert release is not None
             self._t_total_ms = max(0.0, (started + outcome.delivered_ms / 1000 - release) * 1000)
-        # Сохраняем PASTING: нажатия внутри paste не запускают следующую диктовку.
+        # Отложенные события разбираются по порядку: результат следующей фразы ждёт
+        # в своей очереди доставки, нажатие начинает её запись (US-2.7, решение 6).
         while self._queue and not self._closed:
-            if self._phase in (DictationPhase.FINISHING, DictationPhase.IDLE):
-                self._log.debug("диктовка: отложенные события после завершения отброшены")
-                self._queue.clear()
-                break
-            self._queue.popleft()()
+            _, action = self._queue.popleft()
+            action()
         if self._closed or self._cancel_requested or self._phase != DictationPhase.PASTING:
             return
         if self._generation() != self._worker_generation:
@@ -1162,11 +1480,19 @@ class DictationOrchestrator:
             self._dictation_stat("ok")
             self._begin_finish()
             if not_fetched:
-                if self._publication_allowed():
-                    self._pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_NOT_FETCHED)
+                self._show_outcome(
+                    PillState.CLIPBOARD_ONLY,
+                    lambda: self._pill.show_state(
+                        PillState.CLIPBOARD_ONLY, text=CLIPBOARD_NOT_FETCHED
+                    ),
+                )
             else:
-                if self._publication_allowed():
-                    self._pill.show_state(PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED)
+                self._show_outcome(
+                    PillState.CLIPBOARD_ONLY,
+                    lambda: self._pill.show_state(
+                        PillState.CLIPBOARD_ONLY, text=CLIPBOARD_WINDOW_CHANGED
+                    ),
+                )
             self._end_finish(PillState.CLIPBOARD_ONLY, tray=TrayState.IDLE)
         elif kind in (PasteOutcomeKind.CLIPBOARD_ONLY, PasteOutcomeKind.BUSY):
             self._dictation_stat("ok")
@@ -1178,15 +1504,27 @@ class DictationOrchestrator:
             self._fail_recognition()
 
     def cancel(self, source: str) -> None:
-        """Единая отмена до доставки; успешную вставку отменить уже нельзя."""
+        """Единая отмена до доставки; успешную вставку отменить уже нельзя.
+
+        Отменяется одна фраза — самая новая (Escape отменяет последнюю начатую);
+        потеря индикаторов О4 отменяет только пишущуюся (US-2.7, решение 7).
+        """
         if self._closed:
             return
         if self._level_callback is not None:
             self.stop_level_monitor()
             return
         if self._suspended:
-            self._queue.append(lambda: self.cancel(source))
+            self._queue.append((_QUEUED_OTHER, lambda: self.cancel(source)))
             return
+        target = self._default()
+        if source == "indicators":
+            target = self._recording_item() or target
+        with self._within(target):
+            self._cancel_one(source)
+        self._pump()
+
+    def _cancel_one(self, source: str) -> None:
         if self._phase == DictationPhase.DELIVERING:
             return
         if self._delivered:
@@ -1197,21 +1535,36 @@ class DictationOrchestrator:
         if self._cancel_requested:
             return
         self._cancel_requested = True
+        if self._result_pending is not None:
+            # Распознана и ждёт очереди: воркеру отменять уже нечего (US-2.7).
+            self._result_pending = None
+            self._dictation_stat("cancelled")
+            self._finish(PillState.CANCELLED)
+            return
         self._cancel_pending = True
         self._tail_pending = False
         if self._t_stop is None:
             self._t_stop = self._clock()
-        # _cancel_timers снимает все ручки _later, поэтому сначала очищаем старые.
+        # _cancel_timers снимает все ручки _later фразы, поэтому сначала очищаем старые.
         self._cancel_timers()
         # Сторож ставится до send: синхронный cancelled тоже должен его отменить.
         self._later(CANCEL_TIMEOUT_MS, self._cancel_timeout)
         self._send_cancel()
-        self._safe_ui(self._hotkey_cancel, "диктовка: не удалось сбросить горячую клавишу")
+        others = [u for u in self._items if u is not self._current()]
+        if others:
+            # Более старые фразы продолжают распознаваться: хоткей возвращается к ним.
+            self._safe_ui(
+                self._return_hotkey_to_queue, "диктовка: не удалось сбросить горячую клавишу"
+            )
+        else:
+            self._safe_ui(self._hotkey_cancel, "диктовка: не удалось сбросить горячую клавишу")
+        if self._recording_item() in (None, self._current()):
+            self._safe_ui(
+                lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
+            )
         self._safe_ui(
-            lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
-        )
-        self._safe_ui(
-            lambda: self._tray.set_state(TrayState.IDLE), "диктовка: не удалось обновить трей"
+            lambda: self._tray.set_state(TrayState.PROCESSING if others else TrayState.IDLE),
+            "диктовка: не удалось обновить трей",
         )
 
     def _send_cancel(self) -> None:
@@ -1219,6 +1572,10 @@ class DictationOrchestrator:
             self._send({"type": "record.cancel", "utterance_id": self._utterance_id})
         except Exception:
             self._log.warning("диктовка: отправка отмены не удалась")
+
+    def _send_cancel_for(self, utterance: _Utterance) -> None:
+        with self._within(utterance):
+            self._send_cancel()
 
     def on_indicators_lost(self) -> None:
         """IndicatorGuard сам уведомляет пользователя; здесь только отмена О4."""
@@ -1287,8 +1644,10 @@ class DictationOrchestrator:
         elif code == "audio-no-device" and self._device_selected:
             self._append_stat("mic_error", kind="device-lost", recovered_by="none")
             self._begin_finish()
-            if self._publication_allowed():
-                self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_LOST)
+            self._show_outcome(
+                PillState.ERROR,
+                lambda: self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_LOST),
+            )
             self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
             if self._on_device_lost is not None and self._publication_allowed():
                 self._on_device_lost()
@@ -1296,8 +1655,10 @@ class DictationOrchestrator:
             # Источник открыт, но звука не даёт. Статистику и причину пишет
             # обработчик тишины: у него есть состояние источника (kind=muted/…).
             self._begin_finish()
-            if self._publication_allowed():
-                self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_SILENT)
+            self._show_outcome(
+                PillState.ERROR,
+                lambda: self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_SILENT),
+            )
             self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
             self._announce_silent()
         elif code in ("audio-no-device", "audio-busy", "audio-failed"):
@@ -1314,19 +1675,33 @@ class DictationOrchestrator:
         self._fail_recognition(cancel_worker=True)
 
     def _fail_restarted(self) -> None:
+        """Смена поколения воркера завершает всю очередь одним сообщением (US-2.7)."""
         if self.test_active:
             self._cancel_pending = False
             self._finish_test(MicrophoneTestUpdate("error", message=TEST_FAILED))
             return
+        self._deferred_notice = None
+        for other in [u for u in self._items if u is not self._current()]:
+            # Задания старого воркера пропали вместе с ним: молча, без вставки.
+            self._items.remove(other)
+            with self._within(other):
+                self._cancel_timers()
+            other._phase = DictationPhase.IDLE
+            other._cancel_pending = other._tail_pending = False
+            other._result_pending = other._paste_text = None
         self._begin_finish()
-        if self._publication_allowed():
-            self._pill.show_state(PillState.ERROR, text=ERROR_RECOGNITION_RESTARTED)
+        self._show_outcome(
+            PillState.ERROR,
+            lambda: self._pill.show_state(PillState.ERROR, text=ERROR_RECOGNITION_RESTARTED),
+        )
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _fail_microphone(self) -> None:
         self._begin_finish()
-        if self._publication_allowed():
-            self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_UNAVAILABLE)
+        self._show_outcome(
+            PillState.ERROR,
+            lambda: self._pill.show_state(PillState.ERROR, text=ERROR_MICROPHONE_UNAVAILABLE),
+        )
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _fail_recognition(self, *, cancel_worker: bool = False) -> None:
@@ -1341,30 +1716,61 @@ class DictationOrchestrator:
         self._begin_finish()
         if cancel_worker:
             self._send_cancel()
-        if self._publication_allowed():
-            self._pill.show_state(PillState.ERROR, text=ERROR_RECOGNITION_FAILED)
+        self._show_outcome(
+            PillState.ERROR,
+            lambda: self._pill.show_state(PillState.ERROR, text=ERROR_RECOGNITION_FAILED),
+        )
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _fail_model_not_loaded(self) -> None:
         self._begin_finish()
-        if self._publication_allowed():
-            self._pill.show_state(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
+        self._show_outcome(
+            PillState.ERROR,
+            lambda: self._pill.show_state(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED),
+        )
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _fail_secret(self) -> None:
         self._begin_finish()
-        if self._publication_allowed():
-            self._pill.show_state(PillState.ERROR, text=ERROR_BUFFER_CLEARED)
+        self._show_outcome(
+            PillState.ERROR,
+            lambda: self._pill.show_state(PillState.ERROR, text=ERROR_BUFFER_CLEARED),
+        )
         self._end_finish(PillState.ERROR, tray=TrayState.ERROR)
 
     def _finish(self, state: PillState, *, tray: TrayState = TrayState.IDLE) -> None:
         self._begin_finish()
         if self._publication_allowed() and not self._device_pill_held(state):
-            if self._publication_allowed():
-                self._pill.show_state(state)
+            self._show_outcome(state)
         elif not self._publication_allowed():
             self._pill.hide()
         self._end_finish(state, tray=tray)
+
+    def _show_outcome(self, state: PillState, display: Callable[[], None] | None = None) -> None:
+        """Пилюля исхода фразы с учётом остальных фраз очереди (US-2.7, решение 3).
+
+        Пока пишется более новая фраза, видна только запись: ошибка и «в буфере»
+        откладываются до её отпускания, остальные исходы не показываются. Пока
+        другая фраза распознаётся, вместо «Готово»/«Пусто»/«Отменено» остаётся
+        «Распознаю». Текст подписи — только константы реестра pill в ``display``.
+        """
+        if not self._publication_allowed():
+            return
+        show = display if display is not None else lambda: self._pill.show_state(state)
+        notice = state in _NOTICE_STATES
+        if self._items:
+            if self._recording_item() is not None:
+                if notice:
+                    self._deferred_notice = show
+                return
+            if not notice:
+                show = partial(self._pill.show_state, PillState.PROCESSING)
+        else:
+            deferred, self._deferred_notice = self._deferred_notice, None
+            if deferred is not None and not notice:
+                # Новая фраза закончилась без распознавания: ошибку старой не прячем.
+                show = deferred
+        show()
 
     def _device_pill_held(self, state: PillState) -> bool:
         """Пилюля «Микрофон сменился/отключился» ещё видна и важнее этого состояния."""
@@ -1375,9 +1781,13 @@ class DictationOrchestrator:
     def _begin_finish(self) -> None:
         self._cancel_pending = False
         self._tail_pending = False
+        self._result_pending = None
+        self._paste_text = None
         self._cancel_timers()
         self._change_phase(DictationPhase.FINISHING)
-        self._set_recording(False)
+        if self._recording_item() is None:
+            # Пишущаяся новая фраза держит индикацию записи (О4, US-2.7).
+            self._set_recording(False)
         if not self._publication_allowed():
             self._pill.hide()
 
@@ -1389,8 +1799,17 @@ class DictationOrchestrator:
             tray = TrayState.ERROR
             remaining = math.ceil((self._device_pill_until - self._clock()) * 1000)
             duration = max(duration, remaining)
+        if self._items:
+            # В работе другие фразы: трей и хоткей остаются за ними (US-2.7).
+            if self._recording_item() is None and self._publication_allowed():
+                self._tray.set_state(TrayState.PROCESSING)
+            self._later(duration, self._tail_done)
+            return
         self._tray.set_state(tray if self._publication_allowed() else TrayState.IDLE)
         self._later(duration, self._tail_done)
+        if self._press_queued():
+            # Нажатие во время вставки уже перевело автомат клавиши к новой фразе.
+            return
         self._hotkey_done()
         # done завершает только PROCESSING; терминальный исход возможен и из RECORDING.
         if not self._hotkey_idle():
@@ -1398,7 +1817,8 @@ class DictationOrchestrator:
 
     def _tail_done(self) -> None:
         self._change_phase(DictationPhase.IDLE)
-        self._tray.set_state(TrayState.IDLE)
+        if not self._items and self._current() is self._last:
+            self._tray.set_state(TrayState.IDLE)
 
     def _command(self, message: dict[str, Any], **kwargs: float) -> bool:
         try:
@@ -1465,25 +1885,38 @@ class DictationOrchestrator:
                 self._log.warning("диктовка: статистика недоступна")
 
     def _change_phase(self, phase: DictationPhase) -> None:
-        previous = self._phase
-        self._phase = phase
+        """Фаза фразы контекста; on_idle — по переходу агрегированной фазы в IDLE."""
+        previous = self.phase
+        utterance = self._current()
+        utterance._phase = phase
+        if phase in (DictationPhase.FINISHING, DictationPhase.IDLE) and utterance in self._items:
+            self._items.remove(utterance)
+            if not self._items:
+                self._last = utterance
         self._log.debug("диктовка: фаза %s", phase.value)
-        if phase == DictationPhase.IDLE and previous != phase and self._on_idle is not None:
+        if (
+            self.phase == DictationPhase.IDLE
+            and previous != DictationPhase.IDLE
+            and self._on_idle is not None
+        ):
             self._safe_ui(self._on_idle, "диктовка: не удалось обработать простой")
 
     def _later(self, milliseconds: int, callback: Callable[[], None]) -> None:
         self._timer_serial += 1
         token = self._timer_serial
+        utterance = self._current()
 
         def fire() -> None:
             # Даже уже доставленный отменённый таймер не выполняет работу. Его
             # оболочка не удерживает фразу из замыкания BUSY после отмены.
-            entry = self._timers.pop(token, None)
+            entry = utterance._timers.pop(token, None)
             if entry is not None and not self._closed:
-                entry[1]()
+                with self._within(utterance):
+                    entry[1]()
+                self._pump()
 
         handle = self._schedule(milliseconds, fire)
-        self._timers[token] = (handle, callback)
+        utterance._timers[token] = (handle, callback)
 
     def _cancel_timers(self) -> None:
         pending, self._timers = self._timers, {}
@@ -1501,19 +1934,30 @@ class DictationOrchestrator:
         if self._level_callback is not None:
             self.stop_level_monitor()
             self._finish_level()
-        active = self._phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
-        self._cancel_pending = False
-        self._tail_pending = False
-        self._cancel_requested = True
+        # Отменяются все незавершённые фразы очереди (US-2.7).
+        active = list(self._items) or [
+            u
+            for u in (self._last,)
+            if u._phase not in (DictationPhase.IDLE, DictationPhase.FINISHING)
+        ]
+        self._items.clear()
+        self._deferred_notice = None
         self._queue.clear()
-        self._cancel_timers()
-        self._phase = DictationPhase.IDLE
+        for utterance in self._contexts:
+            utterance._cancel_pending = utterance._tail_pending = False
+            utterance._cancel_requested = True
+            utterance._result_pending = utterance._paste_text = None
+            with self._within(utterance):
+                self._cancel_timers()
+            utterance._phase = DictationPhase.IDLE
         callback, self._test_callback = self._test_callback, None
         actions: list[Callable[[], None]] = []
         if callback is not None:
             actions.append(lambda: callback(MicrophoneTestUpdate("idle")))
         if active:
-            actions.extend((self._hotkey_cancel, self._send_cancel))
+            actions.append(self._hotkey_cancel)
+        for utterance in active:
+            actions.append(partial(self._send_cancel_for, utterance))
         actions.extend((lambda: self._set_recording(False), self._hotkey_done, self._pill.hide))
         for action in actions:
             try:

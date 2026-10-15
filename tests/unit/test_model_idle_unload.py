@@ -15,7 +15,7 @@ import pytest
 from test_command_mouse_runtime import MouseRuntimeRig
 from test_runtime import MARKER, FakeTimer, Rig, assert_phase
 
-from astra_voice.core.dictation import DictationPhase
+from astra_voice.core.dictation import PROCESSING_WATCHDOG_MS, DictationPhase
 from astra_voice.core.settings import MODEL_UNLOAD_MINUTES, Settings, from_dict
 from astra_voice.platform.hotkey import HotkeyState
 from astra_voice.platform.mouse_button import MouseHoldState
@@ -375,3 +375,54 @@ def test_bridge_saves_choice_applies_it_and_rejects_others() -> None:
         setattr(bridge, prop, invalid)
     assert settings.model_unload_minutes == 15
     assert save.call_count == 1 and apply.model_unload_minutes.call_count == 1
+
+
+# US-2.7 × US-2.6 (T-218) ------------------------------------------------------------------
+
+
+def record_ids(rig: Rig) -> list[str]:
+    return [
+        str(item.args[0]["utterance_id"])
+        for item in rig.supervisor.send.call_args_list
+        if item.args[0]["type"] == "record.start"
+    ]
+
+
+def test_overlap_queue_blocks_idle_unload_until_last_phrase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Пока в очереди есть фраза, выгрузка по простою не срабатывает; владелец ввода — text."""
+    rig = make_rig(monkeypatch)
+    runtime = rig.runtime
+    rig.hotkey.fsm.press(rig.now)
+    rig.release(rig.now + 1)
+    rig.now += 2
+    rig.hotkey.fsm.press(rig.now)
+    first, second = record_ids(rig)
+    assert runtime.orchestrator.pending_utterances == 2
+    assert runtime._input_owner == "text"
+    # Третье нажатие при двух фразах: автомат клавиши возвращается к распознаванию.
+    rig.release(rig.now + 1)
+    rig.hotkey.fsm.press(rig.now + 2)
+    assert rig.hotkey.fsm.state is HotkeyState.PROCESSING
+    assert len(record_ids(rig)) == 2
+    assert runtime._work_pending()
+    rig.now += FIVE_MIN_S + 10
+    fire_idle(rig)
+    assert not runtime._model_parked
+    rig.event(type="result", utterance_id=first, text=MARKER)
+    for timer in list(rig.timers):
+        # Только пилюля «Готово» первой фразы: сторож распознавания второй не трогаем.
+        if timer.name == "scheduled" and timer.active and timer.interval < PROCESSING_WATCHDOG_MS:
+            timer.fire()
+    assert runtime.orchestrator.pending_utterances == 1
+    assert runtime._input_owner == "text" and runtime._work_pending()
+    rig.event(type="result", utterance_id=second, text=MARKER)
+    settle(rig)
+    assert_phase(runtime, DictationPhase.IDLE)
+    assert runtime._input_owner is None
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE
+    assert not runtime._model_parked
+    rig.now += FIVE_MIN_S
+    fire_idle(rig)
+    assert runtime._model_parked

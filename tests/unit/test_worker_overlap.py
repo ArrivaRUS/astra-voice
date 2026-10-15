@@ -136,3 +136,39 @@ def test_engine_failure_of_first_keeps_second_recording(make_worker: Any) -> Non
     assert cmd(worker, "recognize", "b") == []
     result = events.get(timeout=2)
     assert (result["type"], result["utterance_id"]) == ("result", "b")
+
+
+def test_engine_failure_reports_queued_phrase_as_error(make_worker: Any) -> None:
+    """Решение 5: ожидавшая очереди B при engine-failed A — ошибка с её id, не «cancelled».
+
+    PCM B сохраняется до срока хранения остановленных буферов, как у упавшей A.
+    """
+    gate = Event()
+    engine = FailFirstEngine(gate=gate)
+    worker, events = make_worker(engine)
+    assert cmd(worker, "record.start", "a") == []
+    worker.feed_audio("a", [0.1])
+    assert cmd(worker, "recognize", "a") == []
+    assert engine.started.wait(2)
+    assert cmd(worker, "record.start", "b") == []
+    worker.feed_audio("b", [0.2])
+    assert cmd(worker, "record.stop", "b") == []
+    assert cmd(worker, "recognize", "b") == []
+    gate.set()
+    first, second = events.get(timeout=2), events.get(timeout=2)
+    assert (first["type"], first.get("code"), "utterance_id" in first) == (
+        "error",
+        "engine-failed",
+        False,
+    )
+    assert (second["type"], second.get("code"), second.get("utterance_id")) == (
+        "error",
+        "engine-failed",
+        "b",
+    )
+    assert worker.state is State.idle
+    assert list(worker.buffers["b"]) == pytest.approx([0.2])
+    # Повтор распознавания B возможен: буфер цел.
+    assert cmd(worker, "recognize", "b") == []
+    result = events.get(timeout=2)
+    assert (result["type"], result["utterance_id"]) == ("result", "b")

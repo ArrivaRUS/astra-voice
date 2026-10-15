@@ -51,13 +51,14 @@ from test_dictation import Rig
 from astra_voice.core.command_mode import CommandMode, SessionSnapshot
 from astra_voice.core.dictation import (
     BUSY_RETRY_MS,
+    CANCEL_TIMEOUT_MS,
     PROCESSING_WATCHDOG_MS,
     TEST_BUSY,
     DictationPhase,
     MicrophoneTestUpdate,
 )
 from astra_voice.platform.cowork import DeliveryResult
-from astra_voice.platform.hotkey import HotkeyState
+from astra_voice.platform.hotkey import HotkeyMode, HotkeyState
 from astra_voice.platform.paste import PasteOutcomeKind
 from astra_voice.ui.pill import (
     ERROR_RECOGNITION_FAILED,
@@ -509,3 +510,151 @@ def test_indicator_loss_stops_recording_but_keeps_recorded_phrase(rig: OverlapRi
     rig.event_for(B, "cancelled")
     rig.result_for(A, A_TEXT)
     assert rig.texts() == [A_TEXT]
+
+
+# Дополнения разработчика к US-2.7 (решения владельца 2026-10-15) ------------------------
+
+
+def test_short_tap_during_recognition_cancels_only_its_recording(rig: OverlapRig) -> None:
+    """Открытый риск PTT: касание < 0,3 с поверх распознавания не оставляет запись открытой.
+
+    Запись B отменяется (без toggle и без «Отменено» поверх распознавания A), хоткей
+    возвращается к A: Escape по-прежнему отменяет A, done после A — IDLE.
+    """
+    rig.start()
+    rig.stop()
+    rig.start()
+    a_uid, b_uid = rig.uids
+    rig.now += 0.1
+    rig.fsm.release(rig.now)
+    assert rig.sent_ids("record.cancel") == [b_uid]
+    assert not rig.recording
+    rig.assert_hotkey_state(HotkeyState.PROCESSING)
+    rig.event_for(B, "cancelled")
+    assert rig.pill.calls[-1][0] == PillState.PROCESSING
+    assert rig.tray.state == TrayState.PROCESSING
+    assert phase_of(rig) == DictationPhase.PROCESSING
+    rig.result_for(A, A_TEXT)
+    assert rig.texts() == [A_TEXT]
+    assert a_uid not in rig.sent_ids("record.cancel")
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+
+
+def test_held_press_during_recognition_is_a_normal_phrase(rig: OverlapRig) -> None:
+    """Удержание ≥ 0,3 с поверх распознавания — обычная фраза PTT, без отмены."""
+    begin_overlap(rig)
+    rig.now += 0.5
+    rig.fsm.release(rig.now)
+    rig.fire_tail()
+    assert rig.sent_ids("recognize") == rig.uids
+    assert "record.cancel" not in rig.commands()
+
+
+def test_queued_phrase_failed_by_engine_shows_error_not_cancelled(rig: OverlapRig) -> None:
+    """Решение 5: B, ждавшая очереди и не распознанная из-за ошибки A, — ошибка, не «Отменено»."""
+    begin_overlap(rig, release_b=True)
+    rig.core.on_worker_event(
+        {"type": "error", "generation": rig.worker_generation, "code": "engine-failed"}
+    )
+    # Ошибка без id относится к распознаваемой A; B продолжает ждать.
+    assert rig.active(PROCESSING_WATCHDOG_MS), "ошибка A сняла сторож B"
+    rig.event_for(B, "error", code="engine-failed", request_type="recognize")
+    assert (PillState.ERROR, ERROR_RECOGNITION_FAILED, None) in rig.pill.calls
+    assert all(call[0] != PillState.CANCELLED for call in rig.pill.calls)
+    assert [e["result"] for e in rig.stats.events if e["type"] == "dictation"] == []
+    assert rig.pasted == []
+    assert phase_of(rig) == DictationPhase.FINISHING
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+
+
+def test_escape_on_recognized_waiting_phrase_cancels_locally(rig: OverlapRig) -> None:
+    """B распознана и ждёт A: воркеру отменять нечего — record.cancel не шлём."""
+    begin_overlap(rig, release_b=True)
+    rig.result_for(B, B_TEXT)
+    rig.fsm.escape(rig.now)
+    assert "record.cancel" not in rig.commands()
+    rig.result_for(A, A_TEXT)
+    assert rig.texts() == [A_TEXT]
+    results = [e["result"] for e in rig.stats.events if e["type"] == "dictation"]
+    assert results == ["cancelled", "ok"]
+    assert not rig.restart_worker.called
+
+
+def test_third_press_is_logged_without_text(
+    rig: OverlapRig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Решение 7: отказ третьему нажатию — в журнале, без текста фраз; хоткей у B."""
+    caplog.set_level(logging.DEBUG)
+    begin_overlap(rig, release_b=True)
+    rig.result_for(B, B_TEXT)
+    rig.start()
+    assert len(rig.uids) == 2
+    rig.assert_hotkey_state(HotkeyState.PROCESSING)
+    assert any("нажатие проигнорировано" in r.getMessage() for r in caplog.records)
+    rig.result_for(A, A_TEXT)
+    assert rig.texts() == [A_TEXT, B_TEXT]
+    assert "ГЕЛИОТРОП" not in caplog.text
+
+
+def test_queue_limit_matches_worker_queue() -> None:
+    """Очередь GUI = очередь воркера: одно задание выполняется и одно ждёт."""
+    from astra_voice.core.dictation import MAX_PENDING_UTTERANCES
+
+    assert MAX_PENDING_UTTERANCES == 2
+
+
+def test_first_pastes_after_toggle_stop_of_second() -> None:
+    """Решение 1 в режиме toggle: A вставляется после остановки записи B вторым нажатием."""
+    toggle = OverlapRig(hotkey_mode=HotkeyMode.TOGGLE)
+    toggle.start()
+    toggle.stop()
+    toggle.start()
+    assert len(toggle.uids) == 2, OVERLAP_MISSING
+    toggle.result_for(A, A_TEXT)
+    assert toggle.pasted == []
+    toggle.stop()
+    assert toggle.texts() == [A_TEXT]
+    toggle.result_for(B, B_TEXT)
+    assert toggle.texts() == [A_TEXT, B_TEXT]
+    toggle.assert_hotkey_state(HotkeyState.IDLE)
+
+
+def test_pill_moves_between_phrases_without_hide(rig: OverlapRig) -> None:
+    """T-217 (уровень оркестратора): processing → listening → processing без hide между ними.
+
+    Пилюля не скрывается на стыке фраз, а индикатор записи включается заново только
+    после того, как пилюля уже показывает «Слушаю» (страж О4 не видит потери индикации).
+    """
+    rig.start()
+    rig.stop()
+    mark = len(rig.trace)
+    rig.start()
+    rig.stop()
+    rig.result_for(A, A_TEXT)
+    rig.result_for(B, B_TEXT)
+    window = rig.trace[mark:]
+    assert ("hide",) not in window
+    shown = [entry[1] for entry in window if entry[0] == "pill"]
+    assert shown[:2] == [PillState.LISTENING, PillState.PROCESSING]
+    assert shown[-1] == PillState.DONE
+    on = window.index(("recording", True))
+    assert ("pill", PillState.LISTENING, None, None) in window[:on]
+
+
+@pytest.mark.parametrize("confirm", ["cancelled", "timeout"])
+def test_ready_first_pastes_after_second_is_cancelled(rig: OverlapRig, confirm: str) -> None:
+    """A распознана, пока пишется B; Escape отменяет B — A вставляется после отмены B."""
+    begin_overlap(rig)
+    rig.result_for(A, A_TEXT)
+    assert rig.pasted == []
+    rig.fsm.escape(rig.now)
+    if confirm == "cancelled":
+        rig.event_for(B, "cancelled")
+    else:
+        (timeout,) = rig.active(CANCEL_TIMEOUT_MS)
+        timeout.fire()
+    assert rig.texts() == [A_TEXT]
+    assert [e["result"] for e in rig.stats.events if e["type"] == "dictation"] == [
+        "cancelled",
+        "ok",
+    ]

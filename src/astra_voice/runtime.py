@@ -353,6 +353,7 @@ class DictationRuntime(QObject):
                 hotkey_done=self._input_done,
                 hotkey_cancel=self._input_cancel,
                 hotkey_idle=self._input_idle,
+                hotkey_refuse=self._input_refuse,
                 set_recording=self.guard.set_recording,
                 recording_cue=self._recording_cue,
                 paste_mode=self.paste_mode,
@@ -409,8 +410,7 @@ class DictationRuntime(QObject):
             or self._pending_test is not None
             or self.orchestrator.test_active
             or self.orchestrator.level_active
-            or self.orchestrator._cancel_pending
-            or self.orchestrator._tail_pending
+            or self.orchestrator.cleanup_pending
             or self._pending_switch is not None
             or self._switch_active()
             or self._loading_model
@@ -564,6 +564,14 @@ class DictationRuntime(QObject):
             self._active_hotkey().fsm.escape(monotonic())
         if owner is not None and self.phase in (DictationPhase.IDLE, DictationPhase.FINISHING):
             self._release_input(owner)
+
+    def _input_refuse(self) -> None:
+        """Отказ нажатию поверх распознавания (US-2.7): хоткей возвращается к
+        распознаваемой фразе, владелец ввода и Escape остаются за ней."""
+        if self._input_owner in (None, "text"):
+            self.hotkey.fsm.refuse(monotonic())
+        else:
+            self._input_cancel()
 
     def _input_idle(self) -> bool:
         if self._input_owner == "mouse":
@@ -951,6 +959,10 @@ class DictationRuntime(QObject):
         self._command_client.owner_changed.connect(self._command_owner_changed)
         self._command_client.status_changed.connect(self._command_status_changed)
         self.command_hotkey = self._command_hotkey_factory()
+        # Команды не перекрываются (US-2.7, решение 4): нажатие во время распознавания
+        # команды по-прежнему игнорирует сам автомат клавиши.
+        if self.command_hotkey is not self.hotkey:
+            self.command_hotkey.allow_overlap = False
         self.command_hotkey.on_state = self._on_command_hotkey_state
         self.tray.on_command_details = self.show_command_details
         self.tray.on_launch_cowork = self.launch_cowork
