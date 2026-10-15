@@ -934,15 +934,15 @@ def test_panel_marker_and_mono_version(app: Any) -> None:
 
 
 @pytest.mark.parametrize(
-    "field,name,host",
+    "field,name",
     [
-        ("checkAppUpdates", "checkAppUpdatesToggle", "github.com"),
-        ("checkModelUpdates", "checkModelUpdatesToggle", "huggingface.co"),
+        ("checkAppUpdates", "checkAppUpdatesToggle"),
+        ("checkModelUpdates", "checkModelUpdatesToggle"),
     ],
 )
 @pytest.mark.parametrize("mode", ["ordinary", "offline", "policy"])
 def test_network_check_toggles_visible_and_follow_effective_settings(
-    app: Any, field: str, name: str, host: str, mode: str
+    app: Any, field: str, name: str, mode: str
 ) -> None:
     changes: dict[str, Any] = {}
     values: dict[str, Any] = {}
@@ -963,9 +963,11 @@ def test_network_check_toggles_visible_and_follow_effective_settings(
         assert control.property("enabled") is (mode == "ordinary")
         texts = onboarding.visible_texts(window.contentItem())
         hint = (
-            ("Раз в сутки, " if field == "checkAppUpdates" else "")
-            + host
-            + ". Скачивание — только по вашему нажатию."
+            (
+                "Раз в сутки. Скачивание — только по вашему нажатию."
+                if field == "checkAppUpdates"
+                else "Скачивание — только по вашему нажатию."
+            )
             if mode == "ordinary"
             else "Не работает, пока включён офлайн-режим."
             if mode == "offline"

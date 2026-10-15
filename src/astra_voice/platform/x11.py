@@ -44,6 +44,87 @@ class X11Unavailable(Exception):
     """Операция требует доступного соединения X11."""
 
 
+class XEmbedTrayProbe:
+    """Проверка XEmbed из GUI-потока, на одном ленивом соединении Xlib.
+
+    Ошибка ответа или асинхронного запроса закрывает соединение. Следующий
+    вызов может подключиться заново; конструктор не импортирует Xlib.
+    """
+
+    def __init__(self) -> None:
+        self._display: Any = None
+        self._error = False
+
+    def _on_error(self, *_: Any) -> None:
+        # Не закрываем Display внутри обработчика его же очереди ответов.
+        self._error = True
+
+    def _connection(self) -> Any:
+        if not os.environ.get("DISPLAY"):
+            self.close()
+            return None
+        if self._display is None:
+            from Xlib import display
+
+            self._display = display.Display()
+            self._display.set_error_handler(self._on_error)
+        return self._display
+
+    @staticmethod
+    def _owner(display: Any) -> int | None:
+        atom = display.intern_atom(
+            f"_NET_SYSTEM_TRAY_S{display.get_default_screen()}", only_if_exists=True
+        )
+        window = display.get_selection_owner(atom) if atom else None
+        owner = int(window.id) if window else 0
+        return owner if 0 < owner <= 0xFFFFFFFF else None
+
+    def owner(self) -> int | None:
+        try:
+            display = self._connection()
+            if display is None:
+                return None
+            owner = self._owner(display)
+            display.sync()
+            if not self._error:
+                return owner
+        except Exception:
+            pass
+        self.close()
+        return None
+
+    def is_docked(self, window_id: int, owner: int) -> bool:
+        try:
+            display = self._connection()
+            if display is None:
+                return False
+            current_owner = self._owner(display)
+            docked = False
+            if window_id > 0 and owner > 0 and current_owner == owner:
+                window = display.create_resource_object("window", window_id)
+                tree = window.query_tree()
+                root = int(tree.root.id)
+                parent = int(tree.parent.id) if tree.parent else 0
+                # Selection могла смениться во время query_tree().
+                docked = parent != 0 and parent != root and self._owner(display) == owner
+            display.sync()
+            if not self._error:
+                return docked
+        except Exception:
+            pass
+        self.close()
+        return False
+
+    def close(self) -> None:
+        display, self._display = self._display, None
+        if display is not None:
+            try:
+                display.close()
+            except Exception:
+                pass
+        self._error = False
+
+
 @dataclass
 class ParsedCombo:
     """Модификаторы и клавиша в текущей раскладке X11."""

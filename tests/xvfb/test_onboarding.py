@@ -274,6 +274,7 @@ class FakeOnboarding(QObject):
         self._device: str = ""
         self._deviceResolved: str = "Встроенный микрофон"
         self._level: float = 1.0
+        self._levelSilent: bool = False
         self._levelState: str = "listening"
         self._levelMessage: str = ""
         self._peak: str = "−18 дБ"
@@ -564,6 +565,15 @@ class FakeOnboarding(QObject):
         self.changed.emit()
 
     level = pyqtProperty(float, _get_level, _set_level, notify=changed)
+
+    def _get_levelSilent(self) -> bool:
+        return self._levelSilent
+
+    def _set_levelSilent(self, value: bool) -> None:
+        self._levelSilent = value
+        self.changed.emit()
+
+    levelSilent = pyqtProperty(bool, _get_levelSilent, _set_levelSilent, notify=changed)
 
     def _get_levelState(self) -> str:
         return self._levelState
@@ -4556,33 +4566,91 @@ def test_mic_silence_is_reported_while_listening(onboarding_app: Any, dark: bool
     retry = "Проверить ещё раз"
 
     def inspect(root: Any) -> None:
-        for state, level in (
-            ("idle", 0),
-            ("listening", 0),
-            ("listening", 0.02),
-            ("listening", 0.021),
-            ("listening", 0.5),
-            ("error", 0),
-            ("idle", 0),
+        meter = next(
+            item
+            for item in visual_tree(root)
+            if item.metaObject().indexOfProperty("level") >= 0
+            and item.metaObject().indexOfProperty("silent") >= 0
+        )
+        for state, level, level_silent in (
+            ("idle", 0, False),
+            ("listening", 0, False),
+            ("listening", 0, True),
+            ("listening", 0.02, True),
+            ("listening", 0.033, True),
+            ("listening", 0.021, False),
+            ("listening", 0.5, False),
+            ("error", 0, False),
+            ("idle", 0, False),
         ):
             fake.levelState = state
             fake.level = level
+            fake.levelSilent = level_silent
             onboarding_app.processEvents()
             texts = visible_texts(root)
-            assert (warning in texts) == (state == "listening" and level <= 0.02), (state, level)
+            assert (warning in texts) == (state == "listening" and level_silent), (
+                state,
+                level,
+                level_silent,
+            )
+            assert meter.property("level") == level
+            assert meter.property("silent") == (level <= 0.02)
             # В idle пояснение означает, что мост сам остановил проверку по
             # общему потолку (ИБ, У62): показываем его и даём повторить.
             assert (fake.levelMessage in texts) == (state in ("error", "idle")), (state, level)
             assert (retry in texts) == (state == "idle"), (state, level)
             if state == "listening":
-                assert (silence in texts) == (level <= 0.02), level
-                assert ("Слышим вас" in texts) == (level > 0.02), level
+                assert (silence in texts) == level_silent, (level, level_silent)
+                assert ("Слышим вас" in texts) == (not level_silent), (level, level_silent)
+                assert (f"Пик {fake.peak}" in texts) == level_silent
+                assert (f"Пик {fake.peak} · уровень в норме" in texts) == (not level_silent)
             elif state == "error":
                 assert silence not in texts
                 assert "Слышим вас" not in texts
 
     _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
     assert_no_messages(messages, "microphone silence")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_mic_silence_heading_moves_smoothly_and_returns(onboarding_app: Any, dark: bool) -> None:
+    fake = configure_onboarding(4, level=0, levelSilent=False, testText="")
+    duration = int(theme_number("durationEnter"))
+
+    def inspect(root: Any) -> None:
+        assert root.setProperty("freezeAnimations", False)
+        step = next(
+            item
+            for item in visual_tree(root)
+            if item.metaObject().indexOfProperty("levelState") >= 0
+            and item.metaObject().indexOfProperty("barHint") >= 0
+        )
+        heading = next(
+            item for item in step.childItems() if item.property("text") == "Тестовая диктовка"
+        )
+        QTest.qWait(duration + 80)
+        original_y = heading.y()
+        fake.levelSilent = True
+        onboarding_app.processEvents()
+        assert heading.y() == pytest.approx(original_y, abs=1)
+        QTest.qWait(max(30, duration // 3))
+        entering_y = heading.y()
+        QTest.qWait(duration + 80)
+        expanded_y = heading.y()
+        assert original_y < entering_y < expanded_y
+        QTest.qWait(30)
+        assert heading.y() == pytest.approx(expanded_y, abs=0.1)
+        fake.levelSilent = False
+        onboarding_app.processEvents()
+        assert heading.y() == pytest.approx(expanded_y, abs=1)
+        QTest.qWait(max(30, duration // 3))
+        leaving_y = heading.y()
+        QTest.qWait(duration + 80)
+        assert original_y < leaving_y < expanded_y
+        assert heading.y() == pytest.approx(original_y, abs=0.1)
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "microphone silence heading animation")
 
 
 def test_finish_calls_bridge(onboarding_app: Any) -> None:
@@ -5159,8 +5227,8 @@ def test_step1_network_disclosure_matches_actual_choices(
         if locked:
             assert hint in texts and "Задано администратором" in texts
         else:
-            assert "Раз в сутки, github.com. Скачивание — только по вашему нажатию." in texts
-            assert "huggingface.co. Скачивание — только по вашему нажатию." in texts
+            assert "Раз в сутки. Скачивание — только по вашему нажатию." in texts
+            assert "Скачивание — только по вашему нажатию." in texts
         if app_on or model_on:
             assert any("Не чаще раза в сутки. Сама ничего не скачивает" in text for text in texts)
         rows = [

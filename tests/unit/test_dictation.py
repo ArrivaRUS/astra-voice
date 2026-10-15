@@ -89,6 +89,7 @@ class FakePill:
             or (state == PillState.ERROR and text in ERROR_REASONS)
             or (state == PillState.CLIPBOARD_ONLY and text in CLIPBOARD_REASONS)
         )
+        self.hidden = False
         self.calls.append((state, text, level))
         self.trace.append(("pill", state, text, level))
 
@@ -2278,6 +2279,8 @@ def test_microphone_test_cycle_is_private(
     rig.during_send = encode_command
     assert rig.core.start_test(device, updates.append)
     assert updates == [MicrophoneTestUpdate("recording")]
+    assert rig.pill.calls == [(PillState.LISTENING, None, None)]
+    assert not rig.pill.hidden
     assert rig.sent[0][0].get("device") == (device or None)
     assert rig.sent[0][0]["limit_s"] == 10.0
     assert rig.sent[0][1] == 40.0
@@ -2286,6 +2289,10 @@ def test_microphone_test_cycle_is_private(
     microphone_event(rig, "audio.ready", device="USB-микрофон")
     microphone_event(rig, "level", peak_dbfs=-18.0, rms_dbfs=-26.0)
     assert updates[-1] == MicrophoneTestUpdate("recording", peak_dbfs=-18.0)
+    state, text, level = rig.pill.calls[-1]
+    assert state is PillState.LISTENING
+    assert text is None
+    assert level is not None and level == pytest.approx(0.7)
     if stop == "button":
         rig.core.stop_test()
     elif stop == "limit":
@@ -2293,6 +2300,13 @@ def test_microphone_test_cycle_is_private(
     else:
         microphone_event(rig, stop)
     assert str(updates[-1].state) == "processing"
+    assert rig.pill.calls == [
+        (PillState.LISTENING, None, None),
+        (PillState.LISTENING, None, level),
+        *([(PillState.LIMIT, None, None)] if stop == "record.limit" else []),
+        (PillState.PROCESSING, None, None),
+    ]
+    assert not rig.pill.hidden
     assert not rig.recording
     assert rig.commands() == [
         "record.start",
@@ -2306,7 +2320,8 @@ def test_microphone_test_cycle_is_private(
     assert rig.core.last_text is None
     assert not rig.pasted
     assert not rig.stats.events
-    assert not rig.pill.calls
+    assert rig.pill.hidden
+    assert [entry for entry in rig.trace if entry[0] in {"pill", "hide"}][-1] == ("hide",)
     assert not rig.tray.has_last_text
     rig.device_selected.assert_not_called()
     rig.device_changed.assert_not_called()
@@ -2418,7 +2433,9 @@ def test_microphone_error_is_plain_and_private(
     assert MARKER not in caplog.text
     assert not rig.pasted
     assert not rig.stats.events
-    assert not rig.pill.calls
+    assert rig.pill.calls == [(PillState.LISTENING, None, None)]
+    assert rig.pill.hidden
+    assert rig.core.last_text is None
     rig.device_lost.assert_not_called()
     assert not rig.recording
 
@@ -2447,7 +2464,16 @@ def test_microphone_failures_release_recording_without_logging_exception(
     microphone_event(rig, "cancelled")
     assert not rig.pasted
     assert not rig.stats.events
-    assert not rig.pill.calls
+    assert rig.pill.calls == (
+        []
+        if failure == "record.start"
+        else [
+            (PillState.LISTENING, None, None),
+            *([(PillState.PROCESSING, None, None)] if failure == "watchdog" else []),
+        ]
+    )
+    assert rig.pill.hidden
+    assert rig.core.last_text is None
     assert MARKER not in caplog.text
 
 
@@ -2463,7 +2489,98 @@ def test_microphone_cancel_watchdogs_always_release_worker(rig: Rig) -> None:
     rig.restart_worker.assert_called_once_with()
     assert not rig.pasted
     assert not rig.stats.events
-    assert not rig.pill.calls
+    assert rig.pill.calls == [(PillState.LISTENING, None, None)]
+    assert rig.pill.hidden
+    assert rig.core.last_text is None
+
+
+@pytest.mark.parametrize("phase", ["recording", "processing"])
+@pytest.mark.parametrize("terminal", ["cancel", "shutdown", "worker-cancelled"])
+def test_microphone_terminal_paths_hide_recording_pill(rig: Rig, phase: str, terminal: str) -> None:
+    updates: list[MicrophoneTestUpdate] = []
+    assert rig.core.start_test("", updates.append)
+    assert rig.pill.calls == [(PillState.LISTENING, None, None)]
+    if phase == "processing":
+        rig.core.stop_test()
+        assert rig.pill.calls[-1] == (PillState.PROCESSING, None, None)
+    assert not rig.pill.hidden
+    if terminal == "shutdown":
+        rig.core.shutdown()
+    else:
+        if terminal == "cancel":
+            rig.core.cancel_test()
+        microphone_event(rig, "cancelled")
+    assert rig.pill.hidden
+    assert not rig.recording
+    assert not rig.core.test_active
+    assert rig.core.phase is DictationPhase.IDLE
+    assert rig.core.last_text is None
+    assert not rig.pasted
+    assert not rig.stats.events
+    assert updates[-1].state == "idle"
+
+
+@pytest.mark.parametrize("terminal", ["result", "cancelled", "error"])
+def test_microphone_cleanup_precedes_new_recording_from_idle_callback(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, terminal: str
+) -> None:
+    assert rig.core.start_test("", Mock())
+    rig.core.stop_test()
+    monkeypatch.setattr(rig.core, "_on_idle", rig.start)
+    if terminal == "result":
+        microphone_event(rig, "result", text=MARKER, t_ms=310)
+    elif terminal == "error":
+        microphone_event(rig, "error", code="engine-failed", message=MARKER)
+    else:
+        rig.core.cancel_test()
+        microphone_event(rig, "cancelled")
+    assert rig.core.phase is DictationPhase.RECORDING
+    assert rig.recording
+    assert not rig.pill.hidden
+    assert rig.pill.calls[-1] == (PillState.LISTENING, None, None)
+    assert rig.tray.state is TrayState.LISTENING
+    assert rig.commands().count("record.start") == 2
+    assert rig.core.last_text is None
+    assert not rig.pasted
+    assert not rig.stats.events
+
+
+def test_microphone_empty_result_hides_processing_pill(rig: Rig) -> None:
+    updates: list[MicrophoneTestUpdate] = []
+    assert rig.core.start_test("", updates.append)
+    rig.core.stop_test()
+    assert rig.pill.calls[-1] == (PillState.PROCESSING, None, None)
+    microphone_event(rig, "result", text="", t_ms=310)
+    assert updates[-1] == MicrophoneTestUpdate("done", text="", duration_s=0.31)
+    assert rig.pill.hidden
+    assert rig.core.last_text is None
+    assert not rig.pasted
+    assert not rig.stats.events
+
+
+@pytest.mark.parametrize("terminal", ["result", "cancel"])
+def test_microphone_level_callback_cannot_reshow_finished_pill(rig: Rig, terminal: str) -> None:
+    def receive(update: MicrophoneTestUpdate) -> None:
+        if update.peak_dbfs is not None:
+            if terminal == "result":
+                rig.core.stop_test()
+                microphone_event(rig, "result", text=MARKER, t_ms=310)
+            else:
+                rig.core.cancel_test()
+                microphone_event(rig, "cancelled")
+
+    assert rig.core.start_test("", receive)
+    microphone_event(rig, "level", peak_dbfs=-18.0, rms_dbfs=-26.0)
+    state, text, level = rig.pill.calls[1]
+    assert state is PillState.LISTENING
+    assert text is None
+    assert level is not None and level == pytest.approx(0.7)
+    assert rig.pill.hidden
+    assert not rig.core.test_active
+    assert rig.core.phase is DictationPhase.IDLE
+    assert rig.core.last_text is None
+    assert not rig.pasted
+    assert not rig.stats.events
 
 
 @pytest.mark.parametrize("microphone_test", [False, True])
@@ -2494,8 +2611,8 @@ def test_stop_survives_persistent_ui_failures(
     rig.timer(PROCESSING_WATCHDOG_MS)
     assert set_recording.call_count == (2 if microphone_test else 1)
     assert set_state.call_count == 1
-    assert show_state.call_count == (0 if microphone_test else 1)
-    assert len(caplog.records) == (4 if microphone_test else 3)
+    assert show_state.call_count == 1
+    assert len(caplog.records) == (5 if microphone_test else 3)
     assert all(record.exc_info is not None for record in caplog.records)
     assert MARKER not in caplog.text
 
@@ -2516,6 +2633,8 @@ def test_finish_microphone_test_survives_persistent_ui_failures(
     monkeypatch.setattr(rig.core, "_test_callback", callback)
     monkeypatch.setattr(rig.core, "_set_recording", Mock(side_effect=RuntimeError(MARKER)))
     monkeypatch.setattr(rig.tray, "set_state", Mock(side_effect=RuntimeError(MARKER)))
+    hide = Mock(side_effect=RuntimeError(MARKER))
+    monkeypatch.setattr(rig.pill, "hide", hide)
 
     if terminal == "result":
         microphone_event(rig, "result", text=MARKER, t_ms=310)
@@ -2527,7 +2646,8 @@ def test_finish_microphone_test_survives_persistent_ui_failures(
 
     assert not rig.core.test_active
     assert callback.call_count == 1
-    assert len(caplog.records) == 3
+    hide.assert_called_once_with()
+    assert len(caplog.records) == 4
     assert all(record.exc_info is not None for record in caplog.records)
     assert MARKER not in caplog.text
 

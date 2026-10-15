@@ -283,8 +283,8 @@ def test_onboarding_step1_disclosure_and_snapshots(
         if mode == "policy":
             assert "Задано администратором" in texts
         else:
-            assert "Раз в сутки, github.com. Скачивание — только по вашему нажатию." in texts
-            assert "huggingface.co. Скачивание — только по вашему нажатию." in texts
+            assert "Раз в сутки. Скачивание — только по вашему нажатию." in texts
+            assert "Скачивание — только по вашему нажатию." in texts
         image = states.grab(app, window, 900, 588)
         path = states.save_snapshot(
             image, f"onboarding-015-{mode}-{'dark' if dark else 'light'}.png"
@@ -332,19 +332,17 @@ def test_deb_defaults_reach_step1_and_about(app: Any, component: Any, tmp_path: 
 
 
 @pytest.mark.parametrize(
-    "locked_field,editable_label,locked_label,host",
+    "locked_field,editable_label,locked_label",
     [
         (
             "check_app_updates",
             "Проверять обновления моделей",
             "Проверять обновления утилиты",
-            "github.com",
         ),
         (
             "check_model_updates",
             "Проверять обновления утилиты",
             "Проверять обновления моделей",
-            "huggingface.co",
         ),
     ],
 )
@@ -355,7 +353,6 @@ def test_step1_single_policy_lock_allows_other_preference_to_be_disabled(
     locked_field: str,
     editable_label: str,
     locked_label: str,
-    host: str,
     policy_value: bool,
 ) -> None:
     window, _, settings, onboarding, _ = component
@@ -376,9 +373,11 @@ def test_step1_single_policy_lock_allows_other_preference_to_be_disabled(
     assert not editable_row.property("locked") and editable_row.property("rowEnabled")
     assert locked_row.property("locked") and not locked_row.property("rowEnabled")
     expected_sub = (
-        ("Раз в сутки, " if locked_field == "check_app_updates" else "")
-        + host
-        + ". Скачивание — только по вашему нажатию."
+        (
+            "Раз в сутки. Скачивание — только по вашему нажатию."
+            if locked_field == "check_app_updates"
+            else "Скачивание — только по вашему нажатию."
+        )
         if policy_value
         else "Администратор отключил проверку обновлений на этом компьютере."
     )

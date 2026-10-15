@@ -498,13 +498,15 @@ class DictationOrchestrator:
     def _finish_test(self, update: MicrophoneTestUpdate) -> None:
         callback, self._test_callback = self._test_callback, None
         self._cancel_timers()
-        self._change_phase(DictationPhase.IDLE)
         self._safe_ui(
             lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
         )
         self._safe_ui(
             lambda: self._tray.set_state(TrayState.IDLE), "диктовка: не удалось обновить трей"
         )
+        self._safe_ui(self._pill.hide, "диктовка: не удалось скрыть пилюлю")
+        # on_idle может синхронно начать новую запись: её индикаторы уже не трогаем.
+        self._change_phase(DictationPhase.IDLE)
         if callback is not None:
             self._safe_ui(
                 lambda: callback(update), "диктовка: не удалось обновить экран проверки микрофона"
@@ -647,11 +649,10 @@ class DictationOrchestrator:
             return
         if self._test_callback is not None:
             self._later(TEST_RECORD_LIMIT_MS, self.stop_test)
-        if not self.test_active:
-            if self._publication_allowed():
-                self._pill.show_state(
-                    PillState.COMMAND_LISTENING if self.mode == "command" else PillState.LISTENING
-                )
+        if self._publication_allowed():
+            self._pill.show_state(
+                PillState.COMMAND_LISTENING if self.mode == "command" else PillState.LISTENING
+            )
         if self.mode == "command":
             self._tray.set_state(TrayState.LISTENING, tooltip="Слушаю команду")
         else:
@@ -721,11 +722,7 @@ class DictationOrchestrator:
         self._safe_ui(
             lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
         )
-        if (
-            not self.test_active
-            and self._publication_allowed()
-            and not self._device_pill_held(PillState.PROCESSING)
-        ):
+        if self._publication_allowed() and not self._device_pill_held(PillState.PROCESSING):
             self._safe_ui(
                 lambda: self._pill.show_state(PillState.PROCESSING),
                 "диктовка: не удалось обновить пилюлю",
@@ -851,16 +848,15 @@ class DictationOrchestrator:
                 except (ValueError, OverflowError):
                     self._log.debug("диктовка: некорректное поле peak_dbfs")
                     return
+                if self._publication_allowed():
+                    self._pill.show_state(
+                        PillState.COMMAND_LISTENING
+                        if self.mode == "command"
+                        else PillState.LISTENING,
+                        level=level,
+                    )
                 if self._test_callback is not None:
                     self._test_callback(MicrophoneTestUpdate("recording", peak_dbfs=float(peak)))
-                else:
-                    if self._publication_allowed():
-                        self._pill.show_state(
-                            PillState.COMMAND_LISTENING
-                            if self.mode == "command"
-                            else PillState.LISTENING,
-                            level=level,
-                        )
             elif kind == "silent":
                 if self.test_active:
                     self._stop()
@@ -873,9 +869,8 @@ class DictationOrchestrator:
                         )
                     self._announce_silent()
             elif kind == "record.limit":
-                if not self.test_active:
-                    if self._publication_allowed():
-                        self._pill.show_state(PillState.LIMIT)
+                if self._publication_allowed():
+                    self._pill.show_state(PillState.LIMIT)
                 self._stop(recording_stopped=True)
 
     def _device_change_fields(self, event: dict[str, Any]) -> tuple[str | None, str]:
@@ -1514,9 +1509,10 @@ class DictationOrchestrator:
             actions.append(lambda: callback(MicrophoneTestUpdate("idle")))
         if active:
             actions.extend((self._hotkey_cancel, self._send_cancel))
-        actions.extend((lambda: self._set_recording(False), self._hotkey_done, self._pill.hide))
+        actions.extend((lambda: self._set_recording(False), self._hotkey_done))
         for action in actions:
             try:
                 action()
             except Exception:
                 self._log.warning("диктовка: ошибка при завершении")
+        self._safe_ui(self._pill.hide, "диктовка: не удалось скрыть пилюлю")

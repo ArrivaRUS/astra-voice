@@ -83,7 +83,9 @@ def test_register_writes_current_menu_icons_and_is_idempotent(
     check.assert_called_with(launcher)
     menu = home / suffix / "applications/astra-voice.desktop"
     data = menu.read_bytes()
-    assert data == userinstall.menu_entry_bytes(launcher, VERSION)
+    icon = home / suffix / "icons/hicolor/48x48/apps/astravoice.png"
+    assert data == userinstall.menu_entry_bytes(launcher, VERSION, icon)
+    assert f"Icon={icon}\n".encode() in data
     assert f"Exec={autostart._exec_argument(str(launcher))}\n".encode() in data
     assert (b"TryExec=" in data) == (suffix == "data")
     assert b"X-AppImage-Version=0.2.0\n" in data
@@ -173,8 +175,170 @@ def test_register_replaces_our_old_menu(home: Path, monkeypatch: pytest.MonkeyPa
     put(menu_path(home), userinstall.menu_entry_bytes(Path("/old"), "old"))
     assert userinstall.register().menu == "written"
     assert menu_path(home).read_bytes() == userinstall.menu_entry_bytes(
-        paths.appimage_current_apprun(), VERSION
+        paths.appimage_current_apprun(),
+        VERSION,
+        home / "data/icons/hicolor/48x48/apps/astravoice.png",
     )
+
+
+@pytest.mark.parametrize("sizes", [(48, 128, 256), (64, 512)])
+def test_menu_uses_largest_numeric_square_png(
+    home: Path, monkeypatch: pytest.MonkeyPatch, sizes: tuple[int, ...]
+) -> None:
+    copy = installed(monkeypatch)
+    source = copy / "usr/share/icons/hicolor"
+    shutil.rmtree(source)
+    for size in sizes:
+        put(source / f"{size}x{size}/apps/astravoice.png", f"png {size}".encode())
+    for invalid_size in ("scalable", "1024x512", "larger", "2048x2048extra", "０x０", "0x0"):
+        put(source / invalid_size / "apps/astravoice.png", b"not a positive square size")
+    put(source / "scalable/apps/astravoice.svg", b"svg")
+
+    assert userinstall.register().menu == "written"
+
+    largest = home / f"data/icons/hicolor/{max(sizes)}x{max(sizes)}/apps/astravoice.png"
+    assert f"Icon={largest}\n".encode() in menu_path(home).read_bytes()
+    assert largest.read_bytes() == f"png {max(sizes)}".encode()
+
+
+@pytest.mark.parametrize("svg_only", [False, True])
+def test_menu_without_png_uses_icon_name(
+    home: Path, monkeypatch: pytest.MonkeyPatch, svg_only: bool
+) -> None:
+    copy = installed(monkeypatch)
+    source = copy / "usr/share/icons/hicolor"
+    shutil.rmtree(source)
+    if svg_only:
+        put(source / "scalable/apps/astravoice.svg", b"svg")
+
+    assert userinstall.register().menu == "written"
+    assert b"\nIcon=astravoice\n" in menu_path(home).read_bytes()
+    assert userinstall.register().menu == "unchanged"
+
+
+def test_menu_reregistration_selects_new_larger_png(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy = installed(monkeypatch)
+    userinstall.register()
+    previous = menu_path(home).read_bytes()
+    assert b"/48x48/apps/astravoice.png\n" in previous
+    put(copy / "usr/share/icons/hicolor/256x256/apps/astravoice.png", b"larger png")
+
+    assert userinstall.register().menu == "written"
+    largest = home / "data/icons/hicolor/256x256/apps/astravoice.png"
+    assert f"Icon={largest}\n".encode() in menu_path(home).read_bytes()
+    assert userinstall.register().menu == "unchanged"
+
+
+def test_menu_is_written_after_owned_png_exists(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy = installed(monkeypatch)
+    source = put(copy / "usr/share/icons/hicolor/256x256/apps/astravoice.png", b"larger png")
+    expected = home / "data/icons/hicolor/256x256/apps/astravoice.png"
+    write = userinstall._write_desktop_file
+    checked: list[Path] = []
+
+    def check_icon_before_menu(path: Path, data: bytes) -> bool:
+        if path == menu_path(home):
+            assert f"Icon={expected}\n".encode() in data
+            assert stat.S_ISREG(expected.lstat().st_mode)
+            assert expected.read_bytes() == source.read_bytes()
+            checked.append(expected)
+        return write(path, data)
+
+    monkeypatch.setattr(userinstall, "_write_desktop_file", check_icon_before_menu)
+    userinstall.register()
+    assert checked == [expected]
+
+
+@pytest.mark.parametrize("unsafe", ["\nIcon=foreign", "\r", "\t", "\x01", "\x7f", "\x85", "\\n"])
+def test_menu_unsafe_icon_path_falls_back(
+    home: Path, monkeypatch: pytest.MonkeyPatch, unsafe: str
+) -> None:
+    installed(monkeypatch)
+    icons = home / f"unsafe{unsafe}" / "icons/hicolor"
+    monkeypatch.setattr(userinstall, "_desktop_paths", lambda: (menu_path(home), icons))
+
+    assert userinstall.register().menu == "written"
+    data = menu_path(home).read_bytes()
+    assert b"\nIcon=astravoice\n" in data
+    assert str(icons).encode() not in data
+    assert (icons / "48x48/apps/astravoice.png").is_file()
+
+
+@pytest.mark.parametrize("path", ["relative/icon.png", "~/icon.png", "$HOME/icon.png"])
+def test_menu_icon_does_not_expand_relative_path(path: str) -> None:
+    assert b"\nIcon=astravoice\n" in userinstall.menu_entry_bytes(
+        Path("/installed/AppRun"), VERSION, Path(path)
+    )
+
+
+@pytest.mark.parametrize("kind", ["foreign", "symlink", "directory", "size-link", "apps-link"])
+def test_menu_does_not_select_foreign_or_linked_png(
+    home: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    copy = installed(monkeypatch)
+    source = copy / "usr/share/icons/hicolor/512x512/apps/astravoice.png"
+    if kind != "foreign":
+        put(source, b"owned larger png")
+    icons = home / "data/icons/hicolor"
+    candidate = icons / "512x512/apps/astravoice.png"
+    outside = put(home / "outside/apps/astravoice.png", b"owned larger png")
+    candidate.parent.mkdir(parents=True)
+    if kind == "foreign":
+        candidate.write_bytes(b"foreign larger png")
+    elif kind == "symlink":
+        candidate.symlink_to(outside)
+    elif kind == "directory":
+        candidate.mkdir()
+    else:
+        directory = candidate.parent.parent if kind == "size-link" else candidate.parent
+        shutil.rmtree(directory)
+        directory.symlink_to(outside.parent.parent if kind == "size-link" else outside.parent)
+    before = tree_snapshot(home / "outside")
+
+    userinstall.register()
+
+    small = icons / "48x48/apps/astravoice.png"
+    assert f"Icon={small}\n".encode() in menu_path(home).read_bytes()
+    assert tree_snapshot(home / "outside") == before
+    if kind == "foreign":
+        assert candidate.read_bytes() == b"foreign larger png"
+
+
+def test_menu_skips_byte_mutated_owned_png(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    copy = installed(monkeypatch)
+    put(copy / "usr/share/icons/hicolor/512x512/apps/astravoice.png", b"owned larger png")
+    userinstall.register()
+    icons = home / "data/icons/hicolor"
+    put(icons / "512x512/apps/astravoice.png", b"changed by user")
+    # A failed refresh must not make a formerly owned, modified file eligible.
+    monkeypatch.setattr(userinstall, "_copy_icons", Mock())
+
+    assert userinstall.register().menu == "written"
+    assert f"Icon={icons / '48x48/apps/astravoice.png'}\n".encode() in menu_path(home).read_bytes()
+
+
+def test_menu_copy_failure_without_png_falls_back(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installed(monkeypatch)
+    write = userinstall._write_desktop_file
+
+    def fail_icon(path: Path, data: bytes) -> bool:
+        if path.suffix in (".png", ".svg"):
+            raise OSError("icon copy failed")
+        return write(path, data)
+
+    monkeypatch.setattr(userinstall, "_write_desktop_file", fail_icon)
+
+    result = userinstall.register()
+    assert result.menu == "written"
+    assert not result.icons_written
+    assert b"\nIcon=astravoice\n" in menu_path(home).read_bytes()
+    assert not (home / "data/icons/hicolor/48x48/apps/astravoice.png").exists()
 
 
 @pytest.mark.parametrize("ours", [True, False])
@@ -215,6 +379,28 @@ def test_icon_sources_never_follow_symlinks(
     assert (tree_snapshot(outside) if outside.is_dir() else outside.read_bytes()) == before
 
 
+def test_internal_unregister_removes_absolute_menu_and_owned_pngs(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copy = installed(monkeypatch)
+    put(copy / "usr/share/icons/hicolor/256x256/apps/astravoice.png", b"owned 256 png")
+    userinstall.register()
+    icons = home / "data/icons/hicolor"
+    small = icons / "48x48/apps/astravoice.png"
+    large = icons / "256x256/apps/astravoice.png"
+    foreign = put(icons / "512x512/apps/astravoice.png", b"foreign png")
+    assert small.is_file() and large.is_file()
+    assert f"Icon={large}\n".encode() in menu_path(home).read_bytes()
+
+    result = userinstall._unregister(deb_executable=home / "missing")
+
+    assert result.menu
+    assert small in result.icons and large in result.icons
+    assert not menu_path(home).exists()
+    assert all(not icon.exists() for icon in result.icons)
+    assert foreign.read_bytes() == b"foreign png"
+
+
 @pytest.mark.parametrize("deb", ["executable", "missing", "not-executable"])
 def test_unregister_removes_ours_and_restores_deb(
     home: Path, monkeypatch: pytest.MonkeyPatch, deb: str
@@ -226,6 +412,7 @@ def test_unregister_removes_ours_and_restores_deb(
     )
     userinstall.register()
     icons = home / "data/icons/hicolor"
+    assert f"Icon={icons / '48x48/apps/astravoice.png'}\n".encode() in menu_path(home).read_bytes()
     foreign = put(icons / "48x48/apps/other.png", b"other")
     tray = put(icons / "22x22/status/astravoice-tray-idle.svg", b"tray")
     directory = icons / "64x64/apps/astravoice.png"
@@ -240,6 +427,7 @@ def test_unregister_removes_ours_and_restores_deb(
     result = userinstall.unregister(deb_executable=executable)
     assert result.menu and result.autostart
     assert len(result.icons) == 2
+    assert all(not icon.exists() for icon in result.icons)
     assert not menu_path(home).exists()
     assert directory.is_dir() and directory.parent.is_dir()
     assert foreign.read_bytes() == b"other"

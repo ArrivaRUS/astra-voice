@@ -26,7 +26,7 @@ Item {
     readonly property string testText: root.bridge ? root.bridge.testText : ""
     readonly property string testState: root.bridge ? root.bridge.testState : "idle"
     readonly property string testMessage: root.bridge ? root.bridge.testMessage : ""
-    readonly property bool silent: level <= 0.02 // Порог «тишина» по заданию шага 4.
+    readonly property bool levelSilent: root.bridge ? root.bridge.levelSilent : false
     readonly property bool testing: testState === "preparing" || testState === "recording" || testState === "processing"
     readonly property int selectedDeviceIndex: deviceIndex(device)
     readonly property var selectedDevice: selectedDeviceIndex >= 0 ? devices[selectedDeviceIndex] : null
@@ -219,7 +219,7 @@ Item {
 
             LevelMeter {
                 level: root.level
-                silent: root.silent
+                silent: root.level <= 0.02
                 Layout.alignment: Qt.AlignVCenter
             }
 
@@ -232,7 +232,7 @@ Item {
                     width: parent.width
                     textFormat: Text.PlainText
                     text: root.levelState === "error" || root.levelStopped ? root.levelMessage
-                        : root.silent ? qsTr("Пока тишина") : qsTr("Слышим вас")
+                        : root.levelSilent ? qsTr("Пока тишина") : qsTr("Слышим вас")
                     color: root.levelState === "error" ? Theme.dangerInk : Theme.fg
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontSettingLabelSize
@@ -246,7 +246,8 @@ Item {
                     width: parent.width
                     textFormat: Text.PlainText
                     text: root.levelState === "listening" && root.peak !== ""
-                        ? qsTr("Пик %1 · уровень в норме").arg(root.peak) : ""
+                        ? (root.levelSilent ? qsTr("Пик %1")
+                            : qsTr("Пик %1 · уровень в норме")).arg(root.peak) : ""
                     visible: text !== ""
                     height: visible ? implicitHeight : 0
                     color: Theme.fgMuted
@@ -272,10 +273,17 @@ Item {
 
     NoteBanner {
         id: silenceNote
-        visible: root.levelState === "listening" && root.silent
+        visible: root.levelState === "listening" && root.levelSilent
         y: levelBox.y + levelBox.height + (visible ? 11 : 0)
         width: root.width
         height: visible ? implicitHeight : 0
+        clip: true
+        Behavior on height {
+            NumberAnimation { duration: Theme.durationEnter; easing.type: Easing.InOutQuad }
+        }
+        Behavior on y {
+            NumberAnimation { duration: Theme.durationEnter; easing.type: Easing.InOutQuad }
+        }
         variant: "warn"
         iconName: "alert"
         title: qsTr("Микрофон молчит")

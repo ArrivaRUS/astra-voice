@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from typing import Any, Protocol, cast
 
@@ -50,7 +51,13 @@ from astra_voice.ui.model_downloads import (
     ModelDownloads,
     ModelPort,
 )
-from astra_voice.worker.audio import AudioDevice, AudioError, default_device, list_devices
+from astra_voice.worker.audio import (
+    SILENCE_HOLD_S,
+    AudioDevice,
+    AudioError,
+    default_device,
+    list_devices,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1587,6 +1594,7 @@ class OnboardingController(QObject):
     levelStateChanged = pyqtSignal()
     levelMessageChanged = pyqtSignal()
     levelChanged = pyqtSignal()
+    levelSilentChanged = pyqtSignal()
     peakChanged = pyqtSignal()
     testPhraseChanged = pyqtSignal()
     testStateChanged = pyqtSignal()
@@ -1622,6 +1630,7 @@ class OnboardingController(QObject):
             else lambda url: open_external(url.toString(QUrl.FullyEncoded))
         )
         self._device_provider = device_provider
+        self._clock = clock
         bridge._refresh_devices(device_provider)
         self._owns_downloads = downloads is None
         self._downloads = downloads if downloads is not None else ModelDownloads(model, clock=clock)
@@ -1665,6 +1674,9 @@ class OnboardingController(QObject):
         self._level_stopping = False
         self._test_after_level = False
         self._level = 0.0
+        self._level_silent = False
+        self._level_listening_since: float | None = None
+        self._level_window: deque[tuple[float, float]] = deque()
         self._peak = ""
         self._test_state = "idle"
         self._test_text = ""
@@ -1673,6 +1685,13 @@ class OnboardingController(QObject):
         self._test_epoch = 0
         step = settings.extra.get("onboarding_step")
         self._step = step if type(step) is int and 1 <= step <= 5 else 1
+
+        def preselect_on_model_step() -> None:
+            if self._step == 2:
+                self._downloads.preselect_recommended()
+
+        self.stepChanged.connect(preselect_on_model_step)
+        preselect_on_model_step()
         self._capture = capture if capture is not None else bridge.capture
         # События окна принимает один фильтр; мастер очищает только свою пробу.
         self._capture.windowEvent.connect(self.eventFilter, Qt.DirectConnection)
@@ -2014,7 +2033,7 @@ class OnboardingController(QObject):
         return self._level_message
 
     def _level_updated(self, update: MicrophoneLevelUpdate) -> None:
-        old = (self._level_state, self._level_message, self._level, self._peak)
+        old = (self._level_state, self._level_message, self._level, self._peak, self._level_silent)
         self._level_state = update.state
         self._level_message = update.message
         if update.state == "listening" and update.peak_dbfs is not None:
@@ -2023,9 +2042,27 @@ class OnboardingController(QObject):
                 self._peak = f"{update.peak_dbfs:.0f} дБ".replace("-", "−")
         elif update.state != "listening":
             self._level = 0.0
-        new = (self._level_state, self._level_message, self._level, self._peak)
+        if update.state == "listening":
+            now = self._clock()
+            if self._level_listening_since is None:
+                self._level_listening_since = now
+            self._level_window.append((now, self._level))
+            while self._level_window and self._level_window[0][0] <= now - SILENCE_HOLD_S:
+                self._level_window.popleft()
+            # Короткие паузы в речи не меняют подсказку. Уже показанную тишину
+            # снимает только отчётливый сигнал, чтобы шум у порога не мигал.
+            if self._level_silent:
+                if self._level > 0.05:
+                    self._level_silent = False
+            elif now - self._level_listening_since >= SILENCE_HOLD_S:
+                self._level_silent = max(level for _, level in self._level_window) <= 0.02
+        else:
+            self._level_listening_since = None
+            self._level_window.clear()
+            self._level_silent = False
+        new = (self._level_state, self._level_message, self._level, self._peak, self._level_silent)
         for name, before, after in zip(
-            ("levelState", "levelMessage", "level", "peak"), old, new, strict=True
+            ("levelState", "levelMessage", "level", "peak", "levelSilent"), old, new, strict=True
         ):
             if before != after:
                 getattr(self, name + "Changed").emit()
@@ -2099,6 +2136,10 @@ class OnboardingController(QObject):
     @pyqtProperty(float, notify=levelChanged)
     def level(self) -> float:
         return self._level
+
+    @pyqtProperty(bool, notify=levelSilentChanged)
+    def levelSilent(self) -> bool:  # noqa: N802
+        return self._level_silent
 
     @pyqtProperty(str, notify=peakChanged)
     def peak(self) -> str:
