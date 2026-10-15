@@ -204,6 +204,15 @@ class HotkeyFsm:
         if self._limit_deadline is not None and now >= self._limit_deadline:
             self.stop(now, "limit")
 
+    def restart_limit(self, now: float | None) -> None:
+        """Предел длительности фразы — от настоящего старта записи (US-2.6).
+
+        Нажатие при выгруженной модели ждёт её загрузки: ``None`` снимает предел
+        на время ожидания, время старта записи ставит полный предел заново.
+        """
+        if self.state == HotkeyState.RECORDING:
+            self._limit_deadline = None if now is None else now + RECORD_LIMIT_S
+
 
 class HotkeyBackend(Protocol):
     """Захваты и очередь клавиш; ожидание пары автоповтора ограничено S4.

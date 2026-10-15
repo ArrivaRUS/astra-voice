@@ -351,6 +351,8 @@ class DictationOrchestrator:
         self._closed = False
         self._suspended = False
         self._queue: deque[tuple[str, Callable[[], None]]] = deque()
+        # Окно-цель, зафиксированное до старта фразы (US-2.6: нажатие ждало загрузки модели).
+        self._pinned_window: tuple[int | None] | None = None
         self._timer_serial = 0
         self._test_callback: TestCallback | None = None
         self._level_callback: LevelCallback | None = None
@@ -881,10 +883,29 @@ class DictationOrchestrator:
         with self._within(self._new_context(queued=True)):
             self._start_phrase(test_device)
 
+    @contextmanager
+    def pinned_window(self, window: int | None) -> Iterator[None]:
+        """Фраза, начатая внутри блока, вставляется в окно на момент нажатия.
+
+        Нажатие при выгруженной модели (US-2.6) стартует запись только после её
+        загрузки; фокус за это время мог уйти. Окно-цель — окно на момент нажатия,
+        как у очереди фраз (окно на старте фразы): сменилось — штатная ветка
+        «окно сменилось», текст в буфере.
+        """
+        self._pinned_window = (window,)
+        try:
+            yield
+        finally:
+            self._pinned_window = None
+
     def _start_phrase(self, test_device: str | None) -> None:
-        self._target_window = (
-            None if self.test_active or self.mode == "command" else self._active_window()
-        )
+        pinned, self._pinned_window = self._pinned_window, None
+        if self.test_active or self.mode == "command":
+            self._target_window = None
+        elif pinned is not None:
+            self._target_window = pinned[0]
+        else:
+            self._target_window = self._active_window()
         self._utterance_id = uuid4().hex
         self._sync_device_generation()
         self._worker_generation = self._generation()

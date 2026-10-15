@@ -186,7 +186,7 @@ ApplicationWindow {
 
                 Text {
                     textFormat: Text.PlainText
-                    text: window.currentSection.key === "advanced" ? qsTr("Голосовые команды Astra Cowork")
+                    text: window.currentSection.key === "advanced" ? qsTr("Голосовые команды Astra Cowork и память")
                         : window.currentSection.key === "network" ? qsTr("Сетевые проверки и обновления программы")
                         : window.currentSection.subtitle
                     color: Theme.fgMuted

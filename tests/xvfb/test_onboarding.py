@@ -2435,7 +2435,7 @@ def test_menu_and_show_section_switch_real_sections(onboarding_app: Any, dark: b
                 else description["title"]
             )
             subtitle = (
-                "Голосовые команды Astra Cowork"
+                "Голосовые команды Astra Cowork и память"
                 if description["key"] == "advanced"
                 else description["subtitle"]
             )

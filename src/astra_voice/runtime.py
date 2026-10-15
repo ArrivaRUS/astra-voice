@@ -284,6 +284,10 @@ class DictationRuntime(QObject):
         # загружает модель в этот воркер; запись начинается, когда модель готова.
         self._model_parked = False
         self._wake_dictation = False
+        # Окно-цель на момент нажатия, разбудившего модель: запись стартует позже (US-2.6).
+        self._wake_window: tuple[int | None] | None = None
+        # Поколение воркера, в которое нажатие грузит выгруженную модель.
+        self._wake_generation: int | None = None
         self._idle_unload_timer: QTimer | None = None
         self._last_activity = monotonic()
         try:
@@ -624,7 +628,9 @@ class DictationRuntime(QObject):
             return False
         epoch = self._input_epoch
         button = self.settings.command_mouse_button
-        trusted = self._model_parked or self._command_model_trusted(capture=identity)
+        # Выгруженной модели доверяем без проверки загруженного поколения, но не мимо
+        # отзыва, ручного каталога модели и неизвестного списка отозванных версий.
+        trusted = self._command_model_trusted(capture=identity, parked=self._model_parked)
         current = self._command_snapshot()
         return bool(
             trusted
@@ -1371,7 +1377,16 @@ class DictationRuntime(QObject):
             return
         self.orchestrator.on_hotkey_state(state, reason, mode="command")
 
-    def _command_model_trusted(self, *, capture: tuple[int, object] | None = None) -> bool:
+    def _command_model_trusted(
+        self, *, capture: tuple[int, object] | None = None, parked: bool = False
+    ) -> bool:
+        """Доверие модели для команд: статичное и «загружено то же поколение».
+
+        Статичное — запись модели в порядке и совпадает с запросом, ревизия не
+        отозвана, нет ручного model_dir, список отзыва известен. ``parked`` —
+        модель выгружена по простою (US-2.6): проверяется только статичная часть,
+        поколение с загруженной моделью проверит следующая команда после загрузки.
+        """
         # Snapshot scalar identity before file I/O, then verify it again afterwards:
         # the worker can be replaced or a manual path selected while current() reads.
         request = dict(self._model_load_request or {})
@@ -1381,19 +1396,25 @@ class DictationRuntime(QObject):
         revoked = self._revoked_check
 
         def unchanged() -> bool:
-            return bool(
+            static = bool(
                 request
-                and not getattr(self, "_loading_model", False)
                 and self.settings.to_dict().get("model_dir") is None
                 and self.model_store is store
                 and store is not None
                 and not self.revocation_unknown
                 and self._revoked_check is revoked
                 and self._model_load_request == request
-                and self._model_load_generation == generation
                 and self.supervisor.generation == generation
                 and expected == (generation, request)
                 and (capture is not None or self._command_capture_model == expected)
+            )
+            if not static:
+                return False
+            if parked:
+                return bool(self._model_parked)
+            return bool(
+                not getattr(self, "_loading_model", False)
+                and self._model_load_generation == generation
             )
 
         if not unchanged() or store is None or revoked is None:
@@ -1667,6 +1688,11 @@ class DictationRuntime(QObject):
         self._preparing_timer = self.schedule(PREPARING_WATCHDOG_MS, self._preparing_watchdog)
         callback(MicrophoneTestUpdate("preparing", message=TEST_PREPARING))
         if self._pending_test is not None and (not self._loading_model or not same_model):
+            if self._model_parked:
+                # Модель выгружена по простою: воркер уже запущен, грузим в него.
+                if not self._wake_model():
+                    self._fail_pending_test()
+                return True
             try:
                 self.restart_worker(wait_for_model=True)
             except Exception:
@@ -1769,6 +1795,9 @@ class DictationRuntime(QObject):
         self._switch_loaded_event = None
         if candidate is not None:
             self._cleanup("временный воркер", candidate.stop)
+        if result != "ok" and getattr(self, "_wake_dictation", False):
+            # Нажатие ждало новую модель: она не пришла, клавиша не залипает.
+            self._drop_wake()
         if self.on_switch_finished is not None and not self._closed:
             self.on_switch_finished(result)
 
@@ -1847,6 +1876,12 @@ class DictationRuntime(QObject):
             log.warning("Не удалось подготовить переключение модели")
             self._finish_switch("failed")
             return
+        if self._model_parked and not pause:
+            # Модель выгружена по простою: воркер без модели заменяется новым с паузой,
+            # а не держит рядом временный — иначе нажатие грузило бы прежнюю модель
+            # параллельно с новой (две модели в памяти).
+            log.info("смена модели при выгруженной модели — с паузой")
+            pause = True
         if not pause:
             try:
                 enough_memory = self.can_switch_without_pause(min_ram_mb)
@@ -1936,7 +1971,7 @@ class DictationRuntime(QObject):
 
     def _fail_pending_test(self) -> None:
         # Загрузка не удалась: запись, ждавшая пробуждения модели, тоже не начнётся.
-        self._wake_dictation = False
+        self._drop_wake()
         self._cancel_preparing_timer()
         pending, self._pending_test = self._pending_test, None
         if pending is not None:
@@ -1991,7 +2026,8 @@ class DictationRuntime(QObject):
             self._cancel_idle_unload()
         if not retry_selfcheck:
             # Запись после пробуждения ждёт только автоматический повтор самопроверки.
-            self._wake_dictation = False
+            self._drop_wake()
+            self._wake_generation = None
         self._stop_mouse("model")
         self._invalidate_mouse_capture()
         if self._switch_active() and not (_for_switch or retry_selfcheck):
@@ -2022,8 +2058,12 @@ class DictationRuntime(QObject):
             self._revoked_notified = True
             notify.notify_model_revoked()
 
-    def _load_model(self) -> None:
-        """Загружает настроенную модель при каждом запуске нового воркера."""
+    def _load_model(self, *, wake: bool = False) -> None:
+        """Загружает настроенную модель при каждом запуске нового воркера.
+
+        wake — загрузку начал жест пользователя при выгруженной модели (US-2.6):
+        отсутствие модели в настройках тогда показывается пилюлей, а не молча.
+        """
         if self._appimage_removal_reserved:
             return
         if self._model_parked:
@@ -2062,6 +2102,10 @@ class DictationRuntime(QObject):
             log.info("модель в настройках не указана")
             if self._selfcheck == "retrying":
                 self._finish_selfcheck("load-failed")
+                return
+            if wake and self.orchestrator.phase == DictationPhase.IDLE:
+                if self._command_publication_allowed():
+                    self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
             return
         try:
             ipc.encode(request)
@@ -2133,16 +2177,28 @@ class DictationRuntime(QObject):
         self._loading_model = False
         self._model_load_failures = 0
         wake, self._wake_dictation = self._wake_dictation, False
-        if (
+        window, self._wake_window = self._wake_window, None
+        self._wake_generation = None
+        autostart = (
             wake
             and self.orchestrator.phase == DictationPhase.IDLE
             and self.hotkey.fsm.state == HotkeyState.RECORDING
-        ):
+        )
+        if autostart:
             # Нажатие разбудило модель, выгруженную по простою, и запись ещё не
-            # отпущена: она начинается сейчас, без второго нажатия.
-            self._on_hotkey_state(HotkeyState.RECORDING, "press")
+            # отпущена: она начинается сейчас, без второго нажатия. Предел длительности
+            # — от этого старта, окно-цель — на момент нажатия.
+            self.hotkey.fsm.restart_limit(monotonic())
+            if window is None:
+                self._on_hotkey_state(HotkeyState.RECORDING, "press")
+            else:
+                with self.orchestrator.pinned_window(window[0]):
+                    self._on_hotkey_state(HotkeyState.RECORDING, "press")
         if self.orchestrator.phase == DictationPhase.IDLE:
-            # Нажатие во время проверки могло оставить автомат в PROCESSING.
+            # Фаза IDLE после автостарта — только молчаливый отказ нажатию: провал
+            # записи с пилюлей ошибки переводит фразу в FINISHING и сюда не попадает,
+            # а «Загружаю модель…» прячется. Нажатие во время проверки могло оставить
+            # автомат в PROCESSING.
             self.hotkey.fsm.escape(monotonic())
             self.pill.hide()
             self.tray.set_state(TrayState.NOKEY if self._regrab_timer else TrayState.IDLE)
@@ -2373,6 +2429,11 @@ class DictationRuntime(QObject):
             ):
                 if not self._fail_switch():
                     self._loading_model = False
+                    if self._wake_generation == self.supervisor.generation:
+                        # Пробуждение не удалось: воркер по-прежнему без модели, и
+                        # следующее нажатие снова загружает её, а не шлёт запись.
+                        self._model_parked = True
+                    self._wake_generation = None
                     self._fail_pending_test()
                     self._model_load_failures += 1
                     if self._selfcheck == "retrying":
@@ -2418,6 +2479,9 @@ class DictationRuntime(QObject):
                 if self._command_publication_allowed():
                     self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
             return
+        if not self._closed and self._model_parked and state == HotkeyState.RECORDING:
+            self._wake_for_hotkey()
+            return
         if (
             not self._closed
             and state == HotkeyState.RECORDING
@@ -2430,12 +2494,6 @@ class DictationRuntime(QObject):
             self._model_load_failures = 0
             self._model_load_generation = None
             self._load_model()
-            return
-        if not self._closed and self._model_parked and state == HotkeyState.RECORDING:
-            log.info("хоткей: модель выгружена по простою — загружаю, запись начнётся после")
-            self._wake_model()
-            # Ошибку загрузки показал _load_model; запись ждёт только идущей загрузки.
-            self._wake_dictation = self._loading_model
             return
         if (
             not self._closed
@@ -2642,14 +2700,70 @@ class DictationRuntime(QObject):
         except Exception:
             log.warning("Не удалось выгрузить модель из памяти")
 
-    def _wake_model(self) -> None:
-        """Загружает модель, выгруженную по простою, в уже запущенный воркер."""
-        if not self._model_parked or self._closed:
-            return
+    def _wake_model(self) -> bool:
+        """Загружает модель, выгруженную по простою, в уже запущенный воркер.
+
+        True — загрузка идёт. Не начавшаяся загрузка (отзыв, модель не выбрана,
+        неверные параметры, сбой отправки; ошибку показал _load_model) оставляет
+        модель выгруженной: следующее нажатие пробует снова, а не шлёт запись
+        воркеру без модели. Во время смены модели прежнюю не будим: новая уже
+        грузится, а двум моделям в памяти не место.
+        """
+        if (
+            not self._model_parked
+            or self._closed
+            or self._appimage_removal_reserved
+            or self._switch_active()
+        ):
+            return False
         self._model_parked = False
         self._last_activity = monotonic()
+        # Жест пользователя — новая попытка: прежняя неудача пробуждения в этом же
+        # воркере её не запрещает.
+        self._model_load_failures = 0
+        self._model_load_generation = None
         log.info("загружаю модель после выгрузки по простою")
-        self._load_model()
+        self._load_model(wake=True)
+        if not self._loading_model:
+            self._model_parked = True
+            return False
+        self._wake_generation = self.supervisor.generation
+        return True
+
+    def _wake_for_hotkey(self) -> None:
+        """Нажатие хоткея при выгруженной модели: запись начнётся, когда она готова."""
+        try:
+            window: tuple[int | None] | None = (self.x11.target_window(),)
+        except Exception:
+            # Окно не узнать — его определит старт записи, как без выгрузки.
+            window = None
+        if self._switch_active():
+            log.info("хоткей: модель выгружена, идёт смена модели — запись начнётся после неё")
+            if self.orchestrator.phase == DictationPhase.IDLE:
+                if self._command_publication_allowed():
+                    self.pill.show_state(PillState.LOADING_MODEL)
+        else:
+            log.info("хоткей: модель выгружена по простою — загружаю, запись начнётся после")
+            if not self._wake_model():
+                # Загрузка не началась, ошибку показал _load_model: клавиша не залипает.
+                self.hotkey.fsm.escape(monotonic())
+                return
+        self._wake_dictation = True
+        self._wake_window = window
+        # Предел длительности фразы считается от настоящего старта записи.
+        self.hotkey.fsm.restart_limit(None)
+
+    def _drop_wake(self) -> None:
+        """Запись, ждавшая загрузки модели, не начнётся: автомат клавиши не залипает."""
+        wake, self._wake_dictation = self._wake_dictation, False
+        self._wake_window = None
+        if (
+            wake
+            and not self._closed
+            and self.orchestrator.phase == DictationPhase.IDLE
+            and self.hotkey.fsm.state is not HotkeyState.IDLE
+        ):
+            self.hotkey.fsm.escape(monotonic())
 
     def apply_hotkey(self, combo: str, mode: str) -> str:
         """Освобождает прежний хоткей и захватывает сохранённый без перезапуска."""

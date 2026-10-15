@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from typing import Any, cast
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 from test_command_mouse_runtime import MouseRuntimeRig
@@ -20,7 +20,13 @@ from astra_voice.core.settings import MODEL_UNLOAD_MINUTES, Settings, from_dict
 from astra_voice.platform.hotkey import HotkeyState
 from astra_voice.platform.mouse_button import MouseHoldState
 from astra_voice.ui.bridges import SettingsApply, SettingsBridge
-from astra_voice.ui.pill import ERROR_MODEL_LOAD_FAILED, PillState
+from astra_voice.ui.pill import (
+    ERROR_MODEL_LOAD_FAILED,
+    ERROR_MODEL_NOT_LOADED,
+    ERROR_MODEL_REVOKED,
+    ERROR_RECOGNITION_FAILED,
+    PillState,
+)
 
 pytestmark = pytest.mark.unit
 FIVE_MIN_S = 5 * 60.0
@@ -274,11 +280,34 @@ def test_setting_changes_apply_on_the_fly(monkeypatch: pytest.MonkeyPatch) -> No
 def test_microphone_test_while_unloaded_loads_model(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = make_rig(monkeypatch)
     park(rig)
+    workers = rig.supervisor_factory.call_count
+    loads = sent(rig).count("model.load")
     callback = Mock()
     assert rig.runtime.start_test("", callback)
     assert not rig.runtime._model_parked
-    rig.event(type="hello")
-    assert sent(rig)[-1] == "model.load"
+    # Модель грузится в уже запущенный выгруженный воркер — второго перезапуска нет.
+    assert rig.supervisor_factory.call_count == workers
+    rig.supervisor.stop.assert_called_once()  # только выгрузка
+    assert sent(rig).count("model.load") == loads + 1
+    rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="проверка")
+    assert sent(rig)[-1] == "record.start"  # проверка микрофона началась
+
+
+def test_microphone_test_while_unloaded_reports_failed_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from astra_voice.core.dictation import TEST_MODEL_UNAVAILABLE, MicrophoneTestUpdate
+
+    rig = make_rig(monkeypatch)
+    park(rig)
+    monkeypatch.setattr(rig.runtime, "_resolve_model_request", lambda: None)
+    callback = Mock()
+    rig.runtime.start_test("", callback)
+    assert callback.call_args.args[0] == MicrophoneTestUpdate(
+        "error", message=TEST_MODEL_UNAVAILABLE
+    )
+    assert rig.runtime._model_parked and rig.runtime._pending_test is None
 
 
 def test_mouse_command_stays_armed_and_press_reloads_model(
@@ -426,3 +455,326 @@ def test_overlap_queue_blocks_idle_unload_until_last_phrase(
     rig.now += FIVE_MIN_S
     fire_idle(rig)
     assert runtime._model_parked
+
+
+# Код-ревью US-2.6: отказы пробуждения, смена модели, доверие мыши, предел и окно ----------
+
+
+TRUSTED_REQUEST: dict[str, Any] = {
+    "type": "model.load",
+    "id": "model",
+    "revision": "revision",
+    "dir": "/tmp/trusted",
+    "layout": "onnx-asr-gigaam-v3",
+    "variant": "gigaam-v3-e2e-rnnt",
+    "threads": 2,
+    "min_ram_mb": 768,
+}
+
+
+def fail_wake(rig: Rig, monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    """Подменяет загрузку так, чтобы пробуждение не началось (синхронный отказ)."""
+    from astra_voice.core.model_source import ModelRevoked
+
+    runtime = rig.runtime
+    request = runtime._resolve_model_request()
+    assert request is not None
+    if failure == "send":
+
+        def send(message: dict[str, Any], **kwargs: object) -> None:
+            if message["type"] == "model.load":
+                raise RuntimeError(MARKER)
+            rig.send(message, **kwargs)
+
+        rig.supervisor.send.side_effect = send
+    elif failure == "none":
+        monkeypatch.setattr(runtime, "_resolve_model_request", lambda: None)
+    elif failure == "revoked":
+
+        def revoked() -> dict[str, Any]:
+            raise ModelRevoked("revision")
+
+        monkeypatch.setattr(runtime, "_resolve_model_request", revoked)
+    else:
+        monkeypatch.setattr(runtime, "_resolve_model_request", lambda: {**request, "threads": 0})
+
+
+@pytest.mark.parametrize(
+    ("failure", "text"),
+    [
+        ("send", ERROR_MODEL_LOAD_FAILED),
+        ("none", ERROR_MODEL_NOT_LOADED),
+        ("revoked", ERROR_MODEL_REVOKED),
+        ("params", ERROR_MODEL_LOAD_FAILED),
+    ],
+)
+def test_failed_wake_keeps_model_unloaded_and_frees_hotkey(
+    monkeypatch: pytest.MonkeyPatch, failure: str, text: str
+) -> None:
+    """MAJOR-1: загрузка не началась — модель остаётся выгруженной, клавиша не залипает,
+    следующее нажатие снова грузит модель, а не шлёт запись воркеру без модели."""
+    rig = make_rig(monkeypatch)
+    park(rig)
+    original_send = rig.supervisor.send.side_effect
+    original_resolve = rig.runtime._resolve_model_request
+    fail_wake(rig, monkeypatch, failure)
+    rig.pill.show_state.reset_mock()
+    rig.hotkey.fsm.press(rig.now)
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE
+    assert rig.runtime._model_parked and not rig.runtime._loading_model
+    assert not rig.runtime._wake_dictation
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=text)
+    rig.release(rig.now + 1)
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE
+    assert not rig.runtime._work_pending()
+    assert "record.start" not in sent(rig)
+    # Причина устранена: следующее нажатие грузит модель и пишет фразу.
+    rig.supervisor.send.side_effect = original_send
+    monkeypatch.setattr(rig.runtime, "_resolve_model_request", original_resolve)
+    loads = sent(rig).count("model.load")
+    rig.now += 5
+    rig.hotkey.fsm.press(rig.now)
+    assert sent(rig).count("model.load") == loads + 1
+    assert "record.start" not in sent(rig)
+    rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="проверка")
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    rig.release(rig.now + 2)
+    rig.event(type="result", text=MARKER)
+    assert rig.paste.call_args.args[0] == MARKER
+
+
+def test_failed_wake_twice_in_same_worker_retries_each_press(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Две неудачи пробуждения в одном воркере не запрещают третью попытку нажатием."""
+    rig = make_rig(monkeypatch)
+    park(rig)
+    original_send = rig.supervisor.send.side_effect
+    fail_wake(rig, monkeypatch, "send")
+    for _ in range(2):
+        rig.hotkey.fsm.press(rig.now)
+        rig.release(rig.now + 1)
+        rig.now += 2
+    assert rig.runtime._model_parked and rig.hotkey.fsm.state is HotkeyState.IDLE
+    rig.supervisor.send.side_effect = original_send
+    loads = sent(rig).count("model.load")
+    rig.hotkey.fsm.press(rig.now)
+    assert sent(rig).count("model.load") == loads + 1 and rig.runtime._loading_model
+
+
+def test_worker_load_error_after_wake_unloads_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Воркер ответил ошибкой загрузки: клавиша свободна, следующее нажатие грузит снова."""
+    rig = make_rig(monkeypatch)
+    park(rig)
+    rig.hotkey.fsm.press(rig.now)
+    rig.event(type="error", code="engine-failed", request_type="model.load")
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE
+    assert rig.runtime._model_parked and not rig.runtime._loading_model
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    rig.release(rig.now + 1)
+    loads = sent(rig).count("model.load")
+    rig.hotkey.fsm.press(rig.now + 5)
+    assert sent(rig).count("model.load") == loads + 1
+    assert "record.start" not in sent(rig)
+
+
+def test_switch_while_unloaded_uses_pause_not_second_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MINOR-2: смена модели при выгруженной — с паузой, без временного воркера рядом;
+    нажатие во время смены не будит прежнюю модель."""
+    rig = make_rig(monkeypatch)
+    park(rig)
+    monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda mb: True)
+    loads = sent(rig).count("model.load")
+    workers = rig.supervisor_factory.call_count
+    rig.runtime.switch_model(min_ram_mb=768)
+    assert rig.runtime._switch_active() and rig.runtime._switch_paused
+    assert rig.runtime._switch_candidate is None
+    assert not rig.runtime._model_parked and rig.runtime._loading_model
+    assert rig.supervisor_factory.call_count == workers + 1  # воркер заменён, не добавлен
+    rig.hotkey.fsm.press(rig.now)
+    assert sent(rig).count("model.load") == loads  # прежняя модель не грузится
+    rig.event(type="hello")
+    assert sent(rig).count("model.load") == loads + 1  # только новая
+
+
+def test_press_while_unloaded_during_switch_waits_for_new_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Защитная ветка MINOR-2: выгружена и идёт смена — прежнюю не будим; смена
+    не удалась — автомат клавиши свободен."""
+    rig = make_rig(monkeypatch)
+    park(rig)
+    rig.runtime._switch_in_progress = True
+    loads = sent(rig).count("model.load")
+    rig.pill.show_state.reset_mock()
+    rig.hotkey.fsm.press(rig.now)
+    assert sent(rig).count("model.load") == loads
+    assert rig.runtime._model_parked and rig.runtime._wake_dictation
+    rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
+    rig.runtime._finish_switch("failed")
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE
+    assert not rig.runtime._wake_dictation
+
+
+def test_always_during_appimage_removal_keeps_model_unloaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MINOR-3: «Всегда» во время подготовки удаления AppImage не снимает выгрузку
+    без загрузки; следующее нажатие грузит модель, а не пишет без неё."""
+    rig = make_rig(monkeypatch)
+    park(rig)
+    assert rig.runtime.reserve_appimage_removal()
+    loads = sent(rig).count("model.load")
+    rig.runtime.apply_model_unload_minutes(0)
+    assert rig.runtime._model_parked and sent(rig).count("model.load") == loads
+    rig.runtime.release_appimage_removal()
+    rig.hotkey.fsm.press(rig.now)
+    assert sent(rig).count("model.load") == loads + 1
+    assert "record.start" not in sent(rig)
+    rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="проверка")
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+
+
+def parked_mouse(monkeypatch: pytest.MonkeyPatch) -> MouseRuntimeRig:
+    mouse = MouseRuntimeRig(monkeypatch)
+    monkeypatch.setattr(mouse.runtime, "_resolve_model_request", lambda: dict(TRUSTED_REQUEST))
+    mouse.runtime._model_load_request = dict(TRUSTED_REQUEST)
+    mouse.runtime.restart_worker(_park=True)
+    mouse.rig.event(type="hello")
+    retry = mouse.runtime._mouse_retry_timer
+    assert retry is not None
+    cast(FakeTimer, retry).fire()
+    return mouse
+
+
+@pytest.mark.parametrize("distrust", ["revoked", "revocation-unknown", "manual-dir", "record"])
+def test_unloaded_mouse_still_checks_static_model_trust(
+    monkeypatch: pytest.MonkeyPatch, distrust: str
+) -> None:
+    """MINOR-4: при выгруженной модели мышь пропускает только проверку загруженного
+    поколения; отзыв, неизвестный список отзыва, ручной каталог и запись — проверяются."""
+    mouse = parked_mouse(monkeypatch)
+    runtime = mouse.runtime
+    assert runtime._model_parked and runtime._mouse_allowed()
+    if distrust == "revoked":
+        runtime._revoked_check = lambda _id, revision: True
+    elif distrust == "revocation-unknown":
+        runtime.revocation_unknown = True
+    elif distrust == "manual-dir":
+        runtime.settings.extra["model_dir"] = "/tmp/manual"
+    else:
+        mouse.record.state = "broken"
+    assert not runtime._mouse_allowed()
+    mouse.press()
+    assert runtime._model_parked
+    assert not mouse.sent("model.load")
+
+
+def test_record_limit_counts_from_real_start_after_wake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MINOR-5: долгая загрузка в toggle не съедает предел 120 с — он от старта записи."""
+    from astra_voice.core.constants import RECORD_LIMIT_S
+
+    rig = Rig(
+        monkeypatch,
+        from_dict({"model_dir": "/tmp/model", "model_unload_minutes": 5, "hotkey_mode": "toggle"}),
+    )
+    rig.runtime.start()
+    rig.hotkey.has_pending_press = False
+    load_model(rig)
+    park(rig)
+    rig.hotkey.fsm.press(rig.now)
+    rig.hotkey.fsm.release(rig.now + 0.1)
+    rig.now += RECORD_LIMIT_S + 30  # загрузка дольше предела
+    rig.hotkey.fsm.tick(rig.now)
+    assert rig.hotkey.fsm.state is HotkeyState.RECORDING
+    rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="проверка")
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    started = rig.now
+    rig.hotkey.fsm.tick(started + RECORD_LIMIT_S - 1)
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    rig.hotkey.fsm.tick(started + RECORD_LIMIT_S)
+    assert cast(HotkeyState, rig.hotkey.fsm.state) is HotkeyState.PROCESSING  # предел — от старта
+
+
+def test_target_window_is_fixed_at_press_not_after_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MINOR-6: фокус ушёл за время загрузки — текст не уходит в новое окно: окно-цель
+    — на момент нажатия, вставка идёт штатной веткой «окно сменилось»."""
+    rig = make_rig(monkeypatch)
+    park(rig)
+    rig.hotkey.fsm.press(rig.now)
+    rig.x11.target_window.return_value = 9999  # пользователь переключился, пока грузится
+    rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="проверка")
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+    rig.release(rig.now + 2)
+    rig.event(type="result", text=MARKER)
+    assert rig.paste.call_args.args[1] == 4321
+    # Следующая фраза без выгрузки — окно на её старте.
+    rig.now += 5
+    rig.recognize()
+    assert rig.paste.call_args.args[1] == 9999
+
+
+def test_autostart_failure_keeps_its_error_pill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Пункт 7: синхронный провал автостарта показал ошибку — готовность модели её
+    не прячет, автомат клавиши свободен."""
+    rig = make_rig(monkeypatch)
+    park(rig)
+
+    def send(message: dict[str, Any], **kwargs: object) -> None:
+        if message["type"] == "record.start":
+            raise RuntimeError(MARKER)
+        rig.send(message, **kwargs)
+
+    rig.supervisor.send.side_effect = send
+    rig.hotkey.fsm.press(rig.now)
+    rig.event(type="model.loaded")
+    rig.pill.reset_mock()
+    rig.event(type="result", utterance_id="file", text="проверка")
+    assert rig.pill.mock_calls[-1] == call.show_state(
+        PillState.ERROR, text=ERROR_RECOGNITION_FAILED
+    )
+    rig.pill.hide.assert_not_called()
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE
+
+
+def test_autostart_silent_refusal_hides_loading_pill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Молчаливый отказ автостарту (ввод занят) не оставляет «Загружаю модель…»."""
+    rig = make_rig(monkeypatch)
+    park(rig)
+    rig.hotkey.fsm.press(rig.now)
+    rig.event(type="model.loaded")
+    rig.runtime._input_owner = "keyboard"  # ввод занят другим источником
+    rig.pill.reset_mock()
+    rig.event(type="result", utterance_id="file", text="проверка")
+    rig.runtime._input_owner = None
+    assert_phase(rig.runtime, DictationPhase.IDLE)
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE
+    rig.pill.hide.assert_called()
+    assert "record.start" not in sent(rig)
+
+
+@pytest.mark.parametrize("value", [30, -5, 1])
+def test_invalid_admin_policy_value_is_logged(caplog: pytest.LogCaptureFixture, value: int) -> None:
+    """Пункт 8: недопустимое значение политики не применяется молча — WARNING в журнал."""
+    from astra_voice.core import policy as pol
+
+    settings = Settings(model_unload_minutes=15)
+    with caplog.at_level("WARNING", logger="astra_voice.core.policy"):
+        result = pol.effective(
+            settings, pol.Policy(values={"model_unload_minutes": value}, status=pol.PolicyStatus.OK)
+        )
+    assert result.model_unload_minutes == 15
+    assert any(
+        record.levelname == "WARNING" and "model_unload_minutes" in record.getMessage()
+        for record in caplog.records
+    )
+    valid = pol.effective(
+        settings, pol.Policy(values={"model_unload_minutes": 60}, status=pol.PolicyStatus.OK)
+    )
+    assert valid.model_unload_minutes == 60
