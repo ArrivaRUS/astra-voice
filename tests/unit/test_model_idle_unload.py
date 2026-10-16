@@ -937,3 +937,45 @@ def test_always_while_unloaded_without_model_choice_shows_no_error(
     rig.hotkey.fsm.press(rig.now)
     rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
     assert rig.hotkey.fsm.state is HotkeyState.IDLE
+
+
+def test_failed_selfcheck_after_wake_then_crash_does_not_unload_or_grab_mouse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N2 (W7): пробуждение закончилось проваленной самопроверкой, затем воркер упал.
+    Hello нового воркера не считает пробуждение прерванным: модель не уходит в
+    выгруженные мимо провала, кнопка мыши не захватывается и клик не съедается."""
+    mouse = parked_mouse(monkeypatch)
+    runtime = mouse.runtime
+    mouse.press()
+    assert runtime._loading_model and runtime._wake_generation is not None
+    mouse.release()
+    mouse.rig.event(type="model.loaded")
+    mouse.rig.event(type="result", utterance_id="file", text="совсем не то")
+    assert runtime._selfcheck == "failed"
+    mouse.rig.event(type="error", code="worker-crashed")
+    mouse.rig.supervisor.generation += 1
+    mouse.rig.event(type="hello")
+    assert runtime._selfcheck == "failed"
+    assert not runtime._model_parked
+    assert not runtime._mouse_allowed()
+    retry = runtime._mouse_retry_timer
+    if retry is not None:
+        cast(FakeTimer, retry).fire()
+    assert runtime.command_mouse_status != "ready"
+    loads = len(mouse.sent("model.load"))
+    mouse.press()
+    assert runtime._input_owner is None
+    assert not mouse.sent("record.start")
+    assert len(mouse.sent("model.load")) == loads
+
+
+def test_mouse_not_allowed_with_failed_selfcheck_even_when_unloaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N2: выгруженная модель пропускает только незагруженную самопроверку, не проваленную."""
+    mouse = parked_mouse(monkeypatch)
+    runtime = mouse.runtime
+    assert runtime._model_parked and runtime._mouse_allowed()
+    runtime._selfcheck = "failed"
+    assert not runtime._mouse_allowed()

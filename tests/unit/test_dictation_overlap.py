@@ -929,11 +929,9 @@ def test_press_while_second_cancel_awaits_worker_keeps_escape_for_first(
     rig.assert_hotkey_state(HotkeyState.IDLE)
 
 
-def test_failing_ui_port_when_second_starts_keeps_recording_indicator(rig: OverlapRig) -> None:
-    """minor-2 (О4): порт пилюли или трея бросает при старте B после record.start —
-    индикатор записи всё равно включён, запись не идёт «втихую»."""
-    rig.start()
-    rig.stop()
+def failing_ui_ports(rig: OverlapRig, *, pill: bool = True) -> tuple[Any, Any]:
+    """Порт трея (и пилюли) бросает с текстом речи; возвращает исходные методы."""
+    show_state, set_state = rig.core._pill.show_state, rig.core._tray.set_state
 
     def failing_pill(state: PillState, *args: object, **kwargs: object) -> None:
         raise RuntimeError(B_TEXT)
@@ -941,9 +939,67 @@ def test_failing_ui_port_when_second_starts_keeps_recording_indicator(rig: Overl
     def failing_tray(state: TrayState, tooltip: str | None = None) -> None:
         raise RuntimeError(B_TEXT)
 
-    rig.core._pill.show_state = failing_pill  # type: ignore[method-assign]
+    if pill:
+        rig.core._pill.show_state = failing_pill  # type: ignore[method-assign]
     rig.core._tray.set_state = failing_tray  # type: ignore[method-assign]
+    return show_state, set_state
+
+
+def restore_ui_ports(rig: OverlapRig, ports: tuple[Any, Any]) -> None:
+    rig.core._pill.show_state, rig.core._tray.set_state = ports  # type: ignore[method-assign]
+
+
+def test_failing_ui_ports_on_single_phrase_cancel_recording(
+    rig: OverlapRig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """N1 (О4): пилюля и трей бросают после record.start — запись втихую не идёт:
+    фраза отменяется, индикатор записи выключен, текст исключения не в журнале."""
+    caplog.set_level(logging.DEBUG)
+    ports = failing_ui_ports(rig)
     rig.start()
-    assert len(rig.uids) == 2, OVERLAP_MISSING
+    restore_ui_ports(rig, ports)
+    assert rig.sent_ids("record.cancel") == [rig.uids[A]]
+    assert not rig.recording, "запись идёт без индикации"
+    rig.event_for(A, "cancelled")
+    fire_finishing_timers(rig)
+    assert rig.texts() == []
+    assert phase_of(rig) == DictationPhase.IDLE
+    assert "ГЕЛИОТРОП" not in caplog.text
+
+
+def test_icon_only_mode_with_failing_tray_cancels_recording(rig: OverlapRig) -> None:
+    """N1 (О4): режим «только значок» (пилюля не видна) и трей не обновился —
+    значок зарегистрирован, но не показывает запись; фраза отменяется."""
+    rig.pill.visible = False
+    ports = failing_ui_ports(rig, pill=False)
+    rig.start()
+    restore_ui_ports(rig, ports)
+    assert rig.sent_ids("record.cancel") == [rig.uids[A]]
+    assert not rig.recording
+
+
+def test_failing_tray_with_visible_pill_keeps_recording(rig: OverlapRig) -> None:
+    """N1 (О4): трей не обновился, но пилюля «Слушаю» видна — запись идёт."""
+    ports = failing_ui_ports(rig, pill=False)
+    rig.start()
+    restore_ui_ports(rig, ports)
+    assert "record.cancel" not in rig.commands()
     assert phase_of(rig) == DictationPhase.RECORDING
-    assert rig.recording, "запись B идёт без индикатора записи"
+    assert rig.recording
+    assert rig.pill.calls[-1][0] == PillState.LISTENING
+
+
+def test_failing_ui_ports_when_second_starts_cancel_only_second(rig: OverlapRig) -> None:
+    """minor-2 + N1 (О4): порты пилюли и трея бросают при старте B после record.start —
+    B не пишется втихую: отменяется только она (путь Q7), распознаваемая A вставляется."""
+    rig.start()
+    rig.stop()
+    ports = failing_ui_ports(rig)
+    rig.start()
+    restore_ui_ports(rig, ports)
+    assert len(rig.uids) == 2, OVERLAP_MISSING
+    assert rig.sent_ids("record.cancel") == [rig.uids[B]]
+    assert not rig.recording, "запись B идёт без индикации"
+    rig.event_for(B, "cancelled")
+    rig.result_for(A, A_TEXT)
+    assert rig.texts() == [A_TEXT]

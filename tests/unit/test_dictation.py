@@ -80,6 +80,8 @@ class FakePill:
         self.trace = trace
         self.calls: list[tuple[PillState, str | None, float | None]] = []
         self.hidden = False
+        # Как Pill.visible для стража О4; False — режим «только значок».
+        self.visible = True
 
     def show_state(
         self, state: PillState, *, text: str | None = None, level: float | None = None

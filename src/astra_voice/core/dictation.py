@@ -762,7 +762,8 @@ class DictationOrchestrator:
         if self.test_active:
             self.cancel("microphone-test")
 
-    def _safe_ui(self, call: Callable[[], None], message: str) -> None:
+    def _safe_ui(self, call: Callable[[], None], message: str) -> bool:
+        """Сбой порта UI гасится на месте; ``False`` — вызов бросил исключение."""
         try:
             call()
         except Exception as error:
@@ -771,6 +772,16 @@ class DictationOrchestrator:
             self._log.warning(
                 message, exc_info=(RuntimeError, RuntimeError(message), error.__traceback__)
             )
+            return False
+        return True
+
+    def _pill_visible(self) -> bool:
+        """Пилюля видна (как её видит страж О4); порт без признака — не видна."""
+        try:
+            return bool(getattr(self._pill, "visible", False))
+        except Exception:
+            self._log.warning("диктовка: видимость пилюли недоступна")
+            return False
 
     def _finish_test(self, update: MicrophoneTestUpdate) -> None:
         callback, self._test_callback = self._test_callback, None
@@ -995,31 +1006,47 @@ class DictationOrchestrator:
             return
         if self._test_callback is not None:
             self._later(TEST_RECORD_LIMIT_MS, self.stop_test)
+        indicated = True
         if self.test_active:
-            # Проверка микрофона сбой трея не гасит: её мост по исключению отменяет запись.
+            # Проверка микрофона сбой трея не гасит. Прямой вызов из моста
+            # (bridges.py, startTest) по исключению отменяет запись; отложенный
+            # старт из runtime._model_ready исключение не ловит, и этот путь
+            # проверка О4 ниже не закрывает: запись ограничена TEST_RECORD_LIMIT_MS.
             self._tray.set_state(TrayState.LISTENING)
         else:
             # О4: record.start уже отправлен — сбой порта пилюли или трея не должен
             # помешать включить индикатор записи (страж индикаторов видит запись).
             # Пилюля «Слушаю» — до индикатора, чтобы страж не счёл индикацию потерянной.
             command = self.mode == "command"
+            pill_shown = False
             if self._publication_allowed():
                 listening = PillState.COMMAND_LISTENING if command else PillState.LISTENING
-                self._safe_ui(
-                    lambda: self._pill.show_state(listening),
-                    "диктовка: не удалось обновить пилюлю",
+                pill_shown = (
+                    self._safe_ui(
+                        lambda: self._pill.show_state(listening),
+                        "диктовка: не удалось обновить пилюлю",
+                    )
+                    and self._pill_visible()
                 )
             if command:
-                self._safe_ui(
+                tray_shown = self._safe_ui(
                     lambda: self._tray.set_state(TrayState.LISTENING, tooltip="Слушаю команду"),
                     "диктовка: не удалось обновить трей",
                 )
             else:
-                self._safe_ui(
+                tray_shown = self._safe_ui(
                     lambda: self._tray.set_state(TrayState.LISTENING),
                     "диктовка: не удалось обновить трей",
                 )
+            # Страж О4 считает индикацией зарегистрированный значок, а не его состояние:
+            # значок в IDLE при невидимой пилюле — запись втихую. Отменяется только
+            # пишущаяся фраза (путь Q7), распознаваемые раньше вставляются.
+            indicated = pill_shown or tray_shown
         self._set_recording(True)
+        if not indicated:
+            self._log.warning("диктовка: запись не показана ни пилюлей, ни значком — отмена")
+            self.on_indicators_lost()
+            return
         if self._test_callback is not None:
             self._test_callback(MicrophoneTestUpdate("recording"))
 

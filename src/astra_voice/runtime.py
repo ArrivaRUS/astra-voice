@@ -604,6 +604,8 @@ class DictationRuntime(QObject):
             or self._command_mode is None
             or self._loading_model
             # Выгруженная по простою модель не мешает держать кнопку: нажатие её загрузит.
+            # Проваленная самопроверка мешает всегда, даже при выгруженной модели.
+            or self._selfcheck == "failed"
             or (self._selfcheck != "ok" and not self._model_parked)
             or self._capture_watchdog is not None
             or self._mouse_capture_token is not None
@@ -2295,6 +2297,9 @@ class DictationRuntime(QObject):
             if self._switch_active() and self._switch_candidate is None:
                 self._finish_switch("ok")
         else:
+            # Пробуждение закончилось провалом: поздний hello нового воркера не должен
+            # счесть его прерванным и вернуть модель в выгруженные (мимо провала).
+            self._wake_generation = None
             too_slow = False
             if self._switch_active() and self._switch_candidate is None:
                 # Верная, но медленная модель не укладывается в дедлайн самопроверки.
@@ -2425,7 +2430,8 @@ class DictationRuntime(QObject):
                     self._wake_generation = self.supervisor.generation
                 else:
                     self._wake_generation = None
-                    self._model_parked = not self._closed
+                    # Проваленную самопроверку выгрузка не прячет: её снимает только жест.
+                    self._model_parked = self._selfcheck != "failed"
         if (
             not self._closed
             and self._loading_model
