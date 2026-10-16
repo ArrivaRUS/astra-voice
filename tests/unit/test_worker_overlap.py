@@ -1,9 +1,9 @@
-"""US-2.7 на стороне воркера: запись B во время распознавания A (T-214, T-215).
+"""US-2.7 на стороне воркера: запись B во время распознавания A (T-274, T-275).
 
 Воркер 0.1.6 уже умеет состояние recording+processing и очередь «одно задание
-выполняется + одно ждёт» с FIFO-выдачей результатов. T-214 — guard этого контракта,
+выполняется + одно ждёт» с FIFO-выдачей результатов. T-274 — guard этого контракта,
 на нём держится порядок вставок US-2.7 (зелёный сейчас, должен остаться зелёным).
-T-215 (вопрос Q5 отчёта tester) — красный: при ``engine-failed`` фразы A воркер
+T-275 (вопрос Q5 отчёта tester) — красный: при ``engine-failed`` фразы A воркер
 молча останавливает идущую запись B (``WorkerState._finish``: ``_stop_recording()``
 без события ``record.limit``), и остаток речи B теряется, хотя пользователь ещё
 держит клавишу. Предлагаемое изменение: при ``engine-failed`` не трогать текущую
@@ -94,7 +94,7 @@ def cmd(worker: WorkerState, kind: str, uid: str) -> list[Message]:
 
 
 def test_second_recording_during_recognition_is_fifo(make_worker: Any) -> None:
-    """T-214 guard: B пишется целиком, пока A распознаётся; результаты строго A, затем B."""
+    """T-274 guard: B пишется целиком, пока A распознаётся; результаты строго A, затем B."""
     gate = Event()
     engine = FakeEngine(gate=gate)
     worker, events = make_worker(engine)
@@ -115,7 +115,7 @@ def test_second_recording_during_recognition_is_fifo(make_worker: Any) -> None:
 
 
 def test_engine_failure_of_first_keeps_second_recording(make_worker: Any) -> None:
-    """T-215 (Q5): engine-failed фразы A не обрывает идущую запись B."""
+    """T-275 (Q5): engine-failed фразы A не обрывает идущую запись B."""
     gate = Event()
     engine = FailFirstEngine(gate=gate)
     worker, events = make_worker(engine)

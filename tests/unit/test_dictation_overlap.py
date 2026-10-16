@@ -1,4 +1,4 @@
-"""US-2.7: запись новой фразы, пока предыдущая распознаётся (тесты до кода, T-200…T-219).
+"""US-2.7: запись новой фразы, пока предыдущая распознаётся (тесты до кода, T-260…T-279).
 
 Given идёт распознавание фразы A, When начинаю запись B, Then запись принята,
 обе вставки приходят по порядку (stories.md, US-2.7).
@@ -141,11 +141,11 @@ def fire_finishing_timers(rig: OverlapRig) -> None:
             timer.fire()
 
 
-# T-200 ---------------------------------------------------------------------------------
+# T-260 ---------------------------------------------------------------------------------
 
 
 def test_press_during_recognition_starts_second_recording(rig: OverlapRig) -> None:
-    """T-200: B принята: свой id, A не отменена, индикация записи включена."""
+    """T-260: B принята: свой id, A не отменена, индикация записи включена."""
     begin_overlap(rig)
     a_uid, b_uid = rig.uids
     assert a_uid != b_uid
@@ -163,12 +163,12 @@ def test_press_during_recognition_starts_second_recording(rig: OverlapRig) -> No
     assert len(rig.pill.calls) == calls
 
 
-# T-201 ---------------------------------------------------------------------------------
+# T-261 ---------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("arrival", ["a-first", "b-first"])
 def test_pastes_follow_press_order(rig: OverlapRig, arrival: str) -> None:
-    """T-201: вставки по порядку нажатий, даже если результат B пришёл раньше A."""
+    """T-261: вставки по порядку нажатий, даже если результат B пришёл раньше A."""
     begin_overlap(rig, release_b=True)
     if arrival == "b-first":
         rig.result_for(B, B_TEXT)
@@ -186,7 +186,7 @@ def test_pastes_follow_press_order(rig: OverlapRig, arrival: str) -> None:
 
 
 def test_second_result_during_first_paste_is_not_dropped(rig: OverlapRig) -> None:
-    """T-201: результат B, пришедший во вложенном цикле вставки A, вставляется после A."""
+    """T-261: результат B, пришедший во вложенном цикле вставки A, вставляется после A."""
     begin_overlap(rig, release_b=True)
     rig.during_paste = lambda: rig.result_for(B, B_TEXT)
     rig.result_for(A, A_TEXT)
@@ -195,7 +195,7 @@ def test_second_result_during_first_paste_is_not_dropped(rig: OverlapRig) -> Non
 
 
 def test_busy_retry_of_first_keeps_order(rig: OverlapRig) -> None:
-    """T-201: повтор BUSY фразы A не пропускает B вперёд."""
+    """T-261: повтор BUSY фразы A не пропускает B вперёд."""
     begin_overlap(rig, release_b=True)
     rig.outcomes.append(PasteOutcomeKind.BUSY)
     rig.result_for(A, A_TEXT)
@@ -206,12 +206,12 @@ def test_busy_retry_of_first_keeps_order(rig: OverlapRig) -> None:
     assert rig.texts() == [A_TEXT, A_TEXT, B_TEXT]
 
 
-# T-202 ---------------------------------------------------------------------------------
+# T-262 ---------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("b_state", ["recording", "processing"])
 def test_escape_cancels_only_newest_phrase(rig: OverlapRig, b_state: str) -> None:
-    """T-202: Esc отменяет B; A распознаётся и вставляется."""
+    """T-262: Esc отменяет B; A распознаётся и вставляется."""
     begin_overlap(rig, release_b=b_state == "processing")
     a_uid, b_uid = rig.uids
     rig.fsm.escape(rig.now)
@@ -226,7 +226,7 @@ def test_escape_cancels_only_newest_phrase(rig: OverlapRig, b_state: str) -> Non
 
 
 def test_escape_after_first_delivered_cancels_second(rig: OverlapRig) -> None:
-    """T-202: A вставлена, B распознаётся — хоткей не сброшен исходом A, Esc отменяет B."""
+    """T-262: A вставлена, B распознаётся — хоткей не сброшен исходом A, Esc отменяет B."""
     begin_overlap(rig, release_b=True)
     rig.result_for(A, A_TEXT)
     assert rig.fsm.state is not HotkeyState.IDLE, "исход A сбросил хоткей фразы B"
@@ -234,13 +234,13 @@ def test_escape_after_first_delivered_cancels_second(rig: OverlapRig) -> None:
     assert rig.sent_ids("record.cancel") == [rig.uids[B]]
 
 
-# T-203 ---------------------------------------------------------------------------------
+# T-263 ---------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("a_outcome", ["error", "empty", "watchdog"])
 @pytest.mark.parametrize("b_state", ["recording", "processing"])
 def test_first_failure_does_not_lose_second(rig: OverlapRig, a_outcome: str, b_state: str) -> None:
-    """T-203: ошибка/пусто/сторож A не отменяет B; B вставляется."""
+    """T-263: ошибка/пусто/сторож A не отменяет B; B вставляется."""
     begin_overlap(rig, release_b=b_state == "processing")
     b_uid = rig.uids[B]
     if a_outcome == "error":
@@ -264,11 +264,11 @@ def test_first_failure_does_not_lose_second(rig: OverlapRig, a_outcome: str, b_s
     assert [e["result"] for e in rig.stats.events if e["type"] == "dictation"][-1] == "ok"
 
 
-# T-204 ---------------------------------------------------------------------------------
+# T-264 ---------------------------------------------------------------------------------
 
 
 def test_each_phrase_pastes_into_its_own_start_window(rig: OverlapRig) -> None:
-    """T-204: окно-цель — окно фокуса при старте КАЖДОЙ фразы (Q2)."""
+    """T-264: окно-цель — окно фокуса при старте КАЖДОЙ фразы (Q2)."""
     rig.window = 42
     rig.start()
     rig.stop()
@@ -282,11 +282,11 @@ def test_each_phrase_pastes_into_its_own_start_window(rig: OverlapRig) -> None:
     assert [(text, target) for text, target, _ in rig.pasted] == [(A_TEXT, 42), (B_TEXT, 77)]
 
 
-# T-205 ---------------------------------------------------------------------------------
+# T-265 ---------------------------------------------------------------------------------
 
 
 def test_third_press_is_ignored_without_cancelling_queue(rig: OverlapRig) -> None:
-    """T-205: не больше двух незавершённых фраз; третье нажатие не трогает A и B."""
+    """T-265: не больше двух незавершённых фраз; третье нажатие не трогает A и B."""
     begin_overlap(rig, release_b=True)
     rig.start()
     assert len(rig.uids) == 2, "третья запись при двух незавершённых фразах"
@@ -301,12 +301,12 @@ def test_third_press_is_ignored_without_cancelling_queue(rig: OverlapRig) -> Non
     assert rig.texts() == [A_TEXT, B_TEXT, "третья"]
 
 
-# T-206 ---------------------------------------------------------------------------------
+# T-266 ---------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("b_state", ["recording", "processing"])
 def test_worker_restart_ends_whole_queue_once(rig: OverlapRig, b_state: str) -> None:
-    """T-206: смена поколения (крах/смена модели) — одна ошибка на обе фразы, без вставок."""
+    """T-266: смена поколения (крах/смена модели) — одна ошибка на обе фразы, без вставок."""
     begin_overlap(rig, release_b=b_state == "processing")
     rig.worker_generation = 2
     rig.event_for(A, "audio.ready")
@@ -327,7 +327,7 @@ def test_worker_restart_ends_whole_queue_once(rig: OverlapRig, b_state: str) -> 
 
 
 def test_shutdown_cancels_every_queued_phrase(rig: OverlapRig) -> None:
-    """T-206: выход при непустой очереди — отмена обеих фраз, индикаторы погашены."""
+    """T-266: выход при непустой очереди — отмена обеих фраз, индикаторы погашены."""
     begin_overlap(rig)
     a_uid, b_uid = rig.uids
     rig.core.shutdown()
@@ -338,11 +338,11 @@ def test_shutdown_cancels_every_queued_phrase(rig: OverlapRig) -> None:
     assert rig.pasted == []
 
 
-# T-207 ---------------------------------------------------------------------------------
+# T-267 ---------------------------------------------------------------------------------
 
 
 def test_phase_and_on_idle_wait_for_whole_queue(rig: OverlapRig) -> None:
-    """T-207: смена модели/выгрузка ждут конца очереди — on_idle один раз в конце."""
+    """T-267: смена модели/выгрузка ждут конца очереди — on_idle один раз в конце."""
     begin_overlap(rig, release_b=True)
     rig.result_for(A, A_TEXT)
     fire_finishing_timers(rig)
@@ -355,7 +355,7 @@ def test_phase_and_on_idle_wait_for_whole_queue(rig: OverlapRig) -> None:
 
 
 def test_microphone_test_refused_while_phrase_recognizes(rig: OverlapRig) -> None:
-    """T-207 guard: проверка микрофона/мастер не вклиниваются в распознавание."""
+    """T-267 guard: проверка микрофона/мастер не вклиниваются в распознавание."""
     rig.start()
     rig.stop()
     updates: list[MicrophoneTestUpdate] = []
@@ -365,7 +365,7 @@ def test_microphone_test_refused_while_phrase_recognizes(rig: OverlapRig) -> Non
 
 
 def test_microphone_test_refused_during_overlap(rig: OverlapRig) -> None:
-    """T-207: и при двух фразах в полёте проверка микрофона отказывает."""
+    """T-267: и при двух фразах в полёте проверка микрофона отказывает."""
     begin_overlap(rig, release_b=True)
     rig.result_for(A, A_TEXT)
     updates: list[MicrophoneTestUpdate] = []
@@ -373,11 +373,11 @@ def test_microphone_test_refused_during_overlap(rig: OverlapRig) -> None:
     assert updates == [MicrophoneTestUpdate("error", message=TEST_BUSY)]
 
 
-# T-208 ---------------------------------------------------------------------------------
+# T-268 ---------------------------------------------------------------------------------
 
 
 def test_command_press_during_text_recognition_is_ignored(rig: OverlapRig) -> None:
-    """T-208 guard: «Команда» не перекрывает распознавание текста (Q4)."""
+    """T-268 guard: «Команда» не перекрывает распознавание текста (Q4)."""
     rig.start()
     rig.stop()
     rig.core.on_hotkey_state(HotkeyState.RECORDING, "press", mode="command")
@@ -386,7 +386,7 @@ def test_command_press_during_text_recognition_is_ignored(rig: OverlapRig) -> No
 
 
 def test_text_press_during_command_recognition_is_ignored(rig: OverlapRig) -> None:
-    """T-208 guard: текст не перекрывает распознавание команды (Q4)."""
+    """T-268 guard: текст не перекрывает распознавание команды (Q4)."""
 
     class Client:
         def submit(self, text: str, callback: Any) -> None:
@@ -412,19 +412,19 @@ def test_text_press_during_command_recognition_is_ignored(rig: OverlapRig) -> No
 
 
 def test_command_press_during_overlap_is_ignored(rig: OverlapRig) -> None:
-    """T-208: при A в распознавании и B в записи «Команда» не начинает третью запись."""
+    """T-268: при A в распознавании и B в записи «Команда» не начинает третью запись."""
     begin_overlap(rig)
     rig.core.on_hotkey_state(HotkeyState.RECORDING, "press", mode="command")
     assert len(rig.uids) == 2
     assert rig.core.mode == "text"
 
 
-# T-209 ---------------------------------------------------------------------------------
+# T-269 ---------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("a_outcome", ["result", "error"])
 def test_recording_indication_survives_first_outcome(rig: OverlapRig, a_outcome: str) -> None:
-    """T-209: пока пишется B, исход A не гасит запись в пилюле, трее и страже О4."""
+    """T-269: пока пишется B, исход A не гасит запись в пилюле, трее и страже О4."""
     begin_overlap(rig)
     mark = len(rig.trace)
     if a_outcome == "result":
@@ -440,7 +440,7 @@ def test_recording_indication_survives_first_outcome(rig: OverlapRig, a_outcome:
 
 
 def test_first_error_is_reported_after_second_recording(rig: OverlapRig) -> None:
-    """T-209 (Q3): ошибку A не прячем навсегда — она видна после записи B."""
+    """T-269 (Q3): ошибку A не прячем навсегда — она видна после записи B."""
     begin_overlap(rig)
     rig.event_for(A, "error", code="frame-too-large", message="x")
     release = len(rig.pill.calls)
@@ -453,13 +453,13 @@ def test_first_error_is_reported_after_second_recording(rig: OverlapRig) -> None
     assert rig.texts() == [B_TEXT]
 
 
-# T-210 ---------------------------------------------------------------------------------
+# T-270 ---------------------------------------------------------------------------------
 
 
 def test_overlap_keeps_text_out_of_logs_and_stats(
     rig: OverlapRig, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T-210: текст обеих фраз не попадает ни в журнал, ни в статистику."""
+    """T-270: текст обеих фраз не попадает ни в журнал, ни в статистику."""
     caplog.set_level(logging.DEBUG)
     begin_overlap(rig, release_b=True)
     rig.result_for(B, B_TEXT)
@@ -470,11 +470,11 @@ def test_overlap_keeps_text_out_of_logs_and_stats(
         assert all(marker not in str(v) for e in rig.stats.events for v in e.values())
 
 
-# T-211 (Q1) ----------------------------------------------------------------------------
+# T-271 (Q1) ----------------------------------------------------------------------------
 
 
 def test_first_paste_waits_until_second_recording_ends(rig: OverlapRig) -> None:
-    """T-211 (Q1): A не вставляется, пока зажата клавиша B; после отпускания — сразу."""
+    """T-271 (Q1): A не вставляется, пока зажата клавиша B; после отпускания — сразу."""
     begin_overlap(rig)
     rig.result_for(A, A_TEXT)
     assert rig.pasted == [], "вставка A во время записи B (клавиша зажата → keys-held)"
@@ -484,11 +484,11 @@ def test_first_paste_waits_until_second_recording_ends(rig: OverlapRig) -> None:
     assert rig.texts() == [A_TEXT, B_TEXT]
 
 
-# T-212 (Q6) ----------------------------------------------------------------------------
+# T-272 (Q6) ----------------------------------------------------------------------------
 
 
 def test_press_during_first_paste_starts_second_after_paste(rig: OverlapRig) -> None:
-    """T-212 (Q6): нажатие во время вставки A не теряется — B стартует после вставки."""
+    """T-272 (Q6): нажатие во время вставки A не теряется — B стартует после вставки."""
     rig.start()
     rig.stop()
     rig.during_paste = rig.start
@@ -500,11 +500,11 @@ def test_press_during_first_paste_starts_second_after_paste(rig: OverlapRig) -> 
     rig.assert_hotkey_state(HotkeyState.RECORDING)
 
 
-# T-213 (Q7) ----------------------------------------------------------------------------
+# T-273 (Q7) ----------------------------------------------------------------------------
 
 
 def test_indicator_loss_stops_recording_but_keeps_recorded_phrase(rig: OverlapRig) -> None:
-    """T-213 (Q7): потеря индикаторов О4 останавливает запись B; записанная A вставляется."""
+    """T-273 (Q7): потеря индикаторов О4 останавливает запись B; записанная A вставляется."""
     begin_overlap(rig)
     rig.core.on_indicators_lost()
     assert rig.sent_ids("record.cancel") == [rig.uids[B]]
@@ -622,7 +622,7 @@ def test_first_pastes_after_toggle_stop_of_second() -> None:
 
 
 def test_pill_moves_between_phrases_without_hide(rig: OverlapRig) -> None:
-    """T-217 (уровень оркестратора): processing → listening → processing без hide между ними.
+    """T-277 (уровень оркестратора): processing → listening → processing без hide между ними.
 
     Пилюля не скрывается на стыке фраз, а индикатор записи включается заново только
     после того, как пилюля уже показывает «Слушаю» (страж О4 не видит потери индикации).
@@ -837,11 +837,11 @@ def test_press_during_busy_paste_with_second_in_flight_is_third(rig: OverlapRig)
 def test_first_in_clipboard_then_second_delivered(
     rig: OverlapRig, b_outcome: PasteOutcomeKind
 ) -> None:
-    """T-216 (уровень оркестратора): A ушла в буфер (окно сменилось), затем B.
+    """T-276 (уровень оркестратора): A ушла в буфер (окно сменилось), затем B.
 
     Каждая фраза сообщает свой исход: «в буфере» у A видно, хотя B ещё в работе
     (решение 3). Если и B ушла в буфер, буфер и «последний текст» — B: текст A
-    остаётся только в буфере до вставки B (возврат снимка буфера — xvfb, T-216).
+    остаётся только в буфере до вставки B (возврат снимка буфера — xvfb, T-276).
     """
     begin_overlap(rig, release_b=True)
     rig.outcomes.extend([PasteOutcomeKind.WINDOW_CHANGED, b_outcome])

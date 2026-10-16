@@ -406,7 +406,7 @@ def test_bridge_saves_choice_applies_it_and_rejects_others() -> None:
     assert save.call_count == 1 and apply.model_unload_minutes.call_count == 1
 
 
-# US-2.7 × US-2.6 (T-218) ------------------------------------------------------------------
+# US-2.7 × US-2.6 (T-278) ------------------------------------------------------------------
 
 
 def record_ids(rig: Rig) -> list[str]:
@@ -478,7 +478,7 @@ def fire_phrase_outcome(rig: Rig) -> None:
 def test_overlap_queue_defers_model_switch_until_last_phrase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """T-218: смена модели при непустой очереди ждёт исхода последней фразы (on_idle);
+    """T-278: смена модели при непустой очереди ждёт исхода последней фразы (on_idle);
     обе фразы вставлены прежней моделью, воркер не заменён посреди очереди."""
     rig = make_rig(monkeypatch)
     runtime = rig.runtime
@@ -507,7 +507,7 @@ def test_overlap_queue_defers_model_switch_until_last_phrase(
 def test_quit_with_overlap_queue_cancels_both_without_paste(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """T-218: «Выход» при непустой очереди — обе фразы отменены, вставок нет, хоткей и
+    """T-278: «Выход» при непустой очереди — обе фразы отменены, вставок нет, хоткей и
     индикатор записи освобождены."""
     rig = make_rig(monkeypatch)
     runtime = rig.runtime
