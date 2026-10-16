@@ -801,8 +801,11 @@ class DictationRuntime(QObject):
         self._note_activity()
         if self._model_parked:
             # Модель выгружена по простою: нажатие загружает её, команду дают после.
-            self._stop_mouse("model")
-            self._wake_model()
+            # Как у клавиши «Команды»: сессия, где команды запрещены, модель не будит.
+            allowed = self._command_snapshot().allowed
+            self._stop_mouse("model" if allowed else "blocked")
+            if allowed:
+                self._wake_model()
             return
         manager = self.command_mouse
         if manager is None or not self._mouse_allowed() or not self._reserve_input("mouse"):
@@ -1795,7 +1798,7 @@ class DictationRuntime(QObject):
         self._switch_loaded_event = None
         if candidate is not None:
             self._cleanup("временный воркер", candidate.stop)
-        if result != "ok" and getattr(self, "_wake_dictation", False):
+        if result != "ok" and self._wake_dictation:
             # Нажатие ждало новую модель: она не пришла, клавиша не залипает.
             self._drop_wake()
         if self.on_switch_finished is not None and not self._closed:
@@ -2411,7 +2414,18 @@ class DictationRuntime(QObject):
         ):
             self.measurements.new_generation()
             self.orchestrator.model_changed()
+            waking = self._wake_generation not in (None, self.supervisor.generation)
             self._load_model()
+            # restart_worker внутри загрузки (возврат прежней модели) сам снял пробуждение.
+            if waking and self._wake_generation is not None:
+                # Пробуждение прервал перезапуск воркера: загрузка в новом — его
+                # продолжение. Её неудача возвращает модель в выгруженные, и следующее
+                # нажатие грузит её снова, а не шлёт запись в воркер без модели.
+                if self._loading_model:
+                    self._wake_generation = self.supervisor.generation
+                else:
+                    self._wake_generation = None
+                    self._model_parked = not self._closed
         if (
             not self._closed
             and self._loading_model
@@ -2642,7 +2656,7 @@ class DictationRuntime(QObject):
         if value == 0:
             self._cancel_idle_unload()
             # «Всегда» — модель, выгруженная прежним выбором, возвращается в память.
-            self._wake_model()
+            self._wake_model(gesture=False)
             return
         self._arm_idle_unload()
 
@@ -2700,8 +2714,11 @@ class DictationRuntime(QObject):
         except Exception:
             log.warning("Не удалось выгрузить модель из памяти")
 
-    def _wake_model(self) -> bool:
+    def _wake_model(self, *, gesture: bool = True) -> bool:
         """Загружает модель, выгруженную по простою, в уже запущенный воркер.
+
+        gesture=False — загрузку начал не жест пользователя (выбор «Всегда» в
+        настройках): модель, не выбранная в настройках, ошибкой не показывается.
 
         True — загрузка идёт. Не начавшаяся загрузка (отзыв, модель не выбрана,
         неверные параметры, сбой отправки; ошибку показал _load_model) оставляет
@@ -2723,7 +2740,7 @@ class DictationRuntime(QObject):
         self._model_load_failures = 0
         self._model_load_generation = None
         log.info("загружаю модель после выгрузки по простою")
-        self._load_model(wake=True)
+        self._load_model(wake=gesture)
         if not self._loading_model:
             self._model_parked = True
             return False
@@ -2738,6 +2755,8 @@ class DictationRuntime(QObject):
             # Окно не узнать — его определит старт записи, как без выгрузки.
             window = None
         if self._switch_active():
+            # Защитная ветка: смена при выгруженной модели идёт с паузой и снимает
+            # выгрузку (restart_worker), так что сюда штатно не попадаем.
             log.info("хоткей: модель выгружена, идёт смена модели — запись начнётся после неё")
             if self.orchestrator.phase == DictationPhase.IDLE:
                 if self._command_publication_allowed():

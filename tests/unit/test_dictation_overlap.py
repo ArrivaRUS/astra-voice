@@ -748,7 +748,9 @@ def test_failing_ui_port_during_paste_queue_does_not_strand_phrase(
     assert rig.texts() == [A_TEXT]
     assert [e["result"] for e in rig.stats.events if e["type"] == "dictation"] == ["ok"]
     assert rig.core.pending_utterances == 1, "A осталась в очереди после сбоя порта"
-    assert any("отложенное событие" in r.getMessage() for r in caplog.records)
+    # Сбой порта гасится на месте (О4): B пишется с включённым индикатором записи.
+    assert any("не удалось обновить трей" in r.getMessage() for r in caplog.records)
+    assert rig.recording, "B пишется без индикатора записи"
     assert "ГЕЛИОТРОП" not in caplog.text
     fire_finishing_timers(rig)
     rig.stop()
@@ -898,3 +900,50 @@ def test_restart_reply_error_still_ends_queue(rig: OverlapRig) -> None:
     restarted = [c for c in rig.pill.calls if c[1] == ERROR_RECOGNITION_RESTARTED]
     assert len(restarted) == 1
     assert rig.core.pending_utterances == 0
+
+
+# Финальный проход ревью (minor-1, minor-2) ----------------------------------------------
+
+
+def test_press_while_second_cancel_awaits_worker_keeps_escape_for_first(
+    rig: OverlapRig,
+) -> None:
+    """minor-1: потеря индикаторов отменила B; нажатие до подтверждения отмены B не
+    сбрасывает автомат клавиши в IDLE — Esc по-прежнему отменяет распознаваемую A."""
+    begin_overlap(rig)
+    rig.core.on_indicators_lost()
+    rig.assert_hotkey_state(HotkeyState.PROCESSING)
+    rig.now += 0.2
+    rig.fsm.press(rig.now)
+    rig.assert_hotkey_state(HotkeyState.PROCESSING)
+    assert rig.uids[A] not in rig.sent_ids("record.cancel")
+    assert len(rig.uids) == 2, "нажатие во время отмены B начало новую запись"
+    rig.event_for(B, "cancelled")
+    rig.now += 0.1
+    rig.fsm.escape(rig.now)
+    assert rig.uids[A] in rig.sent_ids("record.cancel"), "Esc для A потерян"
+    rig.event_for(A, "cancelled")
+    fire_finishing_timers(rig)
+    assert rig.texts() == []
+    assert phase_of(rig) == DictationPhase.IDLE
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+
+
+def test_failing_ui_port_when_second_starts_keeps_recording_indicator(rig: OverlapRig) -> None:
+    """minor-2 (О4): порт пилюли или трея бросает при старте B после record.start —
+    индикатор записи всё равно включён, запись не идёт «втихую»."""
+    rig.start()
+    rig.stop()
+
+    def failing_pill(state: PillState, *args: object, **kwargs: object) -> None:
+        raise RuntimeError(B_TEXT)
+
+    def failing_tray(state: TrayState, tooltip: str | None = None) -> None:
+        raise RuntimeError(B_TEXT)
+
+    rig.core._pill.show_state = failing_pill  # type: ignore[method-assign]
+    rig.core._tray.set_state = failing_tray  # type: ignore[method-assign]
+    rig.start()
+    assert len(rig.uids) == 2, OVERLAP_MISSING
+    assert phase_of(rig) == DictationPhase.RECORDING
+    assert rig.recording, "запись B идёт без индикатора записи"

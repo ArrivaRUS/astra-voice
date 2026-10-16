@@ -477,10 +477,16 @@ class DictationOrchestrator:
         возвращается к фразам очереди, не отменяя их (``_return_hotkey_to_queue``).
         Фраза, уже отпущенная и дописывающая хвост (``RELEASE_TAIL_MS``), записана:
         нажатие в эти миллисекунды (дребезг, быстрый повтор) её не отменяет.
+        Фраза, чья отмена уже запрошена и ждёт подтверждения воркера, тоже не повод
+        сбрасывать автомат: иначе Esc для распознаваемых фраз очереди теряется.
         """
         recording = self._recording_item()
         if recording is not None and recording._tail_pending:
             self._log.info("диктовка: нажатие проигнорировано — дописывается хвост записи")
+            self._return_hotkey_to_queue()
+            return
+        if recording is not None and recording._cancel_requested:
+            self._log.info("диктовка: нажатие проигнорировано — запись уже отменяется")
             self._return_hotkey_to_queue()
             return
         if recording is not None or not self._items:
@@ -989,15 +995,30 @@ class DictationOrchestrator:
             return
         if self._test_callback is not None:
             self._later(TEST_RECORD_LIMIT_MS, self.stop_test)
-        if not self.test_active:
-            if self._publication_allowed():
-                self._pill.show_state(
-                    PillState.COMMAND_LISTENING if self.mode == "command" else PillState.LISTENING
-                )
-        if self.mode == "command":
-            self._tray.set_state(TrayState.LISTENING, tooltip="Слушаю команду")
-        else:
+        if self.test_active:
+            # Проверка микрофона сбой трея не гасит: её мост по исключению отменяет запись.
             self._tray.set_state(TrayState.LISTENING)
+        else:
+            # О4: record.start уже отправлен — сбой порта пилюли или трея не должен
+            # помешать включить индикатор записи (страж индикаторов видит запись).
+            # Пилюля «Слушаю» — до индикатора, чтобы страж не счёл индикацию потерянной.
+            command = self.mode == "command"
+            if self._publication_allowed():
+                listening = PillState.COMMAND_LISTENING if command else PillState.LISTENING
+                self._safe_ui(
+                    lambda: self._pill.show_state(listening),
+                    "диктовка: не удалось обновить пилюлю",
+                )
+            if command:
+                self._safe_ui(
+                    lambda: self._tray.set_state(TrayState.LISTENING, tooltip="Слушаю команду"),
+                    "диктовка: не удалось обновить трей",
+                )
+            else:
+                self._safe_ui(
+                    lambda: self._tray.set_state(TrayState.LISTENING),
+                    "диктовка: не удалось обновить трей",
+                )
         self._set_recording(True)
         if self._test_callback is not None:
             self._test_callback(MicrophoneTestUpdate("recording"))
@@ -1689,7 +1710,7 @@ class DictationOrchestrator:
                 return
             self._finish_test(MicrophoneTestUpdate("error", message=message))
             return
-        if code in ("worker-crashed", "restart-limit", "worker-start"):
+        if code in _RESTART_CODES:
             self._fail_restarted()
         elif code == "audio-no-device" and self._device_selected:
             self._append_stat("mic_error", kind="device-lost", recovered_by="none")
@@ -1864,6 +1885,8 @@ class DictationOrchestrator:
             return
         # Итог старой фразы, отложенный на запись новой, не переживает очередь: иначе
         # он всплыл бы на следующей фразе. Пилюля «Микрофон сменился» важнее него.
+        # Сброс обязателен; показ ниже — защитная ветка: штатно отложенный итог уже
+        # показан в _show_outcome, когда очередь опустела.
         deferred, self._deferred_notice = self._deferred_notice, None
         if (
             deferred is not None

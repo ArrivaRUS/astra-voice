@@ -846,3 +846,94 @@ def test_invalid_admin_policy_value_is_logged(caplog: pytest.LogCaptureFixture, 
         settings, pol.Policy(values={"model_unload_minutes": 60}, status=pol.PolicyStatus.OK)
     )
     assert valid.model_unload_minutes == 60
+
+
+# Финальный проход ревью US-2.6 ----------------------------------------------------------
+
+
+def crash_during_wake(rig: Rig) -> None:
+    """Нажатие будит модель; воркер падает до её загрузки, новый воркер грузит её сам."""
+    park(rig)
+    rig.hotkey.fsm.press(rig.now)
+    assert rig.runtime._loading_model
+    rig.event(type="error", code="worker-crashed")
+    rig.supervisor.generation += 1
+    loads = sent(rig).count("model.load")
+    rig.event(type="hello")
+    assert sent(rig).count("model.load") == loads + 1 and rig.runtime._loading_model
+
+
+def test_load_error_after_crash_during_wake_unloads_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """minor: пробуждение прервал перезапуск воркера, загрузка в новом тоже упала —
+    модель снова выгружена, клавиша свободна, следующее нажатие грузит её, а не шлёт
+    record.start в воркер без модели."""
+    rig = make_rig(monkeypatch)
+    crash_during_wake(rig)
+    rig.event(type="error", code="engine-failed", request_type="model.load")
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE
+    assert rig.runtime._model_parked and not rig.runtime._loading_model
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+    rig.release(rig.now + 1)
+    loads = sent(rig).count("model.load")
+    rig.hotkey.fsm.press(rig.now + 5)
+    assert sent(rig).count("model.load") == loads + 1
+    assert "record.start" not in sent(rig)
+    rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="проверка")
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+
+
+def test_crash_during_wake_then_load_in_new_worker_keeps_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Загрузка в новом воркере удалась: модель в памяти, следующее нажатие пишет."""
+    rig = make_rig(monkeypatch)
+    crash_during_wake(rig)
+    rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="проверка")
+    assert not rig.runtime._model_parked and rig.runtime._wake_generation is None
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE  # падение воркера сбросило нажатие
+    rig.hotkey.fsm.press(rig.now + 5)
+    assert sent(rig)[-1] == "record.start"
+    assert_phase(rig.runtime, DictationPhase.RECORDING)
+
+
+def test_mouse_press_while_unloaded_in_disallowed_session_keeps_model_unloaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """nit: как клавиша «Команды», кнопка мыши в сессии, где команды запрещены
+    (экран заблокирован), выгруженную модель не будит."""
+    from dataclasses import replace
+
+    mouse = parked_mouse(monkeypatch)
+    runtime = mouse.runtime
+    loads = len(mouse.sent("model.load"))
+    mouse.snapshot = replace(mouse.snapshot, locked=True)
+    runtime._mouse_pending(mouse.manager.generation)
+    assert runtime._model_parked and not runtime._loading_model
+    assert len(mouse.sent("model.load")) == loads
+    mouse.snapshot = replace(mouse.snapshot, locked=False)
+    runtime._mouse_pending(mouse.manager.generation)
+    assert not runtime._model_parked and runtime._loading_model
+    assert len(mouse.sent("model.load")) == loads + 1
+
+
+def test_always_while_unloaded_without_model_choice_shows_no_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """nit: «Всегда» при выгруженной модели и пустом выборе модели — не жест нажатия:
+    пилюли ошибки нет, модель остаётся выгруженной, нажатие покажет причину."""
+    rig = make_rig(monkeypatch)
+    park(rig)
+    monkeypatch.setattr(rig.runtime, "_resolve_model_request", lambda: None)
+    rig.pill.show_state.reset_mock()
+    rig.runtime.apply_model_unload_minutes(0)
+    assert rig.runtime._model_parked
+    assert call(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED) not in (
+        rig.pill.show_state.call_args_list
+    )
+    rig.hotkey.fsm.press(rig.now)
+    rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE

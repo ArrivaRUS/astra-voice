@@ -3391,3 +3391,49 @@ def test_device_change_in_processing_does_not_touch_recognition(rig: Rig, kind: 
     rig.result()
     assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
     assert pill_states_after_device_error(rig, kind) == []
+
+
+# US-2.6: окно-цель на момент нажатия (pinned_window) ------------------------------------
+
+
+def test_pinned_window_targets_phrase_started_inside_block(rig: Rig) -> None:
+    with rig.core.pinned_window(777):
+        rig.start()
+    assert rig.core._pinned_window is None
+    rig.stop()
+    rig.result()
+    assert rig.pasted[-1][1] == 777
+
+
+def test_pinned_window_is_dropped_when_press_is_refused(rig: Rig) -> None:
+    """Отказ нажатию внутри блока (идёт проверка микрофона) не оставляет окно-цель
+    следующей фразе: она вставляется в окно на своём старте."""
+    updates: list[MicrophoneTestUpdate] = []
+    rig.core.start_test("", updates.append)
+    before = rig.commands()
+    with rig.core.pinned_window(777):
+        rig.start()
+    assert rig.commands() == before
+    assert rig.core._pinned_window is None
+    rig.core.stop_test()
+    rig.result("проверка")
+    for timer in [t for t in rig.timers if not t.cancelled and not t.fired]:
+        timer.fire()
+    assert rig.core.phase is DictationPhase.IDLE
+    rig.fsm.escape(rig.now)
+    rig.window = 99
+    rig.start()
+    rig.stop()
+    rig.result()
+    assert rig.pasted[-1][1] == 99
+
+
+def test_pinned_window_is_dropped_on_exception(rig: Rig) -> None:
+    with pytest.raises(RuntimeError, match=MARKER), rig.core.pinned_window(777):
+        raise RuntimeError(MARKER)
+    assert rig.core._pinned_window is None
+    rig.window = 99
+    rig.start()
+    rig.stop()
+    rig.result()
+    assert rig.pasted[-1][1] == 99

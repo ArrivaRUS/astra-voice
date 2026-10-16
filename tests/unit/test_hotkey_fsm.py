@@ -1448,3 +1448,47 @@ def test_active_window_accepts_cardinal_typed_property(
         property_type=property_type, format=16, value=[91]
     )
     assert mocked_x11.active_window() is None
+
+
+# US-2.6: предел фразы от настоящего старта записи -----------------------------------------
+
+
+@pytest.mark.parametrize("state", ["idle", "processing"])
+def test_restart_limit_outside_recording_does_nothing(state: str) -> None:
+    from astra_voice.platform.hotkey import RECORD_LIMIT_S
+
+    states: list[tuple[HotkeyState, str]] = []
+    fsm = HotkeyFsm(HotkeyMode.TOGGLE, lambda s, reason: states.append((s, reason)))
+    if state == "processing":
+        fsm.press(0.0)
+        fsm.press(1.0)  # toggle-off
+        assert fsm.state is HotkeyState.PROCESSING
+    expected = fsm.state
+    before = list(states)
+    fsm.restart_limit(5.0)
+    assert fsm.limit_deadline is None
+    fsm.restart_limit(None)
+    assert fsm.limit_deadline is None
+    assert fsm.state is expected
+    fsm.tick(5.0 + RECORD_LIMIT_S + 1)
+    assert states == before
+
+
+def test_restart_limit_none_lifts_limit_and_time_rearms_it() -> None:
+    from astra_voice.platform.hotkey import RECORD_LIMIT_S
+
+    states: list[tuple[HotkeyState, str]] = []
+    fsm = HotkeyFsm(HotkeyMode.TOGGLE, lambda s, reason: states.append((s, reason)))
+    fsm.press(0.0)
+    assert fsm.limit_deadline == RECORD_LIMIT_S
+    fsm.restart_limit(None)
+    assert fsm.limit_deadline is None
+    fsm.tick(RECORD_LIMIT_S * 3)  # ожидание загрузки модели не обрывается пределом
+    assert fsm.state is HotkeyState.RECORDING
+    fsm.restart_limit(30.0)
+    assert fsm.limit_deadline == 30.0 + RECORD_LIMIT_S
+    fsm.tick(30.0 + RECORD_LIMIT_S - 0.5)
+    assert fsm.state is HotkeyState.RECORDING
+    fsm.tick(30.0 + RECORD_LIMIT_S)
+    assert fsm.state is HotkeyState.PROCESSING
+    assert states[-1] == (HotkeyState.PROCESSING, "limit")
