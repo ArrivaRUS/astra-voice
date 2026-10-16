@@ -30,6 +30,7 @@ from astra_voice.core.dictation import (
     level_from_dbfs,
 )
 from astra_voice.core.settings import (
+    MODEL_UNLOAD_MINUTES,
     Settings,
     is_valid_combo,
     is_valid_command_combo,
@@ -89,6 +90,8 @@ class SettingsApply(Protocol):
     """Живое применение настроек; захват клавиши проверяется до записи."""
 
     def pill_enabled(self, value: bool) -> None: ...
+
+    def model_unload_minutes(self, value: int) -> None: ...
 
     def hotkey(self, combo: str, mode: str) -> str:
         """Пустая строка или ok — успех; иначе код отказа захвата."""
@@ -211,6 +214,7 @@ class SettingsBridge(QObject):
     soundCuesEnabledChanged = pyqtSignal()
     soundCuesStatusChanged = pyqtSignal()
     pillEnabledChanged = pyqtSignal()
+    modelUnloadMinutesChanged = pyqtSignal()
     languageChanged = pyqtSignal()
     checkAppUpdatesChanged = pyqtSignal()
     checkModelUpdatesChanged = pyqtSignal()
@@ -254,6 +258,7 @@ class SettingsBridge(QObject):
         "hotkeyMode": "hotkey_mode",
         "soundCuesEnabled": "sound_cues_enabled",
         "pillEnabled": "pill_enabled",
+        "modelUnloadMinutes": "model_unload_minutes",
         "language": "language",
         "checkAppUpdates": "check_app_updates",
         "checkModelUpdates": "check_model_updates",
@@ -642,7 +647,7 @@ class SettingsBridge(QObject):
         self.extraChanged.emit(key)
         return True
 
-    def _set_value(self, name: str, value: str | bool) -> None:
+    def _set_value(self, name: str, value: str | bool | int) -> None:
         field = self._FIELDS[name]
         if self.is_locked(field):
             log.info("%s: настройка задана администратором", field)
@@ -658,6 +663,10 @@ class SettingsBridge(QObject):
             or (name == "language" and value not in ("ru", "en"))
             or (name == "hotkey" and not is_valid_combo(cast(str, value)))
             or (name == "commandHotkey" and not is_valid_command_combo(cast(str, value)))
+            or (
+                name == "modelUnloadMinutes"
+                and (type(value) is not int or value not in MODEL_UNLOAD_MINUTES)
+            )
         ):
             log.warning("Недопустимое значение настройки %s", name)
             if name == "hotkey":
@@ -754,6 +763,8 @@ class SettingsBridge(QObject):
         if self._apply is not None:
             if name == "pillEnabled":
                 self._apply.pill_enabled(self.pillEnabled)
+            elif name == "modelUnloadMinutes":
+                self._apply.model_unload_minutes(self.modelUnloadMinutes)
             elif hotkey_apply is not None:
                 self.set_hotkey_status(
                     "busy"
@@ -1193,6 +1204,15 @@ class SettingsBridge(QObject):
     @pillEnabled.setter  # type: ignore[no-redef]
     def pillEnabled(self, value: bool) -> None:  # noqa: N802
         self._set_value("pillEnabled", value)
+
+    @pyqtProperty(int, notify=modelUnloadMinutesChanged)
+    def modelUnloadMinutes(self) -> int:  # noqa: N802
+        """Минуты простоя до выгрузки модели; 0 — держать в памяти всегда."""
+        return cast(int, self._values["modelUnloadMinutes"])
+
+    @modelUnloadMinutes.setter  # type: ignore[no-redef]
+    def modelUnloadMinutes(self, value: int) -> None:  # noqa: N802
+        self._set_value("modelUnloadMinutes", value)
 
     @pyqtProperty(str, notify=languageChanged)
     def language(self) -> str:

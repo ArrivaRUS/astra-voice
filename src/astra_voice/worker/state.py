@@ -700,10 +700,19 @@ class WorkerState:
             self._active = None
             discarded: list[Message] = []
             if msg.get("code") == "engine-failed":
+                # US-2.7, решение 5: идущую запись следующей фразы не трогаем — её
+                # распознает следующее задание. Ожидавшая очереди фраза получает
+                # ошибку (а не «отменено»); её PCM сохраняется, как у упавшей.
                 if self._pending is not None:
-                    discarded = self._cancel(self._pending.utterance_id)
-                if self._recording is not None:
-                    self._stop_recording()
+                    pending, self._pending = self._pending, None
+                    if pending.utterance_id in self.buffers:
+                        self._stopped[pending.utterance_id] = self._clock()
+                    discarded = [
+                        {
+                            **error("engine-failed", "Ошибка распознавания движка."),
+                            "utterance_id": pending.utterance_id,
+                        }
+                    ]
             elif self._pending is not None:
                 pending, self._pending = self._pending, None
                 self._launch(pending)

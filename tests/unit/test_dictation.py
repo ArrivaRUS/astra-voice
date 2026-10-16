@@ -80,6 +80,8 @@ class FakePill:
         self.trace = trace
         self.calls: list[tuple[PillState, str | None, float | None]] = []
         self.hidden = False
+        # Как Pill.visible для стража О4; False — режим «только значок».
+        self.visible = True
 
     def show_state(
         self, state: PillState, *, text: str | None = None, level: float | None = None
@@ -165,6 +167,7 @@ class Rig:
         self.timers: list[Timer] = []
         self.done = 0
         self.cancels = 0
+        self.refusals = 0
         self.recording = False
         self.pill = FakePill(self.trace)
         self.tray = FakeTray(self.trace)
@@ -195,6 +198,7 @@ class Rig:
             hotkey_done=self.hotkey_done,
             hotkey_cancel=self.hotkey_cancel,
             hotkey_idle=lambda: self.hotkey.fsm.state is HotkeyState.IDLE,
+            hotkey_refuse=self.hotkey_refuse,
             set_recording=self.set_recording,
             paste_mode=lambda: self.mode,
             record_params=lambda: self.params,
@@ -260,6 +264,11 @@ class Rig:
     def hotkey_cancel(self) -> None:
         self.cancels += 1
         self.fsm.escape(self.now)
+
+    def hotkey_refuse(self) -> None:
+        """Как runtime._input_refuse: отказ нажатию поверх распознавания (US-2.7)."""
+        self.refusals += 1
+        self.fsm.refuse(self.now)
 
     def set_recording(self, value: bool) -> None:
         self.recording = value
@@ -577,20 +586,36 @@ def test_first_dictation_only_is_cold_and_finishing_can_restart(
 
 
 @pytest.mark.parametrize("phase", ["recording", "processing", "pasting", "busy"])
-def test_single_slot_ignores_repeated_presses(rig: Rig, phase: str) -> None:
+def test_repeated_presses_respect_single_recording_and_queue_limit(rig: Rig, phase: str) -> None:
+    """Пишется одна фраза; поверх распознавания/вставки — ещё одна (US-2.7), не больше двух.
+
+    До US-2.7 (test_single_slot_ignores_repeated_presses) нажатия в processing/pasting/busy
+    игнорировались; решения владельца 2026-10-15 (US-2.7, Q6 и Q7) их принимают.
+    """
     rig.start()
     if phase != "recording":
         rig.stop()
     if phase == "pasting":
         rig.during_paste = rig.start
         rig.result()
+        rig.during_paste = None
     elif phase == "busy":
         rig.outcomes.append(PasteOutcomeKind.BUSY)
         rig.result()
         rig.start()
     else:
         rig.start()
-    assert rig.commands().count("record.start") == 1
+    expected = 1 if phase == "recording" else 2
+    assert rig.commands().count("record.start") == expected
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    if phase in ("processing", "busy"):
+        # Третье нажатие при двух незавершённых фразах тихо игнорируется (решение 7).
+        rig.stop()
+        rig.start()
+        assert rig.commands().count("record.start") == 2
+        assert "record.cancel" not in rig.commands()
+        rig.assert_hotkey_state(HotkeyState.PROCESSING)
+        assert rig.refusals == 1 and rig.cancels == 0
 
 
 @pytest.mark.parametrize(
@@ -1795,9 +1820,15 @@ def test_mapping_regrab_during_recording_does_not_cancel(mode: HotkeyMode) -> No
 
 
 @pytest.mark.parametrize("terminal", ["error", "cancelled", "generation"])
-def test_queued_press_after_terminal_transition_is_discarded(
+def test_queued_press_after_terminal_transition_starts_next_phrase(
     rig: Rig, terminal: str, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Нажатие во время вставки не теряется и после исхода фразы внутри вставки (US-2.7, Q6).
+
+    Было test_queued_press_after_terminal_transition_is_discarded: отложенные события
+    после завершения отбрасывались вместе с нажатием. Теперь разбираются по порядку:
+    события старой фразы отсеиваются по её фазе, нажатие начинает следующую запись.
+    """
     rig.start()
     rig.stop()
     caplog.set_level(logging.DEBUG, logger="test.dictation")
@@ -1814,19 +1845,19 @@ def test_queued_press_after_terminal_transition_is_discarded(
 
     rig.during_paste = reenter
     rig.result()
-    assert rig.core.phase.value == "finishing"
-    rig.assert_hotkey_state(HotkeyState.IDLE)
-    assert rig.backend.ungrab_escape.call_count == 2
-    assert rig.commands().count("record.start") == 1
-    dropped = [r for r in caplog.records if "отложенные события" in r.message]
-    assert len(dropped) == 1 and dropped[0].levelno == logging.DEBUG
-    assert not dropped[0].args and MARKER not in caplog.text
-
     rig.during_paste = None
-    rig.start()
-    assert rig.commands().count("record.start") == 2
+    # Исход старой фразы показан до начала новой записи; Escape до нажатия её не трогает.
+    assert any(call[0] in (PillState.ERROR, PillState.CANCELLED) for call in rig.pill.calls)
+    assert rig.pill.calls[-1][0] == PillState.LISTENING
+    assert rig.core.phase == DictationPhase.RECORDING
     rig.assert_hotkey_state(HotkeyState.RECORDING)
-    assert rig.recording
+    assert rig.commands().count("record.start") == 2
+    assert "record.cancel" not in rig.commands()
+    assert rig.recording and MARKER not in caplog.text
+    rig.stop()
+    rig.result()
+    assert [text for text, _, _ in rig.pasted] == [MARKER, MARKER]
+    rig.assert_hotkey_state(HotkeyState.IDLE)
 
 
 @pytest.mark.parametrize("kind", [PasteOutcomeKind.PASTED, PasteOutcomeKind.BUSY])
@@ -1844,19 +1875,24 @@ def test_escape_and_press_during_paste_release_regrabbed_escape(
 
     rig.during_paste = reenter
     rig.result()
-    rig.assert_hotkey_state(HotkeyState.IDLE)
-    assert rig.backend.ungrab_escape.call_count == 2
-    assert rig.commands().count("record.start") == 1
+    rig.during_paste = None
     if kind == PasteOutcomeKind.BUSY:
+        # Escape отменил невставленную фразу; нажатие ждало подтверждения отмены — отказ.
+        rig.assert_hotkey_state(HotkeyState.IDLE)
+        assert rig.backend.ungrab_escape.call_count == 2
+        assert rig.commands().count("record.start") == 1
         assert rig.commands().count("record.cancel") == 1
         rig.event("cancelled")
+        assert rig.core.phase.value == "finishing"
+        rig.start()
     else:
+        # US-2.7, Q6: вставленную фразу Escape уже не отменяет, нажатие начинает следующую;
+        # «Готово» не перебивает индикацию новой записи (решение 3).
         assert "record.cancel" not in rig.commands()
-        assert rig.cancels == 1
-        assert rig.pill.calls[-1] == (PillState.DONE, None, None)
-    assert rig.core.phase.value == "finishing"
-    rig.during_paste = None
-    rig.start()
+        assert rig.cancels == 0
+        assert (PillState.DONE, None, None) not in rig.pill.calls
+        assert rig.pill.calls[-1][0] == PillState.LISTENING
+        assert rig.core.phase == DictationPhase.RECORDING
     assert rig.commands().count("record.start") == 2
     rig.assert_hotkey_state(HotkeyState.RECORDING)
     assert rig.recording
@@ -2118,11 +2154,17 @@ def test_paste_exception_cannot_leak_text_or_leave_input_suspended(
 
     rig.during_paste = fail
     rig.result()
-    assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
-    assert MARKER not in caplog.text and rig.commands().count("record.start") == 1
     rig.during_paste = None
+    # US-2.7 (Q6): нажатие во время вставки начало следующую запись; ошибка первой
+    # фразы видна после её отпускания (решение 3), ввод не остался приостановленным.
+    assert MARKER not in caplog.text and rig.commands().count("record.start") == 2
+    assert rig.pill.calls[-1][0] == PillState.LISTENING and rig.recording
+    rig.stop()
+    assert (PillState.ERROR, ERROR_RECOGNITION_FAILED, None) in rig.pill.calls
+    rig.result()
+    assert [text for text, _, _ in rig.pasted] == [MARKER, MARKER]
     rig.start()
-    assert rig.commands().count("record.start") == 2
+    assert rig.commands().count("record.start") == 3
 
 
 @pytest.mark.parametrize("kind", list(PasteOutcomeKind))
@@ -3351,3 +3393,49 @@ def test_device_change_in_processing_does_not_touch_recognition(rig: Rig, kind: 
     rig.result()
     assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
     assert pill_states_after_device_error(rig, kind) == []
+
+
+# US-2.6: окно-цель на момент нажатия (pinned_window) ------------------------------------
+
+
+def test_pinned_window_targets_phrase_started_inside_block(rig: Rig) -> None:
+    with rig.core.pinned_window(777):
+        rig.start()
+    assert rig.core._pinned_window is None
+    rig.stop()
+    rig.result()
+    assert rig.pasted[-1][1] == 777
+
+
+def test_pinned_window_is_dropped_when_press_is_refused(rig: Rig) -> None:
+    """Отказ нажатию внутри блока (идёт проверка микрофона) не оставляет окно-цель
+    следующей фразе: она вставляется в окно на своём старте."""
+    updates: list[MicrophoneTestUpdate] = []
+    rig.core.start_test("", updates.append)
+    before = rig.commands()
+    with rig.core.pinned_window(777):
+        rig.start()
+    assert rig.commands() == before
+    assert rig.core._pinned_window is None
+    rig.core.stop_test()
+    rig.result("проверка")
+    for timer in [t for t in rig.timers if not t.cancelled and not t.fired]:
+        timer.fire()
+    assert rig.core.phase is DictationPhase.IDLE
+    rig.fsm.escape(rig.now)
+    rig.window = 99
+    rig.start()
+    rig.stop()
+    rig.result()
+    assert rig.pasted[-1][1] == 99
+
+
+def test_pinned_window_is_dropped_on_exception(rig: Rig) -> None:
+    with pytest.raises(RuntimeError, match=MARKER), rig.core.pinned_window(777):
+        raise RuntimeError(MARKER)
+    assert rig.core._pinned_window is None
+    rig.window = 99
+    rig.start()
+    rig.stop()
+    rig.result()
+    assert rig.pasted[-1][1] == 99

@@ -2589,8 +2589,15 @@ def test_capture_watchdog_never_frees_during_libpulse_call(
             if cancel == "engine-failed":
                 engine_gate.set()
                 assert events.get(timeout=TIMEOUT)["code"] == "engine-failed"
-            else:
-                capture.request_stop()
+                # US-2.7, решение 5: ошибка движка у прошлой фразы не останавливает
+                # захват следующей — сторож молчит и после своего срока, поток жив.
+                time.sleep(watchdog_s * 2)
+                worker.check_capture_watchdog()
+                assert capture.active and owner.is_alive()
+                assert close_threads == closes_before_stop
+                # Остановка — только явная, дальше — как у request_stop.
+                stopped_at = time.monotonic()
+            capture.request_stop()
             worker.check_capture_watchdog()
             with pytest.raises(CaptureStopTimeout):
                 capture.stop()

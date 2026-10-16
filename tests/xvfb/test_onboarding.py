@@ -1005,6 +1005,7 @@ class FakeSettings(QObject):
         self._soundCuesEnabled: bool = False
         self._soundCuesStatus: str = ""
         self._pillEnabled: bool = True
+        self._modelUnloadMinutes: int = 0
         self._language: str = "ru"
         self._checkAppUpdates: bool = True  # Стенд AppImage; deb задаётся явно.
         self._checkModelUpdates: bool = True
@@ -1205,6 +1206,17 @@ class FakeSettings(QObject):
         self.changed.emit()
 
     pillEnabled = pyqtProperty(bool, _get_pillEnabled, _set_pillEnabled, notify=changed)
+
+    def _get_modelUnloadMinutes(self) -> int:
+        return self._modelUnloadMinutes
+
+    def _set_modelUnloadMinutes(self, value: int) -> None:
+        self._modelUnloadMinutes = value
+        self.changed.emit()
+
+    modelUnloadMinutes = pyqtProperty(
+        int, _get_modelUnloadMinutes, _set_modelUnloadMinutes, notify=changed
+    )
 
     def _get_language(self) -> str:
         return self._language
@@ -2423,7 +2435,7 @@ def test_menu_and_show_section_switch_real_sections(onboarding_app: Any, dark: b
                 else description["title"]
             )
             subtitle = (
-                "Голосовые команды Astra Cowork"
+                "Голосовые команды Astra Cowork и память"
                 if description["key"] == "advanced"
                 else description["subtitle"]
             )

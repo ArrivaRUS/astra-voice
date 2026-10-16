@@ -22,7 +22,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from astra_voice.core.settings import Settings, is_valid_combo
+from astra_voice.core.settings import MODEL_UNLOAD_MINUTES, Settings, is_valid_combo
 
 log = logging.getLogger(__name__)
 
@@ -178,6 +178,17 @@ def effective(settings: Settings, policy: Policy) -> Settings:
     for key, value in policy.values.items():
         if key == "hotkey" and (not isinstance(value, str) or not is_valid_combo(value)):
             log.warning("hotkey=%r из политики недопустим, оставляю прежнее значение", value)
+            continue
+        if key == "model_unload_minutes" and (
+            type(value) is not int or value not in MODEL_UNLOAD_MINUTES
+        ):
+            # Иначе модель молча держалась бы в памяти при выбранной администратором выгрузке.
+            log.warning(
+                "model_unload_minutes=%r из политики недопустим (допустимо: %s), "
+                "оставляю прежнее значение",
+                value,
+                ", ".join(map(str, MODEL_UNLOAD_MINUTES)),
+            )
             continue
         if key in _SETTINGS_TYPES:
             setattr(result, key, value)

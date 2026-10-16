@@ -207,7 +207,9 @@ def test_unwired_mouse_controls_are_visible_reachable_and_fail_closed(width: int
         assert window is not None
         items = list(tree(window.contentItem()))
         assert any(item.property("text") == "Продвинутые настройки" for item in items)
-        assert any(item.property("text") == "Голосовые команды Astra Cowork" for item in items)
+        assert any(
+            item.property("text") == "Голосовые команды Astra Cowork и память" for item in items
+        )
         body = next(item for item in items if item.metaObject().indexOfProperty("contentY") >= 0)
         controls = {
             item.objectName(): item
