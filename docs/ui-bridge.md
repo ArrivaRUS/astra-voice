@@ -129,6 +129,7 @@ Python вызывает метод `show_section(name)`
 | `soundCuesEnabled` | `bool` | чтение и запись | По умолчанию `false`. Атомарное сохранение `sound_cues_enabled` → применение звуковых сигналов; отказ сохранения откатывает значение и сообщает `saveError` | `soundCuesEnabledChanged` |
 | `soundCuesStatus` | `string` | только чтение | Пустая строка при выключении или отсутствии диагностического статуса; иначе честное сообщение о недоступности/ошибке/приостановке. Непустая строка показывается пояснением в строке звука; пустая не гарантирует слышимость | `soundCuesStatusChanged` |
 | `pillEnabled` | `bool` | чтение и запись | Запись файла → `apply.pill_enabled()`: индикатор-пилюля и значок в трее переключаются сразу | `pillEnabledChanged` |
+| `trayXembedUnconfirmed` | `bool` | только чтение | `True`, только если значок показан через XEmbed без подтверждённой регистрации SNI; при `tray=None` — `False`. Пояснение в строке индикатора записи «Общих» обновляется по сигналу | `trayXembedUnconfirmedChanged` |
 | `language` | `string` | чтение и запись | Допустимы только `"ru"` и `"en"`; иное отвергается. Только запись файла, живого применения нет | `languageChanged` |
 | `checkAppUpdates` | `bool` | чтение и запись | Только запись файла | `checkAppUpdatesChanged` |
 | `checkModelUpdates` | `bool` | чтение и запись | Только запись файла | `checkModelUpdatesChanged` |

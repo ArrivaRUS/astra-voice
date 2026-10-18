@@ -20,6 +20,7 @@ from PyQt5.QtCore import (
     QObject,
     Qt,
     QTimer,
+    pyqtSignal,
     pyqtSlot,
 )
 from PyQt5.QtDBus import (
@@ -348,6 +349,8 @@ class Tray(QObject):
     Тесты подменяют отправку команд транспорта до start().
     """
 
+    xembedUnconfirmedChanged = pyqtSignal()
+
     def __init__(
         self,
         provider: TrayIconProvider,
@@ -388,6 +391,7 @@ class Tray(QObject):
         self._xembed_owner_id: int | None = None
         self._xembed_allowed = False
         self._shown_unconfirmed = False
+        self._xembed_unconfirmed = False
         self._xembed_polling = False
         self._xembed_poll_at = 0.0
         self._item_registered = False
@@ -664,6 +668,18 @@ class Tray(QObject):
             self._invalidate_registration()
         return self._shown_unconfirmed
 
+    @property
+    def xembed_unconfirmed(self) -> bool:
+        """XEmbed показан локально, но SNI не подтвердил видимость на панели."""
+        # Как visible_for_close, проверяем только локальный значок, без D-Bus/X11.
+        return self.visible_for_close and self._xembed_unconfirmed
+
+    def _sync_xembed_unconfirmed(self) -> None:
+        value = self._path == "XEmbed" and self._shown_unconfirmed and not self._registered
+        if value != self._xembed_unconfirmed:
+            self._xembed_unconfirmed = value
+            self.xembedUnconfirmedChanged.emit()
+
     def _registration_ready(self) -> bool:
         return self._panel_ready() and self._item_registered
 
@@ -676,6 +692,7 @@ class Tray(QObject):
                 else ""
             )
             _logger.info("трей: путь %s%s", path, suffix)
+            self._sync_xembed_unconfirmed()
 
     def _poll_xembed_owner(self) -> None:
         """Редкая сверка SNI и владельца XEmbed, всегда из GUI-потока."""
@@ -742,6 +759,7 @@ class Tray(QObject):
         self._shown_unconfirmed = bool(keep_shown and self._tray.isVisible())
         if not self._shown_unconfirmed:
             self._tray.hide()
+        self._sync_xembed_unconfirmed()
         if self._running and self._deadline is None:
             self._begin_retry()
 
@@ -991,6 +1009,7 @@ class Tray(QObject):
                 self._retry_after_change()
             elif not self._shown_unconfirmed:
                 self._begin_retry()
+        self._sync_xembed_unconfirmed()
         self._query_items()
 
     def _plasma_reply(self, reply: _BusReply | None) -> None:
@@ -1116,6 +1135,7 @@ class Tray(QObject):
             if self._registered:
                 self._sni_backend_proven = True
             self._shown_unconfirmed = bool(self._tray.isVisible()) and not self._sni_backend_proven
+            self._sync_xembed_unconfirmed()
             if (self._shown_unconfirmed or self._registered) and not self._xembed_polling:
                 self._xembed_polling = True
                 self._xembed_timer.start()
@@ -1262,3 +1282,4 @@ class Tray(QObject):
         if _bus_receiver is not None and _bus_receiver.tray is self:
             _bus_receiver.tray = None
         self._tray.hide()
+        self._sync_xembed_unconfirmed()

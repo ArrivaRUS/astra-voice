@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 from PyQt5.QtDBus import QDBusMessage
+from PyQt5.QtTest import QSignalSpy
 from test_tray import OWN_ITEM, SERVICE, Harness
 from test_tray import forbid_real_x as forbid_real_x
 from test_tray import harness as harness
@@ -56,6 +57,83 @@ def test_xembed_show_never_proves_registration_or_warns(xembed: Harness, missing
     h.banner.assert_not_called()
     h.flush.assert_not_called()
     h.icon.isSystemTrayAvailable.assert_not_called()
+
+
+def test_xembed_hint_tracks_show_owner_loss_return_and_stop(xembed: Harness) -> None:
+    h = xembed
+    changed = QSignalSpy(h.tray.xembedUnconfirmedChanged)
+    assert h.tray.xembed_unconfirmed is False
+    h.tray.start()
+    assert h.tray.xembed_unconfirmed is True
+    assert len(changed) == 1
+    h.tray.set_state(TrayState.LISTENING)
+    assert h.tray.xembed_unconfirmed is True
+    assert len(changed) == 1
+    h.probe.owner.return_value = None
+    h.clock.advance(10_000)
+    assert h.tray.xembed_unconfirmed is False
+    assert len(changed) == 2
+    h.probe.owner.return_value = 0xF01
+    h.clock.advance(10_000)
+    assert h.tray.xembed_unconfirmed is True
+    assert len(changed) == 3
+    h.tray.stop()
+    assert h.tray.xembed_unconfirmed is False
+    assert len(changed) == 4
+
+
+def test_xembed_hint_disappears_on_sni_path_and_confirmation(xembed: Harness) -> None:
+    h = xembed
+    h.tray.start()
+    assert h.tray.xembed_unconfirmed is True
+    changed = QSignalSpy(h.tray.xembedUnconfirmedChanged)
+    h.bus.host_registered = True
+    h.bus.registered_items = []
+    h.watcher.serviceRegistered.emit(SERVICE)
+    # Неподтверждённый показ бывает и на SNI: одного _shown_unconfirmed мало.
+    assert h.tray._shown_unconfirmed
+    assert h.tray._path == "SNI"
+    assert h.tray.xembed_unconfirmed is False
+    assert len(changed) == 1
+    h.bus.item_registered(OWN_ITEM)
+    assert h.tray.registered
+    assert not h.tray.xembed_unconfirmed
+    assert len(changed) == 1
+
+
+@pytest.mark.parametrize("loss", ["hidden", "empty_icon"])
+def test_xembed_hint_validates_local_visibility(xembed: Harness, loss: str) -> None:
+    h = xembed
+    h.tray.start()
+    changed = QSignalSpy(h.tray.xembedUnconfirmedChanged)
+    if loss == "hidden":
+        h.icon.hide()
+    else:
+        h.provider.has_icon.return_value = False
+    assert not h.tray.xembed_unconfirmed
+    assert len(changed) == 1
+
+
+def test_unconfirmed_sni_falls_back_to_xembed_with_signal(xembed: Harness) -> None:
+    h = xembed
+    h.bus.host_registered = True
+    h.bus.registered_items = []
+    h.tray.start()
+    assert not h.tray.xembed_unconfirmed
+    changed = QSignalSpy(h.tray.xembedUnconfirmedChanged)
+    h.bus.host_registered = False
+    h.watcher.serviceUnregistered.emit(SERVICE)
+    assert h.tray._path == "XEmbed"
+    assert h.tray.xembed_unconfirmed
+    assert len(changed) == 1
+
+
+def test_sni_show_without_confirmation_has_no_xembed_hint(harness: Harness) -> None:
+    harness.bus.registered_items = []
+    harness.tray.start()
+    assert harness.tray._shown_unconfirmed
+    assert harness.tray._path == "SNI"
+    assert not harness.tray.xembed_unconfirmed
 
 
 def test_kde_never_uses_xembed(xembed: Harness) -> None:

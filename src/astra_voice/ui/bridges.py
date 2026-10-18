@@ -51,6 +51,7 @@ from astra_voice.ui.model_downloads import (
     ModelDownloads,
     ModelPort,
 )
+from astra_voice.ui.tray import Tray
 from astra_voice.worker.audio import (
     SILENCE_HOLD_S,
     AudioDevice,
@@ -218,6 +219,7 @@ class SettingsBridge(QObject):
     soundCuesEnabledChanged = pyqtSignal()
     soundCuesStatusChanged = pyqtSignal()
     pillEnabledChanged = pyqtSignal()
+    trayXembedUnconfirmedChanged = pyqtSignal()
     languageChanged = pyqtSignal()
     checkAppUpdatesChanged = pyqtSignal()
     checkModelUpdatesChanged = pyqtSignal()
@@ -286,8 +288,12 @@ class SettingsBridge(QObject):
         device_provider: Callable[[], list[AudioDevice]] = list_devices,
         default_device_provider: Callable[[list[AudioDevice]], AudioDevice] | None = None,
         parent: QObject | None = None,
+        tray: Tray | None = None,
     ) -> None:
         super().__init__(parent)
+        self._tray = tray
+        if tray is not None:
+            tray.xembedUnconfirmedChanged.connect(self.trayXembedUnconfirmedChanged)
         self._settings = settings
         self._mirror = mirror
         # Список микрофонов читается по запросу экрана (refreshDevices), а не при
@@ -1192,6 +1198,10 @@ class SettingsBridge(QObject):
         if self._sound_cues_host is None:
             return "Звуковые сигналы недоступны: запись не готова"
         return str(self._sound_cues_host.sound_cues_status)
+
+    @pyqtProperty(bool, notify=trayXembedUnconfirmedChanged)
+    def trayXembedUnconfirmed(self) -> bool:  # noqa: N802
+        return self._tray.xembed_unconfirmed if self._tray is not None else False
 
     @pyqtProperty(bool, notify=pillEnabledChanged)
     def pillEnabled(self) -> bool:  # noqa: N802

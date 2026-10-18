@@ -85,6 +85,36 @@ MICROPHONE_ERROR = (
 )
 
 
+def test_tray_hint_defaults_false_and_is_read_only() -> None:
+    bridge = SettingsBridge(Settings(), save=Mock())
+    assert bridge.trayXembedUnconfirmed is False
+    meta = bridge.metaObject()
+    prop = meta.property(meta.indexOfProperty("trayXembedUnconfirmed"))
+    assert prop.typeName() == "bool"
+    assert not prop.isWritable()
+    assert bytes(prop.notifySignal().name()) == b"trayXembedUnconfirmedChanged"
+
+
+def test_tray_hint_forwards_live_state_and_signal() -> None:
+    from PyQt5.QtCore import pyqtSignal
+
+    from astra_voice.ui.tray import Tray
+
+    class FakeTray(QObject):
+        xembedUnconfirmedChanged = pyqtSignal()
+        xembed_unconfirmed = False
+
+    tray = FakeTray()
+    bridge = SettingsBridge(Settings(), tray=cast(Tray, tray), save=Mock())
+    changed = QSignalSpy(bridge.trayXembedUnconfirmedChanged)
+    assert bridge.trayXembedUnconfirmed is False
+    for value in (True, False):
+        tray.xembed_unconfirmed = value
+        tray.xembedUnconfirmedChanged.emit()
+        assert bridge.trayXembedUnconfirmed is value
+    assert len(changed) == 2
+
+
 def _autostart_state(enabled: bool) -> AutostartState:
     return AutostartState(enabled, "none", False, False)
 

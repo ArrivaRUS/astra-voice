@@ -786,6 +786,7 @@ class FakeSettings(QObject):
     """Изменяемый контракт настроек без системных побочных действий."""
 
     changed = pyqtSignal()
+    trayXembedUnconfirmedChanged = pyqtSignal()
     commandMouseEnabledChanged = pyqtSignal()
     commandMouseButtonChanged = pyqtSignal()
     commandMouseStateChanged = pyqtSignal()
@@ -1215,6 +1216,13 @@ class FakeSettings(QObject):
         self.changed.emit()
 
     pillEnabled = pyqtProperty(bool, _get_pillEnabled, _set_pillEnabled, notify=changed)
+
+    def _get_trayXembedUnconfirmed(self) -> bool:
+        return False
+
+    trayXembedUnconfirmed = pyqtProperty(
+        bool, _get_trayXembedUnconfirmed, notify=trayXembedUnconfirmedChanged
+    )
 
     def _get_language(self) -> str:
         return self._language

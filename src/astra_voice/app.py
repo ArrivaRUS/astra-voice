@@ -1713,6 +1713,7 @@ def main(argv: list[str] | None = None) -> int:
             capture=capture,
             locked=locked_settings,
             autostart=autostart,
+            tray=runtime.tray if runtime_ready and runtime is not None else None,
         )
         if runtime_ready and runtime is not None:
 
