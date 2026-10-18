@@ -20,6 +20,7 @@ from astra_voice.models.catalog_effective import (
     CATALOG_LOCK,
     SIGNATURE_MAX_BYTES,
     SNAPSHOT_FILE_NAME,
+    SNAPSHOT_MAX_BYTES,
     load_effective,
     read_snapshot,
     state_of,
@@ -396,12 +397,42 @@ class CatalogUpdateSource:
                         },
                         separators=(",", ":"),
                     ).encode()
-                    # Пока snapshot не записан, watermark и принятый каталог
-                    # остаются пригодны; ошибка записи не блокирует current().
-                    update_cache.write_private(self._snapshot, snapshot)
+                    try:
+                        previous_snapshot = read_private(self._snapshot, SNAPSHOT_MAX_BYTES)
+                    except (OSError, ValueError):
+                        previous_snapshot = None
                     self._blocked = True
-                    self._watermark.parent.mkdir(parents=True, exist_ok=True)
-                    catalog_state.apply_state(self._watermark, candidate)
+                    try:
+                        try:
+                            update_cache.write_private(self._snapshot, snapshot)
+                        except IsADirectoryError:
+                            # Пустой каталог на месте снимка тоже не содержит
+                            # прежних байтов; непустой каталог не удаляем.
+                            self._snapshot.rmdir()
+                            update_cache.write_private(self._snapshot, snapshot)
+                        self._watermark.parent.mkdir(parents=True, exist_ok=True)
+                        catalog_state.apply_state(self._watermark, candidate)
+                    except OSError:
+                        # fsync каталога может упасть уже после замены отметки.
+                        # Принятую пару в этом случае откатывать нельзя.
+                        if catalog_state.read_state(self._watermark) == candidate:
+                            self._catalog = catalog
+                            self._accepted = candidate
+                            self._initialized = True
+                            self._blocked = False
+                        else:
+                            try:
+                                if previous_snapshot is None:
+                                    self._snapshot.unlink(missing_ok=True)
+                                else:
+                                    update_cache.write_private(self._snapshot, previous_snapshot)
+                            except OSError:
+                                log.warning(
+                                    "Не удалось откатить снимок каталога после сбоя записи."
+                                )
+                            else:
+                                self._blocked = False
+                        raise
                     self._catalog = catalog
                     self._accepted = candidate
                     self._initialized = True

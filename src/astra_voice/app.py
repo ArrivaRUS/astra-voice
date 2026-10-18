@@ -39,7 +39,7 @@ from astra_voice.core.paths import (
 )
 from astra_voice.core.version import __version__
 from astra_voice.models import catalog_state
-from astra_voice.models.catalog_effective import CATALOG_LOCK
+from astra_voice.models.catalog_effective import CATALOG_LOCK, _cached_pending_snapshot
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.sound import MicrophoneState
@@ -251,7 +251,13 @@ def _revoked_check(model: Any | None) -> Callable[[str, str], bool]:
                     exists = True
                 state = catalog_state.read_state(path)
             except (OSError, paths.PathError, ValueError, RecursionError) as error:
+                cached = _cached_pending_snapshot(None)
+                if cached is not None and cached.is_revoked(model_id, revision):
+                    return True
                 raise RevocationUnknown from error
+            cached = _cached_pending_snapshot(state)
+            if cached is not None and cached.is_revoked(model_id, revision):
+                return True
             if exists and state is None:
                 raise RevocationUnknown
             if state is not None and state.revoked is not None:

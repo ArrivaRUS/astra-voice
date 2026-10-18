@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import stat
+import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -376,8 +377,17 @@ def test_snapshot_failure_after_marker_repair_clears_previous_block(
     source._baseline = source.current()
     raw = json.dumps(scenario.remote()).encode()
     monkeypatch.setattr(catalog_updates, "fetch", Mock(return_value=(raw, signature(raw))))
+    # T-233: снимок новее отметки теперь остаётся только при двойном сбое.
+    real_unlink = Path.unlink
+
+    def fail_snapshot_removal(path: Path, missing_ok: bool = False) -> None:
+        if path == source._snapshot:
+            raise OSError("сбой удаления снимка при откате")
+        real_unlink(path, missing_ok=missing_ok)
+
     with monkeypatch.context() as failed_marker:
         failed_marker.setattr(catalog_state, "write_state", Mock(side_effect=OSError("disk full")))
+        failed_marker.setattr(Path, "unlink", fail_snapshot_removal)
         with pytest.raises(CatalogError) as refused:
             source.refresh(threading.Event())
         assert refused.value.code == "state-write"
@@ -974,11 +984,16 @@ def test_new_snapshot_signature_is_verified_once_per_exact_pair(
         assert refused.value.code == "revoked"
     assert scenario.verifier.calls == before + 1
     # Та же raw, другая подпись: старый положительный результат не переиспользуется.
+    # T-233: отказ проверяем на безопасной ревизии, сохраняя известный отзыв X.
     scenario.snapshot(remote, valid_signature=False)
     for expected_calls in (before + 2, before + 2):  # Отказ проверки тоже кэшируется.
         with pytest.raises(StoreError) as unknown:
-            catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+            catalog_effective.check_revoked(entry.id, NEW_REVISION, None, include_snapshot=True)
         assert unknown.value.code == "catalog-unavailable"
+        assert scenario.verifier.calls == expected_calls
+        with pytest.raises(StoreError) as revoked:
+            catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+        assert revoked.value.code == "revoked"
         assert scenario.verifier.calls == expected_calls
 
 
@@ -1318,4 +1333,363 @@ def test_t231_unverifiable_newer_snapshot_refuses_activation(
         service.set_current(entry.id, entry.revision)
 
     assert refused.value.code == "catalog-unavailable"
+    assert (service._store.root / "current.json").read_bytes() == before
+
+
+def prepare_revoking_refresh(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+) -> bytes:
+    """Готовит настоящий подписанный каталог с отзывом поверх принятой пары (1,4)."""
+    source._baseline = source.current()
+    entry = source._baseline.entries[0]
+    remote = scenario.remote()
+    remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    raw = json.dumps(remote).encode()
+    monkeypatch.setattr(catalog_updates, "fetch", Mock(return_value=(raw, signature(raw))))
+    return raw
+
+
+@pytest.mark.parametrize("previous_snapshot", [False, True])
+@pytest.mark.parametrize("failure", ["marker", "snapshot-before-replace", "snapshot-after-replace"])
+def test_t233_refresh_rolls_back_snapshot_and_retries(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    revocation_service: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    previous_snapshot: bool,
+    failure: str,
+) -> None:
+    from astra_voice.app import _revoked_check
+    from astra_voice.core.model_source import _not_revoked
+
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry)
+    if previous_snapshot:
+        scenario.snapshot(scenario.document)
+    snapshot_path = scenario.snapshots / catalog_effective.SNAPSHOT_FILE_NAME
+    before = snapshot_path.read_bytes() if previous_snapshot else None
+    prepare_revoking_refresh(scenario, source, monkeypatch)
+    accepted, accepted_state = source._catalog, source._accepted
+    real_write = update_cache.write_private
+    calls = 0
+
+    def fail_snapshot(path: Path, raw: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if failure == "snapshot-after-replace":
+                real_write(path, raw)
+            raise OSError("сбой записи снимка")
+        real_write(path, raw)
+
+    with monkeypatch.context() as fault:
+        if failure == "marker":
+            fault.setattr(catalog_state, "write_state", Mock(side_effect=OSError("диск заполнен")))
+        else:
+            fault.setattr(update_cache, "write_private", fail_snapshot)
+        with pytest.raises(CatalogError) as refused:
+            source.refresh(threading.Event())
+    assert refused.value.code == "state-write"
+    assert not source._blocked
+    assert source._catalog is accepted and source._accepted == accepted_state
+    assert (snapshot_path.read_bytes() if snapshot_path.exists() else None) == before
+    assert source.current() is accepted
+    service.set_current(entry.id, entry.revision)
+    checker = _revoked_check(service)
+    request = {"id": entry.id, "revision": entry.revision}
+    assert checker(entry.id, entry.revision) is False
+    assert _not_revoked(request, checker) is request
+    restarted = scenario.load()
+    assert restarted.serial == 4 and not restarted.is_revoked(entry.id, entry.revision)
+    source.refresh(threading.Event())
+    assert source.current().serial == 5
+    marker = catalog_state.read_state(scenario.state)
+    assert marker is not None and (marker.trust_epoch, marker.serial) == (1, 5)
+
+
+@pytest.mark.parametrize("previous_snapshot", ["oversized", "symlink", "directory", "eio"])
+@pytest.mark.parametrize("marker_failure", [False, True])
+def test_t233_unreadable_previous_snapshot_does_not_block_refresh(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+    previous_snapshot: str,
+    marker_failure: bool,
+) -> None:
+    raw = prepare_revoking_refresh(scenario, source, monkeypatch)
+    accepted, accepted_state = source._catalog, source._accepted
+    marker_before = scenario.state.read_bytes()
+    snapshot_path = scenario.snapshots / catalog_effective.SNAPSHOT_FILE_NAME
+    target = scenario.snapshots / "snapshot-target.json"
+    target.write_bytes("не изменять".encode())
+    if previous_snapshot == "oversized":
+        with snapshot_path.open("wb") as stream:
+            stream.truncate(catalog_effective.SNAPSHOT_MAX_BYTES + 1)
+    elif previous_snapshot == "symlink":
+        snapshot_path.symlink_to(target)
+    elif previous_snapshot == "directory":
+        snapshot_path.mkdir()
+    else:
+        snapshot_path.write_bytes("нечитаемый прежний снимок".encode())
+    read_private = update_cache.read_private
+
+    def read_with_eio(path: Path, limit: int) -> bytes:
+        if path == snapshot_path:
+            raise OSError(5, "сбой чтения снимка")
+        return read_private(path, limit)
+
+    with monkeypatch.context() as fault:
+        if previous_snapshot == "eio":
+            fault.setattr(catalog_updates, "read_private", read_with_eio)
+        if marker_failure:
+            fault.setattr(catalog_state, "write_state", Mock(side_effect=OSError("диск заполнен")))
+            with pytest.raises(CatalogError) as refused:
+                source.refresh(threading.Event())
+            assert refused.value.code == "state-write"
+        else:
+            source.refresh(threading.Event())
+    assert not source._blocked
+    assert target.read_bytes() == "не изменять".encode()
+    if marker_failure:
+        assert not snapshot_path.exists() and not snapshot_path.is_symlink()
+        assert source._catalog is accepted and source._accepted == accepted_state
+        assert scenario.state.read_bytes() == marker_before
+        assert source.current() is accepted
+    else:
+        assert catalog_effective.read_snapshot(scenario.snapshots) == (raw, signature(raw))
+        marker = catalog_state.read_state(scenario.state)
+        assert marker is not None and (marker.trust_epoch, marker.serial) == (1, 5)
+        assert source.current().serial == 5
+
+
+def test_t233_marker_failure_after_replace_keeps_accepted_snapshot(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = prepare_revoking_refresh(scenario, source, monkeypatch)
+    real_write = catalog_state.write_state
+
+    def write_then_fail(path: Path, state: catalog_state.CatalogState) -> None:
+        real_write(path, state)
+        raise OSError("сбой fsync после замены отметки")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(catalog_state, "write_state", write_then_fail)
+        with pytest.raises(CatalogError) as refused:
+            source.refresh(threading.Event())
+    assert refused.value.code == "state-write"
+    assert catalog_effective.read_snapshot(scenario.snapshots) == (raw, signature(raw))
+    assert source._catalog is not None and source._catalog.serial == 5
+    assert not source._blocked
+    assert source.current().serial == 5
+    assert catalog_state.read_state(scenario.state) == source._accepted
+
+
+@pytest.mark.parametrize("damage", ["eio", "json", "missing", "catalog-json"])
+def test_t233_cached_revocation_survives_double_write_failure(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    revocation_service: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    damage: str,
+) -> None:
+    from astra_voice.app import _revoked_check
+    from astra_voice.core.model_source import ModelRevoked, _not_revoked
+
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry)
+    install_fixture(service._store, replace(entry, revision=NEW_REVISION))
+    service.set_current(entry.id, NEW_REVISION)
+    before = (service._store.root / "current.json").read_bytes()
+    scenario.snapshot(scenario.document)
+    raw = prepare_revoking_refresh(scenario, source, monkeypatch)
+    real_write = update_cache.write_private
+    calls = 0
+
+    def fail_rollback(path: Path, payload: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise OSError("сбой отката")
+        real_write(path, payload)
+
+    with monkeypatch.context() as fault, caplog.at_level(logging.WARNING):
+        fault.setattr(catalog_state, "write_state", Mock(side_effect=OSError("диск заполнен")))
+        fault.setattr(update_cache, "write_private", fail_rollback)
+        with pytest.raises(CatalogError) as refused:
+            source.refresh(threading.Event())
+    assert refused.value.code == "state-write"
+    assert source._blocked
+    assert "Не удалось откатить снимок" in caplog.text
+    assert str(scenario.snapshots) not in caplog.text
+    assert catalog_effective.read_snapshot(scenario.snapshots) == (raw, signature(raw))
+    with pytest.raises(StoreError) as first:
+        service.set_current(entry.id, entry.revision)
+    assert first.value.code == "revoked"
+    cached = catalog_effective._snapshot_cache
+    assert cached is not None and cached[1] is not None
+    assert cached[1].is_revoked(entry.id, entry.revision)
+    verify_calls = scenario.verifier.calls
+    snapshot_path = scenario.snapshots / catalog_effective.SNAPSHOT_FILE_NAME
+    if damage == "eio":
+        monkeypatch.setattr(catalog_effective, "read_snapshot", Mock(side_effect=OSError(5, "EIO")))
+    elif damage == "json":
+        snapshot_path.write_bytes(b"{")
+    elif damage == "missing":
+        snapshot_path.unlink()
+    else:
+        scenario.snapshot_bytes(b"{", b"bad signature")
+    with pytest.raises(StoreError) as second:
+        service.set_current(entry.id, entry.revision)
+    assert second.value.code == "revoked"
+    assert (service._store.root / "current.json").read_bytes() == before
+    snapshot_read = Mock(side_effect=AssertionError("Быстрый путь читает снимок"))
+    monkeypatch.setattr(catalog_effective, "read_snapshot", snapshot_read)
+    for model in (service, None):
+        checker = _revoked_check(model)
+        assert checker(entry.id, entry.revision) is True
+        with pytest.raises(ModelRevoked):
+            _not_revoked({"id": entry.id, "revision": entry.revision}, checker)
+    assert scenario.verifier.calls == verify_calls
+    snapshot_read.assert_not_called()
+
+
+@pytest.mark.parametrize("marker_serial", [5, 6])
+def test_t233_cached_revocation_not_newer_than_marker_is_ignored(
+    scenario: Scenario, revocation_service: Any, marker_serial: int
+) -> None:
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry)
+    remote = scenario.remote()
+    remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    scenario.snapshot(remote)
+    with pytest.raises(StoreError, match="отозвана"):
+        service.set_current(entry.id, entry.revision)
+    accepted = scenario.remote(serial=marker_serial)
+    raw = json.dumps(accepted).encode()
+    catalog = verify_catalog(raw, signature(raw), scenario.verifier, schema_root=scenario.root)
+    catalog_state.write_state(scenario.state, state_of(catalog, raw))
+    service.set_current(entry.id, entry.revision)
+    assert service.revoked_revision(entry.id, entry.revision) is False
+    assert service._store.current().revision == entry.revision
+
+
+@pytest.mark.parametrize("failure", ["io", "clock-behind", "timeout", "oserror"])
+def test_t235_transient_snapshot_failure_is_retried(
+    scenario: Scenario,
+    revocation_service: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry)
+    scenario.snapshot(scenario.remote())
+    real_verify = scenario.verifier.verify_detached
+    verify_calls = 0
+    failing = True
+
+    def verify(data: Path, sig: Path, *, cancel: Callable[[], bool] | None = None) -> VerifyResult:
+        nonlocal verify_calls
+        verify_calls += 1
+        result = real_verify(data, sig, cancel=cancel)
+        if failing:
+            if failure == "io":
+                raise CatalogError("io", "Временный сбой проверки")
+            if failure == "oserror":
+                raise OSError("Временный сбой временной папки gpgv")
+            if failure == "clock-behind":
+                return replace(result, ok=False, code="clock-behind")
+            return replace(result, ok=False, code="", reason="gpgv не ответил за отведённое время")
+        return result
+
+    monkeypatch.setattr(scenario.verifier, "verify_detached", verify)
+    with pytest.raises(StoreError) as first:
+        service.set_current(entry.id, entry.revision)
+    assert first.value.code == "catalog-unavailable"
+    assert catalog_effective._snapshot_cache is None
+    failing = False
+    service.set_current(entry.id, entry.revision)
+    assert verify_calls == 2
+    assert service._store.current().revision == entry.revision
+
+
+@pytest.mark.parametrize("failure", ["signature", "schema", "json"])
+def test_t235_deterministic_snapshot_failure_is_cached(
+    scenario: Scenario, revocation_service: Any, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry)
+    remote = scenario.remote()
+    if failure == "schema":
+        remote["schema_sha256"] = "0" * 64
+    if failure == "json":
+        raw = (json.dumps(remote)[:-1] + ', "serial": 5}').encode()
+        scenario.snapshot_bytes(raw, signature(raw))
+    else:
+        scenario.snapshot(remote, valid_signature=failure != "signature")
+    verify = Mock(wraps=scenario.verifier.verify_detached)
+    monkeypatch.setattr(scenario.verifier, "verify_detached", verify)
+    for _ in range(2):
+        with pytest.raises(StoreError) as refused:
+            service.set_current(entry.id, entry.revision)
+        assert refused.value.code == "catalog-unavailable"
+    assert verify.call_count == 1
+    assert service.revoked_revision(entry.id, entry.revision) is False
+
+
+def test_t235_temporary_directory_failure_is_retried(
+    scenario: Scenario, revocation_service: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry)
+    scenario.snapshot(scenario.remote())
+    verify = Mock(wraps=catalog_effective.verify_catalog)
+    monkeypatch.setattr(catalog_effective, "verify_catalog", verify)
+    with monkeypatch.context() as fault:
+        fault.setattr(
+            tempfile,
+            "TemporaryDirectory",
+            Mock(side_effect=OSError("Временная папка недоступна")),
+        )
+        with pytest.raises(StoreError) as refused:
+            service.set_current(entry.id, entry.revision)
+    assert refused.value.code == "catalog-unavailable"
+    assert catalog_effective._snapshot_cache is None
+    service.set_current(entry.id, entry.revision)
+    assert verify.call_count == 2
+    assert service._store.current().revision == entry.revision
+
+
+@pytest.mark.parametrize("revoked", [False, True])
+def test_t233_cached_snapshot_without_marker_keeps_unreadable_failure_closed(
+    scenario: Scenario, revocation_service: Any, revoked: bool
+) -> None:
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry)
+    remote = scenario.remote()
+    if revoked:
+        remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    scenario.snapshot(remote)
+    if revoked:
+        with pytest.raises(StoreError, match="отозвана"):
+            service.set_current(entry.id, entry.revision)
+    else:
+        service.set_current(entry.id, entry.revision)
+    before = (service._store.root / "current.json").read_bytes()
+    scenario.state.unlink()
+    (scenario.snapshots / catalog_effective.SNAPSHOT_FILE_NAME).write_bytes(b"{")
+    with pytest.raises(StoreError) as refused:
+        service.set_current(entry.id, entry.revision)
+    assert refused.value.code == ("revoked" if revoked else "catalog-unavailable")
     assert (service._store.root / "current.json").read_bytes() == before

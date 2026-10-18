@@ -6034,3 +6034,57 @@ def test_revoked_selfchecked_candidate_stops_outside_catalog_lock(
         bench.finish_restore(restored)
     finally:
         runtime.shutdown()
+
+
+@pytest.mark.parametrize("stage", ["model.loaded", "selfcheck"])
+def test_t234_revoked_ordinary_worker_is_replaced_outside_catalog_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stage: str
+) -> None:
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
+    runtime = rig.runtime
+    old = rig.supervisor
+    clean = Mock(state="running", generation=old.generation + 1)
+    rig.supervisor_factory.return_value = clean
+    ownership = observe_stop_catalog_lock(old)
+    try:
+        if stage == "selfcheck":
+            rig.event(type="model.loaded", id="gigaam", revision="r1")
+        publish_runtime_revocation(tmp_path)
+        old.stop.reset_mock()
+        old.send.reset_mock()
+        if stage == "model.loaded":
+            rig.event(type="model.loaded", id="gigaam", revision="r1")
+        else:
+            rig.event(type="result", utterance_id="file", text="проверка связи")
+        old.stop.assert_called_once_with()
+        assert ownership == [False]
+        assert runtime.supervisor is clean
+        assert clean.generation == old.generation + 1
+        clean.start.assert_called_once_with()
+        rig.supervisor_factory.assert_called_with(on_event=runtime._on_worker_event, use_qt=True)
+        assert runtime._selfcheck == "failed"
+        assert not runtime._loading_model
+        assert runtime._selfcheck_timer is None
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_REVOKED)
+        rig.tray.set_state.assert_called_with(TrayState.ERROR)
+        rig.notify.notify_model_revoked.assert_called_once_with()
+        emit = rig.supervisor_factory.call_args.kwargs["on_event"]
+        emit({"type": "hello", "generation": clean.generation})
+        assert "model.load" not in [call.args[0]["type"] for call in clean.send.call_args_list]
+        level = Mock()
+        assert runtime.start_level_monitor("default", level) is True
+        assert "record.start" in [call.args[0]["type"] for call in clean.send.call_args_list]
+        old.send.assert_not_called()
+        runtime.stop_level_monitor()
+        clean.send.reset_mock()
+        rig.hotkey.fsm.press(rig.now)
+        clean.send.assert_not_called()
+        assert runtime._mouse_allowed() is False
+        assert runtime.start_test("default", Mock()) is False
+        runtime.reload_model()
+        emit({"type": "hello", "generation": clean.generation})
+        assert "model.load" not in [call.args[0]["type"] for call in clean.send.call_args_list]
+        old.send.assert_not_called()
+        old.stop.assert_called_once_with()
+    finally:
+        runtime.shutdown()

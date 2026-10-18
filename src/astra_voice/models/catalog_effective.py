@@ -18,7 +18,7 @@ from astra_voice.models import catalog_state
 from astra_voice.models.catalog import CATALOG_MAX_BYTES, Catalog, CatalogError, load_builtin
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.net.update_cache import read_private, write_private
-from astra_voice.security.verify import Verifier
+from astra_voice.security.verify import Verifier, VerifyResult
 
 log = logging.getLogger(__name__)
 SNAPSHOT_FILE_NAME = "catalog-snapshot.json"
@@ -35,9 +35,47 @@ class ModelActivator(Protocol):
     ) -> None: ...
 
 
-# Один последний результат проверки: ограниченная память, ключ связывает точные
-# байты каталога и подписи. Смена схемы сбрасывает результат, даже если raw прежний.
+# Последний проверенный каталог и один отказ: ограниченная память, ключ связывает
+# байты каталога, подписи и схему. Отказ не стирает уже проверенные отзывы.
 _snapshot_cache: tuple[tuple[str, str, Path, str], Catalog | None] | None = None
+_snapshot_rejection_cache: tuple[str, str, Path, str] | None = None
+
+
+def _cached_pending_snapshot(marker: catalog_state.CatalogState | None) -> Catalog | None:
+    """Возвращает только проверенный кэш новее отметки, не читая снимок."""
+    if _snapshot_cache is None or _snapshot_cache[0][2] != paths.data_dir_static():
+        return None
+    cached = _snapshot_cache[1]
+    if cached is not None and (
+        marker is None or (cached.trust_epoch, cached.serial) > (marker.trust_epoch, marker.serial)
+    ):
+        return cached
+    return None
+
+
+class _SnapshotVerifier(Verifier):
+    """Сохраняет временные отказы, которые load_builtin обобщает до bad-signature."""
+
+    def __init__(self, verifier: Verifier) -> None:
+        self._verifier = verifier
+        self.purpose = verifier.purpose
+
+    def verify_detached(
+        self, data: Path, sig: Path, *, cancel: Callable[[], bool] | None = None
+    ) -> VerifyResult:
+        try:
+            result = self._verifier.verify_detached(data, sig, cancel=cancel)
+        except OSError:
+            raise CatalogError("io", "Не удалось проверить сохранённый каталог.") from None
+        # У таймаута и отсутствующего gpgv в Verifier пока нет отдельного кода.
+        if not result.ok and (
+            result.code in {"cancelled", "output-limit"}
+            or result.reason == "gpgv не ответил за отведённое время"
+            or result.reason.startswith("gpgv не найден:")
+            or "файл не найден или не обычный файл:" in result.reason
+        ):
+            raise CatalogError("io", "Не удалось проверить сохранённый каталог.")
+        return result
 
 
 def _pending_snapshot(
@@ -51,12 +89,12 @@ def _pending_snapshot(
     принятые отзывы уже в отметке. Без отметки или для снимка новее неё
     неудача проверки означает «отзывы неизвестны»: активация отказывает.
     """
-    global _snapshot_cache
+    global _snapshot_cache, _snapshot_rejection_cache
     directory = paths.state_dir() / "model-catalog-updates"
     try:
         raw, signature = read_snapshot(directory)
     except FileNotFoundError:
-        return None, False
+        return _cached_pending_snapshot(marker), False
     except (OSError, ValueError, TypeError, RecursionError, CatalogError):
         return _unreadable_pair(marker)
     digest = hashlib.sha256(raw).hexdigest()
@@ -81,6 +119,8 @@ def _pending_snapshot(
             read_private(root / "catalog.schema.json", CATALOG_MAX_BYTES)
         ).hexdigest()
         key = (digest, hashlib.sha256(signature).hexdigest(), root, schema_sha)
+        if _snapshot_rejection_cache == key:
+            raise CatalogError("bad-signature", "Снимок каталога уже не прошёл проверку.")
         if _snapshot_cache is not None and _snapshot_cache[0] == key:
             cached = _snapshot_cache[1]
             if cached is None:
@@ -90,14 +130,18 @@ def _pending_snapshot(
             snapshot = verify_catalog(
                 raw,
                 signature,
-                Verifier("catalog", keyring=root / "keys" / "release.gpg"),
+                _SnapshotVerifier(Verifier("catalog", keyring=root / "keys" / "release.gpg")),
                 schema_root=root,
                 require_schema=True,
             )
-        except CatalogError:
-            _snapshot_cache = (key, None)
+        except CatalogError as error:
+            if error.code in {"bad-signature", "bad-schema", "bad-path", "too-large"}:
+                _snapshot_rejection_cache = key
+                if _snapshot_cache is None or _snapshot_cache[1] is None:
+                    _snapshot_cache = (key, None)
             raise
         _snapshot_cache = (key, snapshot)
+        _snapshot_rejection_cache = None
         return snapshot, False
     except (OSError, ValueError, TypeError, RecursionError, CatalogError):
         log.warning("Новый снимок каталога не прошёл проверку: отзывы неизвестны.")
@@ -108,11 +152,12 @@ def _unreadable_pair(
     marker: catalog_state.CatalogState | None,
 ) -> tuple[Catalog | None, bool]:
     """Пара снимка не читается: при отметке пропуск, без неё отзывы неизвестны."""
+    cached = _cached_pending_snapshot(marker)
     if marker is not None:
         log.warning("Сохранённый снимок каталога повреждён и пропущен: действует отметка.")
-        return None, False
+        return cached, False
     log.warning("Сохранённый снимок каталога повреждён, отметки нет: отзывы неизвестны.")
-    return None, True
+    return cached, True
 
 
 def check_revoked(
@@ -158,6 +203,9 @@ def check_revoked(
                 marker_error = True
             elif (model_id, revision) in marker.revoked:
                 raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
+        cached = _cached_pending_snapshot(marker)
+        if cached is not None and cached.is_revoked(model_id, revision):
+            raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
         snapshot_error = False
         if include_snapshot:
             snapshot, snapshot_error = _pending_snapshot(marker)

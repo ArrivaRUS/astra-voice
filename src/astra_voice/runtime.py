@@ -1912,6 +1912,14 @@ class DictationRuntime(QObject):
         self._selfcheck = "failed"
         self._fail_pending_test()
         self._model_revoked()
+        # Барьер ready уже отпустил CATALOG_LOCK. Новый процесс обслуживает
+        # измеритель уровня, но failed запрещает ему загружать модель на hello.
+        generation = self.supervisor.generation + 1
+        self._cleanup("отозванный воркер", self.supervisor.stop)
+        self.supervisor = self._supervisor_factory(on_event=self._on_worker_event, use_qt=True)
+        self.supervisor.generation = generation
+        self._model_load_generation = None
+        self.supervisor.start()
 
     def _promote_candidate(self) -> None:
         # Источник не публикует отзыв между проверкой и сменой рабочего воркера.

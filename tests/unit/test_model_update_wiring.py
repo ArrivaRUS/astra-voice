@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -776,7 +777,7 @@ def test_app_factory_and_gui_recover_when_model_service_catalog_is_unavailable(
         app.processEvents()
 
 
-@pytest.mark.parametrize("failed_write", ["snapshot", "watermark"])
+@pytest.mark.parametrize("failed_write", ["snapshot", "watermark", "watermark-and-rollback"])
 def test_catalog_write_failure_blocks_publication_and_preserves_recoverable_state(
     catalog_source: CatalogSourceRig, monkeypatch: pytest.MonkeyPatch, failed_write: str
 ) -> None:
@@ -787,6 +788,24 @@ def test_catalog_write_failure_blocks_publication_and_preserves_recoverable_stat
     snapshot = catalog_source.state_dir / "catalog-snapshot.json"
     original_snapshot_write = update_cache.write_private
     original_state_write = catalog_state.write_state
+    # T-233: обычный сбой откатывает снимок; восстановление нового требует двойного сбоя.
+    if failed_write == "watermark":
+        original_snapshot_write(
+            snapshot,
+            json.dumps(
+                {
+                    "raw": base64.b64encode(catalog_source.raw).decode("ascii"),
+                    "signature": base64.b64encode(b"recorded baseline signature").decode("ascii"),
+                }
+            ).encode(),
+        )
+    snapshot_before = snapshot.read_bytes() if snapshot.exists() else None
+    original_unlink = Path.unlink
+
+    def fail_snapshot_rollback(path: Path, missing_ok: bool = False) -> None:
+        if path == snapshot:
+            raise OSError("recorded snapshot rollback failure")
+        original_unlink(path, missing_ok=missing_ok)
 
     def write_snapshot(path: Path, payload: bytes) -> None:
         if failed_write == "snapshot" and path == snapshot:
@@ -794,17 +813,23 @@ def test_catalog_write_failure_blocks_publication_and_preserves_recoverable_stat
         original_snapshot_write(path, payload)
 
     def write_marker(path: Path, state: catalog_state.CatalogState) -> None:
-        if failed_write == "watermark" and path == marker:
+        if failed_write in {"watermark", "watermark-and-rollback"} and path == marker:
             raise OSError("recorded highwater write failure")
         original_state_write(path, state)
 
     with monkeypatch.context() as failed:
         failed.setattr(update_cache, "write_private", write_snapshot)
         failed.setattr(catalog_state, "write_state", write_marker)
+        if failed_write == "watermark-and-rollback":
+            failed.setattr(Path, "unlink", fail_snapshot_rollback)
         with pytest.raises(CatalogError):
             source.refresh(threading.Event())
         if failed_write == "snapshot":
             assert source.current() == baseline
+        elif failed_write == "watermark":
+            assert source.current() == baseline
+            assert snapshot.read_bytes() == snapshot_before
+            assert not source._blocked
         else:
             with pytest.raises(CatalogError):
                 source.current()
@@ -816,6 +841,14 @@ def test_catalog_write_failure_blocks_publication_and_preserves_recoverable_stat
         assert restarted == baseline
         source.refresh(threading.Event())
         assert source.current().serial == baseline.serial + 1
+    elif failed_write == "watermark":
+        assert restarted == baseline
+        assert marker.read_bytes() == before
+        assert snapshot.read_bytes() == snapshot_before
+        source.refresh(threading.Event())
+        assert source.current().serial == baseline.serial + 1
+        accepted_marker = catalog_state.read_state(marker)
+        assert accepted_marker is not None and accepted_marker.serial == baseline.serial + 1
     else:
         # Успешно сохранённая подписанная пара восстанавливает отставший маркер.
         assert restarted.serial == baseline.serial + 1
