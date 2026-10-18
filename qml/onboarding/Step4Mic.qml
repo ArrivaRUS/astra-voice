@@ -28,6 +28,18 @@ Item {
     readonly property string testMessage: root.bridge ? root.bridge.testMessage : ""
     readonly property bool levelSilent: root.bridge ? root.bridge.levelSilent : false
     readonly property bool testing: testState === "preparing" || testState === "recording" || testState === "processing"
+    // Согласовано с TEST_RECORD_LIMIT_MS = 5000 в core/dictation.py.
+    readonly property int testRecordLimitSeconds: 5
+    property int testSecondsRemaining: testRecordLimitSeconds
+    onTestStateChanged: root.testSecondsRemaining = root.testRecordLimitSeconds
+
+    Timer {
+        objectName: "testRecordingCountdown"
+        interval: 1000
+        repeat: true
+        running: root.testState === "recording"
+        onTriggered: root.testSecondsRemaining = Math.max(1, root.testSecondsRemaining - 1)
+    }
     readonly property int selectedDeviceIndex: deviceIndex(device)
     readonly property var selectedDevice: selectedDeviceIndex >= 0 ? devices[selectedDeviceIndex] : null
     readonly property bool deviceMissing: device !== "" && (!selectedDevice || selectedDevice.missing === true)
@@ -354,10 +366,12 @@ Item {
             }
 
             Text {
+                objectName: "testStatusText"
                 Layout.fillWidth: true
                 Layout.alignment: Qt.AlignVCenter
                 textFormat: Text.PlainText
                 text: root.testState === "preparing" ? root.testMessage
+                    : root.testState === "recording" || root.testState === "processing" ? ""
                     : !root.modelReady ? qsTr("Будет доступно после установки модели")
                     : qsTr("Скажите фразу — покажем, что распознали.")
                 color: Theme.fgMuted
@@ -371,10 +385,29 @@ Item {
         }
     }
 
+    Text {
+        id: recordingHint
+        objectName: "testRecordingHint"
+        visible: root.testState === "recording"
+        y: testBox.y + testBox.height + (visible ? 6 : 0)
+        width: root.width
+        height: visible ? implicitHeight : 0
+        textFormat: Text.PlainText
+        text: qsTr("Говорите. Нажмите «Остановить» — или запись остановится сама через %1 с").arg(root.testSecondsRemaining)
+        color: Theme.fgMuted
+        font.family: Theme.fontUi
+        font.pixelSize: Theme.fontSettingSubSize
+        lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+        lineHeightMode: Text.FixedHeight
+        renderType: Text.NativeRendering
+        wrapMode: Text.WordWrap
+    }
+
     Rectangle {
         id: resultField
+        objectName: "testResultField"
         visible: root.testText !== "" || root.testState === "recording" || root.testState === "processing"
-        y: testBox.y + testBox.height + (visible ? 10 : 0) // Макет: margin-top .field.
+        y: recordingHint.y + recordingHint.height + (visible ? (recordingHint.visible ? 4 : 10) : 0)
         width: root.width
         // design/spec.md §4.5: текст, паддинги и обе границы дают 35,5 → 36 px для одной строки.
         height: visible ? Math.ceil(resultText.height + Theme.fieldPaddingY * 2 + Theme.fieldBorder * 2) : 0
@@ -384,6 +417,7 @@ Item {
 
         Text {
             id: resultText
+            objectName: "testResultText"
             x: Theme.fieldPaddingX
             // FixedHeight оставляет leading снизу; CSS делит его пополам.
             // Паддинг отсчитываем от внутренней стороны рамки, как в макете.

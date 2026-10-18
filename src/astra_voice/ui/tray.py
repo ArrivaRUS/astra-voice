@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import partial
 from itertools import count
 from queue import Empty, Queue
@@ -584,29 +584,40 @@ class Tray(QObject):
         self._model_recheck_action.setEnabled(self._model_recheck_enabled)
         self._model_recheck_action.setVisible(self._model_recheck_enabled)
 
-    def set_models(self, models: list[str], active: str | None) -> None:
+    def set_models(self, models: Sequence[str | tuple[str, str]], active: str | None) -> None:
+        """Пары (id, имя из настроек); прежние строки используют имя как id."""
+        entries = [(item, item) if isinstance(item, str) else item for item in models]
+        self._active_model = active
         self._model_menu.clear()
         self._model_action.setMenu(None)
-        self._model_action.setEnabled(len(models) > 1)
-        if not models:
+        self._model_action.setEnabled(len(entries) > 1)
+        if not entries:
             self._model_action.setText("Модель не установлена")
-        elif len(models) == 1:
-            self._model_action.setText(f"Модель: {models[0]}")
+        elif len(entries) == 1:
+            self._model_action.setText(
+                f"Модель: {clean_display_name(entries[0][1], for_menu=True)}"
+            )
         else:
             self._model_action.setText("Модель")
             self._model_action.setMenu(self._model_menu)
-            for name in models:
-                action = QAction(name, self._model_menu)
+            for model_id, name in entries:
+                action = QAction(clean_display_name(name, for_menu=True), self._model_menu)
+                action.setData(model_id)
                 action.setCheckable(True)
-                action.setChecked(name == active)
+                action.setChecked(model_id == active)
                 self._model_group.addAction(action)
-                action.triggered.connect(partial(self._select_model, name))
+                action.triggered.connect(partial(self._select_model, action))
                 self._model_menu.addAction(action)
         self._update_menu()
 
-    def _select_model(self, name: str, checked: bool = False) -> None:
+    def _select_model(self, action: QAction, checked: bool = False) -> None:
+        model_id = str(action.data())
+        # QAction ставит галочку до triggered; отказ/пауза переключателя не должны
+        # оставлять её у модели, которая не стала рабочей в настройках.
+        for item in self._model_menu.actions():
+            item.setChecked(item.data() == self._active_model)
         if self.on_model_selected is not None:
-            self.on_model_selected(name)
+            self.on_model_selected(model_id)
 
     def set_has_last_text(self, value: bool) -> None:
         self._has_last_text = bool(value)

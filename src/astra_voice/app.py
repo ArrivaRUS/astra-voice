@@ -1219,6 +1219,32 @@ def _bind_updates_bridge(
     return bridge
 
 
+def _wire_tray_models(
+    tray: Any, bridge: Any, show_models: Callable[[], None] | None = None
+) -> None:
+    """Трей использует список, имена и переключение раздела «Модели»."""
+
+    def sync() -> None:
+        installed = [row for row in bridge.models if row["badge"] in {"active", "installed"}]
+        active = next((row["id"] for row in installed if row["badge"] == "active"), None)
+        tray.set_models([(row["id"], row["name"]) for row in installed], active)
+
+    def select(model_id: str) -> None:
+        bridge.makeModelCurrent(model_id)
+        row = next((row for row in bridge.models if row["id"] == model_id), None)
+        if (
+            show_models is not None
+            and row is not None
+            and (row.get("canSwitchWithPause") or row.get("message"))
+        ):
+            show_models()
+
+    tray.on_model_selected = select
+    bridge.modelsChanged.connect(sync)
+    bridge.activeModelChanged.connect(sync)
+    sync()
+
+
 def _wire_tray_updates(tray: Any, bridge: Any, show_network: Callable[[], None]) -> None:
     """Пункт трея «Проверить обновления» (Р9): активен всегда, кроме офлайна и запрета.
 
@@ -1689,6 +1715,12 @@ def main(argv: list[str] | None = None) -> int:
             autostart=autostart,
         )
         if runtime_ready and runtime is not None:
+
+            def show_models() -> None:
+                focuser.focus_shell()
+                app_info.show_section(SECTION_MODELS)
+
+            _wire_tray_models(runtime.tray, settings_bridge, show_models)
             runtime.orchestrator.microphone_count = settings_bridge.microphone_count
             settings_bridge.bind_command_host(runtime)
             settings_bridge.bind_sound_cues_host(runtime)

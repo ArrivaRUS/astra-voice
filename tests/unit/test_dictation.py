@@ -2285,8 +2285,10 @@ def test_microphone_test_cycle_is_private(
     assert rig.pill.calls == [(PillState.LISTENING, None, None)]
     assert not rig.pill.hidden
     assert rig.sent[0][0].get("device") == (device or None)
-    assert rig.sent[0][0]["limit_s"] == 10.0
-    assert rig.sent[0][1] == 40.0
+    assert TEST_RECORD_LIMIT_MS == 5000
+    assert rig.sent[0][0]["limit_s"] == 5.0
+    assert rig.sent[0][1] == 35.0
+    assert rig.timer(5000).callback is not None
     assert rig.recording
     assert not any(entry[0] == "active_window" for entry in rig.trace)
     microphone_event(rig, "audio.ready", device="USB-микрофон")

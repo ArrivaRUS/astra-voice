@@ -1749,6 +1749,14 @@ def configure_mic() -> FakeOnboarding:
     return fake
 
 
+def configure_mic_recording() -> FakeOnboarding:
+    fake = configure_mic()
+    fake.testState = "recording"
+    fake.testText = ""
+    fake.testDuration = ""
+    return fake
+
+
 SNAPSHOT_SETUPS: dict[str, Callable[[], FakeOnboarding | FakeSettings]] = {
     "01-welcome": partial(configure_onboarding, 1),
     "02-model": partial(configure_onboarding, 2),
@@ -1764,6 +1772,7 @@ SNAPSHOT_SETUPS: dict[str, Callable[[], FakeOnboarding | FakeSettings]] = {
         eta="осталось ~3 мин",
     ),
     "04-mic": configure_mic,
+    "04-mic-recording": configure_mic_recording,
     "04-mic-downloading": partial(
         configure_onboarding,
         4,
@@ -2576,7 +2585,7 @@ def test_step_snapshots_are_saved(
     """Проверяет подготовленные PNG; атомарная публикация отложена до teardown."""
     assert set(rendered_steps) == set(CASES)
     expected = {snapshot_name(name, dark) for name, dark in CASES}
-    assert len(expected) == 24
+    assert len(expected) == 26
     paths = [path for _, _, path in rendered_steps.values()]
     assert {path.name for path in paths[0].parent.glob("*.png")} == expected
     for image, messages, path in rendered_steps.values():
@@ -4421,6 +4430,104 @@ def test_mic_test_button_starts_and_stops_including_processing(
 
     _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
     assert_no_messages(messages, "microphone test button")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize("window_width", [900, 1024])
+def test_mic_recording_hint_counts_down_only_during_recording(
+    onboarding_app: Any, dark: bool, window_width: int
+) -> None:
+    from astra_voice.core.dictation import TEST_PREPARING
+
+    fake = configure_mic_recording()
+
+    def inspect(root: Any) -> None:
+        window = root.window()
+        window.resize(window_width, HEIGHT)
+        wait_for_window_size(onboarding_app, window, window_width, HEIGHT, exposed=True)
+        hint = root.findChild(QObject, "testRecordingHint")
+        timer = root.findChild(QObject, "testRecordingCountdown")
+        result = root.findChild(QObject, "testResultField")
+        status = root.findChild(QObject, "testStatusText")
+        assert hint is not None and timer is not None
+        assert result is not None and status is not None
+        assert timer.property("interval") == 1000
+        assert timer.property("running") is True
+        assert hint.property("textFormat") == Qt.PlainText
+        assert hint.property("color") == theme_color("fgMuted", dark)
+        assert hint.property("lineCount") == 1
+        assert hint.property("height") == hint.property("lineHeight")
+        recording_y = result.property("y")
+        assert hint.property("text").endswith("через 5 с")
+        # Первый тик проходит настоящий event loop; дальше не замедляем тест
+        # ожиданием всех пяти секунд и проверяем последовательность сигналом.
+        for _ in range(30):
+            if hint.property("text").endswith("через 4 с"):
+                break
+            QTest.qWait(50)
+        assert hint.property("text").endswith("через 4 с")
+        for remaining in (4, 3, 2, 1, 1):
+            assert hint.property("text") == (
+                f"Говорите. Нажмите «Остановить» — или запись остановится сама через {remaining} с"
+            )
+            assert status.property("text") == ""
+            QMetaObject.invokeMethod(timer, "triggered", Qt.DirectConnection)
+            onboarding_app.processEvents()
+
+        for state, expected in (
+            ("processing", "Распознаю…"),
+            ("preparing", TEST_PREPARING),
+        ):
+            fake.testState = state
+            fake.testMessage = expected
+            onboarding_app.processEvents()
+            assert timer.property("running") is False
+            assert not hint.property("visible")
+            matching_texts = [
+                item
+                for item in visual_tree(root)
+                if item.isVisible() and item.property("text") == expected
+            ]
+            assert len(matching_texts) == 1
+            assert "Скажите фразу — покажем, что распознали." not in visible_texts(root)
+            if state == "processing":
+                assert recording_y - result.property("y") == hint.property("lineHeight")
+
+        fake.testState = "recording"
+        onboarding_app.processEvents()
+        assert timer.property("running") is True
+        assert hint.property("text").endswith("через 5 с")
+        fake.testState = "done"
+        onboarding_app.processEvents()
+        assert timer.property("running") is False
+        assert not hint.property("visible")
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "microphone recording countdown")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize("model_ready", [False, True], ids=["waiting", "ready"])
+def test_done_explains_insertion_at_input_cursor(
+    onboarding_app: Any, dark: bool, model_ready: bool
+) -> None:
+    fake = configure_onboarding(5, modelReady=model_ready)
+
+    def inspect(root: Any) -> None:
+        texts = visible_texts(root)
+        body = next(text for text in texts if "текст появится в этом месте" in text)
+        assert "в любом окне" in body
+        assert "курсор ввода" in body
+        assert "зажмите сочетание и говорите" in body
+        assert "трее" in body or "трей" in body
+        if model_ready:
+            assert body.startswith("Работает в любом окне, где мигает курсор ввода:")
+            assert "Левый клик по значку открывает настройки" in body
+        else:
+            assert body.startswith("Когда модель будет готова,")
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "done cursor explanation")
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])

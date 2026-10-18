@@ -504,7 +504,8 @@ def test_models_zero_one_many_and_reset(harness: Harness) -> None:
     harness.tray.on_model_selected = callback
     submenu.actions()[2].trigger()
     callback.assert_called_once_with("C")
-    assert [a.isChecked() for a in submenu.actions()] == [False, False, True]
+    # Выбор подтверждает источник настроек, а не оптимистичная галочка QAction.
+    assert [a.isChecked() for a in submenu.actions()] == [False, True, False]
     harness.tray.set_models(["A", "B", "C"], "A")
     assert [a.isChecked() for a in submenu.actions()] == [True, False, False]
     harness.tray.on_model_selected = None
@@ -514,6 +515,25 @@ def test_models_zero_one_many_and_reset(harness: Harness) -> None:
     assert not action.isEnabled()
     assert action.text() == "Модель не установлена"
     assert len(harness.menu.actions()) == 12
+
+
+def test_model_ids_are_separate_from_duplicate_display_names(harness: Harness) -> None:
+    harness.tray.set_models([("first", "A & B"), ("second", "A & B")], "first")
+    submenu = harness.menu.actions()[3].menu()
+    assert submenu is not None
+    actions = submenu.actions()
+    assert [action.text() for action in actions] == ["A && B", "A && B"]
+    assert [action.data() for action in actions] == ["first", "second"]
+    assert [action.isChecked() for action in actions] == [True, False]
+    callback = Mock()
+    harness.tray.on_model_selected = callback
+    actions[1].trigger()
+    callback.assert_called_once_with("second")
+    assert [action.isChecked() for action in actions] == [True, False]
+    harness.tray.set_models([("first", "A & B"), ("second", "A & B")], "second")
+    assert [action.isChecked() for action in submenu.actions()] == [False, True]
+    harness.tray.set_models([("second", "A & B")], "second")
+    assert harness.menu.actions()[3].text() == "Модель: A && B"
 
 
 @pytest.mark.parametrize(
