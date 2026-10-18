@@ -17,8 +17,15 @@ from test_runtime import MARKER, FakeTimer, Rig, assert_phase
 
 from astra_voice.core.dictation import PROCESSING_WATCHDOG_MS, DictationPhase
 from astra_voice.core.settings import MODEL_UNLOAD_MINUTES, Settings, from_dict
-from astra_voice.platform.hotkey import HotkeyState
+from astra_voice.platform.hotkey import (
+    GrabResult,
+    HotkeyBackend,
+    HotkeyEvent,
+    HotkeyManager,
+    HotkeyState,
+)
 from astra_voice.platform.mouse_button import MouseHoldState
+from astra_voice.platform.paste import snapshot_target
 from astra_voice.ui.bridges import SettingsApply, SettingsBridge
 from astra_voice.ui.pill import (
     ERROR_MODEL_LOAD_FAILED,
@@ -32,11 +39,38 @@ pytestmark = pytest.mark.unit
 FIVE_MIN_S = 5 * 60.0
 
 
-def make_rig(monkeypatch: pytest.MonkeyPatch, minutes: int = 5) -> Rig:
-    rig = Rig(monkeypatch, from_dict({"model_dir": "/tmp/model", "model_unload_minutes": minutes}))
+class PhysicalHotkeyRig(Rig):
+    """События настоящего менеджера; прямой fsm.press не доказывает удержание."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, settings: Settings) -> None:
+        backend = Mock(spec=HotkeyBackend)
+        backend.grab_combo.return_value = GrabResult("ok", keycode=65, mods=4)
+        backend.grab_escape.return_value = GrabResult("ok", keycode=9)
+        backend.ungrab_combo.return_value = GrabResult("ok")
+        backend.poll_events.return_value = []
+        backend.fileno.return_value = 17
+        hotkey = HotkeyManager(backend, clock=lambda: self.now)
+        super().__init__(monkeypatch, settings, hotkey_factory=lambda: hotkey)
+        self.hotkey = cast(Any, hotkey)
+
+    def press(self, now: float) -> None:
+        self.hotkey.handle_event(HotkeyEvent("KeyPress", 65, int(now * 1000), mods=4), now)
+
+    def release(self, now: float) -> None:
+        self.hotkey.handle_event(HotkeyEvent("KeyRelease", 65, int(now * 1000), mods=4), now)
+        self.fire_tail()
+
+    def recognize(self, text: str = MARKER) -> None:
+        self.press(self.now)
+        self.release(self.now + 1)
+        self.event(type="result", text=text)
+
+
+def make_rig(monkeypatch: pytest.MonkeyPatch, minutes: int = 5) -> PhysicalHotkeyRig:
+    rig = PhysicalHotkeyRig(
+        monkeypatch, from_dict({"model_dir": "/tmp/model", "model_unload_minutes": minutes})
+    )
     rig.runtime.start()
-    # Mock хоткея отвечает Mock на has_pending_press; настоящий менеджер — False в покое.
-    rig.hotkey.has_pending_press = False
     load_model(rig)
     return rig
 
@@ -130,7 +164,7 @@ def test_any_activity_restarts_idle_countdown(
     elif activity == "worker-event":
         rig.event(type="measured", vm_hwm_kb=1000)
     else:
-        rig.hotkey.fsm.press(rig.now)
+        rig.press(rig.now)
         rig.hotkey.fsm.escape(rig.now)
         rig.event(type="cancelled", utterance_id=rig.runtime.orchestrator._utterance_id)
     settle(rig)
@@ -146,7 +180,7 @@ def test_any_activity_restarts_idle_countdown(
 
 def test_work_in_progress_postpones_unload(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = make_rig(monkeypatch)
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     assert_phase(rig.runtime, DictationPhase.RECORDING)
     rig.now += FIVE_MIN_S + 10  # долгая запись без событий воркера
     fire_idle(rig)
@@ -175,7 +209,7 @@ def test_hold_during_reload_starts_recording_when_model_ready(
     rig.pill.show_state.reset_mock()
     rig.pill.hide.reset_mock()
     loads = sent(rig).count("model.load")
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     assert sent(rig).count("model.load") == loads + 1
     assert rig.supervisor.send.call_args.kwargs == {"timeout": 10.0}
     rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
@@ -195,17 +229,21 @@ def test_hold_during_reload_starts_recording_when_model_ready(
     assert idle_timer(rig) is not None
 
 
-@pytest.mark.parametrize("gesture", ["release", "escape"])
+@pytest.mark.parametrize("gesture", ["tap", "release", "escape"])
 def test_released_before_ready_does_not_record(
     monkeypatch: pytest.MonkeyPatch, gesture: str
 ) -> None:
     rig = make_rig(monkeypatch)
     park(rig)
-    rig.hotkey.fsm.press(rig.now)
-    if gesture == "release":
-        rig.release(rig.now + 0.5)
+    rig.press(rig.now)
+    if gesture in ("tap", "release"):
+        rig.release(rig.now + (0.1 if gesture == "tap" else 0.5))
     else:
         rig.hotkey.fsm.escape(rig.now + 0.5)
+        rig.release(rig.now + 0.5)
+    assert not rig.runtime._wake_dictation
+    assert rig.runtime._loading_model
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE
     rig.event(type="model.loaded")
     rig.event(type="result", utterance_id="file", text="проверка")
     assert_phase(rig.runtime, DictationPhase.IDLE)
@@ -219,22 +257,33 @@ def test_released_before_ready_does_not_record(
     assert sent(rig).count("model.load") == loads
 
 
-def test_toggle_press_during_reload_starts_recording(monkeypatch: pytest.MonkeyPatch) -> None:
-    rig = Rig(
+@pytest.mark.parametrize("held", [False, True])
+def test_toggle_wake_only_loads_until_next_press(
+    monkeypatch: pytest.MonkeyPatch, held: bool
+) -> None:
+    rig = PhysicalHotkeyRig(
         monkeypatch,
         from_dict({"model_dir": "/tmp/model", "model_unload_minutes": 15, "hotkey_mode": "toggle"}),
     )
     rig.runtime.start()
-    rig.hotkey.has_pending_press = False
     load_model(rig)
     assert idle_timer(rig).interval == 15 * 60 * 1000  # type: ignore[union-attr]
     rig.now += 15 * 60
     fire_idle(rig)
     rig.event(type="hello")
-    rig.hotkey.fsm.press(rig.now)
-    rig.hotkey.fsm.release(rig.now + 0.1)  # переключение: запись не отпущена
+    rig.press(rig.now)
+    if not held:
+        rig.release(rig.now + 0.1)
     rig.event(type="model.loaded")
     rig.event(type="result", utterance_id="file", text="проверка")
+    assert_phase(rig.runtime, DictationPhase.IDLE)
+    assert "record.start" not in sent(rig)
+    assert rig.hotkey.fsm.state is HotkeyState.IDLE
+    assert not rig.runtime._wake_dictation
+    rig.pill.hide.assert_called()
+    if held:
+        rig.release(rig.now + 1)
+    rig.press(rig.now + 2)
     assert_phase(rig.runtime, DictationPhase.RECORDING)
 
 
@@ -243,7 +292,7 @@ def test_failed_reload_shows_error_and_does_not_record_later(
 ) -> None:
     rig = make_rig(monkeypatch)
     park(rig)
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     rig.event(type="error", code="engine-failed", request_type="model.load")
     assert not rig.runtime._loading_model
     rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
@@ -423,16 +472,16 @@ def test_overlap_queue_blocks_idle_unload_until_last_phrase(
     """Пока в очереди есть фраза, выгрузка по простою не срабатывает; владелец ввода — text."""
     rig = make_rig(monkeypatch)
     runtime = rig.runtime
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     rig.release(rig.now + 1)
     rig.now += 2
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     first, second = record_ids(rig)
     assert runtime.orchestrator.pending_utterances == 2
     assert runtime._input_owner == "text"
     # Третье нажатие при двух фразах: автомат клавиши возвращается к распознаванию.
     rig.release(rig.now + 1)
-    rig.hotkey.fsm.press(rig.now + 2)
+    rig.press(rig.now + 2)
     assert rig.hotkey.fsm.state is HotkeyState.PROCESSING
     assert len(record_ids(rig)) == 2
     assert runtime._work_pending()
@@ -457,12 +506,12 @@ def test_overlap_queue_blocks_idle_unload_until_last_phrase(
     assert runtime._model_parked
 
 
-def start_overlap(rig: Rig) -> tuple[str, str]:
+def start_overlap(rig: PhysicalHotkeyRig) -> tuple[str, str]:
     """A отпущена и распознаётся, B нажата и пишется (настоящие автомат и оркестратор)."""
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     rig.release(rig.now + 1)
     rig.now += 2
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     first, second = record_ids(rig)
     assert rig.runtime.orchestrator.pending_utterances == 2
     return first, second
@@ -587,7 +636,7 @@ def test_failed_wake_keeps_model_unloaded_and_frees_hotkey(
     original_resolve = rig.runtime._resolve_model_request
     fail_wake(rig, monkeypatch, failure)
     rig.pill.show_state.reset_mock()
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     assert rig.hotkey.fsm.state is HotkeyState.IDLE
     assert rig.runtime._model_parked and not rig.runtime._loading_model
     assert not rig.runtime._wake_dictation
@@ -601,7 +650,7 @@ def test_failed_wake_keeps_model_unloaded_and_frees_hotkey(
     monkeypatch.setattr(rig.runtime, "_resolve_model_request", original_resolve)
     loads = sent(rig).count("model.load")
     rig.now += 5
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     assert sent(rig).count("model.load") == loads + 1
     assert "record.start" not in sent(rig)
     rig.event(type="model.loaded")
@@ -621,13 +670,13 @@ def test_failed_wake_twice_in_same_worker_retries_each_press(
     original_send = rig.supervisor.send.side_effect
     fail_wake(rig, monkeypatch, "send")
     for _ in range(2):
-        rig.hotkey.fsm.press(rig.now)
+        rig.press(rig.now)
         rig.release(rig.now + 1)
         rig.now += 2
     assert rig.runtime._model_parked and rig.hotkey.fsm.state is HotkeyState.IDLE
     rig.supervisor.send.side_effect = original_send
     loads = sent(rig).count("model.load")
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     assert sent(rig).count("model.load") == loads + 1 and rig.runtime._loading_model
 
 
@@ -635,14 +684,14 @@ def test_worker_load_error_after_wake_unloads_again(monkeypatch: pytest.MonkeyPa
     """Воркер ответил ошибкой загрузки: клавиша свободна, следующее нажатие грузит снова."""
     rig = make_rig(monkeypatch)
     park(rig)
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     rig.event(type="error", code="engine-failed", request_type="model.load")
     assert rig.hotkey.fsm.state is HotkeyState.IDLE
     assert rig.runtime._model_parked and not rig.runtime._loading_model
     rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
     rig.release(rig.now + 1)
     loads = sent(rig).count("model.load")
-    rig.hotkey.fsm.press(rig.now + 5)
+    rig.press(rig.now + 5)
     assert sent(rig).count("model.load") == loads + 1
     assert "record.start" not in sent(rig)
 
@@ -662,7 +711,7 @@ def test_switch_while_unloaded_uses_pause_not_second_worker(
     assert rig.runtime._switch_candidate is None
     assert not rig.runtime._model_parked and rig.runtime._loading_model
     assert rig.supervisor_factory.call_count == workers + 1  # воркер заменён, не добавлен
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     assert sent(rig).count("model.load") == loads  # прежняя модель не грузится
     rig.event(type="hello")
     assert sent(rig).count("model.load") == loads + 1  # только новая
@@ -678,7 +727,7 @@ def test_press_while_unloaded_during_switch_waits_for_new_model(
     rig.runtime._switch_in_progress = True
     loads = sent(rig).count("model.load")
     rig.pill.show_state.reset_mock()
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     assert sent(rig).count("model.load") == loads
     assert rig.runtime._model_parked and rig.runtime._wake_dictation
     rig.pill.show_state.assert_called_once_with(PillState.LOADING_MODEL)
@@ -699,7 +748,7 @@ def test_always_during_appimage_removal_keeps_model_unloaded(
     rig.runtime.apply_model_unload_minutes(0)
     assert rig.runtime._model_parked and sent(rig).count("model.load") == loads
     rig.runtime.release_appimage_removal()
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     assert sent(rig).count("model.load") == loads + 1
     assert "record.start" not in sent(rig)
     rig.event(type="model.loaded")
@@ -742,31 +791,56 @@ def test_unloaded_mouse_still_checks_static_model_trust(
     assert not mouse.sent("model.load")
 
 
-def test_record_limit_counts_from_real_start_after_wake(monkeypatch: pytest.MonkeyPatch) -> None:
-    """MINOR-5: долгая загрузка в toggle не съедает предел 120 с — он от старта записи."""
+@pytest.mark.parametrize("mode", ["ptt", "toggle"])
+def test_record_limit_counts_from_real_start_after_wake(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """Лимит — от старта: при удержании PTT либо новом нажатии configured toggle."""
     from astra_voice.core.constants import RECORD_LIMIT_S
 
-    rig = Rig(
+    rig = PhysicalHotkeyRig(
         monkeypatch,
-        from_dict({"model_dir": "/tmp/model", "model_unload_minutes": 5, "hotkey_mode": "toggle"}),
+        from_dict({"model_dir": "/tmp/model", "model_unload_minutes": 5, "hotkey_mode": mode}),
     )
     rig.runtime.start()
-    rig.hotkey.has_pending_press = False
     load_model(rig)
     park(rig)
-    rig.hotkey.fsm.press(rig.now)
-    rig.hotkey.fsm.release(rig.now + 0.1)
+    rig.press(rig.now)
+    if mode == "toggle":
+        rig.release(rig.now + 0.1)
     rig.now += RECORD_LIMIT_S + 30  # загрузка дольше предела
     rig.hotkey.fsm.tick(rig.now)
-    assert rig.hotkey.fsm.state is HotkeyState.RECORDING
+    expected = HotkeyState.IDLE if mode == "toggle" else HotkeyState.RECORDING
+    assert rig.hotkey.fsm.state is expected
+    assert "record.start" not in sent(rig)
     rig.event(type="model.loaded")
     rig.event(type="result", utterance_id="file", text="проверка")
+    if mode == "toggle":
+        assert "record.start" not in sent(rig)
+        rig.press(rig.now)
     assert_phase(rig.runtime, DictationPhase.RECORDING)
     started = rig.now
     rig.hotkey.fsm.tick(started + RECORD_LIMIT_S - 1)
     assert_phase(rig.runtime, DictationPhase.RECORDING)
     rig.hotkey.fsm.tick(started + RECORD_LIMIT_S)
-    assert cast(HotkeyState, rig.hotkey.fsm.state) is HotkeyState.PROCESSING  # предел — от старта
+    assert rig.hotkey.fsm.state is HotkeyState.PROCESSING  # предел — от старта
+
+
+def test_fsm_recording_without_physical_press_does_not_autostart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RECORDING сам по себе не разрешает запись после загрузки."""
+    rig = make_rig(monkeypatch)
+    park(rig)
+    rig.hotkey.fsm.press(rig.now)  # Намеренно нет физического KeyPress.
+    assert rig.hotkey.fsm.state is HotkeyState.RECORDING
+    assert not rig.hotkey.physical_key_down
+    rig.event(type="model.loaded")
+    rig.event(type="result", utterance_id="file", text="проверка")
+    assert "record.start" not in sent(rig)
+    assert cast(HotkeyState, rig.hotkey.fsm.state) is HotkeyState.IDLE
+    assert_phase(rig.runtime, DictationPhase.IDLE)
+    rig.pill.hide.assert_called()
 
 
 def test_target_window_is_fixed_at_press_not_after_load(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -774,18 +848,18 @@ def test_target_window_is_fixed_at_press_not_after_load(monkeypatch: pytest.Monk
     — на момент нажатия, вставка идёт штатной веткой «окно сменилось»."""
     rig = make_rig(monkeypatch)
     park(rig)
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     rig.x11.target_window.return_value = 9999  # пользователь переключился, пока грузится
     rig.event(type="model.loaded")
     rig.event(type="result", utterance_id="file", text="проверка")
     assert_phase(rig.runtime, DictationPhase.RECORDING)
     rig.release(rig.now + 2)
     rig.event(type="result", text=MARKER)
-    assert rig.paste.call_args.args[1] == 4321
+    assert rig.paste.call_args.args[1] == rig.target
     # Следующая фраза без выгрузки — окно на её старте.
     rig.now += 5
     rig.recognize()
-    assert rig.paste.call_args.args[1] == 9999
+    assert rig.paste.call_args.args[1] == snapshot_target(rig.x11, 9999)
 
 
 def test_autostart_failure_keeps_its_error_pill(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -800,7 +874,7 @@ def test_autostart_failure_keeps_its_error_pill(monkeypatch: pytest.MonkeyPatch)
         rig.send(message, **kwargs)
 
     rig.supervisor.send.side_effect = send
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     rig.event(type="model.loaded")
     rig.pill.reset_mock()
     rig.event(type="result", utterance_id="file", text="проверка")
@@ -815,7 +889,7 @@ def test_autostart_silent_refusal_hides_loading_pill(monkeypatch: pytest.MonkeyP
     """Молчаливый отказ автостарту (ввод занят) не оставляет «Загружаю модель…»."""
     rig = make_rig(monkeypatch)
     park(rig)
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     rig.event(type="model.loaded")
     rig.runtime._input_owner = "keyboard"  # ввод занят другим источником
     rig.pill.reset_mock()
@@ -851,10 +925,10 @@ def test_invalid_admin_policy_value_is_logged(caplog: pytest.LogCaptureFixture, 
 # Финальный проход ревью US-2.6 ----------------------------------------------------------
 
 
-def crash_during_wake(rig: Rig) -> None:
+def crash_during_wake(rig: PhysicalHotkeyRig) -> None:
     """Нажатие будит модель; воркер падает до её загрузки, новый воркер грузит её сам."""
     park(rig)
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     assert rig.runtime._loading_model
     rig.event(type="error", code="worker-crashed")
     rig.supervisor.generation += 1
@@ -877,7 +951,7 @@ def test_load_error_after_crash_during_wake_unloads_again(
     rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
     rig.release(rig.now + 1)
     loads = sent(rig).count("model.load")
-    rig.hotkey.fsm.press(rig.now + 5)
+    rig.press(rig.now + 5)
     assert sent(rig).count("model.load") == loads + 1
     assert "record.start" not in sent(rig)
     rig.event(type="model.loaded")
@@ -895,7 +969,8 @@ def test_crash_during_wake_then_load_in_new_worker_keeps_model(
     rig.event(type="result", utterance_id="file", text="проверка")
     assert not rig.runtime._model_parked and rig.runtime._wake_generation is None
     assert rig.hotkey.fsm.state is HotkeyState.IDLE  # падение воркера сбросило нажатие
-    rig.hotkey.fsm.press(rig.now + 5)
+    rig.release(rig.now + 1)
+    rig.press(rig.now + 5)
     assert sent(rig)[-1] == "record.start"
     assert_phase(rig.runtime, DictationPhase.RECORDING)
 
@@ -934,7 +1009,7 @@ def test_always_while_unloaded_without_model_choice_shows_no_error(
     assert call(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED) not in (
         rig.pill.show_state.call_args_list
     )
-    rig.hotkey.fsm.press(rig.now)
+    rig.press(rig.now)
     rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
     assert rig.hotkey.fsm.state is HotkeyState.IDLE
 

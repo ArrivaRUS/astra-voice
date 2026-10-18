@@ -663,3 +663,57 @@ def test_level_monitor_with_real_indicator_guard(harness: Harness, scenario: str
     assert harness.pill.state == PillState.HIDDEN
     assert harness.tray.state == TrayState.IDLE
     assert not harness.guard.recording and not harness.timer.active
+
+
+def test_untrusted_tray_is_latched_until_end_of_recording(harness: Harness) -> None:
+    """ИБ-33: зарегистрированный, но не обновлённый значок не доказывает О4."""
+    harness.guard.set_tray_trusted(False)
+    harness.guard.set_recording(True)
+    assert harness.pill.forced
+    harness.guard.set_tray_trusted(True)
+    harness.pill.available = False
+    assert not harness.guard.ok
+    harness.clock.advance(1000)
+    harness.guard.check()
+    assert harness.events == ["stop"]
+    harness.guard.set_recording(False)
+    assert harness.guard.ok  # Новый эпизод вновь может доверять значку.
+    assert not harness.pill.forced
+
+
+@pytest.mark.parametrize("loss", ["disabled", "occluded"])
+def test_tray_failure_during_overlap_forces_pill_or_cancels_only_recording(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, loss: str
+) -> None:
+    """ИБ-33а/б: реальный страж, A распознаётся, B теряет индикацию."""
+    from test_dictation_overlap import A, B, OverlapRig
+
+    rig = OverlapRig()
+    rig.core._pill = harness.pill
+    rig.core._tray = harness.tray
+    rig.core._set_recording = harness.guard.set_recording
+    rig.core._set_tray_trusted = harness.guard.set_tray_trusted
+    harness.guard.on_stop_recording = rig.core.on_indicators_lost
+    rig.start()
+    rig.stop()
+    original = harness.tray.set_state
+
+    def fail_listening(state: TrayState, tooltip: str | None = None) -> None:
+        if state is TrayState.LISTENING:
+            raise RuntimeError("tray unavailable")
+        original(state, tooltip)
+
+    monkeypatch.setattr(harness.tray, "set_state", fail_listening)
+    rig.start()
+    assert harness.guard.recording and harness.pill.forced
+    if loss == "disabled":
+        harness.pill.enabled = False
+        harness.guard.check()
+        assert harness.guard.ok  # Форс сохраняет видимость вопреки настройке.
+        assert not rig.sent_ids("record.cancel")
+    # Реальное исчезновение пилюли, в том числе при отключении оболочкой.
+    harness.pill.available = False
+    harness.clock.advance(1000)
+    harness.guard.check()
+    assert rig.sent_ids("record.cancel") == [rig.uids[B]]
+    assert rig.uids[A] not in rig.sent_ids("record.cancel")

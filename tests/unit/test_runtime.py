@@ -264,6 +264,11 @@ class Rig:
         self.x11 = Mock()
         self.x11.active_window.return_value = 4321
         self.x11.target_window.return_value = 4321
+        title = self.x11.d.create_resource_object.return_value.get_full_property.return_value
+        title.format = 8
+        title.value = b"Runtime test target"
+        self.target = paste_module.snapshot_target(self.x11, 4321)
+        self.x11.reset_mock()
         self.x11.open.side_effect = lambda: self.record("x11.open")
         self.x11.close.side_effect = lambda: self.record("x11.close")
         self.capture_watchdogs: list[Mock] = []
@@ -393,6 +398,8 @@ class Rig:
 
     def send(self, message: dict[str, Any], **kwargs: object) -> None:
         self.record(str(message["type"]))
+        if message["type"] == "record.stop":
+            self.event(type="record.stopped", utterance_id=message["utterance_id"])
 
     def grab(self, combo: str, mode: HotkeyMode) -> GrabResult:
         self.record("hotkey.grab")
@@ -400,6 +407,17 @@ class Rig:
         return GrabResult(self.grab_code)
 
     def event(self, **event: object) -> None:
+        # Ошибки задания настоящего воркера адресованы своей фразе. Глобальные
+        # ошибки и ответы model.load/measure по-прежнему остаются без её id.
+        if (
+            event.get("type") == "error"
+            and "utterance_id" not in event
+            and "request_type" not in event
+            and "response_type" not in event
+            and event.get("code") not in ("worker-start", "worker-crashed", "restart-limit")
+            and self.runtime.phase in (DictationPhase.RECORDING, DictationPhase.PROCESSING)
+        ):
+            event["utterance_id"] = self.runtime.orchestrator._utterance_id
         callback = self.supervisor_factory.call_args.kwargs["on_event"]
         callback({"generation": self.supervisor.generation, **event})
 
@@ -1223,7 +1241,7 @@ def test_start_wires_resources_and_real_dictation(rig: Rig) -> None:
     )
     rig.stats.append.reset_mock()
     rig.recognize()
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
     assert runtime.last_text == MARKER
     assert_phase(runtime, DictationPhase.FINISHING)
     assert rig.hotkey.fsm.state == HotkeyState.IDLE
@@ -1463,7 +1481,7 @@ def test_start_without_model_does_not_load(rig: Rig, caplog: pytest.LogCaptureFi
         (logging.INFO, "модель в настройках не указана")
     ]
     rig.recognize()
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
 
 
 @pytest.mark.parametrize("fields", [{"load_ms": 123.5}, {}, {"load_ms": MARKER}])
@@ -1876,7 +1894,7 @@ def test_model_load_error_preserves_recording_and_hotkey_retries(
     rig.release(rig.now + 1)
     assert_phase(rig.runtime, DictationPhase.PROCESSING)
     rig.event(type="result", text=MARKER)
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
     rig.timers[-1].fire()
     assert_phase(rig.runtime, DictationPhase.IDLE)
     assert rig.runtime._model_load_failures == 2
@@ -2107,7 +2125,7 @@ def test_regrab_success_restores_dictation_once(
         call("hotkey_grab", key_role="text", result="regrabbed", attempts=busy_attempts + 1),
     ]
     rig.recognize()
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
 
 
 @pytest.mark.parametrize("blocked", ["selfcheck", "recording"])
@@ -2198,7 +2216,7 @@ def test_regrab_restores_real_hotkey_manager(
     rig.fire_tail()
     assert_phase(rig.runtime, DictationPhase.PROCESSING)
     rig.event(type="result", text=MARKER)
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
     rig.notify.notify_hotkey_regrabbed.assert_called_once_with("Ctrl+Space")
     rig.stats.append.assert_any_call("hotkey_grab", key_role="text", result="regrabbed", attempts=2)
 
@@ -2481,7 +2499,7 @@ def test_mapping_lost_during_ptt_recording_stops_and_recognizes(
     rig.tray.set_state.assert_any_call(TrayState.NOKEY)
     assert rig.runtime._regrab_timer is not None
     rig.event(type="result", text=MARKER)
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
 
 
 def test_mapping_lost_during_toggle_recording_ends_with_next_press(
@@ -2646,7 +2664,7 @@ def test_settings_are_used_for_recording_and_paste(monkeypatch: pytest.MonkeyPat
     rig.hotkey.fsm.press(rig.now + 1)
     rig.fire_tail()
     rig.event(type="result", text=MARKER)
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.CLIPBOARD_ONLY)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.CLIPBOARD_ONLY)
     settings.extra.clear()
     assert rig.runtime.record_params() == {
         "device": None,
@@ -3111,7 +3129,7 @@ def test_cancel_restart_replaces_supervisor_and_routes_new_cycle(
     callback({"type": "result", "generation": 7, "text": "старый результат"})
     rig.paste.assert_not_called()
     callback({"type": "result", "generation": 8, "text": MARKER})
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
     monkeypatch.setattr(module, "QCoreApplication", Mock())
     drain(runtime)
     new.pump.assert_called_once_with(timeout=0.05)
@@ -4399,7 +4417,7 @@ def test_onboarding_install_and_finish_loads_model_for_next_dictation(
                 "audio_ms": 1000.0,
             }
         )
-        rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+        rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
         assert_phase(rig.runtime, DictationPhase.FINISHING)
         assert rig.runtime.supervisor is replacement
     finally:
@@ -4713,6 +4731,9 @@ def test_microphone_runtime_and_app_host_use_real_ipc_without_side_effects(
     assert send.call_count == 1
     controller.stopTest()
     assert controller.testState == "processing"
+    # Захват настоящего воркера подтверждает физическое закрытие отдельно
+    # от результата распознавания; fake transport должен воспроизвести и его.
+    microphone_runtime_event(rig, {"type": "record.stopped", "utterance_id": uid})
     microphone_runtime_event(
         rig,
         {

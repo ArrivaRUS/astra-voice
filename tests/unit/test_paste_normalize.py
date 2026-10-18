@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import subprocess
@@ -171,6 +172,127 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> tuple[FakeClipboard, Mock, list[
     monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
     monkeypatch.delenv("DESKTOP_SESSION", raising=False)
     return cb, x, delays
+
+
+@pytest.mark.parametrize(
+    ("initial_title", "current_title", "read_error", "expected_reason"),
+    [
+        pytest.param(None, None, False, "", id="none-to-none"),
+        pytest.param(None, b"PRIVATE-OTHER-TAB-128", False, "", id="none-to-hash"),
+        pytest.param(
+            b"PRIVATE-TAB-TITLE-127",
+            b"PRIVATE-OTHER-TAB-128",
+            False,
+            "title-changed",
+            id="hash-to-different-hash",
+        ),
+        pytest.param(b"PRIVATE-TAB-TITLE-127", None, False, "title-unavailable", id="hash-to-none"),
+        pytest.param(b"PRIVATE-TAB-TITLE-127", b"PRIVATE-TAB-TITLE-127", False, "", id="same-hash"),
+        pytest.param(b"PRIVATE-TAB-TITLE-127", None, True, "title-unavailable", id="read-error"),
+    ],
+)
+def test_title_snapshot_rechecked_before_paste_without_private_logs(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    initial_title: bytes | None,
+    current_title: bytes | None,
+    read_error: bool,
+    expected_reason: str,
+) -> None:
+    """ИБ-35: исходный отпечаток требует совпадения; без него решает окно/WM_CLASS."""
+    cb, x, delays = harness
+    saved = cb.snapshot(False)
+    read = x.d.create_resource_object.return_value.get_full_property
+    read.return_value = (
+        None if initial_title is None else SimpleNamespace(format=8, value=initial_title)
+    )
+    target = paste.snapshot_target(x, 42)
+    assert target.title_digest == (
+        None if initial_title is None else hashlib.sha256(initial_title).digest()
+    )
+    assert repr(target) == "PasteTarget(window=42)"
+    assert not hasattr(target, "title")
+
+    def before_paste(ms: int) -> None:
+        delays.append(ms)
+        read.return_value = (
+            None if current_title is None else SimpleNamespace(format=8, value=current_title)
+        )
+        if read_error:
+            read.side_effect = RuntimeError("PRIVATE-TITLE-IN-X11-ERROR")
+
+    monkeypatch.setattr(paste, "_wait_ms", before_paste)
+    with caplog.at_level(logging.DEBUG):
+        outcome = paste.PasteFlow().run("Фраза для исходной вкладки", target, PasteMode.AUTO)
+    assert outcome.reason == expected_reason
+    if not expected_reason:
+        assert outcome.kind is PasteOutcomeKind.PASTED
+        assert outcome.restore is PasteRestore.RESTORED
+        assert cb.data[False] == saved
+        x.send_combo.assert_called_once()
+    else:
+        assert outcome.kind is PasteOutcomeKind.WINDOW_CHANGED
+        assert outcome.restore is PasteRestore.KEPT_OURS
+        assert cb.data[False]["text/plain"] == "Фраза для исходной вкладки".encode()
+        x.send_combo.assert_not_called()
+    assert "PRIVATE-TAB-TITLE-127" not in caplog.text
+    assert "PRIVATE-OTHER-TAB-128" not in caplog.text
+    assert "PRIVATE-TITLE-IN-X11-ERROR" not in caplog.text
+    for title in (initial_title, current_title):
+        if title is not None:
+            digest = hashlib.sha256(title).digest()
+            assert digest.hex() not in caplog.text
+            assert repr(digest) not in caplog.text
+
+
+def test_unavailable_initial_title_snapshot_allows_paste_without_private_logs(
+    harness: tuple[FakeClipboard, Mock, list[int]], caplog: pytest.LogCaptureFixture
+) -> None:
+    cb, x, _ = harness
+    saved = cb.snapshot(False)
+    read = x.d.create_resource_object.return_value.get_full_property
+    read.side_effect = RuntimeError("PRIVATE-TITLE-IN-X11-ERROR")
+    with caplog.at_level(logging.DEBUG):
+        target = paste.snapshot_target(x, 42)
+        outcome = paste.PasteFlow().run("Фраза для исходного окна", target, PasteMode.AUTO)
+    assert target.title_digest is None
+    assert repr(target) == "PasteTarget(window=42)"
+    assert not hasattr(target, "title")
+    assert outcome.kind is PasteOutcomeKind.PASTED
+    assert outcome.reason == ""
+    assert outcome.restore is PasteRestore.RESTORED
+    assert cb.data[False] == saved
+    x.send_combo.assert_called_once()
+    assert "PRIVATE-TITLE-IN-X11-ERROR" not in caplog.text
+    digest = hashlib.sha256(b"PRIVATE-TITLE-IN-X11-ERROR").digest()
+    assert digest.hex() not in caplog.text
+    assert repr(digest) not in caplog.text
+
+
+@pytest.mark.parametrize("reason", ["active-changed", "focus-outside", "wm-class-changed"])
+def test_unavailable_initial_title_still_requires_same_window_and_wm_class(
+    harness: tuple[FakeClipboard, Mock, list[int]], reason: str
+) -> None:
+    cb, x, _ = harness
+    if reason == "active-changed":
+        x.active_window.return_value = 99
+        x.d.get_input_focus.return_value.focus.id = 99
+    elif reason == "focus-outside":
+        x.d.get_input_focus.return_value.focus.id = 99
+    else:
+        x.wm_class.side_effect = [("kate", "kate"), ("kate", "other")]
+
+    outcome = paste.PasteFlow().run(
+        "Фраза для исходного окна", paste.PasteTarget(42, None), PasteMode.AUTO
+    )
+
+    assert outcome.kind is PasteOutcomeKind.WINDOW_CHANGED
+    assert outcome.reason == reason
+    assert outcome.restore is PasteRestore.KEPT_OURS
+    assert cb.data[False]["text/plain"] == "Фраза для исходного окна".encode()
+    x.send_combo.assert_not_called()
+    x.d.create_resource_object.assert_not_called()
 
 
 @pytest.mark.parametrize("pending_exists", [False, True])

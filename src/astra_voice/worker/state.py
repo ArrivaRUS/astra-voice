@@ -16,9 +16,10 @@ float32 без копирования PCM, через лениво импорт�
 
 Переход в idle ничего не удаляет. Буфер освобождается после result, cancelled,
 record.cancel, model.unload или close (граница жизни поколения воркера).
-При ошибке распознавания PCM снова ожидает запроса. Остановленный буфер хранится
-300 секунд по умолчанию; просрочка проверяется при следующем сообщении по
-инъектируемым монотонным часам. Просрочка и новый record.start с тем же id
+При ошибке распознавания PCM активного задания снова ожидает запроса; PCM
+отброшенного ожидающего задания удаляется сразу. Остановленный буфер хранится
+300 секунд по умолчанию; просрочка проверяется периодическим тиком воркера и при
+сообщениях по инъектируемым монотонным часам. Просрочка и новый record.start с тем же id
 удаляют старый остановленный буфер с записью в журнал без текста диктовки.
 
 Отмена неизвестного id возвращает error с кодом bad-state. Отмена существующей
@@ -446,7 +447,9 @@ class WorkerState:
                 deferred.append(self._capture.stop)
 
     def check_capture_watchdog(self) -> None:
-        """Проверяет сроки захвата и остановки независимо от поступления отсчётов."""
+        """Проверяет сроки захвата и хранения PCM без входящих IPC и отсчётов."""
+        with self._lock:
+            self._expire_stopped()
         if self._capture is not None:
             self._capture.check_stop_watchdog()
 
@@ -690,6 +693,10 @@ class WorkerState:
                 return
             if job.cancel.cancelled:
                 msg = {"type": "cancelled", "utterance_id": job.utterance_id}
+            elif msg["type"] == "error":
+                # Любая ошибка задания относится к нему, включая WAV, submit и
+                # кодирование результата. Загрузка модели сюда не попадает.
+                msg = {**msg, "utterance_id": job.utterance_id}
             if msg["type"] in {"result", "cancelled"}:
                 self.buffers.pop(job.utterance_id, None)
                 self._device_changed.discard(job.utterance_id)
@@ -702,11 +709,12 @@ class WorkerState:
             if msg.get("code") == "engine-failed":
                 # US-2.7, решение 5: идущую запись следующей фразы не трогаем — её
                 # распознает следующее задание. Ожидавшая очереди фраза получает
-                # ошибку (а не «отменено»); её PCM сохраняется, как у упавшей.
+                # ошибку (а не «отменено»); её PCM больше не нужен.
                 if self._pending is not None:
                     pending, self._pending = self._pending, None
-                    if pending.utterance_id in self.buffers:
-                        self._stopped[pending.utterance_id] = self._clock()
+                    self.buffers.pop(pending.utterance_id, None)
+                    self._stopped.pop(pending.utterance_id, None)
+                    self._device_changed.discard(pending.utterance_id)
                     discarded = [
                         {
                             **error("engine-failed", "Ошибка распознавания движка."),

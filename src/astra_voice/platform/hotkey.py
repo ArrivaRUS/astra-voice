@@ -582,6 +582,11 @@ class HotkeyManager:
     def has_pending_press(self) -> bool:
         return self._deferred_press is not None
 
+    @property
+    def physical_key_down(self) -> bool:
+        """Клавиша удерживается по событиям backend, независимо от режима FSM."""
+        return self._key_down
+
     def acquire_external_escape(self, token: object, callback: Callable[[], None]) -> GrabResult:
         """Lease passive Escape on this existing reader without changing its FSM."""
         if self._external_escape_revoking or self.fsm.state != HotkeyState.IDLE:

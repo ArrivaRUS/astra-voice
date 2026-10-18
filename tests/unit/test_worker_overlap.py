@@ -127,8 +127,12 @@ def test_engine_failure_of_first_keeps_second_recording(make_worker: Any) -> Non
     worker.feed_audio("b", [0.2])
     gate.set()
     failure = events.get(timeout=2)
-    # Ошибка без id: корреляцию с A по ожиданию recognize добавляет супервизор.
-    assert (failure["type"], failure.get("code")) == ("error", "engine-failed")
+    # Фоновая ошибка несёт id задания: супервизор не угадывает его по ожиданиям.
+    assert (failure["type"], failure.get("code"), failure.get("utterance_id")) == (
+        "error",
+        "engine-failed",
+        "a",
+    )
     assert worker.state is State.recording, "запись B остановлена молча после ошибки A"
     worker.feed_audio("b", [0.3])
     assert list(worker.buffers["b"]) == pytest.approx([0.2, 0.3])
@@ -141,7 +145,7 @@ def test_engine_failure_of_first_keeps_second_recording(make_worker: Any) -> Non
 def test_engine_failure_reports_queued_phrase_as_error(make_worker: Any) -> None:
     """Решение 5: ожидавшая очереди B при engine-failed A — ошибка с её id, не «cancelled».
 
-    PCM B сохраняется до срока хранения остановленных буферов, как у упавшей A.
+    ИБ-34: PCM ожидавшей B сразу освобождается; A остаётся для retry до TTL.
     """
     gate = Event()
     engine = FailFirstEngine(gate=gate)
@@ -156,10 +160,10 @@ def test_engine_failure_reports_queued_phrase_as_error(make_worker: Any) -> None
     assert cmd(worker, "recognize", "b") == []
     gate.set()
     first, second = events.get(timeout=2), events.get(timeout=2)
-    assert (first["type"], first.get("code"), "utterance_id" in first) == (
+    assert (first["type"], first.get("code"), first.get("utterance_id")) == (
         "error",
         "engine-failed",
-        False,
+        "a",
     )
     assert (second["type"], second.get("code"), second.get("utterance_id")) == (
         "error",
@@ -167,8 +171,7 @@ def test_engine_failure_reports_queued_phrase_as_error(make_worker: Any) -> None
         "b",
     )
     assert worker.state is State.idle
-    assert list(worker.buffers["b"]) == pytest.approx([0.2])
-    # Повтор распознавания B возможен: буфер цел.
-    assert cmd(worker, "recognize", "b") == []
-    result = events.get(timeout=2)
-    assert (result["type"], result["utterance_id"]) == ("result", "b")
+    assert "b" not in worker.buffers
+    assert "b" not in worker._stopped
+    assert cmd(worker, "recognize", "b")[0]["code"] == "bad-state"
+    assert engine.transcribe_calls == 1

@@ -37,6 +37,7 @@ class IndicatorGuard(QObject):
         self._pill = pill
         self._tray = tray
         self._recording = False
+        self._tray_trusted = True
         self._recording_episode = 0
         self._loss_reported = False
         self._grace_seconds = grace_ms / 1000
@@ -61,9 +62,19 @@ class IndicatorGuard(QObject):
         else:
             self.stop()
             self._loss_reported = False
+            self._tray_trusted = True
             self._pill_forced = False
             self._force_grace_deadline = 0.0
             self._pill.set_forced(False)
+
+    def set_tray_trusted(self, value: bool) -> None:
+        """Сбой обновления значка исключает его до конца текущей записи."""
+        if not value:
+            self._tray_trusted = False
+        elif not self._recording:
+            self._tray_trusted = True
+        if self._recording:
+            self.check()
 
     @property
     def recording(self) -> bool:
@@ -73,7 +84,8 @@ class IndicatorGuard(QObject):
     def ok(self) -> bool:
         """Прочитать локальные признаки индикации, без D-Bus-запросов в свойствах."""
         return indicator_visible(
-            pill_visible=self._pill.visible, tray_registered=self._tray.registered
+            pill_visible=self._pill.visible,
+            tray_registered=self._tray_trusted and self._tray.registered,
         )
 
     def check(self) -> bool:
@@ -86,7 +98,7 @@ class IndicatorGuard(QObject):
         if not self._recording:
             return self.ok
 
-        tray_registered = self._tray.registered
+        tray_registered = self._tray_trusted and self._tray.registered
         if not self._recording or episode != self._recording_episode:
             return self.ok
         forced = not tray_registered

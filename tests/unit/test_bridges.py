@@ -3671,6 +3671,9 @@ def test_microphone_properties_and_full_cycle(
     rig.event("silent")
     assert controller.testState == "processing"
     assert controller.level == 0.0
+    # silent инициирует stop; подтверждение физического закрытия приходит
+    # отдельным событием до результата, как у настоящего AudioCapture.
+    rig.event("record.stopped")
     rig.event("result", text="Личная фраза микрофона", t_ms=310)
     assert states == ["recording", "processing", "done"]
     assert core_states == [
@@ -3880,25 +3883,36 @@ def test_microphone_start_failure_cancels_even_from_error_state(
     rig.controller.startTest()
     assert rig.controller.testState == "error"
     assert rig.controller.testMessage == "Не удалось распознать речь. Попробуйте ещё раз."
-    assert rig.host.cancel_test.call_args_list == [call(), call()]
-    assert [msg["type"] for msg in rig.commands] == (
-        ["record.start"] if cancel_fails else ["record.start", "record.cancel"]
-    )
+    # Ошибка индикатора обработана внутри оркестратора: bridge не получает
+    # исключение и не должен дублировать отмену. Отказ порта при уходе со
+    # страницы уже не может помешать отправленной отмене захвата.
+    assert rig.host.cancel_test.call_args_list == [call()]
+    assert [msg["type"] for msg in rig.commands] == ["record.start", "record.cancel"]
+    assert rig.commands[0]["utterance_id"] == rig.commands[1]["utterance_id"]
+    assert rig.core.cleanup_pending
     if not cancel_fails:
         rig.event("cancelled")
         assert not rig.core.test_active
         assert rig.core.phase == DictationPhase.IDLE
         assert rig.controller.testState == "error"
     getattr(rig.controller, leave)()
-    assert rig.host.cancel_test.call_args_list == [call(), call(), call()]
+    assert rig.host.cancel_test.call_args_list == [call(), call()]
     assert [msg["type"] for msg in rig.commands] == ["record.start", "record.cancel"]
     if cancel_fails:
+        assert rig.core.cleanup_pending
         rig.event("cancelled")
+    assert not rig.core.cleanup_pending
     assert not rig.core.test_active
     assert rig.core.phase == DictationPhase.IDLE
     assert rig.controller.testState == "idle"
     assert private not in caplog.text
-    assert all(record.exc_info is None for record in caplog.records)
+    # Safe UI сохраняет диагностический стек со служебным исключением;
+    # оригинальная ошибка и её цепочка не должны сохранять приватные данные.
+    exceptions = [record.exc_info[1] for record in caplog.records if record.exc_info]
+    assert exceptions
+    for exception in exceptions:
+        assert exception is not None and private not in str(exception)
+        assert exception.__cause__ is None and exception.__context__ is None
 
 
 @pytest.mark.parametrize("command", ["record.start", "record.stop", "recognize"])
@@ -3965,7 +3979,8 @@ def _microphone_log_violations(
     # - test_microphone_host_exception_is_not_logged: приватная строка из ошибки
     #   start_test отсутствует в caplog.text;
     # - test_microphone_start_failure_cancels_even_from_error_state: ошибки старта
-    #   и отмены не оставляют ни приватной строки, ни record.exc_info;
+    #   и отмены не оставляют приватной строки; safe UI сохраняет только
+    #   служебное исключение без приватного сообщения и цепочки;
     # - test_microphone_command_failure_logs_warning_without_exception: ошибки
     #   record.start/record.stop/recognize не оставляют приватной строки, и
     #   assert all(record.exc_info is None for record in caplog.records).

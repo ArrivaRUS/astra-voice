@@ -90,6 +90,8 @@ class OverlapRig(Rig):
         return [str(m.get("utterance_id")) for m, _ in self.sent if m["type"] == kind]
 
     def event_for(self, index: int, kind: str, **fields: object) -> None:
+        if kind == "record.limit" and self.ack_stop:
+            self.event_for(index, "record.stopped", **fields)
         self.core.on_worker_event(
             {
                 "type": kind,
@@ -555,10 +557,8 @@ def test_held_press_during_recognition_is_a_normal_phrase(rig: OverlapRig) -> No
 def test_queued_phrase_failed_by_engine_shows_error_not_cancelled(rig: OverlapRig) -> None:
     """Решение 5: B, ждавшая очереди и не распознанная из-за ошибки A, — ошибка, не «Отменено»."""
     begin_overlap(rig, release_b=True)
-    rig.core.on_worker_event(
-        {"type": "error", "generation": rig.worker_generation, "code": "engine-failed"}
-    )
-    # Ошибка без id относится к распознаваемой A; B продолжает ждать.
+    rig.event_for(A, "error", code="engine-failed")
+    # Ошибка адресована A; B продолжает ждать.
     assert rig.active(PROCESSING_WATCHDOG_MS), "ошибка A сняла сторож B"
     rig.event_for(B, "error", code="engine-failed", request_type="recognize")
     assert (PillState.ERROR, ERROR_RECOGNITION_FAILED, None) in rig.pill.calls
@@ -709,6 +709,7 @@ def test_deferred_first_error_does_not_resurface_on_later_phrase(rig: OverlapRig
         }
     )
     assert rig.pill.calls[-1][:2] == (PillState.ERROR, ERROR_MICROPHONE_CHANGED)
+    rig.event_for(B, "cancelled")
     fire_finishing_timers(rig)
     assert phase_of(rig) == DictationPhase.IDLE
     rig.now += 60
@@ -774,6 +775,8 @@ def test_second_recording_failure_returns_hotkey_to_queue(hotkey_mode: HotkeyMod
     rig.assert_hotkey_state(HotkeyState.PROCESSING)
     assert not rig.recording
     assert rig.uids[A] not in rig.sent_ids("record.cancel")
+    assert rig.core.cleanup_pending
+    rig.event_for(B, "cancelled")
     rig.now += 1
     if hotkey_mode == HotkeyMode.PTT:
         rig.fsm.release(rig.now)
@@ -1003,3 +1006,19 @@ def test_failing_ui_ports_when_second_starts_cancel_only_second(rig: OverlapRig)
     rig.event_for(B, "cancelled")
     rig.result_for(A, A_TEXT)
     assert rig.texts() == [A_TEXT]
+
+
+@pytest.mark.parametrize("timeout_first", [False, True])
+def test_global_error_never_selects_an_utterance(rig: OverlapRig, timeout_first: bool) -> None:
+    """ИБ-30: ошибка без id не угадывает A и не завершает запись B."""
+    begin_overlap(rig)
+    if timeout_first:
+        rig.event_for(A, "error", code="timeout")
+        assert rig.sent_ids("record.cancel") == [rig.uids[A]]
+    before = list(rig.trace)
+    rig.core.on_worker_event({"type": "error", "generation": 1, "code": "engine-failed"})
+    assert rig.trace == before
+    assert rig.core.phase is DictationPhase.RECORDING
+    assert rig.recording
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    assert rig.uids[B] not in rig.sent_ids("record.cancel")

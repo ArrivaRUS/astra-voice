@@ -21,6 +21,7 @@ from astra_voice.core.command_mode import CommandFeedback, CommandMode, SessionS
 from astra_voice.core.dictation import (
     LEVEL_FAILED,
     TEST_BUSY,
+    TEST_FAILED,
     TEST_MODEL_UNAVAILABLE,
     TEST_PREPARING,
     DictationOrchestrator,
@@ -67,9 +68,11 @@ from astra_voice.platform.mouse_button import MouseHoldManager, MouseHoldState
 from astra_voice.platform.paste import (
     PasteMode,
     PasteOutcome,
+    PasteTarget,
     paste_text,
     publish_clipboard,
     restore_pending,
+    snapshot_target,
 )
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.session_state import SessionMonitor
@@ -167,7 +170,7 @@ class DictationRuntime(QObject):
         hotkey_factory: Callable[[], HotkeyManager] = HotkeyManager,
         mouse_factory: Callable[[], MouseHoldManager] = MouseHoldManager,
         stats_factory: Callable[[], Stats] = Stats,
-        paste_func: Callable[[str, int | None, PasteMode], PasteOutcome] = paste_text,
+        paste_func: Callable[[str, int | None | PasteTarget, PasteMode], PasteOutcome] = paste_text,
         restore_paste: Callable[[], bool] = restore_pending,
         x11_factory: Callable[[], X11Display] = X11Display,
         guard_factory: Callable[..., IndicatorGuard] = IndicatorGuard,
@@ -285,7 +288,7 @@ class DictationRuntime(QObject):
         self._model_parked = False
         self._wake_dictation = False
         # Окно-цель на момент нажатия, разбудившего модель: запись стартует позже (US-2.6).
-        self._wake_window: tuple[int | None] | None = None
+        self._wake_window: tuple[PasteTarget] | None = None
         # Поколение воркера, в которое нажатие грузит выгруженную модель.
         self._wake_generation: int | None = None
         self._idle_unload_timer: QTimer | None = None
@@ -351,7 +354,7 @@ class DictationRuntime(QObject):
                 pill=self.pill,
                 tray=self.tray,
                 paste=self.paste_func,
-                active_window=self.x11.target_window,
+                active_window=lambda: snapshot_target(self.x11, self.x11.target_window()),
                 schedule=self.schedule,
                 cancel_timer=self.cancel_timer,
                 hotkey_done=self._input_done,
@@ -359,6 +362,7 @@ class DictationRuntime(QObject):
                 hotkey_idle=self._input_idle,
                 hotkey_refuse=self._input_refuse,
                 set_recording=self.guard.set_recording,
+                set_tray_trusted=self.guard.set_tray_trusted,
                 recording_cue=self._recording_cue,
                 paste_mode=self.paste_mode,
                 record_params=self.record_params,
@@ -375,6 +379,7 @@ class DictationRuntime(QObject):
             self.supervisor = supervisor_factory(on_event=self._on_worker_event, use_qt=True)
             rollback.append(("воркер", self.supervisor.stop))
             self.hotkey.on_state = self._on_hotkey_state
+            self.hotkey.on_release = self._on_hotkey_release
             self.pill.on_cancel_clicked = partial(self._cancel_input, "pill")
             self.tray.on_cancel = partial(self._cancel_input, "tray")
             self.tray.on_copy_last = self._copy_last
@@ -1974,13 +1979,16 @@ class DictationRuntime(QObject):
     def _fail_candidate(self) -> None:
         self._finish_switch("failed")
 
-    def _fail_pending_test(self) -> None:
+    def _fail_pending_test(self, *, message: str = TEST_MODEL_UNAVAILABLE) -> None:
         # Загрузка не удалась: запись, ждавшая пробуждения модели, тоже не начнётся.
         self._drop_wake()
         self._cancel_preparing_timer()
         pending, self._pending_test = self._pending_test, None
         if pending is not None:
-            pending[1](MicrophoneTestUpdate("error", message=TEST_MODEL_UNAVAILABLE))
+            try:
+                pending[1](MicrophoneTestUpdate("error", message=message))
+            except Exception as exc:
+                log.warning("Не удалось обновить экран проверки микрофона: %s", type(exc).__name__)
 
     def _cancel_preparing_timer(self) -> None:
         timer, self._preparing_timer = self._preparing_timer, None
@@ -2187,7 +2195,8 @@ class DictationRuntime(QObject):
         autostart = (
             wake
             and self.orchestrator.phase == DictationPhase.IDLE
-            and self.hotkey.fsm.state == HotkeyState.RECORDING
+            and self.settings.hotkey_mode == HotkeyMode.PTT.value
+            and self.hotkey.physical_key_down is True
         )
         if autostart:
             # Нажатие разбудило модель, выгруженную по простою, и запись ещё не
@@ -2212,9 +2221,22 @@ class DictationRuntime(QObject):
         else:
             log.info("модель загружена")
         self._cancel_preparing_timer()
-        pending, self._pending_test = self._pending_test, None
+        pending = self._pending_test
         if pending is not None:
-            self.orchestrator.start_test(*pending)
+            try:
+                self.orchestrator.start_test(*pending)
+            except Exception as exc:
+                log.warning("Не удалось начать проверку микрофона: %s", type(exc).__name__)
+                # Ошибка завершает эпоху bridge до служебного idle от отмены.
+                self._fail_pending_test(message=TEST_FAILED)
+                try:
+                    self.orchestrator.cancel_test()
+                except Exception as cancel_exc:
+                    log.warning(
+                        "Не удалось отменить проверку микрофона: %s", type(cancel_exc).__name__
+                    )
+            else:
+                self._pending_test = None
         self._note_activity()
 
     def _start_selfcheck(self, event: dict[str, Any]) -> None:
@@ -2466,16 +2488,26 @@ class DictationRuntime(QObject):
                         self.tray.set_state(TrayState.ERROR)
         self.orchestrator.on_worker_event(event)
 
+    def _on_hotkey_release(self) -> None:
+        # on_release приходит после fsm.release: короткое отпускание уже могло
+        # превратить PTT в toggle. До готовности модели это только загрузка.
+        self._drop_wake()
+
     def _on_hotkey_state(self, state: HotkeyState, reason: str) -> None:
         """Откладывает диктовку, пока воркер загружает модель."""
         if not self._closed:
             self._note_activity()
         if reason.startswith(MAPPING_REGRAB_PREFIX):
+            if self.hotkey.mapping_release_lost is True:
+                self._drop_wake()
             self._validate_command_mapping()
             self._on_mapping_regrab(reason)
             if self.hotkey.fsm.state != state:
                 # Запись с удержанием уже остановлена (mapping-lost): состояние устарело.
                 return
+        if self._wake_dictation and state != HotkeyState.RECORDING:
+            self._drop_wake()
+            return
         if self._input_owner not in (None, "text") or self._capture_watchdog is not None:
             if state == HotkeyState.RECORDING:
                 self.hotkey.fsm.escape(monotonic())
@@ -2721,7 +2753,7 @@ class DictationRuntime(QObject):
             log.warning("Не удалось выгрузить модель из памяти")
 
     def _wake_model(self, *, gesture: bool = True) -> bool:
-        """Загружает модель, выгруженную по простою, в уже запущенный воркер.
+        """Загружает модель после простоя; остановленный воркер заменяет один раз.
 
         gesture=False — загрузку начал не жест пользователя (выбор «Всегда» в
         настройках): модель, не выбранная в настройках, ошибкой не показывается.
@@ -2746,6 +2778,24 @@ class DictationRuntime(QObject):
         self._model_load_failures = 0
         self._model_load_generation = None
         log.info("загружаю модель после выгрузки по простою")
+        if self.supervisor.state == "stopped":
+            # Новый жест — одна ограниченная попытка, без цикла автоперезапусков.
+            # restart_worker сам назначает уникальное поколение новой инстанции.
+            try:
+                self.restart_worker(wait_for_model=True)
+            except Exception as exc:
+                log.warning("Не удалось запустить воркер после выгрузки: %s", type(exc).__name__)
+            if str(self.supervisor.state) != "running":
+                self._model_parked = True
+                self._loading_model = False
+                self._wake_generation = None
+                self._fail_pending_test()
+                if self._command_publication_allowed():
+                    self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+                self.tray.set_state(TrayState.ERROR)
+                return False
+            self._wake_generation = self.supervisor.generation
+            return True
         self._load_model(wake=gesture)
         if not self._loading_model:
             self._model_parked = True
@@ -2754,27 +2804,34 @@ class DictationRuntime(QObject):
         return True
 
     def _wake_for_hotkey(self) -> None:
-        """Нажатие хоткея при выгруженной модели: запись начнётся, когда она готова."""
+        """Загрузить модель; автостарт разрешён только пока физически удержан PTT."""
         try:
-            window: tuple[int | None] | None = (self.x11.target_window(),)
+            window: tuple[PasteTarget] | None = (
+                snapshot_target(self.x11, self.x11.target_window()),
+            )
         except Exception:
             # Окно не узнать — его определит старт записи, как без выгрузки.
             window = None
         if self._switch_active():
             # Защитная ветка: смена при выгруженной модели идёт с паузой и снимает
             # выгрузку (restart_worker), так что сюда штатно не попадаем.
-            log.info("хоткей: модель выгружена, идёт смена модели — запись начнётся после неё")
+            log.info("хоткей: модель выгружена, идёт смена модели")
             if self.orchestrator.phase == DictationPhase.IDLE:
                 if self._command_publication_allowed():
                     self.pill.show_state(PillState.LOADING_MODEL)
         else:
-            log.info("хоткей: модель выгружена по простою — загружаю, запись начнётся после")
+            log.info("хоткей: модель выгружена по простою — загружаю")
             if not self._wake_model():
                 # Загрузка не началась, ошибку показал _load_model: клавиша не залипает.
                 self.hotkey.fsm.escape(monotonic())
                 return
-        self._wake_dictation = True
-        self._wake_window = window
+        self._wake_dictation = self.settings.hotkey_mode == HotkeyMode.PTT.value
+        self._wake_window = window if self._wake_dictation else None
+        if not self._wake_dictation:
+            # В configured toggle первый жест только загружает модель; после
+            # готовности нужен новый press, даже если первый ещё удерживается.
+            self.hotkey.fsm.escape(monotonic())
+            return
         # Предел длительности фразы считается от настоящего старта записи.
         self.hotkey.fsm.restart_limit(None)
 

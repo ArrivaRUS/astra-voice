@@ -1074,6 +1074,73 @@ def test_engine_error_preserves_pcm_for_retry(factory: Factory) -> None:
     assert worker.buffers == {}
 
 
+def test_failed_pcm_expires_on_worker_tick_without_ipc(
+    factory: Factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ИБ-34: periodic tick удаляет PCM упавшей A через 300 с без сообщений GUI."""
+    now = 10.0
+    worker, _, events = factory(FakeEngine(raises=True), clock=lambda: now)
+    start(worker, "a")
+    recognize(worker, "a")
+    assert events.get(timeout=2)["code"] == "engine-failed"
+    now += STOPPED_TTL_S_DEFAULT - 0.01
+    worker.check_capture_watchdog()
+    assert "a" in worker.buffers
+    connection = Mock(spec=socket.socket)
+    connection.recv.return_value = b""
+    loop = WorkerLoop(connection, capture=False)
+    loop.worker.close()
+    loop.worker = worker
+    polls = 0
+
+    def poll(*args: Any) -> tuple[list[Any], list[Any], list[Any]]:
+        nonlocal now, polls
+        polls += 1
+        if polls == 1:
+            now += 0.01
+            return [], [], []
+        # Реальный run сделал следующий tick без поступившего сообщения;
+        # проверяем до close(), который тоже удалил бы PCM.
+        assert worker.buffers == {}
+        assert worker._stopped == {}
+        return [connection], [], []
+
+    monkeypatch.setattr("astra_voice.worker.main.select.select", poll)
+    assert loop.run() == 0
+    assert polls == 2
+
+
+@pytest.mark.parametrize("failure", ["engine", "executor", "encoding", "wav"])
+def test_all_recognition_job_errors_have_job_id(
+    factory: Factory, tmp_path: Path, failure: str
+) -> None:
+    """MJ-1/MN-3: все пути завершения задания коррелируются без догадок GUI."""
+    kwargs: dict[str, Any] = {}
+    if failure == "executor":
+        kwargs["executor"] = Mock(submit=Mock(side_effect=RuntimeError))
+    worker, _, events = factory(
+        FakeEngine(
+            raises=failure == "engine",
+            text="x" * (ipc.MAX_TEXT_BYTES + 1) if failure == "encoding" else "проверка",
+        ),
+        **kwargs,
+    )
+    if failure == "wav":
+        worker.handle({"type": "transcribe.file", "path": str(tmp_path / "missing.wav")})
+        uid, code = "file", "bad-audio"
+    else:
+        start(worker, "a")
+        recognize(worker, "a")
+        uid, code = "a", BAD_FIELD if failure == "encoding" else "engine-failed"
+    message = events.get(timeout=2)
+    assert (message["type"], message["code"], message.get("utterance_id")) == (
+        "error",
+        code,
+        uid,
+    )
+    assert decode(encode(message)[4:]) == message
+
+
 def test_unload_forgets_cancelled_ids(factory: Factory) -> None:
     worker, _, _ = factory()
     start(worker)
@@ -1275,6 +1342,7 @@ def test_load_failure_is_sanitized(factory: Factory, caplog: pytest.LogCaptureFi
     worker, engine, _ = factory(FakeEngine(load_raises=True, text="секрет загрузки"), loaded=False)
     msg = worker.handle(load_message())[0]
     assert msg["code"] == "engine-failed"
+    assert "utterance_id" not in msg
     assert engine.unload_calls == 1
     assert "секрет загрузки" not in str(msg)
     (record,) = [
@@ -1649,6 +1717,9 @@ def test_late_record_stop_through_supervisor_keeps_dictation(factory: Factory, c
     loop._send_buffer.clear()
     # Порядок провода: событие воркера ушло раньше ответов на stop/recognize.
     worker_answers(stopped_by_worker, *replies)
+    # capture=False не создаёт AudioCapture: воспроизводим его подтверждение
+    # закрытия источника, которое в живом воркере предшествует результату.
+    worker_answers({"type": "record.stopped", "utterance_id": uid})
     worker_answers(worker_events.get(timeout=2))
     paste.assert_called_once_with("проверка", 42, PasteMode.AUTO)
     assert supervisor.dropped_late == 0
