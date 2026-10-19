@@ -35,6 +35,8 @@ if TYPE_CHECKING:
     from astra_voice.net.gate import NetworkKind
     from astra_voice.updates.checker import UpdateStatus
 
+from astra_voice.updates.model_updates import ModelUpdateNotice, status_line
+
 log = logging.getLogger(__name__)
 
 #: Состояния строки-статуса, которые мост отдаёт QML (подмножество спеки §2.2).
@@ -110,6 +112,8 @@ class UpdateActions(Protocol):
     """То, что мост вызывает у проверки обновлений (любой поток)."""
 
     def check_now(self) -> None: ...
+
+    def check_models_now(self) -> None: ...
 
     def refresh(self) -> None: ...
 
@@ -205,6 +209,7 @@ class UpdatesBridge(QObject):
         self._cancel_reason = ""
         self._starting = False
         self._pending: list[DownloadStatus] = []
+        self._model_notices: dict[str, ModelUpdateNotice] = {}
         self._state = "disabled"
         self._version = ""
         self._notes: list[dict[str, object]] = []
@@ -215,6 +220,7 @@ class UpdatesBridge(QObject):
         self._check_refusal = ""
         self._network_refusal = ""
         self._scheduled_refusal = ""
+        self._model_check_refusal = ""
         self._read_network()
 
     # -- Python (GUI-поток) -------------------------------------------------
@@ -280,14 +286,25 @@ class UpdatesBridge(QObject):
             self._checker.refresh()
 
     def _read_network(self) -> None:
-        check = download = scheduled = ""
+        check = download = scheduled = models = ""
         if self._refusal is not None:
             check = self._refusal("check_app_manual")
             download = self._refusal("download")
             scheduled = self._refusal("check_app")
-        values = (check, download, scheduled)
-        if values != (self._check_refusal, self._network_refusal, self._scheduled_refusal):
-            self._check_refusal, self._network_refusal, self._scheduled_refusal = values
+            models = self._refusal("check_models")
+        values = (check, download, scheduled, models)
+        if values != (
+            self._check_refusal,
+            self._network_refusal,
+            self._scheduled_refusal,
+            self._model_check_refusal,
+        ):
+            (
+                self._check_refusal,
+                self._network_refusal,
+                self._scheduled_refusal,
+                self._model_check_refusal,
+            ) = values
             self.networkChanged.emit()
             self.statusChanged.emit()
             self.downloadChanged.emit()
@@ -295,6 +312,19 @@ class UpdatesBridge(QObject):
             self._request_cancel(self._network_refusal)
 
     # -- свойства ------------------------------------------------------------
+
+    def set_model_update(self, notice: ModelUpdateNotice) -> None:
+        """Вызывается владельцем в GUI через gui_calls, как set_status."""
+        self._model_notices[notice.model_id] = notice
+        self.statusChanged.emit()
+
+    def clear_model_update(self, model_id: str) -> None:
+        if self._model_notices.pop(model_id, None) is not None:
+            self.statusChanged.emit()
+
+    @pyqtProperty(str, notify=statusChanged)
+    def modelUpdateText(self) -> str:  # noqa: N802
+        return status_line(tuple(self._model_notices.values())) or ""
 
     @pyqtProperty(str, notify=statusChanged)
     def state(self) -> str:
@@ -360,6 +390,14 @@ class UpdatesBridge(QObject):
     def canCheckNow(self) -> bool:  # noqa: N802
         return self._checker is not None and self._check_refusal == ""
 
+    @pyqtProperty(bool, notify=networkChanged)
+    def canCheckModelsNow(self) -> bool:  # noqa: N802
+        return (
+            self._checker is not None
+            and self._refusal is not None
+            and self._model_check_refusal == ""
+        )
+
     # -- слоты ---------------------------------------------------------------
 
     @pyqtSlot()
@@ -367,6 +405,12 @@ class UpdatesBridge(QObject):
         self._read_network()
         if self._checker is not None and self._check_refusal == "":
             self._checker.check_now()
+
+    @pyqtSlot()
+    def checkModelsNow(self) -> None:  # noqa: N802
+        self._read_network()
+        if self._checker is not None and self.canCheckModelsNow:
+            self._checker.check_models_now()
 
     @pyqtSlot()
     def skipVersion(self) -> None:  # noqa: N802

@@ -1371,6 +1371,10 @@ class FakeSettings(QObject):
     def _get_revocationUnknown(self) -> bool:
         return self._revocationUnknown
 
+    @pyqtProperty(bool, notify=changed)
+    def catalogUnavailable(self) -> bool:  # noqa: N802
+        return False
+
     def _set_revocationUnknown(self, value: bool) -> None:
         self._revocationUnknown = value
         self.changed.emit()
@@ -1544,6 +1548,14 @@ class FakeSettings(QObject):
     @pyqtSlot(str)
     def updateModel(self, model_id: str) -> None:
         self.calls.append("updateModel")
+
+    @pyqtSlot()
+    def cancelModelUpdate(self) -> None:
+        self.calls.append("cancelModelUpdate")
+
+    @pyqtSlot(str)
+    def revertModelPrevious(self, model_id: str) -> None:
+        self.calls.append("revertModelPrevious")
 
     @pyqtSlot()
     def reinstallActiveModel(self) -> None:

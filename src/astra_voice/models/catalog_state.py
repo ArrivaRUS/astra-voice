@@ -12,6 +12,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import stat
 import tempfile
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ class CatalogState:
     serial: int
     sha256: str
     revoked: tuple[tuple[str, str], ...] | None = None
+    schema_id: str | None = None
 
 
 def state_path(directory: Path) -> Path:
@@ -98,7 +100,16 @@ def read_state(path: Path) -> CatalogState | None:
             revoked = tuple((item["model_id"], item["revision"]) for item in value)
         else:
             log.warning("Снимок отозванных версий в состоянии каталога повреждён.")
-    return CatalogState(trust_epoch=trust_epoch, serial=serial, sha256=sha256, revoked=revoked)
+    schema_id = document.get("schema_id")
+    if schema_id is not None and (
+        not isinstance(schema_id, str) or re.fullmatch(r"[0-9a-f]{16}", schema_id) is None
+    ):
+        # Повреждение необязательного поля не снимает барьер анти-отката.
+        log.warning("Идентификатор схемы в состоянии каталога повреждён.")
+        schema_id = None
+    return CatalogState(
+        trust_epoch=trust_epoch, serial=serial, sha256=sha256, revoked=revoked, schema_id=schema_id
+    )
 
 
 def write_state(path: Path, state: CatalogState) -> None:
@@ -108,6 +119,8 @@ def write_state(path: Path, state: CatalogState) -> None:
         "serial": state.serial,
         "sha256": state.sha256,
     }
+    if state.schema_id is not None:
+        document["schema_id"] = state.schema_id
     if state.revoked is not None:
         document["revoked"] = [
             {"model_id": model_id, "revision": revision} for model_id, revision in state.revoked
@@ -170,7 +183,7 @@ def apply_state(path: Path, candidate: CatalogState) -> bool:
         applied.serial,
         applied.sha256,
     ):
-        if applied.revoked == candidate.revoked:
+        if applied.revoked == candidate.revoked and applied.schema_id == candidate.schema_id:
             return False
     write_state(path, candidate)
     return True

@@ -77,6 +77,7 @@ class FakeUpdates(QObject):
         self.calls: list[str] = []
         self._values: dict[str, Any] = {
             "state": "disabled",
+            "modelUpdateText": "",
             "version": "",
             "notes": [],
             "currentVersion": "0.2.0",
@@ -87,6 +88,7 @@ class FakeUpdates(QObject):
             "checkRefusal": "",
             "networkRefusal": "",
             "canCheckNow": True,
+            "canCheckModelsNow": False,
             "restState": "idle",
         }
         self._values.update(
@@ -119,6 +121,7 @@ class FakeUpdates(QObject):
         )
         self._values.update(values)
 
+    modelUpdateText = pyqtProperty(str, _value("modelUpdateText"), notify=statusChanged)
     state = pyqtProperty(str, _value("state"), notify=statusChanged)
     version = pyqtProperty(str, _value("version"), notify=statusChanged)
     notes = pyqtProperty("QVariantList", _value("notes"), notify=statusChanged)
@@ -130,6 +133,7 @@ class FakeUpdates(QObject):
     checkRefusal = pyqtProperty(str, _value("checkRefusal"), notify=networkChanged)
     networkRefusal = pyqtProperty(str, _value("networkRefusal"), notify=networkChanged)
     canCheckNow = pyqtProperty(bool, _value("canCheckNow"), notify=networkChanged)
+    canCheckModelsNow = pyqtProperty(bool, _value("canCheckModelsNow"), notify=networkChanged)
     restState = pyqtProperty(str, _value("restState"), notify=networkChanged)
 
     downloadPhase = pyqtProperty(str, _value("downloadPhase"), notify=downloadChanged)
@@ -168,6 +172,10 @@ class FakeUpdates(QObject):
     @pyqtSlot()
     def checkNow(self) -> None:  # noqa: N802
         self.calls.append("checkNow")
+
+    @pyqtSlot()
+    def checkModelsNow(self) -> None:  # noqa: N802
+        self.calls.append("checkModelsNow")
 
     @pyqtSlot()
     def skipVersion(self) -> None:  # noqa: N802

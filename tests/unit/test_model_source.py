@@ -26,7 +26,8 @@ from astra_voice.core.model_source import (
     smoke_wav_path,
 )
 from astra_voice.core.settings import Settings, from_dict
-from astra_voice.models.store import ModelStore
+from astra_voice.models import catalog_state
+from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.worker import ipc
 
 pytestmark = pytest.mark.unit
@@ -648,3 +649,109 @@ def test_missing_model_is_still_not_configured(tmp_path: Path) -> None:
 
     assert resolve_model_request(from_dict({}), None, store_dir=tmp_path, revoked=revoked) is None
     revoked.assert_not_called()
+
+
+@pytest.mark.parametrize("source", ["settings", "store", "model-dir"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("unavailable"),
+        StoreError("catalog-unavailable", "unavailable"),
+        model_source.RevocationUnknown(),
+    ],
+    ids=["io-error", "catalog-unavailable", "revocation-unknown"],
+)
+def test_marker_revocation_survives_callback_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    tmp_path: Path,
+    source: str,
+    error: Exception,
+) -> None:
+    """Недоступный callback не разрешает загрузку уже отозванной ревизии."""
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    store = FakeStore(record=FakeRecord()) if source == "store" else None
+    if source == "model-dir":
+        settings = from_dict({"model_dir": str(tmp_path / "gigaam" / "v3")})
+        expected = ("gigaam", "v3")
+    elif source == "store":
+        expected = ("stored-model", "stored-revision")
+    else:
+        expected = ("saved-model", "r1")
+    catalog_state.write_state(
+        catalog_state.state_path(tmp_path),
+        catalog_state.CatalogState(1, 1, "a" * 64, (expected,)),
+    )
+    revoked = Mock(side_effect=error)
+    unknown = Mock()
+
+    with pytest.raises(model_source.ModelRevoked):
+        resolve_model_request(
+            settings,
+            store,
+            store_dir=tmp_path,
+            revoked=revoked,
+            on_revocation_unknown=unknown,
+        )
+
+    revoked.assert_called_once_with(*expected)
+    unknown.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("unavailable"),
+        StoreError("catalog-unavailable", "unavailable"),
+        model_source.RevocationUnknown(),
+    ],
+    ids=["io-error", "catalog-unavailable", "revocation-unknown"],
+)
+def test_unknown_callback_keeps_other_revision_available(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, tmp_path: Path, error: Exception
+) -> None:
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    catalog_state.write_state(
+        catalog_state.state_path(tmp_path),
+        catalog_state.CatalogState(1, 1, "a" * 64, (("saved-model", "other-revision"),)),
+    )
+    unknown = Mock()
+
+    request = resolve_model_request(
+        settings,
+        store_dir=tmp_path,
+        revoked=Mock(side_effect=error),
+        on_revocation_unknown=unknown,
+    )
+
+    assert request is not None
+    assert (request["id"], request["revision"]) == ("saved-model", "r1")
+    ipc.encode(request)
+    unknown.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [StoreError("revoked", "revoked"), model_source.ModelRevoked("revoked")],
+    ids=["store-error", "model-revoked"],
+)
+def test_explicit_revocation_error_is_never_treated_as_unknown(
+    monkeypatch: pytest.MonkeyPatch, settings: Settings, tmp_path: Path, error: Exception
+) -> None:
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    # Даже пустая исправная отметка не отменяет положительный ответ callback.
+    catalog_state.write_state(
+        catalog_state.state_path(tmp_path),
+        catalog_state.CatalogState(1, 1, "a" * 64, ()),
+    )
+    unknown = Mock()
+
+    with pytest.raises(model_source.ModelRevoked):
+        resolve_model_request(
+            settings,
+            store_dir=tmp_path,
+            revoked=Mock(side_effect=error),
+            on_revocation_unknown=unknown,
+        )
+
+    unknown.assert_not_called()

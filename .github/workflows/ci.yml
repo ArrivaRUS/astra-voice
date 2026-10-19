@@ -390,6 +390,8 @@ jobs:
       # Без секрета (T3 P2-2): latest.json, SHA256SUMS, dist/assets.txt.
       - name: Ассеты выпуска
         run: scripts/release_assets.sh dist
+      - name: Гейт каталога
+        run: python3 scripts/catalog_publish_check.py --dist dist
       - name: Отсоединённая подпись SHA256SUMS
         shell: bash
         env:
@@ -412,4 +414,4 @@ jobs:
         run: |
           # Список ассетов пишет scripts/release_assets.sh (в т. ч. AppImage при ENABLED).
           # shellcheck disable=SC2046
-          gh release create "${GITHUB_REF_NAME}" --generate-notes $(cat dist/assets.txt)
+          gh release create "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" --generate-notes $(cat dist/assets.txt)
