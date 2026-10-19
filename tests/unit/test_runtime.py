@@ -6196,6 +6196,7 @@ def test_t282_revoked_switch_stop_failure_kills_candidate_and_closes_ipc(
 ) -> None:
     """Ошибка stop до закрытия IPC не оставляет кандидата и его захват живыми."""
     bench = SwitchRig(monkeypatch, pause=pause)
+    bench.old._retired = []
     runtime = bench.rig.runtime
     revoked: set[tuple[str, str]] = set()
     runtime.set_revoked_check(lambda model_id, revision: (model_id, revision) in revoked)
@@ -6263,8 +6264,7 @@ def test_t282_revoked_switch_stop_failure_kills_candidate_and_closes_ipc(
         else:
             candidate._emit({"type": "result", "utterance_id": "file", "text": "проверка связи"})
 
-        assert stop.called
-        assert all(entry == call() for entry in stop.call_args_list)
+        stop.assert_called_once_with()
         kill.assert_called_once_with()
         connection.close.assert_called_once_with()
         assert candidate._socket is None
@@ -6280,6 +6280,143 @@ def test_t282_revoked_switch_stop_failure_kills_candidate_and_closes_ipc(
         with pytest.raises(RuntimeError, match="Воркер не запущен"):
             candidate.send({"type": "record.start", "utterance_id": "after-revocation"})
         connection.close.assert_called_once_with()
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_promoted_switch_stop_failure_still_restores_previous_model(
+    monkeypatch: pytest.MonkeyPatch, pause: bool
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=pause)
+    runtime = bench.rig.runtime
+    try:
+        bench.switch()
+        candidate = bench.load_new_model()
+        candidate.stop.side_effect = RuntimeError("Объект Qt удалён")
+        candidate._retired = [Mock(spec=subprocess.Popen)]
+
+        assert runtime._fail_switch() is True
+
+        candidate.stop.assert_called_once_with()
+        candidate.kill.assert_called_once_with()
+        restored = bench.assert_rolled_back(candidate)
+        restored.adopt_retired.assert_called_once_with(candidate._retired)
+        assert (
+            call(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+            not in bench.rig.pill.show_state.call_args_list
+        )
+        bench.finish_restore(restored)
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("stop_flag", ["_closed", "_appimage_removal_reserved"])
+def test_promoted_switch_restore_does_not_restart_after_stop_closes_runtime(
+    monkeypatch: pytest.MonkeyPatch, stop_flag: str
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    candidate: Mock | None = None
+    try:
+        bench.switch()
+        candidate = bench.load_new_model()
+        factory = Mock(wraps=bench.factory)
+        runtime._supervisor_factory = factory
+
+        def close_during_stop() -> None:
+            assert candidate is not None
+            candidate.state = "stopped"
+            setattr(runtime, stop_flag, True)
+
+        candidate.stop.side_effect = close_during_stop
+
+        runtime._fail_switch()
+
+        candidate.stop.assert_called_once_with()
+        candidate.kill.assert_not_called()
+        assert getattr(runtime, stop_flag) is True
+        assert runtime.supervisor is candidate
+        assert not runtime._switch_active()
+        factory.assert_not_called()
+    finally:
+        runtime._closed = False
+        runtime._appimage_removal_reserved = False
+        if candidate is not None:
+            candidate.stop.side_effect = None
+        runtime.shutdown()
+
+
+def test_promoting_candidate_kills_previous_worker_after_stop_failure_with_level_meter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Продвижение при измерении уровня не оставляет прежний процесс захватывать звук."""
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    old = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    old.state = "running"
+    old.generation = bench.old.generation
+    child = {"alive": True, "capturing": False}
+    connection = Mock(spec=socket.socket)
+    frames: list[bytes] = []
+
+    def send_frame(payload: bytes) -> int:
+        frame = bytes(payload)
+        frames.append(frame)
+        if ipc.decode(frame[4:])["type"] == "record.start":
+            child["capturing"] = True
+        return len(payload)
+
+    connection.send.side_effect = send_frame
+    old._socket = connection
+    process = Mock(spec=subprocess.Popen)
+    process.poll.side_effect = lambda: None if child["alive"] else -9
+    process.wait.return_value = -9
+    old.process = process
+
+    def kill_process() -> None:
+        child.update(alive=False, capturing=False)
+
+    process.kill.side_effect = kill_process
+    old._notifier = Mock()
+    old._notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+    real_stop = old.stop
+    capture_at_stop: list[tuple[bool, bool]] = []
+
+    def stop_with_level_meter() -> None:
+        capture_at_stop.append((runtime.orchestrator.level_active, child["capturing"]))
+        real_stop()
+
+    stop = Mock(side_effect=stop_with_level_meter)
+    kill = Mock(wraps=old.kill)
+    monkeypatch.setattr(old, "stop", stop)
+    monkeypatch.setattr(old, "kill", kill)
+    runtime.supervisor = old
+
+    def start_meter_during_revocation_check(_model_id: str, _revision: str) -> bool:
+        # Повторный вход после idle guard: прежний процесс ещё обслуживает команды.
+        if runtime.supervisor is old and not runtime.orchestrator.level_active:
+            assert runtime.start_level_monitor("default", Mock()) is True
+            assert runtime.orchestrator.level_active
+            assert ipc.decode(frames[-1][4:])["type"] == "record.start"
+        return False
+
+    try:
+        bench.switch()
+        runtime.set_revoked_check(start_meter_during_revocation_check)
+        candidate = bench.load_new_model()
+
+        assert runtime.supervisor is candidate
+        stop.assert_called_once_with()
+        assert capture_at_stop == [(True, True)]
+        kill.assert_called_once_with()
+        connection.close.assert_called_once_with()
+        assert old._socket is None
+        process.kill.assert_called_once_with()
+        process.terminate.assert_not_called()
+        process.wait.assert_called_once_with(timeout=0.2)
+        assert not child["alive"] and not child["capturing"]
+        assert old.state == "stopped"
     finally:
         runtime.shutdown()
 

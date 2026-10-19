@@ -2053,11 +2053,59 @@ def test_t281_schema_key_failure_precedes_all_publication_writes(
     monkeypatch.setattr(catalog_effective, "read_private", fail_key_read)
     monkeypatch.setattr(update_cache, "write_private", write_snapshot)
     monkeypatch.setattr(catalog_state, "write_state", write_marker)
-    with pytest.raises(CatalogError):
+    with pytest.raises(CatalogError) as refused:
         source.refresh(threading.Event())
     assert verified and key_reads == 1
+    assert refused.value.code == ("state-write" if error_type is OSError else "bad-schema")
     write_snapshot.assert_not_called()
     write_marker.assert_not_called()
     assert snapshot_path.read_bytes() == snapshot_before
     assert scenario.state.read_bytes() == marker_before
     assert source._blocked is False
+
+
+@pytest.mark.parametrize("known_revocation", [False, True])
+@pytest.mark.parametrize("checker_kind", ["app-no-catalog", "app-with-catalog", "effective"])
+def test_incomplete_revocation_marker_preserves_known_revocation_or_refuses(
+    scenario: Scenario,
+    revocation_service: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    known_revocation: bool,
+    checker_kind: str,
+) -> None:
+    """Неполная отметка из reader не означает разрешение и не скрывает старый отзыв."""
+    from astra_voice import app
+    from astra_voice.core.model_source import RevocationUnknown
+
+    entry = revocation_service.catalog.entries[0]
+    if known_revocation:
+        remote = scenario.remote(serial=5)
+        remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+        scenario.snapshot(remote)
+        with pytest.raises(StoreError) as cached:
+            catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+        assert cached.value.code == "revoked"
+        assert catalog_effective.cached_pending_snapshot(None) is not None
+    else:
+        assert catalog_effective.cached_pending_snapshot(None) is None
+
+    # Даже более новая отметка без revoked не доказывает отмену известного отзыва.
+    marker = catalog_state.CatalogState(trust_epoch=1, serial=6, sha256="a" * 64, revoked=None)
+    reader = Mock(return_value=(marker, False))
+    if checker_kind == "effective":
+        monkeypatch.setattr(catalog_effective, "read_revocation_marker", reader)
+        with pytest.raises(StoreError) as refused:
+            catalog_effective.check_revoked(entry.id, entry.revision, None)
+        assert refused.value.code == ("revoked" if known_revocation else "catalog-unavailable")
+    else:
+        monkeypatch.setattr(app, "read_revocation_marker", reader)
+        model = Mock() if checker_kind == "app-with-catalog" else None
+        if model is not None:
+            model.revoked_revision.return_value = False
+        checker = app._revoked_check(model)
+        if known_revocation:
+            assert checker(entry.id, entry.revision) is True
+        else:
+            with pytest.raises(RevocationUnknown):
+                checker(entry.id, entry.revision)
+    reader.assert_called_once_with()

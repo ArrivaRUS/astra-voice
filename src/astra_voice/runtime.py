@@ -1945,7 +1945,7 @@ class DictationRuntime(QObject):
         if not allowed:
             self._reject_switch_revision()
             return
-        self._cleanup("прежний воркер", old.stop)
+        self._stop_or_kill("прежний воркер", old)
         # Продвижение могла отложить диктовка: полный срок на обе самопроверки
         # отсчитывается заново, чтобы сторож не сработал между ними.
         timer, self._switch_timer = self._switch_timer, None
@@ -2018,8 +2018,12 @@ class DictationRuntime(QObject):
         self._loading_model = wait_for_model or retry_selfcheck or self._selfcheck == "failed"
         self._reset_selfcheck(retry=retry_selfcheck)
         generation = self.supervisor.generation + 1
-        self.supervisor.stop()
+        old = self.supervisor
+        self._stop_or_kill("перезапуск воркера", old)
+        if self._closed or self._appimage_removal_reserved:
+            return
         self.supervisor = self._supervisor_factory(on_event=self._on_worker_event, use_qt=True)
+        self.supervisor.adopt_retired(old._retired)
         self.supervisor.generation = generation
         self._model_load_generation = None
         if not retry_selfcheck:

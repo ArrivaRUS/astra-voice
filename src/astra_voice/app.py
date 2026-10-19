@@ -245,14 +245,18 @@ def _revoked_check(model: Any | None) -> Callable[[str, str], bool]:
             if catalog_revoked:
                 return True
             state, marker_error = read_revocation_marker()
-            cached = cached_pending_snapshot(state)
+            cached = cached_pending_snapshot(
+                state if state is not None and state.revoked is not None else None
+            )
             if cached is not None and cached.is_revoked(model_id, revision):
                 return True
             if marker_error:
                 raise RevocationUnknown
             if state is not None:
-                assert state.revoked is not None  # Гарантия read_revocation_marker.
-                if (model_id, revision) in state.revoked:
+                revoked = state.revoked
+                if revoked is None:
+                    raise RevocationUnknown
+                if (model_id, revision) in revoked:
                     return True
                 if not catalog_unknown:
                     return False

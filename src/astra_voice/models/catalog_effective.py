@@ -226,8 +226,9 @@ def check_revoked(
         if catalog is not None and catalog.is_revoked(model_id, revision):
             raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
         marker, marker_error = read_revocation_marker()
-        if marker is not None:
-            assert marker.revoked is not None  # Гарантия read_revocation_marker.
+        if marker is not None and marker.revoked is None:
+            marker, marker_error = None, True
+        if marker is not None and marker.revoked is not None:
             if (model_id, revision) in marker.revoked:
                 raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
         cached = cached_pending_snapshot(marker)

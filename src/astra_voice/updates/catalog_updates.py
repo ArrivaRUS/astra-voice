@@ -405,7 +405,10 @@ class CatalogUpdateSource:
                         previous_snapshot = None
                     # Ключ читает схему: готовим его до любых записей, чтобы
                     # аварийное сохранение проверенных отзывов не зависело от I/O.
-                    snapshot_key = _snapshot_key(raw, signature)
+                    try:
+                        snapshot_key = _snapshot_key(raw, signature)
+                    except ValueError:
+                        raise CatalogError("bad-schema", "Схема каталога недоступна.") from None
                     self._blocked = True
                     try:
                         try:
