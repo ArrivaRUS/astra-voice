@@ -242,6 +242,15 @@ def icon_theme_dir() -> Path:
     return resource_root().parent / "icons" / "hicolor"
 
 
+def icon_theme_roots() -> tuple[Path, Path]:
+    """Где искать поставляемые значки: установленная тема, затем данные дерева разработки.
+
+    В ``.deb`` тема — ``/usr/share/icons/hicolor``, в AppImage —
+    ``$APPDIR/usr/share/icons/hicolor``; в дереве исходников — ``data/icons/hicolor``.
+    """
+    return icon_theme_dir(), data_dir_static() / "icons" / "hicolor"
+
+
 def _is_bundle_root(candidate: Path, here: Path) -> bool:
     return here.is_relative_to(candidate) and (candidate / BUILD_MARKER).is_file()
 

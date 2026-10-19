@@ -181,6 +181,21 @@ def test_main_passes_debug_flag_to_app_info(rig: Rig, debug: bool) -> None:
     assert info.debug is debug
 
 
+def test_main_sets_window_icon_before_qml(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fly не сопоставляет WM_CLASS с записью меню: значок окон задаём явно и до QML."""
+    order = Mock()
+    order.attach_mock(rig.load_qml, "load_qml")
+    install = Mock(return_value=True)
+    order.attach_mock(install, "install_app_icon")
+    monkeypatch.setattr(app_mod, "install_app_icon", install)
+
+    assert app_mod.main([]) == 7
+
+    install.assert_called_once_with(rig.app)
+    names = [entry[0] for entry in order.mock_calls]
+    assert names.index("install_app_icon") < names.index("load_qml")
+
+
 def test_shutdown_once_before_other_cleanup(rig: Rig) -> None:
     assert app_mod.main([]) == 7
 

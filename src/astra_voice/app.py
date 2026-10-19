@@ -42,6 +42,7 @@ from astra_voice.models import catalog_state
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.sound import MicrophoneState
+from astra_voice.ui.app_icon import install_app_icon
 from astra_voice.ui.hotkey_capture import HotkeyCapture
 from astra_voice.ui.icons import install_icon_provider
 from astra_voice.ui.notify import install_dispatcher as install_notify_dispatcher
@@ -1654,6 +1655,8 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationVersion(__version__)
     app.setOrganizationDomain(ORGANIZATION_DOMAIN)
     app.setDesktopFileName(DESKTOP_FILE_NAME)
+    # Значок окон — явно, до QML: Fly не берёт его из записи меню по WM_CLASS.
+    install_app_icon(app)
     app.setQuitOnLastWindowClosed(not CLOSE_TO_TRAY)
     # XSMP оставляем ради штатного выхода по Die при завершении сеанса, но KDE не должен
     # восстанавливать копию: фоновый старт даёт только автозапуск с --hidden.

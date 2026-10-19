@@ -139,10 +139,7 @@ def find_tray_icon_path(name: str, size: int) -> Path:
     Если файла нет, ошибка перечисляет оба проверенных пути.
     """
     relative = Path(f"{size}x{size}") / "status" / f"{name}.svg"
-    candidates = (
-        paths.icon_theme_dir() / relative,
-        paths.data_dir_static() / "icons" / "hicolor" / relative,
-    )
+    candidates = tuple(root / relative for root in paths.icon_theme_roots())
     for path in candidates:
         if path.is_file():
             return path
