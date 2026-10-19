@@ -6678,6 +6678,71 @@ def test_rejected_loaded_revision_keeps_generation_until_killed_processes_exit(
         runtime.shutdown()
 
 
+@pytest.mark.parametrize("entry", ["start_test", "reload_model"])
+def test_ib63_restart_after_surviving_kill_shows_failure_and_recheck_recovers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entry: str
+) -> None:
+    """ИБ-63 (NM-3): restart_worker без подтверждённого выхода не оставляет «загрузку».
+
+    Отзыв, процесс пережил SIGKILL, пользователь выбрал другую модель и открыл
+    проверку микрофона (или «Применить»). Замена бросает RuntimeError: показан
+    провал, «Проверить модель ещё раз» включён. После выхода процесса этот пункт
+    поднимает ровно один чистый воркер.
+    """
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
+    runtime = rig.runtime
+    old = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    old.state = "running"
+    old._notifier = Mock()
+    old._notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+    process = Mock(spec=subprocess.Popen)
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    old.process = process
+    runtime.supervisor = old
+    clean = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    clean_start = Mock(side_effect=lambda: setattr(clean, "state", "running"))
+    monkeypatch.setattr(clean, "start", clean_start)
+    rig.supervisor_factory.return_value = clean
+    factory_calls = rig.supervisor_factory.call_count
+    try:
+        publish_runtime_revocation(tmp_path)
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        assert runtime.supervisor is old
+        # Переключение не удалось, но текущей осталась новая модель.
+        runtime.settings = from_dict({"model_dir": "/tmp/other-model"})
+        rig.tray.reset_mock()
+        if entry == "start_test":
+            updates: list[MicrophoneTestUpdate] = []
+            assert runtime.start_test("default", updates.append) is True
+            assert updates[-1].state == "error"
+            assert runtime._pending_test is None
+        else:
+            with pytest.raises(RuntimeError):
+                runtime.reload_model()
+
+        assert runtime.supervisor is old
+        assert old.generation == 1
+        assert rig.supervisor_factory.call_count == factory_calls
+        assert runtime._selfcheck == "failed"
+        assert not runtime._loading_model
+        rig.tray.set_state.assert_called_with(TrayState.ERROR)
+        rig.tray.set_model_recheck_enabled.assert_called_with(True)
+
+        process.poll.return_value = -9
+        process.wait.side_effect = None
+        process.wait.return_value = -9
+        runtime._recheck_model()
+        assert runtime.supervisor is clean
+        assert clean.generation == 2
+        assert rig.supervisor_factory.call_count == factory_calls + 1
+        clean_start.assert_called_once_with()
+    finally:
+        process.poll.return_value = -9
+        process.wait.side_effect = None
+        runtime.shutdown()
+
+
 def test_revocation_while_previous_worker_stops_restores_previous_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

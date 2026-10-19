@@ -2200,7 +2200,17 @@ class DictationRuntime(QObject):
         # После пользовательского сброса хоткей закрыт уже до первого hello.
         self._loading_model = wait_for_model or retry_selfcheck or self._selfcheck == "failed"
         self._reset_selfcheck(retry=retry_selfcheck)
-        if not self._replace_worker("перезапуск воркера"):
+        try:
+            replaced = self._replace_worker("перезапуск воркера")
+        except RuntimeError:
+            # NM-3: выход прежнего процесса не подтверждён, а сбросы выше уже скрыли
+            # «Проверить модель ещё раз». Показываем провал, иначе после выхода
+            # процесса воркер никто не поднимет. Повтор самопроверки завершает
+            # вызывающий через _finish_selfcheck.
+            if not (retry_selfcheck or self._closed or self._appimage_removal_reserved):
+                self._show_load_failed()
+            raise
+        if not replaced:
             return
         if not retry_selfcheck:
             self._model_load_failures = 0
