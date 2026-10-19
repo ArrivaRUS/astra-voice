@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from collections.abc import Callable, Iterator
@@ -17,14 +18,24 @@ import pytest
 from PyQt5.QtCore import QCoreApplication
 from PyQt5.QtTest import QSignalSpy
 
+from astra_voice.core import paths
 from astra_voice.core import settings as settings_mod
 from astra_voice.core.model_source import RevocationUnknown
-from astra_voice.models.catalog import CatalogEntry, FileSpec, Metric, Metrics
+from astra_voice.models import catalog_state
+from astra_voice.models.catalog import (
+    Catalog,
+    CatalogEntry,
+    CatalogError,
+    FileSpec,
+    Metric,
+    Metrics,
+)
 from astra_voice.models.downloader import Progress, remaining_bytes
 from astra_voice.models.store import ModelRecord, ModelState, ModelStore, StoreError
 from astra_voice.ui import model_downloads
 from astra_voice.ui.bridges import SettingsBridge
 from astra_voice.ui.model_downloads import ModelDownloads, ModelService
+from astra_voice.updates.model_updates import RevisionUpdateResult
 
 pytestmark = pytest.mark.unit
 
@@ -77,6 +88,13 @@ class FakeManagedPort:
         self.space = True
         self.missing_bytes = 0
         self.staged_store: ModelStore | None = None
+        self.fake_revision_updater = Mock()
+        self.fake_revision_updater.apply.return_value = RevisionUpdateResult(
+            "refused", GIGAAM.id, "r1", reason_code="no-update"
+        )
+
+    def revision_updater(self, *, on_state: Callable[[str, str], None]) -> Any:
+        return self.fake_revision_updater
 
     # ── то, что спрашивает ModelDownloads ────────────────────────────────
     def recommended(self) -> CatalogEntry:
@@ -970,12 +988,20 @@ def test_old_revision_stays_installed_and_offers_update(rig: Rig) -> None:
 
     item = card(downloads, GIGAAM.id)
     assert item["badge"] == "active"
-    assert item["state"] == "installed"
+    assert item["state"] == "update-available"
     assert item["updateAvailable"] is True
     assert downloads.installedSummary == "Установлено 1 из 2 · 226 МБ на диске"
 
     downloads.updateModel(GIGAAM.id)
-    assert queued == [(GIGAAM,)]
+    # Обновление ревизии идёт через updater; обычная очередь установки не используется.
+    from helpers.scripted_model_port import pump_until
+
+    pump_until(lambda: downloads._model_thread is None, "вызов updater активной модели")
+    port.fake_revision_updater.apply.assert_called_once_with(
+        GIGAAM.id, cancel=downloads._model_cancel
+    )
+    assert queued == []
+    assert port.current == (GIGAAM.id, "r1")
 
 
 def test_update_is_not_offered_for_the_catalog_revision(rig: Rig) -> None:
@@ -2052,3 +2078,141 @@ def test_admin_refusal_does_not_mark_cards_proactively() -> None:
         assert card(downloads, GIGAAM.id)["state"] == "available"
     finally:
         downloads.shutdown()
+
+
+def activation_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ModelService:
+    """Реальный store с двумя исправными ревизиями и отдельным state_dir."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(paths, "state_dir", lambda: state_dir)
+    store = ModelStore(tmp_path / "models")
+    for revision in ("safe", "target"):
+        staging = store.staging_dir(GIGAAM.id, revision)
+        (staging / "state.json").write_text(
+            json.dumps({"layout": GIGAAM.layout, "variant": GIGAAM.variant, "size_bytes": 0})
+        )
+        store.commit(GIGAAM.id, revision)
+        store.mark_ok(GIGAAM.id, revision)
+    store.set_current(GIGAAM.id, "safe")
+    service = ModelService.__new__(ModelService)
+    service._catalog = Catalog(1, 1, (), (replace(GIGAAM, revision="target"),))
+    service._catalog_error = None
+    service._store = store
+    return service
+
+
+@pytest.mark.parametrize("operation", ["set", "restore"])
+@pytest.mark.parametrize("catalog_unavailable", [False, True])
+def test_global_revocation_blocks_service_activation_without_gui_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    catalog_unavailable: bool,
+) -> None:
+    """T-227: даже пустая GUI-заглушка не снимает сохранённый отзыв."""
+    service = activation_service(tmp_path, monkeypatch)
+    catalog_state.write_state(
+        catalog_state.state_path(paths.state_dir()),
+        catalog_state.CatalogState(1, 2, "a" * 64, ((GIGAAM.id, "target"),)),
+    )
+    if catalog_unavailable:
+        service._catalog = Catalog(0, 0, (), ())
+        service._catalog_error = CatalogError("state-invalid", "Каталог недоступен")
+    before = (service._store.root / "current.json").read_bytes()
+
+    with pytest.raises(StoreError):
+        if operation == "set":
+            service.set_current(GIGAAM.id, "target")
+        else:
+            service.restore_current(GIGAAM.id, "target", previous_revision="safe")
+
+    assert (service._store.root / "current.json").read_bytes() == before
+    if catalog_unavailable:
+        assert service.installed_ok() is False
+        assert service.entries() == ()
+        assert service.recommended() is None
+        assert service.recheck_entries() == ()
+
+
+@pytest.mark.parametrize("operation", ["set", "restore"])
+@pytest.mark.parametrize("damage", ["json", "directory", "symlink"])
+def test_existing_unreadable_catalog_marker_blocks_service_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, damage: str
+) -> None:
+    service = activation_service(tmp_path, monkeypatch)
+    marker = catalog_state.state_path(paths.state_dir())
+    if damage == "json":
+        marker.write_bytes(b"{")
+    elif damage == "directory":
+        marker.mkdir()
+    else:
+        marker.symlink_to(tmp_path / "missing-marker")
+    before = (service._store.root / "current.json").read_bytes()
+
+    with pytest.raises(StoreError):
+        if operation == "set":
+            service.set_current(GIGAAM.id, "target")
+        else:
+            service.restore_current(GIGAAM.id, "target", previous_revision="safe")
+
+    assert (service._store.root / "current.json").read_bytes() == before
+
+
+def test_accept_catalog_waits_for_activation_pointer_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Проверка отзыва и запись current сериализованы с принятием GUI-каталога."""
+    from astra_voice.models.catalog import RevokedEntry
+
+    service = activation_service(tmp_path, monkeypatch)
+    entered = threading.Event()
+    resume = threading.Event()
+    accepting = threading.Event()
+    accepted = threading.Event()
+    errors: list[Exception] = []
+    original = service._store.set_current
+    catalog = Catalog(2, 1, (RevokedEntry(GIGAAM.id, "target", "отзыв"),), ())
+
+    def write(model_id: str, revision: str, *, previous_revision: str | None = None) -> None:
+        entered.set()
+        assert resume.wait(5), "Тест не освободил запись current"
+        original(model_id, revision, previous_revision=previous_revision)
+
+    def activate() -> None:
+        try:
+            service.set_current(GIGAAM.id, "target")
+        except Exception as error:
+            errors.append(error)
+
+    def accept() -> None:
+        accepting.set()
+        try:
+            service.accept_catalog(catalog)
+            accepted.set()
+        except Exception as error:
+            errors.append(error)
+
+    monkeypatch.setattr(service._store, "set_current", write)
+    activation = threading.Thread(target=activate)
+    publication = threading.Thread(target=accept)
+    activation.start()
+    try:
+        assert entered.wait(5), "Активация не дошла до записи current"
+        publication.start()
+        assert accepting.wait(5), "Поток принятия каталога не стартовал"
+        assert not accepted.wait(0.2), "Отзыв принят посреди активации"
+        assert service.catalog is not catalog
+    finally:
+        resume.set()
+        activation.join(5)
+        if publication.ident is not None:
+            publication.join(5)
+    assert not activation.is_alive() and not publication.is_alive()
+    assert errors == []
+    assert accepted.is_set()
+    assert service.current_ids() == (GIGAAM.id, "target")
+    before = (service._store.root / "current.json").read_bytes()
+    with pytest.raises(StoreError) as refused:
+        service.set_current(GIGAAM.id, "target")
+    assert refused.value.code == "revoked"
+    assert (service._store.root / "current.json").read_bytes() == before

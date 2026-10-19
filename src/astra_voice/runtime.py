@@ -37,6 +37,7 @@ from astra_voice.core.model_source import (
     ModelRevoked,
     ModelStore,
     RevokedCheck,
+    _not_revoked,
     resolve_model_request,
     smoke_matches,
     smoke_wav_path,
@@ -49,6 +50,7 @@ from astra_voice.core.settings import (
     is_valid_command_mouse_button,
 )
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
+from astra_voice.models.catalog_effective import CATALOG_LOCK
 from astra_voice.platform.cowork import (
     CoworkClient,
     is_installed,
@@ -1634,6 +1636,13 @@ class DictationRuntime(QObject):
             if self.on_revocation_unknown is not None:
                 self.on_revocation_unknown()
 
+    def catalog_restored(self) -> None:
+        """Снимает предупреждение после принятия проверенного каталога в GUI."""
+        if self.revocation_unknown:
+            self.revocation_unknown = False
+            if self.on_revocation_unknown is not None:
+                self.on_revocation_unknown()
+
     def _resolve_model_request(self) -> dict[str, Any] | None:
         """Запрос загрузки с учётом отзыва; ModelRevoked пробрасывается выше."""
         return resolve_model_request(
@@ -1848,7 +1857,8 @@ class DictationRuntime(QObject):
         self._switch_target = None
         self._switch_loaded_event = None
         if candidate is not None:
-            self._cleanup("временный воркер", candidate.stop)
+            # Кандидат не текущий: его поколение не владеет захватом, замена не нужна.
+            self._stop_or_kill("временный воркер", candidate)
         if result != "ok" and self._wake_dictation:
             # Нажатие ждало новую модель: она не пришла, клавиша не залипает.
             self._drop_wake()
@@ -1997,42 +2007,121 @@ class DictationRuntime(QObject):
             # Ошибка загрузки может относиться к поколению до автоматического рестарта.
             self._fail_candidate()
 
+    def _switch_revision_allowed(self, request: dict[str, Any]) -> bool:
+        """Повторная проверка после загрузки: отзыв мог прийти во время ожидания."""
+        if self._revoked_check is None:
+            return True
+        try:
+            revoked = self._revoked_check(str(request["id"]), str(request["revision"]))
+        except Exception:
+            self._mark_revocation_unknown()
+            log.warning("Переключение модели отменено: список отзывов недоступен")
+            return False
+        if revoked:
+            log.warning("Переключение модели отменено: версия отозвана издателем")
+        return not revoked
+
+    def _reject_switch_revision(self) -> None:
+        previous_stopped = self._switch_promoted or self._switch_paused
+        if not self._fail_switch() and previous_stopped:
+            self._stop_or_kill("отозванный воркер", self.supervisor)
+            self._show_load_failed()
+
+    def _loaded_revision_allowed(self) -> bool:
+        """Быстро проверяет именно загруженный запрос, без gpgv.
+
+        Обычная загрузка сохраняет политику предзагрузки для RevocationUnknown;
+        переключение сохраняет свой строгий отказ. Проверка и ready выполняются
+        под CATALOG_LOCK. Отзыв после ready действует со следующей загрузки:
+        уже работающую модель при поступлении отзыва не выгружаем.
+        """
+        request = self._model_load_request or {}
+        if self._switch_active():
+            return self._switch_revision_allowed(request)
+        try:
+            _not_revoked(request, self._revoked_check, self._mark_revocation_unknown)
+        except ModelRevoked:
+            return False
+        return True
+
+    def _reject_loaded_revision(self) -> None:
+        if self._switch_active():
+            self._reject_switch_revision()
+            return
+        self._cancel_selfcheck_timer()
+        self._selfcheck = "failed"
+        # N-4: пробуждение по хоткею не продолжается (_fail_pending_test снимает
+        # ожидающую запись), а чистый воркер с failed — не «выгруженная модель».
+        self._fail_pending_test()
+        self._wake_generation = None
+        self._model_parked = False
+        self._cancel_idle_unload()
+        self._model_revoked()
+        # Барьер ready уже отпустил CATALOG_LOCK. Новый процесс обслуживает
+        # измеритель уровня, но failed запрещает ему загружать модель на hello.
+        try:
+            replaced = self._replace_worker("отозванный воркер")
+        except RuntimeError:
+            # Выход не подтверждён: поколение и страж захвата сохраняются, ошибка
+            # показана; «Проверить модель ещё раз» повторит остановку.
+            log.warning("Отозванный воркер не завершился; замена отложена до проверки")
+            return
+        if replaced:
+            self.supervisor.start()
+
     def _promote_candidate(self) -> None:
         if self.orchestrator.cleanup_pending or self.supervisor.restarting:
             return
-        candidate = self._switch_candidate
-        event = self._switch_loaded_event
-        if candidate is not None and event is not None and self.phase == DictationPhase.IDLE:
+        # Источник не публикует отзыв между проверкой и сменой рабочего воркера.
+        with CATALOG_LOCK:
+            candidate = self._switch_candidate
+            event = self._switch_loaded_event
+            if candidate is None or event is None or self.phase != DictationPhase.IDLE:
+                return
             request = self._switch_request
             assert request is not None
-            old = self.supervisor
-            try:
-                old.stop()
-            except Exception:
-                # Не меняем поколение, пока завершение прежнего процесса не доказано.
+            allowed = self._switch_revision_allowed(request)
+        if not allowed:
+            self._reject_switch_revision()
+            return
+        # Прежний воркер останавливается до замены и вне CATALOG_LOCK (N-4в): stop()
+        # может ждать выхода. Отказ stop() — аварийный kill (N-13); без подтверждённого
+        # выхода поколение не меняется, страж захвата прежнего процесса сохраняется.
+        exited = self._stop_or_kill("прежний воркер", self.supervisor)
+        if not exited or self._closed or self._appimage_removal_reserved:
+            if not exited:
                 log.warning("Не удалось остановить прежний воркер для смены модели")
-                self._finish_switch("failed")
-                if not self._closed:
-                    self._show_load_failed()
-                return
-            self._switch_candidate = None
-            self._switch_request = None
-            self._switch_loaded_event = None
-            self.supervisor = candidate
-            self._switch_promoted = True
-            # Продвижение могла отложить диктовка: полный срок на обе самопроверки
-            # отсчитывается заново, чтобы сторож не сработал между ними.
-            timer, self._switch_timer = self._switch_timer, None
-            if timer is not None:
-                self.cancel_timer(timer)
-            self._switch_timer = self.schedule(int(SWITCH_TIMEOUT_S * 1000), self._switch_watchdog)
-            self._reset_selfcheck()
-            self._model_parked = False
-            self._loading_model = True
-            self._model_load_generation = candidate.generation
-            self._model_load_request = request
-            self._model_load_failures = 0
-            self._on_worker_event(event)
+            self._finish_switch("failed")
+            if not self._closed:
+                self._show_load_failed()
+            return
+        with CATALOG_LOCK:
+            allowed = self._switch_revision_allowed(request)
+            if allowed:
+                self._switch_candidate = None
+                self._switch_request = None
+                self._switch_loaded_event = None
+                self.supervisor = candidate
+                self._switch_promoted = True
+        if not allowed:
+            # Отзыв пришёл, пока останавливался прежний воркер: он уже остановлен,
+            # поэтому возврат прежней модели идёт как у переключения с паузой.
+            self._switch_paused = True
+            self._reject_switch_revision()
+            return
+        # Продвижение могла отложить диктовка: полный срок на обе самопроверки
+        # отсчитывается заново, чтобы сторож не сработал между ними.
+        timer, self._switch_timer = self._switch_timer, None
+        if timer is not None:
+            self.cancel_timer(timer)
+        self._switch_timer = self.schedule(int(SWITCH_TIMEOUT_S * 1000), self._switch_watchdog)
+        self._reset_selfcheck()
+        self._model_parked = False
+        self._loading_model = True
+        self._model_load_generation = candidate.generation
+        self._model_load_request = request
+        self._model_load_failures = 0
+        self._on_worker_event(event)
 
     def _fail_candidate(self) -> None:
         self._finish_switch("failed")
@@ -2110,18 +2199,36 @@ class DictationRuntime(QObject):
         # После пользовательского сброса хоткей закрыт уже до первого hello.
         self._loading_model = wait_for_model or retry_selfcheck or self._selfcheck == "failed"
         self._reset_selfcheck(retry=retry_selfcheck)
-        generation = self.supervisor.generation + 1
-        self.supervisor.stop()
+        if not self._replace_worker("перезапуск воркера"):
+            return
+        if not retry_selfcheck:
+            self._model_load_failures = 0
+        self.supervisor.start()
+
+    def _replace_worker(self, step: str) -> bool:
+        """Меняет супервизор на новое поколение только после выхода прежнего процесса.
+
+        Общий путь ``restart_worker`` и ``_reject_loaded_revision`` (N-4г). Поколение
+        берётся до остановки; ``_stop_or_kill`` без подтверждённого выхода бросает
+        RuntimeError — поколение, супервизор и страж захвата сохраняются. False —
+        runtime закрыт или удаление AppImage зарезервировано во время остановки.
+        Новый воркер не запускается: ``start()`` — за вызывающим.
+        """
+        old = self.supervisor
+        generation = old.generation + 1
+        if not self._stop_or_kill(step, old):
+            raise RuntimeError("Прежний воркер не завершился.")
+        if self._closed or self._appimage_removal_reserved:
+            return False
         self.supervisor = self._supervisor_factory(
             on_event=self._on_worker_event,
             use_qt=True,
             launch_allowed=lambda: not self._closed and not self._appimage_removal_reserved,
         )
+        self.supervisor.adopt_retired(old._retired)
         self.supervisor.generation = generation
         self._model_load_generation = None
-        if not retry_selfcheck:
-            self._model_load_failures = 0
-        self.supervisor.start()
+        return True
 
     def _model_revoked(self) -> None:
         """Отозванную ревизию не грузим: показываем состояние и зовём поставить другую."""
@@ -2255,14 +2362,28 @@ class DictationRuntime(QObject):
 
     def _model_ready(self) -> None:
         """Объявляет готовность только после успешной проверки."""
+        ready = self._declare_model_ready()
+        if ready is not None:
+            self._start_after_ready(*ready)
+
+    def _declare_model_ready(self) -> tuple[bool, tuple[PasteTarget] | None] | None:
+        """Решение о готовности; только эта часть выполняется под CATALOG_LOCK (N-4б).
+
+        Возвращает ожидавшее пробуждение (жест и окно-цель) для ``_start_after_ready``
+        или None, если поколение терминально.
+        """
         if self._terminated_generation == self.supervisor.generation:
-            return
+            return None
         self.tray.set_model_recheck_enabled(False)
         self._loading_model = False
         self._model_load_failures = 0
         wake, self._wake_dictation = self._wake_dictation, False
         window, self._wake_window = self._wake_window, None
         self._wake_generation = None
+        return wake, window
+
+    def _start_after_ready(self, wake: bool, window: tuple[PasteTarget] | None) -> None:
+        """Автостарт записи и проверки микрофона — вне CATALOG_LOCK (N-4б)."""
         autostart = (
             wake
             and self.orchestrator.phase == DictationPhase.IDLE
@@ -2391,7 +2512,17 @@ class DictationRuntime(QObject):
             # При load-timeout супервизор уже заменил процесс до доставки ошибки.
             return
         if reason == "ok":
-            self._model_ready()
+            ready = None
+            with CATALOG_LOCK:
+                rejected = not self._loaded_revision_allowed()
+                if not rejected:
+                    ready = self._declare_model_ready()
+            if rejected:
+                self._reject_loaded_revision()
+                return
+            if ready is not None:
+                # Запись и проверка микрофона стартуют после выхода из замка (N-4б).
+                self._start_after_ready(*ready)
             if self._switch_active() and self._switch_candidate is None:
                 self._finish_switch("ok")
         else:
@@ -2609,7 +2740,13 @@ class DictationRuntime(QObject):
                     self._selfcheck in ("idle", "retrying")
                     and event.get("generation") == self.supervisor.generation
                 ):
-                    self._start_selfcheck(event)
+                    with CATALOG_LOCK:
+                        rejected = not self._loaded_revision_allowed()
+                        if not rejected:
+                            self._start_selfcheck(event)
+                    if rejected:
+                        self._reject_loaded_revision()
+                        return
             elif event.get("type") == "error" and (
                 event.get("request_type") == "model.load"
                 or event.get("response_type") == "model.loaded"
@@ -3501,6 +3638,26 @@ class DictationRuntime(QObject):
         """Даёт IPC до 50 мс на освобождение микрофона и обрабатывает события Qt."""
         self.supervisor.pump(timeout=0.05)
         QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents, 50)
+
+    def _stop_or_kill(self, step: str, supervisor: WorkerSupervisor) -> bool:
+        """При сбое штатной остановки аварийно закрывает IPC и завершает процессы.
+
+        True — выход процессов подтверждён: успешный ``stop()`` дожидается его сам,
+        после ``kill()`` (SIGKILL + wait 0,2 с) проверяется ``exited``. False — процесс
+        мог остаться (D-state): менять поколение и снимать страж захвата нельзя.
+        """
+        try:
+            supervisor.stop()
+        except Exception:
+            log.warning("Ошибка завершения диктовки: %s", step)
+            self._cleanup(f"аварийная остановка: {step}", supervisor.kill)
+        else:
+            return True
+        try:
+            return bool(supervisor.exited)
+        except Exception:
+            log.warning("Не удалось проверить завершение воркера: %s", step)
+            return False
 
     @staticmethod
     def _cleanup(step: str, action: Callable[[], object]) -> None:

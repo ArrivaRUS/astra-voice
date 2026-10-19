@@ -683,6 +683,11 @@ class HttpClient:
         self._user_agent = user_agent
         self._extra_hosts = extra_hosts
 
+    @property
+    def gate(self) -> NetworkGate:
+        """Текущий сетевой гейт; заменить его через публичное API нельзя."""
+        return self._gate
+
     def get_stream(
         self,
         url: str,
@@ -753,6 +758,9 @@ class HttpClient:
                 if kind == "download":
                     log.debug("Запрос к %s", host)
                 try:
+                    allowed, reason = self._gate.allowed(kind)
+                    if not allowed:
+                        raise NetworkError("no-network", reason)
                     if _on_request is not None:
                         _on_request()
                     response = session.get(

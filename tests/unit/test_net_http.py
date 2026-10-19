@@ -46,6 +46,19 @@ _BODY = b"Astra Voice " * 64
 _USER_AGENT = "Astra-Voice/1.0"
 
 
+def test_client_exposes_its_live_gate_read_only() -> None:
+    settings = Settings()
+    gate = NetworkGate(settings, Policy())
+    client = HttpClient(gate, user_agent=_USER_AGENT)
+
+    assert client.gate is gate
+    assert client.gate.refusal("download") == ""
+    settings.offline = True
+    assert client.gate.refusal("download") == "offline"
+    with pytest.raises(AttributeError):
+        client.gate = NetworkGate(Settings(), Policy())  # type: ignore[misc]
+
+
 @dataclass
 class LocalServer:
     """Адрес, журнал запросов и сигнал завершения медленных ответов."""
@@ -2029,3 +2042,44 @@ def test_request_watchdog_shuts_down_socket_connected_after_trigger(
             assert sock.recv(1) == b""
         finally:
             watchdog.close()
+
+
+@pytest.mark.parametrize("kind", ("download", "check_app", "check_app_manual", "check_models"))
+def test_t228_offline_after_first_response_stops_redirect(
+    transport: Mock, kind: NetworkKind
+) -> None:
+    settings = Settings(check_app_updates=True, check_model_updates=True)
+    client = HttpClient(NetworkGate(settings, Policy()), user_agent=_USER_AGENT)
+    redirect = _response(302, "https://release-assets.githubusercontent.com/catalog.json")
+
+    def first_response(*args: object, **kwargs: object) -> requests.Response:
+        settings.offline = True
+        return redirect
+
+    transport.side_effect = first_response
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream(
+            "https://github.com/ArrivaRUS/astra-voice/releases/latest/download/catalog.json",
+            deadline_s=2,
+            cancel=threading.Event(),
+            kind=kind,
+        )
+    assert caught.value.code == "no-network"
+    assert transport.call_count == 1
+    assert redirect.raw.closed
+
+
+@pytest.mark.parametrize("value", ["Offline", " OFFLINE "])
+def test_t225_updates_policy_blocks_model_requests(transport: Mock, value: str) -> None:
+    gate = NetworkGate(Settings(check_model_updates=True), Policy(values={"updates": value}))
+    assert gate.refusal("check_models") == "policy"
+    client = HttpClient(gate, user_agent=_USER_AGENT)
+    with pytest.raises(NetworkError) as caught:
+        client.get_stream(
+            "https://github.com/ArrivaRUS/astra-voice/releases/latest/download/catalog.json",
+            deadline_s=2,
+            cancel=threading.Event(),
+            kind="check_models",
+        )
+    assert caught.value.code == "no-network"
+    transport.assert_not_called()

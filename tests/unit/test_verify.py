@@ -575,3 +575,54 @@ def test_keyring_listing_parsing(
     fill = {"{p}": values["p"], "{s}": values["s"], "{t}": values["t"]}
     want = {fill[k]: (fill[v[0]], int(fill[v[1]])) for k, v in expected.items()}
     assert keys == want
+
+
+def test_t31a_catalog_pair_under_release_purpose_is_rejected(
+    env: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    from astra_voice.models.catalog import CatalogError, load_builtin
+
+    data_root = Path(__file__).resolve().parents[2] / "data"
+    catalog = tmp_path / "catalog.json"
+    catalog.write_bytes((data_root / "catalog.json").read_bytes())
+    (tmp_path / "catalog.schema.json").write_bytes((data_root / "catalog.schema.json").read_bytes())
+    gpg = env["gpg"]
+    assert isinstance(gpg, _Gpg)
+    sig = gpg.sign(catalog, tmp_path / "catalog.json.sig", str(env["release_fpr"]) + "!")
+    verifier = _verifier(env)
+    assert verifier.verify_detached(catalog, sig).ok
+    # T-31a: метка, не криптография. Purpose не включён в подписанные байты.
+    with pytest.raises(CatalogError) as refused:
+        load_builtin(verifier, root=tmp_path, require_schema=True)
+    assert refused.value.code == "purpose-mismatch"
+
+
+def test_t31b_release_pair_under_catalog_purpose_is_rejected(
+    env: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    payload = tmp_path / "release.deb"
+    payload.write_bytes(b"release payload")
+    sums = tmp_path / "SHA256SUMS"
+    sums.write_text(f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  {payload.name}\n")
+    gpg = env["gpg"]
+    assert isinstance(gpg, _Gpg)
+    sig = gpg.sign(sums, tmp_path / "SHA256SUMS.asc", str(env["release_fpr"]) + "!")
+    verifier = _verifier(env, purpose="catalog")
+    assert verifier.verify_detached(sums, sig).ok
+    # T-31b: метка, не криптография. При том же S1 detached-проверка проходит;
+    # назначение пары контролируется API, который принимает релизные суммы.
+    result = verifier.verify_sha256sums(sums, payload)
+    assert not result.ok
+    assert result.code == "purpose-mismatch"
+
+
+def test_release_sums_require_release_purpose_without_gpg(tmp_path: Path) -> None:
+    payload = tmp_path / "release.deb"
+    payload.write_bytes(b"payload")
+    sums = tmp_path / "SHA256SUMS"
+    sums.write_text(f"{hashlib.sha256(payload.read_bytes()).hexdigest()}  {payload.name}\n")
+    verifier = Verifier("catalog", keyring=tmp_path / "unused.gpg")
+    result = verifier.verify_sha256sums(sums, payload)
+    assert not result.ok and result.code == "purpose-mismatch"

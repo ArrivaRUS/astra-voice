@@ -13,7 +13,8 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import Mock
+from typing import Any, cast
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -416,6 +417,99 @@ def test_stop_escalates_to_sigkill() -> None:
     process.kill.assert_called_once_with()
     assert process.wait.call_count == 2
     assert process.wait.call_args_list[0].kwargs == {"timeout": 2}
+
+
+@pytest.mark.parametrize("qt_resource", ["notifier", "timer"])
+def test_kill_closes_ipc_and_all_processes_after_qt_stop_failure(qt_resource: str) -> None:
+    """T-239: удалённый объект Qt не оставляет IPC и процессы живыми."""
+    supervisor = WorkerSupervisor(lambda message: None, use_qt=False)
+    supervisor.state = "running"
+    connection = Mock(spec=socket.socket)
+    supervisor._socket = connection
+    notifier = Mock()
+    timer = Mock()
+    supervisor._notifier = notifier
+    supervisor._timer = timer
+    if qt_resource == "notifier":
+        notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+        notifier.deleteLater.side_effect = RuntimeError("Объект Qt удалён")
+    else:
+        timer.stop.side_effect = RuntimeError("Объект Qt удалён")
+        timer.deleteLater.side_effect = RuntimeError("Объект Qt удалён")
+    process = Mock(spec=subprocess.Popen)
+    retired = Mock(spec=subprocess.Popen)
+    exited = Mock(spec=subprocess.Popen)
+    process.poll.return_value = retired.poll.return_value = None
+    exited.poll.return_value = 0
+    supervisor.process = process
+    supervisor._retired = [retired, exited]
+    supervisor._pending[("utterance", "level")] = _Pending(None, 0, "record.start", None)
+    supervisor._outgoing.extend(b"pending")
+
+    with pytest.raises(RuntimeError, match="Объект Qt удалён"):
+        supervisor.stop()
+    connection.close.assert_not_called()
+
+    supervisor.kill()
+
+    # mypy сузил state до "running" присваиванием выше и не сбрасывает сужение
+    # после вызова метода; str() снимает сужение, проверка остаётся точной.
+    assert str(supervisor.state) == "stopped"
+    assert supervisor._socket is None
+    connection.close.assert_called_once_with()
+    process.kill.assert_called_once_with()
+    retired.kill.assert_called_once_with()
+    exited.kill.assert_not_called()
+    for child in (process, retired, exited):
+        child.wait.assert_called_once_with(timeout=0.2)
+    assert supervisor._notifier is None
+    assert supervisor._timer is None
+    assert not supervisor._pending
+    assert not supervisor._outgoing
+    with pytest.raises(RuntimeError, match="Воркер не запущен"):
+        supervisor.send({"type": "record.start", "utterance_id": "next"})
+
+
+def test_kill_continues_after_retired_process_signal_failure() -> None:
+    """Отказ SIGKILL одному процессу не отменяет остальные попытки."""
+    supervisor = WorkerSupervisor(lambda message: None, use_qt=False)
+    retired = Mock(spec=subprocess.Popen)
+    current = Mock(spec=subprocess.Popen)
+    retired.poll.return_value = current.poll.return_value = None
+    retired.kill.side_effect = ProcessLookupError("Процесс уже завершился")
+    supervisor._retired = [retired]
+    supervisor.process = current
+
+    supervisor.kill()
+
+    retired.kill.assert_called_once_with()
+    current.kill.assert_called_once_with()
+    retired.wait.assert_called_once_with(timeout=0.2)
+    current.wait.assert_called_once_with(timeout=0.2)
+
+
+@pytest.mark.parametrize("failed_operation", ["terminate", "wait"])
+def test_stop_failure_preserves_retired_processes_for_emergency_kill(failed_operation: str) -> None:
+    """Сбой штатной остановки не теряет ещё не обработанные процессы."""
+    supervisor = WorkerSupervisor(lambda message: None, use_qt=False)
+    processes = [Mock(spec=subprocess.Popen) for _ in range(3)]
+    for process in processes:
+        process.poll.return_value = None
+    # Mock(spec=Popen) — дублёр процесса; для mypy приводим список к типу поля.
+    supervisor._retired = cast(list[subprocess.Popen[bytes]], processes[:2])
+    supervisor.process = processes[2]
+    getattr(processes[0], failed_operation).side_effect = OSError("Ошибка остановки")
+
+    with pytest.raises(OSError, match="Ошибка остановки"):
+        supervisor.stop()
+    assert supervisor._retired == processes[:2]
+
+    supervisor.kill()
+
+    for process in processes:
+        process.kill.assert_called_once_with()
+    processes[1].wait.assert_called_once_with(timeout=0.2)
+    processes[2].wait.assert_called_once_with(timeout=0.2)
 
 
 @pytest.mark.parametrize("timeout", [None, 120.0])
@@ -1321,3 +1415,85 @@ def test_deferred_restart_does_not_launch_after_runtime_launch_is_forbidden(
     assert events and all(event["generation"] == 1 for event in events)
     assert all(event["code"] == "worker-crashed" for event in events)
     launch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "wait_error",
+    [
+        subprocess.TimeoutExpired("retired-worker", 0.2),
+        OSError("сбой wait"),
+        RuntimeError("сбой wait"),
+    ],
+)
+def test_kill_wait_failure_does_not_skip_remaining_processes(wait_error: Exception) -> None:
+    """N-12: каждый SIGKILL сопровождается wait, сбой не прерывает обработку остальных."""
+    supervisor = WorkerSupervisor(lambda message: None, use_qt=False)
+    processes = [Mock(spec=subprocess.Popen) for _ in range(3)]
+    for process in processes:
+        process.poll.return_value = None
+    processes[0].wait.side_effect = wait_error
+    # Mock(spec=Popen) — дублёр процесса; для mypy приводим список к типу поля.
+    supervisor._retired = cast(list[subprocess.Popen[bytes]], processes[:2])
+    supervisor.process = processes[2]
+
+    supervisor.kill()
+
+    assert supervisor.state == "stopped"
+    for process in processes:
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=0.2)
+        kill_index = process.mock_calls.index(call.kill())
+        wait_index = process.mock_calls.index(call.wait(timeout=0.2))
+        assert kill_index < wait_index
+    assert processes[0] in supervisor._retired
+
+
+def test_adopt_retired_keeps_unique_processes_until_pump_or_stop() -> None:
+    """Новый supervisor собирает переданные процессы, не удваивая общий Popen."""
+    supervisor = WorkerSupervisor(lambda message: None, use_qt=False)
+    running = Mock(spec=subprocess.Popen)
+    exited = Mock(spec=subprocess.Popen)
+    running.poll.return_value = None
+    exited.poll.return_value = -9
+    supervisor.adopt_retired([running, exited])
+    supervisor.adopt_retired([running])
+
+    supervisor.pump()
+
+    running.poll.assert_called_once_with()
+    exited.poll.assert_called_once_with()
+    assert supervisor._retired == [running]
+    supervisor.stop()
+    running.terminate.assert_called_once_with()
+    running.wait.assert_called_once_with(timeout=2)
+    exited.wait.assert_not_called()
+    assert supervisor._retired == []
+
+
+def test_kill_cancels_pending_restart_without_events_and_reports_exit() -> None:
+    """Слияние M7 с US-2.6: kill() терминален и для отложенного рестарта.
+
+    События завершения и смена поколения не уходят ни при kill(), ни после него;
+    ``exited`` сообщает выход только по poll(), а не по факту отправки SIGKILL.
+    """
+    events: list[dict[str, Any]] = []
+    supervisor = WorkerSupervisor(events.append, use_qt=False)
+    process = Mock(spec=subprocess.Popen)
+    alive = [True]
+    process.poll.side_effect = lambda: None if alive[0] else -9
+    supervisor.process = process
+    supervisor.state = "running"
+    supervisor._hello_accepted = True
+    supervisor._restart()
+    assert supervisor.restarting and not events and not supervisor.exited
+
+    supervisor.kill()
+
+    assert str(supervisor.state) == "stopped"
+    assert not supervisor.restarting and not supervisor.ready
+    assert supervisor.generation == 1 and not events
+    assert not supervisor.exited and supervisor._retired == [process]
+    alive[0] = False
+    assert supervisor.exited
+    supervisor.pump()
+    assert not events and supervisor._retired == []

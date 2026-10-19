@@ -845,3 +845,13 @@ def test_schema_require_available_rejects_incompatible_resolver(
 
     with pytest.raises(schema_module.SchemaUnavailable):
         schema_module.require_available()
+
+
+def test_catalog_rejects_release_purpose_before_acceptance(catalog_root: Path) -> None:
+    verifier = StubVerifier()
+    verifier.purpose = "release"
+    # T-31a: метка, не криптография — один S1 может проверить ту же подпись;
+    # ошибочную цель отвергает граница каталога, а не алгоритм подписи.
+    with pytest.raises(CatalogError) as refused:
+        load_builtin(verifier, root=catalog_root, require_schema=True)
+    assert refused.value.code == "purpose-mismatch"

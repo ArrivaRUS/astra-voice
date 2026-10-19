@@ -72,10 +72,15 @@ class CacheEntry:
     backoff_until: float | None = None
     failures: int = 0
     url: str | None = None
+    recorded_at: float | None = None
 
 
 def _entry(value: object) -> CacheEntry | None:
-    if not isinstance(value, dict) or set(value) != set(CacheEntry.__dataclass_fields__):
+    if not isinstance(value, dict):
+        return None
+    # Старые записи ещё не содержат времени записи отрицательного кэша.
+    value = {"recorded_at": None, **value}
+    if set(value) != set(CacheEntry.__dataclass_fields__):
         return None
     etag = value["etag"]
     body = value["body"]
@@ -91,7 +96,7 @@ def _entry(value: object) -> CacheEntry | None:
         return None
     if not isinstance(failures, int) or isinstance(failures, bool) or failures < 0:
         return None
-    for name in ("stored_at", "rate_limited_until", "backoff_until"):
+    for name in ("stored_at", "rate_limited_until", "backoff_until", "recorded_at"):
         number = value[name]
         if number is not None and (
             isinstance(number, bool)

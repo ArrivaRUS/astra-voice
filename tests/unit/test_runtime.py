@@ -6,11 +6,13 @@ import atexit
 import hashlib
 import json
 import logging
+import socket
+import subprocess
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, call
+from unittest.mock import ANY, Mock, call
 
 import pytest
 from PyQt5 import sip
@@ -35,10 +37,12 @@ from astra_voice.core.dictation import (
     MicrophoneLevelUpdate,
     MicrophoneTestUpdate,
 )
-from astra_voice.core.model_source import resolve_model_request
+from astra_voice.core.model_source import RevocationUnknown, resolve_model_request
 from astra_voice.core.settings import Settings, from_dict
+from astra_voice.models import catalog_state
 from astra_voice.models import store as store_module
-from astra_voice.models.catalog import CatalogEntry, FileSpec
+from astra_voice.models.catalog import Catalog, CatalogEntry, CatalogError, FileSpec, RevokedEntry
+from astra_voice.models.catalog_effective import CATALOG_LOCK
 from astra_voice.models.installer import Installer, SmokeResult
 from astra_voice.models.store import ModelRecord, ModelState, ModelStore
 from astra_voice.platform import cowork as cowork_module
@@ -62,11 +66,13 @@ from astra_voice.platform.sound import MicrophoneState, SoundControl
 from astra_voice.runtime import DictationRuntime
 from astra_voice.ui import notify
 from astra_voice.ui.bridges import OnboardingController, SettingsBridge
+from astra_voice.ui.model_downloads import ModelDownloads, ModelService
 from astra_voice.ui.pill import (
     ERROR_MODEL_LOAD_FAILED,
     ERROR_MODEL_NOT_LOADED,
     ERROR_MODEL_REVOKED,
     ERROR_SELFCHECK_FAILED,
+    STATE_DURATION_MS,
     PillState,
 )
 from astra_voice.ui.tray_icons import TrayState
@@ -5216,6 +5222,130 @@ def test_revoked_revision_blocks_microphone_test(monkeypatch: pytest.MonkeyPatch
     assert callback.call_args.args[0].message == TEST_MODEL_UNAVAILABLE
 
 
+def revocation_loading_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, restart: bool
+) -> Rig:
+    """Обычная загрузка с настоящим быстрым checker и отметкой источника."""
+    from astra_voice.app import _revoked_check
+
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    catalog_state.write_state(
+        catalog_state.state_path(tmp_path), catalog_state.CatalogState(1, 1, "a" * 64, ())
+    )
+    rig = Rig(
+        monkeypatch,
+        from_dict({"model_id": "gigaam", "model_revision": "r1", "model_dir": "/tmp/model"}),
+    )
+    rig.runtime.set_revoked_check(_revoked_check(None))
+    rig.runtime.start()
+    if restart:
+        rig.event(type="hello")
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        rig.event(type="result", utterance_id="file", text="проверка связи")
+        assert rig.runtime._selfcheck == "ok"
+        rig.runtime.restart_worker(wait_for_model=True)
+    rig.event(type="hello")
+    assert rig.runtime._model_load_request is not None
+    assert rig.runtime._model_load_request["revision"] == "r1"
+    return rig
+
+
+def publish_runtime_revocation(tmp_path: Path) -> None:
+    """Источник уже принял отзыв; GUI-каталог для проверки не требуется."""
+    with CATALOG_LOCK:
+        catalog_state.write_state(
+            catalog_state.state_path(tmp_path),
+            catalog_state.CatalogState(1, 2, "b" * 64, (("gigaam", "r1"),)),
+        )
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["startup", "restart_worker"])
+@pytest.mark.parametrize("stage", ["model.loaded", "selfcheck"])
+def test_t232_revocation_before_ready_blocks_ordinary_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restart: bool, stage: str
+) -> None:
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=restart)
+    # Готовность объявляется под CATALOG_LOCK отдельно от автостарта (N-4б).
+    ready = Mock(wraps=rig.runtime._declare_model_ready)
+    monkeypatch.setattr(rig.runtime, "_declare_model_ready", ready)
+    try:
+        if stage == "selfcheck":
+            rig.event(type="model.loaded", id="gigaam", revision="r1")
+            assert rig.runtime._selfcheck == "running"
+        publish_runtime_revocation(tmp_path)
+        rig.supervisor.send.reset_mock()
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        # Поздний успешный результат также не может сделать модель рабочей.
+        rig.event(type="result", utterance_id="file", text="проверка связи")
+
+        ready.assert_not_called()
+        assert rig.runtime._selfcheck == "failed"
+        assert not rig.runtime._loading_model
+        assert rig.runtime._selfcheck_timer is None
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_REVOKED)
+        rig.tray.set_state.assert_called_with(TrayState.ERROR)
+        rig.notify.notify_model_revoked.assert_called_once_with()
+        rig.hotkey.fsm.press(rig.now)
+        rig.supervisor.send.assert_not_called()
+    finally:
+        rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["startup", "restart_worker"])
+def test_t232_revocation_after_ready_applies_on_next_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restart: bool
+) -> None:
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=restart)
+    try:
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        rig.event(type="result", utterance_id="file", text="проверка связи")
+        assert rig.runtime._selfcheck == "ok"
+        rig.supervisor.stop.reset_mock()
+        publish_runtime_revocation(tmp_path)
+
+        rig.recognize()
+
+        assert rig.runtime._selfcheck == "ok"
+        rig.supervisor.stop.assert_not_called()
+        rig.paste.assert_called_once()
+        rig.notify.notify_model_revoked.assert_not_called()
+        # Дождаться штатного завершения индикации результата диктовки.
+        for timer in list(rig.timers):
+            if timer.active and timer.interval == STATE_DURATION_MS[PillState.DONE]:
+                timer.fire()
+        assert rig.runtime.phase == DictationPhase.IDLE
+        rig.runtime.restart_worker(wait_for_model=True)
+        rig.supervisor.send.reset_mock()
+        rig.event(type="hello")
+        rig.supervisor.send.assert_not_called()
+        assert rig.runtime._selfcheck != "ok"
+        assert not rig.runtime._loading_model
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_REVOKED)
+        rig.notify.notify_model_revoked.assert_called_once_with()
+    finally:
+        rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("restart", [False, True], ids=["startup", "restart_worker"])
+def test_t232_unknown_revocation_preserves_ordinary_loading_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restart: bool
+) -> None:
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=restart)
+    checker = Mock(side_effect=RevocationUnknown)
+    rig.runtime.set_revoked_check(checker)
+    try:
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        rig.event(type="result", utterance_id="file", text="проверка связи")
+
+        assert checker.call_args_list == [call("gigaam", "r1"), call("gigaam", "r1")]
+        assert rig.runtime._selfcheck == "ok"
+        assert not rig.runtime._loading_model
+        assert rig.runtime.revocation_unknown
+        rig.notify.notify_model_revoked.assert_not_called()
+    finally:
+        rig.runtime.shutdown()
+
+
 # --- Откат неудачного переключения к прежней модели ---
 
 
@@ -5714,3 +5844,861 @@ def test_model_ready_preserves_reentrant_pending_test(
     assert new_updates == []
     expected = [MicrophoneTestUpdate("error", message=TEST_FAILED)] if raises else []
     assert original_updates == expected
+
+
+def revision_runtime(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Rig, ModelService, ModelDownloads, CatalogEntry]:
+    """Настоящие current.json, служба и компенсация GUI; воркеры — порт Rig."""
+    from astra_voice.ui import model_downloads
+
+    store = ModelStore(tmp_path / "models")
+    entry = CatalogEntry(
+        id="gigaam",
+        revision="r1",
+        name="GigaAM",
+        description="",
+        size_bytes=0,
+        min_ram_mb=500,
+        layout="onnx-asr-gigaam-v3",
+        variant="gigaam",
+        recommended=True,
+        host="huggingface.co",
+        files=(),
+    )
+    for revision in ("r0", "r1"):
+        staging = store.staging_dir(entry.id, revision)
+        (staging / "state.json").write_text(
+            json.dumps(
+                {
+                    "layout": entry.layout,
+                    "variant": entry.variant,
+                    "size_bytes": 0,
+                }
+            )
+        )
+        store.commit(entry.id, revision)
+    store.set_current(entry.id, "r0")
+    rig = Rig(monkeypatch, model_store=store)
+    (tmp_path / "state").mkdir()
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(model_downloads, "ModelStore", lambda: store)
+    monkeypatch.setattr(
+        model_downloads,
+        "load_effective",
+        lambda *args, **kwargs: Catalog(
+            serial=1,
+            trust_epoch=1,
+            entries=(entry,),
+            revoked=(),
+        ),
+    )
+    service = ModelService(rig.runtime.settings, policy_module.Policy())
+    from astra_voice.app import _revoked_check
+
+    rig.runtime.set_revoked_check(_revoked_check(service))
+    monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
+    downloads = ModelDownloads(
+        service,
+        store=store,
+        settings=rig.runtime.settings,
+        switcher=rig.runtime,
+        revocation_unknown=lambda: rig.runtime.revocation_unknown,
+    )
+    rig.runtime.on_revocation_unknown = downloads.revocation_unknown_changed
+    rig.runtime.start()
+    rig.event(type="hello")
+    rig.event(type="model.loaded", id=entry.id)
+    rig.event(type="result", utterance_id="file", text="проверка связи")
+    assert rig.runtime._selfcheck == "ok"
+    return rig, service, downloads, entry
+
+
+@pytest.mark.parametrize("pause", [False, True])
+@pytest.mark.parametrize("gui_delayed", [False, True])
+def test_revoked_candidate_restores_current_before_promotion(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pause: bool, gui_delayed: bool
+) -> None:
+    rig, service, downloads, entry = revision_runtime(monkeypatch, tmp_path)
+    old = rig.supervisor
+    assert rig.runtime.supervisor is old
+    before = (service._store.root / "current.json").read_bytes()
+    candidate = Mock(state="running", generation=0, restarting=False)
+    rig.supervisor_factory.return_value = candidate
+    try:
+        service.activate(entry.id, entry.revision, previous_revision="r0")
+        downloads._start_switch(
+            entry,
+            entry.revision,
+            pause=pause,
+            already_current=True,
+            previous_current=(entry.id, "r0"),
+            previous_revision=None,
+        )
+        event = rig.supervisor_factory.call_args.kwargs["on_event"]
+        event({"type": "hello", "generation": candidate.generation})
+        assert candidate.send.call_args.args[0]["revision"] == "r1"
+        revoked = Catalog(
+            serial=2,
+            trust_epoch=1,
+            entries=(entry,),
+            revoked=(RevokedEntry(entry.id, "r1", "test"),),
+        )
+        if gui_delayed:
+            # Публикация отзыва завершилась; очередь accept_catalog ещё не доставлена.
+            catalog_state.apply_state(
+                catalog_state.state_path(paths.state_dir()),
+                catalog_state.CatalogState(1, 2, "a" * 64, ((entry.id, "r1"),)),
+            )
+            assert not service.catalog.is_revoked(entry.id, "r1")
+        else:
+            downloads.accept_catalog(revoked, frozenset())
+        restored = Mock(state="running", generation=0, restarting=False)
+        rig.supervisor_factory.return_value = restored
+        event({"type": "model.loaded", "generation": candidate.generation, "id": entry.id})
+        assert not rig.runtime._switch_active()
+        assert (service._store.root / "current.json").read_bytes() == before
+        candidate.stop.assert_called_once_with()
+        if pause:
+            assert rig.runtime.supervisor is restored
+            restored_event = rig.supervisor_factory.call_args.kwargs["on_event"]
+            restored_event({"type": "hello", "generation": restored.generation})
+            assert restored.send.call_args.args[0]["revision"] == "r0"
+        else:
+            assert rig.runtime.supervisor is old
+            old.stop.assert_not_called()
+            assert rig.runtime._selfcheck == "ok"
+            assert not rig.runtime._loading_model
+        assert not any(
+            call.args[0]["type"] == "transcribe.file" for call in candidate.send.call_args_list
+        )
+    finally:
+        downloads.shutdown()
+        rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_switch_checks_revocation_again_after_selfcheck(
+    monkeypatch: pytest.MonkeyPatch, pause: bool
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=pause)
+    runtime = bench.rig.runtime
+    revoked: set[tuple[str, str]] = set()
+    runtime.set_revoked_check(lambda model_id, revision: (model_id, revision) in revoked)
+    try:
+        bench.switch()
+        candidate = bench.load_new_model()
+        revoked.add(("whisper", "r1"))
+        bench.emit(candidate, type="result", utterance_id="file", text="проверка связи")
+        restored = bench.assert_rolled_back(candidate)
+        bench.finish_restore(restored)
+    finally:
+        runtime.shutdown()
+
+
+def test_catalog_recovery_clears_runtime_revocation_warning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig, service, downloads, entry = revision_runtime(monkeypatch, tmp_path)
+    try:
+        service._catalog_error = CatalogError("state-invalid", "test")
+        service._catalog = Catalog(serial=0, trust_epoch=0, entries=(), revoked=())
+        rig.runtime._mark_revocation_unknown()
+        assert rig.runtime.revocation_unknown
+        assert downloads.revocationUnknown
+        notifications: list[bool] = []
+        downloads.revocationUnknownChanged.connect(
+            lambda: notifications.append(downloads.revocationUnknown)
+        )
+        downloads.accept_catalog(
+            Catalog(serial=2, trust_epoch=1, entries=(entry,), revoked=()),
+            frozenset(),
+        )
+        assert not service.catalog_unavailable
+        assert not rig.runtime.revocation_unknown
+        assert not downloads.revocationUnknown
+        assert notifications == [False]
+        assert rig.runtime._command_model_trusted(
+            capture=(rig.runtime.supervisor.generation, rig.runtime._model_load_request)
+        )
+    finally:
+        downloads.shutdown()
+        rig.runtime.shutdown()
+
+
+def test_unknown_revocation_refuses_candidate_and_preserves_working_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    try:
+        runtime.set_revoked_check(lambda _id, _rev: False)
+        bench.switch()
+        candidate = bench.workers[-1]
+        bench.emit(candidate, type="hello")
+        runtime.set_revoked_check(Mock(side_effect=RevocationUnknown))
+        bench.emit(candidate, type="model.loaded", id="whisper")
+        assert runtime.supervisor is bench.old
+        bench.old.stop.assert_not_called()
+        candidate.stop.assert_called_once_with()
+        bench.finished.assert_called_once_with("failed")
+        assert bench.current == "gigaam"
+        assert runtime.revocation_unknown
+        assert runtime._selfcheck == "ok"
+    finally:
+        runtime.shutdown()
+
+
+def test_revocation_fallback_reads_new_state_and_rejects_corruption(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from astra_voice.app import _revoked_check
+
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    state_path = catalog_state.state_path(tmp_path)
+    catalog_state.write_state(state_path, catalog_state.CatalogState(1, 1, "a" * 64, ()))
+    checker = _revoked_check(None)
+    assert not checker("model", "r1")
+    catalog_state.write_state(
+        state_path, catalog_state.CatalogState(1, 2, "b" * 64, (("model", "r1"),))
+    )
+    assert checker("model", "r1")
+    state_path.write_text("invalid state")
+    with pytest.raises(RevocationUnknown):
+        checker("model", "r1")
+
+
+def test_revocation_checker_uses_known_marker_when_catalog_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from astra_voice.app import _revoked_check
+
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    catalog_state.write_state(
+        catalog_state.state_path(tmp_path),
+        catalog_state.CatalogState(1, 1, "a" * 64, (("model", "r1"),)),
+    )
+    service = Mock()
+    service.revoked_revision.side_effect = store_module.StoreError(
+        "catalog-unavailable", "unavailable"
+    )
+    checker = _revoked_check(service)
+
+    assert checker("model", "r1") is True
+    # Отсутствие другой ревизии в отметке не делает недоступный каталог исправным.
+    with pytest.raises(RevocationUnknown):
+        checker("model", "r2")
+    assert service.revoked_revision.call_args_list == [call("model", "r1"), call("model", "r2")]
+
+
+@pytest.mark.parametrize("marker", ["invalid state", '{"trust_epoch": 1}'])
+def test_revocation_checker_preserves_positive_catalog_with_broken_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, marker: str
+) -> None:
+    from astra_voice.app import _revoked_check
+
+    monkeypatch.setattr(paths, "state_dir", lambda: tmp_path)
+    catalog_state.state_path(tmp_path).write_text(marker)
+    service = Mock()
+    service.revoked_revision.return_value = True
+
+    assert _revoked_check(service)("model", "r1") is True
+
+    service.revoked_revision.assert_called_once_with("model", "r1")
+
+
+def observe_stop_catalog_lock(supervisor: Mock) -> list[bool]:
+    """Проверяет lock внутри разрешённого порта stop, сохраняя его поведение."""
+    ownership: list[bool] = []
+    previous_stop = supervisor.stop.side_effect
+
+    def stop() -> None:
+        # CPython даёт этот probe, но в typeshed у RLock его нет.
+        is_owned = getattr(CATALOG_LOCK, "_is_owned")  # noqa: B009
+        ownership.append(bool(is_owned()))
+        if callable(previous_stop):
+            previous_stop()
+
+    supervisor.stop.side_effect = stop
+    return ownership
+
+
+def test_switch_promotion_stops_previous_worker_outside_catalog_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    ownership = observe_stop_catalog_lock(bench.old)
+    try:
+        bench.switch()
+        candidate = bench.load_new_model()
+
+        bench.old.stop.assert_called_once_with()
+        assert ownership == [False]
+        assert bench.rig.runtime.supervisor is candidate
+    finally:
+        bench.rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_revoked_loaded_candidate_stops_outside_catalog_lock(
+    monkeypatch: pytest.MonkeyPatch, pause: bool
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=pause)
+    runtime = bench.rig.runtime
+    revoked: set[tuple[str, str]] = set()
+    runtime.set_revoked_check(lambda model_id, revision: (model_id, revision) in revoked)
+    try:
+        bench.switch()
+        candidate = bench.workers[-1]
+        ownership = observe_stop_catalog_lock(candidate)
+        bench.emit(candidate, type="hello")
+        assert bench.loads(candidate) == ["whisper"]
+        revoked.add(("whisper", "r1"))
+
+        bench.emit(candidate, type="model.loaded", id="whisper")
+
+        candidate.stop.assert_called_once_with()
+        assert ownership == [False]
+        bench.finished.assert_called_once_with("failed")
+        assert not runtime._switch_active()
+        if pause:
+            restored = bench.workers[-1]
+            assert runtime.supervisor is restored
+            bench.emit(restored, type="hello")
+            assert bench.loads(restored) == ["gigaam"]
+        else:
+            assert runtime.supervisor is bench.old
+            bench.old.stop.assert_not_called()
+            assert runtime._selfcheck == "ok"
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_revoked_selfchecked_candidate_stops_outside_catalog_lock(
+    monkeypatch: pytest.MonkeyPatch, pause: bool
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=pause)
+    runtime = bench.rig.runtime
+    revoked: set[tuple[str, str]] = set()
+    runtime.set_revoked_check(lambda model_id, revision: (model_id, revision) in revoked)
+    try:
+        bench.switch()
+        candidate = bench.load_new_model()
+        ownership = observe_stop_catalog_lock(candidate)
+        revoked.add(("whisper", "r1"))
+
+        bench.emit(candidate, type="result", utterance_id="file", text="проверка связи")
+
+        candidate.stop.assert_called_once_with()
+        assert ownership == [False]
+        restored = bench.assert_rolled_back(candidate)
+        bench.finish_restore(restored)
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("stage", ["model.loaded", "selfcheck"])
+def test_t234_revoked_ordinary_worker_is_replaced_outside_catalog_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stage: str
+) -> None:
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
+    runtime = rig.runtime
+    old = rig.supervisor
+    clean = Mock(state="running", generation=old.generation + 1, restarting=False)
+    rig.supervisor_factory.return_value = clean
+    ownership = observe_stop_catalog_lock(old)
+    try:
+        if stage == "selfcheck":
+            rig.event(type="model.loaded", id="gigaam", revision="r1")
+        publish_runtime_revocation(tmp_path)
+        old.stop.reset_mock()
+        old.send.reset_mock()
+        if stage == "model.loaded":
+            rig.event(type="model.loaded", id="gigaam", revision="r1")
+        else:
+            rig.event(type="result", utterance_id="file", text="проверка связи")
+        old.stop.assert_called_once_with()
+        assert ownership == [False]
+        assert runtime.supervisor is clean
+        assert clean.generation == old.generation + 1
+        clean.start.assert_called_once_with()
+        rig.supervisor_factory.assert_called_with(
+            on_event=runtime._on_worker_event, use_qt=True, launch_allowed=ANY
+        )
+        assert runtime._selfcheck == "failed"
+        assert not runtime._loading_model
+        assert runtime._selfcheck_timer is None
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_REVOKED)
+        rig.tray.set_state.assert_called_with(TrayState.ERROR)
+        rig.notify.notify_model_revoked.assert_called_once_with()
+        emit = rig.supervisor_factory.call_args.kwargs["on_event"]
+        emit({"type": "hello", "generation": clean.generation})
+        assert "model.load" not in [call.args[0]["type"] for call in clean.send.call_args_list]
+        level = Mock()
+        assert runtime.start_level_monitor("default", level) is True
+        assert "record.start" in [call.args[0]["type"] for call in clean.send.call_args_list]
+        old.send.assert_not_called()
+        runtime.stop_level_monitor()
+        clean.send.reset_mock()
+        rig.hotkey.fsm.press(rig.now)
+        clean.send.assert_not_called()
+        assert runtime._mouse_allowed() is False
+        assert runtime.start_test("default", Mock()) is False
+        runtime.reload_model()
+        emit({"type": "hello", "generation": clean.generation})
+        assert "model.load" not in [call.args[0]["type"] for call in clean.send.call_args_list]
+        old.send.assert_not_called()
+        old.stop.assert_called_once_with()
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("exits", [True, False], ids=["killed", "d-state"])
+@pytest.mark.parametrize("level_active", [False, True], ids=["idle", "level-recording"])
+def test_t239_revoked_worker_stop_failure_closes_ipc_and_kills_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, level_active: bool, exits: bool
+) -> None:
+    """Ошибка настоящего stop до socket.close не оставляет отозванный процесс.
+
+    После слияния с US-2.6: чистый воркер нового поколения — только если SIGKILL
+    подтверждён выходом (poll). Процесс, переживший kill (D-state), оставляет
+    прежнее поколение и страж захвата; замены нет до «Проверить модель ещё раз».
+    """
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
+    runtime = rig.runtime
+    old = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    old.state = "running"
+    old._hello_accepted = True  # US-2.7: record.* — только после hello поколения
+    connection = Mock(spec=socket.socket)
+    connection.send.side_effect = len
+    old._socket = connection
+    old._notifier = Mock()
+    old._notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+    process = Mock(spec=subprocess.Popen)
+    alive = [True]
+    process.poll.side_effect = lambda: None if alive[0] else -9
+    if exits:
+        process.kill.side_effect = lambda: alive.__setitem__(0, False)
+    old.process = process
+    runtime.supervisor = old
+    send = Mock(wraps=old.send)
+    monkeypatch.setattr(old, "send", send)
+    clean = Mock(state="running", generation=old.generation + 1, restarting=False)
+    rig.supervisor_factory.return_value = clean
+    factory_calls = rig.supervisor_factory.call_count
+    try:
+        if level_active:
+            assert runtime.start_level_monitor("default", Mock()) is True
+            assert send.call_args.args[0]["type"] == "record.start"
+        publish_runtime_revocation(tmp_path)
+        send.reset_mock()
+
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+
+        connection.close.assert_called_once_with()
+        assert old._socket is None
+        process.kill.assert_called_once_with()
+        process.terminate.assert_not_called()
+        process.wait.assert_called_once_with(timeout=0.2)
+        assert old.state == "stopped"
+        assert runtime._selfcheck == "failed"
+        if not exits:
+            assert runtime.supervisor is old
+            assert old.generation == 1 and old._retired == [process]
+            assert rig.supervisor_factory.call_count == factory_calls
+            clean.start.assert_not_called()
+            assert runtime.orchestrator.level_active is level_active
+            send.assert_not_called()
+            return
+        assert runtime.supervisor is clean
+        clean.start.assert_called_once_with()
+        if not level_active:
+            assert runtime.start_level_monitor("default", Mock()) is True
+            assert clean.send.call_args.args[0]["type"] == "record.start"
+        send.assert_not_called()
+    finally:
+        alive[0] = False
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("stop_action", ["shutdown", "appimage-removal"])
+def test_revoked_worker_replacement_stays_closed_after_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stop_action: str
+) -> None:
+    """Повторный вход при stop не запускает воркер после завершения или резерва."""
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
+    runtime = rig.runtime
+    old = rig.supervisor
+    clean = Mock(state="new", generation=old.generation + 1, restarting=False)
+    rig.supervisor_factory.return_value = clean
+    rig.supervisor_factory.reset_mock()
+    rig.hotkey.has_pending_press = False
+
+    def stop() -> None:
+        rig.stop_worker()
+        if stop_action == "shutdown":
+            runtime.shutdown()
+        else:
+            assert runtime.reserve_appimage_removal() is True
+
+    old.stop.side_effect = stop
+    try:
+        publish_runtime_revocation(tmp_path)
+
+        runtime._on_worker_event(
+            {"generation": old.generation, "type": "model.loaded", "id": "gigaam", "revision": "r1"}
+        )
+
+        assert old.stop.called
+        assert old.state == "stopped"
+        assert runtime.supervisor is old
+        assert runtime._selfcheck == "failed"
+        assert runtime._closed or runtime._appimage_removal_reserved
+        rig.supervisor_factory.assert_not_called()
+        clean.start.assert_not_called()
+        assert runtime.start_level_monitor("default", Mock()) is False
+    finally:
+        old.stop.side_effect = rig.stop_worker
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    "stage,pause,level_active",
+    [
+        ("candidate", False, False),
+        ("selfcheck", False, False),
+        ("selfcheck", False, True),
+        ("selfcheck", True, False),
+        ("selfcheck", True, True),
+    ],
+)
+def test_t282_revoked_switch_stop_failure_kills_candidate_and_closes_ipc(
+    monkeypatch: pytest.MonkeyPatch, stage: str, pause: bool, level_active: bool
+) -> None:
+    """Ошибка stop до закрытия IPC не оставляет кандидата и его захват живыми."""
+    bench = SwitchRig(monkeypatch, pause=pause)
+    bench.old._retired = []
+    runtime = bench.rig.runtime
+    revoked: set[tuple[str, str]] = set()
+    runtime.set_revoked_check(lambda model_id, revision: (model_id, revision) in revoked)
+    candidate: WorkerSupervisor | None = None
+    process = Mock(spec=subprocess.Popen)
+    child = {"alive": True, "capturing": False}
+    process.poll.side_effect = lambda: None if child["alive"] else -9
+    process.wait.return_value = -9
+
+    def kill_process() -> None:
+        child.update(alive=False, capturing=False)
+
+    process.kill.side_effect = kill_process
+    connection = Mock(spec=socket.socket)
+    frames: list[dict[str, Any]] = []
+
+    def send_frame(payload: bytes) -> int:
+        message = ipc.decode(bytes(payload[4:]))
+        frames.append(message)
+        if message["type"] == "record.start":
+            child["capturing"] = True
+        elif message["type"] in ("record.stop", "record.cancel"):
+            child["capturing"] = False
+        return len(payload)
+
+    connection.send.side_effect = send_frame
+
+    def factory(**kwargs: Any) -> WorkerSupervisor | Mock:
+        nonlocal candidate
+        if candidate is not None:
+            return bench.factory(**kwargs)
+        candidate = WorkerSupervisor(kwargs["on_event"], use_qt=False)
+        candidate.process = process
+        candidate._socket = connection
+        monkeypatch.setattr(candidate, "_launch", lambda: setattr(candidate, "state", "running"))
+        return candidate
+
+    runtime._supervisor_factory = factory
+    try:
+        bench.switch()
+        assert candidate is not None
+        candidate._hello_accepted = True  # _emit минует _accept; US-2.7 ждёт hello
+        candidate._emit({"type": "hello"})
+        assert any(frame.get("id") == "whisper" for frame in frames)
+        if stage == "selfcheck":
+            candidate._emit({"type": "model.loaded", "id": "whisper", "revision": "r1"})
+            assert runtime.supervisor is candidate
+            assert runtime._selfcheck == "running"
+            if level_active:
+                assert runtime.start_level_monitor("default", Mock()) is True
+                assert runtime.orchestrator.level_active
+                assert child["capturing"]
+        else:
+            assert runtime.supervisor is bench.old
+
+        candidate._notifier = Mock()
+        candidate._notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+        stop = Mock(wraps=candidate.stop)
+        kill = Mock(wraps=candidate.kill)
+        monkeypatch.setattr(candidate, "stop", stop)
+        monkeypatch.setattr(candidate, "kill", kill)
+        revoked.add(("whisper", "r1"))
+        frames.clear()
+        if stage == "candidate":
+            candidate._emit({"type": "model.loaded", "id": "whisper", "revision": "r1"})
+        else:
+            candidate._emit({"type": "result", "utterance_id": "file", "text": "проверка связи"})
+
+        stop.assert_called_once_with()
+        kill.assert_called_once_with()
+        connection.close.assert_called_once_with()
+        assert candidate._socket is None
+        process.kill.assert_called_once_with()
+        process.terminate.assert_not_called()
+        process.wait.assert_called_once_with(timeout=0.2)
+        assert not child["alive"] and not child["capturing"]
+        assert candidate.state == "stopped"
+        assert not runtime._switch_active()
+        bench.finished.assert_called_once_with("failed")
+        bench.rig.hotkey.fsm.press(bench.rig.now)
+        assert all(frame["type"] != "record.start" for frame in frames)
+        with pytest.raises(RuntimeError, match="Воркер не запущен"):
+            candidate.send({"type": "record.start", "utterance_id": "after-revocation"})
+        connection.close.assert_called_once_with()
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("pause", [False, True])
+def test_promoted_switch_stop_failure_still_restores_previous_model(
+    monkeypatch: pytest.MonkeyPatch, pause: bool
+) -> None:
+    bench = SwitchRig(monkeypatch, pause=pause)
+    runtime = bench.rig.runtime
+    try:
+        bench.switch()
+        candidate = bench.load_new_model()
+        candidate.stop.side_effect = RuntimeError("Объект Qt удалён")
+        candidate._retired = [Mock(spec=subprocess.Popen)]
+
+        assert runtime._fail_switch() is True
+
+        candidate.stop.assert_called_once_with()
+        candidate.kill.assert_called_once_with()
+        restored = bench.assert_rolled_back(candidate)
+        restored.adopt_retired.assert_called_once_with(candidate._retired)
+        assert (
+            call(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
+            not in bench.rig.pill.show_state.call_args_list
+        )
+        bench.finish_restore(restored)
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("stop_flag", ["_closed", "_appimage_removal_reserved"])
+def test_promoted_switch_restore_does_not_restart_after_stop_closes_runtime(
+    monkeypatch: pytest.MonkeyPatch, stop_flag: str
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    candidate: Mock | None = None
+    try:
+        bench.switch()
+        candidate = bench.load_new_model()
+        factory = Mock(wraps=bench.factory)
+        runtime._supervisor_factory = factory
+
+        def close_during_stop() -> None:
+            assert candidate is not None
+            candidate.state = "stopped"
+            setattr(runtime, stop_flag, True)
+
+        candidate.stop.side_effect = close_during_stop
+
+        runtime._fail_switch()
+
+        candidate.stop.assert_called_once_with()
+        candidate.kill.assert_not_called()
+        assert getattr(runtime, stop_flag) is True
+        assert runtime.supervisor is candidate
+        assert not runtime._switch_active()
+        factory.assert_not_called()
+    finally:
+        runtime._closed = False
+        runtime._appimage_removal_reserved = False
+        if candidate is not None:
+            candidate.stop.side_effect = None
+        runtime.shutdown()
+
+
+def test_promoting_candidate_kills_previous_worker_after_stop_failure_with_level_meter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Продвижение при измерении уровня не оставляет прежний процесс захватывать звук."""
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    old = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    old.state = "running"
+    old._hello_accepted = True  # US-2.7: record.* — только после hello поколения
+    old.generation = bench.old.generation
+    child = {"alive": True, "capturing": False}
+    connection = Mock(spec=socket.socket)
+    frames: list[bytes] = []
+
+    def send_frame(payload: bytes) -> int:
+        frame = bytes(payload)
+        frames.append(frame)
+        if ipc.decode(frame[4:])["type"] == "record.start":
+            child["capturing"] = True
+        return len(payload)
+
+    connection.send.side_effect = send_frame
+    old._socket = connection
+    process = Mock(spec=subprocess.Popen)
+    process.poll.side_effect = lambda: None if child["alive"] else -9
+    process.wait.return_value = -9
+    old.process = process
+
+    def kill_process() -> None:
+        child.update(alive=False, capturing=False)
+
+    process.kill.side_effect = kill_process
+    old._notifier = Mock()
+    old._notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+    real_stop = old.stop
+    capture_at_stop: list[tuple[bool, bool]] = []
+
+    def stop_with_level_meter() -> None:
+        capture_at_stop.append((runtime.orchestrator.level_active, child["capturing"]))
+        real_stop()
+
+    stop = Mock(side_effect=stop_with_level_meter)
+    kill = Mock(wraps=old.kill)
+    monkeypatch.setattr(old, "stop", stop)
+    monkeypatch.setattr(old, "kill", kill)
+    runtime.supervisor = old
+
+    def start_meter_during_revocation_check(_model_id: str, _revision: str) -> bool:
+        # Повторный вход после idle guard: прежний процесс ещё обслуживает команды.
+        if runtime.supervisor is old and not runtime.orchestrator.level_active:
+            assert runtime.start_level_monitor("default", Mock()) is True
+            assert runtime.orchestrator.level_active
+            assert ipc.decode(frames[-1][4:])["type"] == "record.start"
+        return False
+
+    try:
+        bench.switch()
+        runtime.set_revoked_check(start_meter_during_revocation_check)
+        candidate = bench.load_new_model()
+
+        assert runtime.supervisor is candidate
+        stop.assert_called_once_with()
+        assert capture_at_stop == [(True, True)]
+        kill.assert_called_once_with()
+        connection.close.assert_called_once_with()
+        assert old._socket is None
+        process.kill.assert_called_once_with()
+        process.terminate.assert_not_called()
+        process.wait.assert_called_once_with(timeout=0.2)
+        assert not child["alive"] and not child["capturing"]
+        assert old.state == "stopped"
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("collect_with", ["pump", "stop"])
+def test_rejected_loaded_revision_keeps_generation_until_killed_processes_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, collect_with: str
+) -> None:
+    """Процессы, пережившие kill, не теряются и не уступают поколение раньше выхода.
+
+    Сведение M7 (N-12, перенос в замену) с контрактом US-2.6/2.7: поколение
+    меняется только после poll() is not None. Пока процессы живы, супервизор
+    остаётся прежним (они в его _retired и в ресурсах завершения программы);
+    после выхода «Проверить модель ещё раз» поднимает чистый воркер и передаёт
+    ему собранные процессы (adopt_retired).
+    """
+    from astra_voice.app import _copy_shutdown_resources
+
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
+    runtime = rig.runtime
+    old = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    old.state = "running"
+    old._notifier = Mock()
+    old._notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+    processes = [Mock(spec=subprocess.Popen) for _ in range(2)]
+    for process in processes:
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    old._retired = [processes[0]]
+    old.process = processes[1]
+    runtime.supervisor = old
+    clean = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    monkeypatch.setattr(clean, "start", lambda: setattr(clean, "state", "running"))
+    rig.supervisor_factory.return_value = clean
+    factory_calls = rig.supervisor_factory.call_count
+    try:
+        publish_runtime_revocation(tmp_path)
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        assert runtime.supervisor is old
+        assert old.generation == 1
+        assert rig.supervisor_factory.call_count == factory_calls
+        for process in processes:
+            process.kill.assert_called_once_with()
+            process.wait.assert_called_once_with(timeout=0.2)
+            process.poll.reset_mock()
+            process.wait.reset_mock(side_effect=True)
+        assert old._retired == processes
+        shutdown_processes, _ = _copy_shutdown_resources(runtime, None, None)
+        for process in processes:
+            assert any(child is process for child in shutdown_processes)
+        for process in processes:
+            process.poll.return_value = -9
+        if collect_with == "pump":
+            old.pump()
+            for process in processes:
+                process.poll.assert_called_once_with()
+            assert old._retired == []
+        # «Проверить модель ещё раз»: stop() прежнего супервизора собирает вышедшие
+        # процессы без сигналов, затем — чистый воркер следующего поколения.
+        runtime._recheck_model()
+        assert runtime.supervisor is clean
+        assert clean.generation == 2
+        assert old._retired == []
+        for process in processes:
+            process.terminate.assert_not_called()
+            if collect_with == "stop":
+                process.wait.assert_called_once_with(timeout=2)
+        assert clean._retired == []
+    finally:
+        for process in processes:
+            process.poll.return_value = -9
+            process.wait.side_effect = None
+        runtime.shutdown()
+
+
+def test_revocation_while_previous_worker_stops_restores_previous_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Слияние M7 с US-2.6: отзыв пришёл, пока останавливался прежний воркер.
+
+    Прежний воркер останавливается до замены супервизора и вне CATALOG_LOCK, затем
+    отзыв перепроверяется под замком: кандидат не продвигается, прежняя модель
+    возвращается так же, как после переключения с паузой.
+    """
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    runtime.set_revoked_check(
+        lambda model_id, revision: model_id == "whisper" and bool(bench.old.stop.called)
+    )
+    try:
+        bench.switch()
+        candidate = bench.workers[-1]
+        bench.emit(candidate, type="hello")
+        bench.emit(candidate, type="model.loaded", id="whisper")
+        candidate.stop.assert_called_once_with()
+        restored = bench.assert_rolled_back(candidate)
+        # Остановка в продвижении и идемпотентная повторная в restart_worker.
+        assert bench.old.stop.call_count == 2
+        bench.finish_restore(restored)
+    finally:
+        runtime.shutdown()

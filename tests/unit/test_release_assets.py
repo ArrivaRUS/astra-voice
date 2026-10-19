@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from astra_voice.core.release_identity import schema_id
+
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = "0.2.0"
@@ -52,6 +54,13 @@ def make_repo(tmp_path: Path, *, enabled: bool) -> Path:
     (repo / "docs" / "SECURITY.md").write_text("# security\n", encoding="utf-8")
     (repo / "data" / "keys").mkdir(parents=True)
     (repo / "data" / "keys" / "release.gpg").write_bytes(b"keyring")
+    (repo / "data" / "catalog.schema.json").write_bytes(b'{"schema": "test"}\n')
+    (repo / "data" / "catalog.json").write_bytes(b'{ "catalog": "test" }\r\n')
+    (repo / "data" / "catalog.json.sig").write_bytes(b"\x00test signature\xff\r\n")
+    for name in ("__init__.py", "core/__init__.py", "core/paths.py", "core/release_identity.py"):
+        target = repo / "src" / "astra_voice" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / "src" / "astra_voice" / name, target)
     if enabled:
         flag = repo / "packaging" / "appimage" / "ENABLED"
         flag.parent.mkdir(parents=True)
@@ -111,6 +120,7 @@ def test_with_appimage(tmp_path: Path) -> None:
     result = run(repo, GITHUB_REF_NAME=f"v{VERSION}")
     assert result.returncode == 0, result.stdout + result.stderr
     listed = sums(dist)
+    catalog_name = f"catalog-{schema_id((repo / 'data/catalog.schema.json').read_bytes())}.json"
     assert set(listed) == {
         DEB,
         "sbom.cdx.json",
@@ -122,6 +132,8 @@ def test_with_appimage(tmp_path: Path) -> None:
         "SECURITY.md",
         "release.gpg",
         "latest.json",
+        catalog_name,
+        catalog_name + ".sig",
     }
     for name, digest in listed.items():
         assert hashlib.sha256((dist / name).read_bytes()).hexdigest() == digest
@@ -159,6 +171,33 @@ def test_refuses_signing_secret(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "секрет подписи" in result.stderr
     assert not (repo / "dist" / "SHA256SUMS").exists()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_catalog_assets_are_exact_copies(tmp_path: Path, enabled: bool) -> None:
+    repo = make_repo(tmp_path, enabled=enabled)
+    result = run(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    dist = repo / "dist"
+    name = f"catalog-{schema_id((repo / 'data/catalog.schema.json').read_bytes())}.json"
+    listed = sums(dist)
+    assets = (dist / "assets.txt").read_text().splitlines()
+    for source, asset in (("catalog.json", name), ("catalog.json.sig", name + ".sig")):
+        raw = (repo / "data" / source).read_bytes()
+        assert (dist / asset).read_bytes() == raw
+        assert listed[asset] == hashlib.sha256(raw).hexdigest()
+        assert f"dist/{asset}" in assets
+    assert list(listed)[-3:] == ["latest.json", name, name + ".sig"]
+
+
+def test_catalog_signature_required(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, enabled=False)
+    (repo / "data/catalog.json.sig").unlink()
+    result = run(repo)
+    assert result.returncode == 1
+    assert "каталог без подписи не публикуется" in result.stderr
+    assert not (repo / "dist/SHA256SUMS").exists()
+    assert not (repo / "dist/assets.txt").exists()
 
 
 def test_enabled_requires_appimage(tmp_path: Path) -> None:

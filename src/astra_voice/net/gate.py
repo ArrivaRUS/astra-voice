@@ -75,6 +75,11 @@ class NetworkGate:
         # Офлайн-режим из «Сеть и обновления» запрещает и ручные действия.
         if self._settings.offline is True:
             return "offline"
+        if kind == "check_models" and (
+            self._policy.values.get("check_model_updates") is False
+            or str(self._policy.values.get("updates")).strip().lower() == "offline"
+        ):
+            return "policy"
         if (
             kind in ("check_app", "check_app_manual")
             and self._policy.is_locked("check_app_updates")

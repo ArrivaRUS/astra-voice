@@ -17,6 +17,7 @@ from test_runtime import MARKER, Rig, assert_phase
 
 from astra_voice.core.dictation import DictationPhase
 from astra_voice.core.settings import from_dict
+from astra_voice.models.catalog_effective import CATALOG_LOCK
 from astra_voice.platform.hotkey import (
     GrabResult,
     HotkeyBackend,
@@ -243,3 +244,92 @@ def test_ready_does_not_restart_abandoned_fsm_while_physical_key_is_down(
     wake.loaded()
     wake.ready()
     assert_load_only(wake)
+
+
+@pytest.mark.parametrize("barrier", ["model.loaded", "selfcheck"])
+def test_t236_revocation_during_hotkey_wake_blocks_autostart(
+    monkeypatch: pytest.MonkeyPatch, barrier: str
+) -> None:
+    """T-236 (N-4, слияние M7 с US-2.6): отзыв на барьере ready во время пробуждения.
+
+    Удержанный PTT разбудил выгруженную модель; отзыв принят до ready → запись не
+    стартует ни в одном воркере, автомат хоткея в IDLE, ожидание пробуждения
+    сброшено, прежний воркер остановлен один раз, а чистый воркер модель не грузит.
+    """
+    wake = unloaded(monkeypatch)
+    rig, runtime = wake.rig, wake.rig.runtime
+    revoked = [False]
+    runtime.set_revoked_check(lambda _model_id, _revision: revoked[0])
+    wake.key("KeyPress")
+    assert runtime._wake_dictation and runtime._wake_generation == rig.supervisor.generation
+    assert wake.hotkey.physical_key_down
+    generation = rig.supervisor.generation
+    stops = rig.supervisor.stop.call_count
+    starts = rig.supervisor.start.call_count
+    if barrier == "selfcheck":
+        wake.loaded()
+    revoked[0] = True
+    if barrier == "model.loaded":
+        rig.event(type="model.loaded")
+    else:
+        wake.ready()
+
+    assert rig.supervisor.stop.call_count == stops + 1
+    assert rig.supervisor.start.call_count == starts + 1
+    assert rig.supervisor.generation == generation + 1
+    assert runtime._selfcheck == "failed" and not runtime._loading_model
+    assert not runtime._wake_dictation
+    assert runtime._wake_window is None and runtime._wake_generation is None
+    assert not runtime._model_parked and runtime._idle_unload_timer is None
+    assert wake.hotkey.fsm.state is HotkeyState.IDLE
+    assert_phase(runtime, DictationPhase.IDLE)
+    loads = sent(rig).count("model.load")
+    rig.event(type="hello")
+    # failed: чистый воркер не грузит модель на hello — отозванной модели в памяти нет.
+    assert sent(rig).count("model.load") == loads
+    assert "record.start" not in sent(rig)
+    # Отпускание и новое нажатие не шлют чистому воркеру ни записи, ни загрузки.
+    before = len(sent(rig))
+    wake.key("KeyRelease", after=0.1)
+    wake.key("KeyPress", after=1)
+    assert sent(rig)[before:] == []
+
+
+def test_t236_wake_autostart_runs_after_catalog_lock_is_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T-236 / N-4(б): под CATALOG_LOCK — только решение о готовности, без записи."""
+    wake = unloaded(monkeypatch)
+    rig, runtime = wake.rig, wake.rig.runtime
+    checks: list[bool] = []
+
+    def not_revoked(_model_id: str, _revision: str) -> bool:
+        checks.append(lock_owned())
+        return False
+
+    runtime.set_revoked_check(not_revoked)
+    owned_at_start: list[bool] = []
+    send = rig.send
+
+    def observe(message: dict[str, object], **kwargs: object) -> object:
+        if message["type"] == "record.start":
+            owned_at_start.append(lock_owned())
+        return send(message, **kwargs)
+
+    rig.supervisor.send.side_effect = observe
+    wake.key("KeyPress")
+    wake.loaded()
+    checks.clear()
+    wake.ready()
+
+    assert checks == [True]  # барьер ready проверяет отзыв под замком
+    assert owned_at_start == [False]  # автостарт записи — уже после замка
+    assert sent(rig).count("record.start") == 1
+    assert_phase(runtime, DictationPhase.RECORDING)
+    assert not runtime._wake_dictation and runtime._wake_generation is None
+
+
+def lock_owned() -> bool:
+    # CPython даёт этот probe, но в typeshed у RLock его нет.
+    is_owned = getattr(CATALOG_LOCK, "_is_owned")  # noqa: B009
+    return bool(is_owned())

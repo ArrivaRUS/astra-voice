@@ -6,7 +6,7 @@ import json
 import struct
 import subprocess
 from typing import Any, cast
-from unittest.mock import Mock, call
+from unittest.mock import Mock, PropertyMock, call
 
 import pytest
 from test_command_mouse_runtime import MouseRuntimeRig
@@ -426,6 +426,9 @@ def test_candidate_is_not_promoted_when_old_process_stop_times_out(
     transport.state = "running"
     transport.process = process
     old.stop.side_effect = transport.stop
+    # Слияние с M7: после отказа stop() runtime делает kill() и сверяет exited —
+    # дублёр сообщает настоящий статус процесса, а не истинный Mock.
+    type(old).exited = PropertyMock(side_effect=lambda: transport.exited)
     try:
         bench.switch()
         candidate = bench.workers[-1]

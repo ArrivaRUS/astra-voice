@@ -15,7 +15,7 @@ import pytest
 
 from astra_voice.core.model_request import build_model_load
 from astra_voice.models import installer as inst
-from astra_voice.models.catalog import Catalog, CatalogEntry, FileSpec, RevokedEntry
+from astra_voice.models.catalog import Catalog, CatalogEntry, CatalogError, FileSpec, RevokedEntry
 from astra_voice.models.installer import Installer, SmokeResult, verify_installed
 from astra_voice.models.store import ModelRecord, ModelStore, StoreError
 from astra_voice.worker import ipc
@@ -1233,3 +1233,120 @@ def test_every_catalog_entry_passes_contents_and_layout(
 
     inst._check_contents(directory, entry, allow_parts=False)
     inst._check_model_layout(directory, entry)
+
+
+def test_install_without_activation_preserves_pointer(
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    smoke: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous = _previous(store, entry, contents)
+    before = _pointer(store)
+    _stage(store, entry, contents)
+    set_current = Mock(wraps=store.set_current)
+    monkeypatch.setattr(store, "set_current", set_current)
+    result = Installer(store, smoke).install_from_staging(entry, activate=False)
+    assert result.state == "ok"
+    assert result.record is not None
+    assert result.record in store.records()
+    smoke.assert_called_once_with(result.record.dir, entry)
+    set_current.assert_not_called()
+    assert store.current() == previous
+    assert _pointer(store) == before
+
+
+@pytest.mark.parametrize("activate", [False, True])
+@pytest.mark.parametrize("interrupt", ["revoked", "cancelled"])
+def test_install_rechecks_after_smoke(
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    activate: bool,
+    interrupt: str,
+) -> None:
+    previous = _previous(store, entry, contents)
+    before = _pointer(store)
+    _stage(store, entry, contents)
+    catalog = Catalog(1, 1, (), (entry,))
+    cancelled = False
+
+    def smoke(directory: Path, model: CatalogEntry) -> SmokeResult:
+        nonlocal catalog, cancelled
+        if interrupt == "revoked":
+            catalog = Catalog(2, 1, (RevokedEntry(entry.id, entry.revision, "отзыв"),), (entry,))
+        else:
+            cancelled = True
+        return SmokeResult(True)
+
+    result = Installer(store, smoke, lambda: catalog).install_from_staging(
+        entry, activate=activate, cancel=lambda: cancelled
+    )
+    assert result.state == "error" and result.reason_code == interrupt
+    assert store.current() == previous
+    assert _pointer(store) == before
+
+
+@pytest.mark.parametrize("from_path", [False, True])
+@pytest.mark.parametrize("fail_after_smoke", [False, True])
+def test_catalog_provider_failure_is_an_install_result(
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    tmp_path: Path,
+    from_path: bool,
+    fail_after_smoke: bool,
+) -> None:
+    _previous(store, entry, contents)
+    before = _pointer(store)
+    unavailable = not fail_after_smoke
+
+    def catalog() -> Catalog:
+        if unavailable:
+            raise CatalogError("state-invalid", "Каталог недоступен")
+        return Catalog(1, 1, (), (entry,))
+
+    def smoke(directory: Path, model: CatalogEntry) -> SmokeResult:
+        nonlocal unavailable
+        unavailable = True
+        return SmokeResult(True)
+
+    installer = Installer(store, smoke, catalog)
+    source = (
+        _write_files(tmp_path / "source", contents) if from_path else _stage(store, entry, contents)
+    )
+    result = (
+        installer.install_from_path(source, entry)
+        if from_path
+        else installer.install_from_staging(entry)
+    )
+
+    assert result.state == "error"
+    assert result.reason_code
+    assert _pointer(store) == before
+
+
+@pytest.mark.parametrize("activate", [False, True])
+def test_installer_uses_activation_dependency_only_when_requested(
+    store: ModelStore,
+    entry: CatalogEntry,
+    contents: dict[str, bytes],
+    smoke: Mock,
+    activate: bool,
+) -> None:
+    _previous(store, entry, contents)
+    before = _pointer(store)
+    _stage(store, entry, contents)
+    activations: list[tuple[str, str]] = []
+
+    def refuse(model_id: str, revision: str, *, previous_revision: str | None = None) -> None:
+        activations.append((model_id, revision))
+        raise StoreError("revoked", "Отозвана")
+
+    result = Installer(store, smoke, activate=refuse).install_from_staging(entry, activate=activate)
+
+    assert result.state == ("error" if activate else "ok")
+    assert result.reason_code == ("revoked" if activate else "")
+    assert activations == ([(entry.id, entry.revision)] if activate else [])
+    assert _pointer(store) == before

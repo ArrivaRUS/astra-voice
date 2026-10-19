@@ -18,6 +18,7 @@ from typing import Any, cast
 from urllib.parse import unquote
 
 from astra_voice.core import paths
+from astra_voice.core.release_identity import schema_id
 from astra_voice.models import catalog_state
 from astra_voice.models import schema as schema_module
 from astra_voice.net.hosts import host_allowed
@@ -424,6 +425,7 @@ def _apply_state(
     serial: int,
     trust_epoch: int,
     revoked: tuple[RevokedEntry, ...],
+    accepted_schema_id: str | None = None,
 ) -> None:
     """Сверяет каталог с применённым и запоминает его (анти-откат, PRD §7.3)."""
     candidate = catalog_state.CatalogState(
@@ -431,6 +433,7 @@ def _apply_state(
         serial=serial,
         sha256=hashlib.sha256(raw).hexdigest(),
         revoked=tuple((entry.model_id, entry.revision) for entry in revoked),
+        schema_id=accepted_schema_id,
     )
     try:
         catalog_state.apply_state(state_path, candidate)
@@ -461,6 +464,8 @@ def load_builtin(
     catalog_path = (directory / "catalog.json").resolve()
     sig_path = (directory / "catalog.json.sig").resolve()
     raw = _read_limited(catalog_path, "Каталог")
+    if verifier.purpose != "catalog":
+        raise CatalogError("purpose-mismatch", "Для каталога требуется проверка с целью catalog.")
     try:
         if not sig_path.is_file():
             raise CatalogError("bad-signature", "Не удалось подтвердить подпись каталога.")
@@ -518,7 +523,7 @@ def load_builtin(
     serial = _positive_integer(data.get("serial"))
     trust_epoch = _positive_integer(data.get("trust_epoch"))
     if state_path is not None:
-        _apply_state(state_path, raw, serial, trust_epoch, revoked)
+        _apply_state(state_path, raw, serial, trust_epoch, revoked, schema_id(schema_raw))
     return Catalog(
         serial=serial,
         trust_epoch=trust_epoch,

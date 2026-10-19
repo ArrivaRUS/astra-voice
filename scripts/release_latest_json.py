@@ -13,15 +13,19 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from astra_voice.core.release_identity import RELEASES_REPO  # noqa: E402
 
 # Минимальная поддерживаемая ОС — Astra Linux SE 1.8 (PRD/ТЗ).
 # Пакет собирается под debian:12 = ALSE 1.8; см. packaging/Containerfile.
 MIN_ASTRA = "1.8"
 SCHEMA = 2
-REPOSITORY = "ArrivaRUS/astra-voice"
 
 
 def published_at(raw: str | None) -> str:
@@ -72,7 +76,7 @@ def generate(
         "version": version,
         "published_at": published_at(date),
         "min_astra": MIN_ASTRA,
-        "release_url": f"https://github.com/{REPOSITORY}/releases/tag/v{version}",
+        "release_url": f"https://github.com/{RELEASES_REPO}/releases/tag/v{version}",
         "artifacts": artifacts,
     }
     (dist / "latest.json").write_text(
