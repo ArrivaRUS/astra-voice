@@ -123,7 +123,8 @@ class Chain:
         self.supervisor._receive(ipc.encode(ipc.make_hello()), self.supervisor.generation)
         self.delivered.clear()
         self.supervisor._socket = cast(Any, self.channel)
-        self.rig.during_send = self.supervisor.send
+        # Наблюдатель Rig игнорирует ответ send(); cast снимает только тип возврата.
+        self.rig.during_send = cast(Any, self.supervisor.send)
         self._new_worker()
         self.command_executor = ThreadPoolExecutor(max_workers=1)
         self.rig.restart_worker.side_effect = self.restart
@@ -132,7 +133,7 @@ class Chain:
         self.worker_channel = Channel()
         self.loop = WorkerLoop(cast(Any, self.worker_channel), capture=False)
         self.loop.worker.close()
-        self.loop._events = self.events
+        self.loop._events = cast(Any, self.events)  # Queue вместо SimpleQueue: нужен get(timeout)
         self.source = Source()
         self.engine = FakeEngine(text=MARKER)
         self.worker = WorkerState(
@@ -143,7 +144,7 @@ class Chain:
             clock=lambda: self.rig.now,
         )
         self.capture = AudioCapture(
-            source=self.source,
+            source=cast(Any, self.source),  # дублёр без flush/device_name: они здесь не вызываются
             on_samples=self.worker.on_samples,
             on_event=self.loop._put_event,
             on_error=self.worker.on_error,
@@ -156,7 +157,7 @@ class Chain:
             self.command_progress.put("wait")
             original_wait(uid)
 
-        self.capture.wait_stopped = observed_wait
+        self.capture.wait_stopped = observed_wait  # type: ignore[method-assign,assignment]
         self.loop.worker = self.worker
         loaded = self.worker.handle(
             dict(
@@ -466,7 +467,7 @@ def run_fixed_seed_chain(
             raise RuntimeError(MARKER)
         original_tray(state, tooltip)
 
-    chain.tray.set_state = set_state
+    chain.tray.set_state = set_state  # type: ignore[method-assign]
     original_deliver = chain.deliver
 
     def deliver(message: dict[str, Any]) -> None:
@@ -478,7 +479,7 @@ def run_fixed_seed_chain(
                 if delivered.get("request_type") != message["request_type"]:
                     violations.append("PROVENANCE: supervisor changed wire request_type")
 
-    chain.deliver = deliver
+    chain.deliver = deliver  # type: ignore[method-assign]
     future: Future[list[dict[str, Any]]] | None = None
     try:
         chain.trace.append("start")

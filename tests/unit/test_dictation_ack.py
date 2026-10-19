@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from subprocess import TimeoutExpired
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import Mock
 
 import pytest
@@ -396,9 +396,9 @@ def test_capture_guard_waits_for_delayed_worker_death(
     process = Mock(poll=Mock(return_value=None))
     process.wait.side_effect = TimeoutExpired("worker", 0.2)
     supervisor.process = process
-    supervisor._launch = Mock()
+    supervisor._launch = Mock()  # type: ignore[method-assign]
     rig.core._generation = lambda: supervisor.generation
-    rig.during_send = supervisor.send
+    rig.during_send = cast(Any, supervisor.send)  # ответ send() наблюдателю не нужен
     supervisor._receive(ipc.encode(ipc.make_hello()), supervisor.generation)
     rig.start()
     if restart == "supervisor":
@@ -448,7 +448,7 @@ def test_cancel_timer_preserves_pending_supervisor_restart_and_capture_guard(
     monkeypatch.setattr(supervisor, "stop", stop)
     rig.core._generation = lambda: supervisor.generation
     rig.core._worker_restarting = lambda: supervisor.restarting
-    rig.during_send = supervisor.send
+    rig.during_send = cast(Any, supervisor.send)  # ответ send() наблюдателю не нужен
     rig.restart_worker.side_effect = supervisor.stop
     supervisor._receive(ipc.encode(ipc.make_hello()), supervisor.generation)
     cancelled = Mock(wraps=rig.core._cancelled)
@@ -489,7 +489,8 @@ def test_cancel_timer_preserves_pending_supervisor_restart_and_capture_guard(
     supervisor.pump()
     assert supervisor._restart_pending is None
     if cause == "restart-limit":
-        assert supervisor.generation == 1 and supervisor.state == "stopped"
+        # str(): mypy держит сужение state до "running" после присваивания выше.
+        assert supervisor.generation == 1 and str(supervisor.state) == "stopped"
         launch.assert_not_called()
     else:
         assert supervisor.generation == 2

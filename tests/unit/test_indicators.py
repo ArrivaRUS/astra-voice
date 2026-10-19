@@ -602,7 +602,10 @@ def test_level_monitor_with_real_indicator_guard(harness: Harness, scenario: str
             microphone_open = True
         elif message["type"] == "record.cancel":
             microphone_open = False
-            core.on_worker_event({**message, "type": "cancelled", "generation": 1})
+            # ACK протокола 4: воркер ставит request_type своей команды (ipc-ack-protocol.md).
+            core.on_worker_event(
+                {**message, "type": "cancelled", "request_type": "record.cancel", "generation": 1}
+            )
 
     core = DictationOrchestrator(
         send=send,

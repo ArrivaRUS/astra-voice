@@ -119,6 +119,16 @@ class Rig:
             }
         )
 
+    def cancel_ack(self) -> None:
+        """ACK отмены протокола 4: тип ставит воркер после физического закрытия захвата."""
+        self.worker("cancelled", request_type="record.cancel")
+
+    def assert_indicator_held_until_ack(self) -> None:
+        """Индикатор и страж держатся до ACK закрытия (docs/ipc-ack-protocol.md)."""
+        self.hardware.guard.set_recording.assert_called_with(True)
+        self.cancel_ack()
+        self.hardware.guard.set_recording.assert_called_with(False)
+
 
 def test_pending_single_win_lost_before_300ms_never_opens_microphone(
     monkeypatch: pytest.MonkeyPatch,
@@ -142,9 +152,10 @@ def test_mapping_loss_while_recording_cancels_without_waiting_for_release_or_lim
     rig.hold()
     rig.mapping(GrabResult("busy", keycode=134))
     assert rig.commands() == ["record.start", "record.cancel"]
-    rig.hardware.guard.set_recording.assert_called_with(False)
+    rig.hardware.guard.set_recording.assert_called_with(True)  # до ACK закрытия
     rig.worker("result", text=PHRASE)  # old worker response before acknowledgement
-    rig.worker("cancelled")
+    rig.cancel_ack()
+    rig.hardware.guard.set_recording.assert_called_with(False)
     rig.hardware.now += 121
     rig.manager.tick()  # no physical release ever arrives from the lost grab
     assert rig.commands() == ["record.start", "record.cancel"]
@@ -160,7 +171,7 @@ def test_busy_to_ready_recovery_requires_a_fresh_command_gesture(
     rig.hold()
     rig.mapping(GrabResult("busy", keycode=134))
     assert "record.cancel" in rig.commands()
-    rig.worker("cancelled")
+    rig.cancel_ack()
     before = list(rig.commands())
     rig.keyboard.signature = (133, 0)
     rig.mapping(GrabResult("ok", keycode=133))
@@ -182,7 +193,7 @@ def test_mapping_collision_stops_command_but_does_not_ungrab_text(
     rig.keyboard.signature = (65, 4)  # current map aliases the text role
     rig.mapping(GrabResult("ok", keycode=65, mods=4))
     assert rig.commands() == ["record.start", "record.cancel"]
-    rig.hardware.guard.set_recording.assert_called_with(False)
+    rig.assert_indicator_held_until_ack()
     rig.hardware.hotkey.ungrab.assert_not_called()
     assert not rig.runtime.reload_command_hotkey()
     rig.hardware.now += 0.31
@@ -248,7 +259,7 @@ def test_successful_keycode_shift_during_hold_cannot_wait_for_old_physical_relea
     rig.keyboard.signature = (134, 0)
     rig.mapping(GrabResult("ok", keycode=134))
     assert rig.commands() == ["record.start", "record.cancel"]
-    rig.hardware.guard.set_recording.assert_called_with(False)
+    rig.assert_indicator_held_until_ack()
     rig.event(HotkeyEvent("KeyRelease", 133, int(rig.hardware.now * 1000)))
     rig.worker("result", text=PHRASE)
     assert rig.command.client.calls == []
@@ -293,8 +304,11 @@ def test_loss_after_release_cancels_tail_before_it_can_request_recognition(
     assert rig.commands() == ["record.start"]  # release tail is still recording
     rig.mapping(GrabResult("busy", keycode=134))
     assert rig.commands() == ["record.start", "record.cancel"]
-    rig.hardware.guard.set_recording.assert_called_with(False)
+    rig.hardware.guard.set_recording.assert_called_with(True)  # до ACK закрытия
     rig.runtime.orchestrator._release_tail_elapsed()  # callback already dispatched before cancel
+    assert rig.commands() == ["record.start", "record.cancel"]
+    rig.cancel_ack()
+    rig.hardware.guard.set_recording.assert_called_with(False)
     assert rig.commands() == ["record.start", "record.cancel"]
     assert rig.command.client.calls == []
 
@@ -322,7 +336,7 @@ def test_recovery_timer_restores_free_key_within_30s_without_opening_microphone(
     rig = Rig(monkeypatch)
     rig.hold()
     rig.mapping(GrabResult("busy", keycode=134))
-    rig.worker("cancelled")
+    rig.cancel_ack()
     retries = [t for t in rig.hardware.timers if t.active and not t.single_shot]
     assert len(retries) == 1
     assert 0 < retries[0].interval <= 30_000  # PRD F2.11 bound, independent of timer constant

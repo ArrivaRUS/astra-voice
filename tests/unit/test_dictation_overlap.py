@@ -43,7 +43,7 @@ tester (рекомендация зашита в ожидание; другое 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from test_dictation import Rig
@@ -1028,9 +1028,10 @@ class WorkerWireRig(OverlapRig):
         from concurrent.futures import Future
         from types import SimpleNamespace
 
-        from test_worker_state import FakeCancelToken, FakeEngine, load_message
+        from test_worker_state import load_message
 
         from astra_voice.worker.state import WorkerState
+        from fakes import FakeCancelToken, FakeEngine
 
         super().__init__()
         self.ack_stop = False
@@ -1065,9 +1066,9 @@ class WorkerWireRig(OverlapRig):
             engine_factory=lambda layout: self.engine,
             cancel_factory=FakeCancelToken,
             audio_factory=list,
-            executor=SimpleNamespace(submit=submit),
+            executor=cast(Any, SimpleNamespace(submit=submit)),
             on_event=self.wire.append,
-            capture=capture,
+            capture=cast(Any, capture),
         )
         assert self.worker.handle(load_message())[0]["type"] == "model.loaded"
         self.during_send = self.to_worker
@@ -1137,6 +1138,7 @@ def test_worker_late_close_after_result_never_interrupts_next_capture(
     rig.deliver("result")
     if boundary != "cold-stop":
         # Real capture eventually closes after request_stop, even without a GUI cancel.
+        assert rig.worker._capture is not None
         rig.worker._capture.stop()
     assert any(e.get("code") == "bad-state" for e in rig.wire)
     assert not any(e["type"] == "cancelled" for e in rig.wire)

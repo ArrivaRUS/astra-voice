@@ -2951,7 +2951,7 @@ class DictationRuntime(QObject):
             message = "Воркер ещё перезапускается."
             self._fail_pending_test(message=message)
             if self._command_publication_allowed():
-                self.pill.show_state(PillState.ERROR, text=message)
+                self.pill.show_state(PillState.ERROR, text="Воркер ещё перезапускается.")
             self.tray.set_state(TrayState.ERROR)
             return False
         self._model_parked = False

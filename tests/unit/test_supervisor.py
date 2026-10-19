@@ -1315,7 +1315,8 @@ def test_deferred_restart_does_not_launch_after_runtime_launch_is_forbidden(
     process.poll.return_value = -signal.SIGKILL
     process.wait.side_effect = None
     supervisor.pump()
-    assert supervisor.state == "stopped" and not supervisor.restarting
+    # str(): mypy держит сужение state до "running" после присваивания выше.
+    assert str(supervisor.state) == "stopped" and not supervisor.restarting
     assert supervisor.generation == 1
     assert events and all(event["generation"] == 1 for event in events)
     assert all(event["code"] == "worker-crashed" for event in events)

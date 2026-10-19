@@ -17,7 +17,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from queue import Queue
 from threading import Event, Thread
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -123,7 +123,10 @@ def test_cancel_waits_for_physical_close(make_worker: Any, finish: str, kind: st
 
     source = FaultSource()
     capture = AudioCapture(
-        source=source, on_samples=worker.on_samples, on_event=events.put, on_error=worker.on_error
+        source=cast(Any, source),
+        on_samples=worker.on_samples,
+        on_event=events.put,
+        on_error=worker.on_error,
     )
     worker.set_capture(capture)
     original_wait = capture.wait_stopped
@@ -132,7 +135,7 @@ def test_cancel_waits_for_physical_close(make_worker: Any, finish: str, kind: st
         waiting.set()
         original_wait(uid)
 
-    capture.wait_stopped = wait_stopped  # type: ignore[method-assign]
+    capture.wait_stopped = wait_stopped  # type: ignore[method-assign,assignment]
     replies: list[Message] = []
 
     def cancel() -> None:
@@ -200,7 +203,10 @@ def test_unknown_cancel_does_not_stop_another_capture(make_worker: Any, kind: st
 
     source = Source()
     capture = AudioCapture(
-        source=source, on_samples=worker.on_samples, on_event=events.put, on_error=worker.on_error
+        source=cast(Any, source),
+        on_samples=worker.on_samples,
+        on_event=events.put,
+        on_error=worker.on_error,
     )
     worker.set_capture(capture)
     try:

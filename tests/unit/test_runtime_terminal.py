@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import struct
 import subprocess
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock, call
 
 import pytest
@@ -328,7 +328,7 @@ def test_candidate_waits_for_capture_cleanup_after_error_tail_then_promotes(
 ) -> None:
     bench = SwitchRig(monkeypatch)
     rig, runtime = bench.rig, bench.rig.runtime
-    old = runtime.supervisor
+    old = cast(Any, runtime.supervisor)  # SwitchRig подменяет супервизор на Mock
     process = Mock()
     process.poll.return_value = None
     process.wait.side_effect = subprocess.TimeoutExpired("worker", 2)
@@ -354,7 +354,8 @@ def test_candidate_waits_for_capture_cleanup_after_error_tail_then_promotes(
         if loaded_at == "idle-cleanup":
             SwitchRig.emit(candidate, type="model.loaded", id="whisper")
         assert runtime.supervisor is old
-        assert runtime.phase == DictationPhase.IDLE
+        # mypy держит сужение phase до RECORDING из assert выше.
+        assert runtime.phase == DictationPhase.IDLE  # type: ignore[comparison-overlap]
         assert old.generation < candidate.generation
         assert runtime.orchestrator.cleanup_pending
         assert runtime.orchestrator._capture_open
@@ -383,7 +384,7 @@ def test_pending_switch_waits_for_microphone_cleanup_then_starts(
 ) -> None:
     bench = SwitchRig(monkeypatch)
     rig, runtime = bench.rig, bench.rig.runtime
-    old = runtime.supervisor
+    old = cast(Any, runtime.supervisor)  # SwitchRig подменяет супервизор на Mock
     try:
         assert runtime.start_test("test-mic", Mock())
         uid = old.send.call_args.args[0]["utterance_id"]
@@ -417,7 +418,7 @@ def test_candidate_is_not_promoted_when_old_process_stop_times_out(
 ) -> None:
     bench = SwitchRig(monkeypatch)
     runtime = bench.rig.runtime
-    old = runtime.supervisor
+    old = cast(Any, runtime.supervisor)  # SwitchRig подменяет супервизор на Mock
     process = Mock()
     process.poll.return_value = None
     process.wait.side_effect = subprocess.TimeoutExpired("worker", 2)
@@ -440,9 +441,11 @@ def test_candidate_is_not_promoted_when_old_process_stop_times_out(
         assert runtime._selfcheck == "failed"
         bench.rig.tray.set_state.assert_called_with(TrayState.ERROR)
         bench.rig.tray.set_model_recheck_enabled.assert_called_with(True)
-        old.send.reset_mock()
+        # `runtime.supervisor is old` выше сузил Any до WorkerSupervisor; send — Mock.
+        old_send = cast(Mock, old.send)
+        old_send.reset_mock()
         bench.rig.hotkey.fsm.press(bench.rig.now)
-        assert not any(c.args[0]["type"] == "record.start" for c in old.send.call_args_list)
+        assert not any(c.args[0]["type"] == "record.start" for c in old_send.call_args_list)
         bench.rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
         bench.rig.hotkey.fsm.escape(bench.rig.now)
         # После подтверждённого выхода старого процесса доступен явный повтор.
@@ -552,6 +555,7 @@ def test_protocol_mismatch_keeps_runtime_capture_guard_until_process_exit(
     process = Mock(poll=Mock(return_value=None))
     process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
     supervisor.process = process
+    launch = cast(Mock, supervisor._launch)  # restart_transport подменяет _launch на Mock
     send = Mock(wraps=supervisor.send)
     monkeypatch.setattr(supervisor, "send", send)
     try:
@@ -570,7 +574,7 @@ def test_protocol_mismatch_keeps_runtime_capture_guard_until_process_exit(
             assert rig.guard.set_recording.call_count == before
             rig.guard.set_recording.assert_called_with(True)
             assert runtime._terminated_generation is None
-            supervisor._launch.assert_not_called()
+            launch.assert_not_called()
         process.poll.return_value = -9
         process.wait.side_effect = None
         supervisor.pump()
@@ -583,7 +587,7 @@ def test_protocol_mismatch_keeps_runtime_capture_guard_until_process_exit(
         rig.hotkey.fsm.press(rig.now + 1)
         rig.pill.show_state.assert_called_with(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
         assert not any(c.args[0]["type"] == "record.start" for c in send.call_args_list)
-        supervisor._launch.assert_not_called()
+        launch.assert_not_called()
     finally:
         process.poll.return_value = -9
         process.wait.side_effect = None
@@ -658,7 +662,7 @@ def test_candidate_promotion_waits_for_restarting_supervisor(
 ) -> None:
     bench = SwitchRig(monkeypatch)
     runtime = bench.rig.runtime
-    old = runtime.supervisor
+    old = cast(Any, runtime.supervisor)  # SwitchRig подменяет супервизор на Mock
     try:
         bench.switch()
         candidate = bench.workers[-1]
@@ -669,7 +673,7 @@ def test_candidate_promotion_waits_for_restarting_supervisor(
             runtime._promote_candidate()
             runtime._run_pending_switch()
             assert runtime.supervisor is old and runtime._switch_candidate is candidate
-            old.stop.assert_not_called()
+            cast(Mock, old.stop).assert_not_called()  # is сузил Any до WorkerSupervisor
             bench.finished.assert_not_called()
         old.restarting = False
         runtime._on_worker_event({"type": "error", "code": "worker-crashed", "generation": 0})
@@ -724,7 +728,7 @@ def test_candidate_stop_failure_after_close_does_not_publish_load_error(
 ) -> None:
     bench = SwitchRig(monkeypatch)
     rig, runtime = bench.rig, bench.rig.runtime
-    old = runtime.supervisor
+    old = cast(Any, runtime.supervisor)  # SwitchRig подменяет супервизор на Mock
 
     def closed_during_stop() -> None:
         runtime._closed = True
@@ -745,6 +749,6 @@ def test_candidate_stop_failure_after_close_does_not_publish_load_error(
         rig.tray.set_state.assert_not_called()
         rig.tray.set_model_recheck_enabled.assert_not_called()
     finally:
-        old.stop.side_effect = None
+        cast(Mock, old.stop).side_effect = None  # is выше сузил Any до WorkerSupervisor
         runtime._closed = False
         runtime.shutdown()

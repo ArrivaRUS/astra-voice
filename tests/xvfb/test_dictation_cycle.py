@@ -102,6 +102,8 @@ class WavSupervisor(QObject):
         self.on_event = on_event
         self.generation = 1
         self.state = "new"
+        # Барьер рестарта WorkerSupervisor: процесса нет, рестарт не происходит.
+        self.restarting = False
         self.recording = False
         self.utterance_id = ""
         self.samples_read = 0
@@ -115,6 +117,11 @@ class WavSupervisor(QObject):
 
     def start(self) -> None:
         self.state = "running"
+
+    @property
+    def ready(self) -> bool:
+        # Совместимость протокола не проверяется: без процесса hello не нужен.
+        return self.state == "running"
 
     def queue_event(self, kind: str, **fields: object) -> None:
         self.pending.append(
@@ -291,9 +298,13 @@ def cycle(
     hotkey = FakeHotkey()
 
     def supervisor_factory(
-        *, on_event: Callable[[dict[str, Any]], None], use_qt: bool
+        *,
+        on_event: Callable[[dict[str, Any]], None],
+        use_qt: bool,
+        launch_allowed: Callable[[], bool] | None = None,
     ) -> WorkerSupervisor:
-        assert use_qt
+        # launch_allowed нужен только отложенному рестарту процесса — у WAV его нет.
+        assert use_qt and launch_allowed is not None
         return cast(WorkerSupervisor, WavSupervisor(source, on_event))
 
     runtime = DictationRuntime(

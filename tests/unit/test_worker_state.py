@@ -272,6 +272,9 @@ def test_cancel_after_recognize_error_closes_capture(
     events: list[Message] = []
     supervisor = WorkerSupervisor(events.append, use_qt=False)
     supervisor.state = "running"
+    # Барьер круга 7: record.* уходят только после hello текущего поколения.
+    supervisor._receive(encode(ipc.make_hello()), supervisor.generation)
+    events.clear()
 
     def exchange(kind: str) -> None:
         """Передаёт настоящие кадры между супервизором и воркером без UNIX-сокетов."""
@@ -1729,6 +1732,8 @@ def test_late_record_stop_through_supervisor_keeps_dictation(factory: Factory, c
         paste_mode=lambda: PasteMode.AUTO,
         record_params=lambda: {"limit_s": 1.0 if cause == "record.limit" else 120.0},
     )
+    # Барьер круга 7: record.* уходят только после hello текущего поколения.
+    supervisor._receive(encode(ipc.make_hello()), supervisor.generation)
 
     def worker_takes_frames() -> None:
         """GUI → воркер: все накопленные кадры разом, ответы остаются в буфере воркера."""
