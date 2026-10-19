@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import logging
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -20,6 +22,7 @@ from PyQt5.QtCore import QCoreApplication, QEvent
 from astra_voice.core import settings as settings_mod
 from astra_voice.core.policy import Policy
 from astra_voice.models.catalog import Catalog
+from astra_voice.models.store import StoreError
 from astra_voice.net.gate import NetworkGate
 from astra_voice.ui.bridges import SettingsBridge
 from astra_voice.ui.model_downloads import ModelDownloads
@@ -685,3 +688,111 @@ def test_refusal_text_depends_on_operation_without_download_failure(
     assert rig.card()["reason"] == message
     assert "Не удалось скачать" not in str(rig.card())
     assert rig.port.current == (FIRST.id, "r0")
+
+
+_STORE_WARNING = "Не удалось прочитать или изменить состояние моделей"
+
+
+def _store_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.getMessage() == _STORE_WARNING]
+
+
+@pytest.mark.parametrize("revert", [False, True])
+@pytest.mark.parametrize("error_type", [OSError, StoreError])
+@pytest.mark.parametrize("failed_read", ["current_ids", "previous_revision"])
+def test_ib40c_revision_store_read_error_does_not_crash(
+    rig: RevisionRig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    revert: bool,
+    error_type: type[Exception],
+    failed_read: str,
+) -> None:
+    rig.port.previous = "r-1"
+    rig.port.records[(FIRST.id, "r-1")] = "ok"
+    rig.port.revision_gate.set()
+    assert rig.card()["state"] == "update-available"
+    hints = dict(rig.downloads._card_hints)
+    hint_kinds = dict(rig.downloads._card_hint_kinds)
+    report = Mock(wraps=rig.downloads.report_store_error)
+    monkeypatch.setattr(rig.downloads, "report_store_error", report)
+    original = getattr(rig.port, failed_read)
+
+    def read(*args: Any, **kwargs: Any) -> Any:
+        # Ошибка ровно в чтении указателей перед запуском ревизии: значок
+        # карточки читает current_ids раньше и обрабатывает ошибку сам.
+        if sys._getframe(1).f_code.co_name == "_start_revision":
+            raise error_type("private/path model-id")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(rig.port, failed_read, read)
+    caplog.set_level(logging.WARNING)
+
+    if revert:
+        rig.bridge.revertModelPrevious(FIRST.id)
+    else:
+        rig.bridge.updateModel(FIRST.id)
+
+    report.assert_called_once_with()
+    assert len(_store_warnings(caplog)) == 1
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "private" not in caplog.text and "model-id" not in caplog.text
+    assert rig.idle()
+    assert rig.downloads._revision_entry is None
+    assert rig.downloads._revision_pause_pending is None
+    assert rig.downloads._card_hints == hints
+    assert rig.downloads._card_hint_kinds == hint_kinds
+    assert rig.port.revision_calls == []
+    assert rig.port.current_writes == []
+    assert rig.port.current == (FIRST.id, "r0")
+    assert rig.port.previous == "r-1"
+
+
+@pytest.mark.parametrize("revert", [False, True])
+@pytest.mark.parametrize("error_type", [OSError, StoreError])
+@pytest.mark.parametrize("failed_read", ["current_ids", "previous_revision"])
+def test_ib40c_pause_pending_survives_store_read_error(
+    rig: RevisionRig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    revert: bool,
+    error_type: type[Exception],
+    failed_read: str,
+) -> None:
+    switcher = Mock()
+    switcher.can_switch_without_pause.return_value = False
+    rig.downloads._switcher = switcher
+    switcher.on_switch_finished = rig.downloads._switch_finished
+    rig.port.previous = "r-1"
+    rig.port.records[(FIRST.id, "r-1")] = "ok"
+    rig.port.revision_gate.set()
+    if revert:
+        rig.bridge.revertModelPrevious(FIRST.id)
+    else:
+        rig.bridge.updateModel(FIRST.id)
+    pending = rig.downloads._revision_pause_pending
+    assert pending == (FIRST.id, revert)
+    hints = dict(rig.downloads._card_hints)
+    hint_kinds = dict(rig.downloads._card_hint_kinds)
+    assert hints
+    caplog.set_level(logging.WARNING)
+    with monkeypatch.context() as patch:
+        patch.setattr(rig.port, failed_read, Mock(side_effect=error_type("private/path model-id")))
+        rig.bridge.switchModelWithPause(FIRST.id)
+
+    assert len(_store_warnings(caplog)) == 1
+    assert "private" not in caplog.text and "model-id" not in caplog.text
+    assert rig.idle()
+    assert rig.downloads._revision_pause_pending == pending
+    assert rig.downloads._card_hints == hints
+    assert rig.downloads._card_hint_kinds == hint_kinds
+    switcher.switch_model.assert_not_called()
+    assert rig.port.revision_calls == []
+    assert rig.port.current == (FIRST.id, "r0")
+
+    # Состояние не тронуто: после восстановления хранилища пауза работает.
+    rig.bridge.switchModelWithPause(FIRST.id)
+    pump_until(rig.idle, "переключение с паузой после ошибки хранилища")
+    switcher.switch_model.assert_called_once_with(min_ram_mb=FIRST.min_ram_mb, pause=True)
+    switcher.on_switch_finished("ok")
+    assert rig.card()["state"] == "ok"

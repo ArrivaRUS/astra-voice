@@ -2500,13 +2500,21 @@ class ModelDownloads(QObject):
             self._card_hint_kinds[model_id] = "switch-pause"
             self._notify("modelsChanged")
             return
+        # Указатели читаются до любых изменений: ошибка хранилища в слоте QML
+        # не должна ронять программу и не должна сбрасывать паузу и подсказки.
+        try:
+            previous_current = self._model.current_ids() if self._model else None
+            previous = getattr(self._model, "previous_revision", None)
+            previous_revision = previous() if callable(previous) else None
+        except (OSError, StoreError):
+            self.report_store_error()
+            return
         with self._update():
             self._revision_pause_pending = None
             self._clear_card_hints()
             self._revision_revert, self._revision_pause = revert, pause
-            self._revision_previous_current = self._model.current_ids() if self._model else None
-            previous = getattr(self._model, "previous_revision", None)
-            self._revision_previous_revision = previous() if callable(previous) else None
+            self._revision_previous_current = previous_current
+            self._revision_previous_revision = previous_revision
             self._revision_activating = activating = threading.Event()
             self._model_cancel = threading.Event()
             set_cancel = getattr(self._model, "set_cancel", None)
