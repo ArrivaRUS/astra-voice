@@ -107,6 +107,12 @@ class Scenario:
         return document
 
 
+@pytest.fixture(autouse=True)
+def reset_snapshot_caches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(catalog_effective, "_snapshot_cache", None)
+    monkeypatch.setattr(catalog_effective, "_snapshot_rejection_cache", None)
+
+
 @pytest.fixture
 def scenario(tmp_path: Path) -> Scenario:
     root = tmp_path / "builtin"
@@ -645,12 +651,12 @@ def test_verify_helper_never_applies_state(
     assert not scenario.state.exists()
 
 
-def install_fixture(store: ModelStore, entry: CatalogEntry) -> None:
+def install_fixture(store: ModelStore, entry: CatalogEntry, *, activate: bool = True) -> None:
     staging = store.staging_dir(entry.id, entry.revision)
     for name, raw in CONTENTS.items():
         (staging / name).write_bytes(raw)
     result = Installer(store, lambda _directory, _entry: SmokeResult(True)).install_from_staging(
-        entry
+        entry, activate=activate
     )
     assert result.state == "ok", result.reason
 
@@ -983,7 +989,7 @@ def test_new_snapshot_signature_is_verified_once_per_exact_pair(
             catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
         assert refused.value.code == "revoked"
     assert scenario.verifier.calls == before + 1
-    # Та же raw, другая подпись: старый положительный результат не переиспользуется.
+    # Те же raw, другая подпись: нужна новая проверка, прежние отзывы кэша остаются.
     # T-233: отказ проверяем на безопасной ревизии, сохраняя известный отзыв X.
     scenario.snapshot(remote, valid_signature=False)
     for expected_calls in (before + 2, before + 2):  # Отказ проверки тоже кэшируется.
@@ -1503,10 +1509,9 @@ def test_t233_cached_revocation_survives_double_write_failure(
 
     service = revocation_service
     entry = service.catalog.entries[0]
-    install_fixture(service._store, entry)
-    install_fixture(service._store, replace(entry, revision=NEW_REVISION))
-    service.set_current(entry.id, NEW_REVISION)
-    before = (service._store.root / "current.json").read_bytes()
+    install_fixture(service._store, entry, activate=False)
+    current_path = service._store.root / "current.json"
+    assert not current_path.exists()
     scenario.snapshot(scenario.document)
     raw = prepare_revoking_refresh(scenario, source, monkeypatch)
     real_write = update_cache.write_private
@@ -1529,12 +1534,18 @@ def test_t233_cached_revocation_survives_double_write_failure(
     assert "Не удалось откатить снимок" in caplog.text
     assert str(scenario.snapshots) not in caplog.text
     assert catalog_effective.read_snapshot(scenario.snapshots) == (raw, signature(raw))
-    with pytest.raises(StoreError) as first:
-        service.set_current(entry.id, entry.revision)
-    assert first.value.code == "revoked"
+    # Быстрый путь обязан знать отзыв до первой активации после двойного сбоя.
+    for model in (service, None):
+        assert _revoked_check(model)(entry.id, entry.revision) is True
     cached = catalog_effective._snapshot_cache
     assert cached is not None and cached[1] is not None
     assert cached[1].is_revoked(entry.id, entry.revision)
+    assert cached[0] == (
+        hashlib.sha256(raw).hexdigest(),
+        hashlib.sha256(signature(raw)).hexdigest(),
+        scenario.root,
+        hashlib.sha256((scenario.root / "catalog.schema.json").read_bytes()).hexdigest(),
+    )
     verify_calls = scenario.verifier.calls
     snapshot_path = scenario.snapshots / catalog_effective.SNAPSHOT_FILE_NAME
     if damage == "eio":
@@ -1545,10 +1556,13 @@ def test_t233_cached_revocation_survives_double_write_failure(
         snapshot_path.unlink()
     else:
         scenario.snapshot_bytes(b"{", b"bad signature")
+    # Повреждение/ошибка чтения случились до полной активации: она не заполняла кэш.
+    for model in (service, None):
+        assert _revoked_check(model)(entry.id, entry.revision) is True
     with pytest.raises(StoreError) as second:
         service.set_current(entry.id, entry.revision)
     assert second.value.code == "revoked"
-    assert (service._store.root / "current.json").read_bytes() == before
+    assert not current_path.exists()
     snapshot_read = Mock(side_effect=AssertionError("Быстрый путь читает снимок"))
     monkeypatch.setattr(catalog_effective, "read_snapshot", snapshot_read)
     for model in (service, None):
@@ -1693,3 +1707,231 @@ def test_t233_cached_snapshot_without_marker_keeps_unreadable_failure_closed(
         service.set_current(entry.id, entry.revision)
     assert refused.value.code == ("revoked" if revoked else "catalog-unavailable")
     assert (service._store.root / "current.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("marker_damage", ["nonhex", "missing-revoked"])
+@pytest.mark.parametrize("known_revocation", [False, True])
+def test_t237_invalid_marker_does_not_hide_cached_revocation(
+    scenario: Scenario,
+    revocation_service: Any,
+    marker_damage: str,
+    known_revocation: bool,
+) -> None:
+    from astra_voice.app import _revoked_check
+    from astra_voice.core.model_source import ModelRevoked, RevocationUnknown, _not_revoked
+
+    entry = revocation_service.catalog.entries[0]
+    if known_revocation:
+        remote = scenario.remote()
+        remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+        scenario.snapshot(remote)
+        with pytest.raises(StoreError, match="отозвана"):
+            catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+    document = json.loads(scenario.state.read_bytes())
+    document.update(serial=6, sha256="a" * 64, revoked=[])
+    if marker_damage == "nonhex":
+        document["sha256"] = "z" * 64
+    else:
+        document.pop("revoked")
+    scenario.state.write_text(json.dumps(document))
+    checker = _revoked_check(None)
+    if known_revocation:
+        assert checker(entry.id, entry.revision) is True
+    else:
+        with pytest.raises(RevocationUnknown):
+            checker(entry.id, entry.revision)
+    request = {"id": entry.id, "revision": entry.revision}
+    if known_revocation:
+        with pytest.raises(ModelRevoked):
+            _not_revoked(request, checker)
+    else:
+        unknown = Mock()
+        assert _not_revoked(request, checker, unknown) is request
+        unknown.assert_called_once_with()
+    for include_snapshot in (False, True):
+        with pytest.raises(StoreError) as refused:
+            catalog_effective.check_revoked(
+                entry.id, entry.revision, None, include_snapshot=include_snapshot
+            )
+        assert refused.value.code == ("revoked" if known_revocation else "catalog-unavailable")
+
+    # Валидная новая отметка без X подавляет старый положительный кэш.
+    document.update(sha256="a" * 64, revoked=[])
+    scenario.state.write_text(json.dumps(document))
+    assert checker(entry.id, entry.revision) is False
+    request = {"id": entry.id, "revision": entry.revision}
+    assert _not_revoked(request, checker) is request
+    catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+
+
+@pytest.mark.parametrize(
+    "cached_pair,incoming_pair", [((1, 5), (1, 4)), ((1, 5), (1, 5)), ((2, 1), (1, 999))]
+)
+@pytest.mark.parametrize("remember_directly", [False, True])
+def test_t237_older_verified_snapshot_preserves_positive_cache(
+    scenario: Scenario,
+    revocation_service: Any,
+    cached_pair: tuple[int, int],
+    incoming_pair: tuple[int, int],
+    remember_directly: bool,
+) -> None:
+    from astra_voice.app import _revoked_check
+
+    entry = revocation_service.catalog.entries[0]
+    remote = scenario.remote(epoch=cached_pair[0], serial=cached_pair[1])
+    remote["revoked"] = [{"model_id": entry.id, "revision": entry.revision, "reason": "отзыв"}]
+    scenario.snapshot(remote)
+    with catalog_effective.CATALOG_LOCK:
+        cached, unknown = catalog_effective._pending_snapshot(None)
+        assert cached is not None and not unknown
+        positive = catalog_effective._snapshot_cache
+        incoming = scenario.remote(epoch=incoming_pair[0], serial=incoming_pair[1])
+        raw = scenario.snapshot(incoming)
+        if remember_directly:
+            verified = verify_catalog(
+                raw, signature(raw), scenario.verifier, schema_root=scenario.root
+            )
+            catalog_effective.remember_verified_snapshot(raw, signature(raw), verified)
+        else:
+            verified, unknown = catalog_effective._pending_snapshot(None)
+            assert verified is not None and not unknown
+        assert (verified.trust_epoch, verified.serial) == incoming_pair
+        assert not verified.is_revoked(entry.id, entry.revision)
+        assert catalog_effective._snapshot_cache is positive
+        assert catalog_effective.cached_pending_snapshot(None) is cached
+        assert cached.is_revoked(entry.id, entry.revision)
+        assert _revoked_check(None)(entry.id, entry.revision) is True
+
+
+@pytest.mark.parametrize("error_type", [MemoryError, KeyboardInterrupt, ValueError])
+@pytest.mark.parametrize("previous_snapshot", [False, True])
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_t238_any_publication_failure_rolls_back_or_remembers_revocation(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    revocation_service: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_type: type[BaseException],
+    previous_snapshot: bool,
+    rollback_fails: bool,
+) -> None:
+    from astra_voice.app import _revoked_check
+
+    entry = revocation_service.catalog.entries[0]
+    if previous_snapshot:
+        scenario.snapshot(scenario.document)
+    raw = prepare_revoking_refresh(scenario, source, monkeypatch)
+    snapshot_path = scenario.snapshots / catalog_effective.SNAPSHOT_FILE_NAME
+    snapshot_before = snapshot_path.read_bytes() if previous_snapshot else None
+    marker_before = scenario.state.read_bytes()
+    accepted, accepted_state = source._catalog, source._accepted
+    real_write, real_unlink = update_cache.write_private, Path.unlink
+    failure = error_type("сбой публикации")
+    calls = 0
+
+    def write_snapshot(path: Path, payload: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if rollback_fails and calls > 1:
+            raise OSError("сбой отката")
+        real_write(path, payload)
+
+    def unlink_snapshot(path: Path, missing_ok: bool = False) -> None:
+        if rollback_fails and path == snapshot_path:
+            raise OSError("сбой отката")
+        real_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as fault, caplog.at_level(logging.WARNING):
+        fault.setattr(catalog_state, "apply_state", Mock(side_effect=failure))
+        fault.setattr(update_cache, "write_private", write_snapshot)
+        fault.setattr(Path, "unlink", unlink_snapshot)
+        with pytest.raises(CatalogError if error_type is ValueError else error_type) as refused:
+            source.refresh(threading.Event())
+    if error_type is ValueError:
+        assert isinstance(refused.value, CatalogError) and refused.value.code == "stale-catalog"
+    else:
+        assert refused.value is failure
+    assert scenario.state.read_bytes() == marker_before
+    assert source._catalog is accepted and source._accepted == accepted_state
+    assert source._blocked is rollback_fails
+    if rollback_fails:
+        assert "Не удалось откатить снимок" in caplog.text
+        assert catalog_effective.read_snapshot(scenario.snapshots) == (raw, signature(raw))
+        snapshot_path.write_bytes(b"{")
+        assert _revoked_check(None)(entry.id, entry.revision) is True
+        with pytest.raises(StoreError) as revoked:
+            catalog_effective.check_revoked(entry.id, entry.revision, None, include_snapshot=True)
+        assert revoked.value.code == "revoked"
+    else:
+        assert (snapshot_path.read_bytes() if snapshot_path.exists() else None) == snapshot_before
+        assert catalog_effective.cached_pending_snapshot(None) is None
+        assert source.current() is accepted
+
+
+@pytest.mark.parametrize("error_type", [MemoryError, KeyboardInterrupt, ValueError])
+def test_t238_failure_after_marker_replace_preserves_accepted_pair(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[BaseException],
+) -> None:
+    raw = prepare_revoking_refresh(scenario, source, monkeypatch)
+    apply_state = catalog_state.apply_state
+    failure = error_type("сбой после замены отметки")
+
+    def apply_then_fail(path: Path, state: catalog_state.CatalogState) -> None:
+        apply_state(path, state)
+        raise failure
+
+    with monkeypatch.context() as fault:
+        fault.setattr(catalog_state, "apply_state", apply_then_fail)
+        with pytest.raises(CatalogError if error_type is ValueError else error_type) as refused:
+            source.refresh(threading.Event())
+    if error_type is ValueError:
+        assert isinstance(refused.value, CatalogError) and refused.value.code == "stale-catalog"
+    else:
+        assert refused.value is failure
+    assert not source._blocked
+    assert source.current().serial == 5
+    assert catalog_state.read_state(scenario.state) == source._accepted
+    assert catalog_effective.read_snapshot(scenario.snapshots) == (raw, signature(raw))
+
+
+@pytest.mark.parametrize(
+    "cache_error", [OSError, ValueError, RuntimeError, MemoryError, KeyboardInterrupt]
+)
+@pytest.mark.parametrize("publication_error", [OSError, MemoryError, KeyboardInterrupt, ValueError])
+def test_t238_remember_failure_does_not_mask_publication_failure(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cache_error: type[BaseException],
+    publication_error: type[BaseException],
+) -> None:
+    prepare_revoking_refresh(scenario, source, monkeypatch)
+    snapshot_path = scenario.snapshots / catalog_effective.SNAPSHOT_FILE_NAME
+    original_unlink = Path.unlink
+    failure = publication_error("исходный сбой")
+
+    def fail_unlink(path: Path, missing_ok: bool = False) -> None:
+        if path == snapshot_path:
+            raise OSError("сбой отката")
+        original_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as fault, caplog.at_level(logging.WARNING):
+        fault.setattr(catalog_state, "apply_state", Mock(side_effect=failure))
+        fault.setattr(Path, "unlink", fail_unlink)
+        fault.setattr(catalog_updates, "remember_verified_snapshot", Mock(side_effect=cache_error))
+        with pytest.raises(
+            CatalogError if publication_error in (OSError, ValueError) else publication_error
+        ) as refused:
+            source.refresh(threading.Event())
+    if publication_error in (OSError, ValueError):
+        expected_code = "state-write" if publication_error is OSError else "stale-catalog"
+        assert isinstance(refused.value, CatalogError) and refused.value.code == expected_code
+    else:
+        assert refused.value is failure
+    assert source._blocked
+    assert "Не удалось сохранить проверенные отзывы" in caplog.text

@@ -6,6 +6,8 @@ import atexit
 import hashlib
 import json
 import logging
+import socket
+import subprocess
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -6087,4 +6089,93 @@ def test_t234_revoked_ordinary_worker_is_replaced_outside_catalog_lock(
         old.send.assert_not_called()
         old.stop.assert_called_once_with()
     finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("level_active", [False, True], ids=["idle", "level-recording"])
+def test_t239_revoked_worker_stop_failure_closes_ipc_and_kills_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, level_active: bool
+) -> None:
+    """Ошибка настоящего stop до socket.close не оставляет отозванный процесс."""
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
+    runtime = rig.runtime
+    old = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    old.state = "running"
+    connection = Mock(spec=socket.socket)
+    connection.send.side_effect = len
+    old._socket = connection
+    old._notifier = Mock()
+    old._notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+    process = Mock(spec=subprocess.Popen)
+    process.poll.return_value = None
+    old.process = process
+    runtime.supervisor = old
+    send = Mock(wraps=old.send)
+    monkeypatch.setattr(old, "send", send)
+    clean = Mock(state="running", generation=old.generation + 1)
+    rig.supervisor_factory.return_value = clean
+    try:
+        if level_active:
+            assert runtime.start_level_monitor("default", Mock()) is True
+            assert send.call_args.args[0]["type"] == "record.start"
+        publish_runtime_revocation(tmp_path)
+        send.reset_mock()
+
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+
+        connection.close.assert_called_once_with()
+        assert old._socket is None
+        process.kill.assert_called_once_with()
+        process.terminate.assert_not_called()
+        process.wait.assert_not_called()
+        assert old.state == "stopped"
+        assert runtime.supervisor is clean
+        clean.start.assert_called_once_with()
+        assert runtime._selfcheck == "failed"
+        if not level_active:
+            assert runtime.start_level_monitor("default", Mock()) is True
+            assert clean.send.call_args.args[0]["type"] == "record.start"
+        send.assert_not_called()
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("stop_action", ["shutdown", "appimage-removal"])
+def test_revoked_worker_replacement_stays_closed_after_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stop_action: str
+) -> None:
+    """Повторный вход при stop не запускает воркер после завершения или резерва."""
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
+    runtime = rig.runtime
+    old = rig.supervisor
+    clean = Mock(state="new", generation=old.generation + 1)
+    rig.supervisor_factory.return_value = clean
+    rig.supervisor_factory.reset_mock()
+    rig.hotkey.has_pending_press = False
+
+    def stop() -> None:
+        rig.stop_worker()
+        if stop_action == "shutdown":
+            runtime.shutdown()
+        else:
+            assert runtime.reserve_appimage_removal() is True
+
+    old.stop.side_effect = stop
+    try:
+        publish_runtime_revocation(tmp_path)
+
+        runtime._on_worker_event(
+            {"generation": old.generation, "type": "model.loaded", "id": "gigaam", "revision": "r1"}
+        )
+
+        assert old.stop.called
+        assert old.state == "stopped"
+        assert runtime.supervisor is old
+        assert runtime._selfcheck == "failed"
+        assert runtime._closed or runtime._appimage_removal_reserved
+        rig.supervisor_factory.assert_not_called()
+        clean.start.assert_not_called()
+        assert runtime.start_level_monitor("default", Mock()) is False
+    finally:
+        old.stop.side_effect = rig.stop_worker
         runtime.shutdown()

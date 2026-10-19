@@ -1915,7 +1915,13 @@ class DictationRuntime(QObject):
         # Барьер ready уже отпустил CATALOG_LOCK. Новый процесс обслуживает
         # измеритель уровня, но failed запрещает ему загружать модель на hello.
         generation = self.supervisor.generation + 1
-        self._cleanup("отозванный воркер", self.supervisor.stop)
+        try:
+            self.supervisor.stop()
+        except Exception:
+            log.warning("Ошибка завершения диктовки: отозванный воркер")
+            self._cleanup("аварийная остановка отозванного воркера", self.supervisor.kill)
+        if self._closed or self._appimage_removal_reserved:
+            return
         self.supervisor = self._supervisor_factory(on_event=self._on_worker_event, use_qt=True)
         self.supervisor.generation = generation
         self._model_load_generation = None

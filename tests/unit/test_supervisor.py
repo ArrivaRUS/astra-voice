@@ -422,6 +422,96 @@ def test_stop_escalates_to_sigkill() -> None:
     assert process.wait.call_args_list[0].kwargs == {"timeout": 2}
 
 
+@pytest.mark.parametrize("qt_resource", ["notifier", "timer"])
+def test_kill_closes_ipc_and_all_processes_after_qt_stop_failure(qt_resource: str) -> None:
+    """T-239: удалённый объект Qt не оставляет IPC и процессы живыми."""
+    supervisor = WorkerSupervisor(lambda message: None, use_qt=False)
+    supervisor.state = "running"
+    connection = Mock(spec=socket.socket)
+    supervisor._socket = connection
+    notifier = Mock()
+    timer = Mock()
+    supervisor._notifier = notifier
+    supervisor._timer = timer
+    if qt_resource == "notifier":
+        notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+        notifier.deleteLater.side_effect = RuntimeError("Объект Qt удалён")
+    else:
+        timer.stop.side_effect = RuntimeError("Объект Qt удалён")
+        timer.deleteLater.side_effect = RuntimeError("Объект Qt удалён")
+    process = Mock(spec=subprocess.Popen)
+    retired = Mock(spec=subprocess.Popen)
+    exited = Mock(spec=subprocess.Popen)
+    process.poll.return_value = retired.poll.return_value = None
+    exited.poll.return_value = 0
+    supervisor.process = process
+    supervisor._retired = [retired, exited]
+    supervisor._pending[("utterance", "level")] = _Pending(None, 0, "record.start", None)
+    supervisor._outgoing.extend(b"pending")
+
+    with pytest.raises(RuntimeError, match="Объект Qt удалён"):
+        supervisor.stop()
+    connection.close.assert_not_called()
+
+    supervisor.kill()
+
+    assert supervisor.state == "stopped"
+    assert supervisor._socket is None
+    connection.close.assert_called_once_with()
+    process.kill.assert_called_once_with()
+    retired.kill.assert_called_once_with()
+    exited.kill.assert_not_called()
+    for child in (process, retired, exited):
+        child.wait.assert_not_called()
+    assert supervisor._notifier is None
+    assert supervisor._timer is None
+    assert not supervisor._pending
+    assert not supervisor._outgoing
+    with pytest.raises(RuntimeError, match="Воркер не запущен"):
+        supervisor.send({"type": "record.start", "utterance_id": "next"})
+
+
+def test_kill_continues_after_retired_process_signal_failure() -> None:
+    """Отказ SIGKILL одному процессу не отменяет остальные попытки."""
+    supervisor = WorkerSupervisor(lambda message: None, use_qt=False)
+    retired = Mock(spec=subprocess.Popen)
+    current = Mock(spec=subprocess.Popen)
+    retired.poll.return_value = current.poll.return_value = None
+    retired.kill.side_effect = ProcessLookupError("Процесс уже завершился")
+    supervisor._retired = [retired]
+    supervisor.process = current
+
+    supervisor.kill()
+
+    retired.kill.assert_called_once_with()
+    current.kill.assert_called_once_with()
+    retired.wait.assert_not_called()
+    current.wait.assert_not_called()
+
+
+@pytest.mark.parametrize("failed_operation", ["terminate", "wait"])
+def test_stop_failure_preserves_retired_processes_for_emergency_kill(failed_operation: str) -> None:
+    """Сбой штатной остановки не теряет ещё не обработанные процессы."""
+    supervisor = WorkerSupervisor(lambda message: None, use_qt=False)
+    processes = [Mock(spec=subprocess.Popen) for _ in range(3)]
+    for process in processes:
+        process.poll.return_value = None
+    supervisor._retired = processes[:2]
+    supervisor.process = processes[2]
+    getattr(processes[0], failed_operation).side_effect = OSError("Ошибка остановки")
+
+    with pytest.raises(OSError, match="Ошибка остановки"):
+        supervisor.stop()
+    assert supervisor._retired == processes[:2]
+
+    supervisor.kill()
+
+    for process in processes:
+        process.kill.assert_called_once_with()
+    processes[1].wait.assert_not_called()
+    processes[2].wait.assert_not_called()
+
+
 @pytest.mark.parametrize("timeout", [None, 120.0])
 def test_transcribe_file_correlates_with_service_id(timeout: float | None) -> None:
     """Запрос без id получает result с контрактным id file, без dropped_late."""

@@ -54,7 +54,7 @@ import requests
 
 from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
-from astra_voice.models import catalog_state
+from astra_voice.models import catalog_effective, catalog_state
 from astra_voice.models.catalog import CATALOG_MAX_BYTES, Catalog, CatalogError, load_builtin
 from astra_voice.models.store import ModelRecord
 from astra_voice.net import http
@@ -71,6 +71,12 @@ KEYRING = DATA_ROOT / "keys/release.gpg"
 DAY = 24 * 3600.0
 T0 = 1_790_000_000.0
 CATALOG_PATH = "/astra-voice/catalog.json"
+
+
+@pytest.fixture(autouse=True)
+def reset_snapshot_caches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(catalog_effective, "_snapshot_cache", None)
+    monkeypatch.setattr(catalog_effective, "_snapshot_rejection_cache", None)
 
 
 @pytest.fixture

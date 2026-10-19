@@ -25,7 +25,7 @@ from astra_voice.core.policy import Policy, PolicyStatus, effective
 from astra_voice.core.policy import load as load_policy
 from astra_voice.core.release_identity import catalog_default_url
 from astra_voice.core.settings import Settings
-from astra_voice.models import catalog_state
+from astra_voice.models import catalog_effective, catalog_state
 from astra_voice.models.catalog import Catalog, CatalogEntry, CatalogError, FileSpec, load_builtin
 from astra_voice.models.installer import Installer, SmokeResult
 from astra_voice.models.store import ModelStore, StoreError
@@ -96,6 +96,12 @@ class WiringRig:
             finished = threading.Event()
             self.checker._request(action=finished.set)
             assert finished.wait(5), "планировщик не обработал очередь"
+
+
+@pytest.fixture(autouse=True)
+def reset_snapshot_caches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(catalog_effective, "_snapshot_cache", None)
+    monkeypatch.setattr(catalog_effective, "_snapshot_rejection_cache", None)
 
 
 @pytest.fixture
@@ -476,7 +482,11 @@ def test_catalog_refresh_precedes_hf_comparison(
 
 
 class CatalogVerifier(Verifier):
-    """Криптографическая граница, как StubVerifier в исходных каталоговых тестах."""
+    """Фиктивная подпись: здесь проверяется проводка, а не криптография.
+
+    Непривязанные к байтам подписи допустимы только с этим стабом; проверки
+    точной пары и отзывов находятся в test_catalog_effective с BoundVerifier.
+    """
 
     def __init__(self) -> None:
         super().__init__("catalog", keyring=DATA_ROOT / "keys/release.gpg")
@@ -790,6 +800,8 @@ def test_catalog_write_failure_blocks_publication_and_preserves_recoverable_stat
     original_state_write = catalog_state.write_state
     # T-233: обычный сбой откатывает снимок; восстановление нового требует двойного сбоя.
     if failed_write == "watermark":
+        # Подпись фиктивная: здесь проверяется побайтовый откат снимка,
+        # криптографическая проверка подписи не является целью этого теста.
         original_snapshot_write(
             snapshot,
             json.dumps(

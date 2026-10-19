@@ -10,6 +10,7 @@ import sys
 import time
 from collections import deque
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -463,7 +464,6 @@ class WorkerSupervisor:
         self.state = "stopped"
         self._close_connection()
         processes = list(self._retired)
-        self._retired.clear()
         if self.process is not None and self.process not in processes:
             processes.append(self.process)
         for process in processes:
@@ -474,3 +474,33 @@ class WorkerSupervisor:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
+        self._retired.clear()
+
+    def kill(self) -> None:
+        """Аварийно закрывает IPC и убивает все процессы без ожидания и callback."""
+        self.state = "stopped"
+        notifier, self._notifier = self._notifier, None
+        timer, self._timer = self._timer, None
+        if notifier is not None:
+            with suppress(RuntimeError):
+                notifier.setEnabled(False)
+            with suppress(RuntimeError):
+                notifier.deleteLater()
+        if timer is not None:
+            with suppress(RuntimeError):
+                timer.stop()
+            with suppress(RuntimeError):
+                timer.deleteLater()
+        connection, self._socket = self._socket, None
+        if connection is not None:
+            with suppress(OSError):
+                connection.close()
+        self._pending.clear()
+        self._finished.clear()
+        self._outgoing.clear()
+        if self.process is not None and self.process not in self._retired:
+            self._retired.append(self.process)
+        for process in self._retired:
+            with suppress(OSError):
+                if process.poll() is None:
+                    process.kill()

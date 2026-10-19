@@ -41,7 +41,7 @@ _snapshot_cache: tuple[tuple[str, str, Path, str], Catalog | None] | None = None
 _snapshot_rejection_cache: tuple[str, str, Path, str] | None = None
 
 
-def _cached_pending_snapshot(marker: catalog_state.CatalogState | None) -> Catalog | None:
+def cached_pending_snapshot(marker: catalog_state.CatalogState | None) -> Catalog | None:
     """Возвращает только проверенный кэш новее отметки, не читая снимок."""
     if _snapshot_cache is None or _snapshot_cache[0][2] != paths.data_dir_static():
         return None
@@ -51,6 +51,54 @@ def _cached_pending_snapshot(marker: catalog_state.CatalogState | None) -> Catal
     ):
         return cached
     return None
+
+
+def _snapshot_key(raw: bytes, signature: bytes) -> tuple[str, str, Path, str]:
+    root = paths.data_dir_static()
+    schema_sha = hashlib.sha256(
+        read_private(root / "catalog.schema.json", CATALOG_MAX_BYTES)
+    ).hexdigest()
+    return hashlib.sha256(raw).hexdigest(), hashlib.sha256(signature).hexdigest(), root, schema_sha
+
+
+def _remember_verified_snapshot(key: tuple[str, str, Path, str], catalog: Catalog) -> None:
+    global _snapshot_cache
+    previous = None if _snapshot_cache is None else _snapshot_cache[1]
+    if previous is None or (catalog.trust_epoch, catalog.serial) > (
+        previous.trust_epoch,
+        previous.serial,
+    ):
+        _snapshot_cache = (key, catalog)
+
+
+def remember_verified_snapshot(raw: bytes, signature: bytes, catalog: Catalog) -> None:
+    """Запоминает уже проверенные байты, не заменяя старший положительный кэш.
+
+    Вызывающий передаёт результат полной проверки именно этой пары. При сбое
+    отката снимка это сохраняет известные отзывы до следующей принятой отметки.
+    """
+    with CATALOG_LOCK:
+        _remember_verified_snapshot(_snapshot_key(raw, signature), catalog)
+
+
+def read_revocation_marker() -> tuple[catalog_state.CatalogState | None, bool]:
+    """Читает отметку отзывов: отсутствие допустимо, повреждение — неизвестность."""
+    try:
+        marker_path = catalog_state.state_path(paths.state_dir())
+        try:
+            marker_path.lstat()
+        except FileNotFoundError:
+            return None, False
+        marker = catalog_state.read_state(marker_path)
+    except (OSError, paths.PathError, ValueError, RecursionError):
+        return None, True
+    if (
+        marker is None
+        or re.fullmatch(r"[0-9a-f]{64}", marker.sha256) is None
+        or marker.revoked is None
+    ):
+        return None, True
+    return marker, False
 
 
 class _SnapshotVerifier(Verifier):
@@ -94,7 +142,7 @@ def _pending_snapshot(
     try:
         raw, signature = read_snapshot(directory)
     except FileNotFoundError:
-        return _cached_pending_snapshot(marker), False
+        return cached_pending_snapshot(marker), False
     except (OSError, ValueError, TypeError, RecursionError, CatalogError):
         return _unreadable_pair(marker)
     digest = hashlib.sha256(raw).hexdigest()
@@ -114,11 +162,8 @@ def _pending_snapshot(
         # отозвать версию может лишь результат полной проверки ниже.
         if marker is not None and (epoch, serial) <= (marker.trust_epoch, marker.serial):
             return None, False
-        root = paths.data_dir_static()
-        schema_sha = hashlib.sha256(
-            read_private(root / "catalog.schema.json", CATALOG_MAX_BYTES)
-        ).hexdigest()
-        key = (digest, hashlib.sha256(signature).hexdigest(), root, schema_sha)
+        key = _snapshot_key(raw, signature)
+        root = key[2]
         if _snapshot_rejection_cache == key:
             raise CatalogError("bad-signature", "Снимок каталога уже не прошёл проверку.")
         if _snapshot_cache is not None and _snapshot_cache[0] == key:
@@ -140,7 +185,7 @@ def _pending_snapshot(
                 if _snapshot_cache is None or _snapshot_cache[1] is None:
                     _snapshot_cache = (key, None)
             raise
-        _snapshot_cache = (key, snapshot)
+        _remember_verified_snapshot(key, snapshot)
         _snapshot_rejection_cache = None
         return snapshot, False
     except (OSError, ValueError, TypeError, RecursionError, CatalogError):
@@ -152,7 +197,7 @@ def _unreadable_pair(
     marker: catalog_state.CatalogState | None,
 ) -> tuple[Catalog | None, bool]:
     """Пара снимка не читается: при отметке пропуск, без неё отзывы неизвестны."""
-    cached = _cached_pending_snapshot(marker)
+    cached = cached_pending_snapshot(marker)
     if marker is not None:
         log.warning("Сохранённый снимок каталога повреждён и пропущен: действует отметка.")
         return cached, False
@@ -180,30 +225,10 @@ def check_revoked(
     with CATALOG_LOCK:
         if catalog is not None and catalog.is_revoked(model_id, revision):
             raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
-        marker = None
-        marker_error = False
-        marker_path = catalog_state.state_path(paths.state_dir())
-        try:
-            marker_path.lstat()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            marker_error = True
-        else:
-            try:
-                marker = catalog_state.read_state(marker_path)
-            except (OSError, ValueError, RecursionError):
-                marker = None
-            if (
-                marker is None
-                or re.fullmatch(r"[0-9a-f]{64}", marker.sha256) is None
-                or marker.revoked is None
-            ):
-                marker = None
-                marker_error = True
-            elif (model_id, revision) in marker.revoked:
-                raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
-        cached = _cached_pending_snapshot(marker)
+        marker, marker_error = read_revocation_marker()
+        if marker is not None and (model_id, revision) in (marker.revoked or ()):
+            raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
+        cached = cached_pending_snapshot(marker)
         if cached is not None and cached.is_revoked(model_id, revision):
             raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
         snapshot_error = False

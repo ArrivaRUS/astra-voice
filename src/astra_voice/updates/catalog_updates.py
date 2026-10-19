@@ -23,6 +23,7 @@ from astra_voice.models.catalog_effective import (
     SNAPSHOT_MAX_BYTES,
     load_effective,
     read_snapshot,
+    remember_verified_snapshot,
     state_of,
     verify_catalog,
 )
@@ -412,10 +413,15 @@ class CatalogUpdateSource:
                             update_cache.write_private(self._snapshot, snapshot)
                         self._watermark.parent.mkdir(parents=True, exist_ok=True)
                         catalog_state.apply_state(self._watermark, candidate)
-                    except OSError:
+                    except BaseException:
                         # fsync каталога может упасть уже после замены отметки.
                         # Принятую пару в этом случае откатывать нельзя.
-                        if catalog_state.read_state(self._watermark) == candidate:
+                        try:
+                            accepted = catalog_state.read_state(self._watermark) == candidate
+                        except BaseException:
+                            accepted = False
+                            log.warning("Не удалось прочитать отметку каталога после сбоя записи.")
+                        if accepted:
                             self._catalog = catalog
                             self._accepted = candidate
                             self._initialized = True
@@ -426,10 +432,16 @@ class CatalogUpdateSource:
                                     self._snapshot.unlink(missing_ok=True)
                                 else:
                                     update_cache.write_private(self._snapshot, previous_snapshot)
-                            except OSError:
+                            except BaseException:
                                 log.warning(
                                     "Не удалось откатить снимок каталога после сбоя записи."
                                 )
+                                try:
+                                    remember_verified_snapshot(raw, signature, catalog)
+                                except BaseException:
+                                    log.warning(
+                                        "Не удалось сохранить проверенные отзывы каталога в памяти."
+                                    )
                             else:
                                 self._blocked = False
                         raise
