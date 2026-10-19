@@ -21,6 +21,7 @@ from astra_voice.models.catalog_effective import (
     SIGNATURE_MAX_BYTES,
     SNAPSHOT_FILE_NAME,
     SNAPSHOT_MAX_BYTES,
+    _snapshot_key,
     load_effective,
     read_snapshot,
     remember_verified_snapshot,
@@ -402,6 +403,9 @@ class CatalogUpdateSource:
                         previous_snapshot = read_private(self._snapshot, SNAPSHOT_MAX_BYTES)
                     except (OSError, ValueError):
                         previous_snapshot = None
+                    # Ключ читает схему: готовим его до любых записей, чтобы
+                    # аварийное сохранение проверенных отзывов не зависело от I/O.
+                    snapshot_key = _snapshot_key(raw, signature)
                     self._blocked = True
                     try:
                         try:
@@ -419,6 +423,8 @@ class CatalogUpdateSource:
                         try:
                             accepted = catalog_state.read_state(self._watermark) == candidate
                         except BaseException:
+                            # Вторичное прерывание уступает первичному, которое
+                            # пробрасывается ниже; refresh выполняется в фоне.
                             accepted = False
                             log.warning("Не удалось прочитать отметку каталога после сбоя записи.")
                         if accepted:
@@ -437,7 +443,7 @@ class CatalogUpdateSource:
                                     "Не удалось откатить снимок каталога после сбоя записи."
                                 )
                                 try:
-                                    remember_verified_snapshot(raw, signature, catalog)
+                                    remember_verified_snapshot(snapshot_key, catalog)
                                 except BaseException:
                                     log.warning(
                                         "Не удалось сохранить проверенные отзывы каталога в памяти."

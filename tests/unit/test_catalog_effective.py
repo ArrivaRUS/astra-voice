@@ -1791,7 +1791,9 @@ def test_t237_older_verified_snapshot_preserves_positive_cache(
             verified = verify_catalog(
                 raw, signature(raw), scenario.verifier, schema_root=scenario.root
             )
-            catalog_effective.remember_verified_snapshot(raw, signature(raw), verified)
+            catalog_effective.remember_verified_snapshot(
+                catalog_effective._snapshot_key(raw, signature(raw)), verified
+            )
         else:
             verified, unknown = catalog_effective._pending_snapshot(None)
             assert verified is not None and not unknown
@@ -1935,3 +1937,127 @@ def test_t238_remember_failure_does_not_mask_publication_failure(
         assert refused.value is failure
     assert source._blocked
     assert "Не удалось сохранить проверенные отзывы" in caplog.text
+
+
+@pytest.mark.parametrize("damage", ["eio", "json", "missing", "catalog-json"])
+def test_t281_known_revocation_survives_schema_eio_and_publication_failures(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    revocation_service: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    """После принятия отзыва аварийный кэш не зависит от нового чтения схемы."""
+    from astra_voice.app import _revoked_check
+
+    service = revocation_service
+    entry = service.catalog.entries[0]
+    install_fixture(service._store, entry, activate=False)
+    current_path = service._store.root / "current.json"
+    scenario.snapshot(scenario.document)
+    prepare_revoking_refresh(scenario, source, monkeypatch)
+    marker_before = scenario.state.read_bytes()
+    real_read = catalog_effective.read_private
+    real_write = update_cache.write_private
+    schema_failed = False
+    publication_writes = 0
+    schema_reads_after_failure = 0
+
+    def fail_schema(path: Path, limit: int) -> bytes:
+        nonlocal schema_reads_after_failure
+        if path == scenario.root / "catalog.schema.json" and schema_failed:
+            schema_reads_after_failure += 1
+            raise OSError(5, "EIO")
+        return real_read(path, limit)
+
+    def fail_marker(*args: Any, **kwargs: Any) -> None:
+        nonlocal schema_failed
+        schema_failed = True
+        raise OSError("сбой записи отметки")
+
+    def fail_rollback(path: Path, payload: bytes) -> None:
+        nonlocal publication_writes
+        publication_writes += 1
+        if publication_writes > 1:
+            raise OSError("сбой отката снимка")
+        real_write(path, payload)
+
+    monkeypatch.setattr(catalog_effective, "read_private", fail_schema)
+    monkeypatch.setattr(catalog_state, "write_state", fail_marker)
+    monkeypatch.setattr(update_cache, "write_private", fail_rollback)
+    with pytest.raises(CatalogError) as refused:
+        source.refresh(threading.Event())
+    assert refused.value.code == "state-write"
+    assert schema_failed and publication_writes == 2
+    assert source._blocked
+    assert scenario.state.read_bytes() == marker_before
+    # В частности, до первой активации и до чтения повреждённого снимка.
+    for model in (service, None):
+        assert _revoked_check(model)(entry.id, entry.revision) is True
+    assert schema_reads_after_failure == 0
+
+    snapshot_path = scenario.snapshots / catalog_effective.SNAPSHOT_FILE_NAME
+    if damage == "eio":
+        monkeypatch.setattr(catalog_effective, "read_snapshot", Mock(side_effect=OSError(5, "EIO")))
+    elif damage == "json":
+        snapshot_path.write_bytes(b"{")
+    elif damage == "missing":
+        snapshot_path.unlink()
+    else:
+        # Писатель публикации подменён: записываем испорченную пару напрямую.
+        snapshot_path.write_text(json.dumps({"raw": "ew==", "signature": "YmFk"}))
+    for model in (service, None):
+        assert _revoked_check(model)(entry.id, entry.revision) is True
+    with pytest.raises(StoreError) as activation:
+        service.set_current(entry.id, entry.revision)
+    assert activation.value.code == "revoked"
+    assert not current_path.exists()
+
+
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+def test_t281_schema_key_failure_precedes_all_publication_writes(
+    scenario: Scenario,
+    source: catalog_updates.CatalogUpdateSource,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    """Нельзя начинать публикацию, если аварийный ключ не удалось подготовить."""
+    monkeypatch.setattr(paths, "data_dir_static", lambda: scenario.root)
+    scenario.snapshot(scenario.document)
+    prepare_revoking_refresh(scenario, source, monkeypatch)
+    snapshot_path = scenario.snapshots / catalog_effective.SNAPSHOT_FILE_NAME
+    snapshot_before = snapshot_path.read_bytes()
+    marker_before = scenario.state.read_bytes()
+    verify = catalog_updates.verify_catalog
+    read = catalog_effective.read_private
+    verified = False
+    key_reads = 0
+
+    def verify_then_fail_schema(*args: Any, **kwargs: Any) -> Catalog:
+        nonlocal verified
+        catalog = verify(*args, **kwargs)
+        verified = True
+        return catalog
+
+    def fail_key_read(path: Path, limit: int) -> bytes:
+        nonlocal key_reads
+        if verified and path == scenario.root / "catalog.schema.json":
+            key_reads += 1
+            assert source._blocked is False
+            raise error_type("сбой подготовки ключа")
+        return read(path, limit)
+
+    write_snapshot = Mock(wraps=update_cache.write_private)
+    write_marker = Mock(wraps=catalog_state.write_state)
+    monkeypatch.setattr(catalog_updates, "verify_catalog", verify_then_fail_schema)
+    monkeypatch.setattr(catalog_effective, "read_private", fail_key_read)
+    monkeypatch.setattr(update_cache, "write_private", write_snapshot)
+    monkeypatch.setattr(catalog_state, "write_state", write_marker)
+    with pytest.raises(CatalogError):
+        source.refresh(threading.Event())
+    assert verified and key_reads == 1
+    write_snapshot.assert_not_called()
+    write_marker.assert_not_called()
+    assert snapshot_path.read_bytes() == snapshot_before
+    assert scenario.state.read_bytes() == marker_before
+    assert source._blocked is False

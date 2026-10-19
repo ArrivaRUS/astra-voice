@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -462,7 +462,7 @@ def test_kill_closes_ipc_and_all_processes_after_qt_stop_failure(qt_resource: st
     retired.kill.assert_called_once_with()
     exited.kill.assert_not_called()
     for child in (process, retired, exited):
-        child.wait.assert_not_called()
+        child.wait.assert_called_once_with(timeout=0.2)
     assert supervisor._notifier is None
     assert supervisor._timer is None
     assert not supervisor._pending
@@ -485,8 +485,8 @@ def test_kill_continues_after_retired_process_signal_failure() -> None:
 
     retired.kill.assert_called_once_with()
     current.kill.assert_called_once_with()
-    retired.wait.assert_not_called()
-    current.wait.assert_not_called()
+    retired.wait.assert_called_once_with(timeout=0.2)
+    current.wait.assert_called_once_with(timeout=0.2)
 
 
 @pytest.mark.parametrize("failed_operation", ["terminate", "wait"])
@@ -508,8 +508,8 @@ def test_stop_failure_preserves_retired_processes_for_emergency_kill(failed_oper
 
     for process in processes:
         process.kill.assert_called_once_with()
-    processes[1].wait.assert_not_called()
-    processes[2].wait.assert_not_called()
+    processes[1].wait.assert_called_once_with(timeout=0.2)
+    processes[2].wait.assert_called_once_with(timeout=0.2)
 
 
 @pytest.mark.parametrize("timeout", [None, 120.0])
@@ -1048,3 +1048,55 @@ def test_expired_batch_is_removed_before_callback() -> None:
     assert [e["type"] for e in events] == ["error", "error", "pong"]
     assert all(e["code"] == "timeout" for e in events[:2])
     assert not supervisor._pending
+
+
+@pytest.mark.parametrize(
+    "wait_error",
+    [
+        subprocess.TimeoutExpired("retired-worker", 0.2),
+        OSError("сбой wait"),
+        RuntimeError("сбой wait"),
+    ],
+)
+def test_kill_wait_failure_does_not_skip_remaining_processes(wait_error: Exception) -> None:
+    """N-12: каждый SIGKILL сопровождается wait, сбой не прерывает обработку остальных."""
+    supervisor = WorkerSupervisor(lambda message: None, use_qt=False)
+    processes = [Mock(spec=subprocess.Popen) for _ in range(3)]
+    for process in processes:
+        process.poll.return_value = None
+    processes[0].wait.side_effect = wait_error
+    supervisor._retired = processes[:2]
+    supervisor.process = processes[2]
+
+    supervisor.kill()
+
+    assert supervisor.state == "stopped"
+    for process in processes:
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=0.2)
+        kill_index = process.mock_calls.index(call.kill())
+        wait_index = process.mock_calls.index(call.wait(timeout=0.2))
+        assert kill_index < wait_index
+    assert processes[0] in supervisor._retired
+
+
+def test_adopt_retired_keeps_unique_processes_until_pump_or_stop() -> None:
+    """Новый supervisor собирает переданные процессы, не удваивая общий Popen."""
+    supervisor = WorkerSupervisor(lambda message: None, use_qt=False)
+    running = Mock(spec=subprocess.Popen)
+    exited = Mock(spec=subprocess.Popen)
+    running.poll.return_value = None
+    exited.poll.return_value = -9
+    supervisor.adopt_retired([running, exited])
+    supervisor.adopt_retired([running])
+
+    supervisor.pump()
+
+    running.poll.assert_called_once_with()
+    exited.poll.assert_called_once_with()
+    assert supervisor._retired == [running]
+    supervisor.stop()
+    running.terminate.assert_called_once_with()
+    running.wait.assert_called_once_with(timeout=2)
+    exited.wait.assert_not_called()
+    assert supervisor._retired == []

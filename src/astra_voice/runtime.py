@@ -1731,7 +1731,7 @@ class DictationRuntime(QObject):
         self._switch_target = None
         self._switch_loaded_event = None
         if candidate is not None:
-            self._cleanup("временный воркер", candidate.stop)
+            self._stop_or_kill("временный воркер", candidate)
         if self.on_switch_finished is not None and not self._closed:
             self.on_switch_finished(result)
 
@@ -1884,7 +1884,7 @@ class DictationRuntime(QObject):
     def _reject_switch_revision(self) -> None:
         previous_stopped = self._switch_promoted or self._switch_paused
         if not self._fail_switch() and previous_stopped:
-            self._cleanup("отозванный воркер", self.supervisor.stop)
+            self._stop_or_kill("отозванный воркер", self.supervisor)
             self._show_load_failed()
 
     def _loaded_revision_allowed(self) -> bool:
@@ -1914,15 +1914,13 @@ class DictationRuntime(QObject):
         self._model_revoked()
         # Барьер ready уже отпустил CATALOG_LOCK. Новый процесс обслуживает
         # измеритель уровня, но failed запрещает ему загружать модель на hello.
-        generation = self.supervisor.generation + 1
-        try:
-            self.supervisor.stop()
-        except Exception:
-            log.warning("Ошибка завершения диктовки: отозванный воркер")
-            self._cleanup("аварийная остановка отозванного воркера", self.supervisor.kill)
+        old = self.supervisor
+        generation = old.generation + 1
+        self._stop_or_kill("отозванный воркер", old)
         if self._closed or self._appimage_removal_reserved:
             return
         self.supervisor = self._supervisor_factory(on_event=self._on_worker_event, use_qt=True)
+        self.supervisor.adopt_retired(old._retired)
         self.supervisor.generation = generation
         self._model_load_generation = None
         self.supervisor.start()
@@ -3020,6 +3018,14 @@ class DictationRuntime(QObject):
         """Даёт IPC до 50 мс на освобождение микрофона и обрабатывает события Qt."""
         self.supervisor.pump(timeout=0.05)
         QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents, 50)
+
+    def _stop_or_kill(self, step: str, supervisor: WorkerSupervisor) -> None:
+        """При сбое штатной остановки аварийно закрывает IPC и завершает процессы."""
+        try:
+            supervisor.stop()
+        except Exception:
+            log.warning("Ошибка завершения диктовки: %s", step)
+            self._cleanup(f"аварийная остановка: {step}", supervisor.kill)
 
     @staticmethod
     def _cleanup(step: str, action: Callable[[], object]) -> None:

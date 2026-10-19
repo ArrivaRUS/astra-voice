@@ -71,14 +71,14 @@ def _remember_verified_snapshot(key: tuple[str, str, Path, str], catalog: Catalo
         _snapshot_cache = (key, catalog)
 
 
-def remember_verified_snapshot(raw: bytes, signature: bytes, catalog: Catalog) -> None:
-    """Запоминает уже проверенные байты, не заменяя старший положительный кэш.
+def remember_verified_snapshot(key: tuple[str, str, Path, str], catalog: Catalog) -> None:
+    """Запоминает проверенный каталог без I/O, сохраняя старший положительный кэш.
 
-    Вызывающий передаёт результат полной проверки именно этой пары. При сбое
-    отката снимка это сохраняет известные отзывы до следующей принятой отметки.
+    Вызывающий заранее вычисляет ключ проверенной пары до записи снимка.
+    При сбое отката это сохраняет известные отзывы независимо от состояния диска.
     """
     with CATALOG_LOCK:
-        _remember_verified_snapshot(_snapshot_key(raw, signature), catalog)
+        _remember_verified_snapshot(key, catalog)
 
 
 def read_revocation_marker() -> tuple[catalog_state.CatalogState | None, bool]:
@@ -226,8 +226,10 @@ def check_revoked(
         if catalog is not None and catalog.is_revoked(model_id, revision):
             raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
         marker, marker_error = read_revocation_marker()
-        if marker is not None and (model_id, revision) in (marker.revoked or ()):
-            raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
+        if marker is not None:
+            assert marker.revoked is not None  # Гарантия read_revocation_marker.
+            if (model_id, revision) in marker.revoked:
+                raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")
         cached = cached_pending_snapshot(marker)
         if cached is not None and cached.is_revoked(model_id, revision):
             raise StoreError("revoked", "Эта версия модели отозвана. Выберите другую версию.")

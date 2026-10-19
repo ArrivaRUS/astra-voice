@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -459,6 +459,12 @@ class WorkerSupervisor:
         if report and not events:
             self._emit(ipc.error("worker-crashed", "Распознавание перезапущено."))
 
+    def adopt_retired(self, processes: Iterable[subprocess.Popen[bytes]]) -> None:
+        """Принимает процессы прежнего супервизора для сбора через pump/stop."""
+        for process in processes:
+            if not any(retired is process for retired in self._retired):
+                self._retired.append(process)
+
     def stop(self) -> None:
         """Закрывает IPC, посылает SIGTERM; через две секунды применяет SIGKILL."""
         self.state = "stopped"
@@ -477,7 +483,7 @@ class WorkerSupervisor:
         self._retired.clear()
 
     def kill(self) -> None:
-        """Аварийно закрывает IPC и убивает все процессы без ожидания и callback."""
+        """Закрывает IPC и убивает процессы, ожидая каждый до 0,2 с, без callback."""
         self.state = "stopped"
         notifier, self._notifier = self._notifier, None
         timer, self._timer = self._timer, None
@@ -504,3 +510,5 @@ class WorkerSupervisor:
             with suppress(OSError):
                 if process.poll() is None:
                     process.kill()
+            with suppress(Exception):
+                process.wait(timeout=0.2)

@@ -133,6 +133,8 @@ def test_external_launch_contract_allows_ordinary_exit(copy: Path, launcher: str
 def test_failed_switch_forgotten_worker_still_protects_code(
     copy: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from types import MethodType
+
     candidate = WorkerSupervisor(
         on_event=lambda event: None, command_factory=lambda fd: _sleep_command(), use_qt=False
     )
@@ -144,6 +146,7 @@ def test_failed_switch_forgotten_worker_still_protects_code(
         monkeypatch.setattr(
             candidate, "stop", Mock(side_effect=subprocess.TimeoutExpired("test worker", 2))
         )
+        monkeypatch.setattr(candidate, "kill", Mock(side_effect=RuntimeError("test kill failed")))
         state = SimpleNamespace(
             _switch_in_progress=True,
             _switch_timer=None,
@@ -152,9 +155,11 @@ def test_failed_switch_forgotten_worker_still_protects_code(
             on_switch_finished=None,
             supervisor=SimpleNamespace(process=None, _retired=[]),
         )
-        # Настоящий путь неудачного switch забывает candidate после проглоченной
-        # ошибки stop. Текущие поля runtime уже не позволяют найти живого ребёнка.
+        state._stop_or_kill = MethodType(DictationRuntime._stop_or_kill, state)
+        # Настоящий путь неудачного switch забывает candidate после проглоченных
+        # ошибок stop и kill. Поля runtime уже не позволяют найти живого ребёнка.
         DictationRuntime._finish_switch(cast(DictationRuntime, state), "failed")
+        candidate.kill.assert_called_once_with()
         assert state._switch_candidate is None
         processes, threads = app._copy_shutdown_resources(state, None, None)
         assert child not in processes

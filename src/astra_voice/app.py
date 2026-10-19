@@ -250,7 +250,8 @@ def _revoked_check(model: Any | None) -> Callable[[str, str], bool]:
                 return True
             if marker_error:
                 raise RevocationUnknown
-            if state is not None and state.revoked is not None:
+            if state is not None:
+                assert state.revoked is not None  # Гарантия read_revocation_marker.
                 if (model_id, revision) in state.revoked:
                     return True
                 if not catalog_unknown:

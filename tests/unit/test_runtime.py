@@ -6127,7 +6127,7 @@ def test_t239_revoked_worker_stop_failure_closes_ipc_and_kills_process(
         assert old._socket is None
         process.kill.assert_called_once_with()
         process.terminate.assert_not_called()
-        process.wait.assert_not_called()
+        process.wait.assert_called_once_with(timeout=0.2)
         assert old.state == "stopped"
         assert runtime.supervisor is clean
         clean.start.assert_called_once_with()
@@ -6178,4 +6178,162 @@ def test_revoked_worker_replacement_stays_closed_after_stop(
         assert runtime.start_level_monitor("default", Mock()) is False
     finally:
         old.stop.side_effect = rig.stop_worker
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    "stage,pause,level_active",
+    [
+        ("candidate", False, False),
+        ("selfcheck", False, False),
+        ("selfcheck", False, True),
+        ("selfcheck", True, False),
+        ("selfcheck", True, True),
+    ],
+)
+def test_t282_revoked_switch_stop_failure_kills_candidate_and_closes_ipc(
+    monkeypatch: pytest.MonkeyPatch, stage: str, pause: bool, level_active: bool
+) -> None:
+    """Ошибка stop до закрытия IPC не оставляет кандидата и его захват живыми."""
+    bench = SwitchRig(monkeypatch, pause=pause)
+    runtime = bench.rig.runtime
+    revoked: set[tuple[str, str]] = set()
+    runtime.set_revoked_check(lambda model_id, revision: (model_id, revision) in revoked)
+    candidate: WorkerSupervisor | None = None
+    process = Mock(spec=subprocess.Popen)
+    child = {"alive": True, "capturing": False}
+    process.poll.side_effect = lambda: None if child["alive"] else -9
+    process.wait.return_value = -9
+
+    def kill_process() -> None:
+        child.update(alive=False, capturing=False)
+
+    process.kill.side_effect = kill_process
+    connection = Mock(spec=socket.socket)
+    frames: list[dict[str, Any]] = []
+
+    def send_frame(payload: bytes) -> int:
+        message = ipc.decode(bytes(payload[4:]))
+        frames.append(message)
+        if message["type"] == "record.start":
+            child["capturing"] = True
+        elif message["type"] in ("record.stop", "record.cancel"):
+            child["capturing"] = False
+        return len(payload)
+
+    connection.send.side_effect = send_frame
+
+    def factory(**kwargs: Any) -> WorkerSupervisor | Mock:
+        nonlocal candidate
+        if candidate is not None:
+            return bench.factory(**kwargs)
+        candidate = WorkerSupervisor(kwargs["on_event"], use_qt=False)
+        candidate.process = process
+        candidate._socket = connection
+        monkeypatch.setattr(candidate, "_launch", lambda: setattr(candidate, "state", "running"))
+        return candidate
+
+    runtime._supervisor_factory = factory
+    try:
+        bench.switch()
+        assert candidate is not None
+        candidate._emit({"type": "hello"})
+        assert any(frame.get("id") == "whisper" for frame in frames)
+        if stage == "selfcheck":
+            candidate._emit({"type": "model.loaded", "id": "whisper", "revision": "r1"})
+            assert runtime.supervisor is candidate
+            assert runtime._selfcheck == "running"
+            if level_active:
+                assert runtime.start_level_monitor("default", Mock()) is True
+                assert runtime.orchestrator.level_active
+                assert child["capturing"]
+        else:
+            assert runtime.supervisor is bench.old
+
+        candidate._notifier = Mock()
+        candidate._notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+        stop = Mock(wraps=candidate.stop)
+        kill = Mock(wraps=candidate.kill)
+        monkeypatch.setattr(candidate, "stop", stop)
+        monkeypatch.setattr(candidate, "kill", kill)
+        revoked.add(("whisper", "r1"))
+        frames.clear()
+        if stage == "candidate":
+            candidate._emit({"type": "model.loaded", "id": "whisper", "revision": "r1"})
+        else:
+            candidate._emit({"type": "result", "utterance_id": "file", "text": "проверка связи"})
+
+        assert stop.called
+        assert all(entry == call() for entry in stop.call_args_list)
+        kill.assert_called_once_with()
+        connection.close.assert_called_once_with()
+        assert candidate._socket is None
+        process.kill.assert_called_once_with()
+        process.terminate.assert_not_called()
+        process.wait.assert_called_once_with(timeout=0.2)
+        assert not child["alive"] and not child["capturing"]
+        assert candidate.state == "stopped"
+        assert not runtime._switch_active()
+        bench.finished.assert_called_once_with("failed")
+        bench.rig.hotkey.fsm.press(bench.rig.now)
+        assert all(frame["type"] != "record.start" for frame in frames)
+        with pytest.raises(RuntimeError, match="Воркер не запущен"):
+            candidate.send({"type": "record.start", "utterance_id": "after-revocation"})
+        connection.close.assert_called_once_with()
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("collect_with", ["pump", "stop"])
+def test_rejected_loaded_revision_transfers_retired_processes_to_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, collect_with: str
+) -> None:
+    """Смена supervisor не теряет процессы, не успевшие завершиться при kill."""
+    from astra_voice.app import _copy_shutdown_resources
+
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
+    runtime = rig.runtime
+    old = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    old.state = "running"
+    old._notifier = Mock()
+    old._notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+    processes = [Mock(spec=subprocess.Popen) for _ in range(2)]
+    for process in processes:
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    old._retired = [processes[0]]
+    old.process = processes[1]
+    runtime.supervisor = old
+    clean = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    monkeypatch.setattr(clean, "start", lambda: setattr(clean, "state", "running"))
+    rig.supervisor_factory.return_value = clean
+    try:
+        publish_runtime_revocation(tmp_path)
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        assert runtime.supervisor is clean
+        for process in processes:
+            process.kill.assert_called_once_with()
+            process.wait.assert_called_once_with(timeout=0.2)
+            process.poll.reset_mock()
+            process.wait.reset_mock(side_effect=True)
+        assert clean._retired == processes
+        shutdown_processes, _ = _copy_shutdown_resources(runtime, None, None)
+        for process in processes:
+            assert any(child is process for child in shutdown_processes)
+        if collect_with == "pump":
+            for process in processes:
+                process.poll.return_value = -9
+            clean.pump()
+            for process in processes:
+                process.poll.assert_called_once_with()
+        else:
+            clean.stop()
+            for process in processes:
+                process.terminate.assert_called_once_with()
+                process.wait.assert_called_once_with(timeout=2)
+        assert clean._retired == []
+    finally:
+        for process in processes:
+            process.poll.return_value = -9
+            process.wait.side_effect = None
         runtime.shutdown()
