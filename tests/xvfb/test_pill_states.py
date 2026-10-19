@@ -15,11 +15,10 @@ PNG публикуются из временного каталога
 from __future__ import annotations
 
 import os
-import shutil
 import sys
-import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import cache
 from hashlib import sha256
 from math import ceil, floor
 from pathlib import Path
@@ -30,11 +29,17 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
-from helpers.snapshots import snapshot_dir, write_snapshot  # noqa: E402
+from helpers.snapshots import publish_snapshot, snapshot_dir, snapshot_staging, write_snapshot  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-SNAPSHOTS = snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_PILL", "pill", "design/refs/impl/pill")
+
+
+@cache
+def snapshots() -> Path:
+    return snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_PILL", "pill", "design/refs/impl/pill")
+
+
 LABELS = {
     "hidden": "",
     "loading-model": "Загружаю модель…",
@@ -335,14 +340,13 @@ def rendered_states(
 
     # Общая фикстура гарантирует снимки и при отдельном запуске теста референса.
     # Staging внутри проверенного каталога сохраняет атомарность замены и не попадает в glob.
-    staging = Path(tempfile.mkdtemp(prefix=".pill-", dir=SNAPSHOTS))
     failures_before = request.session.testsfailed
-    try:
+    with snapshot_staging(snapshots(), prefix=".pill-") as staging:
         rendered = {state: capture_state(pill_app, state, snapshot_dir=staging) for state in LABELS}
         expected = {f"{state}.png" for state in LABELS if state not in INVISIBLE}
         assert len(expected) == 10
         assert {path.name for path in staging.glob("*.png")} == expected
-        assert {path.name for path in SNAPSHOTS.glob("*.png")} <= expected
+        assert {path.name for path in snapshots().glob("*.png")} <= expected
         for state in LABELS.keys() - INVISIBLE:
             assert_saved_snapshot(state, rendered[state])
         yield rendered
@@ -350,13 +354,11 @@ def rendered_states(
         if request.session.testsfailed == failures_before:
             for name in sorted(expected):
                 source = staging / name
-                destination = SNAPSHOTS / name
+                destination = snapshots() / name
                 current = QImage(str(destination)).convertToFormat(QImage.Format_RGBA8888)
                 candidate = QImage(str(source)).convertToFormat(QImage.Format_RGBA8888)
                 if current.isNull() or current != candidate:
-                    os.replace(source, destination)
-    finally:
-        shutil.rmtree(staging)
+                    publish_snapshot(source, snapshots(), name)
 
 
 def assert_pill_geometry_and_text(state: str, rendered: RenderedState) -> None:
@@ -416,7 +418,7 @@ def test_pill_state(state: str, rendered_states: dict[str, RenderedState]) -> No
 
     if state in INVISIBLE:
         assert rendered.snapshot is None
-        assert not (SNAPSHOTS / f"{state}.png").exists()
+        assert not (snapshots() / f"{state}.png").exists()
     else:
         assert rendered.snapshot is not None
         assert rendered.snapshot.name == f"{state}.png"

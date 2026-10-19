@@ -1664,6 +1664,77 @@ def test_remove_model_refuses_the_working_model(rig: Rig) -> None:
     assert card(downloads, GIGAAM.id)["badge"] == "active"
 
 
+@pytest.mark.parametrize("error_type", [OSError, StoreError])
+@pytest.mark.parametrize("failed_read", ["installed_ids", "record_state", "current_ids"])
+def test_ib40b_switch_with_pause_store_error_does_not_crash(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_type: type[Exception],
+    failed_read: str,
+) -> None:
+    port, downloads, switcher = switched_rig(enough_memory=True)
+    caplog.set_level(logging.WARNING)
+    try:
+        monkeypatch.setattr(
+            port, failed_read, Mock(side_effect=error_type("private/path model-id"))
+        )
+        for _ in range(3):
+            downloads.switchModelWithPause(TONE.id)
+        assert port.current == (GIGAAM.id, GIGAAM.revision)
+        assert switcher.calls == []
+        assert len(caplog.records) == 1
+        assert caplog.records[0].exc_info is None
+        assert "private" not in caplog.text and "model-id" not in caplog.text
+    finally:
+        downloads.shutdown()
+
+
+@pytest.mark.parametrize("error_type", [OSError, StoreError])
+@pytest.mark.parametrize("failed_read", ["current_ids", "record_state"])
+def test_ib40b_remove_current_refuses_stale_badge_after_store_read_error(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_type: type[Exception],
+    failed_read: str,
+) -> None:
+    port, downloads, _ = rig
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    assert card(downloads, TONE.id)["badge"] == "installed"
+    port.current = (TONE.id, TONE.revision)
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(port, failed_read, Mock(side_effect=error_type("private/path model-id")))
+
+    for _ in range(3):
+        downloads.removeModel(TONE.id)
+
+    assert port.removed == []
+    assert port.current == (TONE.id, TONE.revision)
+    assert port.records[(TONE.id, TONE.revision)] == "ok"
+    if failed_read == "current_ids":
+        assert len(caplog.records) == 1
+    else:
+        assert len(caplog.records) <= 1
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "private" not in caplog.text and "model-id" not in caplog.text
+
+
+def test_ib40b_remove_current_refuses_stale_badge_with_healthy_current_read(rig: Rig) -> None:
+    port, downloads, _ = rig
+    port.records[(GIGAAM.id, GIGAAM.revision)] = "ok"
+    port.records[(TONE.id, TONE.revision)] = "ok"
+    port.current = (GIGAAM.id, GIGAAM.revision)
+    assert card(downloads, TONE.id)["badge"] == "installed"
+    port.current = (TONE.id, TONE.revision)
+
+    downloads.removeModel(TONE.id)
+
+    assert port.removed == []
+    assert port.current == (TONE.id, TONE.revision)
+
+
 def test_broken_installed_model_can_be_reinstalled(rig: Rig) -> None:
     port, downloads, queued = rig
     port.records[(TONE.id, TONE.revision)] = "broken"

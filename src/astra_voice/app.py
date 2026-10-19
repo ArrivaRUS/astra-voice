@@ -1223,6 +1223,7 @@ def _wire_tray_models(
     tray: Any, bridge: Any, show_models: Callable[[], None] | None = None
 ) -> None:
     """Трей использует список, имена и переключение раздела «Модели»."""
+    bridge.defer_model_store_error_reset()
     snapshot: tuple[tuple[tuple[str, str], ...], str | None] | None = None
     disabled_snapshot: frozenset[str] = frozenset()
     availability_fingerprint: tuple[tuple[Any, ...], ...] | None = None
@@ -1306,10 +1307,8 @@ def _wire_tray_models(
                     show_models()
                 return
             pending_id = model_id
-            serial = bridge.model_store_error_serial
             selection_in_progress = True
-            bridge.makeModelCurrent(model_id)
-            if serial != bridge.model_store_error_serial:
+            if not bridge.make_model_current(model_id):
                 raise StoreError("model selection unavailable")
         except (OSError, StoreError):
             pending_id = None

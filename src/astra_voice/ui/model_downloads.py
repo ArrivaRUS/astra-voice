@@ -986,6 +986,7 @@ class ModelDownloads(QObject):
         self._snapshot_revocation_warned = False
         self._store_error_warned = False
         self.store_error_serial = 0
+        self.store_error_reset_on_models_read = True
         self.models_read_failed = False
         self._badge_snapshot: dict[str, str] = {}
         self._revocation_unknown_state = bool(revocation_unknown()) if revocation_unknown else False
@@ -1483,9 +1484,12 @@ class ModelDownloads(QObject):
     def models(self) -> list[dict[str, Any]]:
         serial = self.store_error_serial
         try:
-            return self._model_rows()
+            rows = self._model_rows()
         finally:
             self.models_read_failed = serial != self.store_error_serial
+        if not self.models_read_failed and self.store_error_reset_on_models_read:
+            self.reset_store_error()
+        return rows
 
     def _model_rows(self) -> list[dict[str, Any]]:
         best_rtfx = catalog_best(self._entries)
@@ -1923,26 +1927,29 @@ class ModelDownloads(QObject):
 
     def makeModelCurrent(self, model_id: str) -> None:  # noqa: N802
         """Делает установленную ревизию рабочей; сломанную рабочей не делаем."""
+        self.make_current(model_id)
+
+    def make_current(self, model_id: str) -> bool:
+        """Выбирает ревизию; False означает ошибку хранилища этой операции."""
         entry = self._managed_entry(model_id)
         if entry is None or self._model is None:
-            return
+            return True
         try:
             revision = self._installed_revision(entry, self._model.installed_ids())
             if not revision or self._model.record_state(entry.id, revision) != "ok":
-                return
+                return True
             if self._is_revoked(entry, revision):
                 self._set_card(entry, "failed", _REVOKED_MESSAGE)
-                return
+                return True
             if self._switcher is not None:
-                self._start_switch(entry, revision, pause=False)
-                return
+                return self._start_switch(entry, revision, pause=False)
             with self._update():
                 try:
                     self._model.set_current(entry.id, revision)
                 except (OSError, StoreError):
                     self.report_store_error()
                     self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
-                    return
+                    return False
                 if self._paused_entry is not None:
                     self._queue_current = (entry.id, revision)
                 self._card_messages.pop(entry.id, None)
@@ -1952,42 +1959,47 @@ class ModelDownloads(QObject):
                 self._notify("selectionChanged")
         except (OSError, StoreError):
             self.report_store_error()
+            return False
+        return True
 
     def switchModelWithPause(self, model_id: str) -> None:  # noqa: N802
         """Переключает рабочую модель с короткой паузой в диктовке."""
         entry = self._managed_entry(model_id)
         if entry is None or self._model is None or self._switcher is None:
             return
-        revision = self._installed_revision(entry)
-        if revision and self._model.record_state(entry.id, revision) == "ok":
-            if self._is_revoked(entry, revision):
-                self._set_card(entry, "failed", _REVOKED_MESSAGE)
-                return
-            self._start_switch(entry, revision, pause=True)
+        try:
+            revision = self._installed_revision(entry, self._model.installed_ids())
+            if revision and self._model.record_state(entry.id, revision) == "ok":
+                if self._is_revoked(entry, revision):
+                    self._set_card(entry, "failed", _REVOKED_MESSAGE)
+                    return
+                self._start_switch(entry, revision, pause=True)
+        except (OSError, StoreError):
+            self.report_store_error()
 
-    def _start_switch(self, entry: Any, revision: str, *, pause: bool) -> None:
+    def _start_switch(self, entry: Any, revision: str, *, pause: bool) -> bool:
         model, switcher = self._model, self._switcher
         if model is None or switcher is None:
-            return
+            return True
         if self._is_revoked(entry, revision):
             self._set_card(entry, "failed", _REVOKED_MESSAGE)
-            return
+            return True
         previous = model.current_ids()
         if previous == (entry.id, revision):
-            return
+            return True
         if not pause and not switcher.can_switch_without_pause(entry.min_ram_mb):
             self._card_messages.pop(entry.id, None)
             self._card_hints[entry.id] = _SWITCH_PAUSE_HINT
             self._card_hint_kinds[entry.id] = "switch-pause"
             self._notify("modelsChanged")
-            return
+            return True
         with self._update():
             try:
                 model.set_current(entry.id, revision)
             except (OSError, StoreError):
                 self.report_store_error()
                 self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
-                return
+                return False
             self._previous_current = previous
             self._switching_entry = entry
             self._set_card(entry, "switching")
@@ -1999,6 +2011,7 @@ class ModelDownloads(QObject):
             except Exception:
                 log.warning("Не удалось переключить модель", exc_info=True)
                 self._switch_finished("failed")
+        return True
 
     def _switch_finished(self, result: str) -> None:
         entry, previous = self._switching_entry, self._previous_current
@@ -2093,8 +2106,15 @@ class ModelDownloads(QObject):
         entry = self._managed_entry(model_id)
         if entry is None or self._model is None:
             return
-        revision = self._installed_revision(entry)
-        if not revision or self._badge(entry) == "active" or entry is self._paused_entry:
+        try:
+            revision = self._installed_revision(entry, self._model.installed_ids())
+            if not revision:
+                return
+            current = self._model.current_ids()
+        except (OSError, StoreError):
+            self.report_store_error()
+            return
+        if current == (entry.id, revision) or entry is self._paused_entry:
             return
         with self._update():
             try:

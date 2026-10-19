@@ -3,7 +3,7 @@
 Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING;
 по умолчанию используется приватный кеш снимков. ASTRA_VOICE_UPDATE_REFS=1
 явно направляет снимки в design/refs/impl/onboarding.
-Все записи тестов, включая временные PNG, ограничены SNAPSHOTS. Публикация
+Все записи тестов, включая временные PNG, ограничены snapshots(). Публикация
 через os.replace выполняется в teardown только после успеха всего модуля.
 """
 
@@ -13,11 +13,10 @@ import copy
 import os
 import re
 import sys
-import tempfile
 import time
 from collections.abc import Callable, Iterator
 from decimal import Decimal
-from functools import partial
+from functools import cache, partial
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -47,14 +46,26 @@ from PyQt5.QtTest import QSignalSpy, QTest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
-from helpers.snapshots import snapshot_dir, write_snapshot  # noqa: E402
+from helpers.snapshots import (  # noqa: E402
+    delete_snapshot,
+    publish_snapshot,
+    snapshot_dir,
+    snapshot_staging,
+    write_snapshot,
+)
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
+
+
 # Промежуточные прогоны разработки не трогают эталоны репозитория.
-SNAPSHOTS = snapshot_dir(
-    "ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING", "onboarding", "design/refs/impl/onboarding"
-)
+@cache
+def snapshots() -> Path:
+    return snapshot_dir(
+        "ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING", "onboarding", "design/refs/impl/onboarding"
+    )
+
+
 WIDTH, HEIGHT = 1024, 620
 
 
@@ -2558,8 +2569,7 @@ def rendered_steps(
 ) -> Iterator[dict[tuple[str, bool], tuple[QImage, list[str], Path]]]:
     """Готовит кадры всех случаев; публикует их только после успеха тестов модуля."""
     failures_before = request.session.testsfailed
-    with tempfile.TemporaryDirectory(prefix=".onboarding-", dir=SNAPSHOTS) as temporary:
-        staging = Path(temporary)
+    with snapshot_staging(snapshots(), prefix=".onboarding-") as staging:
         rendered: dict[tuple[str, bool], tuple[QImage, list[str], Path]] = {}
         for name, dark in CASES:
             image, messages = render_case(onboarding_app, name, dark)
@@ -2574,12 +2584,12 @@ def rendered_steps(
                 assert_no_messages(messages, path.name)
                 assert_saved_snapshot(path, image)
             for _, _, path in rendered.values():
-                os.replace(path, SNAPSHOTS / path.name)
+                publish_snapshot(path, snapshots(), path.name)
             for image, _, path in rendered.values():
-                assert_saved_snapshot(SNAPSHOTS / path.name, image)
+                assert_saved_snapshot(snapshots() / path.name, image)
             for step in range(1, 6):
                 for theme in ("light", "dark"):
-                    (SNAPSHOTS / f"step{step}-{theme}.png").unlink(missing_ok=True)
+                    delete_snapshot(snapshots(), f"step{step}-{theme}.png")
 
 
 @pytest.mark.parametrize("name", SNAPSHOT_SETUPS)

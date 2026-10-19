@@ -8,6 +8,8 @@ import pwd
 import secrets
 import stat
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -31,8 +33,9 @@ def tree_key() -> str:
     return hashlib.sha256(str(REPO.resolve()).encode()).hexdigest()[:16]
 
 
-def _check_directory(path: Path) -> None:
-    info = os.lstat(path)
+def _check_directory(path: Path, info: os.stat_result | None = None) -> os.stat_result:
+    if info is None:
+        info = os.lstat(path)
     if stat.S_ISLNK(info.st_mode):
         raise ValueError(f"Небезопасный каталог снимков {path}: символическая ссылка")
     if not stat.S_ISDIR(info.st_mode):
@@ -43,26 +46,79 @@ def _check_directory(path: Path) -> None:
         raise ValueError(
             f"Небезопасный каталог снимков {path}: доступен для записи группе/остальным"
         )
+    return info
+
+
+def _directory_boundary(path: Path) -> Path:
+    absolute = Path(os.path.abspath(path))
+    repo = Path(os.path.abspath(REPO))
+    if absolute.is_relative_to(repo):
+        return repo
+    # Системные /, /tmp и /home не принадлежат пользователю; sticky /tmp допустим.
+    # В namespace их uid может отличаться от 0. После первого пользовательского
+    # звена проверяем ВСЮ цепочку: иначе общий родитель позволяет подменить leaf.
+    for parent in reversed((absolute, *absolute.parents)):
+        if parent in {Path("/"), Path("/tmp"), Path("/home")}:
+            continue
+        try:
+            info = os.lstat(parent)
+        except FileNotFoundError:
+            return parent
+        if info.st_uid == os.getuid():
+            return parent
+    return absolute  # Готовая чужая leaf тоже обязана пройти проверку владельца.
+
+
+@contextmanager
+def _open_directory(path: Path, *, create: bool = True) -> Iterator[int]:
+    """Открыть каждый исходный компонент без ссылок и удержать каталог записи."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    directory_fd = None
+    current = Path(path.absolute().anchor)
+    try:
+        try:
+            boundary = _directory_boundary(path)
+            directory_fd = os.open(current, flags)
+            # Не resolve: ссылка перед '..' также должна быть отвергнута.
+            for part in path.absolute().parts[1:]:
+                current = current / part
+                try:
+                    info = os.lstat(current)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=directory_fd)
+                    except FileExistsError:
+                        pass
+                    info = os.lstat(current)
+                checked = Path(os.path.abspath(current)).is_relative_to(boundary)
+                if checked:
+                    info = _check_directory(current)
+                child_fd = os.open(part, flags, dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    if checked:
+                        _check_directory(current, opened)
+                    if (info.st_dev, info.st_ino) != (opened.st_dev, opened.st_ino):
+                        raise ValueError(f"Каталог снимков {current}: подменён при открытии")
+                except BaseException:
+                    os.close(child_fd)
+                    raise
+                os.close(directory_fd)
+                directory_fd = child_fd
+            _check_directory(path, os.fstat(directory_fd))
+        except OSError as error:
+            raise ValueError(f"Каталог снимков {current}: {error.strerror or error}") from error
+        yield directory_fd
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def _ensure_directory(path: Path) -> None:
-    """Проверить конечный каталог и каждое вновь созданное звено."""
-    try:
-        try:
-            _check_directory(path)
-            return
-        except FileNotFoundError:
-            pass
-        # Существующие родители explicit/ref не входят в границу проверки.
-        if not path.parent.exists():
-            _ensure_directory(path.parent)
-        try:
-            path.mkdir(mode=0o700)
-        except FileExistsError:
-            pass  # Другой писатель мог успеть создать звено; всё равно проверяем.
-        _check_directory(path)
-    except OSError as error:
-        raise ValueError(f"Каталог снимков {path}: {error.strerror or error}") from error
+    with _open_directory(path):
+        pass
 
 
 def _safe_name(name: str) -> None:
@@ -76,12 +132,12 @@ def snapshot_dir(
     """Выбрать и проверить каталог; относительный env считается от REPO.
 
     По умолчанию: passwd-home/.cache/astra-voice/snapshots/<tree-key>/<set>.
-    HOME и XDG_CACHE_HOME игнорируются. В cache проверяется вся цепочка
-    начиная с cache root; explicit/ref и переданный default проверяются в листе.
+    HOME и XDG_CACHE_HOME игнорируются. Проверяется вся пользовательская
+    цепочка родителей, для путей внутри репозитория — начиная с REPO.
     Только ASTRA_VOICE_UPDATE_REFS=1 разрешает обновлять design/refs.
     """
     design = (REPO / "design").resolve()
-    refs = (REPO / "design/refs").resolve()
+    refs = REPO.resolve() / "design/refs"
     if os.environ.get("ASTRA_VOICE_UPDATE_REFS") == "1":
         destination = REPO / refs_default
         if not destination.resolve().is_relative_to(refs):
@@ -91,7 +147,14 @@ def snapshot_dir(
 
     explicit = os.environ.get(env_var)
     selected = REPO / explicit if explicit else default
-    redirected = selected is not None and selected.resolve().is_relative_to(design)
+    resolved = selected.resolve() if selected is not None else None
+    redirected = resolved is not None and (
+        resolved.is_relative_to(design)
+        or any(
+            first == "design" and second == "refs"
+            for first, second in zip(resolved.parts, resolved.parts[1:], strict=False)
+        )
+    )
     if selected is not None and not redirected:
         _ensure_directory(selected)
         return selected
@@ -137,33 +200,103 @@ def write_snapshot(directory: Path, name: str, image: SnapshotImage | bytes) -> 
     """Закодировать в память и опубликовать bytes через защищённый дескриптор."""
     _safe_name(name)
     data = _encode_png(image)
-    _ensure_directory(directory)
     flags = os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY | os.O_CLOEXEC
-    for _ in range(10):
-        temporary = directory / f".{name}.{secrets.token_hex(12)}.tmp"
+    with _open_directory(directory) as directory_fd:
+        for _ in range(10):
+            temporary = f".{name}.{secrets.token_hex(12)}.tmp"
+            try:
+                fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise FileExistsError(f"Не удалось создать уникальный временный снимок в {directory}")
         try:
-            fd = os.open(temporary, flags, 0o600)
-        except FileExistsError:
-            continue
-        break
-    else:
-        raise FileExistsError(f"Не удалось создать уникальный временный снимок в {directory}")
-    try:
-        try:
-            remaining = memoryview(data)
-            while remaining:
-                written = os.write(fd, remaining)
-                if written <= 0:
-                    raise OSError(f"Не удалось записать снимок {temporary}")
-                remaining = remaining[written:]
-            os.fsync(fd)
+            try:
+                remaining = memoryview(data)
+                while remaining:
+                    written = os.write(fd, remaining)
+                    if written <= 0:
+                        raise OSError(f"Не удалось записать снимок {temporary}")
+                    remaining = remaining[written:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            return directory / name
         finally:
-            os.close(fd)
-        destination = directory / name
-        os.replace(temporary, destination)
-        return destination
-    finally:
-        temporary.unlink(missing_ok=True)
+            _unlink_snapshot(directory_fd, temporary)
+
+
+def _unlink_snapshot(directory_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+
+
+def publish_snapshot(source: Path, directory: Path, name: str) -> Path:
+    """Публикация staging-файла между двумя проверенными каталогами."""
+    _safe_name(name)
+    _safe_name(source.name)
+    with _open_directory(source.parent, create=False) as source_fd:
+        with _open_directory(directory) as destination_fd:
+            os.replace(source.name, name, src_dir_fd=source_fd, dst_dir_fd=destination_fd)
+    return directory / name
+
+
+def delete_snapshot(directory: Path, name: str) -> None:
+    """Удалить имя относительно проверенного каталога, не следуя подмене пути."""
+    _safe_name(name)
+    with _open_directory(directory, create=False) as directory_fd:
+        _unlink_snapshot(directory_fd, name)
+
+
+@contextmanager
+def snapshot_staging(directory: Path, prefix: str) -> Iterator[Path]:
+    """Приватный плоский staging модуля; создание и очистка привязаны к fd."""
+    _safe_name(prefix)
+    with _open_directory(directory) as parent_fd:
+        for _ in range(10):
+            name = f"{prefix}{secrets.token_hex(12)}"
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise FileExistsError(f"Не удалось создать staging в {directory}")
+        path = directory / name
+        original = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        _check_directory(path, original)
+        staging_fd = None
+        checked = False
+        try:
+            staging_fd = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd
+            )
+            opened = _check_directory(path, os.fstat(staging_fd))
+            if (opened.st_dev, opened.st_ino) != (original.st_dev, original.st_ino):
+                raise ValueError(f"Каталог снимков {path}: подменён при открытии")
+            checked = True
+            yield path
+        finally:
+            try:
+                # В staging лежат только PNG/временные файлы; ссылки не обходим.
+                if staging_fd is not None and checked:
+                    for child in os.listdir(staging_fd):
+                        _unlink_snapshot(staging_fd, child)
+                try:
+                    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    # Подставленный вместо staging каталог не удаляем.
+                    if (current.st_dev, current.st_ino) == (original.st_dev, original.st_ino):
+                        os.rmdir(name, dir_fd=parent_fd)
+            finally:
+                if staging_fd is not None:
+                    os.close(staging_fd)
 
 
 RefsInventory = dict[str, tuple[str, str]]

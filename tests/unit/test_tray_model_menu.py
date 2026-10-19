@@ -15,7 +15,9 @@ from test_tray_model_sync_independent import ManagedPort, Rig
 from test_tray_model_sync_independent import qapp as qapp
 from test_tray_model_sync_independent import rig as rig
 
+from astra_voice.core import settings as settings_mod
 from astra_voice.models.store import StoreError
+from astra_voice.ui.bridges import SettingsBridge
 from astra_voice.ui.model_downloads import ModelDownloads
 from helpers.scripted_model_port import FIRST, SECOND, pump_until
 
@@ -345,14 +347,14 @@ def test_ib40_store_error_does_not_crash_tray(
             assert rig.downloads.installedCount == 2
             assert rig.downloads.installedSummary.startswith("Установлено 2")
         else:
-            make_current = rig.bridge.makeModelCurrent
+            make_current = rig.bridge.make_model_current
 
-            def failing_make_current(model_id: str) -> None:
+            def failing_make_current(model_id: str) -> bool:
                 with monkeypatch.context() as store_failure:
                     store_failure.setattr(rig.port, method, Mock(side_effect=error))
-                    make_current(model_id)
+                    return make_current(model_id)
 
-            failing.setattr(rig.bridge, "makeModelCurrent", failing_make_current)
+            failing.setattr(rig.bridge, "make_model_current", failing_make_current)
 
         if failure in {"bridge-tick", "badge-record_state", "badge-current_ids"}:
             rig.bridge.modelsChanged.emit()
@@ -447,6 +449,131 @@ def test_store_warning_once_per_failure_series_and_recovery_resets(
         rig.bridge.modelsChanged.emit()
 
 
+@pytest.mark.parametrize("reader", ["downloads", "bridge"])
+@pytest.mark.parametrize("failed_read", ["record_state", "installed_ids", "current_ids"])
+def test_without_tray_successful_models_read_starts_new_warning_series(
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    reader: str,
+    failed_read: str,
+) -> None:
+    port = ManagedPort()
+    port.install_both()
+    downloads = ModelDownloads(port)
+    bridge = SettingsBridge(settings_mod.from_dict({}), downloads=downloads, save=Mock())
+    source = bridge if reader == "bridge" else downloads
+    caplog.set_level(logging.WARNING)
+    try:
+        for series in range(2):
+            with monkeypatch.context() as failing:
+                failing.setattr(
+                    port, failed_read, Mock(side_effect=StoreError("private/path model-id"))
+                )
+                for _ in range(5):
+                    assert len(source.models) == 2
+                    assert downloads.models_read_failed
+                assert len(caplog.records) == series + 1
+                assert all(record.exc_info is None for record in caplog.records)
+                assert "private" not in caplog.text and "model-id" not in caplog.text
+            assert [row["id"] for row in source.models] == [FIRST.id, SECOND.id]
+            assert not downloads.models_read_failed
+    finally:
+        downloads.shutdown()
+        bridge.deleteLater()
+        downloads.deleteLater()
+
+
+def test_tray_warning_series_requires_successful_rows_and_availability(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig.port.install_both()
+    rig.downloads.modelsChanged.emit()
+    caplog.set_level(logging.WARNING)
+    check = rig.bridge.can_select_model_or_unknown
+
+    def unavailable(model_id: str) -> bool | None:
+        with monkeypatch.context() as failing:
+            failing.setattr(
+                rig.port, "record_state", Mock(side_effect=StoreError("private/path model-id"))
+            )
+            return check(model_id)
+
+    for series in range(2):
+        with monkeypatch.context() as failing:
+            failing.setattr(
+                rig.port, "installed_ids", Mock(side_effect=StoreError("private/path model-id"))
+            )
+            rig.downloads.modelsChanged.emit()
+        with monkeypatch.context() as failing:
+            failing.setattr(rig.bridge, "can_select_model_or_unknown", unavailable)
+            for _ in range(5):
+                assert len(rig.bridge.models) == 2
+                assert not rig.downloads.models_read_failed
+                rig.downloads.modelsChanged.emit()
+            assert len(caplog.records) == series + 1
+        rig.downloads.modelsChanged.emit()
+        assert not rig.downloads.models_read_failed
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "private" not in caplog.text and "model-id" not in caplog.text
+    rig.show_models.assert_not_called()
+
+
+@pytest.mark.parametrize("availability_error", ["unknown", "raised"])
+@pytest.mark.parametrize(
+    ("with_switcher", "switch_result"), [(False, "ok"), (True, "ok"), (True, "failed")]
+)
+def test_accepted_selection_survives_reentrant_other_model_availability_error(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    with_switcher: bool,
+    switch_result: str,
+    availability_error: str,
+) -> None:
+    rig.port.install_both()
+    rig.downloads.modelsChanged.emit()
+    if not with_switcher:
+        rig.downloads._switcher = None
+    check = rig.bridge.can_select_model_or_unknown
+    failed_checks: list[str] = []
+
+    def unavailable(model_id: str) -> bool | None:
+        # Выбор и его чтения хранилища успешны. Только вложенное обновление
+        # меню сбоит на соседней модели после set_current.
+        if model_id == FIRST.id and rig.port.current == (SECOND.id, SECOND.revision):
+            failed_checks.append(model_id)
+            if availability_error == "raised":
+                raise StoreError("private/path model-id")
+            with monkeypatch.context() as store_failure:
+                store_failure.setattr(
+                    rig.port,
+                    "record_state",
+                    Mock(side_effect=StoreError("private/path model-id")),
+                )
+                return check(model_id)
+        return check(model_id)
+
+    with monkeypatch.context() as failing:
+        failing.setattr(rig.bridge, "can_select_model_or_unknown", unavailable)
+        rig.choose(SECOND.id)
+        assert failed_checks
+        assert rig.port.current == (SECOND.id, SECOND.revision)
+        if with_switcher:
+            assert rig.switcher.calls == [(SECOND.min_ram_mb, False)]
+            assert rig.checked_ids() == [FIRST.id]
+        rig.show_models.assert_not_called()
+
+    if with_switcher:
+        rig.switcher.finish(switch_result)
+    for _ in range(3):
+        rig.downloads.modelsChanged.emit()
+    assert rig.checked_ids() == [SECOND.id if switch_result == "ok" else FIRST.id]
+    if switch_result == "ok":
+        rig.show_models.assert_not_called()
+    else:
+        rig.show_models.assert_called_once_with()
+
+
 @pytest.mark.parametrize("with_switcher", [False, True])
 @pytest.mark.parametrize("failed_read", ["record_state", "installed_ids", "set_current"])
 def test_selection_failure_warning_waits_for_successful_tick(
@@ -460,18 +587,18 @@ def test_selection_failure_warning_waits_for_successful_tick(
     rig.downloads.modelsChanged.emit()
     if not with_switcher:
         rig.downloads._switcher = None
-    make_current = rig.bridge.makeModelCurrent
+    make_current = rig.bridge.make_model_current
     updates = Mock(wraps=rig.tray.set_models)
     monkeypatch.setattr(rig.tray, "set_models", updates)
 
-    def failing_make_current(model_id: str) -> None:
+    def failing_make_current(model_id: str) -> bool:
         with monkeypatch.context() as failing:
             failing.setattr(
                 rig.port, failed_read, Mock(side_effect=StoreError("private/path model-id"))
             )
-            make_current(model_id)
+            return make_current(model_id)
 
-    monkeypatch.setattr(rig.bridge, "makeModelCurrent", failing_make_current)
+    monkeypatch.setattr(rig.bridge, "make_model_current", failing_make_current)
     caplog.set_level(logging.WARNING)
     for series in range(2):
         for _ in range(5):

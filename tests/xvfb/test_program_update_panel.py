@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import math
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -18,11 +19,17 @@ from helpers.snapshots import snapshot_dir, write_snapshot
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
 states: Any = importlib.import_module("test_update_states")
-SNAPSHOTS = snapshot_dir(
-    "ASTRA_VOICE_SNAPSHOT_DIR_PROGRAM_UPDATES",
-    "program-updates",
-    "design/refs/impl/program-updates",
-)
+
+
+@cache
+def snapshots() -> Path:
+    return snapshot_dir(
+        "ASTRA_VOICE_SNAPSHOT_DIR_PROGRAM_UPDATES",
+        "program-updates",
+        "design/refs/impl/program-updates",
+    )
+
+
 NOTES = [
     {"text": "Улучшена работа настроек программы.", "bullet": True},
     {"text": "Исправлены ошибки проверки обновлений.", "bullet": True},
@@ -173,7 +180,7 @@ def test_actual_program_panel(app: Any, dark: bool, size: tuple[int, int], phase
             int(panel.width()),
             min(int(panel.height()), size[1] - int(point.y()) - 36),
         )
-        write_snapshot(SNAPSHOTS, f"{name}-panel.png", crop)
+        write_snapshot(snapshots(), f"{name}-panel.png", crop)
 
     try:
         image, texts, messages = states.render_network(app, dark, updates, settings, inspect)
@@ -182,7 +189,7 @@ def test_actual_program_panel(app: Any, dark: bool, size: tuple[int, int], phase
         if phase == "error":
             assert "Не удалось проверить обновление" in texts
         assert not updates.calls  # Opening the panel never starts download / install.
-        write_snapshot(SNAPSHOTS, f"{name}.png", image)
+        write_snapshot(snapshots(), f"{name}.png", image)
     finally:
         states.WIDTH, states.HEIGHT = original_size
         sip.delete(updates)
@@ -377,7 +384,7 @@ def test_cancel_escape_and_ready_focus(app: Any) -> None:
         app.processEvents()
         assert states.find_object(window, "updatePanelHeading").hasActiveFocus()
         write_snapshot(
-            SNAPSHOTS,
+            snapshots(),
             "program-heading-focus-light.png",
             states.grab(app, window, states.WIDTH, states.HEIGHT),
         )
@@ -557,7 +564,7 @@ def test_narrow_column_with_long_notes_and_empty_notes(app: Any, dark: bool) -> 
         version = states.find_object(window, "updateReleaseVersion")
         assert version.height() > 20
         write_snapshot(
-            SNAPSHOTS,
+            snapshots(),
             f"program-stress-{'dark' if dark else 'light'}.png",
             states.grab(app, window, states.WIDTH, states.HEIGHT),
         )
@@ -566,7 +573,7 @@ def test_narrow_column_with_long_notes_and_empty_notes(app: Any, dark: bool) -> 
         point = primary.mapToItem(window.contentItem(), QPointF(0, 0))
         assert point.y() >= 0 and point.y() + primary.height() < window.height() - 36
         write_snapshot(
-            SNAPSHOTS,
+            snapshots(),
             f"program-stress-actions-{'dark' if dark else 'light'}.png",
             states.grab(app, window, states.WIDTH, states.HEIGHT),
         )
@@ -625,7 +632,7 @@ def test_artificial_font_stress_150_percent(app: Any, dark: bool) -> None:
         point = primary.mapToItem(window.contentItem(), QPointF(0, 0))
         assert point.y() + primary.height() < window.height() - 36
         write_snapshot(
-            SNAPSHOTS,
+            snapshots(),
             f"program-font150-{'dark' if dark else 'light'}.png",
             states.grab(app, window, states.WIDTH, states.HEIGHT),
         )
@@ -692,7 +699,7 @@ def test_offline_preserves_local_phase_and_action(app: Any, dark: bool, phase: s
             else ["openFolder" if phase == "readydeb" else "installAndRestart"]
         )
         write_snapshot(
-            SNAPSHOTS, f"program-offline-{phase}-{'dark' if dark else 'light'}-900x588.png", image
+            snapshots(), f"program-offline-{phase}-{'dark' if dark else 'light'}-900x588.png", image
         )
     finally:
         states.WIDTH, states.HEIGHT = original_size

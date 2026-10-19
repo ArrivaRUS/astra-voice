@@ -433,6 +433,11 @@ class SettingsBridge(QObject):
         if self._downloads is not None:
             self._downloads.reset_store_error()
 
+    def defer_model_store_error_reset(self) -> None:
+        """Трей завершает серию ошибок после проверки всего меню."""
+        if self._downloads is not None:
+            self._downloads.store_error_reset_on_models_read = False
+
     @pyqtProperty(bool, notify=revocationUnknownChanged)
     def revocationUnknown(self) -> bool:  # noqa: N802
         return self._downloads.revocationUnknown if self._downloads is not None else False
@@ -473,6 +478,10 @@ class SettingsBridge(QObject):
     def makeModelCurrent(self, model_id: str) -> None:  # noqa: N802
         if self._downloads is not None:
             self._downloads.makeModelCurrent(model_id)
+
+    def make_model_current(self, model_id: str) -> bool:
+        """Результат операции для трея без изменения контракта QML-слота."""
+        return self._downloads is None or self._downloads.make_current(model_id)
 
     @pyqtSlot(str)
     def switchModelWithPause(self, model_id: str) -> None:  # noqa: N802

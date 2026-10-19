@@ -14,6 +14,7 @@ import importlib.util
 import os
 import sys
 from collections.abc import Callable
+from functools import cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -31,7 +32,13 @@ from helpers.snapshots import snapshot_dir, write_snapshot  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-SNAPSHOTS = snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_ABOUT", "about", "design/refs/impl/about")
+
+
+@cache
+def snapshots() -> Path:
+    return snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_ABOUT", "about", "design/refs/impl/about")
+
+
 WIDTH, HEIGHT = 1024, 620
 TALL = 1200
 
@@ -276,7 +283,7 @@ def render_about(
 
 
 def save_snapshot(image: QImage, name: str) -> Path:
-    return write_snapshot(SNAPSHOTS, name, image)
+    return write_snapshot(snapshots(), name, image)
 
 
 def find_object(window: Any, name: str) -> Any:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import os
 from collections.abc import Callable
+from functools import cache
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -27,11 +28,15 @@ from helpers.snapshots import snapshot_dir, write_snapshot
 
 states: Any = importlib.import_module("test_update_states")
 pytestmark = pytest.mark.xvfb
-SNAPSHOTS = snapshot_dir(
-    "ASTRA_VOICE_SNAPSHOT_DIR_PROGRAM_UPDATES",
-    "program-updates-keyboard-independent",
-    "design/refs/impl/program-updates-keyboard-independent",
-)
+
+
+@cache
+def snapshots() -> Path:
+    return snapshot_dir(
+        "ASTRA_VOICE_SNAPSHOT_DIR_PROGRAM_UPDATES",
+        "program-updates-keyboard-independent",
+        "design/refs/impl/program-updates-keyboard-independent",
+    )
 
 
 @pytest.fixture(scope="module")
@@ -64,7 +69,9 @@ def assert_focus_visible(window: Any, name: str) -> None:
 
 
 def snapshot(app: Any, window: Any, name: str) -> None:
-    write_snapshot(SNAPSHOTS, f"{name}.png", states.grab(app, window, states.WIDTH, states.HEIGHT))
+    write_snapshot(
+        snapshots(), f"{name}.png", states.grab(app, window, states.WIDTH, states.HEIGHT)
+    )
 
 
 def assert_heading_ring_follows_visible_content(window: Any, *, compact: bool = True) -> None:

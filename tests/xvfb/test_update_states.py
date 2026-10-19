@@ -14,6 +14,7 @@ import importlib.util
 import os
 import sys
 from collections.abc import Callable, Iterator
+from functools import cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -33,7 +34,13 @@ from helpers.snapshots import snapshot_dir, write_snapshot  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-SNAPSHOTS = snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_UPDATES", "updates", "design/refs/impl/updates")
+
+
+@cache
+def snapshots() -> Path:
+    return snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_UPDATES", "updates", "design/refs/impl/updates")
+
+
 FOOTER_W, FOOTER_H = 760, 36
 WIDTH, HEIGHT = 1024, 620
 NOTE_LINES = (
@@ -276,7 +283,7 @@ def collect_messages() -> tuple[list[str], Any]:
 
 
 def save_snapshot(image: QImage, name: str) -> Path:
-    return write_snapshot(SNAPSHOTS, name, image)
+    return write_snapshot(snapshots(), name, image)
 
 
 def grab(app: Any, window: QQuickWindow, width: int, height: int) -> QImage:
@@ -839,7 +846,7 @@ def test_footer_click_opens_network_and_unskips(app: Any) -> None:
 
 @pytest.fixture(autouse=True, scope="module")
 def _snapshot_dir() -> Iterator[None]:
-    SNAPSHOTS.mkdir(parents=True, exist_ok=True)
+    snapshots().mkdir(parents=True, exist_ok=True)
     yield
 
 
