@@ -228,18 +228,8 @@ def test_sigkill_restarts_with_new_pid_within_one_second() -> None:
         assert supervisor.generation == 2
         assert supervisor.process is not None
         assert supervisor.process.pid != process.pid
-        # Пожинание асинхронное по замыслу: `_restart` не блокирует поток GUI, а
-        # кладёт мёртвый процесс в `_retired`, и статус забирает ближайший `pump`
-        # (supervisor.py, комментарий у `self.process.kill()`). Кто первым заметит
-        # смерть — EOF сокета или `poll()` — зависит от планировщика, поэтому
-        # мгновенная проверка `poll()` здесь была гонкой: в четверти прогонов
-        # поколение уже сменилось, а зомби ещё не пожат (пожинается через ~10 мс).
-        # Проверяем инвариант О1 целиком — процесс именно пожат, и в тот же
-        # секундный бюджет, — а не то, успел ли он попасть в конкретный `pump`.
-        # Сам `poll()` в предикате и пожинает процесс; из `_retired` запись уберёт
-        # только следующий `pump` — это деталь реализации, инвариант О1 её не требует
-        # (за полную уборку отвечает `stop()`, он дренирует `_retired` с `wait`).
-        wait_for(supervisor, lambda: process.poll() is not None, "старый процесс пожат")
+        # Новое поколение допускается только после подтверждённого выхода старого.
+        assert process.poll() is not None
         assert process.returncode == -signal.SIGKILL
         wait_for(
             supervisor,
@@ -911,6 +901,12 @@ def test_unresponsive_deadline_kills_before_reporting(
     supervisor, events = detached(clock)
     old_process = Mock(spec=subprocess.Popen)
     old_process.poll.return_value = None
+
+    def exited(*, timeout: float) -> int:
+        old_process.poll.return_value = -signal.SIGKILL
+        return -signal.SIGKILL
+
+    old_process.wait.side_effect = exited
     supervisor.process = old_process
     new_process = Mock(spec=subprocess.Popen)
 
@@ -934,7 +930,7 @@ def test_unresponsive_deadline_kills_before_reporting(
     assert events[0]["generation"] == 1
     supervisor._expire()
     assert len(events) == 1
-    old_process.wait.assert_not_called()
+    old_process.wait.assert_any_call(timeout=0.2)
 
 
 def test_expired_batch_is_removed_before_callback() -> None:
@@ -1064,3 +1060,129 @@ def test_bad_state_cancel_retires_capture_chain_without_orphan_timeout() -> None
     supervisor._expire()
     assert events == [{**event, "generation": 1} for event in (capture_error, ack)]
     assert supervisor.generation == 1
+
+
+@pytest.mark.parametrize("cause", ["crash", "deadline", "restart-limit"])
+@pytest.mark.parametrize("wait_fails", [False, True])
+def test_restart_defers_generation_and_events_until_process_exits(
+    monkeypatch: pytest.MonkeyPatch, cause: str, wait_fails: bool
+) -> None:
+    """SIGKILL и даже успешный wait без poll не доказывают закрытие микрофона."""
+    clock = Clock()
+    supervisor, events = detached(clock)
+    old_process = Mock(spec=subprocess.Popen)
+    old_process.poll.return_value = None
+    if wait_fails:
+        old_process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    supervisor.process = old_process
+    launch = Mock()
+    monkeypatch.setattr(supervisor, "_launch", launch)
+    if cause == "deadline":
+        supervisor.send({"type": "record.cancel", "utterance_id": "one"}, timeout=1)
+        clock.now += 1
+        supervisor._expire()
+    else:
+        if cause == "restart-limit":
+            supervisor._restarts.extend([clock.now] * MAX_RESTARTS)
+        supervisor._restart()
+
+    old_process.kill.assert_called_once_with()
+    old_process.wait.assert_any_call(timeout=0.2)
+    for _ in range(3):
+        supervisor.pump()
+        supervisor._restart()  # Повторная эскалация не заменяет ожидаемую операцию.
+        assert supervisor.generation == 1
+        assert supervisor.process is old_process
+        assert supervisor.state == "running"
+        assert events == []
+        launch.assert_not_called()
+        with pytest.raises(RuntimeError, match="не запущен"):
+            supervisor.send({"type": "record.start", "utterance_id": "next"})
+    old_process.kill.assert_called_once_with()
+    assert all(call.kwargs["timeout"] == 0 for call in old_process.wait.call_args_list[1:])
+
+    old_process.poll.return_value = -signal.SIGKILL
+    old_process.wait.side_effect = None
+    supervisor.pump()
+    assert supervisor._restart_pending is None
+    if cause == "restart-limit":
+        assert supervisor.state == "stopped"
+        assert supervisor.generation == 1
+        launch.assert_not_called()
+        assert [event["code"] for event in events] == ["restart-limit"]
+    else:
+        assert supervisor.generation == 2
+        launch.assert_called_once_with()
+        assert len(events) == 1
+        assert events[0]["code"] == ("load-timeout" if cause == "deadline" else "worker-crashed")
+        if cause == "deadline":
+            assert events[0]["generation"] == 1
+            assert events[0]["request_type"] == "record.cancel"
+            assert events[0]["utterance_id"] == "one"
+    supervisor.pump()
+    assert len(events) == 1
+
+
+def test_deferred_restart_keeps_qt_timer_until_process_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """После отключения IPC Qt продолжает проверять D-state без блокирующих wait."""
+    from PyQt5 import QtCore
+
+    supervisor, events = detached(Clock())
+    supervisor._use_qt = True
+    process = Mock(spec=subprocess.Popen)
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    supervisor.process = process
+    timer = Mock()
+    monkeypatch.setattr(QtCore, "QTimer", Mock(return_value=timer))
+    launch = Mock()
+    monkeypatch.setattr(supervisor, "_launch", launch)
+    supervisor._restart()
+    timer.timeout.connect.assert_called_once_with(supervisor.pump)
+    timer.start.assert_called_once_with(50)
+    for _ in range(3):
+        supervisor.pump()
+        timer.stop.assert_not_called()
+        assert events == []
+    process.poll.return_value = -signal.SIGKILL
+    supervisor.pump()
+    timer.stop.assert_called_once_with()
+    timer.deleteLater.assert_called_once_with()
+    launch.assert_called_once_with()
+    assert len(events) == 1
+
+
+def test_deferred_restart_retries_kill_at_bounded_rate_without_early_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = Clock()
+    supervisor, events = detached(clock)
+    process = Mock(spec=subprocess.Popen)
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    supervisor.process = process
+    launch = Mock()
+    monkeypatch.setattr(supervisor, "_launch", launch)
+    supervisor._restart()
+    assert process.kill.call_count == 1
+    clock.now += 1.9
+    supervisor.pump()
+    assert process.kill.call_count == 1
+    clock.now += 0.1
+    supervisor.pump()
+    assert process.kill.call_count == 2
+    for _ in range(3):
+        supervisor.pump()
+    assert process.kill.call_count == 2
+    assert supervisor.generation == 1
+    assert events == []
+    launch.assert_not_called()
+    assert [call.kwargs["timeout"] for call in process.wait.call_args_list] == [0.2] + [0] * 6
+    process.poll.return_value = -signal.SIGKILL
+    supervisor.pump()
+    assert supervisor.generation == 2
+    assert len(events) == 1
+    assert supervisor._restart_kill_deadline is None
+    assert process.kill.call_count == 2

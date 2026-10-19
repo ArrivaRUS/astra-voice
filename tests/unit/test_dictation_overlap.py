@@ -90,20 +90,7 @@ class OverlapRig(Rig):
         return [str(m.get("utterance_id")) for m, _ in self.sent if m["type"] == kind]
 
     def event_for(self, index: int, kind: str, **fields: object) -> None:
-        if kind in ("cancelled", "audio.closed"):
-            fields.setdefault(
-                "request_type", {"cancelled": "record.cancel", "audio.closed": "audio.close"}[kind]
-            )
-        if kind == "record.limit" and self.ack_stop:
-            self.event_for(index, "record.stopped", **fields)
-        self.core.on_worker_event(
-            {
-                "type": kind,
-                "generation": self.worker_generation,
-                "utterance_id": self.uids[index],
-                **fields,
-            }
-        )
+        self.event(kind, utterance_id=self.uids[index], **fields)
 
     def result_for(self, index: int, text: str) -> None:
         self.now += 0.25
@@ -1258,8 +1245,6 @@ def test_pasted_first_preserves_each_queued_target_snapshot(
         "other-tab": PasteTarget(42, b"different-tab"),
         "other-window": PasteTarget(43, b"initial"),
     }[target_kind]
-    updated = PasteTarget(42, b"own-insertion")
-    rig.core._refresh_paste_target = lambda target: updated
     rig.window = original
     rig.start()
     rig.stop()
@@ -1299,7 +1284,6 @@ def test_own_kate_title_change_sends_second_phrase_to_clipboard(
         return rig.paste(text, target, mode)
 
     rig.core._paste = checked_paste
-    rig.core._refresh_paste_target = snapshot
     rig.window = snapshot(PasteTarget(42, None))
     begin_overlap(rig, release_b=True)
     rig.result_for(A, A_TEXT)

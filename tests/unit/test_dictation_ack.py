@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from subprocess import TimeoutExpired
 from typing import TYPE_CHECKING, cast
 from unittest.mock import Mock
 
@@ -21,6 +22,7 @@ from astra_voice.ui import indicators
 from astra_voice.ui.indicators import IndicatorGuard
 from astra_voice.ui.pill import STATE_DURATION_MS, PillState
 from astra_voice.ui.tray_icons import TrayState
+from astra_voice.worker.supervisor import WorkerSupervisor
 
 if TYPE_CHECKING:
     from astra_voice.ui.pill import Pill
@@ -281,3 +283,142 @@ def test_audio_closed_does_not_ack_running_recognition_cancel(
         t.delay == CANCEL_RESTART_MS and not t.cancelled and not t.fired for t in rig.timers
     )
     rig.restart_worker.assert_not_called()
+
+
+@pytest.mark.parametrize("ack", ["cancelled", "audio.closed", "restart"])
+@pytest.mark.parametrize("tail_order", ["before-timeout", "before-ack", "after-ack"])
+def test_cancel_timeout_preserves_terminal_tail(ack: str, tail_order: str) -> None:
+    """ИБ-53: исход audio-failed имеет один tail даже после эскалации отмены."""
+    rig = Rig()
+    rig.start()
+    rig.event("error", code="audio-failed")
+    tail = rig.timer(STATE_DURATION_MS[PillState.ERROR])
+    if tail_order == "before-timeout":
+        tail.fire()
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert rig.commands()[-1] == "audio.close"
+    assert rig.core.cleanup_pending and rig.recording
+    if tail_order == "before-ack":
+        tail.fire()
+    if ack == "restart":
+        rig.timer(CANCEL_RESTART_MS).fire()
+        rig.restart_worker.assert_called_once_with()
+    else:
+        rig.event(ack, request_type="record.cancel" if ack == "cancelled" else "audio.close")
+        rig.restart_worker.assert_not_called()
+    assert not rig.core.cleanup_pending and not rig.recording
+    if tail_order == "after-ack":
+        assert rig.core.phase is DictationPhase.FINISHING
+        assert rig.timer(STATE_DURATION_MS[PillState.ERROR]) is tail
+        tail.fire()
+    assert rig.core.phase is DictationPhase.IDLE
+    assert rig.fsm.state is HotkeyState.IDLE
+    assert rig.tray.state is TrayState.IDLE
+    rig.idle.assert_called_once_with()
+    assert not [t for t in rig.timers if not t.cancelled and not t.fired]
+
+
+@pytest.mark.parametrize("level", [False, True])
+@pytest.mark.parametrize("accepted", [False, True])
+def test_synchronous_audio_closed_waits_for_send_acceptance(
+    guarded_rig: tuple[Rig, IndicatorGuard], level: bool, accepted: bool
+) -> None:
+    rig, guard = guarded_rig
+    if level:
+        assert rig.core.start_level_monitor("fake-mic", Mock())
+        rig.core.stop_level_monitor()
+    else:
+        rig.start()
+        rig.core.cancel("tray")
+
+    def send(message: dict[str, object]) -> None:
+        if message["type"] != "audio.close":
+            return
+        assert not rig.core._awaiting_audio_closed
+        assert not rig.core._level_awaiting_audio_closed
+        rig.core.on_worker_event(
+            {"type": "audio.closed", "request_type": "audio.close", "generation": 1}
+        )
+        assert guard.recording and rig.recording
+        if not accepted:
+            raise ValueError("previous close is still pending")
+
+    rig.during_send = send
+    rig.restart_worker.side_effect = RuntimeError("worker still alive")
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert rig.recording is (not accepted)
+    assert guard.recording is (not accepted)
+    assert rig.core.cleanup_pending is (not accepted)
+    if not accepted:
+        assert not rig.core._awaiting_audio_closed
+        assert not rig.core._level_awaiting_audio_closed
+        rig.restart_worker.side_effect = None
+        rig.timer(CANCEL_RESTART_MS).fire()
+        assert not guard.recording and not rig.core.cleanup_pending
+
+
+def test_synchronous_audio_close_callback_cannot_adopt_next_capture(
+    guarded_rig: tuple[Rig, IndicatorGuard],
+) -> None:
+    rig, guard = guarded_rig
+    rig.start()
+    first_uid = rig.uid
+    rig.core.cancel("tray")
+
+    def send(message: dict[str, object]) -> None:
+        if message["type"] != "audio.close":
+            return
+        rig.event("cancelled", utterance_id=first_uid, request_type="record.cancel")
+        rig.now += 1
+        rig.start()
+        rig.core.on_worker_event(
+            {"type": "audio.closed", "request_type": "audio.close", "generation": 1}
+        )
+
+    rig.during_send = send
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert rig.uid != first_uid
+    assert rig.recording and guard.recording and rig.core._capture_open
+    assert not rig.core._awaiting_audio_closed
+    rig.restart_worker.assert_not_called()
+
+
+@pytest.mark.parametrize("restart", ["supervisor", "cancel-timeout"])
+def test_capture_guard_waits_for_delayed_worker_death(
+    guarded_rig: tuple[Rig, IndicatorGuard], restart: str
+) -> None:
+    """F2: kill/wait timeout не означает, что процесс освободил микрофон."""
+    rig, guard = guarded_rig
+    supervisor = WorkerSupervisor(rig.core.on_worker_event, use_qt=False)
+    supervisor.state = "running"
+    supervisor._socket = Mock(send=Mock(side_effect=len))
+    process = Mock(poll=Mock(return_value=None))
+    process.wait.side_effect = TimeoutExpired("worker", 0.2)
+    supervisor.process = process
+    supervisor._launch = Mock()
+    rig.core._generation = lambda: supervisor.generation
+    rig.during_send = supervisor.send
+    rig.start()
+    if restart == "supervisor":
+        supervisor._restart()
+        for _ in range(3):
+            supervisor.pump()
+            assert supervisor.generation == 1
+            assert rig.recording and guard.recording and rig.core._capture_open
+        supervisor._launch.assert_not_called()
+    else:
+        rig.core.cancel("tray")
+        rig.timer(CANCEL_TIMEOUT_MS).fire()
+        rig.restart_worker.side_effect = supervisor.stop
+        rig.timer(CANCEL_RESTART_MS).fire()
+        assert rig.recording and guard.recording and rig.core._capture_open
+    process.poll.return_value = -9
+    process.wait.side_effect = None
+    if restart == "supervisor":
+        supervisor.pump()
+        assert supervisor.generation == 2
+        supervisor._launch.assert_called_once_with()
+    else:
+        rig.timer(CANCEL_RESTART_MS).fire()
+    assert not rig.core._capture_open and not rig.recording and not guard.recording
+    supervisor.stop()

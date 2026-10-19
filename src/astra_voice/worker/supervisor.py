@@ -10,6 +10,7 @@ import sys
 import time
 from collections import deque
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -20,6 +21,7 @@ from astra_voice.worker import ipc
 MAX_RESTARTS = 3
 RESTART_WINDOW_S = 600
 _POLL_INTERVAL_S = 0.05
+_KILL_RETRY_INTERVAL_S = 2.0
 Message = dict[str, Any]
 RequestKey = tuple[str, str] | tuple[str, str, str]
 _CORRELATION: dict[str, RequestKey] = {
@@ -139,6 +141,8 @@ class WorkerSupervisor:
         self._activity = 0
         self._restarts: deque[float] = deque()
         self._retired: list[subprocess.Popen[bytes]] = []
+        self._restart_pending: tuple[int, list[Message], bool] | None = None
+        self._restart_kill_deadline: float | None = None
         self._notifier: Any = None
         self._timer: Any = None
 
@@ -201,8 +205,13 @@ class WorkerSupervisor:
         )
 
     def send(self, message: Message, *, timeout: float | None = None) -> Message:
-        """Ставит кадр в неблокирующую очередь и регистрирует ожидание ответа."""
-        if self.state != "running":
+        """Ставит кадр в очередь и регистрирует ожидание ответа.
+
+        Без явного timeout команда с utterance_id, включая record.cancel,
+        наследует срок последнего соседнего ожидания с таймаутом того же id.
+        Это исходный абсолютный срок, а не новый интервал от момента отмены.
+        """
+        if self.state != "running" or self._restart_pending is not None:
             raise RuntimeError("Воркер не запущен.")
         if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
             raise ValueError("Таймаут должен быть конечным и неотрицательным.")
@@ -269,6 +278,9 @@ class WorkerSupervisor:
         if not math.isfinite(timeout) or timeout < 0:
             raise ValueError("Таймаут pump должен быть конечным и неотрицательным.")
         self._retired = [process for process in self._retired if process.poll() is None]
+        if self._restart_pending is not None:
+            self._poll_restart()
+            return
         self._expire()
         connection = self._socket
         if self.state != "running" or connection is None:
@@ -485,7 +497,9 @@ class WorkerSupervisor:
         self._outgoing.clear()
 
     def _restart(self, *, report: bool = True, failure_code: str = "worker-crashed") -> None:
-        """Убивает повреждённый воркер и применяет скользящее окно рестартов."""
+        """Убивает воркер; смена поколения и события ждут подтверждения выхода."""
+        if self._restart_pending is not None:
+            return
         generation = self.generation
         failure = ipc.error(
             failure_code,
@@ -495,10 +509,40 @@ class WorkerSupervisor:
         )
         events = [self._finish(key, failure) for key in list(self._pending)]
         self._close_connection()
+        self._restart_pending = (generation, events, report)
         if self.process is not None and self.process.poll() is None:
             self.process.kill()
-            # Не ждём завершения в GUI; poll следующих pump соберёт статус.
-            self._retired.append(self.process)
+            self._restart_kill_deadline = self._clock() + _KILL_RETRY_INTERVAL_S
+            with suppress(Exception):
+                self.process.wait(timeout=0.2)
+        self._poll_restart()
+        if self._restart_pending is not None and self._use_qt:
+            from PyQt5.QtCore import QTimer
+
+            # IPC уже закрыт, но D-state процесс ещё может владеть микрофоном.
+            self._timer = QTimer()
+            self._timer.timeout.connect(self.pump)
+            self._timer.start(int(_POLL_INTERVAL_S * 1000))
+
+    def _poll_restart(self) -> None:
+        """Продолжает рестарт лишь после выхода; последующие wait неблокирующие."""
+        if self._restart_pending is None:
+            return
+        if self.process is not None:
+            with suppress(Exception):
+                self.process.wait(timeout=0)
+            if self.process.poll() is None:
+                now = self._clock()
+                if self._restart_kill_deadline is not None and now >= self._restart_kill_deadline:
+                    # Повторяем сигнал с ограниченной частотой; это не ACK выхода.
+                    self._restart_kill_deadline = now + _KILL_RETRY_INTERVAL_S
+                    with suppress(Exception):
+                        self.process.kill()
+                return
+        generation, events, report = self._restart_pending
+        self._restart_pending = None
+        self._restart_kill_deadline = None
+        self._close_connection()
         now = self._clock()
         while self._restarts and now - self._restarts[0] >= RESTART_WINDOW_S:
             self._restarts.popleft()
@@ -526,6 +570,8 @@ class WorkerSupervisor:
     def stop(self) -> None:
         """Закрывает IPC, посылает SIGTERM; через две секунды применяет SIGKILL."""
         self.state = "stopped"
+        self._restart_pending = None
+        self._restart_kill_deadline = None
         self._close_connection()
         processes = list(self._retired)
         self._retired.clear()

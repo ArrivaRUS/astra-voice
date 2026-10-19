@@ -311,8 +311,6 @@ def test_overlap_chat_switch_during_first_paste_keeps_second_in_clipboard(
         return outcome
 
     rig.core._paste = run
-    # На старом коде этот порт снимал Y после A и переписывал цель B.
-    rig.core._refresh_paste_target = lambda target: paste.snapshot_target(x, target.window)
     with caplog.at_level(logging.DEBUG):
         begin_overlap(rig, release_b=True)
         rig.result_for(A, A_TEXT)

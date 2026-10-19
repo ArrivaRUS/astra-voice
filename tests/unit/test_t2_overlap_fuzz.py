@@ -21,7 +21,7 @@ import pytest
 from test_dictation import MARKER, Rig
 from test_indicators import FakePill, FakeTimer, FakeTray
 
-from astra_voice.core.dictation import DictationPhase
+from astra_voice.core.dictation import CANCEL_RESTART_MS, CANCEL_TIMEOUT_MS, DictationPhase
 from astra_voice.platform.hotkey import HotkeyMode, HotkeyState
 from astra_voice.ui import indicators
 from astra_voice.ui.indicators import IndicatorGuard
@@ -384,6 +384,52 @@ def test_bad_state_waits_through_real_chain(monkeypatch: pytest.MonkeyPatch, kin
         chain.close()
 
 
+@pytest.mark.parametrize("finish", ["cancelled", "restart"])
+def test_rejected_close_cannot_adopt_previous_phrases_ack(
+    monkeypatch: pytest.MonkeyPatch, finish: str
+) -> None:
+    """F1: ручная доставка настоящих ответов A после отклонённого close B."""
+    chain = Chain(monkeypatch, HotkeyMode.PTT)
+    try:
+        uid_a = chain.start()
+        chain.rig.fsm.escape(chain.rig.now)
+        chain.rig.timer(CANCEL_TIMEOUT_MS).fire()
+        chain.commands()
+        replies = []
+        while not chain.responses.empty():
+            replies.append(chain.responses.get_nowait())
+        closed_a = next(r for r in replies if r["type"] == "audio.closed")
+        cancel_a = next(
+            r for r in replies if r["type"] == "cancelled" and r["utterance_id"] == uid_a
+        )
+        chain.deliver(cancel_a)
+        chain.drain()
+        chain.rig.now += 1
+        uid_b = chain.start()
+        assert uid_b is not None and uid_b != uid_a
+        chain.rig.fsm.escape(chain.rig.now)
+        chain.rig.timer(CANCEL_TIMEOUT_MS).fire()
+        # Supervisor ещё ждёт close A и отклонил close B до отправки в wire.
+        assert not any(c["type"] == "audio.close" for c in chain.channel.commands)
+        context_b = next(c for c in chain.rig.core._contexts if c._utterance_id == uid_b)
+        assert not context_b._awaiting_audio_closed
+        chain.deliver(closed_a)
+        assert chain.source.is_open and context_b._capture_open
+        assert chain.guard.recording and chain.rig.recording and context_b._cancel_pending
+        if finish == "cancelled":
+            chain.commands()
+            chain.drain()
+            chain.rig.restart_worker.assert_not_called()
+        else:
+            chain.rig.timer(CANCEL_RESTART_MS).fire()
+            chain.rig.restart_worker.assert_called_once_with()
+        assert not chain.source.is_open and not context_b._capture_open
+        assert not chain.guard.recording and not chain.rig.recording
+        chain.settle()
+    finally:
+        chain.close()
+
+
 def run_fixed_seed_chain(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -618,6 +664,26 @@ def test_capture_fixed_seed_async_ack_invariants(
     """ИБ-51: 24 других seed × 2 режима: окно ACK и ещё 24 случайных шага."""
     violations = run_fixed_seed_corpus(
         monkeypatch, first_seed=0xAC4_2026, count=24, mode=mode, steps=24
+    )
+    assert not violations, violations
+
+
+@pytest.mark.parametrize(
+    ("seed", "mode"),
+    [
+        (900203, HotkeyMode.TOGGLE),
+        (900432, HotkeyMode.TOGGLE),
+        (900461, HotkeyMode.TOGGLE),
+        (900518, HotkeyMode.PTT),
+        (900518, HotkeyMode.TOGGLE),
+    ],
+)
+def test_terminal_tail_fixed_seed_regressions(
+    monkeypatch: pytest.MonkeyPatch, seed: int, mode: HotkeyMode
+) -> None:
+    """ИБ-53: точные параметры p_fuzz_wide/p_seed_fix, включая settle до IDLE."""
+    violations = run_fixed_seed_chain(
+        monkeypatch, seed=seed, mode=mode, steps=120, tray_faults=bool(seed % 2)
     )
     assert not violations, violations
 

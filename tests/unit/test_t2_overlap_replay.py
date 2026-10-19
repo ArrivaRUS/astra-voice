@@ -55,7 +55,7 @@ class WorkerModel:
             uid = str(message["utterance_id"])
             if kind == "record.cancel":
                 self.cancel_replies[uid] = (
-                    {"type": "cancelled"}
+                    {"type": "cancelled", "request_type": kind}
                     if uid in self.known
                     else {"type": "error", "code": "bad-state", "request_type": kind}
                 )
@@ -174,11 +174,8 @@ def run_sequence(
             "generation": rig.worker_generation,
             **fields,
         }
-        if event_type in {"cancelled", "audio.closed"}:
-            message.setdefault(
-                "request_type",
-                {"cancelled": "record.cancel", "audio.closed": "audio.close"}[event_type],
-            )
+        if event_type == "audio.closed":
+            message.setdefault("request_type", "audio.close")
         if uid is not None:
             message["utterance_id"] = uid
         rig.core.on_worker_event(message)
@@ -458,11 +455,8 @@ class CaptureReplay:
             "generation": self.worker.generation,
             **fields,
         }
-        if event_type in {"cancelled", "audio.closed"}:
-            message.setdefault(
-                "request_type",
-                {"cancelled": "record.cancel", "audio.closed": "audio.close"}[event_type],
-            )
+        if event_type == "audio.closed":
+            message.setdefault("request_type", "audio.close")
         if uid is not None:
             message["utterance_id"] = uid
         self.rig.core.on_worker_event(message)

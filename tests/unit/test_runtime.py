@@ -888,12 +888,18 @@ def test_seamless_switch_candidate_outcome(
     else:
         rig.hotkey.fsm.press(rig.now)
         assert_phase(rig.runtime, DictationPhase.RECORDING)
+        uid = old.send.call_args.args[0]["utterance_id"]
         callback({"type": "model.loaded", "generation": candidate.generation})
         finished.assert_not_called()
         assert rig.runtime.supervisor is old
         old.stop.assert_not_called()
         rig.release(rig.now + 1)
-        old_callback({"type": "result", "generation": old.generation, "text": MARKER})
+        # Rig.send uses the most recent factory callback, which now belongs to
+        # the candidate. Deliver the old worker's physical-close notice explicitly.
+        old_callback({"type": "record.stopped", "generation": old.generation, "utterance_id": uid})
+        old_callback(
+            {"type": "result", "generation": old.generation, "utterance_id": uid, "text": MARKER}
+        )
         rig.timers[-1].fire()
         assert rig.runtime.supervisor is candidate
         old.stop.assert_called_once_with()
@@ -3111,7 +3117,10 @@ def test_cancel_restart_replaces_supervisor_and_routes_new_cycle(
     rig.supervisor_factory.return_value = new
     rig.trace.clear()
     new.start.side_effect = lambda: rig.record("new.start")
-    next(t for t in rig.timers if t.interval == CANCEL_RESTART_MS).fire()
+    restart_timer = next(
+        t for t in rig.timers if t.interval == CANCEL_RESTART_MS and t.active and not t.deleted
+    )
+    restart_timer.fire()
     assert rig.trace[:2] == ["worker.stop", "new.start"]
     assert runtime.supervisor is new
     old.stop.assert_called_once_with()
@@ -3428,7 +3437,7 @@ def test_selfcheck_failure_blocks_dictation_once(
         assert not rig.runtime.orchestrator.cleanup_pending
         assert timer.deleted and not timer.active
         assert not rig.runtime.timers
-        rig.tray.set_model_recheck_enabled.assert_called_with(False)
+        rig.tray.set_model_recheck_enabled.assert_called_with(True)
         rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
         factory_calls = rig.supervisor_factory.call_count
         requests = list(rig.supervisor.send.call_args_list)

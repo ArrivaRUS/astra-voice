@@ -1286,13 +1286,18 @@ class AudioCapture:
         self.check_stop_watchdog()
         with self._watchdog_lock:
             own_deadline = self._stop_deadlines.get(thread, time.monotonic() + STOP_WATCHDOG_S)
-            deadline = min([own_deadline, *self._stop_deadlines.values()])
         while thread.is_alive():
             self.check_stop_watchdog()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            now = time.monotonic()
+            if own_deadline <= now:
                 raise CaptureStopTimeout("Поток захвата не завершился до срока ожидания.")
-            thread.join(timeout=remaining)
+            with self._watchdog_lock:
+                # Чужой срок только будит нас для watchdog; завершившийся сосед
+                # больше не ограничивает ожидание владельца.
+                wake_deadline = min(
+                    [own_deadline] + [d for t, d in self._stop_deadlines.items() if t.is_alive()]
+                )
+            thread.join(timeout=max(0.0, wake_deadline - now))
         self.check_stop_watchdog()
 
     @property
@@ -1522,9 +1527,9 @@ class PulseSimpleSource:
 
     def close(self) -> None:
         """Освобождает дескриптор ровно один раз и сбрасывает выбранное устройство."""
-        if self._handle is not None and self._pulse is not None:
-            self._pulse.lib.pa_simple_free(self._handle)
-        self._handle = None
+        handle, self._handle = self._handle, None
+        if handle is not None and self._pulse is not None:
+            self._pulse.lib.pa_simple_free(handle)
         self._device_name = None
         self._selected_device = None
         self.device_label = None

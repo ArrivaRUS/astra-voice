@@ -15,7 +15,7 @@ from typing import Any
 
 from astra_voice.core.version import __version__
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAX_FRAME_BYTES = 64 * 1024
 MAX_TEXT_BYTES = 32 * 1024
 MAX_DEVICE_LABEL = 120

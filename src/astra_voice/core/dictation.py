@@ -321,7 +321,6 @@ class DictationOrchestrator:
         microphone_count: Callable[[], int] = lambda: 0,
         hotkey_refuse: Callable[[], None] | None = None,
         set_tray_trusted: Callable[[bool], None] | None = None,
-        refresh_paste_target: Callable[[PasteTarget], PasteTarget] | None = None,
     ) -> None:
         # Контекст фраз создаётся первым: остальные поля фразы читаются через него.
         self._ctx: _Utterance | None = None
@@ -345,7 +344,6 @@ class DictationOrchestrator:
         self._tray = tray
         self._paste = paste
         self._active_window = active_window
-        self._refresh_paste_target = refresh_paste_target
         self._schedule = schedule
         self._cancel_timer = cancel_timer
         self._hotkey_done = hotkey_done
@@ -386,6 +384,7 @@ class DictationOrchestrator:
         self._level_failed = False
         self._level_idle_message = ""
         self._level_awaiting_audio_closed = False
+        self._audio_close_events: list[dict[str, Any]] | None = None
 
     # --- Очередь фраз (US-2.7) -------------------------------------------------------
 
@@ -707,12 +706,13 @@ class DictationOrchestrator:
             self._level_failed = True
             self._level_notify(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
         try:
-            # Ставим до send: ответ может прийти синхронно.
-            self._level_awaiting_audio_closed = True
-            self._send({"type": "audio.close"})
+            self._send_audio_close(level=True)
         except Exception:
             self._level_failed = True
             self._level_notify(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
+            # Немедленная попытка заменяет уже взведённый restart; её отказ
+            # должен оставить одну повторную попытку, а не два таймера.
+            self._cancel_timers()
             self._level_cancel_restart()
 
     def _level_cancel_restart(self) -> None:
@@ -833,7 +833,7 @@ class DictationOrchestrator:
 
     def _finish_test(self, update: MicrophoneTestUpdate) -> None:
         callback, self._test_callback = self._test_callback, None
-        self._cancel_timers(keep_cancel_restart=self._awaiting_audio_closed)
+        self._cancel_timers(keep_cancel_restart=self._cancel_pending)
         self._cancel_pending = self._capture_open or self._cancel_pending
         self._change_phase(DictationPhase.IDLE)
         self._ensure_capture_closed()
@@ -1281,6 +1281,15 @@ class DictationOrchestrator:
     def on_worker_event(self, event: dict[str, Any]) -> None:
         """Отбрасывает чужие результаты до чтения содержимого распознанной речи."""
         if self._closed or self._terminated_generation == self._generation():
+            return
+        if (
+            self._audio_close_events is not None
+            and event.get("type") == "audio.closed"
+            and event.get("request_type") == "audio.close"
+        ):
+            # Синхронный ответ разбирается после результата send: отказ отправки
+            # не даёт текущей фразе право принять запоздалый close другой фразы.
+            self._audio_close_events.append(event.copy())
             return
         if event.get("type") in ("record.started", "record.stopped"):
             target = self._route(event)
@@ -1923,12 +1932,11 @@ class DictationOrchestrator:
         if self._generation() != self._worker_generation:
             self._fail_restarted()
             return
-        self._cancel_timers()
+        self._cancel_timers(keep_tail_done=self._capture_outcome is not None)
         # Global close/restart must never interrupt another phrase's capture.
         if self._other_capture_open():
             self._later(CANCEL_TIMEOUT_MS, self._cancel_timeout)
             return
-        self._awaiting_audio_closed = True
         self._later(CANCEL_RESTART_MS, self._restart_after_cancel)
         # UI callbacks may acknowledge A and start B reentrantly.
         if self.test_active:
@@ -1950,13 +1958,29 @@ class DictationOrchestrator:
         if self._other_capture_open():
             self._later(CANCEL_TIMEOUT_MS, self._cancel_timeout)
             return
-        self._awaiting_audio_closed = True
         if not any(callback == self._restart_after_cancel for _, callback in self._timers.values()):
             self._later(CANCEL_RESTART_MS, self._restart_after_cancel)
         try:
-            self._send({"type": "audio.close"})
+            self._send_audio_close()
         except Exception:
             self._log.warning("диктовка: освобождение микрофона не удалось")
+
+    def _send_audio_close(self, *, level: bool = False) -> None:
+        """Ожидание принадлежит только успешно отправившему close контексту."""
+        context = self._current()
+        events: list[dict[str, Any]] = []
+        self._audio_close_events = events
+        try:
+            self._send({"type": "audio.close"})
+            if context._cancel_pending and context._worker_generation == self._generation():
+                if level:
+                    self._level_awaiting_audio_closed = True
+                else:
+                    context._awaiting_audio_closed = True
+        finally:
+            self._audio_close_events = None
+            for event in events:
+                self.on_worker_event(event)
 
     def _restart_after_cancel(self) -> None:
         if self._other_capture_open():
@@ -2147,7 +2171,9 @@ class DictationOrchestrator:
         """Терминал без подтверждения stop обязан запросить отмену и дождаться ack."""
         if self._capture_open and self._generation() == self._worker_generation:
             self._cancel_pending = True
-            if not self._awaiting_audio_closed:
+            if not self._awaiting_audio_closed and not any(
+                callback == self._restart_after_cancel for _, callback in self._timers.values()
+            ):
                 self._later(CANCEL_TIMEOUT_MS, self._cancel_timeout)
                 self._send_cancel()
 
@@ -2161,7 +2187,7 @@ class DictationOrchestrator:
         self._tail_pending = False
         self._result_pending = None
         self._paste_text = None
-        self._cancel_timers(keep_cancel_restart=self._awaiting_audio_closed)
+        self._cancel_timers(keep_cancel_restart=self._cancel_pending)
         self._change_phase(DictationPhase.FINISHING)
         self._ensure_capture_closed()
         if not self._any_capture_open():

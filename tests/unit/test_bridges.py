@@ -3547,13 +3547,18 @@ class MicrophoneBridgeRig:
         self.commands.extend(ipc.FrameReader().feed(ipc.encode(message)))
 
     def event(self, kind: str, **fields: object) -> None:
-        if kind in ("cancelled", "audio.closed"):
-            fields.setdefault(
-                "request_type", {"cancelled": "record.cancel", "audio.closed": "audio.close"}[kind]
+        uid = fields.get("utterance_id")
+        if uid is None:
+            uid = next(
+                msg["utterance_id"]
+                for msg in reversed(self.commands)
+                if msg["type"] == "record.start"
             )
-        uid = next(
-            msg["utterance_id"] for msg in reversed(self.commands) if msg["type"] == "record.start"
-        )
+        if kind == "cancelled" and "request_type" not in fields:
+            request = next(msg for msg in reversed(self.commands) if msg.get("utterance_id") == uid)
+            fields["request_type"] = request["type"]
+        elif kind == "audio.closed":
+            fields.setdefault("request_type", "audio.close")
         message = {"type": kind, "utterance_id": uid, **fields}
         if kind == "result":
             message.update(infer_ms=5.0, audio_ms=1000.0)
@@ -3564,6 +3569,49 @@ class MicrophoneBridgeRig:
 @pytest.fixture
 def microphone_bridge() -> MicrophoneBridgeRig:
     return MicrophoneBridgeRig()
+
+
+@pytest.mark.parametrize("request_type", ["record.start", "record.cancel", "recognize"])
+def test_microphone_event_cancelled_uses_last_request_of_selected_phrase(
+    microphone_bridge: MicrophoneBridgeRig,
+    monkeypatch: pytest.MonkeyPatch,
+    request_type: str,
+) -> None:
+    rig = microphone_bridge
+    rig.controller.startTest()
+    uid = rig.commands[-1]["utterance_id"]
+    rig.send({"type": request_type, "utterance_id": uid})
+    rig.send({"type": "record.start", "utterance_id": "other-phrase"})
+    receive = Mock()
+    monkeypatch.setattr(rig.core, "on_worker_event", receive)
+    rig.event("cancelled", utterance_id=uid)
+    receive.assert_called_once_with(
+        {
+            "type": "cancelled",
+            "utterance_id": uid,
+            "request_type": request_type,
+            "generation": rig.generation,
+        }
+    )
+    receive.reset_mock()
+    rig.event("cancelled", utterance_id=uid, request_type="record.cancel")
+    assert receive.call_args.args[0]["request_type"] == "record.cancel"
+
+
+def test_microphone_event_audio_closed_keeps_global_request_type(
+    microphone_bridge: MicrophoneBridgeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = microphone_bridge
+    rig.controller.startTest()
+    uid = rig.commands[-1]["utterance_id"]
+    rig.send({"type": "audio.close"})
+    rig.send({"type": "record.cancel", "utterance_id": uid})
+    receive = Mock()
+    monkeypatch.setattr(rig.core, "on_worker_event", receive)
+    rig.event("audio.closed")
+    receive.assert_called_once_with(
+        {"type": "audio.closed", "request_type": "audio.close", "generation": rig.generation}
+    )
 
 
 def test_microphone_resolved_device_signal_and_worker_restart(

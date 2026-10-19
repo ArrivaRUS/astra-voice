@@ -40,7 +40,7 @@ _MESSAGES: list[dict[str, Any]] = [
     {"type": "audio.close"},
     {
         "type": "hello",
-        "protocol": 3,
+        "protocol": 4,
         "build": "0.1.0",
         "runtime": {"python": "3.11.0", "onnxruntime": None},
     },
@@ -323,11 +323,11 @@ def test_invalid_hello(changes: dict[str, Any]) -> None:
 
 def test_protocol_versions_reject_both_directions(monkeypatch: pytest.MonkeyPatch) -> None:
     new_hello = ipc.make_hello()
-    old_hello = {**new_hello, "protocol": 2}
+    old_hello = {**new_hello, "protocol": 3}
     with pytest.raises(ipc.FrameError, match="Программа обновлена") as caught:
         ipc.decode(_payload(old_hello))
     assert caught.value.code == ipc.PROTOCOL_MISMATCH
-    monkeypatch.setattr(ipc, "PROTOCOL_VERSION", 2)
+    monkeypatch.setattr(ipc, "PROTOCOL_VERSION", 3)
     with pytest.raises(ipc.FrameError, match="Программа обновлена"):
         ipc.decode(_payload(new_hello))
 
@@ -406,7 +406,7 @@ def test_hello_without_onnxruntime(monkeypatch: pytest.MonkeyPatch) -> None:
     assert type(hello["protocol"]) is int
     assert hello == {
         "type": "hello",
-        "protocol": 3,
+        "protocol": 4,
         "build": __version__,
         "runtime": {"python": platform.python_version(), "onnxruntime": None},
     }

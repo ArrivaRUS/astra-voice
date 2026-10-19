@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
-from unittest.mock import call
+import json
+import struct
+import subprocess
+from typing import Any
+from unittest.mock import Mock, call
 
 import pytest
 from test_command_mouse_runtime import MouseRuntimeRig
-from test_runtime import Rig
+from test_runtime import Rig, SwitchRig
 from test_runtime import smoke_wav as smoke_wav  # noqa: F401
 from test_runtime_t2b_fixes import ready_keyboard, stop_transport
 
-from astra_voice.core.dictation import DictationPhase
+from astra_voice.core.dictation import CANCEL_TIMEOUT_MS, DictationPhase
 from astra_voice.platform.hotkey import GrabResult, HotkeyEvent, HotkeyMode, HotkeyState
 from astra_voice.platform.mouse_button import MouseHoldState
-from astra_voice.ui.pill import PillState
+from astra_voice.ui.pill import STATE_DURATION_MS, PillState
 from astra_voice.ui.tray_icons import TrayState
 from astra_voice.worker import ipc
+from astra_voice.worker.supervisor import WorkerSupervisor
 
 pytestmark = pytest.mark.unit
 
@@ -185,7 +190,10 @@ def test_terminal_pending_rearm_failure_keeps_retry_until_key_released(
         runtime.shutdown()
 
 
-def test_terminal_wake_is_blocked_until_explicit_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("restart", ["direct", "tray"])
+def test_terminal_wake_is_blocked_until_explicit_restart(
+    monkeypatch: pytest.MonkeyPatch, restart: str
+) -> None:
     mouse = MouseRuntimeRig(monkeypatch)
     rig, runtime = mouse.rig, mouse.runtime
     runtime._model_parked = True
@@ -196,9 +204,238 @@ def test_terminal_wake_is_blocked_until_explicit_restart(monkeypatch: pytest.Mon
         assert_rejected(rig, factories)
         generation = rig.supervisor.generation
         rig.supervisor.send.side_effect = rig.send
-        runtime.restart_worker()
+        rig.tray.set_model_recheck_enabled.assert_called_with(True)
+        if restart == "direct":
+            runtime.restart_worker()
+        else:
+            rig.tray.on_model_recheck()
         assert runtime._terminated_generation is None
         assert rig.supervisor_factory.call_count == factories + 1
         assert rig.supervisor.generation > generation
+        if restart == "tray":
+            assert runtime._loading_model
+            rig.supervisor.send.assert_not_called()
+        runtime._model_parked = False
+        runtime._selfcheck = "ok"
+        runtime._model_ready()
+        runtime.hotkey.handle_event(HotkeyEvent("KeyPress", 65, 1, mods=4), rig.now)
+        assert any(c.args[0]["type"] == "record.start" for c in rig.supervisor.send.call_args_list)
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("parked", [False, True])
+@pytest.mark.parametrize("action", ["start_test", "reload_model", "switch_model"])
+def test_terminal_model_actions_repeat_reason_without_new_worker(
+    monkeypatch: pytest.MonkeyPatch, parked: bool, action: str
+) -> None:
+    mouse = MouseRuntimeRig(monkeypatch)
+    rig, runtime = mouse.rig, mouse.runtime
+    runtime._model_parked = parked
+    callback = Mock()
+    runtime.on_switch_finished = callback
+    resolve = Mock(side_effect=AssertionError("Terminal generation must not resolve models"))
+    monkeypatch.setattr(runtime, "_resolve_model_request", resolve)
+    try:
+        factories = mismatch(rig)
+        requests = list(rig.supervisor.send.call_args_list)
+        for _ in range(2):
+            callback.reset_mock()
+            rig.pill.show_state.reset_mock()
+            rig.tray.set_state.reset_mock()
+            if action == "start_test":
+                assert not runtime.start_test("test-mic", callback)
+                callback.assert_called_once()
+                update = callback.call_args.args[0]
+                assert update.state == "error"
+                assert update.message == ipc.PROTOCOL_MISMATCH_MESSAGE
+            elif action == "reload_model":
+                runtime.reload_model()
+            else:
+                runtime.switch_model(min_ram_mb=1, pause=False)
+                callback.assert_called_once_with("failed")
+            assert_rejected(rig, factories)
+            assert rig.supervisor.send.call_args_list == requests
+            resolve.assert_not_called()
+            assert runtime._pending_test is None
+            assert runtime._pending_switch is None
+            assert not runtime._switch_active()
+            assert not runtime._loading_model
+            assert runtime._model_parked is parked
+    finally:
+        runtime.shutdown()
+
+
+def test_protocol3_hello_terminates_new_worker_in_protocol4_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert ipc.PROTOCOL_VERSION == 4
+    monkeypatch.setattr(
+        WorkerSupervisor, "_launch", lambda supervisor: setattr(supervisor, "state", "running")
+    )
+    supervisors: list[WorkerSupervisor] = []
+
+    def factory(**kwargs: Any) -> WorkerSupervisor:
+        supervisor = WorkerSupervisor(on_event=kwargs["on_event"], use_qt=False)
+        supervisors.append(supervisor)
+        return supervisor
+
+    rig = Rig(monkeypatch, supervisor_factory=factory)
+    runtime = rig.runtime
+    runtime.start()
+    try:
+        runtime.restart_worker(wait_for_model=True)
+        supervisor = runtime.supervisor
+        generation = supervisor.generation
+        send = Mock(wraps=supervisor.send)
+        monkeypatch.setattr(supervisor, "send", send)
+        # Decode an old hello frame instead of injecting a pre-made mismatch event.
+        hello = {**ipc.make_hello(), "protocol": 3}
+        payload = json.dumps(hello).encode("utf-8")
+        supervisor._receive(struct.pack(">I", len(payload)) + payload, generation)
+        assert supervisor.state == "stopped"
+        assert runtime._terminated_generation == generation
+        assert runtime.phase == DictationPhase.IDLE
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
+        rig.tray.set_state.assert_called_with(TrayState.ERROR)
+        rig.tray.set_state.reset_mock()
+        for offset in (0, 2):
+            rig.hotkey.fsm.press(rig.now + offset)
+            rig.release(rig.now + offset + 1)
+            runtime.reload_model()
+            runtime.switch_model(min_ram_mb=1, pause=False)
+            assert not runtime.start_test("test-mic", Mock())
+        # A late compatible hello cannot revive the terminated process.
+        supervisor._receive(ipc.encode(ipc.make_hello()), generation)
+        runtime._on_worker_event({"type": "hello", "generation": generation})
+        runtime._on_worker_event({"type": "model.loaded", "generation": generation})
+        assert len(supervisors) == 2
+        assert supervisor.state == "stopped"
+        assert runtime._terminated_generation == generation
+        send.assert_not_called()
+        assert not supervisor._outgoing
+        assert rig.tray.set_state.call_args_list
+        assert all(c == call(TrayState.ERROR) for c in rig.tray.set_state.call_args_list)
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("loaded_at", ["recording", "idle-cleanup"])
+def test_candidate_waits_for_capture_cleanup_after_error_tail_then_promotes(
+    monkeypatch: pytest.MonkeyPatch,
+    loaded_at: str,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    rig, runtime = bench.rig, bench.rig.runtime
+    old = runtime.supervisor
+    process = Mock()
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired("worker", 2)
+    transport = WorkerSupervisor(lambda event: None, use_qt=False)
+    transport.state = "running"
+    transport.process = process
+    old.stop.side_effect = transport.stop
+    try:
+        bench.switch()
+        candidate = bench.workers[-1]
+        SwitchRig.emit(candidate, type="hello")
+        rig.hotkey.fsm.press(rig.now)
+        uid = old.send.call_args.args[0]["utterance_id"]
+        assert runtime.phase == DictationPhase.RECORDING
+        if loaded_at == "recording":
+            SwitchRig.emit(candidate, type="model.loaded", id="whisper")
+        assert runtime.supervisor is old
+        rig.job_error(uid, code="audio-failed")
+        next(t for t in rig.timers if t.active and t.interval == CANCEL_TIMEOUT_MS).fire()
+        next(
+            t for t in rig.timers if t.active and t.interval == STATE_DURATION_MS[PillState.ERROR]
+        ).fire()
+        if loaded_at == "idle-cleanup":
+            SwitchRig.emit(candidate, type="model.loaded", id="whisper")
+        assert runtime.supervisor is old
+        assert runtime.phase == DictationPhase.IDLE
+        assert old.generation < candidate.generation
+        assert runtime.orchestrator.cleanup_pending
+        assert runtime.orchestrator._capture_open
+        rig.guard.set_recording.assert_called_with(True)
+        old.stop.assert_not_called()
+        assert process.poll() is None
+        # The old process has now exited; its own cancellation ACK is delivered
+        # after the ERROR tail already consumed the transition to IDLE.
+        process.poll.return_value = 0
+        process.wait.side_effect = None
+        rig.event(type="cancelled", utterance_id=uid, request_type="record.cancel")
+        assert not runtime.orchestrator.cleanup_pending
+        assert not runtime.orchestrator._capture_open
+        assert runtime.supervisor is candidate
+        old.stop.assert_called_once_with()
+        assert runtime._loading_model
+        bench.finished.assert_not_called()
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("requested_at", ["recording", "idle-cleanup"])
+def test_pending_switch_waits_for_microphone_cleanup_then_starts(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_at: str,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    rig, runtime = bench.rig, bench.rig.runtime
+    old = runtime.supervisor
+    try:
+        assert runtime.start_test("test-mic", Mock())
+        uid = old.send.call_args.args[0]["utterance_id"]
+        if requested_at == "recording":
+            bench.switch()
+            assert runtime._pending_switch is not None
+        rig.job_error(uid, code="audio-failed")
+        assert runtime.phase == DictationPhase.IDLE
+        assert runtime.orchestrator.cleanup_pending
+        if requested_at == "idle-cleanup":
+            bench.switch()
+        assert runtime._pending_switch is not None
+        assert not bench.workers
+        rig.guard.set_recording.assert_called_with(True)
+        old.stop.assert_not_called()
+        rig.event(type="cancelled", utterance_id=uid, request_type="record.cancel")
+        assert not runtime.orchestrator.cleanup_pending
+        assert runtime._pending_switch is None
+        assert len(bench.workers) == 1
+        candidate = bench.workers[-1]
+        SwitchRig.emit(candidate, type="hello")
+        SwitchRig.emit(candidate, type="model.loaded", id="whisper")
+        assert runtime.supervisor is candidate
+        old.stop.assert_called_once_with()
+    finally:
+        runtime.shutdown()
+
+
+def test_candidate_is_not_promoted_when_old_process_stop_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    old = runtime.supervisor
+    process = Mock()
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired("worker", 2)
+    transport = WorkerSupervisor(lambda event: None, use_qt=False)
+    transport.state = "running"
+    transport.process = process
+    old.stop.side_effect = transport.stop
+    try:
+        bench.switch()
+        candidate = bench.workers[-1]
+        SwitchRig.emit(candidate, type="hello")
+        SwitchRig.emit(candidate, type="model.loaded", id="whisper")
+        assert process.poll() is None
+        assert process.wait.call_count == 2
+        process.kill.assert_called_once_with()
+        assert runtime.supervisor is old
+        assert not runtime._switch_active()
+        candidate.stop.assert_called_once_with()
+        bench.finished.assert_called_once_with("failed")
     finally:
         runtime.shutdown()

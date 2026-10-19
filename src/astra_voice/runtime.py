@@ -357,7 +357,6 @@ class DictationRuntime(QObject):
                 tray=self.tray,
                 paste=self.paste_func,
                 active_window=lambda: snapshot_target(self.x11, self.x11.target_window()),
-                refresh_paste_target=lambda target: snapshot_target(self.x11, target.window),
                 schedule=self.schedule,
                 cancel_timer=self.cancel_timer,
                 hotkey_done=self._input_done,
@@ -1685,6 +1684,9 @@ class DictationRuntime(QObject):
 
     def start_test(self, device: str, callback: TestCallback) -> bool:
         """Запускает частную проверку; новую модель мастера сначала загружает."""
+        if self._reject_terminal_gesture():
+            callback(MicrophoneTestUpdate("error", message=ipc.PROTOCOL_MISMATCH_MESSAGE))
+            return False
         if self._terminating_worker:
             return False
         if (
@@ -1748,6 +1750,8 @@ class DictationRuntime(QObject):
 
     def reload_model(self) -> None:
         """Перезапускает воркер, если текущая модель ещё не загружена и проверена."""
+        if self._reject_terminal_gesture():
+            return
         if self._appimage_removal_reserved:
             return
         try:
@@ -1777,6 +1781,10 @@ class DictationRuntime(QObject):
 
     def switch_model(self, *, min_ram_mb: int, pause: bool = False) -> None:
         """Меняет выбранную модель после завершения текущей диктовки."""
+        if self._reject_terminal_gesture():
+            if self.on_switch_finished is not None and not self._closed:
+                self.on_switch_finished("failed")
+            return
         if (
             self._closed
             or self._terminating_worker
@@ -1785,7 +1793,7 @@ class DictationRuntime(QObject):
             or self._switch_active()
         ):
             return
-        if self.phase != DictationPhase.IDLE:
+        if self.phase != DictationPhase.IDLE or self.orchestrator.cleanup_pending:
             self._pending_switch = (min_ram_mb, pause)
             self._pending_switch_timer = self.schedule(
                 int(PENDING_SWITCH_TIMEOUT_S * 1000), self._pending_switch_watchdog
@@ -1972,16 +1980,24 @@ class DictationRuntime(QObject):
             self._fail_candidate()
 
     def _promote_candidate(self) -> None:
+        if self.orchestrator.cleanup_pending:
+            return
         candidate = self._switch_candidate
         event = self._switch_loaded_event
         if candidate is not None and event is not None and self.phase == DictationPhase.IDLE:
             request = self._switch_request
             assert request is not None
             old = self.supervisor
+            try:
+                old.stop()
+            except Exception:
+                # Не меняем поколение, пока завершение прежнего процесса не доказано.
+                log.warning("Не удалось остановить прежний воркер для смены модели")
+                self._finish_switch("failed")
+                return
             self._switch_candidate = None
             self._switch_request = None
             self._switch_loaded_event = None
-            self._cleanup("прежний воркер", old.stop)
             self.supervisor = candidate
             self._switch_promoted = True
             # Продвижение могла отложить диктовка: полный срок на обе самопроверки
@@ -2026,14 +2042,15 @@ class DictationRuntime(QObject):
         """Жест пользователя начинает новую серию проверок после запрета."""
         if self._appimage_removal_reserved:
             return
-        if self._closed or self._selfcheck != "failed":
+        terminal = self._terminated_generation == self.supervisor.generation
+        if self._closed or (not terminal and self._selfcheck != "failed"):
             return
         self.hotkey.fsm.escape(monotonic())
         if self._command_publication_allowed():
             self.pill.show_state(PillState.LOADING_MODEL)
         self.tray.set_state(TrayState.NOKEY if self._regrab_timer else TrayState.IDLE)
         try:
-            self.restart_worker()
+            self.restart_worker(wait_for_model=terminal)
         except Exception:
             self._selfcheck = "running"
             self._selfcheck_attempts = 1
@@ -2432,6 +2449,7 @@ class DictationRuntime(QObject):
             if pending_switch and self.on_switch_finished is not None:
                 self._cleanup("ожидание смены модели", partial(self.on_switch_finished, "failed"))
             self._fail_pending_test(message=ipc.PROTOCOL_MISMATCH_MESSAGE)
+            self.tray.set_model_recheck_enabled(True)
             if self._command_publication_allowed():
                 self.pill.show_state(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
             self.tray.set_state(TrayState.ERROR)
@@ -2580,6 +2598,12 @@ class DictationRuntime(QObject):
                             self.pill.show_state(PillState.ERROR, text=ERROR_MODEL_LOAD_FAILED)
                         self.tray.set_state(TrayState.ERROR)
         self.orchestrator.on_worker_event(event)
+        if self.phase == DictationPhase.IDLE and (
+            self._pending_switch is not None or self._switch_loaded_event is not None
+        ):
+            # ACK может завершить очистку уже после хвоста ошибки: нового перехода
+            # в IDLE (и on_idle) тогда не будет, но переключение должно продолжиться.
+            self._run_pending_switch()
 
     def _on_hotkey_release(self) -> None:
         # on_release приходит после fsm.release: короткое отпускание уже могло
@@ -3228,7 +3252,11 @@ class DictationRuntime(QObject):
         return timer
 
     def _run_pending_switch(self) -> None:
-        if self._terminated_generation == self.supervisor.generation:
+        if (
+            self._closed
+            or self._terminated_generation == self.supervisor.generation
+            or self.orchestrator.cleanup_pending
+        ):
             return
         # Хвост предыдущей диктовки может завершиться во время нового нажатия.
         # Его IDLE не завершает PENDING: owner и Escape принадлежат новому жесту.

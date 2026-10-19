@@ -326,10 +326,16 @@ class Rig:
         return str([m for m, _ in self.sent if m["type"] == "record.start"][-1]["utterance_id"])
 
     def event(self, kind: str, **fields: object) -> None:
-        if kind in ("cancelled", "audio.closed"):
-            fields.setdefault(
-                "request_type", {"cancelled": "record.cancel", "audio.closed": "audio.close"}[kind]
+        if kind == "cancelled":
+            uid = fields["utterance_id"] if "utterance_id" in fields else self.uid
+            request_type = next(
+                (m["type"] for m, _ in reversed(self.sent) if m.get("utterance_id") == uid),
+                None,
             )
+            if request_type is not None:
+                fields.setdefault("request_type", request_type)
+        elif kind == "audio.closed":
+            fields.setdefault("request_type", "audio.close")
         if kind == "record.limit" and self.ack_stop:
             self.event("record.stopped", **fields)
         self.core.on_worker_event(
@@ -1753,7 +1759,8 @@ def test_recording_terminal_releases_escape_and_next_combo_starts(
         assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
         assert rig.commands() == ["record.start", "recognize"]
     elif terminal == "cancelled":
-        rig.event("cancelled")
+        rig.core.cancel("tray")
+        rig.event("cancelled", request_type="record.cancel")
     else:
         rig.event("error", code=terminal)
 
@@ -1767,6 +1774,8 @@ def test_recording_terminal_releases_escape_and_next_combo_starts(
         assert rig.commands()[-1] == "record.cancel"
         assert rig.core.cleanup_pending
         rig.event("cancelled")
+    elif terminal == "cancelled":
+        assert rig.commands()[-1] == "record.cancel"
     else:
         assert "record.cancel" not in rig.commands()
     rig.combo_key(pressed=False)
@@ -1852,7 +1861,7 @@ def test_mapping_regrab_during_recording_does_not_cancel(mode: HotkeyMode) -> No
     assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
 
 
-@pytest.mark.parametrize("terminal", ["error", "cancelled", "generation"])
+@pytest.mark.parametrize("terminal", ["error", "cancelled", "cancelled-recognize", "generation"])
 def test_queued_press_after_terminal_transition_starts_next_phrase(
     rig: Rig, terminal: str, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1869,6 +1878,12 @@ def test_queued_press_after_terminal_transition_starts_next_phrase(
     def reenter() -> None:
         if terminal == "generation":
             rig.event("audio.ready", generation=2)
+        elif terminal in ("cancelled", "cancelled-recognize"):
+            # Явный запоздалый ACK; тип кадра не выводится из последней команды.
+            rig.event(
+                "cancelled",
+                request_type="record.cancel" if terminal == "cancelled" else "recognize",
+            )
         else:
             rig.event(terminal, code="worker-crashed", message=MARKER)
         rig.fsm.escape(rig.now)
@@ -1879,8 +1894,12 @@ def test_queued_press_after_terminal_transition_starts_next_phrase(
     rig.during_paste = reenter
     rig.result()
     rig.during_paste = None
-    # Исход старой фразы показан до начала новой записи; Escape до нажатия её не трогает.
-    assert any(call[0] in (PillState.ERROR, PillState.CANCELLED) for call in rig.pill.calls)
+    # Поздний cancelled(recognize) после доставки не отменяет готовый результат.
+    # Ошибка поколения, напротив, показывается до начала следующей записи.
+    if terminal == "cancelled-recognize":
+        assert not any(call[0] == PillState.CANCELLED for call in rig.pill.calls)
+    else:
+        assert any(call[0] in (PillState.ERROR, PillState.CANCELLED) for call in rig.pill.calls)
     assert rig.pill.calls[-1][0] == PillState.LISTENING
     assert rig.core.phase == DictationPhase.RECORDING
     rig.assert_hotkey_state(HotkeyState.RECORDING)
@@ -2366,10 +2385,16 @@ def test_audio_close_failure_still_restarts_worker(rig: Rig) -> None:
 
 def microphone_event(rig: Rig, kind: str, **fields: object) -> None:
     """События проходят настоящий IPC; generation добавляет супервизор."""
-    if kind in ("cancelled", "audio.closed"):
-        fields.setdefault(
-            "request_type", {"cancelled": "record.cancel", "audio.closed": "audio.close"}[kind]
+    if kind == "cancelled":
+        uid = fields["utterance_id"] if "utterance_id" in fields else rig.uid
+        request_type = next(
+            (m["type"] for m, _ in reversed(rig.sent) if m.get("utterance_id") == uid),
+            None,
         )
+        if request_type is not None:
+            fields.setdefault("request_type", request_type)
+    elif kind == "audio.closed":
+        fields.setdefault("request_type", "audio.close")
     message = {"type": kind, **fields}
     if "utterance_id" not in message:
         message["utterance_id"] = rig.uid

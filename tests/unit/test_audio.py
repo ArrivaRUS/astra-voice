@@ -3856,33 +3856,66 @@ def test_read_chunks_close_failure_is_sticky(
     running.set()
     capture._run("fault", None, running, None, time.monotonic() + 30)
     assert [event["type"] for event in events] == ["record.started"]
-    assert attempts == ([handle] if clear_before_failure else [handle, handle])
+    assert attempts == [handle]
     assert capture._close_failed
     for check in (capture.check_stop_watchdog, lambda: capture.wait_stopped("fault"), capture.stop):
         with pytest.raises(CaptureStopTimeout):
             check()
 
 
-def test_simple_close_retains_handle_until_success() -> None:
+def test_simple_close_detaches_handle_before_free_even_on_failure() -> None:
     source = PulseSimpleSource()
     pulse = Mock()
     source._pulse = pulse
-    source._handle = ctypes.c_void_p(123)
-    pulse.lib.pa_simple_free.side_effect = RuntimeError("failed")
+    handle = ctypes.c_void_p(123)
+    source._handle = handle
+
+    def free(detached: object) -> None:
+        assert detached is handle
+        assert not source.is_open
+        raise RuntimeError("failed")
+
+    pulse.lib.pa_simple_free.side_effect = free
     with pytest.raises(RuntimeError):
         source.close()
-    assert source.is_open
-    pulse.lib.pa_simple_free.side_effect = None
-    source.close()
     assert not source.is_open
-    assert pulse.lib.pa_simple_free.call_count == 2
+    source.close()
+    pulse.lib.pa_simple_free.assert_called_once_with(handle)
 
 
-@pytest.mark.parametrize("other_deadline", [None, 1001.0])
-def test_wait_thread_uses_one_earliest_deadline(
-    monkeypatch: pytest.MonkeyPatch, other_deadline: float | None
+def test_wait_thread_recalculates_deadlines_after_other_owner_exits(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """А-1: чужой срок сокращает join, а запасной срок не уплывает при пробуждениях."""
+    """Сосед умер до 1001: его срок не мешает владельцу закрыться в 1001.5."""
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    capture = AudioCapture(
+        source=Mock(spec=AudioSource), on_samples=Mock(), on_event=Mock(), on_error=Mock()
+    )
+    owner = Mock(spec=threading.Thread)
+    owner.is_alive.side_effect = lambda: now[0] < 1001.5
+    other = Mock(spec=threading.Thread)
+    other.is_alive.side_effect = lambda: now[0] < 1000.9
+    capture._stop_deadlines.update({other: 1001.0, owner: 1005.0})
+    joins: list[float] = []
+
+    def join(timeout: float) -> None:
+        joins.append(timeout)
+        now[0] = min(now[0] + timeout, 1001.5)
+        assert len(joins) <= 2
+
+    owner.join.side_effect = join
+    capture._wait_thread(owner)
+    assert joins == [1.0, 4.0]
+    assert now[0] == 1001.5
+    assert not capture._stop_deadlines
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_wait_thread_own_deadline_does_not_slide(
+    monkeypatch: pytest.MonkeyPatch, registered: bool
+) -> None:
+    """И зарегистрированный, и запасной срок владельца фиксируются один раз."""
     now = [1000.0]
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
     capture = AudioCapture(
@@ -3890,22 +3923,36 @@ def test_wait_thread_uses_one_earliest_deadline(
     )
     owner = Mock(spec=threading.Thread)
     owner.is_alive.return_value = True
+    if registered:
+        capture._stop_deadlines[owner] = 1005.0
     joins: list[float] = []
 
     def join(timeout: float) -> None:
         joins.append(timeout)
         now[0] += min(1.0, timeout)
-        assert len(joins) <= 6, "Запасной дедлайн пересчитывается бесконечно"
+        assert len(joins) <= 5, "Собственный дедлайн пересчитывается бесконечно"
 
     owner.join.side_effect = join
-    if other_deadline is not None:
-        other = Mock(spec=threading.Thread)
-        other.is_alive.return_value = True
-        capture._stop_deadlines[other] = other_deadline
-        capture._stop_deadlines[owner] = 1005.0
     with pytest.raises(CaptureStopTimeout):
         capture._wait_thread(owner)
-    assert joins == ([1.0] if other_deadline is not None else [5.0, 4.0, 3.0, 2.0, 1.0])
+    assert joins == [5.0, 4.0, 3.0, 2.0, 1.0]
+
+
+def test_wait_thread_other_owner_overdue_is_reported_by_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    capture = AudioCapture(
+        source=Mock(spec=AudioSource), on_samples=Mock(), on_event=Mock(), on_error=Mock()
+    )
+    owner, other = Mock(spec=threading.Thread), Mock(spec=threading.Thread)
+    owner.is_alive.return_value = other.is_alive.return_value = True
+    capture._stop_deadlines.update({other: 1001.0, owner: 1005.0})
+    owner.join.side_effect = lambda timeout: now.__setitem__(0, now[0] + timeout)
+    with pytest.raises(CaptureStopTimeout, match="после отмены"):
+        capture._wait_thread(owner)
+    owner.join.assert_called_once_with(timeout=1.0)
 
 
 def test_read_chunks_arms_watchdog_before_first_close(monkeypatch: pytest.MonkeyPatch) -> None:
