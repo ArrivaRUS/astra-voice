@@ -80,3 +80,28 @@ def test_parallel_keys(tmp_path: Path) -> None:
         thread.join()
     assert cache.get("a").body == "49"
     assert cache.get("b").body == "49"
+
+
+def test_legacy_entry_without_recorded_at_preserves_cached_response(tmp_path: Path) -> None:
+    import json
+
+    cache = UpdateCache(tmp_path / "cache.json")
+    cache.set("app:github", CacheEntry(etag='"known"', body="known", stored_at=1.0))
+    data = json.loads(cache.path.read_bytes())
+    del data["app:github"]["recorded_at"]
+    cache.path.write_text(json.dumps(data))
+    entry = UpdateCache(cache.path).get("app:github")
+    assert entry.body == "known" and entry.etag == '"known"'
+    assert entry.recorded_at is None
+
+
+@pytest.mark.parametrize("stamp", [True, "tomorrow", float("inf"), float("nan")])
+def test_invalid_recorded_at_discards_cache(tmp_path: Path, stamp: object) -> None:
+    import json
+
+    cache = UpdateCache(tmp_path / "cache.json")
+    cache.set("models:catalog:not-found", CacheEntry(url="https://github.com/catalog.json"))
+    data = json.loads(cache.path.read_bytes())
+    data["models:catalog:not-found"]["recorded_at"] = stamp
+    cache.path.write_text(json.dumps(data))
+    assert cache.get("models:catalog:not-found") == CacheEntry()

@@ -66,6 +66,16 @@ files+=(INSTALL-ADMIN.md SECURITY.md release.gpg)
 python3 "$ROOT/scripts/release_latest_json.py" --dist "$DIST" --version "$VERSION" "${latest_args[@]}"
 files+=(latest.json)
 
+[ -f "$ROOT/data/catalog.json.sig" ] || die 'нет data/catalog.json.sig: каталог без подписи не публикуется'
+[ -f "$ROOT/data/catalog.json" ] || die 'нет data/catalog.json'
+SCHEMA_ID=$(PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}" python3 -c \
+    'import sys; from pathlib import Path; from astra_voice.core.release_identity import schema_id; print(schema_id(Path(sys.argv[1]).read_bytes()))' \
+    "$ROOT/data/catalog.schema.json")
+CATALOG="catalog-$SCHEMA_ID.json"
+cp -- "$ROOT/data/catalog.json" "$DIST/$CATALOG"
+cp -- "$ROOT/data/catalog.json.sig" "$DIST/$CATALOG.sig"
+files+=("$CATALOG" "$CATALOG.sig")
+
 (cd "$DIST" && sha256sum -- "${files[@]}" > SHA256SUMS)
 say "SHA256SUMS: ${#files[@]} файлов"
 

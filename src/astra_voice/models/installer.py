@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import Literal
 
 from astra_voice.core import paths
-from astra_voice.models.catalog import ID_RE, Catalog, CatalogEntry, FileSpec
+from astra_voice.models.catalog import ID_RE, Catalog, CatalogEntry, CatalogError, FileSpec
+from astra_voice.models.catalog_effective import (
+    CATALOG_LOCK,
+    ModelActivator,
+    activate_revision,
+    check_revoked,
+)
 from astra_voice.models.store import ModelRecord, ModelStore, StoreError
 from astra_voice.security.verify import HashCancelledError
 from astra_voice.security.verify import sha256_file as sha256_file
@@ -50,7 +56,9 @@ class SmokeResult:
 
 
 SmokeCheck = Callable[[Path, CatalogEntry], SmokeResult]
-ReasonCode = Literal["", "checksum", "layout", "selfcheck", "disk", "cancelled", "revoked"]
+ReasonCode = Literal[
+    "", "checksum", "layout", "selfcheck", "disk", "cancelled", "revoked", "catalog-unavailable"
+]
 
 
 @dataclass(frozen=True)
@@ -245,6 +253,14 @@ def _error_result(exc: Exception) -> InstallResult:
     if isinstance(exc, _InstallError):
         reason = str(exc)
         reason_code = exc.reason_code
+    elif isinstance(exc, StoreError) and exc.code == "revoked":
+        reason = "Эта версия модели отозвана. Выберите другую версию или модель."
+        reason_code = "revoked"
+    elif isinstance(exc, CatalogError) or (
+        isinstance(exc, StoreError) and exc.code == "catalog-unavailable"
+    ):
+        reason = "Не удалось проверить список отозванных версий. Попробуйте ещё раз."
+        reason_code = "catalog-unavailable"
     elif (
         isinstance(exc, StoreError)
         and exc.code == "disk-full"
@@ -265,17 +281,29 @@ class Installer:
     """Меняет текущую модель только после успешного пробного распознавания."""
 
     def __init__(
-        self, store: ModelStore, smoke: SmokeCheck, catalog: Catalog | None = None
+        self,
+        store: ModelStore,
+        smoke: SmokeCheck,
+        catalog: Catalog | Callable[[], Catalog] | None = None,
+        *,
+        activate: ModelActivator | None = None,
     ) -> None:
         self._store = store
         self._smoke = smoke
         self._catalog = catalog
+        self._activate = activate if activate is not None else self._activate_default
+
+    def _activate_default(
+        self, model_id: str, revision: str, *, previous_revision: str | None = None
+    ) -> None:
+        activate_revision(
+            self._store, self._catalog, model_id, revision, previous_revision=previous_revision
+        )
 
     def _check_revoked(self, entry: CatalogEntry) -> None:
-        if self._catalog is not None and self._catalog.is_revoked(entry.id, entry.revision):
-            raise _InstallError(
-                "Эта версия модели отозвана. Выберите другую версию или модель.", "revoked"
-            )
+        with CATALOG_LOCK:
+            catalog = self._catalog() if callable(self._catalog) else self._catalog
+            check_revoked(entry.id, entry.revision, catalog)
 
     def _staging_path(self, entry: CatalogEntry) -> Path:
         # staging_dir создаёт папку; здесь отсутствие проверяется без побочных эффектов.
@@ -292,9 +320,13 @@ class Installer:
         return staging
 
     def install_from_staging(
-        self, entry: CatalogEntry, *, cancel: Callable[[], bool] | None = None
+        self,
+        entry: CatalogEntry,
+        *,
+        cancel: Callable[[], bool] | None = None,
+        activate: bool = True,
     ) -> InstallResult:
-        """Проверяет весь набор до переноса, затем выполняет оставшиеся шаги О2."""
+        """Проверяет и устанавливает набор; activate=False оставляет current владельцу."""
         try:
             self._check_revoked(entry)
             staging = self._staging_path(entry)
@@ -356,9 +388,12 @@ class Installer:
                     replace(record, state="broken", reason=reason),
                     reason_code="selfcheck",
                 )
-            self._store.set_current(entry.id, entry.revision)  # О2.6
+            _check_cancel(cancel)
+            self._check_revoked(entry)
+            if activate:
+                self._activate(entry.id, entry.revision)  # О2.6
             return InstallResult("ok", "", record)
-        except (_InstallError, StoreError, OSError, ValueError, RuntimeError) as exc:
+        except (_InstallError, StoreError, CatalogError, OSError, ValueError, RuntimeError) as exc:
             return _error_result(exc)
 
     def install_from_path(
@@ -401,7 +436,7 @@ class Installer:
                 target = _make_parents(staging, file.path)
                 _copy_file(source, target, file, cancel=cancel)
             return self.install_from_staging(entry, cancel=cancel)
-        except (_InstallError, StoreError, OSError, ValueError, RuntimeError) as exc:
+        except (_InstallError, StoreError, CatalogError, OSError, ValueError, RuntimeError) as exc:
             return _error_result(exc)
         finally:
             if staging is not None and staging.exists():

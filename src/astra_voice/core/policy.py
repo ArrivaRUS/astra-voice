@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from astra_voice.core.settings import Settings, is_valid_combo
+from astra_voice.net.catalog_url import catalog_urls
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +61,8 @@ _SETTINGS_TYPES = {f.name: f.type for f in fields(Settings) if f.name != "extra"
 def _coerce(key: str, raw: str) -> Any:
     """Приводит строку INI к типу одноимённой настройки; иначе оставляет строкой."""
     text = raw.strip()
+    if key == "catalog_url" and text:
+        catalog_urls(text)
     default = getattr(Settings(), key, None) if key in _SETTINGS_TYPES else None
     if isinstance(default, bool):
         low = text.lower()

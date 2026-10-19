@@ -19,6 +19,9 @@ Item {
     readonly property bool downloadOffline: (root.updates && root.updates.networkRefusal === "offline")
         || (root.settings !== null && root.settings.offline === true)
     readonly property var entries: root.settings ? root.settings.models : []
+    readonly property bool catalogUnavailable: root.settings !== null && root.settings.catalogUnavailable
+    readonly property bool canRecoverCatalog: root.updates !== null
+        && typeof root.updates.canCheckModelsNow !== "undefined" ? root.updates.canCheckModelsNow : false
     readonly property bool hasSelection: root.settings !== null
         && root.settings.selectionSummary !== ""
 
@@ -125,11 +128,26 @@ Item {
         metrics: entry.metrics !== undefined ? entry.metrics : []
         tags: entry.tags !== undefined ? entry.tags : []
         updateAvailable: entry.updateAvailable === true
+        previousAvailable: entry.previousAvailable === true
+        isNew: entry.isNew === true
+        reason: entry.reason !== undefined ? entry.reason : ""
+        updateActionsAvailable: bridge !== null && entry.badge === "active"
+        detailsActionAvailable: true
         manageEnabled: bridge !== null
         openFolderEnabled: bridge !== null
         onToggleRequested: { if (bridge) bridge.toggleModel(entry.id); }
-        onRetryRequested: { if (bridge) bridge.retryModel(entry.id); }
-        onCancelRequested: { if (bridge) bridge.cancelModel(entry.id); }
+        onRetryRequested: {
+            if (bridge) {
+                if (cardState === "update-failed") bridge.updateModel(entry.id);
+                else bridge.retryModel(entry.id);
+            }
+        }
+        onCancelRequested: {
+            if (bridge) {
+                if (cardState === "updating") bridge.cancelModelUpdate();
+                else bridge.cancelModel(entry.id);
+            }
+        }
         onDequeueRequested: { if (bridge) bridge.dequeueModel(entry.id); }
         onOpenFolderRequested: { if (bridge) bridge.openModelsFolder(); }
         onActivateRequested: { if (bridge) bridge.makeModelCurrent(entry.id); }
@@ -137,12 +155,50 @@ Item {
         onReinstallRequested: { if (bridge) bridge.reinstallModel(entry.id); }
         onRemoveRequested: { if (removalSection) removalSection.requestRemoval(entry.id); }
         onUpdateRequested: { if (bridge) bridge.updateModel(entry.id); }
+        onRevertPreviousRequested: { if (bridge) bridge.revertModelPrevious(entry.id); }
     }
 
     Column {
         id: content
         width: root.width
         spacing: Theme.modelCardMarginBottom
+
+        Column {
+            objectName: "catalogUnavailableNotice"
+            width: parent.width
+            spacing: 12
+            visible: root.catalogUnavailable
+
+            Text {
+                objectName: "catalogUnavailableText"
+                width: parent.width
+                textFormat: Text.PlainText
+                text: qsTr("Список моделей повреждён. Программа загрузит его заново при следующей проверке обновлений")
+                wrapMode: Text.WordWrap
+                color: Theme.fg
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontBodySize
+            }
+
+            Text {
+                objectName: "catalogRecoveryHint"
+                width: parent.width
+                visible: !root.canRecoverCatalog
+                textFormat: Text.PlainText
+                text: qsTr("Включите проверку обновлений моделей или переустановите программу")
+                wrapMode: Text.WordWrap
+                color: Theme.fgMuted
+                font.family: Theme.fontUi
+                font.pixelSize: Theme.fontBodySize
+            }
+
+            AvButton {
+                objectName: "catalogRecoveryButton"
+                visible: root.canRecoverCatalog
+                text: qsTr("Проверить сейчас")
+                onClicked: { if (root.updates) root.updates.checkModelsNow(); }
+            }
+        }
 
         // Шапка списка: фильтр слева, счётчик справа (§5.6).
         RowLayout {
@@ -256,6 +312,7 @@ Item {
             Text {
                 id: emptyNote
                 width: parent.width
+                visible: !root.catalogUnavailable
                 textFormat: Text.PlainText
                 text: qsTr("Список моделей недоступен. Модель можно поставить из файла или папки.")
                 color: Theme.fgMuted

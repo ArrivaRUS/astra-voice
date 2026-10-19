@@ -38,7 +38,11 @@ from astra_voice.core.paths import (
     settings_path,
 )
 from astra_voice.core.version import __version__
-from astra_voice.models import catalog_state
+from astra_voice.models.catalog_effective import (
+    CATALOG_LOCK,
+    cached_pending_snapshot,
+    read_revocation_marker,
+)
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.sound import MicrophoneState
@@ -51,6 +55,7 @@ from astra_voice.ui.tray import shutdown_bus_threads
 
 if TYPE_CHECKING:
     from astra_voice.core.dictation import LevelCallback, TestCallback
+    from astra_voice.models.catalog import Catalog
     from astra_voice.runtime import DictationRuntime
     from astra_voice.updates.checker import UpdateChecker
     from astra_voice.updates.download import VerifiedDownload
@@ -223,22 +228,44 @@ def _finish_running_copy(
 
 
 def _revoked_check(model: Any | None) -> Callable[[str, str], bool]:
-    """Проверяет каталог, а при его отказе — снимок последнего принятого."""
-    try:
-        state = catalog_state.read_state(catalog_state.state_path(paths.state_dir()))
-    except (OSError, paths.PathError):
-        state = None
-    snapshot = None if state is None else state.revoked
+    """Проверяет память и JSON отметки без проверки подписи в рантайме."""
 
     def check(model_id: str, revision: str) -> bool:
-        if model is not None:
-            try:
-                return bool(model.revoked_revision(model_id, revision))
-            except Exception:
-                pass
-        if snapshot is None:
+        with CATALOG_LOCK:
+            catalog_revoked = None
+            catalog_unknown = False
+            if model is not None:
+                try:
+                    catalog_revoked = bool(model.revoked_revision(model_id, revision))
+                except StoreError as error:
+                    if error.code == "revoked":
+                        return True
+                    catalog_unknown = error.code == "catalog-unavailable"
+                except Exception:
+                    pass
+            if catalog_revoked:
+                return True
+            state, marker_error = read_revocation_marker()
+            cached = cached_pending_snapshot(
+                state if state is not None and state.revoked is not None else None
+            )
+            if cached is not None and cached.is_revoked(model_id, revision):
+                return True
+            if marker_error:
+                raise RevocationUnknown
+            if state is not None:
+                revoked = state.revoked
+                if revoked is None:
+                    raise RevocationUnknown
+                if (model_id, revision) in revoked:
+                    return True
+                if not catalog_unknown:
+                    return False
+            if catalog_unknown:
+                raise RevocationUnknown
+            if catalog_revoked is not None:
+                return catalog_revoked
             raise RevocationUnknown
-        return (model_id, revision) in snapshot
 
     return check
 
@@ -998,15 +1025,20 @@ def _start_update_checker(
     bind: Callable[[UpdateChecker], None] | None = None,
     *,
     scheduled: bool = True,
+    model_store: ModelStore | None = None,
+    catalog: Catalog | Callable[[], Catalog] | None = None,
 ) -> UpdateChecker | None:
-    """Фоновая проверка обновлений программы (M7-ядро).
+    """Фоновые проверки программы и активной модели (M7).
 
     ``bind`` подключает окно до старта потока, чтобы первый снимок не потерялся.
     """
     try:
         from astra_voice.updates.checker import create_app_checker
 
-        checker = create_app_checker(settings, policy)
+        if model_store is not None:
+            checker = create_app_checker(settings, policy, model_store=model_store, catalog=catalog)
+        else:
+            checker = create_app_checker(settings, policy)
     except Exception:  # noqa: BLE001 — без проверки обновлений приложение работает
         log.warning("Проверка обновлений недоступна", exc_info=True)
         return None
@@ -1213,9 +1245,14 @@ def _bind_updates_bridge(
         # Рабочий поток проверки: мост трогаем только в GUI-потоке (урок 025).
         gui_calls.post(partial(bridge.set_status, status))
 
+    def post_model_update(notice: Any) -> None:
+        gui_calls.post(partial(bridge.set_model_update, notice))
+
+    checker.on_model_update = post_model_update
     checker.on_status = post_status
     if settings_bridge is not None:
         settings_bridge.checkAppUpdatesChanged.connect(bridge.refresh)
+        settings_bridge.checkModelUpdatesChanged.connect(bridge.refresh)
         settings_bridge.offlineChanged.connect(bridge.refresh)
     return bridge
 
@@ -1700,7 +1737,7 @@ def main(argv: list[str] | None = None) -> int:
 
         model = None
         try:
-            model = ModelService(settings, policy)
+            model = ModelService(settings, policy, allow_catalog_unavailable=True)
         except Exception as exc:  # noqa: BLE001 — каталог не должен мешать запуску окна
             if getattr(exc, "code", None) == "clock-behind":  # У92/T-116
                 log.warning("Каталог моделей не принят: часы компьютера отстают")
@@ -1898,6 +1935,12 @@ def main(argv: list[str] | None = None) -> int:
                 program_updates=program_updates,
             )
             timer.timeout.connect(program_updates.refresh)
+            downloads.modelRevisionChanged.connect(updates_bridge.clear_model_update)
+
+            def post_model_catalog(catalog: Catalog, new_ids: frozenset[str]) -> None:
+                gui_calls.post(partial(downloads.accept_catalog, catalog, new_ids))
+
+            checker.on_model_catalog = post_model_catalog
             QQmlEngine.setObjectOwnership(updates_bridge, QQmlEngine.CppOwnership)
             _set_context_property(shell, "updatesBridge", updates_bridge)
             if about_bridge is not None:
@@ -1927,6 +1970,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime if runtime_ready else None,
             bind_updates,
             scheduled=onboarding is None or onboarding.done or onboarding.step > 1,
+            model_store=model_store,
         )
         if not args.hidden:
             focuser.focus_shell()

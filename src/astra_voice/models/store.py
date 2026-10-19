@@ -351,6 +351,20 @@ class ModelStore:
             else None
         )
 
+    def previous_revision(self) -> str | None:
+        """Читает необязательный указатель возврата, не карантиня current.json."""
+        try:
+            data = _read_json(self._checked(self.root / "current.json"))
+            model_id, revision = data.get("id"), data.get("previous_revision")
+            if not isinstance(model_id, str) or not isinstance(revision, str):
+                return None
+            if revision == data.get("revision"):
+                return None
+            self._installed(model_id, revision)
+        except (OSError, ValueError, StoreError, RecursionError):
+            return None
+        return revision
+
     def _directories(self) -> Iterator[tuple[str, Path]]:
         if not self.root.exists():
             return
@@ -381,14 +395,20 @@ class ModelStore:
                 result.append(self._record(model_id, revision, directory))
         return tuple(result)
 
-    def set_current(self, model_id: str, revision: str) -> None:
+    def set_current(
+        self, model_id: str, revision: str, *, previous_revision: str | None = None
+    ) -> None:
         """Атомарно записывает указатель на существующую ревизию."""
         with _store_errors():
             self._installed(model_id, revision)
+            data: dict[str, object] = {"id": model_id, "revision": revision}
+            if previous_revision is not None:
+                if not isinstance(previous_revision, str) or previous_revision == revision:
+                    raise StoreError("bad-id")
+                self._installed(model_id, previous_revision)
+                data["previous_revision"] = previous_revision
             self._private_dir(self.root)
-            _write_json(
-                self._checked(self.root / "current.json"), {"id": model_id, "revision": revision}
-            )
+            _write_json(self._checked(self.root / "current.json"), data)
 
     def mark_broken(self, model_id: str, revision: str, reason: str) -> None:
         """Помечает ревизию сломанной, сохраняя метаданные и указатель current.json."""

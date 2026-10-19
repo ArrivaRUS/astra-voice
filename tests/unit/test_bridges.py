@@ -67,7 +67,6 @@ from astra_voice.ui.hotkey_capture import CaptureHost, HotkeyCapture
 from astra_voice.ui.icons import install_icon_provider
 from astra_voice.ui.model_downloads import (
     ModelDownloads,
-    ModelPort,
     ModelService,
     _ModelJob,
     make_smoke_check,
@@ -3063,7 +3062,7 @@ def test_model_service_uses_existing_modules(
     factories = {}
     for name in (
         "Verifier",
-        "load_builtin",
+        "load_effective",
         "ModelStore",
         "NetworkGate",
         "HttpClient",
@@ -3074,15 +3073,17 @@ def test_model_service_uses_existing_modules(
         factory = Mock()
         factories[name] = factory
         monkeypatch.setattr(bridges, name, factory)
-    factories["load_builtin"].return_value = catalog
-    service: ModelPort = ModelService(settings, policy)
+    factories["load_effective"].return_value = catalog
+    service = ModelService(settings, policy)
     assert service.recommended() == entry
     factories["Verifier"].assert_called_once_with(
         "catalog",
         keyring=paths.data_dir_static() / "keys" / "release.gpg",
     )
-    factories["load_builtin"].assert_called_once_with(
+    factories["load_effective"].assert_called_once_with(
         factories["Verifier"].return_value,
+        builtin_root=paths.data_dir_static(),
+        snapshot_dir=paths.state_dir() / "model-catalog-updates",
         state_path=catalog_state.state_path(paths.state_dir()),
     )
     gate = factories["NetworkGate"].return_value
@@ -3105,7 +3106,9 @@ def test_model_service_uses_existing_modules(
     assert len(warnings) == int(isinstance(corp_base, str) and not expected_host)
     assert factories["Installer"].call_args.args[0] is store
     assert callable(factories["Installer"].call_args.args[1])
-    assert factories["Installer"].call_args.kwargs == {"catalog": catalog}
+    provider = factories["Installer"].call_args.kwargs["catalog"]
+    assert callable(provider)
+    assert provider() is catalog
     service.allowed()
     gate.allowed.assert_called_once_with("download")
     service.refusal()
@@ -3115,6 +3118,10 @@ def test_model_service_uses_existing_modules(
     assert not service.installed_ok()
     store.records.return_value = [Mock(state="ok")]
     assert service.installed_ok()
+    refreshed = Catalog(serial=2, trust_epoch=1, entries=(), revoked=())
+    service.accept_catalog(refreshed)
+    assert provider() is refreshed
+    assert factories["Installer"].call_count == 1
 
 
 def test_model_service_invalid_corp_base_warns_once_without_address(
@@ -3125,20 +3132,28 @@ def test_model_service_invalid_corp_base_warns_once_without_address(
     address = "http://corp.example"
     policy = policy_mod.Policy(values={"corp_base": address})
     store = ModelStore(tmp_path / "models")
+    factories = {}
     for name in (
         "Verifier",
-        "load_builtin",
+        "load_effective",
         "NetworkGate",
         "HttpClient",
         "Installer",
         "SmokeRunner",
     ):
-        monkeypatch.setattr(bridges, name, Mock())
+        factories[name] = Mock()
+        monkeypatch.setattr(bridges, name, factories[name])
     monkeypatch.setattr(bridges, "ModelStore", Mock(return_value=store))
 
     with caplog.at_level(logging.WARNING):
         service = ModelService(Settings(), policy)
 
+    factories["load_effective"].assert_called_once_with(
+        factories["Verifier"].return_value,
+        builtin_root=paths.data_dir_static(),
+        snapshot_dir=paths.state_dir() / "model-catalog-updates",
+        state_path=catalog_state.state_path(paths.state_dir()),
+    )
     assert isinstance(service._downloader, Downloader)
     assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
         (logging.WARNING, "Корпоративный источник не используется: некорректный адрес.")
@@ -3178,7 +3193,7 @@ def test_model_service_rejects_revoked_revision(
     source.mkdir(parents=True, exist_ok=True)
     for name, data in contents.items():
         (source / name).write_bytes(data)
-    monkeypatch.setattr(model_downloads, "load_builtin", Mock(return_value=catalog))
+    monkeypatch.setattr(model_downloads, "load_effective", Mock(return_value=catalog))
     monkeypatch.setattr(model_downloads, "ModelStore", Mock(return_value=store))
     service = ModelService(Settings(), policy_mod.Policy())
 
@@ -3218,7 +3233,7 @@ def test_model_service_cancel_during_checksum_preserves_source(
         ),
     )
     monkeypatch.setattr(
-        model_downloads, "load_builtin", lambda verifier, **kwargs: Catalog(1, 1, (), (entry,))
+        model_downloads, "load_effective", lambda verifier, **kwargs: Catalog(1, 1, (), (entry,))
     )
     monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
     service = ModelService(Settings(), policy_mod.Policy())
@@ -3394,7 +3409,7 @@ def test_model_shutdown_cancels_active_smoke_check(
     gate.allowed.return_value = (True, "")
     catalog = Mock(entries=[port.entry])
     catalog.is_revoked.return_value = False
-    monkeypatch.setattr(model_downloads, "load_builtin", Mock(return_value=catalog))
+    monkeypatch.setattr(model_downloads, "load_effective", Mock(return_value=catalog))
     monkeypatch.setattr(model_downloads, "Verifier", Mock())
     monkeypatch.setattr(model_downloads, "ModelStore", Mock(return_value=store))
     monkeypatch.setattr(model_downloads, "NetworkGate", Mock(return_value=gate))
@@ -3415,8 +3430,14 @@ def test_model_shutdown_cancels_active_smoke_check(
     monkeypatch.setattr(model_downloads, "SmokeRunner", Mock(return_value=runner))
 
     def installer_factory(
-        store: object, smoke: Callable[..., object], catalog: Catalog | None = None
+        store: object,
+        smoke: Callable[..., object],
+        catalog: Catalog | None = None,
+        *,
+        activate: Callable[..., None] | None = None,
     ) -> Mock:
+        assert callable(activate)
+
         def install(*args: object, cancel: Callable[[], bool]) -> InstallResult:
             smoke(Path("/fake/model"), port.entry)
             return InstallResult("broken", reason_code="selfcheck")
@@ -3487,7 +3508,9 @@ def test_model_app_assembly_and_shutdown(
                 app_mod.main([])
         else:
             assert app_mod.main([]) == 7
-    factory.assert_called_once_with(rig.settings, policy_mod.Policy())
+    factory.assert_called_once_with(
+        rig.settings, policy_mod.Policy(), allow_catalog_unavailable=True
+    )
     properties = dict(
         item.args for item in rig.shell.rootContext().setContextProperty.call_args_list
     )
@@ -4547,6 +4570,9 @@ def test_model_cards_exact_keys_and_selection(model_rig: ModelRig) -> None:
             "vendorShort": "",
             "domestic": False,
             "updateAvailable": False,
+            "previousAvailable": False,
+            "isNew": False,
+            "reason": "",
             "tags": [],
             "metrics": [
                 {

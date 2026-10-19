@@ -54,6 +54,24 @@ def test_real_workflows_are_clean() -> None:
         assert ci_lint.check_workflow(path) == [], path.name
 
 
+def test_catalog_gate_precedes_release_signing_and_publication() -> None:
+    workflow = ci_lint.yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    release = workflow["jobs"]["release"]
+    steps = release["steps"]
+    names = [step.get("name") for step in steps]
+    assets = names.index("Ассеты выпуска")
+    gate = names.index("Гейт каталога")
+    signing = names.index("Отсоединённая подпись SHA256SUMS")
+    publishing = names.index("Публикация")
+    assert assets < gate < signing < publishing
+    assert steps[gate]["run"] == "python3 scripts/catalog_publish_check.py --dist dist"
+    assert "env" not in steps[gate]
+    assert "GPG_SIGNING_KEY" not in release.get("env", {})
+    assert '--repo "$GITHUB_REPOSITORY"' in steps[publishing]["run"]
+    secret_steps = [step for step in steps if "GPG_SIGNING_KEY" in step.get("env", {})]
+    assert secret_steps == [steps[signing]]
+
+
 def test_good_workflow_passes(tmp_path: Path) -> None:
     assert ci_lint.check_workflow(_write(tmp_path, GOOD)) == []
 

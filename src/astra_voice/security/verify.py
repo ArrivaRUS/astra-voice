@@ -217,9 +217,9 @@ def _run_cancellable(
 class Verifier:
     """Проверяльщик подписей для одной цели (`release` или `catalog`).
 
-    Разделение по цели закрывает T-31: релизный ключ не должен принимать
-    каталог, подписанный корпоративным `catalog_pubkey`, и наоборот — у каждой
-    цели своя связка ключей и свои пины.
+    Purpose — метка API, не криптографическое разделение: при одинаковых
+    ключах и пинах detached-подпись проходит для обеих целей. Назначение
+    проверяется потребителем каталога и методом verify_sha256sums.
     """
 
     def __init__(
@@ -375,6 +375,8 @@ class Verifier:
         Имя файла обязано встречаться в `SHA256SUMS` **ровно один раз**:
         дубль имени с разными суммами — попытка подсунуть другой файл (У4).
         """
+        if self.purpose != "release":
+            return self._fail("SHA256SUMS requires release purpose", code="purpose-mismatch")
         sums, file = Path(sums), Path(file)
         for label, path in (("SHA256SUMS", sums), ("файл", file)):
             if not path.is_file():

@@ -1019,3 +1019,50 @@ def test_filesystem_errors_have_public_codes(store: ModelStore) -> None:
     with pytest.raises(StoreError) as error:
         store.staging_dir("model", "rev")
     assert error.value.code == "broken-store"
+
+
+def test_previous_revision_roundtrip_and_clear(store: ModelStore) -> None:
+    assert store.previous_revision() is None
+    install(store, revision="old")
+    install(store, revision="new")
+    store.set_current("model", "new")
+    assert store.previous_revision() is None
+    store.set_current("model", "new", previous_revision="old")
+    assert store.previous_revision() == "old"
+    assert json.loads((store.root / "current.json").read_text()) == {
+        "id": "model",
+        "revision": "new",
+        "previous_revision": "old",
+    }
+    current = store.current()
+    assert current is not None and current.revision == "new"
+    store.set_current("model", "new")
+    assert store.previous_revision() is None
+    assert "previous_revision" not in json.loads((store.root / "current.json").read_text())
+
+
+@pytest.mark.parametrize(
+    ("previous_revision", "code"),
+    [
+        ("../x", "bad-id"),
+        ("new", "bad-id"),
+        ("missing", "not-found"),
+        ("other-model-revision", "not-found"),
+        ("r.partial", "bad-id"),
+        ("r.json", "bad-id"),
+        ("r.old-backup", "bad-id"),
+    ],
+)
+def test_set_current_rejects_invalid_previous_without_changing_pointer(
+    store: ModelStore, previous_revision: str, code: str
+) -> None:
+    install(store, revision="old")
+    install(store, revision="new")
+    install(store, model_id="other-model", revision="other-model-revision")
+    store.set_current("model", "new", previous_revision="old")
+    before = (store.root / "current.json").read_bytes()
+    with pytest.raises(StoreError) as error:
+        store.set_current("model", "new", previous_revision=previous_revision)
+    assert error.value.code == code
+    assert (store.root / "current.json").read_bytes() == before
+    assert store.previous_revision() == "old"

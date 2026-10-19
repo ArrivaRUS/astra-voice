@@ -407,6 +407,10 @@ class SettingsBridge(QObject):
     def models(self) -> list[dict[str, Any]]:
         return self._downloads.models if self._downloads is not None else []
 
+    @pyqtProperty(bool, notify=modelsChanged)
+    def catalogUnavailable(self) -> bool:  # noqa: N802
+        return self._downloads is None or self._downloads.catalogUnavailable
+
     def can_select_model(self, model_id: str) -> bool:
         """Доступность ревизии для трея независимо от кэша состояния карточки."""
         return self._downloads is not None and self._downloads.can_make_current(model_id)
@@ -502,6 +506,16 @@ class SettingsBridge(QObject):
     def updateModel(self, model_id: str) -> None:  # noqa: N802
         if self._downloads is not None:
             self._downloads.updateModel(model_id)
+
+    @pyqtSlot()
+    def cancelModelUpdate(self) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.cancelModelUpdate()
+
+    @pyqtSlot(str)
+    def revertModelPrevious(self, model_id: str) -> None:  # noqa: N802
+        if self._downloads is not None:
+            self._downloads.revertModelPrevious(model_id)
 
     @pyqtSlot(str)
     def toggleModel(self, model_id: str) -> None:  # noqa: N802

@@ -188,3 +188,30 @@ def test_appimage_invalid_policy_is_allowed(tmp_path: Path) -> None:
     assert not pol.appimage_denied(
         pol.Policy(values={"appimage": "deny"}, status=pol.PolicyStatus.INVALID)
     )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://models.example.ru/catalog.json",
+        "https://user:pass@models.example.ru/catalog.json",
+        "https://models.example.ru/catalog.json?q=1",
+        "https://models.example.ru/catalog.json#x",
+        "https://models.example.ru/a/../catalog.json",
+        "https://модели.рф/catalog.json",
+    ],
+)
+def test_bad_catalog_url_invalidates_entire_policy(tmp_path: Path, url: str) -> None:
+    policy = pol.load(
+        _write(tmp_path, f"[astra-voice]\ncheck_model_updates=no\ncatalog_url={url}\n")
+    )
+    assert policy.status is pol.PolicyStatus.INVALID
+    assert policy.values == {}
+    assert policy.locked_keys == frozenset()
+
+
+@pytest.mark.parametrize("url", ["", "https://models.example.ru/catalog.json"])
+def test_catalog_url_policy_allows_empty_or_https(tmp_path: Path, url: str) -> None:
+    policy = pol.load(_write(tmp_path, f"[astra-voice]\ncatalog_url={url}\n"))
+    assert policy.status is pol.PolicyStatus.OK
+    assert policy.values["catalog_url"] == url

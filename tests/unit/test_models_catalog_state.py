@@ -194,6 +194,7 @@ def test_load_builtin_records_and_then_rejects_rollback(tmp_path: Path) -> None:
         catalog.serial,
         hashlib.sha256(raw).hexdigest(),
         tuple((item.model_id, item.revision) for item in catalog.revoked),
+        hashlib.sha256((DATA_ROOT / "catalog.schema.json").read_bytes()).hexdigest()[:16],
     )
     # Тот же каталог принимается повторно: состояние не меняется.
     assert load_builtin(verifier, root=DATA_ROOT, state_path=state_file).serial == catalog.serial
@@ -223,3 +224,33 @@ def test_load_builtin_survives_unwritable_state(
         state_path=catalog_state.state_path(tmp_path),
     )
     assert catalog.entries
+
+
+def test_schema_id_is_optional_and_migrated_without_reset(state_file: Path) -> None:
+    old = CatalogState(2, 9, SHA_A, (("model", "r1"),))
+    catalog_state.write_state(state_file, old)
+    assert "schema_id" not in read_raw(state_file)
+    assert catalog_state.read_state(state_file) == old
+    candidate = CatalogState(2, 9, SHA_A, old.revoked, "0123456789abcdef")
+    assert catalog_state.apply_state(state_file, candidate)
+    assert read_raw(state_file)["schema_id"] == candidate.schema_id
+    assert catalog_state.read_state(state_file) == candidate
+    assert not catalog_state.apply_state(state_file, candidate)
+    changed = CatalogState(2, 9, SHA_A, old.revoked, "fedcba9876543210")
+    assert catalog_state.apply_state(state_file, changed)
+    for rollback in (
+        CatalogState(2, 8, SHA_B, (), changed.schema_id),
+        CatalogState(2, 9, SHA_B, (), changed.schema_id),
+    ):
+        with pytest.raises(ValueError):
+            catalog_state.apply_state(state_file, rollback)
+        assert catalog_state.read_state(state_file) == changed
+
+
+def test_bad_schema_id_preserves_watermark(state_file: Path) -> None:
+    state_file.write_text(
+        json.dumps({"trust_epoch": 2, "serial": 9, "sha256": SHA_A, "schema_id": ["broken"]})
+    )
+    assert catalog_state.read_state(state_file) == CatalogState(2, 9, SHA_A)
+    with pytest.raises(ValueError):
+        catalog_state.apply_state(state_file, CatalogState(2, 8, SHA_B))

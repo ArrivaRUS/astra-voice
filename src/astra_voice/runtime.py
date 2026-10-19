@@ -36,6 +36,7 @@ from astra_voice.core.model_source import (
     ModelRevoked,
     ModelStore,
     RevokedCheck,
+    _not_revoked,
     resolve_model_request,
     smoke_matches,
     smoke_wav_path,
@@ -43,6 +44,7 @@ from astra_voice.core.model_source import (
 from astra_voice.core.recording_cues import RecordingCues
 from astra_voice.core.settings import Settings, is_valid_combo, is_valid_command_mouse_button
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
+from astra_voice.models.catalog_effective import CATALOG_LOCK
 from astra_voice.platform.cowork import (
     CoworkClient,
     is_installed,
@@ -1537,6 +1539,13 @@ class DictationRuntime(QObject):
             if self.on_revocation_unknown is not None:
                 self.on_revocation_unknown()
 
+    def catalog_restored(self) -> None:
+        """Снимает предупреждение после принятия проверенного каталога в GUI."""
+        if self.revocation_unknown:
+            self.revocation_unknown = False
+            if self.on_revocation_unknown is not None:
+                self.on_revocation_unknown()
+
     def _resolve_model_request(self) -> dict[str, Any] | None:
         """Запрос загрузки с учётом отзыва; ModelRevoked пробрасывается выше."""
         return resolve_model_request(
@@ -1722,7 +1731,7 @@ class DictationRuntime(QObject):
         self._switch_target = None
         self._switch_loaded_event = None
         if candidate is not None:
-            self._cleanup("временный воркер", candidate.stop)
+            self._stop_or_kill("временный воркер", candidate)
         if self.on_switch_finished is not None and not self._closed:
             self.on_switch_finished(result)
 
@@ -1858,31 +1867,97 @@ class DictationRuntime(QObject):
             # Ошибка загрузки может относиться к поколению до автоматического рестарта.
             self._fail_candidate()
 
+    def _switch_revision_allowed(self, request: dict[str, Any]) -> bool:
+        """Повторная проверка после загрузки: отзыв мог прийти во время ожидания."""
+        if self._revoked_check is None:
+            return True
+        try:
+            revoked = self._revoked_check(str(request["id"]), str(request["revision"]))
+        except Exception:
+            self._mark_revocation_unknown()
+            log.warning("Переключение модели отменено: список отзывов недоступен")
+            return False
+        if revoked:
+            log.warning("Переключение модели отменено: версия отозвана издателем")
+        return not revoked
+
+    def _reject_switch_revision(self) -> None:
+        previous_stopped = self._switch_promoted or self._switch_paused
+        if not self._fail_switch() and previous_stopped:
+            self._stop_or_kill("отозванный воркер", self.supervisor)
+            self._show_load_failed()
+
+    def _loaded_revision_allowed(self) -> bool:
+        """Быстро проверяет именно загруженный запрос, без gpgv.
+
+        Обычная загрузка сохраняет политику предзагрузки для RevocationUnknown;
+        переключение сохраняет свой строгий отказ. Проверка и ready выполняются
+        под CATALOG_LOCK. Отзыв после ready действует со следующей загрузки:
+        уже работающую модель при поступлении отзыва не выгружаем.
+        """
+        request = self._model_load_request or {}
+        if self._switch_active():
+            return self._switch_revision_allowed(request)
+        try:
+            _not_revoked(request, self._revoked_check, self._mark_revocation_unknown)
+        except ModelRevoked:
+            return False
+        return True
+
+    def _reject_loaded_revision(self) -> None:
+        if self._switch_active():
+            self._reject_switch_revision()
+            return
+        self._cancel_selfcheck_timer()
+        self._selfcheck = "failed"
+        self._fail_pending_test()
+        self._model_revoked()
+        # Барьер ready уже отпустил CATALOG_LOCK. Новый процесс обслуживает
+        # измеритель уровня, но failed запрещает ему загружать модель на hello.
+        old = self.supervisor
+        generation = old.generation + 1
+        self._stop_or_kill("отозванный воркер", old)
+        if self._closed or self._appimage_removal_reserved:
+            return
+        self.supervisor = self._supervisor_factory(on_event=self._on_worker_event, use_qt=True)
+        self.supervisor.adopt_retired(old._retired)
+        self.supervisor.generation = generation
+        self._model_load_generation = None
+        self.supervisor.start()
+
     def _promote_candidate(self) -> None:
-        candidate = self._switch_candidate
-        event = self._switch_loaded_event
-        if candidate is not None and event is not None and self.phase == DictationPhase.IDLE:
+        # Источник не публикует отзыв между проверкой и сменой рабочего воркера.
+        with CATALOG_LOCK:
+            candidate = self._switch_candidate
+            event = self._switch_loaded_event
+            if candidate is None or event is None or self.phase != DictationPhase.IDLE:
+                return
             request = self._switch_request
             assert request is not None
-            old = self.supervisor
-            self._switch_candidate = None
-            self._switch_request = None
-            self._switch_loaded_event = None
-            self._cleanup("прежний воркер", old.stop)
-            self.supervisor = candidate
-            self._switch_promoted = True
-            # Продвижение могла отложить диктовка: полный срок на обе самопроверки
-            # отсчитывается заново, чтобы сторож не сработал между ними.
-            timer, self._switch_timer = self._switch_timer, None
-            if timer is not None:
-                self.cancel_timer(timer)
-            self._switch_timer = self.schedule(int(SWITCH_TIMEOUT_S * 1000), self._switch_watchdog)
-            self._reset_selfcheck()
-            self._loading_model = True
-            self._model_load_generation = candidate.generation
-            self._model_load_request = request
-            self._model_load_failures = 0
-            self._on_worker_event(event)
+            allowed = self._switch_revision_allowed(request)
+            if allowed:
+                old = self.supervisor
+                self._switch_candidate = None
+                self._switch_request = None
+                self._switch_loaded_event = None
+                self.supervisor = candidate
+                self._switch_promoted = True
+        if not allowed:
+            self._reject_switch_revision()
+            return
+        self._stop_or_kill("прежний воркер", old)
+        # Продвижение могла отложить диктовка: полный срок на обе самопроверки
+        # отсчитывается заново, чтобы сторож не сработал между ними.
+        timer, self._switch_timer = self._switch_timer, None
+        if timer is not None:
+            self.cancel_timer(timer)
+        self._switch_timer = self.schedule(int(SWITCH_TIMEOUT_S * 1000), self._switch_watchdog)
+        self._reset_selfcheck()
+        self._loading_model = True
+        self._model_load_generation = candidate.generation
+        self._model_load_request = request
+        self._model_load_failures = 0
+        self._on_worker_event(event)
 
     def _fail_candidate(self) -> None:
         self._finish_switch("failed")
@@ -1943,8 +2018,12 @@ class DictationRuntime(QObject):
         self._loading_model = wait_for_model or retry_selfcheck or self._selfcheck == "failed"
         self._reset_selfcheck(retry=retry_selfcheck)
         generation = self.supervisor.generation + 1
-        self.supervisor.stop()
+        old = self.supervisor
+        self._stop_or_kill("перезапуск воркера", old)
+        if self._closed or self._appimage_removal_reserved:
+            return
         self.supervisor = self._supervisor_factory(on_event=self._on_worker_event, use_qt=True)
+        self.supervisor.adopt_retired(old._retired)
         self.supervisor.generation = generation
         self._model_load_generation = None
         if not retry_selfcheck:
@@ -2162,7 +2241,13 @@ class DictationRuntime(QObject):
             # При load-timeout супервизор уже заменил процесс до доставки ошибки.
             return
         if reason == "ok":
-            self._model_ready()
+            with CATALOG_LOCK:
+                rejected = not self._loaded_revision_allowed()
+                if not rejected:
+                    self._model_ready()
+            if rejected:
+                self._reject_loaded_revision()
+                return
             if self._switch_active() and self._switch_candidate is None:
                 self._finish_switch("ok")
         else:
@@ -2294,7 +2379,13 @@ class DictationRuntime(QObject):
                     self._selfcheck in ("idle", "retrying")
                     and event.get("generation") == self.supervisor.generation
                 ):
-                    self._start_selfcheck(event)
+                    with CATALOG_LOCK:
+                        rejected = not self._loaded_revision_allowed()
+                        if not rejected:
+                            self._start_selfcheck(event)
+                    if rejected:
+                        self._reject_loaded_revision()
+                        return
             elif event.get("type") == "error" and (
                 event.get("request_type") == "model.load"
                 or event.get("response_type") == "model.loaded"
@@ -2931,6 +3022,14 @@ class DictationRuntime(QObject):
         """Даёт IPC до 50 мс на освобождение микрофона и обрабатывает события Qt."""
         self.supervisor.pump(timeout=0.05)
         QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents, 50)
+
+    def _stop_or_kill(self, step: str, supervisor: WorkerSupervisor) -> None:
+        """При сбое штатной остановки аварийно закрывает IPC и завершает процессы."""
+        try:
+            supervisor.stop()
+        except Exception:
+            log.warning("Ошибка завершения диктовки: %s", step)
+            self._cleanup(f"аварийная остановка: {step}", supervisor.kill)
 
     @staticmethod
     def _cleanup(step: str, action: Callable[[], object]) -> None:
