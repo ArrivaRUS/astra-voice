@@ -22,7 +22,8 @@ from astra_voice.ui import indicators
 from astra_voice.ui.indicators import IndicatorGuard
 from astra_voice.ui.pill import STATE_DURATION_MS, PillState
 from astra_voice.ui.tray_icons import TrayState
-from astra_voice.worker.supervisor import WorkerSupervisor
+from astra_voice.worker import ipc
+from astra_voice.worker.supervisor import MAX_RESTARTS, WorkerSupervisor
 
 if TYPE_CHECKING:
     from astra_voice.ui.pill import Pill
@@ -398,6 +399,7 @@ def test_capture_guard_waits_for_delayed_worker_death(
     supervisor._launch = Mock()
     rig.core._generation = lambda: supervisor.generation
     rig.during_send = supervisor.send
+    supervisor._receive(ipc.encode(ipc.make_hello()), supervisor.generation)
     rig.start()
     if restart == "supervisor":
         supervisor._restart()
@@ -421,4 +423,79 @@ def test_capture_guard_waits_for_delayed_worker_death(
     else:
         rig.timer(CANCEL_RESTART_MS).fire()
     assert not rig.core._capture_open and not rig.recording and not guard.recording
+    supervisor.stop()
+
+
+@pytest.mark.parametrize("level", [False, True], ids=["dictation", "level"])
+@pytest.mark.parametrize("cause", ["worker-crashed", "load-timeout", "restart-limit"])
+def test_cancel_timer_preserves_pending_supervisor_restart_and_capture_guard(
+    guarded_rig: tuple[Rig, IndicatorGuard],
+    monkeypatch: pytest.MonkeyPatch,
+    level: bool,
+    cause: str,
+) -> None:
+    """Таймер отмены не сбрасывает ожидание выхода всё ещё живого воркера."""
+    rig, guard = guarded_rig
+    supervisor = WorkerSupervisor(rig.core.on_worker_event, use_qt=False)
+    supervisor.state = "running"
+    supervisor._socket = Mock(send=Mock(side_effect=len))
+    process = Mock(poll=Mock(return_value=None))
+    process.wait.side_effect = TimeoutExpired("worker", 0.2)
+    supervisor.process = process
+    launch = Mock()
+    monkeypatch.setattr(supervisor, "_launch", launch)
+    stop = Mock(wraps=supervisor.stop)
+    monkeypatch.setattr(supervisor, "stop", stop)
+    rig.core._generation = lambda: supervisor.generation
+    rig.core._worker_restarting = lambda: supervisor.restarting
+    rig.during_send = supervisor.send
+    rig.restart_worker.side_effect = supervisor.stop
+    supervisor._receive(ipc.encode(ipc.make_hello()), supervisor.generation)
+    cancelled = Mock(wraps=rig.core._cancelled)
+    finish_level = Mock(wraps=rig.core._finish_level)
+    monkeypatch.setattr(rig.core, "_cancelled", cancelled)
+    monkeypatch.setattr(rig.core, "_finish_level", finish_level)
+    if level:
+        assert rig.core.start_level_monitor("fake-mic", Mock())
+        rig.core.stop_level_monitor()
+    else:
+        rig.start()
+        rig.core.cancel("tray")
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    if cause == "restart-limit":
+        supervisor._restarts.extend([supervisor._clock()] * MAX_RESTARTS)
+    supervisor._restart(
+        failure_code="load-timeout" if cause == "load-timeout" else "worker-crashed"
+    )
+    pending = supervisor._restart_pending
+    assert pending is not None
+    for _ in range(3):
+        rig.timer(CANCEL_RESTART_MS).fire()
+        supervisor.pump()
+        assert supervisor._restart_pending is pending
+        assert supervisor.generation == 1
+        assert rig.core.cleanup_pending
+        if not level:
+            assert rig.core._capture_open
+        assert rig.recording and guard.recording
+        assert not rig.pill.hidden and rig.tray.state is TrayState.LISTENING
+        rig.restart_worker.assert_not_called()
+        stop.assert_not_called()
+        launch.assert_not_called()
+        cancelled.assert_not_called()
+        finish_level.assert_not_called()
+    process.poll.return_value = -9
+    process.wait.side_effect = None
+    supervisor.pump()
+    assert supervisor._restart_pending is None
+    if cause == "restart-limit":
+        assert supervisor.generation == 1 and supervisor.state == "stopped"
+        launch.assert_not_called()
+    else:
+        assert supervisor.generation == 2
+        launch.assert_called_once_with()
+    assert not rig.core.cleanup_pending and not rig.core._capture_open
+    assert not rig.recording and not guard.recording
+    rig.restart_worker.assert_not_called()
+    stop.assert_not_called()
     supervisor.stop()

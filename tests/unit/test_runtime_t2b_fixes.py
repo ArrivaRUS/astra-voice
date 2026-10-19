@@ -394,6 +394,7 @@ def test_real_supervisor_protocol_mismatch_kills_process_and_never_restarts(
     supervisor = runtime.supervisor
     process = Mock()
     process.poll.return_value = None
+    process.wait.side_effect = lambda **kwargs: setattr(process.poll, "return_value", -9)
     supervisor.process = process
     factory = Mock(wraps=runtime._supervisor_factory)
     monkeypatch.setattr(runtime, "_supervisor_factory", factory)
@@ -405,7 +406,7 @@ def test_real_supervisor_protocol_mismatch_kills_process_and_never_restarts(
     body = json.dumps(bad_hello).encode("utf-8")
     supervisor._receive(struct.pack("!I", len(body)) + body, supervisor.generation)
     process.kill.assert_called_once_with()
-    process.wait.assert_called_once_with(timeout=2)
+    process.wait.assert_any_call(timeout=0.2)
     assert supervisor.state == "stopped"
     drain_scheduled(rig)
     factory.assert_not_called()

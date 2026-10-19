@@ -120,6 +120,8 @@ class Chain:
             self._receive_gui, use_qt=False, clock=lambda: self.rig.now
         )
         self.supervisor.state = "running"
+        self.supervisor._receive(ipc.encode(ipc.make_hello()), self.supervisor.generation)
+        self.delivered.clear()
         self.supervisor._socket = cast(Any, self.channel)
         self.rig.during_send = self.supervisor.send
         self._new_worker()
@@ -184,6 +186,7 @@ class Chain:
         assert not self.source.is_open
         self.rig.worker_generation += 1
         self.supervisor.generation = self.rig.worker_generation
+        self.supervisor._receive(ipc.encode(ipc.make_hello()), self.supervisor.generation)
         self.supervisor._pending.clear()
         self.supervisor._finished.clear()
         self.channel.commands.clear()

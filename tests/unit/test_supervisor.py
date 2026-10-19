@@ -40,6 +40,7 @@ def test_protocol_mismatch_stops_without_restart() -> None:
     supervisor.generation = 1
     process = Mock()
     process.poll.return_value = None
+    process.wait.side_effect = lambda **kwargs: setattr(process.poll, "return_value", -9)
     supervisor.process = process
     hello = {**ipc.make_hello(), "protocol": ipc.PROTOCOL_VERSION - 1}
     payload = json.dumps(hello).encode("utf-8")
@@ -47,7 +48,7 @@ def test_protocol_mismatch_stops_without_restart() -> None:
     assert str(supervisor.state) == "stopped"
     assert supervisor.generation == 1
     process.kill.assert_called_once_with()
-    process.wait.assert_called_once_with(timeout=2)
+    process.wait.assert_any_call(timeout=0.2)
     assert supervisor._retired == []
     assert events[-1]["code"] == ipc.PROTOCOL_MISMATCH
     assert events[-1]["message"] == "Программа обновлена — перезапустите её."
@@ -59,6 +60,7 @@ def test_protocol_mismatch_finishes_all_pending_requests() -> None:
     supervisor.state = "running"
     process = Mock()
     process.poll.return_value = None
+    process.wait.side_effect = lambda **kwargs: setattr(process.poll, "return_value", -9)
     supervisor.process = process
     supervisor._pending[("reply", "measured")] = _Pending(None, 0, "measure", None)
     supervisor._pending[("reply", "model.loaded")] = _Pending(None, 0, "model.load", None)
@@ -71,7 +73,7 @@ def test_protocol_mismatch_finishes_all_pending_requests() -> None:
     }
     assert all(event["code"] == ipc.PROTOCOL_MISMATCH for event in events)
     assert supervisor._pending == {}
-    process.wait.assert_called_once_with(timeout=2)
+    process.wait.assert_any_call(timeout=0.2)
 
 
 def test_protocol_mismatch_retains_process_after_wait_timeout() -> None:
@@ -89,8 +91,12 @@ def test_protocol_mismatch_retains_process_after_wait_timeout() -> None:
 
     assert str(supervisor.state) == "stopped"
     process.kill.assert_called_once_with()
-    process.wait.assert_called_once_with(timeout=2)
-    assert supervisor._retired == [process]
+    process.wait.assert_any_call(timeout=0.2)
+    assert supervisor.process is process and supervisor.restarting
+    assert not events
+    process.poll.return_value = -9
+    supervisor.pump()
+    assert not supervisor.restarting
     assert events[-1]["code"] == ipc.PROTOCOL_MISMATCH
 
 
@@ -574,6 +580,8 @@ def detached(clock: Clock) -> tuple[WorkerSupervisor, list[Message]]:
     events: list[Message] = []
     supervisor = WorkerSupervisor(events.append, clock=clock, use_qt=False)
     supervisor.state = "running"
+    supervisor._receive(ipc.encode(ipc.make_hello()), supervisor.generation)
+    events.clear()
     return supervisor, events
 
 
@@ -1077,6 +1085,7 @@ def test_restart_defers_generation_and_events_until_process_exits(
     supervisor.process = old_process
     launch = Mock()
     monkeypatch.setattr(supervisor, "_launch", launch)
+    assert supervisor.restarting is False
     if cause == "deadline":
         supervisor.send({"type": "record.cancel", "utterance_id": "one"}, timeout=1)
         clock.now += 1
@@ -1091,6 +1100,7 @@ def test_restart_defers_generation_and_events_until_process_exits(
     for _ in range(3):
         supervisor.pump()
         supervisor._restart()  # Повторная эскалация не заменяет ожидаемую операцию.
+        assert supervisor.restarting is True
         assert supervisor.generation == 1
         assert supervisor.process is old_process
         assert supervisor.state == "running"
@@ -1105,6 +1115,7 @@ def test_restart_defers_generation_and_events_until_process_exits(
     old_process.wait.side_effect = None
     supervisor.pump()
     assert supervisor._restart_pending is None
+    assert supervisor.restarting is False
     if cause == "restart-limit":
         assert supervisor.state == "stopped"
         assert supervisor.generation == 1
@@ -1186,3 +1197,126 @@ def test_deferred_restart_retries_kill_at_bounded_rate_without_early_event(
     assert len(events) == 1
     assert supervisor._restart_kill_deadline is None
     assert process.kill.call_count == 2
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_protocol_mismatch_waits_for_process_exit_before_terminal_events(
+    monkeypatch: pytest.MonkeyPatch, pending: bool
+) -> None:
+    """ИБ-58: protocol3 не снимает защиту до физического выхода воркера."""
+    from PyQt5 import QtCore
+
+    clock = Clock()
+    supervisor, events = detached(clock)
+    supervisor._use_qt = True
+    process = Mock(spec=subprocess.Popen)
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    supervisor.process = process
+    if pending:
+        supervisor.send({"type": "record.start", "utterance_id": "one"})
+        supervisor.send({"type": "audio.close"})
+    launch = Mock()
+    monkeypatch.setattr(supervisor, "_launch", launch)
+    timer = Mock()
+    monkeypatch.setattr(QtCore, "QTimer", Mock(return_value=timer))
+    body = json.dumps({**ipc.make_hello(), "protocol": 3}).encode()
+    supervisor._receive(struct.pack(">I", len(body)) + body, supervisor.generation)
+    assert supervisor.state == "stopped" and supervisor.restarting
+    assert supervisor.generation == 1 and not events
+    timer.start.assert_called_once_with(50)
+    timer.timeout.connect.assert_called_once_with(supervisor.pump)
+    process.wait.assert_any_call(timeout=0.2)
+    for _ in range(3):
+        supervisor.pump()
+        assert supervisor.restarting and not events
+        launch.assert_not_called()
+        timer.stop.assert_not_called()
+    process.kill.assert_called_once_with()
+    clock.now += 2
+    supervisor.pump()
+    assert process.kill.call_count == 2 and not events
+    process.poll.return_value = -signal.SIGKILL
+    supervisor.pump()
+    assert not supervisor.restarting and supervisor.state == "stopped"
+    assert supervisor.generation == 1
+    assert len(events) == (3 if pending else 1)
+    assert all(event["code"] == ipc.PROTOCOL_MISMATCH for event in events)
+    assert all(event["generation"] == 1 for event in events)
+    assert all(event["message"] == ipc.PROTOCOL_MISMATCH_MESSAGE + "." for event in events)
+    assert {event.get("request_type") for event in events} == (
+        {"record.start", "audio.close", None} if pending else {None}
+    )
+    assert all(call.kwargs["timeout"] == 0 for call in process.wait.call_args_list[1:])
+    timer.stop.assert_called_once_with()
+    timer.deleteLater.assert_called_once_with()
+    launch.assert_not_called()
+    supervisor.pump()
+    assert len(events) == (3 if pending else 1)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        {"type": "record.start", "utterance_id": "one"},
+        {"type": "record.stop", "utterance_id": "one"},
+        {"type": "record.cancel", "utterance_id": "one"},
+        {"type": "audio.close"},
+    ],
+)
+def test_capture_commands_require_hello_in_current_generation(command: Message) -> None:
+    events: list[Message] = []
+    supervisor = WorkerSupervisor(events.append, use_qt=False)
+    supervisor.state = "running"
+    sent: list[bytes] = []
+
+    def write(data: bytearray) -> int:
+        sent.append(bytes(data))
+        return len(data)
+
+    connection = Mock(send=Mock(side_effect=write))
+    supervisor._socket = connection
+    for generation in (1, 2):
+        supervisor.generation = generation
+        supervisor._receive(ipc.encode(ipc.make_hello()), generation - 1)
+        with pytest.raises(RuntimeError, match="не готов"):
+            supervisor.send(command)
+        assert not supervisor._pending and not supervisor._outgoing
+        connection.send.assert_not_called()
+        supervisor._receive(ipc.encode(ipc.make_hello()), generation)
+        supervisor.send(command)
+        connection.send.assert_called_once()
+        assert ipc.FrameReader().feed(sent[-1]) == [command]
+        supervisor._close_connection()
+        connection.reset_mock()
+        supervisor._socket = connection
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_deferred_restart_does_not_launch_after_runtime_launch_is_forbidden(
+    monkeypatch: pytest.MonkeyPatch, pending: bool
+) -> None:
+    allowed = True
+    events: list[Message] = []
+    supervisor = WorkerSupervisor(events.append, use_qt=False, launch_allowed=lambda: allowed)
+    supervisor.state = "running"
+    supervisor._receive(ipc.encode(ipc.make_hello()), supervisor.generation)
+    events.clear()
+    process = Mock(poll=Mock(return_value=None))
+    process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    supervisor.process = process
+    launch = Mock()
+    monkeypatch.setattr(supervisor, "_launch", launch)
+    if pending:
+        supervisor.send({"type": "record.cancel", "utterance_id": "one"})
+    supervisor._restart(report=False)
+    assert supervisor.restarting and not events
+    allowed = False
+    process.poll.return_value = -signal.SIGKILL
+    process.wait.side_effect = None
+    supervisor.pump()
+    assert supervisor.state == "stopped" and not supervisor.restarting
+    assert supervisor.generation == 1
+    assert events and all(event["generation"] == 1 for event in events)
+    assert all(event["code"] == "worker-crashed" for event in events)
+    launch.assert_not_called()

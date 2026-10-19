@@ -124,6 +124,7 @@ class WorkerSupervisor:
         clock: Callable[[], float] = time.monotonic,
         command_factory: Callable[[int], list[str]] = worker_command,
         use_qt: bool = True,
+        launch_allowed: Callable[[], bool] = lambda: True,
     ) -> None:
         self.generation = 1
         self.dropped_late = 0
@@ -133,6 +134,8 @@ class WorkerSupervisor:
         self._clock = clock
         self._command_factory = command_factory
         self._use_qt = use_qt
+        self._launch_allowed = launch_allowed
+        self._hello_accepted = False
         self._socket: socket.socket | None = None
         self._reader = ipc.FrameReader()
         self._outgoing = bytearray()
@@ -141,10 +144,20 @@ class WorkerSupervisor:
         self._activity = 0
         self._restarts: deque[float] = deque()
         self._retired: list[subprocess.Popen[bytes]] = []
-        self._restart_pending: tuple[int, list[Message], bool] | None = None
+        self._restart_pending: tuple[int, list[Message], bool, bool] | None = None
         self._restart_kill_deadline: float | None = None
         self._notifier: Any = None
         self._timer: Any = None
+
+    @property
+    def restarting(self) -> bool:
+        """Перезапуск ждёт подтверждения завершения прежнего процесса."""
+        return self._restart_pending is not None
+
+    @property
+    def ready(self) -> bool:
+        """Текущий воркер подтвердил совместимость протокола через hello."""
+        return self.state == "running" and not self.restarting and self._hello_accepted
 
     def start(self) -> None:
         """Запускает воркер один раз; повторный вызов при работе безопасен."""
@@ -165,6 +178,7 @@ class WorkerSupervisor:
 
     def _launch(self) -> None:
         """Передаёт только дочерний fd и закрывает его копию в родителе."""
+        self._hello_accepted = False
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             parent.setblocking(False)
@@ -219,6 +233,8 @@ class WorkerSupervisor:
         request = {**ipc.decode(frame[4:]), "generation": self.generation}
         uid = request.get("utterance_id")
         kind = str(request["type"])
+        if not self._hello_accepted and kind.startswith(("record.", "audio.")):
+            raise RuntimeError("Воркер ещё не готов.")
         key = _correlation(request)
         if key[0] == "utterance" and key[:2] in self._finished and kind != "record.cancel":
             raise ValueError("Идентификатор уже завершён в текущем поколении.")
@@ -329,25 +345,7 @@ class WorkerSupervisor:
                 message = ipc.decode(frame)
             except ipc.FrameError as exc:
                 if exc.code == ipc.PROTOCOL_MISMATCH:
-                    failure = ipc.error(exc.code, exc.message)
-                    events = [self._finish(key, failure) for key in list(self._pending)]
-                    self.state = "stopped"
-                    self._close_connection()
-                    if self.process is not None:
-                        if self.process.poll() is None:
-                            self.process.kill()
-                        try:
-                            self.process.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            if not any(process is self.process for process in self._retired):
-                                self._retired.append(self.process)
-                        else:
-                            self._retired = [
-                                process for process in self._retired if process is not self.process
-                            ]
-                    for event in events:
-                        self._emit(event, generation=generation)
-                    self._emit(failure, generation=generation)
+                    self._restart(report=False, failure_code=exc.code, relaunch=False)
                     return
                 self._emit(ipc.error(exc.code, exc.message))
                 continue
@@ -430,7 +428,9 @@ class WorkerSupervisor:
             elif kind in ("result", "cancelled") or key[:2] in self._finished:
                 self.dropped_late += 1
                 return
-        if kind != "hello":
+        if kind == "hello":
+            self._hello_accepted = True
+        else:
             self._activity += 1
         self._emit(message)
 
@@ -481,6 +481,7 @@ class WorkerSupervisor:
 
     def _close_connection(self) -> None:
         """Отключает Qt до закрытия fd и аннулирует ожидания поколения."""
+        self._hello_accepted = False
         if self._notifier is not None:
             self._notifier.setEnabled(False)
             self._notifier.deleteLater()
@@ -496,20 +497,31 @@ class WorkerSupervisor:
         self._finished.clear()
         self._outgoing.clear()
 
-    def _restart(self, *, report: bool = True, failure_code: str = "worker-crashed") -> None:
+    def _restart(
+        self,
+        *,
+        report: bool = True,
+        failure_code: str = "worker-crashed",
+        relaunch: bool = True,
+    ) -> None:
         """Убивает воркер; смена поколения и события ждут подтверждения выхода."""
         if self._restart_pending is not None:
             return
         generation = self.generation
         failure = ipc.error(
             failure_code,
-            "Воркер не ответил до истечения дедлайна."
+            ipc.PROTOCOL_MISMATCH_MESSAGE + "."
+            if failure_code == ipc.PROTOCOL_MISMATCH
+            else "Воркер не ответил до истечения дедлайна."
             if failure_code == "load-timeout"
             else "Распознавание перезапущено.",
         )
         events = [self._finish(key, failure) for key in list(self._pending)]
+        if not relaunch:
+            self.state = "stopped"
+            events.append(failure)
         self._close_connection()
-        self._restart_pending = (generation, events, report)
+        self._restart_pending = (generation, events, report, relaunch)
         if self.process is not None and self.process.poll() is None:
             self.process.kill()
             self._restart_kill_deadline = self._clock() + _KILL_RETRY_INTERVAL_S
@@ -539,10 +551,20 @@ class WorkerSupervisor:
                     with suppress(Exception):
                         self.process.kill()
                 return
-        generation, events, report = self._restart_pending
+        generation, events, _report, relaunch = self._restart_pending
         self._restart_pending = None
         self._restart_kill_deadline = None
         self._close_connection()
+        if not relaunch or not self._launch_allowed():
+            self.state = "stopped"
+            for event in events:
+                self._emit(event, generation=generation)
+            if not events:
+                self._emit(
+                    ipc.error("worker-crashed", "Распознавание перезапущено."),
+                    generation=generation,
+                )
+            return
         now = self._clock()
         while self._restarts and now - self._restarts[0] >= RESTART_WINDOW_S:
             self._restarts.popleft()
@@ -564,7 +586,8 @@ class WorkerSupervisor:
             return
         for event in events:
             self._emit(event, generation=generation)
-        if report and not events:
+        # Даже report=False должен разбудить отложенную смену модели после выхода.
+        if not events:
             self._emit(ipc.error("worker-crashed", "Распознавание перезапущено."))
 
     def stop(self) -> None:

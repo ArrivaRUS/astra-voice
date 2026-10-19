@@ -124,6 +124,54 @@ def test_always_keeps_model_and_never_arms_unload(monkeypatch: pytest.MonkeyPatc
     rig.supervisor.stop.assert_not_called()
 
 
+def test_work_pending_includes_supervisor_waiting_for_worker_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = make_rig(monkeypatch)
+    try:
+        assert not rig.runtime._work_pending()
+        rig.supervisor.restarting = True
+        assert rig.runtime._work_pending()
+        assert not rig.runtime.reserve_appimage_removal()
+        assert not rig.runtime._appimage_removal_reserved
+        factories = rig.supervisor_factory.call_count
+        rig.now += FIVE_MIN_S
+        fire_idle(rig)
+        assert not rig.runtime._model_parked
+        assert rig.supervisor_factory.call_count == factories
+        rig.supervisor.stop.assert_not_called()
+        rig.supervisor.restarting = False
+        assert not rig.runtime._work_pending()
+    finally:
+        rig.runtime.shutdown()
+
+
+def test_wake_while_worker_restarts_preserves_parked_model_and_reports_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = make_rig(monkeypatch)
+    park(rig)
+    runtime = rig.runtime
+    rig.supervisor.restarting = True
+    rig.supervisor.send.reset_mock()
+    rig.supervisor.stop.reset_mock()
+    pending_test = Mock()
+    runtime._pending_test = ("fake-mic", pending_test)
+    try:
+        assert not runtime._wake_model()
+        assert runtime._model_parked and not runtime._loading_model
+        assert runtime._pending_test is None
+        pending_test.assert_called_once()
+        update = pending_test.call_args.args[0]
+        assert update.state == "error" and "перезапускается" in update.message
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=update.message)
+        rig.supervisor.send.assert_not_called()
+        rig.supervisor.stop.assert_not_called()
+    finally:
+        rig.supervisor.restarting = False
+        runtime.shutdown()
+
+
 def test_unload_after_idle_restarts_worker_without_model(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = make_rig(monkeypatch)
     timer = idle_timer(rig)
@@ -543,7 +591,7 @@ def test_overlap_queue_defers_model_switch_until_last_phrase(
     assert rig.supervisor_factory.call_count == workers
     rig.event(type="result", utterance_id=second, text=MARKER)
     assert rig.paste.call_count == 2
-    replacement = Mock(state="running", generation=2)
+    replacement = Mock(state="running", generation=2, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
     fire_phrase_outcome(rig)
     assert_phase(runtime, DictationPhase.IDLE)

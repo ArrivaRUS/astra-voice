@@ -17,7 +17,7 @@ from test_runtime_t2b_fixes import ready_keyboard, stop_transport
 from astra_voice.core.dictation import CANCEL_TIMEOUT_MS, DictationPhase
 from astra_voice.platform.hotkey import GrabResult, HotkeyEvent, HotkeyMode, HotkeyState
 from astra_voice.platform.mouse_button import MouseHoldState
-from astra_voice.ui.pill import STATE_DURATION_MS, PillState
+from astra_voice.ui.pill import ERROR_MODEL_NOT_LOADED, STATE_DURATION_MS, PillState
 from astra_voice.ui.tray_icons import TrayState
 from astra_voice.worker import ipc
 from astra_voice.worker.supervisor import WorkerSupervisor
@@ -437,5 +437,314 @@ def test_candidate_is_not_promoted_when_old_process_stop_times_out(
         assert not runtime._switch_active()
         candidate.stop.assert_called_once_with()
         bench.finished.assert_called_once_with("failed")
+        assert runtime._selfcheck == "failed"
+        bench.rig.tray.set_state.assert_called_with(TrayState.ERROR)
+        bench.rig.tray.set_model_recheck_enabled.assert_called_with(True)
+        old.send.reset_mock()
+        bench.rig.hotkey.fsm.press(bench.rig.now)
+        assert not any(c.args[0]["type"] == "record.start" for c in old.send.call_args_list)
+        bench.rig.pill.show_state.assert_called_with(PillState.ERROR, text=ERROR_MODEL_NOT_LOADED)
+        bench.rig.hotkey.fsm.escape(bench.rig.now)
+        # После подтверждённого выхода старого процесса доступен явный повтор.
+        process.poll.return_value = -9
+        process.wait.side_effect = None
+        runtime._recheck_model()
+        restored = bench.workers[-1]
+        assert restored is not candidate
+        assert runtime.supervisor is restored
+        restored.start.assert_called_once_with()
+        SwitchRig.emit(restored, type="hello")
+        assert bench.loads(restored) == ["gigaam"]
+        bench.finished.assert_called_once_with("failed")
     finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("blocked", ["open", "closed", "reserved", "terminating"])
+def test_restart_worker_refuses_pending_supervisor_restart_without_stopping_it(
+    monkeypatch: pytest.MonkeyPatch,
+    blocked: str,
+) -> None:
+    rig = Rig(monkeypatch)
+    runtime = rig.runtime
+    runtime.start()
+    rig.supervisor.restarting = True
+    factories = rig.supervisor_factory.call_count
+    generation = rig.supervisor.generation
+    runtime._model_parked = True
+    runtime._closed = blocked == "closed"
+    runtime._appimage_removal_reserved = blocked == "reserved"
+    runtime._terminating_worker = blocked == "terminating"
+    runtime._terminated_generation = generation
+    before = vars(runtime).copy()
+    callbacks = ("_drop_wake", "_stop_mouse", "_invalidate_mouse_capture", "_reset_selfcheck")
+    operations = [Mock() for _ in callbacks]
+    for name, operation in zip(callbacks, operations, strict=True):
+        monkeypatch.setattr(runtime, name, operation)
+    try:
+        with pytest.raises(RuntimeError, match="перезапускается"):
+            runtime.restart_worker(wait_for_model=True)
+        rig.supervisor.stop.assert_not_called()
+        assert runtime.supervisor is rig.supervisor
+        assert rig.supervisor.generation == generation
+        assert rig.supervisor_factory.call_count == factories
+        assert runtime._model_parked
+        assert all(vars(runtime)[name] == value for name, value in before.items())
+        for operation in operations:
+            operation.assert_not_called()
+    finally:
+        rig.supervisor.restarting = False
+        runtime._closed = False
+        runtime._appimage_removal_reserved = False
+        runtime._terminating_worker = False
+        runtime.shutdown()
+
+
+def test_level_monitor_reports_pending_worker_restart_without_opening_microphone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = Rig(monkeypatch)
+    runtime = rig.runtime
+    runtime.start()
+    rig.supervisor.restarting = True
+    callback = Mock()
+    rig.supervisor.send.reset_mock()
+    try:
+        assert not runtime.start_level_monitor("fake-mic", callback)
+        callback.assert_called_once()
+        update = callback.call_args.args[0]
+        assert update.state == "error" and "перезапускается" in update.message
+        assert not runtime.orchestrator.level_active
+        rig.supervisor.send.assert_not_called()
+        rig.supervisor.stop.assert_not_called()
+    finally:
+        rig.supervisor.restarting = False
+        runtime.shutdown()
+
+
+def restart_transport(
+    monkeypatch: pytest.MonkeyPatch, rig: Rig, *, hello: bool = True
+) -> WorkerSupervisor:
+    """Настоящий супервизор с ручными IPC/процессом, без создания subprocess."""
+    runtime = rig.runtime
+    supervisor = WorkerSupervisor(
+        runtime._on_worker_event,
+        use_qt=False,
+        clock=lambda: rig.now,
+        launch_allowed=lambda: not runtime._closed and not runtime._appimage_removal_reserved,
+    )
+    supervisor.state = "running"
+    runtime.supervisor = supervisor
+    monkeypatch.setattr(supervisor, "_launch", Mock())
+    if hello:
+        supervisor._receive(ipc.encode(ipc.make_hello()), supervisor.generation)
+    return supervisor
+
+
+@pytest.mark.parametrize("level", [False, True], ids=["dictation", "level"])
+def test_protocol_mismatch_keeps_runtime_capture_guard_until_process_exit(
+    monkeypatch: pytest.MonkeyPatch, level: bool
+) -> None:
+    rig = Rig(monkeypatch)
+    runtime = rig.runtime
+    runtime.start()
+    supervisor = restart_transport(monkeypatch, rig)
+    process = Mock(poll=Mock(return_value=None))
+    process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    supervisor.process = process
+    send = Mock(wraps=supervisor.send)
+    monkeypatch.setattr(supervisor, "send", send)
+    try:
+        if level:
+            assert runtime.start_level_monitor("fake-mic", Mock())
+        else:
+            rig.hotkey.fsm.press(rig.now)
+        rig.guard.set_recording.assert_called_with(True)
+        before = rig.guard.set_recording.call_count
+        payload = json.dumps({**ipc.make_hello(), "protocol": 3}).encode()
+        supervisor._receive(struct.pack(">I", len(payload)) + payload, supervisor.generation)
+        for _ in range(3):
+            supervisor.pump()
+            assert supervisor.state == "stopped" and supervisor.restarting
+            assert supervisor.generation == 1
+            assert rig.guard.set_recording.call_count == before
+            rig.guard.set_recording.assert_called_with(True)
+            assert runtime._terminated_generation is None
+            supervisor._launch.assert_not_called()
+        process.poll.return_value = -9
+        process.wait.side_effect = None
+        supervisor.pump()
+        assert not supervisor.restarting and supervisor.generation == 1
+        assert runtime._terminated_generation == 1
+        assert not runtime.orchestrator.cleanup_pending
+        rig.guard.set_recording.assert_called_with(False)
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
+        send.reset_mock()
+        rig.hotkey.fsm.press(rig.now + 1)
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
+        assert not any(c.args[0]["type"] == "record.start" for c in send.call_args_list)
+        supervisor._launch.assert_not_called()
+    finally:
+        process.poll.return_value = -9
+        process.wait.side_effect = None
+        runtime.shutdown()
+
+
+def test_level_monitor_before_worker_hello_keeps_indicator_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rig = Rig(monkeypatch)
+    runtime = rig.runtime
+    runtime.start()
+    supervisor = restart_transport(monkeypatch, rig, hello=False)
+    callback = Mock()
+    rig.guard.set_recording.reset_mock()
+    send = Mock(wraps=supervisor.send)
+    monkeypatch.setattr(supervisor, "send", send)
+    try:
+        assert not runtime.start_level_monitor("fake-mic", callback)
+        callback.assert_called_once()
+        assert callback.call_args.args[0].state == "error"
+        assert "не готов" in callback.call_args.args[0].message
+        assert not runtime.orchestrator.level_active
+        assert not supervisor._outgoing and not supervisor._pending
+        rig.guard.set_recording.assert_not_called()
+        send.assert_not_called()
+        supervisor._receive(ipc.encode(ipc.make_hello()), supervisor.generation)
+        assert runtime.start_level_monitor("fake-mic", Mock())
+        rig.guard.set_recording.assert_called_with(True)
+        assert send.call_args.args[0]["type"] == "record.start"
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("pending", ["empty", "selfcheck-file"])
+def test_pending_switch_resumes_after_unreported_restart_exit(
+    monkeypatch: pytest.MonkeyPatch, pending: str
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    rig, runtime = bench.rig, bench.rig.runtime
+    old = restart_transport(monkeypatch, rig)
+    process = Mock(poll=Mock(return_value=None))
+    process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    old.process = process
+    if pending == "selfcheck-file":
+        old.send({"type": "transcribe.file", "path": "/tmp/selfcheck.wav"})
+    old._restart(report=False)
+    try:
+        bench.switch()
+        assert runtime._pending_switch is not None and not bench.workers
+        for _ in range(3):
+            runtime._run_pending_switch()
+            old.pump()
+            assert runtime._pending_switch is not None and not bench.workers
+        process.poll.return_value = -9
+        process.wait.side_effect = None
+        old.pump()
+        assert runtime._pending_switch is None
+        assert len(bench.workers) == 1
+        assert runtime._switch_active()
+        candidate = bench.workers[-1]
+        SwitchRig.emit(candidate, type="hello")
+        assert bench.loads(candidate) == ["whisper"]
+    finally:
+        process.poll.return_value = -9
+        process.wait.side_effect = None
+        runtime.shutdown()
+
+
+def test_candidate_promotion_waits_for_restarting_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    old = runtime.supervisor
+    try:
+        bench.switch()
+        candidate = bench.workers[-1]
+        SwitchRig.emit(candidate, type="hello")
+        old.restarting = True
+        SwitchRig.emit(candidate, type="model.loaded", id="whisper")
+        for _ in range(3):
+            runtime._promote_candidate()
+            runtime._run_pending_switch()
+            assert runtime.supervisor is old and runtime._switch_candidate is candidate
+            old.stop.assert_not_called()
+            bench.finished.assert_not_called()
+        old.restarting = False
+        runtime._on_worker_event({"type": "error", "code": "worker-crashed", "generation": 0})
+        assert runtime.supervisor is candidate
+        old.stop.assert_called_once_with()
+    finally:
+        old.restarting = False
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("blocked", ["closed", "reserved"])
+def test_deferred_worker_launch_is_forbidden_by_runtime_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, blocked: str
+) -> None:
+    seen: list[WorkerSupervisor] = []
+
+    def factory(**kwargs: Any) -> WorkerSupervisor:
+        supervisor = WorkerSupervisor(**{**kwargs, "use_qt": False})
+        seen.append(supervisor)
+        return supervisor
+
+    monkeypatch.setattr(
+        WorkerSupervisor, "_launch", lambda supervisor: setattr(supervisor, "state", "running")
+    )
+    rig = Rig(monkeypatch, supervisor_factory=factory)
+    runtime = rig.runtime
+    runtime.start()
+    supervisor = runtime.supervisor
+    process = Mock(poll=Mock(return_value=None))
+    process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    supervisor.process = process
+    supervisor._restart(report=False)
+    launch = Mock()
+    monkeypatch.setattr(supervisor, "_launch", launch)
+    runtime._closed = blocked == "closed"
+    runtime._appimage_removal_reserved = blocked == "reserved"
+    try:
+        process.poll.return_value = -9
+        process.wait.side_effect = None
+        supervisor.pump()
+        assert supervisor.state == "stopped" and supervisor.generation == 1
+        assert len(seen) == 1
+        launch.assert_not_called()
+    finally:
+        runtime._closed = False
+        runtime._appimage_removal_reserved = False
+        runtime.shutdown()
+
+
+def test_candidate_stop_failure_after_close_does_not_publish_load_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = SwitchRig(monkeypatch)
+    rig, runtime = bench.rig, bench.rig.runtime
+    old = runtime.supervisor
+
+    def closed_during_stop() -> None:
+        runtime._closed = True
+        raise subprocess.TimeoutExpired("worker", 2)
+
+    old.stop.side_effect = closed_during_stop
+    try:
+        bench.switch()
+        candidate = bench.workers[-1]
+        SwitchRig.emit(candidate, type="hello")
+        rig.pill.show_state.reset_mock()
+        rig.tray.set_state.reset_mock()
+        rig.tray.set_model_recheck_enabled.reset_mock()
+        SwitchRig.emit(candidate, type="model.loaded", id="whisper")
+        assert runtime._closed and not runtime._switch_active()
+        assert runtime.supervisor is old
+        rig.pill.show_state.assert_not_called()
+        rig.tray.set_state.assert_not_called()
+        rig.tray.set_model_recheck_enabled.assert_not_called()
+    finally:
+        old.stop.side_effect = None
+        runtime._closed = False
         runtime.shutdown()

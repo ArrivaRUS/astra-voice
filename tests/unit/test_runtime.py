@@ -277,7 +277,7 @@ class Rig:
         self.capture_watchdogs: list[Mock] = []
         self.capture_open_ok = True
         self.capture_watchdog_factory = Mock(side_effect=self.create_capture_watchdog)
-        self.supervisor = Mock(state="new", generation=1)
+        self.supervisor = Mock(state="new", generation=1, restarting=False, ready=True)
         self.supervisor.start.side_effect = self.start_worker
         self.supervisor.stop.side_effect = self.stop_worker
         self.supervisor.send.side_effect = self.send
@@ -666,6 +666,9 @@ def test_microphone_announcement_follows_worker_generations(
                 event(ipc.make_hello())
             send = Mock(wraps=rig.runtime.supervisor.send)
             monkeypatch.setattr(rig.runtime.supervisor, "send", send)
+            if not hello_before_record:
+                # Транспорт принимает hello и при поздней установке наблюдателя.
+                event(ipc.make_hello())
             for _ in range(2):
                 rig.now += 2
                 rig.hotkey.fsm.press(rig.now)
@@ -750,7 +753,7 @@ def test_switch_memory_boundary(
         model_store=ModelStore(tmp_path / "models"),
     )
     assert rig.runtime.can_switch_without_pause(100) is expected
-    candidate = Mock(state="running", generation=1)
+    candidate = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = candidate
     finished = Mock()
     rig.runtime.on_switch_finished = finished
@@ -776,7 +779,7 @@ def test_switch_waits_for_dictation_boundary(monkeypatch: pytest.MonkeyPatch) ->
     rig.event(type="result", text=MARKER)
     assert_phase(rig.runtime, DictationPhase.FINISHING)
     assert rig.supervisor_factory.call_count == 1
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
     rig.timers[-1].fire()
     assert_phase(rig.runtime, DictationPhase.IDLE)
@@ -795,7 +798,7 @@ def test_pending_switch_runs_on_idle_without_runtime_timer_firing(
     rig.release(rig.now + 1)
     rig.event(type="result", text=MARKER)
     assert_phase(rig.runtime, DictationPhase.FINISHING)
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
     # Доставка перехода в IDLE происходит без вызова fire у таймера рантайма.
     rig.runtime.orchestrator._tail_done()
@@ -860,7 +863,7 @@ def test_seamless_switch_candidate_outcome(
     rig.runtime.start()
     old = rig.supervisor
     old_callback = rig.supervisor_factory.call_args.kwargs["on_event"]
-    candidate = Mock(state="running", generation=1)
+    candidate = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = candidate
     monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
     finished = Mock()
@@ -921,7 +924,7 @@ def test_seamless_switch_candidate_outcome(
         )
     finished.assert_called_once_with(outcome)
     if outcome == "ok":
-        next_candidate = Mock(state="running", generation=1)
+        next_candidate = Mock(state="running", generation=1, restarting=False, ready=True)
         rig.supervisor_factory.return_value = next_candidate
         rig.runtime.switch_model(min_ram_mb=100)
         on_worker_event = Mock()
@@ -937,7 +940,7 @@ def test_promoted_switch_watchdog_rejects_silent_selfcheck(monkeypatch: pytest.M
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
     rig.runtime.start()
     old = rig.supervisor
-    candidate = Mock(state="running", generation=1)
+    candidate = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = candidate
     monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
     finished = Mock()
@@ -979,7 +982,7 @@ def test_switch_watchdog_without_rollback_allows_tray_recheck(
     """
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
     rig.runtime.start()
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
     finished = Mock()
     rig.runtime.on_switch_finished = finished
@@ -1012,7 +1015,7 @@ def test_switch_watchdog_without_rollback_allows_tray_recheck(
 def test_paused_switch_survives_restart_before_hello(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
     rig.runtime.start()
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
     finished = Mock()
     rig.runtime.on_switch_finished = finished
@@ -1040,7 +1043,7 @@ def test_paused_switch_survives_restart_before_hello(monkeypatch: pytest.MonkeyP
 
 def test_switch_watchdog_stops_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
-    candidate = Mock(state="running", generation=1)
+    candidate = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = candidate
     monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
     finished = Mock()
@@ -1060,9 +1063,9 @@ def test_switch_watchdog_stops_candidate(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_paused_switch_watchdog_stops_unresponsive_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
     rig.runtime.start()
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
-    recovered = Mock(state="running", generation=1)
+    recovered = Mock(state="running", generation=1, restarting=False, ready=True)
     current = ["whisper"]
     monkeypatch.setattr(rig.runtime, "_resolve_model_request", lambda: _switch_request(current[0]))
 
@@ -1109,7 +1112,7 @@ def test_paused_switch_watchdog_stops_unresponsive_worker(monkeypatch: pytest.Mo
 
 def test_restart_worker_fails_paused_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
     finished = Mock()
     rig.runtime.on_switch_finished = finished
@@ -1223,6 +1226,22 @@ def test_failed_build_releases_resources_and_cannot_restart(
     resources["hotkey"].grab.assert_not_called()
 
 
+def assert_launch_guard_tracks_lifecycle(
+    runtime: DictationRuntime, launch_allowed: Callable[[], bool]
+) -> None:
+    """Переданный фабрике callback читает текущее состояние при каждом вызове."""
+    assert callable(launch_allowed)
+    closed, reserved = runtime._closed, runtime._appimage_removal_reserved
+    try:
+        for closed_state, reserved_state in ((False, False), (True, False), (False, True)):
+            runtime._closed = closed_state
+            runtime._appimage_removal_reserved = reserved_state
+            assert launch_allowed() is (not closed_state and not reserved_state)
+    finally:
+        runtime._closed = closed
+        runtime._appimage_removal_reserved = reserved
+
+
 def test_start_wires_resources_and_real_dictation(rig: Rig) -> None:
     """Реальные переходы проверяют обе стороны проводки, вставку и статистику."""
     runtime = rig.runtime
@@ -1236,7 +1255,11 @@ def test_start_wires_resources_and_real_dictation(rig: Rig) -> None:
     rig.pill_factory.assert_called_once_with(session=SessionKind.FLY, parent=runtime)
     rig.tray_factory.assert_called_once_with(rig.provider, hotkey="Ctrl+Space", parent=runtime)
     rig.guard_factory.assert_called_once_with(rig.pill, rig.tray, parent=runtime)
-    rig.supervisor_factory.assert_called_once_with(on_event=runtime._on_worker_event, use_qt=True)
+    launch_allowed = rig.supervisor_factory.call_args.kwargs["launch_allowed"]
+    rig.supervisor_factory.assert_called_once_with(
+        on_event=runtime._on_worker_event, use_qt=True, launch_allowed=launch_allowed
+    )
+    assert_launch_guard_tracks_lifecycle(runtime, launch_allowed)
     assert rig.hotkey.on_state == runtime._on_hotkey_state
     assert rig.guard.on_stop_recording == runtime.orchestrator.on_indicators_lost
     rig.create_notifier.assert_called_once_with(17)
@@ -1755,7 +1778,7 @@ def test_restart_loads_model_again(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     request = rig.supervisor.send.call_args.args[0]
     rig.event(type="model.loaded")
     rig.event(type="result", utterance_id="file", text="Проверка связи")
-    new = Mock(state="running", generation=1)
+    new = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = new
     rig.runtime.restart_worker()
     rig.supervisor.stop.assert_called_once_with()
@@ -3113,7 +3136,7 @@ def test_cancel_restart_replaces_supervisor_and_routes_new_cycle(
     rig.hotkey.fsm.press(rig.now)
     runtime.orchestrator.cancel("tray")
     next(t for t in rig.timers if t.interval == CANCEL_TIMEOUT_MS).fire()
-    new = Mock(state="running", generation=1)
+    new = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = new
     rig.trace.clear()
     new.start.side_effect = lambda: rig.record("new.start")
@@ -3126,7 +3149,11 @@ def test_cancel_restart_replaces_supervisor_and_routes_new_cycle(
     old.stop.assert_called_once_with()
     new.start.assert_called_once_with()
     assert new.generation == 8
-    rig.supervisor_factory.assert_called_with(on_event=runtime._on_worker_event, use_qt=True)
+    launch_allowed = rig.supervisor_factory.call_args.kwargs["launch_allowed"]
+    rig.supervisor_factory.assert_called_with(
+        on_event=runtime._on_worker_event, use_qt=True, launch_allowed=launch_allowed
+    )
+    assert_launch_guard_tracks_lifecycle(runtime, launch_allowed)
     old.send.reset_mock()
     rig.hotkey.fsm.press(rig.now + 3)
     assert new.send.call_args.args[0]["type"] == "record.start"
@@ -5052,6 +5079,7 @@ def test_level_runtime_does_not_prepare_model(
     monkeypatch: pytest.MonkeyPatch, selfcheck: str
 ) -> None:
     rig = microphone_runtime(monkeypatch, model=False)
+    microphone_runtime_event(rig, ipc.make_hello())
     rig.runtime._selfcheck = selfcheck
     resolve = Mock(side_effect=AssertionError("Модель не нужна"))
     restart = Mock(side_effect=AssertionError("Перезапуск не нужен"))
@@ -5075,6 +5103,7 @@ def test_level_runtime_does_not_prepare_model(
 @pytest.mark.parametrize("unavailable", ["not-started", "closed", "stopped", "busy"])
 def test_level_runtime_unavailable(monkeypatch: pytest.MonkeyPatch, unavailable: str) -> None:
     rig = microphone_runtime(monkeypatch, model=False)
+    microphone_runtime_event(rig, ipc.make_hello())
     if unavailable == "not-started":
         rig.runtime._started = False
     elif unavailable == "closed":
@@ -5230,7 +5259,7 @@ class SwitchRig:
         return _switch_request(self.current)
 
     def factory(self, **kwargs: Any) -> Mock:
-        worker = Mock(state="running", generation=0)
+        worker = Mock(state="running", generation=0, restarting=False, ready=True)
         worker.on_event = kwargs["on_event"]
         self.workers.append(worker)
         return worker

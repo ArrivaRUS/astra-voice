@@ -353,6 +353,7 @@ class DictationRuntime(QObject):
                 send=self._send,
                 generation=lambda: self.supervisor.generation,
                 restart_worker=self.restart_worker,
+                worker_restarting=lambda: self.supervisor.restarting,
                 pill=self.pill,
                 tray=self.tray,
                 paste=self.paste_func,
@@ -378,7 +379,11 @@ class DictationRuntime(QObject):
                 on_idle=self._run_pending_switch,
             )
             rollback.append(("оркестратор", self.orchestrator.shutdown))
-            self.supervisor = supervisor_factory(on_event=self._on_worker_event, use_qt=True)
+            self.supervisor = supervisor_factory(
+                on_event=self._on_worker_event,
+                use_qt=True,
+                launch_allowed=lambda: not self._closed and not self._appimage_removal_reserved,
+            )
             rollback.append(("воркер", self.supervisor.stop))
             self.hotkey.on_state = self._on_hotkey_state
             self.hotkey.on_release = self._on_hotkey_release
@@ -413,6 +418,7 @@ class DictationRuntime(QObject):
         return bool(
             self._closed
             or self._appimage_removal_reserved
+            or self.supervisor.restarting
             or self.phase is not DictationPhase.IDLE
             or self._input_owner is not None
             or self._capture_watchdog is not None
@@ -1666,8 +1672,14 @@ class DictationRuntime(QObject):
 
     def start_level_monitor(self, device: str, callback: LevelCallback) -> bool:
         """Измерение уровня не зависит от модели и её самопроверки."""
+        if self.supervisor.restarting:
+            callback(MicrophoneLevelUpdate("error", message="Воркер ещё перезапускается."))
+            return False
         if self._closed or not self._started or self.supervisor.state != "running":
             callback(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
+            return False
+        if not self.supervisor.ready:
+            callback(MicrophoneLevelUpdate("error", message="Воркер ещё не готов."))
             return False
         if (
             self._pending_test is not None
@@ -1793,7 +1805,11 @@ class DictationRuntime(QObject):
             or self._switch_active()
         ):
             return
-        if self.phase != DictationPhase.IDLE or self.orchestrator.cleanup_pending:
+        if (
+            self.phase != DictationPhase.IDLE
+            or self.orchestrator.cleanup_pending
+            or self.supervisor.restarting
+        ):
             self._pending_switch = (min_ram_mb, pause)
             self._pending_switch_timer = self.schedule(
                 int(PENDING_SWITCH_TIMEOUT_S * 1000), self._pending_switch_watchdog
@@ -1940,7 +1956,9 @@ class DictationRuntime(QObject):
         candidate: WorkerSupervisor | None = None
         try:
             candidate = self._supervisor_factory(
-                on_event=lambda event: self._on_candidate_event(candidate, event), use_qt=True
+                on_event=lambda event: self._on_candidate_event(candidate, event),
+                use_qt=True,
+                launch_allowed=lambda: not self._closed and not self._appimage_removal_reserved,
             )
             candidate.generation = self.supervisor.generation + 1
             self._switch_candidate = candidate
@@ -1980,7 +1998,7 @@ class DictationRuntime(QObject):
             self._fail_candidate()
 
     def _promote_candidate(self) -> None:
-        if self.orchestrator.cleanup_pending:
+        if self.orchestrator.cleanup_pending or self.supervisor.restarting:
             return
         candidate = self._switch_candidate
         event = self._switch_loaded_event
@@ -1994,6 +2012,8 @@ class DictationRuntime(QObject):
                 # Не меняем поколение, пока завершение прежнего процесса не доказано.
                 log.warning("Не удалось остановить прежний воркер для смены модели")
                 self._finish_switch("failed")
+                if not self._closed:
+                    self._show_load_failed()
                 return
             self._switch_candidate = None
             self._switch_request = None
@@ -2071,6 +2091,8 @@ class DictationRuntime(QObject):
         retry_selfcheck сохраняет бюджет автоматической повторной попытки.
         _park — выгрузка по простою: новый воркер не грузит модель до нажатия.
         """
+        if self.supervisor.restarting:
+            raise RuntimeError("Воркер ещё перезапускается.")
         if self._closed or self._appimage_removal_reserved or self._terminating_worker:
             return
         self._terminated_generation = None
@@ -2090,7 +2112,11 @@ class DictationRuntime(QObject):
         self._reset_selfcheck(retry=retry_selfcheck)
         generation = self.supervisor.generation + 1
         self.supervisor.stop()
-        self.supervisor = self._supervisor_factory(on_event=self._on_worker_event, use_qt=True)
+        self.supervisor = self._supervisor_factory(
+            on_event=self._on_worker_event,
+            use_qt=True,
+            launch_allowed=lambda: not self._closed and not self._appimage_removal_reserved,
+        )
         self.supervisor.generation = generation
         self._model_load_generation = None
         if not retry_selfcheck:
@@ -2535,6 +2561,10 @@ class DictationRuntime(QObject):
                         if event.get("code") in ("timeout", "load-timeout")
                         else "worker-error"
                     )
+            if self.phase == DictationPhase.IDLE and (
+                self._pending_switch is not None or self._switch_loaded_event is not None
+            ):
+                self._run_pending_switch()
             return
         if (
             not self._closed
@@ -2544,6 +2574,10 @@ class DictationRuntime(QObject):
             and event.get("code") in ("worker-start", "worker-crashed", "restart-limit")
         ):
             self._finish_selfcheck("worker-error")
+            if self.phase == DictationPhase.IDLE and (
+                self._pending_switch is not None or self._switch_loaded_event is not None
+            ):
+                self._run_pending_switch()
             return
         if (
             not self._closed
@@ -2591,6 +2625,11 @@ class DictationRuntime(QObject):
                     self._model_load_failures += 1
                     if self._selfcheck == "retrying":
                         self._finish_selfcheck("load-failed")
+                        if self.phase == DictationPhase.IDLE and (
+                            self._pending_switch is not None
+                            or self._switch_loaded_event is not None
+                        ):
+                            self._run_pending_switch()
                         return
                     log.warning("Не удалось загрузить модель")
                     if self.orchestrator.phase == DictationPhase.IDLE:
@@ -2907,6 +2946,13 @@ class DictationRuntime(QObject):
             or self._appimage_removal_reserved
             or self._switch_active()
         ):
+            return False
+        if self.supervisor.restarting:
+            message = "Воркер ещё перезапускается."
+            self._fail_pending_test(message=message)
+            if self._command_publication_allowed():
+                self.pill.show_state(PillState.ERROR, text=message)
+            self.tray.set_state(TrayState.ERROR)
             return False
         self._model_parked = False
         self._last_activity = monotonic()
@@ -3256,6 +3302,7 @@ class DictationRuntime(QObject):
             self._closed
             or self._terminated_generation == self.supervisor.generation
             or self.orchestrator.cleanup_pending
+            or self.supervisor.restarting
         ):
             return
         # Хвост предыдущей диктовки может завершиться во время нового нажатия.

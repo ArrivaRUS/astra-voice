@@ -321,6 +321,7 @@ class DictationOrchestrator:
         microphone_count: Callable[[], int] = lambda: 0,
         hotkey_refuse: Callable[[], None] | None = None,
         set_tray_trusted: Callable[[bool], None] | None = None,
+        worker_restarting: Callable[[], bool] = lambda: False,
     ) -> None:
         # Контекст фраз создаётся первым: остальные поля фразы читаются через него.
         self._ctx: _Utterance | None = None
@@ -340,6 +341,7 @@ class DictationOrchestrator:
         self._send = send
         self._generation = generation
         self._restart_worker = restart_worker
+        self._worker_restarting = worker_restarting
         self._pill = pill
         self._tray = tray
         self._paste = paste
@@ -716,6 +718,9 @@ class DictationOrchestrator:
             self._level_cancel_restart()
 
     def _level_cancel_restart(self) -> None:
+        if self._worker_restarting():
+            self._later(CANCEL_RESTART_MS, self._level_cancel_restart)
+            return
         try:
             if self._generation() == self._worker_generation:
                 self._restart_worker()
@@ -740,6 +745,12 @@ class DictationOrchestrator:
         if event.get("utterance_id", self._utterance_id) != self._utterance_id:
             return
         kind = event.get("type")
+        if kind == "error" and event.get("code") in _RESTART_CODES:
+            self._capture_open = False
+            self._level_failed = True
+            self._level_notify(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
+            self._finish_level()
+            return
         if kind == "audio.closed" and event.get("request_type") == "audio.close":
             # В ответе нет utterance_id: чужой поздний ответ не снимает сторожей.
             if self._cancel_pending and self._level_awaiting_audio_closed:
@@ -1369,6 +1380,9 @@ class DictationOrchestrator:
         if event.get("utterance_id", self._utterance_id) != self._utterance_id:
             return
         kind = event.get("type")
+        if kind == "error" and event.get("code") in _RESTART_CODES:
+            self._fail_restarted()
+            return
         if self.mode == "command" and not self._publication_allowed():
             self.command_session_changed()
             if kind != "cancelled":
@@ -1983,7 +1997,7 @@ class DictationOrchestrator:
                 self.on_worker_event(event)
 
     def _restart_after_cancel(self) -> None:
-        if self._other_capture_open():
+        if self._worker_restarting() or self._other_capture_open():
             self._later(CANCEL_RESTART_MS, self._restart_after_cancel)
             return
         try:
