@@ -18,6 +18,7 @@ from astra_voice.core.paths import qml_dir
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.x11 import X11Display
 from astra_voice.ui.icons import install_icon_provider
+from astra_voice.worker.ipc import PROTOCOL_MISMATCH_MESSAGE
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ ERROR_REASONS: Final = frozenset(
         ERROR_MODEL_LOAD_FAILED,
         ERROR_SELFCHECK_FAILED,
         ERROR_MODEL_REVOKED,
+        PROTOCOL_MISMATCH_MESSAGE,
     )
 )
 

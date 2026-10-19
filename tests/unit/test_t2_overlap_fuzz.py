@@ -1,431 +1,102 @@
-"""Фиксированный фазз ИБ: О4, очередь, автомат клавиши и приватность (US-2.7)."""
+"""ИБ-46/51: настоящий IPC, WorkerState, AudioCapture и оркестратор.
+
+ОС заменена каналом в памяти и управляемым источником PCM; UI и часы — Rig.
+Предыдущие model/replay проверки без ослабления сохранены в test_t2_overlap_replay.
+"""
 
 from __future__ import annotations
 
 import logging
 import random
-from collections.abc import Callable
+import sys
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
+from queue import Empty, Queue
+from threading import Event
 from typing import Any, cast
 from unittest.mock import Mock
 
 import pytest
-from test_dictation import MARKER, Rig, Timer
+from test_dictation import MARKER, Rig
 from test_indicators import FakePill, FakeTimer, FakeTray
 
-from astra_voice.core.dictation import (
-    CANCEL_TIMEOUT_MS,
-    RELEASE_TAIL_MS,
-    DictationPhase,
-)
+from astra_voice.core.dictation import DictationPhase
 from astra_voice.platform.hotkey import HotkeyMode, HotkeyState
-from astra_voice.platform.paste import PasteOutcomeKind
 from astra_voice.ui import indicators
 from astra_voice.ui.indicators import IndicatorGuard
 from astra_voice.ui.pill import PillState
 from astra_voice.ui.tray_icons import TrayState
+from astra_voice.worker import ipc
+from astra_voice.worker import supervisor as supervisor_module
+from astra_voice.worker.audio import ERROR_FAILED, AudioCapture, AudioError
+from astra_voice.worker.main import WorkerLoop
+from astra_voice.worker.state import WorkerState
+from astra_voice.worker.supervisor import WorkerSupervisor
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from fakes import FakeCancelToken, FakeEngine  # noqa: E402
 
 pytestmark = pytest.mark.unit
-LISTENING = {PillState.LISTENING, PillState.LISTENING_SILENT, PillState.LIMIT}
 
 
-class WorkerModel:
-    """Захват на стороне воркера: только wire-команды и физические границы.
+class Source:
+    """Источник ОС: отдельно управляет чтением и физическим закрытием."""
 
-    Модель не читает состояние оркестратора/FSM/стража. В частности, cancel(A)
-    закрывает только A, а глобальная ошибка сама по себе не закрывает B.
-    """
+    live = False
+    ended = False
 
-    def __init__(self, *, defer_stop: bool = False) -> None:
-        self.generation = 1
-        self.captures: set[str] = set()
-        self.known: set[str] = set()
-        self.defer_stop = defer_stop
-        self.stop_requests: set[str] = set()
-        self.cancel_replies: dict[str, dict[str, Any]] = {}
-        self.sent: list[tuple[dict[str, Any], int]] = []
+    def __init__(self) -> None:
+        self.is_open = False
+        self.opened = Event()
+        self.closing = Event()
+        self.release_close = Event()
+        self.release_close.set()
+        self.fault = Event()
+        self.read_tick = Event()
 
-    def send(self, message: dict[str, Any]) -> None:
-        self.sent.append((dict(message), self.generation))
-        kind = message["type"]
-        if kind == "record.start":
-            uid = str(message["utterance_id"])
-            self.captures.add(uid)
-            self.known.add(uid)
-        elif kind in {"record.stop", "record.cancel", "recognize"}:
-            uid = str(message["utterance_id"])
-            if kind == "record.cancel":
-                self.cancel_replies[uid] = (
-                    {"type": "cancelled"}
-                    if uid in self.known
-                    else {"type": "error", "code": "bad-state", "request_type": kind}
-                )
-                self.known.discard(uid)
-            if self.defer_stop:
-                self.stop_requests.add(uid)
-            else:
-                self.close(uid)
-        elif kind == "audio.close":
-            self.captures.clear()
+    def open(self, device: str | None) -> None:
+        assert not self.is_open, "два физических захвата"
+        self.fault.clear()
+        self.closing.clear()
+        self.is_open = True
+        self.opened.set()
 
-    def close(self, uid: str) -> None:
-        self.captures.discard(uid)
+    def read_chunk(self) -> bytes:
+        self.read_tick.wait(0.001)
+        if self.fault.is_set():
+            raise AudioError(ERROR_FAILED, "Ошибка источника.")
+        return b"\x00\x20" * 160
 
-    def restart(self) -> None:
-        self.generation += 1
-        self.captures.clear()
-        self.known.clear()
-        self.stop_requests.clear()
-        self.cancel_replies.clear()
+    def close(self) -> None:
+        self.closing.set()
+        assert self.release_close.wait(3), "тест не освободил close"
+        self.is_open = False
 
 
-@pytest.mark.parametrize("mode", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
-@pytest.mark.parametrize("tray_faults", [False, True])
-def test_overlap_fixed_seed_invariants(
-    mode: HotkeyMode,
-    tray_faults: bool,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Логика fuzz_overlap.py: 128 последовательностей по 80 шагов, затем досчёт."""
-    caplog.set_level(logging.DEBUG, logger="test.dictation")
-    for seed in range(32):
-        run_sequence(mode, caplog, seed, tray_faults, monkeypatch)
+class Channel:
+    """Только транспорт вместо socket.send; фрейминг остаётся настоящим."""
+
+    def __init__(self) -> None:
+        self.reader = ipc.FrameReader()
+        self.commands: deque[dict[str, Any]] = deque()
+
+    def send(self, data: bytes) -> int:
+        self.commands.extend(self.reader.feed(bytes(data)))
+        return len(data)
+
+    def close(self) -> None:
+        pass
 
 
-def run_sequence(
-    mode: HotkeyMode,
-    caplog: pytest.LogCaptureFixture,
-    seed: int,
-    tray_faults: bool,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    caplog.clear()
-    rng = random.Random(0xA57A_2026 + seed)
-    rig = Rig(mode)
-    pill = FakePill()
-    tray = FakeTray()
-    raising = False
-    original_set_state = tray.set_state
-
-    def set_state(state: TrayState, tooltip: str | None = None) -> None:
-        if raising and state is TrayState.LISTENING:
-            raise RuntimeError(MARKER)
-        original_set_state(state, tooltip)
-
-    monkeypatch.setattr(tray, "set_state", set_state)
-    monkeypatch.setattr(indicators, "monotonic", lambda: rig.now)
-    monkeypatch.setattr(
-        indicators,
-        "QTimer",
-        Mock(side_effect=FakeTimer, singleShot=lambda delay, callback: None),
-    )
-    # Нулевой грейс позволяет проверять строгий О4 на каждом шаге; реальные
-    # границы грейса отдельно проверены в test_indicators и runtime T2.
-    guard = IndicatorGuard(cast(Any, pill), cast(Any, tray), grace_ms=0)
-    rig.core._pill = pill
-    rig.core._tray = tray
-    rig.core._set_tray_trusted = guard.set_tray_trusted
-    guard.on_stop_recording = rig.core.on_indicators_lost
-
-    def set_recording(value: bool) -> None:
-        rig.set_recording(value)
-        guard.set_recording(value)
-
-    rig.core._set_recording = set_recording
-    worker = WorkerModel()
-    sent = worker.sent
-    delivered: set[tuple[str, str]] = set()
-    history: list[str] = []
-    rig.during_send = worker.send
-    tail_deadlines: dict[int, tuple[Timer, float]] = {}
-
-    def schedule(delay: int, callback: Callable[[], None]) -> object:
-        timer = cast(Timer, rig.schedule(delay, callback))
-        if delay == RELEASE_TAIL_MS:
-            tail_deadlines[id(timer)] = (timer, rig.now + delay / 1000)
-        return timer
-
-    rig.core._schedule = schedule
-
-    def advance(seconds: float) -> None:
-        # Длинный случайный скачок не растягивает физический хвост записи.
-        target = rig.now + seconds
-        for timer, deadline in sorted(tail_deadlines.values(), key=lambda pair: pair[1]):
-            if not timer.cancelled and not timer.fired and deadline <= target:
-                rig.now = max(rig.now, deadline)
-                timer.fire()
-        rig.now = max(rig.now, target)
-
-    def recording() -> list[str]:
-        return sorted(worker.captures)
-
-    def pending(kind: str) -> list[str]:
-        return [
-            str(m["utterance_id"])
-            for m, generation in sent
-            if m["type"] == kind
-            and generation == rig.worker_generation
-            and (kind, str(m["utterance_id"])) not in delivered
-        ]
-
-    def event(event_type: str, uid: str | None = None, **fields: object) -> None:
-        message: dict[str, Any] = {
-            "type": event_type,
-            "generation": rig.worker_generation,
-            **fields,
-        }
-        if uid is not None:
-            message["utterance_id"] = uid
-        rig.core.on_worker_event(message)
-
-    def check() -> None:
-        guard.check()
-        guard.check()
-        context = f"seed={seed} mode={mode.name} actions={history[-20:]}"
-        active = recording()
-        assert len(active) <= 1, context
-        for uid in active:
-            assert guard.recording and rig.recording, context
-            assert (pill.visible and pill.state in LISTENING) or (
-                guard._tray_trusted and tray.registered and tray.state is TrayState.LISTENING
-            ), context
-            tail = any(c._utterance_id == uid and c._tail_pending for c in rig.core._contexts)
-            bounded_tail = tail and any(
-                not timer.cancelled
-                and not timer.fired
-                and rig.now <= deadline <= rig.now + RELEASE_TAIL_MS / 1000
-                for timer, deadline in tail_deadlines.values()
-            )
-            assert rig.fsm.state is HotkeyState.RECORDING or bounded_tail, context
-        assert not any(MARKER in record.getMessage() for record in caplog.records), context
-        assert not any(MARKER in str(entry) for entry in rig.stats.events), context
-        if rig.core.phase is DictationPhase.IDLE:
-            assert not rig.core._items, context
-
-    def phrase_state() -> tuple[object, ...]:
-        # Только семантика фраз/команд/индикации; clock() и прочая трассировка
-        # не являются частью контракта изоляции глобальной ошибки.
-        return (
-            [(c._utterance_id, c._phase) for c in rig.core._items],
-            list(sent),
-            set(worker.captures),
-            rig.fsm.state,
-            guard.recording,
-            rig.recording,
-            pill.visible,
-            pill.state,
-            tray.state,
-            list(rig.stats.events),
-            list(rig.pasted),
-        )
-
-    def global_error(code: str = "engine-failed") -> None:
-        # О4 допускает безопасную отмену B при потере индикации. Здесь другой
-        # контракт: без id нет владельца ошибки, значит отменять B тоже нельзя.
-        before = phrase_state()
-        event("error", code=code)
-        context = f"idless error changed phrase: seed={seed} mode={mode.name} actions={history}"
-        assert phrase_state() == before, context
-
-    # Каждый seed гарантирует timeout A и позднюю ошибку во время записи B.
-    # Нечётные seed также проверяют угадывание PROCESSING A старым _route.
-    history.append("directed:start_A")
-    rig.fsm.press(rig.now)
-    check()
-    advance(rng.uniform(0.5, 1.0))
-    history.append("directed:stop_A")
-    if mode is HotkeyMode.TOGGLE:
-        rig.fsm.press(rig.now)
-    else:
-        rig.fsm.release(rig.now)
-    check()
-    advance(RELEASE_TAIL_MS / 1000)
-    check()
-    (a_uid,) = pending("recognize")
-    advance(rng.uniform(0.5, 1.0))
-    history.append("directed:start_B")
-    rig.fsm.press(rig.now)
-    (b_uid,) = recording()
-    assert b_uid != a_uid
-    check()
-    if seed % 2:
-        history.append("directed:global_engine_error")
-        global_error()
-        check()
-    history.append("directed:timeout_A")
-    event("error", a_uid, code="timeout", request_type="recognize")
-    delivered.add(("recognize", a_uid))
-    assert any(m["type"] == "record.cancel" and m.get("utterance_id") == a_uid for m, _ in sent)
-    assert recording() == [b_uid]
-    check()
-    history.append("directed:late_global_engine_error_while_B_records")
-    global_error()
-    assert recording() == [b_uid]
-    check()
-
-    actions = (
-        "press",
-        "release_short",
-        "release_long",
-        "escape",
-        "tick_limit",
-        "timer",
-        "timer",
-        "result",
-        "empty",
-        "error",
-        "global_error",
-        "cancelled",
-        "limit",
-        "device",
-        "restart",
-        "pill",
-        "audio_closed",
-        "level",
-        "outcome",
-        "pill_enabled",
-        *(["tray_raise"] if tray_faults else []),
-    )
-    for _ in range(80):
-        action = rng.choice(actions)
-        history.append(action)
-        if action == "press":
-            advance(0.5)
-            rig.fsm.press(rig.now)
-        elif action in {"release_short", "release_long"}:
-            advance(0.1 if action == "release_short" else 1.0)
-            rig.fsm.release(rig.now)
-        elif action == "escape":
-            rig.fsm.escape(rig.now)
-        elif action == "tick_limit":
-            advance(200)
-            rig.fsm.tick(rig.now)
-        elif action == "timer":
-            timers = [t for t in rig.timers if not t.cancelled and not t.fired]
-            if timers:
-                timer = rng.choice(timers)
-                advance(timer.delay / 1000)
-                if not timer.cancelled and not timer.fired:
-                    timer.fire()
-        elif action in {"result", "empty", "error"}:
-            candidates = pending("recognize")
-            if candidates:
-                uid = rng.choice(candidates)
-                delivered.add(("recognize", uid))
-                worker.known.discard(uid)
-                advance(0.3)
-                if action == "error":
-                    event(
-                        "error",
-                        uid,
-                        code=rng.choice(["engine-failed", "timeout", "busy"]),
-                        request_type="recognize",
-                    )
-                else:
-                    event("result", uid, text="" if action == "empty" else MARKER)
-        elif action == "global_error":
-            global_error(rng.choice(["engine-failed", "timeout", "busy"]))
-        elif action == "cancelled":
-            candidates = pending("record.cancel")
-            if candidates:
-                uid = rng.choice(candidates)
-                delivered.add(("record.cancel", uid))
-                worker.close(uid)
-                reply = worker.cancel_replies[uid]
-                event(str(reply["type"]), uid, **{k: v for k, v in reply.items() if k != "type"})
-        elif action in {"limit", "device"}:
-            active = recording()
-            if active:
-                uid = active[0]
-                worker.close(uid)
-                if action == "limit":
-                    event("record.limit", uid)
-                else:
-                    event(
-                        "audio.device.changed",
-                        uid,
-                        kind=rng.choice(["device-lost", "switched"]),
-                        label="X",
-                        audio_ms=rng.choice([100, 1000]),
-                    )
-        elif action == "restart":
-            worker.restart()
-            rig.worker_generation = worker.generation
-            event("error", code="worker-crashed")
-        elif action == "pill":
-            pill.available = not pill.available
-        elif action == "pill_enabled":
-            pill.enabled = not pill.enabled
-        elif action == "tray_raise":
-            raising = not raising
-        elif action == "audio_closed":
-            worker.captures.clear()
-            event("audio.closed")
-        elif action == "level":
-            active = recording()
-            if active:
-                event("level", active[0], peak_dbfs=-20.0)
-        elif action == "outcome":
-            rig.outcomes.append(rng.choice(list(PasteOutcomeKind)))
-        check()
-
-    raising = False
-    for _ in range(200):
-        progressed = False
-        if rig.fsm.state is HotkeyState.RECORDING:
-            advance(1)
-            if rig.fsm.mode is HotkeyMode.TOGGLE:
-                rig.fsm.press(rig.now)
-            else:
-                rig.fsm.release(rig.now)
-            progressed = True
-        for kind in ("recognize", "record.cancel"):
-            candidates = pending(kind)
-            if candidates:
-                uid = candidates[0]
-                delivered.add((kind, uid))
-                if kind == "record.cancel":
-                    worker.close(uid)
-                    reply = worker.cancel_replies[uid]
-                    event(
-                        str(reply["type"]), uid, **{k: v for k, v in reply.items() if k != "type"}
-                    )
-                else:
-                    worker.known.discard(uid)
-                    event("result", uid, text=MARKER)
-                progressed = True
-        timers = [t for t in rig.timers if not t.cancelled and not t.fired]
-        if timers:
-            timer = min(timers, key=lambda t: t.delay)
-            advance(timer.delay / 1000)
-            if not timer.cancelled and not timer.fired:
-                timer.fire()
-            progressed = True
-        check()
-        if not progressed:
-            break
-    context = f"seed={seed} mode={mode.name} actions={history[-20:]}"
-    assert not rig.core._items, context
-    assert rig.core.phase is DictationPhase.IDLE, context
-    assert rig.fsm.state is HotkeyState.IDLE, context
-    assert not guard.recording and not rig.recording and not recording(), context
-
-
-class CaptureReplay:
-    """Wire replay: время, физический захват и доставка ACK независимы от GUI."""
-
-    def __init__(self, mode: HotkeyMode, monkeypatch: pytest.MonkeyPatch) -> None:
+class Chain:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, mode: HotkeyMode) -> None:
         self.rig = Rig(mode)
         self.rig.ack_stop = False
-        self.worker = WorkerModel(defer_stop=True)
-        self.rig.during_send = self.worker.send
-        self.pill = FakePill()
-        self.tray = FakeTray()
+        self.pill, self.tray = FakePill(), FakeTray()
         monkeypatch.setattr(indicators, "monotonic", lambda: self.rig.now)
         monkeypatch.setattr(
-            indicators,
-            "QTimer",
-            Mock(side_effect=FakeTimer, singleShot=lambda delay, callback: None),
+            indicators, "QTimer", Mock(side_effect=FakeTimer, singleShot=lambda *_: None)
         )
         self.guard = IndicatorGuard(cast(Any, self.pill), cast(Any, self.tray), grace_ms=0)
         self.rig.core._pill = self.pill
@@ -433,351 +104,586 @@ class CaptureReplay:
         self.rig.core._set_tray_trusted = self.guard.set_tray_trusted
         self.guard.on_stop_recording = self.rig.core.on_indicators_lost
 
-        def set_recording(value: bool) -> None:
+        def recording(value: bool) -> None:
             self.rig.set_recording(value)
             self.guard.set_recording(value)
 
-        self.rig.core._set_recording = set_recording
-        self.deadlines: list[tuple[Timer, float]] = []
+        self.rig.core._set_recording = recording
+        self.events: Queue[dict[str, Any]] = Queue()
+        self.responses: Queue[dict[str, Any]] = Queue()
+        self.command_progress: Queue[str] = Queue()
+        self.delivered: list[dict[str, Any]] = []
+        self.trace: list[str] = []
+        self.seed: int | None = None
+        self.channel = Channel()
+        self.supervisor = WorkerSupervisor(
+            self._receive_gui, use_qt=False, clock=lambda: self.rig.now
+        )
+        self.supervisor.state = "running"
+        self.supervisor._socket = cast(Any, self.channel)
+        self.rig.during_send = self.supervisor.send
+        self._new_worker()
+        self.command_executor = ThreadPoolExecutor(max_workers=1)
+        self.rig.restart_worker.side_effect = self.restart
 
-        def schedule(delay: int, callback: Callable[[], None]) -> object:
-            timer = cast(Timer, self.rig.schedule(delay, callback))
-            self.deadlines.append((timer, self.rig.now + delay / 1000))
-            return timer
+    def _new_worker(self) -> None:
+        self.worker_channel = Channel()
+        self.loop = WorkerLoop(cast(Any, self.worker_channel), capture=False)
+        self.loop.worker.close()
+        self.loop._events = self.events
+        self.source = Source()
+        self.engine = FakeEngine(text=MARKER)
+        self.worker = WorkerState(
+            engine_factory=lambda _: self.engine,
+            cancel_factory=FakeCancelToken,
+            on_event=self.loop._put_event,
+            audio_factory=list,
+            clock=lambda: self.rig.now,
+        )
+        self.capture = AudioCapture(
+            source=self.source,
+            on_samples=self.worker.on_samples,
+            on_event=self.loop._put_event,
+            on_error=self.worker.on_error,
+        )
+        self.worker.set_capture(self.capture)
+        original_wait = self.capture.wait_stopped
 
-        self.rig.core._schedule = schedule
+        def observed_wait(uid: str) -> None:
+            # Только наблюдение: настоящее ожидание и его дедлайн не меняются.
+            self.command_progress.put("wait")
+            original_wait(uid)
 
-    def event(self, event_type: str, uid: str | None = None, **fields: object) -> None:
-        message: dict[str, Any] = {
-            "type": event_type,
-            "generation": self.worker.generation,
-            **fields,
-        }
-        if uid is not None:
-            message["utterance_id"] = uid
-        self.rig.core.on_worker_event(message)
+        self.capture.wait_stopped = observed_wait
+        self.loop.worker = self.worker
+        loaded = self.worker.handle(
+            dict(
+                type="model.load",
+                id="fake",
+                revision="r",
+                dir="/model",
+                layout="fake",
+                variant="int8",
+                threads=1,
+                min_ram_mb=512,
+            )
+        )
+        assert loaded[0]["type"] == "model.loaded"
 
-    def advance(self, seconds: float) -> None:
-        target = self.rig.now + seconds
-        while True:
-            due = [
-                (timer, deadline)
-                for timer, deadline in self.deadlines
-                if not timer.cancelled and not timer.fired and deadline <= target
-            ]
-            if not due:
+    def _receive_gui(self, event: dict[str, Any]) -> None:
+        self.delivered.append(dict(event))
+        self.rig.core.on_worker_event(event)
+
+    def restart(self) -> None:
+        # ОС закрывает ресурс завершённого процесса до смены поколения.
+        self.source.release_close.set()
+        self.capture.stop()
+        self.worker.close()
+        self.loop._wake_r.close()
+        self.loop._wake_w.close()
+        assert not self.source.is_open
+        self.rig.worker_generation += 1
+        self.supervisor.generation = self.rig.worker_generation
+        self.supervisor._pending.clear()
+        self.supervisor._finished.clear()
+        self.channel.commands.clear()
+        for queue in (self.events, self.responses):
+            while not queue.empty():
+                queue.get_nowait()
+        self._new_worker()
+
+    def handle_one(self) -> list[dict[str, Any]]:
+        command = self.channel.commands.popleft()
+        # Настоящий main добавляет uid/request_type даже прежнему WorkerState.
+        # Ответы уходят внутри _receive; события capture — в следующем обороте.
+        assert self.loop._receive(ipc.encode(command))
+        self.loop._flush_send()
+        replies = list(self.worker_channel.commands)
+        self.worker_channel.commands.clear()
+        for reply in replies:
+            self.responses.put(reply)
+        self.command_progress.put("done")
+        return replies
+
+    def commands(self) -> None:
+        while self.channel.commands:
+            self.handle_one()
+
+    def deliver(self, message: dict[str, Any]) -> None:
+        self.supervisor._receive(ipc.encode(message), self.supervisor.generation)
+        self.check()
+
+    def drain_responses(self) -> None:
+        while not self.responses.empty():
+            self.deliver(self.responses.get_nowait())
+
+    def serialize_events(self) -> list[dict[str, Any]]:
+        """Начало оборота WorkerLoop: до _receive сериализовать до 64 событий."""
+        for _ in range(64):
+            try:
+                message = self.events.get_nowait()
+            except Empty:
                 break
-            timer, deadline = min(due, key=lambda pair: pair[1])
-            self.rig.now = max(self.rig.now, deadline)
-            timer.fire()
-            self.assert_o4()
-        self.rig.now = max(self.rig.now, target)
+            self.loop._send(message)
+        self.loop._flush_send()
+        messages = list(self.worker_channel.commands)
+        self.worker_channel.commands.clear()
+        return messages
+
+    def drain(self) -> None:
+        self.drain_responses()
+        for message in self.serialize_events():
+            self.deliver(message)
 
     def start(self) -> str | None:
-        before = set(self.worker.captures)
+        before = len(self.rig.sent)
         self.rig.fsm.press(self.rig.now)
-        started = self.worker.captures - before
-        self.assert_o4()
-        return next(iter(started)) if started else None
+        self.commands()
+        starts = [m for m, _ in self.rig.sent[before:] if m["type"] == "record.start"]
+        if not starts:
+            return None
+        assert self.source.opened.wait(2)
+        # record.started доказывает, что поток прошёл open, а не только вошёл в него.
+        while True:
+            message = self.events.get(timeout=2)
+            self.deliver(message)
+            if message["type"] == "record.started":
+                break
+        self.check()
+        return str(starts[-1]["utterance_id"])
 
-    def stop(self) -> None:
-        if self.rig.fsm.mode is HotkeyMode.PTT:
-            self.rig.fsm.release(self.rig.now)
-        else:
-            self.rig.fsm.press(self.rig.now)
-        self.advance(RELEASE_TAIL_MS / 1000)
-        self.assert_o4()
-
-    def physical_stop(self, uid: str, *, acknowledge: bool) -> None:
-        self.worker.close(uid)
-        if acknowledge:
-            self.event("record.stopped", uid)
-
-    def result(self, uid: str, text: str) -> None:
-        # Настоящий WorkerState забывает законченное задание до отправки result.
-        self.worker.known.discard(uid)
-        self.event("result", uid, text=text)
-        self.assert_o4()
-
-    def cancel_reply(self, uid: str) -> bool:
-        reply = self.worker.cancel_replies.pop(uid, None)
-        if reply is None:
-            return False
-        assert uid not in self.worker.captures, "cancel ACK до физического закрытия"
-        self.event(str(reply["type"]), uid, **{k: v for k, v in reply.items() if k != "type"})
-        self.assert_o4()
-        return True
-
-    def assert_o4(self) -> None:
+    def check(self) -> None:
         self.guard.check()
-        assert len(self.worker.captures) <= 1, "два физических захвата одновременно"
-        if not self.worker.captures:
-            return
-        assert self.guard.recording and self.rig.recording, "захват жив, страж выключен"
-        assert (self.pill.visible and self.pill.state in LISTENING) or (
-            self.guard._tray_trusted
-            and self.tray.registered
-            and self.tray.state is TrayState.LISTENING
-        ), "физический захват без видимого состояния «слушаю»"
+        if self.source.is_open:
+            assert self.guard.recording and self.rig.recording, (
+                f"O4: источник открыт, страж выключен; seed={self.seed}; trace={self.trace}"
+            )
+            assert (
+                any(c._cancel_pending for c in self.rig.core._contexts)
+                or (
+                    self.pill.visible
+                    and self.pill.state
+                    in {PillState.LISTENING, PillState.LISTENING_SILENT, PillState.LIMIT}
+                )
+                or (
+                    self.guard._tray_trusted
+                    and self.tray.registered
+                    and self.tray.state is TrayState.LISTENING
+                )
+            ), f"O4: нет индикации; seed={self.seed}; trace={self.trace}"
+
+    def settle(self) -> None:
+        self.source.release_close.set()
+        self.rig.fsm.escape(self.rig.now)
+        for _ in range(30):
+            self.commands()
+            # Дождаться настоящего задания движка, не подменяя его исход.
+            if self.worker._active is not None:
+                self.engine.finished.wait(2)
+            self.drain()
+            timers = [t for t in self.rig.timers if not t.cancelled and not t.fired]
+            if not timers and not self.channel.commands:
+                break
+            for timer in timers:
+                if not timer.cancelled and not timer.fired:
+                    self.rig.now += timer.delay / 1000
+                    timer.fire()
+            self.check()
+        assert not self.source.is_open
+        assert not self.guard.recording and not self.rig.recording
+        assert self.rig.core.phase is DictationPhase.IDLE
+        assert self.rig.fsm.state is HotkeyState.IDLE
+
+    def close(self) -> None:
+        self.source.release_close.set()
+        self.capture.stop()
+        self.command_executor.shutdown(wait=True)
+        self.worker.close()
+        self.loop._wake_r.close()
+        self.loop._wake_w.close()
+        self.supervisor.stop()
+
+
+@pytest.mark.parametrize("trigger", ["capture-error", "escape"])
+def test_stop_reply_cannot_ack_pending_cancel(
+    monkeypatch: pytest.MonkeyPatch, trigger: str
+) -> None:
+    """ИБ-46: реальный супервизор не переписывает stop и не теряет cancel."""
+    chain = Chain(monkeypatch, HotkeyMode.PTT)
+    try:
+        uid = chain.start()
+        assert uid is not None
+        chain.source.release_close.clear()
+        chain.rig.stop()
+        # start -> stop -> recognize находятся в настоящем wire-канале.
+        if trigger == "capture-error":
+            chain.source.fault.set()
+            assert chain.source.closing.wait(2)
+            while True:
+                message = chain.events.get(timeout=2)
+                chain.deliver(message)
+                if message["type"] == "error":
+                    break
+        else:
+            chain.rig.fsm.escape(chain.rig.now)
+        assert any(m["type"] == "record.cancel" for m in chain.channel.commands)
+        # Даже ошибочный/прежний воркер может ответить раньше close: первая защита GUI.
+        chain.deliver(
+            dict(
+                type="error",
+                code="bad-state",
+                message="Нет записи.",
+                utterance_id=uid,
+                request_type="record.stop",
+            )
+        )
+        assert chain.delivered[-1]["request_type"] == "record.stop"
+        assert chain.guard.recording and chain.rig.recording
+        assert any(c._utterance_id == uid and c._cancel_pending for c in chain.rig.core._contexts)
+        chain.source.release_close.set()
+        chain.commands()
+        chain.capture.wait_stopped(uid)
+        chain.drain()
+        assert any(e.get("request_type") == "record.cancel" for e in chain.delivered)
+        assert not chain.guard.recording and not chain.rig.recording
+        chain.rig.restart_worker.assert_not_called()
+    finally:
+        chain.close()
+
+
+@pytest.mark.parametrize("kind", ["record.stop", "recognize"])
+def test_bad_state_waits_through_real_chain(monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    """ИБ-46/51: ответ WorkerState не выходит в IPC до физического close."""
+    chain = Chain(monkeypatch, HotkeyMode.PTT)
+    future: Future[list[dict[str, Any]]] | None = None
+    try:
+        uid = chain.start()
+        assert uid is not None
+        chain.source.release_close.clear()
+        chain.source.fault.set()
+        assert chain.source.closing.wait(2)
+        # Ошибка пока в транспорте: GUI успевает отправить stop/recognize.
+        chain.supervisor.send(dict(type=kind, utterance_id=uid))
+        while not chain.command_progress.empty():
+            chain.command_progress.get_nowait()
+        future = chain.command_executor.submit(chain.handle_one)
+        # Поток действительно вошёл в ожидание закрывающегося владельца,
+        # а не просто ещё не получил процессорное время.
+        assert chain.command_progress.get(timeout=2) == "wait"
+        assert not future.done()
+        chain.drain()
+        chain.check()
+        chain.source.release_close.set()
+        replies = future.result(timeout=2)
+        assert replies[0]["code"] == "bad-state"
+        assert replies[0]["request_type"] == kind
+        assert not chain.source.is_open
+        chain.commands()
+        chain.drain()
+    finally:
+        chain.close()
+
+
+def run_fixed_seed_chain(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    seed: int,
+    mode: HotkeyMode,
+    steps: int,
+    tray_faults: bool = False,
+    caplog: pytest.LogCaptureFixture | None = None,
+) -> list[str]:
+    """Общий генератор для обоих фаззов и mutation matrix.
+
+    Сначала исследуется опасное окно: GUI уже послал stop+recognize, capture
+    потерял PCM, но Source.close удерживается Event. Случайный планировщик
+    выбирает порядок command-thread, события ошибки и Esc. Ответы из _receive
+    могут обогнать ещё не сериализованные события capture (как в WorkerLoop).
+    После окна — свободная случайная цепь жестов, таймеров и UI-сбоев.
+
+    O4 проверяется немедленно после каждого перехода. Нарушения двух отдельных
+    защит собираются до конца: они не заслоняют O4 на полностью старом коде.
+    Возвращаемые BARRIER/PROVENANCE используются теми же mutation-тестами.
+    """
+    rng = random.Random(seed)
+    chain = Chain(monkeypatch, mode)
+    chain.seed = seed
+    violations: list[str] = []
+    original_tray = chain.tray.set_state
+    fault_state = [False]
+
+    def set_state(state: TrayState, tooltip: str | None = None) -> None:
+        if fault_state[0] and state is TrayState.LISTENING:
+            raise RuntimeError(MARKER)
+        original_tray(state, tooltip)
+
+    chain.tray.set_state = set_state
+    original_deliver = chain.deliver
+
+    def deliver(message: dict[str, Any]) -> None:
+        before = len(chain.delivered)
+        chain.trace.append(f"wire:{message['type']}:{message.get('request_type', '-')}")
+        original_deliver(message)  # O4 имеет приоритет над диагностикой контракта.
+        if "request_type" in message:
+            for delivered in chain.delivered[before:]:
+                if delivered.get("request_type") != message["request_type"]:
+                    violations.append("PROVENANCE: supervisor changed wire request_type")
+
+    chain.deliver = deliver
+    future: Future[list[dict[str, Any]]] | None = None
+    try:
+        chain.trace.append("start")
+        uid = chain.start()
+        assert uid is not None
+        chain.source.release_close.clear()
+        chain.trace.append("hold-close")
+        chain.check()
+        chain.rig.now += rng.uniform(0.35, 0.8)
+        chain.trace.append("gui-stop+recognize")
+        chain.rig.stop()
+        assert [c["type"] for c in chain.channel.commands] == ["record.stop", "recognize"]
+        chain.check()
+        chain.trace.append("capture-fault")
+        chain.source.fault.set()
+        assert chain.source.closing.wait(2)
+        chain.check()
+
+        # Эти действия — разные допустимые порядки двух циклов GUI/worker.
+        # В варианте Esc событие может оставаться в очереди до ответа команды.
+        via_error = rng.choice([False, True])
+        actions = ["command", "capture-error" if via_error else "escape"]
+        if not via_error and rng.choice([False, True]):
+            actions.append("capture-error")
+        rng.shuffle(actions)
+        # Если GUI получит error, кадры уже отправлены ДО чтения команд воркером.
+        # Пока _receive блокируется в wait, GUI может прочитать эти старые кадры,
+        # но рабочий цикл не способен сериализовать новые события.
+        staged_events = chain.serialize_events() if "capture-error" in actions else []
+        while not chain.command_progress.empty():
+            chain.command_progress.get_nowait()
+        for action in actions:
+            chain.trace.append(action)
+            if action == "command":
+                # По проводу идут stop, затем recognize; старый handle успевает
+                # вернуть оба bad-state. Новый блокирует уже первую команду.
+                for _ in range(2):
+                    future = chain.command_executor.submit(chain.handle_one)
+                    progress = chain.command_progress.get(timeout=2)
+                    if progress == "wait":
+                        chain.trace.append("command-waits")
+                        break
+                    replies = future.result(timeout=2)
+                    if any(r.get("code") == "bad-state" for r in replies):
+                        violations.append("BARRIER: bad-state before physical close")
+                    chain.trace.append("command-replied-before-close")
+                    chain.check()
+            elif action == "escape":
+                chain.rig.fsm.escape(chain.rig.now)
+            else:
+                # Сохраняем FIFO событий. Ошибка должна вызвать настоящий cancel.
+                assert any(event["type"] == "error" for event in staged_events)
+                for event in staged_events:
+                    chain.deliver(event)
+                staged_events.clear()
+            chain.check()
+        assert future is not None
+        assert any(c["type"] == "record.cancel" for c in chain.channel.commands), (
+            seed,
+            chain.trace,
+        )
+        chain.trace.append("responses-before-close")
+        # Если старый handle уже ответил, это реальные ответы _receive, а не
+        # заранее изготовленный bad-state. Новый handle всё ещё ждёт close.
+        chain.drain_responses()
+        chain.check()
+        chain.trace.append("release-close")
+        chain.source.release_close.set()
+        future.result(timeout=2)
+        chain.check()
+        # Перестановка выбирает границу следующего оборота рабочего цикла:
+        # уже сериализованные ответы FIFO; накопленные события могут пойти
+        # перед обработкой следующих команд либо после их синхронных ответов.
+        if rng.choice([False, True]):
+            chain.drain()
+        chain.commands()
+        chain.drain()
+        chain.check()
+        chain.settle()
+
+        chain.rig.now += 0.5
+        chain.trace.append("next-start")
+        assert chain.start() is not None
+        for step in range(steps):
+            chain.rig.now += rng.uniform(0.35, 0.8)
+            action = rng.choice(
+                ("press", "release", "escape", "timer", "deliver", "fault", "level", "pill", "tray")
+            )
+            chain.trace.append(f"{step}:{action}")
+            if action == "press":
+                chain.rig.fsm.press(chain.rig.now)
+            elif action == "release":
+                chain.rig.fsm.release(chain.rig.now)
+            elif action == "escape":
+                chain.rig.fsm.escape(chain.rig.now)
+            elif action == "timer":
+                timers = [t for t in chain.rig.timers if not t.cancelled and not t.fired]
+                if timers:
+                    timer = rng.choice(timers)
+                    chain.rig.now += timer.delay / 1000
+                    timer.fire()
+            elif action == "deliver":
+                chain.drain()
+            elif action == "fault" and chain.source.is_open:
+                chain.source.fault.set()
+                assert chain.source.closing.wait(2)
+            elif action == "level":
+                chain.capture.check_stop_watchdog()
+            elif action == "pill":
+                chain.pill.available = not chain.pill.available
+            elif action == "tray" and tray_faults:
+                fault_state[0] = not fault_state[0]
+            chain.check()
+            chain.commands()
+            chain.check()
+            if caplog is not None:
+                assert not any(MARKER in r.getMessage() for r in caplog.records), (
+                    seed,
+                    chain.trace,
+                )
+            assert not any(MARKER in str(e) for e in chain.rig.stats.events), (seed, chain.trace)
+        fault_state[0] = False
+        chain.settle()
+        return violations
+    except AssertionError as exc:
+        raise AssertionError(f"{exc}; seed={seed}; mode={mode}; trace={chain.trace}") from exc
+    finally:
+        # Освободить владельца до join command-thread даже при падении O4.
+        chain.close()
+
+
+def run_fixed_seed_corpus(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    first_seed: int,
+    count: int,
+    mode: HotkeyMode,
+    steps: int,
+    tray_faults: bool = False,
+    caplog: pytest.LogCaptureFixture | None = None,
+) -> list[str]:
+    """Не дать контракту одного seed заслонить нарушение O4 в другом порядке."""
+    violations: list[str] = []
+    for seed in range(first_seed, first_seed + count):
+        found = run_fixed_seed_chain(
+            monkeypatch,
+            seed=seed,
+            mode=mode,
+            steps=steps,
+            tray_faults=tray_faults,
+            caplog=caplog,
+        )
+        violations.extend(f"{violation}; seed={seed}" for violation in found)
+        if caplog is not None:
+            caplog.clear()
+    return violations
 
 
 @pytest.mark.parametrize("mode", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
-@pytest.mark.parametrize("boundary", ["cold", "limit", "device"])
-@pytest.mark.parametrize("stop_ack", ["missing", "delayed"])
-def test_capture_cleanup_replay_never_closes_next_phrase(
+@pytest.mark.parametrize("tray_faults", [False, True])
+def test_overlap_fixed_seed_invariants(
     mode: HotkeyMode,
-    boundary: str,
-    stop_ack: str,
+    tray_faults: bool,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """ИБ-36: неизвестная A отвечает bad-state, B переживает все таймеры A."""
+    """ИБ-51: 32 seed × 80 случайных шагов × 4 варианта + окно slow-close."""
     caplog.set_level(logging.DEBUG, logger="test.dictation")
-    replay = CaptureReplay(mode, monkeypatch)
-    a_uid = replay.start()
-    assert a_uid is not None
-    replay.advance(0.5)
-    if boundary == "cold":
-        # Нет record.started: холодное открытие завершилось уже после stop.
-        # Физическое закрытие быстрое, потеряно только его подтверждение.
-        replay.worker.defer_stop = False
-        replay.stop()
-        replay.worker.defer_stop = True
-        replay.physical_stop(a_uid, acknowledge=False)
-    else:
-        replay.event("record.started", a_uid)
-        replay.physical_stop(a_uid, acknowledge=False)
-        if boundary == "limit":
-            replay.event("record.limit", a_uid)
-        else:
-            replay.event("audio.device.changed", a_uid, kind="switched", audio_ms=1000)
-        # После автоостановки пользователь отпускает PTT / завершает toggle.
-        replay.stop()
-    assert any(
-        m["type"] == "recognize" and m.get("utterance_id") == a_uid for m, _ in replay.worker.sent
+    violations = run_fixed_seed_corpus(
+        monkeypatch,
+        first_seed=0xA57A_2026,
+        count=32,
+        mode=mode,
+        steps=80,
+        tray_faults=tray_faults,
+        caplog=caplog,
     )
-
-    # Без ACK можно отказать новому нажатию. Если B уже принята (старый код),
-    # результат A и её отрицательный ACK всё равно не имеют права обрывать B.
-    replay.advance(0.5)
-    b_uid = replay.start()
-    # Пустое распознавание тоже терминально; очистка A начинается до конца B.
-    replay.result(a_uid, "")
-    if a_uid in replay.worker.cancel_replies:
-        assert replay.worker.cancel_replies[a_uid] == {
-            "type": "error",
-            "code": "bad-state",
-            "request_type": "record.cancel",
-        }
-        replay.cancel_reply(a_uid)
-    if stop_ack == "delayed":
-        replay.event("record.stopped", a_uid)
-    if b_uid is None:
-        replay.advance(0.5)
-        b_uid = replay.start()
-    assert b_uid is not None, "после физического ACK следующее нажатие должно начать B"
-    replay.event("record.started", b_uid)
-    command_boundary = len(replay.worker.sent)
-    replay.advance(CANCEL_TIMEOUT_MS / 1000 + 0.1)
-
-    assert bool(replay.worker.captures == {b_uid}), "очистка A оборвала физический захват B"
-    assert not any(m["type"] == "audio.close" for m, _ in replay.worker.sent[command_boundary:]), (
-        "таймер A отправил глобальный audio.close во время B"
-    )
-    replay.rig.restart_worker.assert_not_called()
-    replay.assert_o4()
-    replay.stop()
-    replay.physical_stop(b_uid, acknowledge=True)
-    pasted_before_b = len(replay.rig.pasted)
-    replay.result(b_uid, MARKER)
-    assert len(replay.rig.pasted) == pasted_before_b + 1, "результат B потерян"
-    assert replay.rig.pasted[-1][0] == MARKER
-    assert not any(MARKER in record.getMessage() for record in caplog.records)
-    assert not any(MARKER in str(entry) for entry in replay.rig.stats.events)
-
-
-@pytest.mark.parametrize("mode", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
-@pytest.mark.parametrize("ack", ["record.stopped", "cancelled", "audio.closed"])
-def test_delayed_cancel_replay_keeps_o4_until_physical_ack(
-    mode: HotkeyMode,
-    ack: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Esc не означает, что поток уже закрыл микрофон; таймаут тоже не ACK."""
-    replay = CaptureReplay(mode, monkeypatch)
-    uid = replay.start()
-    assert uid is not None
-    replay.event("record.started", uid)
-    replay.advance(0.5)
-    replay.rig.fsm.escape(replay.rig.now)
-    assert uid in replay.worker.stop_requests
-    # Новое нажатие в ожидании ACK не создаёт второй физический захват.
-    assert replay.start() is None
-    replay.assert_o4()
-    replay.advance(CANCEL_TIMEOUT_MS / 1000 - 0.1)
-    assert replay.worker.captures == {uid}
-    if ack == "audio.closed":
-        replay.advance(0.2)
-        assert not replay.worker.captures
-        # audio.close отправлен, но ответ ещё в пути: индикация остаётся.
-        assert replay.guard.recording and replay.rig.recording
-        replay.event("audio.closed")
-    else:
-        replay.physical_stop(uid, acknowledge=ack == "record.stopped")
-        if ack == "cancelled":
-            assert replay.cancel_reply(uid)
-    assert not replay.guard.recording and not replay.rig.recording
-    replay.rig.restart_worker.assert_not_called()
+    assert not violations, violations
 
 
 @pytest.mark.parametrize("mode", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
 def test_capture_fixed_seed_async_ack_invariants(
     mode: HotkeyMode,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Фиксированные перестановки stop/result/cancel ACK и поздних событий A."""
-    caplog.set_level(logging.DEBUG, logger="test.dictation")
-    for seed in range(24):
-        rng = random.Random(0xAC4_2026 + seed)
-        replay = CaptureReplay(mode, monkeypatch)
-        uid = replay.start()
-        assert uid is not None
-        if rng.choice([False, True]):
-            replay.event("record.started", uid)
-        replay.advance(rng.uniform(0.35, 0.8))
-        if rng.choice([False, True]):
-            replay.rig.fsm.escape(replay.rig.now)
-            replay.assert_o4()
-            replay.advance(rng.uniform(0.01, 1.0))
-            replay.physical_stop(uid, acknowledge=False)
-            deliveries = ["stopped", "cancel"]
+    """ИБ-51: 24 других seed × 2 режима: окно ACK и ещё 24 случайных шага."""
+    violations = run_fixed_seed_corpus(
+        monkeypatch, first_seed=0xAC4_2026, count=24, mode=mode, steps=24
+    )
+    assert not violations, violations
+
+
+def _mutate_last_request_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Вернуть ошибку provenance: ACK помечен последним запросом того же uid."""
+    original = WorkerSupervisor._finish
+    original_correlation = supervisor_module._correlation
+
+    def correlation(message: dict[str, Any]) -> Any:
+        key = original_correlation(message)
+        return key[:2] if key[0] == "utterance" else key
+
+    monkeypatch.setattr(supervisor_module, "_correlation", correlation)
+
+    def overwrite(self: WorkerSupervisor, key: Any, message: dict[str, Any]) -> dict[str, Any]:
+        latest = next(
+            (p.request_type for k, p in reversed(self._pending.items()) if k[:2] == key[:2]),
+            None,
+        )
+        event = original(self, key, message)
+        if latest is not None:
+            event["request_type"] = latest
+        return event
+
+    monkeypatch.setattr(WorkerSupervisor, "_finish", overwrite)
+
+
+def _mutate_early_bad_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Прежний handle: нет добавленного wait для stop/recognize bad-state.
+
+    Существующие deferred (в том числе ожидание cancel) остаются настоящими.
+    Метаданные текущего handle сохранены: отключается только новый барьер.
+    """
+
+    def handle(self: WorkerState, message: dict[str, Any]) -> list[dict[str, Any]]:
+        deferred: list[Any] = []
+        with self._lock:
+            replies = self._handle(message, deferred)
+            for reply in replies:
+                reply.setdefault("request_type", message["type"])
+                if reply["type"] == "error" and "utterance_id" in message:
+                    reply.setdefault("utterance_id", message["utterance_id"])
+        for action in deferred:
+            action()
+        return replies
+
+    monkeypatch.setattr(WorkerState, "handle", handle)
+
+
+@pytest.mark.parametrize("mutation", ["provenance", "barrier", "both"])
+@pytest.mark.parametrize("mode", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
+def test_fixed_seed_mutation_matrix(
+    monkeypatch: pytest.MonkeyPatch, mutation: str, mode: HotkeyMode
+) -> None:
+    """Тот же генератор: одна защита держит O4, обе сняты — O4 нарушается."""
+    with monkeypatch.context() as patch:
+        if mutation in {"provenance", "both"}:
+            _mutate_last_request_type(patch)
+        if mutation in {"barrier", "both"}:
+            _mutate_early_bad_state(patch)
+        if mutation == "both":
+            with pytest.raises(AssertionError, match="O4: источник открыт, страж выключен"):
+                run_fixed_seed_corpus(patch, first_seed=0xA57A_2026, count=32, mode=mode, steps=80)
         else:
-            replay.stop()
-            replay.advance(rng.uniform(0.01, 0.3))
-            replay.physical_stop(uid, acknowledge=False)
-            deliveries = ["stopped", "result"]
-        rng.shuffle(deliveries)
-        for delivery in deliveries:
-            if delivery == "stopped":
-                replay.event("record.stopped", uid)
-            elif delivery == "cancel":
-                replay.cancel_reply(uid)
-            else:
-                replay.result(uid, MARKER if seed % 2 else "")
-            replay.assert_o4()
-            replay.advance(rng.uniform(0.01, 0.2))
-        replay.cancel_reply(uid)
-        replay.advance(0.5)
-        next_uid = replay.start()
-        assert next_uid is not None, f"seed={seed}: ACK не разблокировал запись"
-        assert next_uid != uid
-        replay.event("record.started", next_uid)
-        before = len(replay.worker.sent)
-        # Повторные старые события и все таймеры отмены A во время B.
-        replay.event("record.stopped", uid)
-        replay.event("error", uid, code="bad-state", request_type="record.cancel")
-        replay.advance(4.0)
-        assert replay.worker.captures == {next_uid}, f"seed={seed}: A оборвала B"
-        assert not any(m["type"] == "audio.close" for m, _ in replay.worker.sent[before:])
-        replay.rig.restart_worker.assert_not_called()
-        replay.assert_o4()
-        replay.stop()
-        replay.physical_stop(next_uid, acknowledge=True)
-        pasted_before_b = len(replay.rig.pasted)
-        replay.result(next_uid, MARKER)
-        assert len(replay.rig.pasted) == pasted_before_b + 1, f"seed={seed}: B потеряна"
-        assert replay.rig.pasted[-1][0] == MARKER
-    assert not any(MARKER in record.getMessage() for record in caplog.records)
-
-
-@pytest.mark.parametrize("mode", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
-def test_device_event_before_physical_stop_keeps_listening_indicator(
-    mode: HotkeyMode,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Событие смены устройства ещё не подтверждает закрытие старого источника."""
-    replay = CaptureReplay(mode, monkeypatch)
-    replay.tray.registered = False
-    uid = replay.start()
-    assert uid is not None
-    replay.event("record.started", uid)
-    replay.advance(0.5)
-    replay.event("audio.device.changed", uid, kind="switched", label="USB", audio_ms=1000)
-    assert uid in replay.worker.captures
-    replay.assert_o4()
-    assert replay.pill.visible and replay.pill.state in LISTENING
-    replay.physical_stop(uid, acknowledge=True)
-    assert not replay.guard.recording and not replay.rig.recording
-    replay.result(uid, MARKER)
-    assert replay.rig.pasted[-1][0] == MARKER
-
-
-@pytest.mark.parametrize("mode", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
-def test_old_result_during_next_physical_stop_keeps_listening_indicator(
-    mode: HotkeyMode,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Исход A не перекрывает единственную индикацию B, ждущей physical ACK."""
-    replay = CaptureReplay(mode, monkeypatch)
-    replay.tray.registered = False
-    a_uid = replay.start()
-    assert a_uid is not None
-    replay.advance(0.5)
-    replay.worker.defer_stop = False
-    replay.stop()
-    replay.worker.defer_stop = True
-    replay.physical_stop(a_uid, acknowledge=True)
-    replay.advance(0.5)
-    b_uid = replay.start()
-    assert b_uid is not None
-    replay.event("record.started", b_uid)
-    replay.advance(0.5)
-    replay.stop()
-    assert b_uid in replay.worker.captures
-    replay.result(a_uid, "")
-    replay.assert_o4()
-    assert replay.pill.visible and replay.pill.state in LISTENING
-    replay.physical_stop(b_uid, acknowledge=True)
-    replay.result(b_uid, MARKER)
-    assert replay.rig.pasted[-1][0] == MARKER
-
-
-@pytest.mark.parametrize("mode", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
-def test_reentrant_timeout_completion_cannot_close_new_capture(
-    mode: HotkeyMode,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ACK и новое нажатие из UI completion не дают старому timeout закрыть B."""
-    replay = CaptureReplay(mode, monkeypatch)
-    a_uid = replay.start()
-    assert a_uid is not None
-    replay.event("record.started", a_uid)
-    replay.advance(0.5)
-    replay.rig.fsm.escape(replay.rig.now)
-    replay.assert_o4()
-    original_finish = replay.rig.core._finish
-    next_uids: list[str | None] = []
-
-    def finish_then_receive_ack(state: PillState, *, tray: TrayState = TrayState.IDLE) -> None:
-        # Реальное завершение UI выполнено; вложенный event-loop доставляет ACK
-        # и жест пользователя до возврата в старый timeout. Источник A уже закрыт.
-        original_finish(state, tray=tray)
-        replay.physical_stop(a_uid, acknowledge=True)
-        next_uids.append(replay.start())
-
-    with monkeypatch.context() as callback_patch:
-        callback_patch.setattr(replay.rig.core, "_finish", finish_then_receive_ack)
-        replay.advance(CANCEL_TIMEOUT_MS / 1000 + 0.01)
-    assert len(next_uids) == 1 and next_uids[0] is not None, "вложенный жест не начал B"
-    b_uid = next_uids[0]
-    assert b_uid in replay.worker.captures, "старый timeout закрыл B после вложенного ACK"
-    assert not any(m["type"] == "audio.close" for m, _ in replay.worker.sent)
-    replay.advance(4.0)
-    assert b_uid in replay.worker.captures, "сторож отмены A перезапустил захват B"
-    replay.rig.restart_worker.assert_not_called()
-    replay.assert_o4()
-    replay.stop()
-    replay.physical_stop(b_uid, acknowledge=True)
-    replay.result(b_uid, MARKER)
-    assert replay.rig.pasted[-1][0] == MARKER
+            violations = run_fixed_seed_corpus(
+                patch, first_seed=0xA57A_2026, count=32, mode=mode, steps=80
+            )
+            assert any(v.startswith(mutation.upper()) for v in violations), violations

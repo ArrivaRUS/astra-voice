@@ -21,13 +21,13 @@ MAX_RESTARTS = 3
 RESTART_WINDOW_S = 600
 _POLL_INTERVAL_S = 0.05
 Message = dict[str, Any]
-RequestKey = tuple[str, str]
+RequestKey = tuple[str, str] | tuple[str, str, str]
 _CORRELATION: dict[str, RequestKey] = {
     "ping": ("reply", "pong"),
     "model.load": ("reply", "model.loaded"),
     "measure": ("reply", "measured"),
     "audio.close": ("reply", "audio.closed"),
-    "transcribe.file": ("utterance", "file"),
+    "transcribe.file": ("utterance", "file", "transcribe.file"),
 }
 # Уровень и тишина — индикация во время записи; record.limit означает автоостановку,
 # но распознавание этого utterance_id ещё впереди. audio.ready подтверждает открытие
@@ -46,7 +46,7 @@ _NOTIFICATIONS = {
 
 @dataclass
 class _Pending:
-    """Общее ожидание цепочки команд и номер последнего ответа при отправке."""
+    """Ожидание одного типа команды и номер последнего ответа при отправке."""
 
     deadline: float | None
     activity: int
@@ -57,9 +57,9 @@ class _Pending:
 
 def _correlation(message: Message) -> RequestKey:
     """Нормализует запрос, ответ и коррелированную ошибку в один ключ."""
-    if "utterance_id" in message:
-        return ("utterance", str(message["utterance_id"]))
     kind = str(message.get("request_type", message["type"]))
+    if "utterance_id" in message:
+        return ("utterance", str(message["utterance_id"]), kind)
     return _CORRELATION.get(kind, ("reply", kind))
 
 
@@ -93,14 +93,15 @@ class WorkerSupervisor:
     ожидание ответа, поскольку ошибка могла оставить микрофон открытым (У45).
     Для запросов без id допускается одно ожидание каждого типа ответа.
 
-    Единственный ключ корреляции задаёт ``_correlation``: явный utterance_id либо
-    таблица ``_CORRELATION``. Поэтому transcribe.file ожидает result/cancelled с
-    id "file"; этот служебный id также нельзя повторять в пределах поколения.
-    Команды одной диктовки разделяют одно ожидание и одно завершающее событие.
+    Корреляция диктовки включает utterance_id и request_type; каждое ожидание
+    имеет собственный дедлайн. transcribe.file использует служебный id "file".
+    Результат завершает предыдущие стадии записи, но не отдельную отмену.
     Промежуточные level/silent/record.limit/audio.ready передаются потребителю,
-    сохраняя ожидание и продлевая его дедлайн на заданный таймаут при совпадении ключа.
-    Ошибка с utterance_id завершает точное ожидание; request_type без id допустим,
-    если определяет единственное ожидание. Ошибка без корреляции завершает только
+    сохраняя ожидания фразы и продлевая их дедлайны, кроме ожидания отмены.
+    Ошибка с utterance_id и request_type завершает точное ожидание; тип без id допустим,
+    если определяет единственное ожидание. Ошибка захвата только с id передаётся
+    отдельно без приписывания типа; снимается лишь единственное ожидание не-отмены
+    (совместимость со старыми ответами). Ошибка без корреляции завершает только
     ожидания без диктовки (ключи reply) отдельными коррелированными событиями,
     сохраняя ожидания utterance для остановки и отмены записи (У45). Если ожиданий
     reply нет, такая ошибка всё равно передаётся потребителю через _emit.
@@ -210,11 +211,29 @@ class WorkerSupervisor:
         uid = request.get("utterance_id")
         kind = str(request["type"])
         key = _correlation(request)
-        if key[0] == "utterance" and key in self._finished and kind != "record.cancel":
+        if key[0] == "utterance" and key[:2] in self._finished and kind != "record.cancel":
             raise ValueError("Идентификатор уже завершён в текущем поколении.")
         if uid is None and key in self._pending:
             raise ValueError("Ответ на предыдущий запрос этого типа ещё ожидается.")
-        deadline = None if timeout is None else self._clock() + timeout
+        inherited = None
+        if uid is not None and timeout is None:
+            inherited = next(
+                (
+                    p
+                    for k, p in reversed(self._pending.items())
+                    if k[:2] == key[:2] and p.timeout is not None
+                ),
+                None,
+            )
+            if inherited is not None:
+                timeout = inherited.timeout
+        deadline = (
+            inherited.deadline
+            if inherited is not None
+            else None
+            if timeout is None
+            else self._clock() + timeout
+        )
         expects_reply = uid is not None or kind in _CORRELATION or timeout is not None
         if expects_reply:
             pending = self._pending.get(key)
@@ -227,7 +246,7 @@ class WorkerSupervisor:
                 pending.activity = self._activity
             pending.request_type = kind
             pending.request_types.add(kind)
-            self._finished.discard(key)
+            self._finished.discard(key[:2])
         self._outgoing.extend(frame)
         self._flush()
         return request
@@ -330,14 +349,36 @@ class WorkerSupervisor:
                 self.dropped_late += 1
             return
         key = _correlation(message)
-        if kind == "error":
-            if "utterance_id" in message:
+        uid = message.get("utterance_id")
+        utterance_keys = (
+            [k for k in self._pending if k[0] == "utterance" and k[1] == str(uid)]
+            if uid is not None
+            else []
+        )
+        if kind in _NOTIFICATIONS:
+            for k in utterance_keys:
+                pending = self._pending[k]
+                if pending.timeout is not None and pending.request_type != "record.cancel":
+                    pending.deadline = self._clock() + pending.timeout
+        elif kind == "error":
+            if uid is not None and "request_type" not in message:
+                # Ошибка захвата — независимое событие, не ACK последней команды.
+                keys = [
+                    k for k in utterance_keys if self._pending[k].request_type != "record.cancel"
+                ]
+                if not keys and not utterance_keys:
+                    self.dropped_late += 1
+                    return
+                if len(utterance_keys) == 1 and len(keys) == 1:
+                    self._finish(keys[0], message)
+                self._activity += 1
+                self._emit(message, generation=generation)
+                return
+            if uid is not None:
                 keys = [key] if key in self._pending else []
             elif "request_type" in message:
                 keys = [
-                    k
-                    for k, p in self._pending.items()
-                    if message["request_type"] in p.request_types
+                    k for k, p in self._pending.items() if message["request_type"] == p.request_type
                 ]
                 if len(keys) != 1:
                     keys = []
@@ -352,29 +393,53 @@ class WorkerSupervisor:
                 return
             self._activity += 1
             events = [self._finish(k, message) for k in keys]
+            for k in keys:
+                if len(k) == 3 and (
+                    k[2] in {"recognize", "transcribe.file"}
+                    or (k[2] == "record.cancel" and message.get("code") == "bad-state")
+                ):
+                    self._retire_chain(k[1])
             for event in events:
                 self._emit(event, generation=generation)
             return
-        if kind in _NOTIFICATIONS:
-            pending = self._pending.get(key)
-            if pending is not None and pending.timeout is not None:
-                pending.deadline = self._clock() + pending.timeout
-        elif key in self._pending:
-            self._finish(key, message)
-        elif kind in ("result", "cancelled") or key in self._finished:
-            self.dropped_late += 1
-            return
+        else:
+            if uid is not None and "request_type" not in message:
+                # Ответ без типа совместим лишь с прежней цепочкой распознавания.
+                # Ни result, ни cancelled без типа не являются ACK явной отмены.
+                candidates = [
+                    k for k in utterance_keys if self._pending[k].request_type != "record.cancel"
+                ]
+                if candidates and kind in {"result", "cancelled"}:
+                    key = candidates[-1]
+            if key in self._pending:
+                self._finish(key, message)
+                if key[0] == "utterance" and kind in {"result", "cancelled"}:
+                    self._retire_chain(key[1])
+            elif kind in ("result", "cancelled") or key[:2] in self._finished:
+                self.dropped_late += 1
+                return
         if kind != "hello":
             self._activity += 1
         self._emit(message)
 
+    def _retire_chain(self, uid: str) -> None:
+        """Результат завершает предыдущие стадии, но не независимую отмену."""
+        for key in list(self._pending):
+            if (
+                key[0] == "utterance"
+                and key[1] == uid
+                and self._pending[key].request_type != "record.cancel"
+            ):
+                del self._pending[key]
+        self._finished.add(("utterance", uid))
+
     def _finish(self, key: RequestKey, message: Message) -> Message:
         """Завершает ожидание и дополняет ошибку корреляцией для потребителя."""
         pending = self._pending.pop(key)
-        self._finished.add(key)
+        self._finished.add(key[:2])
         event = dict(message)
         if message["type"] == "error":
-            event["request_type"] = pending.request_type
+            event.setdefault("request_type", pending.request_type)
             if key[0] == "utterance":
                 event["utterance_id"] = key[1]
             else:

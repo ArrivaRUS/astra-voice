@@ -3547,6 +3547,10 @@ class MicrophoneBridgeRig:
         self.commands.extend(ipc.FrameReader().feed(ipc.encode(message)))
 
     def event(self, kind: str, **fields: object) -> None:
+        if kind in ("cancelled", "audio.closed"):
+            fields.setdefault(
+                "request_type", {"cancelled": "record.cancel", "audio.closed": "audio.close"}[kind]
+            )
         uid = next(
             msg["utterance_id"] for msg in reversed(self.commands) if msg["type"] == "record.start"
         )
@@ -4874,9 +4878,12 @@ def test_level_monitor_without_model_is_separate(dbfs: float, expected: float) -
     assert all(len(spy) == 0 for spy in spies)
     controller.stopLevelMonitor()
     assert [msg["type"] for msg in rig.commands] == ["record.start", "record.cancel"]
+    rig.recording.assert_called_with(True)
+    rig.tray.set_state.assert_called_with(TrayState.LISTENING)
+    rig.pill.hide.assert_not_called()
+    rig.event("cancelled")
     rig.recording.assert_called_with(False)
     rig.tray.set_state.assert_called_with(TrayState.IDLE)
-    rig.event("cancelled")
     assert controller.levelState == "idle" and controller.level == 0.0
     assert len(state_spy) == 2
     assert rig.pill.show_state.call_args_list == [
@@ -5035,8 +5042,10 @@ def test_level_monitor_leaving_closes_microphone(leave: str) -> None:
     else:
         getattr(controller, leave)()
     assert rig.commands[-1]["type"] == "record.cancel"
-    rig.recording.assert_called_with(False)
+    rig.recording.assert_called_with(True)
+    rig.pill.hide.assert_not_called()
     rig.event("cancelled")
+    rig.recording.assert_called_with(False)
     assert controller.levelState == "idle"
     assert not rig.core.level_active
 
@@ -5065,6 +5074,9 @@ def test_level_monitor_host_exception_closes_microphone(
     assert rig.controller.levelState == "error"
     assert rig.controller.levelMessage == "Не удалось проверить микрофон. Попробуйте ещё раз."
     assert rig.controller.testState == "idle"
+    rig.recording.assert_called_with(True)
+    rig.pill.hide.assert_not_called()
+    rig.event("cancelled")
     rig.recording.assert_called_with(False)
     assert "Личная речь" not in caplog.text
 

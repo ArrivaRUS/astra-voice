@@ -246,6 +246,93 @@ def test_title_snapshot_rechecked_before_paste_without_private_logs(
             assert repr(digest) not in caplog.text
 
 
+@pytest.mark.parametrize("switch_during", ["fetch", "delay-after"])
+def test_overlap_chat_switch_during_first_paste_keeps_second_in_clipboard(
+    harness: tuple[FakeClipboard, Mock, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    switch_during: str,
+) -> None:
+    """ИБ-47: настоящий PasteFlow не переносит B отпечаток чужого чата после A."""
+    from test_dictation_overlap import A_TEXT, B_TEXT, A, B, OverlapRig, begin_overlap
+
+    from astra_voice.ui.pill import CLIPBOARD_WINDOW_CHANGED, PillState
+
+    cb, x, delays = harness
+    original_title = b"PRIVATE-CHAT-X-IB47"
+    changed_title = b"PRIVATE-CHAT-Y-IB47"
+    read = x.d.create_resource_object.return_value.get_full_property
+    read.return_value = SimpleNamespace(format=8, value=original_title)
+    original = paste.snapshot_target(x, 42)
+    switched = False
+    sent = False
+    sends = 0
+
+    def send_combo(*_args: object) -> bool:
+        nonlocal sent, sends
+        sent = True
+        sends += 1
+        tracker = cb.trackers[False]
+        assert tracker is not None
+        if switch_during == "delay-after" or sends > 1:
+            tracker.mark()
+        return True
+
+    def wait(ms: int) -> None:
+        nonlocal switched
+        delays.append(ms)
+        if (
+            sent
+            and not switched
+            and (
+                (switch_during == "fetch" and ms == paste.KEYS_POLL_MS)
+                or (switch_during == "delay-after" and ms == 101)
+            )
+        ):
+            read.return_value = SimpleNamespace(format=8, value=changed_title)
+            switched = True
+            if switch_during == "fetch":
+                tracker = cb.trackers[False]
+                assert tracker is not None
+                tracker.mark()
+
+    x.send_combo.side_effect = send_combo
+    monkeypatch.setattr(paste, "_wait_ms", wait)
+    rig = OverlapRig()
+    rig.window = original
+    flow = paste.PasteFlow(delay_before_ms=17, delay_after_ms=101)
+    outcomes: list[paste.PasteOutcome] = []
+
+    def run(
+        text: str, target: int | None | paste.PasteTarget, mode: PasteMode
+    ) -> paste.PasteOutcome:
+        outcome = flow.run(text, target, mode)
+        outcomes.append(outcome)
+        return outcome
+
+    rig.core._paste = run
+    # На старом коде этот порт снимал Y после A и переписывал цель B.
+    rig.core._refresh_paste_target = lambda target: paste.snapshot_target(x, target.window)
+    with caplog.at_level(logging.DEBUG):
+        begin_overlap(rig, release_b=True)
+        rig.result_for(A, A_TEXT)
+        assert switched
+        rig.result_for(B, B_TEXT)
+    assert outcomes[0].kind is PasteOutcomeKind.PASTED
+    assert outcomes[1].kind is PasteOutcomeKind.WINDOW_CHANGED
+    assert outcomes[1].reason == "title-changed"
+    assert outcomes[1].restore is PasteRestore.KEPT_OURS
+    assert cb.data[False]["text/plain"] == B_TEXT.encode()
+    x.send_combo.assert_called_once()
+    assert rig.pill.calls[-1][:2] == (PillState.CLIPBOARD_ONLY, CLIPBOARD_WINDOW_CHANGED)
+    for title in (original_title, changed_title):
+        digest = hashlib.sha256(title).digest()
+        assert title.decode() not in caplog.text
+        assert digest.hex() not in caplog.text
+        assert repr(digest) not in caplog.text
+    assert A_TEXT not in caplog.text and B_TEXT not in caplog.text
+
+
 def test_unavailable_initial_title_snapshot_allows_paste_without_private_logs(
     harness: tuple[FakeClipboard, Mock, list[int]], caplog: pytest.LogCaptureFixture
 ) -> None:

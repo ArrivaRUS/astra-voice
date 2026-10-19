@@ -90,6 +90,10 @@ class OverlapRig(Rig):
         return [str(m.get("utterance_id")) for m, _ in self.sent if m["type"] == kind]
 
     def event_for(self, index: int, kind: str, **fields: object) -> None:
+        if kind in ("cancelled", "audio.closed"):
+            fields.setdefault(
+                "request_type", {"cancelled": "record.cancel", "audio.closed": "audio.close"}[kind]
+            )
         if kind == "record.limit" and self.ack_stop:
             self.event_for(index, "record.stopped", **fields)
         self.core.on_worker_event(
@@ -1241,7 +1245,7 @@ def test_cancel_timeout_with_failing_finish_ui_keeps_restart_armed() -> None:
 
 @pytest.mark.parametrize("outcome", [PasteOutcomeKind.PASTED, PasteOutcomeKind.WINDOW_CHANGED])
 @pytest.mark.parametrize("target_kind", ["same", "other-tab", "other-window"])
-def test_pasted_first_refreshes_only_same_queued_target(
+def test_pasted_first_preserves_each_queued_target_snapshot(
     outcome: PasteOutcomeKind,
     target_kind: str,
 ) -> None:
@@ -1265,11 +1269,10 @@ def test_pasted_first_refreshes_only_same_queued_target(
     rig.outcomes.append(outcome)
     rig.result_for(A, A_TEXT)
     rig.result_for(B, B_TEXT)
-    expected = updated if outcome == PasteOutcomeKind.PASTED and target_kind == "same" else queued
-    assert rig.pasted[1][1] == expected
+    assert rig.pasted[1][1] is queued
 
 
-def test_own_kate_title_change_keeps_second_paste_in_window(
+def test_own_kate_title_change_sends_second_phrase_to_clipboard(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     import hashlib
@@ -1301,9 +1304,9 @@ def test_own_kate_title_change_keeps_second_paste_in_window(
     begin_overlap(rig, release_b=True)
     rig.result_for(A, A_TEXT)
     rig.result_for(B, B_TEXT)
-    assert delivered == [A_TEXT, B_TEXT]
-    assert rig.pill.calls[-1][0] == PillState.DONE
-    assert all(state != PillState.CLIPBOARD_ONLY for state, _, _ in rig.pill.calls)
+    assert delivered == [A_TEXT]
+    assert rig.pill.calls[-1][:2] == (PillState.CLIPBOARD_ONLY, CLIPBOARD_WINDOW_CHANGED)
+    assert rig.stats.events[-1]["result"] == "ok"
     assert "file.txt" not in caplog.text
     assert hashlib.sha256(updated_title.encode()).hexdigest() not in caplog.text
 
@@ -1313,7 +1316,7 @@ def test_capture_notice_callback_start_preserves_new_capture_guard(
     mode: HotkeyMode,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from test_t2_overlap_fuzz import CaptureReplay
+    from test_t2_overlap_replay import CaptureReplay
 
     replay = CaptureReplay(mode, monkeypatch)
     first = replay.start()

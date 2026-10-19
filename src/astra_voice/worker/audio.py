@@ -993,21 +993,23 @@ class AudioCapture:
         finally:
             # Даже pa_simple_free может зависнуть: сторож действует до выхода потока.
             self._mark_stopping(threading.current_thread(), running)
-            try:
-                self._source.close()
-            except Exception:
-                # Конец потока без закрытия не является подтверждением для IPC.
-                with self._watchdog_lock:
-                    self._close_failed = True
-                raise
-            finally:
-                with self._watchdog_lock:
-                    if self._owners.get(uid) is threading.current_thread():
-                        del self._owners[uid]
-            # Не подтверждаем остановку, если close упал или завис. Событие может
-            # прийти позже результата/ошибки распознавания и не завершает запрос IPC.
-            # Закрытие подтверждаем и при отмене/ошибке до record.started.
-            self._on_event({"type": "record.stopped", "utterance_id": uid})
+            closed = self._close_source()
+            with self._watchdog_lock:
+                if self._owners.get(uid) is threading.current_thread():
+                    del self._owners[uid]
+            # Липкий сбой любого close запрещает ACK, даже если повтор стал no-op.
+            if closed:
+                self._on_event({"type": "record.stopped", "utterance_id": uid})
+
+    def _close_source(self) -> bool:
+        """Запоминает любой сбой закрытия до завершения процесса, без текста исключения."""
+        try:
+            self._source.close()
+        except Exception:
+            with self._watchdog_lock:
+                self._close_failed = True
+        with self._watchdog_lock:
+            return not self._close_failed
 
     def _read(
         self,
@@ -1057,7 +1059,12 @@ class AudioCapture:
                 if chunk is None:
                     if self._source.ended:
                         return
-                    self._source.close()
+                    # Первый close тоже может зависнуть: взводим сторож до вызова.
+                    with self._watchdog_lock:
+                        self._stop_deadlines.setdefault(
+                            threading.current_thread(), time.monotonic() + STOP_WATCHDOG_S
+                        )
+                    self._close_source()
                     raise AudioError(ERROR_FAILED, "Запись звука прервалась.")
                 with self._watchdog_lock:
                     # Порция пришла: сторож «ни одного отсчёта» больше не нужен.
@@ -1253,7 +1260,8 @@ class AudioCapture:
         thread = self._thread
         if thread is None:
             # Поток никогда не запускался: конкурирующего владельца заведомо нет.
-            self._source.close()
+            self._close_source()
+            self.check_stop_watchdog()
             return
         self._wait_thread(thread)
 
@@ -1275,11 +1283,16 @@ class AudioCapture:
         """Ожидает владельца вне замков автомата и источника, под сторожем."""
         if thread is threading.current_thread():
             raise RuntimeError("Поток захвата не может ожидать сам себя.")
+        self.check_stop_watchdog()
+        with self._watchdog_lock:
+            own_deadline = self._stop_deadlines.get(thread, time.monotonic() + STOP_WATCHDOG_S)
+            deadline = min([own_deadline, *self._stop_deadlines.values()])
         while thread.is_alive():
             self.check_stop_watchdog()
-            with self._watchdog_lock:
-                deadline = self._stop_deadlines.get(thread, time.monotonic() + STOP_WATCHDOG_S)
-            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CaptureStopTimeout("Поток захвата не завершился до срока ожидания.")
+            thread.join(timeout=remaining)
         self.check_stop_watchdog()
 
     @property
@@ -1509,13 +1522,13 @@ class PulseSimpleSource:
 
     def close(self) -> None:
         """Освобождает дескриптор ровно один раз и сбрасывает выбранное устройство."""
-        handle, self._handle = self._handle, None
+        if self._handle is not None and self._pulse is not None:
+            self._pulse.lib.pa_simple_free(self._handle)
+        self._handle = None
         self._device_name = None
         self._selected_device = None
         self.device_label = None
         self.microphone_count = None
-        if handle is not None and self._pulse is not None:
-            self._pulse.lib.pa_simple_free(handle)
 
     @property
     def is_open(self) -> bool:

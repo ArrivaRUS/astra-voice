@@ -603,6 +603,7 @@ class DictationRuntime(QObject):
 
     def _mouse_allowed(self) -> bool:
         snapshot = self._command_snapshot()
+        terminal = self._terminated_generation == self.supervisor.generation
         if (
             self._closed
             or not self.command_installed
@@ -612,9 +613,9 @@ class DictationRuntime(QObject):
             or self._command_mode is None
             or self._loading_model
             # Выгруженная по простою модель не мешает держать кнопку: нажатие её загрузит.
-            # Проваленная самопроверка мешает всегда, даже при выгруженной модели.
-            or self._selfcheck == "failed"
-            or (self._selfcheck != "ok" and not self._model_parked)
+            # Терминальный воркер принимает только жест для повторного показа ошибки.
+            or (not terminal and self._selfcheck == "failed")
+            or (not terminal and self._selfcheck != "ok" and not self._model_parked)
             or self._capture_watchdog is not None
             or self._mouse_capture_token is not None
             or self._pending_test is not None
@@ -808,6 +809,9 @@ class DictationRuntime(QObject):
         self._mouse_tick_timer = timer
 
     def _mouse_pending(self, generation: int) -> None:
+        if self._reject_terminal_gesture():
+            self._stop_mouse("protocol-mismatch")
+            return
         self._note_activity()
         if self._model_parked:
             # Модель выгружена по простою: нажатие загружает её, команду дают после.
@@ -873,6 +877,9 @@ class DictationRuntime(QObject):
                 self._release_mouse_escape()
             if reason not in ("settings", "other-input", "session", "closed", "capture"):
                 self._queue_mouse_retry()
+            return
+        if self._reject_terminal_gesture():
+            self._stop_mouse("protocol-mismatch")
             return
         if (
             self._input_owner != "mouse"
@@ -1339,6 +1346,11 @@ class DictationRuntime(QObject):
             return
         if reason.startswith(MAPPING_REGRAB_PREFIX):
             self._command_mapping_changed(reason)
+            return
+        if self._terminated_generation == self.supervisor.generation:
+            if state != HotkeyState.IDLE:
+                manager.fsm.escape(monotonic())
+                self._reject_terminal_gesture()
             return
         if self._input_owner not in (None, "keyboard") or self._capture_watchdog is not None:
             if state == HotkeyState.RECORDING:
@@ -2365,6 +2377,16 @@ class DictationRuntime(QObject):
             else:
                 notify.notify_selfcheck_failed()
 
+    def _reject_terminal_gesture(self) -> bool:
+        """Повторить причину отказа, не разрешая жесту оживить поколение."""
+        if self._terminated_generation != self.supervisor.generation:
+            return False
+        if not self._closed:
+            if self._command_publication_allowed():
+                self.pill.show_state(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
+            self.tray.set_state(TrayState.ERROR)
+        return True
+
     def _worker_protocol_mismatch(self) -> None:
         """Терминальная граница поколения; ни очистка, ни простой не будят воркер."""
         self._terminated_generation = self.supervisor.generation
@@ -2375,6 +2397,9 @@ class DictationRuntime(QObject):
             self._wake_generation = None
             self._wake_dictation = False
             self._wake_window = None
+            self._input_epoch += 1
+            self._command_hold_epoch += 1
+            self._stop_mouse("protocol-mismatch")
             self._cancel_idle_unload()
             self._cancel_selfcheck_timer()
             self._cancel_preparing_timer()
@@ -2387,6 +2412,22 @@ class DictationRuntime(QObject):
             self.orchestrator.worker_terminated(
                 self.supervisor.generation, message=ipc.PROTOCOL_MISMATCH_MESSAGE
             )
+            for manager, combo in (
+                (self.hotkey, self.settings.hotkey),
+                (self.command_hotkey, self.settings.command_hotkey),
+            ):
+                if manager is None:
+                    continue
+                manager.fsm.escape(monotonic())
+                if manager.has_pending_press is True:
+                    # rearm сбрасывает отложенный Super и события прежнего захвата.
+                    # Удержанная клавиша может мешать захвату: штатный retry сохранён.
+                    result = manager.rearm(combo, HotkeyMode(self.settings.hotkey_mode))
+                    if not result.ok:
+                        if manager is self.hotkey:
+                            self._start_regrab(result.code)
+                        else:
+                            self._start_command_regrab()
             self._cleanup("смена модели", lambda: self._finish_switch("failed"))
             if pending_switch and self.on_switch_finished is not None:
                 self._cleanup("ожидание смены модели", partial(self.on_switch_finished, "failed"))
@@ -2547,20 +2588,23 @@ class DictationRuntime(QObject):
 
     def _on_hotkey_state(self, state: HotkeyState, reason: str) -> None:
         """Откладывает диктовку, пока воркер загружает модель."""
-        if self._terminated_generation == self.supervisor.generation:
-            if state != HotkeyState.IDLE:
-                self.hotkey.fsm.escape(monotonic())
-            return
-        if not self._closed:
+        if not self._closed and self._terminated_generation != self.supervisor.generation:
             self._note_activity()
         if reason.startswith(MAPPING_REGRAB_PREFIX):
             if self.hotkey.mapping_release_lost is True:
                 self._drop_wake()
             self._validate_command_mapping()
             self._on_mapping_regrab(reason)
+            if self._terminated_generation == self.supervisor.generation:
+                return
             if self.hotkey.fsm.state != state:
                 # Запись с удержанием уже остановлена (mapping-lost): состояние устарело.
                 return
+        if self._terminated_generation == self.supervisor.generation:
+            if state != HotkeyState.IDLE:
+                self.hotkey.fsm.escape(monotonic())
+                self._reject_terminal_gesture()
+            return
         if self._wake_dictation and state != HotkeyState.RECORDING:
             self._drop_wake()
             return
@@ -2834,7 +2878,7 @@ class DictationRuntime(QObject):
         if (
             not self._model_parked
             or self._terminating_worker
-            or (not gesture and self._terminated_generation == self.supervisor.generation)
+            or self._terminated_generation == self.supervisor.generation
             or self._closed
             or self._appimage_removal_reserved
             or self._switch_active()
@@ -2927,11 +2971,19 @@ class DictationRuntime(QObject):
         self.hotkey.ungrab()
         result = self._grab_hotkey()
         if not result.ok:
-            self.tray.set_state(TrayState.NOKEY)
+            self.tray.set_state(
+                TrayState.ERROR
+                if self._terminated_generation == self.supervisor.generation
+                else TrayState.NOKEY
+            )
             self._start_regrab(result.code)
         else:
             self._stop_regrab()
-            if self.orchestrator.phase == DictationPhase.IDLE and self._selfcheck != "failed":
+            if (
+                self.orchestrator.phase == DictationPhase.IDLE
+                and self._selfcheck != "failed"
+                and self._terminated_generation != self.supervisor.generation
+            ):
                 self.tray.set_state(TrayState.IDLE)
         return result.code
 
@@ -2971,7 +3023,11 @@ class DictationRuntime(QObject):
             if fsm.state == HotkeyState.RECORDING and fsm.mode == HotkeyMode.PTT:
                 log.info("хоткей: запись остановлена: горячая клавиша потеряна")
                 fsm.stop(now, "mapping-lost")
-            self.tray.set_state(TrayState.NOKEY)
+            self.tray.set_state(
+                TrayState.ERROR
+                if self._terminated_generation == self.supervisor.generation
+                else TrayState.NOKEY
+            )
             self._start_regrab(code)
             if self._hotkey_lost_at is None:
                 # После _start_regrab: его _stop_regrab сбрасывает прежнюю потерю.
@@ -2991,7 +3047,11 @@ class DictationRuntime(QObject):
             return
         announced = self._hotkey_lost_announced
         self._stop_regrab()
-        if self.orchestrator.phase == DictationPhase.IDLE and self._selfcheck != "failed":
+        if (
+            self.orchestrator.phase == DictationPhase.IDLE
+            and self._selfcheck != "failed"
+            and self._terminated_generation != self.supervisor.generation
+        ):
             self.tray.set_state(TrayState.IDLE)
         if announced:
             notify.notify_hotkey_regrabbed(self.settings.hotkey)
@@ -3091,7 +3151,11 @@ class DictationRuntime(QObject):
             # Потеря после смены раскладки без объявления — без «снова работает».
             silent = self._hotkey_lost_at is not None and not self._hotkey_lost_announced
             self._stop_regrab()
-            if self.orchestrator.phase == DictationPhase.IDLE and self._selfcheck != "failed":
+            if (
+                self.orchestrator.phase == DictationPhase.IDLE
+                and self._selfcheck != "failed"
+                and self._terminated_generation != self.supervisor.generation
+            ):
                 self.tray.set_state(TrayState.IDLE)
             if not silent:
                 notify.notify_hotkey_regrabbed(self.settings.hotkey)

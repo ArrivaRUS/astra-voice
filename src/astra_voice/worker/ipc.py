@@ -115,6 +115,14 @@ _SCHEMAS = {
 _RUNTIME = _Schema({"python": _STR, "onnxruntime": (str, type(None))})
 
 
+# Тип проставляет воркер: транспорт сохраняет его у всех ответов, включая ACK.
+for _reply_type in ("model.loaded", "result", "cancelled", "pong", "measured", "audio.closed"):
+    _schema = _SCHEMAS[_reply_type]
+    _SCHEMAS[_reply_type] = _Schema(
+        required=_schema.required, optional={**_schema.optional, "request_type": _STR}
+    )
+
+
 def _fields(value: dict[str, Any], schema: _Schema) -> dict[str, Any]:
     """Проверяет известные поля и отбрасывает расширения протокола."""
     for name in schema.required:

@@ -434,3 +434,20 @@ def test_error_helper() -> None:
     msg = ipc.error(ipc.BAD_FIELD, "Отсутствует поле")
     assert msg == {"type": "error", "code": "bad-field", "message": "Отсутствует поле"}
     assert ipc.FrameReader().feed(ipc.encode(msg)) == [msg]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        message
+        for message in _MESSAGES
+        if message["type"]
+        in {"model.loaded", "result", "cancelled", "pong", "measured", "audio.closed", "error"}
+    ],
+    ids=lambda message: message["type"],
+)
+def test_reply_request_type_survives_wire_roundtrip(reply: dict[str, Any]) -> None:
+    typed = {**reply, "request_type": "record.cancel"}
+    assert ipc.decode(ipc.encode(typed)[4:]) == typed
+    with pytest.raises(ipc.FrameError):
+        ipc.encode({**reply, "request_type": 17})

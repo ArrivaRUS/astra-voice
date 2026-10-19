@@ -941,6 +941,7 @@ def test_error_registry_is_exact() -> None:
         "Не удалось загрузить модель",
         "Распознавание не работает",
         "Модель недоступна",
+        "Программа обновлена — перезапустите её",
     }
     assert ERROR_REASONS == {
         ERROR_MICROPHONE_UNAVAILABLE,
@@ -954,6 +955,7 @@ def test_error_registry_is_exact() -> None:
         ERROR_MODEL_LOAD_FAILED,
         ERROR_SELFCHECK_FAILED,
         ERROR_MODEL_REVOKED,
+        ipc.PROTOCOL_MISMATCH_MESSAGE,
     }
 
 
@@ -1906,3 +1908,21 @@ def test_pill_ast_accepts_literals_and_registry_constants(source: str, clipboard
     if clipboard:
         source = source.replace("ERROR_BUFFER_CLEARED", "CLIPBOARD_WINDOW_CHANGED")
     assert not _pill_text_violations(source)
+
+
+@pytest.mark.parametrize(
+    "import_source, expression",
+    [
+        ("from astra_voice.worker import ipc", "ipc.PROTOCOL_MISMATCH_MESSAGE"),
+        ("from astra_voice.worker.ipc import PROTOCOL_MISMATCH_MESSAGE as REASON", "REASON"),
+        ("from astra_voice.ui.pill import PROTOCOL_MISMATCH_MESSAGE", "PROTOCOL_MISMATCH_MESSAGE"),
+    ],
+)
+def test_pill_ast_accepts_protocol_reason_but_rejects_overwrite_and_shadowing(
+    import_source: str, expression: str
+) -> None:
+    display = f"pill.show_state(state, text={expression})"
+    assert not _pill_text_violations(f"{import_source}\n{display}")
+    assert _pill_text_violations(f"{import_source}\n{expression} = text\n{display}")
+    base = expression.split(".")[0]
+    assert _pill_text_violations(f"{import_source}\ndef display({base}):\n    {display}")

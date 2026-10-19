@@ -28,6 +28,7 @@ from astra_voice.core.dictation import (
     CANCEL_TIMEOUT_MS,
     RECOGNIZE_TIMEOUT_S,
     RELEASE_TAIL_MS,
+    TEST_FAILED,
     TEST_MODEL_UNAVAILABLE,
     TEST_PREPARING,
     DictationPhase,
@@ -409,6 +410,11 @@ class Rig:
         return GrabResult(self.grab_code)
 
     def event(self, **event: object) -> None:
+        request_type = {"cancelled": "record.cancel", "audio.closed": "audio.close"}.get(
+            str(event.get("type"))
+        )
+        if request_type is not None:
+            event.setdefault("request_type", request_type)
         callback = self.supervisor_factory.call_args.kwargs["on_event"]
         callback({"generation": self.supervisor.generation, **event})
 
@@ -3807,7 +3813,9 @@ def test_selfcheck_retry_uses_real_supervisor_correlation(
     if outcome == "watchdog":
         rig.timers[-1].fire()
     elif outcome == "cancelled":
-        first._accept({"type": "cancelled", "utterance_id": "file"}, 1)
+        first._accept(
+            {"type": "cancelled", "utterance_id": "file", "request_type": "transcribe.file"}, 1
+        )
     else:
         if outcome == "timeout":
             first._accept({"type": "pong"}, 1)  # Живой воркер: timeout без рестарта.
@@ -4695,6 +4703,11 @@ def microphone_runtime(
 
 
 def microphone_runtime_event(rig: Rig, message: dict[str, Any]) -> None:
+    request_type = {"cancelled": "record.cancel", "audio.closed": "audio.close"}.get(
+        message["type"]
+    )
+    if request_type is not None:
+        message = {"request_type": request_type, **message}
     supervisor = rig.runtime.supervisor
     supervisor._receive(ipc.encode(message), supervisor.generation)
 
@@ -5661,5 +5674,5 @@ def test_model_ready_preserves_reentrant_pending_test(
     rig.runtime._model_ready()
     assert rig.runtime._pending_test is pending
     assert new_updates == []
-    expected = [MicrophoneTestUpdate("error", message=module.TEST_FAILED)] if raises else []
+    expected = [MicrophoneTestUpdate("error", message=TEST_FAILED)] if raises else []
     assert original_updates == expected

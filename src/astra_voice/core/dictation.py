@@ -657,16 +657,6 @@ class DictationOrchestrator:
         self._cancel_pending = True
         self._level_idle_message = idle_message
         self._cancel_timers()
-        actions: tuple[Callable[[], None], ...] = (
-            lambda: self._set_recording(False),
-            lambda: self._tray.set_state(TrayState.IDLE),
-            self._pill.hide,
-        )
-        for action in actions:
-            try:
-                action()
-            except Exception:
-                message = message or LEVEL_FAILED
         if message:
             self._level_failed = True
             self._level_notify(MicrophoneLevelUpdate("error", message=message))
@@ -679,6 +669,19 @@ class DictationOrchestrator:
             self._level_cancel_timeout()
 
     def _finish_level(self) -> None:
+        # Запрос отмены и его таймаут не доказывают закрытие источника.
+        # До ACK или завершения воркера индикаторы остаются включены.
+        actions: tuple[Callable[[], None], ...] = (
+            lambda: self._set_recording(False),
+            lambda: self._tray.set_state(TrayState.IDLE),
+            self._pill.hide,
+        )
+        for action in actions:
+            try:
+                action()
+            except Exception:
+                self._level_failed = True
+                self._level_notify(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
         callback, self._level_callback = self._level_callback, None
         idle_message, self._level_idle_message = self._level_idle_message, ""
         self._level_awaiting_audio_closed = False
@@ -719,8 +722,9 @@ class DictationOrchestrator:
         except Exception:
             self._level_failed = True
             self._level_notify(MicrophoneLevelUpdate("error", message=LEVEL_FAILED))
-        finally:
-            self._finish_level()
+            self._later(CANCEL_RESTART_MS, self._level_cancel_restart)
+            return
+        self._finish_level()
 
     def _level_event(self, event: dict[str, Any]) -> None:
         if self._generation() != self._worker_generation or (
@@ -736,11 +740,13 @@ class DictationOrchestrator:
         if event.get("utterance_id", self._utterance_id) != self._utterance_id:
             return
         kind = event.get("type")
-        if kind == "audio.closed":
+        if kind == "audio.closed" and event.get("request_type") == "audio.close":
             # В ответе нет utterance_id: чужой поздний ответ не снимает сторожей.
             if self._cancel_pending and self._level_awaiting_audio_closed:
                 self._finish_level()
-        elif kind == "cancelled":
+        elif (
+            kind == "cancelled" or (kind == "error" and event.get("code") == "bad-state")
+        ) and event.get("request_type") == "record.cancel":
             if not self._cancel_requested:
                 self._end_level(LEVEL_FAILED)
             self._finish_level()
@@ -1293,14 +1299,19 @@ class DictationOrchestrator:
                 self._recording_boundary(event)
             self._pump()
             return
-        if event.get("type") == "audio.closed" and self._level_callback is None:
+        if (
+            event.get("type") == "audio.closed"
+            and event.get("request_type") == "audio.close"
+            and self._level_callback is None
+        ):
             for context in list(self._contexts):
                 if (
                     context._awaiting_audio_closed
                     and event.get("generation") == context._worker_generation == self._generation()
                 ):
                     with self._within(context):
-                        self._cancelled()
+                        # audio.close подтверждает только источник, не задание ASR.
+                        self._capture_closed()
             return
         if self._level_callback is not None:
             try:
@@ -1354,7 +1365,12 @@ class DictationOrchestrator:
             if kind != "cancelled":
                 return
         if kind == "cancelled":
-            self._cancelled()
+            if event.get("request_type") == "record.cancel":
+                self._cancelled()
+            elif event.get("request_type") == "recognize":
+                # Завершение задания не доказывает закрытие захвата. Запрашиваем
+                # адресный ACK в текущем контексте, не отменяя более новую фразу.
+                self._cancel_one("worker")
         elif (
             kind == "error"
             and event.get("code") == "bad-state"
@@ -1669,22 +1685,6 @@ class DictationOrchestrator:
             if self._phase in (DictationPhase.RECORDING, DictationPhase.PROCESSING):
                 self.cancel("session")
 
-    def _refresh_queued_targets(self) -> None:
-        target = self._target_window
-        refresh = self._refresh_paste_target
-        if not isinstance(target, PasteTarget) or refresh is None:
-            return
-        try:
-            updated = refresh(target)
-        except Exception:
-            self._log.warning("диктовка: обновление цели вставки недоступно")
-            return
-        if updated.window != target.window or updated.title_digest is None:
-            return
-        for phrase in self._items:
-            if phrase is not self._current() and phrase._target_window == target:
-                phrase._target_window = updated
-
     def _attempt_paste(self, text: str) -> None:
         if self._closed or self._cancel_requested or self._phase != DictationPhase.PASTING:
             return
@@ -1727,8 +1727,6 @@ class DictationOrchestrator:
             release = self._t_release if self._t_release is not None else self._t_stop
             assert release is not None
             self._t_total_ms = max(0.0, (started + outcome.delivered_ms / 1000 - release) * 1000)
-        if kind is PasteOutcomeKind.PASTED:
-            self._refresh_queued_targets()
         # Отложенные события разбираются по порядку: результат следующей фразы ждёт
         # в своей очереди доставки, нажатие начинает её запись (US-2.7, решение 6).
         while self._queue and not self._closed:
@@ -1827,10 +1825,12 @@ class DictationOrchestrator:
         self._send_cancel()
         others = [u for u in self._items if u is not self._current()]
         if others:
-            # Более старые фразы продолжают распознаваться: хоткей возвращается к ним.
-            self._safe_ui(
-                self._return_hotkey_to_queue, "диктовка: не удалось сбросить горячую клавишу"
-            )
+            # Отмена задания A не меняет хоткей продолжающей запись B.
+            # При отмене последней записи хоткей возвращается к очереди.
+            if not self._other_recording():
+                self._safe_ui(
+                    self._return_hotkey_to_queue, "диктовка: не удалось сбросить горячую клавишу"
+                )
         else:
             self._safe_ui(self._hotkey_cancel, "диктовка: не удалось сбросить горячую клавишу")
         if not self._any_capture_open():
@@ -1869,7 +1869,7 @@ class DictationOrchestrator:
                 self._cancelled()
                 return
             self._cancel_pending = False
-            self._cancel_timers()
+            self._cancel_timers(keep_tail_done=self._capture_outcome is not None)
         if self._any_capture_open():
             return
         if self._phase is DictationPhase.PROCESSING and not self._capture_processing:
@@ -1900,7 +1900,7 @@ class DictationOrchestrator:
             self._finish_test(MicrophoneTestUpdate("idle"))
             return
         if self._phase in (DictationPhase.IDLE, DictationPhase.FINISHING):
-            self._cancel_timers()
+            self._cancel_timers(keep_tail_done=outcome is not None)
             if not self._any_capture_open():
                 self._safe_ui(
                     lambda: self._set_recording(False),
@@ -2192,11 +2192,15 @@ class DictationOrchestrator:
                 if outcome is not None:
                     outcome()
                 if not self._any_capture_open():
+                    # Исходный tail мог истечь до ACK. Не возвращаем тогда
+                    # завершающий значок без таймера, который вернёт его в IDLE.
+                    finished_tray = TrayState.IDLE if self._phase is DictationPhase.IDLE else tray
                     self._safe_ui(
-                        lambda: self._tray.set_state(TrayState.PROCESSING if self._items else tray),
+                        lambda: self._tray.set_state(
+                            TrayState.PROCESSING if self._items else finished_tray
+                        ),
                         "диктовка: не удалось обновить трей",
                     )
-                self._later(duration, self._tail_done)
 
             self._capture_outcome = finish_after_close
         if self._items:
@@ -2339,10 +2343,14 @@ class DictationOrchestrator:
         handle = self._schedule(milliseconds, fire)
         utterance._timers[token] = (handle, callback)
 
-    def _cancel_timers(self, *, keep_cancel_restart: bool = False) -> None:
+    def _cancel_timers(
+        self, *, keep_cancel_restart: bool = False, keep_tail_done: bool = False
+    ) -> None:
         pending, self._timers = self._timers, {}
         for token, (handle, callback) in pending.items():
-            if keep_cancel_restart and callback == self._restart_after_cancel:
+            if (keep_cancel_restart and callback == self._restart_after_cancel) or (
+                keep_tail_done and callback == self._tail_done
+            ):
                 self._timers[token] = (handle, callback)
                 continue
             try:

@@ -302,6 +302,20 @@ class WorkerState:
         deferred: list[Callable[[], None]] = []
         with self._lock:
             replies = self._handle(msg, deferred)
+            if (
+                msg["type"] in {"record.stop", "recognize"}
+                and any(reply.get("code") == "bad-state" for reply in replies)
+                and self._capture is not None
+            ):
+                # PCM может уже исчезнуть, пока его владелец ещё закрывает источник.
+                # Адресное ожидание не останавливает соседнюю запись и не держит lock.
+                capture = self._capture
+                uid = str(msg["utterance_id"])
+                deferred.append(lambda: capture.wait_stopped(uid))
+            for reply in replies:
+                reply.setdefault("request_type", msg["type"])
+                if reply["type"] == "error" and "utterance_id" in msg:
+                    reply.setdefault("utterance_id", msg["utterance_id"])
         for action in deferred:
             action()
         return replies
@@ -704,6 +718,9 @@ class WorkerState:
                     self._remember_cancelled(job.utterance_id)
             elif job.utterance_id in self.buffers:
                 self._stopped[job.utterance_id] = self._clock()
+            msg.setdefault(
+                "request_type", "transcribe.file" if job.path is not None else "recognize"
+            )
             self._active = None
             discarded: list[Message] = []
             if msg.get("code") == "engine-failed":
@@ -719,6 +736,9 @@ class WorkerState:
                         {
                             **error("engine-failed", "Ошибка распознавания движка."),
                             "utterance_id": pending.utterance_id,
+                            "request_type": (
+                                "transcribe.file" if pending.path is not None else "recognize"
+                            ),
                         }
                     ]
             elif self._pending is not None:

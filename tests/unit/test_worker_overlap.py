@@ -94,8 +94,12 @@ def cmd(worker: WorkerState, kind: str, uid: str) -> list[Message]:
     return worker.handle({"type": kind, "utterance_id": uid})
 
 
-@pytest.mark.parametrize("finish", ["capture-error", "limit"])
-def test_cancel_waits_for_physical_close(make_worker: Any, finish: str) -> None:
+@pytest.mark.parametrize(
+    ("finish", "kind"),
+    [("capture-error", kind) for kind in ("record.cancel", "record.stop", "recognize")]
+    + [("limit", "record.cancel")],
+)
+def test_cancel_waits_for_physical_close(make_worker: Any, finish: str, kind: str) -> None:
     """bad-state/cancelled выдаётся лишь после закрытия, вне lock автомата."""
     worker, events = make_worker(FakeEngine())
     closing, release, waiting, replied = Event(), Event(), Event(), Event()
@@ -132,7 +136,7 @@ def test_cancel_waits_for_physical_close(make_worker: Any, finish: str) -> None:
     replies: list[Message] = []
 
     def cancel() -> None:
-        replies.extend(cmd(worker, "record.cancel", "a"))
+        replies.extend(cmd(worker, kind, "a"))
         replied.set()
 
     cancelling = Thread(target=cancel)
@@ -151,14 +155,18 @@ def test_cancel_waits_for_physical_close(make_worker: Any, finish: str) -> None:
         assert waiting.wait(2)
         assert not replied.is_set() and source.is_open
         # Отменяющий поток не держит lock: цикл IPC/фоновые callback не заблокированы.
-        assert worker.handle({"type": "ping"}) == [{"type": "pong"}]
+        assert worker.handle({"type": "ping"}) == [{"type": "pong", "request_type": "ping"}]
         release.set()
         cancelling.join(2)
         assert not cancelling.is_alive() and replied.is_set()
+        assert replies[0]["request_type"] == kind
+        assert replies[0]["utterance_id"] == "a"
         if finish == "capture-error":
             assert replies[0]["code"] == "bad-state"
         else:
-            assert replies == [{"type": "cancelled", "utterance_id": "a"}]
+            assert replies == [
+                {"type": "cancelled", "utterance_id": "a", "request_type": "record.cancel"}
+            ]
         assert worker.buffers == {}
         assert not source.is_open
         assert events.get(timeout=2) == {"type": "record.stopped", "utterance_id": "a"}
@@ -169,7 +177,8 @@ def test_cancel_waits_for_physical_close(make_worker: Any, finish: str) -> None:
         capture.stop()
 
 
-def test_unknown_cancel_does_not_stop_another_capture(make_worker: Any) -> None:
+@pytest.mark.parametrize("kind", ["record.cancel", "record.stop", "recognize"])
+def test_unknown_cancel_does_not_stop_another_capture(make_worker: Any, kind: str) -> None:
     """Адресное ожидание неизвестной A сохраняет работающий захват B."""
     worker, events = make_worker(FakeEngine())
     reading, release = Event(), Event()
@@ -197,7 +206,7 @@ def test_unknown_cancel_does_not_stop_another_capture(make_worker: Any) -> None:
     try:
         assert cmd(worker, "record.start", "b") == []
         assert reading.wait(2)
-        assert cmd(worker, "record.cancel", "unknown-a")[0]["code"] == "bad-state"
+        assert cmd(worker, kind, "unknown-a")[0]["code"] == "bad-state"
         assert source.is_open and capture.active
         worker.feed_audio("b", [0.2, 0.3])
         assert list(worker.buffers["b"]) == pytest.approx([0.2, 0.3])

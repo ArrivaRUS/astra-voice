@@ -564,13 +564,13 @@ def test_cancel_is_always_sent_and_registers_pending(terminal: str) -> None:
     supervisor._outgoing.clear()
     events.clear()
     cancel = {"type": "record.cancel", "utterance_id": "done"}
-    cancelled = {"type": "cancelled", "utterance_id": "done"}
+    cancelled = {"type": "cancelled", "utterance_id": "done", "request_type": "record.cancel"}
     # У45: прежнее подавление отмены могло оставлять микрофон открытым.
     for _ in range(2):
         assert supervisor.send(cancel) == {**cancel, "generation": 1}
         assert ipc.FrameReader().feed(bytes(supervisor._outgoing)) == [cancel]
         supervisor._outgoing.clear()
-        assert key in supervisor._pending
+        assert (*key, "record.cancel") in supervisor._pending
         assert key not in supervisor._finished
         supervisor._receive(ipc.encode(cancelled), 1)
         assert not supervisor._pending
@@ -605,11 +605,11 @@ def test_uncorrelated_error_keeps_recording_cancellable(stop_first: bool) -> Non
     supervisor.send({"type": "record.start", "utterance_id": "one"}, timeout=5)
     supervisor.send({"type": "recognize", "utterance_id": "one"})
     key = ("utterance", "one")
-    pending = supervisor._pending[key]
+    pending = supervisor._pending[(*key, "recognize")]
     error = ipc.error("no-model", "Модель не загружена.")
     supervisor._receive(ipc.encode(error), 1)
     assert events == [{**error, "generation": 1}]
-    assert supervisor._pending[key] is pending
+    assert supervisor._pending[(*key, "recognize")] is pending
     assert key not in supervisor._finished
     assert supervisor.dropped_late == 0
     if stop_first:
@@ -619,8 +619,8 @@ def test_uncorrelated_error_keeps_recording_cancellable(stop_first: bool) -> Non
     cancel = {"type": "record.cancel", "utterance_id": "one"}
     assert supervisor.send(cancel) is not None
     assert sent[-1] == cancel
-    assert supervisor._pending[key] is pending
-    cancelled = {"type": "cancelled", "utterance_id": "one"}
+    assert supervisor._pending[(*key, "recognize")] is pending
+    cancelled = {"type": "cancelled", "utterance_id": "one", "request_type": "record.cancel"}
     supervisor._receive(ipc.encode(cancelled), 1)
     assert events[-1] == {**cancelled, "generation": 1}
     assert not supervisor._pending
@@ -653,7 +653,7 @@ def test_device_changed_keeps_pending_until_result(timeout: float | None) -> Non
         "audio_ms": 900,
     }
     supervisor._receive(ipc.encode(changed), 1)
-    assert key in supervisor._pending
+    assert (*key, "record.start") in supervisor._pending
     assert key not in supervisor._finished
     supervisor.send({"type": "record.stop", "utterance_id": "one"})
     supervisor.send({"type": "recognize", "utterance_id": "one"})
@@ -692,7 +692,7 @@ def test_record_notifications_keep_pending_until_result(timeout: float | None) -
     )
     for notification in notifications:
         supervisor._receive(ipc.encode(notification), 1)
-        assert key in supervisor._pending
+        assert (*key, "record.start") in supervisor._pending
         assert key not in supervisor._finished
     result: Message = {
         "type": "result",
@@ -732,7 +732,7 @@ def test_level_stream_extends_record_deadline(continuation_timeout: float | None
             1,
         )
         supervisor._expire()
-        assert ("utterance", "one") in supervisor._pending
+        assert ("utterance", "one", "recognize") in supervisor._pending
         assert supervisor.generation == 1
     assert len(events) == 20
     assert all(event["type"] == "level" for event in events)
@@ -742,7 +742,8 @@ def test_level_stream_extends_record_deadline(continuation_timeout: float | None
     supervisor._expire()
     assert not supervisor._pending
     assert supervisor.generation == 1
-    assert len(events) == 21
+    assert len(events) == 22
+    assert {e["request_type"] for e in events[-2:]} == {"record.start", "recognize"}
     assert events[-1]["code"] == "timeout"
     assert events[-1]["utterance_id"] == "one"
 
@@ -766,8 +767,8 @@ def test_correlated_error_finishes_only_matching_request(correlation: dict[str, 
     supervisor._receive(ipc.encode(error), supervisor.generation)
     assert len(events) == 1
     assert events[0]["utterance_id"] == "one"
-    assert events[0]["request_type"] == "recognize"
-    assert set(supervisor._pending) == {("utterance", "other"), ("reply", "pong")}
+    assert events[0].get("request_type") == correlation.get("request_type")
+    assert set(supervisor._pending) == {("utterance", "other", "record.start"), ("reply", "pong")}
     assert supervisor._finished == {("utterance", "one")}
     clock.now += 2
     supervisor._expire()
@@ -778,7 +779,7 @@ def test_correlated_error_finishes_only_matching_request(correlation: dict[str, 
     supervisor._receive(ipc.encode(error), supervisor.generation)
     assert len(events) == 2
     assert supervisor.dropped_late == 1
-    assert ("utterance", "other") in supervisor._pending
+    assert ("utterance", "other", "record.start") in supervisor._pending
 
 
 def test_file_error_by_request_type_uses_same_correlation() -> None:
@@ -865,13 +866,13 @@ def test_uncorrelated_error_completes_only_replies_before_callback() -> None:
     supervisor._receive(ipc.encode(ipc.error("engine-failed", "Общая ошибка.")), 1)
     assert len(events) == 2
     assert {e["request_type"] for e in events} == {"measure", "ping"}
-    assert set(supervisor._pending) == {("utterance", "one"), ("reply", "pong")}
+    assert set(supervisor._pending) == {("utterance", "one", "recognize"), ("reply", "pong")}
     assert ("utterance", "one") not in supervisor._finished
     clock.now += 2
     supervisor._expire()
     supervisor._receive(ipc.encode({"type": "pong"}), 1)
     assert [e["type"] for e in events] == ["error", "error", "pong"]
-    assert set(supervisor._pending) == {("utterance", "one")}
+    assert set(supervisor._pending) == {("utterance", "one", "recognize")}
 
 
 def test_unknown_correlated_error_does_not_finish_other_request() -> None:
@@ -958,3 +959,108 @@ def test_expired_batch_is_removed_before_callback() -> None:
     assert [e["type"] for e in events] == ["error", "error", "pong"]
     assert all(e["code"] == "timeout" for e in events[:2])
     assert not supervisor._pending
+
+
+def test_finish_preserves_worker_request_type() -> None:
+    """ИБ-46: _finish не имеет права переписать присланный воркером тип."""
+    supervisor, _ = detached(Clock())
+    supervisor.send({"type": "record.cancel", "utterance_id": "one"})
+    reply = {**ipc.error("bad-state", "Нет записи."), "request_type": "record.stop"}
+    event = supervisor._finish(("utterance", "one", "record.cancel"), reply)
+    assert event["request_type"] == "record.stop"
+
+
+@pytest.mark.parametrize("earlier", ["record.stop", "recognize"])
+def test_earlier_reply_cannot_finish_cancel(earlier: str) -> None:
+    """Два запроса одной фразы ждут собственный ответ и сохраняют свои сроки."""
+    clock = Clock()
+    supervisor, events = detached(clock)
+    supervisor.send({"type": earlier, "utterance_id": "one"}, timeout=1)
+    supervisor.send({"type": "record.cancel", "utterance_id": "one"}, timeout=3)
+    cancel_key = ("utterance", "one", "record.cancel")
+    pending = supervisor._pending[cancel_key]
+    failure = {
+        **ipc.error("bad-state", "Нет записи."),
+        "utterance_id": "one",
+        "request_type": earlier,
+    }
+    supervisor._receive(ipc.encode(failure), 1)
+    assert events == [{**failure, "generation": 1}]
+    assert supervisor._pending[cancel_key] is pending
+    assert pending.deadline == clock.now + 3
+    cancelled = {"type": "cancelled", "utterance_id": "one", "request_type": "record.cancel"}
+    supervisor._receive(ipc.encode(cancelled), 1)
+    assert events[-1] == {**cancelled, "generation": 1}
+    assert not supervisor._pending
+    assert supervisor.dropped_late == 0
+
+
+def test_independent_capture_events_do_not_ack_or_consume_cancel() -> None:
+    supervisor, events = detached(Clock())
+    for kind in ("record.start", "record.stop", "recognize", "record.cancel"):
+        supervisor.send({"type": kind, "utterance_id": "one"}, timeout=2)
+    original = dict(supervisor._pending)
+    error = {**ipc.error("audio-failed", "Ошибка источника."), "utterance_id": "one"}
+    stopped = {"type": "record.stopped", "utterance_id": "one"}
+    for event in (error, stopped):
+        supervisor._receive(ipc.encode(event), 1)
+    assert events == [{**event, "generation": 1} for event in (error, stopped)]
+    assert supervisor._pending == original
+    for kind in ("record.stop", "recognize", "record.cancel"):
+        reply = {
+            **ipc.error("bad-state", "Нет записи."),
+            "utterance_id": "one",
+            "request_type": kind,
+        }
+        supervisor._receive(ipc.encode(reply), 1)
+        assert events[-1] == {**reply, "generation": 1}
+    assert not supervisor._pending
+    assert supervisor.dropped_late == 0
+
+
+def test_recognition_result_does_not_consume_cancel_deadline() -> None:
+    clock = Clock()
+    supervisor, events = detached(clock)
+    supervisor.send({"type": "recognize", "utterance_id": "one"}, timeout=1)
+    supervisor.send({"type": "record.cancel", "utterance_id": "one"}, timeout=3)
+    reply = {"type": "cancelled", "utterance_id": "one", "request_type": "recognize"}
+    supervisor._receive(ipc.encode(reply), 1)
+    assert set(supervisor._pending) == {("utterance", "one", "record.cancel")}
+    clock.now += 3
+    supervisor._expire()
+    assert events[-1]["code"] == "timeout"
+    assert events[-1]["request_type"] == "record.cancel"
+    assert not supervisor._pending
+
+
+def test_untyped_cancelled_cannot_consume_explicit_cancel() -> None:
+    supervisor, events = detached(Clock())
+    supervisor.send({"type": "record.cancel", "utterance_id": "one"}, timeout=1)
+    supervisor._receive(ipc.encode({"type": "cancelled", "utterance_id": "one"}), 1)
+    assert not events
+    assert set(supervisor._pending) == {("utterance", "one", "record.cancel")}
+    reply = {"type": "cancelled", "utterance_id": "one", "request_type": "record.cancel"}
+    supervisor._receive(ipc.encode(reply), 1)
+    assert events == [{**reply, "generation": 1}]
+    assert not supervisor._pending
+
+
+def test_bad_state_cancel_retires_capture_chain_without_orphan_timeout() -> None:
+    clock = Clock()
+    supervisor, events = detached(clock)
+    supervisor.send({"type": "record.start", "utterance_id": "one"}, timeout=1)
+    supervisor.send({"type": "record.cancel", "utterance_id": "one"}, timeout=2)
+    capture_error = {**ipc.error("audio-failed", "Ошибка источника."), "utterance_id": "one"}
+    supervisor._receive(ipc.encode(capture_error), 1)
+    assert len(supervisor._pending) == 2
+    ack = {
+        **ipc.error("bad-state", "Нет записи."),
+        "utterance_id": "one",
+        "request_type": "record.cancel",
+    }
+    supervisor._receive(ipc.encode(ack), 1)
+    assert not supervisor._pending
+    clock.now += 3
+    supervisor._expire()
+    assert events == [{**event, "generation": 1} for event in (capture_error, ack)]
+    assert supervisor.generation == 1

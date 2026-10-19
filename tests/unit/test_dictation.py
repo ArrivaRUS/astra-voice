@@ -326,6 +326,10 @@ class Rig:
         return str([m for m, _ in self.sent if m["type"] == "record.start"][-1]["utterance_id"])
 
     def event(self, kind: str, **fields: object) -> None:
+        if kind in ("cancelled", "audio.closed"):
+            fields.setdefault(
+                "request_type", {"cancelled": "record.cancel", "audio.closed": "audio.close"}[kind]
+            )
         if kind == "record.limit" and self.ack_stop:
             self.event("record.stopped", **fields)
         self.core.on_worker_event(
@@ -2084,13 +2088,12 @@ def test_start_failure_releases_hotkey_and_shows_error(
     assert rig.fsm.state == HotkeyState.IDLE
     rig.backend.ungrab_escape.assert_called_once_with()
     if failure == "send":
-        rig.core.on_worker_event(
-            {
-                "type": "record.stopped",
-                "generation": rig.worker_generation,
-                "utterance_id": rig.core._utterance_id,
-            }
-        )
+        assert rig.core.cleanup_pending
+        assert not rig.pill.calls
+        rig.timer(CANCEL_TIMEOUT_MS).fire()
+        assert rig.core.cleanup_pending
+        rig.timer(CANCEL_RESTART_MS).fire()
+        rig.restart_worker.assert_called_once_with()
     assert not rig.sent and not rig.recording
     assert ("recording", True) not in rig.trace
     assert rig.pill.calls == [(PillState.ERROR, ERROR_RECOGNITION_FAILED, None)]
@@ -2105,7 +2108,12 @@ def test_start_failure_releases_hotkey_and_shows_error(
         assert "Канал воркера закрыт" not in caplog.text
         assert not rig.core.cleanup_pending
         rig.core.on_worker_event(
-            {"type": "cancelled", "generation": 1, "utterance_id": rig.core._utterance_id}
+            {
+                "type": "cancelled",
+                "request_type": "record.cancel",
+                "generation": 1,
+                "utterance_id": rig.core._utterance_id,
+            }
         )
     monkeypatch.undo()
     rig.start()
@@ -2280,8 +2288,17 @@ def test_cancel_ack_cancels_escalations(rig: Rig, late: bool, tail_done: bool) -
     pending = [t for t in rig.timers if not t.fired]
     rig.event("cancelled")
     for timer in pending:
+        if timer.delay == STATE_DURATION_MS[PillState.CANCELLED]:
+            # П10: ACK сохраняет исходный tail вместо отмены и повторного взвода.
+            assert not timer.cancelled
+            continue
         assert timer.cancelled
         timer.callback()
+    tails = [t for t in rig.timers if t.delay == STATE_DURATION_MS[PillState.CANCELLED]]
+    assert len(tails) == 1
+    if not tails[0].fired:
+        tails[0].fire()
+    assert rig.core.phase is DictationPhase.IDLE
     assert rig.commands().count("audio.close") == int(late)
     rig.restart_worker.assert_not_called()
     assert len(rig.stats.events) == 1
@@ -2349,7 +2366,13 @@ def test_audio_close_failure_still_restarts_worker(rig: Rig) -> None:
 
 def microphone_event(rig: Rig, kind: str, **fields: object) -> None:
     """События проходят настоящий IPC; generation добавляет супервизор."""
-    message = {"type": kind, "utterance_id": rig.uid, **fields}
+    if kind in ("cancelled", "audio.closed"):
+        fields.setdefault(
+            "request_type", {"cancelled": "record.cancel", "audio.closed": "audio.close"}[kind]
+        )
+    message = {"type": kind, **fields}
+    if "utterance_id" not in message:
+        message["utterance_id"] = rig.uid
     if kind == "result":
         message.update(infer_ms=5.0, audio_ms=1000.0)
     decoded = ipc.FrameReader().feed(ipc.encode(message))[0]
@@ -2718,8 +2741,10 @@ def test_level_monitor_records_without_recognition(rig: Rig, device: str) -> Non
     rig.core.stop_level_monitor()
     rig.core.stop_level_monitor()
     assert rig.commands() == ["record.start", "record.cancel"]
-    assert not rig.recording and rig.tray.state == TrayState.IDLE
+    assert rig.recording and rig.tray.state == TrayState.LISTENING
+    assert not rig.pill.hidden
     microphone_event(rig, "cancelled")
+    assert not rig.recording and rig.tray.state == TrayState.IDLE
     assert updates[-1] == MicrophoneLevelUpdate("idle")
     assert not rig.core.level_active and not rig.core.test_active
     assert not rig.stats.events and not rig.pasted
@@ -2739,13 +2764,22 @@ def test_level_limit_restarts_with_fresh_id(rig: Rig, synchronous: bool) -> None
 
     def send(message: dict[str, Any]) -> None:
         if message["type"] == "record.cancel" and synchronous:
-            rig.core.on_worker_event({**message, "type": "cancelled", "generation": 1})
+            rig.core.on_worker_event(
+                {**message, "type": "cancelled", "request_type": "record.cancel", "generation": 1}
+            )
 
     rig.during_send = send
     microphone_event(rig, "record.limit")
     assert rig.uid != previous
     assert rig.commands() == ["record.start", "record.cancel", "record.start"]
-    rig.core.on_worker_event({"type": "cancelled", "utterance_id": previous, "generation": 1})
+    rig.core.on_worker_event(
+        {
+            "type": "cancelled",
+            "request_type": "record.cancel",
+            "utterance_id": previous,
+            "generation": 1,
+        }
+    )
     microphone_event(rig, "level", peak_dbfs=-20, rms_dbfs=-30)
     assert updates[-1] == MicrophoneLevelUpdate("listening", peak_dbfs=-20)
     assert rig.recording and rig.core.level_active
@@ -2842,6 +2876,11 @@ def test_level_exceptions_close_without_leaking(
             microphone_event(rig, "record.limit")
     assert updates[-1].state == "error"
     assert "record.cancel" in rig.commands()
+    assert not rig.core.level_active
+    assert not rig.pill.hidden
+    # При отказе индикатора start ещё не отправлен; при отказе перезапуска
+    # по лимиту отменяется новый id, для которого start также не успел уйти.
+    microphone_event(rig, "cancelled", utterance_id=rig.core._utterance_id)
     assert not rig.recording and not rig.core.level_active
     assert not rig.stats.events
     assert rig.pill.calls == [(PillState.LISTENING, None, None)]
@@ -2858,7 +2897,9 @@ def test_level_cancel_waits_for_audio_closed_before_idle(rig: Rig) -> None:
     assert updates[-1].state == "listening"
     assert rig.commands()[-1] == "audio.close"
     assert not rig.core.start_test("", Mock())
-    rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+    rig.core.on_worker_event(
+        {"type": "audio.closed", "request_type": "audio.close", "generation": 1}
+    )
     assert str(updates[-1].state) == "idle"
     assert rig.core.start_test("", Mock())
     rig.restart_worker.assert_not_called()
@@ -2912,8 +2953,9 @@ def test_level_total_limit_survives_record_limits(rig: Rig, ack: str) -> None:
     assert len([timer for timer in rig.timers if timer.delay == 180000]) == 1
     total.fire()
     assert rig.commands()[-1] == "record.cancel"
-    assert not microphone_open and not rig.recording and not rig.core.level_active
-    assert rig.tray.state == TrayState.IDLE and rig.pill.hidden
+    assert not microphone_open and not rig.core.level_active
+    assert rig.recording and rig.tray.state == TrayState.LISTENING
+    assert not rig.pill.hidden
     starts = rig.commands().count("record.start")
     microphone_event(rig, "record.limit")
     if ack == "cancelled":
@@ -2922,7 +2964,9 @@ def test_level_total_limit_survives_record_limits(rig: Rig, ack: str) -> None:
         rig.timer(CANCEL_TIMEOUT_MS).fire()
         assert rig.commands()[-1] == "audio.close"
         if ack == "audio.closed":
-            rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+            rig.core.on_worker_event(
+                {"type": "audio.closed", "request_type": "audio.close", "generation": 1}
+            )
         else:
             rig.timer(CANCEL_RESTART_MS).fire()
             rig.restart_worker.assert_called_once_with()
@@ -2932,6 +2976,7 @@ def test_level_total_limit_survives_record_limits(rig: Rig, ack: str) -> None:
     assert updates[-1] == MicrophoneLevelUpdate("idle", message=LEVEL_LIMIT_MESSAGE)
     assert not any(update.state == "error" for update in updates)
     assert rig.core.phase == DictationPhase.IDLE
+    assert not rig.recording and rig.tray.state == TrayState.IDLE and rig.pill.hidden
     assert not [timer for timer in rig.timers if not timer.cancelled and not timer.fired]
     assert not rig.pasted and not rig.stats.events
 
@@ -2962,7 +3007,9 @@ def test_late_audio_closed_cannot_finish_new_level_episode(rig: Rig, stopping: b
         rig.core.stop_level_monitor()
     watchdog = rig.timer(CANCEL_TIMEOUT_MS if stopping else int(LEVEL_TOTAL_LIMIT_S * 1000))
     before = rig.commands()
-    rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+    rig.core.on_worker_event(
+        {"type": "audio.closed", "request_type": "audio.close", "generation": 1}
+    )
     old_watchdog.callback()
     assert rig.commands() == before
     assert not watchdog.cancelled
@@ -2985,7 +3032,9 @@ def test_level_audio_closed_can_arrive_synchronously(rig: Rig) -> None:
 
     def send(message: dict[str, Any]) -> None:
         if message["type"] == "audio.close":
-            rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+            rig.core.on_worker_event(
+                {"type": "audio.closed", "request_type": "audio.close", "generation": 1}
+            )
 
     rig.during_send = send
     rig.timer(CANCEL_TIMEOUT_MS).fire()
@@ -3398,9 +3447,10 @@ def test_level_check_ends_with_device_change_message(rig: Rig, kind: str) -> Non
     ipc_device_event(rig, kind)
     assert updates[-1] == MicrophoneLevelUpdate("error", message=DEVICE_MESSAGE[kind])
     assert rig.commands() == ["record.start", "record.cancel"]
-    assert not rig.core.level_active and not rig.recording
-    assert rig.tray.state == TrayState.IDLE and rig.pill.hidden
+    assert not rig.core.level_active and rig.recording
+    assert rig.tray.state == TrayState.LISTENING and not rig.pill.hidden
     microphone_event(rig, "cancelled")
+    assert not rig.recording and rig.tray.state == TrayState.IDLE and rig.pill.hidden
     assert updates[-1].state == "error"
     assert rig.core.phase == DictationPhase.IDLE
     assert_device_change_private(rig)
@@ -3532,10 +3582,10 @@ def test_capture_cleanup_ack_cancels_restart(rig: Rig, ack: str) -> None:
     rig.event("error", code="audio-failed")
     if ack == "audio.closed":
         # Чужой audio.closed до нашей эскалации не снимает блокировку.
-        rig.core.on_worker_event({"type": ack, "generation": 1})
+        rig.core.on_worker_event({"type": ack, "request_type": "audio.close", "generation": 1})
         assert rig.core.cleanup_pending
         rig.timer(CANCEL_TIMEOUT_MS).fire()
-        rig.core.on_worker_event({"type": ack, "generation": 1})
+        rig.core.on_worker_event({"type": ack, "request_type": "audio.close", "generation": 1})
     else:
         rig.event(ack)
     assert not rig.core.cleanup_pending

@@ -303,13 +303,18 @@ def test_cancel_after_recognize_error_closes_capture(
         assert capture.active
         assert_state(worker, State.recording)
         key = ("utterance", "u1")
-        assert (key in supervisor._pending) == uncorrelated
+        assert ((*key, "recognize") in supervisor._pending) == uncorrelated
         assert (key in supervisor._finished) != uncorrelated
         if not uncorrelated:
             assert events[0]["utterance_id"] == "u1"
             assert events[0]["request_type"] == "recognize"
         exchange("record.cancel")
-        assert events[-1] == {"type": "cancelled", "utterance_id": "u1", "generation": 1}
+        assert events[-1] == {
+            "type": "cancelled",
+            "utterance_id": "u1",
+            "request_type": "record.cancel",
+            "generation": 1,
+        }
         assert not source.is_open
         assert not capture.active
         assert_state(worker, State.idle)
@@ -392,6 +397,7 @@ def test_vad_segments_real_recognition_path(
         "t_ms": 750,
         "infer_ms": 75.0,
         "audio_ms": 49000.0,
+        "request_type": "recognize",
     }
     fake_vad.trim_trailing_silence.assert_called_once()
     trim_call = fake_vad.trim_trailing_silence.call_args
@@ -477,7 +483,11 @@ def test_vad_cancel_between_segments(
     worker, _, events = factory(engine, numpy_audio=True, cancel_factory=lambda: token)
     record_samples(worker, 30 * SAMPLE_RATE)
     recognize(worker)
-    assert events.get(timeout=1) == {"type": "cancelled", "utterance_id": "u1"}
+    assert events.get(timeout=1) == {
+        "type": "cancelled",
+        "utterance_id": "u1",
+        "request_type": "recognize",
+    }
     assert engine.transcribe_calls == 1
     assert len(engine.audios[0]) == 10 * SAMPLE_RATE
     assert worker.buffers == {}
@@ -498,7 +508,11 @@ def test_vad_cancellation_skips_engine(factory: Factory, fake_vad: FakeVAD, stag
     worker, engine, events = factory(numpy_audio=True, cancel_factory=lambda: token)
     record_samples(worker, 25 * SAMPLE_RATE)
     recognize(worker)
-    assert events.get(timeout=1) == {"type": "cancelled", "utterance_id": "u1"}
+    assert events.get(timeout=1) == {
+        "type": "cancelled",
+        "utterance_id": "u1",
+        "request_type": "recognize",
+    }
     assert engine.transcribe_calls == 0
     if stage == "trim_trailing_silence":
         fake_vad.segment.assert_not_called()
@@ -627,7 +641,9 @@ def test_cancel_stopped_is_idempotent(factory: Factory) -> None:
     start(worker)
     assert command(worker, "record.stop") == []
     for _ in range(2):
-        assert command(worker, "record.cancel") == [{"type": "cancelled", "utterance_id": "u1"}]
+        assert command(worker, "record.cancel") == [
+            {"type": "cancelled", "utterance_id": "u1", "request_type": "record.cancel"}
+        ]
         assert worker.buffers == {}
     assert engine.transcribe_calls == 0
     assert events.empty()
@@ -640,7 +656,11 @@ def test_cancelled_history_is_bounded(factory: Factory, cancel_by_result: bool) 
     for index in range(count):
         uid = f"u{index}"
         start(worker, uid)
-        expected = {"type": "cancelled", "utterance_id": uid}
+        expected = {
+            "type": "cancelled",
+            "utterance_id": uid,
+            "request_type": "recognize" if cancel_by_result else "record.cancel",
+        }
         if cancel_by_result:
             recognize(worker, uid)
             assert events.get(timeout=2) == expected
@@ -655,7 +675,7 @@ def test_cancelled_history_is_bounded(factory: Factory, cancel_by_result: bool) 
     for uid in recent:
         for _ in range(2):
             assert command(worker, "record.cancel", uid) == [
-                {"type": "cancelled", "utterance_id": uid}
+                {"type": "cancelled", "utterance_id": uid, "request_type": "record.cancel"}
             ]
     assert list(worker._cancelled_order) == recent
     for index in range(count - CANCELLED_HISTORY_LIMIT):
@@ -663,7 +683,9 @@ def test_cancelled_history_is_bounded(factory: Factory, cancel_by_result: bool) 
 
     # Вытесненный id можно снова записать и отменить без повреждения истории.
     start(worker, "u0")
-    assert command(worker, "record.cancel", "u0") == [{"type": "cancelled", "utterance_id": "u0"}]
+    assert command(worker, "record.cancel", "u0") == [
+        {"type": "cancelled", "utterance_id": "u0", "request_type": "record.cancel"}
+    ]
     assert len(worker._cancelled) == len(worker._cancelled_order) == CANCELLED_HISTORY_LIMIT
     assert worker._cancelled == set(worker._cancelled_order)
     assert command(worker, "record.cancel", recent[0])[0]["code"] == "bad-state"
@@ -677,7 +699,9 @@ def test_reusing_cancelled_id_does_not_leave_stale_history(factory: Factory) -> 
         start(worker)
         assert not worker._cancelled
         assert not worker._cancelled_order
-        assert command(worker, "record.cancel") == [{"type": "cancelled", "utterance_id": "u1"}]
+        assert command(worker, "record.cancel") == [
+            {"type": "cancelled", "utterance_id": "u1", "request_type": "record.cancel"}
+        ]
         assert worker._cancelled == {"u1"}
         assert list(worker._cancelled_order) == ["u1"]
 
@@ -694,11 +718,11 @@ def test_stopped_expires_on_next_message(
     command(worker, "record.stop")
     saved = worker.buffers["u1"]
     now += ttl - 0.5
-    assert worker.handle({"type": "ping"}) == [{"type": "pong"}]
+    assert worker.handle({"type": "ping"}) == [{"type": "pong", "request_type": "ping"}]
     assert worker.buffers["u1"] is saved
     now += 1.0
     assert worker.buffers["u1"] is saved
-    assert worker.handle({"type": "ping"}) == [{"type": "pong"}]
+    assert worker.handle({"type": "ping"}) == [{"type": "pong", "request_type": "ping"}]
     assert worker.buffers == {}
     assert "Истёк срок хранения" in caplog.text
     assert events.empty()
@@ -837,7 +861,9 @@ def test_device_change_ignores_cancelled_unknown_and_foreign_ids(factory: Factor
     worker.on_device_change("unknown", "device-lost")
     assert events.empty()
     assert_state(worker, State.recording)
-    assert command(worker, "record.cancel", "u1") == [{"type": "cancelled", "utterance_id": "u1"}]
+    assert command(worker, "record.cancel", "u1") == [
+        {"type": "cancelled", "utterance_id": "u1", "request_type": "record.cancel"}
+    ]
     worker.on_device_change("u1", "device-lost")
     assert events.empty()
 
@@ -907,7 +933,9 @@ def test_record_limit_resets_when_recording_ends(factory: Factory, finish: str) 
     else:
         replies = command(worker, finish)
         assert replies == (
-            [{"type": "cancelled", "utterance_id": "u1"}] if finish == "record.cancel" else []
+            [{"type": "cancelled", "utterance_id": "u1", "request_type": "record.cancel"}]
+            if finish == "record.cancel"
+            else []
         )
         if finish == "recognize":
             assert engine.gate is not None
@@ -933,7 +961,9 @@ def test_rejected_start_and_other_cancel_preserve_current_limit(factory: Factory
     assert command(worker, "record.stop", "old") == []
     assert worker.handle({"type": "record.start", "utterance_id": "u1", "limit_s": 0.005}) == []
     assert command(worker, "record.start", "u2")[0]["code"] == "bad-state"
-    assert command(worker, "record.cancel", "old") == [{"type": "cancelled", "utterance_id": "old"}]
+    assert command(worker, "record.cancel", "old") == [
+        {"type": "cancelled", "utterance_id": "old", "request_type": "record.cancel"}
+    ]
     worker.feed_audio("u1", repeat(0.25, 160))
     assert len(worker.buffers["u1"]) == 80
     assert events.get_nowait() == {"type": "record.limit", "utterance_id": "u1"}
@@ -1196,7 +1226,9 @@ def test_cancel_processing_suppresses_late_result(factory: Factory, respect_canc
             start(worker)
             recognize(worker)
             assert engine.started.wait(2)
-            assert command(worker, "record.cancel") == [{"type": "cancelled", "utterance_id": "u1"}]
+            assert command(worker, "record.cancel") == [
+                {"type": "cancelled", "utterance_id": "u1", "request_type": "record.cancel"}
+            ]
             assert engine.tokens[0].cancelled
             assert worker.buffers == {}
         finally:
@@ -1205,7 +1237,9 @@ def test_cancel_processing_suppresses_late_result(factory: Factory, respect_canc
         assert_state(worker, State.idle)
         assert worker.buffers == {}
         assert events.empty()
-        assert command(worker, "record.cancel") == [{"type": "cancelled", "utterance_id": "u1"}]
+        assert command(worker, "record.cancel") == [
+            {"type": "cancelled", "utterance_id": "u1", "request_type": "record.cancel"}
+        ]
         worker.close()
 
 
@@ -1230,7 +1264,9 @@ def test_cancel_recording_is_idempotent(factory: Factory) -> None:
     worker, _, events = factory()
     start(worker)
     for _ in range(3):
-        assert command(worker, "record.cancel") == [{"type": "cancelled", "utterance_id": "u1"}]
+        assert command(worker, "record.cancel") == [
+            {"type": "cancelled", "utterance_id": "u1", "request_type": "record.cancel"}
+        ]
         assert worker.buffers == {}
         assert_state(worker, State.idle)
     assert events.empty()
@@ -1240,7 +1276,11 @@ def test_engine_cancelled_result_cleans_pcm(factory: Factory) -> None:
     worker, _, events = factory(FakeEngine(cancelled_result=True))
     start(worker)
     recognize(worker)
-    assert events.get(timeout=2) == {"type": "cancelled", "utterance_id": "u1"}
+    assert events.get(timeout=2) == {
+        "type": "cancelled",
+        "utterance_id": "u1",
+        "request_type": "recognize",
+    }
     assert worker.buffers == {}
     assert_state(worker, State.idle)
     assert command(worker, "record.cancel")[0]["type"] == "cancelled"
@@ -1272,7 +1312,7 @@ def test_unload_processing_suppresses_result(factory: Factory) -> None:
             assert_state(worker, State.idle)
             assert worker.buffers == {}
             assert worker.handle(load_message())[0]["code"] == "busy"
-            assert worker.handle({"type": "ping"}) == [{"type": "pong"}]
+            assert worker.handle({"type": "ping"}) == [{"type": "pong", "request_type": "ping"}]
         finally:
             gate.set()
         executor.submit(lambda: None).result(timeout=2)
@@ -1323,6 +1363,7 @@ def test_model_loaded_and_repeat(factory: Factory) -> None:
         "variant": "int8",
         "load_ms": 1.5,
         "engine_version": "fake-1",
+        "request_type": "model.load",
     }
     assert worker.handle(load_message()) == [expected]
     assert worker.min_ram_mb == 512
@@ -1362,7 +1403,7 @@ def test_ping_during_slow_recognition(factory: Factory) -> None:
     start(worker)
     recognize(worker)
     assert engine.started.wait(2)
-    assert worker.handle({"type": "ping"}) == [{"type": "pong"}]
+    assert worker.handle({"type": "ping"}) == [{"type": "pong", "request_type": "ping"}]
     assert not engine.finished.is_set()
     assert events.get(timeout=2)["t_ms"] >= 300
 
@@ -1370,7 +1411,9 @@ def test_ping_during_slow_recognition(factory: Factory) -> None:
 def test_audio_close_ready(factory: Factory) -> None:
     source = FakeAudioSource()
     worker, _, _ = factory(audio_source=source)
-    assert worker.handle({"type": "audio.close"}) == [{"type": "audio.closed"}]
+    assert worker.handle({"type": "audio.close"}) == [
+        {"type": "audio.closed", "request_type": "audio.close"}
+    ]
     assert source.close_calls == 1
     assert worker.audio_ready() == {"type": "audio.ready"}
 
@@ -1405,7 +1448,13 @@ def test_measure_proc_fixtures(factory: Factory, tmp_path: Path, missing_smaps: 
     path.write_text('{"previous": {"vm_hwm_kb": 1}}', encoding="utf-8")
     msg = worker.handle({"type": "measure"})[0]
     pss = None if missing_smaps else 65432
-    assert msg == {"type": "measured", "vm_hwm_kb": 123456, "pss_kb": pss, "sessions": 3}
+    assert msg == {
+        "type": "measured",
+        "vm_hwm_kb": 123456,
+        "pss_kb": pss,
+        "sessions": 3,
+        "request_type": "measure",
+    }
     encode(msg)
     assert json.loads(path.read_text(encoding="utf-8")) == {"previous": {"vm_hwm_kb": 1}}
 
@@ -1558,7 +1607,7 @@ sys.modules['astra_voice.worker.engine'] = None
 sys.modules['astra_voice.worker.vad'] = None
 from astra_voice.worker.state import WorkerState
 worker = WorkerState(runtime='none')
-assert worker.handle({'type': 'ping'}) == [{'type': 'pong'}]
+assert worker.handle({'type': 'ping'}) == [{'type': 'pong', 'request_type': 'ping'}]
 worker.close()
 """
     result = subprocess.run(

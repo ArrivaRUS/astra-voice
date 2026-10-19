@@ -14,9 +14,44 @@ from PyQt5 import sip  # noqa: E402
 
 from astra_voice.ui import pill as pill_module  # noqa: E402
 from astra_voice.ui.pill import STATE_DURATION_MS, Pill, PillState  # noqa: E402
+from astra_voice.worker.ipc import PROTOCOL_MISMATCH_MESSAGE  # noqa: E402
 from helpers.qt_app import get_qapplication  # noqa: E402
 
 pytestmark = pytest.mark.unit
+
+
+def test_real_pill_shows_protocol_restart_reason_offscreen() -> None:
+    """Настоящие Pill, QQuickView, QML и Qt-таймер; без X11-соединения."""
+    from PyQt5.QtCore import QObject
+    from PyQt5.QtQuick import QQuickWindow
+
+    # Offscreen не гарантирует OpenGL-контекст; реальная сцена QML рисуется CPU.
+    QQuickWindow.setSceneGraphBackend("software")
+    app = get_qapplication()
+    assert app.platformName() == "offscreen"
+    pill = Pill()
+    view = pill._view
+    try:
+        root = view.rootObject()
+        presentation = next(
+            child
+            for child in root.findChildren(QObject)
+            if child.metaObject().indexOfProperty("label") >= 0
+            and child.metaObject().indexOfProperty("name") >= 0
+        )
+        for _ in range(2):
+            pill.show_state(PillState.ERROR, text=PROTOCOL_MISMATCH_MESSAGE)
+            app.processEvents()
+            assert pill.visible
+            assert root.property("label") == PROTOCOL_MISMATCH_MESSAGE
+            assert presentation.property("label") == PROTOCOL_MISMATCH_MESSAGE
+            assert pill._expiry_timer.isActive()
+            pill._expire(pill._timer_generation)
+            assert not pill.visible
+    finally:
+        pill.hide()
+        sip.delete(pill)
+        sip.delete(view)
 
 
 def test_expiry_timer_dies_with_pill(monkeypatch: pytest.MonkeyPatch) -> None:
