@@ -6642,6 +6642,8 @@ def test_rejected_loaded_revision_keeps_generation_until_killed_processes_exit(
         assert runtime.supervisor is old
         assert old.generation == 1
         assert rig.supervisor_factory.call_count == factory_calls
+        # Ревью M-1: без пункта в трее восстановления через recheck нет.
+        rig.tray.set_model_recheck_enabled.assert_called_with(True)
         for process in processes:
             process.kill.assert_called_once_with()
             process.wait.assert_called_once_with(timeout=0.2)
