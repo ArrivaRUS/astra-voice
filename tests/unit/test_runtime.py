@@ -132,6 +132,7 @@ def test_protocol_mismatch_shows_restart_instruction(monkeypatch: pytest.MonkeyP
 def test_protocol_mismatch_for_dictation_reaches_orchestrator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Адресная ошибка протокола завершает поколение вместо обычной отмены фразы."""
     rig = Rig(monkeypatch)
     on_worker_event = Mock()
     monkeypatch.setattr(rig.runtime.orchestrator, "on_worker_event", on_worker_event)
@@ -142,10 +143,11 @@ def test_protocol_mismatch_for_dictation_reaches_orchestrator(
         "utterance_id": "dictation",
     }
     rig.supervisor_factory.call_args.kwargs["on_event"](event)
-    on_worker_event.assert_called_once_with(event)
-    assert on_worker_event.call_args.args[0] is event
-    rig.pill.show_state.assert_not_called()
-    rig.tray.set_state.assert_not_called()
+    on_worker_event.assert_not_called()
+    assert not rig.runtime.orchestrator.cleanup_pending
+    assert rig.runtime.phase is DictationPhase.IDLE
+    rig.pill.show_state.assert_called_once_with(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
+    rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
 
 
 @pytest.mark.parametrize("code", ["timeout", "load-timeout", "measure-failed"])
@@ -407,19 +409,12 @@ class Rig:
         return GrabResult(self.grab_code)
 
     def event(self, **event: object) -> None:
-        # Ошибки задания настоящего воркера адресованы своей фразе. Глобальные
-        # ошибки и ответы model.load/measure по-прежнему остаются без её id.
-        if (
-            event.get("type") == "error"
-            and "utterance_id" not in event
-            and "request_type" not in event
-            and "response_type" not in event
-            and event.get("code") not in ("worker-start", "worker-crashed", "restart-limit")
-            and self.runtime.phase in (DictationPhase.RECORDING, DictationPhase.PROCESSING)
-        ):
-            event["utterance_id"] = self.runtime.orchestrator._utterance_id
         callback = self.supervisor_factory.call_args.kwargs["on_event"]
         callback({"generation": self.supervisor.generation, **event})
+
+    def job_error(self, utterance_id: str, **fields: object) -> None:
+        """Ошибка задания адресована явно выбранной фразе, event остаётся сырым."""
+        self.event(type="error", utterance_id=utterance_id, **fields)
 
     def fire_tail(self) -> None:
         """Дописывает хвост записи после отпускания клавиши (RELEASE_TAIL_MS)."""
@@ -483,7 +478,8 @@ def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_k
     rig.runtime.start()
     rig.hotkey.fsm.press(rig.now)
     if event_kind == "lost":
-        rig.event(type="error", code="audio-no-device")
+        uid = rig.supervisor.send.call_args.args[0]["utterance_id"]
+        rig.job_error(uid, code="audio-no-device")
         assert rig.notify.mock_calls == [call.notify_microphone_lost()]
     else:
         # Даже позднее первое определение микрофона остаётся без уведомления.
@@ -3420,6 +3416,40 @@ def test_selfcheck_failure_blocks_dictation_once(
     with caplog.at_level(logging.DEBUG):
         correlation = {} if "request_type" in event else {"utterance_id": "file"}
         rig.event(**correlation, **event)
+    if event.get("code") == ipc.PROTOCOL_MISMATCH:
+        # Смена протокола завершает поколение: самопроверку в нём не повторяем.
+        assert not rig.runtime._loading_model
+        assert not rig.runtime.orchestrator.cleanup_pending
+        assert timer.deleted and not timer.active
+        assert not rig.runtime.timers
+        rig.tray.set_model_recheck_enabled.assert_called_with(False)
+        rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
+        factory_calls = rig.supervisor_factory.call_count
+        requests = list(rig.supervisor.send.call_args_list)
+        timer.timeout.emit()
+        rig.event(type="result", utterance_id="file", text="проверка")
+        rig.event(type="error", utterance_id="file", message=MARKER)
+        for offset in (0, 3):
+            rig.hotkey.fsm.press(rig.now + offset)
+            rig.release(rig.now + offset + 1)
+            rig.hotkey.fsm.escape(rig.now + offset + 2)
+        assert rig.supervisor_factory.call_count == factory_calls
+        assert rig.supervisor.send.call_args_list == requests
+        assert rig.hotkey.fsm.state is HotkeyState.IDLE
+        assert_phase(rig.runtime, DictationPhase.IDLE)
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
+        rig.pill.hide.assert_not_called()
+        on_event.assert_not_called()
+        rig.notify.notify_engine_failed.assert_not_called()
+        rig.notify.notify_selfcheck_failed.assert_not_called()
+        rig.stats.append.assert_not_called()
+        rig.paste.assert_not_called()
+        assert rig.runtime.last_text is None
+        assert MARKER not in caplog.text
+        assert MARKER not in repr(
+            rig.stats.mock_calls + rig.notify.mock_calls + rig.pill.mock_calls
+        )
+        return
     rig.tray.set_model_recheck_enabled.assert_called_with(True)
     assert not rig.runtime._loading_model
     assert rig.runtime._model_load_failures == 1
@@ -5576,3 +5606,60 @@ def test_rig_can_change_installation_between_instances(monkeypatch: pytest.Monke
         rig = Rig(monkeypatch, session_kind=SessionKind.KDE, cowork_installed=installed)
         assert rig.runtime.command_installed is installed
         rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    "action, commands",
+    [
+        ("stop_test", ["record.start", "record.stop", "recognize"]),
+        ("cancel_test", ["record.start", "record.cancel"]),
+    ],
+)
+def test_prepared_microphone_callback_can_stop_new_recording(
+    monkeypatch: pytest.MonkeyPatch, action: str, commands: list[str]
+) -> None:
+    rig = microphone_runtime(monkeypatch)
+    updates: list[MicrophoneTestUpdate] = []
+    send = Mock(wraps=rig.runtime.orchestrator._send)
+    monkeypatch.setattr(rig.runtime.orchestrator, "_send", send)
+
+    def update(value: MicrophoneTestUpdate) -> None:
+        updates.append(value)
+        if value.state == "recording":
+            assert rig.runtime._pending_test is None
+            getattr(rig.runtime, action)()
+
+    assert rig.runtime.start_test("chosen", update)
+    microphone_model_ready(rig)
+    requests = [item.args[0] for item in send.call_args_list]
+    assert [request["type"] for request in requests] == commands
+    assert all(request["utterance_id"] == requests[0]["utterance_id"] for request in requests)
+    assert rig.runtime._pending_test is None
+    assert updates[-1].state != "idle"  # закрытие ещё не подтверждено воркером
+    rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_model_ready_preserves_reentrant_pending_test(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, raises: bool
+) -> None:
+    original_updates: list[MicrophoneTestUpdate] = []
+    new_updates: list[MicrophoneTestUpdate] = []
+    pending = ("new-device", new_updates.append)
+    rig.runtime._pending_test = ("old-device", original_updates.append)
+
+    def start(device: str, callback: Callable[[MicrophoneTestUpdate], None]) -> bool:
+        assert device == "old-device"
+        assert rig.runtime._pending_test is None
+        rig.runtime._pending_test = pending
+        if raises:
+            raise RuntimeError(MARKER)
+        return True
+
+    monkeypatch.setattr(rig.runtime.orchestrator, "start_test", start)
+    monkeypatch.setattr(rig.runtime.orchestrator, "cancel_test", Mock())
+    rig.runtime._model_ready()
+    assert rig.runtime._pending_test is pending
+    assert new_updates == []
+    expected = [MicrophoneTestUpdate("error", message=module.TEST_FAILED)] if raises else []
+    assert original_updates == expected

@@ -2079,3 +2079,15 @@ def test_active_window_hint_ignored_when_focus_stays(
     assert outcome.kind == PasteOutcomeKind.PASTED
     assert outcome.reason == ""
     x.send_combo.assert_called_once()
+
+
+@pytest.mark.parametrize("target", ["42", paste.PasteTarget("42", None)])  # type: ignore[arg-type]
+def test_invalid_window_type_is_rejected_before_clipboard_access(
+    monkeypatch: pytest.MonkeyPatch, target: object
+) -> None:
+    clipboard = Mock(side_effect=AssertionError("буфер не должен открываться"))
+    monkeypatch.setattr(paste, "_Clipboard", clipboard)
+    with pytest.raises(TypeError, match="X11 id"):
+        paste.PasteFlow().run("фраза", target, PasteMode.AUTO)  # type: ignore[arg-type]
+    clipboard.assert_not_called()
+    assert not paste._running

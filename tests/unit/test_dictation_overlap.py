@@ -218,7 +218,7 @@ def test_escape_cancels_only_newest_phrase(rig: OverlapRig, b_state: str) -> Non
     a_uid, b_uid = rig.uids
     rig.fsm.escape(rig.now)
     assert rig.sent_ids("record.cancel") == [b_uid]
-    assert not rig.recording
+    assert rig.recording == (b_state == "recording")
     rig.event_for(B, "cancelled")
     rig.result_for(A, A_TEXT)
     assert rig.texts() == [A_TEXT]
@@ -510,7 +510,7 @@ def test_indicator_loss_stops_recording_but_keeps_recorded_phrase(rig: OverlapRi
     begin_overlap(rig)
     rig.core.on_indicators_lost()
     assert rig.sent_ids("record.cancel") == [rig.uids[B]]
-    assert not rig.recording
+    assert rig.recording
     rig.event_for(B, "cancelled")
     rig.result_for(A, A_TEXT)
     assert rig.texts() == [A_TEXT]
@@ -532,7 +532,7 @@ def test_short_tap_during_recognition_cancels_only_its_recording(rig: OverlapRig
     rig.now += 0.1
     rig.fsm.release(rig.now)
     assert rig.sent_ids("record.cancel") == [b_uid]
-    assert not rig.recording
+    assert rig.recording
     rig.assert_hotkey_state(HotkeyState.PROCESSING)
     rig.event_for(B, "cancelled")
     assert rig.pill.calls[-1][0] == PillState.PROCESSING
@@ -708,8 +708,10 @@ def test_deferred_first_error_does_not_resurface_on_later_phrase(rig: OverlapRig
             "audio_ms": 100,
         }
     )
-    assert rig.pill.calls[-1][:2] == (PillState.ERROR, ERROR_MICROPHONE_CHANGED)
+    assert rig.pill.calls[-1][0] == PillState.LISTENING
+    assert rig.recording
     rig.event_for(B, "cancelled")
+    assert rig.pill.calls[-1][:2] == (PillState.ERROR, ERROR_MICROPHONE_CHANGED)
     fire_finishing_timers(rig)
     assert phase_of(rig) == DictationPhase.IDLE
     rig.now += 60
@@ -773,7 +775,7 @@ def test_second_recording_failure_returns_hotkey_to_queue(hotkey_mode: HotkeyMod
     assert len(rig.uids) == 2, OVERLAP_MISSING
     rig.event_for(B, "error", code="audio-failed")
     rig.assert_hotkey_state(HotkeyState.PROCESSING)
-    assert not rig.recording
+    assert rig.recording
     assert rig.uids[A] not in rig.sent_ids("record.cancel")
     assert rig.core.cleanup_pending
     rig.event_for(B, "cancelled")
@@ -956,13 +958,13 @@ def test_failing_ui_ports_on_single_phrase_cancel_recording(
     rig: OverlapRig, caplog: pytest.LogCaptureFixture
 ) -> None:
     """N1 (О4): пилюля и трей бросают после record.start — запись втихую не идёт:
-    фраза отменяется, индикатор записи выключен, текст исключения не в журнале."""
+    фраза отменяется, страж активен до ACK, текст исключения не в журнале."""
     caplog.set_level(logging.DEBUG)
     ports = failing_ui_ports(rig)
     rig.start()
     restore_ui_ports(rig, ports)
     assert rig.sent_ids("record.cancel") == [rig.uids[A]]
-    assert not rig.recording, "запись идёт без индикации"
+    assert rig.recording, "страж остаётся активным до ACK"
     rig.event_for(A, "cancelled")
     fire_finishing_timers(rig)
     assert rig.texts() == []
@@ -978,7 +980,7 @@ def test_icon_only_mode_with_failing_tray_cancels_recording(rig: OverlapRig) -> 
     rig.start()
     restore_ui_ports(rig, ports)
     assert rig.sent_ids("record.cancel") == [rig.uids[A]]
-    assert not rig.recording
+    assert rig.recording
 
 
 def test_failing_tray_with_visible_pill_keeps_recording(rig: OverlapRig) -> None:
@@ -1002,7 +1004,7 @@ def test_failing_ui_ports_when_second_starts_cancel_only_second(rig: OverlapRig)
     restore_ui_ports(rig, ports)
     assert len(rig.uids) == 2, OVERLAP_MISSING
     assert rig.sent_ids("record.cancel") == [rig.uids[B]]
-    assert not rig.recording, "запись B идёт без индикации"
+    assert rig.recording, "страж B остаётся активным до ACK"
     rig.event_for(B, "cancelled")
     rig.result_for(A, A_TEXT)
     assert rig.texts() == [A_TEXT]
@@ -1022,3 +1024,316 @@ def test_global_error_never_selects_an_utterance(rig: OverlapRig, timeout_first:
     assert rig.recording
     rig.assert_hotkey_state(HotkeyState.RECORDING)
     assert rig.uids[B] not in rig.sent_ids("record.cancel")
+
+
+class WorkerWireRig(OverlapRig):
+    """Real WorkerState, deterministic jobs and separately delivered capture ACKs.
+
+    Capture models the physical ownership boundary; actual AudioCapture threading
+    and close failure behavior are covered by the worker tests.
+    """
+
+    def __init__(self) -> None:
+        from concurrent.futures import Future
+        from types import SimpleNamespace
+
+        from test_worker_state import FakeCancelToken, FakeEngine, load_message
+
+        from astra_voice.worker.state import WorkerState
+
+        super().__init__()
+        self.ack_stop = False
+        self.wire: list[dict[str, Any]] = []
+        self.jobs: list[Any] = []
+        self.capture_uid: str | None = None
+        self.capture_open = False
+        self.engine = FakeEngine(text=B_TEXT)
+
+        def submit(call: Any, *args: Any) -> Future[Any]:
+            future: Future[Any] = Future()
+            self.jobs.append(lambda: future.set_result(call(*args)))
+            return future
+
+        def start(uid: str, device: str | None, **kwargs: Any) -> None:
+            assert not self.capture_open
+            self.capture_uid, self.capture_open = uid, True
+
+        def close(uid: str | None = None) -> None:
+            if self.capture_open and (uid is None or uid == self.capture_uid):
+                self.capture_open = False
+                self.wire.append({"type": "record.stopped", "utterance_id": self.capture_uid})
+
+        capture = SimpleNamespace(
+            start=start,
+            request_stop=lambda **kwargs: None,
+            stop=close,
+            wait_stopped=close,
+            close=close,
+        )
+        self.worker = WorkerState(
+            engine_factory=lambda layout: self.engine,
+            cancel_factory=FakeCancelToken,
+            audio_factory=list,
+            executor=SimpleNamespace(submit=submit),
+            on_event=self.wire.append,
+            capture=capture,
+        )
+        assert self.worker.handle(load_message())[0]["type"] == "model.loaded"
+        self.during_send = self.to_worker
+
+    def to_worker(self, message: dict[str, Any]) -> None:
+        for response in self.worker.handle(message):
+            if response["type"] == "error":
+                response = {
+                    **response,
+                    "utterance_id": message.get("utterance_id"),
+                    "request_type": message["type"],
+                }
+            self.wire.append(response)
+
+    def deliver(self, kind: str) -> dict[str, Any]:
+        matches = [i for i, event in enumerate(self.wire) if event["type"] == kind]
+        assert matches, f"worker did not deliver {kind}: {[e['type'] for e in self.wire]}"
+        index = matches[0]
+        event = self.wire.pop(index)
+        self.core.on_worker_event({**event, "generation": self.worker_generation})
+        return event
+
+    def run_job(self) -> None:
+        self.jobs.pop(0)()
+
+    def finish_b(self) -> None:
+        from array import array
+
+        uid = self.uids[-1]
+        before = len(self.worker.buffers[uid])
+        assert self.worker.on_samples(uid, array("f", [0.4] * 8000))
+        assert len(self.worker.buffers[uid]) == before + 8000
+        assert self.capture_open and self.recording
+        self.stop()
+        self.deliver("record.stopped")
+        self.run_job()
+        self.deliver("result")
+        assert self.texts()[-1] == B_TEXT
+        assert "audio.close" not in self.commands()
+        self.restart_worker.assert_not_called()
+        self.worker.close()
+
+
+@pytest.mark.parametrize("boundary", ["cold-stop", "limit", "device-change"])
+@pytest.mark.parametrize("ack", ["record.stopped", "bad-state"])
+def test_worker_late_close_after_result_never_interrupts_next_capture(
+    boundary: str,
+    ack: str,
+) -> None:
+    """MAJOR-1: real unknown cancel replies bad-state, never synthetic cancelled."""
+    from array import array
+
+    rig = WorkerWireRig()
+    rig.start()
+    if boundary == "cold-stop":
+        # No PCM and no record.started: opening was cancelled before capture began.
+        rig.stop()
+    else:
+        if boundary == "limit":
+            rig.worker.feed_audio(rig.uids[A], [0.4] * (120 * 16000))
+            rig.deliver("record.limit")
+        else:
+            rig.worker.on_samples(rig.uids[A], array("f", [0.4] * 16000))
+            rig.worker.on_device_change(rig.uids[A], "switched", "USB")
+            rig.deliver("audio.device.changed")
+    rig.run_job()
+    rig.deliver("result")
+    if boundary != "cold-stop":
+        # Real capture eventually closes after request_stop, even without a GUI cancel.
+        rig.worker._capture.stop()
+    assert any(e.get("code") == "bad-state" for e in rig.wire)
+    assert not any(e["type"] == "cancelled" for e in rig.wire)
+    if ack == "record.stopped":
+        rig.deliver("record.stopped")
+    else:
+        reply = rig.deliver("error")
+        assert reply["code"] == "bad-state" and reply["request_type"] == "record.cancel"
+    rig.now += 0.5
+    # Auto-stop can leave the physical hotkey down; release it before the next press.
+    rig.fsm.release(rig.now)
+    rig.start()
+    assert len(rig.uids) == 2
+    if ack == "record.stopped":
+        rig.deliver("error")
+    else:
+        rig.deliver("record.stopped")
+    for timer in list(rig.timers):
+        if not timer.fired and not timer.cancelled and timer.delay != PROCESSING_WATCHDOG_MS:
+            timer.fire()
+    rig.finish_b()
+
+
+@pytest.mark.parametrize("code", ["audio-silent", "audio-busy", "audio-failed"])
+def test_worker_capture_error_bad_state_allows_next_press_after_half_second(code: str) -> None:
+    rig = WorkerWireRig()
+    rig.start()
+    rig.worker.on_error(rig.uids[A], code, "capture failed")
+    rig.deliver("error")
+    reply = rig.deliver("error")
+    assert reply["code"] == "bad-state" and reply["request_type"] == "record.cancel"
+    assert not any(e["type"] == "cancelled" for e in rig.wire)
+    rig.now += 0.5
+    rig.fsm.release(rig.now)
+    rig.start()
+    assert len(rig.uids) == 2
+    rig.deliver("record.stopped")  # delayed A boundary while B physically records
+    for timer in list(rig.timers):
+        if not timer.fired and not timer.cancelled:
+            timer.fire()
+    rig.finish_b()
+
+
+@pytest.mark.parametrize("test_mode", [False, True])
+def test_cancel_guard_stays_active_until_physical_capture_ack(test_mode: bool) -> None:
+    rig = OverlapRig()
+    if test_mode:
+        rig.core.start_test("", lambda update: None)
+        rig.event_for(A, "error", code="audio-failed")
+    else:
+        rig.start()
+        rig.fsm.escape(rig.now)
+    assert rig.recording and rig.tray.state == TrayState.LISTENING
+    if not test_mode:
+        assert rig.pill.calls[-1][0] == PillState.LISTENING
+    rig.event_for(A, "record.stopped")
+    assert not rig.recording and not rig.core.cleanup_pending
+    assert "audio.close" not in rig.commands()
+
+
+def test_capture_ack_does_not_acknowledge_active_recognition_cancel() -> None:
+    rig = OverlapRig()
+    rig.ack_stop = False
+    rig.start()
+    rig.stop()
+    rig.fsm.escape(rig.now)
+    rig.event_for(A, "record.stopped")
+    assert not rig.recording
+    rig.start()
+    assert len(rig.uids) == 1
+    assert rig.core.cleanup_pending
+    rig.event_for(A, "cancelled")
+    assert not rig.core.cleanup_pending
+    rig.start()
+    assert len(rig.uids) == 2
+
+
+def test_cancel_timeout_with_failing_finish_ui_keeps_restart_armed() -> None:
+    from astra_voice.core.dictation import CANCEL_RESTART_MS
+
+    rig = OverlapRig()
+    rig.start()
+    rig.fsm.escape(rig.now)
+    ports = failing_ui_ports(rig)
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert rig.commands()[-1] == "audio.close"
+    assert rig.core.cleanup_pending and rig.recording
+    rig.timer(CANCEL_RESTART_MS).fire()
+    rig.restart_worker.assert_called_once_with()
+    assert not rig.core.cleanup_pending and not rig.recording
+    restore_ui_ports(rig, ports)
+
+
+@pytest.mark.parametrize("outcome", [PasteOutcomeKind.PASTED, PasteOutcomeKind.WINDOW_CHANGED])
+@pytest.mark.parametrize("target_kind", ["same", "other-tab", "other-window"])
+def test_pasted_first_refreshes_only_same_queued_target(
+    outcome: PasteOutcomeKind,
+    target_kind: str,
+) -> None:
+    from astra_voice.platform.paste import PasteTarget
+
+    rig = OverlapRig()
+    original = PasteTarget(42, b"initial")
+    queued = {
+        "same": original,
+        "other-tab": PasteTarget(42, b"different-tab"),
+        "other-window": PasteTarget(43, b"initial"),
+    }[target_kind]
+    updated = PasteTarget(42, b"own-insertion")
+    rig.core._refresh_paste_target = lambda target: updated
+    rig.window = original
+    rig.start()
+    rig.stop()
+    rig.window = queued
+    rig.start()
+    rig.stop()
+    rig.outcomes.append(outcome)
+    rig.result_for(A, A_TEXT)
+    rig.result_for(B, B_TEXT)
+    expected = updated if outcome == PasteOutcomeKind.PASTED and target_kind == "same" else queued
+    assert rig.pasted[1][1] == expected
+
+
+def test_own_kate_title_change_keeps_second_paste_in_window(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import hashlib
+
+    from astra_voice.platform.paste import PasteMode, PasteOutcome, PasteTarget
+
+    rig = OverlapRig()
+    title = "file.txt — Kate"
+    updated_title = "file.txt * — Kate"
+    delivered: list[str] = []
+
+    def snapshot(target: PasteTarget) -> PasteTarget:
+        return PasteTarget(target.window, hashlib.sha256(title.encode()).digest())
+
+    def checked_paste(text: str, target: Any, mode: PasteMode) -> PasteOutcome:
+        nonlocal title
+        assert isinstance(target, PasteTarget)
+        # Paste boundary checks the current title exactly as PasteFlow does.
+        if target.title_digest != snapshot(target).title_digest:
+            rig.outcomes.append(PasteOutcomeKind.WINDOW_CHANGED)
+        else:
+            delivered.append(text)
+            title = updated_title
+        return rig.paste(text, target, mode)
+
+    rig.core._paste = checked_paste
+    rig.core._refresh_paste_target = snapshot
+    rig.window = snapshot(PasteTarget(42, None))
+    begin_overlap(rig, release_b=True)
+    rig.result_for(A, A_TEXT)
+    rig.result_for(B, B_TEXT)
+    assert delivered == [A_TEXT, B_TEXT]
+    assert rig.pill.calls[-1][0] == PillState.DONE
+    assert all(state != PillState.CLIPBOARD_ONLY for state, _, _ in rig.pill.calls)
+    assert "file.txt" not in caplog.text
+    assert hashlib.sha256(updated_title.encode()).hexdigest() not in caplog.text
+
+
+@pytest.mark.parametrize("mode", [HotkeyMode.PTT, HotkeyMode.TOGGLE])
+def test_capture_notice_callback_start_preserves_new_capture_guard(
+    mode: HotkeyMode,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from test_t2_overlap_fuzz import CaptureReplay
+
+    replay = CaptureReplay(mode, monkeypatch)
+    first = replay.start()
+    assert first is not None
+    replay.event("record.started", first)
+    replay.advance(0.5)
+    replay.event("audio.device.changed", first, kind="switched", audio_ms=1000)
+    replay.stop()
+    original = replay.pill.show_state
+    second: list[str | None] = []
+
+    def show_and_start(state: PillState, **fields: Any) -> None:
+        original(state, **fields)
+        if state is PillState.ERROR and not second:
+            second.append(replay.start())
+
+    monkeypatch.setattr(replay.pill, "show_state", show_and_start)
+    replay.physical_stop(first, acknowledge=True)
+    assert len(second) == 1 and second[0] is not None
+    assert replay.worker.captures == {second[0]}
+    replay.assert_o4()
+    assert replay.rig.commands().count("record.start") == 2
+    assert "audio.close" not in replay.rig.commands()

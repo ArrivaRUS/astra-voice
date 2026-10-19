@@ -614,7 +614,8 @@ class PasteFlow:
         entered = time.monotonic()
         target = target_window if isinstance(target_window, PasteTarget) else None
         window = target.window if target is not None else target_window
-        assert window is None or isinstance(window, int)
+        if window is not None and not isinstance(window, int):
+            raise TypeError("окно вставки должно быть целочисленным X11 id или None")
         # Вернуть исход без исключений и закрыть собственное X11-соединение.
         global _running, _pending
         if _running:

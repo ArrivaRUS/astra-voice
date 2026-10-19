@@ -16,11 +16,12 @@ import sys
 from collections.abc import Iterator
 from pathlib import Path
 from queue import Queue
-from threading import Event
+from threading import Event, Thread
 from typing import Any
 
 import pytest
 
+from astra_voice.worker.audio import ERROR_FAILED, AudioCapture, AudioError
 from astra_voice.worker.ipc import decode, encode
 from astra_voice.worker.state import Message, State, WorkerState
 
@@ -91,6 +92,120 @@ def make_worker(tmp_path: Path) -> Iterator[Any]:
 
 def cmd(worker: WorkerState, kind: str, uid: str) -> list[Message]:
     return worker.handle({"type": kind, "utterance_id": uid})
+
+
+@pytest.mark.parametrize("finish", ["capture-error", "limit"])
+def test_cancel_waits_for_physical_close(make_worker: Any, finish: str) -> None:
+    """bad-state/cancelled выдаётся лишь после закрытия, вне lock автомата."""
+    worker, events = make_worker(FakeEngine())
+    closing, release, waiting, replied = Event(), Event(), Event(), Event()
+
+    class FaultSource:
+        is_open = False
+        live = False
+
+        def open(self, device: str | None) -> None:
+            self.is_open = True
+
+        def read_chunk(self) -> bytes | None:
+            if finish == "capture-error":
+                raise AudioError(ERROR_FAILED, "Ошибка чтения.")
+            return b"\x00\x20"
+
+        def close(self) -> None:
+            closing.set()
+            assert release.wait(2)
+            self.is_open = False
+
+    source = FaultSource()
+    capture = AudioCapture(
+        source=source, on_samples=worker.on_samples, on_event=events.put, on_error=worker.on_error
+    )
+    worker.set_capture(capture)
+    original_wait = capture.wait_stopped
+
+    def wait_stopped(uid: str) -> None:
+        waiting.set()
+        original_wait(uid)
+
+    capture.wait_stopped = wait_stopped  # type: ignore[method-assign]
+    replies: list[Message] = []
+
+    def cancel() -> None:
+        replies.extend(cmd(worker, "record.cancel", "a"))
+        replied.set()
+
+    cancelling = Thread(target=cancel)
+    try:
+        assert (
+            worker.handle({"type": "record.start", "utterance_id": "a", "limit_s": 1 / 16000}) == []
+        )
+        assert closing.wait(2)
+        assert [events.get(timeout=2)["type"] for _ in range(3)] == [
+            "audio.ready",
+            "record.started",
+            "error" if finish == "capture-error" else "record.limit",
+        ]
+        assert ("a" in worker.buffers) is (finish == "limit")
+        cancelling.start()
+        assert waiting.wait(2)
+        assert not replied.is_set() and source.is_open
+        # Отменяющий поток не держит lock: цикл IPC/фоновые callback не заблокированы.
+        assert worker.handle({"type": "ping"}) == [{"type": "pong"}]
+        release.set()
+        cancelling.join(2)
+        assert not cancelling.is_alive() and replied.is_set()
+        if finish == "capture-error":
+            assert replies[0]["code"] == "bad-state"
+        else:
+            assert replies == [{"type": "cancelled", "utterance_id": "a"}]
+        assert worker.buffers == {}
+        assert not source.is_open
+        assert events.get(timeout=2) == {"type": "record.stopped", "utterance_id": "a"}
+    finally:
+        release.set()
+        if cancelling.ident is not None:
+            cancelling.join(2)
+        capture.stop()
+
+
+def test_unknown_cancel_does_not_stop_another_capture(make_worker: Any) -> None:
+    """Адресное ожидание неизвестной A сохраняет работающий захват B."""
+    worker, events = make_worker(FakeEngine())
+    reading, release = Event(), Event()
+
+    class Source:
+        is_open = False
+        live = False
+
+        def open(self, device: str | None) -> None:
+            self.is_open = True
+
+        def read_chunk(self) -> bytes | None:
+            reading.set()
+            assert release.wait(2)
+            return None
+
+        def close(self) -> None:
+            self.is_open = False
+
+    source = Source()
+    capture = AudioCapture(
+        source=source, on_samples=worker.on_samples, on_event=events.put, on_error=worker.on_error
+    )
+    worker.set_capture(capture)
+    try:
+        assert cmd(worker, "record.start", "b") == []
+        assert reading.wait(2)
+        assert cmd(worker, "record.cancel", "unknown-a")[0]["code"] == "bad-state"
+        assert source.is_open and capture.active
+        worker.feed_audio("b", [0.2, 0.3])
+        assert list(worker.buffers["b"]) == pytest.approx([0.2, 0.3])
+        assert worker.state is State.recording
+    finally:
+        capture.request_stop()
+        release.set()
+        capture.stop()
 
 
 def test_second_recording_during_recognition_is_fifo(make_worker: Any) -> None:

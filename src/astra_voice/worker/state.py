@@ -755,6 +755,12 @@ class WorkerState:
 
     def _cancel(self, uid: str, deferred: list[Callable[[], None]] | None = None) -> list[Message]:
         if uid not in self.buffers and not self._has_job(uid) and uid not in self._cancelled:
+            if self._capture is not None and deferred is not None:
+                # on_error удаляет PCM до finally.close владельца захвата.
+                # bad-state подтверждает отсутствие capture этого id, поэтому
+                # ждём его адресно, не останавливая уже начавшуюся запись B.
+                capture = self._capture
+                deferred.append(lambda: capture.wait_stopped(uid))
             return [error("bad-state", "Нет такой utterance для отмены.")]
         for job in (self._active, self._pending):
             if job is not None and job.utterance_id == uid:
@@ -765,6 +771,10 @@ class WorkerState:
         if self._recording == uid:
             self._stop_capture(deferred, cancel=True)
             self._recording = None
+        elif self._capture is not None and deferred is not None:
+            # Автоостановка (лимит, смена устройства) снимает _recording до close.
+            capture = self._capture
+            deferred.append(lambda: capture.wait_stopped(uid))
         self.buffers.pop(uid, None)
         self._stopped.pop(uid, None)
         self._device_changed.discard(uid)

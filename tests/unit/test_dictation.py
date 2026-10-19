@@ -332,6 +332,9 @@ class Rig:
             {"type": kind, "generation": self.worker_generation, "utterance_id": self.uid, **fields}
         )
 
+    def job_error(self, utterance_id: str, **fields: object) -> None:
+        self.event("error", utterance_id=utterance_id, **fields)
+
     def result(self, text: str = MARKER) -> None:
         self.now += 0.25
         self.event("result", text=text)
@@ -743,7 +746,8 @@ def test_cancel_blocks_all_later_results_and_retries(rig: Rig, phase: str) -> No
     attempts = len(rig.pasted)
     rig.core.cancel("pill")
     assert rig.sent[-1][0] == {"type": "record.cancel", "utterance_id": rig.uid}
-    assert not rig.recording and rig.tray.state == TrayState.IDLE
+    assert rig.recording == (phase == "recording")
+    assert rig.tray.state == (TrayState.LISTENING if phase == "recording" else TrayState.IDLE)
     assert rig.fsm.state == HotkeyState.IDLE and rig.cancels == 1
     rig.backend.ungrab_escape.assert_called_once_with()
     assert all(t.cancelled for t in old_timers)
@@ -810,8 +814,8 @@ def test_ib8_cancel_survives_persistent_ui_failures(
     watchdog = rig.timer(CANCEL_TIMEOUT_MS)
     assert at_send == [(0, 0, [watchdog])]
     assert all(timer.cancelled for timer in old_timers)
-    assert set_recording.call_count == set_state.call_count == 1
-    assert len(caplog.records) == 2
+    assert set_recording.call_count == set_state.call_count == int(phase != "recording")
+    assert len(caplog.records) == (2 if phase != "recording" else 0)
     assert all(
         record.levelno == logging.WARNING and record.exc_info is not None
         for record in caplog.records
@@ -874,7 +878,8 @@ def test_cancel_timeout_and_synchronous_ack(rig: Rig) -> None:
     rig.start()
     rig.core.cancel("tray")
     rig.timer(CANCEL_TIMEOUT_MS).fire()
-    assert rig.pill.calls[-1][0] == PillState.CANCELLED
+    assert rig.pill.calls[-1][0] == PillState.LISTENING
+    assert rig.recording
     assert rig.core.phase == DictationPhase.FINISHING and rig.done == 1
     rig.event("cancelled")
     rig.start()
@@ -1058,6 +1063,7 @@ def test_error_mapping(rig: Rig, code: str, reason: str, kind: str | None) -> No
     rig.params["device"] = ""
     rig.start()
     rig.event("error", code=code, message=MARKER)
+    rig.event("record.stopped")
     assert rig.pill.calls[-1] == (PillState.ERROR, reason, None)
     assert rig.tray.state == TrayState.ERROR
     assert rig.stats.events == (
@@ -1070,6 +1076,7 @@ def test_audio_silent_error_names_the_reason_and_asks_for_it(rig: Rig) -> None:
     """Источник открылся, но звука не даёт: пилюля «Микрофон молчит» + причина."""
     rig.start()
     rig.event("error", code="audio-silent", message=MARKER)
+    rig.event("record.stopped")
     assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_MICROPHONE_SILENT, None)
     assert rig.tray.state == TrayState.ERROR
     assert rig.done == 1 and not rig.recording
@@ -1400,6 +1407,8 @@ def test_manual_stop_failure_after_audio_ready_releases_hotkey(rig: Rig, command
     assert rig.recording and rig.commands() == ["record.start"]
     assert rig.pill.calls[-1:] == [(PillState.LISTENING, None, None)]
     rig.stop()
+    assert rig.recording == (command == "record.stop")
+    rig.event("record.stopped")
     assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
     rig.assert_hotkey_state(HotkeyState.IDLE)
     assert not rig.recording
@@ -1656,6 +1665,7 @@ def test_missing_device_uses_selection_at_record_start(rig: Rig, device: str | N
         {"type": "mic_error", "kind": "device-lost" if device else "none", "recovered_by": "none"}
     ]
     reason = ERROR_MICROPHONE_LOST if device else ERROR_MICROPHONE_UNAVAILABLE
+    rig.event("record.stopped")
     assert rig.pill.calls[-1] == (PillState.ERROR, reason, None)
     assert rig.device_lost.call_count == int(bool(device))
     assert not rig.recording and rig.done == 1
@@ -1745,7 +1755,9 @@ def test_recording_terminal_releases_escape_and_next_combo_starts(
 
     assert rig.core.phase.value == "finishing"
     rig.assert_hotkey_state(HotkeyState.IDLE)
-    assert not rig.recording
+    assert rig.recording == (
+        terminal in ("audio-no-device", "audio-busy", "audio-failed", "timeout")
+    )
     rig.backend.ungrab_escape.assert_called_once_with()
     if terminal in ("audio-no-device", "audio-busy", "audio-failed", "timeout"):
         assert rig.commands()[-1] == "record.cancel"
@@ -1928,7 +1940,7 @@ def test_limit_recognizes_already_stopped_audio_and_releases_hotkey(
             rig.event("error", code="bad-state")
         elif message["type"] == "recognize":
             rig.now += 0.375
-            rig.event(response, text=MARKER, code="timeout")
+            rig.event(response, utterance_id=rig.uid, text=MARKER, code="timeout")
 
     rig.during_send = worker
     rig.event("record.limit")
@@ -1952,6 +1964,8 @@ def test_limit_recognizes_already_stopped_audio_and_releases_hotkey(
         assert not rig.pasted
         assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
     rig.during_send = None
+    if response == "error":
+        rig.event("cancelled")
     rig.start()
     assert rig.commands().count("record.start") == 2
 
@@ -2069,6 +2083,14 @@ def test_start_failure_releases_hotkey_and_shows_error(
     rig.start()
     assert rig.fsm.state == HotkeyState.IDLE
     rig.backend.ungrab_escape.assert_called_once_with()
+    if failure == "send":
+        rig.core.on_worker_event(
+            {
+                "type": "record.stopped",
+                "generation": rig.worker_generation,
+                "utterance_id": rig.core._utterance_id,
+            }
+        )
     assert not rig.sent and not rig.recording
     assert ("recording", True) not in rig.trace
     assert rig.pill.calls == [(PillState.ERROR, ERROR_RECOGNITION_FAILED, None)]
@@ -2076,11 +2098,12 @@ def test_start_failure_releases_hotkey_and_shows_error(
     assert MARKER not in caplog.text
     if failure == "send":
         assert (
-            caplog.records[0].getMessage() == "диктовка: отправка команды record.start не удалась"
+            caplog.records[0].getMessage()
+            == "диктовка: отправка команды record.start не удалась (BrokenPipeError)"
         )
         assert all(record.exc_info is None for record in caplog.records)
         assert "Канал воркера закрыт" not in caplog.text
-        assert rig.core.cleanup_pending
+        assert not rig.core.cleanup_pending
         rig.core.on_worker_event(
             {"type": "cancelled", "generation": 1, "utterance_id": rig.core._utterance_id}
         )
@@ -2238,7 +2261,8 @@ def test_cancel_escalates_close_then_restart(rig: Rig) -> None:
     assert "audio.close" not in rig.commands()
     rig.timer(CANCEL_TIMEOUT_MS).fire()
     assert rig.sent[-1][0] == {"type": "audio.close"}
-    assert rig.pill.calls[-1][0] == PillState.CANCELLED
+    assert rig.pill.calls[-1][0] == PillState.LISTENING
+    assert rig.recording
     rig.restart_worker.assert_not_called()
     rig.timer(CANCEL_RESTART_MS).fire()
     rig.restart_worker.assert_called_once_with()
@@ -2487,6 +2511,7 @@ def test_microphone_error_is_plain_and_private(
     assert MARKER not in caplog.text
     assert not rig.pasted
     assert not rig.stats.events
+    rig.event("record.stopped")
     assert not rig.pill.calls
     rig.device_lost.assert_not_called()
     assert not rig.recording
@@ -2512,6 +2537,7 @@ def test_microphone_failures_release_recording_without_logging_exception(
         rig.timer(PROCESSING_WATCHDOG_MS).fire()
     assert str(updates[-1].state) == "error"
     assert rig.commands()[-1] == "record.cancel"
+    rig.event("record.stopped")
     assert not rig.recording
     microphone_event(rig, "cancelled")
     assert not rig.pasted
@@ -2596,7 +2622,7 @@ def test_finish_microphone_test_survives_persistent_ui_failures(
 
     assert not rig.core.test_active
     assert callback.call_count == 1
-    assert len(caplog.records) == (4 if terminal == "timeout" else 3)
+    assert len(caplog.records) == 3
     assert all(record.exc_info is not None for record in caplog.records)
     assert MARKER not in caplog.text
 
@@ -3388,11 +3414,12 @@ def test_microphone_test_ends_with_device_change_message(rig: Rig, kind: str) ->
     ipc_device_event(rig, kind)
     assert updates[-1] == MicrophoneTestUpdate("error", message=DEVICE_MESSAGE[kind])
     assert rig.commands() == ["record.start", "record.cancel"]
-    assert not rig.core.test_active and not rig.recording
+    assert not rig.core.test_active
+    assert rig.recording
     assert rig.core.phase == DictationPhase.IDLE
-    # До подтверждения отмены новая проверка не стартует; после — стартует.
     assert not rig.core.start_test("", updates.append)
-    microphone_event(rig, "cancelled")
+    rig.event("record.stopped")
+    assert not rig.recording
     assert rig.core.start_test("", updates.append)
     assert rig.commands()[-1] == "record.start"
     assert_device_change_private(rig)
@@ -3512,7 +3539,11 @@ def test_capture_cleanup_ack_cancels_restart(rig: Rig, ack: str) -> None:
     else:
         rig.event(ack)
     assert not rig.core.cleanup_pending
-    assert all(t.cancelled or t.fired for t in rig.timers)
+    assert all(
+        t.cancelled or t.fired
+        for t in rig.timers
+        if t.delay in (CANCEL_TIMEOUT_MS, CANCEL_RESTART_MS)
+    )
     rig.restart_worker.assert_not_called()
 
 

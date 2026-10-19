@@ -1427,6 +1427,140 @@ class ControlledSource:
         self.device_name = None
 
 
+@pytest.mark.parametrize("phase", ["open", "read"])
+def test_capture_fault_confirms_stopped_only_after_close(
+    phase: str, monkeypatch: pytest.MonkeyPatch, wait_capture: Callable[[], None]
+) -> None:
+    """Ошибка до/после started не подтверждает закрытие до возврата close."""
+    monkeypatch.setattr(audio, "OPEN_FIRST_RETRIES", 0)
+    closing, release = threading.Event(), threading.Event()
+
+    class FaultSource(ControlledSource):
+        def open(self, device: str | None) -> None:
+            super().open(device)
+            if phase == "open":
+                raise AudioError(ERROR_FAILED, "Ошибка открытия.")
+
+        def read_chunk(self) -> bytes | None:
+            raise AudioError(ERROR_FAILED, "Ошибка чтения.")
+
+        def close(self) -> None:
+            closing.set()
+            assert release.wait(TIMEOUT)
+            super().close()
+
+    source = FaultSource()
+    probe = CaptureProbe(source)
+    try:
+        probe.capture.start("fault", None, limit_s=30)
+        assert closing.wait(TIMEOUT)
+        assert probe.errors.get_nowait()[:2] == ("fault", ERROR_FAILED)
+        expected = [{"type": "record.started", "utterance_id": "fault"}] if phase == "read" else []
+        assert [event for _, event in list(probe.boundaries.queue)] == expected
+        assert source.is_open
+        release.set()
+        wait_capture()
+        expected.append({"type": "record.stopped", "utterance_id": "fault"})
+        assert [event for _, event in list(probe.boundaries.queue)] == expected
+        assert not source.is_open
+        assert probe.capture._owners == {}
+    finally:
+        release.set()
+        probe.capture.stop()
+
+
+def test_failed_close_never_confirms_capture_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Умерший на close поток не позволяет ответить ложным ACK на отмену."""
+    monkeypatch.setattr(audio, "OPEN_FIRST_RETRIES", 0)
+    source = Mock(spec=AudioSource)
+    source.is_open = False
+    source.open.side_effect = AudioError(ERROR_FAILED, "Ошибка открытия.")
+    source.close.side_effect = RuntimeError("Ошибка закрытия.")
+    events = Mock()
+    capture = AudioCapture(source=source, on_samples=Mock(), on_event=events, on_error=Mock())
+    running = threading.Event()
+    running.set()
+    with pytest.raises(RuntimeError, match="Ошибка закрытия"):
+        capture._run("fault", None, running, None, time.monotonic() + 30)
+    events.assert_not_called()
+    with pytest.raises(CaptureStopTimeout):
+        capture.wait_stopped("fault")
+    with pytest.raises(CaptureStopTimeout):
+        capture.check_stop_watchdog()
+
+
+def test_wait_stopped_uses_capture_watchdog(
+    monkeypatch: pytest.MonkeyPatch, wait_capture: Callable[[], None]
+) -> None:
+    """Адресное ожидание зависшего close эскалирует, не подтверждая остановку."""
+    monkeypatch.setattr(audio, "STOP_WATCHDOG_S", 0)
+    closing, release = threading.Event(), threading.Event()
+
+    class ClosingSource(ControlledSource):
+        def close(self) -> None:
+            closing.set()
+            assert release.wait(TIMEOUT)
+            super().close()
+
+    source = ClosingSource()
+    source.ended = True
+    source.chunks.put(None)
+    probe = CaptureProbe(source)
+    try:
+        probe.capture.start("closing", None, limit_s=30)
+        assert closing.wait(TIMEOUT)
+        with pytest.raises(CaptureStopTimeout):
+            probe.capture.wait_stopped("closing")
+        assert [event["type"] for _, event in list(probe.boundaries.queue)] == ["record.started"]
+        release.set()
+        wait_capture()
+        probe.capture.wait_stopped("closing")
+    finally:
+        release.set()
+        wait_capture()
+        probe.capture.stop()
+
+
+def test_cold_stop_precedes_next_capture_started(
+    wait_capture: Callable[[], None],
+) -> None:
+    """A закрывается без started; B открывается строго после stopped(A)."""
+    opening, release = threading.Event(), threading.Event()
+
+    class ColdSource(ControlledSource):
+        def open(self, device: str | None) -> None:
+            super().open(device)
+            if self.open_calls == 1:
+                opening.set()
+                assert release.wait(TIMEOUT)
+
+    source = ColdSource()
+    probe = CaptureProbe(source)
+    source.keep_reading = lambda: probe.capture.active
+    try:
+        probe.capture.start("a", None, limit_s=30)
+        assert opening.wait(TIMEOUT)
+        probe.capture.request_stop()
+        probe.capture.start("b", None, limit_s=30)
+        assert probe.boundaries.empty()
+        release.set()
+        assert source.reading.wait(TIMEOUT)
+        assert [probe.boundaries.get(timeout=TIMEOUT)[1] for _ in range(2)] == [
+            {"type": "record.stopped", "utterance_id": "a"},
+            {"type": "record.started", "utterance_id": "b"},
+        ]
+        probe.capture.wait_stopped("a")
+        assert probe.capture.active and source.is_open
+        probe.capture.request_stop()
+        wait_capture()
+        assert probe.boundaries.get_nowait()[1] == {"type": "record.stopped", "utterance_id": "b"}
+        assert source.open_calls == source.close_calls == 2
+        assert probe.capture._owners == {}
+    finally:
+        release.set()
+        probe.capture.stop()
+
+
 class BufferedSource(ControlledSource):
     """Имитирует серверный буфер: открытый микрофон копит звук во время паузы."""
 
@@ -3298,7 +3432,9 @@ def test_capture_cancel_before_open_finishes_while_context_lock_is_held(
             assert not pulse.calls, "отменённый до открытия захват не меняет нативные ресурсы"
             assert not source.is_open and not pulse.server_recording
             capture.stop()
-            events.assert_not_called()
+            events.assert_called_once_with(
+                {"type": "record.stopped", "utterance_id": "cancel-before-open"}
+            )
             errors.assert_not_called()
             samples.assert_not_called()
     finally:

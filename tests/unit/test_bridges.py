@@ -3940,7 +3940,7 @@ def test_microphone_command_failure_logs_warning_without_exception(
     assert not rig.core.test_active
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert [record.getMessage() for record in warnings] == [
-        f"диктовка: отправка команды {command} не удалась"
+        f"диктовка: отправка команды {command} не удалась (RuntimeError)"
     ]
     assert all(record.exc_info is None for record in caplog.records)
     assert private not in caplog.text

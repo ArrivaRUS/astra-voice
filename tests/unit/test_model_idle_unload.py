@@ -878,6 +878,10 @@ def test_autostart_failure_keeps_its_error_pill(monkeypatch: pytest.MonkeyPatch)
     rig.event(type="model.loaded")
     rig.pill.reset_mock()
     rig.event(type="result", utterance_id="file", text="проверка")
+    assert rig.runtime.orchestrator.cleanup_pending
+    rig.pill.hide.assert_not_called()
+    # Ошибка отправки не подтверждает, что воркер уже освободил захват.
+    rig.event(type="record.stopped", utterance_id=rig.runtime.orchestrator._utterance_id)
     assert rig.pill.mock_calls[-1] == call.show_state(
         PillState.ERROR, text=ERROR_RECOGNITION_FAILED
     )

@@ -267,6 +267,8 @@ class DictationRuntime(QObject):
         self._announced_mic_problems: set[MicrophoneProblem] = set()
         self._started = False
         self._closed = False
+        self._terminated_generation: int | None = None
+        self._terminating_worker = False
         self.recording_cues = cues_factory(
             enabled=settings.sound_cues_enabled, admission=self._cue_admission
         )
@@ -355,6 +357,7 @@ class DictationRuntime(QObject):
                 tray=self.tray,
                 paste=self.paste_func,
                 active_window=lambda: snapshot_target(self.x11, self.x11.target_window()),
+                refresh_paste_target=lambda target: snapshot_target(self.x11, target.window),
                 schedule=self.schedule,
                 cancel_timer=self.cancel_timer,
                 hotkey_done=self._input_done,
@@ -1626,6 +1629,8 @@ class DictationRuntime(QObject):
 
     def _send(self, message: dict[str, Any], *, timeout: float | None = None) -> None:
         """Адаптирует возвращаемое значение супервизора к порту команд."""
+        if self._terminated_generation == self.supervisor.generation:
+            raise RuntimeError(ipc.PROTOCOL_MISMATCH_MESSAGE)
         self.supervisor.send(message, timeout=timeout)
 
     def _dictation_succeeded(
@@ -1668,6 +1673,8 @@ class DictationRuntime(QObject):
 
     def start_test(self, device: str, callback: TestCallback) -> bool:
         """Запускает частную проверку; новую модель мастера сначала загружает."""
+        if self._terminating_worker:
+            return False
         if (
             self._pending_test is not None
             or self._input_owner is not None
@@ -1760,6 +1767,7 @@ class DictationRuntime(QObject):
         """Меняет выбранную модель после завершения текущей диктовки."""
         if (
             self._closed
+            or self._terminating_worker
             or self._appimage_removal_reserved
             or self._pending_switch is not None
             or self._switch_active()
@@ -1923,6 +1931,8 @@ class DictationRuntime(QObject):
 
     def _on_candidate_event(self, source: WorkerSupervisor | None, event: dict[str, Any]) -> None:
         """Не пропускает события кандидата в текущую диктовку."""
+        if self._terminating_worker:
+            return
         if self._closed:
             return
         if source is self.supervisor:
@@ -2032,8 +2042,9 @@ class DictationRuntime(QObject):
         retry_selfcheck сохраняет бюджет автоматической повторной попытки.
         _park — выгрузка по простою: новый воркер не грузит модель до нажатия.
         """
-        if self._closed or self._appimage_removal_reserved:
+        if self._closed or self._appimage_removal_reserved or self._terminating_worker:
             return
+        self._terminated_generation = None
         self._model_parked = _park
         if _park:
             self._cancel_idle_unload()
@@ -2077,7 +2088,10 @@ class DictationRuntime(QObject):
         wake — загрузку начал жест пользователя при выгруженной модели (US-2.6):
         отсутствие модели в настройках тогда показывается пилюлей, а не молча.
         """
-        if self._appimage_removal_reserved:
+        if (
+            self._appimage_removal_reserved
+            or self._terminated_generation == self.supervisor.generation
+        ):
             return
         if self._model_parked:
             # Модель выгружена по простою: воркер ждёт нажатия, а не грузит её сразу.
@@ -2186,6 +2200,8 @@ class DictationRuntime(QObject):
 
     def _model_ready(self) -> None:
         """Объявляет готовность только после успешной проверки."""
+        if self._terminated_generation == self.supervisor.generation:
+            return
         self.tray.set_model_recheck_enabled(False)
         self._loading_model = False
         self._model_load_failures = 0
@@ -2197,6 +2213,7 @@ class DictationRuntime(QObject):
             and self.orchestrator.phase == DictationPhase.IDLE
             and self.settings.hotkey_mode == HotkeyMode.PTT.value
             and self.hotkey.physical_key_down is True
+            and self.hotkey.fsm.state == HotkeyState.RECORDING
         )
         if autostart:
             # Нажатие разбудило модель, выгруженную по простою, и запись ещё не
@@ -2221,22 +2238,26 @@ class DictationRuntime(QObject):
         else:
             log.info("модель загружена")
         self._cancel_preparing_timer()
-        pending = self._pending_test
+        pending, self._pending_test = self._pending_test, None
         if pending is not None:
             try:
                 self.orchestrator.start_test(*pending)
             except Exception as exc:
                 log.warning("Не удалось начать проверку микрофона: %s", type(exc).__name__)
                 # Ошибка завершает эпоху bridge до служебного idle от отмены.
-                self._fail_pending_test(message=TEST_FAILED)
+                try:
+                    pending[1](MicrophoneTestUpdate("error", message=TEST_FAILED))
+                except Exception as callback_exc:
+                    log.warning(
+                        "Не удалось обновить экран проверки микрофона: %s",
+                        type(callback_exc).__name__,
+                    )
                 try:
                     self.orchestrator.cancel_test()
                 except Exception as cancel_exc:
                     log.warning(
                         "Не удалось отменить проверку микрофона: %s", type(cancel_exc).__name__
                     )
-            else:
-                self._pending_test = None
         self._note_activity()
 
     def _start_selfcheck(self, event: dict[str, Any]) -> None:
@@ -2344,8 +2365,52 @@ class DictationRuntime(QObject):
             else:
                 notify.notify_selfcheck_failed()
 
+    def _worker_protocol_mismatch(self) -> None:
+        """Терминальная граница поколения; ни очистка, ни простой не будят воркер."""
+        self._terminated_generation = self.supervisor.generation
+        self._terminating_worker = True
+        try:
+            self._loading_model = False
+            self._selfcheck = "idle"
+            self._wake_generation = None
+            self._wake_dictation = False
+            self._wake_window = None
+            self._cancel_idle_unload()
+            self._cancel_selfcheck_timer()
+            self._cancel_preparing_timer()
+            pending_switch = self._pending_switch is not None
+            self._pending_switch = None
+            self._cancel_pending_switch_timer()
+            timer, self._switch_timer = self._switch_timer, None
+            if timer is not None:
+                self.cancel_timer(timer)
+            self.orchestrator.worker_terminated(
+                self.supervisor.generation, message=ipc.PROTOCOL_MISMATCH_MESSAGE
+            )
+            self._cleanup("смена модели", lambda: self._finish_switch("failed"))
+            if pending_switch and self.on_switch_finished is not None:
+                self._cleanup("ожидание смены модели", partial(self.on_switch_finished, "failed"))
+            self._fail_pending_test(message=ipc.PROTOCOL_MISMATCH_MESSAGE)
+            if self._command_publication_allowed():
+                self.pill.show_state(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
+            self.tray.set_state(TrayState.ERROR)
+        finally:
+            self._terminating_worker = False
+
     def _on_worker_event(self, event: dict[str, Any]) -> None:
         """Обрабатывает загрузку модели и передаёт исходное событие оркестратору."""
+        # Супервизор уже остановил процесс до первого (в том числе адресного)
+        # mismatch. Обычная обработка ошибок запросов не должна взводить cleanup.
+        if event.get("type") == "error" and event.get("code") == ipc.PROTOCOL_MISMATCH:
+            if (
+                not self._closed
+                and event.get("generation") == self.supervisor.generation
+                and self._terminated_generation != self.supervisor.generation
+            ):
+                self._worker_protocol_mismatch()
+            return
+        if self._terminated_generation == self.supervisor.generation:
+            return
         if not self._closed:
             self._note_activity()
         if self._input_owner == "mouse" and not self._mouse_allowed():
@@ -2383,19 +2448,6 @@ class DictationRuntime(QObject):
             )
         ):
             self.measurements.measure_failed()
-        if (
-            not self._closed
-            and event.get("generation") == self.supervisor.generation
-            and event.get("type") == "error"
-            and event.get("code") == ipc.PROTOCOL_MISMATCH
-            and "utterance_id" not in event
-        ):
-            self._loading_model = False
-            self._fail_pending_test()
-            if self._command_publication_allowed():
-                self.pill.show_state(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
-            self.tray.set_state(TrayState.ERROR)
-            return
         if (
             not self._closed
             and event.get("generation") == self.supervisor.generation
@@ -2495,6 +2547,10 @@ class DictationRuntime(QObject):
 
     def _on_hotkey_state(self, state: HotkeyState, reason: str) -> None:
         """Откладывает диктовку, пока воркер загружает модель."""
+        if self._terminated_generation == self.supervisor.generation:
+            if state != HotkeyState.IDLE:
+                self.hotkey.fsm.escape(monotonic())
+            return
         if not self._closed:
             self._note_activity()
         if reason.startswith(MAPPING_REGRAB_PREFIX):
@@ -2714,7 +2770,13 @@ class DictationRuntime(QObject):
         """Ставит проверку на момент, когда с последней активности пройдёт срок простоя."""
         self._cancel_idle_unload()
         limit = self._idle_unload_s()
-        if limit is None or self._closed or not self._started or self._model_parked:
+        if (
+            limit is None
+            or self._closed
+            or not self._started
+            or self._model_parked
+            or self._terminated_generation == self.supervisor.generation
+        ):
             return
         remaining = limit - (monotonic() - self._last_activity)
         self._idle_unload_timer = self.schedule(
@@ -2730,7 +2792,12 @@ class DictationRuntime(QObject):
         # schedule уже удалил сработавший таймер из набора и сам освободит его.
         self._idle_unload_timer = None
         limit = self._idle_unload_s()
-        if limit is None or self._model_parked or self._selfcheck != "ok":
+        if (
+            limit is None
+            or self._model_parked
+            or self._selfcheck != "ok"
+            or self._terminated_generation == self.supervisor.generation
+        ):
             # Выгружать нечего; готовность модели взведёт проверку заново.
             return
         try:
@@ -2766,6 +2833,8 @@ class DictationRuntime(QObject):
         """
         if (
             not self._model_parked
+            or self._terminating_worker
+            or (not gesture and self._terminated_generation == self.supervisor.generation)
             or self._closed
             or self._appimage_removal_reserved
             or self._switch_active()
@@ -2910,6 +2979,14 @@ class DictationRuntime(QObject):
                 self._hotkey_lost_announced = False
                 self._schedule_lost_notice()
             return
+        fsm = self.hotkey.fsm
+        if (
+            self.hotkey.mapping_release_lost is True
+            and self.orchestrator.mode == "text"
+            and fsm.mode == HotkeyMode.PTT
+            and fsm.state == HotkeyState.RECORDING
+        ):
+            fsm.stop(now, "mapping-lost")
         if self._regrab_timer is None:
             return
         announced = self._hotkey_lost_announced
@@ -3087,6 +3164,8 @@ class DictationRuntime(QObject):
         return timer
 
     def _run_pending_switch(self) -> None:
+        if self._terminated_generation == self.supervisor.generation:
+            return
         # Хвост предыдущей диктовки может завершиться во время нового нажатия.
         # Его IDLE не завершает PENDING: owner и Escape принадлежат новому жесту.
         pending_mouse = (

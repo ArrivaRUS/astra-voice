@@ -227,3 +227,19 @@ def test_escape_while_waking_leaves_model_loading_without_autostart(
     wake.loaded()
     wake.ready()
     assert_load_only(wake)
+
+
+@pytest.mark.parametrize("state", [HotkeyState.IDLE, HotkeyState.PROCESSING])
+def test_ready_does_not_restart_abandoned_fsm_while_physical_key_is_down(
+    monkeypatch: pytest.MonkeyPatch, state: HotkeyState
+) -> None:
+    wake = unloaded(monkeypatch)
+    wake.key("KeyPress")
+    assert wake.hotkey.physical_key_down
+    assert wake.rig.runtime._wake_dictation
+    # Независимый сброс автомата не доказывает физическое отпускание клавиши.
+    # Даже если ожидание пробуждения осталось, готовность не возобновляет запись.
+    wake.hotkey.fsm.state = state
+    wake.loaded()
+    wake.ready()
+    assert_load_only(wake)
