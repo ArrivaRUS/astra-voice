@@ -8,6 +8,12 @@ from unittest.mock import Mock
 
 import pytest
 
+# astra_voice.net.http импортирует requests, а в окружении движка (job engine)
+# его нет: без пропуска падает сбор всего прогона. В unit-окружении requests
+# обязателен — это проверяет scripts/ci_require_imports.py.
+pytest.importorskip("requests")
+
+# ruff: noqa: E402 — импорт проверяемых модулей после importorskip.
 from astra_voice.core.policy import Policy
 from astra_voice.core.settings import Settings
 from astra_voice.net.gate import NetworkGate

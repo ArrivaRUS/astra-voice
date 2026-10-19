@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import cast
 from unittest.mock import Mock, call
 
 import pytest
@@ -455,7 +456,9 @@ def test_kill_closes_ipc_and_all_processes_after_qt_stop_failure(qt_resource: st
 
     supervisor.kill()
 
-    assert supervisor.state == "stopped"
+    # mypy сузил state до "running" присваиванием выше и не сбрасывает сужение
+    # после вызова метода; str() снимает сужение, проверка остаётся точной.
+    assert str(supervisor.state) == "stopped"
     assert supervisor._socket is None
     connection.close.assert_called_once_with()
     process.kill.assert_called_once_with()
@@ -496,7 +499,8 @@ def test_stop_failure_preserves_retired_processes_for_emergency_kill(failed_oper
     processes = [Mock(spec=subprocess.Popen) for _ in range(3)]
     for process in processes:
         process.poll.return_value = None
-    supervisor._retired = processes[:2]
+    # Mock(spec=Popen) — дублёр процесса; для mypy приводим список к типу поля.
+    supervisor._retired = cast(list[subprocess.Popen[bytes]], processes[:2])
     supervisor.process = processes[2]
     getattr(processes[0], failed_operation).side_effect = OSError("Ошибка остановки")
 
@@ -1065,7 +1069,8 @@ def test_kill_wait_failure_does_not_skip_remaining_processes(wait_error: Excepti
     for process in processes:
         process.poll.return_value = None
     processes[0].wait.side_effect = wait_error
-    supervisor._retired = processes[:2]
+    # Mock(spec=Popen) — дублёр процесса; для mypy приводим список к типу поля.
+    supervisor._retired = cast(list[subprocess.Popen[bytes]], processes[:2])
     supervisor.process = processes[2]
 
     supervisor.kill()

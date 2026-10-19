@@ -1795,8 +1795,9 @@ def test_t237_older_verified_snapshot_preserves_positive_cache(
                 catalog_effective._snapshot_key(raw, signature(raw)), verified
             )
         else:
-            verified, unknown = catalog_effective._pending_snapshot(None)
-            assert verified is not None and not unknown
+            pending, unknown = catalog_effective._pending_snapshot(None)
+            assert pending is not None and not unknown
+            verified = pending
         assert (verified.trust_epoch, verified.serial) == incoming_pair
         assert not verified.is_revoked(entry.id, entry.revision)
         assert catalog_effective._snapshot_cache is positive
@@ -1957,7 +1958,8 @@ def test_t281_known_revocation_survives_schema_eio_and_publication_failures(
     scenario.snapshot(scenario.document)
     prepare_revoking_refresh(scenario, source, monkeypatch)
     marker_before = scenario.state.read_bytes()
-    real_read = catalog_effective.read_private
+    # catalog_effective импортирует read_private из update_cache: это тот же объект.
+    real_read = update_cache.read_private
     real_write = update_cache.write_private
     schema_failed = False
     publication_writes = 0
@@ -2028,8 +2030,10 @@ def test_t281_schema_key_failure_precedes_all_publication_writes(
     snapshot_path = scenario.snapshots / catalog_effective.SNAPSHOT_FILE_NAME
     snapshot_before = snapshot_path.read_bytes()
     marker_before = scenario.state.read_bytes()
-    verify = catalog_updates.verify_catalog
-    read = catalog_effective.read_private
+    # Оригиналы до подмены: catalog_updates берёт verify_catalog из catalog_effective,
+    # а catalog_effective — read_private из update_cache.
+    verify = catalog_effective.verify_catalog
+    read = update_cache.read_private
     verified = False
     key_reads = 0
 

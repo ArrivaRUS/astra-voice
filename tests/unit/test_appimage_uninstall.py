@@ -146,7 +146,8 @@ def test_failed_switch_forgotten_worker_still_protects_code(
         monkeypatch.setattr(
             candidate, "stop", Mock(side_effect=subprocess.TimeoutExpired("test worker", 2))
         )
-        monkeypatch.setattr(candidate, "kill", Mock(side_effect=RuntimeError("test kill failed")))
+        kill = Mock(side_effect=RuntimeError("test kill failed"))
+        monkeypatch.setattr(candidate, "kill", kill)
         state = SimpleNamespace(
             _switch_in_progress=True,
             _switch_timer=None,
@@ -159,7 +160,7 @@ def test_failed_switch_forgotten_worker_still_protects_code(
         # Настоящий путь неудачного switch забывает candidate после проглоченных
         # ошибок stop и kill. Поля runtime уже не позволяют найти живого ребёнка.
         DictationRuntime._finish_switch(cast(DictationRuntime, state), "failed")
-        candidate.kill.assert_called_once_with()
+        kill.assert_called_once_with()
         assert state._switch_candidate is None
         processes, threads = app._copy_shutdown_resources(state, None, None)
         assert child not in processes
