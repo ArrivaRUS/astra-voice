@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from unittest.mock import Mock, call
 
@@ -10,11 +11,12 @@ from PyQt5 import sip
 from PyQt5.QtCore import QCoreApplication, QEvent, QPoint, Qt
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QAction, QApplication
-from test_tray_model_sync_independent import Rig
+from test_tray_model_sync_independent import ManagedPort, Rig
 from test_tray_model_sync_independent import qapp as qapp
 from test_tray_model_sync_independent import rig as rig
 
 from astra_voice.models.store import StoreError
+from astra_voice.ui.model_downloads import ModelDownloads
 from helpers.scripted_model_port import FIRST, SECOND, pump_until
 
 pytestmark = pytest.mark.unit
@@ -50,8 +52,8 @@ def test_unchanged_availability_skips_checks_after_priming(
     rig.port.install_both()
     rig.port.records[(SECOND.id, SECOND.revision)] = "broken"
     rig.downloads.modelsChanged.emit()
-    checks = Mock(wraps=rig.downloads.can_make_current)
-    monkeypatch.setattr(rig.downloads, "can_make_current", checks)
+    checks = Mock(wraps=rig.downloads.can_make_current_or_unknown)
+    monkeypatch.setattr(rig.downloads, "can_make_current_or_unknown", checks)
     for tick in range(50):
         if progress_ticks:
             rig.downloads._card_progress[SECOND.id] = tick / 50
@@ -68,8 +70,8 @@ def test_availability_change_checks_each_installed_model_once(
     if field == "uninstalled-state":
         rig.port.records.pop((SECOND.id, SECOND.revision))
     rig.downloads.modelsChanged.emit()
-    checks = Mock(wraps=rig.downloads.can_make_current)
-    monkeypatch.setattr(rig.downloads, "can_make_current", checks)
+    checks = Mock(wraps=rig.downloads.can_make_current_or_unknown)
+    monkeypatch.setattr(rig.downloads, "can_make_current_or_unknown", checks)
     if field == "badge":
         rig.port.current = (SECOND.id, SECOND.revision)
     elif field in {"state", "uninstalled-state"}:
@@ -89,22 +91,398 @@ def test_name_change_updates_menu_without_rechecking_availability(
 ) -> None:
     rig.port.install_both()
     rig.downloads.modelsChanged.emit()
-    checks = Mock(wraps=rig.downloads.can_make_current)
-    monkeypatch.setattr(rig.downloads, "can_make_current", checks)
+    checks = Mock(wraps=rig.downloads.can_make_current_or_unknown)
+    monkeypatch.setattr(rig.downloads, "can_make_current_or_unknown", checks)
     rig.downloads._entries = (rig.port.catalog[0], replace(rig.port.catalog[1], name="Новое имя"))
     rig.downloads.modelsChanged.emit()
     checks.assert_not_called()
     assert rig.choices()[1].text() == "Новое имя"
 
 
-@pytest.mark.parametrize("error", [OSError("unavailable"), StoreError("unavailable")])
-def test_public_availability_check_refuses_storage_errors(
-    rig: Rig, monkeypatch: pytest.MonkeyPatch, error: Exception
+@pytest.mark.parametrize("error_type", [OSError, StoreError])
+def test_memory_read_error_keeps_cards_fresh_and_tray_updates(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
 ) -> None:
     rig.port.install_both()
-    monkeypatch.setattr(rig.port, "record_state", Mock(side_effect=error))
+    rig.downloads.modelsChanged.emit()
+    monkeypatch.setattr(rig.port, "mem_total_mb", Mock(side_effect=error_type("unavailable")))
+    rig.downloads._entries = (rig.port.catalog[0], replace(rig.port.catalog[1], name="Новое имя"))
+
+    rows = rig.bridge.models
+    assert [row["id"] for row in rows] == [FIRST.id, SECOND.id]
+    assert rows[1]["name"] == "Новое имя"
+    assert [(row["state"], row["badge"]) for row in rows] == [
+        ("installed", "active"),
+        ("installed", "installed"),
+    ]
+    assert all(
+        (row["hint"], row["hintKind"], row["memoryShortage"]) == ("", "", False) for row in rows
+    )
+    assert rig.downloads.models_read_failed is False
+
+    rig.downloads.modelsChanged.emit()
+    assert [action.data() for action in rig.choices()] == [FIRST.id, SECOND.id]
+    assert rig.choices()[1].text() == "Новое имя"
+    assert rig.checked_ids() == [FIRST.id]
+    assert rig.downloads.models_read_failed is False
+
+
+@pytest.mark.parametrize("error", [OSError("unavailable"), StoreError("unavailable")])
+@pytest.mark.parametrize("failed_read", ["record_state", "installed_ids"])
+def test_public_availability_check_refuses_storage_errors(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, error: Exception, failed_read: str
+) -> None:
+    rig.port.install_both()
+    monkeypatch.setattr(rig.port, failed_read, Mock(side_effect=error))
     assert not rig.downloads.can_make_current(SECOND.id)
     assert not rig.bridge.can_select_model(SECOND.id)
+    assert rig.downloads.can_make_current_or_unknown(SECOND.id) is None
+    assert rig.bridge.can_select_model_or_unknown(SECOND.id) is None
+
+
+@pytest.mark.parametrize("error_type", [OSError, StoreError])
+@pytest.mark.parametrize("failed_read", ["record_state", "installed_ids"])
+def test_first_models_read_keeps_cards_when_one_store_read_fails(
+    qapp: QApplication,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_type: type[Exception],
+    failed_read: str,
+) -> None:
+    port = ManagedPort()
+    port.install_both()
+    downloads = ModelDownloads(port)
+    record_state = port.record_state
+
+    def unavailable(model_id: str, revision: str) -> str:
+        if model_id == SECOND.id:
+            raise error_type("private/path model-id")
+        return record_state(model_id, revision)
+
+    caplog.set_level(logging.WARNING)
+    try:
+        # A fresh queue has never exposed models; no snapshot is primed or cleared.
+        with monkeypatch.context() as failing:
+            failing.setattr(
+                port,
+                failed_read,
+                unavailable
+                if failed_read == "record_state"
+                else Mock(side_effect=error_type("private/path model-id")),
+            )
+            for _ in range(3):
+                rows = downloads.models
+                assert [row["id"] for row in rows] == [FIRST.id, SECOND.id]
+                assert downloads.models_read_failed
+                if failed_read == "record_state":
+                    assert (rows[0]["state"], rows[0]["badge"]) == ("installed", "active")
+                    assert (rows[1]["state"], rows[1]["badge"]) == ("installed", "")
+                else:
+                    assert [(row["state"], row["badge"]) for row in rows] == [
+                        ("available", ""),
+                        ("available", ""),
+                    ]
+            assert len(caplog.records) == 1
+            assert caplog.records[0].exc_info is None
+            assert "private" not in caplog.text and "model-id" not in caplog.text
+
+        rows = downloads.models
+        assert not downloads.models_read_failed
+        assert [row["id"] for row in rows] == [FIRST.id, SECOND.id]
+        assert [(row["state"], row["badge"]) for row in rows] == [
+            ("installed", "active"),
+            ("installed", "installed"),
+        ]
+    finally:
+        downloads.shutdown()
+        downloads.deleteLater()
+
+
+@pytest.mark.parametrize("error", [OSError("unavailable"), StoreError("unavailable")])
+@pytest.mark.parametrize("previously_enabled", [False, True])
+def test_storage_error_keeps_previous_availability_and_retries_unchanged_rows(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, error: Exception, previously_enabled: bool
+) -> None:
+    rig.port.install_both()
+    rig.port.records[(SECOND.id, SECOND.revision)] = "ok" if previously_enabled else "broken"
+    rig.downloads.modelsChanged.emit()
+    actions = rig.choices()
+    assert actions[1].isEnabled() == previously_enabled
+
+    # Строки карточек не меняются между неудачной и успешной проверками.
+    # Ошибка возникает в проверке доступности, после чтения списка карточек.
+    rig.downloads._card_messages[SECOND.id] = "Модель ожидает проверки"
+    rows = rig.bridge.models
+    monkeypatch.setattr(type(rig.bridge), "models", property(lambda _: rows))
+    rig.port.records[(FIRST.id, FIRST.revision)] = "broken"
+    rig.port.records[(SECOND.id, SECOND.revision)] = "broken" if previously_enabled else "ok"
+    record_state = rig.port.record_state
+
+    def unavailable(model_id: str, revision: str) -> str:
+        if model_id == SECOND.id:
+            raise error
+        return record_state(model_id, revision)
+
+    monkeypatch.setattr(rig.port, "record_state", unavailable)
+    rig.bridge.modelsChanged.emit()
+    assert rig.choices() == actions
+    assert not actions[0].isEnabled()
+    assert actions[1].isEnabled() == previously_enabled
+
+    monkeypatch.setattr(rig.port, "record_state", record_state)
+    checks = Mock(wraps=rig.downloads.can_make_current_or_unknown)
+    monkeypatch.setattr(rig.downloads, "can_make_current_or_unknown", checks)
+    rig.bridge.modelsChanged.emit()
+    assert rig.choices() == actions
+    assert not actions[0].isEnabled()
+    assert actions[1].isEnabled() != previously_enabled
+    assert checks.call_args_list == [call(FIRST.id), call(SECOND.id)]
+
+    for _ in range(50):
+        rig.bridge.modelsChanged.emit()
+    assert checks.call_args_list == [call(FIRST.id), call(SECOND.id)]
+
+
+@pytest.mark.parametrize("error", [OSError("unavailable"), StoreError("unavailable")])
+@pytest.mark.parametrize("previously_enabled", [False, True])
+def test_installed_ids_error_preserves_availability_and_retries_unchanged_rows(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, error: Exception, previously_enabled: bool
+) -> None:
+    rig.port.install_both()
+    rig.port.records[(SECOND.id, SECOND.revision)] = "ok" if previously_enabled else "broken"
+    rig.downloads.modelsChanged.emit()
+    actions = rig.choices()
+    assert actions[0].isEnabled()
+    assert actions[1].isEnabled() == previously_enabled
+
+    # Список карточек прочитан успешно; сбоит следующий запрос installed_ids,
+    # который выполняет проверка доступности для меню.
+    rig.downloads._card_messages[SECOND.id] = "Модель ожидает проверки"
+    rows = rig.bridge.models
+    monkeypatch.setattr(type(rig.bridge), "models", property(lambda _: rows))
+    rig.port.records[(FIRST.id, FIRST.revision)] = "broken"
+    rig.port.records[(SECOND.id, SECOND.revision)] = "broken" if previously_enabled else "ok"
+    installed_ids = rig.port.installed_ids
+    monkeypatch.setattr(rig.port, "installed_ids", Mock(side_effect=error))
+    rig.bridge.modelsChanged.emit()
+    assert rig.choices() == actions
+    assert actions[0].isEnabled()
+    assert actions[1].isEnabled() == previously_enabled
+
+    monkeypatch.setattr(rig.port, "installed_ids", installed_ids)
+    checks = Mock(wraps=rig.downloads.can_make_current_or_unknown)
+    monkeypatch.setattr(rig.downloads, "can_make_current_or_unknown", checks)
+    rig.bridge.modelsChanged.emit()
+    assert rig.choices() == actions
+    assert not actions[0].isEnabled()
+    assert actions[1].isEnabled() != previously_enabled
+    assert checks.call_args_list == [call(FIRST.id), call(SECOND.id)]
+
+    for _ in range(50):
+        rig.bridge.modelsChanged.emit()
+    assert checks.call_args_list == [call(FIRST.id), call(SECOND.id)]
+
+
+@pytest.mark.parametrize("error_type", [OSError, StoreError])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "bridge-tick",
+        "bridge-select",
+        "badge-record_state",
+        "badge-current_ids",
+        "make-record_state",
+        "make-current_ids",
+        "make-installed_ids",
+        "make-set_current",
+    ],
+)
+def test_ib40_store_error_does_not_crash_tray(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+    failure: str,
+) -> None:
+    rig.port.install_both()
+    rig.downloads.modelsChanged.emit()
+    actions = rig.choices()
+    updates = Mock(wraps=rig.tray.set_models)
+    monkeypatch.setattr(rig.tray, "set_models", updates)
+    error = error_type("private/path model-id private-data")
+
+    with monkeypatch.context() as failing:
+        kind, method = failure.split("-", 1)
+        if kind == "bridge":
+
+            def unavailable(_bridge: object) -> list[dict[str, object]]:
+                raise error
+
+            failing.setattr(type(rig.bridge), "models", property(unavailable))
+        elif kind == "badge":
+            if method == "record_state":
+                record_state = rig.port.record_state
+
+                def unavailable_record(model_id: str, revision: str) -> str:
+                    if model_id == SECOND.id:
+                        raise error
+                    return record_state(model_id, revision)
+
+                failing.setattr(rig.port, method, unavailable_record)
+            else:
+                failing.setattr(rig.port, method, Mock(side_effect=error))
+            rig.downloads._entries = (
+                replace(rig.port.catalog[0], name="Свежая первая"),
+                rig.port.catalog[1],
+            )
+            rig.port.records[(FIRST.id, FIRST.revision)] = "broken"
+            # UI rows stay fresh while the tray retains its confirmed menu.
+            rows = rig.bridge.models
+            assert [row["id"] for row in rows] == [FIRST.id, SECOND.id]
+            assert rows[0]["name"] == "Свежая первая"
+            assert (rows[0]["state"], rows[0]["badge"]) == ("broken", "installed")
+            assert (rows[1]["state"], rows[1]["badge"]) == ("installed", "installed")
+            assert rig.downloads.models_read_failed
+            assert rig.downloads.installedCount == 2
+            assert rig.downloads.installedSummary.startswith("Установлено 2")
+        else:
+            make_current = rig.bridge.makeModelCurrent
+
+            def failing_make_current(model_id: str) -> None:
+                with monkeypatch.context() as store_failure:
+                    store_failure.setattr(rig.port, method, Mock(side_effect=error))
+                    make_current(model_id)
+
+            failing.setattr(rig.bridge, "makeModelCurrent", failing_make_current)
+
+        if failure in {"bridge-tick", "badge-record_state", "badge-current_ids"}:
+            rig.bridge.modelsChanged.emit()
+        else:
+            rig.choose(SECOND.id)
+            rig.show_models.assert_called_once_with()
+        updates.assert_not_called()
+        assert rig.choices() == actions
+        assert rig.checked_ids() == [FIRST.id]
+
+    # Новый сигнал повторяет чтение после ошибки; обновляется и имя, и доступность.
+    rig.port.records[(FIRST.id, FIRST.revision)] = "ok"
+    rig.downloads._entries = (rig.port.catalog[0], replace(rig.port.catalog[1], name="Новое имя"))
+    rig.port.records[(SECOND.id, SECOND.revision)] = "broken"
+    rig.bridge.modelsChanged.emit()
+    assert rig.choices()[1].text() == "Новое имя"
+    assert not rig.choices()[1].isEnabled()
+    assert not rig.downloads.models_read_failed
+    assert rig.show_models.call_count == (0 if "tick" in failure or "badge" in failure else 1)
+
+
+@pytest.mark.parametrize("error_type", [OSError, StoreError])
+@pytest.mark.parametrize("operation", ["install", "remove"])
+def test_install_remove_race_recovers_after_failed_store_read(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception], operation: str
+) -> None:
+    rig.port.install_both()
+    if operation == "install":
+        rig.port.records.pop((SECOND.id, SECOND.revision))
+    rig.downloads.modelsChanged.emit()
+    previous = rig.tray._model_entries
+    updates = Mock(wraps=rig.tray.set_models)
+    monkeypatch.setattr(rig.tray, "set_models", updates)
+    if operation == "install":
+        rig.port.records[(SECOND.id, SECOND.revision)] = "ok"
+    else:
+        rig.port.records.pop((SECOND.id, SECOND.revision))
+
+    with monkeypatch.context() as failing:
+        failing.setattr(rig.port, "installed_ids", Mock(side_effect=error_type("private")))
+        rig.downloads._entries = (
+            rig.port.catalog[0],
+            replace(rig.port.catalog[1], name="Свежая вторая"),
+        )
+        rows = rig.bridge.models
+        assert [row["id"] for row in rows] == [FIRST.id, SECOND.id]
+        assert rows[1]["name"] == "Свежая вторая"
+        assert [(row["state"], row["badge"]) for row in rows] == [
+            ("available", ""),
+            ("available", ""),
+        ]
+        assert rig.downloads.models_read_failed
+        rig.bridge.modelsChanged.emit()
+        updates.assert_not_called()
+        assert rig.tray._model_entries == previous
+
+    rig.bridge.modelsChanged.emit()
+    expected = [FIRST.id, SECOND.id] if operation == "install" else [FIRST.id]
+    assert [model_id for model_id, _ in rig.tray._model_entries or ()] == expected
+    updates.assert_called_once()
+    assert not rig.downloads.models_read_failed
+    checks = Mock(wraps=rig.downloads.can_make_current_or_unknown)
+    monkeypatch.setattr(rig.downloads, "can_make_current_or_unknown", checks)
+    updates.reset_mock()
+    for _ in range(50):
+        rig.bridge.modelsChanged.emit()
+    checks.assert_not_called()
+    updates.assert_not_called()
+
+
+@pytest.mark.parametrize("failed_read", ["record_state", "installed_ids", "current_ids"])
+def test_store_warning_once_per_failure_series_and_recovery_resets(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failed_read: str
+) -> None:
+    rig.port.install_both()
+    rig.downloads.modelsChanged.emit()
+    caplog.set_level(logging.WARNING)
+
+    for series in range(2):
+        with monkeypatch.context() as failing:
+            failing.setattr(
+                rig.port, failed_read, Mock(side_effect=StoreError("private/path model-id"))
+            )
+            for _ in range(5):
+                rig.bridge.modelsChanged.emit()
+                rig.downloads.can_make_current_or_unknown(SECOND.id)
+                rig.choose(SECOND.id)
+            assert len(caplog.records) == series + 1
+            assert all(record.exc_info is None for record in caplog.records)
+            assert all("private" not in record.getMessage() for record in caplog.records)
+            assert all("model-id" not in record.getMessage() for record in caplog.records)
+        rig.bridge.modelsChanged.emit()
+
+
+@pytest.mark.parametrize("with_switcher", [False, True])
+@pytest.mark.parametrize("failed_read", ["record_state", "installed_ids", "set_current"])
+def test_selection_failure_warning_waits_for_successful_tick(
+    rig: Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    with_switcher: bool,
+    failed_read: str,
+) -> None:
+    rig.port.install_both()
+    rig.downloads.modelsChanged.emit()
+    if not with_switcher:
+        rig.downloads._switcher = None
+    make_current = rig.bridge.makeModelCurrent
+    updates = Mock(wraps=rig.tray.set_models)
+    monkeypatch.setattr(rig.tray, "set_models", updates)
+
+    def failing_make_current(model_id: str) -> None:
+        with monkeypatch.context() as failing:
+            failing.setattr(
+                rig.port, failed_read, Mock(side_effect=StoreError("private/path model-id"))
+            )
+            make_current(model_id)
+
+    monkeypatch.setattr(rig.bridge, "makeModelCurrent", failing_make_current)
+    caplog.set_level(logging.WARNING)
+    for series in range(2):
+        for _ in range(5):
+            rig.choose(SECOND.id)
+        assert len(caplog.records) == series + 1
+        assert all(record.exc_info is None for record in caplog.records)
+        assert all("private" not in record.getMessage() for record in caplog.records)
+        assert rig.show_models.call_count == (series + 1) * 5
+        assert rig.checked_ids() == [FIRST.id]
+        updates.assert_not_called()
+        rig.bridge.modelsChanged.emit()
 
 
 def test_active_only_update_preserves_action_identity(rig: Rig) -> None:

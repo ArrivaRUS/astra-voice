@@ -3,7 +3,7 @@
 xvfb в системе не установлен. Запуск без X-сервера:
 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software pytest -m xvfb.
 Снимки всегда включают поля тени 18/18/18/24 px и принимаются только при альфе
-фона 240 ± 1 в центре пилюли. Без флага снимки идут в системный временный каталог
+фона 240 ± 1 в центре пилюли. Без флага снимки идут в приватный кеш снимков
 или заданный через ASTRA_VOICE_SNAPSHOT_DIR_PILL путь вне design/refs. Только
 ASTRA_VOICE_UPDATE_REFS=1 выбирает design/refs/impl/pill, игнорируя этот путь.
 PNG публикуются из временного каталога
@@ -30,7 +30,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
-from helpers.snapshots import snapshot_dir  # noqa: E402
+from helpers.snapshots import snapshot_dir, write_snapshot  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
@@ -247,9 +247,7 @@ def capture_state(
                 and pixel.red() == pixel.green() == pixel.blue() == 0
                 for y in range(bottom, image.height())
             )
-            snapshot_dir.mkdir(parents=True, exist_ok=True)
-            snapshot = snapshot_dir / f"{state}.png"
-            assert image.save(str(snapshot), "PNG"), f"не удалось сохранить {snapshot}"
+            snapshot = write_snapshot(snapshot_dir, f"{state}.png", image)
 
         texts = []
         bars = []
@@ -336,9 +334,8 @@ def rendered_states(
     from PyQt5.QtGui import QImage
 
     # Общая фикстура гарантирует снимки и при отдельном запуске теста референса.
-    # Соседний staging сохраняет атомарность замены и не попадает в glob снимков.
-    SNAPSHOTS.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".pill-", dir=SNAPSHOTS.parent))
+    # Staging внутри проверенного каталога сохраняет атомарность замены и не попадает в glob.
+    staging = Path(tempfile.mkdtemp(prefix=".pill-", dir=SNAPSHOTS))
     failures_before = request.session.testsfailed
     try:
         rendered = {state: capture_state(pill_app, state, snapshot_dir=staging) for state in LABELS}
@@ -351,7 +348,6 @@ def rendered_states(
         yield rendered
         # При ошибке съёмки или любой проверки модуля прежние PNG остаются нетронутыми.
         if request.session.testsfailed == failures_before:
-            SNAPSHOTS.mkdir(parents=True, exist_ok=True)
             for name in sorted(expected):
                 source = staging / name
                 destination = SNAPSHOTS / name

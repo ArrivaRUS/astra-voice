@@ -1,7 +1,7 @@
 """M7-ядро v0.2: строка-статус, панель «Что нового» и раздел «Сеть» в двух темах.
 
-Без флага снимки идут в системный временный каталог или заданный через
-ASTRA_VOICE_SNAPSHOT_DIR_UPDATES путь вне design/refs. Только
+Без флага снимки идут в пользовательский кеш или заданный через
+ASTRA_VOICE_SNAPSHOT_DIR_UPDATES путь вне design/. Только
 ASTRA_VOICE_UPDATE_REFS=1 выбирает design/refs/impl/updates, игнорируя этот путь.
 Снимки сверяются глазами с
 design/refs/04-footer-states*.png, 04-update-panel*.png и 04-network*.png;
@@ -29,7 +29,7 @@ from PyQt5.QtTest import QTest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
-from helpers.snapshots import snapshot_dir  # noqa: E402
+from helpers.snapshots import snapshot_dir, write_snapshot  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
@@ -276,12 +276,7 @@ def collect_messages() -> tuple[list[str], Any]:
 
 
 def save_snapshot(image: QImage, name: str) -> Path:
-    SNAPSHOTS.mkdir(parents=True, exist_ok=True)
-    path = SNAPSHOTS / name
-    temporary = SNAPSHOTS / f".{name}.tmp"
-    assert image.save(str(temporary), "PNG"), f"не удалось сохранить {temporary}"
-    os.replace(temporary, path)
-    return path
+    return write_snapshot(SNAPSHOTS, name, image)
 
 
 def grab(app: Any, window: QQuickWindow, width: int, height: int) -> QImage:

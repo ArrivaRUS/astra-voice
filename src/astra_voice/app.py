@@ -1228,11 +1228,23 @@ def _wire_tray_models(
     availability_fingerprint: tuple[tuple[Any, ...], ...] | None = None
     confirmed_active: str | None = None
     pending_id: str | None = None
+    selection_in_progress = False
 
     def sync() -> None:
+        nonlocal availability_fingerprint
+        try:
+            refresh()
+        except (OSError, StoreError):
+            availability_fingerprint = None
+            bridge.report_model_store_error()
+
+    def refresh() -> None:
         nonlocal snapshot, disabled_snapshot, confirmed_active, pending_id
         nonlocal availability_fingerprint
         rows = bridge.models
+        if bridge.models_read_failed:
+            availability_fingerprint = None
+            return
         installed = [row for row in rows if row["badge"] in {"active", "installed"}]
         active = next((row["id"] for row in installed if row["badge"] == "active"), None)
         # set_current опережает ответ движка; до его ответа галочка остаётся прежней.
@@ -1244,14 +1256,29 @@ def _wire_tray_models(
             (row["id"], row["badge"], row.get("state"), row.get("message")) for row in rows
         )
         disabled = disabled_snapshot
+        check_failed = False
         if fingerprint != availability_fingerprint:
-            disabled = frozenset(
-                row["id"] for row in installed if not bridge.can_select_model(row["id"])
-            )
-            availability_fingerprint = fingerprint
+            unavailable: set[str] = set()
+            for row in installed:
+                model_id = row["id"]
+                available = bridge.can_select_model_or_unknown(model_id)
+                if available is None:
+                    check_failed = True
+                    if model_id in disabled_snapshot:
+                        unavailable.add(model_id)
+                elif not available:
+                    unavailable.add(model_id)
+            disabled = frozenset(unavailable)
+            # Ошибка не становится кэшем: следующий сигнал повторит проверку,
+            # сохранив прежнюю доступность только у затронутой модели.
+            availability_fingerprint = None if check_failed else fingerprint
         if current != snapshot or disabled != disabled_snapshot:
             snapshot, disabled_snapshot = current, disabled
             tray.set_models(entries, confirmed_active, disabled=disabled)
+        if not check_failed and not selection_in_progress:
+            bridge.reset_model_store_error()
+        if selection_in_progress:
+            return
 
         if pending_id is not None:
             row = next((row for row in rows if row["id"] == pending_id), None)
@@ -1267,15 +1294,32 @@ def _wire_tray_models(
                 show_models()
 
     def select(model_id: str) -> None:
-        nonlocal pending_id
-        if any(row.get("state") == "switching" for row in bridge.models):
-            # Чужое/предыдущее переключение уже выполняется; его итог не присваиваем
-            # новой попытке. Сохраняем pending исходного запроса до ответа движка.
+        nonlocal pending_id, availability_fingerprint, selection_in_progress
+        try:
+            rows = bridge.models
+            if bridge.models_read_failed:
+                raise StoreError("models unavailable")
+            if any(row.get("state") == "switching" for row in rows):
+                # Чужое/предыдущее переключение уже выполняется; его итог не присваиваем
+                # новой попытке. Сохраняем pending исходного запроса до ответа движка.
+                if show_models is not None:
+                    show_models()
+                return
+            pending_id = model_id
+            serial = bridge.model_store_error_serial
+            selection_in_progress = True
+            bridge.makeModelCurrent(model_id)
+            if serial != bridge.model_store_error_serial:
+                raise StoreError("model selection unavailable")
+        except (OSError, StoreError):
+            pending_id = None
+            availability_fingerprint = None
+            bridge.report_model_store_error()
             if show_models is not None:
                 show_models()
             return
-        pending_id = model_id
-        bridge.makeModelCurrent(model_id)
+        finally:
+            selection_in_progress = False
         # Занятый мост может отказать без сигнала; синхронный успех тоже допустим.
         sync()
 

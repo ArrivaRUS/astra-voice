@@ -984,6 +984,10 @@ class ModelDownloads(QObject):
         self._revoked_check = revoked_check
         self._catalog_revocation_warned = False
         self._snapshot_revocation_warned = False
+        self._store_error_warned = False
+        self.store_error_serial = 0
+        self.models_read_failed = False
+        self._badge_snapshot: dict[str, str] = {}
         self._revocation_unknown_state = bool(revocation_unknown()) if revocation_unknown else False
         self._measurements_cache: dict[str, Any] | None = None
         self._switcher = switcher
@@ -1223,7 +1227,7 @@ class ModelDownloads(QObject):
                 if record_state == "ok" and getattr(entry, "removed_from_catalog", False):
                     return "removed-from-catalog"
             except (OSError, StoreError):
-                log.warning("Не удалось прочитать состояние установленной модели")
+                self.report_store_error()
                 return "installed" if revision else "available"
         return "installed" if self._badge(entry, installed) else "available"
 
@@ -1409,7 +1413,7 @@ class ModelDownloads(QObject):
         try:
             return self._model.installed_ids()
         except (OSError, StoreError):
-            log.warning("Не удалось прочитать список установленных моделей")
+            self.report_store_error()
             return ()
 
     def _installed_revision(
@@ -1438,15 +1442,25 @@ class ModelDownloads(QObject):
     def _badge(self, entry: Any, installed: tuple[tuple[str, str], ...] | None = None) -> str:
         if self._model is None:
             return ""
-        revision = self._installed_revision(entry, installed)
-        if not revision:
-            return ""
-        state = self._model.record_state(entry.id, revision)
-        if not state:
-            return ""
-        if state == "ok" and self._model.current_ids() == (entry.id, revision):
-            return "active"
-        return "installed"
+        try:
+            revision = self._installed_revision(entry, installed)
+            if not revision:
+                self._badge_snapshot[entry.id] = ""
+                return ""
+            state = self._model.record_state(entry.id, revision)
+            if not state:
+                self._badge_snapshot[entry.id] = ""
+                return ""
+            badge = (
+                "active"
+                if state == "ok" and self._model.current_ids() == (entry.id, revision)
+                else "installed"
+            )
+            self._badge_snapshot[entry.id] = badge
+            return badge
+        except (OSError, StoreError):
+            self.report_store_error()
+            return self._badge_snapshot.get(entry.id, "")
 
     def _refresh_free_space_text(self) -> None:
         size = ""
@@ -1467,6 +1481,13 @@ class ModelDownloads(QObject):
 
     @property
     def models(self) -> list[dict[str, Any]]:
+        serial = self.store_error_serial
+        try:
+            return self._model_rows()
+        finally:
+            self.models_read_failed = serial != self.store_error_serial
+
+    def _model_rows(self) -> list[dict[str, Any]]:
         best_rtfx = catalog_best(self._entries)
         if self._measurements_cache is None:
             try:
@@ -1866,6 +1887,21 @@ class ModelDownloads(QObject):
 
     def can_make_current(self, model_id: str) -> bool:
         """Установленная ревизия проверена и не отозвана издателем."""
+        return self.can_make_current_or_unknown(model_id) is True
+
+    def report_store_error(self) -> None:
+        """Одно предупреждение на серию ошибок до успешного обновления меню."""
+        self.store_error_serial += 1
+        if not self._store_error_warned:
+            log.warning("Не удалось прочитать или изменить состояние моделей")
+            self._store_error_warned = True
+
+    def reset_store_error(self) -> None:
+        """Полный успешный снимок завершает серию временных ошибок."""
+        self._store_error_warned = False
+
+    def can_make_current_or_unknown(self, model_id: str) -> bool | None:
+        """Доступность ревизии; None означает временную ошибку хранилища."""
         if self._model is None:
             return False
         entry = next((entry for entry in self._entries if entry.id == model_id), None)
@@ -1873,44 +1909,49 @@ class ModelDownloads(QObject):
             return False
         try:
             # Каталог может уже предлагать другую, более новую ревизию.
-            revision = self._installed_revision(entry)
+            # Читаем напрямую: _installed_ids превращает ошибку в пустой список,
+            # а здесь она должна отличаться от отсутствующей установки.
+            revision = self._installed_revision(entry, self._model.installed_ids())
             return (
                 bool(revision)
                 and self._model.record_state(entry.id, revision) == "ok"
                 and not self._is_revoked(entry, revision)
             )
         except (OSError, StoreError):
-            log.warning("Не удалось проверить доступность установленной модели")
-            return False
+            self.report_store_error()
+            return None
 
     def makeModelCurrent(self, model_id: str) -> None:  # noqa: N802
         """Делает установленную ревизию рабочей; сломанную рабочей не делаем."""
         entry = self._managed_entry(model_id)
         if entry is None or self._model is None:
             return
-        revision = self._installed_revision(entry)
-        if not revision or self._model.record_state(entry.id, revision) != "ok":
-            return
-        if self._is_revoked(entry, revision):
-            self._set_card(entry, "failed", _REVOKED_MESSAGE)
-            return
-        if self._switcher is not None:
-            self._start_switch(entry, revision, pause=False)
-            return
-        with self._update():
-            try:
-                self._model.set_current(entry.id, revision)
-            except (OSError, StoreError):
-                log.warning("Не удалось сделать модель рабочей")
-                self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
+        try:
+            revision = self._installed_revision(entry, self._model.installed_ids())
+            if not revision or self._model.record_state(entry.id, revision) != "ok":
                 return
-            if self._paused_entry is not None:
-                self._queue_current = (entry.id, revision)
-            self._card_messages.pop(entry.id, None)
-            self._clear_card_hints()
-            self._notify("modelsChanged")
-            self._notify("modelReadyChanged")
-            self._notify("selectionChanged")
+            if self._is_revoked(entry, revision):
+                self._set_card(entry, "failed", _REVOKED_MESSAGE)
+                return
+            if self._switcher is not None:
+                self._start_switch(entry, revision, pause=False)
+                return
+            with self._update():
+                try:
+                    self._model.set_current(entry.id, revision)
+                except (OSError, StoreError):
+                    self.report_store_error()
+                    self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
+                    return
+                if self._paused_entry is not None:
+                    self._queue_current = (entry.id, revision)
+                self._card_messages.pop(entry.id, None)
+                self._clear_card_hints()
+                self._notify("modelsChanged")
+                self._notify("modelReadyChanged")
+                self._notify("selectionChanged")
+        except (OSError, StoreError):
+            self.report_store_error()
 
     def switchModelWithPause(self, model_id: str) -> None:  # noqa: N802
         """Переключает рабочую модель с короткой паузой в диктовке."""
@@ -1944,7 +1985,7 @@ class ModelDownloads(QObject):
             try:
                 model.set_current(entry.id, revision)
             except (OSError, StoreError):
-                log.warning("Не удалось сделать модель рабочей")
+                self.report_store_error()
                 self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
                 return
             self._previous_current = previous

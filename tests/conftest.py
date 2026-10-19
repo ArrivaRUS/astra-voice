@@ -34,8 +34,11 @@ import pytest
 from _pytest.nodes import Node
 from _pytest.terminal import TerminalReporter
 
+from helpers.snapshots import RefsGuard
+
 pytest_plugins = ("pytester",)
 
+_REFS_GUARD = pytest.StashKey[RefsGuard]()
 _QT_AVAILABLE = pytest.StashKey[bool]()
 _QAPP_ADDRESS: int | None = None
 _QAPP_LAST_NODEID: str | None = None
@@ -180,6 +183,7 @@ _XDG_NAMES = (
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config: pytest.Config) -> None:
     """Изолируем всех потомков ещё до сбора тестов и подпроцесса проверки Qt."""
+    config.stash[_REFS_GUARD] = RefsGuard.capture()
     directory = TemporaryDirectory(prefix="astra-tests-pulse-")
     config.stash[_PULSE_DIRECTORY] = directory
     config.stash[_PULSE_ORIGINAL_ENV] = {
@@ -203,6 +207,23 @@ def pytest_configure(config: pytest.Config) -> None:
     config.stash[_PULSE_ENV] = pulse_env
     os.environ.update(pulse_env)
     config.stash[_PULSE_PROCESSES] = pulseaudio_processes()
+
+
+def pytest_sessionfinish(session: pytest.Session) -> None:
+    guard = session.config.stash.get(_REFS_GUARD, None)
+    if guard is None:
+        return
+    try:
+        message = guard.failure_message()
+    except OSError as error:
+        message = f"IB42: не удалось проверить design/refs: {error}"
+    if message is not None:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is not None:
+            reporter.write_sep("!", message, red=True)
+        else:
+            print(message, file=sys.stderr)
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:

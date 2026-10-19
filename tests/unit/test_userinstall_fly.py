@@ -16,7 +16,7 @@ from unittest.mock import Mock
 import pytest
 
 from astra_voice.core import childenv, paths
-from astra_voice.platform import autostart, userinstall
+from astra_voice.platform import autostart, session, userinstall
 from helpers.appimage_bundle import KEY, make_bundle, module_path, tree_snapshot
 
 pytestmark = pytest.mark.unit
@@ -42,6 +42,7 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture(autouse=True)
 def refresh(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    monkeypatch.setattr(session, "detect", lambda: session.SessionKind.FLY)
     original_is_file = Path.is_file
     original_access = os.access
     monkeypatch.setattr(
@@ -67,6 +68,29 @@ def section(home: Path, tree: str, name: str = "tools", properties: bytes = b"")
     directory.mkdir(parents=True, exist_ok=True)
     (directory / ".directory").write_bytes(b"[Desktop Entry]\n" + properties)
     return directory
+
+
+@pytest.mark.parametrize("kind", list(session.SessionKind))
+def test_ib44_refresh_only_in_fly_session(
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refresh: Mock,
+    caplog: pytest.LogCaptureFixture,
+    kind: session.SessionKind,
+) -> None:
+    directory = section(home, "startmenu2", properties=b"Name=Utility\n")
+    monkeypatch.setattr(session, "detect", lambda: kind)
+    with caplog.at_level(logging.INFO):
+        result = userinstall.register()
+    assert result.fly_written == (directory / "astra-voice.desktop",)
+    assert result.fly_written[0].is_file()
+    if kind is session.SessionKind.FLY:
+        refresh.assert_called_once()
+        assert refresh.call_args.args == (["/usr/bin/fly-wmfunc", "FLYWM_UPDATE_STARTMENU"],)
+    else:
+        refresh.assert_not_called()
+        assert "текущая сессия не Fly" in caplog.text
+        assert str(home) not in caplog.text
 
 
 def owned() -> bytes:
@@ -627,6 +651,52 @@ def test_home_symlink_has_explicit_warning(
         for record in caplog.records
     )
     refresh.assert_not_called()
+
+
+@pytest.mark.parametrize("open_error", [errno.ENOTDIR, errno.ELOOP])
+@pytest.mark.parametrize("stat_error", [errno.ENOENT, errno.EACCES, errno.EIO])
+def test_home_ancestor_diagnostic_failure_preserves_open_error(
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    open_error: int,
+    stat_error: int,
+) -> None:
+    directory = section(home, "startmenu2")
+    ancestor = home.parent.name
+    primary = OSError(open_error, "ошибка открытия предка")
+    secondary = OSError(stat_error, "ошибка диагностической проверки")
+    original_open = os.open
+    original_stat = os.stat
+    failed_fds: list[int] = []
+    diagnostic_fds: list[int] = []
+
+    def failing_open(
+        path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if path == ancestor and dir_fd is not None:
+            failed_fds.append(dir_fd)
+            raise primary
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    def failing_stat(
+        path: str | Path, *, dir_fd: int | None = None, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        if path == ancestor and dir_fd is not None and not follow_symlinks:
+            diagnostic_fds.append(dir_fd)
+            raise secondary
+        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "open", failing_open)
+    monkeypatch.setattr(os, "stat", failing_stat)
+    with pytest.raises(OSError) as caught:
+        with userinstall._fly_directory(directory):
+            pytest.fail("недоступный предок не должен открывать каталог меню")
+    assert caught.value is primary
+    assert len(failed_fds) == 1
+    assert diagnostic_fds == failed_fds
+    with pytest.raises(OSError) as closed:
+        os.fstat(failed_fds[0])
+    assert closed.value.errno == errno.EBADF
 
 
 def test_refresh_uses_absolute_utility_and_clean_environment(

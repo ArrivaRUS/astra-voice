@@ -34,6 +34,7 @@ from astra_voice.ui.about_bridge import AboutBridge
 from astra_voice.ui.appimage_management import AppImageManagement
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication
+from helpers.snapshots import snapshot_dir, write_snapshot
 
 pytestmark = pytest.mark.xvfb
 ROOT = Path(__file__).resolve().parents[2]
@@ -147,14 +148,13 @@ def scale_fonts(item: QQuickItem, scale: float) -> None:
 
 
 def screenshot(window: Any, directory: Path, name: str) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
     capture = window.contentItem().grabToImage()
     assert capture is not None
     for _ in range(30):
         if not capture.image().isNull():
             break
         QTest.qWait(20)
-    assert capture.image().save(str(directory / name))
+    write_snapshot(directory, name, capture.image())
 
 
 @contextmanager
@@ -285,15 +285,19 @@ def test_management_layout_no_clipping(
         assert path.property("contentWidth") <= path.width() + 1
         assert path.property("contentHeight") <= path.height() + 1
         assert not messages, messages
-        directory = Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR", str(tmp_path)))
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = snapshot_dir(
+            "ASTRA_VOICE_SNAPSHOT_DIR",
+            "appimage-management",
+            "design/refs/impl/appimage-management",
+            default=tmp_path,
+        )
         capture = window.contentItem().grabToImage()
         assert capture is not None
         for _ in range(30):
             if not capture.image().isNull():
                 break
             QTest.qWait(20)
-        assert capture.image().save(str(directory / f"appimage-{width}-{scale}-{dark}.png"))
+        write_snapshot(directory, f"appimage-{width}-{scale}-{dark}.png", capture.image())
 
 
 @pytest.mark.parametrize("kind", ["deb", "source", "unknown"])
@@ -446,7 +450,12 @@ def test_real_backend_full_confirmation_and_keyboard_scroll(
         for part in (body, dialog.property("header"), dialog.property("footer")):
             scale_fonts(part, scale)
         QTest.qWait(50)
-        directory = Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR", str(tmp_path)))
+        directory = snapshot_dir(
+            "ASTRA_VOICE_SNAPSHOT_DIR",
+            "appimage-management",
+            "design/refs/impl/appimage-management",
+            default=tmp_path,
+        )
         prefix = f"real-{action}-{width}-{scale}"
         screenshot(window, directory, prefix + "-top.png")
         # D1 at 100% may fit in full; long D2 and enlarged text must scroll.
@@ -501,15 +510,19 @@ def test_small_dialog_scroll_and_persistent_error(
             assert button.x() >= 0
             assert button.x() + button.width() <= button.parentItem().width() + 1
             assert button.y() + button.height() <= button.parentItem().height() + 1
-        directory = Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR", str(tmp_path)))
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = snapshot_dir(
+            "ASTRA_VOICE_SNAPSHOT_DIR",
+            "appimage-management",
+            "design/refs/impl/appimage-management",
+            default=tmp_path,
+        )
         capture = window.contentItem().grabToImage()
         assert capture is not None
         for _ in range(30):
             if not capture.image().isNull():
                 break
             QTest.qWait(20)
-        assert capture.image().save(str(directory / f"appimage-dialog-{width}-{scale}-{dark}.png"))
+        write_snapshot(directory, f"appimage-dialog-{width}-{scale}-{dark}.png", capture.image())
         management.values.update(
             state="error", confirmationId="", errorText="Часть копий могла остаться."
         )
@@ -731,7 +744,12 @@ def test_management_state_render_matrix(
         QTest.qWait(50)
         screenshot(
             window,
-            Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR", str(tmp_path))),
+            snapshot_dir(
+                "ASTRA_VOICE_SNAPSHOT_DIR",
+                "appimage-management",
+                "design/refs/impl/appimage-management",
+                default=tmp_path,
+            ),
             f"appimage-state-{state}-{width}-{scale}.png",
         )
         assert not messages, messages

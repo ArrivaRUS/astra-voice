@@ -23,10 +23,15 @@ from astra_voice.ui.updates_bridge import UpdatesBridge
 from astra_voice.updates.checker import UpdateStatus
 from astra_voice.updates.download import DownloadStatus, FileIdentity, VerifiedDownload
 from astra_voice.updates.release import VerifiedArtifact, VerifiedRelease
+from helpers.snapshots import snapshot_dir, write_snapshot
 
 states: Any = importlib.import_module("test_update_states")
 pytestmark = pytest.mark.xvfb
-SNAPSHOTS = Path("/tmp/astra-updater-independent-keyboard")
+SNAPSHOTS = snapshot_dir(
+    "ASTRA_VOICE_SNAPSHOT_DIR_PROGRAM_UPDATES",
+    "program-updates-keyboard-independent",
+    "design/refs/impl/program-updates-keyboard-independent",
+)
 
 
 @pytest.fixture(scope="module")
@@ -59,10 +64,7 @@ def assert_focus_visible(window: Any, name: str) -> None:
 
 
 def snapshot(app: Any, window: Any, name: str) -> None:
-    SNAPSHOTS.mkdir(parents=True, exist_ok=True)
-    assert states.grab(app, window, states.WIDTH, states.HEIGHT).save(
-        str(SNAPSHOTS / f"{name}.png")
-    )
+    write_snapshot(SNAPSHOTS, f"{name}.png", states.grab(app, window, states.WIDTH, states.HEIGHT))
 
 
 def assert_heading_ring_follows_visible_content(window: Any, *, compact: bool = True) -> None:

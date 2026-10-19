@@ -1,7 +1,7 @@
 """Пять шагов и настройки в двух темах: Qt5, состояния мостов и детерминированные PNG.
 
 Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING;
-по умолчанию используется системный временный каталог. ASTRA_VOICE_UPDATE_REFS=1
+по умолчанию используется приватный кеш снимков. ASTRA_VOICE_UPDATE_REFS=1
 явно направляет снимки в design/refs/impl/onboarding.
 Все записи тестов, включая временные PNG, ограничены SNAPSHOTS. Публикация
 через os.replace выполняется в teardown только после успеха всего модуля.
@@ -47,7 +47,7 @@ from PyQt5.QtTest import QSignalSpy, QTest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
-from helpers.snapshots import snapshot_dir  # noqa: E402
+from helpers.snapshots import snapshot_dir, write_snapshot  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
@@ -2558,7 +2558,6 @@ def rendered_steps(
 ) -> Iterator[dict[tuple[str, bool], tuple[QImage, list[str], Path]]]:
     """Готовит кадры всех случаев; публикует их только после успеха тестов модуля."""
     failures_before = request.session.testsfailed
-    SNAPSHOTS.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".onboarding-", dir=SNAPSHOTS) as temporary:
         staging = Path(temporary)
         rendered: dict[tuple[str, bool], tuple[QImage, list[str], Path]] = {}
@@ -2566,8 +2565,7 @@ def rendered_steps(
             image, messages = render_case(onboarding_app, name, dark)
             filename = snapshot_name(name, dark)
             assert_no_messages(messages, filename)
-            path = staging / filename
-            assert image.save(str(path), "PNG"), f"не удалось сохранить {path}"
+            path = write_snapshot(staging, filename, image)
             assert_saved_snapshot(path, image)
             rendered[name, dark] = image, messages, path
         yield rendered
@@ -2988,11 +2986,9 @@ def test_download_strip_track_stays_at_right_edge(onboarding_app: Any, screen: s
 def test_download_card_state_frames(onboarding_app: Any) -> None:
     from astra_voice.ui.model_downloads import _FAILURE_MESSAGES, _SOURCE_TEXT
 
-    destination = os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_M6DL")
-    if not destination:
+    if not os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_M6DL"):
         pytest.skip("ASTRA_VOICE_SNAPSHOT_DIR_M6DL не задан")
-    snapshots = Path(destination)
-    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshots = snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_M6DL", "m6dl", "design/refs/impl/m6dl")
     states = ("queued", "downloading", "downloading-calc", "verifying", "paused-no-space", "failed")
     paused_message = "Не хватает места — освободите 172 МБ"
     for state in states:
@@ -3212,8 +3208,7 @@ def test_download_card_state_frames(onboarding_app: Any) -> None:
                 )
             filename = f"m6dl-{screen}-{state}.png"
             assert_no_messages(messages, filename)
-            path = snapshots / filename
-            assert image.save(str(path), "PNG"), filename
+            path = write_snapshot(snapshots, filename, image)
             assert_saved_snapshot(path, image)
 
 

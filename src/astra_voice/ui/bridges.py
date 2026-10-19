@@ -411,6 +411,28 @@ class SettingsBridge(QObject):
         """Доступность ревизии для трея независимо от кэша состояния карточки."""
         return self._downloads is not None and self._downloads.can_make_current(model_id)
 
+    def can_select_model_or_unknown(self, model_id: str) -> bool | None:
+        """Не смешивает отказ выбора с временной ошибкой проверки хранилища."""
+        if self._downloads is None:
+            return False
+        return self._downloads.can_make_current_or_unknown(model_id)
+
+    def report_model_store_error(self) -> None:
+        if self._downloads is not None:
+            self._downloads.report_store_error()
+
+    @property
+    def models_read_failed(self) -> bool:
+        return self._downloads is not None and self._downloads.models_read_failed
+
+    @property
+    def model_store_error_serial(self) -> int:
+        return self._downloads.store_error_serial if self._downloads is not None else 0
+
+    def reset_model_store_error(self) -> None:
+        if self._downloads is not None:
+            self._downloads.reset_store_error()
+
     @pyqtProperty(bool, notify=revocationUnknownChanged)
     def revocationUnknown(self) -> bool:  # noqa: N802
         return self._downloads.revocationUnknown if self._downloads is not None else False

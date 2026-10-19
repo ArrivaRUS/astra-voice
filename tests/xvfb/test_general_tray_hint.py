@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -27,6 +26,7 @@ from astra_voice.ui.bridges import SettingsBridge
 from astra_voice.ui.icons import install_icon_provider
 from astra_voice.ui.tray import Tray
 from helpers.qt_app import get_qapplication
+from helpers.snapshots import snapshot_dir, write_snapshot
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
@@ -65,8 +65,9 @@ def test_general_tray_hint_live_layout_and_snapshot(tmp_path: Path, dark: bool) 
     theme = FakeTheme(dark)
     engine = QQmlApplicationEngine()
     install_icon_provider(engine)
-    snapshots = Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_GENERAL") or tmp_path)
-    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshots = snapshot_dir(
+        "ASTRA_VOICE_SNAPSHOT_DIR_GENERAL", "general", "design/refs/impl/general", default=tmp_path
+    )
     theme_name = "dark" if dark else "light"
     try:
         context = engine.rootContext()
@@ -94,7 +95,7 @@ def test_general_tray_hint_live_layout_and_snapshot(tmp_path: Path, dark: bool) 
         assert not hint.isVisible() and hint.height() == 0
         assert sound_row.y() == base_y
         image = grab(app, window, 1024, 588)
-        assert image.save(str(snapshots / f"general-tray-default-{theme_name}.png"), "PNG")
+        write_snapshot(snapshots, f"general-tray-default-{theme_name}.png", image)
 
         tray.set_unconfirmed(True)
         QTest.qWait(40)
@@ -112,7 +113,7 @@ def test_general_tray_hint_live_layout_and_snapshot(tmp_path: Path, dark: bool) 
         )
         ensure_control_in_viewport(app, body, hint)
         image = grab(app, window, 1024, 588)
-        assert image.save(str(snapshots / f"general-tray-xembed-{theme_name}.png"), "PNG")
+        write_snapshot(snapshots, f"general-tray-xembed-{theme_name}.png", image)
 
         tray.set_unconfirmed(False)
         QTest.qWait(40)

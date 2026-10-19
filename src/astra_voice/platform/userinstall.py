@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Literal
 
 from astra_voice.core import childenv, paths
-from astra_voice.platform import autostart
+from astra_voice.platform import autostart, session
 
 log = logging.getLogger(__name__)
 
@@ -810,8 +810,15 @@ def _fly_directory(path: Path) -> Iterator[int]:
                 )
             except OSError as exc:
                 if index < len(home.parts) and exc.errno in (errno.ENOTDIR, errno.ELOOP):
-                    if stat.S_ISLNK(os.stat(part, dir_fd=fd, follow_symlinks=False).st_mode):
-                        log.warning("fly_menu_skipped reason=home_symlink")
+                    try:
+                        mode = os.stat(part, dir_fd=fd, follow_symlinks=False).st_mode
+                    except OSError:
+                        log.debug(
+                            "Не удалось проверить ссылку домашнего каталога Fly", exc_info=True
+                        )
+                    else:
+                        if stat.S_ISLNK(mode):
+                            log.warning("fly_menu_skipped reason=home_symlink")
                 raise
             os.close(fd)
             fd = child
@@ -932,6 +939,9 @@ def _fly_menu_targets() -> list[Path]:
 
 def _refresh_fly_menu() -> None:
     """Обновляет уже существующее меню; сбой оболочки не отменяет установку."""
+    if session.detect() is not session.SessionKind.FLY:
+        log.info("Обновление меню Fly пропущено: текущая сессия не Fly.")
+        return
     try:
         utility = Path("/usr/bin/fly-wmfunc")
         if not utility.is_file() or not os.access(utility, os.X_OK):
