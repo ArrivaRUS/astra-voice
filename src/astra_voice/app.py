@@ -1223,21 +1223,61 @@ def _wire_tray_models(
     tray: Any, bridge: Any, show_models: Callable[[], None] | None = None
 ) -> None:
     """Трей использует список, имена и переключение раздела «Модели»."""
+    snapshot: tuple[tuple[tuple[str, str], ...], str | None] | None = None
+    disabled_snapshot: frozenset[str] = frozenset()
+    availability_fingerprint: tuple[tuple[Any, ...], ...] | None = None
+    confirmed_active: str | None = None
+    pending_id: str | None = None
 
     def sync() -> None:
-        installed = [row for row in bridge.models if row["badge"] in {"active", "installed"}]
+        nonlocal snapshot, disabled_snapshot, confirmed_active, pending_id
+        nonlocal availability_fingerprint
+        rows = bridge.models
+        installed = [row for row in rows if row["badge"] in {"active", "installed"}]
         active = next((row["id"] for row in installed if row["badge"] == "active"), None)
-        tray.set_models([(row["id"], row["name"]) for row in installed], active)
+        # set_current опережает ответ движка; до его ответа галочка остаётся прежней.
+        if not any(row.get("state") == "switching" for row in rows):
+            confirmed_active = active
+        entries = tuple((row["id"], row["name"]) for row in installed)
+        current = (entries, confirmed_active)
+        fingerprint = tuple(
+            (row["id"], row["badge"], row.get("state"), row.get("message")) for row in rows
+        )
+        disabled = disabled_snapshot
+        if fingerprint != availability_fingerprint:
+            disabled = frozenset(
+                row["id"] for row in installed if not bridge.can_select_model(row["id"])
+            )
+            availability_fingerprint = fingerprint
+        if current != snapshot or disabled != disabled_snapshot:
+            snapshot, disabled_snapshot = current, disabled
+            tray.set_models(entries, confirmed_active, disabled=disabled)
+
+        if pending_id is not None:
+            row = next((row for row in rows if row["id"] == pending_id), None)
+            if row is not None and row.get("state") == "switching":
+                return
+            refused = pending_id != confirmed_active or (
+                row is not None and (row.get("canSwitchWithPause") or row.get("message"))
+            )
+            # Гасим запрос до вызова окна: повторные сигналы и вложенный цикл
+            # событий не должны открыть раздел ещё раз для той же попытки.
+            pending_id = None
+            if refused and show_models is not None:
+                show_models()
 
     def select(model_id: str) -> None:
+        nonlocal pending_id
+        if any(row.get("state") == "switching" for row in bridge.models):
+            # Чужое/предыдущее переключение уже выполняется; его итог не присваиваем
+            # новой попытке. Сохраняем pending исходного запроса до ответа движка.
+            if show_models is not None:
+                show_models()
+            return
+        pending_id = model_id
         bridge.makeModelCurrent(model_id)
-        row = next((row for row in bridge.models if row["id"] == model_id), None)
-        if (
-            show_models is not None
-            and row is not None
-            and (row.get("canSwitchWithPause") or row.get("message"))
-        ):
-            show_models()
+        # Занятый мост может отказать без сигнала; синхронный успех тоже допустим.
+        sync()
 
     tray.on_model_selected = select
     bridge.modelsChanged.connect(sync)

@@ -15,8 +15,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from astra_voice.core import paths
-from astra_voice.platform import userinstall
+from astra_voice.core import childenv, paths
+from astra_voice.platform import autostart, userinstall
 from helpers.appimage_bundle import KEY, make_bundle, module_path, tree_snapshot
 
 pytestmark = pytest.mark.unit
@@ -42,7 +42,21 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture(autouse=True)
 def refresh(monkeypatch: pytest.MonkeyPatch) -> Mock:
-    monkeypatch.setattr(shutil, "which", Mock(return_value="/usr/bin/fly-wmfunc"))
+    original_is_file = Path.is_file
+    original_access = os.access
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda path: True if path == Path("/usr/bin/fly-wmfunc") else original_is_file(path),
+    )
+    monkeypatch.setattr(
+        os,
+        "access",
+        lambda path, mode: (
+            True if path == Path("/usr/bin/fly-wmfunc") else original_access(path, mode)
+        ),
+    )
+    monkeypatch.setattr(shutil, "which", Mock(side_effect=AssertionError("PATH lookup forbidden")))
     run = Mock(return_value=subprocess.CompletedProcess([], 0))
     monkeypatch.setattr(subprocess, "run", run)
     return run
@@ -72,17 +86,19 @@ def test_both_trees_exact_bytes_mode_and_idempotence(home: Path, refresh: Mock) 
         assert entry.read_bytes() == expected
         assert stat.S_IMODE(entry.stat().st_mode) == 0o644
     refresh.assert_called_once_with(
-        ["fly-wmfunc", "FLYWM_UPDATE_STARTMENU"],
+        ["/usr/bin/fly-wmfunc", "FLYWM_UPDATE_STARTMENU"],
         timeout=5,
         check=False,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=childenv.clean_env(),
     )
-    shutil.which.assert_called_once_with("fly-wmfunc")  # type: ignore[attr-defined]
+    shutil.which.assert_not_called()  # type: ignore[attr-defined]
     before = {p: p.stat().st_mtime_ns for p in entries}
     again = userinstall.register()
-    assert again.fly_written == () and again.fly_skipped == entries
+    assert again.fly_written == again.fly_skipped == ()
+    assert again.fly_unchanged == entries
     assert {p: p.stat().st_mtime_ns for p in entries} == before
     assert refresh.call_count == 1
 
@@ -177,7 +193,7 @@ def test_moved_owned_removed_foreign_retained_and_depth_limited(
     refresh.assert_called_once()
 
 
-@pytest.mark.parametrize("failure", ["missing", "oserror", "timeout", "nonzero"])
+@pytest.mark.parametrize("failure", ["missing", "not-executable", "oserror", "timeout", "nonzero"])
 def test_refresh_failures_nonfatal(
     home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -187,7 +203,21 @@ def test_refresh_failures_nonfatal(
 ) -> None:
     section(home, "startmenu2", "tools", b"Name=Utility\n")
     if failure == "missing":
-        monkeypatch.setattr(shutil, "which", Mock(return_value=None))
+        original_is_file = Path.is_file
+        monkeypatch.setattr(
+            Path,
+            "is_file",
+            lambda path: False if path == Path("/usr/bin/fly-wmfunc") else original_is_file(path),
+        )
+    elif failure == "not-executable":
+        original_access = os.access
+        monkeypatch.setattr(
+            os,
+            "access",
+            lambda path, mode: (
+                False if path == Path("/usr/bin/fly-wmfunc") else original_access(path, mode)
+            ),
+        )
     elif failure == "oserror":
         refresh.side_effect = OSError("ошибка")
     elif failure == "timeout":
@@ -199,7 +229,7 @@ def test_refresh_failures_nonfatal(
         removed = userinstall.unregister()
     assert len(result.fly_written) == len(removed.fly) == 1
     assert "Меню Fly" in caplog.text
-    assert refresh.call_count == (0 if failure == "missing" else 2)
+    assert refresh.call_count == (0 if failure in ("missing", "not-executable") else 2)
 
 
 @pytest.mark.parametrize("component", ["home", ".fly", "startmenu2", "section"])
@@ -355,6 +385,12 @@ def test_unsafe_fly_reopen_after_discovery_skipped(
 
 def test_fly_io_error_still_propagates(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     directory = section(home, "startmenu2")
+    userinstall.register()
+    autostart.set_enabled(True)
+    menu, icons = userinstall._desktop_paths()
+    registered = (menu, autostart._paths()[0], *userinstall._owned_icons(icons))
+    assert len(registered) > 2
+    before = {path: path.read_bytes() for path in registered}
 
     @contextmanager
     def broken(path: Path) -> Iterator[int]:
@@ -367,6 +403,8 @@ def test_fly_io_error_still_propagates(home: Path, monkeypatch: pytest.MonkeyPat
             pass
     with pytest.raises(OSError, match="ошибка чтения"):
         userinstall._unregister()
+    # Неожиданный сбой Fly происходит до снятия остальной регистрации.
+    assert {path: path.read_bytes() for path in registered} == before
 
 
 def test_strict_menu_state_skips_symlink_replaced_after_discovery(
@@ -563,3 +601,246 @@ def test_internal_unregister_removes_moved_copies_once(home: Path, refresh: Mock
     refresh.assert_called_once()
     assert userinstall._unregister(deb_executable=home / "missing-deb").fly == ()
     refresh.assert_called_once()
+
+
+@pytest.mark.parametrize("component", ["home", "ancestor"])
+def test_home_symlink_has_explicit_warning(
+    home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    refresh: Mock,
+    component: str,
+) -> None:
+    directory = section(home, "startmenu2", properties=b"Name=Utility\n")
+    entry = directory / "astra-voice.desktop"
+    entry.write_bytes(owned())
+    link = tmp_path / "linked"
+    link.symlink_to(home if component == "home" else tmp_path)
+    monkeypatch.setenv("HOME", str(link if component == "home" else link / "home"))
+    result = userinstall.register()
+    assert result.fly_written == result.fly_unchanged == ()
+    assert entry.read_bytes() == owned()
+    assert any(
+        record.levelno == logging.WARNING
+        and record.message == "fly_menu_skipped reason=home_symlink"
+        for record in caplog.records
+    )
+    refresh.assert_not_called()
+
+
+def test_refresh_uses_absolute_utility_and_clean_environment(
+    home: Path, monkeypatch: pytest.MonkeyPatch, refresh: Mock
+) -> None:
+    monkeypatch.setenv("PATH", str(home / "untrusted-bin"))
+    for name in (
+        "APPDIR",
+        "APPIMAGE",
+        "ASTRA_VOICE_APPIMAGE_DIR",
+        "LD_LIBRARY_PATH",
+        "QT_PLUGIN_PATH",
+    ):
+        monkeypatch.setenv(name, "/bundle/private")
+    monkeypatch.setenv(childenv.ORIG_UNSET, "LD_LIBRARY_PATH QT_PLUGIN_PATH")
+    monkeypatch.delenv(childenv.ORIG_PREFIX + "LD_LIBRARY_PATH", raising=False)
+    monkeypatch.delenv(childenv.ORIG_PREFIX + "QT_PLUGIN_PATH", raising=False)
+    expected = childenv.clean_env()
+    userinstall._refresh_fly_menu()
+    assert refresh.call_args.args == (["/usr/bin/fly-wmfunc", "FLYWM_UPDATE_STARTMENU"],)
+    actual = refresh.call_args.kwargs["env"]
+    assert actual == expected
+    assert not {"APPDIR", "APPIMAGE", "LD_LIBRARY_PATH", "QT_PLUGIN_PATH"}.intersection(actual)
+    assert not any(name.startswith("ASTRA_VOICE_") for name in actual)
+    assert os.environ["LD_LIBRARY_PATH"] == "/bundle/private"
+    shutil.which.assert_not_called()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("tree", ["startmenu2", "startmenu"])
+def test_existing_moved_copies_updated_without_new_tools_entry(
+    home: Path, refresh: Mock, tree: str
+) -> None:
+    root = section(home, tree).parent
+    original = userinstall.register()
+    assert original.fly_written == (root / "astra-voice.desktop",)
+    moved_dir = section(home, tree, "moved/deeper/custom")
+    moved = moved_dir / "astra-voice.desktop"
+    (root / moved.name).rename(moved)
+    tools = section(
+        home, tree, "Tools", b"Name=Utility\nCategories=Utility;\nX-Categories=Utility;\n"
+    )
+    # Появление штатного раздела не возвращает перенесённую пользователем запись.
+    again = userinstall.register()
+    assert again.fly_written == again.fly_skipped == ()
+    assert again.fly_unchanged == (moved,)
+    refresh.assert_called_once()
+    moved.write_bytes(owned())
+    second = section(home, tree, "another") / moved.name
+    second.write_bytes(owned())
+    other_tree = "startmenu" if tree == "startmenu2" else "startmenu2"
+    other_tools = section(home, other_tree, "Tools", b"Name=Utility\nCategories=Utility;\n")
+    updated = userinstall.register()
+    assert set(updated.fly_written) == {moved, second, other_tools / moved.name}
+    assert not (tools / moved.name).exists()
+    assert not (root / moved.name).exists()
+    assert moved.read_bytes() == second.read_bytes() == (other_tools / moved.name).read_bytes()
+    before = {entry: entry.stat().st_mtime_ns for entry in updated.fly_written}
+    final = userinstall.register()
+    assert final.fly_written == final.fly_skipped == ()
+    assert set(final.fly_unchanged) == set(updated.fly_written)
+    assert {entry: entry.stat().st_mtime_ns for entry in before} == before
+    assert refresh.call_count == 2
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "tree", "readonly"])
+@pytest.mark.parametrize(
+    "operation", ["unregister", "_unregister", "validate_remove_paths", "management_snapshot"]
+)
+@pytest.mark.skipif(os.geteuid() == 0, reason="root обходит реальные права chmod")
+def test_real_permissions_preserve_fly_and_complete_other_removal(
+    home: Path, refresh: Mock, caplog: pytest.LogCaptureFixture, kind: str, operation: str
+) -> None:
+    directory = section(home, "startmenu2", properties=b"Name=Utility\n")
+    userinstall.register()
+    autostart.set_enabled(True)
+    entry = directory / "astra-voice.desktop"
+    xdg, icons = userinstall._desktop_paths()
+    installed_icons = tuple(userinstall._owned_icons(icons))
+    assert installed_icons
+    auto = autostart._paths()[0]
+    before = entry.read_bytes()
+    protected = entry if kind == "file" else directory.parent if kind == "tree" else directory
+    original_mode = stat.S_IMODE(protected.stat().st_mode)
+    protected.chmod(0 if kind == "file" else 0o500 if kind == "readonly" else 0o400)
+    try:
+        required = os.R_OK if kind == "file" else os.W_OK if kind == "readonly" else os.X_OK
+        if os.access(protected, required):
+            pytest.skip("файловая система не применяет chmod")
+        refresh.reset_mock()
+        if operation in ("unregister", "_unregister"):
+            result = getattr(userinstall, operation)(deb_executable=home / "missing-deb")
+            assert result.menu and result.autostart and set(result.icons) == set(installed_icons)
+            assert result.fly == ()
+            assert not xdg.exists() and not auto.exists()
+            assert all(not icon.exists() for icon in installed_icons)
+            refresh.assert_not_called()
+        else:
+            result = getattr(userinstall, operation)()
+            assert xdg.exists() and auto.exists()
+            assert all(icon.exists() for icon in installed_icons)
+            if operation == "management_snapshot" and kind == "file":
+                assert len(dict(result.identities)[str(entry)]) == 4
+        if kind != "readonly" or operation in ("unregister", "_unregister"):
+            assert "меню Fly" in caplog.text
+        assert str(home) not in caplog.text
+    finally:
+        protected.chmod(original_mode)
+    assert entry.read_bytes() == before
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root обходит реальные права chmod")
+def test_real_unreadable_entry_state_and_identity(
+    home: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    directory = section(home, "startmenu2")
+    entry = directory / "astra-voice.desktop"
+    entry.write_bytes(owned())
+    entry.chmod(0)
+    try:
+        if os.access(entry, os.R_OK):
+            pytest.skip("файловая система не применяет chmod")
+        with userinstall._fly_directory(directory) as fd:
+            info = entry.stat()
+            assert userinstall._menu_state(entry, directory_fd=fd) == "foreign"
+            assert userinstall._management_identity(entry, directory_fd=fd) == (
+                info.st_dev,
+                info.st_ino,
+                info.st_mode,
+                info.st_uid,
+            )
+        assert "Недоступная запись меню Fly сохранена" in caplog.text
+        # Льготная обработка относится только к Fly, не к XDG.
+        with pytest.raises(PermissionError):
+            userinstall._menu_state(entry)
+        with pytest.raises(PermissionError):
+            userinstall._management_identity(entry)
+    finally:
+        entry.chmod(0o644)
+    assert entry.read_bytes() == owned()
+
+
+@pytest.mark.parametrize("error", [errno.ENOENT, errno.EACCES, errno.EPERM])
+@pytest.mark.parametrize("stage", ["stat", "open"])
+@pytest.mark.parametrize("strict", [True, False])
+def test_child_discovery_error_keeps_parent_and_sibling(
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: int,
+    stage: str,
+    strict: bool,
+) -> None:
+    skipped = section(home, "startmenu2", "a-denied")
+    sibling = section(home, "startmenu2", "b-allowed")
+    original_stat = os.stat
+    original_open = os.open
+
+    def failing_stat(
+        path: str | Path, *, dir_fd: int | None = None, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        if path == skipped.name and dir_fd is not None:
+            raise OSError(error, "недоступная запись")
+        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    def failing_open(
+        path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
+        if path == skipped.name and dir_fd is not None:
+            raise OSError(error, "недоступный каталог")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, stage, failing_stat if stage == "stat" else failing_open)
+    assert list(userinstall._fly_directories(3, strict=strict)) == [skipped.parent, sibling]
+    assert "a-denied" in caplog.text
+    assert str(home) not in caplog.text
+
+
+def test_register_result_preserves_positional_arguments(home: Path) -> None:
+    result = userinstall.RegisterResult("written", (), (), False, (home,), ())
+    assert result.fly_written == (home,)
+    assert result.fly_skipped == result.fly_unchanged == ()
+
+
+@pytest.mark.parametrize("error", [errno.EACCES, errno.EPERM, errno.EIO])
+def test_fly_read_access_denied_uses_base_identity(
+    home: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: int
+) -> None:
+    directory = section(home, "startmenu2")
+    entry = directory / "astra-voice.desktop"
+    entry.write_bytes(owned())
+    info = entry.stat()
+    original_fdopen = os.fdopen
+
+    @contextmanager
+    def denied_read(fd: int, mode: str) -> Iterator[Mock]:
+        with original_fdopen(fd, mode) as stream:
+            wrapped = Mock(wraps=stream)
+            wrapped.read.side_effect = OSError(error, "чтение запрещено")
+            yield wrapped
+
+    monkeypatch.setattr(os, "fdopen", denied_read)
+    with userinstall._fly_directory(directory) as fd:
+        if error == errno.EIO:
+            with pytest.raises(OSError, match="чтение запрещено"):
+                userinstall._management_identity(entry, directory_fd=fd)
+            with pytest.raises(OSError, match="чтение запрещено"):
+                userinstall._menu_state(entry, directory_fd=fd)
+        else:
+            assert userinstall._management_identity(entry, directory_fd=fd) == (
+                info.st_dev,
+                info.st_ino,
+                info.st_mode,
+                info.st_uid,
+            )
+            assert userinstall._menu_state(entry, directory_fd=fd) == "foreign"
+            assert "Недоступная запись меню Fly сохранена" in caplog.text
+    assert entry.read_bytes() == owned()

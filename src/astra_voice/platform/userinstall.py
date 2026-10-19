@@ -134,7 +134,10 @@ class InstallResult:
 
 @dataclass(frozen=True)
 class RegisterResult:
-    """Меню: записано, совпало или чужое; значки: записаны/пропущены."""
+    """Меню: записано, совпало или чужое; значки: записаны/пропущены.
+
+    Fly: written — новые байты, unchanged — совпали, skipped — чужое/ошибка.
+    """
 
     menu: Literal["written", "unchanged", "foreign"]
     icons_written: tuple[Path, ...]
@@ -142,6 +145,7 @@ class RegisterResult:
     autostart: bool
     fly_written: tuple[Path, ...] = ()
     fly_skipped: tuple[Path, ...] = ()
+    fly_unchanged: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -769,10 +773,20 @@ def _menu_state(
         ).st_mode
     except FileNotFoundError:
         return "none"
+    except OSError as exc:
+        if directory_fd is None or exc.errno not in (errno.EACCES, errno.EPERM):
+            raise
+        log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
+        return "foreign"
     if stat.S_ISREG(mode):
         try:
             data = _desktop_data(path, directory_fd=directory_fd)
         except UserInstallError:
+            return "foreign"
+        except OSError as exc:
+            if directory_fd is None or exc.errno not in (errno.EACCES, errno.EPERM):
+                raise
+            log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
             return "foreign"
         if autostart._properties(data).get(b"X-AstraVoice-Managed") == b"true":
             return "ours"
@@ -788,11 +802,17 @@ def _fly_directory(path: Path) -> Iterator[int]:
     fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         for index, part in enumerate(path.parts[1:], 1):
-            child = os.open(
-                part,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=fd,
-            )
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+            except OSError as exc:
+                if index < len(home.parts) and exc.errno in (errno.ENOTDIR, errno.ELOOP):
+                    if stat.S_ISLNK(os.stat(part, dir_fd=fd, follow_symlinks=False).st_mode):
+                        log.warning("fly_menu_skipped reason=home_symlink")
+                raise
             os.close(fd)
             fd = child
             info = os.fstat(fd)
@@ -803,6 +823,8 @@ def _fly_directory(path: Path) -> Iterator[int]:
                 raise UserInstallError(f"Небезопасный каталог меню Fly: {tilde(path)}.")
         if os.fstat(fd).st_uid != os.getuid():
             raise UserInstallError(f"Чужой каталог меню Fly: {tilde(path)}.")
+        # Чтение списка имён без права поиска (0400) ещё не даёт доступа к записям.
+        os.stat(".", dir_fd=fd, follow_symlinks=False)
         yield fd
     finally:
         os.close(fd)
@@ -841,19 +863,28 @@ def _fly_directories(depth: int, *, strict: bool = False) -> Iterator[Path]:
             with opener(directory) as fd:
                 if fd is None:
                     continue
-                children = sorted(os.listdir(fd)) if level < depth else []
-                children = [
-                    name
-                    for name in children
-                    if stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)
-                ]
+                children = []
+                for name in sorted(os.listdir(fd)) if level < depth else []:
+                    try:
+                        mode = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode
+                    except OSError as exc:
+                        if exc.errno not in (errno.ENOENT, errno.EACCES, errno.EPERM):
+                            raise
+                        log.warning(
+                            "Недоступная папка меню Fly пропущена: %s", tilde(directory / name)
+                        )
+                        continue
+                    if stat.S_ISDIR(mode):
+                        children.append(name)
         except FileNotFoundError:
+            if level:
+                log.warning("Недоступная папка меню Fly пропущена: %s", tilde(directory))
             continue
         except OSError as exc:
             # Симлинк/не-каталог не является деревом меню и не обходится.
             if exc.errno in (errno.ENOTDIR, errno.ELOOP):
                 continue
-            if strict:
+            if strict and exc.errno not in (errno.EACCES, errno.EPERM):
                 raise
             log.warning("Папка меню Fly пропущена: %s", tilde(directory))
             continue
@@ -865,9 +896,16 @@ def _fly_directories(depth: int, *, strict: bool = False) -> Iterator[Path]:
 
 
 def _fly_menu_targets() -> list[Path]:
-    """По одному разделу «Инструменты» в каждом дереве, иначе корень дерева."""
+    """Свои записи на прежних местах; при их отсутствии — «Инструменты» или корень."""
+    # Перенесённые пользователем записи обновляем на месте в каждом дереве.
+    existing: dict[Path, list[Path]] = {}
+    fly = Path.home() / ".fly"
+    for entry, state in _fly_menu_entries(strict=False):
+        if state == "ours":
+            root = fly / entry.relative_to(fly).parts[0]
+            existing.setdefault(root, []).append(entry.parent)
     targets: dict[Path, Path] = {}
-    selected: set[Path] = set()
+    selected: set[Path] = set(existing)
     for directory in _fly_directories(2):
         root = Path.home() / ".fly" / directory.relative_to(Path.home() / ".fly").parts[0]
         targets.setdefault(root, root)
@@ -885,22 +923,28 @@ def _fly_menu_targets() -> list[Path]:
         if utility or (root.name == "startmenu2" and properties.get(b"Name") == b"Utility"):
             targets[root] = directory
             selected.add(root)
-    return list(targets.values())
+    return [
+        directory
+        for root, fallback in targets.items()
+        for directory in existing.get(root, [fallback])
+    ]
 
 
 def _refresh_fly_menu() -> None:
     """Обновляет уже существующее меню; сбой оболочки не отменяет установку."""
     try:
-        if shutil.which("fly-wmfunc") is None:
-            log.info("Меню Fly: fly-wmfunc не найден, обновление пропущено.")
+        utility = Path("/usr/bin/fly-wmfunc")
+        if not utility.is_file() or not os.access(utility, os.X_OK):
+            log.info("Меню Fly: /usr/bin/fly-wmfunc недоступен, обновление пропущено.")
             return
         result = subprocess.run(
-            ["fly-wmfunc", "FLYWM_UPDATE_STARTMENU"],
+            [str(utility), "FLYWM_UPDATE_STARTMENU"],
             timeout=5,
             check=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=childenv.clean_env(),
         )
         if result.returncode:
             log.warning("Меню Fly не обновлено: код %s.", result.returncode)
@@ -908,9 +952,12 @@ def _refresh_fly_menu() -> None:
         log.warning("Меню Fly не обновлено: утилита недоступна или превышено время ожидания.")
 
 
-def _register_fly(menu: Path, data: bytes) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+def _register_fly(
+    menu: Path, data: bytes
+) -> tuple[tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]]:
     written: list[Path] = []
     skipped: list[Path] = []
+    unchanged: list[Path] = []
     origin = str(menu.absolute())
     for directory in _fly_menu_targets():
         target = directory / "astra-voice.desktop"
@@ -918,8 +965,11 @@ def _register_fly(menu: Path, data: bytes) -> tuple[tuple[Path, ...], tuple[Path
             if not origin.isprintable() or "\\" in origin:
                 raise UserInstallError("Небезопасный путь исходной записи меню.")
             fly_data = data + f"X-Fly-OriginFile={origin}\n".encode()
-            if _write_desktop_file(target, fly_data, create_parent=False):
+            result = _write_fly_desktop_file(target, fly_data)
+            if result == "written":
                 written.append(target)
+            elif result == "unchanged":
+                unchanged.append(target)
             else:
                 skipped.append(target)
         except (OSError, UserInstallError) as exc:
@@ -927,7 +977,7 @@ def _register_fly(menu: Path, data: bytes) -> tuple[tuple[Path, ...], tuple[Path
             skipped.append(target)
     if written:
         _refresh_fly_menu()
-    return tuple(written), tuple(skipped)
+    return tuple(written), tuple(skipped), tuple(unchanged)
 
 
 def _fly_menu_entries(*, strict: bool) -> Iterator[tuple[Path, str]]:
@@ -981,39 +1031,44 @@ def _public_directory(path: Path) -> None:
     path.chmod(0o755)
 
 
+def _write_fly_desktop_file(path: Path, data: bytes) -> Literal["written", "unchanged", "foreign"]:
+    """Записывает Fly через закреплённый каталог и различает причины пропуска."""
+    with _fly_directory(path.parent) as fd:
+        state = _menu_state(path, directory_fd=fd)
+        if state == "foreign":
+            log.warning("Чужая запись меню Fly сохранена: %s", tilde(path))
+            return "foreign"
+        if state == "ours" and _desktop_data(path, directory_fd=fd) == data:
+            return "unchanged"
+        fly_temporary = f".{path.name}.{secrets.token_hex(8)}"
+        temporary_fd = os.open(
+            fly_temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=fd,
+        )
+        try:
+            with os.fdopen(temporary_fd, "wb") as file:
+                file.write(data)
+                file.flush()
+                os.fchmod(file.fileno(), 0o644)
+                os.fsync(file.fileno())
+            # Повторная проверка сохраняет чужую запись, появившуюся при записи temp.
+            if _menu_state(path, directory_fd=fd) == "foreign":
+                log.warning("Чужая запись меню Fly сохранена: %s", tilde(path))
+                return "foreign"
+            os.replace(fly_temporary, path.name, src_dir_fd=fd, dst_dir_fd=fd)
+            os.fsync(fd)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(fly_temporary, dir_fd=fd)
+        return "written"
+
+
 def _write_desktop_file(path: Path, data: bytes, *, create_parent: bool = True) -> bool:
     """Атомарная запись рядом с целью; совпавшие байты сохраняют mtime (§4)."""
     if not create_parent:
-        with _fly_directory(path.parent) as fd:
-            state = _menu_state(path, directory_fd=fd)
-            if state == "foreign":
-                log.warning("Чужая запись меню Fly сохранена: %s", tilde(path))
-                return False
-            if state == "ours" and _desktop_data(path, directory_fd=fd) == data:
-                return False
-            fly_temporary = f".{path.name}.{secrets.token_hex(8)}"
-            temporary_fd = os.open(
-                fly_temporary,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                0o600,
-                dir_fd=fd,
-            )
-            try:
-                with os.fdopen(temporary_fd, "wb") as file:
-                    file.write(data)
-                    file.flush()
-                    os.fchmod(file.fileno(), 0o644)
-                    os.fsync(file.fileno())
-                # Повторная проверка сохраняет чужую запись, появившуюся при записи temp.
-                if _menu_state(path, directory_fd=fd) == "foreign":
-                    log.warning("Чужая запись меню Fly сохранена: %s", tilde(path))
-                    return False
-                os.replace(fly_temporary, path.name, src_dir_fd=fd, dst_dir_fd=fd)
-                os.fsync(fd)
-            finally:
-                with suppress(FileNotFoundError):
-                    os.unlink(fly_temporary, dir_fd=fd)
-            return True
+        return _write_fly_desktop_file(path, data) == "written"
     _public_directory(path.parent)
     if os.path.lexists(path):
         if not stat.S_ISREG(path.lstat().st_mode):
@@ -1074,15 +1129,22 @@ def _register() -> RegisterResult:
         menu_result = "written" if _write_desktop_file(menu, data) else "unchanged"
     fly_written: tuple[Path, ...]
     fly_skipped: tuple[Path, ...]
+    fly_unchanged: tuple[Path, ...]
     if menu_result == "foreign":
         log.warning("Регистрация меню Fly пропущена: reason=foreign_xdg_entry")
-        fly_written, fly_skipped = (), ()
+        fly_written, fly_skipped, fly_unchanged = (), (), ()
     else:
-        fly_written, fly_skipped = _register_fly(menu, data)
+        fly_written, fly_skipped, fly_unchanged = _register_fly(menu, data)
     # Автозапуск перенацеливается независимо от значков.
     retargeted = autostart.retarget()
     return RegisterResult(
-        menu_result, tuple(written), tuple(skipped), retargeted, fly_written, fly_skipped
+        menu_result,
+        tuple(written),
+        tuple(skipped),
+        retargeted,
+        fly_written,
+        fly_skipped,
+        fly_unchanged=fly_unchanged,
     )
 
 
@@ -1215,10 +1277,6 @@ def _unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
     if deb_executable is None:
         deb_executable = paths.SYSTEM_EXECUTABLE
     menu, icons = _desktop_paths()
-    removed_menu = _menu_state(menu) == "ours"
-    if removed_menu:
-        menu.unlink()
-        _sync_directory(menu.parent)
     removed_fly: list[Path] = []
     for directory in _fly_directories(3, strict=True):
         with _optional_fly_directory(directory) as fd:
@@ -1226,11 +1284,21 @@ def _unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
                 continue
             path = directory / "astra-voice.desktop"
             if _menu_state(path, directory_fd=fd) == "ours":
-                os.unlink(path.name, dir_fd=fd)
+                try:
+                    os.unlink(path.name, dir_fd=fd)
+                except OSError as exc:
+                    if exc.errno not in (errno.ENOENT, errno.EACCES, errno.EPERM):
+                        raise
+                    log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
+                    continue
                 os.fsync(fd)
                 removed_fly.append(path)
     if removed_fly:
         _refresh_fly_menu()
+    removed_menu = _menu_state(menu) == "ours"
+    if removed_menu:
+        menu.unlink()
+        _sync_directory(menu.parent)
     removed_icons: list[Path] = []
     if _is_real_dir(icons.parent):
         for icon in _owned_icons(icons):
@@ -1364,15 +1432,26 @@ def _management_identity(path: Path, *, directory_fd: int | None = None) -> tupl
         info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         return ()
+    except OSError as exc:
+        if directory_fd is None or exc.errno not in (errno.EACCES, errno.EPERM):
+            raise
+        log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
+        return ()
     base = (info.st_dev, info.st_ino, info.st_mode, info.st_uid)
     if stat.S_ISLNK(info.st_mode):
         return (*base, os.readlink(name, dir_fd=directory_fd))
     if stat.S_ISREG(info.st_mode):
-        fd = os.open(
-            name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
-            dir_fd=directory_fd,
-        )
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            if directory_fd is None or exc.errno not in (errno.EACCES, errno.EPERM):
+                raise
+            log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
+            return base
         with os.fdopen(fd, "rb") as stream:
             opened = os.fstat(stream.fileno())
             if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
@@ -1381,17 +1460,25 @@ def _management_identity(path: Path, *, directory_fd: int | None = None) -> tupl
                 raise UserInstallError("Небезопасный файл установки.")
             if directory_fd is not None:
                 # Большая чужая запись не удаляется; не читаем её целиком ради снимка.
-                digest = hashlib.sha256(stream.read(DESKTOP_FILE_LIMIT + 1)).digest()
+                try:
+                    data = stream.read(DESKTOP_FILE_LIMIT + 1)
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EPERM):
+                        raise
+                    log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
+                    return base
+                digest = hashlib.sha256(data).digest()
                 return (*base, opened.st_size, opened.st_mtime_ns, digest)
             return (*base, hashlib.file_digest(stream, "sha256").digest())
     return base
 
 
 def management_snapshot() -> ManagementSnapshot:
-    """Read strict facts; caller holds the install lock for mutation revalidation.
+    """Снимок для повторной проверки под замком установки перед изменением.
 
-    IO/ownership failures propagate. Ancestor identities cover path replacement.
-    Lock file and directory mtime deliberately are not consent facts.
+    Ошибки ввода-вывода и владельца передаются вызывающему коду, кроме локально
+    недоступных ветвей Fly: они пропускаются, непрочитанная запись — без digest.
+    Идентификаторы предков учитывают подмену пути; mtime каталогов и lock — нет.
     """
     validate_remove_paths()
     app = paths.appimage_app_dir()

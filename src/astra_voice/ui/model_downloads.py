@@ -1864,6 +1864,25 @@ class ModelDownloads(QObject):
             return None
         return next((entry for entry in self._entries if entry.id == model_id), None)
 
+    def can_make_current(self, model_id: str) -> bool:
+        """Установленная ревизия проверена и не отозвана издателем."""
+        if self._model is None:
+            return False
+        entry = next((entry for entry in self._entries if entry.id == model_id), None)
+        if entry is None:
+            return False
+        try:
+            # Каталог может уже предлагать другую, более новую ревизию.
+            revision = self._installed_revision(entry)
+            return (
+                bool(revision)
+                and self._model.record_state(entry.id, revision) == "ok"
+                and not self._is_revoked(entry, revision)
+            )
+        except (OSError, StoreError):
+            log.warning("Не удалось проверить доступность установленной модели")
+            return False
+
     def makeModelCurrent(self, model_id: str) -> None:  # noqa: N802
         """Делает установленную ревизию рабочей; сломанную рабочей не делаем."""
         entry = self._managed_entry(model_id)

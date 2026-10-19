@@ -570,6 +570,29 @@ def test_download_counter_and_selection_line_contract(
         assert ".selectionLine" in (REPO / path).read_text(encoding="utf-8")
 
 
+def test_microphone_record_limit_is_read_only_constant_int() -> None:
+    from astra_voice.core.dictation import TEST_RECORD_LIMIT_MS
+    from astra_voice.core.settings import Settings
+    from astra_voice.ui.bridges import OnboardingController, SettingsBridge
+
+    fakes = load_module("_qml_mic_limit_contract_fakes", REPO / "tests/xvfb/test_onboarding.py")
+    settings = Settings()
+    controller = OnboardingController(
+        SettingsBridge(settings), settings=settings, device_provider=lambda: []
+    )
+    fake = fakes.FakeOnboarding()
+    for bridge in (controller, fake):
+        meta = bridge.metaObject()
+        index = meta.indexOfProperty("testRecordLimitMs")
+        assert index >= 0
+        prop = meta.property(index)
+        assert prop.typeName() == "int"
+        assert prop.isConstant() and not prop.isWritable()
+        assert prop.read(bridge) == TEST_RECORD_LIMIT_MS
+    document = DOC_PATH.read_text(encoding="utf-8")
+    assert "| `testRecordLimitMs` | `int` | только чтение, постоянное |" in document
+
+
 def test_tray_hint_property_is_read_only_bool_with_notify() -> None:
     from astra_voice.ui.bridges import SettingsBridge
 

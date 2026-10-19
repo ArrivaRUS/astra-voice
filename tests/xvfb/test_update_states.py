@@ -1,7 +1,9 @@
 """M7-ядро v0.2: строка-статус, панель «Что нового» и раздел «Сеть» в двух темах.
 
-Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_UPDATES
-или по умолчанию design/refs/impl/updates. Снимки сверяются глазами с
+Без флага снимки идут в системный временный каталог или заданный через
+ASTRA_VOICE_SNAPSHOT_DIR_UPDATES путь вне design/refs. Только
+ASTRA_VOICE_UPDATE_REFS=1 выбирает design/refs/impl/updates, игнорируя этот путь.
+Снимки сверяются глазами с
 design/refs/04-footer-states*.png, 04-update-panel*.png и 04-network*.png;
 сравнение по пикселям не делается — макеты рисуют ещё не реализованные состояния.
 """
@@ -27,13 +29,11 @@ from PyQt5.QtTest import QTest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
+from helpers.snapshots import snapshot_dir  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-# Промежуточные прогоны разработки не трогают эталоны репозитория.
-SNAPSHOTS = REPO / Path(
-    os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_UPDATES") or "design/refs/impl/updates"
-)
+SNAPSHOTS = snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_UPDATES", "updates", "design/refs/impl/updates")
 FOOTER_W, FOOTER_H = 760, 36
 WIDTH, HEIGHT = 1024, 620
 NOTE_LINES = (

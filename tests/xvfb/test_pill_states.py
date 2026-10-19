@@ -3,8 +3,10 @@
 xvfb в системе не установлен. Запуск без X-сервера:
 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software pytest -m xvfb.
 Снимки всегда включают поля тени 18/18/18/24 px и принимаются только при альфе
-фона 240 ± 1 в центре пилюли. Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_PILL
-или по умолчанию design/refs/impl/pill. PNG публикуются из временного каталога
+фона 240 ± 1 в центре пилюли. Без флага снимки идут в системный временный каталог
+или заданный через ASTRA_VOICE_SNAPSHOT_DIR_PILL путь вне design/refs. Только
+ASTRA_VOICE_UPDATE_REFS=1 выбирает design/refs/impl/pill, игнорируя этот путь.
+PNG публикуются из временного каталога
 атомарной заменой только при изменении пикселей (или отсутствии читаемого PNG)
 и после успешных проверок всего модуля; метаданные PNG не учитываются.
 Референс design/refs/09-pill.png проверяется на наличие, без попиксельного сравнения.
@@ -28,10 +30,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
+from helpers.snapshots import snapshot_dir  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-SNAPSHOTS = REPO / Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_PILL") or "design/refs/impl/pill")
+SNAPSHOTS = snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_PILL", "pill", "design/refs/impl/pill")
 LABELS = {
     "hidden": "",
     "loading-model": "Загружаю модель…",

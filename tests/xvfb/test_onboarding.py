@@ -1,7 +1,8 @@
 """Пять шагов и настройки в двух темах: Qt5, состояния мостов и детерминированные PNG.
 
-Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING
-или по умолчанию design/refs/impl/onboarding.
+Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING;
+по умолчанию используется системный временный каталог. ASTRA_VOICE_UPDATE_REFS=1
+явно направляет снимки в design/refs/impl/onboarding.
 Все записи тестов, включая временные PNG, ограничены SNAPSHOTS. Публикация
 через os.replace выполняется в teardown только после успеха всего модуля.
 """
@@ -13,6 +14,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Iterator
 from decimal import Decimal
 from functools import partial
@@ -45,12 +47,13 @@ from PyQt5.QtTest import QSignalSpy, QTest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
+from helpers.snapshots import snapshot_dir  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
 # Промежуточные прогоны разработки не трогают эталоны репозитория.
-SNAPSHOTS = REPO / Path(
-    os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING") or "design/refs/impl/onboarding"
+SNAPSHOTS = snapshot_dir(
+    "ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING", "onboarding", "design/refs/impl/onboarding"
 )
 WIDTH, HEIGHT = 1024, 620
 
@@ -637,6 +640,12 @@ class FakeOnboarding(QObject):
         self.changed.emit()
 
     testState = pyqtProperty(str, _get_testState, _set_testState, notify=changed)
+
+    @pyqtProperty(int, constant=True)
+    def testRecordLimitMs(self) -> int:
+        from astra_voice.core.dictation import TEST_RECORD_LIMIT_MS
+
+        return TEST_RECORD_LIMIT_MS
 
     def _get_testMessage(self) -> str:
         return self._testMessage
@@ -4459,7 +4468,7 @@ def test_mic_recording_hint_counts_down_only_during_recording(
         status = root.findChild(QObject, "testStatusText")
         assert hint is not None and timer is not None
         assert result is not None and status is not None
-        assert timer.property("interval") == 1000
+        assert timer.property("interval") == 200
         assert timer.property("running") is True
         assert hint.property("textFormat") == Qt.PlainText
         assert hint.property("color") == theme_color("fgMuted", dark)
@@ -4467,20 +4476,25 @@ def test_mic_recording_hint_counts_down_only_during_recording(
         assert hint.property("height") == hint.property("lineHeight")
         recording_y = result.property("y")
         assert hint.property("text").endswith("через 5 с")
-        # Первый тик проходит настоящий event loop; дальше не замедляем тест
-        # ожиданием всех пяти секунд и проверяем последовательность сигналом.
+        # Первый переход проходит настоящий event loop; затем моделируем
+        # задержку тика, меняя время начала, без ожидания всего лимита.
         for _ in range(30):
             if hint.property("text").endswith("через 4 с"):
                 break
             QTest.qWait(50)
         assert hint.property("text").endswith("через 4 с")
-        for remaining in (4, 3, 2, 1, 1):
+        # Повторный тик без прошедшего времени не уменьшает счётчик.
+        QMetaObject.invokeMethod(timer, "triggered", Qt.DirectConnection)
+        assert hint.property("text").endswith("через 4 с")
+        mic_step = hint.parent()
+        for elapsed_ms, remaining in ((2200, 3), (3400, 2), (4800, 1), (7200, 1)):
+            mic_step.setProperty("testRecordingStartedAt", time.time() * 1000 - elapsed_ms)
+            QMetaObject.invokeMethod(timer, "triggered", Qt.DirectConnection)
+            onboarding_app.processEvents()
             assert hint.property("text") == (
                 f"Говорите. Нажмите «Остановить» — или запись остановится сама через {remaining} с"
             )
             assert status.property("text") == ""
-            QMetaObject.invokeMethod(timer, "triggered", Qt.DirectConnection)
-            onboarding_app.processEvents()
 
         for state, expected in (
             ("processing", "Распознаю…"),

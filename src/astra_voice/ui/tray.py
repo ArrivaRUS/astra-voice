@@ -417,6 +417,7 @@ class Tray(QObject):
         self._has_last_text = False
         self._updates_enabled = False
         self._model_recheck_enabled = False
+        self._model_entries: tuple[tuple[str, str], ...] | None = None
 
         self._done_timer = QTimer(self)
         self._done_timer.setSingleShot(True)
@@ -588,30 +589,45 @@ class Tray(QObject):
         self._model_recheck_action.setEnabled(self._model_recheck_enabled)
         self._model_recheck_action.setVisible(self._model_recheck_enabled)
 
-    def set_models(self, models: Sequence[str | tuple[str, str]], active: str | None) -> None:
+    def set_models(
+        self,
+        models: Sequence[str | tuple[str, str]],
+        active: str | None,
+        *,
+        disabled: frozenset[str] = frozenset(),
+    ) -> None:
         """Пары (id, имя из настроек); прежние строки используют имя как id."""
-        entries = [(item, item) if isinstance(item, str) else item for item in models]
+        entries = tuple((item, item) if isinstance(item, str) else item for item in models)
         self._active_model = active
-        self._model_menu.clear()
-        self._model_action.setMenu(None)
-        self._model_action.setEnabled(len(entries) > 1)
-        if not entries:
-            self._model_action.setText("Модель не установлена")
-        elif len(entries) == 1:
-            self._model_action.setText(
-                f"Модель: {clean_display_name(entries[0][1], for_menu=True)}"
-            )
-        else:
-            self._model_action.setText("Модель")
-            self._model_action.setMenu(self._model_menu)
-            for model_id, name in entries:
-                action = QAction(clean_display_name(name, for_menu=True), self._model_menu)
-                action.setData(model_id)
-                action.setCheckable(True)
-                action.setChecked(model_id == active)
-                self._model_group.addAction(action)
-                action.triggered.connect(partial(self._select_model, action))
-                self._model_menu.addAction(action)
+        if entries != self._model_entries:
+            self._model_entries = entries
+            # Сигнал выбора может синхронно изменить состав. clear() уничтожает
+            # QAction внутри стека Qt; удаляем только после завершения доставки.
+            for action in self._model_menu.actions():
+                self._model_menu.removeAction(action)
+                self._model_group.removeAction(action)
+                action.deleteLater()
+            self._model_action.setMenu(None)
+            self._model_action.setEnabled(len(entries) > 1)
+            if not entries:
+                self._model_action.setText("Модель не установлена")
+            elif len(entries) == 1:
+                self._model_action.setText(
+                    f"Модель: {clean_display_name(entries[0][1], for_menu=True)}"
+                )
+            else:
+                self._model_action.setText("Модель")
+                self._model_action.setMenu(self._model_menu)
+                for model_id, name in entries:
+                    action = QAction(clean_display_name(name, for_menu=True), self._model_menu)
+                    action.setData(model_id)
+                    action.setCheckable(True)
+                    self._model_group.addAction(action)
+                    action.triggered.connect(partial(self._select_model, action))
+                    self._model_menu.addAction(action)
+        for action in self._model_menu.actions():
+            action.setChecked(action.data() == active)
+            action.setEnabled(action.data() not in disabled)
         self._update_menu()
 
     def _select_model(self, action: QAction, checked: bool = False) -> None:

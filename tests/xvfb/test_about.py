@@ -1,7 +1,9 @@
 """M9-а v0.2: раздел «О программе» в двух темах (PRD F13, референс 06-about*.png).
 
-Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_ABOUT или по умолчанию
-design/refs/impl/about. Снимки сверяются глазами с design/refs/06-about*.png;
+Без флага снимки идут в системный временный каталог или заданный через
+ASTRA_VOICE_SNAPSHOT_DIR_ABOUT путь вне design/refs. Только
+ASTRA_VOICE_UPDATE_REFS=1 выбирает design/refs/impl/about, игнорируя этот путь.
+Снимки сверяются глазами с design/refs/06-about*.png;
 сравнение по пикселям не делается. Два кадра на состояние: окно обычного
 размера (верх раздела, как в макете) и высокое окно — раздел целиком.
 """
@@ -25,13 +27,11 @@ from PyQt5.QtTest import QTest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
+from helpers.snapshots import snapshot_dir  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-# Промежуточные прогоны разработки не трогают эталоны репозитория.
-SNAPSHOTS = REPO / Path(
-    os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_ABOUT") or "design/refs/impl/about"
-)
+SNAPSHOTS = snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_ABOUT", "about", "design/refs/impl/about")
 WIDTH, HEIGHT = 1024, 620
 TALL = 1200
 

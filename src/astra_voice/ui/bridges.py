@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import QFileDialog
 from astra_voice.core.dictation import (
     LEVEL_FAILED,
     TEST_FAILED,
+    TEST_RECORD_LIMIT_MS,
     LevelCallback,
     MicrophoneLevelUpdate,
     MicrophoneTestUpdate,
@@ -405,6 +406,10 @@ class SettingsBridge(QObject):
     @pyqtProperty("QVariantList", notify=modelsChanged)
     def models(self) -> list[dict[str, Any]]:
         return self._downloads.models if self._downloads is not None else []
+
+    def can_select_model(self, model_id: str) -> bool:
+        """Доступность ревизии для трея независимо от кэша состояния карточки."""
+        return self._downloads is not None and self._downloads.can_make_current(model_id)
 
     @pyqtProperty(bool, notify=revocationUnknownChanged)
     def revocationUnknown(self) -> bool:  # noqa: N802
@@ -2163,6 +2168,10 @@ class OnboardingController(QObject):
     @pyqtProperty(str, notify=testStateChanged)
     def testState(self) -> str:  # noqa: N802
         return self._test_state
+
+    @pyqtProperty(int, constant=True)
+    def testRecordLimitMs(self) -> int:  # noqa: N802
+        return TEST_RECORD_LIMIT_MS
 
     @pyqtProperty(str, notify=testTextChanged)
     def testText(self) -> str:  # noqa: N802

@@ -28,17 +28,25 @@ Item {
     readonly property string testMessage: root.bridge ? root.bridge.testMessage : ""
     readonly property bool levelSilent: root.bridge ? root.bridge.levelSilent : false
     readonly property bool testing: testState === "preparing" || testState === "recording" || testState === "processing"
-    // Согласовано с TEST_RECORD_LIMIT_MS = 5000 в core/dictation.py.
-    readonly property int testRecordLimitSeconds: 5
-    property int testSecondsRemaining: testRecordLimitSeconds
-    onTestStateChanged: root.testSecondsRemaining = root.testRecordLimitSeconds
+    readonly property int testRecordLimitMs: root.bridge ? root.bridge.testRecordLimitMs : 0
+    property double testRecordingStartedAt: 0
+    property int testSecondsRemaining: Math.max(1, Math.ceil(testRecordLimitMs / 1000))
+    onTestStateChanged: {
+        root.testRecordingStartedAt = root.testState === "recording" ? Date.now() : 0
+        root.updateTestCountdown()
+    }
+
+    function updateTestCountdown() {
+        var elapsed = root.testState === "recording" ? Date.now() - root.testRecordingStartedAt : 0
+        root.testSecondsRemaining = Math.max(1, Math.ceil((root.testRecordLimitMs - elapsed) / 1000))
+    }
 
     Timer {
         objectName: "testRecordingCountdown"
-        interval: 1000
+        interval: 200
         repeat: true
         running: root.testState === "recording"
-        onTriggered: root.testSecondsRemaining = Math.max(1, root.testSecondsRemaining - 1)
+        onTriggered: root.updateTestCountdown()
     }
     readonly property int selectedDeviceIndex: deviceIndex(device)
     readonly property var selectedDevice: selectedDeviceIndex >= 0 ? devices[selectedDeviceIndex] : null
