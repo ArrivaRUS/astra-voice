@@ -26,7 +26,7 @@ from uuid import uuid4
 
 from astra_voice.core.command_mode import CommandMode, SessionSnapshot
 from astra_voice.platform.cowork import DeliveryResult
-from astra_voice.platform.hotkey import OVERLAP_TAP_REASON, HotkeyState
+from astra_voice.platform.hotkey import OVERLAP_TAP_REASON, PTT_TAP_REASON, HotkeyState
 from astra_voice.platform.paste import (
     PasteMode,
     PasteOutcome,
@@ -186,6 +186,7 @@ class _Utterance:
         self._result_infer_ms: float | None = None
         self._retries = 0
         self._cancel_requested = False
+        self._quiet_cancel = False
         self._cancel_pending = False
         self._job_cancel_pending = False
         self._capture_processing = False
@@ -269,6 +270,7 @@ class DictationOrchestrator:
     _result_infer_ms = _PhraseField[float | None]()
     _retries = _PhraseField[int]()
     _cancel_requested = _PhraseField[bool]()
+    _quiet_cancel = _PhraseField[bool]()
     _cancel_pending = _PhraseField[bool]()
     _job_cancel_pending = _PhraseField[bool]()
     _capture_notice = _PhraseField[Callable[[], None] | None]()
@@ -977,8 +979,8 @@ class DictationOrchestrator:
                     set_command_mode(mode == "command")
                 self._start()
             elif reason == "press":
-                # Только новое нажатие: tap→toggle и mapping-regrab сообщают
-                # о продолжающейся записи и не должны её отменять.
+                # Только новое нажатие: mapping-regrab сообщает
+                # о продолжающейся записи и не должен её отменять.
                 if self._can_overlap(mode):
                     self._log.info("диктовка: запись во время распознавания предыдущей фразы")
                     self._start()
@@ -1008,6 +1010,11 @@ class DictationOrchestrator:
         elif state == HotkeyState.IDLE and reason == "escape-cancel":
             if not self._refusing:
                 self.cancel("escape")
+        elif state == HotkeyState.IDLE and reason == PTT_TAP_REASON:
+            recording = self._recording_item()
+            if recording is not None:
+                with self._within(recording):
+                    self._cancel_one(PTT_TAP_REASON)
         self._pump()
 
     def _replay_hotkey_state(self, state: HotkeyState, reason: str, mode: str) -> None:
@@ -1787,11 +1794,22 @@ class DictationOrchestrator:
             finished = self._clock()
             self._paste_ms += max(0.0, (finished - started) * 1000)
             self._suspended = False
-        # Исход известен до разбора очереди: доставленную фразу отменить уже нельзя.
-        self._delivered = kind in (
+        # Escape мог уже отменить отложенное нажатие: replay тогда не начнёт B.
+        overlap_cancelled = self._press_queued() and self._hotkey_idle()
+        unsent = (
+            kind == PasteOutcomeKind.WINDOW_CHANGED
+            and outcome is not None
+            and outcome.reason in ("keys-held", "grab-refused")
+        )
+        delivered = kind in (
             PasteOutcomeKind.PASTED,
             PasteOutcomeKind.CLIPBOARD_ONLY,
             PasteOutcomeKind.WINDOW_CHANGED,
+        )
+        # Неотправленная A ещё занимает место очереди. Исключение — уже отменённое
+        # нажатие B: его отложенный Escape не должен отменять A вместо B.
+        self._delivered = delivered and (
+            not unsent or not self._press_queued() or overlap_cancelled
         )
         if (
             kind == PasteOutcomeKind.PASTED
@@ -1804,19 +1822,32 @@ class DictationOrchestrator:
             self._t_total_ms = max(0.0, (started + outcome.delivered_ms / 1000 - release) * 1000)
         # Отложенные события разбираются по порядку: результат следующей фразы ждёт
         # в своей очереди доставки, нажатие начинает её запись (US-2.7, решение 6).
+        previous_contexts = set(self._contexts)
         while self._queue and not self._closed:
             _, action = self._queue.popleft()
             # Сбой одного события (порт UI) не оставляет фразу навсегда во вставке.
             self._safe_ui(action, "диктовка: не удалось разобрать отложенное событие")
+            # B может получить и Escape, и подтверждение отмены внутри record.start:
+            # после возврата она уже не RECORDING, но A всё ещё нужна вставка.
+            overlap_cancelled = overlap_cancelled or any(
+                u not in previous_contexts and u._cancel_requested for u in self._contexts
+            )
         if self._closed or self._cancel_requested or self._phase != DictationPhase.PASTING:
             return
         if self._generation() != self._worker_generation:
             self._fail_restarted()
             return
+        if unsent and (self._other_recording() or overlap_cancelled):
+            # XTest не отправлялся: исход A ждёт отпускания или отмены B, как
+            # при перекрытии до вставки. Повтор и FIFO доставки обслужит _pump.
+            self._delivered = False
+            self._paste_text = text
+            return
         if kind == PasteOutcomeKind.BUSY and self._retries == 0:
             self._retries += 1
             self._later(BUSY_RETRY_MS, lambda: self._attempt_paste(text))
             return
+        self._delivered = delivered
         self.last_text_is_command = False
         self._last_text = normalize(text)
         self._tray.set_has_last_text(True)
@@ -1882,6 +1913,7 @@ class DictationOrchestrator:
         if self._cancel_requested:
             return
         self._cancel_requested = True
+        self._quiet_cancel = source == PTT_TAP_REASON
         if self._result_pending is not None:
             # Распознана и ждёт очереди: воркеру отменять уже нечего (US-2.7).
             self._result_pending = None
@@ -2193,7 +2225,10 @@ class DictationOrchestrator:
     def _finish(self, state: PillState, *, tray: TrayState = TrayState.IDLE) -> None:
         self._begin_finish()
         if self._publication_allowed() and not self._device_pill_held(state):
-            self._show_outcome(state)
+            if state == PillState.CANCELLED and self._quiet_cancel:
+                self._show_outcome(state, self._pill.hide)
+            else:
+                self._show_outcome(state)
         elif not self._publication_allowed():
             self._pill.hide()
         self._end_finish(state, tray=tray)

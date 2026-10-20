@@ -212,6 +212,13 @@ def _fly_blacklist_type(
     return FLY_FALLBACK_TYPE
 
 
+def _skip_mime(fmt: str, size: int = 0) -> bool:
+    """Единый фильтр снимка и сравнения с нашей полной публикацией."""
+    name = fmt.lower()
+    required = name.startswith("text/") or name in _TEXT_TARGETS or name == KDE_HINT.lower()
+    return not required and (name.startswith(_HEAVY_MIME_PREFIXES) or size > _MAX_MIME_BYTES)
+
+
 def snapshot_mime(md: Any) -> dict[str, bytes]:
     """Скопировать MIME до передачи владения QMimeData (S4, PRD F5.3).
 
@@ -223,13 +230,11 @@ def snapshot_mime(md: Any) -> dict[str, bytes]:
     if md is None:
         return snapshot
     for fmt in md.formats():
-        name = fmt.lower()
-        required = name.startswith("text/") or name in _TEXT_TARGETS or name == KDE_HINT.lower()
-        if not required and name.startswith(_HEAVY_MIME_PREFIXES):
+        if _skip_mime(fmt):
             log.debug("пропущен тяжёлый формат буфера: %s", fmt)
             continue
         data = md.data(fmt)
-        if not required and len(data) > _MAX_MIME_BYTES:
+        if _skip_mime(fmt, len(data)):
             log.debug("пропущен формат буфера свыше 1 МиБ: %s", fmt)
             continue
         snapshot[fmt] = bytes(data)
@@ -674,7 +679,20 @@ class PasteFlow:
         planned = method_for_wm_class(wm_class) if x is not None else PasteMethod.NONE
         saved = cb.snapshot(False) if mode == PasteMode.AUTO else None
         # Владение проверяется до новой публикации: один hint не доказывает авторство.
-        saved_is_ours = saved is not None and saved == _last_clipboard_snapshot and cb.owns(False)
+        saved_is_ours = (
+            saved is not None
+            and _last_clipboard_snapshot is not None
+            and saved
+            == {
+                fmt: data
+                for fmt, data in _last_clipboard_snapshot.items()
+                if not _skip_mime(fmt, len(data))
+            }
+            and cb.owns(False)
+        )
+        if saved_is_ours and _last_clipboard_snapshot is not None:
+            # Тип из чёрного списка Fly нужен и при возврате нашей прошлой фразы.
+            saved = _last_clipboard_snapshot.copy()
         primary = cb.snapshot(True) if planned == PasteMethod.SHIFT_INSERT else None
         pending = _PendingRestore(saved, saved_is_ours, primary) if saved is not None else None
         normalized = normalize(text)

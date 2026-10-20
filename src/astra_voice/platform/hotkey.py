@@ -33,6 +33,7 @@ MAPPING_REGRAB_PREFIX = "mapping-regrab:"
 # автомат возвращается к распознаванию. Toggle из такого касания не включается,
 # иначе микрофон остался бы открытым без намерения пользователя.
 OVERLAP_TAP_REASON = "overlap-tap"
+PTT_TAP_REASON = "tap-ignored"
 
 
 class HotkeyMode(Enum):
@@ -99,6 +100,8 @@ class MappingEvent:
 class HotkeyFsm:
     """Чистый автомат; ровно 0,3 с считается удержанием, как в S4.
 
+    В PTT касание короче порога возвращает IDLE с причиной ``PTT_TAP_REASON``:
+    слушатель тихо отменяет запись. Toggle включается только настройкой режима.
     US-2.7: при ``allow_overlap`` нажатие во время распознавания (PROCESSING)
     начинает запись следующей фразы. В PTT короткое такое нажатие не включает
     toggle: автомат возвращается в PROCESSING с причиной ``OVERLAP_TAP_REASON``,
@@ -173,8 +176,9 @@ class HotkeyFsm:
             self._limit_deadline = None
             self._emit(OVERLAP_TAP_REASON, now)
         elif held < PTT_THRESHOLD_S:
-            self.mode = HotkeyMode.TOGGLE
-            self._emit(f"tap→toggle ({held:.3f} с)", now)
+            self.state = HotkeyState.IDLE
+            self._limit_deadline = None
+            self._emit(PTT_TAP_REASON, now)
         else:
             self.stop(now, f"release ({held:.3f} с)")
 

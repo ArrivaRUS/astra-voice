@@ -281,6 +281,11 @@ class Pill(QObject):
         return self._state
 
     @property
+    def window_id(self) -> int | None:
+        """Текущий XID: смена флагов окна может пересоздать его."""
+        return self._wid
+
+    @property
     def window_size(self) -> tuple[int, int]:
         """Фактический размер окна, без компоновки и обработки отложенных сигналов."""
         return int(self._view.width()), int(self._view.height())
