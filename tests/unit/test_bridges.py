@@ -84,6 +84,36 @@ MICROPHONE_ERROR = (
 )
 
 
+def test_tray_hint_defaults_false_and_is_read_only() -> None:
+    bridge = SettingsBridge(Settings(), save=Mock())
+    assert bridge.trayXembedUnconfirmed is False
+    meta = bridge.metaObject()
+    prop = meta.property(meta.indexOfProperty("trayXembedUnconfirmed"))
+    assert prop.typeName() == "bool"
+    assert not prop.isWritable()
+    assert bytes(prop.notifySignal().name()) == b"trayXembedUnconfirmedChanged"
+
+
+def test_tray_hint_forwards_live_state_and_signal() -> None:
+    from PyQt5.QtCore import pyqtSignal
+
+    from astra_voice.ui.tray import Tray
+
+    class FakeTray(QObject):
+        xembedUnconfirmedChanged = pyqtSignal()
+        xembed_unconfirmed = False
+
+    tray = FakeTray()
+    bridge = SettingsBridge(Settings(), tray=cast(Tray, tray), save=Mock())
+    changed = QSignalSpy(bridge.trayXembedUnconfirmedChanged)
+    assert bridge.trayXembedUnconfirmed is False
+    for value in (True, False):
+        tray.xembed_unconfirmed = value
+        tray.xembedUnconfirmedChanged.emit()
+        assert bridge.trayXembedUnconfirmed is value
+    assert len(changed) == 2
+
+
 def _autostart_state(enabled: bool) -> AutostartState:
     return AutostartState(enabled, "none", False, False)
 
@@ -3500,7 +3530,13 @@ def test_model_app_assembly_and_shutdown(
 class MicrophoneBridgeRig:
     """Настоящие мост и автомат; внешние эффекты заменены наблюдаемыми портами."""
 
-    def __init__(self, *, with_host: bool = True, model_ready: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        with_host: bool = True,
+        model_ready: bool = True,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.settings = settings_mod.from_dict(
             {
                 "onboarding_step": 4,
@@ -3554,6 +3590,7 @@ class MicrophoneBridgeRig:
             settings=self.settings,
             host=self.host if with_host else None,
             device_provider=lambda: [],
+            clock=clock,
         )
 
     def subscribe_device_resolved(self, callback: Callable[[str], None] | None) -> str:
@@ -3722,6 +3759,155 @@ def test_microphone_properties_and_full_cycle(
     controller.startTest()
     assert controller.testState == "recording"
     assert controller.testText == controller.testDuration == controller.peak == ""
+
+
+def test_level_silent_waits_two_seconds_and_has_readonly_qt_contract() -> None:
+    clock = Mock(return_value=100.0)
+    rig = MicrophoneBridgeRig(clock=clock)
+    controller = rig.controller
+    prop = controller.metaObject().property(controller.metaObject().indexOfProperty("levelSilent"))
+    assert prop.isValid() and prop.typeName() == "bool" and not prop.isWritable()
+    assert bytes(prop.notifySignal().name()) == b"levelSilentChanged"
+    changes = QSignalSpy(controller.levelSilentChanged)
+    assert controller.levelSilent is False
+    controller.startLevelMonitor()
+    for elapsed in (0.0, 1.0, 1.999):
+        clock.return_value = 100.0 + elapsed
+        rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+        assert controller.levelSilent is False
+    assert len(changes) == 0
+    clock.return_value = 102.0
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.levelSilent is True and len(changes) == 1
+    clock.return_value = 103.0
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.levelSilent is True and len(changes) == 1
+
+
+def test_level_silent_never_flaps_for_five_seconds_of_threshold_noise() -> None:
+    clock = Mock(return_value=100.0)
+    rig = MicrophoneBridgeRig(clock=clock)
+    controller = rig.controller
+    changes = QSignalSpy(controller.levelSilentChanged)
+    controller.startLevelMonitor()
+    noise = (-60.0, -58.0, -59.5)
+    for index in range(150):
+        clock.return_value = 100.0 + (index + 1) / 30
+        rig.event("level", peak_dbfs=noise[index % len(noise)], rms_dbfs=-70.0)
+        assert controller.levelSilent is False, index
+    assert len(changes) == 0
+
+
+def test_level_silent_keeps_hysteresis_until_audible_peak() -> None:
+    clock = Mock(return_value=100.0)
+    rig = MicrophoneBridgeRig(clock=clock)
+    controller = rig.controller
+    changes = QSignalSpy(controller.levelSilentChanged)
+    controller.startLevelMonitor()
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    clock.return_value = 102.0
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.levelSilent is True
+    for elapsed in (2.1, 3.0, 5.0):
+        clock.return_value = 100.0 + elapsed
+        rig.event("level", peak_dbfs=-58.0, rms_dbfs=-70.0)
+        assert controller.levelSilent is True
+    assert len(changes) == 1
+    clock.return_value = 105.1
+    rig.event("level", peak_dbfs=-50.0, rms_dbfs=-70.0)
+    assert controller.levelSilent is False and len(changes) == 2
+
+
+def test_level_silent_uses_exact_entry_and_exit_thresholds(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Isolate comparisons from dBFS conversion rounding at the exact boundaries.
+    converted_level = Mock(return_value=0.02)
+    monkeypatch.setattr("astra_voice.ui.bridges.level_from_dbfs", converted_level)
+    clock = Mock(return_value=100.0)
+    rig = MicrophoneBridgeRig(clock=clock)
+    controller = rig.controller
+    controller.startLevelMonitor()
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    clock.return_value = 102.0
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.level == 0.02 and controller.levelSilent is True
+    converted_level.return_value = 0.05
+    clock.return_value = 102.1
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.level == 0.05 and controller.levelSilent is True
+    converted_level.return_value = 0.050001
+    clock.return_value = 102.2
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.levelSilent is False
+    converted_level.return_value = 0.020001
+    clock.return_value = 104.2
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.levelSilent is False
+    converted_level.return_value = 0.02
+    clock.return_value = 106.2
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.levelSilent is True
+
+
+def test_level_silent_forgets_peak_exactly_at_window_cutoff() -> None:
+    clock = Mock(return_value=100.0)
+    rig = MicrophoneBridgeRig(clock=clock)
+    controller = rig.controller
+    controller.startLevelMonitor()
+    rig.event("level", peak_dbfs=-50.0, rms_dbfs=-70.0)
+    clock.return_value = 101.999
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.levelSilent is False
+    clock.return_value = 102.0
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.levelSilent is True
+
+
+@pytest.mark.parametrize("state", ["idle", "error"])
+@pytest.mark.parametrize("initially_silent", [False, True])
+def test_level_silent_resets_window_on_non_listening(
+    state: Literal["idle", "error"], initially_silent: bool
+) -> None:
+    clock = Mock(return_value=100.0)
+    rig = MicrophoneBridgeRig(clock=clock)
+    controller = rig.controller
+    controller.startLevelMonitor()
+    rig.event("level", peak_dbfs=-70.0 if initially_silent else -50.0, rms_dbfs=-75.0)
+    clock.return_value = 102.0 if initially_silent else 101.0
+    if initially_silent:
+        rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+        assert controller.levelSilent is True
+    controller._level_updated(MicrophoneLevelUpdate(state))
+    assert controller.levelSilent is False
+    controller._level_updated(MicrophoneLevelUpdate("listening", peak_dbfs=-70.0))
+    restarted_at = clock.return_value
+    clock.return_value = restarted_at + 1.999
+    controller._level_updated(MicrophoneLevelUpdate("listening", peak_dbfs=-70.0))
+    assert controller.levelSilent is False
+    clock.return_value = restarted_at + 2.0
+    controller._level_updated(MicrophoneLevelUpdate("listening", peak_dbfs=-70.0))
+    assert controller.levelSilent is True
+
+
+def test_level_silent_resets_after_stop_and_requires_new_listening_period() -> None:
+    clock = Mock(return_value=100.0)
+    rig = MicrophoneBridgeRig(clock=clock)
+    controller = rig.controller
+    controller.startLevelMonitor()
+    clock.return_value = 102.0
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.levelSilent is True
+    controller.stopLevelMonitor()
+    rig.event("cancelled")
+    assert controller.levelState == "idle" and controller.levelSilent is False
+    clock.return_value = 110.0
+    controller.startLevelMonitor()
+    assert controller.levelState == "listening" and controller.levelSilent is False
+    clock.return_value = 111.999
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.levelSilent is False
+    clock.return_value = 112.0
+    rig.event("level", peak_dbfs=-70.0, rms_dbfs=-75.0)
+    assert controller.levelSilent is True
 
 
 @pytest.mark.parametrize("dbfs, expected", [(-90.0, 0.0), (-30.0, 0.5), (6.0, 1.0)])

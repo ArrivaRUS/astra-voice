@@ -559,6 +559,24 @@ Column {
             }
         }
 
+        Text {
+            objectName: "trayXembedHint"
+            height: visible ? implicitHeight : 0
+            x: Theme.cardRowPaddingX
+            width: parent.width - Theme.cardRowPaddingX * 2
+            visible: root.settings !== null && root.settings.trayXembedUnconfirmed === true
+            text: qsTr("Во Fly значок может быть скрыт за стрелкой области уведомлений; при записи пилюля показывается всегда.")
+            textFormat: Text.PlainText
+            color: Theme.fgMuted
+            font.family: Theme.fontUi
+            font.pixelSize: Theme.fontSettingSubSize
+            lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+            lineHeightMode: Text.FixedHeight
+            renderType: Text.NativeRendering
+            wrapMode: Text.WordWrap
+            bottomPadding: Theme.cardRowPaddingY
+        }
+
         SettingRow {
             objectName: "soundCuesRow"
             width: parent.width

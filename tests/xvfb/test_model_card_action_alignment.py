@@ -18,6 +18,7 @@ from PyQt5.QtTest import QSignalSpy, QTest
 
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication
+from helpers.snapshots import snapshot_dir, write_snapshot
 
 pytestmark = pytest.mark.xvfb
 QML = Path(__file__).resolve().parents[2] / "qml"
@@ -97,11 +98,13 @@ Rectangle {{
 
 
 def save_evidence(view: QQuickView, card: QQuickItem, name: str) -> None:
-    directory = os.environ.get("ASTRA_VOICE_MODEL_CARD_REPORT_DIR")
-    if not directory:
+    if not os.environ.get("ASTRA_VOICE_MODEL_CARD_REPORT_DIR"):
         return
-    destination = Path(directory)
-    destination.mkdir(parents=True, exist_ok=True)
+    destination = snapshot_dir(
+        "ASTRA_VOICE_MODEL_CARD_REPORT_DIR",
+        "model-card-action-alignment",
+        "design/refs/impl/model-card-action-alignment",
+    )
     geometry = []
     for item in visual_tree(card):
         if item.isVisible() and (item.objectName() or item.property("small") is True):
@@ -117,7 +120,11 @@ def save_evidence(view: QQuickView, card: QQuickItem, name: str) -> None:
                     "implicitWidth": item.implicitWidth(),
                 }
             )
-    (destination / f"{name}.json").write_text(json.dumps(geometry, ensure_ascii=False, indent=2))
+    write_snapshot(
+        destination,
+        f"{name}.json",
+        json.dumps(geometry, ensure_ascii=False, indent=2).encode("utf-8"),
+    )
     frame = view.grabWindow()
     if frame.isNull():
         capture = view.contentItem().grabToImage()
@@ -125,7 +132,7 @@ def save_evidence(view: QQuickView, card: QQuickItem, name: str) -> None:
         QTest.qWait(60)
         frame = capture.image()
     assert not frame.isNull()
-    assert frame.save(str(destination / f"{name}.png"))
+    write_snapshot(destination, f"{name}.png", frame)
 
 
 CASES: dict[str, dict[str, Any]] = {
