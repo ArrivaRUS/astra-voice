@@ -97,6 +97,15 @@ def test_mapping_loss_cancels_recording_without_waiting_for_release(
     r.mapping(escape=escape)
     assert r.manager.fsm.state == HotkeyState.IDLE
     assert r.rig.trace.count("record.cancel") == 1
+    # Индикатор держится до ACK закрытия захвата (docs/ipc-ack-protocol.md, протокол 4).
+    r.rig.guard.set_recording.assert_called_with(True)
+    r.runtime.orchestrator.on_worker_event(
+        {
+            "type": "cancelled",
+            "generation": r.rig.supervisor.generation,
+            "request_type": "record.cancel",
+        }
+    )
     r.rig.guard.set_recording.assert_called_with(False)
     r.manager.handle_event(HotkeyEvent("KeyRelease", 133, 2), r.rig.now + 1)
     r.runtime.orchestrator.on_worker_event(

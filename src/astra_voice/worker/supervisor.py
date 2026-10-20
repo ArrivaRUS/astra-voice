@@ -21,14 +21,15 @@ from astra_voice.worker import ipc
 MAX_RESTARTS = 3
 RESTART_WINDOW_S = 600
 _POLL_INTERVAL_S = 0.05
+_KILL_RETRY_INTERVAL_S = 2.0
 Message = dict[str, Any]
-RequestKey = tuple[str, str]
+RequestKey = tuple[str, str] | tuple[str, str, str]
 _CORRELATION: dict[str, RequestKey] = {
     "ping": ("reply", "pong"),
     "model.load": ("reply", "model.loaded"),
     "measure": ("reply", "measured"),
     "audio.close": ("reply", "audio.closed"),
-    "transcribe.file": ("utterance", "file"),
+    "transcribe.file": ("utterance", "file", "transcribe.file"),
 }
 # Уровень и тишина — индикация во время записи; record.limit означает автоостановку,
 # но распознавание этого utterance_id ещё впереди. audio.ready подтверждает открытие
@@ -47,7 +48,7 @@ _NOTIFICATIONS = {
 
 @dataclass
 class _Pending:
-    """Общее ожидание цепочки команд и номер последнего ответа при отправке."""
+    """Ожидание одного типа команды и номер последнего ответа при отправке."""
 
     deadline: float | None
     activity: int
@@ -58,9 +59,9 @@ class _Pending:
 
 def _correlation(message: Message) -> RequestKey:
     """Нормализует запрос, ответ и коррелированную ошибку в один ключ."""
-    if "utterance_id" in message:
-        return ("utterance", str(message["utterance_id"]))
     kind = str(message.get("request_type", message["type"]))
+    if "utterance_id" in message:
+        return ("utterance", str(message["utterance_id"]), kind)
     return _CORRELATION.get(kind, ("reply", kind))
 
 
@@ -94,14 +95,15 @@ class WorkerSupervisor:
     ожидание ответа, поскольку ошибка могла оставить микрофон открытым (У45).
     Для запросов без id допускается одно ожидание каждого типа ответа.
 
-    Единственный ключ корреляции задаёт ``_correlation``: явный utterance_id либо
-    таблица ``_CORRELATION``. Поэтому transcribe.file ожидает result/cancelled с
-    id "file"; этот служебный id также нельзя повторять в пределах поколения.
-    Команды одной диктовки разделяют одно ожидание и одно завершающее событие.
+    Корреляция диктовки включает utterance_id и request_type; каждое ожидание
+    имеет собственный дедлайн. transcribe.file использует служебный id "file".
+    Результат завершает предыдущие стадии записи, но не отдельную отмену.
     Промежуточные level/silent/record.limit/audio.ready передаются потребителю,
-    сохраняя ожидание и продлевая его дедлайн на заданный таймаут при совпадении ключа.
-    Ошибка с utterance_id завершает точное ожидание; request_type без id допустим,
-    если определяет единственное ожидание. Ошибка без корреляции завершает только
+    сохраняя ожидания фразы и продлевая их дедлайны, кроме ожидания отмены.
+    Ошибка с utterance_id и request_type завершает точное ожидание; тип без id допустим,
+    если определяет единственное ожидание. Ошибка захвата только с id передаётся
+    отдельно без приписывания типа; снимается лишь единственное ожидание не-отмены
+    (совместимость со старыми ответами). Ошибка без корреляции завершает только
     ожидания без диктовки (ключи reply) отдельными коррелированными событиями,
     сохраняя ожидания utterance для остановки и отмены записи (У45). Если ожиданий
     reply нет, такая ошибка всё равно передаётся потребителю через _emit.
@@ -122,6 +124,7 @@ class WorkerSupervisor:
         clock: Callable[[], float] = time.monotonic,
         command_factory: Callable[[int], list[str]] = worker_command,
         use_qt: bool = True,
+        launch_allowed: Callable[[], bool] = lambda: True,
     ) -> None:
         self.generation = 1
         self.dropped_late = 0
@@ -131,6 +134,8 @@ class WorkerSupervisor:
         self._clock = clock
         self._command_factory = command_factory
         self._use_qt = use_qt
+        self._launch_allowed = launch_allowed
+        self._hello_accepted = False
         self._socket: socket.socket | None = None
         self._reader = ipc.FrameReader()
         self._outgoing = bytearray()
@@ -139,8 +144,28 @@ class WorkerSupervisor:
         self._activity = 0
         self._restarts: deque[float] = deque()
         self._retired: list[subprocess.Popen[bytes]] = []
+        self._restart_pending: tuple[int, list[Message], bool, bool] | None = None
+        self._restart_kill_deadline: float | None = None
         self._notifier: Any = None
         self._timer: Any = None
+
+    @property
+    def restarting(self) -> bool:
+        """Перезапуск ждёт подтверждения завершения прежнего процесса."""
+        return self._restart_pending is not None
+
+    @property
+    def exited(self) -> bool:
+        """Все процессы супервизора, включая ``_retired``, подтвердили выход (poll)."""
+        processes = list(self._retired)
+        if self.process is not None:
+            processes.append(self.process)
+        return all(process.poll() is not None for process in processes)
+
+    @property
+    def ready(self) -> bool:
+        """Текущий воркер подтвердил совместимость протокола через hello."""
+        return self.state == "running" and not self.restarting and self._hello_accepted
 
     def start(self) -> None:
         """Запускает воркер один раз; повторный вызов при работе безопасен."""
@@ -161,6 +186,7 @@ class WorkerSupervisor:
 
     def _launch(self) -> None:
         """Передаёт только дочерний fd и закрывает его копию в родителе."""
+        self._hello_accepted = False
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             parent.setblocking(False)
@@ -201,8 +227,13 @@ class WorkerSupervisor:
         )
 
     def send(self, message: Message, *, timeout: float | None = None) -> Message:
-        """Ставит кадр в неблокирующую очередь и регистрирует ожидание ответа."""
-        if self.state != "running":
+        """Ставит кадр в очередь и регистрирует ожидание ответа.
+
+        Без явного timeout команда с utterance_id, включая record.cancel,
+        наследует срок последнего соседнего ожидания с таймаутом того же id.
+        Это исходный абсолютный срок, а не новый интервал от момента отмены.
+        """
+        if self.state != "running" or self._restart_pending is not None:
             raise RuntimeError("Воркер не запущен.")
         if timeout is not None and (not math.isfinite(timeout) or timeout < 0):
             raise ValueError("Таймаут должен быть конечным и неотрицательным.")
@@ -210,12 +241,32 @@ class WorkerSupervisor:
         request = {**ipc.decode(frame[4:]), "generation": self.generation}
         uid = request.get("utterance_id")
         kind = str(request["type"])
+        if not self._hello_accepted and kind.startswith(("record.", "audio.")):
+            raise RuntimeError("Воркер ещё не готов.")
         key = _correlation(request)
-        if key[0] == "utterance" and key in self._finished and kind != "record.cancel":
+        if key[0] == "utterance" and key[:2] in self._finished and kind != "record.cancel":
             raise ValueError("Идентификатор уже завершён в текущем поколении.")
         if uid is None and key in self._pending:
             raise ValueError("Ответ на предыдущий запрос этого типа ещё ожидается.")
-        deadline = None if timeout is None else self._clock() + timeout
+        inherited = None
+        if uid is not None and timeout is None:
+            inherited = next(
+                (
+                    p
+                    for k, p in reversed(self._pending.items())
+                    if k[:2] == key[:2] and p.timeout is not None
+                ),
+                None,
+            )
+            if inherited is not None:
+                timeout = inherited.timeout
+        deadline = (
+            inherited.deadline
+            if inherited is not None
+            else None
+            if timeout is None
+            else self._clock() + timeout
+        )
         expects_reply = uid is not None or kind in _CORRELATION or timeout is not None
         if expects_reply:
             pending = self._pending.get(key)
@@ -228,7 +279,7 @@ class WorkerSupervisor:
                 pending.activity = self._activity
             pending.request_type = kind
             pending.request_types.add(kind)
-            self._finished.discard(key)
+            self._finished.discard(key[:2])
         self._outgoing.extend(frame)
         self._flush()
         return request
@@ -251,6 +302,9 @@ class WorkerSupervisor:
         if not math.isfinite(timeout) or timeout < 0:
             raise ValueError("Таймаут pump должен быть конечным и неотрицательным.")
         self._retired = [process for process in self._retired if process.poll() is None]
+        if self._restart_pending is not None:
+            self._poll_restart()
+            return
         self._expire()
         connection = self._socket
         if self.state != "running" or connection is None:
@@ -299,25 +353,7 @@ class WorkerSupervisor:
                 message = ipc.decode(frame)
             except ipc.FrameError as exc:
                 if exc.code == ipc.PROTOCOL_MISMATCH:
-                    failure = ipc.error(exc.code, exc.message)
-                    events = [self._finish(key, failure) for key in list(self._pending)]
-                    self.state = "stopped"
-                    self._close_connection()
-                    if self.process is not None:
-                        if self.process.poll() is None:
-                            self.process.kill()
-                        try:
-                            self.process.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            if not any(process is self.process for process in self._retired):
-                                self._retired.append(self.process)
-                        else:
-                            self._retired = [
-                                process for process in self._retired if process is not self.process
-                            ]
-                    for event in events:
-                        self._emit(event, generation=generation)
-                    self._emit(failure, generation=generation)
+                    self._restart(report=False, failure_code=exc.code, relaunch=False)
                     return
                 self._emit(ipc.error(exc.code, exc.message))
                 continue
@@ -331,14 +367,36 @@ class WorkerSupervisor:
                 self.dropped_late += 1
             return
         key = _correlation(message)
-        if kind == "error":
-            if "utterance_id" in message:
+        uid = message.get("utterance_id")
+        utterance_keys = (
+            [k for k in self._pending if k[0] == "utterance" and k[1] == str(uid)]
+            if uid is not None
+            else []
+        )
+        if kind in _NOTIFICATIONS:
+            for k in utterance_keys:
+                pending = self._pending[k]
+                if pending.timeout is not None and pending.request_type != "record.cancel":
+                    pending.deadline = self._clock() + pending.timeout
+        elif kind == "error":
+            if uid is not None and "request_type" not in message:
+                # Ошибка захвата — независимое событие, не ACK последней команды.
+                keys = [
+                    k for k in utterance_keys if self._pending[k].request_type != "record.cancel"
+                ]
+                if not keys and not utterance_keys:
+                    self.dropped_late += 1
+                    return
+                if len(utterance_keys) == 1 and len(keys) == 1:
+                    self._finish(keys[0], message)
+                self._activity += 1
+                self._emit(message, generation=generation)
+                return
+            if uid is not None:
                 keys = [key] if key in self._pending else []
             elif "request_type" in message:
                 keys = [
-                    k
-                    for k, p in self._pending.items()
-                    if message["request_type"] in p.request_types
+                    k for k, p in self._pending.items() if message["request_type"] == p.request_type
                 ]
                 if len(keys) != 1:
                     keys = []
@@ -353,29 +411,55 @@ class WorkerSupervisor:
                 return
             self._activity += 1
             events = [self._finish(k, message) for k in keys]
+            for k in keys:
+                if len(k) == 3 and (
+                    k[2] in {"recognize", "transcribe.file"}
+                    or (k[2] == "record.cancel" and message.get("code") == "bad-state")
+                ):
+                    self._retire_chain(k[1])
             for event in events:
                 self._emit(event, generation=generation)
             return
-        if kind in _NOTIFICATIONS:
-            pending = self._pending.get(key)
-            if pending is not None and pending.timeout is not None:
-                pending.deadline = self._clock() + pending.timeout
-        elif key in self._pending:
-            self._finish(key, message)
-        elif kind in ("result", "cancelled") or key in self._finished:
-            self.dropped_late += 1
-            return
-        if kind != "hello":
+        else:
+            if uid is not None and "request_type" not in message:
+                # Ответ без типа совместим лишь с прежней цепочкой распознавания.
+                # Ни result, ни cancelled без типа не являются ACK явной отмены.
+                candidates = [
+                    k for k in utterance_keys if self._pending[k].request_type != "record.cancel"
+                ]
+                if candidates and kind in {"result", "cancelled"}:
+                    key = candidates[-1]
+            if key in self._pending:
+                self._finish(key, message)
+                if key[0] == "utterance" and kind in {"result", "cancelled"}:
+                    self._retire_chain(key[1])
+            elif kind in ("result", "cancelled") or key[:2] in self._finished:
+                self.dropped_late += 1
+                return
+        if kind == "hello":
+            self._hello_accepted = True
+        else:
             self._activity += 1
         self._emit(message)
+
+    def _retire_chain(self, uid: str) -> None:
+        """Результат завершает предыдущие стадии, но не независимую отмену."""
+        for key in list(self._pending):
+            if (
+                key[0] == "utterance"
+                and key[1] == uid
+                and self._pending[key].request_type != "record.cancel"
+            ):
+                del self._pending[key]
+        self._finished.add(("utterance", uid))
 
     def _finish(self, key: RequestKey, message: Message) -> Message:
         """Завершает ожидание и дополняет ошибку корреляцией для потребителя."""
         pending = self._pending.pop(key)
-        self._finished.add(key)
+        self._finished.add(key[:2])
         event = dict(message)
         if message["type"] == "error":
-            event["request_type"] = pending.request_type
+            event.setdefault("request_type", pending.request_type)
             if key[0] == "utterance":
                 event["utterance_id"] = key[1]
             else:
@@ -405,6 +489,7 @@ class WorkerSupervisor:
 
     def _close_connection(self) -> None:
         """Отключает Qt до закрытия fd и аннулирует ожидания поколения."""
+        self._hello_accepted = False
         if self._notifier is not None:
             self._notifier.setEnabled(False)
             self._notifier.deleteLater()
@@ -420,21 +505,74 @@ class WorkerSupervisor:
         self._finished.clear()
         self._outgoing.clear()
 
-    def _restart(self, *, report: bool = True, failure_code: str = "worker-crashed") -> None:
-        """Убивает повреждённый воркер и применяет скользящее окно рестартов."""
+    def _restart(
+        self,
+        *,
+        report: bool = True,
+        failure_code: str = "worker-crashed",
+        relaunch: bool = True,
+    ) -> None:
+        """Убивает воркер; смена поколения и события ждут подтверждения выхода."""
+        if self._restart_pending is not None:
+            return
         generation = self.generation
         failure = ipc.error(
             failure_code,
-            "Воркер не ответил до истечения дедлайна."
+            ipc.PROTOCOL_MISMATCH_MESSAGE + "."
+            if failure_code == ipc.PROTOCOL_MISMATCH
+            else "Воркер не ответил до истечения дедлайна."
             if failure_code == "load-timeout"
             else "Распознавание перезапущено.",
         )
         events = [self._finish(key, failure) for key in list(self._pending)]
+        if not relaunch:
+            self.state = "stopped"
+            events.append(failure)
         self._close_connection()
+        self._restart_pending = (generation, events, report, relaunch)
         if self.process is not None and self.process.poll() is None:
             self.process.kill()
-            # Не ждём завершения в GUI; poll следующих pump соберёт статус.
-            self._retired.append(self.process)
+            self._restart_kill_deadline = self._clock() + _KILL_RETRY_INTERVAL_S
+            with suppress(Exception):
+                self.process.wait(timeout=0.2)
+        self._poll_restart()
+        if self._restart_pending is not None and self._use_qt:
+            from PyQt5.QtCore import QTimer
+
+            # IPC уже закрыт, но D-state процесс ещё может владеть микрофоном.
+            self._timer = QTimer()
+            self._timer.timeout.connect(self.pump)
+            self._timer.start(int(_POLL_INTERVAL_S * 1000))
+
+    def _poll_restart(self) -> None:
+        """Продолжает рестарт лишь после выхода; последующие wait неблокирующие."""
+        if self._restart_pending is None:
+            return
+        if self.process is not None:
+            with suppress(Exception):
+                self.process.wait(timeout=0)
+            if self.process.poll() is None:
+                now = self._clock()
+                if self._restart_kill_deadline is not None and now >= self._restart_kill_deadline:
+                    # Повторяем сигнал с ограниченной частотой; это не ACK выхода.
+                    self._restart_kill_deadline = now + _KILL_RETRY_INTERVAL_S
+                    with suppress(Exception):
+                        self.process.kill()
+                return
+        generation, events, _report, relaunch = self._restart_pending
+        self._restart_pending = None
+        self._restart_kill_deadline = None
+        self._close_connection()
+        if not relaunch or not self._launch_allowed():
+            self.state = "stopped"
+            for event in events:
+                self._emit(event, generation=generation)
+            if not events:
+                self._emit(
+                    ipc.error("worker-crashed", "Распознавание перезапущено."),
+                    generation=generation,
+                )
+            return
         now = self._clock()
         while self._restarts and now - self._restarts[0] >= RESTART_WINDOW_S:
             self._restarts.popleft()
@@ -456,7 +594,8 @@ class WorkerSupervisor:
             return
         for event in events:
             self._emit(event, generation=generation)
-        if report and not events:
+        # Даже report=False должен разбудить отложенную смену модели после выхода.
+        if not events:
             self._emit(ipc.error("worker-crashed", "Распознавание перезапущено."))
 
     def adopt_retired(self, processes: Iterable[subprocess.Popen[bytes]]) -> None:
@@ -468,6 +607,8 @@ class WorkerSupervisor:
     def stop(self) -> None:
         """Закрывает IPC, посылает SIGTERM; через две секунды применяет SIGKILL."""
         self.state = "stopped"
+        self._restart_pending = None
+        self._restart_kill_deadline = None
         self._close_connection()
         processes = list(self._retired)
         if self.process is not None and self.process not in processes:
@@ -483,8 +624,16 @@ class WorkerSupervisor:
         self._retired.clear()
 
     def kill(self) -> None:
-        """Закрывает IPC и убивает процессы, ожидая каждый до 0,2 с, без callback."""
+        """Закрывает IPC и убивает процессы, ожидая каждый до 0,2 с, без callback.
+
+        Терминальна, как ``stop()``: отложенный рестарт отменяется без событий. SIGKILL
+        не подтверждает выход — процессы остаются в ``_retired``, ``exited`` сообщает,
+        завершились ли они; менять поколение до этого вызывающий не вправе.
+        """
         self.state = "stopped"
+        self._restart_pending = None
+        self._restart_kill_deadline = None
+        self._hello_accepted = False
         notifier, self._notifier = self._notifier, None
         timer, self._timer = self._timer, None
         if notifier is not None:

@@ -145,7 +145,7 @@ def test_hello_then_ping() -> None:
         frame = ipc.encode({"type": "ping"})
         peer.sendall(frame[:2])
         peer.sendall(frame[2:])
-        assert receive(peer) == [{"type": "pong"}]
+        assert receive(peer) == [{"type": "pong", "request_type": "ping"}]
 
 
 @pytest.mark.parametrize("failure", ["poll", "command", "disconnect", "parent_changed"])
@@ -193,7 +193,7 @@ def test_capture_timeout_terminates_worker_without_cleanup(
         assert (
             worker_main.__name__,
             logging.CRITICAL,
-            "Поток захвата завис в libpulse после отмены. Воркер завершается.",
+            "Не удалось закрыть источник захвата. Воркер завершается.",
         ) in caplog.record_tuples
         assert close.call_count == int(failure in {"disconnect", "parent_changed"})
         connection.close.assert_not_called()
@@ -268,7 +268,7 @@ def test_error_without_request_id_stays_uncorrelated() -> None:
     loop._wake_w.close()
     assert loop._receive(ipc.encode({"type": "ping"}))
     assert ipc.FrameReader().feed(bytes(loop._send_buffer)) == [
-        ipc.error("bad-state", "Воркер закрыт.")
+        {**ipc.error("bad-state", "Воркер закрыт."), "request_type": "ping"}
     ]
 
 
@@ -294,7 +294,7 @@ def test_slow_reader_preserves_pending_frames() -> None:
         assert 0 < len(loop._send_buffer) < sum(len(ipc.encode(event)) for event in events)
         assert receive(peer, len(events)) == events
         peer.sendall(ipc.encode({"type": "ping"}))
-        assert receive(peer) == [{"type": "pong"}]
+        assert receive(peer) == [{"type": "pong", "request_type": "ping"}]
 
 
 @pytest.mark.parametrize("parent_changed", [False, True])
@@ -404,7 +404,7 @@ def test_oversized_event_becomes_error_and_loop_continues(
     assert messages[1:] == [
         ipc.error(ipc.FRAME_TOO_LARGE, "Тело кадра превышает 64 КиБ."),
         {"type": "audio.ready", "device": "Микрофон"},
-        {"type": "pong"},
+        {"type": "pong", "request_type": "ping"},
     ]
     assert caplog.messages == ["Не удалось отправить событие воркера."]
     assert "Личная метка" not in caplog.text
@@ -475,7 +475,7 @@ def test_eof_closes_audio_and_socket(monkeypatch: pytest.MonkeyPatch) -> None:
         receive(peer)
         peer.sendall(ipc.encode({"type": "record.start", "utterance_id": "u1"}))
         peer.sendall(ipc.encode({"type": "ping"}))
-        assert receive(peer) == [{"type": "pong"}]
+        assert receive(peer) == [{"type": "pong", "request_type": "ping"}]
         started = time.monotonic()
         peer.close()
         try:
@@ -538,9 +538,12 @@ def test_recoverable_error_preserves_frames(payload: bytes, code: str) -> None:
         peer.sendall(ping + struct.pack(">I", len(payload)) + payload + ping)
         responses = receive(peer, 3)
         assert responses[0]["code"] == code
-        assert responses[1:] == [{"type": "pong"}, {"type": "pong"}]
+        assert responses[1:] == [
+            {"type": "pong", "request_type": "ping"},
+            {"type": "pong", "request_type": "ping"},
+        ]
         peer.sendall(ping)
-        assert receive(peer) == [{"type": "pong"}]
+        assert receive(peer) == [{"type": "pong", "request_type": "ping"}]
 
 
 def test_events_from_background_thread(
@@ -571,7 +574,7 @@ def test_events_from_background_thread(
         sender.join(1)
         assert not sender.is_alive()
         assert event in responses
-        assert {"type": "pong"} in responses
+        assert {"type": "pong", "request_type": "ping"} in responses
     assert "секретная фраза" not in caplog.text
 
 

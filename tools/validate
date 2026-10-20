@@ -2222,6 +2222,9 @@ class CatalogGuard:
     def set_recording(self, recording: bool) -> None:
         pass
 
+    def set_tray_trusted(self, value: bool) -> None:
+        pass
+
 
 class CatalogX11:
     def open(self) -> None:

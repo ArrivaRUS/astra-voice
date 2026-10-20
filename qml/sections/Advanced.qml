@@ -1,6 +1,7 @@
-// Astra Cowork: shared keyboard editor and optional mouse hold/PTT.
+// Astra Cowork: shared keyboard editor and optional mouse hold/PTT; memory: model idle unload.
 import QtQuick 2.15
 import QtQuick.Controls 2.15
+import QtQuick.Layouts 1.15
 import ".."
 import "../components"
 
@@ -96,6 +97,47 @@ Column {
                 Accessible.name: qsTr("Показывать команду перед отправкой")
                 Binding { target: commandPreviewToggle; property: "checked"; value: root.settings ? root.settings.commandPreview : false }
                 onToggled: if (root.settings) root.settings.commandPreview = checked
+            }
+        }
+    }
+
+    // US-2.6: выгрузка модели по простою. Строка со списком — как «Индикатор записи»
+    // в «Общих» (§3.2, §4.4: AvSelect 236). Порядок пунктов совпадает с unloadMinutes.
+    SettingGroup {
+        width: root.width
+        title: qsTr("Память")
+
+        SettingRow {
+            objectName: "modelUnloadRow"
+            width: parent.width
+            divider: false
+            label: qsTr("Держать модель в памяти")
+            sub: qsTr("Выгрузка освобождает память. Следующая запись начнётся после загрузки модели")
+            rowEnabled: unloadSelector.enabled
+
+            AvSelect {
+                id: unloadSelector
+                objectName: "modelUnloadSelector"
+                readonly property var unloadMinutes: [0, 5, 15, 60]
+                Layout.preferredWidth: 236
+                Layout.alignment: Qt.AlignVCenter
+                model: [qsTr("Всегда"), qsTr("5 мин"), qsTr("15 мин"), qsTr("60 мин")]
+                enabled: root.settings !== null
+
+                Binding {
+                    target: unloadSelector
+                    property: "currentIndex"
+                    value: Math.max(0, unloadSelector.unloadMinutes.indexOf(
+                        root.settings ? root.settings.modelUnloadMinutes : 0))
+                }
+
+                onCurrentIndexChanged: {
+                    if (currentIndex < 0 || !root.settings)
+                        return
+                    var minutes = unloadMinutes[currentIndex]
+                    if (root.settings.modelUnloadMinutes !== minutes)
+                        root.settings.modelUnloadMinutes = minutes
+                }
             }
         }
     }

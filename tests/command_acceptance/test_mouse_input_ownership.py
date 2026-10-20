@@ -325,7 +325,8 @@ def test_old_timer_escape_lease_and_worker_result_cannot_take_over_new_gesture(r
     old_escape = rig.text._external_escape_token
     old_utterance = rig.runtime.orchestrator._utterance_id
     rig.text.handle_event(HotkeyEvent("KeyPress", 9, 1, escape=True), rig.hardware.now)
-    rig.worker("cancelled")
+    # ACK протокола 4: без request_type захват считается открытым (ipc-ack-protocol.md).
+    rig.worker("cancelled", request_type="record.cancel")
     rig.pointer.held = False
     rig.runtime.reload_command_mouse()
     rig.hold()

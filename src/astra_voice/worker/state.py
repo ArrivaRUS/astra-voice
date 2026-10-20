@@ -16,9 +16,10 @@ float32 без копирования PCM, через лениво импорт�
 
 Переход в idle ничего не удаляет. Буфер освобождается после result, cancelled,
 record.cancel, model.unload или close (граница жизни поколения воркера).
-При ошибке распознавания PCM снова ожидает запроса. Остановленный буфер хранится
-300 секунд по умолчанию; просрочка проверяется при следующем сообщении по
-инъектируемым монотонным часам. Просрочка и новый record.start с тем же id
+При ошибке распознавания PCM активного задания снова ожидает запроса; PCM
+отброшенного ожидающего задания удаляется сразу. Остановленный буфер хранится
+300 секунд по умолчанию; просрочка проверяется периодическим тиком воркера и при
+сообщениях по инъектируемым монотонным часам. Просрочка и новый record.start с тем же id
 удаляют старый остановленный буфер с записью в журнал без текста диктовки.
 
 Отмена неизвестного id возвращает error с кодом bad-state. Отмена существующей
@@ -301,6 +302,20 @@ class WorkerState:
         deferred: list[Callable[[], None]] = []
         with self._lock:
             replies = self._handle(msg, deferred)
+            if (
+                msg["type"] in {"record.stop", "recognize"}
+                and any(reply.get("code") == "bad-state" for reply in replies)
+                and self._capture is not None
+            ):
+                # PCM может уже исчезнуть, пока его владелец ещё закрывает источник.
+                # Адресное ожидание не останавливает соседнюю запись и не держит lock.
+                capture = self._capture
+                uid = str(msg["utterance_id"])
+                deferred.append(lambda: capture.wait_stopped(uid))
+            for reply in replies:
+                reply.setdefault("request_type", msg["type"])
+                if reply["type"] == "error" and "utterance_id" in msg:
+                    reply.setdefault("utterance_id", msg["utterance_id"])
         for action in deferred:
             action()
         return replies
@@ -446,7 +461,9 @@ class WorkerState:
                 deferred.append(self._capture.stop)
 
     def check_capture_watchdog(self) -> None:
-        """Проверяет сроки захвата и остановки независимо от поступления отсчётов."""
+        """Проверяет сроки захвата и хранения PCM без входящих IPC и отсчётов."""
+        with self._lock:
+            self._expire_stopped()
         if self._capture is not None:
             self._capture.check_stop_watchdog()
 
@@ -690,6 +707,10 @@ class WorkerState:
                 return
             if job.cancel.cancelled:
                 msg = {"type": "cancelled", "utterance_id": job.utterance_id}
+            elif msg["type"] == "error":
+                # Любая ошибка задания относится к нему, включая WAV, submit и
+                # кодирование результата. Загрузка модели сюда не попадает.
+                msg = {**msg, "utterance_id": job.utterance_id}
             if msg["type"] in {"result", "cancelled"}:
                 self.buffers.pop(job.utterance_id, None)
                 self._device_changed.discard(job.utterance_id)
@@ -697,13 +718,29 @@ class WorkerState:
                     self._remember_cancelled(job.utterance_id)
             elif job.utterance_id in self.buffers:
                 self._stopped[job.utterance_id] = self._clock()
+            msg.setdefault(
+                "request_type", "transcribe.file" if job.path is not None else "recognize"
+            )
             self._active = None
             discarded: list[Message] = []
             if msg.get("code") == "engine-failed":
+                # US-2.7, решение 5: идущую запись следующей фразы не трогаем — её
+                # распознает следующее задание. Ожидавшая очереди фраза получает
+                # ошибку (а не «отменено»); её PCM больше не нужен.
                 if self._pending is not None:
-                    discarded = self._cancel(self._pending.utterance_id)
-                if self._recording is not None:
-                    self._stop_recording()
+                    pending, self._pending = self._pending, None
+                    self.buffers.pop(pending.utterance_id, None)
+                    self._stopped.pop(pending.utterance_id, None)
+                    self._device_changed.discard(pending.utterance_id)
+                    discarded = [
+                        {
+                            **error("engine-failed", "Ошибка распознавания движка."),
+                            "utterance_id": pending.utterance_id,
+                            "request_type": (
+                                "transcribe.file" if pending.path is not None else "recognize"
+                            ),
+                        }
+                    ]
             elif self._pending is not None:
                 pending, self._pending = self._pending, None
                 self._launch(pending)
@@ -738,6 +775,12 @@ class WorkerState:
 
     def _cancel(self, uid: str, deferred: list[Callable[[], None]] | None = None) -> list[Message]:
         if uid not in self.buffers and not self._has_job(uid) and uid not in self._cancelled:
+            if self._capture is not None and deferred is not None:
+                # on_error удаляет PCM до finally.close владельца захвата.
+                # bad-state подтверждает отсутствие capture этого id, поэтому
+                # ждём его адресно, не останавливая уже начавшуюся запись B.
+                capture = self._capture
+                deferred.append(lambda: capture.wait_stopped(uid))
             return [error("bad-state", "Нет такой utterance для отмены.")]
         for job in (self._active, self._pending):
             if job is not None and job.utterance_id == uid:
@@ -748,6 +791,10 @@ class WorkerState:
         if self._recording == uid:
             self._stop_capture(deferred, cancel=True)
             self._recording = None
+        elif self._capture is not None and deferred is not None:
+            # Автоостановка (лимит, смена устройства) снимает _recording до close.
+            capture = self._capture
+            deferred.append(lambda: capture.wait_stopped(uid))
         self.buffers.pop(uid, None)
         self._stopped.pop(uid, None)
         self._device_changed.discard(uid)

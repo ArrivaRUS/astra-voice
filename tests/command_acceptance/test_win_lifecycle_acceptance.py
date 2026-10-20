@@ -71,7 +71,8 @@ def test_closed_session_cancels_old_gesture_and_late_worker_result(
         assert rig.commands() == []
     else:
         assert rig.commands().count("record.cancel") == 1
-        rig.worker("cancelled")
+        # ACK протокола 4: без request_type захват считается открытым (ipc-ack-protocol.md).
+        rig.worker("cancelled", request_type="record.cancel")
     assert rig.command.client.calls == []
     assert rig.command.published == []
     rig.hardware.paste.assert_not_called()
@@ -149,7 +150,8 @@ def test_early_chord_does_not_damage_next_command_or_ordinary_text(
     rig.hold()
     rig.event(HotkeyEvent("KeyPress", 9, 800, escape=True, mods=64))
     assert rig.commands() == ["record.start", "record.cancel"]
-    rig.worker("cancelled")
+    # ACK протокола 4: без request_type захват считается открытым (ipc-ack-protocol.md).
+    rig.worker("cancelled", request_type="record.cancel")
     core = rig.runtime.orchestrator
     core.mode = "text"
     core._start()

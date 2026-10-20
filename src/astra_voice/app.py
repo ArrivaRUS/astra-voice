@@ -756,6 +756,9 @@ class _RuntimeSettingsApply:
     def pill_enabled(self, value: bool) -> None:
         self._runtime.apply_pill_enabled(value)
 
+    def model_unload_minutes(self, value: int) -> None:
+        self._runtime.apply_model_unload_minutes(value)
+
     def hotkey(self, combo: str, mode: str) -> str:
         return self._runtime.apply_hotkey(combo, mode)
 

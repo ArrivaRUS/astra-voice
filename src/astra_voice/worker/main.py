@@ -208,15 +208,15 @@ class WorkerLoop:
                     reply = {
                         **reply,
                         "utterance_id": message["utterance_id"],
-                        "request_type": message["type"],
                     }
+                    reply.setdefault("request_type", message["type"])
                 self._send(reply)
         return True
 
     def _fatal_capture_timeout(self) -> NoReturn:
         """Записывает причину и завершает процесс, чтобы ядро закрыло аудиосокет."""
         try:
-            logger.critical("Поток захвата завис в libpulse после отмены. Воркер завершается.")
+            logger.critical("Не удалось закрыть источник захвата. Воркер завершается.")
             current: logging.Logger | None = logger
             while current is not None:
                 for handler in current.handlers:

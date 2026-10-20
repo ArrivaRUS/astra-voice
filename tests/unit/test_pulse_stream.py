@@ -766,7 +766,11 @@ def test_capture_mismatch_skips_ready() -> None:
     assert thread is not None
     thread.join(5)
     assert not thread.is_alive()
-    events.assert_not_called()
+    # Ни audio.ready, ни record.started; record.stopped — уведомление о физическом
+    # закрытии захвата (docs/ipc-ack-protocol.md), а не признак готовности.
+    assert [c.args[0] for c in events.call_args_list] == [
+        {"type": "record.stopped", "utterance_id": "mismatch"}
+    ]
     errors.assert_not_called()
     changed.assert_called_once_with("mismatch", audio.KIND_SWITCHED, OTHER.label)
     assert pulse.threads == {thread.ident}

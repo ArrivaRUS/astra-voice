@@ -415,18 +415,20 @@ def writable_properties() -> list[str]:
     ]
 
 
-def changed_value(bridge: SettingsBridge, name: str) -> str | bool:
+def changed_value(bridge: SettingsBridge, name: str) -> str | bool | int:
     old = getattr(bridge, name)
     if isinstance(old, bool):
         return not old
     # Новый строковый контрол требует явного тестового значения, иначе тест падает.
-    return {
+    values: dict[str, str | int] = {
         "hotkey": "Ctrl+Shift+Space",
         "commandHotkey": "Super_R",
         "hotkeyMode": "toggle",
         "language": "en",
         "device": "mic",
-    }[name]
+        "modelUnloadMinutes": 5,
+    }
+    return values[name]
 
 
 def field_name(name: str) -> str:
@@ -630,7 +632,7 @@ def test_s19_a5_all_writable_properties_reach_file(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     settings = Settings()
     bridge = SettingsBridge(settings, save=partial(settings_mod.save, path=path))
-    changed: dict[str, str | bool] = {}
+    changed: dict[str, str | bool | int] = {}
     for name in writable_properties():
         allow_mouse_setting(bridge, name)
         value = changed_value(bridge, name)
@@ -3605,9 +3607,18 @@ class MicrophoneBridgeRig:
         self.commands.extend(ipc.FrameReader().feed(ipc.encode(message)))
 
     def event(self, kind: str, **fields: object) -> None:
-        uid = next(
-            msg["utterance_id"] for msg in reversed(self.commands) if msg["type"] == "record.start"
-        )
+        uid = fields.get("utterance_id")
+        if uid is None:
+            uid = next(
+                msg["utterance_id"]
+                for msg in reversed(self.commands)
+                if msg["type"] == "record.start"
+            )
+        if kind == "cancelled" and "request_type" not in fields:
+            request = next(msg for msg in reversed(self.commands) if msg.get("utterance_id") == uid)
+            fields["request_type"] = request["type"]
+        elif kind == "audio.closed":
+            fields.setdefault("request_type", "audio.close")
         message = {"type": kind, "utterance_id": uid, **fields}
         if kind == "result":
             message.update(infer_ms=5.0, audio_ms=1000.0)
@@ -3618,6 +3629,49 @@ class MicrophoneBridgeRig:
 @pytest.fixture
 def microphone_bridge() -> MicrophoneBridgeRig:
     return MicrophoneBridgeRig()
+
+
+@pytest.mark.parametrize("request_type", ["record.start", "record.cancel", "recognize"])
+def test_microphone_event_cancelled_uses_last_request_of_selected_phrase(
+    microphone_bridge: MicrophoneBridgeRig,
+    monkeypatch: pytest.MonkeyPatch,
+    request_type: str,
+) -> None:
+    rig = microphone_bridge
+    rig.controller.startTest()
+    uid = rig.commands[-1]["utterance_id"]
+    rig.send({"type": request_type, "utterance_id": uid})
+    rig.send({"type": "record.start", "utterance_id": "other-phrase"})
+    receive = Mock()
+    monkeypatch.setattr(rig.core, "on_worker_event", receive)
+    rig.event("cancelled", utterance_id=uid)
+    receive.assert_called_once_with(
+        {
+            "type": "cancelled",
+            "utterance_id": uid,
+            "request_type": request_type,
+            "generation": rig.generation,
+        }
+    )
+    receive.reset_mock()
+    rig.event("cancelled", utterance_id=uid, request_type="record.cancel")
+    assert receive.call_args.args[0]["request_type"] == "record.cancel"
+
+
+def test_microphone_event_audio_closed_keeps_global_request_type(
+    microphone_bridge: MicrophoneBridgeRig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = microphone_bridge
+    rig.controller.startTest()
+    uid = rig.commands[-1]["utterance_id"]
+    rig.send({"type": "audio.close"})
+    rig.send({"type": "record.cancel", "utterance_id": uid})
+    receive = Mock()
+    monkeypatch.setattr(rig.core, "on_worker_event", receive)
+    rig.event("audio.closed")
+    receive.assert_called_once_with(
+        {"type": "audio.closed", "request_type": "audio.close", "generation": rig.generation}
+    )
 
 
 def test_microphone_resolved_device_signal_and_worker_restart(
@@ -3729,6 +3783,9 @@ def test_microphone_properties_and_full_cycle(
     rig.event("silent")
     assert controller.testState == "processing"
     assert controller.level == 0.0
+    # silent инициирует stop; подтверждение физического закрытия приходит
+    # отдельным событием до результата, как у настоящего AudioCapture.
+    rig.event("record.stopped")
     rig.event("result", text="Личная фраза микрофона", t_ms=310)
     assert states == ["recording", "processing", "done"]
     assert core_states == [
@@ -4087,25 +4144,36 @@ def test_microphone_start_failure_cancels_even_from_error_state(
     rig.controller.startTest()
     assert rig.controller.testState == "error"
     assert rig.controller.testMessage == "Не удалось распознать речь. Попробуйте ещё раз."
-    assert rig.host.cancel_test.call_args_list == [call(), call()]
-    assert [msg["type"] for msg in rig.commands] == (
-        ["record.start"] if cancel_fails else ["record.start", "record.cancel"]
-    )
+    # Ошибка индикатора обработана внутри оркестратора: bridge не получает
+    # исключение и не должен дублировать отмену. Отказ порта при уходе со
+    # страницы уже не может помешать отправленной отмене захвата.
+    assert rig.host.cancel_test.call_args_list == [call()]
+    assert [msg["type"] for msg in rig.commands] == ["record.start", "record.cancel"]
+    assert rig.commands[0]["utterance_id"] == rig.commands[1]["utterance_id"]
+    assert rig.core.cleanup_pending
     if not cancel_fails:
         rig.event("cancelled")
         assert not rig.core.test_active
         assert rig.core.phase == DictationPhase.IDLE
         assert rig.controller.testState == "error"
     getattr(rig.controller, leave)()
-    assert rig.host.cancel_test.call_args_list == [call(), call(), call()]
+    assert rig.host.cancel_test.call_args_list == [call(), call()]
     assert [msg["type"] for msg in rig.commands] == ["record.start", "record.cancel"]
     if cancel_fails:
+        assert rig.core.cleanup_pending
         rig.event("cancelled")
+    assert not rig.core.cleanup_pending
     assert not rig.core.test_active
     assert rig.core.phase == DictationPhase.IDLE
     assert rig.controller.testState == "idle"
     assert private not in caplog.text
-    assert all(record.exc_info is None for record in caplog.records)
+    # Safe UI сохраняет диагностический стек со служебным исключением;
+    # оригинальная ошибка и её цепочка не должны сохранять приватные данные.
+    exceptions = [record.exc_info[1] for record in caplog.records if record.exc_info]
+    assert exceptions
+    for exception in exceptions:
+        assert exception is not None and private not in str(exception)
+        assert exception.__cause__ is None and exception.__context__ is None
 
 
 @pytest.mark.parametrize("command", ["record.start", "record.stop", "recognize"])
@@ -4133,7 +4201,7 @@ def test_microphone_command_failure_logs_warning_without_exception(
     assert not rig.core.test_active
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
     assert [record.getMessage() for record in warnings] == [
-        f"диктовка: отправка команды {command} не удалась"
+        f"диктовка: отправка команды {command} не удалась (RuntimeError)"
     ]
     assert all(record.exc_info is None for record in caplog.records)
     assert private not in caplog.text
@@ -4172,7 +4240,8 @@ def _microphone_log_violations(
     # - test_microphone_host_exception_is_not_logged: приватная строка из ошибки
     #   start_test отсутствует в caplog.text;
     # - test_microphone_start_failure_cancels_even_from_error_state: ошибки старта
-    #   и отмены не оставляют ни приватной строки, ни record.exc_info;
+    #   и отмены не оставляют приватной строки; safe UI сохраняет только
+    #   служебное исключение без приватного сообщения и цепочки;
     # - test_microphone_command_failure_logs_warning_without_exception: ошибки
     #   record.start/record.stop/recognize не оставляют приватной строки, и
     #   assert all(record.exc_info is None for record in caplog.records).
@@ -5069,9 +5138,12 @@ def test_level_monitor_without_model_is_separate(dbfs: float, expected: float) -
     assert all(len(spy) == 0 for spy in spies)
     controller.stopLevelMonitor()
     assert [msg["type"] for msg in rig.commands] == ["record.start", "record.cancel"]
+    rig.recording.assert_called_with(True)
+    rig.tray.set_state.assert_called_with(TrayState.LISTENING)
+    rig.pill.hide.assert_not_called()
+    rig.event("cancelled")
     rig.recording.assert_called_with(False)
     rig.tray.set_state.assert_called_with(TrayState.IDLE)
-    rig.event("cancelled")
     assert controller.levelState == "idle" and controller.level == 0.0
     assert len(state_spy) == 2
     assert rig.pill.show_state.call_args_list == [
@@ -5230,8 +5302,10 @@ def test_level_monitor_leaving_closes_microphone(leave: str) -> None:
     else:
         getattr(controller, leave)()
     assert rig.commands[-1]["type"] == "record.cancel"
-    rig.recording.assert_called_with(False)
+    rig.recording.assert_called_with(True)
+    rig.pill.hide.assert_not_called()
     rig.event("cancelled")
+    rig.recording.assert_called_with(False)
     assert controller.levelState == "idle"
     assert not rig.core.level_active
 
@@ -5260,6 +5334,9 @@ def test_level_monitor_host_exception_closes_microphone(
     assert rig.controller.levelState == "error"
     assert rig.controller.levelMessage == "Не удалось проверить микрофон. Попробуйте ещё раз."
     assert rig.controller.testState == "idle"
+    rig.recording.assert_called_with(True)
+    rig.pill.hide.assert_not_called()
+    rig.event("cancelled")
     rig.recording.assert_called_with(False)
     assert "Личная речь" not in caplog.text
 

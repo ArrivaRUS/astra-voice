@@ -1427,6 +1427,140 @@ class ControlledSource:
         self.device_name = None
 
 
+@pytest.mark.parametrize("phase", ["open", "read"])
+def test_capture_fault_confirms_stopped_only_after_close(
+    phase: str, monkeypatch: pytest.MonkeyPatch, wait_capture: Callable[[], None]
+) -> None:
+    """Ошибка до/после started не подтверждает закрытие до возврата close."""
+    monkeypatch.setattr(audio, "OPEN_FIRST_RETRIES", 0)
+    closing, release = threading.Event(), threading.Event()
+
+    class FaultSource(ControlledSource):
+        def open(self, device: str | None) -> None:
+            super().open(device)
+            if phase == "open":
+                raise AudioError(ERROR_FAILED, "Ошибка открытия.")
+
+        def read_chunk(self) -> bytes | None:
+            raise AudioError(ERROR_FAILED, "Ошибка чтения.")
+
+        def close(self) -> None:
+            closing.set()
+            assert release.wait(TIMEOUT)
+            super().close()
+
+    source = FaultSource()
+    probe = CaptureProbe(source)
+    try:
+        probe.capture.start("fault", None, limit_s=30)
+        assert closing.wait(TIMEOUT)
+        assert probe.errors.get_nowait()[:2] == ("fault", ERROR_FAILED)
+        expected = [{"type": "record.started", "utterance_id": "fault"}] if phase == "read" else []
+        assert [event for _, event in list(probe.boundaries.queue)] == expected
+        assert source.is_open
+        release.set()
+        wait_capture()
+        expected.append({"type": "record.stopped", "utterance_id": "fault"})
+        assert [event for _, event in list(probe.boundaries.queue)] == expected
+        assert not source.is_open
+        assert probe.capture._owners == {}
+    finally:
+        release.set()
+        probe.capture.stop()
+
+
+def test_failed_close_never_confirms_capture_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Умерший на close поток не позволяет ответить ложным ACK на отмену."""
+    monkeypatch.setattr(audio, "OPEN_FIRST_RETRIES", 0)
+    source = Mock(spec=AudioSource)
+    source.is_open = False
+    source.open.side_effect = AudioError(ERROR_FAILED, "Ошибка открытия.")
+    source.close.side_effect = RuntimeError("Ошибка закрытия.")
+    events = Mock()
+    capture = AudioCapture(source=source, on_samples=Mock(), on_event=events, on_error=Mock())
+    running = threading.Event()
+    running.set()
+    capture._run("fault", None, running, None, time.monotonic() + 30)
+    assert capture._close_failed
+    events.assert_not_called()
+    with pytest.raises(CaptureStopTimeout):
+        capture.wait_stopped("fault")
+    with pytest.raises(CaptureStopTimeout):
+        capture.check_stop_watchdog()
+
+
+def test_wait_stopped_uses_capture_watchdog(
+    monkeypatch: pytest.MonkeyPatch, wait_capture: Callable[[], None]
+) -> None:
+    """Адресное ожидание зависшего close эскалирует, не подтверждая остановку."""
+    monkeypatch.setattr(audio, "STOP_WATCHDOG_S", 0)
+    closing, release = threading.Event(), threading.Event()
+
+    class ClosingSource(ControlledSource):
+        def close(self) -> None:
+            closing.set()
+            assert release.wait(TIMEOUT)
+            super().close()
+
+    source = ClosingSource()
+    source.ended = True
+    source.chunks.put(None)
+    probe = CaptureProbe(source)
+    try:
+        probe.capture.start("closing", None, limit_s=30)
+        assert closing.wait(TIMEOUT)
+        with pytest.raises(CaptureStopTimeout):
+            probe.capture.wait_stopped("closing")
+        assert [event["type"] for _, event in list(probe.boundaries.queue)] == ["record.started"]
+        release.set()
+        wait_capture()
+        probe.capture.wait_stopped("closing")
+    finally:
+        release.set()
+        wait_capture()
+        probe.capture.stop()
+
+
+def test_cold_stop_precedes_next_capture_started(
+    wait_capture: Callable[[], None],
+) -> None:
+    """A закрывается без started; B открывается строго после stopped(A)."""
+    opening, release = threading.Event(), threading.Event()
+
+    class ColdSource(ControlledSource):
+        def open(self, device: str | None) -> None:
+            super().open(device)
+            if self.open_calls == 1:
+                opening.set()
+                assert release.wait(TIMEOUT)
+
+    source = ColdSource()
+    probe = CaptureProbe(source)
+    source.keep_reading = lambda: probe.capture.active
+    try:
+        probe.capture.start("a", None, limit_s=30)
+        assert opening.wait(TIMEOUT)
+        probe.capture.request_stop()
+        probe.capture.start("b", None, limit_s=30)
+        assert probe.boundaries.empty()
+        release.set()
+        assert source.reading.wait(TIMEOUT)
+        assert [probe.boundaries.get(timeout=TIMEOUT)[1] for _ in range(2)] == [
+            {"type": "record.stopped", "utterance_id": "a"},
+            {"type": "record.started", "utterance_id": "b"},
+        ]
+        probe.capture.wait_stopped("a")
+        assert probe.capture.active and source.is_open
+        probe.capture.request_stop()
+        wait_capture()
+        assert probe.boundaries.get_nowait()[1] == {"type": "record.stopped", "utterance_id": "b"}
+        assert source.open_calls == source.close_calls == 2
+        assert probe.capture._owners == {}
+    finally:
+        release.set()
+        probe.capture.stop()
+
+
 class BufferedSource(ControlledSource):
     """Имитирует серверный буфер: открытый микрофон копит звук во время паузы."""
 
@@ -1609,7 +1743,7 @@ def test_record_cancel_stops_capture_without_late_levels(
 
     monkeypatch.setattr(capture_thread, "join", join)
     assert worker.handle({"type": "record.cancel", "utterance_id": "cancelled"}) == [
-        {"type": "cancelled", "utterance_id": "cancelled"}
+        {"type": "cancelled", "utterance_id": "cancelled", "request_type": "record.cancel"}
     ]
     monkeypatch.setattr(capture_thread, "join", original_join)
     wait_capture()
@@ -1675,7 +1809,9 @@ def test_audio_close_and_lazy_reopen_emit_ready_once(
         assert probe.capture.active
         assert source.open_calls == index
         assert source.device_name == "technical.input"
-        assert worker.handle({"type": "audio.close"}) == [{"type": "audio.closed"}]
+        assert worker.handle({"type": "audio.close"}) == [
+            {"type": "audio.closed", "request_type": "audio.close"}
+        ]
         wait_capture()
         assert not probe.capture.active
         assert not source.is_open
@@ -1742,9 +1878,11 @@ def test_stop_joins_capture_outside_worker_lock(
         command_thread.start()
         expected: list[Message] | None = []
         if kind == "audio.close":
-            expected = [{"type": "audio.closed"}]
+            expected = [{"type": "audio.closed", "request_type": "audio.close"}]
         elif kind == "record.cancel":
-            expected = [{"type": "cancelled", "utterance_id": "locked"}]
+            expected = [
+                {"type": "cancelled", "utterance_id": "locked", "request_type": "record.cancel"}
+            ]
         elif kind == "close":
             expected = None
         # Старый join под RLock удерживал команду две секунды.
@@ -1779,7 +1917,9 @@ def test_audio_ready_only_on_actual_open(
     # Между записями микрофон теперь закрыт: прежнее переиспользование нарушало приватность.
     for index in range(1, 4):
         if index == 3:
-            assert worker.handle({"type": "audio.close"}) == [{"type": "audio.closed"}]
+            assert worker.handle({"type": "audio.close"}) == [
+                {"type": "audio.closed", "request_type": "audio.close"}
+            ]
             assert not source.is_open
             assert source.close_calls == 2
             assert probe.drain() == []
@@ -2589,8 +2729,15 @@ def test_capture_watchdog_never_frees_during_libpulse_call(
             if cancel == "engine-failed":
                 engine_gate.set()
                 assert events.get(timeout=TIMEOUT)["code"] == "engine-failed"
-            else:
-                capture.request_stop()
+                # US-2.7, решение 5: ошибка движка у прошлой фразы не останавливает
+                # захват следующей — сторож молчит и после своего срока, поток жив.
+                time.sleep(watchdog_s * 2)
+                worker.check_capture_watchdog()
+                assert capture.active and owner.is_alive()
+                assert close_threads == closes_before_stop
+                # Остановка — только явная, дальше — как у request_stop.
+                stopped_at = time.monotonic()
+            capture.request_stop()
             worker.check_capture_watchdog()
             with pytest.raises(CaptureStopTimeout):
                 capture.stop()
@@ -2687,7 +2834,9 @@ def test_audio_closed_prevents_next_open_attempt(
             original_join(timeout)
 
         monkeypatch.setattr(owner, "join", join)
-        assert worker.handle({"type": "audio.close"}) == [{"type": "audio.closed"}]
+        assert worker.handle({"type": "audio.close"}) == [
+            {"type": "audio.closed", "request_type": "audio.close"}
+        ]
         calls_at_closed = pulse_library.pa_simple_new.call_count
         assert calls_at_closed == 1
         wait_capture()
@@ -3291,7 +3440,9 @@ def test_capture_cancel_before_open_finishes_while_context_lock_is_held(
             assert not pulse.calls, "отменённый до открытия захват не меняет нативные ресурсы"
             assert not source.is_open and not pulse.server_recording
             capture.stop()
-            events.assert_not_called()
+            events.assert_called_once_with(
+                {"type": "record.stopped", "utterance_id": "cancel-before-open"}
+            )
             errors.assert_not_called()
             samples.assert_not_called()
     finally:
@@ -3672,3 +3823,162 @@ def test_capture_shutdown_bounds_stuck_warmup(caplog: pytest.LogCaptureFixture) 
     source.shutdown.assert_not_called()
     assert caplog.messages == ["Прогрев звука не завершился к сроку выхода."]
     assert capture._shutdown
+
+
+@pytest.mark.parametrize("clear_before_failure", [False, True])
+def test_read_chunks_close_failure_is_sticky(
+    monkeypatch: pytest.MonkeyPatch, clear_before_failure: bool
+) -> None:
+    """ИБ-49: сбой первого close не маскируется успешным/no-op close в finally."""
+    source = PulseSimpleSource()
+    pulse = Mock()
+    source._pulse = pulse
+    handle = ctypes.c_void_p(123)
+    source._handle = handle
+    monkeypatch.setattr(source, "read_chunk", lambda: None)
+    monkeypatch.setattr(source, "flush", lambda: None)
+    attempts = []
+
+    def free(handle: object) -> None:
+        attempts.append(handle)
+        if len(attempts) == 1:
+            if clear_before_failure:
+                # Модель бэкенда с потерей дескриптора до ошибки (старый simple).
+                source._handle = None
+            raise RuntimeError("PRIVATE: exception must not escape capture")
+
+    pulse.lib.pa_simple_free.side_effect = free
+    events: list[dict[str, Any]] = []
+    capture = AudioCapture(
+        source=source, on_samples=Mock(), on_event=events.append, on_error=Mock()
+    )
+    running = threading.Event()
+    running.set()
+    capture._run("fault", None, running, None, time.monotonic() + 30)
+    assert [event["type"] for event in events] == ["record.started"]
+    assert attempts == [handle]
+    assert capture._close_failed
+    for check in (capture.check_stop_watchdog, lambda: capture.wait_stopped("fault"), capture.stop):
+        with pytest.raises(CaptureStopTimeout):
+            check()
+
+
+def test_simple_close_detaches_handle_before_free_even_on_failure() -> None:
+    source = PulseSimpleSource()
+    pulse = Mock()
+    source._pulse = pulse
+    handle = ctypes.c_void_p(123)
+    source._handle = handle
+
+    def free(detached: object) -> None:
+        assert detached is handle
+        assert not source.is_open
+        raise RuntimeError("failed")
+
+    pulse.lib.pa_simple_free.side_effect = free
+    with pytest.raises(RuntimeError):
+        source.close()
+    assert not source.is_open
+    source.close()
+    pulse.lib.pa_simple_free.assert_called_once_with(handle)
+
+
+def test_wait_thread_recalculates_deadlines_after_other_owner_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Сосед умер до 1001: его срок не мешает владельцу закрыться в 1001.5."""
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    capture = AudioCapture(
+        source=Mock(spec=AudioSource), on_samples=Mock(), on_event=Mock(), on_error=Mock()
+    )
+    owner = Mock(spec=threading.Thread)
+    owner.is_alive.side_effect = lambda: now[0] < 1001.5
+    other = Mock(spec=threading.Thread)
+    other.is_alive.side_effect = lambda: now[0] < 1000.9
+    capture._stop_deadlines.update({other: 1001.0, owner: 1005.0})
+    joins: list[float] = []
+
+    def join(timeout: float) -> None:
+        joins.append(timeout)
+        now[0] = min(now[0] + timeout, 1001.5)
+        assert len(joins) <= 2
+
+    owner.join.side_effect = join
+    capture._wait_thread(owner)
+    assert joins == [1.0, 4.0]
+    assert now[0] == 1001.5
+    assert not capture._stop_deadlines
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_wait_thread_own_deadline_does_not_slide(
+    monkeypatch: pytest.MonkeyPatch, registered: bool
+) -> None:
+    """И зарегистрированный, и запасной срок владельца фиксируются один раз."""
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    capture = AudioCapture(
+        source=Mock(spec=AudioSource), on_samples=Mock(), on_event=Mock(), on_error=Mock()
+    )
+    owner = Mock(spec=threading.Thread)
+    owner.is_alive.return_value = True
+    if registered:
+        capture._stop_deadlines[owner] = 1005.0
+    joins: list[float] = []
+
+    def join(timeout: float) -> None:
+        joins.append(timeout)
+        now[0] += min(1.0, timeout)
+        assert len(joins) <= 5, "Собственный дедлайн пересчитывается бесконечно"
+
+    owner.join.side_effect = join
+    with pytest.raises(CaptureStopTimeout):
+        capture._wait_thread(owner)
+    assert joins == [5.0, 4.0, 3.0, 2.0, 1.0]
+
+
+def test_wait_thread_other_owner_overdue_is_reported_by_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    capture = AudioCapture(
+        source=Mock(spec=AudioSource), on_samples=Mock(), on_event=Mock(), on_error=Mock()
+    )
+    owner, other = Mock(spec=threading.Thread), Mock(spec=threading.Thread)
+    owner.is_alive.return_value = other.is_alive.return_value = True
+    capture._stop_deadlines.update({other: 1001.0, owner: 1005.0})
+    owner.join.side_effect = lambda timeout: now.__setitem__(0, now[0] + timeout)
+    with pytest.raises(CaptureStopTimeout, match="после отмены"):
+        capture._wait_thread(owner)
+    owner.join.assert_called_once_with(timeout=1.0)
+
+
+def test_read_chunks_arms_watchdog_before_first_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ИБ-49: зависший первый close уже находится под сторожем остановки."""
+    monkeypatch.setattr(audio, "STOP_WATCHDOG_S", 0)
+    closing, release = threading.Event(), threading.Event()
+
+    class Source(ControlledSource):
+        def close(self) -> None:
+            closing.set()
+            assert release.wait(TIMEOUT)
+            super().close()
+
+    source = Source()
+    source.chunks.put(None)
+    probe = CaptureProbe(source)
+    probe.capture.start("fault", None, limit_s=30)
+    try:
+        assert closing.wait(TIMEOUT)
+        assert probe.errors.empty()  # Прежний порядок: ошибка чтения после close.
+        assert probe.capture._thread in probe.capture._stop_deadlines
+        assert [event["type"] for _, event in list(probe.boundaries.queue)] == ["record.started"]
+        with pytest.raises(CaptureStopTimeout):
+            probe.capture.check_stop_watchdog()
+    finally:
+        release.set()
+        assert probe.capture._thread is not None
+        probe.capture._thread.join(TIMEOUT)
+        probe.capture.stop()

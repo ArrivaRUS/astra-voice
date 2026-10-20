@@ -13,11 +13,12 @@ Fly: тип из ClipboardManagerTypesBlacklist должен исключить 
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import cache
 from pathlib import Path
@@ -99,6 +100,37 @@ class PasteRestore(StrEnum):
     SKIPPED_NOT_OWNER = "skipped-not-owner"
     KEPT_OURS = "kept-ours"
     FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class PasteTarget:
+    """Окно и отпечаток заголовка на старте фразы, только в памяти процесса."""
+
+    window: int | None
+    title_digest: bytes | None = field(repr=False)
+
+
+def snapshot_target(x: X11Display, window: int | None) -> PasteTarget:
+    """Читает _NET_WM_NAME без сохранения/журналирования самого заголовка.
+
+    При отсутствии исходного отпечатка вставка проверяет только окно и WM_CLASS.
+    Если отпечаток получен, перед вставкой заголовок должен читаться и совпадать.
+    """
+    digest = None
+    try:
+        if window and x.d is not None:
+            client = x.d.create_resource_object("window", window)
+            prop = client.get_full_property(
+                x.d.intern_atom("_NET_WM_NAME"), x.d.intern_atom("UTF8_STRING")
+            )
+            if prop is not None and prop.format == 8:
+                value = prop.value
+                if isinstance(value, (bytes, bytearray)):
+                    digest = hashlib.sha256(value).digest()
+    except Exception:
+        # Ни текст исключения, ни title, ни хэш не должны попасть в журнал.
+        pass
+    return PasteTarget(window, digest)
 
 
 @dataclass(frozen=True)
@@ -576,8 +608,14 @@ class PasteFlow:
         self.delay_before_ms = delay_before_ms
         self.delay_after_ms = delay_after_ms
 
-    def run(self, text: str, target_window: int | None, mode: PasteMode) -> PasteOutcome:
+    def run(
+        self, text: str, target_window: int | None | PasteTarget, mode: PasteMode
+    ) -> PasteOutcome:
         entered = time.monotonic()
+        target = target_window if isinstance(target_window, PasteTarget) else None
+        window = target.window if target is not None else target_window
+        if window is not None and not isinstance(window, int):
+            raise TypeError("окно вставки должно быть целочисленным X11 id или None")
         # Вернуть исход без исключений и закрыть собственное X11-соединение.
         global _running, _pending
         if _running:
@@ -585,7 +623,7 @@ class PasteFlow:
             outcome = PasteOutcome(
                 PasteOutcomeKind.BUSY, PasteMethod.NONE, PasteRestore.KEPT_OURS, None, 0, 0, 0.0
             )
-            _log_outcome(outcome, target_window)
+            _log_outcome(outcome, window)
             return outcome
         _running = True
         x: X11Display | None = None
@@ -594,7 +632,7 @@ class PasteFlow:
             if mode == PasteMode.AUTO:
                 x = X11Display()
                 x.open()
-            outcome = self._run(text, target_window, mode, cb, x, entered=entered)
+            outcome = self._run(text, window, mode, cb, x, entered=entered, target=target)
         except Exception:
             # Нет QApplication/GUI-потока либо ошибка до публикации. Ничего не обещаем
             # о наличии фразы в буфере и не выдаём сообщение исключения наружу.
@@ -617,7 +655,7 @@ class PasteFlow:
                 pass
             finally:
                 _running = False
-        _log_outcome(outcome, target_window)
+        _log_outcome(outcome, window)
         return outcome
 
     def _run(
@@ -629,6 +667,7 @@ class PasteFlow:
         x: X11Display | None,
         *,
         entered: float,
+        target: PasteTarget | None = None,
     ) -> PasteOutcome:
         global _pending
         wm_class = x.wm_class(target_window) if x is not None and target_window else None
@@ -683,6 +722,12 @@ class PasteFlow:
                     kind, reason = PasteOutcomeKind.WINDOW_CHANGED, "grab-no-window"
                 else:
                     reason = _focus_mismatch(x, target_window, wm_class)[0]
+                    if not reason and target is not None and target.title_digest is not None:
+                        current = snapshot_target(x, target.window)
+                        if current.title_digest is None:
+                            reason = "title-unavailable"
+                        elif current.title_digest != target.title_digest:
+                            reason = "title-changed"
                     if not reason:
                         reason = _keyboard_busy(x, probe)
                     if reason:
@@ -781,6 +826,6 @@ class PasteFlow:
         )
 
 
-def paste_text(text: str, target_window: int | None, mode: PasteMode) -> PasteOutcome:
+def paste_text(text: str, target_window: int | None | PasteTarget, mode: PasteMode) -> PasteOutcome:
     """Публикация → отпускание клавиш → 50 мс → фокус → проба → XTest → забор → возврат."""
     return PasteFlow().run(text, target_window, mode)

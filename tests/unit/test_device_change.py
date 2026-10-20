@@ -200,7 +200,11 @@ def test_change_after_open_skips_ready() -> None:
     capture.start("uid", None, limit_s=10)
     _wait(capture)
     changed.assert_called_once_with("uid", KIND_SWITCHED, NEXT.label)
-    events.assert_not_called()
+    # Ни audio.ready, ни record.started; record.stopped — уведомление о физическом
+    # закрытии захвата (docs/ipc-ack-protocol.md), а не признак готовности.
+    assert [c.args[0] for c in events.call_args_list] == [
+        {"type": "record.stopped", "utterance_id": "uid"}
+    ]
     errors.assert_not_called()
 
 

@@ -154,6 +154,7 @@ def test_failed_switch_forgotten_worker_still_protects_code(
             _switch_candidate=candidate,
             _cleanup=DictationRuntime._cleanup,
             on_switch_finished=None,
+            _wake_dictation=False,
             supervisor=SimpleNamespace(process=None, _retired=[]),
         )
         state._stop_or_kill = MethodType(DictationRuntime._stop_or_kill, state)

@@ -12,7 +12,7 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, call
+from unittest.mock import ANY, Mock, call
 
 import pytest
 from PyQt5 import sip
@@ -30,6 +30,7 @@ from astra_voice.core.dictation import (
     CANCEL_TIMEOUT_MS,
     RECOGNIZE_TIMEOUT_S,
     RELEASE_TAIL_MS,
+    TEST_FAILED,
     TEST_MODEL_UNAVAILABLE,
     TEST_PREPARING,
     DictationPhase,
@@ -138,6 +139,7 @@ def test_protocol_mismatch_shows_restart_instruction(monkeypatch: pytest.MonkeyP
 def test_protocol_mismatch_for_dictation_reaches_orchestrator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Адресная ошибка протокола завершает поколение вместо обычной отмены фразы."""
     rig = Rig(monkeypatch)
     on_worker_event = Mock()
     monkeypatch.setattr(rig.runtime.orchestrator, "on_worker_event", on_worker_event)
@@ -148,10 +150,11 @@ def test_protocol_mismatch_for_dictation_reaches_orchestrator(
         "utterance_id": "dictation",
     }
     rig.supervisor_factory.call_args.kwargs["on_event"](event)
-    on_worker_event.assert_called_once_with(event)
-    assert on_worker_event.call_args.args[0] is event
-    rig.pill.show_state.assert_not_called()
-    rig.tray.set_state.assert_not_called()
+    on_worker_event.assert_not_called()
+    assert not rig.runtime.orchestrator.cleanup_pending
+    assert rig.runtime.phase is DictationPhase.IDLE
+    rig.pill.show_state.assert_called_once_with(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
+    rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
 
 
 @pytest.mark.parametrize("code", ["timeout", "load-timeout", "measure-failed"])
@@ -270,12 +273,17 @@ class Rig:
         self.x11 = Mock()
         self.x11.active_window.return_value = 4321
         self.x11.target_window.return_value = 4321
+        title = self.x11.d.create_resource_object.return_value.get_full_property.return_value
+        title.format = 8
+        title.value = b"Runtime test target"
+        self.target = paste_module.snapshot_target(self.x11, 4321)
+        self.x11.reset_mock()
         self.x11.open.side_effect = lambda: self.record("x11.open")
         self.x11.close.side_effect = lambda: self.record("x11.close")
         self.capture_watchdogs: list[Mock] = []
         self.capture_open_ok = True
         self.capture_watchdog_factory = Mock(side_effect=self.create_capture_watchdog)
-        self.supervisor = Mock(state="new", generation=1)
+        self.supervisor = Mock(state="new", generation=1, restarting=False, ready=True)
         self.supervisor.start.side_effect = self.start_worker
         self.supervisor.stop.side_effect = self.stop_worker
         self.supervisor.send.side_effect = self.send
@@ -399,6 +407,8 @@ class Rig:
 
     def send(self, message: dict[str, Any], **kwargs: object) -> None:
         self.record(str(message["type"]))
+        if message["type"] == "record.stop":
+            self.event(type="record.stopped", utterance_id=message["utterance_id"])
 
     def grab(self, combo: str, mode: HotkeyMode) -> GrabResult:
         self.record("hotkey.grab")
@@ -406,8 +416,17 @@ class Rig:
         return GrabResult(self.grab_code)
 
     def event(self, **event: object) -> None:
+        request_type = {"cancelled": "record.cancel", "audio.closed": "audio.close"}.get(
+            str(event.get("type"))
+        )
+        if request_type is not None:
+            event.setdefault("request_type", request_type)
         callback = self.supervisor_factory.call_args.kwargs["on_event"]
         callback({"generation": self.supervisor.generation, **event})
+
+    def job_error(self, utterance_id: str, **fields: object) -> None:
+        """Ошибка задания адресована явно выбранной фразе, event остаётся сырым."""
+        self.event(type="error", utterance_id=utterance_id, **fields)
 
     def fire_tail(self) -> None:
         """Дописывает хвост записи после отпускания клавиши (RELEASE_TAIL_MS)."""
@@ -471,7 +490,8 @@ def test_microphone_notification_wiring(monkeypatch: pytest.MonkeyPatch, event_k
     rig.runtime.start()
     rig.hotkey.fsm.press(rig.now)
     if event_kind == "lost":
-        rig.event(type="error", code="audio-no-device")
+        uid = rig.supervisor.send.call_args.args[0]["utterance_id"]
+        rig.job_error(uid, code="audio-no-device")
         assert rig.notify.mock_calls == [call.notify_microphone_lost()]
     else:
         # Даже позднее первое определение микрофона остаётся без уведомления.
@@ -652,6 +672,9 @@ def test_microphone_announcement_follows_worker_generations(
                 event(ipc.make_hello())
             send = Mock(wraps=rig.runtime.supervisor.send)
             monkeypatch.setattr(rig.runtime.supervisor, "send", send)
+            if not hello_before_record:
+                # Транспорт принимает hello и при поздней установке наблюдателя.
+                event(ipc.make_hello())
             for _ in range(2):
                 rig.now += 2
                 rig.hotkey.fsm.press(rig.now)
@@ -736,7 +759,7 @@ def test_switch_memory_boundary(
         model_store=ModelStore(tmp_path / "models"),
     )
     assert rig.runtime.can_switch_without_pause(100) is expected
-    candidate = Mock(state="running", generation=1)
+    candidate = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = candidate
     finished = Mock()
     rig.runtime.on_switch_finished = finished
@@ -762,7 +785,7 @@ def test_switch_waits_for_dictation_boundary(monkeypatch: pytest.MonkeyPatch) ->
     rig.event(type="result", text=MARKER)
     assert_phase(rig.runtime, DictationPhase.FINISHING)
     assert rig.supervisor_factory.call_count == 1
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
     rig.timers[-1].fire()
     assert_phase(rig.runtime, DictationPhase.IDLE)
@@ -781,7 +804,7 @@ def test_pending_switch_runs_on_idle_without_runtime_timer_firing(
     rig.release(rig.now + 1)
     rig.event(type="result", text=MARKER)
     assert_phase(rig.runtime, DictationPhase.FINISHING)
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
     # Доставка перехода в IDLE происходит без вызова fire у таймера рантайма.
     rig.runtime.orchestrator._tail_done()
@@ -846,7 +869,7 @@ def test_seamless_switch_candidate_outcome(
     rig.runtime.start()
     old = rig.supervisor
     old_callback = rig.supervisor_factory.call_args.kwargs["on_event"]
-    candidate = Mock(state="running", generation=1)
+    candidate = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = candidate
     monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
     finished = Mock()
@@ -874,12 +897,18 @@ def test_seamless_switch_candidate_outcome(
     else:
         rig.hotkey.fsm.press(rig.now)
         assert_phase(rig.runtime, DictationPhase.RECORDING)
+        uid = old.send.call_args.args[0]["utterance_id"]
         callback({"type": "model.loaded", "generation": candidate.generation})
         finished.assert_not_called()
         assert rig.runtime.supervisor is old
         old.stop.assert_not_called()
         rig.release(rig.now + 1)
-        old_callback({"type": "result", "generation": old.generation, "text": MARKER})
+        # Rig.send uses the most recent factory callback, which now belongs to
+        # the candidate. Deliver the old worker's physical-close notice explicitly.
+        old_callback({"type": "record.stopped", "generation": old.generation, "utterance_id": uid})
+        old_callback(
+            {"type": "result", "generation": old.generation, "utterance_id": uid, "text": MARKER}
+        )
         rig.timers[-1].fire()
         assert rig.runtime.supervisor is candidate
         old.stop.assert_called_once_with()
@@ -901,7 +930,7 @@ def test_seamless_switch_candidate_outcome(
         )
     finished.assert_called_once_with(outcome)
     if outcome == "ok":
-        next_candidate = Mock(state="running", generation=1)
+        next_candidate = Mock(state="running", generation=1, restarting=False, ready=True)
         rig.supervisor_factory.return_value = next_candidate
         rig.runtime.switch_model(min_ram_mb=100)
         on_worker_event = Mock()
@@ -917,7 +946,7 @@ def test_promoted_switch_watchdog_rejects_silent_selfcheck(monkeypatch: pytest.M
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
     rig.runtime.start()
     old = rig.supervisor
-    candidate = Mock(state="running", generation=1)
+    candidate = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = candidate
     monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
     finished = Mock()
@@ -959,7 +988,7 @@ def test_switch_watchdog_without_rollback_allows_tray_recheck(
     """
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
     rig.runtime.start()
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
     finished = Mock()
     rig.runtime.on_switch_finished = finished
@@ -992,7 +1021,7 @@ def test_switch_watchdog_without_rollback_allows_tray_recheck(
 def test_paused_switch_survives_restart_before_hello(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
     rig.runtime.start()
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
     finished = Mock()
     rig.runtime.on_switch_finished = finished
@@ -1020,7 +1049,7 @@ def test_paused_switch_survives_restart_before_hello(monkeypatch: pytest.MonkeyP
 
 def test_switch_watchdog_stops_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
-    candidate = Mock(state="running", generation=1)
+    candidate = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = candidate
     monkeypatch.setattr(rig.runtime, "can_switch_without_pause", lambda minimum: True)
     finished = Mock()
@@ -1040,9 +1069,9 @@ def test_switch_watchdog_stops_candidate(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_paused_switch_watchdog_stops_unresponsive_worker(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
     rig.runtime.start()
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
-    recovered = Mock(state="running", generation=1)
+    recovered = Mock(state="running", generation=1, restarting=False, ready=True)
     current = ["whisper"]
     monkeypatch.setattr(rig.runtime, "_resolve_model_request", lambda: _switch_request(current[0]))
 
@@ -1089,7 +1118,7 @@ def test_paused_switch_watchdog_stops_unresponsive_worker(monkeypatch: pytest.Mo
 
 def test_restart_worker_fails_paused_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(monkeypatch, Settings(extra={"model_dir": "/tmp/model"}))
-    replacement = Mock(state="running", generation=1)
+    replacement = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = replacement
     finished = Mock()
     rig.runtime.on_switch_finished = finished
@@ -1203,6 +1232,22 @@ def test_failed_build_releases_resources_and_cannot_restart(
     resources["hotkey"].grab.assert_not_called()
 
 
+def assert_launch_guard_tracks_lifecycle(
+    runtime: DictationRuntime, launch_allowed: Callable[[], bool]
+) -> None:
+    """Переданный фабрике callback читает текущее состояние при каждом вызове."""
+    assert callable(launch_allowed)
+    closed, reserved = runtime._closed, runtime._appimage_removal_reserved
+    try:
+        for closed_state, reserved_state in ((False, False), (True, False), (False, True)):
+            runtime._closed = closed_state
+            runtime._appimage_removal_reserved = reserved_state
+            assert launch_allowed() is (not closed_state and not reserved_state)
+    finally:
+        runtime._closed = closed
+        runtime._appimage_removal_reserved = reserved
+
+
 def test_start_wires_resources_and_real_dictation(rig: Rig) -> None:
     """Реальные переходы проверяют обе стороны проводки, вставку и статистику."""
     runtime = rig.runtime
@@ -1216,7 +1261,11 @@ def test_start_wires_resources_and_real_dictation(rig: Rig) -> None:
     rig.pill_factory.assert_called_once_with(session=SessionKind.FLY, parent=runtime)
     rig.tray_factory.assert_called_once_with(rig.provider, hotkey="Ctrl+Space", parent=runtime)
     rig.guard_factory.assert_called_once_with(rig.pill, rig.tray, parent=runtime)
-    rig.supervisor_factory.assert_called_once_with(on_event=runtime._on_worker_event, use_qt=True)
+    launch_allowed = rig.supervisor_factory.call_args.kwargs["launch_allowed"]
+    rig.supervisor_factory.assert_called_once_with(
+        on_event=runtime._on_worker_event, use_qt=True, launch_allowed=launch_allowed
+    )
+    assert_launch_guard_tracks_lifecycle(runtime, launch_allowed)
     assert rig.hotkey.on_state == runtime._on_hotkey_state
     assert rig.guard.on_stop_recording == runtime.orchestrator.on_indicators_lost
     rig.create_notifier.assert_called_once_with(17)
@@ -1229,7 +1278,7 @@ def test_start_wires_resources_and_real_dictation(rig: Rig) -> None:
     )
     rig.stats.append.reset_mock()
     rig.recognize()
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
     assert runtime.last_text == MARKER
     assert_phase(runtime, DictationPhase.FINISHING)
     assert rig.hotkey.fsm.state == HotkeyState.IDLE
@@ -1469,7 +1518,7 @@ def test_start_without_model_does_not_load(rig: Rig, caplog: pytest.LogCaptureFi
         (logging.INFO, "модель в настройках не указана")
     ]
     rig.recognize()
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
 
 
 @pytest.mark.parametrize("fields", [{"load_ms": 123.5}, {}, {"load_ms": MARKER}])
@@ -1735,7 +1784,7 @@ def test_restart_loads_model_again(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     request = rig.supervisor.send.call_args.args[0]
     rig.event(type="model.loaded")
     rig.event(type="result", utterance_id="file", text="Проверка связи")
-    new = Mock(state="running", generation=1)
+    new = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = new
     rig.runtime.restart_worker()
     rig.supervisor.stop.assert_called_once_with()
@@ -1882,7 +1931,7 @@ def test_model_load_error_preserves_recording_and_hotkey_retries(
     rig.release(rig.now + 1)
     assert_phase(rig.runtime, DictationPhase.PROCESSING)
     rig.event(type="result", text=MARKER)
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
     rig.timers[-1].fire()
     assert_phase(rig.runtime, DictationPhase.IDLE)
     assert rig.runtime._model_load_failures == 2
@@ -2113,7 +2162,7 @@ def test_regrab_success_restores_dictation_once(
         call("hotkey_grab", key_role="text", result="regrabbed", attempts=busy_attempts + 1),
     ]
     rig.recognize()
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
 
 
 @pytest.mark.parametrize("blocked", ["selfcheck", "recording"])
@@ -2204,7 +2253,7 @@ def test_regrab_restores_real_hotkey_manager(
     rig.fire_tail()
     assert_phase(rig.runtime, DictationPhase.PROCESSING)
     rig.event(type="result", text=MARKER)
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
     rig.notify.notify_hotkey_regrabbed.assert_called_once_with("Ctrl+Space")
     rig.stats.append.assert_any_call("hotkey_grab", key_role="text", result="regrabbed", attempts=2)
 
@@ -2487,7 +2536,7 @@ def test_mapping_lost_during_ptt_recording_stops_and_recognizes(
     rig.tray.set_state.assert_any_call(TrayState.NOKEY)
     assert rig.runtime._regrab_timer is not None
     rig.event(type="result", text=MARKER)
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
 
 
 def test_mapping_lost_during_toggle_recording_ends_with_next_press(
@@ -2652,7 +2701,7 @@ def test_settings_are_used_for_recording_and_paste(monkeypatch: pytest.MonkeyPat
     rig.hotkey.fsm.press(rig.now + 1)
     rig.fire_tail()
     rig.event(type="result", text=MARKER)
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.CLIPBOARD_ONLY)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.CLIPBOARD_ONLY)
     settings.extra.clear()
     assert rig.runtime.record_params() == {
         "device": None,
@@ -3093,17 +3142,24 @@ def test_cancel_restart_replaces_supervisor_and_routes_new_cycle(
     rig.hotkey.fsm.press(rig.now)
     runtime.orchestrator.cancel("tray")
     next(t for t in rig.timers if t.interval == CANCEL_TIMEOUT_MS).fire()
-    new = Mock(state="running", generation=1)
+    new = Mock(state="running", generation=1, restarting=False, ready=True)
     rig.supervisor_factory.return_value = new
     rig.trace.clear()
     new.start.side_effect = lambda: rig.record("new.start")
-    next(t for t in rig.timers if t.interval == CANCEL_RESTART_MS).fire()
+    restart_timer = next(
+        t for t in rig.timers if t.interval == CANCEL_RESTART_MS and t.active and not t.deleted
+    )
+    restart_timer.fire()
     assert rig.trace[:2] == ["worker.stop", "new.start"]
     assert runtime.supervisor is new
     old.stop.assert_called_once_with()
     new.start.assert_called_once_with()
     assert new.generation == 8
-    rig.supervisor_factory.assert_called_with(on_event=runtime._on_worker_event, use_qt=True)
+    launch_allowed = rig.supervisor_factory.call_args.kwargs["launch_allowed"]
+    rig.supervisor_factory.assert_called_with(
+        on_event=runtime._on_worker_event, use_qt=True, launch_allowed=launch_allowed
+    )
+    assert_launch_guard_tracks_lifecycle(runtime, launch_allowed)
     old.send.reset_mock()
     rig.hotkey.fsm.press(rig.now + 3)
     assert new.send.call_args.args[0]["type"] == "record.start"
@@ -3117,7 +3173,7 @@ def test_cancel_restart_replaces_supervisor_and_routes_new_cycle(
     callback({"type": "result", "generation": 7, "text": "старый результат"})
     rig.paste.assert_not_called()
     callback({"type": "result", "generation": 8, "text": MARKER})
-    rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+    rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
     monkeypatch.setattr(module, "QCoreApplication", Mock())
     drain(runtime)
     new.pump.assert_called_once_with(timeout=0.05)
@@ -3408,6 +3464,40 @@ def test_selfcheck_failure_blocks_dictation_once(
     with caplog.at_level(logging.DEBUG):
         correlation = {} if "request_type" in event else {"utterance_id": "file"}
         rig.event(**correlation, **event)
+    if event.get("code") == ipc.PROTOCOL_MISMATCH:
+        # Смена протокола завершает поколение: самопроверку в нём не повторяем.
+        assert not rig.runtime._loading_model
+        assert not rig.runtime.orchestrator.cleanup_pending
+        assert timer.deleted and not timer.active
+        assert not rig.runtime.timers
+        rig.tray.set_model_recheck_enabled.assert_called_with(True)
+        rig.tray.set_state.assert_called_once_with(TrayState.ERROR)
+        factory_calls = rig.supervisor_factory.call_count
+        requests = list(rig.supervisor.send.call_args_list)
+        timer.timeout.emit()
+        rig.event(type="result", utterance_id="file", text="проверка")
+        rig.event(type="error", utterance_id="file", message=MARKER)
+        for offset in (0, 3):
+            rig.hotkey.fsm.press(rig.now + offset)
+            rig.release(rig.now + offset + 1)
+            rig.hotkey.fsm.escape(rig.now + offset + 2)
+        assert rig.supervisor_factory.call_count == factory_calls
+        assert rig.supervisor.send.call_args_list == requests
+        assert rig.hotkey.fsm.state is HotkeyState.IDLE
+        assert_phase(rig.runtime, DictationPhase.IDLE)
+        rig.pill.show_state.assert_called_with(PillState.ERROR, text=ipc.PROTOCOL_MISMATCH_MESSAGE)
+        rig.pill.hide.assert_not_called()
+        on_event.assert_not_called()
+        rig.notify.notify_engine_failed.assert_not_called()
+        rig.notify.notify_selfcheck_failed.assert_not_called()
+        rig.stats.append.assert_not_called()
+        rig.paste.assert_not_called()
+        assert rig.runtime.last_text is None
+        assert MARKER not in caplog.text
+        assert MARKER not in repr(
+            rig.stats.mock_calls + rig.notify.mock_calls + rig.pill.mock_calls
+        )
+        return
     rig.tray.set_model_recheck_enabled.assert_called_with(True)
     assert not rig.runtime._loading_model
     assert rig.runtime._model_load_failures == 1
@@ -3765,7 +3855,9 @@ def test_selfcheck_retry_uses_real_supervisor_correlation(
     if outcome == "watchdog":
         rig.timers[-1].fire()
     elif outcome == "cancelled":
-        first._accept({"type": "cancelled", "utterance_id": "file"}, 1)
+        first._accept(
+            {"type": "cancelled", "utterance_id": "file", "request_type": "transcribe.file"}, 1
+        )
     else:
         if outcome == "timeout":
             first._accept({"type": "pong"}, 1)  # Живой воркер: timeout без рестарта.
@@ -4405,7 +4497,7 @@ def test_onboarding_install_and_finish_loads_model_for_next_dictation(
                 "audio_ms": 1000.0,
             }
         )
-        rig.paste.assert_called_once_with(MARKER, 4321, PasteMode.AUTO)
+        rig.paste.assert_called_once_with(MARKER, rig.target, PasteMode.AUTO)
         assert_phase(rig.runtime, DictationPhase.FINISHING)
         assert rig.runtime.supervisor is replacement
     finally:
@@ -4653,6 +4745,11 @@ def microphone_runtime(
 
 
 def microphone_runtime_event(rig: Rig, message: dict[str, Any]) -> None:
+    request_type = {"cancelled": "record.cancel", "audio.closed": "audio.close"}.get(
+        message["type"]
+    )
+    if request_type is not None:
+        message = {"request_type": request_type, **message}
     supervisor = rig.runtime.supervisor
     supervisor._receive(ipc.encode(message), supervisor.generation)
 
@@ -4719,6 +4816,9 @@ def test_microphone_runtime_and_app_host_use_real_ipc_without_side_effects(
     assert send.call_count == 1
     controller.stopTest()
     assert controller.testState == "processing"
+    # Захват настоящего воркера подтверждает физическое закрытие отдельно
+    # от результата распознавания; fake transport должен воспроизвести и его.
+    microphone_runtime_event(rig, {"type": "record.stopped", "utterance_id": uid})
     microphone_runtime_event(
         rig,
         {
@@ -4985,6 +5085,7 @@ def test_level_runtime_does_not_prepare_model(
     monkeypatch: pytest.MonkeyPatch, selfcheck: str
 ) -> None:
     rig = microphone_runtime(monkeypatch, model=False)
+    microphone_runtime_event(rig, ipc.make_hello())
     rig.runtime._selfcheck = selfcheck
     resolve = Mock(side_effect=AssertionError("Модель не нужна"))
     restart = Mock(side_effect=AssertionError("Перезапуск не нужен"))
@@ -5008,6 +5109,7 @@ def test_level_runtime_does_not_prepare_model(
 @pytest.mark.parametrize("unavailable", ["not-started", "closed", "stopped", "busy"])
 def test_level_runtime_unavailable(monkeypatch: pytest.MonkeyPatch, unavailable: str) -> None:
     rig = microphone_runtime(monkeypatch, model=False)
+    microphone_runtime_event(rig, ipc.make_hello())
     if unavailable == "not-started":
         rig.runtime._started = False
     elif unavailable == "closed":
@@ -5163,8 +5265,9 @@ def test_t232_revocation_before_ready_blocks_ordinary_load(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restart: bool, stage: str
 ) -> None:
     rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=restart)
-    ready = Mock(wraps=rig.runtime._model_ready)
-    monkeypatch.setattr(rig.runtime, "_model_ready", ready)
+    # Готовность объявляется под CATALOG_LOCK отдельно от автостарта (N-4б).
+    ready = Mock(wraps=rig.runtime._declare_model_ready)
+    monkeypatch.setattr(rig.runtime, "_declare_model_ready", ready)
     try:
         if stage == "selfcheck":
             rig.event(type="model.loaded", id="gigaam", revision="r1")
@@ -5286,7 +5389,7 @@ class SwitchRig:
         return _switch_request(self.current)
 
     def factory(self, **kwargs: Any) -> Mock:
-        worker = Mock(state="running", generation=0)
+        worker = Mock(state="running", generation=0, restarting=False, ready=True)
         worker.on_event = kwargs["on_event"]
         self.workers.append(worker)
         return worker
@@ -5686,6 +5789,63 @@ def test_rig_can_change_installation_between_instances(monkeypatch: pytest.Monke
         rig.runtime.shutdown()
 
 
+@pytest.mark.parametrize(
+    "action, commands",
+    [
+        ("stop_test", ["record.start", "record.stop", "recognize"]),
+        ("cancel_test", ["record.start", "record.cancel"]),
+    ],
+)
+def test_prepared_microphone_callback_can_stop_new_recording(
+    monkeypatch: pytest.MonkeyPatch, action: str, commands: list[str]
+) -> None:
+    rig = microphone_runtime(monkeypatch)
+    updates: list[MicrophoneTestUpdate] = []
+    send = Mock(wraps=rig.runtime.orchestrator._send)
+    monkeypatch.setattr(rig.runtime.orchestrator, "_send", send)
+
+    def update(value: MicrophoneTestUpdate) -> None:
+        updates.append(value)
+        if value.state == "recording":
+            assert rig.runtime._pending_test is None
+            getattr(rig.runtime, action)()
+
+    assert rig.runtime.start_test("chosen", update)
+    microphone_model_ready(rig)
+    requests = [item.args[0] for item in send.call_args_list]
+    assert [request["type"] for request in requests] == commands
+    assert all(request["utterance_id"] == requests[0]["utterance_id"] for request in requests)
+    assert rig.runtime._pending_test is None
+    assert updates[-1].state != "idle"  # закрытие ещё не подтверждено воркером
+    rig.runtime.shutdown()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_model_ready_preserves_reentrant_pending_test(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, raises: bool
+) -> None:
+    original_updates: list[MicrophoneTestUpdate] = []
+    new_updates: list[MicrophoneTestUpdate] = []
+    pending = ("new-device", new_updates.append)
+    rig.runtime._pending_test = ("old-device", original_updates.append)
+
+    def start(device: str, callback: Callable[[MicrophoneTestUpdate], None]) -> bool:
+        assert device == "old-device"
+        assert rig.runtime._pending_test is None
+        rig.runtime._pending_test = pending
+        if raises:
+            raise RuntimeError(MARKER)
+        return True
+
+    monkeypatch.setattr(rig.runtime.orchestrator, "start_test", start)
+    monkeypatch.setattr(rig.runtime.orchestrator, "cancel_test", Mock())
+    rig.runtime._model_ready()
+    assert rig.runtime._pending_test is pending
+    assert new_updates == []
+    expected = [MicrophoneTestUpdate("error", message=TEST_FAILED)] if raises else []
+    assert original_updates == expected
+
+
 def revision_runtime(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> tuple[Rig, ModelService, ModelDownloads, CatalogEntry]:
@@ -5763,7 +5923,7 @@ def test_revoked_candidate_restores_current_before_promotion(
     old = rig.supervisor
     assert rig.runtime.supervisor is old
     before = (service._store.root / "current.json").read_bytes()
-    candidate = Mock(state="running", generation=0)
+    candidate = Mock(state="running", generation=0, restarting=False)
     rig.supervisor_factory.return_value = candidate
     try:
         service.activate(entry.id, entry.revision, previous_revision="r0")
@@ -5793,7 +5953,7 @@ def test_revoked_candidate_restores_current_before_promotion(
             assert not service.catalog.is_revoked(entry.id, "r1")
         else:
             downloads.accept_catalog(revoked, frozenset())
-        restored = Mock(state="running", generation=0)
+        restored = Mock(state="running", generation=0, restarting=False)
         rig.supervisor_factory.return_value = restored
         event({"type": "model.loaded", "generation": candidate.generation, "id": entry.id})
         assert not rig.runtime._switch_active()
@@ -6045,7 +6205,7 @@ def test_t234_revoked_ordinary_worker_is_replaced_outside_catalog_lock(
     rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
     runtime = rig.runtime
     old = rig.supervisor
-    clean = Mock(state="running", generation=old.generation + 1)
+    clean = Mock(state="running", generation=old.generation + 1, restarting=False)
     rig.supervisor_factory.return_value = clean
     ownership = observe_stop_catalog_lock(old)
     try:
@@ -6063,7 +6223,9 @@ def test_t234_revoked_ordinary_worker_is_replaced_outside_catalog_lock(
         assert runtime.supervisor is clean
         assert clean.generation == old.generation + 1
         clean.start.assert_called_once_with()
-        rig.supervisor_factory.assert_called_with(on_event=runtime._on_worker_event, use_qt=True)
+        rig.supervisor_factory.assert_called_with(
+            on_event=runtime._on_worker_event, use_qt=True, launch_allowed=ANY
+        )
         assert runtime._selfcheck == "failed"
         assert not runtime._loading_model
         assert runtime._selfcheck_timer is None
@@ -6092,28 +6254,39 @@ def test_t234_revoked_ordinary_worker_is_replaced_outside_catalog_lock(
         runtime.shutdown()
 
 
+@pytest.mark.parametrize("exits", [True, False], ids=["killed", "d-state"])
 @pytest.mark.parametrize("level_active", [False, True], ids=["idle", "level-recording"])
 def test_t239_revoked_worker_stop_failure_closes_ipc_and_kills_process(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, level_active: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, level_active: bool, exits: bool
 ) -> None:
-    """Ошибка настоящего stop до socket.close не оставляет отозванный процесс."""
+    """Ошибка настоящего stop до socket.close не оставляет отозванный процесс.
+
+    После слияния с US-2.6: чистый воркер нового поколения — только если SIGKILL
+    подтверждён выходом (poll). Процесс, переживший kill (D-state), оставляет
+    прежнее поколение и страж захвата; замены нет до «Проверить модель ещё раз».
+    """
     rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
     runtime = rig.runtime
     old = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
     old.state = "running"
+    old._hello_accepted = True  # US-2.7: record.* — только после hello поколения
     connection = Mock(spec=socket.socket)
     connection.send.side_effect = len
     old._socket = connection
     old._notifier = Mock()
     old._notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
     process = Mock(spec=subprocess.Popen)
-    process.poll.return_value = None
+    alive = [True]
+    process.poll.side_effect = lambda: None if alive[0] else -9
+    if exits:
+        process.kill.side_effect = lambda: alive.__setitem__(0, False)
     old.process = process
     runtime.supervisor = old
     send = Mock(wraps=old.send)
     monkeypatch.setattr(old, "send", send)
-    clean = Mock(state="running", generation=old.generation + 1)
+    clean = Mock(state="running", generation=old.generation + 1, restarting=False)
     rig.supervisor_factory.return_value = clean
+    factory_calls = rig.supervisor_factory.call_count
     try:
         if level_active:
             assert runtime.start_level_monitor("default", Mock()) is True
@@ -6129,14 +6302,23 @@ def test_t239_revoked_worker_stop_failure_closes_ipc_and_kills_process(
         process.terminate.assert_not_called()
         process.wait.assert_called_once_with(timeout=0.2)
         assert old.state == "stopped"
+        assert runtime._selfcheck == "failed"
+        if not exits:
+            assert runtime.supervisor is old
+            assert old.generation == 1 and old._retired == [process]
+            assert rig.supervisor_factory.call_count == factory_calls
+            clean.start.assert_not_called()
+            assert runtime.orchestrator.level_active is level_active
+            send.assert_not_called()
+            return
         assert runtime.supervisor is clean
         clean.start.assert_called_once_with()
-        assert runtime._selfcheck == "failed"
         if not level_active:
             assert runtime.start_level_monitor("default", Mock()) is True
             assert clean.send.call_args.args[0]["type"] == "record.start"
         send.assert_not_called()
     finally:
+        alive[0] = False
         runtime.shutdown()
 
 
@@ -6148,7 +6330,7 @@ def test_revoked_worker_replacement_stays_closed_after_stop(
     rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
     runtime = rig.runtime
     old = rig.supervisor
-    clean = Mock(state="new", generation=old.generation + 1)
+    clean = Mock(state="new", generation=old.generation + 1, restarting=False)
     rig.supervisor_factory.return_value = clean
     rig.supervisor_factory.reset_mock()
     rig.hotkey.has_pending_press = False
@@ -6238,6 +6420,7 @@ def test_t282_revoked_switch_stop_failure_kills_candidate_and_closes_ipc(
     try:
         bench.switch()
         assert candidate is not None
+        candidate._hello_accepted = True  # _emit минует _accept; US-2.7 ждёт hello
         candidate._emit({"type": "hello"})
         assert any(frame.get("id") == "whisper" for frame in frames)
         if stage == "selfcheck":
@@ -6355,6 +6538,7 @@ def test_promoting_candidate_kills_previous_worker_after_stop_failure_with_level
     runtime = bench.rig.runtime
     old = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
     old.state = "running"
+    old._hello_accepted = True  # US-2.7: record.* — только после hello поколения
     old.generation = bench.old.generation
     child = {"alive": True, "capturing": False}
     connection = Mock(spec=socket.socket)
@@ -6422,10 +6606,17 @@ def test_promoting_candidate_kills_previous_worker_after_stop_failure_with_level
 
 
 @pytest.mark.parametrize("collect_with", ["pump", "stop"])
-def test_rejected_loaded_revision_transfers_retired_processes_to_replacement(
+def test_rejected_loaded_revision_keeps_generation_until_killed_processes_exit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, collect_with: str
 ) -> None:
-    """Смена supervisor не теряет процессы, не успевшие завершиться при kill."""
+    """Процессы, пережившие kill, не теряются и не уступают поколение раньше выхода.
+
+    Сведение M7 (N-12, перенос в замену) с контрактом US-2.6/2.7: поколение
+    меняется только после poll() is not None. Пока процессы живы, супервизор
+    остаётся прежним (они в его _retired и в ресурсах завершения программы);
+    после выхода «Проверить модель ещё раз» поднимает чистый воркер и передаёт
+    ему собранные процессы (adopt_retired).
+    """
     from astra_voice.app import _copy_shutdown_resources
 
     rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
@@ -6444,33 +6635,137 @@ def test_rejected_loaded_revision_transfers_retired_processes_to_replacement(
     clean = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
     monkeypatch.setattr(clean, "start", lambda: setattr(clean, "state", "running"))
     rig.supervisor_factory.return_value = clean
+    factory_calls = rig.supervisor_factory.call_count
     try:
         publish_runtime_revocation(tmp_path)
         rig.event(type="model.loaded", id="gigaam", revision="r1")
-        assert runtime.supervisor is clean
+        assert runtime.supervisor is old
+        assert old.generation == 1
+        assert rig.supervisor_factory.call_count == factory_calls
+        # Ревью M-1: без пункта в трее восстановления через recheck нет.
+        rig.tray.set_model_recheck_enabled.assert_called_with(True)
         for process in processes:
             process.kill.assert_called_once_with()
             process.wait.assert_called_once_with(timeout=0.2)
             process.poll.reset_mock()
             process.wait.reset_mock(side_effect=True)
-        assert clean._retired == processes
+        assert old._retired == processes
         shutdown_processes, _ = _copy_shutdown_resources(runtime, None, None)
         for process in processes:
             assert any(child is process for child in shutdown_processes)
+        for process in processes:
+            process.poll.return_value = -9
         if collect_with == "pump":
-            for process in processes:
-                process.poll.return_value = -9
-            clean.pump()
+            old.pump()
             for process in processes:
                 process.poll.assert_called_once_with()
-        else:
-            clean.stop()
-            for process in processes:
-                process.terminate.assert_called_once_with()
+            assert old._retired == []
+        # «Проверить модель ещё раз»: stop() прежнего супервизора собирает вышедшие
+        # процессы без сигналов, затем — чистый воркер следующего поколения.
+        runtime._recheck_model()
+        assert runtime.supervisor is clean
+        assert clean.generation == 2
+        assert old._retired == []
+        for process in processes:
+            process.terminate.assert_not_called()
+            if collect_with == "stop":
                 process.wait.assert_called_once_with(timeout=2)
         assert clean._retired == []
     finally:
         for process in processes:
             process.poll.return_value = -9
             process.wait.side_effect = None
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("entry", ["start_test", "reload_model"])
+def test_ib63_restart_after_surviving_kill_shows_failure_and_recheck_recovers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entry: str
+) -> None:
+    """ИБ-63 (NM-3): restart_worker без подтверждённого выхода не оставляет «загрузку».
+
+    Отзыв, процесс пережил SIGKILL, пользователь выбрал другую модель и открыл
+    проверку микрофона (или «Применить»). Замена бросает RuntimeError: показан
+    провал, «Проверить модель ещё раз» включён. После выхода процесса этот пункт
+    поднимает ровно один чистый воркер.
+    """
+    rig = revocation_loading_runtime(monkeypatch, tmp_path, restart=False)
+    runtime = rig.runtime
+    old = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    old.state = "running"
+    old._notifier = Mock()
+    old._notifier.setEnabled.side_effect = RuntimeError("Объект Qt удалён")
+    process = Mock(spec=subprocess.Popen)
+    process.poll.return_value = None
+    process.wait.side_effect = subprocess.TimeoutExpired("worker", 0.2)
+    old.process = process
+    runtime.supervisor = old
+    clean = WorkerSupervisor(runtime._on_worker_event, use_qt=False)
+    clean_start = Mock(side_effect=lambda: setattr(clean, "state", "running"))
+    monkeypatch.setattr(clean, "start", clean_start)
+    rig.supervisor_factory.return_value = clean
+    factory_calls = rig.supervisor_factory.call_count
+    try:
+        publish_runtime_revocation(tmp_path)
+        rig.event(type="model.loaded", id="gigaam", revision="r1")
+        assert runtime.supervisor is old
+        # Переключение не удалось, но текущей осталась новая модель.
+        runtime.settings = from_dict({"model_dir": "/tmp/other-model"})
+        rig.tray.reset_mock()
+        if entry == "start_test":
+            updates: list[MicrophoneTestUpdate] = []
+            assert runtime.start_test("default", updates.append) is True
+            assert updates[-1].state == "error"
+            assert runtime._pending_test is None
+        else:
+            with pytest.raises(RuntimeError):
+                runtime.reload_model()
+
+        assert runtime.supervisor is old
+        assert old.generation == 1
+        assert rig.supervisor_factory.call_count == factory_calls
+        assert runtime._selfcheck == "failed"
+        assert not runtime._loading_model
+        rig.tray.set_state.assert_called_with(TrayState.ERROR)
+        rig.tray.set_model_recheck_enabled.assert_called_with(True)
+
+        process.poll.return_value = -9
+        process.wait.side_effect = None
+        process.wait.return_value = -9
+        runtime._recheck_model()
+        assert runtime.supervisor is clean
+        assert clean.generation == 2
+        assert rig.supervisor_factory.call_count == factory_calls + 1
+        clean_start.assert_called_once_with()
+    finally:
+        process.poll.return_value = -9
+        process.wait.side_effect = None
+        runtime.shutdown()
+
+
+def test_revocation_while_previous_worker_stops_restores_previous_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Слияние M7 с US-2.6: отзыв пришёл, пока останавливался прежний воркер.
+
+    Прежний воркер останавливается до замены супервизора и вне CATALOG_LOCK, затем
+    отзыв перепроверяется под замком: кандидат не продвигается, прежняя модель
+    возвращается так же, как после переключения с паузой.
+    """
+    bench = SwitchRig(monkeypatch)
+    runtime = bench.rig.runtime
+    runtime.set_revoked_check(
+        lambda model_id, revision: model_id == "whisper" and bool(bench.old.stop.called)
+    )
+    try:
+        bench.switch()
+        candidate = bench.workers[-1]
+        bench.emit(candidate, type="hello")
+        bench.emit(candidate, type="model.loaded", id="whisper")
+        candidate.stop.assert_called_once_with()
+        restored = bench.assert_rolled_back(candidate)
+        # Остановка в продвижении и идемпотентная повторная в restart_worker.
+        assert bench.old.stop.call_count == 2
+        bench.finish_restore(restored)
+    finally:
         runtime.shutdown()

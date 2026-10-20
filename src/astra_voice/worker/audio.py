@@ -847,6 +847,8 @@ class AudioCapture:
         self._cancelled = threading.Event()
         self._thread: threading.Thread | None = None
         self._watchdog_lock = threading.Lock()
+        self._owners: dict[str, threading.Thread] = {}
+        self._close_failed = False
         self._stop_deadlines: dict[threading.Thread, float] = {}
         self._record_deadline: float | None = None
         self._first_chunk_deadline: float | None = None
@@ -880,6 +882,8 @@ class AudioCapture:
             name="audio-capture",
             daemon=True,
         )
+        with self._watchdog_lock:
+            self._owners[utterance_id] = self._thread
         self._thread.start()
 
     def _open(self, device: str | None, running: threading.Event) -> bool | None:
@@ -935,7 +939,6 @@ class AudioCapture:
         cancelled: threading.Event | None = None,
     ) -> None:
         """Владеет циклом чтения; лимит и хранение отсчётов остаются у автомата."""
-        started = False
         try:
             if previous is not None:
                 previous.join()
@@ -982,7 +985,6 @@ class AudioCapture:
                     self._silent_uid = uid
             if not running.is_set():
                 return
-            started = True
             self._on_event({"type": "record.started", "utterance_id": uid})
             self._read(uid, running, deadline, cancelled, ready_at=self._clock())
         except AudioError as err:
@@ -991,11 +993,23 @@ class AudioCapture:
         finally:
             # Даже pa_simple_free может зависнуть: сторож действует до выхода потока.
             self._mark_stopping(threading.current_thread(), running)
-            self._source.close()
-            # Не подтверждаем остановку, если close упал или завис. Событие может
-            # прийти позже результата/ошибки распознавания и не завершает запрос IPC.
-            if started:
+            closed = self._close_source()
+            with self._watchdog_lock:
+                if self._owners.get(uid) is threading.current_thread():
+                    del self._owners[uid]
+            # Липкий сбой любого close запрещает ACK, даже если повтор стал no-op.
+            if closed:
                 self._on_event({"type": "record.stopped", "utterance_id": uid})
+
+    def _close_source(self) -> bool:
+        """Запоминает любой сбой закрытия до завершения процесса, без текста исключения."""
+        try:
+            self._source.close()
+        except Exception:
+            with self._watchdog_lock:
+                self._close_failed = True
+        with self._watchdog_lock:
+            return not self._close_failed
 
     def _read(
         self,
@@ -1045,7 +1059,12 @@ class AudioCapture:
                 if chunk is None:
                     if self._source.ended:
                         return
-                    self._source.close()
+                    # Первый close тоже может зависнуть: взводим сторож до вызова.
+                    with self._watchdog_lock:
+                        self._stop_deadlines.setdefault(
+                            threading.current_thread(), time.monotonic() + STOP_WATCHDOG_S
+                        )
+                    self._close_source()
                     raise AudioError(ERROR_FAILED, "Запись звука прервалась.")
                 with self._watchdog_lock:
                     # Порция пришла: сторож «ни одного отсчёта» больше не нужен.
@@ -1210,6 +1229,8 @@ class AudioCapture:
         """Ограничивает захват по часам и сообщает владельцу о зависшей остановке."""
         self._check_first_chunk()
         with self._watchdog_lock:
+            if self._close_failed:
+                raise CaptureStopTimeout("Источник захвата не подтвердил закрытие.")
             deadline = self._record_deadline
         if deadline is not None and self._clock() >= deadline:
             self.request_stop()
@@ -1239,15 +1260,44 @@ class AudioCapture:
         thread = self._thread
         if thread is None:
             # Поток никогда не запускался: конкурирующего владельца заведомо нет.
-            self._source.close()
+            self._close_source()
+            self.check_stop_watchdog()
             return
+        self._wait_thread(thread)
+
+    def wait_stopped(self, utterance_id: str) -> None:
+        """Ждёт закрытия только указанной записи, не останавливая следующую.
+
+        Используется перед bad-state на отмену: ошибка записи уже могла удалить
+        её PCM, пока владелец ещё освобождает источник. Историю id не храним.
+        """
+        with self._watchdog_lock:
+            thread = self._owners.get(utterance_id)
+            failed = self._close_failed
+        if failed:
+            raise CaptureStopTimeout("Источник захвата не подтвердил закрытие.")
+        if thread is not None:
+            self._wait_thread(thread)
+
+    def _wait_thread(self, thread: threading.Thread) -> None:
+        """Ожидает владельца вне замков автомата и источника, под сторожем."""
         if thread is threading.current_thread():
             raise RuntimeError("Поток захвата не может ожидать сам себя.")
+        self.check_stop_watchdog()
+        with self._watchdog_lock:
+            own_deadline = self._stop_deadlines.get(thread, time.monotonic() + STOP_WATCHDOG_S)
         while thread.is_alive():
             self.check_stop_watchdog()
+            now = time.monotonic()
+            if own_deadline <= now:
+                raise CaptureStopTimeout("Поток захвата не завершился до срока ожидания.")
             with self._watchdog_lock:
-                deadline = min(self._stop_deadlines.values(), default=time.monotonic())
-            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                # Чужой срок только будит нас для watchdog; завершившийся сосед
+                # больше не ограничивает ожидание владельца.
+                wake_deadline = min(
+                    [own_deadline] + [d for t, d in self._stop_deadlines.items() if t.is_alive()]
+                )
+            thread.join(timeout=max(0.0, wake_deadline - now))
         self.check_stop_watchdog()
 
     @property
@@ -1478,12 +1528,12 @@ class PulseSimpleSource:
     def close(self) -> None:
         """Освобождает дескриптор ровно один раз и сбрасывает выбранное устройство."""
         handle, self._handle = self._handle, None
+        if handle is not None and self._pulse is not None:
+            self._pulse.lib.pa_simple_free(handle)
         self._device_name = None
         self._selected_device = None
         self.device_label = None
         self.microphone_count = None
-        if handle is not None and self._pulse is not None:
-            self._pulse.lib.pa_simple_free(handle)
 
     @property
     def is_open(self) -> bool:

@@ -51,6 +51,7 @@ from astra_voice.platform.paste import (
     PasteOutcome,
     PasteOutcomeKind,
     PasteRestore,
+    PasteTarget,
     normalize,
 )
 from astra_voice.ui.pill import (
@@ -83,6 +84,8 @@ class FakePill:
         self.trace = trace
         self.calls: list[tuple[PillState, str | None, float | None]] = []
         self.hidden = False
+        # Как Pill.visible для стража О4; False — режим «только значок».
+        self.visible = True
 
     def show_state(
         self, state: PillState, *, text: str | None = None, level: float | None = None
@@ -150,7 +153,7 @@ class Rig:
         self.trace: list[tuple[Any, ...]] = []
         self.now = 10.0
         self.worker_generation = 1
-        self.window: int | None = 42
+        self.window: int | None | PasteTarget = 42
         self.mode = PasteMode.AUTO
         self.params: dict[str, Any] = {
             "device": "fake-device",
@@ -159,16 +162,18 @@ class Rig:
             "insert": True,
         }
         self.sent: list[tuple[dict[str, Any], float | None]] = []
-        self.pasted: list[tuple[str, int | None, PasteMode]] = []
+        self.pasted: list[tuple[str, int | None | PasteTarget, PasteMode]] = []
         self.outcomes: deque[PasteOutcomeKind] = deque()
         self.paste_reason = ""
         self.paste_duration_ms = 125.0
         self.delivered_ms: float | None = 125.0
         self.during_paste: Callable[[], None] | None = None
         self.during_send: Callable[[dict[str, Any]], None] | None = None
+        self.ack_stop = True
         self.timers: list[Timer] = []
         self.done = 0
         self.cancels = 0
+        self.refusals = 0
         self.recording = False
         self.pill = FakePill(self.trace)
         self.tray = FakeTray(self.trace)
@@ -199,6 +204,7 @@ class Rig:
             hotkey_done=self.hotkey_done,
             hotkey_cancel=self.hotkey_cancel,
             hotkey_idle=lambda: self.hotkey.fsm.state is HotkeyState.IDLE,
+            hotkey_refuse=self.hotkey_refuse,
             set_recording=self.set_recording,
             paste_mode=lambda: self.mode,
             record_params=lambda: self.params,
@@ -218,7 +224,7 @@ class Rig:
         self.trace.append(("clock", self.now))
         return self.now
 
-    def active_window(self) -> int | None:
+    def active_window(self) -> int | None | PasteTarget:
         self.trace.append(("active_window", self.window))
         return self.window
 
@@ -227,8 +233,16 @@ class Rig:
         self.trace.append(("send", message["type"]))
         if self.during_send is not None:
             self.during_send(message)
+        if message["type"] == "record.stop" and self.ack_stop:
+            self.core.on_worker_event(
+                {
+                    "type": "record.stopped",
+                    "generation": self.worker_generation,
+                    "utterance_id": message["utterance_id"],
+                }
+            )
 
-    def paste(self, text: str, target: int | None, mode: PasteMode) -> PasteOutcome:
+    def paste(self, text: str, target: int | None | PasteTarget, mode: PasteMode) -> PasteOutcome:
         self.pasted.append((text, target, mode))
         self.trace.append(("paste",))
         if self.during_paste is not None:
@@ -264,6 +278,11 @@ class Rig:
     def hotkey_cancel(self) -> None:
         self.cancels += 1
         self.fsm.escape(self.now)
+
+    def hotkey_refuse(self) -> None:
+        """Как runtime._input_refuse: отказ нажатию поверх распознавания (US-2.7)."""
+        self.refusals += 1
+        self.fsm.refuse(self.now)
 
     def set_recording(self, value: bool) -> None:
         self.recording = value
@@ -311,9 +330,24 @@ class Rig:
         return str([m for m, _ in self.sent if m["type"] == "record.start"][-1]["utterance_id"])
 
     def event(self, kind: str, **fields: object) -> None:
+        if kind == "cancelled":
+            uid = fields["utterance_id"] if "utterance_id" in fields else self.uid
+            request_type = next(
+                (m["type"] for m, _ in reversed(self.sent) if m.get("utterance_id") == uid),
+                None,
+            )
+            if request_type is not None:
+                fields.setdefault("request_type", request_type)
+        elif kind == "audio.closed":
+            fields.setdefault("request_type", "audio.close")
+        if kind == "record.limit" and self.ack_stop:
+            self.event("record.stopped", **fields)
         self.core.on_worker_event(
             {"type": kind, "generation": self.worker_generation, "utterance_id": self.uid, **fields}
         )
+
+    def job_error(self, utterance_id: str, **fields: object) -> None:
+        self.event("error", utterance_id=utterance_id, **fields)
 
     def result(self, text: str = MARKER) -> None:
         self.now += 0.25
@@ -581,20 +615,36 @@ def test_first_dictation_only_is_cold_and_finishing_can_restart(
 
 
 @pytest.mark.parametrize("phase", ["recording", "processing", "pasting", "busy"])
-def test_single_slot_ignores_repeated_presses(rig: Rig, phase: str) -> None:
+def test_repeated_presses_respect_single_recording_and_queue_limit(rig: Rig, phase: str) -> None:
+    """Пишется одна фраза; поверх распознавания/вставки — ещё одна (US-2.7), не больше двух.
+
+    До US-2.7 (test_single_slot_ignores_repeated_presses) нажатия в processing/pasting/busy
+    игнорировались; решения владельца 2026-10-15 (US-2.7, Q6 и Q7) их принимают.
+    """
     rig.start()
     if phase != "recording":
         rig.stop()
     if phase == "pasting":
         rig.during_paste = rig.start
         rig.result()
+        rig.during_paste = None
     elif phase == "busy":
         rig.outcomes.append(PasteOutcomeKind.BUSY)
         rig.result()
         rig.start()
     else:
         rig.start()
-    assert rig.commands().count("record.start") == 1
+    expected = 1 if phase == "recording" else 2
+    assert rig.commands().count("record.start") == expected
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    if phase in ("processing", "busy"):
+        # Третье нажатие при двух незавершённых фразах тихо игнорируется (решение 7).
+        rig.stop()
+        rig.start()
+        assert rig.commands().count("record.start") == 2
+        assert "record.cancel" not in rig.commands()
+        rig.assert_hotkey_state(HotkeyState.PROCESSING)
+        assert rig.refusals == 1 and rig.cancels == 0
 
 
 @pytest.mark.parametrize(
@@ -710,7 +760,8 @@ def test_cancel_blocks_all_later_results_and_retries(rig: Rig, phase: str) -> No
     attempts = len(rig.pasted)
     rig.core.cancel("pill")
     assert rig.sent[-1][0] == {"type": "record.cancel", "utterance_id": rig.uid}
-    assert not rig.recording and rig.tray.state == TrayState.IDLE
+    assert rig.recording == (phase == "recording")
+    assert rig.tray.state == (TrayState.LISTENING if phase == "recording" else TrayState.IDLE)
     assert rig.fsm.state == HotkeyState.IDLE and rig.cancels == 1
     rig.backend.ungrab_escape.assert_called_once_with()
     assert all(t.cancelled for t in old_timers)
@@ -777,8 +828,8 @@ def test_ib8_cancel_survives_persistent_ui_failures(
     watchdog = rig.timer(CANCEL_TIMEOUT_MS)
     assert at_send == [(0, 0, [watchdog])]
     assert all(timer.cancelled for timer in old_timers)
-    assert set_recording.call_count == set_state.call_count == 1
-    assert len(caplog.records) == 2
+    assert set_recording.call_count == set_state.call_count == int(phase != "recording")
+    assert len(caplog.records) == (2 if phase != "recording" else 0)
     assert all(
         record.levelno == logging.WARNING and record.exc_info is not None
         for record in caplog.records
@@ -841,7 +892,8 @@ def test_cancel_timeout_and_synchronous_ack(rig: Rig) -> None:
     rig.start()
     rig.core.cancel("tray")
     rig.timer(CANCEL_TIMEOUT_MS).fire()
-    assert rig.pill.calls[-1][0] == PillState.CANCELLED
+    assert rig.pill.calls[-1][0] == PillState.LISTENING
+    assert rig.recording
     assert rig.core.phase == DictationPhase.FINISHING and rig.done == 1
     rig.event("cancelled")
     rig.start()
@@ -1025,6 +1077,7 @@ def test_error_mapping(rig: Rig, code: str, reason: str, kind: str | None) -> No
     rig.params["device"] = ""
     rig.start()
     rig.event("error", code=code, message=MARKER)
+    rig.event("record.stopped")
     assert rig.pill.calls[-1] == (PillState.ERROR, reason, None)
     assert rig.tray.state == TrayState.ERROR
     assert rig.stats.events == (
@@ -1037,6 +1090,7 @@ def test_audio_silent_error_names_the_reason_and_asks_for_it(rig: Rig) -> None:
     """Источник открылся, но звука не даёт: пилюля «Микрофон молчит» + причина."""
     rig.start()
     rig.event("error", code="audio-silent", message=MARKER)
+    rig.event("record.stopped")
     assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_MICROPHONE_SILENT, None)
     assert rig.tray.state == TrayState.ERROR
     assert rig.done == 1 and not rig.recording
@@ -1367,6 +1421,8 @@ def test_manual_stop_failure_after_audio_ready_releases_hotkey(rig: Rig, command
     assert rig.recording and rig.commands() == ["record.start"]
     assert rig.pill.calls[-1:] == [(PillState.LISTENING, None, None)]
     rig.stop()
+    assert rig.recording == (command == "record.stop")
+    rig.event("record.stopped")
     assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
     rig.assert_hotkey_state(HotkeyState.IDLE)
     assert not rig.recording
@@ -1623,6 +1679,7 @@ def test_missing_device_uses_selection_at_record_start(rig: Rig, device: str | N
         {"type": "mic_error", "kind": "device-lost" if device else "none", "recovered_by": "none"}
     ]
     reason = ERROR_MICROPHONE_LOST if device else ERROR_MICROPHONE_UNAVAILABLE
+    rig.event("record.stopped")
     assert rig.pill.calls[-1] == (PillState.ERROR, reason, None)
     assert rig.device_lost.call_count == int(bool(device))
     assert not rig.recording and rig.done == 1
@@ -1706,15 +1763,25 @@ def test_recording_terminal_releases_escape_and_next_combo_starts(
         assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
         assert rig.commands() == ["record.start", "recognize"]
     elif terminal == "cancelled":
-        rig.event("cancelled")
+        rig.core.cancel("tray")
+        rig.event("cancelled", request_type="record.cancel")
     else:
         rig.event("error", code=terminal)
 
     assert rig.core.phase.value == "finishing"
     rig.assert_hotkey_state(HotkeyState.IDLE)
-    assert not rig.recording
+    assert rig.recording == (
+        terminal in ("audio-no-device", "audio-busy", "audio-failed", "timeout")
+    )
     rig.backend.ungrab_escape.assert_called_once_with()
-    assert "record.cancel" not in rig.commands()
+    if terminal in ("audio-no-device", "audio-busy", "audio-failed", "timeout"):
+        assert rig.commands()[-1] == "record.cancel"
+        assert rig.core.cleanup_pending
+        rig.event("cancelled")
+    elif terminal == "cancelled":
+        assert rig.commands()[-1] == "record.cancel"
+    else:
+        assert "record.cancel" not in rig.commands()
     rig.combo_key(pressed=False)
     rig.now += 1
     rig.combo_key(pressed=True)
@@ -1798,10 +1865,16 @@ def test_mapping_regrab_during_recording_does_not_cancel(mode: HotkeyMode) -> No
     assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
 
 
-@pytest.mark.parametrize("terminal", ["error", "cancelled", "generation"])
-def test_queued_press_after_terminal_transition_is_discarded(
+@pytest.mark.parametrize("terminal", ["error", "cancelled", "cancelled-recognize", "generation"])
+def test_queued_press_after_terminal_transition_starts_next_phrase(
     rig: Rig, terminal: str, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Нажатие во время вставки не теряется и после исхода фразы внутри вставки (US-2.7, Q6).
+
+    Было test_queued_press_after_terminal_transition_is_discarded: отложенные события
+    после завершения отбрасывались вместе с нажатием. Теперь разбираются по порядку:
+    события старой фразы отсеиваются по её фазе, нажатие начинает следующую запись.
+    """
     rig.start()
     rig.stop()
     caplog.set_level(logging.DEBUG, logger="test.dictation")
@@ -1809,6 +1882,12 @@ def test_queued_press_after_terminal_transition_is_discarded(
     def reenter() -> None:
         if terminal == "generation":
             rig.event("audio.ready", generation=2)
+        elif terminal in ("cancelled", "cancelled-recognize"):
+            # Явный запоздалый ACK; тип кадра не выводится из последней команды.
+            rig.event(
+                "cancelled",
+                request_type="record.cancel" if terminal == "cancelled" else "recognize",
+            )
         else:
             rig.event(terminal, code="worker-crashed", message=MARKER)
         rig.fsm.escape(rig.now)
@@ -1818,19 +1897,23 @@ def test_queued_press_after_terminal_transition_is_discarded(
 
     rig.during_paste = reenter
     rig.result()
-    assert rig.core.phase.value == "finishing"
-    rig.assert_hotkey_state(HotkeyState.IDLE)
-    assert rig.backend.ungrab_escape.call_count == 2
-    assert rig.commands().count("record.start") == 1
-    dropped = [r for r in caplog.records if "отложенные события" in r.message]
-    assert len(dropped) == 1 and dropped[0].levelno == logging.DEBUG
-    assert not dropped[0].args and MARKER not in caplog.text
-
     rig.during_paste = None
-    rig.start()
-    assert rig.commands().count("record.start") == 2
+    # Поздний cancelled(recognize) после доставки не отменяет готовый результат.
+    # Ошибка поколения, напротив, показывается до начала следующей записи.
+    if terminal == "cancelled-recognize":
+        assert not any(call[0] == PillState.CANCELLED for call in rig.pill.calls)
+    else:
+        assert any(call[0] in (PillState.ERROR, PillState.CANCELLED) for call in rig.pill.calls)
+    assert rig.pill.calls[-1][0] == PillState.LISTENING
+    assert rig.core.phase == DictationPhase.RECORDING
     rig.assert_hotkey_state(HotkeyState.RECORDING)
-    assert rig.recording
+    assert rig.commands().count("record.start") == 2
+    assert "record.cancel" not in rig.commands()
+    assert rig.recording and MARKER not in caplog.text
+    rig.stop()
+    rig.result()
+    assert [text for text, _, _ in rig.pasted] == [MARKER, MARKER]
+    rig.assert_hotkey_state(HotkeyState.IDLE)
 
 
 @pytest.mark.parametrize("kind", [PasteOutcomeKind.PASTED, PasteOutcomeKind.BUSY])
@@ -1848,19 +1931,24 @@ def test_escape_and_press_during_paste_release_regrabbed_escape(
 
     rig.during_paste = reenter
     rig.result()
-    rig.assert_hotkey_state(HotkeyState.IDLE)
-    assert rig.backend.ungrab_escape.call_count == 2
-    assert rig.commands().count("record.start") == 1
+    rig.during_paste = None
     if kind == PasteOutcomeKind.BUSY:
+        # Escape отменил невставленную фразу; нажатие ждало подтверждения отмены — отказ.
+        rig.assert_hotkey_state(HotkeyState.IDLE)
+        assert rig.backend.ungrab_escape.call_count == 2
+        assert rig.commands().count("record.start") == 1
         assert rig.commands().count("record.cancel") == 1
         rig.event("cancelled")
+        assert rig.core.phase.value == "finishing"
+        rig.start()
     else:
+        # US-2.7, Q6: вставленную фразу Escape уже не отменяет, нажатие начинает следующую;
+        # «Готово» не перебивает индикацию новой записи (решение 3).
         assert "record.cancel" not in rig.commands()
-        assert rig.cancels == 1
-        assert rig.pill.calls[-1] == (PillState.DONE, None, None)
-    assert rig.core.phase.value == "finishing"
-    rig.during_paste = None
-    rig.start()
+        assert rig.cancels == 0
+        assert (PillState.DONE, None, None) not in rig.pill.calls
+        assert rig.pill.calls[-1][0] == PillState.LISTENING
+        assert rig.core.phase == DictationPhase.RECORDING
     assert rig.commands().count("record.start") == 2
     rig.assert_hotkey_state(HotkeyState.RECORDING)
     assert rig.recording
@@ -1879,11 +1967,16 @@ def test_limit_recognizes_already_stopped_audio_and_releases_hotkey(
             rig.event("error", code="bad-state")
         elif message["type"] == "recognize":
             rig.now += 0.375
-            rig.event(response, text=MARKER, code="timeout")
+            rig.event(response, utterance_id=rig.uid, text=MARKER, code="timeout")
 
     rig.during_send = worker
     rig.event("record.limit")
-    assert rig.sent[1:] == [({"type": "recognize", "utterance_id": rig.uid}, RECOGNIZE_TIMEOUT_S)]
+    expected: list[tuple[dict[str, Any], float | None]] = [
+        ({"type": "recognize", "utterance_id": rig.uid}, RECOGNIZE_TIMEOUT_S)
+    ]
+    if response == "error":
+        expected.append(({"type": "record.cancel", "utterance_id": rig.uid}, None))
+    assert rig.sent[1:] == expected
     assert rig.core.phase.value == "finishing"
     rig.assert_hotkey_state(HotkeyState.IDLE)
     assert not rig.recording
@@ -1898,6 +1991,8 @@ def test_limit_recognizes_already_stopped_audio_and_releases_hotkey(
         assert not rig.pasted
         assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
     rig.during_send = None
+    if response == "error":
+        rig.event("cancelled")
     rig.start()
     assert rig.commands().count("record.start") == 2
 
@@ -2015,17 +2110,34 @@ def test_start_failure_releases_hotkey_and_shows_error(
     rig.start()
     assert rig.fsm.state == HotkeyState.IDLE
     rig.backend.ungrab_escape.assert_called_once_with()
+    if failure == "send":
+        assert rig.core.cleanup_pending
+        assert not rig.pill.calls
+        rig.timer(CANCEL_TIMEOUT_MS).fire()
+        assert rig.core.cleanup_pending
+        rig.timer(CANCEL_RESTART_MS).fire()
+        rig.restart_worker.assert_called_once_with()
     assert not rig.sent and not rig.recording
     assert ("recording", True) not in rig.trace
     assert rig.pill.calls == [(PillState.ERROR, ERROR_RECOGNITION_FAILED, None)]
     assert rig.tray.state == TrayState.ERROR and not rig.stats.events
     assert MARKER not in caplog.text
     if failure == "send":
-        record = caplog.records[-1]
-        assert record.getMessage() == "диктовка: отправка команды record.start не удалась"
-        assert record.exc_info is not None
-        assert isinstance(record.exc_info[1], BrokenPipeError)
-        assert "Канал воркера закрыт" in caplog.text
+        assert (
+            caplog.records[0].getMessage()
+            == "диктовка: отправка команды record.start не удалась (BrokenPipeError)"
+        )
+        assert all(record.exc_info is None for record in caplog.records)
+        assert "Канал воркера закрыт" not in caplog.text
+        assert not rig.core.cleanup_pending
+        rig.core.on_worker_event(
+            {
+                "type": "cancelled",
+                "request_type": "record.cancel",
+                "generation": 1,
+                "utterance_id": rig.core._utterance_id,
+            }
+        )
     monkeypatch.undo()
     rig.start()
     assert rig.commands() == ["record.start"]
@@ -2122,11 +2234,17 @@ def test_paste_exception_cannot_leak_text_or_leave_input_suspended(
 
     rig.during_paste = fail
     rig.result()
-    assert rig.pill.calls[-1] == (PillState.ERROR, ERROR_RECOGNITION_FAILED, None)
-    assert MARKER not in caplog.text and rig.commands().count("record.start") == 1
     rig.during_paste = None
+    # US-2.7 (Q6): нажатие во время вставки начало следующую запись; ошибка первой
+    # фразы видна после её отпускания (решение 3), ввод не остался приостановленным.
+    assert MARKER not in caplog.text and rig.commands().count("record.start") == 2
+    assert rig.pill.calls[-1][0] == PillState.LISTENING and rig.recording
+    rig.stop()
+    assert (PillState.ERROR, ERROR_RECOGNITION_FAILED, None) in rig.pill.calls
+    rig.result()
+    assert [text for text, _, _ in rig.pasted] == [MARKER, MARKER]
     rig.start()
-    assert rig.commands().count("record.start") == 2
+    assert rig.commands().count("record.start") == 3
 
 
 @pytest.mark.parametrize("kind", list(PasteOutcomeKind))
@@ -2174,7 +2292,8 @@ def test_cancel_escalates_close_then_restart(rig: Rig) -> None:
     assert "audio.close" not in rig.commands()
     rig.timer(CANCEL_TIMEOUT_MS).fire()
     assert rig.sent[-1][0] == {"type": "audio.close"}
-    assert rig.pill.calls[-1][0] == PillState.CANCELLED
+    assert rig.pill.calls[-1][0] == PillState.LISTENING
+    assert rig.recording
     rig.restart_worker.assert_not_called()
     rig.timer(CANCEL_RESTART_MS).fire()
     rig.restart_worker.assert_called_once_with()
@@ -2192,8 +2311,17 @@ def test_cancel_ack_cancels_escalations(rig: Rig, late: bool, tail_done: bool) -
     pending = [t for t in rig.timers if not t.fired]
     rig.event("cancelled")
     for timer in pending:
+        if timer.delay == STATE_DURATION_MS[PillState.CANCELLED]:
+            # П10: ACK сохраняет исходный tail вместо отмены и повторного взвода.
+            assert not timer.cancelled
+            continue
         assert timer.cancelled
         timer.callback()
+    tails = [t for t in rig.timers if t.delay == STATE_DURATION_MS[PillState.CANCELLED]]
+    assert len(tails) == 1
+    if not tails[0].fired:
+        tails[0].fire()
+    assert rig.core.phase is DictationPhase.IDLE
     assert rig.commands().count("audio.close") == int(late)
     rig.restart_worker.assert_not_called()
     assert len(rig.stats.events) == 1
@@ -2261,10 +2389,24 @@ def test_audio_close_failure_still_restarts_worker(rig: Rig) -> None:
 
 def microphone_event(rig: Rig, kind: str, **fields: object) -> None:
     """События проходят настоящий IPC; generation добавляет супервизор."""
-    message = {"type": kind, "utterance_id": rig.uid, **fields}
+    if kind == "cancelled":
+        uid = fields["utterance_id"] if "utterance_id" in fields else rig.uid
+        request_type = next(
+            (m["type"] for m, _ in reversed(rig.sent) if m.get("utterance_id") == uid),
+            None,
+        )
+        if request_type is not None:
+            fields.setdefault("request_type", request_type)
+    elif kind == "audio.closed":
+        fields.setdefault("request_type", "audio.close")
+    message = {"type": kind, **fields}
+    if "utterance_id" not in message:
+        message["utterance_id"] = rig.uid
     if kind == "result":
         message.update(infer_ms=5.0, audio_ms=1000.0)
     decoded = ipc.FrameReader().feed(ipc.encode(message))[0]
+    if kind == "record.limit" and rig.ack_stop:
+        rig.event("record.stopped")
     rig.core.on_worker_event({**decoded, "generation": rig.worker_generation})
 
 
@@ -2577,6 +2719,43 @@ def test_microphone_test_start_failure_can_restart_with_same_callback(
     assert not rig.core.test_active
 
 
+@pytest.mark.parametrize("terminal", ["result", "error"])
+def test_microphone_terminal_callback_can_start_another_private_test(
+    rig: Rig, terminal: str
+) -> None:
+    updates: list[MicrophoneTestUpdate] = []
+    restarted: list[bool] = []
+    second_updates: list[MicrophoneTestUpdate] = []
+
+    def receive(update: MicrophoneTestUpdate) -> None:
+        updates.append(update)
+        if update.state in ("done", "error"):
+            restarted.append(rig.core.start_test("retry-device", second_updates.append))
+
+    assert rig.core.start_test("first-device", receive)
+    rig.core.stop_test()
+    if terminal == "result":
+        microphone_event(rig, "result", text=MARKER, t_ms=310)
+    else:
+        microphone_event(rig, "error", code="engine-failed", message=MARKER)
+    assert restarted == [True]
+    assert rig.core.test_active and rig.recording
+    assert rig.core.phase is DictationPhase.RECORDING
+    assert second_updates == [MicrophoneTestUpdate("recording")]
+    assert rig.commands().count("record.start") == 2
+    assert rig.sent[-1][0]["device"] == "retry-device"
+    assert not rig.pill.hidden
+    assert rig.tray.state is TrayState.LISTENING
+    rig.core.stop_test()
+    microphone_event(rig, "result", text=MARKER, t_ms=310)
+    assert second_updates[-1] == MicrophoneTestUpdate("done", text=MARKER, duration_s=0.31)
+    assert not rig.core.test_active
+    assert rig.pill.hidden
+    assert rig.core.last_text is None
+    assert not rig.pasted
+    assert not rig.stats.events
+
+
 def test_microphone_test_start_failure_cannot_restore_over_new_dictation(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2607,7 +2786,7 @@ def test_microphone_test_start_failure_cannot_restore_over_new_dictation(
 
 
 @pytest.mark.parametrize("indicator", ["tray", "set_recording"])
-def test_microphone_limit_timer_survives_indicator_failure(
+def test_microphone_indicator_failure_cancels_without_escaping_slot(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, indicator: str
 ) -> None:
     updates: list[MicrophoneTestUpdate] = []
@@ -2622,16 +2801,15 @@ def test_microphone_limit_timer_survives_indicator_failure(
         original(value)
 
     monkeypatch.setattr(target, name, fail_on_start)
-    with pytest.raises(RuntimeError, match=MARKER):
-        rig.core.start_test("", updates.append)
-    assert rig.core.phase == DictationPhase.RECORDING
-    assert rig.commands() == ["record.start"]
-    assert updates == []
-    rig.timer(TEST_RECORD_LIMIT_MS).fire()
-    assert rig.commands() == ["record.start", "record.stop", "recognize"]
-    assert rig.core.phase.value == "processing"
-    assert not rig.recording
-    assert updates == [MicrophoneTestUpdate("processing")]
+    rig.core.start_test("", updates.append)
+    assert rig.commands() == ["record.start", "record.cancel"]
+    assert len(updates) == 1 and updates[0].state == "error"
+    assert not rig.core.test_active
+    assert rig.core.cleanup_pending
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert rig.commands()[-1] == "audio.close"
+    rig.timer(CANCEL_RESTART_MS).fire()
+    rig.restart_worker.assert_called_once_with()
 
 
 @pytest.mark.parametrize("phase", ["recording", "processing"])
@@ -2707,6 +2885,8 @@ def test_microphone_error_is_plain_and_private(
     assert MARKER not in caplog.text
     assert not rig.pasted
     assert not rig.stats.events
+    assert not rig.pill.hidden and rig.tray.state is TrayState.LISTENING and rig.recording
+    rig.event("record.stopped")
     assert rig.pill.calls == [(PillState.LISTENING, None, None)]
     assert rig.pill.hidden
     assert rig.core.last_text is None
@@ -2734,6 +2914,7 @@ def test_microphone_failures_release_recording_without_logging_exception(
         rig.timer(PROCESSING_WATCHDOG_MS).fire()
     assert str(updates[-1].state) == "error"
     assert rig.commands()[-1] == "record.cancel"
+    rig.event("record.stopped")
     assert not rig.recording
     microphone_event(rig, "cancelled")
     assert not rig.pasted
@@ -2756,6 +2937,7 @@ def test_microphone_cancel_watchdogs_always_release_worker(rig: Rig) -> None:
     rig.core.start_test("", updates.append)
     rig.core.cancel_test()
     rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert not rig.pill.hidden and rig.tray.state is TrayState.LISTENING and rig.recording
     assert str(updates[-1].state) == "idle"
     assert rig.commands()[-1] == "audio.close"
     assert not rig.core.start_test("", Mock())
@@ -2783,6 +2965,13 @@ def test_microphone_terminal_paths_hide_recording_pill(rig: Rig, phase: str, ter
     else:
         if terminal == "cancel":
             rig.core.cancel_test()
+        else:
+            # Терминал ASR не подтверждает закрытие захвата: GUI запрашивает
+            # адресную отмену и ждёт её ACK, прежде чем скрывать индикаторы.
+            microphone_event(rig, "cancelled", request_type="recognize")
+            assert rig.commands()[-1] == "record.cancel"
+            assert rig.core.cleanup_pending
+            assert not rig.pill.hidden
         microphone_event(rig, "cancelled")
     assert rig.pill.hidden
     assert not rig.recording
@@ -3017,8 +3206,10 @@ def test_level_monitor_records_without_recognition(rig: Rig, device: str) -> Non
     rig.core.stop_level_monitor()
     rig.core.stop_level_monitor()
     assert rig.commands() == ["record.start", "record.cancel"]
-    assert not rig.recording and rig.tray.state == TrayState.IDLE
+    assert rig.recording and rig.tray.state == TrayState.LISTENING
+    assert not rig.pill.hidden
     microphone_event(rig, "cancelled")
+    assert not rig.recording and rig.tray.state == TrayState.IDLE
     assert updates[-1] == MicrophoneLevelUpdate("idle")
     assert not rig.core.level_active and not rig.core.test_active
     assert not rig.stats.events and not rig.pasted
@@ -3038,13 +3229,22 @@ def test_level_limit_restarts_with_fresh_id(rig: Rig, synchronous: bool) -> None
 
     def send(message: dict[str, Any]) -> None:
         if message["type"] == "record.cancel" and synchronous:
-            rig.core.on_worker_event({**message, "type": "cancelled", "generation": 1})
+            rig.core.on_worker_event(
+                {**message, "type": "cancelled", "request_type": "record.cancel", "generation": 1}
+            )
 
     rig.during_send = send
     microphone_event(rig, "record.limit")
     assert rig.uid != previous
     assert rig.commands() == ["record.start", "record.cancel", "record.start"]
-    rig.core.on_worker_event({"type": "cancelled", "utterance_id": previous, "generation": 1})
+    rig.core.on_worker_event(
+        {
+            "type": "cancelled",
+            "request_type": "record.cancel",
+            "utterance_id": previous,
+            "generation": 1,
+        }
+    )
     microphone_event(rig, "level", peak_dbfs=-20, rms_dbfs=-30)
     assert updates[-1] == MicrophoneLevelUpdate("listening", peak_dbfs=-20)
     assert rig.recording and rig.core.level_active
@@ -3141,6 +3341,11 @@ def test_level_exceptions_close_without_leaking(
             microphone_event(rig, "record.limit")
     assert updates[-1].state == "error"
     assert "record.cancel" in rig.commands()
+    assert not rig.core.level_active
+    assert not rig.pill.hidden
+    # При отказе индикатора start ещё не отправлен; при отказе перезапуска
+    # по лимиту отменяется новый id, для которого start также не успел уйти.
+    microphone_event(rig, "cancelled", utterance_id=rig.core._utterance_id)
     assert not rig.recording and not rig.core.level_active
     assert not rig.stats.events
     assert rig.pill.calls == [(PillState.LISTENING, None, None)]
@@ -3157,7 +3362,9 @@ def test_level_cancel_waits_for_audio_closed_before_idle(rig: Rig) -> None:
     assert updates[-1].state == "listening"
     assert rig.commands()[-1] == "audio.close"
     assert not rig.core.start_test("", Mock())
-    rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+    rig.core.on_worker_event(
+        {"type": "audio.closed", "request_type": "audio.close", "generation": 1}
+    )
     assert str(updates[-1].state) == "idle"
     assert rig.core.start_test("", Mock())
     rig.restart_worker.assert_not_called()
@@ -3211,8 +3418,9 @@ def test_level_total_limit_survives_record_limits(rig: Rig, ack: str) -> None:
     assert len([timer for timer in rig.timers if timer.delay == 180000]) == 1
     total.fire()
     assert rig.commands()[-1] == "record.cancel"
-    assert not microphone_open and not rig.recording and not rig.core.level_active
-    assert rig.tray.state == TrayState.IDLE and rig.pill.hidden
+    assert not microphone_open and not rig.core.level_active
+    assert rig.recording and rig.tray.state == TrayState.LISTENING
+    assert not rig.pill.hidden
     starts = rig.commands().count("record.start")
     microphone_event(rig, "record.limit")
     if ack == "cancelled":
@@ -3221,7 +3429,9 @@ def test_level_total_limit_survives_record_limits(rig: Rig, ack: str) -> None:
         rig.timer(CANCEL_TIMEOUT_MS).fire()
         assert rig.commands()[-1] == "audio.close"
         if ack == "audio.closed":
-            rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+            rig.core.on_worker_event(
+                {"type": "audio.closed", "request_type": "audio.close", "generation": 1}
+            )
         else:
             rig.timer(CANCEL_RESTART_MS).fire()
             rig.restart_worker.assert_called_once_with()
@@ -3231,6 +3441,7 @@ def test_level_total_limit_survives_record_limits(rig: Rig, ack: str) -> None:
     assert updates[-1] == MicrophoneLevelUpdate("idle", message=LEVEL_LIMIT_MESSAGE)
     assert not any(update.state == "error" for update in updates)
     assert rig.core.phase == DictationPhase.IDLE
+    assert not rig.recording and rig.tray.state == TrayState.IDLE and rig.pill.hidden
     assert not [timer for timer in rig.timers if not timer.cancelled and not timer.fired]
     assert not rig.pasted and not rig.stats.events
 
@@ -3261,7 +3472,9 @@ def test_late_audio_closed_cannot_finish_new_level_episode(rig: Rig, stopping: b
         rig.core.stop_level_monitor()
     watchdog = rig.timer(CANCEL_TIMEOUT_MS if stopping else int(LEVEL_TOTAL_LIMIT_S * 1000))
     before = rig.commands()
-    rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+    rig.core.on_worker_event(
+        {"type": "audio.closed", "request_type": "audio.close", "generation": 1}
+    )
     old_watchdog.callback()
     assert rig.commands() == before
     assert not watchdog.cancelled
@@ -3284,7 +3497,9 @@ def test_level_audio_closed_can_arrive_synchronously(rig: Rig) -> None:
 
     def send(message: dict[str, Any]) -> None:
         if message["type"] == "audio.close":
-            rig.core.on_worker_event({"type": "audio.closed", "generation": 1})
+            rig.core.on_worker_event(
+                {"type": "audio.closed", "request_type": "audio.close", "generation": 1}
+            )
 
     rig.during_send = send
     rig.timer(CANCEL_TIMEOUT_MS).fire()
@@ -3345,6 +3560,10 @@ def device_changed(rig: Rig, kind: str, *, audio_ms: object = 2140, **fields: ob
 
 def device_event(rig: Rig, **fields: object) -> None:
     """Rig.event занят параметром kind: у этого события kind — поле сообщения."""
+    # Штатный захват подтверждает закрытие; тесты отсутствующего ack задают
+    # события напрямую, чтобы отделить состояние воркера от фазы GUI.
+    if rig.ack_stop:
+        rig.event("record.stopped", **{k: v for k, v in fields.items() if k == "generation"})
     rig.core.on_worker_event(
         {
             "type": "audio.device.changed",
@@ -3693,9 +3912,10 @@ def test_level_check_ends_with_device_change_message(rig: Rig, kind: str) -> Non
     ipc_device_event(rig, kind)
     assert updates[-1] == MicrophoneLevelUpdate("error", message=DEVICE_MESSAGE[kind])
     assert rig.commands() == ["record.start", "record.cancel"]
-    assert not rig.core.level_active and not rig.recording
-    assert rig.tray.state == TrayState.IDLE and rig.pill.hidden
+    assert not rig.core.level_active and rig.recording
+    assert rig.tray.state == TrayState.LISTENING and not rig.pill.hidden
     microphone_event(rig, "cancelled")
+    assert not rig.recording and rig.tray.state == TrayState.IDLE and rig.pill.hidden
     assert updates[-1].state == "error"
     assert rig.core.phase == DictationPhase.IDLE
     assert_device_change_private(rig)
@@ -3709,11 +3929,12 @@ def test_microphone_test_ends_with_device_change_message(rig: Rig, kind: str) ->
     ipc_device_event(rig, kind)
     assert updates[-1] == MicrophoneTestUpdate("error", message=DEVICE_MESSAGE[kind])
     assert rig.commands() == ["record.start", "record.cancel"]
-    assert not rig.core.test_active and not rig.recording
+    assert not rig.core.test_active
+    assert rig.recording
     assert rig.core.phase == DictationPhase.IDLE
-    # До подтверждения отмены новая проверка не стартует; после — стартует.
     assert not rig.core.start_test("", updates.append)
-    microphone_event(rig, "cancelled")
+    rig.event("record.stopped")
+    assert not rig.recording
     assert rig.core.start_test("", updates.append)
     assert rig.commands()[-1] == "record.start"
     assert_device_change_private(rig)
@@ -3745,3 +3966,214 @@ def test_device_change_in_processing_does_not_touch_recognition(rig: Rig, kind: 
     rig.result()
     assert rig.pasted == [(MARKER, 42, PasteMode.AUTO)]
     assert pill_states_after_device_error(rig, kind) == []
+
+
+# US-2.6: окно-цель на момент нажатия (pinned_window) ------------------------------------
+
+
+def test_pinned_window_targets_phrase_started_inside_block(rig: Rig) -> None:
+    with rig.core.pinned_window(777):
+        rig.start()
+    assert rig.core._pinned_window is None
+    rig.stop()
+    rig.result()
+    assert rig.pasted[-1][1] == 777
+
+
+def test_pinned_window_is_dropped_when_press_is_refused(rig: Rig) -> None:
+    """Отказ нажатию внутри блока (идёт проверка микрофона) не оставляет окно-цель
+    следующей фразе: она вставляется в окно на своём старте."""
+    updates: list[MicrophoneTestUpdate] = []
+    rig.core.start_test("", updates.append)
+    before = rig.commands()
+    with rig.core.pinned_window(777):
+        rig.start()
+    assert rig.commands() == before
+    assert rig.core._pinned_window is None
+    rig.core.stop_test()
+    rig.result("проверка")
+    for timer in [t for t in rig.timers if not t.cancelled and not t.fired]:
+        timer.fire()
+    assert rig.core.phase is DictationPhase.IDLE
+    rig.fsm.escape(rig.now)
+    rig.window = 99
+    rig.start()
+    rig.stop()
+    rig.result()
+    assert rig.pasted[-1][1] == 99
+
+
+def test_pinned_window_is_dropped_on_exception(rig: Rig) -> None:
+    with pytest.raises(RuntimeError, match=MARKER), rig.core.pinned_window(777):
+        raise RuntimeError(MARKER)
+    assert rig.core._pinned_window is None
+    rig.window = 99
+    rig.start()
+    rig.stop()
+    rig.result()
+    assert rig.pasted[-1][1] == 99
+
+
+@pytest.mark.parametrize("terminal", ["error", "empty", "result"])
+@pytest.mark.parametrize("phase", ["recording", "processing"])
+def test_terminal_without_capture_ack_cancels_and_escalates(
+    rig: Rig, terminal: str, phase: str
+) -> None:
+    """ИБ-30: PROCESSING не доказывает закрытия; любой терминал имеет cleanup."""
+    rig.ack_stop = False
+    rig.start()
+    uid = rig.uid
+    if phase == "processing":
+        rig.stop()
+    if terminal == "error" or phase == "recording":
+        rig.event("error", code="engine-failed")
+    else:
+        rig.result("" if terminal == "empty" else MARKER)
+    assert ("record.cancel", uid) in [(m["type"], m.get("utterance_id")) for m, _ in rig.sent]
+    assert rig.core.cleanup_pending
+    rig.start()
+    assert rig.commands().count("record.start") == 1
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert rig.commands()[-1] == "audio.close"
+    assert rig.core.cleanup_pending
+    rig.timer(CANCEL_RESTART_MS).fire()
+    rig.restart_worker.assert_called_once_with()
+    assert not rig.core.cleanup_pending
+
+
+@pytest.mark.parametrize("ack", ["cancelled", "audio.closed"])
+def test_capture_cleanup_ack_cancels_restart(rig: Rig, ack: str) -> None:
+    rig.start()
+    rig.event("error", code="audio-failed")
+    if ack == "audio.closed":
+        # Чужой audio.closed до нашей эскалации не снимает блокировку.
+        rig.core.on_worker_event({"type": ack, "request_type": "audio.close", "generation": 1})
+        assert rig.core.cleanup_pending
+        rig.timer(CANCEL_TIMEOUT_MS).fire()
+        rig.core.on_worker_event({"type": ack, "request_type": "audio.close", "generation": 1})
+    else:
+        rig.event(ack)
+    assert not rig.core.cleanup_pending
+    assert all(
+        t.cancelled or t.fired
+        for t in rig.timers
+        if t.delay in (CANCEL_TIMEOUT_MS, CANCEL_RESTART_MS)
+    )
+    rig.restart_worker.assert_not_called()
+
+
+def test_microphone_failure_callback_cannot_restart_before_capture_ack(rig: Rig) -> None:
+    retry: list[MicrophoneTestUpdate] = []
+
+    def callback(update: MicrophoneTestUpdate) -> None:
+        if update.state == "error":
+            assert not rig.core.start_test("", retry.append)
+
+    rig.core.start_test("", callback)
+    microphone_event(rig, "error", code="audio-failed", message="failed")
+    assert rig.commands() == ["record.start", "record.cancel"]
+    assert retry == [MicrophoneTestUpdate("error", message=TEST_BUSY)]
+    microphone_event(rig, "cancelled")
+    assert not rig.core.cleanup_pending
+
+
+@pytest.mark.parametrize("test_mode", [False, True])
+def test_terminal_blocks_reentrant_start_from_on_idle(rig: Rig, test_mode: bool) -> None:
+    if test_mode:
+        rig.core.start_test("", Mock())
+    else:
+        rig.start()
+    attempts: list[bool] = []
+
+    def on_idle() -> None:
+        attempts.append(rig.core.cleanup_pending)
+        assert not rig.core.start_test("", Mock())
+
+    rig.core._on_idle = on_idle
+    rig.event("error", code="audio-failed")
+    if not test_mode:
+        rig.timer(STATE_DURATION_MS[PillState.ERROR]).fire()
+    assert attempts == [True]
+    assert rig.commands() == ["record.start", "record.cancel"]
+
+
+def test_processing_cancel_timeout_blocks_reentrant_start_before_restart(rig: Rig) -> None:
+    rig.start()
+    rig.stop()
+    rig.core.cancel("tray")
+    attempts: list[bool] = []
+
+    def on_idle() -> None:
+        attempts.append(rig.core.cleanup_pending)
+        assert not rig.core.start_test("", Mock())
+
+    rig.core._on_idle = on_idle
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    rig.timer(STATE_DURATION_MS[PillState.CANCELLED]).fire()
+    assert attempts == [True]
+    assert rig.commands().count("record.start") == 1
+    assert rig.commands()[-1] == "audio.close"
+
+
+def test_failed_restart_keeps_capture_cleanup_blocked(rig: Rig) -> None:
+    rig.start()
+    rig.event("error", code="audio-failed")
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    rig.restart_worker.side_effect = RuntimeError(MARKER)
+    rig.timer(CANCEL_RESTART_MS).fire()
+    assert rig.core.cleanup_pending
+    rig.start()
+    assert rig.commands().count("record.start") == 1
+    rig.restart_worker.side_effect = None
+    rig.timer(CANCEL_RESTART_MS).fire()
+    assert not rig.core.cleanup_pending
+
+
+def test_paste_receives_target_snapshot_captured_before_overlap(rig: Rig) -> None:
+    target = PasteTarget(42, b"first-target")
+    rig.window = target
+    rig.start()
+    rig.stop()
+    rig.window = PasteTarget(42, b"changed-target")
+    rig.result()
+    assert rig.pasted[0][1] is target
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+def test_microphone_timeout_cancels_job_and_waits_for_ack(rig: Rig, stopped: bool) -> None:
+    updates: list[MicrophoneTestUpdate] = []
+    rig.core.start_test("", updates.append)
+    if stopped:
+        rig.core.stop_test()
+    microphone_event(rig, "error", code="timeout", message="timed out")
+    assert updates[-1].state == "error"
+    assert rig.commands()[-1] == "record.cancel"
+    assert rig.core.cleanup_pending
+    microphone_event(rig, "cancelled")
+    assert not rig.core.cleanup_pending
+
+
+@pytest.mark.parametrize("auto_stop", ["record.limit", "audio.device.changed"])
+@pytest.mark.parametrize("terminal", ["error", "result"])
+def test_logical_auto_stop_without_capture_ack_still_escalates(
+    rig: Rig, auto_stop: str, terminal: str
+) -> None:
+    """ИБ-30: request_stop при лимите/смене устройства ещё не закрыл источник."""
+    rig.ack_stop = False
+    rig.start()
+    if auto_stop == "record.limit":
+        rig.event(auto_stop)
+    else:
+        device_changed(rig, "switched", audio_ms=500)
+    assert rig.core.phase is DictationPhase.PROCESSING
+    assert "record.stop" not in rig.commands()
+    if terminal == "error":
+        rig.event("error", code="engine-failed")
+    else:
+        rig.result("")
+    assert rig.commands()[-1] == "record.cancel"
+    assert rig.core.cleanup_pending
+    rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert rig.commands()[-1] == "audio.close"
+    rig.timer(CANCEL_RESTART_MS).fire()
+    rig.restart_worker.assert_called_once_with()

@@ -15,7 +15,7 @@ from typing import Any
 
 from astra_voice.core.version import __version__
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAX_FRAME_BYTES = 64 * 1024
 MAX_TEXT_BYTES = 32 * 1024
 MAX_DEVICE_LABEL = 120
@@ -113,6 +113,14 @@ _SCHEMAS = {
     "audio.closed": _Schema(),
 }
 _RUNTIME = _Schema({"python": _STR, "onnxruntime": (str, type(None))})
+
+
+# Тип проставляет воркер: транспорт сохраняет его у всех ответов, включая ACK.
+for _reply_type in ("model.loaded", "result", "cancelled", "pong", "measured", "audio.closed"):
+    _schema = _SCHEMAS[_reply_type]
+    _SCHEMAS[_reply_type] = _Schema(
+        required=_schema.required, optional={**_schema.optional, "request_type": _STR}
+    )
 
 
 def _fields(value: dict[str, Any], schema: _Schema) -> dict[str, Any]:

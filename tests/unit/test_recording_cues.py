@@ -283,7 +283,7 @@ def test_boundary_ipc_roundtrip(kind: str) -> None:
 def test_capture_markers_follow_open_and_successful_close(close_fails: bool) -> None:
     from unittest.mock import Mock
 
-    from astra_voice.worker.audio import AudioCapture
+    from astra_voice.worker.audio import AudioCapture, CaptureStopTimeout
 
     source = Mock()
     source.is_open = False
@@ -317,9 +317,12 @@ def test_capture_markers_follow_open_and_successful_close(close_fails: bool) -> 
     running = threading.Event()
     running.set()
     if close_fails:
-        with pytest.raises(RuntimeError, match="fake close"):
-            capture._run("u", None, running, None, time.monotonic() + 1)
+        # Сбой close запоминается липко: record.stopped не уходит, а сторож
+        # сообщает CaptureStopTimeout (docs/ipc-ack-protocol.md, record.stopped).
+        capture._run("u", None, running, None, time.monotonic() + 1)
         assert events[-1] == ("record.started", True)
+        with pytest.raises(CaptureStopTimeout):
+            capture.check_stop_watchdog()
     else:
         capture._run("u", None, running, None, time.monotonic() + 1)
         assert events[-2:] == [("record.started", True), ("record.stopped", False)]

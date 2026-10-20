@@ -103,7 +103,12 @@ def mic_rig(monkeypatch: pytest.MonkeyPatch) -> Iterator[MicTestRig]:
         # Только транспорт/микрофон подставные: автомат сам получает ACK отмены.
         if message["type"] == "record.cancel":
             core.on_worker_event(
-                {"type": "cancelled", "generation": 1, "utterance_id": message["utterance_id"]}
+                {
+                    "type": "cancelled",
+                    "request_type": "record.cancel",
+                    "generation": 1,
+                    "utterance_id": message["utterance_id"],
+                }
             )
 
     core = DictationOrchestrator(
