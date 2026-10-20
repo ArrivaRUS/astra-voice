@@ -1326,3 +1326,99 @@ def test_capture_notice_callback_start_preserves_new_capture_guard(
     replay.assert_o4()
     assert replay.rig.commands().count("record.start") == 2
     assert "audio.close" not in replay.rig.commands()
+
+
+# T-283 (Fly 1.8.4, журнал 20.10) -------------------------------------------------------
+# Нажатие B во время вставки A: решение 1 проверяется только до входа во вставку, а
+# PasteFlow ждёт отпускания клавиш 300 мс и сдаётся с ``keys-held`` (или захват
+# клавиатуры отказан — ``grab-refused``). XTest в этих ветках не отправлялся, поэтому A
+# не завершается, а ждёт отпускания B, как в решении 1. ``not-fetched`` и
+# ``xtest-refused`` — Ctrl+V мог уйти: повтора нет, A остаётся в буфере.
+
+UNSENT_PASTE_REASONS = ("keys-held", "grab-refused")
+SENT_PASTE_REASONS = ("not-fetched", "xtest-refused")
+
+
+def press_during_failed_first_paste(rig: OverlapRig, reason: str) -> None:
+    """A распознана; во время её вставки нажата B, вставка A не подтверждена (reason)."""
+    rig.start()
+    rig.stop()
+    rig.during_paste = rig.start
+    rig.outcomes.append(PasteOutcomeKind.WINDOW_CHANGED)
+    rig.paste_reason = reason
+    rig.result_for(A, A_TEXT)
+    rig.during_paste = None
+    rig.paste_reason = ""
+    assert len(rig.uids) == 2, "нажатие во время вставки A потеряно"
+    assert phase_of(rig) == DictationPhase.RECORDING and rig.recording
+
+
+def dictation_results(rig: OverlapRig) -> list[str]:
+    return [str(e["result"]) for e in rig.stats.events if e["type"] == "dictation"]
+
+
+def clipboard_notices(rig: OverlapRig) -> int:
+    return sum(1 for call in rig.pill.calls if call[0] == PillState.CLIPBOARD_ONLY)
+
+
+@pytest.mark.parametrize("reason", UNSENT_PASTE_REASONS)
+def test_unsent_first_paste_waits_for_second_release_and_retries(
+    rig: OverlapRig, reason: str
+) -> None:
+    """T-283: XTest A не уходил, пишется B → A ждёт отпускания B и вставляется один раз."""
+    press_during_failed_first_paste(rig, reason)
+    assert rig.texts() == [A_TEXT]
+    assert dictation_results(rig) == [], "A завершена исходом неотправленной вставки"
+    assert clipboard_notices(rig) == 0, "A показана «в буфере», хотя ждёт отпускания B"
+    assert rig.pill.calls[-1][0] in LISTENING_STATES
+    rig.assert_hotkey_state(HotkeyState.RECORDING)
+    rig.stop()
+    assert rig.texts() == [A_TEXT, A_TEXT], "A не вставлена повторно после отпускания B"
+    assert rig.core.last_text == A_TEXT
+    assert dictation_results(rig) == ["ok"]
+    rig.result_for(B, B_TEXT)
+    assert rig.texts() == [A_TEXT, A_TEXT, B_TEXT]
+    assert dictation_results(rig) == ["ok", "ok"]
+    assert clipboard_notices(rig) == 0
+    assert rig.core.last_text == B_TEXT
+    assert rig.pill.calls[-1][0] == PillState.DONE
+    rig.assert_hotkey_state(HotkeyState.IDLE)
+
+
+@pytest.mark.parametrize("reason", UNSENT_PASTE_REASONS)
+def test_unsent_first_paste_retries_after_second_is_cancelled(rig: OverlapRig, reason: str) -> None:
+    """T-283: ждущая A не застревает, если B отменили Esc: A вставляется, B — нет."""
+    press_during_failed_first_paste(rig, reason)
+    rig.fsm.escape(rig.now)
+    assert rig.sent_ids("record.cancel") == [rig.uids[B]]
+    rig.event_for(B, "cancelled")
+    assert rig.texts() == [A_TEXT, A_TEXT]
+    assert sorted(dictation_results(rig)) == ["cancelled", "ok"]
+    assert clipboard_notices(rig) == 0
+
+
+@pytest.mark.parametrize("reason", SENT_PASTE_REASONS)
+def test_possibly_sent_first_paste_is_final_during_second_recording(
+    rig: OverlapRig, reason: str
+) -> None:
+    """T-283, контроль: Ctrl+V мог уйти (not-fetched / xtest-refused) — повтора нет."""
+    press_during_failed_first_paste(rig, reason)
+    assert dictation_results(rig) == ["ok"]
+    rig.stop()
+    rig.result_for(B, B_TEXT)
+    assert rig.texts() == [A_TEXT, B_TEXT], "A вставлена повторно, хотя Ctrl+V мог уйти"
+    assert dictation_results(rig) == ["ok", "ok"]
+
+
+def test_keys_held_without_second_recording_stays_final(rig: OverlapRig) -> None:
+    """T-283, контроль: ``keys-held`` без пишущейся фразы — исход окончательный (буфер)."""
+    rig.start()
+    rig.stop()
+    rig.outcomes.append(PasteOutcomeKind.WINDOW_CHANGED)
+    rig.paste_reason = "keys-held"
+    rig.result_for(A, A_TEXT)
+    rig.paste_reason = ""
+    assert rig.texts() == [A_TEXT]
+    assert rig.pill.calls[-1] == (PillState.CLIPBOARD_ONLY, CLIPBOARD_WINDOW_CHANGED, None)
+    assert dictation_results(rig) == ["ok"]
+    assert rig.active(BUSY_RETRY_MS) == []
