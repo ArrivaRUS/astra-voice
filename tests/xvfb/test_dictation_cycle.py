@@ -94,6 +94,10 @@ class WavSupervisor(QObject):
 
     Часы аудио ускорены: первый блок читается при старте, остаток при остановке.
     Распознавание заменено фиксированной фразой; модель и Pulse не создаются.
+    Протокол 4 (docs/ipc-ack-protocol.md): физическое закрытие захвата сообщается
+    уведомлением ``record.stopped``, а ответы ``result``/``cancelled``/``audio.closed``
+    несут ``request_type``, поставленный «воркером». Без них GUI держит индикатор
+    записи и не показывает ни «processing», ни исход фразы.
     """
 
     def __init__(self, source: WavFileSource, on_event: Callable[[dict[str, Any]], None]) -> None:
@@ -104,6 +108,8 @@ class WavSupervisor(QObject):
         self.state = "new"
         # Барьер рестарта WorkerSupervisor: процесса нет, рестарт не происходит.
         self.restarting = False
+        # Контракт аварийной остановки (_stop_or_kill, adopt_retired): процессов нет.
+        self._retired: list[Any] = []
         self.recording = False
         self.utterance_id = ""
         self.samples_read = 0
@@ -122,6 +128,26 @@ class WavSupervisor(QObject):
     def ready(self) -> bool:
         # Совместимость протокола не проверяется: без процесса hello не нужен.
         return self.state == "running"
+
+    @property
+    def exited(self) -> bool:
+        return True
+
+    def adopt_retired(self, processes: list[Any]) -> None:
+        self._retired.extend(processes)
+
+    def kill(self) -> None:
+        self.state = "stopped"
+        self.recording = False
+        self.timer.stop()
+        self.pending.clear()
+        self.source.close()
+
+    def close_capture(self) -> None:
+        """Как воркер после wait_stopped: уведомление о физическом закрытии захвата."""
+        if self.recording:
+            self.recording = False
+            self.queue_event("record.stopped")
 
     def queue_event(self, kind: str, **fields: object) -> None:
         self.pending.append(
@@ -160,18 +186,18 @@ class WavSupervisor(QObject):
                 assert self.recording
                 while (chunk := self.source.read_chunk()) is not None:
                     self.samples_read += len(normalize(chunk))
-                self.recording = False
+                self.close_capture()
             elif kind == "recognize":
                 assert not self.recording and self.samples_read > 0
-                self.queue_event("result", text=MARKER)
+                self.queue_event("result", text=MARKER, request_type=kind)
             else:
-                self.recording = False
+                self.close_capture()
                 self.source.close()
-                self.queue_event("cancelled")
+                self.queue_event("cancelled", request_type=kind)
         elif kind == "audio.close":
-            self.recording = False
+            self.close_capture()
             self.source.close()
-            self.queue_event("audio.closed")
+            self.queue_event("audio.closed", request_type=kind)
         else:
             raise AssertionError(f"Неожиданная команда: {kind}")
         return request
@@ -377,7 +403,12 @@ def test_successful_cycle_pastes_and_restores_clipboard(cycle: Cycle) -> None:
         "recognize",
     ]
     assert cycle.worker.source.ended and cycle.worker.samples_read > 0
-    assert [event["type"] for event in cycle.worker.events] == ["audio.ready", "level", "result"]
+    assert [event["type"] for event in cycle.worker.events] == [
+        "audio.ready",
+        "level",
+        "record.stopped",
+        "result",
+    ]
     assert all(
         event["generation"] == cycle.worker.generation
         and event["utterance_id"] == cycle.worker.commands[0]["utterance_id"]
