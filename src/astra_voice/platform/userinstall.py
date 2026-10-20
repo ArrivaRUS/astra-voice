@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import fcntl
 import hashlib
 import logging
@@ -28,13 +29,13 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from astra_voice.core import childenv, paths
-from astra_voice.platform import autostart
+from astra_voice.platform import autostart, session
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ LOCK_POLL_S = 0.1
 SMOKE_TIMEOUT_S = 60.0
 BUILD_INFO_LIMIT = 4096
 RUNNING_KEY_LIMIT = 256
+DESKTOP_FILE_LIMIT = 65536
 # То же, что проверяет installed_ok() в AppRun.
 REQUIRED_FILES = (
     paths.APPIMAGE_LAUNCHER,
@@ -132,12 +134,18 @@ class InstallResult:
 
 @dataclass(frozen=True)
 class RegisterResult:
-    """Меню: записано, совпало или чужое; значки: записаны/пропущены."""
+    """Меню: записано, совпало или чужое; значки: записаны/пропущены.
+
+    Fly: written — новые байты, unchanged — совпали, skipped — чужое/ошибка.
+    """
 
     menu: Literal["written", "unchanged", "foreign"]
     icons_written: tuple[Path, ...]
     icons_skipped: tuple[Path, ...]
     autostart: bool
+    fly_written: tuple[Path, ...] = ()
+    fly_skipped: tuple[Path, ...] = ()
+    fly_unchanged: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +153,7 @@ class UnregisterResult:
     menu: bool
     icons: tuple[Path, ...]
     autostart: bool
+    fly: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -698,7 +707,7 @@ GenericName=Голосовой ввод
 GenericName[en]=Voice input
 Comment=Офлайн-распознавание речи: сказали — текст появился в активном окне
 Comment[en]=Offline speech to text: speak, and the text lands in the active window
-{command}Icon=astravoice
+{command}Icon={icon}
 Terminal=false
 Categories=Utility;Accessibility;
 Keywords=диктовка;речь;распознавание;микрофон;voice;dictation;speech;
@@ -710,13 +719,25 @@ X-AppImage-Version={version}
 """
 
 
-def menu_entry_bytes(launcher: Path, version: str) -> bytes:
+def menu_entry_bytes(launcher: Path, version: str, icon: Path | None = None) -> bytes:
     """Шаблон data/astra-voice.desktop с установленным launcher (§4)."""
     path = str(launcher)
     command = f"Exec={autostart._exec_argument(path)}\n"
     if not autostart._EXEC_RESERVED.intersection(path) and "%" not in path:
         command += f"TryExec={path}\n"
-    return _MENU_TEMPLATE.format(command=command, version=version).encode("utf-8")
+    icon_name = "astravoice"
+    if icon is not None and icon.is_absolute():
+        value = str(icon)
+        # Icon is a literal Desktop Entry string, not an Exec argument. Avoid
+        # ambiguous escaping and control characters; spaces/$/%/quotes are literal.
+        if "\\" not in value and value.isprintable():
+            icon_name = value
+        else:
+            log.info("Значок меню: Icon=astravoice reason=unsafe_path")
+    elif icon is not None:
+        log.info("Значок меню: Icon=astravoice reason=relative_path")
+    # None is already diagnosed by _menu_icon; do not duplicate that INFO here.
+    return _MENU_TEMPLATE.format(command=command, version=version, icon=icon_name).encode("utf-8")
 
 
 def _desktop_paths() -> tuple[Path, Path]:
@@ -724,19 +745,271 @@ def _desktop_paths() -> tuple[Path, Path]:
     return data / "applications/astra-voice.desktop", data / "icons/hicolor"
 
 
-def _menu_state(path: Path) -> Literal["ours", "foreign", "none"]:
+def _desktop_data(path: Path, *, directory_fd: int | None = None) -> bytes:
+    """Обычный небольшой файл; ссылки и FIFO не открываем с ожиданием."""
+    name = path if directory_fd is None else Path(path.name)
+    fd = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+        dir_fd=directory_fd,
+    )
+    with os.fdopen(fd, "rb") as file:
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            raise UserInstallError("Необычный файл меню.")
+        data = file.read(DESKTOP_FILE_LIMIT + 1)
+    if len(data) > DESKTOP_FILE_LIMIT:
+        raise UserInstallError("Слишком большой файл меню.")
+    return data
+
+
+def _menu_state(
+    path: Path, *, directory_fd: int | None = None
+) -> Literal["ours", "foreign", "none"]:
     try:
-        mode = path.lstat().st_mode
+        mode = os.stat(
+            path if directory_fd is None else path.name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        ).st_mode
     except FileNotFoundError:
         return "none"
+    except OSError as exc:
+        if directory_fd is None or exc.errno not in (errno.EACCES, errno.EPERM):
+            raise
+        log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
+        return "foreign"
     if stat.S_ISREG(mode):
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        with os.fdopen(fd, "rb") as file:
-            if stat.S_ISREG(os.fstat(file.fileno()).st_mode):
-                data = file.read()
-                if autostart._properties(data).get(b"X-AstraVoice-Managed") == b"true":
-                    return "ours"
+        try:
+            data = _desktop_data(path, directory_fd=directory_fd)
+        except UserInstallError:
+            return "foreign"
+        except OSError as exc:
+            if directory_fd is None or exc.errno not in (errno.EACCES, errno.EPERM):
+                raise
+            log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
+            return "foreign"
+        if autostart._properties(data).get(b"X-AstraVoice-Managed") == b"true":
+            return "ours"
     return "foreign"
+
+
+@contextmanager
+def _fly_directory(path: Path) -> Iterator[int]:
+    """Закрепляет каталог дескриптором, проверяя всю цепочку без симлинков."""
+    home = Path.home()
+    if not home.is_absolute() or ".." in home.parts or not path.is_relative_to(home / ".fly"):
+        raise UserInstallError("Небезопасный путь меню Fly.")
+    fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for index, part in enumerate(path.parts[1:], 1):
+            try:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+            except OSError as exc:
+                if index < len(home.parts) and exc.errno in (errno.ENOTDIR, errno.ELOOP):
+                    try:
+                        mode = os.stat(part, dir_fd=fd, follow_symlinks=False).st_mode
+                    except OSError:
+                        log.debug(
+                            "Не удалось проверить ссылку домашнего каталога Fly", exc_info=True
+                        )
+                    else:
+                        if stat.S_ISLNK(mode):
+                            log.warning("fly_menu_skipped reason=home_symlink")
+                raise
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            sticky_root = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+            if index >= len(home.parts) - 1 and (
+                info.st_uid not in (0, os.getuid()) or (info.st_mode & 0o022 and not sticky_root)
+            ):
+                raise UserInstallError(f"Небезопасный каталог меню Fly: {tilde(path)}.")
+        if os.fstat(fd).st_uid != os.getuid():
+            raise UserInstallError(f"Чужой каталог меню Fly: {tilde(path)}.")
+        # Чтение списка имён без права поиска (0400) ещё не даёт доступа к записям.
+        os.stat(".", dir_fd=fd, follow_symlinks=False)
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _optional_fly_directory(path: Path) -> Iterator[int | None]:
+    """Пропускает небезопасную папку и при повторном открытии после обхода."""
+    with ExitStack() as stack:
+        try:
+            fd = stack.enter_context(_fly_directory(path))
+        except UserInstallError:
+            log.warning("Небезопасная папка меню Fly пропущена: %s", tilde(path))
+            fd = None
+        except OSError as exc:
+            if exc.errno not in (
+                errno.ENOENT,
+                errno.ENOTDIR,
+                errno.ELOOP,
+                errno.EACCES,
+                errno.EPERM,
+            ):
+                raise
+            log.warning("Недоступная папка меню Fly пропущена: %s", tilde(path))
+            fd = None
+        yield fd
+
+
+def _fly_directories(depth: int, *, strict: bool = False) -> Iterator[Path]:
+    """Обходит только существующие папки; глубина корня каждого дерева — ноль."""
+    pending = [(Path.home() / ".fly" / name, 0) for name in ("startmenu2", "startmenu")]
+    while pending:
+        directory, level = pending.pop(0)
+        try:
+            opener = _optional_fly_directory if strict else _fly_directory
+            with opener(directory) as fd:
+                if fd is None:
+                    continue
+                children = []
+                for name in sorted(os.listdir(fd)) if level < depth else []:
+                    try:
+                        mode = os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode
+                    except OSError as exc:
+                        if exc.errno not in (errno.ENOENT, errno.EACCES, errno.EPERM):
+                            raise
+                        log.warning(
+                            "Недоступная папка меню Fly пропущена: %s", tilde(directory / name)
+                        )
+                        continue
+                    if stat.S_ISDIR(mode):
+                        children.append(name)
+        except FileNotFoundError:
+            if level:
+                log.warning("Недоступная папка меню Fly пропущена: %s", tilde(directory))
+            continue
+        except OSError as exc:
+            # Симлинк/не-каталог не является деревом меню и не обходится.
+            if exc.errno in (errno.ENOTDIR, errno.ELOOP):
+                continue
+            if strict and exc.errno not in (errno.EACCES, errno.EPERM):
+                raise
+            log.warning("Папка меню Fly пропущена: %s", tilde(directory))
+            continue
+        except UserInstallError:
+            log.warning("Небезопасная папка меню Fly пропущена: %s", tilde(directory))
+            continue
+        yield directory
+        pending.extend((directory / name, level + 1) for name in children)
+
+
+def _fly_menu_targets() -> list[Path]:
+    """Свои записи на прежних местах; при их отсутствии — «Инструменты» или корень."""
+    # Перенесённые пользователем записи обновляем на месте в каждом дереве.
+    existing: dict[Path, list[Path]] = {}
+    fly = Path.home() / ".fly"
+    for entry, state in _fly_menu_entries(strict=False):
+        if state == "ours":
+            root = fly / entry.relative_to(fly).parts[0]
+            existing.setdefault(root, []).append(entry.parent)
+    targets: dict[Path, Path] = {}
+    selected: set[Path] = set(existing)
+    for directory in _fly_directories(2):
+        root = Path.home() / ".fly" / directory.relative_to(Path.home() / ".fly").parts[0]
+        targets.setdefault(root, root)
+        if root in selected:
+            continue
+        try:
+            with _fly_directory(directory) as fd:
+                properties = autostart._properties(
+                    _desktop_data(directory / ".directory", directory_fd=fd)
+                )
+        except (OSError, UserInstallError):
+            continue
+        key = b"X-Categories" if root.name == "startmenu2" else b"Categories"
+        utility = b"Utility" in properties.get(key, b"").split(b";")
+        if utility or (root.name == "startmenu2" and properties.get(b"Name") == b"Utility"):
+            targets[root] = directory
+            selected.add(root)
+    return [
+        directory
+        for root, fallback in targets.items()
+        for directory in existing.get(root, [fallback])
+    ]
+
+
+def _refresh_fly_menu() -> None:
+    """Обновляет уже существующее меню; сбой оболочки не отменяет установку."""
+    if session.detect() is not session.SessionKind.FLY:
+        log.info("Обновление меню Fly пропущено: текущая сессия не Fly.")
+        return
+    try:
+        utility = Path("/usr/bin/fly-wmfunc")
+        if not utility.is_file() or not os.access(utility, os.X_OK):
+            log.info("Меню Fly: /usr/bin/fly-wmfunc недоступен, обновление пропущено.")
+            return
+        result = subprocess.run(
+            [str(utility), "FLYWM_UPDATE_STARTMENU"],
+            timeout=5,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=childenv.clean_env(),
+        )
+        if result.returncode:
+            log.warning("Меню Fly не обновлено: код %s.", result.returncode)
+    except (OSError, subprocess.TimeoutExpired):
+        log.warning("Меню Fly не обновлено: утилита недоступна или превышено время ожидания.")
+
+
+def _register_fly(
+    menu: Path, data: bytes
+) -> tuple[tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]]:
+    written: list[Path] = []
+    skipped: list[Path] = []
+    unchanged: list[Path] = []
+    origin = str(menu.absolute())
+    for directory in _fly_menu_targets():
+        target = directory / "astra-voice.desktop"
+        try:
+            if not origin.isprintable() or "\\" in origin:
+                raise UserInstallError("Небезопасный путь исходной записи меню.")
+            fly_data = data + f"X-Fly-OriginFile={origin}\n".encode()
+            result = _write_fly_desktop_file(target, fly_data)
+            if result == "written":
+                written.append(target)
+            elif result == "unchanged":
+                unchanged.append(target)
+            else:
+                skipped.append(target)
+        except (OSError, UserInstallError) as exc:
+            log.warning("Запись меню Fly не добавлена: %s: %s", tilde(target), tilde(exc))
+            skipped.append(target)
+    if written:
+        _refresh_fly_menu()
+    return tuple(written), tuple(skipped), tuple(unchanged)
+
+
+def _fly_menu_entries(*, strict: bool) -> Iterator[tuple[Path, str]]:
+    for directory in _fly_directories(3, strict=strict):
+        try:
+            opener = _optional_fly_directory if strict else _fly_directory
+            with opener(directory) as fd:
+                if fd is None:
+                    continue
+                path = directory / "astra-voice.desktop"
+                yield path, _menu_state(path, directory_fd=fd)
+        except UserInstallError:
+            log.warning("Не удалось проверить запись меню Fly: %s", tilde(directory))
+        except OSError:
+            if strict:
+                raise
+            log.warning("Не удалось проверить запись меню Fly: %s", tilde(directory))
+
+
+def _combined_menu_state(menu: Path, *, strict: bool = True) -> Literal["ours", "foreign", "none"]:
+    states = {_menu_state(menu), *(state for _, state in _fly_menu_entries(strict=strict))}
+    return "ours" if "ours" in states else "foreign" if "foreign" in states else "none"
 
 
 def _icon_files(root: Path, *, links: bool = False) -> Iterator[Path]:
@@ -768,8 +1041,44 @@ def _public_directory(path: Path) -> None:
     path.chmod(0o755)
 
 
-def _write_desktop_file(path: Path, data: bytes) -> bool:
+def _write_fly_desktop_file(path: Path, data: bytes) -> Literal["written", "unchanged", "foreign"]:
+    """Записывает Fly через закреплённый каталог и различает причины пропуска."""
+    with _fly_directory(path.parent) as fd:
+        state = _menu_state(path, directory_fd=fd)
+        if state == "foreign":
+            log.warning("Чужая запись меню Fly сохранена: %s", tilde(path))
+            return "foreign"
+        if state == "ours" and _desktop_data(path, directory_fd=fd) == data:
+            return "unchanged"
+        fly_temporary = f".{path.name}.{secrets.token_hex(8)}"
+        temporary_fd = os.open(
+            fly_temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=fd,
+        )
+        try:
+            with os.fdopen(temporary_fd, "wb") as file:
+                file.write(data)
+                file.flush()
+                os.fchmod(file.fileno(), 0o644)
+                os.fsync(file.fileno())
+            # Повторная проверка сохраняет чужую запись, появившуюся при записи temp.
+            if _menu_state(path, directory_fd=fd) == "foreign":
+                log.warning("Чужая запись меню Fly сохранена: %s", tilde(path))
+                return "foreign"
+            os.replace(fly_temporary, path.name, src_dir_fd=fd, dst_dir_fd=fd)
+            os.fsync(fd)
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(fly_temporary, dir_fd=fd)
+        return "written"
+
+
+def _write_desktop_file(path: Path, data: bytes, *, create_parent: bool = True) -> bool:
     """Атомарная запись рядом с целью; совпавшие байты сохраняют mtime (§4)."""
+    if not create_parent:
+        return _write_fly_desktop_file(path, data) == "written"
     _public_directory(path.parent)
     if os.path.lexists(path):
         if not stat.S_ISREG(path.lstat().st_mode):
@@ -814,23 +1123,39 @@ def _registration_source() -> tuple[Path, Path, BuildInfo]:
 
 def _register() -> RegisterResult:
     copy, launcher, info = _registration_source()
-    data = menu_entry_bytes(launcher, info.version)
     menu, icons = _desktop_paths()
-    menu_result: Literal["written", "unchanged", "foreign"]
-    if _menu_state(menu) == "foreign":
-        log.warning("Чужая запись меню сохранена: %s", tilde(menu))
-        menu_result = "foreign"
-    else:
-        menu_result = "written" if _write_desktop_file(menu, data) else "unchanged"
     written: list[Path] = []
     skipped: list[Path] = []
     try:
         _copy_icons(copy, icons, written, skipped)
     except (OSError, UserInstallError) as exc:
         log.warning("Значки программы не добавлены: %s", tilde(exc))
+    data = menu_entry_bytes(launcher, info.version, _menu_icon(icons))
+    menu_result: Literal["written", "unchanged", "foreign"]
+    if _menu_state(menu) == "foreign":
+        log.warning("Чужая запись меню сохранена: %s", tilde(menu))
+        menu_result = "foreign"
+    else:
+        menu_result = "written" if _write_desktop_file(menu, data) else "unchanged"
+    fly_written: tuple[Path, ...]
+    fly_skipped: tuple[Path, ...]
+    fly_unchanged: tuple[Path, ...]
+    if menu_result == "foreign":
+        log.warning("Регистрация меню Fly пропущена: reason=foreign_xdg_entry")
+        fly_written, fly_skipped, fly_unchanged = (), (), ()
+    else:
+        fly_written, fly_skipped, fly_unchanged = _register_fly(menu, data)
     # Автозапуск перенацеливается независимо от значков.
     retargeted = autostart.retarget()
-    return RegisterResult(menu_result, tuple(written), tuple(skipped), retargeted)
+    return RegisterResult(
+        menu_result,
+        tuple(written),
+        tuple(skipped),
+        retargeted,
+        fly_written,
+        fly_skipped,
+        fly_unchanged=fly_unchanged,
+    )
 
 
 def register() -> RegisterResult:
@@ -900,6 +1225,28 @@ def _owned_icons(icons: Path, *, strict: bool = False) -> Iterator[Path]:
             yield icon
 
 
+def _menu_icon(icons: Path) -> Path | None:
+    """Largest owned square PNG; scalable icons and symbolic links are excluded."""
+    largest: Path | None = None
+    largest_size = 0
+    try:
+        for icon in _owned_icons(icons):
+            if icon.name != "astravoice.png" or not icon.is_absolute():
+                continue
+            width, separator, height = icon.parent.parent.name.partition("x")
+            if not separator or width != height or not width.isascii() or not width.isdecimal():
+                continue
+            size = int(width)
+            if size > largest_size and all(_is_real_dir(parent) for parent in icon.parents):
+                largest, largest_size = icon, size
+    except (OSError, UserInstallError):
+        log.info("Значок меню: Icon=astravoice reason=selection_error")
+        return None
+    if largest is None:
+        log.info("Значок меню: Icon=astravoice reason=no_usable_png")
+    return largest
+
+
 def validate_remove_paths(runtime_dirs: Iterable[Path] = ()) -> None:
     """Проверяет существующих предков до изменений; ссылки/чужая запись — отказ.
 
@@ -929,12 +1276,35 @@ def validate_remove_paths(runtime_dirs: Iterable[Path] = ()) -> None:
                 )
             if directory == target and target in runtimes and stat.S_IMODE(info.st_mode) != 0o700:
                 raise UserInstallError(f"Небезопасные права runtime: {tilde(directory)}.")
+    # Для Fly действует та же проверка каталога, но небезопасная ветвь пропускается.
+    # Не включаем её в общий список: ошибка Fly не отменяет удаление XDG-регистрации.
+    for directory in _fly_directories(3, strict=True):
+        with _optional_fly_directory(directory):
+            pass
 
 
 def _unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
     if deb_executable is None:
         deb_executable = paths.SYSTEM_EXECUTABLE
     menu, icons = _desktop_paths()
+    removed_fly: list[Path] = []
+    for directory in _fly_directories(3, strict=True):
+        with _optional_fly_directory(directory) as fd:
+            if fd is None:
+                continue
+            path = directory / "astra-voice.desktop"
+            if _menu_state(path, directory_fd=fd) == "ours":
+                try:
+                    os.unlink(path.name, dir_fd=fd)
+                except OSError as exc:
+                    if exc.errno not in (errno.ENOENT, errno.EACCES, errno.EPERM):
+                        raise
+                    log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
+                    continue
+                os.fsync(fd)
+                removed_fly.append(path)
+    if removed_fly:
+        _refresh_fly_menu()
     removed_menu = _menu_state(menu) == "ours"
     if removed_menu:
         menu.unlink()
@@ -950,7 +1320,7 @@ def _unregister(*, deb_executable: Path | None = None) -> UnregisterResult:
         if deb_executable.exists() and os.access(deb_executable, os.X_OK)
         else autostart.remove_ours()
     )
-    return UnregisterResult(removed_menu, tuple(removed_icons), changed)
+    return UnregisterResult(removed_menu, tuple(removed_icons), changed, tuple(removed_fly))
 
 
 def unregister(
@@ -1066,31 +1436,59 @@ class ManagementSnapshot:
         )
 
 
-def _management_identity(path: Path) -> tuple[object, ...]:
+def _management_identity(path: Path, *, directory_fd: int | None = None) -> tuple[object, ...]:
+    name = path if directory_fd is None else Path(path.name)
     try:
-        info = path.lstat()
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
+        return ()
+    except OSError as exc:
+        if directory_fd is None or exc.errno not in (errno.EACCES, errno.EPERM):
+            raise
+        log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
         return ()
     base = (info.st_dev, info.st_ino, info.st_mode, info.st_uid)
     if stat.S_ISLNK(info.st_mode):
-        return (*base, os.readlink(path))
+        return (*base, os.readlink(name, dir_fd=directory_fd))
     if stat.S_ISREG(info.st_mode):
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            if directory_fd is None or exc.errno not in (errno.EACCES, errno.EPERM):
+                raise
+            log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
+            return base
         with os.fdopen(fd, "rb") as stream:
             opened = os.fstat(stream.fileno())
             if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
                 raise UserInstallError("Состояние установки изменилось. Повторите проверку.")
             if not stat.S_ISREG(opened.st_mode):
                 raise UserInstallError("Небезопасный файл установки.")
+            if directory_fd is not None:
+                # Большая чужая запись не удаляется; не читаем её целиком ради снимка.
+                try:
+                    data = stream.read(DESKTOP_FILE_LIMIT + 1)
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EPERM):
+                        raise
+                    log.warning("Недоступная запись меню Fly сохранена: %s", tilde(path))
+                    return base
+                digest = hashlib.sha256(data).digest()
+                return (*base, opened.st_size, opened.st_mtime_ns, digest)
             return (*base, hashlib.file_digest(stream, "sha256").digest())
     return base
 
 
 def management_snapshot() -> ManagementSnapshot:
-    """Read strict facts; caller holds the install lock for mutation revalidation.
+    """Снимок для повторной проверки под замком установки перед изменением.
 
-    IO/ownership failures propagate. Ancestor identities cover path replacement.
-    Lock file and directory mtime deliberately are not consent facts.
+    Ошибки ввода-вывода и владельца передаются вызывающему коду, кроме локально
+    недоступных ветвей Fly: они пропускаются, непрочитанная запись — без digest.
+    Идентификаторы предков учитывают подмену пути; mtime каталогов и lock — нет.
     """
     validate_remove_paths()
     app = paths.appimage_app_dir()
@@ -1112,6 +1510,23 @@ def management_snapshot() -> ManagementSnapshot:
                     candidates.extend((entry / REMOVE_ON_EXIT, entry / SHUTDOWN_INCOMPLETE))
     owned_icons = tuple(sorted(_owned_icons(icons, strict=True)))
     candidates.extend(_icon_files(icons, links=True))
+    fly_identities: list[tuple[str, tuple[object, ...]]] = []
+    for directory in _fly_directories(3, strict=True):
+        with _optional_fly_directory(directory) as fd:
+            if fd is None:
+                continue
+            if directory.parent == Path.home() / ".fly":
+                # Предок уже проверен при открытии дерева; для него допустим root-владелец.
+                info = os.stat("..", dir_fd=fd, follow_symlinks=False)
+                fly_identities.append(
+                    (str(directory.parent), (info.st_dev, info.st_ino, info.st_mode, info.st_uid))
+                )
+            info = os.fstat(fd)
+            fly_identities.append(
+                (str(directory), (info.st_dev, info.st_ino, info.st_mode, info.st_uid))
+            )
+            entry = directory / "astra-voice.desktop"
+            fly_identities.append((str(entry), _management_identity(entry, directory_fd=fd)))
     # Symlink autostart belongs to the user; never promise to change it.
     auto_identity = _management_identity(auto)
     auto_mode = auto_identity[2] if auto_identity else None
@@ -1140,12 +1555,12 @@ def management_snapshot() -> ManagementSnapshot:
         paths.model_store_dir_path(),
         paths.config_dir_path(),
         tuple(copies),
-        _menu_state(menu),
+        _combined_menu_state(menu),
         owned_icons,
         owned,
         program,
         deb_available,
-        (*identities, (str(deb), deb_identity)),
+        (*identities, *fly_identities, (str(deb), deb_identity)),
     )
 
 
@@ -1167,11 +1582,11 @@ def status() -> InstallStatus:
         log.warning("Не удалось проверить копии программы: %s", tilde(exc))
     menu, icons = _desktop_paths()
     try:
-        menu_state = _menu_state(menu)
+        menu_state = _combined_menu_state(menu, strict=False)
         icons_present = (
             _is_real_dir(icons.parent) and next(_icon_files(icons, links=True), None) is not None
         )
-    except OSError as exc:
+    except (OSError, UserInstallError) as exc:
         log.warning("Не удалось проверить меню и значки: %s", tilde(exc))
     try:
         target = autostart.state().target

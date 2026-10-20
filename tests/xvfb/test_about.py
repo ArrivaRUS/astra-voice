@@ -1,7 +1,9 @@
 """M9-а v0.2: раздел «О программе» в двух темах (PRD F13, референс 06-about*.png).
 
-Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_ABOUT или по умолчанию
-design/refs/impl/about. Снимки сверяются глазами с design/refs/06-about*.png;
+Без флага снимки идут в пользовательский кеш или заданный через
+ASTRA_VOICE_SNAPSHOT_DIR_ABOUT путь вне design/. Только
+ASTRA_VOICE_UPDATE_REFS=1 выбирает design/refs/impl/about, игнорируя этот путь.
+Снимки сверяются глазами с design/refs/06-about*.png;
 сравнение по пикселям не делается. Два кадра на состояние: окно обычного
 размера (верх раздела, как в макете) и высокое окно — раздел целиком.
 """
@@ -12,6 +14,7 @@ import importlib.util
 import os
 import sys
 from collections.abc import Callable
+from functools import cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -25,13 +28,17 @@ from PyQt5.QtTest import QTest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
+from helpers.snapshots import snapshot_dir, write_snapshot  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-# Промежуточные прогоны разработки не трогают эталоны репозитория.
-SNAPSHOTS = REPO / Path(
-    os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_ABOUT") or "design/refs/impl/about"
-)
+
+
+@cache
+def snapshots() -> Path:
+    return snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_ABOUT", "about", "design/refs/impl/about")
+
+
 WIDTH, HEIGHT = 1024, 620
 TALL = 1200
 
@@ -276,12 +283,7 @@ def render_about(
 
 
 def save_snapshot(image: QImage, name: str) -> Path:
-    SNAPSHOTS.mkdir(parents=True, exist_ok=True)
-    path = SNAPSHOTS / name
-    temporary = SNAPSHOTS / f".{name}.tmp"
-    assert image.save(str(temporary), "PNG"), f"не удалось сохранить {temporary}"
-    os.replace(temporary, path)
-    return path
+    return write_snapshot(snapshots(), name, image)
 
 
 def find_object(window: Any, name: str) -> Any:

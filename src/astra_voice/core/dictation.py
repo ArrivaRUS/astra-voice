@@ -58,7 +58,7 @@ RELEASE_TAIL_MS = 50
 CANCEL_TIMEOUT_MS = 1500
 CANCEL_RESTART_MS = 2000
 BUSY_RETRY_MS = 200
-TEST_RECORD_LIMIT_MS = 10000
+TEST_RECORD_LIMIT_MS = 5000
 LEVEL_RECORD_LIMIT_S = 60.0
 LEVEL_TOTAL_LIMIT_S = 180.0
 LEVEL_LIMIT_MESSAGE = "Проверка микрофона остановлена. Нажмите, чтобы продолжить"
@@ -803,8 +803,46 @@ class DictationOrchestrator:
         ):
             callback(MicrophoneTestUpdate("error", message=TEST_BUSY))
             return False
-        self._test_callback = callback
+
+        previous_mode = self.mode
+        set_command_mode = getattr(self._tray, "set_command_mode", None)
+        test_started = False
+
+        def deliver_test_update(update: MicrophoneTestUpdate) -> None:
+            nonlocal test_started
+            if update.state in ("recording", "processing", "done"):
+                test_started = True
+            elif (
+                not test_started
+                and update.state in ("idle", "error")
+                and self._test_callback is None
+                and self.phase in (DictationPhase.IDLE, DictationPhase.FINISHING)
+            ):
+                # Откатываем до callback: он может сразу начать следующую запись.
+                self.mode = previous_mode
+                if previous_mode == "command" and set_command_mode is not None:
+                    self._safe_ui(
+                        lambda: set_command_mode(True), "диктовка: не удалось обновить режим трея"
+                    )
+            callback(update)
+
+        self._test_callback = deliver_test_update
+        self.mode = "text"
+        if set_command_mode is not None:
+            self._safe_ui(
+                lambda: set_command_mode(False), "диктовка: не удалось обновить режим трея"
+            )
         self._start(test_device=device)
+        # Терминальный callback мог уже завершить тест и начать следующий.
+        if self._test_callback is not deliver_test_update:
+            return False
+        if self.phase not in (DictationPhase.RECORDING, DictationPhase.PROCESSING):
+            self._test_callback = None
+            self._safe_ui(
+                lambda: deliver_test_update(MicrophoneTestUpdate("error", message=TEST_FAILED)),
+                "диктовка: не удалось обновить экран проверки микрофона",
+            )
+            return False
         return True
 
     def stop_test(self) -> None:
@@ -843,18 +881,33 @@ class DictationOrchestrator:
             return False
 
     def _finish_test(self, update: MicrophoneTestUpdate) -> None:
+        utterance = self._current()
         callback, self._test_callback = self._test_callback, None
         self._cancel_timers(keep_cancel_restart=self._cancel_pending)
         self._cancel_pending = self._capture_open or self._cancel_pending
-        self._change_phase(DictationPhase.IDLE)
-        self._ensure_capture_closed()
+
+        def clear_test_presentation() -> None:
+            if not self._any_capture_open():
+                self._safe_ui(
+                    lambda: self._tray.set_state(TrayState.IDLE),
+                    "диктовка: не удалось обновить трей",
+                )
+                self._safe_ui(self._pill.hide, "диктовка: не удалось скрыть пилюлю")
+
         if not self._any_capture_open():
             self._safe_ui(
                 lambda: self._set_recording(False), "диктовка: не удалось обновить индикатор записи"
             )
-            self._safe_ui(
-                lambda: self._tray.set_state(TrayState.IDLE), "диктовка: не удалось обновить трей"
-            )
+            clear_test_presentation()
+        elif self._capture_open:
+            # До ACK индикаторы принадлежат ещё открытому захвату теста.
+            # _capture_closed/_cancelled снимут recording перед этим callback.
+            self._capture_outcome = clear_test_presentation
+        # on_idle может синхронно начать новую запись: её индикаторы уже не трогаем.
+        # При открытом захвате cancel_pending блокирует такой старт до ACK.
+        self._change_phase(DictationPhase.IDLE)
+        with self._within(utterance):
+            self._ensure_capture_closed()
         if callback is not None:
             self._safe_ui(
                 lambda: callback(update), "диктовка: не удалось обновить экран проверки микрофона"
@@ -1071,6 +1124,11 @@ class DictationOrchestrator:
             self._later(TEST_RECORD_LIMIT_MS, self.stop_test)
         indicated = True
         if self.test_active:
+            if self._publication_allowed():
+                self._safe_ui(
+                    lambda: self._pill.show_state(PillState.LISTENING),
+                    "диктовка: не удалось обновить пилюлю",
+                )
             # Одинаковый безопасный старт для прямого вызова и слота model_ready.
             indicated = self._safe_ui(
                 lambda: self._tray.set_state(TrayState.LISTENING),
@@ -1205,11 +1263,7 @@ class DictationOrchestrator:
         notice, self._deferred_notice = self._deferred_notice, None
         if notice is not None and self._publication_allowed():
             self._safe_ui(notice, "диктовка: не удалось обновить пилюлю")
-        elif (
-            not self.test_active
-            and self._publication_allowed()
-            and not self._device_pill_held(PillState.PROCESSING)
-        ):
+        elif self._publication_allowed() and not self._device_pill_held(PillState.PROCESSING):
             self._safe_ui(
                 lambda: self._pill.show_state(PillState.PROCESSING),
                 "диктовка: не удалось обновить пилюлю",
@@ -1449,16 +1503,15 @@ class DictationOrchestrator:
                 except (ValueError, OverflowError):
                     self._log.debug("диктовка: некорректное поле peak_dbfs")
                     return
+                if self._publication_allowed():
+                    self._pill.show_state(
+                        PillState.COMMAND_LISTENING
+                        if self.mode == "command"
+                        else PillState.LISTENING,
+                        level=level,
+                    )
                 if self._test_callback is not None:
                     self._test_callback(MicrophoneTestUpdate("recording", peak_dbfs=float(peak)))
-                else:
-                    if self._publication_allowed():
-                        self._pill.show_state(
-                            PillState.COMMAND_LISTENING
-                            if self.mode == "command"
-                            else PillState.LISTENING,
-                            level=level,
-                        )
             elif kind == "silent":
                 if self.test_active:
                     self._stop()
@@ -1471,9 +1524,8 @@ class DictationOrchestrator:
                         )
                     self._announce_silent()
             elif kind == "record.limit":
-                if not self.test_active:
-                    if self._publication_allowed():
-                        self._pill.show_state(PillState.LIMIT)
+                if self._publication_allowed():
+                    self._pill.show_state(PillState.LIMIT)
                 self._stop(recording_stopped=True)
 
     def _device_change_fields(self, event: dict[str, Any]) -> tuple[str | None, str]:
@@ -2430,9 +2482,10 @@ class DictationOrchestrator:
             actions.append(self._hotkey_cancel)
         for utterance in active:
             actions.append(partial(self._send_cancel_for, utterance))
-        actions.extend((lambda: self._set_recording(False), self._hotkey_done, self._pill.hide))
+        actions.extend((lambda: self._set_recording(False), self._hotkey_done))
         for action in actions:
             try:
                 action()
             except Exception:
                 self._log.warning("диктовка: ошибка при завершении")
+        self._safe_ui(self._pill.hide, "диктовка: не удалось скрыть пилюлю")

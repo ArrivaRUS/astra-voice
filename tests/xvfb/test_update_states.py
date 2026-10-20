@@ -1,7 +1,9 @@
 """M7-ядро v0.2: строка-статус, панель «Что нового» и раздел «Сеть» в двух темах.
 
-Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_UPDATES
-или по умолчанию design/refs/impl/updates. Снимки сверяются глазами с
+Без флага снимки идут в пользовательский кеш или заданный через
+ASTRA_VOICE_SNAPSHOT_DIR_UPDATES путь вне design/. Только
+ASTRA_VOICE_UPDATE_REFS=1 выбирает design/refs/impl/updates, игнорируя этот путь.
+Снимки сверяются глазами с
 design/refs/04-footer-states*.png, 04-update-panel*.png и 04-network*.png;
 сравнение по пикселям не делается — макеты рисуют ещё не реализованные состояния.
 """
@@ -12,6 +14,7 @@ import importlib.util
 import os
 import sys
 from collections.abc import Callable, Iterator
+from functools import cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -27,13 +30,17 @@ from PyQt5.QtTest import QTest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
+from helpers.snapshots import snapshot_dir, write_snapshot  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-# Промежуточные прогоны разработки не трогают эталоны репозитория.
-SNAPSHOTS = REPO / Path(
-    os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_UPDATES") or "design/refs/impl/updates"
-)
+
+
+@cache
+def snapshots() -> Path:
+    return snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_UPDATES", "updates", "design/refs/impl/updates")
+
+
 FOOTER_W, FOOTER_H = 760, 36
 WIDTH, HEIGHT = 1024, 620
 NOTE_LINES = (
@@ -284,12 +291,7 @@ def collect_messages() -> tuple[list[str], Any]:
 
 
 def save_snapshot(image: QImage, name: str) -> Path:
-    SNAPSHOTS.mkdir(parents=True, exist_ok=True)
-    path = SNAPSHOTS / name
-    temporary = SNAPSHOTS / f".{name}.tmp"
-    assert image.save(str(temporary), "PNG"), f"не удалось сохранить {temporary}"
-    os.replace(temporary, path)
-    return path
+    return write_snapshot(snapshots(), name, image)
 
 
 def grab(app: Any, window: QQuickWindow, width: int, height: int) -> QImage:
@@ -852,7 +854,7 @@ def test_footer_click_opens_network_and_unskips(app: Any) -> None:
 
 @pytest.fixture(autouse=True, scope="module")
 def _snapshot_dir() -> Iterator[None]:
-    SNAPSHOTS.mkdir(parents=True, exist_ok=True)
+    snapshots().mkdir(parents=True, exist_ok=True)
     yield
 
 
@@ -942,15 +944,15 @@ def test_panel_marker_and_mono_version(app: Any) -> None:
 
 
 @pytest.mark.parametrize(
-    "field,name,host",
+    "field,name",
     [
-        ("checkAppUpdates", "checkAppUpdatesToggle", "github.com"),
-        ("checkModelUpdates", "checkModelUpdatesToggle", "huggingface.co"),
+        ("checkAppUpdates", "checkAppUpdatesToggle"),
+        ("checkModelUpdates", "checkModelUpdatesToggle"),
     ],
 )
 @pytest.mark.parametrize("mode", ["ordinary", "offline", "policy"])
 def test_network_check_toggles_visible_and_follow_effective_settings(
-    app: Any, field: str, name: str, host: str, mode: str
+    app: Any, field: str, name: str, mode: str
 ) -> None:
     changes: dict[str, Any] = {}
     values: dict[str, Any] = {}
@@ -971,9 +973,11 @@ def test_network_check_toggles_visible_and_follow_effective_settings(
         assert control.property("enabled") is (mode == "ordinary")
         texts = onboarding.visible_texts(window.contentItem())
         hint = (
-            ("Раз в сутки, " if field == "checkAppUpdates" else "")
-            + host
-            + ". Скачивание — только по вашему нажатию."
+            (
+                "Раз в сутки. Скачивание — только по вашему нажатию."
+                if field == "checkAppUpdates"
+                else "Скачивание — только по вашему нажатию."
+            )
             if mode == "ordinary"
             else "Не работает, пока включён офлайн-режим."
             if mode == "offline"

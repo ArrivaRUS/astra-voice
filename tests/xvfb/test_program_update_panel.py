@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 import math
-import os
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +14,22 @@ from PyQt5.QtCore import QPointF, Qt
 from PyQt5.QtGui import QFontMetricsF
 from PyQt5.QtTest import QTest
 
+from helpers.snapshots import snapshot_dir, write_snapshot
+
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
 states: Any = importlib.import_module("test_update_states")
-SNAPSHOTS = Path(
-    os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_PROGRAM_UPDATES", "/tmp/astra-program-update-panel")
-)
+
+
+@cache
+def snapshots() -> Path:
+    return snapshot_dir(
+        "ASTRA_VOICE_SNAPSHOT_DIR_PROGRAM_UPDATES",
+        "program-updates",
+        "design/refs/impl/program-updates",
+    )
+
+
 NOTES = [
     {"text": "Улучшена работа настроек программы.", "bullet": True},
     {"text": "Исправлены ошибки проверки обновлений.", "bullet": True},
@@ -170,8 +180,7 @@ def test_actual_program_panel(app: Any, dark: bool, size: tuple[int, int], phase
             int(panel.width()),
             min(int(panel.height()), size[1] - int(point.y()) - 36),
         )
-        SNAPSHOTS.mkdir(parents=True, exist_ok=True)
-        assert crop.save(str(SNAPSHOTS / f"{name}-panel.png"))
+        write_snapshot(snapshots(), f"{name}-panel.png", crop)
 
     try:
         image, texts, messages = states.render_network(app, dark, updates, settings, inspect)
@@ -180,7 +189,7 @@ def test_actual_program_panel(app: Any, dark: bool, size: tuple[int, int], phase
         if phase == "error":
             assert "Не удалось проверить обновление" in texts
         assert not updates.calls  # Opening the panel never starts download / install.
-        assert image.save(str(SNAPSHOTS / f"{name}.png"))
+        write_snapshot(snapshots(), f"{name}.png", image)
     finally:
         states.WIDTH, states.HEIGHT = original_size
         sip.delete(updates)
@@ -374,8 +383,10 @@ def test_cancel_escape_and_ready_focus(app: Any) -> None:
         )
         app.processEvents()
         assert states.find_object(window, "updatePanelHeading").hasActiveFocus()
-        assert states.grab(app, window, states.WIDTH, states.HEIGHT).save(
-            str(SNAPSHOTS / "program-heading-focus-light.png")
+        write_snapshot(
+            snapshots(),
+            "program-heading-focus-light.png",
+            states.grab(app, window, states.WIDTH, states.HEIGHT),
         )
         QTest.keyClick(window, Qt.Key_Return)
         assert updates.calls == ["cancelDownload"]
@@ -552,16 +563,19 @@ def test_narrow_column_with_long_notes_and_empty_notes(app: Any, dark: bool) -> 
         assert cancel.isVisible() is False
         version = states.find_object(window, "updateReleaseVersion")
         assert version.height() > 20
-        SNAPSHOTS.mkdir(parents=True, exist_ok=True)
-        assert states.grab(app, window, states.WIDTH, states.HEIGHT).save(
-            str(SNAPSHOTS / f"program-stress-{'dark' if dark else 'light'}.png")
+        write_snapshot(
+            snapshots(),
+            f"program-stress-{'dark' if dark else 'light'}.png",
+            states.grab(app, window, states.WIDTH, states.HEIGHT),
         )
         primary.forceActiveFocus()
         QTest.qWait(50)
         point = primary.mapToItem(window.contentItem(), QPointF(0, 0))
         assert point.y() >= 0 and point.y() + primary.height() < window.height() - 36
-        assert states.grab(app, window, states.WIDTH, states.HEIGHT).save(
-            str(SNAPSHOTS / f"program-stress-actions-{'dark' if dark else 'light'}.png")
+        write_snapshot(
+            snapshots(),
+            f"program-stress-actions-{'dark' if dark else 'light'}.png",
+            states.grab(app, window, states.WIDTH, states.HEIGHT),
         )
         updates.update(notes=[], version="0.2.1")
         QTest.qWait(50)
@@ -617,8 +631,10 @@ def test_artificial_font_stress_150_percent(app: Any, dark: bool) -> None:
         assert skip.y() >= primary.height() + 8
         point = primary.mapToItem(window.contentItem(), QPointF(0, 0))
         assert point.y() + primary.height() < window.height() - 36
-        assert states.grab(app, window, states.WIDTH, states.HEIGHT).save(
-            str(SNAPSHOTS / f"program-font150-{'dark' if dark else 'light'}.png")
+        write_snapshot(
+            snapshots(),
+            f"program-font150-{'dark' if dark else 'light'}.png",
+            states.grab(app, window, states.WIDTH, states.HEIGHT),
         )
         for name in ("updatePrimary", "updateSkip"):
             control = states.find_object(window, name)
@@ -682,8 +698,8 @@ def test_offline_preserves_local_phase_and_action(app: Any, dark: bool, phase: s
             if phase == "verifying"
             else ["openFolder" if phase == "readydeb" else "installAndRestart"]
         )
-        assert image.save(
-            str(SNAPSHOTS / f"program-offline-{phase}-{'dark' if dark else 'light'}-900x588.png")
+        write_snapshot(
+            snapshots(), f"program-offline-{phase}-{'dark' if dark else 'light'}-900x588.png", image
         )
     finally:
         states.WIDTH, states.HEIGHT = original_size

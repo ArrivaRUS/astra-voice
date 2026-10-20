@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import time
+from collections import deque
 from collections.abc import Callable, Iterable
 from typing import Any, Protocol, cast
 
@@ -23,6 +24,7 @@ from PyQt5.QtWidgets import QFileDialog
 from astra_voice.core.dictation import (
     LEVEL_FAILED,
     TEST_FAILED,
+    TEST_RECORD_LIMIT_MS,
     LevelCallback,
     MicrophoneLevelUpdate,
     MicrophoneTestUpdate,
@@ -51,7 +53,14 @@ from astra_voice.ui.model_downloads import (
     ModelDownloads,
     ModelPort,
 )
-from astra_voice.worker.audio import AudioDevice, AudioError, default_device, list_devices
+from astra_voice.ui.tray import Tray
+from astra_voice.worker.audio import (
+    SILENCE_HOLD_S,
+    AudioDevice,
+    AudioError,
+    default_device,
+    list_devices,
+)
 
 log = logging.getLogger(__name__)
 
@@ -215,6 +224,7 @@ class SettingsBridge(QObject):
     soundCuesStatusChanged = pyqtSignal()
     pillEnabledChanged = pyqtSignal()
     modelUnloadMinutesChanged = pyqtSignal()
+    trayXembedUnconfirmedChanged = pyqtSignal()
     languageChanged = pyqtSignal()
     checkAppUpdatesChanged = pyqtSignal()
     checkModelUpdatesChanged = pyqtSignal()
@@ -284,8 +294,12 @@ class SettingsBridge(QObject):
         device_provider: Callable[[], list[AudioDevice]] = list_devices,
         default_device_provider: Callable[[list[AudioDevice]], AudioDevice] | None = None,
         parent: QObject | None = None,
+        tray: Tray | None = None,
     ) -> None:
         super().__init__(parent)
+        self._tray = tray
+        if tray is not None:
+            tray.xembedUnconfirmedChanged.connect(self.trayXembedUnconfirmedChanged)
         self._settings = settings
         self._mirror = mirror
         # Список микрофонов читается по запросу экрана (refreshDevices), а не при
@@ -402,6 +416,37 @@ class SettingsBridge(QObject):
     def catalogUnavailable(self) -> bool:  # noqa: N802
         return self._downloads is None or self._downloads.catalogUnavailable
 
+    def can_select_model(self, model_id: str) -> bool:
+        """Доступность ревизии для трея независимо от кэша состояния карточки."""
+        return self._downloads is not None and self._downloads.can_make_current(model_id)
+
+    def can_select_model_or_unknown(self, model_id: str) -> bool | None:
+        """Не смешивает отказ выбора с временной ошибкой проверки хранилища."""
+        if self._downloads is None:
+            return False
+        return self._downloads.can_make_current_or_unknown(model_id)
+
+    def report_model_store_error(self) -> None:
+        if self._downloads is not None:
+            self._downloads.report_store_error()
+
+    @property
+    def models_read_failed(self) -> bool:
+        return self._downloads is not None and self._downloads.models_read_failed
+
+    @property
+    def model_store_error_serial(self) -> int:
+        return self._downloads.store_error_serial if self._downloads is not None else 0
+
+    def reset_model_store_error(self) -> None:
+        if self._downloads is not None:
+            self._downloads.reset_store_error()
+
+    def defer_model_store_error_reset(self) -> None:
+        """Трей завершает серию ошибок после проверки всего меню."""
+        if self._downloads is not None:
+            self._downloads.store_error_reset_on_models_read = False
+
     @pyqtProperty(bool, notify=revocationUnknownChanged)
     def revocationUnknown(self) -> bool:  # noqa: N802
         return self._downloads.revocationUnknown if self._downloads is not None else False
@@ -442,6 +487,10 @@ class SettingsBridge(QObject):
     def makeModelCurrent(self, model_id: str) -> None:  # noqa: N802
         if self._downloads is not None:
             self._downloads.makeModelCurrent(model_id)
+
+    def make_model_current(self, model_id: str) -> bool:
+        """Результат операции для трея без изменения контракта QML-слота."""
+        return self._downloads is None or self._downloads.make_current(model_id)
 
     @pyqtSlot(str)
     def switchModelWithPause(self, model_id: str) -> None:  # noqa: N802
@@ -1211,6 +1260,10 @@ class SettingsBridge(QObject):
             return "Звуковые сигналы недоступны: запись не готова"
         return str(self._sound_cues_host.sound_cues_status)
 
+    @pyqtProperty(bool, notify=trayXembedUnconfirmedChanged)
+    def trayXembedUnconfirmed(self) -> bool:  # noqa: N802
+        return self._tray.xembed_unconfirmed if self._tray is not None else False
+
     @pyqtProperty(bool, notify=pillEnabledChanged)
     def pillEnabled(self) -> bool:  # noqa: N802
         return cast(bool, self._values["pillEnabled"])
@@ -1621,6 +1674,7 @@ class OnboardingController(QObject):
     levelStateChanged = pyqtSignal()
     levelMessageChanged = pyqtSignal()
     levelChanged = pyqtSignal()
+    levelSilentChanged = pyqtSignal()
     peakChanged = pyqtSignal()
     testPhraseChanged = pyqtSignal()
     testStateChanged = pyqtSignal()
@@ -1656,6 +1710,7 @@ class OnboardingController(QObject):
             else lambda url: open_external(url.toString(QUrl.FullyEncoded))
         )
         self._device_provider = device_provider
+        self._clock = clock
         bridge._refresh_devices(device_provider)
         self._owns_downloads = downloads is None
         self._downloads = downloads if downloads is not None else ModelDownloads(model, clock=clock)
@@ -1699,6 +1754,9 @@ class OnboardingController(QObject):
         self._level_stopping = False
         self._test_after_level = False
         self._level = 0.0
+        self._level_silent = False
+        self._level_listening_since: float | None = None
+        self._level_window: deque[tuple[float, float]] = deque()
         self._peak = ""
         self._test_state = "idle"
         self._test_text = ""
@@ -1707,6 +1765,14 @@ class OnboardingController(QObject):
         self._test_epoch = 0
         step = settings.extra.get("onboarding_step")
         self._step = step if type(step) is int and 1 <= step <= 5 else 1
+
+        def preselect_on_model_step() -> None:
+            if self._step == 2:
+                self._downloads.preselect_recommended()
+
+        self.stepChanged.connect(preselect_on_model_step)
+        self.modelsChanged.connect(preselect_on_model_step)
+        preselect_on_model_step()
         self._capture = capture if capture is not None else bridge.capture
         # События окна принимает один фильтр; мастер очищает только свою пробу.
         self._capture.windowEvent.connect(self.eventFilter, Qt.DirectConnection)
@@ -2048,7 +2114,7 @@ class OnboardingController(QObject):
         return self._level_message
 
     def _level_updated(self, update: MicrophoneLevelUpdate) -> None:
-        old = (self._level_state, self._level_message, self._level, self._peak)
+        old = (self._level_state, self._level_message, self._level, self._peak, self._level_silent)
         self._level_state = update.state
         self._level_message = update.message
         if update.state == "listening" and update.peak_dbfs is not None:
@@ -2057,9 +2123,27 @@ class OnboardingController(QObject):
                 self._peak = f"{update.peak_dbfs:.0f} дБ".replace("-", "−")
         elif update.state != "listening":
             self._level = 0.0
-        new = (self._level_state, self._level_message, self._level, self._peak)
+        if update.state == "listening":
+            now = self._clock()
+            if self._level_listening_since is None:
+                self._level_listening_since = now
+            self._level_window.append((now, self._level))
+            while self._level_window and self._level_window[0][0] <= now - SILENCE_HOLD_S:
+                self._level_window.popleft()
+            # Короткие паузы в речи не меняют подсказку. Уже показанную тишину
+            # снимает только отчётливый сигнал, чтобы шум у порога не мигал.
+            if self._level_silent:
+                if self._level > 0.05:
+                    self._level_silent = False
+            elif now - self._level_listening_since >= SILENCE_HOLD_S:
+                self._level_silent = max(level for _, level in self._level_window) <= 0.02
+        else:
+            self._level_listening_since = None
+            self._level_window.clear()
+            self._level_silent = False
+        new = (self._level_state, self._level_message, self._level, self._peak, self._level_silent)
         for name, before, after in zip(
-            ("levelState", "levelMessage", "level", "peak"), old, new, strict=True
+            ("levelState", "levelMessage", "level", "peak", "levelSilent"), old, new, strict=True
         ):
             if before != after:
                 getattr(self, name + "Changed").emit()
@@ -2134,6 +2218,10 @@ class OnboardingController(QObject):
     def level(self) -> float:
         return self._level
 
+    @pyqtProperty(bool, notify=levelSilentChanged)
+    def levelSilent(self) -> bool:  # noqa: N802
+        return self._level_silent
+
     @pyqtProperty(str, notify=peakChanged)
     def peak(self) -> str:
         return self._peak
@@ -2145,6 +2233,10 @@ class OnboardingController(QObject):
     @pyqtProperty(str, notify=testStateChanged)
     def testState(self) -> str:  # noqa: N802
         return self._test_state
+
+    @pyqtProperty(int, constant=True)
+    def testRecordLimitMs(self) -> int:  # noqa: N802
+        return TEST_RECORD_LIMIT_MS
 
     @pyqtProperty(str, notify=testTextChanged)
     def testText(self) -> str:  # noqa: N802

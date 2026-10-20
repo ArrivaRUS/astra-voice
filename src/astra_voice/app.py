@@ -46,6 +46,7 @@ from astra_voice.models.catalog_effective import (
 from astra_voice.models.store import ModelStore, StoreError
 from astra_voice.platform.session import SessionKind, detect
 from astra_voice.platform.sound import MicrophoneState
+from astra_voice.ui.app_icon import install_app_icon
 from astra_voice.ui.hotkey_capture import HotkeyCapture
 from astra_voice.ui.icons import install_icon_provider
 from astra_voice.ui.notify import install_dispatcher as install_notify_dispatcher
@@ -1259,6 +1260,115 @@ def _bind_updates_bridge(
     return bridge
 
 
+def _wire_tray_models(
+    tray: Any, bridge: Any, show_models: Callable[[], None] | None = None
+) -> None:
+    """Трей использует список, имена и переключение раздела «Модели»."""
+    bridge.defer_model_store_error_reset()
+    snapshot: tuple[tuple[tuple[str, str], ...], str | None] | None = None
+    disabled_snapshot: frozenset[str] = frozenset()
+    availability_fingerprint: tuple[tuple[Any, ...], ...] | None = None
+    confirmed_active: str | None = None
+    pending_id: str | None = None
+    selection_in_progress = False
+
+    def sync() -> None:
+        nonlocal availability_fingerprint
+        try:
+            refresh()
+        except (OSError, StoreError):
+            availability_fingerprint = None
+            bridge.report_model_store_error()
+
+    def refresh() -> None:
+        nonlocal snapshot, disabled_snapshot, confirmed_active, pending_id
+        nonlocal availability_fingerprint
+        rows = bridge.models
+        if bridge.models_read_failed:
+            availability_fingerprint = None
+            return
+        installed = [row for row in rows if row["badge"] in {"active", "installed"}]
+        active = next((row["id"] for row in installed if row["badge"] == "active"), None)
+        # set_current опережает ответ движка; до его ответа галочка остаётся прежней.
+        if not any(row.get("state") == "switching" for row in rows):
+            confirmed_active = active
+        entries = tuple((row["id"], row["name"]) for row in installed)
+        current = (entries, confirmed_active)
+        fingerprint = tuple(
+            (row["id"], row["badge"], row.get("state"), row.get("message")) for row in rows
+        )
+        disabled = disabled_snapshot
+        check_failed = False
+        if fingerprint != availability_fingerprint:
+            unavailable: set[str] = set()
+            for row in installed:
+                model_id = row["id"]
+                available = bridge.can_select_model_or_unknown(model_id)
+                if available is None:
+                    check_failed = True
+                    if model_id in disabled_snapshot:
+                        unavailable.add(model_id)
+                elif not available:
+                    unavailable.add(model_id)
+            disabled = frozenset(unavailable)
+            # Ошибка не становится кэшем: следующий сигнал повторит проверку,
+            # сохранив прежнюю доступность только у затронутой модели.
+            availability_fingerprint = None if check_failed else fingerprint
+        if current != snapshot or disabled != disabled_snapshot:
+            snapshot, disabled_snapshot = current, disabled
+            tray.set_models(entries, confirmed_active, disabled=disabled)
+        if not check_failed and not selection_in_progress:
+            bridge.reset_model_store_error()
+        if selection_in_progress:
+            return
+
+        if pending_id is not None:
+            row = next((row for row in rows if row["id"] == pending_id), None)
+            if row is not None and row.get("state") == "switching":
+                return
+            refused = pending_id != confirmed_active or (
+                row is not None and (row.get("canSwitchWithPause") or row.get("message"))
+            )
+            # Гасим запрос до вызова окна: повторные сигналы и вложенный цикл
+            # событий не должны открыть раздел ещё раз для той же попытки.
+            pending_id = None
+            if refused and show_models is not None:
+                show_models()
+
+    def select(model_id: str) -> None:
+        nonlocal pending_id, availability_fingerprint, selection_in_progress
+        try:
+            rows = bridge.models
+            if bridge.models_read_failed:
+                raise StoreError("models unavailable")
+            if any(row.get("state") == "switching" for row in rows):
+                # Чужое/предыдущее переключение уже выполняется; его итог не присваиваем
+                # новой попытке. Сохраняем pending исходного запроса до ответа движка.
+                if show_models is not None:
+                    show_models()
+                return
+            pending_id = model_id
+            selection_in_progress = True
+            if not bridge.make_model_current(model_id):
+                raise StoreError("model selection unavailable")
+        except (OSError, StoreError):
+            pending_id = None
+            availability_fingerprint = None
+            bridge.report_model_store_error()
+            if show_models is not None:
+                show_models()
+            return
+        finally:
+            selection_in_progress = False
+        # Занятый мост может отказать без сигнала; синхронный успех тоже допустим.
+        sync()
+
+    tray.on_model_selected = select
+    bridge.modelsChanged.connect(sync)
+    bridge.activeModelChanged.connect(sync)
+    sync()
+
+
 def _wire_tray_updates(tray: Any, bridge: Any, show_network: Callable[[], None]) -> None:
     """Пункт трея «Проверить обновления» (Р9): активен всегда, кроме офлайна и запрета.
 
@@ -1585,6 +1695,8 @@ def main(argv: list[str] | None = None) -> int:
     app.setApplicationVersion(__version__)
     app.setOrganizationDomain(ORGANIZATION_DOMAIN)
     app.setDesktopFileName(DESKTOP_FILE_NAME)
+    # Значок окон — явно, до QML: Fly не берёт его из записи меню по WM_CLASS.
+    install_app_icon(app)
     app.setQuitOnLastWindowClosed(not CLOSE_TO_TRAY)
     # XSMP оставляем ради штатного выхода по Die при завершении сеанса, но KDE не должен
     # восстанавливать копию: фоновый старт даёт только автозапуск с --hidden.
@@ -1616,7 +1728,7 @@ def main(argv: list[str] | None = None) -> int:
     model_store: ModelStore | None = None
     # Проверяем текущее состояние: диктовка и трей запускаются позже фильтра.
     close_watcher = _wire_close(  # держим ссылку на фильтр
-        app, shell, is_tray_ready=lambda: runtime is not None and runtime.tray.registered
+        app, shell, is_tray_ready=lambda: runtime is not None and runtime.tray.visible_for_close
     )
     focuser = _WindowFocuser(shell, app if isinstance(app, QObject) else None)
     server = ShowServer(focuser.focus_shell)
@@ -1727,8 +1839,15 @@ def main(argv: list[str] | None = None) -> int:
             capture=capture,
             locked=locked_settings,
             autostart=autostart,
+            tray=runtime.tray if runtime_ready and runtime is not None else None,
         )
         if runtime_ready and runtime is not None:
+
+            def show_models() -> None:
+                focuser.focus_shell()
+                app_info.show_section(SECTION_MODELS)
+
+            _wire_tray_models(runtime.tray, settings_bridge, show_models)
             runtime.orchestrator.microphone_count = settings_bridge.microphone_count
             settings_bridge.bind_command_host(runtime)
             settings_bridge.bind_sound_cues_host(runtime)

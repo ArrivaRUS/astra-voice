@@ -1,8 +1,9 @@
 """Пять шагов и настройки в двух темах: Qt5, состояния мостов и детерминированные PNG.
 
-Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING
-или по умолчанию design/refs/impl/onboarding.
-Все записи тестов, включая временные PNG, ограничены SNAPSHOTS. Публикация
+Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING;
+по умолчанию используется приватный кеш снимков. ASTRA_VOICE_UPDATE_REFS=1
+явно направляет снимки в design/refs/impl/onboarding.
+Все записи тестов, включая временные PNG, ограничены snapshots(). Публикация
 через os.replace выполняется в teardown только после успеха всего модуля.
 """
 
@@ -12,10 +13,10 @@ import copy
 import os
 import re
 import sys
-import tempfile
+import time
 from collections.abc import Callable, Iterator
 from decimal import Decimal
-from functools import partial
+from functools import cache, partial
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -45,13 +46,26 @@ from PyQt5.QtTest import QSignalSpy, QTest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
+from helpers.snapshots import (  # noqa: E402
+    delete_snapshot,
+    publish_snapshot,
+    snapshot_dir,
+    snapshot_staging,
+    write_snapshot,
+)
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
+
+
 # Промежуточные прогоны разработки не трогают эталоны репозитория.
-SNAPSHOTS = REPO / Path(
-    os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING") or "design/refs/impl/onboarding"
-)
+@cache
+def snapshots() -> Path:
+    return snapshot_dir(
+        "ASTRA_VOICE_SNAPSHOT_DIR_ONBOARDING", "onboarding", "design/refs/impl/onboarding"
+    )
+
+
 WIDTH, HEIGHT = 1024, 620
 
 
@@ -274,6 +288,7 @@ class FakeOnboarding(QObject):
         self._device: str = ""
         self._deviceResolved: str = "Встроенный микрофон"
         self._level: float = 1.0
+        self._levelSilent: bool = False
         self._levelState: str = "listening"
         self._levelMessage: str = ""
         self._peak: str = "−18 дБ"
@@ -565,6 +580,15 @@ class FakeOnboarding(QObject):
 
     level = pyqtProperty(float, _get_level, _set_level, notify=changed)
 
+    def _get_levelSilent(self) -> bool:
+        return self._levelSilent
+
+    def _set_levelSilent(self, value: bool) -> None:
+        self._levelSilent = value
+        self.changed.emit()
+
+    levelSilent = pyqtProperty(bool, _get_levelSilent, _set_levelSilent, notify=changed)
+
     def _get_levelState(self) -> str:
         return self._levelState
 
@@ -627,6 +651,12 @@ class FakeOnboarding(QObject):
         self.changed.emit()
 
     testState = pyqtProperty(str, _get_testState, _set_testState, notify=changed)
+
+    @pyqtProperty(int, constant=True)
+    def testRecordLimitMs(self) -> int:
+        from astra_voice.core.dictation import TEST_RECORD_LIMIT_MS
+
+        return TEST_RECORD_LIMIT_MS
 
     def _get_testMessage(self) -> str:
         return self._testMessage
@@ -776,6 +806,7 @@ class FakeSettings(QObject):
     """Изменяемый контракт настроек без системных побочных действий."""
 
     changed = pyqtSignal()
+    trayXembedUnconfirmedChanged = pyqtSignal()
     commandMouseEnabledChanged = pyqtSignal()
     commandMouseButtonChanged = pyqtSignal()
     commandMouseStateChanged = pyqtSignal()
@@ -1216,6 +1247,13 @@ class FakeSettings(QObject):
 
     modelUnloadMinutes = pyqtProperty(
         int, _get_modelUnloadMinutes, _set_modelUnloadMinutes, notify=changed
+    )
+
+    def _get_trayXembedUnconfirmed(self) -> bool:
+        return False
+
+    trayXembedUnconfirmed = pyqtProperty(
+        bool, _get_trayXembedUnconfirmed, notify=trayXembedUnconfirmedChanged
     )
 
     def _get_language(self) -> str:
@@ -1763,6 +1801,14 @@ def configure_mic() -> FakeOnboarding:
     return fake
 
 
+def configure_mic_recording() -> FakeOnboarding:
+    fake = configure_mic()
+    fake.testState = "recording"
+    fake.testText = ""
+    fake.testDuration = ""
+    return fake
+
+
 SNAPSHOT_SETUPS: dict[str, Callable[[], FakeOnboarding | FakeSettings]] = {
     "01-welcome": partial(configure_onboarding, 1),
     "02-model": partial(configure_onboarding, 2),
@@ -1778,6 +1824,7 @@ SNAPSHOT_SETUPS: dict[str, Callable[[], FakeOnboarding | FakeSettings]] = {
         eta="осталось ~3 мин",
     ),
     "04-mic": configure_mic,
+    "04-mic-recording": configure_mic_recording,
     "04-mic-downloading": partial(
         configure_onboarding,
         4,
@@ -2546,16 +2593,13 @@ def rendered_steps(
 ) -> Iterator[dict[tuple[str, bool], tuple[QImage, list[str], Path]]]:
     """Готовит кадры всех случаев; публикует их только после успеха тестов модуля."""
     failures_before = request.session.testsfailed
-    SNAPSHOTS.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".onboarding-", dir=SNAPSHOTS) as temporary:
-        staging = Path(temporary)
+    with snapshot_staging(snapshots(), prefix=".onboarding-") as staging:
         rendered: dict[tuple[str, bool], tuple[QImage, list[str], Path]] = {}
         for name, dark in CASES:
             image, messages = render_case(onboarding_app, name, dark)
             filename = snapshot_name(name, dark)
             assert_no_messages(messages, filename)
-            path = staging / filename
-            assert image.save(str(path), "PNG"), f"не удалось сохранить {path}"
+            path = write_snapshot(staging, filename, image)
             assert_saved_snapshot(path, image)
             rendered[name, dark] = image, messages, path
         yield rendered
@@ -2564,12 +2608,12 @@ def rendered_steps(
                 assert_no_messages(messages, path.name)
                 assert_saved_snapshot(path, image)
             for _, _, path in rendered.values():
-                os.replace(path, SNAPSHOTS / path.name)
+                publish_snapshot(path, snapshots(), path.name)
             for image, _, path in rendered.values():
-                assert_saved_snapshot(SNAPSHOTS / path.name, image)
+                assert_saved_snapshot(snapshots() / path.name, image)
             for step in range(1, 6):
                 for theme in ("light", "dark"):
-                    (SNAPSHOTS / f"step{step}-{theme}.png").unlink(missing_ok=True)
+                    delete_snapshot(snapshots(), f"step{step}-{theme}.png")
 
 
 @pytest.mark.parametrize("name", SNAPSHOT_SETUPS)
@@ -2590,7 +2634,7 @@ def test_step_snapshots_are_saved(
     """Проверяет подготовленные PNG; атомарная публикация отложена до teardown."""
     assert set(rendered_steps) == set(CASES)
     expected = {snapshot_name(name, dark) for name, dark in CASES}
-    assert len(expected) == 24
+    assert len(expected) == 26
     paths = [path for _, _, path in rendered_steps.values()]
     assert {path.name for path in paths[0].parent.glob("*.png")} == expected
     for image, messages, path in rendered_steps.values():
@@ -2976,11 +3020,9 @@ def test_download_strip_track_stays_at_right_edge(onboarding_app: Any, screen: s
 def test_download_card_state_frames(onboarding_app: Any) -> None:
     from astra_voice.ui.model_downloads import _FAILURE_MESSAGES, _SOURCE_TEXT
 
-    destination = os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_M6DL")
-    if not destination:
+    if not os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_M6DL"):
         pytest.skip("ASTRA_VOICE_SNAPSHOT_DIR_M6DL не задан")
-    snapshots = Path(destination)
-    snapshots.mkdir(parents=True, exist_ok=True)
+    snapshots = snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_M6DL", "m6dl", "design/refs/impl/m6dl")
     states = ("queued", "downloading", "downloading-calc", "verifying", "paused-no-space", "failed")
     paused_message = "Не хватает места — освободите 172 МБ"
     for state in states:
@@ -3200,8 +3242,7 @@ def test_download_card_state_frames(onboarding_app: Any) -> None:
                 )
             filename = f"m6dl-{screen}-{state}.png"
             assert_no_messages(messages, filename)
-            path = snapshots / filename
-            assert image.save(str(path), "PNG"), filename
+            path = write_snapshot(snapshots, filename, image)
             assert_saved_snapshot(path, image)
 
 
@@ -4438,6 +4479,109 @@ def test_mic_test_button_starts_and_stops_including_processing(
 
 
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize("window_width", [900, 1024])
+def test_mic_recording_hint_counts_down_only_during_recording(
+    onboarding_app: Any, dark: bool, window_width: int
+) -> None:
+    from astra_voice.core.dictation import TEST_PREPARING
+
+    fake = configure_mic_recording()
+
+    def inspect(root: Any) -> None:
+        window = root.window()
+        window.resize(window_width, HEIGHT)
+        wait_for_window_size(onboarding_app, window, window_width, HEIGHT, exposed=True)
+        hint = root.findChild(QObject, "testRecordingHint")
+        timer = root.findChild(QObject, "testRecordingCountdown")
+        result = root.findChild(QObject, "testResultField")
+        status = root.findChild(QObject, "testStatusText")
+        assert hint is not None and timer is not None
+        assert result is not None and status is not None
+        assert timer.property("interval") == 200
+        assert timer.property("running") is True
+        assert hint.property("textFormat") == Qt.PlainText
+        assert hint.property("color") == theme_color("fgMuted", dark)
+        assert hint.property("lineCount") == 1
+        assert hint.property("height") == hint.property("lineHeight")
+        recording_y = result.property("y")
+        assert hint.property("text").endswith("через 5 с")
+        # Первый переход проходит настоящий event loop; затем моделируем
+        # задержку тика, меняя время начала, без ожидания всего лимита.
+        for _ in range(30):
+            if hint.property("text").endswith("через 4 с"):
+                break
+            QTest.qWait(50)
+        assert hint.property("text").endswith("через 4 с")
+        # Повторный тик без прошедшего времени не уменьшает счётчик.
+        QMetaObject.invokeMethod(timer, "triggered", Qt.DirectConnection)
+        assert hint.property("text").endswith("через 4 с")
+        mic_step = hint.parent()
+        for elapsed_ms, remaining in ((2200, 3), (3400, 2), (4800, 1), (7200, 1)):
+            mic_step.setProperty("testRecordingStartedAt", time.time() * 1000 - elapsed_ms)
+            QMetaObject.invokeMethod(timer, "triggered", Qt.DirectConnection)
+            onboarding_app.processEvents()
+            assert hint.property("text") == (
+                f"Говорите. Нажмите «Остановить» — или запись остановится сама через {remaining} с"
+            )
+            assert status.property("text") == ""
+
+        for state, expected in (
+            ("processing", "Распознаю…"),
+            ("preparing", TEST_PREPARING),
+        ):
+            fake.testState = state
+            fake.testMessage = expected
+            onboarding_app.processEvents()
+            assert timer.property("running") is False
+            assert not hint.property("visible")
+            matching_texts = [
+                item
+                for item in visual_tree(root)
+                if item.isVisible() and item.property("text") == expected
+            ]
+            assert len(matching_texts) == 1
+            assert "Скажите фразу — покажем, что распознали." not in visible_texts(root)
+            if state == "processing":
+                assert recording_y - result.property("y") == hint.property("lineHeight")
+
+        fake.testState = "recording"
+        onboarding_app.processEvents()
+        assert timer.property("running") is True
+        assert hint.property("text").endswith("через 5 с")
+        fake.testState = "done"
+        onboarding_app.processEvents()
+        assert timer.property("running") is False
+        assert not hint.property("visible")
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "microphone recording countdown")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize("model_ready", [False, True], ids=["waiting", "ready"])
+def test_done_explains_insertion_at_input_cursor(
+    onboarding_app: Any, dark: bool, model_ready: bool
+) -> None:
+    fake = configure_onboarding(5, modelReady=model_ready)
+
+    def inspect(root: Any) -> None:
+        texts = visible_texts(root)
+        body = next(text for text in texts if "текст появится в этом месте" in text)
+        assert "в любом окне" in body
+        assert "курсор ввода" in body
+        assert "зажмите сочетание и говорите" in body
+        assert "трее" in body or "трей" in body
+        if model_ready:
+            assert body.startswith("Работает в любом окне, где мигает курсор ввода:")
+            assert "Левый клик по значку открывает настройки" in body
+        else:
+            assert body.startswith("Когда модель будет готова,")
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "done cursor explanation")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_mic_card_with_resolved_default_device_is_57px(onboarding_app: Any, dark: bool) -> None:
     fake = FakeOnboarding()
     fake.step = 4
@@ -4580,33 +4724,127 @@ def test_mic_silence_is_reported_while_listening(onboarding_app: Any, dark: bool
     retry = "Проверить ещё раз"
 
     def inspect(root: Any) -> None:
-        for state, level in (
-            ("idle", 0),
-            ("listening", 0),
-            ("listening", 0.02),
-            ("listening", 0.021),
-            ("listening", 0.5),
-            ("error", 0),
-            ("idle", 0),
+        meter = next(
+            item
+            for item in visual_tree(root)
+            if item.metaObject().indexOfProperty("level") >= 0
+            and item.metaObject().indexOfProperty("silent") >= 0
+        )
+        heard = False
+        for state, level, level_silent in (
+            ("idle", 0, False),
+            ("listening", 0, False),
+            ("listening", 0, True),
+            ("listening", 0.02, True),
+            ("listening", 0.033, True),
+            ("listening", 0.021, False),
+            ("listening", 0.5, False),
+            ("error", 0, False),
+            ("idle", 0, False),
         ):
+            heard = (heard or level > 0.02) if state == "listening" else False
             fake.levelState = state
             fake.level = level
+            fake.levelSilent = level_silent
             onboarding_app.processEvents()
             texts = visible_texts(root)
-            assert (warning in texts) == (state == "listening" and level <= 0.02), (state, level)
+            assert (warning in texts) == (state == "listening" and level_silent), (
+                state,
+                level,
+                level_silent,
+            )
+            assert meter.property("level") == level
+            assert meter.property("silent") == (level <= 0.02)
             # В idle пояснение означает, что мост сам остановил проверку по
             # общему потолку (ИБ, У62): показываем его и даём повторить.
             assert (fake.levelMessage in texts) == (state in ("error", "idle")), (state, level)
             assert (retry in texts) == (state == "idle"), (state, level)
             if state == "listening":
-                assert (silence in texts) == (level <= 0.02), level
-                assert ("Слышим вас" in texts) == (level > 0.02), level
+                assert (silence in texts) == (not heard or level_silent), (level, level_silent)
+                assert ("Слышим вас" in texts) == (heard and not level_silent), (
+                    level,
+                    level_silent,
+                )
+                assert (f"Пик {fake.peak}" in texts) == level_silent
+                assert (f"Пик {fake.peak} · уровень в норме" in texts) == (not level_silent)
             elif state == "error":
                 assert silence not in texts
                 assert "Слышим вас" not in texts
 
     _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
     assert_no_messages(messages, "microphone silence")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_mic_silence_waits_for_signal_and_resets_on_new_session(
+    onboarding_app: Any, dark: bool
+) -> None:
+    fake = configure_onboarding(4, levelState="listening", level=0, levelSilent=False, testText="")
+
+    def inspect(root: Any) -> None:
+        def expect_hint(expected: str) -> None:
+            onboarding_app.processEvents()
+            texts = visible_texts(root)
+            assert expected in texts
+            other = "Слышим вас" if expected == "Пока тишина" else "Пока тишина"
+            assert other not in texts
+            assert "Микрофон молчит" not in texts
+
+        # levelSilent ещё не накопил окно тишины, но сигнала пока не было.
+        expect_hint("Пока тишина")
+        fake.level = 0.5
+        expect_hint("Слышим вас")
+        fake.level = 0.01
+        expect_hint("Слышим вас")
+        fake.levelState = "idle"
+        onboarding_app.processEvents()
+        fake.level = 0
+        fake.levelState = "listening"
+        expect_hint("Пока тишина")
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "microphone initial silence and new session")
+
+
+@pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
+def test_mic_silence_heading_moves_smoothly_and_returns(onboarding_app: Any, dark: bool) -> None:
+    fake = configure_onboarding(4, level=0, levelSilent=False, testText="")
+    duration = int(theme_number("durationEnter"))
+
+    def inspect(root: Any) -> None:
+        assert root.setProperty("freezeAnimations", False)
+        step = next(
+            item
+            for item in visual_tree(root)
+            if item.metaObject().indexOfProperty("levelState") >= 0
+            and item.metaObject().indexOfProperty("barHint") >= 0
+        )
+        heading = next(
+            item for item in step.childItems() if item.property("text") == "Тестовая диктовка"
+        )
+        QTest.qWait(duration + 80)
+        original_y = heading.y()
+        fake.levelSilent = True
+        onboarding_app.processEvents()
+        assert heading.y() == pytest.approx(original_y, abs=1)
+        QTest.qWait(max(30, duration // 3))
+        entering_y = heading.y()
+        QTest.qWait(duration + 80)
+        expanded_y = heading.y()
+        assert original_y < entering_y < expanded_y
+        QTest.qWait(30)
+        assert heading.y() == pytest.approx(expanded_y, abs=0.1)
+        fake.levelSilent = False
+        onboarding_app.processEvents()
+        assert heading.y() == pytest.approx(expanded_y, abs=1)
+        QTest.qWait(max(30, duration // 3))
+        leaving_y = heading.y()
+        QTest.qWait(duration + 80)
+        assert original_y < leaving_y < expanded_y
+        assert heading.y() == pytest.approx(original_y, abs=0.1)
+
+    _, messages = render_onboarding(onboarding_app, fake, dark, inspect=inspect)
+    assert_no_messages(messages, "microphone silence heading animation")
 
 
 def test_finish_calls_bridge(onboarding_app: Any) -> None:
@@ -5183,8 +5421,8 @@ def test_step1_network_disclosure_matches_actual_choices(
         if locked:
             assert hint in texts and "Задано администратором" in texts
         else:
-            assert "Раз в сутки, github.com. Скачивание — только по вашему нажатию." in texts
-            assert "huggingface.co. Скачивание — только по вашему нажатию." in texts
+            assert "Раз в сутки. Скачивание — только по вашему нажатию." in texts
+            assert "Скачивание — только по вашему нажатию." in texts
         if app_on or model_on:
             assert any("Не чаще раза в сутки. Сама ничего не скачивает" in text for text in texts)
         rows = [

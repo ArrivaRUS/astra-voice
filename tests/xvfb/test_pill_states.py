@@ -3,8 +3,10 @@
 xvfb в системе не установлен. Запуск без X-сервера:
 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software pytest -m xvfb.
 Снимки всегда включают поля тени 18/18/18/24 px и принимаются только при альфе
-фона 240 ± 1 в центре пилюли. Каталог снимков задаётся ASTRA_VOICE_SNAPSHOT_DIR_PILL
-или по умолчанию design/refs/impl/pill. PNG публикуются из временного каталога
+фона 240 ± 1 в центре пилюли. Без флага снимки идут в приватный кеш снимков
+или заданный через ASTRA_VOICE_SNAPSHOT_DIR_PILL путь вне design/refs. Только
+ASTRA_VOICE_UPDATE_REFS=1 выбирает design/refs/impl/pill, игнорируя этот путь.
+PNG публикуются из временного каталога
 атомарной заменой только при изменении пикселей (или отсутствии читаемого PNG)
 и после успешных проверок всего модуля; метаданные PNG не учитываются.
 Референс design/refs/09-pill.png проверяется на наличие, без попиксельного сравнения.
@@ -13,11 +15,10 @@ QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software pytest -m xvfb.
 from __future__ import annotations
 
 import os
-import shutil
 import sys
-import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
+from functools import cache
 from hashlib import sha256
 from math import ceil, floor
 from pathlib import Path
@@ -28,10 +29,17 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from astra_voice.ui.icons import install_icon_provider
 from helpers.qt_app import get_qapplication  # noqa: E402
+from helpers.snapshots import publish_snapshot, snapshot_dir, snapshot_staging, write_snapshot  # noqa: E402
 
 pytestmark = pytest.mark.xvfb
 REPO = Path(__file__).resolve().parents[2]
-SNAPSHOTS = REPO / Path(os.environ.get("ASTRA_VOICE_SNAPSHOT_DIR_PILL") or "design/refs/impl/pill")
+
+
+@cache
+def snapshots() -> Path:
+    return snapshot_dir("ASTRA_VOICE_SNAPSHOT_DIR_PILL", "pill", "design/refs/impl/pill")
+
+
 LABELS = {
     "hidden": "",
     "loading-model": "Загружаю модель…",
@@ -244,9 +252,7 @@ def capture_state(
                 and pixel.red() == pixel.green() == pixel.blue() == 0
                 for y in range(bottom, image.height())
             )
-            snapshot_dir.mkdir(parents=True, exist_ok=True)
-            snapshot = snapshot_dir / f"{state}.png"
-            assert image.save(str(snapshot), "PNG"), f"не удалось сохранить {snapshot}"
+            snapshot = write_snapshot(snapshot_dir, f"{state}.png", image)
 
         texts = []
         bars = []
@@ -333,31 +339,26 @@ def rendered_states(
     from PyQt5.QtGui import QImage
 
     # Общая фикстура гарантирует снимки и при отдельном запуске теста референса.
-    # Соседний staging сохраняет атомарность замены и не попадает в glob снимков.
-    SNAPSHOTS.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".pill-", dir=SNAPSHOTS.parent))
+    # Staging внутри проверенного каталога сохраняет атомарность замены и не попадает в glob.
     failures_before = request.session.testsfailed
-    try:
+    with snapshot_staging(snapshots(), prefix=".pill-") as staging:
         rendered = {state: capture_state(pill_app, state, snapshot_dir=staging) for state in LABELS}
         expected = {f"{state}.png" for state in LABELS if state not in INVISIBLE}
         assert len(expected) == 10
         assert {path.name for path in staging.glob("*.png")} == expected
-        assert {path.name for path in SNAPSHOTS.glob("*.png")} <= expected
+        assert {path.name for path in snapshots().glob("*.png")} <= expected
         for state in LABELS.keys() - INVISIBLE:
             assert_saved_snapshot(state, rendered[state])
         yield rendered
         # При ошибке съёмки или любой проверки модуля прежние PNG остаются нетронутыми.
         if request.session.testsfailed == failures_before:
-            SNAPSHOTS.mkdir(parents=True, exist_ok=True)
             for name in sorted(expected):
                 source = staging / name
-                destination = SNAPSHOTS / name
+                destination = snapshots() / name
                 current = QImage(str(destination)).convertToFormat(QImage.Format_RGBA8888)
                 candidate = QImage(str(source)).convertToFormat(QImage.Format_RGBA8888)
                 if current.isNull() or current != candidate:
-                    os.replace(source, destination)
-    finally:
-        shutil.rmtree(staging)
+                    publish_snapshot(source, snapshots(), name)
 
 
 def assert_pill_geometry_and_text(state: str, rendered: RenderedState) -> None:
@@ -417,7 +418,7 @@ def test_pill_state(state: str, rendered_states: dict[str, RenderedState]) -> No
 
     if state in INVISIBLE:
         assert rendered.snapshot is None
-        assert not (SNAPSHOTS / f"{state}.png").exists()
+        assert not (snapshots() / f"{state}.png").exists()
     else:
         assert rendered.snapshot is not None
         assert rendered.snapshot.name == f"{state}.png"

@@ -26,8 +26,28 @@ Item {
     readonly property string testText: root.bridge ? root.bridge.testText : ""
     readonly property string testState: root.bridge ? root.bridge.testState : "idle"
     readonly property string testMessage: root.bridge ? root.bridge.testMessage : ""
-    readonly property bool silent: level <= 0.02 // Порог «тишина» по заданию шага 4.
+    readonly property bool levelSilent: root.bridge ? root.bridge.levelSilent : false
     readonly property bool testing: testState === "preparing" || testState === "recording" || testState === "processing"
+    readonly property int testRecordLimitMs: root.bridge ? root.bridge.testRecordLimitMs : 0
+    property double testRecordingStartedAt: 0
+    property int testSecondsRemaining: Math.max(1, Math.ceil(testRecordLimitMs / 1000))
+    onTestStateChanged: {
+        root.testRecordingStartedAt = root.testState === "recording" ? Date.now() : 0
+        root.updateTestCountdown()
+    }
+
+    function updateTestCountdown() {
+        var elapsed = root.testState === "recording" ? Date.now() - root.testRecordingStartedAt : 0
+        root.testSecondsRemaining = Math.max(1, Math.ceil((root.testRecordLimitMs - elapsed) / 1000))
+    }
+
+    Timer {
+        objectName: "testRecordingCountdown"
+        interval: 200
+        repeat: true
+        running: root.testState === "recording"
+        onTriggered: root.updateTestCountdown()
+    }
     readonly property int selectedDeviceIndex: deviceIndex(device)
     readonly property var selectedDevice: selectedDeviceIndex >= 0 ? devices[selectedDeviceIndex] : null
     readonly property bool deviceMissing: device !== "" && (!selectedDevice || selectedDevice.missing === true)
@@ -35,6 +55,7 @@ Item {
     readonly property bool deviceLocked: bridge && bridge.lockedSettings
         ? bridge.lockedSettings.indexOf("device") >= 0 : false
     property bool levelMonitorRequested: false
+    property bool heardSinceStart: false
     // Мост сам останавливает проверку по общему потолку эпизода (ИБ, У62):
     // тогда он возвращает idle с пояснением, и продолжить может только человек.
     readonly property bool levelStopped: root.levelState === "idle" && root.levelMessage !== ""
@@ -54,7 +75,18 @@ Item {
 
     // Проверку мог остановить мост; без сброса отметки кнопка «Проверить ещё
     // раз» считала бы, что измерение уже идёт, и молчала бы.
-    onLevelStateChanged: if (root.levelState === "idle") root.levelMonitorRequested = false
+    onLevelStateChanged: {
+        if (root.levelState !== "listening")
+            root.heardSinceStart = false
+        else if (root.level > 0.02)
+            root.heardSinceStart = true
+        if (root.levelState === "idle")
+            root.levelMonitorRequested = false
+    }
+    onLevelChanged: {
+        if (root.levelState === "listening" && root.level > 0.02)
+            root.heardSinceStart = true
+    }
 
     Component.onCompleted: root.setLevelMonitoring(root.shown)
     onShownChanged: root.setLevelMonitoring(root.shown)
@@ -219,7 +251,7 @@ Item {
 
             LevelMeter {
                 level: root.level
-                silent: root.silent
+                silent: root.level <= 0.02
                 Layout.alignment: Qt.AlignVCenter
             }
 
@@ -232,7 +264,8 @@ Item {
                     width: parent.width
                     textFormat: Text.PlainText
                     text: root.levelState === "error" || root.levelStopped ? root.levelMessage
-                        : root.silent ? qsTr("Пока тишина") : qsTr("Слышим вас")
+                        : !root.heardSinceStart || root.levelSilent
+                            ? qsTr("Пока тишина") : qsTr("Слышим вас")
                     color: root.levelState === "error" ? Theme.dangerInk : Theme.fg
                     font.family: Theme.fontUi
                     font.pixelSize: Theme.fontSettingLabelSize
@@ -246,7 +279,8 @@ Item {
                     width: parent.width
                     textFormat: Text.PlainText
                     text: root.levelState === "listening" && root.peak !== ""
-                        ? qsTr("Пик %1 · уровень в норме").arg(root.peak) : ""
+                        ? (root.levelSilent ? qsTr("Пик %1")
+                            : qsTr("Пик %1 · уровень в норме")).arg(root.peak) : ""
                     visible: text !== ""
                     height: visible ? implicitHeight : 0
                     color: Theme.fgMuted
@@ -272,10 +306,17 @@ Item {
 
     NoteBanner {
         id: silenceNote
-        visible: root.levelState === "listening" && root.silent
+        visible: root.levelState === "listening" && root.levelSilent
         y: levelBox.y + levelBox.height + (visible ? 11 : 0)
         width: root.width
         height: visible ? implicitHeight : 0
+        clip: true
+        Behavior on height {
+            NumberAnimation { duration: Theme.durationEnter; easing.type: Easing.InOutQuad }
+        }
+        Behavior on y {
+            NumberAnimation { duration: Theme.durationEnter; easing.type: Easing.InOutQuad }
+        }
         variant: "warn"
         iconName: "alert"
         title: qsTr("Микрофон молчит")
@@ -333,10 +374,12 @@ Item {
             }
 
             Text {
+                objectName: "testStatusText"
                 Layout.fillWidth: true
                 Layout.alignment: Qt.AlignVCenter
                 textFormat: Text.PlainText
                 text: root.testState === "preparing" ? root.testMessage
+                    : root.testState === "recording" || root.testState === "processing" ? ""
                     : !root.modelReady ? qsTr("Будет доступно после установки модели")
                     : qsTr("Скажите фразу — покажем, что распознали.")
                 color: Theme.fgMuted
@@ -350,10 +393,29 @@ Item {
         }
     }
 
+    Text {
+        id: recordingHint
+        objectName: "testRecordingHint"
+        visible: root.testState === "recording"
+        y: testBox.y + testBox.height + (visible ? 6 : 0)
+        width: root.width
+        height: visible ? implicitHeight : 0
+        textFormat: Text.PlainText
+        text: qsTr("Говорите. Нажмите «Остановить» — или запись остановится сама через %1 с").arg(root.testSecondsRemaining)
+        color: Theme.fgMuted
+        font.family: Theme.fontUi
+        font.pixelSize: Theme.fontSettingSubSize
+        lineHeight: Math.round(Theme.fontSettingSubSize * Theme.fontSettingSubLineHeight)
+        lineHeightMode: Text.FixedHeight
+        renderType: Text.NativeRendering
+        wrapMode: Text.WordWrap
+    }
+
     Rectangle {
         id: resultField
+        objectName: "testResultField"
         visible: root.testText !== "" || root.testState === "recording" || root.testState === "processing"
-        y: testBox.y + testBox.height + (visible ? 10 : 0) // Макет: margin-top .field.
+        y: recordingHint.y + recordingHint.height + (visible ? (recordingHint.visible ? 4 : 10) : 0)
         width: root.width
         // design/spec.md §4.5: текст, паддинги и обе границы дают 35,5 → 36 px для одной строки.
         height: visible ? Math.ceil(resultText.height + Theme.fieldPaddingY * 2 + Theme.fieldBorder * 2) : 0
@@ -363,6 +425,7 @@ Item {
 
         Text {
             id: resultText
+            objectName: "testResultText"
             x: Theme.fieldPaddingX
             // FixedHeight оставляет leading снизу; CSS делит его пополам.
             // Паддинг отсчитываем от внутренней стороны рамки, как в макете.

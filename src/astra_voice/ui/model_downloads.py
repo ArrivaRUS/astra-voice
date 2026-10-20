@@ -1147,6 +1147,11 @@ class ModelDownloads(QObject):
         self._revoked_check = revoked_check
         self._catalog_revocation_warned = False
         self._snapshot_revocation_warned = False
+        self._store_error_warned = False
+        self.store_error_serial = 0
+        self.store_error_reset_on_models_read = True
+        self.models_read_failed = False
+        self._badge_snapshot: dict[str, str] = {}
         self._revocation_unknown_state = bool(revocation_unknown()) if revocation_unknown else False
         self._measurements_cache: dict[str, Any] | None = None
         self._switcher = switcher
@@ -1157,6 +1162,7 @@ class ModelDownloads(QObject):
         self._entry = model.recommended() if model is not None else None
         self._entries = model.entries() if model is not None else ()
         self._selected: set[str] = set()
+        self._recommended_preselect_done = False
         self._card_states: dict[str, str] = {}
         self._card_messages: dict[str, str] = {}
         self._card_hints: dict[str, str] = {}
@@ -1412,7 +1418,7 @@ class ModelDownloads(QObject):
                 if record_state == "ok" and getattr(entry, "removed_from_catalog", False):
                     return "removed-from-catalog"
             except (OSError, StoreError):
-                log.warning("Не удалось прочитать состояние установленной модели")
+                self.report_store_error()
                 return "installed" if revision else "available"
         if self._badge(entry, installed) == "active" and self._update_available(entry, installed):
             return "update-available"
@@ -1610,11 +1616,15 @@ class ModelDownloads(QObject):
         try:
             return self._model.installed_ids()
         except (OSError, StoreError):
-            log.warning("Не удалось прочитать список установленных моделей")
+            self.report_store_error()
             return ()
 
     def _installed_revision(
-        self, entry: Any, installed: tuple[tuple[str, str], ...] | None = None
+        self,
+        entry: Any,
+        installed: tuple[tuple[str, str], ...] | None = None,
+        *,
+        strict: bool = False,
     ) -> str:
         """Ревизия этой модели в хранилище: своя из каталога, иначе прежняя.
 
@@ -1623,7 +1633,14 @@ class ModelDownloads(QObject):
         именно на этом держится «Обновить» в карточке.
         """
         known = self._installed_ids() if installed is None else installed
-        current = self._model.current_ids() if self._model is not None else None
+        try:
+            current = self._model.current_ids() if self._model is not None else None
+        except (OSError, StoreError):
+            if strict:
+                raise
+            # Без рабочей ревизии карточка выбирает ревизию по каталогу.
+            self.report_store_error()
+            current = None
         if current is not None and current[0] == entry.id and current in known:
             return current[1]
         if (entry.id, entry.revision) in known:
@@ -1642,15 +1659,25 @@ class ModelDownloads(QObject):
     def _badge(self, entry: Any, installed: tuple[tuple[str, str], ...] | None = None) -> str:
         if self._model is None:
             return ""
-        revision = self._installed_revision(entry, installed)
-        if not revision:
-            return ""
-        state = self._model.record_state(entry.id, revision)
-        if not state:
-            return ""
-        if state == "ok" and self._model.current_ids() == (entry.id, revision):
-            return "active"
-        return "installed"
+        try:
+            revision = self._installed_revision(entry, installed)
+            if not revision:
+                self._badge_snapshot[entry.id] = ""
+                return ""
+            state = self._model.record_state(entry.id, revision)
+            if not state:
+                self._badge_snapshot[entry.id] = ""
+                return ""
+            badge = (
+                "active"
+                if state == "ok" and self._model.current_ids() == (entry.id, revision)
+                else "installed"
+            )
+            self._badge_snapshot[entry.id] = badge
+            return badge
+        except (OSError, StoreError):
+            self.report_store_error()
+            return self._badge_snapshot.get(entry.id, "")
 
     def _refresh_free_space_text(self) -> None:
         size = ""
@@ -1671,6 +1698,16 @@ class ModelDownloads(QObject):
 
     @property
     def models(self) -> list[dict[str, Any]]:
+        serial = self.store_error_serial
+        try:
+            rows = self._model_rows()
+        finally:
+            self.models_read_failed = serial != self.store_error_serial
+        if not self.models_read_failed and self.store_error_reset_on_models_read:
+            self.reset_store_error()
+        return rows
+
+    def _model_rows(self) -> list[dict[str, Any]]:
         best_rtfx = catalog_best(self._entries)
         if self._measurements_cache is None:
             try:
@@ -1935,6 +1972,40 @@ class ModelDownloads(QObject):
         )
         self._notify("modelsChanged")
 
+    def preselect_recommended(self) -> None:
+        """Один раз предлагает выбор мастеру; настройки явно не вызывают этот метод.
+
+        Флаг живёт вместе с общей очередью, чтобы повторный вход в мастер или
+        обновление карточек не восстанавливали снятую человеком галочку.
+        """
+        if self._recommended_preselect_done:
+            return
+        model = self._model
+        if model is None:
+            self._recommended_preselect_done = True
+            return
+        recommended = model.recommended()
+        if recommended is None:
+            self._recommended_preselect_done = True
+            return
+        entry = next((entry for entry in self._entries if entry.id == recommended.id), None)
+        if (
+            entry is None
+            or entry.removed_from_catalog
+            or self._is_revoked(entry, entry.revision)
+            or any(model_id == entry.id for model_id, _ in self._installed_ids())
+        ):
+            self._recommended_preselect_done = True
+            return
+        if entry.id in self._selected:
+            self._recommended_preselect_done = True
+            return
+        # Сеть и занятая очередь могут стать доступны позже. Не тратим
+        # предложение, пока toggleModel не изменит выбор на самом деле.
+        if not model.allowed()[0]:
+            return
+        self.toggleModel(entry.id)
+
     def toggleModel(self, model_id: str) -> None:  # noqa: N802
         if self._rechecking or self._shutting_down or self._switching_entry is not None:
             return
@@ -1943,7 +2014,10 @@ class ModelDownloads(QObject):
             return
         if self._card_state(entry) not in {"available", "failed"}:
             return
+        # Ручной выбор общей очереди важнее первого предложения мастера.
         self._selected.symmetric_difference_update({model_id})
+        # До emit: modelsChanged может синхронно повторить предвыбор мастера.
+        self._recommended_preselect_done = True
         self._notify("modelsChanged")
         self._notify("selectionChanged")
 
@@ -2035,34 +2109,78 @@ class ModelDownloads(QObject):
             return None
         return next((entry for entry in self._entries if entry.id == model_id), None)
 
+    def can_make_current(self, model_id: str) -> bool:
+        """Установленная ревизия проверена и не отозвана издателем."""
+        return self.can_make_current_or_unknown(model_id) is True
+
+    def report_store_error(self) -> None:
+        """Одно предупреждение на серию ошибок до успешного обновления меню."""
+        self.store_error_serial += 1
+        if not self._store_error_warned:
+            log.warning("Не удалось прочитать или изменить состояние моделей")
+            self._store_error_warned = True
+
+    def reset_store_error(self) -> None:
+        """Полный успешный снимок завершает серию временных ошибок."""
+        self._store_error_warned = False
+
+    def can_make_current_or_unknown(self, model_id: str) -> bool | None:
+        """Доступность ревизии; None означает временную ошибку хранилища."""
+        if self._model is None:
+            return False
+        entry = next((entry for entry in self._entries if entry.id == model_id), None)
+        if entry is None:
+            return False
+        try:
+            # Каталог может уже предлагать другую, более новую ревизию.
+            # Читаем напрямую: _installed_ids превращает ошибку в пустой список,
+            # а здесь она должна отличаться от отсутствующей установки.
+            revision = self._installed_revision(entry, self._model.installed_ids(), strict=True)
+            return (
+                bool(revision)
+                and self._model.record_state(entry.id, revision) == "ok"
+                and not self._is_revoked(entry, revision)
+            )
+        except (OSError, StoreError):
+            self.report_store_error()
+            return None
+
     def makeModelCurrent(self, model_id: str) -> None:  # noqa: N802
         """Делает установленную ревизию рабочей; сломанную рабочей не делаем."""
+        self.make_current(model_id)
+
+    def make_current(self, model_id: str) -> bool:
+        """Выбирает ревизию; False означает ошибку хранилища этой операции."""
         entry = self._managed_entry(model_id)
         if entry is None or self._model is None:
-            return
-        revision = self._installed_revision(entry)
-        if not revision or self._model.record_state(entry.id, revision) != "ok":
-            return
-        if self._is_revoked(entry, revision):
-            self._set_card(entry, "failed", _REVOKED_MESSAGE)
-            return
-        if self._switcher is not None:
-            self._start_switch(entry, revision, pause=False)
-            return
-        with self._update():
-            try:
-                self._model.set_current(entry.id, revision)
-            except (OSError, StoreError):
-                log.warning("Не удалось сделать модель рабочей")
-                self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
-                return
-            if self._paused_entry is not None:
-                self._queue_current = (entry.id, revision)
-            self._card_messages.pop(entry.id, None)
-            self._clear_card_hints()
-            self._notify("modelsChanged")
-            self._notify("modelReadyChanged")
-            self._notify("selectionChanged")
+            return True
+        try:
+            revision = self._installed_revision(entry, self._model.installed_ids(), strict=True)
+            if not revision or self._model.record_state(entry.id, revision) != "ok":
+                return True
+            if self._is_revoked(entry, revision):
+                self._set_card(entry, "failed", _REVOKED_MESSAGE)
+                return True
+            if self._switcher is not None:
+                return self._start_switch(entry, revision, pause=False)
+            with self._update():
+                try:
+                    self._model.set_current(entry.id, revision)
+                except (OSError, StoreError):
+                    self.report_store_error()
+                    self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
+                    return False
+                if self._paused_entry is not None:
+                    self._queue_current = (entry.id, revision)
+                self._card_messages.pop(entry.id, None)
+                self._clear_card_hints()
+                self._notify("modelsChanged")
+                self._notify("modelReadyChanged")
+                self._notify("selectionChanged")
+        except (OSError, StoreError):
+            self.report_store_error()
+            return False
+        return True
 
     def switchModelWithPause(self, model_id: str) -> None:  # noqa: N802
         """Переключает рабочую модель с короткой паузой в диктовке."""
@@ -2074,12 +2192,15 @@ class ModelDownloads(QObject):
             if pending_id == model_id:
                 self._start_revision(model_id, revert=revert, pause=True)
                 return
-        revision = self._installed_revision(entry)
-        if revision and self._model.record_state(entry.id, revision) == "ok":
-            if self._is_revoked(entry, revision):
-                self._set_card(entry, "failed", _REVOKED_MESSAGE)
-                return
-            self._start_switch(entry, revision, pause=True)
+        try:
+            revision = self._installed_revision(entry, self._model.installed_ids(), strict=True)
+            if revision and self._model.record_state(entry.id, revision) == "ok":
+                if self._is_revoked(entry, revision):
+                    self._set_card(entry, "failed", _REVOKED_MESSAGE)
+                    return
+                self._start_switch(entry, revision, pause=True)
+        except (OSError, StoreError):
+            self.report_store_error()
 
     def _start_switch(
         self,
@@ -2090,10 +2211,10 @@ class ModelDownloads(QObject):
         already_current: bool = False,
         previous_current: tuple[str, str] | None = None,
         previous_revision: str | None = None,
-    ) -> None:
+    ) -> bool:
         model, switcher = self._model, self._switcher
         if model is None or switcher is None:
-            return
+            return True
         if already_current:
             self._previous_current = previous_current
             self._switch_previous_revision = previous_revision
@@ -2104,10 +2225,10 @@ class ModelDownloads(QObject):
                 self._switch_finished("failed")
             else:
                 self._set_card(entry, "failed", _REVOKED_MESSAGE)
-            return
+            return True
         previous = previous_current if already_current else model.current_ids()
         if not already_current and previous == (entry.id, revision):
-            return
+            return True
         if (
             not already_current
             and not pause
@@ -2117,15 +2238,15 @@ class ModelDownloads(QObject):
             self._card_hints[entry.id] = _SWITCH_PAUSE_HINT
             self._card_hint_kinds[entry.id] = "switch-pause"
             self._notify("modelsChanged")
-            return
+            return True
         with self._update():
             try:
                 if not already_current:
                     model.set_current(entry.id, revision)
             except (OSError, StoreError):
-                log.warning("Не удалось сделать модель рабочей")
+                self.report_store_error()
                 self._set_card(entry, self._card_state(entry), _CURRENT_FAILED_MESSAGE)
-                return
+                return False
             self._previous_current = previous
             self._switching_entry = entry
             self._set_card(entry, "switching")
@@ -2137,6 +2258,7 @@ class ModelDownloads(QObject):
             except Exception:
                 log.warning("Не удалось переключить модель", exc_info=True)
                 self._switch_finished("failed")
+        return True
 
     def _switch_finished(self, result: str) -> None:
         entry, previous = self._switching_entry, self._previous_current
@@ -2246,8 +2368,15 @@ class ModelDownloads(QObject):
         entry = self._managed_entry(model_id)
         if entry is None or self._model is None:
             return
-        revision = self._installed_revision(entry)
-        if not revision or self._badge(entry) == "active" or entry is self._paused_entry:
+        try:
+            revision = self._installed_revision(entry, self._model.installed_ids(), strict=True)
+            if not revision:
+                return
+            current = self._model.current_ids()
+        except (OSError, StoreError):
+            self.report_store_error()
+            return
+        if current == (entry.id, revision) or entry is self._paused_entry:
             return
         with self._update():
             try:
@@ -2371,13 +2500,21 @@ class ModelDownloads(QObject):
             self._card_hint_kinds[model_id] = "switch-pause"
             self._notify("modelsChanged")
             return
+        # Указатели читаются до любых изменений: ошибка хранилища в слоте QML
+        # не должна ронять программу и не должна сбрасывать паузу и подсказки.
+        try:
+            previous_current = self._model.current_ids() if self._model else None
+            previous = getattr(self._model, "previous_revision", None)
+            previous_revision = previous() if callable(previous) else None
+        except (OSError, StoreError):
+            self.report_store_error()
+            return
         with self._update():
             self._revision_pause_pending = None
             self._clear_card_hints()
             self._revision_revert, self._revision_pause = revert, pause
-            self._revision_previous_current = self._model.current_ids() if self._model else None
-            previous = getattr(self._model, "previous_revision", None)
-            self._revision_previous_revision = previous() if callable(previous) else None
+            self._revision_previous_current = previous_current
+            self._revision_previous_revision = previous_revision
             self._revision_activating = activating = threading.Event()
             self._model_cancel = threading.Event()
             set_cancel = getattr(self._model, "set_cancel", None)

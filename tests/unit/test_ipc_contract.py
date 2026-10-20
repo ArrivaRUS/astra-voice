@@ -140,7 +140,7 @@ def test_new_gui_record_start_is_accepted_by_old_worker_schema(
     send = runtime.supervisor.send
     assert isinstance(send, Mock)
     message = send.call_args.args[0]
-    assert message["limit_s"] == (10.0 if microphone_test else 120.0)
+    assert message["limit_s"] == (5.0 if microphone_test else 120.0)
     frame = ipc.encode(message)
     assert ipc.decode(frame[4:]) == message
     # Старый воркер знает устройство, но молча отбрасывает новое поле предела.
