@@ -2885,6 +2885,7 @@ def test_microphone_error_is_plain_and_private(
     assert MARKER not in caplog.text
     assert not rig.pasted
     assert not rig.stats.events
+    assert not rig.pill.hidden and rig.tray.state is TrayState.LISTENING and rig.recording
     rig.event("record.stopped")
     assert rig.pill.calls == [(PillState.LISTENING, None, None)]
     assert rig.pill.hidden
@@ -2936,6 +2937,7 @@ def test_microphone_cancel_watchdogs_always_release_worker(rig: Rig) -> None:
     rig.core.start_test("", updates.append)
     rig.core.cancel_test()
     rig.timer(CANCEL_TIMEOUT_MS).fire()
+    assert not rig.pill.hidden and rig.tray.state is TrayState.LISTENING and rig.recording
     assert str(updates[-1].state) == "idle"
     assert rig.commands()[-1] == "audio.close"
     assert not rig.core.start_test("", Mock())
