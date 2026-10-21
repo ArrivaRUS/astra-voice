@@ -12,6 +12,7 @@ import pytest
 from astra_voice.platform import fly_themerc
 from astra_voice.platform.paste import FLY_FALLBACK_TYPE, _fly_blacklist_type
 from astra_voice.ui.tray_icons import _theme_variables, fly_panel_dark
+from helpers.fly_deadline import fifo_deadline
 
 pytestmark = pytest.mark.unit
 
@@ -42,9 +43,10 @@ def test_ib76_both_consumers_fail_fast(
 
         monkeypatch.setattr(os, "read", growing)
     start = time.monotonic()
-    assert fly_panel_dark((path,)) is None
-    assert _theme_variables(path) is None
-    assert _fly_blacklist_type((path,)) == FLY_FALLBACK_TYPE
+    with fifo_deadline():
+        assert fly_panel_dark((path,)) is None
+        assert _theme_variables(path) is None
+        assert _fly_blacklist_type((path,)) == FLY_FALLBACK_TYPE
     assert time.monotonic() - start < 0.1
 
 
@@ -60,9 +62,11 @@ def test_ib76_size_limit_uses_read_bytes_not_only_stat(
         calls += 1
         return b"x" * count
 
-    monkeypatch.setattr(os, "read", read_forever)
-    assert fly_themerc.read_themerc(path) is None
-    assert calls < 30
+    # Restore before pytest's PulseAudio /proc guard runs its teardown hook.
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "read", read_forever)
+        assert fly_themerc.read_themerc(path) is None
+        assert calls < 30
 
 
 def test_ib76_symlink_ancestor_rejected(tmp_path: Path) -> None:

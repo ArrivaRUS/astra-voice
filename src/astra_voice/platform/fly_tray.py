@@ -20,7 +20,7 @@ import stat
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -98,9 +98,15 @@ class _Snapshot:
     def same(self, other: _Snapshot) -> bool:
         return (
             fingerprint(self.info) == fingerprint(other.info)
-            and self.data == other.data
+            and _digest(self.data) == _digest(other.data)
             and self.attrs == other.attrs
         )
+
+
+@dataclass(frozen=True)
+class _Staged:
+    name: str
+    snapshot: _Snapshot
 
 
 @dataclass(frozen=True)
@@ -219,6 +225,25 @@ def _write_all(fd: int, data: bytes) -> None:
         if written <= 0:
             raise OSError(errno.EIO, "write")
         view = view[written:]
+
+
+def _check_temporary(directory: int, name: str, expected: _Snapshot) -> None:
+    fd = os.open(name, READ_FLAGS, dir_fd=directory)
+    try:
+        data, info = read_fd(fd)
+        if not expected.same(_Snapshot(data, info, _attrs(fd))):
+            raise FlyTrayError("changed")
+    finally:
+        os.close(fd)
+
+
+def _unlink_owned_temp(directory: int, name: str, created: os.stat_result) -> None:
+    try:
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) == (created.st_dev, created.st_ino):
+            os.unlink(name, dir_fd=directory)
+    except FileNotFoundError:
+        pass
 
 
 class FlyTrayPriority:
@@ -349,7 +374,7 @@ class FlyTrayPriority:
         self, snapshot: _Snapshot, home: Path
     ) -> tuple[TrayPriorityStatus, _Line, dict[str, str | bool] | None, bytes]:
         line = _parse(snapshot.data)
-        for raw in snapshot.data.split(b"\n"):
+        for raw in snapshot.data.removeprefix(b"\xef\xbb\xbf").split(b"\n"):
             key, sep, value = raw.strip().partition(b"=")
             if not sep or key.startswith((b"#", b";")):
                 continue
@@ -509,100 +534,168 @@ class FlyTrayPriority:
         except OSError as exc:
             raise FlyTrayError("administrator", exc.errno or 0) from None
 
-    def _replace(
-        self,
-        directory: int,
-        before: _Snapshot,
-        data: bytes,
-        *,
-        metadata: _Snapshot | None = None,
-        recover: bool = True,
-    ) -> _Snapshot:
-        source = metadata if metadata is not None else before
-        name = ".current.themerc.astra-voice." + secrets.token_hex(16) + ".tmp"
+    @contextmanager
+    def _stage(
+        self, directory: int, data: bytes, *, source: _Snapshot | None = None
+    ) -> Iterator[_Staged]:
+        prefix = ".current.themerc.astra-voice." if source is not None else ".fly-tray."
+        name = prefix + secrets.token_hex(16) + ".tmp"
         fd = os.open(
             name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
             0o600,
             dir_fd=directory,
         )
-        installed = False
         created = os.fstat(fd)
         try:
             try:
                 _write_all(fd, data)
-                self._metadata(fd, source)
+                if source is not None:
+                    self._metadata(fd, source)
+                else:
+                    os.fchmod(fd, 0o600)
                 os.fsync(fd)
+                os.lseek(fd, 0, os.SEEK_SET)
+                written, info = read_fd(fd)
+                if written != data:
+                    raise FlyTrayError("changed")
+                temporary = _Snapshot(written, info, _attrs(fd))
             finally:
                 os.close(fd)
-            if not before.same(self._snapshot(directory)):
-                raise FlyTrayError("changed")
-            os.replace(name, self.themerc.name, src_dir_fd=directory, dst_dir_fd=directory)
-            installed = True
-            # The remaining race against uncooperative Fly writers is accepted risk П34.
-            os.fsync(directory)
-            after = self._snapshot(directory)
-            if (
-                after.data != data
-                or after.attrs != source.attrs
-                or stat.S_IMODE(after.info.st_mode) != stat.S_IMODE(source.info.st_mode) & 0o666
-                or (after.info.st_uid, after.info.st_gid)
-                != (source.info.st_uid, source.info.st_gid)
-            ):
-                raise FlyTrayError("changed")
-            return after
-        except (OSError, ThemercError):
-            if installed and recover:
-                # Roll back only the exact bytes on the inode we installed. A
-                # concurrent writer's content or a replacement inode wins.
-                try:
-                    observed = self._snapshot(directory)
-                    if observed.data == data and (observed.info.st_dev, observed.info.st_ino) == (
-                        created.st_dev,
-                        created.st_ino,
-                    ):
-                        self._replace(
-                            directory, observed, before.data, metadata=before, recover=False
-                        )
-                except (OSError, ThemercError):
-                    pass
-            raise
+            _check_temporary(directory, name, temporary)
+            yield _Staged(name, temporary)
         finally:
+            _unlink_owned_temp(directory, name, created)
+
+    @staticmethod
+    def _matches_output(actual: _Snapshot, data: bytes, metadata: _Snapshot) -> bool:
+        return (
+            actual.data == data
+            and actual.attrs == metadata.attrs
+            and stat.S_IMODE(actual.info.st_mode) == stat.S_IMODE(metadata.info.st_mode) & 0o666
+            and (actual.info.st_uid, actual.info.st_gid)
+            == (metadata.info.st_uid, metadata.info.st_gid)
+        )
+
+    def _restore(self, directory: int, expected: _Snapshot, undo: _Staged) -> None:
+        # All rollback bytes and metadata were persisted BEFORE the first rename.
+        # Recovery must not allocate or write data on a full filesystem.
+        _check_temporary(directory, undo.name, undo.snapshot)
+        if not expected.same(self._snapshot(directory)):
+            raise FlyTrayError("changed")
+        os.replace(undo.name, self.themerc.name, src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+        if not self._matches_output(self._snapshot(directory), undo.snapshot.data, undo.snapshot):
+            raise FlyTrayError("changed")
+
+    def _replace(self, directory: int, before: _Snapshot, data: bytes, undo: _Staged) -> _Snapshot:
+        with self._stage(directory, data, source=before) as staged:
+            installed = False
             try:
-                os.unlink(name, dir_fd=directory)
+                _check_temporary(directory, staged.name, staged.snapshot)
+                if not before.same(self._snapshot(directory)):
+                    raise FlyTrayError("changed")
+                os.replace(
+                    staged.name, self.themerc.name, src_dir_fd=directory, dst_dir_fd=directory
+                )
+                installed = True
+                # Uncooperative writers can still race this rename: accepted risk П34.
+                os.fsync(directory)
+                after = self._snapshot(directory)
+                if not self._matches_output(after, data, before) or (
+                    after.info.st_dev,
+                    after.info.st_ino,
+                ) != (staged.snapshot.info.st_dev, staged.snapshot.info.st_ino):
+                    raise FlyTrayError("changed")
+                return after
+            except (OSError, ThemercError):
+                if installed:
+                    try:
+                        observed = self._snapshot(directory)
+                        if self._matches_output(observed, data, before) and (
+                            observed.info.st_dev,
+                            observed.info.st_ino,
+                        ) == (staged.snapshot.info.st_dev, staged.snapshot.info.st_ino):
+                            self._restore(directory, observed, undo)
+                    except (OSError, ThemercError):
+                        pass
+                raise
+
+    def _publish_state(self, directory: int, staged: _Staged | None) -> None:
+        if staged is None:
+            try:
+                os.unlink(self.state_path.name, dir_fd=directory)
             except FileNotFoundError:
                 pass
+        else:
+            _check_temporary(directory, staged.name, staged.snapshot)
+            os.replace(
+                staged.name, self.state_path.name, src_dir_fd=directory, dst_dir_fd=directory
+            )
+        os.fsync(directory)
 
     def _save_state(self, home: Path, state: dict[str, str | bool] | None) -> None:
         with open_directory(self.state_path.parent, home=home, create=True) as directory:
             if state is None:
-                try:
-                    os.unlink(self.state_path.name, dir_fd=directory)
-                except FileNotFoundError:
-                    pass
-                os.fsync(directory)
-                return
-            name = ".fly-tray." + secrets.token_hex(16) + ".tmp"
-            fd = os.open(
-                name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                0o600,
-                dir_fd=directory,
+                self._publish_state(directory, None)
+            else:
+                data = json.dumps(state, sort_keys=True).encode("ascii")
+                with self._stage(directory, data) as staged:
+                    self._publish_state(directory, staged)
+
+    def _transaction(
+        self,
+        home: Path,
+        directory: int,
+        current: _Snapshot,
+        data: bytes,
+        state: dict[str, str | bool] | None,
+        new_state: dict[str, str | bool] | None,
+    ) -> None:
+        with ExitStack() as stack:
+            undo = stack.enter_context(self._stage(directory, current.data, source=current))
+            state_fd = stack.enter_context(
+                open_directory(self.state_path.parent, home=home, create=True)
             )
+            old = (
+                None
+                if state is None
+                else stack.enter_context(
+                    self._stage(state_fd, json.dumps(state, sort_keys=True).encode("ascii"))
+                )
+            )
+            new = (
+                None
+                if new_state is None
+                else stack.enter_context(
+                    self._stage(state_fd, json.dumps(new_state, sort_keys=True).encode("ascii"))
+                )
+            )
+            # Reserve state bytes and directory entries before committing themerc.
+            os.fsync(state_fd)
+            after = self._replace(directory, current, data, undo)
             try:
+                if self._state(home) != state:
+                    raise FlyTrayError("changed")
+                self._publish_state(state_fd, new)
+            except (OSError, ThemercError):
                 try:
-                    os.fchmod(fd, 0o600)
-                    _write_all(fd, json.dumps(state, sort_keys=True).encode("ascii"))
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                os.replace(name, self.state_path.name, src_dir_fd=directory, dst_dir_fd=directory)
-                os.fsync(directory)
-            finally:
-                try:
-                    os.unlink(name, dir_fd=directory)
-                except FileNotFoundError:
+                    if after.same(self._snapshot(directory)):
+                        try:
+                            self._restore(directory, after, undo)
+                        except (OSError, ThemercError):
+                            pass
+                        # A directory fsync can fail after the rollback rename;
+                        # still restore state using its prewritten inode.
+                        restored = self._snapshot(directory)
+                        if (
+                            self._matches_output(restored, current.data, current)
+                            and self._state(home) == new_state
+                        ):
+                            self._publish_state(state_fd, old)
+                except (OSError, ThemercError):
                     pass
+                raise
 
     def _cleanup(self, directory: int) -> None:
         for name in os.listdir(directory):
@@ -670,14 +763,7 @@ class FlyTrayPriority:
                     data = current.data[: line.start] + edited + current.data[line.end :]
                     self._log("backup", "ok", op)
                     self._backup(copies, current.data)
-                    after = self._replace(directory, current, data)
-                    try:
-                        self._save_state(home, new_state)
-                    except (OSError, ThemercError):
-                        # Only our exact output may be rolled back, never a foreign edit.
-                        if after.same(self._snapshot(directory)):
-                            self._replace(directory, after, current.data)
-                        raise
+                    self._transaction(home, directory, current, data, state, new_state)
                     self._log("verify", "ok", op)
                     return Result(True, True, "ok", _MESSAGES["ok"])
         except (OSError, ThemercError) as exc:

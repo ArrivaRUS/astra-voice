@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from astra_voice.platform import session
+from astra_voice.platform.fly_themerc import read_themerc
 from astra_voice.platform.session import SessionKind
 from astra_voice.platform.x11 import X11Display
 
@@ -193,8 +194,6 @@ def _fly_blacklist_type(
         theme = Path.home() / ".fly/theme"
         paths = (theme / "current.themerc", theme / "default.themerc", FLY_SYSTEM_THEME)
     for path in paths:
-        from astra_voice.platform.fly_themerc import read_themerc
-
         data = read_themerc(path)
         if data is None:
             continue
