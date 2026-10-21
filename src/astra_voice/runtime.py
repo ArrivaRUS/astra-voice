@@ -50,6 +50,7 @@ from astra_voice.core.settings import (
     is_valid_command_mouse_button,
 )
 from astra_voice.core.stats import SAVE_INTERVAL_S, Stats
+from astra_voice.core.theme import ThemeSource
 from astra_voice.models.catalog_effective import CATALOG_LOCK
 from astra_voice.platform.cowork import (
     CoworkClient,
@@ -1606,6 +1607,10 @@ class DictationRuntime(QObject):
     def set_revoked_check(self, revoked: RevokedCheck | None) -> None:
         """Подключает проверку отзыва ревизии по каталогу (US-6.6)."""
         self._revoked_check = revoked
+
+    def set_theme_source(self, source: ThemeSource | None) -> None:
+        """Подключает общий источник темы окна, пилюли и значка лотка."""
+        self.provider.set_theme(source)
 
     def set_catalog_rtfx(self, lookup: Callable[[str], float | None] | None) -> None:
         """Подключает скорость модели из каталога для дедлайна самопроверки."""

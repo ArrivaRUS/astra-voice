@@ -474,6 +474,17 @@ class Tray(QObject):
         self._tray.setContextMenu(self._menu)
         self.set_state(TrayState.IDLE)
         self.set_models([], None)
+        if callable(getattr(self._provider, "subscribe", None)):  # дублёры без подписки
+            self._provider.subscribe(self._icons_changed)
+
+    def _icons_changed(self) -> None:
+        # Источник темы может пережить runtime и его удалённый QObject.
+        if sip.isdeleted(self):
+            return
+        if self._has_icon():
+            self._tray.setIcon(self._display_icon())
+        else:
+            self._invalidate_registration()
 
     @staticmethod
     def _invoke(callback: Callable[[], None] | None) -> None:
@@ -783,6 +794,8 @@ class Tray(QObject):
         if self._running:
             return
         self._running = True
+        if callable(getattr(self._provider, "start", None)):
+            self._provider.start()
         self._bus_generation = next(_bus_generations)
         _get_bus_receiver().tray = self
         self._retry_expired = False
@@ -1272,6 +1285,8 @@ class Tray(QObject):
             self._service_unregistered(service)
 
     def stop(self) -> None:
+        if callable(getattr(self._provider, "stop", None)):
+            self._provider.stop()
         self._running = False
         self._registered = False
         self._host_registered = False

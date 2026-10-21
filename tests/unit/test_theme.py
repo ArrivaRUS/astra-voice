@@ -251,7 +251,12 @@ def test_kde_watcher_survives_atomic_rewrite(tmp_path: Path) -> None:
 
 
 def test_fly_stub_is_honestly_light(tmp_path: Path) -> None:
-    source = FlyThemeSource(tmp_path / "paletterc")
+    source = FlyThemeSource(
+        tmp_path / "paletterc",
+        admin_themerc=tmp_path / "fly-admin-themerc",
+        schemes_dir=tmp_path / "schemes",
+        user_schemes_dir=tmp_path / "user-schemes",
+    )
     assert source.dark is False
     assert source.accent is None
 
