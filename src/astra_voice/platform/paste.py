@@ -193,9 +193,14 @@ def _fly_blacklist_type(
         theme = Path.home() / ".fly/theme"
         paths = (theme / "current.themerc", theme / "default.themerc", FLY_SYSTEM_THEME)
     for path in paths:
+        from astra_voice.platform.fly_themerc import read_themerc
+
+        data = read_themerc(path)
+        if data is None:
+            continue
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError):
+            lines = data.decode("utf-8").splitlines()
+        except UnicodeError:
             continue
         for line in lines:
             key, sep, value = line.partition("=")
