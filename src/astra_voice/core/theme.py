@@ -321,27 +321,36 @@ class KdeThemeSource(_FileThemeSource):
 _FLY_MAX_BYTES = 256 * 1024
 
 
-def _read_fly_ini(path: Path, roots: tuple[Path, ...] = ()) -> dict[str, dict[str, str]]:
+def _read_fly_ini(path: Path, roots: dict[Path, int] | None = None) -> dict[str, dict[str, str]]:
     """Ограниченное чтение обычного файла, без выхода через подмену симлинка.
 
-    Сначала раскрываем ссылки и проверяем границу, затем открываем каждый компонент
-    через dir_fd/O_NOFOLLOW: подмена каталога между проверкой и open отвергается.
+    Для схем границы уже закреплены открытыми дескрипторами каталогов. Раскрываем
+    внутренние ссылки и открываем компоненты относительно такого дескриптора
+    через O_NOFOLLOW: подмена каталога между проверкой и open отвергается.
     O_NONBLOCK и fstat не дают зависнуть на FIFO или читать устройства.
     """
     fd: int | None = None
     try:
         resolved = path.resolve()
-        if roots and not any(resolved.is_relative_to(root) for root in roots):
+        if roots is not None:
+            root = next((root for root in roots if resolved.is_relative_to(root)), None)
+            if root is None:
+                return {}
+            fd = os.dup(roots[root])
+            parts = resolved.relative_to(root).parts
+        else:
+            fd = os.open(resolved.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            parts = resolved.parts[1:]
+        if not parts:
             return {}
-        fd = os.open(resolved.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        for part in resolved.parts[1:-1]:
+        for part in parts[:-1]:
             child = os.open(
                 part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd
             )
             os.close(fd)
             fd = child
         child = os.open(
-            resolved.name,
+            parts[-1],
             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
             dir_fd=fd,
         )
@@ -402,7 +411,7 @@ class FlyThemeSource(_FileThemeSource):
             )
             self._warned = True
 
-    def _scheme(self, path: Path, roots: tuple[Path, ...]) -> dict[str, dict[str, str]]:
+    def _scheme(self, path: Path, roots: dict[Path, int]) -> dict[str, dict[str, str]]:
         try:
             resolved = path.resolve()
             if path.suffix != ".colors" or not any(resolved.is_relative_to(root) for root in roots):
@@ -414,17 +423,40 @@ class FlyThemeSource(_FileThemeSource):
             return {}
 
     def _read(self) -> tuple[bool, str | None, str | None, str | None]:
+        roots: dict[Path, int] = {}
+        system: Path | None = None
+        try:
+            for path in (self._schemes, self._user_schemes):
+                try:
+                    # Канонизируем только предков (HOME может быть ссылкой).
+                    # Сам root не resolve(): его ссылка не расширяет доверие.
+                    root = path.absolute()
+                    root = root.parent.resolve() / root.name
+                    if root.name == "..":
+                        root = root.parent.parent
+                    if path == self._schemes:
+                        system = root
+                    if root in roots:
+                        continue
+                    roots[root] = os.open(
+                        root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    self._warn()
+            return self._read_theme(roots, system)
+        finally:
+            for fd in roots.values():
+                os.close(fd)
+
+    def _read_theme(
+        self, roots: dict[Path, int], system: Path | None
+    ) -> tuple[bool, str | None, str | None, str | None]:
         self._scheme_paths.clear()
         variables = _read_fly_ini(self._path).get("Variables", {})
         accent = parse_color(variables.get("PrimaryColor", ""))
         ini: dict[str, dict[str, str]] = {}
-        roots: tuple[Path, ...]
-        try:
-            roots = (self._schemes.resolve(), self._user_schemes.resolve())
-        except (OSError, RuntimeError, ValueError):
-            roots = ()
         scheme = variables.get("ColorScheme", "")
-        if scheme and roots:
+        if scheme:
             ini = self._scheme(Path(scheme), roots)
             if not ini:
                 self._warn()
@@ -435,13 +467,17 @@ class FlyThemeSource(_FileThemeSource):
         if bg is None:
             name = _read_fly_ini(self._admin).get("UiSettings", {}).get("ColorScheme", "")
             name = name.strip().casefold()
-            if name and roots:
+            if name and system is not None and system in roots:
                 try:
-                    candidates = sorted(self._schemes.glob("*.colors"))
+                    candidates = sorted(
+                        system / entry
+                        for entry in os.listdir(roots[system])
+                        if entry.endswith(".colors")
+                    )
                 except OSError:
                     candidates = []
                 for candidate in candidates:
-                    candidate_ini = self._scheme(candidate, roots[:1])
+                    candidate_ini = self._scheme(candidate, {system: roots[system]})
                     general = candidate_ini.get("General", {})
                     if name not in (
                         general.get("Name", "").strip().casefold(),

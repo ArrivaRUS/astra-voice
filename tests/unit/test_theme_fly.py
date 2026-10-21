@@ -447,6 +447,43 @@ def test_t294_oversized_scheme_found_by_name_is_not_used(
 # ── T-295 · пути вне допустимых каталогов ──────────────────────────────────
 
 
+@pytest.mark.parametrize("root_kind", ["system", "user"])
+@pytest.mark.parametrize("redirected", [True, False], ids=["symlink-root", "real-root"])
+def test_t295_scheme_root_cannot_be_redirected_outside_its_parent(
+    fly: FlyHome,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    root_kind: str,
+    redirected: bool,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    root = tmp_path / "configured-parent" / "color-schemes"
+    root.parent.mkdir()
+    target = tmp_path / "outside-parent" / "private-schemes" if redirected else root
+    target.mkdir(parents=True)
+    if redirected:
+        root.symlink_to(target, target_is_directory=True)
+    filename = "PrivateScheme.colors"
+    (target / filename).write_text(scheme(SECRET_NAME, "#FFFFFF"), encoding="utf-8")
+    fly.write_paletterc(color_scheme=root / filename, background="#262626")
+    source = FlyThemeSource(
+        fly.paletterc,
+        admin_themerc=fly.admin,
+        schemes_dir=root if root_kind == "system" else fly.system,
+        user_schemes_dir=root if root_kind == "user" else fly.user,
+    )
+    assert (source.dark, source.window_bg) == (
+        (True, "#262626") if redirected else (False, "#FFFFFF")
+    )
+    assert source.reload() is False
+    warnings = theme_warnings(caplog)
+    assert len(warnings) == (1 if redirected else 0)
+    for warning in warnings:
+        message = warning.getMessage()
+        for private in (str(tmp_path), str(root), str(target), filename, SECRET_NAME):
+            assert private not in message, "WARNING раскрыл путь или имя схемы"
+
+
 def test_t295_paletterc_path_outside_allowed_dirs_is_rejected(
     fly: FlyHome, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

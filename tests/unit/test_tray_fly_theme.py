@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock
@@ -82,7 +83,7 @@ def qapp() -> QApplication:
 @pytest.fixture(autouse=True)
 def no_fly_panel(monkeypatch: pytest.MonkeyPatch) -> None:
     """~/.fly/theme машины не читаем: цвет панели «неизвестен», решает тема."""
-    monkeypatch.setattr(tray_icons, "fly_panel_dark", lambda: None)
+    monkeypatch.setattr(tray_icons, "fly_theme_files", lambda: ())
 
 
 @pytest.fixture
@@ -158,6 +159,141 @@ def test_t298_known_panel_color_wins_over_theme(
 
 
 # ── T-299 · живая смена темы → значок без перезапуска ──────────────────────
+
+
+def icon_marks(provider: TrayIconProvider) -> tuple[str, str]:
+    return mark(provider.icon(TrayState.IDLE)), mark(provider.command_icon(TrayState.IDLE))
+
+
+def observe_file_write(path: Path, action: Callable[[], None]) -> None:
+    """Доставить настоящее fileChanged и собрать уведомления за бюджет истории ≤ 2 с."""
+    from PyQt5.QtCore import QEventLoop, QFileSystemWatcher, QTimer
+
+    delivered: list[str] = []
+    watcher = QFileSystemWatcher([str(path)])
+    watcher.fileChanged.connect(delivered.append)
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.setSingleShot(True)
+    timer.timeout.connect(loop.quit)
+    timer.start(2000)
+    action()
+    loop.exec_()
+    assert delivered, "контрольный watcher не получил файловое событие за 2 с"
+
+
+def test_t299_panel_only_change_repaints_both_icons_and_notifies_once(
+    qapp: QApplication, bundled_icons: None, fly: FlyHome
+) -> None:
+    source = fly_source(fly, "AstraLight.colors")
+    panel = fly.home / ".fly" / "theme" / "current.themerc"
+    atomic_write(panel, "[Variables]\nTaskbarColor=#FFFFFF\n")
+    provider = TrayIconProvider(SessionKind.FLY, source, panel_paths=(panel,))
+    assert icon_marks(provider) == (DARK_MARK, DARK_MARK)
+    seen: list[tuple[str, str]] = []
+    provider.subscribe(lambda: seen.append(icon_marks(provider)))
+    source.start()
+    provider.start()
+    try:
+        observe_file_write(
+            panel, lambda: atomic_write(panel, "[Variables]\nTaskbarColor=#101010\n")
+        )
+        assert source.dark is False, "в этом сценарии тема окон не менялась"
+        assert seen == [(LIGHT_MARK, LIGHT_MARK)]
+        assert icon_marks(provider) == (LIGHT_MARK, LIGHT_MARK)
+    finally:
+        provider.stop()
+        source.stop()
+
+
+@pytest.mark.parametrize("order", ["window-first", "panel-first", "unknown-panel-window-first"])
+def test_t299_window_and_panel_changes_in_either_order_keep_current_icons(
+    qapp: QApplication, bundled_icons: None, fly: FlyHome, order: str
+) -> None:
+    source = fly_source(fly, "AstraLight.colors")
+    panel = fly.home / ".fly" / "theme" / "current.themerc"
+    initially_unknown = order == "unknown-panel-window-first"
+    atomic_write(
+        panel,
+        "[Variables]\nTaskbarColor=unknown\n"
+        if initially_unknown
+        else "[Variables]\nTaskbarColor=#FFFFFF\n",
+    )
+    provider = TrayIconProvider(SessionKind.FLY, source, panel_paths=(panel,))
+    assert icon_marks(provider) == (DARK_MARK, DARK_MARK)
+    seen: list[tuple[str, str]] = []
+    provider.subscribe(lambda: seen.append(icon_marks(provider)))
+    changes: dict[str, tuple[Path, Callable[[], None]]] = {
+        "window": (
+            fly.paletterc,
+            lambda: fly.write_paletterc(color_scheme=fly.system / "AstraDark.colors"),
+        ),
+        "panel": (
+            panel,
+            lambda: atomic_write(
+                panel,
+                "[Variables]\nTaskbarColor=#FFFFFF\n"
+                if initially_unknown
+                else "[Variables]\nTaskbarColor=#101010\n",
+            ),
+        ),
+    }
+    source.start()
+    provider.start()
+    try:
+        parts = ["panel", "window"] if order == "panel-first" else ["window", "panel"]
+        for part in parts:
+            path, action = changes[part]
+            observe_file_write(path, action)
+            if initially_unknown:
+                expected = LIGHT_MARK if part == "window" else DARK_MARK
+                assert icon_marks(provider) == (expected, expected)
+                expected_seen = [(LIGHT_MARK, LIGHT_MARK)]
+                if part == "panel":
+                    expected_seen.append((DARK_MARK, DARK_MARK))
+                assert seen == expected_seen
+                continue
+            panel_changed = part == "panel" or order == "panel-first"
+            expected = LIGHT_MARK if panel_changed else DARK_MARK
+            assert icon_marks(provider) == (expected, expected)
+            assert seen == ([(LIGHT_MARK, LIGHT_MARK)] if panel_changed else [])
+        assert source.dark is True
+    finally:
+        provider.stop()
+        source.stop()
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected"),
+    [("#FFFFFF", "#F0F0F0", DARK_MARK), ("#101010", "#202020", LIGHT_MARK)],
+    ids=["still-light", "still-dark"],
+)
+def test_t299_same_effective_panel_color_does_not_notify(
+    qapp: QApplication,
+    bundled_icons: None,
+    fly: FlyHome,
+    before: str,
+    after: str,
+    expected: str,
+) -> None:
+    source = fly_source(fly, "AstraLight.colors")
+    panel = fly.home / ".fly" / "theme" / "current.themerc"
+    atomic_write(panel, f"[Variables]\nTaskbarColor={before}\n")
+    provider = TrayIconProvider(SessionKind.FLY, source, panel_paths=(panel,))
+    assert icon_marks(provider) == (expected, expected)
+    seen: list[tuple[str, str]] = []
+    provider.subscribe(lambda: seen.append(icon_marks(provider)))
+    source.start()
+    provider.start()
+    try:
+        observe_file_write(
+            panel, lambda: atomic_write(panel, f"[Variables]\nTaskbarColor={after}\n")
+        )
+        assert seen == []
+        assert icon_marks(provider) == (expected, expected)
+    finally:
+        provider.stop()
+        source.stop()
 
 
 def test_t299_provider_follows_theme_change_without_manual_refresh(

@@ -6,11 +6,12 @@ import logging
 import re
 from collections.abc import Callable
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from astra_voice.core import paths
-from astra_voice.core.theme import ThemeSource
+from astra_voice.core.theme import ThemeSource, _FileThemeSource
 from astra_voice.platform.session import SessionKind
 
 if TYPE_CHECKING:
@@ -146,6 +147,25 @@ def find_tray_icon_path(name: str, size: int) -> Path:
     raise FileNotFoundError(f"Не найден SVG трея: {candidates[0]}; {candidates[1]}")
 
 
+class _FlyPanelSource(_FileThemeSource):
+    """Наблюдает тот же набор файлов, из которого провайдер читает цвет панели."""
+
+    def __init__(self, files: tuple[Path, ...], dark: Callable[[], bool | None]) -> None:
+        self._files = files
+        self._dark = dark
+        super().__init__(files[0])
+
+    def _read(self) -> tuple[bool, str | None, str | None, str | None]:
+        dark = self._dark()
+        # None отличается от известной светлой панели. Состояние окна здесь
+        # не кэшируем: оно меняется по собственной подписке провайдера.
+        background = None if dark is None else "#000000" if dark else "#FFFFFF"
+        return (dark is True, None, background, None)
+
+    def _watch_paths(self) -> set[Path]:
+        return set(self._files)
+
+
 class TrayIconProvider:
     """Загрузка иконок требует QApplication; смена темы обновляет подписчиков."""
 
@@ -155,24 +175,76 @@ class TrayIconProvider:
         theme: ThemeSource | None = None,
         *,
         panel_dark: Callable[[], bool | None] | None = None,
+        panel_paths: tuple[Path, ...] | None = None,
     ) -> None:
         self._session = session
         self._theme: ThemeSource | None = None
-        self._panel_dark = fly_panel_dark if panel_dark is None else panel_dark
+        self._panel_dark = (
+            panel_dark
+            if panel_dark is not None
+            else fly_panel_dark
+            if panel_paths is None
+            else partial(fly_panel_dark, panel_paths)
+        )
         self._cache: dict[TrayState, QIcon] = {}
         self._command_cache: dict[TrayState, QIcon] = {}
         self._listeners: list[Callable[[], None]] = []
+        self._stopped = False
+        self._effective_dark = self._file_icon_dark()
         self.set_theme(theme)
+        files = fly_theme_files() if panel_paths is None else panel_paths
+        self._panel_source = (
+            _FlyPanelSource(files, self._panel_dark)
+            if self._session == SessionKind.FLY and files
+            else None
+        )
+        if self._panel_source is not None:
+            self._panel_source.subscribe(self._theme_changed)
 
     def set_theme(self, theme: ThemeSource | None) -> None:
         """Заменить источник, отсоединив старый, и обновить уже установленный значок."""
         if theme is self._theme:
             return
-        if self._theme is not None:
-            self._theme.unsubscribe(self.refresh)
+        if self._theme is not None and not self._stopped:
+            self._theme.unsubscribe(self._theme_changed)
         self._theme = theme
-        if theme is not None:
-            theme.subscribe(self.refresh)
+        if theme is not None and not self._stopped:
+            theme.subscribe(self._theme_changed)
+        self._theme_changed()
+
+    def start(self) -> None:
+        """Включить наблюдение Fly после создания приложения и при повторном запуске."""
+        if self._session != SessionKind.FLY:
+            return
+        from PyQt5.QtCore import QCoreApplication
+
+        if QCoreApplication.instance() is None:
+            return
+        if self._stopped:
+            self._stopped = False
+            if self._theme is not None:
+                self._theme.subscribe(self._theme_changed)
+        if self._panel_source is not None:
+            self._panel_source.start()
+        self._theme_changed()
+
+    def stop(self) -> None:
+        """Отсоединить файловый наблюдатель и источник темы, в том числе до start()."""
+        if self._session != SessionKind.FLY or self._stopped:
+            return
+        self._stopped = True
+        if self._panel_source is not None:
+            self._panel_source.stop()
+        if self._theme is not None:
+            self._theme.unsubscribe(self._theme_changed)
+
+    def _theme_changed(self) -> None:
+        if self._stopped:
+            return
+        # Окно и панель записываются в любом порядке. Обе подписки сравнивают
+        # итоговый цвет, поэтому позднее событие окна/каталога не даёт дубль.
+        if self._session == SessionKind.FLY and self._file_icon_dark() == self._effective_dark:
+            return
         self.refresh()
 
     def subscribe(self, callback: Callable[[], None]) -> None:
@@ -275,6 +347,7 @@ class TrayIconProvider:
 
     def refresh(self) -> None:
         """Сбросить иконки, чтобы следующий запрос учитывал новую тему панели."""
+        self._effective_dark = self._file_icon_dark()
         self._cache.clear()
         self._command_cache.clear()
         for callback in list(self._listeners):
